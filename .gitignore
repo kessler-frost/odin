@@ -26,3 +26,6 @@ docs/plans/
 
 # Claude Code machine-local settings (keep CLAUDE.md tracked)
 .claude/settings.local.json
+
+# Built UI bundled into the wheel at release time (not committed)
+src/odin/_ui/

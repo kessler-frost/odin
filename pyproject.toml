@@ -33,6 +33,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/odin"]
+# Include the bundled UI (gitignored, copied in at release/build time).
+artifacts = ["src/odin/_ui/**/*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

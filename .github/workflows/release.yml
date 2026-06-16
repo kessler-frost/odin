@@ -1,0 +1,29 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v8.2.0
+      - uses: oven-sh/setup-bun@v2
+      - name: Build the UI
+        working-directory: ui
+        run: |
+          bun install
+          bun run build
+      - name: Bundle the UI into the package
+        run: cp -r ui/dist src/odin/_ui
+      - name: Build the wheel
+        run: uv build --wheel
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" dist/*.whl --title "${{ github.ref_name }}" --generate-notes

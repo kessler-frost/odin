@@ -39,13 +39,14 @@ before anything touches real AWS.
 
 ## Install
 
-Install the `odin` CLI straight from GitHub:
+Each release ships a wheel with the UI already built in. Grab the wheel URL from
+the [latest release](https://github.com/kessler-frost/odin/releases/latest) and:
 
 ```bash
-uv tool install git+https://github.com/kessler-frost/odin.git
+uv tool install <wheel-url>
 ```
 
-Or from a local clone (recommended while it's evolving, and what builds the canvas UI):
+Or from a local clone, for development:
 
 ```bash
 git clone https://github.com/kessler-frost/odin.git

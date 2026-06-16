@@ -20,6 +20,8 @@ BACKEND_DEV_PORT = 4201
 
 
 def _build_ui() -> None:
+    if (Path(__file__).resolve().parent / "_ui").exists():
+        return  # UI ships bundled with the installed package
     dist = UI_DIR / "dist"
     if not dist.exists():
         typer.echo("Building UI …")

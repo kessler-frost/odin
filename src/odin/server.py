@@ -91,7 +91,11 @@ def create_app(
     app.state.orchestrator = orchestrator
     app.state.agent = agent
 
-    ui_dist = Path(__file__).resolve().parent.parent.parent / "ui" / "dist"
+    # Prefer the UI bundled into the installed package; fall back to the source
+    # build for local development.
+    bundled_ui = Path(__file__).resolve().parent / "_ui"
+    source_ui = Path(__file__).resolve().parent.parent.parent / "ui" / "dist"
+    ui_dist = bundled_ui if bundled_ui.exists() else source_ui
     if ui_dist.exists():
         @app.get("/")
         def serve_index():
