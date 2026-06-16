@@ -1,0 +1,31 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.worktrees/
+.DS_Store
+.odin/
+node_modules/
+bun.lock
+.vite/
+.playwright-cli/
+.playwright/
+*.png
+.odin-dev.log
+.odin.pid
+infra/
+ui/infra/
+ui/.odin-dev.log
+
+# Local planning/design notes, not part of the repo
+docs/plans/
+
+# Claude Code machine-local settings (keep CLAUDE.md tracked)
+.claude/settings.local.json
+
+# README screenshot (tracked despite the *.png rule above)
+!assets/odin-canvas.png

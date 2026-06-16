@@ -1,0 +1,111 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg-primary: #050508;
+  --color-bg-secondary: #0a0a10;
+  --color-bg-tertiary: #111118;
+  --color-bg-hover: #1a1a24;
+  --color-border: #333345;
+  --color-border-bright: #4a4a60;
+  --color-text-primary: #ededf2;
+  --color-text-secondary: #bbbbd2;
+  --color-text-muted: #8a8aa5;
+  --color-neon-green: #00ff88;
+  --color-neon-blue: #00bbff;
+  --color-neon-purple: #aa55ff;
+  --color-neon-orange: #ff8800;
+  --color-neon-yellow: #ffdd00;
+  --color-neon-red: #ff3355;
+  --font-mono: 'JetBrains Mono', monospace;
+}
+
+@layer base {
+  @font-face {
+    font-family: 'JetBrains Mono';
+    src: local('JetBrains Mono');
+  }
+
+  * {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+  }
+
+  body {
+    font-family: 'Inter', sans-serif;
+    background: var(--color-bg-primary);
+    color: var(--color-text-primary);
+    height: 100vh;
+    overflow: hidden;
+  }
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+/* ReactFlow theme overrides */
+.react-flow__node {
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.react-flow__node.selected {
+  box-shadow: 0 0 0 1px rgba(0, 187, 255, 0.5);
+}
+
+.react-flow__edge-path {
+  stroke: #4a4a60;
+  stroke-width: 1.5;
+}
+
+.react-flow__controls {
+  bottom: 12px;
+  left: 12px;
+  background: #0a0a10;
+  border: 1px solid #4a4a60;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.react-flow__controls button {
+  background: #0a0a10;
+  border: none;
+  border-bottom: 1px solid #333345;
+  border-radius: 0;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.react-flow__controls button:last-child {
+  border-bottom: none;
+}
+
+.react-flow__controls button:hover {
+  background: #1a1a24;
+}
+
+.react-flow__controls button svg {
+  fill: #bbbbd2;
+}
+
+.react-flow__controls button:hover svg {
+  fill: #ededf2;
+}
+
+.react-flow__nodesselection-rect {
+  display: none;
+}
+
+.react-flow__minimap {
+  bottom: 12px;
+  right: 12px;
+}
