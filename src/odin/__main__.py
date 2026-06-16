@@ -60,13 +60,18 @@ def start(
         uvicorn.run("odin.server:create_app", factory=True, host="0.0.0.0", port=port)
     else:
         ODIN_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = ODIN_DIR / "server.log"
+        log = log_path.open("w")
         proc = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "odin.server:create_app",
              "--factory", "--host", "0.0.0.0", "--port", str(port)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdout=log, stderr=log, start_new_session=True,
         )
         PID_FILE.write_text(str(proc.pid))
-        typer.echo(f"Odin started in background (pid {proc.pid}). Use `odin stop` to shut down.")
+        typer.echo(
+            f"Odin started in background (pid {proc.pid}). "
+            f"Logs: {log_path}. Use `odin stop` to shut down."
+        )
 
 
 def _start_dev(port: int) -> None:
@@ -136,6 +141,10 @@ def stop() -> None:
         typer.echo("Odin is not running (no PID file found).")
         return
     pid = int(PID_FILE.read_text().strip())
+    if not _pid_exists(pid):
+        PID_FILE.unlink(missing_ok=True)
+        typer.echo(f"Odin is not running (cleaned up stale pid {pid}).")
+        return
     typer.echo(f"Stopping Odin (pid {pid}) …")
     os.kill(pid, signal.SIGTERM)
     PID_FILE.unlink(missing_ok=True)

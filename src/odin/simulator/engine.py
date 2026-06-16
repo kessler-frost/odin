@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import socket
+import sys
 import time
 import urllib.request
 
@@ -19,7 +20,11 @@ class MotoEngine:
     def __init__(self, host: str = "127.0.0.1", port: int = DEFAULT_PORT) -> None:
         self._host = host
         self._port = port
-        self._daemon = Daemon("moto_server", "-H", host, "-p", str(port))
+        # Invoke via the current interpreter so it works regardless of PATH
+        # (the `moto_server` script is only on PATH inside the venv).
+        self._daemon = Daemon(
+            sys.executable, "-m", "moto.server", "-H", host, "-p", str(port)
+        )
         self._clients: dict[str, boto3.client] = {}
 
     @property
