@@ -1,7 +1,7 @@
 # Odin — AI-Controlled Local AWS Simulator
 
 ## Overview
-Local AWS simulator: AI agent (Claude Agent SDK) writes boto3 code → Moto simulates → Lima VMs/containers execute. Users never write code.
+A visual canvas for AWS. The agent (Claude Agent SDK) translates the canvas into one Terraform (OpenTofu) config; `tofu` validates/applies it against a local Moto server. Users draw, not code.
 
 ## Tech Stack
 - **Backend:** Python 3.12+ (uv), FastAPI + WebSocket, Moto, Lima, Nebula
@@ -11,11 +11,12 @@ Local AWS simulator: AI agent (Claude Agent SDK) writes boto3 code → Moto simu
 ## Architecture
 Single Python monolith: `src/odin/` with modules for `agent/`, `simulator/`, `compute/`, `network/`, `mcp/`, `api/`, and `orchestrator.py`.
 
-- Single agent (ClaudeSDKClient) handles validation + smart defaults, session persists via `.odin/agent_session_id`
-- MCP tools via `@tool` decorator (validate_file, get_infrastructure_state)
-- Agent code lives in `.odin/infra/` (one file per resource)
-- Pipeline: agent writes file → calls validate_file MCP tool → moto → registry → WebSocket → UI
-- Two simulation levels: API-level (moto) + real execution (Lima VMs, Nebula networking)
+- Single agent (ClaudeSDKClient), session persists via `.odin/agent_session_id`
+- MCP tools via `@tool` decorator (validate_infrastructure, get_infrastructure_state)
+- Agent writes one whole-canvas Terraform config to `.odin/tf/main.tf` (Odin owns `provider.tf`)
+- Pipeline: agent writes main.tf → validate_infrastructure (`tofu plan`) → Moto → registry → WebSocket → UI
+- Moto runs as a standalone `moto_server` subprocess; `tofu` targets it via provider endpoint overrides
+- Lima/Nebula/nerdctl modules are parked for a future "Simulate" mode
 
 ## Conventions
 - **ALWAYS use `bun` instead of `npm`, `npx`, `yarn`, or `pnpm`** — `bun install`, `bun run`, `bunx` for all JS/TS operations

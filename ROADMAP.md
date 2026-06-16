@@ -12,19 +12,18 @@ Core infrastructure: agent client, Moto simulator, and project scaffolding.
 - [x] FastAPI server with REST endpoints + WebSocket
 - [x] Orchestrator wiring all components together
 
-## Phase 2 — Real Execution (Backend built, not yet wired to the UI)
+## Phase 2 — Real Execution / "Simulate" (Parked)
 
-The managers and orchestrator deploy/destroy logic for real local compute and
-networking exist, but deploy/destroy are currently gated behind a "coming soon"
-notice in the UI. The validated-against-Moto pipeline (Phase 4) is what runs end
-to end today.
+The Lima VM, Nebula mesh, and nerdctl container managers are built and tested,
+but parked: they're the foundation for a future **Simulate** mode that runs
+resources for real. They are no longer wired into deploy — deploy now goes
+through Terraform against Moto (see below).
 
 - [x] Lima VM Manager + YAML/cloud-init templates for EC2
 - [x] Nebula mesh networking (cert-based VPC isolation, lighthouse auto-provisioning)
 - [x] ContainerManager (nerdctl) + Lambda deploy/destroy/invoke
 - [x] Nebula overlay networking for Lambda containers
-- [x] `/invoke` API endpoint
-- [ ] Wire deploy/destroy through to the UI (today the buttons show "coming soon")
+- [ ] "Simulate" mode: wire these into a real-execution path in the UI
 
 ## Phase 3 — UI (Complete)
 
@@ -46,19 +45,23 @@ React 19 + ReactFlow + Tailwind CSS v4 — high-contrast dark industrial interfa
 
 Moto-backed validation pipeline and `.odin/` state consolidation.
 
-- [x] Validate pipeline: canvas → agent → boto3 → Moto → UI status
-- [x] MCP tools: `validate_file`, `get_infrastructure_state`
+- [x] Validate pipeline: canvas → agent → Terraform → `tofu plan` → Moto → UI status
+- [x] MCP tools: `validate_infrastructure`, `get_infrastructure_state`
 - [x] Destroy resets validated/error → draft
 - [x] `.odin/` directory consolidation
 - [x] Agent session persistence across server restarts
 - [ ] Smart defaults: reactive agent fills config on canvas changes (experimental, disabled)
 
-## Next — Terraform / OpenTofu Pivot (active, in design)
+## Terraform / OpenTofu (Complete)
 
-Replace boto3 generation with Terraform (OpenTofu) HCL, run against a local Moto
-server using AWS provider endpoint overrides. Planned split: **validate =
-`tofu plan`** (fast per-edit feedback), **deploy = `tofu apply`** (explicit). A
-full design spec is being written; this section will be expanded once it lands.
+The agent writes one whole-canvas Terraform config (not boto3), run against a
+local Moto server via AWS provider endpoint overrides.
+
+- [x] Moto runs as a standalone `moto_server` subprocess
+- [x] Agent writes one declarative `main.tf` for the whole canvas
+- [x] validate = `tofu plan`, deploy = `tofu apply`, destroy = `tofu destroy`
+- [x] Per-node canvas status mapped from tofu results
+- [x] boto3 generation path removed; CI runs the Moto + tofu path
 
 ## Phase 5 — Extended AWS Services
 
