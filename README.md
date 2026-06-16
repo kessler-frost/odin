@@ -39,12 +39,13 @@ before anything touches real AWS.
 
 ## Install
 
-Each release ships a wheel with the UI already built in. Grab the wheel URL from
-the [latest release](https://github.com/kessler-frost/odin/releases/latest) and:
+Each release ships a wheel with the UI already built in. Install the latest one:
 
 ```bash
-uv tool install <wheel-url>
+uv tool install "$(curl -fsSL https://api.github.com/repos/kessler-frost/odin/releases/latest | grep -o 'https://github.com/[^"]*\.whl' | head -1)"
 ```
+
+That resolves the newest release's wheel and installs the `odin` CLI.
 
 Or from a local clone, for development:
 
