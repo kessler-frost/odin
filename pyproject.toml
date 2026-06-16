@@ -1,7 +1,7 @@
 [project]
 name = "odin"
 version = "0.1.2"
-description = "AI-controlled local AWS simulator"
+description = "A canvas for building and visualizing AWS infrastructure. Generates Terraform and simulates locally against Moto."
 requires-python = ">=3.12"
 license = "Apache-2.0"
 dependencies = [
