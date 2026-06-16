@@ -5,12 +5,12 @@ description = "AI-controlled local AWS simulator"
 requires-python = ">=3.12"
 license = "Apache-2.0"
 dependencies = [
-    "moto[ec2,s3,iam,lambda]>=5.0",
+    "moto[server,ec2,s3,iam,lambda]>=5.0",
     "boto3>=1.35",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
     "websockets>=14.0",
-    "watchfiles>=1.0",
+    "anyio>=4.0",
     "pydantic>=2.10",
     "pyyaml>=6.0",
     "claude-agent-sdk>=0.1.39",
