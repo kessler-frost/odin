@@ -135,7 +135,7 @@ function InnerCanvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onS
 
       const statusMap: Record<string, Record<string, string>> = {};
       for (const r of (stateRes.resources ?? [])) {
-        statusMap[r.name] = { status: r.status, ...(r.metadata ?? {}) };
+        statusMap[r.name] = { status: r.status, ...(r.error ? { error: r.error } : {}), ...(r.metadata ?? {}) };
       }
 
       const rfNodes: Node[] = (canvasRes.nodes ?? []).map((n: any) => ({

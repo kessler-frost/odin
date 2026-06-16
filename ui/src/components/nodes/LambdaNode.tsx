@@ -28,7 +28,7 @@ export default function LambdaNode({ data, selected }: NodeProps) {
       <div className="flex items-center gap-2 px-3 h-10 border-b border-[rgba(255,221,0,0.3)] text-xs font-semibold overflow-hidden whitespace-nowrap">
         <span className="text-neon-yellow shrink-0">Lambda</span>
         <span className="truncate">{label}</span>
-        <StatusBadge status={status} />
+        <StatusBadge status={status} error={(data as { error?: string }).error} />
       </div>
       <div className="flex flex-col justify-center px-3 h-10 font-mono text-[10px] text-text-secondary leading-tight">
         <span>{runtime} &bull; {handler}</span>

@@ -13,10 +13,12 @@ const statusStyles: Record<string, string> = {
     'text-neon-red border-neon-red bg-[rgba(255,51,85,0.1)] shadow-[0_0_8px_rgba(255,51,85,0.15)]',
 };
 
-export default function StatusBadge({ status }: { status: string }) {
+export default function StatusBadge({ status, error }: { status: string; error?: string }) {
+  const showError = status === 'error' && Boolean(error);
   return (
     <span
-      className={`font-mono text-[9px] py-0.5 px-1.5 border uppercase tracking-[1px] ${statusStyles[status] ?? statusStyles.draft}`}
+      title={showError ? error : undefined}
+      className={`font-mono text-[9px] py-0.5 px-1.5 border uppercase tracking-[1px] ${showError ? 'cursor-help ' : ''}${statusStyles[status] ?? statusStyles.draft}`}
     >
       {status}
     </span>
