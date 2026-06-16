@@ -39,13 +39,14 @@ before anything touches real AWS.
 
 ## Install
 
-Each release ships a wheel with the UI already built in. Install the latest one:
+Install the latest release (UI bundled in, no `bun` needed):
 
 ```bash
-uv tool install "$(curl -fsSL https://api.github.com/repos/kessler-frost/odin/releases/latest | grep -o 'https://github.com/[^"]*\.whl' | head -1)"
+uv tool install git+https://github.com/kessler-frost/odin.git@latest
 ```
 
-That resolves the newest release's wheel and installs the `odin` CLI.
+`latest` is a branch CI fast-forwards on every release, so this always tracks the
+newest tagged version, not `main`.
 
 Or from a local clone, for development:
 
