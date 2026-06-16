@@ -26,6 +26,3 @@ docs/plans/
 
 # Claude Code machine-local settings (keep CLAUDE.md tracked)
 .claude/settings.local.json
-
-# README screenshot (tracked despite the *.png rule above)
-!assets/odin-canvas.png

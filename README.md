@@ -12,7 +12,7 @@ with what you draw, checking it against a local [Moto](https://github.com/getmot
 server. An AI agent does the translation from canvas to HCL, so you don't
 hand-write the Terraform.
 
-![Odin canvas](assets/odin-canvas.png)
+![Odin: drawing a VPC with an EC2 instance and a Lambda, then validating](assets/odin-canvas.gif)
 
 ## How it works
 
