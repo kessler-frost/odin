@@ -37,13 +37,28 @@ before anything touches real AWS.
 - [OpenTofu](https://opentofu.org/) (`tofu`)
 - Claude access for the agent (via the Claude Code CLI the Agent SDK wraps)
 
+## Install
+
+Install the `odin` CLI straight from GitHub:
+
+```bash
+uv tool install git+https://github.com/kessler-frost/odin.git
+```
+
+Or from a local clone (recommended while it's evolving, and what builds the canvas UI):
+
+```bash
+git clone https://github.com/kessler-frost/odin.git
+cd odin
+uv tool install --editable ".[dev]"
+cd ui && bun install
+```
+
 ## Quick start
 
 ```bash
-uv tool install --editable ".[dev]"
-
 odin start            # build the UI and serve on http://localhost:4200
-odin start --dev      # dev mode: Vite HMR + uvicorn reload
+odin start --dev      # Vite HMR + uvicorn reload
 ```
 
 ```
