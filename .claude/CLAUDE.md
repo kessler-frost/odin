@@ -1,12 +1,12 @@
-# Odin — AI-Controlled Local AWS Simulator
+# Odin — Visual AWS Infrastructure Canvas
 
 ## Overview
 A visual canvas for AWS. The agent (Claude Agent SDK) translates the canvas into one Terraform (OpenTofu) config; `tofu` validates/applies it against a local Moto server. Users draw, not code.
 
 ## Tech Stack
-- **Backend:** Python 3.12+ (uv), FastAPI + WebSocket, Moto, Lima, Nebula
+- **Backend:** Python 3.12+ (uv), FastAPI + WebSocket, Moto (server mode), OpenTofu (`tofu`). Lima/Nebula are parked for a future "Simulate" mode.
 - **UI:** React 19 + ReactFlow + Tailwind CSS v4 + Vite — high-contrast dark industrial aesthetic. Run from `ui/` with `bun install && bun run dev`.
-- **Agent:** Claude Agent SDK (`claude-agent-sdk` Python package) — wraps Claude Code CLI as subprocess, provides `ClaudeSDKClient` for multi-turn conversations, in-process MCP tools via `@tool` decorator. Uses Claude Sonnet 4.6 (`claude-sonnet-4-6`) for speed in agentic loops.
+- **Agent:** Claude Agent SDK (`claude-agent-sdk` Python package) — wraps Claude Code CLI as subprocess, provides `ClaudeSDKClient` for multi-turn conversations, in-process MCP tools via `@tool` decorator. Uses the Claude Code CLI's default model (no model pinned).
 
 ## Architecture
 Single Python monolith: `src/odin/` with modules for `agent/`, `simulator/`, `compute/`, `network/`, `mcp/`, `api/`, and `orchestrator.py`.
@@ -37,17 +37,20 @@ Single Python monolith: `src/odin/` with modules for `agent/`, `simulator/`, `co
 
 ## Key Files
 - `ROADMAP.md` — Project phases
-- `src/odin/orchestrator.py` — Central deploy/destroy logic
+- `src/odin/orchestrator.py` — Drives validate (`tofu plan`) / deploy (`tofu apply`) / destroy + per-node status
 - `src/odin/server.py` — FastAPI app factory
-- `src/odin/agent/prompt.py` — Agent system prompt, graph formatting, containment rules
-- `src/odin/api/canvas.py` — Canvas CRUD, validate endpoint, status management
+- `src/odin/agent/prompt.py` — Agent system prompt (canvas → Terraform HCL), graph formatting
+- `src/odin/terraform/` — `TofuRunner` (init/validate/plan/apply/destroy) + `provider.tf` generation
+- `src/odin/simulator/engine.py` — `moto_server` subprocess lifecycle + boto3 clients
+- `src/odin/process.py` — anyio `run()` for one-shot commands + `Daemon` for the Moto server
+- `src/odin/api/canvas.py` — Canvas CRUD + validate router + node→HCL helpers
 - `src/odin/api/ws.py` — WebSocket manager, persists events to `.odin/events.jsonl`
+- `src/odin/mcp/tools.py` — MCP tools (`validate_infrastructure`, `get_infrastructure_state`)
+- `.odin/tf/` — Agent-generated Terraform (`main.tf`) + Odin's `provider.tf` + tofu state
 - `.odin/registry.json` — Resource state manifest
 - `.odin/canvas.json` — Canvas layout state
-- `.odin/events.jsonl` — Persisted WS events (agent logs, status updates)
-- `.odin/infra/` — Agent-generated boto3 files (one per resource)
 - `.odin/agent_session_id` — Persistent agent session ID
-- `src/odin/__main__.py` — CLI entry point (start/stop/status/dev/clean)
+- `src/odin/__main__.py` — CLI entry point (start/stop/status/clean)
 - `ui/` — React 19 + ReactFlow v12 + Tailwind v4 frontend (the real UI)
 
 ## UI Design Rules
@@ -65,11 +68,11 @@ Single Python monolith: `src/odin/` with modules for `agent/`, `simulator/`, `co
 
 ## Status Management
 - **Canonical name format**: `{type}_{label}` (e.g., `vpc_prod-vpc`, `ec2_web-server`) used in registry, WS broadcasts, and MCP tool
-- **Validate flow**: pre-register as "validating" (persists to registry for refresh) → agent runs → MCP tool updates to validated/error → final pass restores previous status for nodes agent skipped
+- **Validate flow**: orchestrator marks nodes "validating" → agent rewrites `.odin/tf/main.tf` → `tofu validate`+`plan` → per-node status (validated/error) mapped from tofu diagnostics by resource address
 - **Spatial containment**: full bounding box inside container = "inside", partial overlap = "outside" (agent-interpreted from prompt, not computed in code)
 - **Node sizes**: `@xyflow/react` v12 NodeResizer sets `node.width/height` (not `node.style`). Save captures `n.width ?? n.style?.width`. Load merges with defaults: `{ ...defaultStyleForType, ...savedSize }`
 - **Agent output**: prefix symbols per line (`+` created, `~` updated, `.` skipped, `!` warning, `x` error, `-` deleted)
 - **Events**: persisted to `.odin/events.jsonl` (append-only JSONL), served via `/events`, BottomPanel loads on mount
 
-## Current Phase — Phase 4 (Resource Integration) Complete
-Moto-only validation working end-to-end. Single persistent agent with MCP tools (validate_file, get_infrastructure_state). Smart defaults disabled (experimental). Deploy buttons show "coming soon" until real infra (Lima/Nebula) is wired. All state in `.odin/` directory.
+## Current Phase — Terraform/OpenTofu pivot complete
+Agent writes one whole-canvas `main.tf`; validate = `tofu plan`, deploy = `tofu apply`, destroy = `tofu destroy`, all against a local `moto_server`. boto3 path removed. Lima/Nebula/nerdctl modules parked for a future "Simulate" mode. State in `.odin/`. Tests: `uv run pytest` (unit) + `uv run pytest -m tofu` (Moto+tofu).
