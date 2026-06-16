@@ -805,6 +805,9 @@ wheels = [
 ]
 
 [package.optional-dependencies]
+awslambda = [
+    { name = "docker" },
+]
 s3 = [
     { name = "py-partiql-parser" },
     { name = "pyyaml" },
@@ -853,7 +856,7 @@ dependencies = [
     { name = "boto3" },
     { name = "claude-agent-sdk" },
     { name = "fastapi" },
-    { name = "moto", extra = ["s3", "server"] },
+    { name = "moto", extra = ["awslambda", "s3", "server"] },
     { name = "pydantic" },
     { name = "pyyaml" },
     { name = "typer" },
@@ -874,7 +877,7 @@ requires-dist = [
     { name = "boto3", specifier = ">=1.35" },
     { name = "claude-agent-sdk", specifier = ">=0.1.39" },
     { name = "fastapi", specifier = ">=0.115" },
-    { name = "moto", extras = ["server", "ec2", "s3", "iam", "lambda"], specifier = ">=5.0" },
+    { name = "moto", extras = ["server", "ec2", "s3", "iam", "awslambda"], specifier = ">=5.0" },
     { name = "pydantic", specifier = ">=2.10" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
