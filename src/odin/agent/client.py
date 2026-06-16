@@ -42,16 +42,16 @@ class OdinAgent:
 
     Wraps ClaudeSDKClient to provide a high-level interface for sending canvas
     graphs to the agent and streaming back events as it generates infra code.
-    Registers MCP tools (validate_file, get_infrastructure_state) so the agent
-    can execute boto3 files against the moto simulator and query registry state.
+    Registers MCP tools (validate_infrastructure, get_infrastructure_state) so
+    the agent can write Terraform HCL and validate it against the Moto server.
     """
 
     def __init__(
         self,
-        infra_dir: str = ".odin/infra",
+        tf_dir: str = ".odin/tf",
         tools: OdinTools | None = None,
     ) -> None:
-        self._infra_dir = infra_dir
+        self._tf_dir = tf_dir
         self._tools = tools
         self._client: ClaudeSDKClient | None = None
         self._session_id: str | None = None
@@ -71,21 +71,21 @@ class OdinAgent:
         self._session_id = session_id
 
     def _create_mcp_server(self):
-        """Build an in-process MCP server with validate_file and get_infrastructure_state tools."""
+        """Build an in-process MCP server with validate_infrastructure + get_infrastructure_state."""
         tools_instance = self._tools
 
         @tool(
-            "validate_file",
-            "Execute a boto3 file against moto simulator and update registry.",
-            {"file_path": str},
+            "validate_infrastructure",
+            "Run tofu validate + plan on the current Terraform config against Moto and report errors.",
+            {},
         )
-        async def validate_file(args):
-            result = tools_instance.validate_file(args["file_path"])
+        async def validate_infrastructure(args):
+            result = await tools_instance.validate_infrastructure()
             return {"content": [{"type": "text", "text": str(result)}]}
 
         @tool(
             "get_infrastructure_state",
-            "Get all resources with status and metadata.",
+            "Get the current main.tf config and the registry's resource list.",
             {"service": str},
         )
         async def get_infrastructure_state(args):
@@ -96,7 +96,7 @@ class OdinAgent:
         return create_sdk_mcp_server(
             name="odin",
             version="1.0.0",
-            tools=[validate_file, get_infrastructure_state],
+            tools=[validate_infrastructure, get_infrastructure_state],
         )
 
     async def start(self) -> None:
@@ -109,14 +109,14 @@ class OdinAgent:
         if self._tools:
             mcp_servers["odin"] = self._create_mcp_server()
             allowed_mcp_tools = [
-                "mcp__odin__validate_file",
+                "mcp__odin__validate_infrastructure",
                 "mcp__odin__get_infrastructure_state",
             ]
 
         saved_session = self._load_session_id()
 
         options = ClaudeAgentOptions(
-            system_prompt=build_system_prompt(self._infra_dir),
+            system_prompt=build_system_prompt(self._tf_dir),
             permission_mode="acceptEdits",
             allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "Bash"]
             + allowed_mcp_tools,

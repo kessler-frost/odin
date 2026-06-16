@@ -1,4 +1,3 @@
-
 from odin.agent.prompt import (
     build_suggest_defaults_prompt,
     build_system_prompt,
@@ -7,46 +6,38 @@ from odin.agent.prompt import (
 from odin.api.canvas import CanvasGraph
 
 
-def test_build_system_prompt():
+def test_system_prompt_targets_terraform():
     prompt = build_system_prompt()
-    assert "boto3" in prompt
-    assert ".odin/infra/" in prompt
-    assert "one file per resource" in prompt.lower() or ".odin/infra/" in prompt
+    assert "Terraform" in prompt or "OpenTofu" in prompt
+    assert "main.tf" in prompt
+    assert ".odin/tf" in prompt
 
 
-def test_build_system_prompt_contains_workflow():
+def test_system_prompt_has_workflow_and_validate_tool():
     prompt = build_system_prompt()
     assert "## Workflow" in prompt
+    assert "validate_infrastructure" in prompt
 
 
-def test_build_system_prompt_contains_validate_file():
-    prompt = build_system_prompt()
-    assert "validate_file" in prompt
+def test_system_prompt_output_rules():
+    assert "ZERO text output" in build_system_prompt()
 
 
-def test_build_system_prompt_contains_output_rules():
-    prompt = build_system_prompt()
-    assert "ZERO text output" in prompt
-
-
-def test_build_validate_prompt_with_nodes():
+def test_validate_prompt_with_nodes():
     graph = CanvasGraph(
         nodes=[
             {
-                "id": "vpc-1",
-                "type": "vpc",
+                "id": "vpc-1", "type": "vpc",
                 "position": {"x": 40, "y": 40},
                 "size": {"width": 560, "height": 380},
                 "data": {"label": "prod-vpc", "cidr": "10.0.0.0/16"},
             },
             {
-                "id": "ec2-1",
-                "type": "ec2",
+                "id": "ec2-1", "type": "ec2",
                 "position": {"x": 80, "y": 160},
                 "data": {"label": "web-server", "instanceType": "t2.micro"},
             },
         ],
-        edges=[],
     )
     prompt = build_validate_prompt(graph)
     assert "prod-vpc" in prompt
@@ -54,7 +45,7 @@ def test_build_validate_prompt_with_nodes():
     assert "10.0.0.0/16" in prompt
 
 
-def test_build_validate_prompt_with_edges():
+def test_validate_prompt_with_edges():
     graph = CanvasGraph(
         nodes=[
             {"id": "ec2-1", "type": "ec2", "position": {"x": 0, "y": 0}, "data": {"label": "web"}},
@@ -68,41 +59,23 @@ def test_build_validate_prompt_with_edges():
     assert "edge" in prompt.lower() or "connection" in prompt.lower()
 
 
-def test_build_validate_prompt_empty_graph():
-    graph = CanvasGraph(nodes=[], edges=[])
-    prompt = build_validate_prompt(graph)
-    assert "no resources" in prompt.lower() or "empty" in prompt.lower() or "clean up" in prompt.lower()
+def test_validate_prompt_empty_graph():
+    assert "empty" in build_validate_prompt(CanvasGraph()).lower()
 
 
-def test_build_suggest_defaults_prompt_with_nodes():
+def test_suggest_defaults_prompt_with_nodes():
     graph = CanvasGraph(
         nodes=[
-            {
-                "id": "vpc-1",
-                "type": "vpc",
-                "position": {"x": 0, "y": 0},
-                "size": {"width": 600, "height": 400},
-                "data": {"label": "prod-vpc", "cidr": "10.0.0.0/16"},
-            },
-            {
-                "id": "ec2-1",
-                "type": "ec2",
-                "position": {"x": 100, "y": 100},
-                "data": {"label": "web-server", "instanceType": "t2.micro"},
-            },
+            {"id": "vpc-1", "type": "vpc", "position": {"x": 0, "y": 0}, "data": {"label": "prod-vpc"}},
         ],
-        edges=[],
     )
     prompt = build_suggest_defaults_prompt(graph)
     assert "JSON array" in prompt
-    assert "Smart default rules" in prompt
     assert "vpc-1" in prompt
-    assert "ec2-1" in prompt
     assert "prod-vpc" in prompt
 
 
-def test_build_suggest_defaults_prompt_empty_graph():
-    graph = CanvasGraph(nodes=[], edges=[])
-    prompt = build_suggest_defaults_prompt(graph)
+def test_suggest_defaults_prompt_empty_graph():
+    prompt = build_suggest_defaults_prompt(CanvasGraph())
     assert "empty" in prompt.lower()
     assert "no defaults" in prompt.lower()

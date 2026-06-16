@@ -38,9 +38,10 @@ packages = ["src/odin"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = ["-m", "not integration"]
+addopts = ["-m", "not integration and not tofu"]
 markers = [
-    "integration: opt-in tests that require real Lima VMs (deselected by default)",
+    "integration: needs real Lima VMs or the Claude agent — off by default",
+    "tofu: needs the tofu binary + a Moto server — off by default, run with `-m tofu`",
 ]
 
 [tool.ruff]

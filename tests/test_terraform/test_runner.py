@@ -9,7 +9,7 @@ import pytest
 from odin.process import Daemon
 from odin.terraform.runner import TofuRunner
 
-pytestmark = pytest.mark.integration
+pytestmark = pytest.mark.tofu
 
 PORT = 4299
 ENDPOINT = f"http://127.0.0.1:{PORT}"

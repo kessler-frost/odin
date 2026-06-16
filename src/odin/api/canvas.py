@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,39 @@ from pydantic import BaseModel
 class CanvasGraph(BaseModel):
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
+
+
+# Canvas node type → AWS / Terraform resource type.
+NODE_AWS_TYPE = {
+    "vpc": "aws_vpc",
+    "subnet": "aws_subnet",
+    "sg": "aws_security_group",
+    "ec2": "aws_instance",
+    "lambda": "aws_lambda_function",
+    "s3": "aws_s3_bucket",
+}
+
+
+def hcl_name(label: str) -> str:
+    """Sanitize a node label into a valid HCL resource name."""
+    name = re.sub(r"[^a-zA-Z0-9_]", "_", label).lower()
+    return name if name[:1].isalpha() else f"r_{name}"
+
+
+def node_reg_name(node: dict[str, Any]) -> tuple[str, str]:
+    """Return (label, registry_name) for a canvas node."""
+    label = node.get("data", {}).get("label", node.get("id", ""))
+    node_type = node.get("type", "")
+    return label, f"{node_type}_{label}"
+
+
+def node_tf_address(node: dict[str, Any]) -> str | None:
+    """The Terraform address for a node, e.g. `aws_vpc.prod_vpc`."""
+    label = node.get("data", {}).get("label", node.get("id", ""))
+    aws_type = NODE_AWS_TYPE.get(node.get("type", ""))
+    if not aws_type or not label:
+        return None
+    return f"{aws_type}.{hcl_name(label)}"
 
 
 def create_canvas_router(canvas_path: Path) -> APIRouter:
@@ -49,66 +83,16 @@ def create_suggest_defaults_router(agent, ws_manager=None) -> APIRouter:
     return router
 
 
-def _node_reg_name(node: dict[str, Any]) -> tuple[str, str]:
-    """Return (label, registry_name) for a canvas node."""
-    label = node.get("data", {}).get("label", node.get("id", ""))
-    node_type = node.get("type", "")
-    return label, f"{node_type}_{label}"
-
-
-def create_validate_router(agent, ws_manager=None, registry=None) -> APIRouter:
+def create_validate_router(orchestrator) -> APIRouter:
+    """Validate the canvas: the orchestrator drives the agent + tofu and
+    broadcasts per-node status; this router just collects the agent events."""
     router = APIRouter()
 
     @router.post("/validate")
     async def validate(graph: CanvasGraph) -> dict[str, Any]:
-        # Save previous status for each node, then mark as "validating"
-        prev_status: dict[str, str] = {}
-        node_reg_names: list[tuple[str, str]] = []
-        for node in graph.nodes:
-            label, reg_name = _node_reg_name(node)
-            node_reg_names.append((label, reg_name))
-            if label and registry:
-                entry = registry.get(reg_name)
-                prev_status[reg_name] = entry.status if entry else "draft"
-                if entry:
-                    registry.update_status(reg_name, "validating")
-                else:
-                    registry.register(reg_name, service=node.get("type", ""), file_path="")
-                    registry.update_status(reg_name, "validating")
-            if label and ws_manager:
-                await ws_manager.broadcast({"type": "resource_validating", "name": reg_name})
-
-        if not agent.is_running:
-            for label, reg_name in node_reg_names:
-                if label and registry:
-                    registry.update_status(reg_name, "error", error="Agent not connected")
-                if label and ws_manager:
-                    await ws_manager.broadcast({"type": "resource_error", "name": reg_name, "error": "Agent not connected"})
-            return {"status": "error", "error": "Agent not connected — start server outside Claude Code"}
-
         events: list[dict[str, Any]] = []
-        async for event in agent.validate(graph):
-            event_data = event.model_dump()
-            events.append(event_data)
-            if ws_manager:
-                await ws_manager.broadcast(event_data)
-
-        # Final pass: restore previous status for nodes the agent skipped
-        for label, reg_name in node_reg_names:
-            if not label:
-                continue
-            entry = registry.get(reg_name) if registry else None
-            if entry and entry.status == "validating":
-                restored = prev_status.get(reg_name, "draft")
-                registry.update_status(reg_name, restored)
-                entry = registry.get(reg_name)
-            if entry and ws_manager:
-                await ws_manager.broadcast({
-                    "type": f"resource_{entry.status}",
-                    "name": reg_name,
-                    **({"error": entry.error} if entry.error else {}),
-                })
-
+        async for event in orchestrator.validate(graph):
+            events.append(event.model_dump())
         return {"status": "completed", "events": events}
 
     return router

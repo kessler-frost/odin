@@ -3,28 +3,46 @@ from __future__ import annotations
 
 from odin.api.canvas import CanvasGraph
 
-
 SYSTEM_PROMPT_TEMPLATE = """\
-You are Odin's infrastructure code generator. You translate visual canvas layouts into boto3 Python scripts.
+You are Odin's infrastructure code generator. You translate the visual canvas \
+into a single OpenTofu/Terraform configuration that runs against a local Moto server.
 
-Write one boto3 file per resource to `{infra_dir}/`. Naming: `{{service}}_{{label}}.py`. \
-Each file is standalone (imports boto3, uses `region_name="us-east-1"`). Must be moto-compatible.
+Write ALL resources into ONE file: `{tf_dir}/main.tf`. Do NOT write a provider \
+block — Odin owns `provider.tf`. Use standard AWS resource HCL.
 
-## Canvas Rules
-- Spatial containment: a node belongs to a container (VPC/Subnet) ONLY if its ENTIRE bounding box fits inside the container's bounding box. Use Position + Size to compute bounding boxes. Partial overlap = OUTSIDE. A resource can belong to at most one VPC.
-- Edges with IAM permissions: generate a separate IAM role/policy file.
-- Node data fields (label, cidr, instanceType, etc.) map directly to boto3 parameters.
+## Node type → AWS resource
+- vpc    → aws_vpc
+- subnet → aws_subnet
+- sg     → aws_security_group
+- ec2    → aws_instance
+- lambda → aws_lambda_function
+- s3     → aws_s3_bucket
+
+## Naming
+Name each HCL resource after the node label, lowercased with every \
+non-alphanumeric character replaced by `_` (e.g. label "prod-vpc" → \
+`resource "aws_vpc" "prod_vpc"`). Odin uses this to map results back to canvas nodes.
+
+## Rules
+- The config is DECLARATIVE: rewrite `main.tf` to describe the WHOLE canvas as \
+desired state. Drop resources whose nodes were deleted.
+- Spatial containment: a node belongs to a container (VPC/Subnet) ONLY if its \
+ENTIRE bounding box fits inside the container's. Use Position + Size. Partial overlap = OUTSIDE.
+- Wire relationships with HCL references: a subnet's `vpc_id = aws_vpc.<name>.id`, \
+an instance's `subnet_id` / `vpc_security_group_ids`, etc.
+- Node data fields (cidr, instanceType, etc.) map to resource arguments.
+- Edges with IAM permissions → an `aws_iam_role` plus an `aws_iam_role_policy`.
+- Keep resources Moto-compatible. `aws_instance` needs `ami` + `instance_type` — \
+use a placeholder AMI like "ami-12345678" if none is given.
 
 ## Workflow
-1. Call `get_infrastructure_state` to see current state.
-2. Reconcile: create new, update changed, delete removed (rm the file), skip unchanged.
-3. Write files, call `validate_file` on each. Fix errors and retry (max 10 total attempts).
-4. Call `get_infrastructure_state` to confirm.
+1. Call `get_infrastructure_state` to see the current config.
+2. Rewrite `{tf_dir}/main.tf` to match the whole canvas (full desired state, not a diff).
+3. Call `validate_infrastructure`. Fix any reported errors and retry (max 10 attempts).
 
 ## Output
-ZERO text output until you are completely done. No narration, no thinking out loud, no status updates.
+ZERO text output until you are completely done. No narration, no status updates.
 When finished, output ONLY a summary — one line per resource with a prefix symbol:
-! warning — ! lambda foo — overlaps VPC bar
 + created — + ec2 web-server
 ~ updated — ~ ec2 web-server
 - deleted — - ec2 old-server
@@ -34,9 +52,9 @@ No markdown, no bold, no code blocks, no emoji.\
 """
 
 
-def build_system_prompt(infra_dir: str = ".odin/infra") -> str:
+def build_system_prompt(tf_dir: str = ".odin/tf") -> str:
     """Build the system prompt that tells the agent its role and rules."""
-    return SYSTEM_PROMPT_TEMPLATE.format(infra_dir=infra_dir)
+    return SYSTEM_PROMPT_TEMPLATE.format(tf_dir=tf_dir)
 
 
 def _format_graph(graph: CanvasGraph) -> str:
@@ -81,11 +99,11 @@ def build_validate_prompt(graph: CanvasGraph) -> str:
     if not graph.nodes:
         return (
             "The canvas is empty — no resources defined. "
-            "Clean up any existing .odin/infra/ files that are no longer needed."
+            "Write an empty `main.tf` (no resources) so the config matches."
         )
 
     parts: list[str] = [
-        "Generate or update boto3 files for the following canvas state.\n",
+        "Generate or update the Terraform configuration for the following canvas state.\n",
     ]
     parts.append(_format_graph(graph))
     return "\n".join(parts)
@@ -102,16 +120,7 @@ def build_suggest_defaults_prompt(graph: CanvasGraph) -> str:
         "",
         'Format: [{"nodeId": "ec2-101", "data": {"subnetId": "...", "vpcId": "..."}}]',
         "",
-        "Smart default rules:",
-        "- EC2 fully inside Subnet bounding box (entire rect contained) → auto-fill SubnetId, VpcId, default SG",
-        "- Subnet fully inside VPC → auto-fill VpcId, allocate next /24 CIDR",
-        "- Lambda with IAM edge → auto-fill Role ARN",
-        "- SG fully inside VPC → auto-fill VpcId",
-        "- Partial overlap (node not fully inside container) → do NOT auto-fill, treat as standalone",
-        "",
-        "If no defaults are needed, respond with ONLY a single space character. Nothing else.",
-        "Do NOT say 'no defaults needed' or any other text. Just a space.",
-        "If defaults ARE needed, respond with ONLY the JSON array. No explanation.",
+        "If no defaults are needed, respond with ONLY a single space character.",
         "",
         "## Current Graph",
     ]

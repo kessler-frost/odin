@@ -25,6 +25,14 @@ jobs:
         run: uv run ruff check .
       - name: Test
         run: uv run pytest -q
+      - name: Install OpenTofu
+        if: matrix.python-version == '3.12'
+        uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_wrapper: false
+      - name: Test (Moto + tofu)
+        if: matrix.python-version == '3.12'
+        run: uv run pytest -m tofu -q
 
   frontend:
     name: Frontend (typecheck + build)

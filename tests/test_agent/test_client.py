@@ -5,14 +5,14 @@ from odin.agent.client import AgentEvent, OdinAgent
 
 def test_odin_agent_instantiates():
     """OdinAgent can be created without starting."""
-    agent = OdinAgent(infra_dir="infra")
+    agent = OdinAgent(tf_dir="tf")
     assert agent is not None
     assert not agent.is_running
 
 
 def test_odin_agent_instantiates_with_tools():
     """OdinAgent accepts optional tools parameter."""
-    agent = OdinAgent(infra_dir="infra", tools=None)
+    agent = OdinAgent(tf_dir="tf", tools=None)
     assert agent is not None
     assert agent._tools is None
 
