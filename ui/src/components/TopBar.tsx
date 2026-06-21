@@ -89,7 +89,21 @@ export default function TopBar({ wsConnected, onValidate, onSimulate, onSimulate
         disabled={validating}
         className={`font-mono text-xs py-1.5 px-4 border border-neon-blue bg-bg-tertiary text-neon-blue cursor-pointer uppercase tracking-[1px] transition-all duration-200 hover:bg-[rgba(51,153,255,0.1)] hover:shadow-[0_0_12px_rgba(51,153,255,0.2)] ${validating ? 'opacity-50 cursor-wait' : ''}`}
       >
-        {validating ? 'Validating...' : 'Validate All'}
+        {validating ? 'Validating...' : 'Validate'}
+      </button>
+      <button
+        onClick={() => onSimulate?.()}
+        title="Run the canvas for real as local Lima VMs + containers (heavy)"
+        className="font-mono text-xs py-1.5 px-4 border border-neon-purple bg-bg-tertiary text-neon-purple cursor-pointer uppercase tracking-[1px] transition-all duration-200 hover:bg-[rgba(170,85,255,0.1)] hover:shadow-[0_0_12px_rgba(170,85,255,0.2)]"
+      >
+        Simulate
+      </button>
+      <button
+        onClick={() => onSimulateDestroy?.()}
+        title="Tear down everything Simulate created (VMs + containers)"
+        className="font-mono text-xs py-1.5 px-4 border border-neon-red bg-bg-tertiary text-neon-red cursor-pointer uppercase tracking-[1px] transition-all duration-200 hover:bg-[rgba(255,51,85,0.1)] hover:shadow-[0_0_12px_rgba(255,51,85,0.2)]"
+      >
+        Destroy
       </button>
       <div className="relative" ref={menuRef}>
         <button
@@ -99,21 +113,7 @@ export default function TopBar({ wsConnected, onValidate, onSimulate, onSimulate
           &middot;&middot;&middot;
         </button>
         {menuOpen && (
-          <div className="absolute right-0 top-full mt-1 bg-bg-secondary border border-border-bright z-50 min-w-[200px] shadow-lg">
-            <button
-              onClick={() => { onSimulate?.(); setMenuOpen(false); }}
-              className="w-full text-left font-mono text-xs py-2 px-4 text-neon-purple hover:bg-bg-tertiary transition-colors uppercase tracking-[1px]"
-              title="Run for real as local Lima VMs + Nebula (heavy)"
-            >
-              Simulate (Real VMs)
-            </button>
-            <button
-              onClick={() => { onSimulateDestroy?.(); setMenuOpen(false); }}
-              className="w-full text-left font-mono text-xs py-2 px-4 text-text-secondary hover:bg-bg-tertiary hover:text-neon-purple transition-colors uppercase tracking-[1px]"
-            >
-              Tear Down Simulation
-            </button>
-            <div className="border-t border-border"></div>
+          <div className="absolute right-0 top-full mt-1 bg-bg-secondary border border-border-bright z-50 min-w-[160px] shadow-lg">
             <button
               onClick={() => { onReset?.(); setMenuOpen(false); }}
               className="w-full text-left font-mono text-xs py-2 px-4 text-text-secondary hover:bg-bg-tertiary hover:text-neon-red transition-colors uppercase tracking-[1px]"

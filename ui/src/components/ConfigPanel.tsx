@@ -322,7 +322,7 @@ function MultiSelectView({ nodes, onCollapse, onValidate }: { nodes: Node[]; onC
           onClick={() => onValidate?.()}
           className="w-full font-mono text-xs py-1.5 px-4 border border-neon-blue bg-bg-tertiary text-neon-blue cursor-pointer uppercase tracking-[1px] transition-all duration-200 hover:bg-[rgba(51,153,255,0.1)] hover:shadow-[0_0_12px_rgba(51,153,255,0.2)]"
         >
-          Validate All
+          Validate
         </button>
       </div>
     </div>
