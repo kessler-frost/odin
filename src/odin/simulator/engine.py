@@ -10,7 +10,7 @@ import boto3
 
 from odin.process import Daemon
 
-SUPPORTED_SERVICES = frozenset({"ec2", "s3", "iam", "lambda", "sts"})
+SUPPORTED_SERVICES = frozenset({"ec2", "s3", "iam", "lambda", "sts", "dynamodb"})
 DEFAULT_PORT = 4202
 
 

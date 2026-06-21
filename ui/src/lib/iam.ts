@@ -2,6 +2,7 @@ export const iamActionsForTarget: Record<string, string[]> = {
   s3: ['s3:GetObject', 's3:PutObject', 's3:DeleteObject', 's3:ListBucket', 's3:GetBucketLocation', 's3:*'],
   lambda: ['lambda:InvokeFunction', 'lambda:GetFunction', 'lambda:ListFunctions', 'lambda:*'],
   ec2: ['ec2:DescribeInstances', 'ec2:StartInstances', 'ec2:StopInstances', 'ec2:*'],
+  dynamodb: ['dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:Query', 'dynamodb:Scan', 'dynamodb:DeleteItem', 'dynamodb:*'],
 };
 
 export const defaultPermissions: Record<string, string[]> = {
@@ -35,6 +36,8 @@ const edgeTypesForPair: Record<string, string[]> = {
   [pairKey('lambda', 's3')]: ['iam'],
   [pairKey('ec2', 'ec2')]: ['network'],
   [pairKey('lambda', 'lambda')]: ['iam'],
+  [pairKey('lambda', 'dynamodb')]: ['iam'],
+  [pairKey('ec2', 'dynamodb')]: ['iam'],
 };
 
 export function detectEdgeTypes(nodeTypeA: string, nodeTypeB: string): string[] {

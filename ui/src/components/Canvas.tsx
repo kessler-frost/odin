@@ -25,6 +25,7 @@ import Ec2Node from './nodes/Ec2Node';
 import LambdaNode from './nodes/LambdaNode';
 import S3Node from './nodes/S3Node';
 import SgNode from './nodes/SgNode';
+import DynamodbNode from './nodes/DynamodbNode';
 import { computeTypes, defaultPermissions, detectDefaultEdgeType, edgeStyle, edgeTypes } from '../lib/iam';
 
 const nodeTypes: NodeTypes = {
@@ -34,6 +35,7 @@ const nodeTypes: NodeTypes = {
   lambda: LambdaNode,
   s3: S3Node,
   sg: SgNode,
+  dynamodb: DynamodbNode,
 };
 
 const nodeTypeMap: Record<string, string> = {
@@ -43,6 +45,7 @@ const nodeTypeMap: Record<string, string> = {
   FN: 'lambda',
   S3: 's3',
   SG: 'sg',
+  DDB: 'dynamodb',
 };
 
 const defaultDataForType: Record<string, Record<string, string>> = {
@@ -52,6 +55,7 @@ const defaultDataForType: Record<string, Record<string, string>> = {
   lambda: { label: 'new-function', runtime: 'python3.12', handler: 'handler.main', memory: '128MB', timeout: '30s timeout', status: 'draft' },
   s3: { label: 'new-bucket', arn: '', status: 'draft' },
   sg: { label: 'new-sg', groupId: '', vpcId: '', inboundRules: '', outboundRules: '', status: 'draft' },
+  dynamodb: { label: 'new-table', hashKey: 'id', billingMode: 'PAY_PER_REQUEST', arn: '', status: 'draft' },
 };
 
 const defaultStyleForType: Record<string, React.CSSProperties> = {
@@ -61,6 +65,7 @@ const defaultStyleForType: Record<string, React.CSSProperties> = {
   lambda: { width: 220 },
   s3: { width: 200 },
   sg: { width: 220 },
+  dynamodb: { width: 200 },
 };
 
 
@@ -71,6 +76,7 @@ const zIndexForType: Record<string, number> = {
   lambda: 2,
   s3: 2,
   sg: 2,
+  dynamodb: 2,
 };
 
 const API = '';

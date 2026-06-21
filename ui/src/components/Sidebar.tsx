@@ -5,6 +5,7 @@ const resources = [
   { abbr: 'EC2', label: 'EC2 Instance', sublabel: 'Virtual machine', color: 'neon-orange' },
   { abbr: 'FN', label: 'Lambda', sublabel: 'Serverless function', color: 'neon-yellow' },
   { abbr: 'S3', label: 'S3 Bucket', sublabel: 'Object storage', color: 'neon-green' },
+  { abbr: 'DDB', label: 'DynamoDB', sublabel: 'NoSQL table', color: 'neon-cyan' },
 ] as const;
 
 const iconColors: Record<string, string> = {
@@ -14,6 +15,7 @@ const iconColors: Record<string, string> = {
   'neon-orange': 'text-neon-orange border-neon-orange',
   'neon-yellow': 'text-neon-yellow border-neon-yellow',
   'neon-green': 'text-neon-green border-neon-green',
+  'neon-cyan': 'text-neon-cyan border-neon-cyan',
 };
 
 function onDragStart(event: React.DragEvent, abbr: string) {

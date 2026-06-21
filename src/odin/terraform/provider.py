@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 # Services the canvas can target. Moto serves them all on one endpoint.
-SERVICES = ("ec2", "s3", "iam", "lambda", "sts")
+SERVICES = ("ec2", "s3", "iam", "lambda", "sts", "dynamodb")
 
 
 def render_provider(endpoint: str, region: str = "us-east-1") -> str:

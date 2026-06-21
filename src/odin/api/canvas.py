@@ -22,6 +22,7 @@ NODE_AWS_TYPE = {
     "ec2": "aws_instance",
     "lambda": "aws_lambda_function",
     "s3": "aws_s3_bucket",
+    "dynamodb": "aws_dynamodb_table",
 }
 
 

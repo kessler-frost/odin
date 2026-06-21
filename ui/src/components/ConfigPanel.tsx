@@ -21,6 +21,7 @@ const typeConfig: Record<string, { label: string; neonColor: string; neonBg: str
   lambda: { label: 'Lambda', neonColor: 'text-neon-yellow', neonBg: 'bg-[rgba(255,221,0,0.1)] border-neon-yellow' },
   s3: { label: 'S3', neonColor: 'text-neon-green', neonBg: 'bg-[rgba(0,255,136,0.1)] border-neon-green' },
   sg: { label: 'Security Group', neonColor: 'text-neon-red', neonBg: 'bg-[rgba(255,51,85,0.1)] border-neon-red' },
+  dynamodb: { label: 'DynamoDB', neonColor: 'text-neon-cyan', neonBg: 'bg-[rgba(34,211,238,0.1)] border-neon-cyan' },
 };
 
 type FieldDef = { key: string; label: string; editable?: boolean; select?: string[] };
@@ -72,6 +73,14 @@ const fieldsForType: Record<string, FieldDef[]> = {
     { key: 'vpcId', label: 'VPC ID' },
     { key: 'inboundRules', label: 'Inbound Rules', editable: true },
     { key: 'outboundRules', label: 'Outbound Rules', editable: true },
+    { key: 'status', label: 'Status' },
+    { key: 'error', label: 'Error' },
+  ],
+  dynamodb: [
+    { key: 'label', label: 'Name', editable: true },
+    { key: 'hashKey', label: 'Partition Key', editable: true },
+    { key: 'billingMode', label: 'Billing Mode', editable: true, select: ['PAY_PER_REQUEST', 'PROVISIONED'] },
+    { key: 'arn', label: 'ARN' },
     { key: 'status', label: 'Status' },
     { key: 'error', label: 'Error' },
   ],
