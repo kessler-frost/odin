@@ -75,8 +75,27 @@ odin clean        Reset local state (odin clean --all wipes everything)
 ## Status
 
 The canvas, the Terraform generation, and local simulation against Moto work end
-to end. A mode that runs resources for real (Lima VMs, containers, Nebula
-networking) is planned. See [ROADMAP.md](ROADMAP.md).
+to end. **Simulate mode** also runs resources for real — Lima VMs for EC2, Nebula
+overlays for VPCs, and containers for stateful services (S3 → RustFS, etc.). See
+[ROADMAP.md](ROADMAP.md).
+
+## Acknowledgements
+
+Odin stands on the shoulders of open source giants — most of what makes it work
+is other people's excellent work, and a lot of the thanks belongs to them:
+
+- **[OpenTofu](https://opentofu.org/)** — the Terraform engine Odin drives
+- **[Moto](https://github.com/getmoto/moto)** — the local AWS API simulator
+- **[Lima](https://lima-vm.io/)** + **[nerdctl](https://github.com/containerd/nerdctl)** — VMs and containers for Simulate mode
+- **[Nebula](https://github.com/slackhq/nebula)** — the overlay network for simulated VPCs
+- **[RustFS](https://rustfs.com/)** — the Apache-2.0 S3 server for real object storage
+- **[ElasticMQ](https://github.com/softwaremill/elasticmq)** + **[PostgreSQL](https://www.postgresql.org/)** — real SQS / RDS backends in Simulate
+- **[FastAPI](https://fastapi.tiangolo.com/)**, **[Pydantic](https://pydantic.dev/)**, **[boto3](https://github.com/boto/boto3)** — the backend
+- **[React](https://react.dev/)** + **[React Flow](https://reactflow.dev/)** + **[Tailwind CSS](https://tailwindcss.com/)** + **[Vite](https://vitejs.dev/)** — the canvas UI
+- **[uv](https://github.com/astral-sh/uv)** + **[bun](https://bun.sh/)** — the toolchain
+- the **[Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python)** — the agent that writes the Terraform
+
+Thank you to every one of these projects and their maintainers. 🙏
 
 ## License
 

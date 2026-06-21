@@ -32,14 +32,17 @@ _DEFAULT_SIZES = {
 
 # Stateful AWS services → real container images for Simulate mode. Moto serves
 # the AWS API for the validate/deploy path; Simulate runs these for real — e.g.
-# S3 → RustFS (Apache-2.0), ElastiCache → Valkey. Images run via nerdctl in the
-# host VM (native on Linux; via the Lima host VM on macOS). No new host deps.
+# S3 → RustFS. Images run via nerdctl in the host VM (native on Linux; via the
+# Lima host VM on macOS). No new host deps.
+#
+# Every image here is permissively licensed: RustFS (Apache-2.0), ElasticMQ
+# (Apache-2.0), Postgres (PostgreSQL License, an MIT-style permissive license).
+# We intentionally do NOT use amazon/dynamodb-local (proprietary) — Moto already
+# covers the DynamoDB API.
 SERVICE_CONTAINERS: dict[str, dict] = {
     "s3": {"image": "rustfs/rustfs:latest", "env": {"RUSTFS_ACCESS_KEY": "odin", "RUSTFS_SECRET_KEY": "odinpass"}},
     "rds": {"image": "postgres:16", "env": {"POSTGRES_PASSWORD": "odin"}},
-    "dynamodb": {"image": "amazon/dynamodb-local:latest", "env": {}},
     "sqs": {"image": "softwaremill/elasticmq-native:latest", "env": {}},
-    "elasticache": {"image": "valkey/valkey:8", "env": {}},
 }
 
 

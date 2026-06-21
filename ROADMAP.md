@@ -92,14 +92,17 @@ the top-bar `...` overflow runs the canvas for real via the (formerly parked)
 Lima/Nebula modules — a Lima VM per EC2, a Nebula CA/overlay per VPC, and **real
 containers (via `nerdctl`) for stateful services**:
 
-| Node | Container | Node | Container |
-|------|-----------|------|-----------|
-| S3 | RustFS *(Apache-2.0)* | RDS | Postgres |
-| DynamoDB | dynamodb-local | SQS | ElasticMQ |
-| ElastiCache | Valkey | Lambda | its runtime image |
+| Node | Container | License |
+|------|-----------|---------|
+| S3 | RustFS | Apache-2.0 |
+| RDS | Postgres | PostgreSQL (MIT-style) |
+| SQS | ElasticMQ | Apache-2.0 |
+| Lambda | its runtime image | — |
 
 `nerdctl` is native on a Linux prod host and runs via the Lima host VM on macOS,
-so this adds **no new host dependency** — RustFS et al. are just images.
+so this adds **no new host dependency** — RustFS et al. are just images. All
+images are permissively licensed; DynamoDB stays on Moto (no permissive
+DynamoDB-local image exists — `amazon/dynamodb-local` is proprietary).
 "Tear Down Simulation" cleans up VMs + containers. Verified end-to-end (EC2 → a
 real, SSH-able Ubuntu VM; S3→RustFS container orchestration unit-tested).
 
