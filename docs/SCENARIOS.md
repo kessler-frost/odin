@@ -16,18 +16,29 @@ session transcript for the exact Playwright helpers.
 
 ## Results
 
+All 10 pass: every node reaches `validated` through the live agent, built via the
+real UI. Run 2026-06-21.
+
 | # | Scenario | Services exercised | Result |
 |---|----------|--------------------|--------|
-| S1 | Serverless REST API | API Gateway, Lambda, DynamoDB, CloudWatch Logs, IAM (edges) | ✅ validated (agent also created `new-function-role`) |
-| S2 | 3-tier web app | VPC, Subnet, Security Group, EC2, RDS, ALB, S3 | ⏳ |
-| S3 | Event-driven data pipeline | S3, Lambda, SQS, DynamoDB, SNS, EventBridge, IAM | ⏳ |
-| S4 | Container microservices | VPC, Subnet, ECS, ALB, RDS, Secrets Manager, S3 | ⏳ |
-| S5 | Secure API + storage | API Gateway, Lambda, S3, KMS, Secrets Manager, Route 53, Logs | ⏳ |
-| S6 | Multi-AZ HA web tier | VPC, 2×Subnet, 2×EC2, ALB, RDS, Security Group | ⏳ |
-| S7 | Static site + dynamic API | S3, Route 53, API Gateway, Lambda, DynamoDB | ⏳ |
-| S8 | Streaming analytics | Kinesis, Lambda, DynamoDB, S3, SNS, CloudWatch Logs | ⏳ |
-| S9 | Scheduled secure batch | EventBridge, Lambda, RDS, Secrets Manager, KMS, SQS, Logs | ⏳ |
-| S10 | Full VPC networking stack | VPC, Internet Gateway, 2×Subnet, EC2, Elastic IP, ALB, Security Group, Route 53 | ⏳ |
+| S1 | Serverless REST API | API Gateway, Lambda, DynamoDB, CloudWatch Logs, IAM (edges) | ✅ 4/4 (agent also created `new-function-role`) |
+| S2 | 3-tier web app | VPC, Subnet, Security Group, EC2, RDS, ALB, S3 | ✅ 7/7 |
+| S3 | Event-driven data pipeline | S3, 2×Lambda, SQS, DynamoDB, SNS, EventBridge, IAM | ✅ 7/7 |
+| S4 | Container microservices | VPC, Subnet, ECS, ALB, RDS, Secrets Manager, S3 | ✅ 7/7 |
+| S5 | Secure API + storage | API Gateway, Lambda, S3, KMS, Secrets Manager, Route 53, Logs | ✅ 7/7 |
+| S6 | Multi-AZ HA web tier | VPC, 2×Subnet, 2×EC2, ALB, RDS, Security Group | ✅ 8/8 |
+| S7 | Static site + dynamic API | S3, Route 53, API Gateway, Lambda, DynamoDB | ✅ 5/5 |
+| S8 | Streaming analytics | Kinesis, Lambda, DynamoDB, S3, SNS, CloudWatch Logs | ✅ 6/6 |
+| S9 | Scheduled secure batch | EventBridge, Lambda, RDS, Secrets Manager, KMS, SQS, Logs | ✅ 7/7 |
+| S10 | Full VPC networking stack | VPC, Internet Gateway, 2×Subnet, EC2, Elastic IP, ALB, Security Group, Route 53 | ✅ 9/9 |
+
+### Bugs found & fixed during this run
+
+- **Duplicate node labels collided.** Dropping two nodes of one type (e.g. S3's
+  two Lambdas, S6's two Subnets/EC2s) gave both the same default label, and the
+  registry keys on `{type}_{label}` — so they silently merged into one entry.
+  Fixed by auto-suffixing the default label (`new-function-2`, …) on drop/add
+  (`ui/src/components/Canvas.tsx`). S3 and S6 then validated all nodes distinctly.
 
 ## Scenario details
 
