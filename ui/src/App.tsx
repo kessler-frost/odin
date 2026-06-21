@@ -64,11 +64,6 @@ export default function App() {
     }).catch(() => {});
   }, [selectedNodes]);
 
-  const handleDeploy = useCallback(async () => {
-    // Apply the validated canvas to the local Moto simulator (tofu apply).
-    await fetch('/deploy', { method: 'POST' }).catch(() => {});
-  }, []);
-
   const handleSimulate = useCallback(async () => {
     // Real local execution: Lima VMs (EC2) + Nebula (VPC) + containers (Lambda).
     const canvas = await fetch('/canvas').then(r => r.json()).catch(() => null);
@@ -116,11 +111,6 @@ export default function App() {
   //   }, 500);
   // }, []);
 
-  const handleDestroy = useCallback(async () => {
-    // Tear down what was applied to Moto (tofu destroy → back to draft).
-    await fetch('/destroy-all', { method: 'POST' }).catch(() => {});
-  }, []);
-
   const cycleBottom = useCallback(() => {
     const order: BottomState[] = ['default', 'half', 'collapsed'];
     setBottomState(prev => order[(order.indexOf(prev) + 1) % order.length]);
@@ -141,7 +131,7 @@ export default function App() {
       }}
     >
       {/* Row 1: TopBar */}
-      <div className="col-span-full"><TopBar wsConnected={wsConnected} onValidate={handleValidate} onDeploy={handleDeploy} onDestroy={handleDestroy} onSimulate={handleSimulate} onSimulateDestroy={handleSimulateDestroy} onReset={() => { resetDraftsRef.current?.(); setClearLogSignal(s => s + 1); }} /></div>
+      <div className="col-span-full"><TopBar wsConnected={wsConnected} onValidate={handleValidate} onSimulate={handleSimulate} onSimulateDestroy={handleSimulateDestroy} onReset={() => { resetDraftsRef.current?.(); setClearLogSignal(s => s + 1); }} /></div>
 
       {/* Row 2: Sidebar + Canvas + Config */}
       <div className="overflow-hidden">
@@ -185,8 +175,6 @@ export default function App() {
           onEdgeUpdate={handleEdgeUpdate}
           onCollapse={() => setConfigOpen(false)}
           onValidate={handleValidateSelected}
-          onDeploy={handleDeploy}
-          onDestroy={handleDestroy}
         />
       </div>
 

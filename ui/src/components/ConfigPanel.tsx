@@ -11,8 +11,6 @@ interface ConfigPanelProps {
   onEdgeUpdate?: (edgeId: string, data: Record<string, unknown>) => void;
   onCollapse?: () => void;
   onValidate?: () => void;
-  onDeploy?: () => void;
-  onDestroy?: () => void;
 }
 
 const typeConfig: Record<string, { label: string; neonColor: string; neonBg: string }> = {
@@ -257,7 +255,7 @@ function EdgeConfigView({ edge, onEdgeUpdate, onCollapse }: { edge: Edge; onEdge
   );
 }
 
-function MultiSelectView({ nodes, onCollapse, onValidate, onDeploy, onDestroy }: { nodes: Node[]; onCollapse?: () => void; onValidate?: () => void; onDeploy?: () => void; onDestroy?: () => void }) {
+function MultiSelectView({ nodes, onCollapse, onValidate }: { nodes: Node[]; onCollapse?: () => void; onValidate?: () => void }) {
   const panelBase = "bg-bg-secondary border-l border-border-bright p-0 overflow-y-auto h-full";
 
   const typeCounts: Record<string, number> = {};
@@ -326,24 +324,12 @@ function MultiSelectView({ nodes, onCollapse, onValidate, onDeploy, onDestroy }:
         >
           Validate All
         </button>
-        <button
-          onClick={() => onDeploy?.()}
-          className="w-full font-mono text-xs py-1.5 px-4 border border-neon-green bg-bg-tertiary text-neon-green cursor-pointer uppercase tracking-[1px] transition-all duration-200 hover:bg-[rgba(0,255,136,0.1)] hover:shadow-[0_0_12px_rgba(0,255,136,0.2)]"
-        >
-          Deploy All
-        </button>
-        <button
-          onClick={() => onDestroy?.()}
-          className="w-full font-mono text-xs py-1.5 px-4 border border-neon-red bg-bg-tertiary text-neon-red cursor-pointer uppercase tracking-[1px] transition-all duration-200 hover:bg-[rgba(255,51,85,0.1)] hover:shadow-[0_0_12px_rgba(255,51,85,0.2)]"
-        >
-          Destroy All
-        </button>
       </div>
     </div>
   );
 }
 
-export default function ConfigPanel({ nodes, selectedEdge, onNodeUpdate, onEdgeUpdate, onCollapse, onValidate, onDeploy, onDestroy }: ConfigPanelProps) {
+export default function ConfigPanel({ nodes, selectedEdge, onNodeUpdate, onEdgeUpdate, onCollapse, onValidate }: ConfigPanelProps) {
   const [localData, setLocalData] = useState<Record<string, string>>({});
 
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -366,7 +352,7 @@ export default function ConfigPanel({ nodes, selectedEdge, onNodeUpdate, onEdgeU
 
   // Multi-select view
   if (nodes.length > 1) {
-    return <MultiSelectView nodes={nodes} onCollapse={onCollapse} onValidate={onValidate} onDeploy={onDeploy} onDestroy={onDestroy} />;
+    return <MultiSelectView nodes={nodes} onCollapse={onCollapse} onValidate={onValidate} />;
   }
 
   // No node selected -- empty state
@@ -442,50 +428,12 @@ export default function ConfigPanel({ nodes, selectedEdge, onNodeUpdate, onEdgeU
 
       {/* Actions */}
       <div className="px-4 py-3 border-t border-border space-y-2">
-        {(status === 'draft' || status === 'error') && (
-          <button
-            onClick={() => onValidate?.()}
-            className="w-full font-mono text-xs py-1.5 px-4 border border-neon-blue bg-bg-tertiary text-neon-blue cursor-pointer uppercase tracking-[1px] transition-all duration-200 hover:bg-[rgba(51,153,255,0.1)] hover:shadow-[0_0_12px_rgba(51,153,255,0.2)]"
-          >
-            Validate
-          </button>
-        )}
-        {status === 'validated' && (
-          <>
-            <button
-              onClick={() => onValidate?.()}
-              className="w-full font-mono text-xs py-1.5 px-4 border border-neon-blue bg-bg-tertiary text-neon-blue cursor-pointer uppercase tracking-[1px] transition-all duration-200 hover:bg-[rgba(51,153,255,0.1)] hover:shadow-[0_0_12px_rgba(51,153,255,0.2)]"
-            >
-              Re-validate
-            </button>
-            <button
-              onClick={() => onDeploy?.()}
-              className="w-full font-mono text-xs py-1.5 px-4 border border-neon-green bg-bg-tertiary text-neon-green cursor-pointer uppercase tracking-[1px] transition-all duration-200 hover:bg-[rgba(0,255,136,0.1)] hover:shadow-[0_0_12px_rgba(0,255,136,0.2)]"
-            >
-              Deploy
-            </button>
-          </>
-        )}
-        {status === 'live' && (
-          <button
-            onClick={() => onDestroy?.()}
-            className="w-full font-mono text-xs py-1.5 px-4 border border-neon-red bg-bg-tertiary text-neon-red cursor-pointer uppercase tracking-[1px] transition-all duration-200 hover:bg-[rgba(255,51,85,0.1)] hover:shadow-[0_0_12px_rgba(255,51,85,0.2)]"
-          >
-            Destroy
-          </button>
-        )}
-        {(status === 'deploying' || status === 'destroying') && (
-          <button
-            disabled
-            className="w-full font-mono text-xs py-1.5 px-4 border border-border-bright bg-bg-tertiary text-text-muted cursor-wait uppercase tracking-[1px] opacity-50 flex items-center justify-center gap-2"
-          >
-            <svg className="animate-spin h-3 w-3" viewBox="0 0 24 24" fill="none">
-              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-            </svg>
-            {status === 'deploying' ? 'Deploying...' : 'Destroying...'}
-          </button>
-        )}
+        <button
+          onClick={() => onValidate?.()}
+          className="w-full font-mono text-xs py-1.5 px-4 border border-neon-blue bg-bg-tertiary text-neon-blue cursor-pointer uppercase tracking-[1px] transition-all duration-200 hover:bg-[rgba(51,153,255,0.1)] hover:shadow-[0_0_12px_rgba(51,153,255,0.2)]"
+        >
+          {status === 'validated' ? 'Re-validate' : 'Validate'}
+        </button>
       </div>
     </div>
   );

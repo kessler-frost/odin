@@ -17,14 +17,12 @@ function Led({ state }: { state: LedState }) {
 interface TopBarProps {
   wsConnected?: boolean;
   onValidate?: () => Promise<void>;
-  onDeploy?: () => Promise<void>;
-  onDestroy?: () => Promise<void>;
   onSimulate?: () => Promise<void>;
   onSimulateDestroy?: () => Promise<void>;
   onReset?: () => void;
 }
 
-export default function TopBar({ wsConnected, onValidate, onDeploy, onDestroy, onSimulate, onSimulateDestroy, onReset }: TopBarProps) {
+export default function TopBar({ wsConnected, onValidate, onSimulate, onSimulateDestroy, onReset }: TopBarProps) {
   const [validating, setValidating] = useState(false);
   const [backendUp, setBackendUp] = useState(false);
   const [agentUp, setAgentUp] = useState(false);
@@ -61,14 +59,6 @@ export default function TopBar({ wsConnected, onValidate, onDeploy, onDestroy, o
     setValidating(false);
   };
 
-  const handleDeploy = async () => {
-    await onDeploy?.();
-  };
-
-  const handleDestroy = async () => {
-    await onDestroy?.();
-  };
-
   const backendLed: LedState = backendUp ? 'green' : 'red';
   const wsLed: LedState = wsConnected ? 'green' : backendUp ? 'yellow' : 'red';
   const agentLed: LedState = agentUp ? 'green' : backendUp ? 'yellow' : 'red';
@@ -100,18 +90,6 @@ export default function TopBar({ wsConnected, onValidate, onDeploy, onDestroy, o
         className={`font-mono text-xs py-1.5 px-4 border border-neon-blue bg-bg-tertiary text-neon-blue cursor-pointer uppercase tracking-[1px] transition-all duration-200 hover:bg-[rgba(51,153,255,0.1)] hover:shadow-[0_0_12px_rgba(51,153,255,0.2)] ${validating ? 'opacity-50 cursor-wait' : ''}`}
       >
         {validating ? 'Validating...' : 'Validate All'}
-      </button>
-      <button
-        onClick={handleDeploy}
-        className="font-mono text-xs py-1.5 px-4 border border-neon-green bg-bg-tertiary text-neon-green cursor-pointer uppercase tracking-[1px] transition-all duration-200 hover:bg-[rgba(0,255,136,0.1)] hover:shadow-[0_0_12px_rgba(0,255,136,0.2)]"
-      >
-        Deploy All
-      </button>
-      <button
-        onClick={handleDestroy}
-        className="font-mono text-xs py-1.5 px-4 border border-neon-red bg-bg-tertiary text-neon-red cursor-pointer uppercase tracking-[1px] transition-all duration-200 hover:bg-[rgba(255,51,85,0.1)] hover:shadow-[0_0_12px_rgba(255,51,85,0.2)]"
-      >
-        Destroy All
       </button>
       <div className="relative" ref={menuRef}>
         <button
