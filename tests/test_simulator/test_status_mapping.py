@@ -49,6 +49,22 @@ async def _run(registry, tmp_path, graph, *, validate_res=None, plan_res=None):
     return registry
 
 
+class StubAgent:
+    is_running = True
+
+    async def validate(self, graph):
+        return
+        yield
+
+
+async def _validate(registry, tmp_path, graph, **kw):
+    runner = StubRunner(tmp_path, **kw)
+    orch = Orchestrator(engine=None, registry=registry, runner=runner, agent=StubAgent())
+    async for _ in orch.validate(graph):
+        pass
+    return registry
+
+
 async def test_prefix_address_does_not_taint_sibling(registry, tmp_path):
     """A failing `aws_instance.web2` must NOT mark `aws_instance.web` as error."""
     graph = CanvasGraph(nodes=[
@@ -157,3 +173,29 @@ async def test_deploy_unapplied_resource_left_validated(registry, tmp_path):
     deployed = await _deploy(registry, tmp_path, [("ec2_web", "ec2")], apply, state=[])
     assert registry.get("ec2_web").status == "validated"
     assert deployed == []
+
+
+# --- registry pruning on re-validate ---
+
+async def test_validate_prunes_removed_nodes(registry, tmp_path):
+    """Re-validating a canvas with a node removed drops its registry entry."""
+    g_a = CanvasGraph(nodes=[
+        {"id": "1", "type": "vpc", "data": {"label": "v"}},
+        {"id": "2", "type": "s3", "data": {"label": "b"}},
+    ])
+    await _validate(registry, tmp_path, g_a)
+    assert registry.get("vpc_v") is not None
+    assert registry.get("s3_b") is not None
+
+    g_b = CanvasGraph(nodes=[{"id": "1", "type": "vpc", "data": {"label": "v"}}])
+    await _validate(registry, tmp_path, g_b)
+    assert registry.get("vpc_v") is not None
+    assert registry.get("s3_b") is None  # pruned
+
+
+async def test_validate_empty_canvas_prunes_all(registry, tmp_path):
+    g = CanvasGraph(nodes=[{"id": "1", "type": "vpc", "data": {"label": "v"}}])
+    await _validate(registry, tmp_path, g)
+    assert registry.get("vpc_v") is not None
+    await _validate(registry, tmp_path, CanvasGraph(nodes=[]))
+    assert registry.list_all() == []

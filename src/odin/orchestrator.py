@@ -81,6 +81,7 @@ class Orchestrator:
     async def validate(self, graph: CanvasGraph) -> AsyncIterator[AgentEvent]:
         """Mark nodes validating, run the agent, then plan and map status back."""
         reg_names = self._register_validating(graph)
+        await self._prune_stale(reg_names)
         for reg_name in reg_names:
             await self._broadcast({"type": "resource_validating", "name": reg_name})
 
@@ -97,6 +98,18 @@ class Orchestrator:
             yield event
 
         await self._finalize(graph, reg_names)
+
+    async def _prune_stale(self, current: list[str]) -> None:
+        """Drop registry entries for canvas nodes that no longer exist.
+
+        The canvas is the source of truth; without this, deleting a node leaves
+        a phantom resource in the registry (and `/state`) until a full reset.
+        """
+        keep = set(current)
+        for entry in self.registry.list_all():
+            if entry.name not in keep:
+                self.registry.remove(entry.name)
+                await self._broadcast({"type": "resource_removed", "name": entry.name})
 
     def _register_validating(self, graph: CanvasGraph) -> list[str]:
         reg_names: list[str] = []
