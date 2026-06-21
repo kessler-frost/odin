@@ -12,12 +12,20 @@ from fastapi.staticfiles import StaticFiles
 
 from odin.agent.client import OdinAgent
 from odin.api.canvas import create_canvas_router, create_validate_router
-from odin.api.resources import create_deploy_router, create_resource_router
+from odin.api.resources import (
+    create_deploy_router,
+    create_resource_router,
+    create_simulate_router,
+)
 from odin.api.ws import ConnectionManager
+from odin.compute.container_manager import ContainerManager
+from odin.compute.vm_manager import VmManager
 from odin.mcp.tools import OdinTools
+from odin.network.nebula_manager import NebulaManager
 from odin.orchestrator import Orchestrator
 from odin.simulator.engine import MotoEngine
 from odin.simulator.registry import ResourceRegistry
+from odin.simulator.runner import SimulationRunner
 from odin.terraform.runner import TofuRunner
 
 ODIN_DIR = Path(".odin")
@@ -45,8 +53,11 @@ def create_app(
     runner = TofuRunner(TF_DIR, _engine.endpoint_url)
     tools = OdinTools(runner, _registry, ws_manager=ws_manager)
     agent = OdinAgent(tf_dir=str(TF_DIR), tools=tools)
+    simulation = SimulationRunner(
+        VmManager(), ContainerManager(), NebulaManager(), _registry, ws_manager=ws_manager
+    )
     orchestrator = Orchestrator(
-        _engine, _registry, runner, ws_manager=ws_manager, agent=agent
+        _engine, _registry, runner, ws_manager=ws_manager, agent=agent, simulation=simulation
     )
 
     @asynccontextmanager
@@ -68,6 +79,7 @@ def create_app(
         create_resource_router(tools, orchestrator=orchestrator, agent=agent, ws_manager=ws_manager)
     )
     app.include_router(create_deploy_router(orchestrator))
+    app.include_router(create_simulate_router(orchestrator))
     app.include_router(create_canvas_router(CANVAS_PATH))
     app.include_router(create_validate_router(orchestrator))
 

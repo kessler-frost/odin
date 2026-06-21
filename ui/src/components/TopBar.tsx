@@ -19,10 +19,12 @@ interface TopBarProps {
   onValidate?: () => Promise<void>;
   onDeploy?: () => Promise<void>;
   onDestroy?: () => Promise<void>;
+  onSimulate?: () => Promise<void>;
+  onSimulateDestroy?: () => Promise<void>;
   onReset?: () => void;
 }
 
-export default function TopBar({ wsConnected, onValidate, onDeploy, onDestroy, onReset }: TopBarProps) {
+export default function TopBar({ wsConnected, onValidate, onDeploy, onDestroy, onSimulate, onSimulateDestroy, onReset }: TopBarProps) {
   const [validating, setValidating] = useState(false);
   const [backendUp, setBackendUp] = useState(false);
   const [agentUp, setAgentUp] = useState(false);
@@ -119,7 +121,21 @@ export default function TopBar({ wsConnected, onValidate, onDeploy, onDestroy, o
           &middot;&middot;&middot;
         </button>
         {menuOpen && (
-          <div className="absolute right-0 top-full mt-1 bg-bg-secondary border border-border-bright z-50 min-w-[160px] shadow-lg">
+          <div className="absolute right-0 top-full mt-1 bg-bg-secondary border border-border-bright z-50 min-w-[200px] shadow-lg">
+            <button
+              onClick={() => { onSimulate?.(); setMenuOpen(false); }}
+              className="w-full text-left font-mono text-xs py-2 px-4 text-neon-purple hover:bg-bg-tertiary transition-colors uppercase tracking-[1px]"
+              title="Run for real as local Lima VMs + Nebula (heavy)"
+            >
+              Simulate (Real VMs)
+            </button>
+            <button
+              onClick={() => { onSimulateDestroy?.(); setMenuOpen(false); }}
+              className="w-full text-left font-mono text-xs py-2 px-4 text-text-secondary hover:bg-bg-tertiary hover:text-neon-purple transition-colors uppercase tracking-[1px]"
+            >
+              Tear Down Simulation
+            </button>
+            <div className="border-t border-border"></div>
             <button
               onClick={() => { onReset?.(); setMenuOpen(false); }}
               className="w-full text-left font-mono text-xs py-2 px-4 text-text-secondary hover:bg-bg-tertiary hover:text-neon-red transition-colors uppercase tracking-[1px]"

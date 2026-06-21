@@ -78,3 +78,20 @@ def create_deploy_router(orchestrator: Orchestrator) -> APIRouter:
         return {"destroyed": await orchestrator.destroy_all()}
 
     return router
+
+
+def create_simulate_router(orchestrator: Orchestrator) -> APIRouter:
+    """Real local execution (Lima VMs + Nebula), separate from the Moto deploy."""
+    from odin.api.canvas import CanvasGraph
+
+    router = APIRouter()
+
+    @router.post("/simulate")
+    async def simulate(graph: CanvasGraph):
+        return await orchestrator.simulate(graph)
+
+    @router.post("/simulate-destroy")
+    async def simulate_destroy():
+        return await orchestrator.simulate_destroy()
+
+    return router

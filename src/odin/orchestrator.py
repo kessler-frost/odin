@@ -19,6 +19,7 @@ from odin.api.canvas import (
 from odin.api.ws import ConnectionManager
 from odin.simulator.engine import MotoEngine
 from odin.simulator.registry import ResourceRegistry
+from odin.simulator.runner import SimulationRunner
 from odin.terraform.runner import PlanResult, TofuRunner
 
 
@@ -62,12 +63,14 @@ class Orchestrator:
         runner: TofuRunner,
         ws_manager: ConnectionManager | None = None,
         agent: OdinAgent | None = None,
+        simulation: SimulationRunner | None = None,
     ) -> None:
         self.engine = engine
         self.registry = registry
         self._runner = runner
         self._ws = ws_manager
         self._agent = agent
+        self._simulation = simulation
 
     def start(self) -> None:
         """Start the Moto server and reset tofu state to match its empty world."""
@@ -226,6 +229,18 @@ class Orchestrator:
                 await self._broadcast({"type": "resource_draft", "name": entry.name})
                 destroyed.append(entry.name)
         return destroyed
+
+    async def simulate(self, graph: CanvasGraph) -> dict:
+        """Run the canvas for real (Lima VMs + Nebula), not against Moto."""
+        if self._simulation is None:
+            return {"simulated": [], "error": "Simulation runner not available"}
+        return await self._simulation.simulate(graph)
+
+    async def simulate_destroy(self) -> dict:
+        """Tear down everything the last simulate created."""
+        if self._simulation is None:
+            return {"destroyed": []}
+        return await self._simulation.cleanup()
 
     async def _broadcast(self, message: dict) -> None:
         if self._ws:

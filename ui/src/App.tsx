@@ -65,7 +65,26 @@ export default function App() {
   }, [selectedNodes]);
 
   const handleDeploy = useCallback(async () => {
-    alert('Real deployment coming soon — validate to test your infrastructure');
+    // Apply the validated canvas to the local Moto simulator (tofu apply).
+    await fetch('/deploy', { method: 'POST' }).catch(() => {});
+  }, []);
+
+  const handleSimulate = useCallback(async () => {
+    // Real local execution: Lima VMs (EC2) + Nebula (VPC) + containers (Lambda).
+    const canvas = await fetch('/canvas').then(r => r.json()).catch(() => null);
+    if (!canvas) return;
+    for (const node of (canvas.nodes ?? [])) {
+      statusUpdateFnRef.current?.(node.data?.label ?? node.id, 'simulating');
+    }
+    await fetch('/simulate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(canvas),
+    }).catch(() => {});
+  }, []);
+
+  const handleSimulateDestroy = useCallback(async () => {
+    await fetch('/simulate-destroy', { method: 'POST' }).catch(() => {});
   }, []);
 
   const handleResourceStatus = useCallback((name: string, status: string, error?: string) => {
@@ -98,7 +117,8 @@ export default function App() {
   // }, []);
 
   const handleDestroy = useCallback(async () => {
-    alert('Real destruction coming soon — requires deployment first');
+    // Tear down what was applied to Moto (tofu destroy → back to draft).
+    await fetch('/destroy-all', { method: 'POST' }).catch(() => {});
   }, []);
 
   const cycleBottom = useCallback(() => {
@@ -121,7 +141,7 @@ export default function App() {
       }}
     >
       {/* Row 1: TopBar */}
-      <div className="col-span-full"><TopBar wsConnected={wsConnected} onValidate={handleValidate} onDeploy={handleDeploy} onDestroy={handleDestroy} onReset={() => { resetDraftsRef.current?.(); setClearLogSignal(s => s + 1); }} /></div>
+      <div className="col-span-full"><TopBar wsConnected={wsConnected} onValidate={handleValidate} onDeploy={handleDeploy} onDestroy={handleDestroy} onSimulate={handleSimulate} onSimulateDestroy={handleSimulateDestroy} onReset={() => { resetDraftsRef.current?.(); setClearLogSignal(s => s + 1); }} /></div>
 
       {/* Row 2: Sidebar + Canvas + Config */}
       <div className="overflow-hidden">

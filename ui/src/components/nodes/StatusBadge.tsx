@@ -11,6 +11,10 @@ const statusStyles: Record<string, string> = {
     'text-neon-green border-neon-green bg-[rgba(0,255,136,0.1)] shadow-[0_0_8px_rgba(0,255,136,0.15)]',
   error:
     'text-neon-red border-neon-red bg-[rgba(255,51,85,0.1)] shadow-[0_0_8px_rgba(255,51,85,0.15)]',
+  simulating:
+    'text-neon-purple border-neon-purple bg-[rgba(170,85,255,0.1)] animate-[pulse_1.5s_infinite]',
+  simulated:
+    'text-neon-purple border-neon-purple bg-[rgba(170,85,255,0.1)] shadow-[0_0_8px_rgba(170,85,255,0.15)]',
 };
 
 export default function StatusBadge({ status, error }: { status: string; error?: string }) {
