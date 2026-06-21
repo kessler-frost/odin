@@ -184,13 +184,15 @@ class SimulationRunner:
 
     async def _wait_for_nerdctl(self, host: str, timeout: float = 360.0) -> None:
         """start_vm returns at "Running", but cloud-init is still installing
-        nerdctl — wait for it before running containers."""
+        nerdctl + starting containerd — wait until `nerdctl info` reports a
+        Server Version (i.e. the containerd socket is up) before running
+        containers."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if "nerdctl" in (await self._vm.exec_in_vm(host, "nerdctl --version")).lower():
+            if "server version" in (await self._vm.exec_in_vm(host, "sudo nerdctl info")).lower():
                 return
             await asyncio.sleep(5)
-        raise RuntimeError(f"nerdctl not ready in VM {host} within {timeout}s")
+        raise RuntimeError(f"containerd not ready in VM {host} within {timeout}s")
 
     async def _run_lambda_container(
         self, node: dict, vpcs: list[dict], overlays: dict[str, VpcOverlay], state: dict
