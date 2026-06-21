@@ -54,6 +54,14 @@ real UI (run 2026-06-21).
   subnet prompt hint requiring distinct, non-overlapping CIDRs across AZs
   (`src/odin/resources.py`) — the generated HCL is now correct regardless of
   apply. S6/S10 get `10.0.1.0/24` + `10.0.2.0/24`.
+- **Simulate/Destroy did nothing in dev.** The Vite dev proxy didn't forward
+  `/simulate` or `/simulate-destroy`, so the buttons' requests stopped at Vite
+  (:4200) and never reached the backend. Fixed the proxy (`ui/vite.config.js`).
+  After the fix, verified the full lifecycle through the UI: EC2 → real Lima VM
+  (Running, SSH-able), S3 → real RustFS container, Destroy → clean teardown
+  (0 VMs, 0 orphaned processes). The earlier "containerd not ready in 360s" was
+  contention from orphaned `limactl hostagent` processes left by repeated
+  attempts — with a clean process state containerd is ready in seconds.
 
 ## Scenario details
 
