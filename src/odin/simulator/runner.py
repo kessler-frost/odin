@@ -8,7 +8,9 @@ canvas geometry, since the agent isn't in this path.
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from pathlib import Path
 
 from odin.api.canvas import CanvasGraph, node_reg_name
@@ -17,7 +19,7 @@ from odin.compute.cloud_init import generate_cloud_init
 from odin.compute.container_manager import ContainerManager
 from odin.compute.lima_yaml import generate_lima_yaml
 from odin.compute.models import get_instance_type
-from odin.compute.vm_manager import VmManager
+from odin.compute.vm_manager import ODIN_VM_PREFIX, VmManager
 from odin.network.models import VpcOverlay
 from odin.network.nebula_manager import NebulaManager
 from odin.network.vpc_mapper import LIGHTHOUSE_FIREWALL
@@ -175,9 +177,20 @@ class SimulationRunner:
         yaml = generate_lima_yaml(get_instance_type("t2.small"), cloud_init_script=cloud_init, shared_network=False)
         await self._vm.create_vm_from_yaml(host, yaml)
         await self._vm.start_vm(host)
+        await self._wait_for_nerdctl(host)
         state["hosts"][vpc_name] = host
         state["vms"].append(host)
         return host
+
+    async def _wait_for_nerdctl(self, host: str, timeout: float = 360.0) -> None:
+        """start_vm returns at "Running", but cloud-init is still installing
+        nerdctl — wait for it before running containers."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if "nerdctl" in (await self._vm.exec_in_vm(host, "nerdctl --version")).lower():
+                return
+            await asyncio.sleep(5)
+        raise RuntimeError(f"nerdctl not ready in VM {host} within {timeout}s")
 
     async def _run_lambda_container(
         self, node: dict, vpcs: list[dict], overlays: dict[str, VpcOverlay], state: dict
@@ -187,7 +200,7 @@ class SimulationRunner:
         host = await self._ensure_host_vm(vpc_name, overlays, state)
         runtime = node.get("data", {}).get("runtime", "python3.12").replace("python", "python:")
         await self._container.run_container(
-            vm_name=host,
+            vm_name=f"{ODIN_VM_PREFIX}{host}",  # ContainerManager wants the full lima name
             name=reg,
             image=f"{runtime}-slim",
             env={"HANDLER": node.get("data", {}).get("handler", "index.handler")},
@@ -204,7 +217,7 @@ class SimulationRunner:
         vpc_name = self._vpc_of(node, vpcs) or ""
         host = await self._ensure_host_vm(vpc_name, overlays, state)
         await self._container.run_container(
-            vm_name=host, name=reg, image=spec["image"], env=spec.get("env", {}), volumes=[],
+            vm_name=f"{ODIN_VM_PREFIX}{host}", name=reg, image=spec["image"], env=spec.get("env", {}), volumes=[],
         )
         return host, reg
 
@@ -239,8 +252,8 @@ class SimulationRunner:
             return {"destroyed": []}
         state = json.loads(self._state_path.read_text())
         for c in state.get("containers", []):
-            await self._container.stop_container(c["vm"], c["name"])
-            await self._container.remove_container(c["vm"], c["name"])
+            await self._container.stop_container(f"{ODIN_VM_PREFIX}{c['vm']}", c["name"])
+            await self._container.remove_container(f"{ODIN_VM_PREFIX}{c['vm']}", c["name"])
         destroyed: list[str] = []
         for vm_name in state.get("vms", []):
             await self._vm.delete_vm(vm_name)  # --force stops + deletes in one step

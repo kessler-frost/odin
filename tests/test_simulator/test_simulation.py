@@ -32,6 +32,7 @@ def _build(tmp_path, registry):
     vm.start_vm = AsyncMock()
     vm.stop_vm = AsyncMock()
     vm.delete_vm = AsyncMock()
+    vm.exec_in_vm = AsyncMock(return_value="nerdctl version 2.0.0")  # host-VM readiness
 
     nebula = MagicMock()
     nebula.create_ca = AsyncMock()
