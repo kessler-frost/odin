@@ -28,7 +28,13 @@ class ResourceSpec:
 
 RESOURCE_SPECS: tuple[ResourceSpec, ...] = (
     ResourceSpec("vpc", "aws_vpc", "ec2"),
-    ResourceSpec("subnet", "aws_subnet", "ec2"),
+    ResourceSpec(
+        "subnet", "aws_subnet", "ec2",
+        '`aws_subnet` needs `vpc_id` and a `cidr_block` within the VPC range. When '
+        'a VPC has multiple subnets, give each a DISTINCT, non-overlapping '
+        '`cidr_block` (e.g. 10.0.1.0/24, 10.0.2.0/24, …) — identical CIDRs fail at '
+        'apply — and spread them across different `availability_zone`s.',
+    ),
     ResourceSpec("sg", "aws_security_group", "ec2"),
     ResourceSpec(
         "ec2", "aws_instance", "ec2",
