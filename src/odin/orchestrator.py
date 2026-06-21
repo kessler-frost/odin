@@ -23,6 +23,16 @@ def _error_text(result: PlanResult) -> str | None:
     return "; ".join(s for s in summaries if s) or None
 
 
+def _addr_matches(diag_addr: str, node_addr: str) -> bool:
+    """Whether a tofu diagnostic address names a node's resource.
+
+    Matches the exact resource address or an indexed instance of it
+    (count/for_each), e.g. `aws_instance.web[0]`. A plain prefix is NOT a
+    match, so a failing `aws_instance.web2` never taints `aws_instance.web`.
+    """
+    return diag_addr == node_addr or diag_addr.startswith(node_addr + "[")
+
+
 class Orchestrator:
     """Wires the agent, registry, Moto engine, and Terraform runner together."""
 
@@ -89,24 +99,36 @@ class Orchestrator:
         planned = await self._runner.plan() if validated.ok else None
         diagnostics = validated.diagnostics + (planned.diagnostics if planned else [])
         errors = [d for d in diagnostics if d.get("severity") == "error"]
-        text = "; ".join(d.get("summary", "") for d in errors) or None
 
         addr_to_reg = {
             node_tf_address(node): reg
             for node, reg in ((n, node_reg_name(n)[1]) for n in graph.nodes)
             if node_tf_address(node)
         }
-        errored = {
-            reg
-            for d in errors
-            for addr, reg in addr_to_reg.items()
-            if d.get("address", "").startswith(addr)
-        }
-        if errors and not errored:
-            errored = set(reg_names)
+
+        # Attribute each error to the node(s) it names, collecting per-node
+        # messages. Errors we can't attribute to any node are "unmatched".
+        per_node: dict[str, list[str]] = {}
+        unmatched: list[str] = []
+        for d in errors:
+            summary = d.get("summary", "") or "validation error"
+            matched = [
+                reg for addr, reg in addr_to_reg.items()
+                if _addr_matches(d.get("address", ""), addr)
+            ]
+            for reg in matched:
+                per_node.setdefault(reg, []).append(summary)
+            if not matched:
+                unmatched.append(summary)
+
+        # If errors exist but none could be attributed, the config is broken as
+        # a whole — blame every node with the unattributed messages.
+        global_msgs = unmatched if (errors and not per_node) else []
 
         for reg_name in reg_names:
-            if reg_name in errored:
+            messages = per_node.get(reg_name, []) + global_msgs
+            if messages:
+                text = "; ".join(dict.fromkeys(messages))
                 self.registry.update_status(reg_name, "error", error=text)
                 await self._broadcast({"type": "resource_error", "name": reg_name, "error": text})
             else:
