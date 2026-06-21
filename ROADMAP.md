@@ -74,21 +74,18 @@ Resource definitions are centralized: backend in `src/odin/resources.py`
 (`RESOURCE_SPECS` → node→AWS type map, provider endpoints, agent prompt hints);
 frontend in `ui/src/lib/catalog.ts` (node, config fields, sidebar group, IAM).
 
-**Done (22 resource types), each verified deploying to Moto:**
+**Done (25 resource types), each verified deploying to Moto:**
 VPC, Subnet, Security Group, EC2, Lambda, S3, DynamoDB, SQS, SNS, Kinesis,
 RDS, Secrets Manager, KMS, IAM Role, Route 53, API Gateway, EFS, SSM Parameter,
-ECS, CloudWatch Log Group, EventBridge, EBS Volume.
+ECS, CloudWatch Log Group, EventBridge, EBS Volume, Elastic IP, Internet
+Gateway, ALB (application/network load balancer).
 
-**Still to add:**
-- [ ] ELB / ALB (load balancer + target group — needs subnets/SG wiring)
-- [ ] Step Functions (state machine — needs role + definition)
-- [ ] CloudFront (distribution)
-- [ ] CloudWatch Alarm
-- [ ] Internet Gateway / NAT Gateway / Route Table
-
-**Dropped — not cleanly Moto-simulatable:**
-- ElastiCache: Moto never transitions the cluster out of "creating", so
-  `tofu apply` hangs on the status wait.
+**Dropped — not cleanly Moto-simulatable via the OpenTofu v6 AWS provider:**
+- ElastiCache — Moto leaves the cluster "creating" forever (apply hangs).
+- NAT Gateway — Moto never reports the gateway "deleted" (destroy hangs).
+- Step Functions — Moto's `stepfunctions` create never completes (apply hangs).
+- CloudWatch Alarm — Moto returns 404 for `PutMetricAlarm`.
+- CloudFront — same InProgress-status hang class + very heavy HCL; skipped.
 
 **Networking polish:**
 - [ ] Real S3 storage backend (RustFS/MinIO) for object persistence
