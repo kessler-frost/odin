@@ -130,7 +130,9 @@ class SimulationRunner:
             get_instance_type(instance_type),
             cloud_init_script=cloud_init,
             install_nebula=bool(nebula_kwargs),
-            shared_network=True,
+            # Shared (vmnet) networking is only needed for the Nebula mesh, and
+            # it requires socket_vmnet. A standalone VM uses user-mode networking.
+            shared_network=bool(nebula_kwargs),
         )
         await self._vm.create_vm_from_yaml(reg, yaml)
         await self._vm.start_vm(reg)
@@ -201,8 +203,7 @@ class SimulationRunner:
             await self._container.remove_container(c["vm"], c["name"])
         destroyed: list[str] = []
         for vm_name in state.get("vms", []):
-            await self._vm.stop_vm(vm_name)
-            await self._vm.delete_vm(vm_name)
+            await self._vm.delete_vm(vm_name)  # --force stops + deletes in one step
             destroyed.append(vm_name)
         for entry in self._registry.list_all():
             if entry.status in ("simulating", "simulated"):

@@ -86,8 +86,7 @@ async def test_cleanup_tears_everything_down(registry, tmp_path):
     await runner.simulate(graph)
     res = await runner.cleanup()
     assert "ec2_web" in res["destroyed"]
-    vm.stop_vm.assert_awaited_with("ec2_web")
-    vm.delete_vm.assert_awaited_with("ec2_web")
+    vm.delete_vm.assert_awaited_with("ec2_web")  # --force stops + deletes
     assert registry.get("ec2_web").status == "draft"
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+import time
 from pathlib import Path
 
 from odin.compute.cloud_init import generate_cloud_init
@@ -29,10 +30,13 @@ class VmManager:
         keys_dir.mkdir(parents=True, exist_ok=True)
         private_key = keys_dir / "id_ed25519"
         public_key = keys_dir / "id_ed25519.pub"
-        subprocess.run(
-            ["ssh-keygen", "-t", "ed25519", "-f", str(private_key), "-N", "", "-q"],
-            check=True,
-        )
+        # Reuse an existing key — ssh-keygen errors rather than overwrite, so a
+        # second simulate of the same node would otherwise fail.
+        if not private_key.exists():
+            subprocess.run(
+                ["ssh-keygen", "-t", "ed25519", "-f", str(private_key), "-N", "", "-q"],
+                check=True,
+            )
         return private_key, public_key
 
     async def _run(self, *args: str) -> tuple[str, str, int]:
@@ -72,13 +76,30 @@ class VmManager:
 
         return VmInfo(name=vm_name, status="Created")
 
-    async def start_vm(self, name: str) -> None:
+    async def start_vm(self, name: str, timeout: float = 240.0) -> None:
         vm_name = self._vm_name(name)
-        stdout, stderr, returncode = await self._run(
+        # Lima 2.x's `limactl start` can block on a guest-agent readiness probe
+        # long after the VM is actually Running (and SSH-able). Launch it
+        # detached, return once the VM reports Running, then kill the lingering
+        # CLI so its instance lock is released for stop/delete.
+        proc = await asyncio.create_subprocess_exec(
             "limactl", "start", "--tty=false", vm_name,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         )
-        if returncode != 0:
-            raise RuntimeError(f"limactl start failed: {stderr}")
+        deadline = time.monotonic() + timeout
+        try:
+            while time.monotonic() < deadline:
+                info = await self.get_vm(name)
+                if info and info.status == "Running":
+                    return
+                if proc.returncode is not None and proc.returncode != 0:
+                    raise RuntimeError(f"limactl start failed for {vm_name}")
+                await asyncio.sleep(2)
+            raise RuntimeError(f"VM {vm_name} did not reach Running within {timeout}s")
+        finally:
+            if proc.returncode is None:
+                proc.kill()
+                await proc.wait()
 
     async def stop_vm(self, name: str) -> None:
         vm_name = self._vm_name(name)
@@ -93,7 +114,9 @@ class VmManager:
         stdout, stderr, returncode = await self._run(
             "limactl", "delete", "--force", vm_name,
         )
-        if returncode != 0:
+        # Idempotent: a delete that "fails" only because the VM is already gone
+        # is success — so re-running teardown over stale state doesn't error.
+        if returncode != 0 and await self.get_vm(name) is not None:
             raise RuntimeError(f"limactl delete failed: {stderr}")
 
     async def list_vms(self) -> list[VmInfo]:

@@ -67,7 +67,12 @@ async def test_stop_vm(mock_exec, vm_manager):
 
 @patch("odin.compute.vm_manager.asyncio.create_subprocess_exec")
 async def test_start_vm(mock_exec, vm_manager):
-    mock_exec.return_value = _mock_process()
+    # start_vm launches `limactl start` then polls `limactl list` for Running.
+    running = json.dumps({
+        "name": "odin-ec2-web", "status": "Running", "sshLocalPort": 60022,
+        "cpus": 1, "memory": 1073741824, "disk": 10737418240,
+    })
+    mock_exec.return_value = _mock_process(stdout=running)
     await vm_manager.start_vm("ec2-web")
 
     call_args = mock_exec.call_args_list[0]

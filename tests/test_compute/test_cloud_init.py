@@ -25,7 +25,10 @@ def test_cloud_init_without_ssh_key():
 def test_cloud_init_is_valid_bash():
     script = generate_cloud_init(hostname="ec2-test")
     assert script.startswith("#!/bin/bash")
-    assert "set -eux" in script
+    # `set -ux` (no `-e`): a per-boot provision script must not hard-fail, or
+    # `limactl start` hangs waiting for a readiness it never gets.
+    assert "set -ux" in script
+    assert "set -e" not in script
 
 
 def test_cloud_init_with_nebula():

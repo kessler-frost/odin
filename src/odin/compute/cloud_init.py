@@ -12,20 +12,27 @@ def generate_cloud_init(
 ) -> str:
     lines = [
         "#!/bin/bash",
-        "set -eux -o pipefail",
+        # NOT `set -e`: this runs as a Lima per-boot provision script, and if any
+        # one command fails the whole boot script fails — which leaves
+        # `limactl start` waiting forever for a readiness it never gets.
+        "set -ux",
         "",
-        f"hostnamectl set-hostname {hostname}",
+        f"hostnamectl set-hostname {hostname} || true",
     ]
 
     if ssh_pubkey:
+        # Detect the VM's regular user at runtime (UID 1000). Lima warns against
+        # referencing LIMA_CIDATA_* in provision scripts (and they're undefined
+        # there), which left provisioning unfinished so `limactl start` hung.
         lines.extend([
             "",
             "# Install SSH public key",
-            "mkdir -p /home/${LIMA_CIDATA_USER}/.ssh",
-            f'echo "{ssh_pubkey}" >> /home/${{LIMA_CIDATA_USER}}/.ssh/authorized_keys',
-            "chown -R ${LIMA_CIDATA_USER}:${LIMA_CIDATA_USER} /home/${LIMA_CIDATA_USER}/.ssh",
-            "chmod 700 /home/${LIMA_CIDATA_USER}/.ssh",
-            "chmod 600 /home/${LIMA_CIDATA_USER}/.ssh/authorized_keys",
+            'LIMA_USER="$(getent passwd 1000 | cut -d: -f1)"',
+            'mkdir -p "/home/${LIMA_USER}/.ssh"',
+            f'echo "{ssh_pubkey}" >> "/home/${{LIMA_USER}}/.ssh/authorized_keys"',
+            'chown -R "${LIMA_USER}:${LIMA_USER}" "/home/${LIMA_USER}/.ssh"',
+            'chmod 700 "/home/${LIMA_USER}/.ssh"',
+            'chmod 600 "/home/${LIMA_USER}/.ssh/authorized_keys"',
         ])
 
     if install_nerdctl:

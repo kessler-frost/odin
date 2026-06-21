@@ -4,6 +4,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query
 
+from odin.api.canvas import CanvasGraph
 from odin.mcp.tools import OdinTools
 from odin.orchestrator import Orchestrator
 
@@ -82,8 +83,6 @@ def create_deploy_router(orchestrator: Orchestrator) -> APIRouter:
 
 def create_simulate_router(orchestrator: Orchestrator) -> APIRouter:
     """Real local execution (Lima VMs + Nebula), separate from the Moto deploy."""
-    from odin.api.canvas import CanvasGraph
-
     router = APIRouter()
 
     @router.post("/simulate")

@@ -28,6 +28,12 @@ Single Python monolith: `src/odin/` with modules for `agent/`, `simulator/`, `co
 - Always merge to `main` locally, push after merge, never create PRs
 - Lima via `limactl` CLI (`--tty=false --format=json`), containers via `nerdctl` in Lima VMs, Nebula via `nebula-cert` CLI
 
+## Cleanup / Disk (dev box: MacBook M1, 256GB — limited headroom)
+Clean up frequently; check `df -h /Users/sankalp` between heavy steps.
+- **After Simulate mode**: delete every Lima VM it created — `limactl delete --force <name>` (or `odin`'s `/simulate-destroy`). A stray Ubuntu VM is ~2–4GB. `limactl list -q` to find leftovers; never leave VMs Running/Stopped after a test.
+- **Tofu providers**: use the shared cache (`~/.cache/odin/tofu-plugins`); never let a per-project `.terraform/` keep a full ~800MB AWS provider copy.
+- **Misc**: prune `/tmp` screenshots/JSON, stale `.playwright-cli/*.yml` snapshots, `.odin/` test artifacts, and `brew cleanup` after installs. `odin clean` removes test artifacts/PNGs/dev logs.
+
 ## CLI (Typer + Rich)
 - Installed as editable uv tool: `uv tool install --editable ".[dev]"`
 - Built with Typer (`add_completion=False`), Rich Console for test output
