@@ -116,6 +116,11 @@ RESOURCE_SPECS: tuple[ResourceSpec, ...] = (
         '`aws_ebs_volume` needs `availability_zone` (e.g. "us-east-1a") and '
         '`size` in GiB (e.g. 10).',
     ),
+    ResourceSpec("eip", "aws_eip", "ec2", '`aws_eip` needs `domain = "vpc"`.'),
+    ResourceSpec(
+        "igw", "aws_internet_gateway", "ec2",
+        '`aws_internet_gateway` needs no required args; set `vpc_id` if a VPC is present.',
+    ),
 )
 
 # Always needed, not themselves canvas resources: `iam` (emitted for IAM edges)

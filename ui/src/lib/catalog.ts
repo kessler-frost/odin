@@ -167,6 +167,18 @@ export const CATALOG: ServiceDef[] = [
     defaultData: { label: 'new-volume', az: 'us-east-1a', size: '10' },
     primary: { key: 'size', label: 'GiB' },
   },
+  {
+    type: 'eip', abbr: 'EIP', label: 'Elastic IP', sublabel: 'Static IP',
+    category: 'Networking', color: 'teal', width: 200,
+    fields: [{ key: 'label', label: 'Name', editable: true }, { key: 'publicIp', label: 'Public IP' }],
+    defaultData: { label: 'new-eip', publicIp: '' },
+  },
+  {
+    type: 'igw', abbr: 'IGW', label: 'Internet Gateway', sublabel: 'VPC internet access',
+    category: 'Networking', color: 'sky', width: 200,
+    fields: [{ key: 'label', label: 'Name', editable: true }, { key: 'igwId', label: 'Gateway ID' }],
+    defaultData: { label: 'new-igw', igwId: '' },
+  },
 ];
 
 export const catalogByType: Record<string, ServiceDef> = Object.fromEntries(
