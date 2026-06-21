@@ -170,7 +170,9 @@ class SimulationRunner:
             return host
         host = f"host_{vpc_name}" if vpc_name else "host_default"
         cloud_init = generate_cloud_init(hostname=host, install_nerdctl=True)
-        yaml = generate_lima_yaml(get_instance_type("t2.small"), cloud_init_script=cloud_init, shared_network=True)
+        # User-mode networking (shared/vmnet needs socket_vmnet, which we don't
+        # require); containers reach each other inside the VM.
+        yaml = generate_lima_yaml(get_instance_type("t2.small"), cloud_init_script=cloud_init, shared_network=False)
         await self._vm.create_vm_from_yaml(host, yaml)
         await self._vm.start_vm(host)
         state["hosts"][vpc_name] = host
