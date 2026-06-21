@@ -1,12 +1,27 @@
 """Drive the `tofu` CLI: init / validate / plan / apply / destroy against Moto."""
 from __future__ import annotations
 
+import io
 import json
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from odin.process import run
 from odin.terraform.provider import render_provider
+
+# A minimal but valid Lambda deployment package. `aws_lambda_function` requires
+# `filename` to point at a real archive (tofu reads it locally to upload), so
+# Odin ships this placeholder in the tf dir for agent-generated Lambdas.
+PLACEHOLDER_ZIP_NAME = "placeholder.zip"
+_PLACEHOLDER_HANDLER = "def handler(event, context):\n    return {'statusCode': 200}\n"
+
+
+def _placeholder_zip_bytes() -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("index.py", _PLACEHOLDER_HANDLER)
+    return buf.getvalue()
 
 
 @dataclass
@@ -62,6 +77,8 @@ class TofuRunner:
         (self._dir / "provider.tf").write_text(
             render_provider(self._endpoint, self._region)
         )
+        # Odin owns the Lambda placeholder package alongside provider.tf.
+        (self._dir / PLACEHOLDER_ZIP_NAME).write_bytes(_placeholder_zip_bytes())
 
     async def ensure_init(self) -> None:
         """Write the provider and run `tofu init` once (if not already done)."""
@@ -98,6 +115,13 @@ class TofuRunner:
         )
         diagnostics, changes = _parse_ndjson(result.stdout)
         return PlanResult(ok=result.ok, diagnostics=diagnostics, changes=changes, raw=result.stdout)
+
+    async def state_list(self) -> list[str]:
+        """Resource addresses currently in tofu state (i.e. live on Moto)."""
+        if not (self._dir / ".terraform").exists():
+            return []
+        result = await run("tofu", "state", "list", cwd=self._dir)
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
     async def destroy(self) -> PlanResult:
         if not (self._dir / ".terraform").exists():

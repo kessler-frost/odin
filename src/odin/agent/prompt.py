@@ -34,6 +34,9 @@ an instance's `subnet_id` / `vpc_security_group_ids`, etc.
 - Edges with IAM permissions → an `aws_iam_role` plus an `aws_iam_role_policy`.
 - Keep resources Moto-compatible. `aws_instance` needs `ami` + `instance_type` — \
 use a placeholder AMI like "ami-12345678" if none is given.
+- `aws_lambda_function` needs a deployment package: set `filename = "placeholder.zip"` \
+(Odin provides this file in the tf dir) plus `handler`, `runtime`, and a `role` ARN. \
+Do NOT invent your own zip path or try to create one.
 
 ## Workflow
 1. Call `get_infrastructure_state` to see the current config.

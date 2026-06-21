@@ -19,18 +19,26 @@ def registry(tmp_path) -> ResourceRegistry:
 
 
 class StubRunner:
-    """Returns crafted validate/plan results without touching tofu."""
+    """Returns crafted validate/plan/apply results without touching tofu."""
 
-    def __init__(self, tmp_path, validate_res=None, plan_res=None):
+    def __init__(self, tmp_path, validate_res=None, plan_res=None, apply_res=None, state=None):
         self.work_dir = tmp_path
         self._v = validate_res or PlanResult(ok=True)
         self._p = plan_res or PlanResult(ok=True)
+        self._a = apply_res or PlanResult(ok=True)
+        self._state = state or []
 
     async def validate(self):
         return self._v
 
     async def plan(self):
         return self._p
+
+    async def apply(self):
+        return self._a
+
+    async def state_list(self):
+        return self._state
 
 
 async def _run(registry, tmp_path, graph, *, validate_res=None, plan_res=None):
@@ -102,3 +110,50 @@ async def test_all_validated_when_no_errors(registry, tmp_path):
     assert reg.get("vpc_v").status == "validated"
     assert reg.get("s3_b").status == "validated"
     assert reg.get("vpc_v").error is None
+
+
+# --- deploy_all per-resource attribution ---
+
+async def _deploy(registry, tmp_path, entries, apply_res, state):
+    runner = StubRunner(tmp_path, apply_res=apply_res, state=state)
+    orch = Orchestrator(engine=None, registry=registry, runner=runner)
+    for name, service in entries:
+        registry.register(name, service=service, file_path="")
+        registry.update_status(name, "validated")
+    return await orch.deploy_all()
+
+
+async def test_deploy_partial_failure_attributes_per_resource(registry, tmp_path):
+    """A failed Lambda must not taint a successfully-applied S3 bucket."""
+    apply = PlanResult(ok=False, diagnostics=[
+        {"severity": "error", "summary": "reading ZIP file", "address": "aws_lambda_function.processor"},
+    ])
+    state = ["aws_s3_bucket.data_lake", "aws_iam_role.processor_role"]  # lambda absent
+    deployed = await _deploy(
+        registry, tmp_path,
+        [("lambda_processor", "lambda"), ("s3_data_lake", "s3")], apply, state,
+    )
+    assert registry.get("s3_data_lake").status == "live"
+    assert registry.get("lambda_processor").status == "error"
+    assert "ZIP" in (registry.get("lambda_processor").error or "")
+    assert deployed == ["s3_data_lake"]
+
+
+async def test_deploy_full_success_all_live(registry, tmp_path):
+    state = ["aws_vpc.v", "aws_s3_bucket.b"]
+    deployed = await _deploy(
+        registry, tmp_path, [("vpc_v", "vpc"), ("s3_b", "s3")], PlanResult(ok=True), state,
+    )
+    assert registry.get("vpc_v").status == "live"
+    assert registry.get("s3_b").status == "live"
+    assert set(deployed) == {"vpc_v", "s3_b"}
+
+
+async def test_deploy_unapplied_resource_left_validated(registry, tmp_path):
+    """A resource neither errored nor in state (skipped) stays validated."""
+    apply = PlanResult(ok=False, diagnostics=[
+        {"severity": "error", "summary": "boom", "address": "aws_iam_role.r"},
+    ])
+    deployed = await _deploy(registry, tmp_path, [("ec2_web", "ec2")], apply, state=[])
+    assert registry.get("ec2_web").status == "validated"
+    assert deployed == []

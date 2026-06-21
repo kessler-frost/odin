@@ -9,7 +9,13 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 
 from odin.agent.client import AgentEvent, OdinAgent
-from odin.api.canvas import CanvasGraph, node_reg_name, node_tf_address
+from odin.api.canvas import (
+    NODE_AWS_TYPE,
+    CanvasGraph,
+    hcl_name,
+    node_reg_name,
+    node_tf_address,
+)
 from odin.api.ws import ConnectionManager
 from odin.simulator.engine import MotoEngine
 from odin.simulator.registry import ResourceRegistry
@@ -31,6 +37,19 @@ def _addr_matches(diag_addr: str, node_addr: str) -> bool:
     match, so a failing `aws_instance.web2` never taints `aws_instance.web`.
     """
     return diag_addr == node_addr or diag_addr.startswith(node_addr + "[")
+
+
+def _entry_tf_address(entry) -> str | None:
+    """The Terraform address for a registry entry, e.g. `aws_s3_bucket.data`.
+
+    A registry name is `{type}_{label}` and `service` is the node type, so the
+    label is the name with the `{service}_` prefix stripped.
+    """
+    aws_type = NODE_AWS_TYPE.get(entry.service)
+    if not aws_type:
+        return None
+    label = entry.name[len(entry.service) + 1:]
+    return f"{aws_type}.{hcl_name(label)}"
 
 
 class Orchestrator:
@@ -140,20 +159,41 @@ class Orchestrator:
         if not entry or entry.status not in ("validated", "live"):
             return
         result = await self._runner.apply()
-        status = "live" if result.ok else "error"
-        self.registry.update_status(resource_name, status, error=_error_text(result))
-        await self._broadcast({"type": f"resource_{status}", "name": resource_name})
+        await self._apply_status(result, only=resource_name)
 
     async def deploy_all(self) -> list[str]:
         result = await self._runner.apply()
+        return await self._apply_status(result)
+
+    async def _apply_status(self, result: PlanResult, only: str | None = None) -> list[str]:
+        """Map a `tofu apply` result to per-resource status.
+
+        A resource is `live` if it landed in tofu state and no error names it;
+        `error` (with only its own message) if a diagnostic names it; otherwise
+        it wasn't applied (e.g. skipped after an upstream failure) and is left
+        untouched. This keeps one resource's failure from tainting the rest.
+        """
+        errors = [d for d in result.diagnostics if d.get("severity") == "error"]
+        state_addrs = set(await self._runner.state_list())
         deployed: list[str] = []
         for entry in self.registry.list_all():
             if entry.status not in ("validated", "live"):
                 continue
-            status = "live" if result.ok else "error"
-            self.registry.update_status(entry.name, status, error=_error_text(result))
-            await self._broadcast({"type": f"resource_{status}", "name": entry.name})
-            if result.ok:
+            if only is not None and entry.name != only:
+                continue
+            addr = _entry_tf_address(entry)
+            messages = [
+                d.get("summary", "") or "deploy error"
+                for d in errors
+                if addr and _addr_matches(d.get("address", ""), addr)
+            ]
+            if messages:
+                text = "; ".join(dict.fromkeys(messages))
+                self.registry.update_status(entry.name, "error", error=text)
+                await self._broadcast({"type": "resource_error", "name": entry.name, "error": text})
+            elif addr in state_addrs:
+                self.registry.update_status(entry.name, "live", error=None)
+                await self._broadcast({"type": "resource_live", "name": entry.name})
                 deployed.append(entry.name)
         return deployed
 
