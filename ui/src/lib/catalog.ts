@@ -179,6 +179,17 @@ export const CATALOG: ServiceDef[] = [
     fields: [{ key: 'label', label: 'Name', editable: true }, { key: 'igwId', label: 'Gateway ID' }],
     defaultData: { label: 'new-igw', igwId: '' },
   },
+  {
+    type: 'alb', abbr: 'ALB', label: 'Load Balancer', sublabel: 'Application/Network LB',
+    category: 'Networking', color: 'rose', width: 220,
+    fields: [
+      { key: 'label', label: 'Name', editable: true },
+      { key: 'lbType', label: 'Type', editable: true, select: ['application', 'network'] },
+      { key: 'arn', label: 'ARN' },
+    ],
+    defaultData: { label: 'new-lb', lbType: 'application', arn: '' },
+    primary: { key: 'lbType', label: 'Type' },
+  },
 ];
 
 export const catalogByType: Record<string, ServiceDef> = Object.fromEntries(

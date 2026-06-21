@@ -121,6 +121,12 @@ RESOURCE_SPECS: tuple[ResourceSpec, ...] = (
         "igw", "aws_internet_gateway", "ec2",
         '`aws_internet_gateway` needs no required args; set `vpc_id` if a VPC is present.',
     ),
+    ResourceSpec(
+        "alb", "aws_lb", "elbv2",
+        '`aws_lb` needs `name`, `load_balancer_type` ("application"/"network"), and '
+        '`subnets` — at least two subnet ids in different AZs (reference subnet nodes). '
+        'Add `security_groups` for an application load balancer.',
+    ),
 )
 
 # Always needed, not themselves canvas resources: `iam` (emitted for IAM edges)
