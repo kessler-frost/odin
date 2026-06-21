@@ -3,12 +3,25 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from odin.process import run
 from odin.terraform.provider import render_provider
+
+# One shared provider cache for every Odin project (and the test suite), so the
+# ~800MB AWS provider is downloaded once instead of copied into each project's
+# `.terraform/`. With a cache set, `.terraform/providers` holds symlinks.
+DEFAULT_PLUGIN_CACHE = Path.home() / ".cache" / "odin" / "tofu-plugins"
+
+
+def ensure_plugin_cache() -> Path:
+    """Point tofu at the shared plugin cache (respecting an external override)."""
+    cache = Path(os.environ.setdefault("TF_PLUGIN_CACHE_DIR", str(DEFAULT_PLUGIN_CACHE)))
+    cache.mkdir(parents=True, exist_ok=True)
+    return cache
 
 # A minimal but valid Lambda deployment package. `aws_lambda_function` requires
 # `filename` to point at a real archive (tofu reads it locally to upload), so
@@ -82,6 +95,7 @@ class TofuRunner:
 
     async def ensure_init(self) -> None:
         """Write the provider and run `tofu init` once (if not already done)."""
+        ensure_plugin_cache()
         self.write_provider()
         if (self._dir / ".terraform").exists():
             return

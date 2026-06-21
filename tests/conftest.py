@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 import pytest
 
@@ -15,10 +14,12 @@ TEST_PORT = 4298
 
 @pytest.fixture(scope="session", autouse=True)
 def _tofu_plugin_cache():
-    """Cache the downloaded AWS provider so repeated `tofu init` calls are fast."""
-    cache = Path("/tmp/odin-tofu-plugin-cache")
-    cache.mkdir(parents=True, exist_ok=True)
-    os.environ["TF_PLUGIN_CACHE_DIR"] = str(cache)
+    """Use Odin's shared provider cache so the AWS provider is downloaded once
+    (and shared with the running app), not re-fetched per project."""
+    from odin.terraform.runner import DEFAULT_PLUGIN_CACHE
+
+    DEFAULT_PLUGIN_CACHE.mkdir(parents=True, exist_ok=True)
+    os.environ["TF_PLUGIN_CACHE_DIR"] = str(DEFAULT_PLUGIN_CACHE)
     yield
 
 
