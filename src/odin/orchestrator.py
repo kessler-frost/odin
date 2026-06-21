@@ -132,15 +132,9 @@ class Orchestrator:
 
         validated = await self._runner.validate()
         planned = await self._runner.plan() if validated.ok else None
-        # Fold apply into validate so it also catches apply-time errors that
-        # `plan` misses (e.g. a missing Lambda package), against the ephemeral
-        # Moto. There's no separate "Deploy" — Simulate is the real run.
-        applied = await self._runner.apply() if (planned and planned.ok) else None
-        diagnostics = (
-            validated.diagnostics
-            + (planned.diagnostics if planned else [])
-            + (applied.diagnostics if applied else [])
-        )
+        # Validate is a preview only: `tofu validate` + `plan` against Moto.
+        # Applying for real is Simulate's job (Lima VMs + containers), not this.
+        diagnostics = validated.diagnostics + (planned.diagnostics if planned else [])
         errors = [d for d in diagnostics if d.get("severity") == "error"]
 
         addr_to_reg = {

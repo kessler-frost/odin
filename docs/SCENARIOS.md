@@ -6,11 +6,10 @@ UI** (drag-drop nodes from the sidebar, draw edges handle-to-handle) and
 `validated` and the agent emits the expected resources (including IAM roles
 auto-derived from IAM edges).
 
-**Validate = plan + apply.** The **Validate** button runs the agent → `tofu
-validate` + `plan` + **`apply`** against the ephemeral Moto server, so it catches
-*apply-time* errors that `plan` alone misses (there's no separate "Deploy";
-**Simulate** is the real run on Lima VMs + containers). Apply makes Validate
-slower — RDS/ALB scenarios take ~120–190s.
+**Validate = plan.** The **Validate** button runs the agent → `tofu validate` +
+`plan` against the ephemeral Moto server — a fast preview/check, no apply.
+Actually running the architecture for real is **Simulate** (Lima VMs +
+containers); **Destroy** tears that down.
 
 How they're driven (for future sessions): the dev server runs (`uv run odin
 start --dev`), a Playwright browser drives `localhost:4200`. Nodes are dropped by
@@ -23,7 +22,7 @@ session keeps its original system prompt).
 ## Results
 
 All 15 pass: every node reaches `validated` through the live agent, built via the
-real UI. Re-run 2026-06-21 with Validate = plan + **apply**.
+real UI (run 2026-06-21).
 
 | # | Scenario | Services exercised | Result |
 |---|----------|--------------------|--------|
@@ -49,11 +48,12 @@ real UI. Re-run 2026-06-21 with Validate = plan + **apply**.
   default label merged into one registry entry (it keys on `{type}_{label}`).
   Fixed by auto-suffixing the default label (`new-function-2`, …) on drop/add
   (`ui/src/components/Canvas.tsx`).
-- **Identical subnet CIDRs.** Found on the S6 re-run once Validate started
-  applying: the agent gave two subnets in one VPC the same `10.0.1.0/24`, which
-  passes `plan` but fails `apply` (`InvalidSubnet.Conflict`). Fixed with a subnet
-  prompt hint requiring distinct, non-overlapping CIDRs across AZs
-  (`src/odin/resources.py`). S6/S10 then got `10.0.1.0/24` + `10.0.2.0/24`.
+- **Identical subnet CIDRs.** Surfaced while exercising `tofu apply` during
+  testing: the agent gave two subnets in one VPC the same `10.0.1.0/24`, which
+  passes `plan` but would fail `apply` (`InvalidSubnet.Conflict`). Fixed with a
+  subnet prompt hint requiring distinct, non-overlapping CIDRs across AZs
+  (`src/odin/resources.py`) — the generated HCL is now correct regardless of
+  apply. S6/S10 get `10.0.1.0/24` + `10.0.2.0/24`.
 
 ## Scenario details
 
