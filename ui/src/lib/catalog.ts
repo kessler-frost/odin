@@ -139,6 +139,34 @@ export const CATALOG: ServiceDef[] = [
     defaultData: { label: 'new-param', paramValue: 'changeme' },
     iamActions: ['ssm:GetParameter', 'ssm:GetParameters', 'ssm:*'],
   },
+  {
+    type: 'logs', abbr: 'LOG', label: 'Log Group', sublabel: 'CloudWatch Logs',
+    category: 'Monitoring', color: 'amber', width: 200,
+    fields: [{ key: 'label', label: 'Name', editable: true }, { key: 'arn', label: 'ARN' }],
+    defaultData: { label: '/odin/logs', arn: '' },
+    iamActions: ['logs:CreateLogStream', 'logs:PutLogEvents', 'logs:*'],
+  },
+  {
+    type: 'events', abbr: 'EVT', label: 'EventBridge', sublabel: 'Event rule',
+    category: 'Integration', color: 'sky', width: 200,
+    fields: [
+      { key: 'label', label: 'Name', editable: true },
+      { key: 'schedule', label: 'Schedule', editable: true },
+    ],
+    defaultData: { label: 'new-rule', schedule: 'rate(5 minutes)' },
+    primary: { key: 'schedule', label: 'Schedule' },
+  },
+  {
+    type: 'ebs', abbr: 'EBS', label: 'EBS Volume', sublabel: 'Block storage',
+    category: 'Storage', color: 'lime', width: 200,
+    fields: [
+      { key: 'label', label: 'Name', editable: true },
+      { key: 'az', label: 'Availability Zone', editable: true },
+      { key: 'size', label: 'Size (GiB)', editable: true },
+    ],
+    defaultData: { label: 'new-volume', az: 'us-east-1a', size: '10' },
+    primary: { key: 'size', label: 'GiB' },
+  },
 ];
 
 export const catalogByType: Record<string, ServiceDef> = Object.fromEntries(

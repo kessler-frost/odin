@@ -99,6 +99,23 @@ RESOURCE_SPECS: tuple[ResourceSpec, ...] = (
         '`aws_kinesis_stream` needs `name` and `shard_count = 1`.',
     ),
     ResourceSpec("ecs", "aws_ecs_cluster", "ecs", '`aws_ecs_cluster` needs `name`.'),
+    ResourceSpec(
+        "logs", "aws_cloudwatch_log_group", "logs",
+        '`aws_cloudwatch_log_group` needs `name` (e.g. "/aws/lambda/fn"); '
+        '`retention_in_days` is optional.',
+        provider_key="cloudwatchlogs",
+    ),
+    ResourceSpec(
+        "events", "aws_cloudwatch_event_rule", "events",
+        '`aws_cloudwatch_event_rule` needs `name` and either `schedule_expression` '
+        '(e.g. "rate(5 minutes)") or `event_pattern` (a jsonencode pattern).',
+        provider_key="cloudwatchevents",
+    ),
+    ResourceSpec(
+        "ebs", "aws_ebs_volume", "ec2",
+        '`aws_ebs_volume` needs `availability_zone` (e.g. "us-east-1a") and '
+        '`size` in GiB (e.g. 10).',
+    ),
 )
 
 # Always needed, not themselves canvas resources: `iam` (emitted for IAM edges)
