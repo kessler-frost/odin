@@ -24,7 +24,14 @@ class ContainerManager:
         return stdout.decode(), stderr.decode(), proc.returncode
 
     async def _run_in_vm(self, vm_name: str, *args: str) -> tuple[str, str, int]:
-        """Run a command inside a Lima VM via limactl shell."""
+        """Run a command inside a Lima VM via limactl shell.
+
+        `nerdctl` runs under sudo: cloud-init sets up rootful containerd, and
+        `limactl shell` runs as a non-root user (which would otherwise default
+        nerdctl to rootless mode, needing a separate containerd-rootless setup).
+        """
+        if args and args[0] == "nerdctl":
+            args = ("sudo", *args)
         return await self._run(
             "limactl", "shell", "--tty=false", vm_name, "--", *args,
         )
