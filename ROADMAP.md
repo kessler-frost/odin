@@ -63,18 +63,48 @@ local Moto server via AWS provider endpoint overrides.
 - [x] Per-node canvas status mapped from tofu results
 - [x] boto3 generation path removed; CI runs the Moto + tofu path
 
-## Phase 5 — Extended AWS Services
+## Phase 5 — Broad AWS Service Coverage
 
-Beyond core compute + storage.
+Goal: cover the AWS services people actually use every day (skip the niche
+ones). Each service is one `ResourceSpec` (backend) + one catalog entry
+(frontend) + a Moto-backed tofu test. Services are grouped by category in the
+sidebar.
 
-- [ ] API Gateway simulation
-- [ ] DynamoDB simulation
-- [ ] SQS/SNS simulation
-- [ ] EventBridge simulation
-- [ ] ECS/Fargate simulation
-- [ ] CloudWatch basics (logs, metrics)
-- [ ] Route 53 (DNS) simulation via Nebula DNS
+Resource definitions are centralized: backend in `src/odin/resources.py`
+(`RESOURCE_SPECS` → node→AWS type map, provider endpoints, agent prompt hints);
+frontend in `ui/src/lib/catalog.ts` (node, config fields, sidebar group, IAM).
+
+**Done:** VPC, Subnet, Security Group, EC2, Lambda, S3, DynamoDB.
+
+**Tier 1 — extremely common (build first):**
+- [ ] RDS (relational DB instance)
+- [ ] SQS (queue)
+- [ ] SNS (topic)
+- [ ] API Gateway (REST API)
+- [ ] ELB / ALB (load balancer + target group)
+- [ ] CloudWatch Log Group
+- [ ] Route 53 (hosted zone + record)
+- [ ] Secrets Manager (secret)
+- [ ] IAM Role (standalone node)
+- [ ] ECS (cluster + Fargate service)
+- [ ] EventBridge (rule + bus)
+- [ ] KMS (key)
+
+**Tier 2 — common:**
+- [ ] ElastiCache (Redis/Memcached)
+- [ ] CloudFront (distribution)
+- [ ] Step Functions (state machine)
+- [ ] Kinesis (stream)
+- [ ] SSM Parameter Store
+- [ ] EFS (file system)
+- [ ] Internet Gateway / NAT Gateway / Route Table
+- [ ] CloudWatch Alarm
+- [ ] EBS Volume
+
+**Networking polish:**
 - [ ] Real S3 storage backend (RustFS/MinIO) for object persistence
+- [ ] Simulate mode: wire parked Lima/Nebula real-execution into a UI "Simulate"
+      action (top-bar `...` overflow, to avoid crowding the primary actions)
 
 ## Testing
 

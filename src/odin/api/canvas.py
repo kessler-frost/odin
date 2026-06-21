@@ -8,22 +8,14 @@ from typing import Any
 from fastapi import APIRouter
 from pydantic import BaseModel
 
+# Canvas node type → AWS / Terraform resource type. Defined in odin.resources
+# (single source of truth); re-exported here for existing import sites.
+from odin.resources import NODE_AWS_TYPE
+
 
 class CanvasGraph(BaseModel):
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
-
-
-# Canvas node type → AWS / Terraform resource type.
-NODE_AWS_TYPE = {
-    "vpc": "aws_vpc",
-    "subnet": "aws_subnet",
-    "sg": "aws_security_group",
-    "ec2": "aws_instance",
-    "lambda": "aws_lambda_function",
-    "s3": "aws_s3_bucket",
-    "dynamodb": "aws_dynamodb_table",
-}
 
 
 def hcl_name(label: str) -> str:

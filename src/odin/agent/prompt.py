@@ -2,6 +2,7 @@ from __future__ import annotations
 
 
 from odin.api.canvas import CanvasGraph
+from odin.resources import node_type_lines, resource_hints
 
 SYSTEM_PROMPT_TEMPLATE = """\
 You are Odin's infrastructure code generator. You translate the visual canvas \
@@ -11,13 +12,7 @@ Write ALL resources into ONE file: `{tf_dir}/main.tf`. Do NOT write a provider \
 block — Odin owns `provider.tf`. Use standard AWS resource HCL.
 
 ## Node type → AWS resource
-- vpc      → aws_vpc
-- subnet   → aws_subnet
-- sg       → aws_security_group
-- ec2      → aws_instance
-- lambda   → aws_lambda_function
-- s3       → aws_s3_bucket
-- dynamodb → aws_dynamodb_table
+{node_types}
 
 ## Naming
 Name each HCL resource after the node label, lowercased with every \
@@ -33,14 +28,8 @@ ENTIRE bounding box fits inside the container's. Use Position + Size. Partial ov
 an instance's `subnet_id` / `vpc_security_group_ids`, etc.
 - Node data fields (cidr, instanceType, etc.) map to resource arguments.
 - Edges with IAM permissions → an `aws_iam_role` plus an `aws_iam_role_policy`.
-- Keep resources Moto-compatible. `aws_instance` needs `ami` + `instance_type` — \
-use a placeholder AMI like "ami-12345678" if none is given.
-- `aws_lambda_function` needs a deployment package: set `filename = "placeholder.zip"` \
-(Odin provides this file in the tf dir) plus `handler`, `runtime`, and a `role` ARN. \
-Do NOT invent your own zip path or try to create one.
-- `aws_dynamodb_table` needs `name`, `billing_mode = "PAY_PER_REQUEST"`, `hash_key`, \
-and a matching `attribute { name = <hash_key> type = "S" }` block (type "S"/"N"/"B"). \
-Add `range_key` plus a second `attribute` block only if a sort key is given.
+- Keep resources Moto-compatible. Per-resource requirements:
+{resource_hints}
 
 ## Workflow
 1. Call `get_infrastructure_state` to see the current config.
@@ -61,7 +50,11 @@ No markdown, no bold, no code blocks, no emoji.\
 
 def build_system_prompt(tf_dir: str = ".odin/tf") -> str:
     """Build the system prompt that tells the agent its role and rules."""
-    return SYSTEM_PROMPT_TEMPLATE.format(tf_dir=tf_dir)
+    return SYSTEM_PROMPT_TEMPLATE.format(
+        tf_dir=tf_dir,
+        node_types=node_type_lines(),
+        resource_hints=resource_hints(),
+    )
 
 
 def _format_graph(graph: CanvasGraph) -> str:
