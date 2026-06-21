@@ -11,7 +11,7 @@ import boto3
 from odin.process import Daemon
 from odin.resources import MOTO_SERVICES
 
-SUPPORTED_SERVICES = frozenset(MOTO_SERVICES) | {"iam"}
+SUPPORTED_SERVICES = frozenset(MOTO_SERVICES)
 DEFAULT_PORT = 4202
 
 

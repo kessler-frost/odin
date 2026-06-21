@@ -1,11 +1,10 @@
 """Generate the fixed AWS provider config that points Terraform at Moto."""
 from __future__ import annotations
 
-from odin.resources import MOTO_SERVICES
+from odin.resources import PROVIDER_SERVICES
 
-# Endpoint overrides the canvas can target. Moto serves them all on one
-# endpoint. `iam` is always included (roles/policies are emitted for IAM edges).
-SERVICES = tuple(dict.fromkeys((*MOTO_SERVICES, "iam")))
+# Endpoint overrides the canvas can target. Moto serves them all on one endpoint.
+SERVICES = PROVIDER_SERVICES
 
 
 def render_provider(endpoint: str, region: str = "us-east-1") -> str:

@@ -16,8 +16,14 @@ from dataclasses import dataclass
 class ResourceSpec:
     node_type: str          # canvas node type (e.g. "dynamodb")
     aws_type: str           # Terraform resource type (e.g. "aws_dynamodb_table")
-    moto_service: str       # provider endpoint / Moto service (e.g. "dynamodb")
+    moto_service: str       # boto3 / Moto service name (e.g. "dynamodb")
     hint: str = ""          # Moto-compat HCL guidance appended to the agent prompt
+    provider_key: str = ""  # AWS-provider endpoint key when it differs from
+                            # moto_service (e.g. logs → "cloudwatchlogs")
+
+    @property
+    def endpoint_key(self) -> str:
+        return self.provider_key or self.moto_service
 
 
 RESOURCE_SPECS: tuple[ResourceSpec, ...] = (
@@ -50,17 +56,67 @@ RESOURCE_SPECS: tuple[ResourceSpec, ...] = (
         'and end the name with ".fifo".',
     ),
     ResourceSpec("sns", "aws_sns_topic", "sns", '`aws_sns_topic` needs `name`.'),
+    ResourceSpec(
+        "rds", "aws_db_instance", "rds",
+        '`aws_db_instance` needs `identifier` (= the label), `engine` (e.g. '
+        '"postgres"/"mysql"), `instance_class` (e.g. "db.t3.micro"), '
+        '`allocated_storage` (e.g. 20), `username`, `password` (any placeholder), '
+        'and `skip_final_snapshot = true`.',
+    ),
+    ResourceSpec(
+        "secret", "aws_secretsmanager_secret", "secretsmanager",
+        '`aws_secretsmanager_secret` needs `name`.',
+    ),
+    ResourceSpec(
+        "kms", "aws_kms_key", "kms",
+        '`aws_kms_key` takes an optional `description` (use the label); it has no '
+        '`name` argument.',
+    ),
+    ResourceSpec(
+        "iamrole", "aws_iam_role", "iam",
+        '`aws_iam_role` needs `name` and an `assume_role_policy` — a `jsonencode` '
+        'of a single `sts:AssumeRole` statement with a sensible service principal.',
+    ),
+    ResourceSpec(
+        "route53", "aws_route53_zone", "route53",
+        '`aws_route53_zone` needs `name` — a DNS domain like "example.com".',
+    ),
+    ResourceSpec(
+        "apigateway", "aws_api_gateway_rest_api", "apigateway",
+        '`aws_api_gateway_rest_api` needs `name`.',
+    ),
+    ResourceSpec(
+        "efs", "aws_efs_file_system", "efs",
+        '`aws_efs_file_system` has no required args; set `creation_token` to the label.',
+    ),
+    ResourceSpec(
+        "ssm", "aws_ssm_parameter", "ssm",
+        '`aws_ssm_parameter` needs `name`, `type = "String"`, and `value` '
+        '(any placeholder).',
+    ),
+    ResourceSpec(
+        "kinesis", "aws_kinesis_stream", "kinesis",
+        '`aws_kinesis_stream` needs `name` and `shard_count = 1`.',
+    ),
+    ResourceSpec("ecs", "aws_ecs_cluster", "ecs", '`aws_ecs_cluster` needs `name`.'),
 )
 
-# Always-needed Moto services that aren't themselves canvas resources.
-_EXTRA_MOTO_SERVICES = ("sts",)
+# Always needed, not themselves canvas resources: `iam` (emitted for IAM edges)
+# and `sts` (the provider's account lookups).
+_EXTRA_SERVICES = ("iam", "sts")
 
 # canvas node type → Terraform resource type
 NODE_AWS_TYPE: dict[str, str] = {s.node_type: s.aws_type for s in RESOURCE_SPECS}
 
-# Ordered-unique provider/Moto services (resources + extras).
+# boto3 / Moto service names — used by the engine's clients.
 MOTO_SERVICES: tuple[str, ...] = tuple(
-    dict.fromkeys(s.moto_service for s in RESOURCE_SPECS) | dict.fromkeys(_EXTRA_MOTO_SERVICES)
+    dict.fromkeys((*(s.moto_service for s in RESOURCE_SPECS), *_EXTRA_SERVICES))
+)
+
+# AWS-provider endpoint keys — used for provider.tf endpoint overrides. Differs
+# from MOTO_SERVICES only where a provider key isn't the boto3 name.
+PROVIDER_SERVICES: tuple[str, ...] = tuple(
+    dict.fromkeys((*(s.endpoint_key for s in RESOURCE_SPECS), *_EXTRA_SERVICES))
 )
 
 

@@ -66,6 +66,79 @@ export const CATALOG: ServiceDef[] = [
     defaultData: { label: 'new-topic', arn: '' },
     iamActions: ['sns:Publish', 'sns:Subscribe', 'sns:*'],
   },
+  {
+    type: 'kinesis', abbr: 'KIN', label: 'Kinesis Stream', sublabel: 'Data stream',
+    category: 'Integration', color: 'fuchsia', width: 200,
+    fields: [{ key: 'label', label: 'Name', editable: true }, { key: 'arn', label: 'ARN' }],
+    defaultData: { label: 'new-stream', arn: '' },
+    iamActions: ['kinesis:PutRecord', 'kinesis:GetRecords', 'kinesis:*'],
+  },
+  {
+    type: 'rds', abbr: 'RDS', label: 'RDS Database', sublabel: 'Relational DB',
+    category: 'Database', color: 'sky', width: 220,
+    fields: [
+      { key: 'label', label: 'Name', editable: true },
+      { key: 'engine', label: 'Engine', editable: true, select: ['postgres', 'mysql', 'mariadb'] },
+      { key: 'instanceClass', label: 'Instance Class', editable: true },
+      { key: 'arn', label: 'ARN' },
+    ],
+    defaultData: { label: 'new-db', engine: 'postgres', instanceClass: 'db.t3.micro', arn: '' },
+    primary: { key: 'engine', label: 'Engine' },
+  },
+  {
+    type: 'secret', abbr: 'SEC', label: 'Secret', sublabel: 'Secrets Manager',
+    category: 'Security', color: 'lime', width: 200,
+    fields: [{ key: 'label', label: 'Name', editable: true }, { key: 'arn', label: 'ARN' }],
+    defaultData: { label: 'new-secret', arn: '' },
+    iamActions: ['secretsmanager:GetSecretValue', 'secretsmanager:*'],
+  },
+  {
+    type: 'kms', abbr: 'KMS', label: 'KMS Key', sublabel: 'Encryption key',
+    category: 'Security', color: 'teal', width: 200,
+    fields: [{ key: 'label', label: 'Description', editable: true }, { key: 'arn', label: 'Key ARN' }],
+    defaultData: { label: 'new-key', arn: '' },
+    iamActions: ['kms:Encrypt', 'kms:Decrypt', 'kms:GenerateDataKey', 'kms:*'],
+  },
+  {
+    type: 'iamrole', abbr: 'IAM', label: 'IAM Role', sublabel: 'Identity role',
+    category: 'Security', color: 'amber', width: 200,
+    fields: [{ key: 'label', label: 'Name', editable: true }, { key: 'arn', label: 'ARN' }],
+    defaultData: { label: 'new-role', arn: '' },
+  },
+  {
+    type: 'route53', abbr: 'DNS', label: 'Route 53 Zone', sublabel: 'Hosted zone',
+    category: 'Networking', color: 'indigo', width: 200,
+    fields: [{ key: 'label', label: 'Domain', editable: true }, { key: 'zoneId', label: 'Zone ID' }],
+    defaultData: { label: 'example.com', zoneId: '' },
+  },
+  {
+    type: 'apigateway', abbr: 'API', label: 'API Gateway', sublabel: 'REST API',
+    category: 'Networking', color: 'fuchsia', width: 200,
+    fields: [{ key: 'label', label: 'Name', editable: true }, { key: 'apiId', label: 'API ID' }],
+    defaultData: { label: 'new-api', apiId: '' },
+  },
+  {
+    type: 'efs', abbr: 'EFS', label: 'EFS', sublabel: 'Elastic file system',
+    category: 'Storage', color: 'sky', width: 200,
+    fields: [{ key: 'label', label: 'Name', editable: true }, { key: 'fsId', label: 'File System ID' }],
+    defaultData: { label: 'new-fs', fsId: '' },
+  },
+  {
+    type: 'ecs', abbr: 'ECS', label: 'ECS Cluster', sublabel: 'Container cluster',
+    category: 'Compute', color: 'lime', width: 200,
+    fields: [{ key: 'label', label: 'Name', editable: true }, { key: 'arn', label: 'ARN' }],
+    defaultData: { label: 'new-cluster', arn: '' },
+  },
+  {
+    type: 'ssm', abbr: 'SSM', label: 'SSM Parameter', sublabel: 'Parameter store',
+    category: 'Management', color: 'indigo', width: 200,
+    fields: [
+      { key: 'label', label: 'Name', editable: true },
+      { key: 'paramValue', label: 'Value', editable: true },
+    ],
+    defaultData: { label: 'new-param', paramValue: 'changeme' },
+    iamActions: ['ssm:GetParameter', 'ssm:GetParameters', 'ssm:*'],
+  },
 ];
 
 export const catalogByType: Record<string, ServiceDef> = Object.fromEntries(

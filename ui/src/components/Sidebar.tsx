@@ -21,7 +21,7 @@ const catalogItems: Item[] = CATALOG.map((s) => ({
   iconClass: `${COLORS[s.color].text} ${COLORS[s.color].border}`,
 }));
 
-const CATEGORY_ORDER = ['Networking', 'Compute', 'Storage', 'Database', 'Integration', 'Security', 'Monitoring'];
+const CATEGORY_ORDER = ['Networking', 'Compute', 'Storage', 'Database', 'Integration', 'Security', 'Monitoring', 'Management'];
 
 const allItems = [...builtins, ...catalogItems];
 const groups = CATEGORY_ORDER
