@@ -93,3 +93,16 @@ async def test_cleanup_tears_everything_down(registry, tmp_path):
 async def test_cleanup_without_state_is_noop(registry, tmp_path):
     runner, *_ = _build(tmp_path, registry)
     assert await runner.cleanup() == {"destroyed": []}
+
+
+async def test_s3_node_runs_rustfs_container(registry, tmp_path):
+    """A stateful service node (S3) runs as a real container (RustFS) in Simulate."""
+    runner, vm, nebula, container = _build(tmp_path, registry)
+    graph = CanvasGraph(nodes=[
+        {"id": "1", "type": "s3", "position": {"x": 0, "y": 0}, "data": {"label": "data"}},
+    ])
+    result = await runner.simulate(graph)
+    assert result["simulated"] == ["s3_data"]
+    container.run_container.assert_awaited_once()
+    assert "rustfs" in container.run_container.call_args.kwargs["image"]
+    assert registry.get("s3_data").status == "simulated"

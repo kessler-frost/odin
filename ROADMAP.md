@@ -80,29 +80,37 @@ RDS, Secrets Manager, KMS, IAM Role, Route 53, API Gateway, EFS, SSM Parameter,
 ECS, CloudWatch Log Group, EventBridge, EBS Volume, Elastic IP, Internet
 Gateway, ALB (application/network load balancer).
 
-**Dropped — not cleanly Moto-simulatable via the OpenTofu v6 AWS provider:**
-- ElastiCache — Moto leaves the cluster "creating" forever (apply hangs).
-- NAT Gateway — Moto never reports the gateway "deleted" (destroy hangs).
-- Step Functions — Moto's `stepfunctions` create never completes (apply hangs).
-- CloudWatch Alarm — Moto returns 404 for `PutMetricAlarm`.
-- CloudFront — same InProgress-status hang class + very heavy HCL; skipped.
+**Not cleanly Moto-simulatable via the OpenTofu v6 AWS provider** (apply/destroy
+hangs or 404s): ElastiCache, NAT Gateway, Step Functions, CloudWatch Alarm,
+CloudFront. These aren't lost — Moto covers the *AWS API*; the stateful ones can
+run for real as containers in **Simulate mode** (below).
 
 ## Simulate mode (Done)
 
 Real local execution alongside the Moto path: a "Simulate (Real VMs)" action in
 the top-bar `...` overflow runs the canvas for real via the (formerly parked)
-Lima/Nebula modules — a Lima VM per EC2, a Nebula CA/overlay per VPC, a container
-per Lambda — with "Tear Down Simulation" to clean up. Verified end-to-end (one
-EC2 → a real, SSH-able Ubuntu VM, then deleted).
+Lima/Nebula modules — a Lima VM per EC2, a Nebula CA/overlay per VPC, and **real
+containers (via `nerdctl`) for stateful services**:
 
-## Real S3 storage backend
+| Node | Container | Node | Container |
+|------|-----------|------|-----------|
+| S3 | RustFS *(Apache-2.0)* | RDS | Postgres |
+| DynamoDB | dynamodb-local | SQS | ElasticMQ |
+| ElastiCache | Valkey | Lambda | its runtime image |
 
-- [ ] Back S3 with **RustFS** so objects persist on disk (Moto's S3 is
-      in-memory). RustFS is chosen over MinIO because it's **Apache 2.0**
-      licensed (MinIO is AGPL). RustFS is S3-compatible; tofu's `aws_s3_bucket`
-      applies against it with path-style addressing. Run it as a managed
-      subprocess and point the `s3` provider endpoint at it (Moto keeps serving
-      the other services).
+`nerdctl` is native on a Linux prod host and runs via the Lima host VM on macOS,
+so this adds **no new host dependency** — RustFS et al. are just images.
+"Tear Down Simulation" cleans up VMs + containers. Verified end-to-end (EC2 → a
+real, SSH-able Ubuntu VM; S3→RustFS container orchestration unit-tested).
+
+Architecture: **Moto = the AWS API for validate/deploy; Simulate = real
+execution.** This is also why RustFS lives here (a container), not as a Moto
+replacement.
+
+## Packaging (future)
+
+- [ ] Bundle the external tools (tofu, lima, nebula, uv, …) into a single
+      distributable so prod install is one artifact.
 
 ## Testing
 

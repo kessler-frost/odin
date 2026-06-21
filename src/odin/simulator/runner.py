@@ -30,6 +30,19 @@ _DEFAULT_SIZES = {
 }
 
 
+# Stateful AWS services → real container images for Simulate mode. Moto serves
+# the AWS API for the validate/deploy path; Simulate runs these for real — e.g.
+# S3 → RustFS (Apache-2.0), ElastiCache → Valkey. Images run via nerdctl in the
+# host VM (native on Linux; via the Lima host VM on macOS). No new host deps.
+SERVICE_CONTAINERS: dict[str, dict] = {
+    "s3": {"image": "rustfs/rustfs:latest", "env": {"RUSTFS_ACCESS_KEY": "odin", "RUSTFS_SECRET_KEY": "odinpass"}},
+    "rds": {"image": "postgres:16", "env": {"POSTGRES_PASSWORD": "odin"}},
+    "dynamodb": {"image": "amazon/dynamodb-local:latest", "env": {}},
+    "sqs": {"image": "softwaremill/elasticmq-native:latest", "env": {}},
+    "elasticache": {"image": "valkey/valkey:8", "env": {}},
+}
+
+
 def _bbox(node: dict) -> tuple[float, float, float, float]:
     pos = node.get("position", {})
     size = node.get("size") or {}
@@ -110,6 +123,15 @@ class SimulationRunner:
             await self._mark(reg, "simulated", "resource_simulated")
             simulated.append(reg)
 
+        # Stateful services (S3→RustFS, RDS→Postgres, …) run as real containers.
+        for node in [n for n in graph.nodes if n.get("type") in SERVICE_CONTAINERS]:
+            reg = node_reg_name(node)[1]
+            await self._mark(reg, "simulating", "resource_simulating")
+            host, container = await self._run_service_container(node, vpcs, overlays, state)
+            state["containers"].append({"vm": host, "name": container})
+            await self._mark(reg, "simulated", "resource_simulated")
+            simulated.append(reg)
+
         self._state_path.parent.mkdir(parents=True, exist_ok=True)
         self._state_path.write_text(json.dumps(state, indent=2))
         return {"simulated": simulated}
@@ -165,6 +187,19 @@ class SimulationRunner:
             image=f"{runtime}-slim",
             env={"HANDLER": node.get("data", {}).get("handler", "index.handler")},
             volumes=[],
+        )
+        return host, reg
+
+    async def _run_service_container(
+        self, node: dict, vpcs: list[dict], overlays: dict[str, VpcOverlay], state: dict
+    ) -> tuple[str, str]:
+        """Run a stateful service (S3→RustFS, RDS→Postgres, …) as a real container."""
+        reg = node_reg_name(node)[1]
+        spec = SERVICE_CONTAINERS[node.get("type", "")]
+        vpc_name = self._vpc_of(node, vpcs) or ""
+        host = await self._ensure_host_vm(vpc_name, overlays, state)
+        await self._container.run_container(
+            vm_name=host, name=reg, image=spec["image"], env=spec.get("env", {}), volumes=[],
         )
         return host, reg
 
