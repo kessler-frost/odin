@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import type { Node, Edge } from '@xyflow/react';
 import StatusBadge from './nodes/StatusBadge';
 import { iamActionsForTarget, edgeTypes, detectEdgeTypes } from '../lib/iam';
+import { catalogTypeConfig, catalogFields } from '../lib/catalog';
 
 interface ConfigPanelProps {
   nodes: Node[];
@@ -22,6 +23,7 @@ const typeConfig: Record<string, { label: string; neonColor: string; neonBg: str
   s3: { label: 'S3', neonColor: 'text-neon-green', neonBg: 'bg-[rgba(0,255,136,0.1)] border-neon-green' },
   sg: { label: 'Security Group', neonColor: 'text-neon-red', neonBg: 'bg-[rgba(255,51,85,0.1)] border-neon-red' },
   dynamodb: { label: 'DynamoDB', neonColor: 'text-neon-cyan', neonBg: 'bg-[rgba(34,211,238,0.1)] border-neon-cyan' },
+  ...catalogTypeConfig,
 };
 
 type FieldDef = { key: string; label: string; editable?: boolean; select?: string[] };
@@ -84,6 +86,7 @@ const fieldsForType: Record<string, FieldDef[]> = {
     { key: 'status', label: 'Status' },
     { key: 'error', label: 'Error' },
   ],
+  ...catalogFields,
 };
 
 function ReadOnlyField({ label, value }: { label: string; value: string }) {

@@ -44,6 +44,12 @@ RESOURCE_SPECS: tuple[ResourceSpec, ...] = (
         'block (type "S"/"N"/"B"). Add `range_key` plus a second `attribute` '
         'block only if a sort key is given.',
     ),
+    ResourceSpec(
+        "sqs", "aws_sqs_queue", "sqs",
+        '`aws_sqs_queue` needs `name`. For a FIFO queue set `fifo_queue = true` '
+        'and end the name with ".fifo".',
+    ),
+    ResourceSpec("sns", "aws_sns_topic", "sns", '`aws_sns_topic` needs `name`.'),
 )
 
 # Always-needed Moto services that aren't themselves canvas resources.

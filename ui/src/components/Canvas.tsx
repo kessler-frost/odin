@@ -26,6 +26,8 @@ import LambdaNode from './nodes/LambdaNode';
 import S3Node from './nodes/S3Node';
 import SgNode from './nodes/SgNode';
 import DynamodbNode from './nodes/DynamodbNode';
+import ServiceNode from './nodes/ServiceNode';
+import { CATALOG, catalogNodeTypeMap, catalogDefaultData, catalogDefaultStyle, catalogZIndex } from '../lib/catalog';
 import { computeTypes, defaultPermissions, detectDefaultEdgeType, edgeStyle, edgeTypes } from '../lib/iam';
 
 const nodeTypes: NodeTypes = {
@@ -36,6 +38,8 @@ const nodeTypes: NodeTypes = {
   s3: S3Node,
   sg: SgNode,
   dynamodb: DynamodbNode,
+  // Every catalog (Phase-5) service renders with the generic ServiceNode.
+  ...Object.fromEntries(CATALOG.map((s) => [s.type, ServiceNode])),
 };
 
 const nodeTypeMap: Record<string, string> = {
@@ -46,6 +50,7 @@ const nodeTypeMap: Record<string, string> = {
   S3: 's3',
   SG: 'sg',
   DDB: 'dynamodb',
+  ...catalogNodeTypeMap,
 };
 
 const defaultDataForType: Record<string, Record<string, string>> = {
@@ -56,6 +61,7 @@ const defaultDataForType: Record<string, Record<string, string>> = {
   s3: { label: 'new-bucket', arn: '', status: 'draft' },
   sg: { label: 'new-sg', groupId: '', vpcId: '', inboundRules: '', outboundRules: '', status: 'draft' },
   dynamodb: { label: 'new-table', hashKey: 'id', billingMode: 'PAY_PER_REQUEST', arn: '', status: 'draft' },
+  ...catalogDefaultData,
 };
 
 const defaultStyleForType: Record<string, React.CSSProperties> = {
@@ -66,6 +72,7 @@ const defaultStyleForType: Record<string, React.CSSProperties> = {
   s3: { width: 200 },
   sg: { width: 220 },
   dynamodb: { width: 200 },
+  ...catalogDefaultStyle,
 };
 
 
@@ -77,6 +84,7 @@ const zIndexForType: Record<string, number> = {
   s3: 2,
   sg: 2,
   dynamodb: 2,
+  ...catalogZIndex,
 };
 
 const API = '';
