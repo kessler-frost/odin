@@ -2,77 +2,99 @@
 
 Realistic multi-service platform architectures, each **built through the actual
 UI** (drag-drop nodes from the sidebar, draw edges handle-to-handle) and
-**validated through the live agent** (canvas → agent → OpenTofu `plan` → Moto →
-per-node status). A scenario "passes" when every node reaches `validated` and the
-agent emits the expected resources (including IAM roles auto-derived from IAM
-edges).
+**validated through the live agent**. A scenario "passes" when every node reaches
+`validated` and the agent emits the expected resources (including IAM roles
+auto-derived from IAM edges).
+
+**Validate = plan + apply.** The **Validate** button runs the agent → `tofu
+validate` + `plan` + **`apply`** against the ephemeral Moto server, so it catches
+*apply-time* errors that `plan` alone misses (there's no separate "Deploy";
+**Simulate** is the real run on Lima VMs + containers). Apply makes Validate
+slower — RDS/ALB scenarios take ~120–190s.
 
 How they're driven (for future sessions): the dev server runs (`uv run odin
 start --dev`), a Playwright browser drives `localhost:4200`. Nodes are dropped by
 dispatching an HTML5 `drop` with a `DataTransfer` carrying the sidebar abbr;
 edges are drawn by `page.mouse` dragging from a source node's handle to a
-target's; then the top-bar **VALIDATE ALL** button runs the agent. See the
-session transcript for the exact Playwright helpers.
+target's; then the top-bar **Validate** button runs the agent. Note: a prompt
+change only takes effect after clearing `.odin/agent_session_id` (a resumed agent
+session keeps its original system prompt).
 
 ## Results
 
-All 10 pass: every node reaches `validated` through the live agent, built via the
-real UI. Run 2026-06-21.
+All 15 pass: every node reaches `validated` through the live agent, built via the
+real UI. Re-run 2026-06-21 with Validate = plan + **apply**.
 
 | # | Scenario | Services exercised | Result |
 |---|----------|--------------------|--------|
-| S1 | Serverless REST API | API Gateway, Lambda, DynamoDB, CloudWatch Logs, IAM (edges) | ✅ 4/4 (agent also created `new-function-role`) |
+| S1 | Serverless REST API | API Gateway, Lambda, DynamoDB, CloudWatch Logs, IAM | ✅ 4/4 (agent also created the Lambda IAM role) |
 | S2 | 3-tier web app | VPC, Subnet, Security Group, EC2, RDS, ALB, S3 | ✅ 7/7 |
 | S3 | Event-driven data pipeline | S3, 2×Lambda, SQS, DynamoDB, SNS, EventBridge, IAM | ✅ 7/7 |
 | S4 | Container microservices | VPC, Subnet, ECS, ALB, RDS, Secrets Manager, S3 | ✅ 7/7 |
 | S5 | Secure API + storage | API Gateway, Lambda, S3, KMS, Secrets Manager, Route 53, Logs | ✅ 7/7 |
-| S6 | Multi-AZ HA web tier | VPC, 2×Subnet, 2×EC2, ALB, RDS, Security Group | ✅ 8/8 |
+| S6 | Multi-AZ HA web tier | VPC, 2×Subnet, 2×EC2, ALB, RDS, Security Group | ✅ 8/8 (caught the subnet-CIDR bug below) |
 | S7 | Static site + dynamic API | S3, Route 53, API Gateway, Lambda, DynamoDB | ✅ 5/5 |
 | S8 | Streaming analytics | Kinesis, Lambda, DynamoDB, S3, SNS, CloudWatch Logs | ✅ 6/6 |
 | S9 | Scheduled secure batch | EventBridge, Lambda, RDS, Secrets Manager, KMS, SQS, Logs | ✅ 7/7 |
 | S10 | Full VPC networking stack | VPC, Internet Gateway, 2×Subnet, EC2, Elastic IP, ALB, Security Group, Route 53 | ✅ 9/9 |
+| S11 | Container platform + storage | VPC, Subnet, ECS, EFS, ALB, Security Group | ✅ 6/6 |
+| S12 | Full event mesh | EventBridge, Lambda, Kinesis, SQS, SNS, DynamoDB, Logs | ✅ 7/7 |
+| S13 | Compute + block storage | VPC, Subnet, EC2, EBS, Elastic IP, Security Group, Internet Gateway | ✅ 7/7 |
+| S14 | Secure data API | API Gateway, Lambda, RDS, Secrets Manager, KMS, Logs | ✅ 6/6 |
+| S15 | Big mixed stress test | VPC, Subnet, EC2, RDS, API GW, Lambda, DynamoDB, S3, SQS, SNS, Secrets, KMS, Logs | ✅ 13/13 (Lambda → 7 targets) |
 
-### Bugs found & fixed during this run
+### Bugs found & fixed
 
-- **Duplicate node labels collided.** Dropping two nodes of one type (e.g. S3's
-  two Lambdas, S6's two Subnets/EC2s) gave both the same default label, and the
-  registry keys on `{type}_{label}` — so they silently merged into one entry.
+- **Duplicate node labels collided.** Two nodes of one type dropped with the same
+  default label merged into one registry entry (it keys on `{type}_{label}`).
   Fixed by auto-suffixing the default label (`new-function-2`, …) on drop/add
-  (`ui/src/components/Canvas.tsx`). S3 and S6 then validated all nodes distinctly.
+  (`ui/src/components/Canvas.tsx`).
+- **Identical subnet CIDRs.** Found on the S6 re-run once Validate started
+  applying: the agent gave two subnets in one VPC the same `10.0.1.0/24`, which
+  passes `plan` but fails `apply` (`InvalidSubnet.Conflict`). Fixed with a subnet
+  prompt hint requiring distinct, non-overlapping CIDRs across AZs
+  (`src/odin/resources.py`). S6/S10 then got `10.0.1.0/24` + `10.0.2.0/24`.
 
 ## Scenario details
 
-**S1 — Serverless REST API.** API Gateway → Lambda → DynamoDB; Lambda →
-CloudWatch Logs. IAM edges from Lambda to DynamoDB and Logs. Expect the agent to
-add an `aws_iam_role` + policy for the Lambda. ✅ All validated.
+**S1 — Serverless REST API.** API Gateway → Lambda → DynamoDB; Lambda → Logs.
+IAM edges from Lambda. Agent adds an `aws_iam_role` for the Lambda.
 
-**S2 — 3-tier web app.** A VPC containing a Subnet containing an EC2 web server;
-a Security Group; an RDS database; an ALB in front of the EC2; an S3 bucket for
-static assets. Tests spatial containment + DB + load balancer.
+**S2 — 3-tier web app.** VPC ⊃ Subnet ⊃ EC2; Security Group; RDS; ALB → EC2; S3.
 
-**S3 — Event-driven data pipeline.** S3 (uploads) → Lambda (ingest) → SQS →
-Lambda (worker) → DynamoDB; SNS for alerts; EventBridge for a schedule. Tests
-messaging fan-out + multiple IAM edges.
+**S3 — Event-driven pipeline.** S3 → Lambda (ingest) → SQS → Lambda (worker) →
+DynamoDB; SNS; EventBridge. Two distinct Lambdas (dup-label fix).
 
-**S4 — Container microservices.** VPC ⊃ Subnet ⊃ ECS cluster; ALB → ECS; RDS;
-Secrets Manager for DB credentials; S3. Tests containers + secrets + LB + DB.
+**S4 — Container microservices.** VPC ⊃ Subnet ⊃ ECS; ALB → ECS; RDS; Secrets; S3.
 
-**S5 — Secure API + storage.** API Gateway → Lambda → S3 + KMS + Secrets
-Manager; Route 53 for DNS; CloudWatch Logs. Tests the security services + DNS.
+**S5 — Secure API + storage.** API Gateway → Lambda → S3 + KMS + Secrets; Route
+53; Logs.
 
-**S6 — Multi-AZ HA web tier.** VPC with two Subnets (different AZs), an EC2 in
-each, an ALB spanning both, an RDS, and a Security Group. Tests a high-
-availability layout.
+**S6 — Multi-AZ HA web tier.** VPC, two Subnets (distinct CIDRs/AZs), an EC2 in
+each, ALB, RDS, Security Group.
 
-**S7 — Static site + dynamic API.** S3 website + Route 53; plus API Gateway →
-Lambda → DynamoDB for the dynamic part. Tests a hybrid static/serverless app.
+**S7 — Static site + dynamic API.** S3 + Route 53; plus API Gateway → Lambda →
+DynamoDB.
 
-**S8 — Streaming analytics.** Kinesis → Lambda → DynamoDB + S3 (data lake); SNS
-alerts; CloudWatch Logs. Tests a streaming/data-processing pipeline.
+**S8 — Streaming analytics.** Kinesis → Lambda → DynamoDB + S3; SNS; Logs.
 
-**S9 — Scheduled secure batch.** EventBridge (schedule) → Lambda → RDS + Secrets
-Manager + KMS; SQS as a dead-letter queue; CloudWatch Logs. Tests a secure
-scheduled job.
+**S9 — Scheduled secure batch.** EventBridge → Lambda → RDS + Secrets + KMS; SQS;
+Logs.
 
-**S10 — Full VPC networking stack.** VPC with an Internet Gateway, two Subnets,
-an EC2, an Elastic IP, an ALB, a Security Group, and Route 53. Networking-heavy.
+**S10 — Full VPC networking stack.** VPC, Internet Gateway, two Subnets, EC2,
+Elastic IP, ALB, Security Group, Route 53.
+
+**S11 — Container platform + storage.** VPC ⊃ Subnet ⊃ ECS mounting EFS; ALB →
+ECS; Security Group.
+
+**S12 — Full event mesh.** EventBridge → Lambda; Lambda ↔ Kinesis, SQS, SNS,
+DynamoDB, Logs.
+
+**S13 — Compute + block storage.** VPC ⊃ Subnet ⊃ EC2 with an attached EBS
+volume; Elastic IP; Security Group; Internet Gateway.
+
+**S14 — Secure data API.** API Gateway → Lambda → RDS + Secrets + KMS; Logs.
+
+**S15 — Big mixed stress test.** 13 services: VPC ⊃ Subnet ⊃ EC2 → RDS, plus API
+Gateway → Lambda fanning out to DynamoDB, S3, SQS, SNS, Secrets, KMS, and Logs.
+Stresses the agent with a large graph; all applied cleanly.
