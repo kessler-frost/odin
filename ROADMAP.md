@@ -87,10 +87,22 @@ Gateway, ALB (application/network load balancer).
 - CloudWatch Alarm — Moto returns 404 for `PutMetricAlarm`.
 - CloudFront — same InProgress-status hang class + very heavy HCL; skipped.
 
-**Networking polish:**
-- [ ] Real S3 storage backend (RustFS/MinIO) for object persistence
-- [ ] Simulate mode: wire parked Lima/Nebula real-execution into a UI "Simulate"
-      action (top-bar `...` overflow, to avoid crowding the primary actions)
+## Simulate mode (Done)
+
+Real local execution alongside the Moto path: a "Simulate (Real VMs)" action in
+the top-bar `...` overflow runs the canvas for real via the (formerly parked)
+Lima/Nebula modules — a Lima VM per EC2, a Nebula CA/overlay per VPC, a container
+per Lambda — with "Tear Down Simulation" to clean up. Verified end-to-end (one
+EC2 → a real, SSH-able Ubuntu VM, then deleted).
+
+## Real S3 storage backend
+
+- [ ] Back S3 with **RustFS** so objects persist on disk (Moto's S3 is
+      in-memory). RustFS is chosen over MinIO because it's **Apache 2.0**
+      licensed (MinIO is AGPL). RustFS is S3-compatible; tofu's `aws_s3_bucket`
+      applies against it with path-style addressing. Run it as a managed
+      subprocess and point the `s3` provider endpoint at it (Moto keeps serving
+      the other services).
 
 ## Testing
 
