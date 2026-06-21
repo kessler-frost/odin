@@ -57,7 +57,7 @@ const defaultDataForType: Record<string, Record<string, string>> = {
   vpc: { label: 'new-vpc', resourceId: '', cidr: '10.0.0.0/16', status: 'draft' },
   subnet: { label: 'new-subnet', resourceId: '', cidr: '10.0.1.0/24', status: 'draft' },
   ec2: { label: 'new-instance', resourceId: '', instanceType: 't2.micro', privateIp: '—', overlayIp: '—', status: 'draft' },
-  lambda: { label: 'new-function', runtime: 'python3.12', handler: 'handler.main', memory: '128MB', timeout: '30s timeout', status: 'draft' },
+  lambda: { label: 'new-function', runtime: 'python3.12', handler: 'handler.main', memory: '128MB', timeout: '30s', status: 'draft' },
   s3: { label: 'new-bucket', arn: '', status: 'draft' },
   sg: { label: 'new-sg', groupId: '', vpcId: '', inboundRules: '', outboundRules: '', status: 'draft' },
   dynamodb: { label: 'new-table', hashKey: 'id', billingMode: 'PAY_PER_REQUEST', arn: '', status: 'draft' },

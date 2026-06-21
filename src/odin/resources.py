@@ -40,7 +40,8 @@ RESOURCE_SPECS: tuple[ResourceSpec, ...] = (
         '`aws_lambda_function` needs a deployment package: set '
         '`filename = "placeholder.zip"` (Odin provides this file in the tf dir) '
         'plus `handler`, `runtime`, and a `role` ARN. Do NOT invent your own zip '
-        'path or try to create one.',
+        'path or try to create one. If the node has `memory`/`timeout`, set '
+        '`memory_size` (MB) and `timeout` (seconds) — use just the numbers.',
     ),
     ResourceSpec("s3", "aws_s3_bucket", "s3"),
     ResourceSpec(
