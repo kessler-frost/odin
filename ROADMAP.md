@@ -74,32 +74,21 @@ Resource definitions are centralized: backend in `src/odin/resources.py`
 (`RESOURCE_SPECS` → node→AWS type map, provider endpoints, agent prompt hints);
 frontend in `ui/src/lib/catalog.ts` (node, config fields, sidebar group, IAM).
 
-**Done:** VPC, Subnet, Security Group, EC2, Lambda, S3, DynamoDB.
+**Done (22 resource types), each verified deploying to Moto:**
+VPC, Subnet, Security Group, EC2, Lambda, S3, DynamoDB, SQS, SNS, Kinesis,
+RDS, Secrets Manager, KMS, IAM Role, Route 53, API Gateway, EFS, SSM Parameter,
+ECS, CloudWatch Log Group, EventBridge, EBS Volume.
 
-**Tier 1 — extremely common (build first):**
-- [ ] RDS (relational DB instance)
-- [ ] SQS (queue)
-- [ ] SNS (topic)
-- [ ] API Gateway (REST API)
-- [ ] ELB / ALB (load balancer + target group)
-- [ ] CloudWatch Log Group
-- [ ] Route 53 (hosted zone + record)
-- [ ] Secrets Manager (secret)
-- [ ] IAM Role (standalone node)
-- [ ] ECS (cluster + Fargate service)
-- [ ] EventBridge (rule + bus)
-- [ ] KMS (key)
-
-**Tier 2 — common:**
-- [ ] ElastiCache (Redis/Memcached)
+**Still to add:**
+- [ ] ELB / ALB (load balancer + target group — needs subnets/SG wiring)
+- [ ] Step Functions (state machine — needs role + definition)
 - [ ] CloudFront (distribution)
-- [ ] Step Functions (state machine)
-- [ ] Kinesis (stream)
-- [ ] SSM Parameter Store
-- [ ] EFS (file system)
-- [ ] Internet Gateway / NAT Gateway / Route Table
 - [ ] CloudWatch Alarm
-- [ ] EBS Volume
+- [ ] Internet Gateway / NAT Gateway / Route Table
+
+**Dropped — not cleanly Moto-simulatable:**
+- ElastiCache: Moto never transitions the cluster out of "creating", so
+  `tofu apply` hangs on the status wait.
 
 **Networking polish:**
 - [ ] Real S3 storage backend (RustFS/MinIO) for object persistence

@@ -4,6 +4,7 @@ from fastapi.testclient import TestClient
 
 from odin.agent.client import OdinAgent
 from odin.server import create_app
+from odin.simulator.engine import MotoEngine
 
 pytestmark = pytest.mark.tofu
 
@@ -11,7 +12,7 @@ VPC_HCL = 'resource "aws_vpc" "v" {\n  cidr_block = "10.50.0.0/16"\n}\n'
 
 
 @pytest.fixture
-def app_client(moto_engine, registry, tmp_path, monkeypatch):
+def app_client(registry, tmp_path, monkeypatch):
     async def _noop_start(self):
         return
 
@@ -19,9 +20,14 @@ def app_client(moto_engine, registry, tmp_path, monkeypatch):
     tf_dir = tmp_path / "tf"
     monkeypatch.setattr("odin.server.TF_DIR", tf_dir)
     monkeypatch.setattr("odin.server.CANVAS_PATH", tmp_path / "canvas.json")
-    app = create_app(engine=moto_engine, registry=registry)
+    # Own Moto on a distinct port: the app's lifespan stops its engine on
+    # shutdown, which must not kill the shared session Moto (port 4298).
+    engine = MotoEngine(port=4299)
+    engine.start()
+    app = create_app(engine=engine, registry=registry)
     with TestClient(app) as client:
         yield client, registry, tf_dir
+    engine.stop()
 
 
 def test_health(app_client):

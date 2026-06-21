@@ -30,8 +30,10 @@ def registry(tmp_path) -> ResourceRegistry:
     return ResourceRegistry(path)
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def moto_engine():
+    # One Moto server for the whole session (startup is the slow part); each
+    # tofu test resets it for isolation via the tofu_runner fixture below.
     engine = MotoEngine(port=TEST_PORT)
     engine.start()
     yield engine
@@ -40,4 +42,6 @@ def moto_engine():
 
 @pytest.fixture
 def tofu_runner(tmp_path, moto_engine) -> TofuRunner:
+    moto_engine.start()  # idempotent: heal if a prior app-lifespan test stopped it
+    moto_engine.reset()  # clean Moto state per test (server stays up)
     return TofuRunner(tmp_path / "tf", moto_engine.endpoint_url)
