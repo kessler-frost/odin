@@ -411,17 +411,25 @@ function InnerCanvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onS
       const position = screenToFlowPosition({ x: event.clientX, y: event.clientY });
       position.x = Math.round(position.x / 20) * 20;
       position.y = Math.round(position.y / 20) * 20;
-      setNodes((nds) => [
-        ...nds,
-        {
-          id: nextId(type),
-          type,
-          position,
-          zIndex: zIndexForType[type] ?? 2,
-          data: { ...defaultDataForType[type] },
-          style: { ...defaultStyleForType[type] },
-        },
-      ]);
+      setNodes((nds) => {
+        // Keep labels unique — the registry keys on `{type}_{label}`, so two
+        // nodes of a type with the same default label would otherwise collide.
+        const base = defaultDataForType[type].label;
+        const taken = new Set(nds.map((n) => (n.data as { label?: string })?.label));
+        let label = base;
+        for (let i = 2; taken.has(label); i++) label = `${base}-${i}`;
+        return [
+          ...nds,
+          {
+            id: nextId(type),
+            type,
+            position,
+            zIndex: zIndexForType[type] ?? 2,
+            data: { ...defaultDataForType[type], label },
+            style: { ...defaultStyleForType[type] },
+          },
+        ];
+      });
     },
     [setNodes, screenToFlowPosition],
   );
@@ -436,17 +444,25 @@ function InnerCanvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onS
       const position = screenToFlowPosition({ x: event.clientX, y: event.clientY });
       position.x = Math.round(position.x / 20) * 20;
       position.y = Math.round(position.y / 20) * 20;
-      setNodes((nds) => [
-        ...nds,
-        {
-          id: nextId(type),
-          type,
-          position,
-          zIndex: zIndexForType[type] ?? 2,
-          data: { ...defaultDataForType[type] },
-          style: { ...defaultStyleForType[type] },
-        },
-      ]);
+      setNodes((nds) => {
+        // Keep labels unique — the registry keys on `{type}_{label}`, so two
+        // nodes of a type with the same default label would otherwise collide.
+        const base = defaultDataForType[type].label;
+        const taken = new Set(nds.map((n) => (n.data as { label?: string })?.label));
+        let label = base;
+        for (let i = 2; taken.has(label); i++) label = `${base}-${i}`;
+        return [
+          ...nds,
+          {
+            id: nextId(type),
+            type,
+            position,
+            zIndex: zIndexForType[type] ?? 2,
+            data: { ...defaultDataForType[type], label },
+            style: { ...defaultStyleForType[type] },
+          },
+        ];
+      });
     },
     [setNodes, screenToFlowPosition],
   );
