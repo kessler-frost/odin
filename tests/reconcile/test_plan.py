@@ -71,6 +71,19 @@ def test_errored_service_recovers_when_refs_ready():
     assert RunContainer(id="api") in plan(STACK, world)
 
 
+def test_two_services_share_one_db():
+    api2 = ResourceDesired(
+        id="api2", kind="service", fields={"image": FieldValue(value="app:latest")},
+        refs=(Ref(var="DATABASE_URL", target_id="db", target_attr="DATABASE_URL"),),
+    )
+    stack = Stack(resources=(DB, API, api2))
+    world = _world(
+        ResourceObserved(id="db", kind="rds", phase="healthy", facts={"DATABASE_URL": "x"}),
+    )
+    actions = plan(stack, world)
+    assert RunContainer(id="api") in actions and RunContainer(id="api2") in actions
+
+
 def test_prune_extra():
     world = _world(ResourceObserved(id="ghost", kind="service", phase="healthy"))
     actions = plan(STACK, world)

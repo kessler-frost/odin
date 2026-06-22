@@ -1,4 +1,29 @@
-# Odin — End-to-End User Scenarios
+# allfather — End-to-End Scenarios
+
+> **Architecture pivot (2026-06-21):** allfather replaces odin's old one-shot
+> Moto/OpenTofu **validate** path with a continuous Reconciler + embedded
+> MiniStack. The 15 AWS-drawing scenarios further below tested the *retired*
+> agent→tofu→Moto validate flow and are kept only as legacy reference — they no
+> longer run (there is no `/validate`). The live scenarios are now these:
+
+## Walking-skeleton scenarios (S0–S3, the new model)
+
+Driven through the real UI (`uvicorn odin.server:create_app --factory`) + Colima.
+
+| # | Scenario | Exercises | Result |
+|---|----------|-----------|--------|
+| W1 | App + RDS, `${{db.DATABASE_URL}}` | embed MiniStack, RDS→real Postgres via allfather's runner (no double-spawn), ref-gated app start, live status tiles | ✅ db+api → healthy; app received the injected URL |
+| W2 | Kill the app container | crash detection + auto-restart (supervision) | ✅ crashed → starting → healthy, no user action |
+| W3 | Destroy | prune containers + MiniStack RDS record | ✅ 0 containers, 0 World resources |
+| W4 | Backend integration (`tests/aws/test_skeleton_e2e.py -m integration`) | the whole spine headless: apply → real Postgres + app, restart, teardown | ✅ green |
+
+Verified 2026-06-21 via playwright-cli (browser) + the integration test. Both
+nodes reach a green `HEALTHY` badge; the app's 200 depends on the resolved
+`DATABASE_URL`, so health proves the ref wiring end to end.
+
+---
+
+# Legacy: odin AWS validate scenarios (SUPERSEDED — retired Moto/tofu path)
 
 Realistic multi-service platform architectures, each **built through the actual
 UI** (drag-drop nodes from the sidebar, draw edges handle-to-handle) and
