@@ -73,6 +73,18 @@ export const CATALOG: ServiceDef[] = [
     primary: { key: 'image', label: 'Image' },
   },
   {
+    type: 'llm', abbr: 'LLM', label: 'LLM Endpoint', sublabel: 'Local model (omlx)',
+    category: 'Compute', color: 'fuchsia', width: 220,
+    fields: [
+      { key: 'label', label: 'Name', editable: true },
+      { key: 'image', label: 'Server image', editable: true },
+      { key: 'port', label: 'Port', editable: true },
+      { key: 'memory_mib', label: 'Memory (MiB)', editable: true },
+    ],
+    defaultData: { label: 'model', image: 'omlx-server:latest', port: '1234', memory_mib: '4096' },
+    primary: { key: 'image', label: 'Server' },
+  },
+  {
     type: 'batch', abbr: 'JOB', label: 'Batch Job', sublabel: 'Run-to-completion',
     category: 'Compute', color: 'amber', width: 220,
     fields: [

@@ -157,6 +157,29 @@ async def test_scheduler_queues_over_budget_then_runs_when_freed(tmp_path):
     assert "b" in rt.runs
 
 
+async def test_llm_evicted_to_make_room_for_service(tmp_path):
+    from odin.reconcile.scheduler import Scheduler
+
+    rt, rds = FakeRuntime(), FakeRds()
+    store = SpecStore(tmp_path)
+    llm = ResourceDesired(id="model", kind="llm",
+                          fields={"image": FieldValue(value="m"), "port": FieldValue(value=1234),
+                                  "memory_mib": FieldValue(value=200)})
+    svc = ResourceDesired(id="svc", kind="service",
+                          fields={"image": FieldValue(value="s"), "memory_mib": FieldValue(value=200)})
+    store.apply(Stack(resources=(llm,)))
+    recon = Reconciler(store, rt, rds, scheduler=Scheduler(budget_mib=300),
+                       http_ok=_yes, pg_ready=_yes, poll_interval=0)
+
+    await recon.tick(); await recon.tick()   # the model loads and goes healthy
+    assert store.current_world().get("model").phase == "healthy"
+
+    store.apply(Stack(resources=(llm, svc)))  # a service now needs memory
+    await recon.tick()                        # evict the idle model to fit the service
+    assert store.current_world().get("model").phase == "evicted"
+    assert "svc" in rt.runs
+
+
 async def test_dep_healthy_publishes_endpoint(tmp_path):
     rt, rds = FakeRuntime(), FakeRds()
     store = SpecStore(tmp_path)

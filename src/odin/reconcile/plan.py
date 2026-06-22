@@ -51,7 +51,7 @@ def plan(stack: Stack, world: World) -> list[Action]:
                 actions.append(CreateMiniStackResource(id=res.id, service="rds"))
             else:
                 actions.append(NoOp(id=res.id))
-        elif res.kind in ("service", "dep"):
+        elif res.kind in ("service", "dep", "llm"):
             if not _refs_ready(res, world):
                 actions.append(NoOp(id=res.id))  # blocked; reconciler sets the phase
             elif phase in ("pending", "crashed", "blocked", "error", "queued"):

@@ -115,7 +115,7 @@ class Reconciler:
                 await self._observe_rds(res)
             elif res.kind == "service" and observed.phase in ("starting", "healthy"):
                 await self._observe_service(res)
-            elif res.kind == "dep" and observed.phase in ("starting", "healthy"):
+            elif res.kind in ("dep", "llm") and observed.phase in ("starting", "healthy"):
                 await self._observe_dep(res)
             elif res.kind == "batch" and observed.phase == "running":
                 await self._observe_batch(res)
@@ -158,12 +158,12 @@ class Reconciler:
         publishes its loopback endpoint as facts other nodes can reference."""
         facts = self._rt.facts(res.id, container_port=self._port(res))
         if facts.phase != "starting":
-            await self._emit(res.id, "dep", "crashed")
+            await self._emit(res.id, res.kind, "crashed")
             return
         if not facts.host_port:
             return
         await self._emit(
-            res.id, "dep", "healthy",
+            res.id, res.kind, "healthy",
             facts={"endpoint": f"127.0.0.1:{facts.host_port}", "HOST": "127.0.0.1",
                    "PORT": facts.host_port, "host_port": facts.host_port,
                    "cpu": facts.cpu, "ram": facts.ram},
@@ -210,13 +210,29 @@ class Reconciler:
             and obs.phase in ("starting", "healthy", "running")
         )
 
+    def _evictable_llms(self, stack: Stack, exclude: str) -> list:
+        world = self._store.current_world(self._env)
+        by_id = {r.id: r for r in stack.resources}
+        return [
+            by_id[obs.id] for obs in world.resources
+            if obs.id != exclude and obs.id in by_id
+            and by_id[obs.id].kind == "llm" and obs.phase in ("starting", "healthy", "idle")
+        ]
+
     async def _run_service(self, stack: Stack, rid: str) -> None:
         res = self._res(stack, rid)
-        if self._scheduler is not None and not self._scheduler.admits(
-            res, self._running_footprint(stack, exclude=rid)
-        ):
-            await self._emit(rid, res.kind, "queued")  # won't fit the memory budget
-            return
+        if self._scheduler is not None:
+            running = self._running_footprint(stack, exclude=rid)
+            if not self._scheduler.admits(res, running):
+                # Make room by evicting idle LLMs (only for higher-priority non-llm work).
+                candidates = self._evictable_llms(stack, exclude=rid) if res.kind != "llm" else []
+                to_evict = self._scheduler.evict_for(res, candidates, running)
+                if not to_evict:
+                    await self._emit(rid, res.kind, "queued")
+                    return
+                for eid in to_evict:
+                    self._rt.stop(eid)
+                    await self._emit(eid, "llm", "evicted")
         world = self._store.current_world(self._env)
         env_vars = dict(res.fields["env"].value) if "env" in res.fields else {}
         for ref in res.refs:

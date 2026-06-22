@@ -14,7 +14,8 @@ from odin.spec.models import Edge, FieldValue, Ref, ResourceDesired, Stack
 _REF = re.compile(r"^\$\{\{\s*([\w-]+)\.([\w-]+)\s*\}\}$")
 
 # Canvas node type -> Stack kind.
-_KIND = {"service": "service", "app": "service", "rds": "rds", "batch": "batch", "dep": "dep"}
+_KIND = {"service": "service", "app": "service", "rds": "rds",
+         "batch": "batch", "dep": "dep", "llm": "llm"}
 
 
 def parse_ref(var: str, value: str) -> Ref | None:

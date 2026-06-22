@@ -30,3 +30,23 @@ class Scheduler:
 
     def admits(self, res: ResourceDesired, running_mib: float) -> bool:
         return running_mib + self.footprint(res) <= self._budget
+
+    def evict_for(
+        self, res: ResourceDesired, candidates: list[ResourceDesired], running_mib: float
+    ) -> list[str]:
+        """LLM ids to evict (idle-LRU order from the caller) so `res` fits.
+
+        Returns [] if `res` already fits OR eviction still can't free enough (the
+        caller then queues it). Only ever evicts the provided candidates (LLMs).
+        """
+        deficit = (running_mib + self.footprint(res)) - self._budget
+        if deficit <= 0:
+            return []
+        evicted: list[str] = []
+        freed = 0.0
+        for candidate in candidates:
+            evicted.append(candidate.id)
+            freed += self.footprint(candidate)
+            if freed >= deficit:
+                return evicted
+        return []
