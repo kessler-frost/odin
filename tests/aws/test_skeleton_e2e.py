@@ -68,7 +68,7 @@ def runtime():
 
 
 def test_skeleton_slice_end_to_end(tmp_path, runtime):
-    app = create_app(runtime=runtime, store=SpecStore(tmp_path), embed=True)
+    app = create_app(runtime=runtime, store=SpecStore(tmp_path), embed=True, complete=False)
     with TestClient(app) as client:
         assert client.post("/apply", json=CANVAS).json()["status"] == "applied"
 

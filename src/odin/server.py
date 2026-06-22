@@ -34,12 +34,18 @@ ENV = "default"
 log = logging.getLogger("odin")
 
 
-def create_apply_router(store: SpecStore, reconciler: Reconciler) -> APIRouter:
+def create_apply_router(store: SpecStore, reconciler: Reconciler, complete_fn=None) -> APIRouter:
     router = APIRouter()
 
     @router.post("/apply")
     async def apply(graph: CanvasGraph) -> dict:
-        rev = store.apply(canvas_to_stack(graph.model_dump(), env=ENV))
+        stack = canvas_to_stack(graph.model_dump(), env=ENV)
+        if complete_fn is not None:  # best-effort AI completion; defaults cover failure
+            try:
+                stack = await complete_fn(stack)
+            except Exception:
+                log.exception("brain completion failed; applying as-is")
+        rev = store.apply(stack)
         await reconciler.tick()  # kick an immediate pass; the loop continues it
         return {"status": "applied", "rev": rev}
 
@@ -61,6 +67,7 @@ def create_app(
     store: SpecStore | None = None,
     rds=None,
     embed: bool = True,
+    complete: bool = True,
 ) -> FastAPI:
     _runtime = runtime or ColimaRuntime()
     _store = store or SpecStore(ODIN_DIR)
@@ -70,6 +77,10 @@ def create_app(
         _store, _runtime, _rds, fabric=LocalhostFabric(),
         ws=ws_manager, env=ENV, poll_interval=1.0,
     )
+    complete_fn = None
+    if complete:
+        from odin.agent.brain import claude_complete
+        complete_fn = claude_complete
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -86,7 +97,7 @@ def create_app(
 
     app = FastAPI(title="allfather", version="0.1.0", lifespan=lifespan)
     app.include_router(create_canvas_router(CANVAS_PATH))
-    app.include_router(create_apply_router(_store, reconciler))
+    app.include_router(create_apply_router(_store, reconciler, complete_fn=complete_fn))
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):

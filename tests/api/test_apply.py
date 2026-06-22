@@ -59,7 +59,7 @@ CANVAS = {
 
 def test_apply_translates_stores_and_reconciles(tmp_path):
     rt, rds = FakeRuntime(), FakeRds()
-    app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, embed=False)
+    app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, embed=False, complete=False)
     with TestClient(app) as client:
         resp = client.post("/apply", json=CANVAS)
         assert resp.json()["status"] == "applied" and resp.json()["rev"]
@@ -74,7 +74,7 @@ def test_apply_translates_stores_and_reconciles(tmp_path):
 
 def test_destroy_prunes(tmp_path):
     rt, rds = FakeRuntime(), FakeRds()
-    app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, embed=False)
+    app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, embed=False, complete=False)
     with TestClient(app) as client:
         client.post("/apply", json=CANVAS)
         client.post("/destroy")

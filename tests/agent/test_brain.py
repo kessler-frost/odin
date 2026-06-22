@@ -1,0 +1,28 @@
+"""M1 — the real Brain (claude-agent-sdk) fills missing fields.
+
+Marked `integration`: drives the Claude Code CLI. Values are non-deterministic,
+so we assert the gaps got filled + tagged `ai` and the user value survived.
+"""
+from __future__ import annotations
+
+import pytest
+
+from odin.agent.brain import claude_complete
+from odin.spec.models import FieldValue, ResourceDesired, Stack
+
+pytestmark = pytest.mark.integration
+
+
+async def test_claude_fills_rds_gaps():
+    stack = Stack(resources=(
+        ResourceDesired(id="db", kind="rds",
+                        fields={"engine": FieldValue(value="postgres", provenance="user")}),
+    ))
+    out = await claude_complete(stack)
+    db = out.resources[0]
+
+    assert db.fields["engine"].value == "postgres"        # user value survives
+    assert db.fields["engine"].provenance == "user"
+    for field in ("username", "password", "port"):
+        assert field in db.fields                          # gap filled
+        assert db.fields[field].provenance == "ai"         # tagged AI
