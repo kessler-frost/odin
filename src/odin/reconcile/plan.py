@@ -33,7 +33,9 @@ def plan(stack: Stack, world: World) -> list[Action]:
     # Prune: anything observed but no longer desired.
     for observed in world.resources:
         if observed.id not in desired_ids:
-            actions.append(StopContainer(id=observed.id, name=observed.id))
+            actions.append(
+                StopContainer(id=observed.id, name=observed.id, kind=observed.kind)
+            )
 
     for res in stack.resources:
         observed = world.get(res.id)

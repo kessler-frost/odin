@@ -25,6 +25,7 @@ class RunContainer:
 class StopContainer:
     id: str
     name: str
+    kind: str = "service"
 
 
 @dataclass(frozen=True)

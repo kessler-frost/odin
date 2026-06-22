@@ -26,6 +26,7 @@ class ContainerSpec:
     env: dict[str, str] = field(default_factory=dict)
     ports: dict[int, int] = field(default_factory=dict)  # container_port -> host_port
     labels: dict[str, str] = field(default_factory=dict)
+    command: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -87,6 +88,7 @@ class ColimaRuntime:
         for cport, hport in spec.ports.items():
             args += ["-p", (f"{hport}:{cport}" if hport else str(cport))]
         args.append(spec.image)
+        args += list(spec.command)
         cid = self._docker(*args)
         return RunHandle(id=cid, name=spec.name)
 

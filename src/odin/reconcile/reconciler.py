@@ -101,7 +101,8 @@ class Reconciler:
         world = self._store.current_world(self._env)
         for res in stack.resources:
             observed = world.get(res.id)
-            if observed is None or observed.phase in ("pending",):
+            # Only observe things that were actually started; plan() handles the rest.
+            if observed is None or observed.phase not in ("starting", "healthy"):
                 continue
             if res.kind == "rds":
                 await self._observe_rds(res)
@@ -127,10 +128,11 @@ class Reconciler:
 
     async def _observe_service(self, res: ResourceDesired) -> None:
         facts = self._rt.facts(res.id, container_port=self._port(res))
-        if facts.phase == "crashed":
+        if facts.phase != "starting":
+            # Not running (exited / removed / absent) while we expected it up.
             await self._emit(res.id, "service", "crashed")
             return
-        if facts.phase != "starting" or not facts.host_port:
+        if not facts.host_port:
             return
         url = f"http://127.0.0.1:{facts.host_port}/"
         if await self._http_ok(url):
@@ -150,7 +152,8 @@ class Reconciler:
         elif isinstance(action, RunContainer):
             await self._run_service(stack, action.id)
         elif isinstance(action, StopContainer):
-            self._rt.stop(action.name)
+            name = self._rds.container_name(action.id) if action.kind == "rds" else action.name
+            self._rt.stop(name)
             self._prune(action.id)
         elif isinstance(action, NoOp):
             await self._gate_blocked(stack, action.id)
@@ -161,11 +164,13 @@ class Reconciler:
         env_vars = dict(res.fields["env"].value) if "env" in res.fields else {}
         for ref in res.refs:
             env_vars[ref.var] = self._fabric.resolve(ref, world)
+        command = tuple(res.fields["command"].value) if "command" in res.fields else ()
         spec = ContainerSpec(
             name=rid,
             image=str(res.fields["image"].value),
             env={k: str(v) for k, v in env_vars.items()},
             ports={self._port(res): 0},
+            command=command,
         )
         self._rt.stop(rid)  # idempotent: clear any crashed remnant before re-run
         self._rt.run_container(spec)
