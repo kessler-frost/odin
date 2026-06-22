@@ -47,6 +47,19 @@ export default function App() {
 
   const handleValidateSelected = handleApply;
 
+  // Staged changeset: show what the AI would fill before committing with Apply.
+  const handlePreview = useCallback(async () => {
+    const canvas = await fetch('/canvas').then(r => r.json()).catch(() => null);
+    if (!canvas) return;
+    const res = await fetch(`/preview?env=${encodeURIComponent(env)}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(canvas),
+    }).then(r => r.json()).catch(() => null);
+    const diff = res?.diff ?? {};
+    const lines = Object.entries(diff).flatMap(([id, fields]: [string, any]) =>
+      Object.entries(fields).map(([k, v]) => `${id}.${k} = ${v}  [AI]`));
+    window.alert(lines.length ? `AI would set:\n\n${lines.join('\n')}` : 'No AI-proposed changes — apply will run as drawn.');
+  }, [env]);
+
   const handleDestroy = useCallback(async () => {
     await fetch(`/destroy?env=${encodeURIComponent(env)}`, { method: 'POST' }).catch(() => {});
   }, [env]);
@@ -100,7 +113,7 @@ export default function App() {
       }}
     >
       {/* Row 1: TopBar */}
-      <div className="col-span-full"><TopBar wsConnected={wsConnected} env={env} onEnvChange={setEnv} onApply={handleApply} onDestroy={handleDestroy} onReset={() => { resetDraftsRef.current?.(); setClearLogSignal(s => s + 1); }} /></div>
+      <div className="col-span-full"><TopBar wsConnected={wsConnected} env={env} onEnvChange={setEnv} onPreview={handlePreview} onApply={handleApply} onDestroy={handleDestroy} onReset={() => { resetDraftsRef.current?.(); setClearLogSignal(s => s + 1); }} /></div>
 
       {/* Row 2: Sidebar + Canvas + Config */}
       <div className="overflow-hidden">

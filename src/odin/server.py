@@ -65,6 +65,31 @@ def create_apply_router(store: SpecStore, reconciler_for, complete_fn=None) -> A
         await reconciler.tick()
         return {"status": "destroyed", "env": env}
 
+    @router.post("/preview")
+    async def preview(graph: CanvasGraph, env: str = ENV) -> dict:
+        """Staged changeset: what the AI would fill, for review before Apply."""
+        from odin.agent.completion import ai_diff
+
+        stack = canvas_to_stack(graph.model_dump(), env=env)
+        if complete_fn is not None:
+            try:
+                stack = await complete_fn(stack)
+            except Exception:
+                log.exception("preview completion failed")
+        return {"diff": ai_diff(stack), "env": env}
+
+    @router.post("/review-iam")
+    async def review_iam_route(graph: CanvasGraph, env: str = ENV) -> dict:
+        from odin.agent.brain import review_iam
+
+        stack = canvas_to_stack(graph.model_dump(), env=env)
+        try:
+            findings = await review_iam(stack)
+        except Exception:
+            log.exception("iam review failed")
+            findings = []
+        return {"findings": findings, "env": env}
+
     @router.get("/world")
     def world(env: str = ENV) -> dict:
         return store.current_world(env).model_dump()

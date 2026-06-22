@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import pytest
 
-from odin.agent.brain import claude_complete
-from odin.spec.models import FieldValue, ResourceDesired, Stack
+from odin.agent.brain import claude_complete, review_iam
+from odin.spec.models import Edge, FieldValue, ResourceDesired, Stack
 
 pytestmark = pytest.mark.integration
 
@@ -26,3 +26,10 @@ async def test_claude_fills_rds_gaps():
     for field in ("username", "password", "port"):
         assert field in db.fields                          # gap filled
         assert db.fields[field].provenance == "ai"         # tagged AI
+
+
+async def test_review_iam_returns_list():
+    assert await review_iam(Stack()) == []                 # no edges -> no call
+    stack = Stack(edges=(Edge(src="api", dst="db", kind="iam", perms=("rds:*",)),))
+    findings = await review_iam(stack)
+    assert isinstance(findings, list)                      # LLM returns findings

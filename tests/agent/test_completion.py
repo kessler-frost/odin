@@ -1,7 +1,7 @@
 """S2.4 — schema completion fills gaps, never overrides user values."""
 from __future__ import annotations
 
-from odin.agent.completion import complete, merge_completion, needs_completion
+from odin.agent.completion import ai_diff, complete, merge_completion, needs_completion
 from odin.spec.models import FieldValue, ResourceDesired, Stack
 
 
@@ -25,6 +25,19 @@ def test_merge_fills_only_missing_and_tags_ai():
     assert db.fields["username"].provenance == "user"
     assert db.fields["port"].value == 5432                 # ai filled the gap
     assert db.fields["port"].provenance == "ai"
+
+
+def test_ai_diff_reports_only_ai_filled_fields():
+    stack = Stack(resources=(
+        ResourceDesired(id="db", kind="rds", fields={
+            "engine": FieldValue(value="postgres", provenance="user"),
+            "port": FieldValue(value=5432, provenance="ai"),
+        }),
+        ResourceDesired(id="api", kind="service", fields={
+            "image": FieldValue(value="x", provenance="user"),
+        }),
+    ))
+    assert ai_diff(stack) == {"db": {"port": 5432}}  # api has no AI fields -> omitted
 
 
 def test_complete_orchestrates_fill():

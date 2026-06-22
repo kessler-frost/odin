@@ -18,12 +18,13 @@ interface TopBarProps {
   wsConnected?: boolean;
   env?: string;
   onEnvChange?: (env: string) => void;
+  onPreview?: () => Promise<void>;
   onApply?: () => Promise<void>;
   onDestroy?: () => Promise<void>;
   onReset?: () => void;
 }
 
-export default function TopBar({ wsConnected, env, onEnvChange, onApply, onDestroy, onReset }: TopBarProps) {
+export default function TopBar({ wsConnected, env, onEnvChange, onPreview, onApply, onDestroy, onReset }: TopBarProps) {
   const [validating, setValidating] = useState(false);
   const [backendUp, setBackendUp] = useState(false);
   const [agentUp, setAgentUp] = useState(false);
@@ -91,6 +92,13 @@ export default function TopBar({ wsConnected, env, onEnvChange, onApply, onDestr
         title="Environment (isolated experiment copy)"
         className="font-mono text-xs py-1.5 px-2 w-28 bg-bg-tertiary border border-border-bright text-text-secondary focus:text-neon-green focus:border-neon-green outline-none"
       />
+      <button
+        onClick={() => onPreview?.()}
+        title="Preview the AI's proposed config changes before applying"
+        className="font-mono text-xs py-1.5 px-3 border border-border-bright bg-bg-tertiary text-text-secondary cursor-pointer uppercase tracking-[1px] transition-all duration-200 hover:text-neon-blue hover:border-neon-blue"
+      >
+        Preview
+      </button>
       <button
         onClick={handleApply}
         disabled={validating}

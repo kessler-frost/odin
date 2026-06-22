@@ -44,6 +44,19 @@ def merge_completion(stack: Stack, filled: dict[str, dict[str, object]]) -> Stac
     return stack.model_copy(update={"resources": tuple(resources)})
 
 
+def ai_diff(stack: Stack) -> dict[str, dict[str, object]]:
+    """The fields the AI filled, per resource — the reviewable changeset.
+
+    `{resource_id: {field: value}}` for every field whose provenance is "ai".
+    The UI shows this as a staged diff before the user commits with Apply.
+    """
+    return {
+        res.id: {k: fv.value for k, fv in res.fields.items() if fv.provenance == "ai"}
+        for res in stack.resources
+        if any(fv.provenance == "ai" for fv in res.fields.values())
+    }
+
+
 def complete(stack: Stack, llm_fill: LlmFill) -> Stack:
     """Fill every resource's gaps via the model, then merge (user wins)."""
     gaps = needs_completion(stack)

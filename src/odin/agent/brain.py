@@ -66,3 +66,28 @@ async def claude_complete(stack: Stack) -> Stack:
             log.exception("brain fill failed for %s", rid)
             filled[rid] = {}
     return merge_completion(stack, filled)
+
+
+_IAM_SYSTEM = (
+    "You are a security reviewer for local infrastructure. Reply with ONLY a JSON "
+    "array of short finding strings about least-privilege / blast-radius / "
+    "lateral-movement risks (empty array if the access graph looks fine)."
+)
+
+
+async def review_iam(stack: Stack) -> list[str]:
+    """LLM review of the access graph (the canvas's permission edges)."""
+    os.environ.pop("CLAUDECODE", None)
+    edges = [{"from": e.src, "to": e.dst, "perms": list(e.perms)} for e in stack.edges]
+    if not edges:
+        return []
+    prompt = f"Access edges between resources: {json.dumps(edges)}. Findings?"
+    text = ""
+    async for msg in query(prompt=prompt,
+                           options=ClaudeAgentOptions(system_prompt=_IAM_SYSTEM, allowed_tools=[])):
+        if isinstance(msg, AssistantMessage):
+            for block in msg.content:
+                if isinstance(block, TextBlock):
+                    text += block.text
+    match = re.search(r"\[.*\]", text, re.DOTALL)
+    return json.loads(match.group(0)) if match else []

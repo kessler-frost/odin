@@ -72,6 +72,15 @@ def test_apply_translates_stores_and_reconciles(tmp_path):
         assert "api" not in rt.runs
 
 
+def test_preview_returns_diff_structure(tmp_path):
+    rt, rds = FakeRuntime(), FakeRds()
+    app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, embed=False, complete=False)
+    with TestClient(app) as client:
+        resp = client.post("/preview", json=CANVAS)
+        body = resp.json()
+        assert "diff" in body and body["env"] == "default"  # staged-changeset shape
+
+
 def test_destroy_prunes(tmp_path):
     rt, rds = FakeRuntime(), FakeRds()
     app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, embed=False, complete=False)
