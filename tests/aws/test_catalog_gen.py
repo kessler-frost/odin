@@ -8,7 +8,7 @@ def test_generates_service_nodes_and_skips_internal():
     ts = generate_catalog_ts()
     assert "GENERATED_CATALOG: ServiceDef[]" in ts
     # long-tail AWS services get canvas nodes
-    for svc in ("aws_elasticache", "aws_eks", "aws_cloudformation", "aws_stepfunctions"):
+    for svc in ("aws_elasticache", "aws_eks", "aws_cloudformation", "aws_states"):
         assert f"type: '{svc}'" in ts
     # internal / already-curated ones are skipped
     for skipped in ("aws_sts", "aws_account", "aws_s3", "aws_rds"):
