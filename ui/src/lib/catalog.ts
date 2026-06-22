@@ -7,6 +7,8 @@
 // Class strings are written out in full (not constructed) so Tailwind's scanner
 // keeps them.
 
+import { GENERATED_CATALOG } from './catalog.generated';
+
 export type CatalogField = { key: string; label: string; editable?: boolean; select?: string[] };
 
 export type ColorBundle = {
@@ -238,6 +240,7 @@ export const CATALOG: ServiceDef[] = [
     defaultData: { label: 'new-lb', lbType: 'application', arn: '' },
     primary: { key: 'lbType', label: 'Type' },
   },
+  ...GENERATED_CATALOG,  // full MiniStack service parity (auto-generated)
 ];
 
 export const catalogByType: Record<string, ServiceDef> = Object.fromEntries(
