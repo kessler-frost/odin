@@ -54,14 +54,14 @@ def plan(stack: Stack, world: World) -> list[Action]:
         elif res.kind in ("service", "dep"):
             if not _refs_ready(res, world):
                 actions.append(NoOp(id=res.id))  # blocked; reconciler sets the phase
-            elif phase in ("pending", "crashed", "blocked", "error"):
-                # "error" (a timed-out ref) recovers once the dependency heals.
+            elif phase in ("pending", "crashed", "blocked", "error", "queued"):
+                # "error" recovers when a ref heals; "queued" retries when memory frees.
                 actions.append(RunContainer(id=res.id))
             else:
                 actions.append(NoOp(id=res.id))
         elif res.kind == "batch":
             # run-to-completion: run once when ready; never restart on exit.
-            if phase in ("pending", "blocked") and _refs_ready(res, world):
+            if phase in ("pending", "blocked", "queued") and _refs_ready(res, world):
                 actions.append(RunContainer(id=res.id))
             else:
                 actions.append(NoOp(id=res.id))

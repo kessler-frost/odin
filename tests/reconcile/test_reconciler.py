@@ -134,6 +134,29 @@ async def test_destroy_then_reapply_recreates_db(tmp_path):
     assert rds.created.count("db") == 2                 # re-created, not skipped
 
 
+async def test_scheduler_queues_over_budget_then_runs_when_freed(tmp_path):
+    from odin.reconcile.scheduler import Scheduler
+
+    rt, rds = FakeRuntime(), FakeRds()
+    store = SpecStore(tmp_path)
+    a = ResourceDesired(id="a", kind="service",
+                        fields={"image": FieldValue(value="x"), "memory_mib": FieldValue(value=200)})
+    b = ResourceDesired(id="b", kind="service",
+                        fields={"image": FieldValue(value="x"), "memory_mib": FieldValue(value=200)})
+    store.apply(Stack(resources=(a, b)))
+    recon = Reconciler(store, rt, rds, scheduler=Scheduler(budget_mib=300),
+                       http_ok=_yes, pg_ready=_yes, poll_interval=0)
+
+    await recon.tick()                       # only one 200-MiB service fits in 300
+    phases = sorted([store.current_world().get("a").phase,
+                     store.current_world().get("b").phase])
+    assert phases == ["queued", "starting"]  # one ran, one queued
+
+    store.apply(Stack(resources=(b,)))       # drop a -> frees memory
+    await recon.tick()                       # b now fits and runs
+    assert "b" in rt.runs
+
+
 async def test_dep_healthy_publishes_endpoint(tmp_path):
     rt, rds = FakeRuntime(), FakeRds()
     store = SpecStore(tmp_path)

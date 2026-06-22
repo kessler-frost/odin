@@ -36,6 +36,7 @@ class Reconciler:
         fabric: LocalhostFabric | None = None,
         ws=None,
         env: str = "default",
+        scheduler=None,
         http_ok=assertions.http_ok,
         pg_ready=assertions.pg_ready,
         ref_timeout: float = 30.0,
@@ -44,6 +45,7 @@ class Reconciler:
         self._store = store
         self._rt = runtime
         self._rds = rds
+        self._scheduler = scheduler
         self._fabric = fabric or LocalhostFabric()
         self._ws = ws
         self._env = env
@@ -198,8 +200,23 @@ class Reconciler:
         elif isinstance(action, NoOp):
             await self._gate_blocked(stack, action.id)
 
+    def _running_footprint(self, stack: Stack, exclude: str) -> float:
+        world = self._store.current_world(self._env)
+        by_id = {r.id: r for r in stack.resources}
+        return sum(
+            self._scheduler.footprint(by_id[obs.id])
+            for obs in world.resources
+            if obs.id != exclude and obs.id in by_id
+            and obs.phase in ("starting", "healthy", "running")
+        )
+
     async def _run_service(self, stack: Stack, rid: str) -> None:
         res = self._res(stack, rid)
+        if self._scheduler is not None and not self._scheduler.admits(
+            res, self._running_footprint(stack, exclude=rid)
+        ):
+            await self._emit(rid, res.kind, "queued")  # won't fit the memory budget
+            return
         world = self._store.current_world(self._env)
         env_vars = dict(res.fields["env"].value) if "env" in res.fields else {}
         for ref in res.refs:

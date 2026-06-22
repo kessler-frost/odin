@@ -22,6 +22,7 @@ from odin.aws.embed import install_rds_spawn_rewire, start_ministack, stop_minis
 from odin.aws.rds import MiniStackRds
 from odin.fabric.localhost import LocalhostFabric
 from odin.reconcile.reconciler import Reconciler
+from odin.reconcile.scheduler import Scheduler
 from odin.runtime.colima import ColimaRuntime
 from odin.spec.models import Stack
 from odin.spec.store import SpecStore
@@ -73,9 +74,10 @@ def create_app(
     _store = store or SpecStore(ODIN_DIR)
     _rds = rds or MiniStackRds()
     ws_manager = ConnectionManager()
+    budget = _runtime.ensure_host().total_mem_mib or 4096.0
     reconciler = Reconciler(
         _store, _runtime, _rds, fabric=LocalhostFabric(),
-        ws=ws_manager, env=ENV, poll_interval=1.0,
+        ws=ws_manager, env=ENV, scheduler=Scheduler(budget), poll_interval=1.0,
     )
     complete_fn = None
     if complete:
