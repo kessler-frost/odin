@@ -197,6 +197,7 @@ Strict one-way projection so the canvas can never disagree with reality. Drivers
 - **M5** — Catalog codegen from MiniStack's service list → ~55-service UI parity (pure data, parallelizable).
 - **M6** — Environments as cheap copies + per-env MiniStack namespacing + config-as-code precedence.
 - **M7** (later, no core change) — new Runtime/Fabric impls: apple-container CLI, Tailscale fabric, multi-Mac memberlist/raft.
+- **M8 — Region-select debugging ("what's wrong here?")** (UX, no core change) — drag a selection rectangle over a canvas region → context menu ("Debug this" / "What's wrong here?" / "Fix this part" / free-form ask) → a region-scoped agent AUTO-GATHERS the enclosed nodes + edges and, for each, its World state (phase/facts/verdict/restarts) + recent events/logs + relevant Stack fields, then investigates/fixes from there. Reuses the existing Cmd+drag selection; the new parts are the menu + a context-assembler that turns a selection into the agent prompt. Goal: the user points at a region instead of describing it — far less back-and-forth.
 
 M1, M5, and M2's per-service work are independently dispatchable to parallel agents once S0–S3 lands.
 

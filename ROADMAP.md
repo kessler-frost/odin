@@ -1,132 +1,42 @@
-# Odin Roadmap
+# allfather Roadmap
 
-## Phase 1 — Foundation (Complete)
+allfather: a Mac-native, AI-operated orchestration canvas (repo: odin, branch
+`allfather`). Drop apps + AWS resources, the AI completes config, a control loop
+runs them for real on Colima/Lima with an embedded MiniStack AWS control plane.
 
-Core infrastructure: agent client, Moto simulator, and project scaffolding.
+> The pre-allfather history (Moto/OpenTofu validate, Lima/Nebula "Simulate"
+> mode) was **retired and deleted** — 21 source modules + 30 test files removed.
+> Do not resurrect Terraform/Moto/HCL/Nebula.
 
-- [x] Project scaffolding (uv, pyproject.toml, directory structure)
-- [x] Agent client (Claude Agent SDK)
-- [x] Moto simulator engine (EC2, S3, Lambda, IAM, VPC mocking)
-- [x] Resource registry + executor pipeline
-- [x] MCP tool server for agent integration
-- [x] FastAPI server with REST endpoints + WebSocket
-- [x] Orchestrator wiring all components together
+## Done
 
-## Phase 2 — Real Execution / "Simulate" (Parked)
+### Walking skeleton (S0–S3)
+- [x] Spec Store spine — Stack (desired) + World (observed) + append-only, content-addressed, per-env revisions
+- [x] Pure `plan(Stack, World) → [Action]` (total + idempotent) + the Reconciler loop (observe → plan → execute, supervision, ref-gating)
+- [x] MiniStack embedded in-process as the AWS control plane; its container spawn rewired to allfather's runtime (one spawn authority, no double-spawn)
+- [x] `ColimaRuntime` behind a `RuntimeDriver` protocol; localhost fabric resolving `${{node.VAR}}` from World facts
+- [x] api + RDS→real-Postgres slice, proven end-to-end (headless + browser)
 
-The Lima VM, Nebula mesh, and nerdctl container managers are built and tested,
-but parked: they're the foundation for a future **Simulate** mode that runs
-resources for real. They are no longer wired into deploy — deploy now goes
-through Terraform against Moto (see below).
+### Milestones
+- [x] **M1 — Brain:** `claude_complete` fills blank config (AI-tagged, user values win, best-effort); IAM review
+- [x] **M1-UX — staged changeset:** `POST /preview` returns the AI's proposed diff before Apply; Preview button; `POST /review-iam`
+- [x] **M2 — workloads:** all 4 kinds — service (HTTP-supervised), dep (any container, e.g. Redis), batch (run-to-completion), llm — plus AWS usable *by* app containers (injected endpoint/creds)
+- [x] **M3 — Scheduler:** memory-aware admission (queue over budget) + idle-LLM eviction for higher-priority work
+- [x] **M4 — Assertion Engine:** per-kind health probe registry (http / tcp / `/v1/models` / pg / exit-code), injectable
+- [x] **M5 — UI parity:** catalog codegen from MiniStack's service registry (47 generated AWS nodes)
+- [x] **M6 — environments:** independent per-env reconcilers, each scoped to a distinct MiniStack account (isolated AWS state); `/envs`; UI env switcher
+- [x] **M7 (single-host) — Lima runtime:** `LimaRuntime`, a second `RuntimeDriver` impl running workloads inside a Lima VM (VM isolation); unit + real-VM integration
+- [x] AWS resource provisioning from canvas nodes (S3/SQS/SNS/DynamoDB created in the embed on Apply)
 
-- [x] Lima VM Manager + YAML/cloud-init templates for EC2
-- [x] Nebula mesh networking (cert-based VPC isolation, lighthouse auto-provisioning)
-- [x] ContainerManager (nerdctl) + Lambda deploy/destroy/invoke
-- [x] Nebula overlay networking for Lambda containers
-- [ ] "Simulate" mode: wire these into a real-execution path in the UI
+## Roadmap
 
-## Phase 3 — UI (Complete)
-
-React 19 + ReactFlow + Tailwind CSS v4 — high-contrast dark industrial interface.
-
-- [x] React 19 + Tailwind CSS v4 + Vite
-- [x] Component scaffold (TopBar, Sidebar, Canvas, ConfigPanel, BottomPanel)
-- [x] High-contrast dark industrial color palette
-- [x] ReactFlow interactive canvas (pan/zoom, drag-and-drop, connections, undo/redo, z-index layering)
-- [x] Collapsible panels (sidebar, config, bottom panel)
-- [x] Config panel edits propagate to canvas nodes and backend
-- [x] IAM edge permissions (auto-detect, permission selection UI)
-- [x] WebSocket connection with reconnection and event buffer
-- [x] Security Group node type
-- [x] Per-resource validation status on the canvas
-- [x] Agent conversation streaming to the bottom panel via WebSocket
-
-## Phase 4 — Resource Integration (Complete)
-
-Moto-backed validation pipeline and `.odin/` state consolidation.
-
-- [x] Validate pipeline: canvas → agent → Terraform → `tofu plan` → Moto → UI status
-- [x] MCP tools: `validate_infrastructure`, `get_infrastructure_state`
-- [x] Destroy resets validated/error → draft
-- [x] `.odin/` directory consolidation
-- [x] Agent session persistence across server restarts
-- [ ] Smart defaults: reactive agent fills config on canvas changes (experimental, disabled)
-
-## Terraform / OpenTofu (Complete)
-
-The agent writes one whole-canvas Terraform config (not boto3), run against a
-local Moto server via AWS provider endpoint overrides.
-
-- [x] Moto runs as a standalone `moto_server` subprocess
-- [x] Agent writes one declarative `main.tf` for the whole canvas
-- [x] validate = `tofu plan`, deploy = `tofu apply`, destroy = `tofu destroy`
-- [x] Per-node canvas status mapped from tofu results
-- [x] boto3 generation path removed; CI runs the Moto + tofu path
-
-## Phase 5 — Broad AWS Service Coverage
-
-Goal: cover the AWS services people actually use every day (skip the niche
-ones). Each service is one `ResourceSpec` (backend) + one catalog entry
-(frontend) + a Moto-backed tofu test. Services are grouped by category in the
-sidebar.
-
-Resource definitions are centralized: backend in `src/odin/resources.py`
-(`RESOURCE_SPECS` → node→AWS type map, provider endpoints, agent prompt hints);
-frontend in `ui/src/lib/catalog.ts` (node, config fields, sidebar group, IAM).
-
-**Done (25 resource types), each verified deploying to Moto:**
-VPC, Subnet, Security Group, EC2, Lambda, S3, DynamoDB, SQS, SNS, Kinesis,
-RDS, Secrets Manager, KMS, IAM Role, Route 53, API Gateway, EFS, SSM Parameter,
-ECS, CloudWatch Log Group, EventBridge, EBS Volume, Elastic IP, Internet
-Gateway, ALB (application/network load balancer).
-
-**Not cleanly Moto-simulatable via the OpenTofu v6 AWS provider** (apply/destroy
-hangs or 404s): ElastiCache, NAT Gateway, Step Functions, CloudWatch Alarm,
-CloudFront. These aren't lost — Moto covers the *AWS API*; the stateful ones can
-run for real as containers in **Simulate mode** (below).
-
-## Simulate mode (Done)
-
-Real local execution alongside the Moto path: a "Simulate (Real VMs)" action in
-the top-bar `...` overflow runs the canvas for real via the (formerly parked)
-Lima/Nebula modules — a Lima VM per EC2, a Nebula CA/overlay per VPC, and **real
-containers (via `nerdctl`) for stateful services**:
-
-| Node | Container | License |
-|------|-----------|---------|
-| S3 | RustFS | Apache-2.0 |
-| RDS | Postgres | PostgreSQL (MIT-style) |
-| SQS | ElasticMQ | Apache-2.0 |
-| Lambda | its runtime image | — |
-
-`nerdctl` is native on a Linux prod host and runs via the Lima host VM on macOS,
-so this adds **no new host dependency** — RustFS et al. are just images. All
-images are permissively licensed; DynamoDB stays on Moto (no permissive
-DynamoDB-local image exists — `amazon/dynamodb-local` is proprietary).
-"Tear Down Simulation" cleans up VMs + containers. Verified end-to-end (EC2 → a
-real, SSH-able Ubuntu VM; S3→RustFS container orchestration unit-tested).
-
-Architecture: **Moto = the AWS API for validate/deploy; Simulate = real
-execution.** This is also why RustFS lives here (a container), not as a Moto
-replacement.
-
-## Packaging (future)
-
-- [ ] Bundle the external tools (tofu, lima, nebula, uv, …) into a single
-      distributable so prod install is one artifact.
+- [ ] **M8 — Region-select debugging ("what's wrong here?")** — drag a selection rectangle over a canvas region → context menu ("Debug this" / "What's wrong here?" / "Fix this part" / free-form ask) → a region-scoped agent auto-gathers the enclosed nodes + edges and, for each, its World state (phase/facts/verdict/restarts) + recent events/logs + relevant Stack fields, then investigates or fixes from there. Reuses the existing Cmd+drag selection; new parts are the menu + a context-assembler that turns a selection into the agent prompt. **Point at a region instead of describing it — far less back-and-forth.**
+- [ ] **M7 (multi-Mac) — the fleet:** Tailscale fabric + multi-Mac membership (memberlist/raft) + apple-container runtime. Deliberately deferred; additive, no core change.
+- [ ] **Brain Toolbelt MCP:** make the Brain a candidate-only producer behind a typed `place` + `propose_changeset` + `review_iam` MCP membrane (stricter than today's best-effort completion).
+- [ ] **MiniStack real-container backings** for the remaining stateful AWS services (ElastiCache→Redis, etc.) so apps use them for real, not just the API.
+- [ ] **Packaging:** bundle the external tools (colima, lima, uv, …) into one distributable.
 
 ## Testing
-
-- [x] pytest suite (unit + API; integration tests gated by a marker)
-- [x] GitHub Actions CI: backend (ruff + pytest on Python 3.12 / 3.13 / 3.14) and frontend (typecheck + build)
-- [ ] Broader end-to-end scenario coverage
-
-## Performance
-
-- [ ] Validation speed: the agent can be slow for simple resources — profile token usage, trim the prompt, cache unchanged files, parallelize validation calls
-
-## Open Questions
-
-- Which additional AWS services matter most for Phase 5
-- Multi-region simulation (multiple Nebula networks?)
-- Cost estimation (simulate AWS billing?)
+- [x] pytest suite: 80 unit + 9 integration (real Colima/MiniStack/Lima/Claude, marker-gated)
+- [x] Browser e2e via playwright (skeleton + full-breadth scenarios)
+- [ ] Broader end-to-end scenario coverage as milestones land
