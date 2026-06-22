@@ -62,6 +62,27 @@ export const CATALOG: ServiceDef[] = [
     primary: { key: 'image', label: 'Image' },
   },
   {
+    type: 'dep', abbr: 'DEP', label: 'Dependency', sublabel: 'Container (Redis, etc.)',
+    category: 'Compute', color: 'rose', width: 220,
+    fields: [
+      { key: 'label', label: 'Name', editable: true },
+      { key: 'image', label: 'Image', editable: true },
+      { key: 'port', label: 'Port', editable: true },
+    ],
+    defaultData: { label: 'redis', image: 'redis:7-alpine', port: '6379' },
+    primary: { key: 'image', label: 'Image' },
+  },
+  {
+    type: 'batch', abbr: 'JOB', label: 'Batch Job', sublabel: 'Run-to-completion',
+    category: 'Compute', color: 'amber', width: 220,
+    fields: [
+      { key: 'label', label: 'Name', editable: true },
+      { key: 'image', label: 'Image', editable: true },
+    ],
+    defaultData: { label: 'job', image: 'busybox:latest' },
+    primary: { key: 'image', label: 'Image' },
+  },
+  {
     type: 'sqs', abbr: 'SQS', label: 'SQS Queue', sublabel: 'Message queue',
     category: 'Integration', color: 'pink', width: 200,
     fields: [

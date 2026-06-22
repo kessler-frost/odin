@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 
 from odin.reconcile.reconciler import Reconciler
-from odin.runtime.colima import ContainerFacts, HostFacts, RunHandle
+from odin.runtime.colima import _STATUS_TO_PHASE, ContainerFacts, HostFacts, RunHandle
 from odin.spec.models import FieldValue, Ref, ResourceDesired, Stack
 from odin.spec.store import SpecStore
 
@@ -19,21 +19,28 @@ API = ResourceDesired(
 class FakeRuntime:
     def __init__(self):
         self.runs, self.stopped = [], []
-        self._phase, self._port = {}, {}
+        self._status, self._port, self._exit = {}, {}, {}
 
     def run_container(self, spec):
         self.runs.append(spec.name)
-        self._phase[spec.name] = "starting"  # i.e. running
+        self._status[spec.name] = "running"
         self._port[spec.name] = 18080
         return RunHandle(id="fake-" + spec.name, name=spec.name)
 
     def stop(self, name):
         self.stopped.append(name)
-        self._phase[name] = "pending"
+        self._status[name] = "absent"
+
+    def status(self, name):
+        return self._status.get(name, "absent")
+
+    def exit_code(self, name):
+        return self._exit.get(name, 0)
 
     def facts(self, name, container_port=0):
-        return ContainerFacts(phase=self._phase.get(name, "pending"),
-                              host_port=self._port.get(name, 0), cpu=1.0, ram=10.0)
+        phase = _STATUS_TO_PHASE.get(self.status(name), "pending")
+        port = self._port.get(name, 0) if self.status(name) == "running" else 0
+        return ContainerFacts(phase=phase, host_port=port, cpu=1.0, ram=10.0)
 
     def stats(self, name):
         return {"cpu": 1.0, "ram": 10.0}
@@ -41,8 +48,9 @@ class FakeRuntime:
     def ensure_host(self):
         return HostFacts(total_mem_mib=48000, cpu_count=8)
 
-    def set(self, name, phase):
-        self._phase[name] = phase
+    def set(self, name, docker_status, exit_code=0):
+        self._status[name] = docker_status
+        self._exit[name] = exit_code
 
 
 class FakeRds:
@@ -101,7 +109,7 @@ async def test_restarts_crashed_service(tmp_path):
         await recon.tick()
     assert store.current_world().get("api").phase == "healthy"
 
-    rt.set("api", "crashed")                 # the container dies
+    rt.set("api", "exited", exit_code=1)     # the container dies
     await recon.tick()                       # observe crashed -> plan restart
     assert rt.runs.count("api") == 2         # restarted
     assert store.current_world().get("api").phase == "starting"
@@ -124,6 +132,43 @@ async def test_destroy_then_reapply_recreates_db(tmp_path):
     rds.available = True
     await recon.tick()
     assert rds.created.count("db") == 2                 # re-created, not skipped
+
+
+async def test_dep_healthy_publishes_endpoint(tmp_path):
+    rt, rds = FakeRuntime(), FakeRds()
+    store = SpecStore(tmp_path)
+    redis = ResourceDesired(id="redis", kind="dep",
+                            fields={"image": FieldValue(value="redis:7"),
+                                    "port": FieldValue(value=6379)})
+    store.apply(Stack(resources=(redis,)))
+    recon = Reconciler(store, rt, rds, http_ok=_yes, pg_ready=_yes, poll_interval=0)
+
+    await recon.tick()                       # run redis -> starting
+    await recon.tick()                       # observe running -> healthy
+    obs = store.current_world().get("redis")
+    assert obs.phase == "healthy"
+    assert obs.facts["endpoint"].startswith("127.0.0.1:")  # referenceable by other nodes
+    assert obs.facts["PORT"] == 18080
+
+
+async def test_batch_runs_to_completion_no_restart(tmp_path):
+    rt, rds = FakeRuntime(), FakeRds()
+    store = SpecStore(tmp_path)
+    job = ResourceDesired(id="job", kind="batch",
+                          fields={"image": FieldValue(value="busybox")})
+    store.apply(Stack(resources=(job,)))
+    recon = Reconciler(store, rt, rds, http_ok=_yes, pg_ready=_yes, poll_interval=0)
+
+    await recon.tick()                       # run the job
+    assert "job" in rt.runs
+    assert store.current_world().get("job").phase == "running"
+
+    rt.set("job", "exited", exit_code=0)     # the job finishes successfully
+    await recon.tick()                       # observe -> done
+    assert store.current_world().get("job").phase == "done"
+
+    await recon.tick()                       # terminal: never restarts
+    assert rt.runs.count("job") == 1
 
 
 async def test_blocked_ref_times_out_to_error(tmp_path):

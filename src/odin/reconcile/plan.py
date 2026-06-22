@@ -51,11 +51,17 @@ def plan(stack: Stack, world: World) -> list[Action]:
                 actions.append(CreateMiniStackResource(id=res.id, service="rds"))
             else:
                 actions.append(NoOp(id=res.id))
-        elif res.kind == "service":
+        elif res.kind in ("service", "dep"):
             if not _refs_ready(res, world):
                 actions.append(NoOp(id=res.id))  # blocked; reconciler sets the phase
             elif phase in ("pending", "crashed", "blocked", "error"):
                 # "error" (a timed-out ref) recovers once the dependency heals.
+                actions.append(RunContainer(id=res.id))
+            else:
+                actions.append(NoOp(id=res.id))
+        elif res.kind == "batch":
+            # run-to-completion: run once when ready; never restart on exit.
+            if phase in ("pending", "blocked") and _refs_ready(res, world):
                 actions.append(RunContainer(id=res.id))
             else:
                 actions.append(NoOp(id=res.id))

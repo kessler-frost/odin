@@ -97,6 +97,10 @@ class ColimaRuntime:
         out = self._docker("inspect", "-f", "{{.State.Status}}", name, check=False)
         return out or "absent"
 
+    def exit_code(self, name: str) -> int:
+        out = self._docker("inspect", "-f", "{{.State.ExitCode}}", name, check=False)
+        return int(out) if out.lstrip("-").isdigit() else -1
+
     def host_port(self, name: str, container_port: int) -> int:
         out = self._docker("port", name, str(container_port), check=False)
         return int(out.splitlines()[0].rsplit(":", 1)[-1]) if out else 0

@@ -84,6 +84,15 @@ def test_two_services_share_one_db():
     assert RunContainer(id="api") in actions and RunContainer(id="api2") in actions
 
 
+def test_batch_runs_once_then_terminal():
+    job = ResourceDesired(id="job", kind="batch", fields={"image": FieldValue(value="busybox")})
+    stack = Stack(resources=(job,))
+    assert RunContainer(id="job") in plan(stack, World())          # pending -> run
+    for terminal in ("running", "done", "error"):
+        world = _world(ResourceObserved(id="job", kind="batch", phase=terminal))
+        assert plan(stack, world) == [NoOp(id="job")]             # never re-run
+
+
 def test_prune_extra():
     world = _world(ResourceObserved(id="ghost", kind="service", phase="healthy"))
     actions = plan(STACK, world)

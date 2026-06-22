@@ -107,13 +107,16 @@ class Reconciler:
         world = self._store.current_world(self._env)
         for res in stack.resources:
             observed = world.get(res.id)
-            # Only observe things that were actually started; plan() handles the rest.
-            if observed is None or observed.phase not in ("starting", "healthy"):
+            if observed is None:
                 continue
-            if res.kind == "rds":
+            if res.kind == "rds" and observed.phase in ("starting", "healthy"):
                 await self._observe_rds(res)
-            elif res.kind == "service":
+            elif res.kind == "service" and observed.phase in ("starting", "healthy"):
                 await self._observe_service(res)
+            elif res.kind == "dep" and observed.phase in ("starting", "healthy"):
+                await self._observe_dep(res)
+            elif res.kind == "batch" and observed.phase == "running":
+                await self._observe_batch(res)
 
     async def _observe_rds(self, res: ResourceDesired) -> None:
         cname = self._rds.container_name(res.id)
@@ -147,6 +150,32 @@ class Reconciler:
                 facts={"endpoint": url, "host_port": facts.host_port,
                        "cpu": facts.cpu, "ram": facts.ram},
             )
+
+    async def _observe_dep(self, res: ResourceDesired) -> None:
+        """A dev dependency (e.g. Redis): healthy once its container is running;
+        publishes its loopback endpoint as facts other nodes can reference."""
+        facts = self._rt.facts(res.id, container_port=self._port(res))
+        if facts.phase != "starting":
+            await self._emit(res.id, "dep", "crashed")
+            return
+        if not facts.host_port:
+            return
+        await self._emit(
+            res.id, "dep", "healthy",
+            facts={"endpoint": f"127.0.0.1:{facts.host_port}", "HOST": "127.0.0.1",
+                   "PORT": facts.host_port, "host_port": facts.host_port,
+                   "cpu": facts.cpu, "ram": facts.ram},
+        )
+
+    async def _observe_batch(self, res: ResourceDesired) -> None:
+        status = self._rt.status(res.id)
+        if status == "running":
+            return  # still executing
+        code = self._rt.exit_code(res.id) if status in ("exited", "dead") else -1
+        if code == 0:
+            await self._emit(res.id, "batch", "done")
+        else:
+            await self._emit(res.id, "batch", "error", verdict=f"exit {code}")
 
     # ---- execute ----
     async def _execute(self, action, stack: Stack) -> None:
@@ -186,7 +215,8 @@ class Reconciler:
         self._rt.stop(rid)  # idempotent: clear any crashed remnant before re-run
         self._rt.run_container(spec)
         self._blocked_since.pop(rid, None)
-        await self._emit(rid, "service", "starting")
+        phase = "running" if res.kind == "batch" else "starting"
+        await self._emit(rid, res.kind, phase)
 
     async def _gate_blocked(self, stack: Stack, rid: str) -> None:
         """A service NoOp means it is waiting on an unready ref — mark blocked,
@@ -194,7 +224,7 @@ class Reconciler:
         if not rid:
             return
         res = next((r for r in stack.resources if r.id == rid), None)
-        if res is None or res.kind != "service" or not res.refs:
+        if res is None or res.kind not in ("service", "batch") or not res.refs:
             return
         world = self._store.current_world(self._env)
         if (obs := world.get(rid)) and obs.phase == "healthy":
@@ -207,9 +237,9 @@ class Reconciler:
             pass
         first = self._blocked_since.setdefault(rid, time.monotonic())
         if time.monotonic() - first > self._ref_timeout:
-            await self._emit(rid, "service", "error", verdict="reference never resolved")
+            await self._emit(rid, res.kind, "error", verdict="reference never resolved")
         else:
-            await self._emit(rid, "service", "blocked")
+            await self._emit(rid, res.kind, "blocked")
 
     def _prune(self, rid: str) -> None:
         world = self._store.current_world(self._env)
