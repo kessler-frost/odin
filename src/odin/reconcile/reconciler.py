@@ -9,7 +9,10 @@ service + rds, single host, no scheduler.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
+
+log = logging.getLogger("odin.reconcile")
 
 from odin.fabric.localhost import LocalhostFabric, Unresolved
 from odin.reconcile import assertions
@@ -65,7 +68,10 @@ class Reconciler:
 
     async def _run(self) -> None:
         while not self._stop:
-            await self.tick()
+            try:
+                await self.tick()
+            except Exception:  # a control loop must survive a bad tick
+                log.exception("reconciler tick failed")
             await asyncio.sleep(self._poll)
 
     async def tick(self) -> None:
@@ -147,13 +153,18 @@ class Reconciler:
         if isinstance(action, CreateMiniStackResource):
             res = self._res(stack, action.id)
             user, pw = self._creds(res)
-            self._rds.create_db(action.id, user, pw)
+            log.info("creating rds %s", action.id)
+            await asyncio.to_thread(self._rds.create_db, action.id, user, pw)
+            log.info("rds %s create returned", action.id)
             await self._emit(action.id, "rds", "starting")
         elif isinstance(action, RunContainer):
             await self._run_service(stack, action.id)
         elif isinstance(action, StopContainer):
-            name = self._rds.container_name(action.id) if action.kind == "rds" else action.name
-            self._rt.stop(name)
+            if action.kind == "rds":
+                self._rds.delete_db(action.id)  # clear MiniStack so re-apply re-boots
+                self._rt.stop(self._rds.container_name(action.id))
+            else:
+                self._rt.stop(action.name)
             self._prune(action.id)
         elif isinstance(action, NoOp):
             await self._gate_blocked(stack, action.id)

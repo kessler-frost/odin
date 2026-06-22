@@ -36,6 +36,9 @@ class FakeRds:
     def create_db(self, db_id, user, pw):
         self.created.append(db_id)
 
+    def delete_db(self, db_id):
+        pass
+
     def endpoint(self, db_id):
         return None
 

@@ -52,6 +52,9 @@ class FakeRds:
     def create_db(self, db_id, user, pw):
         self.created.append(db_id)
 
+    def delete_db(self, db_id):
+        self.available = False
+
     def endpoint(self, db_id):
         return ("127.0.0.1", 15432) if self.available else None
 
@@ -102,6 +105,25 @@ async def test_restarts_crashed_service(tmp_path):
     await recon.tick()                       # observe crashed -> plan restart
     assert rt.runs.count("api") == 2         # restarted
     assert store.current_world().get("api").phase == "starting"
+
+
+async def test_destroy_then_reapply_recreates_db(tmp_path):
+    rt, rds = FakeRuntime(), FakeRds()
+    rds.available = True
+    store, recon = _recon(tmp_path, rt, rds)
+    for _ in range(3):
+        await recon.tick()
+    assert store.current_world().get("api").phase == "healthy"
+
+    store.apply(Stack())                  # destroy: empty desired state
+    await recon.tick()
+    assert store.current_world().resources == ()        # pruned
+    assert rds.available is False                        # delete_db was called
+
+    store.apply(Stack(resources=(DB, API)))             # re-apply
+    rds.available = True
+    await recon.tick()
+    assert rds.created.count("db") == 2                 # re-created, not skipped
 
 
 async def test_blocked_ref_times_out_to_error(tmp_path):

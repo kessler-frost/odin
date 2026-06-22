@@ -26,6 +26,14 @@ class MiniStackRds:
             if "AlreadyExists" not in str(exc):
                 raise
 
+    def delete_db(self, db_id: str) -> None:
+        """Remove MiniStack's RDS record so a later create boots a fresh DB."""
+        rds = ministack_boto_client("rds")
+        try:
+            rds.delete_db_instance(DBInstanceIdentifier=db_id, SkipFinalSnapshot=True)
+        except ClientError:
+            pass
+
     def endpoint(self, db_id: str) -> tuple[str, int] | None:
         rds = ministack_boto_client("rds")
         try:

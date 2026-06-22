@@ -63,7 +63,15 @@ def test_restart_crashed_service():
     assert RunContainer(id="api") in plan(STACK, world)
 
 
+def test_errored_service_recovers_when_refs_ready():
+    world = _world(
+        ResourceObserved(id="db", kind="rds", phase="healthy", facts={"DATABASE_URL": "x"}),
+        ResourceObserved(id="api", kind="service", phase="error"),
+    )
+    assert RunContainer(id="api") in plan(STACK, world)
+
+
 def test_prune_extra():
     world = _world(ResourceObserved(id="ghost", kind="service", phase="healthy"))
     actions = plan(STACK, world)
-    assert StopContainer(id="ghost", name="ghost") in actions
+    assert StopContainer(id="ghost", name="ghost", kind="service") in actions
