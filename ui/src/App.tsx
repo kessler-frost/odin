@@ -32,54 +32,22 @@ export default function App() {
     setEdgeUpdates({ edgeId, data });
   }, []);
 
-  const handleValidate = useCallback(async () => {
+  // Apply: send the canvas as desired state; the Reconciler runs it for real and
+  // streams live status back over the WebSocket (world_delta -> node phase).
+  const handleApply = useCallback(async () => {
     const canvas = await fetch('/canvas').then(r => r.json()).catch(() => null);
     if (!canvas) return;
-    for (const node of (canvas.nodes ?? [])) {
-      const name = node.data?.label ?? node.id;
-      statusUpdateFnRef.current?.(name, 'validating');
-    }
-    await fetch('/validate', {
+    await fetch('/apply', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(canvas),
     }).catch(() => {});
   }, []);
 
-  const handleValidateSelected = useCallback(async () => {
-    const canvas = await fetch('/canvas').then(r => r.json()).catch(() => null);
-    if (!canvas) return;
-    const selectedIds = new Set(selectedNodes.map(n => n.id));
-    const nodes = (canvas.nodes ?? []).filter((n: any) => selectedIds.has(n.id));
-    const nodeIds = new Set(nodes.map((n: any) => n.id));
-    const edges = (canvas.edges ?? []).filter((e: any) => nodeIds.has(e.source) && nodeIds.has(e.target));
-    for (const node of nodes) {
-      const name = node.data?.label ?? node.id;
-      statusUpdateFnRef.current?.(name, 'validating');
-    }
-    await fetch('/validate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ nodes, edges }),
-    }).catch(() => {});
-  }, [selectedNodes]);
+  const handleValidateSelected = handleApply;
 
-  const handleSimulate = useCallback(async () => {
-    // Real local execution: Lima VMs (EC2) + Nebula (VPC) + containers (Lambda).
-    const canvas = await fetch('/canvas').then(r => r.json()).catch(() => null);
-    if (!canvas) return;
-    for (const node of (canvas.nodes ?? [])) {
-      statusUpdateFnRef.current?.(node.data?.label ?? node.id, 'simulating');
-    }
-    await fetch('/simulate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(canvas),
-    }).catch(() => {});
-  }, []);
-
-  const handleSimulateDestroy = useCallback(async () => {
-    await fetch('/simulate-destroy', { method: 'POST' }).catch(() => {});
+  const handleDestroy = useCallback(async () => {
+    await fetch('/destroy', { method: 'POST' }).catch(() => {});
   }, []);
 
   const handleResourceStatus = useCallback((name: string, status: string, error?: string) => {
@@ -131,7 +99,7 @@ export default function App() {
       }}
     >
       {/* Row 1: TopBar */}
-      <div className="col-span-full"><TopBar wsConnected={wsConnected} onValidate={handleValidate} onSimulate={handleSimulate} onSimulateDestroy={handleSimulateDestroy} onReset={() => { resetDraftsRef.current?.(); setClearLogSignal(s => s + 1); }} /></div>
+      <div className="col-span-full"><TopBar wsConnected={wsConnected} onApply={handleApply} onDestroy={handleDestroy} onReset={() => { resetDraftsRef.current?.(); setClearLogSignal(s => s + 1); }} /></div>
 
       {/* Row 2: Sidebar + Canvas + Config */}
       <div className="overflow-hidden">

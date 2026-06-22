@@ -47,6 +47,21 @@ export type ServiceDef = {
 
 export const CATALOG: ServiceDef[] = [
   {
+    type: 'service', abbr: 'APP', label: 'App Service', sublabel: 'Your container',
+    category: 'Compute', color: 'cyan', width: 220,
+    fields: [
+      { key: 'label', label: 'Name', editable: true },
+      { key: 'image', label: 'Image', editable: true },
+      { key: 'port', label: 'Port', editable: true },
+      { key: 'DATABASE_URL', label: 'DATABASE_URL', editable: true },
+    ],
+    defaultData: {
+      label: 'api', image: 'allfather-skel-app:latest', port: '8000',
+      DATABASE_URL: '${{db.DATABASE_URL}}',
+    },
+    primary: { key: 'image', label: 'Image' },
+  },
+  {
     type: 'sqs', abbr: 'SQS', label: 'SQS Queue', sublabel: 'Message queue',
     category: 'Integration', color: 'pink', width: 200,
     fields: [

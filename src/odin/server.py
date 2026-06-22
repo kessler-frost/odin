@@ -101,6 +101,10 @@ def create_app(
     def get_events():
         return ws_manager.get_events()
 
+    @app.get("/health")
+    def health():
+        return {"ok": True, "agent": False}
+
     app.state.store = _store
     app.state.runtime = _runtime
     app.state.ws_manager = ws_manager

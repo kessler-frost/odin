@@ -16,13 +16,12 @@ function Led({ state }: { state: LedState }) {
 
 interface TopBarProps {
   wsConnected?: boolean;
-  onValidate?: () => Promise<void>;
-  onSimulate?: () => Promise<void>;
-  onSimulateDestroy?: () => Promise<void>;
+  onApply?: () => Promise<void>;
+  onDestroy?: () => Promise<void>;
   onReset?: () => void;
 }
 
-export default function TopBar({ wsConnected, onValidate, onSimulate, onSimulateDestroy, onReset }: TopBarProps) {
+export default function TopBar({ wsConnected, onApply, onDestroy, onReset }: TopBarProps) {
   const [validating, setValidating] = useState(false);
   const [backendUp, setBackendUp] = useState(false);
   const [agentUp, setAgentUp] = useState(false);
@@ -53,9 +52,9 @@ export default function TopBar({ wsConnected, onValidate, onSimulate, onSimulate
     return () => document.removeEventListener('mousedown', handler);
   }, [menuOpen]);
 
-  const handleValidate = async () => {
+  const handleApply = async () => {
     setValidating(true);
-    await onValidate?.();
+    await onApply?.();
     setValidating(false);
   };
 
@@ -85,22 +84,16 @@ export default function TopBar({ wsConnected, onValidate, onSimulate, onSimulate
       </div>
       <div className="flex-1"></div>
       <button
-        onClick={handleValidate}
+        onClick={handleApply}
         disabled={validating}
-        className={`font-mono text-xs py-1.5 px-4 border border-neon-blue bg-bg-tertiary text-neon-blue cursor-pointer uppercase tracking-[1px] transition-all duration-200 hover:bg-[rgba(51,153,255,0.1)] hover:shadow-[0_0_12px_rgba(51,153,255,0.2)] ${validating ? 'opacity-50 cursor-wait' : ''}`}
+        title="Run the canvas for real: containers via Colima, AWS via embedded MiniStack"
+        className={`font-mono text-xs py-1.5 px-4 border border-neon-green bg-bg-tertiary text-neon-green cursor-pointer uppercase tracking-[1px] transition-all duration-200 hover:bg-[rgba(0,255,136,0.1)] hover:shadow-[0_0_12px_rgba(0,255,136,0.2)] ${validating ? 'opacity-50 cursor-wait' : ''}`}
       >
-        {validating ? 'Validating...' : 'Validate'}
+        {validating ? 'Applying...' : 'Apply'}
       </button>
       <button
-        onClick={() => onSimulate?.()}
-        title="Run the canvas for real as local Lima VMs + containers (heavy)"
-        className="font-mono text-xs py-1.5 px-4 border border-neon-purple bg-bg-tertiary text-neon-purple cursor-pointer uppercase tracking-[1px] transition-all duration-200 hover:bg-[rgba(170,85,255,0.1)] hover:shadow-[0_0_12px_rgba(170,85,255,0.2)]"
-      >
-        Simulate
-      </button>
-      <button
-        onClick={() => onSimulateDestroy?.()}
-        title="Tear down everything Simulate created (VMs + containers)"
+        onClick={() => onDestroy?.()}
+        title="Tear down everything (containers + AWS resources)"
         className="font-mono text-xs py-1.5 px-4 border border-neon-red bg-bg-tertiary text-neon-red cursor-pointer uppercase tracking-[1px] transition-all duration-200 hover:bg-[rgba(255,51,85,0.1)] hover:shadow-[0_0_12px_rgba(255,51,85,0.2)]"
       >
         Destroy

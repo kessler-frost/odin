@@ -32,7 +32,9 @@ def _resource(node: dict) -> ResourceDesired | None:
     if kind is None:
         return None
     data = dict(node.get("data") or {})
-    label = data.pop("label", None)
+    data.pop("label", None)
+    data.pop("status", None)  # UI-only fields, not desired state
+    data.pop("error", None)
     env_in = data.pop("env", {}) or {}
 
     refs: list[Ref] = []
@@ -41,9 +43,15 @@ def _resource(node: dict) -> ResourceDesired | None:
         ref = parse_ref(key, value)
         (refs.append(ref) if ref else static_env.update({key: value}))
 
-    fields: dict[str, FieldValue] = {
-        k: FieldValue(value=v, provenance="user") for k, v in data.items() if v is not None
-    }
+    fields: dict[str, FieldValue] = {}
+    for key, value in data.items():
+        if value is None or value == "":
+            continue
+        ref = parse_ref(key, value) if isinstance(value, str) else None
+        if ref is not None:  # a top-level ${{node.attr}} field becomes a Ref
+            refs.append(ref)
+        else:
+            fields[key] = FieldValue(value=value, provenance="user")
     if static_env:
         fields["env"] = FieldValue(value=static_env, provenance="user")
 

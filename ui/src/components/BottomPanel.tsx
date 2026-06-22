@@ -59,6 +59,12 @@ function parseWebSocketMessage(msg: Record<string, unknown>): LogLine[] {
     return [{ time, source: 'event', msg: text, msgClass }];
   }
 
+  if (type === 'world_delta') {
+    const phase = msg.phase as string;
+    const msgClass = phase === 'healthy' ? 'success' : (phase === 'crashed' || phase === 'error') ? 'error' : '';
+    return [{ time, source: 'event', msg: `${msg.resource_id}: ${phase}`, msgClass }];
+  }
+
   return [];
 }
 
@@ -162,6 +168,11 @@ export default function BottomPanel({ bottomState, onCycleBottom, onWsStatusChan
       const name = msg.name as string;
       const status = type.replace('resource_', '');
       onResourceStatusRef.current?.(name, status, msg.error as string | undefined);
+    }
+    if (type === 'world_delta') {
+      onResourceStatusRef.current?.(
+        msg.resource_id as string, msg.phase as string, msg.verdict as string | undefined,
+      );
     }
     const logLines = parseWebSocketMessage(msg);
     if (logLines.length) setLogs(prev => [...logLines, ...prev]);
