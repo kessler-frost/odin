@@ -4,10 +4,6 @@ from __future__ import annotations
 def generate_cloud_init(
     hostname: str,
     ssh_pubkey: str | None = None,
-    nebula_ca_crt: str | None = None,
-    nebula_host_crt: str | None = None,
-    nebula_host_key: str | None = None,
-    nebula_config: str | None = None,
     install_nerdctl: bool = False,
 ) -> str:
     lines = [
@@ -71,39 +67,6 @@ def generate_cloud_init(
             'ODIN_BUILDKIT_UNIT',
             'systemctl daemon-reload',
             'systemctl enable --now buildkitd',
-        ])
-
-    if nebula_ca_crt and nebula_host_crt and nebula_host_key and nebula_config:
-        lines.extend([
-            "",
-            "# Configure Nebula overlay network",
-            "mkdir -p /etc/nebula",
-            "cat > /etc/nebula/ca.crt << 'ODIN_NEBULA_CA'",
-            nebula_ca_crt,
-            "ODIN_NEBULA_CA",
-            "cat > /etc/nebula/host.crt << 'ODIN_NEBULA_CRT'",
-            nebula_host_crt,
-            "ODIN_NEBULA_CRT",
-            "cat > /etc/nebula/host.key << 'ODIN_NEBULA_KEY'",
-            nebula_host_key,
-            "ODIN_NEBULA_KEY",
-            "cat > /etc/nebula/config.yaml << 'ODIN_NEBULA_CFG'",
-            nebula_config,
-            "ODIN_NEBULA_CFG",
-            "",
-            "# Create and start Nebula systemd service",
-            "cat > /etc/systemd/system/nebula.service << 'ODIN_NEBULA_UNIT'",
-            "[Unit]",
-            "Description=Nebula Overlay Network",
-            "After=network.target",
-            "[Service]",
-            "ExecStart=/usr/local/bin/nebula -config /etc/nebula/config.yaml",
-            "Restart=always",
-            "[Install]",
-            "WantedBy=multi-user.target",
-            "ODIN_NEBULA_UNIT",
-            "systemctl daemon-reload",
-            "systemctl enable --now nebula",
         ])
 
     return "\n".join(lines) + "\n"

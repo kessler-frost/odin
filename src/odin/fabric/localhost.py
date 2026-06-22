@@ -4,8 +4,8 @@ For the skeleton, inter-node addressing is just loopback host ports. A producer
 publishes its address as a World fact (e.g. `facts["DATABASE_URL"]`) when it goes
 healthy; `resolve()` reads it. A reference to a not-yet-healthy producer raises
 `Unresolved`, which the Reconciler turns into a deterministic `blocked` phase
-(never a silent empty value). Nebula/`*.local`/tailscale are later milestones
-behind this same interface.
+(never a silent empty value). A Tailscale/`*.local` cross-Mac fabric is a later
+milestone behind this same interface.
 """
 from __future__ import annotations
 

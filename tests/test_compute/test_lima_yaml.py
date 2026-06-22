@@ -52,15 +52,6 @@ def test_no_provision_without_cloud_init():
     assert parsed.get("provision") is None or parsed["provision"] == []
 
 
-def test_nebula_installer_provisioner():
-    config = VmConfig(cpus=1, memory="1GiB", disk="10GiB")
-    cloud_init = "#!/bin/bash\nset -eux\nhostnamectl set-hostname test\n"
-    parsed = yaml.safe_load(generate_lima_yaml(config, cloud_init_script=cloud_init, install_nebula=True))
-    assert len(parsed["provision"]) == 2
-    assert "nebula" in parsed["provision"][0]["script"]
-    assert "hostnamectl" in parsed["provision"][1]["script"]
-
-
 def test_shared_network():
     config = VmConfig(cpus=1, memory="1GiB", disk="10GiB")
     parsed = yaml.safe_load(generate_lima_yaml(config, shared_network=True))

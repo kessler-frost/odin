@@ -15,26 +15,9 @@ UBUNTU_IMAGES = [
     },
 ]
 
-NEBULA_INSTALL_SCRIPT = """#!/bin/bash
-set -eux -o pipefail
-NEBULA_VERSION="1.9.5"
-ARCH=$(uname -m)
-case $ARCH in
-  aarch64|arm64) ARCH="arm64" ;;
-  x86_64) ARCH="amd64" ;;
-esac
-curl -fsSL -o /tmp/nebula.tar.gz \
-  "https://github.com/slackhq/nebula/releases/download/v${NEBULA_VERSION}/nebula-linux-${ARCH}.tar.gz"
-tar -xzf /tmp/nebula.tar.gz -C /usr/local/bin nebula nebula-cert
-chmod +x /usr/local/bin/nebula /usr/local/bin/nebula-cert
-rm /tmp/nebula.tar.gz
-"""
-
-
 def generate_lima_yaml(
     config: VmConfig,
     cloud_init_script: str | None = None,
-    install_nebula: bool = False,
     shared_network: bool = False,
 ) -> str:
     doc: dict = {
@@ -53,8 +36,6 @@ def generate_lima_yaml(
         doc["networks"] = [{"lima": "shared"}]
 
     provision = []
-    if install_nebula:
-        provision.append({"mode": "system", "script": NEBULA_INSTALL_SCRIPT})
     if cloud_init_script:
         provision.append({"mode": "system", "script": cloud_init_script})
     doc["provision"] = provision
