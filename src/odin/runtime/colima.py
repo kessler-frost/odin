@@ -14,6 +14,8 @@ from __future__ import annotations
 import subprocess
 from dataclasses import dataclass, field
 
+from odin.spec.models import Phase
+
 LABEL = "allfather"
 
 
@@ -30,6 +32,34 @@ class ContainerSpec:
 class RunHandle:
     id: str
     name: str
+
+
+@dataclass(frozen=True)
+class ContainerFacts:
+    phase: Phase
+    host_port: int = 0
+    cpu: float = 0.0
+    ram: float = 0.0
+    logtail: str = ""
+
+
+@dataclass(frozen=True)
+class HostFacts:
+    total_mem_mib: float = 0.0
+    cpu_count: int = 0
+
+
+# Docker container state -> coarse runtime phase ("healthy" is an assertion's call).
+_STATUS_TO_PHASE: dict[str, Phase] = {
+    "running": "starting",
+    "restarting": "starting",
+    "paused": "starting",
+    "created": "pending",
+    "exited": "crashed",
+    "dead": "crashed",
+    "removing": "crashed",
+    "absent": "pending",
+}
 
 
 class ColimaRuntime:
@@ -85,6 +115,26 @@ class ColimaRuntime:
         mem = mem_s.split("/")[0].strip()  # e.g. "23.5MiB"
         ram = _to_mib(mem)
         return {"cpu": cpu, "ram": ram}
+
+    def facts(self, name: str, container_port: int = 0) -> ContainerFacts:
+        status = self.status(name)
+        phase = _STATUS_TO_PHASE.get(status, "pending")
+        host_port = self.host_port(name, container_port) if container_port else 0
+        stats = self.stats(name) if status == "running" else {"cpu": 0.0, "ram": 0.0}
+        return ContainerFacts(
+            phase=phase,
+            host_port=host_port,
+            cpu=stats["cpu"],
+            ram=stats["ram"],
+            logtail=self.logs(name, tail=5) if status != "absent" else "",
+        )
+
+    def ensure_host(self) -> HostFacts:
+        out = self._docker("info", "--format", "{{.MemTotal}} {{.NCPU}}", check=False)
+        if not out:
+            return HostFacts()
+        mem_bytes, ncpu = out.split()
+        return HostFacts(total_mem_mib=int(mem_bytes) / 1024 / 1024, cpu_count=int(ncpu))
 
     def stop(self, name: str) -> None:
         self._docker("rm", "-f", name, check=False)

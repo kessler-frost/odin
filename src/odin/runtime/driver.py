@@ -1,0 +1,22 @@
+"""The Runtime driver port: how allfather runs + observes workloads on a host.
+
+`ColimaRuntime` (in `colima.py`) is the single-host impl for the skeleton. A
+Lima-VM impl (VM isolation / remote hosts) is a later milestone behind the same
+Protocol. The data types live in `colima.py` (the concrete module) to keep the
+import graph one-way (driver → colima).
+"""
+from __future__ import annotations
+
+from typing import Protocol
+
+from odin.runtime.colima import ContainerFacts, ContainerSpec, HostFacts, RunHandle
+
+__all__ = ["RuntimeDriver", "ContainerSpec", "RunHandle", "ContainerFacts", "HostFacts"]
+
+
+class RuntimeDriver(Protocol):
+    def ensure_host(self) -> HostFacts: ...
+    def run_container(self, spec: ContainerSpec) -> RunHandle: ...
+    def stop(self, name: str) -> None: ...
+    def facts(self, name: str, container_port: int = 0) -> ContainerFacts: ...
+    def stats(self, name: str) -> dict[str, float]: ...
