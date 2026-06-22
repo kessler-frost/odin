@@ -1,7 +1,6 @@
 """S2.3 — the Reconciler loop, driven against fakes (no Colima / no MiniStack)."""
 from __future__ import annotations
 
-import pytest
 
 from odin.reconcile.reconciler import Reconciler
 from odin.runtime.colima import _STATUS_TO_PHASE, ContainerFacts, HostFacts, RunHandle
@@ -172,7 +171,8 @@ async def test_llm_evicted_to_make_room_for_service(tmp_path):
     recon = Reconciler(store, rt, rds, scheduler=Scheduler(budget_mib=300),
                        http_ok=_yes, pg_ready=_yes, poll_interval=0)
 
-    await recon.tick(); await recon.tick()   # the model loads and goes healthy
+    await recon.tick()                       # the model loads...
+    await recon.tick()                       # ...and goes healthy
     assert store.current_world().get("model").phase == "healthy"
 
     store.apply(Stack(resources=(llm, svc)))  # a service now needs memory

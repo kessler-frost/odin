@@ -12,8 +12,6 @@ import asyncio
 import logging
 import time
 
-log = logging.getLogger("odin.reconcile")
-
 from odin.aws.provision import PROVISIONED
 from odin.fabric.localhost import LocalhostFabric, Unresolved
 from odin.reconcile import assertions
@@ -27,6 +25,8 @@ from odin.reconcile.plan import plan
 from odin.reconcile.probes import ProbeEngine
 from odin.runtime.colima import ContainerSpec
 from odin.spec.models import ResourceDesired, Stack, World, WorldDelta
+
+log = logging.getLogger("odin.reconcile")
 
 
 class Reconciler:
