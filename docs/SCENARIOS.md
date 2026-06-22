@@ -16,6 +16,10 @@ Driven through the real UI (`uvicorn odin.server:create_app --factory`) + Colima
 | W2 | Kill the app container | crash detection + auto-restart (supervision) | ✅ crashed → starting → healthy, no user action |
 | W3 | Destroy | prune containers + MiniStack RDS record | ✅ 0 containers, 0 World resources |
 | W4 | Backend integration (`tests/aws/test_skeleton_e2e.py -m integration`) | the whole spine headless: apply → real Postgres + app, restart, teardown | ✅ green |
+| W5 | Multi-kind (`test_multikind_e2e.py`) | app + Postgres + Redis dep + batch job, all real, multi-ref gating | ✅ db+cache+api healthy, migrate done |
+| W6 | AWS usable by containers (`test_aws_usable_e2e.py`) | a batch container runs `aws s3 mb` against the embedded AWS; host sees the bucket | ✅ container→embed AWS works |
+| W7 | Real Brain (`tests/agent/test_brain.py`) | claude-agent-sdk fills blank config on apply (AI-tagged, user wins) | ✅ green |
+| W8 | Memory-aware scheduling + LLM eviction (unit) | over-budget workloads queue; idle LLMs evicted for higher-priority work | ✅ green |
 
 Verified 2026-06-21 via playwright-cli (browser) + the integration test. Both
 nodes reach a green `HEALTHY` badge; the app's 200 depends on the resolved
