@@ -14,6 +14,7 @@ import time
 
 log = logging.getLogger("odin.reconcile")
 
+from odin.aws.provision import PROVISIONED
 from odin.fabric.localhost import LocalhostFabric, Unresolved
 from odin.reconcile import assertions
 from odin.reconcile.actions import (
@@ -33,6 +34,7 @@ class Reconciler:
         store,
         runtime,
         rds,
+        aws=None,
         fabric: LocalhostFabric | None = None,
         ws=None,
         env: str = "default",
@@ -46,6 +48,7 @@ class Reconciler:
         self._store = store
         self._rt = runtime
         self._rds = rds
+        self._aws = aws
         self._scheduler = scheduler
         self._aws_env = aws_env
         self._fabric = fabric or LocalhostFabric()
@@ -121,6 +124,9 @@ class Reconciler:
                 await self._observe_dep(res)
             elif res.kind == "batch" and observed.phase == "running":
                 await self._observe_batch(res)
+            elif res.kind in PROVISIONED and observed.phase == "starting":
+                if await asyncio.to_thread(self._aws.exists, res.kind, res.id):
+                    await self._emit(res.id, res.kind, "healthy")
 
     async def _observe_rds(self, res: ResourceDesired) -> None:
         cname = self._rds.container_name(res.id)
@@ -185,17 +191,21 @@ class Reconciler:
     async def _execute(self, action, stack: Stack) -> None:
         if isinstance(action, CreateMiniStackResource):
             res = self._res(stack, action.id)
-            user, pw = self._creds(res)
-            log.info("creating rds %s", action.id)
-            await asyncio.to_thread(self._rds.create_db, action.id, user, pw)
-            log.info("rds %s create returned", action.id)
-            await self._emit(action.id, "rds", "starting")
+            if action.service == "rds":
+                user, pw = self._creds(res)
+                await asyncio.to_thread(self._rds.create_db, action.id, user, pw)
+                await self._emit(action.id, "rds", "starting")
+            else:  # control-plane AWS resource (s3/sqs/sns/dynamodb)
+                await asyncio.to_thread(self._aws.provision, action.service, action.id)
+                await self._emit(action.id, action.service, "starting")
         elif isinstance(action, RunContainer):
             await self._run_service(stack, action.id)
         elif isinstance(action, StopContainer):
             if action.kind == "rds":
                 self._rds.delete_db(action.id)  # clear MiniStack so re-apply re-boots
                 self._rt.stop(self._rds.container_name(action.id))
+            elif action.kind in PROVISIONED:
+                await asyncio.to_thread(self._aws.deprovision, action.kind, action.id)
             else:
                 self._rt.stop(action.name)
             self._prune(action.id)

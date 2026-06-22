@@ -15,7 +15,9 @@ _REF = re.compile(r"^\$\{\{\s*([\w-]+)\.([\w-]+)\s*\}\}$")
 
 # Canvas node type -> Stack kind.
 _KIND = {"service": "service", "app": "service", "rds": "rds",
-         "batch": "batch", "dep": "dep", "llm": "llm"}
+         "batch": "batch", "dep": "dep", "llm": "llm",
+         # control-plane AWS resources provisioned in the embed
+         "s3": "s3", "sqs": "sqs", "sns": "sns", "dynamodb": "dynamodb"}
 
 
 def parse_ref(var: str, value: str) -> Ref | None:

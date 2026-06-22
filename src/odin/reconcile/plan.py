@@ -7,6 +7,7 @@ scheduler / batch / llm branches.
 """
 from __future__ import annotations
 
+from odin.aws.provision import PROVISIONED
 from odin.reconcile.actions import (
     Action,
     CreateMiniStackResource,
@@ -63,6 +64,12 @@ def plan(stack: Stack, world: World) -> list[Action]:
             # run-to-completion: run once when ready; never restart on exit.
             if phase in ("pending", "blocked", "queued") and _refs_ready(res, world):
                 actions.append(RunContainer(id=res.id))
+            else:
+                actions.append(NoOp(id=res.id))
+        elif res.kind in PROVISIONED:
+            # control-plane AWS resource: create once, then it just exists.
+            if phase in ("pending", "crashed"):
+                actions.append(CreateMiniStackResource(id=res.id, service=res.kind))
             else:
                 actions.append(NoOp(id=res.id))
         else:

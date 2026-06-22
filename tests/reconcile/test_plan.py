@@ -93,6 +93,14 @@ def test_batch_runs_once_then_terminal():
         assert plan(stack, world) == [NoOp(id="job")]             # never re-run
 
 
+def test_aws_resource_created_once_then_exists():
+    bucket = ResourceDesired(id="uploads", kind="s3")
+    stack = Stack(resources=(bucket,))
+    assert CreateMiniStackResource(id="uploads", service="s3") in plan(stack, World())
+    world = _world(ResourceObserved(id="uploads", kind="s3", phase="healthy"))
+    assert plan(stack, world) == [NoOp(id="uploads")]
+
+
 def test_prune_extra():
     world = _world(ResourceObserved(id="ghost", kind="service", phase="healthy"))
     actions = plan(STACK, world)

@@ -24,6 +24,7 @@ from odin.aws.embed import (
     start_ministack,
     stop_ministack,
 )
+from odin.aws.provision import MiniStackAws
 from odin.aws.rds import MiniStackRds
 from odin.fabric.localhost import LocalhostFabric
 from odin.reconcile.reconciler import Reconciler
@@ -82,7 +83,7 @@ def create_app(
     budget = _runtime.ensure_host().total_mem_mib or 4096.0
     aws_env = aws_container_env if embed else None
     reconciler = Reconciler(
-        _store, _runtime, _rds, fabric=LocalhostFabric(),
+        _store, _runtime, _rds, aws=MiniStackAws(), fabric=LocalhostFabric(),
         ws=ws_manager, env=ENV, scheduler=Scheduler(budget),
         aws_env=aws_env, poll_interval=1.0,
     )
