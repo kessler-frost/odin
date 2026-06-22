@@ -20,6 +20,15 @@ async def http_ok(url: str, timeout: float = 2.0) -> bool:
         return False
 
 
+async def tcp_open(host: str, port: int, timeout: float = 2.0) -> bool:
+    try:
+        _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
+        writer.close()
+        return True
+    except (OSError, asyncio.TimeoutError):
+        return False
+
+
 def _pg_connect(host: str, port: int, user: str, password: str, db: str) -> bool:
     import psycopg2
 

@@ -202,7 +202,7 @@ async def test_dep_healthy_publishes_endpoint(tmp_path):
                             fields={"image": FieldValue(value="redis:7"),
                                     "port": FieldValue(value=6379)})
     store.apply(Stack(resources=(redis,)))
-    recon = Reconciler(store, rt, rds, http_ok=_yes, pg_ready=_yes, poll_interval=0)
+    recon = Reconciler(store, rt, rds, http_ok=_yes, pg_ready=_yes, tcp_ok=_yes, poll_interval=0)
 
     await recon.tick()                       # run redis -> starting
     await recon.tick()                       # observe running -> healthy

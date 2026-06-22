@@ -24,6 +24,7 @@ from odin.reconcile.actions import (
     StopContainer,
 )
 from odin.reconcile.plan import plan
+from odin.reconcile.probes import ProbeEngine
 from odin.runtime.colima import ContainerSpec
 from odin.spec.models import ResourceDesired, Stack, World, WorldDelta
 
@@ -42,6 +43,7 @@ class Reconciler:
         aws_env=None,
         http_ok=assertions.http_ok,
         pg_ready=assertions.pg_ready,
+        tcp_ok=assertions.tcp_open,
         ref_timeout: float = 30.0,
         poll_interval: float = 2.0,
     ) -> None:
@@ -56,6 +58,7 @@ class Reconciler:
         self._env = env
         self._http_ok = http_ok
         self._pg_ready = pg_ready
+        self._probes = ProbeEngine(http_ok, tcp_ok)
         self._ref_timeout = ref_timeout
         self._poll = poll_interval
         self._blocked_since: dict[str, float] = {}
@@ -118,10 +121,8 @@ class Reconciler:
                 continue
             if res.kind == "rds" and observed.phase in ("starting", "healthy"):
                 await self._observe_rds(res)
-            elif res.kind == "service" and observed.phase in ("starting", "healthy"):
-                await self._observe_service(res)
-            elif res.kind in ("dep", "llm") and observed.phase in ("starting", "healthy"):
-                await self._observe_dep(res)
+            elif res.kind in ("service", "dep", "llm") and observed.phase in ("starting", "healthy"):
+                await self._observe_container(res)
             elif res.kind == "batch" and observed.phase == "running":
                 await self._observe_batch(res)
             elif res.kind in PROVISIONED and observed.phase == "starting":
@@ -145,37 +146,25 @@ class Reconciler:
                 facts={"DATABASE_URL": url, "endpoint": f"{endpoint[0]}:{endpoint[1]}", **stats},
             )
 
-    async def _observe_service(self, res: ResourceDesired) -> None:
+    async def _observe_container(self, res: ResourceDesired) -> None:
+        """service / dep / llm: healthy when the kind's probe passes (Assertion
+        Engine). Publishes a referenceable endpoint as World facts."""
         facts = self._rt.facts(res.id, container_port=self._port(res))
         if facts.phase != "starting":
-            # Not running (exited / removed / absent) while we expected it up.
-            await self._emit(res.id, "service", "crashed")
+            await self._emit(res.id, res.kind, "crashed")  # exited / removed
             return
         if not facts.host_port:
             return
-        url = f"http://127.0.0.1:{facts.host_port}/"
-        if await self._http_ok(url):
-            await self._emit(
-                res.id, "service", "healthy",
-                facts={"endpoint": url, "host_port": facts.host_port,
-                       "cpu": facts.cpu, "ram": facts.ram},
-            )
-
-    async def _observe_dep(self, res: ResourceDesired) -> None:
-        """A dev dependency (e.g. Redis): healthy once its container is running;
-        publishes its loopback endpoint as facts other nodes can reference."""
-        facts = self._rt.facts(res.id, container_port=self._port(res))
-        if facts.phase != "starting":
-            await self._emit(res.id, res.kind, "crashed")
-            return
-        if not facts.host_port:
-            return
-        await self._emit(
-            res.id, res.kind, "healthy",
-            facts={"endpoint": f"127.0.0.1:{facts.host_port}", "HOST": "127.0.0.1",
-                   "PORT": facts.host_port, "host_port": facts.host_port,
-                   "cpu": facts.cpu, "ram": facts.ram},
-        )
+        if not await self._probes.healthy(res.kind, facts.host_port):
+            return  # still booting
+        published = {
+            "host_port": facts.host_port, "cpu": facts.cpu, "ram": facts.ram,
+            "endpoint": (f"http://127.0.0.1:{facts.host_port}/" if res.kind == "service"
+                         else f"127.0.0.1:{facts.host_port}"),
+        }
+        if res.kind in ("dep", "llm"):  # referenceable HOST/PORT for consumers
+            published.update({"HOST": "127.0.0.1", "PORT": facts.host_port})
+        await self._emit(res.id, res.kind, "healthy", facts=published)
 
     async def _observe_batch(self, res: ResourceDesired) -> None:
         status = self._rt.status(res.id)
