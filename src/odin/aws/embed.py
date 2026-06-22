@@ -99,6 +99,20 @@ def current_port() -> int:
     return _port
 
 
+def install_rds_spawn_rewire(runtime) -> None:
+    """Route MiniStack's RDS container spawns through allfather's runtime.
+
+    Monkeypatches `ministack.services.rds._docker` with the shim so a
+    `CreateDBInstance` boots a real Postgres via allfather's ColimaRuntime
+    (joining allfather's World) instead of MiniStack's own docker client.
+    """
+    import ministack.services.rds as rds
+
+    from odin.runtime.shim import AllfatherDockerShim
+
+    rds._docker = AllfatherDockerShim(runtime)
+
+
 def ministack_boto_client(service: str):
     """A boto3 client for the embedded MiniStack (the 12-digit key = account id)."""
     return boto3.client(
