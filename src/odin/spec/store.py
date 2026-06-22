@@ -42,6 +42,12 @@ class SpecStore:
         (self._env_dir(stack.env) / "HEAD").write_text(rev)
         return rev
 
+    def list_envs(self) -> list[str]:
+        if not self._root.exists():
+            return ["default"]
+        envs = sorted(p.name for p in self._root.iterdir() if (p / "HEAD").exists())
+        return envs or ["default"]
+
     def head(self, env: str = "default") -> str | None:
         head = self._env_dir(env) / "HEAD"
         return head.read_text().strip() if head.exists() else None

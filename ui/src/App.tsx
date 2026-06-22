@@ -17,6 +17,7 @@ export default function App() {
   const [configOpen, setConfigOpen] = useState(true);
   const [bottomState, setBottomState] = useState<BottomState>('default');
   const [wsConnected, setWsConnected] = useState(false);
+  const [env, setEnv] = useState('default');
   const statusUpdateFnRef = useRef<((name: string, status: string, error?: string) => void) | null>(null);
   const [configUpdate, setConfigUpdate] = useState<{ nodeId: string; data: Record<string, any> } | null>(null);
   const resetDraftsRef = useRef<(() => void) | null>(null);
@@ -37,18 +38,18 @@ export default function App() {
   const handleApply = useCallback(async () => {
     const canvas = await fetch('/canvas').then(r => r.json()).catch(() => null);
     if (!canvas) return;
-    await fetch('/apply', {
+    await fetch(`/apply?env=${encodeURIComponent(env)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(canvas),
     }).catch(() => {});
-  }, []);
+  }, [env]);
 
   const handleValidateSelected = handleApply;
 
   const handleDestroy = useCallback(async () => {
-    await fetch('/destroy', { method: 'POST' }).catch(() => {});
-  }, []);
+    await fetch(`/destroy?env=${encodeURIComponent(env)}`, { method: 'POST' }).catch(() => {});
+  }, [env]);
 
   const handleResourceStatus = useCallback((name: string, status: string, error?: string) => {
     statusUpdateFnRef.current?.(name, status, error);
@@ -99,7 +100,7 @@ export default function App() {
       }}
     >
       {/* Row 1: TopBar */}
-      <div className="col-span-full"><TopBar wsConnected={wsConnected} onApply={handleApply} onDestroy={handleDestroy} onReset={() => { resetDraftsRef.current?.(); setClearLogSignal(s => s + 1); }} /></div>
+      <div className="col-span-full"><TopBar wsConnected={wsConnected} env={env} onEnvChange={setEnv} onApply={handleApply} onDestroy={handleDestroy} onReset={() => { resetDraftsRef.current?.(); setClearLogSignal(s => s + 1); }} /></div>
 
       {/* Row 2: Sidebar + Canvas + Config */}
       <div className="overflow-hidden">
@@ -148,7 +149,7 @@ export default function App() {
 
       {/* Row 3: Bottom panel */}
       <div className="col-span-full overflow-hidden">
-        <BottomPanel bottomState={bottomState} onCycleBottom={cycleBottom} onWsStatusChange={setWsConnected} onResourceStatus={handleResourceStatus} onConfigUpdate={handleConfigUpdate} clearSignal={clearLogSignal} />
+        <BottomPanel bottomState={bottomState} activeEnv={env} onCycleBottom={cycleBottom} onWsStatusChange={setWsConnected} onResourceStatus={handleResourceStatus} onConfigUpdate={handleConfigUpdate} clearSignal={clearLogSignal} />
       </div>
     </div>
   );

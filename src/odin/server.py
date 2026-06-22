@@ -19,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from odin.api.canvas import CanvasGraph, create_canvas_router
 from odin.api.ws import ConnectionManager
 from odin.aws.embed import (
+    account_for_env,
     aws_container_env,
     install_rds_spawn_rewire,
     start_ministack,
@@ -41,12 +42,13 @@ ENV = "default"
 log = logging.getLogger("odin")
 
 
-def create_apply_router(store: SpecStore, reconciler: Reconciler, complete_fn=None) -> APIRouter:
+def create_apply_router(store: SpecStore, reconciler_for, complete_fn=None) -> APIRouter:
     router = APIRouter()
 
     @router.post("/apply")
-    async def apply(graph: CanvasGraph) -> dict:
-        stack = canvas_to_stack(graph.model_dump(), env=ENV)
+    async def apply(graph: CanvasGraph, env: str = ENV) -> dict:
+        reconciler = await reconciler_for(env)
+        stack = canvas_to_stack(graph.model_dump(), env=env)
         if complete_fn is not None:  # best-effort AI completion; defaults cover failure
             try:
                 stack = await complete_fn(stack)
@@ -54,17 +56,22 @@ def create_apply_router(store: SpecStore, reconciler: Reconciler, complete_fn=No
                 log.exception("brain completion failed; applying as-is")
         rev = store.apply(stack)
         await reconciler.tick()  # kick an immediate pass; the loop continues it
-        return {"status": "applied", "rev": rev}
+        return {"status": "applied", "rev": rev, "env": env}
 
     @router.post("/destroy")
-    async def destroy() -> dict:
-        store.apply(Stack(env=ENV))  # empty desired state -> reconciler prunes all
+    async def destroy(env: str = ENV) -> dict:
+        reconciler = await reconciler_for(env)
+        store.apply(Stack(env=env))  # empty desired state -> reconciler prunes all
         await reconciler.tick()
-        return {"status": "destroyed"}
+        return {"status": "destroyed", "env": env}
 
     @router.get("/world")
-    def world() -> dict:
-        return store.current_world(ENV).model_dump()
+    def world(env: str = ENV) -> dict:
+        return store.current_world(env).model_dump()
+
+    @router.get("/envs")
+    def envs() -> dict:
+        return {"envs": store.list_envs()}
 
     return router
 
@@ -78,36 +85,50 @@ def create_app(
 ) -> FastAPI:
     _runtime = runtime or ColimaRuntime()
     _store = store or SpecStore(ODIN_DIR)
-    _rds = rds or MiniStackRds()
     ws_manager = ConnectionManager()
-    budget = _runtime.ensure_host().total_mem_mib or 4096.0
-    aws_env = aws_container_env if embed else None
-    reconciler = Reconciler(
-        _store, _runtime, _rds, aws=MiniStackAws(), fabric=LocalhostFabric(),
-        ws=ws_manager, env=ENV, scheduler=Scheduler(budget),
-        aws_env=aws_env, poll_interval=1.0,
-    )
+    scheduler = Scheduler(_runtime.ensure_host().total_mem_mib or 4096.0)
     complete_fn = None
     if complete:
         from odin.agent.brain import claude_complete
         complete_fn = claude_complete
+
+    # One reconciler per environment, created lazily. Each is scoped to its own
+    # MiniStack account so environments get isolated AWS state in one embed.
+    reconcilers: dict[str, Reconciler] = {}
+
+    def _make_reconciler(env: str) -> Reconciler:
+        account = account_for_env(env)
+        env_rds = rds or MiniStackRds(account)
+        env_aws_env = (lambda a=account: aws_container_env(a)) if embed else None
+        return Reconciler(
+            _store, _runtime, env_rds, aws=MiniStackAws(account), fabric=LocalhostFabric(),
+            ws=ws_manager, env=env, scheduler=scheduler, aws_env=env_aws_env, poll_interval=1.0,
+        )
+
+    async def reconciler_for(env: str) -> Reconciler:
+        if env not in reconcilers:
+            reconcilers[env] = _make_reconciler(env)
+            await reconcilers[env].start()
+        return reconcilers[env]
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         if embed:
             await asyncio.to_thread(start_ministack)
             install_rds_spawn_rewire(_runtime)
-        await reconciler.start()
+        for env in _store.list_envs():  # resume reconciling existing environments
+            await reconciler_for(env)
         try:
             yield
         finally:
-            await reconciler.stop()
+            for reconciler in reconcilers.values():
+                await reconciler.stop()
             if embed:
                 stop_ministack()
 
     app = FastAPI(title="allfather", version="0.1.0", lifespan=lifespan)
     app.include_router(create_canvas_router(CANVAS_PATH))
-    app.include_router(create_apply_router(_store, reconciler, complete_fn=complete_fn))
+    app.include_router(create_apply_router(_store, reconciler_for, complete_fn=complete_fn))
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
@@ -129,7 +150,7 @@ def create_app(
     app.state.store = _store
     app.state.runtime = _runtime
     app.state.ws_manager = ws_manager
-    app.state.reconciler = reconciler
+    app.state.reconcilers = reconcilers
 
     bundled_ui = Path(__file__).resolve().parent / "_ui"
     source_ui = Path(__file__).resolve().parent.parent.parent / "ui" / "dist"

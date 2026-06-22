@@ -9,14 +9,17 @@ from __future__ import annotations
 
 from botocore.exceptions import ClientError
 
-from odin.aws.embed import ministack_boto_client
+from odin.aws.embed import ACCOUNT_ID, ministack_boto_client
 
 PROVISIONED = ("s3", "sqs", "sns", "dynamodb")
 
 
 class MiniStackAws:
+    def __init__(self, account_id: str = ACCOUNT_ID) -> None:
+        self._account = account_id
+
     def provision(self, service: str, name: str) -> None:
-        client = ministack_boto_client(service)
+        client = ministack_boto_client(service, self._account)
         try:
             if service == "s3":
                 client.create_bucket(Bucket=name)
@@ -35,7 +38,7 @@ class MiniStackAws:
                 raise
 
     def exists(self, service: str, name: str) -> bool:
-        client = ministack_boto_client(service)
+        client = ministack_boto_client(service, self._account)
         try:
             if service == "s3":
                 client.head_bucket(Bucket=name)
@@ -51,7 +54,7 @@ class MiniStackAws:
             return False
 
     def deprovision(self, service: str, name: str) -> None:
-        client = ministack_boto_client(service)
+        client = ministack_boto_client(service, self._account)
         try:
             if service == "s3":
                 client.delete_bucket(Bucket=name)

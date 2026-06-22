@@ -15,6 +15,7 @@ Env that MiniStack freezes at import (host is baked into regexes) is set here
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import socket
 import threading
@@ -22,6 +23,19 @@ import threading
 import boto3
 
 ACCOUNT_ID = "000000000000"
+
+
+def account_for_env(env: str) -> str:
+    """A stable 12-digit account id per environment.
+
+    MiniStack scopes all control-plane state by the request's 12-digit access
+    key, so a distinct account per env gives free per-env AWS isolation in one
+    embedded instance.
+    """
+    if env == "default":
+        return ACCOUNT_ID
+    digest = hashlib.sha256(env.encode()).hexdigest()
+    return str(int(digest, 16) % 10**12).zfill(12)
 
 # Frozen-at-import MiniStack config — must be set before `import ministack.app`.
 os.environ.setdefault("MINISTACK_HOST", "localhost")
@@ -113,26 +127,27 @@ def install_rds_spawn_rewire(runtime) -> None:
     rds._docker = AllfatherDockerShim(runtime)
 
 
-def aws_container_env() -> dict[str, str]:
+def aws_container_env(account_id: str = ACCOUNT_ID) -> dict[str, str]:
     """AWS env to inject into app containers so their AWS SDK hits the embed.
 
     Containers reach the host-side embed via host.docker.internal (allfather's
-    runtime adds the host-gateway mapping to every container).
+    runtime adds the host-gateway mapping to every container). The account id
+    scopes the container to its environment's isolated AWS state.
     """
     return {
         "AWS_ENDPOINT_URL": f"http://host.docker.internal:{current_port()}",
-        "AWS_ACCESS_KEY_ID": ACCOUNT_ID,
+        "AWS_ACCESS_KEY_ID": account_id,
         "AWS_SECRET_ACCESS_KEY": "x",
         "AWS_DEFAULT_REGION": "us-east-1",
     }
 
 
-def ministack_boto_client(service: str):
+def ministack_boto_client(service: str, account_id: str = ACCOUNT_ID):
     """A boto3 client for the embedded MiniStack (the 12-digit key = account id)."""
     return boto3.client(
         service,
         endpoint_url=f"http://127.0.0.1:{current_port()}",
-        aws_access_key_id=ACCOUNT_ID,
+        aws_access_key_id=account_id,
         aws_secret_access_key="x",
         region_name="us-east-1",
     )

@@ -124,6 +124,7 @@ const statusConfig: Record<WsStatus, { color: string; label: string; pulse: bool
 
 interface BottomPanelProps {
   bottomState: string;
+  activeEnv?: string;
   onCycleBottom: () => void;
   onWsStatusChange?: (connected: boolean) => void;
   onResourceStatus?: (name: string, status: string, error?: string) => void;
@@ -131,7 +132,7 @@ interface BottomPanelProps {
   clearSignal?: number;
 }
 
-export default function BottomPanel({ bottomState, onCycleBottom, onWsStatusChange, onResourceStatus, onConfigUpdate, clearSignal }: BottomPanelProps) {
+export default function BottomPanel({ bottomState, activeEnv, onCycleBottom, onWsStatusChange, onResourceStatus, onConfigUpdate, clearSignal }: BottomPanelProps) {
   const [activeTab, setActiveTab] = useState("Agent");
   const [logs, setLogs] = useState<LogLine[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -154,6 +155,8 @@ export default function BottomPanel({ bottomState, onCycleBottom, onWsStatusChan
 
   const onResourceStatusRef = useRef(onResourceStatus);
   onResourceStatusRef.current = onResourceStatus;
+  const activeEnvRef = useRef(activeEnv);
+  activeEnvRef.current = activeEnv;
   const onConfigUpdateRef = useRef(onConfigUpdate);
   onConfigUpdateRef.current = onConfigUpdate;
 
@@ -170,9 +173,12 @@ export default function BottomPanel({ bottomState, onCycleBottom, onWsStatusChan
       onResourceStatusRef.current?.(name, status, msg.error as string | undefined);
     }
     if (type === 'world_delta') {
-      onResourceStatusRef.current?.(
-        msg.resource_id as string, msg.phase as string, msg.verdict as string | undefined,
-      );
+      const env = (msg.env as string | undefined) ?? 'default';
+      if (env === (activeEnvRef.current ?? 'default')) {  // only the active env's status
+        onResourceStatusRef.current?.(
+          msg.resource_id as string, msg.phase as string, msg.verdict as string | undefined,
+        );
+      }
     }
     const logLines = parseWebSocketMessage(msg);
     if (logLines.length) setLogs(prev => [...logLines, ...prev]);

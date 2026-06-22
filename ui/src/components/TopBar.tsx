@@ -16,12 +16,14 @@ function Led({ state }: { state: LedState }) {
 
 interface TopBarProps {
   wsConnected?: boolean;
+  env?: string;
+  onEnvChange?: (env: string) => void;
   onApply?: () => Promise<void>;
   onDestroy?: () => Promise<void>;
   onReset?: () => void;
 }
 
-export default function TopBar({ wsConnected, onApply, onDestroy, onReset }: TopBarProps) {
+export default function TopBar({ wsConnected, env, onEnvChange, onApply, onDestroy, onReset }: TopBarProps) {
   const [validating, setValidating] = useState(false);
   const [backendUp, setBackendUp] = useState(false);
   const [agentUp, setAgentUp] = useState(false);
@@ -83,6 +85,12 @@ export default function TopBar({ wsConnected, onApply, onDestroy, onReset }: Top
         </div>
       </div>
       <div className="flex-1"></div>
+      <input
+        value={env ?? 'default'}
+        onChange={(e) => onEnvChange?.(e.target.value || 'default')}
+        title="Environment (isolated experiment copy)"
+        className="font-mono text-xs py-1.5 px-2 w-28 bg-bg-tertiary border border-border-bright text-text-secondary focus:text-neon-green focus:border-neon-green outline-none"
+      />
       <button
         onClick={handleApply}
         disabled={validating}
