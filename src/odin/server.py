@@ -18,7 +18,12 @@ from fastapi.staticfiles import StaticFiles
 
 from odin.api.canvas import CanvasGraph, create_canvas_router
 from odin.api.ws import ConnectionManager
-from odin.aws.embed import install_rds_spawn_rewire, start_ministack, stop_ministack
+from odin.aws.embed import (
+    aws_container_env,
+    install_rds_spawn_rewire,
+    start_ministack,
+    stop_ministack,
+)
 from odin.aws.rds import MiniStackRds
 from odin.fabric.localhost import LocalhostFabric
 from odin.reconcile.reconciler import Reconciler
@@ -75,9 +80,11 @@ def create_app(
     _rds = rds or MiniStackRds()
     ws_manager = ConnectionManager()
     budget = _runtime.ensure_host().total_mem_mib or 4096.0
+    aws_env = aws_container_env if embed else None
     reconciler = Reconciler(
         _store, _runtime, _rds, fabric=LocalhostFabric(),
-        ws=ws_manager, env=ENV, scheduler=Scheduler(budget), poll_interval=1.0,
+        ws=ws_manager, env=ENV, scheduler=Scheduler(budget),
+        aws_env=aws_env, poll_interval=1.0,
     )
     complete_fn = None
     if complete:

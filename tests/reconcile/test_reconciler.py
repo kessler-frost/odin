@@ -18,11 +18,12 @@ API = ResourceDesired(
 
 class FakeRuntime:
     def __init__(self):
-        self.runs, self.stopped = [], []
+        self.runs, self.stopped, self.specs = [], [], {}
         self._status, self._port, self._exit = {}, {}, {}
 
     def run_container(self, spec):
         self.runs.append(spec.name)
+        self.specs[spec.name] = spec
         self._status[spec.name] = "running"
         self._port[spec.name] = 18080
         return RunHandle(id="fake-" + spec.name, name=spec.name)
@@ -178,6 +179,20 @@ async def test_llm_evicted_to_make_room_for_service(tmp_path):
     await recon.tick()                        # evict the idle model to fit the service
     assert store.current_world().get("model").phase == "evicted"
     assert "svc" in rt.runs
+
+
+async def test_aws_env_injected_into_app_containers(tmp_path):
+    rt, rds = FakeRuntime(), FakeRds()
+    rds.available = True
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(DB, API)))
+    recon = Reconciler(store, rt, rds, http_ok=_yes, pg_ready=_yes, poll_interval=0,
+                       aws_env=lambda: {"AWS_ENDPOINT_URL": "http://host.docker.internal:4566"})
+    for _ in range(3):
+        await recon.tick()
+    spec = rt.specs["api"]
+    assert spec.env["AWS_ENDPOINT_URL"] == "http://host.docker.internal:4566"
+    assert spec.env["DATABASE_URL"].startswith("postgresql://")  # ref still wins/coexists
 
 
 async def test_dep_healthy_publishes_endpoint(tmp_path):

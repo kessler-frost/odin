@@ -37,6 +37,7 @@ class Reconciler:
         ws=None,
         env: str = "default",
         scheduler=None,
+        aws_env=None,
         http_ok=assertions.http_ok,
         pg_ready=assertions.pg_ready,
         ref_timeout: float = 30.0,
@@ -46,6 +47,7 @@ class Reconciler:
         self._rt = runtime
         self._rds = rds
         self._scheduler = scheduler
+        self._aws_env = aws_env
         self._fabric = fabric or LocalhostFabric()
         self._ws = ws
         self._env = env
@@ -234,7 +236,9 @@ class Reconciler:
                     self._rt.stop(eid)
                     await self._emit(eid, "llm", "evicted")
         world = self._store.current_world(self._env)
-        env_vars = dict(res.fields["env"].value) if "env" in res.fields else {}
+        env_vars: dict = dict(self._aws_env()) if self._aws_env is not None else {}
+        if "env" in res.fields:
+            env_vars.update(res.fields["env"].value)  # user env wins over injected AWS
         for ref in res.refs:
             env_vars[ref.var] = self._fabric.resolve(ref, world)
         command = tuple(res.fields["command"].value) if "command" in res.fields else ()

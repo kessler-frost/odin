@@ -78,6 +78,7 @@ class ColimaRuntime:
         args = [
             "run", "-d",
             "--name", spec.name,
+            "--add-host", "host.docker.internal:host-gateway",  # reach the host-side AWS embed
             "--label", f"{LABEL}=1",
             "--label", f"{LABEL}.name={spec.name}",
         ]

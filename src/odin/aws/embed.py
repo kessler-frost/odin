@@ -70,7 +70,7 @@ def start_ministack(port: int | None = None) -> int:
     _port = port or _free_port()
     config = uvicorn.Config(
         build_ministack_app(),
-        host="127.0.0.1",
+        host="0.0.0.0",  # reachable from app containers via host.docker.internal
         port=_port,
         lifespan="off",
         log_level="warning",
@@ -111,6 +111,20 @@ def install_rds_spawn_rewire(runtime) -> None:
     from odin.runtime.shim import AllfatherDockerShim
 
     rds._docker = AllfatherDockerShim(runtime)
+
+
+def aws_container_env() -> dict[str, str]:
+    """AWS env to inject into app containers so their AWS SDK hits the embed.
+
+    Containers reach the host-side embed via host.docker.internal (allfather's
+    runtime adds the host-gateway mapping to every container).
+    """
+    return {
+        "AWS_ENDPOINT_URL": f"http://host.docker.internal:{current_port()}",
+        "AWS_ACCESS_KEY_ID": ACCOUNT_ID,
+        "AWS_SECRET_ACCESS_KEY": "x",
+        "AWS_DEFAULT_REGION": "us-east-1",
+    }
 
 
 def ministack_boto_client(service: str):
