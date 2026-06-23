@@ -24,6 +24,7 @@ def create_canvas_router(canvas_path: Path) -> APIRouter:
 
     @router.post("/canvas")
     def save_canvas(graph: CanvasGraph) -> dict[str, str]:
+        canvas_path.parent.mkdir(parents=True, exist_ok=True)
         canvas_path.write_text(graph.model_dump_json(indent=2))
         return {"status": "saved"}
 

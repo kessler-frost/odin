@@ -37,6 +37,18 @@ def test_post_and_get_canvas(client):
     assert len(data["edges"]) == 1
 
 
+def test_post_canvas_creates_missing_parent_dir(tmp_path):
+    # A fresh start (no .odin yet): saving the canvas must create the dir, not 500.
+    path = tmp_path / "fresh" / "canvas.json"
+    app = FastAPI()
+    app.include_router(create_canvas_router(path))
+    with TestClient(app) as fresh_client:
+        resp = fresh_client.post("/canvas", json={"nodes": [{"id": "a", "type": "service",
+                                  "position": {"x": 0, "y": 0}, "data": {}}], "edges": []})
+        assert resp.status_code == 200
+        assert path.exists()
+
+
 def test_post_canvas_persists_and_overwrites(client, canvas_path):
     client.post("/canvas", json={"nodes": [{"id": "a", "type": "rds", "position": {"x": 0, "y": 0}, "data": {}}], "edges": []})
     assert canvas_path.exists()

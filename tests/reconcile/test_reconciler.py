@@ -186,6 +186,25 @@ async def test_llm_evicted_to_make_room_for_service(tmp_path):
     assert rt.runs.count("model") == 2        # re-admitted, not stranded
 
 
+async def test_destroy_broadcasts_draft_reset_so_canvas_clears(tmp_path):
+    rt, rds = FakeRuntime(), FakeRds()
+    rds.available = True
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(DB,)))
+    sent = []
+
+    class FakeWS:
+        async def broadcast(self, msg):
+            sent.append(msg)
+
+    recon = Reconciler(store, rt, rds, ws=FakeWS(), http_ok=_yes, pg_ready=_yes, poll_interval=0)
+    await recon.tick()                        # db -> starting
+    store.apply(Stack())                      # destroy
+    await recon.tick()                        # prune db
+    resets = [m for m in sent if m.get("resource_id") == "db" and m.get("phase") == "draft"]
+    assert resets, "prune must tell the canvas the node is draft again (else stale-green tile)"
+
+
 async def test_rds_crash_clears_record_and_recreates(tmp_path):
     rt, rds = FakeRuntime(), FakeRds()
     rds.available = True

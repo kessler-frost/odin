@@ -205,7 +205,7 @@ class Reconciler:
                 await asyncio.to_thread(self._aws.deprovision, action.kind, action.id)
             else:
                 self._rt.stop(action.name)
-            self._prune(action.id)
+            await self._prune(action.id)
         elif isinstance(action, NoOp):
             await self._gate_blocked(stack, action.id)
 
@@ -285,7 +285,15 @@ class Reconciler:
         else:
             await self._emit(rid, res.kind, "blocked")
 
-    def _prune(self, rid: str) -> None:
+    async def _prune(self, rid: str) -> None:
         world = self._store.current_world(self._env)
+        gone = world.get(rid)
         kept = World(env=world.env, resources=tuple(r for r in world.resources if r.id != rid))
         self._store.write_world(kept)
+        # Tell the canvas the node is back to draft, else its tile stays stale-green
+        # after a Destroy / node removal (the World emptied but the UI never heard).
+        if self._ws is not None and gone is not None:
+            await self._ws.broadcast({
+                "type": "world_delta", "env": self._env, "resource_id": rid,
+                "kind": gone.kind, "phase": "draft", "facts": {}, "verdict": None,
+            })
