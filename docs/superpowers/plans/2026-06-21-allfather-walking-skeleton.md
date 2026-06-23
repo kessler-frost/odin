@@ -165,7 +165,7 @@ tests/spec, tests/runtime, tests/reconcile, tests/aws  NEW
 - **M4** — Assertion Engine per-kind probe registry; full supervision/re-place.
 - **M5** — Catalog codegen from MiniStack's service list → ~55-service UI parity.
 - **M6** — Environments as cheap copies + per-env account-id namespacing + runner name/port scoping + config-as-code.
-- **M7** — Lima-VM Runtime impl (VM isolation), Nebula/`*.local` Fabric + `apply_edge_policy`, Tailscale fabric, multi-Mac memberlist/raft.
+- **M7** — Lima-VM Runtime impl (VM isolation) ✅ done; self-hosted Nebula mesh Fabric (`fabric/nebula.py`) + `apply_edge_policy`, multi-Mac memberlist/raft (NOT Tailscale).
 
 ## Acceptance for the walking skeleton
 1. `uv run pytest` green (unit + the new spine tests). 2. `odin start --dev` boots on the new Reconciler path (no Moto/Tofu). 3. The S3 playwright slice passes: api+db apply → real Postgres + supervised app reading the live `DATABASE_URL`, live tiles, auto-restart, clean teardown (0 containers/VMs/orphans). 4. No license violations; no leftover build/test artifacts.

@@ -17,7 +17,7 @@ It is built by evolving the existing `odin` codebase (Python + React/ReactFlow).
 - Run all four workload classes: long-running services, batch/agentic jobs, dev/data dependencies, local LLM inference (via `omlx`).
 - Continuous supervision: restart on crash, re-place on host failure, memory-aware scheduling on one 48GB host.
 - Live, trustworthy status on the canvas (status is a strict projection of observed reality).
-- Single Mac now; multi-Mac fleet over Tailscale later (additive, behind ports).
+- Single Mac now; multi-Mac fleet over a self-hosted Nebula mesh later (additive, behind ports).
 
 ### Non-goals (explicitly out of scope)
 - Real AWS-IAM policy *enforcement* (no permissive engine exists; building one is engineer-months). IAM is *modeled* + AI-sanity-checked; real boundaries come from the substrate.
@@ -32,11 +32,11 @@ It is built by evolving the existing `odin` codebase (Python + React/ReactFlow).
 2. **Two layers on one canvas:** INFRA nodes (the "where" — AWS-shaped: VPC/subnet/security-group/host + the ~55 AWS services MiniStack emulates) + APP nodes (the "what" — user services, batch/agentic jobs). The AI places app nodes onto infra and completes config.
 3. **Workloads (all four):** services (long-running, supervised), batch/agentic jobs (run-to-completion), dev/data deps (Postgres/Redis/etc.), local LLM inference via `omlx` (memory-aware load/evict).
 4. **Control model:** allfather owns a desired-state spec + a **continuous reconciler/control loop** (not one-shot IaC apply). Nomad-shaped; Nomad itself is out (BUSL).
-5. **Scope:** single Mac now (bin-pack one host's mem/CPU/GPU); a `Node` abstraction with `localhost` as its only impl now; multi-Mac over Tailscale is a later additive milestone (then memberlist/raft, both MPL).
+5. **Scope:** single Mac now (bin-pack one host's mem/CPU/GPU); a `Node` abstraction with `localhost` as its only impl now; multi-Mac over a self-hosted Nebula mesh (you own the lighthouse — private network, build a control plane/UI on top; chosen over Tailscale) is a later additive milestone (then memberlist/raft, both MPL).
 6. **Brain:** reuse odin's claude-agent-sdk agent + clockwork's "schema-native completion" pattern (under-specified Pydantic models; LLM fills missing fields; **user values always win**; track which fields the AI filled). LLM **generates + places + proposes changesets + sanity-checks IAM**; deterministic code **reconciles**; deterministic **assertions verify** (the LLM never verifies).
 7. **AWS emulation = MiniStack-central.** MiniStack (Python, MIT, ~55 services) is **forked + embedded in-process** (`ministack.app:app`, a bare ASGI3 callable, mounted in allfather's FastAPI app). Its container-spawn step is **rewired to allfather's Runtime driver** so its containers join allfather's World. 8 services spawn real containers (RDS→Postgres/MySQL, ElastiCache→Redis, ECS→Docker tasks, EKS→k3s, Lambda→RIE, Glue, MWAA, OpenSearch); the rest are in-memory control-plane.
 8. **IAM:** no enforcement engine. Modeled on the canvas (edges-with-permissions) + AI sanity-check (least-privilege / blast-radius). Real boundaries = container namespaces/capabilities/seccomp + overlay-network firewall rules (odin's `sg_rules_to_firewall` already does SG→Nebula).
-9. **Runtime:** odin's existing `SimulationRunner` (real Lima VMs + nerdctl containers + per-network Nebula overlay, clean teardown) is generalized into the Runtime driver. Runtime drivers (lima/nerdctl now; apple-container, linux later) and the Fabric (localhost/`*.local` now; tailscale later) are **platform-gated plugin seams**.
+9. **Runtime:** odin's existing `SimulationRunner` (real Lima VMs + nerdctl containers + per-network Nebula overlay, clean teardown) is generalized into the Runtime driver. Runtime drivers (lima/nerdctl now; apple-container, linux later) and the Fabric (localhost/`*.local` now; self-hosted Nebula mesh later) are **platform-gated plugin seams**.
 10. **UX = Railway minus the cloud:** spatial canvas primary view; live status painted on tiles (state + CPU/RAM/GPU + log tail); reference variables `${{node.VAR}}` that auto-draw edges; staged-changes/changeset model (review a diff, apply atomically — pairs with the AI proposing the changeset); environments as cheap experiment copies; config-as-code layered over the GUI.
 
 ### The six settled design decisions
@@ -97,7 +97,7 @@ Enforcement mechanism: odin already has an in-process MCP server (`@tool` + `cre
      RUNTIME       FABRIC         SERVICE-BACKEND ──► MiniStack embed (/aws, forked)
      (lima+        (localhost+     decision: control-    ~47 in-mem control-plane
      nerdctl;      *.local now;    plane(no-op) vs        + 8 real-container svcs
-     apple@)       tailscale@)     container→Runtime      (spawn rewired→Runtime)
+     apple@)       nebula@)        container→Runtime      (spawn rewired→Runtime)
 ```
 
 ### 3.3 Components
@@ -196,7 +196,7 @@ Strict one-way projection so the canvas can never disagree with reality. Drivers
 - **M4** — Assertion Engine per-kind probes + full supervision/restart/re-place.
 - **M5** — Catalog codegen from MiniStack's service list → ~55-service UI parity (pure data, parallelizable).
 - **M6** — Environments as cheap copies + per-env MiniStack namespacing + config-as-code precedence.
-- **M7** (later, no core change) — new Runtime/Fabric impls: apple-container CLI, Tailscale fabric, multi-Mac memberlist/raft.
+- **M7** (later, no core change) — new Runtime/Fabric impls: apple-container CLI, self-hosted Nebula mesh fabric (NOT Tailscale — see §3.7), multi-Mac memberlist/raft.
 - **M8 — Region-select debugging ("what's wrong here?")** (UX, no core change) — drag a selection rectangle over a canvas region → context menu ("Debug this" / "What's wrong here?" / "Fix this part" / free-form ask) → a region-scoped agent AUTO-GATHERS the enclosed nodes + edges and, for each, its World state (phase/facts/verdict/restarts) + recent events/logs + relevant Stack fields, then investigates/fixes from there. Reuses the existing Cmd+drag selection; the new parts are the menu + a context-assembler that turns a selection into the agent prompt. Goal: the user points at a region instead of describing it — far less back-and-forth.
 
 M1, M5, and M2's per-service work are independently dispatchable to parallel agents once S0–S3 lands.

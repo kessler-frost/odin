@@ -4,8 +4,9 @@ For the skeleton, inter-node addressing is just loopback host ports. A producer
 publishes its address as a World fact (e.g. `facts["DATABASE_URL"]`) when it goes
 healthy; `resolve()` reads it. A reference to a not-yet-healthy producer raises
 `Unresolved`, which the Reconciler turns into a deterministic `blocked` phase
-(never a silent empty value). A Tailscale/`*.local` cross-Mac fabric is a later
-milestone behind this same interface.
+(never a silent empty value). A self-hosted Nebula mesh fabric (see
+`fabric/nebula.py`) resolves cross-Mac references to overlay addresses behind
+this same interface — that's the multi-Mac (M7) path.
 """
 from __future__ import annotations
 
