@@ -41,10 +41,9 @@ artifacts = ["src/odin/_ui/**/*"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = ["-m", "not integration and not tofu"]
+addopts = ["-m", "not integration"]
 markers = [
-    "integration: needs real Lima VMs or the Claude agent — off by default",
-    "tofu: needs the tofu binary + a Moto server — off by default, run with `-m tofu`",
+    "integration: needs real Colima/Lima/MiniStack or the Claude agent — off by default",
 ]
 
 [tool.ruff]
