@@ -116,7 +116,7 @@ def create_app(
 ) -> FastAPI:
     _runtime = runtime or ColimaRuntime()
     _store = store or SpecStore(ODIN_DIR)
-    ws_manager = ConnectionManager()
+    ws_manager = ConnectionManager(_store.root)
     scheduler = Scheduler(_runtime.ensure_host().total_mem_mib or 4096.0)
     complete_fn = None
     if complete:
@@ -171,8 +171,8 @@ def create_app(
             ws_manager.disconnect(websocket)
 
     @app.get("/events")
-    def get_events():
-        return ws_manager.get_events()
+    def get_events(env: str = ENV):
+        return ws_manager.get_events(env)
 
     @app.get("/health")
     def health():

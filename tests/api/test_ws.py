@@ -1,7 +1,6 @@
-"""ConnectionManager: broadcast must survive a broken viewer and prune it."""
+"""ConnectionManager: survive a broken viewer, prune it, and scope events per env."""
 from __future__ import annotations
 
-import odin.api.ws as wsmod
 from odin.api.ws import ConnectionManager
 
 
@@ -19,34 +18,32 @@ class FakeWS:
         self.sent.append(message)
 
 
-def _manager(tmp_path, monkeypatch) -> ConnectionManager:
-    monkeypatch.setattr(wsmod, "EVENTS_LOG", tmp_path / "events.jsonl")
-    return ConnectionManager()
-
-
-async def test_broadcast_delivers_persists_and_prunes_dead(tmp_path, monkeypatch):
-    mgr = _manager(tmp_path, monkeypatch)
+async def test_broadcast_delivers_persists_and_prunes_dead(tmp_path):
+    mgr = ConnectionManager(tmp_path)
     good, bad = FakeWS(), FakeWS(dead=True)
     await mgr.connect(good)
     await mgr.connect(bad)
 
-    await mgr.broadcast({"type": "a"})          # bad raises, must not propagate
-    assert good.sent == [{"type": "a"}]         # live viewer got it
-    assert len(mgr.get_events()) == 1           # persisted regardless of viewers
+    await mgr.broadcast({"type": "a", "env": "default"})   # bad raises, must not propagate
+    assert good.sent == [{"type": "a", "env": "default"}]   # live viewer got it
+    assert len(mgr.get_events("default")) == 1              # persisted regardless of viewers
 
-    await mgr.broadcast({"type": "b"})          # bad was pruned -> not retried
-    assert good.sent == [{"type": "a"}, {"type": "b"}]
+    await mgr.broadcast({"type": "b", "env": "default"})    # bad was pruned -> not retried
+    assert good.sent[-1] == {"type": "b", "env": "default"}
 
 
-async def test_disconnect_is_idempotent(tmp_path, monkeypatch):
-    mgr = _manager(tmp_path, monkeypatch)
+async def test_disconnect_is_idempotent(tmp_path):
+    mgr = ConnectionManager(tmp_path)
     w = FakeWS()
     await mgr.connect(w)
     mgr.disconnect(w)
-    mgr.disconnect(w)                           # second time must not raise
+    mgr.disconnect(w)                                       # second time must not raise
 
 
-async def test_broadcast_with_no_viewers_still_persists(tmp_path, monkeypatch):
-    mgr = _manager(tmp_path, monkeypatch)
-    await mgr.broadcast({"type": "x"})
-    assert mgr.get_events() == [{"type": "x"}]
+async def test_events_are_scoped_per_env(tmp_path):
+    mgr = ConnectionManager(tmp_path)
+    await mgr.broadcast({"type": "x", "env": "staging"})
+    await mgr.broadcast({"type": "y", "env": "prod"})
+    assert mgr.get_events("staging") == [{"type": "x", "env": "staging"}]
+    assert mgr.get_events("prod") == [{"type": "y", "env": "prod"}]
+    assert mgr.get_events("default") == []                  # an untouched env is empty

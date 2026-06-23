@@ -140,14 +140,14 @@ export default function BottomPanel({ bottomState, activeEnv, onCycleBottom, onW
   const [spinnerWord, setSpinnerWord] = useState(spinnerWords[0]);
 
   useEffect(() => {
-    fetch('/events')
+    fetch(`/events?env=${encodeURIComponent(activeEnv ?? 'default')}`)
       .then(r => r.json())
       .then((events: Record<string, unknown>[]) => {
         const lines = events.flatMap(parseWebSocketMessage);
         setLogs(lines.reverse());
       })
       .catch(() => {});
-  }, []);
+  }, [activeEnv]);
 
   useEffect(() => {
     if (clearSignal) setLogs([]);

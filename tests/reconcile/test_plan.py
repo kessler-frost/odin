@@ -93,6 +93,21 @@ def test_batch_runs_once_then_terminal():
         assert plan(stack, world) == [NoOp(id="job")]             # never re-run
 
 
+def test_crash_looped_workload_is_not_rerun():
+    from odin.reconcile.plan import MAX_RESTARTS
+
+    svc = ResourceDesired(id="svc", kind="service", fields={"image": FieldValue(value="bad")})
+    stack = Stack(resources=(svc,))
+    under = _world(ResourceObserved(id="svc", kind="service", phase="crashed", restarts=MAX_RESTARTS - 1))
+    assert plan(stack, under) == [RunContainer(id="svc")]          # still retrying under the cap
+    at_cap = _world(ResourceObserved(id="svc", kind="service", phase="crashed", restarts=MAX_RESTARTS))
+    assert plan(stack, at_cap) == [NoOp(id="svc")]                 # given up at the cap
+
+    db_stack = Stack(resources=(DB,))
+    rds_capped = _world(ResourceObserved(id="db", kind="rds", phase="crashed", restarts=MAX_RESTARTS))
+    assert plan(db_stack, rds_capped) == [NoOp(id="db")]           # rds recreate churn stops too
+
+
 def test_aws_resource_created_once_then_exists():
     bucket = ResourceDesired(id="uploads", kind="s3")
     stack = Stack(resources=(bucket,))

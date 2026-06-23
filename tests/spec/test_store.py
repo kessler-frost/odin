@@ -44,3 +44,18 @@ def test_world_delta_upserts_and_persists(tmp_path):
     assert db.facts["endpoint"] == "postgres://localhost:15432"
     # persisted
     assert SpecStore(tmp_path).current_world().get("db").phase == "healthy"
+
+
+def test_apply_delta_counts_consecutive_crashes(tmp_path):
+    store = SpecStore(tmp_path)
+
+    def push(phase):
+        return store.apply_delta(WorldDelta(env="default", resource_id="api", kind="service", phase=phase))
+
+    push("starting")
+    assert push("healthy").get("api").restarts == 0
+    assert push("crashed").get("api").restarts == 1       # fresh crash
+    assert push("crashed").get("api").restarts == 1       # still crashed -> not double-counted
+    assert push("starting").get("api").restarts == 1      # preserved across restart
+    assert push("crashed").get("api").restarts == 2       # next crash
+    assert push("healthy").get("api").restarts == 0       # recovery resets the streak

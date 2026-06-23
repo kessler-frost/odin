@@ -6,16 +6,19 @@ from typing import Any
 
 from fastapi import WebSocket
 
-EVENTS_LOG = Path(".odin/events.jsonl")
-
 
 class ConnectionManager:
-    """Manages WebSocket connections and broadcasts state updates."""
+    """Manages WebSocket connections and broadcasts state updates.
 
-    def __init__(self) -> None:
+    The durable event log is scoped per environment (`<root>/<env>/events.jsonl`,
+    parallel to that env's `world.json`), so the log panel never mixes envs."""
+
+    def __init__(self, root: Path | str = ".odin") -> None:
         self._connections: set[WebSocket] = set()
-        self._log_path = EVENTS_LOG
-        self._log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._root = Path(root)
+
+    def _log(self, env: str) -> Path:
+        return self._root / env / "events.jsonl"
 
     async def connect(self, websocket: WebSocket) -> None:
         await websocket.accept()
@@ -25,10 +28,13 @@ class ConnectionManager:
         self._connections.discard(websocket)  # idempotent
 
     async def broadcast(self, message: dict[str, Any]) -> None:
-        with self._log_path.open("a") as f:
+        env = message.get("env", "default")
+        path = self._log(env)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as f:
             f.write(json.dumps(message) + "\n")
         # Best-effort: a broken viewer must never stall reconciliation. A failed
-        # send drops that socket; the durable events.jsonl above is the source of
+        # send drops that socket; the durable per-env log above is the source of
         # truth, and live viewers backfill from /events on (re)connect.
         dead = []
         for connection in list(self._connections):
@@ -39,8 +45,8 @@ class ConnectionManager:
         for connection in dead:
             self._connections.discard(connection)
 
-    def get_events(self) -> list[dict[str, Any]]:
-        if not self._log_path.exists():
+    def get_events(self, env: str = "default") -> list[dict[str, Any]]:
+        path = self._log(env)
+        if not path.exists():
             return []
-        lines = self._log_path.read_text().splitlines()
-        return [json.loads(line) for line in lines if line.strip()]
+        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]

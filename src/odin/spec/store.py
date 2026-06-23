@@ -75,15 +75,22 @@ class SpecStore:
         (env_dir / "world.json").write_text(world.model_dump_json(indent=2))
 
     def apply_delta(self, delta: WorldDelta) -> World:
-        """Upsert one resource's observed state and persist the new World."""
+        """Upsert one resource's observed state and persist the new World.
+
+        Tracks consecutive crashes: reset to 0 on healthy, +1 on each fresh
+        crash (so `plan` can give up on a crash-looping workload)."""
         world = self.current_world(delta.env)
+        prior = world.get(delta.resource_id)
+        prev = prior.restarts if prior else 0
+        fresh_crash = delta.phase == "crashed" and prior is not None and prior.phase != "crashed"
+        restarts = 0 if delta.phase == "healthy" else prev + (1 if fresh_crash else 0)
         observed = ResourceObserved(
             id=delta.resource_id,
             kind=delta.kind,
             phase=delta.phase,
             facts=delta.facts,
             verdict=delta.verdict,
-            restarts=(r.restarts if (r := world.get(delta.resource_id)) else 0),
+            restarts=restarts,
         )
         others = tuple(r for r in world.resources if r.id != delta.resource_id)
         new_world = World(env=delta.env, resources=(*others, observed))

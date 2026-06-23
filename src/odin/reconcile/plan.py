@@ -15,7 +15,9 @@ from odin.reconcile.actions import (
     RunContainer,
     StopContainer,
 )
-from odin.spec.models import ResourceDesired, Stack, World
+from odin.spec.models import ResourceDesired, ResourceObserved, Stack, World
+
+MAX_RESTARTS = 5  # consecutive crashes before plan gives up (don't respawn a bad image forever)
 
 
 def _refs_ready(res: ResourceDesired, world: World) -> bool:
@@ -25,6 +27,11 @@ def _refs_ready(res: ResourceDesired, world: World) -> bool:
         if target is None or target.phase != "healthy":
             return False
     return True
+
+
+def _crash_looped(observed: ResourceObserved | None) -> bool:
+    """Given up: crashed MAX_RESTARTS times in a row without going healthy."""
+    return observed is not None and observed.restarts >= MAX_RESTARTS
 
 
 def plan(stack: Stack, world: World) -> list[Action]:
@@ -48,13 +55,13 @@ def plan(stack: Stack, world: World) -> list[Action]:
 
         if res.kind == "rds":
             # (re)create when nothing is up; otherwise wait for it to go healthy.
-            if phase in ("pending", "crashed"):
+            if phase in ("pending", "crashed") and not _crash_looped(observed):
                 actions.append(CreateMiniStackResource(id=res.id, service="rds"))
             else:
                 actions.append(NoOp(id=res.id))
         elif res.kind in ("service", "dep", "llm"):
-            if not _refs_ready(res, world):
-                actions.append(NoOp(id=res.id))  # blocked; reconciler sets the phase
+            if not _refs_ready(res, world) or _crash_looped(observed):
+                actions.append(NoOp(id=res.id))  # blocked, or given up after crash-looping
             elif phase in ("pending", "crashed", "blocked", "error", "queued", "evicted"):
                 # "error" recovers when a ref heals; "queued"/"evicted" retry when
                 # memory frees (the scheduler re-queues if it's still tight).
