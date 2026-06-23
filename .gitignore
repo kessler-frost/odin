@@ -29,3 +29,4 @@ docs/plans/
 
 # Built UI bundled into the wheel at release time (not committed)
 src/odin/_ui/
+.superpowers/

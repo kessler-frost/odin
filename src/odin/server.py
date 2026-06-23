@@ -33,7 +33,7 @@ from odin.reconcile.scheduler import Scheduler
 from odin.runtime.colima import ColimaRuntime
 from odin.spec.models import Stack
 from odin.spec.store import SpecStore
-from odin.spec.translate import canvas_to_stack
+from odin.spec.translate import canvas_to_stack, skipped_node_types
 
 ODIN_DIR = Path(".odin")
 CANVAS_PATH = ODIN_DIR / "canvas.json"
@@ -48,7 +48,8 @@ def create_apply_router(store: SpecStore, reconciler_for, complete_fn=None) -> A
     @router.post("/apply")
     async def apply(graph: CanvasGraph, env: str = ENV) -> dict:
         reconciler = await reconciler_for(env)
-        stack = canvas_to_stack(graph.model_dump(), env=env)
+        canvas = graph.model_dump()
+        stack = canvas_to_stack(canvas, env=env)
         if complete_fn is not None:  # best-effort AI completion; defaults cover failure
             try:
                 stack = await complete_fn(stack)
@@ -56,7 +57,7 @@ def create_apply_router(store: SpecStore, reconciler_for, complete_fn=None) -> A
                 log.exception("brain completion failed; applying as-is")
         rev = store.apply(stack)
         await reconciler.tick()  # kick an immediate pass; the loop continues it
-        return {"status": "applied", "rev": rev, "env": env}
+        return {"status": "applied", "rev": rev, "env": env, "skipped": skipped_node_types(canvas)}
 
     @router.post("/destroy")
     async def destroy(env: str = ENV) -> dict:
@@ -70,13 +71,14 @@ def create_apply_router(store: SpecStore, reconciler_for, complete_fn=None) -> A
         """Staged changeset: what the AI would fill, for review before Apply."""
         from odin.agent.completion import ai_diff
 
-        stack = canvas_to_stack(graph.model_dump(), env=env)
+        canvas = graph.model_dump()
+        stack = canvas_to_stack(canvas, env=env)
         if complete_fn is not None:
             try:
                 stack = await complete_fn(stack)
             except Exception:
                 log.exception("preview completion failed")
-        return {"diff": ai_diff(stack), "env": env}
+        return {"diff": ai_diff(stack), "env": env, "skipped": skipped_node_types(canvas)}
 
     @router.post("/review-iam")
     async def review_iam_route(graph: CanvasGraph, env: str = ENV) -> dict:
@@ -176,7 +178,8 @@ def create_app(
 
     @app.get("/health")
     def health():
-        return {"ok": True, "agent": False}
+        # The Brain runs on demand (claude-agent-sdk); "agent" = is it wired in.
+        return {"ok": True, "agent": complete_fn is not None}
 
     app.state.store = _store
     app.state.runtime = _runtime

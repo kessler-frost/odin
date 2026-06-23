@@ -134,6 +134,7 @@ export default function App() {
       if (!res.ok) throw new Error(String(res.status));
       const body = await res.json();
       pushToast('success', `Applied to ${body.env ?? env}`);
+      if (body.skipped?.length) pushToast('info', `Not runnable: ${body.skipped.join(', ')}`);
     } catch {
       pushToast('error', 'Apply failed — backend unreachable');
     }

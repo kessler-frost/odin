@@ -74,6 +74,13 @@ def _edge(e: dict) -> Edge:
     return Edge(src=e.get("source", ""), dst=e.get("target", ""), kind=kind, perms=perms)
 
 
+def skipped_node_types(canvas: dict) -> list[str]:
+    """Distinct canvas node types that aren't runnable workloads/resources, so
+    Apply/Preview can tell the user instead of silently dropping them."""
+    types = [n.get("type", "?") for n in (canvas.get("nodes") or []) if n.get("type") not in _KIND]
+    return sorted(set(types))
+
+
 def canvas_to_stack(canvas: dict, env: str = "default") -> Stack:
     nodes = canvas.get("nodes") or []
     resources = tuple(r for n in nodes if (r := _resource(n)) is not None)
