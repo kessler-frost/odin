@@ -95,6 +95,13 @@ class HostMembership(BaseModel):
     online: bool = False
 
 
+class MeshResource(BaseModel):
+    id: str
+    kind: str
+    phase: str
+    endpoint: str | None = None
+
+
 class MeshState(BaseModel):
     """The read model a mesh UI / control plane builds on (the reason Nebula
     was chosen over Tailscale: a self-owned, introspectable mesh)."""
@@ -103,3 +110,4 @@ class MeshState(BaseModel):
     lighthouse_ip: str = "10.42.0.1"
     lighthouse_underlay: str | None = None
     hosts: list[HostMembership] = []
+    resources: list[MeshResource] = []

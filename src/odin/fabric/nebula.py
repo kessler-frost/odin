@@ -30,6 +30,7 @@ from odin.fabric.models import (
     FirewallRules,
     HostMembership,
     MeshNetwork,
+    MeshResource,
     MeshState,
 )
 from odin.spec.models import World
@@ -67,9 +68,8 @@ class NebulaManager:
     """
 
     def __init__(self, data_dir: Path, runner=None) -> None:
-        self._dir = Path(data_dir)
-        self._dir.mkdir(parents=True, exist_ok=True)
-        self._run = runner or _default_runner
+        self._dir = Path(data_dir)  # created on first WRITE, not construction, so
+        self._run = runner or _default_runner  # a read (mesh_state) has no side effect
 
     @property
     def _ca_crt(self) -> Path:
@@ -85,6 +85,7 @@ class NebulaManager:
         return d
 
     def create_ca(self, network: str) -> CaInfo:
+        self._dir.mkdir(parents=True, exist_ok=True)
         proc = self._run([
             "nebula-cert", "ca", "-name", network,
             "-out-crt", str(self._ca_crt), "-out-key", str(self._ca_key),
@@ -145,6 +146,7 @@ class NebulaManager:
         return self._dir / "overlay.json"
 
     def save_overlay(self, overlay: MeshNetwork) -> None:
+        self._dir.mkdir(parents=True, exist_ok=True)
         self._overlay_path().write_text(overlay.model_dump_json(indent=2))
 
     def load_overlay(self) -> MeshNetwork | None:
@@ -203,11 +205,16 @@ def ensure_network(root: Path, env: str, lighthouse_underlay: str, runner=None) 
 
 
 def mesh_state(root: Path, env: str, world: World | None = None) -> MeshState:
-    """The UI read model: the env's overlay joined with observed membership.
-    Returns an empty network when no host has joined yet (no overlay file)."""
+    """The UI read model: the env's overlay membership joined with the observed
+    World (resources + their published endpoints). Both sides are optional — an
+    env with no joined host (no overlay file) and/or no World still renders."""
+    resources = [
+        MeshResource(id=r.id, kind=r.kind, phase=r.phase, endpoint=r.facts.get("endpoint"))
+        for r in (world.resources if world else ())
+    ]
     overlay = NebulaManager(_nebula_dir(root, env)).load_overlay()
     if overlay is None:
-        return MeshState(network=env)
+        return MeshState(network=env, resources=resources)
     hosts_subnet = overlay.subnets.get("hosts")
     hosts = [
         HostMembership(hostname=name, overlay_ip=ip, groups=["host"])
@@ -216,7 +223,7 @@ def mesh_state(root: Path, env: str, world: World | None = None) -> MeshState:
     return MeshState(
         network=overlay.network, base_cidr=overlay.base_cidr,
         lighthouse_ip=overlay.lighthouse_ip, lighthouse_underlay=overlay.lighthouse_underlay_ip,
-        hosts=hosts,
+        hosts=hosts, resources=resources,
     )
 
 

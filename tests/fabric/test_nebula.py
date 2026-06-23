@@ -125,6 +125,17 @@ def test_ensure_network_bootstraps_and_is_idempotent(tmp_path):
     assert sum(1 for c in runner.calls if "ca" in c) == ca_calls     # CA not re-minted
 
 
+def test_mesh_state_read_has_no_filesystem_side_effect(tmp_path):
+    mesh_state(tmp_path, "prod")
+    assert not (tmp_path / "prod" / "nebula").exists()  # a GET must not mkdir
+
+
+def test_mesh_state_projects_world_resources(tmp_path):
+    world = _world("healthy", {"endpoint": "10.42.1.7:5432"})
+    state = mesh_state(tmp_path, "prod", world)
+    assert [(r.id, r.phase, r.endpoint) for r in state.resources] == [("db", "healthy", "10.42.1.7:5432")]
+
+
 def test_mesh_state_empty_then_populated(tmp_path):
     assert mesh_state(tmp_path, "prod").hosts == []   # no overlay yet
     mgr = NebulaManager(tmp_path / "prod" / "nebula", runner=FakeRunner())
