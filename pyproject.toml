@@ -1,6 +1,6 @@
 [project]
 name = "odin"
-version = "0.1.2"
+version = "0.2.0"
 description = "allfather: a Mac-native, AI-operated orchestration canvas. Drop apps + AWS resources, the AI completes config, a control loop runs them for real on Colima/Lima with an embedded MiniStack AWS control plane."
 requires-python = ">=3.12"
 license = "Apache-2.0"
