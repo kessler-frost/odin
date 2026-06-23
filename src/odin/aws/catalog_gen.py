@@ -44,6 +44,7 @@ def generate_catalog_ts() -> str:
     import ministack.app as ministack_app
 
     registry = getattr(ministack_app, "SERVICE_REGISTRY", {})
+    assert registry, "MiniStack SERVICE_REGISTRY not found or empty"
     stale = _SKIP - set(registry)
     assert not stale, f"stale _SKIP entries (no longer MiniStack services): {sorted(stale)}"
     services = sorted(n for n in registry if n not in _SKIP)

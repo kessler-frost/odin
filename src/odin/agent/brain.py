@@ -78,7 +78,7 @@ _IAM_SYSTEM = (
 async def review_iam(stack: Stack) -> list[str]:
     """LLM review of the access graph (the canvas's permission edges)."""
     os.environ.pop("CLAUDECODE", None)
-    # Only review access grants (IAM edges), not the ${{}} data-flow refs.
+    # Only review access grants (IAM edges); other edges (e.g. network) aren't grants.
     edges = [{"from": e.src, "to": e.dst, "perms": list(e.perms)}
              for e in stack.edges if e.kind == "iam"]
     if not edges:

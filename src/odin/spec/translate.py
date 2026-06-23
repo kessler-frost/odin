@@ -65,10 +65,12 @@ def _resource(node: dict) -> ResourceDesired | None:
 
 def _edge(e: dict) -> Edge:
     # The UI stores access metadata under `data` (Canvas.tsx): `permissions` +
-    # `edgeType`. Thread both through so the Brain's IAM review sees real grants.
+    # `edgeType` ("iam" | "network"). Thread both through so the Brain's IAM
+    # review sees real grants. (Data-flow ${{node.attr}} refs are NOT edges —
+    # they're lifted into ResourceDesired.refs above.)
     data = e.get("data") or {}
     perms = tuple(data.get("permissions") or ())
-    kind = data.get("edgeType") or ("iam" if perms else "ref")
+    kind = data.get("edgeType") or ("iam" if perms else "network")
     return Edge(src=e.get("source", ""), dst=e.get("target", ""), kind=kind, perms=perms)
 
 
