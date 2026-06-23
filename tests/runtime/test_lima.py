@@ -2,9 +2,9 @@
 nerdctl-in-VM commands. Unit-level (injected subprocess), so deterministic."""
 from __future__ import annotations
 
-from odin.runtime.colima import ContainerSpec
+from odin.runtime.colima import ContainerSpec, _Proc
 from odin.runtime.driver import RuntimeDriver
-from odin.runtime.lima import LimaRuntime, _Proc
+from odin.runtime.lima import LimaRuntime
 
 
 class FakeRunner:

@@ -1,10 +1,10 @@
-"""The single-host container runtime: real containers via Colima's `docker`.
+"""Container runtimes: a shared base + the default Colima (`docker`) driver.
 
 For the walking skeleton the Runtime driver's "host" is the local Colima
-container engine (run containers directly), not a per-node Lima VM — fast, real
-containers, and matches the project's "Colima as the container runtime" rule.
-A Lima-VM Runtime impl (VM isolation / remote hosts) is a later milestone behind
-the same interface.
+container engine (run containers directly), fast and real. `LimaRuntime`
+(runtime/lima.py) runs the same containers inside a Lima VM for isolation,
+reusing the `_ContainerRuntime` base here — they differ only in the CLI seam
+(`docker` vs `nerdctl`-in-VM) and Colima's host-gateway run flag.
 
 Every container allfather runs is labelled ``allfather=1`` (deliberately NOT
 ``ministack=…``, so MiniStack's own container reaper never touches them).
@@ -53,7 +53,7 @@ class HostFacts:
     overlay_ip: str | None = None
 
 
-# Docker container state -> coarse runtime phase ("healthy" is an assertion's call).
+# Docker/nerdctl container state -> coarse runtime phase ("healthy" is an assertion's call).
 _STATUS_TO_PHASE: dict[str, Phase] = {
     "running": "starting",
     "restarting": "starting",
@@ -66,24 +66,45 @@ _STATUS_TO_PHASE: dict[str, Phase] = {
 }
 
 
-class ColimaRuntime:
-    """Drives `docker` (Colima) to run/inspect/stop labelled containers."""
+def _to_mib(value: str) -> float:
+    # Longest suffixes first: "MiB" also ends with "B".
+    units = [("GiB", 1024.0), ("MiB", 1.0), ("KiB", 1 / 1024), ("B", 1 / 1024 / 1024)]
+    for unit, factor in units:
+        if value.endswith(unit):
+            return float(value[: -len(unit)] or 0) * factor
+    return 0.0
 
-    def _docker(self, *args: str, check: bool = True) -> str:
-        proc = subprocess.run(
-            ["docker", *args], capture_output=True, text=True
-        )
-        if check and proc.returncode != 0:
-            raise RuntimeError(f"docker {' '.join(args)} failed: {proc.stderr.strip()}")
-        return proc.stdout.strip()
+
+@dataclass
+class _Proc:
+    returncode: int
+    stdout: str
+    stderr: str = ""
+
+
+def _default_runner(args: list[str]) -> _Proc:
+    proc = subprocess.run(args, capture_output=True, text=True)
+    return _Proc(proc.returncode, proc.stdout, proc.stderr)
+
+
+class _ContainerRuntime:
+    """Run/inspect/stop labelled containers. Subclasses supply `_cli` (the
+    container-CLI seam) and optionally `_run_flags` (runtime-specific run args).
+    The subprocess runner is injectable, so subclasses are unit-testable."""
+
+    def __init__(self, runner=None) -> None:
+        self._run = runner or _default_runner
+
+    def _cli(self, *args: str, check: bool = True) -> str:
+        raise NotImplementedError
+
+    def _run_flags(self) -> list[str]:
+        return []
 
     def run_container(self, spec: ContainerSpec) -> RunHandle:
         args = [
-            "run", "-d",
-            "--name", spec.name,
-            "--add-host", "host.docker.internal:host-gateway",  # reach the host-side AWS embed
-            "--label", f"{LABEL}=1",
-            "--label", f"{LABEL}.name={spec.name}",
+            "run", "-d", "--name", spec.name, *self._run_flags(),
+            "--label", f"{LABEL}=1", "--label", f"{LABEL}.name={spec.name}",
         ]
         for key, value in spec.labels.items():
             args += ["--label", f"{key}={value}"]
@@ -93,71 +114,67 @@ class ColimaRuntime:
             args += ["-p", (f"{hport}:{cport}" if hport else str(cport))]
         args.append(spec.image)
         args += list(spec.command)
-        cid = self._docker(*args)
-        return RunHandle(id=cid, name=spec.name)
+        return RunHandle(id=self._cli(*args), name=spec.name)
 
     def status(self, name: str) -> str:
         """Container state: running / exited / created / … / absent."""
-        out = self._docker("inspect", "-f", "{{.State.Status}}", name, check=False)
-        return out or "absent"
+        return self._cli("inspect", "-f", "{{.State.Status}}", name, check=False) or "absent"
 
     def exit_code(self, name: str) -> int:
-        out = self._docker("inspect", "-f", "{{.State.ExitCode}}", name, check=False)
+        out = self._cli("inspect", "-f", "{{.State.ExitCode}}", name, check=False)
         return int(out) if out.lstrip("-").isdigit() else -1
 
     def host_port(self, name: str, container_port: int) -> int:
-        out = self._docker("port", name, str(container_port), check=False)
+        out = self._cli("port", name, str(container_port), check=False)
         return int(out.splitlines()[0].rsplit(":", 1)[-1]) if out else 0
 
     def logs(self, name: str, tail: int = 20) -> str:
-        return self._docker("logs", "--tail", str(tail), name, check=False)
+        return self._cli("logs", "--tail", str(tail), name, check=False)
 
     def stats(self, name: str) -> dict[str, float]:
         """One-shot cpu% + memory (MiB) for a running container."""
-        out = self._docker(
-            "stats", "--no-stream", "--format",
-            "{{.CPUPerc}} {{.MemUsage}}", name, check=False,
+        out = self._cli(
+            "stats", "--no-stream", "--format", "{{.CPUPerc}} {{.MemUsage}}", name, check=False,
         )
         if not out:
             return {"cpu": 0.0, "ram": 0.0}
         cpu_s, mem_s = out.split(" ", 1)
-        cpu = float(cpu_s.strip().rstrip("%") or 0)
-        mem = mem_s.split("/")[0].strip()  # e.g. "23.5MiB"
-        ram = _to_mib(mem)
-        return {"cpu": cpu, "ram": ram}
+        return {"cpu": float(cpu_s.strip().rstrip("%") or 0), "ram": _to_mib(mem_s.split("/")[0].strip())}
 
     def facts(self, name: str, container_port: int = 0) -> ContainerFacts:
         status = self.status(name)
-        phase = _STATUS_TO_PHASE.get(status, "pending")
-        host_port = self.host_port(name, container_port) if container_port else 0
         stats = self.stats(name) if status == "running" else {"cpu": 0.0, "ram": 0.0}
         return ContainerFacts(
-            phase=phase,
-            host_port=host_port,
-            cpu=stats["cpu"],
-            ram=stats["ram"],
+            phase=_STATUS_TO_PHASE.get(status, "pending"),
+            host_port=self.host_port(name, container_port) if container_port else 0,
+            cpu=stats["cpu"], ram=stats["ram"],
             logtail=self.logs(name, tail=5) if status != "absent" else "",
         )
 
+    def stop(self, name: str) -> None:
+        self._cli("rm", "-f", name, check=False)
+
+    def list_allfather(self) -> list[str]:
+        out = self._cli("ps", "-aq", "--filter", f"label={LABEL}=1", check=False)
+        return [line for line in out.splitlines() if line]
+
+
+class ColimaRuntime(_ContainerRuntime):
+    """Drives `docker` (Colima) directly on the host."""
+
+    def _cli(self, *args: str, check: bool = True) -> str:
+        proc = self._run(["docker", *args])
+        if check and proc.returncode != 0:
+            raise RuntimeError(f"docker {' '.join(args)} failed: {proc.stderr.strip()}")
+        return proc.stdout.strip()
+
+    def _run_flags(self) -> list[str]:
+        # Reach the host-side AWS embed + RDS from inside containers.
+        return ["--add-host", "host.docker.internal:host-gateway"]
+
     def ensure_host(self) -> HostFacts:
-        out = self._docker("info", "--format", "{{.MemTotal}} {{.NCPU}}", check=False)
+        out = self._cli("info", "--format", "{{.MemTotal}} {{.NCPU}}", check=False)
         if not out:
             return HostFacts()
         mem_bytes, ncpu = out.split()
         return HostFacts(total_mem_mib=int(mem_bytes) / 1024 / 1024, cpu_count=int(ncpu))
-
-    def stop(self, name: str) -> None:
-        self._docker("rm", "-f", name, check=False)
-
-    def list_allfather(self) -> list[str]:
-        out = self._docker("ps", "-aq", "--filter", f"label={LABEL}=1", check=False)
-        return [line for line in out.splitlines() if line]
-
-
-def _to_mib(value: str) -> float:
-    # Longest suffixes first: "MiB" also ends with "B".
-    units = [("GiB", 1024.0), ("MiB", 1.0), ("KiB", 1 / 1024), ("B", 1 / 1024 / 1024)]
-    for unit, factor in units:
-        if value.endswith(unit):
-            return float(value[: -len(unit)] or 0) * factor
-    return 0.0
