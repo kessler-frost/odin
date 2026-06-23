@@ -55,9 +55,6 @@ class SubnetAllocation(BaseModel):
         self.next_ip += 1
         return ip
 
-    def release(self, host_id: str) -> str | None:
-        return self.assignments.pop(host_id, None)
-
 
 class MeshNetwork(BaseModel):
     """One Nebula network per environment (env = allfather's isolation unit)."""

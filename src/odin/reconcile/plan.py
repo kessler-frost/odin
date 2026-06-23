@@ -55,8 +55,9 @@ def plan(stack: Stack, world: World) -> list[Action]:
         elif res.kind in ("service", "dep", "llm"):
             if not _refs_ready(res, world):
                 actions.append(NoOp(id=res.id))  # blocked; reconciler sets the phase
-            elif phase in ("pending", "crashed", "blocked", "error", "queued"):
-                # "error" recovers when a ref heals; "queued" retries when memory frees.
+            elif phase in ("pending", "crashed", "blocked", "error", "queued", "evicted"):
+                # "error" recovers when a ref heals; "queued"/"evicted" retry when
+                # memory frees (the scheduler re-queues if it's still tight).
                 actions.append(RunContainer(id=res.id))
             else:
                 actions.append(NoOp(id=res.id))

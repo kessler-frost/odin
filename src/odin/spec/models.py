@@ -21,7 +21,6 @@ Phase = Literal[
     "healthy",    # assertion passed
     "crashed",    # was healthy/started, now down unexpectedly
     "blocked",    # waiting on an unresolved reference / dependency
-    "idle",       # llm model loaded but unused
     "queued",     # batch job waiting for capacity
     "running",    # batch job executing
     "done",       # batch job finished
@@ -60,7 +59,6 @@ class ResourceDesired(BaseModel):
     id: str
     kind: str                              # "service" | "rds" | "batch" | "llm" | …
     fields: dict[str, FieldValue] = {}
-    placement_hint: str | None = None
     refs: tuple[Ref, ...] = ()
 
 
@@ -75,7 +73,6 @@ class ResourceObserved(BaseModel):
     model_config = {"frozen": True}
     id: str
     kind: str
-    backing: str = "container"             # "container" | "control_plane"
     phase: Phase = "pending"
     facts: dict[str, Any] = {}             # endpoint, host_port, cpu, ram, logtail…
     verdict: str | None = None

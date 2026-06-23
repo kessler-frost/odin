@@ -23,6 +23,9 @@ import threading
 import boto3
 
 ACCOUNT_ID = "000000000000"
+# How a container reaches the host (the Mac) — for the embedded AWS + RDS. The
+# runtime adds `--add-host host.docker.internal:host-gateway` to every container.
+CONTAINER_HOST = "host.docker.internal"
 
 
 def account_for_env(env: str) -> str:
@@ -135,7 +138,7 @@ def aws_container_env(account_id: str = ACCOUNT_ID) -> dict[str, str]:
     scopes the container to its environment's isolated AWS state.
     """
     return {
-        "AWS_ENDPOINT_URL": f"http://host.docker.internal:{current_port()}",
+        "AWS_ENDPOINT_URL": f"http://{CONTAINER_HOST}:{current_port()}",
         "AWS_ACCESS_KEY_ID": account_id,
         "AWS_SECRET_ACCESS_KEY": "x",
         "AWS_DEFAULT_REGION": "us-east-1",

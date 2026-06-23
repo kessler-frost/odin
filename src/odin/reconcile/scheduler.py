@@ -34,10 +34,12 @@ class Scheduler:
     def evict_for(
         self, res: ResourceDesired, candidates: list[ResourceDesired], running_mib: float
     ) -> list[str]:
-        """LLM ids to evict (idle-LRU order from the caller) so `res` fits.
+        """LLM ids to evict (in the caller's order) so `res` fits.
 
-        Returns [] if `res` already fits OR eviction still can't free enough (the
-        caller then queues it). Only ever evicts the provided candidates (LLMs).
+        LLMs are memory-managed and reloadable, so a running one can be evicted
+        under pressure for higher-priority non-LLM work. Returns [] if `res`
+        already fits OR eviction still can't free enough (the caller then queues
+        it). Only ever evicts the provided candidates (LLMs).
         """
         deficit = (running_mib + self.footprint(res)) - self._budget
         if deficit <= 0:

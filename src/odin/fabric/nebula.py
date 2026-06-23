@@ -44,7 +44,6 @@ DEFAULT_FIREWALL = FirewallRules(
     inbound=[FirewallRule(port="any", proto="any")],
     outbound=[FirewallRule(port="any", proto="any")],
 )
-LIGHTHOUSE_FIREWALL = DEFAULT_FIREWALL
 
 
 @dataclass

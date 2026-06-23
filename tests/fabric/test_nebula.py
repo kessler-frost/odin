@@ -114,6 +114,20 @@ def test_sg_rules_to_firewall_translates():
     assert rules.inbound[0].port == "6379" and rules.inbound[0].cidr == "10.0.0.0/8"
 
 
+def test_sg_rules_to_firewall_edge_cases():
+    # proto "-1" (all) -> any/any; a port range; a security-group reference
+    rules = sg_rules_to_firewall([
+        {"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+        {"IpProtocol": "tcp", "FromPort": 8000, "ToPort": 8100, "IpRanges": [{"CidrIp": "10.0.0.0/8"}]},
+        {"IpProtocol": "tcp", "FromPort": 443, "ToPort": 443, "UserIdGroupPairs": [{"GroupId": "sg-1"}]},
+    ])
+    by = {(r.port, r.proto): r for r in rules.inbound}
+    assert by[("any", "any")].cidr == "0.0.0.0/0"          # -1 -> any proto/port
+    assert ("8000-8100", "tcp") in by                       # range preserved
+    assert by[("443", "tcp")].group == "sg-1"               # group ref carried
+    assert rules.outbound[0].port == "any"                  # default allow-all out
+
+
 # --- mesh read model (the UI hook) + lazy bootstrap ---
 
 def test_ensure_network_bootstraps_and_is_idempotent(tmp_path):

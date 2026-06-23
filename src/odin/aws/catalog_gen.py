@@ -12,13 +12,14 @@ import os
 from pathlib import Path
 
 # Internal / non-user-facing, or already curated by hand in catalog.ts.
+# (efs/elbv2 are emitted by MiniStack as elasticfilesystem/elasticloadbalancing,
+#  which fall through to the generated catalog — that's intended.)
 _SKIP = {
-    "account", "sts", "imds", "ecs-task-metadata", "container-credentials",
-    "resourcegroupstaggingapi", "resource-groups", "appconfigdata",
+    "account", "sts", "imds", "resource-groups", "appconfigdata",
     # already hand-curated:
     "sqs", "sns", "kinesis", "rds", "secretsmanager", "kms", "iam",
-    "route53", "apigateway", "efs", "ecs", "ssm", "logs", "events",
-    "elbv2", "s3", "dynamodb", "ec2", "lambda",
+    "route53", "apigateway", "ecs", "ssm", "logs", "events",
+    "s3", "dynamodb", "ec2", "lambda",
 }
 
 _COLORS = ["cyan", "pink", "rose", "indigo", "lime", "amber", "teal", "sky", "fuchsia"]
@@ -43,6 +44,8 @@ def generate_catalog_ts() -> str:
     import ministack.app as ministack_app
 
     registry = getattr(ministack_app, "SERVICE_REGISTRY", {})
+    stale = _SKIP - set(registry)
+    assert not stale, f"stale _SKIP entries (no longer MiniStack services): {sorted(stale)}"
     services = sorted(n for n in registry if n not in _SKIP)
 
     entries = []

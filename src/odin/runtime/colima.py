@@ -58,7 +58,7 @@ _STATUS_TO_PHASE: dict[str, Phase] = {
     "running": "starting",
     "restarting": "starting",
     "paused": "starting",
-    "created": "pending",
+    "created": "starting",  # booting, not gone — distinct from "absent" (=pending)
     "exited": "crashed",
     "dead": "crashed",
     "removing": "crashed",

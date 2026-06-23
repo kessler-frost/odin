@@ -26,6 +26,3 @@ class LocalhostFabric:
         if value is None:
             raise Unresolved(f"{ref.target_id} exposes no {ref.target_attr}")
         return str(value)
-
-    def localhost_endpoint(self, host_port: int, scheme: str = "tcp") -> str:
-        return f"{scheme}://127.0.0.1:{host_port}"

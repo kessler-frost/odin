@@ -12,6 +12,7 @@ import asyncio
 import logging
 import time
 
+from odin.aws.embed import CONTAINER_HOST
 from odin.aws.provision import PROVISIONED
 from odin.fabric.localhost import LocalhostFabric, Unresolved
 from odin.reconcile import assertions
@@ -132,18 +133,25 @@ class Reconciler:
     async def _observe_rds(self, res: ResourceDesired) -> None:
         cname = self._rds.container_name(res.id)
         if self._rt.facts(cname).phase == "crashed":
+            # Clear MiniStack's stale record so the recreate boots a fresh DB
+            # (else create_db sees AlreadyExists and the DB never recovers).
+            await asyncio.to_thread(self._rds.delete_db, res.id)
             await self._emit(res.id, "rds", "crashed")
             return
         endpoint = self._rds.endpoint(res.id)
         if endpoint is None:
             return  # still creating
         user, pw = self._creds(res)
-        if await self._pg_ready(endpoint[0], endpoint[1], user, pw):
-            url = f"postgresql://{user}:{pw}@{endpoint[0]}:{endpoint[1]}/postgres"
+        if await self._pg_ready(endpoint[0], endpoint[1], user, pw):  # host-side probe
+            # Publish a CONTAINER-reachable address: a consumer gets this verbatim
+            # as DATABASE_URL, and "localhost" inside a container is the container
+            # itself, not the Mac. host.docker.internal is the host (same as AWS).
+            addr = f"{CONTAINER_HOST}:{endpoint[1]}"
+            url = f"postgresql://{user}:{pw}@{addr}/postgres"
             stats = self._rt.stats(cname)
             await self._emit(
                 res.id, "rds", "healthy",
-                facts={"DATABASE_URL": url, "endpoint": f"{endpoint[0]}:{endpoint[1]}", **stats},
+                facts={"DATABASE_URL": url, "endpoint": addr, **stats},
             )
 
     async def _observe_container(self, res: ResourceDesired) -> None:
@@ -217,7 +225,7 @@ class Reconciler:
         return [
             by_id[obs.id] for obs in world.resources
             if obs.id != exclude and obs.id in by_id
-            and by_id[obs.id].kind == "llm" and obs.phase in ("starting", "healthy", "idle")
+            and by_id[obs.id].kind == "llm" and obs.phase in ("starting", "healthy")
         ]
 
     async def _run_service(self, stack: Stack, rid: str) -> None:
@@ -260,7 +268,7 @@ class Reconciler:
         if not rid:
             return
         res = next((r for r in stack.resources if r.id == rid), None)
-        if res is None or res.kind not in ("service", "batch") or not res.refs:
+        if res is None or res.kind not in ("service", "batch", "dep", "llm") or not res.refs:
             return
         world = self._store.current_world(self._env)
         if (obs := world.get(rid)) and obs.phase == "healthy":

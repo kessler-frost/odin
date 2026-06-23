@@ -30,6 +30,9 @@ async def test_claude_fills_rds_gaps():
 
 async def test_review_iam_returns_list():
     assert await review_iam(Stack()) == []                 # no edges -> no call
+    # ref (data-flow) edges are NOT access grants -> ignored, no LLM call
+    refs_only = Stack(edges=(Edge(src="api", dst="db", kind="ref"),))
+    assert await review_iam(refs_only) == []
     stack = Stack(edges=(Edge(src="api", dst="db", kind="iam", perms=("rds:*",)),))
     findings = await review_iam(stack)
     assert isinstance(findings, list)                      # LLM returns findings

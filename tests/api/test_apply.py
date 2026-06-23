@@ -72,6 +72,32 @@ def test_apply_translates_stores_and_reconciles(tmp_path):
         assert "api" not in rt.runs
 
 
+def test_apply_survives_brain_failure(tmp_path):
+    # The Brain only proposes; a failure must NOT block applying the drawn stack.
+    from fastapi import FastAPI
+
+    from odin.server import create_apply_router
+
+    store = SpecStore(tmp_path)
+
+    class FakeRecon:
+        async def tick(self):
+            pass
+
+    async def recon_for(env):
+        return FakeRecon()
+
+    async def boom(stack):
+        raise RuntimeError("brain down")
+
+    app = FastAPI()
+    app.include_router(create_apply_router(store, recon_for, complete_fn=boom))
+    with TestClient(app) as client:
+        resp = client.post("/apply", json={"nodes": [{"type": "rds", "data": {"label": "db"}}], "edges": []})
+        assert resp.json()["status"] == "applied"          # applied despite the brain failing
+        assert store.head() is not None                    # the un-completed stack was stored
+
+
 def test_mesh_endpoint_returns_empty_network(tmp_path):
     rt, rds = FakeRuntime(), FakeRds()
     app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, embed=False, complete=False)

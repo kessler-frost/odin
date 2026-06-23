@@ -63,11 +63,17 @@ def _resource(node: dict) -> ResourceDesired | None:
     )
 
 
+def _edge(e: dict) -> Edge:
+    # The UI stores access metadata under `data` (Canvas.tsx): `permissions` +
+    # `edgeType`. Thread both through so the Brain's IAM review sees real grants.
+    data = e.get("data") or {}
+    perms = tuple(data.get("permissions") or ())
+    kind = data.get("edgeType") or ("iam" if perms else "ref")
+    return Edge(src=e.get("source", ""), dst=e.get("target", ""), kind=kind, perms=perms)
+
+
 def canvas_to_stack(canvas: dict, env: str = "default") -> Stack:
     nodes = canvas.get("nodes") or []
     resources = tuple(r for n in nodes if (r := _resource(n)) is not None)
-    edges = tuple(
-        Edge(src=e.get("source", ""), dst=e.get("target", ""))
-        for e in (canvas.get("edges") or [])
-    )
+    edges = tuple(_edge(e) for e in (canvas.get("edges") or []))
     return Stack(env=env, resources=resources, edges=edges)

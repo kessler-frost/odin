@@ -176,9 +176,32 @@ async def test_llm_evicted_to_make_room_for_service(tmp_path):
     assert store.current_world().get("model").phase == "healthy"
 
     store.apply(Stack(resources=(llm, svc)))  # a service now needs memory
-    await recon.tick()                        # evict the idle model to fit the service
+    await recon.tick()                        # evict the model to fit the service
     assert store.current_world().get("model").phase == "evicted"
     assert "svc" in rt.runs
+
+    store.apply(Stack(resources=(llm,)))      # pressure clears: drop the service
+    await recon.tick()                        # the evicted model must come back
+    assert store.current_world().get("model").phase == "starting"
+    assert rt.runs.count("model") == 2        # re-admitted, not stranded
+
+
+async def test_rds_crash_clears_record_and_recreates(tmp_path):
+    rt, rds = FakeRuntime(), FakeRds()
+    rds.available = True
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(DB,)))
+    recon = Reconciler(store, rt, rds, http_ok=_yes, pg_ready=_yes, poll_interval=0)
+    await recon.tick()                        # create db
+    await recon.tick()                        # db healthy
+    assert store.current_world().get("db").phase == "healthy"
+    assert rds.created.count("db") == 1
+
+    rt.set("ministack-rds-db", "exited", exit_code=1)  # the DB container dies
+    # one tick: observe sees crashed -> clears the stale record -> plan recreates
+    await recon.tick()
+    assert rds.available is False             # delete_db was called (the fix)
+    assert rds.created.count("db") == 2       # recreated (AlreadyExists would block this without the delete)
 
 
 async def test_aws_env_injected_into_app_containers(tmp_path):
