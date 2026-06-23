@@ -4,6 +4,33 @@ allfather: a Mac-native, AI-operated orchestration canvas (repo: odin, branch
 `allfather`). Drop apps + AWS resources, the AI completes config, a control loop
 runs them for real on Colima/Lima with an embedded MiniStack AWS control plane.
 
+## Direction (2026-06-23): local-only pivot
+
+**allfather is going local-only.** We're dropping the ambition to maintain AWS /
+cloud resources. The actual use cases are personal + friends/family, the local
+machine is plenty, and the intelligence runs locally too — so there's no reason
+to cater to cloud/AWS users.
+
+What this means:
+- **Drop the AWS-emulation story.** MiniStack (the embedded AWS control plane),
+  the Pulumi-for-AWS infra layer we were mid-designing, the real-AWS↔local
+  switching, and the whole infra-vs-app layering question — none of it.
+  allfather is not an AWS tool. (MiniStack was also just friction.)
+- **Everything is a local container / process.** A "database" is just a Postgres
+  container (a `dep` node); a cache is a Redis container; a queue is a real
+  local broker (NATS/Redis) — run + supervised by the reconciler directly, with
+  no AWS abstraction in front of them.
+- **allfather = a local-first, AI-operated orchestrator** for your Mac (Railway/
+  Compose, but with a brain, fully local). Workloads: app services,
+  dependencies, batch jobs, local LLMs. Intelligence: local (omlx / local models).
+- **The palette** eventually sheds the AWS nodes (VPC/EC2/S3/SQS/RDS/…) and keeps
+  the local primitives (app, dependency, job, LLM, + local volumes / networks).
+
+**Nothing is deleted yet** — this only records the direction. The current
+MiniStack-backed build (v0.2.0) keeps working; the AWS/MiniStack/Pulumi path gets
+phased out over time as the local-only model is built. Everything below this
+note describes the current (pre-pivot) state and is being superseded by it.
+
 > The pre-allfather history (Moto/OpenTofu validate, the old Lima+Nebula
 > per-EC2 "Simulate" overlay) was **retired and deleted** — 21 source modules +
 > 30 test files removed. Do not resurrect Terraform/Moto/HCL or that old
