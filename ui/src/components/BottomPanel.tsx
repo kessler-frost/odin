@@ -127,7 +127,7 @@ interface BottomPanelProps {
   activeEnv?: string;
   onCycleBottom: () => void;
   onWsStatusChange?: (connected: boolean) => void;
-  onResourceStatus?: (name: string, status: string, error?: string) => void;
+  onResourceStatus?: (name: string, status: string, error?: string, facts?: Record<string, unknown>) => void;
   onConfigUpdate?: (nodeId: string, data: Record<string, any>) => void;
   clearSignal?: number;
 }
@@ -177,6 +177,7 @@ export default function BottomPanel({ bottomState, activeEnv, onCycleBottom, onW
       if (env === (activeEnvRef.current ?? 'default')) {  // only the active env's status
         onResourceStatusRef.current?.(
           msg.resource_id as string, msg.phase as string, msg.verdict as string | undefined,
+          (msg.facts ?? {}) as Record<string, unknown>,
         );
       }
     }
@@ -230,6 +231,13 @@ export default function BottomPanel({ bottomState, activeEnv, onCycleBottom, onW
           <div className="py-1.5 px-4 flex items-center gap-2 animate-[pulse_1.5s_infinite]">
             <div className="w-1.5 h-1.5 rounded-full bg-neon-orange shadow-[0_0_6px_rgba(255,136,0,0.5)]" />
             <span className="font-mono text-[11px] text-neon-orange">{spinnerWord}...</span>
+          </div>
+        )}
+        {filteredLogs.length === 0 && !(activeTab === 'Agent' && agentActive) && (
+          <div className="py-6 px-4 font-mono text-[11px] text-text-muted/60">
+            {activeTab === 'Agent' ? 'Agent idle.'
+              : activeTab === 'Events' ? 'No events yet — press Apply to start.'
+              : 'No logs yet.'}
           </div>
         )}
         {filteredLogs.map((line, i) => (

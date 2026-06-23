@@ -27,7 +27,7 @@ import S3Node from './nodes/S3Node';
 import SgNode from './nodes/SgNode';
 import DynamodbNode from './nodes/DynamodbNode';
 import ServiceNode from './nodes/ServiceNode';
-import { CATALOG, catalogNodeTypeMap, catalogDefaultData, catalogDefaultStyle, catalogZIndex } from '../lib/catalog';
+import { CATALOG, catalogNodeTypeMap, catalogDefaultData, catalogDefaultStyle, catalogZIndex, catalogByType, COLORS } from '../lib/catalog';
 import { computeTypes, defaultPermissions, detectDefaultEdgeType, edgeStyle, edgeTypes } from '../lib/iam';
 
 const nodeTypes: NodeTypes = {
@@ -94,6 +94,14 @@ function nextId(type: string) {
   return `${type}-${++idCounter}`;
 }
 
+// Nudge a drop/double-click spot so a new node never lands exactly on an existing one.
+function deCollide(pos: { x: number; y: number }, nodes: Node[]) {
+  let { x, y } = pos;
+  const occupied = () => nodes.some(n => Math.abs(n.position.x - x) < 20 && Math.abs(n.position.y - y) < 20);
+  for (let i = 0; i < 50 && occupied(); i++) { x += 20; y += 20; }
+  return { x, y };
+}
+
 type HistoryEntry = { nodes: Node[]; edges: Edge[] };
 
 interface CanvasProps {
@@ -101,7 +109,7 @@ interface CanvasProps {
   onEdgeSelect?: (edges: Edge[]) => void;
   nodeUpdates?: { nodeId: string; data: Record<string, string> } | null;
   edgeUpdates?: { edgeId: string; data: Record<string, unknown> } | null;
-  onStatusUpdate?: React.MutableRefObject<((name: string, status: string, error?: string) => void) | null>;
+  onStatusUpdate?: React.MutableRefObject<((name: string, status: string, error?: string, facts?: Record<string, unknown>) => void) | null>;
   configUpdate?: { nodeId: string; data: Record<string, any> } | null;
   onCanvasSave?: (graph: { nodes: any[]; edges: any[] }) => void;
   onResetDrafts?: React.MutableRefObject<(() => void) | null>;
@@ -301,11 +309,13 @@ function InnerCanvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onS
   // --- Register status update callback (called directly, avoids React batching loss) ---
   useEffect(() => {
     if (!onStatusUpdate) return;
-    onStatusUpdate.current = (name: string, status: string, error?: string) => {
+    onStatusUpdate.current = (name: string, status: string, error?: string, facts?: Record<string, unknown>) => {
+      // The live endpoint / DATABASE_URL is the actual deliverable — surface it on the tile.
+      const endpoint = (facts?.endpoint as string) || (facts?.DATABASE_URL as string) || '';
       setNodes(nds => {
         const updated = nds.map(n => {
           const matches = n.data?.label === name || n.id === name || `${n.type}_${n.data?.label}` === name;
-          if (matches) return { ...n, data: { ...n.data, status, ...(error ? { error } : {}) } };
+          if (matches) return { ...n, data: { ...n.data, status, ...(error ? { error } : {}), ...(endpoint ? { endpoint } : {}) } };
           return n;
         });
         // Re-fire selection so ConfigPanel sees updated status
@@ -423,7 +433,7 @@ function InnerCanvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onS
           {
             id: nextId(type),
             type,
-            position,
+            position: deCollide(position, nds),
             zIndex: zIndexForType[type] ?? 2,
             data: { ...defaultDataForType[type], label },
             style: { ...defaultStyleForType[type] },
@@ -456,7 +466,7 @@ function InnerCanvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onS
           {
             id: nextId(type),
             type,
-            position,
+            position: deCollide(position, nds),
             zIndex: zIndexForType[type] ?? 2,
             data: { ...defaultDataForType[type], label },
             style: { ...defaultStyleForType[type] },
@@ -596,9 +606,17 @@ function InnerCanvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onS
           color="rgba(50, 50, 70, 0.4)"
         />
         <Controls showInteractive={true} />
+        {nodes.length === 0 && (
+          <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-0">
+            <p className="font-mono text-xs text-text-muted/70 text-center leading-relaxed">
+              Drag a resource from the left, or double-click the canvas.<br />
+              Then press <span className="text-neon-green">Apply</span> to run it.
+            </p>
+          </div>
+        )}
         <MiniMap
           nodeColor={(node) => {
-            const colors: Record<string, string> = {
+            const bespoke: Record<string, string> = {
               vpc: 'rgba(170,85,255,0.4)',
               subnet: 'rgba(0,187,255,0.4)',
               ec2: 'rgba(255,136,0,0.6)',
@@ -606,7 +624,10 @@ function InnerCanvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onS
               s3: 'rgba(0,255,136,0.6)',
               sg: 'rgba(255,51,85,0.6)',
             };
-            return colors[node.type ?? ''] ?? '#333';
+            const t = node.type ?? '';
+            if (bespoke[t]) return bespoke[t];
+            const def = catalogByType[t];
+            return def ? `rgba(${COLORS[def.color].rgb},0.5)` : 'rgba(120,120,140,0.5)';
           }}
           maskColor="rgba(5,5,8,0.85)"
           className="!bg-bg-secondary !border-border-bright"

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import type { Node, Edge } from '@xyflow/react';
-import StatusBadge from './nodes/StatusBadge';
+import StatusBadge, { phaseTextColor } from './nodes/StatusBadge';
 import { iamActionsForTarget, edgeTypes, detectEdgeTypes } from '../lib/iam';
 import { catalogTypeConfig, catalogFields } from '../lib/catalog';
 
@@ -102,15 +102,32 @@ function ReadOnlyField({ label, value }: { label: string; value: string }) {
 }
 
 function EditableField({ label, value, onChange }: { label: string; value: string; onChange: (v: string) => void }) {
+  // ${{node.attr}} references are the core wiring mechanism — make them legible.
+  const isRef = value.includes('${{');
   return (
     <div className="mb-2.5">
-      <label className="block text-[11px] text-text-secondary mb-1 font-mono">{label}</label>
+      <label className="block text-[11px] text-text-secondary mb-1 font-mono">
+        {label}
+        {isRef && <span className="ml-1.5 text-[8px] text-neon-blue uppercase tracking-[1px]">ref</span>}
+      </label>
       <input
         type="text"
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        className="w-full py-1.5 px-2.5 bg-bg-primary border border-border text-text-primary font-mono text-xs outline-none transition-colors duration-200 focus:border-neon-blue focus:ring-1 focus:ring-neon-blue/30"
+        placeholder="value or ${{node.attr}}"
+        className={`w-full py-1.5 px-2.5 bg-bg-primary border font-mono text-xs outline-none transition-colors duration-200 focus:ring-1 focus:ring-neon-blue/30 focus:border-neon-blue placeholder:text-text-muted/50 ${isRef ? 'border-neon-blue/50 text-neon-blue' : 'border-border text-text-primary'}`}
       />
+    </div>
+  );
+}
+
+function ReadOnlyBlock({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="mb-2.5">
+      <label className="block text-[11px] text-neon-red mb-1 font-mono">{label}</label>
+      <div title={value} className="w-full py-1.5 px-2.5 bg-[rgba(255,51,85,0.06)] border border-neon-red/40 text-neon-red font-mono text-[11px] leading-relaxed whitespace-pre-wrap break-words max-h-28 overflow-y-auto">
+        {value}
+      </div>
     </div>
   );
 }
@@ -306,7 +323,7 @@ function MultiSelectView({ nodes, onCollapse, onValidate }: { nodes: Node[]; onC
         </div>
         <div className="space-y-1.5">
           {Object.entries(statusCounts).map(([s, count]) => (
-            <p key={s} className={`text-xs font-mono ${s === 'validated' ? 'text-neon-blue' : s === 'live' ? 'text-neon-green' : s === 'error' ? 'text-neon-red' : 'text-text-muted'}`}>
+            <p key={s} className={`text-xs font-mono ${phaseTextColor[s] ?? 'text-text-muted'}`}>
               {count} {s}
             </p>
           ))}
@@ -320,9 +337,10 @@ function MultiSelectView({ nodes, onCollapse, onValidate }: { nodes: Node[]; onC
         </div>
         <button
           onClick={() => onValidate?.()}
-          className="w-full font-mono text-xs py-1.5 px-4 border border-neon-blue bg-bg-tertiary text-neon-blue cursor-pointer uppercase tracking-[1px] transition-all duration-200 hover:bg-[rgba(51,153,255,0.1)] hover:shadow-[0_0_12px_rgba(51,153,255,0.2)]"
+          title="Apply the whole canvas (runs everything for real)"
+          className="w-full font-mono text-xs py-1.5 px-4 border border-neon-green bg-bg-tertiary text-neon-green cursor-pointer uppercase tracking-[1px] transition-all duration-200 hover:bg-[rgba(0,255,136,0.1)] hover:shadow-[0_0_12px_rgba(0,255,136,0.2)]"
         >
-          Validate
+          Apply
         </button>
       </div>
     </div>
@@ -408,6 +426,8 @@ export default function ConfigPanel({ nodes, selectedEdge, onNodeUpdate, onEdgeU
           if (!field.editable && !value) return null;
           // Status field uses the StatusBadge instead of an input
           if (field.key === 'status') return null;
+          // The failure reason wraps + scrolls so the user can actually read it
+          if (field.key === 'error') return <ReadOnlyBlock key={field.key} label={field.label} value={value} />;
 
           if (field.select) {
             return <SelectField key={field.key} label={field.label} value={value} options={field.select} onChange={(v) => updateField(field.key, v)} />;
@@ -430,9 +450,10 @@ export default function ConfigPanel({ nodes, selectedEdge, onNodeUpdate, onEdgeU
       <div className="px-4 py-3 border-t border-border space-y-2">
         <button
           onClick={() => onValidate?.()}
-          className="w-full font-mono text-xs py-1.5 px-4 border border-neon-blue bg-bg-tertiary text-neon-blue cursor-pointer uppercase tracking-[1px] transition-all duration-200 hover:bg-[rgba(51,153,255,0.1)] hover:shadow-[0_0_12px_rgba(51,153,255,0.2)]"
+          title="Apply the whole canvas (runs everything for real)"
+          className="w-full font-mono text-xs py-1.5 px-4 border border-neon-green bg-bg-tertiary text-neon-green cursor-pointer uppercase tracking-[1px] transition-all duration-200 hover:bg-[rgba(0,255,136,0.1)] hover:shadow-[0_0_12px_rgba(0,255,136,0.2)]"
         >
-          {status === 'validated' ? 'Re-validate' : 'Validate'}
+          Apply
         </button>
       </div>
     </div>

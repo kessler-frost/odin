@@ -9,6 +9,9 @@ export default function ServiceNode({ type, data, selected }: NodeProps) {
   const c = COLORS[def.color];
   const d = data as Record<string, string>;
   const detail = def.primary ? `${def.primary.label}: ${d[def.primary.key] || '—'}` : (d.arn || '');
+  // Once it's running, the live endpoint is what the user actually wants.
+  const endpoint = d.endpoint;
+  const isUrl = endpoint?.startsWith('http');
   return (
     <div className={`w-full h-full border ${c.border} bg-bg-secondary ${c.shadow}`}>
       <NodeResizer
@@ -30,8 +33,18 @@ export default function ServiceNode({ type, data, selected }: NodeProps) {
         <span className="truncate">{d.label}</span>
         <StatusBadge status={d.status} error={d.error} />
       </div>
-      <div className="flex items-center px-3 h-5 font-mono text-[10px] text-text-secondary truncate">
-        {detail}
+      <div className="flex items-center px-3 h-5 font-mono text-[10px] truncate">
+        {endpoint ? (
+          isUrl ? (
+            <a href={endpoint} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()}
+               className="text-neon-green hover:underline truncate" title={`Open ${endpoint}`}>{endpoint}</a>
+          ) : (
+            <span onClick={e => { e.stopPropagation(); navigator.clipboard?.writeText(endpoint); }}
+                  className="text-neon-green truncate cursor-copy" title={`Click to copy ${endpoint}`}>{endpoint}</span>
+          )
+        ) : (
+          <span className="text-text-secondary truncate">{detail}</span>
+        )}
       </div>
     </div>
   );

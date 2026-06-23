@@ -17,7 +17,7 @@ export default function LambdaNode({ data, selected }: NodeProps) {
       <NodeResizer
         isVisible={selected}
         minWidth={200}
-        minHeight={120}
+        minHeight={80}
         lineClassName="!border-neon-yellow"
         handleClassName="!bg-neon-yellow !border-none !w-2 !h-2"
       />
@@ -33,11 +33,6 @@ export default function LambdaNode({ data, selected }: NodeProps) {
       <div className="flex flex-col justify-center px-3 h-10 font-mono text-[10px] text-text-secondary leading-tight">
         <span>{runtime} &bull; {handler}</span>
         <span>{memory} &bull; {timeout}</span>
-      </div>
-      <div className="flex items-center px-3 h-10">
-        <button className="py-1 px-2.5 font-mono text-[10px] bg-[rgba(255,221,0,0.1)] border border-neon-yellow text-neon-yellow cursor-pointer uppercase tracking-[1px]">
-          Invoke
-        </button>
       </div>
     </div>
   );
