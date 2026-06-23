@@ -24,7 +24,8 @@ desired-state; deterministic code reconciles; deterministic assertions verify.**
 - `reconcile/` — `plan.py` (pure `plan(Stack,World)→[Action]`, total+idempotent), `reconciler.py` (the loop: observe → plan → execute, supervision, ref-gating, AWS env injection, per-env), `scheduler.py` (memory-aware admission + LLM eviction), `probes.py` (Assertion Engine: per-kind health), `assertions.py`, `actions.py`.
 - `runtime/` — `driver.py` (protocol), `colima.py`, `lima.py`, `shim.py` (the MiniStack `_docker` lookalike).
 - `aws/` — `embed.py` (run MiniStack in-process + per-env account scoping), `rds.py`, `provision.py` (S3/SQS/SNS/DynamoDB), `catalog_gen.py` (codegen the canvas catalog from MiniStack's services).
-- `fabric/localhost.py` — resolve `${{node.VAR}}` from World facts. `agent/` — `brain.py` (claude_complete, review_iam), `completion.py` (merge + ai_diff). `api/canvas.py`, `api/ws.py`, `server.py`.
+- `fabric/` — resolve `${{node.VAR}}` from World facts. `localhost.py` (loopback, the default); `nebula.py` + `models.py` = the **self-hosted Nebula mesh fabric** for multi-Mac (M7): `NebulaFabric` is a drop-in for `resolve` (the overlay IP rides in via facts), plus recovered nebula-cert/lighthouse primitives (one network per env, sticky overlay IPs) + `mesh_state`/`GET /mesh?env=` for a mesh UI. Nebula NOT Tailscale (you own the lighthouse, build a control plane on top). The old per-EC2 Nebula *Simulate* overlay was deleted; this host-level mesh is the new thing — don't confuse them.
+- `agent/` — `brain.py` (claude_complete, review_iam), `completion.py` (merge + ai_diff). `api/canvas.py`, `api/ws.py`, `server.py`.
 
 **Node kinds:** service (HTTP-supervised), dep (any container, e.g. Redis), batch (run-to-completion), llm (omlx, memory-managed/evictable), rds + s3/sqs/sns/dynamodb (AWS). The 8 MiniStack real-container services + workloads share ONE spawn authority (the Runtime driver) — never double-spawned.
 

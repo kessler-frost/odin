@@ -48,6 +48,9 @@ class ContainerFacts:
 class HostFacts:
     total_mem_mib: float = 0.0
     cpu_count: int = 0
+    # This host's Nebula overlay IP, when it's a mesh member (M7 multi-Mac).
+    # None on a single host => producers publish 127.0.0.1, behavior unchanged.
+    overlay_ip: str | None = None
 
 
 # Docker container state -> coarse runtime phase ("healthy" is an assertion's call).

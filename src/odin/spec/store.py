@@ -30,6 +30,10 @@ class SpecStore:
     def __init__(self, root: Path | str = ".odin") -> None:
         self._root = Path(root)
 
+    @property
+    def root(self) -> Path:
+        return self._root
+
     def _env_dir(self, env: str) -> Path:
         return self._root / env
 

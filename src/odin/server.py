@@ -2,8 +2,7 @@
 
 The canvas authors a desired-state Stack; a continuous Reconciler drives reality
 (real containers via Colima, the AWS control plane via embedded MiniStack); the
-World projects back to the canvas over WebSocket. This replaces odin's old
-one-shot Moto/OpenTofu validate path (those modules remain on disk, unused).
+World projects back to the canvas over WebSocket.
 """
 from __future__ import annotations
 
@@ -28,6 +27,7 @@ from odin.aws.embed import (
 from odin.aws.provision import MiniStackAws
 from odin.aws.rds import MiniStackRds
 from odin.fabric.localhost import LocalhostFabric
+from odin.fabric.nebula import mesh_state
 from odin.reconcile.reconciler import Reconciler
 from odin.reconcile.scheduler import Scheduler
 from odin.runtime.colima import ColimaRuntime
@@ -93,6 +93,12 @@ def create_apply_router(store: SpecStore, reconciler_for, complete_fn=None) -> A
     @router.get("/world")
     def world(env: str = ENV) -> dict:
         return store.current_world(env).model_dump()
+
+    @router.get("/mesh")
+    def mesh(env: str = ENV) -> dict:
+        """The env's Nebula overlay membership — the read model a mesh UI builds
+        on. Empty until hosts join (single-host today)."""
+        return mesh_state(store.root, env, store.current_world(env)).model_dump()
 
     @router.get("/envs")
     def envs() -> dict:

@@ -4,9 +4,12 @@ allfather: a Mac-native, AI-operated orchestration canvas (repo: odin, branch
 `allfather`). Drop apps + AWS resources, the AI completes config, a control loop
 runs them for real on Colima/Lima with an embedded MiniStack AWS control plane.
 
-> The pre-allfather history (Moto/OpenTofu validate, Lima/Nebula "Simulate"
-> mode) was **retired and deleted** — 21 source modules + 30 test files removed.
-> Do not resurrect Terraform/Moto/HCL/Nebula.
+> The pre-allfather history (Moto/OpenTofu validate, the old Lima+Nebula
+> per-EC2 "Simulate" overlay) was **retired and deleted** — 21 source modules +
+> 30 test files removed. Do not resurrect Terraform/Moto/HCL or that old
+> per-VM Nebula overlay. NOTE: this is distinct from the **self-hosted Nebula
+> mesh fabric** (`fabric/nebula.py`) — a host-level mesh that IS the chosen
+> multi-Mac direction (see M7 below). Different thing; don't re-strip it.
 
 ## Done
 
@@ -27,6 +30,7 @@ runs them for real on Colima/Lima with an embedded MiniStack AWS control plane.
 - [x] **M6 — environments:** independent per-env reconcilers, each scoped to a distinct MiniStack account (isolated AWS state); `/envs`; UI env switcher
 - [x] **M7 (single-host) — Lima runtime:** `LimaRuntime`, a second `RuntimeDriver` impl running workloads inside a Lima VM (VM isolation); unit + real-VM integration
 - [x] AWS resource provisioning from canvas nodes (S3/SQS/SNS/DynamoDB created in the embed on Apply)
+- [x] **Nebula mesh fabric foundation** (`fabric/nebula.py`) — recovered cert/lighthouse/config primitives (one network per env, sticky overlay IPs) + `NebulaFabric` (a verified drop-in for the `resolve` seam) + a `mesh_state` read model and `GET /mesh?env=` for a future mesh UI. The cross-Mac *activation* (host overlay IP → World facts, World replication, placement) is M7 below.
 
 ## Roadmap
 

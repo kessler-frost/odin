@@ -72,6 +72,14 @@ def test_apply_translates_stores_and_reconciles(tmp_path):
         assert "api" not in rt.runs
 
 
+def test_mesh_endpoint_returns_empty_network(tmp_path):
+    rt, rds = FakeRuntime(), FakeRds()
+    app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, embed=False, complete=False)
+    with TestClient(app) as client:
+        body = client.get("/mesh").json()
+        assert body["network"] == "default" and body["hosts"] == []  # no hosts joined yet
+
+
 def test_preview_returns_diff_structure(tmp_path):
     rt, rds = FakeRuntime(), FakeRds()
     app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, embed=False, complete=False)
