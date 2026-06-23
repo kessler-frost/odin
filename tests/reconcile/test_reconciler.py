@@ -186,6 +186,24 @@ async def test_llm_evicted_to_make_room_for_service(tmp_path):
     assert rt.runs.count("model") == 2        # re-admitted, not stranded
 
 
+async def test_unchanged_status_is_not_rebroadcast(tmp_path):
+    rt, rds = FakeRuntime(), FakeRds()
+    rds.available = True
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(DB,)))
+    sent = []
+
+    class FakeWS:
+        async def broadcast(self, msg):
+            sent.append(msg)
+
+    recon = Reconciler(store, rt, rds, ws=FakeWS(), http_ok=_yes, pg_ready=_yes, poll_interval=0)
+    for _ in range(5):
+        await recon.tick()                    # db goes healthy, then stays healthy
+    healthy = [m for m in sent if m.get("resource_id") == "db" and m.get("phase") == "healthy"]
+    assert len(healthy) == 1                  # emitted once, not re-spammed every tick
+
+
 async def test_destroy_broadcasts_draft_reset_so_canvas_clears(tmp_path):
     rt, rds = FakeRuntime(), FakeRds()
     rds.available = True

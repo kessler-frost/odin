@@ -105,6 +105,12 @@ class Reconciler:
         return int(res.fields["port"].value) if "port" in res.fields else 8000
 
     async def _emit(self, rid, kind, phase, facts=None, verdict=None) -> None:
+        # Skip unchanged status: observe runs every tick and the cpu/ram facts
+        # fluctuate, but only a phase/verdict CHANGE is worth a WorldDelta — else
+        # the event log + WS + events.jsonl fill with identical "healthy" noise.
+        prior = self._store.current_world(self._env).get(rid)
+        if prior is not None and prior.phase == phase and prior.verdict == verdict:
+            return
         delta = WorldDelta(
             env=self._env, resource_id=rid, kind=kind, phase=phase,
             facts=facts or {}, verdict=verdict,

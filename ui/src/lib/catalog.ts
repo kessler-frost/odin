@@ -132,7 +132,7 @@ export const CATALOG: ServiceDef[] = [
       { key: 'instanceClass', label: 'Instance Class', editable: true },
       { key: 'arn', label: 'ARN' },
     ],
-    defaultData: { label: 'new-db', engine: 'postgres', instanceClass: 'db.t3.micro', arn: '' },
+    defaultData: { label: 'db', engine: 'postgres', instanceClass: 'db.t3.micro', arn: '' },
     primary: { key: 'engine', label: 'Engine' },
   },
   {
