@@ -4,37 +4,54 @@
 [![CI](https://github.com/kessler-frost/odin/actions/workflows/ci.yml/badge.svg)](https://github.com/kessler-frost/odin/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.12+-blue.svg)
 
-Odin is a canvas for building and visualizing AWS infrastructure. You arrange the
-resources you need (VPCs, subnets, EC2, Lambda, S3, security groups) and see how
-they fit together. It also generates the Terraform (OpenTofu) behind what you
-draw, and can simulate that against a local Moto server if you want to check it
-before anything touches real AWS.
+Odin is an intelligent canvas for orchestrating your infrastructure and application
+deployments. You drop apps and resources onto a visual canvas, an AI fills in the
+config you leave blank, and a continuous control loop runs them **for real** on your
+Mac — real containers, a real embedded AWS control plane — supervising them and
+streaming live status back to the canvas. Think Railway, but local-first on a single
+Mac, with an AI operator. You draw; you don't write config.
 
-![Building a VPC with an EC2 instance and a Lambda, then validating](assets/odin-canvas.gif)
+![Odin — draw your stack, the AI fills it in, the reconciler runs it for real](assets/odin-canvas.gif)
 
 ## What it does
 
-- **Build and visualize.** Lay out AWS resources on a canvas and see the shape of
-  your infrastructure: what sits inside which VPC or subnet, and what connects to
-  what.
-- **Generates Terraform.** Odin keeps an OpenTofu configuration in sync with the
-  canvas, so you end up with real HCL, not a throwaway diagram.
-- **Simulates locally, if you want.** Check the config against a local
-  [Moto](https://github.com/getmoto/moto) server with `tofu plan`, or run it with
-  `tofu apply`, all without using real AWS.
+- **Draw, don't configure.** Drop app services, dependencies (Redis, Postgres),
+  batch jobs, local LLMs, and AWS resources (S3, SQS, SNS, DynamoDB, RDS) onto the
+  canvas and wire them together with `${{node.attr}}` references.
+- **The AI completes the blanks.** A Claude Agent SDK brain fills in whatever config
+  you leave unspecified (your explicit values always win) and reviews IAM —
+  best-effort, with safe defaults when it can't.
+- **Runs for real, locally.** A deterministic reconciler (observe → plan → execute)
+  runs everything as real containers on [Colima](https://github.com/abiosoft/colima)
+  (or inside a [Lima](https://lima-vm.io/) VM for isolation) and backs AWS resources
+  with a real embedded control plane — no cloud account, no Terraform, no mocks.
+- **Supervised, with live status.** The reconciler watches health and restarts what
+  breaks; every phase (starting / healthy / blocked / crashed / …) streams to the
+  canvas over WebSocket.
+- **Environments.** Multiple named environments reconcile independently, each
+  isolated from the others.
 
 ## How it's built
 
-- **UI:** React 19 + ReactFlow + Tailwind, served by Vite.
-- **Backend:** FastAPI + WebSocket and a resource registry, with a local Moto server.
-- **Terraform:** written by an agent (the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python))
-  and run with [OpenTofu](https://opentofu.org/).
+- **UI:** React 19 + ReactFlow + Tailwind v4, served by Vite (`ui/`, `bun`).
+- **Backend:** Python 3.12+ (`uv`), FastAPI + WebSocket, Pydantic.
+- **Control loop:** a Spec Store (Stack = desired, World = observed) with a pure,
+  idempotent `plan(Stack, World) → [Action]` reconciler that drives reality and
+  verifies it with per-kind health assertions.
+- **Runtime:** real containers via Colima (the default) or a Lima VM, behind a single
+  `RuntimeDriver` protocol.
+- **AWS control plane:** [MiniStack](https://pypi.org/project/ministack/) embedded
+  in-process — S3, SQS, SNS, DynamoDB, and RDS backed for real (RDS → a real Postgres
+  container).
+- **Brain:** the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python)
+  completes blank config and reviews IAM.
 
 ## Requirements
 
 - Python 3.12+ and [uv](https://github.com/astral-sh/uv)
-- [bun](https://bun.sh/) for the UI
-- [OpenTofu](https://opentofu.org/) (`tofu`)
+- [Colima](https://github.com/abiosoft/colima) for the container runtime (or
+  [Lima](https://lima-vm.io/) for VM isolation)
+- [bun](https://bun.sh/) — only for building the UI from a dev clone
 - Claude access for the agent (via the Claude Code CLI the Agent SDK wraps)
 
 ## Install
@@ -74,26 +91,24 @@ odin clean        Reset local state (odin clean --all wipes everything)
 
 ## Status
 
-The canvas, the Terraform generation, and local simulation against Moto work end
-to end. **Simulate mode** also runs resources for real — Lima VMs for EC2, Nebula
-overlays for VPCs, and containers for stateful services (S3 → RustFS, etc.). See
+The canvas, AI config-completion, and the reconciler running real workloads
+(services, dependencies, batch jobs, local LLMs) with an embedded AWS control plane
+work end to end. Odin is moving toward a **fully local-only** model — dropping the
+AWS-emulation layer in favor of plain local containers and processes. See
 [ROADMAP.md](ROADMAP.md).
 
 ## Acknowledgements
 
-Odin stands on the shoulders of open source giants — most of what makes it work
-is other people's excellent work, and a lot of the thanks belongs to them:
+Odin stands on the shoulders of open source giants — most of what makes it work is
+other people's excellent work, and a lot of the thanks belongs to them:
 
-- **[OpenTofu](https://opentofu.org/)** — the Terraform engine Odin drives
-- **[Moto](https://github.com/getmoto/moto)** — the local AWS API simulator
-- **[Lima](https://lima-vm.io/)** + **[nerdctl](https://github.com/containerd/nerdctl)** — VMs and containers for Simulate mode
-- **[Nebula](https://github.com/slackhq/nebula)** — the overlay network for simulated VPCs
-- **[RustFS](https://rustfs.com/)** — the Apache-2.0 S3 server for real object storage
-- **[ElasticMQ](https://github.com/softwaremill/elasticmq)** + **[PostgreSQL](https://www.postgresql.org/)** — real SQS / RDS backends in Simulate
+- **[MiniStack](https://pypi.org/project/ministack/)** — the embedded AWS control plane
+- **[Colima](https://github.com/abiosoft/colima)** + **[Lima](https://lima-vm.io/)** — containers and VMs on the Mac
+- **[PostgreSQL](https://www.postgresql.org/)** — the real backing for RDS
 - **[FastAPI](https://fastapi.tiangolo.com/)**, **[Pydantic](https://pydantic.dev/)**, **[boto3](https://github.com/boto/boto3)** — the backend
 - **[React](https://react.dev/)** + **[React Flow](https://reactflow.dev/)** + **[Tailwind CSS](https://tailwindcss.com/)** + **[Vite](https://vitejs.dev/)** — the canvas UI
 - **[uv](https://github.com/astral-sh/uv)** + **[bun](https://bun.sh/)** — the toolchain
-- the **[Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python)** — the agent that writes the Terraform
+- the **[Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python)** — the agent that completes config
 
 Thank you to every one of these projects and their maintainers. 🙏
 
