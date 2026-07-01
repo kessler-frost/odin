@@ -7,8 +7,8 @@
 Odin is a canvas for building and visualizing AWS infrastructure. You arrange the
 resources you need (VPCs, subnets, EC2, Lambda, S3, security groups) and see how
 they fit together. It also generates the Terraform (OpenTofu) behind what you
-draw, and can simulate that against a local Moto server if you want to check it
-before anything touches real AWS.
+draw, and can simulate that locally if you want to check it before anything
+touches real AWS.
 
 ![Building a VPC with an EC2 instance and a Lambda, then validating](assets/odin-canvas.gif)
 
@@ -19,14 +19,13 @@ before anything touches real AWS.
   what.
 - **Generates Terraform.** Odin keeps an OpenTofu configuration in sync with the
   canvas, so you end up with real HCL, not a throwaway diagram.
-- **Simulates locally, if you want.** Check the config against a local
-  [Moto](https://github.com/getmoto/moto) server with `tofu plan`, or run it with
-  `tofu apply`, all without using real AWS.
+- **Simulates locally, if you want.** Check the config with `tofu plan`, or run it
+  locally with `tofu apply`, all without using real AWS.
 
 ## How it's built
 
 - **UI:** React 19 + ReactFlow + Tailwind, served by Vite.
-- **Backend:** FastAPI + WebSocket and a resource registry, with a local Moto server.
+- **Backend:** FastAPI + WebSocket and a resource registry.
 - **Terraform:** written by an agent (the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python))
   and run with [OpenTofu](https://opentofu.org/).
 
@@ -74,7 +73,7 @@ odin clean        Reset local state (odin clean --all wipes everything)
 
 ## Status
 
-The canvas, the Terraform generation, and local simulation against Moto work end
+The canvas, the Terraform generation, and local simulation work end
 to end. **Simulate mode** also runs resources for real — Lima VMs for EC2, Nebula
 overlays for VPCs, and containers for stateful services (S3 → RustFS, etc.). See
 [ROADMAP.md](ROADMAP.md).
@@ -85,7 +84,6 @@ Odin stands on the shoulders of open source giants — most of what makes it wor
 is other people's excellent work, and a lot of the thanks belongs to them:
 
 - **[OpenTofu](https://opentofu.org/)** — the Terraform engine Odin drives
-- **[Moto](https://github.com/getmoto/moto)** — the local AWS API simulator
 - **[Lima](https://lima-vm.io/)** + **[nerdctl](https://github.com/containerd/nerdctl)** — VMs and containers for Simulate mode
 - **[Nebula](https://github.com/slackhq/nebula)** — the overlay network for simulated VPCs
 - **[RustFS](https://rustfs.com/)** — the Apache-2.0 S3 server for real object storage
