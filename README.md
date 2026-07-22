@@ -4,47 +4,47 @@
 [![CI](https://github.com/kessler-frost/odin/actions/workflows/ci.yml/badge.svg)](https://github.com/kessler-frost/odin/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.12+-blue.svg)
 
-Odin is an intelligent canvas for orchestrating your infrastructure and application
-deployments. You drop apps and resources onto a visual canvas, an AI fills in the
-config you leave blank, and a continuous control loop runs them **for real** on your
-Mac — real containers, a real embedded AWS control plane — supervising them and
-streaming live status back to the canvas. Think Railway, but local-first on a single
-Mac, with an AI operator. You draw; you don't write config.
+Odin is a local-first AWS: a drag-drop canvas where you design real AWS
+architectures, an agent translates the canvas to Terraform/OpenTofu and back,
+**Simulate** applies that through odin's own gateway onto real local
+substitutes (RustFS for S3, and so on) at full API compatibility, and IAM
+permissions drawn as edges on the canvas are enforced for real by odin's own
+IAM engine. See [NORTHSTAR.md](NORTHSTAR.md) for the full direction this is
+being built toward.
 
-![Odin — draw your stack, the AI fills it in, the reconciler runs it for real](assets/odin-canvas.gif)
+![Odin — draw your stack, apply it, the reconciler runs it for real](assets/odin-canvas.gif)
 
-## What it does
+## What works today
 
-- **Draw, don't configure.** Drop app services, dependencies (Redis, Postgres),
-  batch jobs, local LLMs, and AWS resources (S3, SQS, SNS, DynamoDB, RDS) onto the
-  canvas and wire them together with `${{node.attr}}` references.
-- **The AI completes the blanks.** A Claude Agent SDK brain fills in whatever config
-  you leave unspecified (your explicit values always win) and reviews IAM —
-  best-effort, with safe defaults when it can't.
-- **Runs for real, locally.** A deterministic reconciler (observe → plan → execute)
-  runs everything as real containers on [Colima](https://github.com/abiosoft/colima)
-  (or inside a [Lima](https://lima-vm.io/) VM for isolation) and backs AWS resources
-  with a real embedded control plane — no cloud account, no Terraform, no mocks.
-- **Supervised, with live status.** The reconciler watches health and restarts what
-  breaks; every phase (starting / healthy / blocked / crashed / …) streams to the
-  canvas over WebSocket.
+- **Draw resources on the canvas.** Drop RDS, S3, SQS, SNS, and DynamoDB nodes
+  and wire them together with `${{node.attr}}` references; config panel, drag/
+  resize/connect, all through the real UI.
+- **Apply runs it for real, locally.** A deterministic reconciler (observe →
+  plan → execute) provisions RDS as a real Postgres container and the other
+  AWS-shaped resources in real open-source backings — RustFS (S3), goaws (SQS
+  + SNS), dynalite (DynamoDB) — run through [Colima](https://github.com/abiosoft/colima)
+  (or inside a [Lima](https://lima-vm.io/) VM for isolation).
+  No cloud account, no mocks.
+  Errors and IAM checks are done at Apply time — Terraform generation and
+  Simulate are in progress (see [Status](#status) below).
+- **Supervised, with live status.** The reconciler watches health and
+  reprovisions what crashes; every phase (starting / healthy / crashed / …)
+  streams to the canvas over WebSocket.
 - **Environments.** Multiple named environments reconcile independently, each
-  isolated from the others.
+  with its own isolated AWS-shaped state.
 
 ## How it's built
 
 - **UI:** React 19 + ReactFlow + Tailwind v4, served by Vite (`ui/`, `bun`).
 - **Backend:** Python 3.12+ (`uv`), FastAPI + WebSocket, Pydantic.
-- **Control loop:** a Spec Store (Stack = desired, World = observed) with a pure,
-  idempotent `plan(Stack, World) → [Action]` reconciler that drives reality and
-  verifies it with per-kind health assertions.
-- **Runtime:** real containers via Colima (the default) or a Lima VM, behind a single
-  `RuntimeDriver` protocol.
-- **AWS control plane:** [MiniStack](https://pypi.org/project/ministack/) embedded
-  in-process — S3, SQS, SNS, DynamoDB, and RDS backed for real (RDS → a real Postgres
-  container).
-- **Brain:** the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python)
-  completes blank config and reviews IAM.
+- **Control loop:** a Spec Store (Stack = desired, World = observed) with a
+  pure, idempotent `plan(Stack, World) → [Action]` reconciler that drives
+  reality and verifies it with health assertions.
+- **Runtime:** real containers via Colima (the default) or a Lima VM, behind a
+  single `RuntimeDriver` protocol.
+- **AWS-shaped resources:** RustFS (S3), goaws (SQS + SNS), dynalite
+  (DynamoDB), and real Postgres (RDS) — provisioned per environment, run
+  through the same runtime as everything else.
 
 ## Requirements
 
@@ -52,7 +52,6 @@ Mac, with an AI operator. You draw; you don't write config.
 - [Colima](https://github.com/abiosoft/colima) for the container runtime (or
   [Lima](https://lima-vm.io/) for VM isolation)
 - [bun](https://bun.sh/) — only for building the UI from a dev clone
-- Claude access for the agent (via the Claude Code CLI the Agent SDK wraps)
 
 ## Install
 
@@ -91,24 +90,27 @@ odin clean        Reset local state (odin clean --all wipes everything)
 
 ## Status
 
-The canvas, AI config-completion, and the reconciler running real workloads
-(services, dependencies, batch jobs, local LLMs) with an embedded AWS control plane
-work end to end. Odin is moving toward a **fully local-only** model — dropping the
-AWS-emulation layer in favor of plain local containers and processes. See
-[ROADMAP.md](ROADMAP.md).
+Odin is mid-pivot toward the local-first-AWS shape described in
+[NORTHSTAR.md](NORTHSTAR.md): the canvas, environments, and RDS/S3/SQS/SNS/
+DynamoDB on real substitutes work end to end today. The gateway, the
+canvas↔Terraform translation agent, Simulate, and full IAM enforcement are in
+progress — see [ROADMAP.md](ROADMAP.md) for the sequence.
+
+The previous app-workload layer (services, dependencies, batch jobs, local
+LLMs) has been parked — git tag `app-layer-parked` — while odin refocuses on
+being an AWS-compatible core first; it may return as a layer on top later.
 
 ## Acknowledgements
 
 Odin stands on the shoulders of open source giants — most of what makes it work is
 other people's excellent work, and a lot of the thanks belongs to them:
 
-- **[MiniStack](https://pypi.org/project/ministack/)** — the embedded AWS control plane
 - **[Colima](https://github.com/abiosoft/colima)** + **[Lima](https://lima-vm.io/)** — containers and VMs on the Mac
 - **[PostgreSQL](https://www.postgresql.org/)** — the real backing for RDS
+- **[RustFS](https://github.com/rustfs/rustfs)**, **[goaws](https://github.com/Admiral-Piett/goaws)**, **[dynalite](https://github.com/mhart/dynalite)** — the real backings for S3, SQS/SNS, and DynamoDB
 - **[FastAPI](https://fastapi.tiangolo.com/)**, **[Pydantic](https://pydantic.dev/)**, **[boto3](https://github.com/boto/boto3)** — the backend
 - **[React](https://react.dev/)** + **[React Flow](https://reactflow.dev/)** + **[Tailwind CSS](https://tailwindcss.com/)** + **[Vite](https://vitejs.dev/)** — the canvas UI
 - **[uv](https://github.com/astral-sh/uv)** + **[bun](https://bun.sh/)** — the toolchain
-- the **[Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python)** — the agent that completes config
 
 Thank you to every one of these projects and their maintainers. 🙏
 

@@ -1,5 +1,15 @@
 # allfather — End-to-End Scenarios
 
+> **Deprecated 2026-07-22 (see [NORTHSTAR.md](../NORTHSTAR.md)):** every
+> scenario in this file — the "walking-skeleton" ones below and the legacy
+> Moto/tofu ones further down — exercises the app-workload layer (service/dep/
+> batch/llm nodes, the scheduler, the config-completion brain). That layer has
+> been ripped from live code and parked at git tag `app-layer-parked`; none of
+> these scenarios run against current `main`/`develop`. Kept for history —
+> don't use them as a guide to today's behavior. New scenario coverage for the
+> AWS-core direction (gateway, canvas↔Terraform translation, Simulate) lands
+> as that work does.
+
 > **Architecture pivot (2026-06-21):** allfather replaces odin's old one-shot
 > Moto/OpenTofu **validate** path with a continuous Reconciler + embedded
 > MiniStack. The 15 AWS-drawing scenarios further below tested the *retired*
