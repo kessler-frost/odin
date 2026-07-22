@@ -45,6 +45,28 @@ def test_edges_already_naming_labels_pass_through_unchanged():
     assert (edge.src, edge.dst) == ("alerts", "jobs")
 
 
+def test_iam_edges_survive_when_source_node_is_an_unknown_kind():
+    # Post-ripout contract (NORTHSTAR.md): edges-as-grants outlive workload
+    # kinds. A workload identity on the canvas (e.g. a phantom node standing
+    # in for a principal that will be issued keys directly) isn't a runnable
+    # resource kind, so `_resource()` drops it from Stack.resources -- but
+    # its iam edge must still translate, since `labels` + `edges` are built
+    # from ALL canvas nodes/edges, not filtered to known kinds.
+    canvas = {
+        "nodes": [
+            {"id": "s3-node", "type": "s3", "data": {"label": "uploads"}},
+            {"id": "worker-node", "type": "phantomWorkload", "data": {"label": "worker"}},
+        ],
+        "edges": [{"source": "worker-node", "target": "s3-node",
+                   "data": {"edgeType": "iam", "permissions": ["s3:PutObject", "s3:GetObject", "s3:ListBucket"]}}],
+    }
+    stack = canvas_to_stack(canvas)
+    assert [r.id for r in stack.resources] == ["uploads"]  # the unknown-kind node itself is dropped
+    edge = stack.edges[0]
+    assert (edge.src, edge.dst, edge.kind) == ("worker", "uploads", "iam")
+    assert edge.perms == ("s3:PutObject", "s3:GetObject", "s3:ListBucket")
+
+
 def test_canvas_to_stack_maps_kinds_fields_refs():
     canvas = {
         "nodes": [
