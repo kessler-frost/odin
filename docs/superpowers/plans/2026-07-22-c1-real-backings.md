@@ -358,7 +358,7 @@ BACKINGS: tuple[BackingDef, ...] = (
 - Test-modify (integration, must IMPORT cleanly — execution happens in Task 4): `tests/aws/test_provision_e2e.py`, `tests/aws/test_skeleton_e2e.py`, `tests/aws/test_multikind_e2e.py`, `tests/aws/test_aws_usable_e2e.py`
 
 **Interfaces:**
-- Consumes (from Tasks 1-2): `PostgresRds(runtime, env)` and `BackingAws(runtime, env)` with `provision(service, name, subscriptions=())`, `exists(service, name) -> bool`, `deprovision(service, name)`, `ensure_backing(service)`, `endpoints() -> dict[str, str]` (service → container-reachable URL), `aws_env() -> dict[str, str]` (the injection vars), `gc(active_kinds: set[str])`.
+- Consumes (from Tasks 1-2, both landed — read `src/odin/aws/backings.py` for ground truth): `PostgresRds(runtime, env)` and `BackingAws(runtime, env, root=Path(".odin"), client_factory=None)` with `provision(service, name, subscriptions=())`, `exists(service, name) -> bool`, `deprovision(service, name)`, `ensure_backing(service)`, `facts(service, name) -> dict` (the per-kind World facts incl. container-reachable `endpoint`), `aws_env() -> dict[str, str]` (the injection vars), `gc(active_kinds: set[str])`, `client(service)` (host-side boto3, for tests).
 - Produces: `create_app(runtime=None, store=None, rds=None, aws=None, backings: bool = True, complete: bool = True)` — `backings=False` replaces `embed=False` (pure fakes mode for tests); when True and `rds`/`aws` are None, each env's reconciler gets `PostgresRds(_runtime, env)` / `BackingAws(_runtime, env)`.
 
 **Reconciler changes (exact):**
