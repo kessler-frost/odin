@@ -8,6 +8,7 @@ over WebSocket.
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -21,6 +22,8 @@ from odin.aws.backings import BackingAws
 from odin.aws.rds import PostgresRds
 from odin.fabric.localhost import LocalhostFabric
 from odin.fabric.nebula import mesh_state
+from odin.gateway.app import GatewayState, create_gateway_app, serve_in_thread, stop_in_thread
+from odin.gateway.keys import KeyStore, Principal
 from odin.reconcile.reconciler import Reconciler
 from odin.runtime.colima import ColimaRuntime
 from odin.spec.models import Stack
@@ -30,6 +33,8 @@ from odin.spec.translate import canvas_to_stack, skipped_node_types
 ODIN_DIR = Path(".odin")
 CANVAS_PATH = ODIN_DIR / "canvas.json"
 ENV = "default"
+GATEWAY_PORT_ENV = "ODIN_GATEWAY_PORT"
+DEFAULT_GATEWAY_PORT = 4266
 
 log = logging.getLogger("odin")
 
@@ -76,6 +81,7 @@ def create_app(
     rds=None,
     aws=None,
     backings: bool = True,
+    gateway_port: int | None = None,
 ) -> FastAPI:
     _runtime = runtime or ColimaRuntime()
     _store = store or SpecStore(ODIN_DIR)
@@ -99,15 +105,41 @@ def create_app(
             await reconcilers[env].start()
         return reconcilers[env]
 
+    # The gateway: workload SDK calls carry per-node creds and land here
+    # (checked reverse proxy -> real backing), never the backing directly.
+    # Stateless routing table + key registry, rebuilt/persisted independent
+    # of the reconciler; `state`/`keystore` are exposed on app.state so the
+    # reconciler's injection swap (a later task) can populate them per Apply.
+    gateway_state = GatewayState()
+    gateway_keystore = KeyStore(_store.root)
+
+    async def on_deny(principal: Principal | None, action: str | None, resource: str | None, reason: str) -> None:
+        await ws_manager.broadcast({
+            "type": "access_denied",
+            "env": principal.env if principal else "default",
+            "resource_id": principal.node_id if principal else None,
+            "action": action,
+            "target": resource,
+            "reason": reason,
+        })
+
+    gateway_app = create_gateway_app(gateway_state, gateway_keystore, on_deny)
+    _resolved_gateway_port = gateway_port if gateway_port is not None else int(os.environ.get(GATEWAY_PORT_ENV, DEFAULT_GATEWAY_PORT))
+    gateway_server = None
+    gateway_thread = None
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        nonlocal gateway_server, gateway_thread
         for env in _store.list_envs():  # resume reconciling existing environments
             await reconciler_for(env)
+        gateway_server, gateway_thread, _ = serve_in_thread(gateway_app, port=_resolved_gateway_port)
         try:
             yield
         finally:
             for reconciler in reconcilers.values():
                 await reconciler.stop()
+            stop_in_thread(gateway_server, gateway_thread)
 
     app = FastAPI(title="allfather", version="0.1.0", lifespan=lifespan)
     app.include_router(create_canvas_router(CANVAS_PATH))
@@ -134,6 +166,8 @@ def create_app(
     app.state.runtime = _runtime
     app.state.ws_manager = ws_manager
     app.state.reconcilers = reconcilers
+    app.state.gateway = gateway_state
+    app.state.gateway_keys = gateway_keystore
 
     bundled_ui = Path(__file__).resolve().parent / "_ui"
     source_ui = Path(__file__).resolve().parent.parent.parent / "ui" / "dist"

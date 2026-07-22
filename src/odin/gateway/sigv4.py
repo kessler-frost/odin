@@ -53,15 +53,24 @@ def _parse_authorization(headers: dict[str, str]) -> dict[str, str] | None:
     return fields
 
 
-def scope(headers: dict[str, str]) -> tuple[str, str] | None:
-    """(service, region) read from the Authorization header's credential scope."""
+def identify(headers: dict[str, str]) -> tuple[str, str, str] | None:
+    """(access_key, region, service) parsed from the Authorization header's
+    credential scope, WITHOUT verifying the signature -- lets a caller (the
+    gateway) know who's asking and for which service even when
+    verification is about to fail or hasn't run yet, so an auth-failure
+    response can still be shaped for the right protocol."""
     fields = _parse_authorization(headers)
     if fields is None:
         return None
-    credential = _parse_credential(fields)
-    if credential is None:
+    return _parse_credential(fields)
+
+
+def scope(headers: dict[str, str]) -> tuple[str, str] | None:
+    """(service, region) read from the Authorization header's credential scope."""
+    identified = identify(headers)
+    if identified is None:
         return None
-    _access_key, region, service = credential
+    _access_key, region, service = identified
     return service, region
 
 

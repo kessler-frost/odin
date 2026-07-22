@@ -63,6 +63,16 @@ class KeyStore:
         self._ensure_root_scanned()
         return self._by_key.get(access_key)
 
+    def secret_for(self, access_key: str) -> str | None:
+        """The secret half of an issued pair -- the `secret_for` callback
+        SigV4 verification needs, without exposing the (env, node_id) ->
+        pair mapping itself."""
+        principal = self.lookup(access_key)
+        if principal is None:
+            return None
+        pair = self._by_env.get(principal.env, {}).get(principal.node_id)
+        return pair[1] if pair else None
+
     def revoke_env(self, env: str) -> None:
         self._ensure_loaded(env)
         nodes = self._by_env.pop(env, {})
