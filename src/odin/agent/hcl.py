@@ -1,0 +1,147 @@
+"""Deterministic canvas -> Terraform skeleton generator (S3a).
+
+Consumes a `Stack` (the output of `odin.spec.translate.canvas_to_stack`) and
+emits a PORTABLE Terraform project: no endpoints, no `skip_*` flags, no
+credentials. Those live in odin's runtime-generated `override.tf` + env vars
+(docs/superpowers/plans/2026-07-22-s-simulate-translation.md, Global
+Constraints) — never here. The translation agent (S3, later) refines/
+annotates this skeleton; determinism comes first.
+
+Output is fmt-canonical HCL (two-space indent, `=` aligned to the widest key
+in each block) so `tofu fmt -check` accepts it unmodified.
+"""
+from __future__ import annotations
+
+import json
+import re
+
+from pydantic import BaseModel
+
+from odin.spec.models import ResourceDesired, Stack
+
+_REGION = "us-east-1"
+_SANITIZE = re.compile(r"[^a-z0-9_]")
+
+# kind -> human reason it can't be simulated yet. Anything not in the map (and
+# not one of the supported kinds below) gets a generic fallback reason.
+_UNSUPPORTED_REASONS = {
+    "rds": "Simulate v1 — stays on the reconciler path",
+}
+
+_HEADER = (
+    'terraform {\n'
+    '  required_providers {\n'
+    '    aws = {\n'
+    '      source  = "hashicorp/aws"\n'
+    '      version = "~> 5.0"\n'
+    '    }\n'
+    '  }\n'
+    '}'
+)
+
+
+class TfProject(BaseModel):
+    model_config = {"frozen": True}
+    files: dict[str, str] = {}
+    unsupported: list[str] = []
+
+
+def _quote(value: object) -> str:
+    """An HCL string literal. json.dumps shares HCL's basic-string escaping
+    for the ASCII cases odin's labels can contain — no hand-rolled escaper."""
+    return json.dumps(value)
+
+
+def _sanitize(label: str) -> str:
+    name = _SANITIZE.sub("_", label.lower())
+    return f"_{name}" if name[:1].isdigit() else name
+
+
+def _unique_name(name: str, used: set[str]) -> str:
+    candidate, n = name, 2
+    while candidate in used:
+        candidate, n = f"{name}_{n}", n + 1
+    used.add(candidate)
+    return candidate
+
+
+def _field(res: ResourceDesired, key: str, default: str) -> str:
+    fv = res.fields.get(key)
+    return fv.value if fv is not None else default
+
+
+def _block(resource_type: str, name: str, attrs: dict[str, str], nested: str = "") -> str:
+    width = max(len(k) for k in attrs)
+    lines = [f"  {k.ljust(width)} = {v}" for k, v in attrs.items()]
+    if nested:
+        lines += ["", nested]
+    body = "\n".join(lines)
+    return f'resource "{resource_type}" "{name}" {{\n{body}\n}}'
+
+
+def _s3(res: ResourceDesired) -> tuple[str, dict[str, str], str]:
+    return "aws_s3_bucket", {"bucket": _quote(res.id)}, ""
+
+
+def _sqs(res: ResourceDesired) -> tuple[str, dict[str, str], str]:
+    return "aws_sqs_queue", {"name": _quote(res.id)}, ""
+
+
+def _sns(res: ResourceDesired) -> tuple[str, dict[str, str], str]:
+    return "aws_sns_topic", {"name": _quote(res.id)}, ""
+
+
+def _dynamodb(res: ResourceDesired) -> tuple[str, dict[str, str], str]:
+    hash_key = _field(res, "hashKey", "id")
+    attrs = {
+        "name": _quote(res.id),
+        "billing_mode": _quote("PAY_PER_REQUEST"),
+        "hash_key": _quote(hash_key),
+    }
+    nested = f'  attribute {{\n    name = {_quote(hash_key)}\n    type = "S"\n  }}'
+    return "aws_dynamodb_table", attrs, nested
+
+
+_BUILDERS = {"s3": _s3, "sqs": _sqs, "sns": _sns, "dynamodb": _dynamodb}
+
+
+def generate_tf(stack: Stack) -> TfProject:
+    by_id = {r.id: r for r in stack.resources}
+    used_names: dict[str, set[str]] = {}
+    hcl_name_by_id: dict[str, str] = {}
+    blocks: list[tuple[tuple[str, str], str]] = []
+    unsupported: list[str] = []
+
+    for res in sorted(stack.resources, key=lambda r: (r.kind, r.id)):
+        builder = _BUILDERS.get(res.kind)
+        if builder is None:
+            reason = _UNSUPPORTED_REASONS.get(res.kind, f"{res.kind} — not supported in Simulate v1")
+            unsupported.append(f"{res.id} ({res.kind}): {reason}")
+            continue
+        resource_type, attrs, nested = builder(res)
+        name = _unique_name(_sanitize(res.id), used_names.setdefault(resource_type, set()))
+        hcl_name_by_id[res.id] = name
+        blocks.append(((res.kind, res.id), _block(resource_type, name, attrs, nested)))
+
+    for edge in sorted(stack.edges, key=lambda e: (e.src, e.dst)):
+        topic, queue = by_id.get(edge.src), by_id.get(edge.dst)
+        if topic is None or queue is None or topic.kind != "sns" or queue.kind != "sqs":
+            continue
+        topic_name, queue_name = hcl_name_by_id[topic.id], hcl_name_by_id[queue.id]
+        name = _unique_name(
+            _sanitize(f"{topic_name}_{queue_name}"),
+            used_names.setdefault("aws_sns_topic_subscription", set()),
+        )
+        attrs = {
+            "topic_arn": f"aws_sns_topic.{topic_name}.arn",
+            "protocol": _quote("sqs"),
+            "endpoint": f"aws_sqs_queue.{queue_name}.arn",
+            "raw_message_delivery": "true",
+        }
+        block = _block("aws_sns_topic_subscription", name, attrs)
+        blocks.append((("sns_subscription", f"{topic.id}.{queue.id}"), block))
+
+    blocks.sort(key=lambda b: b[0])
+    provider = f'provider "aws" {{\n  region = {_quote(_REGION)}\n}}'
+    main_tf = "\n\n".join([_HEADER, provider, *(text for _, text in blocks)]) + "\n"
+    return TfProject(files={"main.tf": main_tf}, unsupported=unsupported)
