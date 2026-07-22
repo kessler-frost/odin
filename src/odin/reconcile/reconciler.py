@@ -62,6 +62,10 @@ class Reconciler:
         self._blocked_since: dict[str, float] = {}
         self._task: asyncio.Task | None = None
         self._stop = False
+        # tick() is called by BOTH the background loop and the /apply//destroy
+        # endpoints; it yields at every to_thread, so unserialized ticks plan
+        # on the same pre-execute world and double-run containers.
+        self._tick_lock = asyncio.Lock()
 
     # ---- lifecycle ----
     async def start(self) -> None:
@@ -83,13 +87,14 @@ class Reconciler:
             await asyncio.sleep(self._poll)
 
     async def tick(self) -> None:
-        stack = self._store.get_stack(self._env)
-        await self._observe(stack)
-        world = self._store.current_world(self._env)
-        for action in plan(stack, world):
-            await self._execute(action, stack)
-        if self._aws is not None:  # stop backings no active kind needs anymore
-            await asyncio.to_thread(self._aws.gc, {r.kind for r in stack.resources})
+        async with self._tick_lock:
+            stack = self._store.get_stack(self._env)
+            await self._observe(stack)
+            world = self._store.current_world(self._env)
+            for action in plan(stack, world):
+                await self._execute(action, stack)
+            if self._aws is not None:  # stop backings no active kind needs anymore
+                await asyncio.to_thread(self._aws.gc, {r.kind for r in stack.resources})
 
     # ---- helpers ----
     def _res(self, stack: Stack, rid: str) -> ResourceDesired:

@@ -1,6 +1,8 @@
 """S2.3 — the Reconciler loop, driven against fakes (no Colima, no real backings)."""
 from __future__ import annotations
 
+import asyncio
+import time
 
 from odin.reconcile.reconciler import Reconciler
 from odin.runtime.colima import _STATUS_TO_PHASE, ContainerFacts, HostFacts, RunHandle
@@ -337,3 +339,25 @@ async def test_blocked_ref_times_out_to_error(tmp_path):
     await recon.tick()                       # past timeout -> error
     assert store.current_world().get("api").phase == "error"
     assert "api" not in rt.runs
+
+
+class SlowAws(FakeAws):
+    """provision takes real time (as a container boot does), widening the
+    window in which a second tick can plan on the not-yet-updated world."""
+
+    def provision(self, service, name, subscriptions=()):
+        time.sleep(0.05)
+        super().provision(service, name, subscriptions)
+
+
+async def test_concurrent_ticks_do_not_double_provision(tmp_path):
+    # /apply's synchronous tick overlaps the background loop's tick (tick
+    # yields at to_thread) — unserialized, both plan on the same pre-provision
+    # world and double-provision (live: two `docker run` on one backing name).
+    rt, rds, aws = FakeRuntime(), FakeRds(), SlowAws()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(ResourceDesired(id="uploads", kind="s3"),)))
+    recon = Reconciler(store, rt, rds, aws=aws, http_ok=_yes, pg_ready=_yes,
+                       poll_interval=0)
+    await asyncio.gather(recon.tick(), recon.tick())
+    assert aws.provisioned == [("s3", "uploads", ())]
