@@ -16,6 +16,7 @@ from fastapi import APIRouter, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from odin.agent import translate as translate_mod
 from odin.agent.hcl import generate_tf
 from odin.api.canvas import CanvasGraph, create_canvas_router
 from odin.api.ws import ConnectionManager
@@ -129,6 +130,15 @@ def create_tf_router(store: SpecStore, runner: TfRunner, keystore: KeyStore, gat
     @router.get("/tf/status")
     def tf_status(env: str = ENV) -> dict:
         return runner.status(env)
+
+    @router.post("/translate")
+    async def translate_route(env: str = ENV) -> dict:
+        """S3b: the canvas -> TF review pass, for the UI to show before
+        Apply runs it (`translate` is always best-effort; see its own
+        docstring for the fallback chain -- this route never fails)."""
+        stack = store.get_stack(env)
+        result = await translate_mod.translate(stack)
+        return result.model_dump()
 
     return router
 

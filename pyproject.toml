@@ -15,6 +15,7 @@ dependencies = [
     "claude-agent-sdk>=0.1.39",
     "typer>=0.15",
     "psycopg2-binary>=2.9.12",
+    "python-hcl2>=8.1.2",
 ]
 
 [project.optional-dependencies]

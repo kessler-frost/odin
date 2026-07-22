@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import re
 
+import hcl2
 from pydantic import BaseModel
 
 from odin.spec.models import ResourceDesired, Stack
@@ -28,7 +29,12 @@ _UNSUPPORTED_REASONS = {
     "rds": "Simulate v1 — stays on the reconciler path",
 }
 
-_HEADER = (
+# Public: the translation agent (S3b) and TF import (S4) both need the
+# terraform{} header (a live-import scratch project builds one from scratch)
+# and the `resource "type" "name"` parsing below (S3b's guardrail, S4's
+# HCL->canvas parser) -- shared here, next to the generator they must
+# round-trip with, instead of duplicated per consumer.
+HEADER = (
     'terraform {\n'
     '  required_providers {\n'
     '    aws = {\n'
@@ -46,23 +52,63 @@ class TfProject(BaseModel):
     unsupported: list[str] = []
 
 
-def _quote(value: object) -> str:
+def quote(value: object) -> str:
     """An HCL string literal. json.dumps shares HCL's basic-string escaping
     for the ASCII cases odin's labels can contain — no hand-rolled escaper."""
     return json.dumps(value)
 
 
-def _sanitize(label: str) -> str:
+def unquote(value: object) -> str | None:
+    """The inverse of `quote`, for reading hcl2-parsed attribute values back:
+    python-hcl2 keeps a quoted literal's surrounding `"` characters in the
+    parsed string (verified empirically — `bucket = "x"` parses to the
+    3-character string '"x"', not 'x'). Anything else (an interpolation like
+    `${aws_sns_topic.t.arn}`, a bare number/bool, a nested block) is left
+    alone — only a plain quoted-literal string gets unwrapped."""
+    if isinstance(value, str) and value.startswith('"') and value.endswith('"'):
+        return value[1:-1]
+    return value if isinstance(value, str) else None
+
+
+def sanitize_name(label: str) -> str:
     name = _SANITIZE.sub("_", label.lower())
     return f"_{name}" if name[:1].isdigit() else name
 
 
-def _unique_name(name: str, used: set[str]) -> str:
+def unique_name(name: str, used: set[str]) -> str:
     candidate, n = name, 2
     while candidate in used:
         candidate, n = f"{name}_{n}", n + 1
     used.add(candidate)
     return candidate
+
+
+def provider_block(region: str = _REGION) -> str:
+    return f'provider "aws" {{\n  region = {quote(region)}\n}}'
+
+
+def parse_tf(files: dict[str, str]) -> list[tuple[str, str, dict]]:
+    """Parse every `resource "type" "name" { ... }` block across `files`
+    (filename -> HCL text) into `(type, name, attrs)` triples — `type`/`name`
+    unquoted, `attrs` left as hcl2's raw parse (see `unquote` for reading
+    individual values back out). The one place odin reads HCL back in: S3b's
+    guardrail (resource-SET equality between skeleton and agent output) and
+    S4's HCL->canvas parser both call this instead of parsing HCL twice."""
+    triples: list[tuple[str, str, dict]] = []
+    for content in files.values():
+        for block in hcl2.loads(content).get("resource", []):
+            for raw_type, named in block.items():
+                for raw_name, attrs in named.items():
+                    triples.append((unquote(raw_type), unquote(raw_name), attrs))
+    return triples
+
+
+def resource_set(files: dict[str, str]) -> frozenset[tuple[str, str]]:
+    """The (type, name) identity of every resource block across `files` —
+    S3b's guardrail compares this set between the skeleton and the agent's
+    refinement; they must be identical (the agent may edit arguments, never
+    add/remove a resource)."""
+    return frozenset((rtype, name) for rtype, name, _ in parse_tf(files))
 
 
 def _field(res: ResourceDesired, key: str, default: str) -> str:
@@ -80,25 +126,25 @@ def _block(resource_type: str, name: str, attrs: dict[str, str], nested: str = "
 
 
 def _s3(res: ResourceDesired) -> tuple[str, dict[str, str], str]:
-    return "aws_s3_bucket", {"bucket": _quote(res.id)}, ""
+    return "aws_s3_bucket", {"bucket": quote(res.id)}, ""
 
 
 def _sqs(res: ResourceDesired) -> tuple[str, dict[str, str], str]:
-    return "aws_sqs_queue", {"name": _quote(res.id)}, ""
+    return "aws_sqs_queue", {"name": quote(res.id)}, ""
 
 
 def _sns(res: ResourceDesired) -> tuple[str, dict[str, str], str]:
-    return "aws_sns_topic", {"name": _quote(res.id)}, ""
+    return "aws_sns_topic", {"name": quote(res.id)}, ""
 
 
 def _dynamodb(res: ResourceDesired) -> tuple[str, dict[str, str], str]:
     hash_key = _field(res, "hashKey", "id")
     attrs = {
-        "name": _quote(res.id),
-        "billing_mode": _quote("PAY_PER_REQUEST"),
-        "hash_key": _quote(hash_key),
+        "name": quote(res.id),
+        "billing_mode": quote("PAY_PER_REQUEST"),
+        "hash_key": quote(hash_key),
     }
-    nested = f'  attribute {{\n    name = {_quote(hash_key)}\n    type = "S"\n  }}'
+    nested = f'  attribute {{\n    name = {quote(hash_key)}\n    type = "S"\n  }}'
     return "aws_dynamodb_table", attrs, nested
 
 
@@ -119,7 +165,7 @@ def generate_tf(stack: Stack) -> TfProject:
             unsupported.append(f"{res.id} ({res.kind}): {reason}")
             continue
         resource_type, attrs, nested = builder(res)
-        name = _unique_name(_sanitize(res.id), used_names.setdefault(resource_type, set()))
+        name = unique_name(sanitize_name(res.id), used_names.setdefault(resource_type, set()))
         hcl_name_by_id[res.id] = name
         blocks.append(((res.kind, res.id), _block(resource_type, name, attrs, nested)))
 
@@ -128,13 +174,13 @@ def generate_tf(stack: Stack) -> TfProject:
         if topic is None or queue is None or topic.kind != "sns" or queue.kind != "sqs":
             continue
         topic_name, queue_name = hcl_name_by_id[topic.id], hcl_name_by_id[queue.id]
-        name = _unique_name(
-            _sanitize(f"{topic_name}_{queue_name}"),
+        name = unique_name(
+            sanitize_name(f"{topic_name}_{queue_name}"),
             used_names.setdefault("aws_sns_topic_subscription", set()),
         )
         attrs = {
             "topic_arn": f"aws_sns_topic.{topic_name}.arn",
-            "protocol": _quote("sqs"),
+            "protocol": quote("sqs"),
             "endpoint": f"aws_sqs_queue.{queue_name}.arn",
             "raw_message_delivery": "true",
         }
@@ -142,6 +188,5 @@ def generate_tf(stack: Stack) -> TfProject:
         blocks.append((("sns_subscription", f"{topic.id}.{queue.id}"), block))
 
     blocks.sort(key=lambda b: b[0])
-    provider = f'provider "aws" {{\n  region = {_quote(_REGION)}\n}}'
-    main_tf = "\n\n".join([_HEADER, provider, *(text for _, text in blocks)]) + "\n"
+    main_tf = "\n\n".join([HEADER, provider_block(), *(text for _, text in blocks)]) + "\n"
     return TfProject(files={"main.tf": main_tf}, unsupported=unsupported)
