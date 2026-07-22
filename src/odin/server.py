@@ -11,11 +11,14 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
+from odin.agent import import_tf as import_tf_mod
 from odin.agent import translate as translate_mod
 from odin.agent.hcl import generate_tf
 from odin.api.canvas import CanvasGraph, create_canvas_router
@@ -82,6 +85,12 @@ def create_apply_router(store: SpecStore, reconciler_for, keystore: KeyStore) ->
 _TOFU_NOT_INSTALLED = {"error": "tofu not installed", "fix": "brew install opentofu"}
 
 
+class ImportTfRequest(BaseModel):
+    source: Literal["hcl", "live"]
+    hcl: str = ""
+    resources: list[dict] = []  # [{"type": "s3", "id": "uploads"}, ...] -- see import_tf.LiveResource
+
+
 def create_tf_router(store: SpecStore, runner: TfRunner, keystore: KeyStore, gateway_port) -> APIRouter:
     """`/tf/*` -- Simulate's own apply/destroy/status, independent of the
     canvas `/apply`/`/destroy` above (S2 CONTRACT ADDENDUM: routes named
@@ -138,6 +147,20 @@ def create_tf_router(store: SpecStore, runner: TfRunner, keystore: KeyStore, gat
         docstring for the fallback chain -- this route never fails)."""
         stack = store.get_stack(env)
         result = await translate_mod.translate(stack)
+        return result.model_dump()
+
+    @router.post("/import-tf")
+    async def import_tf_route(body: ImportTfRequest, env: str = ENV) -> dict:
+        """S4: TF -> canvas, the reverse direction. `source="hcl"` parses the
+        given text deterministically; `source="live"` resolves `resources`
+        against the env's real backings through the gateway (operator creds,
+        same as /tf/apply)."""
+        if body.source == "hcl":
+            result = import_tf_mod.parse_hcl_text(body.hcl)
+        else:
+            resources = [import_tf_mod.LiveResource(type=r["type"], id=r["id"]) for r in body.resources]
+            access_key, secret_key = _issue_operator(env)
+            result = await import_tf_mod.import_live(resources, gateway_port(), access_key, secret_key)
         return result.model_dump()
 
     return router
