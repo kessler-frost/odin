@@ -4,6 +4,34 @@ allfather: a Mac-native, AI-operated orchestration canvas (repo: odin, branch
 `allfather`). Drop apps + AWS resources, the AI completes config, a control loop
 runs them for real on Colima/Lima with an embedded MiniStack AWS control plane.
 
+## North star (2026-07-22) — the invariant that survives pivots
+
+Read this before proposing or accepting any architecture swing. The
+project has pivoted its MIDDLE layer three times (Moto → MiniStack →
+own gateway); the destination never moved. Test every future decision
+against these five points instead of re-deriving them:
+
+1. **Odin is an infra tool first** — an AWS-compatible endpoint on your Mac:
+   real AWS wire protocol, real AWS verbs, real IAM semantics. The app-canvas
+   layer is built ON TOP of that, not instead of it.
+2. **Real execution, always.** Every resource is a real local thing (RustFS,
+   goaws, dynalite, Postgres, containers) — never in-memory make-believe.
+   Emulators/routers may front the wire protocol, but never hold the data.
+3. **Edges = IAM permissions = the core UX.** Drawing an edge between two
+   components IS granting access (AWS verbs). This is the selling point;
+   it must be enforced for real (odin issues per-workload credentials and
+   evaluates policies at its API layer — real AccessDenied).
+4. **Nebula is the network layer, IAM is the API layer.** Separate concerns,
+   never conflated: the mesh firewall decides who can REACH whom (M7,
+   multi-Mac); IAM decides who may CALL what.
+5. **Dependencies are replaceable; the contract is not.** Moto, MiniStack,
+   RustFS et al. are implementation details behind odin's endpoint. Swapping
+   one must never change what users' boto3 code sees.
+
+(The 2026-06-23 note below said "drop the AWS-emulation story" — that went
+too far and is superseded on that point: the AWS *contract* stays; what was
+dropped is the all-in-one emulator holding fake state.)
+
 ## Direction (2026-06-23): local-only pivot
 
 **allfather is going local-only.** We're dropping the ambition to maintain AWS /

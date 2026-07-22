@@ -117,14 +117,22 @@ isolation is container-level (one backing set per env).
   ec2/lambda/vpc/subnet/sg from palette + their bespoke components (non-
   runnable decorations post-MiniStack; keeping them would be false
   advertising).
-- **Access edges stay** (standing decision, 2026-06-21 design spec §IAM +
-  `fabric/nebula.py:41-42`): edges-with-permissions are the access-graph
-  model, generalized from the old ec2/lambda pairs to **workload→resource**
-  (service/batch/llm → s3/sqs/sns/dynamodb/rds). Modeled + AI-reviewed today,
-  explicitly "modeled, not enforced" in the UX; ENFORCEMENT compiles them to
-  Nebula overlay firewall rules via the preserved `sg_rules_to_firewall` when
-  M7 multi-Mac activates (single-host has no inter-host traffic to police).
-  `iam.ts` is generalized, not deleted.
+- **Access edges stay and become REAL IAM** (user directive 2026-07-22; see
+  ROADMAP.md north star): edges-with-permissions keep their AWS verbs
+  completely, generalized from the old ec2/lambda pairs to
+  **workload→resource** (service/batch/llm → s3/sqs/sns/dynamodb/rds).
+  Enforcement = **C1.5, the odin gateway**: every workload node gets issued
+  per-node access keys (principals); workloads' AWS SDKs point at ONE
+  `AWS_ENDPOINT_URL` (the gateway); the gateway verifies SigV4 → principal,
+  maps request → (service, action verb, resource), evaluates policies
+  compiled from the canvas edges, forwards allowed ops to the real backings
+  (re-signing for RustFS), returns real `AccessDenied` otherwise. Gateway v1
+  design lands after the two research reports
+  (`.superpowers/sdd/research-iam-{moto,gateway}.md`) — internals (moto's
+  policy evaluator as a library vs a compact own evaluator) are an
+  implementation detail behind a fixed contract. `iam.ts` is generalized,
+  not deleted. Nebula remains the SEPARATE network layer (M7) — reachability,
+  not API authorization; `sg_rules_to_firewall` preserved for that day.
 - `review_iam` → `review_stack` (see C3): reviews BOTH the access graph
   (least-privilege / blast-radius on permission edges — the old review_iam
   semantics, kept) AND config hygiene (exposed ports, plaintext secrets,
