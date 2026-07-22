@@ -1,7 +1,7 @@
 """M2/M3 — a richer real scenario: app + Postgres + Redis dep + batch job.
 
 Validates all the new workload kinds end-to-end with real containers:
-- rds  -> real Postgres (MiniStack control plane + allfather's runner)
+- rds  -> real Postgres container
 - dep  -> real Redis, publishes its endpoint
 - service -> app gated on BOTH db and cache, reading the injected URLs
 - batch -> run-to-completion (exits 0 -> done)
@@ -64,11 +64,11 @@ def runtime():
     rt = ColimaRuntime()
     yield rt
     for cid in rt.list_allfather():
-        rt._docker("rm", "-f", cid, check=False)
+        rt.stop(cid)
 
 
 def test_multikind_slice(tmp_path, runtime):
-    app = create_app(runtime=runtime, store=SpecStore(tmp_path), embed=True, complete=False)
+    app = create_app(runtime=runtime, store=SpecStore(tmp_path), complete=False)
     with TestClient(app) as client:
         client.post("/apply", json=CANVAS)
         _wait(client, lambda p: (

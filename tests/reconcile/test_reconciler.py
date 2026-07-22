@@ -1,4 +1,4 @@
-"""S2.3 — the Reconciler loop, driven against fakes (no Colima / no MiniStack)."""
+"""S2.3 — the Reconciler loop, driven against fakes (no Colima, no real backings)."""
 from __future__ import annotations
 
 
@@ -67,7 +67,33 @@ class FakeRds:
         return ("127.0.0.1", 15432) if self.available else None
 
     def container_name(self, db_id):
-        return f"ministack-rds-{db_id}"
+        return f"allfather-rds-default-{db_id}"
+
+
+class FakeAws:
+    def __init__(self):
+        self.provisioned, self.gc_calls = [], []
+
+    def provision(self, service, name, subscriptions=()):
+        self.provisioned.append((service, name, subscriptions))
+
+    def exists(self, service, name):
+        return True
+
+    def deprovision(self, service, name):
+        pass
+
+    def facts(self, service, name):
+        return {"endpoint": "http://host.docker.internal:9000"}
+
+    def aws_env(self):
+        return {"AWS_ENDPOINT_URL_S3": "http://host.docker.internal:9000",
+                "AWS_ACCESS_KEY_ID": "allfather",
+                "AWS_SECRET_ACCESS_KEY": "allfather-secret",
+                "AWS_DEFAULT_REGION": "us-east-1"}
+
+    def gc(self, active_kinds):
+        self.gc_calls.append(active_kinds)
 
 
 async def _yes(*a, **k):
@@ -234,7 +260,7 @@ async def test_rds_crash_clears_record_and_recreates(tmp_path):
     assert store.current_world().get("db").phase == "healthy"
     assert rds.created.count("db") == 1
 
-    rt.set("ministack-rds-db", "exited", exit_code=1)  # the DB container dies
+    rt.set("allfather-rds-default-db", "exited", exit_code=1)  # the DB container dies
     # one tick: observe sees crashed -> clears the stale record -> plan recreates
     await recon.tick()
     assert rds.available is False             # delete_db was called (the fix)
@@ -246,13 +272,25 @@ async def test_aws_env_injected_into_app_containers(tmp_path):
     rds.available = True
     store = SpecStore(tmp_path)
     store.apply(Stack(resources=(DB, API)))
-    recon = Reconciler(store, rt, rds, http_ok=_yes, pg_ready=_yes, poll_interval=0,
-                       aws_env=lambda: {"AWS_ENDPOINT_URL": "http://host.docker.internal:4566"})
+    recon = Reconciler(store, rt, rds, aws=FakeAws(), http_ok=_yes, pg_ready=_yes,
+                       poll_interval=0)
     for _ in range(3):
         await recon.tick()
     spec = rt.specs["api"]
-    assert spec.env["AWS_ENDPOINT_URL"] == "http://host.docker.internal:4566"
+    assert spec.env["AWS_ENDPOINT_URL_S3"] == "http://host.docker.internal:9000"
+    assert spec.env["AWS_ACCESS_KEY_ID"] == "allfather"
+    assert spec.env["AWS_SECRET_ACCESS_KEY"] == "allfather-secret"
+    assert spec.env["AWS_DEFAULT_REGION"] == "us-east-1"
     assert spec.env["DATABASE_URL"].startswith("postgresql://")  # ref still wins/coexists
+
+
+async def test_gc_called_every_tick_with_active_kinds(tmp_path):
+    rt, rds, aws = FakeRuntime(), FakeRds(), FakeAws()
+    store = SpecStore(tmp_path)
+    store.apply(Stack())
+    recon = Reconciler(store, rt, rds, aws=aws, http_ok=_yes, pg_ready=_yes, poll_interval=0)
+    await recon.tick()
+    assert aws.gc_calls == [set()]  # empty stack -> every backing is stoppable
 
 
 async def test_dep_healthy_publishes_endpoint(tmp_path):

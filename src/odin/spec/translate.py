@@ -16,7 +16,7 @@ _REF = re.compile(r"^\$\{\{\s*([\w-]+)\.([\w-]+)\s*\}\}$")
 # Canvas node type -> Stack kind.
 _KIND = {"service": "service", "app": "service", "rds": "rds",
          "batch": "batch", "dep": "dep", "llm": "llm",
-         # control-plane AWS resources provisioned in the embed
+         # AWS-shaped resources provisioned in per-env backing containers
          "s3": "s3", "sqs": "sqs", "sns": "sns", "dynamodb": "dynamodb"}
 
 

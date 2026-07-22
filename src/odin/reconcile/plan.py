@@ -7,11 +7,11 @@ scheduler / batch / llm branches.
 """
 from __future__ import annotations
 
-from odin.aws.provision import PROVISIONED
+from odin.aws.backings import PROVISIONED
 from odin.reconcile.actions import (
     Action,
-    CreateMiniStackResource,
     NoOp,
+    ProvisionResource,
     RunContainer,
     StopContainer,
 )
@@ -56,7 +56,7 @@ def plan(stack: Stack, world: World) -> list[Action]:
         if res.kind == "rds":
             # (re)create when nothing is up; otherwise wait for it to go healthy.
             if phase in ("pending", "crashed") and not _crash_looped(observed):
-                actions.append(CreateMiniStackResource(id=res.id, service="rds"))
+                actions.append(ProvisionResource(id=res.id, service="rds"))
             else:
                 actions.append(NoOp(id=res.id))
         elif res.kind in ("service", "dep", "llm"):
@@ -75,9 +75,9 @@ def plan(stack: Stack, world: World) -> list[Action]:
             else:
                 actions.append(NoOp(id=res.id))
         elif res.kind in PROVISIONED:
-            # control-plane AWS resource: create once, then it just exists.
+            # AWS-shaped resource in a shared backing: create once, then it just exists.
             if phase in ("pending", "crashed"):
-                actions.append(CreateMiniStackResource(id=res.id, service=res.kind))
+                actions.append(ProvisionResource(id=res.id, service=res.kind))
             else:
                 actions.append(NoOp(id=res.id))
         else:

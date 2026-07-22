@@ -43,7 +43,7 @@ class FakeRds:
         return None
 
     def container_name(self, db_id):
-        return f"ministack-rds-{db_id}"
+        return f"allfather-rds-default-{db_id}"
 
 
 CANVAS = {
@@ -59,7 +59,7 @@ CANVAS = {
 
 def test_apply_translates_stores_and_reconciles(tmp_path):
     rt, rds = FakeRuntime(), FakeRds()
-    app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, embed=False, complete=False)
+    app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, backings=False, complete=False)
     with TestClient(app) as client:
         resp = client.post("/apply", json=CANVAS)
         assert resp.json()["status"] == "applied" and resp.json()["rev"]
@@ -100,7 +100,7 @@ def test_apply_survives_brain_failure(tmp_path):
 
 def test_mesh_endpoint_returns_empty_network(tmp_path):
     rt, rds = FakeRuntime(), FakeRds()
-    app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, embed=False, complete=False)
+    app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, backings=False, complete=False)
     with TestClient(app) as client:
         body = client.get("/mesh").json()
         assert body["network"] == "default" and body["hosts"] == []  # no hosts joined yet
@@ -108,7 +108,7 @@ def test_mesh_endpoint_returns_empty_network(tmp_path):
 
 def test_preview_returns_diff_structure(tmp_path):
     rt, rds = FakeRuntime(), FakeRds()
-    app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, embed=False, complete=False)
+    app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, backings=False, complete=False)
     with TestClient(app) as client:
         resp = client.post("/preview", json=CANVAS)
         body = resp.json()
@@ -117,7 +117,7 @@ def test_preview_returns_diff_structure(tmp_path):
 
 def test_destroy_prunes(tmp_path):
     rt, rds = FakeRuntime(), FakeRds()
-    app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, embed=False, complete=False)
+    app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, backings=False, complete=False)
     with TestClient(app) as client:
         client.post("/apply", json=CANVAS)
         client.post("/destroy")

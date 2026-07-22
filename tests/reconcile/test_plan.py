@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 from odin.reconcile.actions import (
-    CreateMiniStackResource,
     NoOp,
+    ProvisionResource,
     RunContainer,
     StopContainer,
 )
@@ -31,7 +31,7 @@ def _world(*observed: ResourceObserved) -> World:
 
 def test_empty_world_creates_db_and_gates_app():
     actions = plan(STACK, World())
-    assert CreateMiniStackResource(id="db", service="rds") in actions
+    assert ProvisionResource(id="db", service="rds") in actions
     # api gated on db (not healthy yet) -> NoOp, no RunContainer
     assert RunContainer(id="api") not in actions
     assert NoOp(id="api") in actions
@@ -111,7 +111,7 @@ def test_crash_looped_workload_is_not_rerun():
 def test_aws_resource_created_once_then_exists():
     bucket = ResourceDesired(id="uploads", kind="s3")
     stack = Stack(resources=(bucket,))
-    assert CreateMiniStackResource(id="uploads", service="s3") in plan(stack, World())
+    assert ProvisionResource(id="uploads", service="s3") in plan(stack, World())
     world = _world(ResourceObserved(id="uploads", kind="s3", phase="healthy"))
     assert plan(stack, world) == [NoOp(id="uploads")]
 

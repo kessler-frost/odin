@@ -1,12 +1,12 @@
 """allfather FastAPI app factory.
 
 The canvas authors a desired-state Stack; a continuous Reconciler drives reality
-(real containers via Colima, the AWS control plane via embedded MiniStack); the
-World projects back to the canvas over WebSocket.
+(real containers via Colima — apps, Postgres for rds nodes, and per-env backing
+containers for the AWS-shaped resources); the World projects back to the canvas
+over WebSocket.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -17,15 +17,8 @@ from fastapi.staticfiles import StaticFiles
 
 from odin.api.canvas import CanvasGraph, create_canvas_router
 from odin.api.ws import ConnectionManager
-from odin.aws.embed import (
-    account_for_env,
-    aws_container_env,
-    install_rds_spawn_rewire,
-    start_ministack,
-    stop_ministack,
-)
-from odin.aws.provision import MiniStackAws
-from odin.aws.rds import MiniStackRds
+from odin.aws.backings import BackingAws
+from odin.aws.rds import PostgresRds
 from odin.fabric.localhost import LocalhostFabric
 from odin.fabric.nebula import mesh_state
 from odin.reconcile.reconciler import Reconciler
@@ -113,7 +106,8 @@ def create_app(
     runtime=None,
     store: SpecStore | None = None,
     rds=None,
-    embed: bool = True,
+    aws=None,
+    backings: bool = True,
     complete: bool = True,
 ) -> FastAPI:
     _runtime = runtime or ColimaRuntime()
@@ -125,17 +119,16 @@ def create_app(
         from odin.agent.brain import claude_complete
         complete_fn = claude_complete
 
-    # One reconciler per environment, created lazily. Each is scoped to its own
-    # MiniStack account so environments get isolated AWS state in one embed.
+    # One reconciler per environment, created lazily. Each gets its own
+    # env-scoped rds runner + backing containers, so AWS state stays isolated.
     reconcilers: dict[str, Reconciler] = {}
 
     def _make_reconciler(env: str) -> Reconciler:
-        account = account_for_env(env)
-        env_rds = rds or MiniStackRds(account)
-        env_aws_env = (lambda a=account: aws_container_env(a)) if embed else None
+        env_rds = rds or PostgresRds(_runtime, env)
+        env_aws = aws or (BackingAws(_runtime, env) if backings else None)
         return Reconciler(
-            _store, _runtime, env_rds, aws=MiniStackAws(account), fabric=LocalhostFabric(),
-            ws=ws_manager, env=env, scheduler=scheduler, aws_env=env_aws_env, poll_interval=1.0,
+            _store, _runtime, env_rds, aws=env_aws, fabric=LocalhostFabric(),
+            ws=ws_manager, env=env, scheduler=scheduler, poll_interval=1.0,
         )
 
     async def reconciler_for(env: str) -> Reconciler:
@@ -146,9 +139,6 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        if embed:
-            await asyncio.to_thread(start_ministack)
-            install_rds_spawn_rewire(_runtime)
         for env in _store.list_envs():  # resume reconciling existing environments
             await reconciler_for(env)
         try:
@@ -156,8 +146,6 @@ def create_app(
         finally:
             for reconciler in reconcilers.values():
                 await reconciler.stop()
-            if embed:
-                stop_ministack()
 
     app = FastAPI(title="allfather", version="0.1.0", lifespan=lifespan)
     app.include_router(create_canvas_router(CANVAS_PATH))

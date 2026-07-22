@@ -4,7 +4,7 @@ Chosen over Tailscale: Nebula runs inside your private network, YOU own the
 lighthouse, and a control plane / UI can be built on top of the mesh. One
 Nebula network == one allfather environment, so a host in `prod` cannot present
 a valid cert to `staging`'s lighthouse — cross-env isolation is free at the PKI
-layer, mirroring the per-env MiniStack account boundary.
+layer, mirroring the per-env isolation of the AWS backing containers.
 
 This module is the FOUNDATION: the cert/lighthouse/config primitives (recovered
 from the retired `network/` module, now sync + with an injectable subprocess

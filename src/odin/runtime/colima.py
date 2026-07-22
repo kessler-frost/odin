@@ -6,8 +6,7 @@ container engine (run containers directly), fast and real. `LimaRuntime`
 reusing the `_ContainerRuntime` base here — they differ only in the CLI seam
 (`docker` vs `nerdctl`-in-VM) and Colima's host-gateway run flag.
 
-Every container allfather runs is labelled ``allfather=1`` (deliberately NOT
-``ministack=…``, so MiniStack's own container reaper never touches them).
+Every container allfather runs is labelled ``allfather=1``.
 """
 from __future__ import annotations
 
@@ -17,6 +16,11 @@ from dataclasses import dataclass, field
 from odin.spec.models import Phase
 
 LABEL = "allfather"
+
+# The host as seen from inside containers: Colima's host-gateway alias (wired
+# by `_run_flags`). Producers publish this instead of localhost so a consumer
+# container can dial host-published ports verbatim.
+CONTAINER_HOST = "host.docker.internal"
 
 
 @dataclass(frozen=True)

@@ -1,9 +1,9 @@
 """S3 — full walking-skeleton slice through the real stack (no browser).
 
-create_app(embed=True) + real Colima + embedded MiniStack: apply a canvas with
-an app node + an RDS node wired by ${{db.DATABASE_URL}}, watch both reach
-healthy (real Postgres + real app container that received the injected URL),
-kill the app -> auto-restart, destroy -> clean teardown.
+create_app() + real Colima: apply a canvas with an app node + an RDS node wired
+by ${{db.DATABASE_URL}}, watch both reach healthy (real Postgres + real app
+container that received the injected URL), kill the app -> auto-restart,
+destroy -> clean teardown.
 
 Marked `integration`: needs Colima/Docker. Run with `-m integration`.
 """
@@ -64,11 +64,11 @@ def runtime():
     rt = ColimaRuntime()
     yield rt
     for cid in rt.list_allfather():
-        rt._docker("rm", "-f", cid, check=False)
+        rt.stop(cid)
 
 
 def test_skeleton_slice_end_to_end(tmp_path, runtime):
-    app = create_app(runtime=runtime, store=SpecStore(tmp_path), embed=True, complete=False)
+    app = create_app(runtime=runtime, store=SpecStore(tmp_path), complete=False)
     with TestClient(app) as client:
         assert client.post("/apply", json=CANVAS).json()["status"] == "applied"
 

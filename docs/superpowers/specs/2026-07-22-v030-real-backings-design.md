@@ -114,12 +114,21 @@ isolation is container-level (one backing set per env).
   description updated.
 - UI: delete `ui/src/lib/catalog.generated.ts`; drop its import+spread in
   `catalog.ts` (L10, L243); fix TopBar tooltip (L153). Remove
-  ec2/lambda/vpc/subnet/sg from palette + their bespoke components + the
-  IAM-pair machinery in `iam.ts` (these kinds are non-runnable decorations
-  post-MiniStack; keeping them would be false advertising). Edges stay as
-  plain reference/network edges.
-- `review_iam` → `review_stack` (see C3): general security review of the
-  stack (exposed ports, plaintext secrets, risky images), no IAM edges.
+  ec2/lambda/vpc/subnet/sg from palette + their bespoke components (non-
+  runnable decorations post-MiniStack; keeping them would be false
+  advertising).
+- **Access edges stay** (standing decision, 2026-06-21 design spec §IAM +
+  `fabric/nebula.py:41-42`): edges-with-permissions are the access-graph
+  model, generalized from the old ec2/lambda pairs to **workload→resource**
+  (service/batch/llm → s3/sqs/sns/dynamodb/rds). Modeled + AI-reviewed today,
+  explicitly "modeled, not enforced" in the UX; ENFORCEMENT compiles them to
+  Nebula overlay firewall rules via the preserved `sg_rules_to_firewall` when
+  M7 multi-Mac activates (single-host has no inter-host traffic to police).
+  `iam.ts` is generalized, not deleted.
+- `review_iam` → `review_stack` (see C3): reviews BOTH the access graph
+  (least-privilege / blast-radius on permission edges — the old review_iam
+  semantics, kept) AND config hygiene (exposed ports, plaintext secrets,
+  risky images).
 
 ### Tests (from the coverage map)
 

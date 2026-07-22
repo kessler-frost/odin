@@ -1,11 +1,11 @@
-"""Real AWS-compatible backing services replacing the MiniStack emulator.
+"""Real AWS-compatible backing services.
 
 s3/sqs/sns/dynamodb nodes become resources inside real backing containers —
 RustFS (s3), goaws (sqs+sns in one process, so SNS→SQS delivery works),
 dynalite (dynamodb) — one shared container per (env, backing), run through the
-same RuntimeDriver as every other workload. Drop-in for the Reconciler's
-`_aws` seam (provision/exists/deprovision) plus lifecycle powers the
-switchover task wires up: ensure_backing/gc/aws_env/facts/client.
+same RuntimeDriver as every other workload. The Reconciler's `_aws` seam:
+provision/exists/deprovision plus lifecycle (ensure_backing/gc/aws_env/facts)
+and a host-side boto3 `client` for tests.
 """
 from __future__ import annotations
 
@@ -17,17 +17,13 @@ import boto3
 from botocore.client import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
-from odin.runtime.colima import ContainerSpec
+from odin.runtime.colima import CONTAINER_HOST, ContainerSpec
 
 PROVISIONED = ("s3", "sqs", "sns", "dynamodb")
 ACCESS_KEY = "allfather"
 SECRET_KEY = "allfather-secret-key"
 REGION = "us-east-1"
 ACCOUNT = "000000000000"
-
-# Containers dial the host through Colima's host-gateway alias. Task 3 moves
-# CONTAINER_HOST here from odin.aws.embed; until then keep the literal local.
-CONTAINER_HOST = "host.docker.internal"
 
 READY_TIMEOUT = 120.0  # dynalite's npx fetch + first-run image pulls
 

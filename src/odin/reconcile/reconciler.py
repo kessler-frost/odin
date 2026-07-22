@@ -12,19 +12,18 @@ import asyncio
 import logging
 import time
 
-from odin.aws.embed import CONTAINER_HOST
-from odin.aws.provision import PROVISIONED
+from odin.aws.backings import PROVISIONED
 from odin.fabric.localhost import LocalhostFabric, Unresolved
 from odin.reconcile import assertions
 from odin.reconcile.actions import (
-    CreateMiniStackResource,
     NoOp,
+    ProvisionResource,
     RunContainer,
     StopContainer,
 )
 from odin.reconcile.plan import plan
 from odin.reconcile.probes import ProbeEngine
-from odin.runtime.colima import ContainerSpec
+from odin.runtime.colima import CONTAINER_HOST, ContainerSpec
 from odin.spec.models import ResourceDesired, Stack, World, WorldDelta
 
 log = logging.getLogger("odin.reconcile")
@@ -41,7 +40,6 @@ class Reconciler:
         ws=None,
         env: str = "default",
         scheduler=None,
-        aws_env=None,
         http_ok=assertions.http_ok,
         pg_ready=assertions.pg_ready,
         tcp_ok=assertions.tcp_open,
@@ -53,7 +51,6 @@ class Reconciler:
         self._rds = rds
         self._aws = aws
         self._scheduler = scheduler
-        self._aws_env = aws_env
         self._fabric = fabric or LocalhostFabric()
         self._ws = ws
         self._env = env
@@ -91,10 +88,15 @@ class Reconciler:
         world = self._store.current_world(self._env)
         for action in plan(stack, world):
             await self._execute(action, stack)
+        if self._aws is not None:  # stop backings no active kind needs anymore
+            await asyncio.to_thread(self._aws.gc, {r.kind for r in stack.resources})
 
     # ---- helpers ----
     def _res(self, stack: Stack, rid: str) -> ResourceDesired:
         return next(r for r in stack.resources if r.id == rid)
+
+    def _kind_of(self, stack: Stack, rid: str) -> str | None:
+        return next((r.kind for r in stack.resources if r.id == rid), None)
 
     def _creds(self, res: ResourceDesired) -> tuple[str, str]:
         user = res.fields["username"].value if "username" in res.fields else "app"
@@ -132,15 +134,24 @@ class Reconciler:
                 await self._observe_container(res)
             elif res.kind == "batch" and observed.phase == "running":
                 await self._observe_batch(res)
-            elif res.kind in PROVISIONED and observed.phase == "starting":
-                if await asyncio.to_thread(self._aws.exists, res.kind, res.id):
-                    await self._emit(res.id, res.kind, "healthy")
+            elif res.kind in PROVISIONED and observed.phase in ("starting", "healthy"):
+                await self._observe_provisioned(res, observed.phase)
+
+    async def _observe_provisioned(self, res: ResourceDesired, phase: str) -> None:
+        """s3/sqs/sns/dynamodb: healthy once the resource exists in its backing;
+        a healthy one whose backing lost it demotes to crashed (plan's existing
+        pending/crashed branch then re-provisions)."""
+        ok = await asyncio.to_thread(self._aws.exists, res.kind, res.id)
+        if phase == "starting" and ok:
+            facts = await asyncio.to_thread(self._aws.facts, res.kind, res.id)
+            await self._emit(res.id, res.kind, "healthy", facts=facts)
+        if phase == "healthy" and not ok:
+            await self._emit(res.id, res.kind, "crashed")
 
     async def _observe_rds(self, res: ResourceDesired) -> None:
         cname = self._rds.container_name(res.id)
         if self._rt.facts(cname).phase == "crashed":
-            # Clear MiniStack's stale record so the recreate boots a fresh DB
-            # (else create_db sees AlreadyExists and the DB never recovers).
+            # Clear the dead container so the recreate boots a fresh Postgres.
             await asyncio.to_thread(self._rds.delete_db, res.id)
             await self._emit(res.id, "rds", "crashed")
             return
@@ -192,20 +203,26 @@ class Reconciler:
 
     # ---- execute ----
     async def _execute(self, action, stack: Stack) -> None:
-        if isinstance(action, CreateMiniStackResource):
+        if isinstance(action, ProvisionResource):
             res = self._res(stack, action.id)
             if action.service == "rds":
                 user, pw = self._creds(res)
                 await asyncio.to_thread(self._rds.create_db, action.id, user, pw)
                 await self._emit(action.id, "rds", "starting")
-            else:  # control-plane AWS resource (s3/sqs/sns/dynamodb)
-                await asyncio.to_thread(self._aws.provision, action.service, action.id)
+            else:  # AWS-shaped resource in a shared backing (s3/sqs/sns/dynamodb)
+                # An sns→sqs canvas edge is a subscription: fan the topic out to
+                # those queues at provision time.
+                subs = tuple(
+                    e.dst for e in stack.edges
+                    if e.src == action.id and self._kind_of(stack, e.dst) == "sqs"
+                ) if action.service == "sns" else ()
+                await asyncio.to_thread(self._aws.provision, action.service, action.id, subs)
                 await self._emit(action.id, action.service, "starting")
         elif isinstance(action, RunContainer):
             await self._run_service(stack, action.id)
         elif isinstance(action, StopContainer):
             if action.kind == "rds":
-                self._rds.delete_db(action.id)  # clear MiniStack so re-apply re-boots
+                self._rds.delete_db(action.id)  # stop the DB container so re-apply re-boots
                 self._rt.stop(self._rds.container_name(action.id))
             elif action.kind in PROVISIONED:
                 await asyncio.to_thread(self._aws.deprovision, action.kind, action.id)
@@ -249,7 +266,7 @@ class Reconciler:
                     self._rt.stop(eid)
                     await self._emit(eid, "llm", "evicted")
         world = self._store.current_world(self._env)
-        env_vars: dict = dict(self._aws_env()) if self._aws_env is not None else {}
+        env_vars: dict = dict(self._aws.aws_env()) if self._aws is not None else {}
         if "env" in res.fields:
             env_vars.update(res.fields["env"].value)  # user env wins over injected AWS
         for ref in res.refs:
