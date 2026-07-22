@@ -56,6 +56,11 @@ def sns(sink: CaptureSink):
     return _client(sink, "sns")
 
 
+@pytest.fixture
+def sts(sink: CaptureSink):
+    return _client(sink, "sts")
+
+
 def split_url(url: str) -> tuple[str, dict[str, str]]:
     """path + query dict for classify(), preserving bare markers with no
     `=` (`?location`, `?uploads`, `?acl`, `?delete`) that `parse_qsl` drops

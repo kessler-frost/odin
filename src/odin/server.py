@@ -25,6 +25,7 @@ from odin.fabric.nebula import mesh_state
 from odin.gateway import DEFAULT_GATEWAY_PORT, GATEWAY_PORT_ENV
 from odin.gateway.app import GatewayState, create_gateway_app, serve_in_thread, stop_in_thread
 from odin.gateway.keys import KeyStore, Principal
+from odin.gateway.stores import SynthStores
 from odin.reconcile.reconciler import Reconciler
 from odin.runtime.colima import ColimaRuntime
 from odin.spec.models import Stack
@@ -94,6 +95,9 @@ def create_app(
     # (Stack, issued keys) -- never a cache that outlives an Apply.
     gateway_state = GatewayState()
     gateway_keystore = KeyStore(_store.root)
+    # The synthesized control-plane's tag/attribute/delete-marker stores
+    # (gateway/synth.py) -- unlike gateway_state, this must OUTLIVE a tick.
+    gateway_stores = SynthStores(_store.root)
     # port=0 (the test default) resolves to an ephemeral port; lifespan fills
     # this in with the ACTUAL bound port before any reconciler is made, so
     # BackingAws/`/health` never advertise the possibly-0 request instead.
@@ -127,7 +131,7 @@ def create_app(
             "reason": reason,
         })
 
-    gateway_app = create_gateway_app(gateway_state, gateway_keystore, on_deny)
+    gateway_app = create_gateway_app(gateway_state, gateway_keystore, gateway_stores, on_deny)
     gateway_server = None
     gateway_thread = None
 

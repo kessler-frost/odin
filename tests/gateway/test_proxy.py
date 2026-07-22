@@ -27,6 +27,7 @@ from odin.aws.backings import ACCESS_KEY as BACKING_ACCESS_KEY
 from odin.gateway.app import GatewayState, create_gateway_app, serve_in_thread, stop_in_thread
 from odin.gateway.keys import KeyStore
 from odin.gateway.policy import Statement
+from odin.gateway.stores import SynthStores
 from odin.server import create_app
 from odin.spec.store import SpecStore
 
@@ -89,6 +90,11 @@ def keystore(tmp_path: Path) -> KeyStore:
     return KeyStore(tmp_path)
 
 
+@pytest.fixture
+def stores(tmp_path: Path) -> SynthStores:
+    return SynthStores(tmp_path)
+
+
 def _issued_client(sink: CaptureSink, keystore: KeyStore, env: str, node_id: str, service: str, **extra):
     access_key, secret_key = keystore.issue(env, node_id)
     return boto3.client(
@@ -114,7 +120,7 @@ async def _drive(app, req) -> httpx.Response:
 # --- allowed: forward + s3 re-sign + pass-through for others --------------
 
 
-async def test_allowed_s3_get_object_forwards_and_resigns(sink, keystore):
+async def test_allowed_s3_get_object_forwards_and_resigns(sink, keystore, stores):
     s3 = _issued_client(sink, keystore, "default", "api", "s3", config=Config(signature_version="s3v4", s3={"addressing_style": "path"}))
     req = sink.call(lambda: s3.get_object(Bucket="uploads", Key="a.txt"))
 
@@ -122,7 +128,7 @@ async def test_allowed_s3_get_object_forwards_and_resigns(sink, keystore):
     state.update("default", {"api": [Statement(actions=("s3:GetObject",), resources=("uploads",))]}, {"s3": FAKE_PORT})
     echo = EchoBacking(body=b"payload")
     on_deny, events = _recording_on_deny()
-    app = create_gateway_app(state, keystore, on_deny, forward_client=httpx.AsyncClient(transport=httpx.ASGITransport(app=echo)))
+    app = create_gateway_app(state, keystore, stores, on_deny, forward_client=httpx.AsyncClient(transport=httpx.ASGITransport(app=echo)))
 
     resp = await _drive(app, req)
 
@@ -133,7 +139,7 @@ async def test_allowed_s3_get_object_forwards_and_resigns(sink, keystore):
     assert forwarded.headers["authorization"] != req.headers["Authorization"]
 
 
-async def test_allowed_s3_put_object_forwards_body_byte_identical(sink, keystore):
+async def test_allowed_s3_put_object_forwards_body_byte_identical(sink, keystore, stores):
     s3 = _issued_client(sink, keystore, "default", "api", "s3", config=Config(signature_version="s3v4", s3={"addressing_style": "path"}))
     req = sink.call(lambda: s3.put_object(Bucket="uploads", Key="a.txt", Body=b"payload-bytes-123"))
 
@@ -141,7 +147,7 @@ async def test_allowed_s3_put_object_forwards_body_byte_identical(sink, keystore
     state.update("default", {"api": [Statement(actions=("s3:PutObject",), resources=("uploads",))]}, {"s3": FAKE_PORT})
     echo = EchoBacking()
     on_deny, _events = _recording_on_deny()
-    app = create_gateway_app(state, keystore, on_deny, forward_client=httpx.AsyncClient(transport=httpx.ASGITransport(app=echo)))
+    app = create_gateway_app(state, keystore, stores, on_deny, forward_client=httpx.AsyncClient(transport=httpx.ASGITransport(app=echo)))
 
     resp = await _drive(app, req)
 
@@ -149,7 +155,7 @@ async def test_allowed_s3_put_object_forwards_body_byte_identical(sink, keystore
     assert echo.requests[0].body == b"payload-bytes-123"
 
 
-async def test_s3_head_object_preserves_upstream_content_length(sink, keystore):
+async def test_s3_head_object_preserves_upstream_content_length(sink, keystore, stores):
     s3 = _issued_client(sink, keystore, "default", "api", "s3", config=Config(signature_version="s3v4", s3={"addressing_style": "path"}))
     req = sink.call(lambda: s3.head_object(Bucket="uploads", Key="a.txt"))
 
@@ -157,7 +163,7 @@ async def test_s3_head_object_preserves_upstream_content_length(sink, keystore):
     state.update("default", {"api": [Statement(actions=("s3:GetObject",), resources=("uploads",))]}, {"s3": FAKE_PORT})
     echo = EchoBacking(body=b"seventeen-bytes!!")  # 17 bytes, deliberately not len(response body) since HEAD sends none
     on_deny, _events = _recording_on_deny()
-    app = create_gateway_app(state, keystore, on_deny, forward_client=httpx.AsyncClient(transport=httpx.ASGITransport(app=echo)))
+    app = create_gateway_app(state, keystore, stores, on_deny, forward_client=httpx.AsyncClient(transport=httpx.ASGITransport(app=echo)))
 
     resp = await _drive(app, req)
 
@@ -165,7 +171,7 @@ async def test_s3_head_object_preserves_upstream_content_length(sink, keystore):
     assert resp.headers["content-length"] == str(len(b"seventeen-bytes!!"))
 
 
-async def test_allowed_sqs_send_message_forwards_creds_pass_through(sink, keystore):
+async def test_allowed_sqs_send_message_forwards_creds_pass_through(sink, keystore, stores):
     sqs = _issued_client(sink, keystore, "default", "worker", "sqs")
     req = sink.call(lambda: sqs.send_message(QueueUrl=f"{sink.endpoint}/000000000000/jobs", MessageBody="hi"))
 
@@ -173,7 +179,7 @@ async def test_allowed_sqs_send_message_forwards_creds_pass_through(sink, keysto
     state.update("default", {"worker": [Statement(actions=("sqs:SendMessage",), resources=("jobs",))]}, {"sqs": FAKE_PORT})
     echo = EchoBacking()
     on_deny, _events = _recording_on_deny()
-    app = create_gateway_app(state, keystore, on_deny, forward_client=httpx.AsyncClient(transport=httpx.ASGITransport(app=echo)))
+    app = create_gateway_app(state, keystore, stores, on_deny, forward_client=httpx.AsyncClient(transport=httpx.ASGITransport(app=echo)))
 
     resp = await _drive(app, req)
 
@@ -186,14 +192,14 @@ async def test_allowed_sqs_send_message_forwards_creds_pass_through(sink, keysto
 # --- denies: protocol-correct shapes + on_deny fired -----------------------
 
 
-async def test_s3_denied_action_returns_bare_error_xml(sink, keystore):
+async def test_s3_denied_action_returns_bare_error_xml(sink, keystore, stores):
     s3 = _issued_client(sink, keystore, "default", "api", "s3", config=Config(signature_version="s3v4", s3={"addressing_style": "path"}))
     req = sink.call(lambda: s3.get_object(Bucket="uploads", Key="a.txt"))
 
     state = GatewayState()
     state.update("default", {}, {"s3": FAKE_PORT})  # no statements -> default-deny
     on_deny, events = _recording_on_deny()
-    app = create_gateway_app(state, keystore, on_deny)
+    app = create_gateway_app(state, keystore, stores, on_deny)
 
     resp = await _drive(app, req)
 
@@ -204,14 +210,14 @@ async def test_s3_denied_action_returns_bare_error_xml(sink, keystore):
     assert principal.node_id == "api" and action == "s3:GetObject" and resource == "uploads" and reason == "denied"
 
 
-async def test_dynamodb_denied_action_returns_json_access_denied_exception(sink, keystore):
+async def test_dynamodb_denied_action_returns_json_access_denied_exception(sink, keystore, stores):
     dynamodb = _issued_client(sink, keystore, "default", "worker", "dynamodb")
     req = sink.call(lambda: dynamodb.get_item(TableName="orders", Key={"id": {"S": "1"}}))
 
     state = GatewayState()
     state.update("default", {}, {"dynamodb": FAKE_PORT})
     on_deny, events = _recording_on_deny()
-    app = create_gateway_app(state, keystore, on_deny)
+    app = create_gateway_app(state, keystore, stores, on_deny)
 
     resp = await _drive(app, req)
 
@@ -222,14 +228,14 @@ async def test_dynamodb_denied_action_returns_json_access_denied_exception(sink,
     assert action == "dynamodb:GetItem" and resource == "orders" and reason == "denied"
 
 
-async def test_sqs_denied_action_returns_json_access_denied_exception(sink, keystore):
+async def test_sqs_denied_action_returns_json_access_denied_exception(sink, keystore, stores):
     sqs = _issued_client(sink, keystore, "default", "worker", "sqs")
     req = sink.call(lambda: sqs.send_message(QueueUrl=f"{sink.endpoint}/000000000000/jobs", MessageBody="hi"))
 
     state = GatewayState()
     state.update("default", {}, {"sqs": FAKE_PORT})
     on_deny, events = _recording_on_deny()
-    app = create_gateway_app(state, keystore, on_deny)
+    app = create_gateway_app(state, keystore, stores, on_deny)
 
     resp = await _drive(app, req)
 
@@ -238,14 +244,14 @@ async def test_sqs_denied_action_returns_json_access_denied_exception(sink, keys
     assert events[0][3] == "denied"
 
 
-async def test_sns_denied_action_returns_wrapped_error_response_xml(sink, keystore):
+async def test_sns_denied_action_returns_wrapped_error_response_xml(sink, keystore, stores):
     sns = _issued_client(sink, keystore, "default", "worker", "sns")
     req = sink.call(lambda: sns.publish(TopicArn="arn:aws:sns:us-east-1:000000000000:alerts", Message="hi"))
 
     state = GatewayState()
     state.update("default", {}, {"sns": FAKE_PORT})
     on_deny, events = _recording_on_deny()
-    app = create_gateway_app(state, keystore, on_deny)
+    app = create_gateway_app(state, keystore, stores, on_deny)
 
     resp = await _drive(app, req)
 
@@ -254,37 +260,45 @@ async def test_sns_denied_action_returns_wrapped_error_response_xml(sink, keysto
     assert events[0][1] == "sns:Publish" and events[0][2] == "alerts"
 
 
-async def test_sqs_get_queue_url_unmappable_denies_cleanly(sink, keystore):
+async def test_sqs_get_queue_url_now_classifies_but_still_denied_by_default(sink, keystore, stores):
+    # S1 (synth.py): GetQueueUrl now resolves via QueueName, so it reaches
+    # evaluate() instead of an "unmappable-action" deny -- but no edge grants
+    # workers this verb in v1, so it's STILL denied, just via ordinary
+    # default-deny (see classify.py's module docstring).
     sqs = _issued_client(sink, keystore, "default", "worker", "sqs")
     req = sink.call(lambda: sqs.get_queue_url(QueueName="jobs"))
 
     state = GatewayState()
-    state.update("default", {"worker": [Statement(actions=("*",), resources=("*",))]}, {"sqs": FAKE_PORT})
+    state.update("default", {}, {"sqs": FAKE_PORT})  # no statements -> default-deny
     on_deny, events = _recording_on_deny()
-    app = create_gateway_app(state, keystore, on_deny)
-
-    resp = await _drive(app, req)
-
-    assert resp.status_code == 403  # broad allow doesn't matter -- classify() itself returns None
-    assert events[0][3] == "unmappable-action"
-
-
-async def test_sns_create_topic_unmappable_denies_cleanly(sink, keystore):
-    sns = _issued_client(sink, keystore, "default", "worker", "sns")
-    req = sink.call(lambda: sns.create_topic(Name="alerts"))
-
-    state = GatewayState()
-    state.update("default", {"worker": [Statement(actions=("*",), resources=("*",))]}, {"sns": FAKE_PORT})
-    on_deny, events = _recording_on_deny()
-    app = create_gateway_app(state, keystore, on_deny)
+    app = create_gateway_app(state, keystore, stores, on_deny)
 
     resp = await _drive(app, req)
 
     assert resp.status_code == 403
-    assert events[0][3] == "unmappable-action"
+    ((principal, action, resource, reason),) = events
+    assert action == "sqs:GetQueueUrl" and resource == "jobs" and reason == "denied"
 
 
-async def test_unknown_access_key_denies_401_invalid_client_token_id(sink, keystore, tmp_path):
+async def test_sns_create_topic_now_classifies_but_still_denied_by_default(sink, keystore, stores):
+    # Same shift for CreateTopic (resolves via `Name`) -- still denied, now
+    # for the ordinary reason.
+    sns = _issued_client(sink, keystore, "default", "worker", "sns")
+    req = sink.call(lambda: sns.create_topic(Name="alerts"))
+
+    state = GatewayState()
+    state.update("default", {}, {"sns": FAKE_PORT})
+    on_deny, events = _recording_on_deny()
+    app = create_gateway_app(state, keystore, stores, on_deny)
+
+    resp = await _drive(app, req)
+
+    assert resp.status_code == 403
+    ((principal, action, resource, reason),) = events
+    assert action == "sns:CreateTopic" and resource == "alerts" and reason == "denied"
+
+
+async def test_unknown_access_key_denies_401_invalid_client_token_id(sink, keystore, stores, tmp_path):
     other = KeyStore(tmp_path / "other-keystore")  # a key this gateway's keystore never issued
     stray_key, stray_secret = other.issue("default", "ghost")
     s3 = boto3.client(
@@ -297,7 +311,7 @@ async def test_unknown_access_key_denies_401_invalid_client_token_id(sink, keyst
     state = GatewayState()
     state.update("default", {}, {"s3": FAKE_PORT})
     on_deny, events = _recording_on_deny()
-    app = create_gateway_app(state, keystore, on_deny)
+    app = create_gateway_app(state, keystore, stores, on_deny)
 
     resp = await _drive(app, req)
 
@@ -307,7 +321,7 @@ async def test_unknown_access_key_denies_401_invalid_client_token_id(sink, keyst
     assert principal is None and reason == "unknown-key"
 
 
-async def test_bad_signature_denies_401_signature_does_not_match(sink, keystore):
+async def test_bad_signature_denies_401_signature_does_not_match(sink, keystore, stores):
     s3 = _issued_client(sink, keystore, "default", "api", "s3", config=Config(signature_version="s3v4", s3={"addressing_style": "path"}))
     req = sink.call(lambda: s3.get_object(Bucket="uploads", Key="a.txt"))
     tampered_headers = dict(req.headers)
@@ -316,7 +330,7 @@ async def test_bad_signature_denies_401_signature_does_not_match(sink, keystore)
     state = GatewayState()
     state.update("default", {"api": [Statement(actions=("s3:GetObject",), resources=("uploads",))]}, {"s3": FAKE_PORT})
     on_deny, events = _recording_on_deny()
-    app = create_gateway_app(state, keystore, on_deny)
+    app = create_gateway_app(state, keystore, stores, on_deny)
 
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app)) as client:
         resp = await client.request(req.method, req.url, headers=tampered_headers, content=req.body)
@@ -327,14 +341,73 @@ async def test_bad_signature_denies_401_signature_does_not_match(sink, keystore)
     assert principal is not None and principal.node_id == "api" and reason == "bad-signature"
 
 
-async def test_backing_unavailable_returns_503(sink, keystore):
+# --- S1: synthesized control-plane, driven through the FULL app.py pipeline
+# (tests/gateway/test_synth.py covers synth.py's functions directly; these
+# prove the app.py wiring around them -- content-length after a body
+# rewrite, GetQueueAttributes never reaching the backing, STS bypassing
+# classify/evaluate entirely). --------------------------------------------
+
+
+async def test_sqs_create_queue_rewrites_host_and_fixes_content_length(sink, keystore, stores):
+    sqs = _issued_client(sink, keystore, "default", "worker", "sqs")
+    req = sink.call(lambda: sqs.create_queue(QueueName="jobs"))
+
+    state = GatewayState()
+    state.update("default", {"worker": [Statement(actions=("sqs:CreateQueue",), resources=("jobs",))]}, {"sqs": FAKE_PORT})
+    echo = EchoBacking(body=b'{"QueueUrl": "http://us-east-1.goaws.com:4100/000000000000/jobs"}')
+    on_deny, events = _recording_on_deny()
+    app = create_gateway_app(state, keystore, stores, on_deny, forward_client=httpx.AsyncClient(transport=httpx.ASGITransport(app=echo)))
+
+    resp = await _drive(app, req)
+
+    assert resp.status_code == 200
+    assert events == []
+    assert resp.json()["QueueUrl"] == f"http://{req.headers['Host']}/000000000000/jobs"
+    assert resp.headers["content-length"] == str(len(resp.content))  # was rewritten -- must not be goaws's stale length
+
+
+async def test_sqs_get_queue_attributes_never_reaches_backing(sink, keystore, stores):
+    sqs = _issued_client(sink, keystore, "default", "worker", "sqs")
+    req = sink.call(
+        lambda: sqs.get_queue_attributes(QueueUrl=f"{sink.endpoint}/000000000000/jobs", AttributeNames=["All"])
+    )
+
+    state = GatewayState()
+    state.update("default", {"worker": [Statement(actions=("sqs:GetQueueAttributes",), resources=("jobs",))]}, {"sqs": FAKE_PORT})
+    echo = EchoBacking(body=b'{"Attributes": {}}')
+    on_deny, events = _recording_on_deny()
+    app = create_gateway_app(state, keystore, stores, on_deny, forward_client=httpx.AsyncClient(transport=httpx.ASGITransport(app=echo)))
+
+    resp = await _drive(app, req)
+
+    assert resp.status_code == 200
+    assert echo.requests == []  # pure synth answer -- goaws never sees this request
+
+
+async def test_sts_get_caller_identity_answered_for_any_verified_principal(sink, keystore, stores):
+    sts = _issued_client(sink, keystore, "default", "worker", "sts")
+    req = sink.call(lambda: sts.get_caller_identity())
+
+    state = GatewayState()
+    state.update("default", {}, {})  # no statements, no backings registered at all
+    on_deny, events = _recording_on_deny()
+    app = create_gateway_app(state, keystore, stores, on_deny)
+
+    resp = await _drive(app, req)
+
+    assert resp.status_code == 200
+    assert events == []
+    assert "<Account>000000000000</Account>" in resp.text
+
+
+async def test_backing_unavailable_returns_503(sink, keystore, stores):
     s3 = _issued_client(sink, keystore, "default", "api", "s3", config=Config(signature_version="s3v4", s3={"addressing_style": "path"}))
     req = sink.call(lambda: s3.get_object(Bucket="uploads", Key="a.txt"))
 
     state = GatewayState()
     state.update("default", {"api": [Statement(actions=("s3:GetObject",), resources=("uploads",))]}, {})  # no s3 backing registered
     on_deny, events = _recording_on_deny()
-    app = create_gateway_app(state, keystore, on_deny)
+    app = create_gateway_app(state, keystore, stores, on_deny)
 
     resp = await _drive(app, req)
 
@@ -354,7 +427,7 @@ def test_real_boto3_client_raises_access_denied_client_error(tmp_path):
     async def on_deny(principal, action, resource, reason) -> None:
         pass
 
-    app = create_gateway_app(state, store, on_deny)
+    app = create_gateway_app(state, store, SynthStores(tmp_path), on_deny)
     server, thread, port = serve_in_thread(app, port=0)
     try:
         client = boto3.client(
@@ -377,7 +450,7 @@ def test_real_boto3_client_raises_invalid_client_token_id_for_unknown_key(tmp_pa
     async def on_deny(principal, action, resource, reason) -> None:
         pass
 
-    app = create_gateway_app(state, store, on_deny)
+    app = create_gateway_app(state, store, SynthStores(tmp_path), on_deny)
     server, thread, port = serve_in_thread(app, port=0)
     try:
         client = boto3.client(

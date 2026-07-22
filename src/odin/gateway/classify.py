@@ -10,6 +10,21 @@ Ported from the research prototype
 Returns None for anything unmappable (unknown S3 subresource, CopyObject,
 a control-plane call with no resource identifier yet) -- the caller denies
 closed-world rather than guessing.
+
+CREATE/NAME-CARRYING PATHS (S-plan task S1): SQS CreateQueue/GetQueueUrl and
+SNS CreateTopic don't carry the QueueUrl/TopicArn the addendum's original
+extraction rule keyed off of (they're discovering/creating the identifier,
+not using it) -- resolved via QueueName/Name instead, so the operator
+principal (S2, tofu) and the gateway's own synth post-processing
+(synth.py's CreateQueue/CreateTopic hooks) can reach evaluate()/forward at
+all. Workload-principal denial semantics are unaffected: no edge grants
+create verbs to workers in v1, so these still deny -- just via ordinary
+default-deny (`reason="denied"`) rather than `unmappable-action`. Tag-CRUD
+reads/writes (SNS/DynamoDB Tag*/List*Tags carry `ResourceArn` instead of
+Topic/TableName) resolve the same way. SNS subscription-scoped calls
+(GetSubscriptionAttributes/Unsubscribe) carry `SubscriptionArn`, not
+`TopicArn` -- the topic name lives in the ARN's second-to-last segment
+(`...:<topic>:<subscription-id>`), extracted the same bare-label way.
 """
 from __future__ import annotations
 
@@ -80,15 +95,24 @@ def _classify_target(service: str, lower_headers: dict[str, str], body: bytes) -
     return f"{service}:{op}", resource
 
 
+def _first_str(payload: dict[str, object], *keys: str) -> str | None:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
 def _target_resource(service: str, payload: dict[str, object]) -> str | None:
     if service == "dynamodb":
-        table = payload.get("TableName")
-        return table if isinstance(table, str) and table else None
-    queue_url = payload.get("QueueUrl")
-    if not isinstance(queue_url, str) or not queue_url:
-        return None
-    name = queue_url.rstrip("/").rsplit("/", 1)[-1]
-    return name or None
+        resource_arn = _first_str(payload, "ResourceArn")
+        if resource_arn:
+            return resource_arn.rsplit("/", 1)[-1] or None
+        return _first_str(payload, "TableName")
+    queue_url = _first_str(payload, "QueueUrl")
+    if queue_url:
+        return queue_url.rstrip("/").rsplit("/", 1)[-1] or None
+    return _first_str(payload, "QueueName")
 
 
 def _classify_sns(body: bytes) -> tuple[str, str] | None:
@@ -97,13 +121,23 @@ def _classify_sns(body: bytes) -> tuple[str, str] | None:
     except UnicodeDecodeError:
         return None
     action_name = params.get("Action")
-    topic_arn = params.get("TopicArn")
-    if not action_name or not topic_arn:
+    if not action_name:
         return None
-    resource = topic_arn.rsplit(":", 1)[-1]
-    if not resource:
+    resource = _sns_resource(action_name, params)
+    return (f"sns:{action_name}", resource) if resource else None
+
+
+def _sns_resource(action_name: str, params: dict[str, str]) -> str | None:
+    if action_name == "CreateTopic":
+        return params.get("Name") or None
+    arn = params.get("TopicArn") or params.get("ResourceArn")
+    if arn:
+        return arn.rsplit(":", 1)[-1] or None
+    subscription_arn = params.get("SubscriptionArn")
+    if not subscription_arn:
         return None
-    return f"sns:{action_name}", resource
+    segments = subscription_arn.split(":")
+    return segments[-2] if len(segments) >= 2 else None
 
 
 def _classify_s3(

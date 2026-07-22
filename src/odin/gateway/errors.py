@@ -55,9 +55,13 @@ def _sns_xml(code: str, message: str) -> str:
     )
 
 
-def _json_body(service: str, code: str, message: str) -> str:
+def _json_body_raw(service: str, code: str, message: str) -> str:
     prefix = _JSON_TYPE_PREFIX.get(service, "")
-    return json.dumps({"__type": f"{prefix}{code}Exception", "message": message})
+    return json.dumps({"__type": f"{prefix}{code}", "message": message})
+
+
+def _json_body(service: str, code: str, message: str) -> str:
+    return _json_body_raw(service, f"{code}Exception", message)
 
 
 def _respond(service: str, code: str, message: str) -> Response:
@@ -88,3 +92,16 @@ def service_unavailable(service: str) -> Response:
     "dead backing" failure mode: fail closed with a distinct error rather
     than hang or silently drop the request."""
     return _respond(service, "ServiceUnavailable", "The backing service is not currently available")
+
+
+def synth_error(service: str, code: str, message: str, status: int) -> Response:
+    """A synth-authored error (gateway.synth) with an explicit status and
+    the EXACT wire code -- unlike `access_denied`/`auth_error`'s fixed
+    status+`...Exception` convention, synth errors must match botocore's
+    exact modeled shape/code, which varies per exception: SQS's
+    `QueueDoesNotExist` carries no suffix at all, while SNS's subscription
+    NotFound uses that shape's explicit `code` override, `NotFound` (both
+    verified against botocore's own parser, not guessed at)."""
+    if service == "sns":
+        return Response(_sns_xml(code, message), status_code=status, media_type="text/xml")
+    return Response(_json_body_raw(service, code, message), status_code=status, media_type="application/x-amz-json-1.0")

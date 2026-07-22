@@ -1,0 +1,394 @@
+"""The gateway's synthesized control-plane -- the AWS calls the substitutes
+can't answer, per research §§3-5 (docs/superpowers/research/research-tofu-provider.md,
+build-order items 2-5): STS identity, tag CRUD, SNS topic attributes, SQS/SNS
+delete-confirmation fidelity, and the CreateQueue host rewrite.
+
+Every response shape below was verified by round-tripping candidate bytes
+through botocore's OWN protocol parser against the real service models
+(sqs/dynamodb=JSON, sns/sts=query-XML) -- not guessed at. The tag-CRUD and
+SNS-attribute logic ports the research prototype's `proxy.py` gap-filler
+(validated by a real `tofu apply` -> zero-drift `plan` -> `destroy`), with
+two deliberate improvements beyond it: SNS tags are a REAL store here (the
+prototype's `ListTagsForResource`/`TagResource`/`UntagResource` were no-op
+stubs -- always-empty reads, discarded writes), and DynamoDB gains the same
+tag store (the prototype had none for dynamodb at all -- research's own
+table still lists dynamodb tags as "⚠ drift"). Both gaps are closed here
+because the brief's ask is a REAL per-env store for all three services, not
+just sqs/sns.
+
+Three call shapes, dispatched by `app.py`:
+  - `get_caller_identity` -- STS, handled OUTSIDE classify()/evaluate()
+    entirely (verify() is the only gate: GetCallerIdentity isn't scoped to
+    any canvas resource, so there's no edge-compiled statement that could
+    ever grant/deny it -- matching real AWS, where it needs no IAM policy).
+  - `pure_answer` -- PURE_ACTIONS never reach a backing (goaws/dynalite lack
+    or mishandle them entirely): tag CRUD, SNS Get/SetTopicAttributes, SQS
+    GetQueueAttributes (always synth-owned -- see its docstring for why).
+    Also covers the one CONDITIONAL action, SNS GetSubscriptionAttributes:
+    returns None (meaning "not synth-owned for THIS call, forward normally")
+    unless the subscription was already Unsubscribed.
+  - `postprocess` -- POSTPROCESS_ACTIONS forward for real (the create/delete
+    must actually happen in goaws/dynalite) but the gateway also observes or
+    reshapes the response: CreateQueue's host rewrite + attribute/tag
+    seeding, CreateTopic's attribute/tag seeding, DeleteQueue/Unsubscribe's
+    delete markers, CreateTable's tag seeding (dynalite accepts-but-drops
+    tags on create -- the exact drift research documents).
+
+Called ONLY after evaluate() allows the request (app.py's routing order:
+verify -> scope -> classify -> evaluate -> synth -> forward) -- a synth
+answer is never a way around policy; STS is the sole, deliberate exception,
+justified above.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+from collections.abc import Callable
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
+
+from starlette.responses import Response
+
+from odin.aws.backings import ACCOUNT, REGION
+from odin.gateway import errors
+from odin.gateway.keys import Principal
+from odin.gateway.stores import SynthStores
+
+_SNS_NS = "http://sns.amazonaws.com/doc/2010-03-31/"
+_STS_NS = "https://sts.amazonaws.com/doc/2011-06-15/"
+
+# The gateway must serve deleted-queue attributes for a short window after
+# DeleteQueue rather than 400 immediately -- research's "one unresolved
+# edge": swapping the error code alone still fails the provider's delete
+# waiter, because it expects the transitional "still readable, then gone"
+# shape real AWS has. Not real AWS's ~60s (no test should sleep that long);
+# just long enough that a caller polling immediately after delete still
+# briefly sees the queue before it goes to QueueDoesNotExist.
+QUEUE_DELETE_GRACE_SECONDS = 2.0
+
+_TOPIC_ATTRIBUTE_DEFAULTS = {
+    "SubscriptionsConfirmed": "0",
+    "SubscriptionsPending": "0",
+    "SubscriptionsDeleted": "0",
+    "DisplayName": "",
+    "EffectiveDeliveryPolicy": json.dumps({"http": {"defaultHealthyRetryPolicy": {"numRetries": 3}}}),
+    "Policy": json.dumps({"Version": "2008-10-17", "Id": "__default_policy_ID", "Statement": []}),
+}
+
+
+def account_for_env(env: str) -> str:
+    """A stable 12-digit account id per environment (ported from the
+    deleted MiniStack-era `account_for_env`). Used ONLY for STS's `Account`
+    field for now -- the ARNs synth constructs elsewhere (QueueArn, topic
+    Owner) still use the fixed `backings.ACCOUNT`, matching what the rest of
+    the system already bakes into QUEUE_URL/TOPIC_ARN facts. Unifying the
+    two is deferred until the provider's `skip_requesting_account_id` flag
+    actually gets dropped (S-plan: "keep flags for now")."""
+    if env == "default":
+        return ACCOUNT
+    digest = hashlib.sha256(env.encode()).hexdigest()
+    return str(int(digest, 16) % 10**12).zfill(12)
+
+
+def get_caller_identity(env: str, principal: Principal) -> Response:
+    account = account_for_env(env)
+    arn = f"arn:aws:iam::{account}:user/{principal.node_id}"
+    xml = (
+        f'<GetCallerIdentityResponse xmlns="{_STS_NS}"><GetCallerIdentityResult>'
+        f"<UserId>{principal.node_id}</UserId><Account>{account}</Account><Arn>{arn}</Arn>"
+        f"</GetCallerIdentityResult>{_response_metadata_xml()}</GetCallerIdentityResponse>"
+    )
+    return Response(xml, media_type="text/xml")
+
+
+# --- shared wire-format helpers ---------------------------------------------
+
+
+def _response_metadata_xml() -> str:
+    return "<ResponseMetadata><RequestId>00000000-0000-0000-0000-000000000000</RequestId></ResponseMetadata>"
+
+
+def _sns_result_xml(op: str, result_xml: str = "") -> str:
+    return f'<{op}Response xmlns="{_SNS_NS}"><{op}Result>{result_xml}</{op}Result>{_response_metadata_xml()}</{op}Response>'
+
+
+def _parse_map(params: dict[str, str], prefix: str) -> dict[str, str]:
+    """`prefix.entry.N.key`/`prefix.entry.N.value` -> a flat dict (AWS's
+    query-protocol Map<string,string> serialization, e.g. SNS CreateTopic's
+    `Attributes` param)."""
+    indexed: dict[int, dict[str, str]] = {}
+    for param_key, value in params.items():
+        if not param_key.startswith(f"{prefix}.entry."):
+            continue
+        _prefix, _entry, index, field = param_key.split(".", 3)
+        indexed.setdefault(int(index), {})[field] = value
+    return {item["key"]: item["value"] for item in indexed.values()}
+
+
+def _parse_struct_list(params: dict[str, str], prefix: str) -> list[dict[str, str]]:
+    """`prefix.member.N.Field` -> a list of dicts (AWS's query-protocol
+    List<Structure> serialization, e.g. SNS's `Tags` param)."""
+    indexed: dict[int, dict[str, str]] = {}
+    for param_key, value in params.items():
+        if not param_key.startswith(f"{prefix}.member."):
+            continue
+        _prefix, _member, index, field = param_key.split(".", 3)
+        indexed.setdefault(int(index), {})[field] = value
+    return [indexed[i] for i in sorted(indexed)]
+
+
+def _parse_scalar_list(params: dict[str, str], prefix: str) -> list[str]:
+    """`prefix.member.N` -> a list of scalars (AWS's query-protocol
+    List<String> serialization, e.g. SNS's `TagKeys` param)."""
+    indexed: dict[int, str] = {}
+    for param_key, value in params.items():
+        if not param_key.startswith(f"{prefix}.member."):
+            continue
+        indexed[int(param_key.rsplit(".", 1)[-1])] = value
+    return [indexed[i] for i in sorted(indexed)]
+
+
+def _tags_from_structs(items: list[dict[str, str]]) -> dict[str, str]:
+    return {item["Key"]: item["Value"] for item in items}
+
+
+def _structs_from_tags(tags: dict[str, str]) -> list[dict[str, str]]:
+    return [{"Key": key, "Value": value} for key, value in tags.items()]
+
+
+def _sns_tag_members_xml(tags: dict[str, str]) -> str:
+    return "".join(f"<member><Key>{key}</Key><Value>{value}</Value></member>" for key, value in tags.items())
+
+
+def _sns_attribute_entries_xml(attributes: dict[str, str]) -> str:
+    return "".join(f"<entry><key>{key}</key><value>{value}</value></entry>" for key, value in attributes.items())
+
+
+def _tags_key(service: str, resource: str) -> str:
+    return f"{service}:{resource}"
+
+
+def _rewrite_host(url: str, host: str) -> str:
+    if not url or not host:
+        return url
+    return urlunsplit(urlsplit(url)._replace(netloc=host))
+
+
+# --- pure answers: SQS -------------------------------------------------------
+
+
+def _sqs_list_tags(resource: str, env: str, body: bytes, stores: SynthStores, now: float) -> Response:
+    tags = stores.tags.get(env, _tags_key("sqs", resource), {})
+    return Response(json.dumps({"Tags": tags}), media_type="application/x-amz-json-1.0")
+
+
+def _sqs_tag_queue(resource: str, env: str, body: bytes, stores: SynthStores, now: float) -> Response:
+    payload = json.loads(body or b"{}")
+    tags = {**stores.tags.get(env, _tags_key("sqs", resource), {}), **payload.get("Tags", {})}
+    stores.tags.set(env, _tags_key("sqs", resource), tags)
+    return Response("{}", media_type="application/x-amz-json-1.0")
+
+
+def _sqs_untag_queue(resource: str, env: str, body: bytes, stores: SynthStores, now: float) -> Response:
+    payload = json.loads(body or b"{}")
+    tags = dict(stores.tags.get(env, _tags_key("sqs", resource), {}))
+    for key in payload.get("TagKeys", []):
+        tags.pop(key, None)
+    stores.tags.set(env, _tags_key("sqs", resource), tags)
+    return Response("{}", media_type="application/x-amz-json-1.0")
+
+
+def _sqs_get_queue_attributes(resource: str, env: str, body: bytes, stores: SynthStores, now: float) -> Response:
+    """Always synth-owned, never forwarded (research build-order item 5/6,
+    folded together here): goaws's own answer converges slowly (9 polls over
+    ~31s) and, once DeleteQueue has run, goaws no longer HAS the queue to
+    ask at all -- so the gateway needs its own attribute store regardless,
+    and using it for the live case too is what makes the create-time waiter
+    converge on the first poll (research §6)."""
+    payload = json.loads(body or b"{}")
+    state = stores.sqs_queues.get(env, resource, {"attributes": {}, "deleted_at": None})
+    deleted_at = state.get("deleted_at")
+    if deleted_at is not None and now - deleted_at > QUEUE_DELETE_GRACE_SECONDS:
+        return errors.synth_error("sqs", "QueueDoesNotExist", "The specified queue does not exist.", 400)
+    requested = payload.get("AttributeNames") or []
+    attributes = state.get("attributes", {})
+    if requested and "All" not in requested:
+        attributes = {k: v for k, v in attributes.items() if k in requested}
+    return Response(json.dumps({"Attributes": attributes}), media_type="application/x-amz-json-1.0")
+
+
+# --- pure answers: SNS -------------------------------------------------------
+
+
+def _sns_get_topic_attributes(resource: str, env: str, body: bytes, stores: SynthStores, now: float) -> Response:
+    params = dict(parse_qsl(body.decode("utf-8")))
+    topic_arn = params.get("TopicArn", "")
+    stored = stores.sns_topics.get(env, resource, {})
+    attributes = {"TopicArn": topic_arn, "Owner": ACCOUNT, **_TOPIC_ATTRIBUTE_DEFAULTS, **stored}
+    result = f"<Attributes>{_sns_attribute_entries_xml(attributes)}</Attributes>"
+    return Response(_sns_result_xml("GetTopicAttributes", result), media_type="text/xml")
+
+
+def _sns_set_topic_attributes(resource: str, env: str, body: bytes, stores: SynthStores, now: float) -> Response:
+    params = dict(parse_qsl(body.decode("utf-8")))
+    stored = dict(stores.sns_topics.get(env, resource, {}))
+    stored[params.get("AttributeName", "")] = params.get("AttributeValue", "")
+    stores.sns_topics.set(env, resource, stored)
+    return Response(_sns_result_xml("SetTopicAttributes"), media_type="text/xml")
+
+
+def _sns_list_tags(resource: str, env: str, body: bytes, stores: SynthStores, now: float) -> Response:
+    tags = stores.tags.get(env, _tags_key("sns", resource), {})
+    result = f"<Tags>{_sns_tag_members_xml(tags)}</Tags>"
+    return Response(_sns_result_xml("ListTagsForResource", result), media_type="text/xml")
+
+
+def _sns_tag_resource(resource: str, env: str, body: bytes, stores: SynthStores, now: float) -> Response:
+    params = dict(parse_qsl(body.decode("utf-8")))
+    new_tags = _tags_from_structs(_parse_struct_list(params, "Tags"))
+    tags = {**stores.tags.get(env, _tags_key("sns", resource), {}), **new_tags}
+    stores.tags.set(env, _tags_key("sns", resource), tags)
+    return Response(_sns_result_xml("TagResource"), media_type="text/xml")
+
+
+def _sns_untag_resource(resource: str, env: str, body: bytes, stores: SynthStores, now: float) -> Response:
+    params = dict(parse_qsl(body.decode("utf-8")))
+    keys_to_remove = _parse_scalar_list(params, "TagKeys")
+    tags = dict(stores.tags.get(env, _tags_key("sns", resource), {}))
+    for key in keys_to_remove:
+        tags.pop(key, None)
+    stores.tags.set(env, _tags_key("sns", resource), tags)
+    return Response(_sns_result_xml("UntagResource"), media_type="text/xml")
+
+
+def _sns_get_subscription_attributes(resource: str, env: str, body: bytes, stores: SynthStores, now: float) -> Response | None:
+    """CONDITIONAL: only synth-owned once the subscription is gone (research:
+    the SNS case needed no transitional grace window, unlike SQS -- "fully
+    solved" by an immediate NotFound). Live subscriptions fall through
+    (returns None) to a normal forward -- goaws answers those for real."""
+    params = dict(parse_qsl(body.decode("utf-8")))
+    subscription_arn = params.get("SubscriptionArn", "")
+    if stores.sns_subscriptions.get(env, subscription_arn) is None:
+        return None
+    return errors.synth_error("sns", "NotFound", "Subscription does not exist", 404)
+
+
+# --- pure answers: DynamoDB ---------------------------------------------------
+
+
+def _ddb_list_tags(resource: str, env: str, body: bytes, stores: SynthStores, now: float) -> Response:
+    tags = stores.tags.get(env, _tags_key("dynamodb", resource), {})
+    return Response(json.dumps({"Tags": _structs_from_tags(tags)}), media_type="application/x-amz-json-1.0")
+
+
+def _ddb_tag_resource(resource: str, env: str, body: bytes, stores: SynthStores, now: float) -> Response:
+    payload = json.loads(body or b"{}")
+    new_tags = _tags_from_structs(payload.get("Tags", []))
+    tags = {**stores.tags.get(env, _tags_key("dynamodb", resource), {}), **new_tags}
+    stores.tags.set(env, _tags_key("dynamodb", resource), tags)
+    return Response("{}", media_type="application/x-amz-json-1.0")
+
+
+def _ddb_untag_resource(resource: str, env: str, body: bytes, stores: SynthStores, now: float) -> Response:
+    payload = json.loads(body or b"{}")
+    tags = dict(stores.tags.get(env, _tags_key("dynamodb", resource), {}))
+    for key in payload.get("TagKeys", []):
+        tags.pop(key, None)
+    stores.tags.set(env, _tags_key("dynamodb", resource), tags)
+    return Response("{}", media_type="application/x-amz-json-1.0")
+
+
+_PureHandler = Callable[[str, str, bytes, SynthStores, float], Response | None]
+
+_PURE_HANDLERS: dict[str, _PureHandler] = {
+    "sqs:ListQueueTags": _sqs_list_tags,
+    "sqs:TagQueue": _sqs_tag_queue,
+    "sqs:UntagQueue": _sqs_untag_queue,
+    "sqs:GetQueueAttributes": _sqs_get_queue_attributes,
+    "sns:GetTopicAttributes": _sns_get_topic_attributes,
+    "sns:SetTopicAttributes": _sns_set_topic_attributes,
+    "sns:ListTagsForResource": _sns_list_tags,
+    "sns:TagResource": _sns_tag_resource,
+    "sns:UntagResource": _sns_untag_resource,
+    "sns:GetSubscriptionAttributes": _sns_get_subscription_attributes,
+    "dynamodb:ListTagsOfResource": _ddb_list_tags,
+    "dynamodb:TagResource": _ddb_tag_resource,
+    "dynamodb:UntagResource": _ddb_untag_resource,
+}
+
+
+def pure_answer(action: str, resource: str, env: str, body: bytes, stores: SynthStores, now: float) -> Response | None:
+    """A direct synth answer for a PURE/CONDITIONAL action, or None if
+    `action` isn't synth-owned for this call -- the caller (app.py) forwards
+    normally in that case."""
+    handler = _PURE_HANDLERS.get(action)
+    return handler(resource, env, body, stores, now) if handler else None
+
+
+# --- postprocess: forwarded for real, then observed/reshaped ----------------
+
+
+def _sqs_create_queue(resource: str, env: str, request_body: bytes, response_body: bytes, stores: SynthStores, gateway_host: str, now: float) -> bytes:
+    request = json.loads(request_body or b"{}")
+    payload = json.loads(response_body)
+    payload["QueueUrl"] = _rewrite_host(payload.get("QueueUrl", ""), gateway_host)
+    queue_arn = f"arn:aws:sqs:{REGION}:{ACCOUNT}:{resource}"
+    attributes = {**request.get("Attributes", {}), "QueueArn": queue_arn, "SqsManagedSseEnabled": "false", "Policy": ""}
+    stores.sqs_queues.set(env, resource, {"attributes": attributes, "deleted_at": None})
+    stores.tags.set(env, _tags_key("sqs", resource), dict(request.get("tags", {})))
+    return json.dumps(payload).encode()
+
+
+def _sqs_delete_queue(resource: str, env: str, request_body: bytes, response_body: bytes, stores: SynthStores, gateway_host: str, now: float) -> bytes:
+    state = stores.sqs_queues.get(env, resource, {"attributes": {}, "deleted_at": None})
+    state["deleted_at"] = now
+    stores.sqs_queues.set(env, resource, state)
+    return response_body
+
+
+def _sns_create_topic(resource: str, env: str, request_body: bytes, response_body: bytes, stores: SynthStores, gateway_host: str, now: float) -> bytes:
+    params = dict(parse_qsl(request_body.decode("utf-8")))
+    stores.sns_topics.set(env, resource, _parse_map(params, "Attributes"))
+    stores.tags.set(env, _tags_key("sns", resource), _tags_from_structs(_parse_struct_list(params, "Tags")))
+    return response_body
+
+
+def _sns_unsubscribe(resource: str, env: str, request_body: bytes, response_body: bytes, stores: SynthStores, gateway_host: str, now: float) -> bytes:
+    params = dict(parse_qsl(request_body.decode("utf-8")))
+    subscription_arn = params.get("SubscriptionArn", "")
+    if subscription_arn:
+        stores.sns_subscriptions.set(env, subscription_arn, now)
+    return response_body
+
+
+def _ddb_create_table(resource: str, env: str, request_body: bytes, response_body: bytes, stores: SynthStores, gateway_host: str, now: float) -> bytes:
+    request = json.loads(request_body or b"{}")
+    stores.tags.set(env, _tags_key("dynamodb", resource), _tags_from_structs(request.get("Tags", [])))
+    return response_body
+
+
+_PostprocessHandler = Callable[[str, str, bytes, bytes, SynthStores, str, float], bytes]
+
+_POSTPROCESS_HANDLERS: dict[str, _PostprocessHandler] = {
+    "sqs:CreateQueue": _sqs_create_queue,
+    "sqs:DeleteQueue": _sqs_delete_queue,
+    "sns:CreateTopic": _sns_create_topic,
+    "sns:Unsubscribe": _sns_unsubscribe,
+    "dynamodb:CreateTable": _ddb_create_table,
+}
+
+
+def is_postprocess_action(action: str) -> bool:
+    return action in _POSTPROCESS_HANDLERS
+
+
+def postprocess(
+    action: str, resource: str, env: str, request_body: bytes, response_body: bytes,
+    stores: SynthStores, gateway_host: str, now: float,
+) -> bytes:
+    """The (possibly rewritten) response body for a POSTPROCESS action --
+    called only after a successful (<300) forward. `gateway_host` is the
+    caller's own arrival `Host` header, so a rewritten QueueUrl re-dials
+    through whichever path (container docker-host-gateway alias, or a
+    host-side tofu process on 127.0.0.1) reached the gateway in the first
+    place, matching research's "rewrite to the gateway's own host:port"."""
+    return _POSTPROCESS_HANDLERS[action](resource, env, request_body, response_body, stores, gateway_host, now)

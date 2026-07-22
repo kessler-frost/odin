@@ -9,13 +9,16 @@ NODE LABEL the policy compiler emits (G1), never an ARN -- s3 bucket name,
 sqs/sns/dynamodb resource NAME. One test per service below asserts that
 form explicitly.
 
-Two ops are deliberately unmappable in v1 and documented as such rather
-than guessed at: SQS GetQueueUrl and SNS CreateTopic don't carry the
-QueueUrl/TopicArn the addendum's extraction rule keys off of (they're
-discovering/creating the identifier, not using it) -- odin's fabric layer
-injects QueueUrl/TopicArn at Apply time instead, so workloads calling
-these through the gateway get a clean deny (R6) rather than a mis-scoped
-resource.
+S1 (gateway/synth.py) extended this surface for create/name-carrying and
+tag-CRUD paths: SQS CreateQueue/GetQueueUrl and SNS CreateTopic resolve via
+QueueName/Name (no QueueUrl/TopicArn exists yet at that point); SNS/DynamoDB
+tag ops resolve via `ResourceArn` instead of Topic/TableName; SNS
+subscription-scoped ops (GetSubscriptionAttributes/Unsubscribe) resolve via
+`SubscriptionArn`'s embedded topic name. None of these change what a
+workload principal can reach in practice -- no edge grants create/tag verbs
+to workers in v1 (see test_proxy.py's default-deny coverage for these same
+two ops) -- classify() just stops manufacturing a distinct
+`unmappable-action` reason for them.
 """
 from __future__ import annotations
 
@@ -230,12 +233,30 @@ def test_sqs_delete_message(sink, sqs):
     assert classify("sqs", req.method, path, query, req.headers, req.body) == ("sqs:DeleteMessage", "jobs")
 
 
-def test_sqs_get_queue_url_unmappable_in_v1(sink, sqs):
-    # GetQueueUrl carries QueueName, not QueueUrl -- deferred (see module
-    # docstring), must fail cleanly rather than guess.
+def test_sqs_get_queue_url_resolves_via_queue_name(sink, sqs):
     req = sink.call(lambda: sqs.get_queue_url(QueueName="jobs"))
     path, query = split_url(req.url)
-    assert classify("sqs", req.method, path, query, req.headers, req.body) is None
+    assert classify("sqs", req.method, path, query, req.headers, req.body) == ("sqs:GetQueueUrl", "jobs")
+
+
+def test_sqs_create_queue_resolves_via_queue_name(sink, sqs):
+    req = sink.call(lambda: sqs.create_queue(QueueName="jobs"))
+    path, query = split_url(req.url)
+    assert classify("sqs", req.method, path, query, req.headers, req.body) == ("sqs:CreateQueue", "jobs")
+
+
+def test_sqs_list_queue_tags(sink, sqs):
+    req = sink.call(lambda: sqs.list_queue_tags(QueueUrl=f"{sink.endpoint}/000000000000/jobs"))
+    path, query = split_url(req.url)
+    assert classify("sqs", req.method, path, query, req.headers, req.body) == ("sqs:ListQueueTags", "jobs")
+
+
+def test_sqs_get_queue_attributes(sink, sqs):
+    req = sink.call(
+        lambda: sqs.get_queue_attributes(QueueUrl=f"{sink.endpoint}/000000000000/jobs", AttributeNames=["All"])
+    )
+    path, query = split_url(req.url)
+    assert classify("sqs", req.method, path, query, req.headers, req.body) == ("sqs:GetQueueAttributes", "jobs")
 
 
 def test_sqs_resource_is_bare_label_not_url(sink, sqs):
@@ -267,12 +288,49 @@ def test_sns_subscribe(sink, sns):
     assert classify("sns", req.method, path, query, req.headers, req.body) == ("sns:Subscribe", "alerts")
 
 
-def test_sns_create_topic_unmappable_in_v1(sink, sns):
-    # CreateTopic carries Name, not TopicArn (there's no ARN yet) --
-    # deferred (see module docstring), must fail cleanly rather than guess.
+def test_sns_create_topic_resolves_via_name(sink, sns):
     req = sink.call(lambda: sns.create_topic(Name="alerts"))
     path, query = split_url(req.url)
-    assert classify("sns", req.method, path, query, req.headers, req.body) is None
+    assert classify("sns", req.method, path, query, req.headers, req.body) == ("sns:CreateTopic", "alerts")
+
+
+def test_sns_list_tags_for_resource_resolves_via_resource_arn(sink, sns):
+    req = sink.call(
+        lambda: sns.list_tags_for_resource(ResourceArn="arn:aws:sns:us-east-1:000000000000:alerts")
+    )
+    path, query = split_url(req.url)
+    assert classify("sns", req.method, path, query, req.headers, req.body) == ("sns:ListTagsForResource", "alerts")
+
+
+def test_sns_tag_resource_resolves_via_resource_arn(sink, sns):
+    req = sink.call(
+        lambda: sns.tag_resource(
+            ResourceArn="arn:aws:sns:us-east-1:000000000000:alerts", Tags=[{"Key": "env", "Value": "prod"}]
+        )
+    )
+    path, query = split_url(req.url)
+    assert classify("sns", req.method, path, query, req.headers, req.body) == ("sns:TagResource", "alerts")
+
+
+def test_sns_get_subscription_attributes_resolves_topic_from_subscription_arn(sink, sns):
+    req = sink.call(
+        lambda: sns.get_subscription_attributes(
+            SubscriptionArn="arn:aws:sns:us-east-1:000000000000:alerts:sub-uuid-1"
+        )
+    )
+    path, query = split_url(req.url)
+    assert classify("sns", req.method, path, query, req.headers, req.body) == (
+        "sns:GetSubscriptionAttributes",
+        "alerts",
+    )
+
+
+def test_sns_unsubscribe_resolves_topic_from_subscription_arn(sink, sns):
+    req = sink.call(
+        lambda: sns.unsubscribe(SubscriptionArn="arn:aws:sns:us-east-1:000000000000:alerts:sub-uuid-1")
+    )
+    path, query = split_url(req.url)
+    assert classify("sns", req.method, path, query, req.headers, req.body) == ("sns:Unsubscribe", "alerts")
 
 
 def test_sns_resource_is_bare_label_not_arn(sink, sns):
@@ -281,6 +339,36 @@ def test_sns_resource_is_bare_label_not_arn(sink, sns):
     action, resource = classify("sns", req.method, path, query, req.headers, req.body)
     assert resource == "alerts"
     assert "arn:" not in resource
+
+
+# --- dynamodb tag CRUD (via ResourceArn, not TableName) ---------------------
+
+
+def test_dynamodb_list_tags_of_resource_resolves_via_resource_arn(sink, dynamodb):
+    req = sink.call(
+        lambda: dynamodb.list_tags_of_resource(
+            ResourceArn="arn:aws:dynamodb:us-east-1:000000000000:table/orders"
+        )
+    )
+    path, query = split_url(req.url)
+    assert classify("dynamodb", req.method, path, query, req.headers, req.body) == (
+        "dynamodb:ListTagsOfResource",
+        "orders",
+    )
+
+
+def test_dynamodb_tag_resource_resolves_via_resource_arn(sink, dynamodb):
+    req = sink.call(
+        lambda: dynamodb.tag_resource(
+            ResourceArn="arn:aws:dynamodb:us-east-1:000000000000:table/orders",
+            Tags=[{"Key": "env", "Value": "prod"}],
+        )
+    )
+    path, query = split_url(req.url)
+    assert classify("dynamodb", req.method, path, query, req.headers, req.body) == (
+        "dynamodb:TagResource",
+        "orders",
+    )
 
 
 # --- unknown service -------------------------------------------------------

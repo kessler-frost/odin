@@ -17,7 +17,20 @@ event (PRD R6) rather than a silent failure.
 
 The gateway itself holds no data beyond this request-scoped routing table
 (GatewayState) -- rebuilt wholesale by `update()` on every Apply/tick,
-never a cache that outlives one (PRD: "the gateway is stateless").
+never a cache that outlives one (PRD: "the gateway is stateless"). It DOES
+hold a `SynthStores` (see gateway/stores.py) for the synthesized
+control-plane (gateway/synth.py, S-plan task S1) -- tags, SNS topic
+attributes, delete-confirmation markers -- which is the deliberate opposite:
+it must OUTLIVE a tick, so it's never rebuilt by `update()`.
+
+STS is a deliberate exception to the verify -> classify -> evaluate ->
+forward pipeline: GetCallerIdentity isn't scoped to any canvas resource (no
+edge could ever grant/deny it), so it's answered right after verify(),
+before classify() even runs -- see synth.py's module docstring for the full
+justification. Every other synth-owned action (sqs/sns/dynamodb tag CRUD,
+SNS topic attributes, delete-confirmation shims) DOES go through the normal
+classify -> evaluate gate; synth only decides whether an ALLOWED request is
+answered directly or forwarded -- "synth never bypasses policy" (S1 brief).
 """
 from __future__ import annotations
 
@@ -39,9 +52,10 @@ from odin.aws.backings import ACCESS_KEY as BACKING_ACCESS_KEY
 from odin.aws.backings import REGION as BACKING_REGION
 from odin.aws.backings import SECRET_KEY as BACKING_SECRET_KEY
 from odin.gateway import classify as classify_mod
-from odin.gateway import errors, sigv4
+from odin.gateway import errors, sigv4, synth
 from odin.gateway.keys import KeyStore, Principal
 from odin.gateway.policy import Statement, evaluate
+from odin.gateway.stores import SynthStores
 
 # Stripped before ANY forward -- hop-by-hop / connection-specific, never
 # meaningful to replay to the backing (httpx recomputes content-length and
@@ -101,6 +115,7 @@ def _raw_target(request: Request) -> tuple[str, str]:
 def create_gateway_app(
     state: GatewayState,
     keystore: KeyStore,
+    stores: SynthStores,
     on_deny: OnDeny,
     forward_client: httpx.AsyncClient | None = None,
 ) -> Starlette:
@@ -127,6 +142,12 @@ def create_gateway_app(
             await on_deny(principal, None, None, "bad-signature")
             return errors.auth_error(service, "SignatureDoesNotMatch", "The request signature did not match")
 
+        if service == "sts":
+            # Not resource-scoped -- no edge could ever grant/deny this, so
+            # it's answered for any verified principal (see module + synth.py
+            # docstrings).
+            return synth.get_caller_identity(principal.env, principal)
+
         query_params = dict(parse_qsl(query, keep_blank_values=True))
         classified = classify_mod.classify(service, request.method, path, query_params, headers, body)
         if classified is None:
@@ -138,6 +159,11 @@ def create_gateway_app(
         if not evaluate(statements, action, resource):
             await on_deny(principal, action, resource, "denied")
             return errors.access_denied(service, action)
+
+        now = time.monotonic()
+        pure = synth.pure_answer(action, resource, principal.env, body, stores, now)
+        if pure is not None:
+            return pure
 
         backing_port = state.backing_port(principal.env, service)
         if backing_port is None:
@@ -152,11 +178,14 @@ def create_gateway_app(
                 BACKING_ACCESS_KEY, BACKING_SECRET_KEY, "s3", BACKING_REGION,
             )
         upstream = await client.request(request.method, backing_url, headers=forward_headers, content=body)
-        return Response(
-            content=upstream.content,
-            status_code=upstream.status_code,
-            headers=_strip(dict(upstream.headers), _RESPONSE_HOP_BY_HOP),
-        )
+        response_body = upstream.content
+        response_headers = _strip(dict(upstream.headers), _RESPONSE_HOP_BY_HOP)
+        if upstream.status_code < 300 and synth.is_postprocess_action(action):
+            rewritten = synth.postprocess(action, resource, principal.env, body, response_body, stores, headers.get("host", ""), now)
+            if rewritten != response_body:
+                response_headers["content-length"] = str(len(rewritten))
+            response_body = rewritten
+        return Response(content=response_body, status_code=upstream.status_code, headers=response_headers)
 
     methods = ["GET", "PUT", "POST", "DELETE", "HEAD"]
     return Starlette(routes=[

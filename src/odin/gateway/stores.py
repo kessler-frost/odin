@@ -1,0 +1,78 @@
+"""Per-env JSON sidecar stores for the gateway's synthesized control-plane
+(synth.py) -- tags, SNS topic attributes, SQS queue state (attributes +
+delete-confirmation marker), SNS subscription delete markers.
+
+Each store is a flat `key -> value` dict persisted at
+`.odin/{env}/gateway/{name}.json`, the same lazy-load/persist-on-mutation
+shape `keys.py` already uses for credentials. Unlike `GatewayState` (rebuilt
+wholesale on every Apply/tick -- "the gateway is stateless"), these stores
+MUST outlive a tick: a tag set via `TagQueue` has to still be there the next
+time `ListQueueTags` asks, which is the whole point (research: "without it
+every plan drifts on tags"). Nothing here is cleared on Apply/destroy today
+-- queues/topics/tables are re-created wholesale on every canvas Apply, so a
+stale entry is simply orphaned (never wrong), not actively torn down.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+
+class JsonStore:
+    """A flat `key -> value` dict, one JSON file per env, loaded lazily and
+    rewritten wholesale on every mutation."""
+
+    def __init__(self, root: Path, name: str) -> None:
+        self._root = root
+        self._name = name
+        self._loaded: dict[str, dict[str, Any]] = {}
+
+    def get(self, env: str, key: str, default: Any = None) -> Any:
+        return self._data(env).get(key, default)
+
+    def set(self, env: str, key: str, value: Any) -> None:
+        self._data(env)[key] = value
+        self._persist(env)
+
+    def _data(self, env: str) -> dict[str, Any]:
+        if env not in self._loaded:
+            path = self._path(env)
+            self._loaded[env] = json.loads(path.read_text()) if path.exists() else {}
+        return self._loaded[env]
+
+    def _path(self, env: str) -> Path:
+        return self._root / env / "gateway" / f"{self._name}.json"
+
+    def _persist(self, env: str) -> None:
+        path = self._path(env)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self._data(env)))
+
+
+class SynthStores:
+    """The four sidecar stores synth.py needs, grouped for one-arg wiring
+    into `create_gateway_app`.
+
+    - `tags`: keyed `"{service}:{resource}"` -> flat `{tag_key: tag_value}`,
+      shared by sqs/sns/dynamodb (each service's resource-name namespace is
+      disjoint by construction, but the prefix avoids any ambiguity anyway).
+    - `sqs_queues`: keyed by queue name -> `{"attributes": {...},
+      "deleted_at": float | None}` -- the attribute set CreateQueue seeds and
+      GetQueueAttributes echoes (research: goaws's slow/incomplete
+      convergence means the gateway owns this read entirely), plus the
+      delete-confirmation shim's grace-window marker.
+    - `sns_topics`: keyed by topic name -> `{attribute_name: value}`, seeded
+      on CreateTopic, read by GetTopicAttributes, mutated by
+      SetTopicAttributes (goaws has neither call at all).
+    - `sns_subscriptions`: keyed by the full subscription ARN (NOT the
+      classify()-derived topic-name resource -- multiple subscriptions can
+      share a topic) -> the `now` Unsubscribe fired, so
+      GetSubscriptionAttributes can answer NotFound immediately after.
+    """
+
+    def __init__(self, root: Path) -> None:
+        self.tags = JsonStore(root, "tags")
+        self.sqs_queues = JsonStore(root, "sqs_queues")
+        self.sns_topics = JsonStore(root, "sns_topics")
+        self.sns_subscriptions = JsonStore(root, "sns_subscriptions")
