@@ -25,22 +25,68 @@ Topic/TableName) resolve the same way. SNS subscription-scoped calls
 (GetSubscriptionAttributes/Unsubscribe) carry `SubscriptionArn`, not
 `TopicArn` -- the topic name lives in the ARN's second-to-last segment
 (`...:<topic>:<subscription-id>`), extracted the same bare-label way.
+
+S3 BUCKET-CONFIG READS (S2, discovered running real tofu through the real
+gateway): the TF AWS provider's `aws_s3_bucket` refresh probes bucket-config
+subresources -- `?policy`, `?tagging`, `?acl`, `?cors`, `?versioning`, etc.
+-- on every create-then-read and every plan (research §3). These used to sit
+in the same "unmappable" bucket as truly-unsupported object-level ops
+(`?restore`, `?legal-hold`, ...), which denied the OPERATOR principal (S2)
+before `evaluate()` even ran -- its full-allow statement never got a chance.
+Now mapped to their real IAM action names (`_S3_BUCKET_CONFIG_READ_ACTIONS`)
+so evaluate() decides: the operator's wildcard grants them, no workload iam
+edge grants a bucket-config verb in v1, so a workload principal still denies
+-- via ordinary default-deny, not `unmappable-action`. Only the GET (read)
+side is mapped; v1 has no write path for any of these, so a PUT/DELETE
+still denies.
 """
 from __future__ import annotations
 
 import json
 from urllib.parse import parse_qsl, unquote
 
-# S3 subresources with no v1 action mapping: explicit deny, never silent
-# pass-through (research §Q2: "unknown subresources ... -> explicit deny").
-_S3_UNSUPPORTED_SUBRESOURCES = {
-    "acl", "tagging", "versioning", "policy", "cors", "lifecycle",
-    "notification", "replication", "encryption", "website", "logging",
-    "accelerate", "requestPayment", "publicAccessBlock", "policyStatus",
-    "object-lock", "restore", "torrent", "legal-hold", "retention",
-    "ownershipControls", "intelligent-tiering", "metrics", "inventory",
-    "analytics", "versions",
+# Bucket-config GET probes the TF AWS provider's `aws_s3_bucket` makes on
+# every create-then-read and every plan's refresh (research §3: "read/
+# refresh probes (every plan): GET /bucket?tagging ?policy ?acl ?cors
+# ?website ?versioning ?accelerate ?requestPayment ?logging ?lifecycle
+# ?replication ?encryption ?object-lock ... — all tolerated by the
+# provider"). Mapped to their real IAM action names (S2: "G2 left them None
+# -> extend classify for operator flows" -- the same technique S1 used for
+# SQS/SNS create-paths) so evaluate() gets a chance to run at all: the
+# OPERATOR principal's full-allow grants them, but no workload iam edge
+# grants a bucket-CONFIG verb in v1, so a workload principal still denies --
+# via evaluate()'s ordinary default-deny now, not classify()'s
+# "unmappable-action" short-circuit.
+_S3_BUCKET_CONFIG_READ_ACTIONS = {
+    "acl": "s3:GetBucketAcl",
+    "tagging": "s3:GetBucketTagging",
+    "versioning": "s3:GetBucketVersioning",
+    "policy": "s3:GetBucketPolicy",
+    "cors": "s3:GetBucketCORS",
+    "lifecycle": "s3:GetLifecycleConfiguration",
+    "notification": "s3:GetBucketNotification",
+    "replication": "s3:GetReplicationConfiguration",
+    "encryption": "s3:GetEncryptionConfiguration",
+    "website": "s3:GetBucketWebsite",
+    "logging": "s3:GetBucketLogging",
+    "accelerate": "s3:GetAccelerateConfiguration",
+    "requestPayment": "s3:GetBucketRequestPayment",
+    "publicAccessBlock": "s3:GetBucketPublicAccessBlock",
+    "policyStatus": "s3:GetBucketPolicyStatus",
+    "object-lock": "s3:GetBucketObjectLockConfiguration",
+    "ownershipControls": "s3:GetBucketOwnershipControls",
+    "intelligent-tiering": "s3:GetIntelligentTieringConfiguration",
+    "metrics": "s3:GetMetricsConfiguration",
+    "inventory": "s3:GetInventoryConfiguration",
+    "analytics": "s3:GetAnalyticsConfiguration",
+    "versions": "s3:ListBucketVersions",
 }
+
+# Object-level subresources v1 has no create path for at all (nothing ever
+# PUTs a legal hold, restores an object, requests a torrent) -- genuinely
+# unmapped regardless of method, never silent pass-through (research §Q2:
+# "unknown subresources ... -> explicit deny").
+_S3_UNSUPPORTED_SUBRESOURCES = {"restore", "torrent", "legal-hold", "retention"}
 
 _S3_MULTIPART_ACTIONS = {
     "PUT": "s3:PutObject",
@@ -150,6 +196,13 @@ def _classify_s3(
     trimmed = path.strip("/")
     segments = trimmed.split("/", 1) if trimmed else []
     bucket = unquote(segments[0]) if segments else None
+    config_hit = _S3_BUCKET_CONFIG_READ_ACTIONS.keys() & query.keys()
+    if config_hit:
+        # v1 has no write path for any of these -- only the GET (read) side
+        # is mapped; PUT/DELETE on a bucket-config subresource still denies.
+        if method != "GET" or bucket is None:
+            return None
+        return _S3_BUCKET_CONFIG_READ_ACTIONS[next(iter(config_hit))], bucket
     has_key = len(segments) > 1 and segments[1] != ""
     action = _s3_action(method, bucket, has_key, query)
     if action is None:

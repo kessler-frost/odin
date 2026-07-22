@@ -143,8 +143,43 @@ def test_s3_list_multipart_uploads(sink, s3):
     )
 
 
-def test_s3_unknown_subresource_denies_cleanly(sink, s3):
+def test_s3_get_bucket_acl_resolves_to_its_real_action(sink, s3):
+    # S2: mapped so evaluate() gets to run (the operator's full-allow needs a
+    # chance) -- a workload still denies via default-deny, not unmappable.
     req = sink.call(lambda: s3.get_bucket_acl(Bucket="uploads"))
+    path, query = split_url(req.url)
+    assert classify("s3", req.method, path, query, req.headers, req.body) == ("s3:GetBucketAcl", "uploads")
+
+
+def test_s3_get_bucket_policy_resolves_to_its_real_action(sink, s3):
+    # The exact probe a real `tofu apply` of aws_s3_bucket makes right after
+    # CreateBucket -- the gap that surfaced this whole mapping (S2).
+    req = sink.call(lambda: s3.get_bucket_policy(Bucket="uploads"))
+    path, query = split_url(req.url)
+    assert classify("s3", req.method, path, query, req.headers, req.body) == ("s3:GetBucketPolicy", "uploads")
+
+
+def test_s3_get_bucket_tagging_resolves_to_its_real_action(sink, s3):
+    req = sink.call(lambda: s3.get_bucket_tagging(Bucket="uploads"))
+    path, query = split_url(req.url)
+    assert classify("s3", req.method, path, query, req.headers, req.body) == ("s3:GetBucketTagging", "uploads")
+
+
+def test_s3_put_bucket_config_subresource_still_denies_cleanly(sink, s3):
+    # v1 has no write path for any bucket-config subresource -- only the GET
+    # side is mapped; a PUT still denies (unmappable, not merely unpermitted).
+    req = sink.call(lambda: s3.put_bucket_tagging(Bucket="uploads", Tagging={"TagSet": [{"Key": "k", "Value": "v"}]}))
+    path, query = split_url(req.url)
+    assert classify("s3", req.method, path, query, req.headers, req.body) is None
+
+
+def test_s3_object_level_subresource_still_denies_cleanly(sink, s3):
+    # Genuinely unsupported (v1 has no create path for a legal hold at all)
+    # -- unlike bucket-config reads, this stays unmappable regardless of
+    # method (research §Q2: "unknown subresources ... -> explicit deny").
+    req = sink.call(
+        lambda: s3.get_object_legal_hold(Bucket="uploads", Key="a.txt")
+    )
     path, query = split_url(req.url)
     assert classify("s3", req.method, path, query, req.headers, req.body) is None
 

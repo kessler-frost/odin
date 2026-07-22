@@ -97,11 +97,17 @@ def service_unavailable(service: str) -> Response:
 def synth_error(service: str, code: str, message: str, status: int) -> Response:
     """A synth-authored error (gateway.synth) with an explicit status and
     the EXACT wire code -- unlike `access_denied`/`auth_error`'s fixed
-    status+`...Exception` convention, synth errors must match botocore's
-    exact modeled shape/code, which varies per exception: SQS's
-    `QueueDoesNotExist` carries no suffix at all, while SNS's subscription
-    NotFound uses that shape's explicit `code` override, `NotFound` (both
-    verified against botocore's own parser, not guessed at)."""
+    status+`...Exception` convention, synth errors must match the REAL wire
+    code a caller's SDK checks against, which varies per exception and does
+    NOT always match botocore's shape name: SNS's subscription NotFound
+    uses that shape's explicit `code` override, `NotFound` (verified
+    against botocore's own parser); SQS's "queue doesn't exist" is the
+    legacy `AWS.SimpleQueueService.NonExistentQueue` -- botocore's own
+    model calls the shape `QueueDoesNotExist`, but that friendlier name is
+    NOT what SQS (one of AWS's oldest services) actually sends over the
+    wire, and a real `tofu destroy`'s Go-SDK-based delete-waiter checks the
+    literal legacy string (S2, verified against terraform-provider-aws's
+    own source), not botocore's shape name."""
     if service == "sns":
         return Response(_sns_xml(code, message), status_code=status, media_type="text/xml")
     return Response(_json_body_raw(service, code, message), status_code=status, media_type="application/x-amz-json-1.0")

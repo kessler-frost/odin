@@ -53,7 +53,7 @@ from odin.aws.backings import REGION as BACKING_REGION
 from odin.aws.backings import SECRET_KEY as BACKING_SECRET_KEY
 from odin.gateway import classify as classify_mod
 from odin.gateway import errors, sigv4, synth
-from odin.gateway.keys import KeyStore, Principal
+from odin.gateway.keys import OPERATOR_NODE_ID, KeyStore, Principal
 from odin.gateway.policy import Statement, evaluate
 from odin.gateway.stores import SynthStores
 
@@ -75,6 +75,16 @@ class _EnvGatewayState:
     backing_ports: dict[str, int] = field(default_factory=dict)
 
 
+# The OPERATOR principal (S2 CONTRACT ADDENDUM): full allow within whatever
+# env issued its keys, WITHOUT any canvas edge -- a tofu run isn't a
+# workload node, so it can never have a compiled iam statement of its own.
+# Special-cased in `statements_for` (never entered into
+# `_EnvGatewayState.statements_by_node`), so `update()` wholesale-rebuilding
+# that map every reconciler tick can never touch it -- workload principals
+# are unaffected either way.
+_OPERATOR_STATEMENTS: list[Statement] = [Statement(actions=("*",), resources=("*",))]
+
+
 class GatewayState:
     """Per-env edge-compiled policies + backing routing table.
 
@@ -82,7 +92,9 @@ class GatewayState:
     incrementally) so a stale edge can never survive a reconcile pass --
     the same "no cache that outlives an Apply" invariant as the rest of
     the gateway. All lookups are env-scoped; an unknown env behaves as
-    empty (default-deny, no backing registered) rather than raising.
+    empty (default-deny, no backing registered) rather than raising --
+    except the OPERATOR principal (`gateway.keys.OPERATOR_NODE_ID`), which
+    always resolves to full-allow (see `_OPERATOR_STATEMENTS` above).
     """
 
     def __init__(self) -> None:
@@ -92,6 +104,8 @@ class GatewayState:
         self._envs[env] = _EnvGatewayState(statements_by_node=statements_by_node, backing_ports=backing_ports)
 
     def statements_for(self, env: str, node_id: str) -> list[Statement]:
+        if node_id == OPERATOR_NODE_ID:
+            return _OPERATOR_STATEMENTS
         env_state = self._envs.get(env)
         return env_state.statements_by_node.get(node_id, []) if env_state else []
 

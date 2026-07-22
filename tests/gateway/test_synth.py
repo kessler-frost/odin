@@ -180,7 +180,10 @@ def test_sqs_get_queue_attributes_returns_queue_does_not_exist_past_grace_window
     response = synth.pure_answer("sqs:GetQueueAttributes", "jobs", "default", get_req.body, stores, now)
     assert response.status_code == 400
     parsed = _parse("sqs", "GetQueueAttributes", response, error=True)
-    assert parsed["Error"]["Code"] == "QueueDoesNotExist"
+    # The REAL wire code (S2, verified against terraform-provider-aws's own
+    # source) -- NOT botocore's friendlier shape name "QueueDoesNotExist",
+    # which the Go-SDK-based `tofu destroy` delete-waiter does not match.
+    assert parsed["Error"]["Code"] == "AWS.SimpleQueueService.NonExistentQueue"
 
 
 def test_sqs_delete_queue_then_recreate_clears_deleted_marker(sink, sqs, stores):
@@ -420,3 +423,35 @@ def test_pure_answer_returns_none_for_non_synth_action(stores):
 def test_is_postprocess_action():
     assert synth.is_postprocess_action("sqs:CreateQueue") is True
     assert synth.is_postprocess_action("sqs:SendMessage") is False
+    assert synth.is_postprocess_action("sns:GetSubscriptionAttributes") is True
+
+
+# --- SNS: live GetSubscriptionAttributes FilterPolicy fixup (S2) ------------
+
+
+def test_postprocess_strips_the_null_placeholder_entries_goaws_sends():
+    # The exact wire shape captured from a real goaws (harness.py's
+    # CaptureSink can't emit this -- goaws is the one answering it, not
+    # boto3): one populated attribute alongside one goaws leaves as the
+    # literal string "null" for an optional field nobody set.
+    goaws_body = (
+        b"<GetSubscriptionAttributesResponse><GetSubscriptionAttributesResult>"
+        b"<Attributes>"
+        b"<entry><key>RawMessageDelivery</key><value>true</value></entry>"
+        b"<entry><key>FilterPolicy</key><value>null</value></entry>"
+        b"</Attributes>"
+        b"</GetSubscriptionAttributesResult></GetSubscriptionAttributesResponse>"
+    )
+    fixed = synth.postprocess(
+        "sns:GetSubscriptionAttributes", "alerts", "default", b"", goaws_body, None, "127.0.0.1:4266", 0.0,
+    )
+    assert b"<key>FilterPolicy</key>" not in fixed
+    assert b"<key>RawMessageDelivery</key><value>true</value>" in fixed  # a real value is untouched
+
+
+def test_postprocess_is_a_noop_when_no_null_placeholders_are_present():
+    goaws_body = b"<Attributes><entry><key>RawMessageDelivery</key><value>true</value></entry></Attributes>"
+    fixed = synth.postprocess(
+        "sns:GetSubscriptionAttributes", "alerts", "default", b"", goaws_body, None, "127.0.0.1:4266", 0.0,
+    )
+    assert fixed == goaws_body

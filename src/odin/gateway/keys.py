@@ -21,6 +21,12 @@ _ACCESS_KEY_PREFIX = "AKODIN"
 _ACCESS_KEY_SUFFIX_LEN = 14
 _SECRET_KEY_LEN = 40
 
+# The tofu runner's per-env identity (S2) -- issued/looked-up exactly like
+# any workload node_id, but never authored by a canvas. GatewayState
+# special-cases this node_id to a full-allow statement (gateway/app.py),
+# so it needs no compiled iam edge to reach create-path AWS calls.
+OPERATOR_NODE_ID = "__operator__"
+
 
 def _random_urlsafe(length: int) -> str:
     return "".join(secrets.choice(_URLSAFE_ALPHABET) for _ in range(length))

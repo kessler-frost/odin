@@ -26,13 +26,21 @@ Three call shapes, dispatched by `app.py`:
     GetQueueAttributes (always synth-owned -- see its docstring for why).
     Also covers the one CONDITIONAL action, SNS GetSubscriptionAttributes:
     returns None (meaning "not synth-owned for THIS call, forward normally")
-    unless the subscription was already Unsubscribed.
-  - `postprocess` -- POSTPROCESS_ACTIONS forward for real (the create/delete
-    must actually happen in goaws/dynalite) but the gateway also observes or
-    reshapes the response: CreateQueue's host rewrite + attribute/tag
-    seeding, CreateTopic's attribute/tag seeding, DeleteQueue/Unsubscribe's
-    delete markers, CreateTable's tag seeding (dynalite accepts-but-drops
-    tags on create -- the exact drift research documents).
+    unless the subscription was already Unsubscribed -- a LIVE subscription
+    forwards to goaws for real and gets patched by `postprocess` instead
+    (below): a real `tofu apply` through a real gateway (S2) found goaws's
+    live answer includes `FilterPolicy = "null"` (the literal string) for
+    every unset optional attribute, which the TF provider reads as a REAL
+    value and drifts on every subsequent plan -- `_sns_fix_subscription_attributes`
+    strips it, closing the "goaws returns incomplete attrs -> drift; GW
+    completes" half of research §3 that S1 left as a live-forward pass-through.
+  - `postprocess` -- POSTPROCESS_ACTIONS forward for real (the create/delete/
+    read must actually happen in goaws/dynalite) but the gateway also
+    observes or reshapes the response: CreateQueue's host rewrite +
+    attribute/tag seeding, CreateTopic's attribute/tag seeding, DeleteQueue/
+    Unsubscribe's delete markers, CreateTable's tag seeding (dynalite
+    accepts-but-drops tags on create -- the exact drift research documents),
+    and (S2) a live GetSubscriptionAttributes' FilterPolicy fixup above.
 
 Called ONLY after evaluate() allows the request (app.py's routing order:
 verify -> scope -> classify -> evaluate -> synth -> forward) -- a synth
@@ -43,6 +51,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Callable
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
@@ -62,8 +71,22 @@ _STS_NS = "https://sts.amazonaws.com/doc/2011-06-15/"
 # waiter, because it expects the transitional "still readable, then gone"
 # shape real AWS has. Not real AWS's ~60s (no test should sleep that long);
 # just long enough that a caller polling immediately after delete still
-# briefly sees the queue before it goes to QueueDoesNotExist.
+# briefly sees the queue before it goes to not-found.
 QUEUE_DELETE_GRACE_SECONDS = 2.0
+
+# The REAL wire error code, verified against terraform-provider-aws's own
+# source (internal/service/sqs/consts.go: `errCodeQueueDoesNotExist =
+# "AWS.SimpleQueueService.NonExistentQueue"`) after a real `tofu destroy`
+# through the real gateway kept erroring despite the delete-grace window
+# above (S2): botocore models this exception under the friendlier shape
+# name `QueueDoesNotExist`, but that is NOT what SQS actually sends over
+# the wire -- SQS predates the newer error-code-matches-shape-name
+# convention, and aws-sdk-go-v2 (what the TF provider uses) checks the
+# legacy string literally. Sending botocore's shape name instead of the
+# real wire code makes the provider's `tfawserr.ErrCodeEquals` check MISS,
+# so it never recognizes "gone" as the delete-waiter's target state and
+# treats the response as a genuine unretryable error instead.
+_SQS_QUEUE_DOES_NOT_EXIST = "AWS.SimpleQueueService.NonExistentQueue"
 
 _TOPIC_ATTRIBUTE_DEFAULTS = {
     "SubscriptionsConfirmed": "0",
@@ -208,7 +231,7 @@ def _sqs_get_queue_attributes(resource: str, env: str, body: bytes, stores: Synt
     state = stores.sqs_queues.get(env, resource, {"attributes": {}, "deleted_at": None})
     deleted_at = state.get("deleted_at")
     if deleted_at is not None and now - deleted_at > QUEUE_DELETE_GRACE_SECONDS:
-        return errors.synth_error("sqs", "QueueDoesNotExist", "The specified queue does not exist.", 400)
+        return errors.synth_error("sqs", _SQS_QUEUE_DOES_NOT_EXIST, "The specified queue does not exist.", 400)
     requested = payload.get("AttributeNames") or []
     attributes = state.get("attributes", {})
     if requested and "All" not in requested:
@@ -264,7 +287,9 @@ def _sns_get_subscription_attributes(resource: str, env: str, body: bytes, store
     """CONDITIONAL: only synth-owned once the subscription is gone (research:
     the SNS case needed no transitional grace window, unlike SQS -- "fully
     solved" by an immediate NotFound). Live subscriptions fall through
-    (returns None) to a normal forward -- goaws answers those for real."""
+    (returns None) to a normal forward -- goaws answers those for real (then
+    `_sns_fix_subscription_attributes`, a POSTPROCESS handler below, patches
+    the one field goaws gets wrong)."""
     params = dict(parse_qsl(body.decode("utf-8")))
     subscription_arn = params.get("SubscriptionArn", "")
     if stores.sns_subscriptions.get(env, subscription_arn) is None:
@@ -352,6 +377,20 @@ def _sns_create_topic(resource: str, env: str, request_body: bytes, response_bod
     return response_body
 
 
+def _sns_fix_subscription_attributes(resource: str, env: str, request_body: bytes, response_body: bytes, stores: SynthStores, gateway_host: str, now: float) -> bytes:
+    """goaws's LIVE GetSubscriptionAttributes answer includes an entry like
+    `FilterPolicy = "null"` (the literal 4-char string) for every optional
+    attribute nobody set -- verified against goaws's own wire response.
+    Real AWS OMITS an unset attribute entirely, so without this fix the TF
+    provider's refreshed state reads `filter_policy = "null"` (a real value)
+    instead of unset, and every `plan` shows drift (research §3: "goaws
+    returns incomplete attrs -> drift; GW completes" -- S1 only implemented
+    the post-Unsubscribe NotFound half of that; this closes the other half).
+    Strips ANY entry whose value is the bare string "null" -- goaws's
+    general placeholder shape for "unset", not just this one field."""
+    return re.sub(rb"<entry><key>[^<]+</key><value>null</value></entry>", b"", response_body)
+
+
 def _sns_unsubscribe(resource: str, env: str, request_body: bytes, response_body: bytes, stores: SynthStores, gateway_host: str, now: float) -> bytes:
     params = dict(parse_qsl(request_body.decode("utf-8")))
     subscription_arn = params.get("SubscriptionArn", "")
@@ -373,6 +412,7 @@ _POSTPROCESS_HANDLERS: dict[str, _PostprocessHandler] = {
     "sqs:DeleteQueue": _sqs_delete_queue,
     "sns:CreateTopic": _sns_create_topic,
     "sns:Unsubscribe": _sns_unsubscribe,
+    "sns:GetSubscriptionAttributes": _sns_fix_subscription_attributes,
     "dynamodb:CreateTable": _ddb_create_table,
 }
 

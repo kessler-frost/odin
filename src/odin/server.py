@@ -13,9 +13,10 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import APIRouter, FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from odin.agent.hcl import generate_tf
 from odin.api.canvas import CanvasGraph, create_canvas_router
 from odin.api.ws import ConnectionManager
 from odin.aws.backings import BackingAws
@@ -24,10 +25,11 @@ from odin.fabric.localhost import LocalhostFabric
 from odin.fabric.nebula import mesh_state
 from odin.gateway import DEFAULT_GATEWAY_PORT, GATEWAY_PORT_ENV
 from odin.gateway.app import GatewayState, create_gateway_app, serve_in_thread, stop_in_thread
-from odin.gateway.keys import KeyStore, Principal
+from odin.gateway.keys import OPERATOR_NODE_ID, KeyStore, Principal
 from odin.gateway.stores import SynthStores
 from odin.reconcile.reconciler import Reconciler
 from odin.runtime.colima import ColimaRuntime
+from odin.simulate.runner import SimulateBusy, TfRunner, TofuNotInstalled
 from odin.spec.models import Stack
 from odin.spec.store import SpecStore
 from odin.spec.translate import canvas_to_stack, skipped_node_types
@@ -76,6 +78,61 @@ def create_apply_router(store: SpecStore, reconciler_for, keystore: KeyStore) ->
     return router
 
 
+_TOFU_NOT_INSTALLED = {"error": "tofu not installed", "fix": "brew install opentofu"}
+
+
+def create_tf_router(store: SpecStore, runner: TfRunner, keystore: KeyStore, gateway_port) -> APIRouter:
+    """`/tf/*` -- Simulate's own apply/destroy/status, independent of the
+    canvas `/apply`/`/destroy` above (S2 CONTRACT ADDENDUM: routes named
+    `/tf/*`, not `/simulate/*` -- "the owner renamed the user surface to
+    Apply"). `gateway_port` is a zero-arg callable rather than a plain int:
+    the real port is only known once the gateway's uvicorn listener starts
+    in `create_app`'s `lifespan`, resolved AFTER this router is built."""
+    router = APIRouter()
+
+    def _issue_operator(env: str) -> tuple[str, str]:
+        return keystore.issue(env, OPERATOR_NODE_ID)
+
+    @router.post("/tf/apply")
+    async def tf_apply(env: str = ENV) -> JSONResponse:
+        stack = store.get_stack(env)
+        project = generate_tf(stack)
+        access_key, secret_key = _issue_operator(env)
+        try:
+            result = await runner.apply(env, project, gateway_port(), access_key, secret_key)
+        except TofuNotInstalled:
+            return JSONResponse(status_code=409, content=_TOFU_NOT_INSTALLED)
+        except SimulateBusy as exc:
+            return JSONResponse(status_code=409, content={"error": str(exc)})
+        body = {
+            "status": "applied" if result.ok else "failed", "env": env,
+            "exit_code": result.exit_code, "unsupported": project.unsupported,
+        }
+        if not result.ok:
+            body["tail"] = list(result.tail)
+        return JSONResponse(status_code=200 if result.ok else 500, content=body)
+
+    @router.post("/tf/destroy")
+    async def tf_destroy(env: str = ENV) -> JSONResponse:
+        access_key, secret_key = _issue_operator(env)
+        try:
+            result = await runner.destroy(env, gateway_port(), access_key, secret_key)
+        except TofuNotInstalled:
+            return JSONResponse(status_code=409, content=_TOFU_NOT_INSTALLED)
+        except SimulateBusy as exc:
+            return JSONResponse(status_code=409, content={"error": str(exc)})
+        body = {"status": "destroyed" if result.ok else "failed", "env": env, "exit_code": result.exit_code}
+        if not result.ok:
+            body["tail"] = list(result.tail)
+        return JSONResponse(status_code=200 if result.ok else 500, content=body)
+
+    @router.get("/tf/status")
+    def tf_status(env: str = ENV) -> dict:
+        return runner.status(env)
+
+    return router
+
+
 def create_app(
     runtime=None,
     store: SpecStore | None = None,
@@ -102,6 +159,11 @@ def create_app(
     # this in with the ACTUAL bound port before any reconciler is made, so
     # BackingAws/`/health` never advertise the possibly-0 request instead.
     gateway_port_actual: int | None = None
+    # Simulate (S2): materializes .odin/{env}/tf/ and drives tofu through the
+    # gateway above under the OPERATOR principal. No lifespan hook of its own
+    # (unlike reconcilers) -- routes only ever run once lifespan has resolved
+    # gateway_port_actual, so a plain closure over it is enough.
+    tf_runner = TfRunner(_store.root, ws_manager)
 
     # One reconciler per environment, created lazily. Each gets its own
     # env-scoped rds runner + backing containers, so AWS state stays isolated.
@@ -154,6 +216,7 @@ def create_app(
     app = FastAPI(title="allfather", version="0.1.0", lifespan=lifespan)
     app.include_router(create_canvas_router(CANVAS_PATH))
     app.include_router(create_apply_router(_store, reconciler_for, gateway_keystore))
+    app.include_router(create_tf_router(_store, tf_runner, gateway_keystore, lambda: gateway_port_actual))
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
@@ -178,6 +241,7 @@ def create_app(
     app.state.reconcilers = reconcilers
     app.state.gateway = gateway_state
     app.state.gateway_keys = gateway_keystore
+    app.state.tf_runner = tf_runner
 
     bundled_ui = Path(__file__).resolve().parent / "_ui"
     source_ui = Path(__file__).resolve().parent.parent.parent / "ui" / "dist"
