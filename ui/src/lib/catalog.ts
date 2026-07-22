@@ -1,13 +1,11 @@
-// Catalog-driven AWS service definitions. Adding a frequently-used service =
-// one entry here (plus a backend ResourceSpec + a Moto test). The existing
-// bespoke nodes (vpc/subnet/ec2/lambda/s3/sg) stay as-is; everything here is
+// Catalog-driven service definitions: workloads plus AWS-shaped resources on
+// real open-source backings. Adding a service = one entry here (plus a backend
+// ResourceSpec). The bespoke S3/DynamoDB nodes stay as-is; everything here is
 // rendered by the generic ServiceNode and merged into the Canvas/ConfigPanel/
 // Sidebar/IAM maps.
 //
 // Class strings are written out in full (not constructed) so Tailwind's scanner
 // keeps them.
-
-import { GENERATED_CATALOG } from './catalog.generated';
 
 export type CatalogField = { key: string; label: string; editable?: boolean; select?: string[] };
 
@@ -134,6 +132,7 @@ export const CATALOG: ServiceDef[] = [
     ],
     defaultData: { label: 'db', engine: 'postgres', instanceClass: 'db.t3.micro', arn: '' },
     primary: { key: 'engine', label: 'Engine' },
+    iamActions: ['rds-db:connect', 'rds:DescribeDBInstances', 'rds:*'],
   },
   {
     type: 'secret', abbr: 'SEC', label: 'Secret', sublabel: 'Secrets Manager',
@@ -240,7 +239,6 @@ export const CATALOG: ServiceDef[] = [
     defaultData: { label: 'new-lb', lbType: 'application', arn: '' },
     primary: { key: 'lbType', label: 'Type' },
   },
-  ...GENERATED_CATALOG,  // full MiniStack service parity (auto-generated)
 ];
 
 export const catalogByType: Record<string, ServiceDef> = Object.fromEntries(

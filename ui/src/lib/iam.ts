@@ -1,19 +1,21 @@
-import { CATALOG, catalogIamActions } from './catalog';
+import { catalogIamActions } from './catalog';
 
 export const iamActionsForTarget: Record<string, string[]> = {
   s3: ['s3:GetObject', 's3:PutObject', 's3:DeleteObject', 's3:ListBucket', 's3:GetBucketLocation', 's3:*'],
-  lambda: ['lambda:InvokeFunction', 'lambda:GetFunction', 'lambda:ListFunctions', 'lambda:*'],
-  ec2: ['ec2:DescribeInstances', 'ec2:StartInstances', 'ec2:StopInstances', 'ec2:*'],
   dynamodb: ['dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:Query', 'dynamodb:Scan', 'dynamodb:DeleteItem', 'dynamodb:*'],
   ...catalogIamActions,
 };
 
 export const defaultPermissions: Record<string, string[]> = {
   s3: ['s3:GetObject', 's3:PutObject'],
-  lambda: ['lambda:InvokeFunction'],
+  dynamodb: ['dynamodb:GetItem', 'dynamodb:PutItem'],
+  sqs: ['sqs:SendMessage', 'sqs:ReceiveMessage'],
+  sns: ['sns:Publish'],
+  rds: ['rds-db:connect'],
 };
 
-export const computeTypes = new Set(['ec2', 'lambda']);
+// Workload kinds act as IAM principals; permission edges run workload → resource.
+export const computeTypes = new Set(['service', 'app', 'batch', 'llm']);
 
 // --- Edge type registry ---
 
@@ -33,24 +35,12 @@ export const edgeTypes: Record<string, EdgeTypeDef> = {
 // First entry is the auto-detected default
 const pairKey = (a: string, b: string) => [a, b].sort().join(':');
 
-// Compute (ec2/lambda) → any catalog IAM target is an IAM edge.
-const catalogIamPairs: Record<string, string[]> = {};
-for (const s of CATALOG) {
-  if (!s.iamActions) continue;
-  catalogIamPairs[pairKey('ec2', s.type)] = ['iam'];
-  catalogIamPairs[pairKey('lambda', s.type)] = ['iam'];
+// Workload → any IAM target (s3/dynamodb + every catalog entry with
+// iamActions) is an IAM permission edge; everything else defaults to network.
+const edgeTypesForPair: Record<string, string[]> = {};
+for (const target of Object.keys(iamActionsForTarget)) {
+  for (const workload of computeTypes) edgeTypesForPair[pairKey(workload, target)] = ['iam'];
 }
-
-const edgeTypesForPair: Record<string, string[]> = {
-  [pairKey('ec2', 's3')]: ['iam'],
-  [pairKey('ec2', 'lambda')]: ['iam', 'network'],
-  [pairKey('lambda', 's3')]: ['iam'],
-  [pairKey('ec2', 'ec2')]: ['network'],
-  [pairKey('lambda', 'lambda')]: ['iam'],
-  [pairKey('lambda', 'dynamodb')]: ['iam'],
-  [pairKey('ec2', 'dynamodb')]: ['iam'],
-  ...catalogIamPairs,
-};
 
 export function detectEdgeTypes(nodeTypeA: string, nodeTypeB: string): string[] {
   return edgeTypesForPair[pairKey(nodeTypeA, nodeTypeB)] ?? ['network'];

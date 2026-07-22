@@ -19,70 +19,40 @@ import {
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 
-import VpcNode from './nodes/VpcNode';
-import SubnetNode from './nodes/SubnetNode';
-import Ec2Node from './nodes/Ec2Node';
-import LambdaNode from './nodes/LambdaNode';
 import S3Node from './nodes/S3Node';
-import SgNode from './nodes/SgNode';
 import DynamodbNode from './nodes/DynamodbNode';
 import ServiceNode from './nodes/ServiceNode';
 import { CATALOG, catalogNodeTypeMap, catalogDefaultData, catalogDefaultStyle, catalogZIndex, catalogByType, COLORS } from '../lib/catalog';
 import { computeTypes, defaultPermissions, detectDefaultEdgeType, edgeStyle, edgeTypes } from '../lib/iam';
 
 const nodeTypes: NodeTypes = {
-  vpc: VpcNode,
-  subnet: SubnetNode,
-  ec2: Ec2Node,
-  lambda: LambdaNode,
   s3: S3Node,
-  sg: SgNode,
   dynamodb: DynamodbNode,
-  // Every catalog (Phase-5) service renders with the generic ServiceNode.
+  // Every catalog service renders with the generic ServiceNode.
   ...Object.fromEntries(CATALOG.map((s) => [s.type, ServiceNode])),
 };
 
 const nodeTypeMap: Record<string, string> = {
-  VPC: 'vpc',
-  SUB: 'subnet',
-  EC2: 'ec2',
-  FN: 'lambda',
   S3: 's3',
-  SG: 'sg',
   DDB: 'dynamodb',
   ...catalogNodeTypeMap,
 };
 
 const defaultDataForType: Record<string, Record<string, string>> = {
-  vpc: { label: 'new-vpc', resourceId: '', cidr: '10.0.0.0/16', status: 'draft' },
-  subnet: { label: 'new-subnet', resourceId: '', cidr: '10.0.1.0/24', status: 'draft' },
-  ec2: { label: 'new-instance', resourceId: '', instanceType: 't2.micro', privateIp: '—', overlayIp: '—', status: 'draft' },
-  lambda: { label: 'new-function', runtime: 'python3.12', handler: 'handler.main', memory: '128MB', timeout: '30s', status: 'draft' },
   s3: { label: 'new-bucket', arn: '', status: 'draft' },
-  sg: { label: 'new-sg', groupId: '', vpcId: '', inboundRules: '', outboundRules: '', status: 'draft' },
   dynamodb: { label: 'new-table', hashKey: 'id', billingMode: 'PAY_PER_REQUEST', arn: '', status: 'draft' },
   ...catalogDefaultData,
 };
 
 const defaultStyleForType: Record<string, React.CSSProperties> = {
-  vpc: { width: 560, height: 380 },
-  subnet: { width: 520, height: 280 },
-  ec2: { width: 220 },
-  lambda: { width: 220 },
   s3: { width: 200 },
-  sg: { width: 220 },
   dynamodb: { width: 200 },
   ...catalogDefaultStyle,
 };
 
 
 const zIndexForType: Record<string, number> = {
-  vpc: 0,
-  subnet: 1,
-  ec2: 2,
-  lambda: 2,
   s3: 2,
-  sg: 2,
   dynamodb: 2,
   ...catalogZIndex,
 };
@@ -445,7 +415,7 @@ function InnerCanvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onS
   );
 
   const dblClickTypeRef = useRef(0);
-  const typeOrder = ['ec2', 'lambda', 's3', 'sg', 'vpc', 'subnet'];
+  const typeOrder = ['service', 'dep', 's3', 'sqs', 'dynamodb', 'rds'];
 
   const onPaneDoubleClick = useCallback(
     (event: React.MouseEvent) => {
@@ -617,12 +587,7 @@ function InnerCanvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onS
         <MiniMap
           nodeColor={(node) => {
             const bespoke: Record<string, string> = {
-              vpc: 'rgba(170,85,255,0.4)',
-              subnet: 'rgba(0,187,255,0.4)',
-              ec2: 'rgba(255,136,0,0.6)',
-              lambda: 'rgba(255,221,0,0.6)',
               s3: 'rgba(0,255,136,0.6)',
-              sg: 'rgba(255,51,85,0.6)',
             };
             const t = node.type ?? '';
             if (bespoke[t]) return bespoke[t];

@@ -150,7 +150,7 @@ export default function TopBar({ wsConnected, env, onEnvChange, onPreview, onApp
       <button
         onClick={run('apply', onApply)}
         disabled={disabled}
-        title="Run the canvas for real (⌘↵): containers via Colima, AWS via embedded MiniStack"
+        title="Run the canvas for real (⌘↵): containers via Colima, AWS-shaped resources on real open-source backings"
         className={`font-mono text-xs py-1.5 px-4 border border-neon-green bg-bg-tertiary text-neon-green uppercase tracking-[1px] transition-all duration-200 hover:bg-[rgba(0,255,136,0.1)] hover:shadow-[0_0_12px_rgba(0,255,136,0.2)] ${busy === 'apply' ? 'opacity-50 cursor-wait' : dim || 'cursor-pointer'}`}
       >
         {busy === 'apply' ? 'Applying…' : 'Apply'}

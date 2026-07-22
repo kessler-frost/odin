@@ -14,65 +14,17 @@ interface ConfigPanelProps {
 }
 
 const typeConfig: Record<string, { label: string; neonColor: string; neonBg: string }> = {
-  vpc: { label: 'VPC', neonColor: 'text-neon-purple', neonBg: 'bg-[rgba(170,85,255,0.1)] border-neon-purple' },
-  subnet: { label: 'Subnet', neonColor: 'text-neon-blue', neonBg: 'bg-[rgba(0,187,255,0.1)] border-neon-blue' },
-  ec2: { label: 'EC2', neonColor: 'text-neon-orange', neonBg: 'bg-[rgba(255,136,0,0.1)] border-neon-orange' },
-  lambda: { label: 'Lambda', neonColor: 'text-neon-yellow', neonBg: 'bg-[rgba(255,221,0,0.1)] border-neon-yellow' },
   s3: { label: 'S3', neonColor: 'text-neon-green', neonBg: 'bg-[rgba(0,255,136,0.1)] border-neon-green' },
-  sg: { label: 'Security Group', neonColor: 'text-neon-red', neonBg: 'bg-[rgba(255,51,85,0.1)] border-neon-red' },
   dynamodb: { label: 'DynamoDB', neonColor: 'text-neon-cyan', neonBg: 'bg-[rgba(34,211,238,0.1)] border-neon-cyan' },
   ...catalogTypeConfig,
 };
 
 type FieldDef = { key: string; label: string; editable?: boolean; select?: string[] };
 
-const ec2InstanceTypes = ['t2.micro', 't2.small', 't2.medium'];
-
 const fieldsForType: Record<string, FieldDef[]> = {
-  vpc: [
-    { key: 'label', label: 'Name', editable: true },
-    { key: 'cidr', label: 'CIDR Block', editable: true },
-    { key: 'resourceId', label: 'Resource ID' },
-    { key: 'status', label: 'Status' },
-    { key: 'error', label: 'Error' },
-  ],
-  subnet: [
-    { key: 'label', label: 'Name', editable: true },
-    { key: 'cidr', label: 'CIDR Block', editable: true },
-    { key: 'resourceId', label: 'Resource ID' },
-    { key: 'status', label: 'Status' },
-    { key: 'error', label: 'Error' },
-  ],
-  ec2: [
-    { key: 'label', label: 'Name', editable: true },
-    { key: 'instanceType', label: 'Instance Type', editable: true, select: ec2InstanceTypes },
-    { key: 'resourceId', label: 'Instance ID' },
-    { key: 'privateIp', label: 'Private IP' },
-    { key: 'overlayIp', label: 'Overlay IP' },
-    { key: 'status', label: 'Status' },
-    { key: 'error', label: 'Error' },
-  ],
-  lambda: [
-    { key: 'label', label: 'Name', editable: true },
-    { key: 'runtime', label: 'Runtime', editable: true },
-    { key: 'handler', label: 'Handler', editable: true },
-    { key: 'memory', label: 'Memory', editable: true },
-    { key: 'timeout', label: 'Timeout', editable: true },
-    { key: 'status', label: 'Status' },
-    { key: 'error', label: 'Error' },
-  ],
   s3: [
     { key: 'label', label: 'Name', editable: true },
     { key: 'arn', label: 'ARN' },
-    { key: 'status', label: 'Status' },
-    { key: 'error', label: 'Error' },
-  ],
-  sg: [
-    { key: 'label', label: 'Name', editable: true },
-    { key: 'groupId', label: 'Group ID' },
-    { key: 'vpcId', label: 'VPC ID' },
-    { key: 'inboundRules', label: 'Inbound Rules', editable: true },
-    { key: 'outboundRules', label: 'Outbound Rules', editable: true },
     { key: 'status', label: 'Status' },
     { key: 'error', label: 'Error' },
   ],
