@@ -84,6 +84,19 @@ class BackingAws:
     def _cname(self, d: BackingDef) -> str:
         return f"allfather-aws-{d.name}-{self._env}"
 
+    def _listen_port(self, d: BackingDef) -> int:
+        """The port the backing's process actually listens on INSIDE its
+        container. Normally that's the BackingDef's fixed wire port -- but
+        goaws binds its listener to whatever `Local.Port` its own mounted
+        config says (verified against the real image), and that config is
+        deliberately pointed at the gateway's port, not goaws's own (G4:
+        "goaws builds returned QueueUrls from its configured Host/Port" so
+        a re-dialed QueueUrl stays inside the gateway). So for goaws the
+        real listen port tracks the gateway, and every Docker publish/
+        lookup must use THIS, never the BackingDef's nominal 4100 (which
+        nothing is actually listening on)."""
+        return self._gateway_port if d.name == "goaws" else d.port
+
     def ensure_backing(self, service: str) -> None:
         d = self._backing_for(service)
         cname = self._cname(d)
@@ -99,7 +112,7 @@ class BackingAws:
             (conf_dir / "goaws.yaml").write_text(_goaws_config(self._gateway_port))
             volumes = {str(conf_dir): "/conf"}
         self._rt.run_container(ContainerSpec(
-            name=cname, image=d.image, env=d.env, ports={d.port: 0},
+            name=cname, image=d.image, env=d.env, ports={self._listen_port(d): 0},
             labels={"allfather-env": self._env}, command=d.command, volumes=volumes,
         ))
         deadline = time.monotonic() + READY_TIMEOUT
@@ -114,7 +127,7 @@ class BackingAws:
     def client(self, service: str):
         """Host-side client against the backing's published port (tests/e2e)."""
         d = self._backing_for(service)
-        endpoint = f"http://127.0.0.1:{self._rt.host_port(self._cname(d), d.port)}"
+        endpoint = f"http://127.0.0.1:{self._rt.host_port(self._cname(d), self._listen_port(d))}"
         if self._client_factory:
             return self._client_factory(service, endpoint)
         config = Config(signature_version="s3v4", s3={"addressing_style": "path"}) \
@@ -187,7 +200,7 @@ class BackingAws:
 
     def facts(self, service: str, name: str) -> dict:
         d = self._backing_for(service)
-        endpoint = f"http://{CONTAINER_HOST}:{self._rt.host_port(self._cname(d), d.port)}"
+        endpoint = f"http://{CONTAINER_HOST}:{self._rt.host_port(self._cname(d), self._listen_port(d))}"
         # QUEUE_URL is constructed canonically, pointed at the gateway (not
         # goaws's own direct port) to match the Host/Port baked into
         # goaws.yaml -- the fact and what goaws itself now returns agree.
@@ -204,7 +217,7 @@ class BackingAws:
                "AWS_DEFAULT_REGION": REGION}
         running = (d for d in BACKINGS if self._rt.status(self._cname(d)) == "running")
         for d in running:
-            endpoint = f"http://{CONTAINER_HOST}:{self._rt.host_port(self._cname(d), d.port)}"
+            endpoint = f"http://{CONTAINER_HOST}:{self._rt.host_port(self._cname(d), self._listen_port(d))}"
             for kind in d.kinds:  # goaws yields both _SQS and _SNS from one container
                 env[f"AWS_ENDPOINT_URL_{kind.upper()}"] = endpoint
         return env
@@ -218,7 +231,7 @@ class BackingAws:
         ports: dict[str, int] = {}
         running = (d for d in BACKINGS if self._rt.status(self._cname(d)) == "running")
         for d in running:
-            port = self._rt.host_port(self._cname(d), d.port)
+            port = self._rt.host_port(self._cname(d), self._listen_port(d))
             for kind in d.kinds:
                 ports[kind] = port
         return ports

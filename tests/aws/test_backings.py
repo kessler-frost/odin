@@ -115,7 +115,10 @@ def test_sqs_and_sns_share_one_goaws_container_with_mounted_config(rt, factory, 
     assert spec.name == "allfather-aws-goaws-staging"
     assert spec.image == "admiralpiett/goaws:v0.5.4"
     assert spec.command == ("-config", "/conf/goaws.yaml", "Local")
-    assert spec.ports == {4100: 0}
+    # goaws binds its listener to the config's Local.Port (verified against
+    # the real image), which is deliberately the GATEWAY's port, not 4100 --
+    # Docker must publish that same port or nothing is reachable (G5 bug).
+    assert spec.ports == {DEFAULT_GATEWAY_PORT: 0}
     assert spec.volumes == {str((tmp_path / "staging").resolve()): "/conf"}
     config_text = (tmp_path / "staging" / "goaws.yaml").read_text()
     assert 'AccountId: "000000000000"' in config_text
@@ -131,6 +134,9 @@ def test_goaws_config_uses_the_configured_gateway_port(rt, factory, tmp_path):
     config_text = (tmp_path / "staging" / "goaws.yaml").read_text()
     assert 'Host: "host.docker.internal"' in config_text
     assert 'Port: "5555"' in config_text
+    # the published/queried container port must track the SAME gateway port
+    # goaws was actually told to listen on -- not the BackingDef's nominal 4100.
+    assert rt.runs[0].ports == {5555: 0}
 
 
 def test_ensure_backing_timeout_raises_with_logs(rt, factory, tmp_path, monkeypatch):
