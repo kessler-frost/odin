@@ -81,3 +81,15 @@ def test_destroy_prunes(tmp_path):
         client.post("/destroy")
         world = client.get("/world").json()
         assert world["resources"] == []
+
+
+def test_destroy_revokes_the_envs_gateway_keys(tmp_path):
+    rt, rds = FakeRuntime(), FakeRds()
+    app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, backings=False)
+    with TestClient(app) as client:
+        client.post("/apply", json=CANVAS)
+        access_key, _secret_key = app.state.gateway_keys.issue("default", "db")
+        assert app.state.gateway_keys.lookup(access_key) is not None
+
+        client.post("/destroy")
+        assert app.state.gateway_keys.lookup(access_key) is None

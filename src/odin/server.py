@@ -22,6 +22,7 @@ from odin.aws.backings import BackingAws
 from odin.aws.rds import PostgresRds
 from odin.fabric.localhost import LocalhostFabric
 from odin.fabric.nebula import mesh_state
+from odin.gateway import DEFAULT_GATEWAY_PORT, GATEWAY_PORT_ENV
 from odin.gateway.app import GatewayState, create_gateway_app, serve_in_thread, stop_in_thread
 from odin.gateway.keys import KeyStore, Principal
 from odin.reconcile.reconciler import Reconciler
@@ -33,13 +34,11 @@ from odin.spec.translate import canvas_to_stack, skipped_node_types
 ODIN_DIR = Path(".odin")
 CANVAS_PATH = ODIN_DIR / "canvas.json"
 ENV = "default"
-GATEWAY_PORT_ENV = "ODIN_GATEWAY_PORT"
-DEFAULT_GATEWAY_PORT = 4266
 
 log = logging.getLogger("odin")
 
 
-def create_apply_router(store: SpecStore, reconciler_for) -> APIRouter:
+def create_apply_router(store: SpecStore, reconciler_for, keystore: KeyStore) -> APIRouter:
     router = APIRouter()
 
     @router.post("/apply")
@@ -56,6 +55,7 @@ def create_apply_router(store: SpecStore, reconciler_for) -> APIRouter:
         reconciler = await reconciler_for(env)
         store.apply(Stack(env=env))  # empty desired state -> reconciler prunes all
         await reconciler.tick()
+        keystore.revoke_env(env)  # gateway-issued keys die with the env they belong to
         return {"status": "destroyed", "env": env}
 
     @router.get("/world")
@@ -86,6 +86,18 @@ def create_app(
     _runtime = runtime or ColimaRuntime()
     _store = store or SpecStore(ODIN_DIR)
     ws_manager = ConnectionManager(_store.root)
+    _resolved_gateway_port = gateway_port if gateway_port is not None else int(os.environ.get(GATEWAY_PORT_ENV, DEFAULT_GATEWAY_PORT))
+
+    # The gateway: workload SDK calls carry per-node creds and land here
+    # (checked reverse proxy -> real backing), never the backing directly.
+    # Stateless routing table + key registry, rebuilt every tick from
+    # (Stack, issued keys) -- never a cache that outlives an Apply.
+    gateway_state = GatewayState()
+    gateway_keystore = KeyStore(_store.root)
+    # port=0 (the test default) resolves to an ephemeral port; lifespan fills
+    # this in with the ACTUAL bound port before any reconciler is made, so
+    # BackingAws/`/health` never advertise the possibly-0 request instead.
+    gateway_port_actual: int | None = None
 
     # One reconciler per environment, created lazily. Each gets its own
     # env-scoped rds runner + backing containers, so AWS state stays isolated.
@@ -93,9 +105,9 @@ def create_app(
 
     def _make_reconciler(env: str) -> Reconciler:
         env_rds = rds or PostgresRds(_runtime, env)
-        env_aws = aws or (BackingAws(_runtime, env) if backings else None)
+        env_aws = aws or (BackingAws(_runtime, env, gateway_port=gateway_port_actual) if backings else None)
         return Reconciler(
-            _store, _runtime, env_rds, aws=env_aws, fabric=LocalhostFabric(),
+            _store, _runtime, env_rds, aws=env_aws, gateway=gateway_state, fabric=LocalhostFabric(),
             ws=ws_manager, env=env, poll_interval=1.0,
         )
 
@@ -104,14 +116,6 @@ def create_app(
             reconcilers[env] = _make_reconciler(env)
             await reconcilers[env].start()
         return reconcilers[env]
-
-    # The gateway: workload SDK calls carry per-node creds and land here
-    # (checked reverse proxy -> real backing), never the backing directly.
-    # Stateless routing table + key registry, rebuilt/persisted independent
-    # of the reconciler; `state`/`keystore` are exposed on app.state so the
-    # reconciler's injection swap (a later task) can populate them per Apply.
-    gateway_state = GatewayState()
-    gateway_keystore = KeyStore(_store.root)
 
     async def on_deny(principal: Principal | None, action: str | None, resource: str | None, reason: str) -> None:
         await ws_manager.broadcast({
@@ -124,16 +128,18 @@ def create_app(
         })
 
     gateway_app = create_gateway_app(gateway_state, gateway_keystore, on_deny)
-    _resolved_gateway_port = gateway_port if gateway_port is not None else int(os.environ.get(GATEWAY_PORT_ENV, DEFAULT_GATEWAY_PORT))
     gateway_server = None
     gateway_thread = None
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        nonlocal gateway_server, gateway_thread
+        nonlocal gateway_server, gateway_thread, gateway_port_actual
+        # The gateway listener starts FIRST: reconcilers (built below, for
+        # envs resumed on restart) need the ACTUAL resolved port to point
+        # BackingAws's goaws.yaml at.
+        gateway_server, gateway_thread, gateway_port_actual = serve_in_thread(gateway_app, port=_resolved_gateway_port)
         for env in _store.list_envs():  # resume reconciling existing environments
             await reconciler_for(env)
-        gateway_server, gateway_thread, _ = serve_in_thread(gateway_app, port=_resolved_gateway_port)
         try:
             yield
         finally:
@@ -143,7 +149,7 @@ def create_app(
 
     app = FastAPI(title="allfather", version="0.1.0", lifespan=lifespan)
     app.include_router(create_canvas_router(CANVAS_PATH))
-    app.include_router(create_apply_router(_store, reconciler_for))
+    app.include_router(create_apply_router(_store, reconciler_for, gateway_keystore))
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
@@ -160,7 +166,7 @@ def create_app(
 
     @app.get("/health")
     def health():
-        return {"ok": True}
+        return {"ok": True, "gateway": {"port": gateway_port_actual}}
 
     app.state.store = _store
     app.state.runtime = _runtime

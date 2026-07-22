@@ -4,9 +4,10 @@ from __future__ import annotations
 import asyncio
 import time
 
+from odin.gateway.policy import compile_policies
 from odin.reconcile.reconciler import Reconciler
 from odin.runtime.colima import _STATUS_TO_PHASE, ContainerFacts, HostFacts, RunHandle
-from odin.spec.models import FieldValue, ResourceDesired, Stack
+from odin.spec.models import Edge, FieldValue, ResourceDesired, Stack
 from odin.spec.store import SpecStore
 
 DB = ResourceDesired(id="db", kind="rds", fields={"engine": FieldValue(value="postgres")})
@@ -85,6 +86,17 @@ class FakeAws:
 
     def gc(self, active_kinds):
         self.gc_calls.append(active_kinds)
+
+    def backing_ports(self):
+        return {"s3": 9000}
+
+
+class FakeGateway:
+    def __init__(self):
+        self.calls = []
+
+    def update(self, env, statements_by_node, backing_ports):
+        self.calls.append((env, statements_by_node, backing_ports))
 
 
 async def _yes(*a, **k):
@@ -190,6 +202,44 @@ async def test_gc_called_every_tick_with_active_kinds(tmp_path):
     recon = Reconciler(store, rt, rds, aws=aws, pg_ready=_yes, poll_interval=0)
     await recon.tick()
     assert aws.gc_calls == [set()]  # empty stack -> every backing is stoppable
+
+
+async def test_gateway_updated_every_tick_with_compiled_policies_and_backing_ports(tmp_path):
+    rt, rds, aws, gw = FakeRuntime(), FakeRds(), FakeAws(), FakeGateway()
+    store = SpecStore(tmp_path)
+    stack = Stack(
+        resources=(ResourceDesired(id="uploads", kind="s3"),),
+        edges=(Edge(src="app", dst="uploads", kind="iam", perms=("s3:GetObject",)),),
+    )
+    store.apply(stack)
+    recon = Reconciler(store, rt, rds, aws=aws, gateway=gw, pg_ready=_yes, poll_interval=0)
+
+    await recon.tick()
+    assert len(gw.calls) == 1
+    env, statements_by_node, backing_ports = gw.calls[0]
+    assert env == "default"
+    assert statements_by_node == compile_policies(stack)
+    assert backing_ports == {"s3": 9000}
+
+    await recon.tick()                        # cheap + idempotent: pushed every pass
+    assert len(gw.calls) == 2
+
+
+async def test_gateway_update_uses_empty_ports_without_an_aws_seam(tmp_path):
+    rt, rds, gw = FakeRuntime(), FakeRds(), FakeGateway()
+    store = SpecStore(tmp_path)
+    store.apply(Stack())
+    recon = Reconciler(store, rt, rds, gateway=gw, pg_ready=_yes, poll_interval=0)
+    await recon.tick()
+    assert gw.calls == [("default", {}, {})]
+
+
+async def test_no_gateway_configured_does_not_crash_tick(tmp_path):
+    rt, rds = FakeRuntime(), FakeRds()
+    store = SpecStore(tmp_path)
+    store.apply(Stack())
+    recon = Reconciler(store, rt, rds, pg_ready=_yes, poll_interval=0)
+    await recon.tick()  # gateway=None is the default; must not raise
 
 
 class SlowAws(FakeAws):

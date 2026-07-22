@@ -17,6 +17,7 @@ import boto3
 from botocore.client import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
+from odin.gateway import DEFAULT_GATEWAY_PORT
 from odin.runtime.colima import CONTAINER_HOST, ContainerSpec
 
 PROVISIONED = ("s3", "sqs", "sns", "dynamodb")
@@ -50,11 +51,15 @@ BACKINGS: tuple[BackingDef, ...] = (
 )
 
 # Key casing verified live (AccountId shows up in returned ARNs); the `Local`
-# top-level key matches the positional `Local` in goaws's command.
-GOAWS_CONFIG = """\
+# top-level key matches the positional `Local` in goaws's command. Host/Port
+# point at the gateway, not goaws's own container port: goaws bakes this pair
+# into every QueueUrl/TopicArn it returns, so routing it through the gateway
+# up front is what makes a returned QueueUrl re-dial through the gateway.
+def _goaws_config(gateway_port: int) -> str:
+    return f"""\
 Local:
-  Host: "localhost"
-  Port: "4100"
+  Host: "{CONTAINER_HOST}"
+  Port: "{gateway_port}"
   Region: "us-east-1"
   AccountId: "000000000000"
   LogToFile: false
@@ -66,11 +71,12 @@ _PROBES = {"s3": "list_buckets", "sqs": "list_queues",
 
 class BackingAws:
     def __init__(self, runtime, env: str = "default", root: Path = Path(".odin"),
-                 client_factory=None) -> None:
+                 client_factory=None, gateway_port: int = DEFAULT_GATEWAY_PORT) -> None:
         self._rt = runtime
         self._env = env
         self._root = root
         self._client_factory = client_factory
+        self._gateway_port = gateway_port
 
     def _backing_for(self, service: str) -> BackingDef:
         return next(d for d in BACKINGS if service in d.kinds)
@@ -90,7 +96,7 @@ class BackingAws:
             # Colima shares into the VM — a /tmp mount silently comes up empty).
             conf_dir = (self._root / self._env).resolve()
             conf_dir.mkdir(parents=True, exist_ok=True)
-            (conf_dir / "goaws.yaml").write_text(GOAWS_CONFIG)
+            (conf_dir / "goaws.yaml").write_text(_goaws_config(self._gateway_port))
             volumes = {str(conf_dir): "/conf"}
         self._rt.run_container(ContainerSpec(
             name=cname, image=d.image, env=d.env, ports={d.port: 0},
@@ -182,11 +188,13 @@ class BackingAws:
     def facts(self, service: str, name: str) -> dict:
         d = self._backing_for(service)
         endpoint = f"http://{CONTAINER_HOST}:{self._rt.host_port(self._cname(d), d.port)}"
-        # QUEUE_URL is constructed canonically — goaws's own returned URL host
-        # doesn't resolve from containers; boto3 consumers dial the endpoint anyway.
+        # QUEUE_URL is constructed canonically, pointed at the gateway (not
+        # goaws's own direct port) to match the Host/Port baked into
+        # goaws.yaml -- the fact and what goaws itself now returns agree.
+        gateway_endpoint = f"http://{CONTAINER_HOST}:{self._gateway_port}"
         return {
             "s3": {"BUCKET": name, "endpoint": endpoint},
-            "sqs": {"QUEUE_URL": f"{endpoint}/{ACCOUNT}/{name}", "endpoint": endpoint},
+            "sqs": {"QUEUE_URL": f"{gateway_endpoint}/{ACCOUNT}/{name}", "endpoint": endpoint},
             "sns": {"TOPIC_ARN": f"arn:aws:sns:{REGION}:{ACCOUNT}:{name}", "endpoint": endpoint},
             "dynamodb": {"TABLE": name, "endpoint": endpoint},
         }[service]
@@ -200,6 +208,20 @@ class BackingAws:
             for kind in d.kinds:  # goaws yields both _SQS and _SNS from one container
                 env[f"AWS_ENDPOINT_URL_{kind.upper()}"] = endpoint
         return env
+
+    def backing_ports(self) -> dict[str, int]:
+        """service -> host port of its running backing; the routing table
+        GatewayState.update forwards proxied requests against. A backing
+        that isn't running (or never started) is simply absent -- the
+        gateway then answers with service-unavailable rather than a stale
+        port (PRD: no cache that outlives an Apply)."""
+        ports: dict[str, int] = {}
+        running = (d for d in BACKINGS if self._rt.status(self._cname(d)) == "running")
+        for d in running:
+            port = self._rt.host_port(self._cname(d), d.port)
+            for kind in d.kinds:
+                ports[kind] = port
+        return ports
 
     def gc(self, active_kinds: set[str]) -> None:
         for d in BACKINGS:

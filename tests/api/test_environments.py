@@ -16,7 +16,7 @@ S3_ONLY = {"nodes": [{"type": "s3", "data": {"label": "uploads"}}], "edges": []}
 class FakeAws:
     """Per-env stand-in for BackingAws (same constructor signature)."""
 
-    def __init__(self, runtime, env="default"):
+    def __init__(self, runtime, env="default", gateway_port=4266):
         self.env = env
         self.provisioned = []
 
@@ -34,6 +34,9 @@ class FakeAws:
 
     def gc(self, active_kinds):
         pass
+
+    def backing_ports(self):
+        return {}
 
 
 def test_environments_are_isolated_and_listed(tmp_path):

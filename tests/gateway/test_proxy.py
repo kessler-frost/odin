@@ -398,6 +398,11 @@ def test_real_boto3_client_raises_invalid_client_token_id_for_unknown_key(tmp_pa
 def test_create_app_boots_gateway_thread_and_health_still_works(tmp_path):
     app = create_app(store=SpecStore(tmp_path), backings=False, gateway_port=0)
     with TestClient(app) as client:
-        assert client.get("/health").json() == {"ok": True}
+        health = client.get("/health").json()
+        assert health["ok"] is True
+        # port=0 resolves to an ephemeral port; /health must report the
+        # ACTUAL bound port, never the 0 that was requested.
+        assert isinstance(health["gateway"]["port"], int)
+        assert health["gateway"]["port"] > 0
     assert app.state.gateway is not None
     assert app.state.gateway_keys is not None

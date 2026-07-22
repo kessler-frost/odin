@@ -12,6 +12,7 @@ from botocore.exceptions import ClientError
 
 from odin.aws import backings
 from odin.aws.backings import ACCESS_KEY, ACCOUNT, BackingAws, REGION, SECRET_KEY
+from odin.gateway import DEFAULT_GATEWAY_PORT
 from odin.runtime.colima import ContainerSpec
 
 
@@ -116,7 +117,20 @@ def test_sqs_and_sns_share_one_goaws_container_with_mounted_config(rt, factory, 
     assert spec.command == ("-config", "/conf/goaws.yaml", "Local")
     assert spec.ports == {4100: 0}
     assert spec.volumes == {str((tmp_path / "staging").resolve()): "/conf"}
-    assert 'AccountId: "000000000000"' in (tmp_path / "staging" / "goaws.yaml").read_text()
+    config_text = (tmp_path / "staging" / "goaws.yaml").read_text()
+    assert 'AccountId: "000000000000"' in config_text
+    # Host/Port point at the gateway (not goaws's own container port) so
+    # goaws's returned QueueUrls/TopicArns re-dial through the gateway.
+    assert 'Host: "host.docker.internal"' in config_text
+    assert f'Port: "{DEFAULT_GATEWAY_PORT}"' in config_text
+
+
+def test_goaws_config_uses_the_configured_gateway_port(rt, factory, tmp_path):
+    aws = BackingAws(rt, env="staging", root=tmp_path, client_factory=factory, gateway_port=5555)
+    aws.ensure_backing("sqs")
+    config_text = (tmp_path / "staging" / "goaws.yaml").read_text()
+    assert 'Host: "host.docker.internal"' in config_text
+    assert 'Port: "5555"' in config_text
 
 
 def test_ensure_backing_timeout_raises_with_logs(rt, factory, tmp_path, monkeypatch):
@@ -205,12 +219,30 @@ def test_facts_shapes_for_all_four_kinds(rt, factory, tmp_path):
     s3_ep = f"http://host.docker.internal:{rt.ports['allfather-aws-rustfs-default']}"
     goaws_ep = f"http://host.docker.internal:{rt.ports['allfather-aws-goaws-default']}"
     ddb_ep = f"http://host.docker.internal:{rt.ports['allfather-aws-dynalite-default']}"
+    gateway_ep = f"http://host.docker.internal:{DEFAULT_GATEWAY_PORT}"
     assert aws.facts("s3", "uploads") == {"BUCKET": "uploads", "endpoint": s3_ep}
+    # QUEUE_URL is the one fact re-pointed at the gateway (matches goaws.yaml's
+    # own Host/Port); "endpoint" stays the backing's own direct port.
     assert aws.facts("sqs", "jobs") == {
-        "QUEUE_URL": f"{goaws_ep}/{ACCOUNT}/jobs", "endpoint": goaws_ep}
+        "QUEUE_URL": f"{gateway_ep}/{ACCOUNT}/jobs", "endpoint": goaws_ep}
     assert aws.facts("sns", "alerts") == {
         "TOPIC_ARN": f"arn:aws:sns:{REGION}:{ACCOUNT}:alerts", "endpoint": goaws_ep}
     assert aws.facts("dynamodb", "tasks") == {"TABLE": "tasks", "endpoint": ddb_ep}
+
+
+def test_backing_ports_maps_service_to_running_backings_host_port(rt, factory, tmp_path):
+    aws = _aws(rt, factory, tmp_path)
+    aws.ensure_backing("s3")
+    aws.ensure_backing("sqs")  # goaws also serves sns from the same container
+    assert aws.backing_ports() == {
+        "s3": rt.ports["allfather-aws-rustfs-default"],
+        "sqs": rt.ports["allfather-aws-goaws-default"],
+        "sns": rt.ports["allfather-aws-goaws-default"],
+    }
+
+
+def test_backing_ports_empty_when_nothing_running(rt, factory, tmp_path):
+    assert _aws(rt, factory, tmp_path).backing_ports() == {}
 
 
 def test_aws_env_yields_sqs_and_sns_from_one_goaws_plus_creds(rt, factory, tmp_path):

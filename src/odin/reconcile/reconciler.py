@@ -5,6 +5,14 @@ advancing started resources to healthy/crashed; (2) plan(Stack, World) → Actio
 (3) execute — provision/stop. The pure plan() decides intent; this executor
 builds specs (resolving refs via the Fabric) and runs them. Scope: rds + the
 AWS-shaped PROVISIONED resources, single host.
+
+Per-node credential injection (a workload container's env bound to
+keystore-issued creds + the gateway endpoint, formerly `_run_service`) is
+deferred with the app-workload layer (NORTHSTAR.md, tag app-layer-parked) —
+it returns here when workload nodes do. What tick() does today: push
+(compiled policies, backing ports) into GatewayState every pass so the
+gateway enforces against whatever Stack is applied, even before anything
+dials in through it.
 """
 from __future__ import annotations
 
@@ -13,6 +21,7 @@ import logging
 
 from odin.aws.backings import PROVISIONED
 from odin.fabric.localhost import LocalhostFabric
+from odin.gateway.policy import compile_policies
 from odin.reconcile import assertions
 from odin.reconcile.actions import NoOp, ProvisionResource, StopContainer
 from odin.reconcile.plan import plan
@@ -29,6 +38,7 @@ class Reconciler:
         runtime,
         rds,
         aws=None,
+        gateway=None,
         fabric: LocalhostFabric | None = None,
         ws=None,
         env: str = "default",
@@ -39,6 +49,7 @@ class Reconciler:
         self._rt = runtime
         self._rds = rds
         self._aws = aws
+        self._gateway = gateway
         self._fabric = fabric or LocalhostFabric()
         self._ws = ws
         self._env = env
@@ -79,6 +90,9 @@ class Reconciler:
                 await self._execute(action, stack)
             if self._aws is not None:  # stop backings no active kind needs anymore
                 await asyncio.to_thread(self._aws.gc, {r.kind for r in stack.resources})
+            if self._gateway is not None:  # policies/ports always track the applied Stack
+                ports = await asyncio.to_thread(self._aws.backing_ports) if self._aws is not None else {}
+                self._gateway.update(self._env, compile_policies(stack), ports)
 
     # ---- helpers ----
     def _res(self, stack: Stack, rid: str) -> ResourceDesired:
