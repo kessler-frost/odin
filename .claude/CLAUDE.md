@@ -53,7 +53,7 @@ work.
 ## Conventions
 - **`bun`** (not npm/npx/yarn/pnpm); **`uv`** (not pip); **`python`** (not python3).
 - Pathlib for paths; imports at top; minimize if/else + try/except; structured I/O (Pydantic) over regex.
-- Permissive licenses only (Apache/MIT/BSD/MPL). Branch work on `allfather`; never merge to `main` without asking.
+- Permissive licenses only (Apache/MIT/BSD/MPL). Branch work on `develop`; merge to `main` only for releases (locally, no PRs), then push.
 - Lima via `limactl` CLI; containers via Colima `docker` (default) or `nerdctl` in a Lima VM.
 
 ## Cleanup / Disk (limited headroom — clean up after EVERY heavy step)
