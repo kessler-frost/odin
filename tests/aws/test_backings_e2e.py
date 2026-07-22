@@ -87,7 +87,7 @@ def runtime():
 
 
 def test_sqs_roundtrip(tmp_path, runtime):
-    app = create_app(runtime=runtime, store=SpecStore(tmp_path), complete=False)
+    app = create_app(runtime=runtime, store=SpecStore(tmp_path))
     with TestClient(app) as client:
         client.post("/apply", json=CANVAS_SQS)
         _wait(client, lambda p: p.get("jobs") == "healthy")
@@ -103,7 +103,7 @@ def test_sqs_roundtrip(tmp_path, runtime):
 
 
 def test_sns_to_sqs_delivery(tmp_path, runtime):
-    app = create_app(runtime=runtime, store=SpecStore(tmp_path), complete=False)
+    app = create_app(runtime=runtime, store=SpecStore(tmp_path))
     with TestClient(app) as client:
         client.post("/apply", json=CANVAS_SNS)
         _wait(client, lambda p: p.get("alerts") == "healthy" and p.get("jobs") == "healthy")
@@ -133,7 +133,7 @@ def test_sns_to_sqs_delivery(tmp_path, runtime):
 
 
 def test_dynamodb_put_get(tmp_path, runtime):
-    app = create_app(runtime=runtime, store=SpecStore(tmp_path), complete=False)
+    app = create_app(runtime=runtime, store=SpecStore(tmp_path))
     with TestClient(app) as client:
         client.post("/apply", json=CANVAS_DDB)
         _wait(client, lambda p: p.get("sessions") == "healthy")  # npx cold start is slow
@@ -149,7 +149,7 @@ def test_dynamodb_put_get(tmp_path, runtime):
 
 
 def test_env_isolation(tmp_path, runtime):
-    app = create_app(runtime=runtime, store=SpecStore(tmp_path), complete=False)
+    app = create_app(runtime=runtime, store=SpecStore(tmp_path))
     with TestClient(app) as client:
         client.post("/apply", params={"env": "a"}, json=CANVAS_S3)
         client.post("/apply", params={"env": "b"}, json=CANVAS_S3)
@@ -176,7 +176,7 @@ def test_env_isolation(tmp_path, runtime):
 
 
 def test_backing_crash_recovers(tmp_path, runtime):
-    app = create_app(runtime=runtime, store=SpecStore(tmp_path), complete=False)
+    app = create_app(runtime=runtime, store=SpecStore(tmp_path))
     with TestClient(app) as client:
         client.post("/apply", json=CANVAS_S3)
         _wait(client, lambda p: p.get("uploads") == "healthy")

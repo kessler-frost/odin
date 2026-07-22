@@ -1,111 +1,38 @@
 """S2.1 — the pure plan(Stack, World) -> [Action] across lifecycle states."""
 from __future__ import annotations
 
-from odin.reconcile.actions import (
-    NoOp,
-    ProvisionResource,
-    RunContainer,
-    StopContainer,
-)
+from odin.reconcile.actions import NoOp, ProvisionResource, StopContainer
 from odin.reconcile.plan import plan
-from odin.spec.models import (
-    FieldValue,
-    Ref,
-    ResourceDesired,
-    ResourceObserved,
-    Stack,
-    World,
-)
+from odin.spec.models import FieldValue, ResourceDesired, ResourceObserved, Stack, World
 
 DB = ResourceDesired(id="db", kind="rds", fields={"engine": FieldValue(value="postgres")})
-API = ResourceDesired(
-    id="api", kind="service", fields={"image": FieldValue(value="app:latest")},
-    refs=(Ref(var="DATABASE_URL", target_id="db", target_attr="DATABASE_URL"),),
-)
-STACK = Stack(resources=(DB, API))
+STACK = Stack(resources=(DB,))
 
 
 def _world(*observed: ResourceObserved) -> World:
     return World(resources=observed)
 
 
-def test_empty_world_creates_db_and_gates_app():
+def test_empty_world_creates_db():
     actions = plan(STACK, World())
     assert ProvisionResource(id="db", service="rds") in actions
-    # api gated on db (not healthy yet) -> NoOp, no RunContainer
-    assert RunContainer(id="api") not in actions
-    assert NoOp(id="api") in actions
 
 
-def test_app_runs_once_db_healthy():
-    world = _world(
-        ResourceObserved(id="db", kind="rds", phase="healthy",
-                         facts={"DATABASE_URL": "postgres://x"}),
-    )
-    actions = plan(STACK, world)
-    assert RunContainer(id="api") in actions
-    assert NoOp(id="db") in actions  # db healthy -> no-op
+def test_db_noop_once_healthy():
+    world = _world(ResourceObserved(id="db", kind="rds", phase="healthy", facts={"DATABASE_URL": "x"}))
+    assert plan(STACK, world) == [NoOp(id="db")]
 
 
-def test_idempotent_when_all_healthy():
-    world = _world(
-        ResourceObserved(id="db", kind="rds", phase="healthy", facts={"DATABASE_URL": "x"}),
-        ResourceObserved(id="api", kind="service", phase="healthy"),
-    )
-    assert plan(STACK, world) == [NoOp(id="db"), NoOp(id="api")]
+def test_db_recreated_when_crashed():
+    world = _world(ResourceObserved(id="db", kind="rds", phase="crashed"))
+    assert ProvisionResource(id="db", service="rds") in plan(STACK, world)
 
 
-def test_restart_crashed_service():
-    world = _world(
-        ResourceObserved(id="db", kind="rds", phase="healthy", facts={"DATABASE_URL": "x"}),
-        ResourceObserved(id="api", kind="service", phase="crashed"),
-    )
-    assert RunContainer(id="api") in plan(STACK, world)
-
-
-def test_errored_service_recovers_when_refs_ready():
-    world = _world(
-        ResourceObserved(id="db", kind="rds", phase="healthy", facts={"DATABASE_URL": "x"}),
-        ResourceObserved(id="api", kind="service", phase="error"),
-    )
-    assert RunContainer(id="api") in plan(STACK, world)
-
-
-def test_two_services_share_one_db():
-    api2 = ResourceDesired(
-        id="api2", kind="service", fields={"image": FieldValue(value="app:latest")},
-        refs=(Ref(var="DATABASE_URL", target_id="db", target_attr="DATABASE_URL"),),
-    )
-    stack = Stack(resources=(DB, API, api2))
-    world = _world(
-        ResourceObserved(id="db", kind="rds", phase="healthy", facts={"DATABASE_URL": "x"}),
-    )
-    actions = plan(stack, world)
-    assert RunContainer(id="api") in actions and RunContainer(id="api2") in actions
-
-
-def test_batch_runs_once_then_terminal():
-    job = ResourceDesired(id="job", kind="batch", fields={"image": FieldValue(value="busybox")})
-    stack = Stack(resources=(job,))
-    assert RunContainer(id="job") in plan(stack, World())          # pending -> run
-    for terminal in ("running", "done", "error"):
-        world = _world(ResourceObserved(id="job", kind="batch", phase=terminal))
-        assert plan(stack, world) == [NoOp(id="job")]             # never re-run
-
-
-def test_crash_looped_workload_is_not_rerun():
+def test_crash_looped_rds_gives_up():
     from odin.reconcile.plan import MAX_RESTARTS
 
-    svc = ResourceDesired(id="svc", kind="service", fields={"image": FieldValue(value="bad")})
-    stack = Stack(resources=(svc,))
-    under = _world(ResourceObserved(id="svc", kind="service", phase="crashed", restarts=MAX_RESTARTS - 1))
-    assert plan(stack, under) == [RunContainer(id="svc")]          # still retrying under the cap
-    at_cap = _world(ResourceObserved(id="svc", kind="service", phase="crashed", restarts=MAX_RESTARTS))
-    assert plan(stack, at_cap) == [NoOp(id="svc")]                 # given up at the cap
-
-    db_stack = Stack(resources=(DB,))
-    rds_capped = _world(ResourceObserved(id="db", kind="rds", phase="crashed", restarts=MAX_RESTARTS))
-    assert plan(db_stack, rds_capped) == [NoOp(id="db")]           # rds recreate churn stops too
+    at_cap = _world(ResourceObserved(id="db", kind="rds", phase="crashed", restarts=MAX_RESTARTS))
+    assert plan(STACK, at_cap) == [NoOp(id="db")]           # rds recreate churn stops too
 
 
 def test_aws_resource_created_once_then_exists():
@@ -117,6 +44,6 @@ def test_aws_resource_created_once_then_exists():
 
 
 def test_prune_extra():
-    world = _world(ResourceObserved(id="ghost", kind="service", phase="healthy"))
+    world = _world(ResourceObserved(id="ghost", kind="rds", phase="healthy"))
     actions = plan(STACK, world)
-    assert StopContainer(id="ghost", name="ghost", kind="service") in actions
+    assert StopContainer(id="ghost", name="ghost", kind="rds") in actions

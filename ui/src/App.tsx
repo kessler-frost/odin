@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import type { Node, Edge } from '@xyflow/react';
 import TopBar from './components/TopBar';
 import Sidebar from './components/Sidebar';
@@ -9,8 +9,6 @@ import BottomPanel from './components/BottomPanel';
 export type BottomState = 'default' | 'collapsed' | 'half';
 
 type Toast = { id: number; kind: 'success' | 'error' | 'info'; text: string };
-type Diff = Record<string, Record<string, unknown>>;
-type PreviewState = { open: boolean; loading: boolean; diff: Diff };
 
 // --- Toasts: surface the result of real-infra actions instead of swallowing them ---
 function Toasts({ toasts }: { toasts: Toast[] }) {
@@ -26,59 +24,6 @@ function Toasts({ toasts }: { toasts: Toast[] }) {
           {t.text}
         </div>
       ))}
-    </div>
-  );
-}
-
-// --- Preview: the AI's staged changeset, as a themed drawer (was a window.alert) ---
-function PreviewDrawer({ diff, onApply, onClose }: { diff: Diff; onApply: () => void; onClose: () => void }) {
-  useEffect(() => {
-    const h = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
-    window.addEventListener('keydown', h);
-    return () => window.removeEventListener('keydown', h);
-  }, [onClose]);
-  const entries = Object.entries(diff);
-  const empty = entries.length === 0;
-  return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60" onClick={onClose}>
-      <div onClick={e => e.stopPropagation()} className="w-[460px] max-h-[70vh] flex flex-col bg-bg-secondary border border-border-bright shadow-2xl">
-        <div className="px-4 py-3 border-b border-border flex items-center justify-between">
-          <div className="font-mono text-[11px] text-text-secondary uppercase tracking-[2px]">
-            Staged changes <span className="text-neon-blue">[AI]</span>
-          </div>
-          <button onClick={onClose} className="font-mono text-[10px] text-text-muted hover:text-text-primary cursor-pointer uppercase tracking-[1px]">esc ✕</button>
-        </div>
-        <div className="px-4 py-3 overflow-y-auto flex-1">
-          {empty ? (
-            <p className="text-text-muted font-mono text-xs py-8 text-center leading-relaxed">
-              No AI-proposed changes.<br />Apply will run the canvas as drawn.
-            </p>
-          ) : entries.map(([id, fields]) => (
-            <div key={id} className="mb-3">
-              <div className="font-mono text-xs text-text-primary mb-1 flex items-center gap-1.5">
-                <span className="w-1.5 h-1.5 rounded-full bg-neon-blue" />{id}
-              </div>
-              {Object.entries(fields).map(([k, v]) => (
-                <div key={k} className="font-mono text-[11px] pl-3.5 leading-relaxed">
-                  <span className="text-text-muted">{k}</span>
-                  <span className="text-text-muted"> = </span>
-                  <span className="text-neon-green">{String(v)}</span>
-                </div>
-              ))}
-            </div>
-          ))}
-        </div>
-        <div className="px-4 py-3 border-t border-border flex gap-2 justify-end">
-          <button onClick={onClose} className="font-mono text-xs py-1.5 px-3 border border-border-bright bg-bg-tertiary text-text-secondary cursor-pointer uppercase tracking-[1px] hover:text-text-primary transition-colors">
-            Dismiss
-          </button>
-          {!empty && (
-            <button onClick={onApply} className="font-mono text-xs py-1.5 px-3 border border-neon-green bg-bg-tertiary text-neon-green cursor-pointer uppercase tracking-[1px] hover:bg-[rgba(0,255,136,0.1)] transition-colors">
-              Apply changes
-            </button>
-          )}
-        </div>
-      </div>
     </div>
   );
 }
@@ -99,7 +44,6 @@ export default function App() {
   const [clearLogSignal, setClearLogSignal] = useState(0);
 
   const [toasts, setToasts] = useState<Toast[]>([]);
-  const [preview, setPreview] = useState<PreviewState>({ open: false, loading: false, diff: {} });
   const toastId = useRef(0);
 
   const pushToast = useCallback((kind: Toast['kind'], text: string) => {
@@ -142,24 +86,6 @@ export default function App() {
 
   const handleValidateSelected = handleApply;
 
-  // Staged changeset: show what the AI would fill, in a drawer, before committing.
-  const handlePreview = useCallback(async () => {
-    const canvas = await readCanvas();
-    if (!canvas) return;
-    setPreview(p => ({ ...p, loading: true }));
-    try {
-      const res = await fetch(`/preview?env=${encodeURIComponent(env)}`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(canvas),
-      });
-      if (!res.ok) throw new Error(String(res.status));
-      const body = await res.json();
-      setPreview({ open: true, loading: false, diff: body.diff ?? {} });
-    } catch {
-      setPreview({ open: false, loading: false, diff: {} });
-      pushToast('error', 'Preview failed — could not reach the AI');
-    }
-  }, [env, readCanvas, pushToast]);
-
   const handleDestroy = useCallback(async () => {
     try {
       const res = await fetch(`/destroy?env=${encodeURIComponent(env)}`, { method: 'POST' });
@@ -198,7 +124,7 @@ export default function App() {
       }}
     >
       {/* Row 1: TopBar */}
-      <div className="col-span-full"><TopBar wsConnected={wsConnected} env={env} onEnvChange={setEnv} onPreview={handlePreview} onApply={handleApply} onDestroy={handleDestroy} onReset={() => { resetDraftsRef.current?.(); setClearLogSignal(s => s + 1); }} /></div>
+      <div className="col-span-full"><TopBar wsConnected={wsConnected} env={env} onEnvChange={setEnv} onApply={handleApply} onDestroy={handleDestroy} onReset={() => { resetDraftsRef.current?.(); setClearLogSignal(s => s + 1); }} /></div>
 
       {/* Row 2: Sidebar + Canvas + Config */}
       <div className="overflow-hidden">
@@ -250,13 +176,6 @@ export default function App() {
         <BottomPanel bottomState={bottomState} activeEnv={env} onCycleBottom={cycleBottom} onWsStatusChange={setWsConnected} onResourceStatus={handleResourceStatus} onConfigUpdate={handleConfigUpdate} clearSignal={clearLogSignal} />
       </div>
 
-      {preview.open && (
-        <PreviewDrawer
-          diff={preview.diff}
-          onApply={() => { setPreview(p => ({ ...p, open: false })); handleApply(); }}
-          onClose={() => setPreview(p => ({ ...p, open: false }))}
-        />
-      )}
       <Toasts toasts={toasts} />
     </div>
   );

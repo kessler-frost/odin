@@ -1,8 +1,9 @@
-// Catalog-driven service definitions: workloads plus AWS-shaped resources on
-// real open-source backings. Adding a service = one entry here (plus a backend
-// ResourceSpec). The bespoke S3/DynamoDB nodes stay as-is; everything here is
-// rendered by the generic ServiceNode and merged into the Canvas/ConfigPanel/
-// Sidebar/IAM maps.
+// Catalog-driven service definitions: AWS-shaped resources, mostly on real
+// open-source backings (sqs/sns/rds live today; the rest are future-coverage
+// placeholders — see NORTHSTAR.md directive 5). Adding a service = one entry
+// here (plus a backend ResourceSpec). The bespoke S3/DynamoDB nodes stay
+// as-is; everything here is rendered by the generic ServiceNode and merged
+// into the Canvas/ConfigPanel/Sidebar/IAM maps.
 //
 // Class strings are written out in full (not constructed) so Tailwind's scanner
 // keeps them.
@@ -46,54 +47,6 @@ export type ServiceDef = {
 };
 
 export const CATALOG: ServiceDef[] = [
-  {
-    type: 'service', abbr: 'APP', label: 'App Service', sublabel: 'Your container',
-    category: 'Compute', color: 'cyan', width: 220,
-    fields: [
-      { key: 'label', label: 'Name', editable: true },
-      { key: 'image', label: 'Image', editable: true },
-      { key: 'port', label: 'Port', editable: true },
-      { key: 'DATABASE_URL', label: 'DATABASE_URL', editable: true },
-    ],
-    defaultData: {
-      label: 'api', image: 'allfather-skel-app:latest', port: '8000',
-      DATABASE_URL: '${{db.DATABASE_URL}}',
-    },
-    primary: { key: 'image', label: 'Image' },
-  },
-  {
-    type: 'dep', abbr: 'DEP', label: 'Dependency', sublabel: 'Container (Redis, etc.)',
-    category: 'Compute', color: 'rose', width: 220,
-    fields: [
-      { key: 'label', label: 'Name', editable: true },
-      { key: 'image', label: 'Image', editable: true },
-      { key: 'port', label: 'Port', editable: true },
-    ],
-    defaultData: { label: 'redis', image: 'redis:7-alpine', port: '6379' },
-    primary: { key: 'image', label: 'Image' },
-  },
-  {
-    type: 'llm', abbr: 'LLM', label: 'LLM Endpoint', sublabel: 'Local model (omlx)',
-    category: 'Compute', color: 'fuchsia', width: 220,
-    fields: [
-      { key: 'label', label: 'Name', editable: true },
-      { key: 'image', label: 'Server image', editable: true },
-      { key: 'port', label: 'Port', editable: true },
-      { key: 'memory_mib', label: 'Memory (MiB)', editable: true },
-    ],
-    defaultData: { label: 'model', image: 'omlx-server:latest', port: '1234', memory_mib: '4096' },
-    primary: { key: 'image', label: 'Server' },
-  },
-  {
-    type: 'batch', abbr: 'JOB', label: 'Batch Job', sublabel: 'Run-to-completion',
-    category: 'Compute', color: 'amber', width: 220,
-    fields: [
-      { key: 'label', label: 'Name', editable: true },
-      { key: 'image', label: 'Image', editable: true },
-    ],
-    defaultData: { label: 'job', image: 'busybox:latest' },
-    primary: { key: 'image', label: 'Image' },
-  },
   {
     type: 'sqs', abbr: 'SQS', label: 'SQS Queue', sublabel: 'Message queue',
     category: 'Integration', color: 'pink', width: 200,

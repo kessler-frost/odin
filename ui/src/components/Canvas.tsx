@@ -415,7 +415,7 @@ function InnerCanvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onS
   );
 
   const dblClickTypeRef = useRef(0);
-  const typeOrder = ['service', 'dep', 's3', 'sqs', 'dynamodb', 'rds'];
+  const typeOrder = ['s3', 'sqs', 'dynamodb', 'rds'];
 
   const onPaneDoubleClick = useCallback(
     (event: React.MouseEvent) => {

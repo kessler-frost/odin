@@ -22,7 +22,7 @@ def runtime():
 
 
 def test_s3_node_provisions_bucket(tmp_path, runtime):
-    app = create_app(runtime=runtime, store=SpecStore(tmp_path), complete=False)
+    app = create_app(runtime=runtime, store=SpecStore(tmp_path))
     with TestClient(app) as client:
         client.post("/apply", json=CANVAS)
         deadline = time.monotonic() + 30

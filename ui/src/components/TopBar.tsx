@@ -14,23 +14,21 @@ function Led({ state }: { state: LedState }) {
   return <div className={`w-1.5 h-1.5 rounded-full ${ledStyles[state]}`} />;
 }
 
-type Busy = null | 'apply' | 'preview' | 'destroy';
+type Busy = null | 'apply' | 'destroy';
 
 interface TopBarProps {
   wsConnected?: boolean;
   env?: string;
   onEnvChange?: (env: string) => void;
-  onPreview?: () => Promise<void>;
   onApply?: () => Promise<void>;
   onDestroy?: () => Promise<void>;
   onReset?: () => void;
 }
 
-export default function TopBar({ wsConnected, env, onEnvChange, onPreview, onApply, onDestroy, onReset }: TopBarProps) {
+export default function TopBar({ wsConnected, env, onEnvChange, onApply, onDestroy, onReset }: TopBarProps) {
   const [busy, setBusy] = useState<Busy>(null);
   const [armed, setArmed] = useState<null | 'destroy' | 'reset'>(null);
   const [backendUp, setBackendUp] = useState(false);
-  const [agentUp, setAgentUp] = useState(false);
   const [envs, setEnvs] = useState<string[]>([]);
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -43,7 +41,6 @@ export default function TopBar({ wsConnected, env, onEnvChange, onPreview, onApp
       const res = await fetch(`${API}/health`).then(r => r.json()).catch(() => null);
       if (!mountedRef.current) return;
       setBackendUp(!!res);
-      setAgentUp(res?.agent ?? false);
     };
     poll();
     const interval = setInterval(poll, 5000);
@@ -101,7 +98,6 @@ export default function TopBar({ wsConnected, env, onEnvChange, onPreview, onApp
 
   const backendLed: LedState = backendUp ? 'green' : 'red';
   const wsLed: LedState = wsConnected ? 'green' : backendUp ? 'yellow' : 'red';
-  const agentLed: LedState = agentUp ? 'green' : backendUp ? 'yellow' : 'red';
 
   const disabled = !!busy || !backendUp;
   const dim = disabled ? 'opacity-40 cursor-not-allowed' : '';
@@ -121,10 +117,6 @@ export default function TopBar({ wsConnected, env, onEnvChange, onPreview, onApp
           <Led state={wsLed} />
           WebSocket
         </div>
-        <div className="flex items-center gap-1.5 text-text-secondary" title={agentUp ? 'Agent ready' : 'Agent unavailable'}>
-          <Led state={agentLed} />
-          Agent
-        </div>
       </div>
       <div className="flex-1"></div>
       <input
@@ -139,14 +131,6 @@ export default function TopBar({ wsConnected, env, onEnvChange, onPreview, onApp
       <datalist id="env-list">
         {envs.map(e => <option key={e} value={e} />)}
       </datalist>
-      <button
-        onClick={run('preview', onPreview)}
-        disabled={disabled}
-        title="Preview the AI's proposed config changes before applying"
-        className={`font-mono text-xs py-1.5 px-3 border border-border-bright bg-bg-tertiary text-text-secondary uppercase tracking-[1px] transition-all duration-200 hover:text-neon-blue hover:border-neon-blue ${busy === 'preview' ? 'opacity-50 cursor-wait' : dim || 'cursor-pointer'}`}
-      >
-        {busy === 'preview' ? 'Preview…' : 'Preview'}
-      </button>
       <button
         onClick={run('apply', onApply)}
         disabled={disabled}

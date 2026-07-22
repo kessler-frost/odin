@@ -1,8 +1,8 @@
 """allfather FastAPI app factory.
 
 The canvas authors a desired-state Stack; a continuous Reconciler drives reality
-(real containers via Colima — apps, Postgres for rds nodes, and per-env backing
-containers for the AWS-shaped resources); the World projects back to the canvas
+(real Postgres for rds nodes, and per-env backing containers for the
+AWS-shaped resources, both via Colima); the World projects back to the canvas
 over WebSocket.
 """
 from __future__ import annotations
@@ -22,7 +22,6 @@ from odin.aws.rds import PostgresRds
 from odin.fabric.localhost import LocalhostFabric
 from odin.fabric.nebula import mesh_state
 from odin.reconcile.reconciler import Reconciler
-from odin.reconcile.scheduler import Scheduler
 from odin.runtime.colima import ColimaRuntime
 from odin.spec.models import Stack
 from odin.spec.store import SpecStore
@@ -35,7 +34,7 @@ ENV = "default"
 log = logging.getLogger("odin")
 
 
-def create_apply_router(store: SpecStore, reconciler_for, complete_fn=None) -> APIRouter:
+def create_apply_router(store: SpecStore, reconciler_for) -> APIRouter:
     router = APIRouter()
 
     @router.post("/apply")
@@ -43,11 +42,6 @@ def create_apply_router(store: SpecStore, reconciler_for, complete_fn=None) -> A
         reconciler = await reconciler_for(env)
         canvas = graph.model_dump()
         stack = canvas_to_stack(canvas, env=env)
-        if complete_fn is not None:  # best-effort AI completion; defaults cover failure
-            try:
-                stack = await complete_fn(stack)
-            except Exception:
-                log.exception("brain completion failed; applying as-is")
         rev = store.apply(stack)
         await reconciler.tick()  # kick an immediate pass; the loop continues it
         return {"status": "applied", "rev": rev, "env": env, "skipped": skipped_node_types(canvas)}
@@ -58,32 +52,6 @@ def create_apply_router(store: SpecStore, reconciler_for, complete_fn=None) -> A
         store.apply(Stack(env=env))  # empty desired state -> reconciler prunes all
         await reconciler.tick()
         return {"status": "destroyed", "env": env}
-
-    @router.post("/preview")
-    async def preview(graph: CanvasGraph, env: str = ENV) -> dict:
-        """Staged changeset: what the AI would fill, for review before Apply."""
-        from odin.agent.completion import ai_diff
-
-        canvas = graph.model_dump()
-        stack = canvas_to_stack(canvas, env=env)
-        if complete_fn is not None:
-            try:
-                stack = await complete_fn(stack)
-            except Exception:
-                log.exception("preview completion failed")
-        return {"diff": ai_diff(stack), "env": env, "skipped": skipped_node_types(canvas)}
-
-    @router.post("/review-iam")
-    async def review_iam_route(graph: CanvasGraph, env: str = ENV) -> dict:
-        from odin.agent.brain import review_iam
-
-        stack = canvas_to_stack(graph.model_dump(), env=env)
-        try:
-            findings = await review_iam(stack)
-        except Exception:
-            log.exception("iam review failed")
-            findings = []
-        return {"findings": findings, "env": env}
 
     @router.get("/world")
     def world(env: str = ENV) -> dict:
@@ -108,16 +76,10 @@ def create_app(
     rds=None,
     aws=None,
     backings: bool = True,
-    complete: bool = True,
 ) -> FastAPI:
     _runtime = runtime or ColimaRuntime()
     _store = store or SpecStore(ODIN_DIR)
     ws_manager = ConnectionManager(_store.root)
-    scheduler = Scheduler(_runtime.ensure_host().total_mem_mib or 4096.0)
-    complete_fn = None
-    if complete:
-        from odin.agent.brain import claude_complete
-        complete_fn = claude_complete
 
     # One reconciler per environment, created lazily. Each gets its own
     # env-scoped rds runner + backing containers, so AWS state stays isolated.
@@ -128,7 +90,7 @@ def create_app(
         env_aws = aws or (BackingAws(_runtime, env) if backings else None)
         return Reconciler(
             _store, _runtime, env_rds, aws=env_aws, fabric=LocalhostFabric(),
-            ws=ws_manager, env=env, scheduler=scheduler, poll_interval=1.0,
+            ws=ws_manager, env=env, poll_interval=1.0,
         )
 
     async def reconciler_for(env: str) -> Reconciler:
@@ -149,7 +111,7 @@ def create_app(
 
     app = FastAPI(title="allfather", version="0.1.0", lifespan=lifespan)
     app.include_router(create_canvas_router(CANVAS_PATH))
-    app.include_router(create_apply_router(_store, reconciler_for, complete_fn=complete_fn))
+    app.include_router(create_apply_router(_store, reconciler_for))
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
@@ -166,8 +128,7 @@ def create_app(
 
     @app.get("/health")
     def health():
-        # The Brain runs on demand (claude-agent-sdk); "agent" = is it wired in.
-        return {"ok": True, "agent": complete_fn is not None}
+        return {"ok": True}
 
     app.state.store = _store
     app.state.runtime = _runtime

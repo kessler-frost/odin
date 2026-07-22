@@ -5,8 +5,10 @@ from fastapi.testclient import TestClient
 
 from odin.server import create_app
 from odin.spec.store import SpecStore
-from tests.api.test_apply import CANVAS, FakeRds, FakeRuntime
+from tests.api.test_apply import FakeRds, FakeRuntime
 
+TWO_DBS = {"nodes": [{"type": "rds", "data": {"label": "db"}},
+                     {"type": "rds", "data": {"label": "db2"}}], "edges": []}
 DB_ONLY = {"nodes": [{"type": "rds", "data": {"label": "db"}}], "edges": []}
 S3_ONLY = {"nodes": [{"type": "s3", "data": {"label": "uploads"}}], "edges": []}
 
@@ -30,23 +32,20 @@ class FakeAws:
     def facts(self, service, name):
         return {"BUCKET": name, "endpoint": "http://host.docker.internal:9000"}
 
-    def aws_env(self):
-        return {}
-
     def gc(self, active_kinds):
         pass
 
 
 def test_environments_are_isolated_and_listed(tmp_path):
     app = create_app(runtime=FakeRuntime(), store=SpecStore(tmp_path),
-                     rds=FakeRds(), backings=False, complete=False)
+                     rds=FakeRds(), backings=False)
     with TestClient(app) as client:
-        client.post("/apply?env=staging", json=CANVAS)     # db + api
+        client.post("/apply?env=staging", json=TWO_DBS)     # db + db2
         client.post("/apply?env=production", json=DB_ONLY)  # db only
 
         staging = {r["id"] for r in client.get("/world?env=staging").json()["resources"]}
         production = {r["id"] for r in client.get("/world?env=production").json()["resources"]}
-        assert "api" in staging and "api" not in production  # isolated desired state
+        assert "db2" in staging and "db2" not in production  # isolated desired state
 
         envs = client.get("/envs").json()["envs"]
         assert "staging" in envs and "production" in envs
@@ -56,8 +55,7 @@ def test_each_env_gets_its_own_aws_backing(tmp_path, monkeypatch):
     # The default wiring hands every env its OWN BackingAws — same node label,
     # zero cross-env collision. FakeAws stands in so no containers run.
     monkeypatch.setattr("odin.server.BackingAws", FakeAws)
-    app = create_app(runtime=FakeRuntime(), store=SpecStore(tmp_path),
-                     rds=FakeRds(), complete=False)
+    app = create_app(runtime=FakeRuntime(), store=SpecStore(tmp_path), rds=FakeRds())
     with TestClient(app) as client:
         client.post("/apply?env=staging", json=S3_ONLY)
         client.post("/apply?env=production", json=S3_ONLY)

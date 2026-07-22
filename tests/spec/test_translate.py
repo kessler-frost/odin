@@ -49,8 +49,8 @@ def test_canvas_to_stack_maps_kinds_fields_refs():
     canvas = {
         "nodes": [
             {"type": "rds", "data": {"label": "db", "engine": "postgres"}},
-            {"type": "service", "data": {
-                "label": "api", "image": "app:latest", "port": 8000,
+            {"type": "s3", "data": {
+                "label": "uploads", "arn": "",
                 "env": {"DATABASE_URL": "${{db.DATABASE_URL}}", "STATIC": "v"},
             }},
             {"type": "vpc", "data": {"label": "ignored"}},  # unknown kind dropped
@@ -59,12 +59,12 @@ def test_canvas_to_stack_maps_kinds_fields_refs():
     }
     stack = canvas_to_stack(canvas)
     ids = {r.id for r in stack.resources}
-    assert ids == {"db", "api"}  # vpc dropped
+    assert ids == {"db", "uploads"}  # vpc dropped
 
     db = next(r for r in stack.resources if r.id == "db")
     assert db.kind == "rds" and db.fields["engine"].value == "postgres"
 
-    api = next(r for r in stack.resources if r.id == "api")
-    assert api.kind == "service" and api.fields["image"].value == "app:latest"
-    assert api.refs[0].target_id == "db" and api.refs[0].var == "DATABASE_URL"
-    assert api.fields["env"].value == {"STATIC": "v"}  # ref lifted out of static env
+    bucket = next(r for r in stack.resources if r.id == "uploads")
+    assert bucket.kind == "s3"
+    assert bucket.refs[0].target_id == "db" and bucket.refs[0].var == "DATABASE_URL"
+    assert bucket.fields["env"].value == {"STATIC": "v"}  # ref lifted out of static env
