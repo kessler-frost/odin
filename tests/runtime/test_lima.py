@@ -33,12 +33,14 @@ def test_run_container_goes_through_nerdctl_in_the_vm():
     rt = LimaRuntime(runner=runner)
 
     handle = rt.run_container(ContainerSpec(
-        name="job", image="busybox", env={"K": "v"}, ports={8000: 18080}, command=("true",)))
+        name="job", image="busybox", env={"K": "v"}, ports={8000: 18080},
+        command=("true",), volumes={"/host/conf": "/conf"}))
     assert handle.id == "abc123" and handle.name == "job"
 
     run_call = next(c for c in runner.calls if "busybox" in c)
     assert run_call[:5] == ["limactl", "shell", "allfather-host", "sudo", "nerdctl"]
     assert "-e" in run_call and "K=v" in run_call
+    assert "-v" in run_call and "/host/conf:/conf" in run_call
     assert "18080:8000" in run_call and run_call[-1] == "true"
 
 

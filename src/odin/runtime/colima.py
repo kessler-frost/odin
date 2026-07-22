@@ -27,6 +27,7 @@ class ContainerSpec:
     ports: dict[int, int] = field(default_factory=dict)  # container_port -> host_port
     labels: dict[str, str] = field(default_factory=dict)
     command: tuple[str, ...] = ()
+    volumes: dict[str, str] = field(default_factory=dict)  # host_path -> container_path
 
 
 @dataclass(frozen=True)
@@ -112,6 +113,8 @@ class _ContainerRuntime:
             args += ["-e", f"{key}={value}"]
         for cport, hport in spec.ports.items():
             args += ["-p", (f"{hport}:{cport}" if hport else str(cport))]
+        for host, container in spec.volumes.items():
+            args += ["-v", f"{host}:{container}"]
         args.append(spec.image)
         args += list(spec.command)
         return RunHandle(id=self._cli(*args), name=spec.name)
