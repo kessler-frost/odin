@@ -1,0 +1,104 @@
+"""Per-(env, node) credential issuance for the odin gateway.
+
+Every workload node gets a stable AWS-shaped access/secret key pair keyed by
+(env, node_id): issuing again for the same pair returns the SAME credentials
+until revoke_env drops the whole env (odin's /destroy path). Keys persist to
+`.odin/{env}/keys.json` on every mutation and load lazily -- a fresh
+KeyStore (e.g. after a server restart) resolves keys issued by a prior
+instance without needing to reissue them, so a restart never orphans a
+running container's creds.
+"""
+from __future__ import annotations
+
+import json
+import secrets
+import string
+from dataclasses import dataclass
+from pathlib import Path
+
+_URLSAFE_ALPHABET = string.ascii_letters + string.digits + "-_"
+_ACCESS_KEY_PREFIX = "AKODIN"
+_ACCESS_KEY_SUFFIX_LEN = 14
+_SECRET_KEY_LEN = 40
+
+
+def _random_urlsafe(length: int) -> str:
+    return "".join(secrets.choice(_URLSAFE_ALPHABET) for _ in range(length))
+
+
+@dataclass(frozen=True)
+class Principal:
+    """The (env, node) identity behind a verified access key."""
+
+    env: str
+    node_id: str
+
+
+class KeyStore:
+    """Issues and resolves per-(env, node) credential pairs, persisted per env."""
+
+    def __init__(self, root: Path) -> None:
+        self._root = root
+        self._loaded_envs: set[str] = set()
+        self._scanned_root = False
+        self._by_env: dict[str, dict[str, tuple[str, str]]] = {}
+        self._by_key: dict[str, Principal] = {}
+
+    def issue(self, env: str, node_id: str) -> tuple[str, str]:
+        self._ensure_loaded(env)
+        nodes = self._by_env.setdefault(env, {})
+        existing = nodes.get(node_id)
+        if existing is not None:
+            return existing
+        pair = (_ACCESS_KEY_PREFIX + _random_urlsafe(_ACCESS_KEY_SUFFIX_LEN), _random_urlsafe(_SECRET_KEY_LEN))
+        nodes[node_id] = pair
+        self._by_key[pair[0]] = Principal(env=env, node_id=node_id)
+        self._persist(env)
+        return pair
+
+    def lookup(self, access_key: str) -> Principal | None:
+        principal = self._by_key.get(access_key)
+        if principal is not None:
+            return principal
+        self._ensure_root_scanned()
+        return self._by_key.get(access_key)
+
+    def revoke_env(self, env: str) -> None:
+        self._ensure_loaded(env)
+        nodes = self._by_env.pop(env, {})
+        for access_key, _secret_key in nodes.values():
+            self._by_key.pop(access_key, None)
+        self._loaded_envs.discard(env)
+        self._persist(env)
+
+    def _path(self, env: str) -> Path:
+        return self._root / env / "keys.json"
+
+    def _ensure_loaded(self, env: str) -> None:
+        if env in self._loaded_envs:
+            return
+        self._loaded_envs.add(env)
+        path = self._path(env)
+        if not path.exists():
+            self._by_env.setdefault(env, {})
+            return
+        raw: dict[str, list[str]] = json.loads(path.read_text())
+        nodes = {node_id: (pair[0], pair[1]) for node_id, pair in raw.items()}
+        self._by_env[env] = nodes
+        for node_id, (access_key, _secret_key) in nodes.items():
+            self._by_key[access_key] = Principal(env=env, node_id=node_id)
+
+    def _ensure_root_scanned(self) -> None:
+        if self._scanned_root:
+            return
+        self._scanned_root = True
+        if not self._root.exists():
+            return
+        for env_dir in sorted(self._root.iterdir()):
+            if env_dir.is_dir():
+                self._ensure_loaded(env_dir.name)
+
+    def _persist(self, env: str) -> None:
+        path = self._path(env)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self._by_env.get(env, {})))
