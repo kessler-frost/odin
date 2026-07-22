@@ -71,12 +71,15 @@ class PostgresRds:
         return f"allfather-rds-{self._env}-{db_id}"
 
     def create_db(self, db_id: str, user: str, password: str) -> None:
-        # Any exited remnant is already cleared by the Reconciler's crash
-        # observer (which calls delete_db before the next create), so a
-        # fresh boot never collides with a stale container of this name.
         name = self.container_name(db_id)
         if self._rt.status(name) == "running":
             return  # idempotent: already up
+        # A same-name exited remnant makes the bare `docker run` below fail
+        # outright. The Reconciler's crash observer only clears one on the
+        # "crashed" path (reconciler.py:126-146) — a World reset (World has
+        # no observed record, e.g. `.odin/` wiped) goes through "pending"
+        # instead and skips it entirely, so create_db must clear defensively.
+        self._rt.stop(name)
         self._rt.run_container(ContainerSpec(
             name=name,
             image=POSTGRES_IMAGE,

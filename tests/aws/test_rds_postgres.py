@@ -70,9 +70,9 @@ def test_endpoint_none_until_running_then_host_port():
 def test_delete_db_stops_container():
     rt = FakeRuntime()
     rds = PostgresRds(rt)
-    rds.create_db("db", "app", "pw")
+    rds.create_db("db", "app", "pw")  # stops once itself: clears any remnant pre-run
     rds.delete_db("db")
-    assert rt.stopped == ["allfather-rds-default-db"]
+    assert rt.stopped == ["allfather-rds-default-db", "allfather-rds-default-db"]
     assert rds.endpoint("db") is None
 
 
