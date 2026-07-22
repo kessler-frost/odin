@@ -64,19 +64,29 @@ function nextId(type: string) {
   return `${type}-${++idCounter}`;
 }
 
-// Nudge a drop/double-click spot so a new node never lands exactly on an existing one.
+// Nudge a drop/double-click spot so a new node never overlaps an existing one.
+// Step is >= the default node width (200px), kept on the 20px grid.
+const DECOLLIDE_STEP = 220;
 function deCollide(pos: { x: number; y: number }, nodes: Node[]) {
   let { x, y } = pos;
-  const occupied = () => nodes.some(n => Math.abs(n.position.x - x) < 20 && Math.abs(n.position.y - y) < 20);
-  for (let i = 0; i < 50 && occupied(); i++) { x += 20; y += 20; }
+  const occupied = () => nodes.some(n => Math.abs(n.position.x - x) < DECOLLIDE_STEP && Math.abs(n.position.y - y) < DECOLLIDE_STEP);
+  for (let i = 0; i < 50 && occupied(); i++) { x += DECOLLIDE_STEP; y += DECOLLIDE_STEP; }
   return { x, y };
+}
+
+// Read the live endpoint / DATABASE_URL off a World resource's facts — the
+// same extraction the live world_delta handler uses, reused for rehydration.
+function endpointFromFacts(facts?: Record<string, unknown>): string {
+  return (facts?.endpoint as string) || (facts?.DATABASE_URL as string) || '';
 }
 
 type HistoryEntry = { nodes: Node[]; edges: Edge[] };
 
 interface CanvasProps {
+  env?: string;
   onNodeSelect?: (nodes: Node[]) => void;
   onEdgeSelect?: (edges: Edge[]) => void;
+  onNodeLabelsChange?: (entries: { id: string; label?: string }[]) => void;
   nodeUpdates?: { nodeId: string; data: Record<string, string> } | null;
   edgeUpdates?: { edgeId: string; data: Record<string, unknown> } | null;
   onStatusUpdate?: React.MutableRefObject<((name: string, status: string, error?: string, facts?: Record<string, unknown>) => void) | null>;
@@ -85,7 +95,7 @@ interface CanvasProps {
   onResetDrafts?: React.MutableRefObject<(() => void) | null>;
 }
 
-function InnerCanvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onStatusUpdate, configUpdate, onCanvasSave, onResetDrafts }: CanvasProps) {
+function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, nodeUpdates, edgeUpdates, onStatusUpdate, configUpdate, onCanvasSave, onResetDrafts }: CanvasProps) {
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   const [loaded, setLoaded] = useState(false);
@@ -117,25 +127,17 @@ function InnerCanvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onS
     return () => { onResetDrafts.current = null; };
   }, [onResetDrafts, setNodes, setEdges]);
 
-  // --- Load canvas from backend on mount ---
+  // --- Load canvas from backend on mount (status is seeded separately, from /world) ---
   useEffect(() => {
     const load = async () => {
-      const [canvasRes, stateRes] = await Promise.all([
-        fetch(`${API}/canvas`).then(r => r.json()).catch(() => ({ nodes: [], edges: [] })),
-        fetch(`${API}/state`).then(r => r.json()).catch(() => ({ resources: [] })),
-      ]);
-
-      const statusMap: Record<string, Record<string, string>> = {};
-      for (const r of (stateRes.resources ?? [])) {
-        statusMap[r.name] = { status: r.status, ...(r.error ? { error: r.error } : {}), ...(r.metadata ?? {}) };
-      }
+      const canvasRes = await fetch(`${API}/canvas`).then(r => r.json()).catch(() => ({ nodes: [], edges: [] }));
 
       const rfNodes: Node[] = (canvasRes.nodes ?? []).map((n: any) => ({
         id: n.id,
         type: n.type,
         position: n.position,
         zIndex: zIndexForType[n.type] ?? 2,
-        data: { ...defaultDataForType[n.type], ...n.data, ...(statusMap[`${n.type}_${n.data?.label}`] ?? statusMap[n.data?.label] ?? {}) },
+        data: { ...defaultDataForType[n.type], ...n.data },
         style: { ...defaultStyleForType[n.type], ...n.size },
       }));
 
@@ -167,6 +169,36 @@ function InnerCanvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onS
     };
     load();
   }, [setNodes, setEdges]);
+
+  // --- Rehydrate node badges from the observed World, on mount and on env change ---
+  // (a live world_delta over the WebSocket always arrives after this and wins).
+  const worldForEnv = useCallback((envName: string) => {
+    fetch(`${API}/world?env=${encodeURIComponent(envName)}`)
+      .then(r => r.json())
+      .then((world: { resources?: { id: string; phase: string; facts?: Record<string, unknown>; verdict?: string | null }[] }) => {
+        const byId = new Map((world.resources ?? []).map(r => [r.id, r]));
+        setNodes(nds => nds.map(n => {
+          const label = (n.data as Record<string, string>)?.label;
+          const resource = label ? byId.get(label) : undefined;
+          const endpoint = endpointFromFacts(resource?.facts);
+          return {
+            ...n,
+            data: {
+              ...n.data,
+              status: resource?.phase ?? 'draft',
+              ...(resource?.verdict ? { error: resource.verdict } : {}),
+              ...(endpoint ? { endpoint } : {}),
+            },
+          };
+        }));
+      })
+      .catch(() => {});
+  }, [setNodes]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    worldForEnv(env ?? 'default');
+  }, [env, loaded, worldForEnv]);
 
   // --- Undo/redo via debounced history ---
   const historyRef = useRef<HistoryEntry[]>([{ nodes: [], edges: [] }]);
@@ -281,7 +313,7 @@ function InnerCanvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onS
     if (!onStatusUpdate) return;
     onStatusUpdate.current = (name: string, status: string, error?: string, facts?: Record<string, unknown>) => {
       // The live endpoint / DATABASE_URL is the actual deliverable — surface it on the tile.
-      const endpoint = (facts?.endpoint as string) || (facts?.DATABASE_URL as string) || '';
+      const endpoint = endpointFromFacts(facts);
       setNodes(nds => {
         const updated = nds.map(n => {
           const matches = n.data?.label === name || n.id === name || `${n.type}_${n.data?.label}` === name;
@@ -296,6 +328,11 @@ function InnerCanvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onS
     };
     return () => { onStatusUpdate.current = null; };
   }, [onStatusUpdate, setNodes, onNodeSelect]);
+
+  // --- Surface live labels to the parent so the config panel can guard against duplicates ---
+  useEffect(() => {
+    onNodeLabelsChange?.(nodes.map(n => ({ id: n.id, label: (n.data as Record<string, string>)?.label })));
+  }, [nodes, onNodeLabelsChange]);
 
   // --- Apply config updates from agent (via WebSocket → BottomPanel → App.tsx) ---
   useEffect(() => {
@@ -603,10 +640,10 @@ function InnerCanvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onS
   );
 }
 
-export default function Canvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onStatusUpdate, configUpdate, onCanvasSave, onResetDrafts }: CanvasProps) {
+export default function Canvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, nodeUpdates, edgeUpdates, onStatusUpdate, configUpdate, onCanvasSave, onResetDrafts }: CanvasProps) {
   return (
     <ReactFlowProvider>
-      <InnerCanvas onNodeSelect={onNodeSelect} onEdgeSelect={onEdgeSelect} nodeUpdates={nodeUpdates} edgeUpdates={edgeUpdates} onStatusUpdate={onStatusUpdate} configUpdate={configUpdate} onCanvasSave={onCanvasSave} onResetDrafts={onResetDrafts} />
+      <InnerCanvas env={env} onNodeSelect={onNodeSelect} onEdgeSelect={onEdgeSelect} onNodeLabelsChange={onNodeLabelsChange} nodeUpdates={nodeUpdates} edgeUpdates={edgeUpdates} onStatusUpdate={onStatusUpdate} configUpdate={configUpdate} onCanvasSave={onCanvasSave} onResetDrafts={onResetDrafts} />
     </ReactFlowProvider>
   );
 }

@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import type { Node, Edge } from '@xyflow/react';
 import TopBar from './components/TopBar';
 import Sidebar from './components/Sidebar';
@@ -37,11 +37,13 @@ export default function App() {
   const [configOpen, setConfigOpen] = useState(true);
   const [bottomState, setBottomState] = useState<BottomState>('default');
   const [wsConnected, setWsConnected] = useState(false);
-  const [env, setEnv] = useState('default');
+  const [env, setEnv] = useState(() => localStorage.getItem('odin-active-env') || 'default');
   const statusUpdateFnRef = useRef<((name: string, status: string, error?: string, facts?: Record<string, unknown>) => void) | null>(null);
   const [configUpdate, setConfigUpdate] = useState<{ nodeId: string; data: Record<string, any> } | null>(null);
-  const resetDraftsRef = useRef<(() => void) | null>(null);
-  const [clearLogSignal, setClearLogSignal] = useState(0);
+  const [nodeLabels, setNodeLabels] = useState<{ id: string; label?: string }[]>([]);
+
+  // The active env survives a reload so world rehydration lands on the right one.
+  useEffect(() => { localStorage.setItem('odin-active-env', env); }, [env]);
 
   const [toasts, setToasts] = useState<Toast[]>([]);
   const toastId = useRef(0);
@@ -86,16 +88,6 @@ export default function App() {
 
   const handleValidateSelected = handleApply;
 
-  const handleDestroy = useCallback(async () => {
-    try {
-      const res = await fetch(`/destroy?env=${encodeURIComponent(env)}`, { method: 'POST' });
-      if (!res.ok) throw new Error(String(res.status));
-      pushToast('success', `Destroyed ${env}`);
-    } catch {
-      pushToast('error', 'Destroy failed — backend unreachable');
-    }
-  }, [env, pushToast]);
-
   const handleResourceStatus = useCallback((name: string, status: string, error?: string, facts?: Record<string, unknown>) => {
     statusUpdateFnRef.current?.(name, status, error, facts);
   }, []);
@@ -124,14 +116,14 @@ export default function App() {
       }}
     >
       {/* Row 1: TopBar */}
-      <div className="col-span-full"><TopBar wsConnected={wsConnected} env={env} onEnvChange={setEnv} onApply={handleApply} onDestroy={handleDestroy} onReset={() => { resetDraftsRef.current?.(); setClearLogSignal(s => s + 1); }} /></div>
+      <div className="col-span-full"><TopBar wsConnected={wsConnected} env={env} onEnvChange={setEnv} onApply={handleApply} /></div>
 
       {/* Row 2: Sidebar + Canvas + Config */}
       <div className="overflow-hidden">
         <Sidebar onCollapse={() => setSidebarOpen(false)} />
       </div>
       <div className="relative overflow-hidden">
-        <Canvas onNodeSelect={setSelectedNodes} onEdgeSelect={setSelectedEdges} nodeUpdates={nodeUpdates} edgeUpdates={edgeUpdates} onStatusUpdate={statusUpdateFnRef} configUpdate={configUpdate} onResetDrafts={resetDraftsRef} />
+        <Canvas env={env} onNodeSelect={setSelectedNodes} onEdgeSelect={setSelectedEdges} onNodeLabelsChange={setNodeLabels} nodeUpdates={nodeUpdates} edgeUpdates={edgeUpdates} onStatusUpdate={statusUpdateFnRef} configUpdate={configUpdate} />
         {!sidebarOpen && (
           <button
             onClick={() => setSidebarOpen(true)}
@@ -164,6 +156,7 @@ export default function App() {
         <ConfigPanel
           nodes={selectedNodes}
           selectedEdge={selectedEdges.length === 1 ? selectedEdges[0] : null}
+          allLabels={nodeLabels}
           onNodeUpdate={handleNodeUpdate}
           onEdgeUpdate={handleEdgeUpdate}
           onCollapse={() => setConfigOpen(false)}
@@ -173,7 +166,7 @@ export default function App() {
 
       {/* Row 3: Bottom panel */}
       <div className="col-span-full overflow-hidden">
-        <BottomPanel bottomState={bottomState} activeEnv={env} onCycleBottom={cycleBottom} onWsStatusChange={setWsConnected} onResourceStatus={handleResourceStatus} onConfigUpdate={handleConfigUpdate} clearSignal={clearLogSignal} />
+        <BottomPanel bottomState={bottomState} activeEnv={env} onCycleBottom={cycleBottom} onWsStatusChange={setWsConnected} onResourceStatus={handleResourceStatus} onConfigUpdate={handleConfigUpdate} />
       </div>
 
       <Toasts toasts={toasts} />

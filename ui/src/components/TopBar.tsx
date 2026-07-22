@@ -14,26 +14,22 @@ function Led({ state }: { state: LedState }) {
   return <div className={`w-1.5 h-1.5 rounded-full ${ledStyles[state]}`} />;
 }
 
-type Busy = null | 'apply' | 'destroy';
+type Busy = null | 'apply';
 
 interface TopBarProps {
   wsConnected?: boolean;
   env?: string;
   onEnvChange?: (env: string) => void;
   onApply?: () => Promise<void>;
-  onDestroy?: () => Promise<void>;
-  onReset?: () => void;
 }
 
-export default function TopBar({ wsConnected, env, onEnvChange, onApply, onDestroy, onReset }: TopBarProps) {
+export default function TopBar({ wsConnected, env, onEnvChange, onApply }: TopBarProps) {
   const [busy, setBusy] = useState<Busy>(null);
-  const [armed, setArmed] = useState<null | 'destroy' | 'reset'>(null);
   const [backendUp, setBackendUp] = useState(false);
   const [envs, setEnvs] = useState<string[]>([]);
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const mountedRef = useRef(true);
-  const armTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -64,14 +60,6 @@ export default function TopBar({ wsConnected, env, onEnvChange, onApply, onDestr
     if (busy) return;
     setBusy(action);
     try { await fn?.(); } finally { if (mountedRef.current) setBusy(null); }
-  };
-
-  // Click-to-arm for the two irreversible actions: first click arms (~2.5s), second commits.
-  const onDanger = (which: 'destroy' | 'reset', commit: () => void) => () => {
-    if (armTimer.current) clearTimeout(armTimer.current);
-    if (armed === which) { setArmed(null); commit(); return; }
-    setArmed(which);
-    armTimer.current = setTimeout(() => mountedRef.current && setArmed(null), 2500);
   };
 
   // Cmd/Ctrl+Enter is the commit chord -> Apply.
@@ -139,14 +127,6 @@ export default function TopBar({ wsConnected, env, onEnvChange, onApply, onDestr
       >
         {busy === 'apply' ? 'Applying…' : 'Apply'}
       </button>
-      <button
-        onClick={onDanger('destroy', () => run('destroy', onDestroy)())}
-        disabled={!!busy || !backendUp}
-        title="Tear down everything (containers + AWS resources) for this env"
-        className={`font-mono text-xs py-1.5 px-4 border border-neon-red bg-bg-tertiary text-neon-red uppercase tracking-[1px] transition-all duration-200 hover:bg-[rgba(255,51,85,0.1)] hover:shadow-[0_0_12px_rgba(255,51,85,0.2)] ${armed === 'destroy' ? 'bg-[rgba(255,51,85,0.15)] shadow-[0_0_12px_rgba(255,51,85,0.3)]' : ''} ${(!!busy || !backendUp) ? dim : 'cursor-pointer'}`}
-      >
-        {busy === 'destroy' ? 'Destroying…' : armed === 'destroy' ? `Confirm? (${env})` : 'Destroy'}
-      </button>
       <div className="relative" ref={menuRef}>
         <button
           onClick={() => setMenuOpen(!menuOpen)}
@@ -161,12 +141,6 @@ export default function TopBar({ wsConnected, env, onEnvChange, onApply, onDestr
               className="w-full text-left font-mono text-xs py-2 px-4 text-text-secondary hover:bg-bg-tertiary hover:text-neon-blue transition-colors uppercase tracking-[1px]"
             >
               Export Canvas
-            </button>
-            <button
-              onClick={onDanger('reset', () => { onReset?.(); setMenuOpen(false); })}
-              className={`w-full text-left font-mono text-xs py-2 px-4 hover:bg-bg-tertiary transition-colors uppercase tracking-[1px] ${armed === 'reset' ? 'text-neon-red bg-[rgba(255,51,85,0.08)]' : 'text-text-secondary hover:text-neon-red'}`}
-            >
-              {armed === 'reset' ? 'Confirm reset?' : 'Reset Canvas'}
             </button>
           </div>
         )}

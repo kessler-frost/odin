@@ -7,6 +7,7 @@ import { catalogTypeConfig, catalogFields } from '../lib/catalog';
 interface ConfigPanelProps {
   nodes: Node[];
   selectedEdge?: Edge | null;
+  allLabels?: { id: string; label?: string }[];
   onNodeUpdate?: (nodeId: string, data: Record<string, string>) => void;
   onEdgeUpdate?: (edgeId: string, data: Record<string, unknown>) => void;
   onCollapse?: () => void;
@@ -53,7 +54,7 @@ function ReadOnlyField({ label, value }: { label: string; value: string }) {
   );
 }
 
-function EditableField({ label, value, onChange }: { label: string; value: string; onChange: (v: string) => void }) {
+function EditableField({ label, value, onChange, error }: { label: string; value: string; onChange: (v: string) => void; error?: string }) {
   // ${{node.attr}} references are the core wiring mechanism — make them legible.
   const isRef = value.includes('${{');
   return (
@@ -67,8 +68,9 @@ function EditableField({ label, value, onChange }: { label: string; value: strin
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder="value or ${{node.attr}}"
-        className={`w-full py-1.5 px-2.5 bg-bg-primary border font-mono text-xs outline-none transition-colors duration-200 focus:ring-1 focus:ring-neon-blue/30 focus:border-neon-blue placeholder:text-text-muted/50 ${isRef ? 'border-neon-blue/50 text-neon-blue' : 'border-border text-text-primary'}`}
+        className={`w-full py-1.5 px-2.5 bg-bg-primary border font-mono text-xs outline-none transition-colors duration-200 focus:ring-1 placeholder:text-text-muted/50 ${error ? 'border-neon-red text-neon-red focus:border-neon-red focus:ring-neon-red/30' : isRef ? 'border-neon-blue/50 text-neon-blue focus:border-neon-blue focus:ring-neon-blue/30' : 'border-border text-text-primary focus:border-neon-blue focus:ring-neon-blue/30'}`}
       />
+      {error && <p className="mt-1 text-[10px] text-neon-red font-mono">{error}</p>}
     </div>
   );
 }
@@ -299,8 +301,9 @@ function MultiSelectView({ nodes, onCollapse, onValidate }: { nodes: Node[]; onC
   );
 }
 
-export default function ConfigPanel({ nodes, selectedEdge, onNodeUpdate, onEdgeUpdate, onCollapse, onValidate }: ConfigPanelProps) {
+export default function ConfigPanel({ nodes, selectedEdge, allLabels, onNodeUpdate, onEdgeUpdate, onCollapse, onValidate }: ConfigPanelProps) {
   const [localData, setLocalData] = useState<Record<string, string>>({});
+  const [labelError, setLabelError] = useState(false);
 
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -316,7 +319,17 @@ export default function ConfigPanel({ nodes, selectedEdge, onNodeUpdate, onEdgeU
   // Sync local editable state when the selected node changes
   useEffect(() => {
     setLocalData(node ? { ...(node.data as Record<string, string>) } : {});
+    setLabelError(false);
   }, [node?.id, node?.data]);
+
+  // Resource ids are labels — block committing a rename that collides with
+  // another node's label (drop-time auto-suffixing already keeps fresh drops unique).
+  const otherLabels = new Set(
+    (allLabels ?? [])
+      .filter((n) => n.id !== node?.id)
+      .map((n) => n.label)
+      .filter((l): l is string => Boolean(l)),
+  );
 
   const panelBase = "bg-bg-secondary border-l border-border-bright p-0 overflow-y-auto h-full";
 
@@ -354,6 +367,14 @@ export default function ConfigPanel({ nodes, selectedEdge, onNodeUpdate, onEdgeU
   const updateField = (key: string, value: string) => {
     const updated = { ...localData, [key]: value };
     setLocalData(updated);
+    if (key === 'label') {
+      const isDup = value.length > 0 && otherLabels.has(value);
+      setLabelError(isDup);
+      if (isDup) {
+        if (debounceRef.current) clearTimeout(debounceRef.current);
+        return; // don't propagate a colliding label to canvas state
+      }
+    }
     debouncedUpdate(node.id, updated);
   };
 
@@ -385,7 +406,7 @@ export default function ConfigPanel({ nodes, selectedEdge, onNodeUpdate, onEdgeU
             return <SelectField key={field.key} label={field.label} value={value} options={field.select} onChange={(v) => updateField(field.key, v)} />;
           }
           return field.editable
-            ? <EditableField key={field.key} label={field.label} value={value} onChange={(v) => updateField(field.key, v)} />
+            ? <EditableField key={field.key} label={field.label} value={value} onChange={(v) => updateField(field.key, v)} error={field.key === 'label' && labelError ? 'Name already in use by another node' : undefined} />
             : <ReadOnlyField key={field.key} label={field.label} value={value} />;
         })}
       </div>
