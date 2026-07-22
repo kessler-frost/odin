@@ -133,6 +133,16 @@ canvas and its configuration.
    cloud-init, real SSH, joins Nebula). ECS tasks ride containers; Lambda
    substitute design comes with its service work.
 
+## Amendments (owner, dated)
+
+- **2026-07-22 (evening) — one button, named Apply.** Directive 3's button is
+  renamed: "Simulate" → **Apply** (owner: "I'm liking the latter better").
+  And it's the ONLY action button: no Destroy, no Reset — the canvas is the
+  single source of truth, and Apply converges reality to it, deletions
+  included (remove a node, Apply, it's gone; empty canvas + Apply = full
+  teardown). Keep the UI uncrowded. Backend routes like `/destroy` may
+  survive for tests/CLI, but the human surface is: draw → Apply.
+
 ## Non-negotiables carried forward
 
 Local-first on one Mac (multi-Mac via self-hosted Nebula later) · real
