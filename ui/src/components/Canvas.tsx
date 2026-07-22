@@ -596,7 +596,7 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
         nodesDraggable={!shiftHeld}
         panActivationKeyCode="Shift"
         selectionKeyCode="Meta"
-        multiSelectionKeyCode="Meta"
+        multiSelectionKeyCode={['Meta', 'Shift']}
         deleteKeyCode={null}
         connectionMode={ConnectionMode.Loose}
         elevateNodesOnSelect={false}
