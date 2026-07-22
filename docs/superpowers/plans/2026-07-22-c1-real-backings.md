@@ -320,6 +320,8 @@ BACKINGS: tuple[BackingDef, ...] = (
 - Create: `tests/aws/test_backings_e2e.py`
 - Modify if reality disagrees: `src/odin/aws/backings.py` (e.g. goaws config key casing, probe timing) — every such fix gets its own assertion
 
+**Step 0 (do first — a container-churn suite needs it):** `ColimaRuntime.stop` (src/odin/runtime/colima.py:157-158) is `docker rm -f` WITHOUT `-v`, so every removed container leaks its anonymous volumes (postgres creates one per boot — the host accumulated 2.4GB of them before this plan). Change to `self._cli("rm", "-f", "-v", name, check=False)`, update any unit test asserting stop's CLI args, and add to this task's final gate: `docker volume ls -qf dangling=true` is empty after the full integration sweep.
+
 **What must pass (run each; fix code until green):**
 1. `test_provision_e2e.py`: s3 node "uploads" → healthy; `BackingAws(runtime, "default").client("s3").list_buckets()` shows `uploads`.
 2. `test_skeleton_e2e.py` + `test_multikind_e2e.py`: unchanged intent (rds+service gating, multi-kind) on the new wiring.
