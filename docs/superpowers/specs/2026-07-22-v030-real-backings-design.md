@@ -41,19 +41,26 @@ it, merge to `main`, tag v0.3.0, GitHub release.
 - **Per-env isolation** comes from per-env containers. The 12-digit
   account-scoping machinery (`account_for_env`) dies with MiniStack.
 
-### Backing services (pending license/arm64 verification by research agent)
+### Backing services (LOCKED 2026-07-22 — every row live-verified on Colima/arm64 with boto3)
 
-| kind | backing | wire protocol | notes |
-|---|---|---|---|
-| s3 | RustFS (Apache-2.0) — fallback SeaweedFS | real S3 API | fixed local creds |
-| sqs | goaws or ElasticMQ | real SQS API | |
-| sns | goaws (same container can serve sqs+sns → internal SNS→SQS delivery) | real SNS API | if goaws fails vetting: ship a minimal SNS shim of our own |
-| dynamodb | dynalite (MIT) — must verify a runnable arm64 container path | real DynamoDB API | fallback decided by research |
-| rds | postgres official image | postgres wire | unchanged behavior |
+| kind | backing | license (verified) | image | port | notes |
+|---|---|---|---|---|---|
+| s3 | RustFS | Apache-2.0 | `rustfs/rustfs:latest` (261MB) | 9000 | creds via `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` (override defaults); boto3 needs path-style + region; probe `GET /health` |
+| sqs + sns | goaws | MIT | `admiralpiett/goaws:v0.5.4` (22MB) — MUST pin v0.5.x (v0.4.x can't speak boto3's SQS JSON protocol) | 4100 (both) | ONE container serves both kinds; SNS→SQS delivery is in-process; needs a yaml config mounted from under `$HOME` (Colima only shares `$HOME` + `/tmp/colima` — `.odin/{env}/` qualifies) |
+| dynamodb | Dynalite | Apache-2.0 | `node:alpine` + `npx -y dynalite --port 4567` (~20s cold start; no maintained image) | 4567 | verified create_table/put/get/query; NO TTL, NO Streams (accepted gaps); last commit 2025-09 |
+| rds | PostgreSQL | PostgreSQL License | `postgres:16-alpine` | 5432 | per-node container (landed in C1 Task 1) |
 
-NOT allowed: MinIO/Garage/Scylla-Alternator (AGPL), amazon/dynamodb-local
-(proprietary), LocalStack (its non-community edition + scope; and it IS the
-kind of emulator we're escaping).
+Fallback (documented, not wired): SeaweedFS for s3 (Apache-2.0, list_buckets
+quirk in anonymous mode), ElasticMQ for sqs-only (Apache-2.0).
+
+NOT allowed (verified): MinIO/Garage/Scylla-Alternator (AGPL),
+amazon/dynamodb-local (proprietary "DynamoDB Local License Agreement"),
+LocalStack (the emulator pattern we're escaping).
+
+Cross-cutting verified facts: boto3 respects per-service
+`AWS_ENDPOINT_URL_{S3,SQS,SNS,DYNAMODB}` env vars; goaws queue URLs carry a
+non-resolving host (harmless — boto3 dials the endpoint override); per-env
+isolation is container-level (one backing set per env).
 
 ### Code changes (ground truth from 2026-07-22 read-through)
 
