@@ -54,18 +54,35 @@ future decision against these points instead of re-deriving them:
 
 ## Roadmap (northstar-derived sequence)
 
-- [ ] **Gateway + IAM enforcement.** SigV4 verification → (service, action,
-  resource) classification → policy evaluation → forward to substitutes. The
-  front door for the TF AWS provider, not just boto3 SDKs — IAM permissions
-  drawn as canvas edges are evaluated here for real.
-- [ ] **Canvas↔Terraform translation agent + Simulate + TF import.** The
-  Claude Agent SDK translates canvas state to Terraform/OpenTofu and back;
-  **Simulate** runs a real `tofu apply` through the gateway; import an
-  existing TF project onto the canvas.
-- [ ] **Service coverage expansion.** EC2 (real Lima VMs), ECS (containers),
-  Lambda, ECR, VPC, and more — adopting MiniStack's per-service models as a
-  design reference where they help, not as a runtime dependency. Anything not
-  yet supportable gets recorded as unsupported, not silently dropped.
+- [x] **Gateway + IAM enforcement.** DONE 2026-07-22 (G1–G5 + synthesized
+  control-plane): SigV4 verification (incl. S3 body-hash cross-check) →
+  (service, action, resource) classification → edge-compiled policy
+  evaluation → forward to substitutes (re-signed for RustFS), with
+  protocol-correct AccessDenied per service, STS identity, tag/attribute
+  stores, and ~2ms added latency. Proven by real-container acceptance tests
+  (edges grant; absence denies; foreign envs deny; a container crossed the
+  boundary via aws-cli).
+- [~] **Canvas↔Terraform translation + Apply-runs-tofu + TF import.** Runner
+  DONE: `tofu apply` through the gateway (operator principal) achieves
+  apply → zero-drift plan → destroy on s3/sqs/sns/subscription/dynamodb
+  against real substitutes. Deterministic canvas→TF generator DONE. In
+  flight: the agent-refined translation pass, TF import (HCL + live-state),
+  and wiring the single **Apply** button to the pipeline.
+- [ ] **Service coverage expansion** (sequence fixed by captured provider
+  surfaces — see `docs/superpowers/research/research-coverage.md`): the
+  gateway owns each service's model (MiniStack's record shapes adopted as
+  reference), bound to real substrates:
+  1. VPC / Subnet / Security Groups → Nebula (the AWS `IpPermissions` wire
+     shape is a direct match for `sg_rules_to_firewall`'s input)
+  2. IAM control-plane CRUD (roles/policies onto odin's policy store) + ECR
+     (CNCF `registry:2`, Apache-2.0 — real `docker push`)
+  3. EC2 as real Lima VMs (the flagship; the provider's pending→running
+     waiter absorbs VM boot)
+  4. Lambda (AWS RIE, Apache-2.0)
+  5. ECS (Colima containers; MiniStack's mini-reconciler semantics adopted)
+- **Recorded as UNSUPPORTED for now** (northstar directive 5's honesty rule):
+  ALB/ELBv2, EKS, CloudFormation, autoscaling, and RDS-via-Terraform (rds
+  nodes stay on the reconciler path until an RDS API model lands).
 - [ ] **Nebula network layer.** Security groups, VPCs, and firewalls drawn on
   the canvas become real Nebula network primitives.
 - [ ] **odin CLI as an agent control surface.** Lets a human's or an agent's
