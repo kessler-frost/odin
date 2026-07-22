@@ -24,6 +24,27 @@ def test_edges_thread_perms_and_kind_from_ui_data():
     assert edges[("api", "cache")].kind == "network" and edges[("api", "cache")].perms == ()
 
 
+def test_edges_translate_reactflow_node_ids_to_labels():
+    # Canvas edges carry ReactFlow node IDs, but Stack resources are keyed by
+    # label — the reconciler's sns-subscription matching needs label edges.
+    canvas = {"nodes": [
+        {"id": "n1", "type": "sns", "data": {"label": "alerts"}},
+        {"id": "n2", "type": "sqs", "data": {"label": "jobs"}},
+    ], "edges": [{"source": "n1", "target": "n2"}]}
+    edge = canvas_to_stack(canvas).edges[0]
+    assert (edge.src, edge.dst) == ("alerts", "jobs")
+
+
+def test_edges_already_naming_labels_pass_through_unchanged():
+    # Stack-level tests build edges with labels directly — no id to map.
+    canvas = {"nodes": [
+        {"id": "n1", "type": "sns", "data": {"label": "alerts"}},
+        {"id": "n2", "type": "sqs", "data": {"label": "jobs"}},
+    ], "edges": [{"source": "alerts", "target": "jobs"}]}
+    edge = canvas_to_stack(canvas).edges[0]
+    assert (edge.src, edge.dst) == ("alerts", "jobs")
+
+
 def test_canvas_to_stack_maps_kinds_fields_refs():
     canvas = {
         "nodes": [

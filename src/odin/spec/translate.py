@@ -63,15 +63,18 @@ def _resource(node: dict) -> ResourceDesired | None:
     )
 
 
-def _edge(e: dict) -> Edge:
+def _edge(e: dict, labels: dict[str, str]) -> Edge:
     # The UI stores access metadata under `data` (Canvas.tsx): `permissions` +
     # `edgeType` ("iam" | "network"). Thread both through so the Brain's IAM
     # review sees real grants. (Data-flow ${{node.attr}} refs are NOT edges —
     # they're lifted into ResourceDesired.refs above.)
+    # Edge endpoints are ReactFlow node IDs but Stack resources are keyed by
+    # LABEL — translate through `labels` (fall back for edges naming labels).
     data = e.get("data") or {}
     perms = tuple(data.get("permissions") or ())
     kind = data.get("edgeType") or ("iam" if perms else "network")
-    return Edge(src=e.get("source", ""), dst=e.get("target", ""), kind=kind, perms=perms)
+    src, dst = e.get("source", ""), e.get("target", "")
+    return Edge(src=labels.get(src, src), dst=labels.get(dst, dst), kind=kind, perms=perms)
 
 
 def skipped_node_types(canvas: dict) -> list[str]:
@@ -83,6 +86,7 @@ def skipped_node_types(canvas: dict) -> list[str]:
 
 def canvas_to_stack(canvas: dict, env: str = "default") -> Stack:
     nodes = canvas.get("nodes") or []
+    labels = {n["id"]: _node_id(n) for n in nodes if n.get("id")}
     resources = tuple(r for n in nodes if (r := _resource(n)) is not None)
-    edges = tuple(_edge(e) for e in (canvas.get("edges") or []))
+    edges = tuple(_edge(e, labels) for e in (canvas.get("edges") or []))
     return Stack(env=env, resources=resources, edges=edges)

@@ -159,7 +159,9 @@ class _ContainerRuntime:
         )
 
     def stop(self, name: str) -> None:
-        self._cli("rm", "-f", name, check=False)
+        # -v: drop the container's anonymous volumes with it (postgres creates
+        # one per boot; without this a churn loop leaks gigabytes).
+        self._cli("rm", "-f", "-v", name, check=False)
 
     def list_allfather(self) -> list[str]:
         out = self._cli("ps", "-aq", "--filter", f"label={LABEL}=1", check=False)
