@@ -111,6 +111,12 @@ class SynthStores:
       that path directly off `root`, the same way ec2net's Nebula bootstrap
       reaches non-store state). Lambda tags live in the shared `tags` store
       above, keyed `"lambda:{functionArn}"`.
+    - `ecsctl`: the ECS control-plane model's whole state
+      (`gateway/models/ecsctl.py`, task V5a) -- flat keys
+      `"cluster:{name}"` / `"taskdef-rev:{family}"` (revision counter) /
+      `"taskdef:{family}:{revision}"` / `"service:{cluster}:{name}"` /
+      `"task:{cluster}:{task_id}"`, persisted at
+      `.odin/{env}/gateway/ecsctl.json`.
     """
 
     def __init__(self, root: Path) -> None:
@@ -124,3 +130,4 @@ class SynthStores:
         self.ecr = JsonStore(root, "ecr")
         self.ec2compute = JsonStore(root, "ec2compute")
         self.lambdactl = JsonStore(root, "lambdactl")
+        self.ecsctl = JsonStore(root, "ecsctl")

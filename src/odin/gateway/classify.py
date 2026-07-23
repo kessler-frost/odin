@@ -64,6 +64,13 @@ reasoning as ec2/iam/ecr: extraction only needs to never return None for a
 route it recognizes; an unrecognized (method, path) pair returns None
 (unmappable, closed-world deny) rather than guessing.
 
+ECS (task V5a) SHARES ECR's JSON-target SHAPE, IAM/ECR's OPERATOR-only
+REASONING: `_classify_ecs` extracts a real id when the request carries one
+(clusterName/serviceName/family, or the last path segment of an ARN) and
+falls back to `"*"` rather than ever returning None -- the only principal
+driving ECS calls in v1 is the OPERATOR (TF-authored clusters/services), so
+this only needs to never deny it via `unmappable-action`.
+
 S3 BUCKET-CONFIG READS (S2, discovered running real tofu through the real
 gateway): the TF AWS provider's `aws_s3_bucket` refresh probes bucket-config
 subresources -- `?policy`, `?tagging`, `?acl`, `?cors`, `?versioning`, etc.
@@ -200,6 +207,8 @@ def classify(
         return _classify_ecr(lower_headers, body)
     if service == "lambda":
         return _classify_lambda(method, path, body)
+    if service == "ecs":
+        return _classify_ecs(lower_headers, body)
     return None
 
 
@@ -319,6 +328,53 @@ def _classify_ecr(lower_headers: dict[str, str], body: bytes) -> tuple[str, str]
     except (json.JSONDecodeError, UnicodeDecodeError):
         return None
     return f"ecr:{op}", _ecr_resource(payload)
+
+
+def _bare_id(value: str) -> str:
+    return value.rsplit("/", 1)[-1]
+
+
+# op -> which payload field(s) carry the id, in the OPERATOR-only style
+# _classify_iam/_classify_ecr already use: extract a real value when present,
+# "*" otherwise (never None -- see module docstring's ECS note).
+def _ecs_resource(op: str, payload: dict) -> str:
+    if op in ("CreateCluster", "DeleteCluster"):
+        value = payload.get("clusterName") or payload.get("cluster")
+        return _bare_id(value) if value else "*"
+    if op == "DescribeClusters":
+        names = payload.get("clusters")
+        return _bare_id(names[0]) if isinstance(names, list) and names else "*"
+    if op == "RegisterTaskDefinition":
+        return payload.get("family") or "*"
+    if op in ("DescribeTaskDefinition", "DeregisterTaskDefinition"):
+        value = payload.get("taskDefinition")
+        return _bare_id(value) if value else "*"
+    if op == "CreateService":
+        return payload.get("serviceName") or "*"
+    if op in ("UpdateService", "DeleteService"):
+        value = payload.get("service")
+        return _bare_id(value) if value else "*"
+    if op == "DescribeServices":
+        names = payload.get("services")
+        return _bare_id(names[0]) if isinstance(names, list) and names else "*"
+    if op == "ListTasks":
+        return payload.get("serviceName") or payload.get("family") or "*"
+    if op == "DescribeTasks":
+        tasks = payload.get("tasks")
+        return _bare_id(tasks[0]) if isinstance(tasks, list) and tasks else "*"
+    return "*"
+
+
+def _classify_ecs(lower_headers: dict[str, str], body: bytes) -> tuple[str, str] | None:
+    target = lower_headers.get("x-amz-target")
+    if target is None or "." not in target:
+        return None
+    op = target.rsplit(".", 1)[1]
+    try:
+        payload = json.loads(body) if body else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return f"ecs:{op}", _ecs_resource(op, payload)
 
 
 # The captured REST route table (research §2d + botocore's own lambda

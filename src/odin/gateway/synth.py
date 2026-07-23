@@ -60,7 +60,7 @@ from starlette.responses import Response
 from odin.aws.backings import ACCOUNT, REGION
 from odin.gateway import errors
 from odin.gateway.keys import Principal
-from odin.gateway.models import ec2compute, ecr, iamctl, lambdactl
+from odin.gateway.models import ec2compute, ecr, ecsctl, iamctl, lambdactl
 from odin.gateway.stores import SynthStores
 
 _SNS_NS = "http://sns.amazonaws.com/doc/2010-03-31/"
@@ -348,11 +348,12 @@ def pure_answer(
 ) -> Response | None:
     """A direct synth answer for a PURE/CONDITIONAL action, or None if
     `action` isn't synth-owned for this call -- the caller (app.py) forwards
-    normally in that case. Every `ec2:*`/`iam:*`/`lambda:*` action is owned
-    wholesale by its own model module(s) -- `ec2compute.py` (task V3:
+    normally in that case. Every `ec2:*`/`iam:*`/`lambda:*`/`ecs:*` action is
+    owned wholesale by its own model module(s) -- `ec2compute.py` (task V3:
     instances + key pairs, falling through to `ec2net.py`'s VPC/Subnet/SG for
-    everything else), `iamctl.py`, and `lambdactl.py` (task V4a) -- none has
-    a backing container to forward to, so those paths never return None.
+    everything else), `iamctl.py`, `lambdactl.py` (task V4a), and
+    `ecsctl.py` (task V5a) -- none has a backing container to forward to, so
+    those paths never return None.
     `ecr:*` is likewise all-synth for its CONTROL plane, but (task V2b) needs
     the registry:2 backing's own live port to build `repositoryUri` --
     `backing_port` is app.py's existing `GatewayState.backing_port` lookup,
@@ -361,7 +362,10 @@ def pure_answer(
     `query` is app.py's already-parsed query-string dict, needed only by
     lambdactl.py's UntagResource (`TagKeys` rides the querystring on
     Lambda's REST wire, unlike every other service modeled here -- see its
-    own docstring for the resulting v1 limitation)."""
+    own docstring for the resulting v1 limitation). `ecs:*` (task V5a) is
+    all-synth the same way, with its own REAL Colima-container substrate
+    (`compute/tasks.py::TaskRuntime`, defaulted inside ecsctl.py itself --
+    it needs no live fact threaded through here, unlike ecr's backing_port)."""
     if action.startswith("ec2:"):
         return ec2compute.pure_answer(action, resource, env, body, stores, now)
     if action.startswith("iam:"):
@@ -370,6 +374,8 @@ def pure_answer(
         return ecr.pure_answer(action, resource, env, body, stores, now, backing_port)
     if action.startswith("lambda:"):
         return lambdactl.pure_answer(action, resource, env, body, stores, now, query=query)
+    if action.startswith("ecs:"):
+        return ecsctl.pure_answer(action, resource, env, body, stores, now)
     handler = _PURE_HANDLERS.get(action)
     return handler(resource, env, body, stores, now) if handler else None
 
