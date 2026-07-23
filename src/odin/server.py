@@ -237,7 +237,26 @@ def create_apply_full_router(
         # store commit stays INSIDE the hold so no tick can ever run between
         # tofu's creates and the new desired state becoming visible.
         async with reconciler.hold():
-            if resource_set(translated.files):
+            # The gate is "any TF-supported resource NOW, or tofu already
+            # manages something for this env" -- not resource_set(translated.
+            # files) alone. V1 cross-layer e2e finding: vpc/subnet/sg have NO
+            # reconciler-driven teardown path at all (plan.py NoOps them
+            # forever -- they're never even entered into World, so the
+            # "observed but no longer desired" prune in plan() can never see
+            # them either); tofu is the ONLY thing that can ever remove them.
+            # An empty canvas has an empty resource_set, so without the
+            # workspace_exists half a prior VPC/Subnet/SG stayed orphaned in
+            # ec2net.json AND in tofu's own state file forever -- the
+            # "empty canvas + Apply = full teardown" NORTHSTAR promise broke
+            # silently for this whole resource family. Safe to broaden for
+            # every kind (not just ec2net's): running an empty-project tofu
+            # apply is a no-op destroy against tofu's own state, ordered
+            # entirely inside this same hold() before the reconciler's own
+            # prune step (below, via the trailing tick()) ever runs, so it
+            # never races a container-deprovision teardown for s3/sqs/sns/
+            # dynamodb -- it only makes tofu's state stop lying about what
+            # still exists.
+            if resource_set(translated.files) or runner.status(env)["workspace_exists"]:
                 await reconciler.ensure_backings(stack)
                 project = TfProject(files=translated.files, unsupported=translated.unsupported)
                 access_key, secret_key = keystore.issue(env, OPERATOR_NODE_ID)

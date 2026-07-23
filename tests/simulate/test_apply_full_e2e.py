@@ -101,14 +101,30 @@ def test_apply_full_converges_reapplies_zero_drift_and_tears_down(tmp_path, runt
         # Empty canvas: the amendment's "no Destroy button" promise -- the
         # canvas alone is the source of truth, Apply on an empty canvas is
         # full teardown. LOAD-BEARING: verify this actually converges rather
-        # than assuming the reconciler-only path (apply-full skips invoking
-        # tofu when the translated canvas has zero TF-supported resources --
-        # see server.py's `create_apply_full_router`) leaves anything behind.
+        # than assuming the reconciler-only path leaves anything behind.
+        #
+        # tofu now ALSO runs here (V1 cross-layer finding, task-v1-report.md):
+        # the gate in `create_apply_full_router` used to be
+        # `resource_set(translated.files)` alone, which is empty for an empty
+        # canvas -- so tofu was NEVER invoked on teardown, only skipped
+        # straight to the reconciler's prune. That's harmless for THIS test's
+        # kinds (s3/sqs/sns/dynamodb tear down for real via
+        # BackingAws.deprovision wiping the whole backing container -- tofu's
+        # own state file just went stale, silently), but for vpc/subnet/sg
+        # (task V1) there IS no reconciler-driven teardown at all (plan.py
+        # NoOps them forever), so tofu was the ONLY thing that could ever
+        # remove them -- skipping it orphaned them permanently. The gate is
+        # now `resource_set(translated.files) or
+        # runner.status(env)["workspace_exists"]`, so tofu also runs (an
+        # empty-project apply -> a destroy-everything plan against its own
+        # prior state) whenever this env has ANY prior tofu-managed state,
+        # ordered entirely inside the same reconciler.hold() as before this
+        # env's reconciler prune step -- no double-teardown race.
         resp3 = client.post("/apply-full", params={"env": ENV}, json=EMPTY_CANVAS)
         assert resp3.status_code == 200, resp3.text
         body3 = resp3.json()
         assert body3["status"] == "applied", body3
-        assert body3["tf"] is None, body3  # nothing left to hand tofu -- reconciler-only prune
+        assert body3["tf"] is not None and body3["tf"]["status"] == "ok", body3
 
         _wait(client, lambda p: not p)
         world = client.get("/world", params={"env": ENV}).json()
