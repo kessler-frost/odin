@@ -586,3 +586,77 @@ def test_tofu_fmt_accepts_lambda_output(tmp_path):
         capture_output=True, text=True,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+# --- ecs (V5c) ---------------------------------------------------------------
+
+
+def test_ecs_emits_service_taskdef_and_one_shared_cluster():
+    stack = Stack(resources=(
+        ResourceDesired(id="app", kind="ecs", fields=_fields(image="nginx:alpine", count="2", port="80")),
+    ))
+    main_tf = generate_tf(stack).files["main.tf"]
+    assert 'resource "aws_ecs_cluster" "odin"' in main_tf
+    assert 'name = "odin"' in main_tf
+    assert 'resource "aws_ecs_service" "app"' in main_tf
+    assert "cluster         = aws_ecs_cluster.odin.id" in main_tf
+    assert "task_definition = aws_ecs_task_definition.app_taskdef.arn" in main_tf
+    assert "desired_count   = 2" in main_tf
+    assert 'launch_type     = "EC2"' in main_tf
+    assert 'resource "aws_ecs_task_definition" "app_taskdef"' in main_tf
+    assert 'family                   = "app"' in main_tf
+    assert '\\"image\\": \\"nginx:alpine\\"' in main_tf
+    assert '\\"containerPort\\": 80' in main_tf
+
+
+def test_ecs_defaults_image_count_and_port_when_fields_absent():
+    stack = Stack(resources=(ResourceDesired(id="app", kind="ecs"),))
+    main_tf = generate_tf(stack).files["main.tf"]
+    assert "desired_count   = 1" in main_tf
+    assert '\\"image\\": \\"nginx:alpine\\"' in main_tf
+    assert '\\"containerPort\\": 80' in main_tf
+
+
+def test_ecs_multiple_nodes_share_one_cluster():
+    stack = Stack(resources=(
+        ResourceDesired(id="app-a", kind="ecs"),
+        ResourceDesired(id="app-b", kind="ecs"),
+    ))
+    main_tf = generate_tf(stack).files["main.tf"]
+    assert main_tf.count('resource "aws_ecs_cluster"') == 1
+    assert 'resource "aws_ecs_service" "app_a"' in main_tf
+    assert 'resource "aws_ecs_service" "app_b"' in main_tf
+    assert 'resource "aws_ecs_task_definition" "app_a_taskdef"' in main_tf
+    assert 'resource "aws_ecs_task_definition" "app_b_taskdef"' in main_tf
+    assert "cluster         = aws_ecs_cluster.odin.id" in main_tf.split('"aws_ecs_service" "app_a"')[1]
+    assert "cluster         = aws_ecs_cluster.odin.id" in main_tf.split('"aws_ecs_service" "app_b"')[1]
+
+
+def test_ecs_with_non_numeric_count_lands_in_unsupported():
+    stack = Stack(resources=(ResourceDesired(id="app", kind="ecs", fields=_fields(count="two")),))
+    proj = generate_tf(stack)
+    assert proj.unsupported == ["app (ecs): count must be a whole number (e.g. 2)"]
+    assert "aws_ecs_service" not in proj.files["main.tf"]
+
+
+def test_ecs_with_non_numeric_port_lands_in_unsupported():
+    stack = Stack(resources=(ResourceDesired(id="app", kind="ecs", fields=_fields(port="http")),))
+    proj = generate_tf(stack)
+    assert proj.unsupported == ["app (ecs): port must be a whole number (e.g. 80)"]
+    assert "aws_ecs_service" not in proj.files["main.tf"]
+
+
+def test_tofu_fmt_accepts_ecs_output(tmp_path):
+    tofu = shutil.which("tofu")
+    if tofu is None:
+        return  # skip cleanly -- no tofu on PATH in this environment
+    stack = Stack(resources=(
+        ResourceDesired(id="app", kind="ecs", fields=_fields(image="nginx:alpine", count="2", port="80")),
+    ))
+    main_tf = tmp_path / "main.tf"
+    main_tf.write_text(generate_tf(stack).files["main.tf"])
+    result = subprocess.run(
+        [tofu, "fmt", "-check", "-diff", str(main_tf)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

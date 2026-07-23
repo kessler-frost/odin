@@ -382,6 +382,62 @@ def _lambda(res: ResourceDesired, refs: Refs) -> Built:
     return attrs, ""
 
 
+# V5c: ECS services (real per-task Colima containers, gateway/models/
+# ecsctl.py). "The drawn node IS the service+taskdef pair" (the brief's own
+# words) -- v1 single-container taskdefs, so one ecs canvas node emits BOTH
+# an `aws_ecs_service` (this builder's primary resource, _TF_TYPES below)
+# AND a companion `aws_ecs_task_definition` (the zip/aws_key_pair/aws_iam_role
+# pattern: one canvas node -> more than one TF resource, built in its own
+# pass after pass 2). Every ecs node on the canvas shares ONE
+# `aws_ecs_cluster`, reserved the first time pass 1 sees an ecs node --
+# exactly the `_lambda_role_key` auto-role reservation technique, just keyed
+# by a single constant instead of per-node.
+#
+# Containment/networking: deliberately launch_type="EC2" + networkMode
+# "bridge" (ecsctl.py's own default), NOT FARGATE/awsvpc -- the LEAST-FICTION
+# choice research-coverage.md's V5 brief calls for. `network_configuration`
+# is only meaningful for FARGATE or awsvpc-mode EC2 tasks; bridge-mode EC2
+# tasks need none at all, so an ecs node needs no vpc/subnet containment
+# (unlike `_ec2`'s hard subnet requirement) -- odin has no ENI/awsvpc model
+# to stand behind that block anyway.
+_ECS_CLUSTER_KEY = "__ecs_cluster__"
+_DEFAULT_ECS_IMAGE = "nginx:alpine"
+_DEFAULT_ECS_COUNT = "1"
+_DEFAULT_ECS_PORT = "80"
+_BAD_ECS_COUNT = "count must be a whole number (e.g. 2)"
+_BAD_ECS_PORT = "port must be a whole number (e.g. 80)"
+
+
+def _ecs(res: ResourceDesired, refs: Refs) -> Built:
+    count = _field(res, "count", _DEFAULT_ECS_COUNT)
+    if not count.isdigit():
+        return _BAD_ECS_COUNT
+    port = _field(res, "port", _DEFAULT_ECS_PORT)
+    if not port.isdigit():
+        return _BAD_ECS_PORT
+    _, cluster_name = refs[_ECS_CLUSTER_KEY]
+    _, own_name = refs[res.id]
+    attrs = {
+        "name": quote(res.id),
+        "cluster": f"aws_ecs_cluster.{cluster_name}.id",
+        "task_definition": f"aws_ecs_task_definition.{own_name}_taskdef.arn",
+        "desired_count": count,
+        "launch_type": quote("EC2"),
+    }
+    return attrs, ""
+
+
+def _ecs_container_definitions(res: ResourceDesired) -> list[dict]:
+    port = _field(res, "port", _DEFAULT_ECS_PORT)
+    port_int = int(port) if port.isdigit() else int(_DEFAULT_ECS_PORT)
+    return [{
+        "name": res.id,
+        "image": _field(res, "image", _DEFAULT_ECS_IMAGE),
+        "essential": True,
+        "portMappings": [{"containerPort": port_int, "hostPort": 0, "protocol": "tcp"}],
+    }]
+
+
 # kind -> terraform resource type; kept separate from _BUILDERS so pass 1 of
 # generate_tf can assign HCL names (scoped per resource type) without running
 # any builder.
@@ -397,6 +453,7 @@ _TF_TYPES = {
     "ecr": "aws_ecr_repository",
     "ec2": "aws_instance",
     "lambda": "aws_lambda_function",
+    "ecs": "aws_ecs_service",
 }
 
 _BUILDERS = {
@@ -411,6 +468,7 @@ _BUILDERS = {
     "ecr": _ecr,
     "ec2": _ec2,
     "lambda": _lambda,
+    "ecs": _ecs,
 }
 
 
@@ -443,6 +501,12 @@ def generate_tf(stack: Stack) -> TfProject:
                 sanitize_name(f"{res.id}_role"), used_names.setdefault("aws_iam_role", set()),
             )
             refs[_lambda_role_key(res.id)] = ("iam_role", role_name)
+        # V5c: the FIRST ecs node seen reserves the one shared cluster's HCL
+        # name -- every later ecs node's `_ecs` builder (pass 2) just reads
+        # it back, same reservation technique as the lambda auto-role above.
+        if res.kind == "ecs" and _ECS_CLUSTER_KEY not in refs:
+            cluster_name = unique_name(sanitize_name("odin"), used_names.setdefault("aws_ecs_cluster", set()))
+            refs[_ECS_CLUSTER_KEY] = ("ecs_cluster", cluster_name)
 
     # Pass 2 — build blocks with the name table complete. A builder may still
     # opt out for THIS resource (returns the reason string) — e.g. a subnet
@@ -530,6 +594,38 @@ def generate_tf(stack: Stack) -> TfProject:
         nested = f"  assume_role_policy = {_LAMBDA_TRUST_POLICY}"
         block = _block("aws_iam_role", role_name, {"name": quote(f"{res.id}-role")}, nested)
         blocks.append((("aws_iam_role", res.id), block))
+
+    # V5c: the one shared `aws_ecs_cluster` -- emitted only if some ecs node
+    # actually reserved it in pass 1 (never a dangling resource on a canvas
+    # with no ecs nodes at all).
+    if _ECS_CLUSTER_KEY in refs:
+        _, cluster_name = refs[_ECS_CLUSTER_KEY]
+        block = _block("aws_ecs_cluster", cluster_name, {"name": quote("odin")})
+        blocks.append((("aws_ecs_cluster", "__cluster__"), block))
+
+    # V5c: each ecs node's companion `aws_ecs_task_definition` -- named
+    # deterministically off the node's own hcl name (`_ecs`'s builder
+    # references this exact same name for `task_definition`), same
+    # one-canvas-node-to-two-tf-resources shape as aws_key_pair/aws_iam_role
+    # above. `container_definitions` is a plain JSON STRING literal (not
+    # `jsonencode(<native HCL>)`) -- both compile to the identical wire
+    # value once TF sends the RegisterTaskDefinition call, and a string
+    # literal needs no hand-rolled HCL-native serializer here.
+    for res in ordered:
+        if res.kind != "ecs":
+            continue
+        own_name = hcl_name_by_id.get(res.id)
+        if own_name is None:
+            continue
+        container_json = quote(json.dumps(_ecs_container_definitions(res)))
+        nested = f"  container_definitions = {container_json}"
+        attrs = {
+            "family": quote(res.id),
+            "requires_compatibilities": '["EC2"]',
+            "network_mode": quote("bridge"),
+        }
+        block = _block("aws_ecs_task_definition", f"{own_name}_taskdef", attrs, nested)
+        blocks.append((("aws_ecs_task_definition", res.id), block))
 
     blocks.sort(key=lambda b: b[0])
     main_tf = "\n\n".join([HEADER, provider_block(), *(text for _, text in blocks)]) + "\n"

@@ -145,11 +145,22 @@ export const CATALOG: ServiceDef[] = [
     fields: [{ key: 'label', label: 'Name', editable: true }, { key: 'fsId', label: 'File System ID' }],
     defaultData: { label: 'new-fs', fsId: '' },
   },
+  // ecs (V5c) is the REAL, gateway-modeled ECS service (NORTHSTAR directive
+  // 5): the drawn node IS the service+taskdef pair (v1 single-container
+  // taskdefs), sharing ONE auto-generated cluster per canvas (agent/hcl.py's
+  // `_ecs` builder) -- renders via the generic ServiceNode, no bespoke
+  // component, same as iam_role/ecr/lambda.
   {
-    type: 'ecs', abbr: 'ECS', label: 'ECS Cluster', sublabel: 'Container cluster',
+    type: 'ecs', abbr: 'ECS', label: 'ECS Service', sublabel: 'Container service',
     category: 'Compute', color: 'lime', width: 200,
-    fields: [{ key: 'label', label: 'Name', editable: true }, { key: 'arn', label: 'ARN' }],
-    defaultData: { label: 'new-cluster', arn: '' },
+    fields: [
+      { key: 'label', label: 'Name', editable: true },
+      { key: 'image', label: 'Image', editable: true },
+      { key: 'count', label: 'Task Count', editable: true },
+      { key: 'port', label: 'Container Port', editable: true },
+    ],
+    defaultData: { label: 'new-service', image: 'nginx:alpine', count: '1', port: '80' },
+    primary: { key: 'count', label: 'tasks' },
   },
   {
     type: 'ssm', abbr: 'SSM', label: 'SSM Parameter', sublabel: 'Parameter store',
