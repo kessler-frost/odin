@@ -35,6 +35,16 @@ class JsonStore:
         self._data(env)[key] = value
         self._persist(env)
 
+    def delete(self, env: str, key: str) -> None:
+        self._data(env).pop(key, None)
+        self._persist(env)
+
+    def items(self, env: str) -> dict[str, Any]:
+        """A copy of the env's whole flat dict -- the "describe all" read the
+        EC2-network model's list answers need, without callers reaching into
+        `_data` directly."""
+        return dict(self._data(env))
+
     def _data(self, env: str) -> dict[str, Any]:
         if env not in self._loaded:
             path = self._path(env)
@@ -51,8 +61,11 @@ class JsonStore:
 
 
 class SynthStores:
-    """The four sidecar stores synth.py needs, grouped for one-arg wiring
-    into `create_gateway_app`.
+    """The sidecar stores synth.py (and the gateway model modules under
+    `gateway/models/`) need, grouped for one-arg wiring into
+    `create_gateway_app`. `root` is public so a model module can reach
+    non-store per-env state under the same `.odin` tree (ec2net's Nebula
+    network bootstrap needs it).
 
     - `tags`: keyed `"{service}:{resource}"` -> flat `{tag_key: tag_value}`,
       shared by sqs/sns/dynamodb (each service's resource-name namespace is
@@ -69,10 +82,17 @@ class SynthStores:
       classify()-derived topic-name resource -- multiple subscriptions can
       share a topic) -> the `now` Unsubscribe fired, so
       GetSubscriptionAttributes can answer NotFound immediately after.
+    - `ec2net`: the EC2-network model's whole state
+      (`gateway/models/ec2net.py`) -- flat keys `"vpc:{id}"` /
+      `"subnet:{id}"` / `"sg:{id}"`, persisted at
+      `.odin/{env}/gateway/ec2net.json`. EC2 tags live in the shared `tags`
+      store above, keyed `"ec2:{resource_id}"`.
     """
 
     def __init__(self, root: Path) -> None:
+        self.root = root
         self.tags = JsonStore(root, "tags")
         self.sqs_queues = JsonStore(root, "sqs_queues")
         self.sns_topics = JsonStore(root, "sns_topics")
         self.sns_subscriptions = JsonStore(root, "sns_subscriptions")
+        self.ec2net = JsonStore(root, "ec2net")

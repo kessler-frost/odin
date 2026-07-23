@@ -26,6 +26,15 @@ Topic/TableName) resolve the same way. SNS subscription-scoped calls
 `TopicArn` -- the topic name lives in the ARN's second-to-last segment
 (`...:<topic>:<subscription-id>`), extracted the same bare-label way.
 
+EC2 (task V1a) IS A DIFFERENT RESOURCE CONVENTION: for ec2 the resource is
+the id param carried by the request (`VpcId`/`GroupId`/`SubnetId`, or the
+first `VpcId.1`/`SubnetId.1`/`GroupId.1`/`ResourceId.1` list entry), else
+`"*"` -- NOT a canvas label. Created vpc/subnet/sg ids don't correspond to
+canvas labels in V1 (no workload edge references them yet; EC2 instances
+arrive in V3), and the only principal driving EC2 calls is the OPERATOR
+(full allow), so extraction only needs to never return None -- a None here
+would deny even the operator via `unmappable-action`.
+
 S3 BUCKET-CONFIG READS (S2, discovered running real tofu through the real
 gateway): the TF AWS provider's `aws_s3_bucket` refresh probes bucket-config
 subresources -- `?policy`, `?tagging`, `?acl`, `?cors`, `?versioning`, etc.
@@ -153,6 +162,8 @@ def classify(
         return _classify_target(service, lower_headers, body)
     if service == "sns":
         return _classify_sns(body)
+    if service == "ec2":
+        return _classify_ec2(body)
     return None
 
 
@@ -214,6 +225,24 @@ def _sns_resource(action_name: str, params: dict[str, str]) -> str | None:
         return None
     segments = subscription_arn.split(":")
     return segments[-2] if len(segments) >= 2 else None
+
+
+# Ordered id-param candidates (some requests carry several id kinds; the
+# scoped one wins -- e.g. CreateSubnet carries VpcId but is subnet-scoped
+# work under that vpc, which is fine: the OPERATOR is the only ec2 caller).
+_EC2_ID_PARAMS = ("VpcId", "VpcId.1", "SubnetId", "SubnetId.1", "GroupId", "GroupId.1", "ResourceId.1")
+
+
+def _classify_ec2(body: bytes) -> tuple[str, str] | None:
+    try:
+        params = dict(parse_qsl(body.decode("utf-8"), keep_blank_values=True))
+    except UnicodeDecodeError:
+        return None
+    action_name = params.get("Action")
+    if not action_name:
+        return None
+    resource = next((params[key] for key in _EC2_ID_PARAMS if params.get(key)), "*")
+    return f"ec2:{action_name}", resource
 
 
 def _classify_s3(

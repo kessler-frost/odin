@@ -60,6 +60,7 @@ from starlette.responses import Response
 from odin.aws.backings import ACCOUNT, REGION
 from odin.gateway import errors
 from odin.gateway.keys import Principal
+from odin.gateway.models import ec2net
 from odin.gateway.stores import SynthStores
 
 _SNS_NS = "http://sns.amazonaws.com/doc/2010-03-31/"
@@ -344,7 +345,11 @@ _PURE_HANDLERS: dict[str, _PureHandler] = {
 def pure_answer(action: str, resource: str, env: str, body: bytes, stores: SynthStores, now: float) -> Response | None:
     """A direct synth answer for a PURE/CONDITIONAL action, or None if
     `action` isn't synth-owned for this call -- the caller (app.py) forwards
-    normally in that case."""
+    normally in that case. Every `ec2:*` action is owned wholesale by the
+    EC2-network model module (gateway/models/ec2net.py) -- EC2 has no
+    backing container to forward to, so that path never returns None."""
+    if action.startswith("ec2:"):
+        return ec2net.pure_answer(action, resource, env, body, stores, now)
     handler = _PURE_HANDLERS.get(action)
     return handler(resource, env, body, stores, now) if handler else None
 

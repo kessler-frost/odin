@@ -13,6 +13,12 @@ service set spans three wire protocols:
                   conventional `...Exception` suffix (real AWS: DynamoDB/
                   SQS permission denials surface as `AccessDeniedException`,
                   not the bare `AccessDenied` S3/SNS use).
+- ec2:            the EC2 protocol's OWN envelope,
+                  ``<Response><Errors><Error>...</Error></Errors>
+                  <RequestID>...</RequestID></Response>`` -- distinct from
+                  SNS's query shape (verified against botocore's
+                  `EC2QueryParser._do_error_parse`, incl. the EC2-specific
+                  capital-D ``RequestID``).
 
 Status codes follow the brief's literal choices (401 for the two SigV4
 auth failures, 403 for AccessDenied, 503 for a dead backing) rather than
@@ -55,6 +61,16 @@ def _sns_xml(code: str, message: str) -> str:
     )
 
 
+def _ec2_xml(code: str, message: str) -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response><Errors><Error>"
+        f"<Code>{code}</Code><Message>{message}</Message>"
+        "</Error></Errors>"
+        "<RequestID>00000000-0000-0000-0000-000000000000</RequestID></Response>"
+    )
+
+
 def _json_body_raw(service: str, code: str, message: str) -> str:
     prefix = _JSON_TYPE_PREFIX.get(service, "")
     return json.dumps({"__type": f"{prefix}{code}", "message": message})
@@ -70,6 +86,8 @@ def _respond(service: str, code: str, message: str) -> Response:
         return Response(_s3_xml(code, message), status_code=status, media_type="application/xml")
     if service == "sns":
         return Response(_sns_xml(code, message), status_code=status, media_type="text/xml")
+    if service == "ec2":
+        return Response(_ec2_xml(code, message), status_code=status, media_type="text/xml")
     return Response(_json_body(service, code, message), status_code=status, media_type="application/x-amz-json-1.0")
 
 
@@ -107,7 +125,11 @@ def synth_error(service: str, code: str, message: str, status: int) -> Response:
     NOT what SQS (one of AWS's oldest services) actually sends over the
     wire, and a real `tofu destroy`'s Go-SDK-based delete-waiter checks the
     literal legacy string (S2, verified against terraform-provider-aws's
-    own source), not botocore's shape name."""
+    own source), not botocore's shape name. EC2's per-kind NotFound codes
+    (`InvalidVpcID.NotFound` & co., gateway/models/ec2net.py) ride this same
+    exact-wire-code path in the EC2 error envelope."""
     if service == "sns":
         return Response(_sns_xml(code, message), status_code=status, media_type="text/xml")
+    if service == "ec2":
+        return Response(_ec2_xml(code, message), status_code=status, media_type="text/xml")
     return Response(_json_body_raw(service, code, message), status_code=status, media_type="application/x-amz-json-1.0")
