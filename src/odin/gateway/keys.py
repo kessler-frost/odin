@@ -16,6 +16,8 @@ import string
 from dataclasses import dataclass
 from pathlib import Path
 
+from odin.util import atomic_write_text
+
 _URLSAFE_ALPHABET = string.ascii_letters + string.digits + "-_"
 _ACCESS_KEY_PREFIX = "AKODIN"
 _ACCESS_KEY_SUFFIX_LEN = 14
@@ -115,6 +117,7 @@ class KeyStore:
                 self._ensure_loaded(env_dir.name)
 
     def _persist(self, env: str) -> None:
-        path = self._path(env)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self._by_env.get(env, {})))
+        # Access/secret key pairs: never briefly world-readable between
+        # create and chmod (see util.atomic_write_text's own ordering).
+        text = json.dumps(self._by_env.get(env, {}))
+        atomic_write_text(self._path(env), text, mode=0o600)

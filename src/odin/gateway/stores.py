@@ -18,6 +18,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from odin.util import atomic_write_text
+
 
 class JsonStore:
     """A flat `key -> value` dict, one JSON file per env, loaded lazily and
@@ -55,9 +57,13 @@ class JsonStore:
         return self._root / env / "gateway" / f"{self._name}.json"
 
     def _persist(self, env: str) -> None:
-        path = self._path(env)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self._data(env)))
+        # A snapshot (`dict(...)`) BEFORE `json.dumps`, not the live dict
+        # itself: a concurrent `set`/`delete` mutating the original mid-dump
+        # would otherwise risk "dictionary changed size during iteration".
+        # `mode=0o600`: this sidecar can carry another env's IAM/EC2 state,
+        # not just public catalog data -- never briefly world-readable.
+        text = json.dumps(dict(self._data(env)))
+        atomic_write_text(self._path(env), text, mode=0o600)
 
 
 class SynthStores:

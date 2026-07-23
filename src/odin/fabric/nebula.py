@@ -37,6 +37,7 @@ from odin.fabric.models import (
     VpcNetwork,
 )
 from odin.spec.models import World
+from odin.util import atomic_write_text
 
 NEBULA_PORT = 4242
 
@@ -148,8 +149,7 @@ class NebulaManager:
         return self._dir / "overlay.json"
 
     def save_overlay(self, overlay: MeshNetwork) -> None:
-        self._dir.mkdir(parents=True, exist_ok=True)
-        self._overlay_path().write_text(overlay.model_dump_json(indent=2))
+        atomic_write_text(self._overlay_path(), overlay.model_dump_json(indent=2))
 
     def load_overlay(self) -> MeshNetwork | None:
         path = self._overlay_path()

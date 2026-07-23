@@ -7,6 +7,8 @@ from typing import Any
 from fastapi import APIRouter
 from pydantic import BaseModel
 
+from odin.util import atomic_write_text
+
 
 class CanvasGraph(BaseModel):
     nodes: list[dict[str, Any]] = []
@@ -24,8 +26,7 @@ def create_canvas_router(canvas_path: Path) -> APIRouter:
 
     @router.post("/canvas")
     def save_canvas(graph: CanvasGraph) -> dict[str, str]:
-        canvas_path.parent.mkdir(parents=True, exist_ok=True)
-        canvas_path.write_text(graph.model_dump_json(indent=2))
+        atomic_write_text(canvas_path, graph.model_dump_json(indent=2))
         return {"status": "saved"}
 
     return router

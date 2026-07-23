@@ -1,6 +1,8 @@
 """S1.2 — SpecStore: append-only content-addressed revisions + World."""
 from __future__ import annotations
 
+import pytest
+
 from odin.spec.models import FieldValue, ResourceDesired, Stack, WorldDelta
 from odin.spec.store import SpecStore, rev_of
 
@@ -44,6 +46,24 @@ def test_world_delta_upserts_and_persists(tmp_path):
     assert db.facts["endpoint"] == "postgres://localhost:15432"
     # persisted
     assert SpecStore(tmp_path).current_world().get("db").phase == "healthy"
+
+
+def test_write_world_crash_leaves_prior_world_intact(tmp_path, monkeypatch):
+    # Release finding #2: write_world is atomic -- a crash mid-write must
+    # not corrupt or drop the previously-persisted World.
+    store = SpecStore(tmp_path)
+    store.apply_delta(WorldDelta(env="default", resource_id="db", kind="rds", phase="healthy"))
+
+    def boom(*a, **k):
+        raise OSError("simulated crash")
+
+    monkeypatch.setattr("odin.util.os.replace", boom)
+    with pytest.raises(OSError):
+        store.apply_delta(WorldDelta(env="default", resource_id="api", kind="service", phase="starting"))
+
+    reloaded = SpecStore(tmp_path).current_world()
+    assert reloaded.get("db").phase == "healthy"
+    assert reloaded.get("api") is None
 
 
 def test_apply_delta_counts_consecutive_crashes(tmp_path):

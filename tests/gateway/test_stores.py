@@ -2,6 +2,8 @@
 control-plane persists tags/attributes/delete-markers to."""
 from __future__ import annotations
 
+import stat
+import threading
 from pathlib import Path
 
 from odin.gateway.stores import JsonStore, SynthStores
@@ -62,6 +64,39 @@ def test_set_overwrites_existing_key(tmp_path: Path):
     store.set("default", "jobs", "first")
     store.set("default", "jobs", "second")
     assert store.get("default", "jobs") == "second"
+
+
+def test_persisted_file_is_0600(tmp_path: Path):
+    # Release finding #2: this sidecar can carry another env's IAM/EC2
+    # state -- never briefly world-readable, and never left world-readable.
+    store = JsonStore(tmp_path, "widgets")
+    store.set("default", "jobs", {"env": "prod"})
+    path = tmp_path / "default" / "gateway" / "widgets.json"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_concurrent_set_calls_do_not_raise_during_persist(tmp_path: Path):
+    """Release finding #2: `_persist` serializes a SNAPSHOT of the env dict,
+    not the live dict itself -- many threads calling `set()` concurrently
+    must never raise "dictionary changed size during iteration" out of the
+    `json.dumps` inside `_persist`."""
+    store = JsonStore(tmp_path, "widgets")
+    errors: list[Exception] = []
+
+    def hammer(i: int) -> None:
+        try:
+            for j in range(50):
+                store.set("default", f"key-{i}", {"n": j})
+        except Exception as exc:  # pragma: no cover - fails the test via errors list
+            errors.append(exc)
+
+    threads = [threading.Thread(target=hammer, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors
 
 
 def test_synth_stores_are_independently_namespaced(tmp_path: Path):

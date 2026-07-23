@@ -1,6 +1,7 @@
 """G1 -- KeyStore: stable per-(env, node) credential issuance + persistence."""
 from __future__ import annotations
 
+import stat
 from pathlib import Path
 
 from odin.gateway.keys import KeyStore, Principal
@@ -80,6 +81,15 @@ def test_persists_to_keys_json_file(tmp_path: Path):
     keys_file = tmp_path / "default" / "keys.json"
     assert keys_file.exists()
     assert "api" in keys_file.read_text()
+
+
+def test_persisted_keys_file_is_0600(tmp_path: Path):
+    # Release finding #2: real access/secret key pairs -- never briefly
+    # world-readable, and never left world-readable.
+    store = KeyStore(tmp_path)
+    store.issue("default", "api")
+    keys_file = tmp_path / "default" / "keys.json"
+    assert stat.S_IMODE(keys_file.stat().st_mode) == 0o600
 
 
 def test_reload_from_disk_preserves_stability_via_issue(tmp_path: Path):

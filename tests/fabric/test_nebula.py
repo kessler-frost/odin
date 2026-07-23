@@ -110,6 +110,27 @@ def test_overlay_save_load_roundtrip(tmp_path):
     assert mgr.load_overlay().subnets["hosts"].assignments == net.subnets["hosts"].assignments
 
 
+def test_overlay_save_crash_leaves_prior_overlay_intact(tmp_path, monkeypatch):
+    # Release finding #2: save_overlay is atomic -- a crash mid-write must
+    # not corrupt or drop the previously-saved overlay.
+    mgr = NebulaManager(tmp_path / "nebula", runner=FakeRunner())
+    original = MeshNetwork(network="prod")
+    original.allocate_host("mac-1")
+    mgr.save_overlay(original)
+
+    def boom(*a, **k):
+        raise OSError("simulated crash")
+
+    monkeypatch.setattr("odin.util.os.replace", boom)
+    replacement = MeshNetwork(network="prod")
+    replacement.allocate_host("mac-2")
+    with pytest.raises(OSError):
+        mgr.save_overlay(replacement)
+
+    reloaded = mgr.load_overlay()
+    assert reloaded.subnets["hosts"].assignments == original.subnets["hosts"].assignments
+
+
 def test_sg_rules_to_firewall_translates():
     rules = sg_rules_to_firewall([{"IpProtocol": "tcp", "FromPort": 6379, "ToPort": 6379,
                                    "IpRanges": [{"CidrIp": "10.0.0.0/8"}]}])
