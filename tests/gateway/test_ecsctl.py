@@ -341,10 +341,48 @@ def test_delete_service_stops_all_its_tasks(sink, ecs, stores):
     assert deleted["status"] == "INACTIVE"
     assert len(runtime.stopped) == 2
 
+    # LOAD-BEARING (V5d): a real tofu destroy's own delete-waiter polls
+    # DescribeServices expecting to see status="INACTIVE" on a successfully
+    # DESCRIBED service -- not a "MISSING" failure, which the real Go-SDK
+    # provider treats as "not ready yet" and retries forever (see
+    # ecsctl.py's `_INACTIVE_SERVICE_SWEEP_SECONDS` docstring). So the
+    # record must still describe cleanly, INACTIVE, right after delete.
     describe_req = sink.call(lambda: ecs.describe_services(cluster="odin", services=["app"]))
     parsed = _parse("DescribeServices", _answer(stores, describe_req, runtime))
-    assert parsed["services"] == []
-    assert parsed["failures"][0]["reason"] == "MISSING"
+    assert parsed["failures"] == []
+    (described,) = parsed["services"]
+    assert described["status"] == "INACTIVE"
+    assert described["runningCount"] == 0
+
+
+def test_delete_service_lets_the_same_name_be_recreated_immediately(sink, ecs, stores):
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(stores, sink, ecs, runtime, desiredCount=1)
+    _wait_for_running_count(stores, sink, ecs, runtime, 1)
+    req = sink.call(lambda: ecs.delete_service(cluster="odin", service="app", force=True))
+    _answer(stores, req, runtime)
+
+    recreated = _create_service(stores, sink, ecs, runtime, desiredCount=1)
+    assert recreated["status"] == "ACTIVE"
+
+
+def test_delete_cluster_after_service_delete_is_allowed(sink, ecs, stores):
+    """An INACTIVE (recently-deleted) service must NOT block cluster
+    deletion -- only a still-ACTIVE one does (see
+    test_delete_cluster_with_active_services_is_denied)."""
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(stores, sink, ecs, runtime, desiredCount=1)
+    _wait_for_running_count(stores, sink, ecs, runtime, 1)
+    req = sink.call(lambda: ecs.delete_service(cluster="odin", service="app", force=True))
+    _answer(stores, req, runtime)
+
+    req = sink.call(lambda: ecs.delete_cluster(cluster="odin"))
+    response = _answer(stores, req, runtime)
+    assert response.status_code == 200
 
 
 # --- Tasks: lazy sweep (spontaneous exit) --------------------------------------

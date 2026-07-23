@@ -81,6 +81,7 @@ import logging
 import threading
 import time
 import uuid
+import weakref
 from collections.abc import Callable
 
 from starlette.responses import Response
@@ -102,6 +103,19 @@ _DEFAULT_COMPATIBILITIES = ["EC2"]
 # delete), which never goes through the lazy sweep at all (this module
 # already knows the outcome the moment it issues the stop).
 _ESSENTIAL_CONTAINER_EXITED = "Essential container in task exited"
+
+# DeleteService keeps the record around, `status="INACTIVE"`, for this long
+# before actually purging it (mirrors ec2compute.py's
+# `_TERMINATED_SWEEP_SECONDS` grace-window pattern) -- LOAD-BEARING (V5d):
+# real terraform-provider-aws's post-delete poll (aws-sdk-go-v2, not
+# botocore's own `ServicesInactive` waiter, whose `failures[].reason ==
+# "MISSING"` acceptor is a FAILURE state, verified against botocore's own
+# ecs waiters-2.json) treats a service that's simply GONE as "not ready yet"
+# and retries forever -- it needs to see `status: "INACTIVE"` on a
+# successfully-described service to consider the delete complete. Deleting
+# the record outright (this module's first cut) hung a real `tofu destroy`
+# indefinitely; this grace window is what makes the delete observable.
+_INACTIVE_SERVICE_SWEEP_SECONDS = 60.0
 
 _Handler = Callable[[dict, str, SynthStores, TaskRuntime], Response]
 
@@ -173,6 +187,22 @@ def _service(stores: SynthStores, env: str, cluster: str, name: str) -> dict | N
 def _services_for_cluster(stores: SynthStores, env: str, cluster: str) -> list[dict]:
     prefix = f"service:{cluster}:"
     return [v for k, v in stores.ecsctl.items(env).items() if k.startswith(prefix)]
+
+
+def _active_services_for_cluster(stores: SynthStores, env: str, cluster: str) -> list[dict]:
+    return [s for s in _services_for_cluster(stores, env, cluster) if s["status"] == "ACTIVE"]
+
+
+def _sweep_inactive_services(stores: SynthStores, env: str) -> None:
+    now = time.time()
+    for service in _all_services(stores, env):
+        deleted_at = service.get("deleted_at")
+        if deleted_at is not None and now - deleted_at > _INACTIVE_SERVICE_SWEEP_SECONDS:
+            stores.ecsctl.delete(env, _service_key(service["cluster_name"], service["service_name"]))
+
+
+def _all_services(stores: SynthStores, env: str) -> list[dict]:
+    return [v for k, v in stores.ecsctl.items(env).items() if k.startswith("service:")]
 
 
 def _all_tasks(stores: SynthStores, env: str) -> list[dict]:
@@ -251,7 +281,7 @@ def _cluster_wire(stores: SynthStores, env: str, cluster: dict) -> dict:
         "registeredContainerInstancesCount": 0,  # v1 never models real ECS container instances
         "runningTasksCount": running,
         "pendingTasksCount": pending,
-        "activeServicesCount": len(_services_for_cluster(stores, env, cluster["cluster_name"])),
+        "activeServicesCount": len(_active_services_for_cluster(stores, env, cluster["cluster_name"])),
         "statistics": [],
         "tags": [],
         "settings": cluster["settings"],
@@ -307,7 +337,7 @@ def _service_wire(stores: SynthStores, env: str, service: dict) -> dict:
         "clusterArn": _cluster_arn(service["cluster_name"]),
         "loadBalancers": [],
         "serviceRegistries": [],
-        "status": "ACTIVE",
+        "status": service["status"],
         "desiredCount": service["desired_count"],
         "runningCount": running,
         "pendingCount": pending,
@@ -322,6 +352,10 @@ def _service_wire(stores: SynthStores, env: str, service: dict) -> dict:
         "schedulingStrategy": "REPLICA",
         "enableECSManagedTags": False,
         "propagateTags": "NONE",
+        # Real AWS's own default (verified live, V5d): the TF provider's
+        # schema treats this as Computed with that default, so omitting it
+        # entirely reads as "unset" and drifts on every subsequent plan.
+        "availabilityZoneRebalancing": "DISABLED",
     }
 
 
@@ -436,31 +470,61 @@ def _stop_task(stores: SynthStores, env: str, task: dict, runtime: TaskRuntime) 
 
 
 def _reconcile_service_tasks(stores: SynthStores, env: str, cluster_name: str, service_name: str, runtime: TaskRuntime) -> None:
-    service = _service(stores, env, cluster_name, service_name)
-    if service is None:  # deleted while this reconcile was still queued
-        return
-    taskdef = _resolve_taskdef_ref(stores, env, service["task_definition_arn"])
-    if taskdef is None:  # taskdef deregistered out from under a live service -- nothing to converge to
-        return
-    live = [t for t in _tasks_for_service(stores, env, cluster_name, service_name) if t["last_status"] != "STOPPED"]
-    stale = [t for t in live if t["task_definition_arn"] != service["task_definition_arn"]]
-    fresh = [t for t in live if t not in stale]
-    for task in stale:
-        _stop_task(stores, env, task, runtime)
-
-    desired = service["desired_count"]
-    if len(fresh) < desired:
-        for _ in range(desired - len(fresh)):
-            _launch_task(stores, env, cluster_name, service_name, taskdef, runtime)
-    elif len(fresh) > desired:
-        # Newest-task-first scale-down (the digest's own ordering).
-        excess = sorted(fresh, key=lambda t: t["started_at"] or 0, reverse=True)[: len(fresh) - desired]
-        for task in excess:
+    with _lock_for_service(stores, env, cluster_name, service_name):
+        service = _service(stores, env, cluster_name, service_name)
+        if service is None or service["status"] != "ACTIVE":  # deleted while this reconcile was queued/racing
+            return
+        taskdef = _resolve_taskdef_ref(stores, env, service["task_definition_arn"])
+        if taskdef is None:  # taskdef deregistered out from under a live service -- nothing to converge to
+            return
+        live = [t for t in _tasks_for_service(stores, env, cluster_name, service_name) if t["last_status"] != "STOPPED"]
+        stale = [t for t in live if t["task_definition_arn"] != service["task_definition_arn"]]
+        fresh = [t for t in live if t not in stale]
+        for task in stale:
             _stop_task(stores, env, task, runtime)
+
+        desired = service["desired_count"]
+        if len(fresh) < desired:
+            for _ in range(desired - len(fresh)):
+                _launch_task(stores, env, cluster_name, service_name, taskdef, runtime)
+        elif len(fresh) > desired:
+            # Newest-task-first scale-down (the digest's own ordering).
+            excess = sorted(fresh, key=lambda t: t["started_at"] or 0, reverse=True)[: len(fresh) - desired]
+            for task in excess:
+                _stop_task(stores, env, task, runtime)
 
 
 def _spawn(target: Callable[..., None], *args: object) -> None:
     threading.Thread(target=target, args=args, daemon=True).start()
+
+
+# Per-(SynthStores, env, cluster, service) lock, serializing
+# `_reconcile_service_tasks` (spawned off CreateService/UpdateService)
+# against `_delete_service`'s own stop pass -- LOAD-BEARING (V5d): real
+# terraform-provider-aws's own Delete for aws_ecs_service calls
+# UpdateService(desiredCount=0) immediately before DeleteService (verified
+# live, TF_LOG=DEBUG trace), so a background reconcile thread from THAT
+# UpdateService and DeleteService's own synchronous stop loop were racing to
+# `docker rm` the SAME container -- the loser's exception is caught (the
+# module's own "best-effort teardown" contract, `_stop_task`'s docstring),
+# so the record still went away while the REAL container silently survived.
+# Without this lock two concurrent stops of the same task are possible;
+# with it, at most one ever runs. Keyed through a `WeakKeyDictionary` on the
+# `SynthStores` instance itself (the same instance-scoping
+# `aws/backings.py::BackingAws._ensure_lock` uses, not a bare module
+# global) -- a bare `(env, cluster, service)` global leaked ACROSS
+# independent `SynthStores` instances (every test reuses env="default"),
+# found the hard way when an unrelated test's never-released FakeTaskRuntime
+# block deadlocked every later test sharing that key.
+_service_locks: "weakref.WeakKeyDictionary[SynthStores, dict[tuple[str, str, str], threading.Lock]]" = weakref.WeakKeyDictionary()
+_service_locks_guard = threading.Lock()
+
+
+def _lock_for_service(stores: SynthStores, env: str, cluster_name: str, service_name: str) -> threading.Lock:
+    key = (env, cluster_name, service_name)
+    with _service_locks_guard:
+        per_store = _service_locks.setdefault(stores, {})
+        return per_store.setdefault(key, threading.Lock())
 
 
 # --- Cluster ---------------------------------------------------------------
@@ -502,7 +566,7 @@ def _delete_cluster(payload: dict, env: str, stores: SynthStores, runtime: TaskR
     cluster = _cluster(stores, env, name)
     if cluster is None:
         return _not_found_cluster(name)
-    if _services_for_cluster(stores, env, name):
+    if _active_services_for_cluster(stores, env, name):
         return errors.synth_error(
             "ecs", "ClusterContainsServicesException",
             f"The Cluster cannot be deleted while Services are active: {name}", 400,
@@ -567,7 +631,8 @@ def _create_service(payload: dict, env: str, stores: SynthStores, runtime: TaskR
     if cluster is None:
         return _not_found_cluster(cluster_name)
     service_name = payload.get("serviceName", "")
-    if _service(stores, env, cluster_name, service_name) is not None:
+    existing = _service(stores, env, cluster_name, service_name)
+    if existing is not None and existing["status"] == "ACTIVE":
         return errors.synth_error(
             "ecs", "InvalidParameterException",
             f"Creation of service was not idempotent. {service_name} already exists", 400,
@@ -582,6 +647,8 @@ def _create_service(payload: dict, env: str, stores: SynthStores, runtime: TaskR
         "desired_count": int(payload.get("desiredCount") or 0),
         "launch_type": payload.get("launchType") or _DEFAULT_LAUNCH_TYPE,
         "created_at": time.time(),
+        "status": "ACTIVE",
+        "deleted_at": None,
     }
     stores.ecsctl.set(env, _service_key(cluster_name, service_name), service)
     # No tasks exist yet at this instant (CreateService just minted the
@@ -596,6 +663,7 @@ def _create_service(payload: dict, env: str, stores: SynthStores, runtime: TaskR
 
 def _describe_services(payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime) -> Response:
     _sweep_tasks(stores, env, runtime)
+    _sweep_inactive_services(stores, env)
     cluster_name = _strip_id(payload.get("cluster"))
     names = payload.get("services") or []
     selected, failures = [], []
@@ -613,7 +681,7 @@ def _update_service(payload: dict, env: str, stores: SynthStores, runtime: TaskR
     cluster_name = _strip_id(payload.get("cluster"))
     service_name = _strip_id(payload.get("service"), default="")
     service = _service(stores, env, cluster_name, service_name)
-    if service is None:
+    if service is None or service["status"] != "ACTIVE":
         return _not_found_service(service_name)
     if "desiredCount" in payload:
         service["desired_count"] = int(payload["desiredCount"])
@@ -632,19 +700,31 @@ def _delete_service(payload: dict, env: str, stores: SynthStores, runtime: TaskR
     cluster_name = _strip_id(payload.get("cluster"))
     service_name = _strip_id(payload.get("service"), default="")
     service = _service(stores, env, cluster_name, service_name)
-    if service is None:
+    if service is None or service["status"] != "ACTIVE":
         return _not_found_service(service_name)
-    wire = _service_wire(stores, env, service)
-    wire["status"] = "INACTIVE"
     # A real docker stop/rm is fast (no cold pull involved), so -- unlike
-    # CreateService/UpdateService's convergence pass -- deleting is done
-    # synchronously here: by the time this responds, the containers are
-    # genuinely gone, matching "force=true" AWS semantics without needing
-    # to model the `force` parameter at all (v1 simplification).
-    for task in _tasks_for_service(stores, env, cluster_name, service_name):
-        _stop_task(stores, env, task, runtime)
-    stores.ecsctl.delete(env, _service_key(cluster_name, service_name))
-    return _json({"service": wire})
+    # CreateService/UpdateService's convergence pass -- stopping the real
+    # containers is done synchronously here: by the time this responds,
+    # they're genuinely gone, matching "force=true" AWS semantics without
+    # needing to model the `force` parameter at all (v1 simplification).
+    # The same per-service lock `_reconcile_service_tasks` takes -- real
+    # terraform-provider-aws issues UpdateService(desiredCount=0) right
+    # before this call, so without the lock its background reconcile thread
+    # and this stop loop can race to `docker rm` the same container (see
+    # `_lock_for_service`'s docstring -- V5d found this for real).
+    with _lock_for_service(stores, env, cluster_name, service_name):
+        for task in _tasks_for_service(stores, env, cluster_name, service_name):
+            _stop_task(stores, env, task, runtime)
+        # The RECORD, unlike the containers, is NOT deleted outright -- see
+        # `_INACTIVE_SERVICE_SWEEP_SECONDS`'s docstring: a real `tofu
+        # destroy` hangs forever polling DescribeServices for a service
+        # that's simply gone, so this module keeps it around,
+        # `status="INACTIVE"`, for the provider's own delete-waiter to
+        # actually observe.
+        service["status"] = "INACTIVE"
+        service["deleted_at"] = time.time()
+        stores.ecsctl.set(env, _service_key(cluster_name, service_name), service)
+    return _json({"service": _service_wire(stores, env, service)})
 
 
 # --- Tasks ---------------------------------------------------------------
