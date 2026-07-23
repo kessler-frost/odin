@@ -1,6 +1,6 @@
 """`odin doctor` — preflight checks that this machine can actually RUN Odin
-(not just start it): Colima up, the docker CLI + tofu on PATH, plus optional
-niceties (limactl, bun, claude).
+(not just start it): Colima up, the docker CLI + tofu on PATH, disk headroom,
+plus optional niceties (limactl, bun, claude).
 
 `run_checks` is the pure core: it takes the check names to run and a
 subprocess-runner callable (fakeable in tests — the same runner seam
@@ -14,11 +14,15 @@ import subprocess
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
+from shutil import disk_usage
 from typing import Literal, Protocol
 
 import typer
 
 from odin.cli.app import app
+
+MIN_DISK_GIB = 10.0
 
 
 class Proc(Protocol):
@@ -50,7 +54,7 @@ _TOOLS: tuple[tuple[str, bool, str], ...] = (
     ("claude", False, "see https://docs.claude.com/claude-code"),  # translate has a fallback
 )
 
-ALL_CHECKS: tuple[str, ...] = ("colima", *(name for name, _, _ in _TOOLS))
+ALL_CHECKS: tuple[str, ...] = ("colima", *(name for name, _, _ in _TOOLS), "disk")
 
 
 def _subprocess_run(args: list[str], input: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -78,10 +82,25 @@ def _check_colima(run: Runner) -> CheckResult:
     return CheckResult("colima", "ok", True, f"{path} — running")
 
 
-def run_checks(which: Iterable[str], run: Runner) -> list[CheckResult]:
+def _check_disk(root: Path) -> CheckResult:
+    free_gib = disk_usage(root).free / 2**30
+    ok = free_gib > MIN_DISK_GIB
+    return CheckResult(
+        "disk", "ok" if ok else "fail", True,
+        f"{free_gib:.1f} GiB free on the volume holding {root}",
+        "" if ok else f"free up disk space (>{MIN_DISK_GIB:.0f} GiB needed; no single command)",
+    )
+
+
+def run_checks(which: Iterable[str], run: Runner, disk_path: Path | None = None) -> list[CheckResult]:
     """Run the named checks through `run` (the subprocess seam); results come
-    back in the order asked."""
-    checks: dict[str, Callable[[], CheckResult]] = {"colima": partial(_check_colima, run)}
+    back in the order asked. `disk_path` defaults to the current directory —
+    the volume Odin's images, containers, and `.odin/` state land on."""
+    root = disk_path or Path.cwd()
+    checks: dict[str, Callable[[], CheckResult]] = {
+        "colima": partial(_check_colima, run),
+        "disk": partial(_check_disk, root),
+    }
     checks.update({name: partial(_check_tool, run, name, required, fix)
                    for name, required, fix in _TOOLS})
     return [checks[name]() for name in which]

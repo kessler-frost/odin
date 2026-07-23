@@ -3,6 +3,8 @@ real Colima/Docker calls (real-infra checks live behind `-m integration`)."""
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
 
 from typer.testing import CliRunner
 
@@ -12,6 +14,8 @@ from odin.cli.app import app
 from odin.cli.doctor import ALL_CHECKS, run_checks
 
 runner = CliRunner()
+
+GIB = 2**30
 
 
 @dataclass(frozen=True)
@@ -47,10 +51,19 @@ def by_name(results):
     return {r.name: r for r in results}
 
 
+def fake_disk(free_bytes: int):
+    return lambda path: SimpleNamespace(total=500 * GIB, used=0, free=free_bytes)
+
+
+def patch_disk(monkeypatch, free_bytes: int = 50 * GIB) -> None:
+    monkeypatch.setattr(doctor_mod, "disk_usage", fake_disk(free_bytes))
+
+
 # --- run_checks core -------------------------------------------------------
 
-def test_all_checks_pass():
-    results = run_checks(ALL_CHECKS, make_run())
+def test_all_checks_pass(monkeypatch):
+    patch_disk(monkeypatch)
+    results = run_checks(ALL_CHECKS, make_run(), disk_path=Path.cwd())
     assert [r.status for r in results] == ["ok"] * len(ALL_CHECKS)
     assert [r.name for r in results] == list(ALL_CHECKS)
 
@@ -83,9 +96,26 @@ def test_optional_tools_missing_are_skips():
     ]
 
 
+# --- disk headroom ---------------------------------------------------------
+
+def test_disk_low_fails(monkeypatch):
+    patch_disk(monkeypatch, free_bytes=5 * GIB)
+    disk = by_name(run_checks(["disk"], make_run(), disk_path=Path.cwd()))["disk"]
+    assert (disk.status, disk.required) == ("fail", True)
+    assert "5.0 GiB free" in disk.detail
+    assert "free up disk space" in disk.fix
+
+
+def test_disk_headroom_ok(monkeypatch):
+    patch_disk(monkeypatch, free_bytes=50 * GIB)
+    disk = by_name(run_checks(["disk"], make_run(), disk_path=Path.cwd()))["disk"]
+    assert (disk.status, disk.fix) == ("ok", "")
+
+
 # --- the CLI command -------------------------------------------------------
 
 def test_cli_exit_zero_with_optional_missing(monkeypatch):
+    patch_disk(monkeypatch)
     monkeypatch.setattr(doctor_mod, "_subprocess_run", make_run({"which limactl": FakeProc(1)}))
     result = runner.invoke(app, ["doctor"])
     assert result.exit_code == 0
@@ -95,6 +125,7 @@ def test_cli_exit_zero_with_optional_missing(monkeypatch):
 
 
 def test_cli_exit_one_on_required_failure(monkeypatch):
+    patch_disk(monkeypatch)
     monkeypatch.setattr(doctor_mod, "_subprocess_run", make_run({"which tofu": FakeProc(1)}))
     result = runner.invoke(app, ["doctor"])
     assert result.exit_code == 1
@@ -103,6 +134,7 @@ def test_cli_exit_one_on_required_failure(monkeypatch):
 
 
 def test_cli_all_ok(monkeypatch):
+    patch_disk(monkeypatch)
     monkeypatch.setattr(doctor_mod, "_subprocess_run", make_run())
     result = runner.invoke(app, ["doctor"])
     assert result.exit_code == 0
