@@ -120,3 +120,23 @@ def test_vpc_subnet_sg_round_trip_with_containment_fields():
     assert by_id["web-sg"].fields["vpc"].value == "net"
     assert by_id["web-sg"].fields["subnet"].value == "web"
     assert by_id["web-sg"].fields["ingressRules"].value == "tcp:443:0.0.0.0/0"
+
+
+def test_iam_role_and_ecr_translate_with_fields_passed_generically():
+    # V2c: iam_role/ecr are pure gateway-model kinds like vpc/subnet/sg --
+    # `_resource` needs no special-casing for them, just the _KIND mapping.
+    canvas = {
+        "nodes": [
+            {"id": "n1", "type": "iam_role", "data": {"label": "lambda-exec", "inlinePolicy": '{"Version": "2012-10-17"}'}},
+            {"id": "n2", "type": "ecr", "data": {"label": "app-image"}},
+        ],
+        "edges": [],
+    }
+    stack = canvas_to_stack(canvas)
+    by_id = {r.id: r for r in stack.resources}
+    assert set(by_id) == {"lambda-exec", "app-image"}
+
+    assert by_id["lambda-exec"].kind == "iam_role"
+    assert by_id["lambda-exec"].fields["inlinePolicy"].value == '{"Version": "2012-10-17"}'
+
+    assert by_id["app-image"].kind == "ecr"

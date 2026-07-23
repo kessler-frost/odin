@@ -203,6 +203,38 @@ def _subnet(res: ResourceDesired, refs: Refs) -> Built:
     return {"vpc_id": vpc_id, "cidr_block": quote(_field(res, "cidr", "10.0.1.0/24"))}, ""
 
 
+# The standard Lambda execution-role trust document (research §2d's captured
+# IAM+Lambda sequence: `aws_lambda_function` requires an `aws_iam_role` whose
+# AssumeRolePolicyDocument trusts `lambda.amazonaws.com`) -- the default
+# every iam_role node gets unless a later slice adds a way to author a
+# different principal on the canvas.
+_LAMBDA_TRUST_POLICY = (
+    "jsonencode({\n"
+    '    Version = "2012-10-17"\n'
+    "    Statement = [{\n"
+    '      Action    = "sts:AssumeRole"\n'
+    '      Effect    = "Allow"\n'
+    '      Principal = { Service = "lambda.amazonaws.com" }\n'
+    "    }]\n"
+    "  })"
+)
+
+
+def _iam_role(res: ResourceDesired, refs: Refs) -> Built:
+    # assume_role_policy's value spans multiple lines (jsonencode({...})),
+    # so it's passed as `nested` rather than joining `attrs`' aligned
+    # cluster -- `tofu fmt` itself breaks alignment around a multi-line
+    # value (verified empirically), and `_block`'s `width = max(len(k) for
+    # k in attrs)` would otherwise force-pad "name" to match
+    # "assume_role_policy"'s length, which real `tofu fmt` then un-pads.
+    nested = f"  assume_role_policy = {_LAMBDA_TRUST_POLICY}"
+    return {"name": quote(res.id)}, nested
+
+
+def _ecr(res: ResourceDesired, refs: Refs) -> Built:
+    return {"name": quote(res.id)}, ""
+
+
 def _sg(res: ResourceDesired, refs: Refs) -> Built:
     vpc_id = _vpc_ref(res, refs)
     if vpc_id is None:
@@ -235,6 +267,8 @@ _TF_TYPES = {
     "vpc": "aws_vpc",
     "subnet": "aws_subnet",
     "sg": "aws_security_group",
+    "iam_role": "aws_iam_role",
+    "ecr": "aws_ecr_repository",
 }
 
 _BUILDERS = {
@@ -245,6 +279,8 @@ _BUILDERS = {
     "vpc": _vpc,
     "subnet": _subnet,
     "sg": _sg,
+    "iam_role": _iam_role,
+    "ecr": _ecr,
 }
 
 
@@ -300,6 +336,27 @@ def generate_tf(stack: Stack) -> TfProject:
         }
         block = _block("aws_sns_topic_subscription", name, attrs)
         blocks.append((("sns_subscription", f"{topic.id}.{queue.id}"), block))
+
+    # iam_role's optional inline-policy textarea (V2c) becomes a SEPARATE
+    # aws_iam_role_policy resource, not a nested block on aws_iam_role
+    # itself — mirrors the sns_subscription pass above: one canvas node can
+    # still emit more than one TF resource. `policy` takes the field's raw
+    # text verbatim (a plain JSON string is a valid `aws_iam_role_policy`
+    # argument; no jsonencode() round-trip needed since the user already
+    # typed JSON into the textarea).
+    for res in ordered:
+        if res.kind != "iam_role":
+            continue
+        inline = _field(res, "inlinePolicy", "").strip()
+        role_name = hcl_name_by_id.get(res.id)
+        if not inline or role_name is None:
+            continue
+        name = unique_name(
+            sanitize_name(f"{role_name}_inline"), used_names.setdefault("aws_iam_role_policy", set()),
+        )
+        attrs = {"name": quote(f"{res.id}-inline"), "role": f"aws_iam_role.{role_name}.name", "policy": quote(inline)}
+        block = _block("aws_iam_role_policy", name, attrs)
+        blocks.append((("iam_role_policy", res.id), block))
 
     blocks.sort(key=lambda b: b[0])
     main_tf = "\n\n".join([HEADER, provider_block(), *(text for _, text in blocks)]) + "\n"

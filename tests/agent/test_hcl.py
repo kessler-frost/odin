@@ -285,6 +285,64 @@ def test_sg_with_malformed_ingress_rule_lands_in_unsupported():
     ]
 
 
+def test_iam_role_emits_name_and_the_lambda_trust_policy():
+    stack = Stack(resources=(ResourceDesired(id="lambda-exec", kind="iam_role"),))
+    proj = generate_tf(stack)
+    main_tf = proj.files["main.tf"]
+    assert 'resource "aws_iam_role" "lambda_exec"' in main_tf
+    assert '  name = "lambda-exec"' in main_tf
+    assert 'Service = "lambda.amazonaws.com"' in main_tf
+    assert 'Action    = "sts:AssumeRole"' in main_tf
+    assert proj.unsupported == []
+    assert "aws_iam_role_policy" not in main_tf  # no inlinePolicy field -> no second block
+
+
+def test_iam_role_with_inline_policy_emits_a_separate_role_policy_resource():
+    doc = '{"Version": "2012-10-17", "Statement": []}'
+    stack = Stack(resources=(
+        ResourceDesired(id="lambda-exec", kind="iam_role", fields=_fields(inlinePolicy=doc)),
+    ))
+    main_tf = generate_tf(stack).files["main.tf"]
+    assert 'resource "aws_iam_role" "lambda_exec"' in main_tf
+    assert 'resource "aws_iam_role_policy" "lambda_exec_inline"' in main_tf
+    assert "  role   = aws_iam_role.lambda_exec.name" in main_tf
+    assert '  policy = "{\\"Version\\": \\"2012-10-17\\", \\"Statement\\": []}"' in main_tf
+
+
+def test_iam_role_with_blank_inline_policy_emits_no_second_block():
+    stack = Stack(resources=(
+        ResourceDesired(id="lambda-exec", kind="iam_role", fields=_fields(inlinePolicy="   ")),
+    ))
+    main_tf = generate_tf(stack).files["main.tf"]
+    assert "aws_iam_role_policy" not in main_tf
+
+
+def test_ecr_emits_repository_name():
+    stack = Stack(resources=(ResourceDesired(id="app-image", kind="ecr"),))
+    proj = generate_tf(stack)
+    main_tf = proj.files["main.tf"]
+    assert 'resource "aws_ecr_repository" "app_image"' in main_tf
+    assert 'name = "app-image"' in main_tf
+    assert proj.unsupported == []
+
+
+def test_tofu_fmt_accepts_iam_role_and_ecr_output(tmp_path):
+    tofu = shutil.which("tofu")
+    if tofu is None:
+        return  # skip cleanly -- no tofu on PATH in this environment
+    stack = Stack(resources=(
+        ResourceDesired(id="lambda-exec", kind="iam_role", fields=_fields(inlinePolicy='{"Version": "2012-10-17"}')),
+        ResourceDesired(id="app-image", kind="ecr"),
+    ))
+    main_tf = tmp_path / "main.tf"
+    main_tf.write_text(generate_tf(stack).files["main.tf"])
+    result = subprocess.run(
+        [tofu, "fmt", "-check", "-diff", str(main_tf)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_tofu_fmt_accepts_vpc_subnet_sg_output(tmp_path):
     tofu = shutil.which("tofu")
     if tofu is None:

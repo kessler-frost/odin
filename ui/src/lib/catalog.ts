@@ -107,6 +107,26 @@ export const CATALOG: ServiceDef[] = [
     fields: [{ key: 'label', label: 'Name', editable: true }, { key: 'arn', label: 'ARN' }],
     defaultData: { label: 'new-role', arn: '' },
   },
+  // iam_role/ecr (V2c) are the REAL, gateway-modeled services (NORTHSTAR
+  // directive 5) — distinct from the 'iamrole' placeholder above, which
+  // stays an unwired future-coverage entry (not in translate.py's _KIND, so
+  // Apply silently skips it; see skipped_node_types). Both render via the
+  // generic ServiceNode, no bespoke component.
+  {
+    type: 'iam_role', abbr: 'ROLE', label: 'IAM Role', sublabel: 'Terraform-managed role',
+    category: 'Security', color: 'amber', width: 220,
+    fields: [
+      { key: 'label', label: 'Name', editable: true },
+      { key: 'inlinePolicy', label: 'Inline Policy (JSON)', editable: true },
+    ],
+    defaultData: { label: 'new-role', inlinePolicy: '' },
+  },
+  {
+    type: 'ecr', abbr: 'ECR', label: 'ECR Repository', sublabel: 'Container registry',
+    category: 'Storage', color: 'sky', width: 200,
+    fields: [{ key: 'label', label: 'Name', editable: true }],
+    defaultData: { label: 'new-repo' },
+  },
   {
     type: 'route53', abbr: 'DNS', label: 'Route 53 Zone', sublabel: 'Hosted zone',
     category: 'Networking', color: 'indigo', width: 200,
