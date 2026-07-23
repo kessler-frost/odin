@@ -96,6 +96,13 @@ class SynthStores:
       (`gateway/models/ecr.py`) -- flat keys `"repo:{name}"`, persisted at
       `.odin/{env}/gateway/ecr.json`. ECR tags live in the shared `tags`
       store above, keyed `"ecr:{repositoryArn}"`.
+    - `ec2compute`: the EC2-compute model's whole state
+      (`gateway/models/ec2compute.py`, task V3) -- flat keys
+      `"instance:{id}"` / `"keypair:{name}"`, persisted at
+      `.odin/{env}/gateway/ec2compute.json`. Instance/key-pair tags live in
+      the shared `tags` store above, keyed `"ec2:{resource_id}"` -- the SAME
+      namespace ec2net.py's vpc/subnet/sg tags use (a bare EC2 resource id is
+      unique across the whole `ec2:*` family by construction).
     """
 
     def __init__(self, root: Path) -> None:
@@ -107,3 +114,4 @@ class SynthStores:
         self.ec2net = JsonStore(root, "ec2net")
         self.iamctl = JsonStore(root, "iamctl")
         self.ecr = JsonStore(root, "ecr")
+        self.ec2compute = JsonStore(root, "ec2compute")

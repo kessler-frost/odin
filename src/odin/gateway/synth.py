@@ -60,7 +60,7 @@ from starlette.responses import Response
 from odin.aws.backings import ACCOUNT, REGION
 from odin.gateway import errors
 from odin.gateway.keys import Principal
-from odin.gateway.models import ec2net, ecr, iamctl
+from odin.gateway.models import ec2compute, ecr, iamctl
 from odin.gateway.stores import SynthStores
 
 _SNS_NS = "http://sns.amazonaws.com/doc/2010-03-31/"
@@ -349,15 +349,17 @@ def pure_answer(
     """A direct synth answer for a PURE/CONDITIONAL action, or None if
     `action` isn't synth-owned for this call -- the caller (app.py) forwards
     normally in that case. Every `ec2:*`/`iam:*` action is owned wholesale by
-    its own model module (gateway/models/ec2net.py, iamctl.py) -- neither
-    has a backing container to forward to, so those paths never return None.
-    `ecr:*` is likewise all-synth for its CONTROL plane, but (task V2b)
-    needs the registry:2 backing's own live port to build `repositoryUri` --
-    `backing_port` is app.py's existing `GatewayState.backing_port` lookup,
-    threaded through here rather than forwarded (ECR's data plane, image
-    bytes, bypasses the gateway entirely -- see gateway/models/ecr.py)."""
+    its own model module(s) -- `ec2compute.py` (task V3: instances + key
+    pairs, falling through to `ec2net.py`'s VPC/Subnet/SG for everything
+    else) and `iamctl.py` -- neither has a backing container to forward to,
+    so those paths never return None. `ecr:*` is likewise all-synth for its
+    CONTROL plane, but (task V2b) needs the registry:2 backing's own live
+    port to build `repositoryUri` -- `backing_port` is app.py's existing
+    `GatewayState.backing_port` lookup, threaded through here rather than
+    forwarded (ECR's data plane, image bytes, bypasses the gateway entirely
+    -- see gateway/models/ecr.py)."""
     if action.startswith("ec2:"):
-        return ec2net.pure_answer(action, resource, env, body, stores, now)
+        return ec2compute.pure_answer(action, resource, env, body, stores, now)
     if action.startswith("iam:"):
         return iamctl.pure_answer(action, resource, env, body, stores, now)
     if action.startswith("ecr:"):

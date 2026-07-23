@@ -50,6 +50,14 @@ INSTANCE_TYPES: dict[str, VmConfig] = {
     "t2.micro": VmConfig(cpus=1, memory="1GiB", disk="10GiB"),
     "t2.small": VmConfig(cpus=1, memory="2GiB", disk="20GiB"),
     "t2.medium": VmConfig(cpus=2, memory="4GiB", disk="20GiB"),
+    # V3: the gateway's EC2-compute model (gateway/models/ec2compute.py)
+    # maps aws_instance's `instance_type` through this same table -- t3.*
+    # rows added here (rather than a second table) so LimaRuntime's own
+    # "t2.medium" host-VM lookup and EC2's per-instance VMs share one
+    # source of truth.
+    "t3.micro": VmConfig(cpus=1, memory="1GiB", disk="10GiB"),
+    "t3.small": VmConfig(cpus=1, memory="2GiB", disk="20GiB"),
+    "t3.medium": VmConfig(cpus=2, memory="4GiB", disk="20GiB"),
 }
 
 

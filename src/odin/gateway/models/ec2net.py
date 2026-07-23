@@ -106,7 +106,15 @@ _NOT_FOUND = {
     "sg": "InvalidGroup.NotFound",
 }
 
-_RESOURCE_TYPES = {"vpc": "vpc", "subnet": "subnet", "sg": "security-group"}
+# "i"/"vol"/"key" (V3): the compute model's instance/volume/key-pair id
+# prefixes -- `_describe_tags` below is resource-id-agnostic (scans every
+# "ec2:{id}" tag key regardless of which module created it), so ec2compute.py
+# never needs its own DescribeTags/CreateTags/DeleteTags handlers; this table
+# just needs their prefixes to report the right `resourceType`.
+_RESOURCE_TYPES = {
+    "vpc": "vpc", "subnet": "subnet", "sg": "security-group",
+    "i": "instance", "vol": "volume", "key": "key-pair",
+}
 
 
 def _mint(prefix: str) -> str:
