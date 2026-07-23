@@ -65,6 +65,31 @@ class FakeInstanceVm:
         self.deleted.append(name)
 
 
+class GatedDeleteInstanceVm(FakeInstanceVm):
+    """`delete()` blocks on a per-attempt gate before doing anything --
+    lets a test deterministically observe the "delete failed, waiting for a
+    retry" window instead of racing a near-instant fake delete against its
+    own retry (release finding #4's honesty fix). The FIRST attempt raises
+    once released; every attempt after that succeeds once released."""
+
+    def __init__(self, ip: str = "192.168.64.10") -> None:
+        super().__init__(ip=ip)
+        self.delete_attempts = 0
+        self.first_delete_blocked = threading.Event()
+        self.release_first_delete = threading.Event()
+        self.release_retry = threading.Event()
+
+    def delete(self, name):
+        self.delete_attempts += 1
+        if self.delete_attempts == 1:
+            self.first_delete_blocked.set()
+            self.release_first_delete.wait(timeout=5.0)
+            self.deleted.append(name)
+            raise RuntimeError("delete failed")
+        self.release_retry.wait(timeout=5.0)
+        self.deleted.append(name)
+
+
 class SlowBootInstanceVm(FakeInstanceVm):
     """A `boot()` that blocks until `release` is set -- lets a test win a
     Terminate race against a still-in-flight RunInstances boot completion
@@ -257,6 +282,46 @@ def test_terminate_transitions_then_sweeps_after_grace_window(sink, ec2, stores)
     assert parsed["Error"]["Code"] == "InvalidInstanceID.NotFound"
 
 
+def test_terminate_delete_failure_keeps_shutting_down_with_reason_and_retries(sink, ec2, stores):
+    """Release finding #4 -- VM delete honesty: a failed `vm.delete` must
+    NOT be reported as a clean `terminated`. The record stays
+    `shutting-down` with the error recorded, and the NEXT Describe-driven
+    pass retries the delete until it actually succeeds."""
+    subnet_id = _subnet(stores, sink, ec2)
+    vm = GatedDeleteInstanceVm()
+    instance_id = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)["Instances"][0]["InstanceId"]
+    _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+
+    term_req = sink.call(lambda: ec2.terminate_instances(InstanceIds=[instance_id]))
+    _answer(stores, term_req, vm)
+    assert vm.first_delete_blocked.wait(timeout=2.0)  # the first (failing) delete attempt is mid-flight
+    vm.release_first_delete.set()
+
+    # Poll until the failure has genuinely landed. Every poll ALSO drives
+    # `_retry_failed_deletes`, but its retry attempt blocks on
+    # `release_retry` (not yet set) before mutating anything -- so once the
+    # failed state is observed here it's stable, not a narrow race window.
+    deadline = time.monotonic() + 2.0
+    reasoned = None
+    while time.monotonic() < deadline:
+        req = sink.call(lambda: ec2.describe_instances(InstanceIds=[instance_id]))
+        parsed = _parse("DescribeInstances", _answer(stores, req, vm))
+        instance = parsed["Reservations"][0]["Instances"][0]
+        if instance["State"]["Name"] == "shutting-down" and instance.get("StateReason"):
+            reasoned = instance
+            break
+        time.sleep(0.02)
+    assert reasoned is not None, "the delete failure was never recorded"
+    assert "delete failed" in reasoned["StateReason"]["Message"].lower()
+
+    # Release the retry that the polling above already spawned -- it
+    # succeeds, and the instance genuinely reaches terminated.
+    vm.release_retry.set()
+    _wait_for_state(stores, sink, ec2, instance_id, "terminated", vm)
+    name = f"allfather-ec2-{ENV}-{instance_id}"
+    assert vm.deleted.count(name) == 2  # the original failed attempt + the successful retry
+
+
 def test_late_boot_completion_cannot_resurrect_a_terminated_instance(sink, ec2, stores):
     """Release finding #3 -- the resurrection race: RunInstances's background
     `_finish_boot` thread is still in flight when Terminate wins first. The
@@ -406,3 +471,59 @@ def test_tags_flow_through_ec2net_and_report_the_right_resource_type(sink, ec2, 
     parsed = _parse("DescribeTags", _answer(stores, req, vm))
     (tag,) = parsed["Tags"]
     assert tag == {"ResourceId": instance_id, "ResourceType": "instance", "Key": "Name", "Value": "web"}
+
+
+# --- startup reaper (release finding #4) -------------------------------------
+
+
+class FakeReaperVm:
+    """The `list_names`/`delete` shape `reap_orphaned_vms` needs --
+    deliberately NOT the full InstanceVm boot/stop/start surface, since the
+    reaper never touches those."""
+
+    def __init__(self, names: list[str]) -> None:
+        self._names = list(names)
+        self.deleted: list[str] = []
+
+    def list_names(self) -> list[str]:
+        return list(self._names)
+
+    def delete(self, name: str) -> None:
+        self.deleted.append(name)
+        self._names.remove(name)
+
+
+def test_reap_orphaned_vms_deletes_only_unmatched_ec2_named_vms(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.ec2compute.set("default", "instance:i-known", {"instance_id": "i-known"})
+    vm = FakeReaperVm(names=[
+        "allfather-ec2-default-i-known",      # matches the store -- must survive
+        "allfather-ec2-default-i-orphaned",   # no matching record -- reaped
+        "allfather-ec2-staging-i-elsewhere",  # a different env, no record at all -- reaped
+        "veronica",                           # a user's own Lima VM -- never even a candidate
+        "some-other-tool-vm",                 # another subsystem's VM -- never touched
+    ])
+
+    reaped = ec2compute.reap_orphaned_vms(tmp_path, ["default", "staging"], vm=vm)
+
+    assert sorted(reaped) == ["allfather-ec2-default-i-orphaned", "allfather-ec2-staging-i-elsewhere"]
+    assert sorted(vm.deleted) == sorted(reaped)
+    assert "allfather-ec2-default-i-known" not in vm.deleted
+    assert "veronica" not in vm.deleted
+    assert "some-other-tool-vm" not in vm.deleted
+
+
+def test_reap_orphaned_vms_is_a_no_op_when_everything_matches(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.ec2compute.set("default", "instance:i-known", {"instance_id": "i-known"})
+    vm = FakeReaperVm(names=["allfather-ec2-default-i-known"])
+
+    reaped = ec2compute.reap_orphaned_vms(tmp_path, ["default"], vm=vm)
+
+    assert reaped == []
+    assert vm.deleted == []
+
+
+def test_reap_orphaned_vms_with_no_vms_at_all_is_a_no_op(tmp_path):
+    vm = FakeReaperVm(names=[])
+    assert ec2compute.reap_orphaned_vms(tmp_path, ["default"], vm=vm) == []

@@ -197,6 +197,22 @@ def test_status_absent_when_vm_is_gone():
     assert InstanceVm(runner=runner).status(NAME) == "absent"
 
 
+def test_list_names_returns_every_name_from_json_lines():
+    runner = FakeRunner()
+    runner.responses["list"] = _Proc(
+        0,
+        '{"name": "veronica", "status": "Running"}\n'
+        f'{{"name": "{NAME}", "status": "Stopped"}}\n',
+    )
+    assert InstanceVm(runner=runner).list_names() == ["veronica", NAME]
+
+
+def test_list_names_empty_when_no_vms():
+    runner = FakeRunner()
+    runner.responses["list"] = _Proc(0, "")
+    assert InstanceVm(runner=runner).list_names() == []
+
+
 # --- Nebula join -----------------------------------------------------------------
 
 

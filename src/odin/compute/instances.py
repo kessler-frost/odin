@@ -218,3 +218,20 @@ class InstanceVm:
             if record.get("name") == name:
                 return str(record.get("status", "Unknown")).lower()
         return "absent"
+
+    def list_names(self) -> list[str]:
+        """Every VM name `limactl list --json` currently reports -- read-only
+        (never touches a VM), the one non-exact-name limactl call this class
+        makes. The startup reaper
+        (`gateway/models/ec2compute.py::reap_orphaned_vms`) is the only
+        caller; it still only ever calls `delete(name)` with an exact name
+        it has already validated against the store."""
+        out = self._lima("list", "--json", check=False).stdout
+        names = []
+        for line in out.splitlines():
+            if not line.strip():
+                continue
+            name = json.loads(line).get("name")
+            if name:
+                names.append(name)
+        return names

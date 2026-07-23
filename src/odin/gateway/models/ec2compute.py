@@ -133,6 +133,11 @@ _TERMINATED_SWEEP_SECONDS = 60.0
 # "last write wins".
 _TERMINAL_STATES = frozenset({"shutting-down", "terminated"})
 
+# `compute.instances.vm_name`'s own prefix -- the startup reaper
+# (`reap_orphaned_vms` below) only ever considers a VM shaped like this,
+# never anything else `limactl list` happens to report.
+_VM_NAME_PREFIX = "allfather-ec2-"
+
 
 def _mint(prefix: str) -> str:
     return f"{prefix}-{secrets.token_hex(9)[:17]}"
@@ -370,12 +375,51 @@ def _finish_terminate(stores: SynthStores, env: str, instance_id: str, name: str
     try:
         vm.delete(name)
     except Exception as exc:
-        # Best-effort teardown: the record still goes `terminated` (real AWS
-        # gives the caller no retry seam here either) -- a leaked VM is
-        # caught by the test fixture's exact-name sweep, not left for this
-        # request-scoped model to retry forever.
-        log.warning("VM delete failed for instance %s (%s): %s", instance_id, name, exc)
-    _update_instance(stores, env, instance_id, state_name="terminated", terminated_at=time.monotonic())
+        # VM delete honesty (release finding #4): a failed delete must NOT
+        # be reported as a clean `terminated` -- a caller (tofu's own
+        # destroy waiter, a human) polling DescribeInstances deserves the
+        # truth, not a record claiming the VM is gone when it might not be.
+        # The record stays `shutting-down` with the failure recorded and
+        # `delete_failed` set, so `_retry_failed_deletes` (every
+        # Describe-driven pass, below) tries again -- and the startup
+        # reaper (`reap_orphaned_vms`) is the backstop for a VM that
+        # outlives every record of it entirely (e.g. this env's store gets
+        # destroyed before a retry ever lands).
+        log.error("VM delete failed for instance %s (%s), will retry on next describe: %s", instance_id, name, exc)
+        _update_instance(
+            stores, env, instance_id,
+            state_reason={"code": "Server.InternalError", "message": f"VM delete failed, retrying: {exc}"},
+            delete_failed=True,
+        )
+        return
+    _update_instance(
+        stores, env, instance_id, state_name="terminated", terminated_at=time.monotonic(),
+        state_reason=None, delete_failed=False,
+    )
+
+
+def _claim_delete_retry(instance: dict | None) -> dict | object:
+    """The mutator `_retry_failed_deletes` uses to atomically claim ONE
+    retry attempt for an instance stuck in `shutting-down` with a prior
+    delete failure -- flips `delete_failed` off BEFORE spawning the retry,
+    so a second concurrent Describe-driven pass sees it already claimed and
+    skips it (no two threads calling `vm.delete` on the same VM at once).
+    `_finish_terminate` re-sets `delete_failed` if THIS attempt also fails,
+    making it eligible again for the next pass."""
+    if instance is None or instance["state_name"] != "shutting-down" or not instance.get("delete_failed"):
+        return NO_CHANGE
+    instance = dict(instance)
+    instance["delete_failed"] = False
+    return instance
+
+
+def _retry_failed_deletes(stores: SynthStores, env: str, vm: InstanceVm) -> None:
+    for instance in _records(stores, env, "instance"):
+        instance_id = instance["instance_id"]
+        claimed = stores.ec2compute.update(env, _key("instance", instance_id), _claim_delete_retry)
+        if claimed is NO_CHANGE:
+            continue
+        _spawn(_finish_terminate, stores, env, instance_id, vm_name(env, instance_id), vm)
 
 
 def _finish_stop(stores: SynthStores, env: str, instance_id: str, name: str, vm: InstanceVm) -> None:
@@ -476,6 +520,7 @@ def _run_instances(params: dict[str, str], env: str, stores: SynthStores, now: f
 
 def _describe_instances(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm) -> Response:
     _sweep_terminated(stores, env, now)
+    _retry_failed_deletes(stores, env, vm)
     instance_ids = _scalars(params, "InstanceId")
     filters = _filters(params)
     instances = _records(stores, env, "instance")
@@ -682,6 +727,40 @@ def _delete_key_pair(params: dict[str, str], env: str, stores: SynthStores, now:
         stores.tags.set(env, f"ec2:{keypair['key_pair_id']}", {})
         stores.ec2compute.delete(env, _key("keypair", name))
     return _response("DeleteKeyPair", "<return>true</return>")
+
+
+# --- startup reaper (release finding #4) ------------------------------------
+
+
+def reap_orphaned_vms(root: Path, envs: list[str], vm: InstanceVm | None = None) -> list[str]:
+    """A one-shot startup safety net for a VM that's on disk with NO
+    matching store record anywhere -- e.g. a crash between `vm.delete`
+    succeeding and the store update landing, or any other drift between
+    "the store thinks this instance is gone" and "the VM is actually gone".
+    `limactl list --json` (via `InstanceVm.list_names`) -> delete any VM
+    shaped like this module's own `vm_name()` convention whose EXACT name
+    isn't one any of `envs`' ec2compute stores currently expects.
+
+    Exact-name discipline throughout: the "expected" set is built by
+    calling the SAME `vm_name(env, instance_id)` every real creation uses,
+    never a prefix/wildcard match on the delete side -- a user's own Lima
+    VM (e.g. `veronica`) or another allfather subsystem's is never even a
+    candidate, let alone touched. Returns the names of VMs it deleted."""
+    vm = vm or InstanceVm()
+    stores = SynthStores(root)
+    expected = {
+        vm_name(env, record["instance_id"])
+        for env in envs
+        for key, record in stores.ec2compute.items(env).items()
+        if key.startswith("instance:")
+    }
+    reaped = []
+    for name in vm.list_names():
+        if name.startswith(_VM_NAME_PREFIX) and name not in expected:
+            log.warning("startup reaper: deleting orphaned EC2 VM %r (no matching store record)", name)
+            vm.delete(name)
+            reaped.append(name)
+    return reaped
 
 
 # --- dispatch ----------------------------------------------------------------

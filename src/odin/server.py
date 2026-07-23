@@ -7,6 +7,7 @@ over WebSocket.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -31,6 +32,7 @@ from odin.fabric.nebula import mesh_state
 from odin.gateway import DEFAULT_GATEWAY_PORT, GATEWAY_PORT_ENV
 from odin.gateway.app import GatewayState, create_gateway_app, serve_in_thread, stop_in_thread
 from odin.gateway.keys import OPERATOR_NODE_ID, KeyStore, Principal
+from odin.gateway.models import ec2compute
 from odin.gateway.stores import SynthStores
 from odin.reconcile.reconciler import Reconciler
 from odin.runtime.colima import ColimaRuntime
@@ -296,6 +298,20 @@ def create_apply_full_router(
     return router
 
 
+async def _reap_orphaned_ec2_vms(root: Path, envs: list[str]) -> None:
+    """Best-effort (release finding #4): `limactl` being unavailable, or
+    any other reaper failure, must never block server startup -- this is a
+    one-shot cleanup pass, not something reconciling depends on. Runs off
+    the event loop thread (`limactl list`/`delete` are blocking subprocess
+    calls that can take real wall-clock time for however many VMs exist)."""
+    try:
+        reaped = await asyncio.to_thread(ec2compute.reap_orphaned_vms, root, envs)
+        if reaped:
+            log.warning("startup reaper deleted %d orphaned EC2 VM(s): %s", len(reaped), reaped)
+    except Exception:
+        log.exception("startup EC2 VM reaper failed (continuing without it)")
+
+
 def create_app(
     runtime=None,
     store: SpecStore | None = None,
@@ -303,9 +319,19 @@ def create_app(
     aws=None,
     backings: bool = True,
     gateway_port: int | None = None,
+    reap_ec2_vms: bool | None = None,
 ) -> FastAPI:
     _runtime = runtime or ColimaRuntime()
     _store = store or SpecStore(ODIN_DIR)
+    # The startup EC2-VM reaper (release finding #4) cross-references
+    # REAL, machine-global `limactl` VMs against this app's OWN store --
+    # unsafe to run against anything but the one true `.odin` tree (a
+    # second store, e.g. a test's own `tmp_path`, has no way to know about
+    # VMs that legitimately belong to a DIFFERENT store/process on the same
+    # machine, and would reap them as "orphaned"). Default it to "on" only
+    # when `store` wasn't overridden -- i.e. only for the real production
+    # app, never for a test or any other caller that brought its own store.
+    _reap_ec2_vms = reap_ec2_vms if reap_ec2_vms is not None else store is None
     ws_manager = ConnectionManager(_store.root)
     _resolved_gateway_port = gateway_port if gateway_port is not None else int(os.environ.get(GATEWAY_PORT_ENV, DEFAULT_GATEWAY_PORT))
 
@@ -367,7 +393,10 @@ def create_app(
         # envs resumed on restart) need the ACTUAL resolved port to point
         # BackingAws's goaws.yaml at.
         gateway_server, gateway_thread, gateway_port_actual = serve_in_thread(gateway_app, port=_resolved_gateway_port)
-        for env in _store.list_envs():  # resume reconciling existing environments
+        envs = _store.list_envs()
+        if _reap_ec2_vms:
+            await _reap_orphaned_ec2_vms(_store.root, envs)
+        for env in envs:  # resume reconciling existing environments
             await reconciler_for(env)
         try:
             yield
