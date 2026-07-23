@@ -321,6 +321,21 @@ def test_delete_vpc_removes_its_default_security_group(sink, ec2, stores):
     assert _parse("DescribeSecurityGroups", _answer(stores, req))["SecurityGroups"] == []
 
 
+def test_delete_last_vpc_drops_the_envs_nebula_ca(sink, ec2, stores):
+    """The Nebula CA at .odin/{env}/nebula/ dies with the env's LAST VPC --
+    and survives while any other VPC in the env still needs it."""
+    vpc_a = _create_vpc(stores, sink, ec2, "10.0.0.0/16")
+    vpc_b = _create_vpc(stores, sink, ec2, "10.1.0.0/16")
+    nebula_dir = stores.root / ENV / "nebula"
+    assert nebula_dir.exists()
+
+    assert _answer(stores, sink.call(lambda: ec2.delete_vpc(VpcId=vpc_a))).status_code == 200
+    assert nebula_dir.exists()
+
+    assert _answer(stores, sink.call(lambda: ec2.delete_vpc(VpcId=vpc_b))).status_code == 200
+    assert not nebula_dir.exists()
+
+
 # --- Tags (EC2's own wire shape) ------------------------------------------------
 
 
