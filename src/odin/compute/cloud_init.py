@@ -5,6 +5,7 @@ def generate_cloud_init(
     hostname: str,
     ssh_pubkey: str | None = None,
     install_nerdctl: bool = False,
+    extra_script: str | None = None,
 ) -> str:
     lines = [
         "#!/bin/bash",
@@ -68,5 +69,13 @@ def generate_cloud_init(
             'systemctl daemon-reload',
             'systemctl enable --now buildkitd',
         ])
+
+    if extra_script:
+        # V3: compute/instances.py composes this from two sources -- an
+        # instance's Nebula cert/config files (written verbatim, no download)
+        # and/or its RunInstances `UserData` (already base64-decoded by the
+        # caller) -- both are plain bash appended after the base provisioning
+        # above, one script, one Lima `provision` entry.
+        lines.extend(["", "# Extra provisioning (Nebula join / instance user_data)", extra_script])
 
     return "\n".join(lines) + "\n"
