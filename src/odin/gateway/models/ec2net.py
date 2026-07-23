@@ -50,6 +50,25 @@ Persistence: one `JsonStore` at `.odin/{env}/gateway/ec2net.json`
 The default NACL/route-table are not independent records -- their ids live
 on the VPC record and their describes are synthesized from it (nothing in
 V1 ever mutates them).
+
+Nebula compile (task V1b, NORTHSTAR directive 6 -- "Nebula is the network
+layer"): mutations push the env's desired network state through
+`fabric/nebula.py`'s EXISTING primitives, never parallel structures.
+- CreateVpc calls `ensure_network(stores.root, env, "127.0.0.1")` -- real
+  CA/cert artifacts via nebula-cert plus overlay bookkeeping; no lighthouse
+  PROCESS ever starts in V1, and "127.0.0.1" is a deliberate placeholder
+  underlay until a real multi-Mac underlay exists. odin's mesh is per-ENV
+  and V1 canvases carry one VPC per env, so the VPC -> Nebula-network
+  mapping is 1:1 for now (`nebula_network` == env on the VPC record);
+  multi-VPC-per-env topology is deliberately NOT modeled yet.
+- Every SG mutation (create / authorize / revoke) recompiles the group's
+  ingress rule set through `sg_rules_to_firewall` -- research finding #3:
+  the IpPermissions shape IS that function's input, no adapter -- and
+  stores the resulting `FirewallRules` dump on the SG record itself
+  (`sg["firewall"]`), so it dies with the group and `fabric.nebula
+  .mesh_state` can read it straight off this module's sidecar file. The
+  artifacts are exactly what a Nebula node config consumes at V3
+  (golden-tested through `NebulaManager.generate_config`).
 """
 from __future__ import annotations
 
@@ -63,6 +82,7 @@ from xml.sax.saxutils import escape
 from starlette.responses import Response
 
 from odin.aws.backings import ACCOUNT, REGION
+from odin.fabric.nebula import ensure_network, sg_rules_to_firewall
 from odin.gateway import errors
 from odin.gateway.stores import SynthStores
 
@@ -363,6 +383,9 @@ def _create_vpc(params: dict[str, str], env: str, stores: SynthStores) -> Respon
     vpc_id = _mint("vpc")
     tags = _spec_tags(params)
     default_sg = _new_sg(stores, env, vpc_id, "default", "default VPC security group", is_default=True)
+    # V1b: a VPC joins the env's Nebula network (1:1 for now -- see module
+    # docstring). Real CA/cert artifacts, idempotent, no daemon started.
+    network = ensure_network(stores.root, env, "127.0.0.1")
     vpc = {
         "vpc_id": vpc_id,
         "cidr_block": params.get("CidrBlock", "10.0.0.0/16"),
@@ -373,6 +396,7 @@ def _create_vpc(params: dict[str, str], env: str, stores: SynthStores) -> Respon
         "route_table_id": _mint("rtb"),
         "route_table_association_id": _mint("rtbassoc"),
         "default_sg_id": default_sg["group_id"],
+        "nebula_network": network.network,
     }
     stores.ec2net.set(env, _key("vpc", vpc_id), vpc)
     stores.tags.set(env, f"ec2:{vpc_id}", tags)
@@ -518,6 +542,15 @@ def _delete_subnet(params: dict[str, str], env: str, stores: SynthStores) -> Res
 # --- Security Group -----------------------------------------------------------
 
 
+def _compiled_firewall(sg: dict) -> dict:
+    """The SG's ingress rule set through `fabric.nebula.sg_rules_to_firewall`
+    (V1b) -- `aggregate_permissions` already emits that function's exact
+    input shape. Stored as a plain dump on the SG record so it dies with the
+    group and `mesh_state` reads it without importing gateway code."""
+    ingress = [r for r in sg["rules"].values() if not r["is_egress"]]
+    return sg_rules_to_firewall(aggregate_permissions(ingress)).model_dump()
+
+
 def _new_sg(stores: SynthStores, env: str, vpc_id: str, name: str, description: str, is_default: bool) -> dict:
     """Mint + store an SG seeded with the default allow-all IPv4 egress rule
     (research finding #3: the provider revokes it, so it must exist to be
@@ -532,6 +565,7 @@ def _new_sg(stores: SynthStores, env: str, vpc_id: str, name: str, description: 
         "vpc_id": vpc_id, "is_default": is_default,
         "rules": {_rule_id(group_id, egress_all): egress_all},
     }
+    sg["firewall"] = _compiled_firewall(sg)
     stores.ec2net.set(env, _key("sg", group_id), sg)
     return sg
 
@@ -600,6 +634,7 @@ def _mutate_rules(params: dict[str, str], env: str, stores: SynthStores, is_egre
                 rule_items.append(f"<item>{_sg_rule_xml(rule_id, group_id, rule)}</item>")
             else:
                 sg["rules"].pop(rule_id, None)
+    sg["firewall"] = _compiled_firewall(sg)  # V1b: every mutation recompiles
     stores.ec2net.set(env, _key("sg", group_id), sg)
     rule_set = f"<securityGroupRuleSet>{''.join(rule_items)}</securityGroupRuleSet>" if authorize else ""
     return _response(action_name, f"<return>true</return>{rule_set}")

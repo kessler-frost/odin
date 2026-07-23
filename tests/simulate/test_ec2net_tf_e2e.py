@@ -19,7 +19,10 @@ deliberate differences:
   Colima/Lima involved.
 
 Also the empirical proof for ec2net's delete-confirm choice (hard delete,
-immediate NotFound): `tofu destroy` exits 0 with no grace window.
+immediate NotFound): `tofu destroy` exits 0 with no grace window. And the
+V1b observable outcome: the applied VPC/SG show up on `GET /mesh?env=` as
+a per-VPC Nebula network + compiled firewall rules (real CA/cert artifacts
+under `{root}/{env}/nebula/`; no lighthouse process).
 """
 from __future__ import annotations
 
@@ -140,6 +143,20 @@ def test_tf_apply_zero_drift_destroy_vpc_subnets_sg(tmp_path):
         assert {(r["from_port"], r["cidr_ipv4"]) for r in ingress} == {(443, "10.0.0.0/16"), (22, "192.168.0.0/24")}
         # the provider revoked the seeded default egress (config declares none)
         assert [r for r in rules if r["is_egress"]] == []
+
+        # V1b: the applied VPC bootstrapped the env's REAL Nebula network
+        # (CA/cert artifacts only -- no lighthouse process), and the SG's
+        # ingress compiled to Nebula firewall rules, visible on /mesh.
+        assert (store.root / ENV / "nebula" / "ca.crt").exists()
+        inbound = web_sg["firewall"]["inbound"]
+        assert {(r["port"], r["proto"], r["cidr"]) for r in inbound} == {
+            ("443", "tcp", "10.0.0.0/16"), ("22", "tcp", "192.168.0.0/24"),
+        }
+        mesh = client.get("/mesh", params={"env": ENV}).json()
+        (vpc_net,) = mesh["vpcs"]
+        assert vpc_net["network"] == ENV and vpc_net["cidr_block"] == "10.0.0.0/16"
+        (mesh_web,) = [g for g in mesh["security_groups"] if g["group_name"] == "web"]
+        assert mesh_web["firewall"]["inbound"] == inbound
 
         # zero drift: the research bar -- apply -> plan changes NOTHING
         plan = _tofu(["plan", "-detailed-exitcode"], workspace, env_vars)
