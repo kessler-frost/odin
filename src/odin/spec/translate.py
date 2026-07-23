@@ -17,10 +17,13 @@ _REF = re.compile(r"^\$\{\{\s*([\w-]+)\.([\w-]+)\s*\}\}$")
 # are AWS-shaped resources provisioned in per-env backing containers.
 # vpc/subnet/sg are the V1 network containers: their containment-stamped
 # data.vpc/data.subnet fields flow through `_resource` like any other field.
-# iam_role/ecr (V2c) are pure gateway-model kinds like vpc/subnet/sg -- no
-# reconciler-driven provisioning at all (plan.py NoOps them; see
-# reconcile/plan.py + aws/backings.py::ENSURE_KINDS), just fields flowing
-# through generically for hcl.py's builders to read.
+# iam_role/ecr (V2c) and ec2 (V3c) are pure gateway-model kinds like
+# vpc/subnet/sg -- no reconciler-driven provisioning at all (plan.py NoOps
+# them; see reconcile/plan.py + aws/backings.py::ENSURE_KINDS), just fields
+# flowing through generically for hcl.py's builders to read. ec2's REAL
+# lifecycle (a Lima VM) is driven entirely by the gateway's RunInstances
+# handler (gateway/models/ec2compute.py) once `tofu apply` reaches it -- the
+# reconciler never touches it, same as vpc/subnet/sg.
 _KIND = {
     "rds": "rds",
     "s3": "s3",
@@ -32,6 +35,7 @@ _KIND = {
     "sg": "sg",
     "iam_role": "iam_role",
     "ecr": "ecr",
+    "ec2": "ec2",
 }
 
 

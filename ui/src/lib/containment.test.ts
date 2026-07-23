@@ -71,6 +71,16 @@ describe('computeContainment', () => {
     expect(c['web-sg']).toEqual({ vpc: 'net', subnet: 'web' });
   });
 
+  test('an ec2 node is a leaf like sg -- stamped by center point (V3c)', () => {
+    const nodes = [
+      node('net', 'vpc', 0, 0, 560, 380),
+      node('web', 'subnet', 20, 60, 520, 280),
+      node('server', 'ec2', 40, 100, 200, 60),
+    ];
+    const c = computeContainment(nodes);
+    expect(c['server']).toEqual({ vpc: 'net', subnet: 'web' });
+  });
+
   test('measured dimensions win over stale style dimensions', () => {
     const stale = node('web', 'subnet', 20, 60, 9999, 9999);
     stale.measured = { width: 520, height: 280 };

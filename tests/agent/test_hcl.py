@@ -374,3 +374,112 @@ def test_tofu_fmt_check_accepts_generated_output(tmp_path):
         capture_output=True, text=True,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+# --- ec2 (V3c) -----------------------------------------------------------------
+
+
+def _subnet_stack(*ec2_nodes: ResourceDesired) -> Stack:
+    return Stack(resources=(
+        ResourceDesired(id="net", kind="vpc"),
+        ResourceDesired(id="web", kind="subnet", fields=_fields(vpc="net")),
+        *ec2_nodes,
+    ))
+
+
+def test_ec2_in_a_subnet_emits_ami_type_and_subnet_ref():
+    stack = _subnet_stack(ResourceDesired(
+        id="server", kind="ec2", fields=_fields(subnet="web", ami="ami-custom", instanceType="t3.small"),
+    ))
+    main_tf = generate_tf(stack).files["main.tf"]
+    assert 'resource "aws_instance" "server"' in main_tf
+    assert 'ami           = "ami-custom"' in main_tf
+    assert 'instance_type = "t3.small"' in main_tf
+    assert "subnet_id     = aws_subnet.web.id" in main_tf
+
+
+def test_ec2_defaults_ami_and_instance_type_when_fields_absent():
+    stack = _subnet_stack(ResourceDesired(id="server", kind="ec2", fields=_fields(subnet="web")))
+    main_tf = generate_tf(stack).files["main.tf"]
+    assert 'ami           = "ami-0c101f26f147fa7fd"' in main_tf
+    assert 'instance_type = "t3.micro"' in main_tf
+
+
+def test_ec2_outside_a_subnet_lands_in_unsupported():
+    proj = generate_tf(Stack(resources=(ResourceDesired(id="stray", kind="ec2"),)))
+    assert proj.unsupported == [
+        "stray (ec2): not contained inside a Subnet on the canvas (drag it into a Subnet box)"
+    ]
+    assert "aws_instance" not in proj.files["main.tf"]
+
+
+def test_ec2_security_groups_field_references_sg_nodes():
+    stack = Stack(resources=(
+        ResourceDesired(id="net", kind="vpc"),
+        ResourceDesired(id="web", kind="subnet", fields=_fields(vpc="net")),
+        ResourceDesired(id="web-sg", kind="sg", fields=_fields(vpc="net", ingressRules="tcp:22:0.0.0.0/0")),
+        ResourceDesired(id="db-sg", kind="sg", fields=_fields(vpc="net", ingressRules="tcp:5432:10.0.0.0/16")),
+        ResourceDesired(id="server", kind="ec2", fields=_fields(subnet="web", securityGroups="web-sg\ndb-sg")),
+    ))
+    main_tf = generate_tf(stack).files["main.tf"]
+    assert "vpc_security_group_ids = [aws_security_group.web_sg.id, aws_security_group.db_sg.id]" in main_tf
+
+
+def test_ec2_with_unknown_security_group_label_lands_in_unsupported():
+    stack = _subnet_stack(ResourceDesired(id="server", kind="ec2", fields=_fields(subnet="web", securityGroups="ghost")))
+    proj = generate_tf(stack)
+    assert proj.unsupported == [
+        "server (ec2): securityGroups names something that isn't a Security Group on the canvas"
+    ]
+
+
+def test_ec2_with_no_security_groups_field_omits_the_argument():
+    stack = _subnet_stack(ResourceDesired(id="server", kind="ec2", fields=_fields(subnet="web")))
+    main_tf = generate_tf(stack).files["main.tf"]
+    assert "vpc_security_group_ids" not in main_tf
+
+
+def test_ec2_user_data_becomes_a_plain_string_argument():
+    stack = _subnet_stack(ResourceDesired(
+        id="server", kind="ec2", fields=_fields(subnet="web", userData="#!/bin/bash\necho hi\n"),
+    ))
+    main_tf = generate_tf(stack).files["main.tf"]
+    assert '  user_data = "#!/bin/bash\\necho hi\\n"' in main_tf
+
+
+def test_ec2_key_field_emits_a_companion_key_pair_and_references_it():
+    stack = _subnet_stack(ResourceDesired(
+        id="server", kind="ec2", fields=_fields(subnet="web", key="ssh-ed25519 AAAAtest me@host"),
+    ))
+    main_tf = generate_tf(stack).files["main.tf"]
+    assert 'resource "aws_key_pair" "server_key"' in main_tf
+    assert 'public_key = "ssh-ed25519 AAAAtest me@host"' in main_tf
+    assert 'key_name   = "server-key"' in main_tf
+    assert "  key_name = aws_key_pair.server_key.key_name" in main_tf
+
+
+def test_ec2_without_key_field_emits_no_key_pair():
+    stack = _subnet_stack(ResourceDesired(id="server", kind="ec2", fields=_fields(subnet="web")))
+    main_tf = generate_tf(stack).files["main.tf"]
+    assert "aws_key_pair" not in main_tf
+    assert "key_name" not in main_tf
+
+
+def test_tofu_fmt_accepts_ec2_output(tmp_path):
+    tofu = shutil.which("tofu")
+    if tofu is None:
+        return  # skip cleanly -- no tofu on PATH in this environment
+    stack = _subnet_stack(ResourceDesired(
+        id="server", kind="ec2",
+        fields=_fields(
+            subnet="web", key="ssh-ed25519 AAAAtest me@host",
+            userData="#!/bin/bash\necho hi\n", instanceType="t3.small",
+        ),
+    ))
+    main_tf = tmp_path / "main.tf"
+    main_tf.write_text(generate_tf(stack).files["main.tf"])
+    result = subprocess.run(
+        [tofu, "fmt", "-check", "-diff", str(main_tf)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

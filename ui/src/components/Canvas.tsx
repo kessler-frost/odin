@@ -23,6 +23,7 @@ import '@xyflow/react/dist/style.css';
 import VpcNode from './nodes/VpcNode';
 import SubnetNode from './nodes/SubnetNode';
 import SgNode from './nodes/SgNode';
+import Ec2Node from './nodes/Ec2Node';
 import S3Node from './nodes/S3Node';
 import DynamodbNode from './nodes/DynamodbNode';
 import ServiceNode from './nodes/ServiceNode';
@@ -34,6 +35,7 @@ const nodeTypes: NodeTypes = {
   vpc: VpcNode,
   subnet: SubnetNode,
   sg: SgNode,
+  ec2: Ec2Node,
   s3: S3Node,
   dynamodb: DynamodbNode,
   // Every catalog service renders with the generic ServiceNode.
@@ -44,6 +46,7 @@ const nodeTypeMap: Record<string, string> = {
   VPC: 'vpc',
   SUB: 'subnet',
   SG: 'sg',
+  EC2: 'ec2',
   S3: 's3',
   DDB: 'dynamodb',
   ...catalogNodeTypeMap,
@@ -53,6 +56,7 @@ const defaultDataForType: Record<string, Record<string, string>> = {
   vpc: { label: 'new-vpc', resourceId: '', cidr: '10.0.0.0/16', status: 'draft' },
   subnet: { label: 'new-subnet', resourceId: '', cidr: '10.0.1.0/24', status: 'draft' },
   sg: { label: 'new-sg', groupId: '', vpcId: '', ingressRules: '', status: 'draft' },
+  ec2: { label: 'new-instance', instanceType: 't3.micro', ami: '', key: '', userData: '', securityGroups: '', status: 'draft' },
   s3: { label: 'new-bucket', arn: '', status: 'draft' },
   dynamodb: { label: 'new-table', hashKey: 'id', billingMode: 'PAY_PER_REQUEST', arn: '', status: 'draft' },
   ...catalogDefaultData,
@@ -62,6 +66,7 @@ const defaultStyleForType: Record<string, React.CSSProperties> = {
   vpc: { width: 560, height: 380 },
   subnet: { width: 520, height: 280 },
   sg: { width: 200 },
+  ec2: { width: 200 },
   s3: { width: 200 },
   dynamodb: { width: 200 },
   ...catalogDefaultStyle,
@@ -74,6 +79,7 @@ const zIndexForType: Record<string, number> = {
   vpc: 0,
   subnet: 1,
   sg: 2,
+  ec2: 2,
   s3: 2,
   dynamodb: 2,
   ...catalogZIndex,
@@ -476,7 +482,7 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
   );
 
   const dblClickTypeRef = useRef(0);
-  const typeOrder = ['s3', 'sqs', 'dynamodb', 'rds', 'vpc', 'subnet', 'sg'];
+  const typeOrder = ['s3', 'sqs', 'dynamodb', 'rds', 'vpc', 'subnet', 'sg', 'ec2'];
 
   const onPaneDoubleClick = useCallback(
     (event: React.MouseEvent) => {

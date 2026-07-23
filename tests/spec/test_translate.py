@@ -75,13 +75,13 @@ def test_canvas_to_stack_maps_kinds_fields_refs():
                 "label": "uploads", "arn": "",
                 "env": {"DATABASE_URL": "${{db.DATABASE_URL}}", "STATIC": "v"},
             }},
-            {"type": "ec2", "data": {"label": "ignored"}},  # unknown kind dropped
+            {"type": "lambda", "data": {"label": "ignored"}},  # unknown kind dropped
         ],
         "edges": [],
     }
     stack = canvas_to_stack(canvas)
     ids = {r.id for r in stack.resources}
-    assert ids == {"db", "uploads"}  # ec2 dropped (a future slice, not V1)
+    assert ids == {"db", "uploads"}  # lambda dropped (a future slice, not yet modeled)
 
     db = next(r for r in stack.resources if r.id == "db")
     assert db.kind == "rds" and db.fields["engine"].value == "postgres"

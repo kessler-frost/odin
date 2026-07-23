@@ -159,6 +159,13 @@ def _vpc_ref(res: ResourceDesired, refs: Refs) -> str | None:
     return f"aws_vpc.{name}.id" if kind == "vpc" else None
 
 
+def _subnet_ref(res: ResourceDesired, refs: Refs) -> str | None:
+    """`aws_subnet.<name>.id` for res's containment-stamped `subnet` field
+    (V3c: an ec2 node's subnet_id), or None when missing/not a subnet."""
+    kind, name = refs.get(_field(res, "subnet", ""), ("", ""))
+    return f"aws_subnet.{name}.id" if kind == "subnet" else None
+
+
 def _ingress_rules(res: ResourceDesired) -> list[tuple[str, str, str]] | None:
     """Parse the SG node's `ingressRules` field: one rule per line, formatted
     `protocol:port:cidr` (e.g. `tcp:443:0.0.0.0/0`). Returns (protocol, port,
@@ -256,6 +263,59 @@ def _sg(res: ResourceDesired, refs: Refs) -> Built:
     return {"name": quote(res.id), "vpc_id": vpc_id}, "\n\n".join([*ingress, _DEFAULT_EGRESS])
 
 
+# V3c: EC2 instances (real Lima VMs, gateway/models/ec2compute.py). Matches
+# that module's own stub-catalog default (documentation only — ImageId is
+# accepted verbatim, never validated) and default instance type.
+_NOT_IN_SUBNET = "not contained inside a Subnet on the canvas (drag it into a Subnet box)"
+_BAD_SECURITY_GROUPS = 'securityGroups names something that isn\'t a Security Group on the canvas'
+_DEFAULT_AMI = "ami-0c101f26f147fa7fd"
+_DEFAULT_INSTANCE_TYPE = "t3.micro"
+
+
+def _security_group_refs(res: ResourceDesired, refs: Refs) -> list[str] | None:
+    """The ec2 node's `securityGroups` field: one sg canvas label per line
+    (SIMPLEST honest v1 — see the V3 brief: no implicit "same containment
+    scope" placement, just an explicit list). Returns `aws_security_group.
+    <name>.id` refs, `[]` for an empty field (the instance just gets the
+    VPC's default SG, a legitimate case), or None if ANY line names
+    something that isn't a sg resource."""
+    lines = [line.strip() for line in _field(res, "securityGroups", "").splitlines() if line.strip()]
+    resolved = []
+    for label in lines:
+        kind, name = refs.get(label, ("", ""))
+        if kind != "sg":
+            return None
+        resolved.append(f"aws_security_group.{name}.id")
+    return resolved
+
+
+def _ec2(res: ResourceDesired, refs: Refs) -> Built:
+    subnet_id = _subnet_ref(res, refs)
+    if subnet_id is None:
+        return _NOT_IN_SUBNET
+    sg_ids = _security_group_refs(res, refs)
+    if sg_ids is None:
+        return _BAD_SECURITY_GROUPS
+    attrs = {
+        "ami": quote(_field(res, "ami", _DEFAULT_AMI)),
+        "instance_type": quote(_field(res, "instanceType", _DEFAULT_INSTANCE_TYPE)),
+        "subnet_id": subnet_id,
+    }
+    nested = []
+    if sg_ids:
+        nested.append(f"  vpc_security_group_ids = [{', '.join(sg_ids)}]")
+    if _field(res, "key", ""):
+        # The companion aws_key_pair block (below, generate_tf's 3rd pass)
+        # is named deterministically off THIS instance's own hcl name --
+        # already assigned in pass 1, so `refs[res.id]` is available here.
+        _, own_name = refs[res.id]
+        nested.append(f"  key_name = aws_key_pair.{own_name}_key.key_name")
+    user_data = _field(res, "userData", "")
+    if user_data:
+        nested.append(f"  user_data = {quote(user_data)}")
+    return attrs, "\n\n".join(nested)
+
+
 # kind -> terraform resource type; kept separate from _BUILDERS so pass 1 of
 # generate_tf can assign HCL names (scoped per resource type) without running
 # any builder.
@@ -269,6 +329,7 @@ _TF_TYPES = {
     "sg": "aws_security_group",
     "iam_role": "aws_iam_role",
     "ecr": "aws_ecr_repository",
+    "ec2": "aws_instance",
 }
 
 _BUILDERS = {
@@ -281,6 +342,7 @@ _BUILDERS = {
     "sg": _sg,
     "iam_role": _iam_role,
     "ecr": _ecr,
+    "ec2": _ec2,
 }
 
 
@@ -357,6 +419,24 @@ def generate_tf(stack: Stack) -> TfProject:
         attrs = {"name": quote(f"{res.id}-inline"), "role": f"aws_iam_role.{role_name}.name", "policy": quote(inline)}
         block = _block("aws_iam_role_policy", name, attrs)
         blocks.append((("iam_role_policy", res.id), block))
+
+    # V3c: an ec2 node's optional `key` field (a raw SSH public key) becomes
+    # a SEPARATE aws_key_pair resource, named deterministically off the
+    # instance's own hcl name (`_ec2`'s builder references this exact same
+    # name for `key_name` — see its docstring) — one more one-canvas-node-to
+    # -two-tf-resources pass, same shape as sns_subscription/iam_role_policy
+    # above.
+    for res in ordered:
+        if res.kind != "ec2":
+            continue
+        key = _field(res, "key", "").strip()
+        instance_name = hcl_name_by_id.get(res.id)
+        if not key or instance_name is None:
+            continue
+        name = f"{instance_name}_key"
+        attrs = {"key_name": quote(f"{res.id}-key"), "public_key": quote(key)}
+        block = _block("aws_key_pair", name, attrs)
+        blocks.append((("aws_key_pair", res.id), block))
 
     blocks.sort(key=lambda b: b[0])
     main_tf = "\n\n".join([HEADER, provider_block(), *(text for _, text in blocks)]) + "\n"
