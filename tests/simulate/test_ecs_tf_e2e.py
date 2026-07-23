@@ -74,12 +74,24 @@ def _main_tf(desired_count: int) -> str:
     }}
   ])
 }}"""
+    # `tags` on the service is the recorded-drift regression this file's two
+    # `plan -detailed-exitcode` checks now also cover: the gateway must echo
+    # the block back (DescribeServices/ListTagsForResource) or every plan
+    # after apply shows a tags diff (ROADMAP's old ECS v1 limit). `odin:node`
+    # mirrors agent/hcl.py::_tags_block's production stamp; the `scale` tag
+    # CHANGES with desired_count, so the scale-down re-apply drives a real
+    # TagResource call through the provider, not just the create-time path.
     service = f"""resource "aws_ecs_service" "app" {{
   name            = {hcl.quote(SERVICE_NAME)}
   cluster         = aws_ecs_cluster.main.id
   task_definition = aws_ecs_task_definition.app.arn
   desired_count   = {desired_count}
   launch_type     = "EC2"
+
+  tags = {{
+    {hcl.quote("odin:node")} = {hcl.quote(SERVICE_NAME)}
+    {hcl.quote("scale")}     = {hcl.quote(str(desired_count))}
+  }}
 }}"""
     return "\n\n".join([hcl.HEADER, hcl.provider_block(), cluster, taskdef, service]) + "\n"
 
@@ -184,6 +196,9 @@ def test_tf_apply_converges_real_containers_zero_drift_scale_destroy(tmp_path, e
         print(f"[V5d] runningCount converged to 2 in {converge_elapsed:.1f}s (incl. any nginx:alpine pull)")
         assert service["desiredCount"] == 2
         assert service["pendingCount"] == 0
+        # The tags block round-tripped through the gateway (the zero-drift
+        # plan below is the provider-side proof; this is the wire-side one).
+        assert {t["key"]: t["value"] for t in service["tags"]} == {"odin:node": SERVICE_NAME, "scale": "2"}
 
         # THE proof the containers are real, not a model fiction.
         ps = _docker("ps", "--filter", f"name=allfather-ecs-{ENV}-", "--format", "{{.Image}}")
@@ -204,6 +219,9 @@ def test_tf_apply_converges_real_containers_zero_drift_scale_destroy(tmp_path, e
 
         service = _wait_for_running_count(ecs_client, 1, store.root, ecs_cleanup)
         assert service["desiredCount"] == 1
+        # The provider updated the changed tag in-place via a real
+        # TagResource call (the `scale` tag tracks desired_count).
+        assert {t["key"]: t["value"] for t in service["tags"]} == {"odin:node": SERVICE_NAME, "scale": "1"}
 
         ps_after_scale = _docker("ps", "--filter", f"name=allfather-ecs-{ENV}-", "--format", "{{.Names}}")
         remaining = [line for line in ps_after_scale.stdout.splitlines() if line]

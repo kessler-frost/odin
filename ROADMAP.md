@@ -93,10 +93,10 @@ future decision against these points instead of re-deriving them:
   - ECS: no `network_configuration` (awsvpc/Fargate-style ENIs — odin's tasks
     are `launch_type = "EC2"` / `network_mode = "bridge"`, which need none);
     a task that dies between API calls isn't auto-replaced until the next
-    Apply reconciles the service; a `tags` block on `aws_ecs_service` can
-    show as drift on a subsequent `tofu plan` (ECS service tags aren't
-    echoed back from the gateway yet — `TagResource`/`ListTagsForResource`
-    isn't modeled beyond extracting the `odin:node` label).
+    Apply reconciles the service. (Fixed: a `tags` block on
+    `aws_ecs_service` now plans zero-drift — the gateway stores the full tag
+    set and echoes it back, with
+    `TagResource`/`UntagResource`/`ListTagsForResource` modeled.)
   - SNS→SQS: adding a subscription edge to an *already-healthy* topic
     doesn't retroactively re-provision it (fixed on create; the live-edit
     path is a known gap).

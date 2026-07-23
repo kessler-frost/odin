@@ -72,7 +72,11 @@ Persistence: one `JsonStore` at `.odin/{env}/gateway/ecsctl.json`
 prefixes (`"taskdef:"` never collides with `"taskdef-rev:"`, `"task:"` never
 matches `"taskdef..."` -- the 5th character disagrees) sharing one flat
 namespace, the exact convention ec2net/ec2compute already use for their own
-multi-kind stores.
+multi-kind stores. Service TAGS live in the shared `stores.tags` store
+(lambdactl's exact convention), keyed `"ecs:{serviceArn}"`, so a `tags`
+block on `aws_ecs_service` round-trips (DescribeServices echoes it;
+`TagResource`/`UntagResource`/`ListTagsForResource` are modeled) instead of
+drifting on every subsequent `tofu plan`.
 """
 from __future__ import annotations
 
@@ -248,6 +252,10 @@ def _resolve_taskdef_ref(stores: SynthStores, env: str, ref: str) -> dict | None
     return _latest_active_taskdef(stores, env, bare)
 
 
+def _tags_for(stores: SynthStores, env: str, arn: str) -> dict[str, str]:
+    return stores.tags.get(env, f"ecs:{arn}", {})
+
+
 def _latest_active_taskdef(stores: SynthStores, env: str, family: str) -> dict | None:
     latest = stores.ecsctl.get(env, _taskdef_counter_key(family), 0)
     for revision in range(latest, 0, -1):
@@ -258,6 +266,14 @@ def _latest_active_taskdef(stores: SynthStores, env: str, family: str) -> dict |
 
 
 # --- wire building --------------------------------------------------------
+
+
+def _tag_list(tags: dict[str, str]) -> list[dict]:
+    """The ECS `Tag` wire shape: a LIST of lowercase {"key","value"} dicts
+    (botocore's ecs service-2.json) -- the exact inverse of
+    `_create_service`/`_tag_resource`'s parse, so tags round-trip
+    symmetrically."""
+    return [{"key": k, "value": v} for k, v in tags.items()]
 
 
 def _json(payload: dict) -> Response:
@@ -322,6 +338,7 @@ def _taskdef_wire(taskdef: dict) -> dict:
 
 
 def _service_wire(stores: SynthStores, env: str, service: dict) -> dict:
+    arn = _service_arn(service["cluster_name"], service["service_name"])
     tasks = _tasks_for_service(stores, env, service["cluster_name"], service["service_name"])
     running = sum(1 for t in tasks if t["last_status"] == "RUNNING")
     pending = sum(1 for t in tasks if t["last_status"] == "PROVISIONING")
@@ -339,7 +356,7 @@ def _service_wire(stores: SynthStores, env: str, service: dict) -> dict:
         "rolloutStateReason": f"ECS deployment ecs-svc/{service['service_name']} completed.",
     }
     return {
-        "serviceArn": _service_arn(service["cluster_name"], service["service_name"]),
+        "serviceArn": arn,
         "serviceName": service["service_name"],
         "clusterArn": _cluster_arn(service["cluster_name"]),
         "loadBalancers": [],
@@ -359,6 +376,12 @@ def _service_wire(stores: SynthStores, env: str, service: dict) -> dict:
         "schedulingStrategy": "REPLICA",
         "enableECSManagedTags": False,
         "propagateTags": "NONE",
+        # Echoed on EVERY describe (real AWS gates this behind
+        # `include=["TAGS"]`; always answering is harmless to the parser and
+        # covers the TF provider's DescribeServices-with-TAGS read path) --
+        # THE fix for the recorded "tags block drifts on a subsequent plan"
+        # v1 limit.
+        "tags": _tag_list(_tags_for(stores, env, arn)),
         # Real AWS's own default (verified live, V5d): the TF provider's
         # schema treats this as Computed with that default, so omitting it
         # entirely reads as "unset" and drifts on every subsequent plan.
@@ -706,11 +729,17 @@ def _create_service(
         "deleted_at": None,
     }
     stores.ecsctl.set(env, _service_key(cluster_name, service_name), service)
+    # The FULL tag dict is persisted (shared `stores.tags`, lambdactl's
+    # convention), not just the `odin:node` extraction above -- and set
+    # unconditionally, so recreating a name always overwrites any stale tags
+    # a deleted prior incarnation left behind. UpdateService has no `tags`
+    # param on the real wire (botocore's ecs service-2.json); later edits
+    # arrive via TagResource/UntagResource only.
+    stores.tags.set(env, f"ecs:{_service_arn(cluster_name, service_name)}", tags)
     # No tasks exist yet at this instant (CreateService just minted the
     # record), so rendering the response before spawning the reconcile
     # thread -- the same ordering ec2compute/lambdactl document for their
-    # own async creates -- carries no race here; it's kept for consistency
-    # and because a future field (e.g. tags) could change that.
+    # own async creates -- carries no race here; it's kept for consistency.
     response = _json({"service": _service_wire(stores, env, service)})
     _spawn(_reconcile_service_tasks, stores, env, cluster_name, service_name, runtime, keystore, gateway_port)
     return response
@@ -830,6 +859,58 @@ def _describe_tasks(
     return _json({"tasks": [_task_wire(t) for t in selected], "failures": failures})
 
 
+# --- Tags (TagResource/UntagResource/ListTagsForResource, shared stores.tags,
+# JSON-body params only -- ECS's JSON protocol carries `resourceArn`/`tags`/
+# `tagKeys` in the body, never query params like Lambda's REST shape) --------
+
+
+def _tagged_service(stores: SynthStores, env: str, arn: str) -> dict | None:
+    """v1 tags SERVICES only -- the one ECS resource odin's own HCL stamps a
+    `tags` block on (agent/hcl.py::_tags_block deliberately skips the shared
+    cluster and the taskdef, and the TF provider submits the serviceArn for
+    `aws_ecs_service` tag ops). Resolve `arn:...:service/{cluster}/{name}`
+    back to its record; any other ARN shape answers None -> not-found."""
+    parts = arn.rsplit(":", 1)[-1].split("/")
+    if len(parts) == 3 and parts[0] == "service":
+        return _service(stores, env, parts[1], parts[2])
+    return None
+
+
+def _tag_resource(
+    payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
+    keystore: KeyStore | None = None, gateway_port: int | None = None,
+) -> Response:
+    arn = payload.get("resourceArn", "")
+    if _tagged_service(stores, env, arn) is None:
+        return _not_found_service(arn)
+    new_tags = {t["key"]: t.get("value") for t in payload.get("tags") or []}
+    stores.tags.set(env, f"ecs:{arn}", {**_tags_for(stores, env, arn), **new_tags})
+    return _json({})
+
+
+def _untag_resource(
+    payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
+    keystore: KeyStore | None = None, gateway_port: int | None = None,
+) -> Response:
+    arn = payload.get("resourceArn", "")
+    if _tagged_service(stores, env, arn) is None:
+        return _not_found_service(arn)
+    removed = set(payload.get("tagKeys") or [])
+    kept = {k: v for k, v in _tags_for(stores, env, arn).items() if k not in removed}
+    stores.tags.set(env, f"ecs:{arn}", kept)
+    return _json({})
+
+
+def _list_tags_for_resource(
+    payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
+    keystore: KeyStore | None = None, gateway_port: int | None = None,
+) -> Response:
+    arn = payload.get("resourceArn", "")
+    if _tagged_service(stores, env, arn) is None:
+        return _not_found_service(arn)
+    return _json({"tags": _tag_list(_tags_for(stores, env, arn))})
+
+
 # --- dispatch ----------------------------------------------------------------
 
 
@@ -846,6 +927,9 @@ _HANDLERS: dict[str, _Handler] = {
     "DeleteService": _delete_service,
     "ListTasks": _list_tasks,
     "DescribeTasks": _describe_tasks,
+    "TagResource": _tag_resource,
+    "UntagResource": _untag_resource,
+    "ListTagsForResource": _list_tags_for_resource,
 }
 
 
