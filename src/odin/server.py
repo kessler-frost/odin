@@ -20,7 +20,7 @@ from pydantic import BaseModel
 
 from odin.agent import import_tf as import_tf_mod
 from odin.agent import translate as translate_mod
-from odin.agent.hcl import generate_tf
+from odin.agent.hcl import TfProject, generate_tf, resource_set
 from odin.api.canvas import CanvasGraph, create_canvas_router
 from odin.api.ws import ConnectionManager
 from odin.aws.backings import BackingAws
@@ -166,6 +166,102 @@ def create_tf_router(store: SpecStore, runner: TfRunner, keystore: KeyStore, gat
     return router
 
 
+def create_apply_full_router(
+    store: SpecStore, reconciler_for, runner: TfRunner, keystore: KeyStore, gateway_port,
+) -> APIRouter:
+    """S5 -- the UI's single Apply button: /apply's exact canvas->Stack->tick
+    semantics, then translate (S3b) and, when the canvas has TF-supported
+    resources, `tofu apply` through the gateway (S2). Every non-busy outcome
+    is a 200 with an honest per-half status -- the reconciler half can
+    genuinely succeed while tofu fails ("applied_tf_failed"); 409 only when a
+    tofu run is already in flight for the env."""
+    router = APIRouter()
+
+    @router.post("/apply-full")
+    async def apply_full(graph: CanvasGraph, env: str = ENV) -> JSONResponse:
+        # Busy guard BEFORE any mutation (mirrors SimulateBusy's own message):
+        # no reconcile, no store write while a tofu run holds the env's lock.
+        if runner.status(env)["running"]:
+            return JSONResponse(
+                status_code=409,
+                content={"error": f"a tofu run is already in progress for env {env!r}"},
+            )
+        canvas = graph.model_dump()
+        stack = canvas_to_stack(canvas, env=env)
+
+        translated = await translate_mod.translate(stack)
+        body = {
+            "status": "applied", "rev": None, "env": env,
+            "skipped": skipped_node_types(canvas),
+            "refined": translated.refined, "unsupported": translated.unsupported,
+            "tf": None,
+        }
+
+        # Three phases, in this exact order (load-bearing -- root-caused
+        # against real backings, S5 night-freeze e2e failure): (1) ENSURE the
+        # backing containers this Stack needs are up and the gateway has a
+        # route to them, WITHOUT creating any resource yet (`ensure_backing`
+        # only boots the container -- see Reconciler.ensure_backings) --
+        # a never-before-applied env has no registered backing_port, so
+        # skipping this makes the gateway 503 every forward and tofu's own
+        # retry/backoff turn that into a long opaque hang rather than a fast
+        # failure. (2) tofu AUTHORS the actual resources through the
+        # now-routable gateway. (3) ONLY THEN does `store.apply(stack)` make
+        # this Stack the env's desired state -- which is also the ONLY
+        # signal the reconciler's OWN background loop (already running,
+        # ticking every `poll_interval` seconds independent of this request
+        # -- see Reconciler._run/start, started by reconciler_for()) uses to
+        # decide there's work to do. Committing the store any earlier (the
+        # original bug: right after canvas_to_stack, before ensure_backings/
+        # tofu even started) let that background tick observe the new desired
+        # s3/sqs/sns/dynamodb resources and provision them ITSELF, via
+        # BackingAws.provision() -- concurrently with, and typically faster
+        # than, tofu's own multi-phase init+plan+apply. Tofu's AWS-provider
+        # creates are NOT idempotent the way SQS/SNS's happen to be, so tofu
+        # then lost the race for real: "BucketAlreadyExists" /
+        # "ResourceInUseException" on S3/DynamoDB, and an SQS queue stuck
+        # forever waiting for attributes (tags) the reconciler's bare-create
+        # never set. translate()/ensure_backings/tofu all operate on the
+        # in-memory `stack`, never the store, so deferring the commit changes
+        # nothing about what they see -- it only delays when the desired
+        # state becomes visible to the env's independent background loop.
+        # The final `reconciler.tick()` below (same request) then converges
+        # rds (untouched by tofu either way) and observes what tofu already
+        # created into World -- BackingAws.provision() tolerating an
+        # already-exists conflict is what makes that safe.
+        reconciler = await reconciler_for(env)
+        # hold(): the background loop must not tick during ensure/tofu/commit.
+        # A tick still sees the OLD stack (empty on a fresh env) and its gc
+        # stops the very backing containers ensure_backings is booting — the
+        # S5 e2e "rustfs never became ready with empty logs" failure. The
+        # store commit stays INSIDE the hold so no tick can ever run between
+        # tofu's creates and the new desired state becoming visible.
+        async with reconciler.hold():
+            if resource_set(translated.files):
+                await reconciler.ensure_backings(stack)
+                project = TfProject(files=translated.files, unsupported=translated.unsupported)
+                access_key, secret_key = keystore.issue(env, OPERATOR_NODE_ID)
+                try:
+                    result = await runner.apply(env, project, gateway_port(), access_key, secret_key)
+                except TofuNotInstalled:
+                    # Not a request-level error: the reconciler half still applies below.
+                    body["tf"] = {"status": "unavailable", "exit_code": None, **_TOFU_NOT_INSTALLED}
+                    body["status"] = "applied_tf_failed"
+                except SimulateBusy as exc:  # a second call won the race after our guard passed
+                    return JSONResponse(status_code=409, content={"error": str(exc)})
+                else:
+                    body["tf"] = {"status": "ok" if result.ok else "failed", "exit_code": result.exit_code}
+                    if not result.ok:
+                        body["tf"]["tail"] = list(result.tail)
+                        body["status"] = "applied_tf_failed"
+
+            body["rev"] = store.apply(stack)  # the desired state goes live before any tick can run
+        await reconciler.tick()  # kick an immediate pass; the loop continues it
+        return JSONResponse(status_code=200, content=body)
+
+    return router
+
+
 def create_app(
     runtime=None,
     store: SpecStore | None = None,
@@ -250,6 +346,7 @@ def create_app(
     app.include_router(create_canvas_router(CANVAS_PATH))
     app.include_router(create_apply_router(_store, reconciler_for, gateway_keystore))
     app.include_router(create_tf_router(_store, tf_runner, gateway_keystore, lambda: gateway_port_actual))
+    app.include_router(create_apply_full_router(_store, reconciler_for, tf_runner, gateway_keystore, lambda: gateway_port_actual))
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):

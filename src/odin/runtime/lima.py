@@ -23,15 +23,15 @@ from odin.runtime.colima import HostFacts, _ContainerRuntime
 class LimaRuntime(_ContainerRuntime):
     VM = "allfather-host"
 
-    def _lima(self, *args: str, check: bool = True) -> str:
-        proc = self._run(["limactl", *args])
+    def _lima(self, *args: str, check: bool = True, input: str | None = None) -> str:
+        proc = self._run(["limactl", *args], input=input)
         if check and proc.returncode != 0:
             raise RuntimeError(f"limactl {' '.join(args)} failed: {proc.stderr.strip()}")
         return proc.stdout.strip()
 
-    def _cli(self, *args: str, check: bool = True) -> str:
+    def _cli(self, *args: str, check: bool = True, input: str | None = None) -> str:
         # the base seam: nerdctl inside the VM
-        return self._lima("shell", self.VM, "sudo", "nerdctl", *args, check=check)
+        return self._lima("shell", self.VM, "sudo", "nerdctl", *args, check=check, input=input)
 
     def ensure_host(self) -> HostFacts:
         if self.VM not in self._lima("list", "-q", check=False).split():

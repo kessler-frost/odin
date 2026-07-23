@@ -87,8 +87,8 @@ class _Proc:
     stderr: str = ""
 
 
-def _default_runner(args: list[str]) -> _Proc:
-    proc = subprocess.run(args, capture_output=True, text=True)
+def _default_runner(args: list[str], input: str | None = None) -> _Proc:
+    proc = subprocess.run(args, capture_output=True, text=True, input=input)
     return _Proc(proc.returncode, proc.stdout, proc.stderr)
 
 
@@ -100,11 +100,26 @@ class _ContainerRuntime:
     def __init__(self, runner=None) -> None:
         self._run = runner or _default_runner
 
-    def _cli(self, *args: str, check: bool = True) -> str:
+    def _cli(self, *args: str, check: bool = True, input: str | None = None) -> str:
         raise NotImplementedError
 
     def _run_flags(self) -> list[str]:
         return []
+
+    def image_exists(self, tag: str) -> bool:
+        # Plain `image inspect` prints a truthy "[]" to stdout when the image
+        # is MISSING (docker rc=1), which silently skipped the one-time build.
+        # The Id template prints nothing on a missing image; "[]" is still
+        # guarded because nerdctl's behavior differs across versions.
+        out = self._cli("image", "inspect", "-f", "{{.Id}}", tag, check=False)
+        return out not in ("", "[]")
+
+    def build(self, tag: str, dockerfile: str) -> None:
+        """Build `tag` from an inline Dockerfile (no build context — piped on
+        stdin, `-`). Used to bake a one-time `npm install` into a local image
+        (dynalite: see BackingAws) so container boot never re-fetches from a
+        registry that might be slow or flaky that day."""
+        self._cli("build", "-t", tag, "-", input=dockerfile)
 
     def run_container(self, spec: ContainerSpec) -> RunHandle:
         args = [
@@ -171,8 +186,8 @@ class _ContainerRuntime:
 class ColimaRuntime(_ContainerRuntime):
     """Drives `docker` (Colima) directly on the host."""
 
-    def _cli(self, *args: str, check: bool = True) -> str:
-        proc = self._run(["docker", *args])
+    def _cli(self, *args: str, check: bool = True, input: str | None = None) -> str:
+        proc = self._run(["docker", *args], input=input)
         if check and proc.returncode != 0:
             raise RuntimeError(f"docker {' '.join(args)} failed: {proc.stderr.strip()}")
         return proc.stdout.strip()

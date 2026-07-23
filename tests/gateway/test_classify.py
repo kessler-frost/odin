@@ -165,12 +165,30 @@ def test_s3_get_bucket_tagging_resolves_to_its_real_action(sink, s3):
     assert classify("s3", req.method, path, query, req.headers, req.body) == ("s3:GetBucketTagging", "uploads")
 
 
-def test_s3_put_bucket_config_subresource_still_denies_cleanly(sink, s3):
-    # v1 has no write path for any bucket-config subresource -- only the GET
-    # side is mapped; a PUT still denies (unmappable, not merely unpermitted).
+def test_s3_put_bucket_tagging_resolves_to_its_real_action(sink, s3):
+    # The S3b translation agent may legally add tags to any resource, and the
+    # provider then calls PutBucketTagging during apply — first seen live in
+    # the S5 e2e ("AccessDenied: unmappable-action" killing the whole apply).
+    # Bucket-config WRITES map symmetrically with the read probes.
     req = sink.call(lambda: s3.put_bucket_tagging(Bucket="uploads", Tagging={"TagSet": [{"Key": "k", "Value": "v"}]}))
     path, query = split_url(req.url)
-    assert classify("s3", req.method, path, query, req.headers, req.body) is None
+    assert classify("s3", req.method, path, query, req.headers, req.body) == ("s3:PutBucketTagging", "uploads")
+
+
+def test_s3_delete_bucket_tagging_requires_the_put_action(sink, s3):
+    # Mirrors real AWS IAM: DeleteBucketTagging is authorized by
+    # s3:PutBucketTagging — our engine keeps that convention.
+    req = sink.call(lambda: s3.delete_bucket_tagging(Bucket="uploads"))
+    path, query = split_url(req.url)
+    assert classify("s3", req.method, path, query, req.headers, req.body) == ("s3:PutBucketTagging", "uploads")
+
+
+def test_s3_put_on_read_only_config_subresource_still_denies(sink, s3):
+    # policyStatus has no write API — a PUT against it stays unmappable.
+    req = sink.call(lambda: s3.put_bucket_versioning(
+        Bucket="uploads", VersioningConfiguration={"Status": "Enabled"}))
+    path, query = split_url(req.url)
+    assert classify("s3", req.method, path, query, req.headers, req.body) == ("s3:PutBucketVersioning", "uploads")
 
 
 def test_s3_object_level_subresource_still_denies_cleanly(sink, s3):

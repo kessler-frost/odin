@@ -70,7 +70,10 @@ class FakeRds:
 
 class FakeAws:
     def __init__(self):
-        self.provisioned, self.gc_calls = [], []
+        self.provisioned, self.gc_calls, self.ensured = [], [], []
+
+    def ensure_backing(self, service):
+        self.ensured.append(service)
 
     def provision(self, service, name, subscriptions=()):
         self.provisioned.append((service, name, subscriptions))
@@ -204,6 +207,23 @@ async def test_gc_called_every_tick_with_active_kinds(tmp_path):
     assert aws.gc_calls == [set()]  # empty stack -> every backing is stoppable
 
 
+async def test_hold_blocks_ticks_until_released(tmp_path):
+    # The /apply-full race (S5 e2e v8): the route's ensure phase boots
+    # backings BEFORE the new stack is committed, while the background loop
+    # keeps ticking against the OLD (empty) stack — whose gc(set()) stops
+    # the very containers being ensured. hold() must make ticks wait.
+    rt, rds, aws = FakeRuntime(), FakeRds(), FakeAws()
+    store = SpecStore(tmp_path)
+    store.apply(Stack())
+    recon = Reconciler(store, rt, rds, aws=aws, pg_ready=_yes, poll_interval=0)
+    async with recon.hold():
+        tick_task = asyncio.create_task(recon.tick())
+        await asyncio.sleep(0.05)  # give the tick every chance to run
+        assert aws.gc_calls == []  # blocked: no gc while held
+    await tick_task
+    assert aws.gc_calls == [set()]  # released: the tick proceeded
+
+
 async def test_gateway_updated_every_tick_with_compiled_policies_and_backing_ports(tmp_path):
     rt, rds, aws, gw = FakeRuntime(), FakeRds(), FakeAws(), FakeGateway()
     store = SpecStore(tmp_path)
@@ -223,6 +243,40 @@ async def test_gateway_updated_every_tick_with_compiled_policies_and_backing_por
 
     await recon.tick()                        # cheap + idempotent: pushed every pass
     assert len(gw.calls) == 2
+
+
+async def test_ensure_backings_boots_containers_and_routes_the_gateway_without_provisioning(tmp_path):
+    # S5's /apply-full pre-flight: get the gateway routable for tofu WITHOUT
+    # racing tofu's own resource creation (ensure_backing only starts the
+    # container -- provision(), which actually creates the resource, is
+    # never called here).
+    rt, rds, aws, gw = FakeRuntime(), FakeRds(), FakeAws(), FakeGateway()
+    store = SpecStore(tmp_path)
+    stack = Stack(resources=(
+        ResourceDesired(id="uploads", kind="s3"),
+        ResourceDesired(id="jobs", kind="sqs"),
+        DB,  # rds is not PROVISIONED -- must be excluded from ensure_backing calls
+    ))
+    store.apply(stack)
+    recon = Reconciler(store, rt, rds, aws=aws, gateway=gw, pg_ready=_yes, poll_interval=0)
+
+    await recon.ensure_backings(stack)
+
+    assert set(aws.ensured) == {"s3", "sqs"}
+    assert aws.provisioned == []  # no resource created -- that's tofu's job
+    assert gw.calls == [("default", compile_policies(stack), {"s3": 9000})]
+
+
+async def test_ensure_backings_is_a_noop_without_an_aws_seam(tmp_path):
+    rt, rds, gw = FakeRuntime(), FakeRds(), FakeGateway()
+    store = SpecStore(tmp_path)
+    stack = Stack(resources=(ResourceDesired(id="uploads", kind="s3"),))
+    store.apply(stack)
+    recon = Reconciler(store, rt, rds, gateway=gw, pg_ready=_yes, poll_interval=0)
+
+    await recon.ensure_backings(stack)  # must not raise
+
+    assert gw.calls == []  # nothing to route without an aws seam
 
 
 async def test_gateway_update_uses_empty_ports_without_an_aws_seam(tmp_path):

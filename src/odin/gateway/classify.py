@@ -82,6 +82,36 @@ _S3_BUCKET_CONFIG_READ_ACTIONS = {
     "versions": "s3:ListBucketVersions",
 }
 
+# Bucket-config WRITES: the S3b translation agent may add tags (and other
+# arguments) to any resource, so the provider's PutBucketTagging & co. arrive
+# through the gateway during apply (first seen live in the S5 e2e — an
+# unmapped PUT ?tagging turned into AccessDenied and killed the whole apply).
+# DELETE maps to the same write action as PUT, mirroring real AWS IAM (e.g.
+# DeleteBucketTagging is authorized by s3:PutBucketTagging). Read-only
+# subresources (versions, policyStatus) are deliberately absent.
+_S3_BUCKET_CONFIG_WRITE_ACTIONS = {
+    "acl": "s3:PutBucketAcl",
+    "tagging": "s3:PutBucketTagging",
+    "versioning": "s3:PutBucketVersioning",
+    "policy": "s3:PutBucketPolicy",
+    "cors": "s3:PutBucketCORS",
+    "lifecycle": "s3:PutLifecycleConfiguration",
+    "notification": "s3:PutBucketNotification",
+    "replication": "s3:PutReplicationConfiguration",
+    "encryption": "s3:PutEncryptionConfiguration",
+    "website": "s3:PutBucketWebsite",
+    "logging": "s3:PutBucketLogging",
+    "accelerate": "s3:PutAccelerateConfiguration",
+    "requestPayment": "s3:PutBucketRequestPayment",
+    "publicAccessBlock": "s3:PutBucketPublicAccessBlock",
+    "object-lock": "s3:PutBucketObjectLockConfiguration",
+    "ownershipControls": "s3:PutBucketOwnershipControls",
+    "intelligent-tiering": "s3:PutIntelligentTieringConfiguration",
+    "metrics": "s3:PutMetricsConfiguration",
+    "inventory": "s3:PutInventoryConfiguration",
+    "analytics": "s3:PutAnalyticsConfiguration",
+}
+
 # Object-level subresources v1 has no create path for at all (nothing ever
 # PUTs a legal hold, restores an object, requests a torrent) -- genuinely
 # unmapped regardless of method, never silent pass-through (research §Q2:
@@ -198,11 +228,14 @@ def _classify_s3(
     bucket = unquote(segments[0]) if segments else None
     config_hit = _S3_BUCKET_CONFIG_READ_ACTIONS.keys() & query.keys()
     if config_hit:
-        # v1 has no write path for any of these -- only the GET (read) side
-        # is mapped; PUT/DELETE on a bucket-config subresource still denies.
-        if method != "GET" or bucket is None:
+        if bucket is None:
             return None
-        return _S3_BUCKET_CONFIG_READ_ACTIONS[next(iter(config_hit))], bucket
+        sub = next(iter(config_hit))
+        if method == "GET":
+            return _S3_BUCKET_CONFIG_READ_ACTIONS[sub], bucket
+        if method in ("PUT", "DELETE") and sub in _S3_BUCKET_CONFIG_WRITE_ACTIONS:
+            return _S3_BUCKET_CONFIG_WRITE_ACTIONS[sub], bucket
+        return None  # a write to a read-only subresource stays unmappable
     has_key = len(segments) > 1 and segments[1] != ""
     action = _s3_action(method, bucket, has_key, query)
     if action is None:

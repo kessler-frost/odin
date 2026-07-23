@@ -5,6 +5,8 @@ boto3. Real containers are exercised in the integration pass (Task 4).
 """
 from __future__ import annotations
 
+import threading
+import time
 from dataclasses import dataclass, field
 
 import pytest
@@ -22,6 +24,8 @@ class FakeRuntime:
     stopped: list[str] = field(default_factory=list)
     statuses: dict[str, str] = field(default_factory=dict)
     ports: dict[str, int] = field(default_factory=dict)
+    images: set[str] = field(default_factory=set)
+    builds: list[str] = field(default_factory=list)
 
     def run_container(self, spec: ContainerSpec):
         self.runs.append(spec)
@@ -41,6 +45,13 @@ class FakeRuntime:
 
     def logs(self, name: str, tail: int = 20) -> str:
         return f"fake logs of {name}"
+
+    def image_exists(self, tag: str) -> bool:
+        return tag in self.images
+
+    def build(self, tag: str, dockerfile: str) -> None:
+        self.builds.append(tag)
+        self.images.add(tag)
 
 
 class FakeClient:
@@ -106,6 +117,78 @@ def test_ensure_backing_is_idempotent_while_running(rt, factory, tmp_path):
     assert len(rt.runs) == 1
 
 
+def test_ensure_backing_is_thread_safe_against_concurrent_callers(rt, factory, tmp_path):
+    """S5 regression: /apply-full calls ensure_backing directly while the
+    SAME BackingAws instance's Reconciler background loop can independently
+    call it too (provision() -> ensure_backing()) on another OS thread
+    (both run under asyncio.to_thread). Without a lock around the
+    check-then-create, two threads can both observe "not running" and both
+    call docker run for the identical container name -- exactly the
+    Conflict error a real docker daemon raises. The fake mimics that: a
+    slight sleep before registering the container widens the race window
+    (like a real `docker run` taking real wall time), and a second create
+    for a name already running raises the same error shape Colima did."""
+
+    class RacyRuntime(FakeRuntime):
+        def run_container(self, spec):
+            if spec.name in self.statuses:
+                raise RuntimeError(
+                    f'docker run ... failed: Conflict. The container name '
+                    f'"/{spec.name}" is already in use by container "deadbeef"'
+                )
+            time.sleep(0.05)  # widen the window a real `docker run` leaves open
+            super().run_container(spec)
+
+    racy_rt = RacyRuntime()
+    aws = _aws(racy_rt, factory, tmp_path)
+    errors: list[Exception] = []
+
+    def _call() -> None:
+        try:
+            aws.ensure_backing("s3")
+        except Exception as exc:  # noqa: BLE001 — capturing across threads for the assertion
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_call) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert errors == []  # the lock serializes the race away — no Conflict ever surfaces
+    assert len(racy_rt.runs) == 1  # exactly one effective run
+
+
+def test_ensure_backing_heals_a_stale_already_in_use_conflict(rt, factory, tmp_path, monkeypatch):
+    """Belt-and-braces: even with the per-instance lock, a stale remnant
+    from a different process/instance can still lose the name race (the
+    lock only serializes callers on THIS instance). ensure_backing must
+    heal -- wait for Docker to report the container running, then proceed
+    to the readiness probe -- rather than raising."""
+    monkeypatch.setattr(backings, "READY_TIMEOUT", 2.0)
+    cname = "allfather-aws-rustfs-default"
+
+    class ConflictingRuntime(FakeRuntime):
+        def run_container(self, spec):
+            raise RuntimeError(
+                f'docker run ... failed: Conflict. The container name '
+                f'"/{spec.name}" is already in use by container "deadbeef"'
+            )
+
+    conflict_rt = ConflictingRuntime()
+    aws = _aws(conflict_rt, factory, tmp_path)
+
+    def _external_creator_wins() -> None:
+        time.sleep(0.1)  # simulate the other creator's docker run finishing shortly after
+        conflict_rt.statuses[cname] = "running"
+        conflict_rt.ports[cname] = 51000
+
+    threading.Thread(target=_external_creator_wins).start()
+
+    aws.ensure_backing("s3")  # must not raise -- heals via the except branch
+    assert conflict_rt.runs == []  # this instance never successfully created anything itself
+
+
 def test_sqs_and_sns_share_one_goaws_container_with_mounted_config(rt, factory, tmp_path):
     aws = _aws(rt, factory, tmp_path, env="staging")
     aws.ensure_backing("sqs")
@@ -143,6 +226,25 @@ def test_ensure_backing_timeout_raises_with_logs(rt, factory, tmp_path, monkeypa
     monkeypatch.setattr(backings, "READY_TIMEOUT", 0.0)
     with pytest.raises(RuntimeError, match="fake logs of allfather-aws-dynalite-default"):
         _aws(rt, factory, tmp_path).ensure_backing("dynamodb")
+
+
+def test_ensure_backing_dynamodb_builds_the_baked_image_when_absent(rt, factory, tmp_path):
+    """S5 e2e root cause #2: bare `node:alpine` + `npx -y dynalite` re-fetched
+    from the npm registry on every boot, and a slow/flaky registry blew the
+    readiness probe's budget ("never became ready", empty container logs).
+    The baked image is built ONCE (network access accepted there) so every
+    subsequent boot is instant and offline."""
+    _aws(rt, factory, tmp_path).ensure_backing("dynamodb")
+    assert rt.builds == [backings._DYNALITE_IMAGE]
+    spec = rt.runs[0]
+    assert spec.image == backings._DYNALITE_IMAGE
+    assert spec.command == ("--port", "4567")  # no more npx -y dynalite
+
+
+def test_ensure_backing_dynamodb_skips_the_build_when_the_image_already_exists(rt, factory, tmp_path):
+    rt.images.add(backings._DYNALITE_IMAGE)
+    _aws(rt, factory, tmp_path).ensure_backing("dynamodb")
+    assert rt.builds == []
 
 
 def test_provision_dynamodb_creates_table_with_id_hash_key(rt, factory, tmp_path):

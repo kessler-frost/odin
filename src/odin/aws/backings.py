@@ -9,6 +9,7 @@ and a host-side boto3 `client` for tests.
 """
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,7 +27,24 @@ SECRET_KEY = "allfather-secret-key"
 REGION = "us-east-1"
 ACCOUNT = "000000000000"
 
-READY_TIMEOUT = 120.0  # dynalite's npx fetch + first-run image pulls
+READY_TIMEOUT = 120.0  # first-run image pulls (dynalite no longer re-fetches on every boot)
+
+# dynalite has no maintained image, so it used to run as bare `node:alpine` +
+# `npx -y dynalite` on every container boot -- normally a ~3s npm-registry
+# fetch (task-4-report), but a slow/flaky registry turns that into a
+# multi-minute stall that blows the readiness probe's whole budget (S5 e2e:
+# `never became ready`, empty container logs -- the process was still
+# mid-download). Bake the npm install into a local image ONCE per machine
+# (`_ensure_dynalite_image`, network access accepted there -- the same
+# one-time cost as pulling any other backing's published image) so every
+# subsequent boot is instant and fully offline.
+_DYNALITE_IMAGE = "odin-dynalite:1"
+_DYNALITE_DOCKERFILE = """\
+FROM node:20-alpine
+RUN npm install -g dynalite
+ENTRYPOINT ["dynalite"]
+CMD ["--port", "4567"]
+"""
 
 
 @dataclass(frozen=True)
@@ -45,9 +63,10 @@ BACKINGS: tuple[BackingDef, ...] = (
     BackingDef(name="goaws", image="admiralpiett/goaws:v0.5.4", port=4100,
                env={}, command=("-config", "/conf/goaws.yaml", "Local"),
                kinds=("sqs", "sns")),   # ONE container serves both; SNS→SQS delivery is in-process
-    BackingDef(name="dynalite", image="node:alpine", port=4567, env={},
-               command=("npx", "-y", "dynalite", "--port", "4567"),
-               kinds=("dynamodb",)),    # ~20s cold start (npx fetch); no TTL/Streams — accepted
+    BackingDef(name="dynalite", image=_DYNALITE_IMAGE, port=4567, env={},
+               command=("--port", "4567"),
+               kinds=("dynamodb",)),    # baked image (see _ensure_dynalite_image) — instant,
+                                         # offline boot; no TTL/Streams — accepted
 )
 
 # Key casing verified live (AccountId shows up in returned ARNs); the `Local`
@@ -77,6 +96,15 @@ class BackingAws:
         self._root = root
         self._client_factory = client_factory
         self._gateway_port = gateway_port
+        # Guards ensure_backing's check-then-create against TOCTOU: S5's
+        # /apply-full calls it directly (to make the gateway routable before
+        # tofu runs) while the SAME instance's Reconciler background loop can
+        # independently call it too (provision() -> ensure_backing()) --
+        # without this, both threads can see "not running" and race
+        # `docker run` with the same container name (a hard Conflict error).
+        # A threading.Lock, not asyncio.Lock: this runs under
+        # asyncio.to_thread on separate OS threads, not on the event loop.
+        self._ensure_lock = threading.Lock()
 
     def _backing_for(self, service: str) -> BackingDef:
         return next(d for d in BACKINGS if service in d.kinds)
@@ -100,8 +128,17 @@ class BackingAws:
     def ensure_backing(self, service: str) -> None:
         d = self._backing_for(service)
         cname = self._cname(d)
-        if self._rt.status(cname) == "running":
-            return
+        # Only the check+create is serialized -- the readiness wait below
+        # runs OUTSIDE the lock so concurrent ensure_backing calls for
+        # DIFFERENT services (S5's ensure_backings runs one asyncio.to_thread
+        # per kind, in parallel) aren't forced sequential by a single
+        # per-instance lock.
+        with self._ensure_lock:
+            if self._rt.status(cname) != "running":
+                self._create_backing_container(d, cname)
+        self._await_ready(cname, service)
+
+    def _create_backing_container(self, d: BackingDef, cname: str) -> None:
         self._rt.stop(cname)  # clear any exited remnant (same contract as PostgresRds)
         volumes: dict[str, str] = {}
         if d.name == "goaws":
@@ -111,10 +148,35 @@ class BackingAws:
             conf_dir.mkdir(parents=True, exist_ok=True)
             (conf_dir / "goaws.yaml").write_text(_goaws_config(self._gateway_port))
             volumes = {str(conf_dir): "/conf"}
-        self._rt.run_container(ContainerSpec(
-            name=cname, image=d.image, env=d.env, ports={self._listen_port(d): 0},
-            labels={"allfather-env": self._env}, command=d.command, volumes=volumes,
-        ))
+        if d.name == "dynalite":
+            self._ensure_dynalite_image()
+        try:
+            self._rt.run_container(ContainerSpec(
+                name=cname, image=d.image, env=d.env, ports={self._listen_port(d): 0},
+                labels={"allfather-env": self._env}, command=d.command, volumes=volumes,
+            ))
+        except RuntimeError as exc:
+            if "already in use" not in str(exc):
+                raise
+            # Belt-and-braces: the per-instance lock above should already
+            # prevent a same-instance race, but a stale remnant from a
+            # different process/instance can still lose this exact race.
+            # The container exists either way -- heal by waiting for Docker
+            # to report it running, then fall through to the readiness
+            # probe like the happy path.
+            deadline = time.monotonic() + READY_TIMEOUT
+            while time.monotonic() < deadline and self._rt.status(cname) != "running":
+                time.sleep(0.2)
+
+    def _ensure_dynalite_image(self) -> None:
+        """One-time (per machine) build of the baked dynalite image -- see
+        the module-level comment by `_DYNALITE_IMAGE`. Runs inside
+        `ensure_backing`'s `_ensure_lock`, so two threads racing to boot
+        dynalite for the first time never both `docker build` the same tag."""
+        if not self._rt.image_exists(_DYNALITE_IMAGE):
+            self._rt.build(_DYNALITE_IMAGE, _DYNALITE_DOCKERFILE)
+
+    def _await_ready(self, cname: str, service: str) -> None:
         deadline = time.monotonic() + READY_TIMEOUT
         while time.monotonic() < deadline:
             try:

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 
 from odin.aws.backings import PROVISIONED
 from odin.fabric.localhost import LocalhostFabric
@@ -81,6 +82,16 @@ class Reconciler:
                 log.exception("reconciler tick failed")
             await asyncio.sleep(self._poll)
 
+    @asynccontextmanager
+    async def hold(self):
+        """Block the background loop's ticks while an external author
+        mutates the env (the /apply-full route: ensure backings + tofu +
+        store commit). Without this, a tick against the not-yet-committed
+        stack gc's the very backing containers the ensure phase is booting
+        (fresh env: old stack is empty, so gc(set()) stops everything)."""
+        async with self._tick_lock:
+            yield
+
     async def tick(self) -> None:
         async with self._tick_lock:
             stack = self._store.get_stack(self._env)
@@ -93,6 +104,26 @@ class Reconciler:
             if self._gateway is not None:  # policies/ports always track the applied Stack
                 ports = await asyncio.to_thread(self._aws.backing_ports) if self._aws is not None else {}
                 self._gateway.update(self._env, compile_policies(stack), ports)
+
+    async def ensure_backings(self, stack: Stack) -> None:
+        """Boot (but don't create any resource on) the backing containers
+        `stack`'s AWS-shaped kinds need, and register their ports + this
+        Stack's compiled policies with the gateway -- WITHOUT running
+        plan/execute. `ensure_backing` only starts a container; it never
+        touches the resources inside it, so this is safe to call ahead of an
+        external creator racing this same Stack (S5's /apply-full: tofu
+        authors the actual resources through the gateway after this call).
+        Without it, a never-before-applied env has no registered
+        `backing_port`, the gateway 503s every forward, and tofu's own
+        AWS-provider retry/backoff turns that into a long, opaque hang
+        instead of a request-scoped failure."""
+        if self._aws is None:
+            return
+        kinds = {r.kind for r in stack.resources if r.kind in PROVISIONED}
+        await asyncio.gather(*(asyncio.to_thread(self._aws.ensure_backing, k) for k in kinds))
+        if self._gateway is not None:
+            ports = await asyncio.to_thread(self._aws.backing_ports)
+            self._gateway.update(self._env, compile_policies(stack), ports)
 
     # ---- helpers ----
     def _res(self, stack: Stack, rid: str) -> ResourceDesired:
