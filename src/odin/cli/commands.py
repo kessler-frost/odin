@@ -6,4 +6,10 @@ exactly that side effect.
 """
 from __future__ import annotations
 
-from odin.cli import apply, canvas, observe, tf  # noqa: F401  (registration side effects)
+from odin.cli import (  # noqa: F401  (registration side effects)
+    apply,
+    canvas,
+    observe,
+    tf,
+    translate,
+)
