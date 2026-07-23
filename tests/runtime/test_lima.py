@@ -41,6 +41,7 @@ def test_run_container_goes_through_nerdctl_in_the_vm():
     assert run_call[:5] == ["limactl", "shell", "allfather-host", "sudo", "nerdctl"]
     assert "-e" in run_call and "K=v" in run_call
     assert "-v" in run_call and "/host/conf:/conf" in run_call
+    assert run_call.index("-v") < run_call.index("busybox")  # flags before the image, or nerdctl eats them
     assert "18080:8000" in run_call and run_call[-1] == "true"
 
 

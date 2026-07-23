@@ -205,7 +205,8 @@ async def test_gc_called_every_tick_with_active_kinds(tmp_path):
     store.apply(Stack())
     recon = Reconciler(store, rt, rds, aws=aws, pg_ready=_yes, poll_interval=0)
     await recon.tick()
-    assert aws.gc_calls == [set()]  # empty stack -> every backing is stoppable
+    await recon.tick()
+    assert aws.gc_calls == [set(), set()]  # empty stack -> every backing is stoppable, every tick
 
 
 async def test_hold_blocks_ticks_until_released(tmp_path):
