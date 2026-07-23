@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import asynccontextmanager
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 from typing import Literal
 
@@ -43,6 +44,20 @@ CANVAS_PATH = ODIN_DIR / "canvas.json"
 ENV = "default"
 
 log = logging.getLogger("odin")
+
+# Single source of truth for the running version: the installed package's own
+# metadata (kept in lockstep with pyproject.toml's `version` by the build).
+# The literal fallback only fires for an editable/unpackaged checkout where
+# `importlib.metadata` has nothing to look up -- it still needs to say
+# SOMETHING plausible rather than raise out of app startup.
+_FALLBACK_VERSION = "0.4.0"
+
+
+def _odin_version() -> str:
+    try:
+        return _pkg_version("odin")
+    except PackageNotFoundError:
+        return _FALLBACK_VERSION
 
 
 def create_apply_router(store: SpecStore, reconciler_for, keystore: KeyStore) -> APIRouter:
@@ -361,7 +376,7 @@ def create_app(
                 await reconciler.stop()
             stop_in_thread(gateway_server, gateway_thread)
 
-    app = FastAPI(title="allfather", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="allfather", version=_odin_version(), lifespan=lifespan)
     app.include_router(create_canvas_router(CANVAS_PATH))
     app.include_router(create_apply_router(_store, reconciler_for, gateway_keystore))
     app.include_router(create_tf_router(_store, tf_runner, gateway_keystore, lambda: gateway_port_actual))
