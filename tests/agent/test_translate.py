@@ -17,9 +17,11 @@ import pytest
 from mcp import types as mcp_types
 
 from odin.agent import hcl
+from odin.agent import translate as translate_mod
 from odin.agent.hcl import generate_tf
 from odin.agent.translate import translate, validate_refinement
 from odin.spec.models import ResourceDesired, Stack
+from odin.spec.store import rev_of
 
 _NO_TOFU = shutil.which("tofu") is None
 
@@ -137,8 +139,8 @@ async def test_no_files_is_rejected():
 async def test_comment_and_tag_only_refinement_passes_and_gets_formatted():
     skeleton = generate_tf(_S3_STACK).files
     main_tf = skeleton["main.tf"].replace(
-        'resource "aws_s3_bucket" "uploads" {\n  bucket = "uploads"\n}',
-        '# uploaded user content\nresource "aws_s3_bucket" "uploads" {\n bucket="uploads"\n}',
+        'resource "aws_s3_bucket" "uploads" {\n  bucket = "uploads"\n\n  tags = {\n    "odin:node" = "uploads"\n  }\n}',
+        '# uploaded user content\nresource "aws_s3_bucket" "uploads" {\n bucket="uploads"\n\n  tags = {\n    "odin:node" = "uploads"\n  }\n}',
     )
     reason, formatted = await validate_refinement({"main.tf": main_tf}, skeleton)
     assert reason is None
@@ -250,8 +252,8 @@ async def test_binary_files_survive_a_successful_refinement():
 async def test_happy_path_refinement_is_kept():
     skeleton = generate_tf(_S3_STACK).files["main.tf"]
     refined_tf = skeleton.replace(
-        'resource "aws_s3_bucket" "uploads" {\n  bucket = "uploads"\n}',
-        '# user uploads\nresource "aws_s3_bucket" "uploads" {\n  bucket = "uploads"\n}',
+        'resource "aws_s3_bucket" "uploads" {\n  bucket = "uploads"\n\n  tags = {\n    "odin:node" = "uploads"\n  }\n}',
+        '# user uploads\nresource "aws_s3_bucket" "uploads" {\n  bucket = "uploads"\n\n  tags = {\n    "odin:node" = "uploads"\n  }\n}',
     )
     fake = _client_with(canned_args={"files": [{"path": "main.tf", "content": refined_tf}], "notes": ["added a comment"]})
     result = await translate(_S3_STACK, client_cls=fake)
@@ -278,3 +280,100 @@ async def test_real_sdk_refines_a_three_node_canvas():
     # The guardrail's own invariant, re-asserted here against the real agent:
     # arguments/comments may change, the resource SET may not.
     assert hcl.resource_set(result.files) == hcl.resource_set(generate_tf(stack).files)
+
+
+# --- release finding #5: the SDK timeout default + the unchanged-canvas cache
+
+
+def test_default_timeout_reads_the_env_var(monkeypatch):
+    monkeypatch.setenv("ODIN_TRANSLATE_TIMEOUT", "12")
+    assert translate_mod._default_timeout() == 12.0
+
+
+def test_default_timeout_falls_back_to_45_seconds(monkeypatch):
+    monkeypatch.delenv("ODIN_TRANSLATE_TIMEOUT", raising=False)
+    assert translate_mod._default_timeout() == 45.0
+
+
+def test_shipped_default_timeout_constant_is_45_seconds():
+    # The 120s default meant a timed-out translate() (most applies, in
+    # practice, per the release sweep) wasted two full minutes before ever
+    # falling back to the skeleton. Guards against a future edit silently
+    # creeping the default back up.
+    assert translate_mod._TIMEOUT_S == 45.0
+
+
+@pytest.mark.skipif(_NO_TOFU, reason="tofu not on PATH")
+async def test_unchanged_stack_skips_the_sdk_pass_after_a_successful_refinement():
+    construct_count: list[int] = []
+
+    class _Counting(_FakeClient):
+        canned_args = {
+            "files": [{"path": "main.tf", "content": generate_tf(_S3_STACK).files["main.tf"]}],
+            "notes": ["ok"],
+        }
+
+        def __init__(self, options) -> None:
+            construct_count.append(1)
+            super().__init__(options)
+
+    cache: dict = {}
+    first = await translate(_S3_STACK, client_cls=_Counting, cache=cache)
+    assert first.refined is True
+    assert len(construct_count) == 1
+    assert rev_of(_S3_STACK) in cache
+
+    # SAME stack content, a fresh cache lookup -- the SDK must not be
+    # constructed a second time. _NeverConstructed asserts this for free.
+    second = await translate(_S3_STACK, client_cls=_NeverConstructed, cache=cache)
+    assert second == first
+
+
+async def test_a_fallback_result_is_never_cached_so_the_next_call_retries():
+    cache: dict = {}
+    failing = _client_with(raises=RuntimeError("boom"))
+    first = await translate(_S3_STACK, client_cls=failing, cache=cache)
+    assert first.refined is False
+    assert cache == {}  # only a SUCCESSFUL refinement is cached
+
+    construct_count: list[int] = []
+
+    class _Counting(_FakeClient):
+        def __init__(self, options) -> None:
+            construct_count.append(1)
+            super().__init__(options)
+
+    await translate(_S3_STACK, client_cls=_Counting, cache=cache)
+    assert len(construct_count) == 1  # the SDK really was retried, not skipped
+
+
+async def test_a_rejected_refinement_is_never_cached_so_the_next_call_retries():
+    cache: dict = {}
+    tampered = generate_tf(_S3_STACK).files["main.tf"] + '\nresource "aws_sqs_queue" "extra" {\n  name = "extra"\n}\n'
+    rejecting = _client_with(canned_args={"files": [{"path": "main.tf", "content": tampered}], "notes": []})
+    first = await translate(_S3_STACK, client_cls=rejecting, cache=cache)
+    assert first.refined is False
+    assert cache == {}
+
+    construct_count: list[int] = []
+
+    class _Counting(_FakeClient):
+        def __init__(self, options) -> None:
+            construct_count.append(1)
+            super().__init__(options)
+
+    await translate(_S3_STACK, client_cls=_Counting, cache=cache)
+    assert len(construct_count) == 1
+
+
+async def test_a_different_stack_is_a_cache_miss():
+    cache: dict = {rev_of(_S3_STACK): "unrelated cached entry"}
+    result = await translate(_RDS_ONLY_STACK, client_cls=_NeverConstructed, cache=cache)
+    assert result.refined is False  # untouched by the unrelated cache entry
+
+
+async def test_translate_works_with_no_cache_given():
+    # cache=None (the default) must behave exactly as before finding #5 --
+    # no caching, no crash on the missing dict.
+    result = await translate(_RDS_ONLY_STACK, client_cls=_NeverConstructed)
+    assert result.refined is False

@@ -152,7 +152,10 @@ class ImportTfRequest(BaseModel):
     resources: list[dict] = []  # [{"type": "s3", "id": "uploads"}, ...] -- see import_tf.LiveResource
 
 
-def create_tf_router(store: SpecStore, runner: TfRunner, keystore: KeyStore, gateway_port) -> APIRouter:
+def create_tf_router(
+    store: SpecStore, runner: TfRunner, keystore: KeyStore, gateway_port,
+    translate_cache: dict[str, translate_mod.TranslateResult],
+) -> APIRouter:
     """`/tf/*` -- Simulate's own apply/destroy/status, independent of the
     canvas `/apply`/`/destroy` above (S2 CONTRACT ADDENDUM: routes named
     `/tf/*`, not `/simulate/*` -- "the owner renamed the user surface to
@@ -213,7 +216,7 @@ def create_tf_router(store: SpecStore, runner: TfRunner, keystore: KeyStore, gat
         Omitting it keeps the original API-compat behavior (the stored
         Stack)."""
         stack = canvas_to_stack(graph.model_dump(), env=env) if graph is not None else store.get_stack(env)
-        result = await translate_mod.translate(stack)
+        result = await translate_mod.translate(stack, cache=translate_cache)
         return result.model_dump()
 
     @router.post("/import-tf")
@@ -238,6 +241,7 @@ _SUPERSEDED = {"error": "superseded by a newer teardown/apply"}
 
 def create_apply_full_router(
     store: SpecStore, reconciler_for, runner: TfRunner, keystore: KeyStore, gateway_port, env_epoch: dict[str, int],
+    translate_cache: dict[str, translate_mod.TranslateResult],
 ) -> APIRouter:
     """S5 -- the UI's single Apply button: /apply's exact canvas->Stack->tick
     semantics, then translate (S3b) and, when the canvas has TF-supported
@@ -267,7 +271,7 @@ def create_apply_full_router(
         # just captures the current epoch -- it doesn't own a bump itself.
         my_epoch = _bump_epoch(env_epoch, env) if not stack.resources else env_epoch.get(env, 0)
 
-        translated = await translate_mod.translate(stack)
+        translated = await translate_mod.translate(stack, cache=translate_cache)
         body = {
             "status": "applied", "rev": None, "env": env,
             "skipped": skipped_node_types(canvas),
@@ -448,6 +452,11 @@ def create_app(
     # Release finding #4: a per-env generation counter /destroy and an
     # empty-canvas /apply-full bump -- see _bump_epoch's own docstring.
     env_epoch: dict[str, int] = {}
+    # Release finding #5: shared across every /translate and /apply-full call
+    # for the app's lifetime -- see translate()'s own docstring for the
+    # cache-key/eviction (never-evicted, only a successful refinement lands
+    # here) contract.
+    translate_cache: dict[str, translate_mod.TranslateResult] = {}
 
     # One reconciler per environment, created lazily. Each gets its own
     # env-scoped rds runner + backing containers, so AWS state stays isolated.
@@ -458,7 +467,7 @@ def create_app(
         env_aws = aws or (BackingAws(_runtime, env, gateway_port=gateway_port_actual) if backings else None)
         return Reconciler(
             _store, _runtime, env_rds, aws=env_aws, gateway=gateway_state, fabric=LocalhostFabric(),
-            ws=ws_manager, env=env, poll_interval=1.0,
+            ws=ws_manager, env=env, poll_interval=1.0, stores=gateway_stores,
         )
 
     async def reconciler_for(env: str) -> Reconciler:
@@ -508,9 +517,13 @@ def create_app(
     app.include_router(
         create_apply_router(_store, reconciler_for, gateway_keystore, tf_runner, lambda: gateway_port_actual, env_epoch)
     )
-    app.include_router(create_tf_router(_store, tf_runner, gateway_keystore, lambda: gateway_port_actual))
     app.include_router(
-        create_apply_full_router(_store, reconciler_for, tf_runner, gateway_keystore, lambda: gateway_port_actual, env_epoch)
+        create_tf_router(_store, tf_runner, gateway_keystore, lambda: gateway_port_actual, translate_cache)
+    )
+    app.include_router(
+        create_apply_full_router(
+            _store, reconciler_for, tf_runner, gateway_keystore, lambda: gateway_port_actual, env_epoch, translate_cache,
+        )
     )
 
     @app.websocket("/ws")
@@ -538,6 +551,7 @@ def create_app(
     app.state.gateway_keys = gateway_keystore
     app.state.tf_runner = tf_runner
     app.state.env_epoch = env_epoch
+    app.state.translate_cache = translate_cache
 
     bundled_ui = Path(__file__).resolve().parent / "_ui"
     source_ui = Path(__file__).resolve().parent.parent.parent / "ui" / "dist"

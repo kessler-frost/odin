@@ -30,11 +30,22 @@ from odin.agent import hcl
 from odin.agent.hcl import TfProject, generate_tf
 from odin.simulate.runner import PLUGIN_CACHE_DIR
 from odin.spec.models import Stack
+from odin.spec.store import rev_of
 
 log = logging.getLogger("odin.translate")
 
 _MODEL = "claude-sonnet-5"
-_TIMEOUT_S = 120.0
+
+
+def _default_timeout() -> float:
+    """Release finding #5: the SDK pass's own default budget. 120s meant a
+    translate() call that hit the timeout (most applies, per the release
+    sweep) wasted two full minutes before ever falling back to the
+    skeleton. `ODIN_TRANSLATE_TIMEOUT` overrides it."""
+    return float(os.environ.get("ODIN_TRANSLATE_TIMEOUT", "45"))
+
+
+_TIMEOUT_S = _default_timeout()
 _TAIL_LINES = 15
 
 # The Global Constraint (plan doc): agent-emitted HCL stays portable -- no
@@ -199,14 +210,28 @@ async def validate_refinement(
     return None, formatted
 
 
-async def translate(stack: Stack, client_cls: type = ClaudeSDKClient, timeout: float = _TIMEOUT_S) -> TranslateResult:
+async def translate(
+    stack: Stack, client_cls: type = ClaudeSDKClient, timeout: float = _TIMEOUT_S,
+    cache: dict[str, TranslateResult] | None = None,
+) -> TranslateResult:
     """S3b entry point. `client_cls` is a `ClaudeSDKClient`-shaped seam
     (async-context-manager `__init__(options=...)`, `.query()`,
     `.receive_response()`) — tests inject a fake to drive the real MCP tool
-    dispatch without spawning the Claude Code CLI."""
+    dispatch without spawning the Claude Code CLI.
+
+    `cache` (release finding #5): an optional, caller-owned dict the SDK
+    pass can skip entirely when this exact canvas already has a SUCCESSFUL
+    refinement in it, keyed by the Stack's own content hash
+    (`spec.store.rev_of` -- any edit at all misses and re-refines). A
+    fallback result (SDK failure/timeout/guardrail rejection) is never
+    cached -- the cause may be transient, so the next call must retry."""
     skeleton = generate_tf(stack)
     if not hcl.resource_set(skeleton.files):
         return TranslateResult(files=skeleton.files, unsupported=skeleton.unsupported, binary_files=skeleton.binary_files)
+
+    rev = rev_of(stack)
+    if cache is not None and rev in cache:
+        return cache[rev]
 
     payload = await _refine(skeleton, stack, client_cls, timeout)
     if payload is None:
@@ -224,7 +249,10 @@ async def translate(stack: Stack, client_cls: type = ClaudeSDKClient, timeout: f
             files=skeleton.files, unsupported=skeleton.unsupported, binary_files=skeleton.binary_files,
             notes=[*notes, f"refinement rejected ({violation}) -- using the deterministic skeleton"],
         )
-    return TranslateResult(
+    result = TranslateResult(
         files=formatted, unsupported=skeleton.unsupported, binary_files=skeleton.binary_files,
         notes=notes, refined=True,
     )
+    if cache is not None:
+        cache[rev] = result
+    return result

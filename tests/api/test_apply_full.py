@@ -305,6 +305,28 @@ def test_refined_false_fallback_still_applies_the_skeleton(tmp_path, monkeypatch
     assert (tf_dir(tmp_path, "default") / "main.tf").read_text() == skeleton["main.tf"]
 
 
+def test_apply_full_passes_a_shared_translate_cache_across_requests(tmp_path, monkeypatch):
+    # Release finding #5: apply-full must thread the SAME cache dict into
+    # every call of translate() -- not a fresh one per request -- or an
+    # unchanged canvas would never skip the SDK pass on a re-apply.
+    _write_fake_tofu(tmp_path, _APPLY_OK)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    seen_caches = []
+
+    async def fake_translate(stack, cache=None, **kwargs):
+        seen_caches.append(cache)
+        return TranslateResult(files=_skeleton_files(), refined=True)
+
+    monkeypatch.setattr("odin.server.translate_mod.translate", fake_translate)
+    app = _app(tmp_path)
+    with TestClient(app) as client:
+        client.post("/apply-full", json=S3_SQS)
+        client.post("/apply-full", json=S3_SQS)
+    assert len(seen_caches) == 2
+    assert seen_caches[0] is not None
+    assert seen_caches[0] is seen_caches[1] is app.state.translate_cache
+
+
 LAMBDA_CANVAS = {"nodes": [{"type": "lambda", "data": {"label": "fn"}}], "edges": []}
 
 

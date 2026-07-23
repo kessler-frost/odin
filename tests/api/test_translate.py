@@ -112,3 +112,26 @@ def test_translate_with_a_graph_body_previews_the_unsaved_canvas_not_the_stored_
     assert resp.status_code == 200
     assert len(seen_stacks) == 1
     assert [r.id for r in seen_stacks[0].resources] == ["unsaved-bucket"]
+
+
+def test_translate_route_shares_the_apps_translate_cache(tmp_path, monkeypatch):
+    # Release finding #5: /translate must pass the SAME cache dict every
+    # request, so an unchanged canvas skips the SDK pass even across
+    # separate /translate calls, not just within apply-full.
+    app = _app(tmp_path)
+    store: SpecStore = app.state.store
+    store.apply(Stack(env="default", resources=(ResourceDesired(id="uploads", kind="s3"),)))
+
+    seen_caches = []
+
+    async def fake_translate(passed_stack, cache=None, **kwargs):
+        seen_caches.append(cache)
+        return TranslateResult(files={"main.tf": "fake"}, notes=[], unsupported=[], refined=False)
+
+    monkeypatch.setattr("odin.server.translate_mod.translate", fake_translate)
+    with TestClient(app) as client:
+        client.post("/translate", params={"env": "default"})
+        client.post("/translate", params={"env": "default"})
+    assert len(seen_caches) == 2
+    assert seen_caches[0] is not None
+    assert seen_caches[0] is seen_caches[1] is app.state.translate_cache
