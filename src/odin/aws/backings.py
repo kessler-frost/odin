@@ -189,7 +189,18 @@ class BackingAws:
     def client(self, service: str):
         """Host-side client against the backing's published port (tests/e2e)."""
         d = self._backing_for(service)
-        endpoint = f"http://127.0.0.1:{self._rt.host_port(self._cname(d), self._listen_port(d))}"
+        port = self._rt.host_port(self._cname(d), self._listen_port(d))
+        if not port:
+            # Fail loud: a 0 here means the container publishes a DIFFERENT
+            # inside-port than this instance expects — for goaws that's a
+            # gateway_port mismatch (the container was created by a BackingAws
+            # with another resolved gateway port; construct this one with the
+            # same value, e.g. the app's /health gateway.port).
+            raise RuntimeError(
+                f"{self._cname(d)} publishes no port {self._listen_port(d)} — "
+                f"gateway_port mismatch between this BackingAws and the container's creator?"
+            )
+        endpoint = f"http://127.0.0.1:{port}"
         if self._client_factory:
             return self._client_factory(service, endpoint)
         config = Config(signature_version="s3v4", s3={"addressing_style": "path"}) \

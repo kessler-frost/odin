@@ -86,6 +86,18 @@ def runtime():
         rt.stop(cid)
 
 
+
+def _aws_for(client, runtime, env="default"):
+    """A BackingAws matched to the app's ACTUAL resolved gateway port.
+
+    The suite runs with ODIN_GATEWAY_PORT=0, so the app's gateway binds an
+    ephemeral port and goaws publishes THAT inside-port — a standalone
+    BackingAws built with the 4266 default would query a mapping that does
+    not exist (the /health gateway.port is the one source of truth).
+    """
+    port = client.get("/health").json()["gateway"]["port"]
+    return BackingAws(runtime, env, gateway_port=port)
+
 def test_sqs_roundtrip(tmp_path, runtime):
     app = create_app(runtime=runtime, store=SpecStore(tmp_path))
     with TestClient(app) as client:
@@ -93,7 +105,7 @@ def test_sqs_roundtrip(tmp_path, runtime):
         _wait(client, lambda p: p.get("jobs") == "healthy")
         assert f"/{ACCOUNT}/jobs" in _world(client)["jobs"]["facts"]["QUEUE_URL"]
 
-        sqs = BackingAws(runtime, "default").client("sqs")
+        sqs = _aws_for(client, runtime).client("sqs")
         url = sqs.get_queue_url(QueueName="jobs")["QueueUrl"]
         sqs.send_message(QueueUrl=url, MessageBody="hello-roundtrip")
         assert _receive(sqs, url) == "hello-roundtrip"
@@ -113,7 +125,7 @@ def test_sns_to_sqs_delivery(tmp_path, runtime):
         topic_arn = _world(client)["alerts"]["facts"]["TOPIC_ARN"]
         assert f":{ACCOUNT}:" in topic_arn
 
-        aws = BackingAws(runtime, "default")
+        aws = _aws_for(client, runtime)
         sns, sqs = aws.client("sns"), aws.client("sqs")
         sns.publish(TopicArn=topic_arn, Message="ping")
         jobs_url = sqs.get_queue_url(QueueName="jobs")["QueueUrl"]
@@ -139,7 +151,7 @@ def test_dynamodb_put_get(tmp_path, runtime):
         _wait(client, lambda p: p.get("sessions") == "healthy")  # npx cold start is slow
         assert _world(client)["sessions"]["facts"]["TABLE"] == "sessions"
 
-        ddb = BackingAws(runtime, "default").client("dynamodb")
+        ddb = _aws_for(client, runtime).client("dynamodb")
         ddb.put_item(TableName="sessions", Item={"id": {"S": "u1"}, "val": {"S": "hello"}})
         item = ddb.get_item(TableName="sessions", Key={"id": {"S": "u1"}})["Item"]
         assert item["val"]["S"] == "hello"
@@ -160,7 +172,7 @@ def test_env_isolation(tmp_path, runtime):
         assert runtime.status("allfather-aws-rustfs-a") == "running"
         assert runtime.status("allfather-aws-rustfs-b") == "running"
         for env in ("a", "b"):
-            buckets = BackingAws(runtime, env).client("s3").list_buckets()["Buckets"]
+            buckets = _aws_for(client, runtime, env).client("s3").list_buckets()["Buckets"]
             assert "uploads" in [b["Name"] for b in buckets]
 
         # Destroying a gc's ONLY a's backing; b keeps serving.
