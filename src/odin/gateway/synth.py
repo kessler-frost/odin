@@ -60,7 +60,7 @@ from starlette.responses import Response
 from odin.aws.backings import ACCOUNT, REGION
 from odin.gateway import errors
 from odin.gateway.keys import Principal
-from odin.gateway.models import ec2compute, ecr, iamctl
+from odin.gateway.models import ec2compute, ecr, iamctl, lambdactl
 from odin.gateway.stores import SynthStores
 
 _SNS_NS = "http://sns.amazonaws.com/doc/2010-03-31/"
@@ -344,26 +344,32 @@ _PURE_HANDLERS: dict[str, _PureHandler] = {
 
 def pure_answer(
     action: str, resource: str, env: str, body: bytes, stores: SynthStores, now: float,
-    backing_port: int | None = None,
+    backing_port: int | None = None, query: dict[str, str] | None = None,
 ) -> Response | None:
     """A direct synth answer for a PURE/CONDITIONAL action, or None if
     `action` isn't synth-owned for this call -- the caller (app.py) forwards
-    normally in that case. Every `ec2:*`/`iam:*` action is owned wholesale by
-    its own model module(s) -- `ec2compute.py` (task V3: instances + key
-    pairs, falling through to `ec2net.py`'s VPC/Subnet/SG for everything
-    else) and `iamctl.py` -- neither has a backing container to forward to,
-    so those paths never return None. `ecr:*` is likewise all-synth for its
-    CONTROL plane, but (task V2b) needs the registry:2 backing's own live
-    port to build `repositoryUri` -- `backing_port` is app.py's existing
-    `GatewayState.backing_port` lookup, threaded through here rather than
-    forwarded (ECR's data plane, image bytes, bypasses the gateway entirely
-    -- see gateway/models/ecr.py)."""
+    normally in that case. Every `ec2:*`/`iam:*`/`lambda:*` action is owned
+    wholesale by its own model module(s) -- `ec2compute.py` (task V3:
+    instances + key pairs, falling through to `ec2net.py`'s VPC/Subnet/SG for
+    everything else), `iamctl.py`, and `lambdactl.py` (task V4a) -- none has
+    a backing container to forward to, so those paths never return None.
+    `ecr:*` is likewise all-synth for its CONTROL plane, but (task V2b) needs
+    the registry:2 backing's own live port to build `repositoryUri` --
+    `backing_port` is app.py's existing `GatewayState.backing_port` lookup,
+    threaded through here rather than forwarded (ECR's data plane, image
+    bytes, bypasses the gateway entirely -- see gateway/models/ecr.py).
+    `query` is app.py's already-parsed query-string dict, needed only by
+    lambdactl.py's UntagResource (`TagKeys` rides the querystring on
+    Lambda's REST wire, unlike every other service modeled here -- see its
+    own docstring for the resulting v1 limitation)."""
     if action.startswith("ec2:"):
         return ec2compute.pure_answer(action, resource, env, body, stores, now)
     if action.startswith("iam:"):
         return iamctl.pure_answer(action, resource, env, body, stores, now)
     if action.startswith("ecr:"):
         return ecr.pure_answer(action, resource, env, body, stores, now, backing_port)
+    if action.startswith("lambda:"):
+        return lambdactl.pure_answer(action, resource, env, body, stores, now, query=query)
     handler = _PURE_HANDLERS.get(action)
     return handler(resource, env, body, stores, now) if handler else None
 

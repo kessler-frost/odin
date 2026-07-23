@@ -103,6 +103,14 @@ class SynthStores:
       the shared `tags` store above, keyed `"ec2:{resource_id}"` -- the SAME
       namespace ec2net.py's vpc/subnet/sg tags use (a bare EC2 resource id is
       unique across the whole `ec2:*` family by construction).
+    - `lambdactl`: the Lambda control-plane model's whole state
+      (`gateway/models/lambdactl.py`, task V4a) -- flat keys `"fn:{name}"`,
+      persisted at `.odin/{env}/gateway/lambdactl.json`. The function's CODE
+      (zip bytes) is deliberately NOT in this JSON sidecar -- it lives on
+      disk at `.odin/{env}/gateway/lambda/{name}.zip` (lambdactl.py mints
+      that path directly off `root`, the same way ec2net's Nebula bootstrap
+      reaches non-store state). Lambda tags live in the shared `tags` store
+      above, keyed `"lambda:{functionArn}"`.
     """
 
     def __init__(self, root: Path) -> None:
@@ -115,3 +123,4 @@ class SynthStores:
         self.iamctl = JsonStore(root, "iamctl")
         self.ecr = JsonStore(root, "ecr")
         self.ec2compute = JsonStore(root, "ec2compute")
+        self.lambdactl = JsonStore(root, "lambdactl")

@@ -22,6 +22,16 @@ service set spans four wire protocols:
                   SNS's query shape (verified against botocore's
                   `EC2QueryParser._do_error_parse`, incl. the EC2-specific
                   capital-D ``RequestID``).
+- lambda:         rest-json (task V4a) -- botocore's `RestJSONParser
+                  ._inject_error_code` (verified against botocore's own
+                  parsers.py) derives `Code` from the response HEADER
+                  `x-amzn-errortype` FIRST, only falling back to a body
+                  `code`/`Code` field if that header is absent -- so unlike
+                  every other branch here (which encodes the code purely in
+                  the body), lambda errors carry it in both places: the
+                  header (what botocore actually reads) and a `Type`/
+                  `Message` body (real Lambda's own shape) for a human
+                  reading the raw response.
 
 Status codes follow the brief's literal choices (401 for the two SigV4
 auth failures, 403 for AccessDenied, 503 for a dead backing) rather than
@@ -74,6 +84,11 @@ def _ec2_xml(code: str, message: str) -> str:
     )
 
 
+def _lambda_response(code: str, message: str, status: int) -> Response:
+    body = json.dumps({"Type": "User", "Message": message})
+    return Response(body, status_code=status, media_type="application/json", headers={"x-amzn-errortype": code})
+
+
 def _json_body_raw(service: str, code: str, message: str) -> str:
     prefix = _JSON_TYPE_PREFIX.get(service, "")
     return json.dumps({"__type": f"{prefix}{code}", "message": message})
@@ -91,6 +106,8 @@ def _respond(service: str, code: str, message: str) -> Response:
         return Response(_sns_xml(code, message), status_code=status, media_type="text/xml")
     if service == "ec2":
         return Response(_ec2_xml(code, message), status_code=status, media_type="text/xml")
+    if service == "lambda":
+        return _lambda_response(code, message, status)
     return Response(_json_body(service, code, message), status_code=status, media_type="application/x-amz-json-1.0")
 
 
@@ -135,4 +152,6 @@ def synth_error(service: str, code: str, message: str, status: int) -> Response:
         return Response(_sns_xml(code, message), status_code=status, media_type="text/xml")
     if service == "ec2":
         return Response(_ec2_xml(code, message), status_code=status, media_type="text/xml")
+    if service == "lambda":
+        return _lambda_response(code, message, status)
     return Response(_json_body_raw(service, code, message), status_code=status, media_type="application/x-amz-json-1.0")

@@ -76,6 +76,13 @@ def ecr(sink: CaptureSink):
     return _client(sink, "ecr")
 
 
+@pytest.fixture
+def lambda_(sink: CaptureSink):
+    # Named `lambda_` (trailing underscore) since `lambda` is a keyword --
+    # same reason every consumer below imports it as `lambda_`.
+    return _client(sink, "lambda")
+
+
 def split_url(url: str) -> tuple[str, dict[str, str]]:
     """path + query dict for classify(), preserving bare markers with no
     `=` (`?location`, `?uploads`, `?acl`, `?delete`) that `parse_qsl` drops

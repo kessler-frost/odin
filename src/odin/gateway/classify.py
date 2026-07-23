@@ -46,6 +46,24 @@ models/iamctl.py's module docstring has the full boundary rule) -- this
 `resource` value is used only for evaluate()'s wildcard match against the
 OPERATOR's full-allow statement, never to authorize a workload.
 
+LAMBDA (task V4a) IS A FOURTH WIRE SHAPE: unlike ec2/iam's query-protocol
+`Action=` param and ecr's `X-Amz-Target` header, Lambda is REST (method +
+path) -- research §2d / §3: `POST /2015-03-31/functions`, `GET .../
+functions/{name}`, `.../invocations`, etc. `_classify_lambda` matches
+`(method, path)` against the exact captured route table (each pattern
+anchored full-string, so `GET /functions/{name}` and `GET /functions/
+{name}/configuration` never collide) and extracts the FunctionName from
+the path's `{name}` segment -- except `CreateFunction`, whose path carries
+no name at all (`POST /2015-03-31/functions`), so that one route reads
+`FunctionName` out of the JSON body instead (the same body-reads-what-the-
+-path-doesn't-carry technique `_classify_ecr` already uses). The `/2017-
+03-31/tags/{Resource}` routes carry a full ARN, not a bare name -- resolved
+to the bare function name the same way SNS's `_sns_resource` strips an ARN
+down (`arn:...:function:name` -> the last segment). Same OPERATOR-only
+reasoning as ec2/iam/ecr: extraction only needs to never return None for a
+route it recognizes; an unrecognized (method, path) pair returns None
+(unmappable, closed-world deny) rather than guessing.
+
 S3 BUCKET-CONFIG READS (S2, discovered running real tofu through the real
 gateway): the TF AWS provider's `aws_s3_bucket` refresh probes bucket-config
 subresources -- `?policy`, `?tagging`, `?acl`, `?cors`, `?versioning`, etc.
@@ -63,6 +81,7 @@ still denies.
 from __future__ import annotations
 
 import json
+import re
 from urllib.parse import parse_qsl, unquote
 
 # Bucket-config GET probes the TF AWS provider's `aws_s3_bucket` makes on
@@ -179,6 +198,8 @@ def classify(
         return _classify_iam(body)
     if service == "ecr":
         return _classify_ecr(lower_headers, body)
+    if service == "lambda":
+        return _classify_lambda(method, path, body)
     return None
 
 
@@ -298,6 +319,51 @@ def _classify_ecr(lower_headers: dict[str, str], body: bytes) -> tuple[str, str]
     except (json.JSONDecodeError, UnicodeDecodeError):
         return None
     return f"ecr:{op}", _ecr_resource(payload)
+
+
+# The captured REST route table (research §2d + botocore's own lambda
+# service-2.json `http.requestUri` per operation, verified live): (method,
+# path pattern, op name). `{name}` is the FunctionName path segment;
+# `{arn}` is the tag routes' full resource ARN. Order doesn't matter --
+# every pattern is `$`-anchored to its own full path, so no two can match
+# the same (method, path) pair.
+_LAMBDA_ROUTES: tuple[tuple[str, re.Pattern[str], str], ...] = (
+    ("POST", re.compile(r"^/2015-03-31/functions$"), "CreateFunction"),
+    ("GET", re.compile(r"^/2015-03-31/functions/(?P<name>[^/]+)$"), "GetFunction"),
+    ("DELETE", re.compile(r"^/2015-03-31/functions/(?P<name>[^/]+)$"), "DeleteFunction"),
+    ("GET", re.compile(r"^/2015-03-31/functions/(?P<name>[^/]+)/configuration$"), "GetFunctionConfiguration"),
+    ("PUT", re.compile(r"^/2015-03-31/functions/(?P<name>[^/]+)/code$"), "UpdateFunctionCode"),
+    ("PUT", re.compile(r"^/2015-03-31/functions/(?P<name>[^/]+)/configuration$"), "UpdateFunctionConfiguration"),
+    ("GET", re.compile(r"^/2015-03-31/functions/(?P<name>[^/]+)/versions$"), "ListVersionsByFunction"),
+    ("POST", re.compile(r"^/2015-03-31/functions/(?P<name>[^/]+)/invocations$"), "Invoke"),
+    ("GET", re.compile(r"^/2020-06-30/functions/(?P<name>[^/]+)/code-signing-config$"), "GetFunctionCodeSigningConfig"),
+    ("GET", re.compile(r"^/2017-03-31/tags/(?P<arn>.+)$"), "ListTags"),
+    ("POST", re.compile(r"^/2017-03-31/tags/(?P<arn>.+)$"), "TagResource"),
+    ("DELETE", re.compile(r"^/2017-03-31/tags/(?P<arn>.+)$"), "UntagResource"),
+)
+
+
+def _classify_lambda(method: str, path: str, body: bytes) -> tuple[str, str] | None:
+    for route_method, pattern, op in _LAMBDA_ROUTES:
+        if route_method != method:
+            continue
+        match = pattern.match(path)
+        if match is None:
+            continue
+        groups = match.groupdict()
+        if "name" in groups:
+            return f"lambda:{op}", unquote(groups["name"])
+        if "arn" in groups:
+            return f"lambda:{op}", unquote(groups["arn"]).rsplit(":", 1)[-1]
+        # CreateFunction: the path carries no name -- read it from the body,
+        # same technique _classify_ecr uses for repositoryName.
+        try:
+            payload = json.loads(body) if body else {}
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            payload = {}
+        name = payload.get("FunctionName")
+        return f"lambda:{op}", name if isinstance(name, str) and name else "*"
+    return None
 
 
 def _classify_s3(

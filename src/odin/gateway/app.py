@@ -181,7 +181,7 @@ def create_gateway_app(
         # threaded through as the same value the forward path below would
         # otherwise look up on its own.
         backing_port = state.backing_port(principal.env, service)
-        pure = synth.pure_answer(action, resource, principal.env, body, stores, now, backing_port)
+        pure = synth.pure_answer(action, resource, principal.env, body, stores, now, backing_port, query_params)
         if pure is not None:
             return pure
 
