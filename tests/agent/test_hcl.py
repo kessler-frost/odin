@@ -45,14 +45,26 @@ resource "aws_dynamodb_table" "items" {
     name = "pk"
     type = "S"
   }
+
+  tags = {
+    "odin:node" = "items"
+  }
 }
 
 resource "aws_s3_bucket" "uploads" {
   bucket = "uploads"
+
+  tags = {
+    "odin:node" = "uploads"
+  }
 }
 
 resource "aws_sns_topic" "alerts" {
   name = "alerts"
+
+  tags = {
+    "odin:node" = "alerts"
+  }
 }
 
 resource "aws_sns_topic_subscription" "alerts_jobs" {
@@ -64,6 +76,10 @@ resource "aws_sns_topic_subscription" "alerts_jobs" {
 
 resource "aws_sqs_queue" "jobs" {
   name = "jobs"
+
+  tags = {
+    "odin:node" = "jobs"
+  }
 }
 '''
 
@@ -644,6 +660,66 @@ def test_ecs_with_non_numeric_port_lands_in_unsupported():
     proj = generate_tf(stack)
     assert proj.unsupported == ["app (ecs): port must be a whole number (e.g. 80)"]
     assert "aws_ecs_service" not in proj.files["main.tf"]
+
+
+# --- odin:node tagging (fix-wave 2b finding #2 prerequisite) ---------------
+#
+# Every primary node-backed resource carries `tags = { "odin:node" = <label> }`
+# -- the ONE mechanism both the reconciler's TF-owned-status projection
+# (vpc/subnet/ec2 have no other queryable label) and the gateway's
+# substrate-launch credential issuance (EC2 cloud-init, ECS task containers,
+# Lambda RIE containers) key off. Companion resources (a lambda's
+# auto-generated role, an ec2's key pair, an sns->sqs subscription, an ecs
+# node's task definition + the one shared cluster, an iam_role's inline
+# policy) are NOT canvas nodes themselves, so they get no tag of their own.
+
+
+def test_vpc_subnet_and_ec2_get_the_odin_node_tag():
+    # These three kinds carry NO other AWS-native name/label field (real
+    # CreateVpc/CreateSubnet/RunInstances have no such argument) -- the tag
+    # is their ONLY way back to the canvas label.
+    stack = _subnet_stack(ResourceDesired(id="server", kind="ec2", fields=_fields(subnet="web")))
+    main_tf = generate_tf(stack).files["main.tf"]
+    assert 'resource "aws_vpc" "net"' in main_tf
+    vpc_block = main_tf.split('resource "aws_vpc" "net"')[1].split("\nresource")[0]
+    assert '"odin:node" = "net"' in vpc_block
+    subnet_block = main_tf.split('resource "aws_subnet" "web"')[1].split("\nresource")[0]
+    assert '"odin:node" = "web"' in subnet_block
+    ec2_block = main_tf.split('resource "aws_instance" "server"')[1].split("\nresource")[0]
+    assert '"odin:node" = "server"' in ec2_block
+
+
+def test_s3_sqs_sns_dynamodb_sg_iam_role_ecr_lambda_ecs_all_get_the_tag():
+    stack = Stack(resources=(
+        ResourceDesired(id="uploads", kind="s3"),
+        ResourceDesired(id="jobs", kind="sqs"),
+        ResourceDesired(id="alerts", kind="sns"),
+        ResourceDesired(id="items", kind="dynamodb"),
+        ResourceDesired(id="net", kind="vpc"),
+        ResourceDesired(id="web-sg", kind="sg", fields=_fields(vpc="net")),
+        ResourceDesired(id="lambda-exec", kind="iam_role"),
+        ResourceDesired(id="app-image", kind="ecr"),
+        ResourceDesired(id="fn1", kind="lambda", fields=_fields(role="lambda-exec")),
+        ResourceDesired(id="svc", kind="ecs"),
+    ))
+    main_tf = generate_tf(stack).files["main.tf"]
+    for label in ("uploads", "jobs", "alerts", "items", "web-sg", "lambda-exec", "app-image", "fn1", "svc"):
+        assert f'"odin:node" = "{label}"' in main_tf, label
+    assert '"odin:node" = "net"' in main_tf
+
+
+def test_companion_resources_get_no_odin_node_tag_of_their_own():
+    stack = Stack(resources=(
+        ResourceDesired(id="net", kind="vpc"),
+        ResourceDesired(id="web", kind="subnet", fields=_fields(vpc="net")),
+        ResourceDesired(id="server", kind="ec2", fields=_fields(subnet="web", key="ssh-ed25519 AAAAtest me@host")),
+        ResourceDesired(id="fn1", kind="lambda"),  # no role field -> auto-generated companion role
+        ResourceDesired(id="app", kind="ecs"),
+    ))
+    main_tf = generate_tf(stack).files["main.tf"]
+    for companion in ("aws_key_pair", "aws_iam_role", "aws_ecs_cluster", "aws_ecs_task_definition"):
+        block = main_tf.split(f'resource "{companion}"')[1].split("\nresource")[0]
+        assert "tags" not in block, companion
 
 
 def test_tofu_fmt_accepts_ecs_output(tmp_path):

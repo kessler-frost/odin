@@ -21,10 +21,13 @@ import pytest
 from botocore.parsers import create_parser
 from starlette.responses import Response
 
+from odin.aws.backings import REGION
 from odin.compute.tasks import TaskContainerHandle
 from odin.gateway.classify import classify
+from odin.gateway.keys import KeyStore
 from odin.gateway.models import ecsctl
 from odin.gateway.stores import SynthStores
+from odin.runtime.colima import CONTAINER_HOST
 
 from .conftest import split_url
 
@@ -52,10 +55,10 @@ class FakeTaskRuntime:
         self._status: dict[tuple, str] = {}
         self._exit_codes: dict[tuple, int] = {}
 
-    def run(self, env: str, task_id: str, container_def: dict) -> TaskContainerHandle:
+    def run(self, env: str, task_id: str, container_def: dict, extra_env: dict[str, str] | None = None) -> TaskContainerHandle:
         if self.block is not None:
             self.block.wait(timeout=5.0)
-        self.ran.append((env, task_id, container_def))
+        self.ran.append((env, task_id, container_def, extra_env))
         if self.fail_run:
             raise RuntimeError("container failed to start")
         key = (env, task_id, container_def["name"])
@@ -97,12 +100,20 @@ def stores(tmp_path: Path) -> SynthStores:
     return SynthStores(tmp_path)
 
 
-def _answer(stores, req, runtime=None) -> Response:
+@pytest.fixture
+def keystore(tmp_path: Path) -> KeyStore:
+    return KeyStore(tmp_path)
+
+
+def _answer(stores, req, runtime=None, keystore=None, gateway_port=None) -> Response:
     path, query = split_url(req.url)
     classified = classify("ecs", req.method, path, query, req.headers, req.body)
     assert classified is not None, "a recognized ECS action must never be unmappable"
     action, resource = classified
-    response = ecsctl.pure_answer(action, resource, ENV, req.body, stores, time.monotonic(), runtime)
+    response = ecsctl.pure_answer(
+        action, resource, ENV, req.body, stores, time.monotonic(), runtime,
+        keystore=keystore, gateway_port=gateway_port,
+    )
     assert response is not None, "ecsctl never falls through to None"
     return response
 
@@ -118,13 +129,13 @@ def _register_taskdef(stores, sink, ecs, runtime, family: str = "app", **kwargs)
     return _parse("RegisterTaskDefinition", _answer(stores, req, runtime))["taskDefinition"]
 
 
-def _create_service(stores, sink, ecs, runtime, **kwargs) -> dict:
+def _create_service(stores, sink, ecs, runtime, keystore=None, gateway_port=None, **kwargs) -> dict:
     kwargs.setdefault("cluster", "odin")
     kwargs.setdefault("serviceName", "app")
     kwargs.setdefault("taskDefinition", "app")
     kwargs.setdefault("desiredCount", 1)
     req = sink.call(lambda: ecs.create_service(**kwargs))
-    return _parse("CreateService", _answer(stores, req, runtime))["service"]
+    return _parse("CreateService", _answer(stores, req, runtime, keystore=keystore, gateway_port=gateway_port))["service"]
 
 
 def _describe_service(stores, sink, ecs, runtime, cluster: str = "odin", name: str = "app") -> dict:
@@ -300,18 +311,27 @@ def test_concurrent_sweeps_and_scale_up_do_not_corrupt_the_store(sink, ecs, stor
 
     errors: list[Exception] = []
 
+    # Capture the two request shapes ONCE, single-threaded: `sink.call`'s
+    # index-based return (`requests[before]`) is not safe under concurrent
+    # callers -- a racing thread's capture can land at `before` first, so the
+    # scale-up thread could dispatch a ListTasks body and silently drop the
+    # desiredCount=10 update (a rare flake under full-suite load). The
+    # concurrency under test -- many dispatches sweeping the store while a
+    # scale-up mutates it -- is preserved: every thread still re-dispatches
+    # through classify + pure_answer on each iteration.
+    list_req = sink.call(lambda: ecs.list_tasks(cluster="odin"))
+    update_req = sink.call(lambda: ecs.update_service(cluster="odin", service="app", desiredCount=10))
+
     def list_tasks_repeatedly() -> None:
         try:
             for _ in range(30):
-                req = sink.call(lambda: ecs.list_tasks(cluster="odin"))
-                _answer(stores, req, runtime)
+                _answer(stores, list_req, runtime)
         except Exception as exc:  # pragma: no cover - fails the test via errors list
             errors.append(exc)
 
     def scale_up() -> None:
         try:
-            req = sink.call(lambda: ecs.update_service(cluster="odin", service="app", desiredCount=10))
-            _answer(stores, req, runtime)
+            _answer(stores, update_req, runtime)
         except Exception as exc:  # pragma: no cover - fails the test via errors list
             errors.append(exc)
 
@@ -428,6 +448,82 @@ def test_delete_cluster_after_service_delete_is_allowed(sink, ecs, stores):
     assert response.status_code == 200
 
 
+# --- Workload creds injection (odin:node tag -> per-node keystore creds) -------
+
+
+def test_create_service_with_odin_node_tag_injects_workload_creds(sink, ecs, stores, keystore):
+    """A service tagged `odin:node` (agent/hcl.py's `_tags_block` stamp)
+    launches its REAL task containers with the four AWS-SDK env vars layered
+    on via `extra_env` -- so the container can call odin's own gateway AS
+    ITSELF -- while the stored taskdef stays byte-for-byte untouched."""
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(
+        stores, sink, ecs, runtime, keystore=keystore, gateway_port=4266,
+        tags=[{"key": "odin:node", "value": "myservice"}],
+    )
+    _wait_for_running_count(stores, sink, ecs, runtime, 1)
+
+    assert stores.ecsctl.get(ENV, "service:odin:app")["node_label"] == "myservice"
+    (_, _, container_def, extra_env) = runtime.ran[0]
+    access_key, secret_key = keystore.issue(ENV, "myservice")
+    assert extra_env == {
+        "AWS_ACCESS_KEY_ID": access_key,
+        "AWS_SECRET_ACCESS_KEY": secret_key,
+        "AWS_ENDPOINT_URL": f"http://{CONTAINER_HOST}:4266",
+        "AWS_DEFAULT_REGION": REGION,
+    }
+    # Zero-drift mandate: the creds ride in via extra_env ONLY -- the taskdef's
+    # own containerDefinitions (stored + echoed verbatim) must not gain them.
+    assert container_def.get("environment") is None
+
+
+def test_update_service_scale_up_injects_the_same_stable_creds(sink, ecs, stores, keystore):
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(
+        stores, sink, ecs, runtime, keystore=keystore, gateway_port=4266,
+        tags=[{"key": "odin:node", "value": "myservice"}],
+    )
+    _wait_for_running_count(stores, sink, ecs, runtime, 1)
+
+    req = sink.call(lambda: ecs.update_service(cluster="odin", service="app", desiredCount=2))
+    _answer(stores, req, runtime, keystore=keystore, gateway_port=4266)
+    _wait_for_running_count(stores, sink, ecs, runtime, 2)
+
+    access_key, _ = keystore.issue(ENV, "myservice")
+    assert len(runtime.ran) == 2
+    for _, _, _, extra_env in runtime.ran:
+        assert extra_env["AWS_ACCESS_KEY_ID"] == access_key  # stable identity, never a second mint
+
+
+def test_create_service_without_keystore_keeps_prior_behavior(sink, ecs, stores):
+    """REGRESSION: today's callers pass no keystore/gateway_port -- the tag
+    may be present, but no creds are injected and nothing crashes."""
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(stores, sink, ecs, runtime, tags=[{"key": "odin:node", "value": "myservice"}])
+    _wait_for_running_count(stores, sink, ecs, runtime, 1)
+
+    (_, _, _, extra_env) = runtime.ran[0]
+    assert not extra_env
+
+
+def test_create_service_without_tags_launches_with_no_injected_creds(sink, ecs, stores, keystore):
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(stores, sink, ecs, runtime, keystore=keystore, gateway_port=4266)
+    _wait_for_running_count(stores, sink, ecs, runtime, 1)
+
+    assert stores.ecsctl.get(ENV, "service:odin:app")["node_label"] is None
+    (_, _, _, extra_env) = runtime.ran[0]
+    assert not extra_env
+
+
 # --- Tasks: lazy sweep (spontaneous exit) --------------------------------------
 
 
@@ -437,7 +533,7 @@ def test_describe_tasks_lazily_marks_a_spontaneously_exited_container_stopped(si
     _register_taskdef(stores, sink, ecs, runtime)
     _create_service(stores, sink, ecs, runtime, desiredCount=1)
     _wait_for_running_count(stores, sink, ecs, runtime, 1)
-    _, task_id, _ = runtime.ran[0]
+    _, task_id, _, _ = runtime.ran[0]
 
     runtime.mark_exited(ENV, task_id, "app", exit_code=137)
 

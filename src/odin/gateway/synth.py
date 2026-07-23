@@ -59,7 +59,7 @@ from starlette.responses import Response
 
 from odin.aws.backings import ACCOUNT, REGION
 from odin.gateway import errors
-from odin.gateway.keys import Principal
+from odin.gateway.keys import KeyStore, Principal
 from odin.gateway.models import ec2compute, ecr, ecsctl, iamctl, lambdactl
 from odin.gateway.stores import SynthStores
 
@@ -345,6 +345,7 @@ _PURE_HANDLERS: dict[str, _PureHandler] = {
 def pure_answer(
     action: str, resource: str, env: str, body: bytes, stores: SynthStores, now: float,
     backing_port: int | None = None, query: dict[str, str] | None = None,
+    keystore: KeyStore | None = None, gateway_port: int | None = None,
 ) -> Response | None:
     """A direct synth answer for a PURE/CONDITIONAL action, or None if
     `action` isn't synth-owned for this call -- the caller (app.py) forwards
@@ -365,17 +366,24 @@ def pure_answer(
     own docstring for the resulting v1 limitation). `ecs:*` (task V5a) is
     all-synth the same way, with its own REAL Colima-container substrate
     (`compute/tasks.py::TaskRuntime`, defaulted inside ecsctl.py itself --
-    it needs no live fact threaded through here, unlike ecr's backing_port)."""
+    it needs no live fact threaded through here, unlike ecr's backing_port).
+    `keystore`/`gateway_port` (fix-wave 2b finding #2) are threaded to the
+    THREE substrate-launching models only (ec2/ecs/lambda -- iam/ecr never
+    launch a workload runtime of their own): each resolves the launching
+    resource's own `odin:node` tag and calls `gateway.keys.workload_env` to
+    inject the workload's keystore identity into the real container/VM it's
+    booting. Both are None in every test that doesn't care (app.py's
+    production caller always supplies both)."""
     if action.startswith("ec2:"):
-        return ec2compute.pure_answer(action, resource, env, body, stores, now)
+        return ec2compute.pure_answer(action, resource, env, body, stores, now, keystore=keystore, gateway_port=gateway_port)
     if action.startswith("iam:"):
         return iamctl.pure_answer(action, resource, env, body, stores, now)
     if action.startswith("ecr:"):
         return ecr.pure_answer(action, resource, env, body, stores, now, backing_port)
     if action.startswith("lambda:"):
-        return lambdactl.pure_answer(action, resource, env, body, stores, now, query=query)
+        return lambdactl.pure_answer(action, resource, env, body, stores, now, query=query, keystore=keystore, gateway_port=gateway_port)
     if action.startswith("ecs:"):
-        return ecsctl.pure_answer(action, resource, env, body, stores, now)
+        return ecsctl.pure_answer(action, resource, env, body, stores, now, keystore=keystore, gateway_port=gateway_port)
     handler = _PURE_HANDLERS.get(action)
     return handler(resource, env, body, stores, now) if handler else None
 

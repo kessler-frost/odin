@@ -148,13 +148,16 @@ class InstanceVm:
         user_data: str | None = None,
         nebula: NebulaJoin | None = None,
         timeout: float = BOOT_TIMEOUT,
+        env_vars: dict[str, str] | None = None,
     ) -> str:
         """Create + start a fresh VM, wait for its vzNAT IP, return it.
         Raises on any failure (boot timeout, a `limactl` error) -- the
         caller (ec2compute.py) turns that into the instance's terminal
-        StateReason, never a silent hang."""
+        StateReason, never a silent hang. `env_vars` (the workload's gateway
+        identity, see `gateway/keys.py::workload_env`) is baked into the
+        VM's cloud-init -- /etc/environment + ~/.aws/credentials."""
         extra = _extra_provision_script(self._nebula_files(nebula), user_data)
-        script = generate_cloud_init(hostname=hostname, ssh_pubkey=ssh_pubkey, extra_script=extra)
+        script = generate_cloud_init(hostname=hostname, ssh_pubkey=ssh_pubkey, extra_script=extra, env_vars=env_vars)
         yaml_doc = generate_lima_yaml(vm_config, cloud_init_script=script, shared_network=True)
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as handle:
             handle.write(yaml_doc)

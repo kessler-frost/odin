@@ -46,16 +46,26 @@ class TaskRuntime:
     def __init__(self, runtime=None) -> None:
         self._rt = runtime or ColimaRuntime()
 
-    def run(self, env: str, task_id: str, container_def: dict) -> TaskContainerHandle:
+    def run(
+        self, env: str, task_id: str, container_def: dict, extra_env: dict[str, str] | None = None,
+    ) -> TaskContainerHandle:
         """Boot the task's single container from its taskdef container
         definition (image/environment/portMappings/command) -- returns as
         soon as the container process starts (module docstring: ECS's own
         RUNNING semantics need no readiness wait, unlike Lambda's RIE).
         Raises on a boot failure; the caller (ecsctl.py's background
         reconcile) turns that into the task's terminal STOPPED state, same
-        contract as `InstanceVm.boot`/`FunctionRuntime.ensure`."""
+        contract as `InstanceVm.boot`/`FunctionRuntime.ensure`.
+
+        `extra_env` layers odin-injected vars (the workload's own gateway
+        creds -- `gateway/keys.py::workload_env`) on top of the taskdef's
+        environment, WINNING any same-named collision -- into the REAL
+        container's env only, never back into the stored taskdef (ecsctl.py's
+        byte-for-byte TASK-DEFINITION DRIFT mandate)."""
         name = container_name(env, task_id, container_def["name"])
         env_vars = {kv["name"]: kv.get("value", "") for kv in container_def.get("environment") or []}
+        if extra_env:
+            env_vars.update(extra_env)
         ports = {pm["containerPort"]: pm.get("hostPort") or 0 for pm in container_def.get("portMappings") or []}
         self._rt.run_container(ContainerSpec(
             name=name, image=container_def["image"], env=env_vars, ports=ports,

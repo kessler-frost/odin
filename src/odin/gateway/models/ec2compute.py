@@ -89,6 +89,7 @@ from odin.aws.backings import ACCOUNT, REGION
 from odin.compute.instances import InstanceVm, NebulaJoin, vm_name
 from odin.compute.models import INSTANCE_TYPES, get_instance_type
 from odin.gateway import errors
+from odin.gateway.keys import KeyStore, workload_env
 from odin.gateway.models import ec2net
 from odin.gateway.stores import NO_CHANGE, SynthStores
 
@@ -352,6 +353,7 @@ def _update_instance(stores: SynthStores, env: str, instance_id: str, **fields: 
 
 def _finish_boot(
     stores: SynthStores, env: str, instance_id: str, name: str, vm_config, ssh_pubkey, user_data, nebula, vm: InstanceVm,
+    env_vars: dict[str, str] | None = None,
 ) -> None:
     # Deliberately broad: this runs on a daemon thread with no caller to
     # propagate an exception to. Without this catch, a boot failure would
@@ -359,7 +361,7 @@ def _finish_boot(
     # exactly the "silent hang" the brief forbids. Any failure instead
     # becomes a real, provider-visible terminal state.
     try:
-        ip = vm.boot(name, vm_config, hostname=instance_id, ssh_pubkey=ssh_pubkey, user_data=user_data, nebula=nebula)
+        ip = vm.boot(name, vm_config, hostname=instance_id, ssh_pubkey=ssh_pubkey, user_data=user_data, nebula=nebula, env_vars=env_vars)
     except Exception as exc:
         log.warning("boot failed for instance %s (%s): %s", instance_id, name, exc)
         _update_instance(
@@ -457,7 +459,7 @@ def _sweep_terminated(stores: SynthStores, env: str, now: float) -> None:
             stores.ec2compute.delete(env, _key("instance", instance["instance_id"]))
 
 
-def _run_instances(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm) -> Response:
+def _run_instances(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     subnet_id = params.get("SubnetId", "")
     subnet = stores.ec2net.get(env, f"subnet:{subnet_id}") if subnet_id else None
     if subnet_id and subnet is None:
@@ -513,12 +515,20 @@ def _run_instances(params: dict[str, str], env: str, stores: SynthStores, now: f
     ssh_pubkey = keypair.get("public_key") if keypair else None
     user_data = base64.b64decode(user_data_b64).decode("utf-8", "replace") if user_data_b64 else None
     name = vm_name(env, instance_id)
-    _spawn(_finish_boot, stores, env, instance_id, name, vm_config, ssh_pubkey, user_data, nebula, vm)
+    # Workload identity (fix-wave 2b finding #2): an instance carrying the
+    # `odin:node` tag (agent/hcl.py stamps it on every canvas-node-backed
+    # resource) boots with its keystore credentials + the gateway endpoint
+    # baked into cloud-init -- the VM can call the gateway AS ITSELF. These
+    # env vars go ONLY into the VM, never into any AWS API response body.
+    label = tags.get("odin:node")
+    injectable = keystore is not None and gateway_port is not None and label
+    env_vars = workload_env(keystore, env, label, gateway_port) if injectable else None
+    _spawn(_finish_boot, stores, env, instance_id, name, vm_config, ssh_pubkey, user_data, nebula, vm, env_vars)
 
     return response
 
 
-def _describe_instances(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm) -> Response:
+def _describe_instances(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     _sweep_terminated(stores, env, now)
     _retry_failed_deletes(stores, env, vm)
     instance_ids = _scalars(params, "InstanceId")
@@ -538,7 +548,7 @@ def _describe_instances(params: dict[str, str], env: str, stores: SynthStores, n
     return _response("DescribeInstances", _reservation_set_xml(stores, env, selected))
 
 
-def _terminate_instances(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm) -> Response:
+def _terminate_instances(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     ids = _scalars(params, "InstanceId")
     changes = []
     for instance_id in ids:
@@ -556,7 +566,7 @@ def _terminate_instances(params: dict[str, str], env: str, stores: SynthStores, 
     return _response("TerminateInstances", f"<instancesSet>{items}</instancesSet>")
 
 
-def _stop_instances(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm) -> Response:
+def _stop_instances(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     ids = _scalars(params, "InstanceId")
     changes = []
     for instance_id in ids:
@@ -571,7 +581,7 @@ def _stop_instances(params: dict[str, str], env: str, stores: SynthStores, now: 
     return _response("StopInstances", f"<instancesSet>{items}</instancesSet>")
 
 
-def _start_instances(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm) -> Response:
+def _start_instances(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     ids = _scalars(params, "InstanceId")
     changes = []
     for instance_id in ids:
@@ -589,7 +599,7 @@ def _start_instances(params: dict[str, str], env: str, stores: SynthStores, now:
 # --- read-only hydration describes (research §2b) --------------------------
 
 
-def _describe_instance_types(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm) -> Response:
+def _describe_instance_types(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     names = _scalars(params, "InstanceType") or list(INSTANCE_TYPES.keys())
     items = []
     for name in names:
@@ -605,7 +615,7 @@ def _describe_instance_types(params: dict[str, str], env: str, stores: SynthStor
     return _response("DescribeInstanceTypes", f"<instanceTypeSet>{''.join(items)}</instanceTypeSet>")
 
 
-def _describe_instance_attribute(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm) -> Response:
+def _describe_instance_attribute(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     instance_id = params.get("InstanceId", "")
     instance = _instance(stores, env, instance_id)
     if instance is None:
@@ -628,7 +638,7 @@ def _describe_instance_attribute(params: dict[str, str], env: str, stores: Synth
     )
 
 
-def _describe_instance_credit_specifications(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm) -> Response:
+def _describe_instance_credit_specifications(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     instance_ids = _scalars(params, "InstanceId")
     instances = _records(stores, env, "instance")
     selected = [i for i in instances if not instance_ids or i["instance_id"] in instance_ids]
@@ -638,7 +648,7 @@ def _describe_instance_credit_specifications(params: dict[str, str], env: str, s
     return _response("DescribeInstanceCreditSpecifications", f"<instanceCreditSpecificationSet>{items}</instanceCreditSpecificationSet>")
 
 
-def _describe_volumes(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm) -> Response:
+def _describe_volumes(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     volume_ids = _scalars(params, "VolumeId")
     filters = _filters(params)
     volumes = [i["root_volume"] for i in _records(stores, env, "instance")]
@@ -675,7 +685,7 @@ def _store_keypair(stores: SynthStores, env: str, params: dict[str, str], name: 
     return record
 
 
-def _import_key_pair(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm) -> Response:
+def _import_key_pair(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     name = params.get("KeyName", "")
     if _keypair(stores, env, name) is not None:
         return errors.synth_error("ec2", "InvalidKeyPair.Duplicate", f"The keypair '{name}' already exists.", 400)
@@ -689,7 +699,7 @@ def _import_key_pair(params: dict[str, str], env: str, stores: SynthStores, now:
     return _response("ImportKeyPair", inner)
 
 
-def _create_key_pair(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm) -> Response:
+def _create_key_pair(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     name = params.get("KeyName", "")
     if _keypair(stores, env, name) is not None:
         return errors.synth_error("ec2", "InvalidKeyPair.Duplicate", f"The keypair '{name}' already exists.", 400)
@@ -703,7 +713,7 @@ def _create_key_pair(params: dict[str, str], env: str, stores: SynthStores, now:
     return _response("CreateKeyPair", inner)
 
 
-def _describe_key_pairs(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm) -> Response:
+def _describe_key_pairs(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     names = _scalars(params, "KeyName")
     keypairs = _records(stores, env, "keypair")
     missing = [n for n in names if n not in {k["key_name"] for k in keypairs}]
@@ -718,7 +728,7 @@ def _describe_key_pairs(params: dict[str, str], env: str, stores: SynthStores, n
     return _response("DescribeKeyPairs", f"<keySet>{items}</keySet>")
 
 
-def _delete_key_pair(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm) -> Response:
+def _delete_key_pair(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     # Idempotent-succeed even if the key is already gone -- real AWS's own
     # DeleteKeyPair semantics, and one fewer branch than a NotFound check.
     name = params.get("KeyName", "")
@@ -766,7 +776,7 @@ def reap_orphaned_vms(root: Path, envs: list[str], vm: InstanceVm | None = None)
 # --- dispatch ----------------------------------------------------------------
 
 
-_Handler = Callable[[dict[str, str], str, SynthStores, float, InstanceVm], Response]
+_Handler = Callable[[dict[str, str], str, SynthStores, float, InstanceVm, KeyStore | None, int | None], Response]
 
 _HANDLERS: dict[str, _Handler] = {
     "RunInstances": _run_instances,
@@ -787,16 +797,19 @@ _HANDLERS: dict[str, _Handler] = {
 
 def pure_answer(
     action: str, resource: str, env: str, body: bytes, stores: SynthStores, now: float,
-    vm: InstanceVm | None = None,
+    vm: InstanceVm | None = None, keystore: KeyStore | None = None, gateway_port: int | None = None,
 ) -> Response | None:
     """The gateway's whole `ec2:*` answer -- this module's own compute
     actions, or a fall-through to `ec2net.pure_answer` (VPC/Subnet/SG/Tags,
     and the InvalidAction envelope for anything neither module knows).
     `vm` is the injectable `InstanceVm` (or a test's fake stand-in with the
     same `boot`/`stop`/`start`/`delete` shape); production callers
-    (gateway/synth.py) never pass one, so a real VM manager is used."""
+    (gateway/synth.py) never pass one, so a real VM manager is used.
+    `keystore`/`gateway_port` (threaded from synth.pure_answer, ecr.py's
+    `backing_port` precedent) let `_run_instances` bake an `odin:node`-tagged
+    instance's own gateway credentials into its cloud-init."""
     op = action.removeprefix("ec2:")
     handler = _HANDLERS.get(op)
     if handler is None:
         return ec2net.pure_answer(action, resource, env, body, stores, now)
-    return handler(_params(body), env, stores, now, vm or InstanceVm())
+    return handler(_params(body), env, stores, now, vm or InstanceVm(), keystore, gateway_port)

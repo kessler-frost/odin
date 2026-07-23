@@ -4,7 +4,7 @@ from __future__ import annotations
 import stat
 from pathlib import Path
 
-from odin.gateway.keys import KeyStore, Principal
+from odin.gateway.keys import KeyStore, Principal, workload_env
 
 
 def test_issue_returns_ak_sk_with_expected_shapes(tmp_path: Path):
@@ -99,6 +99,40 @@ def test_reload_from_disk_preserves_stability_via_issue(tmp_path: Path):
     second_store = KeyStore(tmp_path)
     after = second_store.issue("default", "api")
     assert before == after
+
+
+# --- workload_env (fix-wave 2b finding #2): the 4 env vars every workload
+# substrate (EC2 cloud-init, an ECS task container, a Lambda RIE container)
+# gets injected with, so it can call the gateway AS ITSELF. ------------------
+
+
+def test_workload_env_has_the_four_expected_keys(tmp_path: Path):
+    store = KeyStore(tmp_path)
+    env_vars = workload_env(store, "default", "server", 4266)
+    assert set(env_vars) == {
+        "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_ENDPOINT_URL", "AWS_DEFAULT_REGION",
+    }
+
+
+def test_workload_env_endpoint_uses_container_reachable_host_and_the_given_port(tmp_path: Path):
+    store = KeyStore(tmp_path)
+    env_vars = workload_env(store, "default", "server", 4266)
+    assert env_vars["AWS_ENDPOINT_URL"] == "http://host.docker.internal:4266"
+
+
+def test_workload_env_issues_stable_keystore_creds_for_env_and_label(tmp_path: Path):
+    store = KeyStore(tmp_path)
+    env_vars = workload_env(store, "default", "server", 4266)
+    access_key, secret_key = store.issue("default", "server")
+    assert env_vars["AWS_ACCESS_KEY_ID"] == access_key
+    assert env_vars["AWS_SECRET_ACCESS_KEY"] == secret_key
+
+
+def test_workload_env_differs_per_node_label(tmp_path: Path):
+    store = KeyStore(tmp_path)
+    server_env = workload_env(store, "default", "server", 4266)
+    worker_env = workload_env(store, "default", "worker", 4266)
+    assert server_env["AWS_ACCESS_KEY_ID"] != worker_env["AWS_ACCESS_KEY_ID"]
 
 
 def test_reload_lookup_without_prior_issue_call(tmp_path: Path):

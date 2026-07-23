@@ -16,6 +16,8 @@ import string
 from dataclasses import dataclass
 from pathlib import Path
 
+from odin.aws.backings import REGION
+from odin.runtime.colima import CONTAINER_HOST
 from odin.util import atomic_write_text
 
 _URLSAFE_ALPHABET = string.ascii_letters + string.digits + "-_"
@@ -121,3 +123,28 @@ class KeyStore:
         # create and chmod (see util.atomic_write_text's own ordering).
         text = json.dumps(self._by_env.get(env, {}))
         atomic_write_text(self._path(env), text, mode=0o600)
+
+
+def workload_env(keystore: KeyStore, env: str, node_label: str, gateway_port: int) -> dict[str, str]:
+    """The four AWS-SDK env vars a workload substrate injects so it can call
+    the gateway AS ITSELF (fix-wave 2b finding #2): a Lima VM's cloud-init
+    (`compute/instances.py`), an ECS task container (`compute/tasks.py`), or
+    a Lambda RIE container (`compute/functions.py`). `node_label` is the
+    canvas node's own label -- the SAME string `agent/hcl.py` stamps as the
+    `odin:node` tag on the resource being launched, so every substrate
+    resolves it the identical way (see `hcl._tags_block`'s docstring).
+    Issuing again for the same (env, node_label) returns the SAME keystore
+    credentials (`KeyStore.issue`'s own stability contract) -- a redeploy or
+    a service scaling up a second task never mints a second identity.
+    `AWS_ENDPOINT_URL` uses `CONTAINER_HOST` (`host.docker.internal`), never
+    `127.0.0.1` -- from inside a container/VM that's the container/VM's own
+    loopback, not the Mac running the gateway (the same reasoning
+    `Reconciler._observe_rds`'s DATABASE_URL fact and `aws/backings.py`'s
+    goaws QUEUE_URL already apply)."""
+    access_key, secret_key = keystore.issue(env, node_label)
+    return {
+        "AWS_ACCESS_KEY_ID": access_key,
+        "AWS_SECRET_ACCESS_KEY": secret_key,
+        "AWS_ENDPOINT_URL": f"http://{CONTAINER_HOST}:{gateway_port}",
+        "AWS_DEFAULT_REGION": REGION,
+    }

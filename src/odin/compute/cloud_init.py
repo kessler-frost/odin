@@ -6,6 +6,7 @@ def generate_cloud_init(
     ssh_pubkey: str | None = None,
     install_nerdctl: bool = False,
     extra_script: str | None = None,
+    env_vars: dict[str, str] | None = None,
 ) -> str:
     lines = [
         "#!/bin/bash",
@@ -30,6 +31,33 @@ def generate_cloud_init(
             'chown -R "${LIMA_USER}:${LIMA_USER}" "/home/${LIMA_USER}/.ssh"',
             'chmod 700 "/home/${LIMA_USER}/.ssh"',
             'chmod 600 "/home/${LIMA_USER}/.ssh/authorized_keys"',
+        ])
+
+    if env_vars:
+        # Workload identity (gateway/keys.py::workload_env): the four AWS-SDK
+        # env vars land system-wide in /etc/environment (overwritten, not
+        # appended -- this is a per-boot provision script, appending would
+        # duplicate lines every boot) AND the credential pair lands in the
+        # default user's ~/.aws/credentials ([default] holds ONLY the two
+        # standard credentials-file keys; endpoint/region aren't valid there).
+        # Computes its OWN LIMA_USER: this section and the SSH-key one are
+        # independent conditionals -- either can run without the other.
+        environment_lines = "\n".join(f"{key}={value}" for key, value in env_vars.items())
+        lines.extend([
+            "",
+            "# Inject AWS credentials + endpoint (odin gateway workload identity)",
+            "cat > /etc/environment << 'ODIN_ETC_ENVIRONMENT'",
+            environment_lines,
+            "ODIN_ETC_ENVIRONMENT",
+            'LIMA_USER="$(getent passwd 1000 | cut -d: -f1)"',
+            'mkdir -p "/home/${LIMA_USER}/.aws"',
+            'cat > "/home/${LIMA_USER}/.aws/credentials" << \'ODIN_AWS_CREDENTIALS\'',
+            "[default]",
+            f"aws_access_key_id={env_vars.get('AWS_ACCESS_KEY_ID', '')}",
+            f"aws_secret_access_key={env_vars.get('AWS_SECRET_ACCESS_KEY', '')}",
+            "ODIN_AWS_CREDENTIALS",
+            'chown -R "${LIMA_USER}:${LIMA_USER}" "/home/${LIMA_USER}/.aws"',
+            'chmod 600 "/home/${LIMA_USER}/.aws/credentials"',
         ])
 
     if install_nerdctl:

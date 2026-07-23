@@ -89,6 +89,7 @@ from starlette.responses import Response
 from odin.aws.backings import ACCOUNT, REGION
 from odin.compute.tasks import TaskRuntime
 from odin.gateway import errors
+from odin.gateway.keys import KeyStore, workload_env
 from odin.gateway.stores import NO_CHANGE, SynthStores
 
 log = logging.getLogger("odin.gateway.ecsctl")
@@ -117,7 +118,10 @@ _ESSENTIAL_CONTAINER_EXITED = "Essential container in task exited"
 # indefinitely; this grace window is what makes the delete observable.
 _INACTIVE_SERVICE_SWEEP_SECONDS = 60.0
 
-_Handler = Callable[[dict, str, SynthStores, TaskRuntime], Response]
+# Trailing keystore/gateway_port are threaded to EVERY handler even where
+# unused (the same convention `runtime` itself follows): only the service
+# handlers act on them (workload-creds injection -- `workload_env`).
+_Handler = Callable[[dict, str, SynthStores, TaskRuntime, KeyStore | None, int | None], Response]
 
 
 # --- keys / arns -------------------------------------------------------
@@ -420,6 +424,7 @@ def _sweep_tasks(stores: SynthStores, env: str, runtime: TaskRuntime) -> None:
 
 def _launch_task(
     stores: SynthStores, env: str, cluster_name: str, service_name: str, taskdef: dict, runtime: TaskRuntime,
+    extra_env: dict[str, str] | None = None,
 ) -> None:
     container_def = taskdef["container_definitions"][0]  # v1: single-container taskdefs (V5c)
     task_id = uuid.uuid4().hex
@@ -442,7 +447,7 @@ def _launch_task(
     }
     stores.ecsctl.set(env, _task_key(cluster_name, task_id), task)
     try:
-        handle = runtime.run(env, task_id, container_def)
+        handle = runtime.run(env, task_id, container_def, extra_env=extra_env)
     except Exception as exc:
         # Deliberately broad: this runs on a daemon thread with no caller to
         # propagate an exception to -- see ec2compute.py's `_finish_boot` for
@@ -472,7 +477,10 @@ def _stop_task(stores: SynthStores, env: str, task: dict, runtime: TaskRuntime) 
     stores.ecsctl.delete(env, _task_key(task["cluster_name"], task["task_id"]))
 
 
-def _reconcile_service_tasks(stores: SynthStores, env: str, cluster_name: str, service_name: str, runtime: TaskRuntime) -> None:
+def _reconcile_service_tasks(
+    stores: SynthStores, env: str, cluster_name: str, service_name: str, runtime: TaskRuntime,
+    keystore: KeyStore | None = None, gateway_port: int | None = None,
+) -> None:
     with _lock_for_service(stores, env, cluster_name, service_name):
         service = _service(stores, env, cluster_name, service_name)
         if service is None or service["status"] != "ACTIVE":  # deleted while this reconcile was queued/racing
@@ -480,6 +488,13 @@ def _reconcile_service_tasks(stores: SynthStores, env: str, cluster_name: str, s
         taskdef = _resolve_taskdef_ref(stores, env, service["task_definition_arn"])
         if taskdef is None:  # taskdef deregistered out from under a live service -- nothing to converge to
             return
+        # Workload-creds injection: an `odin:node`-tagged service's tasks get
+        # the four AWS-SDK env vars (`workload_env`) layered into the REAL
+        # container's env at launch -- never into the stored taskdef (the
+        # module docstring's byte-for-byte TASK-DEFINITION DRIFT mandate).
+        extra_env: dict[str, str] = {}
+        if keystore is not None and gateway_port is not None and service.get("node_label"):
+            extra_env = workload_env(keystore, env, service["node_label"], gateway_port)
         live = [t for t in _tasks_for_service(stores, env, cluster_name, service_name) if t["last_status"] != "STOPPED"]
         stale = [t for t in live if t["task_definition_arn"] != service["task_definition_arn"]]
         fresh = [t for t in live if t not in stale]
@@ -489,7 +504,7 @@ def _reconcile_service_tasks(stores: SynthStores, env: str, cluster_name: str, s
         desired = service["desired_count"]
         if len(fresh) < desired:
             for _ in range(desired - len(fresh)):
-                _launch_task(stores, env, cluster_name, service_name, taskdef, runtime)
+                _launch_task(stores, env, cluster_name, service_name, taskdef, runtime, extra_env)
         elif len(fresh) > desired:
             # Newest-task-first scale-down (the digest's own ordering).
             excess = sorted(fresh, key=lambda t: t["started_at"] or 0, reverse=True)[: len(fresh) - desired]
@@ -542,7 +557,10 @@ def _lock_for_service(stores: SynthStores, env: str, cluster_name: str, service_
 # --- Cluster ---------------------------------------------------------------
 
 
-def _create_cluster(payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime) -> Response:
+def _create_cluster(
+    payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
+    keystore: KeyStore | None = None, gateway_port: int | None = None,
+) -> Response:
     name = payload.get("clusterName") or "default"
     existing = _cluster(stores, env, name)
     if existing is not None:  # real CreateCluster is idempotent on an existing name
@@ -556,7 +574,10 @@ def _create_cluster(payload: dict, env: str, stores: SynthStores, runtime: TaskR
     return _json({"cluster": _cluster_wire(stores, env, cluster)})
 
 
-def _describe_clusters(payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime) -> Response:
+def _describe_clusters(
+    payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
+    keystore: KeyStore | None = None, gateway_port: int | None = None,
+) -> Response:
     names = payload.get("clusters")
     failures: list[dict] = []
     if names:
@@ -573,7 +594,10 @@ def _describe_clusters(payload: dict, env: str, stores: SynthStores, runtime: Ta
     return _json({"clusters": [_cluster_wire(stores, env, c) for c in selected], "failures": failures})
 
 
-def _delete_cluster(payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime) -> Response:
+def _delete_cluster(
+    payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
+    keystore: KeyStore | None = None, gateway_port: int | None = None,
+) -> Response:
     name = _strip_id(payload.get("cluster"))
     cluster = _cluster(stores, env, name)
     if cluster is None:
@@ -591,7 +615,10 @@ def _delete_cluster(payload: dict, env: str, stores: SynthStores, runtime: TaskR
 # --- TaskDefinition ----------------------------------------------------------
 
 
-def _register_task_definition(payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime) -> Response:
+def _register_task_definition(
+    payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
+    keystore: KeyStore | None = None, gateway_port: int | None = None,
+) -> Response:
     family = payload.get("family", "")
     counter_key = _taskdef_counter_key(family)
     revision = stores.ecsctl.get(env, counter_key, 0) + 1
@@ -615,7 +642,10 @@ def _register_task_definition(payload: dict, env: str, stores: SynthStores, runt
     return _json({"taskDefinition": _taskdef_wire(taskdef), "tags": []})
 
 
-def _describe_task_definition(payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime) -> Response:
+def _describe_task_definition(
+    payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
+    keystore: KeyStore | None = None, gateway_port: int | None = None,
+) -> Response:
     ref = payload.get("taskDefinition", "")
     taskdef = _resolve_taskdef_ref(stores, env, ref)
     if taskdef is None:
@@ -623,7 +653,10 @@ def _describe_task_definition(payload: dict, env: str, stores: SynthStores, runt
     return _json({"taskDefinition": _taskdef_wire(taskdef), "tags": []})
 
 
-def _deregister_task_definition(payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime) -> Response:
+def _deregister_task_definition(
+    payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
+    keystore: KeyStore | None = None, gateway_port: int | None = None,
+) -> Response:
     ref = payload.get("taskDefinition", "")
     taskdef = _resolve_taskdef_ref(stores, env, ref)
     if taskdef is None:
@@ -637,7 +670,10 @@ def _deregister_task_definition(payload: dict, env: str, stores: SynthStores, ru
 # --- Service -----------------------------------------------------------------
 
 
-def _create_service(payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime) -> Response:
+def _create_service(
+    payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
+    keystore: KeyStore | None = None, gateway_port: int | None = None,
+) -> Response:
     cluster_name = _strip_id(payload.get("cluster"))
     cluster = _cluster(stores, env, cluster_name)
     if cluster is None:
@@ -652,9 +688,16 @@ def _create_service(payload: dict, env: str, stores: SynthStores, runtime: TaskR
     taskdef = _resolve_taskdef_ref(stores, env, payload.get("taskDefinition", ""))
     if taskdef is None:
         return _not_found_taskdef(payload.get("taskDefinition", ""))
+    # ECS `Tag` wire shape on CreateService: a LIST of lowercase
+    # {"key":..., "value":...} dicts (botocore's ecs service-2.json), NOT a
+    # map. `odin:node` is agent/hcl.py::_tags_block's canvas-label stamp --
+    # stored on the record so LATER reconcile passes (UpdateService, scale-up)
+    # still know which keystore identity this service's tasks run as.
+    tags = {t["key"]: t.get("value") for t in payload.get("tags") or []}
     service = {
         "cluster_name": cluster_name,
         "service_name": service_name,
+        "node_label": tags.get("odin:node"),
         "task_definition_arn": _taskdef_arn(taskdef["family"], taskdef["revision"]),
         "desired_count": int(payload.get("desiredCount") or 0),
         "launch_type": payload.get("launchType") or _DEFAULT_LAUNCH_TYPE,
@@ -669,11 +712,14 @@ def _create_service(payload: dict, env: str, stores: SynthStores, runtime: TaskR
     # own async creates -- carries no race here; it's kept for consistency
     # and because a future field (e.g. tags) could change that.
     response = _json({"service": _service_wire(stores, env, service)})
-    _spawn(_reconcile_service_tasks, stores, env, cluster_name, service_name, runtime)
+    _spawn(_reconcile_service_tasks, stores, env, cluster_name, service_name, runtime, keystore, gateway_port)
     return response
 
 
-def _describe_services(payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime) -> Response:
+def _describe_services(
+    payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
+    keystore: KeyStore | None = None, gateway_port: int | None = None,
+) -> Response:
     _sweep_tasks(stores, env, runtime)
     _sweep_inactive_services(stores, env)
     cluster_name = _strip_id(payload.get("cluster"))
@@ -689,7 +735,10 @@ def _describe_services(payload: dict, env: str, stores: SynthStores, runtime: Ta
     return _json({"services": [_service_wire(stores, env, s) for s in selected], "failures": failures})
 
 
-def _update_service(payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime) -> Response:
+def _update_service(
+    payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
+    keystore: KeyStore | None = None, gateway_port: int | None = None,
+) -> Response:
     cluster_name = _strip_id(payload.get("cluster"))
     service_name = _strip_id(payload.get("service"), default="")
     service = _service(stores, env, cluster_name, service_name)
@@ -704,11 +753,14 @@ def _update_service(payload: dict, env: str, stores: SynthStores, runtime: TaskR
         service["task_definition_arn"] = _taskdef_arn(taskdef["family"], taskdef["revision"])
     stores.ecsctl.set(env, _service_key(cluster_name, service_name), service)
     response = _json({"service": _service_wire(stores, env, service)})
-    _spawn(_reconcile_service_tasks, stores, env, cluster_name, service_name, runtime)
+    _spawn(_reconcile_service_tasks, stores, env, cluster_name, service_name, runtime, keystore, gateway_port)
     return response
 
 
-def _delete_service(payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime) -> Response:
+def _delete_service(
+    payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
+    keystore: KeyStore | None = None, gateway_port: int | None = None,
+) -> Response:
     cluster_name = _strip_id(payload.get("cluster"))
     service_name = _strip_id(payload.get("service"), default="")
     service = _service(stores, env, cluster_name, service_name)
@@ -742,7 +794,10 @@ def _delete_service(payload: dict, env: str, stores: SynthStores, runtime: TaskR
 # --- Tasks ---------------------------------------------------------------
 
 
-def _list_tasks(payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime) -> Response:
+def _list_tasks(
+    payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
+    keystore: KeyStore | None = None, gateway_port: int | None = None,
+) -> Response:
     _sweep_tasks(stores, env, runtime)
     cluster_name = _strip_id(payload.get("cluster"))
     tasks = _tasks_for_cluster(stores, env, cluster_name)
@@ -757,7 +812,10 @@ def _list_tasks(payload: dict, env: str, stores: SynthStores, runtime: TaskRunti
     return _json({"taskArns": [t["task_arn"] for t in tasks], "nextToken": None})
 
 
-def _describe_tasks(payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime) -> Response:
+def _describe_tasks(
+    payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
+    keystore: KeyStore | None = None, gateway_port: int | None = None,
+) -> Response:
     _sweep_tasks(stores, env, runtime)
     cluster_name = _strip_id(payload.get("cluster"))
     by_arn = {t["task_arn"]: t for t in _tasks_for_cluster(stores, env, cluster_name)}
@@ -794,13 +852,17 @@ _HANDLERS: dict[str, _Handler] = {
 def pure_answer(
     action: str, resource: str, env: str, body: bytes, stores: SynthStores, now: float,
     runtime: TaskRuntime | None = None,
+    keystore: KeyStore | None = None, gateway_port: int | None = None,
 ) -> Response | None:
     """The whole ECS control-plane answer -- same no-backing contract as
     ec2compute/iamctl/ecr/lambdactl. `runtime` is the injectable
     `TaskRuntime` (or a test's fake stand-in with the same `run`/`status`/
     `exit_code`/`stop` shape); production callers (gateway/synth.py) never
     pass one, so a real `TaskRuntime()` is used, mirroring
-    ec2compute.py's `vm or InstanceVm()` default."""
+    ec2compute.py's `vm or InstanceVm()` default. `keystore` + `gateway_port`
+    (threaded down from create_gateway_app via synth.pure_answer) let an
+    `odin:node`-tagged service's tasks launch with their own gateway creds
+    injected (`workload_env`); absent either, no injection happens."""
     op = action.removeprefix("ecs:")
     handler = _HANDLERS.get(op)
     if handler is None:
@@ -809,4 +871,4 @@ def pure_answer(
         payload = json.loads(body) if body else {}
     except (json.JSONDecodeError, UnicodeDecodeError):
         payload = {}
-    return handler(payload, env, stores, runtime or TaskRuntime())
+    return handler(payload, env, stores, runtime or TaskRuntime(), keystore, gateway_port)

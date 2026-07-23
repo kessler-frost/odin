@@ -132,10 +132,19 @@ def create_gateway_app(
     stores: SynthStores,
     on_deny: OnDeny,
     forward_client: httpx.AsyncClient | None = None,
+    gateway_port: Callable[[], int | None] | None = None,
 ) -> Starlette:
     """The gateway ASGI app. `forward_client` lets tests substitute a
     fake-backing transport (httpx.ASGITransport over a recording ASGI
-    echo) for the real one used in production."""
+    echo) for the real one used in production. `gateway_port` is a zero-arg
+    callable (never a plain int) for the SAME reason server.py's own
+    `create_apply_router`/`create_tf_router` take one: this app is built
+    BEFORE uvicorn resolves its own actual bound port (server.py's
+    `serve_in_thread` -- port=0 resolves lazily), so the value can only be
+    read at request time. Fix-wave 2b finding #2: threaded down to
+    ec2compute/ecsctl/lambdactl (via synth.pure_answer) so a workload
+    substrate's injected AWS_ENDPOINT_URL points at THIS gateway's real
+    port, never a stale/guessed one."""
     client = forward_client or httpx.AsyncClient()
 
     async def catch_all(request: Request) -> Response:
@@ -181,7 +190,10 @@ def create_gateway_app(
         # threaded through as the same value the forward path below would
         # otherwise look up on its own.
         backing_port = state.backing_port(principal.env, service)
-        pure = synth.pure_answer(action, resource, principal.env, body, stores, now, backing_port, query_params)
+        pure = synth.pure_answer(
+            action, resource, principal.env, body, stores, now, backing_port, query_params,
+            keystore=keystore, gateway_port=gateway_port() if gateway_port else None,
+        )
         if pure is not None:
             return pure
 

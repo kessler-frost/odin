@@ -24,6 +24,7 @@ from starlette.responses import Response
 
 from odin.compute.functions import InvokeResult
 from odin.gateway.classify import classify
+from odin.gateway.keys import KeyStore, workload_env
 from odin.gateway.models import lambdactl
 from odin.gateway.stores import SynthStores
 
@@ -31,6 +32,7 @@ from .conftest import split_url
 
 _SESSION = botocore.session.get_session()
 ENV = "default"
+_GATEWAY_PORT = 4266
 _ROLE_ARN = "arn:aws:iam::000000000000:role/lambda-exec"
 _ZIP_BYTES = b"PK\x03\x04fake-zip-bytes"
 
@@ -105,24 +107,31 @@ def stores(tmp_path: Path) -> SynthStores:
     return SynthStores(tmp_path)
 
 
-def _answer(stores, req, substrate=None) -> Response:
+@pytest.fixture
+def keystore(tmp_path: Path) -> KeyStore:
+    return KeyStore(tmp_path)
+
+
+def _answer(stores, req, substrate=None, keystore=None, gateway_port=None) -> Response:
     path, query = split_url(req.url)
     classified = classify("lambda", req.method, path, query, req.headers, req.body)
     assert classified is not None, "a recognized Lambda REST route must never be unmappable"
     action, resource = classified
-    response = lambdactl.pure_answer(action, resource, ENV, req.body, stores, time.monotonic(), substrate, query)
+    response = lambdactl.pure_answer(
+        action, resource, ENV, req.body, stores, time.monotonic(), substrate, query, keystore, gateway_port,
+    )
     assert response is not None, "lambdactl never falls through to None"
     return response
 
 
-def _create(stores, sink, lambda_, substrate, **kwargs) -> dict:
+def _create(stores, sink, lambda_, substrate, *, keystore=None, gateway_port=None, **kwargs) -> dict:
     kwargs.setdefault("FunctionName", "fn1")
     kwargs.setdefault("Role", _ROLE_ARN)
     kwargs.setdefault("Runtime", "python3.12")
     kwargs.setdefault("Handler", "lambda_function.lambda_handler")
     kwargs.setdefault("Code", {"ZipFile": _ZIP_BYTES})
     req = sink.call(lambda: lambda_.create_function(**kwargs))
-    return _parse("CreateFunction", _answer(stores, req, substrate))
+    return _parse("CreateFunction", _answer(stores, req, substrate, keystore, gateway_port))
 
 
 def _wait_for(stores, sink, lambda_, name: str, field: str, want: str, substrate, timeout: float = 2.0) -> dict:
@@ -413,3 +422,76 @@ def test_untag_resource_removes_the_key(sink, lambda_, stores):
     list_req = sink.call(lambda: lambda_.list_tags(Resource="arn:aws:lambda:us-east-1:000000000000:function:fn1"))
     parsed = _parse("ListTags", _answer(stores, list_req, substrate))
     assert parsed["Tags"] == {"team": "x"}
+
+
+# --- workload credential injection (keystore/gateway_port, fix-wave 2b) ---------
+
+
+_AWS_INJECTED_KEYS = {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_ENDPOINT_URL", "AWS_DEFAULT_REGION"}
+
+
+def test_create_with_odin_node_tag_injects_gateway_creds_into_the_container(sink, lambda_, stores, keystore):
+    substrate = FakeFunctionRuntime()
+    _create(
+        stores, sink, lambda_, substrate, keystore=keystore, gateway_port=_GATEWAY_PORT,
+        Tags={"odin:node": "myfn"}, Environment={"Variables": {"FOO": "bar"}},
+    )
+    _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
+
+    env_vars = substrate.ensured[0][4]
+    # `KeyStore.issue` is stable per (env, node): calling workload_env again
+    # in the test reproduces the EXACT credentials the deploy must have used.
+    expected = workload_env(keystore, ENV, "myfn", _GATEWAY_PORT)
+    assert expected["AWS_ACCESS_KEY_ID"] == keystore.issue(ENV, "myfn")[0]
+    assert env_vars == {"FOO": "bar", **expected}
+
+
+def test_injected_creds_never_leak_into_the_configuration_response(sink, lambda_, stores, keystore):
+    substrate = FakeFunctionRuntime()
+    _create(
+        stores, sink, lambda_, substrate, keystore=keystore, gateway_port=_GATEWAY_PORT,
+        Tags={"odin:node": "myfn"}, Environment={"Variables": {"FOO": "bar"}},
+    )
+    active = _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
+    # The drift-safety guarantee: the response echoes EXACTLY what the user
+    # configured -- the injected AWS_* vars live only in the container.
+    assert active["Environment"]["Variables"] == {"FOO": "bar"}
+    assert not _AWS_INJECTED_KEYS & set(active["Environment"]["Variables"])
+
+
+def test_update_configuration_redeploy_reinjects_creds_from_persisted_tags(sink, lambda_, stores, keystore):
+    substrate = FakeFunctionRuntime()
+    _create(
+        stores, sink, lambda_, substrate, keystore=keystore, gateway_port=_GATEWAY_PORT,
+        Tags={"odin:node": "myfn"},
+    )
+    _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
+
+    # Tags are NOT resent on the update call -- they persist from creation.
+    req = sink.call(lambda: lambda_.update_function_configuration(FunctionName="fn1", MemorySize=256))
+    parsed = _parse(
+        "UpdateFunctionConfiguration",
+        _answer(stores, req, substrate, keystore, _GATEWAY_PORT),
+    )
+    assert parsed["LastUpdateStatus"] == "InProgress"
+    _wait_for(stores, sink, lambda_, "fn1", "LastUpdateStatus", "Successful", substrate)
+
+    env_vars = substrate.ensured[1][4]
+    assert env_vars == workload_env(keystore, ENV, "myfn", _GATEWAY_PORT)
+
+
+def test_create_without_keystore_behaves_exactly_as_before(sink, lambda_, stores):
+    substrate = FakeFunctionRuntime()
+    _create(
+        stores, sink, lambda_, substrate,
+        Tags={"odin:node": "myfn"}, Environment={"Variables": {"FOO": "bar"}},
+    )
+    _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
+    assert substrate.ensured[0][4] == {"FOO": "bar"}  # regression: no injection without a keystore
+
+
+def test_create_without_odin_node_tag_deploys_with_no_injected_vars(sink, lambda_, stores, keystore):
+    substrate = FakeFunctionRuntime()
+    _create(stores, sink, lambda_, substrate, keystore=keystore, gateway_port=_GATEWAY_PORT)
+    _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
+    assert substrate.ensured[0][4] == {}  # no odin:node tag -> nothing to inject, deploy still lands

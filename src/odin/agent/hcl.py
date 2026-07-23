@@ -133,6 +133,22 @@ def _block(resource_type: str, name: str, attrs: dict[str, str], nested: str = "
     return f'resource "{resource_type}" "{name}" {{\n{body}\n}}'
 
 
+def _tags_block(label: str) -> str:
+    """`tags = { "odin:node" = <label> }` -- stamped on every PRIMARY
+    canvas-node-backed resource (never a companion resource -- a key pair,
+    an sns->sqs subscription, an inline role policy, a lambda's
+    auto-generated execution role, the one shared ecs cluster, or an ecs
+    node's task definition -- those aren't canvas nodes themselves).
+    This tag is the ONE mechanism two other odin subsystems key off: the
+    reconciler's TF-owned-status World projection (vpc/subnet/ec2 have no
+    other AWS-native field carrying the canvas label back) and the
+    gateway's substrate-launch credential issuance (EC2 cloud-init, an ECS
+    task container, a Lambda RIE container all resolve which (env, node)
+    keystore identity to inject from this same tag) -- see
+    reconcile/tf_status.py and gateway/keys.py::workload_env."""
+    return f"  tags = {{\n    {quote('odin:node')} = {quote(label)}\n  }}"
+
+
 # Cross-resource references passed to every builder: resource id -> (kind,
 # hcl_name). Fully populated BEFORE any builder runs (see generate_tf pass 1),
 # so a subnet/sg can name its containing vpc regardless of sort order.
@@ -519,6 +535,7 @@ def generate_tf(stack: Stack) -> TfProject:
             unsupported.append(f"{res.id} ({res.kind}): {built}")
             continue
         attrs, nested = built
+        nested = "\n\n".join(part for part in (nested, _tags_block(res.id)) if part)
         block = _block(_TF_TYPES[res.kind], hcl_name_by_id[res.id], attrs, nested)
         blocks.append(((res.kind, res.id), block))
 

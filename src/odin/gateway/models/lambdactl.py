@@ -89,6 +89,7 @@ from starlette.responses import Response
 from odin.aws.backings import ACCOUNT, REGION
 from odin.compute.functions import DEFAULT_RUNTIME, FunctionRuntime
 from odin.gateway import errors
+from odin.gateway.keys import KeyStore, workload_env
 from odin.gateway.stores import NO_CHANGE, SynthStores
 from odin.runtime.colima import ColimaRuntime
 
@@ -98,7 +99,10 @@ _DEFAULT_HANDLER = "lambda_function.lambda_handler"
 _DEFAULT_TIMEOUT = 3
 _DEFAULT_MEMORY = 128
 
-_Handler = Callable[[str, str, bytes, SynthStores, float, FunctionRuntime, dict[str, str]], Response]
+_Handler = Callable[
+    [str, str, bytes, SynthStores, float, FunctionRuntime, dict[str, str], KeyStore | None, int | None],
+    Response,
+]
 
 
 def _key(name: str) -> str:
@@ -210,12 +214,26 @@ def _update_function(stores: SynthStores, env: str, name: str, **fields: object)
 def _finish_deploy(
     stores: SynthStores, env: str, name: str, runtime: str, handler: str,
     env_vars: dict[str, str], code_dir: Path, substrate: FunctionRuntime,
+    keystore: KeyStore | None = None, gateway_port: int | None = None,
 ) -> None:
+    # Workload credential injection (fix-wave 2b): resolve the function's own
+    # canvas label from its `odin:node` tag (stamped by hcl.py's `_tags_block`
+    # at CreateFunction; UpdateFunctionCode/Configuration never resend Tags,
+    # but the store still holds them from creation, so a redeploy resolves
+    # identically) and merge `workload_env`'s four AWS_* vars into the
+    # CONTAINER's env only -- never into `fn["environment"]`, which
+    # `_configuration_json` echoes verbatim to the TF provider (merging there
+    # would surface four undeclared vars as drift on every `tofu plan`).
+    arn = f"arn:aws:lambda:{REGION}:{ACCOUNT}:function:{name}"
+    label = _tags_for(stores, env, arn).get("odin:node", "")
+    container_env = dict(env_vars)
+    if keystore is not None and gateway_port is not None and label:
+        container_env.update(workload_env(keystore, env, label, gateway_port))
     # Deliberately broad: this runs on a daemon thread with no caller to
     # propagate an exception to -- see ec2compute.py's `_finish_boot` for
     # the identical "silent hang is forbidden" reasoning.
     try:
-        substrate.ensure(env, name, runtime, handler, env_vars, code_dir)
+        substrate.ensure(env, name, runtime, handler, container_env, code_dir)
     except Exception as exc:
         log.warning("lambda container failed for function %s (env %s): %s", name, env, exc)
         _update_function(
@@ -240,7 +258,7 @@ def _spawn(target: Callable[..., None], *args: object) -> None:
 # --- CreateFunction / GetFunction / DeleteFunction ------------------------
 
 
-def _create_function(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str]) -> Response:
+def _create_function(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     payload = _payload(body)
     name = payload.get("FunctionName") or resource
     if _function(stores, env, name) is not None:
@@ -296,25 +314,25 @@ def _create_function(resource: str, env: str, body: bytes, stores: SynthStores, 
     # suite), not a test artifact. Same fix ec2compute.py's RunInstances
     # already documents for the identical shape.
     response = _json(201, _configuration_json(fn))
-    _spawn(_finish_deploy, stores, env, name, runtime, handler, env_vars, code_dir, substrate)
+    _spawn(_finish_deploy, stores, env, name, runtime, handler, env_vars, code_dir, substrate, keystore, gateway_port)
     return response
 
 
-def _get_function(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str]) -> Response:
+def _get_function(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     fn = _function(stores, env, resource)
     if fn is None:
         return _not_found(resource)
     return _json(200, _get_function_response(fn, stores, env))
 
 
-def _get_function_configuration(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str]) -> Response:
+def _get_function_configuration(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     fn = _function(stores, env, resource)
     if fn is None:
         return _not_found(resource)
     return _json(200, _configuration_json(fn))
 
 
-def _delete_function(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str]) -> Response:
+def _delete_function(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     fn = _function(stores, env, resource)
     if fn is None:
         return _not_found(resource)
@@ -345,7 +363,10 @@ def _redeploy_fields(extra: dict[str, object]) -> dict[str, object]:
     }
 
 
-def _redeploy_response(stores: SynthStores, env: str, name: str, fn: dict, code_dir: Path, substrate: FunctionRuntime) -> Response:
+def _redeploy_response(
+    stores: SynthStores, env: str, name: str, fn: dict, code_dir: Path, substrate: FunctionRuntime,
+    keystore: KeyStore | None = None, gateway_port: int | None = None,
+) -> Response:
     # `fn` is the fresh dict `JsonStore.update()` already returned (its own
     # private copy, not aliased with the store's internal object -- see
     # stores.py), so unlike CreateFunction's still-`set()`-aliased `fn`
@@ -353,11 +374,14 @@ def _redeploy_response(stores: SynthStores, env: str, name: str, fn: dict, code_
     # ORDER is kept anyway, for the same "the response reflects the state at
     # the instant this call was made" reasoning.
     response = _json(200, _configuration_json(fn))
-    _spawn(_finish_deploy, stores, env, name, fn["runtime"], fn["handler"], fn["environment"], code_dir, substrate)
+    _spawn(
+        _finish_deploy, stores, env, name, fn["runtime"], fn["handler"], fn["environment"], code_dir, substrate,
+        keystore, gateway_port,
+    )
     return response
 
 
-def _update_function_code(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str]) -> Response:
+def _update_function_code(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     fn = _function(stores, env, resource)
     if fn is None:
         return _not_found(resource)
@@ -379,10 +403,10 @@ def _update_function_code(resource: str, env: str, body: bytes, stores: SynthSto
     fn = stores.lambdactl.update(env, _key(resource), mutate)
     if fn is NO_CHANGE:
         return _not_found(resource)
-    return _redeploy_response(stores, env, resource, fn, code_dir, substrate)
+    return _redeploy_response(stores, env, resource, fn, code_dir, substrate, keystore, gateway_port)
 
 
-def _update_function_configuration(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str]) -> Response:
+def _update_function_configuration(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     fn = _function(stores, env, resource)
     if fn is None:
         return _not_found(resource)
@@ -411,20 +435,20 @@ def _update_function_configuration(resource: str, env: str, body: bytes, stores:
     if fn is NO_CHANGE:
         return _not_found(resource)
     code_dir = substrate.code_dir(env, resource)  # config-only: same code, restarted container
-    return _redeploy_response(stores, env, resource, fn, code_dir, substrate)
+    return _redeploy_response(stores, env, resource, fn, code_dir, substrate, keystore, gateway_port)
 
 
 # --- ListVersionsByFunction / GetFunctionCodeSigningConfig ----------------
 
 
-def _list_versions_by_function(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str]) -> Response:
+def _list_versions_by_function(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     fn = _function(stores, env, resource)
     if fn is None:
         return _not_found(resource)
     return _json(200, {"Versions": [_configuration_json(fn)], "NextMarker": None})
 
 
-def _get_function_code_signing_config(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str]) -> Response:
+def _get_function_code_signing_config(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     fn = _function(stores, env, resource)
     if fn is None:
         return _not_found(resource)
@@ -438,7 +462,7 @@ def _get_function_code_signing_config(resource: str, env: str, body: bytes, stor
 # --- Invoke: the data plane ------------------------------------------------
 
 
-def _invoke(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str]) -> Response:
+def _invoke(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     fn = _function(stores, env, resource)
     if fn is None:
         return _not_found(resource)
@@ -458,14 +482,14 @@ def _invoke(resource: str, env: str, body: bytes, stores: SynthStores, now: floa
 # --- Tags (per-function Tag/Untag/List, shared stores.tags) ---------------
 
 
-def _list_tags(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str]) -> Response:
+def _list_tags(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     fn = _function(stores, env, resource)
     if fn is None:
         return _not_found(resource)
     return _json(200, {"Tags": _tags_for(stores, env, fn["function_arn"])})
 
 
-def _tag_resource(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str]) -> Response:
+def _tag_resource(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     fn = _function(stores, env, resource)
     if fn is None:
         return _not_found(resource)
@@ -475,7 +499,7 @@ def _tag_resource(resource: str, env: str, body: bytes, stores: SynthStores, now
     return Response(status_code=204)
 
 
-def _untag_resource(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str]) -> Response:
+def _untag_resource(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     fn = _function(stores, env, resource)
     if fn is None:
         return _not_found(resource)
@@ -508,6 +532,7 @@ _HANDLERS: dict[str, _Handler] = {
 def pure_answer(
     action: str, resource: str, env: str, body: bytes, stores: SynthStores, now: float,
     substrate: FunctionRuntime | None = None, query: dict[str, str] | None = None,
+    keystore: KeyStore | None = None, gateway_port: int | None = None,
 ) -> Response | None:
     """The whole Lambda answer -- same no-backing contract as ec2net/iamctl/
     ecr: an unmodeled action still gets a protocol-correct error, never a
@@ -520,4 +545,4 @@ def pure_answer(
     handler = _HANDLERS.get(op)
     if handler is None:
         return errors.synth_error("lambda", "InvalidAction", f"The action {op} is not valid.", 400)
-    return handler(resource, env, body, stores, now, substrate or FunctionRuntime(ColimaRuntime(), stores.root), query or {})
+    return handler(resource, env, body, stores, now, substrate or FunctionRuntime(ColimaRuntime(), stores.root), query or {}, keystore, gateway_port)

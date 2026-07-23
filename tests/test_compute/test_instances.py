@@ -130,6 +130,24 @@ def test_boot_ssh_pubkey_and_user_data_land_in_the_cloud_init_script():
     assert "echo hello-from-user-data" in runner.script
 
 
+def test_boot_env_vars_land_in_the_cloud_init_script():
+    class _TrackingRunner(FakeRunner):
+        def __call__(self, args, input=None):
+            if "create" in args:
+                self.script = yaml.safe_load(Path(args[-1]).read_text())["provision"][0]["script"]
+            return super().__call__(args, input=input)
+
+    runner = _TrackingRunner()
+    runner.responses["hostname -I"] = _Proc(0, "192.168.64.20")
+    vm = InstanceVm(runner=runner)
+    vm.boot(
+        NAME, get_instance_type("t3.micro"), hostname="ec2-test",
+        env_vars={"AWS_ACCESS_KEY_ID": "AKboot", "AWS_SECRET_ACCESS_KEY": "bootsec"},
+    )
+    assert "AWS_ACCESS_KEY_ID=AKboot" in runner.script
+    assert "aws_access_key_id=AKboot" in runner.script
+
+
 def test_boot_polls_until_the_shared_ip_appears():
     runner = FakeRunner()
     runner.hostname_i_queue = ["192.168.5.9", "192.168.5.9", "192.168.64.30"]

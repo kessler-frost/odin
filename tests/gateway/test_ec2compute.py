@@ -22,6 +22,7 @@ from botocore.parsers import create_parser
 from starlette.responses import Response
 
 from odin.gateway.classify import classify
+from odin.gateway.keys import KeyStore
 from odin.gateway.models import ec2compute
 from odin.gateway.stores import SynthStores
 
@@ -46,8 +47,8 @@ class FakeInstanceVm:
         self.started: list[str] = []
         self.deleted: list[str] = []
 
-    def boot(self, name, vm_config, *, hostname, ssh_pubkey=None, user_data=None, nebula=None, timeout=300.0):
-        self.booted.append((name, hostname, ssh_pubkey, user_data, nebula))
+    def boot(self, name, vm_config, *, hostname, ssh_pubkey=None, user_data=None, nebula=None, timeout=300.0, env_vars=None):
+        self.booted.append((name, hostname, ssh_pubkey, user_data, nebula, env_vars))
         if self.fail_boot:
             raise RuntimeError("boot failed")
         return self.ip
@@ -100,10 +101,10 @@ class SlowBootInstanceVm(FakeInstanceVm):
         self.release = threading.Event()
         self.boot_started = threading.Event()
 
-    def boot(self, name, vm_config, *, hostname, ssh_pubkey=None, user_data=None, nebula=None, timeout=300.0):
+    def boot(self, name, vm_config, *, hostname, ssh_pubkey=None, user_data=None, nebula=None, timeout=300.0, env_vars=None):
         self.boot_started.set()
         self.release.wait(timeout=5.0)
-        return super().boot(name, vm_config, hostname=hostname, ssh_pubkey=ssh_pubkey, user_data=user_data, nebula=nebula, timeout=timeout)
+        return super().boot(name, vm_config, hostname=hostname, ssh_pubkey=ssh_pubkey, user_data=user_data, nebula=nebula, timeout=timeout, env_vars=env_vars)
 
 
 def _parse(operation: str, response: Response, *, error: bool = False):
@@ -122,12 +123,15 @@ def stores(tmp_path: Path) -> SynthStores:
     return SynthStores(tmp_path)
 
 
-def _answer(stores, req, vm=None) -> Response:
+def _answer(stores, req, vm=None, keystore=None, gateway_port=None) -> Response:
     path, query = split_url(req.url)
     classified = classify("ec2", req.method, path, query, req.headers, req.body)
     assert classified is not None, "an EC2 request must never be unmappable"
     action, resource = classified
-    response = ec2compute.pure_answer(action, resource, ENV, req.body, stores, time.monotonic(), vm)
+    response = ec2compute.pure_answer(
+        action, resource, ENV, req.body, stores, time.monotonic(), vm,
+        keystore=keystore, gateway_port=gateway_port,
+    )
     assert response is not None, "ec2compute delegates VPC/SG/unknown actions to ec2net, never falls through to None"
     return response
 
@@ -146,9 +150,9 @@ def _subnet(stores, sink, ec2) -> str:
     return _create_subnet(stores, sink, ec2, _create_vpc(stores, sink, ec2))
 
 
-def _run_instance(stores, sink, ec2, vm, **kwargs) -> dict:
+def _run_instance(stores, sink, ec2, vm, *, keystore=None, gateway_port=None, **kwargs) -> dict:
     req = sink.call(lambda: ec2.run_instances(MinCount=1, MaxCount=1, **kwargs))
-    return _parse("RunInstances", _answer(stores, req, vm))
+    return _parse("RunInstances", _answer(stores, req, vm, keystore=keystore, gateway_port=gateway_port))
 
 
 def _wait_for_state(stores, sink, ec2, instance_id: str, want: str, vm, timeout: float = 2.0) -> dict:
@@ -232,6 +236,56 @@ def test_describe_instances_filters_by_state_and_vpc(sink, ec2, stores):
     parsed = _parse("DescribeInstances", _answer(stores, req, vm))
     ids = {i["InstanceId"] for r in parsed["Reservations"] for i in r["Instances"]}
     assert a["InstanceId"] in ids
+
+
+# --- workload identity injection (fix-wave 2b finding #2) ----------------------
+
+
+def test_run_instances_with_odin_node_tag_injects_workload_env(sink, ec2, stores, tmp_path):
+    """An instance tagged `odin:node=<label>` (agent/hcl.py stamps this on
+    every canvas-node-backed resource) boots with the four AWS-SDK env vars
+    from `workload_env` -- the keystore identity issued for that label --
+    baked into its cloud-init, so the VM can call the gateway AS ITSELF."""
+    keystore = KeyStore(tmp_path)
+    subnet_id = _subnet(stores, sink, ec2)
+    vm = FakeInstanceVm()
+    instance_id = _run_instance(
+        stores, sink, ec2, vm, keystore=keystore, gateway_port=4266,
+        SubnetId=subnet_id,
+        TagSpecifications=[{"ResourceType": "instance", "Tags": [{"Key": "odin:node", "Value": "myserver"}]}],
+    )["Instances"][0]["InstanceId"]
+    _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+
+    env_vars = vm.booted[0][5]
+    assert set(env_vars) == {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_ENDPOINT_URL", "AWS_DEFAULT_REGION"}
+    access_key, secret_key = keystore.issue(ENV, "myserver")  # stable -- reissuing returns the SAME pair
+    assert env_vars["AWS_ACCESS_KEY_ID"] == access_key
+    assert env_vars["AWS_SECRET_ACCESS_KEY"] == secret_key
+    assert env_vars["AWS_ENDPOINT_URL"].endswith(":4266")
+
+
+def test_run_instances_with_keystore_but_no_odin_node_tag_boots_without_env_vars(sink, ec2, stores, tmp_path):
+    keystore = KeyStore(tmp_path)
+    subnet_id = _subnet(stores, sink, ec2)
+    vm = FakeInstanceVm()
+    instance_id = _run_instance(
+        stores, sink, ec2, vm, keystore=keystore, gateway_port=4266, SubnetId=subnet_id,
+    )["Instances"][0]["InstanceId"]
+    _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+    assert vm.booted[0][5] is None
+
+
+def test_run_instances_without_keystore_boots_without_env_vars(sink, ec2, stores):
+    """Regression: today's callers that pass no keystore/gateway_port get
+    exactly the old behavior -- no env vars injected."""
+    subnet_id = _subnet(stores, sink, ec2)
+    vm = FakeInstanceVm()
+    instance_id = _run_instance(
+        stores, sink, ec2, vm, SubnetId=subnet_id,
+        TagSpecifications=[{"ResourceType": "instance", "Tags": [{"Key": "odin:node", "Value": "myserver"}]}],
+    )["Instances"][0]["InstanceId"]
+    _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+    assert vm.booted[0][5] is None
 
 
 # --- Stop / Start / Terminate -------------------------------------------------
