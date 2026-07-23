@@ -75,6 +75,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+import shutil
 from collections.abc import Callable
 from urllib.parse import parse_qsl
 from xml.sax.saxutils import escape
@@ -453,6 +454,11 @@ def _delete_vpc(params: dict[str, str], env: str, stores: SynthStores) -> Respon
         )
     stores.ec2net.delete(env, _key("sg", vpc["default_sg_id"]))
     stores.ec2net.delete(env, _key("vpc", vpc_id))
+    # V1b symmetry with _create_vpc's ensure_network: the env's Nebula CA
+    # lives at .odin/{env}/nebula/ and belongs to the env's VPCs. When the
+    # last VPC goes, the CA goes too -- a recreated VPC mints a fresh one.
+    if not _records(stores, env, "vpc"):
+        shutil.rmtree(stores.root / env / "nebula", ignore_errors=True)
     return _response("DeleteVpc", "<return>true</return>")
 
 
