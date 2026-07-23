@@ -60,7 +60,7 @@ from starlette.responses import Response
 from odin.aws.backings import ACCOUNT, REGION
 from odin.gateway import errors
 from odin.gateway.keys import Principal
-from odin.gateway.models import ec2net
+from odin.gateway.models import ec2net, ecr, iamctl
 from odin.gateway.stores import SynthStores
 
 _SNS_NS = "http://sns.amazonaws.com/doc/2010-03-31/"
@@ -342,14 +342,26 @@ _PURE_HANDLERS: dict[str, _PureHandler] = {
 }
 
 
-def pure_answer(action: str, resource: str, env: str, body: bytes, stores: SynthStores, now: float) -> Response | None:
+def pure_answer(
+    action: str, resource: str, env: str, body: bytes, stores: SynthStores, now: float,
+    backing_port: int | None = None,
+) -> Response | None:
     """A direct synth answer for a PURE/CONDITIONAL action, or None if
     `action` isn't synth-owned for this call -- the caller (app.py) forwards
-    normally in that case. Every `ec2:*` action is owned wholesale by the
-    EC2-network model module (gateway/models/ec2net.py) -- EC2 has no
-    backing container to forward to, so that path never returns None."""
+    normally in that case. Every `ec2:*`/`iam:*` action is owned wholesale by
+    its own model module (gateway/models/ec2net.py, iamctl.py) -- neither
+    has a backing container to forward to, so those paths never return None.
+    `ecr:*` is likewise all-synth for its CONTROL plane, but (task V2b)
+    needs the registry:2 backing's own live port to build `repositoryUri` --
+    `backing_port` is app.py's existing `GatewayState.backing_port` lookup,
+    threaded through here rather than forwarded (ECR's data plane, image
+    bytes, bypasses the gateway entirely -- see gateway/models/ecr.py)."""
     if action.startswith("ec2:"):
         return ec2net.pure_answer(action, resource, env, body, stores, now)
+    if action.startswith("iam:"):
+        return iamctl.pure_answer(action, resource, env, body, stores, now)
+    if action.startswith("ecr:"):
+        return ecr.pure_answer(action, resource, env, body, stores, now, backing_port)
     handler = _PURE_HANDLERS.get(action)
     return handler(resource, env, body, stores, now) if handler else None
 

@@ -1,18 +1,21 @@
 """Protocol-correct error responses per AWS service wire format, so
 boto3/aws-cli raise the SAME `ClientError` shape a real AWS deny would
 produce (PRD R1: "Errors are protocol-correct per service"). The v1
-service set spans three wire protocols:
+service set spans four wire protocols:
 
 - s3:            REST-XML, a bare ``<Error>`` document.
-- sns:            query-XML, wrapped in ``<ErrorResponse><Error>...`` --
-                  SNS is botocore's "query" protocol, whose error parser
-                  looks one level deeper than S3's REST-XML.
-- dynamodb/sqs:   AWS JSON, ``{"__type": "...#XException", "message": ...}``
+- sns/iam:        query-XML, wrapped in ``<ErrorResponse><Error>...`` --
+                  both are botocore's "query" protocol (verified against
+                  each service's own model), whose error parser looks one
+                  level deeper than S3's REST-XML. IAM shares SNS's exact
+                  envelope shape, so both route through `_sns_xml`.
+- dynamodb/sqs/ecr: AWS JSON, ``{"__type": "...#XException", "message": ...}``
                   -- botocore's JSON error parser derives `Code` from the
                   part of `__type` after `#`, so it must carry the
                   conventional `...Exception` suffix (real AWS: DynamoDB/
                   SQS permission denials surface as `AccessDeniedException`,
-                  not the bare `AccessDenied` S3/SNS use).
+                  not the bare `AccessDenied` S3/SNS use). ECR falls into
+                  this same default JSON branch -- no dedicated case needed.
 - ec2:            the EC2 protocol's OWN envelope,
                   ``<Response><Errors><Error>...</Error></Errors>
                   <RequestID>...</RequestID></Response>`` -- distinct from
@@ -84,7 +87,7 @@ def _respond(service: str, code: str, message: str) -> Response:
     status = _STATUS[code]
     if service == "s3":
         return Response(_s3_xml(code, message), status_code=status, media_type="application/xml")
-    if service == "sns":
+    if service in ("sns", "iam"):
         return Response(_sns_xml(code, message), status_code=status, media_type="text/xml")
     if service == "ec2":
         return Response(_ec2_xml(code, message), status_code=status, media_type="text/xml")
@@ -128,7 +131,7 @@ def synth_error(service: str, code: str, message: str, status: int) -> Response:
     own source), not botocore's shape name. EC2's per-kind NotFound codes
     (`InvalidVpcID.NotFound` & co., gateway/models/ec2net.py) ride this same
     exact-wire-code path in the EC2 error envelope."""
-    if service == "sns":
+    if service in ("sns", "iam"):
         return Response(_sns_xml(code, message), status_code=status, media_type="text/xml")
     if service == "ec2":
         return Response(_ec2_xml(code, message), status_code=status, media_type="text/xml")

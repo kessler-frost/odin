@@ -175,11 +175,16 @@ def create_gateway_app(
             return errors.access_denied(service, action)
 
         now = time.monotonic()
-        pure = synth.pure_answer(action, resource, principal.env, body, stores, now)
+        # Computed once, ahead of pure_answer: ecr's control-plane model
+        # (all-synth, like ec2/iam) still needs the registry:2 backing's
+        # OWN live port to build repositoryUri (gateway/models/ecr.py),
+        # threaded through as the same value the forward path below would
+        # otherwise look up on its own.
+        backing_port = state.backing_port(principal.env, service)
+        pure = synth.pure_answer(action, resource, principal.env, body, stores, now, backing_port)
         if pure is not None:
             return pure
 
-        backing_port = state.backing_port(principal.env, service)
         if backing_port is None:
             await on_deny(principal, action, resource, "backing-unavailable")
             return errors.service_unavailable(service)

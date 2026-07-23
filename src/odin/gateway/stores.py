@@ -87,6 +87,15 @@ class SynthStores:
       `"subnet:{id}"` / `"sg:{id}"`, persisted at
       `.odin/{env}/gateway/ec2net.json`. EC2 tags live in the shared `tags`
       store above, keyed `"ec2:{resource_id}"`.
+    - `iamctl`: the IAM control-plane model's whole state
+      (`gateway/models/iamctl.py`) -- flat keys `"role:{name}"` /
+      `"policy:{arn}"` / `"instance-profile:{name}"`, persisted at
+      `.odin/{env}/gateway/iamctl.json`. IAM tags live in the shared `tags`
+      store above, keyed `"iam:{arn}"`.
+    - `ecr`: the ECR control-plane model's whole state
+      (`gateway/models/ecr.py`) -- flat keys `"repo:{name}"`, persisted at
+      `.odin/{env}/gateway/ecr.json`. ECR tags live in the shared `tags`
+      store above, keyed `"ecr:{repositoryArn}"`.
     """
 
     def __init__(self, root: Path) -> None:
@@ -96,3 +105,5 @@ class SynthStores:
         self.sns_topics = JsonStore(root, "sns_topics")
         self.sns_subscriptions = JsonStore(root, "sns_subscriptions")
         self.ec2net = JsonStore(root, "ec2net")
+        self.iamctl = JsonStore(root, "iamctl")
+        self.ecr = JsonStore(root, "ecr")

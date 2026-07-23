@@ -35,6 +35,17 @@ arrive in V3), and the only principal driving EC2 calls is the OPERATOR
 (full allow), so extraction only needs to never return None -- a None here
 would deny even the operator via `unmappable-action`.
 
+IAM + ECR (task V2) share EC2's reasoning exactly: the only principal
+driving these calls in v1 is the OPERATOR (TF-authored roles/policies/
+repos), so `_classify_iam`/`_classify_ecr` extract a real id when the
+request carries one (IAM: `RoleName`/`PolicyArn`/`InstanceProfileName`;
+ECR: `repositoryName`/the first `repositoryNames` entry/`resourceArn`'s
+last path segment) and fall back to `"*"` rather than ever returning None.
+IAM's control-plane document store does NOT feed `evaluate()` (gateway/
+models/iamctl.py's module docstring has the full boundary rule) -- this
+`resource` value is used only for evaluate()'s wildcard match against the
+OPERATOR's full-allow statement, never to authorize a workload.
+
 S3 BUCKET-CONFIG READS (S2, discovered running real tofu through the real
 gateway): the TF AWS provider's `aws_s3_bucket` refresh probes bucket-config
 subresources -- `?policy`, `?tagging`, `?acl`, `?cors`, `?versioning`, etc.
@@ -164,6 +175,10 @@ def classify(
         return _classify_sns(body)
     if service == "ec2":
         return _classify_ec2(body)
+    if service == "iam":
+        return _classify_iam(body)
+    if service == "ecr":
+        return _classify_ecr(lower_headers, body)
     return None
 
 
@@ -243,6 +258,46 @@ def _classify_ec2(body: bytes) -> tuple[str, str] | None:
         return None
     resource = next((params[key] for key in _EC2_ID_PARAMS if params.get(key)), "*")
     return f"ec2:{action_name}", resource
+
+
+_IAM_ID_PARAMS = ("RoleName", "PolicyArn", "InstanceProfileName")
+
+
+def _classify_iam(body: bytes) -> tuple[str, str] | None:
+    try:
+        params = dict(parse_qsl(body.decode("utf-8"), keep_blank_values=True))
+    except UnicodeDecodeError:
+        return None
+    action_name = params.get("Action")
+    if not action_name:
+        return None
+    resource = next((params[key] for key in _IAM_ID_PARAMS if params.get(key)), "*")
+    return f"iam:{action_name}", resource
+
+
+def _ecr_resource(payload: dict) -> str:
+    name = payload.get("repositoryName")
+    if isinstance(name, str) and name:
+        return name
+    names = payload.get("repositoryNames")
+    if isinstance(names, list) and names and isinstance(names[0], str):
+        return names[0]
+    arn = payload.get("resourceArn")
+    if isinstance(arn, str) and arn:
+        return arn.rsplit("/", 1)[-1]
+    return "*"
+
+
+def _classify_ecr(lower_headers: dict[str, str], body: bytes) -> tuple[str, str] | None:
+    target = lower_headers.get("x-amz-target")
+    if target is None or "." not in target:
+        return None
+    op = target.rsplit(".", 1)[1]
+    try:
+        payload = json.loads(body) if body else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return f"ecr:{op}", _ecr_resource(payload)
 
 
 def _classify_s3(

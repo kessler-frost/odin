@@ -66,6 +66,16 @@ def ec2(sink: CaptureSink):
     return _client(sink, "ec2")
 
 
+@pytest.fixture
+def iam(sink: CaptureSink):
+    return _client(sink, "iam")
+
+
+@pytest.fixture
+def ecr(sink: CaptureSink):
+    return _client(sink, "ecr")
+
+
 def split_url(url: str) -> tuple[str, dict[str, str]]:
     """path + query dict for classify(), preserving bare markers with no
     `=` (`?location`, `?uploads`, `?acl`, `?delete`) that `parse_qsl` drops
