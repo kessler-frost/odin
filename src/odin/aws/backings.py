@@ -18,14 +18,15 @@ import boto3
 from botocore.client import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
+from odin.gateway import DEFAULT_GATEWAY_PORT
+from odin.runtime.colima import CONTAINER_HOST, ContainerSpec
+
 
 class BackingUnavailable(RuntimeError):
     """A backing container isn't publishing the expected port (gone, or a
     gateway_port mismatch with its creator). Loud by default; best-effort
     paths (deprovision) catch it explicitly."""
 
-from odin.gateway import DEFAULT_GATEWAY_PORT
-from odin.runtime.colima import CONTAINER_HOST, ContainerSpec
 
 PROVISIONED = ("s3", "sqs", "sns", "dynamodb")
 ACCESS_KEY = "allfather"
