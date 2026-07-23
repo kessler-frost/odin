@@ -62,7 +62,7 @@ def _odin_version() -> str:
         return _FALLBACK_VERSION
 
 
-def create_apply_router(store: SpecStore, reconciler_for, keystore: KeyStore) -> APIRouter:
+def create_apply_router(store: SpecStore, reconciler_for, keystore: KeyStore, runner: TfRunner, gateway_port) -> APIRouter:
     router = APIRouter()
 
     @router.post("/apply")
@@ -75,12 +75,41 @@ def create_apply_router(store: SpecStore, reconciler_for, keystore: KeyStore) ->
         return {"status": "applied", "rev": rev, "env": env, "skipped": skipped_node_types(canvas)}
 
     @router.post("/destroy")
-    async def destroy(env: str = ENV) -> dict:
+    async def destroy(env: str = ENV) -> JSONResponse:
+        # Release finding #5: `/destroy` used to only ever prune the
+        # reconciler half, leaving anything tofu created (vpc/subnet/sg have
+        # NO reconciler-driven teardown path at all -- see
+        # create_apply_full_router's own note on this) permanently orphaned.
+        # Busy guard BEFORE any mutation (mirrors /tf/destroy's own
+        # SimulateBusy message, and apply_full's identical guard) -- no
+        # reconcile, no store write while a tofu run holds the env's lock.
+        status = runner.status(env)
+        if status["running"]:
+            return JSONResponse(
+                status_code=409,
+                content={"error": f"a tofu run is already in progress for env {env!r}"},
+            )
+
+        body: dict = {"status": "destroyed", "env": env, "tf": None}
+        if status["workspace_exists"]:
+            access_key, secret_key = keystore.issue(env, OPERATOR_NODE_ID)
+            try:
+                result = await runner.destroy(env, gateway_port(), access_key, secret_key)
+            except TofuNotInstalled:
+                # Not a request-level error: the reconciler half still runs below.
+                body["tf"] = {"status": "unavailable", "exit_code": None, **_TOFU_NOT_INSTALLED}
+            except SimulateBusy as exc:  # a second call won the race after our guard passed
+                return JSONResponse(status_code=409, content={"error": str(exc)})
+            else:
+                body["tf"] = {"status": "ok" if result.ok else "failed", "exit_code": result.exit_code}
+                if not result.ok:
+                    body["tf"]["tail"] = list(result.tail)
+
         reconciler = await reconciler_for(env)
         store.apply(Stack(env=env))  # empty desired state -> reconciler prunes all
         await reconciler.tick()
         keystore.revoke_env(env)  # gateway-issued keys die with the env they belong to
-        return {"status": "destroyed", "env": env}
+        return JSONResponse(status_code=200, content=body)
 
     @router.get("/world")
     def world(env: str = ENV) -> dict:
@@ -407,7 +436,7 @@ def create_app(
 
     app = FastAPI(title="allfather", version=_odin_version(), lifespan=lifespan)
     app.include_router(create_canvas_router(CANVAS_PATH))
-    app.include_router(create_apply_router(_store, reconciler_for, gateway_keystore))
+    app.include_router(create_apply_router(_store, reconciler_for, gateway_keystore, tf_runner, lambda: gateway_port_actual))
     app.include_router(create_tf_router(_store, tf_runner, gateway_keystore, lambda: gateway_port_actual))
     app.include_router(create_apply_full_router(_store, reconciler_for, tf_runner, gateway_keystore, lambda: gateway_port_actual))
 
