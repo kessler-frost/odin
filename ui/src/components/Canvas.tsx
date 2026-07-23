@@ -12,6 +12,7 @@ import {
   type Node,
   type Edge,
   type NodeTypes,
+  type NodeChange,
   type Connection,
   type OnConnect,
   BackgroundVariant,
@@ -19,13 +20,20 @@ import {
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 
+import VpcNode from './nodes/VpcNode';
+import SubnetNode from './nodes/SubnetNode';
+import SgNode from './nodes/SgNode';
 import S3Node from './nodes/S3Node';
 import DynamodbNode from './nodes/DynamodbNode';
 import ServiceNode from './nodes/ServiceNode';
 import { CATALOG, catalogNodeTypeMap, catalogDefaultData, catalogDefaultStyle, catalogZIndex, catalogByType, COLORS } from '../lib/catalog';
+import { withContainment } from '../lib/containment';
 import { computeTypes, defaultPermissions, detectDefaultEdgeType, edgeStyle, edgeTypes } from '../lib/iam';
 
 const nodeTypes: NodeTypes = {
+  vpc: VpcNode,
+  subnet: SubnetNode,
+  sg: SgNode,
   s3: S3Node,
   dynamodb: DynamodbNode,
   // Every catalog service renders with the generic ServiceNode.
@@ -33,25 +41,39 @@ const nodeTypes: NodeTypes = {
 };
 
 const nodeTypeMap: Record<string, string> = {
+  VPC: 'vpc',
+  SUB: 'subnet',
+  SG: 'sg',
   S3: 's3',
   DDB: 'dynamodb',
   ...catalogNodeTypeMap,
 };
 
 const defaultDataForType: Record<string, Record<string, string>> = {
+  vpc: { label: 'new-vpc', resourceId: '', cidr: '10.0.0.0/16', status: 'draft' },
+  subnet: { label: 'new-subnet', resourceId: '', cidr: '10.0.1.0/24', status: 'draft' },
+  sg: { label: 'new-sg', groupId: '', vpcId: '', ingressRules: '', status: 'draft' },
   s3: { label: 'new-bucket', arn: '', status: 'draft' },
   dynamodb: { label: 'new-table', hashKey: 'id', billingMode: 'PAY_PER_REQUEST', arn: '', status: 'draft' },
   ...catalogDefaultData,
 };
 
 const defaultStyleForType: Record<string, React.CSSProperties> = {
+  vpc: { width: 560, height: 380 },
+  subnet: { width: 520, height: 280 },
+  sg: { width: 200 },
   s3: { width: 200 },
   dynamodb: { width: 200 },
   ...catalogDefaultStyle,
 };
 
 
+// Containers layer under their contents: containment is spatial + z-index,
+// never ReactFlow parent-child (elevateNodesOnSelect stays false).
 const zIndexForType: Record<string, number> = {
+  vpc: 0,
+  subnet: 1,
+  sg: 2,
   s3: 2,
   dynamodb: 2,
   ...catalogZIndex,
@@ -346,12 +368,14 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
   }, [configUpdate, setNodes]);
 
   // --- Apply config panel edits to nodes ---
+  // Re-stamp containment after edits: renaming a VPC/Subnet must refresh the
+  // data.vpc/data.subnet labels stamped on everything drawn inside it.
   useEffect(() => {
     if (!nodeUpdates) return;
     const { nodeId, data } = nodeUpdates;
-    setNodes(nds => nds.map(n =>
+    setNodes(nds => withContainment(nds.map(n =>
       n.id === nodeId ? { ...n, data: { ...n.data, ...data } } : n
-    ));
+    )));
   }, [nodeUpdates, setNodes]);
 
   // --- Apply config panel edits to edges ---
@@ -435,7 +459,7 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
         const taken = new Set(nds.map((n) => (n.data as { label?: string })?.label));
         let label = base;
         for (let i = 2; taken.has(label); i++) label = `${base}-${i}`;
-        return [
+        return withContainment([
           ...nds,
           {
             id: nextId(type),
@@ -445,14 +469,14 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
             data: { ...defaultDataForType[type], label },
             style: { ...defaultStyleForType[type] },
           },
-        ];
+        ]);
       });
     },
     [setNodes, screenToFlowPosition],
   );
 
   const dblClickTypeRef = useRef(0);
-  const typeOrder = ['s3', 'sqs', 'dynamodb', 'rds'];
+  const typeOrder = ['s3', 'sqs', 'dynamodb', 'rds', 'vpc', 'subnet', 'sg'];
 
   const onPaneDoubleClick = useCallback(
     (event: React.MouseEvent) => {
@@ -468,7 +492,7 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
         const taken = new Set(nds.map((n) => (n.data as { label?: string })?.label));
         let label = base;
         for (let i = 2; taken.has(label); i++) label = `${base}-${i}`;
-        return [
+        return withContainment([
           ...nds,
           {
             id: nextId(type),
@@ -478,7 +502,7 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
             data: { ...defaultDataForType[type], label },
             style: { ...defaultStyleForType[type] },
           },
-        ];
+        ]);
       });
     },
     [setNodes, screenToFlowPosition],
@@ -542,7 +566,7 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
           parentId: undefined,
           extent: undefined,
         }));
-        setNodes((nds) => [...nds.map((n) => ({ ...n, selected: false })), ...pasted]);
+        setNodes((nds) => withContainment([...nds.map((n) => ({ ...n, selected: false })), ...pasted]));
         e.preventDefault();
         return;
       }
@@ -557,6 +581,35 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
     document.addEventListener('keydown', handler);
     return () => document.removeEventListener('keydown', handler);
   }, [setNodes, setEdges, fitView, undo, redo]);
+
+  // --- Spatial containment (owner rule: geometry compiles to infrastructure) ---
+  // Re-stamp data.vpc/data.subnet whenever geometry settles: drag-stop below,
+  // drop/double-click/paste at creation, and resize via the dimension changes
+  // NodeResizer reports through the standard node-change channel (which also
+  // covers the first post-render measure of freshly created nodes).
+  // withContainment returns the same array on no-op, so these never push
+  // spurious history entries. When stamps change on a selected node, re-fire
+  // selection so the ConfigPanel sees the fresh data (same pattern as the
+  // onStatusUpdate handler above).
+  const restampContainment = useCallback(() => {
+    setNodes((nds) => {
+      const updated = withContainment(nds);
+      if (updated !== nds) {
+        const sel = updated.filter((n) => n.selected);
+        if (sel.length > 0) queueMicrotask(() => onNodeSelect?.(sel));
+      }
+      return updated;
+    });
+  }, [setNodes, onNodeSelect]);
+
+  const handleNodesChange = useCallback((changes: NodeChange<Node>[]) => {
+    onNodesChange(changes);
+    if (changes.some((c) => c.type === 'dimensions')) restampContainment();
+  }, [onNodesChange, restampContainment]);
+
+  const handleNodeDragStop = useCallback(() => {
+    restampContainment();
+  }, [restampContainment]);
 
   const handleSelectionChange = useCallback(({ nodes: selNodes, edges: selEdges }: { nodes: Node[]; edges: Edge[] }) => {
     onNodeSelect?.(selNodes);
@@ -578,7 +631,8 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
       <ReactFlow
         nodes={nodes}
         edges={edges}
-        onNodesChange={onNodesChange}
+        onNodesChange={handleNodesChange}
+        onNodeDragStop={handleNodeDragStop}
         onEdgesChange={onEdgesChange}
         onConnect={onConnect}
         onEdgeClick={handleEdgeClick}
@@ -624,6 +678,9 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
         <MiniMap
           nodeColor={(node) => {
             const bespoke: Record<string, string> = {
+              vpc: 'rgba(170,85,255,0.4)',
+              subnet: 'rgba(0,187,255,0.4)',
+              sg: 'rgba(255,51,85,0.6)',
               s3: 'rgba(0,255,136,0.6)',
             };
             const t = node.type ?? '';

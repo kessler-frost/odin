@@ -15,7 +15,18 @@ _REF = re.compile(r"^\$\{\{\s*([\w-]+)\.([\w-]+)\s*\}\}$")
 
 # Canvas node type -> Stack kind. rds is a direct Postgres container; the rest
 # are AWS-shaped resources provisioned in per-env backing containers.
-_KIND = {"rds": "rds", "s3": "s3", "sqs": "sqs", "sns": "sns", "dynamodb": "dynamodb"}
+# vpc/subnet/sg are the V1 network containers: their containment-stamped
+# data.vpc/data.subnet fields flow through `_resource` like any other field.
+_KIND = {
+    "rds": "rds",
+    "s3": "s3",
+    "sqs": "sqs",
+    "sns": "sns",
+    "dynamodb": "dynamodb",
+    "vpc": "vpc",
+    "subnet": "subnet",
+    "sg": "sg",
+}
 
 
 def parse_ref(var: str, value: str) -> Ref | None:

@@ -75,13 +75,13 @@ def test_canvas_to_stack_maps_kinds_fields_refs():
                 "label": "uploads", "arn": "",
                 "env": {"DATABASE_URL": "${{db.DATABASE_URL}}", "STATIC": "v"},
             }},
-            {"type": "vpc", "data": {"label": "ignored"}},  # unknown kind dropped
+            {"type": "ec2", "data": {"label": "ignored"}},  # unknown kind dropped
         ],
         "edges": [],
     }
     stack = canvas_to_stack(canvas)
     ids = {r.id for r in stack.resources}
-    assert ids == {"db", "uploads"}  # vpc dropped
+    assert ids == {"db", "uploads"}  # ec2 dropped (a future slice, not V1)
 
     db = next(r for r in stack.resources if r.id == "db")
     assert db.kind == "rds" and db.fields["engine"].value == "postgres"
@@ -90,3 +90,33 @@ def test_canvas_to_stack_maps_kinds_fields_refs():
     assert bucket.kind == "s3"
     assert bucket.refs[0].target_id == "db" and bucket.refs[0].var == "DATABASE_URL"
     assert bucket.fields["env"].value == {"STATIC": "v"}  # ref lifted out of static env
+
+
+def test_vpc_subnet_sg_round_trip_with_containment_fields():
+    # V1c: the UI stamps data.vpc/data.subnet from spatial containment; the
+    # translator must carry them (and cidr/ingressRules) into ResourceDesired
+    # fields untouched — `_resource` copies every non-UI data key generically.
+    canvas = {
+        "nodes": [
+            {"id": "n1", "type": "vpc", "data": {"label": "net", "cidr": "10.9.0.0/16", "status": "draft"}},
+            {"id": "n2", "type": "subnet", "data": {"label": "web", "cidr": "10.9.1.0/24", "vpc": "net"}},
+            {"id": "n3", "type": "sg", "data": {"label": "web-sg", "vpc": "net", "subnet": "web",
+                                                 "ingressRules": "tcp:443:0.0.0.0/0"}},
+        ],
+        "edges": [],
+    }
+    stack = canvas_to_stack(canvas)
+    by_id = {r.id: r for r in stack.resources}
+    assert set(by_id) == {"net", "web", "web-sg"}
+
+    assert by_id["net"].kind == "vpc" and by_id["net"].fields["cidr"].value == "10.9.0.0/16"
+    assert "status" not in by_id["net"].fields  # UI-only field stays out
+
+    assert by_id["web"].kind == "subnet"
+    assert by_id["web"].fields["vpc"].value == "net"
+    assert by_id["web"].fields["cidr"].value == "10.9.1.0/24"
+
+    assert by_id["web-sg"].kind == "sg"
+    assert by_id["web-sg"].fields["vpc"].value == "net"
+    assert by_id["web-sg"].fields["subnet"].value == "web"
+    assert by_id["web-sg"].fields["ingressRules"].value == "tcp:443:0.0.0.0/0"

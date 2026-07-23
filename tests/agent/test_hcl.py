@@ -174,6 +174,136 @@ def test_generated_hcl_never_contains_local_endpoints_or_credentials():
         assert token not in main_tf, token
 
 
+def _fields(**kwargs: str) -> dict[str, FieldValue]:
+    return {k: FieldValue(value=v, provenance="user") for k, v in kwargs.items()}
+
+
+def test_vpc_alone_emits_aws_vpc_with_cidr():
+    stack = Stack(resources=(
+        ResourceDesired(id="net", kind="vpc", fields=_fields(cidr="10.9.0.0/16")),
+    ))
+    proj = generate_tf(stack)
+    assert 'resource "aws_vpc" "net"' in proj.files["main.tf"]
+    assert 'cidr_block = "10.9.0.0/16"' in proj.files["main.tf"]
+    assert proj.unsupported == []
+
+
+def test_vpc_cidr_defaults_when_field_absent():
+    main_tf = generate_tf(Stack(resources=(ResourceDesired(id="net", kind="vpc"),))).files["main.tf"]
+    assert 'cidr_block = "10.0.0.0/16"' in main_tf
+
+
+def test_subnet_references_its_containing_vpc_by_hcl_name():
+    # V1c containment: the UI stamps data.vpc with the containing VPC's LABEL
+    # (labels are Stack resource ids); the builder resolves it to the HCL name.
+    stack = Stack(resources=(
+        ResourceDesired(id="Net Prod!", kind="vpc"),  # sanitizes to net_prod_
+        ResourceDesired(id="web", kind="subnet", fields=_fields(vpc="Net Prod!", cidr="10.0.2.0/24")),
+    ))
+    main_tf = generate_tf(stack).files["main.tf"]
+    assert 'resource "aws_subnet" "web"' in main_tf
+    assert "vpc_id     = aws_vpc.net_prod_.id" in main_tf
+    assert 'cidr_block = "10.0.2.0/24"' in main_tf
+
+
+def test_two_pass_naming_survives_subnet_sorting_before_vpc():
+    # Regression guard for the single-pass bug: kinds sort alphabetically and
+    # "subnet" < "vpc", so a subnet's builder runs before the vpc is visited.
+    # With incremental (pass-interleaved) name assignment the vpc would have
+    # no HCL name yet and the reference would be lost — pass 1 must assign
+    # ALL names before pass 2 builds any block.
+    stack = Stack(resources=(
+        ResourceDesired(id="app", kind="subnet", fields=_fields(vpc="net")),
+        ResourceDesired(id="net", kind="vpc"),
+    ))
+    proj = generate_tf(stack)
+    assert "vpc_id     = aws_vpc.net.id" in proj.files["main.tf"]
+    assert proj.unsupported == []
+
+
+def test_subnet_without_containing_vpc_lands_in_unsupported():
+    proj = generate_tf(Stack(resources=(ResourceDesired(id="orphan", kind="subnet"),)))
+    assert proj.unsupported == [
+        "orphan (subnet): not contained inside a VPC on the canvas (drag it into a VPC box)"
+    ]
+    assert "aws_subnet" not in proj.files["main.tf"]
+
+
+def test_subnet_contained_in_a_non_vpc_resource_lands_in_unsupported():
+    stack = Stack(resources=(
+        ResourceDesired(id="uploads", kind="s3"),
+        ResourceDesired(id="web", kind="subnet", fields=_fields(vpc="uploads")),
+    ))
+    proj = generate_tf(stack)
+    assert proj.unsupported == [
+        "web (subnet): not contained inside a VPC on the canvas (drag it into a VPC box)"
+    ]
+
+
+def test_sg_with_two_ingress_rules_emits_both_blocks_plus_default_egress():
+    stack = Stack(resources=(
+        ResourceDesired(id="net", kind="vpc"),
+        ResourceDesired(id="web-sg", kind="sg",
+                        fields=_fields(vpc="net", ingressRules="tcp:443:0.0.0.0/0\ntcp:22:10.0.0.0/16")),
+    ))
+    main_tf = generate_tf(stack).files["main.tf"]
+    assert 'resource "aws_security_group" "web_sg"' in main_tf
+    assert "vpc_id = aws_vpc.net.id" in main_tf
+    assert "    from_port   = 443" in main_tf
+    assert "    from_port   = 22" in main_tf
+    assert '    cidr_blocks = ["10.0.0.0/16"]' in main_tf
+    # AWS seeds allow-all egress; the provider removes it unless the config
+    # states it — emitted explicitly so apply -> plan stays zero-drift.
+    assert '    protocol    = "-1"' in main_tf
+
+
+def test_sg_with_no_rules_emits_only_the_default_egress():
+    stack = Stack(resources=(
+        ResourceDesired(id="net", kind="vpc"),
+        ResourceDesired(id="quiet", kind="sg", fields=_fields(vpc="net")),
+    ))
+    main_tf = generate_tf(stack).files["main.tf"]
+    assert "ingress {" not in main_tf
+    assert "egress {" in main_tf
+
+
+def test_sg_outside_a_vpc_lands_in_unsupported():
+    proj = generate_tf(Stack(resources=(ResourceDesired(id="stray", kind="sg"),)))
+    assert proj.unsupported == [
+        "stray (sg): not contained inside a VPC on the canvas (drag it into a VPC box)"
+    ]
+
+
+def test_sg_with_malformed_ingress_rule_lands_in_unsupported():
+    stack = Stack(resources=(
+        ResourceDesired(id="net", kind="vpc"),
+        ResourceDesired(id="bad", kind="sg", fields=_fields(vpc="net", ingressRules="443 from anywhere")),
+    ))
+    proj = generate_tf(stack)
+    assert proj.unsupported == [
+        'bad (sg): invalid ingress rule — expected one "protocol:port:cidr" per line, e.g. tcp:443:0.0.0.0/0'
+    ]
+
+
+def test_tofu_fmt_accepts_vpc_subnet_sg_output(tmp_path):
+    tofu = shutil.which("tofu")
+    if tofu is None:
+        return  # skip cleanly -- no tofu on PATH in this environment
+    stack = Stack(resources=(
+        ResourceDesired(id="net", kind="vpc"),
+        ResourceDesired(id="web", kind="subnet", fields=_fields(vpc="net")),
+        ResourceDesired(id="web-sg", kind="sg",
+                        fields=_fields(vpc="net", ingressRules="tcp:443:0.0.0.0/0")),
+    ))
+    main_tf = tmp_path / "main.tf"
+    main_tf.write_text(generate_tf(stack).files["main.tf"])
+    result = subprocess.run(
+        [tofu, "fmt", "-check", "-diff", str(main_tf)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_tofu_fmt_check_accepts_generated_output(tmp_path):
     tofu = shutil.which("tofu")
     if tofu is None:

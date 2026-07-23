@@ -125,19 +125,63 @@ def _block(resource_type: str, name: str, attrs: dict[str, str], nested: str = "
     return f'resource "{resource_type}" "{name}" {{\n{body}\n}}'
 
 
-def _s3(res: ResourceDesired) -> tuple[str, dict[str, str], str]:
-    return "aws_s3_bucket", {"bucket": quote(res.id)}, ""
+# Cross-resource references passed to every builder: resource id -> (kind,
+# hcl_name). Fully populated BEFORE any builder runs (see generate_tf pass 1),
+# so a subnet/sg can name its containing vpc regardless of sort order.
+Refs = dict[str, tuple[str, str]]
+
+# A builder returns (attrs, nested) — or a plain string: the human reason this
+# specific resource can't be built (e.g. a subnet drawn outside any VPC),
+# routed into `unsupported` exactly like a kind with no builder at all.
+Built = tuple[dict[str, str], str] | str
+
+_NOT_IN_VPC = "not contained inside a VPC on the canvas (drag it into a VPC box)"
+
+# Every aws_security_group implicitly starts with AWS's seeded allow-all
+# egress rule, but the TF provider REMOVES it when the config omits an egress
+# block — emitting it explicitly keeps apply -> plan zero-drift against the
+# gateway's pre-seeded default egress (research §2a / MiniStack digest).
+_DEFAULT_EGRESS = (
+    "  egress {\n"
+    "    from_port   = 0\n"
+    "    to_port     = 0\n"
+    '    protocol    = "-1"\n'
+    '    cidr_blocks = ["0.0.0.0/0"]\n'
+    "  }"
+)
 
 
-def _sqs(res: ResourceDesired) -> tuple[str, dict[str, str], str]:
-    return "aws_sqs_queue", {"name": quote(res.id)}, ""
+def _vpc_ref(res: ResourceDesired, refs: Refs) -> str | None:
+    """`aws_vpc.<name>.id` for res's containment-stamped `vpc` field (the
+    containing VPC's canvas label == its Stack resource id), or None when the
+    field is missing or names something that isn't a vpc resource."""
+    kind, name = refs.get(_field(res, "vpc", ""), ("", ""))
+    return f"aws_vpc.{name}.id" if kind == "vpc" else None
 
 
-def _sns(res: ResourceDesired) -> tuple[str, dict[str, str], str]:
-    return "aws_sns_topic", {"name": quote(res.id)}, ""
+def _ingress_rules(res: ResourceDesired) -> list[tuple[str, str, str]] | None:
+    """Parse the SG node's `ingressRules` field: one rule per line, formatted
+    `protocol:port:cidr` (e.g. `tcp:443:0.0.0.0/0`). Returns (protocol, port,
+    cidr) triples, or None when any non-empty line doesn't fit the format."""
+    lines = [line.strip() for line in _field(res, "ingressRules", "").splitlines()]
+    parsed = [tuple(line.split(":")) for line in lines if line]
+    ok = all(len(p) == 3 and p[1].isdigit() for p in parsed)
+    return parsed if ok else None
 
 
-def _dynamodb(res: ResourceDesired) -> tuple[str, dict[str, str], str]:
+def _s3(res: ResourceDesired, refs: Refs) -> Built:
+    return {"bucket": quote(res.id)}, ""
+
+
+def _sqs(res: ResourceDesired, refs: Refs) -> Built:
+    return {"name": quote(res.id)}, ""
+
+
+def _sns(res: ResourceDesired, refs: Refs) -> Built:
+    return {"name": quote(res.id)}, ""
+
+
+def _dynamodb(res: ResourceDesired, refs: Refs) -> Built:
     hash_key = _field(res, "hashKey", "id")
     attrs = {
         "name": quote(res.id),
@@ -145,29 +189,99 @@ def _dynamodb(res: ResourceDesired) -> tuple[str, dict[str, str], str]:
         "hash_key": quote(hash_key),
     }
     nested = f'  attribute {{\n    name = {quote(hash_key)}\n    type = "S"\n  }}'
-    return "aws_dynamodb_table", attrs, nested
+    return attrs, nested
 
 
-_BUILDERS = {"s3": _s3, "sqs": _sqs, "sns": _sns, "dynamodb": _dynamodb}
+def _vpc(res: ResourceDesired, refs: Refs) -> Built:
+    return {"cidr_block": quote(_field(res, "cidr", "10.0.0.0/16"))}, ""
+
+
+def _subnet(res: ResourceDesired, refs: Refs) -> Built:
+    vpc_id = _vpc_ref(res, refs)
+    if vpc_id is None:
+        return _NOT_IN_VPC
+    return {"vpc_id": vpc_id, "cidr_block": quote(_field(res, "cidr", "10.0.1.0/24"))}, ""
+
+
+def _sg(res: ResourceDesired, refs: Refs) -> Built:
+    vpc_id = _vpc_ref(res, refs)
+    if vpc_id is None:
+        return _NOT_IN_VPC
+    rules = _ingress_rules(res)
+    if rules is None:
+        return 'invalid ingress rule — expected one "protocol:port:cidr" per line, e.g. tcp:443:0.0.0.0/0'
+    ingress = [
+        (
+            "  ingress {\n"
+            f"    from_port   = {port}\n"
+            f"    to_port     = {port}\n"
+            f"    protocol    = {quote(protocol)}\n"
+            f"    cidr_blocks = [{quote(cidr)}]\n"
+            "  }"
+        )
+        for protocol, port, cidr in rules
+    ]
+    return {"name": quote(res.id), "vpc_id": vpc_id}, "\n\n".join([*ingress, _DEFAULT_EGRESS])
+
+
+# kind -> terraform resource type; kept separate from _BUILDERS so pass 1 of
+# generate_tf can assign HCL names (scoped per resource type) without running
+# any builder.
+_TF_TYPES = {
+    "s3": "aws_s3_bucket",
+    "sqs": "aws_sqs_queue",
+    "sns": "aws_sns_topic",
+    "dynamodb": "aws_dynamodb_table",
+    "vpc": "aws_vpc",
+    "subnet": "aws_subnet",
+    "sg": "aws_security_group",
+}
+
+_BUILDERS = {
+    "s3": _s3,
+    "sqs": _sqs,
+    "sns": _sns,
+    "dynamodb": _dynamodb,
+    "vpc": _vpc,
+    "subnet": _subnet,
+    "sg": _sg,
+}
 
 
 def generate_tf(stack: Stack) -> TfProject:
     by_id = {r.id: r for r in stack.resources}
+    ordered = sorted(stack.resources, key=lambda r: (r.kind, r.id))
     used_names: dict[str, set[str]] = {}
     hcl_name_by_id: dict[str, str] = {}
+    refs: Refs = {}
     blocks: list[tuple[tuple[str, str], str]] = []
     unsupported: list[str] = []
 
-    for res in sorted(stack.resources, key=lambda r: (r.kind, r.id)):
-        builder = _BUILDERS.get(res.kind)
-        if builder is None:
+    # Pass 1 — assign every buildable resource its HCL name BEFORE any builder
+    # runs. "subnet" sorts before "vpc", yet aws_subnet.vpc_id must reference
+    # the vpc's name — a single interleaved pass would look it up too early.
+    for res in ordered:
+        if res.kind not in _BUILDERS:
             reason = _UNSUPPORTED_REASONS.get(res.kind, f"{res.kind} — not supported in Simulate v1")
             unsupported.append(f"{res.id} ({res.kind}): {reason}")
             continue
-        resource_type, attrs, nested = builder(res)
-        name = unique_name(sanitize_name(res.id), used_names.setdefault(resource_type, set()))
+        name = unique_name(sanitize_name(res.id), used_names.setdefault(_TF_TYPES[res.kind], set()))
         hcl_name_by_id[res.id] = name
-        blocks.append(((res.kind, res.id), _block(resource_type, name, attrs, nested)))
+        refs[res.id] = (res.kind, name)
+
+    # Pass 2 — build blocks with the name table complete. A builder may still
+    # opt out for THIS resource (returns the reason string) — e.g. a subnet
+    # not drawn inside any VPC — which lands in `unsupported`, never dropped.
+    for res in ordered:
+        if res.kind not in _BUILDERS:
+            continue
+        built = _BUILDERS[res.kind](res, refs)
+        if isinstance(built, str):
+            unsupported.append(f"{res.id} ({res.kind}): {built}")
+            continue
+        attrs, nested = built
+        block = _block(_TF_TYPES[res.kind], hcl_name_by_id[res.id], attrs, nested)
+        blocks.append(((res.kind, res.id), block))
 
     for edge in sorted(stack.edges, key=lambda e: (e.src, e.dst)):
         topic, queue = by_id.get(edge.src), by_id.get(edge.dst)

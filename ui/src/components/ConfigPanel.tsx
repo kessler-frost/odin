@@ -15,14 +15,47 @@ interface ConfigPanelProps {
 }
 
 const typeConfig: Record<string, { label: string; neonColor: string; neonBg: string }> = {
+  vpc: { label: 'VPC', neonColor: 'text-neon-purple', neonBg: 'bg-[rgba(170,85,255,0.1)] border-neon-purple' },
+  subnet: { label: 'Subnet', neonColor: 'text-neon-blue', neonBg: 'bg-[rgba(0,187,255,0.1)] border-neon-blue' },
+  sg: { label: 'Security Group', neonColor: 'text-neon-red', neonBg: 'bg-[rgba(255,51,85,0.1)] border-neon-red' },
   s3: { label: 'S3', neonColor: 'text-neon-green', neonBg: 'bg-[rgba(0,255,136,0.1)] border-neon-green' },
   dynamodb: { label: 'DynamoDB', neonColor: 'text-neon-cyan', neonBg: 'bg-[rgba(34,211,238,0.1)] border-neon-cyan' },
   ...catalogTypeConfig,
 };
 
-type FieldDef = { key: string; label: string; editable?: boolean; select?: string[] };
+type FieldDef = { key: string; label: string; editable?: boolean; select?: string[]; multiline?: boolean; placeholder?: string };
 
 const fieldsForType: Record<string, FieldDef[]> = {
+  // vpc/subnet/sg `vpc`/`subnet` fields are read-only containment stamps —
+  // authored by dragging on the canvas (lib/containment.ts), never typed here.
+  vpc: [
+    { key: 'label', label: 'Name', editable: true },
+    { key: 'cidr', label: 'CIDR Block', editable: true },
+    { key: 'resourceId', label: 'Resource ID' },
+    { key: 'status', label: 'Status' },
+    { key: 'error', label: 'Error' },
+  ],
+  subnet: [
+    { key: 'label', label: 'Name', editable: true },
+    { key: 'cidr', label: 'CIDR Block', editable: true },
+    { key: 'vpc', label: 'VPC (containment)' },
+    { key: 'resourceId', label: 'Resource ID' },
+    { key: 'status', label: 'Status' },
+    { key: 'error', label: 'Error' },
+  ],
+  sg: [
+    { key: 'label', label: 'Name', editable: true },
+    {
+      key: 'ingressRules', label: 'Ingress Rules (protocol:port:cidr, one per line)',
+      editable: true, multiline: true, placeholder: 'tcp:443:0.0.0.0/0',
+    },
+    { key: 'vpc', label: 'VPC (containment)' },
+    { key: 'subnet', label: 'Subnet (containment)' },
+    { key: 'groupId', label: 'Group ID' },
+    { key: 'vpcId', label: 'VPC ID' },
+    { key: 'status', label: 'Status' },
+    { key: 'error', label: 'Error' },
+  ],
   s3: [
     { key: 'label', label: 'Name', editable: true },
     { key: 'arn', label: 'ARN' },
@@ -71,6 +104,21 @@ function EditableField({ label, value, onChange, error }: { label: string; value
         className={`w-full py-1.5 px-2.5 bg-bg-primary border font-mono text-xs outline-none transition-colors duration-200 focus:ring-1 placeholder:text-text-muted/50 ${error ? 'border-neon-red text-neon-red focus:border-neon-red focus:ring-neon-red/30' : isRef ? 'border-neon-blue/50 text-neon-blue focus:border-neon-blue focus:ring-neon-blue/30' : 'border-border text-text-primary focus:border-neon-blue focus:ring-neon-blue/30'}`}
       />
       {error && <p className="mt-1 text-[10px] text-neon-red font-mono">{error}</p>}
+    </div>
+  );
+}
+
+function TextareaField({ label, value, placeholder, onChange }: { label: string; value: string; placeholder?: string; onChange: (v: string) => void }) {
+  return (
+    <div className="mb-2.5">
+      <label className="block text-[11px] text-text-secondary mb-1 font-mono">{label}</label>
+      <textarea
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        rows={3}
+        placeholder={placeholder}
+        className="w-full py-1.5 px-2.5 bg-bg-primary border border-border text-text-primary font-mono text-xs outline-none transition-colors duration-200 focus:border-neon-blue focus:ring-1 focus:ring-neon-blue/30 placeholder:text-text-muted/50 resize-y"
+      />
     </div>
   );
 }
@@ -404,6 +452,9 @@ export default function ConfigPanel({ nodes, selectedEdge, allLabels, onNodeUpda
 
           if (field.select) {
             return <SelectField key={field.key} label={field.label} value={value} options={field.select} onChange={(v) => updateField(field.key, v)} />;
+          }
+          if (field.multiline) {
+            return <TextareaField key={field.key} label={field.label} value={value} placeholder={field.placeholder} onChange={(v) => updateField(field.key, v)} />;
           }
           return field.editable
             ? <EditableField key={field.key} label={field.label} value={value} onChange={(v) => updateField(field.key, v)} error={field.key === 'label' && labelError ? 'Name already in use by another node' : undefined} />
