@@ -75,6 +75,14 @@ export function computeContainment(nodes: Node[]): Record<string, Containment> {
   return result;
 }
 
+// Does `pos` fall inside a VPC or Subnet's rect? Used to keep a direct
+// sidebar-drop INTO a container from being shoved back out by deCollide's
+// proximity nudge — the container's geometry is the same source of truth
+// computeContainment stamps from.
+export function isInsideContainer(pos: { x: number; y: number }, nodes: Node[]): boolean {
+  return nodes.some((n) => (n.type === 'vpc' || n.type === 'subnet') && containsPoint(rectOf(n), pos.x, pos.y));
+}
+
 // Stamp computeContainment's verdicts onto node data. Returns the SAME array
 // when nothing changed, so callers can setNodes unconditionally without
 // dirtying history/undo with no-op entries.

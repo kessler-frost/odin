@@ -29,7 +29,7 @@ import S3Node from './nodes/S3Node';
 import DynamodbNode from './nodes/DynamodbNode';
 import ServiceNode from './nodes/ServiceNode';
 import { CATALOG, catalogNodeTypeMap, catalogDefaultData, catalogDefaultStyle, catalogZIndex, catalogByType, COLORS } from '../lib/catalog';
-import { withContainment } from '../lib/containment';
+import { withContainment, isInsideContainer } from '../lib/containment';
 import { computeTypes, defaultPermissions, detectDefaultEdgeType, edgeStyle, edgeTypes } from '../lib/iam';
 
 const nodeTypes: NodeTypes = {
@@ -481,7 +481,10 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
           {
             id: nextId(type),
             type,
-            position: deCollide(position, nds),
+            // A drop point already inside a VPC/Subnet is a deliberate nesting
+            // gesture — deCollide's proximity shove would otherwise push the
+            // new node outside the container it was just dropped into.
+            position: isInsideContainer(position, nds) ? position : deCollide(position, nds),
             zIndex: zIndexForType[type] ?? 2,
             data: { ...defaultDataForType[type], label },
             style: { ...defaultStyleForType[type] },
@@ -514,7 +517,10 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
           {
             id: nextId(type),
             type,
-            position: deCollide(position, nds),
+            // A drop point already inside a VPC/Subnet is a deliberate nesting
+            // gesture — deCollide's proximity shove would otherwise push the
+            // new node outside the container it was just dropped into.
+            position: isInsideContainer(position, nds) ? position : deCollide(position, nds),
             zIndex: zIndexForType[type] ?? 2,
             data: { ...defaultDataForType[type], label },
             style: { ...defaultStyleForType[type] },
