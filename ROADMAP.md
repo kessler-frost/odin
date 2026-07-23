@@ -102,27 +102,37 @@ future decision against these points instead of re-deriving them:
     path is a known gap).
   - RDS stays off Terraform — the reconciler's real Postgres container, not
     a `tofu`-managed resource, until an RDS gateway model lands.
-  - Nebula: VPC/SG config compiles for real (single-host), but the mesh
-    daemon + lighthouse (needed to actually reach a VM's overlay IP across
-    machines) are built (`fabric/nebula.py`) and not yet wired up — folded
-    into multi-Mac support below rather than half-built now.
+  - Nebula: single-host mesh is REAL end-to-end — a real host lighthouse
+    process (`fabric/nebula.py::LighthouseManager`) and a real `nebula`
+    daemon inside every VPC-joined EC2 VM, the VPC's compiled SG firewall
+    baked into its config, proven by an actual overlay ping + a real
+    SG-rule-filtered connection (`tests/simulate/test_nebula_mesh_e2e.py`).
+    Cross-Mac reachability (a second machine's mesh) is still open — see M7.
 - **Recorded as UNSUPPORTED for now** (northstar directive 5's honesty rule):
   ALB/ELBv2, EKS, CloudFormation, autoscaling, and RDS-via-Terraform (rds
   nodes stay on the reconciler path until an RDS API model lands).
-- [x] **Nebula network layer (single-host).** Security groups and VPCs drawn
-  on the canvas compile to real Nebula network + firewall primitives
-  (`fabric/nebula.py::sg_rules_to_firewall`, `ensure_network`). The
-  multi-Mac half — running an actual mesh daemon + lighthouse so a VM's
-  overlay IP is reachable from another machine — is deferred; see M7 below.
+- [x] **Nebula network layer (single-host), fully activated.** Security
+  groups and VPCs drawn on the canvas compile to real Nebula network +
+  firewall primitives (`fabric/nebula.py::sg_rules_to_firewall`,
+  `ensure_network`) AND run for real: the host runs the env's lighthouse
+  process, every VPC-joined EC2 VM runs a real `nebula` daemon carrying the
+  compiled SG firewall, and `GET /mesh?env=` reports live lighthouse status.
+  Proven by a real overlay `ping` plus a real SG-rule-filtered TCP
+  connection (`tests/simulate/test_nebula_mesh_e2e.py`). The multi-Mac
+  half — a second machine joining the SAME mesh — is deferred; see M7 below.
 - [ ] **odin CLI as an agent control surface.** Lets a human's or an agent's
   (e.g. Claude Code) tooling drive the canvas and its configuration directly.
   Today's `odin` CLI only starts/stops/inspects the server process
   (`start`/`stop`/`status`/`clean`) — it doesn't yet drive the canvas itself.
 - [ ] **Packaging.** Bundle the external tools (colima, lima, uv, …) into one
   distributable.
-- [ ] **M7 (multi-Mac) — the fleet.** Start the self-hosted Nebula mesh
-  daemon + lighthouse (primitives exist, not activated), add multi-Mac
-  membership and cross-machine placement. Additive, no core change.
+- [ ] **M7 (multi-Mac) — the fleet.** The single-host half is DONE (see
+  above: a real lighthouse + real per-VM daemons + a real ping/SG-filter
+  proof, all on one Mac). What remains is genuinely cross-machine: a second
+  Mac's host joining the SAME env's mesh (today's lighthouse only binds
+  `0.0.0.0:4242` locally reachable via this Mac's own vzNAT bridge — a real
+  external/LAN-reachable underlay address plus multi-Mac membership and
+  cross-machine placement are still open). Additive, no core change.
 
 ## Deprecated 2026-07-22 (superseded by NORTHSTAR.md)
 
