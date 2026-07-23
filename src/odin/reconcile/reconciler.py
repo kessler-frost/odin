@@ -167,6 +167,12 @@ class Reconciler:
     def _kind_of(self, stack: Stack, rid: str) -> str | None:
         return next((r.kind for r in stack.resources if r.id == rid), None)
 
+    def _desired_subs(self, stack: Stack, sns_id: str) -> tuple[str, ...]:
+        """An sns→sqs canvas edge is a subscription: the queues this topic
+        must fan out to."""
+        return tuple(e.dst for e in stack.edges
+                     if e.src == sns_id and self._kind_of(stack, e.dst) == "sqs")
+
     def _creds(self, res: ResourceDesired) -> tuple[str, str]:
         user = res.fields["username"].value if "username" in res.fields else "app"
         pw = res.fields["password"].value if "password" in res.fields else "apppass123"
@@ -197,18 +203,32 @@ class Reconciler:
             if res.kind == "rds" and observed.phase in ("starting", "healthy"):
                 await self._observe_rds(res)
             elif res.kind in PROVISIONED and observed.phase in ("starting", "healthy"):
-                await self._observe_provisioned(res, observed.phase)
+                await self._observe_provisioned(stack, res, observed.phase)
 
-    async def _observe_provisioned(self, res: ResourceDesired, phase: str) -> None:
+    async def _observe_provisioned(self, stack: Stack, res: ResourceDesired, phase: str) -> None:
         """s3/sqs/sns/dynamodb: healthy once the resource exists in its backing;
         a healthy one whose backing lost it demotes to crashed (plan's existing
-        pending/crashed branch then re-provisions)."""
+        pending/crashed branch then re-provisions).
+
+        sns additionally re-diffs its subscriptions here: plan() NoOps any
+        healthy resource, so a live canvas edit that adds an sns→sqs edge to
+        an already-healthy topic can only take effect on this observe pass.
+        provision()'s sns branch is idempotent (create_topic returns the
+        existing ARN; duplicate subscribes are swallowed), so re-provisioning
+        just the missing queues is safe. Skipped when the topic doesn't
+        currently exist (`not ok`): plan's pending/crashed path owns that."""
         ok = await asyncio.to_thread(self._aws.exists, res.kind, res.id)
         if phase == "starting" and ok:
             facts = await asyncio.to_thread(self._aws.facts, res.kind, res.id)
             await self._emit(res.id, res.kind, "healthy", facts=facts)
         if phase == "healthy" and not ok:
             await self._emit(res.id, res.kind, "crashed")
+        if res.kind != "sns" or not ok:
+            return
+        actual = await asyncio.to_thread(self._aws.subscriptions, res.id)
+        missing = tuple(q for q in self._desired_subs(stack, res.id) if q not in actual)
+        if missing:
+            await asyncio.to_thread(self._aws.provision, "sns", res.id, missing)
 
     async def _observe_rds(self, res: ResourceDesired) -> None:
         cname = self._rds.container_name(res.id)
@@ -242,12 +262,7 @@ class Reconciler:
                 await asyncio.to_thread(self._rds.create_db, action.id, user, pw)
                 await self._emit(action.id, "rds", "starting")
             else:  # AWS-shaped resource in a shared backing (s3/sqs/sns/dynamodb)
-                # An sns→sqs canvas edge is a subscription: fan the topic out to
-                # those queues at provision time.
-                subs = tuple(
-                    e.dst for e in stack.edges
-                    if e.src == action.id and self._kind_of(stack, e.dst) == "sqs"
-                ) if action.service == "sns" else ()
+                subs = self._desired_subs(stack, action.id) if action.service == "sns" else ()
                 await asyncio.to_thread(self._aws.provision, action.service, action.id, subs)
                 await self._emit(action.id, action.service, "starting")
         elif isinstance(action, StopContainer):

@@ -346,6 +346,19 @@ class BackingAws:
         except (ClientError, BotoCoreError):  # BotoCoreError: backing just died mid-check
             return False
 
+    def subscriptions(self, topic: str) -> tuple[str, ...]:
+        """Queue names currently subscribed to `topic` (the raw-delivery SQS
+        subscriptions provision() creates), read back through
+        ListSubscriptionsByTopic -- so the reconciler can diff desired vs
+        actual on a live canvas edit without recreating the topic. Endpoint
+        is the queue ARN provision() subscribed with
+        (arn:aws:sqs:region:account:name), so the queue name is the ARN's
+        last colon-segment."""
+        sns = self.client("sns")
+        topic_arn = f"arn:aws:sns:{REGION}:{ACCOUNT}:{topic}"
+        subs = sns.list_subscriptions_by_topic(TopicArn=topic_arn)["Subscriptions"]
+        return tuple(s["Endpoint"].rsplit(":", 1)[-1] for s in subs if s["Protocol"] == "sqs")
+
     def deprovision(self, service: str, name: str) -> None:
         try:
             client = self.client(service)

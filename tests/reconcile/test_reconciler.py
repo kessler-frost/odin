@@ -72,12 +72,18 @@ class FakeRds:
 class FakeAws:
     def __init__(self):
         self.provisioned, self.gc_calls, self.ensured = [], [], []
+        self.subs: dict[str, tuple[str, ...]] = {}  # pre-seedable, like the real backing's state
 
     def ensure_backing(self, service):
         self.ensured.append(service)
 
     def provision(self, service, name, subscriptions=()):
         self.provisioned.append((service, name, subscriptions))
+        if service == "sns":  # a re-provision is observable as a subscription change
+            self.subs[name] = self.subs.get(name, ()) + tuple(subscriptions)
+
+    def subscriptions(self, topic):
+        return self.subs.get(topic, ())
 
     def exists(self, service, name):
         return True
@@ -402,3 +408,33 @@ async def test_no_stores_configured_does_not_crash_tick(tmp_path):
     recon = Reconciler(store, rt, rds, pg_ready=_yes, poll_interval=0)  # stores=None is the default
     await recon.tick()  # must not raise
     assert store.current_world().get("net") is None  # nothing to project without stores
+
+
+# --- live-edit sns subscriptions: plan() NoOps a healthy resource, so a new
+# sns→sqs edge on an ALREADY-healthy topic can only take effect on the
+# reconciler's per-tick observe pass (desired vs actual subscription diff). ----
+
+
+async def test_new_sns_edge_on_a_healthy_topic_provisions_the_missing_subscription(tmp_path):
+    rt, rds, aws = FakeRuntime(), FakeRds(), FakeAws()
+    store = SpecStore(tmp_path)
+    alerts = ResourceDesired(id="alerts", kind="sns")
+    jobs = ResourceDesired(id="jobs", kind="sqs")
+    store.apply(Stack(resources=(alerts, jobs)))  # no edge yet
+    recon = Reconciler(store, rt, rds, aws=aws, pg_ready=_yes, poll_interval=0)
+    await recon.tick()                            # provision both -> starting
+    await recon.tick()                            # observe -> healthy
+    assert store.current_world().get("alerts").phase == "healthy"
+    assert aws.subs.get("alerts", ()) == ()       # applied without edges: zero subscriptions
+
+    # The live edit: same nodes plus a new sns→sqs edge, applied while alerts
+    # is healthy in World (so plan() emits only a NoOp for it).
+    store.apply(Stack(resources=(alerts, jobs), edges=(Edge(src="alerts", dst="jobs"),)))
+    await recon.tick()
+
+    assert ("sns", "alerts", ("jobs",)) in aws.provisioned  # observe re-provisioned the gap
+    assert aws.subs["alerts"] == ("jobs",)
+    assert store.current_world().get("alerts").phase == "healthy"  # never left healthy
+
+    await recon.tick()                            # already subscribed: no re-provision spam
+    assert aws.provisioned.count(("sns", "alerts", ("jobs",))) == 1
