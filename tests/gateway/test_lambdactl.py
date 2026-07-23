@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import threading
 import time
 from pathlib import Path
@@ -270,6 +271,44 @@ def test_update_function_code_redeploys_and_updates_hash(sink, lambda_, stores):
     result = _wait_for(stores, sink, lambda_, "fn1", "LastUpdateStatus", "Successful", substrate)
     assert result["State"] == "Active"
     assert len(substrate.ensured) == 2  # once at create, once at this redeploy
+
+
+def test_concurrent_redeploys_do_not_corrupt_or_drop_each_others_fields(sink, lambda_, stores, tmp_path):
+    """Release finding #3 -- lambdactl's `_finish_deploy` (background) vs a
+    synchronous UpdateFunctionCode/UpdateFunctionConfiguration handler used
+    to `get()` the function record, mutate it directly, then `set()` it
+    back: a classic read-modify-write race. Many concurrent redeploys
+    against the SAME function must all land (none silently dropped by a
+    lost race), and the sidecar file must stay valid JSON throughout."""
+    substrate = FakeFunctionRuntime()
+    _create(stores, sink, lambda_, substrate)
+    _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
+
+    errors: list[Exception] = []
+
+    def redeploy_config(memory: int) -> None:
+        try:
+            req = sink.call(lambda: lambda_.update_function_configuration(FunctionName="fn1", MemorySize=memory))
+            response = _answer(stores, req, substrate)
+            assert response.status_code == 200
+        except Exception as exc:  # pragma: no cover - fails the test via errors list
+            errors.append(exc)
+
+    threads = [threading.Thread(target=redeploy_config, args=(128 * i,)) for i in range(1, 9)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors
+    # None of the 8 concurrent redeploys was silently overwritten by another
+    # -- each independently reached `_redeploy_response` and spawned its own
+    # `_finish_deploy` (the fake substrate's `ensure` is synchronous/fast
+    # here, so all 8 plus the initial create have already landed).
+    assert len(substrate.ensured) == 9
+    # The sidecar itself was never left mid-write/corrupted by the hammering.
+    sidecar = tmp_path / ENV / "gateway" / "lambdactl.json"
+    json.loads(sidecar.read_text())  # raises if truncated/invalid
 
 
 def test_update_function_configuration_changes_fields_without_touching_code(sink, lambda_, stores):

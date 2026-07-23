@@ -6,7 +6,7 @@ import stat
 import threading
 from pathlib import Path
 
-from odin.gateway.stores import JsonStore, SynthStores
+from odin.gateway.stores import NO_CHANGE, JsonStore, SynthStores
 
 
 def test_get_returns_default_when_absent(tmp_path: Path):
@@ -97,6 +97,70 @@ def test_concurrent_set_calls_do_not_raise_during_persist(tmp_path: Path):
         t.join()
 
     assert not errors
+
+
+def test_update_mutates_existing_value_atomically(tmp_path: Path):
+    store = JsonStore(tmp_path, "widgets")
+    store.set("default", "counter", {"n": 1})
+    result = store.update("default", "counter", lambda v: {"n": v["n"] + 1})
+    assert result == {"n": 2}
+    assert store.get("default", "counter") == {"n": 2}
+
+
+def test_update_passes_none_for_absent_key(tmp_path: Path):
+    store = JsonStore(tmp_path, "widgets")
+    seen = []
+
+    def mutator(current):
+        seen.append(current)
+        return {"created": True}
+
+    store.update("default", "missing", mutator)
+    assert seen == [None]
+    assert store.get("default", "missing") == {"created": True}
+
+
+def test_update_no_change_sentinel_skips_the_write(tmp_path: Path):
+    store = JsonStore(tmp_path, "widgets")
+    result = store.update("default", "missing", lambda v: NO_CHANGE)
+    assert result is NO_CHANGE
+    assert store.get("default", "missing") is None
+    path = tmp_path / "default" / "gateway" / "widgets.json"
+    assert not path.exists()  # NO_CHANGE never even triggers a persist
+
+
+def test_update_no_change_leaves_existing_value_untouched(tmp_path: Path):
+    store = JsonStore(tmp_path, "widgets")
+    store.set("default", "jobs", {"env": "prod"})
+    store.update("default", "jobs", lambda v: NO_CHANGE)
+    assert store.get("default", "jobs") == {"env": "prod"}
+
+
+def test_concurrent_updates_to_the_same_key_are_serialized_and_lossless(tmp_path: Path):
+    """Many threads incrementing the SAME counter via `update()` must never
+    lose an increment -- the read-modify-write is atomic under the env lock,
+    unlike a bare get()-then-set() pair racing across threads."""
+    store = JsonStore(tmp_path, "widgets")
+    store.set("default", "counter", {"n": 0})
+
+    def increment():
+        for _ in range(50):
+            store.update("default", "counter", lambda v: {"n": v["n"] + 1})
+
+    threads = [threading.Thread(target=increment) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert store.get("default", "counter") == {"n": 400}
+
+
+def test_different_envs_do_not_contend_on_the_same_lock(tmp_path: Path):
+    store = JsonStore(tmp_path, "widgets")
+    store.set("a", "jobs", "a-value")
+    store.set("b", "jobs", "b-value")
+    assert store._lock_for("a") is not store._lock_for("b")
 
 
 def test_synth_stores_are_independently_namespaced(tmp_path: Path):

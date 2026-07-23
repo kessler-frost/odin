@@ -11,6 +11,7 @@ only one that boots real Colima containers.
 """
 from __future__ import annotations
 
+import json
 import threading
 import time
 from pathlib import Path
@@ -282,6 +283,48 @@ def test_update_service_scales_up(sink, ecs, stores):
     _answer(stores, req, runtime)
     _wait_for_running_count(stores, sink, ecs, runtime, 3)
     assert len(runtime.ran) == 3
+
+
+def test_concurrent_sweeps_and_scale_up_do_not_corrupt_the_store(sink, ecs, stores, tmp_path):
+    """Release finding #3 -- `_update_task`'s old get()-then-set() pair, plus
+    `_sweep_tasks` iterating the store's flat dict while ANOTHER thread
+    mutates it (a service scale-up launching+updating several task
+    records), is exactly the "dictionary changed size during iteration"
+    class of bug. Many concurrent ListTasks calls (each sweeps) racing a
+    scale-up must never raise, and the sidecar must stay valid JSON."""
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(stores, sink, ecs, runtime, desiredCount=6)
+    _wait_for_running_count(stores, sink, ecs, runtime, 6)
+
+    errors: list[Exception] = []
+
+    def list_tasks_repeatedly() -> None:
+        try:
+            for _ in range(30):
+                req = sink.call(lambda: ecs.list_tasks(cluster="odin"))
+                _answer(stores, req, runtime)
+        except Exception as exc:  # pragma: no cover - fails the test via errors list
+            errors.append(exc)
+
+    def scale_up() -> None:
+        try:
+            req = sink.call(lambda: ecs.update_service(cluster="odin", service="app", desiredCount=10))
+            _answer(stores, req, runtime)
+        except Exception as exc:  # pragma: no cover - fails the test via errors list
+            errors.append(exc)
+
+    threads = [threading.Thread(target=list_tasks_repeatedly) for _ in range(4)] + [threading.Thread(target=scale_up)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors
+    _wait_for_running_count(stores, sink, ecs, runtime, 10)
+    sidecar = tmp_path / ENV / "gateway" / "ecsctl.json"
+    json.loads(sidecar.read_text())  # raises if truncated/invalid
 
 
 def test_update_service_scales_down_newest_task_first(sink, ecs, stores):

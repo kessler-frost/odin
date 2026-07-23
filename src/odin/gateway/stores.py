@@ -15,39 +15,88 @@ stale entry is simply orphaned (never wrong), not actively torn down.
 from __future__ import annotations
 
 import json
+import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from odin.util import atomic_write_text
 
+# A mutator passed to `JsonStore.update` returns this to mean "leave the
+# store untouched" (no write, no persist) -- the shape every "the record is
+# already gone, nothing to update" guard across the gateway model modules
+# needs, without conflating "no-op" with "set the key to None".
+NO_CHANGE = object()
+
 
 class JsonStore:
     """A flat `key -> value` dict, one JSON file per env, loaded lazily and
-    rewritten wholesale on every mutation."""
+    rewritten wholesale on every mutation.
+
+    Every env has its OWN `threading.Lock`, held for the full duration of
+    `get`/`set`/`delete`/`items`/`update` -- release finding #3: multiple
+    reconciler/gateway-model threads calling these concurrently for the SAME
+    env (e.g. a background boot-completion thread racing a synchronous
+    Terminate handler) could otherwise interleave a read with another
+    thread's write, or hand back a dict that changes size mid-`json.dumps`.
+    Different envs never contend (separate locks), matching the store's own
+    per-env file isolation.
+    """
 
     def __init__(self, root: Path, name: str) -> None:
         self._root = root
         self._name = name
         self._loaded: dict[str, dict[str, Any]] = {}
+        self._locks: dict[str, threading.Lock] = {}
+        self._locks_guard = threading.Lock()
 
     def get(self, env: str, key: str, default: Any = None) -> Any:
-        return self._data(env).get(key, default)
+        with self._lock_for(env):
+            return self._data(env).get(key, default)
 
     def set(self, env: str, key: str, value: Any) -> None:
-        self._data(env)[key] = value
-        self._persist(env)
+        with self._lock_for(env):
+            self._data(env)[key] = value
+            self._persist_locked(env)
 
     def delete(self, env: str, key: str) -> None:
-        self._data(env).pop(key, None)
-        self._persist(env)
+        with self._lock_for(env):
+            self._data(env).pop(key, None)
+            self._persist_locked(env)
 
     def items(self, env: str) -> dict[str, Any]:
         """A copy of the env's whole flat dict -- the "describe all" read the
         EC2-network model's list answers need, without callers reaching into
         `_data` directly."""
-        return dict(self._data(env))
+        with self._lock_for(env):
+            return dict(self._data(env))
+
+    def update(self, env: str, key: str, mutator: Callable[[Any], Any]) -> Any:
+        """Atomic read-modify-write: `mutator` receives the CURRENT value for
+        `key` (or `None` if absent) and returns either the new value to
+        store, or the `NO_CHANGE` sentinel to leave the store untouched.
+        The whole read + mutate + persist happens under the env's lock, so
+        no other `get`/`set`/`delete`/`items`/`update` for this env can
+        interleave with it -- the primitive every gateway-model
+        read-modify-write (an instance's state transition, a function's
+        redeploy bookkeeping, a task's status update) now funnels through
+        instead of a bare `get()` ... `set()` pair. Returns the new value,
+        or `NO_CHANGE` if nothing was written."""
+        with self._lock_for(env):
+            data = self._data(env)
+            new_value = mutator(data.get(key))
+            if new_value is NO_CHANGE:
+                return NO_CHANGE
+            data[key] = new_value
+            self._persist_locked(env)
+            return new_value
+
+    def _lock_for(self, env: str) -> threading.Lock:
+        with self._locks_guard:
+            return self._locks.setdefault(env, threading.Lock())
 
     def _data(self, env: str) -> dict[str, Any]:
+        # Caller must already hold `_lock_for(env)`.
         if env not in self._loaded:
             path = self._path(env)
             self._loaded[env] = json.loads(path.read_text()) if path.exists() else {}
@@ -56,12 +105,12 @@ class JsonStore:
     def _path(self, env: str) -> Path:
         return self._root / env / "gateway" / f"{self._name}.json"
 
-    def _persist(self, env: str) -> None:
-        # A snapshot (`dict(...)`) BEFORE `json.dumps`, not the live dict
-        # itself: a concurrent `set`/`delete` mutating the original mid-dump
-        # would otherwise risk "dictionary changed size during iteration".
-        # `mode=0o600`: this sidecar can carry another env's IAM/EC2 state,
-        # not just public catalog data -- never briefly world-readable.
+    def _persist_locked(self, env: str) -> None:
+        # Caller must already hold `_lock_for(env)` -- the snapshot copy is
+        # kept anyway (defensive, and it's what `atomic_write_text` needs a
+        # stable `text` for regardless of the lock). `mode=0o600`: this
+        # sidecar can carry another env's IAM/EC2 state, not just public
+        # catalog data -- never briefly world-readable.
         text = json.dumps(dict(self._data(env)))
         atomic_write_text(self._path(env), text, mode=0o600)
 

@@ -89,7 +89,7 @@ from starlette.responses import Response
 from odin.aws.backings import ACCOUNT, REGION
 from odin.compute.tasks import TaskRuntime
 from odin.gateway import errors
-from odin.gateway.stores import SynthStores
+from odin.gateway.stores import NO_CHANGE, SynthStores
 
 log = logging.getLogger("odin.gateway.ecsctl")
 
@@ -219,11 +219,14 @@ def _tasks_for_service(stores: SynthStores, env: str, cluster: str, service_name
 
 
 def _update_task(stores: SynthStores, env: str, cluster: str, task_id: str, **fields: object) -> None:
-    task = stores.ecsctl.get(env, _task_key(cluster, task_id))
-    if task is None:  # deleted (or never existed) while a background op was mid-flight
-        return
-    task.update(fields)
-    stores.ecsctl.set(env, _task_key(cluster, task_id), task)
+    def mutate(task: dict | None) -> dict | object:
+        if task is None:  # deleted (or never existed) while a background op was mid-flight
+            return NO_CHANGE
+        task = dict(task)
+        task.update(fields)
+        return task
+
+    stores.ecsctl.update(env, _task_key(cluster, task_id), mutate)
 
 
 def _resolve_taskdef_ref(stores: SynthStores, env: str, ref: str) -> dict | None:
@@ -516,6 +519,15 @@ def _spawn(target: Callable[..., None], *args: object) -> None:
 # independent `SynthStores` instances (every test reuses env="default"),
 # found the hard way when an unrelated test's never-released FakeTaskRuntime
 # block deadlocked every later test sharing that key.
+#
+# NOT superseded by `JsonStore`'s own per-env lock (release finding #3):
+# that lock only makes each INDIVIDUAL get/set/update call atomic (and
+# `_update_task` below now goes through it via `stores.ecsctl.update`) -- it
+# is released between calls, so it cannot serialize the WHOLE multi-step
+# reconcile-vs-delete section this lock covers, which spans several store
+# calls interleaved with REAL `docker stop`/`docker rm` calls via `runtime`.
+# The two locks protect different things at different granularities and
+# both stay.
 _service_locks: "weakref.WeakKeyDictionary[SynthStores, dict[tuple[str, str, str], threading.Lock]]" = weakref.WeakKeyDictionary()
 _service_locks_guard = threading.Lock()
 

@@ -90,7 +90,7 @@ from odin.compute.instances import InstanceVm, NebulaJoin, vm_name
 from odin.compute.models import INSTANCE_TYPES, get_instance_type
 from odin.gateway import errors
 from odin.gateway.models import ec2net
-from odin.gateway.stores import SynthStores
+from odin.gateway.stores import NO_CHANGE, SynthStores
 
 log = logging.getLogger("odin.gateway.ec2compute")
 
@@ -122,6 +122,16 @@ _INSTANCE_ATTRIBUTE_DEFAULTS = {
 # QUEUE_DELETE_GRACE_SECONDS in spirit, just longer -- a `tofu destroy`
 # poll cadence is coarser than SQS's).
 _TERMINATED_SWEEP_SECONDS = 60.0
+
+# Release finding #3 -- the resurrection race: RunInstances spawns
+# `_finish_boot` on a daemon thread that can still be mid-flight when a
+# TerminateInstances call for the SAME instance wins the race and completes
+# first. Once an instance has entered one of these states, NO later
+# completion (a slow boot finishing as "running", a stale Stop/Start
+# finishing as "stopped"/"running") may pull it back out -- `_update_instance`
+# below enforces this as an explicit allowed-transitions guard, not just
+# "last write wins".
+_TERMINAL_STATES = frozenset({"shutting-down", "terminated"})
 
 
 def _mint(prefix: str) -> str:
@@ -319,11 +329,20 @@ def _volume_xml(volume: dict) -> str:
 
 
 def _update_instance(stores: SynthStores, env: str, instance_id: str, **fields: object) -> None:
-    instance = stores.ec2compute.get(env, _key("instance", instance_id))
-    if instance is None:  # already terminated + swept -- nothing to update
-        return
-    instance.update(fields)
-    stores.ec2compute.set(env, _key("instance", instance_id), instance)
+    incoming_state = fields.get("state_name")
+
+    def mutate(instance: dict | None) -> dict | object:
+        if instance is None:  # already terminated + swept -- nothing to update
+            return NO_CHANGE
+        if instance["state_name"] in _TERMINAL_STATES and incoming_state not in (None, *_TERMINAL_STATES):
+            # A late boot/stop/start completion racing a terminate that
+            # already won -- see the module's "resurrection race" note above.
+            return NO_CHANGE
+        instance = dict(instance)
+        instance.update(fields)
+        return instance
+
+    stores.ec2compute.update(env, _key("instance", instance_id), mutate)
 
 
 def _finish_boot(

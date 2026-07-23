@@ -89,7 +89,7 @@ from starlette.responses import Response
 from odin.aws.backings import ACCOUNT, REGION
 from odin.compute.functions import DEFAULT_RUNTIME, FunctionRuntime
 from odin.gateway import errors
-from odin.gateway.stores import SynthStores
+from odin.gateway.stores import NO_CHANGE, SynthStores
 from odin.runtime.colima import ColimaRuntime
 
 log = logging.getLogger("odin.gateway.lambdactl")
@@ -197,11 +197,14 @@ def _get_function_response(fn: dict, stores: SynthStores, env: str) -> dict:
 
 
 def _update_function(stores: SynthStores, env: str, name: str, **fields: object) -> None:
-    fn = stores.lambdactl.get(env, _key(name))
-    if fn is None:  # deleted while the background thread was still running
-        return
-    fn.update(fields)
-    stores.lambdactl.set(env, _key(name), fn)
+    def mutate(fn: dict | None) -> dict | object:
+        if fn is None:  # deleted while the background thread was still running
+            return NO_CHANGE
+        fn = dict(fn)
+        fn.update(fields)
+        return fn
+
+    stores.lambdactl.update(env, _key(name), mutate)
 
 
 def _finish_deploy(
@@ -325,19 +328,30 @@ def _delete_function(resource: str, env: str, body: bytes, stores: SynthStores, 
 # --- UpdateFunctionCode / UpdateFunctionConfiguration ---------------------
 
 
-def _mark_redeploying(stores: SynthStores, env: str, name: str, fn: dict) -> None:
-    fn["last_modified"] = _now_iso()
-    fn["last_update_status"] = "InProgress"
-    fn["last_update_status_reason"] = None
-    fn["last_update_status_reason_code"] = None
-    fn["revision_id"] = str(uuid.uuid4())
-    stores.lambdactl.set(env, _key(name), fn)
+def _redeploy_fields(extra: dict[str, object]) -> dict[str, object]:
+    """The bookkeeping every redeploy (UpdateFunctionCode or
+    UpdateFunctionConfiguration) stamps on the function record, merged with
+    `extra`'s own field changes -- built as one dict so a caller can apply
+    the WHOLE thing inside a single `JsonStore.update()` mutator: one atomic
+    read-modify-write instead of a separate mutate-then-`set()` pair that
+    could interleave with `_finish_deploy`'s own `_update_function` call."""
+    return {
+        "last_modified": _now_iso(),
+        "last_update_status": "InProgress",
+        "last_update_status_reason": None,
+        "last_update_status_reason_code": None,
+        "revision_id": str(uuid.uuid4()),
+        **extra,
+    }
 
 
 def _redeploy_response(stores: SynthStores, env: str, name: str, fn: dict, code_dir: Path, substrate: FunctionRuntime) -> Response:
-    # Same "render before spawn" ordering CreateFunction documents above --
-    # `fn` is the live store object, so the response must be serialized
-    # before `_finish_deploy` can race ahead and mutate it on its own thread.
+    # `fn` is the fresh dict `JsonStore.update()` already returned (its own
+    # private copy, not aliased with the store's internal object -- see
+    # stores.py), so unlike CreateFunction's still-`set()`-aliased `fn`
+    # there's no shared-reference race to guard here; the render-before-spawn
+    # ORDER is kept anyway, for the same "the response reflects the state at
+    # the instant this call was made" reasoning.
     response = _json(200, _configuration_json(fn))
     _spawn(_finish_deploy, stores, env, name, fn["runtime"], fn["handler"], fn["environment"], code_dir, substrate)
     return response
@@ -353,10 +367,18 @@ def _update_function_code(resource: str, env: str, body: bytes, stores: SynthSto
         return _invalid_parameter("Only an inline ZipFile deployment package is supported (v1) -- S3Bucket/S3Key is not")
     zip_bytes = base64.b64decode(zip_b64)
     _zip_path(stores.root, env, resource).write_bytes(zip_bytes)
-    fn["code_size"] = len(zip_bytes)
-    fn["code_sha256"] = _sha256_b64(zip_bytes)
     code_dir = substrate.extract_code(env, resource, zip_bytes)
-    _mark_redeploying(stores, env, resource, fn)
+
+    def mutate(current: dict | None) -> dict | object:
+        if current is None:  # deleted concurrently between the get() above and now
+            return NO_CHANGE
+        updated = dict(current)
+        updated.update(_redeploy_fields({"code_size": len(zip_bytes), "code_sha256": _sha256_b64(zip_bytes)}))
+        return updated
+
+    fn = stores.lambdactl.update(env, _key(resource), mutate)
+    if fn is NO_CHANGE:
+        return _not_found(resource)
     return _redeploy_response(stores, env, resource, fn, code_dir, substrate)
 
 
@@ -365,20 +387,30 @@ def _update_function_configuration(resource: str, env: str, body: bytes, stores:
     if fn is None:
         return _not_found(resource)
     payload = _payload(body)
-    if "Role" in payload:
-        fn["role"] = payload["Role"]
-    if "Handler" in payload:
-        fn["handler"] = payload["Handler"]
-    if "Description" in payload:
-        fn["description"] = payload["Description"]
-    if "Timeout" in payload:
-        fn["timeout"] = int(payload["Timeout"])
-    if "MemorySize" in payload:
-        fn["memory_size"] = int(payload["MemorySize"])
-    if "Environment" in payload:
-        fn["environment"] = dict((payload.get("Environment") or {}).get("Variables") or {})
+
+    def mutate(current: dict | None) -> dict | object:
+        if current is None:  # deleted concurrently between the get() above and now
+            return NO_CHANGE
+        updated = dict(current)
+        if "Role" in payload:
+            updated["role"] = payload["Role"]
+        if "Handler" in payload:
+            updated["handler"] = payload["Handler"]
+        if "Description" in payload:
+            updated["description"] = payload["Description"]
+        if "Timeout" in payload:
+            updated["timeout"] = int(payload["Timeout"])
+        if "MemorySize" in payload:
+            updated["memory_size"] = int(payload["MemorySize"])
+        if "Environment" in payload:
+            updated["environment"] = dict((payload.get("Environment") or {}).get("Variables") or {})
+        updated.update(_redeploy_fields({}))
+        return updated
+
+    fn = stores.lambdactl.update(env, _key(resource), mutate)
+    if fn is NO_CHANGE:
+        return _not_found(resource)
     code_dir = substrate.code_dir(env, resource)  # config-only: same code, restarted container
-    _mark_redeploying(stores, env, resource, fn)
     return _redeploy_response(stores, env, resource, fn, code_dir, substrate)
 
 

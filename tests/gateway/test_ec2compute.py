@@ -12,6 +12,7 @@ V3d's integration test is the only one that boots anything real.
 """
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 
@@ -62,6 +63,22 @@ class FakeInstanceVm:
 
     def delete(self, name):
         self.deleted.append(name)
+
+
+class SlowBootInstanceVm(FakeInstanceVm):
+    """A `boot()` that blocks until `release` is set -- lets a test win a
+    Terminate race against a still-in-flight RunInstances boot completion
+    (release finding #3's "resurrection race")."""
+
+    def __init__(self, ip: str = "192.168.64.10") -> None:
+        super().__init__(ip=ip)
+        self.release = threading.Event()
+        self.boot_started = threading.Event()
+
+    def boot(self, name, vm_config, *, hostname, ssh_pubkey=None, user_data=None, nebula=None, timeout=300.0):
+        self.boot_started.set()
+        self.release.wait(timeout=5.0)
+        return super().boot(name, vm_config, hostname=hostname, ssh_pubkey=ssh_pubkey, user_data=user_data, nebula=nebula, timeout=timeout)
 
 
 def _parse(operation: str, response: Response, *, error: bool = False):
@@ -238,6 +255,30 @@ def test_terminate_transitions_then_sweeps_after_grace_window(sink, ec2, stores)
     late = ec2compute.pure_answer(action, resource, ENV, req.body, stores, time.monotonic() + 120.0, vm)
     parsed = _parse("DescribeInstances", late, error=True)
     assert parsed["Error"]["Code"] == "InvalidInstanceID.NotFound"
+
+
+def test_late_boot_completion_cannot_resurrect_a_terminated_instance(sink, ec2, stores):
+    """Release finding #3 -- the resurrection race: RunInstances's background
+    `_finish_boot` thread is still in flight when Terminate wins first. The
+    instance must stay `terminated` forever; a stale boot completion landing
+    afterward must never bounce it back to `running`."""
+    subnet_id = _subnet(stores, sink, ec2)
+    vm = SlowBootInstanceVm()
+    instance_id = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)["Instances"][0]["InstanceId"]
+    assert vm.boot_started.wait(timeout=2.0)  # the boot thread is genuinely mid-flight
+
+    term_req = sink.call(lambda: ec2.terminate_instances(InstanceIds=[instance_id]))
+    _answer(stores, term_req, vm)
+    _wait_for_state(stores, sink, ec2, instance_id, "terminated", vm)
+
+    vm.release.set()  # let the stale boot finish AFTER the terminate already won
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        req = sink.call(lambda: ec2.describe_instances(InstanceIds=[instance_id]))
+        parsed = _parse("DescribeInstances", _answer(stores, req, vm))
+        state = parsed["Reservations"][0]["Instances"][0]["State"]["Name"]
+        assert state == "terminated", f"resurrected to {state!r}"
+        time.sleep(0.02)
 
 
 def test_terminate_unknown_instance_is_not_found(sink, ec2, stores):
