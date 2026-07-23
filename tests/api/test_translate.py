@@ -81,5 +81,34 @@ def test_translate_route_uses_the_env_stack_and_returns_the_result_verbatim(tmp_
     with TestClient(app) as client:
         resp = client.post("/translate", params={"env": "default"})
     assert resp.status_code == 200
-    assert resp.json() == {"files": {"main.tf": "fake"}, "notes": ["hi"], "unsupported": [], "refined": True}
+    assert resp.json() == {
+        "files": {"main.tf": "fake"}, "notes": ["hi"], "unsupported": [], "refined": True, "binary_files": {},
+    }
     assert seen_stacks == [stack]
+
+
+def test_translate_with_a_graph_body_previews_the_unsaved_canvas_not_the_stored_stack(tmp_path, monkeypatch):
+    # Finding #1 (release sweep, fw2-ui): the stored Stack (last /apply) can
+    # lag behind what's actually drawn on the canvas. A CanvasGraph body lets
+    # the caller preview the CURRENT canvas -- same shape /apply-full takes --
+    # instead of whatever was last applied.
+    app = _app(tmp_path)
+    store: SpecStore = app.state.store
+    store.apply(Stack(env="default", resources=(ResourceDesired(id="uploads", kind="s3"),)))
+
+    seen_stacks = []
+
+    async def fake_translate(passed_stack, **kwargs):
+        seen_stacks.append(passed_stack)
+        return TranslateResult(files={"main.tf": "fake"}, notes=[], unsupported=[], refined=False)
+
+    monkeypatch.setattr("odin.server.translate_mod.translate", fake_translate)
+    graph = {
+        "nodes": [{"id": "n1", "type": "s3", "position": {"x": 0, "y": 0}, "data": {"label": "unsaved-bucket"}}],
+        "edges": [],
+    }
+    with TestClient(app) as client:
+        resp = client.post("/translate", params={"env": "default"}, json=graph)
+    assert resp.status_code == 200
+    assert len(seen_stacks) == 1
+    assert [r.id for r in seen_stacks[0].resources] == ["unsaved-bucket"]

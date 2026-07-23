@@ -16,11 +16,11 @@ export const defaultPermissions: Record<string, string[]> = {
 
 // Compute kinds act as IAM principals; permission edges run compute → resource.
 // The app-workload kinds (service/dep/batch/llm) are parked (see NORTHSTAR.md,
-// git tag app-layer-parked) — ec2/lambda are the AWS compute placeholders that
-// return per northstar directive 5. No compute node exists on the canvas yet,
-// so an edge from one of these to an IAM target has no principal to draw from
-// today; that's fine, the machinery is ready for when they land.
-export const computeTypes = new Set(['ec2', 'lambda']);
+// git tag app-layer-parked) — ec2/lambda/ecs are the AWS compute placeholders
+// that return per northstar directive 5, and all three are real, wired-up
+// nodes on the canvas today, so edges from any of them to an IAM target do
+// have a principal to draw from.
+export const computeTypes = new Set(['ec2', 'lambda', 'ecs']);
 
 // --- Edge type registry ---
 
