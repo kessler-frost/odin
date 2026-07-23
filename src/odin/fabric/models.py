@@ -125,11 +125,15 @@ class MeshState(BaseModel):
 
     `vpcs` / `security_groups` (task V1b): the canvas's VPCs and security
     groups projected onto the mesh -- see `fabric/nebula.py::_ec2net_networks`.
+    `lighthouse_running` (R3): whether the env's host lighthouse PROCESS is
+    up right now (`fabric/lighthouse.py::LighthouseManager.is_running`) --
+    distinct from `lighthouse_underlay` merely being recorded.
     """
     network: str
     base_cidr: str = "10.42.0.0/16"
     lighthouse_ip: str = "10.42.0.1"
     lighthouse_underlay: str | None = None
+    lighthouse_running: bool = False
     hosts: list[HostMembership] = []
     resources: list[MeshResource] = []
     vpcs: list[VpcNetwork] = []

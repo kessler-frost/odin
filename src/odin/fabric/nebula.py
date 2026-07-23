@@ -13,10 +13,20 @@ seam for deterministic tests), a `NebulaFabric` that is a verified drop-in for
 producer-side wiring (a host's overlay IP entering World facts) and cross-Mac
 World replication are M7 — see the spec §3.7; `resolve()` itself is unchanged
 because the overlay address rides in through the same World-facts channel.
+
+R3 (single-host mesh activation) added `LighthouseManager`: a REAL `nebula`
+lighthouse process now runs on the host per env, and
+`compute/instances.py::InstanceVm` installs + starts a REAL `nebula` daemon
+inside each VM with the compiled SG firewall — the single-host half of M7,
+proven by an actual overlay ping + a real SG-rule-filtered connection (see
+`tests/simulate/test_nebula_mesh_e2e.py`). Cross-Mac membership/placement is
+still the M7 remainder (ROADMAP.md).
 """
 from __future__ import annotations
 
 import json
+import logging
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,6 +48,8 @@ from odin.fabric.models import (
 )
 from odin.spec.models import World
 from odin.util import atomic_write_text
+
+log = logging.getLogger("odin.fabric.nebula")
 
 NEBULA_PORT = 4242
 
@@ -114,6 +126,14 @@ class NebulaManager:
             raise RuntimeError(f"nebula-cert sign failed: {proc.stderr.strip()}")
         return CertPaths(crt=host_crt, key=host_key, ca_crt=self._ca_crt)
 
+    def cert_paths(self, hostname: str) -> CertPaths:
+        """Pure path lookup for an ALREADY-signed host (no I/O, no mkdir) --
+        `sign_cert`'s own output paths, so a caller (`LighthouseManager`) can
+        check existence / build a config without re-signing or risking a
+        side-effecting read."""
+        hosts_dir = self._dir / "hosts"
+        return CertPaths(crt=hosts_dir / f"{hostname}.crt", key=hosts_dir / f"{hostname}.key", ca_crt=self._ca_crt)
+
     def revoke_cert(self, hostname: str) -> None:
         # NOTE: deletes the local cert only. A real nebula-cert CRL (so a drained
         # host stops being trusted before its cert expires) is an M7 item.
@@ -126,12 +146,20 @@ class NebulaManager:
         lighthouse_underlay: str,
         firewall: FirewallRules,
         is_lighthouse: bool = False,
+        pki: CertPaths | None = None,
     ) -> str:
+        """`pki=None` (the default, unchanged): the VM-side fixed paths a
+        node's own cloud-init writes its cert to (`/etc/nebula/...`). A REAL
+        `CertPaths` (R3: `LighthouseManager` passes its own
+        `NebulaManager.cert_paths("lighthouse")`) points at wherever the
+        cert ACTUALLY lives instead -- the host lighthouse process reads its
+        cert straight from `.odin/{env}/nebula/hosts/`, never `/etc/nebula`
+        (that path is only ever real inside a VM)."""
         config: dict = {
             "pki": {
-                "ca": "/etc/nebula/ca.crt",
-                "cert": "/etc/nebula/host.crt",
-                "key": "/etc/nebula/host.key",
+                "ca": str(pki.ca_crt) if pki else "/etc/nebula/ca.crt",
+                "cert": str(pki.crt) if pki else "/etc/nebula/host.crt",
+                "key": str(pki.key) if pki else "/etc/nebula/host.key",
             },
             "lighthouse": {"am_lighthouse": is_lighthouse},
             "listen": {"host": "0.0.0.0", "port": NEBULA_PORT},
@@ -206,6 +234,120 @@ def ensure_network(root: Path, env: str, lighthouse_underlay: str, runner=None) 
     return overlay
 
 
+class LighthouseManager:
+    """R3 (single-host mesh activation): supervises ONE real `nebula`
+    lighthouse PROCESS per env on the HOST -- the piece `ensure_network`'s
+    own docstring has always flagged as missing ("no lighthouse PROCESS ever
+    starts"). Plain-subprocess supervision: a `Popen` + a pidfile under
+    `.odin/{env}/nebula/lighthouse.pid`, started when the first VM joins an
+    env's mesh and stopped when the last one leaves --
+    `compute/instances.py::InstanceVm._activate_nebula` is the only
+    production caller (co-located with the VM-side activation it exists to
+    make truthful; `gateway/models/ec2compute.py::_finish_terminate` calls
+    `ensure_stopped` on the "last VM leaves" side -- both are guarded so a
+    fresh `tmp_path` in every unit test, which never has a pidfile, makes
+    every call here a true no-op without a real process or `sudo`).
+
+    macOS root requirement (verified empirically, not assumed): creating a
+    utun device needs root -- an unprivileged `nebula -config ...` exits
+    "operation not permitted" immediately. This therefore shells to `sudo -n
+    nebula ...` (non-interactive: fails fast and loud rather than hanging on
+    a password prompt nothing can answer from a background thread). One-time
+    host setup the operator runs themselves -- mirrors this same machine's
+    own pre-existing `/private/etc/sudoers.d/lima` entry for socket_vmnet,
+    same pattern, just for nebula (`kill` too, since stopping a root-owned
+    lighthouse by its exact pid also needs root):
+
+        echo "$(whoami) ALL=(root) NOPASSWD: $(which nebula), /bin/kill" | sudo tee /etc/sudoers.d/allfather-nebula
+
+    Without it, `ensure_started` logs a clear warning and returns False --
+    mesh activation is best-effort throughout (matching
+    `_activate_nebula`'s own "never fail the instance boot over this" rule).
+    """
+
+    def __init__(self, popen=None, runner=None) -> None:
+        self._popen = popen or subprocess.Popen
+        self._run = runner or _default_runner
+
+    def _pidfile(self, root: Path, env: str) -> Path:
+        return _nebula_dir(root, env) / "lighthouse.pid"
+
+    def _config_path(self, root: Path, env: str) -> Path:
+        return _nebula_dir(root, env) / "lighthouse-config.yml"
+
+    def _log_path(self, root: Path, env: str) -> Path:
+        return _nebula_dir(root, env) / "lighthouse.log"
+
+    def is_running(self, root: Path, env: str) -> bool:
+        """Read-only: no filesystem write (mirrors `mesh_state`'s own "a GET
+        must not mkdir" rule). Signal 0 checks liveness without signaling --
+        a root-owned lighthouse makes our own unprivileged process get
+        `PermissionError` for a LIVE pid (still running, just not ours to
+        signal) vs `ProcessLookupError` for a gone one; both are real
+        outcomes of the same check, not an error to swallow blindly."""
+        pidfile = self._pidfile(root, env)
+        if not pidfile.exists():
+            return False
+        text = pidfile.read_text().strip()
+        if not text.isdigit():
+            return False
+        try:
+            os.kill(int(text), 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def ensure_started(self, root: Path, env: str, underlay: str) -> bool:
+        """Idempotent no-op if already running. Never raises -- returns
+        False when the network isn't bootstrapped yet or `sudo`/`nebula`
+        aren't set up; the caller logs and moves on rather than failing an
+        otherwise-successful instance boot over mesh wiring."""
+        if self.is_running(root, env):
+            return True
+        manager = NebulaManager(_nebula_dir(root, env), runner=self._run)
+        cert = manager.cert_paths("lighthouse")
+        if not cert.crt.exists():
+            log.warning("no lighthouse cert for env %r yet (no VPC created?); lighthouse not started", env)
+            return False
+        overlay = manager.load_overlay()
+        lighthouse_ip = overlay.lighthouse_ip if overlay else MeshNetwork(network=env).lighthouse_ip
+        config_text = manager.generate_config(
+            lighthouse_ip=lighthouse_ip, lighthouse_underlay=underlay,
+            firewall=DEFAULT_FIREWALL, is_lighthouse=True, pki=cert,
+        )
+        config_path = self._config_path(root, env)
+        atomic_write_text(config_path, config_text)
+        log_path = self._log_path(root, env)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with log_path.open("ab") as handle:
+                proc = self._popen(
+                    ["sudo", "-n", "nebula", "-config", str(config_path)],
+                    stdout=handle, stderr=subprocess.STDOUT, start_new_session=True,
+                )
+        except OSError as exc:
+            log.warning("failed to spawn nebula lighthouse for env %r: %s", env, exc)
+            return False
+        atomic_write_text(self._pidfile(root, env), str(proc.pid))
+        log.info("started nebula lighthouse for env %r (pid %d, underlay %s)", env, proc.pid, underlay)
+        return True
+
+    def ensure_stopped(self, root: Path, env: str) -> None:
+        """Exact-pid only, read from THIS env's own pidfile -- never a
+        pattern/blanket kill (the same discipline `InstanceVm`'s VM teardown
+        uses for `limactl`)."""
+        pidfile = self._pidfile(root, env)
+        if not pidfile.exists():
+            return
+        pid = pidfile.read_text().strip()
+        if pid.isdigit():
+            self._run(["sudo", "-n", "kill", pid])
+            log.info("stopped nebula lighthouse for env %r (pid %s)", env, pid)
+        pidfile.unlink(missing_ok=True)
+
+
 def _ec2net_networks(root: Path, env: str) -> tuple[list[VpcNetwork], list[SgFirewall]]:
     """The EC2-network model's per-VPC networks + compiled SG firewalls (task
     V1b), read straight off the gateway's sidecar file
@@ -240,9 +382,17 @@ def mesh_state(root: Path, env: str, world: World | None = None) -> MeshState:
         for r in (world.resources if world else ())
     ]
     vpcs, security_groups = _ec2net_networks(root, env)
+    # Read-only (R3): LighthouseManager.is_running is a pidfile + signal-0
+    # liveness check, no filesystem write -- keeps this function's own
+    # "a GET must not mkdir" contract (test_mesh_state_read_has_no_
+    # filesystem_side_effect).
+    lighthouse_running = LighthouseManager().is_running(root, env)
     overlay = NebulaManager(_nebula_dir(root, env)).load_overlay()
     if overlay is None:
-        return MeshState(network=env, resources=resources, vpcs=vpcs, security_groups=security_groups)
+        return MeshState(
+            network=env, resources=resources, vpcs=vpcs, security_groups=security_groups,
+            lighthouse_running=lighthouse_running,
+        )
     hosts_subnet = overlay.subnets.get("hosts")
     hosts = [
         HostMembership(hostname=name, overlay_ip=ip, groups=["host"])
@@ -251,6 +401,7 @@ def mesh_state(root: Path, env: str, world: World | None = None) -> MeshState:
     return MeshState(
         network=overlay.network, base_cidr=overlay.base_cidr,
         lighthouse_ip=overlay.lighthouse_ip, lighthouse_underlay=overlay.lighthouse_underlay_ip,
+        lighthouse_running=lighthouse_running,
         hosts=hosts, resources=resources, vpcs=vpcs, security_groups=security_groups,
     )
 
