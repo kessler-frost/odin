@@ -6,11 +6,13 @@ from __future__ import annotations
 
 import asyncio
 import stat
+import time
 from pathlib import Path
 
 import pytest
 
 from odin.agent.hcl import TfProject
+from odin.simulate import runner as runner_mod
 from odin.simulate.runner import SimulateBusy, TfResult, TfRunner, TofuNotInstalled
 
 
@@ -38,6 +40,11 @@ _APPLY_OK_TWO_LINES = _INIT_OK + '\nif [ "$1" = "apply" ]; then echo "line one";
 _APPLY_FAILS = _INIT_OK + '\nif [ "$1" = "apply" ]; then echo "planning"; echo "boom: invalid resource"; exit 1; fi'
 
 _APPLY_SLOW = _INIT_OK + '\nif [ "$1" = "apply" ]; then echo "starting"; sleep 0.4; echo "done"; exit 0; fi'
+
+# A wedged apply (release finding #3): sleeps far longer than any test's own
+# short timeout, so a real kill -- not just the process finishing on its
+# own -- is what makes the test complete quickly.
+_APPLY_WEDGED = _INIT_OK + '\nif [ "$1" = "apply" ]; then echo "starting"; sleep 30; echo "should never print"; exit 0; fi'
 
 
 def _project() -> TfProject:
@@ -149,3 +156,49 @@ async def test_status_reflects_last_result_and_running_flag(tmp_path, monkeypatc
     # tail is always carried on the result (status can show recent output
     # even on success); only the WS terminal EVENT omits it for a clean run.
     assert status["last"] == {"ok": True, "exit_code": 0, "tail": ["line one", "line two"]}
+
+
+# --- release finding #3: a hard subprocess timeout -----------------------
+
+
+def test_default_tofu_timeout_reads_the_env_var(monkeypatch):
+    monkeypatch.setenv("ODIN_TOFU_TIMEOUT", "42")
+    assert runner_mod._default_tofu_timeout() == 42.0
+
+
+def test_default_tofu_timeout_falls_back_to_600_seconds(monkeypatch):
+    monkeypatch.delenv("ODIN_TOFU_TIMEOUT", raising=False)
+    assert runner_mod._default_tofu_timeout() == 600.0
+
+
+async def test_wedged_apply_is_killed_at_the_timeout_and_reported_failed(tmp_path, monkeypatch):
+    _write_fake_tofu(tmp_path, _APPLY_WEDGED)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    ws = RecordingWs()
+    runner = TfRunner(tmp_path, ws=ws, timeout=0.3)
+
+    start = time.monotonic()
+    result = await runner.apply("default", _project(), 4266, "ak", "sk")
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 5, "the process should have been killed, not left to sleep out its 30s"
+    assert result.ok is False
+    assert any("timed out" in line for line in result.tail)
+    terminal = next(m for m in ws.messages if m.get("phase") == "apply" and "status" in m)
+    assert terminal["status"] == "failed"
+    assert any("timed out" in line for line in terminal["tail"])
+    # the lock is released -- a wedged, killed run must not wedge the env forever
+    assert runner.status("default")["running"] is False
+
+
+async def test_a_fast_apply_is_unaffected_by_a_short_default_timeout(tmp_path, monkeypatch):
+    # sanity: the timeout wraps the WHOLE subprocess, not just idle time --
+    # a normal fast run under a generous timeout must behave exactly as before.
+    _write_fake_tofu(tmp_path, _APPLY_OK_TWO_LINES)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    runner = TfRunner(tmp_path, timeout=30)
+
+    result = await runner.apply("default", _project(), 4266, "ak", "sk")
+
+    assert result.ok is True
+    assert result.exit_code == 0

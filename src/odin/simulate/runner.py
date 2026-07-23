@@ -24,8 +24,10 @@ failure, enough to show what broke without duplicating the whole log.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import shutil
+import signal
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +44,14 @@ _TAIL_LINES = 20
 # hashicorp/aws once across every env's workspace (and across runs) --
 # the brief's "tofu init -input=false (cached provider)".
 PLUGIN_CACHE_DIR = Path.home() / ".cache" / "odin" / "tofu-plugin-cache"
+
+
+def _default_tofu_timeout() -> float:
+    """Release finding #3: a wedged apply has been observed running for
+    hours with nothing to stop it. `ODIN_TOFU_TIMEOUT` (seconds) overrides
+    the default for every phase (init/apply/destroy each get their own
+    budget, not one shared across the whole call)."""
+    return float(os.environ.get("ODIN_TOFU_TIMEOUT", "600"))
 
 
 class TofuNotInstalled(Exception):
@@ -92,9 +102,10 @@ class TfRunner:
     `ConnectionManager` (or anything with an async `broadcast(dict)`) --
     optional so unit tests can construct a runner with no event sink."""
 
-    def __init__(self, root: Path, ws=None) -> None:
+    def __init__(self, root: Path, ws=None, timeout: float | None = None) -> None:
         self._root = root
         self._ws = ws
+        self._timeout = timeout if timeout is not None else _default_tofu_timeout()
         self._locks: dict[str, asyncio.Lock] = {}
         self._last: dict[str, TfResult] = {}
 
@@ -154,16 +165,32 @@ class TfRunner:
     async def _run(
         self, tofu: str, args: tuple[str, ...], cwd: Path, env_vars: dict[str, str], env: str, phase: str,
     ) -> TfResult:
+        # `start_new_session=True` (release finding #3): tofu spawns its own
+        # provider-plugin child process, so a plain kill of tofu's own pid on
+        # timeout would still leave that child running. Killing the whole
+        # process GROUP (tofu is its leader) reaps both.
         proc = await asyncio.create_subprocess_exec(
             tofu, *args, cwd=cwd, env=env_vars,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,
         )
         tail: deque[str] = deque(maxlen=_TAIL_LINES)
-        async for raw_line in proc.stdout:
-            line = raw_line.decode(errors="replace").rstrip("\n")
-            tail.append(line)
-            await self._emit({"type": "tf", "env": env, "phase": phase, "line": line})
-        code = await proc.wait()
+
+        async def _drain() -> int:
+            async for raw_line in proc.stdout:
+                line = raw_line.decode(errors="replace").rstrip("\n")
+                tail.append(line)
+                await self._emit({"type": "tf", "env": env, "phase": phase, "line": line})
+            return await proc.wait()
+
+        try:
+            code = await asyncio.wait_for(_drain(), timeout=self._timeout)
+        except asyncio.TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            code = await proc.wait()
+            tail.append(f"tofu {phase} timed out after {self._timeout:.0f}s -- process killed")
+
         ok = code == 0
         payload = {"type": "tf", "env": env, "phase": phase, "status": "ok" if ok else "failed", "exit_code": code}
         if not ok:
