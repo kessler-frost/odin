@@ -12,8 +12,10 @@ in each block) so `tofu fmt -check` accepts it unmodified.
 """
 from __future__ import annotations
 
+import io
 import json
 import re
+import zipfile
 
 import hcl2
 from pydantic import BaseModel
@@ -50,6 +52,12 @@ class TfProject(BaseModel):
     model_config = {"frozen": True}
     files: dict[str, str] = {}
     unsupported: list[str] = []
+    # V4c: a lambda node's zip'd deployment package -- filename (relative to
+    # the tf workspace, e.g. "fn1.zip") -> raw bytes. NEVER text: `files`
+    # stays `dict[str, str]` on purpose (every other builder emits HCL, and
+    # `materialize()`/`resource_set()` both assume text there) -- a zip gets
+    # its OWN dict rather than smuggled through as a decode-on-write string.
+    binary_files: dict[str, bytes] = {}
 
 
 def quote(value: object) -> str:
@@ -316,6 +324,64 @@ def _ec2(res: ResourceDesired, refs: Refs) -> Built:
     return attrs, "\n\n".join(nested)
 
 
+# V4c: Lambda functions (real RIE containers, gateway/models/lambdactl.py).
+# odin materializes the zip itself, pre-tofu, into the workspace -- NOT a
+# `data archive_file` block -- and references it by filename +
+# filebase64sha256(), the simplest honest path per the brief (no dependency
+# on the TF archive provider, no extra apply-time step). The zip's single
+# entry filename + default handler both key off `runtime` (python vs
+# node's different module/file conventions); the zip pass below (generate_tf)
+# must derive the SAME entry filename this builder assumes.
+_LAMBDA_RUNTIME_ENTRY: dict[str, tuple[str, str]] = {
+    "python3.12": ("lambda_function.py", "lambda_function.lambda_handler"),
+    "python3.13": ("lambda_function.py", "lambda_function.lambda_handler"),
+    "nodejs20.x": ("index.js", "index.handler"),
+    "nodejs22.x": ("index.js", "index.handler"),
+}
+_DEFAULT_LAMBDA_RUNTIME = "python3.12"
+# The V4d integration test's own proof payload ("return event") IS this
+# default -- an empty code textarea still gets a real, working function.
+_DEFAULT_LAMBDA_CODE = "def lambda_handler(event, context):\n    return event\n"
+_BAD_ROLE_REF = "role names something that isn't an IAM Role on the canvas"
+
+
+def _lambda_entry(runtime: str) -> tuple[str, str]:
+    return _LAMBDA_RUNTIME_ENTRY.get(runtime, _LAMBDA_RUNTIME_ENTRY[_DEFAULT_LAMBDA_RUNTIME])
+
+
+def _lambda_role_key(lambda_id: str) -> str:
+    """A synthetic `refs` key (never a real canvas id -- see the module's
+    Refs type) for a lambda's AUTO-GENERATED execution role, reserved in
+    generate_tf's pass 1 so this builder can already reference its HCL name
+    before the companion `aws_iam_role` block itself is ever built."""
+    return f"__lambda_role__{lambda_id}"
+
+
+def _lambda(res: ResourceDesired, refs: Refs) -> Built:
+    role_label = _field(res, "role", "").strip()
+    if role_label:
+        kind, role_name = refs.get(role_label, ("", ""))
+        if kind != "iam_role":
+            return _BAD_ROLE_REF
+    else:
+        # No role drawn on the canvas: the DX magic -- draw a lambda, paste
+        # code, Apply -- an execution role is auto-generated (pass 1 below
+        # reserved its name; the companion pass after pass 2 builds it).
+        _, role_name = refs[_lambda_role_key(res.id)]
+    runtime = _field(res, "runtime", _DEFAULT_LAMBDA_RUNTIME)
+    _, own_name = refs[res.id]
+    zip_name = quote(f"{own_name}.zip")
+    attrs = {
+        "function_name": quote(res.id),
+        "role": f"aws_iam_role.{role_name}.arn",
+        "handler": quote(_field(res, "handler", _lambda_entry(runtime)[1])),
+        "runtime": quote(runtime),
+        "filename": zip_name,
+        "source_code_hash": f"filebase64sha256({zip_name})",
+    }
+    return attrs, ""
+
+
 # kind -> terraform resource type; kept separate from _BUILDERS so pass 1 of
 # generate_tf can assign HCL names (scoped per resource type) without running
 # any builder.
@@ -330,6 +396,7 @@ _TF_TYPES = {
     "iam_role": "aws_iam_role",
     "ecr": "aws_ecr_repository",
     "ec2": "aws_instance",
+    "lambda": "aws_lambda_function",
 }
 
 _BUILDERS = {
@@ -343,6 +410,7 @@ _BUILDERS = {
     "iam_role": _iam_role,
     "ecr": _ecr,
     "ec2": _ec2,
+    "lambda": _lambda,
 }
 
 
@@ -366,6 +434,15 @@ def generate_tf(stack: Stack) -> TfProject:
         name = unique_name(sanitize_name(res.id), used_names.setdefault(_TF_TYPES[res.kind], set()))
         hcl_name_by_id[res.id] = name
         refs[res.id] = (res.kind, name)
+        # V4c: a lambda with no explicit `role` field gets its companion
+        # auto-role's HCL name reserved HERE (same reasoning as the vpc-
+        # before-subnet ordering this pass already exists for) so `_lambda`'s
+        # builder, which runs in pass 2, can already reference it.
+        if res.kind == "lambda" and not _field(res, "role", "").strip():
+            role_name = unique_name(
+                sanitize_name(f"{res.id}_role"), used_names.setdefault("aws_iam_role", set()),
+            )
+            refs[_lambda_role_key(res.id)] = ("iam_role", role_name)
 
     # Pass 2 — build blocks with the name table complete. A builder may still
     # opt out for THIS resource (returns the reason string) — e.g. a subnet
@@ -438,6 +515,41 @@ def generate_tf(stack: Stack) -> TfProject:
         block = _block("aws_key_pair", name, attrs)
         blocks.append((("aws_key_pair", res.id), block))
 
+    # V4c: a lambda's AUTO-GENERATED execution role (no `role` field drawn)
+    # -- the companion `aws_iam_role` block for the name pass 1 reserved,
+    # using the SAME default Lambda trust policy `_iam_role`'s own builder
+    # emits. One more one-canvas-node-to-two-tf-resources pass, same shape
+    # as sns_subscription/iam_role_policy/aws_key_pair above.
+    for res in ordered:
+        if res.kind != "lambda" or _field(res, "role", "").strip():
+            continue
+        key = _lambda_role_key(res.id)
+        if key not in refs:
+            continue
+        _, role_name = refs[key]
+        nested = f"  assume_role_policy = {_LAMBDA_TRUST_POLICY}"
+        block = _block("aws_iam_role", role_name, {"name": quote(f"{res.id}-role")}, nested)
+        blocks.append((("aws_iam_role", res.id), block))
+
     blocks.sort(key=lambda b: b[0])
     main_tf = "\n\n".join([HEADER, provider_block(), *(text for _, text in blocks)]) + "\n"
-    return TfProject(files={"main.tf": main_tf}, unsupported=unsupported)
+
+    # V4c: materialize each lambda's pasted code into the zip its own HCL
+    # block references by filename -- odin owns this pre-tofu, not a
+    # `data archive_file` round-trip (module docstring). The entry filename
+    # MUST match `_lambda_entry`'s choice for the SAME runtime, or the
+    # deployed zip and the `handler` string would disagree.
+    binary_files: dict[str, bytes] = {}
+    for res in ordered:
+        name = hcl_name_by_id.get(res.id)
+        if res.kind != "lambda" or name is None:
+            continue
+        runtime = _field(res, "runtime", _DEFAULT_LAMBDA_RUNTIME)
+        entry_filename, _ = _lambda_entry(runtime)
+        code = _field(res, "code", "") or _DEFAULT_LAMBDA_CODE
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(entry_filename, code)
+        binary_files[f"{name}.zip"] = buf.getvalue()
+
+    return TfProject(files={"main.tf": main_tf}, unsupported=unsupported, binary_files=binary_files)

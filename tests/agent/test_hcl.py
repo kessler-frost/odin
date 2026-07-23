@@ -1,8 +1,10 @@
 """S3a — deterministic canvas -> Terraform skeleton generator."""
 from __future__ import annotations
 
+import io
 import shutil
 import subprocess
+import zipfile
 
 from odin.agent.hcl import generate_tf
 from odin.spec.models import FieldValue, ResourceDesired, Stack
@@ -476,6 +478,107 @@ def test_tofu_fmt_accepts_ec2_output(tmp_path):
             userData="#!/bin/bash\necho hi\n", instanceType="t3.small",
         ),
     ))
+    main_tf = tmp_path / "main.tf"
+    main_tf.write_text(generate_tf(stack).files["main.tf"])
+    result = subprocess.run(
+        [tofu, "fmt", "-check", "-diff", str(main_tf)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+# --- lambda (V4c) ----------------------------------------------------------
+
+
+def test_lambda_with_explicit_role_references_it_and_emits_no_companion_role():
+    stack = Stack(resources=(
+        ResourceDesired(id="lambda-exec", kind="iam_role"),
+        ResourceDesired(id="fn1", kind="lambda", fields=_fields(role="lambda-exec")),
+    ))
+    proj = generate_tf(stack)
+    main_tf = proj.files["main.tf"]
+    assert 'resource "aws_lambda_function" "fn1"' in main_tf
+    assert "role             = aws_iam_role.lambda_exec.arn" in main_tf
+    # Only ONE aws_iam_role block -- the explicit one, no auto-generated companion.
+    assert main_tf.count('resource "aws_iam_role"') == 1
+    assert proj.unsupported == []
+
+
+def test_lambda_without_role_field_auto_generates_a_companion_role():
+    stack = Stack(resources=(ResourceDesired(id="fn1", kind="lambda"),))
+    main_tf = generate_tf(stack).files["main.tf"]
+    assert 'resource "aws_iam_role" "fn1_role"' in main_tf
+    assert '  name = "fn1-role"' in main_tf
+    assert 'Service = "lambda.amazonaws.com"' in main_tf  # same default trust doc as _iam_role
+    assert "role             = aws_iam_role.fn1_role.arn" in main_tf
+
+
+def test_lambda_with_unknown_role_label_lands_in_unsupported():
+    stack = Stack(resources=(ResourceDesired(id="fn1", kind="lambda", fields=_fields(role="ghost")),))
+    proj = generate_tf(stack)
+    assert proj.unsupported == [
+        "fn1 (lambda): role names something that isn't an IAM Role on the canvas"
+    ]
+    assert "aws_lambda_function" not in proj.files["main.tf"]
+    # No orphan companion role for a lambda that DID name a (bad) role.
+    assert "aws_iam_role" not in proj.files["main.tf"]
+
+
+def test_lambda_defaults_runtime_and_handler_when_fields_absent():
+    stack = Stack(resources=(ResourceDesired(id="fn1", kind="lambda"),))
+    main_tf = generate_tf(stack).files["main.tf"]
+    assert 'runtime          = "python3.12"' in main_tf
+    assert 'handler          = "lambda_function.lambda_handler"' in main_tf
+
+
+def test_lambda_honors_explicit_runtime_and_handler():
+    stack = Stack(resources=(
+        ResourceDesired(id="fn1", kind="lambda", fields=_fields(runtime="nodejs20.x", handler="index.custom")),
+    ))
+    main_tf = generate_tf(stack).files["main.tf"]
+    assert 'runtime          = "nodejs20.x"' in main_tf
+    assert 'handler          = "index.custom"' in main_tf
+
+
+def test_lambda_filename_and_hash_reference_its_own_zip():
+    stack = Stack(resources=(ResourceDesired(id="fn1", kind="lambda"),))
+    main_tf = generate_tf(stack).files["main.tf"]
+    assert 'filename         = "fn1.zip"' in main_tf
+    assert "source_code_hash = filebase64sha256(\"fn1.zip\")" in main_tf
+
+
+def test_lambda_materializes_a_real_zip_with_the_pasted_code():
+    stack = Stack(resources=(
+        ResourceDesired(id="fn1", kind="lambda", fields=_fields(code="def lambda_handler(e, c):\n    return 42\n")),
+    ))
+    proj = generate_tf(stack)
+    assert set(proj.binary_files) == {"fn1.zip"}
+    with zipfile.ZipFile(io.BytesIO(proj.binary_files["fn1.zip"])) as archive:
+        assert archive.namelist() == ["lambda_function.py"]
+        assert archive.read("lambda_function.py").decode() == "def lambda_handler(e, c):\n    return 42\n"
+
+
+def test_lambda_with_no_code_field_defaults_to_the_echo_handler():
+    stack = Stack(resources=(ResourceDesired(id="fn1", kind="lambda"),))
+    proj = generate_tf(stack)
+    with zipfile.ZipFile(io.BytesIO(proj.binary_files["fn1.zip"])) as archive:
+        assert "return event" in archive.read("lambda_function.py").decode()
+
+
+def test_lambda_nodejs_runtime_zips_index_js():
+    stack = Stack(resources=(
+        ResourceDesired(id="fn1", kind="lambda", fields=_fields(runtime="nodejs20.x", code="exports.handler = (e) => e;")),
+    ))
+    proj = generate_tf(stack)
+    with zipfile.ZipFile(io.BytesIO(proj.binary_files["fn1.zip"])) as archive:
+        assert archive.namelist() == ["index.js"]
+
+
+def test_tofu_fmt_accepts_lambda_output(tmp_path):
+    tofu = shutil.which("tofu")
+    if tofu is None:
+        return  # skip cleanly -- no tofu on PATH in this environment
+    stack = Stack(resources=(ResourceDesired(id="fn1", kind="lambda"),))
     main_tf = tmp_path / "main.tf"
     main_tf.write_text(generate_tf(stack).files["main.tf"])
     result = subprocess.run(

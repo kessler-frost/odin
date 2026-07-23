@@ -62,3 +62,11 @@ def test_rematerializing_overwrites_main_tf_and_override_tf(tmp_path):
     workspace.materialize(tmp_path, "default", TfProject(files={"main.tf": "first"}))
     workspace.materialize(tmp_path, "default", TfProject(files={"main.tf": "second"}))
     assert (tmp_path / "default" / "tf" / "main.tf").read_text() == "second"
+
+
+def test_materialize_writes_binary_files_alongside_main_tf(tmp_path):
+    # V4c: a lambda node's zip'd deployment package -- odin materializes it
+    # itself, pre-tofu, into the same workspace `filename` references.
+    project = TfProject(files={"main.tf": "x"}, binary_files={"fn1.zip": b"PK\x03\x04fake-zip"})
+    workspace.materialize(tmp_path, "default", project)
+    assert (tmp_path / "default" / "tf" / "fn1.zip").read_bytes() == b"PK\x03\x04fake-zip"

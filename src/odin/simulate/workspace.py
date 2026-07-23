@@ -55,11 +55,15 @@ def tf_dir(root: Path, env: str) -> Path:
 
 
 def materialize(root: Path, env: str, project: TfProject) -> Path:
-    """Write `project.files` (main.tf) + the generated override.tf into the
+    """Write `project.files` (main.tf) + `project.binary_files` (V4c: a
+    lambda node's zip'd deployment package, referenced by `filename` from
+    its own aws_lambda_function block) + the generated override.tf into the
     env's TF workspace, creating it if needed. Returns the workspace dir."""
     workspace = tf_dir(root, env)
     workspace.mkdir(parents=True, exist_ok=True)
     for name, content in project.files.items():
         (workspace / name).write_text(content)
+    for name, content in project.binary_files.items():
+        (workspace / name).write_bytes(content)
     (workspace / "override.tf").write_text(OVERRIDE_TF)
     return workspace
