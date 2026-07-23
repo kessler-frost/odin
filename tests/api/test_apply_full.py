@@ -266,6 +266,28 @@ def test_refined_false_fallback_still_applies_the_skeleton(tmp_path, monkeypatch
     assert (tf_dir(tmp_path, "default") / "main.tf").read_text() == skeleton["main.tf"]
 
 
+LAMBDA_CANVAS = {"nodes": [{"type": "lambda", "data": {"label": "fn"}}], "edges": []}
+
+
+def test_apply_full_materializes_lambda_zip_from_translate_result(tmp_path, monkeypatch):
+    # Release finding #1 (BLOCKER): hcl.generate_tf's lambda zip used to be
+    # dropped between translate()'s TranslateResult and apply_full's TfProject
+    # reconstruction -- tofu then failed EVERY resource with `filebase64sha256:
+    # open fn.zip: no such file`. Proven here without spawning the real SDK.
+    _write_fake_tofu(tmp_path, _APPLY_OK)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    skeleton = generate_tf(canvas_to_stack(LAMBDA_CANVAS, env="default"))
+    assert skeleton.binary_files  # sanity: the lambda builder really zipped something
+    _patch_translate(monkeypatch, TranslateResult(files=skeleton.files, binary_files=skeleton.binary_files))
+    app = _app(tmp_path)
+    with TestClient(app) as client:
+        resp = client.post("/apply-full", json=LAMBDA_CANVAS)
+    assert resp.status_code == 200
+    assert resp.json()["tf"] == {"status": "ok", "exit_code": 0}
+    for name, content in skeleton.binary_files.items():
+        assert (tf_dir(tmp_path, "default") / name).read_bytes() == content
+
+
 def test_busy_guard_rejects_before_touching_anything(tmp_path, monkeypatch):
     calls = _patch_translate(monkeypatch, TranslateResult(files=_skeleton_files(), refined=True))
     rds = FakeRds()

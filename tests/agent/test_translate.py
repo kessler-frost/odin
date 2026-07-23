@@ -73,6 +73,11 @@ def _client_with(canned_args: dict | None = None, raises: Exception | None = Non
 
 _S3_STACK = Stack(resources=(ResourceDesired(id="uploads", kind="s3"),))
 _RDS_ONLY_STACK = Stack(resources=(ResourceDesired(id="db", kind="rds"),))
+# Release finding #1: a lambda's zip'd deployment package (TfProject.binary_files)
+# must survive translate()'s TranslateResult on every path -- the agent never
+# sees or touches it (only main.tf is in its prompt), so it must come back
+# verbatim from the skeleton every time.
+_LAMBDA_STACK = Stack(resources=(ResourceDesired(id="fn", kind="lambda"),))
 
 
 # --- validate_refinement (the guardrail) -------------------------------------
@@ -201,6 +206,24 @@ async def test_agent_calling_no_tool_falls_back_to_skeleton():
     assert "no refinement" in result.notes[0]
 
 
+async def test_binary_files_survive_sdk_failure_fallback():
+    fake = _client_with(raises=RuntimeError("boom"))
+    result = await translate(_LAMBDA_STACK, client_cls=fake)
+    assert result.refined is False
+    skeleton = generate_tf(_LAMBDA_STACK)
+    assert skeleton.binary_files  # sanity: the lambda builder really zipped something
+    assert result.binary_files == skeleton.binary_files
+
+
+async def test_binary_files_survive_a_rejected_refinement():
+    skeleton = generate_tf(_LAMBDA_STACK)
+    tampered = skeleton.files["main.tf"] + '\nresource "aws_sqs_queue" "extra" {\n  name = "extra"\n}\n'
+    fake = _client_with(canned_args={"files": [{"path": "main.tf", "content": tampered}], "notes": []})
+    result = await translate(_LAMBDA_STACK, client_cls=fake)
+    assert result.refined is False
+    assert result.binary_files == skeleton.binary_files
+
+
 async def test_agent_adding_a_resource_is_rejected_end_to_end():
     skeleton = generate_tf(_S3_STACK).files["main.tf"]
     tampered = skeleton + '\nresource "aws_sqs_queue" "extra" {\n  name = "extra"\n}\n'
@@ -209,6 +232,18 @@ async def test_agent_adding_a_resource_is_rejected_end_to_end():
     assert result.refined is False
     assert result.files == generate_tf(_S3_STACK).files
     assert any("refinement rejected" in n for n in result.notes)
+
+
+@pytest.mark.skipif(_NO_TOFU, reason="tofu not on PATH")
+async def test_binary_files_survive_a_successful_refinement():
+    skeleton = generate_tf(_LAMBDA_STACK)
+    main_tf = skeleton.files["main.tf"].replace(
+        'resource "aws_lambda_function"', '# the function\nresource "aws_lambda_function"',
+    )
+    fake = _client_with(canned_args={"files": [{"path": "main.tf", "content": main_tf}], "notes": ["comment"]})
+    result = await translate(_LAMBDA_STACK, client_cls=fake)
+    assert result.refined is True
+    assert result.binary_files == skeleton.binary_files
 
 
 @pytest.mark.skipif(_NO_TOFU, reason="tofu not on PATH")

@@ -187,11 +187,17 @@ def create_tf_router(store: SpecStore, runner: TfRunner, keystore: KeyStore, gat
         return runner.status(env)
 
     @router.post("/translate")
-    async def translate_route(env: str = ENV) -> dict:
+    async def translate_route(graph: CanvasGraph | None = None, env: str = ENV) -> dict:
         """S3b: the canvas -> TF review pass, for the UI to show before
         Apply runs it (`translate` is always best-effort; see its own
-        docstring for the fallback chain -- this route never fails)."""
-        stack = store.get_stack(env)
+        docstring for the fallback chain -- this route never fails).
+
+        `graph`, when given, is the CURRENT (unsaved) canvas -- the same
+        payload /apply-full takes -- so the preview matches what Apply would
+        actually run instead of lagging behind to the last-applied Stack.
+        Omitting it keeps the original API-compat behavior (the stored
+        Stack)."""
+        stack = canvas_to_stack(graph.model_dump(), env=env) if graph is not None else store.get_stack(env)
         result = await translate_mod.translate(stack)
         return result.model_dump()
 
@@ -304,7 +310,10 @@ def create_apply_full_router(
             # still exists.
             if resource_set(translated.files) or runner.status(env)["workspace_exists"]:
                 await reconciler.ensure_backings(stack)
-                project = TfProject(files=translated.files, unsupported=translated.unsupported)
+                project = TfProject(
+                    files=translated.files, unsupported=translated.unsupported,
+                    binary_files=translated.binary_files,
+                )
                 access_key, secret_key = keystore.issue(env, OPERATOR_NODE_ID)
                 try:
                     result = await runner.apply(env, project, gateway_port(), access_key, secret_key)

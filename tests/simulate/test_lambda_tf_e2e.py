@@ -49,6 +49,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from odin.agent import hcl
+from odin.agent import translate as translate_mod
 from odin.agent.hcl import TfProject
 from odin.compute.functions import container_name
 from odin.gateway.keys import OPERATOR_NODE_ID
@@ -229,3 +230,73 @@ def test_tf_apply_boots_a_real_rie_zero_drift_invoke_destroy(store_root, lambda_
     # `-v` flag matters for backings that DO use one, e.g. Postgres.)
     leftover = _docker("ps", "-aq", "--filter", "label=allfather=1", "--filter", f"name={ENV}")
     assert leftover.stdout.strip() == ""
+
+
+CANVAS_ENV = "lambda-tf-e2e-canvas"
+CANVAS_FUNCTION_NAME = "v4d-echo-canvas"
+CANVAS_LAMBDA = {
+    "nodes": [{"id": "n1", "type": "lambda", "data": {
+        "label": CANVAS_FUNCTION_NAME, "runtime": "python3.12", "code": ECHO_CODE,
+    }}],
+    "edges": [],
+}
+EMPTY_CANVAS = {"nodes": [], "edges": []}
+
+
+def test_apply_full_canvas_path_threads_binary_files_through_a_real_tofu_apply(store_root, lambda_cleanup, monkeypatch):
+    """Release finding #1 (BLOCKER), proven against the REAL canvas path --
+    unlike the flagship test above (hand-authored HCL), this one goes
+    through canvas -> Stack -> generate_tf -> translate -> /apply-full's
+    TfProject reconstruction -> a REAL tofu apply -> a REAL RIE container.
+    The SDK refinement pass itself is stubbed out here (cheap, and already
+    covered for the guardrail/validate_refinement shape by
+    tests/agent/test_translate.py's binary_files tests) -- this test's only
+    job is proving the zip survives translate()'s TranslateResult and
+    apply_full's TfProject reconstruction against a real apply, not a fake
+    tofu script."""
+    assert shutil.which("tofu"), "OpenTofu must be on PATH for this integration test"
+    assert shutil.which("docker"), "docker must be on PATH for this integration test"
+    lambda_cleanup.append(container_name(CANVAS_ENV, CANVAS_FUNCTION_NAME))
+
+    async def fake_translate(stack, **kwargs):
+        skeleton = hcl.generate_tf(stack)
+        return translate_mod.TranslateResult(
+            files=skeleton.files, unsupported=skeleton.unsupported, binary_files=skeleton.binary_files,
+        )
+    monkeypatch.setattr("odin.server.translate_mod.translate", fake_translate)
+
+    store = SpecStore(store_root)
+    app = create_app(store=store)
+    with TestClient(app) as client:
+        resp = client.post("/apply-full", json=CANVAS_LAMBDA, params={"env": CANVAS_ENV})
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["tf"] == {"status": "ok", "exit_code": 0}, body["tf"]
+
+        state = _lambdactl_state(store.root, CANVAS_ENV)
+        (fn,) = [v for k, v in state.items() if k.startswith("fn:")]
+        assert fn["function_name"] == CANVAS_FUNCTION_NAME
+        assert fn["state"] == "Active"
+
+        gateway_port = client.get("/health").json()["gateway"]["port"]
+        access_key, secret_key = app.state.gateway_keys.issue(CANVAS_ENV, OPERATOR_NODE_ID)
+        lambda_client = boto3.client(
+            "lambda", endpoint_url=f"http://127.0.0.1:{gateway_port}",
+            aws_access_key_id=access_key, aws_secret_access_key=secret_key, region_name="us-east-1",
+        )
+        payload_in = {"proof": "canvas-path"}
+        response = lambda_client.invoke(FunctionName=CANVAS_FUNCTION_NAME, Payload=json.dumps(payload_in).encode())
+        assert response.get("FunctionError") is None, response
+        assert json.loads(response["Payload"].read()) == payload_in
+
+        # Full teardown via the empty-canvas Apply path (the NORTHSTAR "no
+        # Destroy button" promise) -- proves the zip's presence doesn't
+        # orphan anything either.
+        resp = client.post("/apply-full", json=EMPTY_CANVAS, params={"env": CANVAS_ENV})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["tf"] == {"status": "ok", "exit_code": 0}
+
+    ps_after = _docker(
+        "ps", "-a", "--filter", f"name={container_name(CANVAS_ENV, CANVAS_FUNCTION_NAME)}", "--format", "{{.Names}}",
+    )
+    assert ps_after.stdout.strip() == "", f"lambda container survived teardown: {ps_after.stdout}"

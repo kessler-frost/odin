@@ -71,6 +71,10 @@ class TranslateResult(BaseModel):
     notes: list[str] = []
     unsupported: list[str] = []
     refined: bool = False
+    # V4c/release finding #1: a lambda node's zip'd deployment package. The
+    # agent never sees it (only main.tf is in its prompt) and can't refine
+    # it, so every return path below carries the skeleton's copy verbatim.
+    binary_files: dict[str, bytes] = {}
 
 
 def make_emit_tool(collector: list[dict]) -> SdkMcpTool:
@@ -142,7 +146,7 @@ async def _tofu_run(tofu: str, args: tuple[str, ...], cwd: Path, env: dict[str, 
 
 
 async def validate_refinement(
-    agent_files: dict[str, str], skeleton_files: dict[str, str],
+    agent_files: dict[str, str], skeleton_files: dict[str, str], binary_files: dict[str, bytes] | None = None,
 ) -> tuple[str | None, dict[str, str] | None]:
     """The guardrail — deterministic validation, never trust. Returns
     `(violation_reason, formatted_files)`; exactly one is None. A violation
@@ -152,6 +156,12 @@ async def validate_refinement(
     Order: the resource-SET equality check is pure Python and runs first, so
     an agent that added or removed a resource never pays for the two tofu
     subprocess calls that follow.
+
+    `binary_files` (release finding #1): the skeleton's zip'd lambda
+    deployment packages, verbatim -- the agent never sees or edits them, but
+    `tofu validate` still evaluates `filebase64sha256(...)` calls in a
+    lambda's main.tf, so the scratch dir needs the real bytes on disk or
+    validation fails with a spurious "no such file" for every lambda canvas.
     """
     if not agent_files:
         return "agent returned no files", None
@@ -173,6 +183,8 @@ async def validate_refinement(
         scratch = Path(tmp)
         for name, content in agent_files.items():
             (scratch / name).write_text(content)
+        for name, content in (binary_files or {}).items():
+            (scratch / name).write_bytes(content)
         code, out = await _tofu_run(tofu, ("fmt",), scratch)
         if code != 0:
             return f"tofu fmt failed: {_tail(out)}", None
@@ -194,22 +206,25 @@ async def translate(stack: Stack, client_cls: type = ClaudeSDKClient, timeout: f
     dispatch without spawning the Claude Code CLI."""
     skeleton = generate_tf(stack)
     if not hcl.resource_set(skeleton.files):
-        return TranslateResult(files=skeleton.files, unsupported=skeleton.unsupported)
+        return TranslateResult(files=skeleton.files, unsupported=skeleton.unsupported, binary_files=skeleton.binary_files)
 
     payload = await _refine(skeleton, stack, client_cls, timeout)
     if payload is None:
         return TranslateResult(
-            files=skeleton.files, unsupported=skeleton.unsupported,
+            files=skeleton.files, unsupported=skeleton.unsupported, binary_files=skeleton.binary_files,
             notes=["agent proposed no refinement -- using the deterministic skeleton"],
         )
 
     agent_files = {f["path"]: f["content"] for f in payload.get("files", [])}
     notes = list(payload.get("notes", []))
-    violation, formatted = await validate_refinement(agent_files, skeleton.files)
+    violation, formatted = await validate_refinement(agent_files, skeleton.files, skeleton.binary_files)
     if violation is not None:
         log.warning("translate guardrail rejected agent output for env %s: %s", stack.env, violation)
         return TranslateResult(
-            files=skeleton.files, unsupported=skeleton.unsupported,
+            files=skeleton.files, unsupported=skeleton.unsupported, binary_files=skeleton.binary_files,
             notes=[*notes, f"refinement rejected ({violation}) -- using the deterministic skeleton"],
         )
-    return TranslateResult(files=formatted, unsupported=skeleton.unsupported, notes=notes, refined=True)
+    return TranslateResult(
+        files=formatted, unsupported=skeleton.unsupported, binary_files=skeleton.binary_files,
+        notes=notes, refined=True,
+    )
