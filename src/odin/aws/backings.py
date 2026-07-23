@@ -18,6 +18,12 @@ import boto3
 from botocore.client import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
+
+class BackingUnavailable(RuntimeError):
+    """A backing container isn't publishing the expected port (gone, or a
+    gateway_port mismatch with its creator). Loud by default; best-effort
+    paths (deprovision) catch it explicitly."""
+
 from odin.gateway import DEFAULT_GATEWAY_PORT
 from odin.runtime.colima import CONTAINER_HOST, ContainerSpec
 
@@ -192,11 +198,11 @@ class BackingAws:
         port = self._rt.host_port(self._cname(d), self._listen_port(d))
         if not port:
             # Fail loud: a 0 here means the container publishes a DIFFERENT
-            # inside-port than this instance expects — for goaws that's a
-            # gateway_port mismatch (the container was created by a BackingAws
-            # with another resolved gateway port; construct this one with the
-            # same value, e.g. the app's /health gateway.port).
-            raise RuntimeError(
+            # inside-port than this instance expects (for goaws: a
+            # gateway_port mismatch with the container's creator — construct
+            # with the app's /health gateway.port) or no container at all.
+            # Typed so best-effort paths (deprovision) can swallow it.
+            raise BackingUnavailable(
                 f"{self._cname(d)} publishes no port {self._listen_port(d)} — "
                 f"gateway_port mismatch between this BackingAws and the container's creator?"
             )
@@ -258,8 +264,8 @@ class BackingAws:
             return False
 
     def deprovision(self, service: str, name: str) -> None:
-        client = self.client(service)
         try:
+            client = self.client(service)
             if service == "s3":
                 client.delete_bucket(Bucket=name)
             elif service == "sqs":
@@ -268,8 +274,8 @@ class BackingAws:
                 client.delete_table(TableName=name)
             elif service == "sns":
                 client.delete_topic(TopicArn=f"arn:aws:sns:{REGION}:{ACCOUNT}:{name}")
-        except (ClientError, BotoCoreError):
-            pass
+        except (ClientError, BotoCoreError, BackingUnavailable):
+            pass  # best-effort: the resource or its whole backing may already be gone
 
     def facts(self, service: str, name: str) -> dict:
         d = self._backing_for(service)
