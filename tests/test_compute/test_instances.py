@@ -93,7 +93,7 @@ def test_boot_yaml_has_shared_network():
     runner.responses["hostname -I"] = _Proc(0, "192.168.64.20")
     vm = InstanceVm(runner=runner)
     vm.boot(NAME, get_instance_type("t3.micro"), hostname="ec2-test")
-    assert runner.doc["networks"] == [{"lima": "shared"}]
+    assert runner.doc["networks"] == [{"vzNAT": True}]  # vzNAT, not socket_vmnet -- see lima_yaml.py
 
 
 def test_boot_temp_yaml_is_cleaned_up_after_start():

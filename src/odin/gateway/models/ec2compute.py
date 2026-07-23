@@ -242,6 +242,13 @@ def _instance_xml(instance: dict, tags: dict[str, str]) -> str:
         parts.append(f"<privateIpAddress>{instance['private_ip']}</privateIpAddress>")
     if instance.get("public_ip"):
         parts.append(f"<ipAddress>{instance['public_ip']}</ipAddress>")
+    # sourceDestCheck sits on the Instance shape ITSELF too (not just the
+    # separate DescribeInstanceAttribute call) -- found empirically (V3d):
+    # omitting it here let the Go SDK default it to `false` on create-time
+    # hydration while DescribeInstanceAttribute's own default answered
+    # `true`, a real drift on every plan. Keeping both in lockstep with
+    # `_INSTANCE_ATTRIBUTE_DEFAULTS["sourceDestCheck"]`.
+    parts.append(f"<sourceDestCheck>{_INSTANCE_ATTRIBUTE_DEFAULTS['sourceDestCheck']}</sourceDestCheck>")
     parts.append("<rootDeviceType>ebs</rootDeviceType><rootDeviceName>/dev/sda1</rootDeviceName>")
     volume = instance["root_volume"]
     parts.append(
@@ -542,7 +549,14 @@ def _describe_instance_attribute(params: dict[str, str], env: str, stores: Synth
     attribute = params.get("Attribute", "")
     if attribute == "userData":
         value = instance.get("user_data_b64", "")
-        return _response("DescribeInstanceAttribute", f"<instanceId>{instance_id}</instanceId><userData><value>{escape(value)}</value></userData>")
+        # An empty `<value></value>` (rather than omitting `<value>`
+        # entirely) reads back through the TF AWS provider's Go SDK as a
+        # DIFFERENT thing than "no user data" -- found empirically (V3d):
+        # it caused a real plan-time drift on every instance with no
+        # `user_data` set (the common case). Real AWS's own shape for
+        # "attribute not set" omits the child element outright.
+        inner = f"<value>{escape(value)}</value>" if value else ""
+        return _response("DescribeInstanceAttribute", f"<instanceId>{instance_id}</instanceId><userData>{inner}</userData>")
     value = _INSTANCE_ATTRIBUTE_DEFAULTS.get(attribute, "false")
     return _response(
         "DescribeInstanceAttribute",
