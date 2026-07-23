@@ -72,6 +72,22 @@
   box-shadow: 0 0 0 2px #00bbff, 0 0 14px 2px rgba(0, 187, 255, 0.55);
 }
 
+/* Every .react-flow__node wrapper is hardcoded pointer-events:all by the
+   library (`.react-flow__node.draggable` re-asserts the same value at equal
+   specificity, and wins the cascade tie since its stylesheet is injected
+   after this one) -- a box OUTSIDE VpcNode/SubnetNode's own render tree. So
+   a container's empty interior always intercepted clicks meant for
+   edges/nodes routed through its rect, no matter what pointer-events those
+   components set on their OWN inner markup one level below this wrapper.
+   !important is the deliberate, narrow tool here -- the tie can't be won by
+   specificity or source order against vendor CSS. VpcNode/SubnetNode
+   re-enable pointer-events on their own header/meta/resizer children so
+   drag/select/resize keep working. */
+.react-flow__node.react-flow__node-vpc,
+.react-flow__node.react-flow__node-subnet {
+  pointer-events: none !important;
+}
+
 .react-flow__edge-path {
   stroke: #4a4a60;
   stroke-width: 1.5;
