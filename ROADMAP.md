@@ -2,11 +2,11 @@
 
 Odin (repo: odin): a local-first AWS-compatible cloud. A drag-drop canvas
 where you design real AWS architectures; an agent (claude-agent-sdk)
-translates canvas ↔ Terraform/OpenTofu both ways; **Simulate** runs a real
-`tofu apply` against odin's own gateway, which fulfills the AWS API calls with
-local substitutes (RustFS for S3, etc.) at full API compatibility; IAM
-permissions drawn as edges are **enforced for real** by odin's own IAM engine;
-Nebula is the network layer.
+translates canvas ↔ Terraform/OpenTofu both ways; **Apply** — the one action
+button — runs a real `tofu apply` against odin's own gateway, which fulfills
+the AWS API calls with local substitutes (RustFS for S3, etc.) at full API
+compatibility; IAM permissions drawn as edges are **enforced for real** by
+odin's own gateway; Nebula is the network layer.
 
 ## North star — the source of truth
 
@@ -61,34 +61,68 @@ future decision against these points instead of re-deriving them:
   protocol-correct AccessDenied per service, STS identity, tag/attribute
   stores, and ~2ms added latency. Proven by real-container acceptance tests
   (edges grant; absence denies; foreign envs deny; a container crossed the
-  boundary via aws-cli).
-- [~] **Canvas↔Terraform translation + Apply-runs-tofu + TF import.** Runner
-  DONE: `tofu apply` through the gateway (operator principal) achieves
-  apply → zero-drift plan → destroy on s3/sqs/sns/subscription/dynamodb
-  against real substitutes. Deterministic canvas→TF generator DONE. In
-  flight: the agent-refined translation pass, TF import (HCL + live-state),
-  and wiring the single **Apply** button to the pipeline.
-- [ ] **Service coverage expansion** (sequence fixed by captured provider
-  surfaces — see `docs/superpowers/research/research-coverage.md`): the
-  gateway owns each service's model (MiniStack's record shapes adopted as
-  reference), bound to real substrates:
-  1. VPC / Subnet / Security Groups → Nebula (the AWS `IpPermissions` wire
-     shape is a direct match for `sg_rules_to_firewall`'s input)
+  boundary via aws-cli) — re-proven live for the 0.4.0 release (fine-grained
+  per-action allow/deny against a running gateway; see README's
+  [Edges are IAM](README.md#edges-are-iam)).
+- [x] **Canvas↔Terraform translation + Apply-runs-tofu + TF import.** DONE
+  2026-07-23 (S1–S5): `tofu apply` through the gateway (operator principal),
+  the single **Apply** button (apply → translate → tofu, one call), the
+  agent-refined translation pass with a deterministic fallback when the
+  refinement fails a portability guardrail, the live Terraform code panel
+  (previews the *current* unsaved canvas, not the last-applied one), and TF
+  import (`/import-tf`: HCL text or live-state → canvas nodes) are all live.
+  Terraform-owned resources' status is projected back into `/world` so every
+  node's badge reflects reality regardless of which path provisioned it.
+- [x] **Service coverage expansion.** DONE 2026-07-23 (V1–V5, sequence per
+  the captured provider surfaces in `docs/superpowers/research/
+  research-coverage.md`): the gateway owns each service's model, bound to a
+  real substrate —
+  1. VPC / Subnet / Security Groups → Nebula (`IpPermissions` compiles
+     directly to `sg_rules_to_firewall`'s input)
   2. IAM control-plane CRUD (roles/policies onto odin's policy store) + ECR
-     (CNCF `registry:2`, Apache-2.0 — real `docker push`)
-  3. EC2 as real Lima VMs (the flagship; the provider's pending→running
-     waiter absorbs VM boot)
-  4. Lambda (AWS RIE, Apache-2.0)
-  5. ECS (Colima containers; MiniStack's mini-reconciler semantics adopted)
+     (CNCF `registry:2`, Apache-2.0 — real `docker push` verified)
+  3. EC2 as real Lima VMs (the flagship; boot ~50–60s, the provider's
+     pending→running waiter absorbs it; zero-drift)
+  4. Lambda (real AWS RIE container, Apache-2.0; apply ~6s, invoke ~40ms)
+  5. ECS (real Colima containers; scale up/down re-applies cleanly)
+
+  **v1 limits, recorded rather than hidden** (northstar directive 5's honesty
+  rule):
+  - Lambda: inline code only, `$LATEST` only — no S3-deployed packages,
+    versions, or aliases.
+  - ECS: no `network_configuration` (awsvpc/Fargate-style ENIs — odin's tasks
+    are `launch_type = "EC2"` / `network_mode = "bridge"`, which need none);
+    a task that dies between API calls isn't auto-replaced until the next
+    Apply reconciles the service; a `tags` block on `aws_ecs_service` can
+    show as drift on a subsequent `tofu plan` (ECS service tags aren't
+    echoed back from the gateway yet — `TagResource`/`ListTagsForResource`
+    isn't modeled beyond extracting the `odin:node` label).
+  - SNS→SQS: adding a subscription edge to an *already-healthy* topic
+    doesn't retroactively re-provision it (fixed on create; the live-edit
+    path is a known gap).
+  - RDS stays off Terraform — the reconciler's real Postgres container, not
+    a `tofu`-managed resource, until an RDS gateway model lands.
+  - Nebula: VPC/SG config compiles for real (single-host), but the mesh
+    daemon + lighthouse (needed to actually reach a VM's overlay IP across
+    machines) are built (`fabric/nebula.py`) and not yet wired up — folded
+    into multi-Mac support below rather than half-built now.
 - **Recorded as UNSUPPORTED for now** (northstar directive 5's honesty rule):
   ALB/ELBv2, EKS, CloudFormation, autoscaling, and RDS-via-Terraform (rds
   nodes stay on the reconciler path until an RDS API model lands).
-- [ ] **Nebula network layer.** Security groups, VPCs, and firewalls drawn on
-  the canvas become real Nebula network primitives.
+- [x] **Nebula network layer (single-host).** Security groups and VPCs drawn
+  on the canvas compile to real Nebula network + firewall primitives
+  (`fabric/nebula.py::sg_rules_to_firewall`, `ensure_network`). The
+  multi-Mac half — running an actual mesh daemon + lighthouse so a VM's
+  overlay IP is reachable from another machine — is deferred; see M7 below.
 - [ ] **odin CLI as an agent control surface.** Lets a human's or an agent's
   (e.g. Claude Code) tooling drive the canvas and its configuration directly.
+  Today's `odin` CLI only starts/stops/inspects the server process
+  (`start`/`stop`/`status`/`clean`) — it doesn't yet drive the canvas itself.
 - [ ] **Packaging.** Bundle the external tools (colima, lima, uv, …) into one
   distributable.
+- [ ] **M7 (multi-Mac) — the fleet.** Start the self-hosted Nebula mesh
+  daemon + lighthouse (primitives exist, not activated), add multi-Mac
+  membership and cross-machine placement. Additive, no core change.
 
 ## Deprecated 2026-07-22 (superseded by NORTHSTAR.md)
 

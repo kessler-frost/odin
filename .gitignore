@@ -16,6 +16,7 @@ bun.lock
 .playwright-cli/
 .playwright/
 *.png
+!assets/*.png
 .odin-dev.log
 .odin.pid
 infra/
