@@ -23,7 +23,14 @@ export default function CodePanel({ env, onClose }: CodePanelProps) {
     let cancelled = false;
     setResult(null);
     setFailed(false);
-    fetch(`/translate?env=${encodeURIComponent(env)}`, { method: 'POST' })
+    // Send the CURRENT canvas (same payload App.tsx's handleApply sends to
+    // /apply-full) so the preview matches what Apply would actually run,
+    // not whichever Stack was last applied.
+    fetch('/canvas')
+      .then(r => r.json())
+      .then(canvas => fetch(`/translate?env=${encodeURIComponent(env)}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(canvas),
+      }))
       .then(r => (r.ok ? r.json() : Promise.reject(new Error(String(r.status)))))
       .then(d => { if (!cancelled) setResult(d); })
       .catch(() => { if (!cancelled) setFailed(true); });
