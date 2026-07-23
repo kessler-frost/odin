@@ -5,12 +5,11 @@ import Sidebar from './components/Sidebar';
 import Canvas from './components/Canvas';
 import ConfigPanel from './components/ConfigPanel';
 import BottomPanel from './components/BottomPanel';
+import CodePanel from './components/CodePanel';
 
 export type BottomState = 'default' | 'collapsed' | 'half';
 
 type Toast = { id: number; kind: 'success' | 'error' | 'info'; text: string };
-type Diff = Record<string, Record<string, unknown>>;
-type PreviewState = { open: boolean; loading: boolean; diff: Diff };
 
 // --- Toasts: surface the result of real-infra actions instead of swallowing them ---
 function Toasts({ toasts }: { toasts: Toast[] }) {
@@ -30,59 +29,6 @@ function Toasts({ toasts }: { toasts: Toast[] }) {
   );
 }
 
-// --- Preview: the AI's staged changeset, as a themed drawer (was a window.alert) ---
-function PreviewDrawer({ diff, onApply, onClose }: { diff: Diff; onApply: () => void; onClose: () => void }) {
-  useEffect(() => {
-    const h = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
-    window.addEventListener('keydown', h);
-    return () => window.removeEventListener('keydown', h);
-  }, [onClose]);
-  const entries = Object.entries(diff);
-  const empty = entries.length === 0;
-  return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60" onClick={onClose}>
-      <div onClick={e => e.stopPropagation()} className="w-[460px] max-h-[70vh] flex flex-col bg-bg-secondary border border-border-bright shadow-2xl">
-        <div className="px-4 py-3 border-b border-border flex items-center justify-between">
-          <div className="font-mono text-[11px] text-text-secondary uppercase tracking-[2px]">
-            Staged changes <span className="text-neon-blue">[AI]</span>
-          </div>
-          <button onClick={onClose} className="font-mono text-[10px] text-text-muted hover:text-text-primary cursor-pointer uppercase tracking-[1px]">esc ✕</button>
-        </div>
-        <div className="px-4 py-3 overflow-y-auto flex-1">
-          {empty ? (
-            <p className="text-text-muted font-mono text-xs py-8 text-center leading-relaxed">
-              No AI-proposed changes.<br />Apply will run the canvas as drawn.
-            </p>
-          ) : entries.map(([id, fields]) => (
-            <div key={id} className="mb-3">
-              <div className="font-mono text-xs text-text-primary mb-1 flex items-center gap-1.5">
-                <span className="w-1.5 h-1.5 rounded-full bg-neon-blue" />{id}
-              </div>
-              {Object.entries(fields).map(([k, v]) => (
-                <div key={k} className="font-mono text-[11px] pl-3.5 leading-relaxed">
-                  <span className="text-text-muted">{k}</span>
-                  <span className="text-text-muted"> = </span>
-                  <span className="text-neon-green">{String(v)}</span>
-                </div>
-              ))}
-            </div>
-          ))}
-        </div>
-        <div className="px-4 py-3 border-t border-border flex gap-2 justify-end">
-          <button onClick={onClose} className="font-mono text-xs py-1.5 px-3 border border-border-bright bg-bg-tertiary text-text-secondary cursor-pointer uppercase tracking-[1px] hover:text-text-primary transition-colors">
-            Dismiss
-          </button>
-          {!empty && (
-            <button onClick={onApply} className="font-mono text-xs py-1.5 px-3 border border-neon-green bg-bg-tertiary text-neon-green cursor-pointer uppercase tracking-[1px] hover:bg-[rgba(0,255,136,0.1)] transition-colors">
-              Apply changes
-            </button>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
 export default function App() {
   const [selectedNodes, setSelectedNodes] = useState<Node[]>([]);
   const [selectedEdges, setSelectedEdges] = useState<Edge[]>([]);
@@ -90,16 +36,18 @@ export default function App() {
   const [edgeUpdates, setEdgeUpdates] = useState<{ edgeId: string; data: Record<string, unknown> } | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [configOpen, setConfigOpen] = useState(true);
+  const [codeOpen, setCodeOpen] = useState(false);
   const [bottomState, setBottomState] = useState<BottomState>('default');
   const [wsConnected, setWsConnected] = useState(false);
-  const [env, setEnv] = useState('default');
+  const [env, setEnv] = useState(() => localStorage.getItem('odin-active-env') || 'default');
   const statusUpdateFnRef = useRef<((name: string, status: string, error?: string, facts?: Record<string, unknown>) => void) | null>(null);
   const [configUpdate, setConfigUpdate] = useState<{ nodeId: string; data: Record<string, any> } | null>(null);
-  const resetDraftsRef = useRef<(() => void) | null>(null);
-  const [clearLogSignal, setClearLogSignal] = useState(0);
+  const [nodeLabels, setNodeLabels] = useState<{ id: string; label?: string }[]>([]);
+
+  // The active env survives a reload so world rehydration lands on the right one.
+  useEffect(() => { localStorage.setItem('odin-active-env', env); }, [env]);
 
   const [toasts, setToasts] = useState<Toast[]>([]);
-  const [preview, setPreview] = useState<PreviewState>({ open: false, loading: false, diff: {} });
   const toastId = useRef(0);
 
   const pushToast = useCallback((kind: Toast['kind'], text: string) => {
@@ -122,53 +70,30 @@ export default function App() {
     return canvas;
   }, [pushToast]);
 
-  // Apply: send the canvas as desired state; the Reconciler runs it for real and
-  // streams live status back over the WebSocket (world_delta -> node phase).
+  // Apply: send the canvas as desired state; the Reconciler runs it for real,
+  // Terraform is generated + applied through the gateway, and live status
+  // (world_delta + tf lines) streams back over the WebSocket.
   const handleApply = useCallback(async () => {
     const canvas = await readCanvas();
     if (!canvas) return;
-    try {
-      const res = await fetch(`/apply?env=${encodeURIComponent(env)}`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(canvas),
-      });
-      if (!res.ok) throw new Error(String(res.status));
-      const body = await res.json();
-      pushToast('success', `Applied to ${body.env ?? env}`);
-      if (body.skipped?.length) pushToast('info', `Not runnable: ${body.skipped.join(', ')}`);
-    } catch {
-      pushToast('error', 'Apply failed — backend unreachable');
-    }
+    const res = await fetch(`/apply-full?env=${encodeURIComponent(env)}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(canvas),
+    }).catch(() => null);
+    if (!res) { pushToast('error', 'Apply failed — backend unreachable'); return; }
+    if (res.status === 409) { pushToast('info', `A Terraform run is already in progress for ${env} — try again shortly`); return; }
+    if (!res.ok) { pushToast('error', `Apply failed (HTTP ${res.status})`); return; }
+    const body = await res.json().catch(() => ({}));
+    const tf = body.tf;
+    // tf === null: nothing TF-supported on the canvas — a clean success.
+    if (!tf) pushToast('success', `Applied to ${body.env ?? env}`);
+    else if (tf.status === 'ok') pushToast('success', `Applied to ${body.env ?? env} — Terraform converged`);
+    else if (tf.status === 'failed') pushToast('error', `Applied to ${body.env ?? env}, but Terraform failed (exit ${tf.exit_code}) — see Events for output`);
+    else pushToast('info', `Applied to ${body.env ?? env} — Terraform skipped: ${tf.error}. Fix: ${tf.fix}`);
+    if (body.skipped?.length) pushToast('info', `Not runnable: ${body.skipped.join(', ')}`);
+    if (body.unsupported?.length) pushToast('info', `Not in Terraform: ${body.unsupported.join('; ')}`);
   }, [env, readCanvas, pushToast]);
 
   const handleValidateSelected = handleApply;
-
-  // Staged changeset: show what the AI would fill, in a drawer, before committing.
-  const handlePreview = useCallback(async () => {
-    const canvas = await readCanvas();
-    if (!canvas) return;
-    setPreview(p => ({ ...p, loading: true }));
-    try {
-      const res = await fetch(`/preview?env=${encodeURIComponent(env)}`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(canvas),
-      });
-      if (!res.ok) throw new Error(String(res.status));
-      const body = await res.json();
-      setPreview({ open: true, loading: false, diff: body.diff ?? {} });
-    } catch {
-      setPreview({ open: false, loading: false, diff: {} });
-      pushToast('error', 'Preview failed — could not reach the AI');
-    }
-  }, [env, readCanvas, pushToast]);
-
-  const handleDestroy = useCallback(async () => {
-    try {
-      const res = await fetch(`/destroy?env=${encodeURIComponent(env)}`, { method: 'POST' });
-      if (!res.ok) throw new Error(String(res.status));
-      pushToast('success', `Destroyed ${env}`);
-    } catch {
-      pushToast('error', 'Destroy failed — backend unreachable');
-    }
-  }, [env, pushToast]);
 
   const handleResourceStatus = useCallback((name: string, status: string, error?: string, facts?: Record<string, unknown>) => {
     statusUpdateFnRef.current?.(name, status, error, facts);
@@ -198,14 +123,14 @@ export default function App() {
       }}
     >
       {/* Row 1: TopBar */}
-      <div className="col-span-full"><TopBar wsConnected={wsConnected} env={env} onEnvChange={setEnv} onPreview={handlePreview} onApply={handleApply} onDestroy={handleDestroy} onReset={() => { resetDraftsRef.current?.(); setClearLogSignal(s => s + 1); }} /></div>
+      <div className="col-span-full"><TopBar wsConnected={wsConnected} env={env} onEnvChange={setEnv} onApply={handleApply} onViewCode={() => setCodeOpen(o => !o)} codeOpen={codeOpen} /></div>
 
       {/* Row 2: Sidebar + Canvas + Config */}
       <div className="overflow-hidden">
         <Sidebar onCollapse={() => setSidebarOpen(false)} />
       </div>
       <div className="relative overflow-hidden">
-        <Canvas onNodeSelect={setSelectedNodes} onEdgeSelect={setSelectedEdges} nodeUpdates={nodeUpdates} edgeUpdates={edgeUpdates} onStatusUpdate={statusUpdateFnRef} configUpdate={configUpdate} onResetDrafts={resetDraftsRef} />
+        <Canvas env={env} onNodeSelect={setSelectedNodes} onEdgeSelect={setSelectedEdges} onNodeLabelsChange={setNodeLabels} nodeUpdates={nodeUpdates} edgeUpdates={edgeUpdates} onStatusUpdate={statusUpdateFnRef} configUpdate={configUpdate} />
         {!sidebarOpen && (
           <button
             onClick={() => setSidebarOpen(true)}
@@ -224,6 +149,11 @@ export default function App() {
             Configuration
           </button>
         )}
+        {codeOpen && (
+          <div className="absolute top-0 right-0 bottom-0 z-20 w-[520px] max-w-[75%]">
+            <CodePanel env={env} onClose={() => setCodeOpen(false)} />
+          </div>
+        )}
         {bottomState === 'collapsed' && (
           <button
             onClick={cycleBottom}
@@ -238,6 +168,7 @@ export default function App() {
         <ConfigPanel
           nodes={selectedNodes}
           selectedEdge={selectedEdges.length === 1 ? selectedEdges[0] : null}
+          allLabels={nodeLabels}
           onNodeUpdate={handleNodeUpdate}
           onEdgeUpdate={handleEdgeUpdate}
           onCollapse={() => setConfigOpen(false)}
@@ -247,16 +178,9 @@ export default function App() {
 
       {/* Row 3: Bottom panel */}
       <div className="col-span-full overflow-hidden">
-        <BottomPanel bottomState={bottomState} activeEnv={env} onCycleBottom={cycleBottom} onWsStatusChange={setWsConnected} onResourceStatus={handleResourceStatus} onConfigUpdate={handleConfigUpdate} clearSignal={clearLogSignal} />
+        <BottomPanel bottomState={bottomState} activeEnv={env} onCycleBottom={cycleBottom} onWsStatusChange={setWsConnected} onResourceStatus={handleResourceStatus} onConfigUpdate={handleConfigUpdate} />
       </div>
 
-      {preview.open && (
-        <PreviewDrawer
-          diff={preview.diff}
-          onApply={() => { setPreview(p => ({ ...p, open: false })); handleApply(); }}
-          onClose={() => setPreview(p => ({ ...p, open: false }))}
-        />
-      )}
       <Toasts toasts={toasts} />
     </div>
   );

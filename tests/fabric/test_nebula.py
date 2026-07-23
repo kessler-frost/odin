@@ -4,10 +4,13 @@ Cert ops use an injected fake runner, so no nebula-cert binary is required.
 """
 from __future__ import annotations
 
+import json
+
 import pytest
+import yaml
 
 from odin.fabric.localhost import Unresolved
-from odin.fabric.models import FirewallRules, MeshNetwork
+from odin.fabric.models import FirewallRule, FirewallRules, MeshNetwork
 from odin.fabric.nebula import (
     DEFAULT_FIREWALL,
     NebulaFabric,
@@ -107,11 +110,69 @@ def test_overlay_save_load_roundtrip(tmp_path):
     assert mgr.load_overlay().subnets["hosts"].assignments == net.subnets["hosts"].assignments
 
 
+def test_overlay_save_crash_leaves_prior_overlay_intact(tmp_path, monkeypatch):
+    # Release finding #2: save_overlay is atomic -- a crash mid-write must
+    # not corrupt or drop the previously-saved overlay.
+    mgr = NebulaManager(tmp_path / "nebula", runner=FakeRunner())
+    original = MeshNetwork(network="prod")
+    original.allocate_host("mac-1")
+    mgr.save_overlay(original)
+
+    def boom(*a, **k):
+        raise OSError("simulated crash")
+
+    monkeypatch.setattr("odin.util.os.replace", boom)
+    replacement = MeshNetwork(network="prod")
+    replacement.allocate_host("mac-2")
+    with pytest.raises(OSError):
+        mgr.save_overlay(replacement)
+
+    reloaded = mgr.load_overlay()
+    assert reloaded.subnets["hosts"].assignments == original.subnets["hosts"].assignments
+
+
 def test_sg_rules_to_firewall_translates():
     rules = sg_rules_to_firewall([{"IpProtocol": "tcp", "FromPort": 6379, "ToPort": 6379,
                                    "IpRanges": [{"CidrIp": "10.0.0.0/8"}]}])
     assert isinstance(rules, FirewallRules)
     assert rules.inbound[0].port == "6379" and rules.inbound[0].cidr == "10.0.0.0/8"
+
+
+# --- V1b golden: the research's own example, byte-for-byte on the fields ---
+# "SG with tcp/443 from 10.0.0.0/16 + an SG-ref rule -> expected
+# FirewallRule list" -- the exact IpPermissions wire dicts the gateway's
+# EC2-network model stores/aggregates, and the exact compiled output.
+
+GOLDEN_PERMISSIONS = [
+    {"IpProtocol": "tcp", "FromPort": 443, "ToPort": 443, "IpRanges": [{"CidrIp": "10.0.0.0/16"}]},
+    {"IpProtocol": "tcp", "FromPort": 443, "ToPort": 443,
+     "UserIdGroupPairs": [{"GroupId": "sg-0123456789abcdef0"}]},
+]
+
+GOLDEN_FIREWALL = FirewallRules(
+    inbound=[
+        FirewallRule(port="443", proto="tcp", cidr="10.0.0.0/16"),
+        FirewallRule(port="443", proto="tcp", group="sg-0123456789abcdef0"),
+    ],
+    outbound=[FirewallRule(port="any", proto="any")],
+)
+
+
+def test_sg_rules_to_firewall_golden():
+    assert sg_rules_to_firewall(GOLDEN_PERMISSIONS) == GOLDEN_FIREWALL
+
+
+def test_compiled_firewall_round_trips_through_generate_config(tmp_path):
+    """REAL but dormant (V1): the compiled FirewallRules must be EXACTLY what
+    a Nebula node config consumes at V3 -- proven by feeding them through
+    generate_config itself and reading the YAML a nebula daemon would."""
+    mgr = NebulaManager(tmp_path / "nebula", runner=FakeRunner())
+    config = yaml.safe_load(mgr.generate_config("10.42.0.1", "127.0.0.1", GOLDEN_FIREWALL))
+    assert config["firewall"]["inbound"] == [
+        {"port": "443", "proto": "tcp", "cidr": "10.0.0.0/16"},
+        {"port": "443", "proto": "tcp", "group": "sg-0123456789abcdef0"},
+    ]
+    assert config["firewall"]["outbound"] == [{"port": "any", "proto": "any", "host": "any"}]
 
 
 def test_sg_rules_to_firewall_edge_cases():
@@ -148,6 +209,30 @@ def test_mesh_state_projects_world_resources(tmp_path):
     world = _world("healthy", {"endpoint": "10.42.1.7:5432"})
     state = mesh_state(tmp_path, "prod", world)
     assert [(r.id, r.phase, r.endpoint) for r in state.resources] == [("db", "healthy", "10.42.1.7:5432")]
+
+
+def test_mesh_state_projects_ec2net_vpcs_and_sg_firewalls(tmp_path):
+    """V1b: mesh_state reads the EC2-network model's sidecar file (the JSON
+    file is the fabric<->gateway boundary -- no gateway import here) and
+    projects per-VPC networks + compiled SG firewalls."""
+    gateway_dir = tmp_path / "prod" / "gateway"
+    gateway_dir.mkdir(parents=True)
+    firewall = sg_rules_to_firewall(GOLDEN_PERMISSIONS)
+    (gateway_dir / "ec2net.json").write_text(json.dumps({
+        "vpc:vpc-1": {"vpc_id": "vpc-1", "cidr_block": "10.0.0.0/16", "nebula_network": "prod"},
+        "sg:sg-1": {"group_id": "sg-1", "group_name": "web", "vpc_id": "vpc-1",
+                    "is_default": False, "rules": {}, "firewall": firewall.model_dump()},
+    }))
+    state = mesh_state(tmp_path, "prod")
+    assert [(v.vpc_id, v.cidr_block, v.network) for v in state.vpcs] == [("vpc-1", "10.0.0.0/16", "prod")]
+    (sg,) = state.security_groups
+    assert (sg.sg_id, sg.vpc_id, sg.group_name) == ("sg-1", "vpc-1", "web")
+    assert sg.firewall == GOLDEN_FIREWALL
+
+
+def test_mesh_state_without_ec2net_file_has_no_networks(tmp_path):
+    state = mesh_state(tmp_path, "prod")
+    assert state.vpcs == [] and state.security_groups == []
 
 
 def test_mesh_state_empty_then_populated(tmp_path):

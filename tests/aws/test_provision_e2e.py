@@ -1,8 +1,10 @@
-"""M5 — a canvas AWS node provisions a real resource in the embed."""
+"""M5 — a canvas AWS node provisions a real resource in a real backing."""
 import time
+
 import pytest
 from fastapi.testclient import TestClient
-from odin.aws.embed import ministack_boto_client
+
+from odin.aws.backings import BackingAws
 from odin.runtime.colima import ColimaRuntime
 from odin.server import create_app
 from odin.spec.store import SpecStore
@@ -11,8 +13,16 @@ pytestmark = pytest.mark.integration
 CANVAS = {"nodes": [{"type": "s3", "data": {"label": "uploads"}}], "edges": []}
 
 
-def test_s3_node_provisions_bucket(tmp_path):
-    app = create_app(runtime=ColimaRuntime(), store=SpecStore(tmp_path), embed=True, complete=False)
+@pytest.fixture
+def runtime():
+    rt = ColimaRuntime()
+    yield rt
+    for cid in rt.list_allfather():
+        rt.stop(cid)
+
+
+def test_s3_node_provisions_bucket(tmp_path, runtime):
+    app = create_app(runtime=runtime, store=SpecStore(tmp_path))
     with TestClient(app) as client:
         client.post("/apply", json=CANVAS)
         deadline = time.monotonic() + 30
@@ -22,5 +32,6 @@ def test_s3_node_provisions_bucket(tmp_path):
                 break
             time.sleep(1)
         assert ph.get("uploads") == "healthy"
-        names = [b["Name"] for b in ministack_boto_client("s3").list_buckets()["Buckets"]]
+        s3 = BackingAws(runtime, "default").client("s3")
+        names = [b["Name"] for b in s3.list_buckets()["Buckets"]]
         assert "uploads" in names

@@ -13,11 +13,36 @@ from odin.spec.models import Edge, FieldValue, Ref, ResourceDesired, Stack
 
 _REF = re.compile(r"^\$\{\{\s*([\w-]+)\.([\w-]+)\s*\}\}$")
 
-# Canvas node type -> Stack kind.
-_KIND = {"service": "service", "app": "service", "rds": "rds",
-         "batch": "batch", "dep": "dep", "llm": "llm",
-         # control-plane AWS resources provisioned in the embed
-         "s3": "s3", "sqs": "sqs", "sns": "sns", "dynamodb": "dynamodb"}
+# Canvas node type -> Stack kind. rds is a direct Postgres container; the rest
+# are AWS-shaped resources provisioned in per-env backing containers.
+# vpc/subnet/sg are the V1 network containers: their containment-stamped
+# data.vpc/data.subnet fields flow through `_resource` like any other field.
+# iam_role/ecr (V2c), ec2 (V3c), lambda (V4c), and ecs (V5c) are pure
+# gateway-model kinds like vpc/subnet/sg -- no reconciler-driven provisioning
+# at all (plan.py NoOps them; see reconcile/plan.py + aws/backings.py::
+# ENSURE_KINDS), just fields flowing through generically for hcl.py's
+# builders to read. ec2's REAL lifecycle (a Lima VM) is driven entirely by
+# the gateway's RunInstances handler (gateway/models/ec2compute.py) once
+# `tofu apply` reaches it; lambda's (a per-function RIE container) the same
+# way via CreateFunction (gateway/models/lambdactl.py); ecs's (per-task
+# Colima containers) via CreateService/UpdateService
+# (gateway/models/ecsctl.py) -- the reconciler never touches any of them,
+# same as vpc/subnet/sg.
+_KIND = {
+    "rds": "rds",
+    "s3": "s3",
+    "sqs": "sqs",
+    "sns": "sns",
+    "dynamodb": "dynamodb",
+    "vpc": "vpc",
+    "subnet": "subnet",
+    "sg": "sg",
+    "iam_role": "iam_role",
+    "ecr": "ecr",
+    "ec2": "ec2",
+    "lambda": "lambda",
+    "ecs": "ecs",
+}
 
 
 def parse_ref(var: str, value: str) -> Ref | None:
@@ -63,15 +88,18 @@ def _resource(node: dict) -> ResourceDesired | None:
     )
 
 
-def _edge(e: dict) -> Edge:
+def _edge(e: dict, labels: dict[str, str]) -> Edge:
     # The UI stores access metadata under `data` (Canvas.tsx): `permissions` +
     # `edgeType` ("iam" | "network"). Thread both through so the Brain's IAM
     # review sees real grants. (Data-flow ${{node.attr}} refs are NOT edges —
     # they're lifted into ResourceDesired.refs above.)
+    # Edge endpoints are ReactFlow node IDs but Stack resources are keyed by
+    # LABEL — translate through `labels` (fall back for edges naming labels).
     data = e.get("data") or {}
     perms = tuple(data.get("permissions") or ())
     kind = data.get("edgeType") or ("iam" if perms else "network")
-    return Edge(src=e.get("source", ""), dst=e.get("target", ""), kind=kind, perms=perms)
+    src, dst = e.get("source", ""), e.get("target", "")
+    return Edge(src=labels.get(src, src), dst=labels.get(dst, dst), kind=kind, perms=perms)
 
 
 def skipped_node_types(canvas: dict) -> list[str]:
@@ -83,6 +111,7 @@ def skipped_node_types(canvas: dict) -> list[str]:
 
 def canvas_to_stack(canvas: dict, env: str = "default") -> Stack:
     nodes = canvas.get("nodes") or []
+    labels = {n["id"]: _node_id(n) for n in nodes if n.get("id")}
     resources = tuple(r for n in nodes if (r := _resource(n)) is not None)
-    edges = tuple(_edge(e) for e in (canvas.get("edges") or []))
+    edges = tuple(_edge(e, labels) for e in (canvas.get("edges") or []))
     return Stack(env=env, resources=resources, edges=edges)

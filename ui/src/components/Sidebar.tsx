@@ -2,13 +2,13 @@ import { CATALOG, COLORS } from '../lib/catalog';
 
 type Item = { abbr: string; label: string; sublabel: string; category: string; iconClass: string };
 
-// Built-in (bespoke-node) resources. Catalog (Phase-5) services are appended.
+// Built-in (bespoke-node) resources. Catalog services are appended.
 const builtins: Item[] = [
   { abbr: 'VPC', label: 'VPC', sublabel: 'Virtual Private Cloud', category: 'Networking', iconClass: 'text-neon-purple border-neon-purple' },
   { abbr: 'SUB', label: 'Subnet', sublabel: 'Network partition', category: 'Networking', iconClass: 'text-neon-blue border-neon-blue' },
   { abbr: 'SG', label: 'Security Group', sublabel: 'Firewall rules', category: 'Networking', iconClass: 'text-neon-red border-neon-red' },
-  { abbr: 'EC2', label: 'EC2 Instance', sublabel: 'Virtual machine', category: 'Compute', iconClass: 'text-neon-orange border-neon-orange' },
-  { abbr: 'FN', label: 'Lambda', sublabel: 'Serverless function', category: 'Compute', iconClass: 'text-neon-yellow border-neon-yellow' },
+  { abbr: 'EC2', label: 'EC2 Instance', sublabel: 'Real Lima VM', category: 'Compute', iconClass: 'text-neon-orange border-neon-orange' },
+  { abbr: 'LAM', label: 'Lambda Function', sublabel: 'Real RIE container', category: 'Compute', iconClass: 'text-neon-yellow border-neon-yellow' },
   { abbr: 'S3', label: 'S3 Bucket', sublabel: 'Object storage', category: 'Storage', iconClass: 'text-neon-green border-neon-green' },
   { abbr: 'DDB', label: 'DynamoDB', sublabel: 'NoSQL table', category: 'Database', iconClass: 'text-neon-cyan border-neon-cyan' },
 ];
@@ -21,7 +21,8 @@ const catalogItems: Item[] = CATALOG.map((s) => ({
   iconClass: `${COLORS[s.color].text} ${COLORS[s.color].border}`,
 }));
 
-const CATEGORY_ORDER = ['Networking', 'Compute', 'Storage', 'Database', 'Integration', 'Security', 'Monitoring', 'Management'];
+// Workloads first, then the data/AWS-shaped resources.
+const CATEGORY_ORDER = ['Compute', 'Storage', 'Database', 'Integration', 'Networking', 'Security', 'Monitoring', 'Management'];
 
 const allItems = [...builtins, ...catalogItems];
 const groups = CATEGORY_ORDER

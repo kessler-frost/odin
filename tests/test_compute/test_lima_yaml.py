@@ -53,9 +53,14 @@ def test_no_provision_without_cloud_init():
 
 
 def test_shared_network():
+    # vzNAT (macOS Virtualization.framework's own NAT device), not
+    # socket_vmnet's "lima: shared" -- see generate_lima_yaml's own comment;
+    # a real V3 boot fails hard against "lima: shared" without an external
+    # socket_vmnet binary installed.
     config = VmConfig(cpus=1, memory="1GiB", disk="10GiB")
     parsed = yaml.safe_load(generate_lima_yaml(config, shared_network=True))
-    assert parsed["networks"] == [{"lima": "shared"}]
+    assert parsed["vmType"] == "vz"
+    assert parsed["networks"] == [{"vzNAT": True}]
 
 
 def test_no_shared_network_by_default():

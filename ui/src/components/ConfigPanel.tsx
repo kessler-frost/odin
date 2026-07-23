@@ -7,6 +7,7 @@ import { catalogTypeConfig, catalogFields } from '../lib/catalog';
 interface ConfigPanelProps {
   nodes: Node[];
   selectedEdge?: Edge | null;
+  allLabels?: { id: string; label?: string }[];
   onNodeUpdate?: (nodeId: string, data: Record<string, string>) => void;
   onEdgeUpdate?: (edgeId: string, data: Record<string, unknown>) => void;
   onCollapse?: () => void;
@@ -16,19 +17,19 @@ interface ConfigPanelProps {
 const typeConfig: Record<string, { label: string; neonColor: string; neonBg: string }> = {
   vpc: { label: 'VPC', neonColor: 'text-neon-purple', neonBg: 'bg-[rgba(170,85,255,0.1)] border-neon-purple' },
   subnet: { label: 'Subnet', neonColor: 'text-neon-blue', neonBg: 'bg-[rgba(0,187,255,0.1)] border-neon-blue' },
-  ec2: { label: 'EC2', neonColor: 'text-neon-orange', neonBg: 'bg-[rgba(255,136,0,0.1)] border-neon-orange' },
-  lambda: { label: 'Lambda', neonColor: 'text-neon-yellow', neonBg: 'bg-[rgba(255,221,0,0.1)] border-neon-yellow' },
-  s3: { label: 'S3', neonColor: 'text-neon-green', neonBg: 'bg-[rgba(0,255,136,0.1)] border-neon-green' },
   sg: { label: 'Security Group', neonColor: 'text-neon-red', neonBg: 'bg-[rgba(255,51,85,0.1)] border-neon-red' },
+  ec2: { label: 'EC2 Instance', neonColor: 'text-neon-orange', neonBg: 'bg-[rgba(255,136,0,0.1)] border-neon-orange' },
+  lambda: { label: 'Lambda Function', neonColor: 'text-neon-yellow', neonBg: 'bg-[rgba(255,221,0,0.1)] border-neon-yellow' },
+  s3: { label: 'S3', neonColor: 'text-neon-green', neonBg: 'bg-[rgba(0,255,136,0.1)] border-neon-green' },
   dynamodb: { label: 'DynamoDB', neonColor: 'text-neon-cyan', neonBg: 'bg-[rgba(34,211,238,0.1)] border-neon-cyan' },
   ...catalogTypeConfig,
 };
 
-type FieldDef = { key: string; label: string; editable?: boolean; select?: string[] };
-
-const ec2InstanceTypes = ['t2.micro', 't2.small', 't2.medium'];
+type FieldDef = { key: string; label: string; editable?: boolean; select?: string[]; multiline?: boolean; placeholder?: string };
 
 const fieldsForType: Record<string, FieldDef[]> = {
+  // vpc/subnet/sg `vpc`/`subnet` fields are read-only containment stamps —
+  // authored by dragging on the canvas (lib/containment.ts), never typed here.
   vpc: [
     { key: 'label', label: 'Name', editable: true },
     { key: 'cidr', label: 'CIDR Block', editable: true },
@@ -39,40 +40,51 @@ const fieldsForType: Record<string, FieldDef[]> = {
   subnet: [
     { key: 'label', label: 'Name', editable: true },
     { key: 'cidr', label: 'CIDR Block', editable: true },
+    { key: 'vpc', label: 'VPC (containment)' },
     { key: 'resourceId', label: 'Resource ID' },
+    { key: 'status', label: 'Status' },
+    { key: 'error', label: 'Error' },
+  ],
+  sg: [
+    { key: 'label', label: 'Name', editable: true },
+    {
+      key: 'ingressRules', label: 'Ingress Rules (protocol:port:cidr, one per line)',
+      editable: true, multiline: true, placeholder: 'tcp:443:0.0.0.0/0',
+    },
+    { key: 'vpc', label: 'VPC (containment)' },
+    { key: 'subnet', label: 'Subnet (containment)' },
+    { key: 'groupId', label: 'Group ID' },
+    { key: 'vpcId', label: 'VPC ID' },
     { key: 'status', label: 'Status' },
     { key: 'error', label: 'Error' },
   ],
   ec2: [
     { key: 'label', label: 'Name', editable: true },
-    { key: 'instanceType', label: 'Instance Type', editable: true, select: ec2InstanceTypes },
-    { key: 'resourceId', label: 'Instance ID' },
-    { key: 'privateIp', label: 'Private IP' },
-    { key: 'overlayIp', label: 'Overlay IP' },
+    { key: 'instanceType', label: 'Instance Type', editable: true, select: ['t3.micro', 't3.small', 't3.medium'] },
+    { key: 'ami', label: 'AMI (optional)', editable: true, placeholder: 'ami-0c101f26f147fa7fd' },
+    { key: 'key', label: 'SSH Public Key (optional)', editable: true, multiline: true, placeholder: 'ssh-ed25519 AAAA...' },
+    { key: 'securityGroups', label: 'Security Groups (one label per line)', editable: true, multiline: true },
+    { key: 'userData', label: 'User Data (bash)', editable: true, multiline: true, placeholder: '#!/bin/bash\necho hello' },
+    { key: 'vpc', label: 'VPC (containment)' },
+    { key: 'subnet', label: 'Subnet (containment)' },
     { key: 'status', label: 'Status' },
     { key: 'error', label: 'Error' },
   ],
   lambda: [
     { key: 'label', label: 'Name', editable: true },
-    { key: 'runtime', label: 'Runtime', editable: true },
-    { key: 'handler', label: 'Handler', editable: true },
-    { key: 'memory', label: 'Memory', editable: true },
-    { key: 'timeout', label: 'Timeout', editable: true },
+    { key: 'runtime', label: 'Runtime', editable: true, select: ['python3.12', 'python3.13', 'nodejs20.x', 'nodejs22.x'] },
+    { key: 'handler', label: 'Handler', editable: true, placeholder: 'lambda_function.lambda_handler' },
+    {
+      key: 'code', label: 'Code', editable: true, multiline: true,
+      placeholder: 'def lambda_handler(event, context):\n    return event',
+    },
+    { key: 'role', label: 'IAM Role (optional -- blank auto-generates one)', editable: true, placeholder: 'an IAM Role node\'s name' },
     { key: 'status', label: 'Status' },
     { key: 'error', label: 'Error' },
   ],
   s3: [
     { key: 'label', label: 'Name', editable: true },
     { key: 'arn', label: 'ARN' },
-    { key: 'status', label: 'Status' },
-    { key: 'error', label: 'Error' },
-  ],
-  sg: [
-    { key: 'label', label: 'Name', editable: true },
-    { key: 'groupId', label: 'Group ID' },
-    { key: 'vpcId', label: 'VPC ID' },
-    { key: 'inboundRules', label: 'Inbound Rules', editable: true },
-    { key: 'outboundRules', label: 'Outbound Rules', editable: true },
     { key: 'status', label: 'Status' },
     { key: 'error', label: 'Error' },
   ],
@@ -101,7 +113,7 @@ function ReadOnlyField({ label, value }: { label: string; value: string }) {
   );
 }
 
-function EditableField({ label, value, onChange }: { label: string; value: string; onChange: (v: string) => void }) {
+function EditableField({ label, value, onChange, error }: { label: string; value: string; onChange: (v: string) => void; error?: string }) {
   // ${{node.attr}} references are the core wiring mechanism — make them legible.
   const isRef = value.includes('${{');
   return (
@@ -115,7 +127,23 @@ function EditableField({ label, value, onChange }: { label: string; value: strin
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder="value or ${{node.attr}}"
-        className={`w-full py-1.5 px-2.5 bg-bg-primary border font-mono text-xs outline-none transition-colors duration-200 focus:ring-1 focus:ring-neon-blue/30 focus:border-neon-blue placeholder:text-text-muted/50 ${isRef ? 'border-neon-blue/50 text-neon-blue' : 'border-border text-text-primary'}`}
+        className={`w-full py-1.5 px-2.5 bg-bg-primary border font-mono text-xs outline-none transition-colors duration-200 focus:ring-1 placeholder:text-text-muted/50 ${error ? 'border-neon-red text-neon-red focus:border-neon-red focus:ring-neon-red/30' : isRef ? 'border-neon-blue/50 text-neon-blue focus:border-neon-blue focus:ring-neon-blue/30' : 'border-border text-text-primary focus:border-neon-blue focus:ring-neon-blue/30'}`}
+      />
+      {error && <p className="mt-1 text-[10px] text-neon-red font-mono">{error}</p>}
+    </div>
+  );
+}
+
+function TextareaField({ label, value, placeholder, onChange }: { label: string; value: string; placeholder?: string; onChange: (v: string) => void }) {
+  return (
+    <div className="mb-2.5">
+      <label className="block text-[11px] text-text-secondary mb-1 font-mono">{label}</label>
+      <textarea
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        rows={3}
+        placeholder={placeholder}
+        className="w-full py-1.5 px-2.5 bg-bg-primary border border-border text-text-primary font-mono text-xs outline-none transition-colors duration-200 focus:border-neon-blue focus:ring-1 focus:ring-neon-blue/30 placeholder:text-text-muted/50 resize-y"
       />
     </div>
   );
@@ -347,8 +375,9 @@ function MultiSelectView({ nodes, onCollapse, onValidate }: { nodes: Node[]; onC
   );
 }
 
-export default function ConfigPanel({ nodes, selectedEdge, onNodeUpdate, onEdgeUpdate, onCollapse, onValidate }: ConfigPanelProps) {
+export default function ConfigPanel({ nodes, selectedEdge, allLabels, onNodeUpdate, onEdgeUpdate, onCollapse, onValidate }: ConfigPanelProps) {
   const [localData, setLocalData] = useState<Record<string, string>>({});
+  const [labelError, setLabelError] = useState(false);
 
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -364,7 +393,17 @@ export default function ConfigPanel({ nodes, selectedEdge, onNodeUpdate, onEdgeU
   // Sync local editable state when the selected node changes
   useEffect(() => {
     setLocalData(node ? { ...(node.data as Record<string, string>) } : {});
+    setLabelError(false);
   }, [node?.id, node?.data]);
+
+  // Resource ids are labels — block committing a rename that collides with
+  // another node's label (drop-time auto-suffixing already keeps fresh drops unique).
+  const otherLabels = new Set(
+    (allLabels ?? [])
+      .filter((n) => n.id !== node?.id)
+      .map((n) => n.label)
+      .filter((l): l is string => Boolean(l)),
+  );
 
   const panelBase = "bg-bg-secondary border-l border-border-bright p-0 overflow-y-auto h-full";
 
@@ -402,6 +441,14 @@ export default function ConfigPanel({ nodes, selectedEdge, onNodeUpdate, onEdgeU
   const updateField = (key: string, value: string) => {
     const updated = { ...localData, [key]: value };
     setLocalData(updated);
+    if (key === 'label') {
+      const isDup = value.length > 0 && otherLabels.has(value);
+      setLabelError(isDup);
+      if (isDup) {
+        if (debounceRef.current) clearTimeout(debounceRef.current);
+        return; // don't propagate a colliding label to canvas state
+      }
+    }
     debouncedUpdate(node.id, updated);
   };
 
@@ -432,8 +479,11 @@ export default function ConfigPanel({ nodes, selectedEdge, onNodeUpdate, onEdgeU
           if (field.select) {
             return <SelectField key={field.key} label={field.label} value={value} options={field.select} onChange={(v) => updateField(field.key, v)} />;
           }
+          if (field.multiline) {
+            return <TextareaField key={field.key} label={field.label} value={value} placeholder={field.placeholder} onChange={(v) => updateField(field.key, v)} />;
+          }
           return field.editable
-            ? <EditableField key={field.key} label={field.label} value={value} onChange={(v) => updateField(field.key, v)} />
+            ? <EditableField key={field.key} label={field.label} value={value} onChange={(v) => updateField(field.key, v)} error={field.key === 'label' && labelError ? 'Name already in use by another node' : undefined} />
             : <ReadOnlyField key={field.key} label={field.label} value={value} />;
         })}
       </div>

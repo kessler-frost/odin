@@ -6,8 +6,7 @@ container engine (run containers directly), fast and real. `LimaRuntime`
 reusing the `_ContainerRuntime` base here — they differ only in the CLI seam
 (`docker` vs `nerdctl`-in-VM) and Colima's host-gateway run flag.
 
-Every container allfather runs is labelled ``allfather=1`` (deliberately NOT
-``ministack=…``, so MiniStack's own container reaper never touches them).
+Every container allfather runs is labelled ``allfather=1``.
 """
 from __future__ import annotations
 
@@ -18,6 +17,11 @@ from odin.spec.models import Phase
 
 LABEL = "allfather"
 
+# The host as seen from inside containers: Colima's host-gateway alias (wired
+# by `_run_flags`). Producers publish this instead of localhost so a consumer
+# container can dial host-published ports verbatim.
+CONTAINER_HOST = "host.docker.internal"
+
 
 @dataclass(frozen=True)
 class ContainerSpec:
@@ -27,6 +31,7 @@ class ContainerSpec:
     ports: dict[int, int] = field(default_factory=dict)  # container_port -> host_port
     labels: dict[str, str] = field(default_factory=dict)
     command: tuple[str, ...] = ()
+    volumes: dict[str, str] = field(default_factory=dict)  # host_path -> container_path
 
 
 @dataclass(frozen=True)
@@ -82,8 +87,8 @@ class _Proc:
     stderr: str = ""
 
 
-def _default_runner(args: list[str]) -> _Proc:
-    proc = subprocess.run(args, capture_output=True, text=True)
+def _default_runner(args: list[str], input: str | None = None) -> _Proc:
+    proc = subprocess.run(args, capture_output=True, text=True, input=input)
     return _Proc(proc.returncode, proc.stdout, proc.stderr)
 
 
@@ -95,11 +100,26 @@ class _ContainerRuntime:
     def __init__(self, runner=None) -> None:
         self._run = runner or _default_runner
 
-    def _cli(self, *args: str, check: bool = True) -> str:
+    def _cli(self, *args: str, check: bool = True, input: str | None = None) -> str:
         raise NotImplementedError
 
     def _run_flags(self) -> list[str]:
         return []
+
+    def image_exists(self, tag: str) -> bool:
+        # Plain `image inspect` prints a truthy "[]" to stdout when the image
+        # is MISSING (docker rc=1), which silently skipped the one-time build.
+        # The Id template prints nothing on a missing image; "[]" is still
+        # guarded because nerdctl's behavior differs across versions.
+        out = self._cli("image", "inspect", "-f", "{{.Id}}", tag, check=False)
+        return out not in ("", "[]")
+
+    def build(self, tag: str, dockerfile: str) -> None:
+        """Build `tag` from an inline Dockerfile (no build context — piped on
+        stdin, `-`). Used to bake a one-time `npm install` into a local image
+        (dynalite: see BackingAws) so container boot never re-fetches from a
+        registry that might be slow or flaky that day."""
+        self._cli("build", "-t", tag, "-", input=dockerfile)
 
     def run_container(self, spec: ContainerSpec) -> RunHandle:
         args = [
@@ -112,6 +132,8 @@ class _ContainerRuntime:
             args += ["-e", f"{key}={value}"]
         for cport, hport in spec.ports.items():
             args += ["-p", (f"{hport}:{cport}" if hport else str(cport))]
+        for host, container in spec.volumes.items():
+            args += ["-v", f"{host}:{container}"]
         args.append(spec.image)
         args += list(spec.command)
         return RunHandle(id=self._cli(*args), name=spec.name)
@@ -152,7 +174,9 @@ class _ContainerRuntime:
         )
 
     def stop(self, name: str) -> None:
-        self._cli("rm", "-f", name, check=False)
+        # -v: drop the container's anonymous volumes with it (postgres creates
+        # one per boot; without this a churn loop leaks gigabytes).
+        self._cli("rm", "-f", "-v", name, check=False)
 
     def list_allfather(self) -> list[str]:
         out = self._cli("ps", "-aq", "--filter", f"label={LABEL}=1", check=False)
@@ -162,8 +186,8 @@ class _ContainerRuntime:
 class ColimaRuntime(_ContainerRuntime):
     """Drives `docker` (Colima) directly on the host."""
 
-    def _cli(self, *args: str, check: bool = True) -> str:
-        proc = self._run(["docker", *args])
+    def _cli(self, *args: str, check: bool = True, input: str | None = None) -> str:
+        proc = self._run(["docker", *args], input=input)
         if check and proc.returncode != 0:
             raise RuntimeError(f"docker {' '.join(args)} failed: {proc.stderr.strip()}")
         return proc.stdout.strip()

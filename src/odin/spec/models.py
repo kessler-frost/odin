@@ -57,7 +57,10 @@ class Edge(BaseModel):
 class ResourceDesired(BaseModel):
     model_config = {"frozen": True}
     id: str
-    kind: str                              # "service" | "rds" | "batch" | "llm" | …
+    kind: str                              # canvas node type, from spec/translate.py's
+                                            # _KIND map: "rds" | "s3" | "sqs" | "sns" |
+                                            # "dynamodb" | "vpc" | "subnet" | "sg" |
+                                            # "iam_role" | "ecr" | "ec2" | "lambda" | "ecs"
     fields: dict[str, FieldValue] = {}
     refs: tuple[Ref, ...] = ()
 

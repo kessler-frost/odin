@@ -1,13 +1,12 @@
-// Catalog-driven AWS service definitions. Adding a frequently-used service =
-// one entry here (plus a backend ResourceSpec + a Moto test). The existing
-// bespoke nodes (vpc/subnet/ec2/lambda/s3/sg) stay as-is; everything here is
-// rendered by the generic ServiceNode and merged into the Canvas/ConfigPanel/
-// Sidebar/IAM maps.
+// Catalog-driven service definitions: AWS-shaped resources, mostly on real
+// open-source backings (sqs/sns/rds live today; the rest are future-coverage
+// placeholders — see NORTHSTAR.md directive 5). Adding a service = one entry
+// here (plus a backend ResourceSpec). The bespoke S3/DynamoDB nodes stay
+// as-is; everything here is rendered by the generic ServiceNode and merged
+// into the Canvas/ConfigPanel/Sidebar/IAM maps.
 //
 // Class strings are written out in full (not constructed) so Tailwind's scanner
 // keeps them.
-
-import { GENERATED_CATALOG } from './catalog.generated';
 
 export type CatalogField = { key: string; label: string; editable?: boolean; select?: string[] };
 
@@ -49,54 +48,6 @@ export type ServiceDef = {
 
 export const CATALOG: ServiceDef[] = [
   {
-    type: 'service', abbr: 'APP', label: 'App Service', sublabel: 'Your container',
-    category: 'Compute', color: 'cyan', width: 220,
-    fields: [
-      { key: 'label', label: 'Name', editable: true },
-      { key: 'image', label: 'Image', editable: true },
-      { key: 'port', label: 'Port', editable: true },
-      { key: 'DATABASE_URL', label: 'DATABASE_URL', editable: true },
-    ],
-    defaultData: {
-      label: 'api', image: 'allfather-skel-app:latest', port: '8000',
-      DATABASE_URL: '${{db.DATABASE_URL}}',
-    },
-    primary: { key: 'image', label: 'Image' },
-  },
-  {
-    type: 'dep', abbr: 'DEP', label: 'Dependency', sublabel: 'Container (Redis, etc.)',
-    category: 'Compute', color: 'rose', width: 220,
-    fields: [
-      { key: 'label', label: 'Name', editable: true },
-      { key: 'image', label: 'Image', editable: true },
-      { key: 'port', label: 'Port', editable: true },
-    ],
-    defaultData: { label: 'redis', image: 'redis:7-alpine', port: '6379' },
-    primary: { key: 'image', label: 'Image' },
-  },
-  {
-    type: 'llm', abbr: 'LLM', label: 'LLM Endpoint', sublabel: 'Local model (omlx)',
-    category: 'Compute', color: 'fuchsia', width: 220,
-    fields: [
-      { key: 'label', label: 'Name', editable: true },
-      { key: 'image', label: 'Server image', editable: true },
-      { key: 'port', label: 'Port', editable: true },
-      { key: 'memory_mib', label: 'Memory (MiB)', editable: true },
-    ],
-    defaultData: { label: 'model', image: 'omlx-server:latest', port: '1234', memory_mib: '4096' },
-    primary: { key: 'image', label: 'Server' },
-  },
-  {
-    type: 'batch', abbr: 'JOB', label: 'Batch Job', sublabel: 'Run-to-completion',
-    category: 'Compute', color: 'amber', width: 220,
-    fields: [
-      { key: 'label', label: 'Name', editable: true },
-      { key: 'image', label: 'Image', editable: true },
-    ],
-    defaultData: { label: 'job', image: 'busybox:latest' },
-    primary: { key: 'image', label: 'Image' },
-  },
-  {
     type: 'sqs', abbr: 'SQS', label: 'SQS Queue', sublabel: 'Message queue',
     category: 'Integration', color: 'pink', width: 200,
     fields: [
@@ -134,6 +85,7 @@ export const CATALOG: ServiceDef[] = [
     ],
     defaultData: { label: 'db', engine: 'postgres', instanceClass: 'db.t3.micro', arn: '' },
     primary: { key: 'engine', label: 'Engine' },
+    iamActions: ['rds-db:connect', 'rds:DescribeDBInstances', 'rds:*'],
   },
   {
     type: 'secret', abbr: 'SEC', label: 'Secret', sublabel: 'Secrets Manager',
@@ -155,6 +107,26 @@ export const CATALOG: ServiceDef[] = [
     fields: [{ key: 'label', label: 'Name', editable: true }, { key: 'arn', label: 'ARN' }],
     defaultData: { label: 'new-role', arn: '' },
   },
+  // iam_role/ecr (V2c) are the REAL, gateway-modeled services (NORTHSTAR
+  // directive 5) — distinct from the 'iamrole' placeholder above, which
+  // stays an unwired future-coverage entry (not in translate.py's _KIND, so
+  // Apply silently skips it; see skipped_node_types). Both render via the
+  // generic ServiceNode, no bespoke component.
+  {
+    type: 'iam_role', abbr: 'ROLE', label: 'IAM Role', sublabel: 'Terraform-managed role',
+    category: 'Security', color: 'amber', width: 220,
+    fields: [
+      { key: 'label', label: 'Name', editable: true },
+      { key: 'inlinePolicy', label: 'Inline Policy (JSON)', editable: true },
+    ],
+    defaultData: { label: 'new-role', inlinePolicy: '' },
+  },
+  {
+    type: 'ecr', abbr: 'ECR', label: 'ECR Repository', sublabel: 'Container registry',
+    category: 'Storage', color: 'sky', width: 200,
+    fields: [{ key: 'label', label: 'Name', editable: true }],
+    defaultData: { label: 'new-repo' },
+  },
   {
     type: 'route53', abbr: 'DNS', label: 'Route 53 Zone', sublabel: 'Hosted zone',
     category: 'Networking', color: 'indigo', width: 200,
@@ -173,11 +145,22 @@ export const CATALOG: ServiceDef[] = [
     fields: [{ key: 'label', label: 'Name', editable: true }, { key: 'fsId', label: 'File System ID' }],
     defaultData: { label: 'new-fs', fsId: '' },
   },
+  // ecs (V5c) is the REAL, gateway-modeled ECS service (NORTHSTAR directive
+  // 5): the drawn node IS the service+taskdef pair (v1 single-container
+  // taskdefs), sharing ONE auto-generated cluster per canvas (agent/hcl.py's
+  // `_ecs` builder) -- renders via the generic ServiceNode, no bespoke
+  // component, same as iam_role/ecr/lambda.
   {
-    type: 'ecs', abbr: 'ECS', label: 'ECS Cluster', sublabel: 'Container cluster',
+    type: 'ecs', abbr: 'ECS', label: 'ECS Service', sublabel: 'Container service',
     category: 'Compute', color: 'lime', width: 200,
-    fields: [{ key: 'label', label: 'Name', editable: true }, { key: 'arn', label: 'ARN' }],
-    defaultData: { label: 'new-cluster', arn: '' },
+    fields: [
+      { key: 'label', label: 'Name', editable: true },
+      { key: 'image', label: 'Image', editable: true },
+      { key: 'count', label: 'Task Count', editable: true },
+      { key: 'port', label: 'Container Port', editable: true },
+    ],
+    defaultData: { label: 'new-service', image: 'nginx:alpine', count: '1', port: '80' },
+    primary: { key: 'count', label: 'tasks' },
   },
   {
     type: 'ssm', abbr: 'SSM', label: 'SSM Parameter', sublabel: 'Parameter store',
@@ -240,7 +223,6 @@ export const CATALOG: ServiceDef[] = [
     defaultData: { label: 'new-lb', lbType: 'application', arn: '' },
     primary: { key: 'lbType', label: 'Type' },
   },
-  ...GENERATED_CATALOG,  // full MiniStack service parity (auto-generated)
 ];
 
 export const catalogByType: Record<string, ServiceDef> = Object.fromEntries(

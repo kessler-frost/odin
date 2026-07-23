@@ -12,6 +12,7 @@ import {
   type Node,
   type Edge,
   type NodeTypes,
+  type NodeChange,
   type Connection,
   type OnConnect,
   BackgroundVariant,
@@ -21,45 +22,51 @@ import '@xyflow/react/dist/style.css';
 
 import VpcNode from './nodes/VpcNode';
 import SubnetNode from './nodes/SubnetNode';
+import SgNode from './nodes/SgNode';
 import Ec2Node from './nodes/Ec2Node';
 import LambdaNode from './nodes/LambdaNode';
 import S3Node from './nodes/S3Node';
-import SgNode from './nodes/SgNode';
 import DynamodbNode from './nodes/DynamodbNode';
 import ServiceNode from './nodes/ServiceNode';
 import { CATALOG, catalogNodeTypeMap, catalogDefaultData, catalogDefaultStyle, catalogZIndex, catalogByType, COLORS } from '../lib/catalog';
+import { withContainment, isInsideContainer } from '../lib/containment';
 import { computeTypes, defaultPermissions, detectDefaultEdgeType, edgeStyle, edgeTypes } from '../lib/iam';
 
 const nodeTypes: NodeTypes = {
   vpc: VpcNode,
   subnet: SubnetNode,
+  sg: SgNode,
   ec2: Ec2Node,
   lambda: LambdaNode,
   s3: S3Node,
-  sg: SgNode,
   dynamodb: DynamodbNode,
-  // Every catalog (Phase-5) service renders with the generic ServiceNode.
+  // Every catalog service renders with the generic ServiceNode.
   ...Object.fromEntries(CATALOG.map((s) => [s.type, ServiceNode])),
 };
 
 const nodeTypeMap: Record<string, string> = {
   VPC: 'vpc',
   SUB: 'subnet',
-  EC2: 'ec2',
-  FN: 'lambda',
-  S3: 's3',
   SG: 'sg',
+  EC2: 'ec2',
+  LAM: 'lambda',
+  S3: 's3',
   DDB: 'dynamodb',
   ...catalogNodeTypeMap,
 };
 
+// V4c: the same "return event" default hcl.py's own `_lambda` builder
+// falls back to when the code field is blank -- a freshly-dropped node is
+// already a real, working (if trivial) function, not an empty shell.
+const DEFAULT_LAMBDA_CODE = 'def lambda_handler(event, context):\n    return event\n';
+
 const defaultDataForType: Record<string, Record<string, string>> = {
   vpc: { label: 'new-vpc', resourceId: '', cidr: '10.0.0.0/16', status: 'draft' },
   subnet: { label: 'new-subnet', resourceId: '', cidr: '10.0.1.0/24', status: 'draft' },
-  ec2: { label: 'new-instance', resourceId: '', instanceType: 't2.micro', privateIp: '—', overlayIp: '—', status: 'draft' },
-  lambda: { label: 'new-function', runtime: 'python3.12', handler: 'handler.main', memory: '128MB', timeout: '30s', status: 'draft' },
+  sg: { label: 'new-sg', groupId: '', vpcId: '', ingressRules: '', status: 'draft' },
+  ec2: { label: 'new-instance', instanceType: 't3.micro', ami: '', key: '', userData: '', securityGroups: '', status: 'draft' },
+  lambda: { label: 'new-function', runtime: 'python3.12', handler: 'lambda_function.lambda_handler', code: DEFAULT_LAMBDA_CODE, role: '', status: 'draft' },
   s3: { label: 'new-bucket', arn: '', status: 'draft' },
-  sg: { label: 'new-sg', groupId: '', vpcId: '', inboundRules: '', outboundRules: '', status: 'draft' },
   dynamodb: { label: 'new-table', hashKey: 'id', billingMode: 'PAY_PER_REQUEST', arn: '', status: 'draft' },
   ...catalogDefaultData,
 };
@@ -67,22 +74,24 @@ const defaultDataForType: Record<string, Record<string, string>> = {
 const defaultStyleForType: Record<string, React.CSSProperties> = {
   vpc: { width: 560, height: 380 },
   subnet: { width: 520, height: 280 },
-  ec2: { width: 220 },
+  sg: { width: 200 },
+  ec2: { width: 200 },
   lambda: { width: 220 },
   s3: { width: 200 },
-  sg: { width: 220 },
   dynamodb: { width: 200 },
   ...catalogDefaultStyle,
 };
 
 
+// Containers layer under their contents: containment is spatial + z-index,
+// never ReactFlow parent-child (elevateNodesOnSelect stays false).
 const zIndexForType: Record<string, number> = {
   vpc: 0,
   subnet: 1,
+  sg: 2,
   ec2: 2,
   lambda: 2,
   s3: 2,
-  sg: 2,
   dynamodb: 2,
   ...catalogZIndex,
 };
@@ -94,19 +103,29 @@ function nextId(type: string) {
   return `${type}-${++idCounter}`;
 }
 
-// Nudge a drop/double-click spot so a new node never lands exactly on an existing one.
+// Nudge a drop/double-click spot so a new node never overlaps an existing one.
+// Step is >= the default node width (200px), kept on the 20px grid.
+const DECOLLIDE_STEP = 220;
 function deCollide(pos: { x: number; y: number }, nodes: Node[]) {
   let { x, y } = pos;
-  const occupied = () => nodes.some(n => Math.abs(n.position.x - x) < 20 && Math.abs(n.position.y - y) < 20);
-  for (let i = 0; i < 50 && occupied(); i++) { x += 20; y += 20; }
+  const occupied = () => nodes.some(n => Math.abs(n.position.x - x) < DECOLLIDE_STEP && Math.abs(n.position.y - y) < DECOLLIDE_STEP);
+  for (let i = 0; i < 50 && occupied(); i++) { x += DECOLLIDE_STEP; y += DECOLLIDE_STEP; }
   return { x, y };
+}
+
+// Read the live endpoint / DATABASE_URL off a World resource's facts — the
+// same extraction the live world_delta handler uses, reused for rehydration.
+function endpointFromFacts(facts?: Record<string, unknown>): string {
+  return (facts?.endpoint as string) || (facts?.DATABASE_URL as string) || '';
 }
 
 type HistoryEntry = { nodes: Node[]; edges: Edge[] };
 
 interface CanvasProps {
+  env?: string;
   onNodeSelect?: (nodes: Node[]) => void;
   onEdgeSelect?: (edges: Edge[]) => void;
+  onNodeLabelsChange?: (entries: { id: string; label?: string }[]) => void;
   nodeUpdates?: { nodeId: string; data: Record<string, string> } | null;
   edgeUpdates?: { edgeId: string; data: Record<string, unknown> } | null;
   onStatusUpdate?: React.MutableRefObject<((name: string, status: string, error?: string, facts?: Record<string, unknown>) => void) | null>;
@@ -115,7 +134,7 @@ interface CanvasProps {
   onResetDrafts?: React.MutableRefObject<(() => void) | null>;
 }
 
-function InnerCanvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onStatusUpdate, configUpdate, onCanvasSave, onResetDrafts }: CanvasProps) {
+function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, nodeUpdates, edgeUpdates, onStatusUpdate, configUpdate, onCanvasSave, onResetDrafts }: CanvasProps) {
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   const [loaded, setLoaded] = useState(false);
@@ -147,25 +166,17 @@ function InnerCanvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onS
     return () => { onResetDrafts.current = null; };
   }, [onResetDrafts, setNodes, setEdges]);
 
-  // --- Load canvas from backend on mount ---
+  // --- Load canvas from backend on mount (status is seeded separately, from /world) ---
   useEffect(() => {
     const load = async () => {
-      const [canvasRes, stateRes] = await Promise.all([
-        fetch(`${API}/canvas`).then(r => r.json()).catch(() => ({ nodes: [], edges: [] })),
-        fetch(`${API}/state`).then(r => r.json()).catch(() => ({ resources: [] })),
-      ]);
-
-      const statusMap: Record<string, Record<string, string>> = {};
-      for (const r of (stateRes.resources ?? [])) {
-        statusMap[r.name] = { status: r.status, ...(r.error ? { error: r.error } : {}), ...(r.metadata ?? {}) };
-      }
+      const canvasRes = await fetch(`${API}/canvas`).then(r => r.json()).catch(() => ({ nodes: [], edges: [] }));
 
       const rfNodes: Node[] = (canvasRes.nodes ?? []).map((n: any) => ({
         id: n.id,
         type: n.type,
         position: n.position,
         zIndex: zIndexForType[n.type] ?? 2,
-        data: { ...defaultDataForType[n.type], ...n.data, ...(statusMap[`${n.type}_${n.data?.label}`] ?? statusMap[n.data?.label] ?? {}) },
+        data: { ...defaultDataForType[n.type], ...n.data },
         style: { ...defaultStyleForType[n.type], ...n.size },
       }));
 
@@ -197,6 +208,36 @@ function InnerCanvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onS
     };
     load();
   }, [setNodes, setEdges]);
+
+  // --- Rehydrate node badges from the observed World, on mount and on env change ---
+  // (a live world_delta over the WebSocket always arrives after this and wins).
+  const worldForEnv = useCallback((envName: string) => {
+    fetch(`${API}/world?env=${encodeURIComponent(envName)}`)
+      .then(r => r.json())
+      .then((world: { resources?: { id: string; phase: string; facts?: Record<string, unknown>; verdict?: string | null }[] }) => {
+        const byId = new Map((world.resources ?? []).map(r => [r.id, r]));
+        setNodes(nds => nds.map(n => {
+          const label = (n.data as Record<string, string>)?.label;
+          const resource = label ? byId.get(label) : undefined;
+          const endpoint = endpointFromFacts(resource?.facts);
+          return {
+            ...n,
+            data: {
+              ...n.data,
+              status: resource?.phase ?? 'draft',
+              ...(resource?.verdict ? { error: resource.verdict } : {}),
+              ...(endpoint ? { endpoint } : {}),
+            },
+          };
+        }));
+      })
+      .catch(() => {});
+  }, [setNodes]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    worldForEnv(env ?? 'default');
+  }, [env, loaded, worldForEnv]);
 
   // --- Undo/redo via debounced history ---
   const historyRef = useRef<HistoryEntry[]>([{ nodes: [], edges: [] }]);
@@ -311,7 +352,7 @@ function InnerCanvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onS
     if (!onStatusUpdate) return;
     onStatusUpdate.current = (name: string, status: string, error?: string, facts?: Record<string, unknown>) => {
       // The live endpoint / DATABASE_URL is the actual deliverable — surface it on the tile.
-      const endpoint = (facts?.endpoint as string) || (facts?.DATABASE_URL as string) || '';
+      const endpoint = endpointFromFacts(facts);
       setNodes(nds => {
         const updated = nds.map(n => {
           const matches = n.data?.label === name || n.id === name || `${n.type}_${n.data?.label}` === name;
@@ -327,6 +368,11 @@ function InnerCanvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onS
     return () => { onStatusUpdate.current = null; };
   }, [onStatusUpdate, setNodes, onNodeSelect]);
 
+  // --- Surface live labels to the parent so the config panel can guard against duplicates ---
+  useEffect(() => {
+    onNodeLabelsChange?.(nodes.map(n => ({ id: n.id, label: (n.data as Record<string, string>)?.label })));
+  }, [nodes, onNodeLabelsChange]);
+
   // --- Apply config updates from agent (via WebSocket → BottomPanel → App.tsx) ---
   useEffect(() => {
     if (!configUpdate) return;
@@ -339,12 +385,14 @@ function InnerCanvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onS
   }, [configUpdate, setNodes]);
 
   // --- Apply config panel edits to nodes ---
+  // Re-stamp containment after edits: renaming a VPC/Subnet must refresh the
+  // data.vpc/data.subnet labels stamped on everything drawn inside it.
   useEffect(() => {
     if (!nodeUpdates) return;
     const { nodeId, data } = nodeUpdates;
-    setNodes(nds => nds.map(n =>
+    setNodes(nds => withContainment(nds.map(n =>
       n.id === nodeId ? { ...n, data: { ...n.data, ...data } } : n
-    ));
+    )));
   }, [nodeUpdates, setNodes]);
 
   // --- Apply config panel edits to edges ---
@@ -428,24 +476,27 @@ function InnerCanvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onS
         const taken = new Set(nds.map((n) => (n.data as { label?: string })?.label));
         let label = base;
         for (let i = 2; taken.has(label); i++) label = `${base}-${i}`;
-        return [
+        return withContainment([
           ...nds,
           {
             id: nextId(type),
             type,
-            position: deCollide(position, nds),
+            // A drop point already inside a VPC/Subnet is a deliberate nesting
+            // gesture — deCollide's proximity shove would otherwise push the
+            // new node outside the container it was just dropped into.
+            position: isInsideContainer(position, nds) ? position : deCollide(position, nds),
             zIndex: zIndexForType[type] ?? 2,
             data: { ...defaultDataForType[type], label },
             style: { ...defaultStyleForType[type] },
           },
-        ];
+        ]);
       });
     },
     [setNodes, screenToFlowPosition],
   );
 
   const dblClickTypeRef = useRef(0);
-  const typeOrder = ['ec2', 'lambda', 's3', 'sg', 'vpc', 'subnet'];
+  const typeOrder = ['s3', 'sqs', 'dynamodb', 'rds', 'vpc', 'subnet', 'sg', 'ec2', 'lambda'];
 
   const onPaneDoubleClick = useCallback(
     (event: React.MouseEvent) => {
@@ -461,17 +512,20 @@ function InnerCanvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onS
         const taken = new Set(nds.map((n) => (n.data as { label?: string })?.label));
         let label = base;
         for (let i = 2; taken.has(label); i++) label = `${base}-${i}`;
-        return [
+        return withContainment([
           ...nds,
           {
             id: nextId(type),
             type,
-            position: deCollide(position, nds),
+            // A drop point already inside a VPC/Subnet is a deliberate nesting
+            // gesture — deCollide's proximity shove would otherwise push the
+            // new node outside the container it was just dropped into.
+            position: isInsideContainer(position, nds) ? position : deCollide(position, nds),
             zIndex: zIndexForType[type] ?? 2,
             data: { ...defaultDataForType[type], label },
             style: { ...defaultStyleForType[type] },
           },
-        ];
+        ]);
       });
     },
     [setNodes, screenToFlowPosition],
@@ -535,7 +589,7 @@ function InnerCanvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onS
           parentId: undefined,
           extent: undefined,
         }));
-        setNodes((nds) => [...nds.map((n) => ({ ...n, selected: false })), ...pasted]);
+        setNodes((nds) => withContainment([...nds.map((n) => ({ ...n, selected: false })), ...pasted]));
         e.preventDefault();
         return;
       }
@@ -550,6 +604,35 @@ function InnerCanvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onS
     document.addEventListener('keydown', handler);
     return () => document.removeEventListener('keydown', handler);
   }, [setNodes, setEdges, fitView, undo, redo]);
+
+  // --- Spatial containment (owner rule: geometry compiles to infrastructure) ---
+  // Re-stamp data.vpc/data.subnet whenever geometry settles: drag-stop below,
+  // drop/double-click/paste at creation, and resize via the dimension changes
+  // NodeResizer reports through the standard node-change channel (which also
+  // covers the first post-render measure of freshly created nodes).
+  // withContainment returns the same array on no-op, so these never push
+  // spurious history entries. When stamps change on a selected node, re-fire
+  // selection so the ConfigPanel sees the fresh data (same pattern as the
+  // onStatusUpdate handler above).
+  const restampContainment = useCallback(() => {
+    setNodes((nds) => {
+      const updated = withContainment(nds);
+      if (updated !== nds) {
+        const sel = updated.filter((n) => n.selected);
+        if (sel.length > 0) queueMicrotask(() => onNodeSelect?.(sel));
+      }
+      return updated;
+    });
+  }, [setNodes, onNodeSelect]);
+
+  const handleNodesChange = useCallback((changes: NodeChange<Node>[]) => {
+    onNodesChange(changes);
+    if (changes.some((c) => c.type === 'dimensions')) restampContainment();
+  }, [onNodesChange, restampContainment]);
+
+  const handleNodeDragStop = useCallback(() => {
+    restampContainment();
+  }, [restampContainment]);
 
   const handleSelectionChange = useCallback(({ nodes: selNodes, edges: selEdges }: { nodes: Node[]; edges: Edge[] }) => {
     onNodeSelect?.(selNodes);
@@ -571,7 +654,8 @@ function InnerCanvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onS
       <ReactFlow
         nodes={nodes}
         edges={edges}
-        onNodesChange={onNodesChange}
+        onNodesChange={handleNodesChange}
+        onNodeDragStop={handleNodeDragStop}
         onEdgesChange={onEdgesChange}
         onConnect={onConnect}
         onEdgeClick={handleEdgeClick}
@@ -589,7 +673,7 @@ function InnerCanvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onS
         nodesDraggable={!shiftHeld}
         panActivationKeyCode="Shift"
         selectionKeyCode="Meta"
-        multiSelectionKeyCode="Meta"
+        multiSelectionKeyCode={['Meta', 'Shift']}
         deleteKeyCode={null}
         connectionMode={ConnectionMode.Loose}
         elevateNodesOnSelect={false}
@@ -619,10 +703,8 @@ function InnerCanvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onS
             const bespoke: Record<string, string> = {
               vpc: 'rgba(170,85,255,0.4)',
               subnet: 'rgba(0,187,255,0.4)',
-              ec2: 'rgba(255,136,0,0.6)',
-              lambda: 'rgba(255,221,0,0.6)',
-              s3: 'rgba(0,255,136,0.6)',
               sg: 'rgba(255,51,85,0.6)',
+              s3: 'rgba(0,255,136,0.6)',
             };
             const t = node.type ?? '';
             if (bespoke[t]) return bespoke[t];
@@ -638,10 +720,10 @@ function InnerCanvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onS
   );
 }
 
-export default function Canvas({ onNodeSelect, onEdgeSelect, nodeUpdates, edgeUpdates, onStatusUpdate, configUpdate, onCanvasSave, onResetDrafts }: CanvasProps) {
+export default function Canvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, nodeUpdates, edgeUpdates, onStatusUpdate, configUpdate, onCanvasSave, onResetDrafts }: CanvasProps) {
   return (
     <ReactFlowProvider>
-      <InnerCanvas onNodeSelect={onNodeSelect} onEdgeSelect={onEdgeSelect} nodeUpdates={nodeUpdates} edgeUpdates={edgeUpdates} onStatusUpdate={onStatusUpdate} configUpdate={configUpdate} onCanvasSave={onCanvasSave} onResetDrafts={onResetDrafts} />
+      <InnerCanvas env={env} onNodeSelect={onNodeSelect} onEdgeSelect={onEdgeSelect} onNodeLabelsChange={onNodeLabelsChange} nodeUpdates={nodeUpdates} edgeUpdates={edgeUpdates} onStatusUpdate={onStatusUpdate} configUpdate={configUpdate} onCanvasSave={onCanvasSave} onResetDrafts={onResetDrafts} />
     </ReactFlowProvider>
   );
 }

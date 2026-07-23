@@ -14,28 +14,24 @@ function Led({ state }: { state: LedState }) {
   return <div className={`w-1.5 h-1.5 rounded-full ${ledStyles[state]}`} />;
 }
 
-type Busy = null | 'apply' | 'preview' | 'destroy';
+type Busy = null | 'apply';
 
 interface TopBarProps {
   wsConnected?: boolean;
   env?: string;
   onEnvChange?: (env: string) => void;
-  onPreview?: () => Promise<void>;
   onApply?: () => Promise<void>;
-  onDestroy?: () => Promise<void>;
-  onReset?: () => void;
+  onViewCode?: () => void;
+  codeOpen?: boolean;
 }
 
-export default function TopBar({ wsConnected, env, onEnvChange, onPreview, onApply, onDestroy, onReset }: TopBarProps) {
+export default function TopBar({ wsConnected, env, onEnvChange, onApply, onViewCode, codeOpen }: TopBarProps) {
   const [busy, setBusy] = useState<Busy>(null);
-  const [armed, setArmed] = useState<null | 'destroy' | 'reset'>(null);
   const [backendUp, setBackendUp] = useState(false);
-  const [agentUp, setAgentUp] = useState(false);
   const [envs, setEnvs] = useState<string[]>([]);
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const mountedRef = useRef(true);
-  const armTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -43,7 +39,6 @@ export default function TopBar({ wsConnected, env, onEnvChange, onPreview, onApp
       const res = await fetch(`${API}/health`).then(r => r.json()).catch(() => null);
       if (!mountedRef.current) return;
       setBackendUp(!!res);
-      setAgentUp(res?.agent ?? false);
     };
     poll();
     const interval = setInterval(poll, 5000);
@@ -67,14 +62,6 @@ export default function TopBar({ wsConnected, env, onEnvChange, onPreview, onApp
     if (busy) return;
     setBusy(action);
     try { await fn?.(); } finally { if (mountedRef.current) setBusy(null); }
-  };
-
-  // Click-to-arm for the two irreversible actions: first click arms (~2.5s), second commits.
-  const onDanger = (which: 'destroy' | 'reset', commit: () => void) => () => {
-    if (armTimer.current) clearTimeout(armTimer.current);
-    if (armed === which) { setArmed(null); commit(); return; }
-    setArmed(which);
-    armTimer.current = setTimeout(() => mountedRef.current && setArmed(null), 2500);
   };
 
   // Cmd/Ctrl+Enter is the commit chord -> Apply.
@@ -101,7 +88,6 @@ export default function TopBar({ wsConnected, env, onEnvChange, onPreview, onApp
 
   const backendLed: LedState = backendUp ? 'green' : 'red';
   const wsLed: LedState = wsConnected ? 'green' : backendUp ? 'yellow' : 'red';
-  const agentLed: LedState = agentUp ? 'green' : backendUp ? 'yellow' : 'red';
 
   const disabled = !!busy || !backendUp;
   const dim = disabled ? 'opacity-40 cursor-not-allowed' : '';
@@ -121,10 +107,6 @@ export default function TopBar({ wsConnected, env, onEnvChange, onPreview, onApp
           <Led state={wsLed} />
           WebSocket
         </div>
-        <div className="flex items-center gap-1.5 text-text-secondary" title={agentUp ? 'Agent ready' : 'Agent unavailable'}>
-          <Led state={agentLed} />
-          Agent
-        </div>
       </div>
       <div className="flex-1"></div>
       <input
@@ -140,28 +122,20 @@ export default function TopBar({ wsConnected, env, onEnvChange, onPreview, onApp
         {envs.map(e => <option key={e} value={e} />)}
       </datalist>
       <button
-        onClick={run('preview', onPreview)}
-        disabled={disabled}
-        title="Preview the AI's proposed config changes before applying"
-        className={`font-mono text-xs py-1.5 px-3 border border-border-bright bg-bg-tertiary text-text-secondary uppercase tracking-[1px] transition-all duration-200 hover:text-neon-blue hover:border-neon-blue ${busy === 'preview' ? 'opacity-50 cursor-wait' : dim || 'cursor-pointer'}`}
-      >
-        {busy === 'preview' ? 'Preview…' : 'Preview'}
-      </button>
-      <button
         onClick={run('apply', onApply)}
         disabled={disabled}
-        title="Run the canvas for real (⌘↵): containers via Colima, AWS via embedded MiniStack"
+        title="Run the canvas for real (⌘↵): containers via Colima, AWS-shaped resources on real open-source backings"
         className={`font-mono text-xs py-1.5 px-4 border border-neon-green bg-bg-tertiary text-neon-green uppercase tracking-[1px] transition-all duration-200 hover:bg-[rgba(0,255,136,0.1)] hover:shadow-[0_0_12px_rgba(0,255,136,0.2)] ${busy === 'apply' ? 'opacity-50 cursor-wait' : dim || 'cursor-pointer'}`}
       >
         {busy === 'apply' ? 'Applying…' : 'Apply'}
       </button>
       <button
-        onClick={onDanger('destroy', () => run('destroy', onDestroy)())}
-        disabled={!!busy || !backendUp}
-        title="Tear down everything (containers + AWS resources) for this env"
-        className={`font-mono text-xs py-1.5 px-4 border border-neon-red bg-bg-tertiary text-neon-red uppercase tracking-[1px] transition-all duration-200 hover:bg-[rgba(255,51,85,0.1)] hover:shadow-[0_0_12px_rgba(255,51,85,0.2)] ${armed === 'destroy' ? 'bg-[rgba(255,51,85,0.15)] shadow-[0_0_12px_rgba(255,51,85,0.3)]' : ''} ${(!!busy || !backendUp) ? dim : 'cursor-pointer'}`}
+        onClick={onViewCode}
+        disabled={!backendUp}
+        title="View the generated Terraform for this canvas"
+        className={`font-mono text-xs py-1.5 px-3 border bg-bg-tertiary transition-all duration-200 ${codeOpen ? 'border-neon-purple text-neon-purple bg-[rgba(170,85,255,0.1)]' : 'border-border-bright text-text-muted hover:bg-bg-hover hover:text-text-primary'} ${!backendUp ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer'}`}
       >
-        {busy === 'destroy' ? 'Destroying…' : armed === 'destroy' ? `Confirm? (${env})` : 'Destroy'}
+        {'{ }'}
       </button>
       <div className="relative" ref={menuRef}>
         <button
@@ -177,12 +151,6 @@ export default function TopBar({ wsConnected, env, onEnvChange, onPreview, onApp
               className="w-full text-left font-mono text-xs py-2 px-4 text-text-secondary hover:bg-bg-tertiary hover:text-neon-blue transition-colors uppercase tracking-[1px]"
             >
               Export Canvas
-            </button>
-            <button
-              onClick={onDanger('reset', () => { onReset?.(); setMenuOpen(false); })}
-              className={`w-full text-left font-mono text-xs py-2 px-4 hover:bg-bg-tertiary transition-colors uppercase tracking-[1px] ${armed === 'reset' ? 'text-neon-red bg-[rgba(255,51,85,0.08)]' : 'text-text-secondary hover:text-neon-red'}`}
-            >
-              {armed === 'reset' ? 'Confirm reset?' : 'Reset Canvas'}
             </button>
           </div>
         )}

@@ -1,18 +1,17 @@
-"""S2.3 — the Reconciler loop, driven against fakes (no Colima / no MiniStack)."""
+"""S2.3 — the Reconciler loop, driven against fakes (no Colima, no real backings)."""
 from __future__ import annotations
 
+import asyncio
+import time
 
+from odin.gateway.policy import compile_policies
+from odin.gateway.stores import SynthStores
 from odin.reconcile.reconciler import Reconciler
 from odin.runtime.colima import _STATUS_TO_PHASE, ContainerFacts, HostFacts, RunHandle
-from odin.spec.models import FieldValue, Ref, ResourceDesired, Stack
+from odin.spec.models import Edge, FieldValue, ResourceDesired, Stack
 from odin.spec.store import SpecStore
 
 DB = ResourceDesired(id="db", kind="rds", fields={"engine": FieldValue(value="postgres")})
-API = ResourceDesired(
-    id="api", kind="service",
-    fields={"image": FieldValue(value="app:latest"), "port": FieldValue(value=8000)},
-    refs=(Ref(var="DATABASE_URL", target_id="db", target_attr="DATABASE_URL"),),
-)
 
 
 class FakeRuntime:
@@ -67,123 +66,82 @@ class FakeRds:
         return ("127.0.0.1", 15432) if self.available else None
 
     def container_name(self, db_id):
-        return f"ministack-rds-{db_id}"
+        return f"allfather-rds-default-{db_id}"
+
+
+class FakeAws:
+    def __init__(self):
+        self.provisioned, self.gc_calls, self.ensured = [], [], []
+
+    def ensure_backing(self, service):
+        self.ensured.append(service)
+
+    def provision(self, service, name, subscriptions=()):
+        self.provisioned.append((service, name, subscriptions))
+
+    def exists(self, service, name):
+        return True
+
+    def deprovision(self, service, name):
+        pass
+
+    def facts(self, service, name):
+        return {"endpoint": "http://host.docker.internal:9000"}
+
+    def gc(self, active_kinds):
+        self.gc_calls.append(active_kinds)
+
+    def backing_ports(self):
+        return {"s3": 9000}
+
+
+class FakeGateway:
+    def __init__(self):
+        self.calls = []
+
+    def update(self, env, statements_by_node, backing_ports):
+        self.calls.append((env, statements_by_node, backing_ports))
 
 
 async def _yes(*a, **k):
     return True
 
 
-def _recon(tmp_path, rt, rds, **kw):
-    store = SpecStore(tmp_path)
-    store.apply(Stack(resources=(DB, API)))
-    return store, Reconciler(store, rt, rds, http_ok=_yes, pg_ready=_yes,
-                             poll_interval=0, **kw)
-
-
-async def test_brings_app_up_after_db(tmp_path):
+async def test_db_reaches_healthy(tmp_path):
     rt, rds = FakeRuntime(), FakeRds()
-    store, recon = _recon(tmp_path, rt, rds)
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(DB,)))
+    recon = Reconciler(store, rt, rds, pg_ready=_yes, poll_interval=0)
 
-    await recon.tick()                       # create db; api blocked
+    await recon.tick()                       # create db
     assert "db" in rds.created
     assert store.current_world().get("db").phase == "starting"
-    assert store.current_world().get("api").phase == "blocked"
-    assert "api" not in rt.runs              # gated on db
 
     rds.available = True
-    await recon.tick()                       # db -> healthy; api runs
+    await recon.tick()                       # db -> healthy
     assert store.current_world().get("db").phase == "healthy"
     assert store.current_world().get("db").facts["DATABASE_URL"].startswith("postgresql://")
-    assert "api" in rt.runs
-
-    await recon.tick()                       # api -> healthy
-    assert store.current_world().get("api").phase == "healthy"
-
-
-async def test_restarts_crashed_service(tmp_path):
-    rt, rds = FakeRuntime(), FakeRds()
-    rds.available = True
-    store, recon = _recon(tmp_path, rt, rds)
-    for _ in range(3):
-        await recon.tick()
-    assert store.current_world().get("api").phase == "healthy"
-
-    rt.set("api", "exited", exit_code=1)     # the container dies
-    await recon.tick()                       # observe crashed -> plan restart
-    assert rt.runs.count("api") == 2         # restarted
-    assert store.current_world().get("api").phase == "starting"
 
 
 async def test_destroy_then_reapply_recreates_db(tmp_path):
     rt, rds = FakeRuntime(), FakeRds()
     rds.available = True
-    store, recon = _recon(tmp_path, rt, rds)
-    for _ in range(3):
-        await recon.tick()
-    assert store.current_world().get("api").phase == "healthy"
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(DB,)))
+    recon = Reconciler(store, rt, rds, pg_ready=_yes, poll_interval=0)
+    for _ in range(2):
+        await recon.tick()                    # create db, then observe it healthy
+    assert store.current_world().get("db").phase == "healthy"
 
     store.apply(Stack())                  # destroy: empty desired state
     await recon.tick()
     assert store.current_world().resources == ()        # pruned
     assert rds.available is False                        # delete_db was called
 
-    store.apply(Stack(resources=(DB, API)))             # re-apply
+    store.apply(Stack(resources=(DB,)))                 # re-apply
     rds.available = True
     await recon.tick()
     assert rds.created.count("db") == 2                 # re-created, not skipped
-
-
-async def test_scheduler_queues_over_budget_then_runs_when_freed(tmp_path):
-    from odin.reconcile.scheduler import Scheduler
-
-    rt, rds = FakeRuntime(), FakeRds()
-    store = SpecStore(tmp_path)
-    a = ResourceDesired(id="a", kind="service",
-                        fields={"image": FieldValue(value="x"), "memory_mib": FieldValue(value=200)})
-    b = ResourceDesired(id="b", kind="service",
-                        fields={"image": FieldValue(value="x"), "memory_mib": FieldValue(value=200)})
-    store.apply(Stack(resources=(a, b)))
-    recon = Reconciler(store, rt, rds, scheduler=Scheduler(budget_mib=300),
-                       http_ok=_yes, pg_ready=_yes, poll_interval=0)
-
-    await recon.tick()                       # only one 200-MiB service fits in 300
-    phases = sorted([store.current_world().get("a").phase,
-                     store.current_world().get("b").phase])
-    assert phases == ["queued", "starting"]  # one ran, one queued
-
-    store.apply(Stack(resources=(b,)))       # drop a -> frees memory
-    await recon.tick()                       # b now fits and runs
-    assert "b" in rt.runs
-
-
-async def test_llm_evicted_to_make_room_for_service(tmp_path):
-    from odin.reconcile.scheduler import Scheduler
-
-    rt, rds = FakeRuntime(), FakeRds()
-    store = SpecStore(tmp_path)
-    llm = ResourceDesired(id="model", kind="llm",
-                          fields={"image": FieldValue(value="m"), "port": FieldValue(value=1234),
-                                  "memory_mib": FieldValue(value=200)})
-    svc = ResourceDesired(id="svc", kind="service",
-                          fields={"image": FieldValue(value="s"), "memory_mib": FieldValue(value=200)})
-    store.apply(Stack(resources=(llm,)))
-    recon = Reconciler(store, rt, rds, scheduler=Scheduler(budget_mib=300),
-                       http_ok=_yes, pg_ready=_yes, poll_interval=0)
-
-    await recon.tick()                       # the model loads...
-    await recon.tick()                       # ...and goes healthy
-    assert store.current_world().get("model").phase == "healthy"
-
-    store.apply(Stack(resources=(llm, svc)))  # a service now needs memory
-    await recon.tick()                        # evict the model to fit the service
-    assert store.current_world().get("model").phase == "evicted"
-    assert "svc" in rt.runs
-
-    store.apply(Stack(resources=(llm,)))      # pressure clears: drop the service
-    await recon.tick()                        # the evicted model must come back
-    assert store.current_world().get("model").phase == "starting"
-    assert rt.runs.count("model") == 2        # re-admitted, not stranded
 
 
 async def test_unchanged_status_is_not_rebroadcast(tmp_path):
@@ -197,7 +155,7 @@ async def test_unchanged_status_is_not_rebroadcast(tmp_path):
         async def broadcast(self, msg):
             sent.append(msg)
 
-    recon = Reconciler(store, rt, rds, ws=FakeWS(), http_ok=_yes, pg_ready=_yes, poll_interval=0)
+    recon = Reconciler(store, rt, rds, ws=FakeWS(), pg_ready=_yes, poll_interval=0)
     for _ in range(5):
         await recon.tick()                    # db goes healthy, then stays healthy
     healthy = [m for m in sent if m.get("resource_id") == "db" and m.get("phase") == "healthy"]
@@ -215,7 +173,7 @@ async def test_destroy_broadcasts_draft_reset_so_canvas_clears(tmp_path):
         async def broadcast(self, msg):
             sent.append(msg)
 
-    recon = Reconciler(store, rt, rds, ws=FakeWS(), http_ok=_yes, pg_ready=_yes, poll_interval=0)
+    recon = Reconciler(store, rt, rds, ws=FakeWS(), pg_ready=_yes, poll_interval=0)
     await recon.tick()                        # db -> starting
     store.apply(Stack())                      # destroy
     await recon.tick()                        # prune db
@@ -228,74 +186,219 @@ async def test_rds_crash_clears_record_and_recreates(tmp_path):
     rds.available = True
     store = SpecStore(tmp_path)
     store.apply(Stack(resources=(DB,)))
-    recon = Reconciler(store, rt, rds, http_ok=_yes, pg_ready=_yes, poll_interval=0)
+    recon = Reconciler(store, rt, rds, pg_ready=_yes, poll_interval=0)
     await recon.tick()                        # create db
     await recon.tick()                        # db healthy
     assert store.current_world().get("db").phase == "healthy"
     assert rds.created.count("db") == 1
 
-    rt.set("ministack-rds-db", "exited", exit_code=1)  # the DB container dies
+    rt.set("allfather-rds-default-db", "exited", exit_code=1)  # the DB container dies
     # one tick: observe sees crashed -> clears the stale record -> plan recreates
     await recon.tick()
     assert rds.available is False             # delete_db was called (the fix)
     assert rds.created.count("db") == 2       # recreated (AlreadyExists would block this without the delete)
 
 
-async def test_aws_env_injected_into_app_containers(tmp_path):
-    rt, rds = FakeRuntime(), FakeRds()
-    rds.available = True
+async def test_gc_called_every_tick_with_active_kinds(tmp_path):
+    rt, rds, aws = FakeRuntime(), FakeRds(), FakeAws()
     store = SpecStore(tmp_path)
-    store.apply(Stack(resources=(DB, API)))
-    recon = Reconciler(store, rt, rds, http_ok=_yes, pg_ready=_yes, poll_interval=0,
-                       aws_env=lambda: {"AWS_ENDPOINT_URL": "http://host.docker.internal:4566"})
-    for _ in range(3):
-        await recon.tick()
-    spec = rt.specs["api"]
-    assert spec.env["AWS_ENDPOINT_URL"] == "http://host.docker.internal:4566"
-    assert spec.env["DATABASE_URL"].startswith("postgresql://")  # ref still wins/coexists
+    store.apply(Stack())
+    recon = Reconciler(store, rt, rds, aws=aws, pg_ready=_yes, poll_interval=0)
+    await recon.tick()
+    assert aws.gc_calls == [set()]  # empty stack -> every backing is stoppable
 
 
-async def test_dep_healthy_publishes_endpoint(tmp_path):
+async def test_hold_blocks_ticks_until_released(tmp_path):
+    # The /apply-full race (S5 e2e v8): the route's ensure phase boots
+    # backings BEFORE the new stack is committed, while the background loop
+    # keeps ticking against the OLD (empty) stack — whose gc(set()) stops
+    # the very containers being ensured. hold() must make ticks wait.
+    rt, rds, aws = FakeRuntime(), FakeRds(), FakeAws()
+    store = SpecStore(tmp_path)
+    store.apply(Stack())
+    recon = Reconciler(store, rt, rds, aws=aws, pg_ready=_yes, poll_interval=0)
+    async with recon.hold():
+        tick_task = asyncio.create_task(recon.tick())
+        await asyncio.sleep(0.05)  # give the tick every chance to run
+        assert aws.gc_calls == []  # blocked: no gc while held
+    await tick_task
+    assert aws.gc_calls == [set()]  # released: the tick proceeded
+
+
+async def test_gateway_updated_every_tick_with_compiled_policies_and_backing_ports(tmp_path):
+    rt, rds, aws, gw = FakeRuntime(), FakeRds(), FakeAws(), FakeGateway()
+    store = SpecStore(tmp_path)
+    stack = Stack(
+        resources=(ResourceDesired(id="uploads", kind="s3"),),
+        edges=(Edge(src="app", dst="uploads", kind="iam", perms=("s3:GetObject",)),),
+    )
+    store.apply(stack)
+    recon = Reconciler(store, rt, rds, aws=aws, gateway=gw, pg_ready=_yes, poll_interval=0)
+
+    await recon.tick()
+    assert len(gw.calls) == 1
+    env, statements_by_node, backing_ports = gw.calls[0]
+    assert env == "default"
+    assert statements_by_node == compile_policies(stack)
+    assert backing_ports == {"s3": 9000}
+
+    await recon.tick()                        # cheap + idempotent: pushed every pass
+    assert len(gw.calls) == 2
+
+
+async def test_ensure_backings_boots_containers_and_routes_the_gateway_without_provisioning(tmp_path):
+    # S5's /apply-full pre-flight: get the gateway routable for tofu WITHOUT
+    # racing tofu's own resource creation (ensure_backing only starts the
+    # container -- provision(), which actually creates the resource, is
+    # never called here).
+    rt, rds, aws, gw = FakeRuntime(), FakeRds(), FakeAws(), FakeGateway()
+    store = SpecStore(tmp_path)
+    stack = Stack(resources=(
+        ResourceDesired(id="uploads", kind="s3"),
+        ResourceDesired(id="jobs", kind="sqs"),
+        DB,  # rds is not PROVISIONED -- must be excluded from ensure_backing calls
+    ))
+    store.apply(stack)
+    recon = Reconciler(store, rt, rds, aws=aws, gateway=gw, pg_ready=_yes, poll_interval=0)
+
+    await recon.ensure_backings(stack)
+
+    assert set(aws.ensured) == {"s3", "sqs"}
+    assert aws.provisioned == []  # no resource created -- that's tofu's job
+    assert gw.calls == [("default", compile_policies(stack), {"s3": 9000})]
+
+
+async def test_ensure_backings_is_a_noop_without_an_aws_seam(tmp_path):
+    rt, rds, gw = FakeRuntime(), FakeRds(), FakeGateway()
+    store = SpecStore(tmp_path)
+    stack = Stack(resources=(ResourceDesired(id="uploads", kind="s3"),))
+    store.apply(stack)
+    recon = Reconciler(store, rt, rds, gateway=gw, pg_ready=_yes, poll_interval=0)
+
+    await recon.ensure_backings(stack)  # must not raise
+
+    assert gw.calls == []  # nothing to route without an aws seam
+
+
+async def test_gateway_update_uses_empty_ports_without_an_aws_seam(tmp_path):
+    rt, rds, gw = FakeRuntime(), FakeRds(), FakeGateway()
+    store = SpecStore(tmp_path)
+    store.apply(Stack())
+    recon = Reconciler(store, rt, rds, gateway=gw, pg_ready=_yes, poll_interval=0)
+    await recon.tick()
+    assert gw.calls == [("default", {}, {})]
+
+
+async def test_no_gateway_configured_does_not_crash_tick(tmp_path):
     rt, rds = FakeRuntime(), FakeRds()
     store = SpecStore(tmp_path)
-    redis = ResourceDesired(id="redis", kind="dep",
-                            fields={"image": FieldValue(value="redis:7"),
-                                    "port": FieldValue(value=6379)})
-    store.apply(Stack(resources=(redis,)))
-    recon = Reconciler(store, rt, rds, http_ok=_yes, pg_ready=_yes, tcp_ok=_yes, poll_interval=0)
-
-    await recon.tick()                       # run redis -> starting
-    await recon.tick()                       # observe running -> healthy
-    obs = store.current_world().get("redis")
-    assert obs.phase == "healthy"
-    assert obs.facts["endpoint"].startswith("127.0.0.1:")  # referenceable by other nodes
-    assert obs.facts["PORT"] == 18080
+    store.apply(Stack())
+    recon = Reconciler(store, rt, rds, pg_ready=_yes, poll_interval=0)
+    await recon.tick()  # gateway=None is the default; must not raise
 
 
-async def test_batch_runs_to_completion_no_restart(tmp_path):
+class SlowAws(FakeAws):
+    """provision takes real time (as a container boot does), widening the
+    window in which a second tick can plan on the not-yet-updated world."""
+
+    def provision(self, service, name, subscriptions=()):
+        time.sleep(0.05)
+        super().provision(service, name, subscriptions)
+
+
+async def test_concurrent_ticks_do_not_double_provision(tmp_path):
+    # /apply's synchronous tick overlaps the background loop's tick (tick
+    # yields at to_thread) — unserialized, both plan on the same pre-provision
+    # world and double-provision (live: two `docker run` on one backing name).
+    rt, rds, aws = FakeRuntime(), FakeRds(), SlowAws()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(ResourceDesired(id="uploads", kind="s3"),)))
+    recon = Reconciler(store, rt, rds, aws=aws, pg_ready=_yes, poll_interval=0)
+    await asyncio.gather(recon.tick(), recon.tick())
+    assert aws.provisioned == [("s3", "uploads", ())]
+
+
+# --- TF-owned status projection (fix-wave 2b finding #1): vpc/subnet/sg/
+# ec2/ecs/lambda/iam_role/ecr are created ONLY by tofu (never by this
+# reconciler's own plan/execute), but a Reconciler wired with `stores=` still
+# projects the gateway's synth stores into World every tick -- else these
+# kinds show a permanently stale DRAFT badge on the canvas even once tofu
+# has a real VM/role/etc. up. ------------------------------------------------
+
+
+async def test_tf_owned_resource_becomes_healthy_via_projection(tmp_path):
     rt, rds = FakeRuntime(), FakeRds()
     store = SpecStore(tmp_path)
-    job = ResourceDesired(id="job", kind="batch",
-                          fields={"image": FieldValue(value="busybox")})
-    store.apply(Stack(resources=(job,)))
-    recon = Reconciler(store, rt, rds, http_ok=_yes, pg_ready=_yes, poll_interval=0)
+    store.apply(Stack(resources=(ResourceDesired(id="net", kind="vpc"),)))
+    stores = SynthStores(tmp_path)
+    stores.ec2net.set("default", "vpc:vpc-1", {"vpc_id": "vpc-1"})
+    stores.tags.set("default", "ec2:vpc-1", {"odin:node": "net"})
+    recon = Reconciler(store, rt, rds, pg_ready=_yes, poll_interval=0, stores=stores)
 
-    await recon.tick()                       # run the job
-    assert "job" in rt.runs
-    assert store.current_world().get("job").phase == "running"
+    await recon.tick()
 
-    rt.set("job", "exited", exit_code=0)     # the job finishes successfully
-    await recon.tick()                       # observe -> done
-    assert store.current_world().get("job").phase == "done"
-
-    await recon.tick()                       # terminal: never restarts
-    assert rt.runs.count("job") == 1
+    observed = store.current_world().get("net")
+    assert observed.kind == "vpc"
+    assert observed.phase == "healthy"
 
 
-async def test_blocked_ref_times_out_to_error(tmp_path):
-    rt, rds = FakeRuntime(), FakeRds()       # rds never becomes available
-    store, recon = _recon(tmp_path, rt, rds, ref_timeout=0.0)
-    await recon.tick()                       # api blocked
-    await recon.tick()                       # past timeout -> error
-    assert store.current_world().get("api").phase == "error"
-    assert "api" not in rt.runs
+async def test_tf_owned_resource_pruned_when_tofu_destroys_it(tmp_path):
+    rt, rds = FakeRuntime(), FakeRds()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(ResourceDesired(id="net", kind="vpc"),)))
+    stores = SynthStores(tmp_path)
+    stores.ec2net.set("default", "vpc:vpc-1", {"vpc_id": "vpc-1"})
+    stores.tags.set("default", "ec2:vpc-1", {"odin:node": "net"})
+    recon = Reconciler(store, rt, rds, pg_ready=_yes, poll_interval=0, stores=stores)
+    await recon.tick()
+    assert store.current_world().get("net") is not None
+
+    stores.ec2net.delete("default", "vpc:vpc-1")  # tofu destroy already ran
+    await recon.tick()
+
+    assert store.current_world().get("net") is None
+
+
+async def test_ec2_instance_phase_reflects_real_state_name(tmp_path):
+    rt, rds = FakeRuntime(), FakeRds()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(ResourceDesired(id="server", kind="ec2"),)))
+    stores = SynthStores(tmp_path)
+    stores.ec2compute.set("default", "instance:i-1", {"instance_id": "i-1", "state_name": "running"})
+    stores.tags.set("default", "ec2:i-1", {"odin:node": "server"})
+    recon = Reconciler(store, rt, rds, pg_ready=_yes, poll_interval=0, stores=stores)
+
+    await recon.tick()
+
+    observed = store.current_world().get("server")
+    assert observed.kind == "ec2"
+    assert observed.phase == "healthy"
+
+
+async def test_stale_tf_owned_world_entry_never_calls_runtime_stop(tmp_path):
+    # A canvas node removed WITHOUT a tofu destroy having run yet (e.g. a
+    # canvas edit ahead of the next Apply) leaves plan() seeing "observed but
+    # no longer desired" -> a StopContainer action -- tofu, never
+    # `self._rt.stop`, owns tearing down a TF-managed resource.
+    rt, rds = FakeRuntime(), FakeRds()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(ResourceDesired(id="net", kind="vpc"),)))
+    stores = SynthStores(tmp_path)
+    stores.ec2net.set("default", "vpc:vpc-1", {"vpc_id": "vpc-1"})
+    stores.tags.set("default", "ec2:vpc-1", {"odin:node": "net"})
+    recon = Reconciler(store, rt, rds, pg_ready=_yes, poll_interval=0, stores=stores)
+    await recon.tick()  # "net" enters World, healthy
+
+    store.apply(Stack())  # the canvas node is gone; the synth store record still exists
+    await recon.tick()
+
+    assert rt.stopped == []
+
+
+async def test_no_stores_configured_does_not_crash_tick(tmp_path):
+    rt, rds = FakeRuntime(), FakeRds()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(ResourceDesired(id="net", kind="vpc"),)))
+    recon = Reconciler(store, rt, rds, pg_ready=_yes, poll_interval=0)  # stores=None is the default
+    await recon.tick()  # must not raise
+    assert store.current_world().get("net") is None  # nothing to project without stores

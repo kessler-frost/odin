@@ -99,12 +99,38 @@ class MeshResource(BaseModel):
     endpoint: str | None = None
 
 
+class VpcNetwork(BaseModel):
+    """A canvas VPC's membership in the env's Nebula network (task V1b --
+    per-env mesh, so `network` == env; 1:1 while V1 canvases carry one VPC
+    per env)."""
+    vpc_id: str
+    cidr_block: str
+    network: str
+
+
+class SgFirewall(BaseModel):
+    """A security group's compiled Nebula firewall -- exactly what a node
+    config's `firewall:` section consumes at V3 (golden-tested through
+    `NebulaManager.generate_config`). REAL but dormant in V1: no VM is on
+    the mesh yet."""
+    sg_id: str
+    vpc_id: str
+    group_name: str
+    firewall: FirewallRules = FirewallRules()
+
+
 class MeshState(BaseModel):
     """The read model a mesh UI / control plane builds on (the reason Nebula
-    was chosen over Tailscale: a self-owned, introspectable mesh)."""
+    was chosen over Tailscale: a self-owned, introspectable mesh).
+
+    `vpcs` / `security_groups` (task V1b): the canvas's VPCs and security
+    groups projected onto the mesh -- see `fabric/nebula.py::_ec2net_networks`.
+    """
     network: str
     base_cidr: str = "10.42.0.0/16"
     lighthouse_ip: str = "10.42.0.1"
     lighthouse_underlay: str | None = None
     hosts: list[HostMembership] = []
     resources: list[MeshResource] = []
+    vpcs: list[VpcNetwork] = []
+    security_groups: list[SgFirewall] = []

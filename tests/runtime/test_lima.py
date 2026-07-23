@@ -12,7 +12,7 @@ class FakeRunner:
         self.calls: list[list[str]] = []
         self.responses: dict[str, _Proc] = {}
 
-    def __call__(self, args):
+    def __call__(self, args, input=None):
         self.calls.append(args)
         joined = " ".join(args)
         for key, resp in self.responses.items():
@@ -23,7 +23,7 @@ class FakeRunner:
 
 def test_conforms_to_runtime_driver_protocol():
     rt: RuntimeDriver = LimaRuntime(runner=FakeRunner())
-    for method in ("ensure_host", "run_container", "stop", "facts", "stats"):
+    for method in ("ensure_host", "run_container", "stop", "facts", "stats", "image_exists", "build"):
         assert callable(getattr(rt, method))
 
 
@@ -33,12 +33,14 @@ def test_run_container_goes_through_nerdctl_in_the_vm():
     rt = LimaRuntime(runner=runner)
 
     handle = rt.run_container(ContainerSpec(
-        name="job", image="busybox", env={"K": "v"}, ports={8000: 18080}, command=("true",)))
+        name="job", image="busybox", env={"K": "v"}, ports={8000: 18080},
+        command=("true",), volumes={"/host/conf": "/conf"}))
     assert handle.id == "abc123" and handle.name == "job"
 
     run_call = next(c for c in runner.calls if "busybox" in c)
     assert run_call[:5] == ["limactl", "shell", "allfather-host", "sudo", "nerdctl"]
     assert "-e" in run_call and "K=v" in run_call
+    assert "-v" in run_call and "/host/conf:/conf" in run_call
     assert "18080:8000" in run_call and run_call[-1] == "true"
 
 
@@ -50,3 +52,44 @@ def test_status_and_exit_code_inspect_in_vm():
     assert rt.status("job") == "exited"
     assert rt.exit_code("job") == 0
     assert rt.facts("job").phase == "crashed"  # exited -> crashed phase
+
+
+def test_build_pipes_the_dockerfile_through_limactl_shell_into_nerdctl():
+    class RecordingRunner(FakeRunner):
+        def __init__(self):
+            super().__init__()
+            self.inputs: list[str | None] = []
+
+        def __call__(self, args, input=None):
+            self.inputs.append(input)
+            return super().__call__(args, input=input)
+
+    runner = RecordingRunner()
+    rt = LimaRuntime(runner=runner)
+
+    rt.build("odin-dynalite:1", "FROM node:20-alpine\n")
+
+    build_call = next(c for c in runner.calls if "build" in c)
+    assert build_call == [
+        "limactl", "shell", "allfather-host", "sudo", "nerdctl",
+        "build", "-t", "odin-dynalite:1", "-",
+    ]
+    assert runner.inputs == ["FROM node:20-alpine\n"]
+
+
+def test_image_exists_inspects_through_the_vm():
+    runner = FakeRunner()
+    runner.responses["image inspect"] = _Proc(0, "sha256:abc")
+    rt = LimaRuntime(runner=runner)
+    assert rt.image_exists("odin-dynalite:1") is True
+
+
+def test_image_exists_false_on_dockers_empty_array_stdout():
+    # REAL docker/nerdctl prints literal "[]" to stdout (rc=1) for a missing
+    # image — a truthy string. This exact behavior skipped the dynalite image
+    # build in S5's e2e (bool("[]") is True), so the inspect MUST use a
+    # format template whose output is empty when the image is absent.
+    runner = FakeRunner()
+    runner.responses["image inspect"] = _Proc(1, "[]")
+    rt = LimaRuntime(runner=runner)
+    assert rt.image_exists("odin-dynalite:1") is False

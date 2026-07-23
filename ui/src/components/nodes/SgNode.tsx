@@ -5,11 +5,15 @@ export type SgNodeData = {
   label: string;
   groupId: string;
   vpcId: string;
+  ingressRules: string;
   status: string;
+  vpc?: string;    // containment-stamped: the VPC whose rect holds this node's center
+  subnet?: string; // containment-stamped: the deepest subnet holding this node's center
 };
 
 export default function SgNode({ data, selected }: NodeProps) {
-  const { label, groupId, vpcId, status } = data as SgNodeData;
+  const { label, groupId, vpcId, status, vpc, subnet } = data as SgNodeData;
+  const containedIn = subnet ?? vpc;
   return (
     <div className="w-full h-full border border-neon-red bg-bg-secondary shadow-[0_0_15px_rgba(255,51,85,0.08)]">
       <NodeResizer
@@ -30,6 +34,7 @@ export default function SgNode({ data, selected }: NodeProps) {
       </div>
       <div className="flex flex-col justify-center px-3 h-10 font-mono text-[10px] text-text-secondary leading-tight">
         <span>{groupId || '—'} &bull; {vpcId || '—'}</span>
+        {containedIn && <span className="text-neon-purple/70">in {containedIn}</span>}
       </div>
     </div>
   );

@@ -2,29 +2,37 @@
 
 Each tick: (1) observe — refresh the World from runtime facts + assertions,
 advancing started resources to healthy/crashed; (2) plan(Stack, World) → Actions;
-(3) execute — create/run/stop. The pure plan() decides intent; this executor
-builds specs (resolving refs via the Fabric) and runs them. Skeleton scope:
-service + rds, single host, no scheduler.
+(3) execute — provision/stop; (4) project the gateway's TF-owned resources
+(vpc/subnet/sg/ec2/ecs/lambda/iam_role/ecr) into World too (fix-wave 2b
+finding #1 -- see reconcile/tf_status.py). The pure plan() decides intent for
+rds + the AWS-shaped PROVISIONED resources; this executor builds specs
+(resolving refs via the Fabric) and runs them; TF_OWNED_KINDS never go
+through plan/execute at all -- tofu is their sole creator/destroyer, this
+loop only OBSERVES what tofu already did.
+
+Per-node credential injection (a workload container's env bound to
+keystore-issued creds + the gateway endpoint, formerly `_run_service`) is
+deferred with the app-workload layer (NORTHSTAR.md, tag app-layer-parked) —
+it returns here when workload nodes do. What tick() does today: push
+(compiled policies, backing ports) into GatewayState every pass so the
+gateway enforces against whatever Stack is applied, even before anything
+dials in through it.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-import time
+from contextlib import asynccontextmanager
 
-from odin.aws.embed import CONTAINER_HOST
-from odin.aws.provision import PROVISIONED
-from odin.fabric.localhost import LocalhostFabric, Unresolved
+from odin.aws.backings import ENSURE_KINDS, PROVISIONED
+from odin.fabric.localhost import LocalhostFabric
+from odin.gateway.policy import compile_policies
+from odin.gateway.stores import SynthStores
 from odin.reconcile import assertions
-from odin.reconcile.actions import (
-    CreateMiniStackResource,
-    NoOp,
-    RunContainer,
-    StopContainer,
-)
+from odin.reconcile.actions import NoOp, ProvisionResource, StopContainer
 from odin.reconcile.plan import plan
-from odin.reconcile.probes import ProbeEngine
-from odin.runtime.colima import ContainerSpec
+from odin.reconcile.tf_status import TF_OWNED_KINDS, project as project_tf_owned
+from odin.runtime.colima import CONTAINER_HOST
 from odin.spec.models import ResourceDesired, Stack, World, WorldDelta
 
 log = logging.getLogger("odin.reconcile")
@@ -37,34 +45,36 @@ class Reconciler:
         runtime,
         rds,
         aws=None,
+        gateway=None,
         fabric: LocalhostFabric | None = None,
         ws=None,
         env: str = "default",
-        scheduler=None,
-        aws_env=None,
-        http_ok=assertions.http_ok,
         pg_ready=assertions.pg_ready,
-        tcp_ok=assertions.tcp_open,
-        ref_timeout: float = 30.0,
         poll_interval: float = 2.0,
+        stores: SynthStores | None = None,
     ) -> None:
         self._store = store
         self._rt = runtime
         self._rds = rds
         self._aws = aws
-        self._scheduler = scheduler
-        self._aws_env = aws_env
+        self._gateway = gateway
         self._fabric = fabric or LocalhostFabric()
         self._ws = ws
         self._env = env
-        self._http_ok = http_ok
         self._pg_ready = pg_ready
-        self._probes = ProbeEngine(http_ok, tcp_ok)
-        self._ref_timeout = ref_timeout
         self._poll = poll_interval
-        self._blocked_since: dict[str, float] = {}
+        # The gateway's synth stores (tags/ec2net/iamctl/ecr/ec2compute/
+        # lambdactl/ecsctl) -- read-only here, for the TF-owned-status
+        # projection (see tick()'s trailing step + tf_status.py). None in
+        # every test that doesn't care; server.py's real wiring always
+        # passes the SAME SynthStores instance the gateway itself uses.
+        self._stores = stores
         self._task: asyncio.Task | None = None
         self._stop = False
+        # tick() is called by BOTH the background loop and the /apply//destroy
+        # endpoints; it yields at every to_thread, so unserialized ticks plan
+        # on the same pre-execute world and double-run containers.
+        self._tick_lock = asyncio.Lock()
 
     # ---- lifecycle ----
     async def start(self) -> None:
@@ -85,24 +95,82 @@ class Reconciler:
                 log.exception("reconciler tick failed")
             await asyncio.sleep(self._poll)
 
+    @asynccontextmanager
+    async def hold(self):
+        """Block the background loop's ticks while an external author
+        mutates the env (the /apply-full route: ensure backings + tofu +
+        store commit). Without this, a tick against the not-yet-committed
+        stack gc's the very backing containers the ensure phase is booting
+        (fresh env: old stack is empty, so gc(set()) stops everything)."""
+        async with self._tick_lock:
+            yield
+
     async def tick(self) -> None:
-        stack = self._store.get_stack(self._env)
-        await self._observe(stack)
+        async with self._tick_lock:
+            stack = self._store.get_stack(self._env)
+            await self._observe(stack)
+            world = self._store.current_world(self._env)
+            for action in plan(stack, world):
+                await self._execute(action, stack)
+            if self._aws is not None:  # stop backings no active kind needs anymore
+                await asyncio.to_thread(self._aws.gc, {r.kind for r in stack.resources})
+            if self._gateway is not None:  # policies/ports always track the applied Stack
+                ports = await asyncio.to_thread(self._aws.backing_ports) if self._aws is not None else {}
+                self._gateway.update(self._env, compile_policies(stack), ports)
+            if self._stores is not None:  # fix-wave 2b finding #1: project tofu's own creations into World
+                await self._project_tf_owned()
+
+    async def _project_tf_owned(self) -> None:
+        """`tf_status.project()` is the whole snapshot; diff it against the
+        current World and emit only what changed (`_emit`'s own dedupe) plus
+        prune any label that dropped out (tofu destroyed it -- this loop
+        never destroys a TF-owned resource itself)."""
+        projected = await asyncio.to_thread(project_tf_owned, self._stores, self._env)
+        for label, (kind, phase, facts) in projected.items():
+            await self._emit(label, kind, phase, facts=facts)
         world = self._store.current_world(self._env)
-        for action in plan(stack, world):
-            await self._execute(action, stack)
+        for observed in world.resources:
+            if observed.kind in TF_OWNED_KINDS and observed.id not in projected:
+                await self._prune(observed.id)
+
+    async def ensure_backings(self, stack: Stack) -> None:
+        """Boot (but don't create any resource on) the backing containers
+        `stack`'s AWS-shaped kinds need, and register their ports + this
+        Stack's compiled policies with the gateway -- WITHOUT running
+        plan/execute. `ensure_backing` only starts a container; it never
+        touches the resources inside it, so this is safe to call ahead of an
+        external creator racing this same Stack (S5's /apply-full: tofu
+        authors the actual resources through the gateway after this call).
+        Without it, a never-before-applied env has no registered
+        `backing_port`, the gateway 503s every forward, and tofu's own
+        AWS-provider retry/backoff turns that into a long, opaque hang
+        instead of a request-scoped failure.
+
+        Uses ENSURE_KINDS (not the narrower PROVISIONED): "ecr" needs its
+        registry:2 CONTAINER booted here too (V2b), even though its actual
+        resource CRUD never runs through this instance's client()-based
+        provision/exists/deprovision -- CreateRepository's very first call
+        (via tofu, through the gateway) needs the registry's live port
+        already resolvable to build `repositoryUri`."""
+        if self._aws is None:
+            return
+        kinds = {r.kind for r in stack.resources if r.kind in ENSURE_KINDS}
+        await asyncio.gather(*(asyncio.to_thread(self._aws.ensure_backing, k) for k in kinds))
+        if self._gateway is not None:
+            ports = await asyncio.to_thread(self._aws.backing_ports)
+            self._gateway.update(self._env, compile_policies(stack), ports)
 
     # ---- helpers ----
     def _res(self, stack: Stack, rid: str) -> ResourceDesired:
         return next(r for r in stack.resources if r.id == rid)
 
+    def _kind_of(self, stack: Stack, rid: str) -> str | None:
+        return next((r.kind for r in stack.resources if r.id == rid), None)
+
     def _creds(self, res: ResourceDesired) -> tuple[str, str]:
         user = res.fields["username"].value if "username" in res.fields else "app"
         pw = res.fields["password"].value if "password" in res.fields else "apppass123"
         return str(user), str(pw)
-
-    def _port(self, res: ResourceDesired) -> int:
-        return int(res.fields["port"].value) if "port" in res.fields else 8000
 
     async def _emit(self, rid, kind, phase, facts=None, verdict=None) -> None:
         # Skip unchanged status: observe runs every tick and the cpu/ram facts
@@ -128,19 +196,24 @@ class Reconciler:
                 continue
             if res.kind == "rds" and observed.phase in ("starting", "healthy"):
                 await self._observe_rds(res)
-            elif res.kind in ("service", "dep", "llm") and observed.phase in ("starting", "healthy"):
-                await self._observe_container(res)
-            elif res.kind == "batch" and observed.phase == "running":
-                await self._observe_batch(res)
-            elif res.kind in PROVISIONED and observed.phase == "starting":
-                if await asyncio.to_thread(self._aws.exists, res.kind, res.id):
-                    await self._emit(res.id, res.kind, "healthy")
+            elif res.kind in PROVISIONED and observed.phase in ("starting", "healthy"):
+                await self._observe_provisioned(res, observed.phase)
+
+    async def _observe_provisioned(self, res: ResourceDesired, phase: str) -> None:
+        """s3/sqs/sns/dynamodb: healthy once the resource exists in its backing;
+        a healthy one whose backing lost it demotes to crashed (plan's existing
+        pending/crashed branch then re-provisions)."""
+        ok = await asyncio.to_thread(self._aws.exists, res.kind, res.id)
+        if phase == "starting" and ok:
+            facts = await asyncio.to_thread(self._aws.facts, res.kind, res.id)
+            await self._emit(res.id, res.kind, "healthy", facts=facts)
+        if phase == "healthy" and not ok:
+            await self._emit(res.id, res.kind, "crashed")
 
     async def _observe_rds(self, res: ResourceDesired) -> None:
         cname = self._rds.container_name(res.id)
         if self._rt.facts(cname).phase == "crashed":
-            # Clear MiniStack's stale record so the recreate boots a fresh DB
-            # (else create_db sees AlreadyExists and the DB never recovers).
+            # Clear the dead container so the recreate boots a fresh Postgres.
             await asyncio.to_thread(self._rds.delete_db, res.id)
             await self._emit(res.id, "rds", "crashed")
             return
@@ -160,136 +233,44 @@ class Reconciler:
                 facts={"DATABASE_URL": url, "endpoint": addr, **stats},
             )
 
-    async def _observe_container(self, res: ResourceDesired) -> None:
-        """service / dep / llm: healthy when the kind's probe passes (Assertion
-        Engine). Publishes a referenceable endpoint as World facts."""
-        facts = self._rt.facts(res.id, container_port=self._port(res))
-        if facts.phase != "starting":
-            await self._emit(res.id, res.kind, "crashed")  # exited / removed
-            return
-        if not facts.host_port:
-            return
-        if not await self._probes.healthy(res.kind, facts.host_port):
-            return  # still booting
-        published = {
-            "host_port": facts.host_port, "cpu": facts.cpu, "ram": facts.ram,
-            "endpoint": (f"http://127.0.0.1:{facts.host_port}/" if res.kind == "service"
-                         else f"127.0.0.1:{facts.host_port}"),
-        }
-        if res.kind in ("dep", "llm"):  # referenceable HOST/PORT for consumers
-            published.update({"HOST": "127.0.0.1", "PORT": facts.host_port})
-        await self._emit(res.id, res.kind, "healthy", facts=published)
-
-    async def _observe_batch(self, res: ResourceDesired) -> None:
-        status = self._rt.status(res.id)
-        if status == "running":
-            return  # still executing
-        code = self._rt.exit_code(res.id) if status in ("exited", "dead") else -1
-        if code == 0:
-            await self._emit(res.id, "batch", "done")
-        else:
-            await self._emit(res.id, "batch", "error", verdict=f"exit {code}")
-
     # ---- execute ----
     async def _execute(self, action, stack: Stack) -> None:
-        if isinstance(action, CreateMiniStackResource):
+        if isinstance(action, ProvisionResource):
             res = self._res(stack, action.id)
             if action.service == "rds":
                 user, pw = self._creds(res)
                 await asyncio.to_thread(self._rds.create_db, action.id, user, pw)
                 await self._emit(action.id, "rds", "starting")
-            else:  # control-plane AWS resource (s3/sqs/sns/dynamodb)
-                await asyncio.to_thread(self._aws.provision, action.service, action.id)
+            else:  # AWS-shaped resource in a shared backing (s3/sqs/sns/dynamodb)
+                # An sns→sqs canvas edge is a subscription: fan the topic out to
+                # those queues at provision time.
+                subs = tuple(
+                    e.dst for e in stack.edges
+                    if e.src == action.id and self._kind_of(stack, e.dst) == "sqs"
+                ) if action.service == "sns" else ()
+                await asyncio.to_thread(self._aws.provision, action.service, action.id, subs)
                 await self._emit(action.id, action.service, "starting")
-        elif isinstance(action, RunContainer):
-            await self._run_service(stack, action.id)
         elif isinstance(action, StopContainer):
             if action.kind == "rds":
-                self._rds.delete_db(action.id)  # clear MiniStack so re-apply re-boots
+                self._rds.delete_db(action.id)  # stop the DB container so re-apply re-boots
                 self._rt.stop(self._rds.container_name(action.id))
             elif action.kind in PROVISIONED:
                 await asyncio.to_thread(self._aws.deprovision, action.kind, action.id)
+            elif action.kind in TF_OWNED_KINDS:
+                # tofu (never this reconciler) owns create/destroy for a
+                # TF-managed kind -- a StopContainer here only means a stale
+                # World entry (the canvas node was removed but tofu hasn't
+                # destroyed the real resource yet); `action.name` is a
+                # label, not a real container name, so `self._rt.stop`
+                # would be a no-op at best. Just let the prune below clear
+                # the stale entry; the NEXT tick's projection re-adds it
+                # (still accurately) if the real resource is still there.
+                pass
             else:
                 self._rt.stop(action.name)
             await self._prune(action.id)
         elif isinstance(action, NoOp):
-            await self._gate_blocked(stack, action.id)
-
-    def _running_footprint(self, stack: Stack, exclude: str) -> float:
-        world = self._store.current_world(self._env)
-        by_id = {r.id: r for r in stack.resources}
-        return sum(
-            self._scheduler.footprint(by_id[obs.id])
-            for obs in world.resources
-            if obs.id != exclude and obs.id in by_id
-            and obs.phase in ("starting", "healthy", "running")
-        )
-
-    def _evictable_llms(self, stack: Stack, exclude: str) -> list:
-        world = self._store.current_world(self._env)
-        by_id = {r.id: r for r in stack.resources}
-        return [
-            by_id[obs.id] for obs in world.resources
-            if obs.id != exclude and obs.id in by_id
-            and by_id[obs.id].kind == "llm" and obs.phase in ("starting", "healthy")
-        ]
-
-    async def _run_service(self, stack: Stack, rid: str) -> None:
-        res = self._res(stack, rid)
-        if self._scheduler is not None:
-            running = self._running_footprint(stack, exclude=rid)
-            if not self._scheduler.admits(res, running):
-                # Make room by evicting idle LLMs (only for higher-priority non-llm work).
-                candidates = self._evictable_llms(stack, exclude=rid) if res.kind != "llm" else []
-                to_evict = self._scheduler.evict_for(res, candidates, running)
-                if not to_evict:
-                    await self._emit(rid, res.kind, "queued")
-                    return
-                for eid in to_evict:
-                    self._rt.stop(eid)
-                    await self._emit(eid, "llm", "evicted")
-        world = self._store.current_world(self._env)
-        env_vars: dict = dict(self._aws_env()) if self._aws_env is not None else {}
-        if "env" in res.fields:
-            env_vars.update(res.fields["env"].value)  # user env wins over injected AWS
-        for ref in res.refs:
-            env_vars[ref.var] = self._fabric.resolve(ref, world)
-        command = tuple(res.fields["command"].value) if "command" in res.fields else ()
-        spec = ContainerSpec(
-            name=rid,
-            image=str(res.fields["image"].value),
-            env={k: str(v) for k, v in env_vars.items()},
-            ports={self._port(res): 0},
-            command=command,
-        )
-        self._rt.stop(rid)  # idempotent: clear any crashed remnant before re-run
-        self._rt.run_container(spec)
-        self._blocked_since.pop(rid, None)
-        phase = "running" if res.kind == "batch" else "starting"
-        await self._emit(rid, res.kind, phase)
-
-    async def _gate_blocked(self, stack: Stack, rid: str) -> None:
-        """A service NoOp means it is waiting on an unready ref — mark blocked,
-        and fail loudly if it stays blocked past the timeout."""
-        if not rid:
-            return
-        res = next((r for r in stack.resources if r.id == rid), None)
-        if res is None or res.kind not in ("service", "batch", "dep", "llm") or not res.refs:
-            return
-        world = self._store.current_world(self._env)
-        if (obs := world.get(rid)) and obs.phase == "healthy":
-            return
-        try:
-            for ref in res.refs:
-                self._fabric.resolve(ref, world)
-            return  # all resolvable — not blocked
-        except Unresolved:
-            pass
-        first = self._blocked_since.setdefault(rid, time.monotonic())
-        if time.monotonic() - first > self._ref_timeout:
-            await self._emit(rid, res.kind, "error", verdict="reference never resolved")
-        else:
-            await self._emit(rid, res.kind, "blocked")
+            pass  # nothing left to gate on now that workload refs are gone
 
     async def _prune(self, rid: str) -> None:
         world = self._store.current_world(self._env)

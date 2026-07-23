@@ -1,10 +1,141 @@
-# allfather Roadmap
+# Odin Roadmap
 
-allfather: a Mac-native, AI-operated orchestration canvas (repo: odin, branch
-`allfather`). Drop apps + AWS resources, the AI completes config, a control loop
-runs them for real on Colima/Lima with an embedded MiniStack AWS control plane.
+Odin (repo: odin): a local-first AWS-compatible cloud. A drag-drop canvas
+where you design real AWS architectures; an agent (claude-agent-sdk)
+translates canvas ↔ Terraform/OpenTofu both ways; **Apply** — the one action
+button — runs a real `tofu apply` against odin's own gateway, which fulfills
+the AWS API calls with local substitutes (RustFS for S3, etc.) at full API
+compatibility; IAM permissions drawn as edges are **enforced for real** by
+odin's own gateway; Nebula is the network layer.
 
-## Direction (2026-06-23): local-only pivot
+## North star — the source of truth
+
+[NORTHSTAR.md](NORTHSTAR.md), set by the owner on 2026-07-22, governs every
+architecture decision here — read it before proposing or accepting any
+direction change. The project has pivoted its middle layer more than once
+(Moto → MiniStack → own gateway); the destination hasn't moved. Test every
+future decision against these points instead of re-deriving them:
+
+1. **Odin is an infra tool first** — an AWS-compatible endpoint on your Mac:
+   real AWS wire protocol, real AWS verbs, real IAM semantics. Anything built
+   on top (a canvas-driven app layer, say) sits ON TOP of that, not instead of it.
+2. **Real execution, always.** Every resource is a real local thing (RustFS,
+   goaws, dynalite, Postgres, containers, Lima VMs) — never in-memory
+   make-believe. Emulators/routers may front the wire protocol, but never
+   hold the data.
+3. **Edges = IAM permissions = the core UX.** Drawing an edge between two
+   components IS granting access (AWS verbs), enforced for real by odin's own
+   IAM engine at its gateway (real `AccessDenied`).
+4. **Nebula is the network layer, IAM is the API layer.** Separate concerns,
+   never conflated: the mesh firewall decides who can REACH whom; IAM decides
+   who may CALL what.
+5. **Dependencies are replaceable; the contract is not.** RustFS, goaws,
+   dynalite, Postgres, MiniStack's models (as a design reference) — all
+   implementation details behind odin's own AWS endpoint. Swapping one must
+   never change what a user's Terraform or boto3 code sees.
+
+## What's done and reused
+
+- **Canvas UI** — ReactFlow drag/drop/resize/connect, config panel, env
+  switcher, live status over WebSocket.
+- **Real AWS-shaped substitutes** — RustFS (S3), goaws (SQS+SNS), dynalite
+  (DynamoDB), real Postgres (RDS) — provisioned per env, supervised,
+  crash-recovering, integration-tested today.
+- **Runtime drivers** — Colima (containers) and Lima (VMs) behind one
+  `RuntimeDriver` protocol, the execution substrate EC2/ECS/Lambda substitutes
+  will run on.
+- **Nebula fabric** — cert/lighthouse/config primitives, per-env networks,
+  sticky IPs, `sg_rules_to_firewall` — the substrate for the network layer.
+- **Spec Store** (append-only revisions), per-env isolation, the events/WS
+  status pipeline, the integration-test harness, the `odin` CLI skeleton.
+- **claude-agent-sdk brain machinery** — repurposed toward canvas↔IaC
+  translation and TF generation; its typed-membrane pattern moves into the
+  translation agent's tools.
+
+## Roadmap (northstar-derived sequence)
+
+- [x] **Gateway + IAM enforcement.** DONE 2026-07-22 (G1–G5 + synthesized
+  control-plane): SigV4 verification (incl. S3 body-hash cross-check) →
+  (service, action, resource) classification → edge-compiled policy
+  evaluation → forward to substitutes (re-signed for RustFS), with
+  protocol-correct AccessDenied per service, STS identity, tag/attribute
+  stores, and ~2ms added latency. Proven by real-container acceptance tests
+  (edges grant; absence denies; foreign envs deny; a container crossed the
+  boundary via aws-cli) — re-proven live for the 0.4.0 release (fine-grained
+  per-action allow/deny against a running gateway; see README's
+  [Edges are IAM](README.md#edges-are-iam)).
+- [x] **Canvas↔Terraform translation + Apply-runs-tofu + TF import.** DONE
+  2026-07-23 (S1–S5): `tofu apply` through the gateway (operator principal),
+  the single **Apply** button (apply → translate → tofu, one call), the
+  agent-refined translation pass with a deterministic fallback when the
+  refinement fails a portability guardrail, the live Terraform code panel
+  (previews the *current* unsaved canvas, not the last-applied one), and TF
+  import (`/import-tf`: HCL text or live-state → canvas nodes) are all live.
+  Terraform-owned resources' status is projected back into `/world` so every
+  node's badge reflects reality regardless of which path provisioned it.
+- [x] **Service coverage expansion.** DONE 2026-07-23 (V1–V5, sequence per
+  the captured provider surfaces in `docs/superpowers/research/
+  research-coverage.md`): the gateway owns each service's model, bound to a
+  real substrate —
+  1. VPC / Subnet / Security Groups → Nebula (`IpPermissions` compiles
+     directly to `sg_rules_to_firewall`'s input)
+  2. IAM control-plane CRUD (roles/policies onto odin's policy store) + ECR
+     (CNCF `registry:2`, Apache-2.0 — real `docker push` verified)
+  3. EC2 as real Lima VMs (the flagship; boot ~50–60s, the provider's
+     pending→running waiter absorbs it; zero-drift)
+  4. Lambda (real AWS RIE container, Apache-2.0; apply ~6s, invoke ~40ms)
+  5. ECS (real Colima containers; scale up/down re-applies cleanly)
+
+  **v1 limits, recorded rather than hidden** (northstar directive 5's honesty
+  rule):
+  - Lambda: inline code only, `$LATEST` only — no S3-deployed packages,
+    versions, or aliases.
+  - ECS: no `network_configuration` (awsvpc/Fargate-style ENIs — odin's tasks
+    are `launch_type = "EC2"` / `network_mode = "bridge"`, which need none);
+    a task that dies between API calls isn't auto-replaced until the next
+    Apply reconciles the service; a `tags` block on `aws_ecs_service` can
+    show as drift on a subsequent `tofu plan` (ECS service tags aren't
+    echoed back from the gateway yet — `TagResource`/`ListTagsForResource`
+    isn't modeled beyond extracting the `odin:node` label).
+  - SNS→SQS: adding a subscription edge to an *already-healthy* topic
+    doesn't retroactively re-provision it (fixed on create; the live-edit
+    path is a known gap).
+  - RDS stays off Terraform — the reconciler's real Postgres container, not
+    a `tofu`-managed resource, until an RDS gateway model lands.
+  - Nebula: VPC/SG config compiles for real (single-host), but the mesh
+    daemon + lighthouse (needed to actually reach a VM's overlay IP across
+    machines) are built (`fabric/nebula.py`) and not yet wired up — folded
+    into multi-Mac support below rather than half-built now.
+- **Recorded as UNSUPPORTED for now** (northstar directive 5's honesty rule):
+  ALB/ELBv2, EKS, CloudFormation, autoscaling, and RDS-via-Terraform (rds
+  nodes stay on the reconciler path until an RDS API model lands).
+- [x] **Nebula network layer (single-host).** Security groups and VPCs drawn
+  on the canvas compile to real Nebula network + firewall primitives
+  (`fabric/nebula.py::sg_rules_to_firewall`, `ensure_network`). The
+  multi-Mac half — running an actual mesh daemon + lighthouse so a VM's
+  overlay IP is reachable from another machine — is deferred; see M7 below.
+- [ ] **odin CLI as an agent control surface.** Lets a human's or an agent's
+  (e.g. Claude Code) tooling drive the canvas and its configuration directly.
+  Today's `odin` CLI only starts/stops/inspects the server process
+  (`start`/`stop`/`status`/`clean`) — it doesn't yet drive the canvas itself.
+- [ ] **Packaging.** Bundle the external tools (colima, lima, uv, …) into one
+  distributable.
+- [ ] **M7 (multi-Mac) — the fleet.** Start the self-hosted Nebula mesh
+  daemon + lighthouse (primitives exist, not activated), add multi-Mac
+  membership and cross-machine placement. Additive, no core change.
+
+## Deprecated 2026-07-22 (superseded by NORTHSTAR.md)
+
+Everything below this line described **allfather**, a local-only "Railway,
+but with a brain" app orchestrator — the product identity before the owner's
+2026-07-22 pivot back to odin being an AWS-compatible core. The app-workload
+layer it describes (service/dep/batch/llm node kinds, the memory-aware
+scheduler, the per-kind probe registry, the claude-agent-sdk config-completion
+brain) has been ripped from live code and parked at git tag
+`app-layer-parked` — it may return as a layer on top of the AWS core later.
+Kept below for history, not as current direction.
+
+### Direction (2026-06-23): local-only pivot (superseded)
 
 **allfather is going local-only.** We're dropping the ambition to maintain AWS /
 cloud resources. The actual use cases are personal + friends/family, the local
@@ -26,28 +157,23 @@ What this means:
 - **The palette** eventually sheds the AWS nodes (VPC/EC2/S3/SQS/RDS/…) and keeps
   the local primitives (app, dependency, job, LLM, + local volumes / networks).
 
-**Nothing is deleted yet** — this only records the direction. The current
-MiniStack-backed build (v0.2.0) keeps working; the AWS/MiniStack/Pulumi path gets
-phased out over time as the local-only model is built. Everything below this
-note describes the current (pre-pivot) state and is being superseded by it.
-
 > The pre-allfather history (Moto/OpenTofu validate, the old Lima+Nebula
 > per-EC2 "Simulate" overlay) was **retired and deleted** — 21 source modules +
 > 30 test files removed. Do not resurrect Terraform/Moto/HCL or that old
 > per-VM Nebula overlay. NOTE: this is distinct from the **self-hosted Nebula
 > mesh fabric** (`fabric/nebula.py`) — a host-level mesh that IS the chosen
-> multi-Mac direction (see M7 below). Different thing; don't re-strip it.
+> multi-Mac direction. Different thing; don't re-strip it.
 
-## Done
+### Done (superseded)
 
-### Walking skeleton (S0–S3)
+#### Walking skeleton (S0–S3)
 - [x] Spec Store spine — Stack (desired) + World (observed) + append-only, content-addressed, per-env revisions
 - [x] Pure `plan(Stack, World) → [Action]` (total + idempotent) + the Reconciler loop (observe → plan → execute, supervision, ref-gating)
 - [x] MiniStack embedded in-process as the AWS control plane; its container spawn rewired to allfather's runtime (one spawn authority, no double-spawn)
 - [x] `ColimaRuntime` behind a `RuntimeDriver` protocol; localhost fabric resolving `${{node.VAR}}` from World facts
 - [x] api + RDS→real-Postgres slice, proven end-to-end (headless + browser)
 
-### Milestones
+#### Milestones
 - [x] **M1 — Brain:** `claude_complete` fills blank config (AI-tagged, user values win, best-effort); IAM review
 - [x] **M1-UX — staged changeset:** `POST /preview` returns the AI's proposed diff before Apply; Preview button; `POST /review-iam`
 - [x] **M2 — workloads:** all 4 kinds — service (HTTP-supervised), dep (any container, e.g. Redis), batch (run-to-completion), llm — plus AWS usable *by* app containers (injected endpoint/creds)
@@ -59,7 +185,7 @@ note describes the current (pre-pivot) state and is being superseded by it.
 - [x] AWS resource provisioning from canvas nodes (S3/SQS/SNS/DynamoDB created in the embed on Apply)
 - [x] **Nebula mesh fabric foundation** (`fabric/nebula.py`) — recovered cert/lighthouse/config primitives (one network per env, sticky overlay IPs) + `NebulaFabric` (a verified drop-in for the `resolve` seam) + a `mesh_state` read model and `GET /mesh?env=` for a future mesh UI. The cross-Mac *activation* (host overlay IP → World facts, World replication, placement) is M7 below.
 
-## Roadmap
+### Roadmap (superseded)
 
 - [ ] **M8 — Region-select debugging ("what's wrong here?")** — drag a selection rectangle over a canvas region → context menu ("Debug this" / "What's wrong here?" / "Fix this part" / free-form ask) → a region-scoped agent auto-gathers the enclosed nodes + edges and, for each, its World state (phase/facts/verdict/restarts) + recent events/logs + relevant Stack fields, then investigates or fixes from there. Reuses the existing Cmd+drag selection; new parts are the menu + a context-assembler that turns a selection into the agent prompt. **Point at a region instead of describing it — far less back-and-forth.**
 - [ ] **M7 (multi-Mac) — the fleet:** a **self-hosted Nebula mesh** fabric (you own the lighthouse — runs in your private network, programmable, a control-plane/UI can be built on top; chosen over Tailscale, whose SaaS coordination would limit that) + multi-Mac membership (memberlist/raft) + apple-container runtime. The Nebula fabric foundation (cert/lighthouse/config primitives + the `NebulaFabric` resolve seam) is reinstated under `fabric/nebula.py`; cross-Mac placement is the deferred part. Additive, no core change.
@@ -67,7 +193,7 @@ note describes the current (pre-pivot) state and is being superseded by it.
 - [ ] **MiniStack real-container backings** for the remaining stateful AWS services (ElastiCache→Redis, etc.) so apps use them for real, not just the API.
 - [ ] **Packaging:** bundle the external tools (colima, lima, uv, …) into one distributable.
 
-## Testing
+### Testing (superseded)
 - [x] pytest suite: 80 unit + 9 integration (real Colima/MiniStack/Lima/Claude, marker-gated)
 - [x] Browser e2e via playwright (skeleton + full-breadth scenarios)
 - [ ] Broader end-to-end scenario coverage as milestones land

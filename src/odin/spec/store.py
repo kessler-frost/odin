@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 
 from odin.spec.models import ResourceObserved, Stack, World, WorldDelta
+from odin.util import atomic_write_text
 
 
 def _canonical(stack: Stack) -> bytes:
@@ -41,9 +42,8 @@ class SpecStore:
         """Persist a Stack revision and move HEAD to it. Returns the rev."""
         rev = rev_of(stack)
         stacks = self._env_dir(stack.env) / "stacks"
-        stacks.mkdir(parents=True, exist_ok=True)
-        (stacks / f"{rev}.json").write_text(stack.model_dump_json(indent=2))
-        (self._env_dir(stack.env) / "HEAD").write_text(rev)
+        atomic_write_text(stacks / f"{rev}.json", stack.model_dump_json(indent=2))
+        atomic_write_text(self._env_dir(stack.env) / "HEAD", rev)
         return rev
 
     def list_envs(self) -> list[str]:
@@ -70,9 +70,7 @@ class SpecStore:
         return World.model_validate_json(path.read_text())
 
     def write_world(self, world: World) -> None:
-        env_dir = self._env_dir(world.env)
-        env_dir.mkdir(parents=True, exist_ok=True)
-        (env_dir / "world.json").write_text(world.model_dump_json(indent=2))
+        atomic_write_text(self._env_dir(world.env) / "world.json", world.model_dump_json(indent=2))
 
     def apply_delta(self, delta: WorldDelta) -> World:
         """Upsert one resource's observed state and persist the new World.

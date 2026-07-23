@@ -1,4 +1,4 @@
-"""S2.5 — the new /apply path drives the Reconciler (wiring test, fakes)."""
+"""S2.5 — the /apply path drives the Reconciler (wiring test, fakes)."""
 from __future__ import annotations
 
 from fastapi.testclient import TestClient
@@ -43,23 +43,18 @@ class FakeRds:
         return None
 
     def container_name(self, db_id):
-        return f"ministack-rds-{db_id}"
+        return f"allfather-rds-default-{db_id}"
 
 
 CANVAS = {
-    "nodes": [
-        {"type": "rds", "data": {"label": "db"}},
-        {"type": "service", "data": {
-            "label": "api", "image": "app:latest", "port": 8000,
-            "env": {"DATABASE_URL": "${{db.DATABASE_URL}}"}}},
-    ],
+    "nodes": [{"type": "rds", "data": {"label": "db"}}],
     "edges": [],
 }
 
 
 def test_apply_translates_stores_and_reconciles(tmp_path):
     rt, rds = FakeRuntime(), FakeRds()
-    app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, embed=False, complete=False)
+    app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, backings=False)
     with TestClient(app) as client:
         resp = client.post("/apply", json=CANVAS)
         assert resp.json()["status"] == "applied" and resp.json()["rev"]
@@ -68,58 +63,33 @@ def test_apply_translates_stores_and_reconciles(tmp_path):
         phases = {r["id"]: r["phase"] for r in world["resources"]}
         assert rds.created == ["db"]          # rds creation was driven
         assert phases["db"] == "starting"
-        assert phases["api"] == "blocked"     # gated on db, not run
-        assert "api" not in rt.runs
-
-
-def test_apply_survives_brain_failure(tmp_path):
-    # The Brain only proposes; a failure must NOT block applying the drawn stack.
-    from fastapi import FastAPI
-
-    from odin.server import create_apply_router
-
-    store = SpecStore(tmp_path)
-
-    class FakeRecon:
-        async def tick(self):
-            pass
-
-    async def recon_for(env):
-        return FakeRecon()
-
-    async def boom(stack):
-        raise RuntimeError("brain down")
-
-    app = FastAPI()
-    app.include_router(create_apply_router(store, recon_for, complete_fn=boom))
-    with TestClient(app) as client:
-        resp = client.post("/apply", json={"nodes": [{"type": "rds", "data": {"label": "db"}}], "edges": []})
-        assert resp.json()["status"] == "applied"          # applied despite the brain failing
-        assert store.head() is not None                    # the un-completed stack was stored
 
 
 def test_mesh_endpoint_returns_empty_network(tmp_path):
     rt, rds = FakeRuntime(), FakeRds()
-    app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, embed=False, complete=False)
+    app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, backings=False)
     with TestClient(app) as client:
         body = client.get("/mesh").json()
         assert body["network"] == "default" and body["hosts"] == []  # no hosts joined yet
 
 
-def test_preview_returns_diff_structure(tmp_path):
-    rt, rds = FakeRuntime(), FakeRds()
-    app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, embed=False, complete=False)
-    with TestClient(app) as client:
-        resp = client.post("/preview", json=CANVAS)
-        body = resp.json()
-        assert "diff" in body and body["env"] == "default"  # staged-changeset shape
-
-
 def test_destroy_prunes(tmp_path):
     rt, rds = FakeRuntime(), FakeRds()
-    app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, embed=False, complete=False)
+    app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, backings=False)
     with TestClient(app) as client:
         client.post("/apply", json=CANVAS)
         client.post("/destroy")
         world = client.get("/world").json()
         assert world["resources"] == []
+
+
+def test_destroy_revokes_the_envs_gateway_keys(tmp_path):
+    rt, rds = FakeRuntime(), FakeRds()
+    app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, backings=False)
+    with TestClient(app) as client:
+        client.post("/apply", json=CANVAS)
+        access_key, _secret_key = app.state.gateway_keys.issue("default", "db")
+        assert app.state.gateway_keys.lookup(access_key) is not None
+
+        client.post("/destroy")
+        assert app.state.gateway_keys.lookup(access_key) is None

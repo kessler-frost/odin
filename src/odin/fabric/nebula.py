@@ -4,7 +4,7 @@ Chosen over Tailscale: Nebula runs inside your private network, YOU own the
 lighthouse, and a control plane / UI can be built on top of the mesh. One
 Nebula network == one allfather environment, so a host in `prod` cannot present
 a valid cert to `staging`'s lighthouse — cross-env isolation is free at the PKI
-layer, mirroring the per-env MiniStack account boundary.
+layer, mirroring the per-env isolation of the AWS backing containers.
 
 This module is the FOUNDATION: the cert/lighthouse/config primitives (recovered
 from the retired `network/` module, now sync + with an injectable subprocess
@@ -16,6 +16,7 @@ because the overlay address rides in through the same World-facts channel.
 """
 from __future__ import annotations
 
+import json
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,8 +33,11 @@ from odin.fabric.models import (
     MeshNetwork,
     MeshResource,
     MeshState,
+    SgFirewall,
+    VpcNetwork,
 )
 from odin.spec.models import World
+from odin.util import atomic_write_text
 
 NEBULA_PORT = 4242
 
@@ -145,8 +149,7 @@ class NebulaManager:
         return self._dir / "overlay.json"
 
     def save_overlay(self, overlay: MeshNetwork) -> None:
-        self._dir.mkdir(parents=True, exist_ok=True)
-        self._overlay_path().write_text(overlay.model_dump_json(indent=2))
+        atomic_write_text(self._overlay_path(), overlay.model_dump_json(indent=2))
 
     def load_overlay(self) -> MeshNetwork | None:
         path = self._overlay_path()
@@ -203,17 +206,43 @@ def ensure_network(root: Path, env: str, lighthouse_underlay: str, runner=None) 
     return overlay
 
 
+def _ec2net_networks(root: Path, env: str) -> tuple[list[VpcNetwork], list[SgFirewall]]:
+    """The EC2-network model's per-VPC networks + compiled SG firewalls (task
+    V1b), read straight off the gateway's sidecar file
+    (`.odin/{env}/gateway/ec2net.json`). The JSON file is the boundary --
+    fabric deliberately does NOT import gateway code (the import direction is
+    gateway -> fabric: `gateway/models/ec2net.py` calls `ensure_network` /
+    `sg_rules_to_firewall` above)."""
+    path = Path(root) / env / "gateway" / "ec2net.json"
+    data: dict = json.loads(path.read_text()) if path.exists() else {}
+    vpcs = [
+        VpcNetwork(vpc_id=v["vpc_id"], cidr_block=v["cidr_block"], network=v.get("nebula_network", env))
+        for key, v in data.items() if key.startswith("vpc:")
+    ]
+    security_groups = [
+        SgFirewall(
+            sg_id=g["group_id"], vpc_id=g["vpc_id"], group_name=g["group_name"],
+            firewall=FirewallRules.model_validate(g.get("firewall", {})),
+        )
+        for key, g in data.items() if key.startswith("sg:")
+    ]
+    return vpcs, security_groups
+
+
 def mesh_state(root: Path, env: str, world: World | None = None) -> MeshState:
     """The UI read model: the env's overlay membership joined with the observed
-    World (resources + their published endpoints). Both sides are optional — an
-    env with no joined host (no overlay file) and/or no World still renders."""
+    World (resources + their published endpoints) and the EC2-network model's
+    per-VPC networks + compiled SG firewalls. All sides are optional — an env
+    with no joined host (no overlay file), no World, and/or no VPCs still
+    renders."""
     resources = [
         MeshResource(id=r.id, kind=r.kind, phase=r.phase, endpoint=r.facts.get("endpoint"))
         for r in (world.resources if world else ())
     ]
+    vpcs, security_groups = _ec2net_networks(root, env)
     overlay = NebulaManager(_nebula_dir(root, env)).load_overlay()
     if overlay is None:
-        return MeshState(network=env, resources=resources)
+        return MeshState(network=env, resources=resources, vpcs=vpcs, security_groups=security_groups)
     hosts_subnet = overlay.subnets.get("hosts")
     hosts = [
         HostMembership(hostname=name, overlay_ip=ip, groups=["host"])
@@ -222,7 +251,7 @@ def mesh_state(root: Path, env: str, world: World | None = None) -> MeshState:
     return MeshState(
         network=overlay.network, base_cidr=overlay.base_cidr,
         lighthouse_ip=overlay.lighthouse_ip, lighthouse_underlay=overlay.lighthouse_underlay_ip,
-        hosts=hosts, resources=resources,
+        hosts=hosts, resources=resources, vpcs=vpcs, security_groups=security_groups,
     )
 
 

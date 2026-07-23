@@ -1,23 +1,32 @@
 import { Handle, Position, type NodeProps, NodeResizer } from '@xyflow/react';
 import StatusBadge from './StatusBadge';
 
+// V3c: adapted from the pre-ripout Ec2Node (git show 82a064e~1) for the
+// real-Lima-VM model -- instanceType/ami/key/userData/securityGroups are
+// USER fields (hcl.py's aws_instance/aws_key_pair builders read them);
+// vpc/subnet are read-only containment stamps (lib/containment.ts), same
+// convention as SgNode.
 export type Ec2NodeData = {
   label: string;
-  resourceId: string;
   instanceType: string;
-  privateIp: string;
-  overlayIp: string;
+  ami: string;
+  key: string;
+  userData: string;
+  securityGroups: string;
   status: string;
+  vpc?: string;
+  subnet?: string;
 };
 
 export default function Ec2Node({ data, selected }: NodeProps) {
-  const { label, resourceId, instanceType, privateIp, overlayIp, status } = data as Ec2NodeData;
+  const { label, instanceType, status, vpc, subnet } = data as Ec2NodeData;
+  const containedIn = subnet ?? vpc;
   return (
     <div className="w-full h-full border border-neon-orange bg-bg-secondary shadow-[0_0_15px_rgba(255,136,0,0.08)]">
       <NodeResizer
         isVisible={selected}
         minWidth={200}
-        minHeight={80}
+        minHeight={60}
         lineClassName="!border-neon-orange"
         handleClassName="!bg-neon-orange !border-none !w-2 !h-2"
       />
@@ -31,8 +40,8 @@ export default function Ec2Node({ data, selected }: NodeProps) {
         <StatusBadge status={status} error={(data as { error?: string }).error} />
       </div>
       <div className="flex flex-col justify-center px-3 h-10 font-mono text-[10px] text-text-secondary leading-tight">
-        <span>{resourceId} &bull; {instanceType}</span>
-        <span>{privateIp} &bull; overlay: {overlayIp}</span>
+        <span>{instanceType || 't3.micro'}</span>
+        {containedIn && <span className="text-neon-purple/70">in {containedIn}</span>}
       </div>
     </div>
   );

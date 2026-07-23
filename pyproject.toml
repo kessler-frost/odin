@@ -1,7 +1,7 @@
 [project]
 name = "odin"
-version = "0.2.0"
-description = "allfather: a Mac-native, AI-operated orchestration canvas. Drop apps + AWS resources, the AI completes config, a control loop runs them for real on Colima/Lima with an embedded MiniStack AWS control plane."
+version = "0.4.0"
+description = "Odin: a local-first AWS-compatible cloud. Design AWS architectures on a drag-drop canvas; apply them for real onto local open-source substitutes (RustFS, goaws, dynalite, Postgres) on Colima/Lima."
 requires-python = ">=3.12"
 license = "Apache-2.0"
 dependencies = [
@@ -14,8 +14,8 @@ dependencies = [
     "httpx>=0.27",
     "claude-agent-sdk>=0.1.39",
     "typer>=0.15",
-    "ministack>=1.3.66",
     "psycopg2-binary>=2.9.12",
+    "python-hcl2>=8.1.2",
 ]
 
 [project.optional-dependencies]
@@ -43,7 +43,7 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = ["-m", "not integration"]
 markers = [
-    "integration: needs real Colima/Lima/MiniStack or the Claude agent — off by default",
+    "integration: needs real Colima/Lima backings or the Claude agent — off by default",
 ]
 
 [tool.ruff]
