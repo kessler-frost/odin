@@ -176,6 +176,45 @@ def test_tofu_failure_reports_failed_with_tail(tmp_path, monkeypatch):
     assert body["status"] == "applied_tf_failed"
     assert body["tf"] == {"status": "failed", "exit_code": 1,
                           "tail": ["planning", "boom: invalid resource"]}
+    # Release finding #2: a failed tofu apply must NOT become the env's new
+    # desired state -- see test_failed_tofu_apply_does_not_commit below for
+    # why (the reconciler would provision the same s3/sqs itself on the next
+    # background tick, then a RETRY's tofu apply collides against them:
+    # BucketAlreadyExists/ResourceInUseException).
+    assert body["rev"] is None
+    assert "not committed" in body["note"]
+
+
+def test_failed_tofu_apply_does_not_commit_the_new_stack(tmp_path, monkeypatch):
+    """Root cause: /apply-full used to call store.apply(stack) unconditionally,
+    even when tofu failed. The reconciler's OWN background loop then saw a
+    new desired state it had never provisioned and created the same s3/sqs
+    backings itself (BackingAws.provision) -- so the user's very next retry
+    lost the race against tofu's own (non-idempotent) creates: exactly the
+    same BucketAlreadyExists/ResourceInUseException class of bug the S5
+    store-apply-ordering fix (see the module docstring above) already fixed
+    for the FIRST apply. Keeping the prior HEAD on a failed apply means a
+    fix-and-retry starts from the same clean slate as the first attempt."""
+    _write_fake_tofu(tmp_path, _APPLY_FAILS)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    _patch_translate(monkeypatch, TranslateResult(files=_skeleton_files(), refined=True))
+    app = _app(tmp_path)
+
+    calls: list[str] = []
+    orig_store_apply = app.state.store.apply
+
+    def recording_store_apply(stack):
+        calls.append("store.apply")
+        return orig_store_apply(stack)
+
+    app.state.store.apply = recording_store_apply
+    with TestClient(app) as client:
+        resp = client.post("/apply-full", json=S3_SQS)
+        world = client.get("/world").json()
+    assert resp.status_code == 200
+    assert calls == []  # store.apply was never reached
+    assert app.state.store.head("default") is None  # HEAD stays unset
+    assert world["resources"] == []  # the reconciler never provisioned anything
 
 
 def test_success_path_runs_tofu_and_reports_ok(tmp_path, monkeypatch):

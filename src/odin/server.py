@@ -308,6 +308,19 @@ def create_apply_full_router(
             # never races a container-deprovision teardown for s3/sqs/sns/
             # dynamodb -- it only makes tofu's state stop lying about what
             # still exists.
+            # Release finding #2: a tofu run that actually FAILED must never
+            # become the env's new desired state. store.apply(stack)
+            # unconditionally used to run here regardless of tf's outcome --
+            # the reconciler's own next background tick then saw that new
+            # desired state and provisioned the same s3/sqs/... backings
+            # ITSELF (BackingAws.provision, non-idempotent the way tofu's
+            # AWS-provider creates are), so a user's very next retry lost the
+            # race against its own prior failure: BucketAlreadyExists /
+            # ResourceInUseException. `tofu not installed` is NOT this case
+            # (tofu never ran -- nothing to collide with -- and the
+            # reconciler half committing is the pre-existing, desired
+            # behavior; see test_no_tofu_installed_reports_tf_unavailable).
+            tf_failed = False
             if resource_set(translated.files) or runner.status(env)["workspace_exists"]:
                 await reconciler.ensure_backings(stack)
                 project = TfProject(
@@ -328,8 +341,12 @@ def create_apply_full_router(
                     if not result.ok:
                         body["tf"]["tail"] = list(result.tail)
                         body["status"] = "applied_tf_failed"
+                        tf_failed = True
 
-            body["rev"] = store.apply(stack)  # the desired state goes live before any tick can run
+            if tf_failed:
+                body["note"] = "desired state not committed; fix and re-apply"
+            else:
+                body["rev"] = store.apply(stack)  # the desired state goes live before any tick can run
         await reconciler.tick()  # kick an immediate pass; the loop continues it
         return JSONResponse(status_code=200, content=body)
 
@@ -420,7 +437,10 @@ def create_app(
             "reason": reason,
         })
 
-    gateway_app = create_gateway_app(gateway_state, gateway_keystore, gateway_stores, on_deny)
+    gateway_app = create_gateway_app(
+        gateway_state, gateway_keystore, gateway_stores, on_deny,
+        gateway_port=lambda: gateway_port_actual,
+    )
     gateway_server = None
     gateway_thread = None
 
