@@ -9,6 +9,7 @@ build/
 .worktrees/
 .DS_Store
 .odin/
+.odin-v4d-test/
 node_modules/
 bun.lock
 .vite/
