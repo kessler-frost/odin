@@ -62,7 +62,21 @@ def _odin_version() -> str:
         return _FALLBACK_VERSION
 
 
-def create_apply_router(store: SpecStore, reconciler_for, keystore: KeyStore, runner: TfRunner, gateway_port) -> APIRouter:
+def _bump_epoch(env_epoch: dict[str, int], env: str) -> int:
+    """Release finding #4: a per-env, in-memory generation counter. A client
+    disconnect does NOT cancel the in-flight server-side request -- a stale
+    /apply-full can still be mid-tofu when a NEWER /destroy (or an
+    empty-canvas apply, which is also a teardown) commits. Bumping here and
+    re-checking against the value captured at the stale request's own entry
+    (create_apply_full_router's `apply_full`) is what lets that request
+    notice it's been superseded instead of going on to undo the teardown."""
+    env_epoch[env] = env_epoch.get(env, 0) + 1
+    return env_epoch[env]
+
+
+def create_apply_router(
+    store: SpecStore, reconciler_for, keystore: KeyStore, runner: TfRunner, gateway_port, env_epoch: dict[str, int],
+) -> APIRouter:
     router = APIRouter()
 
     @router.post("/apply")
@@ -89,6 +103,7 @@ def create_apply_router(store: SpecStore, reconciler_for, keystore: KeyStore, ru
                 status_code=409,
                 content={"error": f"a tofu run is already in progress for env {env!r}"},
             )
+        _bump_epoch(env_epoch, env)  # finding #4: invalidate any older in-flight apply-full for this env
 
         body: dict = {"status": "destroyed", "env": env, "tf": None}
         if status["workspace_exists"]:
@@ -218,8 +233,11 @@ def create_tf_router(store: SpecStore, runner: TfRunner, keystore: KeyStore, gat
     return router
 
 
+_SUPERSEDED = {"error": "superseded by a newer teardown/apply"}
+
+
 def create_apply_full_router(
-    store: SpecStore, reconciler_for, runner: TfRunner, keystore: KeyStore, gateway_port,
+    store: SpecStore, reconciler_for, runner: TfRunner, keystore: KeyStore, gateway_port, env_epoch: dict[str, int],
 ) -> APIRouter:
     """S5 -- the UI's single Apply button: /apply's exact canvas->Stack->tick
     semantics, then translate (S3b) and, when the canvas has TF-supported
@@ -240,6 +258,14 @@ def create_apply_full_router(
             )
         canvas = graph.model_dump()
         stack = canvas_to_stack(canvas, env=env)
+
+        # Release finding #4: an empty-canvas apply IS a teardown (see the
+        # hold() block below) -- it must invalidate any older, still-in-flight
+        # apply-full for a non-empty canvas the same way /destroy does, or
+        # that stale request's own store.apply() re-creates what this
+        # teardown just removed once it finally completes. A non-empty apply
+        # just captures the current epoch -- it doesn't own a bump itself.
+        my_epoch = _bump_epoch(env_epoch, env) if not stack.resources else env_epoch.get(env, 0)
 
         translated = await translate_mod.translate(stack)
         body = {
@@ -322,6 +348,11 @@ def create_apply_full_router(
             # behavior; see test_no_tofu_installed_reports_tf_unavailable).
             tf_failed = False
             if resource_set(translated.files) or runner.status(env)["workspace_exists"]:
+                # Finding #4, checkpoint 1: a newer teardown/apply may have
+                # already landed while translate() (a claude-agent-sdk call,
+                # genuinely slow) was running -- catch it before tofu starts.
+                if env_epoch.get(env, 0) != my_epoch:
+                    return JSONResponse(status_code=409, content=_SUPERSEDED)
                 await reconciler.ensure_backings(stack)
                 project = TfProject(
                     files=translated.files, unsupported=translated.unsupported,
@@ -343,6 +374,12 @@ def create_apply_full_router(
                         body["status"] = "applied_tf_failed"
                         tf_failed = True
 
+            # Finding #4, checkpoint 2: the epoch can also change WHILE tofu
+            # itself was running (a slow apply racing a fast concurrent
+            # /destroy) -- re-check right before the commit that makes this
+            # request's Stack live.
+            if env_epoch.get(env, 0) != my_epoch:
+                return JSONResponse(status_code=409, content=_SUPERSEDED)
             if tf_failed:
                 body["note"] = "desired state not committed; fix and re-apply"
             else:
@@ -408,6 +445,9 @@ def create_app(
     # (unlike reconcilers) -- routes only ever run once lifespan has resolved
     # gateway_port_actual, so a plain closure over it is enough.
     tf_runner = TfRunner(_store.root, ws_manager)
+    # Release finding #4: a per-env generation counter /destroy and an
+    # empty-canvas /apply-full bump -- see _bump_epoch's own docstring.
+    env_epoch: dict[str, int] = {}
 
     # One reconciler per environment, created lazily. Each gets its own
     # env-scoped rds runner + backing containers, so AWS state stays isolated.
@@ -465,9 +505,13 @@ def create_app(
 
     app = FastAPI(title="allfather", version=_odin_version(), lifespan=lifespan)
     app.include_router(create_canvas_router(CANVAS_PATH))
-    app.include_router(create_apply_router(_store, reconciler_for, gateway_keystore, tf_runner, lambda: gateway_port_actual))
+    app.include_router(
+        create_apply_router(_store, reconciler_for, gateway_keystore, tf_runner, lambda: gateway_port_actual, env_epoch)
+    )
     app.include_router(create_tf_router(_store, tf_runner, gateway_keystore, lambda: gateway_port_actual))
-    app.include_router(create_apply_full_router(_store, reconciler_for, tf_runner, gateway_keystore, lambda: gateway_port_actual))
+    app.include_router(
+        create_apply_full_router(_store, reconciler_for, tf_runner, gateway_keystore, lambda: gateway_port_actual, env_epoch)
+    )
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
@@ -493,6 +537,7 @@ def create_app(
     app.state.gateway = gateway_state
     app.state.gateway_keys = gateway_keystore
     app.state.tf_runner = tf_runner
+    app.state.env_epoch = env_epoch
 
     bundled_ui = Path(__file__).resolve().parent / "_ui"
     source_ui = Path(__file__).resolve().parent.parent.parent / "ui" / "dist"

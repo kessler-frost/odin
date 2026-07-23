@@ -360,3 +360,109 @@ def test_busy_race_after_the_guard_returns_409(tmp_path, monkeypatch):
         resp = client.post("/apply-full", json=S3_SQS)
     assert resp.status_code == 409
     assert resp.json() == BUSY_BODY
+
+
+# --- release finding #4: a per-env epoch guards against a stale request ------
+# undoing a newer teardown/apply once its own store.apply() finally runs
+# (a client disconnect does NOT cancel the in-flight server-side request).
+
+STALE_BODY = {"error": "superseded by a newer teardown/apply"}
+
+
+def test_destroy_bumps_the_env_epoch(tmp_path, monkeypatch):
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: None)
+    app = _app(tmp_path)
+    with TestClient(app) as client:
+        before = app.state.env_epoch.get("default", 0)
+        client.post("/destroy")
+        after = app.state.env_epoch.get("default", 0)
+    assert after == before + 1
+
+
+def test_empty_canvas_apply_full_bumps_the_env_epoch(tmp_path, monkeypatch):
+    # An empty-canvas Apply IS a teardown (the "no Destroy button" NORTHSTAR
+    # promise -- see create_apply_full_router's own docstring) -- it must
+    # invalidate an older in-flight apply-full the same way /destroy does.
+    _patch_translate(monkeypatch, TranslateResult(files={}, refined=False))
+    app = _app(tmp_path)
+    with TestClient(app) as client:
+        before = app.state.env_epoch.get("default", 0)
+        resp = client.post("/apply-full", json={"nodes": [], "edges": []})
+        after = app.state.env_epoch.get("default", 0)
+    assert resp.status_code == 200
+    assert after == before + 1
+
+
+def test_non_empty_apply_full_does_not_bump_the_epoch(tmp_path, monkeypatch):
+    _write_fake_tofu(tmp_path, _APPLY_OK)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    _patch_translate(monkeypatch, TranslateResult(files=_skeleton_files(), refined=True))
+    app = _app(tmp_path)
+    with TestClient(app) as client:
+        before = app.state.env_epoch.get("default", 0)
+        resp = client.post("/apply-full", json=S3_SQS)
+        after = app.state.env_epoch.get("default", 0)
+    assert resp.status_code == 200
+    assert after == before
+
+
+def test_stale_request_is_superseded_before_tofu_ever_starts(tmp_path, monkeypatch):
+    """An epoch bump that lands before this request reaches tofu (e.g. a
+    concurrent /destroy that raced ahead) must abort BEFORE tofu ever runs --
+    the first of the finding's two checkpoints."""
+    _write_fake_tofu(tmp_path, _APPLY_OK)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    app = _app(tmp_path)
+
+    async def fake_translate(stack, **kwargs):
+        app.state.env_epoch["default"] = app.state.env_epoch.get("default", 0) + 1
+        return TranslateResult(files=_skeleton_files(), refined=True)
+
+    monkeypatch.setattr("odin.server.translate_mod.translate", fake_translate)
+    apply_calls: list = []
+    orig_runner_apply = app.state.tf_runner.apply
+
+    async def recording_runner_apply(*args, **kwargs):
+        apply_calls.append(1)
+        return await orig_runner_apply(*args, **kwargs)
+
+    app.state.tf_runner.apply = recording_runner_apply
+    with TestClient(app) as client:
+        resp = client.post("/apply-full", json=S3_SQS)
+    assert resp.status_code == 409
+    assert resp.json() == STALE_BODY
+    assert apply_calls == []  # tofu never even started
+    assert app.state.store.head("default") is None
+
+
+def test_stale_request_is_superseded_right_before_the_final_commit(tmp_path, monkeypatch):
+    """The second checkpoint: the epoch can also change WHILE tofu itself is
+    running (a slow apply racing a fast concurrent /destroy). Even though
+    tofu succeeded, the stale request must not go on to commit."""
+    _write_fake_tofu(tmp_path, _APPLY_OK)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    _patch_translate(monkeypatch, TranslateResult(files=_skeleton_files(), refined=True))
+    app = _app(tmp_path)
+
+    orig_runner_apply = app.state.tf_runner.apply
+
+    async def apply_then_bump(*args, **kwargs):
+        result = await orig_runner_apply(*args, **kwargs)
+        app.state.env_epoch["default"] = app.state.env_epoch.get("default", 0) + 1
+        return result
+
+    app.state.tf_runner.apply = apply_then_bump
+    calls: list[str] = []
+    orig_store_apply = app.state.store.apply
+
+    def recording_store_apply(stack):
+        calls.append("store.apply")
+        return orig_store_apply(stack)
+
+    app.state.store.apply = recording_store_apply
+    with TestClient(app) as client:
+        resp = client.post("/apply-full", json=S3_SQS)
+    assert resp.status_code == 409
+    assert resp.json() == STALE_BODY
+    assert calls == []
+    assert app.state.store.head("default") is None
