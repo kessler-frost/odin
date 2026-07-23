@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typer.testing import CliRunner
 
 import odin.__main__  # noqa: F401 — registers start/stop/… so `app` stays a multi-command group
+from odin.aws.backings import DYNALITE_IMAGE
 from odin.cli import doctor as doctor_mod
 from odin.cli.app import app
 from odin.cli.doctor import ALL_CHECKS, run_checks
@@ -33,6 +34,7 @@ ALL_OK = {
     "which limactl": FakeProc(0, "/opt/homebrew/bin/limactl\n"),
     "which bun": FakeProc(0, "/Users/me/.bun/bin/bun\n"),
     "which claude": FakeProc(0, "/opt/homebrew/bin/claude\n"),
+    "docker image inspect -f {{.Id}} " + DYNALITE_IMAGE: FakeProc(0, "sha256:abc\n"),
 }
 
 
@@ -112,6 +114,27 @@ def test_disk_headroom_ok(monkeypatch):
     assert (disk.status, disk.fix) == ("ok", "")
 
 
+# --- dynalite prebake offer ------------------------------------------------
+
+def test_dynalite_image_present_is_ok():
+    note = by_name(run_checks(["dynalite-image"], make_run()))["dynalite-image"]
+    assert (note.status, note.required, note.fix) == ("ok", False, "")
+
+
+def test_dynalite_image_absent_is_informational_note():
+    absent = {"docker image inspect -f {{.Id}} " + DYNALITE_IMAGE: FakeProc(1)}
+    note = by_name(run_checks(["dynalite-image"], make_run(absent)))["dynalite-image"]
+    assert (note.status, note.required) == ("skip", False)
+    assert "first Apply with DynamoDB will build it (one-time npm install)" in note.detail
+    assert note.fix == "odin doctor --prebake"
+
+
+def test_dynalite_note_survives_missing_docker():
+    absent = {"which docker": FakeProc(1)}
+    note = by_name(run_checks(["dynalite-image"], make_run(absent)))["dynalite-image"]
+    assert note.status == "skip"
+
+
 # --- the CLI command -------------------------------------------------------
 
 def test_cli_exit_zero_with_optional_missing(monkeypatch):
@@ -139,3 +162,48 @@ def test_cli_all_ok(monkeypatch):
     result = runner.invoke(app, ["doctor"])
     assert result.exit_code == 0
     assert result.output.count("✓") == len(ALL_CHECKS)
+
+
+# --- odin doctor --prebake -------------------------------------------------
+
+class FakeRuntime:
+    def __init__(self, images: set[str]):
+        self.images = images
+
+    def image_exists(self, tag: str) -> bool:
+        return tag in self.images
+
+
+class FakeBacking:
+    ensured: list[str] = []
+
+    def __init__(self, runtime):
+        self.runtime = runtime
+
+    def ensure_dynalite_image(self) -> None:
+        FakeBacking.ensured.append(DYNALITE_IMAGE)
+        self.runtime.images.add(DYNALITE_IMAGE)
+
+
+def patch_prebake(monkeypatch, images: set[str]) -> None:
+    FakeBacking.ensured = []
+    monkeypatch.setattr(doctor_mod, "ColimaRuntime", lambda *a, **kw: FakeRuntime(images))
+    monkeypatch.setattr(doctor_mod, "BackingAws", FakeBacking)
+
+
+def test_prebake_builds_absent_image(monkeypatch):
+    patch_prebake(monkeypatch, images=set())
+    result = runner.invoke(app, ["doctor", "--prebake"])
+    assert result.exit_code == 0
+    assert FakeBacking.ensured == [DYNALITE_IMAGE]
+    assert f"before: {DYNALITE_IMAGE} absent" in result.output
+    assert "just built" in result.output
+
+
+def test_prebake_with_image_already_present(monkeypatch):
+    patch_prebake(monkeypatch, images={DYNALITE_IMAGE})
+    result = runner.invoke(app, ["doctor", "--prebake"])
+    assert result.exit_code == 0
+    assert FakeBacking.ensured == [DYNALITE_IMAGE]  # idempotent call-through, still invoked
+    assert f"before: {DYNALITE_IMAGE} present" in result.output
+    assert "already there" in result.output

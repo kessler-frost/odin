@@ -1,6 +1,6 @@
 """`odin doctor` — preflight checks that this machine can actually RUN Odin
 (not just start it): Colima up, the docker CLI + tofu on PATH, disk headroom,
-plus optional niceties (limactl, bun, claude).
+plus optional niceties (limactl, bun, claude, the prebaked dynalite image).
 
 `run_checks` is the pure core: it takes the check names to run and a
 subprocess-runner callable (fakeable in tests — the same runner seam
@@ -20,7 +20,9 @@ from typing import Literal, Protocol
 
 import typer
 
+from odin.aws.backings import DYNALITE_IMAGE, BackingAws
 from odin.cli.app import app
+from odin.runtime.colima import ColimaRuntime
 
 MIN_DISK_GIB = 10.0
 
@@ -54,7 +56,9 @@ _TOOLS: tuple[tuple[str, bool, str], ...] = (
     ("claude", False, "see https://docs.claude.com/claude-code"),  # translate has a fallback
 )
 
-ALL_CHECKS: tuple[str, ...] = ("colima", *(name for name, _, _ in _TOOLS), "disk")
+ALL_CHECKS: tuple[str, ...] = (
+    "colima", *(name for name, _, _ in _TOOLS), "disk", "dynalite-image",
+)
 
 
 def _subprocess_run(args: list[str], input: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -92,6 +96,18 @@ def _check_disk(root: Path) -> CheckResult:
     )
 
 
+def _check_dynalite_image(run: Runner) -> CheckResult:
+    # Guard on the docker CLI first: without it there's no daemon to ask, and
+    # the note below (skip + the prebake offer) is still the right answer.
+    present = bool(_which(run, "docker")) and ColimaRuntime(runner=run).image_exists(DYNALITE_IMAGE)
+    detail = f"{DYNALITE_IMAGE} " + (
+        "present" if present
+        else "absent — first Apply with DynamoDB will build it (one-time npm install)"
+    )
+    return CheckResult("dynalite-image", "ok" if present else "skip", False, detail,
+                       "" if present else "odin doctor --prebake")
+
+
 def run_checks(which: Iterable[str], run: Runner, disk_path: Path | None = None) -> list[CheckResult]:
     """Run the named checks through `run` (the subprocess seam); results come
     back in the order asked. `disk_path` defaults to the current directory —
@@ -100,6 +116,7 @@ def run_checks(which: Iterable[str], run: Runner, disk_path: Path | None = None)
     checks: dict[str, Callable[[], CheckResult]] = {
         "colima": partial(_check_colima, run),
         "disk": partial(_check_disk, root),
+        "dynalite-image": partial(_check_dynalite_image, run),
     }
     checks.update({name: partial(_check_tool, run, name, required, fix)
                    for name, required, fix in _TOOLS})
@@ -109,9 +126,26 @@ def run_checks(which: Iterable[str], run: Runner, disk_path: Path | None = None)
 _ICONS = {"ok": "✓", "fail": "✗", "skip": "○"}
 
 
+def _prebake() -> None:
+    runtime = ColimaRuntime()
+    present = runtime.image_exists(DYNALITE_IMAGE)
+    state = "present" if present else "absent — building now (one-time npm install)"
+    typer.echo(f"before: {DYNALITE_IMAGE} {state}")
+    BackingAws(runtime).ensure_dynalite_image()
+    typer.echo(f"after:  {DYNALITE_IMAGE} present ({'already there' if present else 'just built'})")
+
+
 @app.command()
-def doctor() -> None:
+def doctor(
+    prebake: bool = typer.Option(
+        False, "--prebake",
+        help=f"Build the {DYNALITE_IMAGE} image now instead of on the first DynamoDB Apply.",
+    ),
+) -> None:
     """Preflight: verify this machine has everything Odin needs to run."""
+    if prebake:
+        _prebake()
+        return
     results = run_checks(ALL_CHECKS, _subprocess_run)
     for result in results:
         typer.echo(f" {_ICONS[result.status]} {result.name:<15} {result.detail}")
