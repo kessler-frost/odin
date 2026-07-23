@@ -88,6 +88,8 @@ from starlette.responses import Response
 from odin.aws.backings import ACCOUNT, REGION
 from odin.compute.instances import InstanceVm, NebulaJoin, vm_name
 from odin.compute.models import INSTANCE_TYPES, get_instance_type
+from odin.fabric.models import FirewallRules
+from odin.fabric.nebula import LighthouseManager
 from odin.gateway import errors
 from odin.gateway.keys import KeyStore, workload_env
 from odin.gateway.models import ec2net
@@ -398,6 +400,22 @@ def _finish_terminate(stores: SynthStores, env: str, instance_id: str, name: str
         stores, env, instance_id, state_name="terminated", terminated_at=time.monotonic(),
         state_reason=None, delete_failed=False,
     )
+    _maybe_stop_lighthouse(stores, env)
+
+
+def _maybe_stop_lighthouse(stores: SynthStores, env: str) -> None:
+    """R3's "last VM leaves" half of `LighthouseManager`'s lifecycle (the
+    "first VM joins" half is `InstanceVm._activate_nebula`, co-located with
+    the VM-side activation it exists to make truthful). A true no-op
+    whenever this env has no lighthouse pidfile -- every unit test's fresh
+    `tmp_path`, so this never touches a real process outside the real
+    integration test."""
+    still_meshed = any(
+        i.get("vpc_id") and i["state_name"] not in _TERMINAL_STATES
+        for i in _records(stores, env, "instance")
+    )
+    if not still_meshed:
+        LighthouseManager().ensure_stopped(stores.root, env)
 
 
 def _claim_delete_retry(instance: dict | None) -> dict | object:
@@ -459,6 +477,19 @@ def _sweep_terminated(stores: SynthStores, env: str, now: float) -> None:
             stores.ec2compute.delete(env, _key("instance", instance["instance_id"]))
 
 
+def _vpc_default_firewall(stores: SynthStores, env: str, vpc: dict) -> FirewallRules | None:
+    """R3: the containing VPC's default security group's ALREADY-compiled
+    Nebula firewall (`ec2net.py::_compiled_firewall`, recomputed on every SG
+    mutation and stored on the SG record itself -- read here, not
+    recomputed, matching `fabric.nebula.mesh_state`'s own "read the sidecar,
+    don't reach into ec2net" boundary). v1 doesn't model RunInstances'
+    SecurityGroupIds (ROADMAP's own recorded limit), so every instance
+    inherits its VPC's default SG -- exactly what real AWS does for an
+    instance launched with none specified."""
+    sg = stores.ec2net.get(env, f"sg:{vpc['default_sg_id']}")
+    return FirewallRules.model_validate(sg["firewall"]) if sg and sg.get("firewall") else None
+
+
 def _run_instances(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     subnet_id = params.get("SubnetId", "")
     subnet = stores.ec2net.get(env, f"subnet:{subnet_id}") if subnet_id else None
@@ -511,7 +542,7 @@ def _run_instances(params: dict[str, str], env: str, stores: SynthStores, now: f
     # back on a fast (fake-VM) boot, a real race, not a test artifact.
     response = _response("RunInstances", _reservation_inner_xml(stores, env, instance))
 
-    nebula = NebulaJoin(root=stores.root, env=env, host_id=instance_id) if vpc else None
+    nebula = NebulaJoin(root=stores.root, env=env, host_id=instance_id, firewall=_vpc_default_firewall(stores, env, vpc)) if vpc else None
     ssh_pubkey = keypair.get("public_key") if keypair else None
     user_data = base64.b64decode(user_data_b64).decode("utf-8", "replace") if user_data_b64 else None
     name = vm_name(env, instance_id)
