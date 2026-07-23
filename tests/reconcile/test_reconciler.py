@@ -5,6 +5,7 @@ import asyncio
 import time
 
 from odin.gateway.policy import compile_policies
+from odin.gateway.stores import SynthStores
 from odin.reconcile.reconciler import Reconciler
 from odin.runtime.colima import _STATUS_TO_PHASE, ContainerFacts, HostFacts, RunHandle
 from odin.spec.models import Edge, FieldValue, ResourceDesired, Stack
@@ -315,3 +316,89 @@ async def test_concurrent_ticks_do_not_double_provision(tmp_path):
     recon = Reconciler(store, rt, rds, aws=aws, pg_ready=_yes, poll_interval=0)
     await asyncio.gather(recon.tick(), recon.tick())
     assert aws.provisioned == [("s3", "uploads", ())]
+
+
+# --- TF-owned status projection (fix-wave 2b finding #1): vpc/subnet/sg/
+# ec2/ecs/lambda/iam_role/ecr are created ONLY by tofu (never by this
+# reconciler's own plan/execute), but a Reconciler wired with `stores=` still
+# projects the gateway's synth stores into World every tick -- else these
+# kinds show a permanently stale DRAFT badge on the canvas even once tofu
+# has a real VM/role/etc. up. ------------------------------------------------
+
+
+async def test_tf_owned_resource_becomes_healthy_via_projection(tmp_path):
+    rt, rds = FakeRuntime(), FakeRds()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(ResourceDesired(id="net", kind="vpc"),)))
+    stores = SynthStores(tmp_path)
+    stores.ec2net.set("default", "vpc:vpc-1", {"vpc_id": "vpc-1"})
+    stores.tags.set("default", "ec2:vpc-1", {"odin:node": "net"})
+    recon = Reconciler(store, rt, rds, pg_ready=_yes, poll_interval=0, stores=stores)
+
+    await recon.tick()
+
+    observed = store.current_world().get("net")
+    assert observed.kind == "vpc"
+    assert observed.phase == "healthy"
+
+
+async def test_tf_owned_resource_pruned_when_tofu_destroys_it(tmp_path):
+    rt, rds = FakeRuntime(), FakeRds()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(ResourceDesired(id="net", kind="vpc"),)))
+    stores = SynthStores(tmp_path)
+    stores.ec2net.set("default", "vpc:vpc-1", {"vpc_id": "vpc-1"})
+    stores.tags.set("default", "ec2:vpc-1", {"odin:node": "net"})
+    recon = Reconciler(store, rt, rds, pg_ready=_yes, poll_interval=0, stores=stores)
+    await recon.tick()
+    assert store.current_world().get("net") is not None
+
+    stores.ec2net.delete("default", "vpc:vpc-1")  # tofu destroy already ran
+    await recon.tick()
+
+    assert store.current_world().get("net") is None
+
+
+async def test_ec2_instance_phase_reflects_real_state_name(tmp_path):
+    rt, rds = FakeRuntime(), FakeRds()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(ResourceDesired(id="server", kind="ec2"),)))
+    stores = SynthStores(tmp_path)
+    stores.ec2compute.set("default", "instance:i-1", {"instance_id": "i-1", "state_name": "running"})
+    stores.tags.set("default", "ec2:i-1", {"odin:node": "server"})
+    recon = Reconciler(store, rt, rds, pg_ready=_yes, poll_interval=0, stores=stores)
+
+    await recon.tick()
+
+    observed = store.current_world().get("server")
+    assert observed.kind == "ec2"
+    assert observed.phase == "healthy"
+
+
+async def test_stale_tf_owned_world_entry_never_calls_runtime_stop(tmp_path):
+    # A canvas node removed WITHOUT a tofu destroy having run yet (e.g. a
+    # canvas edit ahead of the next Apply) leaves plan() seeing "observed but
+    # no longer desired" -> a StopContainer action -- tofu, never
+    # `self._rt.stop`, owns tearing down a TF-managed resource.
+    rt, rds = FakeRuntime(), FakeRds()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(ResourceDesired(id="net", kind="vpc"),)))
+    stores = SynthStores(tmp_path)
+    stores.ec2net.set("default", "vpc:vpc-1", {"vpc_id": "vpc-1"})
+    stores.tags.set("default", "ec2:vpc-1", {"odin:node": "net"})
+    recon = Reconciler(store, rt, rds, pg_ready=_yes, poll_interval=0, stores=stores)
+    await recon.tick()  # "net" enters World, healthy
+
+    store.apply(Stack())  # the canvas node is gone; the synth store record still exists
+    await recon.tick()
+
+    assert rt.stopped == []
+
+
+async def test_no_stores_configured_does_not_crash_tick(tmp_path):
+    rt, rds = FakeRuntime(), FakeRds()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(ResourceDesired(id="net", kind="vpc"),)))
+    recon = Reconciler(store, rt, rds, pg_ready=_yes, poll_interval=0)  # stores=None is the default
+    await recon.tick()  # must not raise
+    assert store.current_world().get("net") is None  # nothing to project without stores

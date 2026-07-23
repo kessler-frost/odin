@@ -2,9 +2,13 @@
 
 Each tick: (1) observe — refresh the World from runtime facts + assertions,
 advancing started resources to healthy/crashed; (2) plan(Stack, World) → Actions;
-(3) execute — provision/stop. The pure plan() decides intent; this executor
-builds specs (resolving refs via the Fabric) and runs them. Scope: rds + the
-AWS-shaped PROVISIONED resources, single host.
+(3) execute — provision/stop; (4) project the gateway's TF-owned resources
+(vpc/subnet/sg/ec2/ecs/lambda/iam_role/ecr) into World too (fix-wave 2b
+finding #1 -- see reconcile/tf_status.py). The pure plan() decides intent for
+rds + the AWS-shaped PROVISIONED resources; this executor builds specs
+(resolving refs via the Fabric) and runs them; TF_OWNED_KINDS never go
+through plan/execute at all -- tofu is their sole creator/destroyer, this
+loop only OBSERVES what tofu already did.
 
 Per-node credential injection (a workload container's env bound to
 keystore-issued creds + the gateway endpoint, formerly `_run_service`) is
@@ -23,9 +27,11 @@ from contextlib import asynccontextmanager
 from odin.aws.backings import ENSURE_KINDS, PROVISIONED
 from odin.fabric.localhost import LocalhostFabric
 from odin.gateway.policy import compile_policies
+from odin.gateway.stores import SynthStores
 from odin.reconcile import assertions
 from odin.reconcile.actions import NoOp, ProvisionResource, StopContainer
 from odin.reconcile.plan import plan
+from odin.reconcile.tf_status import TF_OWNED_KINDS, project as project_tf_owned
 from odin.runtime.colima import CONTAINER_HOST
 from odin.spec.models import ResourceDesired, Stack, World, WorldDelta
 
@@ -45,6 +51,7 @@ class Reconciler:
         env: str = "default",
         pg_ready=assertions.pg_ready,
         poll_interval: float = 2.0,
+        stores: SynthStores | None = None,
     ) -> None:
         self._store = store
         self._rt = runtime
@@ -56,6 +63,12 @@ class Reconciler:
         self._env = env
         self._pg_ready = pg_ready
         self._poll = poll_interval
+        # The gateway's synth stores (tags/ec2net/iamctl/ecr/ec2compute/
+        # lambdactl/ecsctl) -- read-only here, for the TF-owned-status
+        # projection (see tick()'s trailing step + tf_status.py). None in
+        # every test that doesn't care; server.py's real wiring always
+        # passes the SAME SynthStores instance the gateway itself uses.
+        self._stores = stores
         self._task: asyncio.Task | None = None
         self._stop = False
         # tick() is called by BOTH the background loop and the /apply//destroy
@@ -104,6 +117,21 @@ class Reconciler:
             if self._gateway is not None:  # policies/ports always track the applied Stack
                 ports = await asyncio.to_thread(self._aws.backing_ports) if self._aws is not None else {}
                 self._gateway.update(self._env, compile_policies(stack), ports)
+            if self._stores is not None:  # fix-wave 2b finding #1: project tofu's own creations into World
+                await self._project_tf_owned()
+
+    async def _project_tf_owned(self) -> None:
+        """`tf_status.project()` is the whole snapshot; diff it against the
+        current World and emit only what changed (`_emit`'s own dedupe) plus
+        prune any label that dropped out (tofu destroyed it -- this loop
+        never destroys a TF-owned resource itself)."""
+        projected = await asyncio.to_thread(project_tf_owned, self._stores, self._env)
+        for label, (kind, phase, facts) in projected.items():
+            await self._emit(label, kind, phase, facts=facts)
+        world = self._store.current_world(self._env)
+        for observed in world.resources:
+            if observed.kind in TF_OWNED_KINDS and observed.id not in projected:
+                await self._prune(observed.id)
 
     async def ensure_backings(self, stack: Stack) -> None:
         """Boot (but don't create any resource on) the backing containers
@@ -228,6 +256,16 @@ class Reconciler:
                 self._rt.stop(self._rds.container_name(action.id))
             elif action.kind in PROVISIONED:
                 await asyncio.to_thread(self._aws.deprovision, action.kind, action.id)
+            elif action.kind in TF_OWNED_KINDS:
+                # tofu (never this reconciler) owns create/destroy for a
+                # TF-managed kind -- a StopContainer here only means a stale
+                # World entry (the canvas node was removed but tofu hasn't
+                # destroyed the real resource yet); `action.name` is a
+                # label, not a real container name, so `self._rt.stop`
+                # would be a no-op at best. Just let the prune below clear
+                # the stale entry; the NEXT tick's projection re-adds it
+                # (still accurately) if the real resource is still there.
+                pass
             else:
                 self._rt.stop(action.name)
             await self._prune(action.id)
