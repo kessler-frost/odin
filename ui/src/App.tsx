@@ -5,6 +5,7 @@ import Sidebar from './components/Sidebar';
 import Canvas from './components/Canvas';
 import ConfigPanel from './components/ConfigPanel';
 import BottomPanel from './components/BottomPanel';
+import CodePanel from './components/CodePanel';
 
 export type BottomState = 'default' | 'collapsed' | 'half';
 
@@ -35,6 +36,7 @@ export default function App() {
   const [edgeUpdates, setEdgeUpdates] = useState<{ edgeId: string; data: Record<string, unknown> } | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [configOpen, setConfigOpen] = useState(true);
+  const [codeOpen, setCodeOpen] = useState(false);
   const [bottomState, setBottomState] = useState<BottomState>('default');
   const [wsConnected, setWsConnected] = useState(false);
   const [env, setEnv] = useState(() => localStorage.getItem('odin-active-env') || 'default');
@@ -68,22 +70,27 @@ export default function App() {
     return canvas;
   }, [pushToast]);
 
-  // Apply: send the canvas as desired state; the Reconciler runs it for real and
-  // streams live status back over the WebSocket (world_delta -> node phase).
+  // Apply: send the canvas as desired state; the Reconciler runs it for real,
+  // Terraform is generated + applied through the gateway, and live status
+  // (world_delta + tf lines) streams back over the WebSocket.
   const handleApply = useCallback(async () => {
     const canvas = await readCanvas();
     if (!canvas) return;
-    try {
-      const res = await fetch(`/apply?env=${encodeURIComponent(env)}`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(canvas),
-      });
-      if (!res.ok) throw new Error(String(res.status));
-      const body = await res.json();
-      pushToast('success', `Applied to ${body.env ?? env}`);
-      if (body.skipped?.length) pushToast('info', `Not runnable: ${body.skipped.join(', ')}`);
-    } catch {
-      pushToast('error', 'Apply failed — backend unreachable');
-    }
+    const res = await fetch(`/apply-full?env=${encodeURIComponent(env)}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(canvas),
+    }).catch(() => null);
+    if (!res) { pushToast('error', 'Apply failed — backend unreachable'); return; }
+    if (res.status === 409) { pushToast('info', `A Terraform run is already in progress for ${env} — try again shortly`); return; }
+    if (!res.ok) { pushToast('error', `Apply failed (HTTP ${res.status})`); return; }
+    const body = await res.json().catch(() => ({}));
+    const tf = body.tf;
+    // tf === null: nothing TF-supported on the canvas — a clean success.
+    if (!tf) pushToast('success', `Applied to ${body.env ?? env}`);
+    else if (tf.status === 'ok') pushToast('success', `Applied to ${body.env ?? env} — Terraform converged`);
+    else if (tf.status === 'failed') pushToast('error', `Applied to ${body.env ?? env}, but Terraform failed (exit ${tf.exit_code}) — see Events for output`);
+    else pushToast('info', `Applied to ${body.env ?? env} — Terraform skipped: ${tf.error}. Fix: ${tf.fix}`);
+    if (body.skipped?.length) pushToast('info', `Not runnable: ${body.skipped.join(', ')}`);
+    if (body.unsupported?.length) pushToast('info', `Not in Terraform: ${body.unsupported.join('; ')}`);
   }, [env, readCanvas, pushToast]);
 
   const handleValidateSelected = handleApply;
@@ -116,7 +123,7 @@ export default function App() {
       }}
     >
       {/* Row 1: TopBar */}
-      <div className="col-span-full"><TopBar wsConnected={wsConnected} env={env} onEnvChange={setEnv} onApply={handleApply} /></div>
+      <div className="col-span-full"><TopBar wsConnected={wsConnected} env={env} onEnvChange={setEnv} onApply={handleApply} onViewCode={() => setCodeOpen(o => !o)} codeOpen={codeOpen} /></div>
 
       {/* Row 2: Sidebar + Canvas + Config */}
       <div className="overflow-hidden">
@@ -141,6 +148,11 @@ export default function App() {
           >
             Configuration
           </button>
+        )}
+        {codeOpen && (
+          <div className="absolute top-0 right-0 bottom-0 z-20 w-[520px] max-w-[75%]">
+            <CodePanel env={env} onClose={() => setCodeOpen(false)} />
+          </div>
         )}
         {bottomState === 'collapsed' && (
           <button

@@ -21,9 +21,11 @@ interface TopBarProps {
   env?: string;
   onEnvChange?: (env: string) => void;
   onApply?: () => Promise<void>;
+  onViewCode?: () => void;
+  codeOpen?: boolean;
 }
 
-export default function TopBar({ wsConnected, env, onEnvChange, onApply }: TopBarProps) {
+export default function TopBar({ wsConnected, env, onEnvChange, onApply, onViewCode, codeOpen }: TopBarProps) {
   const [busy, setBusy] = useState<Busy>(null);
   const [backendUp, setBackendUp] = useState(false);
   const [envs, setEnvs] = useState<string[]>([]);
@@ -126,6 +128,14 @@ export default function TopBar({ wsConnected, env, onEnvChange, onApply }: TopBa
         className={`font-mono text-xs py-1.5 px-4 border border-neon-green bg-bg-tertiary text-neon-green uppercase tracking-[1px] transition-all duration-200 hover:bg-[rgba(0,255,136,0.1)] hover:shadow-[0_0_12px_rgba(0,255,136,0.2)] ${busy === 'apply' ? 'opacity-50 cursor-wait' : dim || 'cursor-pointer'}`}
       >
         {busy === 'apply' ? 'Applying…' : 'Apply'}
+      </button>
+      <button
+        onClick={onViewCode}
+        disabled={!backendUp}
+        title="View the generated Terraform for this canvas"
+        className={`font-mono text-xs py-1.5 px-3 border bg-bg-tertiary transition-all duration-200 ${codeOpen ? 'border-neon-purple text-neon-purple bg-[rgba(170,85,255,0.1)]' : 'border-border-bright text-text-muted hover:bg-bg-hover hover:text-text-primary'} ${!backendUp ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer'}`}
+      >
+        {'{ }'}
       </button>
       <div className="relative" ref={menuRef}>
         <button

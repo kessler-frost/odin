@@ -9,10 +9,14 @@ interface LogLine {
   msgClass: string;
 }
 
+// Terraform activity (source "tf:init" / "tf:apply" / "tf:destroy") lives in the
+// Events tab alongside resource status, with its own source label to stand out.
+const isEventLine = (line: LogLine) => line.source === 'event' || line.source.startsWith('tf:');
+
 const tabFilter: Record<string, (line: LogLine) => boolean> = {
   Agent: (line) => line.source === 'agent',
-  Logs: (line) => line.source !== 'agent' && line.source !== 'event',
-  Events: (line) => line.source === 'event',
+  Logs: (line) => line.source !== 'agent' && !isEventLine(line),
+  Events: isEventLine,
 };
 
 const msgColors: Record<string, string> = {
@@ -63,6 +67,20 @@ function parseWebSocketMessage(msg: Record<string, unknown>): LogLine[] {
     const phase = msg.phase as string;
     const msgClass = phase === 'healthy' ? 'success' : (phase === 'crashed' || phase === 'error') ? 'error' : '';
     return [{ time, source: 'event', msg: `${msg.resource_id}: ${phase}`, msgClass }];
+  }
+
+  // Terraform stream: one message per output line while tofu runs, then a
+  // terminal message carrying status/exit_code (+ the output tail on failure).
+  if (type === 'tf') {
+    const source = `tf:${msg.phase}`;
+    if (msg.status === undefined) {
+      const text = (msg.line ?? '') as string;
+      return text ? [{ time, source, msg: text, msgClass: '' }] : [];
+    }
+    const ok = msg.status === 'ok';
+    const head = { time, source, msg: `${msg.status} (exit ${msg.exit_code})`, msgClass: ok ? 'success' : 'error' };
+    const tail = ((msg.tail ?? []) as string[]).map(l => ({ time, source, msg: l, msgClass: 'error' }));
+    return [head, ...tail];
   }
 
   return [];
