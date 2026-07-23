@@ -20,7 +20,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from odin.aws.backings import PROVISIONED
+from odin.aws.backings import ENSURE_KINDS, PROVISIONED
 from odin.fabric.localhost import LocalhostFabric
 from odin.gateway.policy import compile_policies
 from odin.reconcile import assertions
@@ -116,10 +116,17 @@ class Reconciler:
         Without it, a never-before-applied env has no registered
         `backing_port`, the gateway 503s every forward, and tofu's own
         AWS-provider retry/backoff turns that into a long, opaque hang
-        instead of a request-scoped failure."""
+        instead of a request-scoped failure.
+
+        Uses ENSURE_KINDS (not the narrower PROVISIONED): "ecr" needs its
+        registry:2 CONTAINER booted here too (V2b), even though its actual
+        resource CRUD never runs through this instance's client()-based
+        provision/exists/deprovision -- CreateRepository's very first call
+        (via tofu, through the gateway) needs the registry's live port
+        already resolvable to build `repositoryUri`."""
         if self._aws is None:
             return
-        kinds = {r.kind for r in stack.resources if r.kind in PROVISIONED}
+        kinds = {r.kind for r in stack.resources if r.kind in ENSURE_KINDS}
         await asyncio.gather(*(asyncio.to_thread(self._aws.ensure_backing, k) for k in kinds))
         if self._gateway is not None:
             ports = await asyncio.to_thread(self._aws.backing_ports)

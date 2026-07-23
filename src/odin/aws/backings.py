@@ -6,6 +6,17 @@ dynalite (dynamodb) — one shared container per (env, backing), run through the
 same RuntimeDriver as every other workload. The Reconciler's `_aws` seam:
 provision/exists/deprovision plus lifecycle (ensure_backing/gc/aws_env/facts)
 and a host-side boto3 `client` for tests.
+
+`ecr`'s registry:2 (V2b) joins the SAME per-env container lifecycle
+(ensure_backing/gc, ENSURE_KINDS below) but is deliberately absent from
+PROVISIONED and every `client()`-based method's if/elif: it's a real Docker
+Registry v2 server, not an AWS API, so it has no boto3 client, no
+provision()/exists()/deprovision()/facts() case, and its own readiness
+probe (`_await_registry_ready`) speaks its native `/v2/` HTTP endpoint
+instead of a boto3 call. Its actual AWS-shaped resource (the ECR
+`Repository`) is owned entirely by the gateway's control-plane model
+(gateway/models/ecr.py, all-synth like ec2/iam) -- this module only ever
+boots/tears down the container the real image bytes live in.
 """
 from __future__ import annotations
 
@@ -15,6 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import boto3
+import httpx
 from botocore.client import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
@@ -29,6 +41,15 @@ class BackingUnavailable(RuntimeError):
 
 
 PROVISIONED = ("s3", "sqs", "sns", "dynamodb")
+# Kinds whose backing CONTAINER needs ensure_backing/gc lifecycle before use
+# -- a superset of PROVISIONED. "ecr"'s own resource CRUD (CreateRepository &
+# co.) happens entirely through the gateway's control-plane model
+# (gateway/models/ecr.py, all-synth like ec2/iam), never through this
+# module's client()-based provision/exists/deprovision/facts dispatch -- so
+# it's deliberately absent from PROVISIONED (plan.py/reconciler._execute
+# stay untouched) but must still get its registry:2 CONTAINER booted ahead
+# of Apply, same as every other AWS-shaped kind (Reconciler.ensure_backings).
+ENSURE_KINDS = PROVISIONED + ("ecr",)
 ACCESS_KEY = "allfather"
 SECRET_KEY = "allfather-secret-key"
 REGION = "us-east-1"
@@ -74,6 +95,15 @@ BACKINGS: tuple[BackingDef, ...] = (
                command=("--port", "4567"),
                kinds=("dynamodb",)),    # baked image (see _ensure_dynalite_image) — instant,
                                          # offline boot; no TTL/Streams — accepted
+    BackingDef(name="registry", image="registry:2", port=5000, env={},
+               command=(), kinds=("ecr",)),  # CNCF Distribution, Apache-2.0 (V2b) — the ECR
+                                              # DATA plane only; the gateway's ecr.py model
+                                              # owns the control plane (Create/Describe/Delete
+                                              # Repository & co.) entirely, so this container
+                                              # never gets a client()/provision() dispatch case
+                                              # -- see ENSURE_KINDS above. Anonymous/auth-less
+                                              # by design (`GetAuthorizationToken`'s synthetic
+                                              # token is compat-only, gateway/models/ecr.py).
 )
 
 # Key casing verified live (AccountId shows up in returned ARNs); the `Local`
@@ -184,6 +214,9 @@ class BackingAws:
             self._rt.build(_DYNALITE_IMAGE, _DYNALITE_DOCKERFILE)
 
     def _await_ready(self, cname: str, service: str) -> None:
+        if service == "ecr":
+            self._await_registry_ready(cname)
+            return
         deadline = time.monotonic() + READY_TIMEOUT
         while time.monotonic() < deadline:
             try:
@@ -191,6 +224,32 @@ class BackingAws:
                 return
             except (ClientError, BotoCoreError):
                 time.sleep(1)
+        raise RuntimeError(f"{cname} never became ready:\n{self._rt.logs(cname)}")
+
+    def _await_registry_ready(self, cname: str) -> None:
+        """registry:2 speaks the Docker Registry v2 HTTP protocol, not any
+        AWS wire shape -- `client()`'s boto3-ecr seam (every OTHER backing's
+        readiness probe) can never reach it, since registry:2 doesn't
+        understand SigV4 or the ECR JSON protocol at all. A raw GET to
+        `/v2/` (the registry's own liveness/version endpoint, 200 when
+        ready) is the real check. Gated on `_client_factory`, the SAME seam
+        every other probe already uses to skip real I/O in unit tests
+        (FakeRuntime never actually listens on its fake ports) -- a test
+        that injects a client_factory gets the same instant-success
+        behavior a FakeClient call already gives the AWS-protocol probes."""
+        if self._client_factory is not None:
+            return
+        d = self._backing_for("ecr")
+        deadline = time.monotonic() + READY_TIMEOUT
+        while time.monotonic() < deadline:
+            port = self._rt.host_port(cname, self._listen_port(d))
+            try:
+                if port:
+                    httpx.get(f"http://127.0.0.1:{port}/v2/", timeout=2.0).raise_for_status()
+                    return
+            except httpx.HTTPError:
+                pass
+            time.sleep(0.5)
         raise RuntimeError(f"{cname} never became ready:\n{self._rt.logs(cname)}")
 
     def client(self, service: str):

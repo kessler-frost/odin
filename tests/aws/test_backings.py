@@ -370,7 +370,7 @@ def test_aws_env_yields_sqs_and_sns_from_one_goaws_plus_creds(rt, factory, tmp_p
 def test_gc_stops_backings_whose_kinds_are_all_inactive(rt, factory, tmp_path):
     _aws(rt, factory, tmp_path).gc({"s3"})
     assert set(rt.stopped) == {
-        "allfather-aws-goaws-default", "allfather-aws-dynalite-default"}
+        "allfather-aws-goaws-default", "allfather-aws-dynalite-default", "allfather-aws-registry-default"}
 
 
 def test_gc_with_no_active_kinds_stops_everything(rt, factory, tmp_path):
@@ -379,4 +379,41 @@ def test_gc_with_no_active_kinds_stops_everything(rt, factory, tmp_path):
         "allfather-aws-rustfs-default",
         "allfather-aws-goaws-default",
         "allfather-aws-dynalite-default",
+        "allfather-aws-registry-default",
     }
+
+
+# --- V2b: the ecr registry:2 backing --------------------------------------------------
+
+
+def test_ensure_backing_ecr_runs_registry_with_dynamic_port(rt, factory, tmp_path):
+    aws = _aws(rt, factory, tmp_path)
+    aws.ensure_backing("ecr")
+    spec = rt.runs[0]
+    assert spec.name == "allfather-aws-registry-default"
+    assert spec.image == "registry:2"
+    assert spec.ports == {5000: 0}
+    assert spec.env == {}
+    assert spec.command == ()
+
+
+def test_ensure_backing_ecr_is_idempotent_while_running(rt, factory, tmp_path):
+    aws = _aws(rt, factory, tmp_path)
+    aws.ensure_backing("ecr")
+    aws.ensure_backing("ecr")
+    assert len(rt.runs) == 1
+
+
+def test_backing_ports_includes_ecr_when_running(rt, factory, tmp_path):
+    aws = _aws(rt, factory, tmp_path)
+    aws.ensure_backing("ecr")
+    assert aws.backing_ports() == {"ecr": rt.ports["allfather-aws-registry-default"]}
+
+
+def test_gc_keeps_registry_running_while_ecr_is_active(rt, factory, tmp_path):
+    # No ensure_backing() first (unlike the running-container assertions
+    # above): ensure_backing's OWN pre-create "clear any exited remnant"
+    # stop() would otherwise pollute rt.stopped before gc() ever runs,
+    # matching test_gc_stops_backings_whose_kinds_are_all_inactive's pattern.
+    _aws(rt, factory, tmp_path).gc({"ecr"})
+    assert "allfather-aws-registry-default" not in rt.stopped
