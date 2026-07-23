@@ -27,26 +27,34 @@ right one.
 Nebula join (directive 6, the payoff): every VPC gets a Nebula network
 unconditionally (V1b's `ec2net.py::_create_vpc`), so an instance launched
 into a subnet always has one to join. `_nebula_files` signs a REAL host cert
-via `fabric.nebula`'s existing nebula-cert primitives and renders the
-instance's `nebula.yml` -- both land on the VM's disk via cloud-init (real
-files, provable with `limactl shell ... cat /etc/nebula/host.crt`).
-Deliberately NOT built here: actually installing/starting the `nebula`
-daemon inside the VM (a binary fetch + systemd unit -- the same shape
-cloud_init.py's `install_nerdctl` already does, so not a bigger CODE lift)
-and running a lighthouse PROCESS on the host ARE the next step. `fabric/
-nebula.py` has never started a lighthouse process (V1b's own docstring: "no
-lighthouse PROCESS ever starts in V1"), and `ensure_network`'s
-`lighthouse_underlay_ip` is still the "127.0.0.1" placeholder documented
-there -- from inside a VM that address means the VM's OWN loopback, not the
-host, so a cloud-init-started nebula daemon would just retry forever with
-nothing reachable. Landing that real connectivity needs a host-reachable
-underlay address (the vzNAT gateway IP) and a lighthouse lifecycle, which is
-a genuinely new seam, not a decoration on this slice -- flagged here rather
-than half-built.
+via `fabric.nebula`'s existing nebula-cert primitives -- landed on the VM's
+disk via cloud-init (real files, provable with `limactl shell ... cat
+/etc/nebula/host.crt`), along with the nebula BINARY itself (`cloud_init.py`'s
+`install_nebula`, same download-a-release-tarball shape as `install_nerdctl`)
+and a registered-but-not-started systemd unit.
+
+R3 (single-host mesh activation) finishes what this module's own docstring
+used to flag as deliberately unbuilt: `config.yml` is NOT written at
+cloud-init time (its `static_host_map` needs a host-reachable underlay
+address that doesn't exist until the VM is actually up on vzNAT -- a genuine
+chicken/egg, not a decoration). Instead `boot()` writes it POST-boot, once
+`_discover_ip` has confirmed the VM is networked:
+`_discover_host_underlay` derives the host's own address on the VM's vzNAT
+/24 (correlated to the VM's OWN observed IP via a live `ifconfig`, not a
+hardcoded subnet -- vzNAT's exact /24 is a macOS implementation detail,
+empirically 192.168.64.0/24 today but not a contract), `_activate_nebula`
+then writes the real config (the VPC's compiled SG firewall included, off
+`NebulaJoin.firewall`) via `limactl shell ... sudo tee` and starts the
+daemon. `fabric.nebula.LighthouseManager` supervises the HOST-side
+lighthouse process this all connects to -- see that module's docstring for
+the macOS root requirement and its one-time `sudoers.d` setup. Both halves
+are best-effort: a mesh-wiring failure never fails the AWS instance boot
+itself (`_activate_nebula` never raises).
 """
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 import tempfile
 import time
@@ -56,7 +64,10 @@ from pathlib import Path
 from odin.compute.cloud_init import generate_cloud_init
 from odin.compute.lima_yaml import generate_lima_yaml
 from odin.compute.models import VmConfig
-from odin.fabric.nebula import DEFAULT_FIREWALL, NebulaManager, ensure_network
+from odin.fabric.models import FirewallRules
+from odin.fabric.nebula import DEFAULT_FIREWALL, LighthouseManager, NebulaManager, ensure_network
+
+log = logging.getLogger("odin.compute.instances")
 
 _SLIRP_PREFIX = "192.168.5."  # Lima's built-in user-mode network -- never host-reachable
 BOOT_TIMEOUT = 300.0
@@ -84,10 +95,17 @@ class NebulaJoin:
     the VM's disk -- `root`/`env` locate the env's Nebula network (V1b: one
     per VPC, keyed by env -- see `ec2net.py`'s module docstring), `host_id`
     is the instance id (the cert's `-name`, and the sticky-IP allocation
-    key)."""
+    key). `firewall` (R3) is the containing VPC's default security group's
+    ALREADY-compiled Nebula firewall (`ec2net.py::_compiled_firewall`,
+    resolved by `gateway/models/ec2compute.py`'s boot path) -- `None` falls
+    back to `DEFAULT_FIREWALL` (allow-all), matching v1's own "no
+    SecurityGroupIds modeled yet, every instance inherits the VPC default
+    SG" limit exactly as real AWS does for an instance launched with none
+    specified."""
     root: Path
     env: str
     host_id: str
+    firewall: FirewallRules | None = None
 
 
 def _pick_shared_ip(hostname_i_output: str) -> str | None:
@@ -125,12 +143,15 @@ class InstanceVm:
     this same method shape, so `gateway/models/ec2compute.py`'s state
     machine is testable without either a real VM OR a real subprocess."""
 
-    def __init__(self, runner=None, poll_interval: float = 2.0) -> None:
+    def __init__(self, runner=None, poll_interval: float = 2.0, lighthouse: LighthouseManager | None = None) -> None:
         self._run = runner or _default_runner
         # A constructor knob (not a hardcoded sleep) purely for testability --
         # `_discover_ip`'s real pacing is 2s between `hostname -I` polls, but
         # a unit test asserting the timeout PATH shouldn't have to wait for it.
         self._poll_interval = poll_interval
+        # R3: injectable so a unit test can assert `_activate_nebula`'s
+        # lighthouse-ensure call without spawning a real `sudo nebula`.
+        self._lighthouse = lighthouse or LighthouseManager()
 
     def _lima(self, *args: str, check: bool = True, input: str | None = None) -> _Proc:
         proc = self._run(["limactl", *args], input=input)
@@ -157,7 +178,10 @@ class InstanceVm:
         identity, see `gateway/keys.py::workload_env`) is baked into the
         VM's cloud-init -- /etc/environment + ~/.aws/credentials."""
         extra = _extra_provision_script(self._nebula_files(nebula), user_data)
-        script = generate_cloud_init(hostname=hostname, ssh_pubkey=ssh_pubkey, extra_script=extra, env_vars=env_vars)
+        script = generate_cloud_init(
+            hostname=hostname, ssh_pubkey=ssh_pubkey, extra_script=extra, env_vars=env_vars,
+            install_nebula=nebula is not None,
+        )
         yaml_doc = generate_lima_yaml(vm_config, cloud_init_script=script, shared_network=True)
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as handle:
             handle.write(yaml_doc)
@@ -167,26 +191,84 @@ class InstanceVm:
             self._lima("start", f"--timeout={int(timeout)}s", name)
         finally:
             Path(yaml_path).unlink(missing_ok=True)
-        return self._discover_ip(name, timeout)
+        ip = self._discover_ip(name, timeout)
+        if nebula is not None:
+            self._activate_nebula(name, nebula, ip)
+        return ip
 
     def _nebula_files(self, nebula: NebulaJoin | None) -> dict[str, str] | None:
+        """Cloud-init-time only: cert material, which doesn't depend on the
+        underlay address -- `config.yml` is deliberately NOT here (see the
+        module docstring's chicken/egg note); `_activate_nebula` writes it
+        post-boot. Reuses a PREVIOUSLY-discovered real underlay if this env
+        already has one (so a second instance's cert-signing pass doesn't
+        regress `overlay.json` back to the "127.0.0.1" bootstrap placeholder)
+        -- `_activate_nebula` re-derives + persists the real value
+        regardless, so THIS instance's own connectivity never depends on
+        that cache."""
         if nebula is None:
             return None
-        network = ensure_network(nebula.root, nebula.env, "127.0.0.1", runner=self._run)
         manager = NebulaManager(Path(nebula.root) / nebula.env / "nebula", runner=self._run)
+        existing = manager.load_overlay()
+        underlay = (existing.lighthouse_underlay_ip if existing else None) or "127.0.0.1"
+        network = ensure_network(nebula.root, nebula.env, underlay, runner=self._run)
         cert = manager.sign_cert(nebula.host_id, network.cert_ip(nebula.host_id), groups=["ec2"])
-        config = manager.generate_config(
-            lighthouse_ip=network.lighthouse_ip,
-            lighthouse_underlay=network.lighthouse_underlay_ip or "127.0.0.1",
-            firewall=DEFAULT_FIREWALL,
-            is_lighthouse=False,
-        )
         return {
             "ca.crt": cert.ca_crt.read_text(),
             "host.crt": cert.crt.read_text(),
             "host.key": cert.key.read_text(),
-            "config.yml": config,
         }
+
+    def _discover_host_underlay(self, vm_ip: str) -> str | None:
+        """The host's own address on the VM's vzNAT /24 -- the address a
+        nebula daemon INSIDE the VM can reach the host lighthouse at.
+        Derived by correlating to the VM's OWN just-discovered IP (e.g.
+        `192.168.64.10` -> look for a host interface in `192.168.64.0/24`)
+        rather than a hardcoded subnet: vzNAT's exact /24 is a macOS
+        implementation detail (`_pick_shared_ip`'s own docstring makes the
+        same call for the VM side). Empirically this is the host's vzNAT
+        bridge interface (`bridge100`, gateway `.1`) -- verified by booting a
+        real Lima vz VM and reading `ifconfig` on both sides; it only exists
+        on the host while at least one vz VM is running, which is always
+        true here (this VM is the one that just booted)."""
+        proc = self._run(["ifconfig"])
+        if proc.returncode != 0:
+            return None
+        prefix = f"{vm_ip.rsplit('.', 1)[0]}."
+        for line in proc.stdout.splitlines():
+            line = line.strip()
+            if line.startswith(f"inet {prefix}"):
+                return line.split()[1]
+        return None
+
+    def _activate_nebula(self, name: str, nebula: NebulaJoin, vm_ip: str) -> None:
+        """Post-boot (the VM is up and vzNAT-networked, so the real underlay
+        is now discoverable): write the FINAL nebula config -- the real
+        underlay address and the VPC's compiled SG firewall -- and start the
+        daemon; also ensures the env's HOST-side lighthouse is up (the
+        "first VM joins" half of `LighthouseManager`'s lifecycle --
+        `gateway/models/ec2compute.py::_finish_terminate` covers "last VM
+        leaves"). Best-effort throughout: NEVER raises. RunInstances has
+        already succeeded and the instance is really running regardless of
+        mesh state -- a wiring failure here must not strand a healthy
+        instance in a failure path over something the AWS API contract
+        doesn't even surface."""
+        try:
+            underlay = self._discover_host_underlay(vm_ip)
+            if underlay is None:
+                log.warning("could not derive a host underlay address for %s; nebula not activated", name)
+                return
+            self._lighthouse.ensure_started(nebula.root, nebula.env, underlay)
+            manager = NebulaManager(Path(nebula.root) / nebula.env / "nebula", runner=self._run)
+            network = ensure_network(nebula.root, nebula.env, underlay, runner=self._run)
+            config = manager.generate_config(
+                lighthouse_ip=network.lighthouse_ip, lighthouse_underlay=underlay,
+                firewall=nebula.firewall or DEFAULT_FIREWALL, is_lighthouse=False,
+            )
+            self._lima("shell", name, "--", "sudo", "tee", "/etc/nebula/config.yml", input=config, check=False)
+            self._lima("shell", name, "--", "sudo", "systemctl", "enable", "--now", "nebula", check=False)
+        except Exception as exc:  # noqa: BLE001 -- deliberately broad, see docstring
+            log.warning("nebula activation failed for %s: %s", name, exc)
 
     def _discover_ip(self, name: str, timeout: float) -> str:
         deadline = time.monotonic() + timeout
