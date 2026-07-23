@@ -81,13 +81,21 @@ class FunctionRuntime:
     (the same seam `aws/backings.py`/`InstanceVm` use, so a test can inject a
     fake runtime with no real Docker involved)."""
 
-    def __init__(self, runtime=None, root: Path = Path(".odin")) -> None:
+    def __init__(
+        self, runtime=None, root: Path = Path(".odin"),
+        ready_timeout: float = READY_TIMEOUT, poll_interval: float = 0.5,
+    ) -> None:
         # `runtime` defaults lazily (like ec2compute.py's `vm or InstanceVm()`)
         # so gateway/models/lambdactl.py's `pure_answer` can construct a real
         # one per-call with no shared state -- `root` still must be threaded
         # explicitly (it's `stores.root`, known only at call time).
+        # `ready_timeout`/`poll_interval` are constructor knobs purely for
+        # testability (InstanceVm's own `poll_interval` precedent) -- real
+        # callers keep the module defaults.
         self._rt = runtime or ColimaRuntime()
         self._root = root
+        self._ready_timeout = ready_timeout
+        self._poll_interval = poll_interval
 
     def code_dir(self, env: str, function_name: str) -> Path:
         return self._root / env / "gateway" / "lambda" / f"{function_name}-code"
@@ -128,12 +136,12 @@ class FunctionRuntime:
         return self._await_ready(name)
 
     def _await_ready(self, name: str) -> int:
-        deadline = time.monotonic() + READY_TIMEOUT
+        deadline = time.monotonic() + self._ready_timeout
         while time.monotonic() < deadline:
             port = self._rt.host_port(name, _RIE_PORT)
             if port and _tcp_open(port):
                 return port
-            time.sleep(0.5)
+            time.sleep(self._poll_interval)
         raise RuntimeError(f"{name} RIE never became ready:\n{self._rt.logs(name)}")
 
     def invoke(self, env: str, function_name: str, payload: bytes, timeout: float = 30.0) -> InvokeResult:
