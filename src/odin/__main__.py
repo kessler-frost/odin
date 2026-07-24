@@ -19,6 +19,22 @@ PID_FILE = ODIN_DIR / "pid"
 UI_DIR = Path(__file__).resolve().parent.parent.parent / "ui"
 DEFAULT_PORT = 4200
 BACKEND_DEV_PORT = 4201
+DEFAULT_HOST = "127.0.0.1"
+# Security finding #1a/b: odin has no authentication of its own -- every
+# route from `/apply` down to `/tf/*` drives real `docker run`/Lima VMs with
+# no login, no token, nothing. Binding to a LAN/0.0.0.0 address turns "my
+# laptop" into "anyone on this network can run containers on my laptop", so
+# loopback is the only default; a wider bind is opt-in and loud about it.
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _warn_if_non_loopback(host: str) -> None:
+    if host not in _LOOPBACK_HOSTS:
+        typer.echo(
+            f"WARNING: binding to {host} -- odin has no authentication. "
+            "Anyone who can reach this port can run containers on this machine.",
+            err=True,
+        )
 
 
 def _build_ui() -> None:
@@ -43,10 +59,17 @@ def start(
     port: int = typer.Option(DEFAULT_PORT, "-p", "--port", help="Port (default: 4200)"),
     foreground: bool = typer.Option(False, "-f", "--foreground", help="Run in foreground"),
     dev: bool = typer.Option(False, "-d", "--dev", help="Dev mode: Vite HMR + uvicorn reload"),
+    host: str = typer.Option(
+        DEFAULT_HOST, "--host",
+        help="Bind address (default: 127.0.0.1 -- loopback only). "
+             "odin has no authentication; only widen this if you know what you're doing.",
+    ),
 ) -> None:
     """Start the Odin server."""
+    _warn_if_non_loopback(host)
+
     if dev:
-        _start_dev(port)
+        _start_dev(port, host)
         return
 
     if PID_FILE.exists():
@@ -57,18 +80,18 @@ def start(
         PID_FILE.unlink()
 
     _build_ui()
-    typer.echo(f"Starting Odin on http://localhost:{port}")
+    typer.echo(f"Starting Odin on http://{host}:{port}")
 
     if foreground:
         import uvicorn
-        uvicorn.run("odin.server:create_app", factory=True, host="0.0.0.0", port=port)
+        uvicorn.run("odin.server:create_app", factory=True, host=host, port=port)
     else:
         ODIN_DIR.mkdir(parents=True, exist_ok=True)
         log_path = ODIN_DIR / "server.log"
         log = log_path.open("w")
         proc = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "odin.server:create_app",
-             "--factory", "--host", "0.0.0.0", "--port", str(port)],
+             "--factory", "--host", host, "--port", str(port)],
             stdout=log, stderr=log, start_new_session=True,
         )
         PID_FILE.write_text(str(proc.pid))
@@ -78,7 +101,7 @@ def start(
         )
 
 
-def _start_dev(port: int) -> None:
+def _start_dev(port: int, host: str = DEFAULT_HOST) -> None:
     """Dev mode startup."""
     if PID_FILE.exists():
         pid = int(PID_FILE.read_text().strip())
@@ -87,7 +110,7 @@ def _start_dev(port: int) -> None:
             return
         PID_FILE.unlink()
 
-    typer.echo(f"Starting Odin dev mode on http://localhost:{port}")
+    typer.echo(f"Starting Odin dev mode on http://{host}:{port}")
     typer.echo(f"  Vite  → :{port}  (HMR)")
     typer.echo(f"  API   → :{BACKEND_DEV_PORT}  (auto-reload)")
 
@@ -108,7 +131,7 @@ def _start_dev(port: int) -> None:
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
     backend = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "odin.server:create_app",
-         "--factory", "--host", "0.0.0.0", "--port", str(BACKEND_DEV_PORT),
+         "--factory", "--host", host, "--port", str(BACKEND_DEV_PORT),
          "--reload", "--reload-dir", "src"],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )

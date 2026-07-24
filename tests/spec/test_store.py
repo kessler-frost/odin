@@ -1,6 +1,8 @@
 """S1.2 — SpecStore: append-only content-addressed revisions + World."""
 from __future__ import annotations
 
+import stat
+
 import pytest
 
 from odin.spec.models import FieldValue, ResourceDesired, Stack, WorldDelta
@@ -31,6 +33,28 @@ def test_apply_creates_revision_and_moves_head(tmp_path):
 
 def test_rev_is_deterministic():
     assert rev_of(_stack("x")) == rev_of(_stack("x"))
+
+
+def test_stack_revision_is_written_0600(tmp_path):
+    # Security finding #3a: a Stack revision carries every field's raw value
+    # (rds `password`, etc.) in cleartext, immutably -- 0600 is the only
+    # defense available for this file.
+    store = SpecStore(tmp_path)
+    rev = store.apply(_stack("v1"))
+    path = tmp_path / "default" / "stacks" / f"{rev}.json"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_world_json_is_written_0600(tmp_path):
+    # Security finding #3a: `facts` can carry a live credential in cleartext
+    # (rds's DATABASE_URL embeds user:password) -- not redacted (the Fabric
+    # resolves refs out of these same facts functionally), so 0600 is the
+    # only defense available.
+    store = SpecStore(tmp_path)
+    store.apply_delta(WorldDelta(env="default", resource_id="db", kind="rds", phase="healthy",
+                                  facts={"DATABASE_URL": "postgresql://app:s3cr3t@host/postgres"}))
+    path = tmp_path / "default" / "world.json"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 def test_world_delta_upserts_and_persists(tmp_path):

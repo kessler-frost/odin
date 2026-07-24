@@ -30,7 +30,7 @@ from pydantic import BaseModel
 from odin.agent import hcl
 from odin.agent.hcl import TfProject, generate_tf
 from odin.simulate.runner import PLUGIN_CACHE_DIR
-from odin.spec.models import Stack
+from odin.spec.models import REDACTED, Stack, scrub
 from odin.spec.store import rev_of
 
 log = logging.getLogger("odin.translate")
@@ -114,11 +114,20 @@ def make_emit_tool(collector: list[dict]) -> SdkMcpTool:
 
 
 def _prompt(skeleton: TfProject, stack: Stack) -> str:
+    # Security finding #3: the agent only ever REVIEWS argument values --
+    # it never needs a real secret to do that, and this prompt is the one
+    # place a canvas's raw field values leave odin's process (to Anthropic's
+    # API). Sensitive fields go in redacted; a field embedded in the
+    # generated HCL itself (e.g. an ECS task's secret-looking env var) is
+    # additionally scrubbed out of the main.tf preview below, so the agent
+    # never sees the value either way, but the REAL skeleton `generate_tf`
+    # already built (never touched here) still carries it for the actual apply.
     resources = [
-        {"id": r.id, "kind": r.kind, "fields": {k: fv.value for k, fv in r.fields.items()}}
+        {"id": r.id, "kind": r.kind,
+         "fields": {k: (REDACTED if fv.sensitive else fv.value) for k, fv in r.fields.items()}}
         for r in stack.resources
     ]
-    main_tf = skeleton.files.get("main.tf", "")
+    main_tf = scrub(skeleton.files.get("main.tf", ""), stack.sensitive_values())
     return (
         f"Canvas resources: {resources!r}\n\n"
         f"Deterministically generated main.tf:\n```hcl\n{main_tf}```\n\n"

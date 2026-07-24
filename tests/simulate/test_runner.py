@@ -37,6 +37,14 @@ _INIT_OK = 'if [ "$1" = "init" ]; then echo "Initializing..."; exit 0; fi'
 
 _APPLY_OK_TWO_LINES = _INIT_OK + '\nif [ "$1" = "apply" ]; then echo "line one"; echo "line two"; exit 0; fi'
 
+_APPLY_LEAKS_A_SECRET = _INIT_OK + (
+    '\nif [ "$1" = "apply" ]; then echo "planning"; echo "password = hunter2"; exit 0; fi'
+)
+
+_APPLY_LEAKS_A_SECRET_ON_FAILURE = _INIT_OK + (
+    '\nif [ "$1" = "apply" ]; then echo "password = hunter2"; echo "boom"; exit 1; fi'
+)
+
 _APPLY_FAILS = _INIT_OK + '\nif [ "$1" = "apply" ]; then echo "planning"; echo "boom: invalid resource"; exit 1; fi'
 
 _APPLY_SLOW = _INIT_OK + '\nif [ "$1" = "apply" ]; then echo "starting"; sleep 0.4; echo "done"; exit 0; fi'
@@ -189,6 +197,61 @@ async def test_wedged_apply_is_killed_at_the_timeout_and_reported_failed(tmp_pat
     assert any("timed out" in line for line in terminal["tail"])
     # the lock is released -- a wedged, killed run must not wedge the env forever
     assert runner.status("default")["running"] is False
+
+
+# --- security finding #3: tofu's own log output is scrubbed for secrets ---
+
+
+async def test_secrets_are_scrubbed_from_streamed_line_events(tmp_path, monkeypatch):
+    _write_fake_tofu(tmp_path, _APPLY_LEAKS_A_SECRET)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    ws = RecordingWs()
+    runner = TfRunner(tmp_path, ws=ws)
+
+    result = await runner.apply("default", _project(), 4266, "ak", "sk", secrets=frozenset({"hunter2"}))
+
+    assert result.ok is True
+    apply_lines = [m["line"] for m in ws.messages if m.get("phase") == "apply" and "line" in m]
+    assert apply_lines == ["planning", "password = [REDACTED]"]
+    assert not any("hunter2" in line for line in apply_lines)
+
+
+async def test_secrets_are_scrubbed_from_the_failure_tail(tmp_path, monkeypatch):
+    _write_fake_tofu(tmp_path, _APPLY_LEAKS_A_SECRET_ON_FAILURE)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    ws = RecordingWs()
+    runner = TfRunner(tmp_path, ws=ws)
+
+    result = await runner.apply("default", _project(), 4266, "ak", "sk", secrets=frozenset({"hunter2"}))
+
+    assert result.ok is False
+    assert "hunter2" not in " ".join(result.tail)
+    assert "password = [REDACTED]" in result.tail
+    terminal = next(m for m in ws.messages if m.get("phase") == "apply" and "status" in m)
+    assert "hunter2" not in " ".join(terminal["tail"])
+
+
+async def test_no_secrets_given_leaves_output_untouched(tmp_path, monkeypatch):
+    _write_fake_tofu(tmp_path, _APPLY_LEAKS_A_SECRET)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    runner = TfRunner(tmp_path)
+
+    result = await runner.apply("default", _project(), 4266, "ak", "sk")  # no secrets= given
+
+    assert result.ok is True
+    assert result.tail == ("planning", "password = hunter2")
+
+
+async def test_secrets_are_scrubbed_from_destroy_output_too(tmp_path, monkeypatch):
+    _write_fake_tofu(tmp_path, _INIT_OK + '\nif [ "$1" = "destroy" ]; then echo "password = hunter2"; exit 0; fi')
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    runner = TfRunner(tmp_path)
+
+    # A prior apply is required for destroy to actually run tofu (else it's the no-workspace no-op).
+    await runner.apply("default", _project(), 4266, "ak", "sk")
+    result = await runner.destroy("default", 4266, "ak", "sk", secrets=frozenset({"hunter2"}))
+
+    assert "hunter2" not in " ".join(result.tail)
 
 
 async def test_a_fast_apply_is_unaffected_by_a_short_default_timeout(tmp_path, monkeypatch):

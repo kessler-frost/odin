@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 
-from odin.spec.models import Edge, FieldValue, Ref, ResourceDesired, Stack
+from odin.spec.models import Edge, FieldValue, Ref, ResourceDesired, Stack, is_sensitive_field_name
 
 _REF = re.compile(r"^\$\{\{\s*([\w-]+)\.([\w-]+)\s*\}\}$")
 
@@ -79,9 +79,14 @@ def _resource(node: dict) -> ResourceDesired | None:
         if ref is not None:  # a top-level ${{node.attr}} field becomes a Ref
             refs.append(ref)
         else:
-            fields[key] = FieldValue(value=value, provenance="user")
+            fields[key] = FieldValue(value=value, provenance="user", sensitive=is_sensitive_field_name(key))
     if static_env:
-        fields["env"] = FieldValue(value=static_env, provenance="user")
+        # Security finding #3: the whole `env` field is flagged sensitive if
+        # ANY entry looks like a secret (coarse -- fine for the LLM-prompt
+        # redaction that reads this flag; `ResourceDesired.sensitive_values`
+        # re-inspects the dict key-by-key for the finer-grained tofu-log scrub).
+        env_sensitive = any(is_sensitive_field_name(k) for k in static_env)
+        fields["env"] = FieldValue(value=static_env, provenance="user", sensitive=env_sensitive)
 
     return ResourceDesired(
         id=_node_id(node), kind=kind, fields=fields, refs=tuple(refs)

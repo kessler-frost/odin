@@ -122,6 +122,35 @@ def test_vpc_subnet_sg_round_trip_with_containment_fields():
     assert by_id["web-sg"].fields["ingressRules"].value == "tcp:443:0.0.0.0/0"
 
 
+def test_password_field_is_marked_sensitive():
+    canvas = {"nodes": [{"type": "rds", "data": {"label": "db", "password": "hunter2"}}], "edges": []}
+    db = canvas_to_stack(canvas).resources[0]
+    assert db.fields["password"].sensitive is True
+    assert db.fields["password"].value == "hunter2"  # the real value is still there -- only flagged
+
+
+def test_ordinary_field_is_not_marked_sensitive():
+    canvas = {"nodes": [{"type": "rds", "data": {"label": "db", "engine": "postgres"}}], "edges": []}
+    db = canvas_to_stack(canvas).resources[0]
+    assert db.fields["engine"].sensitive is False
+
+
+def test_env_field_is_sensitive_if_any_entry_looks_like_a_secret():
+    canvas = {"nodes": [{"type": "ecs", "data": {
+        "label": "api", "env": {"DB_PASSWORD": "hunter2", "PORT": "8080"},
+    }}], "edges": []}
+    api = canvas_to_stack(canvas).resources[0]
+    assert api.fields["env"].sensitive is True
+
+
+def test_env_field_is_not_sensitive_when_nothing_looks_like_a_secret():
+    canvas = {"nodes": [{"type": "ecs", "data": {
+        "label": "api", "env": {"PORT": "8080", "LOG_LEVEL": "info"},
+    }}], "edges": []}
+    api = canvas_to_stack(canvas).resources[0]
+    assert api.fields["env"].sensitive is False
+
+
 def test_iam_role_and_ecr_translate_with_fields_passed_generically():
     # V2c: iam_role/ecr are pure gateway-model kinds like vpc/subnet/sg --
     # `_resource` needs no special-casing for them, just the _KIND mapping.
