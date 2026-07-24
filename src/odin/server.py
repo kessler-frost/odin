@@ -24,6 +24,7 @@ from odin.agent import import_tf as import_tf_mod
 from odin.agent import translate as translate_mod
 from odin.agent.hcl import TfProject, generate_tf, resource_set
 from odin.api.canvas import CanvasGraph, create_canvas_router
+from odin.api.logs import create_logs_router
 from odin.api.ws import ConnectionManager
 from odin.aws.backings import BackingAws
 from odin.aws.rds import PostgresRds
@@ -528,6 +529,7 @@ def create_app(
             _store, reconciler_for, tf_runner, gateway_keystore, lambda: gateway_port_actual, env_epoch, translate_cache,
         )
     )
+    app.include_router(create_logs_router(_store, gateway_stores, _runtime))
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
@@ -552,6 +554,7 @@ def create_app(
     app.state.reconcilers = reconcilers
     app.state.gateway = gateway_state
     app.state.gateway_keys = gateway_keystore
+    app.state.gateway_stores = gateway_stores
     app.state.tf_runner = tf_runner
     app.state.env_epoch = env_epoch
     app.state.translate_cache = translate_cache
