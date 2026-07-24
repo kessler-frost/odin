@@ -150,6 +150,13 @@ colima, installs odin, runs `odin doctor`):
 curl -fsSL https://raw.githubusercontent.com/kessler-frost/odin/main/scripts/install.sh | sh
 ```
 
+To undo it — stop the server, remove odin-managed containers/VMs, and
+uninstall the tool (your Homebrew tools are left alone):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kessler-frost/odin/main/scripts/uninstall.sh | sh
+```
+
 Or from a local clone, for development (verified verbatim against this repo):
 
 ```bash
