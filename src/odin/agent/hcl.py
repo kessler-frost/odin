@@ -133,20 +133,26 @@ def _block(resource_type: str, name: str, attrs: dict[str, str], nested: str = "
     return f'resource "{resource_type}" "{name}" {{\n{body}\n}}'
 
 
-def _tags_block(label: str) -> str:
-    """`tags = { "odin:node" = <label> }` -- stamped on every PRIMARY
-    canvas-node-backed resource (never a companion resource -- a key pair,
-    an sns->sqs subscription, an inline role policy, a lambda's
+def _tags_block(res: ResourceDesired) -> str:
+    """`tags = { <user tags...>, "odin:node" = <label> }` -- stamped on every
+    PRIMARY canvas-node-backed resource (never a companion resource -- a key
+    pair, an sns->sqs subscription, an inline role policy, a lambda's
     auto-generated execution role, the one shared ecs cluster, or an ecs
     node's task definition -- those aren't canvas nodes themselves).
-    This tag is the ONE mechanism two other odin subsystems key off: the
-    reconciler's TF-owned-status World projection (vpc/subnet/ec2 have no
-    other AWS-native field carrying the canvas label back) and the
+    The node's own `tags` field (an imported bucket's user tags, finding #6)
+    is merged in ahead of `odin:node` so a round-trip preserves them; the
+    `odin:node` tag itself is the ONE mechanism two other odin subsystems key
+    off: the reconciler's TF-owned-status World projection (vpc/subnet/ec2
+    have no other AWS-native field carrying the canvas label back) and the
     gateway's substrate-launch credential issuance (EC2 cloud-init, an ECS
     task container, a Lambda RIE container all resolve which (env, node)
     keystore identity to inject from this same tag) -- see
     reconcile/tf_status.py and gateway/keys.py::workload_env."""
-    return f"  tags = {{\n    {quote('odin:node')} = {quote(label)}\n  }}"
+    user = res.fields.get("tags")
+    tags = {**(user.value if user is not None and isinstance(user.value, dict) else {}), "odin:node": res.id}
+    width = max(len(quote(k)) for k in tags)
+    lines = "\n".join(f"    {quote(k).ljust(width)} = {quote(v)}" for k, v in tags.items())
+    return f"  tags = {{\n{lines}\n  }}"
 
 
 # Cross-resource references passed to every builder: resource id -> (kind,
@@ -216,6 +222,10 @@ def _sns(res: ResourceDesired, refs: Refs) -> Built:
     return {"name": quote(res.id)}, ""
 
 
+def _attribute_block(name: str, attr_type: str) -> str:
+    return f"  attribute {{\n    name = {quote(name)}\n    type = {quote(attr_type)}\n  }}"
+
+
 def _dynamodb(res: ResourceDesired, refs: Refs) -> Built:
     hash_key = _field(res, "hashKey", "id")
     attrs = {
@@ -223,8 +233,15 @@ def _dynamodb(res: ResourceDesired, refs: Refs) -> Built:
         "billing_mode": quote("PAY_PER_REQUEST"),
         "hash_key": quote(hash_key),
     }
-    nested = f'  attribute {{\n    name = {quote(hash_key)}\n    type = "S"\n  }}'
-    return attrs, nested
+    blocks = [_attribute_block(hash_key, _field(res, "hashKeyType", "S"))]
+    # A composite (hash + range) key: emit range_key + its own attribute block,
+    # so an imported hash+range table round-trips instead of collapsing to
+    # hash-only -- a real schema change (field-test finding #6).
+    range_key = _field(res, "rangeKey", "")
+    if range_key:
+        attrs["range_key"] = quote(range_key)
+        blocks.append(_attribute_block(range_key, _field(res, "rangeKeyType", "S")))
+    return attrs, "\n\n".join(blocks)
 
 
 def _vpc(res: ResourceDesired, refs: Refs) -> Built:
@@ -556,7 +573,7 @@ def generate_tf(stack: Stack) -> TfProject:
             unsupported.append(f"{res.id} ({res.kind}): {built}")
             continue
         attrs, nested = built
-        nested = "\n\n".join(part for part in (nested, _tags_block(res.id)) if part)
+        nested = "\n\n".join(part for part in (nested, _tags_block(res)) if part)
         block = _block(_TF_TYPES[res.kind], hcl_name_by_id[res.id], attrs, nested)
         blocks.append(((res.kind, res.id), block))
 

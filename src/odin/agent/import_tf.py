@@ -45,12 +45,30 @@ _KIND = {
     "aws_sqs_queue": "sqs",
     "aws_sns_topic": "sns",
     "aws_dynamodb_table": "dynamodb",
+    "aws_iam_role": "iam_role",
 }
 # The attribute each supported type's human-facing name lives in (mirrors
 # hcl.py's builders: s3 uses `bucket`, everything else uses `name`).
-_NAME_ATTR = {"aws_s3_bucket": "bucket", "aws_sqs_queue": "name", "aws_sns_topic": "name", "aws_dynamodb_table": "name"}
-# canvas kind -> aws_* type, for mode (b) (the inverse of `_KIND`).
-_TF_TYPE = {kind: rtype for rtype, kind in _KIND.items()}
+_NAME_ATTR = {
+    "aws_s3_bucket": "bucket", "aws_sqs_queue": "name", "aws_sns_topic": "name",
+    "aws_dynamodb_table": "name", "aws_iam_role": "name",
+}
+# canvas kind -> aws_* type, for mode (b) (the inverse of `_KIND`). iam_role has
+# no backing to live-import against, so it stays out of the live path.
+_TF_TYPE = {kind: rtype for rtype, kind in _KIND.items() if kind != "iam_role"}
+
+# The HCL arguments each kind CARRIES into the canvas -- so a round-trip through
+# generate_tf reproduces them (finding #6). Any OTHER argument present on the
+# resource is reported as a per-node warning rather than silently dropped
+# (`__is_block__` is python-hcl2's internal block marker, never a real arg).
+_IGNORED_ATTRS = {"__is_block__"}
+_CARRIED_ATTRS = {
+    "s3": {"bucket", "tags"},
+    "sqs": {"name"},
+    "sns": {"name"},
+    "dynamodb": {"name", "hash_key", "range_key", "attribute"},
+    "iam_role": {"name"},  # assume_role_policy/inline policies are NOT carried -> warned
+}
 
 
 class Unsupported(BaseModel):
@@ -65,6 +83,10 @@ class ImportResult(BaseModel):
     nodes: list[dict] = []
     edges: list[dict] = []
     unsupported: list[Unsupported] = []
+    # A per-node note that a resource WAS imported but some of its in-resource
+    # arguments couldn't be carried (finding #6) -- honest at attribute
+    # granularity, not just resource-type granularity.
+    warnings: list[str] = []
 
 
 @dataclass(frozen=True)
@@ -99,11 +121,55 @@ def _ref_target(value: object) -> str | None:
     return parts[1] if len(parts) >= 2 else None
 
 
+def _attribute_types(attrs: dict) -> dict[str, str]:
+    """{attribute name -> type} from a dynamodb table's `attribute {}` blocks
+    (python-hcl2 parses repeated blocks into a list of dicts)."""
+    types: dict[str, str] = {}
+    for block in attrs.get("attribute") or []:
+        name = hcl.unquote(block.get("name"))
+        atype = hcl.unquote(block.get("type"))
+        if isinstance(name, str) and isinstance(atype, str):
+            types[name] = atype
+    return types
+
+
+def _tags(attrs: dict) -> dict[str, str]:
+    """The user `tags` map (odin's own `odin:node` management tag excluded, so
+    a round-trip doesn't surface it as a user tag)."""
+    raw = attrs.get("tags")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key, value in raw.items():
+        name = hcl.unquote(key) or key
+        val = hcl.unquote(value)
+        if isinstance(name, str) and name != "odin:node" and isinstance(val, str):
+            out[name] = val
+    return out
+
+
+def _dropped_attrs(kind: str, attrs: dict) -> list[str]:
+    carried = _CARRIED_ATTRS.get(kind, set())
+    return sorted(k for k in attrs if k not in carried and k not in _IGNORED_ATTRS)
+
+
 def _node_data(kind: str, label: str, attrs: dict) -> dict:
     data: dict = {"label": label}
     if kind == "dynamodb":
         hash_key = hcl.unquote(attrs.get("hash_key"))
-        data["hashKey"] = hash_key if hash_key is not None else "id"
+        data["hashKey"] = hash_key if isinstance(hash_key, str) else "id"
+        types = _attribute_types(attrs)
+        if data["hashKey"] in types:
+            data["hashKeyType"] = types[data["hashKey"]]
+        range_key = hcl.unquote(attrs.get("range_key"))
+        if isinstance(range_key, str):
+            data["rangeKey"] = range_key
+            if range_key in types:
+                data["rangeKeyType"] = types[range_key]
+    if kind == "s3":
+        tags = _tags(attrs)
+        if tags:
+            data["tags"] = tags
     return data
 
 
@@ -118,6 +184,7 @@ def parse_hcl(files: dict[str, str]) -> ImportResult:
     by_hcl_name: dict[str, str] = {}  # "aws_sns_topic.alerts" -> canvas label
     nodes: list[dict] = []
     unsupported: list[Unsupported] = []
+    warnings: list[str] = []
     subscriptions: list[tuple[str, dict]] = []
     index = 0
 
@@ -136,6 +203,9 @@ def parse_hcl(files: dict[str, str]) -> ImportResult:
             "position": {"x": index * _GRID_STEP, "y": 0},
             "data": _node_data(kind, label, attrs),
         })
+        dropped = _dropped_attrs(kind, attrs)
+        if dropped:
+            warnings.append(f"{label} ({kind}): imported without unmodeled attribute(s): {', '.join(dropped)}")
         index += 1
 
     edges: list[dict] = []
@@ -152,7 +222,7 @@ def parse_hcl(files: dict[str, str]) -> ImportResult:
                 reason="subscription references a resource outside the supported set -- edge dropped",
             ))
 
-    return ImportResult(nodes=nodes, edges=edges, unsupported=unsupported)
+    return ImportResult(nodes=nodes, edges=edges, unsupported=unsupported, warnings=warnings)
 
 
 def parse_hcl_text(text: str) -> ImportResult:
@@ -243,4 +313,7 @@ async def import_live(
             ])
         result = parse_hcl({"generated.tf": generated.read_text()})
 
-    return ImportResult(nodes=result.nodes, edges=result.edges, unsupported=[*unsupported, *result.unsupported])
+    return ImportResult(
+        nodes=result.nodes, edges=result.edges,
+        unsupported=[*unsupported, *result.unsupported], warnings=result.warnings,
+    )

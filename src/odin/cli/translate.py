@@ -87,3 +87,5 @@ def import_tf(
     unsupported = body.get("unsupported") or []
     if unsupported:
         typer.echo(f"unsupported: {json.dumps(unsupported)}", err=True)
+    for warning in body.get("warnings") or []:  # finding #6: per-node attribute drops, on stderr
+        typer.echo(f"warning: {warning}", err=True)
