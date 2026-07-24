@@ -7,6 +7,8 @@ from pathlib import Path
 
 from odin.cli.app import app
 from odin.gateway.keys import KeyStore
+from odin.spec.models import ResourceDesired, Stack
+from odin.spec.store import SpecStore
 
 
 def test_keys_issue_text_mode(runner, tmp_path, monkeypatch):
@@ -36,6 +38,26 @@ def test_keys_issue_is_stable_per_env_node(runner, tmp_path, monkeypatch):
     assert json.loads(first.stdout) == json.loads(second.stdout)
     other_node = runner.invoke(app, ["keys", "issue", "worker", "-o", "json"])
     assert json.loads(other_node.stdout) != json.loads(first.stdout)
+
+
+def test_keys_issue_warns_when_node_is_not_in_the_applied_stack(runner, tmp_path, monkeypatch):
+    # Release sweep finding #5 (LOW): issuing for a principal that isn't in the
+    # env's applied stack still mints creds (it's an escape hatch), but the
+    # gateway will reject them -- so the offline CLI warns clearly on stderr.
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["keys", "issue", "stranger", "--env", "prod"])
+    assert result.exit_code == 0  # still issues
+    assert "stranger" in result.stderr
+    assert "not a resource" in result.stderr
+    assert result.stdout.splitlines()[0].startswith("AWS_ACCESS_KEY_ID=AKODIN")  # creds still minted
+
+
+def test_keys_issue_does_not_warn_for_a_node_in_the_applied_stack(runner, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    SpecStore(Path(".odin")).apply(Stack(env="prod", resources=(ResourceDesired(id="web", kind="service"),)))
+    result = runner.invoke(app, ["keys", "issue", "web", "--env", "prod"])
+    assert result.exit_code == 0
+    assert result.stderr == ""  # a real stack member: no warning
 
 
 def test_keys_issue_help_documents_the_escape_hatch(runner):
