@@ -113,11 +113,21 @@ future decision against these points instead of re-deriving them:
     and binds its UDP port; the same config without it dies immediately
     with "operation not permitted"). Only the VMs join the actual data
     plane, running `nebula` as root INSIDE the VM (systemd) — that costs
-    the user nothing, since it's a VM they already own outright. The live
-    overlay proof (`tests/simulate/test_nebula_mesh_e2e.py`) boots two real
-    VMs and proves a real VM-to-VM ping plus a real SG-rule-filtered
-    connection — the host itself has no overlay presence to test from.
-    Cross-Mac reachability (a second machine's mesh) is still open — see M7.
+    the user nothing, since it's a VM they already own outright. **Real
+    finding:** stock Lima `vz` NATs every VM into its OWN isolated address
+    space — there is NO VM-to-VM underlay path at all (confirmed live: a
+    raw ping between two VMs' vzNAT addresses is 100% loss, before nebula
+    is even involved), so cross-VM mesh traffic routes THROUGH the
+    lighthouse acting as a relay (`relay: {am_relay: true}` on the
+    lighthouse, `relay: {use_relays: true}` on every VM) rather than
+    direct — still fully unprivileged, since relaying is opaque encrypted
+    UDP forwarding between two peers already handshaken with the lighthouse,
+    needing no tun device either. The live overlay proof
+    (`tests/simulate/test_nebula_mesh_e2e.py`) boots two real VMs and
+    proves a real VM-to-VM ping (via the relay) plus a real
+    SG-rule-filtered connection — the host itself has no overlay presence
+    to test from. Cross-Mac reachability (a second machine's mesh) is still
+    open — see M7.
 - **Recorded as UNSUPPORTED for now** (northstar directive 5's honesty rule):
   ALB/ELBv2, EKS, CloudFormation, autoscaling, and RDS-via-Terraform (rds
   nodes stay on the reconciler path until an RDS API model lands).
