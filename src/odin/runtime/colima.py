@@ -32,6 +32,14 @@ class ContainerSpec:
     labels: dict[str, str] = field(default_factory=dict)
     command: tuple[str, ...] = ()
     volumes: dict[str, str] = field(default_factory=dict)  # host_path -> container_path
+    # Owner directive B4: a runaway container (a bad ECS image, a Lambda
+    # handler gone wild) can't eat the host -- None emits no docker flag at
+    # all (unbounded, today's behavior); the binding layer that owns each
+    # workload kind's policy (compute/tasks.py, compute/functions.py) decides
+    # what to pass, including its own default when the source (a taskdef, a
+    # function's MemorySize) sets none.
+    memory_mib: float | None = None
+    cpus: float | None = None
 
 
 @dataclass(frozen=True)
@@ -134,6 +142,10 @@ class _ContainerRuntime:
             args += ["-p", (f"{hport}:{cport}" if hport else str(cport))]
         for host, container in spec.volumes.items():
             args += ["-v", f"{host}:{container}"]
+        if spec.memory_mib:
+            args += ["--memory", f"{spec.memory_mib:g}m"]
+        if spec.cpus:
+            args += ["--cpus", f"{spec.cpus:g}"]
         args.append(spec.image)
         args += list(spec.command)
         return RunHandle(id=self._cli(*args), name=spec.name)

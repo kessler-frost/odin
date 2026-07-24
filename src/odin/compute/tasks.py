@@ -27,6 +27,23 @@ from dataclasses import dataclass
 
 from odin.runtime.colima import ColimaRuntime, ContainerSpec
 
+# Owner directive B4: a runaway task container can't eat the host. Real ECS
+# taskdef `cpu`/`memory` are strings -- `cpu` in CPU units (1024 == 1 vCPU),
+# `memory` in MiB -- when present (bridge/EC2 launch type, v1's ONLY mode:
+# `agent/hcl.py`'s `_ecs` builder doesn't emit either field today, so this
+# fallback is what actually caps every canvas-drawn ECS node until it does).
+_DEFAULT_MEMORY_MIB = 512.0
+_DEFAULT_CPUS = 1.0
+_CPU_UNITS_PER_VCPU = 1024.0
+
+
+def _memory_mib(taskdef_memory: str | int | None) -> float:
+    return float(taskdef_memory) if taskdef_memory else _DEFAULT_MEMORY_MIB
+
+
+def _cpus(taskdef_cpu: str | int | None) -> float:
+    return float(taskdef_cpu) / _CPU_UNITS_PER_VCPU if taskdef_cpu else _DEFAULT_CPUS
+
 
 def container_name(env: str, task_id: str, container_def_name: str) -> str:
     return f"odin-ecs-{env}-{task_id[:8]}-{container_def_name}"
@@ -48,6 +65,7 @@ class TaskRuntime:
 
     def run(
         self, env: str, task_id: str, container_def: dict, extra_env: dict[str, str] | None = None,
+        cpu: str | int | None = None, memory: str | int | None = None,
     ) -> TaskContainerHandle:
         """Boot the task's single container from its taskdef container
         definition (image/environment/portMappings/command) -- returns as
@@ -61,7 +79,11 @@ class TaskRuntime:
         creds -- `gateway/keys.py::workload_env`) on top of the taskdef's
         environment, WINNING any same-named collision -- into the REAL
         container's env only, never back into the stored taskdef (ecsctl.py's
-        byte-for-byte TASK-DEFINITION DRIFT mandate)."""
+        byte-for-byte TASK-DEFINITION DRIFT mandate).
+
+        `cpu`/`memory` (owner directive B4): the taskdef's own top-level
+        fields (real ECS CPU units / MiB, as strings) when RegisterTaskDefinition
+        set them, else this module's own default cap -- never unbounded."""
         name = container_name(env, task_id, container_def["name"])
         env_vars = {kv["name"]: kv.get("value", "") for kv in container_def.get("environment") or []}
         if extra_env:
@@ -71,6 +93,7 @@ class TaskRuntime:
             name=name, image=container_def["image"], env=env_vars, ports=ports,
             command=tuple(container_def.get("command") or []),
             labels={"odin-env": env, "odin-ecs-task": task_id},
+            memory_mib=_memory_mib(memory), cpus=_cpus(cpu),
         ))
         host_ports = {cport: self._rt.host_port(name, cport) for cport in ports}
         return TaskContainerHandle(name=name, host_ports=host_ports)

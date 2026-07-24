@@ -65,8 +65,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -81,6 +83,26 @@ log = logging.getLogger("odin.compute.instances")
 
 _SLIRP_PREFIX = "192.168.5."  # Lima's built-in user-mode network -- never host-reachable
 BOOT_TIMEOUT = 300.0
+
+
+def _default_max_concurrent_boots() -> int:
+    """Owner directive B2: draw N EC2 nodes and RunInstances spawns N
+    daemon threads (`gateway/models/ec2compute.py::_spawn`), each calling
+    `InstanceVm.boot` -- with nothing bounding them, N concurrent
+    `limactl create`/`start` calls stampede the Mac at once. `vm or
+    InstanceVm()` (ec2compute.py's own `pure_answer`) constructs a FRESH
+    `InstanceVm` per gateway call, so the bound has to live at module scope
+    (`_BOOT_SEMAPHORE` below), not on the instance -- a per-instance
+    semaphore would reset every call and bound nothing. `ODIN_MAX_CONCURRENT_VM_BOOTS`
+    overrides; read fresh (not cached) so tests can monkeypatch it, same
+    convention as `agent/translate.py`'s `_default_timeout`."""
+    return int(os.environ.get("ODIN_MAX_CONCURRENT_VM_BOOTS", "3"))
+
+
+# Process-wide: every `InstanceVm` -- including the fresh one each gateway
+# call constructs -- shares this ONE semaphore by default (`boot`/`start`
+# below fall back to it when no per-call override is given).
+_BOOT_SEMAPHORE = threading.Semaphore(_default_max_concurrent_boots())
 
 
 @dataclass
@@ -153,7 +175,10 @@ class InstanceVm:
     this same method shape, so `gateway/models/ec2compute.py`'s state
     machine is testable without either a real VM OR a real subprocess."""
 
-    def __init__(self, runner=None, poll_interval: float = 2.0, lighthouse: LighthouseManager | None = None) -> None:
+    def __init__(
+        self, runner=None, poll_interval: float = 2.0, lighthouse: LighthouseManager | None = None,
+        boot_semaphore: threading.Semaphore | None = None,
+    ) -> None:
         self._run = runner or _default_runner
         # A constructor knob (not a hardcoded sleep) purely for testability --
         # `_discover_ip`'s real pacing is 2s between `hostname -I` polls, but
@@ -162,6 +187,11 @@ class InstanceVm:
         # R3: injectable so a unit test can assert `_activate_nebula`'s
         # lighthouse-ensure call without spawning a real `sudo nebula`.
         self._lighthouse = lighthouse or LighthouseManager()
+        # Owner directive B2: bounds concurrent `limactl create`/`start`
+        # calls. Defaults to the process-wide `_BOOT_SEMAPHORE` (module
+        # docstring) -- a test injects its own small Semaphore to assert the
+        # bound without needing `ODIN_MAX_CONCURRENT_VM_BOOTS`/a real boot.
+        self._boot_semaphore = boot_semaphore or _BOOT_SEMAPHORE
 
     def _lima(self, *args: str, check: bool = True, input: str | None = None) -> _Proc:
         proc = self._run(["limactl", *args], input=input)
@@ -197,8 +227,15 @@ class InstanceVm:
             handle.write(yaml_doc)
             yaml_path = handle.name
         try:
-            self._lima("create", "--tty=false", f"--name={name}", yaml_path)
-            self._lima("start", f"--timeout={int(timeout)}s", name)
+            # Owner directive B2: only `_boot_semaphore`'s own limit worth of
+            # VMs are ever mid-create/start at once -- a caller beyond that
+            # blocks HERE (on this thread, one of ec2compute.py's own
+            # per-instance daemon threads -- never the event loop) until a
+            # slot frees. Released before `_discover_ip`'s poll loop and
+            # nebula activation, neither of which is the heavy part.
+            with self._boot_semaphore:
+                self._lima("create", "--tty=false", f"--name={name}", yaml_path)
+                self._lima("start", f"--timeout={int(timeout)}s", name)
         finally:
             Path(yaml_path).unlink(missing_ok=True)
         ip = self._discover_ip(name, timeout)
@@ -305,7 +342,8 @@ class InstanceVm:
         self._lima("stop", name, check=False)
 
     def start(self, name: str, timeout: float = BOOT_TIMEOUT) -> str:
-        self._lima("start", f"--timeout={int(timeout)}s", name)
+        with self._boot_semaphore:  # same bound as `boot` -- still a real VM start
+            self._lima("start", f"--timeout={int(timeout)}s", name)
         return self._discover_ip(name, timeout)
 
     def delete(self, name: str) -> None:

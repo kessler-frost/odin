@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from odin.runtime.colima import ColimaRuntime, _Proc, _STATUS_TO_PHASE
+from odin.runtime.colima import ColimaRuntime, ContainerSpec, _Proc, _STATUS_TO_PHASE
 from odin.runtime.driver import RuntimeDriver
 
 
@@ -70,3 +70,33 @@ def test_build_raises_on_failure_same_as_any_other_cli_call():
 
     with pytest.raises(RuntimeError, match="some build error"):
         ColimaRuntime(runner=runner).build("odin-dynalite:1", "FROM node:20-alpine\n")
+
+
+# --- owner directive B4: --memory/--cpus, only when the spec sets them ------
+
+
+def test_run_container_emits_no_memory_or_cpu_flags_when_unset():
+    calls: list[list[str]] = []
+
+    def runner(args, input=None):
+        calls.append(args)
+        return _Proc(0, "container-id")
+
+    ColimaRuntime(runner=runner).run_container(ContainerSpec(name="job", image="alpine"))
+    assert "--memory" not in calls[0]
+    assert "--cpus" not in calls[0]
+
+
+def test_run_container_emits_memory_and_cpus_when_set():
+    calls: list[list[str]] = []
+
+    def runner(args, input=None):
+        calls.append(args)
+        return _Proc(0, "container-id")
+
+    ColimaRuntime(runner=runner).run_container(
+        ContainerSpec(name="job", image="alpine", memory_mib=512.0, cpus=1.5)
+    )
+    args = calls[0]
+    assert args[args.index("--memory") + 1] == "512m"
+    assert args[args.index("--cpus") + 1] == "1.5"

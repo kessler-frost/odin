@@ -265,3 +265,62 @@ async def test_a_fast_apply_is_unaffected_by_a_short_default_timeout(tmp_path, m
 
     assert result.ok is True
     assert result.exit_code == 0
+
+
+# --- owner directive B3: a bounded -parallelism, not tofu's own default 10 --
+
+
+def test_default_parallelism_reads_the_env_var(monkeypatch):
+    monkeypatch.setenv("ODIN_TOFU_PARALLELISM", "8")
+    assert runner_mod._default_parallelism() == 8
+
+
+def test_default_parallelism_falls_back_to_4(monkeypatch):
+    monkeypatch.delenv("ODIN_TOFU_PARALLELISM", raising=False)
+    assert runner_mod._default_parallelism() == 4
+
+
+def test_tf_runner_reads_the_parallelism_env_var_by_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("ODIN_TOFU_PARALLELISM", "9")
+    assert TfRunner(tmp_path)._parallelism == 9
+
+
+_RECORD_APPLY_AND_DESTROY_ARGS = (
+    _INIT_OK
+    + '\nif [ "$1" = "apply" ] || [ "$1" = "destroy" ]; then echo "$@" >> "$RECORDED_ARGS_FILE"; exit 0; fi'
+)
+
+
+async def test_apply_and_destroy_pass_the_configured_parallelism_flag(tmp_path, monkeypatch):
+    args_file = tmp_path / "args.txt"
+    monkeypatch.setenv("RECORDED_ARGS_FILE", str(args_file))
+    _write_fake_tofu(tmp_path, _RECORD_APPLY_AND_DESTROY_ARGS)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    runner = TfRunner(tmp_path, parallelism=2)
+
+    apply_result = await runner.apply("default", _project(), 4266, "ak", "sk")
+    assert apply_result.ok is True
+    destroy_result = await runner.destroy("default", 4266, "ak", "sk")
+    assert destroy_result.ok is True
+
+    lines = args_file.read_text().splitlines()
+    assert any(line.startswith("apply") and "-parallelism=2" in line for line in lines)
+    assert any(line.startswith("destroy") and "-parallelism=2" in line for line in lines)
+
+
+async def test_init_args_never_carry_the_parallelism_flag(tmp_path, monkeypatch):
+    # `-parallelism` is not a valid `tofu init` flag -- a fake tofu that
+    # rejects any unexpected init arg proves it's never passed there.
+    script = (
+        'if [ "$1" = "init" ]; then\n'
+        '  if [ "$#" -gt 2 ]; then echo "unexpected init arg: $@"; exit 1; fi\n'
+        '  echo "Initializing..."; exit 0\n'
+        "fi\n"
+        'if [ "$1" = "apply" ]; then echo "ok"; exit 0; fi'
+    )
+    _write_fake_tofu(tmp_path, script)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    runner = TfRunner(tmp_path, parallelism=2)
+
+    result = await runner.apply("default", _project(), 4266, "ak", "sk")
+    assert result.ok is True

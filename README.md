@@ -120,10 +120,15 @@ Known v1 limits, recorded rather than hidden:
   then either forwards to a real backing or answers from its own per-service
   model store (EC2/VPC/SG/IAM/ECR/Lambda/ECS — nobody makes an open-source AWS
   API for these, so odin owns the model and binds it to a real substrate).
-- **The translation agent** (`src/odin/agent/`, `claude-agent-sdk`): canvas →
-  Terraform, best-effort AI refinement with a deterministic fallback if the
-  refined output doesn't pass a portability guardrail; also does the reverse
-  (`/import-tf`: paste HCL or point at live resources, get canvas nodes back).
+- **Canvas ↔ Terraform translation** (`src/odin/agent/`): deterministic in
+  both directions — the same canvas always produces the same `.tf`, and
+  `/import-tf` parses HCL (or resolves live resources) back into canvas
+  nodes, no model call in the loop for either. An optional agent pass
+  (`claude-agent-sdk`; set `ODIN_TRANSLATE_REFINE=1` to turn it on — off by
+  default) can review the generated file and add comments or tags; every
+  return is re-validated against the skeleton (same resource set, every
+  argument's value byte-identical) and discarded on any deviation, so it
+  cannot change what gets applied.
 - **Runtime:** real containers via Colima (default) or inside a Lima VM
   (`src/odin/runtime/`), and a real Lima VM for EC2 (`src/odin/compute/`).
 - **Control loop:** a Spec Store (Stack = desired, World = observed) with a
@@ -258,7 +263,7 @@ other people's excellent work, and a lot of the thanks belongs to them:
 - **[registry:2](https://github.com/distribution/distribution)** — the real backing for ECR image storage
 - **[AWS Lambda RIE](https://github.com/aws/aws-lambda-runtime-interface-emulator)** — the real backing for Lambda invocation
 - **[Nebula](https://github.com/slackhq/nebula)** — the mesh/firewall substrate for VPCs and Security Groups
-- **[Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python)** — the canvas↔Terraform translation agent
+- **[Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python)** — the optional, off-by-default comment/tag refinement pass over the deterministic canvas↔Terraform translation
 - **[FastAPI](https://fastapi.tiangolo.com/)**, **[Pydantic](https://pydantic.dev/)**, **[boto3](https://github.com/boto/boto3)**, **[python-hcl2](https://github.com/amplify-education/python-hcl2)** — the backend
 - **[React](https://react.dev/)** + **[React Flow](https://reactflow.dev/)** + **[Tailwind CSS](https://tailwindcss.com/)** + **[Vite](https://vitejs.dev/)** — the canvas UI
 - **[uv](https://github.com/astral-sh/uv)** + **[bun](https://bun.sh/)** — the toolchain

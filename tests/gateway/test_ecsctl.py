@@ -55,10 +55,13 @@ class FakeTaskRuntime:
         self._status: dict[tuple, str] = {}
         self._exit_codes: dict[tuple, int] = {}
 
-    def run(self, env: str, task_id: str, container_def: dict, extra_env: dict[str, str] | None = None) -> TaskContainerHandle:
+    def run(
+        self, env: str, task_id: str, container_def: dict, extra_env: dict[str, str] | None = None,
+        cpu: str | int | None = None, memory: str | int | None = None,
+    ) -> TaskContainerHandle:
         if self.block is not None:
             self.block.wait(timeout=5.0)
-        self.ran.append((env, task_id, container_def, extra_env))
+        self.ran.append((env, task_id, container_def, extra_env, cpu, memory))
         if self.fail_run:
             raise RuntimeError("container failed to start")
         key = (env, task_id, container_def["name"])
@@ -494,7 +497,7 @@ def test_create_service_with_odin_node_tag_injects_workload_creds(sink, ecs, sto
     _wait_for_running_count(stores, sink, ecs, runtime, 1)
 
     assert stores.ecsctl.get(ENV, "service:odin:app")["node_label"] == "myservice"
-    (_, _, container_def, extra_env) = runtime.ran[0]
+    (_, _, container_def, extra_env, _, _) = runtime.ran[0]
     access_key, secret_key = keystore.issue(ENV, "myservice")
     assert extra_env == {
         "AWS_ACCESS_KEY_ID": access_key,
@@ -523,7 +526,7 @@ def test_update_service_scale_up_injects_the_same_stable_creds(sink, ecs, stores
 
     access_key, _ = keystore.issue(ENV, "myservice")
     assert len(runtime.ran) == 2
-    for _, _, _, extra_env in runtime.ran:
+    for _, _, _, extra_env, _, _ in runtime.ran:
         assert extra_env["AWS_ACCESS_KEY_ID"] == access_key  # stable identity, never a second mint
 
 
@@ -536,7 +539,7 @@ def test_create_service_without_keystore_keeps_prior_behavior(sink, ecs, stores)
     _create_service(stores, sink, ecs, runtime, tags=[{"key": "odin:node", "value": "myservice"}])
     _wait_for_running_count(stores, sink, ecs, runtime, 1)
 
-    (_, _, _, extra_env) = runtime.ran[0]
+    (_, _, _, extra_env, _, _) = runtime.ran[0]
     assert not extra_env
 
 
@@ -548,7 +551,7 @@ def test_create_service_without_tags_launches_with_no_injected_creds(sink, ecs, 
     _wait_for_running_count(stores, sink, ecs, runtime, 1)
 
     assert stores.ecsctl.get(ENV, "service:odin:app")["node_label"] is None
-    (_, _, _, extra_env) = runtime.ran[0]
+    (_, _, _, extra_env, _, _) = runtime.ran[0]
     assert not extra_env
 
 
@@ -628,7 +631,7 @@ def test_describe_tasks_lazily_marks_a_spontaneously_exited_container_stopped(si
     _register_taskdef(stores, sink, ecs, runtime)
     _create_service(stores, sink, ecs, runtime, desiredCount=1)
     _wait_for_running_count(stores, sink, ecs, runtime, 1)
-    _, task_id, _, _ = runtime.ran[0]
+    _, task_id, _, _, _, _ = runtime.ran[0]
 
     runtime.mark_exited(ENV, task_id, "app", exit_code=137)
 

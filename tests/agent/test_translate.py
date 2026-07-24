@@ -137,6 +137,64 @@ async def test_no_files_is_rejected():
     assert formatted is None
 
 
+# --- value-fidelity guardrail: the agent's one unique capability (rewriting
+# an argument's VALUE) is also its one liability -- nothing else compares
+# agent output to the canvas. Both cases below are pure Python (the
+# resource-set/value-fidelity checks run before any tofu subprocess), so no
+# `skipif(_NO_TOFU)` is needed.
+
+
+async def test_changed_instance_type_is_rejected_without_needing_tofu():
+    vpc = ResourceDesired(id="vpc1", kind="vpc")
+    subnet = ResourceDesired(id="sub1", kind="subnet", fields={"vpc": FieldValue(value="vpc1")})
+    ec2 = ResourceDesired(
+        id="web1", kind="ec2",
+        fields={"subnet": FieldValue(value="sub1"), "instanceType": FieldValue(value="t3.micro")},
+    )
+    stack = Stack(resources=(vpc, subnet, ec2))
+    skeleton = generate_tf(stack).files
+    assert 'instance_type = "t3.micro"' in skeleton["main.tf"]
+    tampered = {"main.tf": skeleton["main.tf"].replace('instance_type = "t3.micro"', 'instance_type = "t3.2xlarge"')}
+    reason, formatted = await validate_refinement(tampered, skeleton)
+    assert reason is not None and "argument value" in reason and "aws_instance.web1" in reason
+    assert formatted is None
+
+
+async def test_changed_cidr_is_rejected_without_needing_tofu():
+    vpc = ResourceDesired(id="vpc1", kind="vpc", fields={"cidr": FieldValue(value="10.0.0.0/16")})
+    stack = Stack(resources=(vpc,))
+    skeleton = generate_tf(stack).files
+    assert 'cidr_block = "10.0.0.0/16"' in skeleton["main.tf"]
+    tampered = {"main.tf": skeleton["main.tf"].replace('cidr_block = "10.0.0.0/16"', 'cidr_block = "0.0.0.0/0"')}
+    reason, formatted = await validate_refinement(tampered, skeleton)
+    assert reason is not None and "argument value" in reason and "aws_vpc.vpc1" in reason
+    assert formatted is None
+
+
+async def test_a_new_tag_is_accepted_without_altering_an_existing_one():
+    # Additive-only nested-map edit (a new key inside `tags {}`) must NOT
+    # trip the value-fidelity check -- only altering/removing a key the
+    # skeleton already set does.
+    stack = Stack(resources=(ResourceDesired(id="uploads", kind="s3"),))
+    skeleton = generate_tf(stack).files
+    tampered = {"main.tf": skeleton["main.tf"].replace(
+        '"odin:node" = "uploads"', '"odin:node" = "uploads"\n    "owner"     = "platform-team"',
+    )}
+    reason, _ = await validate_refinement(tampered, skeleton)
+    assert reason is None
+
+
+async def test_removing_an_existing_argument_value_is_rejected():
+    stack = Stack(resources=(ResourceDesired(id="uploads", kind="s3"),))
+    skeleton = generate_tf(stack).files
+    # The agent dropped force_destroy entirely -- a value that "survives
+    # unchanged" must still be PRESENT, not merely not-contradicted.
+    tampered = {"main.tf": skeleton["main.tf"].replace("  force_destroy = true\n\n", "")}
+    reason, formatted = await validate_refinement(tampered, skeleton)
+    assert reason is not None and "argument value" in reason
+    assert formatted is None
+
+
 @pytest.mark.skipif(_NO_TOFU, reason="tofu not on PATH")
 async def test_comment_and_tag_only_refinement_passes_and_gets_formatted():
     skeleton = generate_tf(_S3_STACK).files
@@ -154,9 +212,11 @@ async def test_comment_and_tag_only_refinement_passes_and_gets_formatted():
 async def test_tofu_validate_rejects_an_unsupported_argument():
     stack = Stack(resources=(ResourceDesired(id="items", kind="dynamodb"),))
     skeleton = generate_tf(stack).files
-    # Same resource identity (type+name) -- passes the resource-SET gate --
-    # but the agent invented an argument that doesn't exist on the provider
-    # schema, which only `tofu validate` (not the resource-set check) catches.
+    # Same resource identity (type+name) AND every skeleton argument value
+    # preserved (including tags -- passes the value-fidelity gate too) -- but
+    # the agent invented an argument that doesn't exist on the provider
+    # schema, which only `tofu validate` (not either pure-Python check)
+    # catches.
     broken = (
         f"{hcl.HEADER}\n\n{hcl.provider_block()}\n\n"
         'resource "aws_dynamodb_table" "items" {\n'
@@ -168,6 +228,10 @@ async def test_tofu_validate_rejects_an_unsupported_argument():
         '  attribute {\n'
         '    name = "id"\n'
         '    type = "S"\n'
+        "  }\n"
+        "\n"
+        "  tags = {\n"
+        '    "odin:node" = "items"\n'
         "  }\n"
         "}\n"
     )
@@ -356,7 +420,51 @@ def test_shipped_default_timeout_constant_is_45_seconds():
     assert translate_mod._TIMEOUT_S == 45.0
 
 
-async def test_a_slow_refine_never_blocks_the_request_when_a_cache_is_given():
+# --- owner directive: ODIN_TRANSLATE_REFINE, off by default -----------------
+# The cached (production, server.py) path is the ONLY one this flag gates
+# (see translate()'s own docstring) -- every test below that exercises the
+# cached path now needs it explicitly on, so it's testing the SAME "refine
+# really runs" behavior the flag's own off-by-default test (below) proves
+# does NOT happen without it.
+
+
+def test_refine_enabled_reads_truthy_env_values(monkeypatch):
+    for value in ("1", "true", "True", "yes", "on"):
+        monkeypatch.setenv("ODIN_TRANSLATE_REFINE", value)
+        assert translate_mod.refine_enabled() is True, value
+
+
+def test_refine_enabled_defaults_off(monkeypatch):
+    monkeypatch.delenv("ODIN_TRANSLATE_REFINE", raising=False)
+    assert translate_mod.refine_enabled() is False
+
+
+def test_refine_enabled_rejects_falsy_or_junk_values(monkeypatch):
+    for value in ("0", "false", "off", "no", "nonsense"):
+        monkeypatch.setenv("ODIN_TRANSLATE_REFINE", value)
+        assert translate_mod.refine_enabled() is False, value
+
+
+async def test_refine_disabled_by_default_never_touches_the_sdk_or_the_cache(monkeypatch):
+    # The exact "wasteful" symptom the flag exists to kill: a no-API-key
+    # install must NOT re-kick a background SDK task on every single
+    # /translate or /apply-full call. `_NeverConstructed` asserts the SDK
+    # client is never even built; no background task means `cache._refining`
+    # stays False and nothing is left running after this call returns.
+    monkeypatch.delenv("ODIN_TRANSLATE_REFINE", raising=False)
+    cache = translate_mod.TranslateCache()
+    rev = rev_of(_S3_STACK)
+    result = await translate(_S3_STACK, client_cls=_NeverConstructed, cache=cache)
+    assert result.refined is False
+    assert result.files == generate_tf(_S3_STACK).files
+    assert "ODIN_TRANSLATE_REFINE" in result.notes[0]
+    assert not cache._refining(rev)
+    assert rev not in cache._tasks
+
+
+async def test_a_slow_refine_never_blocks_the_request_when_a_cache_is_given(monkeypatch):
+    monkeypatch.setenv("ODIN_TRANSLATE_REFINE", "1")
+
     # Release finding #3: with the app's cache, translate() must return the
     # deterministic skeleton IMMEDIATELY and refine on a background task -- it
     # must NOT wait out the (here, deliberately slow) SDK pass on the request's
@@ -381,7 +489,8 @@ async def test_a_slow_refine_never_blocks_the_request_when_a_cache_is_given():
 
 
 @pytest.mark.skipif(_NO_TOFU, reason="tofu not on PATH")
-async def test_background_refine_result_is_served_from_cache_on_the_next_call():
+async def test_background_refine_result_is_served_from_cache_on_the_next_call(monkeypatch):
+    monkeypatch.setenv("ODIN_TRANSLATE_REFINE", "1")
     # Release finding #3/#5: once the background refine for a revision COMPLETES
     # successfully, the next translate() for that SAME canvas revision serves
     # the refined output from the cache -- without constructing the SDK again.
@@ -414,7 +523,8 @@ async def test_background_refine_result_is_served_from_cache_on_the_next_call():
     assert len(construct_count) == 1
 
 
-async def test_a_fallback_result_is_never_cached_so_the_next_call_retries():
+async def test_a_fallback_result_is_never_cached_so_the_next_call_retries(monkeypatch):
+    monkeypatch.setenv("ODIN_TRANSLATE_REFINE", "1")
     cache = translate_mod.TranslateCache()
     rev = rev_of(_S3_STACK)
     failing = _client_with(raises=RuntimeError("boom"))
@@ -435,7 +545,8 @@ async def test_a_fallback_result_is_never_cached_so_the_next_call_retries():
     assert len(construct_count) == 1  # the SDK really was retried, not skipped
 
 
-async def test_a_rejected_refinement_is_never_cached_so_the_next_call_retries():
+async def test_a_rejected_refinement_is_never_cached_so_the_next_call_retries(monkeypatch):
+    monkeypatch.setenv("ODIN_TRANSLATE_REFINE", "1")
     cache = translate_mod.TranslateCache()
     rev = rev_of(_S3_STACK)
     tampered = generate_tf(_S3_STACK).files["main.tf"] + '\nresource "aws_sqs_queue" "extra" {\n  name = "extra"\n}\n'

@@ -55,6 +55,15 @@ def _default_tofu_timeout() -> float:
     return float(os.environ.get("ODIN_TOFU_TIMEOUT", "600"))
 
 
+def _default_parallelism() -> int:
+    """Owner directive B3: tofu's own default (`-parallelism=10`) means a
+    big canvas fans out up to 10 heavy resource operations at once --
+    EC2 boots, ECS convergence waits -- on top of whatever else Apply is
+    already doing. `ODIN_TOFU_PARALLELISM` overrides; read fresh per
+    `TfRunner` construction, same convention as `_default_tofu_timeout`."""
+    return int(os.environ.get("ODIN_TOFU_PARALLELISM", "4"))
+
+
 class TofuNotInstalled(Exception):
     """`tofu` isn't on PATH -- the runner's own preflight (there's no `odin
     doctor` yet; the runner checks itself and the route turns this into a
@@ -103,10 +112,15 @@ class TfRunner:
     `ConnectionManager` (or anything with an async `broadcast(dict)`) --
     optional so unit tests can construct a runner with no event sink."""
 
-    def __init__(self, root: Path, ws=None, timeout: float | None = None) -> None:
+    def __init__(
+        self, root: Path, ws=None, timeout: float | None = None, parallelism: int | None = None,
+    ) -> None:
         self._root = root
         self._ws = ws
         self._timeout = timeout if timeout is not None else _default_tofu_timeout()
+        # Owner directive B3: threaded onto every apply/destroy's args below
+        # (never `init` -- `-parallelism` only governs a resource-graph walk).
+        self._parallelism = parallelism if parallelism is not None else _default_parallelism()
         self._locks: dict[str, asyncio.Lock] = {}
         self._last: dict[str, TfResult] = {}
 
@@ -124,7 +138,7 @@ class TfRunner:
         async with lock:
             workspace = workspace_mod.materialize(self._root, env, project)
             return await self._init_then(
-                tofu, workspace, gateway_port, access_key, secret_key, env, "apply", _TOFU_APPLY_ARGS, secrets,
+                tofu, workspace, gateway_port, access_key, secret_key, env, "apply", self._apply_args(), secrets,
             )
 
     async def destroy(
@@ -142,8 +156,14 @@ class TfRunner:
                 self._last[env] = result
                 return result
             return await self._init_then(
-                tofu, workspace, gateway_port, access_key, secret_key, env, "destroy", _TOFU_DESTROY_ARGS, secrets,
+                tofu, workspace, gateway_port, access_key, secret_key, env, "destroy", self._destroy_args(), secrets,
             )
+
+    def _apply_args(self) -> tuple[str, ...]:
+        return (*_TOFU_APPLY_ARGS, f"-parallelism={self._parallelism}")
+
+    def _destroy_args(self) -> tuple[str, ...]:
+        return (*_TOFU_DESTROY_ARGS, f"-parallelism={self._parallelism}")
 
     def status(self, env: str) -> dict:
         last = self._last.get(env)
