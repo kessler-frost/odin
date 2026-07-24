@@ -105,11 +105,18 @@ future decision against these points instead of re-deriving them:
   - Nebula: single-host mesh is REAL end-to-end — a real host lighthouse
     process (`fabric/nebula.py::LighthouseManager`) and a real `nebula`
     daemon inside every VPC-joined EC2 VM, the VPC's compiled SG firewall
-    baked into its config. The live overlay proof (an actual ping + a real
-    SG-rule-filtered connection, `tests/simulate/test_nebula_mesh_e2e.py`)
-    requires a one-time sudo setup on the host (macOS needs root for a utun
-    device; the test prints the exact, narrowly-scoped command and skips
-    cleanly until it's done — see `scripts/allfather-nebula-ctl`).
+    baked into its config. The lighthouse needs NO host privileges at all:
+    it only ever coordinates (tells mesh members where to find each other),
+    never carries their traffic, so it runs with `tun: disabled: true` —
+    plain unprivileged `nebula`, no root, no sudo, no one-time setup
+    (empirically verified: an unprivileged process with that flag starts
+    and binds its UDP port; the same config without it dies immediately
+    with "operation not permitted"). Only the VMs join the actual data
+    plane, running `nebula` as root INSIDE the VM (systemd) — that costs
+    the user nothing, since it's a VM they already own outright. The live
+    overlay proof (`tests/simulate/test_nebula_mesh_e2e.py`) boots two real
+    VMs and proves a real VM-to-VM ping plus a real SG-rule-filtered
+    connection — the host itself has no overlay presence to test from.
     Cross-Mac reachability (a second machine's mesh) is still open — see M7.
 - **Recorded as UNSUPPORTED for now** (northstar directive 5's honesty rule):
   ALB/ELBv2, EKS, CloudFormation, autoscaling, and RDS-via-Terraform (rds
