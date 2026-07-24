@@ -123,11 +123,19 @@ future decision against these points instead of re-deriving them:
   Proven by a real overlay `ping` plus a real SG-rule-filtered TCP
   connection (`tests/simulate/test_nebula_mesh_e2e.py`). The multi-Mac
   half — a second machine joining the SAME mesh — is deferred; see M7 below.
-- [ ] **odin CLI as an agent control surface.** Lets a human's or an agent's
+- [x] **odin CLI as an agent control surface.** DONE 2026-07-24 (v0.5.0):
+  `odin canvas get/set`, `apply`, `world`, `envs`, `events`, `translate`,
+  `import-tf`, `tf status/destroy`, `destroy`, `keys issue` — a thin client
+  over the HTTP API with `-o json` for machine consumption, proven by an
+  all-CLI session (set → translate → apply → healthy world → destroy).
+  Lets a human's or an agent's
   (e.g. Claude Code) tooling drive the canvas and its configuration directly.
   Today's `odin` CLI only starts/stops/inspects the server process
   (`start`/`stop`/`status`/`clean`) — it doesn't yet drive the canvas itself.
-- [ ] **Packaging.** Bundle the external tools (colima, lima, uv, …) into one
+- [x] **Packaging (pragmatic scope).** DONE 2026-07-24 (v0.5.0):
+  `scripts/install.sh` (one command: brew tools + colima up + odin + doctor)
+  and `odin doctor` (toolchain checks with exact fixes, disk headroom,
+  `--prebake` for the dynalite image). Full binary vendoring into one
   distributable.
 - [ ] **M7 (multi-Mac) — the fleet.** The single-host half is DONE (see
   above: a real lighthouse + real per-VM daemons + a real ping/SG-filter
