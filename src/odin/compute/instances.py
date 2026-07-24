@@ -208,21 +208,22 @@ class InstanceVm:
         regardless, so THIS instance's own connectivity never depends on
         that cache.
 
-        `MeshNetwork.cert_ip` allocates this instance's sticky overlay IP by
-        MUTATING the in-memory `network` object -- `ensure_network` already
-        saved it to `overlay.json` BEFORE that allocation happened, so
-        without an explicit `save_overlay` here the allocation lives only in
-        memory and is lost the moment this call returns (the instance's own
-        overlay IP would never actually be on disk for anything -- e.g.
-        `mesh_state`, a second VM's ping target -- to read back)."""
+        Uses `NebulaManager.allocate_host_ip` (not a bare `MeshNetwork.
+        cert_ip` + `save_overlay` pair) so this instance's sticky overlay IP
+        is allocated AND persisted as one locked operation -- two instances
+        booting concurrently in the same env (this method runs on each
+        instance's own boot thread) would otherwise race on the shared
+        `overlay.json`: both could read the same pre-allocation snapshot,
+        collide on the SAME next IP, and whichever saved last would
+        silently erase the other's assignment entirely (empirically
+        confirmed while proving the R4 rootless mesh with two real VMs)."""
         if nebula is None:
             return None
         manager = NebulaManager(Path(nebula.root) / nebula.env / "nebula", runner=self._run)
         existing = manager.load_overlay()
         underlay = (existing.lighthouse_underlay_ip if existing else None) or "127.0.0.1"
-        network = ensure_network(nebula.root, nebula.env, underlay, runner=self._run)
-        overlay_ip = network.cert_ip(nebula.host_id)
-        manager.save_overlay(network)
+        ensure_network(nebula.root, nebula.env, underlay, runner=self._run)
+        overlay_ip = manager.allocate_host_ip(nebula.host_id)
         cert = manager.sign_cert(nebula.host_id, overlay_ip, groups=["ec2"])
         return {
             "ca.crt": cert.ca_crt.read_text(),

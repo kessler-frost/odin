@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
 
 import pytest
 import yaml
@@ -251,6 +252,60 @@ def test_ensure_network_bootstraps_and_is_idempotent(tmp_path):
     ca_calls = sum(1 for c in runner.calls if "ca" in c)
     ensure_network(tmp_path, "prod", "192.168.1.10", runner=runner)  # again
     assert sum(1 for c in runner.calls if "ca" in c) == ca_calls     # CA not re-minted
+
+
+def test_allocate_host_ip_persists_immediately(tmp_path):
+    """The real bug the R4 two-VM mesh proof found: a bare
+    `MeshNetwork.cert_ip()` mutates its object in memory only -- without
+    `allocate_host_ip`'s own save, the allocation would live only in memory
+    and vanish the moment the caller returns."""
+    runner = FakeRunner()
+    ensure_network(tmp_path, "prod", "192.168.1.10", runner=runner)
+    mgr = NebulaManager(tmp_path / "prod" / "nebula", runner=runner)
+    ip = mgr.allocate_host_ip("i-aaa")  # CIDR form, e.g. "10.42.1.1/16" -- what nebula-cert sign needs
+    reloaded = NebulaManager(tmp_path / "prod" / "nebula").load_overlay()
+    assert reloaded.subnets["hosts"].assignments["i-aaa"] == ip.split("/")[0]  # assignments store the bare IP
+
+
+def test_allocate_host_ip_raises_if_network_never_bootstrapped(tmp_path):
+    mgr = NebulaManager(tmp_path / "prod" / "nebula")
+    with pytest.raises(RuntimeError, match="ensure_network"):
+        mgr.allocate_host_ip("i-aaa")
+
+
+def test_allocate_host_ip_is_atomic_under_concurrent_boots(tmp_path):
+    """The exact race the two-VM proof test hit for real: two instances
+    booting concurrently in the SAME env must not collide on the same IP or
+    silently drop one another's allocation -- see `_lock_for_dir`'s
+    module-level docstring in fabric/nebula.py."""
+    runner = FakeRunner()
+    ensure_network(tmp_path, "prod", "192.168.1.10", runner=runner)
+    host_ids = [f"i-{n:03d}" for n in range(20)]
+    results: dict[str, str] = {}
+    errors: list[Exception] = []
+    results_lock = threading.Lock()
+
+    def worker(host_id: str) -> None:
+        try:
+            ip = NebulaManager(tmp_path / "prod" / "nebula").allocate_host_ip(host_id)
+            with results_lock:
+                results[host_id] = ip
+        except Exception as exc:  # pragma: no cover -- surfaced via `errors`
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(host_id,)) for host_id in host_ids]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not errors
+    assert set(results) == set(host_ids)                # nobody's allocation was lost
+    assert len(set(results.values())) == len(host_ids)  # nobody collided on the same IP (CIDR form)
+
+    reloaded = NebulaManager(tmp_path / "prod" / "nebula").load_overlay()
+    bare_ips = {host_id: ip.split("/")[0] for host_id, ip in results.items()}
+    assert reloaded.subnets["hosts"].assignments == bare_ips  # matches what's actually on disk
 
 
 def test_mesh_state_read_has_no_filesystem_side_effect(tmp_path):

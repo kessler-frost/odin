@@ -43,6 +43,7 @@ import os
 import shutil
 import signal
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -95,6 +96,28 @@ class _Proc:
 def _default_runner(args: list[str]) -> _Proc:
     proc = subprocess.run(args, capture_output=True, text=True)
     return _Proc(proc.returncode, proc.stdout, proc.stderr)
+
+
+# One `threading.Lock` per env's nebula directory (mirrors `gateway/stores.py`
+# ::JsonStore's own per-env lock) -- two VMs in the SAME env can boot
+# concurrently, and each independently reads-mutates-persists the ONE shared
+# `overlay.json` (bootstrap in `ensure_network`, sticky-IP allocation in
+# `NebulaManager.allocate_host_ip`). Without this, two concurrent callers can
+# each read the same pre-mutation snapshot, allocate DIFFERENT host_ids
+# against the SAME next_ip (a collision, not just a lost update), and
+# whichever `save_overlay` lands last silently erases the other's
+# allocation entirely -- empirically confirmed: two VMs booted in parallel
+# both received the identical overlay IP and both handshook with the
+# lighthouse under it, and one instance's id was never in `overlay.json` at
+# all. Different envs never contend (separate locks, separate files).
+_overlay_locks: dict[str, threading.Lock] = {}
+_overlay_locks_guard = threading.Lock()
+
+
+def _lock_for_dir(data_dir: Path) -> threading.Lock:
+    key = str(Path(data_dir).resolve())
+    with _overlay_locks_guard:
+        return _overlay_locks.setdefault(key, threading.Lock())
 
 
 class NebulaManager:
@@ -219,6 +242,24 @@ class NebulaManager:
             return None
         return MeshNetwork.model_validate_json(path.read_text())
 
+    def allocate_host_ip(self, host_id: str) -> str:
+        """Atomic read-modify-write, under this directory's lock: allocates
+        (or reuses) `host_id`'s sticky overlay IP and persists it
+        immediately, in ONE locked critical section -- see `_lock_for_dir`'s
+        module-level docstring for why a bare `network.cert_ip(...)` +
+        `save_overlay(...)` pair (the previous shape) is racy the moment two
+        VMs boot concurrently in the same env. Requires the network already
+        be bootstrapped (`ensure_network` called first, as every real caller
+        already does) -- there's no sensible env name to default a fresh
+        `MeshNetwork` to here."""
+        with _lock_for_dir(self._dir):
+            overlay = self.load_overlay()
+            if overlay is None:
+                raise RuntimeError(f"no Nebula network bootstrapped at {self._dir} -- call ensure_network first")
+            ip = overlay.cert_ip(host_id)
+            self.save_overlay(overlay)
+            return ip
+
 
 def _rule_to_dict(rule: FirewallRule) -> dict:
     d: dict = {"port": rule.port, "proto": rule.proto}
@@ -265,15 +306,20 @@ def _nebula_dir(root: Path, env: str) -> Path:
 
 def ensure_network(root: Path, env: str, lighthouse_underlay: str, runner=None) -> MeshNetwork:
     """Lazily bootstrap an env's Nebula network: CA + lighthouse cert + overlay,
-    persisted under `.odin/<env>/nebula/`. Idempotent (sticky overlay)."""
+    persisted under `.odin/<env>/nebula/`. Idempotent (sticky overlay).
+    Locked (see `_lock_for_dir`'s module-level docstring): two VMs booting
+    concurrently in the same env must not both see `manager._ca_crt.exists()`
+    as False and race to create/sign the CA, nor race on persisting
+    `lighthouse_underlay_ip`."""
     manager = NebulaManager(_nebula_dir(root, env), runner=runner)
-    overlay = manager.load_overlay() or MeshNetwork(network=env)
-    overlay.lighthouse_underlay_ip = lighthouse_underlay
-    if not manager._ca_crt.exists():
-        manager.create_ca(env)
-        manager.sign_cert("lighthouse", f"{overlay.lighthouse_ip}/{overlay.mask}", groups=["lighthouse"])
-    manager.save_overlay(overlay)
-    return overlay
+    with _lock_for_dir(manager._dir):
+        overlay = manager.load_overlay() or MeshNetwork(network=env)
+        overlay.lighthouse_underlay_ip = lighthouse_underlay
+        if not manager._ca_crt.exists():
+            manager.create_ca(env)
+            manager.sign_cert("lighthouse", f"{overlay.lighthouse_ip}/{overlay.mask}", groups=["lighthouse"])
+        manager.save_overlay(overlay)
+        return overlay
 
 
 class LighthouseManager:
