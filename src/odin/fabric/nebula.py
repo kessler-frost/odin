@@ -239,7 +239,14 @@ class NebulaManager:
             # The allowed CIDR is the /24 around the lighthouse underlay,
             # i.e. the vzNAT subnet the VMs and host actually share.
             vznat = ipaddress.ip_network(f"{lighthouse_underlay}/24", strict=False)
-            config["lighthouse"]["local_allow_list"] = {str(vznat): True}
+            # "::/0": False is load-bearing — nebula applies the allow-list
+            # per address family, so a v4-only list leaves the VM's IPv6 ULA
+            # advertised, and every handshake then burns ~6s failing on it
+            # ("listener is IPv4, but writing to IPv6 remote") before trying
+            # the right candidate (observed live, R4 diagnosis round 2).
+            config["lighthouse"]["local_allow_list"] = {str(vznat): True, "::/0": False}
+            # Try the vzNAT candidate FIRST regardless of list order.
+            config["preferred_ranges"] = [str(vznat)]
         return yaml.dump(config, default_flow_style=False, sort_keys=False)
 
     def _overlay_path(self) -> Path:
