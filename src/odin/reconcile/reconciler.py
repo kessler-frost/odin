@@ -223,7 +223,12 @@ class Reconciler:
             facts = await asyncio.to_thread(self._aws.facts, res.kind, res.id)
             await self._emit(res.id, res.kind, "healthy", facts=facts)
         if phase == "healthy" and not ok:
-            await self._emit(res.id, res.kind, "crashed")
+            logtail = await asyncio.to_thread(self._backing_logtail, res.kind)
+            await self._emit(
+                res.id, res.kind, "crashed",
+                facts={"logtail": logtail} if logtail else {},
+                verdict=f"the {res.kind} backing is no longer reachable",
+            )
         if res.kind != "sns" or not ok:
             return
         actual = await asyncio.to_thread(self._aws.subscriptions, res.id)
@@ -231,40 +236,63 @@ class Reconciler:
         if missing:
             await asyncio.to_thread(self._aws.provision, "sns", res.id, missing)
 
+    def _backing_logtail(self, kind: str) -> str:
+        """A short tail off the real backing container for a crash verdict --
+        `container_name` is only on the real `BackingAws` (test doubles that
+        don't implement it just skip the tail, never crash the observe pass
+        over an optional diagnostic extra)."""
+        container_name = getattr(self._aws, "container_name", None)
+        return self._rt.logs(container_name(kind)) if container_name is not None else ""
+
     async def _observe_rds(self, res: ResourceDesired) -> None:
         cname = self._rds.container_name(res.id)
         if self._rt.facts(cname).phase == "crashed":
             # Clear the dead container so the recreate boots a fresh Postgres.
+            exit_code = self._rt.exit_code(cname)
+            logtail = self._rt.logs(cname)
             await asyncio.to_thread(self._rds.delete_db, res.id)
-            await self._emit(res.id, "rds", "crashed")
+            await self._emit(
+                res.id, "rds", "crashed",
+                facts={"logtail": logtail} if logtail else {},
+                verdict=f"container exited (code {exit_code})",
+            )
             return
         endpoint = self._rds.endpoint(res.id)
         if endpoint is None:
             return  # still creating
         user, pw = self._creds(res)
-        if await self._pg_ready(endpoint[0], endpoint[1], user, pw):  # host-side probe
-            # Publish a CONTAINER-reachable address: a consumer gets this verbatim
-            # as DATABASE_URL, and "localhost" inside a container is the container
-            # itself, not the Mac. host.docker.internal is the host (same as AWS).
-            addr = f"{CONTAINER_HOST}:{endpoint[1]}"
-            url = f"postgresql://{user}:{pw}@{addr}/postgres"
-            # A container consumer resolves host.docker.internal; an EC2 Lima VM
-            # does NOT (finding #5) -- it resolves host.lima.internal. Publish a
-            # SECOND, VM-reachable form pointing at the SAME Postgres, so an ec2
-            # node consumes ${{db.DATABASE_URL_VM}} while containers keep
-            # ${{db.DATABASE_URL}} (per-consumer-type ref routing is deferred --
-            # a distinct fact is the honest, smaller fix).
-            vm_addr = f"{LIMA_HOST}:{endpoint[1]}"
-            vm_url = f"postgresql://{user}:{pw}@{vm_addr}/postgres"
-            stats = self._rt.stats(cname)
-            await self._emit(
-                res.id, "rds", "healthy",
-                facts={
-                    "DATABASE_URL": url, "endpoint": addr,
-                    "DATABASE_URL_VM": vm_url, "endpoint_vm": vm_addr,
-                    **stats,
-                },
-            )
+        result = await self._pg_ready(endpoint[0], endpoint[1], user, pw)  # host-side probe
+        if not result.ok:
+            # Not necessarily a crash (Postgres may simply still be booting)
+            # -- phase stays "starting", but WHY the health check keeps
+            # failing must not vanish silently (observability v1). _emit's
+            # own dedupe on (phase, verdict) means this only broadcasts once
+            # per distinct error, never spams every tick.
+            if result.error:
+                await self._emit(res.id, "rds", "starting", verdict=f"not ready: {result.error}")
+            return
+        # Publish a CONTAINER-reachable address: a consumer gets this verbatim
+        # as DATABASE_URL, and "localhost" inside a container is the container
+        # itself, not the Mac. host.docker.internal is the host (same as AWS).
+        addr = f"{CONTAINER_HOST}:{endpoint[1]}"
+        url = f"postgresql://{user}:{pw}@{addr}/postgres"
+        # A container consumer resolves host.docker.internal; an EC2 Lima VM
+        # does NOT (finding #5) -- it resolves host.lima.internal. Publish a
+        # SECOND, VM-reachable form pointing at the SAME Postgres, so an ec2
+        # node consumes ${{db.DATABASE_URL_VM}} while containers keep
+        # ${{db.DATABASE_URL}} (per-consumer-type ref routing is deferred --
+        # a distinct fact is the honest, smaller fix).
+        vm_addr = f"{LIMA_HOST}:{endpoint[1]}"
+        vm_url = f"postgresql://{user}:{pw}@{vm_addr}/postgres"
+        stats = self._rt.stats(cname)
+        await self._emit(
+            res.id, "rds", "healthy",
+            facts={
+                "DATABASE_URL": url, "endpoint": addr,
+                "DATABASE_URL_VM": vm_url, "endpoint_vm": vm_addr,
+                **stats,
+            },
+        )
 
     # ---- execute ----
     async def _execute(self, action, stack: Stack) -> None:

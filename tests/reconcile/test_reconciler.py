@@ -6,6 +6,7 @@ import time
 
 from odin.gateway.policy import compile_policies
 from odin.gateway.stores import SynthStores
+from odin.reconcile import assertions
 from odin.reconcile.reconciler import Reconciler
 from odin.runtime.colima import _STATUS_TO_PHASE, ContainerFacts, HostFacts, RunHandle
 from odin.spec.models import Edge, FieldValue, ResourceDesired, Stack
@@ -17,7 +18,7 @@ DB = ResourceDesired(id="db", kind="rds", fields={"engine": FieldValue(value="po
 class FakeRuntime:
     def __init__(self):
         self.runs, self.stopped, self.specs = [], [], {}
-        self._status, self._port, self._exit = {}, {}, {}
+        self._status, self._port, self._exit, self._logs = {}, {}, {}, {}
 
     def run_container(self, spec):
         self.runs.append(spec.name)
@@ -44,12 +45,17 @@ class FakeRuntime:
     def stats(self, name):
         return {"cpu": 1.0, "ram": 10.0}
 
+    def logs(self, name, tail=20):
+        return self._logs.get(name, "")
+
     def ensure_host(self):
         return HostFacts(total_mem_mib=48000, cpu_count=8)
 
-    def set(self, name, docker_status, exit_code=0):
+    def set(self, name, docker_status, exit_code=0, logs=""):
         self._status[name] = docker_status
         self._exit[name] = exit_code
+        if logs:
+            self._logs[name] = logs
 
 
 class FakeRds:
@@ -100,6 +106,9 @@ class FakeAws:
     def backing_ports(self):
         return {"s3": 9000}
 
+    def container_name(self, service):
+        return f"odin-aws-{service}-default"
+
 
 class FakeGateway:
     def __init__(self):
@@ -110,7 +119,13 @@ class FakeGateway:
 
 
 async def _yes(*a, **k):
-    return True
+    return assertions.PgReady(ok=True)
+
+
+def _no(error: str | None = None):
+    async def fake(*a, **k):
+        return assertions.PgReady(ok=False, error=error)
+    return fake
 
 
 async def test_db_reaches_healthy(tmp_path):
@@ -204,11 +219,88 @@ async def test_rds_crash_clears_record_and_recreates(tmp_path):
     assert store.current_world().get("db").phase == "healthy"
     assert rds.created.count("db") == 1
 
-    rt.set("odin-rds-default-db", "exited", exit_code=1)  # the DB container dies
+    rt.set("odin-rds-default-db", "exited", exit_code=1, logs="FATAL: could not bind to port")  # the DB container dies
     # one tick: observe sees crashed -> clears the stale record -> plan recreates
     await recon.tick()
     assert rds.available is False             # delete_db was called (the fix)
     assert rds.created.count("db") == 2       # recreated (AlreadyExists would block this without the delete)
+
+
+async def test_rds_crash_verdict_carries_exit_code_and_logtail(tmp_path):
+    # Observability v1: a crash reason must not be silently discarded --
+    # verdict carries the real exit code, facts carries a log tail so a
+    # caller can see WHY without a second round-trip.
+    rt, rds = FakeRuntime(), FakeRds()
+    rds.available = True
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(DB,)))
+    sent = []
+
+    class FakeWS:
+        async def broadcast(self, msg):
+            sent.append(msg)
+
+    recon = Reconciler(store, rt, rds, ws=FakeWS(), pg_ready=_yes, poll_interval=0)
+    await recon.tick()
+    await recon.tick()  # db healthy
+
+    rt.set("odin-rds-default-db", "exited", exit_code=137, logs="FATAL: could not bind to port")
+    await recon.tick()
+
+    observed = store.current_world().get("db")
+    assert observed is None or observed.phase != "healthy"  # recreated by the very same tick
+    crashed = next(m for m in sent if m.get("resource_id") == "db" and m.get("phase") == "crashed")
+    assert crashed["verdict"] == "container exited (code 137)"
+    assert crashed["facts"]["logtail"] == "FATAL: could not bind to port"
+
+
+async def test_rds_pg_ready_failure_surfaces_the_connection_error_without_flipping_to_crashed(tmp_path):
+    rt, rds = FakeRuntime(), FakeRds()
+    rds.available = True
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(DB,)))
+    sent = []
+
+    class FakeWS:
+        async def broadcast(self, msg):
+            sent.append(msg)
+
+    recon = Reconciler(store, rt, rds, ws=FakeWS(), pg_ready=_no("connection refused"), poll_interval=0)
+    await recon.tick()  # create -> starting
+    await recon.tick()  # pg_ready fails -> verdict on the still-starting phase
+
+    assert store.current_world().get("db").phase == "starting"  # never wrongly flipped to crashed
+    starting_with_verdict = [m for m in sent if m.get("resource_id") == "db" and m.get("verdict")]
+    assert starting_with_verdict, "the real connection error must reach a WorldDelta"
+    assert starting_with_verdict[0]["verdict"] == "not ready: connection refused"
+
+    sent.clear()
+    await recon.tick()  # same error again: deduped, not re-broadcast
+    assert not [m for m in sent if m.get("resource_id") == "db"]
+
+
+async def test_provisioned_crash_carries_a_verdict_and_logtail(tmp_path):
+    rt, rds, aws = FakeRuntime(), FakeRds(), FakeAws()
+    rt.set("odin-aws-s3-default", "running", logs="panic: disk full")
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(ResourceDesired(id="uploads", kind="s3"),)))
+    sent = []
+
+    class FakeWS:
+        async def broadcast(self, msg):
+            sent.append(msg)
+
+    recon = Reconciler(store, rt, rds, aws=aws, ws=FakeWS(), pg_ready=_yes, poll_interval=0)
+    await recon.tick()  # provision -> starting
+    await recon.tick()  # observe exists() == True -> healthy
+    assert store.current_world().get("uploads").phase == "healthy"
+
+    aws.exists = lambda service, name: False  # the backing lost the resource
+    await recon.tick()
+
+    crashed = next(m for m in sent if m.get("resource_id") == "uploads" and m.get("phase") == "crashed")
+    assert crashed["verdict"] == "the s3 backing is no longer reachable"
+    assert crashed["facts"]["logtail"] == "panic: disk full"
 
 
 async def test_gc_called_every_tick_with_active_kinds(tmp_path):
