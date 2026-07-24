@@ -1,0 +1,73 @@
+#!/bin/bash
+# allfather-nebula-ctl -- root-owned control script for odin's per-env Nebula
+# lighthouse process (fabric/nebula.py::LighthouseManager).
+#
+# Installed ONCE, by hand, as part of this repo's documented one-time setup
+# (see LighthouseManager's docstring):
+#
+#   sudo install -o root -g wheel -m 755 scripts/allfather-nebula-ctl /usr/local/libexec/allfather-nebula-ctl
+#   sudo install -o root -g wheel -m 755 "$(which nebula)" /usr/local/libexec/allfather-nebula
+#   echo "$(whoami) ALL=(root) NOPASSWD: /usr/local/libexec/allfather-nebula-ctl" | sudo tee /etc/sudoers.d/allfather-nebula
+#
+# The sudoers grant is scoped to EXACTLY this script's fixed, root-owned
+# path -- never the brew nebula path (user-writable: /opt/homebrew/bin is
+# owned by the invoking user, so a NOPASSWD grant on it would let anyone who
+# can write there run arbitrary code as root by swapping the binary). This
+# script execs a SEPARATE root-owned copy of nebula (installed by the same
+# one-time setup, refreshed by re-running it after a `brew upgrade nebula`)
+# at a fixed path only root can replace.
+#
+# Modes:
+#   start <config-path> <pidfile>   -- exec the root-owned nebula binary,
+#                                       recording our OWN pid (via $$, which
+#                                       exec never changes) to <pidfile>
+#                                       before handing off -- authoritative,
+#                                       independent of whatever the caller
+#                                       assumes about pid tracking across
+#                                       the sudo/exec chain.
+#   stop  <pidfile>                 -- kill ONLY the pid in <pidfile>, after
+#                                       verifying the running process is
+#                                       actually our nebula copy (a pidfile
+#                                       is user-writable; this script's OWN
+#                                       root ownership is not enough by
+#                                       itself to trust its contents blindly).
+#   check                           -- exit 0 iff both binaries are present
+#                                       and executable (a lightweight sudo-
+#                                       authorization + install-sanity probe;
+#                                       LighthouseManager and this repo's
+#                                       integration test both use it).
+set -euo pipefail
+
+NEBULA_BIN="/usr/local/libexec/allfather-nebula"
+SELF="/usr/local/libexec/allfather-nebula-ctl"
+mode="${1:-}"
+
+case "$mode" in
+  start)
+    config="${2:?usage: allfather-nebula-ctl start <config-path> <pidfile>}"
+    pidfile="${3:?usage: allfather-nebula-ctl start <config-path> <pidfile>}"
+    echo "$$" > "$pidfile"
+    exec "$NEBULA_BIN" -config "$config"
+    ;;
+  stop)
+    pidfile="${2:?usage: allfather-nebula-ctl stop <pidfile>}"
+    [ -f "$pidfile" ] || exit 0
+    pid="$(cat "$pidfile")"
+    case "$pid" in
+      ''|*[!0-9]*) exit 0 ;;  # not a real pid -- nothing to do
+    esac
+    comm="$(ps -o comm= -p "$pid" 2>/dev/null || true)"
+    if [ "$comm" != "$NEBULA_BIN" ]; then
+      echo "allfather-nebula-ctl: pid $pid is not $NEBULA_BIN (got ${comm:-gone}), refusing to kill" >&2
+      exit 1
+    fi
+    kill -TERM "$pid"
+    ;;
+  check)
+    [ -x "$NEBULA_BIN" ] && [ -x "$SELF" ] && echo ok
+    ;;
+  *)
+    echo "usage: allfather-nebula-ctl {start <config-path> <pidfile>|stop <pidfile>|check}" >&2
+    exit 64
+    ;;
+esac

@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -52,6 +53,22 @@ from odin.util import atomic_write_text
 log = logging.getLogger("odin.fabric.nebula")
 
 NEBULA_PORT = 4242
+
+# The ONE-TIME, hand-installed, ROOT-OWNED control script LighthouseManager
+# invokes -- see its class docstring for the full setup command and why a
+# NOPASSWD grant on the raw (user-writable) brew `nebula` path would be a
+# root-escalation hole. Fixed paths, not derived: the whole point is that
+# neither the script nor the nebula copy it execs can be swapped by anyone
+# but root, so these constants must match `scripts/allfather-nebula-ctl`'s
+# own `NEBULA_BIN`/`SELF` exactly.
+NEBULA_CTL_PATH = "/usr/local/libexec/allfather-nebula-ctl"
+NEBULA_BIN_PATH = "/usr/local/libexec/allfather-nebula"
+
+# How long `ensure_started` waits for `allfather-nebula-ctl start` to either
+# write the pidfile (success) or exit (failure, e.g. `sudo -n` rejected) --
+# both happen in well under a second in practice; generous headroom for a
+# loaded box, not a boot-time budget.
+_LIGHTHOUSE_START_TIMEOUT = 3.0
 
 # A documented allow-all default. Real per-kind/group ACLs (derived from canvas
 # security-group / IAM edges via sg_rules_to_firewall) are an M7 hardening item;
@@ -251,14 +268,28 @@ class LighthouseManager:
     macOS root requirement (verified empirically, not assumed): creating a
     utun device needs root -- an unprivileged `nebula -config ...` exits
     "operation not permitted" immediately. This therefore shells to `sudo -n
-    nebula ...` (non-interactive: fails fast and loud rather than hanging on
-    a password prompt nothing can answer from a background thread). One-time
-    host setup the operator runs themselves -- mirrors this same machine's
-    own pre-existing `/private/etc/sudoers.d/lima` entry for socket_vmnet,
-    same pattern, just for nebula (`kill` too, since stopping a root-owned
-    lighthouse by its exact pid also needs root):
+    <NEBULA_CTL_PATH> ...` (non-interactive: fails fast and loud rather than
+    hanging on a password prompt nothing can answer from a background
+    thread) -- NEVER `sudo -n nebula` directly against the brew path: brew
+    installs to a USER-writable prefix (`/opt/homebrew` or `/usr/local`), so
+    a NOPASSWD grant scoped to that path would let anyone who can write
+    there run arbitrary code as root by swapping the binary -- a real
+    root-escalation hole, not a theoretical one. `scripts/
+    allfather-nebula-ctl` (shipped in this repo) is the fix: a small,
+    reviewable, ROOT-OWNED script at a FIXED path only root can ever
+    replace, which execs a SEPARATE root-owned copy of nebula (also only
+    root-replaceable) -- the sudoers grant is scoped to exactly that one
+    script's path, nothing else, never a raw binary or a generic command
+    like `kill`.
 
-        echo "$(whoami) ALL=(root) NOPASSWD: $(which nebula), /bin/kill" | sudo tee /etc/sudoers.d/allfather-nebula
+    One-time host setup the operator runs themselves (mirrors this same
+    machine's own pre-existing `/private/etc/sudoers.d/lima` entry for
+    socket_vmnet -- same pattern: a fixed, root-owned, narrowly-scoped
+    target, never a user-writable path):
+
+        sudo install -o root -g wheel -m 755 scripts/allfather-nebula-ctl /usr/local/libexec/allfather-nebula-ctl
+        sudo install -o root -g wheel -m 755 "$(which nebula)" /usr/local/libexec/allfather-nebula
+        echo "$(whoami) ALL=(root) NOPASSWD: /usr/local/libexec/allfather-nebula-ctl" | sudo tee /etc/sudoers.d/allfather-nebula
 
     Without it, `ensure_started` logs a clear warning and returns False --
     mesh activation is best-effort throughout (matching
@@ -319,33 +350,56 @@ class LighthouseManager:
         )
         config_path = self._config_path(root, env)
         atomic_write_text(config_path, config_text)
+        pidfile = self._pidfile(root, env)
+        pidfile.parent.mkdir(parents=True, exist_ok=True)
         log_path = self._log_path(root, env)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             with log_path.open("ab") as handle:
                 proc = self._popen(
-                    ["sudo", "-n", "nebula", "-config", str(config_path)],
+                    ["sudo", "-n", NEBULA_CTL_PATH, "start", str(config_path), str(pidfile)],
                     stdout=handle, stderr=subprocess.STDOUT, start_new_session=True,
                 )
         except OSError as exc:
             log.warning("failed to spawn nebula lighthouse for env %r: %s", env, exc)
             return False
-        atomic_write_text(self._pidfile(root, env), str(proc.pid))
-        log.info("started nebula lighthouse for env %r (pid %d, underlay %s)", env, proc.pid, underlay)
-        return True
+        # allfather-nebula-ctl writes `pidfile` itself (via $$, right before
+        # it execs into the root-owned nebula copy -- exec never changes
+        # the pid) -- authoritative, independent of whatever we'd otherwise
+        # assume about pid tracking across the sudo/exec chain. A rejected
+        # `sudo -n` (the one-time setup missing) exits FAST with no pidfile
+        # ever written, so a short poll distinguishes the two outcomes
+        # cleanly instead of trusting `proc.pid` blindly.
+        deadline = time.monotonic() + _LIGHTHOUSE_START_TIMEOUT
+        while time.monotonic() < deadline:
+            if pidfile.exists():
+                log.info(
+                    "started nebula lighthouse for env %r (pid %s, underlay %s)",
+                    env, pidfile.read_text().strip(), underlay,
+                )
+                return True
+            if proc.poll() is not None:
+                break
+            time.sleep(0.05)
+        log.warning(
+            "nebula lighthouse did not start for env %r -- is the one-time sudoers setup done? "
+            "see LighthouseManager's docstring (sudo install ... allfather-nebula-ctl)", env,
+        )
+        return False
 
     def ensure_stopped(self, root: Path, env: str) -> None:
         """Exact-pid only, read from THIS env's own pidfile -- never a
         pattern/blanket kill (the same discipline `InstanceVm`'s VM teardown
-        uses for `limactl`)."""
+        uses for `limactl`). Delegates the actual kill to
+        `allfather-nebula-ctl stop`, which re-verifies the pid is really our
+        nebula copy before signaling it (a pidfile is user-writable; this
+        process being unprivileged means it can't `kill` a root-owned
+        process directly regardless)."""
         pidfile = self._pidfile(root, env)
         if not pidfile.exists():
             return
-        pid = pidfile.read_text().strip()
-        if pid.isdigit():
-            self._run(["sudo", "-n", "kill", pid])
-            log.info("stopped nebula lighthouse for env %r (pid %s)", env, pid)
+        self._run(["sudo", "-n", NEBULA_CTL_PATH, "stop", str(pidfile)])
         pidfile.unlink(missing_ok=True)
+        log.info("stopped nebula lighthouse for env %r", env)
 
 
 def _ec2net_networks(root: Path, env: str) -> tuple[list[VpcNetwork], list[SgFirewall]]:

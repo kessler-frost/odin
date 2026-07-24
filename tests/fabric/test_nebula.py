@@ -14,6 +14,7 @@ from odin.fabric.localhost import Unresolved
 from odin.fabric.models import CertPaths, FirewallRule, FirewallRules, MeshNetwork
 from odin.fabric.nebula import (
     DEFAULT_FIREWALL,
+    NEBULA_CTL_PATH,
     LighthouseManager,
     NebulaFabric,
     NebulaManager,
@@ -271,14 +272,29 @@ def test_mesh_state_empty_then_populated(tmp_path):
 
 
 class FakePopen:
-    def __init__(self, pid: int = 424242) -> None:
+    """`returncode=None` while "running" (`poll()` -> None), matching a real
+    `subprocess.Popen` -- `_fake_popen`'s `exits_immediately` flips it to
+    simulate a REJECTED `sudo -n` (fails fast, no pidfile ever written)."""
+
+    def __init__(self, pid: int = 424242, exits_immediately: bool = False) -> None:
         self.pid = pid
+        self.returncode = 1 if exits_immediately else None
+
+    def poll(self):
+        return self.returncode
 
 
-def _fake_popen(calls: list[list[str]]):
+def _fake_popen(calls: list[list[str]], pidfile: object = None, pid: int = 424242, exits_immediately: bool = False):
+    """Stands in for `subprocess.Popen`. When `pidfile` is given, mimics
+    `allfather-nebula-ctl start`'s own behavior of writing its pid there
+    itself (real `LighthouseManager.ensure_started` polls for exactly this,
+    never trusting `Popen.pid` directly -- see its docstring)."""
     def popen(args, **kwargs):
         calls.append(args)
-        return FakePopen()
+        if pidfile is not None and not exits_immediately:
+            pidfile.parent.mkdir(parents=True, exist_ok=True)
+            pidfile.write_text(str(pid))
+        return FakePopen(pid=pid, exits_immediately=exits_immediately)
     return popen
 
 
@@ -311,17 +327,21 @@ def test_lighthouse_is_running_false_for_garbage_pidfile_content(tmp_path):
     assert LighthouseManager().is_running(tmp_path, "prod") is False
 
 
-def test_lighthouse_ensure_started_spawns_and_writes_pidfile(tmp_path):
+def test_lighthouse_ensure_started_spawns_via_the_ctl_script_and_writes_pidfile(tmp_path):
+    """The sudoers grant is scoped to `allfather-nebula-ctl`'s fixed,
+    root-owned path -- NEVER a raw `nebula` invocation (that would need a
+    NOPASSWD grant on brew's user-writable path, a root-escalation hole)."""
     runner = FakeRunner()
     ensure_network(tmp_path, "prod", "1.2.3.4", runner=runner)  # bootstraps the lighthouse cert
     calls: list[list[str]] = []
-    mgr = LighthouseManager(popen=_fake_popen(calls), runner=runner)
+    pidfile = tmp_path / "prod" / "nebula" / "lighthouse.pid"
+    mgr = LighthouseManager(popen=_fake_popen(calls, pidfile=pidfile), runner=runner)
 
     started = mgr.ensure_started(tmp_path, "prod", "192.168.64.1")
     assert started is True
     config_path = tmp_path / "prod" / "nebula" / "lighthouse-config.yml"
-    assert calls == [["sudo", "-n", "nebula", "-config", str(config_path)]]
-    assert (tmp_path / "prod" / "nebula" / "lighthouse.pid").read_text() == "424242"
+    assert calls == [["sudo", "-n", NEBULA_CTL_PATH, "start", str(config_path), str(pidfile)]]
+    assert pidfile.read_text() == "424242"
     config = yaml.safe_load(config_path.read_text())
     assert config["lighthouse"]["am_lighthouse"] is True
     assert config["pki"]["cert"] == str(tmp_path / "prod" / "nebula" / "hosts" / "lighthouse.crt")
@@ -345,13 +365,29 @@ def test_lighthouse_ensure_started_false_when_network_not_bootstrapped_yet(tmp_p
     assert calls == []
 
 
-def test_lighthouse_ensure_stopped_kills_by_exact_pid_and_removes_pidfile(tmp_path):
+def test_lighthouse_ensure_started_false_when_sudo_rejects_the_one_time_setup_is_missing(tmp_path):
+    """The realistic failure mode: `sudo -n` exits immediately (no TTY, no
+    NOPASSWD grant yet) -- no pidfile is ever written, so `ensure_started`
+    must detect the FAST exit rather than blocking for the full poll
+    window."""
+    runner = FakeRunner()
+    ensure_network(tmp_path, "prod", "1.2.3.4", runner=runner)
+    calls: list[list[str]] = []
+    pidfile = tmp_path / "prod" / "nebula" / "lighthouse.pid"
+    mgr = LighthouseManager(popen=_fake_popen(calls, pidfile=pidfile, exits_immediately=True), runner=runner)
+
+    started = mgr.ensure_started(tmp_path, "prod", "192.168.64.1")
+    assert started is False
+    assert not pidfile.exists()
+
+
+def test_lighthouse_ensure_stopped_kills_via_the_ctl_script_by_exact_pidfile(tmp_path):
     pidfile = tmp_path / "prod" / "nebula" / "lighthouse.pid"
     pidfile.parent.mkdir(parents=True)
     pidfile.write_text("424242")
     runner = FakeRunner()
     LighthouseManager(runner=runner).ensure_stopped(tmp_path, "prod")
-    assert runner.calls == [["sudo", "-n", "kill", "424242"]]
+    assert runner.calls == [["sudo", "-n", NEBULA_CTL_PATH, "stop", str(pidfile)]]
     assert not pidfile.exists()
 
 

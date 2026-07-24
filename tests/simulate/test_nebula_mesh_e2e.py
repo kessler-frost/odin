@@ -25,10 +25,14 @@ proves the whole mesh is real, not just compiled artifacts sitting on disk:
 
 Root requirement (macOS, verified empirically -- see `fabric/nebula.py`'s
 `LighthouseManager` docstring): creating a utun device needs root. This test
-is SKIPPED with a clear, actionable message if the one-time `sudoers.d`
-passwordless grant for `nebula`/`kill` hasn't been set up on this Mac --
-never a silent pass, and never an attempt to self-provision root (a real
-security boundary, not a test-harness inconvenience to route around).
+is SKIPPED with a clear, actionable message if the one-time hardened setup
+(a root-owned `allfather-nebula-ctl` control script + a root-owned nebula
+copy, both only root can ever replace, per `scripts/allfather-nebula-ctl`)
+hasn't been done on this Mac -- never a silent pass, and never an attempt to
+self-provision root (a real security boundary, not a test-harness
+inconvenience to route around). The sudoers grant is scoped to that one
+fixed script path -- NEVER the user-writable brew `nebula` binary directly,
+which would be a root-escalation hole.
 
 VM + lighthouse hygiene ABSOLUTE (V3d's own words, carried forward): both
 `vm_cleanup` (exact VM name) and `lighthouse_cleanup`
@@ -51,7 +55,7 @@ from fastapi.testclient import TestClient
 from odin.agent import hcl
 from odin.agent.hcl import TfProject
 from odin.compute.instances import vm_name
-from odin.fabric.nebula import LighthouseManager
+from odin.fabric.nebula import NEBULA_CTL_PATH, LighthouseManager
 from odin.gateway.keys import OPERATOR_NODE_ID
 from odin.server import create_app
 from odin.simulate import workspace as workspace_mod
@@ -117,11 +121,21 @@ def _ec2compute_state(root, env: str) -> dict:
     return json.loads(path.read_text()) if path.exists() else {}
 
 
+_SETUP_COMMAND = (
+    "sudo install -o root -g wheel -m 755 scripts/allfather-nebula-ctl /usr/local/libexec/allfather-nebula-ctl && "
+    'sudo install -o root -g wheel -m 755 "$(which nebula)" /usr/local/libexec/allfather-nebula && '
+    f'echo "$(whoami) ALL=(root) NOPASSWD: {NEBULA_CTL_PATH}" | sudo tee /etc/sudoers.d/allfather-nebula'
+)
+
+
 def _sudo_nebula_authorized() -> bool:
-    """A SCOPED probe (actually runs `nebula -version` under `sudo -n`), not
-    just `sudo -n true` -- proves the specific grant the lighthouse needs
-    exists, not merely that SOME passwordless sudo ticket is cached."""
-    probe = subprocess.run(["sudo", "-n", "nebula", "-version"], capture_output=True, timeout=10)
+    """A SCOPED probe -- runs `allfather-nebula-ctl check` under `sudo -n`,
+    the EXACT command `LighthouseManager` uses, never a raw `nebula`
+    invocation (that would need a NOPASSWD grant on brew's user-writable
+    path, a root-escalation hole `scripts/allfather-nebula-ctl`'s whole
+    design exists to avoid). Proves the specific hardened grant exists, not
+    merely that some passwordless sudo ticket happens to be cached."""
+    probe = subprocess.run(["sudo", "-n", NEBULA_CTL_PATH, "check"], capture_output=True, timeout=10)
     return probe.returncode == 0
 
 
@@ -180,11 +194,10 @@ def test_real_overlay_ping_and_sg_rule_filters_a_real_connection(tmp_path, vm_cl
     assert shutil.which("nebula") and shutil.which("nebula-cert"), "brew install nebula (MIT) required"
     if not _sudo_nebula_authorized():
         pytest.skip(
-            "passwordless sudo for nebula is not set up on this Mac -- one-time host "
-            "setup (mirrors this machine's own /private/etc/sudoers.d/lima entry for "
-            "socket_vmnet):\n"
-            '  echo "$(whoami) ALL=(root) NOPASSWD: $(which nebula), /bin/kill" | '
-            "sudo tee /etc/sudoers.d/allfather-nebula"
+            "the hardened one-time host setup for the nebula lighthouse is not done on "
+            "this Mac -- a root-owned control script + a root-owned nebula copy, both "
+            "only root can replace (never a NOPASSWD grant on the user-writable brew "
+            f"path -- see scripts/allfather-nebula-ctl):\n  {_SETUP_COMMAND}"
         )
 
     store = SpecStore(tmp_path)
