@@ -104,9 +104,12 @@ Known v1 limits, recorded rather than hidden:
   known gap.
 - **RDS** stays off Terraform — it's the reconciler's real Postgres
   container, not a `tofu`-managed resource, until an RDS gateway model lands.
-- **Nebula** compiles VPC/SG config for real today; the actual mesh daemon
-  and lighthouse (needed for reaching a VM's overlay IP across machines)
-  are built but not wired up — that lands with multi-Mac support.
+- **Nebula** is live single-host: VPC/SG config compiles to real Nebula
+  network + firewall primitives, the host runs a real (and fully
+  unprivileged — no root, no sudo, no one-time setup) lighthouse process,
+  and every VPC-joined EC2 VM runs a real `nebula` daemon carrying the
+  compiled SG firewall. Cross-Mac reachability (a second machine joining the
+  same mesh) lands with multi-Mac support.
 
 ## How it's built
 
@@ -145,6 +148,13 @@ colima, installs odin, runs `odin doctor`):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kessler-frost/odin/main/scripts/install.sh | sh
+```
+
+To undo it — stop the server, remove odin-managed containers/VMs, and
+uninstall the tool (your Homebrew tools are left alone):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kessler-frost/odin/main/scripts/uninstall.sh | sh
 ```
 
 Or from a local clone, for development (verified verbatim against this repo):

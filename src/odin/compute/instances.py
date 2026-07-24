@@ -46,10 +46,20 @@ empirically 192.168.64.0/24 today but not a contract), `_activate_nebula`
 then writes the real config (the VPC's compiled SG firewall included, off
 `NebulaJoin.firewall`) via `limactl shell ... sudo tee` and starts the
 daemon. `fabric.nebula.LighthouseManager` supervises the HOST-side
-lighthouse process this all connects to -- see that module's docstring for
-the macOS root requirement and its one-time `sudoers.d` setup. Both halves
-are best-effort: a mesh-wiring failure never fails the AWS instance boot
-itself (`_activate_nebula` never raises).
+lighthouse process this all connects to -- runs unprivileged (R4: `tun:
+disabled: true`, no root, no sudo) since it only coordinates; the VM's own
+`nebula` daemon (started here as root INSIDE the VM via systemd) is the
+mesh's real data plane. Both halves are best-effort: a mesh-wiring failure
+never fails the AWS instance boot itself (`_activate_nebula` never raises).
+
+R5 (relay): stock Lima `vz` NATs every VM into its OWN isolated address
+space -- confirmed live, a raw ping between two VMs' vzNAT addresses is
+100% loss, so a direct VM-to-VM handshake can never succeed regardless of
+config. Every VM CAN reach the host, though (it already handshakes with the
+lighthouse), so `relay_enabled=True` here routes VM-to-VM traffic THROUGH
+the lighthouse instead -- still rootless (a relay forwards opaque encrypted
+UDP between two peers it already has sessions with; it never needs a tun
+device to do it, empirically confirmed in `fabric/nebula.py`).
 """
 from __future__ import annotations
 
@@ -205,14 +215,25 @@ class InstanceVm:
         regress `overlay.json` back to the "127.0.0.1" bootstrap placeholder)
         -- `_activate_nebula` re-derives + persists the real value
         regardless, so THIS instance's own connectivity never depends on
-        that cache."""
+        that cache.
+
+        Uses `NebulaManager.allocate_host_ip` (not a bare `MeshNetwork.
+        cert_ip` + `save_overlay` pair) so this instance's sticky overlay IP
+        is allocated AND persisted as one locked operation -- two instances
+        booting concurrently in the same env (this method runs on each
+        instance's own boot thread) would otherwise race on the shared
+        `overlay.json`: both could read the same pre-allocation snapshot,
+        collide on the SAME next IP, and whichever saved last would
+        silently erase the other's assignment entirely (empirically
+        confirmed while proving the R4 rootless mesh with two real VMs)."""
         if nebula is None:
             return None
         manager = NebulaManager(Path(nebula.root) / nebula.env / "nebula", runner=self._run)
         existing = manager.load_overlay()
         underlay = (existing.lighthouse_underlay_ip if existing else None) or "127.0.0.1"
-        network = ensure_network(nebula.root, nebula.env, underlay, runner=self._run)
-        cert = manager.sign_cert(nebula.host_id, network.cert_ip(nebula.host_id), groups=["ec2"])
+        ensure_network(nebula.root, nebula.env, underlay, runner=self._run)
+        overlay_ip = manager.allocate_host_ip(nebula.host_id)
+        cert = manager.sign_cert(nebula.host_id, overlay_ip, groups=["ec2"])
         return {
             "ca.crt": cert.ca_crt.read_text(),
             "host.crt": cert.crt.read_text(),
@@ -263,7 +284,7 @@ class InstanceVm:
             network = ensure_network(nebula.root, nebula.env, underlay, runner=self._run)
             config = manager.generate_config(
                 lighthouse_ip=network.lighthouse_ip, lighthouse_underlay=underlay,
-                firewall=nebula.firewall or DEFAULT_FIREWALL, is_lighthouse=False,
+                firewall=nebula.firewall or DEFAULT_FIREWALL, is_lighthouse=False, relay_enabled=True,
             )
             self._lima("shell", name, "--", "sudo", "tee", "/etc/nebula/config.yml", input=config, check=False)
             self._lima("shell", name, "--", "sudo", "systemctl", "enable", "--now", "nebula", check=False)
