@@ -87,6 +87,12 @@ class ImportResult(BaseModel):
     # arguments couldn't be carried (finding #6) -- honest at attribute
     # granularity, not just resource-type granularity.
     warnings: list[str] = []
+    # Set ONLY when the input itself failed to PARSE (finding #7) -- distinct
+    # from a well-formed file that merely contains unsupported resources (which
+    # stays a success with an `unsupported` list). The CLI treats a non-None
+    # value as a hard error and exits non-zero, so a CI job's exit-code check
+    # catches a broken import.
+    parse_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -179,7 +185,9 @@ def parse_hcl(files: dict[str, str]) -> ImportResult:
     try:
         triples = hcl.parse_tf(files)
     except Exception as exc:
-        return ImportResult(unsupported=[Unsupported(type="*", name="*", reason=f"HCL failed to parse: {exc}")])
+        # A genuine PARSE failure -- a hard error (finding #7), distinct from a
+        # well-formed file with only unsupported resources.
+        return ImportResult(parse_error=f"HCL failed to parse: {exc}")
 
     by_hcl_name: dict[str, str] = {}  # "aws_sns_topic.alerts" -> canvas label
     nodes: list[dict] = []
@@ -316,4 +324,5 @@ async def import_live(
     return ImportResult(
         nodes=result.nodes, edges=result.edges,
         unsupported=[*unsupported, *result.unsupported], warnings=result.warnings,
+        parse_error=result.parse_error,
     )

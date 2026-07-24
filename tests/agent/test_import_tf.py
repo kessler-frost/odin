@@ -96,11 +96,20 @@ resource "aws_sns_topic_subscription" "orphan" {
     assert result.unsupported[0].name == "orphan"
 
 
-def test_malformed_hcl_reported_as_unsupported_not_raised():
+def test_malformed_hcl_sets_parse_error_not_unsupported():
+    # Finding #7: a genuine parse failure is a distinct, hard error (parse_error),
+    # NOT an "unsupported resource" -- so the CLI can exit non-zero on it while a
+    # well-formed-but-unsupported file stays a success.
     result = parse_hcl_text("not { valid hcl")
     assert result.nodes == []
+    assert result.unsupported == []
+    assert result.parse_error is not None and "failed to parse" in result.parse_error
+
+
+def test_valid_file_with_only_unsupported_resources_has_no_parse_error():
+    result = parse_hcl_text('resource "aws_cloudwatch_log_group" "logs" {\n  name = "logs"\n}\n')
+    assert result.parse_error is None
     assert len(result.unsupported) == 1
-    assert "failed to parse" in result.unsupported[0].reason
 
 
 def test_dynamodb_hash_key_defaults_to_id_when_attribute_missing():

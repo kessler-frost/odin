@@ -83,6 +83,11 @@ def import_tf(
     body = http.body_or_fail(
         http.request("POST", url, "/import-tf", params={"env": env}, body=payload)
     )
+    # Finding #7: a genuine PARSE failure is a hard error (non-zero exit), so a
+    # CI exit-code check catches a broken import -- unlike a well-formed file
+    # with only unsupported resources, which stays a success (exit 0) below.
+    if body.get("parse_error"):
+        raise http.fail(body["parse_error"], 1)
     http.echo_json({"nodes": body["nodes"], "edges": body["edges"]})
     unsupported = body.get("unsupported") or []
     if unsupported:
