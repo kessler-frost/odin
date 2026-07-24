@@ -48,6 +48,22 @@ def _default_timeout() -> float:
     return float(os.environ.get("ODIN_TRANSLATE_TIMEOUT", "45"))
 
 
+def refine_enabled() -> bool:
+    """`ODIN_TRANSLATE_REFINE` opts IN to the claude-agent-sdk refine pass --
+    OFF by default. The canvas -> Terraform translation (`agent/hcl.py`) is
+    fully deterministic; this pass is a best-effort ADD-ON that can only
+    attach comments/tags/unset arguments (`validate_refinement`'s
+    value-fidelity check rejects anything else), never change the
+    architecture -- so leaving it off costs polish, not correctness. Read
+    fresh on every call (not cached at import), same convention as
+    `_default_timeout` -- an env var flip takes effect on the next call, no
+    restart required. Checked ONLY on the cached (production, see
+    server.py) path in `translate()` below: without it, a no-API-key
+    install used to re-kick a doomed ~`_TIMEOUT_S`-second SDK pass, in the
+    background, on every single `/translate`/`/apply-full` call for nothing."""
+    return os.environ.get("ODIN_TRANSLATE_REFINE", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 _TIMEOUT_S = _default_timeout()
 _TAIL_LINES = 15
 
@@ -176,8 +192,10 @@ async def validate_refinement(
     means odin must fall back to the skeleton verbatim; no violation means
     `formatted_files` (tofu fmt-canonicalized) is what odin should keep.
 
-    Order: the resource-SET equality check is pure Python and runs first, so
-    an agent that added or removed a resource never pays for the two tofu
+    Order: the resource-SET equality check and the value-fidelity check are
+    both pure Python and run first, so an agent that added/removed a resource
+    or silently rewrote an argument's VALUE (the drift liability -- nothing
+    else compares agent output to the canvas) never pays for the two tofu
     subprocess calls that follow.
 
     `binary_files` (release finding #1): the skeleton's zip'd lambda
@@ -189,11 +207,18 @@ async def validate_refinement(
     if not agent_files:
         return "agent returned no files", None
     try:
-        agent_set, skeleton_set = hcl.resource_set(agent_files), hcl.resource_set(skeleton_files)
+        agent_attrs, skeleton_attrs = hcl.resource_attrs(agent_files), hcl.resource_attrs(skeleton_files)
     except Exception as exc:
         return f"agent output failed to parse: {exc}", None
+    agent_set, skeleton_set = frozenset(agent_attrs), frozenset(skeleton_attrs)
     if agent_set != skeleton_set:
         return f"resource set changed (skeleton={sorted(skeleton_set)}, agent={sorted(agent_set)})", None
+    drifted = sorted(
+        f"{rtype}.{name}" for (rtype, name), attrs in skeleton_attrs.items()
+        if not hcl.values_preserved(attrs, agent_attrs[(rtype, name)])
+    )
+    if drifted:
+        return f"argument value(s) changed on {drifted} -- only comments/tags/new arguments may be added", None
     combined = "\n".join(agent_files.values()).lower()
     hit = next((token for token in _FORBIDDEN_SUBSTRINGS if token in combined), None)
     if hit is not None:
@@ -223,6 +248,10 @@ async def validate_refinement(
 
 
 _BACKGROUND_NOTE = "refinement is running in the background -- using the deterministic skeleton for now"
+_REFINE_DISABLED_NOTE = (
+    "the optional AI refine pass is off (set ODIN_TRANSLATE_REFINE=1 to enable) -- "
+    "using the deterministic translation"
+)
 
 
 def _fallback_result(skeleton: TfProject, notes: list[str]) -> TranslateResult:
@@ -324,13 +353,23 @@ async def translate(
     a background task whose result a later same-revision call serves from the
     cache. Without a cache it runs the refine inline and returns the refined (or
     fallback) result synchronously -- the shape the guardrail/fallback unit
-    tests drive."""
+    tests drive.
+
+    `refine_enabled()` (owner directive, opt-in decoration) gates ONLY the
+    cached/production path: when off (the default), no background task is
+    even created -- every `/translate`/`/apply-full` call returns the
+    deterministic result immediately, full stop. The uncached path is left
+    alone (it's the guardrail/fallback unit tests' own seam, never a
+    production caller -- server.py always passes a cache)."""
     skeleton = generate_tf(stack)
     if not hcl.resource_set(skeleton.files):
         return _fallback_result(skeleton, [])
 
     if cache is None:
         return await _refine_once(skeleton, stack, client_cls, timeout)
+
+    if not refine_enabled():
+        return _fallback_result(skeleton, [_REFINE_DISABLED_NOTE])
 
     rev = rev_of(stack)
     cached = cache.get(rev)
