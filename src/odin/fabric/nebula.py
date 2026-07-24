@@ -231,6 +231,14 @@ def _rule_to_dict(rule: FirewallRule) -> dict:
     return d
 
 
+_PORTLESS_PROTOCOLS = ("icmp", "icmpv6")  # AWS expresses ICMP type/code via FromPort/ToPort
+# (-1 = "all"), but nebula's `port` field is strictly an L4 TCP/UDP port (or
+# range) -- it has no ICMP type/code granularity. Feeding it AWS's literal
+# "-1" verbatim (empirically confirmed) makes nebula refuse to start at all
+# ("port appears to be a range but could not be parsed") -- silently taking
+# the whole daemon down over a rule that was only ever meant to be a no-op.
+
+
 def sg_rules_to_firewall(permissions: list[dict]) -> FirewallRules:
     """Translate AWS security-group IpPermissions (canvas SG edges) to Nebula
     firewall rules — recovered, for deriving per-env ACLs from the canvas."""
@@ -240,7 +248,7 @@ def sg_rules_to_firewall(permissions: list[dict]) -> FirewallRules:
         from_port, to_port = perm.get("FromPort"), perm.get("ToPort")
         nebula_proto = "any" if proto == "-1" else proto
         nebula_port = "any"
-        if proto != "-1" and from_port is not None:
+        if proto not in ("-1", *_PORTLESS_PROTOCOLS) and from_port is not None:
             nebula_port = str(from_port) if from_port == to_port else f"{from_port}-{to_port}"
         for ip_range in perm.get("IpRanges", []):
             inbound.append(FirewallRule(port=nebula_port, proto=nebula_proto, cidr=ip_range.get("CidrIp")))
