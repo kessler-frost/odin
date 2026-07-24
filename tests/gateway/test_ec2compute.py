@@ -151,6 +151,11 @@ def _subnet(stores, sink, ec2) -> str:
     return _create_subnet(stores, sink, ec2, _create_vpc(stores, sink, ec2))
 
 
+def _create_sg(stores, sink, ec2, vpc_id: str, name: str = "web") -> str:
+    req = sink.call(lambda: ec2.create_security_group(GroupName=name, Description=name, VpcId=vpc_id))
+    return _parse("CreateSecurityGroup", _answer(stores, req))["GroupId"]
+
+
 def _run_instance(stores, sink, ec2, vm, *, keystore=None, gateway_port=None, **kwargs) -> dict:
     req = sink.call(lambda: ec2.run_instances(MinCount=1, MaxCount=1, **kwargs))
     return _parse("RunInstances", _answer(stores, req, vm, keystore=keystore, gateway_port=gateway_port))
@@ -189,6 +194,60 @@ def test_run_instances_starts_pending_and_boots_to_running(sink, ec2, stores):
     assert running["SubnetId"] == subnet_id
     assert len(vm.booted) == 1
     assert vm.booted[0][0].startswith(f"odin-ec2-{ENV}-{instance_id}")
+
+
+def test_run_instances_reflects_security_groups_on_the_primary_eni(sink, ec2, stores):
+    """Field-test finding #2: an instance launched with SecurityGroupIds must
+    report them on a PRIMARY network interface so the TF provider reads
+    `vpc_security_group_ids` with zero drift on re-apply. Before this the model
+    ignored them -> the provider saw a changed group set with no primary NI to
+    modify and errored 'does not contain a primary network interface'."""
+    vpc_id = _create_vpc(stores, sink, ec2)
+    subnet_id = _create_subnet(stores, sink, ec2, vpc_id)
+    sg_id = _create_sg(stores, sink, ec2, vpc_id, name="web-sg")
+
+    vm = FakeInstanceVm()
+    result = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, SecurityGroupIds=[sg_id])
+    instance_id = result["Instances"][0]["InstanceId"]
+    assert stores.ec2compute.get(ENV, f"instance:{instance_id}")["security_group_ids"] == [sg_id]
+
+    req = sink.call(lambda: ec2.describe_instances(InstanceIds=[instance_id]))
+    instance = _parse("DescribeInstances", _answer(stores, req, vm))["Reservations"][0]["Instances"][0]
+    assert [g["GroupId"] for g in instance["SecurityGroups"]] == [sg_id]
+    (eni,) = instance["NetworkInterfaces"]
+    assert eni["Attachment"]["DeviceIndex"] == 0
+    assert [g["GroupId"] for g in eni["Groups"]] == [sg_id]
+    assert eni["Groups"][0]["GroupName"] == "web-sg"
+
+
+def test_run_instances_without_security_groups_has_no_primary_eni(sink, ec2, stores):
+    """The no-SG path is byte-for-byte the pre-finding-#2 shape: no groupSet, no
+    networkInterfaceSet -- the provider reads `vpc_security_group_ids` as an
+    empty computed value (no drift), which is why the existing no-SG e2e stays
+    zero-drift."""
+    subnet_id = _subnet(stores, sink, ec2)
+    vm = FakeInstanceVm()
+    instance_id = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)["Instances"][0]["InstanceId"]
+    req = sink.call(lambda: ec2.describe_instances(InstanceIds=[instance_id]))
+    instance = _parse("DescribeInstances", _answer(stores, req, vm))["Reservations"][0]["Instances"][0]
+    assert instance.get("SecurityGroups", []) == []
+    assert instance.get("NetworkInterfaces", []) == []
+
+
+def test_modify_instance_attribute_updates_the_security_group_set(sink, ec2, stores):
+    """The in-place security-group change path (finding #2): ModifyInstanceAttribute
+    with a new GroupId set updates the stored membership so the next describe --
+    and a re-apply -- reflect it."""
+    vpc_id = _create_vpc(stores, sink, ec2)
+    subnet_id = _create_subnet(stores, sink, ec2, vpc_id)
+    sg1 = _create_sg(stores, sink, ec2, vpc_id, name="sg-a")
+    sg2 = _create_sg(stores, sink, ec2, vpc_id, name="sg-b")
+    vm = FakeInstanceVm()
+    instance_id = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, SecurityGroupIds=[sg1])["Instances"][0]["InstanceId"]
+
+    req = sink.call(lambda: ec2.modify_instance_attribute(InstanceId=instance_id, Groups=[sg2]))
+    assert _answer(stores, req, vm).status_code == 200
+    assert stores.ec2compute.get(ENV, f"instance:{instance_id}")["security_group_ids"] == [sg2]
 
 
 def test_run_instances_default_instance_type_and_ami(sink, ec2, stores):
@@ -411,11 +470,13 @@ def test_terminate_unknown_instance_is_not_found(sink, ec2, stores):
 
 
 def test_run_instances_threads_the_vpc_default_sg_firewall_into_nebula_join(sink, ec2, stores):
-    """RunInstances doesn't model SecurityGroupIds (v1's own recorded
-    limit) -- every instance inherits its VPC's default SG, exactly like
-    real AWS does for an instance launched with none specified. An ingress
-    rule authorized on that default SG must show up on the `NebulaJoin`
-    `InstanceVm.boot` receives."""
+    """An instance launched with NO SecurityGroupIds inherits its VPC's default
+    SG, exactly like real AWS. An ingress rule authorized on that default SG
+    must show up on the `NebulaJoin` `InstanceVm.boot` receives. (The Nebula
+    firewall always compiles from the VPC DEFAULT SG regardless of any assigned
+    groups -- finding #2 wires assigned SGs through the DescribeInstances wire
+    for zero-drift re-apply, but gating the VM's mesh firewall by the assigned
+    SG is a separately-tracked limit.)"""
     subnet_id = _subnet(stores, sink, ec2)
     vpc_id = stores.ec2net.get(ENV, f"subnet:{subnet_id}")["vpc_id"]
     default_sg_id = stores.ec2net.get(ENV, f"vpc:{vpc_id}")["default_sg_id"]
@@ -514,17 +575,16 @@ def test_describe_instance_attribute_defaults(sink, ec2, stores):
     assert parsed["DisableApiTermination"] == {"Value": False}
 
 
-def test_modify_instance_attribute_is_a_tolerated_stub(sink, ec2, stores):
-    # research §2b: the provider calls this during destroy and TOLERATES a
-    # 400 -- no dedicated handler needed, it falls through to the generic
-    # InvalidAction envelope (ec2compute has no ModifyInstanceAttribute
-    # entry, ec2net doesn't either -- both land on the shared fallback).
+def test_modify_instance_attribute_returns_success(sink, ec2, stores):
+    # Finding #2: ModifyInstanceAttribute is now a real (tolerant) success, not
+    # the old InvalidAction 400 -- the provider calls it during destroy
+    # (DisableApiTermination=false) and on an in-place security-group change;
+    # neither must 400 (the SG case is covered below).
     subnet_id = _subnet(stores, sink, ec2)
     vm = FakeInstanceVm()
     instance_id = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)["Instances"][0]["InstanceId"]
     req = sink.call(lambda: ec2.modify_instance_attribute(InstanceId=instance_id, DisableApiTermination={"Value": False}))
-    response = _answer(stores, req, vm)
-    assert response.status_code == 400
+    assert _answer(stores, req, vm).status_code == 200
 
 
 # --- Key pairs -----------------------------------------------------------------

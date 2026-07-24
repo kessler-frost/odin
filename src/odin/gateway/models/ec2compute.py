@@ -240,7 +240,69 @@ def _not_found_instance(instance_id: str) -> Response:
     return errors.synth_error("ec2", "InvalidInstanceID.NotFound", f"The instance ID '{instance_id}' does not exist", 400)
 
 
-def _instance_xml(instance: dict, tags: dict[str, str]) -> str:
+# --- security groups on the instance (field-test finding #2) ----------------
+
+
+def _eni_id(instance_id: str) -> str:
+    """A deterministic primary-ENI id per instance -- not separately stored
+    (same technique as `_reservation_id`), and reversible so
+    ModifyNetworkInterfaceAttribute can map the ENI back to its instance."""
+    return f"eni-{instance_id.removeprefix('i-')}"
+
+
+def _instance_from_eni(eni_id: str) -> str:
+    return f"i-{eni_id.removeprefix('eni-')}"
+
+
+def _instance_groups(stores: SynthStores, env: str, instance: dict) -> list[tuple[str, str]]:
+    """(group_id, group_name) for the security groups EXPLICITLY attached at
+    RunInstances (an ec2 node's `vpc_security_group_ids`). Empty for an
+    instance launched with none -- it inherits the VPC default SG, which the
+    provider reads as a computed value (no drift), so we emit no group/ENI
+    membership at all and keep the pre-SG DescribeInstances shape byte-for-byte
+    (the existing no-SG zero-drift path is unchanged)."""
+    groups = []
+    for gid in instance.get("security_group_ids") or []:
+        sg = stores.ec2net.get(env, f"sg:{gid}")
+        groups.append((gid, sg["group_name"] if sg else ""))
+    return groups
+
+
+def _group_set_xml(groups: list[tuple[str, str]]) -> str:
+    items = "".join(
+        f"<item><groupId>{escape(gid)}</groupId><groupName>{escape(gname)}</groupName></item>"
+        for gid, gname in groups
+    )
+    return f"<groupSet>{items}</groupSet>"
+
+
+def _network_interface_set_xml(instance: dict, groups: list[tuple[str, str]]) -> str:
+    """The instance's PRIMARY network interface (deviceIndex 0) carrying its
+    security groups. terraform-provider-aws reads `vpc_security_group_ids` for
+    a VPC instance from THIS (the primary NI's Groups), not the top-level
+    groupSet -- and its update path errors 'Failed to update
+    vpc_security_group_ids ... does not contain a primary network interface'
+    when the describe has no primary NI (field-test finding #2). Emitting it
+    (with the launched groups) is what makes a re-apply see zero drift and never
+    reach that update path. Only emitted when groups are present."""
+    instance_id = instance["instance_id"]
+    return (
+        "<networkInterfaceSet><item>"
+        f"<networkInterfaceId>{_eni_id(instance_id)}</networkInterfaceId>"
+        f"<subnetId>{instance.get('subnet_id') or ''}</subnetId>"
+        f"<vpcId>{instance.get('vpc_id') or ''}</vpcId>"
+        "<status>in-use</status>"
+        f"<sourceDestCheck>{_INSTANCE_ATTRIBUTE_DEFAULTS['sourceDestCheck']}</sourceDestCheck>"
+        f"{_group_set_xml(groups)}"
+        "<attachment>"
+        f"<attachmentId>eni-attach-{instance_id.removeprefix('i-')}</attachmentId>"
+        "<deviceIndex>0</deviceIndex><status>attached</status><deleteOnTermination>true</deleteOnTermination>"
+        "</attachment>"
+        "</item></networkInterfaceSet>"
+    )
+
+
+def _instance_xml(instance: dict, tags: dict[str, str], groups: list[tuple[str, str]]) -> str:
     parts = [
         f"<instanceId>{instance['instance_id']}</instanceId>",
         f"<imageId>{escape(instance['image_id'])}</imageId>",
@@ -260,6 +322,11 @@ def _instance_xml(instance: dict, tags: dict[str, str]) -> str:
         parts.append(f"<privateIpAddress>{instance['private_ip']}</privateIpAddress>")
     if instance.get("public_ip"):
         parts.append(f"<ipAddress>{instance['public_ip']}</ipAddress>")
+    if groups:
+        # The instance-level groupSet AND the primary-ENI membership below --
+        # the provider reads the ENI's for a VPC instance, but real AWS carries
+        # both, and emitting neither is exactly what stranded re-apply (finding #2).
+        parts.append(_group_set_xml(groups))
     # sourceDestCheck sits on the Instance shape ITSELF too (not just the
     # separate DescribeInstanceAttribute call) -- found empirically (V3d):
     # omitting it here let the Go SDK default it to `false` on create-time
@@ -274,6 +341,8 @@ def _instance_xml(instance: dict, tags: dict[str, str]) -> str:
         f"<ebs><volumeId>{volume['volume_id']}</volumeId><status>attached</status>"
         "<deleteOnTermination>true</deleteOnTermination></ebs></item></blockDeviceMapping>"
     )
+    if groups:
+        parts.append(_network_interface_set_xml(instance, groups))
     if instance.get("state_reason"):
         reason = instance["state_reason"]
         parts.append(f"<stateReason><code>{escape(reason['code'])}</code><message>{escape(reason['message'])}</message></stateReason>")
@@ -296,10 +365,14 @@ def _reservation_inner_xml(stores: SynthStores, env: str, instance: dict) -> str
     DescribeInstances wraps N of these in `<reservationSet><item>...`. v1
     never groups multiple instances under one reservation (MinCount=MaxCount
     =1), so this always covers exactly one instance."""
+    # The RESERVATION-level groupSet stays empty (real AWS's shape for a VPC
+    # instance -- group membership rides the instance-level groupSet + the
+    # primary ENI, both built inside `_instance_xml` from these `groups`).
+    groups = _instance_groups(stores, env, instance)
     return (
         f"<reservationId>{_reservation_id(instance['instance_id'])}</reservationId>"
         f"<ownerId>{ACCOUNT}</ownerId><groupSet/>"
-        f"<instancesSet><item>{_instance_xml(instance, _res_tags(stores, env, instance['instance_id']))}</item></instancesSet>"
+        f"<instancesSet><item>{_instance_xml(instance, _res_tags(stores, env, instance['instance_id']), groups)}</item></instancesSet>"
     )
 
 
@@ -508,6 +581,12 @@ def _run_instances(params: dict[str, str], env: str, stores: SynthStores, now: f
     az = subnet["availability_zone"] if subnet else f"{REGION}a"
     launch_time = _now_iso()
     user_data_b64 = params.get("UserData", "")
+    # field-test finding #2: the security groups the canvas' `vpc_security_group_ids`
+    # drives (RunInstances `SecurityGroupId.N`). Stored so DescribeInstances can
+    # reflect them on the instance's primary ENI -> zero drift on re-apply. An
+    # instance launched with none keeps `[]` and inherits the VPC default SG for
+    # its Nebula firewall exactly as before.
+    security_group_ids = _scalars(params, "SecurityGroupId")
 
     instance = {
         "instance_id": instance_id,
@@ -516,6 +595,7 @@ def _run_instances(params: dict[str, str], env: str, stores: SynthStores, now: f
         "key_name": key_name,
         "subnet_id": subnet_id or None,
         "vpc_id": vpc["vpc_id"] if vpc else None,
+        "security_group_ids": security_group_ids,
         "state_name": "pending",
         "state_reason": None,
         "private_ip": None,
@@ -625,6 +705,37 @@ def _start_instances(params: dict[str, str], env: str, stores: SynthStores, now:
         changes.append((instance_id, previous, "pending"))
     items = "".join(_state_change_xml(i, p, c) for i, p, c in changes)
     return _response("StartInstances", f"<instancesSet>{items}</instancesSet>")
+
+
+# --- in-place attribute edits (field-test finding #2) ----------------------
+
+
+def _modify_instance_attribute(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+    """A real, tolerant success (was an InvalidAction 400 the provider merely
+    tolerated). The provider calls this during destroy (DisableApiTermination
+    =false) and CAN carry an in-place security-group change (`GroupId.N`); the
+    latter updates the stored set so the next describe -- and any re-apply --
+    reflects it with no drift."""
+    instance_id = params.get("InstanceId", "")
+    if _instance(stores, env, instance_id) is None:
+        return _not_found_instance(instance_id)
+    group_ids = _scalars(params, "GroupId")
+    if group_ids:
+        _update_instance(stores, env, instance_id, security_group_ids=group_ids)
+    return _response("ModifyInstanceAttribute", "<return>true</return>")
+
+
+def _modify_network_interface_attribute(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+    """The call terraform-provider-aws actually makes to change a VPC
+    instance's `vpc_security_group_ids` (on the primary ENI). Maps the ENI id
+    back to its instance and updates the stored set, so a canvas security-group
+    change re-applies cleanly instead of stranding on the next plan."""
+    eni_id = params.get("NetworkInterfaceId", "")
+    instance_id = _instance_from_eni(eni_id)
+    group_ids = _scalars(params, "SecurityGroupId")
+    if group_ids and _instance(stores, env, instance_id) is not None:
+        _update_instance(stores, env, instance_id, security_group_ids=group_ids)
+    return _response("ModifyNetworkInterfaceAttribute", "<return>true</return>")
 
 
 # --- read-only hydration describes (research §2b) --------------------------
@@ -815,6 +926,8 @@ _HANDLERS: dict[str, _Handler] = {
     "TerminateInstances": _terminate_instances,
     "StopInstances": _stop_instances,
     "StartInstances": _start_instances,
+    "ModifyInstanceAttribute": _modify_instance_attribute,
+    "ModifyNetworkInterfaceAttribute": _modify_network_interface_attribute,
     "DescribeInstanceTypes": _describe_instance_types,
     "DescribeInstanceAttribute": _describe_instance_attribute,
     "DescribeInstanceCreditSpecifications": _describe_instance_credit_specifications,
