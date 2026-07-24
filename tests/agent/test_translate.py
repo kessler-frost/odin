@@ -248,6 +248,23 @@ async def test_binary_files_survive_a_successful_refinement():
     assert result.binary_files == skeleton.binary_files
 
 
+def test_for_display_drops_binary_files_and_is_json_serializable():
+    # Release finding #1: the /translate response projection must exclude the
+    # raw zip bytes (non-UTF8 -> not JSON-serializable) that broke the route
+    # for every Lambda canvas, while keeping the .tf text + metadata.
+    import json
+
+    result = translate_mod.TranslateResult(
+        files={"main.tf": "resource {}"}, notes=["n"], unsupported=["rds"], refined=True,
+        binary_files={"fn.zip": b"PK\x03\x04\xff\xfe not utf-8"},
+    )
+    display = result.for_display()
+    assert "binary_files" not in display
+    assert display == {"files": {"main.tf": "resource {}"}, "notes": ["n"], "unsupported": ["rds"], "refined": True}
+    json.dumps(display)  # must not raise -- the whole point of the fix
+    assert result.binary_files  # the object still carries the bytes /apply-full needs
+
+
 @pytest.mark.skipif(_NO_TOFU, reason="tofu not on PATH")
 async def test_happy_path_refinement_is_kept():
     skeleton = generate_tf(_S3_STACK).files["main.tf"]

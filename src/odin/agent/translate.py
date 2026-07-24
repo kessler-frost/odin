@@ -87,6 +87,15 @@ class TranslateResult(BaseModel):
     # it, so every return path below carries the skeleton's copy verbatim.
     binary_files: dict[str, bytes] = {}
 
+    def for_display(self) -> dict:
+        """The read-only `/translate` HTTP response shape (release finding #1).
+        `binary_files` (a lambda's zip'd package, raw non-UTF8 bytes) is NOT
+        JSON-serializable and the code panel / `odin translate` never need it --
+        only /apply-full does, and it reads them off this object directly, never
+        through this projection. Excluding them here is what keeps a Lambda
+        canvas's `/translate` from 500-ing on serialization."""
+        return self.model_dump(exclude={"binary_files"})
+
 
 def make_emit_tool(collector: list[dict]) -> SdkMcpTool:
     """The ONE typed tool the agent may call. `collector` accumulates every

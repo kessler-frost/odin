@@ -217,7 +217,9 @@ def create_tf_router(
         Stack)."""
         stack = canvas_to_stack(graph.model_dump(), env=env) if graph is not None else store.get_stack(env)
         result = await translate_mod.translate(stack, cache=translate_cache)
-        return result.model_dump()
+        # Release finding #1: strip the (non-JSON-serializable) lambda zip bytes
+        # -- the code panel needs only the .tf text + notes/unsupported/refined.
+        return result.for_display()
 
     @router.post("/import-tf")
     async def import_tf_route(body: ImportTfRequest, env: str = ENV) -> dict:
