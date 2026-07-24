@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Remove MiniStack; back `rds`/`s3`/`sqs`/`sns`/`dynamodb` nodes with real OSS containers run by allfather's own reconciler.
+**Goal:** Remove MiniStack; back `rds`/`s3`/`sqs`/`sns`/`dynamodb` nodes with real OSS containers run by odin's own reconciler.
 
 **Architecture:** The Reconciler already talks to AWS-ish machinery only via three injected objects (`_rds`, `_aws`, `_aws_env`). We build direct-container replacements (`PostgresRds`, `BackingAws`), then flip `server.py` wiring, rename the action, extend supervision, and delete the emulator. Spec: `docs/superpowers/specs/2026-07-22-v030-real-backings-design.md`.
 
@@ -15,8 +15,8 @@
 - Permissive licenses only for backings (Apache-2.0/MIT/BSD/MPL — NO AGPL, no proprietary dev-only licenses).
 - Unit suite must stay green after every task: `uv run pytest -q` (integration excluded by default via `addopts`).
 - Integration tests marked `@pytest.mark.integration` / `pytestmark = pytest.mark.integration`; run explicitly `uv run pytest -m integration -q <file>`.
-- Every container carries the `allfather=1` label (ColimaRuntime adds it) and is torn down by the test that made it; `docker ps -aq --filter label=allfather=1 | xargs -r docker rm -f` must show nothing left after a test session.
-- Container naming: `allfather-rds-{env}-{id}` for rds, `allfather-aws-{svc}-{env}` for shared backings.
+- Every container carries the `odin=1` label (ColimaRuntime adds it) and is torn down by the test that made it; `docker ps -aq --filter label=odin=1 | xargs -r docker rm -f` must show nothing left after a test session.
+- Container naming: `odin-rds-{env}-{id}` for rds, `odin-aws-{svc}-{env}` for shared backings.
 - Containers reach the host at `host.docker.internal` (the runtime adds the host-gateway mapping); published facts that containers consume must use it, host-side probes use `127.0.0.1`.
 - Commit after every task (conventional commits); do NOT push until the controller says so.
 
@@ -35,7 +35,7 @@
   `create_db(self, db_id: str, user: str, password: str) -> None`,
   `delete_db(self, db_id: str) -> None`,
   `endpoint(self, db_id: str) -> tuple[str, int] | None`,
-  `container_name(self, db_id: str) -> str` (= `f"allfather-rds-{self._env}-{db_id}"`).
+  `container_name(self, db_id: str) -> str` (= `f"odin-rds-{self._env}-{db_id}"`).
   Exact drop-in for how the Reconciler already calls `_rds` (see `reconciler.py:139-161,197-209`).
 
 - [ ] **Step 1: Read the two consumer/pattern files**
@@ -82,14 +82,14 @@ class FakeRuntime:
 
 def test_container_name_is_env_scoped():
     rds = PostgresRds(FakeRuntime(), env="staging")
-    assert rds.container_name("db") == "allfather-rds-staging-db"
+    assert rds.container_name("db") == "odin-rds-staging-db"
 
 
 def test_create_db_runs_postgres_with_creds_and_dynamic_port():
     rt = FakeRuntime()
     PostgresRds(rt, env="default").create_db("db", "app", "s3cret")
     spec = rt.runs[0]
-    assert spec.name == "allfather-rds-default-db"
+    assert spec.name == "odin-rds-default-db"
     assert spec.image.startswith("postgres:16")
     assert spec.env["POSTGRES_USER"] == "app"
     assert spec.env["POSTGRES_PASSWORD"] == "s3cret"
@@ -117,7 +117,7 @@ def test_delete_db_stops_container():
     rds = PostgresRds(rt)
     rds.create_db("db", "app", "pw")
     rds.delete_db("db")
-    assert rt.stopped == ["allfather-rds-default-db"]
+    assert rt.stopped == ["odin-rds-default-db"]
     assert rds.endpoint("db") is None
 ```
 
@@ -146,7 +146,7 @@ class PostgresRds:
         self._env = env
 
     def container_name(self, db_id: str) -> str:
-        return f"allfather-rds-{self._env}-{db_id}"
+        return f"odin-rds-{self._env}-{db_id}"
 
     def create_db(self, db_id: str, user: str, password: str) -> None:
         name = self.container_name(db_id)
@@ -158,7 +158,7 @@ class PostgresRds:
             image=POSTGRES_IMAGE,
             env={"POSTGRES_USER": user, "POSTGRES_PASSWORD": password},
             ports={5432: 0},
-            labels={"allfather-env": self._env},
+            labels={"odin-env": self._env},
         ))
 
     def delete_db(self, db_id: str) -> None:
@@ -227,7 +227,7 @@ Adjust the final status assertion to whatever `ColimaRuntime.status` actually re
 - [ ] **Step 7: Run the integration test for real (Colima is running)**
 
 Run: `uv run pytest -m integration tests/aws/test_rds_postgres.py -q`
-Expected: 1 passed (~10-60s). Then verify no leftovers: `docker ps -a --filter label=allfather=1 --format '{{.Names}}'` prints nothing from this test.
+Expected: 1 passed (~10-60s). Then verify no leftovers: `docker ps -a --filter label=odin=1 --format '{{.Names}}'` prints nothing from this test.
 
 - [ ] **Step 8: Commit**
 
@@ -257,14 +257,14 @@ git commit -m "feat(aws): PostgresRds — rds nodes as direct Postgres container
   `gc(active_kinds: set[str]) -> None`,
   `client(service: str)` (host-side boto3 client for tests/e2e),
   `ensure_backing(service: str) -> None`,
-  plus module constants `PROVISIONED = ("s3", "sqs", "sns", "dynamodb")`, `ACCESS_KEY = "allfather"`, `SECRET_KEY = "allfather-secret-key"`, `REGION = "us-east-1"`, `ACCOUNT = "000000000000"`.
+  plus module constants `PROVISIONED = ("s3", "sqs", "sns", "dynamodb")`, `ACCESS_KEY = "odin"`, `SECRET_KEY = "odin-secret-key"`, `REGION = "us-east-1"`, `ACCOUNT = "000000000000"`.
 
 **The registry (verified values — do not substitute images or versions):**
 
 ```python
 @dataclass(frozen=True)
 class BackingDef:
-    name: str                  # container name suffix: allfather-aws-{name}-{env}
+    name: str                  # container name suffix: odin-aws-{name}-{env}
     image: str
     port: int                  # container port of the wire API
     env: dict[str, str]
@@ -285,7 +285,7 @@ BACKINGS: tuple[BackingDef, ...] = (
 ```
 
 **Behaviors:**
-- `_backing_for(service)`: the def whose `kinds` contains the service. Container name `f"allfather-aws-{d.name}-{env}"`, labels `{"allfather-env": env}`.
+- `_backing_for(service)`: the def whose `kinds` contains the service. Container name `f"odin-aws-{d.name}-{env}"`, labels `{"odin-env": env}`.
 - `ensure_backing(service)`: if `status == "running"` → return. Else `stop(name)` (clear remnant), for goaws first write the config file `root/{env}/goaws.yaml` (mkdir parents) and mount `volumes={str((root/env).resolve()): "/conf"}` — `.odin/` is under the repo CWD which is under `$HOME`, the only tree Colima shares into the VM (macOS `/tmp` is NOT mounted — a `/tmp` mount silently yields a missing file and goaws then emits junk ARNs). Then `run_container` with `ports={d.port: 0}`, then poll `_probe(service)` (a cheap client call: s3 `list_buckets`, sqs `list_queues`, sns `list_topics`, dynamodb `list_tables`) every 1s until success, deadline 120s (dynalite's npx fetch + image pulls). Raise RuntimeError with the container's `logs` tail on timeout.
 - goaws.yaml content (write exactly this — the key casing and quoting were verified live; the `Local` top-level key matches the positional `Local` in `command`):
   ```yaml
@@ -305,7 +305,7 @@ BACKINGS: tuple[BackingDef, ...] = (
 - `deprovision`: best-effort per service (s3 `delete_bucket`; sqs `delete_queue(QueueUrl=get_queue_url(...))`; sns `delete_topic(TopicArn=constructed arn)`; dynamodb `delete_table`), swallow `ClientError`/`BotoCoreError` exactly like the old code.
 - `gc(active_kinds)`: for each def with `set(d.kinds).isdisjoint(active_kinds)` → `self._rt.stop(cname)` (stop is idempotent on absent names).
 
-- [ ] **Step 1: Failing unit tests** (`tests/aws/test_backings.py`) with a `FakeRuntime` (same shape as `tests/aws/test_rds_postgres.py`'s) and a fake client factory recording calls: (a) `ensure_backing("s3")` runs `rustfs/rustfs:latest` with creds env, dynamic port `{9000: 0}`, name `allfather-aws-rustfs-default`; second call while running → one run; (b) `ensure_backing("sqs")` and `("sns")` both target the SAME container name `allfather-aws-goaws-<env>` and write `goaws.yaml` under `root/env/` containing the exact line `AccountId: "000000000000"` + mount `{abs path: "/conf"}` (use `tmp_path` as root); (c) `provision("sns", "alerts", subscriptions=("jobs",))` — the fake sns client returns `{"TopicArn": "arn:fake:alerts"}` from `create_topic` and the fake sqs client returns a QueueUrl from `create_queue` and `{"Attributes": {"QueueArn": "arn:fake:jobs"}}` from `get_queue_attributes`; assert `subscribe` was called with `TopicArn="arn:fake:alerts"`, `Protocol="sqs"`, `Endpoint="arn:fake:jobs"`, `Attributes={"RawMessageDelivery": "true"}` (i.e. RETURNED values are used, never constructed ones); (d) `exists` False when container not running (no client call made — assert factory not invoked); (e) `facts` shapes for all four kinds exactly as specified; (f) `aws_env` lists `_SQS` and `_SNS` when only goaws runs + always the three cred/region vars; (g) `gc({"s3"})` stops goaws + dynalite but not rustfs; `gc(set())` stops everything; (h) `ContainerSpec.volumes` → `run_container` emits `-v host:container` (extend the existing colima unit tests where run_container args are asserted — find them with `grep -rn "run_container" tests/runtime/`).
+- [ ] **Step 1: Failing unit tests** (`tests/aws/test_backings.py`) with a `FakeRuntime` (same shape as `tests/aws/test_rds_postgres.py`'s) and a fake client factory recording calls: (a) `ensure_backing("s3")` runs `rustfs/rustfs:latest` with creds env, dynamic port `{9000: 0}`, name `odin-aws-rustfs-default`; second call while running → one run; (b) `ensure_backing("sqs")` and `("sns")` both target the SAME container name `odin-aws-goaws-<env>` and write `goaws.yaml` under `root/env/` containing the exact line `AccountId: "000000000000"` + mount `{abs path: "/conf"}` (use `tmp_path` as root); (c) `provision("sns", "alerts", subscriptions=("jobs",))` — the fake sns client returns `{"TopicArn": "arn:fake:alerts"}` from `create_topic` and the fake sqs client returns a QueueUrl from `create_queue` and `{"Attributes": {"QueueArn": "arn:fake:jobs"}}` from `get_queue_attributes`; assert `subscribe` was called with `TopicArn="arn:fake:alerts"`, `Protocol="sqs"`, `Endpoint="arn:fake:jobs"`, `Attributes={"RawMessageDelivery": "true"}` (i.e. RETURNED values are used, never constructed ones); (d) `exists` False when container not running (no client call made — assert factory not invoked); (e) `facts` shapes for all four kinds exactly as specified; (f) `aws_env` lists `_SQS` and `_SNS` when only goaws runs + always the three cred/region vars; (g) `gc({"s3"})` stops goaws + dynalite but not rustfs; `gc(set())` stops everything; (h) `ContainerSpec.volumes` → `run_container` emits `-v host:container` (extend the existing colima unit tests where run_container args are asserted — find them with `grep -rn "run_container" tests/runtime/`).
 - [ ] **Step 2:** `uv run pytest tests/aws/test_backings.py -q` → fails (no module).
 - [ ] **Step 3:** Implement `backings.py` + the `ContainerSpec.volumes` extension.
 - [ ] **Step 4:** `uv run pytest tests/aws/test_backings.py tests/runtime/ -q` green; `uv run pytest -q` green; `uv run ruff check .` clean.
@@ -327,16 +327,16 @@ BACKINGS: tuple[BackingDef, ...] = (
 **What must pass (run each; fix code until green):**
 1. `test_provision_e2e.py`: s3 node "uploads" → healthy; `BackingAws(runtime, "default").client("s3").list_buckets()` shows `uploads`.
 2. `test_skeleton_e2e.py` + `test_multikind_e2e.py`: unchanged intent (rds+service gating, multi-kind) on the new wiring.
-3. `test_aws_usable_e2e.py`: batch node on `amazon/aws-cli` runs `s3 mb s3://allfather-test` with ONLY the injected env (now `AWS_ENDPOINT_URL_S3`) → done; host-side client sees the bucket.
-4. New `test_backings_e2e.py` (all `pytestmark = pytest.mark.integration`, each test tears down via `/destroy` and asserts `runtime.list_allfather() == []`):
+3. `test_aws_usable_e2e.py`: batch node on `amazon/aws-cli` runs `s3 mb s3://odin-test` with ONLY the injected env (now `AWS_ENDPOINT_URL_S3`) → done; host-side client sees the bucket.
+4. New `test_backings_e2e.py` (all `pytestmark = pytest.mark.integration`, each test tears down via `/destroy` and asserts `runtime.list_odin() == []`):
    - `test_sqs_roundtrip`: sqs node "jobs" → healthy with `QUEUE_URL` fact; host client `send_message`/`receive_message` roundtrips a body.
    - `test_sns_to_sqs_delivery`: canvas has sns "alerts", sqs "jobs", edge alerts→jobs; both healthy; **assert the topic ARN fact contains `:000000000000:`** (the goaws-config canary); publish "ping" to the TOPIC_ARN via host client → receive from jobs queue → body == "ping" (raw delivery). Then RE-provision with TWO subscription queues (reviewer finding: the single try-block in `BackingAws.provision` means an "Exist"-class error on the first subscribe could skip the second — verify goaws re-subscribe is tolerant and both queues receive a published message; if not, narrow the try in `backings.py` to per-call scope and assert both deliveries).
    - `test_dynamodb_put_get`: dynamodb node "sessions" → healthy; put_item/get_item roundtrip via host client.
-   - `test_env_isolation`: same s3 node label "uploads" applied in env `a` and env `b` → `docker ps` shows `allfather-aws-rustfs-a` AND `allfather-aws-rustfs-b`; bucket exists in each env's client; `/destroy?env=a` kills only `a`'s backings (gc) while `b` stays healthy; then destroy `b`.
-   - `test_backing_crash_recovers`: s3 node healthy → `docker rm -f allfather-aws-rustfs-default` → node phase leaves `healthy` (crashed) within ~10s → returns to healthy (reconciler re-provisions; ensure_backing reboots RustFS) → bucket exists again.
+   - `test_env_isolation`: same s3 node label "uploads" applied in env `a` and env `b` → `docker ps` shows `odin-aws-rustfs-a` AND `odin-aws-rustfs-b`; bucket exists in each env's client; `/destroy?env=a` kills only `a`'s backings (gc) while `b` stays healthy; then destroy `b`.
+   - `test_backing_crash_recovers`: s3 node healthy → `docker rm -f odin-aws-rustfs-default` → node phase leaves `healthy` (crashed) within ~10s → returns to healthy (reconciler re-provisions; ensure_backing reboots RustFS) → bucket exists again.
 5. The Task 1 integration test still green (`tests/aws/test_rds_postgres.py`).
 
-**Sequencing note:** run files one at a time (`uv run pytest -m integration <file> -q`); these boot real containers — after EACH file assert `docker ps -aq --filter label=allfather=1` is empty before the next.
+**Sequencing note:** run files one at a time (`uv run pytest -m integration <file> -q`); these boot real containers — after EACH file assert `docker ps -aq --filter label=odin=1` is empty before the next.
 
 - [ ] **Step 1:** Run e2e files 1-3, fix reality gaps (expect goaws yaml casing and probe timing to be the likely culprits; the canary assertion tells you fast).
 - [ ] **Step 2:** Write + run the five new tests in `test_backings_e2e.py` one by one.
@@ -356,7 +356,7 @@ BACKINGS: tuple[BackingDef, ...] = (
 - Modify: `src/odin/aws/rds.py` (delete `MiniStackRds`; `PostgresRds` remains — move the `CONTAINER_HOST = "host.docker.internal"` constant into `src/odin/runtime/colima.py` and import it from there everywhere)
 - Modify: `src/odin/aws/provision.py` (delete `MiniStackAws`; keep `PROVISIONED`; `BackingAws` from Task 2 lives in `src/odin/aws/backings.py` — `provision.py` re-exports `PROVISIONED` only, or fold `PROVISIONED` into `backings.py` and update the two importers `plan.py`/`reconciler.py`; choose the fold — delete `provision.py`)
 - Delete: `src/odin/aws/embed.py`, `src/odin/runtime/shim.py`, `src/odin/aws/catalog_gen.py`, `tests/aws/test_embed.py`, `tests/aws/test_catalog_gen.py`, `tests/aws/test_rds_rewire.py` (superseded by `tests/aws/test_rds_postgres.py`)
-- Modify: `pyproject.toml` (remove `ministack` dependency; project description → "allfather: a Mac-native, AI-operated orchestration canvas. Draw apps, deps, jobs, LLMs and AWS-shaped resources; a control loop runs them for real on Colima/Lima with real open-source backings.")
+- Modify: `pyproject.toml` (remove `ministack` dependency; project description → "odin: a Mac-native, AI-operated orchestration canvas. Draw apps, deps, jobs, LLMs and AWS-shaped resources; a control loop runs them for real on Colima/Lima with real open-source backings.")
 - Modify: `src/odin/__main__.py` + `src/odin/server.py` docstrings that mention MiniStack
 - Test-modify (unit, must stay green): `tests/reconcile/test_plan.py`, `tests/reconcile/test_reconciler.py`, `tests/api/test_apply.py`, `tests/api/test_environments.py`, `tests/conftest.py` (docstring)
 - Test-modify (integration, must IMPORT cleanly — execution happens in Task 4): `tests/aws/test_provision_e2e.py`, `tests/aws/test_skeleton_e2e.py`, `tests/aws/test_multikind_e2e.py`, `tests/aws/test_aws_usable_e2e.py`
@@ -377,7 +377,7 @@ BACKINGS: tuple[BackingDef, ...] = (
 
 **Unit-test changes (exact):**
 - `test_plan.py`: `CreateMiniStackResource` → `ProvisionResource` (3 sites per the coverage map: lines ~5, 34, 114).
-- `test_reconciler.py`: `FakeRds.container_name` → `f"allfather-rds-default-{db_id}"` and the crash-injection string at ~line 237 likewise; `test_aws_env_injected_into_app_containers` → build the Reconciler with a `FakeAws` (new tiny fake in that file: `aws_env()` returns `{"AWS_ENDPOINT_URL_S3": "http://host.docker.internal:9000", "AWS_ACCESS_KEY_ID": "allfather", "AWS_SECRET_ACCESS_KEY": "allfather-secret", "AWS_DEFAULT_REGION": "us-east-1"}`, `gc()` records calls, `provision/exists/deprovision/facts` minimal) and assert the spec env got those keys + DATABASE_URL still starts `postgresql://`; add one new test: after a tick with an empty stack, `FakeAws.gc` was called with `set()`.
+- `test_reconciler.py`: `FakeRds.container_name` → `f"odin-rds-default-{db_id}"` and the crash-injection string at ~line 237 likewise; `test_aws_env_injected_into_app_containers` → build the Reconciler with a `FakeAws` (new tiny fake in that file: `aws_env()` returns `{"AWS_ENDPOINT_URL_S3": "http://host.docker.internal:9000", "AWS_ACCESS_KEY_ID": "odin", "AWS_SECRET_ACCESS_KEY": "odin-secret", "AWS_DEFAULT_REGION": "us-east-1"}`, `gc()` records calls, `provision/exists/deprovision/facts` minimal) and assert the spec env got those keys + DATABASE_URL still starts `postgresql://`; add one new test: after a tick with an empty stack, `FakeAws.gc` was called with `set()`.
 - `test_apply.py`: `embed=False` → `backings=False` (4 sites); `FakeRds.container_name` string rename.
 - `test_environments.py`: replace the `account_for_env` import/assertions with: two envs, same `s3` node label, `backings=False` + per-env `FakeAws` instances recorded distinct — assert each env's reconciler got its OWN aws object (identity check via `app.state.reconcilers`), and no cross-env World leakage (existing world-scoping assertions stay).
 - Integration files: swap `ministack_boto_client(...)` for boto3 clients built from `BackingAws(runtime, env).client(service)` (Task 2 provides `client(service)` returning a host-side boto3 client for that backing) and `create_app(embed=True)` → `create_app()` — compile-correct now, executed in Task 4.

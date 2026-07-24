@@ -164,9 +164,9 @@ future decision against these points instead of re-deriving them:
 
 ## Deprecated 2026-07-22 (superseded by NORTHSTAR.md)
 
-Everything below this line described **allfather**, a local-only "Railway,
+Everything below this line described **odin**, a local-only "Railway,
 but with a brain" app orchestrator — the product identity before the owner's
-2026-07-22 pivot back to odin being an AWS-compatible core. The app-workload
+2026-07-22 pivot to an AWS-compatible core. The app-workload
 layer it describes (service/dep/batch/llm node kinds, the memory-aware
 scheduler, the per-kind probe registry, the claude-agent-sdk config-completion
 brain) has been ripped from live code and parked at git tag
@@ -175,7 +175,7 @@ Kept below for history, not as current direction.
 
 ### Direction (2026-06-23): local-only pivot (superseded)
 
-**allfather is going local-only.** We're dropping the ambition to maintain AWS /
+**odin is going local-only.** We're dropping the ambition to maintain AWS /
 cloud resources. The actual use cases are personal + friends/family, the local
 machine is plenty, and the intelligence runs locally too — so there's no reason
 to cater to cloud/AWS users.
@@ -184,18 +184,18 @@ What this means:
 - **Drop the AWS-emulation story.** MiniStack (the embedded AWS control plane),
   the Pulumi-for-AWS infra layer we were mid-designing, the real-AWS↔local
   switching, and the whole infra-vs-app layering question — none of it.
-  allfather is not an AWS tool. (MiniStack was also just friction.)
+  odin is not an AWS tool. (MiniStack was also just friction.)
 - **Everything is a local container / process.** A "database" is just a Postgres
   container (a `dep` node); a cache is a Redis container; a queue is a real
   local broker (NATS/Redis) — run + supervised by the reconciler directly, with
   no AWS abstraction in front of them.
-- **allfather = a local-first, AI-operated orchestrator** for your Mac (Railway/
+- **odin = a local-first, AI-operated orchestrator** for your Mac (Railway/
   Compose, but with a brain, fully local). Workloads: app services,
   dependencies, batch jobs, local LLMs. Intelligence: local (omlx / local models).
 - **The palette** eventually sheds the AWS nodes (VPC/EC2/S3/SQS/RDS/…) and keeps
   the local primitives (app, dependency, job, LLM, + local volumes / networks).
 
-> The pre-allfather history (Moto/OpenTofu validate, the old Lima+Nebula
+> The earlier history (Moto/OpenTofu validate, the old Lima+Nebula
 > per-EC2 "Simulate" overlay) was **retired and deleted** — 21 source modules +
 > 30 test files removed. Do not resurrect Terraform/Moto/HCL or that old
 > per-VM Nebula overlay. NOTE: this is distinct from the **self-hosted Nebula
@@ -207,7 +207,7 @@ What this means:
 #### Walking skeleton (S0–S3)
 - [x] Spec Store spine — Stack (desired) + World (observed) + append-only, content-addressed, per-env revisions
 - [x] Pure `plan(Stack, World) → [Action]` (total + idempotent) + the Reconciler loop (observe → plan → execute, supervision, ref-gating)
-- [x] MiniStack embedded in-process as the AWS control plane; its container spawn rewired to allfather's runtime (one spawn authority, no double-spawn)
+- [x] MiniStack embedded in-process as the AWS control plane; its container spawn rewired to odin's runtime (one spawn authority, no double-spawn)
 - [x] `ColimaRuntime` behind a `RuntimeDriver` protocol; localhost fabric resolving `${{node.VAR}}` from World facts
 - [x] api + RDS→real-Postgres slice, proven end-to-end (headless + browser)
 
