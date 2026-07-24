@@ -31,6 +31,21 @@ canvas and its configuration.
 > into IaC as well as vice-versa, cuz I want an importing-from-a-TF-project
 > mechanism too.
 
+*Engineering note, as built (audit finding, 2026-07-24 — not a rewording of*
+*the owner's words above, which stay verbatim per this doc's own charter):*
+*both directions of this translation layer are DETERMINISTIC code*
+*(`agent/hcl.py` canvas→TF, `agent/import_tf.py` TF→canvas) — that's what*
+*makes them reliable and testable. `claude-agent-sdk` sits behind an*
+*optional, off-by-default refine pass (`ODIN_TRANSLATE_REFINE`) over the*
+*canvas→TF direction only: it may add comments/tags/unset arguments, and a*
+*deterministic guardrail (resource-set equality + a value-fidelity check —*
+*every argument the skeleton set must survive unchanged) rejects anything*
+*else and falls back to the skeleton, so it is structurally incapable of*
+*being the thing that decides what gets applied. Genuinely agent-shaped work*
+*this layer doesn't do yet, and could: generating HCL for kinds with no*
+*deterministic builder, least-privilege IAM policy synthesis, and import of*
+*unmodeled resource types — roadmap items, not shipped behavior.*
+
 ### 3. Simulate = tofu apply through the gateway
 > Next button I want is **Simulate** — which will generate the code and do
 > `tf apply` — and this apply would go through our gateway which will create
