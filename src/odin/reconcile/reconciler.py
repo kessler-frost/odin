@@ -127,8 +127,8 @@ class Reconciler:
         prune any label that dropped out (tofu destroyed it -- this loop
         never destroys a TF-owned resource itself)."""
         projected = await asyncio.to_thread(project_tf_owned, self._stores, self._env)
-        for label, (kind, phase, facts) in projected.items():
-            await self._emit(label, kind, phase, facts=facts)
+        for label, (kind, phase, facts, verdict) in projected.items():
+            await self._emit(label, kind, phase, facts=facts, verdict=verdict)
         world = self._store.current_world(self._env)
         for observed in world.resources:
             if observed.kind in TF_OWNED_KINDS and observed.id not in projected:
