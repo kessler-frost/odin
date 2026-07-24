@@ -107,13 +107,13 @@ def test_ensure_backing_s3_runs_rustfs_with_creds_and_dynamic_port(rt, factory, 
     aws = _aws(rt, factory, tmp_path)
     aws.ensure_backing("s3")
     spec = rt.runs[0]
-    assert spec.name == "allfather-aws-rustfs-default"
+    assert spec.name == "odin-aws-rustfs-default"
     assert spec.image == "rustfs/rustfs:latest"
     assert spec.env == {"RUSTFS_ACCESS_KEY": ACCESS_KEY, "RUSTFS_SECRET_KEY": SECRET_KEY}
     assert spec.ports == {9000: 0}
-    assert spec.labels == {"allfather-env": "default"}
+    assert spec.labels == {"odin-env": "default"}
     # remnant-clear contract: stop() before run, same as PostgresRds.create_db
-    assert rt.stopped == ["allfather-aws-rustfs-default"]
+    assert rt.stopped == ["odin-aws-rustfs-default"]
 
 
 def test_ensure_backing_is_idempotent_while_running(rt, factory, tmp_path):
@@ -172,7 +172,7 @@ def test_ensure_backing_heals_a_stale_already_in_use_conflict(rt, factory, tmp_p
     heal -- wait for Docker to report the container running, then proceed
     to the readiness probe -- rather than raising."""
     monkeypatch.setattr(backings, "READY_TIMEOUT", 2.0)
-    cname = "allfather-aws-rustfs-default"
+    cname = "odin-aws-rustfs-default"
 
     class ConflictingRuntime(FakeRuntime):
         def run_container(self, spec):
@@ -201,7 +201,7 @@ def test_sqs_and_sns_share_one_goaws_container_with_mounted_config(rt, factory, 
     aws.ensure_backing("sns")
     assert len(rt.runs) == 1
     spec = rt.runs[0]
-    assert spec.name == "allfather-aws-goaws-staging"
+    assert spec.name == "odin-aws-goaws-staging"
     assert spec.image == "admiralpiett/goaws:v0.5.4"
     assert spec.command == ("-config", "/conf/goaws.yaml", "Local")
     # goaws binds its listener to the config's Local.Port (verified against
@@ -230,7 +230,7 @@ def test_goaws_config_uses_the_configured_gateway_port(rt, factory, tmp_path):
 
 def test_ensure_backing_timeout_raises_with_logs(rt, factory, tmp_path, monkeypatch):
     monkeypatch.setattr(backings, "READY_TIMEOUT", 0.0)
-    with pytest.raises(RuntimeError, match="fake logs of allfather-aws-dynalite-default"):
+    with pytest.raises(RuntimeError, match="fake logs of odin-aws-dynalite-default"):
         _aws(rt, factory, tmp_path).ensure_backing("dynamodb")
 
 
@@ -330,9 +330,9 @@ def test_facts_shapes_for_all_four_kinds(rt, factory, tmp_path):
     aws = _aws(rt, factory, tmp_path)
     for service in ("s3", "sqs", "dynamodb"):
         aws.ensure_backing(service)
-    s3_ep = f"http://host.docker.internal:{rt.ports['allfather-aws-rustfs-default']}"
-    goaws_ep = f"http://host.docker.internal:{rt.ports['allfather-aws-goaws-default']}"
-    ddb_ep = f"http://host.docker.internal:{rt.ports['allfather-aws-dynalite-default']}"
+    s3_ep = f"http://host.docker.internal:{rt.ports['odin-aws-rustfs-default']}"
+    goaws_ep = f"http://host.docker.internal:{rt.ports['odin-aws-goaws-default']}"
+    ddb_ep = f"http://host.docker.internal:{rt.ports['odin-aws-dynalite-default']}"
     gateway_ep = f"http://host.docker.internal:{DEFAULT_GATEWAY_PORT}"
     assert aws.facts("s3", "uploads") == {"BUCKET": "uploads", "endpoint": s3_ep}
     # QUEUE_URL is the one fact re-pointed at the gateway (matches goaws.yaml's
@@ -349,9 +349,9 @@ def test_backing_ports_maps_service_to_running_backings_host_port(rt, factory, t
     aws.ensure_backing("s3")
     aws.ensure_backing("sqs")  # goaws also serves sns from the same container
     assert aws.backing_ports() == {
-        "s3": rt.ports["allfather-aws-rustfs-default"],
-        "sqs": rt.ports["allfather-aws-goaws-default"],
-        "sns": rt.ports["allfather-aws-goaws-default"],
+        "s3": rt.ports["odin-aws-rustfs-default"],
+        "sqs": rt.ports["odin-aws-goaws-default"],
+        "sns": rt.ports["odin-aws-goaws-default"],
     }
 
 
@@ -363,7 +363,7 @@ def test_aws_env_yields_sqs_and_sns_from_one_goaws_plus_creds(rt, factory, tmp_p
     aws = _aws(rt, factory, tmp_path)
     aws.ensure_backing("sqs")  # only goaws runs
     env = aws.aws_env()
-    goaws_ep = f"http://host.docker.internal:{rt.ports['allfather-aws-goaws-default']}"
+    goaws_ep = f"http://host.docker.internal:{rt.ports['odin-aws-goaws-default']}"
     assert env["AWS_ENDPOINT_URL_SQS"] == goaws_ep
     assert env["AWS_ENDPOINT_URL_SNS"] == goaws_ep
     assert "AWS_ENDPOINT_URL_S3" not in env
@@ -376,16 +376,16 @@ def test_aws_env_yields_sqs_and_sns_from_one_goaws_plus_creds(rt, factory, tmp_p
 def test_gc_stops_backings_whose_kinds_are_all_inactive(rt, factory, tmp_path):
     _aws(rt, factory, tmp_path).gc({"s3"})
     assert set(rt.stopped) == {
-        "allfather-aws-goaws-default", "allfather-aws-dynalite-default", "allfather-aws-registry-default"}
+        "odin-aws-goaws-default", "odin-aws-dynalite-default", "odin-aws-registry-default"}
 
 
 def test_gc_with_no_active_kinds_stops_everything(rt, factory, tmp_path):
     _aws(rt, factory, tmp_path).gc(set())
     assert set(rt.stopped) == {
-        "allfather-aws-rustfs-default",
-        "allfather-aws-goaws-default",
-        "allfather-aws-dynalite-default",
-        "allfather-aws-registry-default",
+        "odin-aws-rustfs-default",
+        "odin-aws-goaws-default",
+        "odin-aws-dynalite-default",
+        "odin-aws-registry-default",
     }
 
 
@@ -410,7 +410,7 @@ def test_backing_ports_requeries_after_the_ttl_expires(rt, factory, tmp_path, mo
     status_count = len(rt.status_calls)
     now = time.monotonic()
     monkeypatch.setattr(backings.time, "monotonic", lambda: now + backings.PORTS_CACHE_TTL)
-    assert aws.backing_ports() == {"s3": rt.ports["allfather-aws-rustfs-default"]}
+    assert aws.backing_ports() == {"s3": rt.ports["odin-aws-rustfs-default"]}
     assert len(rt.status_calls) > status_count  # expired: swept the runtime for real
 
 
@@ -444,7 +444,7 @@ def test_gc_resweeps_when_the_active_kinds_change(rt, factory, tmp_path):
     aws.gc({"s3", "sqs"})
     swept = len(rt.stopped)
     aws.gc({"s3"})  # goaws just became inactive — must be swept away
-    assert "allfather-aws-goaws-default" in rt.stopped[swept:]
+    assert "odin-aws-goaws-default" in rt.stopped[swept:]
 
 
 def test_gc_resweeps_after_ensure_backing_actually_starts_a_container(rt, factory, tmp_path):
@@ -473,7 +473,7 @@ def test_ensure_backing_ecr_runs_registry_with_dynamic_port(rt, factory, tmp_pat
     aws = _aws(rt, factory, tmp_path)
     aws.ensure_backing("ecr")
     spec = rt.runs[0]
-    assert spec.name == "allfather-aws-registry-default"
+    assert spec.name == "odin-aws-registry-default"
     assert spec.image == "registry:2"
     assert spec.ports == {5000: 0}
     assert spec.env == {}
@@ -490,7 +490,7 @@ def test_ensure_backing_ecr_is_idempotent_while_running(rt, factory, tmp_path):
 def test_backing_ports_includes_ecr_when_running(rt, factory, tmp_path):
     aws = _aws(rt, factory, tmp_path)
     aws.ensure_backing("ecr")
-    assert aws.backing_ports() == {"ecr": rt.ports["allfather-aws-registry-default"]}
+    assert aws.backing_ports() == {"ecr": rt.ports["odin-aws-registry-default"]}
 
 
 def test_gc_keeps_registry_running_while_ecr_is_active(rt, factory, tmp_path):
@@ -499,4 +499,4 @@ def test_gc_keeps_registry_running_while_ecr_is_active(rt, factory, tmp_path):
     # stop() would otherwise pollute rt.stopped before gc() ever runs,
     # matching test_gc_stops_backings_whose_kinds_are_all_inactive's pattern.
     _aws(rt, factory, tmp_path).gc({"ecr"})
-    assert "allfather-aws-registry-default" not in rt.stopped
+    assert "odin-aws-registry-default" not in rt.stopped

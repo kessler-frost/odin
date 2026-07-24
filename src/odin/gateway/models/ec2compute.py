@@ -139,7 +139,7 @@ _TERMINAL_STATES = frozenset({"shutting-down", "terminated"})
 # `compute.instances.vm_name`'s own prefix -- the startup reaper
 # (`reap_orphaned_vms` below) only ever considers a VM shaped like this,
 # never anything else `limactl list` happens to report.
-_VM_NAME_PREFIX = "allfather-ec2-"
+_VM_NAME_PREFIX = "odin-ec2-"
 
 
 def _mint(prefix: str) -> str:
@@ -785,7 +785,7 @@ def reap_orphaned_vms(root: Path, envs: list[str], vm: InstanceVm | None = None)
     Exact-name discipline throughout: the "expected" set is built by
     calling the SAME `vm_name(env, instance_id)` every real creation uses,
     never a prefix/wildcard match on the delete side -- a user's own Lima
-    VM (e.g. `veronica`) or another allfather subsystem's is never even a
+    VM (e.g. `veronica`) or another odin subsystem's is never even a
     candidate, let alone touched. Returns the names of VMs it deleted."""
     vm = vm or InstanceVm()
     stores = SynthStores(root)

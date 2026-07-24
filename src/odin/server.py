@@ -1,4 +1,4 @@
-"""allfather FastAPI app factory.
+"""odin FastAPI app factory.
 
 The canvas authors a desired-state Stack; a continuous Reconciler drives reality
 (real Postgres for rds nodes, and per-env backing containers for the
@@ -515,7 +515,7 @@ def create_app(
                 await reconciler.stop()
             stop_in_thread(gateway_server, gateway_thread)
 
-    app = FastAPI(title="allfather", version=_odin_version(), lifespan=lifespan)
+    app = FastAPI(title="odin", version=_odin_version(), lifespan=lifespan)
     app.include_router(create_canvas_router(CANVAS_PATH))
     app.include_router(
         create_apply_router(_store, reconciler_for, gateway_keystore, tf_runner, lambda: gateway_port_actual, env_epoch)

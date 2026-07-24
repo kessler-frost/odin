@@ -30,7 +30,7 @@ _ODIN_ENV_DIR = Path(".odin") / ENV
 def runtime():
     rt = ColimaRuntime()
     yield rt
-    for cid in rt.list_allfather():
+    for cid in rt.list_odin():
         rt.stop(cid)
     shutil.rmtree(_ODIN_ENV_DIR, ignore_errors=True)
 
@@ -66,4 +66,4 @@ def test_live_import_of_an_out_of_band_bucket_returns_an_s3_node(tmp_path, runti
 
         aws.gc(set())  # stop the backing container -- nothing else owns it for this env
 
-    assert runtime.list_allfather() == []
+    assert runtime.list_odin() == []

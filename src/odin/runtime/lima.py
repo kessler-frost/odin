@@ -1,7 +1,7 @@
 """A second Runtime impl: containers inside a shared Lima VM (VM isolation).
 
 Same interface as ColimaRuntime via the shared `_ContainerRuntime` base — the
-only differences are the CLI seam (`nerdctl` inside one allfather Lima host VM
+only differences are the CLI seam (`nerdctl` inside one odin Lima host VM
 instead of host `docker`) and that it omits Colima's host-gateway flag. Lima
 auto-forwards VM-bound ports to the Mac, so host-side probes and references work
 the same. Heavier than Colima (a VM boot), so it's an opt-in runtime for
@@ -21,7 +21,7 @@ from odin.runtime.colima import HostFacts, _ContainerRuntime
 
 
 class LimaRuntime(_ContainerRuntime):
-    VM = "allfather-host"
+    VM = "odin-host"
 
     def _lima(self, *args: str, check: bool = True, input: str | None = None) -> str:
         proc = self._run(["limactl", *args], input=input)

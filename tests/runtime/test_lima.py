@@ -38,7 +38,7 @@ def test_run_container_goes_through_nerdctl_in_the_vm():
     assert handle.id == "abc123" and handle.name == "job"
 
     run_call = next(c for c in runner.calls if "busybox" in c)
-    assert run_call[:5] == ["limactl", "shell", "allfather-host", "sudo", "nerdctl"]
+    assert run_call[:5] == ["limactl", "shell", "odin-host", "sudo", "nerdctl"]
     assert "-e" in run_call and "K=v" in run_call
     assert "-v" in run_call and "/host/conf:/conf" in run_call
     assert run_call.index("-v") < run_call.index("busybox")  # flags before the image, or nerdctl eats them
@@ -72,7 +72,7 @@ def test_build_pipes_the_dockerfile_through_limactl_shell_into_nerdctl():
 
     build_call = next(c for c in runner.calls if "build" in c)
     assert build_call == [
-        "limactl", "shell", "allfather-host", "sudo", "nerdctl",
+        "limactl", "shell", "odin-host", "sudo", "nerdctl",
         "build", "-t", "odin-dynalite:1", "-",
     ]
     assert runner.inputs == ["FROM node:20-alpine\n"]

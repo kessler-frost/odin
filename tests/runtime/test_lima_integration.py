@@ -13,7 +13,7 @@ from odin.runtime.lima import LimaRuntime
 
 pytestmark = pytest.mark.integration
 
-NAME = "lima-allfather-test"
+NAME = "lima-odin-test"
 
 
 @pytest.fixture

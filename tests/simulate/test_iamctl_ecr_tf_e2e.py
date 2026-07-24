@@ -137,9 +137,9 @@ def test_role_and_repo_apply_push_zero_drift_teardown(tmp_path):
         ecr_after = (store.root / ENV / "gateway" / "ecr.json").read_text()
         assert json.loads(ecr_after) == {}, f"ecr repo orphaned after empty-canvas apply: {ecr_after}"
 
-        ps = _docker("ps", "-a", "--filter", f"name=allfather-aws-registry-{ENV}", "--format", "{{.Names}}")
+        ps = _docker("ps", "-a", "--filter", f"name=odin-aws-registry-{ENV}", "--format", "{{.Names}}")
         assert ps.stdout.strip() == "", f"registry container survived teardown: {ps.stdout}"
 
-    # Belt-and-braces: no allfather-labelled container left for this env.
-    leftover = _docker("ps", "-aq", "--filter", "label=allfather=1", "--filter", f"name={ENV}")
+    # Belt-and-braces: no odin-labelled container left for this env.
+    leftover = _docker("ps", "-aq", "--filter", "label=odin=1", "--filter", f"name={ENV}")
     assert leftover.stdout.strip() == ""

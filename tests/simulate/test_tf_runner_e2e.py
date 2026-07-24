@@ -55,7 +55,7 @@ CANVAS = {
 def runtime():
     rt = ColimaRuntime()
     yield rt
-    for cid in rt.list_allfather():
+    for cid in rt.list_odin():
         rt.stop(cid)
     shutil.rmtree(_ODIN_ENV_DIR, ignore_errors=True)
 
@@ -123,5 +123,5 @@ def test_tf_apply_zero_drift_destroy(tmp_path, runtime):
 
         aws.gc(set())  # stop the backing containers -- nothing else owns them for this env
 
-    assert runtime.list_allfather() == []
+    assert runtime.list_odin() == []
     print(f"\ntofu apply wall time: {wall_apply:.2f}s")

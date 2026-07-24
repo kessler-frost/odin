@@ -11,7 +11,7 @@ Every test boots a real `create_app()` (real ColimaRuntime, real
 BackingAws-provisioned RustFS/goaws/dynalite, real gateway listener on
 ODIN_GATEWAY_PORT=0), applies a canvas, waits for /world healthy, drives
 real boto3/aws-cli SigV4 traffic through the gateway, destroys, and asserts
-zero allfather containers survive. Marked `integration`: needs Colima/Docker
+zero odin containers survive. Marked `integration`: needs Colima/Docker
 with the backing + aws-cli images pulled.
 """
 from __future__ import annotations
@@ -131,7 +131,7 @@ def _run_aws_cli(port: int, access_key: str, secret_key: str, args: list[str]) -
 def runtime():
     rt = ColimaRuntime()
     yield rt
-    for cid in rt.list_allfather():
+    for cid in rt.list_odin():
         rt.stop(cid)
 
 
@@ -161,7 +161,7 @@ def test_edge_grants_and_absence_denies(tmp_path, runtime):
         ), denied
 
         _destroy(client)
-    assert runtime.list_allfather() == []
+    assert runtime.list_odin() == []
 
 
 def test_foreign_env_creds_denied(tmp_path, runtime):
@@ -189,7 +189,7 @@ def test_foreign_env_creds_denied(tmp_path, runtime):
 
         _destroy(client, env="a")
         _destroy(client, env="b")
-    assert runtime.list_allfather() == []
+    assert runtime.list_odin() == []
 
 
 def test_container_crosses_to_gateway(tmp_path, runtime):
@@ -210,7 +210,7 @@ def test_container_crosses_to_gateway(tmp_path, runtime):
         assert "AccessDenied" in denied.stderr
 
         _destroy(client)
-    assert runtime.list_allfather() == []
+    assert runtime.list_odin() == []
 
 
 def test_sqs_sns_dynamodb_through_gateway(tmp_path, runtime):
@@ -262,7 +262,7 @@ def test_sqs_sns_dynamodb_through_gateway(tmp_path, runtime):
         assert ddb_exc.value.response["Error"]["Code"] == "AccessDeniedException"
 
         _destroy(client)
-    assert runtime.list_allfather() == []
+    assert runtime.list_odin() == []
 
 
 def test_latency_overhead(tmp_path, runtime):
@@ -301,4 +301,4 @@ def test_latency_overhead(tmp_path, runtime):
         )
 
         _destroy(client)
-    assert runtime.list_allfather() == []
+    assert runtime.list_odin() == []

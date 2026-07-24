@@ -8,7 +8,7 @@ Q1 license/availability check).
 Shape mirrors `compute/instances.py::InstanceVm` (V3b), not `aws/backings.py`:
 this is a MANY-per-resource binding (one container per function, like one VM
 per EC2 instance), not aws/backings.py's one-shared-container-per-env-per-
--kind shape. Container naming: `allfather-lambda-{env}-{function_name}` --
+-kind shape. Container naming: `odin-lambda-{env}-{function_name}` --
 the ONLY name this module ever passes to the runtime driver.
 
 Readiness (the brief's "REAL readiness, not a timer"): after `run_container`,
@@ -67,7 +67,7 @@ _INVOKE_PATH = "/2015-03-31/functions/function/invocations"
 
 
 def container_name(env: str, function_name: str) -> str:
-    return f"allfather-lambda-{env}-{function_name}"
+    return f"odin-lambda-{env}-{function_name}"
 
 
 @dataclass(frozen=True)
@@ -129,7 +129,7 @@ class FunctionRuntime:
         self._rt.run_container(ContainerSpec(
             name=name, image=image, env=dict(env_vars),
             ports={_RIE_PORT: 0},
-            labels={"allfather-env": env, "allfather-lambda-fn": function_name},
+            labels={"odin-env": env, "odin-lambda-fn": function_name},
             command=(handler,) if handler else (),
             volumes={str(code_dir): "/var/task"},
         ))

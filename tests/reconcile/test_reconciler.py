@@ -66,7 +66,7 @@ class FakeRds:
         return ("127.0.0.1", 15432) if self.available else None
 
     def container_name(self, db_id):
-        return f"allfather-rds-default-{db_id}"
+        return f"odin-rds-default-{db_id}"
 
 
 class FakeAws:
@@ -198,7 +198,7 @@ async def test_rds_crash_clears_record_and_recreates(tmp_path):
     assert store.current_world().get("db").phase == "healthy"
     assert rds.created.count("db") == 1
 
-    rt.set("allfather-rds-default-db", "exited", exit_code=1)  # the DB container dies
+    rt.set("odin-rds-default-db", "exited", exit_code=1)  # the DB container dies
     # one tick: observe sees crashed -> clears the stale record -> plan recreates
     await recon.tick()
     assert rds.available is False             # delete_db was called (the fix)

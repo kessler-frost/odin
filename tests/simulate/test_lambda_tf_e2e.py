@@ -223,12 +223,12 @@ def test_tf_apply_boots_a_real_rie_zero_drift_invoke_destroy(store_root, lambda_
         assert not (store.root / ENV / "gateway" / "lambda" / f"{FUNCTION_NAME}.zip").exists()
         assert not (store.root / ENV / "gateway" / "lambda" / f"{FUNCTION_NAME}-code").exists()
 
-    # Belt-and-braces: no allfather-labelled container left for this env.
+    # Belt-and-braces: no odin-labelled container left for this env.
     # (No anonymous-volume check needed here -- the lambda container uses
     # only a host bind-mount for /var/task, never a docker-managed volume,
     # so there is nothing of that shape for THIS substrate to leak; `stop`'s
     # `-v` flag matters for backings that DO use one, e.g. Postgres.)
-    leftover = _docker("ps", "-aq", "--filter", "label=allfather=1", "--filter", f"name={ENV}")
+    leftover = _docker("ps", "-aq", "--filter", "label=odin=1", "--filter", f"name={ENV}")
     assert leftover.stdout.strip() == ""
 
 

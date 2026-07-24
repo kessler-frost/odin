@@ -1,5 +1,5 @@
 """Shared test fixtures. (The old Moto/OpenTofu fixtures were retired with that
-path; allfather tests use the Spec Store + real Colima backings directly.)"""
+path; odin tests use the Spec Store + real Colima backings directly.)"""
 from __future__ import annotations
 
 import os

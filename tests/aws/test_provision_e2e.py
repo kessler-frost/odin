@@ -17,7 +17,7 @@ CANVAS = {"nodes": [{"type": "s3", "data": {"label": "uploads"}}], "edges": []}
 def runtime():
     rt = ColimaRuntime()
     yield rt
-    for cid in rt.list_allfather():
+    for cid in rt.list_odin():
         rt.stop(cid)
 
 
