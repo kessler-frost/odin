@@ -214,7 +214,7 @@ def _update_function(stores: SynthStores, env: str, name: str, **fields: object)
 def _finish_deploy(
     stores: SynthStores, env: str, name: str, runtime: str, handler: str,
     env_vars: dict[str, str], code_dir: Path, substrate: FunctionRuntime,
-    keystore: KeyStore | None = None, gateway_port: int | None = None,
+    keystore: KeyStore | None = None, gateway_port: int | None = None, memory_mib: int | None = None,
 ) -> None:
     # Workload credential injection (fix-wave 2b): resolve the function's own
     # canvas label from its `odin:node` tag (stamped by hcl.py's `_tags_block`
@@ -233,7 +233,7 @@ def _finish_deploy(
     # propagate an exception to -- see ec2compute.py's `_finish_boot` for
     # the identical "silent hang is forbidden" reasoning.
     try:
-        substrate.ensure(env, name, runtime, handler, container_env, code_dir)
+        substrate.ensure(env, name, runtime, handler, container_env, code_dir, memory_mib=memory_mib)
     except Exception as exc:
         log.warning("lambda container failed for function %s (env %s): %s", name, env, exc)
         _update_function(
@@ -314,7 +314,10 @@ def _create_function(resource: str, env: str, body: bytes, stores: SynthStores, 
     # suite), not a test artifact. Same fix ec2compute.py's RunInstances
     # already documents for the identical shape.
     response = _json(201, _configuration_json(fn))
-    _spawn(_finish_deploy, stores, env, name, runtime, handler, env_vars, code_dir, substrate, keystore, gateway_port)
+    _spawn(
+        _finish_deploy, stores, env, name, runtime, handler, env_vars, code_dir, substrate,
+        keystore, gateway_port, fn["memory_size"],
+    )
     return response
 
 
@@ -376,7 +379,7 @@ def _redeploy_response(
     response = _json(200, _configuration_json(fn))
     _spawn(
         _finish_deploy, stores, env, name, fn["runtime"], fn["handler"], fn["environment"], code_dir, substrate,
-        keystore, gateway_port,
+        keystore, gateway_port, fn["memory_size"],
     )
     return response
 

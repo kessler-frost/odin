@@ -115,14 +115,20 @@ class FunctionRuntime:
 
     def ensure(
         self, env: str, function_name: str, runtime: str, handler: str,
-        env_vars: dict[str, str], code_dir: Path,
+        env_vars: dict[str, str], code_dir: Path, memory_mib: int | None = None,
     ) -> int:
         """(Re)create the function's container from `code_dir` and block
         until its RIE answers -- the caller (lambdactl.py's background
         thread) is the one already off the request path. Returns the host
         port RIE published on. Raises on a boot/readiness failure; the
         caller turns that into the function's terminal `Failed` state,
-        never a silent hang (same contract as `InstanceVm.boot`)."""
+        never a silent hang (same contract as `InstanceVm.boot`).
+
+        `memory_mib` (owner directive B4): the function's own real
+        `MemorySize` (lambdactl.py always sets one -- `_DEFAULT_MEMORY`, 128,
+        when CreateFunction didn't) -- capped onto the REAL container so a
+        runaway handler can't eat the host; `None` (a caller that predates
+        this) leaves the container unbounded, same as before."""
         name = container_name(env, function_name)
         self._rt.stop(name)  # clear any exited remnant (UpdateFunctionCode redeploy, or a stale prior run)
         image = RUNTIME_IMAGES.get(runtime, RUNTIME_IMAGES[DEFAULT_RUNTIME])
@@ -132,6 +138,7 @@ class FunctionRuntime:
             labels={"odin-env": env, "odin-lambda-fn": function_name},
             command=(handler,) if handler else (),
             volumes={str(code_dir): "/var/task"},
+            memory_mib=float(memory_mib) if memory_mib else None,
         ))
         return self._await_ready(name)
 

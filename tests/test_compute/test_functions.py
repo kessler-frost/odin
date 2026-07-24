@@ -159,6 +159,28 @@ def test_ensure_falls_back_to_the_default_image_for_an_unknown_runtime(tmp_path,
     assert runtime.runs[0].image == RUNTIME_IMAGES[DEFAULT_RUNTIME]
 
 
+# --- owner directive B4: the function's real MemorySize caps the container --
+
+
+def test_ensure_passes_memory_mib_through_to_the_container_spec(tmp_path, listener):
+    runtime = FakeRuntime()
+    runtime.next_port = listener
+    rt = FunctionRuntime(runtime, root=tmp_path)
+    rt.ensure(ENV, FN, "python3.12", "h.h", {}, tmp_path, memory_mib=256)
+    assert runtime.runs[0].memory_mib == 256.0
+
+
+def test_ensure_leaves_memory_mib_unset_when_not_given(tmp_path, listener):
+    # Back-compat: a caller that predates this (or genuinely has none) keeps
+    # today's unbounded behavior rather than a silently invented default --
+    # lambdactl.py always sets one in practice (memory_size defaults to 128).
+    runtime = FakeRuntime()
+    runtime.next_port = listener
+    rt = FunctionRuntime(runtime, root=tmp_path)
+    rt.ensure(ENV, FN, "python3.12", "h.h", {}, tmp_path)
+    assert runtime.runs[0].memory_mib is None
+
+
 def test_ensure_raises_when_the_port_never_opens(tmp_path):
     runtime = FakeRuntime()
     rt = FunctionRuntime(runtime, root=tmp_path, ready_timeout=0.2, poll_interval=0.05)

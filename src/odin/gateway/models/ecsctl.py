@@ -502,7 +502,10 @@ def _launch_task(
     }
     stores.ecsctl.set(env, _task_key(cluster_name, task_id), task)
     try:
-        handle = runtime.run(env, task_id, container_def, extra_env=extra_env)
+        handle = runtime.run(
+            env, task_id, container_def, extra_env=extra_env,
+            cpu=taskdef.get("cpu"), memory=taskdef.get("memory"),
+        )
     except Exception as exc:
         # Deliberately broad: this runs on a daemon thread with no caller to
         # propagate an exception to -- see ec2compute.py's `_finish_boot` for
