@@ -19,6 +19,15 @@ from odin.compute.lima_yaml import generate_lima_yaml
 from odin.compute.models import get_instance_type
 from odin.runtime.colima import HostFacts, _ContainerRuntime
 
+# The Mac host as seen from INSIDE a Lima VM (an EC2 node is a Lima VM): Lima
+# auto-provides this alias, the guest-side counterpart to Colima's
+# `host.docker.internal` (`colima.CONTAINER_HOST`). A host-published port (an
+# rds Postgres container) is reachable from an EC2 VM at `host.lima.internal:
+# <port>` -- `host.docker.internal` does NOT resolve inside a Lima VM
+# (field-test finding #5), so an rds fact meant for an EC2 consumer must use
+# this form.
+LIMA_HOST = "host.lima.internal"
+
 
 class LimaRuntime(_ContainerRuntime):
     VM = "odin-host"

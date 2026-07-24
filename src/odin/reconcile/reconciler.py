@@ -33,6 +33,7 @@ from odin.reconcile.actions import NoOp, ProvisionResource, StopContainer
 from odin.reconcile.plan import plan
 from odin.reconcile.tf_status import TF_OWNED_KINDS, project as project_tf_owned
 from odin.runtime.colima import CONTAINER_HOST
+from odin.runtime.lima import LIMA_HOST
 from odin.spec.models import ResourceDesired, Stack, World, WorldDelta
 
 log = logging.getLogger("odin.reconcile")
@@ -247,10 +248,22 @@ class Reconciler:
             # itself, not the Mac. host.docker.internal is the host (same as AWS).
             addr = f"{CONTAINER_HOST}:{endpoint[1]}"
             url = f"postgresql://{user}:{pw}@{addr}/postgres"
+            # A container consumer resolves host.docker.internal; an EC2 Lima VM
+            # does NOT (finding #5) -- it resolves host.lima.internal. Publish a
+            # SECOND, VM-reachable form pointing at the SAME Postgres, so an ec2
+            # node consumes ${{db.DATABASE_URL_VM}} while containers keep
+            # ${{db.DATABASE_URL}} (per-consumer-type ref routing is deferred --
+            # a distinct fact is the honest, smaller fix).
+            vm_addr = f"{LIMA_HOST}:{endpoint[1]}"
+            vm_url = f"postgresql://{user}:{pw}@{vm_addr}/postgres"
             stats = self._rt.stats(cname)
             await self._emit(
                 res.id, "rds", "healthy",
-                facts={"DATABASE_URL": url, "endpoint": addr, **stats},
+                facts={
+                    "DATABASE_URL": url, "endpoint": addr,
+                    "DATABASE_URL_VM": vm_url, "endpoint_vm": vm_addr,
+                    **stats,
+                },
             )
 
     # ---- execute ----
