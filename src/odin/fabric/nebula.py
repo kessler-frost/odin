@@ -37,6 +37,7 @@ since it's a VM they already own outright.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -228,6 +229,17 @@ class NebulaManager:
         if not is_lighthouse:
             config["static_host_map"] = {lighthouse_ip: [f"{lighthouse_underlay}:{NEBULA_PORT}"]}
             config["lighthouse"]["hosts"] = [lighthouse_ip]
+            # Advertise ONLY the vzNAT address to the lighthouse. A Lima VM
+            # has three local addresses and two of them poison discovery:
+            # the slirp net (192.168.5.x) is IDENTICAL on every VM, so a peer
+            # dialing it hairpins back to ITSELF ("Refusing to handshake with
+            # myself"), and the IPv6 ULA is unsendable from nebula's IPv4
+            # listener ("listener is IPv4, but writing to IPv6 remote") —
+            # both observed live killing the VM↔VM tunnel (R4 diagnosis).
+            # The allowed CIDR is the /24 around the lighthouse underlay,
+            # i.e. the vzNAT subnet the VMs and host actually share.
+            vznat = ipaddress.ip_network(f"{lighthouse_underlay}/24", strict=False)
+            config["lighthouse"]["local_allow_list"] = {str(vznat): True}
         return yaml.dump(config, default_flow_style=False, sort_keys=False)
 
     def _overlay_path(self) -> Path:

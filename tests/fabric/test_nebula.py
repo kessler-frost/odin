@@ -94,8 +94,14 @@ def test_generate_config_shape(tmp_path):
     assert member["lighthouse"]["am_lighthouse"] is False
     assert member["static_host_map"] == {"10.42.0.1": ["192.168.1.10:4242"]}
     assert "tun" not in member  # a VM member keeps its real tun device
+    # Members advertise ONLY the vzNAT subnet — a Lima VM's slirp address
+    # (identical on every VM → self-handshake hairpin) and IPv6 ULA
+    # (unsendable from an IPv4 listener) both poisoned discovery when
+    # advertised (R4 live diagnosis: 100% overlay ping loss).
+    assert member["lighthouse"]["local_allow_list"] == {"192.168.1.0/24": True}
     light = yaml.safe_load(mgr.generate_config("10.42.0.1", "192.168.1.10", DEFAULT_FIREWALL, is_lighthouse=True))
     assert light["lighthouse"]["am_lighthouse"] is True and "static_host_map" not in light
+    assert "local_allow_list" not in light["lighthouse"]  # lighthouse advertises nothing anyway (no tun)
     assert "tun" not in light  # tun_disabled defaults False even for a lighthouse
 
 
