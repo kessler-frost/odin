@@ -30,6 +30,8 @@ from odin.agent import hcl
 from odin.agent.hcl import TfProject
 from odin.compute.instances import vm_name
 from odin.gateway.keys import OPERATOR_NODE_ID
+from odin.gateway.stores import SynthStores
+from odin.reconcile.tf_status import project as project_tf_owned
 from odin.server import create_app
 from odin.simulate import workspace as workspace_mod
 from odin.simulate.runner import PLUGIN_CACHE_DIR
@@ -186,3 +188,16 @@ def test_tf_apply_boots_a_real_vm_zero_drift_destroy(tmp_path, vm_cleanup):
         final_instance = final_state.get(f"instance:{instance_id}")
         assert final_instance is None or final_instance["state_name"] == "terminated"
         assert f"keypair:{keypair['key_name']}" not in final_state
+
+        # Release sweep finding #2: whether the instance record lingers
+        # `terminated` in its grace window or was already swept, the World
+        # projection must NOT surface it -- otherwise a phantom `crashed` ec2
+        # stays in /world forever after teardown (the reconciler prunes on
+        # absence from this snapshot). The hand-written HCL above carries no
+        # odin:node tag, so stamp one on the REAL terminated record's id and
+        # assert project() STILL excludes it -- proving the exclusion is by
+        # instance state, not merely by a missing tag. Without the fix, a
+        # tagged `terminated` record would project as ("ec2", "crashed").
+        stores = SynthStores(store.root)
+        stores.tags.set(ENV, f"ec2:{instance_id}", {"odin:node": "server"})
+        assert "server" not in project_tf_owned(stores, ENV)

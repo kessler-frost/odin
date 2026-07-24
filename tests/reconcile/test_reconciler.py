@@ -366,6 +366,28 @@ async def test_tf_owned_resource_pruned_when_tofu_destroys_it(tmp_path):
     assert store.current_world().get("net") is None
 
 
+async def test_terminated_ec2_is_pruned_from_world_after_teardown(tmp_path):
+    # Release sweep finding #2: an ec2 that reaches `terminated` (tofu destroy /
+    # empty-canvas Apply deleted its Lima VM) must leave World -- not linger as
+    # a phantom `crashed` node forever. The synth record survives (ec2compute's
+    # lazy sweep is Describe-driven and never fires here), so the projection
+    # excluding `terminated` is the ONLY thing that lets the reconciler prune it.
+    rt, rds = FakeRuntime(), FakeRds()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(ResourceDesired(id="server", kind="ec2"),)))
+    stores = SynthStores(tmp_path)
+    stores.ec2compute.set("default", "instance:i-1", {"instance_id": "i-1", "state_name": "running"})
+    stores.tags.set("default", "ec2:i-1", {"odin:node": "server"})
+    recon = Reconciler(store, rt, rds, pg_ready=_yes, poll_interval=0, stores=stores)
+    await recon.tick()
+    assert store.current_world().get("server") is not None
+
+    stores.ec2compute.set("default", "instance:i-1", {"instance_id": "i-1", "state_name": "terminated"})
+    await recon.tick()
+
+    assert store.current_world().get("server") is None
+
+
 async def test_ec2_instance_phase_reflects_real_state_name(tmp_path):
     rt, rds = FakeRuntime(), FakeRds()
     store = SpecStore(tmp_path)

@@ -20,8 +20,9 @@ import logging
 import os
 import shutil
 import tempfile
+from collections.abc import Callable, Coroutine
 from pathlib import Path
-from typing import TypedDict
+from typing import Any, TypedDict
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, SdkMcpTool, create_sdk_mcp_server, tool
 from pydantic import BaseModel
@@ -38,10 +39,12 @@ _MODEL = "claude-sonnet-5"
 
 
 def _default_timeout() -> float:
-    """Release finding #5: the SDK pass's own default budget. 120s meant a
-    translate() call that hit the timeout (most applies, per the release
-    sweep) wasted two full minutes before ever falling back to the
-    skeleton. `ODIN_TRANSLATE_TIMEOUT` overrides it."""
+    """Release finding #5: the SDK refine pass's budget. The pass no longer
+    sits on any request's critical path -- `translate()` returns the
+    deterministic skeleton immediately and refines on a BACKGROUND task (see
+    `TranslateCache`) -- so this timeout only bounds how long that background
+    task runs before giving up, never how long a `/translate` or `/apply-full`
+    caller waits. `ODIN_TRANSLATE_TIMEOUT` overrides it."""
     return float(os.environ.get("ODIN_TRANSLATE_TIMEOUT", "45"))
 
 
@@ -86,6 +89,15 @@ class TranslateResult(BaseModel):
     # agent never sees it (only main.tf is in its prompt) and can't refine
     # it, so every return path below carries the skeleton's copy verbatim.
     binary_files: dict[str, bytes] = {}
+
+    def for_display(self) -> dict:
+        """The read-only `/translate` HTTP response shape (release finding #1).
+        `binary_files` (a lambda's zip'd package, raw non-UTF8 bytes) is NOT
+        JSON-serializable and the code panel / `odin translate` never need it --
+        only /apply-full does, and it reads them off this object directly, never
+        through this projection. Excluding them here is what keeps a Lambda
+        canvas's `/translate` from 500-ing on serialization."""
+        return self.model_dump(exclude={"binary_files"})
 
 
 def make_emit_tool(collector: list[dict]) -> SdkMcpTool:
@@ -210,49 +222,119 @@ async def validate_refinement(
     return None, formatted
 
 
-async def translate(
-    stack: Stack, client_cls: type = ClaudeSDKClient, timeout: float = _TIMEOUT_S,
-    cache: dict[str, TranslateResult] | None = None,
-) -> TranslateResult:
-    """S3b entry point. `client_cls` is a `ClaudeSDKClient`-shaped seam
-    (async-context-manager `__init__(options=...)`, `.query()`,
-    `.receive_response()`) — tests inject a fake to drive the real MCP tool
-    dispatch without spawning the Claude Code CLI.
+_BACKGROUND_NOTE = "refinement is running in the background -- using the deterministic skeleton for now"
 
-    `cache` (release finding #5): an optional, caller-owned dict the SDK
-    pass can skip entirely when this exact canvas already has a SUCCESSFUL
-    refinement in it, keyed by the Stack's own content hash
-    (`spec.store.rev_of` -- any edit at all misses and re-refines). A
-    fallback result (SDK failure/timeout/guardrail rejection) is never
-    cached -- the cause may be transient, so the next call must retry."""
-    skeleton = generate_tf(stack)
-    if not hcl.resource_set(skeleton.files):
-        return TranslateResult(files=skeleton.files, unsupported=skeleton.unsupported, binary_files=skeleton.binary_files)
 
-    rev = rev_of(stack)
-    if cache is not None and rev in cache:
-        return cache[rev]
+def _fallback_result(skeleton: TfProject, notes: list[str]) -> TranslateResult:
+    """A non-refined result carrying the deterministic skeleton verbatim
+    (files + the lambda zip bytes) -- the no-supported-resources short-circuit,
+    every fallback inside `_refine_once`, and the immediate background-refine
+    return all share this shape."""
+    return TranslateResult(
+        files=skeleton.files, unsupported=skeleton.unsupported,
+        binary_files=skeleton.binary_files, notes=notes,
+    )
 
+
+async def _refine_once(skeleton: TfProject, stack: Stack, client_cls: type, timeout: float) -> TranslateResult:
+    """The blocking refine: run the SDK pass, run the deterministic guardrail
+    on whatever it returned, and produce either the refined result
+    (`refined=True`) or the skeleton fallback (`refined=False`). Never touches
+    any cache -- the caller decides whether to await this inline (no cache) or
+    on a background task (`TranslateCache`)."""
     payload = await _refine(skeleton, stack, client_cls, timeout)
     if payload is None:
-        return TranslateResult(
-            files=skeleton.files, unsupported=skeleton.unsupported, binary_files=skeleton.binary_files,
-            notes=["agent proposed no refinement -- using the deterministic skeleton"],
-        )
+        return _fallback_result(skeleton, ["agent proposed no refinement -- using the deterministic skeleton"])
 
     agent_files = {f["path"]: f["content"] for f in payload.get("files", [])}
     notes = list(payload.get("notes", []))
     violation, formatted = await validate_refinement(agent_files, skeleton.files, skeleton.binary_files)
     if violation is not None:
         log.warning("translate guardrail rejected agent output for env %s: %s", stack.env, violation)
-        return TranslateResult(
-            files=skeleton.files, unsupported=skeleton.unsupported, binary_files=skeleton.binary_files,
-            notes=[*notes, f"refinement rejected ({violation}) -- using the deterministic skeleton"],
-        )
-    result = TranslateResult(
+        return _fallback_result(skeleton, [*notes, f"refinement rejected ({violation}) -- using the deterministic skeleton"])
+    return TranslateResult(
         files=formatted, unsupported=skeleton.unsupported, binary_files=skeleton.binary_files,
         notes=notes, refined=True,
     )
-    if cache is not None:
-        cache[rev] = result
-    return result
+
+
+class TranslateCache:
+    """Release finding #5: the per-app translation cache + background-refine
+    orchestrator. The claude-agent-sdk refine pass is genuinely slow (and, when
+    the SDK is unreachable, sits until its timeout), so it must NEVER block a
+    `/translate` or `/apply-full` request: `translate()` returns the
+    deterministic skeleton immediately and, for a canvas revision it has
+    neither refined nor already got an in-flight refine for, kicks that pass on
+    a background task. The task's ONLY effect is to store a guardrail-passing
+    refinement here, keyed by the Stack's own content hash (`spec.store.rev_of`
+    -- any canvas edit misses and re-refines). A LATER translate/apply for the
+    SAME revision then serves that refined output. A fallback (SDK
+    failure/timeout/guardrail rejection) is never stored, so a transient
+    failure is retried on the next call."""
+
+    def __init__(self) -> None:
+        self._results: dict[str, TranslateResult] = {}
+        # Strong refs: asyncio only weakly references a running task, so
+        # without this the background refine could be garbage-collected
+        # mid-flight.
+        self._tasks: dict[str, asyncio.Task] = {}
+
+    def get(self, rev: str) -> TranslateResult | None:
+        return self._results.get(rev)
+
+    def _refining(self, rev: str) -> bool:
+        task = self._tasks.get(rev)
+        return task is not None and not task.done()
+
+    def refine_in_background(self, rev: str, refine: Callable[[], Coroutine[Any, Any, TranslateResult]]) -> None:
+        """Start a background refine for `rev`. `refine` is a factory (the coro
+        is built only when the task actually runs, so a task cancelled before it
+        starts leaves no un-awaited coroutine). Idempotent per rev: a call while
+        one is already in flight is a no-op, so repeated `/translate` polls of
+        the same unchanged canvas never stack up duplicate SDK passes."""
+        if self._refining(rev):
+            return
+
+        async def _run() -> None:
+            result = await refine()
+            if result.refined:
+                self._results[rev] = result
+
+        self._tasks[rev] = asyncio.create_task(_run())
+
+    async def _drain(self, rev: str) -> None:
+        """Test seam: await the in-flight background refine for `rev` (there is
+        no such wait on any request path -- refinement is fire-and-forget)."""
+        task = self._tasks.get(rev)
+        if task is not None:
+            await task
+
+
+async def translate(
+    stack: Stack, client_cls: type = ClaudeSDKClient, timeout: float = _TIMEOUT_S,
+    cache: TranslateCache | None = None,
+) -> TranslateResult:
+    """S3b entry point. `client_cls` is a `ClaudeSDKClient`-shaped seam
+    (async-context-manager `__init__(options=...)`, `.query()`,
+    `.receive_response()`) — tests inject a fake to drive the real MCP tool
+    dispatch without spawning the Claude Code CLI.
+
+    With a `cache` (release finding #5, the production path), this NEVER blocks
+    on the SDK: it returns the deterministic skeleton immediately and refines on
+    a background task whose result a later same-revision call serves from the
+    cache. Without a cache it runs the refine inline and returns the refined (or
+    fallback) result synchronously -- the shape the guardrail/fallback unit
+    tests drive."""
+    skeleton = generate_tf(stack)
+    if not hcl.resource_set(skeleton.files):
+        return _fallback_result(skeleton, [])
+
+    if cache is None:
+        return await _refine_once(skeleton, stack, client_cls, timeout)
+
+    rev = rev_of(stack)
+    cached = cache.get(rev)
+    if cached is not None:
+        return cached
+    cache.refine_in_background(rev, lambda: _refine_once(skeleton, stack, client_cls, timeout))
+    return _fallback_result(skeleton, [_BACKGROUND_NOTE])

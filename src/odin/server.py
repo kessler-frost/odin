@@ -154,7 +154,7 @@ class ImportTfRequest(BaseModel):
 
 def create_tf_router(
     store: SpecStore, runner: TfRunner, keystore: KeyStore, gateway_port,
-    translate_cache: dict[str, translate_mod.TranslateResult],
+    translate_cache: translate_mod.TranslateCache,
 ) -> APIRouter:
     """`/tf/*` -- Simulate's own apply/destroy/status, independent of the
     canvas `/apply`/`/destroy` above (S2 CONTRACT ADDENDUM: routes named
@@ -217,7 +217,9 @@ def create_tf_router(
         Stack)."""
         stack = canvas_to_stack(graph.model_dump(), env=env) if graph is not None else store.get_stack(env)
         result = await translate_mod.translate(stack, cache=translate_cache)
-        return result.model_dump()
+        # Release finding #1: strip the (non-JSON-serializable) lambda zip bytes
+        # -- the code panel needs only the .tf text + notes/unsupported/refined.
+        return result.for_display()
 
     @router.post("/import-tf")
     async def import_tf_route(body: ImportTfRequest, env: str = ENV) -> dict:
@@ -241,7 +243,7 @@ _SUPERSEDED = {"error": "superseded by a newer teardown/apply"}
 
 def create_apply_full_router(
     store: SpecStore, reconciler_for, runner: TfRunner, keystore: KeyStore, gateway_port, env_epoch: dict[str, int],
-    translate_cache: dict[str, translate_mod.TranslateResult],
+    translate_cache: translate_mod.TranslateCache,
 ) -> APIRouter:
     """S5 -- the UI's single Apply button: /apply's exact canvas->Stack->tick
     semantics, then translate (S3b) and, when the canvas has TF-supported
@@ -453,10 +455,11 @@ def create_app(
     # empty-canvas /apply-full bump -- see _bump_epoch's own docstring.
     env_epoch: dict[str, int] = {}
     # Release finding #5: shared across every /translate and /apply-full call
-    # for the app's lifetime -- see translate()'s own docstring for the
-    # cache-key/eviction (never-evicted, only a successful refinement lands
-    # here) contract.
-    translate_cache: dict[str, translate_mod.TranslateResult] = {}
+    # for the app's lifetime -- see TranslateCache's own docstring. It both
+    # caches successful refinements per canvas-revision AND owns the background
+    # refine tasks, so no request ever blocks on the (slow) claude-agent-sdk
+    # pass; a later same-revision call serves the refined output once ready.
+    translate_cache = translate_mod.TranslateCache()
 
     # One reconciler per environment, created lazily. Each gets its own
     # env-scoped rds runner + backing containers, so AWS state stays isolated.

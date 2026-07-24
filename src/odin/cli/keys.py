@@ -40,6 +40,16 @@ def keys_issue(
     Issuing again for the same (env, node) returns the SAME pair.
     """
     store = SpecStore(Path(".odin"))
+    # Release sweep finding #5 (LOW): this is an escape hatch, so it still
+    # issues -- but a label that isn't a resource in the env's applied stack
+    # would get InvalidClientTokenId at the gateway, so warn clearly (stderr,
+    # never polluting the creds on stdout).
+    if node not in {r.id for r in store.get_stack(env).resources}:
+        typer.echo(
+            f"warning: {node!r} is not a resource in env {env!r}'s applied stack -- issuing anyway "
+            "(the gateway rejects credentials for a principal it doesn't know).",
+            err=True,
+        )
     access_key, secret_key = KeyStore(store.root).issue(env, node)
     body = {"access_key": access_key, "secret_key": secret_key}
     http.emit(
