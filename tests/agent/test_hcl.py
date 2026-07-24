@@ -52,7 +52,8 @@ resource "aws_dynamodb_table" "items" {
 }
 
 resource "aws_s3_bucket" "uploads" {
-  bucket = "uploads"
+  bucket        = "uploads"
+  force_destroy = true
 
   tags = {
     "odin:node" = "uploads"
@@ -88,6 +89,13 @@ def test_golden_main_tf_for_full_canvas():
     stack = canvas_to_stack(_FULL_CANVAS)
     proj = generate_tf(stack)
     assert proj.files["main.tf"] == _GOLDEN_MAIN_TF
+
+
+def test_s3_bucket_gets_force_destroy():
+    # Finding #4: a non-empty bucket must tear down cleanly on `tofu destroy`
+    # (empty canvas = full destroy), not error BucketNotEmpty.
+    main_tf = generate_tf(Stack(resources=(ResourceDesired(id="uploads", kind="s3"),))).files["main.tf"]
+    assert "force_destroy = true" in main_tf
 
 
 def test_rds_listed_unsupported_with_reason_never_dropped():
@@ -127,7 +135,7 @@ def test_sanitizer_lowercases_strips_punctuation_and_prefixes_leading_digit():
     assert 'resource "aws_s3_bucket" "data_lake_"' in main_tf
     assert 'resource "aws_s3_bucket" "_3buckets"' in main_tf
     # the raw label is preserved as the actual AWS-facing bucket name
-    assert 'bucket = "Data Lake!"' in main_tf
+    assert '= "Data Lake!"' in main_tf
 
 
 def test_sanitizer_collision_gets_numeric_suffix():

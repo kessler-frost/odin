@@ -201,7 +201,11 @@ def _ingress_rules(res: ResourceDesired) -> list[tuple[str, str, str]] | None:
 
 
 def _s3(res: ResourceDesired, refs: Refs) -> Built:
-    return {"bucket": quote(res.id)}, ""
+    # force_destroy: `tofu destroy` empties the bucket before deleting it, so a
+    # bucket with objects tears down cleanly (field-test finding #4) instead of
+    # erroring BucketNotEmpty -- odin's "empty canvas = full destroy" story
+    # depends on it, and local dev buckets are ephemeral.
+    return {"bucket": quote(res.id), "force_destroy": "true"}, ""
 
 
 def _sqs(res: ResourceDesired, refs: Refs) -> Built:

@@ -141,13 +141,13 @@ async def test_no_files_is_rejected():
 async def test_comment_and_tag_only_refinement_passes_and_gets_formatted():
     skeleton = generate_tf(_S3_STACK).files
     main_tf = skeleton["main.tf"].replace(
-        'resource "aws_s3_bucket" "uploads" {\n  bucket = "uploads"\n\n  tags = {\n    "odin:node" = "uploads"\n  }\n}',
-        '# uploaded user content\nresource "aws_s3_bucket" "uploads" {\n bucket="uploads"\n\n  tags = {\n    "odin:node" = "uploads"\n  }\n}',
+        'resource "aws_s3_bucket" "uploads" {\n  bucket        = "uploads"\n  force_destroy = true\n\n  tags = {\n    "odin:node" = "uploads"\n  }\n}',
+        '# uploaded user content\nresource "aws_s3_bucket" "uploads" {\n bucket="uploads"\n  force_destroy = true\n\n  tags = {\n    "odin:node" = "uploads"\n  }\n}',
     )
     reason, formatted = await validate_refinement({"main.tf": main_tf}, skeleton)
     assert reason is None
     assert "# uploaded user content" in formatted["main.tf"]
-    assert 'bucket = "uploads"' in formatted["main.tf"]  # tofu fmt re-aligned it
+    assert 'bucket        = "uploads"' in formatted["main.tf"]  # tofu fmt re-aligned it
 
 
 @pytest.mark.skipif(_NO_TOFU, reason="tofu not on PATH")
@@ -271,8 +271,8 @@ def test_for_display_drops_binary_files_and_is_json_serializable():
 async def test_happy_path_refinement_is_kept():
     skeleton = generate_tf(_S3_STACK).files["main.tf"]
     refined_tf = skeleton.replace(
-        'resource "aws_s3_bucket" "uploads" {\n  bucket = "uploads"\n\n  tags = {\n    "odin:node" = "uploads"\n  }\n}',
-        '# user uploads\nresource "aws_s3_bucket" "uploads" {\n  bucket = "uploads"\n\n  tags = {\n    "odin:node" = "uploads"\n  }\n}',
+        'resource "aws_s3_bucket" "uploads" {',
+        '# user uploads\nresource "aws_s3_bucket" "uploads" {',
     )
     fake = _client_with(canned_args={"files": [{"path": "main.tf", "content": refined_tf}], "notes": ["added a comment"]})
     result = await translate(_S3_STACK, client_cls=fake)
