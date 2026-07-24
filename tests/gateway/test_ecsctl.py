@@ -524,6 +524,73 @@ def test_create_service_without_tags_launches_with_no_injected_creds(sink, ecs, 
     assert not extra_env
 
 
+# --- Tags: TagResource/UntagResource/ListTagsForResource + describe echo -------
+
+
+def _service_setup_with_tags(sink, ecs, stores, tags: list[dict] | None = None) -> tuple[FakeTaskRuntime, str]:
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    kwargs = {"tags": tags} if tags is not None else {}
+    service = _create_service(stores, sink, ecs, runtime, **kwargs)
+    return runtime, service["serviceArn"]
+
+
+def test_describe_services_echoes_create_service_tags(sink, ecs, stores):
+    """THE recorded-drift kill: a `tags` block on `aws_ecs_service` must come
+    back from DescribeServices exactly as submitted (the wire's own
+    list-of-lowercase-{key,value} shape), so a subsequent `tofu plan` sees no
+    diff -- ROADMAP's old 'tags aren't echoed back' v1 limit."""
+    tags = [{"key": "odin:node", "value": "myservice"}, {"key": "team", "value": "platform"}]
+    runtime, _ = _service_setup_with_tags(sink, ecs, stores, tags)
+    service = _describe_service(stores, sink, ecs, runtime)
+    assert service["tags"] == tags
+
+
+def test_tag_untag_list_round_trip(sink, ecs, stores):
+    runtime, arn = _service_setup_with_tags(sink, ecs, stores, [{"key": "team", "value": "platform"}])
+
+    tag_req = sink.call(lambda: ecs.tag_resource(resourceArn=arn, tags=[
+        {"key": "env", "value": "prod"}, {"key": "team", "value": "core"},
+    ]))
+    assert _answer(stores, tag_req, runtime).status_code == 200
+
+    list_req = sink.call(lambda: ecs.list_tags_for_resource(resourceArn=arn))
+    listed = _parse("ListTagsForResource", _answer(stores, list_req, runtime))["tags"]
+    assert listed == [{"key": "team", "value": "core"}, {"key": "env", "value": "prod"}]  # merged, last write wins
+
+    untag_req = sink.call(lambda: ecs.untag_resource(resourceArn=arn, tagKeys=["team"]))
+    assert _answer(stores, untag_req, runtime).status_code == 200
+
+    relist_req = sink.call(lambda: ecs.list_tags_for_resource(resourceArn=arn))
+    assert _parse("ListTagsForResource", _answer(stores, relist_req, runtime))["tags"] == [{"key": "env", "value": "prod"}]
+    assert _describe_service(stores, sink, ecs, runtime)["tags"] == [{"key": "env", "value": "prod"}]
+
+
+def test_tag_ops_on_unknown_service_arn_are_not_found(sink, ecs, stores):
+    runtime = FakeTaskRuntime()
+    ghost = ecsctl._service_arn("odin", "ghost")
+    req = sink.call(lambda: ecs.list_tags_for_resource(resourceArn=ghost))
+    response = _answer(stores, req, runtime)
+    assert response.status_code == 400
+    parsed = _parse("ListTagsForResource", response, error=True)
+    assert parsed["Error"]["Code"] == "ServiceNotFoundException"
+
+
+def test_recreate_service_overwrites_stale_tags(sink, ecs, stores):
+    """Create-with-tags -> delete -> recreate WITHOUT tags must describe as
+    untagged: CreateService's tag write is authoritative, never a merge with
+    a deleted prior incarnation's leftovers (which would itself be drift)."""
+    runtime, _ = _service_setup_with_tags(sink, ecs, stores, [{"key": "team", "value": "platform"}])
+    _wait_for_running_count(stores, sink, ecs, runtime, 1)
+    delete_req = sink.call(lambda: ecs.delete_service(cluster="odin", service="app", force=True))
+    _answer(stores, delete_req, runtime)
+
+    recreated = _create_service(stores, sink, ecs, runtime)
+    assert recreated["tags"] == []
+    assert _describe_service(stores, sink, ecs, runtime)["tags"] == []
+
+
 # --- Tasks: lazy sweep (spontaneous exit) --------------------------------------
 
 
