@@ -120,7 +120,7 @@ def test_host_ip_allocation_is_sticky():
     ip = net.allocate_host("mac-1")
     assert net.allocate_host("mac-1") == ip            # same host -> same IP
     assert net.allocate_host("mac-2") != ip            # different host -> different IP
-    assert net.cert_ip("mac-1") == f"{ip}/24"          # CIDR form for nebula-cert
+    assert net.cert_ip("mac-1") == f"{ip}/16"          # CIDR form for nebula-cert -- must match base_cidr
 
 
 def test_overlay_save_load_roundtrip(tmp_path):
