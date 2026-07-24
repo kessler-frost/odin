@@ -1,4 +1,5 @@
 import json
+import stat
 
 import pytest
 from fastapi import FastAPI
@@ -56,3 +57,12 @@ def test_post_canvas_persists_and_overwrites(client, canvas_path):
     nodes = client.get("/canvas").json()["nodes"]
     assert len(nodes) == 1 and nodes[0]["id"] == "b"
     assert len(json.loads(canvas_path.read_text())["nodes"]) == 1
+
+
+def test_post_canvas_writes_the_file_0600(client, canvas_path):
+    # Security finding #3a: a node's fields can carry a cleartext secret
+    # (an rds `password`) -- 0600 is the only thing stopping another local
+    # account from reading it.
+    client.post("/canvas", json={"nodes": [{"id": "a", "type": "rds", "position": {"x": 0, "y": 0},
+                                             "data": {"password": "s3cr3t"}}], "edges": []})
+    assert stat.S_IMODE(canvas_path.stat().st_mode) == 0o600

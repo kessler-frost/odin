@@ -26,7 +26,11 @@ def create_canvas_router(canvas_path: Path) -> APIRouter:
 
     @router.post("/canvas")
     def save_canvas(graph: CanvasGraph) -> dict[str, str]:
-        atomic_write_text(canvas_path, graph.model_dump_json(indent=2))
+        # Security finding #3: a node's fields (e.g. an rds `password`) land
+        # in this file in cleartext by design (the reconciler reads it back
+        # verbatim) -- 0600 is the only thing stopping another local account
+        # from reading it.
+        atomic_write_text(canvas_path, graph.model_dump_json(indent=2), mode=0o600)
         return {"status": "saved"}
 
     return router

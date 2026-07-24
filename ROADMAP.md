@@ -173,9 +173,10 @@ future decision against these points instead of re-deriving them:
   over the HTTP API with `-o json` for machine consumption, proven by an
   all-CLI session (set → translate → apply → healthy world → destroy).
   Lets a human's or an agent's
-  (e.g. Claude Code) tooling drive the canvas and its configuration directly.
-  Today's `odin` CLI only starts/stops/inspects the server process
-  (`start`/`stop`/`status`/`clean`) — it doesn't yet drive the canvas itself.
+  (e.g. Claude Code) tooling drive the canvas and its configuration directly —
+  process control (`start`/`stop`/`status`/`clean`/`doctor`) plus the full
+  canvas surface (`canvas get/set`, `translate`, `apply`, `world`, `envs`,
+  `events`, `tf`, `import-tf`, `destroy`, `keys issue`), all with `-o json`.
 - [x] **Packaging (pragmatic scope).** DONE 2026-07-24 (v0.5.0):
   `scripts/install.sh` (one command: brew tools + colima up + odin + doctor)
   and `odin doctor` (toolchain checks with exact fixes, disk headroom,

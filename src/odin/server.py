@@ -14,8 +14,9 @@ from contextlib import asynccontextmanager
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlparse
 
-from fastapi import APIRouter, FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -24,6 +25,7 @@ from odin.agent import import_tf as import_tf_mod
 from odin.agent import translate as translate_mod
 from odin.agent.hcl import TfProject, generate_tf, resource_set
 from odin.api.canvas import CanvasGraph, create_canvas_router
+from odin.api.logs import create_logs_router
 from odin.api.ws import ConnectionManager
 from odin.aws.backings import BackingAws
 from odin.aws.rds import PostgresRds
@@ -34,6 +36,7 @@ from odin.gateway.app import GatewayState, create_gateway_app, serve_in_thread, 
 from odin.gateway.keys import OPERATOR_NODE_ID, KeyStore, Principal
 from odin.gateway.models import ec2compute
 from odin.gateway.stores import SynthStores
+from odin.reconcile import admission
 from odin.reconcile.reconciler import Reconciler
 from odin.runtime.colima import ColimaRuntime
 from odin.simulate.runner import SimulateBusy, TfRunner, TofuNotInstalled
@@ -62,6 +65,32 @@ def _odin_version() -> str:
         return _FALLBACK_VERSION
 
 
+# Security finding #1c: CSRF defense-in-depth. odin has no authentication
+# of its own (see __main__.py's loopback-default fix) -- a browser tab open
+# on ANY other site could POST straight to this server's /apply-full and it
+# would just run it. A browser ALWAYS sends `Origin` (and normally `Referer`)
+# on a cross-site state-changing request; curl, the `odin` CLI, and an
+# agent's own HTTP client send neither -- so this only ever blocks a browser
+# acting on a page odin didn't serve, never a legitimate CLI/agent caller.
+_UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _is_loopback_origin(value: str) -> bool:
+    return urlparse(value).hostname in _LOOPBACK_HOSTS
+
+
+async def _csrf_guard(request: Request, call_next):
+    if request.method in _UNSAFE_METHODS:
+        origin = request.headers.get("origin") or request.headers.get("referer")
+        if origin and not _is_loopback_origin(origin):
+            return JSONResponse(
+                status_code=403,
+                content={"error": "cross-origin request rejected (odin has no authentication; only same-origin requests are trusted)"},
+            )
+    return await call_next(request)
+
+
 def _bump_epoch(env_epoch: dict[str, int], env: str) -> int:
     """Release finding #4: a per-env, in-memory generation counter. A client
     disconnect does NOT cancel the in-flight server-side request -- a stale
@@ -72,6 +101,27 @@ def _bump_epoch(env_epoch: dict[str, int], env: str) -> int:
     notice it's been superseded instead of going on to undo the teardown."""
     env_epoch[env] = env_epoch.get(env, 0) + 1
     return env_epoch[env]
+
+
+async def _admission_rejection(runtime, store: SpecStore, stack: Stack) -> JSONResponse | None:
+    """Owner directive B1: the pre-apply admission check, shared by
+    `/apply-full` and `/tf/apply` -- both must reject BEFORE touching any
+    container/VM, never after. `ensure_host()` shells to `docker info`
+    (blocking); `asyncio.to_thread` keeps that off the event loop, same
+    precaution `_reap_orphaned_ec2_vms` already takes for its own blocking
+    `limactl` calls. Returns None when admitted, else the 409 JSONResponse
+    the caller should return VERBATIM (named numbers, never a bare
+    "rejected")."""
+    host = await asyncio.to_thread(runtime.ensure_host)
+    result = admission.check_admission(stack, host, store.root)
+    if result.ok:
+        return None
+    return JSONResponse(status_code=409, content={
+        "error": result.reason,
+        "estimated_mib": result.estimated_mib,
+        "budget_mib": result.budget_mib,
+        "free_disk_gib": result.free_disk_gib,
+    })
 
 
 def create_apply_router(
@@ -108,8 +158,11 @@ def create_apply_router(
         body: dict = {"status": "destroyed", "env": env, "tf": None}
         if status["workspace_exists"]:
             access_key, secret_key = keystore.issue(env, OPERATOR_NODE_ID)
+            # Security finding #3: scrub any sensitive field's raw value out
+            # of tofu's own destroy log before it reaches the tail/WS/events.
+            secrets = store.get_stack(env).sensitive_values()
             try:
-                result = await runner.destroy(env, gateway_port(), access_key, secret_key)
+                result = await runner.destroy(env, gateway_port(), access_key, secret_key, secrets=secrets)
             except TofuNotInstalled:
                 # Not a request-level error: the reconciler half still runs below.
                 body["tf"] = {"status": "unavailable", "exit_code": None, **_TOFU_NOT_INSTALLED}
@@ -154,7 +207,7 @@ class ImportTfRequest(BaseModel):
 
 def create_tf_router(
     store: SpecStore, runner: TfRunner, keystore: KeyStore, gateway_port,
-    translate_cache: translate_mod.TranslateCache,
+    translate_cache: translate_mod.TranslateCache, runtime,
 ) -> APIRouter:
     """`/tf/*` -- Simulate's own apply/destroy/status, independent of the
     canvas `/apply`/`/destroy` above (S2 CONTRACT ADDENDUM: routes named
@@ -170,10 +223,17 @@ def create_tf_router(
     @router.post("/tf/apply")
     async def tf_apply(env: str = ENV) -> JSONResponse:
         stack = store.get_stack(env)
+        # Owner directive B1: reject BEFORE tofu ever runs, not after it's
+        # already spawned real containers/VMs that then fail one-by-one.
+        rejection = await _admission_rejection(runtime, store, stack)
+        if rejection is not None:
+            return rejection
         project = generate_tf(stack)
         access_key, secret_key = _issue_operator(env)
         try:
-            result = await runner.apply(env, project, gateway_port(), access_key, secret_key)
+            result = await runner.apply(
+                env, project, gateway_port(), access_key, secret_key, secrets=stack.sensitive_values(),
+            )
         except TofuNotInstalled:
             return JSONResponse(status_code=409, content=_TOFU_NOT_INSTALLED)
         except SimulateBusy as exc:
@@ -189,8 +249,9 @@ def create_tf_router(
     @router.post("/tf/destroy")
     async def tf_destroy(env: str = ENV) -> JSONResponse:
         access_key, secret_key = _issue_operator(env)
+        secrets = store.get_stack(env).sensitive_values()
         try:
-            result = await runner.destroy(env, gateway_port(), access_key, secret_key)
+            result = await runner.destroy(env, gateway_port(), access_key, secret_key, secrets=secrets)
         except TofuNotInstalled:
             return JSONResponse(status_code=409, content=_TOFU_NOT_INSTALLED)
         except SimulateBusy as exc:
@@ -243,7 +304,7 @@ _SUPERSEDED = {"error": "superseded by a newer teardown/apply"}
 
 def create_apply_full_router(
     store: SpecStore, reconciler_for, runner: TfRunner, keystore: KeyStore, gateway_port, env_epoch: dict[str, int],
-    translate_cache: translate_mod.TranslateCache,
+    translate_cache: translate_mod.TranslateCache, runtime,
 ) -> APIRouter:
     """S5 -- the UI's single Apply button: /apply's exact canvas->Stack->tick
     semantics, then translate (S3b) and, when the canvas has TF-supported
@@ -264,6 +325,13 @@ def create_apply_full_router(
             )
         canvas = graph.model_dump()
         stack = canvas_to_stack(canvas, env=env)
+
+        # Owner directive B1: reject BEFORE ensure_backings/translate/tofu
+        # ever touch a container or VM, not after 20 of them have already
+        # started thrashing the host.
+        rejection = await _admission_rejection(runtime, store, stack)
+        if rejection is not None:
+            return rejection
 
         # Release finding #4: an empty-canvas apply IS a teardown (see the
         # hold() block below) -- it must invalidate any older, still-in-flight
@@ -366,7 +434,9 @@ def create_apply_full_router(
                 )
                 access_key, secret_key = keystore.issue(env, OPERATOR_NODE_ID)
                 try:
-                    result = await runner.apply(env, project, gateway_port(), access_key, secret_key)
+                    result = await runner.apply(
+                        env, project, gateway_port(), access_key, secret_key, secrets=stack.sensitive_values(),
+                    )
                 except TofuNotInstalled:
                     # Not a request-level error: the reconciler half still applies below.
                     body["tf"] = {"status": "unavailable", "exit_code": None, **_TOFU_NOT_INSTALLED}
@@ -516,18 +586,21 @@ def create_app(
             stop_in_thread(gateway_server, gateway_thread)
 
     app = FastAPI(title="odin", version=_odin_version(), lifespan=lifespan)
+    app.middleware("http")(_csrf_guard)
     app.include_router(create_canvas_router(CANVAS_PATH))
     app.include_router(
         create_apply_router(_store, reconciler_for, gateway_keystore, tf_runner, lambda: gateway_port_actual, env_epoch)
     )
     app.include_router(
-        create_tf_router(_store, tf_runner, gateway_keystore, lambda: gateway_port_actual, translate_cache)
+        create_tf_router(_store, tf_runner, gateway_keystore, lambda: gateway_port_actual, translate_cache, _runtime)
     )
     app.include_router(
         create_apply_full_router(
-            _store, reconciler_for, tf_runner, gateway_keystore, lambda: gateway_port_actual, env_epoch, translate_cache,
+            _store, reconciler_for, tf_runner, gateway_keystore, lambda: gateway_port_actual, env_epoch,
+            translate_cache, _runtime,
         )
     )
+    app.include_router(create_logs_router(_store, gateway_stores, _runtime))
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
@@ -552,6 +625,7 @@ def create_app(
     app.state.reconcilers = reconcilers
     app.state.gateway = gateway_state
     app.state.gateway_keys = gateway_keystore
+    app.state.gateway_stores = gateway_stores
     app.state.tf_runner = tf_runner
     app.state.env_epoch = env_epoch
     app.state.translate_cache = translate_cache

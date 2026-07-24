@@ -178,7 +178,11 @@ export default function App() {
 
       {/* Row 3: Bottom panel */}
       <div className="col-span-full overflow-hidden">
-        <BottomPanel bottomState={bottomState} activeEnv={env} onCycleBottom={cycleBottom} onWsStatusChange={setWsConnected} onResourceStatus={handleResourceStatus} onConfigUpdate={handleConfigUpdate} />
+        <BottomPanel
+          bottomState={bottomState} activeEnv={env}
+          selectedNode={selectedNodes.length === 1 ? ((selectedNodes[0].data?.label as string) || selectedNodes[0].id) : undefined}
+          onCycleBottom={cycleBottom} onWsStatusChange={setWsConnected} onResourceStatus={handleResourceStatus} onConfigUpdate={handleConfigUpdate}
+        />
       </div>
 
       <Toasts toasts={toasts} />

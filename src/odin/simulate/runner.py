@@ -34,6 +34,7 @@ from pathlib import Path
 
 from odin.agent.hcl import TfProject
 from odin.simulate import workspace as workspace_mod
+from odin.spec.models import scrub
 
 _TOFU_INIT_ARGS = ("init", "-input=false")
 _TOFU_APPLY_ARGS = ("apply", "-auto-approve", "-input=false", "-no-color")
@@ -52,6 +53,15 @@ def _default_tofu_timeout() -> float:
     the default for every phase (init/apply/destroy each get their own
     budget, not one shared across the whole call)."""
     return float(os.environ.get("ODIN_TOFU_TIMEOUT", "600"))
+
+
+def _default_parallelism() -> int:
+    """Owner directive B3: tofu's own default (`-parallelism=10`) means a
+    big canvas fans out up to 10 heavy resource operations at once --
+    EC2 boots, ECS convergence waits -- on top of whatever else Apply is
+    already doing. `ODIN_TOFU_PARALLELISM` overrides; read fresh per
+    `TfRunner` construction, same convention as `_default_tofu_timeout`."""
+    return int(os.environ.get("ODIN_TOFU_PARALLELISM", "4"))
 
 
 class TofuNotInstalled(Exception):
@@ -102,10 +112,15 @@ class TfRunner:
     `ConnectionManager` (or anything with an async `broadcast(dict)`) --
     optional so unit tests can construct a runner with no event sink."""
 
-    def __init__(self, root: Path, ws=None, timeout: float | None = None) -> None:
+    def __init__(
+        self, root: Path, ws=None, timeout: float | None = None, parallelism: int | None = None,
+    ) -> None:
         self._root = root
         self._ws = ws
         self._timeout = timeout if timeout is not None else _default_tofu_timeout()
+        # Owner directive B3: threaded onto every apply/destroy's args below
+        # (never `init` -- `-parallelism` only governs a resource-graph walk).
+        self._parallelism = parallelism if parallelism is not None else _default_parallelism()
         self._locks: dict[str, asyncio.Lock] = {}
         self._last: dict[str, TfResult] = {}
 
@@ -114,6 +129,7 @@ class TfRunner:
 
     async def apply(
         self, env: str, project: TfProject, gateway_port: int, access_key: str, secret_key: str,
+        secrets: frozenset[str] = frozenset(),
     ) -> TfResult:
         lock = self._lock(env)
         if lock.locked():
@@ -122,10 +138,13 @@ class TfRunner:
         async with lock:
             workspace = workspace_mod.materialize(self._root, env, project)
             return await self._init_then(
-                tofu, workspace, gateway_port, access_key, secret_key, env, "apply", _TOFU_APPLY_ARGS,
+                tofu, workspace, gateway_port, access_key, secret_key, env, "apply", self._apply_args(), secrets,
             )
 
-    async def destroy(self, env: str, gateway_port: int, access_key: str, secret_key: str) -> TfResult:
+    async def destroy(
+        self, env: str, gateway_port: int, access_key: str, secret_key: str,
+        secrets: frozenset[str] = frozenset(),
+    ) -> TfResult:
         lock = self._lock(env)
         if lock.locked():
             raise SimulateBusy(env)
@@ -137,8 +156,14 @@ class TfRunner:
                 self._last[env] = result
                 return result
             return await self._init_then(
-                tofu, workspace, gateway_port, access_key, secret_key, env, "destroy", _TOFU_DESTROY_ARGS,
+                tofu, workspace, gateway_port, access_key, secret_key, env, "destroy", self._destroy_args(), secrets,
             )
+
+    def _apply_args(self) -> tuple[str, ...]:
+        return (*_TOFU_APPLY_ARGS, f"-parallelism={self._parallelism}")
+
+    def _destroy_args(self) -> tuple[str, ...]:
+        return (*_TOFU_DESTROY_ARGS, f"-parallelism={self._parallelism}")
 
     def status(self, env: str) -> dict:
         last = self._last.get(env)
@@ -151,19 +176,20 @@ class TfRunner:
 
     async def _init_then(
         self, tofu: str, workspace: Path, gateway_port: int, access_key: str, secret_key: str,
-        env: str, phase: str, args: tuple[str, ...],
+        env: str, phase: str, args: tuple[str, ...], secrets: frozenset[str] = frozenset(),
     ) -> TfResult:
         env_vars = _tf_env(gateway_port, access_key, secret_key)
-        init_result = await self._run(tofu, _TOFU_INIT_ARGS, workspace, env_vars, env, "init")
+        init_result = await self._run(tofu, _TOFU_INIT_ARGS, workspace, env_vars, env, "init", secrets)
         if not init_result.ok:
             self._last[env] = init_result
             return init_result
-        result = await self._run(tofu, args, workspace, env_vars, env, phase)
+        result = await self._run(tofu, args, workspace, env_vars, env, phase, secrets)
         self._last[env] = result
         return result
 
     async def _run(
         self, tofu: str, args: tuple[str, ...], cwd: Path, env_vars: dict[str, str], env: str, phase: str,
+        secrets: frozenset[str] = frozenset(),
     ) -> TfResult:
         # `start_new_session=True` (release finding #3): tofu spawns its own
         # provider-plugin child process, so a plain kill of tofu's own pid on
@@ -178,7 +204,11 @@ class TfRunner:
 
         async def _drain() -> int:
             async for raw_line in proc.stdout:
-                line = raw_line.decode(errors="replace").rstrip("\n")
+                # Security finding #3: tofu's own plan/apply diff can print a
+                # resource argument's ACTUAL value (it has no concept of odin's
+                # `sensitive` flag) -- scrub known secrets out of every line
+                # before it reaches the tail, the WS event stream, or events.jsonl.
+                line = scrub(raw_line.decode(errors="replace").rstrip("\n"), secrets)
                 tail.append(line)
                 await self._emit({"type": "tf", "env": env, "phase": phase, "line": line})
             return await proc.wait()

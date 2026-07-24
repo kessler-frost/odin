@@ -85,6 +85,17 @@ def test_image_exists_inspects_through_the_vm():
     assert rt.image_exists("odin-dynalite:1") is True
 
 
+def test_logs_runs_nerdctl_logs_tail_in_the_vm():
+    # LimaRuntime.logs is inherited from _ContainerRuntime unchanged -- this
+    # locks its exact command shape now that observability code depends on it.
+    runner = FakeRunner()
+    runner.responses["nerdctl logs"] = _Proc(0, "line1\nline2\n")
+    rt = LimaRuntime(runner=runner)
+    assert rt.logs("job", tail=5) == "line1\nline2"
+    logs_call = next(c for c in runner.calls if "logs" in c)
+    assert logs_call == ["limactl", "shell", "odin-host", "sudo", "nerdctl", "logs", "--tail", "5", "job"]
+
+
 def test_image_exists_false_on_dockers_empty_array_stdout():
     # REAL docker/nerdctl prints literal "[]" to stdout (rc=1) for a missing
     # image — a truthy string. This exact behavior skipped the dynalite image

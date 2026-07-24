@@ -67,10 +67,13 @@ class FakeFunctionRuntime:
     def code_dir(self, env: str, name: str) -> Path:
         return Path(f"/fake/{env}/{name}-code")
 
-    def ensure(self, env: str, name: str, runtime: str, handler: str, env_vars: dict[str, str], code_dir: Path) -> int:
+    def ensure(
+        self, env: str, name: str, runtime: str, handler: str, env_vars: dict[str, str], code_dir: Path,
+        memory_mib: int | None = None,
+    ) -> int:
         if self.block is not None:
             self.block.wait(timeout=5.0)
-        self.ensured.append((env, name, runtime, handler, dict(env_vars), code_dir))
+        self.ensured.append((env, name, runtime, handler, dict(env_vars), code_dir, memory_mib))
         if self.fail_ensure:
             raise RuntimeError("RIE never became ready")
         return 12345

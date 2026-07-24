@@ -166,6 +166,12 @@ class BackingAws:
     def _cname(self, d: BackingDef) -> str:
         return f"odin-aws-{d.name}-{self._env}"
 
+    def container_name(self, service: str) -> str:
+        """The public form of `_cname`/`_backing_for` -- for callers outside
+        this class that need to name the backing container directly (the
+        /logs route, the reconciler's own crash-verdict log tail)."""
+        return self._cname(self._backing_for(service))
+
     def _listen_port(self, d: BackingDef) -> int:
         """The port the backing's process actually listens on INSIDE its
         container. Normally that's the BackingDef's fixed wire port -- but

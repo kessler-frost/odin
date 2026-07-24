@@ -10,12 +10,22 @@ file-writing FakeRunner trick (a real `sign_cert`/`create_ca` writes files at
 """
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 
 import pytest
 import yaml
 
-from odin.compute.instances import InstanceVm, NebulaJoin, _Proc, _pick_shared_ip, vm_name
+from odin.compute.instances import (
+    InstanceVm,
+    NebulaJoin,
+    _BOOT_SEMAPHORE,
+    _default_max_concurrent_boots,
+    _Proc,
+    _pick_shared_ip,
+    vm_name,
+)
 from odin.compute.models import get_instance_type
 from odin.fabric.models import FirewallRule, FirewallRules
 
@@ -232,6 +242,27 @@ def test_list_names_empty_when_no_vms():
     assert InstanceVm(runner=runner).list_names() == []
 
 
+# --- logs (w1 observability: the VM's journal, the container-runtime's
+# closest honest equivalent since there's no single process to attach to) --
+
+
+def test_logs_reads_the_vms_journal_tail():
+    runner = FakeRunner()
+    runner.responses["journalctl"] = _Proc(0, "boot line 1\nboot line 2\n")
+    out = InstanceVm(runner=runner).logs(NAME, tail=5)
+    assert out == "boot line 1\nboot line 2\n"
+    call = next(c for c in runner.calls if "journalctl" in c)
+    assert call == ["limactl", "shell", NAME, "--", "sudo", "journalctl", "-n", "5", "--no-pager"]
+
+
+def test_logs_never_raises_when_the_vm_is_unreachable():
+    runner = FakeRunner()
+    runner.responses["journalctl"] = _Proc(1, "", "no such instance")
+    out = InstanceVm(runner=runner).logs("odin-ec2-default-gone")
+    assert "not reachable" in out
+    assert "no such instance" in out
+
+
 # --- Nebula join -----------------------------------------------------------------
 
 
@@ -366,3 +397,89 @@ def test_activate_nebula_never_raises_even_if_lighthouse_manager_blows_up(tmp_pa
     nebula = NebulaJoin(root=tmp_path, env="myenv", host_id="i-explode")
     ip = vm.boot(NAME, get_instance_type("t3.micro"), hostname="i-explode", nebula=nebula)
     assert ip == "192.168.64.20"  # never raised out of boot()
+
+
+# --- boot concurrency (owner directive B2): bound how many VMs may be
+# mid-`limactl create`/`start` at once, process-wide -----------------------
+
+
+def test_default_max_concurrent_boots_reads_the_env_var(monkeypatch):
+    monkeypatch.setenv("ODIN_MAX_CONCURRENT_VM_BOOTS", "7")
+    assert _default_max_concurrent_boots() == 7
+
+
+def test_default_max_concurrent_boots_falls_back_to_3(monkeypatch):
+    monkeypatch.delenv("ODIN_MAX_CONCURRENT_VM_BOOTS", raising=False)
+    assert _default_max_concurrent_boots() == 3
+
+
+def test_boot_semaphore_defaults_to_the_process_wide_one():
+    # `vm or InstanceVm()` (ec2compute.py's pure_answer) constructs a FRESH
+    # InstanceVm per gateway call -- the bound only works process-wide if
+    # every one of those shares the SAME semaphore by default.
+    assert InstanceVm(runner=FakeRunner())._boot_semaphore is _BOOT_SEMAPHORE
+
+
+def test_boot_never_exceeds_the_semaphore_bound_under_real_concurrency():
+    """Three `boot()` calls, genuinely concurrent (real threads -- the exact
+    shape ec2compute.py's `_spawn` produces: one daemon thread per
+    RunInstances), against a `boot_semaphore` sized 1: at most ONE may be
+    inside the create/start pair at any instant -- draw N EC2 nodes and they
+    queue instead of stampeding every VM boot onto the Mac at once."""
+    lock = threading.Lock()
+    in_flight = 0
+    peak = 0
+
+    class _ConcurrencyTrackingRunner(FakeRunner):
+        def __call__(self, args, input=None):
+            nonlocal in_flight, peak
+            if "create" in args or ("start" in args and "shell" not in args):
+                with lock:
+                    in_flight += 1
+                    peak = max(peak, in_flight)
+                time.sleep(0.05)  # hold the "boot" long enough to overlap
+                with lock:
+                    in_flight -= 1
+            return super().__call__(args, input=input)
+
+    runner = _ConcurrencyTrackingRunner()
+    runner.responses["hostname -I"] = _Proc(0, "192.168.64.20")
+    vm = InstanceVm(runner=runner, boot_semaphore=threading.Semaphore(1))
+
+    threads = [
+        threading.Thread(
+            target=vm.boot, args=(f"{NAME}-{i}", get_instance_type("t3.micro")), kwargs={"hostname": f"h{i}"},
+        )
+        for i in range(3)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert peak == 1
+
+
+def test_start_also_goes_through_the_boot_semaphore():
+    entered = threading.Event()
+    released = threading.Event()
+
+    class _BlockingRunner(FakeRunner):
+        def __call__(self, args, input=None):
+            if "start" in args and "shell" not in args:
+                entered.set()
+                released.wait(timeout=2)
+            return super().__call__(args, input=input)
+
+    runner = _BlockingRunner()
+    runner.responses["hostname -I"] = _Proc(0, "192.168.64.20")
+    sem = threading.Semaphore(1)
+    vm = InstanceVm(runner=runner, boot_semaphore=sem)
+
+    t = threading.Thread(target=vm.start, args=(NAME,))
+    t.start()
+    assert entered.wait(timeout=2)
+    assert sem.acquire(blocking=False) is False  # held for the duration of start()
+    released.set()
+    t.join(timeout=2)
+    assert sem.acquire(blocking=False) is True  # released once start() returns

@@ -7,6 +7,14 @@ auto-forwards VM-bound ports to the Mac, so host-side probes and references work
 the same. Heavier than Colima (a VM boot), so it's an opt-in runtime for
 VM-level isolation. The subprocess seam is injectable for testing; the multi-Mac
 fleet (a Lima VM per remote Mac) is explicitly out of scope here.
+
+Observability v1: `logs()` (inherited from `_ContainerRuntime`, unchanged) is
+a real `nerdctl logs --tail` against a container inside this shared VM --
+already a full container-level log surface. The DIFFERENT gap this feature
+closes is a real per-instance EC2 VM (one whole VM per instance, managed by
+`compute/instances.py::InstanceVm`, NOT this class): that has no container
+to attach to at all, so `InstanceVm.logs` reads the VM's systemd journal
+instead (`limactl shell <vm> -- journalctl ...`).
 """
 from __future__ import annotations
 

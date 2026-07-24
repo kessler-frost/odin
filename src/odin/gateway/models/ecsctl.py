@@ -457,7 +457,7 @@ def _task_wire(task: dict) -> dict:
 # `_maybe_mark_stopped`, module docstring's "GATEWAY-INTERNAL RECONCILE") ---
 
 
-def _sweep_tasks(stores: SynthStores, env: str, runtime: TaskRuntime) -> None:
+def sweep_tasks(stores: SynthStores, env: str, runtime: TaskRuntime) -> None:
     for task in _all_tasks(stores, env):
         if task["last_status"] != "RUNNING":
             continue
@@ -502,7 +502,10 @@ def _launch_task(
     }
     stores.ecsctl.set(env, _task_key(cluster_name, task_id), task)
     try:
-        handle = runtime.run(env, task_id, container_def, extra_env=extra_env)
+        handle = runtime.run(
+            env, task_id, container_def, extra_env=extra_env,
+            cpu=taskdef.get("cpu"), memory=taskdef.get("memory"),
+        )
     except Exception as exc:
         # Deliberately broad: this runs on a daemon thread with no caller to
         # propagate an exception to -- see ec2compute.py's `_finish_boot` for
@@ -781,7 +784,7 @@ def _describe_services(
     payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
 ) -> Response:
-    _sweep_tasks(stores, env, runtime)
+    sweep_tasks(stores, env, runtime)
     _sweep_inactive_services(stores, env)
     cluster_name = _strip_id(payload.get("cluster"))
     names = payload.get("services") or []
@@ -859,7 +862,7 @@ def _list_tasks(
     payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
 ) -> Response:
-    _sweep_tasks(stores, env, runtime)
+    sweep_tasks(stores, env, runtime)
     cluster_name = _strip_id(payload.get("cluster"))
     tasks = _tasks_for_cluster(stores, env, cluster_name)
     service_name = payload.get("serviceName")
@@ -877,7 +880,7 @@ def _describe_tasks(
     payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
 ) -> Response:
-    _sweep_tasks(stores, env, runtime)
+    sweep_tasks(stores, env, runtime)
     cluster_name = _strip_id(payload.get("cluster"))
     by_arn = {t["task_arn"]: t for t in _tasks_for_cluster(stores, env, cluster_name)}
     selected, failures = [], []

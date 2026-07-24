@@ -37,6 +37,14 @@ _INIT_OK = 'if [ "$1" = "init" ]; then echo "Initializing..."; exit 0; fi'
 
 _APPLY_OK_TWO_LINES = _INIT_OK + '\nif [ "$1" = "apply" ]; then echo "line one"; echo "line two"; exit 0; fi'
 
+_APPLY_LEAKS_A_SECRET = _INIT_OK + (
+    '\nif [ "$1" = "apply" ]; then echo "planning"; echo "password = hunter2"; exit 0; fi'
+)
+
+_APPLY_LEAKS_A_SECRET_ON_FAILURE = _INIT_OK + (
+    '\nif [ "$1" = "apply" ]; then echo "password = hunter2"; echo "boom"; exit 1; fi'
+)
+
 _APPLY_FAILS = _INIT_OK + '\nif [ "$1" = "apply" ]; then echo "planning"; echo "boom: invalid resource"; exit 1; fi'
 
 _APPLY_SLOW = _INIT_OK + '\nif [ "$1" = "apply" ]; then echo "starting"; sleep 0.4; echo "done"; exit 0; fi'
@@ -191,6 +199,61 @@ async def test_wedged_apply_is_killed_at_the_timeout_and_reported_failed(tmp_pat
     assert runner.status("default")["running"] is False
 
 
+# --- security finding #3: tofu's own log output is scrubbed for secrets ---
+
+
+async def test_secrets_are_scrubbed_from_streamed_line_events(tmp_path, monkeypatch):
+    _write_fake_tofu(tmp_path, _APPLY_LEAKS_A_SECRET)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    ws = RecordingWs()
+    runner = TfRunner(tmp_path, ws=ws)
+
+    result = await runner.apply("default", _project(), 4266, "ak", "sk", secrets=frozenset({"hunter2"}))
+
+    assert result.ok is True
+    apply_lines = [m["line"] for m in ws.messages if m.get("phase") == "apply" and "line" in m]
+    assert apply_lines == ["planning", "password = [REDACTED]"]
+    assert not any("hunter2" in line for line in apply_lines)
+
+
+async def test_secrets_are_scrubbed_from_the_failure_tail(tmp_path, monkeypatch):
+    _write_fake_tofu(tmp_path, _APPLY_LEAKS_A_SECRET_ON_FAILURE)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    ws = RecordingWs()
+    runner = TfRunner(tmp_path, ws=ws)
+
+    result = await runner.apply("default", _project(), 4266, "ak", "sk", secrets=frozenset({"hunter2"}))
+
+    assert result.ok is False
+    assert "hunter2" not in " ".join(result.tail)
+    assert "password = [REDACTED]" in result.tail
+    terminal = next(m for m in ws.messages if m.get("phase") == "apply" and "status" in m)
+    assert "hunter2" not in " ".join(terminal["tail"])
+
+
+async def test_no_secrets_given_leaves_output_untouched(tmp_path, monkeypatch):
+    _write_fake_tofu(tmp_path, _APPLY_LEAKS_A_SECRET)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    runner = TfRunner(tmp_path)
+
+    result = await runner.apply("default", _project(), 4266, "ak", "sk")  # no secrets= given
+
+    assert result.ok is True
+    assert result.tail == ("planning", "password = hunter2")
+
+
+async def test_secrets_are_scrubbed_from_destroy_output_too(tmp_path, monkeypatch):
+    _write_fake_tofu(tmp_path, _INIT_OK + '\nif [ "$1" = "destroy" ]; then echo "password = hunter2"; exit 0; fi')
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    runner = TfRunner(tmp_path)
+
+    # A prior apply is required for destroy to actually run tofu (else it's the no-workspace no-op).
+    await runner.apply("default", _project(), 4266, "ak", "sk")
+    result = await runner.destroy("default", 4266, "ak", "sk", secrets=frozenset({"hunter2"}))
+
+    assert "hunter2" not in " ".join(result.tail)
+
+
 async def test_a_fast_apply_is_unaffected_by_a_short_default_timeout(tmp_path, monkeypatch):
     # sanity: the timeout wraps the WHOLE subprocess, not just idle time --
     # a normal fast run under a generous timeout must behave exactly as before.
@@ -202,3 +265,62 @@ async def test_a_fast_apply_is_unaffected_by_a_short_default_timeout(tmp_path, m
 
     assert result.ok is True
     assert result.exit_code == 0
+
+
+# --- owner directive B3: a bounded -parallelism, not tofu's own default 10 --
+
+
+def test_default_parallelism_reads_the_env_var(monkeypatch):
+    monkeypatch.setenv("ODIN_TOFU_PARALLELISM", "8")
+    assert runner_mod._default_parallelism() == 8
+
+
+def test_default_parallelism_falls_back_to_4(monkeypatch):
+    monkeypatch.delenv("ODIN_TOFU_PARALLELISM", raising=False)
+    assert runner_mod._default_parallelism() == 4
+
+
+def test_tf_runner_reads_the_parallelism_env_var_by_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("ODIN_TOFU_PARALLELISM", "9")
+    assert TfRunner(tmp_path)._parallelism == 9
+
+
+_RECORD_APPLY_AND_DESTROY_ARGS = (
+    _INIT_OK
+    + '\nif [ "$1" = "apply" ] || [ "$1" = "destroy" ]; then echo "$@" >> "$RECORDED_ARGS_FILE"; exit 0; fi'
+)
+
+
+async def test_apply_and_destroy_pass_the_configured_parallelism_flag(tmp_path, monkeypatch):
+    args_file = tmp_path / "args.txt"
+    monkeypatch.setenv("RECORDED_ARGS_FILE", str(args_file))
+    _write_fake_tofu(tmp_path, _RECORD_APPLY_AND_DESTROY_ARGS)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    runner = TfRunner(tmp_path, parallelism=2)
+
+    apply_result = await runner.apply("default", _project(), 4266, "ak", "sk")
+    assert apply_result.ok is True
+    destroy_result = await runner.destroy("default", 4266, "ak", "sk")
+    assert destroy_result.ok is True
+
+    lines = args_file.read_text().splitlines()
+    assert any(line.startswith("apply") and "-parallelism=2" in line for line in lines)
+    assert any(line.startswith("destroy") and "-parallelism=2" in line for line in lines)
+
+
+async def test_init_args_never_carry_the_parallelism_flag(tmp_path, monkeypatch):
+    # `-parallelism` is not a valid `tofu init` flag -- a fake tofu that
+    # rejects any unexpected init arg proves it's never passed there.
+    script = (
+        'if [ "$1" = "init" ]; then\n'
+        '  if [ "$#" -gt 2 ]; then echo "unexpected init arg: $@"; exit 1; fi\n'
+        '  echo "Initializing..."; exit 0\n'
+        "fi\n"
+        'if [ "$1" = "apply" ]; then echo "ok"; exit 0; fi'
+    )
+    _write_fake_tofu(tmp_path, script)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    runner = TfRunner(tmp_path, parallelism=2)
+
+    result = await runner.apply("default", _project(), 4266, "ak", "sk")
+    assert result.ok is True

@@ -111,12 +111,48 @@ def parse_tf(files: dict[str, str]) -> list[tuple[str, str, dict]]:
     return triples
 
 
+def resource_attrs(files: dict[str, str]) -> dict[tuple[str, str], dict]:
+    """(type, name) -> parsed attrs, for every resource block across `files`.
+    S3b's guardrail keys the skeleton's and the agent's output by this same
+    identity for its value-fidelity check (`values_preserved` below);
+    `resource_set` is just this dict's keys."""
+    return {(rtype, name): attrs for rtype, name, attrs in parse_tf(files)}
+
+
 def resource_set(files: dict[str, str]) -> frozenset[tuple[str, str]]:
     """The (type, name) identity of every resource block across `files` —
     S3b's guardrail compares this set between the skeleton and the agent's
     refinement; they must be identical (the agent may edit arguments, never
     add/remove a resource)."""
-    return frozenset((rtype, name) for rtype, name, _ in parse_tf(files))
+    return frozenset(resource_attrs(files))
+
+
+# python-hcl2's own synthetic marker on every parsed block -- not a real HCL
+# argument, so `values_preserved` skips it rather than demanding the agent
+# echo it back.
+_BLOCK_MARKER = "__is_block__"
+
+
+def values_preserved(skeleton_attrs: dict, agent_attrs: dict) -> bool:
+    """True iff every argument VALUE the deterministic skeleton set survives,
+    unchanged, in `agent_attrs` -- recursively, so a nested block/map (tags,
+    an ingress {} rule, a dynamodb attribute {} block) is held to the same
+    standard as a top-level argument. The agent MAY add a key the skeleton
+    left unset at any level (a new tag, a new top-level argument, a whole new
+    nested block) -- this only ever walks the SKELETON's keys, so an
+    agent-only addition is invisible to it and never fails the check. This is
+    S3b's drift guardrail: the agent's one unique capability (rewriting an
+    argument's value, e.g. `instance_type` or a CIDR) is also its one
+    liability, and nothing else compares agent output to the canvas — this
+    does."""
+    if isinstance(skeleton_attrs, dict):
+        if not isinstance(agent_attrs, dict):
+            return False
+        return all(
+            key in agent_attrs and values_preserved(value, agent_attrs[key])
+            for key, value in skeleton_attrs.items() if key != _BLOCK_MARKER
+        )
+    return skeleton_attrs == agent_attrs
 
 
 def _field(res: ResourceDesired, key: str, default: str) -> str:

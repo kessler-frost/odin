@@ -42,7 +42,10 @@ class SpecStore:
         """Persist a Stack revision and move HEAD to it. Returns the rev."""
         rev = rev_of(stack)
         stacks = self._env_dir(stack.env) / "stacks"
-        atomic_write_text(stacks / f"{rev}.json", stack.model_dump_json(indent=2))
+        # Security finding #3: a Stack revision carries every field's raw
+        # value in cleartext (rds `password`, etc.), immutably -- 0600 is
+        # the only thing stopping another local account from reading it.
+        atomic_write_text(stacks / f"{rev}.json", stack.model_dump_json(indent=2), mode=0o600)
         atomic_write_text(self._env_dir(stack.env) / "HEAD", rev)
         return rev
 
@@ -70,7 +73,12 @@ class SpecStore:
         return World.model_validate_json(path.read_text())
 
     def write_world(self, world: World) -> None:
-        atomic_write_text(self._env_dir(world.env) / "world.json", world.model_dump_json(indent=2))
+        # Security finding #3: a resource's observed `facts` can carry a live
+        # credential in cleartext (rds's DATABASE_URL embeds user:password) --
+        # NOT redacted (the Fabric resolves `${{node.attr}}` refs straight out
+        # of these same facts, functionally, at reconcile time), so 0600 is
+        # the only defense available for this file.
+        atomic_write_text(self._env_dir(world.env) / "world.json", world.model_dump_json(indent=2), mode=0o600)
 
     def apply_delta(self, delta: WorldDelta) -> World:
         """Upsert one resource's observed state and persist the new World.

@@ -1,4 +1,5 @@
-"""`odin world` / `odin envs` / `odin events` — read-only inspection.
+"""`odin world` / `odin envs` / `odin events` / `odin logs` — read-only
+inspection.
 
 Status is a one-way projection: these commands read the same World/event-log
 the UI projects, they never author anything.
@@ -51,3 +52,26 @@ def events(env: str = http.ENV, url: str = http.URL, output: OutputFormat = http
     """The env's durable event log (world deltas, tf runs, denials) — one line per event."""
     body = http.request("GET", url, "/events", params={"env": env}).json()
     http.emit(body, output, _render_events)
+
+
+def _render_logs(body: dict) -> None:
+    if body.get("message"):
+        typer.echo(body["message"])
+    if body.get("lines"):
+        typer.echo(body["lines"])
+
+
+@app.command()
+def logs(
+    node: str = typer.Argument(..., help="Canvas node label to fetch logs for."),
+    env: str = http.ENV,
+    tail: int = typer.Option(100, "--tail", help="Number of trailing log lines to fetch."),
+    url: str = http.URL,
+    output: OutputFormat = http.OUTPUT,
+) -> None:
+    """Real logs off a node's actual backing container/VM — an unknown node
+    exits 1, a known-but-not-running one prints an honest message and exits 0."""
+    body = http.body_or_fail(
+        http.request("GET", url, "/logs", params={"env": env, "node": node, "tail": tail})
+    )
+    http.emit(body, output, _render_logs)
