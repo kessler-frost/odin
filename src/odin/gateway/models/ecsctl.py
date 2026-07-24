@@ -337,13 +337,45 @@ def _taskdef_wire(taskdef: dict) -> dict:
     }
 
 
+def _rollout(service: dict, tasks: list[dict], deployment_id: str) -> tuple[str, str]:
+    """The deployment's honest `(rolloutState, rolloutStateReason)` from the
+    REAL task outcomes (field-test finding #3). A STOPPED task in the store is
+    always a genuine failure/spontaneous-exit -- a DELIBERATE stop
+    (scale-down/replace/delete) deletes the record outright (`_stop_task`),
+    never leaves it STOPPED -- so its presence while short of desired means the
+    deployment can't converge. Before this the state was hardcoded COMPLETED, so
+    a bad image / crash-on-start read as a healthy deployment and the failure
+    was never surfaced (apply silently 'succeeded'). runningCount==desiredCount
+    wins first, so a lingering STOPPED task from an already-recovered service
+    never reads as FAILED."""
+    running = sum(1 for t in tasks if t["last_status"] == "RUNNING")
+    stopped = [t for t in tasks if t["last_status"] == "STOPPED"]
+    if running == service["desired_count"]:
+        return "COMPLETED", f"ECS deployment {deployment_id} completed."
+    if stopped:
+        reason = next((t["stopped_reason"] for t in stopped if t.get("stopped_reason")), "a task failed to start")
+        return "FAILED", f"ECS deployment circuit breaker: tasks failed to start: {reason}"
+    return "IN_PROGRESS", f"ECS deployment {deployment_id} in progress."
+
+
 def _service_wire(stores: SynthStores, env: str, service: dict) -> dict:
     arn = _service_arn(service["cluster_name"], service["service_name"])
     tasks = _tasks_for_service(stores, env, service["cluster_name"], service["service_name"])
     running = sum(1 for t in tasks if t["last_status"] == "RUNNING")
     pending = sum(1 for t in tasks if t["last_status"] == "PROVISIONING")
+    deployment_id = f"ecs-svc/{service['service_name']}"
+    rollout_state, rollout_reason = _rollout(service, tasks, deployment_id)
+    # A failed deployment surfaces a real service event too (real ECS posts
+    # "unable to..." events here) -- honest in DescribeServices even though the
+    # v5 provider's create waiter keys on runningCount, not rolloutState.
+    events = []
+    if rollout_state == "FAILED":
+        events = [{
+            "id": str(uuid.uuid4()), "createdAt": time.time(),
+            "message": f"(service {service['service_name']}) {rollout_reason}",
+        }]
     deployment = {
-        "id": f"ecs-svc/{service['service_name']}",
+        "id": deployment_id,
         "status": "PRIMARY",
         "taskDefinition": service["task_definition_arn"],
         "desiredCount": service["desired_count"],
@@ -352,8 +384,8 @@ def _service_wire(stores: SynthStores, env: str, service: dict) -> dict:
         "createdAt": service["created_at"],
         "updatedAt": service["created_at"],
         "launchType": service["launch_type"],
-        "rolloutState": "COMPLETED",
-        "rolloutStateReason": f"ECS deployment ecs-svc/{service['service_name']} completed.",
+        "rolloutState": rollout_state,
+        "rolloutStateReason": rollout_reason,
     }
     return {
         "serviceArn": arn,
@@ -369,7 +401,7 @@ def _service_wire(stores: SynthStores, env: str, service: dict) -> dict:
         "taskDefinition": service["task_definition_arn"],
         "deploymentConfiguration": {"maximumPercent": 200, "minimumHealthyPercent": 100},
         "deployments": [deployment],
-        "events": [],
+        "events": events,
         "createdAt": service["created_at"],
         "placementConstraints": [],
         "placementStrategy": [],

@@ -615,10 +615,15 @@ def test_ecs_emits_service_taskdef_and_one_shared_cluster():
     assert 'resource "aws_ecs_cluster" "odin"' in main_tf
     assert 'name = "odin"' in main_tf
     assert 'resource "aws_ecs_service" "app"' in main_tf
-    assert "cluster         = aws_ecs_cluster.odin.id" in main_tf
-    assert "task_definition = aws_ecs_task_definition.app_taskdef.arn" in main_tf
-    assert "desired_count   = 2" in main_tf
-    assert 'launch_type     = "EC2"' in main_tf
+    assert "cluster               = aws_ecs_cluster.odin.id" in main_tf
+    assert "task_definition       = aws_ecs_task_definition.app_taskdef.arn" in main_tf
+    assert "desired_count         = 2" in main_tf
+    assert 'launch_type           = "EC2"' in main_tf
+    # finding #3: apply must wait for the service to converge and fail fast
+    # (bounded) if a bad image / crash-on-start keeps it from running.
+    assert "wait_for_steady_state = true" in main_tf
+    assert "timeouts {" in main_tf
+    assert 'create = "60s"' in main_tf
     assert 'resource "aws_ecs_task_definition" "app_taskdef"' in main_tf
     assert 'family                   = "app"' in main_tf
     assert '\\"image\\": \\"nginx:alpine\\"' in main_tf
@@ -628,7 +633,7 @@ def test_ecs_emits_service_taskdef_and_one_shared_cluster():
 def test_ecs_defaults_image_count_and_port_when_fields_absent():
     stack = Stack(resources=(ResourceDesired(id="app", kind="ecs"),))
     main_tf = generate_tf(stack).files["main.tf"]
-    assert "desired_count   = 1" in main_tf
+    assert "desired_count         = 1" in main_tf
     assert '\\"image\\": \\"nginx:alpine\\"' in main_tf
     assert '\\"containerPort\\": 80' in main_tf
 
@@ -644,8 +649,8 @@ def test_ecs_multiple_nodes_share_one_cluster():
     assert 'resource "aws_ecs_service" "app_b"' in main_tf
     assert 'resource "aws_ecs_task_definition" "app_a_taskdef"' in main_tf
     assert 'resource "aws_ecs_task_definition" "app_b_taskdef"' in main_tf
-    assert "cluster         = aws_ecs_cluster.odin.id" in main_tf.split('"aws_ecs_service" "app_a"')[1]
-    assert "cluster         = aws_ecs_cluster.odin.id" in main_tf.split('"aws_ecs_service" "app_b"')[1]
+    assert "cluster               = aws_ecs_cluster.odin.id" in main_tf.split('"aws_ecs_service" "app_a"')[1]
+    assert "cluster               = aws_ecs_cluster.odin.id" in main_tf.split('"aws_ecs_service" "app_b"')[1]
 
 
 def test_ecs_with_non_numeric_count_lands_in_unsupported():

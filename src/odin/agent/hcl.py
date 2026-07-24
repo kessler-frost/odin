@@ -422,6 +422,15 @@ _DEFAULT_ECS_COUNT = "1"
 _DEFAULT_ECS_PORT = "80"
 _BAD_ECS_COUNT = "count must be a whole number (e.g. 2)"
 _BAD_ECS_PORT = "port must be a whole number (e.g. 80)"
+# field-test finding #3: apply must WAIT for the service to actually converge
+# and FAIL (bounded by this timeout) if the tasks can't reach RUNNING -- a bad
+# image / crash-on-start otherwise made apply silently "succeed" with a service
+# that never runs, the failure never surfaced. Bounded so "never converges"
+# becomes a fast, honest apply failure instead of the provider's long default
+# stabilization wait. A genuinely slow first image pull that exceeds this fails
+# apply too (retry re-uses the now-cached image) -- an accepted local-dev
+# trade-off for never silently shipping a broken service.
+_ECS_CONVERGE_TIMEOUT = "60s"
 
 
 def _ecs(res: ResourceDesired, refs: Refs) -> Built:
@@ -439,8 +448,16 @@ def _ecs(res: ResourceDesired, refs: Refs) -> Built:
         "task_definition": f"aws_ecs_task_definition.{own_name}_taskdef.arn",
         "desired_count": count,
         "launch_type": quote("EC2"),
+        "wait_for_steady_state": "true",
     }
-    return attrs, ""
+    nested = (
+        "  timeouts {\n"
+        f'    create = {quote(_ECS_CONVERGE_TIMEOUT)}\n'
+        f'    update = {quote(_ECS_CONVERGE_TIMEOUT)}\n'
+        f'    delete = {quote(_ECS_CONVERGE_TIMEOUT)}\n'
+        "  }"
+    )
+    return attrs, nested
 
 
 def _ecs_container_definitions(res: ResourceDesired) -> list[dict]:
