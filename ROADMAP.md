@@ -93,15 +93,39 @@ future decision against these points instead of re-deriving them:
   - ECS: no `network_configuration` (awsvpc/Fargate-style ENIs — odin's tasks
     are `launch_type = "EC2"` / `network_mode = "bridge"`, which need none);
     a task that dies between API calls isn't auto-replaced until the next
-    Apply reconciles the service. (Fixed: a `tags` block on
-    `aws_ecs_service` now plans zero-drift — the gateway stores the full tag
-    set and echoes it back, with
+    Apply reconciles the service. Generated services set
+    `wait_for_steady_state = true` with a bounded `timeouts.create` (v0.5.4,
+    finding #3) so a bad image / crash-on-start fails apply fast and honestly
+    instead of silently "succeeding" with a service that never runs — the
+    trade-off is that a genuinely slow FIRST image pull that exceeds the
+    timeout also fails apply (a retry re-uses the now-cached image). (Fixed: a
+    `tags` block on `aws_ecs_service` now plans zero-drift — the gateway stores
+    the full tag set and echoes it back, with
     `TagResource`/`UntagResource`/`ListTagsForResource` modeled.)
   - SNS→SQS live-edit: FIXED (v0.5.0) — adding a subscription edge to an
     already-healthy topic lands on the next Apply via the reconciler's
     observe pass (proven by real fanout to both queues).
   - RDS stays off Terraform — the reconciler's real Postgres container, not
     a `tofu`-managed resource, until an RDS gateway model lands.
+  - RDS endpoint reachability is per-consumer: a CONTAINER consumes
+    `${{db.DATABASE_URL}}` (`host.docker.internal`); an EC2 (Lima VM) consumer
+    must use `${{db.DATABASE_URL_VM}}` (`host.lima.internal`), since a Lima VM
+    can't resolve the container-host alias. odin publishes BOTH facts (v0.5.4,
+    finding #5); picking the right one per consumer type is manual — automatic
+    ref-routing by consumer kind is deferred.
+  - Security groups don't gate RDS or the other backing containers (goaws/
+    RustFS/dynalite/Postgres): those run as HOST containers, not Nebula mesh
+    members, so a drawn `db-sg` is decorative and DB access rides the raw host
+    port, ungoverned. SG enforcement applies only to EC2 VMs on the mesh — and
+    even there v1 compiles the firewall from the VPC's DEFAULT SG, not an
+    instance's assigned security group. An instance's assigned SG IS reflected
+    in DescribeInstances for zero-drift re-apply (v0.5.4, finding #2), but does
+    not yet gate that VM's mesh traffic.
+  - Single local server by design: `ODIN_GATEWAY_PORT` overrides the embedded
+    gateway's port, but there is no supported way to run two servers against
+    the same CWD-relative `.odin` store (the second binds-conflicts on the
+    gateway port and would resume/reconcile the first's envs). Run a second
+    instance only from a separate working directory with its own store.
   - Nebula: single-host mesh is REAL end-to-end — a real host lighthouse
     process (`fabric/nebula.py::LighthouseManager`) and a real `nebula`
     daemon inside every VPC-joined EC2 VM, the VPC's compiled SG firewall
