@@ -220,6 +220,16 @@ odin canvas get | jq '.nodes += [{"id":"x1","type":"s3","data":{"label":"backups
 odin apply --env dev
 ```
 
+## Security
+
+Odin has no authentication of its own — the control app binds to
+`127.0.0.1` by default, and applying a canvas runs whatever's on it for
+real (container images, EC2 user-data as root, Lambda code). That's the
+point of the tool, not a bug, but it means a canvas from someone else
+should be treated like a shell script you're about to run. See
+[SECURITY.md](SECURITY.md) for the full threat model and how to report a
+vulnerability.
+
 ## Verification
 
 Every claim above was checked against a real, running instance for the 0.4.0
