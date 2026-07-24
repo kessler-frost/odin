@@ -11,7 +11,9 @@ that need real `tofu` skip cleanly when it's not on PATH, matching
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import shutil
+import time
 
 import pytest
 from mcp import types as mcp_types
@@ -320,8 +322,35 @@ def test_shipped_default_timeout_constant_is_45_seconds():
     assert translate_mod._TIMEOUT_S == 45.0
 
 
+async def test_a_slow_refine_never_blocks_the_request_when_a_cache_is_given():
+    # Release finding #3: with the app's cache, translate() must return the
+    # deterministic skeleton IMMEDIATELY and refine on a background task -- it
+    # must NOT wait out the (here, deliberately slow) SDK pass on the request's
+    # critical path, the ~45s block the release sweep flagged on every Apply.
+    class _Slow(_FakeClient):
+        async def query(self, prompt: str, session_id: str = "default") -> None:
+            await asyncio.sleep(5)
+
+    cache = translate_mod.TranslateCache()
+    rev = rev_of(_S3_STACK)
+    start = time.perf_counter()
+    result = await translate(_S3_STACK, client_cls=_Slow, cache=cache, timeout=5)
+    elapsed = time.perf_counter() - start
+
+    assert result.refined is False
+    assert elapsed < 1.0, f"request blocked {elapsed:.2f}s on the refine instead of returning immediately"
+    # the background refine really was kicked (and is still running)
+    assert cache._refining(rev)
+    cache._tasks[rev].cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await cache._tasks[rev]
+
+
 @pytest.mark.skipif(_NO_TOFU, reason="tofu not on PATH")
-async def test_unchanged_stack_skips_the_sdk_pass_after_a_successful_refinement():
+async def test_background_refine_result_is_served_from_cache_on_the_next_call():
+    # Release finding #3/#5: once the background refine for a revision COMPLETES
+    # successfully, the next translate() for that SAME canvas revision serves
+    # the refined output from the cache -- without constructing the SDK again.
     construct_count: list[int] = []
 
     class _Counting(_FakeClient):
@@ -334,24 +363,31 @@ async def test_unchanged_stack_skips_the_sdk_pass_after_a_successful_refinement(
             construct_count.append(1)
             super().__init__(options)
 
-    cache: dict = {}
-    first = await translate(_S3_STACK, client_cls=_Counting, cache=cache)
-    assert first.refined is True
-    assert len(construct_count) == 1
-    assert rev_of(_S3_STACK) in cache
+    cache = translate_mod.TranslateCache()
+    rev = rev_of(_S3_STACK)
 
-    # SAME stack content, a fresh cache lookup -- the SDK must not be
-    # constructed a second time. _NeverConstructed asserts this for free.
+    # First call: immediate skeleton (refined=False), refine kicked in the bg.
+    first = await translate(_S3_STACK, client_cls=_Counting, cache=cache)
+    assert first.refined is False
+    await cache._drain(rev)  # let the background refine complete
+    assert len(construct_count) == 1
+    assert cache.get(rev) is not None and cache.get(rev).refined is True
+
+    # SAME stack content -> served from the cache; the SDK is NOT constructed a
+    # second time (_NeverConstructed asserts this) and no new task is spawned.
     second = await translate(_S3_STACK, client_cls=_NeverConstructed, cache=cache)
-    assert second == first
+    assert second.refined is True
+    assert len(construct_count) == 1
 
 
 async def test_a_fallback_result_is_never_cached_so_the_next_call_retries():
-    cache: dict = {}
+    cache = translate_mod.TranslateCache()
+    rev = rev_of(_S3_STACK)
     failing = _client_with(raises=RuntimeError("boom"))
     first = await translate(_S3_STACK, client_cls=failing, cache=cache)
     assert first.refined is False
-    assert cache == {}  # only a SUCCESSFUL refinement is cached
+    await cache._drain(rev)  # let the (failing) background refine finish
+    assert cache.get(rev) is None  # only a SUCCESSFUL refinement is cached
 
     construct_count: list[int] = []
 
@@ -361,16 +397,19 @@ async def test_a_fallback_result_is_never_cached_so_the_next_call_retries():
             super().__init__(options)
 
     await translate(_S3_STACK, client_cls=_Counting, cache=cache)
+    await cache._drain(rev)
     assert len(construct_count) == 1  # the SDK really was retried, not skipped
 
 
 async def test_a_rejected_refinement_is_never_cached_so_the_next_call_retries():
-    cache: dict = {}
+    cache = translate_mod.TranslateCache()
+    rev = rev_of(_S3_STACK)
     tampered = generate_tf(_S3_STACK).files["main.tf"] + '\nresource "aws_sqs_queue" "extra" {\n  name = "extra"\n}\n'
     rejecting = _client_with(canned_args={"files": [{"path": "main.tf", "content": tampered}], "notes": []})
     first = await translate(_S3_STACK, client_cls=rejecting, cache=cache)
     assert first.refined is False
-    assert cache == {}
+    await cache._drain(rev)
+    assert cache.get(rev) is None
 
     construct_count: list[int] = []
 
@@ -380,11 +419,13 @@ async def test_a_rejected_refinement_is_never_cached_so_the_next_call_retries():
             super().__init__(options)
 
     await translate(_S3_STACK, client_cls=_Counting, cache=cache)
+    await cache._drain(rev)
     assert len(construct_count) == 1
 
 
 async def test_a_different_stack_is_a_cache_miss():
-    cache: dict = {rev_of(_S3_STACK): "unrelated cached entry"}
+    cache = translate_mod.TranslateCache()
+    cache._results[rev_of(_S3_STACK)] = translate_mod.TranslateResult(files={"main.tf": "cached"}, refined=True)
     result = await translate(_RDS_ONLY_STACK, client_cls=_NeverConstructed, cache=cache)
     assert result.refined is False  # untouched by the unrelated cache entry
 
