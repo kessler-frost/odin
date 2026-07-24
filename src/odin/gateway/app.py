@@ -34,6 +34,7 @@ answered directly or forwarded -- "synth never bypasses policy" (S1 brief).
 """
 from __future__ import annotations
 
+import asyncio
 import socket
 import threading
 import time
@@ -190,10 +191,23 @@ def create_gateway_app(
         # threaded through as the same value the forward path below would
         # otherwise look up on its own.
         backing_port = state.backing_port(principal.env, service)
-        pure = synth.pure_answer(
+        # `lambda:Invoke` runs the function's handler synchronously inside its
+        # REAL RIE container -- a blocking wait up to the function's timeout
+        # (compute/functions.py). Run ON the event loop it would freeze the
+        # whole gateway for the duration, so the handler's OWN re-entrant AWS
+        # calls back through here (a boto3 PutItem/PutObject during the
+        # invocation) could never be accepted -- they'd time out and the invoke
+        # would return empty (field-test finding #1). Hand JUST that action to a
+        # worker thread so the loop stays free to serve the re-entrant calls;
+        # every other synth answer is fast in-memory work (the substrate-booting
+        # ones already return immediately, finishing on their own daemon
+        # thread), kept inline to avoid a needless thread hop on the hot forward
+        # path (the re-entrant PutItem/PutObject calls themselves).
+        answer = lambda: synth.pure_answer(  # noqa: E731
             action, resource, principal.env, body, stores, now, backing_port, query_params,
             keystore=keystore, gateway_port=gateway_port() if gateway_port else None,
         )
+        pure = await asyncio.to_thread(answer) if action == "lambda:Invoke" else answer()
         if pure is not None:
             return pure
 
