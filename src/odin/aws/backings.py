@@ -80,6 +80,7 @@ RUN npm install -g dynalite
 ENTRYPOINT ["dynalite"]
 CMD ["--port", "4567"]
 """
+DYNALITE_IMAGE = _DYNALITE_IMAGE  # public alias: `odin doctor` inspects/prebakes this tag
 
 
 @dataclass(frozen=True)
@@ -235,6 +236,12 @@ class BackingAws:
         dynalite for the first time never both `docker build` the same tag."""
         if not self._rt.image_exists(_DYNALITE_IMAGE):
             self._rt.build(_DYNALITE_IMAGE, _DYNALITE_DOCKERFILE)
+
+    def ensure_dynalite_image(self) -> None:
+        """Public seam for `odin doctor --prebake`: bake the dynalite image
+        ahead of the first DynamoDB Apply. Idempotent; lock-free is fine here
+        (a one-shot CLI, not the reconciler's concurrent ensure path)."""
+        self._ensure_dynalite_image()
 
     def _await_ready(self, cname: str, service: str) -> None:
         if service == "ecr":
