@@ -111,3 +111,77 @@ def test_events_server_down(runner):
     result = runner.invoke(app, ["events"])
     assert result.exit_code == 2
     assert "Could not reach odin server" in result.stderr
+
+
+# --- odin logs ---------------------------------------------------------
+
+
+@respx.mock
+def test_logs_prints_lines_and_exits_zero(runner):
+    respx.get(f"{BASE}/logs", params={"env": "default", "node": "db", "tail": "100"}).mock(
+        return_value=httpx.Response(200, json={
+            "env": "default", "node": "db", "kind": "rds", "found": True, "running": True,
+            "sources": ["odin-rds-default-db"], "lines": "PostgreSQL init complete", "message": None,
+        })
+    )
+    result = runner.invoke(app, ["logs", "db"])
+    assert result.exit_code == 0
+    assert "PostgreSQL init complete" in result.stdout
+
+
+@respx.mock
+def test_logs_json_mode(runner):
+    body = {
+        "env": "default", "node": "db", "kind": "rds", "found": True, "running": True,
+        "sources": ["odin-rds-default-db"], "lines": "hello", "message": None,
+    }
+    respx.get(f"{BASE}/logs", params={"env": "default", "node": "db", "tail": "100"}).mock(
+        return_value=httpx.Response(200, json=body)
+    )
+    result = runner.invoke(app, ["logs", "db", "-o", "json"])
+    assert result.exit_code == 0
+    assert json.loads(result.stdout) == body
+
+
+@respx.mock
+def test_logs_not_running_prints_the_honest_message_and_still_exits_zero(runner):
+    respx.get(f"{BASE}/logs", params={"env": "default", "node": "db", "tail": "100"}).mock(
+        return_value=httpx.Response(200, json={
+            "env": "default", "node": "db", "kind": "rds", "found": True, "running": False,
+            "sources": ["odin-rds-default-db"], "lines": "", "message": "odin-rds-default-db is not running",
+        })
+    )
+    result = runner.invoke(app, ["logs", "db"])
+    assert result.exit_code == 0
+    assert "not running" in result.stdout
+
+
+@respx.mock
+def test_logs_unknown_node_exits_one(runner):
+    respx.get(f"{BASE}/logs", params={"env": "default", "node": "ghost", "tail": "100"}).mock(
+        return_value=httpx.Response(200, json={"env": "default", "node": "ghost", "error": "no such node 'ghost'"})
+    )
+    result = runner.invoke(app, ["logs", "ghost"])
+    assert result.exit_code == 1
+    assert "no such node" in result.stderr
+
+
+@respx.mock
+def test_logs_custom_env_and_tail(runner):
+    respx.get(f"{BASE}/logs", params={"env": "prod", "node": "app", "tail": "50"}).mock(
+        return_value=httpx.Response(200, json={
+            "env": "prod", "node": "app", "kind": "ecs", "found": True, "running": True,
+            "sources": ["odin-ecs-prod-abc"], "lines": "starting up", "message": None,
+        })
+    )
+    result = runner.invoke(app, ["logs", "app", "--env", "prod", "--tail", "50"])
+    assert result.exit_code == 0
+    assert "starting up" in result.stdout
+
+
+@respx.mock
+def test_logs_server_down(runner):
+    respx.get(f"{BASE}/logs").mock(side_effect=httpx.ConnectError("refused"))
+    result = runner.invoke(app, ["logs", "db"])
+    assert result.exit_code == 2
+    assert "Could not reach odin server" in result.stderr
