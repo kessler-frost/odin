@@ -281,6 +281,34 @@ def test_create_service_is_active_immediately_then_converges_running_count(sink,
     final = _wait_for_running_count(stores, sink, ecs, runtime, 2)
     assert final["pendingCount"] == 0
     assert len(runtime.ran) == 2
+    # A converged deployment reports COMPLETED (finding #3's honest state).
+    assert final["deployments"][0]["rolloutState"] == "COMPLETED"
+    assert final["events"] == []
+
+
+def test_describe_services_reports_failed_deployment_when_a_task_cannot_start(sink, ecs, stores):
+    """Field-test finding #3: a task that fails to start (bad image /
+    crash-on-boot) must surface a FAILED deployment with the real reason in
+    DescribeServices -- not the old hardcoded COMPLETED, which read a broken
+    service as healthy and let a bad-image apply silently 'succeed'. Paired with
+    the HCL's `wait_for_steady_state`, this is what makes apply fail honestly."""
+    runtime = FakeTaskRuntime(fail_run=True)  # every launched container fails
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(stores, sink, ecs, runtime, desiredCount=1)
+
+    deadline = time.monotonic() + 2.0
+    service = None
+    while time.monotonic() < deadline:
+        service = _describe_service(stores, sink, ecs, runtime)
+        if service["deployments"][0]["rolloutState"] == "FAILED":
+            break
+        time.sleep(0.02)
+    assert service["runningCount"] == 0
+    (deployment,) = service["deployments"]
+    assert deployment["rolloutState"] == "FAILED", service
+    assert "failed to start" in deployment["rolloutStateReason"]
+    assert service["events"], "a failed deployment posts a service event"
 
 
 def test_update_service_scales_up(sink, ecs, stores):

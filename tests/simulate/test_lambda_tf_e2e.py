@@ -46,6 +46,7 @@ from pathlib import Path
 
 import boto3
 import pytest
+from botocore.config import Config
 from fastapi.testclient import TestClient
 
 from odin.agent import hcl
@@ -298,5 +299,124 @@ def test_apply_full_canvas_path_threads_binary_files_through_a_real_tofu_apply(s
 
     ps_after = _docker(
         "ps", "-a", "--filter", f"name={container_name(CANVAS_ENV, CANVAS_FUNCTION_NAME)}", "--format", "{{.Names}}",
+    )
+    assert ps_after.stdout.strip() == "", f"lambda container survived teardown: {ps_after.stdout}"
+
+
+# --- Field-test finding #1 (HIGH) re-verify: a Lambda whose handler calls OTHER
+# AWS services back through the gateway DURING its invocation. The repo's echo
+# lambda never calls back, so it never exercised the re-entrancy deadlock -- this
+# does, and it is THE proof the fix lands end-to-end (real RIE container, real
+# re-entrant boto3 PutItem/PutObject with the function's OWN injected creds). ---
+
+CALLBACK_ENV = "lambda-callback-e2e"
+CALLBACK_FUNCTION_NAME = "callback"
+# The handler dials the gateway back AS ITSELF (the four AWS_* vars the RIE
+# container gets injected by `_finish_deploy`/`workload_env`), doing a real
+# DynamoDB PutItem + S3 PutObject mid-invocation. Endpoint read explicitly from
+# the injected env so the test never depends on botocore's AWS_ENDPOINT_URL
+# auto-read version; path-style S3 for RustFS.
+CALLBACK_CODE = (
+    "import os\n"
+    "import boto3\n"
+    "from botocore.config import Config\n"
+    "\n"
+    "def lambda_handler(event, context):\n"
+    "    endpoint = os.environ['AWS_ENDPOINT_URL']\n"
+    "    boto3.client('dynamodb', endpoint_url=endpoint).put_item(\n"
+    "        TableName='orders', Item={'id': {'S': 'order-1'}, 'via': {'S': 'callback'}})\n"
+    "    boto3.client('s3', endpoint_url=endpoint, config=Config(s3={'addressing_style': 'path'})).put_object(\n"
+    "        Bucket='artifacts', Key='receipt.txt', Body=b'paid')\n"
+    "    return {'put_item': 'ok', 'put_object': 'ok'}\n"
+)
+CALLBACK_CANVAS = {
+    "nodes": [
+        {"id": "fn", "type": "lambda", "data": {
+            "label": CALLBACK_FUNCTION_NAME, "runtime": "python3.12", "code": CALLBACK_CODE}},
+        {"id": "ddb", "type": "dynamodb", "data": {"label": "orders"}},
+        {"id": "bkt", "type": "s3", "data": {"label": "artifacts"}},
+    ],
+    "edges": [
+        {"source": "fn", "target": "ddb",
+         "data": {"edgeType": "iam", "permissions": ["dynamodb:PutItem", "dynamodb:GetItem"]}},
+        {"source": "fn", "target": "bkt",
+         "data": {"edgeType": "iam", "permissions": ["s3:PutObject"]}},
+    ],
+}
+
+
+def test_callback_lambda_reaches_other_services_during_invoke(store_root, lambda_cleanup, monkeypatch):
+    """The exact scenario the field test flagged: a Lambda whose handler does a
+    real boto3 PutItem to a dynamodb node + PutObject to an s3 node DURING its
+    invocation. Before the fix the synchronous invoke froze the gateway's event
+    loop, so those re-entrant calls could never be served -- they timed out and
+    the invoke returned empty. Now the invoke returns the handler's result and
+    the item+object actually land."""
+    assert shutil.which("tofu"), "OpenTofu must be on PATH for this integration test"
+    assert shutil.which("docker"), "docker must be on PATH for this integration test"
+    lambda_cleanup.append(container_name(CALLBACK_ENV, CALLBACK_FUNCTION_NAME))
+
+    async def fake_translate(stack, **kwargs):
+        skeleton = hcl.generate_tf(stack)
+        return translate_mod.TranslateResult(
+            files=skeleton.files, unsupported=skeleton.unsupported, binary_files=skeleton.binary_files,
+        )
+    monkeypatch.setattr("odin.server.translate_mod.translate", fake_translate)
+
+    store = SpecStore(store_root)
+    app = create_app(store=store)
+    with TestClient(app) as client:
+        resp = client.post("/apply-full", json=CALLBACK_CANVAS, params={"env": CALLBACK_ENV})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["tf"] == {"status": "ok", "exit_code": 0}, resp.json()
+
+        state = _lambdactl_state(store.root, CALLBACK_ENV)
+        (fn,) = [v for k, v in state.items() if k.startswith("fn:")]
+        assert fn["state"] == "Active", fn
+
+        gateway_port = client.get("/health").json()["gateway"]["port"]
+        operator_key, operator_secret = app.state.gateway_keys.issue(CALLBACK_ENV, OPERATOR_NODE_ID)
+        lambda_client = boto3.client(
+            "lambda", endpoint_url=f"http://127.0.0.1:{gateway_port}",
+            aws_access_key_id=operator_key, aws_secret_access_key=operator_secret, region_name="us-east-1",
+            config=Config(connect_timeout=45, read_timeout=45, retries={"max_attempts": 0}),
+        )
+        invoke_start = time.monotonic()
+        response = lambda_client.invoke(FunctionName=CALLBACK_FUNCTION_NAME, Payload=b"{}")
+        invoke_elapsed = time.monotonic() - invoke_start
+        print(f"\n[finding#1] re-entrant Invoke round-trip took {invoke_elapsed:.1f}s")
+
+        # THE proof: the invoke returns the handler's own result (not 0 bytes,
+        # not a 30s ServiceException timeout) and did not error.
+        assert response.get("FunctionError") is None, response
+        payload_out = json.loads(response["Payload"].read())
+        assert payload_out == {"put_item": "ok", "put_object": "ok"}, payload_out
+        assert invoke_elapsed < 20, f"invoke took {invoke_elapsed:.1f}s -- the re-entrancy deadlock is not fixed"
+
+        # And the writes actually LANDED (operator creds, full-allow).
+        ddb = boto3.client(
+            "dynamodb", endpoint_url=f"http://127.0.0.1:{gateway_port}",
+            aws_access_key_id=operator_key, aws_secret_access_key=operator_secret, region_name="us-east-1",
+        )
+        item = ddb.get_item(TableName="orders", Key={"id": {"S": "order-1"}}).get("Item")
+        assert item and item["via"]["S"] == "callback", item
+
+        s3 = boto3.client(
+            "s3", endpoint_url=f"http://127.0.0.1:{gateway_port}",
+            aws_access_key_id=operator_key, aws_secret_access_key=operator_secret, region_name="us-east-1",
+            config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+        )
+        assert s3.get_object(Bucket="artifacts", Key="receipt.txt")["Body"].read() == b"paid"
+
+        # Empty the bucket before teardown so THIS test stays scoped to finding
+        # #1 -- a non-empty-bucket destroy is finding #4's concern (force_destroy),
+        # proven separately in tests/agent/test_hcl.py + its own e2e.
+        s3.delete_object(Bucket="artifacts", Key="receipt.txt")
+        resp = client.post("/apply-full", json=EMPTY_CANVAS, params={"env": CALLBACK_ENV})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["tf"] == {"status": "ok", "exit_code": 0}
+
+    ps_after = _docker(
+        "ps", "-a", "--filter", f"name={container_name(CALLBACK_ENV, CALLBACK_FUNCTION_NAME)}", "--format", "{{.Names}}",
     )
     assert ps_after.stdout.strip() == "", f"lambda container survived teardown: {ps_after.stdout}"

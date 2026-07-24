@@ -125,8 +125,14 @@ async def test_db_reaches_healthy(tmp_path):
 
     rds.available = True
     await recon.tick()                       # db -> healthy
-    assert store.current_world().get("db").phase == "healthy"
-    assert store.current_world().get("db").facts["DATABASE_URL"].startswith("postgresql://")
+    facts = store.current_world().get("db").facts
+    assert facts["DATABASE_URL"].startswith("postgresql://")
+    # Finding #5: a container-form (host.docker.internal) AND a VM-form
+    # (host.lima.internal, reachable from an EC2 Lima VM) endpoint, same port.
+    assert facts["endpoint"] == "host.docker.internal:15432"
+    assert facts["DATABASE_URL"] == "postgresql://app:apppass123@host.docker.internal:15432/postgres"
+    assert facts["endpoint_vm"] == "host.lima.internal:15432"
+    assert facts["DATABASE_URL_VM"] == "postgresql://app:apppass123@host.lima.internal:15432/postgres"
 
 
 async def test_destroy_then_reapply_recreates_db(tmp_path):

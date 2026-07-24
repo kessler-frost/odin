@@ -3,7 +3,9 @@ import against a real gateway + backings) is exercised in
 tests/simulate/test_import_tf_e2e.py (integration, needs Colima/tofu)."""
 from __future__ import annotations
 
+from odin.agent.hcl import generate_tf
 from odin.agent.import_tf import LiveResource, _import_id, parse_hcl_dir, parse_hcl_text
+from odin.spec.translate import canvas_to_stack
 
 _FULL_TF = '''
 resource "aws_s3_bucket" "uploads" {
@@ -70,12 +72,12 @@ def test_grid_positions_are_on_the_20px_grid_in_220px_steps():
 
 
 def test_unsupported_type_never_dropped_even_when_alone():
-    result = parse_hcl_text('resource "aws_iam_role" "role" {\n  name = "role"\n}\n')
+    result = parse_hcl_text('resource "aws_cloudwatch_log_group" "logs" {\n  name = "logs"\n}\n')
     assert result.nodes == []
     assert result.edges == []
     assert len(result.unsupported) == 1
-    assert result.unsupported[0].type == "aws_iam_role"
-    assert result.unsupported[0].name == "role"
+    assert result.unsupported[0].type == "aws_cloudwatch_log_group"
+    assert result.unsupported[0].name == "logs"
     assert "not supported" in result.unsupported[0].reason
 
 
@@ -94,17 +96,99 @@ resource "aws_sns_topic_subscription" "orphan" {
     assert result.unsupported[0].name == "orphan"
 
 
-def test_malformed_hcl_reported_as_unsupported_not_raised():
+def test_malformed_hcl_sets_parse_error_not_unsupported():
+    # Finding #7: a genuine parse failure is a distinct, hard error (parse_error),
+    # NOT an "unsupported resource" -- so the CLI can exit non-zero on it while a
+    # well-formed-but-unsupported file stays a success.
     result = parse_hcl_text("not { valid hcl")
     assert result.nodes == []
+    assert result.unsupported == []
+    assert result.parse_error is not None and "failed to parse" in result.parse_error
+
+
+def test_valid_file_with_only_unsupported_resources_has_no_parse_error():
+    result = parse_hcl_text('resource "aws_cloudwatch_log_group" "logs" {\n  name = "logs"\n}\n')
+    assert result.parse_error is None
     assert len(result.unsupported) == 1
-    assert "failed to parse" in result.unsupported[0].reason
 
 
 def test_dynamodb_hash_key_defaults_to_id_when_attribute_missing():
     tf = 'resource "aws_dynamodb_table" "t" {\n  name = "t"\n}\n'
     result = parse_hcl_text(tf)
     assert result.nodes[0]["data"]["hashKey"] == "id"
+
+
+# --- finding #6: import carries load-bearing in-resource attributes ----------
+
+_COMPOSITE_TF = '''
+resource "aws_dynamodb_table" "orders" {
+  name      = "orders"
+  hash_key  = "userId"
+  range_key = "createdAt"
+
+  attribute {
+    name = "userId"
+    type = "S"
+  }
+
+  attribute {
+    name = "createdAt"
+    type = "N"
+  }
+}
+
+resource "aws_s3_bucket" "data" {
+  bucket = "data"
+
+  tags = {
+    Team = "platform"
+    Env  = "prod"
+  }
+}
+
+resource "aws_iam_role" "exec" {
+  name               = "exec"
+  assume_role_policy = "{}"
+}
+'''
+
+
+def test_composite_dynamodb_carries_range_key_and_types():
+    (node,) = [n for n in parse_hcl_text(_COMPOSITE_TF).nodes if n["type"] == "dynamodb"]
+    assert node["data"]["hashKey"] == "userId"
+    assert node["data"]["hashKeyType"] == "S"
+    assert node["data"]["rangeKey"] == "createdAt"
+    assert node["data"]["rangeKeyType"] == "N"
+
+
+def test_s3_carries_user_tags_but_not_odins_own():
+    tf = 'resource "aws_s3_bucket" "b" {\n  bucket = "b"\n  tags = { Team = "x"\n    "odin:node" = "b" }\n}\n'
+    (node,) = parse_hcl_text(tf).nodes
+    assert node["data"]["tags"] == {"Team": "x"}  # odin:node excluded
+
+
+def test_iam_role_is_imported_not_listed_unsupported_with_a_warning():
+    result = parse_hcl_text(_COMPOSITE_TF)
+    (role,) = [n for n in result.nodes if n["type"] == "iam_role"]
+    assert role["id"] == "exec"
+    assert not any(u.type == "aws_iam_role" for u in result.unsupported)
+    # the attribute it can't carry is WARNED, not silently dropped
+    assert any("exec" in w and "assume_role_policy" in w for w in result.warnings)
+
+
+def test_round_trip_preserves_composite_key_and_tags():
+    imported = parse_hcl_text(_COMPOSITE_TF)
+    regenerated = generate_tf(canvas_to_stack({"nodes": imported.nodes, "edges": imported.edges})).files["main.tf"]
+
+    # dynamodb composite key survives (hash+range, correct types), not hash-only
+    assert 'range_key    = "createdAt"' in regenerated
+    assert regenerated.count("attribute {") == 2
+    assert 'name = "createdAt"\n    type = "N"' in regenerated
+    # s3 user tags survive (alongside odin's own management tag)
+    assert '"Team"      = "platform"' in regenerated
+    assert '"Env"       = "prod"' in regenerated
+    # iam_role survives as an aws_iam_role
+    assert 'resource "aws_iam_role" "exec"' in regenerated
 
 
 def test_bucket_with_computed_name_falls_back_to_hcl_resource_name_as_label():

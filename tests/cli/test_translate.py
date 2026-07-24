@@ -115,6 +115,39 @@ def test_import_tf_requires_file_or_live(runner):
 
 
 @respx.mock
+def test_import_tf_malformed_hcl_exits_nonzero(runner, tmp_path):
+    # Finding #7: a genuine parse failure is a hard error a CI exit-code check
+    # catches -- not a silent exit 0 with an empty canvas.
+    tf_file = tmp_path / "bad.tf"
+    tf_file.write_text("not { valid hcl")
+    respx.post(f"{BASE}/import-tf").mock(return_value=httpx.Response(200, json={
+        "nodes": [], "edges": [], "unsupported": [], "warnings": [],
+        "parse_error": "HCL failed to parse: something",
+    }))
+    result = runner.invoke(app, ["import-tf", str(tf_file)])
+    assert result.exit_code != 0
+    assert "failed to parse" in result.stderr
+    assert result.stdout == ""  # never a canvas on a parse failure
+
+
+@respx.mock
+def test_import_tf_only_unsupported_stays_exit_zero(runner, tmp_path):
+    # The other side of finding #7: a WELL-FORMED file with only unsupported
+    # resources is a success (exit 0), just with an unsupported list on stderr.
+    tf_file = tmp_path / "unsupported.tf"
+    tf_file.write_text('resource "aws_cloudwatch_log_group" "logs" {\n  name = "logs"\n}\n')
+    respx.post(f"{BASE}/import-tf").mock(return_value=httpx.Response(200, json={
+        "nodes": [], "edges": [],
+        "unsupported": [{"type": "aws_cloudwatch_log_group", "name": "logs", "reason": "not supported"}],
+        "warnings": [], "parse_error": None,
+    }))
+    result = runner.invoke(app, ["import-tf", str(tf_file)])
+    assert result.exit_code == 0
+    assert json.loads(result.stdout) == {"nodes": [], "edges": []}
+    assert "aws_cloudwatch_log_group" in result.stderr
+
+
+@respx.mock
 def test_import_tf_server_down(runner, tmp_path):
     tf_file = tmp_path / "main.tf"
     tf_file.write_text(MAIN_TF)
