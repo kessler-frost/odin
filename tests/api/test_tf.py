@@ -10,6 +10,7 @@ from odin.gateway.keys import OPERATOR_NODE_ID
 from odin.runtime.colima import ContainerFacts, HostFacts, RunHandle
 from odin.server import create_app
 from odin.simulate.runner import SimulateBusy
+from odin.spec.models import FieldValue, ResourceDesired, Stack
 from odin.spec.store import SpecStore
 
 
@@ -99,6 +100,29 @@ def test_tf_destroy_409_when_a_run_is_already_in_flight(tmp_path):
         resp = client.post("/tf/destroy", params={"env": "default"})
     assert resp.status_code == 409
     assert "already in progress" in resp.json()["error"]
+
+
+# --- owner directive B1: pre-apply admission control -----------------------
+
+
+class _LowMemRuntime(FakeRuntime):
+    def ensure_host(self):
+        return HostFacts(total_mem_mib=1000.0)
+
+
+def test_tf_apply_409_when_the_stack_exceeds_the_memory_budget(tmp_path):
+    app = create_app(runtime=_LowMemRuntime(), store=SpecStore(tmp_path), rds=FakeRds(), backings=False)
+    stack = Stack(env="default", resources=tuple(
+        ResourceDesired(id=f"web{i}", kind="ec2", fields={"instanceType": FieldValue(value="t3.medium")})
+        for i in range(50)
+    ))
+    app.state.store.apply(stack)
+    with TestClient(app) as client:
+        resp = client.post("/tf/apply", params={"env": "default"})
+    assert resp.status_code == 409
+    body = resp.json()
+    assert "GiB" in body["error"] and "reduce instance sizes or apply fewer nodes" in body["error"]
+    assert body["estimated_mib"] > body["budget_mib"]
 
 
 def test_tf_status_for_a_never_applied_env(tmp_path):

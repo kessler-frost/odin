@@ -36,6 +36,7 @@ from odin.gateway.app import GatewayState, create_gateway_app, serve_in_thread, 
 from odin.gateway.keys import OPERATOR_NODE_ID, KeyStore, Principal
 from odin.gateway.models import ec2compute
 from odin.gateway.stores import SynthStores
+from odin.reconcile import admission
 from odin.reconcile.reconciler import Reconciler
 from odin.runtime.colima import ColimaRuntime
 from odin.simulate.runner import SimulateBusy, TfRunner, TofuNotInstalled
@@ -100,6 +101,27 @@ def _bump_epoch(env_epoch: dict[str, int], env: str) -> int:
     notice it's been superseded instead of going on to undo the teardown."""
     env_epoch[env] = env_epoch.get(env, 0) + 1
     return env_epoch[env]
+
+
+async def _admission_rejection(runtime, store: SpecStore, stack: Stack) -> JSONResponse | None:
+    """Owner directive B1: the pre-apply admission check, shared by
+    `/apply-full` and `/tf/apply` -- both must reject BEFORE touching any
+    container/VM, never after. `ensure_host()` shells to `docker info`
+    (blocking); `asyncio.to_thread` keeps that off the event loop, same
+    precaution `_reap_orphaned_ec2_vms` already takes for its own blocking
+    `limactl` calls. Returns None when admitted, else the 409 JSONResponse
+    the caller should return VERBATIM (named numbers, never a bare
+    "rejected")."""
+    host = await asyncio.to_thread(runtime.ensure_host)
+    result = admission.check_admission(stack, host, store.root)
+    if result.ok:
+        return None
+    return JSONResponse(status_code=409, content={
+        "error": result.reason,
+        "estimated_mib": result.estimated_mib,
+        "budget_mib": result.budget_mib,
+        "free_disk_gib": result.free_disk_gib,
+    })
 
 
 def create_apply_router(
@@ -185,7 +207,7 @@ class ImportTfRequest(BaseModel):
 
 def create_tf_router(
     store: SpecStore, runner: TfRunner, keystore: KeyStore, gateway_port,
-    translate_cache: translate_mod.TranslateCache,
+    translate_cache: translate_mod.TranslateCache, runtime,
 ) -> APIRouter:
     """`/tf/*` -- Simulate's own apply/destroy/status, independent of the
     canvas `/apply`/`/destroy` above (S2 CONTRACT ADDENDUM: routes named
@@ -201,6 +223,11 @@ def create_tf_router(
     @router.post("/tf/apply")
     async def tf_apply(env: str = ENV) -> JSONResponse:
         stack = store.get_stack(env)
+        # Owner directive B1: reject BEFORE tofu ever runs, not after it's
+        # already spawned real containers/VMs that then fail one-by-one.
+        rejection = await _admission_rejection(runtime, store, stack)
+        if rejection is not None:
+            return rejection
         project = generate_tf(stack)
         access_key, secret_key = _issue_operator(env)
         try:
@@ -277,7 +304,7 @@ _SUPERSEDED = {"error": "superseded by a newer teardown/apply"}
 
 def create_apply_full_router(
     store: SpecStore, reconciler_for, runner: TfRunner, keystore: KeyStore, gateway_port, env_epoch: dict[str, int],
-    translate_cache: translate_mod.TranslateCache,
+    translate_cache: translate_mod.TranslateCache, runtime,
 ) -> APIRouter:
     """S5 -- the UI's single Apply button: /apply's exact canvas->Stack->tick
     semantics, then translate (S3b) and, when the canvas has TF-supported
@@ -298,6 +325,13 @@ def create_apply_full_router(
             )
         canvas = graph.model_dump()
         stack = canvas_to_stack(canvas, env=env)
+
+        # Owner directive B1: reject BEFORE ensure_backings/translate/tofu
+        # ever touch a container or VM, not after 20 of them have already
+        # started thrashing the host.
+        rejection = await _admission_rejection(runtime, store, stack)
+        if rejection is not None:
+            return rejection
 
         # Release finding #4: an empty-canvas apply IS a teardown (see the
         # hold() block below) -- it must invalidate any older, still-in-flight
@@ -558,11 +592,12 @@ def create_app(
         create_apply_router(_store, reconciler_for, gateway_keystore, tf_runner, lambda: gateway_port_actual, env_epoch)
     )
     app.include_router(
-        create_tf_router(_store, tf_runner, gateway_keystore, lambda: gateway_port_actual, translate_cache)
+        create_tf_router(_store, tf_runner, gateway_keystore, lambda: gateway_port_actual, translate_cache, _runtime)
     )
     app.include_router(
         create_apply_full_router(
-            _store, reconciler_for, tf_runner, gateway_keystore, lambda: gateway_port_actual, env_epoch, translate_cache,
+            _store, reconciler_for, tf_runner, gateway_keystore, lambda: gateway_port_actual, env_epoch,
+            translate_cache, _runtime,
         )
     )
     app.include_router(create_logs_router(_store, gateway_stores, _runtime))

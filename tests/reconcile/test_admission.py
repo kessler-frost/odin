@@ -1,0 +1,189 @@
+"""Owner directive B1 -- the pre-apply admission check: sum the Stack's
+estimated memory footprint against real host headroom, and free disk on the
+store volume, BEFORE Apply spawns anything."""
+from __future__ import annotations
+
+from odin.reconcile import admission
+from odin.reconcile.admission import (
+    AdmissionResult,
+    check_admission,
+    default_memory_budget_mib,
+    default_min_disk_gib,
+    estimate_stack_memory_mib,
+)
+from odin.runtime.driver import HostFacts
+from odin.spec.models import FieldValue, ResourceDesired, Stack
+
+# --- estimate_stack_memory_mib -----------------------------------------------
+
+
+def test_empty_stack_estimates_zero():
+    assert estimate_stack_memory_mib(Stack()) == 0.0
+
+
+def test_ec2_uses_the_real_instance_type_memory_table():
+    stack = Stack(resources=(
+        ResourceDesired(id="web1", kind="ec2", fields={"instanceType": FieldValue(value="t3.medium")}),
+    ))
+    assert estimate_stack_memory_mib(stack) == 4096.0  # t3.medium == 4GiB
+
+
+def test_ec2_defaults_to_t3_micro_when_the_field_is_unset():
+    stack = Stack(resources=(ResourceDesired(id="web1", kind="ec2"),))
+    assert estimate_stack_memory_mib(stack) == 1024.0  # t3.micro == 1GiB
+
+
+def test_rds_ecs_lambda_are_charged_per_node():
+    stack = Stack(resources=(
+        ResourceDesired(id="db1", kind="rds"),
+        ResourceDesired(id="db2", kind="rds"),
+        ResourceDesired(id="task1", kind="ecs"),
+        ResourceDesired(id="fn1", kind="lambda"),
+    ))
+    assert estimate_stack_memory_mib(stack) == 2 * 256.0 + 512.0 + 256.0
+
+
+def test_backing_kinds_are_charged_once_per_env_not_per_node():
+    # Ten buckets share ONE RustFS container -- must NOT be 10x the estimate.
+    stack = Stack(resources=tuple(ResourceDesired(id=f"bucket{i}", kind="s3") for i in range(10)))
+    assert estimate_stack_memory_mib(stack) == 256.0
+
+
+def test_multiple_distinct_backing_kinds_each_charged_once():
+    stack = Stack(resources=(
+        ResourceDesired(id="b1", kind="s3"), ResourceDesired(id="b2", kind="s3"),
+        ResourceDesired(id="q1", kind="sqs"), ResourceDesired(id="t1", kind="sns"),
+        ResourceDesired(id="d1", kind="dynamodb"),
+    ))
+    assert estimate_stack_memory_mib(stack) == 256.0 + 128.0 + 128.0 + 256.0
+
+
+def test_zero_footprint_kinds_contribute_nothing():
+    stack = Stack(resources=(
+        ResourceDesired(id="v1", kind="vpc"), ResourceDesired(id="s1", kind="subnet"),
+        ResourceDesired(id="sg1", kind="sg"), ResourceDesired(id="r1", kind="iam_role"),
+        ResourceDesired(id="e1", kind="ecr"),
+    ))
+    assert estimate_stack_memory_mib(stack) == 0.0
+
+
+# --- default_memory_budget_mib / default_min_disk_gib -----------------------
+
+
+def test_memory_budget_defaults_to_70_percent_of_total(monkeypatch):
+    monkeypatch.delenv("ODIN_MEMORY_BUDGET_MIB", raising=False)
+    assert default_memory_budget_mib(10_000.0) == 7_000.0
+
+
+def test_memory_budget_env_override_wins(monkeypatch):
+    monkeypatch.setenv("ODIN_MEMORY_BUDGET_MIB", "2048")
+    assert default_memory_budget_mib(10_000.0) == 2048.0
+
+
+def test_min_disk_gib_defaults_to_10(monkeypatch):
+    monkeypatch.delenv("ODIN_MIN_DISK_GIB", raising=False)
+    assert default_min_disk_gib() == 10.0
+
+
+def test_min_disk_gib_env_override_wins(monkeypatch):
+    monkeypatch.setenv("ODIN_MIN_DISK_GIB", "25")
+    assert default_min_disk_gib() == 25.0
+
+
+# --- check_admission ----------------------------------------------------------
+
+
+def test_a_small_stack_on_a_healthy_host_is_admitted(tmp_path, monkeypatch):
+    monkeypatch.delenv("ODIN_MEMORY_BUDGET_MIB", raising=False)
+    monkeypatch.delenv("ODIN_MIN_DISK_GIB", raising=False)
+    stack = Stack(resources=(ResourceDesired(id="uploads", kind="s3"),))
+    result = check_admission(stack, HostFacts(total_mem_mib=16_000.0), tmp_path)
+    assert result.ok is True
+    assert result.reason == ""
+    assert result.estimated_mib == 256.0
+
+
+def test_a_stack_exceeding_the_memory_budget_is_rejected_with_the_numbers(tmp_path, monkeypatch):
+    monkeypatch.delenv("ODIN_MEMORY_BUDGET_MIB", raising=False)
+    # 20 t3.medium EC2 nodes -> 20 * 4GiB == 80GiB, way past 70% of an 8GiB host.
+    stack = Stack(resources=tuple(
+        ResourceDesired(id=f"web{i}", kind="ec2", fields={"instanceType": FieldValue(value="t3.medium")})
+        for i in range(20)
+    ))
+    result = check_admission(stack, HostFacts(total_mem_mib=8_000.0), tmp_path)
+    assert result.ok is False
+    assert "80.0 GiB" in result.reason
+    assert "GiB" in result.reason and "5.5 GiB" in result.reason  # 70% of 8000 MiB budget
+    assert "reduce instance sizes or apply fewer nodes" in result.reason
+
+
+def test_memory_budget_env_override_is_honored_by_check_admission(tmp_path, monkeypatch):
+    monkeypatch.setenv("ODIN_MEMORY_BUDGET_MIB", "100")  # absurdly small on purpose
+    stack = Stack(resources=(ResourceDesired(id="uploads", kind="s3"),))  # 256 MiB estimate
+    result = check_admission(stack, HostFacts(total_mem_mib=64_000.0), tmp_path)
+    assert result.ok is False
+    assert result.budget_mib == 100.0
+
+
+def test_insufficient_disk_is_rejected_even_when_memory_is_fine(tmp_path, monkeypatch):
+    monkeypatch.delenv("ODIN_MEMORY_BUDGET_MIB", raising=False)
+    monkeypatch.setattr(admission, "disk_usage", lambda path: type("_U", (), {"free": 2 * 2**30})())
+    stack = Stack(resources=(ResourceDesired(id="uploads", kind="s3"),))
+    result = check_admission(stack, HostFacts(total_mem_mib=64_000.0), tmp_path)
+    assert result.ok is False
+    assert "2.0 GiB free disk" in result.reason
+    assert "need >10 GiB" in result.reason
+
+
+def test_min_disk_env_override_is_honored(tmp_path, monkeypatch):
+    monkeypatch.setattr(admission, "disk_usage", lambda path: type("_U", (), {"free": 50 * 2**30})())
+    monkeypatch.setenv("ODIN_MIN_DISK_GIB", "100")
+    stack = Stack(resources=(ResourceDesired(id="uploads", kind="s3"),))
+    result = check_admission(stack, HostFacts(total_mem_mib=64_000.0), tmp_path)
+    assert result.ok is False
+    assert "need >100 GiB" in result.reason
+
+
+def test_unknown_host_memory_skips_the_memory_check_not_the_disk_check(tmp_path, monkeypatch):
+    # HostFacts() (all zero) is what ensure_host() returns when `docker
+    # info` fails (Colima not running) -- and what every test fake that
+    # predates this feature returns. Rejecting on a bogus "0 GiB budget"
+    # would be actively misleading; Apply fails with a clearer error later.
+    monkeypatch.delenv("ODIN_MEMORY_BUDGET_MIB", raising=False)
+    stack = Stack(resources=tuple(
+        ResourceDesired(id=f"web{i}", kind="ec2", fields={"instanceType": FieldValue(value="t3.medium")})
+        for i in range(50)  # would obviously blow any real budget
+    ))
+    result = check_admission(stack, HostFacts(total_mem_mib=0.0), tmp_path)
+    assert result.ok is True
+
+
+def test_an_explicit_budget_override_still_applies_even_with_unknown_host_memory(tmp_path, monkeypatch):
+    monkeypatch.setenv("ODIN_MEMORY_BUDGET_MIB", "100")
+    stack = Stack(resources=(ResourceDesired(id="uploads", kind="s3"),))  # 256 MiB estimate
+    result = check_admission(stack, HostFacts(total_mem_mib=0.0), tmp_path)
+    assert result.ok is False
+    assert result.budget_mib == 100.0
+
+
+def test_ok_result_still_carries_the_numbers_for_display():
+    result = AdmissionResult(ok=True, estimated_mib=256.0, budget_mib=7000.0, free_disk_gib=50.0, min_disk_gib=10.0)
+    assert result.reason == ""
+
+
+def test_check_admission_reads_real_free_disk_on_the_given_path(tmp_path):
+    # No monkeypatch here -- a real shutil.disk_usage call against tmp_path,
+    # proving disk_path (not a hardcoded root) is what's actually checked.
+    stack = Stack(resources=(ResourceDesired(id="uploads", kind="s3"),))
+    result = check_admission(stack, HostFacts(total_mem_mib=64_000.0), tmp_path)
+    assert isinstance(result.free_disk_gib, float) and result.free_disk_gib > 0
+
+
+def test_check_admission_tolerates_a_store_root_that_does_not_exist_yet(tmp_path):
+    # A brand-new install's very first Apply: `.odin/` hasn't been created by
+    # anything yet -- disk_usage must walk up to an existing ancestor instead
+    # of raising FileNotFoundError.
+    never_created = tmp_path / "does-not-exist-yet" / ".odin"
+    stack = Stack(resources=(ResourceDesired(id="uploads", kind="s3"),))
+    result = check_admission(stack, HostFacts(total_mem_mib=64_000.0), never_created)
+    assert isinstance(result.free_disk_gib, float) and result.free_disk_gib > 0
