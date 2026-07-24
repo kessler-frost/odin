@@ -22,7 +22,7 @@ from odin.agent import hcl
 from odin.agent import translate as translate_mod
 from odin.agent.hcl import generate_tf
 from odin.agent.translate import translate, validate_refinement
-from odin.spec.models import ResourceDesired, Stack
+from odin.spec.models import FieldValue, ResourceDesired, Stack
 from odin.spec.store import rev_of
 
 _NO_TOFU = shutil.which("tofu") is None
@@ -248,6 +248,40 @@ async def test_binary_files_survive_a_successful_refinement():
     result = await translate(_LAMBDA_STACK, client_cls=fake)
     assert result.refined is True
     assert result.binary_files == skeleton.binary_files
+
+
+# --- security finding #3: the LLM prompt never sees a raw secret ----------
+
+
+def test_prompt_redacts_sensitive_field_values_in_the_resources_summary():
+    stack = Stack(resources=(
+        ResourceDesired(id="db", kind="rds", fields={
+            "password": FieldValue(value="hunter2", sensitive=True),
+            "engine": FieldValue(value="postgres", sensitive=False),
+        }),
+    ))
+    skeleton = generate_tf(stack)
+    prompt = translate_mod._prompt(skeleton, stack)
+    assert "hunter2" not in prompt
+    assert "postgres" in prompt  # non-sensitive values are still shown, unredacted
+
+
+def test_prompt_scrubs_a_sensitive_value_out_of_the_main_tf_preview_too():
+    # A secret can land IN the generated HCL itself (e.g. an EC2 userData
+    # script), not just in the resources summary -- _prompt must scrub by
+    # VALUE (Stack.sensitive_values()) so it doesn't leak through there either.
+    stack = Stack(resources=(
+        ResourceDesired(id="net", kind="vpc", fields={}),
+        ResourceDesired(id="web", kind="subnet", fields={"vpc": FieldValue(value="net")}),
+        ResourceDesired(id="vm", kind="ec2", fields={
+            "subnet": FieldValue(value="web"),
+            "userData": FieldValue(value="ODIN_SUPER_SECRET_INIT_TOKEN", sensitive=True),
+        }),
+    ))
+    skeleton = generate_tf(stack)
+    assert "ODIN_SUPER_SECRET_INIT_TOKEN" in skeleton.files["main.tf"]  # sanity: the real skeleton has it
+    prompt = translate_mod._prompt(skeleton, stack)
+    assert "ODIN_SUPER_SECRET_INIT_TOKEN" not in prompt
 
 
 def test_for_display_drops_binary_files_and_is_json_serializable():

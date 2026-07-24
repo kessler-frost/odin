@@ -14,6 +14,35 @@ from pydantic import BaseModel
 
 Provenance = Literal["user", "ai", "default"]
 
+# Security finding #3: field names that look like they carry a credential --
+# used to default `FieldValue.sensitive` so a canvas author doesn't have to
+# hand-flag every rds `password`, EC2 `key`, or secret-looking env var.
+_SENSITIVE_NAME_HINTS = ("password", "secret", "token", "key")
+# Shorter than this, scrubbing risks mangling unrelated legitimate text (a
+# tofu log line, an LLM prompt) for a value too short to be a real secret.
+_MIN_SCRUBBABLE_LEN = 4
+REDACTED = "[REDACTED]"
+
+
+def is_sensitive_field_name(name: str) -> bool:
+    """Case-insensitive substring match against `_SENSITIVE_NAME_HINTS` --
+    catches `password`, `db_password`, `apiToken`, `secret_key`, `key_name`,
+    etc. without needing an exhaustive field-name list."""
+    lowered = name.lower()
+    return any(hint in lowered for hint in _SENSITIVE_NAME_HINTS)
+
+
+def scrub(text: str, secrets: frozenset[str]) -> str:
+    """Replace every occurrence of a known-sensitive raw value with a
+    placeholder. Plain substring replacement, not regex -- `secrets` are
+    opaque user-supplied values, not patterns. The last line of defense for
+    any text surface a secret could otherwise ride out on once it's left the
+    structured Stack/FieldValue world (an LLM prompt, a `tofu` apply/destroy
+    log line)."""
+    for secret in secrets:
+        text = text.replace(secret, REDACTED)
+    return text
+
 # A resource's observed lifecycle phase.
 Phase = Literal[
     "pending",    # desired but nothing started
@@ -35,6 +64,12 @@ class FieldValue(BaseModel):
     model_config = {"frozen": True}
     value: Any
     provenance: Provenance = "user"
+    # Security finding #3: a field carrying a credential (rds `password`, a
+    # secret-looking env var, ...). Never changes how the reconciler/gateway
+    # USE the value (they need the real thing) -- only whether a diagnostic
+    # surface that echoes the stack back (an LLM prompt, a tofu log line) is
+    # allowed to show it verbatim. See `is_sensitive_field_name`.
+    sensitive: bool = False
 
 
 class Ref(BaseModel):
@@ -64,12 +99,39 @@ class ResourceDesired(BaseModel):
     fields: dict[str, FieldValue] = {}
     refs: tuple[Ref, ...] = ()
 
+    def sensitive_values(self) -> frozenset[str]:
+        """Every sensitive raw value this resource carries, stringified --
+        used to `scrub()` a diagnostic text surface. A dict-valued field
+        (the `env` block) is inspected key-by-key so one secret-looking
+        entry doesn't blanket-redact its non-secret siblings, independent of
+        whether the whole field was marked `sensitive` (that flag is coarser,
+        meant for the LLM-prompt redaction below, not this collector)."""
+        out: set[str] = set()
+        for key, fv in self.fields.items():
+            if isinstance(fv.value, dict):
+                out.update(
+                    str(v) for k, v in fv.value.items()
+                    if is_sensitive_field_name(k) and v not in (None, "")
+                )
+            elif fv.sensitive and fv.value not in (None, ""):
+                out.add(str(fv.value))
+        return frozenset(v for v in out if len(v) >= _MIN_SCRUBBABLE_LEN)
+
 
 class Stack(BaseModel):
     model_config = {"frozen": True}
     env: str = "default"
     resources: tuple[ResourceDesired, ...] = ()
     edges: tuple[Edge, ...] = ()
+
+    def sensitive_values(self) -> frozenset[str]:
+        """The union of every resource's `sensitive_values()` -- the full
+        secret set a caller should `scrub()` out of a text surface derived
+        from this whole Stack."""
+        out: set[str] = set()
+        for r in self.resources:
+            out |= r.sensitive_values()
+        return frozenset(out)
 
 
 class ResourceObserved(BaseModel):

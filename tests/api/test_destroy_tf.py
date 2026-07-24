@@ -54,7 +54,7 @@ def test_destroy_runs_tofu_destroy_when_a_workspace_exists(tmp_path):
     calls = []
     principals = []
 
-    async def _destroy(env, gateway_port, access_key, secret_key):
+    async def _destroy(env, gateway_port, access_key, secret_key, **kwargs):
         calls.append((env, gateway_port, access_key, secret_key))
         # Captured DURING the call -- /destroy revokes the env's keys
         # (including this operator credential) right after, so the
