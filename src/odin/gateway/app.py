@@ -263,7 +263,17 @@ def serve_in_thread(app: Starlette, host: str = "0.0.0.0", port: int = 0) -> tup
     function used) so the actual bound port is known before uvicorn ever
     starts, rather than needing to introspect it from another thread
     afterward. Returns (server, thread, actual_port); stop via
-    `stop_in_thread`."""
+    `stop_in_thread`.
+
+    Security finding #1 NOTE: `host="0.0.0.0"` here is deliberate and NOT
+    the same bug as the control app's old default (see __main__.py) --
+    containers (a workload's AWS SDK, tofu's own provider) reach this
+    gateway via `host.docker.internal`, which resolves to the HOST's real
+    interface, not its loopback; a `127.0.0.1` bind would be unreachable
+    from inside a container. This is safe specifically because every
+    request here is SigV4-verified (`catch_all` -> `sigv4.verify`, this
+    module's own docstring) before anything is classified or forwarded --
+    unlike the control app, which has no equivalent per-request check."""
     actual_port = port or _free_port()
     config = uvicorn.Config(app, host=host, port=actual_port, log_level="warning")
     server = uvicorn.Server(config)

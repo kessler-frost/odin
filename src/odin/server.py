@@ -14,8 +14,9 @@ from contextlib import asynccontextmanager
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlparse
 
-from fastapi import APIRouter, FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -60,6 +61,32 @@ def _odin_version() -> str:
         return _pkg_version("odin")
     except PackageNotFoundError:
         return _FALLBACK_VERSION
+
+
+# Security finding #1c: CSRF defense-in-depth. odin has no authentication
+# of its own (see __main__.py's loopback-default fix) -- a browser tab open
+# on ANY other site could POST straight to this server's /apply-full and it
+# would just run it. A browser ALWAYS sends `Origin` (and normally `Referer`)
+# on a cross-site state-changing request; curl, the `odin` CLI, and an
+# agent's own HTTP client send neither -- so this only ever blocks a browser
+# acting on a page odin didn't serve, never a legitimate CLI/agent caller.
+_UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _is_loopback_origin(value: str) -> bool:
+    return urlparse(value).hostname in _LOOPBACK_HOSTS
+
+
+async def _csrf_guard(request: Request, call_next):
+    if request.method in _UNSAFE_METHODS:
+        origin = request.headers.get("origin") or request.headers.get("referer")
+        if origin and not _is_loopback_origin(origin):
+            return JSONResponse(
+                status_code=403,
+                content={"error": "cross-origin request rejected (odin has no authentication; only same-origin requests are trusted)"},
+            )
+    return await call_next(request)
 
 
 def _bump_epoch(env_epoch: dict[str, int], env: str) -> int:
@@ -108,8 +135,11 @@ def create_apply_router(
         body: dict = {"status": "destroyed", "env": env, "tf": None}
         if status["workspace_exists"]:
             access_key, secret_key = keystore.issue(env, OPERATOR_NODE_ID)
+            # Security finding #3: scrub any sensitive field's raw value out
+            # of tofu's own destroy log before it reaches the tail/WS/events.
+            secrets = store.get_stack(env).sensitive_values()
             try:
-                result = await runner.destroy(env, gateway_port(), access_key, secret_key)
+                result = await runner.destroy(env, gateway_port(), access_key, secret_key, secrets=secrets)
             except TofuNotInstalled:
                 # Not a request-level error: the reconciler half still runs below.
                 body["tf"] = {"status": "unavailable", "exit_code": None, **_TOFU_NOT_INSTALLED}
@@ -173,7 +203,9 @@ def create_tf_router(
         project = generate_tf(stack)
         access_key, secret_key = _issue_operator(env)
         try:
-            result = await runner.apply(env, project, gateway_port(), access_key, secret_key)
+            result = await runner.apply(
+                env, project, gateway_port(), access_key, secret_key, secrets=stack.sensitive_values(),
+            )
         except TofuNotInstalled:
             return JSONResponse(status_code=409, content=_TOFU_NOT_INSTALLED)
         except SimulateBusy as exc:
@@ -189,8 +221,9 @@ def create_tf_router(
     @router.post("/tf/destroy")
     async def tf_destroy(env: str = ENV) -> JSONResponse:
         access_key, secret_key = _issue_operator(env)
+        secrets = store.get_stack(env).sensitive_values()
         try:
-            result = await runner.destroy(env, gateway_port(), access_key, secret_key)
+            result = await runner.destroy(env, gateway_port(), access_key, secret_key, secrets=secrets)
         except TofuNotInstalled:
             return JSONResponse(status_code=409, content=_TOFU_NOT_INSTALLED)
         except SimulateBusy as exc:
@@ -366,7 +399,9 @@ def create_apply_full_router(
                 )
                 access_key, secret_key = keystore.issue(env, OPERATOR_NODE_ID)
                 try:
-                    result = await runner.apply(env, project, gateway_port(), access_key, secret_key)
+                    result = await runner.apply(
+                        env, project, gateway_port(), access_key, secret_key, secrets=stack.sensitive_values(),
+                    )
                 except TofuNotInstalled:
                     # Not a request-level error: the reconciler half still applies below.
                     body["tf"] = {"status": "unavailable", "exit_code": None, **_TOFU_NOT_INSTALLED}
@@ -516,6 +551,7 @@ def create_app(
             stop_in_thread(gateway_server, gateway_thread)
 
     app = FastAPI(title="odin", version=_odin_version(), lifespan=lifespan)
+    app.middleware("http")(_csrf_guard)
     app.include_router(create_canvas_router(CANVAS_PATH))
     app.include_router(
         create_apply_router(_store, reconciler_for, gateway_keystore, tf_runner, lambda: gateway_port_actual, env_epoch)
