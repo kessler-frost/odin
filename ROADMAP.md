@@ -1,10 +1,10 @@
 # Odin Roadmap
 
 Odin (repo: odin): a local-first AWS-compatible cloud. A drag-drop canvas
-where you design real AWS architectures; an agent (claude-agent-sdk)
-translates canvas ↔ Terraform/OpenTofu both ways; **Apply** — the one action
-button — runs a real `tofu apply` against odin's own gateway, which fulfills
-the AWS API calls with local substitutes (RustFS for S3, etc.) at full API
+where you design real AWS architectures; a deterministic translator turns the
+canvas into Terraform/OpenTofu and back; **Apply** — the one action button —
+runs a real `tofu apply` against odin's own gateway, which fulfills the AWS
+API calls with local substitutes (RustFS for S3, etc.) at full API
 compatibility; IAM permissions drawn as edges are **enforced for real** by
 odin's own gateway; Nebula is the network layer.
 
@@ -48,9 +48,12 @@ future decision against these points instead of re-deriving them:
   sticky IPs, `sg_rules_to_firewall` — the substrate for the network layer.
 - **Spec Store** (append-only revisions), per-env isolation, the events/WS
   status pipeline, the integration-test harness, the `odin` CLI skeleton.
-- **claude-agent-sdk brain machinery** — repurposed toward canvas↔IaC
-  translation and TF generation; its typed-membrane pattern moves into the
-  translation agent's tools.
+- **claude-agent-sdk** — an optional, off-by-default refine pass over the
+  deterministic canvas→TF translation (`ODIN_TRANSLATE_REFINE`), fenced by a
+  guardrail that rejects any change to the architecture or to a value the
+  canvas set. The agent-shaped work it could genuinely own — HCL for kinds
+  with no builder, least-privilege policy synthesis, plain-English failure
+  explanation (M8) — is roadmap, not shipped.
 
 ## Roadmap (northstar-derived sequence)
 
