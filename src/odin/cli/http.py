@@ -64,10 +64,14 @@ def request(
 
 
 def body_or_fail(response: httpx.Response) -> dict:
-    """The parsed body; an `{"error": ...}` refusal (409 busy / superseded /
-    tofu-not-installed) goes to stderr with exit code 1 instead."""
+    """The parsed body; a truthy `error` (409 busy / superseded /
+    tofu-not-installed / GET /logs's "no such node") goes to stderr with
+    exit code 1 instead. Checked by VALUE, not just key presence: a typed
+    Pydantic response model (GET /logs's `LogsResponse`) always serializes
+    an `error` key, `null` on the success path -- a presence-only check
+    would wrongly treat every one of those as a failure."""
     body = response.json()
-    if "error" not in body:
+    if not body.get("error"):
         return body
     raise fail(" — ".join(str(part) for part in (body["error"], body.get("fix")) if part))
 

@@ -143,6 +143,7 @@ const statusConfig: Record<WsStatus, { color: string; label: string; pulse: bool
 interface BottomPanelProps {
   bottomState: string;
   activeEnv?: string;
+  selectedNode?: string;
   onCycleBottom: () => void;
   onWsStatusChange?: (connected: boolean) => void;
   onResourceStatus?: (name: string, status: string, error?: string, facts?: Record<string, unknown>) => void;
@@ -150,12 +151,37 @@ interface BottomPanelProps {
   clearSignal?: number;
 }
 
-export default function BottomPanel({ bottomState, activeEnv, onCycleBottom, onWsStatusChange, onResourceStatus, onConfigUpdate, clearSignal }: BottomPanelProps) {
+// Fetch-on-demand: GET /logs for the selected node and splice its output
+// into the Logs tab as regular lines -- the complement to the crash-tail
+// push (type:"log" over the websocket), for "show me what's happening right
+// now" rather than only "tell me when something breaks".
+async function fetchNodeLogs(env: string, node: string): Promise<LogLine[]> {
+  const time = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const body = await fetch(`/logs?env=${encodeURIComponent(env)}&node=${encodeURIComponent(node)}&tail=200`)
+    .then(r => r.json()).catch(() => null) as Record<string, unknown> | null;
+  if (!body) return [{ time, source: node, msg: 'could not reach the odin server', msgClass: 'error' }];
+  if (body.error) return [{ time, source: node, msg: body.error as string, msgClass: 'error' }];
+  const text = [body.message as string | undefined, body.lines as string | undefined].filter(Boolean).join('\n');
+  const lines = text.split('\n').filter(Boolean);
+  if (lines.length === 0) return [{ time, source: node, msg: '(no output)', msgClass: '' }];
+  return lines.map(l => ({ time, source: node, msg: l, msgClass: body.running ? '' : 'warn' }));
+}
+
+export default function BottomPanel({ bottomState, activeEnv, selectedNode, onCycleBottom, onWsStatusChange, onResourceStatus, onConfigUpdate, clearSignal }: BottomPanelProps) {
   const [activeTab, setActiveTab] = useState("Agent");
   const [logs, setLogs] = useState<LogLine[]>([]);
+  const [fetchingLogs, setFetchingLogs] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [agentActive, setAgentActive] = useState(false);
   const [spinnerWord, setSpinnerWord] = useState(spinnerWords[0]);
+
+  const handleFetchLogs = useCallback(async () => {
+    if (!selectedNode || fetchingLogs) return;
+    setFetchingLogs(true);
+    const lines = await fetchNodeLogs(activeEnv ?? 'default', selectedNode);
+    setLogs(prev => [...lines.reverse(), ...prev]);
+    setFetchingLogs(false);
+  }, [selectedNode, activeEnv, fetchingLogs]);
 
   useEffect(() => {
     fetch(`/events?env=${encodeURIComponent(activeEnv ?? 'default')}`)
@@ -199,6 +225,9 @@ export default function BottomPanel({ bottomState, activeEnv, onCycleBottom, onW
         );
       }
     }
+    // A crash-tail push (type:"log") carries an env too -- other envs'
+    // failures shouldn't spam a console the user isn't looking at.
+    if (type === 'log' && (msg.env as string | undefined ?? 'default') !== (activeEnvRef.current ?? 'default')) return;
     const logLines = parseWebSocketMessage(msg);
     if (logLines.length) setLogs(prev => [...logLines, ...prev]);
   }, []);
@@ -237,6 +266,16 @@ export default function BottomPanel({ bottomState, activeEnv, onCycleBottom, onW
           </div>
         ))}
         <div onClick={onCycleBottom} className="flex-1 cursor-pointer h-full" title="Cycle Console size" />
+        {activeTab === 'Logs' && selectedNode && (
+          <button
+            onClick={handleFetchLogs}
+            disabled={fetchingLogs}
+            title={`Fetch real logs for ${selectedNode}`}
+            className="mr-3 font-mono text-[10px] py-1 px-2 border border-border text-text-secondary uppercase tracking-[1px] cursor-pointer hover:border-neon-blue hover:text-neon-blue disabled:opacity-50 disabled:cursor-wait"
+          >
+            {fetchingLogs ? 'Fetching…' : `Fetch logs: ${selectedNode}`}
+          </button>
+        )}
         <div className="pr-4 flex items-center gap-3 font-mono text-[10px] text-text-muted">
           <div className="flex items-center gap-1.5">
             <div className={`w-1.5 h-1.5 rounded-full ${sc.color} ${sc.pulse ? 'animate-pulse' : ''}`} />
@@ -255,7 +294,8 @@ export default function BottomPanel({ bottomState, activeEnv, onCycleBottom, onW
           <div className="py-6 px-4 font-mono text-[11px] text-text-muted/60">
             {activeTab === 'Agent' ? 'Agent idle.'
               : activeTab === 'Events' ? 'No events yet — press Apply to start.'
-              : 'No logs yet.'}
+              : selectedNode ? `No logs yet — click "Fetch logs: ${selectedNode}" above.`
+              : 'No logs yet — select a node to fetch its logs.'}
           </div>
         )}
         {filteredLogs.map((line, i) => (

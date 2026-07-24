@@ -7,6 +7,19 @@ directly against their backing (see reconciler._observe_provisioned), not here.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class PgReady:
+    """`pg_ready`'s result -- `ok` is the boolean the reconciler gates
+    healthy on; `error` is the real exception text (observability v1: this
+    used to be swallowed entirely, so a persistently-misconfigured rds node
+    -- bad creds, wrong db name, anything short of "still booting" -- just
+    sat in `starting` forever with zero diagnostic trail)."""
+
+    ok: bool
+    error: str | None = None
 
 
 def _pg_connect(host: str, port: int, user: str, password: str, db: str) -> bool:
@@ -23,8 +36,9 @@ def _pg_connect(host: str, port: int, user: str, password: str, db: str) -> bool
     return ok
 
 
-async def pg_ready(host: str, port: int, user: str, password: str, db: str = "postgres") -> bool:
+async def pg_ready(host: str, port: int, user: str, password: str, db: str = "postgres") -> PgReady:
     try:
-        return await asyncio.to_thread(_pg_connect, host, port, user, password, db)
-    except Exception:
-        return False
+        ok = await asyncio.to_thread(_pg_connect, host, port, user, password, db)
+        return PgReady(ok=ok)
+    except Exception as exc:
+        return PgReady(ok=False, error=str(exc))

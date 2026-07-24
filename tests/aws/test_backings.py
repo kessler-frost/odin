@@ -103,6 +103,14 @@ def _aws(rt, factory, tmp_path, env="default"):
     return BackingAws(rt, env=env, root=tmp_path, client_factory=factory)
 
 
+def test_container_name_is_the_public_form_of_the_real_backing_name(rt, factory, tmp_path):
+    aws = _aws(rt, factory, tmp_path, env="prod")
+    assert aws.container_name("s3") == "odin-aws-rustfs-prod"
+    assert aws.container_name("sqs") == "odin-aws-goaws-prod"  # sqs/sns share one container
+    assert aws.container_name("sns") == "odin-aws-goaws-prod"
+    assert aws.container_name("dynamodb") == "odin-aws-dynalite-prod"
+
+
 def test_ensure_backing_s3_runs_rustfs_with_creds_and_dynamic_port(rt, factory, tmp_path):
     aws = _aws(rt, factory, tmp_path)
     aws.ensure_backing("s3")
