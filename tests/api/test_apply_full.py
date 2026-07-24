@@ -124,6 +124,45 @@ def _patch_translate(monkeypatch, result: TranslateResult) -> list:
     return calls
 
 
+# --- owner directive B1: pre-apply admission control -----------------------
+
+
+class _LowMemRuntime(FakeRuntime):
+    def ensure_host(self):
+        return HostFacts(total_mem_mib=1000.0)  # far too small for 50 t3.medium EC2 nodes
+
+
+BIG_EC2 = {
+    "nodes": [
+        {"type": "ec2", "data": {"label": f"web{i}", "instanceType": "t3.medium"}}
+        for i in range(50)
+    ],
+    "edges": [],
+}
+
+
+def test_apply_full_rejects_before_touching_anything_when_over_the_memory_budget(tmp_path, monkeypatch):
+    calls = _patch_translate(monkeypatch, TranslateResult(files={}, refined=False))
+    app = create_app(runtime=_LowMemRuntime(), store=SpecStore(tmp_path), rds=FakeRds(), aws=FakeAws(), backings=False)
+    with TestClient(app) as client:
+        resp = client.post("/apply-full", params={"env": "default"}, json=BIG_EC2)
+    assert resp.status_code == 409
+    body = resp.json()
+    assert "GiB" in body["error"] and "reduce instance sizes or apply fewer nodes" in body["error"]
+    assert body["estimated_mib"] > body["budget_mib"]
+    assert calls == []  # translate() never even ran -- rejected before anything else touched
+    assert app.state.store.get_stack("default").resources == ()  # never became the desired state either
+
+
+def test_apply_full_admits_a_small_stack_that_fits_the_budget(tmp_path, monkeypatch):
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: None)
+    _patch_translate(monkeypatch, TranslateResult(files=_skeleton_files(), refined=True))
+    app = _app(tmp_path)  # default FakeRuntime -- HostFacts() (unknown) -- never rejects on memory
+    with TestClient(app) as client:
+        resp = client.post("/apply-full", json=S3_SQS)
+    assert resp.status_code == 200  # unaffected: nothing regressed on the ordinary path
+
+
 def test_rds_only_canvas_skips_tofu_cleanly(tmp_path, monkeypatch):
     # The REAL translate is used: an rds-only stack has zero TF-supported
     # resources, so translate() short-circuits before ever touching the SDK.
