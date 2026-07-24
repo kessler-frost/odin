@@ -26,6 +26,10 @@ class FakeRuntime:
     ports: dict[str, int] = field(default_factory=dict)
     images: set[str] = field(default_factory=set)
     builds: list[str] = field(default_factory=list)
+    # call logs — each entry is a real docker-CLI-shaped subprocess in prod,
+    # so the caching tests assert against their lengths
+    status_calls: list[str] = field(default_factory=list)
+    port_calls: list[str] = field(default_factory=list)
 
     def run_container(self, spec: ContainerSpec):
         self.runs.append(spec)
@@ -38,9 +42,11 @@ class FakeRuntime:
         self.ports.pop(name, None)
 
     def status(self, name: str) -> str:
+        self.status_calls.append(name)
         return self.statuses.get(name, "absent")
 
     def host_port(self, name: str, container_port: int) -> int:
+        self.port_calls.append(name)
         return self.ports.get(name, 0)
 
     def logs(self, name: str, tail: int = 20) -> str:
@@ -381,6 +387,83 @@ def test_gc_with_no_active_kinds_stops_everything(rt, factory, tmp_path):
         "allfather-aws-dynalite-default",
         "allfather-aws-registry-default",
     }
+
+
+# --- per-tick docker-call cache: backing_ports TTL + gc's nothing-changed skip --------
+# The reconciler calls both every ~2s per env; each recompute/sweep is real
+# docker subprocess traffic, so steady-state ticks must answer from cache.
+
+
+def test_backing_ports_second_call_within_ttl_makes_no_runtime_calls(rt, factory, tmp_path):
+    aws = _aws(rt, factory, tmp_path)
+    aws.ensure_backing("s3")
+    first = aws.backing_ports()
+    counts = (len(rt.status_calls), len(rt.port_calls))
+    assert aws.backing_ports() == first
+    assert (len(rt.status_calls), len(rt.port_calls)) == counts  # served from cache
+
+
+def test_backing_ports_requeries_after_the_ttl_expires(rt, factory, tmp_path, monkeypatch):
+    aws = _aws(rt, factory, tmp_path)
+    aws.ensure_backing("s3")
+    aws.backing_ports()
+    status_count = len(rt.status_calls)
+    now = time.monotonic()
+    monkeypatch.setattr(backings.time, "monotonic", lambda: now + backings.PORTS_CACHE_TTL)
+    assert aws.backing_ports() == {"s3": rt.ports["allfather-aws-rustfs-default"]}
+    assert len(rt.status_calls) > status_count  # expired: swept the runtime for real
+
+
+def test_backing_ports_cache_invalidated_when_a_backing_starts(rt, factory, tmp_path):
+    aws = _aws(rt, factory, tmp_path)
+    aws.ensure_backing("s3")
+    assert set(aws.backing_ports()) == {"s3"}
+    aws.ensure_backing("sqs")  # goaws really boots: the s3-only table is stale now
+    assert set(aws.backing_ports()) == {"s3", "sqs", "sns"}
+
+
+def test_backing_ports_cache_invalidated_when_gc_stops_a_backing(rt, factory, tmp_path):
+    aws = _aws(rt, factory, tmp_path)
+    aws.ensure_backing("s3")
+    aws.ensure_backing("sqs")
+    assert set(aws.backing_ports()) == {"s3", "sqs", "sns"}
+    aws.gc({"s3"})  # stops goaws — the cache must not keep serving sqs/sns
+    assert set(aws.backing_ports()) == {"s3"}
+
+
+def test_gc_skips_the_docker_sweep_when_kinds_unchanged_and_nothing_started(rt, factory, tmp_path):
+    aws = _aws(rt, factory, tmp_path)
+    aws.gc({"s3"})
+    swept = list(rt.stopped)
+    aws.gc({"s3"})  # same kinds, nothing ensured in between: zero docker calls
+    assert rt.stopped == swept
+
+
+def test_gc_resweeps_when_the_active_kinds_change(rt, factory, tmp_path):
+    aws = _aws(rt, factory, tmp_path)
+    aws.gc({"s3", "sqs"})
+    swept = len(rt.stopped)
+    aws.gc({"s3"})  # goaws just became inactive — must be swept away
+    assert "allfather-aws-goaws-default" in rt.stopped[swept:]
+
+
+def test_gc_resweeps_after_ensure_backing_actually_starts_a_container(rt, factory, tmp_path):
+    aws = _aws(rt, factory, tmp_path)
+    aws.gc({"s3"})            # sweep once, then the skip arms
+    aws.ensure_backing("s3")  # a real boot (e.g. crash recovery): re-arms the dirty flag
+    swept = len(rt.stopped)
+    aws.gc({"s3"})            # same kinds, but a container just started: must re-sweep
+    assert len(rt.stopped) > swept
+
+
+def test_noop_ensure_backing_on_a_running_container_keeps_gcs_skip_armed(rt, factory, tmp_path):
+    aws = _aws(rt, factory, tmp_path)
+    aws.ensure_backing("s3")  # boots rustfs (dirty)
+    aws.gc({"s3"})            # sweeps, then the skip arms
+    aws.ensure_backing("s3")  # already running: NOT a state change
+    swept = list(rt.stopped)
+    aws.gc({"s3"})            # unchanged kinds + nothing started: still skipped
+    assert rt.stopped == swept
 
 
 # --- V2b: the ecr registry:2 backing --------------------------------------------------
