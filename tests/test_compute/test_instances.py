@@ -232,6 +232,27 @@ def test_list_names_empty_when_no_vms():
     assert InstanceVm(runner=runner).list_names() == []
 
 
+# --- logs (w1 observability: the VM's journal, the container-runtime's
+# closest honest equivalent since there's no single process to attach to) --
+
+
+def test_logs_reads_the_vms_journal_tail():
+    runner = FakeRunner()
+    runner.responses["journalctl"] = _Proc(0, "boot line 1\nboot line 2\n")
+    out = InstanceVm(runner=runner).logs(NAME, tail=5)
+    assert out == "boot line 1\nboot line 2\n"
+    call = next(c for c in runner.calls if "journalctl" in c)
+    assert call == ["limactl", "shell", NAME, "--", "sudo", "journalctl", "-n", "5", "--no-pager"]
+
+
+def test_logs_never_raises_when_the_vm_is_unreachable():
+    runner = FakeRunner()
+    runner.responses["journalctl"] = _Proc(1, "", "no such instance")
+    out = InstanceVm(runner=runner).logs("odin-ec2-default-gone")
+    assert "not reachable" in out
+    assert "no such instance" in out
+
+
 # --- Nebula join -----------------------------------------------------------------
 
 

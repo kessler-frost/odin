@@ -312,6 +312,21 @@ class InstanceVm:
         self._lima("stop", "--force", name, check=False)
         self._lima("delete", "--force", name, check=False)
 
+    def logs(self, name: str, tail: int = 20) -> str:
+        """The VM's systemd journal tail -- the closest honest equivalent to
+        a container's `docker logs` for a real Lima VM (there's no single
+        process to attach to; journalctl aggregates every unit, including
+        cloud-init's own, so a boot failure shows up here too). Never
+        raises: an unreachable VM (not up yet, already deleted, `limactl`
+        itself missing) answers with a clear message instead of a stack
+        trace, matching every other observability read in this app
+        (`_ContainerRuntime.logs`'s own `check=False` contract)."""
+        proc = self._lima("shell", name, "--", "sudo", "journalctl", "-n", str(tail), "--no-pager", check=False)
+        if proc.returncode != 0:
+            detail = proc.stderr.strip() or "no output"
+            return f"[{name}: VM not reachable ({detail})]"
+        return proc.stdout
+
     def status(self, name: str) -> str:
         """`limactl list --json` filtered by the EXACT name -- 'absent' if
         gone. `--json` emits one JSON object per line (JSON Lines), not a
