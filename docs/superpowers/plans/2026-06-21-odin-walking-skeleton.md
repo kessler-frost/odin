@@ -1,10 +1,10 @@
-# ALLFATHER Walking Skeleton (S0–S3) — Implementation Plan
+# ODIN Walking Skeleton (S0–S3) — Implementation Plan
 
 > **For agentic workers:** Use superpowers:subagent-driven-development or superpowers:executing-plans to implement task-by-task. Steps use checkbox (`- [ ]`) syntax.
 
-**Goal:** Evolve odin into the allfather walking skeleton — drop an `api` (app) node + a `db` (RDS) node on the canvas, wire `${{db.DATABASE_URL}}`, apply, and have allfather boot a real Postgres (via MiniStack's RDS API but allfather's own runner — no double-spawn), run a supervised app container that reads the live connection string, paint live status on the canvas, and auto-restart on crash.
+**Goal:** Evolve odin into the walking skeleton — drop an `api` (app) node + a `db` (RDS) node on the canvas, wire `${{db.DATABASE_URL}}`, apply, and have odin boot a real Postgres (via MiniStack's RDS API but odin's own runner — no double-spawn), run a supervised app container that reads the live connection string, paint live status on the canvas, and auto-restart on crash.
 
-**Architecture:** A Spec Store holds per-env `Stack` (desired) + `World` (observed) Pydantic docs. The LLM only writes candidate desired-state; a deterministic Reconciler `plan(Stack, World) → [Action]` drives reality through a Runtime driver; deterministic assertions decide health. MiniStack is embedded in-process as the AWS control plane with its container spawn rewired (via a `_docker` monkeypatch shim) through allfather's Runtime driver. **The app stays bootable at every step:** build the new spine alongside the old Moto/Tofu path, cut over in S2.
+**Architecture:** A Spec Store holds per-env `Stack` (desired) + `World` (observed) Pydantic docs. The LLM only writes candidate desired-state; a deterministic Reconciler `plan(Stack, World) → [Action]` drives reality through a Runtime driver; deterministic assertions decide health. MiniStack is embedded in-process as the AWS control plane with its container spawn rewired (via a `_docker` monkeypatch shim) through odin's Runtime driver. **The app stays bootable at every step:** build the new spine alongside the old Moto/Tofu path, cut over in S2.
 
 **Tech Stack:** Python 3.12+ (uv), FastAPI, Pydantic v2, claude-agent-sdk, forked MiniStack (ASGI3, embedded), Colima/nerdctl for real containers, React/ReactFlow UI (kept), pytest (asyncio_mode=auto).
 
@@ -27,7 +27,7 @@ src/odin/spec/            NEW   — Stack/World/Changeset models + SpecStore (ap
 src/odin/runtime/         NEW   — Runtime driver port + Colima impl + container shim
   driver.py                     RuntimeDriver Protocol; ContainerSpec; RunHandle; HostFacts
   colima.py                     ColimaRuntime (nerdctl/docker against Colima)
-  shim.py                       AllfatherDockerShim (duck-types docker client for MiniStack)
+  shim.py                       OdinDockerShim (duck-types docker client for MiniStack)
 src/odin/fabric/          NEW   — addressing
   localhost.py                  LocalhostFabric: register(port)->fact, resolve(ref)->Address
 src/odin/aws/             NEW   — MiniStack embed + bootstrap
@@ -56,26 +56,26 @@ tests/spec, tests/runtime, tests/reconcile, tests/aws  NEW
 - [ ] **Step 3 — Implement `embed.py` (routing approach corrected in plan review):** boto3 does NOT use httpx and MiniStack routes at root (not under a `/aws` prefix), so do NOT use `ASGITransport`-for-boto3 and do NOT FastAPI-sub-mount MiniStack. Instead: set `os.environ` (`MINISTACK_HOST=localhost`, `MINISTACK_ACCOUNT_ID`, `RDS_BASE_PORT`) **before** `import ministack.app`; run the embedded app via **`uvicorn` in a background thread on `127.0.0.1:<MINISTACK_PORT>` with `lifespan="off"`** (same process → the `_docker` monkeypatch takes effect; real loopback socket → boto3 works; `lifespan="off"` → MiniStack's reaper/SFTP/scheduler never run). `ministack_boto_client(service)` = `boto3.client(service, endpoint_url="http://127.0.0.1:<port>", aws_access_key_id="000000000000", aws_secret_access_key="x", region_name="us-east-1")` (the 12-digit key = the account id; per-env synthetic ids come at M6). Expose `start_ministack(runtime) -> port` (starts the thread + installs the spawn rewire) and `stop_ministack()`.
 - [ ] **Step 4 — Run → PASS.** **Step 5 — Commit** `feat(aws): embed forked MiniStack as in-process AWS control plane`.
 
-### Task S0.2: AllfatherDockerShim + ColimaRuntime (minimal)
+### Task S0.2: OdinDockerShim + ColimaRuntime (minimal)
 **Files:** Create `src/odin/runtime/shim.py`, `src/odin/runtime/colima.py`, `tests/runtime/test_colima.py`.
 **Interfaces — Produces:**
 - `ColimaRuntime.run_container(ContainerSpec) -> RunHandle` (runs `nerdctl run -d` / `docker run -d` against Colima, returns `RunHandle{id, name}`); `.stop(name)`, `.remove(name)`, `.status(name) -> str`, `.host_port(name, container_port) -> int`.
-- `AllfatherDockerShim(runtime: ColimaRuntime)` exposing the docker-client surface MiniStack calls: `.containers.run(image, environment=, ports=, name=, labels=, **_) -> _ShimContainer`; `_ShimContainer` has `.id`, `.status` (mapped from runtime), `.reload()`, `.attrs`, `.remove()`, `.stop()`.
+- `OdinDockerShim(runtime: ColimaRuntime)` exposing the docker-client surface MiniStack calls: `.containers.run(image, environment=, ports=, name=, labels=, **_) -> _ShimContainer`; `_ShimContainer` has `.id`, `.status` (mapped from runtime), `.reload()`, `.attrs`, `.remove()`, `.stop()`.
 
 - [ ] **Step 1 — Failing test** `test_colima_runs_and_reports`: `rt.run_container(ContainerSpec(image="postgres:16", env={"POSTGRES_PASSWORD":"x"}, ports={5432:0}))`, poll `rt.status(name)` → `"running"`, `rt.host_port(name,5432)` > 0; teardown removes it. (Marked `integration` — needs Colima.)
 - [ ] **Step 2 — Run → FAIL.**
-- [ ] **Step 3 — Implement `ColimaRuntime`** as thin `nerdctl`/`docker` subprocess calls (reuse `odin.process.run`); label every container `allfather=1` + `allfather.name=<name>` (NOT `ministack=…`, to avoid MiniStack's reaper). Implement the shim mapping `containers.run` → `runtime.run_container` with a `_ShimContainer` whose `.status` returns a value never in `{exited,dead,removing}` while booting.
+- [ ] **Step 3 — Implement `ColimaRuntime`** as thin `nerdctl`/`docker` subprocess calls (reuse `odin.process.run`); label every container `odin=1` + `odin.name=<name>` (NOT `ministack=…`, to avoid MiniStack's reaper). Implement the shim mapping `containers.run` → `runtime.run_container` with a `_ShimContainer` whose `.status` returns a value never in `{exited,dead,removing}` while booting.
 - [ ] **Step 4 — Run → PASS** (with Colima). **Step 5 — Commit** `feat(runtime): Colima container runtime + MiniStack docker shim`.
 
 ### Task S0.3: Prove no-double-spawn end-to-end (the make-or-break)
 **Files:** Modify `src/odin/aws/embed.py` (add `install_rds_spawn_rewire(runtime)`); Create `tests/aws/test_rds_rewire.py`.
-**Interfaces — Produces:** `install_rds_spawn_rewire(runtime: ColimaRuntime) -> None` (eagerly `import ministack.services.rds as rds; rds._docker = AllfatherDockerShim(runtime)`).
+**Interfaces — Produces:** `install_rds_spawn_rewire(runtime: ColimaRuntime) -> None` (eagerly `import ministack.services.rds as rds; rds._docker = OdinDockerShim(runtime)`).
 
-- [ ] **Step 1 — Failing integration test** `test_rds_create_boots_real_postgres`: install rewire; in-process boto `rds.create_db_instance(DBInstanceIdentifier="appdb", Engine="postgres", ...)`; poll `describe_db_instances` until `DBInstanceStatus=="available"`; read `Endpoint.Address/Port`; assert a real `psycopg2.connect()` to `127.0.0.1:port` succeeds. Teardown: stop+remove the Postgres, assert 0 leftover `allfather=1` containers.
+- [ ] **Step 1 — Failing integration test** `test_rds_create_boots_real_postgres`: install rewire; in-process boto `rds.create_db_instance(DBInstanceIdentifier="appdb", Engine="postgres", ...)`; poll `describe_db_instances` until `DBInstanceStatus=="available"`; read `Endpoint.Address/Port`; assert a real `psycopg2.connect()` to `127.0.0.1:port` succeeds. Teardown: stop+remove the Postgres, assert 0 leftover `odin=1` containers.
 - [ ] **Step 2 — Run → FAIL.**
 - [ ] **Step 3 — Implement the rewire** + whatever shim fields the RDS path needs (`_docker_image_for_engine` honored, `host_port` binding to 5432, `.reload().status` liveness). Set `RDS_PUBLIC_ENDPOINT`/no `DOCKER_NETWORK` so the endpoint resolves to `{MINISTACK_HOST, host_port}`.
-- [ ] **Step 4 — Run → PASS:** real Postgres boots via allfather's runner, MiniStack reports it available, psycopg2 connects. **This proves the highest-risk seam.** Verify `odin start --dev` still boots (Moto/Tofu path untouched).
-- [ ] **Step 5 — Commit** `feat(aws): prove RDS->real Postgres via allfather runner (no double-spawn)`.
+- [ ] **Step 4 — Run → PASS:** real Postgres boots via odin's runner, MiniStack reports it available, psycopg2 connects. **This proves the highest-risk seam.** Verify `odin start --dev` still boots (Moto/Tofu path untouched).
+- [ ] **Step 5 — Commit** `feat(aws): prove RDS->real Postgres via odin runner (no double-spawn)`.
 
 ---
 
@@ -153,7 +153,7 @@ tests/spec, tests/runtime, tests/reconcile, tests/aws  NEW
   - Drop `api` (image, e.g. a tiny app that reads `DATABASE_URL` and serves 200) + `db` (rds), set `api.env.DATABASE_URL = ${{db.DATABASE_URL}}`, Apply.
   - Assert: db tile → healthy (real Postgres up), api tile → healthy (after db), CPU/RAM strip painted.
   - Kill the api container (`nerdctl rm -f`), assert the tile flips crashed→starting→healthy (auto-restart).
-  - Destroy → assert 0 `allfather=1` containers, clean teardown.
+  - Destroy → assert 0 `odin=1` containers, clean teardown.
   - Record the run in `docs/SCENARIOS.md`. Commit `test(e2e): walking-skeleton slice via playwright + restart + teardown`.
 
 ---

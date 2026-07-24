@@ -1,4 +1,4 @@
-# v0.3.0 — Real Backings: allfather sheds MiniStack
+# v0.3.0 — Real Backings: odin sheds MiniStack
 
 **Date:** 2026-07-22 · **Branch:** `develop` · **Target:** v0.3.0
 
@@ -8,7 +8,7 @@ Keep the AWS-shaped vocabulary — `s3` / `sqs` / `sns` / `dynamodb` / `rds`
 nodes stay, because that's how the user thinks about these components — but
 remove MiniStack entirely. Each kind is backed by a **real open-source
 service** (permissive licenses only: Apache-2.0/MIT/BSD/MPL — no AGPL, no
-proprietary "dev-only" licenses) run as a plain container by allfather's own
+proprietary "dev-only" licenses) run as a plain container by odin's own
 reconciler, so the backings integrate with the runtime, the World, and the
 Nebula mesh like every other workload.
 
@@ -30,12 +30,12 @@ it, merge to `main`, tag v0.3.0, GitHub release.
 
 - **One shared backing container per (env, service-kind)**, started lazily
   when the first node of that kind is provisioned:
-  `allfather-aws-{svc}-{env}` with labels `allfather=1`, `allfather-env={env}`,
-  `allfather-backing={svc}`. Dynamic host ports (`ports={svc_port: 0}`).
+  `odin-aws-{svc}-{env}` with labels `odin=1`, `odin-env={env}`,
+  `odin-backing={svc}`. Dynamic host ports (`ports={svc_port: 0}`).
   Nodes are *resources inside* the backing (bucket / queue / topic / table) —
   dropping two s3 nodes means two buckets, not two object-store clusters.
 - **rds stays per-node**: an rds node = its own Postgres container
-  `allfather-rds-{env}-{id}` (an RDS instance IS a server). Direct spawn via
+  `odin-rds-{env}-{id}` (an RDS instance IS a server). Direct spawn via
   the RuntimeDriver — no emulator in between. (Also fixes the latent cross-env
   container-name collision `ministack-rds-{id}` had.)
 - **Per-env isolation** comes from per-env containers. The 12-digit

@@ -43,7 +43,7 @@ class FakeRds:
         return None
 
     def container_name(self, db_id):
-        return f"allfather-rds-default-{db_id}"
+        return f"odin-rds-default-{db_id}"
 
 
 CANVAS = {

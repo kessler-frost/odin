@@ -90,8 +90,8 @@ def _zip_bytes(files: dict[str, str]) -> bytes:
 # --- container_name / RUNTIME_IMAGES -------------------------------------
 
 
-def test_container_name_is_the_allfather_convention():
-    assert container_name(ENV, FN) == f"allfather-lambda-{ENV}-{FN}"
+def test_container_name_is_the_odin_convention():
+    assert container_name(ENV, FN) == f"odin-lambda-{ENV}-{FN}"
 
 
 def test_runtime_images_map_the_hcl_offered_runtimes():
@@ -138,7 +138,7 @@ def test_ensure_boots_from_the_right_image_with_code_mounted_and_handler_as_comm
     assert spec.command == ("lambda_function.lambda_handler",)
     assert spec.volumes == {str(code_dir): "/var/task"}
     assert spec.env == {"FOO": "bar"}
-    assert spec.labels == {"allfather-env": ENV, "allfather-lambda-fn": FN}
+    assert spec.labels == {"odin-env": ENV, "odin-lambda-fn": FN}
 
 
 def test_ensure_stops_any_existing_container_before_recreating(tmp_path, listener):

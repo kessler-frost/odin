@@ -8,7 +8,7 @@ containers via nerdctl; `InstanceVm` manages MANY per-instance VMs, one full
 VM each -- create/start/stop/delete a whole VM, never `nerdctl run` inside a
 shared one.
 
-VM naming: `allfather-ec2-{env}-{instance_id}` (`vm_name` below) -- the ONLY
+VM naming: `odin-ec2-{env}-{instance_id}` (`vm_name` below) -- the ONLY
 name this module ever passes to `limactl`. NEVER touch a VM outside this
 convention (a user's own Lima VMs, e.g. `veronica`, are off-limits; every
 `limactl` call here names one exact VM, never a wildcard/`--all`).
@@ -96,7 +96,7 @@ def _default_runner(args: list[str], input: str | None = None) -> _Proc:
 
 
 def vm_name(env: str, instance_id: str) -> str:
-    return f"allfather-ec2-{env}-{instance_id}"
+    return f"odin-ec2-{env}-{instance_id}"
 
 
 @dataclass(frozen=True)

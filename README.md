@@ -226,8 +226,8 @@ Every claim above was checked against a real, running instance for the 0.4.0
 release: the full canvas in the screenshot applied end-to-end (`tofu apply`
 exit 0, every resource — including the ones Terraform owns — landing in
 `/world` as `healthy`), real containers confirmed with `docker ps`
-(`allfather-lambda-*` running the actual `public.ecr.aws/lambda/python:3.12`
-image, two `allfather-ecs-*` task containers for a task-count-2 service, a
+(`odin-lambda-*` running the actual `public.ecr.aws/lambda/python:3.12`
+image, two `odin-ecs-*` task containers for a task-count-2 service, a
 real `postgres:16-alpine` for RDS, the RustFS/goaws/dynalite/registry:2
 backings), the IAM deny-check above run against the live gateway, and a full
 teardown that really did destroy all 14 Terraform resources (down to a real

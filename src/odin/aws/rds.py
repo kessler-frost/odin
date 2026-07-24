@@ -15,7 +15,7 @@ class PostgresRds:
         self._env = env
 
     def container_name(self, db_id: str) -> str:
-        return f"allfather-rds-{self._env}-{db_id}"
+        return f"odin-rds-{self._env}-{db_id}"
 
     def create_db(self, db_id: str, user: str, password: str) -> None:
         name = self.container_name(db_id)
@@ -32,7 +32,7 @@ class PostgresRds:
             image=POSTGRES_IMAGE,
             env={"POSTGRES_USER": user, "POSTGRES_PASSWORD": password},
             ports={5432: 0},
-            labels={"allfather-env": self._env},
+            labels={"odin-env": self._env},
         ))
 
     def delete_db(self, db_id: str) -> None:

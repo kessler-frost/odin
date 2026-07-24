@@ -53,7 +53,7 @@ All 22 captures (incl. the SigV2 presigned GET) mapped correctly. **Where it get
 
 ## Q4 — the crux: streaming reverse proxy + re-signing: WORKS
 
-Full chain, nothing mocked: boto3 (`AKIDODINNODE00001`/node secret, path-style) → starlette gateway on :9110 → verify → extract → evaluate → strip `{host, authorization, x-amz-date, x-amz-content-sha256, content-length, user-agent, accept-encoding, expect, connection}` → fresh `AWSRequest` at the backing URL → `S3SigV4Auth(backing_creds).add_auth()` (normal fresh-timestamp signing) → pooled `httpx.Client` → **real RustFS container** (rustfs/rustfs:latest, `allfather`/`allfather-secret-key`).
+Full chain, nothing mocked: boto3 (`AKIDODINNODE00001`/node secret, path-style) → starlette gateway on :9110 → verify → extract → evaluate → strip `{host, authorization, x-amz-date, x-amz-content-sha256, content-length, user-agent, accept-encoding, expect, connection}` → fresh `AWSRequest` at the backing URL → `S3SigV4Auth(backing_creds).add_auth()` (normal fresh-timestamp signing) → pooled `httpx.Client` → **real RustFS container** (rustfs/rustfs:latest, `odin`/`odin-secret-key`).
 
 ```
 create_bucket: OK

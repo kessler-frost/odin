@@ -50,8 +50,8 @@ PROVISIONED = ("s3", "sqs", "sns", "dynamodb")
 # stay untouched) but must still get its registry:2 CONTAINER booted ahead
 # of Apply, same as every other AWS-shaped kind (Reconciler.ensure_backings).
 ENSURE_KINDS = PROVISIONED + ("ecr",)
-ACCESS_KEY = "allfather"
-SECRET_KEY = "allfather-secret-key"
+ACCESS_KEY = "odin"
+SECRET_KEY = "odin-secret-key"
 REGION = "us-east-1"
 ACCOUNT = "000000000000"
 
@@ -85,7 +85,7 @@ DYNALITE_IMAGE = _DYNALITE_IMAGE  # public alias: `odin doctor` inspects/prebake
 
 @dataclass(frozen=True)
 class BackingDef:
-    name: str                  # container name suffix: allfather-aws-{name}-{env}
+    name: str                  # container name suffix: odin-aws-{name}-{env}
     image: str
     port: int                  # container port of the wire API
     env: dict[str, str]
@@ -164,7 +164,7 @@ class BackingAws:
         return next(d for d in BACKINGS if service in d.kinds)
 
     def _cname(self, d: BackingDef) -> str:
-        return f"allfather-aws-{d.name}-{self._env}"
+        return f"odin-aws-{d.name}-{self._env}"
 
     def _listen_port(self, d: BackingDef) -> int:
         """The port the backing's process actually listens on INSIDE its
@@ -207,7 +207,7 @@ class BackingAws:
         try:
             self._rt.run_container(ContainerSpec(
                 name=cname, image=d.image, env=d.env, ports={self._listen_port(d): 0},
-                labels={"allfather-env": self._env}, command=d.command, volumes=volumes,
+                labels={"odin-env": self._env}, command=d.command, volumes=volumes,
             ))
         except RuntimeError as exc:
             if "already in use" not in str(exc):

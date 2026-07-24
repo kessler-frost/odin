@@ -48,7 +48,7 @@ _FIVE = ("uploads", "jobs", "alerts", "items", "db")
 def runtime():
     rt = ColimaRuntime()
     yield rt
-    for cid in rt.list_allfather():
+    for cid in rt.list_odin():
         rt.stop(cid)
 
 
@@ -138,4 +138,4 @@ def test_apply_full_converges_reapplies_zero_drift_and_tears_down(tmp_path, runt
 
         aws.gc(set())  # stop this env's backing containers -- nothing else owns them
 
-    assert runtime.list_allfather() == []
+    assert runtime.list_odin() == []

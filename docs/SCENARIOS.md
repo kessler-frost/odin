@@ -1,4 +1,4 @@
-# allfather — End-to-End Scenarios
+# odin — End-to-End Scenarios
 
 > **Deprecated 2026-07-22 (see [NORTHSTAR.md](../NORTHSTAR.md)):** every
 > scenario in this file — the "walking-skeleton" ones below and the legacy
@@ -10,7 +10,7 @@
 > AWS-core direction (gateway, canvas↔Terraform translation, Simulate) lands
 > as that work does.
 
-> **Architecture pivot (2026-06-21):** allfather replaces odin's old one-shot
+> **Architecture pivot (2026-06-21):** odin replaces its old one-shot
 > Moto/OpenTofu **validate** path with a continuous Reconciler + embedded
 > MiniStack. The 15 AWS-drawing scenarios further below tested the *retired*
 > agent→tofu→Moto validate flow and are kept only as legacy reference — they no
@@ -22,7 +22,7 @@ Driven through the real UI (`uvicorn odin.server:create_app --factory`) + Colima
 
 | # | Scenario | Exercises | Result |
 |---|----------|-----------|--------|
-| W1 | App + RDS, `${{db.DATABASE_URL}}` | embed MiniStack, RDS→real Postgres via allfather's runner (no double-spawn), ref-gated app start, live status tiles | ✅ db+api → healthy; app received the injected URL |
+| W1 | App + RDS, `${{db.DATABASE_URL}}` | embed MiniStack, RDS→real Postgres via odin's runner (no double-spawn), ref-gated app start, live status tiles | ✅ db+api → healthy; app received the injected URL |
 | W2 | Kill the app container | crash detection + auto-restart (supervision) | ✅ crashed → starting → healthy, no user action |
 | W3 | Destroy | prune containers + MiniStack RDS record | ✅ 0 containers, 0 World resources |
 | W4 | Backend integration (`tests/aws/test_skeleton_e2e.py -m integration`) | the whole spine headless: apply → real Postgres + app, restart, teardown | ✅ green |

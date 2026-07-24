@@ -188,7 +188,7 @@ def test_run_instances_starts_pending_and_boots_to_running(sink, ec2, stores):
     assert running["PublicIpAddress"] == "192.168.64.42"
     assert running["SubnetId"] == subnet_id
     assert len(vm.booted) == 1
-    assert vm.booted[0][0].startswith(f"allfather-ec2-{ENV}-{instance_id}")
+    assert vm.booted[0][0].startswith(f"odin-ec2-{ENV}-{instance_id}")
 
 
 def test_run_instances_default_instance_type_and_ami(sink, ec2, stores):
@@ -303,7 +303,7 @@ def test_stop_then_start_round_trips_through_the_vm(sink, ec2, stores):
     assert stop_parsed["StoppingInstances"][0]["CurrentState"]["Name"] == "stopping"
     stopped = _wait_for_state(stores, sink, ec2, instance_id, "stopped", vm)
     assert stopped.get("PrivateIpAddress") is None
-    assert vm.stopped == [f"allfather-ec2-{ENV}-{instance_id}"]
+    assert vm.stopped == [f"odin-ec2-{ENV}-{instance_id}"]
 
     start_req = sink.call(lambda: ec2.start_instances(InstanceIds=[instance_id]))
     _answer(stores, start_req, vm)
@@ -321,7 +321,7 @@ def test_terminate_transitions_then_sweeps_after_grace_window(sink, ec2, stores)
     term_parsed = _parse("TerminateInstances", _answer(stores, term_req, vm))
     assert term_parsed["TerminatingInstances"][0]["CurrentState"]["Name"] == "shutting-down"
     _wait_for_state(stores, sink, ec2, instance_id, "terminated", vm)
-    assert vm.deleted == [f"allfather-ec2-{ENV}-{instance_id}"]
+    assert vm.deleted == [f"odin-ec2-{ENV}-{instance_id}"]
 
     # Still visible right after termination (the ~60s grace window)...
     req = sink.call(lambda: ec2.describe_instances(InstanceIds=[instance_id]))
@@ -373,7 +373,7 @@ def test_terminate_delete_failure_keeps_shutting_down_with_reason_and_retries(si
     # succeeds, and the instance genuinely reaches terminated.
     vm.release_retry.set()
     _wait_for_state(stores, sink, ec2, instance_id, "terminated", vm)
-    name = f"allfather-ec2-{ENV}-{instance_id}"
+    name = f"odin-ec2-{ENV}-{instance_id}"
     assert vm.deleted.count(name) == 2  # the original failed attempt + the successful retry
 
 
@@ -623,18 +623,18 @@ def test_reap_orphaned_vms_deletes_only_unmatched_ec2_named_vms(tmp_path):
     stores = SynthStores(tmp_path)
     stores.ec2compute.set("default", "instance:i-known", {"instance_id": "i-known"})
     vm = FakeReaperVm(names=[
-        "allfather-ec2-default-i-known",      # matches the store -- must survive
-        "allfather-ec2-default-i-orphaned",   # no matching record -- reaped
-        "allfather-ec2-staging-i-elsewhere",  # a different env, no record at all -- reaped
+        "odin-ec2-default-i-known",      # matches the store -- must survive
+        "odin-ec2-default-i-orphaned",   # no matching record -- reaped
+        "odin-ec2-staging-i-elsewhere",  # a different env, no record at all -- reaped
         "veronica",                           # a user's own Lima VM -- never even a candidate
         "some-other-tool-vm",                 # another subsystem's VM -- never touched
     ])
 
     reaped = ec2compute.reap_orphaned_vms(tmp_path, ["default", "staging"], vm=vm)
 
-    assert sorted(reaped) == ["allfather-ec2-default-i-orphaned", "allfather-ec2-staging-i-elsewhere"]
+    assert sorted(reaped) == ["odin-ec2-default-i-orphaned", "odin-ec2-staging-i-elsewhere"]
     assert sorted(vm.deleted) == sorted(reaped)
-    assert "allfather-ec2-default-i-known" not in vm.deleted
+    assert "odin-ec2-default-i-known" not in vm.deleted
     assert "veronica" not in vm.deleted
     assert "some-other-tool-vm" not in vm.deleted
 
@@ -642,7 +642,7 @@ def test_reap_orphaned_vms_deletes_only_unmatched_ec2_named_vms(tmp_path):
 def test_reap_orphaned_vms_is_a_no_op_when_everything_matches(tmp_path):
     stores = SynthStores(tmp_path)
     stores.ec2compute.set("default", "instance:i-known", {"instance_id": "i-known"})
-    vm = FakeReaperVm(names=["allfather-ec2-default-i-known"])
+    vm = FakeReaperVm(names=["odin-ec2-default-i-known"])
 
     reaped = ec2compute.reap_orphaned_vms(tmp_path, ["default"], vm=vm)
 

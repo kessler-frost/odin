@@ -60,6 +60,6 @@
 **Files:**
 - Test: `tests/agent/test_debug_e2e.py` (new)
 
-- [ ] **Step 1:** Marked `integration`, needs Colima + Claude: apply a canvas with a service node whose image is deliberately broken (`image: "busybox"`, `command: ["false"]` — it will crash-loop to `crashed`) plus a healthy dep (`redis:7-alpine`); wait for `crashed`; POST `/agent/debug` for both nodes asking "what's wrong here?"; assert 200, non-empty `answer`, and that some suspect names the crashing node. Teardown: `/destroy`, assert no `allfather=1` containers remain.
+- [ ] **Step 1:** Marked `integration`, needs Colima + Claude: apply a canvas with a service node whose image is deliberately broken (`image: "busybox"`, `command: ["false"]` — it will crash-loop to `crashed`) plus a healthy dep (`redis:7-alpine`); wait for `crashed`; POST `/agent/debug` for both nodes asking "what's wrong here?"; assert 200, non-empty `answer`, and that some suspect names the crashing node. Teardown: `/destroy`, assert no `odin=1` containers remain.
 - [ ] **Step 2:** `uv run pytest -m integration tests/agent/test_debug_e2e.py -q` → passed.
 - [ ] **Step 3:** Commit `test(agent): region-debug e2e — the agent fingers the crashing node`.

@@ -201,7 +201,7 @@ def test_tf_apply_converges_real_containers_zero_drift_scale_destroy(tmp_path, e
         assert {t["key"]: t["value"] for t in service["tags"]} == {"odin:node": SERVICE_NAME, "scale": "2"}
 
         # THE proof the containers are real, not a model fiction.
-        ps = _docker("ps", "--filter", f"name=allfather-ecs-{ENV}-", "--format", "{{.Image}}")
+        ps = _docker("ps", "--filter", f"name=odin-ecs-{ENV}-", "--format", "{{.Image}}")
         images = [line for line in ps.stdout.splitlines() if line]
         assert len(images) == 2, f"expected 2 real running containers, docker ps says: {ps.stdout!r}"
         assert all(image == "nginx:alpine" for image in images)
@@ -223,7 +223,7 @@ def test_tf_apply_converges_real_containers_zero_drift_scale_destroy(tmp_path, e
         # TagResource call (the `scale` tag tracks desired_count).
         assert {t["key"]: t["value"] for t in service["tags"]} == {"odin:node": SERVICE_NAME, "scale": "1"}
 
-        ps_after_scale = _docker("ps", "--filter", f"name=allfather-ecs-{ENV}-", "--format", "{{.Names}}")
+        ps_after_scale = _docker("ps", "--filter", f"name=odin-ecs-{ENV}-", "--format", "{{.Names}}")
         remaining = [line for line in ps_after_scale.stdout.splitlines() if line]
         assert len(remaining) == 1, f"expected exactly 1 real running container, docker ps says: {ps_after_scale.stdout!r}"
 
@@ -234,7 +234,7 @@ def test_tf_apply_converges_real_containers_zero_drift_scale_destroy(tmp_path, e
         assert destroy.returncode == 0, f"destroy failed:\n{destroy.stdout}\n{destroy.stderr}"
 
         # The containers are actually gone -- not just the model records.
-        ps_final = _docker("ps", "-a", "--filter", f"name=allfather-ecs-{ENV}-", "--format", "{{.Names}}")
+        ps_final = _docker("ps", "-a", "--filter", f"name=odin-ecs-{ENV}-", "--format", "{{.Names}}")
         assert ps_final.stdout.strip() == "", f"ECS task containers survived teardown: {ps_final.stdout}"
 
         # NOT a blanket "== {}" -- real AWS soft-deletes here too:
@@ -254,6 +254,6 @@ def test_tf_apply_converges_real_containers_zero_drift_scale_destroy(tmp_path, e
         (service,) = [v for k, v in final_state.items() if k.startswith("service:")]
         assert service["status"] == "INACTIVE"
 
-    # Belt-and-braces: no allfather-labelled container left for this env.
-    leftover = _docker("ps", "-aq", "--filter", "label=allfather=1", "--filter", f"name={ENV}")
+    # Belt-and-braces: no odin-labelled container left for this env.
+    leftover = _docker("ps", "-aq", "--filter", "label=odin=1", "--filter", f"name={ENV}")
     assert leftover.stdout.strip() == ""

@@ -8,10 +8,10 @@ set -eu
 # 1. Stop a running server + tear down any odin-managed containers/VMs.
 command -v odin >/dev/null 2>&1 && odin stop 2>/dev/null || true
 if command -v docker >/dev/null 2>&1; then
-  docker ps -aq --filter label=allfather=1 | xargs -r docker rm -f 2>/dev/null || true
+  docker ps -aq --filter label=odin=1 | xargs -r docker rm -f 2>/dev/null || true
 fi
 if command -v limactl >/dev/null 2>&1; then
-  for vm in $(limactl list -q 2>/dev/null | grep '^allfather-ec2-' || true); do
+  for vm in $(limactl list -q 2>/dev/null | grep '^odin-ec2-' || true); do
     limactl delete -f "$vm" 2>/dev/null || true
   done
 fi

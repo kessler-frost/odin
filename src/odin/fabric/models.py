@@ -1,7 +1,7 @@
 """Data models for the self-hosted Nebula mesh fabric.
 
 Recovered from the retired `network/` module (the primitives were sound) and
-re-homed under `fabric/`, rekeyed from the old per-VPC model to allfather's
+re-homed under `fabric/`, rekeyed from the old per-VPC model to odin's
 per-environment model: one Nebula network == one environment. IP allocation is
 sticky-by-host (re-applies must not churn a host's overlay IP, or already-
 published consumer env vars like DATABASE_URL go stale).
@@ -57,7 +57,7 @@ class SubnetAllocation(BaseModel):
 
 
 class MeshNetwork(BaseModel):
-    """One Nebula network per environment (env = allfather's isolation unit).
+    """One Nebula network per environment (env = odin's isolation unit).
 
     `mask` MUST match `base_cidr`'s own prefix (both `/16`): every signed
     cert (the lighthouse's `lighthouse_ip/mask` in `ensure_network`, and

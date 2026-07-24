@@ -37,14 +37,14 @@ class FakeRuntime:
 
 def test_container_name_is_env_scoped():
     rds = PostgresRds(FakeRuntime(), env="staging")
-    assert rds.container_name("db") == "allfather-rds-staging-db"
+    assert rds.container_name("db") == "odin-rds-staging-db"
 
 
 def test_create_db_runs_postgres_with_creds_and_dynamic_port():
     rt = FakeRuntime()
     PostgresRds(rt, env="default").create_db("db", "app", "s3cret")
     spec = rt.runs[0]
-    assert spec.name == "allfather-rds-default-db"
+    assert spec.name == "odin-rds-default-db"
     assert spec.image.startswith("postgres:16")
     assert spec.env["POSTGRES_USER"] == "app"
     assert spec.env["POSTGRES_PASSWORD"] == "s3cret"
@@ -72,7 +72,7 @@ def test_delete_db_stops_container():
     rds = PostgresRds(rt)
     rds.create_db("db", "app", "pw")  # stops once itself: clears any remnant pre-run
     rds.delete_db("db")
-    assert rt.stopped == ["allfather-rds-default-db", "allfather-rds-default-db"]
+    assert rt.stopped == ["odin-rds-default-db", "odin-rds-default-db"]
     assert rds.endpoint("db") is None
 
 

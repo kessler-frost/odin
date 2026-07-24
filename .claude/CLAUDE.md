@@ -57,8 +57,8 @@ work.
 - Lima via `limactl` CLI; containers via Colima `docker` (default) or `nerdctl` in a Lima VM.
 
 ## Cleanup / Disk (limited headroom — clean up after EVERY heavy step)
-- **Containers:** every test/run tears down its own; `docker ps -aq --filter label=allfather=1 | xargs -r docker rm -f`. Tests use the `runtime` fixture's teardown.
-- **Lima VMs:** the LimaRuntime VM is `allfather-host`; integration tests delete it after. Never leave stray VMs (`limactl list -q`); delete by exact name (the user's own VMs like `veronica` are off-limits).
+- **Containers:** every test/run tears down its own; `docker ps -aq --filter label=odin=1 | xargs -r docker rm -f`. Tests use the `runtime` fixture's teardown.
+- **Lima VMs:** the LimaRuntime VM is `odin-host`; integration tests delete it after. Never leave stray VMs (`limactl list -q`); delete by exact name (the user's own VMs like `veronica` are off-limits).
 - **Misc:** prune `.odin/`, `.playwright-cli/*.yml`, `/tmp/*.png`, `__pycache__`, `.pytest_cache`, `.ruff_cache`.
 
 ## CLI / running
@@ -70,7 +70,7 @@ work.
 - Status is a one-way projection: drivers + assertions author facts → Reconciler emits `WorldDelta` → `ConnectionManager.broadcast` (WS) + append-only `.odin/<env>/world.json` + `events.jsonl`. The UI is a pure projection; `StatusBadge` maps phases to colors; deltas carry `env` (UI filters by the active env).
 
 ## Environments
-Multiple named envs reconciled independently (`/apply?env=`, `/world?env=`, `/destroy?env=`, `/envs`); each env gets its own `BackingAws` + `PostgresRds` (containers named `allfather-aws-<backing>-<env>` / `allfather-rds-<env>-<id>`) → isolated AWS-shaped state per env. UI has an env field in the TopBar.
+Multiple named envs reconciled independently (`/apply?env=`, `/world?env=`, `/destroy?env=`, `/envs`); each env gets its own `BackingAws` + `PostgresRds` (containers named `odin-aws-<backing>-<env>` / `odin-rds-<env>-<id>`) → isolated AWS-shaped state per env. UI has an env field in the TopBar.
 
 ## UI Design Rules
 - **Grid alignment:** 20px grid; node sections are multiples of 20px (header=40, single-line meta=20, two-line=40, button row=40). Snap to 20px; node positions/sizes multiples of 20.

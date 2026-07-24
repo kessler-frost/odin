@@ -7,7 +7,7 @@ aws/backings.py: this is a MANY-per-resource binding (one container per
 TASK, like one RIE container per Lambda function), not aws/backings.py's
 one-shared-container-per-env-per-kind shape. v1 single-container taskdefs
 (V5c: "the drawn node IS the service+taskdef pair") -- one task, one
-container. Container naming: `allfather-ecs-{env}-{task_id8}-{container_name}`
+container. Container naming: `odin-ecs-{env}-{task_id8}-{container_name}`
 -- the ONLY name this module ever passes to the runtime driver.
 
 Unlike Lambda's RIE readiness probe (a real TCP-connect wait -- a function's
@@ -29,7 +29,7 @@ from odin.runtime.colima import ColimaRuntime, ContainerSpec
 
 
 def container_name(env: str, task_id: str, container_def_name: str) -> str:
-    return f"allfather-ecs-{env}-{task_id[:8]}-{container_def_name}"
+    return f"odin-ecs-{env}-{task_id[:8]}-{container_def_name}"
 
 
 @dataclass(frozen=True)
@@ -70,7 +70,7 @@ class TaskRuntime:
         self._rt.run_container(ContainerSpec(
             name=name, image=container_def["image"], env=env_vars, ports=ports,
             command=tuple(container_def.get("command") or []),
-            labels={"allfather-env": env, "allfather-ecs-task": task_id},
+            labels={"odin-env": env, "odin-ecs-task": task_id},
         ))
         host_ports = {cport: self._rt.host_port(name, cport) for cport in ports}
         return TaskContainerHandle(name=name, host_ports=host_ports)

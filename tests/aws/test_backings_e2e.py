@@ -91,7 +91,7 @@ def _destroy(client, env="default"):
 def runtime():
     rt = ColimaRuntime()
     yield rt
-    for cid in rt.list_allfather():
+    for cid in rt.list_odin():
         rt.stop(cid)
 
 
@@ -120,7 +120,7 @@ def test_sqs_roundtrip(tmp_path, runtime):
         assert _receive(sqs, url) == "hello-roundtrip"
 
         _destroy(client)
-    assert runtime.list_allfather() == []
+    assert runtime.list_odin() == []
 
 
 def test_sns_to_sqs_delivery(tmp_path, runtime):
@@ -163,7 +163,7 @@ def test_sns_to_sqs_delivery(tmp_path, runtime):
         assert _receive(sqs, jobs2_url) == "fanout"
 
         _destroy(client)
-    assert runtime.list_allfather() == []
+    assert runtime.list_odin() == []
 
 
 def test_dynamodb_put_get(tmp_path, runtime):
@@ -179,7 +179,7 @@ def test_dynamodb_put_get(tmp_path, runtime):
         assert item["val"]["S"] == "hello"
 
         _destroy(client)
-    assert runtime.list_allfather() == []
+    assert runtime.list_odin() == []
 
 
 def test_env_isolation(tmp_path, runtime):
@@ -191,22 +191,22 @@ def test_env_isolation(tmp_path, runtime):
         _wait(client, lambda p: p.get("uploads") == "healthy", env="b")
 
         # One backing container per env, same node label in both.
-        assert runtime.status("allfather-aws-rustfs-a") == "running"
-        assert runtime.status("allfather-aws-rustfs-b") == "running"
+        assert runtime.status("odin-aws-rustfs-a") == "running"
+        assert runtime.status("odin-aws-rustfs-b") == "running"
         for env in ("a", "b"):
             buckets = _aws_for(client, runtime, env).client("s3").list_buckets()["Buckets"]
             assert "uploads" in [b["Name"] for b in buckets]
 
         # Destroying a gc's ONLY a's backing; b keeps serving.
         _destroy(client, env="a")
-        assert runtime.status("allfather-aws-rustfs-a") == "absent"
-        assert runtime.status("allfather-aws-rustfs-b") == "running"
+        assert runtime.status("odin-aws-rustfs-a") == "absent"
+        assert runtime.status("odin-aws-rustfs-b") == "running"
         assert _phases(client, env="b").get("uploads") == "healthy"
         buckets = BackingAws(runtime, "b").client("s3").list_buckets()["Buckets"]
         assert "uploads" in [b["Name"] for b in buckets]
 
         _destroy(client, env="b")
-    assert runtime.list_allfather() == []
+    assert runtime.list_odin() == []
 
 
 def test_backing_crash_recovers(tmp_path, runtime):
@@ -215,7 +215,7 @@ def test_backing_crash_recovers(tmp_path, runtime):
         client.post("/apply", json=CANVAS_S3)
         _wait(client, lambda p: p.get("uploads") == "healthy")
 
-        runtime.stop("allfather-aws-rustfs-default")  # kill the backing out from under it
+        runtime.stop("odin-aws-rustfs-default")  # kill the backing out from under it
 
         # The node must leave healthy within ~10s (exists() sees the dead
         # backing) — poll fast: the crashed→starting window is about one tick.
@@ -230,4 +230,4 @@ def test_backing_crash_recovers(tmp_path, runtime):
         assert "uploads" in [b["Name"] for b in buckets]
 
         _destroy(client)
-    assert runtime.list_allfather() == []
+    assert runtime.list_odin() == []

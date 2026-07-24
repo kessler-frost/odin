@@ -12,7 +12,7 @@ from odin.runtime.colima import ColimaRuntime, ContainerSpec
 
 pytestmark = pytest.mark.integration
 
-NAME = "allfather-test-nginx"
+NAME = "odin-test-nginx"
 
 
 @pytest.fixture
