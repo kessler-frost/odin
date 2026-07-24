@@ -31,14 +31,15 @@ from odin.gateway.stores import SynthStores
 TF_OWNED_KINDS = frozenset({"vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr"})
 
 # EC2's real instance-state machine (gateway/models/ec2compute.py's own
-# `_STATE_CODES` keys) -> the World Phase enum. Terminal states still read
-# "crashed" for the sweep's grace window (ec2compute.py's own
-# `_TERMINATED_SWEEP_SECONDS`); once the record itself is swept from the
-# store, the next projection simply stops seeing it and the reconciler
-# prunes it from World -- no separate "gone" phase needed here.
+# `_STATE_CODES` keys) -> the World Phase enum. `terminated` is deliberately
+# absent: a terminated instance is GONE (its Lima VM deleted) and is EXCLUDED
+# from the projection in `_ec2_instances` below, not mapped to a phase -- see
+# that function's own note (release sweep finding #2). `stopped` (an
+# intentional Stop, the VM still exists) does read "crashed"; `shutting-down`
+# stays visible (`starting`) because a delete can fail and the VM outlive it.
 _EC2_PHASE = {
     "pending": "starting", "running": "healthy", "stopping": "starting",
-    "stopped": "crashed", "shutting-down": "starting", "terminated": "crashed",
+    "stopped": "crashed", "shutting-down": "starting",
 }
 
 # Lambda's two independent state machines (lambdactl.py's module docstring)
@@ -97,6 +98,15 @@ def _ec2_instances(stores: SynthStores, env: str) -> Projected:
     out: Projected = {}
     for key, record in stores.ec2compute.items(env).items():
         if not key.startswith("instance:"):
+            continue
+        # Release sweep finding #2: a `terminated` instance is GONE (VM deleted
+        # by tofu destroy / empty-canvas Apply / a boot failure). Exclude it so
+        # the reconciler prunes it from World immediately (the ECS INACTIVE
+        # precedent). This projection reads the store directly and never
+        # triggers ec2compute's Describe-driven lazy sweep, so projecting a
+        # terminated record would strand a phantom `crashed` node in /world
+        # forever, breaking the "empty canvas + Apply => /world empty" promise.
+        if record["state_name"] == "terminated":
             continue
         tags = stores.tags.get(env, f"ec2:{record['instance_id']}", {})
         label = tags.get("odin:node")  # no AWS-native name field to fall back to

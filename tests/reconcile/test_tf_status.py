@@ -85,9 +85,11 @@ def _ec2_instance(instance_id: str, state_name: str) -> dict:
 
 def test_ec2_instance_phases_across_the_real_state_machine(tmp_path):
     stores = SynthStores(tmp_path)
+    # `terminated` is NOT here -- it's excluded entirely (see the dedicated
+    # test below); every other live/transitional state maps onto a Phase.
     expected = {
         "pending": "starting", "running": "healthy", "stopping": "starting",
-        "stopped": "crashed", "shutting-down": "starting", "terminated": "crashed",
+        "stopped": "crashed", "shutting-down": "starting",
     }
     for state_name, phase in expected.items():
         stores.ec2compute.set(ENV, f"instance:i-{state_name}", _ec2_instance(f"i-{state_name}", state_name))
@@ -96,6 +98,21 @@ def test_ec2_instance_phases_across_the_real_state_machine(tmp_path):
     result = project(stores, ENV)
     for state_name, phase in expected.items():
         assert result[state_name] == ("ec2", phase, {}), state_name
+
+
+def test_terminated_ec2_instance_is_excluded_entirely(tmp_path):
+    # Release sweep finding #2: a `terminated` instance is GONE -- the Lima VM
+    # was really deleted (tofu destroy / empty-canvas Apply / boot failure). It
+    # must NOT be projected: this projection reads the store directly and never
+    # triggers ec2compute's Describe-driven lazy sweep, so a projected
+    # `terminated` would keep the label in the snapshot forever and the
+    # reconciler would never prune it -- the phantom `crashed` EC2 the sweep
+    # found lingering in /world after teardown. Excluding it (the ECS INACTIVE
+    # precedent) makes the reconciler prune it immediately.
+    stores = SynthStores(tmp_path)
+    stores.ec2compute.set(ENV, "instance:i-1", _ec2_instance("i-1", "terminated"))
+    stores.tags.set(ENV, "ec2:i-1", {"odin:node": "server"})
+    assert project(stores, ENV) == {}
 
 
 def test_ec2_instance_with_no_odin_node_tag_is_not_projected(tmp_path):
