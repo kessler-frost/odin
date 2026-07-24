@@ -193,6 +193,17 @@ class Reconciler:
         self._store.apply_delta(delta)
         if self._ws is not None:
             await self._ws.broadcast(delta.model_dump())
+            if phase == "crashed":
+                # Observability v1: push the failure's own log tail the moment
+                # it happens, matching the `type:"log"` shape the UI's Logs
+                # tab already parses (BottomPanel.tsx) -- fetch-on-demand via
+                # /logs covers everything else; this is the "don't make the
+                # user go looking" half for the resource that just died.
+                await self._ws.broadcast(self._log_message(rid, facts or {}, verdict))
+
+    def _log_message(self, rid: str, facts: dict, verdict: str | None) -> dict:
+        text = "\n".join(part for part in (verdict, facts.get("logtail")) if part) or f"{rid} crashed"
+        return {"type": "log", "env": self._env, "text": text, "source": rid, "level": "error"}
 
     # ---- observe ----
     async def _observe(self, stack: Stack) -> None:

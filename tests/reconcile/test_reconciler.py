@@ -279,6 +279,55 @@ async def test_rds_pg_ready_failure_surfaces_the_connection_error_without_flippi
     assert not [m for m in sent if m.get("resource_id") == "db"]
 
 
+async def test_crash_pushes_a_type_log_message_matching_the_uis_bottompanel_shape(tmp_path):
+    # BottomPanel.tsx's parseWebSocketMessage already understands
+    # {type:"log", text, source, level} -- this is the "feed the dead Logs
+    # tab" half of observability v1, no UI-side shape change needed.
+    rt, rds = FakeRuntime(), FakeRds()
+    rds.available = True
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(DB,)))
+    sent = []
+
+    class FakeWS:
+        async def broadcast(self, msg):
+            sent.append(msg)
+
+    recon = Reconciler(store, rt, rds, ws=FakeWS(), pg_ready=_yes, poll_interval=0)
+    await recon.tick()
+    await recon.tick()  # db healthy
+
+    rt.set("odin-rds-default-db", "exited", exit_code=1, logs="disk full")
+    await recon.tick()
+
+    log_msgs = [m for m in sent if m.get("type") == "log"]
+    assert len(log_msgs) == 1
+    msg = log_msgs[0]
+    assert msg["source"] == "db"
+    assert msg["level"] == "error"
+    assert "container exited (code 1)" in msg["text"]
+    assert "disk full" in msg["text"]
+    assert msg["env"] == "default"
+
+
+async def test_healthy_never_pushes_a_log_message(tmp_path):
+    rt, rds = FakeRuntime(), FakeRds()
+    rds.available = True
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(DB,)))
+    sent = []
+
+    class FakeWS:
+        async def broadcast(self, msg):
+            sent.append(msg)
+
+    recon = Reconciler(store, rt, rds, ws=FakeWS(), pg_ready=_yes, poll_interval=0)
+    await recon.tick()
+    await recon.tick()  # db healthy, never crashed
+
+    assert not [m for m in sent if m.get("type") == "log"]
+
+
 async def test_provisioned_crash_carries_a_verdict_and_logtail(tmp_path):
     rt, rds, aws = FakeRuntime(), FakeRds(), FakeAws()
     rt.set("odin-aws-s3-default", "running", logs="panic: disk full")
