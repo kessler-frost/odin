@@ -34,6 +34,25 @@ sudoers grant, no ctl script. The mesh's actual data-plane members are the
 VMs (`compute/instances.py::InstanceVm._activate_nebula`), where `nebula`
 still runs as root INSIDE the VM via systemd — that costs the user nothing,
 since it's a VM they already own outright.
+
+R5 (relay) found — live, with two real VMs — that R4's design was necessary
+but not sufficient: stock Lima `vz` NATs each VM into its OWN isolated
+address space with NO VM-to-VM underlay path at all (confirmed: a raw ping
+between two VMs' vzNAT addresses is 100% loss, independent of nebula
+entirely), so no amount of nebula config tuning could make a DIRECT
+VM-to-VM handshake succeed. Two real config bugs were also found and fixed
+along the way (a VM advertising its Lima slirp address, identical on every
+VM, hairpinned into "refusing to handshake with myself"; its IPv6 ULA burned
+~6s per handshake failing before the real candidate was tried) — both
+necessary, neither sufficient on their own. The actual fix: every VM CAN
+reach the host (they already handshake with the lighthouse), so
+`generate_config(relay_enabled=True)` routes VM-to-VM traffic THROUGH the
+lighthouse — `relay: {am_relay: true}` on the lighthouse, `relay: {use_relays:
+true, relays: [lighthouse_ip]}` on every VM. Still fully rootless: a relay
+forwards opaque encrypted UDP between two peers it already has live sessions
+with, never decrypting either side, so (empirically verified) it needs no
+tun device to do it — the lighthouse's existing `tun: disabled: true` is
+unaffected.
 """
 from __future__ import annotations
 
@@ -195,6 +214,7 @@ class NebulaManager:
         is_lighthouse: bool = False,
         pki: CertPaths | None = None,
         tun_disabled: bool = False,
+        relay_enabled: bool = False,
     ) -> str:
         """`pki=None` (the default, unchanged): the VM-side fixed paths a
         node's own cloud-init writes its cert to (`/etc/nebula/...`). A REAL
@@ -210,7 +230,23 @@ class NebulaManager:
         with `tun: disabled: true` starts and binds its UDP port; without it,
         the same unprivileged process dies with "operation not permitted").
         Every VM member still gets a real tun device, created as root INSIDE
-        the VM (systemd) -- that's the mesh's actual data plane."""
+        the VM (systemd) -- that's the mesh's actual data plane.
+
+        `relay_enabled` (R5): stock Lima `vz` NATs each VM into its OWN
+        isolated address space -- there is NO VM-to-VM underlay path at all
+        (confirmed live: a raw ping between two VMs' vzNAT addresses is
+        100% loss, before nebula is even involved), so direct VM-to-VM
+        handshakes can never succeed no matter how the members are
+        configured. Every VM CAN reach the host (they already handshake
+        with the lighthouse fine), so traffic instead relays THROUGH the
+        lighthouse at the encrypted-tunnel level -- it forwards opaque UDP
+        between two peers it already has live sessions with, never
+        decrypting either side, so (empirically verified) it needs no tun
+        device to do it: the lighthouse gets `relay: {am_relay: true,
+        use_relays: false}` (offers to relay, never needs one itself), every
+        VM member gets `relay: {use_relays: true, relays: [lighthouse_ip]}`
+        (`lighthouse_ip` doubles as the relay's address -- one node, two
+        roles)."""
         config: dict = {
             "pki": {
                 "ca": str(pki.ca_crt) if pki else "/etc/nebula/ca.crt",
@@ -226,6 +262,11 @@ class NebulaManager:
         }
         if tun_disabled:
             config["tun"] = {"disabled": True}
+        if relay_enabled:
+            config["relay"] = (
+                {"am_relay": True, "use_relays": False} if is_lighthouse
+                else {"use_relays": True, "relays": [lighthouse_ip]}
+            )
         if not is_lighthouse:
             config["static_host_map"] = {lighthouse_ip: [f"{lighthouse_underlay}:{NEBULA_PORT}"]}
             config["lighthouse"]["hosts"] = [lighthouse_ip]
@@ -370,6 +411,15 @@ class LighthouseManager:
     each VM (systemd), which costs the user nothing since it's a VM they
     already own outright.
 
+    R5 (relay): stock Lima `vz` gives every VM its OWN isolated address
+    space -- there's no VM-to-VM underlay path at all, so `ensure_started`
+    also passes `relay_enabled=True`: the lighthouse offers itself as a
+    relay (`relay: {am_relay: true}`) so VM-to-VM traffic can route THROUGH
+    it instead of failing to go direct. Relaying is opaque UDP forwarding
+    between two peers this lighthouse already has live sessions with --
+    empirically confirmed to need no tun device either, so this stays fully
+    unprivileged.
+
     `ensure_started` is best-effort throughout (never raises) -- `nebula`
     missing from PATH, or an immediate crash on a bad cert/config, both
     return False and log a warning rather than failing an otherwise-
@@ -435,7 +485,7 @@ class LighthouseManager:
         lighthouse_ip = overlay.lighthouse_ip if overlay else MeshNetwork(network=env).lighthouse_ip
         config_text = manager.generate_config(
             lighthouse_ip=lighthouse_ip, lighthouse_underlay=underlay,
-            firewall=DEFAULT_FIREWALL, is_lighthouse=True, pki=cert, tun_disabled=True,
+            firewall=DEFAULT_FIREWALL, is_lighthouse=True, pki=cert, tun_disabled=True, relay_enabled=True,
         )
         config_path = self._config_path(root, env)
         atomic_write_text(config_path, config_text)

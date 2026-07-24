@@ -51,6 +51,15 @@ disabled: true`, no root, no sudo) since it only coordinates; the VM's own
 `nebula` daemon (started here as root INSIDE the VM via systemd) is the
 mesh's real data plane. Both halves are best-effort: a mesh-wiring failure
 never fails the AWS instance boot itself (`_activate_nebula` never raises).
+
+R5 (relay): stock Lima `vz` NATs every VM into its OWN isolated address
+space -- confirmed live, a raw ping between two VMs' vzNAT addresses is
+100% loss, so a direct VM-to-VM handshake can never succeed regardless of
+config. Every VM CAN reach the host, though (it already handshakes with the
+lighthouse), so `relay_enabled=True` here routes VM-to-VM traffic THROUGH
+the lighthouse instead -- still rootless (a relay forwards opaque encrypted
+UDP between two peers it already has sessions with; it never needs a tun
+device to do it, empirically confirmed in `fabric/nebula.py`).
 """
 from __future__ import annotations
 
@@ -275,7 +284,7 @@ class InstanceVm:
             network = ensure_network(nebula.root, nebula.env, underlay, runner=self._run)
             config = manager.generate_config(
                 lighthouse_ip=network.lighthouse_ip, lighthouse_underlay=underlay,
-                firewall=nebula.firewall or DEFAULT_FIREWALL, is_lighthouse=False,
+                firewall=nebula.firewall or DEFAULT_FIREWALL, is_lighthouse=False, relay_enabled=True,
             )
             self._lima("shell", name, "--", "sudo", "tee", "/etc/nebula/config.yml", input=config, check=False)
             self._lima("shell", name, "--", "sudo", "systemctl", "enable", "--now", "nebula", check=False)

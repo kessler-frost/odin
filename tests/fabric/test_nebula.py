@@ -117,6 +117,38 @@ def test_generate_config_tun_disabled_for_the_rootless_lighthouse(tmp_path):
     assert config["tun"] == {"disabled": True}
 
 
+def test_generate_config_relay_enabled_lighthouse_offers_itself_as_a_relay(tmp_path):
+    """R5: stock Lima `vz` gives every VM its own isolated address space --
+    no VM-to-VM underlay path exists at all -- so the lighthouse offers
+    itself as a relay (`am_relay: true`) rather than using one itself
+    (empirically verified to work with `tun: disabled: true`, no root
+    needed: a relay only ever forwards opaque encrypted UDP between two
+    peers it already has live sessions with)."""
+    mgr = NebulaManager(tmp_path / "nebula", runner=FakeRunner())
+    config = yaml.safe_load(mgr.generate_config(
+        "10.42.0.1", "192.168.1.10", DEFAULT_FIREWALL, is_lighthouse=True, tun_disabled=True, relay_enabled=True,
+    ))
+    assert config["relay"] == {"am_relay": True, "use_relays": False}
+    assert config["tun"] == {"disabled": True}  # relay-enabled never implies a real tun device
+
+
+def test_generate_config_relay_enabled_member_uses_the_lighthouse_as_its_relay(tmp_path):
+    """R5: every VM member routes to every OTHER VM through the lighthouse
+    -- `lighthouse_ip` doubles as the relay address (one node, two roles)."""
+    mgr = NebulaManager(tmp_path / "nebula", runner=FakeRunner())
+    config = yaml.safe_load(mgr.generate_config(
+        "10.42.0.1", "192.168.1.10", DEFAULT_FIREWALL, is_lighthouse=False, relay_enabled=True,
+    ))
+    assert config["relay"] == {"use_relays": True, "relays": ["10.42.0.1"]}
+
+
+def test_generate_config_relay_disabled_by_default(tmp_path):
+    mgr = NebulaManager(tmp_path / "nebula", runner=FakeRunner())
+    lighthouse = yaml.safe_load(mgr.generate_config("10.42.0.1", "192.168.1.10", DEFAULT_FIREWALL, is_lighthouse=True))
+    member = yaml.safe_load(mgr.generate_config("10.42.0.1", "192.168.1.10", DEFAULT_FIREWALL, is_lighthouse=False))
+    assert "relay" not in lighthouse and "relay" not in member
+
+
 def test_generate_config_with_pki_uses_the_real_paths_not_the_vm_placeholder(tmp_path):
     """R3: the HOST lighthouse reads its cert from wherever it actually
     lives (`.odin/{env}/nebula/hosts/...`), never the `/etc/nebula/...`
@@ -417,7 +449,9 @@ def test_lighthouse_is_running_false_for_garbage_pidfile_content(tmp_path):
 def test_lighthouse_ensure_started_spawns_nebula_directly_no_sudo(tmp_path):
     """R4: a plain `[nebula_bin, "-config", ...]` Popen -- no `sudo`, no ctl
     script -- and the config carries `tun: {disabled: true}` (the rootless
-    flag)."""
+    flag). R5: also carries `relay: {am_relay: true}` -- stock Lima `vz` has
+    no VM-to-VM underlay path, so the lighthouse always offers itself as a
+    relay (still no tun device needed, see LighthouseManager's docstring)."""
     runner = FakeRunner()
     ensure_network(tmp_path, "prod", "1.2.3.4", runner=runner)  # bootstraps the lighthouse cert
     calls: list[list[str]] = []
@@ -432,6 +466,7 @@ def test_lighthouse_ensure_started_spawns_nebula_directly_no_sudo(tmp_path):
     config = yaml.safe_load(config_path.read_text())
     assert config["lighthouse"]["am_lighthouse"] is True
     assert config["tun"] == {"disabled": True}
+    assert config["relay"] == {"am_relay": True, "use_relays": False}
     assert config["pki"]["cert"] == str(tmp_path / "prod" / "nebula" / "hosts" / "lighthouse.crt")
 
 
