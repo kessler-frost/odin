@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+# Pinned to the SAME version this dev machine's `brew install nebula` carries
+# (verified: `brew list nebula` -> 1.10.3) -- host lighthouse and VM daemon
+# must speak the same wire protocol. A hardcoded version string matches this
+# file's own existing NERDCTL_VERSION/BUILDKIT_VERSION convention below.
+NEBULA_VERSION = "1.10.3"
+
 
 def generate_cloud_init(
     hostname: str,
     ssh_pubkey: str | None = None,
     install_nerdctl: bool = False,
+    install_nebula: bool = False,
     extra_script: str | None = None,
     env_vars: dict[str, str] | None = None,
 ) -> str:
@@ -96,6 +103,41 @@ def generate_cloud_init(
             'ODIN_BUILDKIT_UNIT',
             'systemctl daemon-reload',
             'systemctl enable --now buildkitd',
+        ])
+
+    if install_nebula:
+        lines.extend([
+            "",
+            "# Install the Nebula overlay-network binary (MIT, slackhq/nebula) --",
+            "# same download-a-release-tarball shape as nerdctl/buildkit above.",
+            "# The systemd unit is registered but NOT started here: its",
+            "# config.yml (the real underlay address + the VPC's compiled SG",
+            "# firewall) is only knowable once the VM is up and vzNAT-networked --",
+            "# InstanceVm._activate_nebula writes it and starts the daemon",
+            "# post-boot (compute/instances.py).",
+            'ARCH=$(uname -m)',
+            'case $ARCH in aarch64|arm64) ARCH="arm64" ;; x86_64) ARCH="amd64" ;; esac',
+            f'NEBULA_VERSION="{NEBULA_VERSION}"',
+            'curl -fsSL -o /tmp/nebula.tar.gz '
+            '"https://github.com/slackhq/nebula/releases/download/v${NEBULA_VERSION}/nebula-linux-${ARCH}.tar.gz"',
+            'tar -xzf /tmp/nebula.tar.gz -C /usr/local/bin nebula',
+            'chmod +x /usr/local/bin/nebula',
+            'rm /tmp/nebula.tar.gz',
+            'mkdir -p /etc/nebula',
+            '',
+            '# Registered, not enabled -- see comment above.',
+            'cat > /etc/systemd/system/nebula.service << \'ODIN_NEBULA_UNIT\'',
+            '[Unit]',
+            'Description=Nebula overlay network',
+            'After=network-online.target',
+            'Wants=network-online.target',
+            '[Service]',
+            'ExecStart=/usr/local/bin/nebula -config /etc/nebula/config.yml',
+            'Restart=always',
+            '[Install]',
+            'WantedBy=multi-user.target',
+            'ODIN_NEBULA_UNIT',
+            'systemctl daemon-reload',
         ])
 
     if extra_script:

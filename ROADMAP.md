@@ -93,36 +93,57 @@ future decision against these points instead of re-deriving them:
   - ECS: no `network_configuration` (awsvpc/Fargate-style ENIs — odin's tasks
     are `launch_type = "EC2"` / `network_mode = "bridge"`, which need none);
     a task that dies between API calls isn't auto-replaced until the next
-    Apply reconciles the service; a `tags` block on `aws_ecs_service` can
-    show as drift on a subsequent `tofu plan` (ECS service tags aren't
-    echoed back from the gateway yet — `TagResource`/`ListTagsForResource`
-    isn't modeled beyond extracting the `odin:node` label).
-  - SNS→SQS: adding a subscription edge to an *already-healthy* topic
-    doesn't retroactively re-provision it (fixed on create; the live-edit
-    path is a known gap).
+    Apply reconciles the service. (Fixed: a `tags` block on
+    `aws_ecs_service` now plans zero-drift — the gateway stores the full tag
+    set and echoes it back, with
+    `TagResource`/`UntagResource`/`ListTagsForResource` modeled.)
+  - SNS→SQS live-edit: FIXED (v0.5.0) — adding a subscription edge to an
+    already-healthy topic lands on the next Apply via the reconciler's
+    observe pass (proven by real fanout to both queues).
   - RDS stays off Terraform — the reconciler's real Postgres container, not
     a `tofu`-managed resource, until an RDS gateway model lands.
-  - Nebula: VPC/SG config compiles for real (single-host), but the mesh
-    daemon + lighthouse (needed to actually reach a VM's overlay IP across
-    machines) are built (`fabric/nebula.py`) and not yet wired up — folded
-    into multi-Mac support below rather than half-built now.
+  - Nebula: single-host mesh is REAL end-to-end — a real host lighthouse
+    process (`fabric/nebula.py::LighthouseManager`) and a real `nebula`
+    daemon inside every VPC-joined EC2 VM, the VPC's compiled SG firewall
+    baked into its config. The live overlay proof (an actual ping + a real
+    SG-rule-filtered connection, `tests/simulate/test_nebula_mesh_e2e.py`)
+    requires a one-time sudo setup on the host (macOS needs root for a utun
+    device; the test prints the exact, narrowly-scoped command and skips
+    cleanly until it's done — see `scripts/allfather-nebula-ctl`).
+    Cross-Mac reachability (a second machine's mesh) is still open — see M7.
 - **Recorded as UNSUPPORTED for now** (northstar directive 5's honesty rule):
   ALB/ELBv2, EKS, CloudFormation, autoscaling, and RDS-via-Terraform (rds
   nodes stay on the reconciler path until an RDS API model lands).
-- [x] **Nebula network layer (single-host).** Security groups and VPCs drawn
-  on the canvas compile to real Nebula network + firewall primitives
-  (`fabric/nebula.py::sg_rules_to_firewall`, `ensure_network`). The
-  multi-Mac half — running an actual mesh daemon + lighthouse so a VM's
-  overlay IP is reachable from another machine — is deferred; see M7 below.
-- [ ] **odin CLI as an agent control surface.** Lets a human's or an agent's
+- [x] **Nebula network layer (single-host), fully activated.** Security
+  groups and VPCs drawn on the canvas compile to real Nebula network +
+  firewall primitives (`fabric/nebula.py::sg_rules_to_firewall`,
+  `ensure_network`) AND run for real: the host runs the env's lighthouse
+  process, every VPC-joined EC2 VM runs a real `nebula` daemon carrying the
+  compiled SG firewall, and `GET /mesh?env=` reports live lighthouse status.
+  Proven by a real overlay `ping` plus a real SG-rule-filtered TCP
+  connection (`tests/simulate/test_nebula_mesh_e2e.py`). The multi-Mac
+  half — a second machine joining the SAME mesh — is deferred; see M7 below.
+- [x] **odin CLI as an agent control surface.** DONE 2026-07-24 (v0.5.0):
+  `odin canvas get/set`, `apply`, `world`, `envs`, `events`, `translate`,
+  `import-tf`, `tf status/destroy`, `destroy`, `keys issue` — a thin client
+  over the HTTP API with `-o json` for machine consumption, proven by an
+  all-CLI session (set → translate → apply → healthy world → destroy).
+  Lets a human's or an agent's
   (e.g. Claude Code) tooling drive the canvas and its configuration directly.
   Today's `odin` CLI only starts/stops/inspects the server process
   (`start`/`stop`/`status`/`clean`) — it doesn't yet drive the canvas itself.
-- [ ] **Packaging.** Bundle the external tools (colima, lima, uv, …) into one
+- [x] **Packaging (pragmatic scope).** DONE 2026-07-24 (v0.5.0):
+  `scripts/install.sh` (one command: brew tools + colima up + odin + doctor)
+  and `odin doctor` (toolchain checks with exact fixes, disk headroom,
+  `--prebake` for the dynalite image). Full binary vendoring into one
   distributable.
-- [ ] **M7 (multi-Mac) — the fleet.** Start the self-hosted Nebula mesh
-  daemon + lighthouse (primitives exist, not activated), add multi-Mac
-  membership and cross-machine placement. Additive, no core change.
+- [ ] **M7 (multi-Mac) — the fleet.** The single-host half is DONE (see
+  above: a real lighthouse + real per-VM daemons + a real ping/SG-filter
+  proof, all on one Mac). What remains is genuinely cross-machine: a second
+  Mac's host joining the SAME env's mesh (today's lighthouse only binds
+  `0.0.0.0:4242` locally reachable via this Mac's own vzNAT bridge — a real
+  external/LAN-reachable underlay address plus multi-Mac membership and
+  cross-machine placement are still open). Additive, no core change.
 
 ## Deprecated 2026-07-22 (superseded by NORTHSTAR.md)
 

@@ -21,6 +21,7 @@ import pytest
 from botocore.parsers import create_parser
 from starlette.responses import Response
 
+from odin.fabric.models import FirewallRule
 from odin.gateway.classify import classify
 from odin.gateway.keys import KeyStore
 from odin.gateway.models import ec2compute
@@ -404,6 +405,77 @@ def test_terminate_unknown_instance_is_not_found(sink, ec2, stores):
     req = sink.call(lambda: ec2.terminate_instances(InstanceIds=["i-00000000000000000"]))
     response = _answer(stores, req, FakeInstanceVm())
     assert response.status_code == 400
+
+
+# --- R3: the VPC default SG's firewall + the lighthouse start/stop lifecycle ----
+
+
+def test_run_instances_threads_the_vpc_default_sg_firewall_into_nebula_join(sink, ec2, stores):
+    """RunInstances doesn't model SecurityGroupIds (v1's own recorded
+    limit) -- every instance inherits its VPC's default SG, exactly like
+    real AWS does for an instance launched with none specified. An ingress
+    rule authorized on that default SG must show up on the `NebulaJoin`
+    `InstanceVm.boot` receives."""
+    subnet_id = _subnet(stores, sink, ec2)
+    vpc_id = stores.ec2net.get(ENV, f"subnet:{subnet_id}")["vpc_id"]
+    default_sg_id = stores.ec2net.get(ENV, f"vpc:{vpc_id}")["default_sg_id"]
+    req = sink.call(lambda: ec2.authorize_security_group_ingress(GroupId=default_sg_id, IpPermissions=[
+        {"IpProtocol": "tcp", "FromPort": 8080, "ToPort": 8080, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+    ]))
+    assert _answer(stores, req).status_code == 200
+
+    vm = FakeInstanceVm()
+    _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)
+    ((_name, _hostname, _ssh_pubkey, _user_data, nebula, _env_vars),) = vm.booted
+    assert nebula is not None and nebula.firewall is not None
+    assert FirewallRule(port="8080", proto="tcp", cidr="0.0.0.0/0") in nebula.firewall.inbound
+
+
+def test_run_instances_without_a_subnet_gets_no_nebula_join(sink, ec2, stores):
+    vm = FakeInstanceVm()
+    _run_instance(stores, sink, ec2, vm)  # no SubnetId at all
+    ((_name, _hostname, _ssh_pubkey, _user_data, nebula, _env_vars),) = vm.booted
+    assert nebula is None
+
+
+def test_terminate_last_vpc_instance_stops_the_lighthouse(sink, ec2, stores, monkeypatch):
+    stopped = []
+
+    class FakeLighthouse:
+        def ensure_stopped(self, root, env):
+            stopped.append((root, env))
+
+    monkeypatch.setattr(ec2compute, "LighthouseManager", FakeLighthouse)
+    subnet_id = _subnet(stores, sink, ec2)
+    vm = FakeInstanceVm()
+    instance_id = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)["Instances"][0]["InstanceId"]
+    _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+
+    term_req = sink.call(lambda: ec2.terminate_instances(InstanceIds=[instance_id]))
+    _answer(stores, term_req, vm)
+    _wait_for_state(stores, sink, ec2, instance_id, "terminated", vm)
+    assert stopped == [(stores.root, ENV)]
+
+
+def test_terminate_does_not_stop_the_lighthouse_while_another_instance_remains(sink, ec2, stores, monkeypatch):
+    stopped = []
+
+    class FakeLighthouse:
+        def ensure_stopped(self, root, env):
+            stopped.append((root, env))
+
+    monkeypatch.setattr(ec2compute, "LighthouseManager", FakeLighthouse)
+    subnet_id = _subnet(stores, sink, ec2)
+    vm = FakeInstanceVm()
+    id1 = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)["Instances"][0]["InstanceId"]
+    id2 = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)["Instances"][0]["InstanceId"]
+    _wait_for_state(stores, sink, ec2, id1, "running", vm)
+    _wait_for_state(stores, sink, ec2, id2, "running", vm)
+
+    term_req = sink.call(lambda: ec2.terminate_instances(InstanceIds=[id1]))
+    _answer(stores, term_req, vm)
+    _wait_for_state(stores, sink, ec2, id1, "terminated", vm)
+    assert stopped == []  # id2 (same env, same VPC) is still running
 
 
 # --- hydration describes -------------------------------------------------------

@@ -57,6 +57,13 @@ ACCOUNT = "000000000000"
 
 READY_TIMEOUT = 120.0  # first-run image pulls (dynalite no longer re-fetches on every boot)
 
+# backing_ports() is called every reconciler tick (~2s per env) and each
+# recompute is one `docker inspect`-shaped subprocess call per BackingDef.
+# Container state only changes through THIS instance (ensure_backing/gc), so
+# one poll interval of staleness is the exact window the reconciler already
+# tolerates between ticks.
+PORTS_CACHE_TTL = 2.0
+
 # dynalite has no maintained image, so it used to run as bare `node:alpine` +
 # `npx -y dynalite` on every container boot -- normally a ~3s npm-registry
 # fetch (task-4-report), but a slow/flaky registry turns that into a
@@ -73,6 +80,7 @@ RUN npm install -g dynalite
 ENTRYPOINT ["dynalite"]
 CMD ["--port", "4567"]
 """
+DYNALITE_IMAGE = _DYNALITE_IMAGE  # public alias: `odin doctor` inspects/prebakes this tag
 
 
 @dataclass(frozen=True)
@@ -142,6 +150,15 @@ class BackingAws:
         # A threading.Lock, not asyncio.Lock: this runs under
         # asyncio.to_thread on separate OS threads, not on the event loop.
         self._ensure_lock = threading.Lock()
+        # Per-tick docker-call cache. backing_ports() answers from a short-TTL
+        # cache and gc() skips its whole stop-sweep when neither the active
+        # kinds nor container state changed since the last sweep. Both are
+        # invalidated ONLY on a real state change: _create_backing_container
+        # actually booting something, or gc() actually stopping something.
+        self._ports_cache: dict[str, int] | None = None
+        self._ports_cache_at = 0.0
+        self._last_gc_kinds: frozenset[str] | None = None
+        self._dirty = True  # start dirty so the very first gc always sweeps
 
     def _backing_for(self, service: str) -> BackingDef:
         return next(d for d in BACKINGS if service in d.kinds)
@@ -204,6 +221,13 @@ class BackingAws:
             deadline = time.monotonic() + READY_TIMEOUT
             while time.monotonic() < deadline and self._rt.status(cname) != "running":
                 time.sleep(0.2)
+        # A backing genuinely came up (booted here, or by the concurrent
+        # creator the heal above waited on): the cached ports table is stale
+        # and the next gc() must re-sweep even with unchanged active kinds
+        # (e.g. a crash-recovery restart). ensure_backing's fast path (already
+        # running) never reaches here, so a no-op ensure stays cache-neutral.
+        self._ports_cache = None
+        self._dirty = True
 
     def _ensure_dynalite_image(self) -> None:
         """One-time (per machine) build of the baked dynalite image -- see
@@ -212,6 +236,12 @@ class BackingAws:
         dynalite for the first time never both `docker build` the same tag."""
         if not self._rt.image_exists(_DYNALITE_IMAGE):
             self._rt.build(_DYNALITE_IMAGE, _DYNALITE_DOCKERFILE)
+
+    def ensure_dynalite_image(self) -> None:
+        """Public seam for `odin doctor --prebake`: bake the dynalite image
+        ahead of the first DynamoDB Apply. Idempotent; lock-free is fine here
+        (a one-shot CLI, not the reconciler's concurrent ensure path)."""
+        self._ensure_dynalite_image()
 
     def _await_ready(self, cname: str, service: str) -> None:
         if service == "ecr":
@@ -323,6 +353,19 @@ class BackingAws:
         except (ClientError, BotoCoreError):  # BotoCoreError: backing just died mid-check
             return False
 
+    def subscriptions(self, topic: str) -> tuple[str, ...]:
+        """Queue names currently subscribed to `topic` (the raw-delivery SQS
+        subscriptions provision() creates), read back through
+        ListSubscriptionsByTopic -- so the reconciler can diff desired vs
+        actual on a live canvas edit without recreating the topic. Endpoint
+        is the queue ARN provision() subscribed with
+        (arn:aws:sqs:region:account:name), so the queue name is the ARN's
+        last colon-segment."""
+        sns = self.client("sns")
+        topic_arn = f"arn:aws:sns:{REGION}:{ACCOUNT}:{topic}"
+        subs = sns.list_subscriptions_by_topic(TopicArn=topic_arn)["Subscriptions"]
+        return tuple(s["Endpoint"].rsplit(":", 1)[-1] for s in subs if s["Protocol"] == "sqs")
+
     def deprovision(self, service: str, name: str) -> None:
         try:
             client = self.client(service)
@@ -366,16 +409,28 @@ class BackingAws:
         GatewayState.update forwards proxied requests against. A backing
         that isn't running (or never started) is simply absent -- the
         gateway then answers with service-unavailable rather than a stale
-        port (PRD: no cache that outlives an Apply)."""
+        port (PRD: no cache that outlives an Apply). Answers from a
+        PORTS_CACHE_TTL cache (invalidated on any real start/stop this
+        instance performs); callers treat the dict as read-only."""
+        if self._ports_cache is not None and time.monotonic() - self._ports_cache_at < PORTS_CACHE_TTL:
+            return self._ports_cache
         ports: dict[str, int] = {}
         running = (d for d in BACKINGS if self._rt.status(self._cname(d)) == "running")
         for d in running:
             port = self._rt.host_port(self._cname(d), self._listen_port(d))
             for kind in d.kinds:
                 ports[kind] = port
+        self._ports_cache = ports
+        self._ports_cache_at = time.monotonic()
         return ports
 
     def gc(self, active_kinds: set[str]) -> None:
+        kinds = frozenset(active_kinds)
+        if kinds == self._last_gc_kinds and not self._dirty:
+            return  # same kinds, nothing started since the last sweep: zero docker calls
         for d in BACKINGS:
             if set(d.kinds).isdisjoint(active_kinds):
                 self._rt.stop(self._cname(d))  # stop is idempotent on absent names
+                self._ports_cache = None       # a backing may have really stopped
+        self._last_gc_kinds = kinds
+        self._dirty = False

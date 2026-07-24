@@ -57,10 +57,22 @@ class SubnetAllocation(BaseModel):
 
 
 class MeshNetwork(BaseModel):
-    """One Nebula network per environment (env = allfather's isolation unit)."""
+    """One Nebula network per environment (env = allfather's isolation unit).
+
+    `mask` MUST match `base_cidr`'s own prefix (both `/16`): every signed
+    cert (the lighthouse's `lighthouse_ip/mask` in `ensure_network`, and
+    every host/instance's `cert_ip`) embeds its `networks` list from this
+    exact mask, and nebula treats any destination OUTSIDE that embedded
+    CIDR as "not within our networks" -- unroutable, not merely unreachable
+    (R3 finding, confirmed on a real daemon: a `/24` here put the lighthouse
+    at `10.42.0.1/24` and every host in a DIFFERENT `10.42.<n>.0/24` --
+    disjoint networks that could handshake but never route data to each
+    other). A single shared `/16` puts every node in the SAME routable
+    network regardless of which `subnets` bucket allocated its IP.
+    """
     network: str
     base_cidr: str = "10.42.0.0/16"
-    mask: str = "24"
+    mask: str = "16"
     lighthouse_ip: str = "10.42.0.1"
     lighthouse_underlay_ip: str | None = None
     next_subnet: int = 1
@@ -125,11 +137,15 @@ class MeshState(BaseModel):
 
     `vpcs` / `security_groups` (task V1b): the canvas's VPCs and security
     groups projected onto the mesh -- see `fabric/nebula.py::_ec2net_networks`.
+    `lighthouse_running` (R3): whether the env's host lighthouse PROCESS is
+    up right now (`fabric/lighthouse.py::LighthouseManager.is_running`) --
+    distinct from `lighthouse_underlay` merely being recorded.
     """
     network: str
     base_cidr: str = "10.42.0.0/16"
     lighthouse_ip: str = "10.42.0.1"
     lighthouse_underlay: str | None = None
+    lighthouse_running: bool = False
     hosts: list[HostMembership] = []
     resources: list[MeshResource] = []
     vpcs: list[VpcNetwork] = []

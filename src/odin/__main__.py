@@ -10,7 +10,9 @@ from pathlib import Path
 
 import typer
 
-app = typer.Typer(help="Odin server CLI", no_args_is_help=True, add_completion=False)
+from odin.cli import commands as _commands  # noqa: F401  (registers the control-surface commands)
+from odin.cli import doctor as _doctor  # noqa: F401  (registers `odin doctor`)
+from odin.cli.app import app
 
 ODIN_DIR = Path(".odin")
 PID_FILE = ODIN_DIR / "pid"

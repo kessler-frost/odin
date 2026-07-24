@@ -140,8 +140,14 @@ Known v1 limits, recorded rather than hidden:
 
 ## Install
 
-From a local clone, for development (this is the path to use before odin has
-a tagged release — verified verbatim against this repo):
+One command, if you have Homebrew (installs colima/opentofu/uv, starts
+colima, installs odin, runs `odin doctor`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kessler-frost/odin/main/scripts/install.sh | sh
+```
+
+Or from a local clone, for development (verified verbatim against this repo):
 
 ```bash
 git clone https://github.com/kessler-frost/odin.git
@@ -150,9 +156,8 @@ uv tool install --editable ".[dev]"
 cd ui && bun install
 ```
 
-Once a release is tagged, the UI-bundled package installs straight from git
-(the mechanism is live today — CI force-pushes a `latest` branch on every
-tagged release — it just won't have 0.4.0's content until that tag ships):
+Or just the package, UI bundled in, no bun needed (CI fast-forwards the
+`latest` branch on every tagged release — verified working):
 
 ```bash
 uv tool install "git+https://github.com/kessler-frost/odin.git@latest"
@@ -177,6 +182,33 @@ the one port it uses).
 Once it's up: draw something from the sidebar, click **Apply**, watch the
 Events tab stream the `tofu apply` output and the node badges go
 `healthy`. Open the `{ }` button in the top bar for the generated Terraform.
+
+## The CLI is the same product
+
+Everything the canvas does is drivable from a terminal — which also means
+an agent (Claude Code, or anything that can run commands) can operate odin
+directly. All commands take `--url`/`ODIN_URL` (default `localhost:4200`)
+and `-o json` for machine-readable output.
+
+```bash
+odin canvas get                     # the drawn canvas, as JSON
+odin canvas set my-canvas.json      # replace it (or pipe: ... | odin canvas set -)
+odin translate                      # print the Terraform your canvas becomes
+odin apply --env dev                # the Apply button, as a command
+odin world --env dev                # live resource phases
+odin events --env dev               # the event stream, one JSON line each
+odin tf status --env dev            # tofu-side state
+odin destroy --env dev              # full teardown (tofu half included)
+odin import-tf existing.tf          # TF -> canvas JSON (pipe into canvas set -)
+odin doctor                         # toolchain health, with exact fixes
+```
+
+A round-trip example an agent might run:
+
+```bash
+odin canvas get | jq '.nodes += [{"id":"x1","type":"s3","data":{"label":"backups"}}]' | odin canvas set -
+odin apply --env dev
+```
 
 ## Verification
 

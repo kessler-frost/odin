@@ -3,8 +3,10 @@
 Five slices against real containers (goaws, RustFS, dynalite via node:alpine):
 - sqs: a queue node roundtrips a message through the host-side client.
 - sns→sqs: a canvas edge (ReactFlow node ids — exercises the id→label edge
-  translation) becomes a raw-delivery subscription; a re-provision with a
-  second queue must subscribe BOTH (the duplicate-subscribe tolerance probe).
+  translation) becomes a raw-delivery subscription; a LIVE EDIT re-apply that
+  adds a second queue + edge to the already-healthy topic must retrofit the
+  new subscription via the reconciler's observe pass (plan NoOps healthy
+  resources) and deliver to BOTH queues.
 - dynamodb: put_item/get_item roundtrip.
 - env isolation: same node label in envs a+b → two backing containers,
   destroy of a gc's only a's.
@@ -39,6 +41,13 @@ CANVAS_SNS = {
         {"id": "n2", "type": "sqs", "data": {"label": "jobs"}},
     ],
     "edges": [{"id": "e1", "source": "n1", "target": "n2"}],
+}
+# The live-edit shape: CANVAS_SNS plus a second queue and a second sns→sqs
+# edge — applied while `alerts` is already healthy, so only the reconciler's
+# observe pass (plan() NoOps healthy resources) can retrofit the subscription.
+CANVAS_SNS_LIVE_EDIT = {
+    "nodes": CANVAS_SNS["nodes"] + [{"id": "n3", "type": "sqs", "data": {"label": "jobs2"}}],
+    "edges": CANVAS_SNS["edges"] + [{"id": "e2", "source": "n1", "target": "n3"}],
 }
 
 
@@ -131,10 +140,23 @@ def test_sns_to_sqs_delivery(tmp_path, runtime):
         jobs_url = sqs.get_queue_url(QueueName="jobs")["QueueUrl"]
         assert _receive(sqs, jobs_url) == "ping"  # raw delivery: body verbatim
 
-        # RE-provision with TWO queues — jobs is already subscribed, so a
-        # duplicate-subscribe error would abort before jobs2 ever subscribes
-        # (the reviewer's single-try-block finding). Both must deliver.
-        aws.provision("sns", "alerts", subscriptions=("jobs", "jobs2"))
+        # LIVE EDIT through the real apply path: add jobs2 + its edge while
+        # alerts is already healthy. plan() NoOps the healthy topic, so the
+        # retrofit is tick-driven (the observe pass diffs desired vs actual
+        # subscriptions) — poll until the subscription really lands before
+        # publishing the fanout probe. Both queues must then deliver.
+        client.post("/apply", json=CANVAS_SNS_LIVE_EDIT)
+        _wait(client, lambda p: p.get("jobs2") == "healthy")
+
+        def _jobs2_subscribed() -> bool:
+            subs = sns.list_subscriptions_by_topic(TopicArn=topic_arn)["Subscriptions"]
+            return any(s["Endpoint"].endswith(":jobs2") for s in subs)
+
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and not _jobs2_subscribed():
+            time.sleep(0.5)
+        assert _jobs2_subscribed(), "the live-edited jobs2 subscription never appeared"
+
         sns.publish(TopicArn=topic_arn, Message="fanout")
         jobs2_url = sqs.get_queue_url(QueueName="jobs2")["QueueUrl"]
         assert _receive(sqs, jobs_url) == "fanout"
