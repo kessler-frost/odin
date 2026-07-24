@@ -97,16 +97,19 @@ future decision against these points instead of re-deriving them:
     `aws_ecs_service` now plans zero-drift — the gateway stores the full tag
     set and echoes it back, with
     `TagResource`/`UntagResource`/`ListTagsForResource` modeled.)
-  - SNS→SQS: adding a subscription edge to an *already-healthy* topic
-    doesn't retroactively re-provision it (fixed on create; the live-edit
-    path is a known gap).
+  - SNS→SQS live-edit: FIXED (v0.5.0) — adding a subscription edge to an
+    already-healthy topic lands on the next Apply via the reconciler's
+    observe pass (proven by real fanout to both queues).
   - RDS stays off Terraform — the reconciler's real Postgres container, not
     a `tofu`-managed resource, until an RDS gateway model lands.
   - Nebula: single-host mesh is REAL end-to-end — a real host lighthouse
     process (`fabric/nebula.py::LighthouseManager`) and a real `nebula`
     daemon inside every VPC-joined EC2 VM, the VPC's compiled SG firewall
-    baked into its config, proven by an actual overlay ping + a real
-    SG-rule-filtered connection (`tests/simulate/test_nebula_mesh_e2e.py`).
+    baked into its config. The live overlay proof (an actual ping + a real
+    SG-rule-filtered connection, `tests/simulate/test_nebula_mesh_e2e.py`)
+    requires a one-time sudo setup on the host (macOS needs root for a utun
+    device; the test prints the exact, narrowly-scoped command and skips
+    cleanly until it's done — see `scripts/allfather-nebula-ctl`).
     Cross-Mac reachability (a second machine's mesh) is still open — see M7.
 - **Recorded as UNSUPPORTED for now** (northstar directive 5's honesty rule):
   ALB/ELBv2, EKS, CloudFormation, autoscaling, and RDS-via-Terraform (rds
