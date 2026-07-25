@@ -176,12 +176,15 @@ future decision against these points instead of re-deriving them:
     60s budget as `timeouts.update` (`ODIN_ECS_STEADY_TIMEOUT` overrides), and
     it returns the moment nothing is left pending, so a healthy apply pays one
     store read. (Fixed: a
-    **Residual gap, stated plainly:** `/apply-full` holds the reconciler's tick
-    lock for the whole tofu run, so `/world` is FROZEN at its last pre-apply
-    reading for ~60s. The ~59-second blind window the field test measured is
-    therefore unchanged — what changed is that it now conceals a rollout whose
-    old revision is still serving every request, instead of concealing a total
-    outage. Also: a replacement that takes longer than
+    **The blind window is CLOSED (v0.7.3).** `/apply-full` used to hold the
+    reconciler's tick lock for the whole tofu run, freezing `/world` at its
+    last pre-apply reading for ~60s. `hold()` now suspends the reconciler's
+    ACTIONS (plan/execute, gc, the policy push, the prune) while leaving
+    OBSERVATION running, so state changes are visible AS THEY HAPPEN: the
+    honest reading arrived at t=62.3s before the fix (after the apply had
+    already returned) and arrives at **t=4.1s** after it, re-measured
+    independently by field test 4 at ~3s. Sixty observation ticks over a
+    steady projection emit zero deltas, so nothing flaps. **Residual:** a replacement that takes longer than
     `ecsctl._ROLLOUT_STABILIZE_SECONDS` to crash is counted as serving and the
     old revision is retired anyway (real ECS behaves the same for a service
     with no health check configured). (Fixed: a
