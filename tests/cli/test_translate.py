@@ -114,6 +114,44 @@ def test_import_tf_requires_file_or_live(runner):
     assert "needs a <file.tf>" in result.stderr
 
 
+# --- v0.7.1: a real Terraform project IS a directory (field test B7) ----------
+
+
+@respx.mock
+def test_import_tf_accepts_a_directory_and_sends_every_tf_as_one_canvas(runner, tmp_path):
+    project = tmp_path / "tfproj"
+    project.mkdir()
+    (project / "network.tf").write_text('resource "aws_vpc" "net" {}\n')
+    (project / "app.tf").write_text(MAIN_TF)
+    (project / "README.md").write_text("not terraform\n")
+    route = respx.post(f"{BASE}/import-tf").mock(return_value=httpx.Response(200, json=IMPORTED))
+
+    result = runner.invoke(app, ["import-tf", str(project)])
+
+    assert result.exit_code == 0
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["source"] == "hcl"
+    # ONE request, both files, sorted -- and the .md left out.
+    assert len(route.calls) == 1
+    assert sent["hcl"] == f"# ---- app.tf\n{MAIN_TF}\n# ---- network.tf\nresource \"aws_vpc\" \"net\" {{}}\n"
+    assert "as ONE canvas: app.tf, network.tf" in result.stderr
+    assert json.loads(result.stdout) == {"nodes": IMPORTED["nodes"], "edges": []}
+
+
+def test_import_tf_of_a_directory_with_no_tf_files_says_so(runner, tmp_path):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    result = runner.invoke(app, ["import-tf", str(empty)])
+    assert result.exit_code == 2
+    assert "no *.tf files in" in result.stderr and "Traceback" not in result.stderr
+
+
+def test_import_tf_of_a_missing_path_says_so_instead_of_tracebacking(runner, tmp_path):
+    result = runner.invoke(app, ["import-tf", str(tmp_path / "nope.tf")])
+    assert result.exit_code == 2
+    assert "no such file or directory" in result.stderr and "Traceback" not in result.stderr
+
+
 @respx.mock
 def test_import_tf_malformed_hcl_exits_nonzero(runner, tmp_path):
     # Finding #7: a genuine parse failure is a hard error a CI exit-code check

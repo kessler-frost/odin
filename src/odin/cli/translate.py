@@ -58,18 +58,43 @@ def _live_resource(spec: str) -> dict:
     return {"type": kind, "id": resource_id}
 
 
+def _project_hcl(directory: Path) -> str:
+    """Every `*.tf` in a directory, concatenated into one configuration.
+
+    That is exactly what a Terraform PROJECT is -- tofu itself reads every `.tf`
+    in its working directory as a single config, order-independent -- so a
+    directory imports as ONE canvas. Before v0.7.1 a directory argument died
+    with a raw traceback (`IsADirectoryError`), and since multiple file
+    arguments are a usage error, importing a real project meant a shell loop
+    plus hand-merging the JSON fragments (field test B7). The `# ----` headers
+    keep the file boundaries visible in whatever the parser reports.
+    """
+    files = sorted(directory.glob("*.tf"))
+    if not files:
+        raise http.fail(f"no *.tf files in {directory} -- is that the right directory?", 2)
+    typer.echo(
+        f"note: importing {len(files)} .tf file(s) from {directory} as ONE canvas: "
+        f"{', '.join(f.name for f in files)}",
+        err=True,
+    )
+    return "\n".join(f"# ---- {f.name}\n{f.read_text()}" for f in files)
+
+
 def _import_payload(file: Path | None, live: list[str]) -> dict:
     if live:
         return {"source": "live", "resources": [_live_resource(spec) for spec in live]}
     if file is None:
-        raise http.fail("import-tf needs a <file.tf>, or at least one --live type=id", 2)
-    return {"source": "hcl", "hcl": file.read_text()}
+        raise http.fail("import-tf needs a <file.tf> or directory, or at least one --live type=id", 2)
+    if not file.exists():
+        raise http.fail(f"no such file or directory: {file}", 2)
+    return {"source": "hcl", "hcl": _project_hcl(file) if file.is_dir() else file.read_text()}
 
 
 @app.command("import-tf")
 def import_tf(
     file: Path | None = typer.Argument(
-        None, help="A .tf file to parse as HCL (required unless --live is given)."
+        None, help="A .tf file, or a DIRECTORY of them (a whole Terraform project, "
+                   "imported as one canvas). Required unless --live is given.",
     ),
     live: list[str] = LIVE,
     env: str = IMPORT_ENV,
