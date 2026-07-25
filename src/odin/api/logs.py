@@ -24,16 +24,21 @@ Kind -> real backing:
 - lambda: the function's RIE container (compute/functions.py). Always on
   Colima regardless of the app's configured runtime -- FunctionRuntime's own
   default, unchanged here.
-- ecs: EVERY task container currently backing the service (compute/tasks.py)
-  -- v1's "the drawn node IS the service+taskdef pair" can still mean more
-  than one real container when desiredCount > 1, or a crash-looping task
-  that's been replaced. Also always on Colima, matching TaskRuntime's own
-  default.
+- ecs: the LIVE task containers backing the service (compute/tasks.py), plus
+  the few most recently stopped ones -- v1's "the drawn node IS the
+  service+taskdef pair" can still mean more than one real container when
+  desiredCount > 1, or a crash-looping task that's been replaced. Bounded
+  (`_ecs_task_containers`): unbounded history meant one docker call per task
+  that had EVER run. Also always on Colima, matching TaskRuntime's own default.
 - elasticache: the cluster's own `redis:7-alpine` container (aws/cache.py).
 - logs: no container of its own -- an `aws_cloudwatch_log_group` node IS the
   SINK, so this reads the events stored under the group whose name is the
   node's label (`gateway/models/logsctl.py::stored_events`).
 - vpc/subnet/sg/iam_role/ecr: no runnable backing at all.
+
+`tail` is a budget for the WHOLE response, never per container: a node with
+several backing containers honours `--tail N` exactly the way a single-source
+one does (see `_from_containers`).
 
 `?group=` bypasses node resolution entirely and reads ANY group in the env's
 sink -- including the ones the substrates auto-create without anybody drawing
@@ -62,6 +67,9 @@ from odin.spec.store import SpecStore
 
 DEFAULT_TAIL = 100
 NO_BACKING_KINDS = frozenset({"vpc", "subnet", "sg", "iam_role", "ecr"})
+# How many already-STOPPED ECS tasks stay readable behind the live ones --
+# see `_ecs_task_containers` for why they are bounded rather than dropped.
+_MAX_STOPPED_SOURCES = 3
 
 
 class LogsResponse(BaseModel):
@@ -134,16 +142,43 @@ def _find_cache_cluster(stores: SynthStores, env: str, node: str) -> dict | None
 
 
 def _ecs_task_containers(stores: SynthStores, env: str, cluster: str, service: str) -> list[tuple[str, str]]:
-    """(task_id, container_def_name) for every task this service currently
-    owns, most-recently-started first -- a crash-loop's newest attempt (the
-    one the user actually cares about) reads first."""
+    """(task_id, container_def_name) for the task containers worth reading:
+    every LIVE task most-recently-started first, then at most
+    `_MAX_STOPPED_SOURCES` most-recently-stopped ones.
+
+    Field test 3 (MED): this used to return every task record that had ever
+    existed. After a few break/recover cycles that was 27 sources for 3 live
+    tasks -- one `docker` call each, 0.849s against 0.044s for a single-source
+    RDS node, and growing without bound as deployments accumulate (a STOPPED
+    record is never deleted: only a DELIBERATE stop removes one, so every
+    crash leaves a permanent source behind).
+
+    The dead ones are BOUNDED rather than dropped, deliberately: a
+    crash-looping service has zero live tasks, and those final lines are the
+    entire diagnostic -- `odin logs` would be empty exactly when it matters
+    most. Three is enough to see a loop repeating without the cost growing
+    with the service's history."""
     prefix = f"task:{cluster}:"
     tasks = [
         t for key, t in stores.ecsctl.items(env).items()
         if key.startswith(prefix) and t["service_name"] == service
     ]
-    tasks.sort(key=lambda t: t.get("started_at") or 0, reverse=True)
-    return [(t["task_id"], t["container_name"]) for t in tasks]
+    live = sorted(
+        (t for t in tasks if t["last_status"] != "STOPPED"),
+        key=lambda t: t.get("started_at") or 0, reverse=True,
+    )
+    stopped = sorted(
+        (t for t in tasks if t["last_status"] == "STOPPED"),
+        key=lambda t: t.get("stopped_at") or t.get("started_at") or 0, reverse=True,
+    )
+    return [(t["task_id"], t["container_name"]) for t in live + stopped[:_MAX_STOPPED_SOURCES]]
+
+
+def _tail_lines(text: str, budget: int) -> str:
+    """The last `budget` lines of `text`. The driver's own `--tail` is a
+    PER-CONTAINER bound, so it alone cannot make `--tail N` mean N lines when
+    a node has several containers -- this is what closes the gap exactly."""
+    return "\n".join(text.splitlines()[-budget:])
 
 
 def _from_containers(
@@ -151,8 +186,20 @@ def _from_containers(
 ) -> LogsResponse:
     """Read logs off every name in `names` -- an EXITED container's logs are
     exactly the diagnostic a crash needs, so anything short of `absent`
-    (never existed / already removed) still gets its tail read."""
+    (never existed / already removed) still gets its tail read.
+
+    `tail` is a budget for the WHOLE response, not per container (field test
+    3, MED: `--tail 1` on a 3-task service returned 8 lines, while RDS honoured
+    it exactly). It is spent newest-source-first, which is the order `names`
+    already arrives in -- a crash-loop's latest attempt is the one being asked
+    about. The `==> name <==` headers are attribution, not content: they are
+    never counted against the budget, and a single-source node has none at all,
+    so `odin logs db --tail 2` and `odin logs web --tail 2` mean the same
+    thing. Every name stays in `sources` regardless of whether the budget
+    reached it -- the inventory of what was consulted must not shrink just
+    because the output was trimmed."""
     blocks: list[str] = []
+    budget = tail
     any_running = any_present = False
     for name in names:
         status = runtime.status(name)
@@ -160,9 +207,14 @@ def _from_containers(
             continue
         any_present = True
         any_running = any_running or status == "running"
-        text = runtime.logs(name, tail)
-        blocks.append(f"==> {name} <==\n{text}" if len(names) > 1 else text)
-    lines = "\n\n".join(b for b in blocks if b)
+        text = _tail_lines(runtime.logs(name, budget), budget) if budget > 0 else ""
+        budget -= len(text.splitlines())
+        if text:
+            blocks.append(f"==> {name} <==\n{text}" if len(names) > 1 else text)
+    # Joined with a single newline, not a blank line between blocks: every line
+    # of the response is then either a `==>` header or one real log line, which
+    # is what makes "--tail N gives N lines" exactly checkable.
+    lines = "\n".join(blocks)
     if not any_present:
         message = absent_message or f"not running: {', '.join(names)}"
     elif not any_running:

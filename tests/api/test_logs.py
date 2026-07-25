@@ -277,6 +277,122 @@ def test_ecs_reads_logs_from_every_task_container(tmp_path, monkeypatch):
     assert "==>" in result.lines  # multi-source: headered blocks
 
 
+def _ecs_stores(tmp_path, live: int, dead: int) -> SynthStores:
+    """A service with `live` RUNNING tasks and `dead` STOPPED ones -- what a
+    few break/recover cycles leave behind (field test 3 saw 27 records for 3
+    live tasks)."""
+    stores = SynthStores(tmp_path)
+    stores.ecsctl.set(ENV, "service:odin:app", {
+        "cluster_name": "odin", "service_name": "app", "status": "ACTIVE", "desired_count": live,
+    })
+    for i in range(live):
+        stores.ecsctl.set(ENV, f"task:odin:live{i}", {
+            "cluster_name": "odin", "service_name": "app", "task_id": f"live{i}", "container_name": "web",
+            "last_status": "RUNNING", "started_at": 100.0 + i,
+        })
+    for i in range(dead):
+        stores.ecsctl.set(ENV, f"task:odin:dead{i}", {
+            "cluster_name": "odin", "service_name": "app", "task_id": f"dead{i}", "container_name": "web",
+            "last_status": "STOPPED", "started_at": float(i), "stopped_at": float(i),
+        })
+    return stores
+
+
+class _CountingColima:
+    """Counts the real driver calls -- the whole cost of the bug is one docker
+    call per source, and there were 27 sources for 3 live tasks."""
+
+    def __init__(self, lines_per_container: int = 1):
+        self.status_calls: list[str] = []
+        self.log_calls: list[tuple[str, int]] = []
+        self.lines_per_container = lines_per_container
+
+    def status(self, name):
+        self.status_calls.append(name)
+        return "running" if "live" in name else "exited"
+
+    def logs(self, name, tail=20):
+        self.log_calls.append((name, tail))
+        return "\n".join(f"{name} line {i}" for i in range(self.lines_per_container))
+
+
+def test_ecs_sources_are_bounded_by_the_live_tasks_not_every_task_that_ever_ran(tmp_path, monkeypatch):
+    """Field test 3 (MED): 27 sources for 3 live tasks, one docker call each,
+    growing without bound as deployments accumulate."""
+    store = _store(tmp_path, (ResourceDesired(id="app", kind="ecs"),))
+    stores = _ecs_stores(tmp_path, live=3, dead=24)
+    colima = _CountingColima()
+    monkeypatch.setattr("odin.api.logs.ColimaRuntime", lambda: colima)
+
+    result = fetch_logs(store, stores, FakeRuntime(), ENV, "app")
+
+    # 3 live + at most 3 recent dead -- bounded, and the dead ones are kept
+    # because a crash-looping service has NO live task and its last lines are
+    # the entire diagnostic.
+    assert len(result.sources) == 6, result.sources
+    assert len(colima.status_calls) == 6
+    assert all("live" in name for name in result.sources[:3]), result.sources
+    assert result.sources[3:] == [
+        s for s in result.sources if "dead23" in s or "dead22" in s or "dead21" in s
+    ], "the three most recently stopped, newest first"
+
+
+def test_ecs_sources_are_only_the_recent_dead_ones_when_nothing_is_live(tmp_path, monkeypatch):
+    store = _store(tmp_path, (ResourceDesired(id="app", kind="ecs"),))
+    stores = _ecs_stores(tmp_path, live=0, dead=9)
+    colima = _CountingColima()
+    monkeypatch.setattr("odin.api.logs.ColimaRuntime", lambda: colima)
+
+    result = fetch_logs(store, stores, FakeRuntime(), ENV, "app")
+
+    assert len(result.sources) == 3, result.sources
+    assert result.running is False
+    assert result.lines, "a crash-looping service's last lines must still be readable"
+
+
+def test_tail_n_means_n_lines_of_output_for_a_multi_task_service(tmp_path, monkeypatch):
+    """Field test 3 (MED): `--tail 1` returned 8 lines for a 3-task service.
+    RDS honours --tail exactly; a multi-source node now does too -- N lines of
+    CONTENT, newest source first, with the `==>` headers not counted."""
+    store = _store(tmp_path, (ResourceDesired(id="app", kind="ecs"),))
+    stores = _ecs_stores(tmp_path, live=3, dead=0)
+    colima = _CountingColima(lines_per_container=5)
+    monkeypatch.setattr("odin.api.logs.ColimaRuntime", lambda: colima)
+
+    result = fetch_logs(store, stores, FakeRuntime(), ENV, "app", tail=1)
+
+    content = [line for line in result.lines.splitlines() if not line.startswith("==> ")]
+    assert len(content) == 1, result.lines
+    assert result.lines.count("==> ") == 1, "only a source that contributed gets a header"
+    assert len(result.sources) == 3, "every live task is still reported as a source"
+
+
+def test_tail_budget_spreads_across_sources_when_one_cannot_fill_it(tmp_path, monkeypatch):
+    store = _store(tmp_path, (ResourceDesired(id="app", kind="ecs"),))
+    stores = _ecs_stores(tmp_path, live=3, dead=0)
+    colima = _CountingColima(lines_per_container=2)
+    monkeypatch.setattr("odin.api.logs.ColimaRuntime", lambda: colima)
+
+    result = fetch_logs(store, stores, FakeRuntime(), ENV, "app", tail=5)
+
+    content = [line for line in result.lines.splitlines() if not line.startswith("==> ")]
+    assert len(content) == 5, result.lines
+    assert result.lines.count("==> ") == 3
+
+
+def test_a_single_source_node_still_honours_tail_exactly_and_has_no_header(tmp_path):
+    """RDS parity -- the yardstick field test 3 measured against."""
+    store = _store(tmp_path, (ResourceDesired(id="db", kind="rds"),))
+    stores = SynthStores(tmp_path)
+    rt = FakeRuntime()
+    rt.set("odin-rds-default-db", "running", "one\ntwo\nthree")
+
+    result = fetch_logs(store, stores, rt, ENV, "db", tail=2)
+
+    assert result.lines == "two\nthree"
+    assert "==>" not in result.lines
+
+
 def test_ecs_no_service_yet_is_honest_not_found(tmp_path):
     store = _store(tmp_path, (ResourceDesired(id="app", kind="ecs"),))
     stores = SynthStores(tmp_path)
