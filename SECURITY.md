@@ -158,6 +158,15 @@ A field like an RDS `password` is stored, and used, in cleartext:
     and the export archive were world-readable (`0644`). Fixed in v0.7.1;
     restoring an old archive tightens its files on the way in, and an old
     workspace is tightened on the next Apply.
+  - The **directory** half of the claim was false through v0.7.2, and a
+    fresh-user audit caught it: `.odin/` and `.odin/<env>/` were `0755`
+    whenever a writer that used a plain `mkdir` (the goaws config file,
+    `odin start`'s pidfile directory) created them before the private-mkdir
+    helper did — while `.odin/default/` was `0700`, because there the order
+    happened to run the other way. Every such writer now goes through the one
+    helper, and that helper tightens a directory it finds group- or
+    world-accessible, so an existing store is healed rather than left as the
+    first writer set it.
 - `.odin/` is gitignored, so a normal `git add`/`commit` won't leak it into
   a repo — but nothing stops you from committing it deliberately, so don't.
 - Fields that look like a secret (`password`, `secret`, `token`, `key` in

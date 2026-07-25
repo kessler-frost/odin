@@ -96,7 +96,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import subprocess
 import tempfile
 import threading
 import time
@@ -117,7 +116,7 @@ from odin.fabric.nebula import (
     peer_overlay_ips,
     rehandshake_script,
 )
-from odin.util import atomic_write_text
+from odin.util import atomic_write_text, run_command
 
 log = logging.getLogger("odin.compute.instances")
 
@@ -153,7 +152,10 @@ class _Proc:
 
 
 def _default_runner(args: list[str], input: str | None = None) -> _Proc:
-    proc = subprocess.run(args, capture_output=True, text=True, input=input)
+    # `run_command`: `limactl` is genuinely optional (doctor reports it as
+    # such), so "not installed" must surface as a nonzero result every caller
+    # already handles, never a FileNotFoundError.
+    proc = run_command(args, input=input)
     return _Proc(proc.returncode, proc.stdout, proc.stderr)
 
 

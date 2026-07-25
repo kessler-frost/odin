@@ -35,6 +35,7 @@ from odin.gateway.keys import KeyStore
 from odin.simulate import workspace
 from odin.spec.models import FieldValue, ResourceDesired, Stack, World, WorldDelta
 from odin.spec.store import SpecStore
+from odin.util import hold_store_lock
 
 ENV = "modes"
 
@@ -138,6 +139,23 @@ def test_env_and_store_directories_are_not_group_or_world_readable(tmp_path: Pat
     permission on `.odin/<env>/` the mode of a file inside it stops mattering."""
     root = tmp_path / ".odin"
     env_dir = _build_store(root)
+    assert _leaky([root, env_dir, env_dir / "tf", env_dir / "stacks"]) == []
+
+
+def test_a_directory_another_writer_left_loose_is_tightened(tmp_path: Path):
+    """Fresh-user MISLEAD-4: SECURITY.md says "the directories holding them are
+    0700" without qualification, and `.odin/` and `.odin/<env>/` were 0755 —
+    while `.odin/default/` was 0700. Two code paths, one claim, and the claim
+    lost: whichever writer got there first decided the mode, and the goaws
+    config writer and `odin start`'s pidfile dir both used a plain `mkdir`.
+
+    So the store is reproduced in exactly that order — the loose directories
+    already in place — and must come out matching the document anyway."""
+    root = tmp_path / ".odin"
+    (root / ENV).mkdir(parents=True)  # a plain mkdir under umask 022: 0755
+    assert _leaky([root, root / ENV]) != []  # non-vacuity: they really are loose
+    env_dir = _build_store(root)
+    hold_store_lock(root).release()  # what the server's lifespan does on startup
     assert _leaky([root, env_dir, env_dir / "tf", env_dir / "stacks"]) == []
 
 

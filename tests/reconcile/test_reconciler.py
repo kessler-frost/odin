@@ -271,21 +271,167 @@ async def test_gc_called_every_tick_with_active_kinds(tmp_path):
     assert aws.gc_calls == [set(), set()]  # empty stack -> every backing is stoppable, every tick
 
 
-async def test_hold_blocks_ticks_until_released(tmp_path):
+async def test_hold_suspends_gc_even_though_ticks_keep_running(tmp_path):
     # The /apply-full race (S5 e2e v8): the route's ensure phase boots
     # backings BEFORE the new stack is committed, while the background loop
     # keeps ticking against the OLD (empty) stack — whose gc(set()) stops
-    # the very containers being ensured. hold() must make ticks wait.
+    # the very containers being ensured. hold() must suppress that gc.
+    #
+    # v0.7.3: it suppresses the ACTION, not the tick. Ticks run to completion
+    # throughout the hold (that is what keeps /world live during an apply);
+    # what they must not do is touch anything.
     rt, aws = FakeRuntime(), FakeAws()
     store = SpecStore(tmp_path)
     store.apply(Stack())
     recon = Reconciler(store, rt, aws=aws, poll_interval=0)
     async with recon.hold():
-        tick_task = asyncio.create_task(recon.tick())
-        await asyncio.sleep(0.05)  # give the tick every chance to run
-        assert aws.gc_calls == []  # blocked: no gc while held
-    await tick_task
-    assert aws.gc_calls == [set()]  # released: the tick proceeded
+        for _ in range(5):
+            await recon.tick()
+        assert aws.gc_calls == []  # suspended: no gc while held
+    await recon.tick()
+    assert aws.gc_calls == [set()]  # released: the tick acts again
+
+
+async def test_a_cancelled_hold_does_not_leave_the_reconciler_suspended(tmp_path):
+    """An /apply-full killed mid-hold — a shutdown, a connection dropped 40s
+    into a tofu run — must not disable the env's reconciler forever. A
+    suspension is a flag now rather than a held lock, so the unwind has to put
+    it back; a leaked one is an env that silently never gc's or provisions
+    again, and nothing else in the system would notice."""
+    rt, aws = FakeRuntime(), FakeAws()
+    store = SpecStore(tmp_path)
+    store.apply(Stack())
+    recon = Reconciler(store, rt, aws=aws, poll_interval=0)
+
+    async def held():
+        async with recon.hold():
+            await asyncio.sleep(30)  # the tofu run that never gets to finish
+
+    task = asyncio.create_task(held())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    await recon.tick()
+    assert aws.gc_calls == [set()], "the suspension outlived the cancelled apply"
+
+
+async def test_hold_suspends_provisioning_and_the_gateway_push(tmp_path):
+    # The other two halves of "actions", asserted directly: nothing may be
+    # created in a backing while an external author owns the env, and the
+    # gateway's compiled policies/ports must stay exactly as the route's own
+    # `ensure_backings` staged them — a tick pushing the OLD stack's would
+    # break IAM and routing mid-tofu.
+    rt, aws, gw = FakeRuntime(), FakeAws(), FakeGateway()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(ResourceDesired(id="uploads", kind="s3"),)))
+    recon = Reconciler(store, rt, aws=aws, gateway=gw, poll_interval=0)
+    async with recon.hold():
+        for _ in range(3):
+            await recon.tick()
+        assert aws.provisioned == []
+        assert gw.calls == []
+    await recon.tick()
+    assert aws.provisioned == [("s3", "uploads", ())]
+    assert len(gw.calls) == 1
+
+
+async def test_world_is_projected_while_an_apply_holds_the_reconciler(tmp_path):
+    """FIELD TEST 3, the whole point of the split. `/apply-full` holds the
+    reconciler for the entire tofu run (~60s on a real stack), and `/world`
+    reads the last committed snapshot — so a service whose deployment died at
+    t≈4s still read `healthy` at t=64.0s, measured with a 2s sampler.
+
+    Observation is not an action: projecting the gateway's synth stores into
+    World creates nothing and destroys nothing, so it keeps running."""
+    rt, ws = FakeRuntime(), FakeWS()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(ResourceDesired(id="server", kind="ec2"),)))
+    stores = SynthStores(tmp_path)
+    stores.ec2compute.set("default", "instance:i-1", {"instance_id": "i-1", "state_name": "running"})
+    stores.tags.set("default", "ec2:i-1", {"odin:node": "server"})
+    recon = Reconciler(store, rt, ws=ws, poll_interval=0, stores=stores)
+    await recon.tick()
+    assert store.current_world().get("server").phase == "healthy"
+
+    async with recon.hold():  # an apply is now in flight
+        stores.ec2compute.set("default", "instance:i-1", {
+            "instance_id": "i-1", "state_name": "stopped",
+            "state_reason": {"code": "Server.InternalError", "message": "it died"},
+        })
+        await recon.tick()
+
+        observed = store.current_world().get("server")
+        assert observed.phase == "crashed", "the world froze for the whole apply again"
+        assert observed.verdict == "Server.InternalError: it died"
+        assert [m["phase"] for m in ws.sent if m.get("resource_id") == "server"] == ["healthy", "crashed"]
+
+
+async def test_hold_never_prunes_a_label_that_left_the_projection(tmp_path):
+    """The ONE World mutation the observing tick still must not make. tofu
+    replaces a resource by destroying then re-creating it, so a prune landing
+    in that window emits `draft` for a label that returns seconds later —
+    exactly the flap v0.7.1 killed. The tick after the hold is what prunes
+    whatever genuinely went away."""
+    rt, ws = FakeRuntime(), FakeWS()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(ResourceDesired(id="net", kind="vpc"),)))
+    stores = SynthStores(tmp_path)
+    stores.ec2net.set("default", "vpc:vpc-1", {"vpc_id": "vpc-1"})
+    stores.tags.set("default", "ec2:vpc-1", {"odin:node": "net"})
+    recon = Reconciler(store, rt, ws=ws, poll_interval=0, stores=stores)
+    await recon.tick()
+
+    async with recon.hold():
+        stores.ec2net.delete("default", "vpc:vpc-1")  # mid-replace: gone, for now
+        for _ in range(3):
+            await recon.tick()
+        assert store.current_world().get("net") is not None, "pruned mid-apply"
+        assert not [m for m in ws.sent if m.get("phase") == "draft"]
+
+    await recon.tick()
+    assert store.current_world().get("net") is None  # ...and the truth lands right after
+
+
+async def test_hold_reports_known_drift_without_sweeping_for_more(tmp_path):
+    """A sweep CORRECTS records off a `docker ps`/`limactl list` sample, and
+    taking that sample while tofu has the daemon pinned is the busy-daemon
+    hazard drift.py's confirm-before-correcting note names. So the observing
+    tick reads the last sweep's cache instead — a drift already reported stays
+    reported, and no new one is written mid-apply."""
+    rt = FakeRuntime()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(ResourceDesired(id="server", kind="ec2"),)))
+    stores = _ec2_stores(tmp_path)
+    sweeper = _drift(vm_names=["veronica"])  # the instance's own VM is GONE
+    recon = Reconciler(store, rt, poll_interval=0, stores=stores, drift=sweeper)
+
+    async with recon.hold():
+        await recon.tick()
+        assert stores.ec2compute.get("default", "instance:i-1")["state_name"] == "running", (
+            "the record was corrected by a sweep taken mid-apply"
+        )
+    await recon.tick()
+    assert store.current_world().get("server").phase == "crashed"  # the real sweep still runs after
+
+
+async def test_an_ordinary_apply_does_not_burst_deltas(tmp_path):
+    """v0.7.1's regression guard, re-run against the observing tick: 60 watch
+    ticks over a steady projection (an apply where nothing about this resource
+    changes) must emit nothing at all — `_emit`'s dedupe is what keeps the
+    freeze fix from turning into a badge storm."""
+    rt, ws = FakeRuntime(), FakeWS()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(ResourceDesired(id="net", kind="vpc"),)))
+    recon = Reconciler(store, rt, ws=ws, poll_interval=0, stores=_synthesized_sg_stores(tmp_path))
+    await recon.tick()
+    baseline = len(ws.sent)
+
+    async with recon.hold():  # a ~60s apply at the production 1s poll interval
+        for _ in range(60):
+            await recon.tick()
+
+    assert len(ws.sent) == baseline, [m for m in ws.sent[baseline:]]
 
 
 async def test_gateway_updated_every_tick_with_compiled_policies_and_backing_ports(tmp_path):

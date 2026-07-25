@@ -13,6 +13,7 @@ from unittest.mock import patch
 import pytest
 
 from odin import util
+from odin.runtime.colima import ColimaRuntime
 from odin.util import atomic_write_text, odin_version
 
 
@@ -150,3 +151,34 @@ def test_concurrent_writers_never_produce_a_partial_file(tmp_path: Path):
     assert not errors
     final = path.read_text()
     assert final == "seed" or any(final == p for p in payloads)
+
+
+# --- run_command: a missing binary is a RESULT, never an exception ---------
+
+def test_run_command_reports_a_missing_binary_as_127():
+    """Fresh-user BLOCK-2: `odin doctor` crashed with a FileNotFoundError on a
+    Mac with no `docker` CLI. Every odin runner seam goes through here, so the
+    answer for "that tool isn't installed" is the shell's own 127 plus a
+    message -- something every caller already handles."""
+    result = util.run_command(["odin-no-such-binary-exists", "--version"])
+    assert result.returncode == util.COMMAND_NOT_FOUND
+    assert result.stdout == ""
+    assert "odin-no-such-binary-exists" in result.stderr
+    assert "command not found" in result.stderr
+
+
+def test_run_command_passes_through_a_real_command():
+    result = util.run_command(["echo", "hello"])
+    assert (result.returncode, result.stdout.strip()) == (0, "hello")
+
+
+def test_run_command_feeds_stdin():
+    result = util.run_command(["cat"], input="piped")
+    assert (result.returncode, result.stdout) == (0, "piped")
+
+
+def test_colima_runtime_survives_a_missing_docker_cli(monkeypatch: pytest.MonkeyPatch):
+    """The seam fix, end to end: with nothing named `docker` on PATH,
+    `ensure_host()` answers "I don't know" instead of raising."""
+    monkeypatch.setenv("PATH", "/nonexistent")
+    assert ColimaRuntime().ensure_host().total_mem_mib == 0

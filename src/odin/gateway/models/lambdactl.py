@@ -94,6 +94,7 @@ from odin.gateway.models import logsctl
 from odin.gateway.stores import NO_CHANGE, SynthStores
 from odin.gateway.wiring import node_env
 from odin.runtime.colima import ColimaRuntime
+from odin.util import private_mkdir
 
 log = logging.getLogger("odin.gateway.lambdactl")
 
@@ -371,7 +372,7 @@ def _create_function(resource: str, env: str, body: bytes, stores: SynthStores, 
         return _invalid_parameter("Code.ZipFile is not valid base64")
 
     zip_path = _zip_path(stores.root, env, name)
-    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    private_mkdir(zip_path.parent)  # under .odin/<env>/gateway — 0700 like the rest
     zip_path.write_bytes(zip_bytes)
 
     runtime = payload.get("Runtime") or DEFAULT_RUNTIME

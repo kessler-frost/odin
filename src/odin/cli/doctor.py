@@ -10,7 +10,6 @@ optional tooling never blocks.
 """
 from __future__ import annotations
 
-import subprocess
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from functools import partial
@@ -25,6 +24,7 @@ from odin.cli.app import app
 from odin.reconcile.admission import check_admission, default_min_disk_gib
 from odin.runtime.colima import ColimaRuntime
 from odin.spec.models import Stack
+from odin.util import run_command
 
 # Both live-resource checks are READ-ONLY over `reconcile/admission.py` -- the
 # module that can actually hard-fail an Apply -- rather than second guesses at
@@ -60,7 +60,11 @@ class CheckResult:
 # its own was misleading for `limactl` (field test LOW-15), since every EC2 node
 # is a real Lima VM and an EC2 canvas simply cannot work without it.
 _TOOLS: tuple[tuple[str, bool, str, str], ...] = (
-    ("docker", True, "brew install colima", ""),  # colima front-ends the docker CLI
+    # `brew install colima` does NOT bring the docker CLI -- `brew deps colima`
+    # is `lima`, nothing else. Fresh-user finding BLOCK-2: the installer's own
+    # brew list left a fresh Mac with colima and no `docker`, and doctor then
+    # told the user to install the thing they already had.
+    ("docker", True, "brew install docker", ""),
     ("tofu", True, "brew install opentofu", ""),  # Apply shells out to it (simulate/runner.py)
     ("limactl", False, "brew install lima",
      "REQUIRED for any canvas with an EC2 node (each one is a real Lima VM) and for "
@@ -76,8 +80,12 @@ ALL_CHECKS: tuple[str, ...] = (
 )
 
 
-def _subprocess_run(args: list[str], input: str | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, capture_output=True, text=True, input=input)
+def _subprocess_run(args: list[str], input: str | None = None) -> Proc:
+    """The runner every check goes through -- `util.run_command`, so a tool
+    that isn't installed comes back as rc 127 rather than raising. A doctor
+    that can crash on a missing binary is a doctor that reports nothing on the
+    machines that need it most (BLOCK-2: no `docker` -> traceback, zero rows)."""
+    return run_command(args, input=input)
 
 
 def _which(run: Runner, tool: str) -> str:
@@ -96,8 +104,15 @@ def _check_colima(run: Runner) -> CheckResult:
     path = _which(run, "colima")
     if not path:
         return CheckResult("colima", "fail", True, "not found on PATH", "brew install colima")
-    if run(["colima", "status"]).returncode != 0:
-        return CheckResult("colima", "fail", True, f"{path} — installed but not running",
+    proc = run(["colima", "status"])
+    if proc.returncode != 0:
+        # Colima's OWN last line, when it said anything. "dependency check
+        # failed for VM: lima not found" is a different problem from "not
+        # running", and collapsing both to `colima start` sends the user to a
+        # command that fails differently (fresh-user FRICTION-4).
+        said = (proc.stderr or proc.stdout).strip().splitlines()
+        return CheckResult("colima", "fail", True,
+                           f"{path} — {said[-1] if said else 'installed but not running'}",
                            "colima start")
     return CheckResult("colima", "ok", True, f"{path} — running")
 
@@ -121,6 +136,16 @@ def _check_memory(run: Runner, root: Path) -> CheckResult:
     Informational, never a blocker -- an unknown total means the container
     runtime didn't answer, which the `colima` check above already reports as the
     real failure, and admission skips its own memory check in that case too."""
+    # BLOCK-2: no docker CLI = nothing to ask, and `colima start` is the wrong
+    # remedy for it. Named as its own answer rather than collapsed into the
+    # daemon-is-silent one, which sends the user off to start a running Colima.
+    if not _which(run, "docker"):
+        return CheckResult(
+            "memory", "skip", False,
+            "unknown -- there is no `docker` CLI on PATH to ask for a memory total, so "
+            "Apply's memory admission check is skipped entirely (see the docker row)",
+            "brew install docker",
+        )
     host = ColimaRuntime(runner=run).ensure_host()
     budget_mib = check_admission(Stack(), host, root).budget_mib
     known = budget_mib > 0
@@ -168,6 +193,10 @@ _ICONS = {"ok": "✓", "fail": "✗", "skip": "○"}
 
 
 def _prebake() -> None:
+    if not _which(_subprocess_run, "docker"):
+        typer.echo("docker not found on PATH — there is nothing to build the image with.")
+        typer.echo("fix: brew install docker")
+        raise typer.Exit(1)
     runtime = ColimaRuntime()
     present = runtime.image_exists(DYNALITE_IMAGE)
     state = "present" if present else "absent — building now (one-time npm install)"

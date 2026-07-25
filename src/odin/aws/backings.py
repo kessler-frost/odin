@@ -33,6 +33,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 from odin.fabric.sidecar import MeshSidecar
 from odin.gateway import DEFAULT_GATEWAY_PORT
 from odin.runtime.colima import CONTAINER_HOST, ContainerSpec
+from odin.util import private_mkdir
 
 
 class BackingUnavailable(RuntimeError):
@@ -239,8 +240,7 @@ class BackingAws:
         if d.name == "goaws":
             # Config must live under the repo tree ($HOME is the only tree
             # Colima shares into the VM — a /tmp mount silently comes up empty).
-            conf_dir = (self._root / self._env).resolve()
-            conf_dir.mkdir(parents=True, exist_ok=True)
+            conf_dir = private_mkdir((self._root / self._env).resolve())
             (conf_dir / "goaws.yaml").write_text(_goaws_config(self._gateway_port))
             volumes = {str(conf_dir): "/conf"}
         if d.name == "dynalite":

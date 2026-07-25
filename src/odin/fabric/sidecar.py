@@ -70,7 +70,7 @@ from odin.fabric.nebula import (
     rehandshake_script,
 )
 from odin.runtime.colima import ContainerSpec
-from odin.util import atomic_write_text
+from odin.util import atomic_write_text, private_mkdir
 
 log = logging.getLogger("odin.fabric.sidecar")
 
@@ -282,7 +282,7 @@ class MeshSidecar:
             # is exactly what makes the sidecar re-join on the new one.
             lighthouse_port=overlay.lighthouse_port,
         )
-        directory.mkdir(parents=True, exist_ok=True)
+        private_mkdir(directory)  # host.key lives here
         for name, text in (
             ("ca.crt", cert.ca_crt.read_text()),
             ("host.crt", cert.crt.read_text()),

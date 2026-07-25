@@ -6,7 +6,9 @@ import typer
 
 from odin.cli import http
 from odin.cli.app import app
+from odin.cli.apply import not_covered
 from odin.cli.http import OutputFormat
+from odin.spec.translate import skipped_node_types
 
 tf_app = typer.Typer(help="Direct tofu-side operations for an env.", no_args_is_help=True)
 app.add_typer(tf_app, name="tf")
@@ -43,11 +45,13 @@ def _render_tf_plan(body: dict) -> None:
     typer.echo(f"status: {body['status']}  env: {body['env']}  exit code: {body['exit_code']}")
     for line in body.get("tail", []):
         typer.echo(f"  {line}")
-    unsupported = body.get("unsupported") or []
-    # "no changes" only ever means "no drift in what odin can generate" --
-    # a node odin has no Terraform for was never in the plan at all.
-    if unsupported:
-        typer.echo(f"not covered by this plan (unsupported): {', '.join(unsupported)}")
+    # "no changes" only ever means "no drift in what odin can generate" -- a
+    # node odin has no Terraform for was never in the plan at all. MISLEAD-2:
+    # the README promised this line and it never appeared, because a kind odin
+    # doesn't model at all (`kinesis`, a typo) never reaches TF generation and
+    # so never reaches `unsupported` either. Both halves are named here now.
+    if body["not_covered"]:
+        typer.echo(f"not covered by this plan: {', '.join(body['not_covered'])}")
 
 
 @tf_app.command("plan")
@@ -65,6 +69,15 @@ def tf_plan(env: str = http.ENV, url: str = http.URL, output: OutputFormat = htt
     body = http.body_or_fail(http.request(
         "POST", url, "/tf/plan", params={"env": env}, unreachable_code=_PLAN_UNREACHABLE_EXIT,
     ))
+    # A kind odin doesn't model never became a Stack resource, so the plan
+    # cannot see it -- the canvas is the only place it still exists. Read AFTER
+    # the plan (the server is demonstrably up by then) and folded into the same
+    # `not_covered` field `odin apply` publishes, so one gate shape covers both.
+    canvas = http.body_or_fail(http.request(
+        "GET", url, "/canvas", unreachable_code=_PLAN_UNREACHABLE_EXIT,
+    ))
+    body["skipped"] = skipped_node_types(canvas)
+    body["not_covered"] = not_covered(body)
     http.emit(body, output, _render_tf_plan)
     raise typer.Exit(_PLAN_EXIT[body["status"]])
 
