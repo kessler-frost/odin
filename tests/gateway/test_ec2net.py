@@ -358,6 +358,33 @@ def test_delete_last_vpc_stops_the_envs_lighthouse_before_deleting_its_config(si
     assert not (stores.root / ENV / "nebula").exists()
 
 
+def test_purge_env_forgets_the_network_records_an_interrupted_apply_stranded(sink, ec2, stores, monkeypatch):
+    """Field test 3 HIGH-B's other half. `kill -9` on tofu mid-apply leaves
+    these records created and tofu's state empty, so `tofu destroy` has
+    nothing to destroy, `_delete_vpc` never runs, and they outlive every
+    subsequent destroy -- which is why `/world` went on listing a VPC and
+    subnets for an env the user had destroyed. It also re-opened HIGH-A
+    through the back door: the lighthouse stop hangs off the VPC-delete path."""
+    stopped: list[tuple] = []
+    monkeypatch.setattr(
+        ec2net_mod.LighthouseManager, "ensure_stopped",
+        lambda self, root, env: stopped.append((Path(root), env)),
+    )
+    vpc_id = _create_vpc(stores, sink, ec2)
+    _create_sg(stores, sink, ec2, vpc_id, name="web")
+    req = sink.call(lambda: ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.0.1.0/24"))
+    _parse("CreateSubnet", _answer(stores, req))
+
+    forgotten = ec2net_mod.purge_env(stores, ENV)
+
+    assert {k.split(":", 1)[0] for k in forgotten} == {"vpc", "subnet", "sg"}
+    assert stores.ec2net.items(ENV) == {}
+    assert stopped == [(stores.root, ENV)]
+    assert not (stores.root / ENV / "nebula").exists()
+    # A NORMAL destroy (tofu already deleted everything) finds nothing to do.
+    assert ec2net_mod.purge_env(stores, ENV) == []
+
+
 # --- Tags (EC2's own wire shape) ------------------------------------------------
 
 

@@ -36,7 +36,7 @@ from odin.fabric.sidecar import MeshSidecar
 from odin.gateway import DEFAULT_GATEWAY_PORT, GATEWAY_PORT_ENV, wiring
 from odin.gateway.app import GatewayState, create_gateway_app, serve_in_thread, stop_in_thread
 from odin.gateway.keys import OPERATOR_NODE_ID, KeyStore, Principal
-from odin.gateway.models import ec2compute, ecsctl, lambdactl, rdsctl
+from odin.gateway.models import ec2compute, ec2net, ecsctl, lambdactl, rdsctl
 from odin.gateway.stores import SynthStores
 from odin.reconcile import admission
 from odin.reconcile.drift import DriftSweeper
@@ -204,6 +204,15 @@ def create_apply_router(
             reclaimed = await asyncio.to_thread(ec2compute.reclaim_env_instances, stores, env)
             if reclaimed:
                 body["reclaimed_vms"] = reclaimed
+            # ...and the network records the same interruption left behind,
+            # which `tofu destroy` likewise never reaches. They are what kept
+            # `/world` listing a VPC and subnets for a destroyed env -- and,
+            # because the lighthouse stop hangs off the VPC-delete path, a VPC
+            # record that is never deleted is a lighthouse never stopped
+            # (HIGH-A through HIGH-B's back door).
+            forgotten = await asyncio.to_thread(ec2net.purge_env, stores, env)
+            if forgotten:
+                body["reclaimed_network_records"] = forgotten
 
             store.apply(Stack(env=env))  # empty desired state -> the tick below prunes all
 

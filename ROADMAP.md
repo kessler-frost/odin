@@ -421,6 +421,28 @@ future decision against these points instead of re-deriving them:
       by the same Apply-time refresh the SG-edit fix added (a restart, not a
       SIGHUP, because nebula does not reload that section — and a member whose
       lighthouse moved has no working tunnel to lose).
+    - **...and teardown really stops it.** For one release every
+      apply/destroy cycle leaked a live lighthouse and one held port, and the
+      minimal canvas that did it had no EC2 at all — a VPC plus a single S3
+      bucket (field test 3 HIGH-A). `odin destroy` reported "destroyed" and
+      deleted `.odin/<env>/nebula/`, taking with it the pidfile that was the
+      only way to name the process still running against it; three orphans
+      were measured on `*:4343`/`*:4344`/`*:4345`, one 8m20s old. It did NOT
+      leak on an env with VMs, which was the tell: the only stop was
+      `ec2compute._finish_terminate`'s "last VM leaves", which an env without
+      VMs never reaches. Now `_delete_vpc` stops the lighthouse BEFORE
+      deleting its directory (ordering is the fix — `ensure_stopped` finds the
+      process through the pidfile in there), and
+      `fabric/nebula.py::reap_orphaned_lighthouses` is the startup backstop
+      for one that leaked earlier or for a crash between those two steps. It
+      identifies a leak by EVIDENCE, never by name: the process's own
+      `-config` argument must point inside this store's root at a
+      `lighthouse-config.yml` that no longer exists, so a live env's
+      lighthouse, another odin store's, and a user's own `nebula` can none of
+      them match. Proven by three real apply/destroy cycles on that exact
+      canvas: zero surviving `nebula` processes, the port bindable again after
+      each, and every cycle reusing 4342 rather than walking up the range
+      (`tests/simulate/test_lighthouse_no_leak_e2e.py`).
     - **EC2 nodes publish addresses too** (they published nothing before):
       `${{web1.PRIVATE_IP}}` (host-reachable, ungated) and
       `${{web1.MESH_IP}}` (the SG-gated overlay address, sticky across
@@ -428,6 +450,33 @@ future decision against these points instead of re-deriving them:
       withheld when the env's lighthouse is down. For a VM that lighthouse
       check is ALL that is verified: its nebula is a systemd unit inside a
       Lima VM, and a `limactl shell` per VM per sweep is not a tick's price.
+    - **An INTERRUPTED apply no longer strands VMs nothing can reclaim.**
+      Field test 3 HIGH-B, and the one a user hits by closing their laptop:
+      `kill -9` on tofu mid-apply (equally Ctrl-C, or an OOM) leaves tofu's
+      state empty while the VMs it already created keep Running. `odin
+      destroy` then answered `destroyed / tf ok` in 1.7s with three real VMs
+      up and `/world` still listing seven resources — and a second destroy,
+      the empty-canvas Apply, and a server restart all spared them, because
+      `reap_orphaned_vms` builds its "expected" set from the very store that
+      still claimed them. Reality and the store disagreed and the store was
+      trusted. Only `limactl delete` by hand worked.
+      Two fixes, because there are two moments. **`/destroy` now reclaims
+      directly**: destroy is unambiguous about intent, so anything the
+      gateway store still claims is deleted by exact name and forgotten —
+      instances (`ec2compute.reclaim_env_instances`) and the VPC/subnet/SG
+      records the same interruption stranded (`ec2net.purge_env`, which also
+      stops the lighthouse those records were keeping alive). If a VM cannot
+      be deleted, destroy REFUSES to say `destroyed` and names it. **And
+      startup reclaims what an older odin left**: `reclaim_tf_forgotten_vms`
+      takes tofu's own state as the second witness — an instance the store
+      claims and the state has forgotten can never be reached by any
+      terraform operation again, so it is deleted and forgotten. Read
+      strictly: a state file that is missing or empty is NO evidence and
+      reclaims nothing.
+      Proven by SIGKILLing the real `tofu` process mid-apply (identified by
+      its working directory, so nothing else on the machine can be touched)
+      and then requiring a supported command to clean up
+      (`tests/simulate/test_interrupted_apply_reclaim_e2e.py`).
     - **RESIDUAL GAP, stated plainly: the raw host port is still open and
       SGs do NOT gate it.** Mesh membership is ADDITIVE — every backing keeps
       its published Docker port, because the gateway forwards AWS calls to
