@@ -22,9 +22,17 @@ import typer
 
 from odin.aws.backings import DYNALITE_IMAGE, BackingAws
 from odin.cli.app import app
+from odin.reconcile.admission import check_admission, default_min_disk_gib
 from odin.runtime.colima import ColimaRuntime
+from odin.spec.models import Stack
 
-MIN_DISK_GIB = 10.0
+# Both live-resource checks are READ-ONLY over `reconcile/admission.py` -- the
+# module that can actually hard-fail an Apply -- rather than second guesses at
+# its arithmetic. Field test LOW-14/LOW-15: doctor hardcoded a 10 GiB disk floor
+# while admission honoured `ODIN_MIN_DISK_GIB` (so the two disagreed at anything
+# but the default, contradicting admission's own docstring), and said nothing
+# at all about memory even though memory is the one thing that rejects an Apply
+# outright, against a ceiling the user had no way to discover in advance.
 
 
 class Proc(Protocol):
@@ -47,17 +55,24 @@ class CheckResult:
     fix: str = ""  # exact shell command to fix, when status != "ok"
 
 
-# (name, required, fix) for every plain is-it-on-PATH tool check.
-_TOOLS: tuple[tuple[str, bool, str], ...] = (
-    ("docker", True, "brew install colima"),  # colima front-ends the docker CLI (ColimaRuntime)
-    ("tofu", True, "brew install opentofu"),  # Apply shells out to it (simulate/runner.py)
-    ("limactl", False, "brew install lima"),  # only LimaRuntime / EC2-as-Lima-VM needs it
-    ("bun", False, "curl -fsSL https://bun.sh/install | bash"),  # dev-only: building the UI
-    ("claude", False, "see https://docs.claude.com/claude-code"),  # translate has a fallback
+# (name, required, fix, when_optional) for every plain is-it-on-PATH tool check.
+# `when_optional` is the precise consequence of NOT having it -- "optional" on
+# its own was misleading for `limactl` (field test LOW-15), since every EC2 node
+# is a real Lima VM and an EC2 canvas simply cannot work without it.
+_TOOLS: tuple[tuple[str, bool, str, str], ...] = (
+    ("docker", True, "brew install colima", ""),  # colima front-ends the docker CLI
+    ("tofu", True, "brew install opentofu", ""),  # Apply shells out to it (simulate/runner.py)
+    ("limactl", False, "brew install lima",
+     "REQUIRED for any canvas with an EC2 node (each one is a real Lima VM) and for "
+     "LimaRuntime; every other kind runs on containers and needs none of it"),
+    ("bun", False, "curl -fsSL https://bun.sh/install | bash",
+     "needed only to build the UI from a clone -- the released package ships one prebuilt"),
+    ("claude", False, "see https://docs.claude.com/claude-code",
+     "needed only by \"what's wrong here?\" (POST /agent/debug); translation is deterministic"),
 )
 
 ALL_CHECKS: tuple[str, ...] = (
-    "colima", *(name for name, _, _ in _TOOLS), "disk", "dynalite-image",
+    "colima", *(name for name, _, _, _ in _TOOLS), "disk", "memory", "dynalite-image",
 )
 
 
@@ -70,10 +85,11 @@ def _which(run: Runner, tool: str) -> str:
     return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
-def _check_tool(run: Runner, name: str, required: bool, fix: str) -> CheckResult:
+def _check_tool(run: Runner, name: str, required: bool, fix: str, when_optional: str) -> CheckResult:
     path = _which(run, name)
     status = "ok" if path else ("fail" if required else "skip")
-    return CheckResult(name, status, required, path or "not found on PATH", "" if path else fix)
+    absent = "not found on PATH" + (f" -- {when_optional}" if when_optional else "")
+    return CheckResult(name, status, required, path or absent, "" if path else fix)
 
 
 def _check_colima(run: Runner) -> CheckResult:
@@ -88,12 +104,36 @@ def _check_colima(run: Runner) -> CheckResult:
 
 def _check_disk(root: Path) -> CheckResult:
     free_gib = disk_usage(root).free / 2**30
-    ok = free_gib > MIN_DISK_GIB
+    floor = default_min_disk_gib()  # the SAME number admission rejects an Apply on
+    ok = free_gib > floor
     return CheckResult(
         "disk", "ok" if ok else "fail", True,
-        f"{free_gib:.1f} GiB free on the volume holding {root}",
-        "" if ok else f"free up disk space (>{MIN_DISK_GIB:.0f} GiB needed; no single command)",
+        f"{free_gib:.1f} GiB free on the volume holding {root} "
+        f"(Apply needs >{floor:.0f} GiB; ODIN_MIN_DISK_GIB overrides)",
+        "" if ok else f"free up disk space (>{floor:.0f} GiB needed; no single command)",
     )
+
+
+def _check_memory(run: Runner, root: Path) -> CheckResult:
+    """The admission budget, straight from `check_admission` itself (an empty
+    Stack, so this is a pure read): the number an Apply is rejected against.
+
+    Informational, never a blocker -- an unknown total means the container
+    runtime didn't answer, which the `colima` check above already reports as the
+    real failure, and admission skips its own memory check in that case too."""
+    host = ColimaRuntime(runner=run).ensure_host()
+    budget_mib = check_admission(Stack(), host, root).budget_mib
+    known = budget_mib > 0
+    detail = (
+        f"{budget_mib / 1024:.1f} GiB admission budget of {host.total_mem_mib / 1024:.1f} GiB "
+        "total reported by the container runtime -- Apply rejects a canvas estimated above it "
+        "(ODIN_MEMORY_BUDGET_MIB overrides)"
+        if known else
+        "unknown -- the container runtime reported no memory total, so Apply's memory "
+        "admission check is skipped entirely"
+    )
+    return CheckResult("memory", "ok" if known else "skip", False, detail,
+                       "" if known else "colima start")
 
 
 def _check_dynalite_image(run: Runner) -> CheckResult:
@@ -116,10 +156,11 @@ def run_checks(which: Iterable[str], run: Runner, disk_path: Path | None = None)
     checks: dict[str, Callable[[], CheckResult]] = {
         "colima": partial(_check_colima, run),
         "disk": partial(_check_disk, root),
+        "memory": partial(_check_memory, run, root),
         "dynalite-image": partial(_check_dynalite_image, run),
     }
-    checks.update({name: partial(_check_tool, run, name, required, fix)
-                   for name, required, fix in _TOOLS})
+    checks.update({name: partial(_check_tool, run, name, required, fix, when_optional)
+                   for name, required, fix, when_optional in _TOOLS})
     return [checks[name]() for name in which]
 
 

@@ -1,4 +1,5 @@
-"""Small shared helpers: atomic sidecar writes, the running version, liveness.
+"""Small shared helpers: atomic sidecar writes, file modes, the running
+version, liveness.
 
 Every mutable JSON/text sidecar under `.odin/` (spec revisions, HEAD,
 world.json, gateway JsonStores, credential keys, the Nebula overlay, the
@@ -8,6 +9,13 @@ observe a truncated/partial file. `os.replace` is atomic on POSIX for a
 same-filesystem rename, so every writer below stages the new content in a
 sibling temp file and renames it into place instead of writing the target
 path directly.
+
+The file MODE is the other half of the same job, and it lives here for the
+same reason: SECURITY.md rests odin's entire secrets-at-rest argument on
+`0600`, so `SECRET_FILE_MODE`/`PRIVATE_DIR_MODE` are named once and every
+writer -- the spec store, the canvas, the gateway sidecars, the event log,
+the tofu workspace, the export archive -- reaches for the same constant
+instead of an octal literal of its own.
 
 `odin_version` and `pid_alive` live here because more than one surface needs
 them and neither should be duplicated: the FastAPI app stamps its version,
@@ -19,22 +27,52 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+import tomllib
+from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 
-# Single source of truth for the running version: the installed package's own
-# metadata (kept in lockstep with pyproject.toml's `version` by the build).
-# The literal fallback only fires for an editable/unpackaged checkout where
-# `importlib.metadata` has nothing to look up -- it still needs to say
-# SOMETHING plausible rather than raise out of app startup.
-_FALLBACK_VERSION = "0.4.0"
+# Every file odin writes that can carry a secret or a credential, and every
+# directory such a file lives in. SECURITY.md's whole secrets argument rests on
+# these two numbers ("`SecureString` buys you the file mode and nothing else"),
+# so they live in ONE place and every writer names this constant rather than
+# repeating an octal literal.
+SECRET_FILE_MODE = 0o600
+PRIVATE_DIR_MODE = 0o700
+
+# The running version, from the ONE file a human edits (pyproject.toml) when
+# we're in a source checkout, and from installed metadata otherwise. Order
+# matters: `importlib.metadata` answers about the installed DISTRIBUTION, which
+# in an editable checkout is only as fresh as the last `uv sync` -- the field
+# test found `odin export` stamping `odin_version 0.5.3` into archive manifests
+# while pyproject.toml said 0.7.0, because the dist-info was two releases
+# stale. Backup format-compatibility messages quote this, so a wrong answer is
+# worse than a slow one. There is deliberately NO literal version anywhere in
+# the source tree to drift out of step with pyproject.toml.
+_PYPROJECT = Path(__file__).resolve().parents[2] / "pyproject.toml"
+_UNKNOWN_VERSION = "0.0.0+unknown"
 
 
-def odin_version() -> str:
+def _pyproject_version() -> str | None:
+    """pyproject.toml's `[project] version`, if this really is odin's own
+    checkout (the `name` guard: `parents[2]` is only odin's repo root for a
+    source/editable layout, and must never pick up a stranger's manifest)."""
+    project = tomllib.loads(_PYPROJECT.read_text()).get("project", {}) if _PYPROJECT.is_file() else {}
+    return project.get("version") if project.get("name") == "odin" else None
+
+
+def _metadata_version() -> str | None:
     try:
         return _pkg_version("odin")
     except PackageNotFoundError:
-        return _FALLBACK_VERSION
+        return None
+
+
+def odin_version() -> str:
+    """odin's version, or `0.0.0+unknown` when neither source is available --
+    an honest "I don't know" rather than a hardcoded number that rots (the old
+    fallback still claimed 0.4.0 three releases later)."""
+    return _pyproject_version() or _metadata_version() or _UNKNOWN_VERSION
 
 
 def pid_alive(pid: int) -> bool:
@@ -43,8 +81,105 @@ def pid_alive(pid: int) -> bool:
     return subprocess.run(["kill", "-0", str(pid)], capture_output=True).returncode == 0
 
 
-def atomic_write_text(path: Path, text: str, mode: int | None = None) -> None:
-    """Write `text` to `path` atomically.
+# The one string that identifies an odin control app no matter who launched it:
+# the ASGI factory every path names on its command line -- `odin start`'s own
+# `python -m uvicorn odin.server:create_app --factory`, and the
+# `uvicorn odin.server:create_app --factory` that README and CLAUDE.md document
+# for running the real app by hand.
+_SERVER_ARGV_MARKER = "odin.server:create_app"
+
+
+@dataclass(frozen=True)
+class LiveServer:
+    """A control app running against a given store. `managed` = odin started it
+    (there's a pidfile), so `odin stop` can stop it; otherwise the user launched
+    uvicorn themselves and only their own kill/Ctrl-C will."""
+
+    pid: int
+    command: str = ""
+    managed: bool = False
+
+    @property
+    def detail(self) -> str:
+        started = "pidfile" if self.managed else f"started outside `odin start`: {self.command}"
+        return f"pid {self.pid}, {started}"
+
+    @property
+    def how_to_stop(self) -> str:
+        return "`odin stop`" if self.managed else f"kill {self.pid} (or Ctrl-C in its terminal)"
+
+
+def _proc_run(args: list[str]) -> subprocess.CompletedProcess[str]:
+    """The single OS seam for liveness probing -- one place to fake in tests."""
+    return subprocess.run(args, capture_output=True, text=True)
+
+
+def _pidfile_server(root: Path) -> LiveServer | None:
+    pidfile = root / "pid"
+    raw = pidfile.read_text().strip() if pidfile.is_file() else ""
+    alive = raw.isdigit() and pid_alive(int(raw))
+    return LiveServer(pid=int(raw), managed=True) if alive else None
+
+
+def _process_cwd(pid: int) -> Path | None:
+    """A running process's working directory, or None if we can't tell (no
+    `lsof`, or it refused). Callers treat None as "assume it's ours" -- for a
+    destructive operation, an unknowable answer must fail safe."""
+    proc = _proc_run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"])
+    names = [line[1:] for line in proc.stdout.splitlines() if line.startswith("n")]
+    return Path(names[0]) if names else None
+
+
+def _serves(root: Path, pid: int) -> bool:
+    cwd = _process_cwd(pid)
+    return cwd is None or (cwd / root.name).resolve() == root.resolve()
+
+
+def _scanned_server(root: Path) -> LiveServer | None:
+    """Any of MY processes whose command line names odin's ASGI factory and
+    whose working directory makes `root` its store. Own-uid only (`ps -x`), and
+    store-scoped, so a second instance in another directory -- which the
+    ROADMAP explicitly blesses -- stays out of the way."""
+    listed = _proc_run(["ps", "-xo", "pid=,command="]).stdout.splitlines()
+    for line in listed:
+        pid, _, command = line.strip().partition(" ")
+        if _SERVER_ARGV_MARKER in command and pid.isdigit() and _serves(root, int(pid)):
+            return LiveServer(pid=int(pid), command=command)
+    return None
+
+
+def live_server(root: Path) -> LiveServer | None:
+    """The control app running against the store at `root`, if any.
+
+    Liveness must NOT depend on who started the process. v0.7.0 tested only
+    `.odin/pid`, which only `odin start` writes -- so for anyone following the
+    README's own `uvicorn odin.server:create_app --factory`, `odin status` lied
+    and `odin import` happily restored into a live store (field test B5). The
+    pidfile stays the first answer (cheap, exact, and it tells us `odin stop`
+    will work); a process scan is the fallback that catches every other launch
+    path.
+    """
+    return _pidfile_server(root) or _scanned_server(root)
+
+
+def private_mkdir(directory: Path) -> Path:
+    """`mkdir -p`, except every directory this call CREATES is 0700.
+
+    Directory modes are the second half of the file-mode defense: without
+    traverse permission on `.odin/<env>/`, a file inside it that some future
+    writer forgets to lock down is still unreadable by another local account.
+    Only the missing levels are created (and each is created 0700 outright,
+    never chmod'd after the fact -- no window where it exists world-readable);
+    an EXISTING directory's mode is left exactly as the user has it.
+    """
+    missing = [p for p in (directory, *directory.parents) if not p.exists()]
+    for parent in reversed(missing):
+        parent.mkdir(mode=PRIVATE_DIR_MODE, exist_ok=True)
+    return directory
+
+
+def atomic_write_bytes(path: Path, payload: bytes, mode: int | None = None) -> None:
+    """Write `payload` to `path` atomically.
 
     Stages the content in a temp file in the SAME directory as `path` (so
     the final `os.replace` is a same-filesystem rename, never a cross-device
@@ -55,15 +190,57 @@ def atomic_write_text(path: Path, text: str, mode: int | None = None) -> None:
     observes a half-written one. On any failure the temp file is cleaned up
     rather than left behind.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
+    private_mkdir(path.parent)
     fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     tmp_path = Path(tmp_name)
     try:
-        with os.fdopen(fd, "w") as f:
-            f.write(text)
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
         if mode is not None:
             tmp_path.chmod(mode)
         os.replace(tmp_path, path)
     except BaseException:
         tmp_path.unlink(missing_ok=True)
         raise
+
+
+def atomic_write_text(path: Path, text: str, mode: int | None = None) -> None:
+    """`atomic_write_bytes` for text (UTF-8) -- the shape every JSON/HCL
+    sidecar writer uses."""
+    atomic_write_bytes(path, text.encode(), mode)
+
+
+def secure_append_line(path: Path, line: str) -> None:
+    """Append one line to a file that must never be group/world-readable.
+
+    `events.jsonl` is the append-only durable event log, and a WorldDelta's
+    facts carry live credentials in cleartext (an rds `DATABASE_URL` embeds
+    the password; a crash verdict can quote a workload's issued gateway keys),
+    so it needs the same 0600 as `world.json` -- which a plain `open("a")`
+    does not give it (umask 022 -> 0644, the v0.7.0 leak). O_CREAT carries the
+    mode for a NEW file; the `fchmod` re-tightens a file an older odin already
+    left loose, before this line's secret is appended to it.
+    """
+    private_mkdir(path.parent)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, SECRET_FILE_MODE)
+    with os.fdopen(fd, "a") as f:
+        os.fchmod(fd, SECRET_FILE_MODE)
+        f.write(line + "\n")
+
+
+def ensure_private_file(path: Path) -> Path:
+    """Guarantee `path` exists and is owner-only, WITHOUT touching a byte of
+    its contents.
+
+    For files a foreign tool writes and rewrites on its own schedule:
+    `terraform.tfstate` and its `.backup` are tofu's, not odin's, and tofu
+    creates them 0644 under the default umask. Creating them 0600 first is
+    what makes the mode stick -- tofu's local state manager rewrites state
+    IN PLACE (open the same inode O_RDWR, truncate, write; no rename), so the
+    creation mode is the mode forever. The `chmod` heals a workspace an older
+    odin already left loose.
+    """
+    private_mkdir(path.parent)
+    os.close(os.open(path, os.O_RDONLY | os.O_CREAT, SECRET_FILE_MODE))
+    path.chmod(SECRET_FILE_MODE)
+    return path

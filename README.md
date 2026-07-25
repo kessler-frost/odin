@@ -139,7 +139,20 @@ Known v1 limits, recorded rather than hidden:
 - **SNS→SQS subscriptions**: adding the edge to an *already-healthy* topic
   doesn't retroactively re-provision the subscription — remove and re-add the
   topic (or its edge) to force it. Fixed on create; the live-edit path is a
-  known gap.
+  known gap. Every subscription odin generates also sets
+  `raw_message_delivery = true` — the queue gets the published body verbatim,
+  not SNS's JSON envelope — including on an import round trip where your `.tf`
+  didn't have it. It's deliberate (odin's own SQS/SNS substitute is subscribed
+  the same way, so `tofu apply` and Apply deliver identically), but it changes
+  what a consumer reads, so it's said out loud rather than left to be
+  discovered.
+- **Importing Terraform**: `odin import-tf` takes a file or a whole directory
+  (every `*.tf` in it becomes one canvas). Every argument odin doesn't model is
+  named on stderr rather than dropped in silence, and a few are re-emitted with
+  odin's own value (`internal`, `force_destroy`, `skip_final_snapshot`,
+  `recovery_window_in_days`) — those warn too when your value differs. Every
+  resource also gains an `odin:node` tag, so a byte-identical round trip is
+  impossible by design.
 - **RDS** is Terraform-managed (`aws_db_instance` → a real Postgres
   container), but Postgres-only: choosing MySQL or MariaDB is declined with
   a reason rather than quietly given a Postgres. `allocated_storage` and
@@ -184,8 +197,11 @@ Known v1 limits, recorded rather than hidden:
 ## Requirements
 
 - Python 3.12+ and [uv](https://github.com/astral-sh/uv)
-- [Colima](https://github.com/abiosoft/colima) for the container runtime (or
-  [Lima](https://lima-vm.io/) for full VM isolation)
+- [Colima](https://github.com/abiosoft/colima) for the container runtime
+- [Lima](https://lima-vm.io/) (`limactl`) — required for any canvas with an
+  **EC2** node, since each one is a real Lima VM, and for running the
+  containers inside a VM instead of on Colima directly. `odin doctor` reports
+  it as optional and says exactly what it gates.
 - [OpenTofu](https://opentofu.org/) on your `PATH` (Apply shells out to it)
 - [bun](https://bun.sh/) — only if you're building the UI from a clone; the
   released package ships a pre-built UI, no `bun` needed
@@ -262,6 +278,15 @@ odin import-tf existing.tf          # TF -> canvas JSON (pipe into canvas set -)
 odin export --env dev               # back an env's state up to a tar.gz
 odin import odin-dev-export.tar.gz  # restore it (works with odin down)
 odin doctor                         # toolchain health, with exact fixes
+odin --version                      # which odin this is
+```
+
+Exit codes are the contract: `0` success, `1` a refusal or a real failure, `2`
+a usage/format error. One thing an exit-code-only check misses — a node Apply
+skipped as unsupported still exits `0`, so gate on the payload instead:
+
+```bash
+odin apply --env dev -o json | jq -e '.unsupported | length == 0'
 ```
 
 A round-trip example an agent might run:
@@ -303,18 +328,28 @@ named `uploads` should exist, never the objects inside it. Restore an env and
 you get fresh, empty backings matching the archived desired state; a file you
 had put in that bucket is gone. Container volumes are not backed up.
 
+One exception worth knowing, because it cuts the other way: **CloudWatch
+log-group events survive** an export → wipe → import round trip. Odin's log
+sink is a control-plane sidecar (`.odin/<env>/gateway/logsctl.json`), not a
+container volume, so log history comes back while bucket objects don't.
+
 Importing state doesn't boot anything either. It puts odin's model of the
 world back; `odin start` plus one Apply converges reality to it.
 
 Guardrails, because both of these are destructive by nature: `import` refuses
 to overwrite an existing env directory unless you pass `--force`, refuses to
-run at all while odin is up, and rejects any archive containing an absolute
-path, a `..` traversal, or a symlink member. The shared `.odin/canvas.json`
+run at all while odin is up — however you started it, `odin start` or
+`uvicorn odin.server:create_app` by hand — and rejects any archive containing
+an absolute path, a `..` traversal, or a symlink member. `odin status` and
+`odin stop` see the same servers the refusal does; a server running against a
+*different* store directory doesn't get in your way. The shared `.odin/canvas.json`
 travels in the archive but is restored only under `--with-canvas` — a restore
 should never silently replace the canvas you're drawing on.
 
-The archive contains the env's credentials in cleartext. Treat the file like
-a private key — see [SECURITY.md](SECURITY.md#secrets).
+The archive contains the env's credentials in cleartext. It's written `0600`,
+and every file inside it is stored `0600` so a restore can only tighten a
+store's modes — but treat the file like a private key anyway, because copying
+it anywhere else won't preserve that. See [SECURITY.md](SECURITY.md#secrets).
 
 ## Security
 
@@ -322,7 +357,14 @@ Odin has no authentication of its own — the control app binds to
 `127.0.0.1` by default, and applying a canvas runs whatever's on it for
 real (container images, EC2 user-data as root, Lambda code). That's the
 point of the tool, not a bug, but it means a canvas from someone else
-should be treated like a shell script you're about to run. See
+should be treated like a shell script you're about to run.
+
+A canvas secret (an RDS `password`, a `secret` or `ssm` node's value) is
+stored and used in cleartext, in more than one file: the canvas, every Stack
+revision, `world.json`, `events.jsonl`, and the generated Terraform plus its
+state. All of them are `0600`, in `0700` directories, and that file mode is
+the entire protection — there is no encryption at rest and no KMS. SECURITY.md
+lists every file by name; treat canvas secrets as dev/test-grade. See
 [SECURITY.md](SECURITY.md) for the full threat model and how to report a
 vulnerability.
 

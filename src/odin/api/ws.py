@@ -6,6 +6,8 @@ from typing import Any
 
 from fastapi import WebSocket
 
+from odin.util import secure_append_line
+
 
 class ConnectionManager:
     """Manages WebSocket connections and broadcasts state updates.
@@ -29,10 +31,9 @@ class ConnectionManager:
 
     async def broadcast(self, message: dict[str, Any]) -> None:
         env = message.get("env", "default")
-        path = self._log(env)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a") as f:
-            f.write(json.dumps(message) + "\n")
+        # 0600, not umask's 0644: a delta's facts/verdict carry live credentials
+        # in cleartext (see `secure_append_line`).
+        secure_append_line(self._log(env), json.dumps(message))
         # Best-effort: a broken viewer must never stall reconciliation. A failed
         # send drops that socket; the durable per-env log above is the source of
         # truth, and live viewers backfill from /events on (re)connect.

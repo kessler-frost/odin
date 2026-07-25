@@ -40,14 +40,17 @@ state.
 from __future__ import annotations
 
 import io
+import os
 import shutil
 import tarfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 
 from pydantic import BaseModel, ValidationError
 
-from odin.util import odin_version, pid_alive
+from odin.util import SECRET_FILE_MODE, atomic_write_bytes, live_server, odin_version
 
 MANIFEST_NAME = "manifest.json"
 ENV_PREFIX = "env"
@@ -125,10 +128,11 @@ def export_env(root: Path, env: str, dest: Path) -> ExportResult:
     )
     canvas = root / CANVAS_NAME
     dest.parent.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(dest, "w:gz") as tar:
+    with _private_archive(dest) as tar:
         _add_bytes(tar, MANIFEST_NAME, manifest.model_dump_json(indent=2).encode())
         for path in _exportable_files(env_dir):
-            tar.add(path, arcname=f"{ENV_PREFIX}/{path.relative_to(env_dir).as_posix()}")
+            tar.add(path, arcname=f"{ENV_PREFIX}/{path.relative_to(env_dir).as_posix()}",
+                    filter=_owner_only)
         _add_canvas(tar, canvas)
     return ExportResult(
         archive=str(dest), env=env, size=dest.stat().st_size,
@@ -136,9 +140,34 @@ def export_env(root: Path, env: str, dest: Path) -> ExportResult:
     )
 
 
+@contextmanager
+def _private_archive(dest: Path) -> Iterator[tarfile.TarFile]:
+    """The archive, created 0600 before a single byte of it exists.
+
+    `odin export` tells the user to "treat it like a private key file" and it
+    genuinely is one -- it carries `keys.json`'s operator credentials and every
+    canvas secret in cleartext -- but under the default umask `tarfile.open`
+    made it 0644 (v0.7.0's leak). The `fchmod` covers the case where `dest`
+    already existed with a looser mode, since O_CREAT's mode applies only to a
+    file it actually creates.
+    """
+    fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, SECRET_FILE_MODE)
+    os.fchmod(fd, SECRET_FILE_MODE)
+    with os.fdopen(fd, "wb") as raw, tarfile.open(fileobj=raw, mode="w:gz") as tar:
+        yield tar
+
+
+def _owner_only(info: tarfile.TarInfo) -> tarfile.TarInfo:
+    """Every member goes in 0600 regardless of its mode on disk: the archive is
+    a private-key-grade file as a whole, and an archive written from a store an
+    older odin left loose must not carry those loose modes into the restore."""
+    info.mode = SECRET_FILE_MODE
+    return info
+
+
 def _add_canvas(tar: tarfile.TarFile, canvas: Path) -> None:
     if canvas.is_file():
-        tar.add(canvas, arcname=CANVAS_NAME)
+        tar.add(canvas, arcname=CANVAS_NAME, filter=_owner_only)
 
 
 def _add_bytes(tar: tarfile.TarFile, name: str, payload: bytes) -> None:
@@ -148,15 +177,40 @@ def _add_bytes(tar: tarfile.TarFile, name: str, payload: bytes) -> None:
     tar.addfile(info, io.BytesIO(payload))
 
 
+@contextmanager
+def _readable_archive(archive: Path) -> Iterator[tarfile.TarFile]:
+    """Every read of an archive goes through here, so tar's own failures come
+    out as refusals like every other bad input.
+
+    The field test hit this on the disaster-recovery path, the moment a user is
+    most likely to be holding a half-copied backup: a truncated archive printed
+    an empty message then `Aborted.`, and a non-gzip file dumped ~120 lines of
+    raw Python traceback. Both are the same answer to the user -- this file
+    isn't a readable archive -- so they get one clear message with tar's own
+    diagnosis quoted, and code 2 ("this odin can't read that"), matching the
+    valid-tarball-but-not-an-odin-export refusal next door. The `with` covers
+    the whole body deliberately: truncation is usually only discovered while
+    READING a member, long after `tarfile.open` succeeded."""
+    if not archive.is_file():
+        raise BackupError(f"no such archive: {archive}")
+    try:
+        with tarfile.open(archive, "r:gz") as tar:
+            yield tar
+    except (tarfile.TarError, EOFError, OSError) as exc:
+        raise BackupError(
+            f"{archive} is not a readable .tar.gz archive ({exc}). If it is an odin "
+            "export it is truncated or corrupt -- re-copy it from wherever it came "
+            "from and try again.", 2,
+        ) from None
+
+
 def _names(archive: Path) -> list[str]:
-    with tarfile.open(archive, "r:gz") as tar:
+    with _readable_archive(archive) as tar:
         return tar.getnames()
 
 
 def read_manifest(archive: Path) -> Manifest:
-    if not archive.is_file():
-        raise BackupError(f"no such archive: {archive}")
-    with tarfile.open(archive, "r:gz") as tar:
+    with _readable_archive(archive) as tar:
         return _manifest(tar, archive)
 
 
@@ -232,7 +286,7 @@ def import_archive(
             f"environment {target_env!r} already exists at {target} — refusing to overwrite it. "
             "Re-run with --force to replace it, or --env <name> to restore alongside it."
         )
-    with tarfile.open(archive, "r:gz") as tar:
+    with _readable_archive(archive) as tar:
         members = [m for m in tar.getmembers() if m.name != MANIFEST_NAME]
         restore = [
             (member, dest)
@@ -255,22 +309,29 @@ def import_archive(
 
 
 def _write(tar: tarfile.TarFile, member: tarfile.TarInfo, dest: Path) -> None:
-    """One member's bytes, at its archived permissions — keys.json and the
-    stack revisions come back 0600, exactly as they were written."""
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_bytes(tar.extractfile(member).read())
-    dest.chmod(member.mode & 0o777)
+    """One member's bytes, at its archived permissions MINUS every group/other
+    bit — so keys.json and the stack revisions come back 0600 exactly as they
+    were written, and a member an older odin archived world-readable (`tf/
+    main.tf` and `terraform.tfstate` were 0644 through v0.7.0) does NOT come
+    back world-readable. Restoring is also the moment to tighten a store, never
+    to loosen one; the `& 0o700` mask is what makes that direction-only."""
+    atomic_write_bytes(dest, tar.extractfile(member).read(), mode=member.mode & 0o700)
 
 
 def _refuse_live_server(root: Path) -> None:
     """A running odin holds live per-env Reconcilers, BackingAws instances and
     an in-memory World; swapping the store out from under them would leave it
     reconciling against state it never read. Restore is a server-DOWN
-    operation, full stop — no partial-liveness special cases to reason about."""
-    pidfile = root / "pid"
-    raw = pidfile.read_text().strip() if pidfile.is_file() else ""
-    if raw.isdigit() and pid_alive(int(raw)):
+    operation, full stop — no partial-liveness special cases to reason about.
+
+    Liveness comes from `util.live_server`, which does NOT depend on who
+    started the server: v0.7.0 tested only `.odin/pid` (written by `odin start`
+    alone), so this refusal was inert for anyone running the app the way the
+    README documents, and a field test restored straight into a live store."""
+    server = live_server(root)
+    if server is not None:
         raise BackupError(
-            f"odin is running (pid {raw}) — refusing to import into a live store. "
-            "Run `odin stop` first, then `odin import` (restore is a server-down operation)."
+            f"odin is running ({server.detail}) — refusing to import into a live store. "
+            f"Stop it with {server.how_to_stop}, then re-run `odin import` "
+            "(restore is a server-down operation)."
         )
