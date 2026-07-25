@@ -425,6 +425,50 @@ resource "aws_elasticache_cluster" "sessions" {
 '''
 
 
+# --- alb (W2.5): aws_lb(+_target_group +_listener) <-> the `alb` canvas kind.
+# BOTH companions fold onto the aws_lb's node (the exact inverse of hcl.py's own
+# companion pass, so one canvas node stays one canvas node instead of
+# multiplying into three). The LISTENER is what ties the trio together: it names
+# its load balancer directly and its target group through the forward action. ---
+
+
+_ALB_TF = '''
+resource "aws_lb" "front" {
+  name               = "front"
+  internal           = true
+  load_balancer_type = "application"
+
+  tags = {
+    "odin:node" = "front"
+    "team"      = "core"
+  }
+}
+
+resource "aws_lb_target_group" "front_tg" {
+  name        = "front-tg"
+  port        = 3000
+  protocol    = "HTTP"
+  vpc_id      = aws_vpc.net.id
+  target_type = "instance"
+
+  health_check {
+    path = "/healthz"
+  }
+}
+
+resource "aws_lb_listener" "front_listener" {
+  load_balancer_arn = aws_lb.front.arn
+  port              = 8080
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.front_tg.arn
+  }
+}
+'''
+
+
 def test_elasticache_cluster_imports_as_an_elasticache_node():
     result = parse_hcl_text(_CACHE_TF)
     (node,) = result.nodes
@@ -454,3 +498,96 @@ def test_elasticache_stays_out_of_the_live_import_path():
     # (it exists only as a gateway-model record + a real container), so mode
     # (b) reports it unsupported rather than generating a bogus import block.
     assert "elasticache" not in _TF_TYPE
+
+
+def test_the_alb_trio_imports_as_one_node_carrying_both_ports_and_the_health_check():
+    result = parse_hcl_text(_ALB_TF)
+    (node,) = result.nodes  # the two companions produce no node of their own
+    assert node["id"] == "front"  # the aws_lb's `name`, not the HCL resource name
+    assert node["type"] == "alb"
+    assert node["data"]["listenerPort"] == "8080"  # from the listener
+    assert node["data"]["port"] == "3000"          # from the target group
+    assert node["data"]["healthCheckPath"] == "/healthz"
+    assert result.unsupported == []
+
+
+def test_alb_round_trips_through_generate_and_back_reproducing_every_field():
+    canvas = {
+        "nodes": [
+            {"id": "n1", "type": "vpc", "data": {"label": "net"}},
+            {"id": "n2", "type": "subnet", "data": {"label": "web", "vpc": "net"}},
+            {"id": "n3", "type": "alb", "data": {
+                "label": "front", "vpc": "net", "subnet": "web",
+                "listenerPort": "8080", "port": "3000", "healthCheckPath": "/healthz",
+            }},
+        ],
+        "edges": [],
+    }
+    generated = generate_tf(canvas_to_stack(canvas)).files["main.tf"]
+    (node,) = [n for n in parse_hcl_text(generated).nodes if n["type"] == "alb"]
+    assert node["id"] == "front"
+    assert node["data"]["listenerPort"] == "8080"
+    assert node["data"]["port"] == "3000"
+    assert node["data"]["healthCheckPath"] == "/healthz"
+
+
+def test_a_listener_naming_a_load_balancer_outside_the_supported_set_is_reported():
+    tf = (
+        'resource "aws_lb_listener" "orphan" {\n'
+        "  load_balancer_arn = aws_lb.elsewhere.arn\n"
+        "  port              = 80\n"
+        "\n"
+        "  default_action {\n"
+        '    type             = "forward"\n'
+        "    target_group_arn = aws_lb_target_group.tg.arn\n"
+        "  }\n"
+        "}\n"
+    )
+    result = parse_hcl_text(tf)
+    assert result.nodes == []
+    assert [(u.type, u.name) for u in result.unsupported] == [("aws_lb_listener", "orphan")]
+    assert "outside the supported set" in result.unsupported[0].reason
+
+
+def test_a_target_group_no_listener_forwards_to_is_reported_not_dropped():
+    # It can't be attributed to any load balancer, so it's reported rather than
+    # guessed at (the subscription pass's rule).
+    tf = (
+        'resource "aws_lb" "front" {\n  name = "front"\n}\n\n'
+        'resource "aws_lb_target_group" "lonely" {\n  name = "lonely-tg"\n  port = 80\n}\n'
+    )
+    result = parse_hcl_text(tf)
+    assert [n["id"] for n in result.nodes] == ["front"]
+    (dropped,) = result.unsupported
+    assert (dropped.type, dropped.name) == ("aws_lb_target_group", "lonely")
+    assert "not the forward target of any imported listener" in dropped.reason
+
+
+def test_alb_carries_user_tags_but_not_odins_own():
+    (node,) = parse_hcl_text(_ALB_TF).nodes
+    assert node["data"]["tags"] == {"team": "core"}  # odin:node excluded
+
+
+def test_alb_name_scheme_type_and_tags_are_carried_while_other_arguments_warn():
+    # `internal`/`load_balancer_type` are values odin always emits itself, so a
+    # differing imported one is deliberately NOT surfaced as a dropped
+    # attribute -- but a genuinely unmodeled argument still has to be honest.
+    tf = (
+        'resource "aws_lb" "front" {\n'
+        '  name               = "front"\n'
+        "  internal           = true\n"
+        '  load_balancer_type = "application"\n'
+        "  idle_timeout       = 120\n"
+        "\n"
+        '  tags = {\n    "team" = "core"\n  }\n'
+        "}\n"
+    )
+    result = parse_hcl_text(tf)
+    assert result.warnings == ["front (alb): imported without unmodeled attribute(s): idle_timeout"]
+    assert result.unsupported == []
+
+
+def test_alb_stays_out_of_the_live_import_path():
+    # Mode (b) enumerates live resources from a BACKING; an alb's substrate is
+    # the gateway's own nginx proxy, so it reports itself instead of pretending.
+    assert "alb" not in _TF_TYPE

@@ -65,6 +65,7 @@ from odin.gateway.models import (
     ec2compute,
     ecr,
     ecsctl,
+    elbv2ctl,
     iamctl,
     lambdactl,
     logsctl,
@@ -412,7 +413,13 @@ def pure_answer(
     injectable seam for it, threaded from app.py's `create_app(rds=...)` the
     way `keystore`/`gateway_port` are, and None in production (the model then
     builds a per-ENV substrate from the request's own env -- see
-    rdsctl.py::_substrate)."""
+    rdsctl.py::_substrate).
+    `elasticloadbalancing:*` (task W2.5) is all-synth too, and the ONE modeled
+    family whose substrate is a REVERSE PROXY: an nginx container per load
+    balancer (`compute/proxy.py`), whose upstreams are the target group's
+    actually-registered targets. Like ecs's TaskRuntime it needs no live fact
+    threaded through here -- `gateway/models/elbv2ctl.py` defaults its own
+    `LoadBalancerProxy`."""
     if action.startswith("ec2:"):
         return ec2compute.pure_answer(action, resource, env, body, stores, now, keystore=keystore, gateway_port=gateway_port)
     if action.startswith("iam:"):
@@ -433,6 +440,8 @@ def pure_answer(
         return cachectl.pure_answer(action, resource, env, body, stores, now)
     if action.startswith("rds:"):
         return rdsctl.pure_answer(action, resource, env, body, stores, now, rds=rds)
+    if action.startswith("elasticloadbalancing:"):
+        return elbv2ctl.pure_answer(action, resource, env, body, stores, now)
     handler = _PURE_HANDLERS.get(action)
     return handler(resource, env, body, stores, now) if handler else None
 

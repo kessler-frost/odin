@@ -128,6 +128,18 @@ logs': an `rds` canvas node's label IS its `DBInstanceIdentifier`
 `rds-db:connect` edge drawn to that node compiles to a statement the gateway
 enforces with no rds-specific code in the policy layer.
 
+ELBV2 (task W2.5) IS THE QUERY PROTOCOL, like sns/ec2/iam -- the operation
+rides in the `Action` form param, not an `X-Amz-Target` header (verified
+against botocore's own `elbv2` model: `protocol: query`, `endpointPrefix:
+elasticloadbalancing`, which is also the SigV4 credential-scope service name
+this module dispatches on). Its resource is the bare LOAD-BALANCER or
+TARGET-GROUP name (`_elbv2_resource`), extracted from `Name` on a create and
+from whichever ARN the call carries otherwise, falling back to `"*"` -- the
+same OPERATOR-only "never return None" reasoning ec2/iam/ecr/ecs use, and for
+the same reason: a load balancer is not an IAM data-plane target on odin's
+canvas (see `_elbv2_resource`'s own docstring), so tofu is the only principal
+that ever gets here.
+
 S3 BUCKET-CONFIG READS (S2, discovered running real tofu through the real
 gateway): the TF AWS provider's `aws_s3_bucket` refresh probes bucket-config
 subresources -- `?policy`, `?tagging`, `?acl`, `?cors`, `?versioning`, etc.
@@ -276,6 +288,8 @@ def classify(
         return _classify_elasticache(body)
     if service == "rds":
         return _classify_rds(body)
+    if service == "elasticloadbalancing":
+        return _classify_elbv2(body)
     return None
 
 
@@ -582,6 +596,76 @@ def _classify_ssm(lower_headers: dict[str, str], body: bytes) -> tuple[str, str]
     except (json.JSONDecodeError, UnicodeDecodeError):
         return None
     return f"ssm:{op}", _ssm_resource(payload)
+
+
+def _elbv2_name(value: str) -> str:
+    """The bare NAME an elbv2 ARN carries -- kept in lock-step with
+    `gateway/models/elbv2ctl.py::name_from_arn`. A `loadbalancer/app/{name}/
+    {id}` or `listener/app/{lb}/{lbid}/{id}` ARN yields the LOAD BALANCER's
+    name (a listener isn't a canvas node of its own -- one `alb` node expands
+    to lb + target group + listener, so all three classify to the same label);
+    `targetgroup/{name}/{id}` yields the target group's. A value that isn't an
+    ARN comes back unchanged."""
+    tail = value.rsplit(":", 1)[-1]
+    parts = tail.split("/")
+    if parts[0] in ("loadbalancer", "listener") and len(parts) >= 3:
+        return parts[2]
+    if parts[0] == "targetgroup" and len(parts) >= 2:
+        return parts[1]
+    return value
+
+
+# The id-carrying params, MOST SPECIFIC FIRST: a create call carries `Name`;
+# everything else carries one of these ARNs, in singular or `.member.1` list
+# form (the provider's own reads use the LIST spellings --
+# `DescribeLoadBalancers(LoadBalancerArns=[...])` etc.). Target-group params
+# precede load-balancer ones so a target-group read filtered BY a load balancer
+# (`DescribeTargetGroups(LoadBalancerArn=...)`) still reports the group it's
+# actually about. `ResourceArns.member.1` is last: it's the ARN-only tag API,
+# which never carries a typed id at all.
+_ELBV2_ARN_PARAMS = (
+    "TargetGroupArn", "TargetGroupArns.member.1",
+    "ListenerArn", "ListenerArns.member.1",
+    "LoadBalancerArn", "LoadBalancerArns.member.1",
+    "ResourceArns.member.1",
+)
+
+
+def _elbv2_resource(params: dict[str, str]) -> str:
+    """The bare load-balancer / target-group name, in the OPERATOR-only style
+    `_classify_iam`/`_classify_ecr`/`_classify_ecs` already use: extract a real
+    value when the request carries one, `"*"` otherwise -- never None, so the
+    operator (tofu) is never denied via `unmappable-action`. An `alb` canvas
+    node's label IS its load-balancer name (`agent/hcl.py`'s `_alb` emits
+    `name = <label>`), so this value is also what an iam edge's compiled
+    statement would name -- but note the deliberate design choice in
+    `ui/src/lib/iam.ts`: `alb` is NOT an IAM target on the canvas (nothing a
+    workload "calls" on a load balancer; you send it HTTP, which no IAM policy
+    gates), so in practice only the operator ever reaches these actions."""
+    name = params.get("Name")
+    if name:
+        return name
+    for key in _ELBV2_ARN_PARAMS:
+        value = params.get(key)
+        if value:
+            return _elbv2_name(value)
+    names = params.get("Names.member.1")
+    return names if names else "*"
+
+
+def _classify_elbv2(body: bytes) -> tuple[str, str] | None:
+    """elbv2 is the query protocol like sns/ec2/iam -- the operation rides in
+    the `Action` form param, NOT an `X-Amz-Target` header (verified against
+    botocore's own `elbv2` model: `protocol: query`). Its list serialization is
+    AWS's standard `Prefix.member.N`, unlike EC2's `Prefix.N`."""
+    try:
+        params = dict(parse_qsl(body.decode("utf-8"), keep_blank_values=True))
+    except UnicodeDecodeError:
+        return None
+    action_name = params.get("Action")
+    if not action_name:
+        return None
+    return f"elasticloadbalancing:{action_name}", _elbv2_resource(params)
 
 
 def _classify_ecs(lower_headers: dict[str, str], body: bytes) -> tuple[str, str] | None:

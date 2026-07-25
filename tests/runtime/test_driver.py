@@ -100,3 +100,62 @@ def test_run_container_emits_memory_and_cpus_when_set():
     args = calls[0]
     assert args[args.index("--memory") + 1] == "512m"
     assert args[args.index("--cpus") + 1] == "1.5"
+
+
+# --- W2.5: signal + copy_in, the two methods compute/proxy.py added ---------
+
+
+def test_signal_delivers_the_named_signal_to_the_containers_main_process():
+    calls: list[list[str]] = []
+
+    def runner(args, input=None):
+        calls.append(args)
+        return _Proc(0, "")
+
+    ColimaRuntime(runner=runner).signal("odin-alb-default-web", "HUP")
+    # This exact argv is how a load-balancer proxy is told to re-read its
+    # rewritten config: nginx reloads on SIGHUP, so an upstream change needs
+    # neither a `docker exec` seam nor a container recreate -- and never drops
+    # an in-flight request.
+    assert calls == [["docker", "kill", "-s", "HUP", "odin-alb-default-web"]]
+
+
+def test_signal_tolerates_a_nonzero_exit_like_stop_does():
+    # check=False: signalling an already-gone container is a no-op, exactly
+    # like `stop`. A converge that races a delete must not raise.
+    def runner(args, input=None):
+        return _Proc(1, "", "Error response from daemon: No such container: gone")
+
+    assert ColimaRuntime(runner=runner).signal("gone", "HUP") is None
+
+
+def test_copy_in_streams_the_host_file_into_the_container_through_the_daemon():
+    calls: list[list[str]] = []
+
+    def runner(args, input=None):
+        calls.append(args)
+        return _Proc(0, "")
+
+    ColimaRuntime(runner=runner).copy_in(
+        "odin-alb-default-web", "/host/odin.conf", "/etc/nginx/conf.d/odin.conf",
+    )
+    # `docker cp` instead of a `-v` bind mount, found the hard way: a mount of a
+    # path under macOS's per-user temp dir silently resolves to an EMPTY
+    # directory under Colima's virtiofs, so nginx came up with no config at all.
+    assert calls == [[
+        "docker", "cp", "/host/odin.conf", "odin-alb-default-web:/etc/nginx/conf.d/odin.conf",
+    ]]
+
+
+def test_copy_in_raises_on_a_failed_copy_unlike_signal():
+    # Deliberate asymmetry with `signal`/`stop` (which pass check=False):
+    # `copy_in` leaves `check` at its default True, so a failed delivery is
+    # LOUD. It has to be -- the proxy container's entrypoint blocks in a wait
+    # loop until the config file appears, so a silently-dropped copy would be a
+    # container that never serves anything and never explains why. elbv2ctl's
+    # `_converge_safely` turns this raise into the lb's honest `failed` state.
+    def runner(args, input=None):
+        return _Proc(1, "", "no such directory")
+
+    with pytest.raises(RuntimeError, match="no such directory"):
+        ColimaRuntime(runner=runner).copy_in("job", "/host/odin.conf", "/etc/nginx/conf.d/odin.conf")

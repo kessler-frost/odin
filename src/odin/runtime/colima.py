@@ -185,6 +185,28 @@ class _ContainerRuntime:
             logtail=self.logs(name, tail=5) if status != "absent" else "",
         )
 
+    def copy_in(self, name: str, host_path: str, container_path: str) -> None:
+        """Copy a host file INTO a running container (`docker cp`).
+
+        W2.5 uses this instead of a bind mount to deliver a load-balancer
+        proxy's rendered config, and the reason is empirical: a `-v` of a path
+        under macOS's per-user temp dir (`/private/var/folders/...`) silently
+        mounts an EMPTY directory under Colima's virtiofs -- the path exists in
+        the VM, so nothing errors; nginx simply came up with no config and
+        accepted-then-dropped every connection. `docker cp` streams through the
+        daemon, so it works regardless of which host paths the runtime VM
+        happens to share."""
+        self._cli("cp", host_path, f"{name}:{container_path}")
+
+    def signal(self, name: str, sig: str) -> None:
+        """Send UNIX signal `sig` to the container's main process (`docker kill
+        -s`). W2.5: how a load-balancer proxy container is told to re-read its
+        rewritten config (nginx reloads on SIGHUP) WITHOUT `docker exec` and
+        without recreating the container -- so an upstream change never drops
+        an in-flight request. `check=False`: signalling an already-gone
+        container is a no-op, exactly like `stop`."""
+        self._cli("kill", "-s", sig, name, check=False)
+
     def stop(self, name: str) -> None:
         # -v: drop the container's anonymous volumes with it (postgres creates
         # one per boot; without this a churn loop leaks gigabytes).

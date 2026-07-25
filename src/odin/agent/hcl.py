@@ -510,14 +510,96 @@ def _ecs(res: ResourceDesired, refs: Refs) -> Built:
         "launch_type": quote("EC2"),
         "wait_for_steady_state": "true",
     }
-    nested = (
+    blocks = [
         "  timeouts {\n"
         f'    create = {quote(_ECS_CONVERGE_TIMEOUT)}\n'
         f'    update = {quote(_ECS_CONVERGE_TIMEOUT)}\n'
         f'    delete = {quote(_ECS_CONVERGE_TIMEOUT)}\n'
         "  }"
-    )
-    return attrs, nested
+    ]
+    # W2.5: an `alb` node edged to this service fronts it -- which in real AWS
+    # is a `load_balancer` block on the SERVICE (the ECS scheduler then
+    # registers each task with that target group), not a
+    # `aws_lb_target_group_attachment` tofu would have to know the tasks for.
+    # `refs` carries the target group's HCL name under a synthetic key that
+    # pass 1.5 reserved (`_alb_target_key`) -- the same technique the lambda
+    # auto-role and the shared ecs cluster already use.
+    kind, tg_name = refs.get(_alb_target_key(res.id), ("", ""))
+    if kind == "alb_target_group":
+        blocks.append(
+            "  load_balancer {\n"
+            f"    target_group_arn = aws_lb_target_group.{tg_name}.arn\n"
+            f"    container_name   = {quote(res.id)}\n"
+            f"    container_port   = {port}\n"
+            "  }"
+        )
+    return attrs, "\n\n".join(blocks)
+
+
+# W2.5: ALB (gateway/models/elbv2ctl.py + a REAL nginx container per load
+# balancer, compute/proxy.py). ONE `alb` canvas node expands to THREE tf
+# resources -- `aws_lb` (this builder's primary, `_TF_TYPES` below) plus a
+# companion `aws_lb_target_group` and `aws_lb_listener`, built in their own
+# pass after pass 2 exactly like ecs's task definition and lambda's auto-role.
+#
+# Containment: an alb node must be drawn inside a Subnet (like `_ec2`) -- the
+# subnet is what gives `aws_lb.subnets` a value and, transitively, the target
+# group its `vpc_id` (the canvas stamps BOTH `vpc` and `subnet` on a leaf
+# inside a subnet, `ui/src/lib/containment.ts`).
+#
+# `internal = true` is emitted explicitly: odin has no internet gateway, so an
+# internet-facing scheme would be a claim nothing backs. Only `application`
+# type is modeled (an NLB would need nginx's stream module and a TCP-only
+# proxy shape) -- a `network` node reports itself unsupported rather than
+# quietly getting an ALB.
+_ALB_TYPE_APPLICATION = "application"
+_DEFAULT_ALB_LISTENER_PORT = "80"
+_DEFAULT_ALB_TARGET_PORT = "80"
+_DEFAULT_ALB_HEALTH_CHECK_PATH = "/"
+_BAD_ALB_LISTENER_PORT = "listenerPort must be a whole number (e.g. 80)"
+_BAD_ALB_TARGET_PORT = "port must be a whole number (e.g. 80)"
+_ALB_NLB_UNSUPPORTED = (
+    "load balancer type 'network' is not supported in Simulate v1 "
+    "(the real substrate is an HTTP reverse proxy) — set Type to 'application'"
+)
+
+
+def _alb_target_key(target_id: str) -> str:
+    """A synthetic `refs` key (never a real canvas id) meaning "this compute
+    node is a target of some alb's target group". Reserved by pass 1.5, read by
+    `_ecs`."""
+    return f"__alb_target__{target_id}"
+
+
+def _alb_ports(res: ResourceDesired) -> tuple[str, str] | str:
+    listener_port = _field(res, "listenerPort", _DEFAULT_ALB_LISTENER_PORT)
+    if not listener_port.isdigit():
+        return _BAD_ALB_LISTENER_PORT
+    target_port = _field(res, "port", _DEFAULT_ALB_TARGET_PORT)
+    if not target_port.isdigit():
+        return _BAD_ALB_TARGET_PORT
+    return listener_port, target_port
+
+
+def _alb(res: ResourceDesired, refs: Refs) -> Built:
+    """The PRIMARY `aws_lb` block. Gating both the subnet AND the vpc reference
+    here is deliberate: the companion target group (built in its own pass
+    below) needs `vpc_id`, and a node that gets past this builder is guaranteed
+    to have both, so that pass never has to re-report a containment problem."""
+    if _field(res, "lbType", _ALB_TYPE_APPLICATION) != _ALB_TYPE_APPLICATION:
+        return _ALB_NLB_UNSUPPORTED
+    subnet_id = _subnet_ref(res, refs)
+    if subnet_id is None or _vpc_ref(res, refs) is None:
+        return _NOT_IN_SUBNET
+    ports = _alb_ports(res)
+    if isinstance(ports, str):
+        return ports
+    attrs = {
+        "name": quote(res.id),
+        "internal": "true",
+        "load_balancer_type": quote(_ALB_TYPE_APPLICATION),
+    }
+    return attrs, f"  subnets = [{subnet_id}]"
 
 
 # W2.8: ElastiCache (redis) clusters -- a REAL `redis:7-alpine` container per
@@ -705,6 +787,7 @@ _TF_TYPES = {
     "ssm": "aws_ssm_parameter",
     "elasticache": "aws_elasticache_cluster",
     "rds": "aws_db_instance",
+    "alb": "aws_lb",
 }
 
 _BUILDERS = {
@@ -725,7 +808,15 @@ _BUILDERS = {
     "ssm": _ssm,
     "elasticache": _elasticache,
     "rds": _rds,
+    "alb": _alb,
 }
+
+# W2.5: which canvas kinds can actually BE an ALB target in v1. An ECS service
+# registers its own tasks (real ECS's scheduler behaviour, modeled in
+# gateway/models/ecsctl.py); an ec2 instance would need an
+# `aws_lb_target_group_attachment` and is recorded as an unbuilt limit instead
+# of silently doing nothing with the edge the user drew.
+_ALB_TARGET_KINDS = ("ecs",)
 
 
 def generate_tf(stack: Stack) -> TfProject:
@@ -764,9 +855,48 @@ def generate_tf(stack: Stack) -> TfProject:
             cluster_name = unique_name(sanitize_name("odin"), used_names.setdefault("aws_ecs_cluster", set()))
             refs[_ECS_CLUSTER_KEY] = ("ecs_cluster", cluster_name)
 
+    # Pass 1.5 (W2.5) — resolve ALB TARGET EDGES, which pass 1 can't do (it
+    # walks resources, and an edge's other end may not be named yet) and pass 2
+    # can't either (a builder only sees `(res, refs)`, never the edge list). A
+    # NETWORK edge between an `alb` node and a compute node means "this load
+    # balancer fronts that compute": accepted in EITHER drawn direction, since
+    # which end the user started from carries no meaning. The result is a
+    # synthetic `refs` entry per target, which `_ecs` reads to emit its
+    # `load_balancer` block. `alb` deliberately isn't an IAM target on the
+    # canvas (see ui/src/lib/iam.ts), so an alb<->compute edge is unambiguously
+    # this and nothing else.
+    for edge in sorted(stack.edges, key=lambda e: (e.src, e.dst)):
+        for alb_id, target_id in ((edge.src, edge.dst), (edge.dst, edge.src)):
+            alb_res, target_res = by_id.get(alb_id), by_id.get(target_id)
+            if alb_res is None or target_res is None or alb_res.kind != "alb" or alb_id not in hcl_name_by_id:
+                continue
+            if target_res.kind in _ALB_TARGET_KINDS:
+                refs[_alb_target_key(target_id)] = ("alb_target_group", f"{hcl_name_by_id[alb_id]}_tg")
+            else:
+                unsupported.append(
+                    f"{alb_id} (alb): target edge to {target_id} ({target_res.kind}) — only "
+                    f"{'/'.join(_ALB_TARGET_KINDS)} nodes can be load-balancer targets in Simulate v1"
+                )
+            break  # one edge is one (alb, target) pair, whichever way it was drawn
+
     # Pass 2 — build blocks with the name table complete. A builder may still
     # opt out for THIS resource (returns the reason string) — e.g. a subnet
     # not drawn inside any VPC — which lands in `unsupported`, never dropped.
+    #
+    # `built_ids` records what pass 2 ACTUALLY emitted, and it is the only
+    # honest gate for a companion pass whose block REFERENCES its primary
+    # (`aws_lb_listener.load_balancer_arn`,
+    # `aws_secretsmanager_secret_version.secret_id`). Re-deriving the primary
+    # builder's opt-out conditions in the companion pass instead was a real bug
+    # found in review: an alb with `lbType = "network"`, or one drawn in a VPC
+    # but not a Subnet, withheld its `aws_lb` while the companion pass still
+    # emitted a listener pointing at `aws_lb.<name>.arn` — an unresolvable
+    # reference, which fails `tofu plan` for the WHOLE project and so stops
+    # every other resource on the canvas from applying. The companions that do
+    # NOT reference their primary (an ecs task definition, a lambda auto-role,
+    # an `aws_key_pair`) are deliberately left ungated: without their primary
+    # they're merely unused, never invalid.
+    built_ids: set[str] = set()
     for res in ordered:
         if res.kind not in _BUILDERS:
             continue
@@ -778,6 +908,7 @@ def generate_tf(stack: Stack) -> TfProject:
         nested = "\n\n".join(part for part in (nested, _tags_block(res)) if part)
         block = _block(_TF_TYPES[res.kind], hcl_name_by_id[res.id], attrs, nested)
         blocks.append(((res.kind, res.id), block))
+        built_ids.add(res.id)
 
     for edge in sorted(stack.edges, key=lambda e: (e.src, e.dst)):
         topic, queue = by_id.get(edge.src), by_id.get(edge.dst)
@@ -861,7 +992,7 @@ def generate_tf(stack: Stack) -> TfProject:
     # value in later with `aws secretsmanager put-secret-value`), whereas
     # emitting `secret_string = ""` would assert a value nobody typed.
     for res in ordered:
-        if res.kind != "secret":
+        if res.kind != "secret" or res.id not in built_ids:  # `built_ids`: see pass 2
             continue
         value = _field(res, "secretString", "")
         secret_name = hcl_name_by_id.get(res.id)
@@ -905,6 +1036,53 @@ def generate_tf(stack: Stack) -> TfProject:
         }
         block = _block("aws_ecs_task_definition", f"{own_name}_taskdef", attrs, nested)
         blocks.append((("aws_ecs_task_definition", res.id), block))
+
+    # W2.5: each alb node's companion `aws_lb_target_group` + `aws_lb_listener`
+    # -- named deterministically off the node's own hcl name (`_ecs`'s
+    # `load_balancer` block references the `_tg` name; the listener references
+    # both). Same one-canvas-node-to-N-tf-resources shape as the ecs task
+    # definition above, just twice. `_alb` already guaranteed the subnet+vpc
+    # refs and the two port fields parse, so nothing here can fail.
+    for res in ordered:
+        own_name = hcl_name_by_id.get(res.id)
+        # `res.id in built_ids` is the ONLY gate here (see pass 2's note): pass 2
+        # emitting the `aws_lb` is exactly the condition under which a listener
+        # may reference it, and re-deriving `_alb`'s own opt-out checks instead
+        # let a withheld load balancer keep its companions.
+        if res.kind != "alb" or own_name is None or res.id not in built_ids:
+            continue
+        listener_port, target_port = _alb_ports(res)  # pass 2 already proved these parse
+        vpc_id = _vpc_ref(res, refs)  # and that this resolves
+        target_group = _block(
+            "aws_lb_target_group", f"{own_name}_tg",
+            {
+                "name": quote(f"{res.id}-tg"),
+                "port": target_port,
+                "protocol": quote("HTTP"),
+                "vpc_id": vpc_id,
+                "target_type": quote("instance"),
+            },
+            # Only the canvas-authored knob is emitted; every other health-check
+            # member is left for the provider to read back from the gateway,
+            # which keeps the config surface (and so the drift surface) minimal.
+            "  health_check {\n"
+            f"    path = {quote(_field(res, 'healthCheckPath', _DEFAULT_ALB_HEALTH_CHECK_PATH))}\n"
+            "  }",
+        )
+        blocks.append((("aws_lb_target_group", res.id), target_group))
+        listener = _block(
+            "aws_lb_listener", f"{own_name}_listener",
+            {
+                "load_balancer_arn": f"aws_lb.{own_name}.arn",
+                "port": listener_port,
+                "protocol": quote("HTTP"),
+            },
+            "  default_action {\n"
+            '    type             = "forward"\n'
+            f"    target_group_arn = aws_lb_target_group.{own_name}_tg.arn\n"
+            "  }",
+        )
+        blocks.append((("aws_lb_listener", res.id), listener))
 
     blocks.sort(key=lambda b: b[0])
     main_tf = "\n\n".join([HEADER, provider_block(), *(text for _, text in blocks)]) + "\n"

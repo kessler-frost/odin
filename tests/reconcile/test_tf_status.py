@@ -7,7 +7,7 @@ facts, verdict)`. Hand-built `SynthStores`, no reconciler/asyncio involved
 integration (emitting WorldDeltas + pruning)."""
 from __future__ import annotations
 
-from odin.gateway.models import rdsctl, secretsctl, ssmctl
+from odin.gateway.models import elbv2ctl, rdsctl, secretsctl, ssmctl
 from odin.gateway.stores import SynthStores
 from odin.reconcile.tf_status import TF_OWNED_KINDS, project
 from odin.runtime.colima import CONTAINER_HOST
@@ -30,7 +30,7 @@ def test_tf_owned_kinds_excludes_reconciler_owned_kinds():
     # own PROVISIONED path -- this projection must never double-own them.
     assert TF_OWNED_KINDS == {
         "vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr", "logs", "secret", "ssm",
-        "elasticache", "rds",
+        "elasticache", "rds", "alb",
     }
 
 
@@ -526,7 +526,7 @@ def test_the_ecs_sweeps_own_auto_created_log_group_never_enters_world(tmp_path):
     assert project(stores, ENV, ecs_runtime=runtime).keys() == {"app"}  # still absent next tick
 
 
-# --- elasticache (W2.8): the ONE kind here that publishes real facts -- the
+# --- elasticache (W2.8): a kind here that publishes real facts -- the
 # cluster's redis endpoint, in both the container- and VM-reachable forms. ---
 
 
@@ -577,6 +577,70 @@ def test_elasticache_prefers_the_odin_node_tag_over_the_cluster_id(tmp_path):
     assert "cache" not in result
 
 
+# --- W2.5: alb -- another kind that projects FACTS ----------------------------
+
+
+def _lb(name: str, state: str = "active", endpoints: dict | None = None, reason: str | None = None) -> dict:
+    """An elbv2ctl `lb:` record, as CreateLoadBalancer writes it and
+    `converge_proxy` then updates it."""
+    return {
+        "name": name, "lb_id": "abc123", "arn": elbv2ctl.lb_arn(name, "abc123"),
+        "scheme": "internal", "type": "application", "ip_address_type": "ipv4",
+        "vpc_id": "vpc-1", "subnets": ["subnet-1"], "security_groups": [],
+        "availability_zones": [], "created_time": "2026-07-25T00:00:00+00:00",
+        "state": state, "state_reason": reason, "attributes": {},
+        "endpoints": endpoints if endpoints is not None else {"80": 41234},
+    }
+
+
+def test_an_active_load_balancer_projects_healthy_with_its_real_endpoint(tmp_path):
+    """A load balancer's whole point is an address, and `DNSName` has nowhere to
+    put the dynamic host port odin publishes the proxy on -- so the reachable URL
+    is the one fact this projection carries."""
+    stores = SynthStores(tmp_path)
+    stores.elbv2ctl.set(ENV, "lb:web-lb", _lb("web-lb"))
+    stores.tags.set(ENV, f"elasticloadbalancing:{elbv2ctl.lb_arn('web-lb', 'abc123')}", {"odin:node": "the-canvas-label"})
+
+    result = project(stores, ENV)
+    assert result["the-canvas-label"] == ("alb", "healthy", {"ALB_ENDPOINT": "http://127.0.0.1:41234"}, None)
+    assert "web-lb" not in result
+
+
+def test_a_provisioning_load_balancer_projects_starting_not_healthy(tmp_path):
+    # Honest asynchrony: the real nginx container is still coming up.
+    stores = SynthStores(tmp_path)
+    stores.elbv2ctl.set(ENV, "lb:web-lb", _lb("web-lb", state="provisioning", endpoints={}))
+    assert project(stores, ENV)["web-lb"] == ("alb", "starting", {}, None)
+
+
+def test_a_failed_load_balancer_projects_crashed_with_the_real_docker_reason(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.elbv2ctl.set(ENV, "lb:web-lb", _lb(
+        "web-lb", state="failed", endpoints={}, reason="docker run failed: no space left on device",
+    ))
+    assert project(stores, ENV)["web-lb"] == (
+        "alb", "crashed", {}, "docker run failed: no space left on device",
+    )
+
+
+def test_a_load_balancer_falls_back_to_its_own_name_when_untagged(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.elbv2ctl.set(ENV, "lb:web-lb", _lb("web-lb"))
+    assert project(stores, ENV)["web-lb"][0] == "alb"
+
+
+def test_target_groups_listeners_and_targets_are_not_projected_as_resources(tmp_path):
+    """One `alb` canvas node expands to three tf resources; only the load
+    balancer is the node. Projecting the companions would strand World entries
+    no Stack resource can ever prune."""
+    stores = SynthStores(tmp_path)
+    stores.elbv2ctl.set(ENV, "lb:web-lb", _lb("web-lb"))
+    stores.elbv2ctl.set(ENV, "tg:web-lb-tg", {"name": "web-lb-tg", "arn": "arn:tg"})
+    stores.elbv2ctl.set(ENV, "listener:deadbeef", {"listener_id": "deadbeef", "lb_name": "web-lb"})
+    stores.elbv2ctl.set(ENV, "targets:web-lb-tg", [{"id": "host.docker.internal", "port": 32768}])
+    assert set(project(stores, ENV)) == {"web-lb"}
+
+
 # --- multi-kind smoke: nothing clobbers anything else's label namespace ---
 
 
@@ -587,12 +651,13 @@ def test_multiple_kinds_project_independently(tmp_path):
     stores.iamctl.set(ENV, "role:r1", {"role_name": "r1", "arn": "arn:aws:iam::000000000000:role/r1"})
     stores.lambdactl.set(ENV, "fn:fn1", _lambda_fn("fn1", "Active"))
     stores.cachectl.set(ENV, "cluster:cache", _cache_cluster("cache", "available", port=51234))
+    stores.elbv2ctl.set(ENV, "lb:web-lb", _lb("web-lb"))
 
     result = project(stores, ENV)
-    assert set(result) == {"net", "r1", "fn1", "cache"}
+    assert set(result) == {"net", "r1", "fn1", "cache", "web-lb"}
 
 
-# --- rds (W2.7): the first projected kind that carries real FACTS -----------
+# --- rds (W2.7): a projected kind that carries real FACTS -------------------
 
 
 def _db_record(identifier: str, status: str = "available", port: int = 54321, **extra) -> dict:

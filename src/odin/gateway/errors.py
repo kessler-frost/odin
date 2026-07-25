@@ -5,12 +5,14 @@ service set spans four wire protocols:
 
 - s3:            REST-XML, a bare ``<Error>`` document.
 - sns/iam/rds/
-  elasticache:    query-XML, wrapped in ``<ErrorResponse><Error>...`` --
-                  all four are botocore's "query" protocol (verified against
+  elasticache/
+  elbv2:          query-XML, wrapped in ``<ErrorResponse><Error>...`` --
+                  all five are botocore's "query" protocol (verified against
                   each service's own model), whose error parser looks one
-                  level deeper than S3's REST-XML. IAM, RDS (task W2.7) and
-                  ElastiCache share SNS's exact envelope shape, so all of
-                  them route through `_sns_xml`.
+                  level deeper than S3's REST-XML. IAM, RDS (task W2.7),
+                  ElastiCache and elbv2 (`elasticloadbalancing`, task W2.5)
+                  share SNS's exact envelope shape, so all of them route
+                  through `_sns_xml`.
 - dynamodb/sqs/ecr: AWS JSON, ``{"__type": "...#XException", "message": ...}``
                   -- botocore's JSON error parser derives `Code` from the
                   part of `__type` after `#`, so it must carry the
@@ -54,7 +56,7 @@ _JSON_TYPE_PREFIX = {
 
 # Services whose errors ride botocore's "query" protocol envelope
 # (``<ErrorResponse><Error>...``) -- see the module docstring.
-_QUERY_XML_SERVICES = ("sns", "iam", "rds", "elasticache")
+_QUERY_XML_SERVICES = ("sns", "iam", "rds", "elasticache", "elasticloadbalancing")
 
 _STATUS = {
     "InvalidClientTokenId": 401,
