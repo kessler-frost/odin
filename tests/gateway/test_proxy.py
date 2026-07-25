@@ -400,19 +400,31 @@ async def test_sts_get_caller_identity_answered_for_any_verified_principal(sink,
     assert "<Account>000000000000</Account>" in resp.text
 
 
-async def test_backing_unavailable_returns_503(sink, keystore, stores):
+async def test_backing_unavailable_returns_503_and_is_never_an_access_denial(sink, keystore, stores):
+    """Field test 2, finding B6: this used to report a DOWN backing through
+    `on_deny` with `reason: "backing-unavailable"`, which is protocol-wrong (the
+    policy check above it has already PASSED; the response is a real
+    503/`ServiceUnavailable`) and polluted the exact `access_denied` audit stream
+    a security review reads -- during a wedged destroy it filled with thousands
+    of them. It now has its own seam."""
     s3 = _issued_client(sink, keystore, "default", "api", "s3", config=Config(signature_version="s3v4", s3={"addressing_style": "path"}))
     req = sink.call(lambda: s3.get_object(Bucket="uploads", Key="a.txt"))
 
     state = GatewayState()
     state.update("default", {"api": [Statement(actions=("s3:GetObject",), resources=("uploads",))]}, {})  # no s3 backing registered
-    on_deny, events = _recording_on_deny()
-    app = create_gateway_app(state, keystore, stores, on_deny)
+    on_deny, denials = _recording_on_deny()
+    on_unavailable, unavailable = _recording_on_deny()  # same 4-arg shape
+    app = create_gateway_app(state, keystore, stores, on_deny, on_unavailable=on_unavailable)
 
     resp = await _drive(app, req)
 
     assert resp.status_code == 503
-    assert events[0][3] == "backing-unavailable"
+    assert denials == [], "a down backing is not an authorization verdict"
+    (principal, action, resource, service) = unavailable[0]
+    assert action == "s3:GetObject"
+    assert resource == "uploads"
+    assert service == "s3", "the last argument names what is actually down"
+    assert principal is not None and principal.node_id == "api"
 
 
 # --- real sockets: prove boto3 actually raises ClientError -----------------
