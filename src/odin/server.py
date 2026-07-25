@@ -32,6 +32,7 @@ from odin.aws.backings import BackingAws
 from odin.compute.tasks import TaskRuntime
 from odin.fabric.localhost import LocalhostFabric
 from odin.fabric.nebula import mesh_state
+from odin.fabric.sidecar import MeshSidecar
 from odin.gateway import DEFAULT_GATEWAY_PORT, GATEWAY_PORT_ENV
 from odin.gateway.app import GatewayState, create_gateway_app, serve_in_thread, stop_in_thread
 from odin.gateway.keys import OPERATOR_NODE_ID, KeyStore, Principal
@@ -477,6 +478,12 @@ def create_apply_full_router(
         # scenario-2 crash/recover behavior survive the move off the
         # reconciler -- see reconcile/drift.py's rds notes.
         rdsctl.converge_db_instances(stores, env)
+        # W2.6: and push each live database's SG-compiled firewall into its mesh
+        # sidecar. An apply is exactly the right cadence -- security groups are
+        # TF-owned, so an edited `db-sg` only reaches the gateway here, and
+        # nebula reads its firewall at startup. Also heals a sidecar that was
+        # killed under a still-running database. See rdsctl.ensure_db_mesh.
+        rdsctl.ensure_db_mesh(stores, env)
         await reconciler.tick()  # kick an immediate pass; the loop continues it
         return JSONResponse(status_code=200, content=body)
 
@@ -556,7 +563,19 @@ def create_app(
     reconcilers: dict[str, Reconciler] = {}
 
     def _make_reconciler(env: str) -> Reconciler:
-        env_aws = aws or (BackingAws(_runtime, env, gateway_port=gateway_port_actual) if backings else None)
+        # W2.6: the env's backing containers join its Nebula overlay through a
+        # sidecar (`fabric/sidecar.py`). The sidecar's root is the STORE root,
+        # since that's where the env's Nebula CA/overlay actually live
+        # (`ensure_network(stores.root, ...)` in the gateway's VPC model) --
+        # injected rather than defaulted so `BackingAws._root` keeps its own
+        # meaning (the goaws config mount, deliberately CWD-relative)
+        # untouched. The rds substrate joins the SAME mesh, but it isn't built
+        # here any more (W2.7): `rdsctl` builds it per request off
+        # `stores.root`, which is that same directory.
+        env_aws = aws or (BackingAws(
+            _runtime, env, gateway_port=gateway_port_actual,
+            mesh=MeshSidecar(_runtime, env, _store.root),
+        ) if backings else None)
         return Reconciler(
             _store, _runtime, aws=env_aws, gateway=gateway_state, fabric=LocalhostFabric(),
             ws=ws_manager, env=env, poll_interval=1.0, stores=gateway_stores,

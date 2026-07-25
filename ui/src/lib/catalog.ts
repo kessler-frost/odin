@@ -8,7 +8,13 @@
 // Class strings are written out in full (not constructed) so Tailwind's scanner
 // keeps them.
 
-export type CatalogField = { key: string; label: string; editable?: boolean; select?: string[] };
+// `multiline`/`placeholder` mirror ConfigPanel's own FieldDef (catalogFields
+// spreads straight into it), so a catalog entry can declare a textarea field
+// -- e.g. an rds node's one-SG-label-per-line `securityGroups`.
+export type CatalogField = {
+  key: string; label: string; editable?: boolean; select?: string[];
+  multiline?: boolean; placeholder?: string;
+};
 
 export type ColorBundle = {
   text: string;     // badge / label text color
@@ -90,12 +96,18 @@ export const CATALOG: ServiceDef[] = [
       { key: 'dbName', label: 'Database', editable: true },
       { key: 'username', label: 'Username', editable: true },
       { key: 'password', label: 'Password', editable: true },
+      // W2.6: the DB really is gated by the SGs named here -- they become the
+      // `aws_db_instance`'s `vpc_security_group_ids` (agent/hcl.py), and the
+      // gateway puts its Postgres on the env's Nebula mesh behind their
+      // compiled firewall (gateway/models/rdsctl.py::_db_firewall). Same
+      // one-label-per-line convention as an ec2 node's.
+      { key: 'securityGroups', label: 'Security Groups (one label per line)', editable: true, multiline: true },
       { key: 'arn', label: 'ARN' },
     ],
     defaultData: {
       label: 'app-db', engine: 'postgres', instanceClass: 'db.t3.micro',
       allocatedStorage: '20', dbName: 'postgres', username: 'app',
-      password: 'apppass123', arn: '',
+      password: 'apppass123', securityGroups: '', arn: '',
     },
     primary: { key: 'engine', label: 'Engine' },
     iamActions: ['rds-db:connect', 'rds:DescribeDBInstances', 'rds:*'],
@@ -140,12 +152,18 @@ export const CATALOG: ServiceDef[] = [
       'secretsmanager:PutSecretValue', 'secretsmanager:*',
     ],
   },
+  // kms: an UNBACKED placeholder (like 'iamrole' below) -- odin has no KMS
+  // substitute and the gateway classifies no `kms:*` action, so it is not in
+  // translate.py's _KIND and Apply skips it (see skipped_node_types).
+  // Deliberately NO `iamActions`: advertising kms:Encrypt/Decrypt let a user
+  // draw an IAM edge and tick permissions that could never be enforced or
+  // even reached -- a promise the engine cannot keep. They come back with a
+  // real KMS model, not before.
   {
-    type: 'kms', abbr: 'KMS', label: 'KMS Key', sublabel: 'Encryption key',
+    type: 'kms', abbr: 'KMS', label: 'KMS Key', sublabel: 'Encryption key (placeholder)',
     category: 'Security', color: 'teal', width: 200,
     fields: [{ key: 'label', label: 'Description', editable: true }, { key: 'arn', label: 'Key ARN' }],
     defaultData: { label: 'new-key', arn: '' },
-    iamActions: ['kms:Encrypt', 'kms:Decrypt', 'kms:GenerateDataKey', 'kms:*'],
   },
   {
     type: 'iamrole', abbr: 'IAM', label: 'IAM Role', sublabel: 'Identity role',

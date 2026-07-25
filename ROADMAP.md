@@ -178,14 +178,53 @@ future decision against these points instead of re-deriving them:
     can't resolve the container-host alias. odin publishes BOTH facts (v0.5.4,
     finding #5); picking the right one per consumer type is manual — automatic
     ref-routing by consumer kind is deferred.
-  - Security groups don't gate RDS or the other backing containers (goaws/
-    RustFS/dynalite/Postgres): those run as HOST containers, not Nebula mesh
-    members, so a drawn `db-sg` is decorative and DB access rides the raw host
-    port, ungoverned. SG enforcement applies only to EC2 VMs on the mesh — and
-    even there v1 compiles the firewall from the VPC's DEFAULT SG, not an
-    instance's assigned security group. An instance's assigned SG IS reflected
-    in DescribeInstances for zero-drift re-apply (v0.5.4, finding #2), but does
-    not yet gate that VM's mesh traffic.
+  - Security groups: what IS enforced (W2.6) and what is not.
+    - **EC2 VMs**: an instance's ASSIGNED security groups gate its overlay
+      traffic — the UNION of their compiled rules is its nebula firewall
+      (falling back to the VPC default SG only when it has none, as real AWS
+      does), and its sg ids ride into its nebula CERT as groups, so an
+      SG-to-SG rule matches by identity. Proven with two real VMs whose only
+      difference is their drawn SG: one port allowed, the same port refused
+      on the other, and a third port allowed in the refusing direction to
+      rule out a dead tunnel (`tests/simulate/test_ec2_assigned_sg_e2e.py`).
+    - **RDS**: the Postgres container is a REAL mesh member (a nebula
+      companion container shares its network namespace, so the stock upstream
+      image answers on an overlay IP), gated by the SG its canvas node names
+      in `securityGroups` — which reaches the gateway as the
+      `aws_db_instance`'s `vpc_security_group_ids`, exactly like an EC2
+      instance's, since W2.7 put the database on Terraform. A VM in `web-sg`
+      reaches it; one that isn't is
+      refused (`tests/simulate/test_sg_gates_backing_e2e.py`, plus the
+      container-level `tests/aws/test_backing_mesh_e2e.py` where a real
+      `psql` succeeds for the in-group member and times out for the other).
+      The DB publishes the gated address as `${{db.DATABASE_URL_MESH}}` /
+      `endpoint_mesh`, alongside (not instead of) the host-reachable pair.
+    - **RESIDUAL GAP, stated plainly: the raw host port is still open and
+      SGs do NOT gate it.** Mesh membership is ADDITIVE — every backing keeps
+      its published Docker port, because the gateway forwards AWS calls to
+      it, odin's own health probes use it, host-side clients (tests, psql,
+      boto3) use it, and `${{node.VAR}}` facts publish it. So anything that can
+      already dial `127.0.0.1:<published port>` (any process on your Mac, any
+      container that can reach the host) still reaches Postgres with no SG in
+      the path. Only the overlay path is governed. Closing the host path
+      would mean making the Mac itself a data-plane mesh member, i.e. a host
+      `tun` device, i.e. root/sudoers — rejected (see the Nebula bullet).
+      On a local-first single-Mac tool the host is already inside the trust
+      boundary; the SG story is honest about gating traffic BETWEEN drawn
+      resources, not about sandboxing your own machine.
+    - The AWS non-VPC backings (RustFS/goaws/dynalite/registry) join the mesh
+      with certs + overlay IPs but nebula's allow-all firewall: real AWS
+      doesn't SG-gate S3/SQS/SNS/DynamoDB/ECR either (IAM and endpoint policy
+      do — the gateway's job, NORTHSTAR directive 4). Their shared-container
+      shape also means gating would be per-CONTAINER, never per-resource.
+    - Backing mesh membership is inert unless the canvas drew a VPC (no CA →
+      no join), needs `NET_ADMIN` + `/dev/net/tun` INSIDE the sidecar
+      container (a container capability Colima grants unprivileged — no sudo,
+      no host change), and `ODIN_BACKING_MESH=0` turns it off.
+    - Not modeled yet: egress rules (nebula gets allow-all outbound
+      regardless of what a canvas draws), NACLs, an SG's self-reference
+      (`self = true`), and ICMP rules from the canvas (`ingressRules` takes a
+      numeric port, so `icmp:-1:...` can't be drawn — the API path can).
   - Single local server by design: `ODIN_GATEWAY_PORT` overrides the embedded
     gateway's port, but there is no supported way to run two servers against
     the same CWD-relative `.odin` store (the second binds-conflicts on the
@@ -200,9 +239,16 @@ future decision against these points instead of re-deriving them:
     plain unprivileged `nebula`, no root, no sudo, no one-time setup
     (empirically verified: an unprivileged process with that flag starts
     and binds its UDP port; the same config without it dies immediately
-    with "operation not permitted"). Only the VMs join the actual data
-    plane, running `nebula` as root INSIDE the VM (systemd) — that costs
-    the user nothing, since it's a VM they already own outright. **Real
+    with "operation not permitted"). The data-plane members are the VMs
+    (running `nebula` as root INSIDE the VM via systemd — that costs the user
+    nothing, since it's a VM they already own outright) and, since W2.6, the
+    per-env BACKING containers: a nebula companion container shares the
+    backing's network namespace, so an unmodified upstream image
+    (postgres/RustFS/goaws/dynalite/registry) answers on an overlay IP. That
+    needs `NET_ADMIN` + `/dev/net/tun` inside the sidecar CONTAINER — a
+    container capability, not a host privilege (verified live on stock
+    Colima). The macOS host itself is still NOT a data-plane member, by
+    design: a host tun device would need root. **Real
     finding:** stock Lima `vz` NATs every VM into its OWN isolated address
     space — there is NO VM-to-VM underlay path at all (confirmed live: a
     raw ping between two VMs' vzNAT addresses is 100% loss, before nebula
@@ -211,7 +257,21 @@ future decision against these points instead of re-deriving them:
     lighthouse, `relay: {use_relays: true}` on every VM) rather than
     direct — still fully unprivileged, since relaying is opaque encrypted
     UDP forwarding between two peers already handshaken with the lighthouse,
-    needing no tun device either. The live overlay proof
+    needing no tun device either. **Second real finding (W2.6):** Lima
+    automatically forwards every port a guest listens on to the HOST's
+    127.0.0.1 — including each EC2 VM's own `nebula` on UDP 4242, so
+    `limactl hostagent` HOLDS host 127.0.0.1:4242 (seen with lsof, right
+    next to the lighthouse's own socket). Colima maps
+    `host.docker.internal` onto the host loopback, so every BACKING
+    container's handshake to the lighthouse was being delivered into a VM
+    instead: container↔VM mesh traffic could not work at all while any EC2
+    VM existed, though VM↔VM (which rides the vzNAT address, never
+    loopback) was fine. Lima's own `portForwards: ignore` does not suppress
+    it for UDP (the rule lands in the instance's effective config and
+    `limactl` binds the port anyway), so the host lighthouse now listens on
+    its OWN port, 4342 (`fabric/nebula.py::LIGHTHOUSE_PORT`) — nothing in
+    any guest listens there, so nothing can forward it out from under us,
+    including a user's own unrelated Lima VMs. The live overlay proof
     (`tests/simulate/test_nebula_mesh_e2e.py`) boots two real VMs and
     proves a real VM-to-VM ping (via the relay) plus a real
     SG-rule-filtered connection — the host itself has no overlay presence
@@ -377,7 +437,10 @@ future decision against these points instead of re-deriving them:
     it out of band and the load balancer still reports `active` until the next
     Apply re-converges it.
 - **Recorded as UNSUPPORTED for now** (northstar directive 5's honesty rule):
-  EKS, CloudFormation, and autoscaling. (ALB/ELBv2 was on this list until W2.5
+  EKS, CloudFormation, autoscaling, and KMS (the `kms` catalog node is an
+  unbacked placeholder — no substitute, no gateway model, and as of W2.6 it
+  advertises no IAM actions either, since a `kms:Encrypt` permission could
+  never be enforced or even reached). (ALB/ELBv2 was on this list until W2.5
   and RDS-via-Terraform until W2.7 — `aws_lb` and `aws_db_instance` are real
   now; see the ALB and RDS limits above for what's still missing inside them.)
 - [x] **Nebula network layer (single-host), fully activated.** Security

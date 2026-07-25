@@ -91,7 +91,10 @@ from starlette.responses import Response
 
 from odin.aws.backings import ACCOUNT, REGION
 from odin.aws.rds import POSTGRES_MAJOR, PostgresRds
+from odin.fabric.models import FirewallRules
+from odin.fabric.nebula import union_firewalls
 from odin.gateway import errors
+from odin.gateway.models import ec2net
 from odin.gateway.stores import NO_CHANGE, SynthStores
 from odin.reconcile.assertions import pg_ready_sync
 from odin.runtime.colima import CONTAINER_HOST, ColimaRuntime
@@ -197,6 +200,14 @@ def _request_tags(params: dict[str, str]) -> dict[str, str]:
     return {t["Key"]: t.get("Value", "") for t in _indexed(params, "Tags.Tag") if "Key" in t}
 
 
+def _vpc_sg_ids(params: dict[str, str]) -> list[str]:
+    """`VpcSecurityGroupIds.VpcSecurityGroupId.N` -- `VpcSecurityGroupIdList`'s
+    member carries the locationName `VpcSecurityGroupId` (botocore's own rds
+    model), so that, not the generic `.member.`, is its wire prefix."""
+    ids = _indexed(params, "VpcSecurityGroupIds.VpcSecurityGroupId")
+    return [item[""] for item in ids if item.get("")]
+
+
 def _tag_keys(params: dict[str, str]) -> list[str]:
     """`TagKeys.member.N` -- `KeyList`'s member has NO locationName, so it
     serializes with the query protocol's default `member` (again, botocore's
@@ -276,6 +287,24 @@ def _bool(value: bool) -> str:
     return "true" if value else "false"
 
 
+def _vpc_sg_xml(record: dict) -> str:
+    """The instance's assigned security groups, in real RDS's own response
+    shape (`VpcSecurityGroupMembershipList`, whose member locationName is
+    `VpcSecurityGroupMembership` -- botocore's model).
+
+    ZERO-DRIFT, and the reason this isn't the empty `<VpcSecurityGroups/>` it
+    used to be: terraform-provider-aws reads `vpc_security_group_ids` back out
+    of this element, so an `aws_db_instance` that HAS groups would otherwise
+    read back with none and plan a change on every apply. `active` is the only
+    status real RDS ever reports here."""
+    items = "".join(
+        f"<VpcSecurityGroupMembership><VpcSecurityGroupId>{escape(gid)}</VpcSecurityGroupId>"
+        "<Status>active</Status></VpcSecurityGroupMembership>"
+        for gid in record.get("vpc_security_group_ids") or []
+    )
+    return f"<VpcSecurityGroups>{items}</VpcSecurityGroups>"
+
+
 def _db_instance_xml(record: dict, tags: dict[str, str]) -> str:
     identifier = record["db_instance_identifier"]
     port = record.get("endpoint_port") or 0
@@ -292,7 +321,7 @@ def _db_instance_xml(record: dict, tags: dict[str, str]) -> str:
         f"<PreferredBackupWindow>{record['preferred_backup_window']}</PreferredBackupWindow>",
         f"<BackupRetentionPeriod>{record['backup_retention_period']}</BackupRetentionPeriod>",
         "<DBSecurityGroups/>",
-        "<VpcSecurityGroups/>",
+        _vpc_sg_xml(record),
         "<DBParameterGroups><DBParameterGroup>"
         f"<DBParameterGroupName>{_PARAMETER_GROUP}</DBParameterGroupName>"
         "<ParameterApplyStatus>in-sync</ParameterApplyStatus>"
@@ -368,13 +397,63 @@ def _spawn(target: Callable[..., None], *args: object) -> None:
     threading.Thread(target=target, args=args, daemon=True).start()
 
 
-def _substrate(env: str, rds: PostgresRds | None) -> PostgresRds:
+def _substrate(env: str, stores: SynthStores, rds: PostgresRds | None) -> PostgresRds:
     """`ecsctl`'s `runtime or TaskRuntime()` precedent, env-scoped: the real
     substrate is built per call from the env in the request itself, so nothing
     has to be threaded down from `create_app` for production to work. Tests
     (and `create_app`'s own `rds=` seam) inject a stand-in with the same
-    `create_db`/`delete_db`/`endpoint`/`container_name` shape."""
-    return rds or PostgresRds(ColimaRuntime(), env)
+    `create_db`/`delete_db`/`endpoint`/`container_name` shape.
+
+    `stores.root` is the store root, and it is what the substrate's mesh
+    sidecar needs (W2.6): the env's Nebula CA and overlay assignments live at
+    `{stores.root}/{env}/nebula/`, written by `ec2net.py`'s own
+    `ensure_network`. Passing it here is what makes the join work for a store
+    that isn't the default `.odin` (every integration test's own root)."""
+    return rds or PostgresRds(ColimaRuntime(), env, root=stores.root)
+
+
+def _db_firewall(stores: SynthStores, env: str, group_ids: list[str]) -> FirewallRules | None:
+    """The compiled Nebula firewall an rds instance's Postgres container is
+    gated by: the UNION of its ASSIGNED security groups' rules (AWS's
+    permissive-only SG semantics). `ec2compute._instance_firewall`'s twin,
+    reading the very same `ec2net.compiled_firewall` bytes -- so a database and
+    an EC2 VM in one security group are gated by identical rules.
+
+    None means "not gated" (nebula's allow-all default): the node named no
+    security group, or none of the groups it named has a compiled firewall
+    yet. Deliberately NOT deny-everything -- an rds node that worked before
+    anyone drew an SG has to keep working. And deliberately no VPC-default
+    fallback, unlike ec2's: RunInstances with no groups really does inherit the
+    VPC default in AWS, whereas CreateDBInstance's own default is the DB subnet
+    group's VPC default, which odin doesn't model -- so inventing one here
+    would gate a database by rules its canvas never showed."""
+    compiled = [
+        f for gid in group_ids
+        if (f := ec2net.compiled_firewall(stores, env, gid)) is not None
+    ]
+    return union_firewalls(compiled) if compiled else None
+
+
+def _join_mesh(stores: SynthStores, env: str, identifier: str, rds: PostgresRds) -> None:
+    """Put this instance's real Postgres container on the env's Nebula overlay
+    behind its assigned SGs' compiled firewall, and record the overlay IP so
+    `reconcile/tf_status.py::_db_facts` can publish `DATABASE_URL_MESH`.
+
+    W2.6 put this in the reconciler's rds observe pass; W2.7 retired that pass
+    entirely, so it lives HERE now -- with the model that owns the container's
+    lifecycle. The group ids are read from the record rather than passed in, so
+    a re-ensure always compiles the CURRENT assignment.
+
+    Strictly additive, and never able to fail an apply: this runs AFTER the
+    instance is already `available`, and `MeshSidecar.ensure` swallows its own
+    failures (returning None) rather than raising, so a database whose mesh
+    wiring didn't come up is still a working database on its published host
+    port."""
+    record = _record(stores, env, identifier)
+    if record is None:
+        return
+    firewall = _db_firewall(stores, env, record.get("vpc_security_group_ids") or [])
+    _update(stores, env, identifier, overlay_ip=rds.join_mesh(identifier, firewall))
 
 
 def _wait_available(rds: PostgresRds, identifier: str, user: str, password: str, deadline: float) -> tuple[int, str | None]:
@@ -428,6 +507,12 @@ def _finish_create(stores: SynthStores, env: str, identifier: str, user: str, pa
         stores, env, identifier, status=AVAILABLE, status_reason=None,
         endpoint_address=CONTAINER_HOST, endpoint_port=port,
     )
+    # W2.6, deliberately AFTER `available`: the database really is up on its
+    # published host port at this point, so the provider's create waiter is
+    # never held behind mesh wiring (which, on a machine that hasn't built the
+    # nebula sidecar image yet, does real work). The gated overlay address
+    # follows a moment later as an extra fact.
+    _join_mesh(stores, env, identifier, rds)
 
 
 def _finish_delete(stores: SynthStores, env: str, identifier: str, rds: PostgresRds) -> None:
@@ -471,6 +556,14 @@ def _create_db_instance(params: dict[str, str], env: str, stores: SynthStores, n
         # health probe both need it -- see the module docstring's note.
         "master_password": password,
         "db_name": params.get("DBName") or _DEFAULT_DB_NAME,
+        # W2.6: the drawn security groups, arriving the same way an EC2
+        # instance's do -- through terraform (`vpc_security_group_ids`). They
+        # are echoed back for zero-drift (`_vpc_sg_xml`) and they gate the real
+        # container's overlay membership (`_db_firewall`).
+        "vpc_security_group_ids": _vpc_sg_ids(params),
+        # Filled in by `_join_mesh` once the container is on the env's overlay;
+        # stays None for an env with no Nebula network (no VPC drawn).
+        "overlay_ip": None,
         "allocated_storage": _int_param(params, "AllocatedStorage", _DEFAULT_ALLOCATED_STORAGE),
         "backup_retention_period": _int_param(params, "BackupRetentionPeriod", 0),
         "preferred_backup_window": "04:00-04:30",
@@ -555,6 +648,13 @@ def _modify_db_instance(params: dict[str, str], env: str, stores: SynthStores, n
         changes["allocated_storage"] = int(params["AllocatedStorage"])
     if params.get("BackupRetentionPeriod", "").isdigit():
         changes["backup_retention_period"] = int(params["BackupRetentionPeriod"])
+    # Only when the provider actually sent groups -- the query protocol can't
+    # express an empty list, so "no VpcSecurityGroupIds in this request" means
+    # "unchanged", exactly as it does for every scalar above (and as real RDS
+    # treats it). The recompiled firewall reaches the container on the next
+    # `ensure_db_mesh`.
+    if sg_ids := _vpc_sg_ids(params):
+        changes["vpc_security_group_ids"] = sg_ids
     _update(stores, env, identifier, **changes)
     return _instance_response("ModifyDBInstance", stores, env, {**record, **changes})
 
@@ -628,7 +728,7 @@ def converge_db_instances(
 
     `substrate` is per-ENV, so it's built here rather than passed in from the
     request path: one `PostgresRds` covers every record in this env."""
-    rds = substrate or PostgresRds(ColimaRuntime(), env)
+    rds = substrate or PostgresRds(ColimaRuntime(), env, root=stores.root)
     for record in records(stores, env):
         if record["status"] != FAILED:
             continue
@@ -639,6 +739,31 @@ def converge_db_instances(
             _finish_create, stores, env, identifier,
             record["master_username"], record["master_password"], record["db_name"], rds,
         )
+
+
+def ensure_db_mesh(
+    stores: SynthStores, env: str, substrate: PostgresRds | None = None,
+) -> None:
+    """Re-ensure every `available` instance's Nebula mesh membership -- run on
+    each Apply (server.py's /apply-full), beside `converge_db_instances`.
+
+    Two things need it, and an Apply is the honest cadence for both. An SG
+    EDIT: security groups are TF-owned, so a changed `db-sg` reaches the
+    gateway ONLY through an apply, and nebula reads its firewall only at
+    startup -- so this is exactly when the recompiled rules must be pushed into
+    the sidecar. And a DEAD SIDECAR: the companion container can be killed
+    while the database itself keeps running, which no create path would ever
+    notice.
+
+    Cheap and idempotent by construction (`MeshSidecar.ensure`): an unchanged
+    firewall with a running sidecar is a couple of file reads plus one
+    container-status call, and only a genuinely CHANGED config restarts the
+    daemon. `failed` instances are `converge_db_instances`' business -- their
+    re-create joins the mesh on its own."""
+    rds = substrate or PostgresRds(ColimaRuntime(), env, root=stores.root)
+    for record in records(stores, env):
+        if record["status"] == AVAILABLE:
+            _join_mesh(stores, env, record["db_instance_identifier"], rds)
 
 
 # --- dispatch --------------------------------------------------------------
@@ -668,4 +793,4 @@ def pure_answer(
     handler = _HANDLERS.get(op)
     if handler is None:
         return errors.synth_error("rds", "InvalidAction", f"The action {op} is not valid.", 400)
-    return handler(_params(body), env, stores, now, _substrate(env, rds))
+    return handler(_params(body), env, stores, now, _substrate(env, stores, rds))

@@ -20,6 +20,8 @@ import pytest
 from botocore.parsers import create_parser
 from starlette.responses import Response
 
+from odin.fabric.models import FirewallRule
+from odin.fabric.nebula import sg_rules_to_firewall
 from odin.gateway.classify import classify
 from odin.gateway.models import rdsctl
 from odin.gateway.stores import SynthStores
@@ -34,11 +36,17 @@ PASSWORD = "apppass123"
 
 class FakePostgresRds:
     """The `PostgresRds` shape (`create_db`/`delete_db`/`endpoint`/
-    `container_name`/`set_password`) with no container and no database --
-    deterministic and instant, so the background create thread's transitions
-    can be observed with a short poll instead of a real Postgres boot."""
+    `container_name`/`set_password`/`join_mesh`) with no container and no
+    database -- deterministic and instant, so the background create thread's
+    transitions can be observed with a short poll instead of a real Postgres
+    boot.
 
-    def __init__(self, port: int = 54321, fail_create: bool = False, ready: bool = True) -> None:
+    W2.6: `joined` records (db_id, firewall) so a test can assert WHICH
+    compiled SG firewall gated the database, and `overlay` is the address a
+    join hands back (None = this env has no mesh)."""
+
+    def __init__(self, port: int = 54321, fail_create: bool = False, ready: bool = True,
+                 overlay: str | None = None) -> None:
         self.port = port
         self.fail_create = fail_create
         self.ready = ready
@@ -46,6 +54,12 @@ class FakePostgresRds:
         self.deleted: list[str] = []
         self.passwords: list[tuple[str, str]] = []
         self.up: set[str] = set()
+        self.overlay = overlay
+        self.joined: list[tuple[str, object]] = []
+
+    def join_mesh(self, db_id: str, firewall=None) -> str | None:
+        self.joined.append((db_id, firewall))
+        return self.overlay
 
     def container_name(self, db_id: str) -> str:
         return f"odin-rds-{ENV}-{db_id}"
@@ -462,6 +476,105 @@ def test_converge_leaves_available_and_creating_instances_alone(tmp_path, sink, 
     rdsctl.converge_db_instances(stores, ENV, substrate=fake)
     rdsctl.converge_db_instances(stores, ENV, substrate=fake)
     assert fake.created == [(DB, USER, PASSWORD, "postgres")]
+
+
+# --- W2.6: the database on the mesh, gated by its drawn security group ------
+#
+# These four replace the reconciler-side tests that proved the same behaviour
+# before W2.7 moved rds onto Terraform: the SG now arrives as
+# `vpc_security_group_ids` (the ec2 route) instead of being read off the canvas
+# node, and the join happens here, where the container's lifecycle lives.
+
+
+def _seed_sg(stores: SynthStores, group_id: str, port: int, source: dict) -> None:
+    """One SG record shaped exactly as `ec2net.py` stores it once tofu has
+    created the group -- with its firewall compiled by nebula's OWN compiler
+    rather than hand-written, so this can't drift from what the SG model really
+    writes (`ec2net._compiled_firewall`)."""
+    firewall = sg_rules_to_firewall([{"IpProtocol": "tcp", "FromPort": port, "ToPort": port, **source}])
+    stores.ec2net.set(ENV, f"sg:{group_id}", {
+        "group_id": group_id, "group_name": group_id, "vpc_id": "vpc-1",
+        "firewall": firewall.model_dump(),
+    })
+
+
+def test_create_records_and_echoes_its_assigned_security_groups(tmp_path, sink, rds):
+    """ZERO-DRIFT: the provider reads `vpc_security_group_ids` back out of
+    DescribeDBInstances' `VpcSecurityGroups`, so groups that went in have to
+    come back out -- otherwise an `aws_db_instance` with an SG plans a change
+    on every single apply."""
+    stores, fake = _stores(tmp_path), FakePostgresRds()
+    _create(sink, rds, stores, fake, VpcSecurityGroupIds=["sg-db", "sg-ops"])
+    instance = _await_status(sink, rds, stores, fake, "available")
+    assert instance["VpcSecurityGroups"] == [
+        {"VpcSecurityGroupId": "sg-db", "Status": "active"},
+        {"VpcSecurityGroupId": "sg-ops", "Status": "active"},
+    ]
+
+
+def test_the_database_joins_the_mesh_behind_its_assigned_sgs_compiled_firewall(tmp_path, sink, rds):
+    """The W2.6 payoff, for a TF-owned database: the SGs a canvas drew for it
+    compile into the firewall its overlay membership is gated by -- the UNION
+    of every assigned group, byte-identical to what an EC2 VM in those same
+    groups gets (both read `ec2net.compiled_firewall`)."""
+    stores, fake = _stores(tmp_path), FakePostgresRds()
+    _seed_sg(stores, "sg-db", 5432, {"UserIdGroupPairs": [{"GroupId": "sg-web"}]})
+    _seed_sg(stores, "sg-ops", 22, {"IpRanges": [{"CidrIp": "10.0.0.0/8"}]})
+    _create(sink, rds, stores, fake, VpcSecurityGroupIds=["sg-db", "sg-ops"])
+    _await_status(sink, rds, stores, fake, "available")
+
+    (db_id, firewall) = fake.joined[-1]
+    assert db_id == DB
+    assert firewall is not None, "a drawn db-sg must gate the database's overlay membership"
+    assert FirewallRule(port="5432", proto="tcp", group="sg-web") in firewall.inbound
+    assert FirewallRule(port="22", proto="tcp", cidr="10.0.0.0/8") in firewall.inbound
+
+
+def test_a_database_with_no_security_groups_joins_the_mesh_ungated(tmp_path, sink, rds):
+    """No SG assigned -> `None` -> the sidecar's allow-all default. Joining the
+    mesh must never silently become "deny everything" just because nothing was
+    drawn -- that would break a canvas that worked yesterday."""
+    stores, fake = _stores(tmp_path), FakePostgresRds()
+    _create(sink, rds, stores, fake)
+    _await_status(sink, rds, stores, fake, "available")
+    assert fake.joined == [(DB, None)]
+
+
+def test_the_gated_overlay_address_lands_on_the_record(tmp_path, sink, rds):
+    """`overlay_ip` on the record is what `tf_status._db_facts` publishes
+    `DATABASE_URL_MESH` from -- and it stays None for an env with no Nebula
+    network (no VPC drawn), which is what keeps the mesh facts absent rather
+    than empty."""
+    stores, joined = _stores(tmp_path), FakePostgresRds(overlay="10.42.1.4")
+    _create(sink, rds, stores, joined)
+    _await_status(sink, rds, stores, joined, "available")
+    assert rdsctl.records(stores, ENV)[0]["overlay_ip"] == "10.42.1.4"
+
+    meshless_stores, meshless = _stores(tmp_path / "no-mesh"), FakePostgresRds()
+    _create(sink, rds, meshless_stores, meshless)
+    _await_status(sink, rds, meshless_stores, meshless, "available")
+    assert rdsctl.records(meshless_stores, ENV)[0]["overlay_ip"] is None
+
+
+def test_ensure_db_mesh_repushes_an_edited_sgs_rules_and_ignores_failed_instances(tmp_path, sink, rds):
+    """An SG edit reaches the gateway only through an Apply (security groups are
+    TF-owned) and nebula reads its firewall only at startup, so an Apply is
+    when the recompiled rules must be pushed -- `ensure_db_mesh`. A `failed`
+    instance is skipped: `converge_db_instances` re-creates it, and that boot
+    joins on its own."""
+    stores, fake = _stores(tmp_path), FakePostgresRds()
+    _seed_sg(stores, "sg-db", 5432, {"UserIdGroupPairs": [{"GroupId": "sg-web"}]})
+    _create(sink, rds, stores, fake, VpcSecurityGroupIds=["sg-db"])
+    _await_status(sink, rds, stores, fake, "available")
+
+    _seed_sg(stores, "sg-db", 5432, {"UserIdGroupPairs": [{"GroupId": "sg-batch"}]})  # the canvas edited it
+    rdsctl.ensure_db_mesh(stores, ENV, substrate=fake)
+    assert fake.joined[-1][1].inbound == [FirewallRule(port="5432", proto="tcp", group="sg-batch")]
+
+    rdsctl.mark_instance_failed(stores, ENV, DB, "container removed outside odin")
+    before = len(fake.joined)
+    rdsctl.ensure_db_mesh(stores, ENV, substrate=fake)
+    assert len(fake.joined) == before
 
 
 # --- dispatch --------------------------------------------------------------

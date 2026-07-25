@@ -40,6 +40,15 @@ class ContainerSpec:
     # function's MemorySize) sets none.
     memory_mib: float | None = None
     cpus: float | None = None
+    # W2.6 (fabric/sidecar.py): a nebula companion container joins its
+    # BACKING's network namespace (`network="container:<name>"`), which is
+    # what puts the overlay tun device inside the backing's namespace so an
+    # unmodified upstream image answers on the mesh. `cap_add`/`devices` are
+    # what nebula needs to create that tun -- container capabilities from the
+    # container runtime, never host root (see sidecar.py's docstring).
+    network: str | None = None
+    cap_add: tuple[str, ...] = ()
+    devices: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -130,10 +139,20 @@ class _ContainerRuntime:
         self._cli("build", "-t", tag, "-", input=dockerfile)
 
     def run_container(self, spec: ContainerSpec) -> RunHandle:
+        # A namespace-sharing container takes no `_run_flags`: docker rejects
+        # `--add-host` together with `--network container:` outright ("conflicting
+        # options"), and it needs none -- it inherits the target's /etc/hosts-less
+        # networking wholesale (fabric/sidecar.py).
         args = [
-            "run", "-d", "--name", spec.name, *self._run_flags(),
+            "run", "-d", "--name", spec.name, *([] if spec.network else self._run_flags()),
             "--label", f"{LABEL}=1", "--label", f"{LABEL}.name={spec.name}",
         ]
+        if spec.network:
+            args += ["--network", spec.network]
+        for capability in spec.cap_add:
+            args += ["--cap-add", capability]
+        for device in spec.devices:
+            args += ["--device", device]
         for key, value in spec.labels.items():
             args += ["--label", f"{key}={value}"]
         for key, value in spec.env.items():

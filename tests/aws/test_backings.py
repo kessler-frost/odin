@@ -431,10 +431,14 @@ def test_aws_env_yields_sqs_and_sns_from_one_goaws_plus_creds(rt, factory, tmp_p
     assert env["AWS_DEFAULT_REGION"] == REGION
 
 
+# W2.6: each stopped backing takes its mesh SIDECAR with it (`<backing>-mesh`,
+# fabric/sidecar.py) -- it lives in that container's network namespace, so it
+# would die anyway; stopping it explicitly is what leaves nothing behind.
 def test_gc_stops_backings_whose_kinds_are_all_inactive(rt, factory, tmp_path):
     _aws(rt, factory, tmp_path).gc({"s3"})
     assert set(rt.stopped) == {
-        "odin-aws-goaws-default", "odin-aws-dynalite-default", "odin-aws-registry-default"}
+        "odin-aws-goaws-default", "odin-aws-dynalite-default", "odin-aws-registry-default",
+        "odin-aws-goaws-default-mesh", "odin-aws-dynalite-default-mesh", "odin-aws-registry-default-mesh"}
 
 
 def test_gc_with_no_active_kinds_stops_everything(rt, factory, tmp_path):
@@ -444,6 +448,10 @@ def test_gc_with_no_active_kinds_stops_everything(rt, factory, tmp_path):
         "odin-aws-goaws-default",
         "odin-aws-dynalite-default",
         "odin-aws-registry-default",
+        "odin-aws-rustfs-default-mesh",
+        "odin-aws-goaws-default-mesh",
+        "odin-aws-dynalite-default-mesh",
+        "odin-aws-registry-default-mesh",
     }
 
 

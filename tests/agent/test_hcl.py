@@ -144,6 +144,39 @@ def test_rds_carries_every_canvas_field_it_has():
     assert unquote(attrs["password"]) == "s3cr3t-pw"
 
 
+def test_rds_security_groups_field_becomes_vpc_security_group_ids():
+    """W2.6: the SG a canvas draws for its database travels to the gateway
+    through TERRAFORM, exactly as an ec2 node's does (same field, same builder)
+    -- which is what lets `rdsctl` gate the real Postgres container's mesh
+    membership by those groups' compiled firewall, and what puts the attachment
+    in `tofu plan`."""
+    stack = Stack(resources=(
+        ResourceDesired(id="net", kind="vpc"),
+        ResourceDesired(id="db-sg", kind="sg", fields=_fields(vpc="net", ingressRules="tcp:5432:web-sg")),
+        ResourceDesired(id="web-sg", kind="sg", fields=_fields(vpc="net", ingressRules="tcp:22:0.0.0.0/0")),
+        ResourceDesired(id="app-db", kind="rds", fields=_fields(engine="postgres", securityGroups="db-sg")),
+    ))
+    main_tf = generate_tf(stack).files["main.tf"]
+    assert "vpc_security_group_ids = [aws_security_group.db_sg.id]" in main_tf
+
+
+def test_rds_with_no_security_groups_field_omits_the_argument():
+    """An rds node with nothing drawn keeps compiling byte-identical HCL -- the
+    gateway then joins it to the mesh ungated (nebula's allow-all), never
+    deny-all."""
+    main_tf = generate_tf(Stack(resources=(ResourceDesired(id="app-db", kind="rds"),))).files["main.tf"]
+    assert "aws_db_instance" in main_tf and "vpc_security_group_ids" not in main_tf
+
+
+def test_rds_with_an_unknown_security_group_label_lands_in_unsupported():
+    res = ResourceDesired(id="app-db", kind="rds", fields=_fields(securityGroups="ghost"))
+    proj = generate_tf(Stack(resources=(res,)))
+    assert proj.unsupported == [
+        "app-db (rds): securityGroups names something that isn't a Security Group on the canvas"
+    ]
+    assert "aws_db_instance" not in proj.files["main.tf"]
+
+
 def test_rds_with_a_non_postgres_engine_is_declined_not_silently_postgres():
     """The pre-W2.7 reconciler path ran a Postgres container no matter what
     `engine` said. Honest now: no local substrate, no HCL."""
@@ -384,8 +417,50 @@ def test_sg_with_malformed_ingress_rule_lands_in_unsupported():
     ))
     proj = generate_tf(stack)
     assert proj.unsupported == [
-        'bad (sg): invalid ingress rule — expected one "protocol:port:cidr" per line, e.g. tcp:443:0.0.0.0/0'
+        'bad (sg): invalid ingress rule — expected one "protocol:port:source" per line, e.g. tcp:443:0.0.0.0/0'
     ]
+
+
+def test_sg_ingress_can_name_another_sg_as_its_source():
+    """W2.6: "5432, from the web tier only" -- the AWS-idiomatic
+    UserIdGroupPairs rule, which is the ONLY source form that gates by
+    identity (a nebula `group:` rule matched against the peer's cert)
+    rather than by address."""
+    stack = Stack(resources=(
+        ResourceDesired(id="net", kind="vpc"),
+        ResourceDesired(id="web-sg", kind="sg", fields=_fields(vpc="net", ingressRules="tcp:80:0.0.0.0/0")),
+        ResourceDesired(id="db-sg", kind="sg", fields=_fields(vpc="net", ingressRules="tcp:5432:web-sg")),
+    ))
+    proj = generate_tf(stack)
+    assert proj.unsupported == []
+    body = proj.files["main.tf"]
+    assert "    security_groups = [aws_security_group.web_sg.id]" in body
+    assert "tcp:5432:web-sg" not in body  # the rule is compiled, not pasted
+
+
+def test_sg_ingress_naming_a_non_sg_source_lands_in_unsupported():
+    stack = Stack(resources=(
+        ResourceDesired(id="net", kind="vpc"),
+        ResourceDesired(id="db-sg", kind="sg", fields=_fields(vpc="net", ingressRules="tcp:5432:web-tier")),
+    ))
+    proj = generate_tf(stack)
+    assert proj.unsupported == [
+        "db-sg (sg): ingress rule source 'web-tier' is neither a CIDR (like 10.0.0.0/16) "
+        "nor the name of another Security Group node on the canvas"
+    ]
+
+
+def test_sg_ingress_naming_itself_is_unsupported_not_a_tf_cycle():
+    """A same-SG self-reference is real AWS (and needs TF's `self = true`) --
+    unmodeled, so it must be REPORTED, never emitted as an HCL self-reference
+    (which tofu rejects as a cycle)."""
+    stack = Stack(resources=(
+        ResourceDesired(id="net", kind="vpc"),
+        ResourceDesired(id="app-sg", kind="sg", fields=_fields(vpc="net", ingressRules="tcp:5432:app-sg")),
+    ))
+    proj = generate_tf(stack)
+    assert proj.unsupported and proj.unsupported[0].startswith("app-sg (sg): ingress rule source 'app-sg'")
+    assert "aws_security_group" not in proj.files["main.tf"]
 
 
 def test_iam_role_emits_name_and_the_lambda_trust_policy():

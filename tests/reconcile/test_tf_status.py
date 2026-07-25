@@ -692,6 +692,34 @@ def test_an_available_database_projects_healthy_with_both_database_url_forms(tmp
     }
 
 
+def test_a_database_on_the_mesh_also_publishes_its_gated_overlay_address(tmp_path):
+    """W2.6: the overlay address is an ADDITIONAL fact. The two host-reachable
+    forms above are untouched (the gateway, the create waiter's probe and every
+    host-side client ride them), and `DATABASE_URL_MESH` is the SG-gated path a
+    mesh member uses -- on the container's OWN 5432, not the published host
+    port, because the mesh sidecar shares its network namespace."""
+    stores = SynthStores(tmp_path)
+    _db(stores, "app-db", "app-db", overlay_ip="10.42.1.4")
+
+    facts = project(stores, ENV)["app-db"][2]
+
+    assert facts["endpoint_mesh"] == "10.42.1.4:5432"
+    assert facts["DATABASE_URL_MESH"] == "postgresql://app:apppass123@10.42.1.4:5432/postgres"
+    assert facts["endpoint"] == "host.docker.internal:54321"  # the host path, unchanged
+    assert facts["DATABASE_URL_VM"] == "postgresql://app:apppass123@host.lima.internal:54321/postgres"
+
+
+def test_a_database_with_no_mesh_publishes_no_overlay_facts(tmp_path):
+    """An env with no Nebula network (no VPC drawn) publishes exactly the facts
+    it always did -- no empty or placeholder mesh keys."""
+    stores = SynthStores(tmp_path)
+    _db(stores, "app-db", "app-db", overlay_ip=None)
+
+    facts = project(stores, ENV)["app-db"][2]
+
+    assert "DATABASE_URL_MESH" not in facts and "endpoint_mesh" not in facts
+
+
 def test_the_database_url_path_is_the_instances_real_db_name(tmp_path):
     """`db_name` is a real `POSTGRES_DB` the substrate creates (aws/rds.py), so
     the URL points at a database that exists rather than at a label."""

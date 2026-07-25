@@ -65,6 +65,7 @@ import signal
 import subprocess
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -89,6 +90,23 @@ from odin.util import atomic_write_text
 log = logging.getLogger("odin.fabric.nebula")
 
 NEBULA_PORT = 4242
+
+# The HOST lighthouse listens on its OWN port, not on the members' 4242 --
+# W2.6, found live and the hard way. Lima automatically forwards every port a
+# guest listens on to the host's 127.0.0.1, and that includes each EC2 VM's
+# `nebula` daemon on UDP 4242: `limactl hostagent` then HOLDS host
+# 127.0.0.1:4242 (confirmed with lsof, alongside the lighthouse's own
+# `[::]:4242`). Colima's user-mode network maps `host.docker.internal`
+# (192.168.5.2) onto the host's loopback, so a backing container's handshake
+# packets to the lighthouse were being delivered INTO a VM instead --
+# container↔VM mesh traffic could never work while any EC2 VM existed, while
+# VM↔VM (which rides the vzNAT address, never loopback) was fine. Lima's own
+# `portForwards: ignore` does NOT suppress it for UDP (tried: the rule lands
+# in the instance's effective config and `limactl` binds the port anyway), and
+# a user's own unrelated Lima VM could collide the same way. Giving the
+# lighthouse a distinct port sidesteps the whole class: nothing in any guest
+# ever listens on 4342, so nothing can forward it out from under us.
+LIGHTHOUSE_PORT = 4342
 
 # How long `ensure_started` waits, after spawning, to catch an IMMEDIATE
 # crash (bad cert/config, port already in use) before declaring success -- a
@@ -254,7 +272,9 @@ class NebulaManager:
                 "key": str(pki.key) if pki else "/etc/nebula/host.key",
             },
             "lighthouse": {"am_lighthouse": is_lighthouse},
-            "listen": {"host": "0.0.0.0", "port": NEBULA_PORT},
+            # The lighthouse gets its OWN port (see LIGHTHOUSE_PORT's comment:
+            # Lima steals the host's 4242 for a VM's own nebula listener).
+            "listen": {"host": "0.0.0.0", "port": LIGHTHOUSE_PORT if is_lighthouse else NEBULA_PORT},
             "firewall": {
                 "inbound": [_rule_to_dict(r) for r in firewall.inbound],
                 "outbound": [_rule_to_dict(r) for r in firewall.outbound],
@@ -268,7 +288,7 @@ class NebulaManager:
                 else {"use_relays": True, "relays": [lighthouse_ip]}
             )
         if not is_lighthouse:
-            config["static_host_map"] = {lighthouse_ip: [f"{lighthouse_underlay}:{NEBULA_PORT}"]}
+            config["static_host_map"] = {lighthouse_ip: [f"{lighthouse_underlay}:{LIGHTHOUSE_PORT}"]}
             config["lighthouse"]["hosts"] = [lighthouse_ip]
             # Advertise ONLY the vzNAT address to the lighthouse. A Lima VM
             # has three local addresses and two of them poison discovery:
@@ -358,6 +378,28 @@ def sg_rules_to_firewall(permissions: list[dict]) -> FirewallRules:
         if not perm.get("IpRanges") and not perm.get("UserIdGroupPairs"):
             inbound.append(FirewallRule(port=nebula_port, proto=nebula_proto))
     return FirewallRules(inbound=inbound, outbound=[FirewallRule(port="any", proto="any")])
+
+
+def union_firewalls(firewalls: Iterable[FirewallRules]) -> FirewallRules:
+    """The effective firewall for a node carrying SEVERAL security groups.
+
+    AWS's own semantics: security groups are permissive-only (there is no
+    deny rule), so a resource's effective rule set is the UNION of every
+    group attached to it -- W2.6 piece 1, where an EC2 instance's ASSIGNED
+    groups (not merely its VPC's default) compile into its nebula config.
+    De-duplicated (two groups authorizing the identical port/proto/source is
+    one nebula rule, not two) and order-preserving, so the generated config
+    is stable across re-applies. An empty input yields an empty inbound list
+    -- deny-all-inbound, which is exactly what a compiled SG with no ingress
+    rules already means to nebula; the caller decides whether "no groups at
+    all" should instead fall back to something else."""
+    inbound: dict[tuple, FirewallRule] = {}
+    outbound: dict[tuple, FirewallRule] = {}
+    for firewall in firewalls:
+        for side, rules in ((inbound, firewall.inbound), (outbound, firewall.outbound)):
+            for rule in rules:
+                side.setdefault((rule.port, rule.proto, rule.cidr, rule.group), rule)
+    return FirewallRules(inbound=list(inbound.values()), outbound=list(outbound.values()))
 
 
 def _nebula_dir(root: Path, env: str) -> Path:

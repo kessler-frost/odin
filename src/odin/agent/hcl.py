@@ -237,12 +237,32 @@ def _subnet_ref(res: ResourceDesired, refs: Refs) -> str | None:
 
 def _ingress_rules(res: ResourceDesired) -> list[tuple[str, str, str]] | None:
     """Parse the SG node's `ingressRules` field: one rule per line, formatted
-    `protocol:port:cidr` (e.g. `tcp:443:0.0.0.0/0`). Returns (protocol, port,
-    cidr) triples, or None when any non-empty line doesn't fit the format."""
+    `protocol:port:source` (e.g. `tcp:443:0.0.0.0/0`). Returns (protocol, port,
+    source) triples, or None when any non-empty line doesn't fit the format."""
     lines = [line.strip() for line in _field(res, "ingressRules", "").splitlines()]
     parsed = [tuple(line.split(":")) for line in lines if line]
     ok = all(len(p) == 3 and p[1].isdigit() for p in parsed)
     return parsed if ok else None
+
+
+def _ingress_source(source: str, res: ResourceDesired, refs: Refs) -> str | None:
+    """The `source` third of an ingress rule, as an HCL argument line.
+
+    A CIDR (anything with a `/`) stays `cidr_blocks`. ANYTHING ELSE is read as
+    another SG NODE's canvas label and becomes `security_groups` -- the
+    AWS-idiomatic "only the web tier may reach the database" rule (W2.6:
+    `sg_rules_to_firewall` compiles a UserIdGroupPairs rule to a nebula
+    `group:` rule, which nebula matches against the PEER's certificate groups,
+    so this is the one source form that gates by IDENTITY rather than by
+    address -- and overlay addresses are not VPC addresses, so a VPC-CIDR rule
+    could never gate mesh traffic anyway). None = unresolvable, which
+    `_sg` turns into a human reason."""
+    if "/" in source:
+        return f"    cidr_blocks = [{quote(source)}]"
+    if source == res.id:
+        return None  # a self-reference needs TF's `self = true`; not modeled yet
+    kind, name = refs.get(source, ("", ""))
+    return f"    security_groups = [aws_security_group.{name}.id]" if kind == "sg" else None
 
 
 def _s3(res: ResourceDesired, refs: Refs) -> Built:
@@ -332,17 +352,24 @@ def _sg(res: ResourceDesired, refs: Refs) -> Built:
         return _NOT_IN_VPC
     rules = _ingress_rules(res)
     if rules is None:
-        return 'invalid ingress rule — expected one "protocol:port:cidr" per line, e.g. tcp:443:0.0.0.0/0'
+        return 'invalid ingress rule — expected one "protocol:port:source" per line, e.g. tcp:443:0.0.0.0/0'
+    sources = [_ingress_source(source, res, refs) for _protocol, _port, source in rules]
+    if None in sources:
+        bad = [r[2] for r, s in zip(rules, sources, strict=True) if s is None]
+        return (
+            f"ingress rule source {bad[0]!r} is neither a CIDR (like 10.0.0.0/16) "
+            "nor the name of another Security Group node on the canvas"
+        )
     ingress = [
         (
             "  ingress {\n"
             f"    from_port   = {port}\n"
             f"    to_port     = {port}\n"
             f"    protocol    = {quote(protocol)}\n"
-            f"    cidr_blocks = [{quote(cidr)}]\n"
+            f"{source}\n"
             "  }"
         )
-        for protocol, port, cidr in rules
+        for (protocol, port, _source), source in zip(rules, sources, strict=True)
     ]
     return {"name": quote(res.id), "vpc_id": vpc_id}, "\n\n".join([*ingress, _DEFAULT_EGRESS])
 
@@ -749,6 +776,16 @@ def _rds(res: ResourceDesired, refs: Refs) -> Built:
     storage = _field(res, "allocatedStorage", _DEFAULT_ALLOCATED_STORAGE).strip()
     if not storage.isdigit():
         return _BAD_RDS_STORAGE
+    # W2.6: the same `securityGroups` field an ec2 node uses, and the same
+    # builder -- so the SG a canvas draws for its database travels to the
+    # gateway through TERRAFORM (`vpc_security_group_ids`), exactly the way an
+    # instance's does, and shows up in `tofu plan`. The gateway then gates the
+    # real Postgres container's mesh membership with those groups' compiled
+    # firewall (`gateway/models/rdsctl.py::_db_firewall`).
+    sg_ids = _security_group_refs(res, refs)
+    if sg_ids is None:
+        return _BAD_SECURITY_GROUPS
+    nested = f"  vpc_security_group_ids = [{', '.join(sg_ids)}]" if sg_ids else ""
     return {
         "identifier": quote(res.id),
         "engine": quote(engine),
@@ -763,7 +800,7 @@ def _rds(res: ResourceDesired, refs: Refs) -> Built:
         # `final_snapshot_identifier`: the same spirit as s3's `force_destroy`,
         # and what keeps "empty canvas + Apply = full teardown" true.
         "skip_final_snapshot": "true",
-    }, ""
+    }, nested
 
 
 # kind -> terraform resource type; kept separate from _BUILDERS so pass 1 of

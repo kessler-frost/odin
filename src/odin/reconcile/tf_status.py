@@ -50,6 +50,7 @@ simply not projected yet, rather than guessing.
 """
 from __future__ import annotations
 
+from odin.aws.rds import POSTGRES_PORT
 from odin.compute.tasks import TaskRuntime
 from odin.gateway.models import cachectl, elbv2ctl, logsctl, rdsctl, ssmctl
 from odin.gateway.models.ecsctl import sweep_tasks
@@ -219,17 +220,38 @@ def _db_facts(record: dict) -> dict:
     host port, with the instance's real master credentials and its real
     `db_name` (a `POSTGRES_DB` the substrate genuinely creates -- so the path
     in this URL is a database that exists, not a label).
+
+    W2.6 adds a THIRD form, and only when the instance really is on the env's
+    Nebula overlay (`rdsctl._join_mesh` recorded an `overlay_ip`; an env with
+    no VPC drawn has no mesh, and then no mesh key is published at all rather
+    than an empty placeholder):
+
+      - `DATABASE_URL_MESH` / `endpoint_mesh` on the overlay IP and
+        `POSTGRES_PORT` -- the address a drawn security group actually GATES.
+        The port is the container's own 5432, not the published host port,
+        because the mesh sidecar shares the container's network namespace.
+
+    It rides ALONGSIDE the two host forms, never instead of them: the gateway's
+    forwarding, the create waiter's probe, host-side clients and every existing
+    `${{db.DATABASE_URL}}` reference all keep using the published port.
     """
     port = record.get("endpoint_port")
     if not port:
         return {}
     user, password, db = record["master_username"], record["master_password"], record["db_name"]
     addr, vm_addr = f"{CONTAINER_HOST}:{port}", f"{LIMA_HOST}:{port}"
+    overlay_ip = record.get("overlay_ip")
+    mesh_addr = f"{overlay_ip}:{POSTGRES_PORT}" if overlay_ip else None
+    mesh = {
+        "DATABASE_URL_MESH": f"postgresql://{user}:{password}@{mesh_addr}/{db}",
+        "endpoint_mesh": mesh_addr,
+    } if mesh_addr else {}
     return {
         "DATABASE_URL": f"postgresql://{user}:{password}@{addr}/{db}",
         "endpoint": addr,
         "DATABASE_URL_VM": f"postgresql://{user}:{password}@{vm_addr}/{db}",
         "endpoint_vm": vm_addr,
+        **mesh,
     }
 
 
