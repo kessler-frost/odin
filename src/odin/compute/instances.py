@@ -333,6 +333,10 @@ class InstanceVm:
             config = manager.generate_config(
                 lighthouse_ip=network.lighthouse_ip, lighthouse_underlay=underlay,
                 firewall=nebula.firewall or DEFAULT_FIREWALL, is_lighthouse=False, relay_enabled=True,
+                # THIS env's lighthouse port (fabric/nebula.py's B8 note): one
+                # machine-global 4342 meant only one env's lighthouse could
+                # ever bind, so a second env's mesh silently never worked.
+                lighthouse_port=network.lighthouse_port,
             )
             self._lima("shell", name, "--", "sudo", "tee", "/etc/nebula/config.yml", input=config, check=False)
             self._lima("shell", name, "--", "sudo", "systemctl", "enable", "--now", "nebula", check=False)

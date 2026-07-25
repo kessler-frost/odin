@@ -77,6 +77,25 @@ gateway handles is SigV4-verified before it's classified or forwarded —
 there's no equivalent per-request check on the control app, which is why
 its own default is loopback instead.
 
+## Security groups gate the overlay, not the published host port
+
+A drawn security group is real enforcement — a compiled Nebula firewall on
+the mesh — but it governs exactly ONE path: the overlay address odin
+publishes as `DATABASE_URL_MESH` / `endpoint_mesh` (and an EC2 node's
+`MESH_IP`). Every backing also keeps its **published Docker host port**,
+because odin's own probes, the gateway's forwarding and host-side clients all
+ride it, and **nothing gates that port**: any process on your Mac, any
+container that can reach the host, and any EC2 Lima VM (via
+`host.lima.internal:<port>`, which is precisely what the `DATABASE_URL_VM`
+fact hands it) reaches the database with no security group in the path.
+
+Closing the host path would mean making the Mac itself a data-plane mesh
+member — a host `tun` device, i.e. root/sudoers — which odin rejects
+outright. So the honest boundary is: security groups govern traffic between
+drawn resources over the mesh; they do not sandbox your own machine. If you
+want a consumer to be subject to its security group, give it the `*_MESH`
+fact.
+
 ## Secrets
 
 A field like an RDS `password` is stored, and used, in cleartext:
