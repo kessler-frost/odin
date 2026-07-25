@@ -93,6 +93,16 @@ def logs(sink: CaptureSink):
     return _client(sink, "logs")
 
 
+@pytest.fixture
+def secretsmanager(sink: CaptureSink):
+    return _client(sink, "secretsmanager")
+
+
+@pytest.fixture
+def ssm(sink: CaptureSink):
+    return _client(sink, "ssm")
+
+
 def split_url(url: str) -> tuple[str, dict[str, str]]:
     """path + query dict for classify(), preserving bare markers with no
     `=` (`?location`, `?uploads`, `?acl`, `?delete`) that `parse_qsl` drops
