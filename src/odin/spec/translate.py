@@ -17,16 +17,18 @@ _REF = re.compile(r"^\$\{\{\s*([\w-]+)\.([\w-]+)\s*\}\}$")
 # are AWS-shaped resources provisioned in per-env backing containers.
 # vpc/subnet/sg are the V1 network containers: their containment-stamped
 # data.vpc/data.subnet fields flow through `_resource` like any other field.
-# iam_role/ecr (V2c), ec2 (V3c), lambda (V4c), and ecs (V5c) are pure
-# gateway-model kinds like vpc/subnet/sg -- no reconciler-driven provisioning
-# at all (plan.py NoOps them; see reconcile/plan.py + aws/backings.py::
-# ENSURE_KINDS), just fields flowing through generically for hcl.py's
-# builders to read. ec2's REAL lifecycle (a Lima VM) is driven entirely by
-# the gateway's RunInstances handler (gateway/models/ec2compute.py) once
-# `tofu apply` reaches it; lambda's (a per-function RIE container) the same
-# way via CreateFunction (gateway/models/lambdactl.py); ecs's (per-task
-# Colima containers) via CreateService/UpdateService
-# (gateway/models/ecsctl.py) -- the reconciler never touches any of them,
+# iam_role/ecr (V2c), ec2 (V3c), lambda (V4c), ecs (V5c), and logs (W2.1) are
+# pure gateway-model kinds like vpc/subnet/sg -- no reconciler-driven
+# provisioning at all (plan.py NoOps them; see reconcile/plan.py +
+# aws/backings.py::ENSURE_KINDS), just fields flowing through generically for
+# hcl.py's builders to read. ec2's REAL lifecycle (a Lima VM) is driven
+# entirely by the gateway's RunInstances handler
+# (gateway/models/ec2compute.py) once `tofu apply` reaches it; lambda's (a
+# per-function RIE container) the same way via CreateFunction
+# (gateway/models/lambdactl.py); ecs's (per-task Colima containers) via
+# CreateService/UpdateService (gateway/models/ecsctl.py); logs' (a group +
+# streams + events in a per-env JSON sidecar) via CreateLogGroup
+# (gateway/models/logsctl.py) -- the reconciler never touches any of them,
 # same as vpc/subnet/sg.
 _KIND = {
     "rds": "rds",
@@ -42,6 +44,7 @@ _KIND = {
     "ec2": "ec2",
     "lambda": "lambda",
     "ecs": "ecs",
+    "logs": "logs",
 }
 
 

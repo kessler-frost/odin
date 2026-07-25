@@ -172,12 +172,22 @@ export const CATALOG: ServiceDef[] = [
     defaultData: { label: 'new-param', paramValue: 'changeme' },
     iamActions: ['ssm:GetParameter', 'ssm:GetParameters', 'ssm:*'],
   },
+  // W2.1: real CloudWatch Logs -- the node's Name IS the log group name (the
+  // gateway classifies every logs:* call by bare group name, so an IAM edge
+  // only enforces while the two match). Retention is left blank by default =
+  // AWS's own "never expire"; a value is emitted as `retention_in_days`.
   {
     type: 'logs', abbr: 'LOG', label: 'Log Group', sublabel: 'CloudWatch Logs',
     category: 'Monitoring', color: 'amber', width: 200,
-    fields: [{ key: 'label', label: 'Name', editable: true }, { key: 'arn', label: 'ARN' }],
-    defaultData: { label: '/odin/logs', arn: '' },
-    iamActions: ['logs:CreateLogStream', 'logs:PutLogEvents', 'logs:*'],
+    fields: [
+      { key: 'label', label: 'Name', editable: true },
+      { key: 'retentionInDays', label: 'Retention (days)', editable: true },
+    ],
+    defaultData: { label: '/odin/logs', retentionInDays: '' },
+    iamActions: [
+      'logs:CreateLogStream', 'logs:PutLogEvents', 'logs:GetLogEvents',
+      'logs:FilterLogEvents', 'logs:DescribeLogStreams', 'logs:*',
+    ],
   },
   {
     type: 'events', abbr: 'EVT', label: 'EventBridge', sublabel: 'Event rule',

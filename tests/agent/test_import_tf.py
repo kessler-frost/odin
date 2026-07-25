@@ -72,12 +72,12 @@ def test_grid_positions_are_on_the_20px_grid_in_220px_steps():
 
 
 def test_unsupported_type_never_dropped_even_when_alone():
-    result = parse_hcl_text('resource "aws_cloudwatch_log_group" "logs" {\n  name = "logs"\n}\n')
+    result = parse_hcl_text('resource "aws_elasticache_cluster" "cache" {\n  cluster_id = "cache"\n}\n')
     assert result.nodes == []
     assert result.edges == []
     assert len(result.unsupported) == 1
-    assert result.unsupported[0].type == "aws_cloudwatch_log_group"
-    assert result.unsupported[0].name == "logs"
+    assert result.unsupported[0].type == "aws_elasticache_cluster"
+    assert result.unsupported[0].name == "cache"
     assert "not supported" in result.unsupported[0].reason
 
 
@@ -107,7 +107,7 @@ def test_malformed_hcl_sets_parse_error_not_unsupported():
 
 
 def test_valid_file_with_only_unsupported_resources_has_no_parse_error():
-    result = parse_hcl_text('resource "aws_cloudwatch_log_group" "logs" {\n  name = "logs"\n}\n')
+    result = parse_hcl_text('resource "aws_elasticache_cluster" "cache" {\n  cluster_id = "cache"\n}\n')
     assert result.parse_error is None
     assert len(result.unsupported) == 1
 
@@ -189,6 +189,42 @@ def test_round_trip_preserves_composite_key_and_tags():
     assert '"Env"       = "prod"' in regenerated
     # iam_role survives as an aws_iam_role
     assert 'resource "aws_iam_role" "exec"' in regenerated
+
+
+# --- logs (W2.1): aws_cloudwatch_log_group <-> the `logs` canvas kind --------
+
+
+_LOGS_TF = '''
+resource "aws_cloudwatch_log_group" "app" {
+  name              = "/odin/app"
+  retention_in_days = 14
+}
+
+resource "aws_cloudwatch_log_group" "forever" {
+  name = "/odin/forever"
+}
+'''
+
+
+def test_log_group_imports_as_a_logs_node_with_the_group_name_as_its_label():
+    result = parse_hcl_text(_LOGS_TF)
+    by_id = {n["id"]: n for n in result.nodes}
+    assert set(by_id) == {"/odin/app", "/odin/forever"}
+    assert by_id["/odin/app"]["type"] == "logs"
+    assert by_id["/odin/app"]["data"]["retentionInDays"] == "14"
+    # No retention on the wire = AWS's "never expire"; the canvas field stays unset.
+    assert "retentionInDays" not in by_id["/odin/forever"]["data"]
+    assert result.unsupported == []
+    assert result.warnings == []
+
+
+def test_log_group_round_trip_reproduces_name_and_retention():
+    imported = parse_hcl_text(_LOGS_TF)
+    regenerated = generate_tf(canvas_to_stack({"nodes": imported.nodes, "edges": imported.edges})).files["main.tf"]
+    assert 'name              = "/odin/app"' in regenerated
+    assert "retention_in_days = 14" in regenerated
+    assert 'name = "/odin/forever"' in regenerated
+    assert regenerated.count("retention_in_days") == 1  # the never-expire group stays unset
 
 
 def test_bucket_with_computed_name_falls_back_to_hcl_resource_name_as_label():

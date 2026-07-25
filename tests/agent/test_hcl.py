@@ -6,7 +6,7 @@ import shutil
 import subprocess
 import zipfile
 
-from odin.agent.hcl import generate_tf
+from odin.agent.hcl import generate_tf, resource_attrs, resource_set, unquote
 from odin.spec.models import FieldValue, ResourceDesired, Stack
 from odin.spec.translate import canvas_to_stack
 
@@ -675,6 +675,78 @@ def test_ecs_with_non_numeric_port_lands_in_unsupported():
     assert "aws_ecs_service" not in proj.files["main.tf"]
 
 
+# --- logs (W2.1) -------------------------------------------------------------
+
+
+def test_logs_emits_the_group_name_and_the_odin_node_tag():
+    # The canvas label IS the log group name -- the gateway classifies every
+    # logs:* call by bare group name, so an IAM edge drawn to this node only
+    # enforces while the two are the same string.
+    stack = Stack(resources=(ResourceDesired(id="/odin/app", kind="logs"),))
+    proj = generate_tf(stack)
+    main_tf = proj.files["main.tf"]
+    assert 'resource "aws_cloudwatch_log_group" "_odin_app"' in main_tf
+    assert '  name = "/odin/app"' in main_tf
+    assert '"odin:node" = "/odin/app"' in main_tf
+    assert proj.unsupported == []
+
+
+def test_logs_without_a_retention_field_omits_retention_in_days():
+    # AWS's own default is "never expire" -- an invented number would silently
+    # start deleting the user's logs.
+    main_tf = generate_tf(Stack(resources=(ResourceDesired(id="app-logs", kind="logs"),))).files["main.tf"]
+    assert "retention_in_days" not in main_tf
+
+
+def test_logs_retention_field_becomes_retention_in_days():
+    stack = Stack(resources=(ResourceDesired(id="app-logs", kind="logs", fields=_fields(retentionInDays="14")),))
+    main_tf = generate_tf(stack).files["main.tf"]
+    assert 'name              = "app-logs"' in main_tf
+    assert "retention_in_days = 14" in main_tf
+
+
+def test_logs_with_non_numeric_retention_lands_in_unsupported():
+    stack = Stack(resources=(ResourceDesired(id="app-logs", kind="logs", fields=_fields(retentionInDays="two weeks")),))
+    proj = generate_tf(stack)
+    assert proj.unsupported == ["app-logs (logs): retentionInDays must be a whole number of days (e.g. 14)"]
+    assert "aws_cloudwatch_log_group" not in proj.files["main.tf"]
+
+
+def test_logs_with_fractional_retention_lands_in_unsupported():
+    stack = Stack(resources=(ResourceDesired(id="app-logs", kind="logs", fields=_fields(retentionInDays="14.5")),))
+    proj = generate_tf(stack)
+    assert proj.unsupported == ["app-logs (logs): retentionInDays must be a whole number of days (e.g. 14)"]
+
+
+def test_logs_block_parses_back_as_a_log_group_resource():
+    # Zero-drift structural check: S3b's guardrail compares the skeleton's
+    # resource SET against the agent's refinement, so a logs block must read
+    # back through parse_tf under the identity generate_tf assigned it.
+    stack = Stack(resources=(ResourceDesired(id="app-logs", kind="logs", fields=_fields(retentionInDays="14")),))
+    files = generate_tf(stack).files
+    assert ("aws_cloudwatch_log_group", "app_logs") in resource_set(files)
+    attrs = resource_attrs(files)[("aws_cloudwatch_log_group", "app_logs")]
+    assert unquote(attrs["name"]) == "app-logs"
+    assert attrs["retention_in_days"] == 14  # hcl2 parses an unquoted number as an int
+
+
+def test_tofu_fmt_accepts_logs_output(tmp_path):
+    tofu = shutil.which("tofu")
+    if tofu is None:
+        return  # skip cleanly -- no tofu on PATH in this environment
+    stack = Stack(resources=(
+        ResourceDesired(id="/odin/app", kind="logs", fields=_fields(retentionInDays="14")),
+        ResourceDesired(id="app-logs", kind="logs"),  # the no-retention (single-attr) shape too
+    ))
+    main_tf = tmp_path / "main.tf"
+    main_tf.write_text(generate_tf(stack).files["main.tf"])
+    result = subprocess.run(
+        [tofu, "fmt", "-check", "-diff", str(main_tf)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 # --- odin:node tagging (fix-wave 2b finding #2 prerequisite) ---------------
 #
 # Every primary node-backed resource carries `tags = { "odin:node" = <label> }`
@@ -702,7 +774,7 @@ def test_vpc_subnet_and_ec2_get_the_odin_node_tag():
     assert '"odin:node" = "server"' in ec2_block
 
 
-def test_s3_sqs_sns_dynamodb_sg_iam_role_ecr_lambda_ecs_all_get_the_tag():
+def test_every_named_kind_with_a_builder_gets_the_tag():
     stack = Stack(resources=(
         ResourceDesired(id="uploads", kind="s3"),
         ResourceDesired(id="jobs", kind="sqs"),
@@ -714,9 +786,11 @@ def test_s3_sqs_sns_dynamodb_sg_iam_role_ecr_lambda_ecs_all_get_the_tag():
         ResourceDesired(id="app-image", kind="ecr"),
         ResourceDesired(id="fn1", kind="lambda", fields=_fields(role="lambda-exec")),
         ResourceDesired(id="svc", kind="ecs"),
+        ResourceDesired(id="app-logs", kind="logs"),
     ))
     main_tf = generate_tf(stack).files["main.tf"]
-    for label in ("uploads", "jobs", "alerts", "items", "web-sg", "lambda-exec", "app-image", "fn1", "svc"):
+    for label in ("uploads", "jobs", "alerts", "items", "web-sg", "lambda-exec",
+                  "app-image", "fn1", "svc", "app-logs"):
         assert f'"odin:node" = "{label}"' in main_tf, label
     assert '"odin:node" = "net"' in main_tf
 

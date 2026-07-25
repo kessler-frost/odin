@@ -528,6 +528,28 @@ def _ecs_container_definitions(res: ResourceDesired) -> list[dict]:
     }]
 
 
+# W2.1: CloudWatch log groups (gateway/models/logsctl.py -- odin's one log
+# SINK, control plane + data plane, no backing container). The canvas label IS
+# the log group name, deliberately: `classify.py`'s `_classify_logs` reports
+# the bare group name as the IAM resource, so a `logs:PutLogEvents` edge drawn
+# to this node only enforces correctly while name == label (the same identity
+# rule s3's bucket / sqs's queue name already carry).
+_BAD_LOGS_RETENTION = "retentionInDays must be a whole number of days (e.g. 14)"
+
+
+def _logs(res: ResourceDesired, refs: Refs) -> Built:
+    # No retention field = no `retention_in_days` argument at all, which is
+    # AWS's own "never expire" default -- emitting a made-up number instead
+    # would silently expire a user's logs.
+    retention = _field(res, "retentionInDays", "").strip()
+    if retention and not retention.isdigit():
+        return _BAD_LOGS_RETENTION
+    attrs = {"name": quote(res.id)}
+    if retention:
+        attrs["retention_in_days"] = retention
+    return attrs, ""
+
+
 # kind -> terraform resource type; kept separate from _BUILDERS so pass 1 of
 # generate_tf can assign HCL names (scoped per resource type) without running
 # any builder.
@@ -544,6 +566,7 @@ _TF_TYPES = {
     "ec2": "aws_instance",
     "lambda": "aws_lambda_function",
     "ecs": "aws_ecs_service",
+    "logs": "aws_cloudwatch_log_group",
 }
 
 _BUILDERS = {
@@ -559,6 +582,7 @@ _BUILDERS = {
     "ec2": _ec2,
     "lambda": _lambda,
     "ecs": _ecs,
+    "logs": _logs,
 }
 
 

@@ -1,11 +1,11 @@
 """Fix-wave 2b finding #1 -- a pure, read-only projection of the TF-owned
-resource kinds (vpc/subnet/sg/ec2/ecs/lambda/iam_role/ecr: the kinds
+resource kinds (vpc/subnet/sg/ec2/ecs/lambda/iam_role/ecr/logs: the kinds
 `agent/hcl.py` can build and only `tofu apply`/`tofu destroy` ever
 creates/destroys -- s3/sqs/sns/dynamodb are excluded, those already get real
 World entries via the reconciler's own PROVISIONED path in plan.py) from the
 gateway's synth stores into `label -> (kind, phase, facts, verdict)`.
 
-Before this fix these 8 kinds never entered World at all: the canvas showed
+Before this fix these kinds never entered World at all: the canvas showed
 a permanently stale DRAFT badge even once tofu had a real VM/service/
 function/role/repo/network up. `Reconciler.tick()` calls `project()` once
 per tick (see reconcile/reconciler.py) and diffs the result against the
@@ -30,8 +30,9 @@ Label resolution is uniform across every kind: prefer the `odin:node` tag
 `agent/hcl.py::_tags_block` stamps on every canvas-node-backed resource,
 falling back to the resource's own AWS-native name field where one exists
 (sg's GroupName, iam_role's RoleName, ecr's repositoryName, lambda's
-FunctionName, ecs's serviceName -- all of which already equal the canvas
-label by construction, per hcl.py's own builders) -- vpc/subnet/ec2 have NO
+FunctionName, ecs's serviceName, a log group's logGroupName -- all of which
+already equal the canvas label by construction, per hcl.py's own builders and
+`classify.py`'s LOGS note) -- vpc/subnet/ec2 have NO
 such native field (real CreateVpc/CreateSubnet/RunInstances take no `Name`
 argument), so the tag is their ONLY route back to a label; an untagged
 vpc/subnet/ec2 (e.g. a resource applied before this feature existed) is
@@ -40,10 +41,11 @@ simply not projected yet, rather than guessing.
 from __future__ import annotations
 
 from odin.compute.tasks import TaskRuntime
+from odin.gateway.models import logsctl
 from odin.gateway.models.ecsctl import sweep_tasks
 from odin.gateway.stores import SynthStores
 
-TF_OWNED_KINDS = frozenset({"vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr"})
+TF_OWNED_KINDS = frozenset({"vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr", "logs"})
 
 # EC2's real instance-state machine (gateway/models/ec2compute.py's own
 # `_STATE_CODES` keys) -> the World Phase enum. `terminated` is deliberately
@@ -108,6 +110,30 @@ def _ecr_repos(stores: SynthStores, env: str) -> Projected:
         label = _label(tags, record["repository_name"])
         if label:
             out[label] = ("ecr", "healthy", {}, None)
+    return out
+
+
+def _log_groups(stores: SynthStores, env: str) -> Projected:
+    out: Projected = {}
+    for key, record in stores.logsctl.items(env).items():
+        if not key.startswith("group:"):
+            continue
+        # An `auto` group was created by SUBSTRATE log shipping (a lambda
+        # invoke's `/aws/lambda/{fn}`, an ecs task sweep -- logsctl.py's
+        # `ensure_group`), never by tofu from a canvas `logs` node. Projecting
+        # it would strand a phantom World resource the canvas never drew and
+        # nothing can ever prune: no Stack resource matches that label, so it
+        # would sit in /world forever -- the same failure mode as a projected
+        # `terminated` instance below. A real CreateLogGroup ADOPTS an auto
+        # group and clears the flag (logsctl.py's deviation 2), so the moment
+        # the canvas does own the group it starts projecting.
+        if record.get("auto"):
+            continue
+        name = record["log_group_name"]
+        tags = stores.tags.get(env, f"logs:{logsctl.group_arn(name)}", {})
+        label = _label(tags, name)
+        if label:
+            out[label] = ("logs", "healthy", {}, None)
     return out
 
 
@@ -220,6 +246,7 @@ def project(stores: SynthStores, env: str, ecs_runtime: TaskRuntime | None = Non
     out.update(_vpc_subnet_sg(stores, env))
     out.update(_iam_roles(stores, env))
     out.update(_ecr_repos(stores, env))
+    out.update(_log_groups(stores, env))
     out.update(_ec2_instances(stores, env))
     out.update(_lambda_functions(stores, env))
     out.update(_ecs_services(stores, env, ecs_runtime))
