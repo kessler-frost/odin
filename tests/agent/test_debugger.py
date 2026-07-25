@@ -274,6 +274,56 @@ def test_the_prompt_itself_carries_no_secret():
     assert "busybox:latest" in prompt  # non-sensitive evidence is still shown, unredacted
 
 
+# --- field test 2 finding #8: ids odin has never heard of --------------------
+
+
+def test_an_id_with_no_record_anywhere_is_flagged_unknown():
+    context = _context(node_ids=("db", "d1"))
+    assert context["unknown_nodes"] == ["d1"]
+    assert context["known_nodes"] == ["api", "db"]
+
+
+def test_an_observed_or_event_only_id_counts_as_known():
+    # "Selected but not in the applied stack" is the deliberate desired-None
+    # case, NOT an unknown id: World and the event log are records too.
+    world = World(env="dbg", resources=(ResourceObserved(id="gone", kind="ecs", phase="crashed"),))
+    events = [{"type": "access_denied", "env": "dbg", "resource_id": "principal"}]
+    context = assemble_context(Stack(env="dbg"), world, events, _logs, ["gone", "principal"])
+    assert context["unknown_nodes"] == []
+    assert context["nodes"]["gone"]["desired"] is None
+
+
+def test_the_refusal_names_every_unknown_id_and_the_labels_that_do_exist():
+    context = _context(node_ids=("d1", "e1"))
+    answer = debugger.no_evidence_answer(context, ["d1", "e1"])
+    assert answer["suspects"] == []
+    assert "'d1'" in answer["answer"] and "'e1'" in answer["answer"]
+    assert "no such node" in answer["answer"] and "env 'dbg'" in answer["answer"]
+    assert "api, db" in answer["answer"]
+
+
+def test_a_request_with_one_real_id_is_worth_a_model_call():
+    context = _context(node_ids=("db", "d1"))
+    assert debugger.no_evidence_answer(context, ["db", "d1"]) is None
+
+
+def test_an_empty_selection_is_an_env_wide_question_not_a_refusal():
+    # `node_ids: []` + a failed apply in `recent_tf` is a legitimate
+    # "what's wrong with this environment?" -- there is nothing to refuse.
+    context = _context(node_ids=())
+    assert debugger.no_evidence_answer(context, []) is None
+
+
+def test_the_refusal_says_so_plainly_when_the_env_has_nothing_applied():
+    context = assemble_context(Stack(env="dbg"), World(env="dbg"), [], _logs, ["d1"])
+    answer = debugger.no_evidence_answer(context, ["d1"])
+    assert "no applied nodes at all" in answer["answer"]
+
+
+def test_the_prompt_tells_the_agent_to_call_out_unknown_ids():
+    assert "unknown_nodes" in debugger._SYSTEM
+
+
 # --- field test 2 finding #6: credentials odin ISSUED, not ones it was given --
 
 ISSUED_ACCESS = "AKODINFAKEFAKEFAKEFA"

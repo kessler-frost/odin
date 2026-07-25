@@ -133,7 +133,12 @@ def create_debug_router(
         context = await asyncio.to_thread(
             build_context, store, stores, runtime, ws_manager, body.env, body.node_ids,
         )
-        result = await (diagnose or debugger.diagnose)(context, body.question or DEFAULT_QUESTION)
+        # Every selected id unknown to odin => an honest answer naming them,
+        # and NO model call: there is no evidence, so the only thing a run
+        # could produce is confident noise (field test 2 finding #8).
+        result = debugger.no_evidence_answer(context, body.node_ids) or await (
+            diagnose or debugger.diagnose
+        )(context, body.question or DEFAULT_QUESTION)
         return DebugResponse(
             env=body.env,
             answer=str(result.get("answer", "")),

@@ -252,6 +252,54 @@ def _log_tail(text: str) -> str:
     return "\n".join(text.strip().splitlines()[-MAX_LOG_LINES:])
 
 
+def known_node_ids(stack: Stack, world: World, events: list[dict]) -> list[str]:
+    """Every node id odin has ANY record of in this env: desired in the applied
+    Stack, observed in World, or named by an event. Deliberately the UNION and
+    not just the Stack -- a node removed from the canvas but still observed, and
+    a node that only ever appeared in an `access_denied` event, are both real
+    things to ask about."""
+    ids = {r.id for r in stack.resources} | {r.id for r in world.resources}
+    ids |= {node for node in (_event_node(e) for e in events) if node}
+    return sorted(ids)
+
+
+def no_evidence_answer(context: dict[str, Any], node_ids: list[str]) -> dict[str, Any] | None:
+    """The honest refusal for a request in which EVERY selected id is unknown to
+    odin -- and None when at least one id has real evidence behind it, which is
+    when a model call is worth making.
+
+    Field test 2 finding #8: called with canvas node ids (`d1`, `e1`, `e2`)
+    instead of labels, this route spent 52 seconds and a real model call to
+    produce a confident four-paragraph analysis of nodes that do not exist,
+    listing three of them as suspects, and never said so. `odin logs
+    nosuchnode` gets this right (exit 1, "no such node"), and the UI always
+    sends labels, so this only ever bit API and agent callers.
+
+    A MIXED request still runs: the known ids have evidence worth explaining,
+    and `unknown_nodes` rides into the prompt (see `_SYSTEM`) so the answer
+    names the ids odin has never heard of rather than inventing findings for
+    them."""
+    unknown = context["unknown_nodes"]
+    requested = list(dict.fromkeys(node_ids))
+    if not requested or len(unknown) != len(requested):
+        return None
+    known = context["known_nodes"]
+    names = ", ".join(repr(node) for node in unknown)
+    catalogue = (
+        f"this environment's nodes are: {', '.join(known)}." if known
+        else "this environment has no applied nodes at all yet -- nothing has been applied."
+    )
+    return {
+        "answer": (
+            f"no such node {names} in env {context['env']!r}: not in the applied stack, not in the "
+            f"observed world, and named by no event, so there is nothing to diagnose. Nodes are "
+            f"identified by their canvas LABEL (what `odin world` lists), not by a canvas/ReactFlow "
+            f"node id -- {catalogue}"
+        ),
+        "suspects": [],
+    }
+
+
 def assemble_context(
     stack: Stack, world: World, events: list[dict], logs: Callable[[str], str], node_ids: list[str],
     extra_secrets: frozenset[str] = frozenset(),
@@ -266,6 +314,13 @@ def assemble_context(
     already removed, and its last observed state + logs are exactly what
     explains where it went. Beyond `MAX_NODES` the extra ids are named in
     `omitted_nodes` rather than silently dropped.
+
+    `unknown_nodes` / `known_nodes` are the honesty pair that tells apart "on
+    the canvas but not in the applied stack" (a record with `desired: None`,
+    deliberate, above) from "odin has never heard of this id at all" -- the
+    field-test case of a caller sending canvas node ids instead of labels. The
+    model is TOLD which selected ids have no evidence behind them, and
+    `no_evidence_answer` skips the model call entirely when none of them do.
 
     `recent_tf` is the one ENV-level section: the last `MAX_TF_LINES` lines of
     tofu's own apply/destroy output, which belong to no node at all (see
@@ -297,8 +352,11 @@ def assemble_context(
         }
         for node_id in selected
     }
+    known = known_node_ids(stack, world, events)
     return {
         "env": stack.env, "nodes": nodes, "omitted_nodes": omitted,
+        "unknown_nodes": [node_id for node_id in unique if node_id not in known],
+        "known_nodes": known[:MAX_NODES],
         "recent_tf": _sanitize(_tf_lines(events), secrets),
     }
 
@@ -325,6 +383,9 @@ _SYSTEM = (
     "`tofu apply`/`destroy` output, which belongs to the whole environment rather "
     "than to any one node. Read it first when it ends in a failure -- an apply "
     "that failed is often the whole answer, and its error names the resource. "
+    "`unknown_nodes` lists selected ids odin has NO record of (not desired, not "
+    "observed, in no event). Say plainly that those ids do not exist in this "
+    "environment -- `known_nodes` is what does -- and never invent findings for them. "
     "Answer in plain English, in a few sentences, and ground every claim in that "
     "evidence -- quote the exit code, the verdict, or the log line that shows it. "
     "If the evidence does not explain the failure, say so plainly instead of "
