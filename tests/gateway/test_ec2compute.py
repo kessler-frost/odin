@@ -22,6 +22,7 @@ import pytest
 from botocore.parsers import create_parser
 from starlette.responses import Response
 
+from odin.compute.instances import instance_membership_path
 from odin.fabric.models import FirewallRule
 from odin.gateway.classify import classify
 from odin.gateway.keys import KeyStore
@@ -681,6 +682,104 @@ def test_ensure_instance_mesh_skips_instances_with_no_running_vm_to_talk_to(sink
 
     assert ec2compute.ensure_instance_mesh(stores, ENV, vm) == {}
     assert vm.refreshed == []
+
+
+# --- the membership revision: a revoke reaching flows already open ----------
+
+
+def test_membership_revision_moves_only_when_a_members_groups_move(sink, ec2, stores):
+    """Field test 4's number, and its whole contract in one place.
+
+    It has to change when someone's certificate groups change -- that is what
+    makes an admitting member's reload COUNT, and therefore what closes the
+    session a revoked client already had open. And it has to be STABLE
+    otherwise, because every mesh member in the env renders it: a value that
+    drifted on its own would SIGHUP every VM and every database on every
+    Apply, which is precisely the churn the no-op path exists to avoid.
+
+    Editing an SG's RULES deliberately does not move it. Rules travel in the
+    config on their own and are re-validated by the same reload; membership
+    cannot, because it lives in a certificate."""
+    vpc_id = _create_vpc(stores, sink, ec2)
+    subnet_id = _create_subnet(stores, sink, ec2, vpc_id)
+    web_sg = _create_sg(stores, sink, ec2, vpc_id, name="web-sg")
+    admin_sg = _create_sg(stores, sink, ec2, vpc_id, name="admin-sg")
+
+    vm = RefreshingInstanceVm()
+    parsed = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, SecurityGroupIds=[web_sg])
+    instance_id = parsed["Instances"][0]["InstanceId"]
+    _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+
+    revision = ec2compute.membership_revision(stores, ENV)
+    assert revision == ec2compute.membership_revision(stores, ENV), "a re-read must not move it"
+
+    _authorize(stores, sink, ec2, web_sg, 8080)
+    assert ec2compute.membership_revision(stores, ENV) == revision, (
+        "a RULE edit is not a membership change -- it must not churn every member in the env"
+    )
+
+    record = stores.ec2compute.get(ENV, f"instance:{instance_id}")
+    record["security_group_ids"] = [admin_sg]  # THE revoke
+    assert ec2compute.membership_revision(stores, ENV) != revision
+
+
+def test_ensure_instance_mesh_hands_every_vm_the_same_revision(sink, ec2, stores):
+    """One env, one number: the admitting member's reload is only meaningful
+    against the SAME roster the revoked member was re-signed from. Computing it
+    per-VM inside the loop would make an Apply's outcome depend on which VM
+    happened to be refreshed first."""
+    vpc_id = _create_vpc(stores, sink, ec2)
+    subnet_id = _create_subnet(stores, sink, ec2, vpc_id)
+    web_sg = _create_sg(stores, sink, ec2, vpc_id, name="web-sg")
+
+    vm = RefreshingInstanceVm()
+    for _ in range(2):
+        parsed = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, SecurityGroupIds=[web_sg])
+        _wait_for_state(stores, sink, ec2, parsed["Instances"][0]["InstanceId"], "running", vm)
+
+    ec2compute.ensure_instance_mesh(stores, ENV, vm)
+    revisions = {nebula.revision for _name, nebula in vm.refreshed}
+    assert len(vm.refreshed) == 2
+    assert revisions == {ec2compute.membership_revision(stores, ENV)}
+    assert "" not in revisions
+
+
+def test_ensure_instance_mesh_recertifies_a_moved_instance_before_the_others(sink, ec2, stores, tmp_path):
+    """The ordering half of field test 4, and it is not cosmetic.
+
+    An admitting member closes an already-open flow by re-checking it against
+    the PEER'S CURRENT certificate. So an instance that merely reloads must not
+    be reached until the instance whose membership MOVED is holding its new
+    identity -- otherwise the admitter re-validates against the old cert,
+    decides the flow is still fine, and stamps it as current: the revoke then
+    misses that flow entirely, and no later Apply revisits it (the revision has
+    already settled).
+
+    `membership_changed` is the cheap local-file test that orders the loop."""
+    vpc_id = _create_vpc(stores, sink, ec2)
+    subnet_id = _create_subnet(stores, sink, ec2, vpc_id)
+    web_sg = _create_sg(stores, sink, ec2, vpc_id, name="web-sg")
+    admin_sg = _create_sg(stores, sink, ec2, vpc_id, name="admin-sg")
+
+    vm = RefreshingInstanceVm()
+    ids = []
+    for _ in range(3):
+        parsed = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, SecurityGroupIds=[web_sg])
+        ids.append(parsed["Instances"][0]["InstanceId"])
+        _wait_for_state(stores, sink, ec2, ids[-1], "running", vm)
+    # Everyone is up to date on disk except the LAST one, which the canvas just
+    # moved out of web-sg -- i.e. the one member whose cert has to be re-issued.
+    for instance_id in ids:
+        instance_membership_path(stores.root, ENV, instance_id).parent.mkdir(parents=True, exist_ok=True)
+        instance_membership_path(stores.root, ENV, instance_id).write_text(json.dumps(sorted(["ec2", web_sg])))
+    moved = ids[-1]
+    stores.ec2compute.get(ENV, f"instance:{moved}")["security_group_ids"] = [admin_sg]
+
+    vm.refreshed.clear()
+    ec2compute.ensure_instance_mesh(stores, ENV, vm)
+    order = [nebula.host_id for _name, nebula in vm.refreshed]
+    assert order[0] == moved, f"the re-certified instance must go first, got {order}"
+    assert sorted(order) == sorted(ids)
 
 
 def test_terminate_last_vpc_instance_stops_the_lighthouse(sink, ec2, stores, monkeypatch):

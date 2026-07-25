@@ -460,7 +460,15 @@ def test_a_restarted_sidecar_pokes_its_peers_to_re_handshake(tmp_path):
     ((sidecar, script),) = runtime.probes
     assert sidecar == f"{TARGET}-mesh"
     assert "ping -c 1 -W 1 10.42.1." in script
-    assert "/sys/class/net/nebula1" in script, "wait for the daemon's own tun before poking"
+    # Waits for the daemon's own tun before poking -- and for BOTH candidate
+    # names. The device is `tun0` on every member odin actually runs (measured
+    # inside a live EC2 VM and a live sidecar alike), so a check that only
+    # looked for `nebula1` sat out its full timeout every single time.
+    assert "/sys/class/net/tun*" in script and "/sys/class/net/nebula*" in script
+    assert 'for d in ' in script and '[ -d "$d" ] && break 2' in script, (
+        "every candidate must be tested: an unmatched glob stays literal, so testing only the "
+        "first would let `nebula*` mask the `tun*` that is really there"
+    )
 
 
 def test_a_lone_member_has_nobody_to_poke(tmp_path):

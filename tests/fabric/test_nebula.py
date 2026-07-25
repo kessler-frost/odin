@@ -17,10 +17,12 @@ from odin.fabric.localhost import Unresolved
 from odin.fabric.models import CertPaths, FirewallRule, FirewallRules, MeshNetwork
 from odin.fabric.nebula import (
     DEFAULT_FIREWALL,
+    FIREWALL_REVISION_KEY,
     LighthouseManager,
     NebulaFabric,
     NebulaManager,
     ensure_network,
+    firewall_only_change,
     mesh_state,
     sg_rules_to_firewall,
     union_firewalls,
@@ -109,6 +111,50 @@ def test_generate_config_shape(tmp_path):
     assert light["listen"] == {"host": "0.0.0.0", "port": 4342}, "the host lighthouse owns a port no guest listens on"
     assert "local_allow_list" not in light["lighthouse"]  # lighthouse advertises nothing anyway (no tun)
     assert "tun" not in light  # tun_disabled defaults False even for a lighthouse
+
+
+def test_the_firewall_revision_is_rendered_inside_the_block_nebula_reloads(tmp_path):
+    """Field test 4. The value has to sit INSIDE `firewall`, because that is
+    the only section `reloadFirewall` hashes -- a key one level up would leave
+    the daemon answering "No firewall config change detected" and the ruleset
+    version parked, which is the whole thing that lets an already-open flow
+    survive a revoke.
+
+    Measured against the shipped nebula 1.10.3, one SIGHUP with only this key
+    changed: `New firewall has been installed ... rulesVersion=1` with
+    firewallHashes EQUAL to oldFirewallHashes -- same rules, new version."""
+    mgr = NebulaManager(tmp_path / "nebula", runner=FakeRunner())
+    config = yaml.safe_load(mgr.generate_config(
+        "10.42.0.1", "192.168.1.10", DEFAULT_FIREWALL, firewall_revision="roster-7",
+    ))
+    assert config["firewall"][FIREWALL_REVISION_KEY] == "roster-7"
+    assert config["firewall"]["inbound"] == [{"port": "any", "proto": "any", "host": "any"}]
+
+
+def test_no_revision_renders_the_config_byte_identically_to_before(tmp_path):
+    """Shipping this must not itself churn a single member: an env that has
+    never seen a membership change renders exactly the bytes it always did."""
+    mgr = NebulaManager(tmp_path / "nebula", runner=FakeRunner())
+    plain = mgr.generate_config("10.42.0.1", "192.168.1.10", DEFAULT_FIREWALL)
+    assert plain == mgr.generate_config("10.42.0.1", "192.168.1.10", DEFAULT_FIREWALL, firewall_revision="")
+    assert FIREWALL_REVISION_KEY not in plain
+
+
+def test_firewall_only_change_sees_the_revision_as_reloadable(tmp_path):
+    """The revision moves far more often than a rule does (any membership
+    change anywhere in the env), so it MUST classify as reloadable -- if it
+    read as "restart", every member would drop every tunnel it holds each time
+    anyone's groups moved."""
+    mgr = NebulaManager(tmp_path / "nebula", runner=FakeRunner())
+    before = mgr.generate_config("10.42.0.1", "192.168.1.10", DEFAULT_FIREWALL, firewall_revision="one")
+    after = mgr.generate_config("10.42.0.1", "192.168.1.10", DEFAULT_FIREWALL, firewall_revision="two")
+    assert firewall_only_change(before, after) is True
+    # ...and a change nebula does NOT reload still reads as a restart.
+    moved_port = mgr.generate_config(
+        "10.42.0.1", "192.168.1.10", DEFAULT_FIREWALL, firewall_revision="one", lighthouse_port=4399,
+    )
+    assert firewall_only_change(before, moved_port) is False
+    assert firewall_only_change(None, after) is False, "no evidence is not evidence of no change"
 
 
 def test_generate_config_tun_disabled_for_the_rootless_lighthouse(tmp_path):

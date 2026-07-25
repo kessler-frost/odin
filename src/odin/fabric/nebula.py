@@ -530,7 +530,24 @@ class NebulaManager:
 # overrides) -- the one file-system-visible proof that the daemon is up and has
 # configured its interface, readable with no tool at all inside either a Lima
 # VM or the busybox sidecar.
-NEBULA_TUN = "nebula1"
+# The tun device the daemon creates -- the one file-system-visible proof that
+# it is up and has configured its interface, readable with no tool at all
+# inside either a Lima VM or the busybox sidecar.
+#
+# A GLOB, not a name, and measured rather than assumed: this used to be the
+# literal `nebula1`, on the belief that it was "nebula's own default on Linux".
+# It is not. odin never sets `tun.dev`, and an unset `tun.dev` leaves the name
+# to the kernel, which hands out `tun0` -- confirmed on both kinds of member at
+# once (`ip -4 -o addr show` inside an EC2 VM and `ls /sys/class/net` inside a
+# backing's sidecar both report `tun0`, and nebula's own startup line says
+# `interface=tun0`). So the wait below never once short-circuited: every
+# re-handshake poke sat out its full timeout before firing.
+#
+# Both candidates are kept. `nebula1` is what nebula's example config sets, so
+# a member configured that way (or a future default) still matches, and an
+# unmatched glob stays literal in `sh`, which `[ -d ... ]` reads as false --
+# so the loop degrades to exactly the old behaviour rather than to a wrong one.
+NEBULA_TUN_GLOB = "/sys/class/net/nebula* /sys/class/net/tun*"
 # How long `rehandshake_script` waits for that device after a (re)start before
 # poking anyway: 1s ticks, POSIX `sleep` only (busybox's fractional sleep is a
 # compile-time option, and this script runs in alpine as well as Ubuntu).
@@ -563,11 +580,19 @@ def rehandshake_script(peers: Iterable[str]) -> str:
     HANDSHAKE happens below the firewall. We are buying tunnel state, not a
     reply. Self-bounding throughout (`-c 1 -W 1`, a capped wait loop, `exit 0`)
     so it can never hang an Apply, and it is only ever run on a real restart --
-    an unchanged member never pays a millisecond of it."""
+    an unchanged member never pays a millisecond of it.
+
+    The wait tests EVERY candidate, not just the first: an unmatched glob stays
+    literal in `sh`, so `nebula*` not matching would otherwise mask a `tun*`
+    that does (which is the case on every member odin actually runs -- see
+    `NEBULA_TUN_GLOB`). `break 2` leaves the `for` and the `while` together,
+    which is POSIX and works in both shells this runs in (bash inside an EC2
+    VM, busybox `sh` inside a backing's sidecar)."""
     pokes = "\n".join(f"ping -c 1 -W 1 {ip} >/dev/null 2>&1" for ip in peers)
     return (
         f"i=0; while [ $i -lt {_TUN_WAIT_TICKS} ]; do "
-        f"[ -d /sys/class/net/{NEBULA_TUN} ] && break; i=$((i+1)); sleep 1; done\n"
+        f"for d in {NEBULA_TUN_GLOB}; do [ -d \"$d\" ] && break 2; done; "
+        f"i=$((i+1)); sleep 1; done\n"
         f"{pokes}\nexit 0\n"
     )
 
