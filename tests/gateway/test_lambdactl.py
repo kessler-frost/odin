@@ -613,3 +613,99 @@ def test_create_without_odin_node_tag_deploys_with_no_injected_vars(sink, lambda
     _create(stores, sink, lambda_, substrate, keystore=keystore, gateway_port=_GATEWAY_PORT)
     _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
     assert substrate.ensured[0][4] == {}  # no odin:node tag -> nothing to inject, deploy still lands
+
+
+# --- W2.2's honesty fix: the reality sweep's seam + the Apply-driven
+# recovery that makes "re-Apply to recreate" true for lambda ------------------
+
+
+def test_mark_function_failed_is_what_a_caller_reads_after_the_container_vanishes(sink, lambda_, stores):
+    """The sweep's seam: a function whose RIE container was removed outside
+    odin reads `Failed` with the drift reason (so /world says crashed and says
+    why), and Invoke refuses instead of dialing a container that isn't there.
+    The RECORD survives -- real AWS never deletes a function because its
+    execution environment died."""
+    substrate = FakeFunctionRuntime()
+    _create(stores, sink, lambda_, substrate)
+    _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
+
+    lambdactl.mark_function_failed(
+        stores, ENV, "fn1", "container odin-lambda-default-fn1 removed outside odin — re-Apply to recreate",
+    )
+
+    req = sink.call(lambda: lambda_.get_function(FunctionName="fn1"))
+    config = _parse("GetFunction", _answer(stores, req, substrate))["Configuration"]
+    assert config["State"] == "Failed"
+    assert config["StateReasonCode"] == "InternalError"
+    assert "removed outside odin" in config["StateReason"]
+    assert config["LastUpdateStatus"] == "Successful", "the last DEPLOY did succeed -- only the sandbox died"
+
+    invoke = sink.call(lambda: lambda_.invoke(FunctionName="fn1", Payload=b"{}"))
+    response = _answer(stores, invoke, substrate)
+    assert _parse("Invoke", response, error=True)["Error"]["Code"] == "ResourceNotReadyException"
+    assert substrate.invoked == []
+
+
+def test_converge_functions_recreates_the_container_of_a_failed_function(sink, lambda_, stores):
+    """What an Apply now does (server.py's /apply-full). tofu can never fix
+    this itself: the `aws_lambda_function` config is unchanged, so its plan is
+    empty -- the same reason `ecsctl.converge_services` exists for tasks."""
+    substrate = FakeFunctionRuntime()
+    _create(stores, sink, lambda_, substrate)
+    _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
+    lambdactl.mark_function_failed(stores, ENV, "fn1", "container removed outside odin")
+
+    lambdactl.converge_functions(stores, ENV, substrate)
+
+    active = _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
+    assert active["StateReason"] == "The function is ready."
+    assert active["LastUpdateStatus"] == "Successful"
+    assert len(substrate.ensured) == 2, "the container was really re-created"
+    assert substrate.ensured[1][:4] == (ENV, "fn1", "python3.12", "lambda_function.lambda_handler")
+    assert substrate.ensured[1][5] == substrate.code_dir(ENV, "fn1"), "same code, restarted container"
+
+
+def _settle() -> None:
+    """Give any thread a call MIGHT have spawned time to record itself --
+    `FakeFunctionRuntime.ensure` is instant, so a converge that wrongly fired
+    lands well inside this window (the same short-poll technique `_wait_for`
+    uses for the transitions that are SUPPOSED to happen)."""
+    time.sleep(0.1)
+
+
+def test_converge_functions_leaves_an_active_function_completely_alone(sink, lambda_, stores):
+    substrate = FakeFunctionRuntime()
+    _create(stores, sink, lambda_, substrate)
+    _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
+
+    lambdactl.converge_functions(stores, ENV, substrate)
+
+    # The claim is synchronous, so an untouched `Successful` proves no converge
+    # was even started -- restarting a healthy function's container on every
+    # Apply would be a self-inflicted outage.
+    req = sink.call(lambda: lambda_.get_function_configuration(FunctionName="fn1"))
+    assert _parse("GetFunctionConfiguration", _answer(stores, req, substrate))["LastUpdateStatus"] == "Successful"
+    _settle()
+    assert len(substrate.ensured) == 1
+
+
+def test_converge_functions_skips_a_function_mid_deploy(sink, lambda_, stores):
+    """The apply that triggers this converge may itself have just called
+    UpdateFunctionCode on the same function: two `ensure` calls racing for one
+    container is exactly the fight this skip prevents."""
+    substrate = FakeFunctionRuntime(block=threading.Event())
+    _create(stores, sink, lambda_, substrate)
+    substrate.block.set()
+    _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
+    lambdactl.mark_function_failed(stores, ENV, "fn1", "container removed outside odin")
+    # A real redeploy, parked mid-`ensure`: Failed AND LastUpdateStatus=InProgress.
+    substrate.block.clear()
+    req = sink.call(lambda: lambda_.update_function_code(FunctionName="fn1", ZipFile=b"new-zip"))
+    assert _parse("UpdateFunctionCode", _answer(stores, req, substrate))["LastUpdateStatus"] == "InProgress"
+
+    lambdactl.converge_functions(stores, ENV, substrate)
+
+    substrate.block.set()
+    _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
+    _settle()
+    assert len(substrate.ensured) == 2, "the redeploy already in flight is the only ensure"

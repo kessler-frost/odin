@@ -35,6 +35,15 @@ minimum honesty that makes the user's Apply actually work. Per kind:
    apply` plans a create and the VM genuinely returns. The record still
    projects (`crashed` + that reason, tf_status.py's `drifted` exception), so
    the honest report and the working recovery are the same fact.
+ - lambda: `lambdactl.mark_function_failed` -> `State: Failed` with the same
+   reason. The record is deliberately NOT deleted: a function's RIE container
+   is its EXECUTION ENVIRONMENT, not a TF resource, and real AWS never deletes
+   a function because a sandbox died (it starts a new one). tofu therefore
+   can't be the fixer here either -- the provider's `aws_lambda_function`
+   schema has no state/status attribute to diff on (verified against the
+   v5.100.0 provider schema), so its plan stays empty -- which is why the
+   recovery is `lambdactl.converge_functions`, an Apply-driven re-`ensure` of
+   the container, exactly parallel to ecs below.
  - ecs: `ecsctl.mark_task_stopped` -> see the next paragraph.
 
 WHICH KINDS: only the three with a real runtime footprint -- ec2 (a real Lima
@@ -78,6 +87,7 @@ from odin.compute.instances import InstanceVm, vm_name
 from odin.compute.tasks import container_name as task_container_name
 from odin.gateway.models.ec2compute import mark_instance_terminated
 from odin.gateway.models.ecsctl import mark_task_stopped
+from odin.gateway.models.lambdactl import mark_function_failed
 from odin.gateway.stores import SynthStores
 from odin.runtime.colima import ColimaRuntime
 
@@ -118,14 +128,16 @@ def _vm_records(stores: SynthStores, env: str) -> list[tuple[str, str, str]]:
     return out
 
 
-def _function_records(stores: SynthStores, env: str) -> list[tuple[str, str]]:
-    """(label, RIE container name) for every function claiming `Active` and
-    NOT mid-redeploy. `LastUpdateStatus == "InProgress"` is the exempt
-    window: `FunctionRuntime.ensure` deliberately `stop`s (rm -f) the old
-    container before running the new one, so the container is legitimately
+def _function_records(stores: SynthStores, env: str) -> list[tuple[str, str, str]]:
+    """(label, function name, RIE container name) for every function claiming
+    `Active` and NOT mid-redeploy. `LastUpdateStatus == "InProgress"` is the
+    exempt window: `FunctionRuntime.ensure` deliberately `stop`s (rm -f) the
+    old container before running the new one, so the container is legitimately
     absent for a moment while `State` still reads Active (lambdactl.py's two
-    independent state machines)."""
-    out: list[tuple[str, str]] = []
+    independent state machines). The function name rides along because a
+    confirmed-gone container gets its RECORD corrected too
+    (`mark_function_failed`)."""
+    out: list[tuple[str, str, str]] = []
     for key, record in stores.lambdactl.items(env).items():
         if not key.startswith("fn:") or record["state"] != "Active":
             continue
@@ -135,7 +147,7 @@ def _function_records(stores: SynthStores, env: str) -> list[tuple[str, str]]:
             stores.tags.get(env, f"lambda:{record['function_arn']}", {}), record["function_name"],
         )
         if label:
-            out.append((label, function_container_name(env, record["function_name"])))
+            out.append((label, record["function_name"], function_container_name(env, record["function_name"])))
     return out
 
 
@@ -191,7 +203,14 @@ class DriftSweeper:
         instead -- see the module docstring). Sweeps on the first call and
         every `_sweep_ticks()` calls after; every other call answers from the
         last sweep's cache, so a reported drift stays reported between
-        sweeps instead of flapping back to healthy on the very next tick."""
+        sweeps instead of flapping back to healthy on the very next tick.
+
+        This overlay is the FIRST report, not the lasting one: the same sweep
+        corrects the underlying record, and a corrected record is no longer a
+        candidate -- so the next sweep goes quiet and `tf_status.project()`'s
+        own `crashed` + real-reason projection carries the drift from there
+        on. Both say the same thing; only the store's version survives a
+        restart."""
         count = self._ticks.get(env, 0)
         self._ticks[env] = count + 1
         if count % _sweep_ticks() == 0:
@@ -215,9 +234,13 @@ class DriftSweeper:
                 # refresh learns the instance is gone and re-Apply really does
                 # recreate it (see the module docstring).
                 mark_instance_terminated(stores, env, instance_id, out[label])
-        for label, name in functions:
+        for label, function_name, name in functions:
             if live_containers is not None and name not in live_containers:
                 out[label] = f"container {name} removed outside odin — re-Apply to recreate"
+                # Same sentence into the RECORD: a function whose sandbox is
+                # gone is `Failed`, and an Apply's `converge_functions` is what
+                # actually brings it back (see the module docstring).
+                mark_function_failed(stores, env, function_name, out[label])
         for cluster, task_id, name in tasks:
             if live_containers is not None and name not in live_containers:
                 mark_task_stopped(

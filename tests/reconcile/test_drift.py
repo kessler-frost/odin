@@ -177,6 +177,37 @@ def test_missing_lambda_container_yields_a_verdict(tmp_path):
     )
 
 
+def test_missing_lambda_container_marks_the_function_failed(tmp_path):
+    """The record is CORRECTED, not deleted: a function whose RIE container is
+    gone genuinely cannot run (Invoke refuses off this state), the World reads
+    `crashed` + the reason, and an Apply's `lambdactl.converge_functions` is
+    what re-creates the container. Deleting the record would be a bigger lie --
+    real AWS never deletes a function because its sandbox died."""
+    stores = SynthStores(tmp_path)
+    _fn(stores, "hello")
+
+    _sweeper(containers=FakeContainers(names=[])).verdicts(stores, ENV)
+
+    record = stores.lambdactl.get(ENV, "fn:hello")
+    assert record["state"] == "Failed"
+    assert record["state_reason"] == (
+        "container odin-lambda-default-hello removed outside odin — re-Apply to recreate"
+    )
+    assert record["state_reason_code"] == "InternalError"
+    assert record["last_update_status"] == "Successful", "the last DEPLOY did succeed"
+    kind, phase, _, verdict = project(stores, ENV)["hello"]
+    assert (kind, phase) == ("lambda", "crashed")
+    assert "removed outside odin" in verdict
+
+
+def test_live_lambda_container_is_left_alone(tmp_path):
+    stores = SynthStores(tmp_path)
+    _fn(stores, "hello")
+    name = "odin-lambda-default-hello"
+    assert _sweeper(containers=FakeContainers(names=[name])).verdicts(stores, ENV) == {}
+    assert stores.lambdactl.get(ENV, "fn:hello")["state"] == "Active"
+
+
 def test_lambda_mid_redeploy_is_exempt(tmp_path):
     # FunctionRuntime.ensure rm -f's the old container before running the new
     # one: absent-but-Active is legitimate while LastUpdateStatus is InProgress.
@@ -185,12 +216,14 @@ def test_lambda_mid_redeploy_is_exempt(tmp_path):
     containers = FakeContainers(names=[])
     assert _sweeper(containers=containers).verdicts(stores, ENV) == {}
     assert containers.calls == 0
+    assert stores.lambdactl.get(ENV, "fn:hello")["state"] == "Active", "a mid-deploy record is untouched"
 
 
 def test_pending_lambda_is_exempt(tmp_path):
     stores = SynthStores(tmp_path)
     _fn(stores, "hello", state="Pending", last_update="InProgress")
     assert _sweeper(containers=FakeContainers(names=[])).verdicts(stores, ENV) == {}
+    assert stores.lambdactl.get(ENV, "fn:hello")["state"] == "Pending"
 
 
 # --- ecs: reality is written back into the task record (see drift.py's
@@ -336,6 +369,9 @@ def test_a_failed_container_listing_reports_no_drift_and_touches_no_record(tmp_p
 
     assert _sweeper(containers=containers).verdicts(stores, ENV) == {}
     assert stores.ecsctl.get(ENV, "task:odin:t1")["last_status"] == "RUNNING"
+    assert stores.lambdactl.get(ENV, "fn:hello")["state"] == "Active", (
+        "a docker hiccup must never be written into a record as a real failure"
+    )
 
 
 def test_a_docker_failure_does_not_hide_real_vm_drift(tmp_path):
