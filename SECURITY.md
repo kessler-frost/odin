@@ -138,14 +138,17 @@ A field like an RDS `password` is stored, and used, in cleartext:
   sent is in the generated `.odin/<env>/tf/main.tf` and comes back in
   `.odin/<env>/tf/terraform.tfstate` (plus `terraform.tfstate.backup`).
 - **Every file odin creates that can carry a secret or a credential is
-  `0600`** (owner read/write only), and the directories holding them are
-  `0700` — the only real protection is that another local account on the same
-  machine can't read them. Anyone with your user account, or root, can. The
-  exhaustive list, because a mode you can't verify is worth nothing:
-  `canvas.json`, `<env>/stacks/*.json`, `<env>/HEAD`, `<env>/world.json`,
-  `<env>/events.jsonl`, `<env>/keys.json`, `<env>/gateway/*.json`,
-  `<env>/tf/*` (including tofu's own `terraform.tfstate` and its `.backup`),
-  `<env>/nebula/*`, and an `odin export` archive.
+  `0600`** (owner read/write only), and **every directory odin creates** to
+  hold one is `0700`: `.odin/` itself, each `.odin/<env>/`, and the
+  `gateway/`, `stacks/`, `tf/` and `nebula/` (plus `nebula/hosts/`)
+  directories inside an env — the only real protection is that another local
+  account on the same machine can't read them. Anyone with your user account,
+  or root, can. The exhaustive file list, because a mode you can't verify is
+  worth nothing: `canvas.json`, `<env>/stacks/*.json`, `<env>/HEAD`,
+  `<env>/world.json`, `<env>/events.jsonl`, `<env>/keys.json`,
+  `<env>/gateway/*.json`, the files in `<env>/tf/` (including tofu's own
+  `terraform.tfstate` and its `.backup`), `<env>/nebula/*`, and an
+  `odin export` archive.
   - Two of those are not odin's files to write: tofu creates and rewrites
     `terraform.tfstate`/`.backup` itself, at `0644` under the default umask.
     Odin pre-creates both `0600` before every `tofu` invocation, which sticks
@@ -167,6 +170,18 @@ A field like an RDS `password` is stored, and used, in cleartext:
     helper, and that helper tightens a directory it finds group- or
     world-accessible, so an existing store is healed rather than left as the
     first writer set it.
+  - One directory under `.odin/` is **not** `0700`, and deliberately so:
+    `<env>/tf/.terraform/`, which is tofu's, not odin's. `tofu init` creates
+    it (`0755` under the default umask) and re-creates it on every run; it
+    holds provider plugins and their metadata — hundreds of files, no canvas
+    value ever among them — so `_lock_down` in `simulate/workspace.py` skips
+    that subtree instead of re-chmod'ing plugins on every apply. The three
+    workspace files that DO carry secrets (`main.tf`, `terraform.tfstate`,
+    `terraform.tfstate.backup`) sit beside it, not inside it, and are `0600`.
+    Concretely: `find .odin -type d ! -perm 700` prints `<env>/tf/.terraform`
+    and its subdirectories, and nothing else — the only other thing that can
+    appear there is a directory a pre-v0.7.3 odin left `0755` and nothing has
+    written to since, which the helper above tightens on the next write.
 - `.odin/` is gitignored, so a normal `git add`/`commit` won't leak it into
   a repo — but nothing stops you from committing it deliberately, so don't.
 - Fields that look like a secret (`password`, `secret`, `token`, `key` in

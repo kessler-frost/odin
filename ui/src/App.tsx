@@ -64,10 +64,6 @@ export default function App() {
     setEdgeUpdates({ edgeId, data });
   }, []);
 
-  // Anything the canvas had to repair on load (a hand-authored node with no
-  // `position`, say) is said out loud rather than fixed in silence.
-  const handleCanvasNotice = useCallback((text: string) => pushToast('info', text), [pushToast]);
-
   const readCanvas = useCallback(async () => {
     const canvas = await fetch('/canvas').then(r => r.json()).catch(() => null);
     if (!canvas) pushToast('error', 'Could not read the canvas');
@@ -143,7 +139,7 @@ export default function App() {
         <Sidebar onCollapse={() => setSidebarOpen(false)} />
       </div>
       <div className="relative overflow-hidden">
-        <Canvas env={env} onNodeSelect={setSelectedNodes} onEdgeSelect={setSelectedEdges} onNodeLabelsChange={setNodeLabels} nodeUpdates={nodeUpdates} edgeUpdates={edgeUpdates} onStatusUpdate={statusUpdateFnRef} configUpdate={configUpdate} onNotice={handleCanvasNotice} />
+        <Canvas env={env} onNodeSelect={setSelectedNodes} onEdgeSelect={setSelectedEdges} onNodeLabelsChange={setNodeLabels} nodeUpdates={nodeUpdates} edgeUpdates={edgeUpdates} onStatusUpdate={statusUpdateFnRef} configUpdate={configUpdate} />
         {!sidebarOpen && (
           <button
             onClick={() => setSidebarOpen(true)}
