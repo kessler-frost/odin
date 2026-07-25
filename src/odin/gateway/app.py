@@ -206,7 +206,7 @@ def create_gateway_app(
         statements = state.statements_for(principal.env, principal.node_id)
         if not evaluate(statements, action, resource):
             await on_deny(principal, action, resource, "denied")
-            return errors.access_denied(service, action)
+            return errors.access_denied(service, action, resource)
 
         now = time.monotonic()
         # Computed once, ahead of pure_answer: ecr's control-plane model

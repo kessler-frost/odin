@@ -119,11 +119,23 @@ def _respond(service: str, code: str, message: str) -> Response:
     return Response(_json_body(service, code, message), status_code=status, media_type="application/x-amz-json-1.0")
 
 
-def access_denied(service: str, action: str) -> Response:
+_MAX_RESOURCE_CHARS = 200
+
+
+def access_denied(service: str, action: str, resource: str | None = None) -> Response:
     """The default-deny outcome: no statement allowed `action`, or the
     request couldn't even be classified into an action (v1's clean-fail
-    path for unmappable requests -- see classify.py's module docstring)."""
-    return _respond(service, "AccessDenied", f"User is not authorized to perform: {action}")
+    path for unmappable requests -- see classify.py's module docstring).
+
+    Naming the RESOURCE is what makes the denial actionable. Field test 2
+    cost an engineer an hour on an unscoped `DescribeDBInstances()`: an edge
+    grants an action on the one resource it points at, so the wildcard list
+    is a different permission -- but the message said only "not authorized
+    to perform: rds:DescribeDBInstances", which reads as "the edge didn't
+    work" rather than "you asked about a different resource". Real AWS names
+    both. The unmappable-action path has no resource and passes None."""
+    subject = f"{action} on resource: {resource[:_MAX_RESOURCE_CHARS]!r}" if resource else action
+    return _respond(service, "AccessDenied", f"User is not authorized to perform: {subject}")
 
 
 def auth_error(service: str, code: str, message: str) -> Response:

@@ -41,6 +41,7 @@ from __future__ import annotations
 import pytest
 
 from odin.gateway.app import GatewayState
+from odin.gateway import errors
 from odin.gateway.classify import classify
 from odin.gateway.errors import access_denied
 from odin.gateway.keys import OPERATOR_NODE_ID
@@ -170,3 +171,24 @@ def test_the_denial_names_the_action_and_never_the_resource(service, action):
     assert f"User is not authorized to perform: {action}" in body
     assert "*" not in body
     assert "unscoped" not in body.lower()
+
+
+def test_the_denial_names_the_resource_it_refused():
+    """Field test 2 cost an engineer an hour because the denial named only
+    the action: an unscoped `DescribeDBInstances()` reads as "my edge is
+    broken" when it actually means "you asked about `*`, not your db"."""
+    body = errors.access_denied("rds", "rds:DescribeDBInstances", "*").body.decode()
+    assert "rds:DescribeDBInstances" in body
+    assert "on resource" in body and "*" in body
+
+
+def test_a_long_resource_is_capped_not_echoed_whole():
+    body = errors.access_denied("s3", "s3:GetObject", "k" * 5000).body.decode()
+    assert len(body) < 1000
+
+
+def test_the_unmappable_path_has_no_resource_clause():
+    """classify() returning None means odin never worked out a resource --
+    inventing one would be a lie."""
+    body = errors.access_denied("s3", "unmappable-action").body.decode()
+    assert "unmappable-action" in body and "on resource" not in body
