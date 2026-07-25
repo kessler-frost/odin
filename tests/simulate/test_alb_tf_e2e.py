@@ -271,12 +271,12 @@ def test_alb_fronts_two_ecs_tasks_and_still_serves_when_one_dies(tmp_path, conta
         # than pretending the race is deterministic. `render_conf`'s side of the
         # failover is unit-tested directly in tests/compute/test_proxy.py.
         conf_before = proxy_conf_path(store.root, ENV_FLEET, LB).read_text()
-        assert conf_before.count("        server ") == 2, conf_before
+        assert conf_before.count("\n    server ") == 2, conf_before
         _docker("rm", "-f", "-v", task_names[0])
         assert _docker("ps", "--filter", f"name={task_names[0]}", "--format", "{{.Names}}").stdout.strip() == ""
         for attempt in range(6):
             answer = _get(endpoint)
-            upstreams = proxy_conf_path(store.root, ENV_FLEET, LB).read_text().count("        server ")
+            upstreams = proxy_conf_path(store.root, ENV_FLEET, LB).read_text().count("\n    server ")
             assert answer.status_code == 200, (
                 f"attempt {attempt}: the LB stopped serving after one task died "
                 f"({answer.status_code}); upstreams still in the config: {upstreams}"
