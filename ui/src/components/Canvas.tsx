@@ -31,6 +31,7 @@ import ServiceNode from './nodes/ServiceNode';
 import RegionAsk from './RegionAsk';
 import { CATALOG, catalogNodeTypeMap, catalogDefaultData, catalogDefaultStyle, catalogZIndex, catalogByType, COLORS } from '../lib/catalog';
 import { withContainment, isInsideContainer } from '../lib/containment';
+import { placeUnpositioned } from '../lib/placement';
 import { computeTypes, defaultPermissions, detectDefaultEdgeType, edgeStyle, edgeTypes } from '../lib/iam';
 
 const nodeTypes: NodeTypes = {
@@ -122,6 +123,10 @@ function endpointFromFacts(facts?: Record<string, unknown>): string {
 
 type HistoryEntry = { nodes: Node[]; edges: Edge[] };
 
+// A node as it comes off `/canvas`: everything a ReactFlow node needs EXCEPT a
+// guaranteed `position` — the one field a hand-authored canvas keeps omitting.
+type LoadedNode = Omit<Node, 'position'> & { position?: { x: number; y: number } };
+
 interface CanvasProps {
   env?: string;
   onNodeSelect?: (nodes: Node[]) => void;
@@ -179,23 +184,21 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
       // solid black with nothing said anywhere (fresh-user BLOCK-3). Lay those
       // out on the 20px grid, in canvas order, and say so — a node the user
       // can see and drag beats a black rectangle and a console TypeError.
-      let unplaced = 0;
-      const onGrid = () => {
-        const i = unplaced++;
-        return { x: 80 + (i % 5) * 260, y: 80 + Math.floor(i / 5) * 200 };
-      };
-      const rfNodes: Node[] = (canvasRes.nodes ?? []).map((n: any) => ({
+      // The grid v0.7.3 laid them out on was blind, though: field test 4's
+      // DynamoDB table landed exactly on top of an SQS queue the author HAD
+      // positioned, hiding it completely. `placeUnpositioned` skips space
+      // that is already taken.
+      const fromDisk: LoadedNode[] = (canvasRes.nodes ?? []).map((n: any) => ({
         id: n.id,
         type: n.type,
-        position: (typeof n.position?.x === 'number' && typeof n.position?.y === 'number')
-          ? n.position
-          : onGrid(),
+        position: (typeof n.position?.x === 'number' && typeof n.position?.y === 'number') ? n.position : undefined,
         zIndex: zIndexForType[n.type] ?? 2,
         data: { ...defaultDataForType[n.type], ...n.data },
         style: { ...defaultStyleForType[n.type], ...n.size },
       }));
-      if (unplaced > 0) {
-        onNotice?.(`${unplaced} node${unplaced === 1 ? '' : 's'} had no "position" — laid out on the grid. Move one and it sticks.`);
+      const { nodes: rfNodes, placed } = placeUnpositioned(fromDisk);
+      if (placed > 0) {
+        onNotice?.(`${placed} node${placed === 1 ? '' : 's'} had no "position" — laid out on the grid. Move one and it sticks.`);
       }
 
       const rfEdges: Edge[] = (canvasRes.edges ?? []).map((e: any) => {
