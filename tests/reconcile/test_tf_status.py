@@ -7,6 +7,9 @@ facts, verdict)`. Hand-built `SynthStores`, no reconciler/asyncio involved
 integration (emitting WorldDeltas + pruning)."""
 from __future__ import annotations
 
+import os
+
+from odin.fabric.models import MeshNetwork, SubnetAllocation
 from odin.gateway.models import elbv2ctl, rdsctl, secretsctl, ssmctl
 from odin.gateway.stores import SynthStores
 from odin.reconcile import mesh_health
@@ -310,6 +313,41 @@ def test_a_recreated_instance_wins_its_label_over_the_drifted_one_it_replaced(tm
     stores.tags.set(ENV, "ec2:i-old", {"odin:node": "server"})
 
     assert project(stores, ENV)["server"] == ("ec2", "healthy", {}, None)
+
+
+def test_a_running_ec2_publishes_its_private_and_overlay_addresses(tmp_path):
+    """Field test 2 LOW-13: an ec2 node published NO facts at all -- nothing
+    referencable as `${{web1.…}}`, and finding a VM's mesh address meant
+    hand-reading `.odin/<env>/nebula/overlay.json`, while rds published three.
+    Two facts, both plain addresses: `PRIVATE_IP` (host-reachable, NOT
+    SG-gated) and `MESH_IP` (the overlay address a drawn SG really gates, and
+    the one that is sticky across recreation)."""
+    stores = SynthStores(tmp_path)
+    stores.ec2compute.set(ENV, "instance:i-1", {**_ec2_instance("i-1", "running"), "private_ip": "192.168.64.9"})
+    stores.tags.set(ENV, "ec2:i-1", {"odin:node": "web1"})
+    nebula = tmp_path / ENV / "nebula"
+    nebula.mkdir(parents=True)
+    (nebula / "ca.crt").write_text("---ca---\n")
+    (nebula / "overlay.json").write_text(MeshNetwork(
+        network=ENV, subnets={"hosts": SubnetAllocation(
+            network=ENV, subnet="hosts", cidr="10.42.1.0/24", next_ip=2, assignments={"i-1": "10.42.1.1"},
+        )},
+    ).model_dump_json())
+    (nebula / "lighthouse.pid").write_text(str(os.getpid()))  # this env's lighthouse is up
+
+    mesh_health.reset_cache()
+    kind, phase, facts, _ = project(stores, ENV)["web1"]
+    assert (kind, phase) == ("ec2", "healthy")
+    assert facts == {"PRIVATE_IP": "192.168.64.9", "MESH_IP": "10.42.1.1"}
+
+    # ...and the overlay address is held to the same standard as rds's: no
+    # lighthouse, no advertisement (the VM itself is still reachable privately).
+    (nebula / "lighthouse.pid").unlink()
+    mesh_health.reset_cache()
+    _, phase, facts, verdict = project(stores, ENV)["web1"]
+    assert (phase, facts) == ("crashed", {"PRIVATE_IP": "192.168.64.9"})
+    assert "10.42.1.1 is unreachable" in verdict
+    mesh_health.reset_cache()
 
 
 def test_ec2_instance_with_no_odin_node_tag_is_not_projected(tmp_path):

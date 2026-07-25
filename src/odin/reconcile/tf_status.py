@@ -50,9 +50,12 @@ simply not projected yet, rather than guessing.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 from odin.aws.rds import POSTGRES_PORT
 from odin.aws.rds import container_name as db_container_name
 from odin.compute.tasks import TaskRuntime
+from odin.fabric.nebula import NebulaManager
 from odin.gateway.models import cachectl, elbv2ctl, logsctl, rdsctl, ssmctl
 from odin.gateway.models.ecsctl import sweep_tasks
 from odin.gateway.stores import SynthStores
@@ -290,8 +293,9 @@ def _db_instances(stores: SynthStores, env: str) -> Projected:
         container = db_container_name(env, identifier)
         out[label] = mesh_health.gate(
             ("rds", phase, facts, verdict), root=stores.root, env=env,
-            target=container, member=container,  # PostgresRds.mesh_member == the container name
-            overlay_ip=record.get("overlay_ip"), port=POSTGRES_PORT, mesh_keys=_DB_MESH_KEYS,
+            member=container,  # PostgresRds.mesh_member == the container name
+            overlay_ip=record.get("overlay_ip"), mesh_keys=_DB_MESH_KEYS,
+            sidecar_target=container, sidecar_port=POSTGRES_PORT,
         )
     return out
 
@@ -339,8 +343,39 @@ def _ec2_verdict(record: dict) -> str | None:
     return f"{reason['code']}: {reason['message']}"
 
 
+# An ec2 node's facts (field test 2 LOW-13: it published NONE, so a VM's own
+# addresses were only findable by hand-reading `.odin/<env>/nebula/
+# overlay.json`, while rds published three). Both are plain addresses, no
+# credentials, no ports invented:
+#   PRIVATE_IP -- the VM's real private address, what DescribeInstances
+#                 reports as privateIpAddress. Host-reachable, NOT SG-gated.
+#   MESH_IP    -- its Nebula overlay address: sticky across recreation, and
+#                 the ONE path a drawn security group actually gates. Withheld
+#                 (like rds's `*_MESH`) when the env's lighthouse isn't up, so
+#                 odin never hands out an address no peer can reach.
+_EC2_MESH_KEYS = ("MESH_IP",)
+
+
+def _ec2_facts(record: dict, overlay: dict[str, str]) -> dict:
+    private_ip, overlay_ip = record.get("private_ip"), overlay.get(record["instance_id"])
+    return {
+        **({"PRIVATE_IP": private_ip} if private_ip else {}),
+        **({"MESH_IP": overlay_ip} if overlay_ip else {}),
+    }
+
+
+def _overlay_assignments(stores: SynthStores, env: str) -> dict[str, str]:
+    """host_id -> overlay IP for this env, read ONCE per projection (one small
+    JSON read, and none at all for an env with no mesh). Read-only: no mkdir,
+    no allocation -- `NebulaManager.load_overlay`'s own contract."""
+    overlay = NebulaManager(Path(stores.root) / env / "nebula").load_overlay()
+    hosts = overlay.subnets.get("hosts") if overlay else None
+    return dict(hosts.assignments) if hosts else {}
+
+
 def _ec2_instances(stores: SynthStores, env: str) -> Projected:
     out: Projected = {}
+    overlay = _overlay_assignments(stores, env)
     instances = [r for k, r in stores.ec2compute.items(env).items() if k.startswith("instance:")]
     # Terminated records FIRST, so a live instance sharing their label
     # overwrites them: a re-Apply that recovers drift mints a NEW instance
@@ -374,7 +409,12 @@ def _ec2_instances(stores: SynthStores, env: str) -> Projected:
             continue
         phase = _EC2_PHASE.get(record["state_name"], "starting")
         verdict = _ec2_verdict(record) if phase == "crashed" else None
-        out[label] = ("ec2", phase, {}, verdict)
+        facts = _ec2_facts(record, overlay) if phase == "healthy" else {}
+        out[label] = mesh_health.gate(
+            ("ec2", phase, facts, verdict), root=stores.root, env=env,
+            member=record["instance_id"],  # the nebula host_id `InstanceVm` signs (compute/instances.py)
+            overlay_ip=facts.get("MESH_IP"), mesh_keys=_EC2_MESH_KEYS,
+        )
     return out
 
 

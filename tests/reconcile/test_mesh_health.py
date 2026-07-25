@@ -88,16 +88,17 @@ def _clean_cache():
 def _meshed_env(tmp_path):
     """What `MeshSidecar.enabled()` reads: this env has a Nebula network."""
     nebula = tmp_path / ENV / "nebula"
-    nebula.mkdir(parents=True)
+    nebula.mkdir(parents=True, exist_ok=True)
     (nebula / "ca.crt").write_text("---ca---\n")
     return tmp_path
 
 
-def _gate(tmp_path, entry, *, runtime=None, lighthouse=None, now=0.0, overlay_ip=OVERLAY_IP):
+def _gate(tmp_path, entry, *, runtime=None, lighthouse=None, now=0.0, overlay_ip=OVERLAY_IP, **kwargs):
     return mesh_health.gate(
-        entry, root=tmp_path, env=ENV, target=TARGET, member=MEMBER,
-        overlay_ip=overlay_ip, port=PORT, mesh_keys=MESH_KEYS,
-        runtime=runtime or FakeRuntime(), lighthouse=lighthouse or FakeLighthouse(), now=now,
+        entry, root=tmp_path, env=ENV, member=MEMBER, overlay_ip=overlay_ip, mesh_keys=MESH_KEYS,
+        sidecar_target=kwargs.pop("sidecar_target", TARGET),
+        sidecar_port=kwargs.pop("sidecar_port", PORT),
+        runtime=runtime or FakeRuntime(), lighthouse=lighthouse or FakeLighthouse(), now=now, **kwargs,
     )
 
 
@@ -243,6 +244,33 @@ def test_a_check_that_explodes_is_a_verdict_not_a_crashed_tick(tmp_path):
     )
     assert phase == "crashed" and "docker daemon is not responding" in verdict
     assert "endpoint_mesh" not in facts
+
+
+# --- an EC2 member: nebula inside a VM, so only the lighthouse is affordable --
+
+
+def test_a_vm_member_is_checked_against_the_lighthouse_only(tmp_path):
+    """An EC2 node's nebula is a systemd unit inside a Lima VM -- there is no
+    container to stand inside, and a `limactl shell` per VM per sweep is not a
+    tick's price. The lighthouse half IS affordable and IS decisive: without
+    it no peer can find or relay to the VM's overlay address."""
+    runtime = FakeRuntime()
+    entry = ("ec2", "healthy", {"PRIVATE_IP": "192.168.64.7", "MESH_IP": "10.42.1.2"}, None)
+    kwargs = {"sidecar_target": None, "sidecar_port": None}
+    ok = mesh_health.gate(
+        entry, root=_meshed_env(tmp_path), env=ENV, member="i-abc", overlay_ip="10.42.1.2",
+        mesh_keys=("MESH_IP",), runtime=runtime, lighthouse=FakeLighthouse(), now=0.0, **kwargs,
+    )
+    assert ok == entry and runtime.calls == [], "no docker call for a VM member"
+
+    mesh_health.reset_cache()
+    _, phase, facts, verdict = mesh_health.gate(
+        entry, root=_meshed_env(tmp_path), env=ENV, member="i-abc", overlay_ip="10.42.1.2",
+        mesh_keys=("MESH_IP",), runtime=runtime, lighthouse=FakeLighthouse(running=False), now=0.0, **kwargs,
+    )
+    assert phase == "crashed"
+    assert facts == {"PRIVATE_IP": "192.168.64.7"}, "the VM's own address stays; the overlay claim goes"
+    assert "10.42.1.2 is unreachable" in verdict and "lighthouse is not running" in verdict
 
 
 # --- the probe itself ---------------------------------------------------------

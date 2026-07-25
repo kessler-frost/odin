@@ -89,8 +89,9 @@ def reset_cache() -> None:
 
 
 def check(
-    root: Path, env: str, target: str, member: str, overlay_ip: str, port: int,
-    *, runtime=None, lighthouse: LighthouseManager | None = None, now: float | None = None,
+    root: Path, env: str, member: str, address: str,
+    *, sidecar_target: str | None = None, sidecar_port: int | None = None,
+    runtime=None, lighthouse: LighthouseManager | None = None, now: float | None = None,
 ) -> MeshVerdict:
     """The cached, cadenced answer for one mesh member. Never raises: a
     verdict is observability, and an exploding docker CLI must not take down a
@@ -100,52 +101,61 @@ def check(
     cached = _cache.get(key)
     if cached is not None and stamp < cached[0]:
         return cached[1]
-    verdict = _probe(root, env, target, member, overlay_ip, port, runtime, lighthouse)
+    verdict = _probe(root, env, address, sidecar_target, sidecar_port, runtime, lighthouse)
     _cache[key] = (stamp + (_ok_seconds() if verdict.ok else _fail_seconds()), verdict)
     return verdict
 
 
 def _probe(
-    root: Path, env: str, target: str, member: str, overlay_ip: str, port: int,
+    root: Path, env: str, address: str, sidecar_target: str | None, sidecar_port: int | None,
     runtime, lighthouse: LighthouseManager | None,
 ) -> MeshVerdict:
     rt = runtime or ColimaRuntime()
     manager = lighthouse or LighthouseManager()
     mesh = MeshSidecar(rt, env, root, lighthouse=manager)
     try:
-        return _verdict(root, env, target, overlay_ip, port, rt, mesh, manager)
+        return _verdict(root, env, address, sidecar_target, sidecar_port, rt, mesh, manager)
     except Exception as exc:  # noqa: BLE001 -- a verdict must never fail a tick
-        log.warning("mesh health check failed for %s (env %r): %s", target, env, exc)
+        log.warning("mesh health check failed for %s (env %r): %s", address, env, exc)
         return MeshVerdict(ok=False, reason=f"the mesh health check itself failed: {exc}")
 
 
 def _verdict(
-    root: Path, env: str, target: str, overlay_ip: str, port: int,
+    root: Path, env: str, address: str, sidecar_target: str | None, sidecar_port: int | None,
     runtime, mesh: MeshSidecar, lighthouse: LighthouseManager,
 ) -> MeshVerdict:
+    """`sidecar_target`/`sidecar_port` present -- a container member odin can
+    stand inside (rds and the AWS backings): the full four checks. Absent -- an
+    EC2 member, whose nebula runs as a systemd unit inside a Lima VM: only the
+    lighthouse is checkable at a tick's price (a `limactl shell` per VM per
+    sweep is not, and an unreachable lighthouse already means no peer can find
+    or relay to it, which is the honest half we can afford)."""
     if not mesh.enabled():
         # No CA -> this env has no Nebula network, so there is no overlay claim
         # to verify (and nothing published one).
         return MeshVerdict(ok=True)
-    sidecar = mesh.sidecar_name(target)
     if not lighthouse.is_running(root, env):
         return MeshVerdict(ok=False, reason=(
             f"the {env!r} nebula lighthouse is not running, so no peer can find or relay to "
-            f"{overlay_ip}:{port} (see {Path(root) / env / 'nebula' / 'lighthouse.log'})"
+            f"{address} (see {Path(root) / env / 'nebula' / 'lighthouse.log'})"
         ))
+    if sidecar_target is None or sidecar_port is None:
+        return MeshVerdict(ok=True)
+    target, port = sidecar_target, sidecar_port
+    sidecar = mesh.sidecar_name(target)
     if not mesh.running(target):
         return MeshVerdict(ok=False, reason=f"the mesh sidecar {sidecar} is not running")
     if mesh.attached_to(target) is False:
         return MeshVerdict(ok=False, reason=(
             f"the mesh sidecar {sidecar} is in a REPLACED container's network namespace"
         ))
-    ready = mesh_ready_sync(runtime, sidecar, overlay_ip, port)
+    ready = mesh_ready_sync(runtime, sidecar, address.rsplit(":", 1)[0], port)
     return MeshVerdict(ok=ready.ok, reason=ready.error)
 
 
 def gate(
-    entry: Entry, *, root: Path, env: str, target: str, member: str,
-    overlay_ip: str | None, port: int, mesh_keys: tuple[str, ...],
+    entry: Entry, *, root: Path, env: str, member: str, overlay_ip: str | None,
+    mesh_keys: tuple[str, ...], sidecar_target: str | None = None, sidecar_port: int | None = None,
     runtime=None, lighthouse: LighthouseManager | None = None, now: float | None = None,
 ) -> Entry:
     """Hold a projected resource to its OWN mesh advertisement.
@@ -162,15 +172,16 @@ def gate(
     kind, phase, facts, verdict = entry
     if not overlay_ip or not any(key in facts for key in mesh_keys):
         return entry
+    address = f"{overlay_ip}:{sidecar_port}" if sidecar_port else overlay_ip
     result = check(
-        root, env, target, member, overlay_ip, port,
+        root, env, member, address, sidecar_target=sidecar_target, sidecar_port=sidecar_port,
         runtime=runtime, lighthouse=lighthouse, now=now,
     )
     if result.ok:
         return entry
     withheld = {key: value for key, value in facts.items() if key not in mesh_keys}
     reason = (
-        f"the published mesh endpoint {overlay_ip}:{port} is unreachable: {result.reason} "
-        f"-- the SG-gated overlay path is down (the published host port is unaffected); re-Apply to re-join"
+        f"the published mesh address {address} is unreachable: {result.reason} "
+        f"-- the SG-gated overlay path is down (any published host port is unaffected); re-Apply to re-join"
     )
     return (kind, "crashed" if phase == "healthy" else phase, withheld, verdict or reason)
