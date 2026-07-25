@@ -366,7 +366,9 @@ def test_activate_nebula_derives_underlay_and_writes_final_config(tmp_path):
 
     assert lighthouse.started == [(tmp_path, "myenv", "192.168.64.1")]
     config = yaml.safe_load(runner.config_input)
-    assert config["static_host_map"] == {"10.42.0.1": ["192.168.64.1:4242"]}
+    # 4342, not the members' own 4242: Lima forwards a VM's 4242 to the host's
+    # loopback, stealing it from the lighthouse (fabric/nebula.py::LIGHTHOUSE_PORT).
+    assert config["static_host_map"] == {"10.42.0.1": ["192.168.64.1:4342"]}
     assert config["firewall"]["inbound"] == [{"port": "8080", "proto": "tcp", "cidr": "0.0.0.0/0"}]
     # R5: stock Lima vz has no VM-to-VM underlay path -- every VM routes to
     # every other VM through the lighthouse acting as a relay.

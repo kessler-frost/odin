@@ -91,6 +91,23 @@ log = logging.getLogger("odin.fabric.nebula")
 
 NEBULA_PORT = 4242
 
+# The HOST lighthouse listens on its OWN port, not on the members' 4242 --
+# W2.6, found live and the hard way. Lima automatically forwards every port a
+# guest listens on to the host's 127.0.0.1, and that includes each EC2 VM's
+# `nebula` daemon on UDP 4242: `limactl hostagent` then HOLDS host
+# 127.0.0.1:4242 (confirmed with lsof, alongside the lighthouse's own
+# `[::]:4242`). Colima's user-mode network maps `host.docker.internal`
+# (192.168.5.2) onto the host's loopback, so a backing container's handshake
+# packets to the lighthouse were being delivered INTO a VM instead --
+# container↔VM mesh traffic could never work while any EC2 VM existed, while
+# VM↔VM (which rides the vzNAT address, never loopback) was fine. Lima's own
+# `portForwards: ignore` does NOT suppress it for UDP (tried: the rule lands
+# in the instance's effective config and `limactl` binds the port anyway), and
+# a user's own unrelated Lima VM could collide the same way. Giving the
+# lighthouse a distinct port sidesteps the whole class: nothing in any guest
+# ever listens on 4342, so nothing can forward it out from under us.
+LIGHTHOUSE_PORT = 4342
+
 # How long `ensure_started` waits, after spawning, to catch an IMMEDIATE
 # crash (bad cert/config, port already in use) before declaring success -- a
 # real `nebula` binds its UDP port and logs "Nebula interface is active"
@@ -255,7 +272,9 @@ class NebulaManager:
                 "key": str(pki.key) if pki else "/etc/nebula/host.key",
             },
             "lighthouse": {"am_lighthouse": is_lighthouse},
-            "listen": {"host": "0.0.0.0", "port": NEBULA_PORT},
+            # The lighthouse gets its OWN port (see LIGHTHOUSE_PORT's comment:
+            # Lima steals the host's 4242 for a VM's own nebula listener).
+            "listen": {"host": "0.0.0.0", "port": LIGHTHOUSE_PORT if is_lighthouse else NEBULA_PORT},
             "firewall": {
                 "inbound": [_rule_to_dict(r) for r in firewall.inbound],
                 "outbound": [_rule_to_dict(r) for r in firewall.outbound],
@@ -269,7 +288,7 @@ class NebulaManager:
                 else {"use_relays": True, "relays": [lighthouse_ip]}
             )
         if not is_lighthouse:
-            config["static_host_map"] = {lighthouse_ip: [f"{lighthouse_underlay}:{NEBULA_PORT}"]}
+            config["static_host_map"] = {lighthouse_ip: [f"{lighthouse_underlay}:{LIGHTHOUSE_PORT}"]}
             config["lighthouse"]["hosts"] = [lighthouse_ip]
             # Advertise ONLY the vzNAT address to the lighthouse. A Lima VM
             # has three local addresses and two of them poison discovery:

@@ -10,6 +10,11 @@ build/
 .DS_Store
 .odin/
 .odin-v4d-test/
+# W2.6 mesh integration tests: a throwaway store root under the repo tree,
+# because Colima only shares $HOME into its VM and a backing's nebula sidecar
+# bind-mounts its cert/config from the store (a /private/var tmp_path mount
+# comes up empty inside the container).
+.odin-mesh-it/
 node_modules/
 bun.lock
 .vite/

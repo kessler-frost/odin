@@ -93,7 +93,10 @@ def test_generate_config_shape(tmp_path):
     member = yaml.safe_load(mgr.generate_config("10.42.0.1", "192.168.1.10", DEFAULT_FIREWALL))
     assert member["listen"] == {"host": "0.0.0.0", "port": 4242}
     assert member["lighthouse"]["am_lighthouse"] is False
-    assert member["static_host_map"] == {"10.42.0.1": ["192.168.1.10:4242"]}
+    # The lighthouse is dialed on ITS port (4342), not the members' 4242 --
+    # Lima forwards a VM's own 4242 to the host's loopback and would otherwise
+    # swallow every container→lighthouse packet (fabric/nebula.py::LIGHTHOUSE_PORT).
+    assert member["static_host_map"] == {"10.42.0.1": ["192.168.1.10:4342"]}
     assert "tun" not in member  # a VM member keeps its real tun device
     # Members advertise ONLY the vzNAT subnet — a Lima VM's slirp address
     # (identical on every VM → self-handshake hairpin) and IPv6 ULA
@@ -103,6 +106,7 @@ def test_generate_config_shape(tmp_path):
     assert member["preferred_ranges"] == ["192.168.1.0/24"]
     light = yaml.safe_load(mgr.generate_config("10.42.0.1", "192.168.1.10", DEFAULT_FIREWALL, is_lighthouse=True))
     assert light["lighthouse"]["am_lighthouse"] is True and "static_host_map" not in light
+    assert light["listen"] == {"host": "0.0.0.0", "port": 4342}, "the host lighthouse owns a port no guest listens on"
     assert "local_allow_list" not in light["lighthouse"]  # lighthouse advertises nothing anyway (no tun)
     assert "tun" not in light  # tun_disabled defaults False even for a lighthouse
 

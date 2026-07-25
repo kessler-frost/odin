@@ -151,7 +151,7 @@ def test_ensure_writes_cert_material_and_a_gated_config(tmp_path):
     assert config["pki"] == {"ca": "/etc/nebula/ca.crt", "cert": "/etc/nebula/host.crt", "key": "/etc/nebula/host.key"}
     # The host as seen from INSIDE a container, and the relay path every
     # NAT'd member needs (R5) -- a container and a VM have no direct path.
-    assert config["static_host_map"] == {"10.42.0.1": ["192.168.5.2:4242"]}
+    assert config["static_host_map"] == {"10.42.0.1": ["192.168.5.2:4342"]}
     assert config["relay"] == {"use_relays": True, "relays": ["10.42.0.1"]}
 
 

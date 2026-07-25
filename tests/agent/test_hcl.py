@@ -307,8 +307,50 @@ def test_sg_with_malformed_ingress_rule_lands_in_unsupported():
     ))
     proj = generate_tf(stack)
     assert proj.unsupported == [
-        'bad (sg): invalid ingress rule — expected one "protocol:port:cidr" per line, e.g. tcp:443:0.0.0.0/0'
+        'bad (sg): invalid ingress rule — expected one "protocol:port:source" per line, e.g. tcp:443:0.0.0.0/0'
     ]
+
+
+def test_sg_ingress_can_name_another_sg_as_its_source():
+    """W2.6: "5432, from the web tier only" -- the AWS-idiomatic
+    UserIdGroupPairs rule, which is the ONLY source form that gates by
+    identity (a nebula `group:` rule matched against the peer's cert)
+    rather than by address."""
+    stack = Stack(resources=(
+        ResourceDesired(id="net", kind="vpc"),
+        ResourceDesired(id="web-sg", kind="sg", fields=_fields(vpc="net", ingressRules="tcp:80:0.0.0.0/0")),
+        ResourceDesired(id="db-sg", kind="sg", fields=_fields(vpc="net", ingressRules="tcp:5432:web-sg")),
+    ))
+    proj = generate_tf(stack)
+    assert proj.unsupported == []
+    body = proj.files["main.tf"]
+    assert "    security_groups = [aws_security_group.web_sg.id]" in body
+    assert "tcp:5432:web-sg" not in body  # the rule is compiled, not pasted
+
+
+def test_sg_ingress_naming_a_non_sg_source_lands_in_unsupported():
+    stack = Stack(resources=(
+        ResourceDesired(id="net", kind="vpc"),
+        ResourceDesired(id="db-sg", kind="sg", fields=_fields(vpc="net", ingressRules="tcp:5432:web-tier")),
+    ))
+    proj = generate_tf(stack)
+    assert proj.unsupported == [
+        "db-sg (sg): ingress rule source 'web-tier' is neither a CIDR (like 10.0.0.0/16) "
+        "nor the name of another Security Group node on the canvas"
+    ]
+
+
+def test_sg_ingress_naming_itself_is_unsupported_not_a_tf_cycle():
+    """A same-SG self-reference is real AWS (and needs TF's `self = true`) --
+    unmodeled, so it must be REPORTED, never emitted as an HCL self-reference
+    (which tofu rejects as a cycle)."""
+    stack = Stack(resources=(
+        ResourceDesired(id="net", kind="vpc"),
+        ResourceDesired(id="app-sg", kind="sg", fields=_fields(vpc="net", ingressRules="tcp:5432:app-sg")),
+    ))
+    proj = generate_tf(stack)
+    assert proj.unsupported and proj.unsupported[0].startswith("app-sg (sg): ingress rule source 'app-sg'")
+    assert "aws_security_group" not in proj.files["main.tf"]
 
 
 def test_iam_role_emits_name_and_the_lambda_trust_policy():
