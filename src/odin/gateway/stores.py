@@ -175,8 +175,14 @@ class SynthStores:
     - `logsctl`: the CloudWatch Logs model's whole state
       (`gateway/models/logsctl.py`, task W2.1) -- flat keys `"group:{name}"` /
       `"stream:{group}:{stream}"` / `"events:{group}"` (the per-group ring
-      buffer) / `"cursor:{group}:{stream}"` (the substrate log-shipping dedup
-      cursor), persisted at `.odin/{env}/gateway/logsctl.json`. Log-group tags
+      buffer) / `"barrier:{group}:{stream}"` (how many of that stream's stored
+      events predate the container currently behind it -- the substrate
+      log-shipping re-anchors on CONTENT and skips past this barrier, so a
+      restarted container's log does not duplicate the old one's). Pre-v0.7.1
+      stores may still hold a `"cursor:{group}:{stream}"` LINE COUNT under the
+      old scheme; nothing reads it -- a legacy line count read as a barrier
+      would silently duplicate whole streams -- and `_delete_log_group` sweeps
+      it. Persisted at `.odin/{env}/gateway/logsctl.json`. Log-group tags
       live in the shared `tags` store above, keyed `"logs:{logGroupArn}"` (the
       wildcard-less ARN form -- see logsctl.py's own ARN note).
     - `secretsctl`: the Secrets Manager model's whole state
