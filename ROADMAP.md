@@ -189,6 +189,58 @@ future decision against these points instead of re-deriving them:
     an explicit `CreateLogGroup` then ADOPTS that group instead of failing
     `ResourceAlreadyExists` — a deliberate deviation so Apply always
     converges after an invoke-before-you-drew-it.
+- [x] **Secrets Manager + SSM Parameter Store — where secrets live (W2.4).**
+  DONE 2026-07-25: the `secret` and `ssm` nodes are real. Both are full
+  gateway models — the control plane the TF provider drives (secret
+  create/describe/update/delete + `ListSecrets` + tag CRUD +
+  `GetResourcePolicy`; parameter put/delete/describe + tag CRUD → zero-drift
+  plans) *and* the value plane (`GetSecretValue`, `PutSecretValue`,
+  `UpdateSecretVersionStage`; `GetParameter`, `GetParameters`,
+  `GetParametersByPath`). The canvas label IS the secret/parameter name, so
+  an IAM edge drawn to one of these nodes is exactly what lets a workload
+  read the value — and a principal without that edge gets a real
+  AccessDenied.
+
+  **v1 limits, recorded rather than hidden:**
+  - No KMS at all. A secret's value and an SSM `SecureString` are stored
+    CLEARTEXT in a per-env JSON sidecar
+    (`.odin/{env}/gateway/secretsctl.json`, `.odin/{env}/gateway/ssmctl.json`)
+    written `0600`; `KmsKeyId`/`KeyId` are accepted, stored and echoed back
+    for Terraform fidelity and encrypt NOTHING. The protection is the file
+    mode and the machine boundary — see SECURITY.md's Secrets section.
+  - `DeleteSecret` is IMMEDIATE: `RecoveryWindowInDays` is accepted and
+    ignored, there is no recovery window and no `RestoreSecret`. A deliberate
+    deviation, and the thing that makes an empty-canvas Apply followed by a
+    re-Apply converge instead of wedging on "scheduled for deletion" — the
+    generated HCL says it out loud with `recovery_window_in_days = 0`.
+  - Secret ARNs carry no random 6-character suffix (`...:secret:name`, not
+    `...:secret:name-AbCdEf`), so they're deterministic per env.
+  - Versioning covers AWSCURRENT/AWSPREVIOUS plus arbitrary labels via
+    `UpdateSecretVersionStage`. Rotation is NOT modeled (`RotateSecret` is an
+    unmodeled action, `RotationEnabled` is always false), nor are replica
+    regions (`AddReplicaRegions` is accepted and ignored).
+  - A secret RESOURCE POLICY can't be authored — `GetResourcePolicy` always
+    answers "there is no policy" rather than storing an inert document that
+    would look enforced. Access is granted by IAM edges instead, which the
+    gateway enforces for real.
+  - `ListSecrets` filters match as case-insensitive SUBSTRINGS; AWS's own
+    word-prefix semantics and its `!` negation are not modeled, and an
+    unrecognized filter key matches nothing (fails closed).
+  - SSM keeps only the CURRENT version of a parameter — `Version` still
+    increments on every overwrite (so terraform sees a real change), but
+    `GetParameterHistory` and version LABELS (`LabelParameterVersion`,
+    selectors) are not modeled. Parameter POLICIES are stored and echoed back,
+    and nothing expires or notifies on them. The `Advanced` and
+    `Intelligent-Tiering` tiers behave exactly like `Standard`.
+  - `GetParametersByPath`/`DescribeParameters` don't paginate (`NextToken` is
+    never emitted; `MaxResults` truncates), and an unrecognized
+    `ParameterFilters` key/option matches nothing (fails closed).
+  - IAM authorization gap shared by both: a call carrying a LIST of names is
+    authorized against the FIRST one only, so a batch
+    `GetParameters(Names=[a, b])` passes with an edge to `a` alone. The
+    single-name reads a workload actually makes (`GetParameter`,
+    `GetSecretValue`) are exact. Same bounded gap the ecr/ecs classifiers
+    already carry.
 - **Recorded as UNSUPPORTED for now** (northstar directive 5's honesty rule):
   ALB/ELBv2, EKS, CloudFormation, autoscaling, and RDS-via-Terraform (rds
   nodes stay on the reconciler path until an RDS API model lands).
