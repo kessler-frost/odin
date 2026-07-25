@@ -137,8 +137,22 @@ future decision against these points instead of re-deriving them:
     the old tasks serving). Closing that needs the World projection to
     distinguish "serving the previous revision" from "healthy", or a service
     running old tasks would report `healthy` while its deployment failed — a
-    worse lie than the outage. The apply now FAILS loudly either way, so CI
-    stops instead of scoring the outage green. (Fixed: a
+    worse lie than the outage. The apply FAILS loudly either way, so CI
+    stops instead of scoring the outage green — but note it takes **two**
+    guards to make that sentence true, and v0.7.1 shipped only the first.
+    `wait_for_steady_state` is evaluated **only when tofu actually updates the
+    resource**, so field test 3 found the hole: any apply tofu sees as a NO-OP
+    (a re-apply on the already-broken service; an edit that only touches the
+    launch-time `env` map, which is deliberately not in the task definition)
+    skipped the check and reported `applied / tf: ok` at 0-of-3 tasks,
+    reproducibly. FIXED in v0.7.2 by odin's own post-apply verification —
+    `ecsctl.wait_for_steady_services`, run by `/apply-full` after its
+    convergence pass, which fails the apply naming the service, running-vs-
+    desired, and the real underlying reason
+    (`tests/simulate/test_ecs_noop_apply_outage_e2e.py`). Bounded by the same
+    60s budget as `timeouts.update` (`ODIN_ECS_STEADY_TIMEOUT` overrides), and
+    it returns the moment nothing is left pending, so a healthy apply pays one
+    store read. (Fixed: a
     `tags` block on `aws_ecs_service` now plans zero-drift — the gateway stores
     the full tag set and echoes it back, with
     `TagResource`/`UntagResource`/`ListTagsForResource` modeled.)
@@ -568,6 +582,15 @@ future decision against these points instead of re-deriving them:
     `ResourceDesired.refs` does not record whether a ref came from `env` or from
     a top-level field, so a top-level `${{...}}` field also arrives as an env
     var named after that field.
+  - **Not built: an ECS `command`.** The canvas has no `command` field for
+    `ecs` and `hcl.py::_ecs_container_definitions` emits only
+    `name`/`image`/`essential`/`portMappings`, so a task always runs its
+    image's own entrypoint (`compute/tasks.py` would honour a `command` in a
+    task definition, but nothing on the canvas path ever puts one there —
+    locked by `test_ecs_container_definitions_never_carry_a_command`). Worth
+    adding alongside the missing `env` editor if a real canvas needs to
+    override an entrypoint; SECURITY.md's "what odin executes" section must be
+    updated in the same change.
 - [x] **CloudWatch Logs — the log sink (W2.1).** DONE 2026-07-24: the `logs`
   node is real. `aws_cloudwatch_log_group` is a full gateway model
   (Create/Delete/DescribeLogGroups, Put/DeleteRetentionPolicy, tag CRUD →
@@ -739,6 +762,54 @@ future decision against these points instead of re-deriving them:
   by their own stores and backing containers — and ~15 modules bake `ACCOUNT`
   into ARNs. The TF provider never noticed either way
   (`skip_requesting_account_id = true`); only workload STS callers did.
+- **Drift is checked with `odin tf plan`, never by hand.** The generated
+  `main.tf` under `.odin/<env>/tf` is PORTABLE by design (real AWS Terraform —
+  the translation guardrail forbids `endpoints`/`localhost` in it), and the
+  endpoint + operator credentials are injected by the runner at invoke time.
+  So a hand-run `tofu plan` in that directory **talks to real AWS** — a field
+  engineer's first attempt did exactly that and came back with a genuine
+  `UnrecognizedClientException` from Amazon; on a machine with real
+  credentials in the environment it would have planned against the real
+  account (v0.7.2, field test 3; field test 2's U8 asked for this first).
+  Portability was kept and the safe path was made the obvious one instead:
+  `POST /tf/plan` / `odin tf plan` run through the same machinery `/tf/apply`
+  uses (same workspace, same injected `AWS_ENDPOINT_URL`, same per-env
+  OPERATOR credentials, same lock, same secret scrubbing) with
+  `tofu plan -detailed-exitcode`, and every materialized workspace now carries
+  a `README.md` that says the hazard out loud where someone would `cd`.
+  - **Exit codes are the product**: 0 no changes, 2 changes present, 1 a real
+    error or refusal — and 3, not 2, for an unreachable server, because 2
+    already means drift here and a down odin must not read as a clean
+    detection. (`odin tf plan` is the only command that deviates from the
+    repo-wide 0/1/2 contract, deliberately.)
+  - **Read-only**: no `-out` plan file, no `wiring.stage`, no Stack commit,
+    and it is NOT recorded on `odin tf status`'s last-run cache — a drift
+    check must not make the last real apply look like it went differently.
+    It DOES regenerate `main.tf`/`override.tf` from the current canvas first
+    (the same files an apply regenerates), which is what makes "changes
+    present" mean "the canvas and the env disagree".
+- **A failed Lambda invoke reports `FunctionError`, as real AWS does.**
+  `aws lambda invoke` on a handler that raises used to come back
+  `StatusCode: 200` with no `FunctionError` — the documented AWS way to
+  detect a failed invoke — so a CI job scored a crashing function as a
+  success (v0.7.2, field test 3; same failure shape as the exit-0-during-an-
+  outage bug: the truth was available and the success signal didn't reflect
+  it). **Cause:** the real RIE does not send `X-Amz-Function-Error` at all. A
+  raised handler answers `200 OK` with the error document as the BODY and no
+  header; an import failure or runtime exit answers `502` with the same
+  shape. odin read only that header, so the value was always None — and with
+  it `last_invocation_error`, the World verdict's own field (v0.7.1), which
+  is fed from the same value and was therefore also silently dead. odin's
+  fake RIE in the unit tests obligingly sent the header real RIE never sends.
+  `compute/functions.py::_function_error` now reads the invocation outcome
+  off the response RIE actually gives (non-200, or a body carrying BOTH
+  `errorType` and `errorMessage`), one signal feeding both the
+  `x-amz-function-error` response header the SDK parses and the durable
+  record. Always `Unhandled`: RIE collapses AWS's Handled/Unhandled
+  distinction, so odin reports the value an uncaught handler exception gets
+  on real AWS rather than inventing a difference it cannot observe. Proven by
+  `tests/simulate/test_lambda_failure_e2e.py` — real RIE containers, a real
+  gateway, and boto3's own `FunctionError` as the assertion.
 - **`tofu` runs are BOUNDED, and a wedged destroy says why.** `init`/`apply`
   each get `ODIN_TOFU_TIMEOUT` (default 600s); `destroy` gets a smaller
   WHOLE-CALL deadline, `ODIN_TOFU_DESTROY_TIMEOUT` (default 300s, `init`

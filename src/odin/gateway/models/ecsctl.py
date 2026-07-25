@@ -82,11 +82,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 import uuid
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from typing import NamedTuple
 
 from starlette.responses import Response
 
@@ -732,14 +734,16 @@ def _reconcile_service_tasks(
                 _stop_task(stores, env, task, runtime)
 
 
-def _spawn(target: Callable[..., None], *args: object) -> None:
-    threading.Thread(target=target, args=args, daemon=True).start()
+def _spawn(target: Callable[..., None], *args: object) -> threading.Thread:
+    thread = threading.Thread(target=target, args=args, daemon=True)
+    thread.start()
+    return thread
 
 
 def converge_services(
     stores: SynthStores, env: str, runtime: TaskRuntime,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
-) -> None:
+) -> list[threading.Thread]:
     """Re-converge every ACTIVE service's REAL task containers toward
     `desiredCount` -- the exact `_reconcile_service_tasks` pass CreateService/
     UpdateService already spawn, driven by an APPLY (server.py's /apply-full)
@@ -753,14 +757,130 @@ def converge_services(
     is odin's equivalent, deliberately triggered by the user's Apply instead
     of a background timer (the module docstring's "TF's read calls drive
     convergence, not a timer" limit stays: no new scheduler loop). Idempotent
-    -- a service already at desiredCount launches nothing."""
-    for service in _all_services(stores, env):
-        if service["status"] != "ACTIVE":
-            continue
+    -- a service already at desiredCount launches nothing.
+
+    Returns the spawned threads so the caller can WAIT for the convergence it
+    just asked for (`wait_for_steady_services`) instead of guessing at it.
+
+    The leading `sweep_tasks` is load-bearing (field test 3): a container that
+    exited on its own still reads RUNNING in the store until something sweeps
+    it, so without this the reconcile below counted a dead task as live and
+    launched nothing -- the Apply-is-the-recovery promise silently did nothing
+    for the most common failure there is. One sweep per Apply, the same
+    idempotent pass every World projection already runs."""
+    sweep_tasks(stores, env, runtime)
+    return [
         _spawn(
             _reconcile_service_tasks, stores, env, service["cluster_name"],
             service["service_name"], runtime, keystore, gateway_port,
         )
+        for service in _all_services(stores, env) if service["status"] == "ACTIVE"
+    ]
+
+
+# --- post-apply verification: an Apply may not report success at zero tasks --
+
+# Field test 3 (HIGH): `odin apply` exited 0 with `status: applied / tf: ok`
+# while the service sat at 0 of 3 tasks with every task failing. The v0.7.1
+# guard (`wait_for_steady_state` + a bounded `timeouts` on the tf resource) is
+# only ever evaluated when tofu actually UPDATES the service -- so any apply
+# tofu sees as a NO-OP (a re-apply on an already-broken service; an edit that
+# only touches the launch-time `env` map, which is deliberately not in the
+# task definition) skipped the check entirely and scored a full outage green.
+# Nothing in tofu can close that, by definition: tofu has nothing to do. So
+# odin verifies it itself, right after its own convergence pass.
+_STEADY_POLL_SECONDS = 0.5
+_STEADY_TIMEOUT_ENV = "ODIN_ECS_STEADY_TIMEOUT"
+
+
+def steady_timeout() -> float:
+    """The post-apply convergence budget, in seconds. Deliberately the SAME 60s
+    as `agent/hcl.py`'s `timeouts.update` (the tf-side twin of this check) --
+    one number for "how long may a task legitimately take to come up", not two.
+    `ODIN_ECS_STEADY_TIMEOUT` overrides, matching every other odin timeout."""
+    return float(os.environ.get(_STEADY_TIMEOUT_ENV, "60"))
+
+
+class ServiceShortfall(NamedTuple):
+    """One service that is below its desired task count: WHICH service, WHAT
+    was observed, and the real underlying reason when odin knows one (field
+    test 3's caveat: the failing image named only in /world and events was
+    never in the apply's own output)."""
+
+    node: str
+    running: int
+    desired: int
+    reason: str | None
+
+
+def task_verdict(task: dict) -> str:
+    """A STOPPED task's real reason as one human line -- the `docker` error
+    naming a bad image, an `UnresolvedRef` naming a broken `${{...}}`, or the
+    essential-container-exited reason plus its exit code. Shared with
+    `reconcile/tf_status.py`, which renders the same string as the node's
+    World verdict: the apply output and World must not disagree."""
+    reason = task.get("stopped_reason") or "task stopped"
+    exit_code = task.get("exit_code")
+    return f"{reason} (exit {exit_code})" if exit_code is not None else reason
+
+
+def _shortfall(stores: SynthStores, env: str, service: dict) -> tuple[ServiceShortfall, int] | None:
+    """`(shortfall, pending)` when this service is below desired, else None.
+    CURRENT-REVISION tasks only, for the same reason `_on_current_revision`
+    records: a stale task from the previous deployment is neither progress
+    toward this one nor a failure of it."""
+    tasks = _on_current_revision(service, _tasks_for_service(
+        stores, env, service["cluster_name"], service["service_name"],
+    ))
+    running = sum(1 for t in tasks if t["last_status"] == "RUNNING")
+    if running >= service["desired_count"]:
+        return None
+    stopped = [t for t in tasks if t["last_status"] == "STOPPED"]
+    latest = max(stopped, key=lambda t: t.get("stopped_at") or 0, default=None)
+    return ServiceShortfall(
+        node=service.get("node_label") or service["service_name"],
+        running=running, desired=service["desired_count"],
+        reason=task_verdict(latest) if latest is not None else None,
+    ), sum(1 for t in tasks if t["last_status"] not in ("RUNNING", "STOPPED"))
+
+
+def wait_for_steady_services(
+    stores: SynthStores, env: str, runtime: TaskRuntime,
+    converging: Iterable[threading.Thread] = (), timeout: float | None = None,
+) -> list[ServiceShortfall]:
+    """Every ACTIVE service still short of its desired task count once the
+    Apply's convergence has had its bounded chance -- empty means the whole
+    env's ECS surface is genuinely at desired count, which is the only state
+    an Apply may report success in.
+
+    Bounded three ways, so this never becomes a hang and never fails a service
+    that is legitimately still starting:
+      1. it JOINS `converging` (the threads `converge_services` just spawned),
+         so a slow first image pull is waited on rather than raced;
+      2. it returns the instant nothing is left PENDING -- a service short of
+         desired with no task still coming up cannot converge without another
+         Apply, so waiting out the budget would only make the failure slower;
+      3. it returns at `steady_timeout()` regardless.
+    A freshly created or scaled-up service never reaches here short: tofu's own
+    `wait_for_steady_state` already blocked on it, and a tofu failure has
+    already failed the apply before this runs.
+
+    `sweep_tasks` each pass for the same reason every World projection runs it:
+    a task whose container already exited still reads RUNNING in the store, and
+    counting that as healthy is precisely the lie this closes."""
+    deadline = time.monotonic() + (steady_timeout() if timeout is None else timeout)
+    for thread in converging:
+        thread.join(max(0.0, deadline - time.monotonic()))
+    while True:
+        sweep_tasks(stores, env, runtime)
+        short = [
+            found for service in _all_services(stores, env) if service["status"] == "ACTIVE"
+            for found in [_shortfall(stores, env, service)] if found is not None
+        ]
+        settled = all(pending == 0 for _, pending in short)
+        if not short or settled or time.monotonic() >= deadline:
+            return [shortfall for shortfall, _ in short]
+        time.sleep(_STEADY_POLL_SECONDS)
 
 
 # Per-(SynthStores, env, cluster, service) lock, serializing

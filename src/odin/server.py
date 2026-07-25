@@ -231,6 +231,11 @@ def create_apply_router(
 _TOFU_NOT_INSTALLED = {"error": "tofu not installed", "fix": "brew install opentofu"}
 
 
+# `tofu plan -detailed-exitcode`, as odin's own vocabulary. Anything not in
+# here (1, a signal, ...) is a real error -- see `/tf/plan`.
+_PLAN_STATUS = {0: "no_changes", 2: "changes"}
+
+
 class ImportTfRequest(BaseModel):
     source: Literal["hcl", "live"]
     hcl: str = ""
@@ -280,6 +285,41 @@ def create_tf_router(
         }
         if not result.ok:
             body["tail"] = list(result.tail)
+        return JSONResponse(status_code=200 if result.ok else 500, content=body)
+
+    @router.post("/tf/plan")
+    async def tf_plan(env: str = ENV) -> JSONResponse:
+        """Field test 3 (safety): the SAFE drift check. Everything `/tf/apply`
+        does to keep tofu pointed at odin's own gateway -- the injected
+        `AWS_ENDPOINT_URL`, this env's operator credentials, the same
+        workspace -- with `tofu plan -detailed-exitcode` in place of the
+        apply. The alternative a user is otherwise pushed to (hand-running
+        `tofu plan` in `.odin/<env>/tf`, whose main.tf is deliberately
+        portable and therefore endpoint-less) reaches REAL AWS.
+
+        Read-only, unlike `/tf/apply`: no admission control (nothing is
+        provisioned), no `wiring.stage`, no Stack commit -- the only writes
+        are the regenerated `main.tf`/`override.tf` (so the plan is against
+        the CURRENT canvas, which is what makes drift meaningful) and tofu's
+        own refresh, which it does not persist.
+
+        `exit_code` rides through verbatim so a CI gate can use tofu's own
+        contract: 0 no changes, 2 changes present, anything else an error."""
+        stack = store.get_stack(env)
+        project = generate_tf(stack)
+        access_key, secret_key = _issue_operator(env)
+        try:
+            result = await runner.plan(
+                env, project, gateway_port(), access_key, secret_key, secrets=stack.sensitive_values(),
+            )
+        except TofuNotInstalled:
+            return JSONResponse(status_code=409, content=_TOFU_NOT_INSTALLED)
+        except SimulateBusy as exc:
+            return JSONResponse(status_code=409, content={"error": str(exc)})
+        body = {
+            "status": _PLAN_STATUS.get(result.exit_code, "failed"), "env": env,
+            "exit_code": result.exit_code, "unsupported": project.unsupported, "tail": list(result.tail),
+        }
         return JSONResponse(status_code=200 if result.ok else 500, content=body)
 
     @router.post("/tf/destroy")
@@ -346,8 +386,11 @@ def create_apply_full_router(
     semantics, then translate (S3b) and, when the canvas has TF-supported
     resources, `tofu apply` through the gateway (S2). Every non-busy outcome
     is a 200 with an honest per-half status -- the reconciler half can
-    genuinely succeed while tofu fails ("applied_tf_failed"); 409 only when a
-    tofu run is already in flight for the env."""
+    genuinely succeed while tofu fails ("applied_tf_failed"), and BOTH halves
+    can succeed while a service is still short of its desired task count
+    ("applied_services_unhealthy", field test 3); 409 only when a tofu run is
+    already in flight for the env. Only `applied` is a clean apply; every
+    other status is a nonzero exit in `cli/apply.py`."""
     router = APIRouter()
 
     @router.post("/apply-full")
@@ -514,7 +557,7 @@ def create_apply_full_router(
         # A bare `TaskRuntime()` (not this app's `runtime`) deliberately: it
         # must be the SAME substrate that launched these containers, and
         # ecsctl's own `runtime or TaskRuntime()` default is what did.
-        ecsctl.converge_services(stores, env, TaskRuntime(), keystore, gateway_port())
+        converging = ecsctl.converge_services(stores, env, TaskRuntime(), keystore, gateway_port())
         # The same recovery for lambda, and for the same reason: a function's
         # RIE container is its EXECUTION ENVIRONMENT, not a TF resource -- an
         # `aws_lambda_function`'s config doesn't change when its container is
@@ -545,6 +588,29 @@ def create_apply_full_router(
         # compiled rules are unchanged is one local file comparison -- no
         # `limactl`, no signal. See ec2compute.ensure_instance_mesh.
         await asyncio.to_thread(ec2compute.ensure_instance_mesh, stores, env)
+        # Field test 3 (HIGH): an Apply may not report success while a service
+        # is short of its desired task count. tofu's own `wait_for_steady_state`
+        # only runs when tofu UPDATES the service, so every apply tofu sees as a
+        # NO-OP -- a re-apply on an already-broken service, or an edit that only
+        # touches the launch-time `env` map -- reported `applied / tf: ok` at
+        # 0-of-3 tasks. Nothing tofu-side can close that (tofu has nothing to
+        # do), so this is odin's own post-apply verification, placed LAST so the
+        # convergence above overlaps every other recovery pass and a healthy env
+        # costs one store read. Only when everything else went clean: a tofu
+        # failure has already failed this apply, and adding a second wait to it
+        # would only make an already-honest failure slower. Off the event loop:
+        # `wait_for_steady_services` joins real threads and sleeps.
+        if body["status"] == "applied":
+            shortfalls = await asyncio.to_thread(
+                ecsctl.wait_for_steady_services, stores, env, TaskRuntime(), converging,
+            )
+            if shortfalls:
+                body["status"] = "applied_services_unhealthy"
+                body["unhealthy"] = [s._asdict() for s in shortfalls]
+                body["note"] = (
+                    "desired state committed, but the service(s) above are not running "
+                    "their desired task count — fix and re-apply"
+                )
         await reconciler.tick()  # kick an immediate pass; the loop continues it
         return JSONResponse(status_code=200, content=body)
 

@@ -64,6 +64,26 @@ def test_rematerializing_overwrites_main_tf_and_override_tf(tmp_path):
     assert (tmp_path / "default" / "tf" / "main.tf").read_text() == "second"
 
 
+# --- field test 3: the workspace warns the human who cd's into it ---------
+
+
+def test_materialize_writes_a_readme_that_names_the_real_aws_hazard(tmp_path):
+    """main.tf stays PORTABLE (no endpoints -- it is real AWS Terraform on
+    purpose), so a hand-run `tofu plan` in this directory reaches real AWS.
+    The one place a person is standing when they are about to do that is this
+    directory, so the warning lives here too, not only in the README."""
+    workspace.materialize(tmp_path, "default", TfProject(files={"main.tf": "x"}))
+    readme = (tmp_path / "default" / "tf" / "README.md").read_text()
+    assert "REAL AWS" in readme
+    assert "odin tf plan --env default" in readme
+    assert "AWS_ENDPOINT_URL" in readme
+
+
+def test_the_workspace_readme_is_not_terraform_tofu_would_load(tmp_path):
+    workspace.materialize(tmp_path, "default", TfProject(files={"main.tf": "x"}))
+    assert not (tmp_path / "default" / "tf" / "README.md").name.endswith(".tf")
+
+
 def test_materialize_writes_binary_files_alongside_main_tf(tmp_path):
     # V4c: a lambda node's zip'd deployment package -- odin materializes it
     # itself, pre-tofu, into the same workspace `filename` references.

@@ -69,7 +69,11 @@ def logs(
         "", "--group",
         help="Read a CloudWatch log group instead, e.g. /aws/lambda/myfn or /ecs/myservice.",
     ),
-    tail: int = typer.Option(100, "--tail", help="Number of trailing log lines to fetch."),
+    tail: int = typer.Option(
+        100, "--tail",
+        help="Trailing log lines to show, in total — a node with several task "
+             "containers spends the budget newest-first; `==>` headers don't count.",
+    ),
     url: str = http.URL,
     output: OutputFormat = http.OUTPUT,
 ) -> None:

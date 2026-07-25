@@ -50,16 +50,21 @@ def fail(message: str, code: int = 1) -> typer.Exit:
 
 def request(
     method: str, url: str, path: str,
-    params: dict | None = None, body: dict | None = None,
+    params: dict | None = None, body: dict | None = None, unreachable_code: int = 2,
 ) -> httpx.Response:
-    """One round-trip to the odin server; a connection failure exits 2."""
+    """One round-trip to the odin server; a connection failure exits 2.
+
+    `unreachable_code` overrides that 2 for the one command whose own exit
+    codes need it: `odin tf plan` mirrors `tofu plan -detailed-exitcode`,
+    where 2 already means "changes present" -- a down server must not be
+    able to masquerade as drift in a CI gate, so it exits 3 there."""
     try:
         return httpx.request(
             method, f"{url.rstrip('/')}{path}", params=params, json=body, timeout=_TIMEOUT
         )
     except (httpx.ConnectError, httpx.ConnectTimeout):
         raise fail(
-            f"Could not reach odin server at {url} — is it running? Try `odin start`.", 2
+            f"Could not reach odin server at {url} — is it running? Try `odin start`.", unreachable_code
         ) from None
 
 
