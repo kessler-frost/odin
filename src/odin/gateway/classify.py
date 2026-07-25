@@ -85,6 +85,13 @@ denied via `unmappable-action` (the ec2/iam/ecr reasoning), while a workload
 principal without a matching statement still denies through ordinary
 default-deny.
 
+RDS (task W2.7) is the QUERY protocol (form-encoded `Action=`, like sns/ec2/
+iam -- not a JSON target header), and its resource is workload-facing like
+logs': an `rds` canvas node's label IS its `DBInstanceIdentifier`
+(agent/hcl.py's `_rds` builder emits `identifier = <label>`), so an
+`rds-db:connect` edge drawn to that node compiles to a statement the gateway
+enforces with no rds-specific code in the policy layer.
+
 S3 BUCKET-CONFIG READS (S2, discovered running real tofu through the real
 gateway): the TF AWS provider's `aws_s3_bucket` refresh probes bucket-config
 subresources -- `?policy`, `?tagging`, `?acl`, `?cors`, `?versioning`, etc.
@@ -225,6 +232,8 @@ def classify(
         return _classify_ecs(lower_headers, body)
     if service == "logs":
         return _classify_logs(lower_headers, body)
+    if service == "rds":
+        return _classify_rds(body)
     return None
 
 
@@ -409,6 +418,41 @@ def _bare_log_group(value: str) -> str:
     trimmed = value[:-2] if value.endswith(":*") else value
     _prefix, sep, name = trimmed.partition(":log-group:")
     return name.split(":log-stream:")[0] if sep else trimmed
+
+
+def _rds_resource(params: dict[str, str]) -> str:
+    """The bare DB-instance IDENTIFIER -- which for an `rds` canvas node IS
+    its label (agent/hcl.py's `_rds` builder emits `identifier = <label>`), so
+    an `rds-db:connect` / `rds:DescribeDBInstances` edge drawn to that node
+    gates through the ordinary `evaluate(statements, action, resource)` path
+    with no rds-specific plumbing (the same identity rule s3's bucket, sqs's
+    queue name and a log group's name already carry). The tag calls carry a
+    full ARN in `ResourceName` instead -- reduced to the same bare identifier,
+    the way `_sns_resource`/`_ecr_resource` strip theirs."""
+    identifier = params.get("DBInstanceIdentifier")
+    if identifier:
+        return identifier
+    resource_name = params.get("ResourceName", "")
+    _prefix, sep, name = resource_name.rpartition(":db:")
+    if sep and name:
+        return name
+    return "*"
+
+
+def _classify_rds(body: bytes) -> tuple[str, str] | None:
+    """RDS is the query protocol (form-encoded `Action=`), like sns/ec2/iam --
+    not a JSON target header. Never returns None for a request that carries an
+    `Action`: the fallback resource is `"*"` (the operator-only reasoning
+    ec2/iam/ecr/ecs already use), so a `tofu apply`'s bare
+    `DescribeDBInstances` is never denied as unmappable."""
+    try:
+        params = dict(parse_qsl(body.decode("utf-8"), keep_blank_values=True))
+    except UnicodeDecodeError:
+        return None
+    action_name = params.get("Action")
+    if not action_name:
+        return None
+    return f"rds:{action_name}", _rds_resource(params)
 
 
 def _classify_logs(lower_headers: dict[str, str], body: bytes) -> tuple[str, str] | None:

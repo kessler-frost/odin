@@ -60,7 +60,7 @@ from starlette.responses import Response
 from odin.aws.backings import ACCOUNT, REGION
 from odin.gateway import errors
 from odin.gateway.keys import KeyStore, Principal
-from odin.gateway.models import ec2compute, ecr, ecsctl, iamctl, lambdactl, logsctl
+from odin.gateway.models import ec2compute, ecr, ecsctl, iamctl, lambdactl, logsctl, rdsctl
 from odin.gateway.stores import SynthStores
 
 _SNS_NS = "http://sns.amazonaws.com/doc/2010-03-31/"
@@ -346,6 +346,7 @@ def pure_answer(
     action: str, resource: str, env: str, body: bytes, stores: SynthStores, now: float,
     backing_port: int | None = None, query: dict[str, str] | None = None,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
+    rds=None,
 ) -> Response | None:
     """A direct synth answer for a PURE/CONDITIONAL action, or None if
     `action` isn't synth-owned for this call -- the caller (app.py) forwards
@@ -380,7 +381,13 @@ def pure_answer(
     plane (Put/Get/FilterLogEvents, DescribeLogStreams, CreateLogStream) --
     the SINK the Lambda/ECS substrates ship their real container output into,
     so `odin logs` reads one place regardless of kind (gateway/models/
-    logsctl.py)."""
+    logsctl.py).
+    `rds:*` (task W2.7) is all-synth as well, with a REAL Postgres container
+    per instance as its substrate (`aws/rds.py::PostgresRds`) -- `rds` is the
+    injectable seam for it, threaded from app.py's `create_app(rds=...)` the
+    way `keystore`/`gateway_port` are, and None in production (the model then
+    builds a per-ENV substrate from the request's own env -- see
+    rdsctl.py::_substrate)."""
     if action.startswith("ec2:"):
         return ec2compute.pure_answer(action, resource, env, body, stores, now, keystore=keystore, gateway_port=gateway_port)
     if action.startswith("iam:"):
@@ -393,6 +400,8 @@ def pure_answer(
         return ecsctl.pure_answer(action, resource, env, body, stores, now, keystore=keystore, gateway_port=gateway_port)
     if action.startswith("logs:"):
         return logsctl.pure_answer(action, resource, env, body, stores, now)
+    if action.startswith("rds:"):
+        return rdsctl.pure_answer(action, resource, env, body, stores, now, rds=rds)
     handler = _PURE_HANDLERS.get(action)
     return handler(resource, env, body, stores, now) if handler else None
 

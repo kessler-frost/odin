@@ -179,6 +179,14 @@ class SynthStores:
       cursor), persisted at `.odin/{env}/gateway/logsctl.json`. Log-group tags
       live in the shared `tags` store above, keyed `"logs:{logGroupArn}"` (the
       wildcard-less ARN form -- see logsctl.py's own ARN note).
+    - `rdsctl`: the RDS model's whole state (`gateway/models/rdsctl.py`, task
+      W2.7) -- flat keys `"db:{identifier}"`, persisted at
+      `.odin/{env}/gateway/rdsctl.json`. DB-instance tags live in the shared
+      `tags` store above, keyed `"rds:{dbInstanceArn}"`. This record carries the
+      instance's MASTER PASSWORD (the DATABASE_URL World fact is built from it
+      and the drift sweep's health probe authenticates with it) -- the same
+      cleartext value the Stack revision on disk already holds, and this
+      sidecar is written 0600 like every other one.
     """
 
     def __init__(self, root: Path) -> None:
@@ -194,3 +202,4 @@ class SynthStores:
         self.lambdactl = JsonStore(root, "lambdactl")
         self.ecsctl = JsonStore(root, "ecsctl")
         self.logsctl = JsonStore(root, "logsctl")
+        self.rdsctl = JsonStore(root, "rdsctl")

@@ -576,6 +576,12 @@ def create_app(
     gateway_app = create_gateway_app(
         gateway_state, gateway_keystore, gateway_stores, on_deny,
         gateway_port=lambda: gateway_port_actual,
+        # W2.7: `rds` used to be the RECONCILER's Postgres provisioner; it's
+        # now the gateway's RDS-model substrate, because `aws_db_instance` is
+        # what creates a database today. A caller's stand-in (every api test)
+        # lands here; None (production) lets rdsctl build a per-env real
+        # `PostgresRds` from the request's own env.
+        rds=rds,
     )
     gateway_server = None
     gateway_thread = None

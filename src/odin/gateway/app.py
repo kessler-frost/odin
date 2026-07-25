@@ -134,6 +134,7 @@ def create_gateway_app(
     on_deny: OnDeny,
     forward_client: httpx.AsyncClient | None = None,
     gateway_port: Callable[[], int | None] | None = None,
+    rds=None,
 ) -> Starlette:
     """The gateway ASGI app. `forward_client` lets tests substitute a
     fake-backing transport (httpx.ASGITransport over a recording ASGI
@@ -145,7 +146,10 @@ def create_gateway_app(
     read at request time. Fix-wave 2b finding #2: threaded down to
     ec2compute/ecsctl/lambdactl (via synth.pure_answer) so a workload
     substrate's injected AWS_ENDPOINT_URL points at THIS gateway's real
-    port, never a stale/guessed one."""
+    port, never a stale/guessed one. `rds` (task W2.7) is the RDS model's
+    substrate seam -- a `PostgresRds`-shaped stand-in for tests, None in
+    production (the model builds a per-env real one itself; see
+    gateway/models/rdsctl.py::_substrate)."""
     client = forward_client or httpx.AsyncClient()
 
     async def catch_all(request: Request) -> Response:
@@ -205,7 +209,7 @@ def create_gateway_app(
         # path (the re-entrant PutItem/PutObject calls themselves).
         answer = lambda: synth.pure_answer(  # noqa: E731
             action, resource, principal.env, body, stores, now, backing_port, query_params,
-            keystore=keystore, gateway_port=gateway_port() if gateway_port else None,
+            keystore=keystore, gateway_port=gateway_port() if gateway_port else None, rds=rds,
         )
         pure = await asyncio.to_thread(answer) if action == "lambda:Invoke" else answer()
         if pure is not None:
