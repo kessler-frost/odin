@@ -63,15 +63,24 @@ def _render_logs(body: dict) -> None:
 
 @app.command()
 def logs(
-    node: str = typer.Argument(..., help="Canvas node label to fetch logs for."),
+    node: str = typer.Argument("", help="Canvas node label to fetch logs for (optional with --group)."),
     env: str = http.ENV,
+    group: str = typer.Option(
+        "", "--group",
+        help="Read a CloudWatch log group instead, e.g. /aws/lambda/myfn or /ecs/myservice.",
+    ),
     tail: int = typer.Option(100, "--tail", help="Number of trailing log lines to fetch."),
     url: str = http.URL,
     output: OutputFormat = http.OUTPUT,
 ) -> None:
     """Real logs off a node's actual backing container/VM — an unknown node
-    exits 1, a known-but-not-running one prints an honest message and exits 0."""
+    exits 1, a known-but-not-running one prints an honest message and exits 0.
+
+    `--group` reads odin's CloudWatch Logs sink directly instead, which is how
+    the groups the substrates fill in without being drawn are reached
+    (`/aws/lambda/{function}` per Invoke, `/ecs/{service}` per task sweep).
+    Naming neither a node nor a group exits 1."""
     body = http.body_or_fail(
-        http.request("GET", url, "/logs", params={"env": env, "node": node, "tail": tail})
+        http.request("GET", url, "/logs", params={"env": env, "node": node, "group": group, "tail": tail})
     )
     http.emit(body, output, _render_logs)

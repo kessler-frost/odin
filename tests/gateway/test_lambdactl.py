@@ -25,7 +25,7 @@ from starlette.responses import Response
 from odin.compute.functions import InvokeResult
 from odin.gateway.classify import classify
 from odin.gateway.keys import KeyStore, workload_env
-from odin.gateway.models import lambdactl
+from odin.gateway.models import lambdactl, logsctl
 from odin.gateway.stores import SynthStores
 
 from .conftest import split_url
@@ -45,11 +45,15 @@ class FakeFunctionRuntime:
 
     def __init__(
         self, fail_ensure: bool = False, invoke_response: bytes = b'{"ok": true}', invoke_error: str | None = None,
-        block: threading.Event | None = None,
+        block: threading.Event | None = None, log_text: str = "",
     ) -> None:
         self.fail_ensure = fail_ensure
         self.invoke_response = invoke_response
         self.invoke_error = invoke_error
+        # Stands in for the RIE container's own stdout/stderr: a test appends
+        # to it to simulate the handler printing, exactly as `docker logs
+        # --tail N` would then report it.
+        self.log_text = log_text
         # When set, `ensure()` blocks here until the test releases it -- lets
         # a test deterministically observe the `Pending`/`InProgress` window
         # instead of racing a near-instant fake deploy (found empirically:
@@ -59,6 +63,7 @@ class FakeFunctionRuntime:
         self.ensured: list[tuple] = []
         self.invoked: list[tuple] = []
         self.deleted: list[tuple] = []
+        self.log_reads: list[tuple] = []
 
     def extract_code(self, env: str, name: str, zip_bytes: bytes) -> Path:
         self.extracted.append((env, name, zip_bytes))
@@ -87,6 +92,10 @@ class FakeFunctionRuntime:
 
     def status(self, env: str, name: str) -> str:
         return "running"
+
+    def logs(self, env: str, name: str, tail: int = 20) -> str:
+        self.log_reads.append((env, name, tail))
+        return self.log_text
 
 
 def _parse(operation: str, response: Response, *, error: bool = False):
@@ -315,8 +324,15 @@ def test_concurrent_redeploys_do_not_corrupt_or_drop_each_others_fields(sink, la
     assert not errors
     # None of the 8 concurrent redeploys was silently overwritten by another
     # -- each independently reached `_redeploy_response` and spawned its own
-    # `_finish_deploy` (the fake substrate's `ensure` is synchronous/fast
-    # here, so all 8 plus the initial create have already landed).
+    # `_finish_deploy`. Those run on DAEMON threads, so this waits for all 9
+    # (8 redeploys + the initial create) rather than assuming they've already
+    # landed: the fake substrate's `ensure` is fast, not instantaneous, and
+    # asserting a thread-count immediately after `join()`ing the REQUEST
+    # threads is a race (found empirically once `_finish_deploy` grew one more
+    # store write ahead of `ensure` -- W2.1's log-shipping cursor reset).
+    deadline = time.monotonic() + 2.0
+    while len(substrate.ensured) < 9 and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert len(substrate.ensured) == 9
     # The sidecar itself was never left mid-write/corrupted by the hammering.
     sidecar = tmp_path / ENV / "gateway" / "lambdactl.json"
@@ -376,6 +392,105 @@ def test_invoke_unknown_function_is_not_found(sink, lambda_, stores):
     req = sink.call(lambda: lambda_.invoke(FunctionName="ghost", Payload=b"{}"))
     response = _answer(stores, req, FakeFunctionRuntime())
     assert response.status_code == 404
+
+
+# --- W2.1 piece 3: Invoke ships the container tail into /aws/lambda/{fn} --------
+
+
+_FN_LOG_GROUP = "/aws/lambda/fn1"
+_FN_LOG_STREAM = "odin-lambda-default-fn1"  # compute/functions.py::container_name
+
+
+def _invoke_once(stores, sink, lambda_, substrate) -> Response:
+    req = sink.call(lambda: lambda_.invoke(FunctionName="fn1", Payload=b"{}"))
+    return _answer(stores, req, substrate)
+
+
+def _shipped(stores) -> list[dict]:
+    return logsctl.stored_events(stores, ENV, _FN_LOG_GROUP, 100)
+
+
+def test_invoke_ships_the_container_tail_into_the_function_log_group(sink, lambda_, stores):
+    substrate = FakeFunctionRuntime(log_text="START RequestId: abc\nhello from the handler\nEND\n")
+    _create(stores, sink, lambda_, substrate)
+    _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
+
+    assert _invoke_once(stores, sink, lambda_, substrate).status_code == 200
+
+    events = _shipped(stores)
+    assert [e["message"] for e in events] == ["START RequestId: abc", "hello from the handler", "END"]
+    # One stream per real RIE container, named after the container itself
+    # (lambdactl.py's `_ship_logs`: RIE reuses one container for every invoke,
+    # so AWS's `{date}/[$LATEST]{requestId}` naming has nothing to key off).
+    assert {e["stream"] for e in events} == {_FN_LOG_STREAM}
+    # The group was auto-created by ingestion (logsctl deviation 1), so a
+    # later real CreateLogGroup can still adopt it.
+    assert logsctl.group_exists(stores, ENV, _FN_LOG_GROUP)
+
+
+def test_second_invoke_of_an_unchanged_tail_ships_nothing_new(sink, lambda_, stores):
+    """The dedup that makes shipping-per-invoke safe: `ingest_tail`'s cursor
+    counts the lines of this container's output already ingested, so re-reading
+    the same tail appends nothing -- only genuinely new lines land."""
+    substrate = FakeFunctionRuntime(log_text="line one\nline two\n")
+    _create(stores, sink, lambda_, substrate)
+    _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
+
+    _invoke_once(stores, sink, lambda_, substrate)
+    _invoke_once(stores, sink, lambda_, substrate)
+    assert [e["message"] for e in _shipped(stores)] == ["line one", "line two"]
+
+    # A THIRD invoke that actually printed something new ships only that line.
+    substrate.log_text += "line three\n"
+    _invoke_once(stores, sink, lambda_, substrate)
+    assert [e["message"] for e in _shipped(stores)] == ["line one", "line two", "line three"]
+
+
+def test_handler_error_invoke_still_ships_its_traceback(sink, lambda_, stores):
+    """The error path's logs are the whole point -- a handler that raised
+    returns a FunctionError header and its traceback lives only in the
+    container, so shipping must happen on that path too."""
+    substrate = FakeFunctionRuntime(
+        invoke_response=b'{"errorType": "ValueError"}', invoke_error="Unhandled",
+        log_text='Traceback (most recent call last):\nValueError: boom\n',
+    )
+    _create(stores, sink, lambda_, substrate)
+    _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
+
+    parsed = _parse("Invoke", _invoke_once(stores, sink, lambda_, substrate))
+    assert parsed["FunctionError"] == "Unhandled"
+    assert "ValueError: boom" in "\n".join(e["message"] for e in _shipped(stores))
+
+
+def test_a_redeploy_resets_the_cursor_so_the_new_containers_first_lines_still_ship(sink, lambda_, stores):
+    """A redeploy REPLACES the RIE container, whose output starts back at line
+    1 -- `_finish_deploy` forgets the stream's cursor (logsctl's
+    `reset_cursor`), so the fresh container's first lines are ingested instead
+    of being mistaken for already-seen ones. The events already stored stay
+    put: this resets the read position, never the log."""
+    substrate = FakeFunctionRuntime(log_text="old one\nold two\nold three\n")
+    _create(stores, sink, lambda_, substrate)
+    _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
+    _invoke_once(stores, sink, lambda_, substrate)
+    assert [e["message"] for e in _shipped(stores)] == ["old one", "old two", "old three"]
+
+    # The new container prints FEWER lines than the old cursor counted -- the
+    # exact case a stranded cursor would swallow whole.
+    substrate.log_text = "new one\n"
+    req = sink.call(lambda: lambda_.update_function_code(FunctionName="fn1", ZipFile=b"PK\x03\x04new"))
+    _parse("UpdateFunctionCode", _answer(stores, req, substrate))
+    _wait_for(stores, sink, lambda_, "fn1", "LastUpdateStatus", "Successful", substrate)
+
+    _invoke_once(stores, sink, lambda_, substrate)
+    assert [e["message"] for e in _shipped(stores)] == ["old one", "old two", "old three", "new one"]
+
+
+def test_invoke_before_active_never_reads_the_container_logs(sink, lambda_, stores):
+    substrate = FakeFunctionRuntime(block=threading.Event(), log_text="nothing to see")
+    _create(stores, sink, lambda_, substrate)
+    assert _invoke_once(stores, sink, lambda_, substrate).status_code == 502
+    assert substrate.log_reads == []
+    assert _shipped(stores) == []
 
 
 # --- ListVersionsByFunction / GetFunctionCodeSigningConfig ---------------------

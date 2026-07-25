@@ -46,16 +46,20 @@ _KIND = {
     "aws_sns_topic": "sns",
     "aws_dynamodb_table": "dynamodb",
     "aws_iam_role": "iam_role",
+    "aws_cloudwatch_log_group": "logs",
 }
 # The attribute each supported type's human-facing name lives in (mirrors
 # hcl.py's builders: s3 uses `bucket`, everything else uses `name`).
 _NAME_ATTR = {
     "aws_s3_bucket": "bucket", "aws_sqs_queue": "name", "aws_sns_topic": "name",
     "aws_dynamodb_table": "name", "aws_iam_role": "name",
+    "aws_cloudwatch_log_group": "name",
 }
-# canvas kind -> aws_* type, for mode (b) (the inverse of `_KIND`). iam_role has
-# no backing to live-import against, so it stays out of the live path.
-_TF_TYPE = {kind: rtype for rtype, kind in _KIND.items() if kind != "iam_role"}
+# canvas kind -> aws_* type, for mode (b) (the inverse of `_KIND`). iam_role and
+# logs have no backing to enumerate live resources from (both are pure gateway
+# models), so they stay out of the live path.
+_NO_LIVE_IMPORT = {"iam_role", "logs"}
+_TF_TYPE = {kind: rtype for rtype, kind in _KIND.items() if kind not in _NO_LIVE_IMPORT}
 
 # The HCL arguments each kind CARRIES into the canvas -- so a round-trip through
 # generate_tf reproduces them (finding #6). Any OTHER argument present on the
@@ -68,7 +72,12 @@ _CARRIED_ATTRS = {
     "sns": {"name"},
     "dynamodb": {"name", "hash_key", "range_key", "attribute"},
     "iam_role": {"name"},  # assume_role_policy/inline policies are NOT carried -> warned
+    "logs": {"name", "retention_in_days", "tags"},
 }
+# The kinds whose user `tags` map survives the round trip as node data (hcl.py's
+# `_tags_block` merges a node's own `tags` field back in for EVERY primary
+# builder, so this is purely about which imports bother to read them).
+_TAGGED_KINDS = {"s3", "logs"}
 
 
 class Unsupported(BaseModel):
@@ -172,7 +181,13 @@ def _node_data(kind: str, label: str, attrs: dict) -> dict:
             data["rangeKey"] = range_key
             if range_key in types:
                 data["rangeKeyType"] = types[range_key]
-    if kind == "s3":
+    if kind == "logs":
+        # python-hcl2 parses an unquoted `retention_in_days = 14` as a real int
+        # (verified empirically) -- the canvas field is text, so stringify it.
+        retention = attrs.get("retention_in_days")
+        if isinstance(retention, int):
+            data["retentionInDays"] = str(retention)
+    if kind in _TAGGED_KINDS:
         tags = _tags(attrs)
         if tags:
             data["tags"] = tags

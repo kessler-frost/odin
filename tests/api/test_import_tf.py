@@ -65,13 +65,29 @@ def test_import_tf_hcl_source_parses_for_real(tmp_path):
 
 def test_import_tf_hcl_source_lists_unsupported_types(tmp_path):
     app = _app(tmp_path)
-    body = {"source": "hcl", "hcl": 'resource "aws_cloudwatch_log_group" "logs" {\n  name = "logs"\n}\n'}
+    body = {"source": "hcl", "hcl": 'resource "aws_elasticache_cluster" "cache" {\n  cluster_id = "cache"\n}\n'}
     with TestClient(app) as client:
         resp = client.post("/import-tf", params={"env": "default"}, json=body)
     assert resp.status_code == 200
     unsupported = resp.json()["unsupported"]
-    assert unsupported == [{"type": "aws_cloudwatch_log_group", "name": "logs", "reason": unsupported[0]["reason"]}]
+    assert unsupported == [{"type": "aws_elasticache_cluster", "name": "cache", "reason": unsupported[0]["reason"]}]
     assert "not supported" in unsupported[0]["reason"]
+
+
+def test_import_tf_hcl_source_imports_a_log_group_as_a_logs_node(tmp_path):
+    # W2.1: aws_cloudwatch_log_group used to be THIS module's example of an
+    # unsupported type -- it now imports for real, retention and all.
+    app = _app(tmp_path)
+    hcl = 'resource "aws_cloudwatch_log_group" "app" {\n  name = "/odin/app"\n  retention_in_days = 14\n}\n'
+    with TestClient(app) as client:
+        resp = client.post("/import-tf", params={"env": "default"}, json={"source": "hcl", "hcl": hcl})
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["nodes"] == [{
+        "id": "/odin/app", "type": "logs", "position": {"x": 0, "y": 0},
+        "data": {"label": "/odin/app", "retentionInDays": "14"},
+    }]
+    assert payload["unsupported"] == []
 
 
 def test_import_tf_live_source_issues_operator_credentials_and_forwards_to_import_live(tmp_path, monkeypatch):

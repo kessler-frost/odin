@@ -172,6 +172,13 @@ class SynthStores:
       `"taskdef:{family}:{revision}"` / `"service:{cluster}:{name}"` /
       `"task:{cluster}:{task_id}"`, persisted at
       `.odin/{env}/gateway/ecsctl.json`.
+    - `logsctl`: the CloudWatch Logs model's whole state
+      (`gateway/models/logsctl.py`, task W2.1) -- flat keys `"group:{name}"` /
+      `"stream:{group}:{stream}"` / `"events:{group}"` (the per-group ring
+      buffer) / `"cursor:{group}:{stream}"` (the substrate log-shipping dedup
+      cursor), persisted at `.odin/{env}/gateway/logsctl.json`. Log-group tags
+      live in the shared `tags` store above, keyed `"logs:{logGroupArn}"` (the
+      wildcard-less ARN form -- see logsctl.py's own ARN note).
     """
 
     def __init__(self, root: Path) -> None:
@@ -186,3 +193,4 @@ class SynthStores:
         self.ec2compute = JsonStore(root, "ec2compute")
         self.lambdactl = JsonStore(root, "lambdactl")
         self.ecsctl = JsonStore(root, "ecsctl")
+        self.logsctl = JsonStore(root, "logsctl")

@@ -1,7 +1,7 @@
 """S2.5 — canvas graph -> desired Stack (kinds, fields, refs)."""
 from __future__ import annotations
 
-from odin.spec.translate import canvas_to_stack, parse_ref
+from odin.spec.translate import canvas_to_stack, parse_ref, skipped_node_types
 
 
 def test_parse_ref():
@@ -169,3 +169,28 @@ def test_iam_role_and_ecr_translate_with_fields_passed_generically():
     assert by_id["lambda-exec"].fields["inlinePolicy"].value == '{"Version": "2012-10-17"}'
 
     assert by_id["app-image"].kind == "ecr"
+
+
+def test_logs_translates_as_a_gateway_model_kind_and_is_never_skipped():
+    # W2.1: `logs` joins iam_role/ecr/ec2/lambda/ecs -- plan.py NoOps it and the
+    # gateway model owns its whole lifecycle, so the translator needs nothing
+    # but the _KIND entry. It must NOT read as an unsupported node type: that's
+    # what Apply/Preview show the user as "silently dropped".
+    canvas = {
+        "nodes": [{"id": "n1", "type": "logs", "data": {"label": "/odin/app", "retentionInDays": "14"}}],
+        "edges": [],
+    }
+    stack = canvas_to_stack(canvas)
+    (group,) = stack.resources
+    assert group.id == "/odin/app"  # the label IS the log group name
+    assert group.kind == "logs"
+    assert group.fields["retentionInDays"].value == "14"
+    assert skipped_node_types(canvas) == []
+
+
+def test_logs_with_a_blank_retention_field_carries_no_retention_at_all():
+    # The catalog's default is '' (unset = AWS's never-expire), and the
+    # translator drops empty fields -- so hcl.py's builder omits the argument.
+    canvas = {"nodes": [{"type": "logs", "data": {"label": "/odin/app", "retentionInDays": ""}}], "edges": []}
+    (group,) = canvas_to_stack(canvas).resources
+    assert "retentionInDays" not in group.fields

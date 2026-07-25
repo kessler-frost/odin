@@ -1,17 +1,17 @@
 """`GET /logs` -- resolve a canvas node label to its real backing
-container(s)/VM and return their logs. Observability v1: today a running
-workload's logs are simply unreachable and a crash's cause is discarded.
-This is the one route both the CLI (`odin logs`) and the UI's Logs tab
-fetch-on-demand path hit.
+container(s)/VM and return their logs, or read one CloudWatch log GROUP
+directly (`?group=`). Observability v1: today a running workload's logs are
+simply unreachable and a crash's cause is discarded. This is the one route
+both the CLI (`odin logs`) and the UI's Logs tab fetch-on-demand path hit.
 
 Every outcome is an honest 200 -- an unknown node, a kind with no runnable
 backing (vpc/subnet/sg/iam_role/ecr are real API/network primitives, not a
 process), or a real backing that simply isn't running yet all answer with
 `found`/`running` + a `message`, never a 500 (the same "absent is not an
 exception" contract `aws/backings.py::BackingAws.exists` already keeps). An
-UNKNOWN node is the one genuine error (an `error` field, so
-`cli/http.py::body_or_fail` treats it as a hard failure the same way every
-other odin command already does).
+UNKNOWN node -- and a call naming NEITHER a node nor a group -- is the one
+genuine error (an `error` field, so `cli/http.py::body_or_fail` treats it as
+a hard failure the same way every other odin command already does).
 
 Kind -> real backing:
 - rds: the direct Postgres container (aws/rds.py::PostgresRds).
@@ -26,9 +26,21 @@ Kind -> real backing:
   than one real container when desiredCount > 1, or a crash-looping task
   that's been replaced. Also always on Colima, matching TaskRuntime's own
   default.
+- logs: no container of its own -- an `aws_cloudwatch_log_group` node IS the
+  SINK, so this reads the events stored under the group whose name is the
+  node's label (`gateway/models/logsctl.py::stored_events`).
 - vpc/subnet/sg/iam_role/ecr: no runnable backing at all.
+
+`?group=` bypasses node resolution entirely and reads ANY group in the env's
+sink -- including the ones the substrates auto-create without anybody drawing
+them (`/aws/lambda/{function}` from an Invoke, `/ecs/{service}` from the task
+sweep). It's the read that makes those groups reachable: `odin logs --group
+/aws/lambda/foo`. When both `node` and `group` arrive, the group wins (the
+caller asked for a specific group) and `node` is echoed back unchanged.
 """
 from __future__ import annotations
+
+from datetime import datetime, timezone
 
 from fastapi import APIRouter
 from pydantic import BaseModel
@@ -38,6 +50,7 @@ from odin.aws.rds import PostgresRds
 from odin.compute import functions as lambda_compute
 from odin.compute import instances as ec2_compute
 from odin.compute import tasks as ecs_compute
+from odin.gateway.models import logsctl
 from odin.gateway.stores import SynthStores
 from odin.runtime.colima import ColimaRuntime
 from odin.spec.store import SpecStore
@@ -150,6 +163,42 @@ def _from_containers(
     )
 
 
+def _stored_line(event: dict, with_stream: bool) -> str:
+    """One stored event as one human line: an ISO-8601 UTC timestamp (the
+    stored `timestamp` is CloudWatch's own epoch MILLISECONDS), the stream
+    name when the group has more than one (a `/ecs/{service}` group has one
+    stream per task -- without the name, two tasks' output would interleave
+    unattributably), then the message verbatim."""
+    when = datetime.fromtimestamp(event["timestamp"] / 1000, timezone.utc).isoformat(timespec="milliseconds")
+    stream = f" [{event['stream']}]" if with_stream else ""
+    return f"{when}{stream} {event['message']}"
+
+
+def fetch_group_logs(
+    stores: SynthStores, env: str, group: str, tail: int = DEFAULT_TAIL,
+    node: str = "", kind: str | None = None,
+) -> LogsResponse:
+    """One log GROUP's stored events, newest LAST (the order a terminal reads
+    naturally), as one text block. `running` is `True` whenever the group
+    exists: a log group is a sink, not a process -- there is nothing here that
+    could be "up", and reporting `False` for a group that's holding real
+    events would read as a failure that isn't one. `sources` is the stream
+    names the rendered events came from."""
+    events = logsctl.stored_events(stores, env, group, tail)
+    exists = logsctl.group_exists(stores, env, group)
+    streams = sorted({event["stream"] for event in events})
+    message = None
+    if not exists:
+        message = f"no log group {group!r} in env {env!r} yet — nothing has been ingested into it"
+    elif not events:
+        message = f"log group {group!r} exists but has no events yet"
+    return LogsResponse(
+        env=env, node=node, kind=kind, found=True, running=exists, sources=streams,
+        lines="\n".join(_stored_line(event, len(streams) > 1) for event in events),
+        message=message,
+    )
+
+
 def fetch_logs(
     store: SpecStore, stores: SynthStores, runtime, env: str, node: str, tail: int = DEFAULT_TAIL,
 ) -> LogsResponse:
@@ -201,6 +250,13 @@ def fetch_logs(
         names = [ecs_compute.container_name(env, task_id, cdef_name) for task_id, cdef_name in containers]
         return _from_containers(env, node, kind, colima, names, tail)
 
+    if kind == "logs":
+        # A log group's identity IS its name, and odin's canonical resource id
+        # is the node label -- so the group this node backs is the one named
+        # after it, no tag lookup needed (unlike ec2/lambda/ecs above, whose
+        # real ids are server-minted).
+        return fetch_group_logs(stores, env, node, tail, node=node, kind=kind)
+
     return LogsResponse(env=env, node=node, kind=kind, found=True, message=f"no logs available for kind {kind!r}")
 
 
@@ -208,9 +264,13 @@ def create_logs_router(store: SpecStore, stores: SynthStores, runtime) -> APIRou
     router = APIRouter()
 
     @router.get("/logs")
-    def logs_route(env: str = "default", node: str = "", tail: int = DEFAULT_TAIL) -> LogsResponse:
-        if not node:
-            return LogsResponse(env=env, node=node, error="node is required")
+    def logs_route(
+        env: str = "default", node: str = "", group: str = "", tail: int = DEFAULT_TAIL,
+    ) -> LogsResponse:
+        if not node and not group:
+            return LogsResponse(env=env, node=node, error="node or group is required")
+        if group:  # an explicit group read wins over node resolution (module docstring)
+            return fetch_group_logs(stores, env, group, tail, node=node)
         return fetch_logs(store, stores, runtime, env, node, tail)
 
     return router

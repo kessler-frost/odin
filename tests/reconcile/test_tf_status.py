@@ -1,6 +1,6 @@
 """Fix-wave 2b finding #1 -- reconcile/tf_status.py: a pure, read-only
-projection of TF-owned resources (vpc/subnet/sg/ec2/ecs/lambda/iam_role/ecr
--- kinds only tofu ever creates/destroys, never entered into World before
+projection of TF-owned resources (vpc/subnet/sg/ec2/ecs/lambda/iam_role/ecr/
+logs -- kinds only tofu ever creates/destroys, never entered into World before
 this fix) from the gateway's synth stores into `label -> (kind, phase,
 facts, verdict)`. Hand-built `SynthStores`, no reconciler/asyncio involved
 -- see tests/reconcile/test_reconciler.py for the Reconciler-level
@@ -16,7 +16,7 @@ ENV = "default"
 def test_tf_owned_kinds_excludes_reconciler_owned_kinds():
     # s3/sqs/sns/dynamodb already get real World entries via the reconciler's
     # own PROVISIONED path -- this projection must never double-own them.
-    assert TF_OWNED_KINDS == {"vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr"}
+    assert TF_OWNED_KINDS == {"vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr", "logs"}
 
 
 # --- vpc/subnet/sg: no AWS-native name field, so the odin:node tag is the
@@ -73,6 +73,65 @@ def test_ecr_healthy_and_falls_back_to_repository_name(tmp_path):
     stores = SynthStores(tmp_path)
     stores.ecr.set(ENV, "repo:app-image", {"repository_name": "app-image", "repository_arn": "arn:aws:ecr:us-east-1:000000000000:repository/app-image"})
     assert project(stores, ENV)["app-image"] == ("ecr", "healthy", {}, None)
+
+
+# --- logs (W2.1): healthy on existence, tag-then-group-name label -- except an
+# `auto` group, which the SUBSTRATE created and the canvas never drew. --------
+
+
+def _log_group(name: str, auto: bool = False, retention: int | None = None) -> dict:
+    return {
+        "log_group_name": name, "creation_time": 1_700_000_000_000,
+        "retention_in_days": retention, "auto": auto,
+    }
+
+
+def test_log_group_projects_healthy_under_its_odin_node_tag(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.logsctl.set(ENV, "group:/odin/app", _log_group("/odin/app", retention=14))
+    stores.tags.set(
+        ENV, "logs:arn:aws:logs:us-east-1:000000000000:log-group:/odin/app",
+        {"odin:node": "the-canvas-label"},
+    )
+    result = project(stores, ENV)
+    assert result["the-canvas-label"] == ("logs", "healthy", {}, None)
+    assert "/odin/app" not in result
+
+
+def test_log_group_falls_back_to_its_own_group_name_when_untagged(tmp_path):
+    # The group name already IS the canvas label by construction (hcl.py's
+    # `_logs` builder), so the fallback is exact, not a guess.
+    stores = SynthStores(tmp_path)
+    stores.logsctl.set(ENV, "group:/odin/app", _log_group("/odin/app"))
+    assert project(stores, ENV)["/odin/app"] == ("logs", "healthy", {}, None)
+
+
+def test_auto_created_log_group_is_not_projected(tmp_path):
+    # A substrate-created `/aws/lambda/{fn}` group is bookkeeping, not a canvas
+    # node -- projecting it would strand a phantom World resource nothing can
+    # ever prune (no Stack resource carries that label).
+    stores = SynthStores(tmp_path)
+    stores.logsctl.set(ENV, "group:/aws/lambda/fn1", _log_group("/aws/lambda/fn1", auto=True))
+    assert project(stores, ENV) == {}
+
+
+def test_adopted_log_group_projects_once_tofu_owns_it(tmp_path):
+    # CreateLogGroup ADOPTS an auto group (logsctl.py's deviation 2), clearing
+    # the flag -- from that point the canvas owns it and World must show it.
+    stores = SynthStores(tmp_path)
+    stores.logsctl.set(ENV, "group:/aws/lambda/fn1", _log_group("/aws/lambda/fn1", auto=False))
+    assert project(stores, ENV)["/aws/lambda/fn1"] == ("logs", "healthy", {}, None)
+
+
+def test_log_streams_events_and_cursors_are_not_projected_as_resources(tmp_path):
+    # The logsctl store also holds the DATA plane (streams, event ring buffers,
+    # tail cursors) -- only `group:` records are World resources.
+    stores = SynthStores(tmp_path)
+    stores.logsctl.set(ENV, "group:/odin/app", _log_group("/odin/app"))
+    stores.logsctl.set(ENV, "stream:/odin/app:s1", {"log_group": "/odin/app", "log_stream_name": "s1"})
+    stores.logsctl.set(ENV, "events:/odin/app", [{"stream": "s1", "timestamp": 1, "message": "hi"}])
+    stores.logsctl.set(ENV, "cursor:/odin/app:s1", 1)
+    assert set(project(stores, ENV)) == {"/odin/app"}
 
 
 # --- ec2: the flagship case -- a real Lima VM state machine mapped onto the
@@ -185,17 +244,28 @@ def test_lambda_failed_state_reason_becomes_the_verdict(tmp_path):
 
 class FakeTaskRuntime:
     """`sweep_tasks`'s injectable seam -- reports whatever container status/
-    exit code the test pre-seeds, no real Colima involved."""
+    exit code/log tail the test pre-seeds, no real Colima involved."""
 
-    def __init__(self, statuses: dict[str, str] | None = None, exit_codes: dict[str, int] | None = None):
+    def __init__(
+        self, statuses: dict[str, str] | None = None, exit_codes: dict[str, int] | None = None,
+        logs: dict[str, str] | None = None,
+    ):
         self._statuses = statuses or {}
         self._exit_codes = exit_codes or {}
+        self._logs = logs or {}
 
     def status(self, env, task_id, container_name):
         return self._statuses.get(task_id, "running")
 
     def exit_code(self, env, task_id, container_name):
         return self._exit_codes.get(task_id, 0)
+
+    def logs(self, env, task_id, container_name, tail=20):
+        # W2.1: the sweep now also ships each task container's tail into
+        # `/ecs/{service}` (ecsctl.py's `_ship_task_logs`), so this seam has to
+        # answer for a log read too. "" (nothing seeded) is a real container's
+        # own answer once it has been removed, so it needs no special case.
+        return self._logs.get(task_id, "")
 
 
 def _ecs_service(cluster: str, name: str, desired: int, status: str = "ACTIVE", node_label: str | None = None) -> dict:
@@ -314,6 +384,22 @@ def test_ecs_service_falls_back_to_service_name_without_node_label(tmp_path):
     stores = SynthStores(tmp_path)
     stores.ecsctl.set(ENV, "service:odin:app", _ecs_service("odin", "app", desired=0))
     assert "app" in project(stores, ENV)
+
+
+def test_the_ecs_sweeps_own_auto_created_log_group_never_enters_world(tmp_path):
+    # The `auto` skip against its real producer, not a hand-set flag: shipping a
+    # task's tail really does create `/ecs/app` (logsctl's `ensure_group`), and
+    # that group must stay OUT of World -- nobody drew it on the canvas.
+    stores = SynthStores(tmp_path)
+    stores.ecsctl.set(ENV, "service:odin:app", _ecs_service("odin", "app", desired=1))
+    stores.ecsctl.set(ENV, "task:odin:t1", _ecs_task("odin", "app", "t1", "RUNNING"))
+    runtime = FakeTaskRuntime(logs={"t1": "hello from the task\n"})
+
+    result = project(stores, ENV, ecs_runtime=runtime)
+
+    assert stores.logsctl.get(ENV, "group:/ecs/app")["auto"] is True
+    assert set(result) == {"app"}
+    assert project(stores, ENV, ecs_runtime=runtime).keys() == {"app"}  # still absent next tick
 
 
 # --- multi-kind smoke: nothing clobbers anything else's label namespace ---

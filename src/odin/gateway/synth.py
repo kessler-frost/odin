@@ -60,7 +60,7 @@ from starlette.responses import Response
 from odin.aws.backings import ACCOUNT, REGION
 from odin.gateway import errors
 from odin.gateway.keys import KeyStore, Principal
-from odin.gateway.models import ec2compute, ecr, ecsctl, iamctl, lambdactl
+from odin.gateway.models import ec2compute, ecr, ecsctl, iamctl, lambdactl, logsctl
 from odin.gateway.stores import SynthStores
 
 _SNS_NS = "http://sns.amazonaws.com/doc/2010-03-31/"
@@ -373,7 +373,14 @@ def pure_answer(
     resource's own `odin:node` tag and calls `gateway.keys.workload_env` to
     inject the workload's keystore identity into the real container/VM it's
     booting. Both are None in every test that doesn't care (app.py's
-    production caller always supplies both)."""
+    production caller always supplies both).
+    `logs:*` (task W2.1) is all-synth too, and the ONE modeled family whose
+    substrate is odin's own JSON sidecar rather than a container: the
+    CloudWatch Logs control plane (`aws_cloudwatch_log_group`) plus its data
+    plane (Put/Get/FilterLogEvents, DescribeLogStreams, CreateLogStream) --
+    the SINK the Lambda/ECS substrates ship their real container output into,
+    so `odin logs` reads one place regardless of kind (gateway/models/
+    logsctl.py)."""
     if action.startswith("ec2:"):
         return ec2compute.pure_answer(action, resource, env, body, stores, now, keystore=keystore, gateway_port=gateway_port)
     if action.startswith("iam:"):
@@ -384,6 +391,8 @@ def pure_answer(
         return lambdactl.pure_answer(action, resource, env, body, stores, now, query=query, keystore=keystore, gateway_port=gateway_port)
     if action.startswith("ecs:"):
         return ecsctl.pure_answer(action, resource, env, body, stores, now, keystore=keystore, gateway_port=gateway_port)
+    if action.startswith("logs:"):
+        return logsctl.pure_answer(action, resource, env, body, stores, now)
     handler = _PURE_HANDLERS.get(action)
     return handler(resource, env, body, stores, now) if handler else None
 

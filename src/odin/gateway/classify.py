@@ -71,6 +71,20 @@ falls back to `"*"` rather than ever returning None -- the only principal
 driving ECS calls in v1 is the OPERATOR (TF-authored clusters/services), so
 this only needs to never deny it via `unmappable-action`.
 
+LOGS (task W2.1) SHARES ECR's JSON-target SHAPE but is the FIRST modeled
+service whose resource is a real WORKLOAD-FACING label again (like s3/sqs/
+sns/dynamodb, unlike the operator-only ec2/iam/ecr/lambda/ecs families): a
+`logs` canvas node's label IS its log-group name (agent/hcl.py's `_logs`
+builder emits `name = <label>`), so `_logs_resource` returning the bare group
+name is exactly what `policy.compile_policies` puts in an iam edge's
+statement -- draw `lambda -> log-group` with `logs:PutLogEvents` and the
+gateway enforces it for real, with no logs-specific code in the policy layer.
+A call that carries no group at all (a bare `DescribeLogGroups`) falls back to
+its `logGroupNamePrefix`, else `"*"` -- never None, so the OPERATOR is never
+denied via `unmappable-action` (the ec2/iam/ecr reasoning), while a workload
+principal without a matching statement still denies through ordinary
+default-deny.
+
 S3 BUCKET-CONFIG READS (S2, discovered running real tofu through the real
 gateway): the TF AWS provider's `aws_s3_bucket` refresh probes bucket-config
 subresources -- `?policy`, `?tagging`, `?acl`, `?cors`, `?versioning`, etc.
@@ -209,6 +223,8 @@ def classify(
         return _classify_lambda(method, path, body)
     if service == "ecs":
         return _classify_ecs(lower_headers, body)
+    if service == "logs":
+        return _classify_logs(lower_headers, body)
     return None
 
 
@@ -363,6 +379,48 @@ def _ecs_resource(op: str, payload: dict) -> str:
         tasks = payload.get("tasks")
         return _bare_id(tasks[0]) if isinstance(tasks, list) and tasks else "*"
     return "*"
+
+
+def _logs_resource(payload: dict) -> str:
+    """The bare LOG GROUP NAME -- which for a `logs` canvas node IS its label
+    (agent/hcl.py's `_logs` builder sets `name = <label>`), so an iam edge
+    drawn to that node gates every call here through the ordinary
+    `evaluate(statements, action, resource)` path with no logs-specific
+    plumbing (see the module docstring's LOGS note). `logGroupIdentifier` /
+    `resourceArn` carry an ARN instead of a name -- reduced to the same bare
+    group name, the way `_sns_resource`/`_ecr_resource` already strip theirs.
+    """
+    for key in ("logGroupName", "logGroupIdentifier", "resourceArn"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return _bare_log_group(value)
+    identifiers = payload.get("logGroupIdentifiers")
+    if isinstance(identifiers, list) and identifiers and isinstance(identifiers[0], str):
+        return _bare_log_group(identifiers[0])
+    prefix = payload.get("logGroupNamePrefix")
+    return prefix if isinstance(prefix, str) and prefix else "*"
+
+
+def _bare_log_group(value: str) -> str:
+    """`arn:aws:logs:...:log-group:/aws/lambda/f[:*]` -> `/aws/lambda/f`; a
+    value that isn't an ARN comes back unchanged. Kept in lock-step with
+    `gateway/models/logsctl.py::_group_from_arn` (same two ARN forms: real
+    CloudWatch reports the `:*` wildcard suffix, the TF provider trims it)."""
+    trimmed = value[:-2] if value.endswith(":*") else value
+    _prefix, sep, name = trimmed.partition(":log-group:")
+    return name.split(":log-stream:")[0] if sep else trimmed
+
+
+def _classify_logs(lower_headers: dict[str, str], body: bytes) -> tuple[str, str] | None:
+    target = lower_headers.get("x-amz-target")
+    if target is None or "." not in target:
+        return None
+    op = target.rsplit(".", 1)[1]
+    try:
+        payload = json.loads(body) if body else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return f"logs:{op}", _logs_resource(payload)
 
 
 def _classify_ecs(lower_headers: dict[str, str], body: bytes) -> tuple[str, str] | None:

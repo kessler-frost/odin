@@ -12,6 +12,11 @@ export const defaultPermissions: Record<string, string[]> = {
   sqs: ['sqs:SendMessage', 'sqs:ReceiveMessage'],
   sns: ['sns:Publish'],
   rds: ['rds-db:connect'],
+  // W2.1: what a workload actually needs to WRITE to a log group it's edged
+  // to. The read verbs (GetLogEvents/FilterLogEvents/DescribeLogStreams) are
+  // in the catalog's `iamActions` list to tick, but aren't defaults — a
+  // workload writing its own logs is the common case, reading them back isn't.
+  logs: ['logs:CreateLogStream', 'logs:PutLogEvents'],
 };
 
 // Compute kinds act as IAM principals; permission edges run compute → resource.
