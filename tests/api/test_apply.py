@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 from fastapi.testclient import TestClient
 
 from odin.runtime.colima import ContainerFacts, HostFacts, RunHandle
 from odin.server import create_app
+from odin.simulate.workspace import tf_dir
 from odin.spec.store import SpecStore
 
 
@@ -200,3 +202,60 @@ def test_destroy_revokes_the_envs_gateway_keys(tmp_path):
 
         client.post("/destroy")
         assert app.state.gateway_keys.lookup(access_key) is None
+
+
+# --- field test 3, P2-5: `/world` must not lose a resource that EXISTS ------
+#
+# A 22-node canvas whose ECS node never came up failed the apply, and a failed
+# apply deliberately does not commit the desired state -- so the reconciler
+# never provisioned or observed the 12 s3/sqs/sns/dynamodb nodes and the
+# trailing `gc({})` stopped the backings it had just booted. `odin world`
+# showed 12 rows; `tofu state` showed 26 resources; `aws s3api list-buckets`
+# answered ServiceUnavailable. The nodes had no badge at all.
+
+
+def _tf_state(root, env, *names):
+    directory = tf_dir(root, env)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "terraform.tfstate").write_text(json.dumps({
+        "version": 4,
+        "resources": [
+            {"mode": "managed", "type": "aws_s3_bucket", "name": name,
+             "instances": [{"attributes": {"bucket": name, "tags": {"odin:node": name}}}]}
+            for name in names
+        ],
+    }))
+
+
+def test_world_shows_a_resource_tofu_created_whose_backing_is_down(tmp_path):
+    # A non-`default` env deliberately: `default` is the env lifespan always
+    # resumes a reconciler for, and that reconciler republishes the gateway's
+    # routing table every tick -- which is the very thing the next test sets.
+    store = SpecStore(tmp_path)
+    app = create_app(runtime=FakeRuntime(), store=store, rds=FakeRds(), backings=False)
+    _tf_state(store.root, "e2", "uploads")
+    with TestClient(app) as client:
+        rows = client.get("/world", params={"env": "e2"}).json()["resources"]
+
+    assert [r["id"] for r in rows] == ["uploads"], "a resource that exists must not vanish"
+    assert rows[0]["kind"] == "s3"
+    assert rows[0]["phase"] == "crashed"                       # an honest phase, not absence
+    assert "ServiceUnavailable" in rows[0]["verdict"]           # ...and the error the user sees
+
+
+def test_world_says_nothing_extra_once_the_gateway_can_route_to_the_backing(tmp_path):
+    """No false alarm during a healthy apply: the backing is up from
+    `ensure_backings` well before the reconciler observes the new bucket, and
+    the gateway's own routing table is what this reads."""
+    store = SpecStore(tmp_path)
+    app = create_app(runtime=FakeRuntime(), store=store, rds=FakeRds(), backings=False)
+    _tf_state(store.root, "e2", "uploads")
+    app.state.gateway.update("e2", {}, {"s3": 9000})  # what ensure_backings registers
+    with TestClient(app) as client:
+        assert client.get("/world", params={"env": "e2"}).json()["resources"] == []
+
+
+def test_world_stays_empty_for_an_env_that_never_applied_anything(tmp_path):
+    app = create_app(runtime=FakeRuntime(), store=SpecStore(tmp_path), rds=FakeRds(), backings=False)
+    with TestClient(app) as client:
+        assert client.get("/world", params={"env": "nothing-here"}).json()["resources"] == []

@@ -9,6 +9,7 @@ WebSocket.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -28,7 +29,7 @@ from odin.api.canvas import CanvasGraph, create_canvas_router
 from odin.api.debug import create_debug_router
 from odin.api.logs import create_logs_router
 from odin.api.ws import ConnectionManager
-from odin.aws.backings import BackingAws
+from odin.aws.backings import PROVISIONED, BackingAws
 from odin.compute.tasks import TaskRuntime
 from odin.fabric.localhost import LocalhostFabric
 from odin.fabric.nebula import mesh_state, reap_orphaned_lighthouses
@@ -41,15 +42,17 @@ from odin.gateway.stores import SynthStores
 from odin.reconcile import admission
 from odin.reconcile.drift import DriftSweeper
 from odin.reconcile.reconciler import Reconciler
+from odin.reconcile.tf_status import stranded_in_tf_state
 from odin.runtime.colima import ColimaRuntime
 from odin.simulate.runner import SimulateBusy, TfRunner, TofuNotInstalled
-from odin.spec.models import Stack
+from odin.spec.models import Stack, World
 from odin.spec.store import SpecStore
 from odin.spec.translate import canvas_to_stack, skipped_node_types
-from odin.util import hold_store_lock, odin_version
+from odin.util import STORE_LOCK_NAME, StoreLock, hold_store_lock, odin_version
 
 ODIN_DIR = Path(".odin")
-CANVAS_PATH = ODIN_DIR / "canvas.json"
+CANVAS_NAME = "canvas.json"
+CANVAS_PATH = ODIN_DIR / CANVAS_NAME
 ENV = "default"
 
 log = logging.getLogger("odin")
@@ -78,6 +81,28 @@ async def _csrf_guard(request: Request, call_next):
                 content={"error": "cross-origin request rejected (odin has no authentication; only same-origin requests are trusted)"},
             )
     return await call_next(request)
+
+
+def not_covered(skipped: list[str], unsupported: list[str]) -> list[str]:
+    """Everything a request did NOT act on, in ONE array — the field a CI gate
+    should read, published by the API itself.
+
+    Fresh-user MISLEAD-1: the README told CI to gate on `.unsupported`, but a
+    node whose KIND odin has no model for at all lands in `.skipped` and
+    `.unsupported` stayed `[]`. `jq -e '.unsupported | length == 0'` returned
+    true — exit 0 — while two drawn nodes were silently dropped. Two arrays
+    with adjacent meanings is a gate you can get right and still be wrong.
+
+    v0.7.3 computed this union in `cli/apply.py`, which left `curl /apply-full`
+    — how an agent or a CI job without the odin CLI consumes odin, and an equal
+    citizen per NORTHSTAR directive 8 — with the original trap. It lives here
+    now, and the CLI reads it rather than recomputing it: one source of truth.
+
+    `skipped` = a canvas node type that never became a Stack resource (a kind
+    odin doesn't model, or a typo). `unsupported` = a resource odin models but
+    can't generate Terraform for, with the reason. Both are still emitted
+    verbatim alongside; this is a union, not a replacement."""
+    return [*skipped, *unsupported]
 
 
 def _bump_epoch(env_epoch: dict[str, int], env: str) -> int:
@@ -115,7 +140,7 @@ async def _admission_rejection(runtime, store: SpecStore, stack: Stack) -> JSONR
 
 def create_apply_router(
     store: SpecStore, reconciler_for, keystore: KeyStore, runner: TfRunner, gateway_port, env_epoch: dict[str, int],
-    stores: SynthStores,
+    stores: SynthStores, gateway: GatewayState,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -126,7 +151,14 @@ def create_apply_router(
         stack = canvas_to_stack(canvas, env=env)
         rev = store.apply(stack)
         await reconciler.tick()  # kick an immediate pass; the loop continues it
-        return {"status": "applied", "rev": rev, "env": env, "skipped": skipped_node_types(canvas)}
+        skipped = skipped_node_types(canvas)
+        # No `unsupported` half here: this route never generates Terraform, so
+        # the union is the skipped list -- still published under the same name
+        # every other apply surface uses, so a gate reads ONE field everywhere.
+        return {
+            "status": "applied", "rev": rev, "env": env,
+            "skipped": skipped, "not_covered": not_covered(skipped, []),
+        }
 
     @router.post("/destroy")
     async def destroy(env: str = ENV) -> JSONResponse:
@@ -222,7 +254,22 @@ def create_apply_router(
 
     @router.get("/world")
     def world(env: str = ENV) -> dict:
-        return store.current_world(env).model_dump()
+        """The env's observed World, plus the resources tofu really created
+        that odin can currently see nowhere else (field test 3, P2-5: after a
+        failed apply the s3/sqs/sns/dynamodb nodes had NO BADGE AT ALL while
+        tofu's state listed them and every call answered ServiceUnavailable).
+
+        `reachable` is the gateway's own routing table -- the very thing that
+        decides between forwarding a call and refusing it -- so this reports
+        exactly the resources the gateway would genuinely refuse right now, and
+        nothing during a healthy apply. See `stranded_in_tf_state` for why this
+        is a per-request overlay rather than a World write."""
+        observed = store.current_world(env)
+        reachable = {kind for kind in PROVISIONED if gateway.backing_port(env, kind) is not None}
+        stranded = stranded_in_tf_state(store.root, env, observed, reachable)
+        return World(
+            env=observed.env, resources=(*observed.resources, *stranded),
+        ).model_dump()
 
     @router.get("/mesh")
     def mesh(env: str = ENV) -> dict:
@@ -251,9 +298,16 @@ class ImportTfRequest(BaseModel):
     resources: list[dict] = []  # [{"type": "s3", "id": "uploads"}, ...] -- see import_tf.LiveResource
 
 
+def _saved_canvas(path: Path) -> dict:
+    """The canvas currently on disk (`GET /canvas`'s own source), or an empty
+    one. Never raises: a plan must not fail because nobody has drawn yet."""
+    return json.loads(path.read_text()) if path.is_file() else {}
+
+
 def create_tf_router(
     store: SpecStore, runner: TfRunner, keystore: KeyStore, gateway_port,
     translate_cache: translate_mod.TranslateCache, runtime, stores: SynthStores,
+    canvas_path: Path = CANVAS_PATH,
 ) -> APIRouter:
     """`/tf/*` -- Simulate's own apply/destroy/status, independent of the
     canvas `/apply`/`/destroy` above (S2 CONTRACT ADDENDUM: routes named
@@ -291,6 +345,10 @@ def create_tf_router(
         body = {
             "status": "applied" if result.ok else "failed", "env": env,
             "exit_code": result.exit_code, "unsupported": project.unsupported,
+            # This route applies the STORED Stack -- no canvas is read, so
+            # there is no `skipped` half and the union is `unsupported`. The
+            # field is published anyway so one gate shape covers every route.
+            "not_covered": not_covered([], project.unsupported),
         }
         if not result.ok:
             body["tail"] = list(result.tail)
@@ -313,8 +371,23 @@ def create_tf_router(
         own refresh, which it does not persist.
 
         `exit_code` rides through verbatim so a CI gate can use tofu's own
-        contract: 0 no changes, 2 changes present, anything else an error."""
+        contract: 0 no changes, 2 changes present, anything else an error.
+
+        COVERAGE, and what it describes (v0.7.4). `unsupported` comes from the
+        very Stack this plan runs on, so it is exact. `skipped` cannot: a
+        canvas node whose KIND odin has no model for never became a Stack
+        resource at all, so the SAVED CANVAS is the only place it still exists
+        -- and the saved canvas is one global file (`.odin/canvas.json`) while
+        a Stack is per-env, so it is not necessarily what this env last
+        applied. Rather than quietly describe a different thing than the plan
+        (v0.7.3's bug: the CLI fetched the canvas and unioned it in with no
+        check at all), the two are compared here and `canvas_drift` + `note`
+        say so, in the payload and in the CLI's own output, whenever they
+        differ."""
         stack = store.get_stack(env)
+        canvas = _saved_canvas(canvas_path)
+        skipped = skipped_node_types(canvas)
+        canvas_drift = canvas_to_stack(canvas, env=env) != stack
         project = generate_tf(stack)
         access_key, secret_key = _issue_operator(env)
         try:
@@ -328,7 +401,15 @@ def create_tf_router(
         body = {
             "status": _PLAN_STATUS.get(result.exit_code, "failed"), "env": env,
             "exit_code": result.exit_code, "unsupported": project.unsupported, "tail": list(result.tail),
+            "skipped": skipped, "not_covered": not_covered(skipped, project.unsupported),
+            "canvas_drift": canvas_drift,
         }
+        if canvas_drift:
+            body["note"] = (
+                f"the saved canvas is not what env {env!r} last applied — this plan covers the "
+                "last-applied Stack (so `unsupported` describes the plan), while `skipped` "
+                "describes the saved canvas. Apply to make them the same."
+            )
         return JSONResponse(status_code=200 if result.ok else 500, content=body)
 
     @router.post("/tf/destroy")
@@ -430,10 +511,14 @@ def create_apply_full_router(
         my_epoch = _bump_epoch(env_epoch, env) if not stack.resources else env_epoch.get(env, 0)
 
         translated = await translate_mod.translate(stack, cache=translate_cache)
+        skipped = skipped_node_types(canvas)
         body = {
             "status": "applied", "rev": None, "env": env,
-            "skipped": skipped_node_types(canvas),
+            "skipped": skipped,
             "refined": translated.refined, "unsupported": translated.unsupported,
+            # The ONE array a CI gate should read -- see `not_covered`'s own
+            # docstring for the green-while-dropping-nodes trap it closes.
+            "not_covered": not_covered(skipped, translated.unsupported),
             "tf": None,
         }
 
@@ -626,6 +711,35 @@ def create_apply_full_router(
     return router
 
 
+# How often a live server re-checks that its own store lock is still reachable
+# by path. One `stat` per second; the window it bounds is how long odin can
+# lie about whether a server is up after something deletes `.odin/lock`.
+LOCK_WATCH_INTERVAL = 1.0
+
+
+async def _keep_store_lock(lock: StoreLock, interval: float = LOCK_WATCH_INTERVAL) -> None:
+    """Put the store lock FILE back if anything deletes it under this server.
+
+    Field test 4: `rm -rf .odin` releases no lock (flock lives on the inode)
+    but makes it unreachable by path, so `odin status` said "not running"
+    while the server was still serving, `odin import` restored into the live
+    store, and a SECOND server was started on it. `StoreLock.reassert` is the
+    repair; this is the only thing that has to run for it to happen. A warning
+    every interval is the correct volume for the one case it cannot repair --
+    another process already holding the file that replaced ours means two
+    servers really are on this store.
+    """
+    while True:
+        await asyncio.sleep(interval)
+        if not await asyncio.to_thread(lock.reassert):
+            log.warning(
+                "the store lock file was gone or was not ours -- re-established it. Something "
+                "deleted %s under a live server (`odin clean --all`, `rm -rf`); until this ran, "
+                "`odin status` reported no server and `odin import` would have restored into a "
+                "live store.", lock.root / STORE_LOCK_NAME,
+            )
+
+
 async def _reap_orphaned_ec2_vms(root: Path, envs: list[str], stores: SynthStores) -> None:
     """Best-effort (release finding #4): `limactl` being unavailable, or
     any other reaper failure, must never block server startup -- this is a
@@ -804,6 +918,10 @@ def create_app(
         # once nothing is writing to it. (Never a reason to fail startup: an
         # unlockable store answers "free", see util._flock.)
         store_lock = hold_store_lock(_store.root)
+        # ...and a watchdog that puts the lock FILE back if anything deletes it
+        # (field test 4 -- see `_keep_store_lock`). The lock itself survives the
+        # deletion; only the evidence odin can find by path does not.
+        lock_watch = asyncio.create_task(_keep_store_lock(store_lock))
         envs = _store.list_envs()
         if _reap_ec2_vms:
             await _reap_orphaned_ec2_vms(_store.root, envs, gateway_stores)
@@ -812,6 +930,7 @@ def create_app(
         try:
             yield
         finally:
+            lock_watch.cancel()
             for reconciler in reconcilers.values():
                 await reconciler.stop()
             stop_in_thread(gateway_server, gateway_thread)
@@ -819,17 +938,24 @@ def create_app(
 
     app = FastAPI(title="odin", version=odin_version(), lifespan=lifespan)
     app.middleware("http")(_csrf_guard)
-    app.include_router(create_canvas_router(CANVAS_PATH))
+    # The saved canvas belongs to the STORE, not to the process's cwd: in
+    # production `_store.root` IS `.odin`, so this is the same
+    # `.odin/canvas.json` `odin backup`'s archive already resolves as
+    # `root / CANVAS_NAME` -- but a caller that brought its own store (every
+    # test) now reads and writes its OWN canvas instead of the real one under
+    # the checkout. The module constant stays as the documented location.
+    canvas_path = _store.root / CANVAS_NAME
+    app.include_router(create_canvas_router(canvas_path))
     app.include_router(
         create_apply_router(
             _store, reconciler_for, gateway_keystore, tf_runner, lambda: gateway_port_actual, env_epoch,
-            gateway_stores,
+            gateway_stores, gateway_state,
         )
     )
     app.include_router(
         create_tf_router(
             _store, tf_runner, gateway_keystore, lambda: gateway_port_actual,
-            translate_cache, _runtime, gateway_stores,
+            translate_cache, _runtime, gateway_stores, canvas_path,
         )
     )
     app.include_router(
