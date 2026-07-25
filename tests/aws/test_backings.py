@@ -24,6 +24,7 @@ class FakeRuntime:
     stopped: list[str] = field(default_factory=list)
     statuses: dict[str, str] = field(default_factory=dict)
     ports: dict[str, int] = field(default_factory=dict)
+    published: dict[str, set[int]] = field(default_factory=dict)  # name -> inside-ports really published
     images: set[str] = field(default_factory=set)
     builds: list[str] = field(default_factory=list)
     # call logs — each entry is a real docker-CLI-shaped subprocess in prod,
@@ -35,11 +36,17 @@ class FakeRuntime:
         self.runs.append(spec)
         self.statuses[spec.name] = "running"
         self.ports[spec.name] = 51000 + len(self.runs)
+        # Real docker only answers `docker port` for a port the container was
+        # actually created WITH -- load-bearing for the stranded-port
+        # self-heal (a goaws container published on the OLD gateway port
+        # publishes nothing on the new one).
+        self.published[spec.name] = set(spec.ports)
 
     def stop(self, name: str) -> None:
         self.stopped.append(name)
         self.statuses.pop(name, None)
         self.ports.pop(name, None)
+        self.published.pop(name, None)
 
     def status(self, name: str) -> str:
         self.status_calls.append(name)
@@ -47,6 +54,8 @@ class FakeRuntime:
 
     def host_port(self, name: str, container_port: int) -> int:
         self.port_calls.append(name)
+        if container_port not in self.published.get(name, set()):
+            return 0
         return self.ports.get(name, 0)
 
     def logs(self, name: str, tail: int = 20) -> str:
@@ -131,6 +140,46 @@ def test_ensure_backing_is_idempotent_while_running(rt, factory, tmp_path):
     assert len(rt.runs) == 1
 
 
+# --- W2.2: the stranded-port self-heal. A running container that no longer
+# publishes the inside-port this instance needs must be RECREATED, not
+# adopted -- goaws's listener port IS the gateway port, so a gateway-port
+# change used to strand it as BackingUnavailable forever. --------------------
+
+
+def test_goaws_container_on_a_stale_gateway_port_is_recreated(rt, factory, tmp_path):
+    old = BackingAws(rt, env="default", root=tmp_path, client_factory=factory, gateway_port=4266)
+    old.ensure_backing("sqs")
+    assert rt.runs[0].ports == {4266: 0}  # goaws listens on the gateway's port
+
+    # The app restarted onto a different gateway port; the container from the
+    # previous run is still up, still publishing 4266 and nothing else.
+    fresh = BackingAws(rt, env="default", root=tmp_path, client_factory=factory, gateway_port=4300)
+    fresh.ensure_backing("sqs")
+
+    assert len(rt.runs) == 2, "adopting the stranded container is the bug"
+    assert rt.runs[1].ports == {4300: 0}
+    assert rt.stopped.count("odin-aws-goaws-default") == 2  # rm -f before each run
+    # And the whole point: a client can actually be built now.
+    assert fresh.client("sqs") is not None
+    # goaws.yaml was rewritten with the current port too, else the container
+    # would publish 4300 while its listener bound 4266.
+    assert 'Port: "4300"' in (tmp_path / "default" / "goaws.yaml").read_text()
+
+
+def test_a_running_backing_that_publishes_its_port_is_still_adopted(rt, factory, tmp_path):
+    # The normal path must be untouched: same gateway port, no recreate.
+    aws = _aws(rt, factory, tmp_path)
+    aws.ensure_backing("sqs")
+    aws.ensure_backing("sqs")
+    other = BackingAws(
+        rt, env="default", root=tmp_path, client_factory=factory, gateway_port=DEFAULT_GATEWAY_PORT,
+    )
+    other.ensure_backing("sns")  # the SAME container serves both kinds
+
+    assert len(rt.runs) == 1
+    assert rt.stopped.count("odin-aws-goaws-default") == 1
+
+
 def test_ensure_backing_is_thread_safe_against_concurrent_callers(rt, factory, tmp_path):
     """S5 regression: /apply-full calls ensure_backing directly while the
     SAME BackingAws instance's Reconciler background loop can independently
@@ -196,6 +245,7 @@ def test_ensure_backing_heals_a_stale_already_in_use_conflict(rt, factory, tmp_p
         time.sleep(0.1)  # simulate the other creator's docker run finishing shortly after
         conflict_rt.statuses[cname] = "running"
         conflict_rt.ports[cname] = 51000
+        conflict_rt.published[cname] = {9000}  # ...publishing rustfs's real wire port
 
     threading.Thread(target=_external_creator_wins).start()
 

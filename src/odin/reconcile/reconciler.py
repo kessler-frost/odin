@@ -4,7 +4,10 @@ Each tick: (1) observe — refresh the World from runtime facts + assertions,
 advancing started resources to healthy/crashed; (2) plan(Stack, World) → Actions;
 (3) execute — provision/stop; (4) project the gateway's TF-owned resources
 (vpc/subnet/sg/ec2/ecs/lambda/iam_role/ecr) into World too (fix-wave 2b
-finding #1 -- see reconcile/tf_status.py). The pure plan() decides intent for
+finding #1 -- see reconcile/tf_status.py), cross-checked against REALITY on a
+bounded cadence (W2.2 -- see reconcile/drift.py: a VM/container deleted out of
+band projects `crashed` with a verdict instead of a permanent stale `healthy`).
+The pure plan() decides intent for
 rds + the AWS-shaped PROVISIONED resources; this executor builds specs
 (resolving refs via the Fabric) and runs them; TF_OWNED_KINDS never go
 through plan/execute at all -- tofu is their sole creator/destroyer, this
@@ -30,6 +33,7 @@ from odin.gateway.policy import compile_policies
 from odin.gateway.stores import SynthStores
 from odin.reconcile import assertions
 from odin.reconcile.actions import NoOp, ProvisionResource, StopContainer
+from odin.reconcile.drift import DriftSweeper
 from odin.reconcile.plan import plan
 from odin.reconcile.tf_status import TF_OWNED_KINDS, project as project_tf_owned
 from odin.runtime.colima import CONTAINER_HOST
@@ -53,6 +57,7 @@ class Reconciler:
         pg_ready=assertions.pg_ready,
         poll_interval: float = 2.0,
         stores: SynthStores | None = None,
+        drift: DriftSweeper | None = None,
     ) -> None:
         self._store = store
         self._rt = runtime
@@ -70,6 +75,12 @@ class Reconciler:
         # every test that doesn't care; server.py's real wiring always
         # passes the SAME SynthStores instance the gateway itself uses.
         self._stores = stores
+        # W2.2's reality sweep (reconcile/drift.py) -- the same optional-seam
+        # shape as `stores`/`aws`/`gateway`: None means "no reality check"
+        # (every unit test that hand-seeds synth records and doesn't want a
+        # real `limactl list`/`docker ps` leaves it out), and create_app's
+        # real, runtime-backed wiring always passes one.
+        self._drift = drift
         self._task: asyncio.Task | None = None
         self._stop = False
         # tick() is called by BOTH the background loop and the /apply//destroy
@@ -125,14 +136,30 @@ class Reconciler:
         """`tf_status.project()` is the whole snapshot; diff it against the
         current World and emit only what changed (`_emit`'s own dedupe) plus
         prune any label that dropped out (tofu destroyed it -- this loop
-        never destroys a TF-owned resource itself)."""
+        never destroys a TF-owned resource itself).
+
+        W2.2: the drift sweep runs FIRST, deliberately -- its ecs half writes
+        reality back into the task records (reconcile/drift.py's module
+        docstring), so a container removed outside odin surfaces on THIS
+        tick's projection rather than the next one; its ec2/lambda half comes
+        back as a `label -> verdict` overlay that turns a record still
+        claiming to be up into an honest `crashed` + why. `_emit`'s existing
+        crashed path is what then broadcasts both the WorldDelta and the
+        `type:"log"` error line -- drift needs no pipeline of its own."""
+        drifted = await self._drift_verdicts()
         projected = await asyncio.to_thread(project_tf_owned, self._stores, self._env)
         for label, (kind, phase, facts, verdict) in projected.items():
+            phase, verdict = ("crashed", drifted[label]) if label in drifted else (phase, verdict)
             await self._emit(label, kind, phase, facts=facts, verdict=verdict)
         world = self._store.current_world(self._env)
         for observed in world.resources:
             if observed.kind in TF_OWNED_KINDS and observed.id not in projected:
                 await self._prune(observed.id)
+
+    async def _drift_verdicts(self) -> dict[str, str]:
+        if self._drift is None:
+            return {}
+        return await asyncio.to_thread(self._drift.verdicts, self._stores, self._env)
 
     async def ensure_backings(self, stack: Stack) -> None:
         """Boot (but don't create any resource on) the backing containers

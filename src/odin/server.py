@@ -28,14 +28,16 @@ from odin.api.logs import create_logs_router
 from odin.api.ws import ConnectionManager
 from odin.aws.backings import BackingAws
 from odin.aws.rds import PostgresRds
+from odin.compute.tasks import TaskRuntime
 from odin.fabric.localhost import LocalhostFabric
 from odin.fabric.nebula import mesh_state
 from odin.gateway import DEFAULT_GATEWAY_PORT, GATEWAY_PORT_ENV
 from odin.gateway.app import GatewayState, create_gateway_app, serve_in_thread, stop_in_thread
 from odin.gateway.keys import OPERATOR_NODE_ID, KeyStore, Principal
-from odin.gateway.models import ec2compute
+from odin.gateway.models import ec2compute, ecsctl
 from odin.gateway.stores import SynthStores
 from odin.reconcile import admission
+from odin.reconcile.drift import DriftSweeper
 from odin.reconcile.reconciler import Reconciler
 from odin.runtime.colima import ColimaRuntime
 from odin.simulate.runner import SimulateBusy, TfRunner, TofuNotInstalled
@@ -289,7 +291,7 @@ _SUPERSEDED = {"error": "superseded by a newer teardown/apply"}
 
 def create_apply_full_router(
     store: SpecStore, reconciler_for, runner: TfRunner, keystore: KeyStore, gateway_port, env_epoch: dict[str, int],
-    translate_cache: translate_mod.TranslateCache, runtime,
+    translate_cache: translate_mod.TranslateCache, runtime, stores: SynthStores,
 ) -> APIRouter:
     """S5 -- the UI's single Apply button: /apply's exact canvas->Stack->tick
     semantics, then translate (S3b) and, when the canvas has TF-supported
@@ -445,6 +447,18 @@ def create_apply_full_router(
                 body["note"] = "desired state not committed; fix and re-apply"
             else:
                 body["rev"] = store.apply(stack)  # the desired state goes live before any tick can run
+        # W2.2: an Apply is also the recovery for drift the reality sweep
+        # reported. An ECS task is not a TF resource -- nothing in an
+        # `aws_ecs_service`'s config changes when its container is destroyed
+        # out of band, so tofu's plan is empty and tofu will never fix it (in
+        # real AWS the service SCHEDULER, not terraform, replaces a lost
+        # task). This is odin's equivalent, triggered by the user's Apply
+        # rather than a background timer, and idempotent: a service already at
+        # desiredCount launches nothing.
+        # A bare `TaskRuntime()` (not this app's `runtime`) deliberately: it
+        # must be the SAME substrate that launched these containers, and
+        # ecsctl's own `runtime or TaskRuntime()` default is what did.
+        ecsctl.converge_services(stores, env, TaskRuntime(), keystore, gateway_port())
         await reconciler.tick()  # kick an immediate pass; the loop continues it
         return JSONResponse(status_code=200, content=body)
 
@@ -526,6 +540,13 @@ def create_app(
         return Reconciler(
             _store, _runtime, env_rds, aws=env_aws, gateway=gateway_state, fabric=LocalhostFabric(),
             ws=ws_manager, env=env, poll_interval=1.0, stores=gateway_stores,
+            # W2.2's reality sweep shells out to the REAL `limactl`/`docker`,
+            # so it's gated on the same `backings` flag every other real-
+            # runtime dependency is: an app built with `backings=False` is
+            # explicitly the fake-substrate one (every non-integration test),
+            # and its hand-seeded synth records must not be measured against
+            # this machine's actual VMs/containers.
+            drift=DriftSweeper() if backings else None,
         )
 
     async def reconciler_for(env: str) -> Reconciler:
@@ -582,7 +603,7 @@ def create_app(
     app.include_router(
         create_apply_full_router(
             _store, reconciler_for, tf_runner, gateway_keystore, lambda: gateway_port_actual, env_epoch,
-            translate_cache, _runtime,
+            translate_cache, _runtime, gateway_stores,
         )
     )
     app.include_router(create_logs_router(_store, gateway_stores, _runtime))

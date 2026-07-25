@@ -194,9 +194,28 @@ class BackingAws:
         # per kind, in parallel) aren't forced sequential by a single
         # per-instance lock.
         with self._ensure_lock:
-            if self._rt.status(cname) != "running":
+            if self._rt.status(cname) != "running" or self._stranded(d, cname):
                 self._create_backing_container(d, cname)
         self._await_ready(cname, service)
+
+    def _stranded(self, d: BackingDef, cname: str) -> bool:
+        """A container that's RUNNING but no longer publishes the inside-port
+        this instance needs (W2.2). goaws is the real case: its listener port
+        IS the gateway port (`_listen_port`), and that's baked into the
+        container by `docker run -p`, so a gateway-port change (a restart onto
+        a different ephemeral port, an edited ODIN_GATEWAY_PORT) leaves a
+        perfectly healthy container publishing the OLD one. `ensure_backing`
+        used to adopt it, after which every `client()` call could only raise
+        BackingUnavailable — forever, with no self-heal. Recreating it onto
+        the CURRENT port is the fix (`_create_backing_container` rewrites
+        goaws.yaml with that port too).
+
+        Deliberately generic rather than `if d.name == "goaws"`: "the port I
+        need isn't published" is wrong for any backing, whatever stranded it,
+        and it's the exact condition `client()` already fails loud on. Costs
+        one `docker port` per ensure_backing (an Apply/provision path, not the
+        every-tick one — `backing_ports` has its own cache)."""
+        return self._rt.host_port(cname, self._listen_port(d)) == 0
 
     def _create_backing_container(self, d: BackingDef, cname: str) -> None:
         self._rt.stop(cname)  # clear any exited remnant (same contract as PostgresRds)

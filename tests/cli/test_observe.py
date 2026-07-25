@@ -46,6 +46,28 @@ def test_world_text_renders_phase_table(runner):
 
 
 @respx.mock
+def test_world_text_renders_a_drift_verdict(runner):
+    """W2.2: the reality sweep's verdict is the whole point of `odin world`
+    for a drifted resource -- "crashed" alone doesn't tell anyone their VM was
+    deleted out of band, or that re-Apply is the fix. It rides
+    WorldDelta -> world.json -> /world, so this asserts the CLI actually
+    prints it rather than dropping it on the floor."""
+    verdict = "VM odin-ec2-prod-i-1 deleted outside odin — re-Apply to recreate"
+    respx.get(f"{BASE}/world", params={"env": "prod"}).mock(return_value=httpx.Response(200, json={
+        "env": "prod",
+        "resources": [
+            {"id": "server", "kind": "ec2", "phase": "crashed", "facts": {},
+             "verdict": verdict, "restarts": 0},
+        ],
+    }))
+    result = runner.invoke(app, ["world", "--env", "prod"])
+    assert result.exit_code == 0
+    (line,) = result.stdout.splitlines()
+    assert "server" in line and "ec2" in line and "crashed" in line
+    assert verdict in line
+
+
+@respx.mock
 def test_world_text_empty(runner):
     respx.get(f"{BASE}/world", params={"env": "default"}).mock(
         return_value=httpx.Response(200, json={"env": "default", "resources": []})

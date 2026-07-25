@@ -7,10 +7,12 @@ import time
 from odin.gateway.policy import compile_policies
 from odin.gateway.stores import SynthStores
 from odin.reconcile import assertions
+from odin.reconcile.drift import DriftSweeper
 from odin.reconcile.reconciler import Reconciler
 from odin.runtime.colima import _STATUS_TO_PHASE, ContainerFacts, HostFacts, RunHandle
 from odin.spec.models import Edge, FieldValue, ResourceDesired, Stack
 from odin.spec.store import SpecStore
+from tests.reconcile.test_drift import FakeContainers, FakeVms
 
 DB = ResourceDesired(id="db", kind="rds", fields={"engine": FieldValue(value="postgres")})
 
@@ -608,3 +610,131 @@ async def test_new_sns_edge_on_a_healthy_topic_provisions_the_missing_subscripti
 
     await recon.tick()                            # already subscribed: no re-provision spam
     assert aws.provisioned.count(("sns", "alerts", ("jobs",))) == 1
+
+
+# --- W2.2 drift detection: the TF-owned projection is cross-checked against
+# REALITY, so a VM/container deleted out of band stops reading `healthy`
+# forever. tests/reconcile/test_drift.py covers the sweep itself (cadence,
+# exemptions, boundedness); these cover the RECONCILER half -- the WorldDelta
+# and the `type:"log"` error line a drift TRANSITION emits. ------------------
+
+
+def _drift(vm_names=(), container_names=()):
+    return DriftSweeper(
+        vms=FakeVms(names=list(vm_names)), containers=FakeContainers(names=list(container_names)),
+    )
+
+
+def _ec2_stores(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.ec2compute.set("default", "instance:i-1", {
+        "instance_id": "i-1", "state_name": "running", "state_reason": None,
+    })
+    stores.tags.set("default", "ec2:i-1", {"odin:node": "server"})
+    return stores
+
+
+async def test_drifted_ec2_projects_crashed_with_a_verdict_and_an_error_log(tmp_path):
+    rt, rds = FakeRuntime(), FakeRds()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(ResourceDesired(id="server", kind="ec2"),)))
+    sent = []
+
+    class FakeWS:
+        async def broadcast(self, msg):
+            sent.append(msg)
+
+    recon = Reconciler(
+        store, rt, rds, ws=FakeWS(), pg_ready=_yes, poll_interval=0, stores=_ec2_stores(tmp_path),
+        drift=_drift(vm_names=["veronica"]),  # the instance's own VM is GONE
+    )
+
+    await recon.tick()
+
+    observed = store.current_world().get("server")
+    assert observed.phase == "crashed", "a record whose real VM is gone must not read healthy"
+    assert observed.verdict == "VM odin-ec2-default-i-1 deleted outside odin — re-Apply to recreate"
+    # The WS half: the world_delta the canvas badge projects...
+    deltas = [m for m in sent if m.get("resource_id") == "server" and m.get("phase") == "crashed"]
+    assert deltas and deltas[0]["kind"] == "ec2"
+    # ...and the wave-1-shaped log line the UI's Logs tab parses.
+    logs = [m for m in sent if m.get("type") == "log"]
+    assert logs == [{
+        "type": "log", "env": "default", "level": "error", "source": "server",
+        "text": "VM odin-ec2-default-i-1 deleted outside odin — re-Apply to recreate",
+    }]
+
+
+async def test_live_vm_keeps_the_ec2_node_healthy(tmp_path):
+    rt, rds = FakeRuntime(), FakeRds()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(ResourceDesired(id="server", kind="ec2"),)))
+    recon = Reconciler(
+        store, rt, rds, pg_ready=_yes, poll_interval=0, stores=_ec2_stores(tmp_path),
+        drift=_drift(vm_names=["odin-ec2-default-i-1"]),
+    )
+
+    await recon.tick()
+
+    assert store.current_world().get("server").phase == "healthy"
+
+
+async def test_drift_verdict_is_not_rebroadcast_every_tick(tmp_path):
+    rt, rds = FakeRuntime(), FakeRds()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(ResourceDesired(id="server", kind="ec2"),)))
+    sent = []
+
+    class FakeWS:
+        async def broadcast(self, msg):
+            sent.append(msg)
+
+    recon = Reconciler(
+        store, rt, rds, ws=FakeWS(), pg_ready=_yes, poll_interval=0, stores=_ec2_stores(tmp_path),
+        drift=_drift(),
+    )
+    for _ in range(4):
+        await recon.tick()
+
+    assert len([m for m in sent if m.get("type") == "log"]) == 1  # the TRANSITION, not every tick
+
+
+async def test_drifted_ecs_task_makes_the_service_crash_with_a_drift_verdict(tmp_path):
+    # ecs reports through its OWN task record (drift.py's module docstring):
+    # the sweep marks the task STOPPED, and tf_status's existing service
+    # projection turns that into crashed + the real reason. The sweep running
+    # BEFORE the projection is also what keeps this test docker-free --
+    # `sweep_tasks` only inspects tasks still claiming RUNNING.
+    rt, rds = FakeRuntime(), FakeRds()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(ResourceDesired(id="app", kind="ecs"),)))
+    stores = SynthStores(tmp_path)
+    stores.ecsctl.set("default", "service:odin:app", {
+        "cluster_name": "odin", "service_name": "app", "desired_count": 1, "status": "ACTIVE",
+    })
+    stores.ecsctl.set("default", "task:odin:t1", {
+        "cluster_name": "odin", "service_name": "app", "task_id": "t1", "container_name": "app",
+        "last_status": "RUNNING", "stopped_reason": None, "exit_code": None, "stopped_at": None,
+    })
+    recon = Reconciler(
+        store, rt, rds, pg_ready=_yes, poll_interval=0, stores=stores, drift=_drift(),
+    )
+
+    await recon.tick()
+
+    observed = store.current_world().get("app")
+    assert observed.phase == "crashed"
+    assert "removed outside odin" in observed.verdict
+
+
+async def test_drift_is_off_when_no_sweeper_is_wired(tmp_path):
+    # The `stores=`-style optional seam: a Reconciler with no sweeper never
+    # touches limactl/docker, so hand-seeded records stay exactly as projected.
+    rt, rds = FakeRuntime(), FakeRds()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(ResourceDesired(id="server", kind="ec2"),)))
+    recon = Reconciler(store, rt, rds, pg_ready=_yes, poll_interval=0, stores=_ec2_stores(tmp_path))
+
+    await recon.tick()
+
+    assert store.current_world().get("server").phase == "healthy"

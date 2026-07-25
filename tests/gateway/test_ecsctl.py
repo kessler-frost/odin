@@ -647,3 +647,70 @@ def test_describe_tasks_lazily_marks_a_spontaneously_exited_container_stopped(si
 
     service = _describe_service(stores, sink, ecs, runtime)
     assert service["runningCount"] == 0
+
+
+# --- W2.2: an Apply re-converges a service whose task is gone. A task is not
+# a TF resource, so tofu's plan for an unchanged `aws_ecs_service` is empty
+# and only this pass can bring the container back. --------------------------
+
+
+def test_mark_task_stopped_records_the_drift_reason_with_no_invented_exit_code(sink, ecs, stores):
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(stores, sink, ecs, runtime, desiredCount=1)
+    _wait_for_running_count(stores, sink, ecs, runtime, 1)
+    _, task_id, _, _, _, _ = runtime.ran[0]
+
+    ecsctl.mark_task_stopped(stores, ENV, "odin", task_id, "container gone — re-Apply to recreate")
+
+    task = stores.ecsctl.get(ENV, f"task:odin:{task_id}")
+    assert task["last_status"] == "STOPPED"
+    assert task["stopped_reason"] == "container gone — re-Apply to recreate"
+    assert task["exit_code"] is None  # a container that no longer exists never reported one
+    assert _describe_service(stores, sink, ecs, runtime)["runningCount"] == 0
+
+
+def test_converge_services_relaunches_a_task_whose_container_is_gone(sink, ecs, stores):
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(stores, sink, ecs, runtime, desiredCount=1)
+    _wait_for_running_count(stores, sink, ecs, runtime, 1)
+    _, task_id, _, _, _, _ = runtime.ran[0]
+    ecsctl.mark_task_stopped(stores, ENV, "odin", task_id, "removed outside odin")
+
+    ecsctl.converge_services(stores, ENV, runtime)  # what an Apply now does
+
+    _wait_for_running_count(stores, sink, ecs, runtime, 1)
+    assert len(runtime.ran) == 2, "the missing task must be relaunched, not left short"
+
+
+def test_converge_services_is_a_no_op_at_desired_count(sink, ecs, stores):
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(stores, sink, ecs, runtime, desiredCount=2)
+    _wait_for_running_count(stores, sink, ecs, runtime, 2)
+
+    ecsctl.converge_services(stores, ENV, runtime)
+    _wait_for_running_count(stores, sink, ecs, runtime, 2)
+
+    assert len(runtime.ran) == 2  # idempotent: every Apply must not stack up containers
+    assert runtime.stopped == []
+
+
+def test_converge_services_leaves_a_deleted_service_alone(sink, ecs, stores):
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(stores, sink, ecs, runtime, desiredCount=1)
+    _wait_for_running_count(stores, sink, ecs, runtime, 1)
+    delete_req = sink.call(lambda: ecs.delete_service(cluster="odin", service="app", force=True))
+    _parse("DeleteService", _answer(stores, delete_req, runtime))
+    launched = len(runtime.ran)
+
+    ecsctl.converge_services(stores, ENV, runtime)  # an empty-canvas Apply's teardown
+
+    time.sleep(0.1)
+    assert len(runtime.ran) == launched, "an INACTIVE service must never be re-launched"
