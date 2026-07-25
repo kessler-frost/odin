@@ -157,13 +157,25 @@ future decision against these points instead of re-deriving them:
     workload with an `rds` edge can call
     `DescribeDBInstances(DBInstanceIdentifier="db")` but NOT bare
     `DescribeDBInstances()`; likewise `DescribeCacheClusters(CacheClusterId=…)`
-    versus `DescribeCacheClusters()`. This is correct and AWS-ish — an edge
-    grants an action on the ONE resource it points at, and a wildcard list is a
-    different permission — but it is the first thing an engineer tries, the
-    denial says only "not authorized", and it cost a field tester a confusing
-    hour. Written down here rather than fixed: naming the resource is the
-    intended usage, and the endpoint you actually want is also published as a
-    World fact (`${{db.DATABASE_URL}}` and friends).
+    versus `DescribeCacheClusters()`. Both services behave identically, and
+    the deny happens in `app.py` before either model is reached.
+    **The mechanism, precisely** (re-verified against the code in v0.7.1, and
+    worth stating because the intuitive explanation is not quite what
+    happens): a call that names no resource classifies to the LITERAL resource
+    `"*"` (`classify.py::_rds_resource` / `_classify_elasticache`), while an
+    IAM edge compiles to a statement naming one literal node label
+    (`policy.py::compile_policies`). Wildcards are expanded on the STATEMENT
+    side only, so `"db"` does not match the string `"*"` and default-deny
+    applies. The same fallback is why `tofu` is never blocked: the operator's
+    statement really is `*`/`*`, which matches anything including `"*"`.
+    **The denial names the action but never the resource** —
+    `User is not authorized to perform: rds:DescribeDBInstances` — which is
+    exactly why it reads as a contradiction: you are told the action you hold
+    an edge for was denied, with no hint that the resource resolved to `"*"`.
+    That, not the policy decision, is what cost a field tester a confusing
+    hour. Written down rather than fixed: naming the resource is the intended
+    usage, and the endpoint you actually want is also published as a World
+    fact (`${{db.DATABASE_URL}}` and friends).
   - RDS is Terraform-managed (W2.7 — this used to read "RDS stays off
     Terraform"): an `rds` node compiles to `aws_db_instance`, and the gateway's
     own RDS model (`gateway/models/rdsctl.py`) fulfils CreateDBInstance with
