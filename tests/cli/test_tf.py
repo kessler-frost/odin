@@ -70,6 +70,15 @@ PLAN_NO_CHANGES = {
     "status": "no_changes", "env": "default", "exit_code": 0,
     "tail": ["No changes. Your infrastructure matches the configuration."], "unsupported": [],
 }
+
+
+def mock_canvas(*types: str) -> None:
+    """`odin tf plan` reads the canvas too: a kind odin doesn't model never
+    became a Stack resource, so the plan literally cannot see it (MISLEAD-2)."""
+    nodes = [{"id": f"n{i}", "type": t, "data": {"label": f"n{i}"}} for i, t in enumerate(types)]
+    respx.get(f"{BASE}/canvas").mock(
+        return_value=httpx.Response(200, json={"nodes": nodes, "edges": []})
+    )
 PLAN_CHANGES = {
     "status": "changes", "env": "default", "exit_code": 2,
     "tail": ["Plan: 1 to add, 0 to change, 0 to destroy."], "unsupported": [],
@@ -82,6 +91,7 @@ PLAN_FAILED = {
 
 @respx.mock
 def test_tf_plan_no_changes_exits_zero(runner):
+    mock_canvas("s3")
     respx.post(f"{BASE}/tf/plan", params={"env": "default"}).mock(
         return_value=httpx.Response(200, json=PLAN_NO_CHANGES)
     )
@@ -93,6 +103,7 @@ def test_tf_plan_no_changes_exits_zero(runner):
 
 @respx.mock
 def test_tf_plan_with_changes_exits_two(runner):
+    mock_canvas("s3")
     respx.post(f"{BASE}/tf/plan", params={"env": "default"}).mock(
         return_value=httpx.Response(200, json=PLAN_CHANGES)
     )
@@ -104,6 +115,7 @@ def test_tf_plan_with_changes_exits_two(runner):
 
 @respx.mock
 def test_tf_plan_error_exits_one(runner):
+    mock_canvas("s3")
     respx.post(f"{BASE}/tf/plan").mock(return_value=httpx.Response(500, json=PLAN_FAILED))
     result = runner.invoke(app, ["tf", "plan"])
     assert result.exit_code == 1
@@ -112,21 +124,45 @@ def test_tf_plan_error_exits_one(runner):
 
 @respx.mock
 def test_tf_plan_json_mode_keeps_the_exit_code(runner):
+    mock_canvas("s3")
     respx.post(f"{BASE}/tf/plan").mock(return_value=httpx.Response(200, json=PLAN_CHANGES))
     result = runner.invoke(app, ["tf", "plan", "-o", "json"])
     assert result.exit_code == 2
-    assert json.loads(result.stdout) == PLAN_CHANGES
+    assert json.loads(result.stdout) == {**PLAN_CHANGES, "skipped": [], "not_covered": []}
 
 
 @respx.mock
 def test_tf_plan_names_nodes_the_plan_could_not_cover(runner):
     """`no_changes` only means "no drift in what odin can generate" -- an
     unsupported node is not in the plan at all, so the check says so."""
+    mock_canvas("s3")
     body = {**PLAN_NO_CHANGES, "unsupported": ["cache1 (elasticache)"]}
     respx.post(f"{BASE}/tf/plan").mock(return_value=httpx.Response(200, json=body))
     result = runner.invoke(app, ["tf", "plan"])
     assert result.exit_code == 0
     assert "cache1 (elasticache)" in result.stdout
+
+
+@respx.mock
+def test_tf_plan_names_a_kind_odin_does_not_model_at_all(runner):
+    """MISLEAD-2: `kinesis` and a typo'd type appear in NEITHER the text output
+    nor `.unsupported` -- they never became Stack resources, so TF generation
+    never saw them. A drift gate read `no_changes` while two drawn nodes sat
+    outside Terraform entirely."""
+    mock_canvas("s3", "kinesis", "notarealservice")
+    respx.post(f"{BASE}/tf/plan").mock(return_value=httpx.Response(200, json=PLAN_NO_CHANGES))
+    result = runner.invoke(app, ["tf", "plan"])
+    assert result.exit_code == 0
+    assert "not covered by this plan: kinesis, notarealservice" in result.stdout
+
+
+@respx.mock
+def test_tf_plan_json_publishes_the_same_gate_field_as_apply(runner):
+    mock_canvas("s3", "kinesis")
+    respx.post(f"{BASE}/tf/plan").mock(return_value=httpx.Response(200, json=PLAN_NO_CHANGES))
+    body = json.loads(runner.invoke(app, ["tf", "plan", "-o", "json"]).stdout)
+    assert body["skipped"] == ["kinesis"]
+    assert body["not_covered"] == ["kinesis"]
 
 
 @respx.mock

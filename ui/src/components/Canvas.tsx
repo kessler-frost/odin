@@ -133,9 +133,10 @@ interface CanvasProps {
   configUpdate?: { nodeId: string; data: Record<string, any> } | null;
   onCanvasSave?: (graph: { nodes: any[]; edges: any[] }) => void;
   onResetDrafts?: React.MutableRefObject<(() => void) | null>;
+  onNotice?: (text: string) => void;
 }
 
-function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, nodeUpdates, edgeUpdates, onStatusUpdate, configUpdate, onCanvasSave, onResetDrafts }: CanvasProps) {
+function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, nodeUpdates, edgeUpdates, onStatusUpdate, configUpdate, onCanvasSave, onResetDrafts, onNotice }: CanvasProps) {
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   const [loaded, setLoaded] = useState(false);
@@ -172,14 +173,30 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
     const load = async () => {
       const canvasRes = await fetch(`${API}/canvas`).then(r => r.json()).catch(() => ({ nodes: [], edges: [] }));
 
+      // A canvas authored outside the UI (`odin canvas set`, an agent, the
+      // README's own example) may carry no `position`. ReactFlow dereferences
+      // node.position.x, so one such node used to blank the WHOLE canvas to
+      // solid black with nothing said anywhere (fresh-user BLOCK-3). Lay those
+      // out on the 20px grid, in canvas order, and say so — a node the user
+      // can see and drag beats a black rectangle and a console TypeError.
+      let unplaced = 0;
+      const onGrid = () => {
+        const i = unplaced++;
+        return { x: 80 + (i % 5) * 260, y: 80 + Math.floor(i / 5) * 200 };
+      };
       const rfNodes: Node[] = (canvasRes.nodes ?? []).map((n: any) => ({
         id: n.id,
         type: n.type,
-        position: n.position,
+        position: (typeof n.position?.x === 'number' && typeof n.position?.y === 'number')
+          ? n.position
+          : onGrid(),
         zIndex: zIndexForType[n.type] ?? 2,
         data: { ...defaultDataForType[n.type], ...n.data },
         style: { ...defaultStyleForType[n.type], ...n.size },
       }));
+      if (unplaced > 0) {
+        onNotice?.(`${unplaced} node${unplaced === 1 ? '' : 's'} had no "position" — laid out on the grid. Move one and it sticks.`);
+      }
 
       const rfEdges: Edge[] = (canvasRes.edges ?? []).map((e: any) => {
         const eType = e.data?.edgeType ?? 'network';
@@ -208,7 +225,7 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
       setLoaded(true);
     };
     load();
-  }, [setNodes, setEdges]);
+  }, [setNodes, setEdges, onNotice]);
 
   // --- Rehydrate node badges from the observed World, on mount and on env change ---
   // (a live world_delta over the WebSocket always arrives after this and wins).
@@ -728,10 +745,10 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
   );
 }
 
-export default function Canvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, nodeUpdates, edgeUpdates, onStatusUpdate, configUpdate, onCanvasSave, onResetDrafts }: CanvasProps) {
+export default function Canvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, nodeUpdates, edgeUpdates, onStatusUpdate, configUpdate, onCanvasSave, onResetDrafts, onNotice }: CanvasProps) {
   return (
     <ReactFlowProvider>
-      <InnerCanvas env={env} onNodeSelect={onNodeSelect} onEdgeSelect={onEdgeSelect} onNodeLabelsChange={onNodeLabelsChange} nodeUpdates={nodeUpdates} edgeUpdates={edgeUpdates} onStatusUpdate={onStatusUpdate} configUpdate={configUpdate} onCanvasSave={onCanvasSave} onResetDrafts={onResetDrafts} />
+      <InnerCanvas env={env} onNodeSelect={onNodeSelect} onEdgeSelect={onEdgeSelect} onNodeLabelsChange={onNodeLabelsChange} nodeUpdates={nodeUpdates} edgeUpdates={edgeUpdates} onStatusUpdate={onStatusUpdate} configUpdate={configUpdate} onCanvasSave={onCanvasSave} onResetDrafts={onResetDrafts} onNotice={onNotice} />
     </ReactFlowProvider>
   );
 }

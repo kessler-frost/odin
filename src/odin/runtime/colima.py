@@ -10,11 +10,11 @@ Every container odin runs is labelled ``odin=1``.
 """
 from __future__ import annotations
 
-import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from odin.spec.models import Phase
+from odin.util import run_command
 
 LABEL = "odin"
 
@@ -186,7 +186,11 @@ class _Proc:
 
 
 def _default_runner(args: list[str], input: str | None = None) -> _Proc:
-    proc = subprocess.run(args, capture_output=True, text=True, input=input)
+    # `run_command`, so a machine with no `docker` CLI on PATH (Homebrew's
+    # colima formula does NOT bring one) yields rc 127 -- which `_cli` turns
+    # into "docker … failed: docker: command not found" -- instead of a bare
+    # FileNotFoundError traceback out of whatever happened to call first.
+    proc = run_command(args, input=input)
     return _Proc(proc.returncode, proc.stdout, proc.stderr)
 
 

@@ -13,7 +13,7 @@ import typer
 from odin.cli import commands as _commands  # noqa: F401  (registers the control-surface commands)
 from odin.cli import doctor as _doctor  # noqa: F401  (registers `odin doctor`)
 from odin.cli.app import app
-from odin.util import live_server, odin_version, pid_alive
+from odin.util import live_server, odin_version, pid_alive, private_mkdir
 
 ODIN_DIR = Path(".odin")
 PID_FILE = ODIN_DIR / "pid"
@@ -103,12 +103,12 @@ def start(
         # terminal, and `odin import`'s live-store refusal, had nothing cheap to
         # find. (`live_server` would still catch it by process scan, but only
         # because uvicorn.run reuses this process -- the pidfile is exact.)
-        ODIN_DIR.mkdir(parents=True, exist_ok=True)
+        private_mkdir(ODIN_DIR)
         PID_FILE.write_text(str(os.getpid()))
         uvicorn.run("odin.server:create_app", factory=True, host=host, port=port)
         PID_FILE.unlink(missing_ok=True)
     else:
-        ODIN_DIR.mkdir(parents=True, exist_ok=True)
+        private_mkdir(ODIN_DIR)
         log_path = ODIN_DIR / "server.log"
         log = log_path.open("w")
         proc = subprocess.Popen(
@@ -136,7 +136,7 @@ def _start_dev(port: int, host: str = DEFAULT_HOST) -> None:
     typer.echo(f"  Vite  → :{port}  (HMR)")
     typer.echo(f"  API   → :{BACKEND_DEV_PORT}  (auto-reload)")
 
-    ODIN_DIR.mkdir(parents=True, exist_ok=True)
+    private_mkdir(ODIN_DIR)
     PID_FILE.write_text(str(os.getpid()))
 
     log_path = ODIN_DIR / "dev.log"
@@ -235,7 +235,7 @@ def clean(all: bool = typer.Option(False, "--all", help="Wipe entire .odin/ dire
     if all:
         if odin_dir.exists():
             shutil.rmtree(odin_dir)
-            odin_dir.mkdir()
+            private_mkdir(odin_dir)
             removed.append(".odin/ (full reset)")
         for png in root.glob("*.png"):
             png.unlink()

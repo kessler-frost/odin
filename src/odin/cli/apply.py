@@ -49,6 +49,23 @@ def _echo_unhealthy(item: dict) -> None:
     typer.echo(f"unhealthy: {item['node']} — {item['running']}/{item['desired']} tasks running{reason}")
 
 
+def not_covered(body: dict) -> list[str]:
+    """Everything on the canvas the command did NOT act on, in ONE array.
+
+    Fresh-user MISLEAD-1: the README told CI to gate on `.unsupported`, but a
+    node whose KIND odin has no model for at all lands in `.skipped` and
+    `.unsupported` stayed `[]`. `jq -e '.unsupported | length == 0'` returned
+    true — exit 0 — while two drawn nodes were silently dropped. Two arrays
+    with adjacent meanings is a gate you can get right and still be wrong, so
+    both are also published as one field a gate cannot half-read.
+
+    `skipped` = a canvas node type that never became a Stack resource (a kind
+    odin doesn't model, or a typo). `unsupported` = a resource odin models but
+    can't generate Terraform for, with the reason. Both are still emitted
+    verbatim; this is a union, not a replacement."""
+    return [*(body.get("skipped") or []), *(body.get("unsupported") or [])]
+
+
 def _render_apply(body: dict) -> None:
     typer.echo(f"status: {body['status']}  env: {body['env']}  rev: {body.get('rev') or '-'}")
     for key in ("skipped", "unsupported"):
@@ -75,6 +92,7 @@ def apply(
     body = http.body_or_fail(
         http.request("POST", url, "/apply-full", params={"env": env}, body=graph)
     )
+    body["not_covered"] = not_covered(body)  # the one field a CI gate should read
     http.emit(body, output, _render_apply)
     # `applied` is the ONLY clean outcome -- anything else (tofu failed, or a
     # service that ended the apply short of its desired task count) is a
