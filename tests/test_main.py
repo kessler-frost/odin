@@ -8,6 +8,7 @@ import os
 import sys
 
 import pytest
+import typer
 
 from odin import __main__ as main_mod, util
 
@@ -176,6 +177,19 @@ def test_stop_signals_a_server_odin_did_not_start(tmp_path, monkeypatch, capsys)
     main_mod.stop()
     assert killed == [(4242, main_mod.signal.SIGTERM)]
     assert "Stopped." in capsys.readouterr().out
+
+
+def test_version_flag_prints_the_real_version(capsys):
+    """LOW-16: there was no `odin --version` at all, which is exactly why a
+    version stamp could go two releases stale without anyone noticing."""
+    with pytest.raises(typer.Exit):
+        main_mod._print_version(True)
+    assert capsys.readouterr().out.strip() == f"odin {util.odin_version()}"
+
+
+def test_version_callback_is_a_no_op_without_the_flag(capsys):
+    main_mod._print_version(False)
+    assert capsys.readouterr().out == ""
 
 
 def test_start_foreground_writes_and_removes_the_pidfile(tmp_path, monkeypatch):

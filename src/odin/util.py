@@ -27,6 +27,7 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+import tomllib
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
@@ -39,19 +40,39 @@ from pathlib import Path
 SECRET_FILE_MODE = 0o600
 PRIVATE_DIR_MODE = 0o700
 
-# Single source of truth for the running version: the installed package's own
-# metadata (kept in lockstep with pyproject.toml's `version` by the build).
-# The literal fallback only fires for an editable/unpackaged checkout where
-# `importlib.metadata` has nothing to look up -- it still needs to say
-# SOMETHING plausible rather than raise out of app startup.
-_FALLBACK_VERSION = "0.4.0"
+# The running version, from the ONE file a human edits (pyproject.toml) when
+# we're in a source checkout, and from installed metadata otherwise. Order
+# matters: `importlib.metadata` answers about the installed DISTRIBUTION, which
+# in an editable checkout is only as fresh as the last `uv sync` -- the field
+# test found `odin export` stamping `odin_version 0.5.3` into archive manifests
+# while pyproject.toml said 0.7.0, because the dist-info was two releases
+# stale. Backup format-compatibility messages quote this, so a wrong answer is
+# worse than a slow one. There is deliberately NO literal version anywhere in
+# the source tree to drift out of step with pyproject.toml.
+_PYPROJECT = Path(__file__).resolve().parents[2] / "pyproject.toml"
+_UNKNOWN_VERSION = "0.0.0+unknown"
 
 
-def odin_version() -> str:
+def _pyproject_version() -> str | None:
+    """pyproject.toml's `[project] version`, if this really is odin's own
+    checkout (the `name` guard: `parents[2]` is only odin's repo root for a
+    source/editable layout, and must never pick up a stranger's manifest)."""
+    project = tomllib.loads(_PYPROJECT.read_text()).get("project", {}) if _PYPROJECT.is_file() else {}
+    return project.get("version") if project.get("name") == "odin" else None
+
+
+def _metadata_version() -> str | None:
     try:
         return _pkg_version("odin")
     except PackageNotFoundError:
-        return _FALLBACK_VERSION
+        return None
+
+
+def odin_version() -> str:
+    """odin's version, or `0.0.0+unknown` when neither source is available --
+    an honest "I don't know" rather than a hardcoded number that rots (the old
+    fallback still claimed 0.4.0 three releases later)."""
+    return _pyproject_version() or _metadata_version() or _UNKNOWN_VERSION
 
 
 def pid_alive(pid: int) -> bool:

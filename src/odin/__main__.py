@@ -13,7 +13,7 @@ import typer
 from odin.cli import commands as _commands  # noqa: F401  (registers the control-surface commands)
 from odin.cli import doctor as _doctor  # noqa: F401  (registers `odin doctor`)
 from odin.cli.app import app
-from odin.util import live_server, pid_alive
+from odin.util import live_server, odin_version, pid_alive
 
 ODIN_DIR = Path(".odin")
 PID_FILE = ODIN_DIR / "pid"
@@ -27,6 +27,25 @@ DEFAULT_HOST = "127.0.0.1"
 # laptop" into "anyone on this network can run containers on my laptop", so
 # loopback is the only default; a wider bind is opt-in and loud about it.
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _print_version(value: bool) -> None:
+    """`odin --version`, which the field test found missing entirely -- the one
+    thing that would have made a stale version stamp noticeable (`odin export`
+    was writing `odin_version 0.5.3` into manifests two releases later)."""
+    if value:
+        typer.echo(f"odin {odin_version()}")
+        raise typer.Exit()
+
+
+@app.callback()
+def _root(
+    version: bool = typer.Option(
+        False, "--version", "-V", callback=_print_version, is_eager=True,
+        help="Show odin's version and exit.",
+    ),
+) -> None:
+    """Odin — a local-first, AWS-compatible cloud on your own machine."""
 
 
 def _warn_if_non_loopback(host: str) -> None:

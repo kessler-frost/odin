@@ -262,6 +262,15 @@ odin import-tf existing.tf          # TF -> canvas JSON (pipe into canvas set -)
 odin export --env dev               # back an env's state up to a tar.gz
 odin import odin-dev-export.tar.gz  # restore it (works with odin down)
 odin doctor                         # toolchain health, with exact fixes
+odin --version                      # which odin this is
+```
+
+Exit codes are the contract: `0` success, `1` a refusal or a real failure, `2`
+a usage/format error. One thing an exit-code-only check misses — a node Apply
+skipped as unsupported still exits `0`, so gate on the payload instead:
+
+```bash
+odin apply --env dev -o json | jq -e '.unsupported | length == 0'
 ```
 
 A round-trip example an agent might run:
