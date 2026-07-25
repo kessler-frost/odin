@@ -228,6 +228,15 @@ def _db_facts(record: dict) -> dict:
         `${{db.DATABASE_URL}}` (per-consumer-type ref routing is still
         deferred; two facts remain the honest, smaller answer).
 
+    NEITHER of those two is gated by a security group -- they are the same raw
+    published host port under two host aliases (ROADMAP's residual-gap
+    paragraph, which field test 2 MEDIUM-5 rightly pointed out never said
+    "...and that includes Lima VMs"). The mesh form below is the ONLY governed
+    path, and the only one whose address survives a container recreation
+    unchanged, so a VM consumer in an env WITH a mesh should be pointed at it.
+    `_VM` stays published anyway: removing it would break existing canvases,
+    and it is the right answer for an env with no VPC drawn.
+
     Both point at the SAME real Postgres, on the container's actually-published
     host port, with the instance's real master credentials and its real
     `db_name` (a `POSTGRES_DB` the substrate genuinely creates -- so the path

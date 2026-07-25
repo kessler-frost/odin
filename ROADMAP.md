@@ -140,7 +140,10 @@ future decision against these points instead of re-deriving them:
     yet gate host containers either. Endpoint reachability is per-consumer the
     same way RDS's is: a container consumes `${{cache.REDIS_URL}}`
     (`host.docker.internal`), an EC2 (Lima VM) consumer must use
-    `${{cache.REDIS_URL_VM}}` (`host.lima.internal`).
+    `${{cache.REDIS_URL_VM}}` (`host.lima.internal`). Both are the raw
+    published host port and **neither is SG-gated** (see the RDS "which fact
+    is gated" note below); ElastiCache publishes no mesh fact at all, so a
+    cache currently has no gated path.
   - RDS is Terraform-managed (W2.7 — this used to read "RDS stays off
     Terraform"): an `rds` node compiles to `aws_db_instance`, and the gateway's
     own RDS model (`gateway/models/rdsctl.py`) fulfils CreateDBInstance with
@@ -178,6 +181,31 @@ future decision against these points instead of re-deriving them:
     can't resolve the container-host alias. odin publishes BOTH facts (v0.5.4,
     finding #5); picking the right one per consumer type is manual — automatic
     ref-routing by consumer kind is deferred.
+    - **WHICH FACT IS GATED — read this before choosing one.**
+      `DATABASE_URL` and `DATABASE_URL_VM` are the SAME raw published host
+      port, reached by two different host aliases, and **security groups do
+      NOT gate either of them**. `DATABASE_URL_MESH` is the overlay address,
+      and it is **the only one a drawn security group governs**. So on a
+      canvas with a VPC, a VM that a `db-sg` correctly refuses on the mesh
+      still reaches the identical Postgres through `DATABASE_URL_VM` — field
+      test 2 MEDIUM-5, where the fact named after the consumer type was the
+      one that defeated the security group. **If the env has a mesh, a VM
+      consumer should use `${{db.DATABASE_URL_MESH}}`**; `_VM` remains
+      published (removing it would break existing canvases, and it is the
+      right answer for an env with no VPC drawn) but it is the ungoverned
+      path, deliberately, for the same additive reason as the host port
+      itself. The same applies verbatim to `REDIS_URL_VM` — and ElastiCache
+      has no mesh fact at all yet, so on a VM there is currently no gated
+      path to a cache.
+    - **The published host port is NOT stable across recreation.** It is
+      ephemeral (`ports={5432: 0}`), so a `docker kill` + recovery Apply
+      mints a new one (observed: 33363 → 33371) and both `DATABASE_URL` and
+      `DATABASE_URL_VM` change with it. Anything baked in at VM boot time
+      from `_VM` silently points at nothing after a database recovers, and
+      there is no re-injection path — so re-Apply the consumer, or use
+      `DATABASE_URL_MESH`, whose overlay IP and port (5432) are BOTH sticky
+      across recreation. Stabilising the host port is not planned: the mesh
+      address is the stable one by design.
   - Security groups: what IS enforced (W2.6) and what is not.
     - **EC2 VMs**: an instance's ASSIGNED security groups gate its overlay
       traffic — the UNION of their compiled rules is its nebula firewall
@@ -199,14 +227,47 @@ future decision against these points instead of re-deriving them:
       `psql` succeeds for the in-group member and times out for the other).
       The DB publishes the gated address as `${{db.DATABASE_URL_MESH}}` /
       `endpoint_mesh`, alongside (not instead of) the host-reachable pair.
+    - **A `*_MESH` fact is now VERIFIED before it is published**, because for
+      one release it wasn't: every health probe in odin dials the published
+      HOST port, so a mesh endpoint that had been dead for minutes was still
+      advertised beside a `healthy` badge (field test 2 HIGH-2/B8, twice, from
+      two different causes). `reconcile/mesh_health.py` checks, on a sweep
+      cadence (`ODIN_MESH_SWEEP_SECONDS`, default 30s; failures re-checked
+      every 5s), that the env's lighthouse is alive, that the resource's mesh
+      sidecar is running IN THE CURRENT container's network namespace, and
+      that the overlay address itself answers — the last via one bounded
+      `nc -z` run from inside the member's own namespace, the only rootless
+      place a check can stand (the Mac is deliberately not a data-plane mesh
+      member). When it fails, the `*_MESH` facts are WITHHELD and the resource
+      reports `crashed` with the reason; the host path is untouched. It costs
+      nothing for a resource that publishes no mesh fact. What it does NOT
+      prove: that a specific peer is allowed in — that's the SG's job, and a
+      refusal there is policy, not a fault.
+    - **One lighthouse port per ENV, not per machine.** It used to be a single
+      fixed 4342, so the second env to start a lighthouse lost the bind, its
+      `nebula` exited 1 with only a log line, and its whole mesh silently
+      never worked. Each env now allocates its own port from 4342–4441
+      (recorded in its `overlay.json`, reported by `GET /mesh` as
+      `lighthouse_port`, embedded in every member's `static_host_map`), skips
+      ports other envs in the store hold, and moves itself if the recorded one
+      has since been taken. `ODIN_LIGHTHOUSE_PORT` pins it. Still rootless.
+    - **EC2 nodes publish addresses too** (they published nothing before):
+      `${{web1.PRIVATE_IP}}` (host-reachable, ungated) and
+      `${{web1.MESH_IP}}` (the SG-gated overlay address, sticky across
+      recreation). `MESH_IP` is held to the same standard as `*_MESH` above —
+      withheld when the env's lighthouse is down. For a VM that lighthouse
+      check is ALL that is verified: its nebula is a systemd unit inside a
+      Lima VM, and a `limactl shell` per VM per sweep is not a tick's price.
     - **RESIDUAL GAP, stated plainly: the raw host port is still open and
       SGs do NOT gate it.** Mesh membership is ADDITIVE — every backing keeps
       its published Docker port, because the gateway forwards AWS calls to
       it, odin's own health probes use it, host-side clients (tests, psql,
       boto3) use it, and `${{node.VAR}}` facts publish it. So anything that can
       already dial `127.0.0.1:<published port>` (any process on your Mac, any
-      container that can reach the host) still reaches Postgres with no SG in
-      the path. Only the overlay path is governed. Closing the host path
+      container that can reach the host, **and any EC2 Lima VM via
+      `host.lima.internal:<published port>` — i.e. exactly what the
+      `DATABASE_URL_VM` fact hands a VM consumer**) still reaches Postgres
+      with no SG in the path. Only the overlay path is governed. Closing the host path
       would mean making the Mac itself a data-plane mesh member, i.e. a host
       `tun` device, i.e. root/sudoers — rejected (see the Nebula bullet).
       On a local-first single-Mac tool the host is already inside the trust

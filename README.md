@@ -148,10 +148,25 @@ Known v1 limits, recorded rather than hidden:
   hyphen-separated).
 - **Nebula** is live single-host: VPC/SG config compiles to real Nebula
   network + firewall primitives, the host runs a real (and fully
-  unprivileged — no root, no sudo, no one-time setup) lighthouse process,
-  and every VPC-joined EC2 VM runs a real `nebula` daemon carrying the
-  compiled SG firewall. Cross-Mac reachability (a second machine joining the
-  same mesh) lands with multi-Mac support.
+  unprivileged — no root, no sudo, no one-time setup) lighthouse process per
+  environment, and every VPC-joined EC2 VM runs a real `nebula` daemon
+  carrying the compiled SG firewall. Cross-Mac reachability (a second machine
+  joining the same mesh) lands with multi-Mac support.
+- **Which endpoint fact is actually governed by your security groups.** A
+  database publishes three: `DATABASE_URL` (for a container),
+  `DATABASE_URL_VM` (for an EC2 Lima VM) and `DATABASE_URL_MESH` (the Nebula
+  overlay address, only when a VPC is drawn). The first two are the **same raw
+  published host port** and **security groups do not gate either** — that is
+  the documented residual gap, and it applies to VMs as much as to host
+  processes. `DATABASE_URL_MESH` is **the only SG-gated path**, and its address
+  is also the only one that survives a database recreation unchanged (the host
+  port is ephemeral and moves). So: on a canvas with a VPC, point VM consumers
+  at `${{db.DATABASE_URL_MESH}}`; `_VM` is kept for envs with no VPC and for
+  existing canvases, not because it is the safe default. Same for
+  `REDIS_URL_VM` — ElastiCache has no mesh fact yet, so a cache has no gated
+  path at all. odin now verifies a mesh address before publishing it: if the
+  overlay path is down the fact is withheld and the node reports `crashed`
+  with the reason, instead of advertising an endpoint nothing answers on.
 
 ## How it's built
 
