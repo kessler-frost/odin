@@ -9,6 +9,7 @@ WebSocket.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -43,6 +44,7 @@ from odin.reconcile.drift import DriftSweeper
 from odin.reconcile.reconciler import Reconciler
 from odin.runtime.colima import ColimaRuntime
 from odin.simulate.runner import SimulateBusy, TfRunner, TofuNotInstalled
+from odin.simulate.workspace import tf_dir
 from odin.spec.models import Stack
 from odin.spec.store import SpecStore
 from odin.spec.translate import canvas_to_stack, skipped_node_types
@@ -113,9 +115,44 @@ async def _admission_rejection(runtime, store: SpecStore, stack: Stack) -> JSONR
     })
 
 
+def _tf_state_addresses(root: Path, env: str) -> list[str]:
+    """Every managed resource tofu's OWN state still holds for `env` -- the
+    authoritative answer to "what is still standing" after a destroy that
+    didn't finish. Read straight out of `terraform.tfstate` (structured JSON)
+    rather than shelled out to `tofu state list`, which would want the very
+    per-env lock the failed run just released and would cost another process.
+    An unreadable/absent state file is honestly nothing to report, not a
+    crash: the caller is already on a failure path."""
+    state = tf_dir(root, env) / "terraform.tfstate"
+    parsed = json.loads(state.read_text() or "{}") if state.exists() else {}
+    return sorted(
+        f"{resource['type']}.{resource['name']}"
+        for resource in parsed.get("resources", []) if resource.get("mode") != "data"
+    )
+
+
+def _surviving_containers(runtime, env: str) -> list[str]:
+    """Odin containers this env still has, by odin's own container naming --
+    `odin-aws-{backing}-{env}` carries the env as a SUFFIX, `odin-rds-{env}-…`
+    / `odin-ecs-{env}-…` / `odin-lambda-{env}-…` as an INFIX, both anchored on
+    `-` so a longer env sharing this one's prefix never matches (the rule
+    tests/containers.py documents and relies on).
+
+    Best-effort by design, and `reconcile/drift.py::_listing`'s exact
+    reasoning: this runs only when a destroy has ALREADY failed, so a docker
+    daemon that won't answer must degrade to "couldn't tell" rather than
+    replace a real failure report with a traceback."""
+    try:
+        names = runtime.container_names()
+    except Exception as exc:  # noqa: BLE001 -- any CLI/parse failure means "unknown"
+        log.warning("could not list containers while reporting a failed destroy (%s)", exc)
+        return []
+    return sorted(name for name in names if name.endswith(f"-{env}") or f"-{env}-" in name)
+
+
 def create_apply_router(
     store: SpecStore, reconciler_for, keystore: KeyStore, runner: TfRunner, gateway_port, env_epoch: dict[str, int],
-    stores: SynthStores,
+    stores: SynthStores, runtime,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -192,6 +229,25 @@ def create_apply_router(
                     body["tf"] = {"status": "ok" if result.ok else "failed", "exit_code": result.exit_code}
                     if not result.ok:
                         body["tf"]["tail"] = list(result.tail)
+                        # Field test 4 (HIGH): `body["status"]` was set to
+                        # "destroyed" optimistically at the top of this route
+                        # and NEVER revised, so a `tofu destroy` that failed --
+                        # or was killed at its 300s whole-call deadline, exit
+                        # -9 -- still answered `status: destroyed` and `odin
+                        # destroy` exited 0, with six resources left in state
+                        # and containers still running. `/tf/destroy` next door
+                        # already got this right ("destroyed" if result.ok else
+                        # "failed"); the two paths disagreed, and the wrong one
+                        # was the one the CLI and the UI use.
+                        #
+                        # A negative exit code is a SIGNAL, not tofu's own
+                        # verdict, and on this path there is exactly one thing
+                        # that sends it: `TfRunner._run`'s `killpg` when the
+                        # destroy budget blows. That is a different outcome
+                        # from tofu erroring -- nothing was diagnosed, it just
+                        # ran out of time -- so it gets its own status and its
+                        # own message.
+                        body["status"] = "destroy_timed_out" if result.exit_code < 0 else "destroy_failed"
 
             # Field test 3 HIGH-B: whatever tofu did or did not manage to
             # destroy, an EC2 instance this env's gateway store still claims
@@ -218,7 +274,31 @@ def create_apply_router(
 
         await reconciler.tick()
         keystore.revoke_env(env)  # gateway-issued keys die with the env they belong to
-        return JSONResponse(status_code=200, content=body)
+        if body["status"] == "destroyed":
+            return JSONResponse(status_code=200, content=body)
+        # A destroy that failed says so, and says WHAT SURVIVED -- "destroy
+        # failed" on its own is nearly as unhelpful as the false success it
+        # replaces. Both witnesses, gathered only here on the failure path:
+        # tofu's own state (what terraform still owns and a retry must delete)
+        # and the real containers still on the machine. `error` is what makes
+        # `odin destroy` exit nonzero: `cli/http.body_or_fail` keys on it, the
+        # same convention every other honest failure in this file uses.
+        body["still_standing"] = {
+            "tf_state": _tf_state_addresses(store.root, env),
+            "containers": await asyncio.to_thread(_surviving_containers, runtime, env),
+        }
+        timed_out = body["status"] == "destroy_timed_out"
+        budget = "" if not timed_out else (
+            " -- it was killed at its whole-call deadline (ODIN_TOFU_DESTROY_TIMEOUT), "
+            "so nothing was diagnosed, it ran out of time"
+        )
+        body["error"] = (
+            f"destroy did not finish for env {env!r}: tofu exited {body['tf']['exit_code']}{budget}. "
+            f"still standing: {len(body['still_standing']['tf_state'])} resource(s) in tofu state "
+            f"{body['still_standing']['tf_state']}, "
+            f"{len(body['still_standing']['containers'])} container(s) {body['still_standing']['containers']}"
+        )
+        return JSONResponse(status_code=500, content=body)
 
     @router.get("/world")
     def world(env: str = ENV) -> dict:
@@ -869,7 +949,7 @@ def create_app(
     app.include_router(
         create_apply_router(
             _store, reconciler_for, gateway_keystore, tf_runner, lambda: gateway_port_actual, env_epoch,
-            gateway_stores,
+            gateway_stores, _runtime,
         )
     )
     app.include_router(
