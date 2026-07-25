@@ -17,6 +17,7 @@ import yaml
 from odin.fabric.models import FirewallRule, FirewallRules
 from odin.fabric.nebula import ensure_network
 from odin.fabric.sidecar import NEBULA_IMAGE, MeshSidecar
+from odin.runtime.colima import ContainerSpec
 
 ENV = "prod"
 TARGET = "odin-rds-prod-db"
@@ -41,16 +42,30 @@ class FakeRunner:
 
 
 class FakeRuntime:
+    """Models the ONE runtime behaviour the namespace check turns on: a
+    container gets a FRESH id every `run_container`, and a container started
+    with `--network container:<name>` records the target's id AS IT WAS THEN
+    (exactly what docker's `HostConfig.NetworkMode` holds)."""
+
     def __init__(self, images=("odin-nebula:1.10.3",)):
         self.specs: list = []
         self.stopped: list[str] = []
         self.built: list[tuple[str, str]] = []
+        self.probes: list[tuple[str, str]] = []
+        self.probe_reply = ""
         self._images = set(images)
         self._running: set[str] = set()
+        self._ids: dict[str, str] = {}
+        self._netmode: dict[str, str] = {}
+        self._next_id = 0
 
     def run_container(self, spec):
         self.specs.append(spec)
         self._running.add(spec.name)
+        self._next_id += 1
+        self._ids[spec.name] = f"{self._next_id:064x}"
+        target = (spec.network or "").partition("container:")[2]
+        self._netmode[spec.name] = f"container:{self._ids.get(target, target)}" if target else "default"
 
     def stop(self, name):
         self.stopped.append(name)
@@ -58,6 +73,23 @@ class FakeRuntime:
 
     def status(self, name):
         return "running" if name in self._running else "absent"
+
+    def container_id(self, name):
+        return self._ids.get(name, "") if name in self._running else ""
+
+    def network_mode(self, name):
+        return self._netmode.get(name, "")
+
+    def exec_sh(self, name, script):
+        self.probes.append((name, script))
+        return self.probe_reply
+
+    def start_target(self, name):
+        """The BACKING container's own lifecycle (rds.py/backings.py own it,
+        not the sidecar) -- called in the tests that care about which
+        namespace the sidecar landed in."""
+        self.run_container(ContainerSpec(name=name, image="postgres:16-alpine"))
+        self.specs.pop()  # not a sidecar spec; keep `specs` about the sidecar
 
     def image_exists(self, tag):
         return tag in self._images
@@ -214,6 +246,57 @@ def test_changed_firewall_restarts_the_sidecar(tmp_path):
     assert runtime.stopped.count(f"{TARGET}-mesh") == 2  # stopped before each (re)start
     config = yaml.safe_load((tmp_path / ENV / "nebula" / "members" / MEMBER / "config.yml").read_text())
     assert len(config["firewall"]["inbound"]) == 2
+
+
+def test_a_replaced_target_container_gets_a_fresh_sidecar(tmp_path):
+    """Field test 2 HIGH-2: `docker kill` the Postgres, Apply, and the DB comes
+    back as a NEW container -- while the sidecar stayed in the DEAD container's
+    network namespace (`netmode=container:<old id>`), looping "sendto: network
+    is unreachable" forever. The config was byte-identical and the sidecar
+    container was still `running`, so the old idempotence test short-circuited
+    and no Apply could ever heal it."""
+    ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
+    runtime = FakeRuntime()
+    runtime.start_target(TARGET)
+    mesh = _sidecar(tmp_path, runtime)
+    mesh.ensure(TARGET, MEMBER, firewall=DB_FIREWALL)
+    assert mesh.attached_to(TARGET) is True
+
+    runtime.stop(TARGET)          # `docker kill` + the converge's own cleanup
+    runtime.start_target(TARGET)  # ...and the recreated database: a NEW id
+    assert mesh.attached_to(TARGET) is False, "the sidecar is in the dead container's namespace"
+
+    mesh.ensure(TARGET, MEMBER, firewall=DB_FIREWALL)
+    assert len(runtime.specs) == 2, "a replaced target must re-join, not short-circuit"
+    assert runtime.specs[1].network == f"container:{TARGET}"
+    assert mesh.attached_to(TARGET) is True
+
+
+def test_an_unchanged_target_does_not_churn_the_sidecar(tmp_path):
+    """The other half of the same fix -- one bug must not be traded for a
+    restart-every-tick bug (`ensure_db_mesh` runs on every Apply, and the
+    mesh health sweep re-checks this on its own cadence)."""
+    ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
+    runtime = FakeRuntime()
+    runtime.start_target(TARGET)
+    mesh = _sidecar(tmp_path, runtime)
+    for _ in range(4):
+        mesh.ensure(TARGET, MEMBER, firewall=DB_FIREWALL)
+    assert len(runtime.specs) == 1
+    assert runtime.stopped.count(f"{TARGET}-mesh") == 1  # the one pre-start clear
+
+
+def test_attached_to_is_unknown_rather_than_false_when_the_target_is_gone(tmp_path):
+    """A target the runtime can't report on (never started, docker hiccup) is
+    NOT evidence of a replacement -- churning a sidecar on no evidence would
+    be a self-inflicted restart loop."""
+    ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
+    runtime = FakeRuntime()
+    mesh = _sidecar(tmp_path, runtime)
+    mesh.ensure(TARGET, MEMBER, firewall=DB_FIREWALL)
+    assert mesh.attached_to(TARGET) is None
+    mesh.ensure(TARGET, MEMBER, firewall=DB_FIREWALL)
+    assert len(runtime.specs) == 1
 
 
 def test_a_dead_sidecar_is_restarted_even_with_an_unchanged_config(tmp_path):

@@ -217,6 +217,36 @@ class _ContainerRuntime:
         happens to share."""
         self._cli("cp", host_path, f"{name}:{container_path}")
 
+    def container_id(self, name: str) -> str:
+        """This container's full id, or "" when it doesn't exist.
+
+        The id is what makes "is my sidecar in the CURRENT target's network
+        namespace?" answerable: a container that was killed and re-created
+        keeps its NAME but never its id (fabric/sidecar.py's
+        `attached_to`)."""
+        return self._cli("inspect", "-f", "{{.Id}}", name, check=False)
+
+    def network_mode(self, name: str) -> str:
+        """The container's own network mode -- for a namespace-sharing
+        container (`--network container:<target>`) this is
+        `container:<the target's id AS IT WAS AT CREATION>`, because the
+        runtime resolves the name to an id right then. That stale id is
+        exactly the signal that the target has since been replaced."""
+        return self._cli("inspect", "-f", "{{.HostConfig.NetworkMode}}", name, check=False)
+
+    def exec_sh(self, name: str, script: str) -> str:
+        """Run `script` with `sh -c` INSIDE a running container's namespaces
+        and return its stdout ("" if the container is gone, the exec fails, or
+        the script printed nothing).
+
+        The one way to observe a network namespace odin doesn't own: the mesh
+        sidecar shares its target's namespace, so a probe run here sees the
+        overlay exactly as a real consumer on the mesh does
+        (reconcile/assertions.py::mesh_ready_sync). Callers make the script
+        self-bounding (busybox `nc -w`) and print a TOKEN on success rather
+        than relying on an exit code, so this stays a plain stdout read."""
+        return self._cli("exec", name, "sh", "-c", script, check=False)
+
     def signal(self, name: str, sig: str) -> None:
         """Send UNIX signal `sig` to the container's main process (`docker kill
         -s`). W2.5: how a load-balancer proxy container is told to re-read its
