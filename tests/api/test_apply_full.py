@@ -17,7 +17,7 @@ from odin.agent.hcl import generate_tf
 from odin.agent.translate import TranslateResult
 from odin.runtime.colima import ContainerFacts, HostFacts, RunHandle
 from odin.server import _TOFU_NOT_INSTALLED, create_app
-from odin.simulate.runner import SimulateBusy
+from odin.simulate.runner import SimulateBusy, TfResult
 from odin.simulate.workspace import tf_dir
 from odin.spec.store import SpecStore
 from odin.spec.translate import canvas_to_stack
@@ -626,3 +626,62 @@ def test_a_tofu_failure_is_not_also_charged_the_steady_wait(tmp_path, monkeypatc
     body = resp.json()
     assert body["status"] == "applied_tf_failed", body
     assert "unhealthy" not in body
+
+
+# --- field test 3: /world may not freeze for the length of an apply ---------
+
+
+_LB = {
+    "arn": "arn:aws:elasticloadbalancing:us-east-1:000000000000:loadbalancer/app/edge/1",
+    "name": "edge", "state": "active", "endpoints": {"80": 18080},
+}
+
+
+def test_world_keeps_being_projected_while_an_apply_full_is_in_flight(tmp_path, monkeypatch):
+    """FIELD TEST 3's measurement, at the endpoint that produced it.
+
+    `/apply-full` holds the reconciler across ensure + tofu + commit, and
+    `/world` reads the last committed snapshot -- so for the whole ~60s of a
+    real apply the operator was shown a pre-apply reading. Sampled every 2s,
+    the world still said `healthy` at t=64.0s for a deployment that had died
+    at t≈4s. That stale reading has now concealed a total outage AND (after
+    v0.7.2) a rollout that never stopped serving: opposite lies, same blind
+    spot, at the one moment anyone is actually watching.
+
+    Sampled from INSIDE the tofu run, which is the only place the claim means
+    anything: the world must both be projected at all (the alb enters World
+    during the hold) and track a change that happens during it (its real proxy
+    dies mid-apply and the very next tick says so)."""
+    phases: list[str] = []
+    app = _app(tmp_path)
+    store, stores = app.state.store, app.state.gateway_stores
+    stores.elbv2ctl.set("default", "lb:1", dict(_LB))
+
+    def _phase() -> str:
+        observed = store.current_world("default").get("edge")
+        return observed.phase if observed is not None else "absent"
+
+    async def slow_apply(self, env, project, gateway_port, access_key, secret_key, secrets=frozenset()):
+        # ~2.4s at the production 1.0s poll interval: a scale model of the 62s
+        # apply, long enough for the background loop to tick either side of
+        # the failure.
+        for _ in range(3):
+            await asyncio.sleep(0.4)
+            phases.append(_phase())
+        stores.elbv2ctl.set(env, "lb:1", {**_LB, "state": "failed", "state_reason": "no space left on device"})
+        for _ in range(3):
+            await asyncio.sleep(0.4)
+            phases.append(_phase())
+        return TfResult(ok=True, exit_code=0)
+
+    monkeypatch.setattr("odin.simulate.runner.TfRunner.apply", slow_apply)
+    _patch_translate(monkeypatch, TranslateResult(files=_skeleton_files(), refined=True))
+
+    with TestClient(app) as client:
+        resp = client.post("/apply-full", json=S3_SQS)
+
+    assert resp.status_code == 200, resp.text
+    assert "healthy" in phases, f"the world was never projected during the apply: {phases}"
+    assert phases[-1] == "crashed", f"the world froze at its pre-failure reading: {phases}"
+    # ...and the verdict rides along, not just the colour.
+    assert store.current_world("default").get("edge").verdict == "no space left on device"
