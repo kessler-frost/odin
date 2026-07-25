@@ -160,14 +160,24 @@ class Reconciler:
         ensured anything) or wholly AFTER it (its gc is suppressed). There is
         no interleaving in which a tick reads "not suspended" and then acts --
         which is exactly the race the original whole-lock hold was introduced
-        to close. Nesting is safe (a depth, not a boolean)."""
+        to close. Nesting is safe (a depth, not a boolean).
+
+        The asymmetry is deliberate: TAKING the suspension needs the lock
+        (nothing may act after the caller has started mutating), RELEASING it
+        does not. "Actions may resume" carries no ordering requirement --
+        resuming one tick later is harmless, and both routes kick an explicit
+        `tick()` straight after the hold anyway -- so the release is a bare
+        decrement with no await in it. That matters on the unwind path: a
+        `finally` that awaits a lock is one a cancelled request (a shutdown,
+        a connection dropped 40s into a tofu run) can stall in, and a
+        suspension that never lifts is an env whose reconciler silently stops
+        acting."""
         async with self._tick_lock:
             self._suspended += 1
         try:
             yield
         finally:
-            async with self._tick_lock:  # never lift the suspension mid-tick
-                self._suspended -= 1
+            self._suspended -= 1
 
     async def tick(self) -> None:
         async with self._tick_lock:

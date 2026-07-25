@@ -292,6 +292,30 @@ async def test_hold_suspends_gc_even_though_ticks_keep_running(tmp_path):
     assert aws.gc_calls == [set()]  # released: the tick acts again
 
 
+async def test_a_cancelled_hold_does_not_leave_the_reconciler_suspended(tmp_path):
+    """An /apply-full killed mid-hold — a shutdown, a connection dropped 40s
+    into a tofu run — must not disable the env's reconciler forever. A
+    suspension is a flag now rather than a held lock, so the unwind has to put
+    it back; a leaked one is an env that silently never gc's or provisions
+    again, and nothing else in the system would notice."""
+    rt, aws = FakeRuntime(), FakeAws()
+    store = SpecStore(tmp_path)
+    store.apply(Stack())
+    recon = Reconciler(store, rt, aws=aws, poll_interval=0)
+
+    async def held():
+        async with recon.hold():
+            await asyncio.sleep(30)  # the tofu run that never gets to finish
+
+    task = asyncio.create_task(held())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    await recon.tick()
+    assert aws.gc_calls == [set()], "the suspension outlived the cancelled apply"
+
+
 async def test_hold_suspends_provisioning_and_the_gateway_push(tmp_path):
     # The other two halves of "actions", asserted directly: nothing may be
     # created in a backing while an external author owns the env, and the
