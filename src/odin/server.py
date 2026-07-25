@@ -29,7 +29,7 @@ from odin.api.canvas import CanvasGraph, create_canvas_router
 from odin.api.debug import create_debug_router
 from odin.api.logs import create_logs_router
 from odin.api.ws import ConnectionManager
-from odin.aws.backings import BackingAws
+from odin.aws.backings import PROVISIONED, BackingAws
 from odin.compute.tasks import TaskRuntime
 from odin.fabric.localhost import LocalhostFabric
 from odin.fabric.nebula import mesh_state, reap_orphaned_lighthouses
@@ -42,12 +42,13 @@ from odin.gateway.stores import SynthStores
 from odin.reconcile import admission
 from odin.reconcile.drift import DriftSweeper
 from odin.reconcile.reconciler import Reconciler
+from odin.reconcile.tf_status import stranded_in_tf_state
 from odin.runtime.colima import ColimaRuntime
 from odin.simulate.runner import SimulateBusy, TfRunner, TofuNotInstalled
-from odin.spec.models import Stack
+from odin.spec.models import Stack, World
 from odin.spec.store import SpecStore
 from odin.spec.translate import canvas_to_stack, skipped_node_types
-from odin.util import hold_store_lock, odin_version
+from odin.util import STORE_LOCK_NAME, StoreLock, hold_store_lock, odin_version
 
 ODIN_DIR = Path(".odin")
 CANVAS_NAME = "canvas.json"
@@ -139,7 +140,7 @@ async def _admission_rejection(runtime, store: SpecStore, stack: Stack) -> JSONR
 
 def create_apply_router(
     store: SpecStore, reconciler_for, keystore: KeyStore, runner: TfRunner, gateway_port, env_epoch: dict[str, int],
-    stores: SynthStores,
+    stores: SynthStores, gateway: GatewayState,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -253,7 +254,22 @@ def create_apply_router(
 
     @router.get("/world")
     def world(env: str = ENV) -> dict:
-        return store.current_world(env).model_dump()
+        """The env's observed World, plus the resources tofu really created
+        that odin can currently see nowhere else (field test 3, P2-5: after a
+        failed apply the s3/sqs/sns/dynamodb nodes had NO BADGE AT ALL while
+        tofu's state listed them and every call answered ServiceUnavailable).
+
+        `reachable` is the gateway's own routing table -- the very thing that
+        decides between forwarding a call and refusing it -- so this reports
+        exactly the resources the gateway would genuinely refuse right now, and
+        nothing during a healthy apply. See `stranded_in_tf_state` for why this
+        is a per-request overlay rather than a World write."""
+        observed = store.current_world(env)
+        reachable = {kind for kind in PROVISIONED if gateway.backing_port(env, kind) is not None}
+        stranded = stranded_in_tf_state(store.root, env, observed, reachable)
+        return World(
+            env=observed.env, resources=(*observed.resources, *stranded),
+        ).model_dump()
 
     @router.get("/mesh")
     def mesh(env: str = ENV) -> dict:
@@ -695,6 +711,35 @@ def create_apply_full_router(
     return router
 
 
+# How often a live server re-checks that its own store lock is still reachable
+# by path. One `stat` per second; the window it bounds is how long odin can
+# lie about whether a server is up after something deletes `.odin/lock`.
+LOCK_WATCH_INTERVAL = 1.0
+
+
+async def _keep_store_lock(lock: StoreLock, interval: float = LOCK_WATCH_INTERVAL) -> None:
+    """Put the store lock FILE back if anything deletes it under this server.
+
+    Field test 4: `rm -rf .odin` releases no lock (flock lives on the inode)
+    but makes it unreachable by path, so `odin status` said "not running"
+    while the server was still serving, `odin import` restored into the live
+    store, and a SECOND server was started on it. `StoreLock.reassert` is the
+    repair; this is the only thing that has to run for it to happen. A warning
+    every interval is the correct volume for the one case it cannot repair --
+    another process already holding the file that replaced ours means two
+    servers really are on this store.
+    """
+    while True:
+        await asyncio.sleep(interval)
+        if not await asyncio.to_thread(lock.reassert):
+            log.warning(
+                "the store lock file was gone or was not ours -- re-established it. Something "
+                "deleted %s under a live server (`odin clean --all`, `rm -rf`); until this ran, "
+                "`odin status` reported no server and `odin import` would have restored into a "
+                "live store.", lock.root / STORE_LOCK_NAME,
+            )
+
+
 async def _reap_orphaned_ec2_vms(root: Path, envs: list[str], stores: SynthStores) -> None:
     """Best-effort (release finding #4): `limactl` being unavailable, or
     any other reaper failure, must never block server startup -- this is a
@@ -873,6 +918,10 @@ def create_app(
         # once nothing is writing to it. (Never a reason to fail startup: an
         # unlockable store answers "free", see util._flock.)
         store_lock = hold_store_lock(_store.root)
+        # ...and a watchdog that puts the lock FILE back if anything deletes it
+        # (field test 4 -- see `_keep_store_lock`). The lock itself survives the
+        # deletion; only the evidence odin can find by path does not.
+        lock_watch = asyncio.create_task(_keep_store_lock(store_lock))
         envs = _store.list_envs()
         if _reap_ec2_vms:
             await _reap_orphaned_ec2_vms(_store.root, envs, gateway_stores)
@@ -881,6 +930,7 @@ def create_app(
         try:
             yield
         finally:
+            lock_watch.cancel()
             for reconciler in reconcilers.values():
                 await reconciler.stop()
             stop_in_thread(gateway_server, gateway_thread)
@@ -899,7 +949,7 @@ def create_app(
     app.include_router(
         create_apply_router(
             _store, reconciler_for, gateway_keystore, tf_runner, lambda: gateway_port_actual, env_epoch,
-            gateway_stores,
+            gateway_stores, gateway_state,
         )
     )
     app.include_router(

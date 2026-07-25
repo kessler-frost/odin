@@ -7,15 +7,19 @@ facts, verdict)`. Hand-built `SynthStores`, no reconciler/asyncio involved
 integration (emitting WorldDeltas + pruning)."""
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
 
 from odin.fabric.models import MeshNetwork, SubnetAllocation
 from odin.gateway.models import elbv2ctl, rdsctl, secretsctl, ssmctl
 from odin.gateway.stores import SynthStores
 from odin.reconcile import mesh_health
-from odin.reconcile.tf_status import TF_OWNED_KINDS, project
+from odin.reconcile.tf_status import TF_OWNED_KINDS, project, stranded_in_tf_state
 from odin.runtime.colima import CONTAINER_HOST
 from odin.runtime.lima import LIMA_HOST
+from odin.simulate.workspace import tf_dir
+from odin.spec.models import ResourceObserved, World
 
 ENV = "default"
 
@@ -986,3 +990,103 @@ def test_an_untagged_database_still_projects_under_its_identifier(tmp_path):
     stores.rdsctl.set(ENV, "db:app-db", _db_record("app-db"))
 
     assert project(stores, ENV)["app-db"][0] == "rds"
+
+
+# --- field test 3, P2-5: the resources a failed apply leaves ONLY in tofu's
+# state. `/world` showed 12 s3/sqs/sns/dynamodb nodes with NO BADGE AT ALL --
+# not pending, not crashed, absent -- while `tofu state` listed them and every
+# call to them answered ServiceUnavailable. ----------------------------------
+
+
+def _tf_state(root: Path, env: str, *resources: dict) -> None:
+    """tofu's own state file, in tofu's own shape, where the runner puts it."""
+    directory = tf_dir(root, env)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "terraform.tfstate").write_text(json.dumps({"version": 4, "resources": list(resources)}))
+
+
+def _tf_resource(tf_type: str, name_attr: str, name: str, label: str | None = None) -> dict:
+    tags = {"odin:node": label} if label else {}
+    return {
+        "mode": "managed", "type": tf_type, "name": name,
+        "instances": [{"attributes": {name_attr: name, "tags": tags}}],
+    }
+
+
+def test_a_bucket_tofu_created_is_visible_when_its_backing_never_started(tmp_path):
+    """THE finding. The apply failed, so the desired state was never committed
+    and the reconciler never provisioned or observed these -- and the trailing
+    gc stopped the backings. They must not simply disappear."""
+    _tf_state(
+        tmp_path, ENV,
+        _tf_resource("aws_s3_bucket", "bucket", "uploads"),
+        _tf_resource("aws_sqs_queue", "name", "jobs"),
+        _tf_resource("aws_sns_topic", "name", "events"),
+        _tf_resource("aws_dynamodb_table", "name", "sessions"),
+    )
+    stranded = stranded_in_tf_state(tmp_path, ENV, World(env=ENV), reachable_kinds=set())
+
+    assert {r.id for r in stranded} == {"uploads", "jobs", "events", "sessions"}
+    assert {r.kind for r in stranded} == {"s3", "sqs", "sns", "dynamodb"}
+    assert {r.phase for r in stranded} == {"crashed"}          # an honest phase, not absence
+    verdict = next(r.verdict for r in stranded if r.id == "uploads")
+    assert "exists in the env's tofu state" in verdict          # WHY it is still listed
+    assert "no s3 backing container is running" in verdict      # WHY it does not answer
+    assert "ServiceUnavailable" in verdict                      # the error the user actually sees
+    assert "Apply to start it" in verdict                       # ...and the fix
+
+
+def test_a_resource_whose_backing_is_up_is_left_entirely_alone(tmp_path):
+    """The false-alarm guard, and the reason the check is the GATEWAY's own
+    routing table: during a healthy apply the backing is up from
+    `ensure_backings` while the reconciler simply has not observed the new
+    bucket yet. Reporting `crashed` there would be a fresh lie."""
+    _tf_state(tmp_path, ENV, _tf_resource("aws_s3_bucket", "bucket", "uploads"))
+    assert stranded_in_tf_state(tmp_path, ENV, World(env=ENV), reachable_kinds={"s3"}) == ()
+
+
+def test_world_always_wins(tmp_path):
+    """A resource the reconciler really observed keeps its own phase: this
+    overlay only ever speaks about labels World says nothing about."""
+    _tf_state(tmp_path, ENV, _tf_resource("aws_s3_bucket", "bucket", "uploads"))
+    world = World(env=ENV, resources=(ResourceObserved(id="uploads", kind="s3", phase="healthy"),))
+    assert stranded_in_tf_state(tmp_path, ENV, world, reachable_kinds=set()) == ()
+
+
+def test_a_resource_tofu_destroyed_stops_being_reported_immediately(tmp_path):
+    """The v0.5.2 phantom-EC2 guard. Nothing here outlives tofu's state entry,
+    so `tofu destroy` / an empty-canvas Apply makes it disappear the same
+    instant -- a resource that genuinely no longer exists must still vanish."""
+    _tf_state(tmp_path, ENV, _tf_resource("aws_s3_bucket", "bucket", "uploads"))
+    assert stranded_in_tf_state(tmp_path, ENV, World(env=ENV), reachable_kinds=set())
+    _tf_state(tmp_path, ENV)  # what `tofu destroy` leaves behind
+    assert stranded_in_tf_state(tmp_path, ENV, World(env=ENV), reachable_kinds=set()) == ()
+
+
+def test_the_odin_node_tag_wins_over_the_aws_name(tmp_path):
+    _tf_state(tmp_path, ENV, _tf_resource("aws_s3_bucket", "bucket", "uploads-abc123", label="uploads"))
+    assert [r.id for r in stranded_in_tf_state(tmp_path, ENV, World(env=ENV), set())] == ["uploads"]
+
+
+def test_tf_owned_kinds_are_never_duplicated_by_this_overlay(tmp_path):
+    """`project()` already owns every TF_OWNED kind and the reconciler prunes
+    them properly. This overlay is ONLY for the shared-backing kinds."""
+    _tf_state(
+        tmp_path, ENV,
+        _tf_resource("aws_instance", "id", "i-1", label="web"),
+        _tf_resource("aws_db_instance", "identifier", "app-db"),
+        _tf_resource("aws_ecs_service", "name", "svc"),
+    )
+    assert stranded_in_tf_state(tmp_path, ENV, World(env=ENV), reachable_kinds=set()) == ()
+
+
+def test_a_missing_or_half_written_state_is_no_evidence(tmp_path):
+    """tofu rewrites state IN PLACE, so a reader can land mid-write -- and
+    `/world` is polled throughout an apply. Neither case may raise."""
+    assert stranded_in_tf_state(tmp_path, ENV, World(env=ENV), set()) == ()   # never applied
+    directory = tf_dir(tmp_path, ENV)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "terraform.tfstate").write_text("")
+    assert stranded_in_tf_state(tmp_path, ENV, World(env=ENV), set()) == ()   # pre-created, empty
+    (directory / "terraform.tfstate").write_text('{"version": 4, "resou')
+    assert stranded_in_tf_state(tmp_path, ENV, World(env=ENV), set()) == ()   # caught mid-write

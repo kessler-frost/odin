@@ -26,6 +26,7 @@ any seam.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 import sys
@@ -37,6 +38,7 @@ import pytest
 
 from odin import backup, util
 from odin.backup import BackupError, export_env, import_archive
+from odin.server import _keep_store_lock
 
 # The exact command line the README documents -- the one v0.7.1 grepped for.
 UVICORN = "/x/.venv/bin/python -m uvicorn odin.server:create_app --factory --host 127.0.0.1 --port 4510"
@@ -168,6 +170,64 @@ def test_deleting_the_lock_file_lets_two_processes_hold_one_store(tmp_path: Path
     # `test_uvicorn_path_is_detected_with_no_pidfile_at_all` is the same call
     # refusing. Two servers, one store.
     assert lock_path.read_text().strip() == str(os.getpid())
+
+
+def test_the_holder_puts_its_own_lock_file_back_after_a_deletion(tmp_path: Path, held_lock):
+    """The other half of the fix (field test 4). `odin clean --all` refusing
+    stops odin doing this to itself; `reassert` covers every deleter odin does
+    NOT control -- a stray script, an impatient `rm -rf .odin` -- so the window
+    in which odin lies about its own liveness is one watchdog interval instead
+    of the rest of the server's life."""
+    root = _store(tmp_path)
+    lock = held_lock(root)
+    old_fd = lock.fd
+    (root / util.STORE_LOCK_NAME).unlink()
+    assert util.live_server(root) is None                  # the blind window, measured
+
+    assert lock.reassert() is False                        # False = a repair was needed
+    assert lock.fd != old_fd                               # a new inode, taken and stamped
+    server = util.live_server(root)
+    assert server is not None and server.pid == os.getpid()
+    # ...and the repaired lock really excludes: this is the whole point.
+    probe = os.open(root / util.STORE_LOCK_NAME, os.O_RDWR)
+    try:
+        assert util._flock(probe) is False
+    finally:
+        os.close(probe)
+    assert lock.reassert() is True                          # idempotent: nothing left to do
+
+
+def test_reassert_refuses_to_steal_a_lock_file_someone_else_already_owns(tmp_path: Path, held_lock):
+    """The one case it must NOT repair: a second server got there first, so
+    the file on disk is genuinely theirs. Report it (the caller warns) rather
+    than take it -- and keep our own fd until we know we have the new one."""
+    root = _store(tmp_path)
+    lock = held_lock(root)
+    (root / util.STORE_LOCK_NAME).unlink()
+    squatter = held_lock(root)                              # "the second server"
+    ours = lock.fd
+
+    assert lock.reassert() is False
+    assert lock.fd == ours, "our own lock must not be dropped for one we could not take"
+    assert squatter.fd != ours
+    assert util.live_server(root) is not None                # the squatter is the one on record
+
+
+async def test_the_servers_watchdog_restores_the_lock_without_anyone_asking(tmp_path: Path, held_lock):
+    """`reassert` is only worth having if something runs it. This is the loop
+    the app's lifespan starts -- driven at a test interval, but otherwise the
+    production code path, including its cancellation."""
+    root = _store(tmp_path)
+    lock = held_lock(root)
+    (root / util.STORE_LOCK_NAME).unlink()
+    assert util.live_server(root) is None
+
+    watchdog = asyncio.create_task(_keep_store_lock(lock, interval=0.01))
+    await asyncio.sleep(0.1)
+    watchdog.cancel()
+
+    server = util.live_server(root)
+    assert server is not None and server.pid == os.getpid()
 
 
 def test_a_second_holder_is_refused_while_the_lock_file_is_intact(tmp_path: Path, held_lock):
