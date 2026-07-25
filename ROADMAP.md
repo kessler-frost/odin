@@ -109,11 +109,36 @@ future decision against these points instead of re-deriving them:
     are `launch_type = "EC2"` / `network_mode = "bridge"`, which need none);
     a task that dies between API calls isn't auto-replaced until the next
     Apply reconciles the service. Generated services set
-    `wait_for_steady_state = true` with a bounded `timeouts.create` (v0.5.4,
+    `wait_for_steady_state = true` with a bounded `timeouts` block (v0.5.4,
     finding #3) so a bad image / crash-on-start fails apply fast and honestly
     instead of silently "succeeding" with a service that never runs — the
     trade-off is that a genuinely slow FIRST image pull that exceeds the
-    timeout also fails apply (a retry re-uses the now-cached image). (Fixed: a
+    timeout also fails apply (a retry re-uses the now-cached image). That guard
+    covered CREATE but was **inert on UPDATE** until v0.7.1 (field test 2,
+    finding B1): terraform-provider-aws's steady-state waiter keys on
+    `len(deployments) == 1 && desiredCount == runningCount`, and a
+    revision-blind `runningCount` counted the STALE tasks at the instant
+    UpdateService returned, so a typo'd image tag reported `applied / tf: ok`
+    in 2.3s while every healthy task was destroyed. `runningCount` (service and
+    PRIMARY deployment alike) now counts only tasks on the service's CURRENT
+    task definition — real ECS's own definition of a deployment's
+    runningCount — so a bad-image update fails apply inside `timeouts.update`
+    and the real `docker` error naming the image is carried on the deployment's
+    `rolloutStateReason`, an ECS service event, the task's `stoppedReason` and
+    the node's World verdict
+    (`tests/simulate/test_ecs_bad_image_update_e2e.py`).
+    **Deliberate deviation, recorded:** real AWS's SERVICE-level runningCount
+    also counts draining old-revision tasks, but it distinguishes them with a
+    SECOND deployment record, which odin does not model — with one deployment
+    record, current-revision-only is the sole self-consistent choice.
+    **Residual gap, stated plainly:** odin retires the stale tasks before
+    launching replacements, so a failed image update still takes the service to
+    zero until the next Apply (real ECS's `minimumHealthyPercent = 100` keeps
+    the old tasks serving). Closing that needs the World projection to
+    distinguish "serving the previous revision" from "healthy", or a service
+    running old tasks would report `healthy` while its deployment failed — a
+    worse lie than the outage. The apply now FAILS loudly either way, so CI
+    stops instead of scoring the outage green. (Fixed: a
     `tags` block on `aws_ecs_service` now plans zero-drift — the gateway stores
     the full tag set and echoes it back, with
     `TagResource`/`UntagResource`/`ListTagsForResource` modeled.)

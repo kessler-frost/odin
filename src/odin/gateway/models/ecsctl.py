@@ -345,6 +345,29 @@ def _taskdef_wire(taskdef: dict) -> dict:
     }
 
 
+def _on_current_revision(service: dict, tasks: list[dict]) -> list[dict]:
+    """The subset of `tasks` running the service's CURRENT task definition.
+
+    Field-test 2 finding B1 (HIGH): a bad-image ECS *update* reported apply
+    SUCCESS in 2.3 seconds while destroying all three healthy tasks and leaving
+    the load balancer serving 503. The v0.5.4 guard (`wait_for_steady_state` +
+    a bounded `timeouts`) genuinely covered CREATE but was inert on UPDATE,
+    because terraform-provider-aws's steady-state waiter keys on
+    `len(deployments) == 1 && desiredCount == runningCount` -- and a
+    revision-blind `runningCount` still counted the three STALE tasks at the
+    instant UpdateService returned, so the waiter declared the deployment
+    stable before the reconcile thread had even started. Counting only the
+    current revision is also what real ECS's PRIMARY deployment reports, and it
+    is the only self-consistent choice for a model that renders exactly ONE
+    deployment record: an update is never "already steady" the moment it is
+    requested, and it stays short-of-desired for as long as it genuinely is,
+    which is what turns the bounded `timeouts.update` into a real apply
+    failure. (Deliberate deviation, recorded: real AWS's SERVICE-level
+    runningCount also counts draining old-revision tasks, but it distinguishes
+    them with a second deployment record, which odin does not model.)"""
+    return [t for t in tasks if t["task_definition_arn"] == service["task_definition_arn"]]
+
+
 def _rollout(service: dict, tasks: list[dict], deployment_id: str) -> tuple[str, str]:
     """The deployment's honest `(rolloutState, rolloutStateReason)` from the
     REAL task outcomes (field-test finding #3). A STOPPED task in the store is
@@ -355,7 +378,11 @@ def _rollout(service: dict, tasks: list[dict], deployment_id: str) -> tuple[str,
     a bad image / crash-on-start read as a healthy deployment and the failure
     was never surfaced (apply silently 'succeeded'). runningCount==desiredCount
     wins first, so a lingering STOPPED task from an already-recovered service
-    never reads as FAILED."""
+    never reads as FAILED.
+
+    `tasks` is already narrowed to the CURRENT revision by the caller
+    (`_on_current_revision`) -- a stale task from the previous deployment is
+    neither progress toward this one nor a failure of it."""
     running = sum(1 for t in tasks if t["last_status"] == "RUNNING")
     stopped = [t for t in tasks if t["last_status"] == "STOPPED"]
     if running == service["desired_count"]:
@@ -368,7 +395,11 @@ def _rollout(service: dict, tasks: list[dict], deployment_id: str) -> tuple[str,
 
 def _service_wire(stores: SynthStores, env: str, service: dict) -> dict:
     arn = _service_arn(service["cluster_name"], service["service_name"])
-    tasks = _tasks_for_service(stores, env, service["cluster_name"], service["service_name"])
+    all_tasks = _tasks_for_service(stores, env, service["cluster_name"], service["service_name"])
+    # CURRENT-REVISION ONLY -- see `_on_current_revision` for why (finding B1:
+    # this is the whole reason a bad-image UPDATE now fails apply instead of
+    # reading as instantly steady).
+    tasks = _on_current_revision(service, all_tasks)
     running = sum(1 for t in tasks if t["last_status"] == "RUNNING")
     pending = sum(1 for t in tasks if t["last_status"] == "PROVISIONING")
     deployment_id = f"ecs-svc/{service['service_name']}"

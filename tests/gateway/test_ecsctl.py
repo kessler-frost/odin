@@ -434,6 +434,99 @@ def test_update_service_task_definition_replaces_stale_tasks(sink, ecs, stores):
     assert task["taskDefinitionArn"].endswith(":2")
 
 
+def test_a_taskdef_update_reports_zero_running_until_the_new_revision_is_up(sink, ecs, stores):
+    """Field-test 2 finding B1 (HIGH): a bad-image ECS *update* reported apply
+    SUCCESS in 2.3s while taking the service to zero tasks and the load balancer
+    to 503.
+
+    Mechanism: terraform-provider-aws's `wait_for_steady_state` waiter keys on
+    `len(deployments) == 1 && desiredCount == runningCount`. `runningCount` used
+    to count EVERY running task regardless of revision, so at the instant
+    UpdateService returned -- before the background reconcile had even started
+    -- the three STALE tasks made `runningCount == desiredCount` and the waiter
+    declared the deployment stable immediately. `runningCount` must therefore
+    count only tasks on the service's CURRENT task definition, so an update is
+    never "already steady" the moment it is requested.
+
+    UpdateService's own response is that exact instant (`_update_service`
+    renders it before spawning the reconcile), which makes this deterministic."""
+    block = threading.Event()  # hold the reconcile thread in `run`
+    runtime = FakeTaskRuntime(block=block)
+    block.set()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)  # rev 1
+    _create_service(stores, sink, ecs, runtime, desiredCount=3)
+    _wait_for_running_count(stores, sink, ecs, runtime, 3)
+
+    _register_taskdef(stores, sink, ecs, runtime, containerDefinitions=[{
+        "name": "app", "image": "nginx:this-tag-does-not-exist-9z9z", "essential": True,
+    }])  # rev 2
+    block.clear()  # the reconcile spawned by UpdateService cannot make progress
+    req = sink.call(lambda: ecs.update_service(cluster="odin", service="app", taskDefinition="app:2"))
+    updated = _parse("UpdateService", _answer(stores, req, runtime))["service"]
+
+    assert updated["desiredCount"] == 3
+    assert updated["runningCount"] == 0, "three stale tasks must not read as the new revision"
+    (deployment,) = updated["deployments"]
+    assert deployment["taskDefinition"].endswith(":2")
+    assert deployment["runningCount"] == 0
+    assert deployment["rolloutState"] != "COMPLETED", updated
+    block.set()
+
+
+def test_a_taskdef_update_that_cannot_start_keeps_reporting_a_failed_deployment(sink, ecs, stores):
+    """The other half of B1: once the replacement tasks genuinely fail, the
+    service must KEEP reporting short-of-desired for as long as it is short --
+    that is what turns the provider's bounded `timeouts.update` into a real,
+    honest apply failure instead of a 2.3s success."""
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)  # rev 1
+    _create_service(stores, sink, ecs, runtime, desiredCount=2)
+    _wait_for_running_count(stores, sink, ecs, runtime, 2)
+
+    _register_taskdef(stores, sink, ecs, runtime, containerDefinitions=[{
+        "name": "app", "image": "nginx:this-tag-does-not-exist-9z9z", "essential": True,
+    }])  # rev 2
+    runtime.fail_run = True  # the new image cannot be pulled
+    req = sink.call(lambda: ecs.update_service(cluster="odin", service="app", taskDefinition="app:2"))
+    _answer(stores, req, runtime)
+
+    deadline = time.monotonic() + 2.0
+    service = None
+    while time.monotonic() < deadline:
+        service = _describe_service(stores, sink, ecs, runtime)
+        if service["deployments"][0]["rolloutState"] == "FAILED":
+            break
+        time.sleep(0.02)
+    (deployment,) = service["deployments"]
+    assert deployment["rolloutState"] == "FAILED", service
+    assert service["runningCount"] != service["desiredCount"], "would read as steady state"
+    assert "failed to start" in deployment["rolloutStateReason"]
+    assert service["events"], "a failed deployment posts a real service event"
+
+
+def test_a_successful_taskdef_update_still_reaches_steady_state(sink, ecs, stores):
+    """The counterweight to the two above: current-revision-only accounting must
+    still CONVERGE, or every healthy update would hang until its timeout."""
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)  # rev 1
+    _create_service(stores, sink, ecs, runtime, desiredCount=2)
+    _wait_for_running_count(stores, sink, ecs, runtime, 2)
+
+    _register_taskdef(stores, sink, ecs, runtime, containerDefinitions=[{
+        "name": "app", "image": "nginx:1.27-alpine", "essential": True,
+    }])  # rev 2
+    req = sink.call(lambda: ecs.update_service(cluster="odin", service="app", taskDefinition="app:2"))
+    _answer(stores, req, runtime)
+
+    final = _wait_for_running_count(stores, sink, ecs, runtime, 2)
+    (deployment,) = final["deployments"]
+    assert deployment["rolloutState"] == "COMPLETED", final
+    assert deployment["taskDefinition"].endswith(":2")
+
+
 def test_delete_service_stops_all_its_tasks(sink, ecs, stores):
     runtime = FakeTaskRuntime()
     _create_cluster(stores, sink, ecs, runtime)
