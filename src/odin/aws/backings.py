@@ -30,6 +30,7 @@ import httpx
 from botocore.client import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
+from odin.fabric.sidecar import MeshSidecar
 from odin.gateway import DEFAULT_GATEWAY_PORT
 from odin.runtime.colima import CONTAINER_HOST, ContainerSpec
 
@@ -135,12 +136,16 @@ _PROBES = {"s3": "list_buckets", "sqs": "list_queues",
 
 class BackingAws:
     def __init__(self, runtime, env: str = "default", root: Path = Path(".odin"),
-                 client_factory=None, gateway_port: int = DEFAULT_GATEWAY_PORT) -> None:
+                 client_factory=None, gateway_port: int = DEFAULT_GATEWAY_PORT,
+                 mesh: MeshSidecar | None = None) -> None:
         self._rt = runtime
         self._env = env
         self._root = root
         self._client_factory = client_factory
         self._gateway_port = gateway_port
+        # W2.6: puts each backing container on the env's Nebula overlay
+        # (fabric/sidecar.py). Inert unless the env has a Nebula network.
+        self._mesh = mesh or MeshSidecar(runtime, env, root)
         # Guards ensure_backing's check-then-create against TOCTOU: S5's
         # /apply-full calls it directly (to make the gateway routable before
         # tofu runs) while the SAME instance's Reconciler background loop can
@@ -197,6 +202,17 @@ class BackingAws:
             if self._rt.status(cname) != "running":
                 self._create_backing_container(d, cname)
         self._await_ready(cname, service)
+        # W2.6: the backing joins the env's Nebula overlay (a real cert + a
+        # sticky overlay IP), so it is a mesh member a firewall can gate --
+        # a no-op unless the canvas drew a VPC (fabric/sidecar.py::enabled).
+        # ADDITIVE: the published host port the gateway forwards to, the
+        # readiness probe above, and every host-side client are untouched.
+        # These four are AWS's own non-VPC services (S3/SQS/SNS/DynamoDB/ECR
+        # aren't SG-gated in real AWS either -- IAM and endpoint policy are
+        # their access control, which is the gateway's job), so they join
+        # with nebula's allow-all default rather than a compiled SG; rds,
+        # which IS VPC-resident, gets its drawn SG (aws/rds.py).
+        self._mesh.ensure(cname, cname)
 
     def _create_backing_container(self, d: BackingDef, cname: str) -> None:
         self._rt.stop(cname)  # clear any exited remnant (same contract as PostgresRds)
@@ -436,6 +452,7 @@ class BackingAws:
             return  # same kinds, nothing started since the last sweep: zero docker calls
         for d in BACKINGS:
             if set(d.kinds).isdisjoint(active_kinds):
+                self._mesh.stop(self._cname(d))  # its mesh sidecar dies with it
                 self._rt.stop(self._cname(d))  # stop is idempotent on absent names
                 self._ports_cache = None       # a backing may have really stopped
         self._last_gc_kinds = kinds

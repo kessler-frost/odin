@@ -585,6 +585,26 @@ def _ec2net_networks(root: Path, env: str) -> tuple[list[VpcNetwork], list[SgFir
     return vpcs, security_groups
 
 
+def sg_firewall_by_name(root: Path, env: str, group_names: Iterable[str]) -> FirewallRules | None:
+    """The compiled firewall of the drawn security groups NAMED `group_names`,
+    unioned -- how a reconciler-owned resource (an rds node, W2.6 piece 3)
+    finds the SG a canvas drew for it.
+
+    Matching is by GROUP NAME because that's the canvas label: `agent/hcl.py`
+    emits `name = "<node label>"` for every `aws_security_group`, so the
+    label the user typed is what lands in the gateway's SG record. Read
+    through the same `ec2net.json` sidecar-file boundary `_ec2net_networks`
+    uses -- fabric never imports gateway code. Returns None when no named
+    group exists yet (nothing drawn, or tofu hasn't created it), which callers
+    treat as "not gated", never as "deny everything"."""
+    names = list(group_names)
+    if not names:
+        return None
+    _, security_groups = _ec2net_networks(root, env)
+    matched = [g.firewall for g in security_groups if g.group_name in names]
+    return union_firewalls(matched) if matched else None
+
+
 def mesh_state(root: Path, env: str, world: World | None = None) -> MeshState:
     """The UI read model: the env's overlay membership joined with the observed
     World (resources + their published endpoints) and the EC2-network model's

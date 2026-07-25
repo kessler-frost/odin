@@ -31,6 +31,7 @@ from odin.aws.backings import BackingAws
 from odin.aws.rds import PostgresRds
 from odin.fabric.localhost import LocalhostFabric
 from odin.fabric.nebula import mesh_state
+from odin.fabric.sidecar import MeshSidecar
 from odin.gateway import DEFAULT_GATEWAY_PORT, GATEWAY_PORT_ENV
 from odin.gateway.app import GatewayState, create_gateway_app, serve_in_thread, stop_in_thread
 from odin.gateway.keys import OPERATOR_NODE_ID, KeyStore, Principal
@@ -536,8 +537,17 @@ def create_app(
     reconcilers: dict[str, Reconciler] = {}
 
     def _make_reconciler(env: str) -> Reconciler:
-        env_rds = rds or PostgresRds(_runtime, env)
-        env_aws = aws or (BackingAws(_runtime, env, gateway_port=gateway_port_actual) if backings else None)
+        # W2.6: ONE mesh sidecar manager per env, shared by both container
+        # owners -- its root is the STORE root, since that's where the env's
+        # Nebula CA/overlay actually live (`ensure_network(stores.root, ...)`
+        # in the gateway's VPC model). Injected rather than defaulted so
+        # `BackingAws._root` keeps its own meaning (the goaws config mount,
+        # deliberately CWD-relative) untouched.
+        env_mesh = MeshSidecar(_runtime, env, _store.root)
+        env_rds = rds or PostgresRds(_runtime, env, mesh=env_mesh)
+        env_aws = aws or (
+            BackingAws(_runtime, env, gateway_port=gateway_port_actual, mesh=env_mesh) if backings else None
+        )
         return Reconciler(
             _store, _runtime, env_rds, aws=env_aws, gateway=gateway_state, fabric=LocalhostFabric(),
             ws=ws_manager, env=env, poll_interval=1.0, stores=gateway_stores,

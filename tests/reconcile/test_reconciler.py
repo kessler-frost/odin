@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 
+from odin.fabric.models import FirewallRule
 from odin.gateway.policy import compile_policies
 from odin.gateway.stores import SynthStores
 from odin.reconcile import assertions
@@ -61,6 +63,11 @@ class FakeRuntime:
 class FakeRds:
     def __init__(self):
         self.created, self.available = [], False
+        # W2.6: the mesh seam -- `joined` records (db_id, firewall) so a test
+        # can assert WHICH compiled SG firewall gated the database, and
+        # `overlay` stands in for a joined member's overlay address.
+        self.joined: list[tuple] = []
+        self.overlay: tuple[str, int] | None = None
 
     def create_db(self, db_id, user, pw):
         self.created.append(db_id)
@@ -73,6 +80,13 @@ class FakeRds:
 
     def container_name(self, db_id):
         return f"odin-rds-default-{db_id}"
+
+    def join_mesh(self, db_id, firewall=None):
+        self.joined.append((db_id, firewall))
+        return self.overlay[0] if self.overlay else None
+
+    def overlay_endpoint(self, db_id):
+        return self.overlay
 
 
 class FakeAws:
@@ -148,6 +162,102 @@ async def test_db_reaches_healthy(tmp_path):
     assert facts["DATABASE_URL"] == "postgresql://app:apppass123@host.docker.internal:15432/postgres"
     assert facts["endpoint_vm"] == "host.lima.internal:15432"
     assert facts["DATABASE_URL_VM"] == "postgresql://app:apppass123@host.lima.internal:15432/postgres"
+
+
+# --- W2.6: the database on the mesh, gated by its drawn security group ------
+
+
+def _write_sg(tmp_path, env: str, group_name: str, firewall: dict) -> None:
+    """The gateway's OWN sidecar file, exactly as `ec2net.py` writes it after
+    tofu creates an `aws_security_group` -- the reconciler reads the compiled
+    firewall back through `fabric.nebula.sg_firewall_by_name`, never by
+    importing gateway code."""
+    path = tmp_path / env / "gateway" / "ec2net.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        f"sg:{group_name}-id": {
+            "group_id": f"{group_name}-id", "group_name": group_name,
+            "vpc_id": "vpc-1", "firewall": firewall,
+        },
+    }))
+
+
+DB_IN_SG = ResourceDesired(
+    id="db", kind="rds",
+    fields={"engine": FieldValue(value="postgres"), "securityGroups": FieldValue(value="db-sg")},
+)
+
+
+async def test_rds_joins_the_mesh_behind_its_drawn_sgs_compiled_firewall(tmp_path):
+    """The W2.6 payoff for a reconciler-owned resource: the SG a canvas drew
+    for the database compiles into the firewall its overlay membership is
+    gated by -- byte-identical to what an EC2 VM in the same group gets."""
+    rt, rds = FakeRuntime(), FakeRds()
+    rds.available = True
+    _write_sg(tmp_path, "default", "db-sg", {
+        "inbound": [{"port": "5432", "proto": "tcp", "group": "sg-web"}],
+        "outbound": [{"port": "any", "proto": "any"}],
+    })
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(DB_IN_SG,)))
+    recon = Reconciler(store, rt, rds, pg_ready=_yes, poll_interval=0)
+
+    for _ in range(2):
+        await recon.tick()
+    (db_id, firewall) = rds.joined[-1]
+    assert db_id == "db"
+    assert firewall is not None, "a drawn db-sg must gate the database's overlay membership"
+    assert firewall.inbound == [FirewallRule(port="5432", proto="tcp", group="sg-web")]
+
+
+async def test_rds_without_a_drawn_sg_joins_the_mesh_ungated(tmp_path):
+    """No SG drawn -> `None` -> the sidecar's allow-all default. Joining the
+    mesh must never silently become "deny everything" just because nothing was
+    drawn (that would break a canvas that worked yesterday)."""
+    rt, rds = FakeRuntime(), FakeRds()
+    rds.available = True
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(DB,)))
+    recon = Reconciler(store, rt, rds, pg_ready=_yes, poll_interval=0)
+
+    for _ in range(2):
+        await recon.tick()
+    assert rds.joined and rds.joined[-1] == ("db", None)
+
+
+async def test_rds_publishes_its_gated_overlay_endpoint_alongside_the_host_ones(tmp_path):
+    """The overlay address is an ADDITIONAL fact: the host-reachable pair the
+    gateway/probes/tests ride is unchanged, and `DATABASE_URL_MESH` is the
+    SG-gated path a mesh member uses."""
+    rt, rds = FakeRuntime(), FakeRds()
+    rds.available = True
+    rds.overlay = ("10.42.1.4", 5432)
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(DB,)))
+    recon = Reconciler(store, rt, rds, pg_ready=_yes, poll_interval=0)
+
+    for _ in range(2):
+        await recon.tick()
+    facts = store.current_world().get("db").facts
+    assert facts["endpoint_mesh"] == "10.42.1.4:5432"
+    assert facts["DATABASE_URL_MESH"] == "postgresql://app:apppass123@10.42.1.4:5432/postgres"
+    assert facts["endpoint"] == "host.docker.internal:15432"  # host path untouched
+    assert facts["DATABASE_URL_VM"] == "postgresql://app:apppass123@host.lima.internal:15432/postgres"
+
+
+async def test_rds_with_no_mesh_publishes_no_overlay_facts(tmp_path):
+    """An env with no Nebula network (no VPC drawn) publishes exactly the facts
+    it always did -- no empty/placeholder mesh keys."""
+    rt, rds = FakeRuntime(), FakeRds()
+    rds.available = True
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(DB,)))
+    recon = Reconciler(store, rt, rds, pg_ready=_yes, poll_interval=0)
+
+    for _ in range(2):
+        await recon.tick()
+    facts = store.current_world().get("db").facts
+    assert "DATABASE_URL_MESH" not in facts and "endpoint_mesh" not in facts
 
 
 async def test_destroy_then_reapply_recreates_db(tmp_path):

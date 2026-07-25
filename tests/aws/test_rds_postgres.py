@@ -72,7 +72,10 @@ def test_delete_db_stops_container():
     rds = PostgresRds(rt)
     rds.create_db("db", "app", "pw")  # stops once itself: clears any remnant pre-run
     rds.delete_db("db")
-    assert rt.stopped == ["odin-rds-default-db", "odin-rds-default-db"]
+    # W2.6: the database's mesh sidecar goes down WITH it (it lives in this
+    # container's network namespace, so it would die anyway -- stopping it
+    # explicitly is what keeps `docker ps` honest and leaves nothing behind).
+    assert rt.stopped == ["odin-rds-default-db", "odin-rds-default-db-mesh", "odin-rds-default-db"]
     assert rds.endpoint("db") is None
 
 

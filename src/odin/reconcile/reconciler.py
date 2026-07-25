@@ -26,6 +26,8 @@ from contextlib import asynccontextmanager
 
 from odin.aws.backings import ENSURE_KINDS, PROVISIONED
 from odin.fabric.localhost import LocalhostFabric
+from odin.fabric.models import FirewallRules
+from odin.fabric.nebula import sg_firewall_by_name
 from odin.gateway.policy import compile_policies
 from odin.gateway.stores import SynthStores
 from odin.reconcile import assertions
@@ -174,6 +176,24 @@ class Reconciler:
         return tuple(e.dst for e in stack.edges
                      if e.src == sns_id and self._kind_of(stack, e.dst) == "sqs")
 
+    def _sg_names(self, res: ResourceDesired) -> list[str]:
+        """The security-group LABELS a canvas node names in its
+        `securityGroups` field (one per line -- the same convention an ec2
+        node already uses, `agent/hcl.py::_security_group_refs`)."""
+        field = res.fields.get("securityGroups")
+        raw = str(field.value) if field is not None else ""
+        return [line.strip() for line in raw.splitlines() if line.strip()]
+
+    def _sg_firewall(self, res: ResourceDesired) -> FirewallRules | None:
+        """W2.6 piece 3: the drawn SG's ALREADY-compiled nebula firewall, for
+        a resource this reconciler owns (an rds node -- tofu owns SGs but not
+        the database). Read through fabric's `ec2net.json` boundary, so the
+        firewall the DB gets is byte-identical to what an EC2 VM in the same
+        group gets. None (no field, or the group isn't created yet) means
+        "not gated" -- the backing still joins the mesh, with nebula's
+        allow-all default, exactly as it behaved before an SG was drawn."""
+        return sg_firewall_by_name(self._store.root, self._env, self._sg_names(res))
+
     def _creds(self, res: ResourceDesired) -> tuple[str, str]:
         user = res.fields["username"].value if "username" in res.fields else "app"
         pw = res.fields["password"].value if "password" in res.fields else "apppass123"
@@ -271,6 +291,12 @@ class Reconciler:
         endpoint = self._rds.endpoint(res.id)
         if endpoint is None:
             return  # still creating
+        # W2.6: (re)join the env's mesh behind this node's drawn SG. Here, not
+        # only at create time, so a live SG edit takes effect on the next tick
+        # (the same reason sns re-diffs its subscriptions in this pass) and a
+        # dead sidecar heals. Idempotent and cheap: unchanged firewall +
+        # running sidecar is two file reads and one container-status call.
+        await asyncio.to_thread(self._rds.join_mesh, res.id, self._sg_firewall(res))
         user, pw = self._creds(res)
         result = await self._pg_ready(endpoint[0], endpoint[1], user, pw)  # host-side probe
         if not result.ok:
@@ -296,11 +322,21 @@ class Reconciler:
         vm_addr = f"{LIMA_HOST}:{endpoint[1]}"
         vm_url = f"postgresql://{user}:{pw}@{vm_addr}/postgres"
         stats = self._rt.stats(cname)
+        # W2.6: a THIRD form of the same database -- its overlay address,
+        # the one a drawn SG actually gates. Published only when this env has
+        # a mesh, and alongside (never instead of) the host-reachable pair
+        # above, which the gateway/probes/tests all still ride.
+        overlay = self._rds.overlay_endpoint(res.id)
+        mesh_facts = {
+            "DATABASE_URL_MESH": f"postgresql://{user}:{pw}@{overlay[0]}:{overlay[1]}/postgres",
+            "endpoint_mesh": f"{overlay[0]}:{overlay[1]}",
+        } if overlay else {}
         await self._emit(
             res.id, "rds", "healthy",
             facts={
                 "DATABASE_URL": url, "endpoint": addr,
                 "DATABASE_URL_VM": vm_url, "endpoint_vm": vm_addr,
+                **mesh_facts,
                 **stats,
             },
         )

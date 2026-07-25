@@ -1,21 +1,54 @@
 """rds nodes as direct Postgres containers via the RuntimeDriver."""
 from __future__ import annotations
 
+from pathlib import Path
+
+from odin.fabric.models import FirewallRules
+from odin.fabric.sidecar import MeshSidecar
 from odin.runtime.colima import ContainerSpec
 
 POSTGRES_IMAGE = "postgres:16-alpine"
+POSTGRES_PORT = 5432
 
 
 class PostgresRds:
     """The Reconciler's `_rds` seam. `endpoint` returns as soon as a host port
-    is published — the Reconciler's `pg_ready` probe gates healthy."""
+    is published — the Reconciler's `pg_ready` probe gates healthy.
 
-    def __init__(self, runtime, env: str = "default") -> None:
+    W2.6: an rds node also joins the env's Nebula mesh (`fabric/sidecar.py`),
+    so a drawn `db-sg` compiles into a firewall that really gates who may
+    reach the database — `overlay_endpoint` is that gated address. Both are
+    live at once: the published host port stays exactly as it was (the
+    reconciler's own `pg_ready` probe and every `${{db.DATABASE_URL}}`
+    consumer ride it), the overlay is an ADDITIONAL, gated path."""
+
+    def __init__(self, runtime, env: str = "default", root: Path = Path(".odin"), mesh: MeshSidecar | None = None) -> None:
         self._rt = runtime
         self._env = env
+        self._mesh = mesh or MeshSidecar(runtime, env, root)
 
     def container_name(self, db_id: str) -> str:
         return f"odin-rds-{self._env}-{db_id}"
+
+    def mesh_member(self, db_id: str) -> str:
+        """This database's mesh identity == its container name: unique per
+        (env, node) already, and it makes an `overlay.json` assignment
+        legible next to the container it belongs to."""
+        return self.container_name(db_id)
+
+    def join_mesh(self, db_id: str, firewall: FirewallRules | None = None) -> str | None:
+        """Put this database on the env's overlay behind `firewall` (its drawn
+        SG's compiled rules). No-op returning None when the env has no Nebula
+        network — i.e. no VPC on the canvas."""
+        return self._mesh.ensure(
+            self.container_name(db_id), self.mesh_member(db_id), firewall=firewall,
+        )
+
+    def overlay_endpoint(self, db_id: str) -> tuple[str, int] | None:
+        """The SG-gated (overlay_ip, 5432) address, or None when this database
+        never joined a mesh. Read-only."""
+        ip = self._mesh.overlay_ip(self.mesh_member(db_id))
+        return (ip, POSTGRES_PORT) if ip else None
 
     def create_db(self, db_id: str, user: str, password: str) -> None:
         name = self.container_name(db_id)
@@ -36,6 +69,10 @@ class PostgresRds:
         ))
 
     def delete_db(self, db_id: str) -> None:
+        # The mesh sidecar lives in this container's network namespace, so it
+        # dies with it either way -- stopping it explicitly keeps `docker ps`
+        # honest and makes the "no leftover containers" rule hold.
+        self._mesh.stop(self.container_name(db_id))
         self._rt.stop(self.container_name(db_id))
 
     def endpoint(self, db_id: str) -> tuple[str, int] | None:
