@@ -49,7 +49,6 @@ justified above.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from collections.abc import Callable
@@ -111,26 +110,25 @@ _TOPIC_ATTRIBUTE_DEFAULTS = {
 }
 
 
-def account_for_env(env: str) -> str:
-    """A stable 12-digit account id per environment (ported from the
-    deleted MiniStack-era `account_for_env`). Used ONLY for STS's `Account`
-    field for now -- the ARNs synth constructs elsewhere (QueueArn, topic
-    Owner) still use the fixed `backings.ACCOUNT`, matching what the rest of
-    the system already bakes into QUEUE_URL/TOPIC_ARN facts. Unifying the
-    two is deferred until the provider's `skip_requesting_account_id` flag
-    actually gets dropped (S-plan: "keep flags for now")."""
-    if env == "default":
-        return ACCOUNT
-    digest = hashlib.sha256(env.encode()).hexdigest()
-    return str(int(digest, 16) % 10**12).zfill(12)
-
-
 def get_caller_identity(env: str, principal: Principal) -> Response:
-    account = account_for_env(env)
-    arn = f"arn:aws:iam::{account}:user/{principal.node_id}"
+    """Who the caller is, per `backings.ACCOUNT` -- the SINGLE account id in
+    the system, deliberately the same one every ARN odin builds carries.
+
+    There used to be a second one here: `account_for_env(env)`, a per-env
+    sha256-derived id, used for this field alone while QueueArn/TopicArn/
+    secret/log-group ARNs all used `ACCOUNT`. The v0.7.0 field test (U6) found
+    what that costs a real workload: ask STS who you are, build an ARN from
+    the answer -- the ordinary pattern -- and you build an ARN odin will never
+    match. Unified toward `ACCOUNT` rather than the other way because nothing
+    in odin needs per-env account ids (envs are already isolated by their own
+    stores and backing containers), because ~15 modules and ~28 test files
+    bake `ACCOUNT` into ARNs, and because the TF provider never notices either
+    way -- `simulate/workspace.py` sets `skip_requesting_account_id = true`,
+    so STS's answer is read by workload callers only."""
+    arn = f"arn:aws:iam::{ACCOUNT}:user/{principal.node_id}"
     xml = (
         f'<GetCallerIdentityResponse xmlns="{_STS_NS}"><GetCallerIdentityResult>'
-        f"<UserId>{principal.node_id}</UserId><Account>{account}</Account><Arn>{arn}</Arn>"
+        f"<UserId>{principal.node_id}</UserId><Account>{ACCOUNT}</Account><Arn>{arn}</Arn>"
         f"</GetCallerIdentityResult>{_response_metadata_xml()}</GetCallerIdentityResponse>"
     )
     return Response(xml, media_type="text/xml")

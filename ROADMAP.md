@@ -459,20 +459,18 @@ future decision against these points instead of re-deriving them:
   - The proxy container is NOT covered by W2.2's drift sweep yet — `docker rm`
     it out of band and the load balancer still reports `active` until the next
     Apply re-converges it.
-- **KNOWN INCONSISTENCY — the account id STS reports is not the one in odin's
-  ARNs.** `sts:GetCallerIdentity` answers with a per-env id derived from the env
-  name (`gateway/synth.py::account_for_env` — sha256 of the env, mod 10^12,
-  e.g. `561031708110`), while every ARN odin builds uses the fixed
-  `aws/backings.py::ACCOUNT` = `000000000000`. So a client that builds ARNs from
-  its own caller identity — a very common pattern — builds ARNs odin will not
-  recognise. `account_for_env`'s docstring already records the deferral ("used
-  ONLY for STS's `Account` field for now … unifying the two is deferred"); what
-  was missing is that it's a REAL trap for a workload, not just an internal
-  inconsistency. Fixing it means either making STS return `ACCOUNT` (two lines
-  in `synth.py` plus four assertions in `tests/gateway/test_synth.py`) or
-  threading `env` through every ARN builder in `gateway/models/*` (~20 files,
-  ~40 tests) — the first is the obvious v1 answer, since nothing in odin
-  actually needs per-env account ids. Found by the v0.7.0 field test (U6).
+- **ONE account id, everywhere** — `000000000000` (`aws/backings.py::ACCOUNT`).
+  `sts:GetCallerIdentity` reports exactly the account that appears inside every
+  ARN odin builds, so the ordinary workload pattern (ask STS who you are, build
+  an ARN from the answer) builds an ARN odin recognises. FIXED in v0.7.1: STS
+  used to answer with a per-env sha256-derived id
+  (`gateway/synth.py::account_for_env`, e.g. `561031708110`) while every ARN
+  used `ACCOUNT`, so that pattern silently produced unmatchable ARNs (v0.7.0
+  field test, U6). Unified toward `ACCOUNT` rather than making ARNs per-env
+  because nothing in odin needs per-env account ids — envs are already isolated
+  by their own stores and backing containers — and ~15 modules bake `ACCOUNT`
+  into ARNs. The TF provider never noticed either way
+  (`skip_requesting_account_id = true`); only workload STS callers did.
 - **Recorded as UNSUPPORTED for now** (northstar directive 5's honesty rule):
   EKS, CloudFormation, autoscaling, and KMS (the `kms` catalog node is an
   unbacked placeholder — no substitute, no gateway model, and as of W2.6 it
