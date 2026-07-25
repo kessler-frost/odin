@@ -166,11 +166,29 @@ def test_status_says_nothing_is_running_for_a_process_that_only_looks_like_one(
         cwd=tmp_path,
     )
     try:
-        main_mod.status()
+        with pytest.raises(typer.Exit):
+            main_mod.status()
         assert "Odin is not running" in capsys.readouterr().out
     finally:
         decoy.kill()
         decoy.wait()
+
+
+def test_status_exits_nonzero_when_odin_is_not_running(tmp_path, monkeypatch, capsys):
+    """v0.7.3 printed "Odin is not running." and exited 0, so `odin status &&
+    odin apply` applied against a server that wasn't there. The sentence and
+    the code have to say the same thing."""
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(typer.Exit) as exit_info:
+        main_mod.status()
+    assert exit_info.value.exit_code == 1
+    assert "Odin is not running" in capsys.readouterr().out
+
+
+def test_status_exits_zero_when_odin_is_running(tmp_path, monkeypatch, capsys, store_lock):
+    monkeypatch.chdir(tmp_path)
+    main_mod.status()  # no typer.Exit at all == exit 0
+    assert "Odin is running" in capsys.readouterr().out
 
 
 def test_status_reports_the_pidfile_path_as_managed(tmp_path, monkeypatch, capsys):
@@ -185,7 +203,8 @@ def test_status_cleans_a_stale_pidfile_and_says_so(tmp_path, monkeypatch, capsys
     monkeypatch.chdir(tmp_path)
     main_mod.ODIN_DIR.mkdir()
     main_mod.PID_FILE.write_text("999999")
-    main_mod.status()
+    with pytest.raises(typer.Exit):
+        main_mod.status()
     assert "not running (cleaned up a stale PID file)" in capsys.readouterr().out
     assert not main_mod.PID_FILE.exists()
 
@@ -209,11 +228,37 @@ def test_stop_never_signals_a_pid_it_cannot_vouch_for(tmp_path, monkeypatch, cap
     killed = []
     monkeypatch.setattr(main_mod.os, "kill", lambda pid, sig: killed.append((pid, sig)))
     try:
-        main_mod.stop()
+        # ...and exits 1, because odin is still up and this command just said so.
+        with pytest.raises(typer.Exit) as exit_info:
+            main_mod.stop()
     finally:
         lock.release()
+    assert exit_info.value.exit_code == 1
     out = capsys.readouterr().out
     assert killed == [] and "cannot identify the process" in out and "lsof" in out
+
+
+def test_stop_with_nothing_running_is_a_success(tmp_path, monkeypatch, capsys):
+    """The deliberate asymmetry with `odin status`: `stop` asks for an end
+    state, and "odin is down" is exactly the end state it asked for."""
+    monkeypatch.chdir(tmp_path)
+    main_mod.stop()  # no typer.Exit == exit 0
+    assert "Odin is not running" in capsys.readouterr().out
+
+
+def test_start_on_an_already_running_odin_says_the_flags_were_not_applied(
+    tmp_path, monkeypatch, capsys
+):
+    """Still exit 0 -- `odin start && odin apply` must stay idempotent -- but
+    a second `start` cannot honour a different --port/--host, and the message
+    is the only place that can say so."""
+    monkeypatch.chdir(tmp_path)
+    main_mod.ODIN_DIR.mkdir()
+    main_mod.PID_FILE.write_text(str(os.getpid()))
+    monkeypatch.setattr(main_mod, "_build_ui", lambda: pytest.fail("must not build or launch"))
+    main_mod.start(port=9999, foreground=False, dev=False, host=main_mod.DEFAULT_HOST)
+    out = capsys.readouterr().out
+    assert "already running" in out and "NOT applied" in out
 
 
 def test_version_flag_prints_the_real_version(capsys):
