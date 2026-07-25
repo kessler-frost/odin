@@ -20,6 +20,12 @@ as `{type: "tf", env, phase, line}` (phase: "init" | "apply" | "destroy"),
 then a terminal `{type: "tf", env, phase, status: "ok"|"failed", exit_code,
 [tail]}` -- `tail` (the last `_TAIL_LINES` lines) is attached only on
 failure, enough to show what broke without duplicating the whole log.
+
+Timeouts: `init`/`apply` each get their own `ODIN_TOFU_TIMEOUT` budget;
+`destroy` gets a smaller WHOLE-CALL deadline (`ODIN_TOFU_DESTROY_TIMEOUT`,
+default 300s, init included) and, on blowing it, a tail line naming the one
+cause a wedged destroy almost always has plus the documented recovery -- see
+`_default_destroy_timeout` and `_WEDGED_DESTROY_HINT` (field test 2, B6).
 """
 from __future__ import annotations
 
@@ -28,6 +34,7 @@ import contextlib
 import os
 import shutil
 import signal
+import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,9 +57,44 @@ PLUGIN_CACHE_DIR = Path.home() / ".cache" / "odin" / "tofu-plugin-cache"
 def _default_tofu_timeout() -> float:
     """Release finding #3: a wedged apply has been observed running for
     hours with nothing to stop it. `ODIN_TOFU_TIMEOUT` (seconds) overrides
-    the default for every phase (init/apply/destroy each get their own
-    budget, not one shared across the whole call)."""
+    the default for `init` and `apply` (each gets its own budget, not one
+    shared across the whole call). `destroy` has its own, smaller budget --
+    see `_default_destroy_timeout`."""
     return float(os.environ.get("ODIN_TOFU_TIMEOUT", "600"))
+
+
+def _default_destroy_timeout() -> float:
+    """Field test 2, finding B6: `odin destroy` on a RESTORED env was killed by
+    hand at 8m26s of `tofu destroy` with no progress and no timeout.
+
+    Nothing was broken about the existing bound -- 8m26s is 506s, comfortably
+    under the 600s `ODIN_TOFU_TIMEOUT`, so the timeout simply had not fired yet;
+    and because `_init_then` gives `init` its OWN full budget, the worst case
+    for one `/destroy` was 20 minutes. Neither is a bound anyone waits out.
+
+    A destroy against local substrates is fast when it works at all (real
+    measurements: a 12-resource env in 63s, three EC2 VMs in 62s, the slowest
+    single operation an `aws_db_instance` destroy at 1m1s), so 300s is generous
+    for a working teardown and a fifth of the old worst case for a wedged one.
+    It is a DEADLINE ACROSS THE WHOLE CALL (init included), not per phase.
+    `ODIN_TOFU_DESTROY_TIMEOUT` overrides."""
+    return float(os.environ.get("ODIN_TOFU_DESTROY_TIMEOUT", "300"))
+
+
+# What a bounded-out destroy almost always means, and the documented recovery.
+# The gateway answers every AWS call with a real 503/`ServiceUnavailable` when
+# the env has no running backing container (`gateway/app.py`'s
+# `backing-unavailable` branch), and aws-sdk-go-v2 treats that as retryable:
+# ~25 attempts with exponential backoff PER CALL, none of which prints anything
+# on tofu's stdout -- so the run looks like a silent hang. A restored env boots
+# no containers (documented), and `/destroy` does not start them, which is
+# exactly how the field test reproduced it.
+_WEDGED_DESTROY_HINT = (
+    "the usual cause is that this env's AWS backing containers are not running, so every "
+    "AWS call the destroy makes gets a real ServiceUnavailable and the provider retries it "
+    "~25 times with backoff (silently -- retries never reach tofu's output). A restored env "
+    "boots no containers: run `odin apply --env <env>` first to start them, then destroy."
+)
 
 
 def _default_parallelism() -> int:
@@ -114,10 +156,15 @@ class TfRunner:
 
     def __init__(
         self, root: Path, ws=None, timeout: float | None = None, parallelism: int | None = None,
+        destroy_timeout: float | None = None,
     ) -> None:
         self._root = root
         self._ws = ws
         self._timeout = timeout if timeout is not None else _default_tofu_timeout()
+        # Finding B6: destroy gets its own, smaller, WHOLE-CALL deadline.
+        self._destroy_timeout = (
+            destroy_timeout if destroy_timeout is not None else _default_destroy_timeout()
+        )
         # Owner directive B3: threaded onto every apply/destroy's args below
         # (never `init` -- `-parallelism` only governs a resource-graph walk).
         self._parallelism = parallelism if parallelism is not None else _default_parallelism()
@@ -157,6 +204,7 @@ class TfRunner:
                 return result
             return await self._init_then(
                 tofu, workspace, gateway_port, access_key, secret_key, env, "destroy", self._destroy_args(), secrets,
+                budget=self._destroy_timeout, hint=_WEDGED_DESTROY_HINT,
             )
 
     def _apply_args(self) -> tuple[str, ...]:
@@ -177,19 +225,37 @@ class TfRunner:
     async def _init_then(
         self, tofu: str, workspace: Path, gateway_port: int, access_key: str, secret_key: str,
         env: str, phase: str, args: tuple[str, ...], secrets: frozenset[str] = frozenset(),
+        budget: float | None = None, hint: str = "",
     ) -> TfResult:
+        """`budget`, when given, is a deadline across BOTH phases (init + the
+        real one) rather than a per-phase allowance -- finding B6: `init`
+        getting its own full allowance doubled the worst case for one call.
+        `None` keeps the per-phase `self._timeout` behavior apply relies on."""
         env_vars = _tf_env(gateway_port, access_key, secret_key)
-        init_result = await self._run(tofu, _TOFU_INIT_ARGS, workspace, env_vars, env, "init", secrets)
+        deadline = None if budget is None else time.monotonic() + budget
+        init_result = await self._run(
+            tofu, _TOFU_INIT_ARGS, workspace, env_vars, env, "init", secrets, self._remaining(deadline), hint,
+        )
         if not init_result.ok:
             self._last[env] = init_result
             return init_result
-        result = await self._run(tofu, args, workspace, env_vars, env, phase, secrets)
+        result = await self._run(
+            tofu, args, workspace, env_vars, env, phase, secrets, self._remaining(deadline), hint,
+        )
         self._last[env] = result
         return result
 
+    def _remaining(self, deadline: float | None) -> float:
+        """Never zero or negative: a deadline already blown still gets a token
+        slice, so the phase runs, is killed, and reports honestly -- rather than
+        `wait_for` raising before the subprocess even starts."""
+        if deadline is None:
+            return self._timeout
+        return max(1.0, deadline - time.monotonic())
+
     async def _run(
         self, tofu: str, args: tuple[str, ...], cwd: Path, env_vars: dict[str, str], env: str, phase: str,
-        secrets: frozenset[str] = frozenset(),
+        secrets: frozenset[str] = frozenset(), timeout: float | None = None, hint: str = "",
     ) -> TfResult:
         # `start_new_session=True` (release finding #3): tofu spawns its own
         # provider-plugin child process, so a plain kill of tofu's own pid on
@@ -213,13 +279,19 @@ class TfRunner:
                 await self._emit({"type": "tf", "env": env, "phase": phase, "line": line})
             return await proc.wait()
 
+        budget = self._timeout if timeout is None else timeout
         try:
-            code = await asyncio.wait_for(_drain(), timeout=self._timeout)
+            code = await asyncio.wait_for(_drain(), timeout=budget)
         except asyncio.TimeoutError:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(proc.pid, signal.SIGKILL)
             code = await proc.wait()
-            tail.append(f"tofu {phase} timed out after {self._timeout:.0f}s -- process killed")
+            tail.append(f"tofu {phase} timed out after {budget:.0f}s -- process killed")
+            # Finding B6: a bound with no explanation is still an opaque
+            # failure. `hint` names the one cause this almost always is, and the
+            # documented recovery, on the same tail the CLI/UI already print.
+            if hint:
+                tail.append(hint)
 
         ok = code == 0
         payload = {"type": "tf", "env": env, "phase": phase, "status": "ok" if ok else "failed", "exit_code": code}

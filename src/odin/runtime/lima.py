@@ -9,12 +9,19 @@ VM-level isolation. The subprocess seam is injectable for testing; the multi-Mac
 fleet (a Lima VM per remote Mac) is explicitly out of scope here.
 
 Observability v1: `logs()` (inherited from `_ContainerRuntime`, unchanged) is
-a real `nerdctl logs --tail` against a container inside this shared VM --
-already a full container-level log surface. The DIFFERENT gap this feature
+a real `nerdctl logs` against a container inside this shared VM -- already a
+full container-level log surface. The DIFFERENT gap this feature
 closes is a real per-instance EC2 VM (one whole VM per instance, managed by
 `compute/instances.py::InstanceVm`, NOT this class): that has no container
 to attach to at all, so `InstanceVm.logs` reads the VM's systemd journal
 instead (`limactl shell <vm> -- journalctl ...`).
+
+Field test 2 (HIGH-3): that inherited `logs()` now keeps BOTH of the
+container's streams. Here the outer process is `limactl`, so its own
+diagnostics (a `WARN[0000] …` line) share the stderr pipe with the
+container's stderr; they carry no `--timestamps` prefix, so
+`_merge_log_streams` keeps them visibly at the top rather than dropping them
+-- an odd line in the log beats a silently truncated log.
 """
 from __future__ import annotations
 
@@ -39,6 +46,7 @@ LIMA_HOST = "host.lima.internal"
 
 class LimaRuntime(_ContainerRuntime):
     VM = "odin-host"
+    CLI = "nerdctl"
 
     def _lima(self, *args: str, check: bool = True, input: str | None = None) -> str:
         proc = self._run(["limactl", *args], input=input)
@@ -46,9 +54,9 @@ class LimaRuntime(_ContainerRuntime):
             raise RuntimeError(f"limactl {' '.join(args)} failed: {proc.stderr.strip()}")
         return proc.stdout.strip()
 
-    def _cli(self, *args: str, check: bool = True, input: str | None = None) -> str:
+    def _argv(self, *args: str) -> list[str]:
         # the base seam: nerdctl inside the VM
-        return self._lima("shell", self.VM, "sudo", "nerdctl", *args, check=check, input=input)
+        return ["limactl", "shell", self.VM, "sudo", "nerdctl", *args]
 
     def ensure_host(self) -> HostFacts:
         if self.VM not in self._lima("list", "-q", check=False).split():

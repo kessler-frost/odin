@@ -44,6 +44,7 @@ from odin.cli.app import app as cli
 from odin.runtime.colima import ColimaRuntime
 from odin.server import create_app
 from odin.spec.store import SpecStore
+from tests.containers import own_containers
 
 pytestmark = pytest.mark.integration
 
@@ -59,12 +60,21 @@ _BOTH = ("uploads", "jobs")
 OBJECT_KEY = "receipt.txt"
 
 
+def _own_containers(rt: ColimaRuntime) -> list[str]:
+    """Only the containers THIS test can have made -- it creates them in one
+    env, and `aws.gc` already tears them down by env-scoped exact name, so
+    the fixture needs no wider reach either. The naming rules (and why the
+    unscoped `rt.list_odin()` this replaced was dangerous) live in
+    `tests/containers.py`, shared with every other integration file."""
+    return own_containers(rt, ENV)
+
+
 @pytest.fixture
 def runtime():
     rt = ColimaRuntime()
     yield rt
-    for cid in rt.list_odin():
-        rt.stop(cid)
+    for name in _own_containers(rt):
+        rt.stop(name)
 
 
 @pytest.fixture
@@ -126,7 +136,7 @@ def test_export_then_lose_odin_then_import_converges_again(runner, workdir, runt
         assert client.post("/destroy", params={"env": ENV}).status_code == 200
         _wait(lambda: not _phases(client), "world empty")
         aws.gc(set())
-        assert not runtime.list_odin(), "backings gone before the store is wiped"
+        assert not _own_containers(runtime), "backings gone before the store is wiped"
 
     # --- ...and lose .odin/bak entirely. odin now has no idea this env existed.
     shutil.rmtree(root / ENV)
@@ -162,4 +172,4 @@ def test_export_then_lose_odin_then_import_converges_again(runner, workdir, runt
         _wait(lambda: not _phases(client), "world empty again")
         aws.gc(set())
 
-    assert runtime.list_odin() == [], "every container this test made is gone"
+    assert _own_containers(runtime) == [], "every container this test made is gone"

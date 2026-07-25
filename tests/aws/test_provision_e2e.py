@@ -8,8 +8,11 @@ from odin.aws.backings import BackingAws
 from odin.runtime.colima import ColimaRuntime
 from odin.server import create_app
 from odin.spec.store import SpecStore
+from tests.containers import own_containers
 
 pytestmark = pytest.mark.integration
+
+ENV = "default"  # this test posts to /apply with no env param
 CANVAS = {"nodes": [{"type": "s3", "data": {"label": "uploads"}}], "edges": []}
 
 
@@ -17,8 +20,8 @@ CANVAS = {"nodes": [{"type": "s3", "data": {"label": "uploads"}}], "edges": []}
 def runtime():
     rt = ColimaRuntime()
     yield rt
-    for cid in rt.list_odin():
-        rt.stop(cid)
+    for name in own_containers(rt, ENV):
+        rt.stop(name)
 
 
 def test_s3_node_provisions_bucket(tmp_path, runtime):
@@ -32,6 +35,6 @@ def test_s3_node_provisions_bucket(tmp_path, runtime):
                 break
             time.sleep(1)
         assert ph.get("uploads") == "healthy"
-        s3 = BackingAws(runtime, "default").client("s3")
+        s3 = BackingAws(runtime, ENV).client("s3")
         names = [b["Name"] for b in s3.list_buckets()["Buckets"]]
         assert "uploads" in names

@@ -26,8 +26,14 @@ from odin.aws.backings import ACCOUNT, BackingAws
 from odin.runtime.colima import ColimaRuntime
 from odin.server import create_app
 from odin.spec.store import SpecStore
+from tests.containers import own_containers
 
 pytestmark = pytest.mark.integration
+
+# Every env this file applies to -- and therefore everything its teardown is
+# allowed to stop. `default` is the implicit env of the helpers below; `a`
+# and `b` are the two the isolation slice creates by name.
+OWN_ENVS = ("default", "a", "b")
 
 CANVAS_SQS = {"nodes": [{"id": "n1", "type": "sqs", "data": {"label": "jobs"}}], "edges": []}
 CANVAS_DDB = {"nodes": [{"id": "n1", "type": "dynamodb", "data": {"label": "sessions"}}],
@@ -91,8 +97,8 @@ def _destroy(client, env="default"):
 def runtime():
     rt = ColimaRuntime()
     yield rt
-    for cid in rt.list_odin():
-        rt.stop(cid)
+    for name in own_containers(rt, *OWN_ENVS):
+        rt.stop(name)
 
 
 
@@ -120,7 +126,7 @@ def test_sqs_roundtrip(tmp_path, runtime):
         assert _receive(sqs, url) == "hello-roundtrip"
 
         _destroy(client)
-    assert runtime.list_odin() == []
+    assert own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"
 
 
 def test_sns_to_sqs_delivery(tmp_path, runtime):
@@ -163,7 +169,7 @@ def test_sns_to_sqs_delivery(tmp_path, runtime):
         assert _receive(sqs, jobs2_url) == "fanout"
 
         _destroy(client)
-    assert runtime.list_odin() == []
+    assert own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"
 
 
 def test_dynamodb_put_get(tmp_path, runtime):
@@ -179,7 +185,7 @@ def test_dynamodb_put_get(tmp_path, runtime):
         assert item["val"]["S"] == "hello"
 
         _destroy(client)
-    assert runtime.list_odin() == []
+    assert own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"
 
 
 def test_env_isolation(tmp_path, runtime):
@@ -206,7 +212,7 @@ def test_env_isolation(tmp_path, runtime):
         assert "uploads" in [b["Name"] for b in buckets]
 
         _destroy(client, env="b")
-    assert runtime.list_odin() == []
+    assert own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"
 
 
 def test_backing_crash_recovers(tmp_path, runtime):
@@ -230,4 +236,4 @@ def test_backing_crash_recovers(tmp_path, runtime):
         assert "uploads" in [b["Name"] for b in buckets]
 
         _destroy(client)
-    assert runtime.list_odin() == []
+    assert own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"

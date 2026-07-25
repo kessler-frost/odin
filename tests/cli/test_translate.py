@@ -23,13 +23,21 @@ GRAPH = {"nodes": [{"id": "uploads", "type": "s3"}], "edges": []}
 
 
 @respx.mock
-def test_translate_default_posts_no_body_and_prints_main_tf(runner):
+def test_translate_default_posts_the_saved_canvas(runner):
+    """Field-test 2 findings B4/MEDIUM-10: with no `--file` this used to POST
+    an empty body, which made the server translate the env's STORED STACK --
+    empty until something has been applied -- so `odin canvas set x.json &&
+    odin translate` printed only the terraform{}/provider{} blocks, exit 0.
+    The default now matches what README promises and what `odin apply` does:
+    the canvas saved on the server."""
+    canvas = respx.get(f"{BASE}/canvas").mock(return_value=httpx.Response(200, json=GRAPH))
     route = respx.post(f"{BASE}/translate", params={"env": "default"}).mock(
         return_value=httpx.Response(200, json=TRANSLATED)
     )
     result = runner.invoke(app, ["translate"])
     assert result.exit_code == 0
-    assert route.calls.last.request.content == b""  # server uses the stored Stack
+    assert canvas.called
+    assert json.loads(route.calls.last.request.content) == GRAPH
     assert result.stdout == MAIN_TF
     assert "unsupported: ecs" in result.stderr
 
@@ -47,7 +55,24 @@ def test_translate_with_file_posts_that_canvas(runner, tmp_path):
 
 
 @respx.mock
+def test_translate_notes_an_empty_saved_canvas_on_stderr(runner):
+    """The other half of B4/U5: nothing is drawn, so there IS no Terraform --
+    exit 0 (same as `apply`'s legitimate empty-canvas teardown), but never
+    silently, so `odin translate > main.tf` in CI can't look like a success
+    that produced a real file."""
+    respx.get(f"{BASE}/canvas").mock(return_value=httpx.Response(200, json={"nodes": [], "edges": []}))
+    respx.post(f"{BASE}/translate").mock(return_value=httpx.Response(
+        200, json={**TRANSLATED, "unsupported": []},
+    ))
+    result = runner.invoke(app, ["translate"])
+    assert result.exit_code == 0
+    assert "saved canvas is empty" in result.stderr
+    assert "--file" in result.stderr
+
+
+@respx.mock
 def test_translate_json_mode_prints_full_result(runner):
+    respx.get(f"{BASE}/canvas").mock(return_value=httpx.Response(200, json=GRAPH))
     respx.post(f"{BASE}/translate").mock(return_value=httpx.Response(200, json=TRANSLATED))
     result = runner.invoke(app, ["translate", "-o", "json"])
     assert result.exit_code == 0
@@ -57,7 +82,7 @@ def test_translate_json_mode_prints_full_result(runner):
 
 @respx.mock
 def test_translate_server_down(runner):
-    respx.post(f"{BASE}/translate").mock(side_effect=httpx.ConnectError("refused"))
+    respx.get(f"{BASE}/canvas").mock(side_effect=httpx.ConnectError("refused"))
     result = runner.invoke(app, ["translate"])
     assert result.exit_code == 2
     assert "Could not reach odin server" in result.stderr
@@ -112,6 +137,44 @@ def test_import_tf_requires_file_or_live(runner):
     result = runner.invoke(app, ["import-tf"])
     assert result.exit_code == 2
     assert "needs a <file.tf>" in result.stderr
+
+
+# --- v0.7.1: a real Terraform project IS a directory (field test B7) ----------
+
+
+@respx.mock
+def test_import_tf_accepts_a_directory_and_sends_every_tf_as_one_canvas(runner, tmp_path):
+    project = tmp_path / "tfproj"
+    project.mkdir()
+    (project / "network.tf").write_text('resource "aws_vpc" "net" {}\n')
+    (project / "app.tf").write_text(MAIN_TF)
+    (project / "README.md").write_text("not terraform\n")
+    route = respx.post(f"{BASE}/import-tf").mock(return_value=httpx.Response(200, json=IMPORTED))
+
+    result = runner.invoke(app, ["import-tf", str(project)])
+
+    assert result.exit_code == 0
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["source"] == "hcl"
+    # ONE request, both files, sorted -- and the .md left out.
+    assert len(route.calls) == 1
+    assert sent["hcl"] == f"# ---- app.tf\n{MAIN_TF}\n# ---- network.tf\nresource \"aws_vpc\" \"net\" {{}}\n"
+    assert "as ONE canvas: app.tf, network.tf" in result.stderr
+    assert json.loads(result.stdout) == {"nodes": IMPORTED["nodes"], "edges": []}
+
+
+def test_import_tf_of_a_directory_with_no_tf_files_says_so(runner, tmp_path):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    result = runner.invoke(app, ["import-tf", str(empty)])
+    assert result.exit_code == 2
+    assert "no *.tf files in" in result.stderr and "Traceback" not in result.stderr
+
+
+def test_import_tf_of_a_missing_path_says_so_instead_of_tracebacking(runner, tmp_path):
+    result = runner.invoke(app, ["import-tf", str(tmp_path / "nope.tf")])
+    assert result.exit_code == 2
+    assert "no such file or directory" in result.stderr and "Traceback" not in result.stderr
 
 
 @respx.mock

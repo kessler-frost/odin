@@ -60,6 +60,22 @@ lighthouse), so `relay_enabled=True` here routes VM-to-VM traffic THROUGH
 the lighthouse instead -- still rootless (a relay forwards opaque encrypted
 UDP between two peers it already has sessions with; it never needs a tun
 device to do it, empirically confirmed in `fabric/nebula.py`).
+
+`refresh_nebula` (field test 2 HIGH-1) closes the gap all of the above left:
+every one of those writes happened ONCE, at boot. Editing a security group
+afterwards never reached an already-running VM -- Apply reported `applied`,
+the gateway recorded the new rule, and the VM's `/etc/nebula/config.yml`
+still held the old one with `NRestarts=0`. Two VMs in the SAME drawn group
+enforced DIFFERENT firewalls depending on when each was created, which is
+precisely the failure security groups exist to prevent. Now an Apply
+re-renders each running instance's config and pushes it when it actually
+changed -- SIGHUP for a firewall-only edit (verified against the nebula
+version odin ships: "Caught HUP, reloading config" -> "New firewall has been
+installed", and a previously-blocked port starts answering with the tunnel
+never dropping), a restart for anything else, because nebula's reload
+deliberately does NOT cover `static_host_map`/`lighthouse`/`relay` -- and the
+only thing that changes those is a moved lighthouse port, where the tunnel is
+already dead and a restart costs nothing.
 """
 from __future__ import annotations
 
@@ -73,11 +89,14 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import yaml
+
 from odin.compute.cloud_init import generate_cloud_init
 from odin.compute.lima_yaml import generate_lima_yaml
 from odin.compute.models import VmConfig
 from odin.fabric.models import FirewallRules
 from odin.fabric.nebula import DEFAULT_FIREWALL, LighthouseManager, NebulaManager, ensure_network
+from odin.util import atomic_write_text
 
 log = logging.getLogger("odin.compute.instances")
 
@@ -119,6 +138,80 @@ def _default_runner(args: list[str], input: str | None = None) -> _Proc:
 
 def vm_name(env: str, instance_id: str) -> str:
     return f"odin-ec2-{env}-{instance_id}"
+
+
+# --- how long an env name may be, before limactl refuses every boot ---------
+#
+# `limactl` refuses an instance whose SSH control socket would not fit in a
+# unix socket address:
+#
+#   instance name "odin-ec2-<env>-<id>" too long: "/Users/you/.lima/
+#   odin-ec2-<env>-<id>/ssh.sock.1234567890123456" must be less than
+#   UNIX_PATH_MAX=104 characters, but is 107
+#
+# It is a HARD, TOTAL failure of every EC2 boot in that env -- and the message
+# names nothing the user chose, arriving only after a ~60s boot that was never
+# going to work. `max_env_name_len` is what lets Apply refuse it up front
+# instead (`reconcile/admission.py`).
+#
+# DERIVED, never hardcoded, because the limit is machine-specific: it is
+# `104` minus `$LIMA_HOME` (default `~/.lima`, so it moves with the username),
+# minus the two `/` separators, minus Lima's socket filename, minus odin's own
+# `odin-ec2-` + `-` + instance id. On a `/Users/fimbulwinter/.lima` home that
+# works out to 22 -- exactly the value the mesh work measured by hand.
+LIMA_UNIX_PATH_MAX = 104
+
+# Lima's SSH control socket, with the 16-digit suffix its own check appends.
+# The literal digits are Lima's placeholder, not a real value: only the LENGTH
+# is load-bearing here.
+LIMA_SSH_SOCK = "ssh.sock.1234567890123456"
+
+# Lima's own identifier cap, reported as `greater than maximum length (76
+# characters)`. In practice the socket-path rule above always bites first (any
+# non-empty LIMA_HOME makes it tighter), but taking the min keeps this honest
+# if Lima ever moves its sockets elsewhere.
+LIMA_MAX_IDENTIFIER_LEN = 76
+
+# An EC2 instance id is `i-` + 17 hex characters -- AWS's own modern shape,
+# minted by `gateway/models/ec2compute.py::_mint`. Pinned by
+# `tests/test_compute/test_vm_name_limit.py`, so the derivation can't drift
+# from the ids actually minted.
+INSTANCE_ID_LEN = 19
+
+
+def lima_home() -> Path:
+    """Where `limactl` keeps its instances: `$LIMA_HOME`, else `~/.lima` --
+    Lima's own resolution order, and the variable half of the length limit."""
+    return Path(os.environ.get("LIMA_HOME") or Path.home() / ".lima")
+
+
+def max_vm_name_len(home: Path | None = None) -> int:
+    """The longest instance name `limactl` will accept on this machine.
+
+    `len(f"{LIMA_HOME}/{name}/{LIMA_SSH_SOCK}") < LIMA_UNIX_PATH_MAX`, i.e.
+    at most `LIMA_UNIX_PATH_MAX - 1` bytes of path -- rearranged for `name`,
+    and capped by Lima's identifier limit."""
+    root = str(lima_home() if home is None else home)
+    fits_socket = LIMA_UNIX_PATH_MAX - 1 - len(root) - 2 - len(LIMA_SSH_SOCK)
+    return min(fits_socket, LIMA_MAX_IDENTIFIER_LEN)
+
+
+def max_env_name_len(home: Path | None = None) -> int:
+    """The longest env name whose EC2 VMs can boot on this machine -- the VM
+    name limit less everything `vm_name` adds around the env (`odin-ec2-`,
+    the separator, and the instance id)."""
+    return max_vm_name_len(home) - len(vm_name("", "")) - INSTANCE_ID_LEN
+
+
+def instance_config_path(root: Path, env: str, host_id: str) -> Path:
+    """Where odin records the nebula config it LAST PUT ON a given VM.
+
+    The host-side copy is what makes `refresh_nebula` free when nothing
+    changed: comparing against a local file costs no `limactl shell` at all
+    (the same trick `fabric/sidecar.py` uses for a backing's config). It can
+    never go stale across a recreate either -- a recreated instance is a NEW
+    instance id, so it gets a fresh path."""
+    return Path(root) / env / "nebula" / "instances" / host_id / "config.yml"
 
 
 @dataclass(frozen=True)
@@ -166,6 +259,20 @@ def _write_files_script(files: dict[str, str]) -> str:
         lines += [f"cat > /etc/nebula/{filename} << '{marker}'", content.rstrip("\n"), marker]
     lines.append("chmod 600 /etc/nebula/host.key")
     return "\n".join(lines)
+
+
+def _firewall_only_change(before: str | None, after: str) -> bool:
+    """Is the ONLY difference between two rendered configs the `firewall`
+    block? That is the one section nebula genuinely reloads on SIGHUP, so it
+    is the one case where a running daemon can adopt the change without
+    dropping its tunnels. No previous config at all (an unreadable VM) is not
+    evidence of anything, so it answers False -- restart, the safe side."""
+    if before is None:
+        return False
+    old, new = yaml.safe_load(before) or {}, yaml.safe_load(after) or {}
+    old.pop("firewall", None)
+    new.pop("firewall", None)
+    return old == new
 
 
 def _extra_provision_script(nebula_files: dict[str, str] | None, user_data: str | None) -> str | None:
@@ -328,16 +435,103 @@ class InstanceVm:
                 log.warning("could not derive a host underlay address for %s; nebula not activated", name)
                 return
             self._lighthouse.ensure_started(nebula.root, nebula.env, underlay)
-            manager = NebulaManager(Path(nebula.root) / nebula.env / "nebula", runner=self._run)
             network = ensure_network(nebula.root, nebula.env, underlay, runner=self._run)
-            config = manager.generate_config(
-                lighthouse_ip=network.lighthouse_ip, lighthouse_underlay=underlay,
-                firewall=nebula.firewall or DEFAULT_FIREWALL, is_lighthouse=False, relay_enabled=True,
-            )
-            self._lima("shell", name, "--", "sudo", "tee", "/etc/nebula/config.yml", input=config, check=False)
+            config = self._render_config(nebula, network, underlay)
+            self._push_config(name, nebula, config)
             self._lima("shell", name, "--", "sudo", "systemctl", "enable", "--now", "nebula", check=False)
         except Exception as exc:  # noqa: BLE001 -- deliberately broad, see docstring
             log.warning("nebula activation failed for %s: %s", name, exc)
+
+    def _render_config(self, nebula: NebulaJoin, network, underlay: str) -> str:
+        """The one renderer both the boot path and `refresh_nebula` use --
+        identical inputs MUST produce identical bytes, or the "did anything
+        change?" comparison would churn every Apply."""
+        manager = NebulaManager(Path(nebula.root) / nebula.env / "nebula", runner=self._run)
+        return manager.generate_config(
+            lighthouse_ip=network.lighthouse_ip, lighthouse_underlay=underlay,
+            firewall=nebula.firewall or DEFAULT_FIREWALL, is_lighthouse=False, relay_enabled=True,
+            # THIS env's lighthouse port (fabric/nebula.py's B8 note): one
+            # machine-global 4342 meant only one env's lighthouse could
+            # ever bind, so a second env's mesh silently never worked.
+            lighthouse_port=network.lighthouse_port,
+        )
+
+    def _push_config(self, name: str, nebula: NebulaJoin, config: str) -> None:
+        """Write the config INTO the VM and record what we put there."""
+        self._lima("shell", name, "--", "sudo", "tee", "/etc/nebula/config.yml", input=config, check=False)
+        atomic_write_text(instance_config_path(nebula.root, nebula.env, nebula.host_id), config)
+
+    def _vm_config(self, name: str, nebula: NebulaJoin) -> str | None:
+        """What is ACTUALLY on the VM right now. Only read when odin has no
+        record of its own (a VM booted before `refresh_nebula` existed, or one
+        somebody edited by hand) -- one `limactl shell` per VM, once, instead
+        of a blind restart on no evidence."""
+        recorded = instance_config_path(nebula.root, nebula.env, nebula.host_id)
+        if recorded.exists():
+            return recorded.read_text()
+        proc = self._lima("shell", name, "--", "sudo", "cat", "/etc/nebula/config.yml", check=False)
+        return proc.stdout if proc.returncode == 0 and proc.stdout.strip() else None
+
+    def refresh_nebula(self, name: str, nebula: NebulaJoin) -> str:
+        """Bring a RUNNING VM's nebula config up to date with the canvas, and
+        make the running daemon actually adopt it. Returns what it did:
+        `unchanged` / `reloaded` / `restarted` / `skipped` / `failed`.
+
+        This is field test 2 HIGH-1. A security-group rule edit is TF-owned, so
+        it reaches the gateway only through an Apply -- and every nebula config
+        write used to happen once, at boot. The result on the wire: two VMs in
+        one drawn group enforcing different firewalls, forever, with `Apply`
+        reporting success.
+
+        NO CHURN is a hard requirement (this runs for every running instance on
+        every Apply): an unchanged config is a single local file read and
+        nothing else -- no `limactl`, no signal.
+
+        RELOAD vs RESTART, and why it is not a free choice: nebula reloads
+        `firewall` (and its certs) on SIGHUP -- verified live against the
+        version odin ships, watching a previously-blocked port start answering
+        with no restart and no dropped tunnel. It does NOT reload
+        `static_host_map` / `lighthouse` / `relay`; the only thing that changes
+        those here is a moved lighthouse port, and in exactly that case the
+        tunnel is ALREADY dead, so a restart costs nothing and a SIGHUP would
+        be a lie. So: firewall-only diff -> SIGHUP; anything else -> restart.
+
+        NOT covered, deliberately and honestly: an instance's SG MEMBERSHIP
+        (its cert groups) is fixed at first join, because changing it means
+        re-signing and re-distributing a cert. Editing a group's RULES
+        propagates; moving an instance between groups still needs a recreate --
+        the same limit `fabric/sidecar.py` records for backings.
+
+        Never raises: mesh wiring must not fail an Apply (`_activate_nebula`'s
+        rule)."""
+        try:
+            return self._refresh(name, nebula)
+        except Exception as exc:  # noqa: BLE001 -- deliberately broad, see docstring
+            log.warning("nebula refresh failed for %s: %s", name, exc)
+            return "failed"
+
+    def _refresh(self, name: str, nebula: NebulaJoin) -> str:
+        manager = NebulaManager(Path(nebula.root) / nebula.env / "nebula", runner=self._run)
+        network = manager.load_overlay()
+        underlay = network.lighthouse_underlay_ip if network else None
+        if network is None or underlay is None:
+            return "skipped"  # this env has no bootstrapped mesh to be out of date with
+        config = self._render_config(nebula, network, underlay)
+        current = self._vm_config(name, nebula)
+        if current == config:
+            return "unchanged"
+        self._push_config(name, nebula, config)
+        action = "reloaded" if _firewall_only_change(current, config) else "restarted"
+        command = (
+            ["sudo", "systemctl", "kill", "-s", "HUP", "nebula"] if action == "reloaded"
+            else ["sudo", "systemctl", "restart", "nebula"]
+        )
+        proc = self._lima("shell", name, "--", *command, check=False)
+        if proc.returncode != 0:
+            log.warning("nebula %s failed on %s: %s", action, name, proc.stderr.strip() or "no output")
+            return "failed"
+        log.info("nebula config %s on %s (its security groups changed)", action, name)
+        return action
 
     def _discover_ip(self, name: str, timeout: float) -> str:
         deadline = time.monotonic() + timeout

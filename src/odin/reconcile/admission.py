@@ -1,15 +1,36 @@
 """Pre-apply admission control (owner directive B): a local dev tool has no
 scheduler and no business pretending to -- this is a guardrail, not a
 bin-packer. `check_admission` sums the desired Stack's ESTIMATED resource
-footprint and compares it against real host headroom BEFORE Apply spawns a
-single container or VM; a stack that would exceed the budget is rejected with
-an honest message naming the numbers, not discovered only after 20 concurrent
-EC2 boots have already started thrashing the Mac.
+footprint and compares it against real headroom BEFORE Apply spawns a single
+container or VM; a stack that would exceed a budget is rejected with an honest
+message naming the numbers, not discovered only after 20 concurrent EC2 boots
+have already started thrashing the Mac.
+
+TWO DISJOINT POOLS (field test 2, finding MEDIUM-9). Everything used to be
+charged against `HostFacts.total_mem_mib`, which is `docker info`'s MemTotal
+i.e. COLIMA'S VM (`runtime/colima.py::ensure_host`) -- so on a 48 GiB Mac the
+rejection said "the admission budget is 4.0 GiB (5.8 GiB total on this host)",
+which is false, and a 5 x t3.micro canvas was rejected as too big for a machine
+with 43 GiB to spare. The two substrates are genuinely separate:
+
+- CONTAINER pool -- `rds`/`ecs`/`lambda`/`elasticache`/`alb` and the shared
+  `s3`/`sqs`/`sns`/`dynamodb` backings all run as containers inside the
+  container runtime, so `HostFacts.total_mem_mib` really is their ceiling.
+- HOST/VM pool -- an `ec2` node is a REAL Lima VM created by `limactl`
+  (`compute/instances.py` -> `compute/lima_yaml.py`), sized straight from
+  `INSTANCE_TYPES`. It is allocated by Virtualization.framework from the Mac's
+  own RAM and consumes ZERO of the container runtime's memory, so it must be
+  charged against, and quoted against, real host memory
+  (`host_total_mem_mib()`).
+
+Each pool is checked against its own budget, and a rejection quotes only that
+pool's numbers, described as what they actually are. An unknown total (either
+pool) SKIPS that pool's check rather than printing a confident wrong figure.
 
 Memory estimation, by kind:
 - `ec2`: the real per-instance-type memory (`compute.models.INSTANCE_TYPES`,
   the SAME table `gateway/models/ec2compute.py` uses for the real Lima VM) --
-  this is exact, not a guess.
+  this is exact, not a guess. Charged to the HOST pool.
 - `rds`/`ecs`/`lambda`/`elasticache`/`alb`: a modest FIXED estimate per node --
   each spawns its OWN container (a Postgres, a task container, an RIE
   container, a Redis, an nginx reverse proxy), so per-node charging is right.
@@ -24,11 +45,15 @@ Memory estimation, by kind:
   own (Nebula/gateway-model bookkeeping only) -- zero footprint. (`ecr`'s
   registry:2 is a shared per-env backing, not charged per node.)
 
-The budget itself is against `HostFacts.total_mem_mib` (`runtime.ensure_host()`
--- collected today, never used until now) -- a percentage of TOTAL memory,
-not currently-free memory, matching the owner's own framing ("70% of total
-RAM"): simple, doesn't need to sum every already-running container's live
-usage, and leaves headroom for the host OS + Colima itself.
+Each budget is a percentage of its pool's TOTAL memory, not currently-free
+memory, matching the owner's own framing ("70% of total RAM"): simple, doesn't
+need to sum every already-running container's live usage, and leaves headroom
+for the host OS + the runtime itself. **Recorded limit:** it is a static
+per-canvas estimate, so it does not see memory actually in use -- two envs can
+each pass this check and jointly overcommit. Making it cross-env would mean
+summing every OTHER env's applied Stack here, which needs the caller to hand
+this function those stacks; not wired today, and said out loud in ROADMAP
+rather than implied away.
 """
 from __future__ import annotations
 
@@ -38,6 +63,7 @@ from pathlib import Path
 from shutil import disk_usage
 
 from odin.aws.cache import DEFAULT_MEMORY_MIB as CACHE_MEMORY_MIB
+from odin.compute.instances import LIMA_UNIX_PATH_MAX, lima_home, max_env_name_len, vm_name
 from odin.compute.models import get_instance_type
 from odin.runtime.driver import HostFacts
 from odin.spec.models import ResourceDesired, Stack
@@ -65,8 +91,10 @@ _BACKING_MEMORY_MIB: dict[str, float] = {
     "s3": 256.0, "sqs": 128.0, "sns": 128.0, "dynamodb": 256.0,
 }
 
-_DEFAULT_BUDGET_RATIO = 0.7  # >70% of total host memory -- the owner's own number
+_DEFAULT_BUDGET_RATIO = 0.7  # >70% of a pool's total memory -- the owner's own number
 _DEFAULT_MIN_DISK_GIB = 10.0  # matches cli/doctor.py's own MIN_DISK_GIB
+_CONTAINER_BUDGET_ENV = "ODIN_MEMORY_BUDGET_MIB"
+_VM_BUDGET_ENV = "ODIN_VM_MEMORY_BUDGET_MIB"
 
 
 def _gib_str_to_mib(value: str) -> float:
@@ -81,32 +109,81 @@ def _ec2_memory_mib(res: ResourceDesired) -> float:
     return _gib_str_to_mib(get_instance_type(instance_type).memory)
 
 
-def estimate_stack_memory_mib(stack: Stack) -> float:
-    """The Stack's estimated total memory footprint, in MiB -- see the
-    module docstring for the per-kind rules. Pure and total: every resource
-    kind lands in exactly one of ec2/per-node/backing/zero-footprint."""
-    total = 0.0
+def host_total_mem_mib() -> float:
+    """The REAL machine's total RAM, in MiB -- the ceiling an `ec2` node's Lima
+    VM is actually allocated from.
+
+    `os.sysconf` rather than a `sysctl hw.memsize` subprocess or a new
+    dependency: it is stdlib, non-blocking (so `check_admission` stays cheap
+    enough to run on every Apply), and answers on both macOS and Linux. A
+    platform that doesn't define these keys returns 0.0 -- the same "unknown"
+    sentinel `HostFacts()` uses -- which SKIPS the VM check rather than
+    inventing a number for the rejection message to state as fact."""
+    names = os.sysconf_names
+    if "SC_PHYS_PAGES" not in names or "SC_PAGE_SIZE" not in names:
+        return 0.0
+    return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 2**20
+
+
+@dataclass(frozen=True)
+class StackFootprint:
+    """A canvas's estimated memory footprint, split by SUBSTRATE -- the two
+    pools are disjoint (module docstring), so they are never summed for a
+    budget comparison, only for display."""
+    container_mib: float = 0.0
+    vm_mib: float = 0.0
+
+    @property
+    def total_mib(self) -> float:
+        return self.container_mib + self.vm_mib
+
+
+def estimate_stack_footprint(stack: Stack) -> StackFootprint:
+    """The Stack's estimated footprint per pool -- see the module docstring for
+    the per-kind rules. Pure and total: every resource kind lands in exactly one
+    of ec2 (VM pool) / per-node / backing / zero-footprint."""
+    container = 0.0
+    vm = 0.0
     backings_needed: set[str] = set()
     for res in stack.resources:
         if res.kind == "ec2":
-            total += _ec2_memory_mib(res)
+            vm += _ec2_memory_mib(res)
         elif res.kind in _PER_NODE_MEMORY_MIB:
-            total += _PER_NODE_MEMORY_MIB[res.kind]
+            container += _PER_NODE_MEMORY_MIB[res.kind]
         elif res.kind in _BACKING_MEMORY_MIB:
             backings_needed.add(res.kind)
-    total += sum(_BACKING_MEMORY_MIB[kind] for kind in backings_needed)
-    return total
+    container += sum(_BACKING_MEMORY_MIB[kind] for kind in backings_needed)
+    return StackFootprint(container_mib=container, vm_mib=vm)
+
+
+def estimate_stack_memory_mib(stack: Stack) -> float:
+    """The Stack's estimated TOTAL memory footprint across both pools, in MiB --
+    the honest "how much RAM does this canvas want" figure for display. Never
+    compared against a budget (the pools are disjoint); `check_admission` uses
+    `estimate_stack_footprint`."""
+    return estimate_stack_footprint(stack).total_mib
 
 
 def default_memory_budget_mib(total_mem_mib: float) -> float:
-    """`ODIN_MEMORY_BUDGET_MIB` overrides the budget outright (an absolute
-    MiB figure); otherwise it's `_DEFAULT_BUDGET_RATIO` of the host's total
-    memory (`HostFacts.total_mem_mib`). Read fresh on every call (not cached
-    at import), same convention as `agent/translate.py`'s `_default_timeout`."""
-    override = os.environ.get("ODIN_MEMORY_BUDGET_MIB")
+    """The CONTAINER pool's budget. `ODIN_MEMORY_BUDGET_MIB` overrides it
+    outright (an absolute MiB figure); otherwise it's `_DEFAULT_BUDGET_RATIO` of
+    the container runtime's total memory (`HostFacts.total_mem_mib`). Read fresh
+    on every call (not cached at import), same convention as
+    `agent/translate.py`'s `_default_timeout`."""
+    override = os.environ.get(_CONTAINER_BUDGET_ENV)
     if override:
         return float(override)
     return total_mem_mib * _DEFAULT_BUDGET_RATIO
+
+
+def default_vm_budget_mib(host_mem_mib: float) -> float:
+    """The HOST/VM pool's budget (`ec2` nodes = real Lima VMs).
+    `ODIN_VM_MEMORY_BUDGET_MIB` overrides it outright; otherwise it's
+    `_DEFAULT_BUDGET_RATIO` of REAL host memory."""
+    override = os.environ.get(_VM_BUDGET_ENV)
+    if override:
+        return float(override)
+    return host_mem_mib * _DEFAULT_BUDGET_RATIO
 
 
 def default_min_disk_gib() -> float:
@@ -118,16 +195,131 @@ def default_min_disk_gib() -> float:
 
 @dataclass(frozen=True)
 class AdmissionResult:
+    """`estimated_mib` is always the canvas's TOTAL estimate across both pools.
+    `budget_mib` is the budget of the pool the `reason` names on a rejection,
+    and the container pool's budget when nothing was rejected -- the two
+    per-pool pairs below carry the full, unambiguous truth."""
     ok: bool
     reason: str = ""
     estimated_mib: float = 0.0
     budget_mib: float = 0.0
     free_disk_gib: float = 0.0
     min_disk_gib: float = 0.0
+    container_mib: float = 0.0
+    container_budget_mib: float = 0.0
+    vm_mib: float = 0.0
+    vm_budget_mib: float = 0.0
 
 
 def _gib(mib: float) -> float:
     return mib / 1024.0
+
+
+@dataclass(frozen=True)
+class _Pool:
+    """One of the two disjoint memory pools, with everything the rejection
+    message needs to be TRUE: what was estimated, the budget, and an honest
+    description of where that budget came from (never "total on this host" for
+    a number that is actually the container runtime's)."""
+    wants: str        # what this pool's share of the canvas IS
+    ceiling: str      # an honest description of the budget's origin
+    advice: str
+    estimated_mib: float
+    budget_mib: float
+
+    @property
+    def exceeded(self) -> bool:
+        # A zero budget means "unknown total" (docker info failed / sysconf
+        # has no answer) -- skip, rather than reject on a nonsense 0 GiB.
+        return self.budget_mib > 0 and self.estimated_mib > self.budget_mib
+
+    @property
+    def reason(self) -> str:
+        return (
+            f"this canvas needs ~{_gib(self.estimated_mib):.1f} GiB {self.wants}; the admission "
+            f"budget is {_gib(self.budget_mib):.1f} GiB {self.ceiling} -- {self.advice}"
+        )
+
+
+def _budget_origin(env_var: str, total_mib: float, described: str) -> str:
+    """Either the env override that set the budget outright, or the pool total
+    the default ratio was taken from -- so the parenthetical in a rejection is
+    never a number nobody can check."""
+    if os.environ.get(env_var):
+        return f"({env_var})"
+    return f"({_gib(total_mib):.1f} GiB {described})"
+
+
+def _pools(footprint: StackFootprint, host: HostFacts, host_mem_mib: float) -> tuple[_Pool, _Pool]:
+    return (
+        _Pool(
+            wants="of container memory",
+            ceiling=_budget_origin(
+                _CONTAINER_BUDGET_ENV, host.total_mem_mib,
+                "reported by the container runtime -- that is Colima's VM, not the whole machine",
+            ),
+            advice=(
+                "apply fewer container-backed nodes, or give the container runtime more memory "
+                "(`colima stop && colima start --memory N`)"
+            ),
+            estimated_mib=footprint.container_mib,
+            budget_mib=default_memory_budget_mib(host.total_mem_mib),
+        ),
+        _Pool(
+            # EC2 nodes are Lima VMs allocated from the Mac's own RAM, so this
+            # pool -- and only this pool -- may speak of "this host".
+            wants="of memory for its EC2 instances (each one is a real Lima VM on the host)",
+            ceiling=_budget_origin(_VM_BUDGET_ENV, host_mem_mib, "total on this host"),
+            advice="reduce instance sizes or apply fewer nodes",
+            estimated_mib=footprint.vm_mib,
+            budget_mib=default_vm_budget_mib(host_mem_mib),
+        ),
+    )
+
+
+def env_name_rejection(stack: Stack) -> str | None:
+    """The env name is too long for the Lima VM names its `ec2` nodes need --
+    or None, which is every other case.
+
+    THE TRAP, found while building the mesh proof: an `ec2` node becomes a
+    real Lima VM called `odin-ec2-{env}-{instance_id}`, and `limactl` refuses
+    any instance whose SSH control-socket path would not fit a unix socket
+    address. Past a certain env-name length EVERY boot in that env fails --
+    reliably and completely, which is the good part -- with a raw
+
+        instance name "..." too long: ".../ssh.sock.1234567890123456" must be
+        less than UNIX_PATH_MAX=104 characters, but is 107
+
+    that names a socket path, a Lima constant and a byte count, none of which
+    the user chose, ~60s into a boot that was never going to work. Refusing
+    at Apply, while they can still rename, is the whole point: this belongs
+    with the memory/disk guardrails for the same reason and in the same tone
+    -- state the number, state the fix.
+
+    ONLY WHEN AN EC2 NODE IS DRAWN. Nothing else in odin mints a VM name, so
+    a long env is perfectly fine for a canvas of buckets and queues and must
+    not be blocked.
+
+    The limit is MACHINE-SPECIFIC and derived, never hardcoded
+    (`compute/instances.py::max_env_name_len`): it moves with `$LIMA_HOME`
+    (default `~/.lima`, so with the username's length). Hardcoding the 22
+    that was measured on one Mac would refuse valid canvases on another and
+    admit doomed ones on a third."""
+    if not any(res.kind == "ec2" for res in stack.resources):
+        return None
+    limit = max_env_name_len()
+    if len(stack.env) <= limit:
+        return None
+    example = f"{lima_home()}/{vm_name(stack.env, 'i-<17 hex>')}/ssh.sock.<16 digits>"
+    return (
+        f"the environment name {stack.env!r} is {len(stack.env)} characters; an env with an ec2 node "
+        f"must be at most {limit} on this machine. Every ec2 node is a real Lima VM named "
+        f"`{vm_name('<env>', '<instance-id>')}`, and limactl refuses a name whose control-socket path "
+        f"({example}) would reach UNIX_PATH_MAX={LIMA_UNIX_PATH_MAX} bytes -- so every boot in this env "
+        f"would fail after ~60s with a limactl error naming none of this. Rename the env to {limit} "
+        f"characters or fewer, or point LIMA_HOME at a shorter path (the limit is {limit} because "
+        f"{lima_home()} is {len(str(lima_home()))} characters long)"
+    )
 
 
 def _existing_ancestor(path: Path) -> Path:
@@ -141,46 +333,58 @@ def _existing_ancestor(path: Path) -> Path:
     return path
 
 
-def check_admission(stack: Stack, host: HostFacts, disk_path: Path) -> AdmissionResult:
-    """The whole guardrail: estimate the Stack's memory footprint, compare
-    against `host`'s budget, then check free disk on the volume holding
-    `disk_path` (the store root -- `.odin/`, images, containers all land
-    there). Memory is checked first (typically the more informative
-    rejection reason for a local dev canvas); either failure is terminal --
-    `ok=False` with `reason` naming the actual numbers, never a bare
-    "rejected".
+def check_admission(
+    stack: Stack, host: HostFacts, disk_path: Path, host_mem_mib: float | None = None,
+) -> AdmissionResult:
+    """The whole guardrail: estimate the Stack's footprint per SUBSTRATE, compare
+    each against its own pool's budget, then check free disk on the volume
+    holding `disk_path` (the store root -- `.odin/`, images, containers all land
+    there). Memory is checked first (typically the more informative rejection
+    reason for a local dev canvas); any failure is terminal -- `ok=False` with
+    `reason` naming the actual numbers, never a bare "rejected".
 
-    `budget == 0` (host.total_mem_mib unknown -- `ensure_host()` returns this
-    when `docker info` fails, e.g. Colima isn't running) skips the memory
-    check entirely rather than rejecting on a nonsense "0 GiB budget": Apply
-    will fail with a far clearer error at the actual container/VM step, and
-    `ODIN_MEMORY_BUDGET_MIB` still overrides this (a nonzero override always
-    applies the check even when the host total is unknown)."""
-    estimated = estimate_stack_memory_mib(stack)
-    budget = default_memory_budget_mib(host.total_mem_mib)
+    `host` carries the CONTAINER runtime's memory (`ensure_host()` ->
+    `docker info` MemTotal). `host_mem_mib` is REAL machine memory for the
+    VM pool; it defaults to `host_total_mem_mib()` and exists as a parameter so
+    tests are deterministic rather than machine-dependent.
+
+    A zero total for either pool means "unknown" (`docker info` failed because
+    Colima isn't running; `os.sysconf` has no answer) and SKIPS that pool's
+    check rather than rejecting on a nonsense "0 GiB budget" -- Apply will fail
+    with a far clearer error at the actual container/VM step. The matching env
+    override still applies in that case (a nonzero override always enforces its
+    pool). The two pools are independent: Colima being down says nothing about
+    the Mac's RAM, so an EC2 canvas is still checked."""
+    footprint = estimate_stack_footprint(stack)
+    pools = _pools(footprint, host, host_total_mem_mib() if host_mem_mib is None else host_mem_mib)
+    container_pool, vm_pool = pools
     free_disk_gib = disk_usage(_existing_ancestor(disk_path)).free / 2**30
     min_disk_gib = default_min_disk_gib()
+    numbers = {
+        "estimated_mib": footprint.total_mib,
+        "free_disk_gib": free_disk_gib,
+        "min_disk_gib": min_disk_gib,
+        "container_mib": footprint.container_mib,
+        "container_budget_mib": container_pool.budget_mib,
+        "vm_mib": footprint.vm_mib,
+        "vm_budget_mib": vm_pool.budget_mib,
+    }
 
-    if budget > 0 and estimated > budget:
-        reason = (
-            f"this canvas needs ~{_gib(estimated):.1f} GiB of memory; the admission "
-            f"budget is {_gib(budget):.1f} GiB ({_gib(host.total_mem_mib):.1f} GiB total on "
-            "this host) -- reduce instance sizes or apply fewer nodes"
-        )
-        return AdmissionResult(
-            ok=False, reason=reason, estimated_mib=estimated, budget_mib=budget,
-            free_disk_gib=free_disk_gib, min_disk_gib=min_disk_gib,
-        )
+    # FIRST, ahead of both memory pools: an over-budget canvas can be applied
+    # after freeing RAM, but this one can never work as drawn, so it is the
+    # more useful thing to be told. It is also free for every canvas without
+    # an ec2 node.
+    name_reason = env_name_rejection(stack)
+    if name_reason is not None:
+        return AdmissionResult(ok=False, reason=name_reason, budget_mib=container_pool.budget_mib, **numbers)
+
+    rejected = next((pool for pool in pools if pool.exceeded), None)
+    if rejected is not None:
+        return AdmissionResult(ok=False, reason=rejected.reason, budget_mib=rejected.budget_mib, **numbers)
     if free_disk_gib < min_disk_gib:
         reason = (
             f"only {free_disk_gib:.1f} GiB free disk (need >{min_disk_gib:.0f} GiB) -- "
             "free up space before applying"
         )
-        return AdmissionResult(
-            ok=False, reason=reason, estimated_mib=estimated, budget_mib=budget,
-            free_disk_gib=free_disk_gib, min_disk_gib=min_disk_gib,
-        )
-    return AdmissionResult(
-        ok=True, estimated_mib=estimated, budget_mib=budget,
-        free_disk_gib=free_disk_gib, min_disk_gib=min_disk_gib,
-    )
+        return AdmissionResult(ok=False, reason=reason, budget_mib=container_pool.budget_mib, **numbers)
+    return AdmissionResult(ok=True, budget_mib=container_pool.budget_mib, **numbers)

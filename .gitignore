@@ -7,6 +7,7 @@ __pycache__/
 dist/
 build/
 .worktrees/
+.claude/worktrees/
 .DS_Store
 .odin/
 .odin-v4d-test/

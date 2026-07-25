@@ -35,6 +35,8 @@ ALL_OK = {
     "which bun": FakeProc(0, "/Users/me/.bun/bin/bun\n"),
     "which claude": FakeProc(0, "/opt/homebrew/bin/claude\n"),
     "docker image inspect -f {{.Id}} " + DYNALITE_IMAGE: FakeProc(0, "sha256:abc\n"),
+    # `ensure_host` -> the memory check's total (48 GiB in bytes, 8 CPUs)
+    "docker info --format {{.MemTotal}} {{.NCPU}}": FakeProc(0, f"{48 * GIB} 8\n"),
 }
 
 
@@ -112,6 +114,52 @@ def test_disk_headroom_ok(monkeypatch):
     patch_disk(monkeypatch, free_bytes=50 * GIB)
     disk = by_name(run_checks(["disk"], make_run(), disk_path=Path.cwd()))["disk"]
     assert (disk.status, disk.fix) == ("ok", "")
+
+
+def test_disk_floor_follows_odin_min_disk_gib(monkeypatch):
+    """LOW-14: doctor hardcoded 10 GiB while admission read the env var, so its
+    docstring's claim that the two "agree on what 'enough disk' means" held only
+    at the default."""
+    patch_disk(monkeypatch, free_bytes=50 * GIB)
+    monkeypatch.setenv("ODIN_MIN_DISK_GIB", "999")
+    disk = by_name(run_checks(["disk"], make_run(), disk_path=Path.cwd()))["disk"]
+    assert disk.status == "fail"
+    assert "999 GiB" in disk.fix and "ODIN_MIN_DISK_GIB" in disk.detail
+
+
+# --- memory: the budget an Apply is actually admitted against --------------
+
+def test_memory_reports_the_admission_budget(monkeypatch):
+    """LOW-15: doctor said nothing about memory, though admission can hard-
+    reject an Apply on it. The number quoted here comes from `check_admission`
+    itself, so the two cannot drift apart."""
+    patch_disk(monkeypatch)
+    memory = by_name(run_checks(["memory"], make_run(), disk_path=Path.cwd()))["memory"]
+    assert (memory.status, memory.required) == ("ok", False)
+    assert "33.6 GiB admission budget of 48.0 GiB" in memory.detail  # 0.7 x 48
+    assert "ODIN_MEMORY_BUDGET_MIB" in memory.detail
+
+
+def test_memory_budget_honours_the_env_override(monkeypatch):
+    patch_disk(monkeypatch)
+    monkeypatch.setenv("ODIN_MEMORY_BUDGET_MIB", "2048")
+    memory = by_name(run_checks(["memory"], make_run(), disk_path=Path.cwd()))["memory"]
+    assert "2.0 GiB admission budget" in memory.detail
+
+
+def test_memory_is_a_skip_not_a_blocker_when_the_runtime_says_nothing(monkeypatch):
+    patch_disk(monkeypatch)
+    silent = {"docker info --format {{.MemTotal}} {{.NCPU}}": FakeProc(1)}
+    memory = by_name(run_checks(["memory"], make_run(silent), disk_path=Path.cwd()))["memory"]
+    assert (memory.status, memory.required, memory.fix) == ("skip", False, "colima start")
+    assert "admission check is skipped" in memory.detail
+
+
+def test_limactl_says_exactly_when_it_is_optional():
+    """LOW-15: reported as a bare `○` while every EC2 node is a real Lima VM."""
+    limactl = by_name(run_checks(["limactl"], make_run({"which limactl": FakeProc(1)})))["limactl"]
+    assert limactl.status == "skip"
+    assert "REQUIRED for any canvas with an EC2 node" in limactl.detail
 
 
 # --- dynalite prebake offer ------------------------------------------------

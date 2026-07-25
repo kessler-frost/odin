@@ -107,6 +107,14 @@ def underlay_ip() -> str:
     return os.environ.get("ODIN_MESH_UNDERLAY") or HOST_GATEWAY_IP
 
 
+def _shares_namespace(network_mode: str, target_id: str) -> bool:
+    """`container:<id>` vs the target's live id. Compared by prefix in both
+    directions because a container id is legitimately written short (12 hex)
+    or full (64) depending on who recorded it."""
+    joined = network_mode.partition("container:")[2].strip()
+    return bool(joined) and (joined.startswith(target_id) or target_id.startswith(joined))
+
+
 class MeshSidecar:
     """Joins one env's backing containers to that env's Nebula overlay.
 
@@ -156,6 +164,27 @@ class MeshSidecar:
     def running(self, target: str) -> bool:
         return self._rt.status(self.sidecar_name(target)) == "running"
 
+    def attached_to(self, target: str) -> bool | None:
+        """Is the sidecar in the CURRENT `target`'s network namespace?
+
+        True/False, or None for "no evidence either way" (the runtime can't
+        report an id for `target` -- it was never started, or docker itself
+        hiccuped; churning a daemon on no evidence would be a self-inflicted
+        restart loop).
+
+        This is the field-test HIGH-2 check. `--network container:<name>` is
+        resolved to an ID at creation, so a target that was killed and
+        re-created (a `docker kill`ed Postgres + the Apply that brings it
+        back) leaves the sidecar pinned to a namespace that no longer exists:
+        nebula keeps running, logging `sendto: network is unreachable` on
+        every handshake, while the config file is byte-identical and the
+        sidecar container is still `running` -- so "unchanged + running" said
+        "nothing to do" forever and no Apply could heal it."""
+        target_id = self._rt.container_id(target)
+        if not target_id:
+            return None
+        return _shares_namespace(self._rt.network_mode(self.sidecar_name(target)), target_id)
+
     # ---- join / leave ----
     def ensure(
         self, target: str, member: str, *,
@@ -166,9 +195,13 @@ class MeshSidecar:
         allow-all, matching how a VM with no compiled SG behaves). Returns the
         overlay IP, or None when the env has no mesh.
 
-        Idempotent by config: an already-running sidecar whose config file is
-        byte-identical is left alone; a CHANGED firewall (the canvas edited
-        the SG) replaces it, since nebula reads its firewall only at start.
+        Idempotent by config AND by namespace: an already-running sidecar
+        whose config file is byte-identical AND which is in the CURRENT
+        target's network namespace is left alone; a CHANGED firewall (the
+        canvas edited the SG) replaces it, since nebula reads its firewall
+        only at start, and so does a REPLACED target (see `attached_to` --
+        the field-test HIGH-2 bug: without that half, a killed-and-recreated
+        database was never re-joined by any number of Applies).
         Never raises -- like `InstanceVm._activate_nebula`, mesh wiring must
         not fail an otherwise-healthy backing (the host path still works)."""
         if not self.enabled():
@@ -200,6 +233,11 @@ class MeshSidecar:
         config = manager.generate_config(
             lighthouse_ip=overlay.lighthouse_ip, lighthouse_underlay=underlay,
             firewall=firewall, is_lighthouse=False, relay_enabled=True,
+            # This env's own lighthouse port, never the machine-global 4342
+            # (fabric/nebula.py's B8 note). A port that MOVED (because
+            # something else took the recorded one) changes this config, which
+            # is exactly what makes the sidecar re-join on the new one.
+            lighthouse_port=overlay.lighthouse_port,
         )
         directory = self._member_dir(member)
         directory.mkdir(parents=True, exist_ok=True)
@@ -212,7 +250,10 @@ class MeshSidecar:
         config_path = directory / "config.yml"
         unchanged = config_path.exists() and config_path.read_text() == config
         atomic_write_text(config_path, config)
-        if unchanged and self.running(target):
+        # `attached_to(...) is not False`: a definite NO (the target was
+        # replaced) is the one case that must re-join; None (no evidence) keeps
+        # the no-churn contract -- see `attached_to`.
+        if unchanged and self.running(target) and self.attached_to(target) is not False:
             return cert_ip.split("/")[0]
         self._start(target, directory)
         return cert_ip.split("/")[0]

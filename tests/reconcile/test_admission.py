@@ -3,6 +3,7 @@ estimated memory footprint against real host headroom, and free disk on the
 store volume, BEFORE Apply spawns anything."""
 from __future__ import annotations
 
+from odin.compute.instances import max_env_name_len
 from odin.reconcile import admission
 from odin.reconcile.admission import (
     CACHE_MEMORY_MIB,
@@ -114,18 +115,64 @@ def test_a_small_stack_on_a_healthy_host_is_admitted(tmp_path, monkeypatch):
     assert result.estimated_mib == 256.0
 
 
-def test_a_stack_exceeding_the_memory_budget_is_rejected_with_the_numbers(tmp_path, monkeypatch):
+def test_a_stack_exceeding_the_vm_memory_budget_is_rejected_with_true_numbers(tmp_path, monkeypatch):
+    """Field-test 2 finding MEDIUM-9: the rejection was protective but said
+    "the admission budget is 4.0 GiB (5.8 GiB total on this host)" on a 48 GiB
+    Mac -- 5.8 GiB is COLIMA's VM (`docker info` MemTotal). EC2 instances are
+    Lima VMs on the Mac and consume none of Colima's memory, so they must be
+    charged against, and the message must quote, REAL host memory."""
     monkeypatch.delenv("ODIN_MEMORY_BUDGET_MIB", raising=False)
-    # 20 t3.medium EC2 nodes -> 20 * 4GiB == 80GiB, way past 70% of an 8GiB host.
+    monkeypatch.delenv("ODIN_VM_MEMORY_BUDGET_MIB", raising=False)
+    # 20 t3.medium EC2 nodes -> 20 * 4GiB == 80GiB, way past 70% of a 16GiB host.
     stack = Stack(resources=tuple(
         ResourceDesired(id=f"web{i}", kind="ec2", fields={"instanceType": FieldValue(value="t3.medium")})
         for i in range(20)
     ))
-    result = check_admission(stack, HostFacts(total_mem_mib=8_000.0), tmp_path)
+    result = check_admission(
+        stack, HostFacts(total_mem_mib=8_000.0), tmp_path, host_mem_mib=16_384.0,
+    )
     assert result.ok is False
     assert "80.0 GiB" in result.reason
-    assert "GiB" in result.reason and "5.5 GiB" in result.reason  # 70% of 8000 MiB budget
+    assert "11.2 GiB" in result.reason  # 70% of the 16 GiB HOST, not of Colima's 8 GiB
+    assert "16.0 GiB" in result.reason  # the host total, quoted truthfully
+    assert "Colima" not in result.reason, "an EC2 node never touches the container runtime"
     assert "reduce instance sizes or apply fewer nodes" in result.reason
+    assert result.vm_mib == 20 * 4096.0
+    assert result.container_mib == 0.0
+
+
+def test_a_stack_exceeding_the_container_memory_budget_names_the_container_runtime(tmp_path, monkeypatch):
+    """The other pool: container-backed kinds really do live in Colima's VM, so
+    THAT number is the true one to quote for them -- and it must be described as
+    what it is, never as "total on this host"."""
+    monkeypatch.delenv("ODIN_MEMORY_BUDGET_MIB", raising=False)
+    stack = Stack(resources=tuple(ResourceDesired(id=f"task{i}", kind="ecs") for i in range(20)))
+    result = check_admission(
+        stack, HostFacts(total_mem_mib=5_910.0), tmp_path, host_mem_mib=49_152.0,
+    )
+    assert result.ok is False
+    assert "10.0 GiB" in result.reason  # 20 * 512 MiB
+    assert "container runtime" in result.reason
+    assert "5.8 GiB" in result.reason  # Colima's VM, honestly labelled
+    assert "48.0 GiB total on this host" not in result.reason
+    assert result.container_mib == 20 * 512.0
+    assert result.vm_mib == 0.0
+
+
+def test_a_small_ec2_canvas_on_a_big_mac_is_admitted(tmp_path, monkeypatch):
+    """The practical harm MEDIUM-9 reported: 5 x t3.micro (5 GiB) is trivial for
+    a 48 GiB Mac but was rejected because it was charged against Colima's
+    ~5.8 GiB VM, which those VMs never touch."""
+    monkeypatch.delenv("ODIN_MEMORY_BUDGET_MIB", raising=False)
+    monkeypatch.delenv("ODIN_VM_MEMORY_BUDGET_MIB", raising=False)
+    stack = Stack(resources=tuple(
+        ResourceDesired(id=f"web{i}", kind="ec2", fields={"instanceType": FieldValue(value="t3.micro")})
+        for i in range(5)
+    ))
+    result = check_admission(
+        stack, HostFacts(total_mem_mib=5_910.0), tmp_path, host_mem_mib=49_152.0,
+    )
+    assert result.ok is True, result.reason
 
 
 def test_memory_budget_env_override_is_honored_by_check_admission(tmp_path, monkeypatch):
@@ -134,6 +181,15 @@ def test_memory_budget_env_override_is_honored_by_check_admission(tmp_path, monk
     result = check_admission(stack, HostFacts(total_mem_mib=64_000.0), tmp_path)
     assert result.ok is False
     assert result.budget_mib == 100.0
+
+
+def test_vm_memory_budget_env_override_is_honored(tmp_path, monkeypatch):
+    monkeypatch.setenv("ODIN_VM_MEMORY_BUDGET_MIB", "512")
+    stack = Stack(resources=(ResourceDesired(id="web1", kind="ec2"),))  # t3.micro == 1 GiB
+    result = check_admission(stack, HostFacts(total_mem_mib=64_000.0), tmp_path, host_mem_mib=49_152.0)
+    assert result.ok is False
+    assert result.budget_mib == 512.0
+    assert "ODIN_VM_MEMORY_BUDGET_MIB" in result.reason
 
 
 def test_insufficient_disk_is_rejected_even_when_memory_is_fine(tmp_path, monkeypatch):
@@ -155,18 +211,38 @@ def test_min_disk_env_override_is_honored(tmp_path, monkeypatch):
     assert "need >100 GiB" in result.reason
 
 
-def test_unknown_host_memory_skips_the_memory_check_not_the_disk_check(tmp_path, monkeypatch):
+def test_unknown_container_memory_skips_only_the_container_check(tmp_path, monkeypatch):
     # HostFacts() (all zero) is what ensure_host() returns when `docker
     # info` fails (Colima not running) -- and what every test fake that
     # predates this feature returns. Rejecting on a bogus "0 GiB budget"
     # would be actively misleading; Apply fails with a clearer error later.
+    # Colima being down says NOTHING about the Mac's RAM, so the VM pool's
+    # check is unaffected -- the two pools are independent.
     monkeypatch.delenv("ODIN_MEMORY_BUDGET_MIB", raising=False)
+    stack = Stack(resources=tuple(ResourceDesired(id=f"task{i}", kind="ecs") for i in range(50)))
+    result = check_admission(stack, HostFacts(total_mem_mib=0.0), tmp_path, host_mem_mib=49_152.0)
+    assert result.ok is True
+
+
+def test_unknown_host_memory_skips_only_the_vm_check(tmp_path, monkeypatch):
+    """`os.sysconf` not answering is the VM pool's equivalent of `docker info`
+    failing: skip, rather than print a confident wrong number."""
+    monkeypatch.delenv("ODIN_MEMORY_BUDGET_MIB", raising=False)
+    monkeypatch.delenv("ODIN_VM_MEMORY_BUDGET_MIB", raising=False)
     stack = Stack(resources=tuple(
         ResourceDesired(id=f"web{i}", kind="ec2", fields={"instanceType": FieldValue(value="t3.medium")})
         for i in range(50)  # would obviously blow any real budget
     ))
-    result = check_admission(stack, HostFacts(total_mem_mib=0.0), tmp_path)
+    result = check_admission(stack, HostFacts(total_mem_mib=64_000.0), tmp_path, host_mem_mib=0.0)
     assert result.ok is True
+
+
+def test_the_real_host_total_is_read_and_is_not_the_container_runtime_number():
+    """The number itself must be real: os.sysconf-derived, no new dependency, no
+    subprocess -- and on any machine odin runs on it is a plausible RAM size."""
+    total = admission.host_total_mem_mib()
+    assert total > 512.0, total  # nobody runs odin on half a gig
+    assert total % 1024 == 0 or total > 1024, total
 
 
 def test_an_explicit_budget_override_still_applies_even_with_unknown_host_memory(tmp_path, monkeypatch):
@@ -198,3 +274,86 @@ def test_check_admission_tolerates_a_store_root_that_does_not_exist_yet(tmp_path
     stack = Stack(resources=(ResourceDesired(id="uploads", kind="s3"),))
     result = check_admission(stack, HostFacts(total_mem_mib=64_000.0), never_created)
     assert isinstance(result.free_disk_gib, float) and result.free_disk_gib > 0
+
+
+# --- env-name length: the trap that made every EC2 boot fail with a raw
+# limactl error, ~60s after Apply, naming nothing the user chose -------------
+
+
+def _ec2_stack(env: str) -> Stack:
+    return Stack(env=env, resources=(ResourceDesired(id="web1", kind="ec2"),))
+
+
+def _long_env(monkeypatch) -> str:
+    """One character past what this machine can boot. Derived from the same
+    path arithmetic the check uses -- never a hardcoded 23."""
+    monkeypatch.setenv("LIMA_HOME", "/Users/somebody/.lima")
+    return "e" * (max_env_name_len() + 1)
+
+
+def test_an_env_too_long_for_a_lima_vm_name_is_refused_before_anything_boots(tmp_path, monkeypatch):
+    env = _long_env(monkeypatch)
+    result = check_admission(_ec2_stack(env), HostFacts(total_mem_mib=64_000.0), tmp_path, host_mem_mib=49_152.0)
+    assert result.ok is False
+
+
+def test_the_refusal_names_the_length_the_limit_and_the_real_constraint(tmp_path, monkeypatch):
+    """The whole point: the raw limactl error names a socket path and
+    UNIX_PATH_MAX, neither of which the user chose. This one has to name what
+    they DID choose (the env name and its length), the actual number to get
+    under, and why."""
+    env = _long_env(monkeypatch)
+    limit = max_env_name_len()
+    result = check_admission(_ec2_stack(env), HostFacts(total_mem_mib=64_000.0), tmp_path, host_mem_mib=49_152.0)
+    assert env in result.reason
+    assert str(len(env)) in result.reason
+    assert str(limit) in result.reason
+    assert "ec2" in result.reason.lower()
+    assert "UNIX_PATH_MAX" in result.reason
+    assert "LIMA_HOME" in result.reason  # the other way out, for a user who can't rename
+
+
+def test_a_canvas_with_no_ec2_node_is_never_blocked_by_the_env_name(tmp_path, monkeypatch):
+    """Nothing will boot a VM, so nothing can hit the limit -- a long env is
+    perfectly fine for a bucket."""
+    env = _long_env(monkeypatch)
+    stack = Stack(env=env, resources=(ResourceDesired(id="uploads", kind="s3"),))
+    result = check_admission(stack, HostFacts(total_mem_mib=64_000.0), tmp_path, host_mem_mib=49_152.0)
+    assert result.ok is True, result.reason
+
+
+def test_an_env_exactly_at_the_limit_is_admitted(tmp_path, monkeypatch):
+    """The boundary is inclusive: `max_env_name_len()` characters BOOT
+    (verified against a real limactl -- 103 bytes of socket path is accepted,
+    104 is not), so refusing it here would be a false alarm."""
+    monkeypatch.setenv("LIMA_HOME", "/Users/somebody/.lima")
+    env = "e" * max_env_name_len()
+    result = check_admission(_ec2_stack(env), HostFacts(total_mem_mib=64_000.0), tmp_path, host_mem_mib=49_152.0)
+    assert result.ok is True, result.reason
+
+
+def test_a_longer_lima_home_makes_a_previously_fine_env_refused(tmp_path, monkeypatch):
+    """Machine-specific by construction: the identical canvas is admitted for
+    one user and refused for another whose home path is longer. This is why
+    the limit is derived rather than hardcoded."""
+    monkeypatch.setenv("LIMA_HOME", "/Users/somebody/.lima")
+    env = "e" * max_env_name_len()
+    facts, disk = HostFacts(total_mem_mib=64_000.0), tmp_path
+    assert check_admission(_ec2_stack(env), facts, disk, host_mem_mib=49_152.0).ok is True
+
+    monkeypatch.setenv("LIMA_HOME", "/Users/somebody-with-a-much-longer-name/.lima")
+    assert check_admission(_ec2_stack(env), facts, disk, host_mem_mib=49_152.0).ok is False
+
+
+def test_the_env_name_is_refused_ahead_of_a_memory_rejection(tmp_path, monkeypatch):
+    """Ordering, deliberately: an over-budget canvas can be applied after
+    freeing RAM, while this one can NEVER work as drawn -- so the terminal
+    problem is the one worth naming."""
+    env = _long_env(monkeypatch)
+    stack = Stack(env=env, resources=tuple(
+        ResourceDesired(id=f"web{i}", kind="ec2", fields={"instanceType": FieldValue(value="t3.medium")})
+        for i in range(20)
+    ))
+    result = check_admission(stack, HostFacts(total_mem_mib=64_000.0), tmp_path, host_mem_mib=8_192.0)
+    assert result.ok is False
+    assert "UNIX_PATH_MAX" in result.reason

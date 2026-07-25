@@ -62,6 +62,7 @@ import logging
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -106,7 +107,23 @@ NEBULA_PORT = 4242
 # a user's own unrelated Lima VM could collide the same way. Giving the
 # lighthouse a distinct port sidesteps the whole class: nothing in any guest
 # ever listens on 4342, so nothing can forward it out from under us.
+#
+# ...but ONE port for the whole machine was its own bug (field test 2 B8): a
+# lighthouse is PER ENV, so the second env to start one found 4342 held by the
+# first, `nebula` exited 1, and the failure was a single log line while /world
+# went on publishing that env's SG-gated mesh addresses. So 4342 is now only
+# the FIRST CANDIDATE of a reserved range, and each env records the port it
+# actually got in its own `overlay.json` (`MeshNetwork.lighthouse_port`, which
+# every member's `static_host_map` then embeds).
 LIGHTHOUSE_PORT = 4342
+# 100 ports, all of them in the same "nothing inside a guest listens here"
+# space as 4342 itself -- deliberately NOT the ephemeral range, where a Lima
+# guest's own outbound sockets (and therefore Lima's automatic port
+# forwarding) genuinely do land.
+LIGHTHOUSE_PORTS = range(LIGHTHOUSE_PORT, LIGHTHOUSE_PORT + 100)
+# An explicit pin, for reproducing a collision and for a user who needs a
+# specific port open. Honoured verbatim: no probing, no reallocation.
+_PORT_PIN_ENV = "ODIN_LIGHTHOUSE_PORT"
 
 # How long `ensure_started` waits, after spawning, to catch an IMMEDIATE
 # crash (bad cert/config, port already in use) before declaring success -- a
@@ -156,6 +173,65 @@ def _lock_for_dir(data_dir: Path) -> threading.Lock:
     key = str(Path(data_dir).resolve())
     with _overlay_locks_guard:
         return _overlay_locks.setdefault(key, threading.Lock())
+
+
+def _pinned_port() -> int | None:
+    pin = os.environ.get(_PORT_PIN_ENV)
+    return int(pin) if pin and pin.isdigit() else None
+
+
+def _bindable(family: int, port: int) -> bool:
+    try:
+        with socket.socket(family, socket.SOCK_DGRAM) as sock:
+            sock.bind(("", port))
+    except OSError:
+        return False
+    return True
+
+
+def _port_free(port: int) -> bool:
+    """Can a UDP listener own this port right now, in every family a Go
+    listener would take? (`nebula`'s `listen.host: 0.0.0.0` came up as
+    `UDP *:4342` on IPv6 in the field, so testing IPv4 alone would have missed
+    the very collision this exists to prevent.) No SO_REUSE* is set, so the
+    answer is as strict as nebula's own bind. IPv6 is skipped entirely on a
+    host without it, rather than making every port look taken."""
+    families = (socket.AF_INET, socket.AF_INET6) if socket.has_ipv6 else (socket.AF_INET,)
+    return all(_bindable(family, port) for family in families)
+
+
+def _ports_taken_by_other_envs(root: Path, env: str) -> set[int]:
+    """Ports other envs in THIS store have already recorded. A live
+    lighthouse's port is caught by `_port_free` anyway; this is for the env
+    whose lighthouse happens to be DOWN right now -- claiming its port would
+    just move the collision into its next Apply."""
+    return {
+        overlay.lighthouse_port
+        for path in sorted(Path(root).glob("*/nebula/overlay.json"))
+        if path.parent.parent.name != env
+        and (overlay := MeshNetwork.model_validate_json(path.read_text())).lighthouse_port
+    }
+
+
+def allocate_lighthouse_port(root: Path, env: str) -> int:
+    """This env's own lighthouse port: the first candidate in
+    `LIGHTHOUSE_PORTS` that no other env in the store has claimed and that a
+    UDP socket can actually bind. Serialized on the STORE root (not the env
+    dir) because the whole point is that two envs applying concurrently must
+    not pick the same one."""
+    pin = _pinned_port()
+    if pin is not None:
+        return pin
+    with _lock_for_dir(root):
+        taken = _ports_taken_by_other_envs(root, env)
+        free = [port for port in LIGHTHOUSE_PORTS if port not in taken and _port_free(port)]
+    if not free:
+        log.warning(
+            "no free lighthouse port in %s-%s for env %r; falling back to %s (a collision is possible)",
+            LIGHTHOUSE_PORTS.start, LIGHTHOUSE_PORTS.stop - 1, env, LIGHTHOUSE_PORT,
+        )
+        return LIGHTHOUSE_PORT
+    return free[0]
 
 
 class NebulaManager:
@@ -233,6 +309,7 @@ class NebulaManager:
         pki: CertPaths | None = None,
         tun_disabled: bool = False,
         relay_enabled: bool = False,
+        lighthouse_port: int | None = None,
     ) -> str:
         """`pki=None` (the default, unchanged): the VM-side fixed paths a
         node's own cloud-init writes its cert to (`/etc/nebula/...`). A REAL
@@ -264,7 +341,13 @@ class NebulaManager:
         use_relays: false}` (offers to relay, never needs one itself), every
         VM member gets `relay: {use_relays: true, relays: [lighthouse_ip]}`
         (`lighthouse_ip` doubles as the relay's address -- one node, two
-        roles)."""
+        roles).
+
+        `lighthouse_port` (field test 2 B8): the port THIS env's lighthouse
+        owns -- what it binds when `is_lighthouse`, and what every member
+        dials it on. `None` keeps the historical machine-global 4342, which is
+        what an `overlay.json` written before per-env ports existed means."""
+        port = lighthouse_port or LIGHTHOUSE_PORT
         config: dict = {
             "pki": {
                 "ca": str(pki.ca_crt) if pki else "/etc/nebula/ca.crt",
@@ -273,8 +356,9 @@ class NebulaManager:
             },
             "lighthouse": {"am_lighthouse": is_lighthouse},
             # The lighthouse gets its OWN port (see LIGHTHOUSE_PORT's comment:
-            # Lima steals the host's 4242 for a VM's own nebula listener).
-            "listen": {"host": "0.0.0.0", "port": LIGHTHOUSE_PORT if is_lighthouse else NEBULA_PORT},
+            # Lima steals the host's 4242 for a VM's own nebula listener), and
+            # its own per ENV (B8).
+            "listen": {"host": "0.0.0.0", "port": port if is_lighthouse else NEBULA_PORT},
             "firewall": {
                 "inbound": [_rule_to_dict(r) for r in firewall.inbound],
                 "outbound": [_rule_to_dict(r) for r in firewall.outbound],
@@ -288,7 +372,7 @@ class NebulaManager:
                 else {"use_relays": True, "relays": [lighthouse_ip]}
             )
         if not is_lighthouse:
-            config["static_host_map"] = {lighthouse_ip: [f"{lighthouse_underlay}:{LIGHTHOUSE_PORT}"]}
+            config["static_host_map"] = {lighthouse_ip: [f"{lighthouse_underlay}:{port}"]}
             config["lighthouse"]["hosts"] = [lighthouse_ip]
             # Advertise ONLY the vzNAT address to the lighthouse. A Lima VM
             # has three local addresses and two of them poison discovery:
@@ -412,11 +496,16 @@ def ensure_network(root: Path, env: str, lighthouse_underlay: str, runner=None) 
     Locked (see `_lock_for_dir`'s module-level docstring): two VMs booting
     concurrently in the same env must not both see `manager._ca_crt.exists()`
     as False and race to create/sign the CA, nor race on persisting
-    `lighthouse_underlay_ip`."""
+    `lighthouse_underlay_ip`.
+
+    Also where this env's own lighthouse PORT is allocated (field test 2 B8) --
+    once, HERE, before any member config can embed it, and sticky from then
+    on."""
     manager = NebulaManager(_nebula_dir(root, env), runner=runner)
     with _lock_for_dir(manager._dir):
         overlay = manager.load_overlay() or MeshNetwork(network=env)
         overlay.lighthouse_underlay_ip = lighthouse_underlay
+        overlay.lighthouse_port = overlay.lighthouse_port or allocate_lighthouse_port(root, env)
         if not manager._ca_crt.exists():
             manager.create_ca(env)
             manager.sign_cert("lighthouse", f"{overlay.lighthouse_ip}/{overlay.mask}", groups=["lighthouse"])
@@ -506,12 +595,57 @@ class LighthouseManager:
             return True
         return True
 
+    def _usable_port(self, root: Path, env: str, manager: NebulaManager, overlay: MeshNetwork | None) -> int:
+        """This env's recorded port -- unless something else on the machine is
+        holding it, in which case take a fresh one and RECORD it, so the
+        members that regenerate their configs (every sidecar, on the next
+        `ensure`) follow us there.
+
+        This is the B8 fix's teeth: the alternative is what the field saw --
+        `nebula` exiting 1 on a port another env already owned, and an env
+        whose whole mesh silently never worked. An explicit
+        `ODIN_LIGHTHOUSE_PORT` pin is honoured as given (the user asked for
+        that port; if it is busy they get the honest immediate-exit warning
+        below)."""
+        recorded = (overlay.lighthouse_port if overlay else None) or LIGHTHOUSE_PORT
+        if _pinned_port() is not None or _port_free(recorded):
+            return recorded
+        fresh = allocate_lighthouse_port(root, env)
+        log.warning(
+            "lighthouse port %s for env %r is already in use; moving this env to %s "
+            "(mesh members pick it up on their next re-join)", recorded, env, fresh,
+        )
+        # No lock of its own: every caller reaches this while already holding
+        # THIS env's nebula-dir lock (`ensure_started`), which is what makes
+        # "read the port, maybe move it, spawn, write the pidfile" one critical
+        # section instead of a race.
+        current = manager.load_overlay()
+        if current is not None:
+            current.lighthouse_port = fresh
+            manager.save_overlay(current)
+        return fresh
+
     def ensure_started(self, root: Path, env: str, underlay: str) -> bool:
         """Idempotent no-op if already running. Never raises -- returns
         False when the network isn't bootstrapped yet, `nebula` isn't on
         PATH, or it exits immediately (bad cert/config); the caller logs and
         moves on rather than failing an otherwise-successful instance boot
-        over mesh wiring."""
+        over mesh wiring.
+
+        SERIALIZED PER ENV, and that is load-bearing: two VMs in one env boot
+        on their own threads (`compute/instances.py::_activate_nebula`) and a
+        backing can join at the same moment (`fabric/sidecar.py`), so without
+        this both can see `is_running()` False and spawn. That used to be
+        self-limiting -- the loser lost the bind on the one fixed port and
+        exited -- but with a per-env port the loser would instead MOVE the env
+        to a fresh port, spawn a second lighthouse, and overwrite the winner's
+        pidfile, leaking the winner (found by a stray `nebula` process after a
+        two-VM integration test). Inside the lock the loser simply sees a
+        running lighthouse and returns True."""
+        with _lock_for_dir(_nebula_dir(root, env)):
+            return self._start_locked(root, env, underlay)
+
+    def _start_locked(self, root: Path, env: str, underlay: str) -> bool:
         if self.is_running(root, env):
             return True
         manager = NebulaManager(_nebula_dir(root, env), runner=self._run)
@@ -525,9 +659,11 @@ class LighthouseManager:
             return False
         overlay = manager.load_overlay()
         lighthouse_ip = overlay.lighthouse_ip if overlay else MeshNetwork(network=env).lighthouse_ip
+        port = self._usable_port(root, env, manager, overlay)
         config_text = manager.generate_config(
             lighthouse_ip=lighthouse_ip, lighthouse_underlay=underlay,
             firewall=DEFAULT_FIREWALL, is_lighthouse=True, pki=cert, tun_disabled=True, relay_enabled=True,
+            lighthouse_port=port,
         )
         config_path = self._config_path(root, env)
         atomic_write_text(config_path, config_text)
@@ -551,14 +687,15 @@ class LighthouseManager:
             time.sleep(0.05)
         if proc.poll() is not None:
             log.warning(
-                "nebula lighthouse exited immediately for env %r (exit %s); see %s",
-                env, proc.returncode, log_path,
+                "nebula lighthouse exited immediately for env %r on UDP %s (exit %s); see %s -- "
+                "this env's mesh endpoints will report unreachable rather than being advertised",
+                env, port, proc.returncode, log_path,
             )
             return False
         pidfile.write_text(str(proc.pid))
         log.info(
-            "started nebula lighthouse for env %r (pid %s, underlay %s, unprivileged, tun disabled)",
-            env, proc.pid, underlay,
+            "started nebula lighthouse for env %r (pid %s, underlay %s:%s, unprivileged, tun disabled)",
+            env, proc.pid, underlay, port,
         )
         return True
 
@@ -634,7 +771,7 @@ def mesh_state(root: Path, env: str, world: World | None = None) -> MeshState:
     return MeshState(
         network=overlay.network, base_cidr=overlay.base_cidr,
         lighthouse_ip=overlay.lighthouse_ip, lighthouse_underlay=overlay.lighthouse_underlay_ip,
-        lighthouse_running=lighthouse_running,
+        lighthouse_running=lighthouse_running, lighthouse_port=overlay.lighthouse_port,
         hosts=hosts, resources=resources, vpcs=vpcs, security_groups=security_groups,
     )
 

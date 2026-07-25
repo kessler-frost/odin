@@ -25,6 +25,19 @@ from __future__ import annotations
 from pathlib import Path
 
 from odin.agent.hcl import TfProject
+from odin.util import (
+    SECRET_FILE_MODE,
+    atomic_write_bytes,
+    atomic_write_text,
+    ensure_private_file,
+    private_mkdir,
+)
+
+# tofu's own state files. Neither is ever written by odin -- they are
+# pre-CREATED 0600 (see `ensure_private_file`) so tofu's in-place rewrite
+# inherits the mode on every apply, instead of a one-time chmod that the very
+# next apply would undo.
+_TOFU_STATE_FILES = ("terraform.tfstate", "terraform.tfstate.backup")
 
 # Exactly the four verified `skip_*` provider args (research §1 --
 # `skip_requests_validation` is NOT a real argument) + `s3_use_path_style`
@@ -59,11 +72,34 @@ def materialize(root: Path, env: str, project: TfProject) -> Path:
     lambda node's zip'd deployment package, referenced by `filename` from
     its own aws_lambda_function block) + the generated override.tf into the
     env's TF workspace, creating it if needed. Returns the workspace dir."""
-    workspace = tf_dir(root, env)
-    workspace.mkdir(parents=True, exist_ok=True)
+    workspace = private_mkdir(tf_dir(root, env))
     for name, content in project.files.items():
-        (workspace / name).write_text(content)
+        atomic_write_text(workspace / name, content, mode=SECRET_FILE_MODE)
     for name, content in project.binary_files.items():
-        (workspace / name).write_bytes(content)
-    (workspace / "override.tf").write_text(OVERRIDE_TF)
+        atomic_write_bytes(workspace / name, content, mode=SECRET_FILE_MODE)
+    atomic_write_text(workspace / "override.tf", OVERRIDE_TF, mode=SECRET_FILE_MODE)
+    _lock_down(workspace)
     return workspace
+
+
+def _lock_down(workspace: Path) -> None:
+    """0600 for everything in the workspace, on every materialize.
+
+    `main.tf` carries every canvas secret in cleartext (SECURITY.md: the
+    generated Terraform is a legitimate home for the plaintext, precisely
+    because tofu has to send it) and `terraform.tfstate` carries the same
+    values back from the provider -- both were 0644 in v0.7.0, which voided
+    the file-mode argument for exactly the files that matter.
+
+    Two moves, because two different processes write here. odin's own files get
+    their mode at write time above. tofu's files get the state pair
+    pre-created 0600 (its rewrites are in-place, so that mode persists), plus a
+    sweep of whatever else it may have dropped in the workspace this run (a
+    `tfplan`, a `generated.tf`, a crash log). `.terraform/`'s provider cache is
+    deliberately skipped: hundreds of downloaded plugin files, no secrets, and
+    re-chmod'ing them on every apply would be pure waste.
+    """
+    for name in _TOFU_STATE_FILES:
+        ensure_private_file(workspace / name)
+    for path in (p for p in workspace.iterdir() if p.is_file()):
+        path.chmod(SECRET_FILE_MODE)

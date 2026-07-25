@@ -88,12 +88,29 @@ def test_image_exists_inspects_through_the_vm():
 def test_logs_runs_nerdctl_logs_tail_in_the_vm():
     # LimaRuntime.logs is inherited from _ContainerRuntime unchanged -- this
     # locks its exact command shape now that observability code depends on it.
+    # `--timestamps` is what lets the two streams be merged chronologically
+    # (field test 2, HIGH-3).
     runner = FakeRunner()
     runner.responses["nerdctl logs"] = _Proc(0, "line1\nline2\n")
     rt = LimaRuntime(runner=runner)
     assert rt.logs("job", tail=5) == "line1\nline2"
     logs_call = next(c for c in runner.calls if "logs" in c)
-    assert logs_call == ["limactl", "shell", "odin-host", "sudo", "nerdctl", "logs", "--tail", "5", "job"]
+    assert logs_call == [
+        "limactl", "shell", "odin-host", "sudo", "nerdctl", "logs", "--timestamps", "--tail", "5", "job",
+    ]
+
+
+def test_logs_in_the_vm_keeps_the_containers_stderr_half_too():
+    # The nerdctl side of field test 2's HIGH-3: an nginx/Postgres inside the
+    # shared VM logs to stderr, and `limactl shell` hands that back on ITS
+    # stderr.
+    runner = FakeRunner()
+    runner.responses["nerdctl logs"] = _Proc(
+        0,
+        "2026-07-25T14:00:01.000000000Z started\n",
+        "2026-07-25T14:00:02.000000000Z crashed: bad config\n",
+    )
+    assert LimaRuntime(runner=runner).logs("job").splitlines() == ["started", "crashed: bad config"]
 
 
 def test_image_exists_false_on_dockers_empty_array_stdout():

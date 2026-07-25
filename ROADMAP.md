@@ -109,17 +109,54 @@ future decision against these points instead of re-deriving them:
     are `launch_type = "EC2"` / `network_mode = "bridge"`, which need none);
     a task that dies between API calls isn't auto-replaced until the next
     Apply reconciles the service. Generated services set
-    `wait_for_steady_state = true` with a bounded `timeouts.create` (v0.5.4,
+    `wait_for_steady_state = true` with a bounded `timeouts` block (v0.5.4,
     finding #3) so a bad image / crash-on-start fails apply fast and honestly
     instead of silently "succeeding" with a service that never runs — the
     trade-off is that a genuinely slow FIRST image pull that exceeds the
-    timeout also fails apply (a retry re-uses the now-cached image). (Fixed: a
+    timeout also fails apply (a retry re-uses the now-cached image). That guard
+    covered CREATE but was **inert on UPDATE** until v0.7.1 (field test 2,
+    finding B1): terraform-provider-aws's steady-state waiter keys on
+    `len(deployments) == 1 && desiredCount == runningCount`, and a
+    revision-blind `runningCount` counted the STALE tasks at the instant
+    UpdateService returned, so a typo'd image tag reported `applied / tf: ok`
+    in 2.3s while every healthy task was destroyed. `runningCount` (service and
+    PRIMARY deployment alike) now counts only tasks on the service's CURRENT
+    task definition — real ECS's own definition of a deployment's
+    runningCount — so a bad-image update fails apply inside `timeouts.update`
+    and the real `docker` error naming the image is carried on the deployment's
+    `rolloutStateReason`, an ECS service event, the task's `stoppedReason` and
+    the node's World verdict
+    (`tests/simulate/test_ecs_bad_image_update_e2e.py`).
+    **Deliberate deviation, recorded:** real AWS's SERVICE-level runningCount
+    also counts draining old-revision tasks, but it distinguishes them with a
+    SECOND deployment record, which odin does not model — with one deployment
+    record, current-revision-only is the sole self-consistent choice.
+    **Residual gap, stated plainly:** odin retires the stale tasks before
+    launching replacements, so a failed image update still takes the service to
+    zero until the next Apply (real ECS's `minimumHealthyPercent = 100` keeps
+    the old tasks serving). Closing that needs the World projection to
+    distinguish "serving the previous revision" from "healthy", or a service
+    running old tasks would report `healthy` while its deployment failed — a
+    worse lie than the outage. The apply now FAILS loudly either way, so CI
+    stops instead of scoring the outage green. (Fixed: a
     `tags` block on `aws_ecs_service` now plans zero-drift — the gateway stores
     the full tag set and echoes it back, with
     `TagResource`/`UntagResource`/`ListTagsForResource` modeled.)
   - SNS→SQS live-edit: FIXED (v0.5.0) — adding a subscription edge to an
     already-healthy topic lands on the next Apply via the reconciler's
     observe pass (proven by real fanout to both queues).
+  - **Every odin-generated SNS→SQS subscription sets
+    `raw_message_delivery = true`, including on an import round trip where the
+    source didn't have it.** Stated here because it CHANGES DELIVERY SEMANTICS:
+    the queue receives the published body verbatim instead of SNS's JSON
+    envelope, so a consumer that parses `Message` out of an envelope will not
+    find one. It is deliberate and load-bearing rather than cosmetic — the
+    reconciler's own `provision()` path subscribes with
+    `Attributes={"RawMessageDelivery": "true"}` (`aws/backings.py`) and goaws
+    honours it, so dropping it from the generated HCL would make a
+    tofu-applied stack deliver differently from an `/apply`-provisioned one.
+    A source `.tf` that wants the envelope has no way to say so today; the
+    round trip will add the attribute back (v0.7.1, field test U3).
   - ElastiCache (W2.8): **single node, redis only.** `aws_elasticache_cluster`
     is real — a `redis:7-alpine` container per cluster, its published port
     advertised as the cluster's node endpoint, zero-drift re-plan — but
@@ -140,7 +177,34 @@ future decision against these points instead of re-deriving them:
     yet gate host containers either. Endpoint reachability is per-consumer the
     same way RDS's is: a container consumes `${{cache.REDIS_URL}}`
     (`host.docker.internal`), an EC2 (Lima VM) consumer must use
-    `${{cache.REDIS_URL_VM}}` (`host.lima.internal`).
+    `${{cache.REDIS_URL_VM}}` (`host.lima.internal`) — and "consumes" is
+    literal since v0.7.1: see **Canvas wiring** below. Both are the raw
+    published host port and **neither is SG-gated** (see the RDS "which fact
+    is gated" note below); ElastiCache publishes no mesh fact at all, so a
+    cache currently has no gated path.
+  - **An UNSCOPED list/describe call is denied even with an edge drawn.** A
+    workload with an `rds` edge can call
+    `DescribeDBInstances(DBInstanceIdentifier="db")` but NOT bare
+    `DescribeDBInstances()`; likewise `DescribeCacheClusters(CacheClusterId=…)`
+    versus `DescribeCacheClusters()`. Both services behave identically, and
+    the deny happens in `app.py` before either model is reached.
+    **The mechanism, precisely** (re-verified against the code in v0.7.1, and
+    worth stating because the intuitive explanation is not quite what
+    happens): a call that names no resource classifies to the LITERAL resource
+    `"*"` (`classify.py::_rds_resource` / `_classify_elasticache`), while an
+    IAM edge compiles to a statement naming one literal node label
+    (`policy.py::compile_policies`). Wildcards are expanded on the STATEMENT
+    side only, so `"db"` does not match the string `"*"` and default-deny
+    applies. The same fallback is why `tofu` is never blocked: the operator's
+    statement really is `*`/`*`, which matches anything including `"*"`.
+    **The denial names the action but never the resource** —
+    `User is not authorized to perform: rds:DescribeDBInstances` — which is
+    exactly why it reads as a contradiction: you are told the action you hold
+    an edge for was denied, with no hint that the resource resolved to `"*"`.
+    That, not the policy decision, is what cost a field tester a confusing
+    hour. Written down rather than fixed: naming the resource is the intended
+    usage, and the endpoint you actually want is also published as a World
+    fact (`${{db.DATABASE_URL}}` and friends).
   - RDS is Terraform-managed (W2.7 — this used to read "RDS stays off
     Terraform"): an `rds` node compiles to `aws_db_instance`, and the gateway's
     own RDS model (`gateway/models/rdsctl.py`) fulfils CreateDBInstance with
@@ -178,6 +242,31 @@ future decision against these points instead of re-deriving them:
     can't resolve the container-host alias. odin publishes BOTH facts (v0.5.4,
     finding #5); picking the right one per consumer type is manual — automatic
     ref-routing by consumer kind is deferred.
+    - **WHICH FACT IS GATED — read this before choosing one.**
+      `DATABASE_URL` and `DATABASE_URL_VM` are the SAME raw published host
+      port, reached by two different host aliases, and **security groups do
+      NOT gate either of them**. `DATABASE_URL_MESH` is the overlay address,
+      and it is **the only one a drawn security group governs**. So on a
+      canvas with a VPC, a VM that a `db-sg` correctly refuses on the mesh
+      still reaches the identical Postgres through `DATABASE_URL_VM` — field
+      test 2 MEDIUM-5, where the fact named after the consumer type was the
+      one that defeated the security group. **If the env has a mesh, a VM
+      consumer should use `${{db.DATABASE_URL_MESH}}`**; `_VM` remains
+      published (removing it would break existing canvases, and it is the
+      right answer for an env with no VPC drawn) but it is the ungoverned
+      path, deliberately, for the same additive reason as the host port
+      itself. The same applies verbatim to `REDIS_URL_VM` — and ElastiCache
+      has no mesh fact at all yet, so on a VM there is currently no gated
+      path to a cache.
+    - **The published host port is NOT stable across recreation.** It is
+      ephemeral (`ports={5432: 0}`), so a `docker kill` + recovery Apply
+      mints a new one (observed: 33363 → 33371) and both `DATABASE_URL` and
+      `DATABASE_URL_VM` change with it. Anything baked in at VM boot time
+      from `_VM` silently points at nothing after a database recovers, and
+      there is no re-injection path — so re-Apply the consumer, or use
+      `DATABASE_URL_MESH`, whose overlay IP and port (5432) are BOTH sticky
+      across recreation. Stabilising the host port is not planned: the mesh
+      address is the stable one by design.
   - Security groups: what IS enforced (W2.6) and what is not.
     - **EC2 VMs**: an instance's ASSIGNED security groups gate its overlay
       traffic — the UNION of their compiled rules is its nebula firewall
@@ -187,6 +276,26 @@ future decision against these points instead of re-deriving them:
       difference is their drawn SG: one port allowed, the same port refused
       on the other, and a third port allowed in the refusing direction to
       rule out a dead tunnel (`tests/simulate/test_ec2_assigned_sg_e2e.py`).
+      - **Editing a group's RULES reaches instances that are already
+        running** — this used to be false, and silently so (field test 2
+        HIGH-1: Apply said `applied`, the gateway had the new rule, and the
+        running VM kept its boot-time firewall forever, so two VMs in one
+        drawn group enforced different rules on the wire). Every Apply now
+        re-renders each running instance's nebula config and, when it really
+        changed, pushes it and makes the daemon adopt it: a **SIGHUP** for a
+        firewall-only edit — nebula reloads firewall rules in place, so live
+        tunnels are never dropped — and a restart for anything a reload
+        cannot cover (only a moved lighthouse port does that, and there the
+        tunnel is already dead). Unchanged rules cost one local file
+        comparison: no `limactl`, no signal. Proven on two real VMs with the
+        previously-blocked port probed before and after on the SAME instance,
+        `NRestarts=0` and an unchanged `ActiveEnterTimestamp` across the edit
+        (`tests/simulate/test_sg_edit_propagation_e2e.py`).
+      - **Moving an instance BETWEEN groups still needs a recreate.** An
+        instance's group MEMBERSHIP is baked into its nebula certificate at
+        first join, and changing it means re-signing and re-distributing that
+        cert. Rule edits propagate; membership edits do not — the same limit
+        `fabric/sidecar.py` records for backings.
     - **RDS**: the Postgres container is a REAL mesh member (a nebula
       companion container shares its network namespace, so the stock upstream
       image answers on an overlay IP), gated by the SG its canvas node names
@@ -199,14 +308,52 @@ future decision against these points instead of re-deriving them:
       `psql` succeeds for the in-group member and times out for the other).
       The DB publishes the gated address as `${{db.DATABASE_URL_MESH}}` /
       `endpoint_mesh`, alongside (not instead of) the host-reachable pair.
+    - **A `*_MESH` fact is now VERIFIED before it is published**, because for
+      one release it wasn't: every health probe in odin dials the published
+      HOST port, so a mesh endpoint that had been dead for minutes was still
+      advertised beside a `healthy` badge (field test 2 HIGH-2/B8, twice, from
+      two different causes). `reconcile/mesh_health.py` checks, on a sweep
+      cadence (`ODIN_MESH_SWEEP_SECONDS`, default 30s; failures re-checked
+      every 5s), that the env's lighthouse is alive, that the resource's mesh
+      sidecar is running IN THE CURRENT container's network namespace, and
+      that the overlay address itself answers — the last via one bounded
+      `nc -z` run from inside the member's own namespace, the only rootless
+      place a check can stand (the Mac is deliberately not a data-plane mesh
+      member). When it fails, the `*_MESH` facts are WITHHELD and the resource
+      reports `crashed` with the reason; the host path is untouched. It costs
+      nothing for a resource that publishes no mesh fact. What it does NOT
+      prove: that a specific peer is allowed in — that's the SG's job, and a
+      refusal there is policy, not a fault.
+    - **One lighthouse port per ENV, not per machine.** It used to be a single
+      fixed 4342, so the second env to start a lighthouse lost the bind, its
+      `nebula` exited 1 with only a log line, and its whole mesh silently
+      never worked. Each env now allocates its own port from 4342–4441
+      (recorded in its `overlay.json`, reported by `GET /mesh` as
+      `lighthouse_port`, embedded in every member's `static_host_map`), skips
+      ports other envs in the store hold, and moves itself if the recorded one
+      has since been taken. `ODIN_LIGHTHOUSE_PORT` pins it. Still rootless.
+      A move reaches every member: sidecars re-join on the changed config, and
+      already-running VMs are pushed the new `static_host_map` and RESTARTED
+      by the same Apply-time refresh the SG-edit fix added (a restart, not a
+      SIGHUP, because nebula does not reload that section — and a member whose
+      lighthouse moved has no working tunnel to lose).
+    - **EC2 nodes publish addresses too** (they published nothing before):
+      `${{web1.PRIVATE_IP}}` (host-reachable, ungated) and
+      `${{web1.MESH_IP}}` (the SG-gated overlay address, sticky across
+      recreation). `MESH_IP` is held to the same standard as `*_MESH` above —
+      withheld when the env's lighthouse is down. For a VM that lighthouse
+      check is ALL that is verified: its nebula is a systemd unit inside a
+      Lima VM, and a `limactl shell` per VM per sweep is not a tick's price.
     - **RESIDUAL GAP, stated plainly: the raw host port is still open and
       SGs do NOT gate it.** Mesh membership is ADDITIVE — every backing keeps
       its published Docker port, because the gateway forwards AWS calls to
       it, odin's own health probes use it, host-side clients (tests, psql,
       boto3) use it, and `${{node.VAR}}` facts publish it. So anything that can
       already dial `127.0.0.1:<published port>` (any process on your Mac, any
-      container that can reach the host) still reaches Postgres with no SG in
-      the path. Only the overlay path is governed. Closing the host path
+      container that can reach the host, **and any EC2 Lima VM via
+      `host.lima.internal:<published port>` — i.e. exactly what the
+      `DATABASE_URL_VM` fact hands a VM consumer**) still reaches Postgres
+      with no SG in the path. Only the overlay path is governed. Closing the host path
       would mean making the Mac itself a data-plane mesh member, i.e. a host
       `tun` device, i.e. root/sudoers — rejected (see the Nebula bullet).
       On a local-first single-Mac tool the host is already inside the trust
@@ -230,6 +377,27 @@ future decision against these points instead of re-deriving them:
     the same CWD-relative `.odin` store (the second binds-conflicts on the
     gateway port and would resume/reconcile the first's envs). Run a second
     instance only from a separate working directory with its own store.
+    - **`ODIN_REAP_EC2_VMS=0` is what makes that second instance actually
+      safe** (v0.7.1, field test U7). On startup odin deletes every Lima VM
+      named `odin-ec2-*` that no env's store expects — and a second instance's
+      store expects NONE of the first's, so it would reap them all. Until
+      v0.7.1 the only seam was the `create_app(reap_ec2_vms=False)` keyword,
+      so the documented "run a second instance" advice meant bypassing the
+      `odin` CLI with a hand-written factory wrapper. The variable is read
+      inside the reaper itself (`gateway/models/ec2compute.py`), so it holds
+      for `odin start`, a bare `uvicorn`, and any other caller alike.
+      Accepts `0`/`false`/`no`/`off`; **anything else, including unset or a
+      typo, leaves the reaper ON** — a safety net you disabled by mistyping
+      is not a safety net.
+    - **What you give up:** the crash-recovery backstop. The reaper exists
+      for the window where odin dies between `vm.delete` succeeding and the
+      store update landing; with it off, that leftover VM stays on disk
+      burning memory and disk until you `limactl delete` it by hand. It is
+      the ONLY thing the reaper does — it never touches a VM some env's store
+      still expects, and only ever considers names matching odin's own
+      `odin-ec2-` convention, so your own Lima VMs were never at risk either
+      way. Leave it ON unless a second odin (or another agent's VMs) shares
+      the machine.
   - Nebula: single-host mesh is REAL end-to-end — a real host lighthouse
     process (`fabric/nebula.py::LighthouseManager`) and a real `nebula`
     daemon inside every VPC-joined EC2 VM, the VPC's compiled SG firewall
@@ -277,6 +445,59 @@ future decision against these points instead of re-deriving them:
     SG-rule-filtered connection — the host itself has no overlay presence
     to test from. Cross-Mac reachability (a second machine's mesh) is still
     open — see M7.
+- [x] **Canvas wiring — a node's `env` actually reaches its container.** An
+  `ecs` or `lambda` node's `env` map (static entries plus
+  `${{producer.ATTR}}` references) is delivered into the REAL container. Until
+  v0.7.1 the two bullets above ("a container consumes `${{cache.REDIS_URL}}`",
+  "a CONTAINER consumes `${{db.DATABASE_URL}}`") were **not achievable**: both
+  field-test agents confirmed the map was silently dropped — `spec/translate.py`
+  parsed it and lifted refs onto `ResourceDesired.refs`, but `agent/hcl.py`
+  emitted no `environment` block at all, `fabric.resolve` had no production
+  caller, and the container came up with the four `AWS_*` vars and nothing else.
+  So you could provision the whole production stack with no canvas-driven way
+  to hand the app its connection strings. Proven end to end by
+  `tests/simulate/test_ecs_env_wiring_e2e.py`: a real ECS task container speaks
+  a real Postgres SSLRequest and a real Redis `PING` to the addresses its
+  canvas `env` refs resolved to.
+  - **Injected at container LAUNCH, not through the generated HCL**
+    (`gateway/wiring.py`), on the same seam that already injects the workload's
+    issued gateway credentials, keyed off the `odin:node` tag. A resolved
+    `DATABASE_URL` carries the database password, so putting it in
+    `container_definitions`/`environment` would write it in plaintext into
+    `main.tf` AND `terraform.tfstate`; it would also drift on every plan (the
+    value embeds a Docker-assigned host port) and freeze a stale port into
+    state. Facts come from the gateway's own live records, not from World,
+    because World is not written until the reconciler's next tick — after the
+    apply that creates both nodes.
+  - **Ordering** comes from a real `depends_on` on the consumer's resource —
+    the one thing an interpolated value would have given for free — so it
+    carries no values.
+  - **A ref that cannot be resolved fails honestly**, never an empty string: the
+    ECS task goes STOPPED / the Lambda `State: Failed` with a reason naming the
+    variable, the producer and what the producer does publish, which surfaces as
+    a `crashed` node with that verdict AND (since the service stays short of
+    desired) a FAILED apply. A ref naming a node that isn't on the canvas at all
+    is reported in the apply response's `unsupported` at build time.
+  - **v1 limits, recorded rather than hidden:** there is still no `env` editor
+    in the UI's ConfigPanel for an ecs node — the map must be authored in the
+    canvas JSON (`odin canvas set`). Only `rds`, `elasticache`, `alb` and
+    `ec2` publish facts the injector resolves, so only those can be referenced
+    from `env`. **`ec2` was the one that had to be added afterwards**: the
+    mesh work published `${{web1.PRIVATE_IP}}` / `${{web1.MESH_IP}}` into
+    World and the wiring work built the injector IN PARALLEL, coordinating
+    only on the names — so for one release the facts demonstrably existed and
+    no workload could consume them. The injector now applies the projection's
+    own gates verbatim (running-only, `odin:node`-tagged, and
+    `reconcile/mesh_health.py` deciding whether `MESH_IP` survives), so a ref
+    resolves exactly when `/world` shows that fact — and a withheld `MESH_IP`
+    (dead lighthouse) fails the ref honestly rather than injecting an empty or
+    stale address. Values are read at LAUNCH,
+    so editing a node's `env` only reaches a task once that task is replaced
+    (real ECS behaves the same way — a taskdef change forces a new deployment);
+    a re-Apply that changes nothing tofu can see will not restart it.
+    `ResourceDesired.refs` does not record whether a ref came from `env` or from
+    a top-level field, so a top-level `${{...}}` field also arrives as an env
+    var named after that field.
 - [x] **CloudWatch Logs — the log sink (W2.1).** DONE 2026-07-24: the `logs`
   node is real. `aws_cloudwatch_log_group` is a full gateway model
   (Create/Delete/DescribeLogGroups, Put/DeleteRetentionPolicy, tag CRUD →
@@ -436,6 +657,44 @@ future decision against these points instead of re-deriving them:
   - The proxy container is NOT covered by W2.2's drift sweep yet — `docker rm`
     it out of band and the load balancer still reports `active` until the next
     Apply re-converges it.
+- **ONE account id, everywhere** — `000000000000` (`aws/backings.py::ACCOUNT`).
+  `sts:GetCallerIdentity` reports exactly the account that appears inside every
+  ARN odin builds, so the ordinary workload pattern (ask STS who you are, build
+  an ARN from the answer) builds an ARN odin recognises. FIXED in v0.7.1: STS
+  used to answer with a per-env sha256-derived id
+  (`gateway/synth.py::account_for_env`, e.g. `561031708110`) while every ARN
+  used `ACCOUNT`, so that pattern silently produced unmatchable ARNs (v0.7.0
+  field test, U6). Unified toward `ACCOUNT` rather than making ARNs per-env
+  because nothing in odin needs per-env account ids — envs are already isolated
+  by their own stores and backing containers — and ~15 modules bake `ACCOUNT`
+  into ARNs. The TF provider never noticed either way
+  (`skip_requesting_account_id = true`); only workload STS callers did.
+- **`tofu` runs are BOUNDED, and a wedged destroy says why.** `init`/`apply`
+  each get `ODIN_TOFU_TIMEOUT` (default 600s); `destroy` gets a smaller
+  WHOLE-CALL deadline, `ODIN_TOFU_DESTROY_TIMEOUT` (default 300s, `init`
+  included), after which the process GROUP is killed and the failure tail names
+  the cause plus the recovery (v0.7.1, field test 2 finding B6 — a destroy on a
+  restored env was killed by hand at 8m26s with no progress).
+  - **Why a destroy used to wedge, and the real fix:** `tofu destroy` has to
+    REACH the backings its resources live in (an s3 bucket is deleted by a real
+    DeleteBucket forwarded to RustFS), but `/destroy` never booted them. With no
+    registered backing port the gateway answers every call with a real
+    `503 ServiceUnavailable`, which aws-sdk-go-v2 treats as retryable: ~25
+    attempts with exponential backoff per call, none of which prints anything on
+    tofu's stdout — hence a silent hang. `/destroy` now runs the same
+    `ensure_backings` phase `/apply-full` does, so **destroy-first on a restored
+    env just works** instead of needing a manual Apply first. It runs inside the
+    reconciler's `hold()`, spanning ensure + the whole destroy + the empty-Stack
+    commit, so (a) no tick's gc can stop a backing mid-destroy and (b) the very
+    first tick afterwards gc's every backing the ensure started — nothing is
+    left running (`tests/api/test_apply.py`, with a destroy deliberately slower
+    than the poll interval).
+  - **A DOWN backing is no longer an authorization failure.** It fires its own
+    `on_unavailable` seam and lands as a `backing_unavailable` event (with the
+    service that is down and the recovery), instead of a `backing-unavailable`
+    `access_denied` — which was protocol-wrong (the policy check has already
+    passed; the answer is a 503) and polluted the exact stream a security review
+    reads for real denials.
 - **Recorded as UNSUPPORTED for now** (northstar directive 5's honesty rule):
   EKS, CloudFormation, autoscaling, and KMS (the `kms` catalog node is an
   unbacked placeholder — no substitute, no gateway model, and as of W2.6 it
@@ -462,11 +721,86 @@ future decision against these points instead of re-deriving them:
   process control (`start`/`stop`/`status`/`clean`/`doctor`) plus the full
   canvas surface (`canvas get/set`, `translate`, `apply`, `world`, `envs`,
   `events`, `tf`, `import-tf`, `destroy`, `keys issue`), all with `-o json`.
+- [x] **Backup/restore (W2.3) — control plane, not data.** `odin export` /
+  `odin import` tar one env's `.odin/<env>/` (Stack lineage + HEAD,
+  `world.json`, `keys.json`, the gateway's synth stores + lambda zips, the tofu
+  workspace INCLUDING `terraform.tfstate`; `tf/.terraform/`'s provider cache is
+  the one deliberate exclusion). Both work with the server DOWN, which is the
+  whole point. What that means precisely:
+  - **Data-plane state is NOT in the archive.** Restore + Apply gives you fresh
+    backing containers matching the archived desired state: a bucket comes back
+    empty, an RDS table you created is gone.
+  - **One asymmetry worth knowing** (v0.7.1, field test): **CloudWatch
+    log-group events SURVIVE** an export → wipe → import cycle, because odin's
+    log sink is a control-plane sidecar (`gateway/logsctl.json`) rather than a
+    backing container's volume. So log history persists while bucket objects
+    don't — the opposite of what the "control plane, not data" rule leads you
+    to expect for anything that looks like data.
+  - **Guardrails:** refuses an existing env dir without `--force`, refuses any
+    absolute/`..`/link member, and refuses to run while odin is up — as of
+    v0.7.1 detected however the server was started (`odin start` OR a bare
+    `uvicorn odin.server:create_app`), because the pidfile-only check was inert
+    for the launch path the README itself documents.
+  - **The archive is credential-grade**: `keys.json` and every canvas secret in
+    cleartext. Written `0600`, every member stored `0600`, and a restore masks
+    off group/other bits so it can only ever tighten a store's modes.
 - [x] **Packaging (pragmatic scope).** DONE 2026-07-24 (v0.5.0):
   `scripts/install.sh` (one command: brew tools + colima up + odin + doctor)
   and `odin doctor` (toolchain checks with exact fixes, disk headroom,
   `--prebake` for the dynalite image). Full binary vendoring into one
   distributable.
+- [x] **Pre-apply admission control.** `/apply-full` and `/tf/apply` both
+  estimate the canvas's memory footprint and check free disk BEFORE spawning a
+  single container or VM, and reject with a `409` whose message names the real
+  numbers (`reconcile/admission.py`). A 3 x t3.medium canvas is refused in ~1s
+  with nothing booted and no env directory created.
+  - **Two DISJOINT pools, because the substrates are** (fixed v0.7.1, field
+    test 2 finding MEDIUM-9 — everything used to be charged against Colima's
+    VM, so a 48 GiB Mac was told "4.0 GiB budget (5.8 GiB total on this
+    host)" and a 5 x t3.micro canvas was wrongly refused):
+    - CONTAINER pool — `rds`/`ecs`/`lambda`/`elasticache`/`alb` plus the shared
+      `s3`/`sqs`/`sns`/`dynamodb` backing containers, charged against the
+      container runtime's own MemTotal (`docker info`, i.e. Colima's VM), and
+      the rejection says exactly that rather than "this host".
+    - HOST/VM pool — an `ec2` node is a REAL Lima VM allocated by
+      Virtualization.framework from the Mac's RAM and consumes zero Colima
+      memory, so it is charged against, and quoted against, real host memory
+      (`os.sysconf` — stdlib, no new dependency, no subprocess).
+  - **The budget** is 70% of each pool's TOTAL memory (not free memory).
+    Overrides: `ODIN_MEMORY_BUDGET_MIB` (container pool, absolute MiB),
+    `ODIN_VM_MEMORY_BUDGET_MIB` (VM pool), `ODIN_MIN_DISK_GIB` (free-disk
+    floor, default 10 GiB — the same figure `odin doctor` checks).
+  - **What it charges:** ec2 = the exact `INSTANCE_TYPES` memory;
+    rds/ecs/lambda/elasticache/alb = a fixed per-node figure equal to that
+    substrate's own real container memory cap; s3/sqs/sns/dynamodb = once per
+    ENV, not per node (they share one backing container);
+    vpc/subnet/sg/iam_role/ecr = zero.
+  - **It also refuses an env name too long to make a Lima VM name** (v0.7.1,
+    found while building the mesh proof). An `ec2` node becomes a real Lima VM
+    called `odin-ec2-{env}-{instance-id}`, and `limactl` refuses any instance
+    whose SSH control-socket path (`$LIMA_HOME/<vm>/ssh.sock.<16 digits>`)
+    would reach `UNIX_PATH_MAX=104` bytes. Past a certain env length EVERY
+    boot in that env failed — reliably, which is the good part — with a raw
+    limactl error naming a socket path and a Lima constant, ~60s into a boot
+    that was never going to work. Apply now refuses up front, naming the env,
+    its length, the actual limit and both ways out (rename, or a shorter
+    `LIMA_HOME`). **The limit is DERIVED, not hardcoded**
+    (`compute/instances.py::max_env_name_len`), because it is machine-specific:
+    it is 104 less `$LIMA_HOME` — whose default `~/.lima` moves with the
+    username's length — less the separators, Lima's socket filename, odin's
+    `odin-ec2-` prefix and the 19-character instance id. That works out to **22
+    on a `/Users/fimbulwinter/.lima` home**, exactly the figure the mesh work
+    measured by hand; a longer home name gives a shorter limit. A canvas with
+    no `ec2` node is never blocked by it — nothing else mints a VM name.
+  - **v1 limits, recorded rather than hidden:** an unknown total for either
+    pool (Colima not running; `os.sysconf` unanswered) SKIPS that pool's check
+    instead of printing a confident wrong number. It is a STATIC per-canvas
+    estimate and does not look at memory actually in use, so two envs can each
+    pass and jointly overcommit — cross-env accounting would mean summing every
+    other env's applied Stack, which is not wired. `odin doctor` reports
+    nothing about memory, so the ceiling is not discoverable before an Apply
+    hits it, and it hardcodes its own disk floor rather than honouring
+    `ODIN_MIN_DISK_GIB`.
 - [ ] **M7 (multi-Mac) — the fleet.** The single-host half is DONE (see
   above: a real lighthouse + real per-VM daemons + a real ping/SG-filter
   proof, all on one Mac). What remains is genuinely cross-machine: a second

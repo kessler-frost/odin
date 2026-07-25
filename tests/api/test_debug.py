@@ -13,8 +13,9 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from odin.agent import debugger
-from odin.api.debug import build_context, create_debug_router
+from odin.api.debug import build_context, create_debug_router, issued_credentials
 from odin.api.ws import ConnectionManager
+from odin.gateway.keys import KeyStore
 from odin.gateway.stores import SynthStores
 from odin.runtime.colima import ContainerFacts, HostFacts
 from odin.server import create_app
@@ -57,12 +58,16 @@ def _fake_diagnose(seen: list[dict], answer: str = "the db never started", suspe
     return diagnose
 
 
+DB = ResourceDesired(id="db", kind="rds", fields={"engine": FieldValue(value="postgres")})
+
+
 @pytest.fixture
 def wired(tmp_path):
     """The router alone, over real store/stores/ws state -- no lifespan, no
-    reconciler, no gateway."""
+    reconciler, no gateway. `db` is in the applied stack: a node the route has
+    never heard of is a different case, tested on its own below."""
     store = SpecStore(tmp_path)
-    store.apply(Stack(env=ENV))
+    store.apply(Stack(env=ENV, resources=(DB,)))
     seen: list[dict] = []
     app = FastAPI()
     app.include_router(create_debug_router(
@@ -121,7 +126,7 @@ def test_a_failed_tofu_apply_reaches_the_agent_env_wide(tmp_path):
     Driven through a REAL `broadcast` -> `events.jsonl` -> `get_events`
     round-trip, which is the only path the route ever reads."""
     store = SpecStore(tmp_path)
-    store.apply(Stack(env=ENV))
+    store.apply(Stack(env=ENV, resources=(DB,)))
     ws = ConnectionManager(tmp_path)
     seen: list[dict] = []
     app = FastAPI()
@@ -153,11 +158,50 @@ def test_a_secret_in_a_tofu_line_never_reaches_the_agent(app_client, monkeypatch
     assert "hunter2-secret-value" not in json.dumps(context)
 
 
-def test_an_unknown_node_is_a_200_with_no_desired_config(wired):
+def test_a_node_id_odin_has_no_record_of_is_named_and_costs_no_model_call(wired):
+    """Field test 2 finding #8: canvas node ids (`d1`) instead of labels bought
+    52 seconds, a real model call and a confident four-paragraph analysis of
+    nodes that do not exist -- with three of them listed as suspects."""
     client, _store, seen = wired
-    resp = client.post("/agent/debug", json={"env": ENV, "node_ids": ["nope"]})
+    resp = client.post("/agent/debug", json={"env": ENV, "node_ids": ["d1", "e1"]})
+
     assert resp.status_code == 200
-    assert seen[-1]["context"]["nodes"]["nope"]["desired"] is None
+    body = resp.json()
+    assert seen == [], "no evidence means no model call"
+    assert "'d1'" in body["answer"] and "'e1'" in body["answer"]
+    assert "no such node" in body["answer"]
+    assert "db" in body["answer"]  # …and it names the labels that DO exist
+    assert body["suspects"] == []
+
+
+def test_a_selected_node_that_exists_but_has_no_observations_is_still_diagnosed(tmp_path):
+    """The deliberate `desired: None` case must survive: the canvas can select a
+    stale tile whose node was removed from the stack but is still observed, and
+    its last state is exactly what explains where it went."""
+    store = SpecStore(tmp_path)
+    store.apply(Stack(env=ENV))  # no desired resources at all
+    store.apply_delta(WorldDelta(env=ENV, resource_id="gone", kind="ecs", phase="crashed", verdict="removed"))
+    seen: list[dict] = []
+    app = FastAPI()
+    app.include_router(create_debug_router(
+        store, SynthStores(tmp_path), LoggingRuntime(), ConnectionManager(tmp_path),
+        diagnose=_fake_diagnose(seen),
+    ))
+    with TestClient(app) as client:
+        resp = client.post("/agent/debug", json={"env": ENV, "node_ids": ["gone"]})
+
+    assert resp.status_code == 200
+    assert seen, "an observed-but-undesired node has real evidence: the agent must run"
+    assert seen[-1]["context"]["nodes"]["gone"]["desired"] is None
+    assert seen[-1]["context"]["unknown_nodes"] == []
+
+
+def test_a_mixed_request_still_runs_but_the_model_is_told_which_ids_are_unknown(wired):
+    client, _store, seen = wired
+    resp = client.post("/agent/debug", json={"env": ENV, "node_ids": ["db", "d1"]})
+    assert resp.status_code == 200
+    assert seen, "one id has real evidence, so the diagnosis is worth making"
+    assert seen[-1]["context"]["unknown_nodes"] == ["d1"]
 
 
 def test_an_empty_question_falls_back_to_the_canned_one(wired):
@@ -168,9 +212,11 @@ def test_an_empty_question_falls_back_to_the_canned_one(wired):
 
 def test_extra_keys_from_the_agent_cannot_500_the_route(tmp_path):
     seen: list[dict] = []
+    store = SpecStore(tmp_path)
+    store.apply(Stack(env=ENV, resources=(DB,)))
     app = FastAPI()
     app.include_router(create_debug_router(
-        SpecStore(tmp_path), SynthStores(tmp_path), LoggingRuntime(), ConnectionManager(tmp_path),
+        store, SynthStores(tmp_path), LoggingRuntime(), ConnectionManager(tmp_path),
         diagnose=_fake_diagnose(seen, suspects=[{"node_id": "db", "reason": "r", "confidence": "high"}]),
     ))
     with TestClient(app) as client:
@@ -223,6 +269,34 @@ def test_a_secret_typed_on_the_canvas_never_reaches_the_agent(app_client, monkey
     app_client.post("/agent/debug", json={"env": ENV, "node_ids": ["db"]})
     assert "hunter2-secret-value" not in json.dumps(seen[-1]["context"])
     assert seen[-1]["context"]["nodes"]["db"]["desired"]["fields"]["password"]["value"] == "[REDACTED]"
+
+
+def test_a_gateway_issued_credential_never_reaches_the_agent(tmp_path):
+    """Field test 2 finding #6, end to end through the route's own assembly: a
+    REAL key pair minted by the REAL KeyStore, planted in the crash verdict the
+    way a failed `docker run` used to put it there, must be redacted -- by name,
+    not by the 200-char clip that was covering it with 35 characters to spare."""
+    store = SpecStore(tmp_path)
+    store.apply(Stack(env=ENV))
+    access_key, secret_key = KeyStore(store.root).issue(ENV, "web-svc")
+    assert len(secret_key) == 40  # a real issued pair, not a stand-in
+    store.apply_delta(WorldDelta(
+        env=ENV, resource_id="web-svc", kind="ecs", phase="crashed",
+        verdict=f"docker run odin-ecs-{ENV}-web-svc failed: -e AWS_SECRET_ACCESS_KEY={secret_key}",
+        facts={"logtail": f"AWS_ACCESS_KEY_ID={access_key}"},
+    ))
+
+    context = build_context(
+        store, SynthStores(tmp_path), LoggingRuntime(), ConnectionManager(tmp_path), ENV, ["web-svc"],
+    )
+
+    dumped = json.dumps(context)
+    assert secret_key not in dumped and access_key not in dumped
+    assert "docker run odin-ecs-dbg-web-svc failed" in dumped  # the diagnostic itself survives
+
+
+def test_the_issued_credential_scrub_set_is_empty_for_an_env_that_issued_nothing(tmp_path):
+    assert issued_credentials(SpecStore(tmp_path).root, ENV) == frozenset()
 
 
 def test_build_context_is_usable_without_the_route(tmp_path):

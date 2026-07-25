@@ -57,6 +57,14 @@ _KIND = {
     "aws_elasticache_cluster": "elasticache",
     "aws_db_instance": "rds",
     "aws_lb": "alb",
+    # v0.7.1: the two CONTAINER kinds. They were reported unsupported, which
+    # was honest but left the import asymmetric with generate -- and an
+    # `aws_lb` needs a subnet AND a vpc on the canvas, so an imported load
+    # balancer could never be applied (field test U2). Importing them is what
+    # makes containment reconstructible from the source's own `vpc_id`/
+    # `subnets` references.
+    "aws_vpc": "vpc",
+    "aws_subnet": "subnet",
 }
 # W2.5: the two OTHER types an `alb` canvas node expands to. Neither becomes a
 # node of its own -- they fold ONTO the alb node the same way
@@ -123,16 +131,55 @@ _CARRIED_ATTRS = {
         "username", "password", "skip_final_snapshot", "tags",
     },
     # W2.5: `internal`/`load_balancer_type` are values odin always emits itself
-    # (hcl.py's `_alb`: internal, application), so a differing imported one is
-    # deliberately not surfaced as a dropped attribute. `subnets` is CONTAINMENT
-    # on the canvas (the node is drawn inside the subnet box), not node data --
-    # so an import can't reconstruct it and says so via a warning instead.
-    "alb": {"name", "internal", "load_balancer_type", "tags"},
+    # (hcl.py's `_alb`), so they are carried in the sense that odin re-emits
+    # SOMETHING for them -- but a source value that DISAGREES with what odin
+    # emits is a real semantic change and warns via `_FIXED_VALUES` below
+    # (v0.7.0 dropped `internal = false` in silence, quietly turning an
+    # internet-facing load balancer into an internal one). `subnets` is
+    # CONTAINMENT on the canvas: carried as the `subnet`/`vpc` stamps when it
+    # points at an imported subnet, warned about when it can't be resolved.
+    "alb": {"name", "internal", "load_balancer_type", "subnets", "tags"},
+    "vpc": {"cidr_block", "tags"},
+    "subnet": {"cidr_block", "vpc_id", "tags"},
+}
+# The companion resources' equivalent: which of THEIR arguments a round trip
+# reproduces (hcl.py's alb companion pass emits exactly these). Until v0.7.1
+# nothing computed dropped attributes for a companion at all, so a target
+# group's `matcher`, `stickiness`, `deregistration_delay` -- and every
+# health_check member except `path` -- vanished without a word.
+_CARRIED_COMPANION_ATTRS = {
+    "aws_lb_target_group": {"name", "port", "protocol", "vpc_id", "target_type", "health_check"},
+    "aws_lb_listener": {"load_balancer_arn", "port", "protocol", "default_action"},
+}
+_CARRIED_HEALTH_CHECK_ATTRS = {"path"}
+# (owner, attribute) -> the value odin ALWAYS emits, lowercased. An imported
+# value that differs is reported by name: the argument survives, its MEANING
+# does not. Owner is the canvas kind for a primary resource, the aws_* type for
+# a companion.
+_FIXED_VALUES = {
+    ("alb", "internal"): "true",
+    ("alb", "load_balancer_type"): "application",
+    ("aws_lb_target_group", "protocol"): "http",
+    ("aws_lb_target_group", "target_type"): "instance",
+    ("aws_lb_listener", "protocol"): "http",
 }
 # The kinds whose user `tags` map survives the round trip as node data (hcl.py's
 # `_tags_block` merges a node's own `tags` field back in for EVERY primary
 # builder, so this is purely about which imports bother to read them).
-_TAGGED_KINDS = {"s3", "logs", "secret", "ssm", "rds", "alb"}
+_TAGGED_KINDS = {"s3", "logs", "secret", "ssm", "rds", "alb", "vpc", "subnet"}
+_CONTAINER_KINDS = ("vpc", "subnet")
+
+# Canvas geometry for the layout pass. These ARE the UI's own container sizes
+# (`defaultStyleForType` in ui/src/components/Canvas.tsx) and its 20px grid: an
+# imported node has to be geometrically inside its container box, because the
+# browser re-derives the `vpc`/`subnet` stamps from geometry whenever nodes are
+# measured or dragged (ui/src/lib/containment.ts) and would strip a stamp whose
+# node visually sits outside.
+_LEAF_SIZE = (220, 120)
+_MIN_VPC_SIZE = (560, 380)
+_MIN_SUBNET_SIZE = (520, 280)
+_PAD = 20
+_HEADER = 40
 
 
 class Unsupported(BaseModel):
@@ -175,11 +222,12 @@ def _label(rtype: str, rname: str, attrs: dict) -> str:
     unquoted = hcl.unquote(value) if isinstance(value, str) else None
     # Only a plain literal (no leftover `${...}`, whether it was a bare
     # reference or a literal with an embedded interpolation) is trustworthy
-    # as a human label; anything computed falls back to the resource's own
-    # HCL name.
+    # as a human label; anything computed falls back to odin's own management
+    # tag (which IS the canvas label, so odin's generated HCL round-trips even
+    # for the name-less kinds), then to the resource's own HCL name.
     if isinstance(unquoted, str) and "${" not in unquoted:
         return unquoted
-    return rname
+    return _tags(attrs, odin_tag=True).get("odin:node") or rname
 
 
 def _ref_target(value: object) -> str | None:
@@ -203,9 +251,10 @@ def _attribute_types(attrs: dict) -> dict[str, str]:
     return types
 
 
-def _tags(attrs: dict) -> dict[str, str]:
+def _tags(attrs: dict, odin_tag: bool = False) -> dict[str, str]:
     """The user `tags` map (odin's own `odin:node` management tag excluded, so
-    a round-trip doesn't surface it as a user tag)."""
+    a round-trip doesn't surface it as a user tag -- `odin_tag=True` keeps it,
+    for the one caller that reads the label back out of it)."""
     raw = attrs.get("tags")
     if not isinstance(raw, dict):
         return {}
@@ -213,7 +262,7 @@ def _tags(attrs: dict) -> dict[str, str]:
     for key, value in raw.items():
         name = hcl.unquote(key) or key
         val = hcl.unquote(value)
-        if isinstance(name, str) and name != "odin:node" and isinstance(val, str):
+        if isinstance(name, str) and (odin_tag or name != "odin:node") and isinstance(val, str):
             out[name] = val
     return out
 
@@ -250,9 +299,42 @@ def _health_check_path(tg_attrs: dict) -> str:
     return "/"
 
 
-def _dropped_attrs(kind: str, attrs: dict) -> list[str]:
-    carried = _CARRIED_ATTRS.get(kind, set())
-    return sorted(k for k in attrs if k not in carried and k not in _IGNORED_ATTRS)
+def _literal(value: object) -> str:
+    """An HCL scalar reduced to a comparable lowercase string: python-hcl2 gives
+    back a real bool for `internal = false`, an int for `port = 80`, and a
+    quote-wrapped string for `"HTTP"`."""
+    unquoted = hcl.unquote(value) if isinstance(value, str) else value
+    return str(unquoted).lower()
+
+
+def _unsurvived_attrs(owner: str, attrs: dict, carried: set[str]) -> list[str]:
+    """Every argument on this resource that a round trip through `generate_tf`
+    would NOT reproduce -- reported by name, never dropped in silence (the
+    v0.5.4 attribute-honesty rule, which is meant to have no exceptions).
+
+    Two ways an argument fails to survive: odin doesn't model it at all, or
+    odin always emits its own value for it and the source's value differs. The
+    second kind is the sneakier one -- the argument is still THERE in the
+    regenerated HCL, saying something else."""
+    dropped = [k for k in attrs if k not in carried and k not in _IGNORED_ATTRS]
+    overridden = [
+        f"{key}={_literal(attrs[key])} (odin always emits {want})"
+        for (fixed_owner, key), want in _FIXED_VALUES.items()
+        if fixed_owner == owner and key in attrs and _literal(attrs[key]) != want
+    ]
+    return sorted(dropped + overridden)
+
+
+def _dropped_health_check_attrs(tg_attrs: dict) -> list[str]:
+    """Health-check members other than `path`: odin emits only the canvas-
+    authored `path` and leaves the rest for the provider to read back, so a
+    source `matcher`/`interval`/`healthy_threshold` does not survive."""
+    return sorted(
+        f"health_check.{key}"
+        for block in (tg_attrs.get("health_check") or [])
+        for key in block
+        if key not in _CARRIED_HEALTH_CHECK_ATTRS and key not in _IGNORED_ATTRS
+    )
 
 
 def _node_data(kind: str, label: str, attrs: dict) -> dict:
@@ -297,6 +379,10 @@ def _node_data(kind: str, label: str, attrs: dict) -> dict:
             value = hcl.unquote(attrs.get(attr))
             if isinstance(value, str):
                 data[field] = value
+    if kind in _CONTAINER_KINDS:
+        cidr = hcl.unquote(attrs.get("cidr_block"))
+        if isinstance(cidr, str):
+            data["cidr"] = cidr
     if kind in _TAGGED_KINDS:
         tags = _tags(attrs)
         if tags:
@@ -306,6 +392,108 @@ def _node_data(kind: str, label: str, attrs: dict) -> dict:
         if isinstance(node_type, str):
             data["nodeType"] = node_type
     return data
+
+
+def _referenced_label(value: object, rtype: str, by_hcl_name: dict[str, str]) -> str | None:
+    """The canvas label of the imported `rtype` resource an interpolation points
+    at (`vpc_id = aws_vpc.net.id` -> the vpc node's label), or None."""
+    target = _ref_target(value)
+    return by_hcl_name.get(f"{rtype}.{target}") if target else None
+
+
+def _stamp_containment(
+    node_by_label: dict[str, dict], attrs_by_label: dict[str, dict], by_hcl_name: dict[str, str]
+) -> list[str]:
+    """Rebuild the canvas's containment stamps from the source's own references.
+
+    Containment on the canvas is not geometry to the backend: it is the
+    `data.vpc`/`data.subnet` fields the UI stamps onto a node drawn inside a
+    container box (`ui/src/lib/containment.ts`), which `spec/translate.py`
+    carries through like any other field and `agent/hcl.py` turns into
+    `vpc_id`/`subnets`. So the inverse is exact: a subnet's `vpc_id` and a load
+    balancer's `subnets` name the containers it belongs to.
+
+    Returns a warning for any node that needed containment and couldn't get it
+    -- reported HERE, at import time, instead of surfacing much later as
+    Apply's "not contained inside a Subnet on the canvas" for a defect created
+    at import (field test U2).
+    """
+    warnings: list[str] = []
+    subnets = [(label, node) for label, node in node_by_label.items() if node["type"] == "subnet"]
+    for label, node in subnets:
+        vpc = _referenced_label(attrs_by_label[label].get("vpc_id"), "aws_vpc", by_hcl_name)
+        node["data"].update({"vpc": vpc} if vpc else {})
+        warnings += [] if vpc else [
+            f"{label} (subnet): imported without containment -- its `vpc_id` names no imported "
+            "aws_vpc, so Apply will skip it until you draw a VPC on the canvas and drop it inside"
+        ]
+    for label, node in node_by_label.items():
+        if node["type"] != "alb":
+            continue
+        subnet = next(
+            (found for value in (attrs_by_label[label].get("subnets") or [])
+             if (found := _referenced_label(value, "aws_subnet", by_hcl_name))),
+            None,
+        )
+        vpc = node_by_label[subnet]["data"].get("vpc") if subnet in node_by_label else None
+        node["data"].update({"subnet": subnet, "vpc": vpc} if subnet and vpc else {})
+        warnings += [] if subnet and vpc else [
+            f"{label} (alb): imported without containment -- its `subnets` name no imported "
+            "aws_subnet inside an imported aws_vpc, so Apply will skip it (\"not contained inside "
+            "a Subnet on the canvas\") until you draw a VPC + Subnet and drop it inside"
+        ]
+    return warnings
+
+
+def _place(node: dict, x: int, y: int, size: tuple[int, int] | None = None) -> None:
+    node["position"] = {"x": x, "y": y}
+    node.update({"size": {"width": size[0], "height": size[1]}} if size else {})
+
+
+def _subnet_size(children: list[dict]) -> tuple[int, int]:
+    width = max(_MIN_SUBNET_SIZE[0], 2 * _PAD + len(children) * (_LEAF_SIZE[0] + _PAD))
+    return width, max(_MIN_SUBNET_SIZE[1], _HEADER + _LEAF_SIZE[1] + _PAD)
+
+
+def _layout(nodes: list[dict]) -> None:
+    """Nest imported nodes GEOMETRICALLY, so the canvas agrees with the stamps.
+
+    The stamps alone aren't enough: the browser re-derives containment from
+    geometry every time nodes are measured or dragged, and strips a stamp whose
+    node isn't visually inside its box -- so an imported load balancer parked on
+    a flat row at y=0 would lose its containment on the first render. Sizes and
+    the 20px grid come from the UI's own defaults.
+
+    A project with no containers keeps the flat 220px row exactly as before.
+    """
+    vpcs = [n for n in nodes if n["type"] == "vpc"]
+    subnets = [n for n in nodes if n["type"] == "subnet"]
+    if not (vpcs or subnets):
+        return
+    leaves = [n for n in nodes if n["type"] not in _CONTAINER_KINDS]
+    nested: list[int] = []
+    x = bottom = 0
+    for vpc in vpcs:
+        own_subnets = [s for s in subnets if s["data"].get("vpc") == vpc["data"]["label"]]
+        children = [[c for c in leaves if c["data"].get("subnet") == s["data"]["label"]]
+                    for s in own_subnets]
+        sizes = [_subnet_size(kids) for kids in children]
+        width = max(_MIN_VPC_SIZE[0], 2 * _PAD + max((w for w, _ in sizes), default=0))
+        height = max(_MIN_VPC_SIZE[1], _HEADER + sum(h + _PAD for _, h in sizes) + _PAD)
+        _place(vpc, x, 0, (width, height))
+        y = _HEADER
+        for subnet, kids, (sub_w, sub_h) in zip(own_subnets, children, sizes, strict=True):
+            _place(subnet, x + _PAD, y, (sub_w, sub_h))
+            for index, child in enumerate(kids):
+                _place(child, x + 2 * _PAD + index * (_LEAF_SIZE[0] + _PAD), y + _HEADER)
+            nested += [id(subnet), *(id(kid) for kid in kids)]
+            y += sub_h + _PAD
+        x += width + 2 * _PAD
+        bottom = max(bottom, height)
+    loose = [n for n in nodes if n["type"] != "vpc" and id(n) not in nested]
+    for index, node in enumerate(loose):
+        _place(node, index * _GRID_STEP, bottom + 3 * _PAD,
+               _MIN_SUBNET_SIZE if node["type"] == "subnet" else None)
 
 
 def parse_hcl(files: dict[str, str]) -> ImportResult:
@@ -326,6 +514,7 @@ def parse_hcl(files: dict[str, str]) -> ImportResult:
     secret_versions: list[tuple[str, dict]] = []
     alb_companions: list[tuple[str, str, dict]] = []
     node_by_label: dict[str, dict] = {}
+    attrs_by_label: dict[str, dict] = {}
     index = 0
 
     for rtype, rname, attrs in triples:
@@ -351,7 +540,8 @@ def parse_hcl(files: dict[str, str]) -> ImportResult:
         }
         nodes.append(node)
         node_by_label[label] = node
-        dropped = _dropped_attrs(kind, attrs)
+        attrs_by_label[label] = attrs
+        dropped = _unsurvived_attrs(kind, attrs, _CARRIED_ATTRS.get(kind, set()))
         if dropped:
             warnings.append(f"{label} ({kind}): imported without unmodeled attribute(s): {', '.join(dropped)}")
         index += 1
@@ -408,12 +598,29 @@ def parse_hcl(files: dict[str, str]) -> ImportResult:
         claimed_target_groups.add(tg_key)
         node["data"]["port"] = str(_int_attr(tg_attrs.get("port"), 80))
         node["data"]["healthCheckPath"] = _health_check_path(tg_attrs)
+        # The companions' own arguments are held to the same honesty rule as a
+        # primary resource's: v0.7.0 folded them on and said nothing about what
+        # it left behind (a target group's `matcher = "200-299"`, every
+        # health_check member but `path`).
+        for companion_type, companion_attrs in (
+            ("aws_lb_listener", attrs), ("aws_lb_target_group", tg_attrs),
+        ):
+            lost = _unsurvived_attrs(
+                companion_type, companion_attrs, _CARRIED_COMPANION_ATTRS[companion_type]
+            ) + (_dropped_health_check_attrs(companion_attrs) if companion_type.endswith("group") else [])
+            warnings += [
+                f"{node['data']['label']} (alb): imported without unmodeled "
+                f"{companion_type} attribute(s): {', '.join(sorted(lost))}"
+            ] if lost else []
     for rtype, rname, attrs in alb_companions:
         if rtype == "aws_lb_target_group" and f"aws_lb_target_group.{rname}" not in claimed_target_groups:
             unsupported.append(Unsupported(
                 type=rtype, name=rname,
                 reason="target group is not the forward target of any imported listener -- not folded onto a load balancer",
             ))
+
+    warnings += _stamp_containment(node_by_label, attrs_by_label, by_hcl_name)
+    _layout(nodes)
 
     edges: list[dict] = []
     for rname, attrs in subscriptions:

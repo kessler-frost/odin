@@ -19,6 +19,7 @@ from odin.gateway.keys import OPERATOR_NODE_ID
 from odin.runtime.colima import ColimaRuntime
 from odin.server import create_app
 from odin.spec.store import SpecStore
+from tests.containers import own_containers
 
 pytestmark = pytest.mark.integration
 
@@ -30,8 +31,8 @@ _ODIN_ENV_DIR = Path(".odin") / ENV
 def runtime():
     rt = ColimaRuntime()
     yield rt
-    for cid in rt.list_odin():
-        rt.stop(cid)
+    for name in own_containers(rt, ENV):
+        rt.stop(name)
     shutil.rmtree(_ODIN_ENV_DIR, ignore_errors=True)
 
 
@@ -66,4 +67,4 @@ def test_live_import_of_an_out_of_band_bucket_returns_an_s3_node(tmp_path, runti
 
         aws.gc(set())  # stop the backing container -- nothing else owns it for this env
 
-    assert runtime.list_odin() == []
+    assert own_containers(runtime, ENV) == [], "every container this test made is gone"

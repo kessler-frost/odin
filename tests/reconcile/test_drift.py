@@ -486,6 +486,22 @@ def test_a_killed_container_is_real_drift_and_the_record_is_corrected(tmp_path):
     assert record["status_reason"] == verdicts["app-db"]
 
 
+def test_a_removed_database_container_reads_like_ecs_not_like_an_invented_exit_code(tmp_path):
+    """Field test 2 LOW-17: removing a container out of band gave `container … is
+    not running (exit -1)` for rds where ecs said `container … removed outside
+    odin` for the SAME event. -1 is `exit_code`'s "I could not read one"
+    sentinel, and a container that no longer exists never reported one."""
+    stores = SynthStores(tmp_path)
+    name = _db(stores, "app-db", "app-db")
+    containers = FakeContainers(names=[], exited={})  # gone entirely: no exit code to read
+
+    verdicts = _sweeper(containers=containers, probe=FakeProbe(ok=False)).verdicts(stores, ENV)
+
+    assert verdicts["app-db"] == f"container {name} removed outside odin — re-Apply to recreate"
+    assert "exit -1" not in verdicts["app-db"]
+    assert stores.rdsctl.get(ENV, "db:app-db")["status_reason"] == verdicts["app-db"]
+
+
 def test_the_world_stops_claiming_healthy_and_stops_publishing_a_dead_database_url(tmp_path):
     """The projection-level point: a dead database must not keep advertising a
     DATABASE_URL nothing can connect to -- that stale fact is what the Fabric

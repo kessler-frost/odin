@@ -5,12 +5,15 @@ from __future__ import annotations
 
 import stat
 import threading
+import tomllib
+from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from odin.util import atomic_write_text
+from odin import util
+from odin.util import atomic_write_text, odin_version
 
 
 def test_write_then_read_roundtrips(tmp_path: Path):
@@ -67,6 +70,60 @@ def test_crash_mid_write_leaves_original_file_intact(tmp_path: Path):
     assert path.read_text() == "original"
     leftovers = [p for p in tmp_path.iterdir() if p.name != "file.json"]
     assert leftovers == []  # the temp file was cleaned up, not left dangling
+
+
+# ------------------------------------------------------ odin_version (LOW-16)
+# The field test found `odin export` stamping `odin_version 0.5.3` into every
+# archive manifest while pyproject.toml said 0.7.0: the installed editable
+# dist-info was stale, so `importlib.metadata` answered honestly about a
+# distribution nobody had rebuilt. Backup compatibility checks rest on that
+# stamp, so in a source checkout pyproject.toml -- the file a human edits --
+# wins over installed metadata, and there is no second literal to drift.
+
+
+def test_version_matches_pyproject_in_a_source_checkout():
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    declared = tomllib.loads(pyproject.read_text())["project"]["version"]
+    assert odin_version() == declared
+
+
+def test_version_prefers_pyproject_over_stale_installed_metadata(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(util, "_pkg_version", lambda name: "0.5.3")
+    assert odin_version() != "0.5.3"
+
+
+def test_version_falls_back_to_installed_metadata_outside_a_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """An installed wheel has no pyproject.toml above the package."""
+    monkeypatch.setattr(util, "_PYPROJECT", tmp_path / "pyproject.toml")
+    monkeypatch.setattr(util, "_pkg_version", lambda name: "9.9.9")
+    assert odin_version() == "9.9.9"
+
+
+def test_version_ignores_a_pyproject_belonging_to_another_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    other = tmp_path / "pyproject.toml"
+    other.write_text('[project]\nname = "not-odin"\nversion = "1.2.3"\n')
+    monkeypatch.setattr(util, "_PYPROJECT", other)
+    monkeypatch.setattr(util, "_pkg_version", lambda name: "9.9.9")
+    assert odin_version() == "9.9.9"
+
+
+def test_version_says_unknown_rather_than_inventing_a_number(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """No checkout and no installed distribution: the honest answer is "I don't
+    know", never a hardcoded number that will silently rot (v0.7.0's fallback
+    still claimed 0.4.0)."""
+    monkeypatch.setattr(util, "_PYPROJECT", tmp_path / "nope.toml")
+    monkeypatch.setattr(util, "_pkg_version", _raise_not_found)
+    assert odin_version() == "0.0.0+unknown"
+
+
+def _raise_not_found(name: str) -> str:
+    raise PackageNotFoundError(name)
 
 
 def test_concurrent_writers_never_produce_a_partial_file(tmp_path: Path):

@@ -7,8 +7,12 @@ facts, verdict)`. Hand-built `SynthStores`, no reconciler/asyncio involved
 integration (emitting WorldDeltas + pruning)."""
 from __future__ import annotations
 
+import os
+
+from odin.fabric.models import MeshNetwork, SubnetAllocation
 from odin.gateway.models import elbv2ctl, rdsctl, secretsctl, ssmctl
 from odin.gateway.stores import SynthStores
+from odin.reconcile import mesh_health
 from odin.reconcile.tf_status import TF_OWNED_KINDS, project
 from odin.runtime.colima import CONTAINER_HOST
 from odin.runtime.lima import LIMA_HOST
@@ -311,6 +315,41 @@ def test_a_recreated_instance_wins_its_label_over_the_drifted_one_it_replaced(tm
     assert project(stores, ENV)["server"] == ("ec2", "healthy", {}, None)
 
 
+def test_a_running_ec2_publishes_its_private_and_overlay_addresses(tmp_path):
+    """Field test 2 LOW-13: an ec2 node published NO facts at all -- nothing
+    referencable as `${{web1.…}}`, and finding a VM's mesh address meant
+    hand-reading `.odin/<env>/nebula/overlay.json`, while rds published three.
+    Two facts, both plain addresses: `PRIVATE_IP` (host-reachable, NOT
+    SG-gated) and `MESH_IP` (the overlay address a drawn SG really gates, and
+    the one that is sticky across recreation)."""
+    stores = SynthStores(tmp_path)
+    stores.ec2compute.set(ENV, "instance:i-1", {**_ec2_instance("i-1", "running"), "private_ip": "192.168.64.9"})
+    stores.tags.set(ENV, "ec2:i-1", {"odin:node": "web1"})
+    nebula = tmp_path / ENV / "nebula"
+    nebula.mkdir(parents=True)
+    (nebula / "ca.crt").write_text("---ca---\n")
+    (nebula / "overlay.json").write_text(MeshNetwork(
+        network=ENV, subnets={"hosts": SubnetAllocation(
+            network=ENV, subnet="hosts", cidr="10.42.1.0/24", next_ip=2, assignments={"i-1": "10.42.1.1"},
+        )},
+    ).model_dump_json())
+    (nebula / "lighthouse.pid").write_text(str(os.getpid()))  # this env's lighthouse is up
+
+    mesh_health.reset_cache()
+    kind, phase, facts, _ = project(stores, ENV)["web1"]
+    assert (kind, phase) == ("ec2", "healthy")
+    assert facts == {"PRIVATE_IP": "192.168.64.9", "MESH_IP": "10.42.1.1"}
+
+    # ...and the overlay address is held to the same standard as rds's: no
+    # lighthouse, no advertisement (the VM itself is still reachable privately).
+    (nebula / "lighthouse.pid").unlink()
+    mesh_health.reset_cache()
+    _, phase, facts, verdict = project(stores, ENV)["web1"]
+    assert (phase, facts) == ("crashed", {"PRIVATE_IP": "192.168.64.9"})
+    assert "10.42.1.1 is unreachable" in verdict
+    mesh_health.reset_cache()
+
+
 def test_ec2_instance_with_no_odin_node_tag_is_not_projected(tmp_path):
     # No AWS-native "Name" field on a real EC2 instance either -- untagged
     # means unmappable, same as vpc/subnet.
@@ -357,6 +396,42 @@ def test_lambda_failed_state_reason_becomes_the_verdict(tmp_path):
     assert result["fn1"] == (
         "lambda", "crashed", {}, "fn1 RIE never became ready:\nImportError: No module named 'handler'",
     )
+
+
+# --- field test 2 finding #4: a DEPLOYED function whose invocations all fail --
+
+
+def test_a_deployed_function_whose_last_invocation_failed_says_so_in_its_verdict(tmp_path):
+    # M8 found this unprompted: the handler was named `handler` while the entry
+    # point looked for `lambda_handler`, so every invocation raised
+    # Runtime.HandlerNotFound -- and /world said `healthy` throughout.
+    stores = SynthStores(tmp_path)
+    record = _lambda_fn("fn1", "Active") | {"last_invocation_error": "Unhandled"}
+    stores.lambdactl.set(ENV, "fn:fn1", record)
+
+    kind, phase, facts, verdict = project(stores, ENV)["fn1"]
+    assert (kind, phase, facts) == ("lambda", "healthy", {})  # the DEPLOY really did succeed
+    assert verdict == "the last invocation failed (Unhandled) — the deploy succeeded, the handler did not"
+
+
+def test_a_cold_function_that_has_never_been_invoked_raises_no_alarm(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.lambdactl.set(ENV, "fn:fn1", _lambda_fn("fn1", "Active"))
+    assert project(stores, ENV)["fn1"] == ("lambda", "healthy", {}, None)
+
+
+def test_a_function_whose_last_invocation_succeeded_raises_no_alarm(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.lambdactl.set(ENV, "fn:fn1", _lambda_fn("fn1", "Active") | {"last_invocation_error": None})
+    assert project(stores, ENV)["fn1"] == ("lambda", "healthy", {}, None)
+
+
+def test_a_failed_deploy_still_reports_the_deploy_reason_not_the_invocation_one(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.lambdactl.set(ENV, "fn:fn1", _lambda_fn("fn1", "Failed", "container never became ready") | {
+        "last_invocation_error": "Unhandled",
+    })
+    assert project(stores, ENV)["fn1"] == ("lambda", "crashed", {}, "container never became ready")
 
 
 # --- ecs: healthy iff runningCount == desiredCount; a STOPPED task (always
@@ -707,6 +782,30 @@ def test_a_database_on_the_mesh_also_publishes_its_gated_overlay_address(tmp_pat
     assert facts["DATABASE_URL_MESH"] == "postgresql://app:apppass123@10.42.1.4:5432/postgres"
     assert facts["endpoint"] == "host.docker.internal:54321"  # the host path, unchanged
     assert facts["DATABASE_URL_VM"] == "postgresql://app:apppass123@host.lima.internal:54321/postgres"
+
+
+def test_a_dead_mesh_path_withholds_the_overlay_fact_and_ends_healthy(tmp_path):
+    """Field test 2 HIGH-2/B8, at the projection: the database is fine on its
+    published host port, but the address odin ADVERTISES for mesh consumers
+    cannot be reached (here: this env has a Nebula network and no lighthouse
+    process, exactly B8's case). It must stop reading `healthy`, stop handing
+    out that address, and say why -- while the two host forms carry on
+    untouched. `reconcile/mesh_health.py`'s own tests cover every failure mode
+    and the sweep cadence; this one pins that `project` is wired to it."""
+    stores = SynthStores(tmp_path)
+    _db(stores, "app-db", "app-db", overlay_ip="10.42.1.4")
+    nebula = tmp_path / ENV / "nebula"
+    nebula.mkdir(parents=True)
+    (nebula / "ca.crt").write_text("---ca---\n")  # this env HAS a mesh
+
+    mesh_health.reset_cache()
+    _, phase, facts, verdict = project(stores, ENV)["app-db"]
+
+    assert phase == "crashed", "healthy on an unverified overlay address is the bug"
+    assert "DATABASE_URL_MESH" not in facts and "endpoint_mesh" not in facts
+    assert facts["endpoint"] == "host.docker.internal:54321"
+    assert "10.42.1.4:5432 is unreachable" in verdict
+    mesh_health.reset_cache()
 
 
 def test_a_database_with_no_mesh_publishes_no_overlay_facts(tmp_path):

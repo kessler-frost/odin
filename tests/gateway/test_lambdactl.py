@@ -27,6 +27,9 @@ from odin.gateway.classify import classify
 from odin.gateway.keys import KeyStore, workload_env
 from odin.gateway.models import lambdactl, logsctl
 from odin.gateway.stores import SynthStores
+from odin.runtime.colima import CONTAINER_HOST
+from odin.spec.store import SpecStore
+from odin.spec.translate import canvas_to_stack
 
 from .conftest import split_url
 
@@ -377,6 +380,49 @@ def test_invoke_surfaces_function_error_header(sink, lambda_, stores):
     assert parsed["FunctionError"] == "Unhandled"
 
 
+def test_a_failing_invocation_is_recorded_on_the_function_record(sink, lambda_, stores):
+    """Field test 2 finding #4: a function failing EVERY invocation reported
+    `healthy` and nothing else, because the FunctionError the RIE reported went
+    into the response header and nowhere else. `reconcile/tf_status.py` turns
+    this field into the node's verdict."""
+    substrate = FakeFunctionRuntime(invoke_response=b'{"errorType": "Runtime.HandlerNotFound"}', invoke_error="Unhandled")
+    _create(stores, sink, lambda_, substrate)
+    _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
+    assert stores.lambdactl.get(ENV, "fn:fn1")["last_invocation_error"] is None  # cold: no alarm
+
+    _invoke_once(stores, sink, lambda_, substrate)
+
+    assert stores.lambdactl.get(ENV, "fn:fn1")["last_invocation_error"] == "Unhandled"
+
+
+def test_a_redeploy_clears_the_recorded_invocation_failure(sink, lambda_, stores):
+    # Fixing the handler and re-Applying must not leave the old deployment's
+    # failure verdict standing: this deployment hasn't been invoked yet.
+    substrate = FakeFunctionRuntime(invoke_response=b"{}", invoke_error="Unhandled")
+    _create(stores, sink, lambda_, substrate)
+    _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
+    _invoke_once(stores, sink, lambda_, substrate)
+    assert stores.lambdactl.get(ENV, "fn:fn1")["last_invocation_error"] == "Unhandled"
+
+    req = sink.call(lambda: lambda_.update_function_code(FunctionName="fn1", ZipFile=b"PK\x03\x04fixed"))
+    _answer(stores, req, substrate)
+
+    assert stores.lambdactl.get(ENV, "fn:fn1")["last_invocation_error"] is None
+
+
+def test_a_recovering_invocation_clears_the_recorded_failure(sink, lambda_, stores):
+    substrate = FakeFunctionRuntime(invoke_response=b"{}", invoke_error="Unhandled")
+    _create(stores, sink, lambda_, substrate)
+    _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
+    _invoke_once(stores, sink, lambda_, substrate)
+    assert stores.lambdactl.get(ENV, "fn:fn1")["last_invocation_error"] == "Unhandled"
+
+    substrate.invoke_error = None  # the handler was fixed and redeployed
+    _invoke_once(stores, sink, lambda_, substrate)
+
+    assert stores.lambdactl.get(ENV, "fn:fn1")["last_invocation_error"] is None
+
+
 def test_invoke_before_active_is_not_ready(sink, lambda_, stores):
     substrate = FakeFunctionRuntime(block=threading.Event())  # never released -- stays Pending
     _create(stores, sink, lambda_, substrate)
@@ -613,6 +659,66 @@ def test_create_without_odin_node_tag_deploys_with_no_injected_vars(sink, lambda
     _create(stores, sink, lambda_, substrate, keystore=keystore, gateway_port=_GATEWAY_PORT)
     _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
     assert substrate.ensured[0][4] == {}  # no odin:node tag -> nothing to inject, deploy still lands
+
+
+# --- Canvas WIRING: the node's own `env` map reaches the real container --------
+
+
+def test_the_nodes_env_refs_are_resolved_into_the_container(sink, lambda_, stores, keystore, tmp_path):
+    """Field test 2, "the product hole": a lambda node's `env` refs never
+    reached the RIE container. They now ride the same launch-time seam the
+    issued credentials do -- so a resolved DATABASE_URL (which carries the DB
+    password) never enters `fn["environment"]`, and therefore never enters the
+    provider's read or tofu state."""
+    stores.rdsctl.set(ENV, "db:appdb", {
+        "db_instance_identifier": "appdb", "master_username": "app", "master_password": "s3cret",
+        "db_name": "shop", "status": "available", "endpoint_port": 33366,
+    })
+    SpecStore(tmp_path).apply(canvas_to_stack({
+        "nodes": [
+            {"id": "n1", "type": "rds", "data": {"label": "appdb"}},
+            {"id": "n2", "type": "lambda", "data": {
+                "label": "myfn", "env": {"DATABASE_URL": "${{appdb.DATABASE_URL}}"}}},
+        ],
+        "edges": [],
+    }, env=ENV))
+    substrate = FakeFunctionRuntime()
+    _create(
+        stores, sink, lambda_, substrate, keystore=keystore, gateway_port=_GATEWAY_PORT,
+        Tags={"odin:node": "myfn"}, Environment={"Variables": {"FOO": "bar"}},
+    )
+    active = _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
+
+    env_vars = substrate.ensured[0][4]
+    assert env_vars["DATABASE_URL"] == f"postgresql://app:s3cret@{CONTAINER_HOST}:33366/shop"
+    assert env_vars["FOO"] == "bar"  # the declared variable survives alongside it
+    # Zero-drift + no-secrets-in-state: the response still echoes ONLY what the
+    # user configured.
+    assert active["Environment"]["Variables"] == {"FOO": "bar"}
+
+
+def test_an_unresolvable_ref_lands_the_function_failed_with_a_naming_reason(sink, lambda_, stores, keystore, tmp_path):
+    stores.rdsctl.set(ENV, "db:appdb", {
+        "db_instance_identifier": "appdb", "master_username": "app", "master_password": "s3cret",
+        "db_name": "shop", "status": "creating", "endpoint_port": 0,
+    })
+    SpecStore(tmp_path).apply(canvas_to_stack({
+        "nodes": [
+            {"id": "n1", "type": "rds", "data": {"label": "appdb"}},
+            {"id": "n2", "type": "lambda", "data": {
+                "label": "myfn", "env": {"DATABASE_URL": "${{appdb.DATABASE_URL}}"}}},
+        ],
+        "edges": [],
+    }, env=ENV))
+    substrate = FakeFunctionRuntime()
+    _create(
+        stores, sink, lambda_, substrate, keystore=keystore, gateway_port=_GATEWAY_PORT,
+        Tags={"odin:node": "myfn"},
+    )
+    failed = _wait_for_state(stores, sink, lambda_, "fn1", "Failed", substrate)
+    assert "DATABASE_URL" in failed["StateReason"], failed
+    assert "appdb" in failed["StateReason"], failed
+    assert not substrate.ensured, "no container may start with a hole in its environment"
 
 
 # --- W2.2's honesty fix: the reality sweep's seam + the Apply-driven

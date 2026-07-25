@@ -96,6 +96,7 @@ from odin.gateway import errors
 from odin.gateway.keys import KeyStore, workload_env
 from odin.gateway.models import elbv2ctl, logsctl
 from odin.gateway.stores import NO_CHANGE, SynthStores
+from odin.gateway.wiring import node_env
 from odin.runtime.colima import CONTAINER_HOST
 
 log = logging.getLogger("odin.gateway.ecsctl")
@@ -345,6 +346,29 @@ def _taskdef_wire(taskdef: dict) -> dict:
     }
 
 
+def _on_current_revision(service: dict, tasks: list[dict]) -> list[dict]:
+    """The subset of `tasks` running the service's CURRENT task definition.
+
+    Field-test 2 finding B1 (HIGH): a bad-image ECS *update* reported apply
+    SUCCESS in 2.3 seconds while destroying all three healthy tasks and leaving
+    the load balancer serving 503. The v0.5.4 guard (`wait_for_steady_state` +
+    a bounded `timeouts`) genuinely covered CREATE but was inert on UPDATE,
+    because terraform-provider-aws's steady-state waiter keys on
+    `len(deployments) == 1 && desiredCount == runningCount` -- and a
+    revision-blind `runningCount` still counted the three STALE tasks at the
+    instant UpdateService returned, so the waiter declared the deployment
+    stable before the reconcile thread had even started. Counting only the
+    current revision is also what real ECS's PRIMARY deployment reports, and it
+    is the only self-consistent choice for a model that renders exactly ONE
+    deployment record: an update is never "already steady" the moment it is
+    requested, and it stays short-of-desired for as long as it genuinely is,
+    which is what turns the bounded `timeouts.update` into a real apply
+    failure. (Deliberate deviation, recorded: real AWS's SERVICE-level
+    runningCount also counts draining old-revision tasks, but it distinguishes
+    them with a second deployment record, which odin does not model.)"""
+    return [t for t in tasks if t["task_definition_arn"] == service["task_definition_arn"]]
+
+
 def _rollout(service: dict, tasks: list[dict], deployment_id: str) -> tuple[str, str]:
     """The deployment's honest `(rolloutState, rolloutStateReason)` from the
     REAL task outcomes (field-test finding #3). A STOPPED task in the store is
@@ -355,7 +379,11 @@ def _rollout(service: dict, tasks: list[dict], deployment_id: str) -> tuple[str,
     a bad image / crash-on-start read as a healthy deployment and the failure
     was never surfaced (apply silently 'succeeded'). runningCount==desiredCount
     wins first, so a lingering STOPPED task from an already-recovered service
-    never reads as FAILED."""
+    never reads as FAILED.
+
+    `tasks` is already narrowed to the CURRENT revision by the caller
+    (`_on_current_revision`) -- a stale task from the previous deployment is
+    neither progress toward this one nor a failure of it."""
     running = sum(1 for t in tasks if t["last_status"] == "RUNNING")
     stopped = [t for t in tasks if t["last_status"] == "STOPPED"]
     if running == service["desired_count"]:
@@ -368,7 +396,11 @@ def _rollout(service: dict, tasks: list[dict], deployment_id: str) -> tuple[str,
 
 def _service_wire(stores: SynthStores, env: str, service: dict) -> dict:
     arn = _service_arn(service["cluster_name"], service["service_name"])
-    tasks = _tasks_for_service(stores, env, service["cluster_name"], service["service_name"])
+    all_tasks = _tasks_for_service(stores, env, service["cluster_name"], service["service_name"])
+    # CURRENT-REVISION ONLY -- see `_on_current_revision` for why (finding B1:
+    # this is the whole reason a bad-image UPDATE now fails apply instead of
+    # reading as instantly steady).
+    tasks = _on_current_revision(service, all_tasks)
     running = sum(1 for t in tasks if t["last_status"] == "RUNNING")
     pending = sum(1 for t in tasks if t["last_status"] == "PROVISIONING")
     deployment_id = f"ecs-svc/{service['service_name']}"
@@ -587,7 +619,7 @@ def mark_task_stopped(stores: SynthStores, env: str, cluster_name: str, task_id:
 
 def _launch_task(
     stores: SynthStores, env: str, cluster_name: str, service_name: str, taskdef: dict, runtime: TaskRuntime,
-    extra_env: dict[str, str] | None = None,
+    extra_env: dict[str, str] | None = None, node_label: str = "",
 ) -> None:
     container_def = taskdef["container_definitions"][0]  # v1: single-container taskdefs (V5c)
     task_id = uuid.uuid4().hex
@@ -610,8 +642,21 @@ def _launch_task(
     }
     stores.ecsctl.set(env, _task_key(cluster_name, task_id), task)
     try:
+        # CANVAS WIRING (field test 2, the product hole): the node's own `env`
+        # map -- static entries plus every `${{producer.ATTR}}` ref resolved to a
+        # live value -- delivered into the REAL container here rather than baked
+        # into the taskdef, which would put resolved connection strings
+        # (passwords included) into terraform.tfstate and drift on every plan
+        # (see gateway/wiring.py for the full rationale). Resolved BEFORE the
+        # issued credentials are layered on, so odin's own four AWS_* vars
+        # always win over a canvas that happens to name one of them.
+        # An `UnresolvedRef` lands in the SAME `except` as a failed
+        # `docker run`: the task goes STOPPED with the real reason, which is
+        # what makes a bad ref a `crashed` node with a naming verdict AND a
+        # failed apply (the service never reaches steady state).
+        launch_env = {**node_env(stores, env, node_label), **(extra_env or {})} if node_label else extra_env
         handle = runtime.run(
-            env, task_id, container_def, extra_env=extra_env,
+            env, task_id, container_def, extra_env=launch_env,
             cpu=taskdef.get("cpu"), memory=taskdef.get("memory"),
         )
     except Exception as exc:
@@ -676,9 +721,10 @@ def _reconcile_service_tasks(
             _stop_task(stores, env, task, runtime)
 
         desired = service["desired_count"]
+        node_label = service.get("node_label") or ""
         if len(fresh) < desired:
             for _ in range(desired - len(fresh)):
-                _launch_task(stores, env, cluster_name, service_name, taskdef, runtime, extra_env)
+                _launch_task(stores, env, cluster_name, service_name, taskdef, runtime, extra_env, node_label)
         elif len(fresh) > desired:
             # Newest-task-first scale-down (the digest's own ordering).
             excess = sorted(fresh, key=lambda t: t["started_at"] or 0, reverse=True)[: len(fresh) - desired]

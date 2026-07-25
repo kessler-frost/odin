@@ -569,9 +569,9 @@ def test_alb_carries_user_tags_but_not_odins_own():
 
 
 def test_alb_name_scheme_type_and_tags_are_carried_while_other_arguments_warn():
-    # `internal`/`load_balancer_type` are values odin always emits itself, so a
-    # differing imported one is deliberately NOT surfaced as a dropped
-    # attribute -- but a genuinely unmodeled argument still has to be honest.
+    # `internal`/`load_balancer_type` are re-emitted by odin with ITS values, so
+    # they only warn when the source disagrees (see the test below); a genuinely
+    # unmodeled argument always has to be honest.
     tf = (
         'resource "aws_lb" "front" {\n'
         '  name               = "front"\n'
@@ -583,8 +583,179 @@ def test_alb_name_scheme_type_and_tags_are_carried_while_other_arguments_warn():
         "}\n"
     )
     result = parse_hcl_text(tf)
-    assert result.warnings == ["front (alb): imported without unmodeled attribute(s): idle_timeout"]
+    assert "front (alb): imported without unmodeled attribute(s): idle_timeout" in result.warnings
     assert result.unsupported == []
+
+
+# --- v0.7.1: no silent exceptions to the attribute-honesty rule (field test U3)
+
+
+def test_an_internet_facing_load_balancer_warns_that_odin_makes_it_internal():
+    """`internal = false` vanished in silence, quietly turning an
+    internet-facing load balancer into an internal one -- the source argument is
+    still THERE in the regenerated HCL, saying the opposite."""
+    tf = 'resource "aws_lb" "front" {\n  name = "front"\n  internal = false\n}\n'
+    (warning,) = [w for w in parse_hcl_text(tf).warnings if "internal" in w]
+    assert "internal=false (odin always emits true)" in warning
+
+
+def test_a_target_groups_matcher_and_other_health_check_members_warn():
+    """`matcher = "200-299"` was dropped with no warning at all: nothing ever
+    computed dropped attributes for the alb's companion resources."""
+    tf = (
+        'resource "aws_lb" "front" {\n  name = "front"\n}\n\n'
+        'resource "aws_lb_target_group" "front_tg" {\n'
+        '  name     = "front-tg"\n  port = 3000\n  protocol = "HTTPS"\n'
+        "  deregistration_delay = 30\n"
+        '  health_check {\n    path = "/healthz"\n    matcher = "200-299"\n    interval = 10\n  }\n'
+        "}\n\n"
+        'resource "aws_lb_listener" "front_listener" {\n'
+        "  load_balancer_arn = aws_lb.front.arn\n  port = 8080\n"
+        "  default_action {\n    type = \"forward\"\n"
+        "    target_group_arn = aws_lb_target_group.front_tg.arn\n  }\n}\n"
+    )
+    (warning,) = [w for w in parse_hcl_text(tf).warnings if "aws_lb_target_group" in w]
+    assert "health_check.matcher" in warning and "health_check.interval" in warning
+    assert "deregistration_delay" in warning
+    assert "protocol=https (odin always emits http)" in warning
+
+
+def test_the_carried_alb_arguments_produce_no_warning_at_all():
+    """The round trip's own output must stay warning-free, or the honesty rule
+    turns into noise nobody reads."""
+    canvas = {
+        "nodes": [
+            {"id": "n1", "type": "vpc", "data": {"label": "net", "cidr": "10.0.0.0/16"}},
+            {"id": "n2", "type": "subnet", "data": {"label": "web", "cidr": "10.0.1.0/24", "vpc": "net"}},
+            {"id": "n3", "type": "alb", "data": {
+                "label": "front", "vpc": "net", "subnet": "web",
+                "listenerPort": "8080", "port": "3000", "healthCheckPath": "/healthz",
+            }},
+        ],
+        "edges": [],
+    }
+    generated = generate_tf(canvas_to_stack(canvas)).files["main.tf"]
+    assert parse_hcl_text(generated).warnings == []
+
+
+# --- v0.7.1: containment, so an imported load balancer can actually be applied
+# Field test U2: `import-tf` imported an `aws_lb`, warned that `subnets` was
+# dropped, and produced a canvas node Apply then refused ("not contained inside
+# a Subnet on the canvas") -- a defect created at import, surfaced at apply.
+
+_NETWORK_TF = '''
+resource "aws_vpc" "net" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_hostnames = true
+
+  tags = {
+    "Name" = "acme-net"
+  }
+}
+
+resource "aws_subnet" "public" {
+  vpc_id                  = aws_vpc.net.id
+  cidr_block              = "10.0.1.0/24"
+  availability_zone       = "us-east-1a"
+  map_public_ip_on_launch = true
+}
+
+resource "aws_lb" "acme_public" {
+  name     = "acme-public"
+  internal = false
+  subnets  = [aws_subnet.public.id]
+}
+
+resource "aws_lb_target_group" "acme_tg" {
+  name   = "acme-tg"
+  port   = 8080
+  vpc_id = aws_vpc.net.id
+}
+
+resource "aws_lb_listener" "acme_listener" {
+  load_balancer_arn = aws_lb.acme_public.arn
+  port              = 80
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.acme_tg.arn
+  }
+}
+'''
+
+
+def test_vpc_and_subnet_import_as_container_nodes_instead_of_unsupported():
+    result = parse_hcl_text(_NETWORK_TF)
+    by_id = {n["id"]: n for n in result.nodes}
+    assert by_id["net"]["type"] == "vpc" and by_id["net"]["data"]["cidr"] == "10.0.0.0/16"
+    assert by_id["public"]["type"] == "subnet" and by_id["public"]["data"]["cidr"] == "10.0.1.0/24"
+    assert result.unsupported == []
+    # ...and what they DON'T carry is still reported by name.
+    assert any("enable_dns_hostnames" in w for w in result.warnings)
+    assert any("availability_zone" in w and "map_public_ip_on_launch" in w for w in result.warnings)
+
+
+def test_containment_is_rebuilt_from_vpc_id_and_subnets_references():
+    by_id = {n["id"]: n for n in parse_hcl_text(_NETWORK_TF).nodes}
+    assert by_id["public"]["data"]["vpc"] == "net"
+    assert by_id["acme-public"]["data"]["subnet"] == "public"
+    assert by_id["acme-public"]["data"]["vpc"] == "net"
+
+
+def test_an_imported_load_balancer_can_now_be_applied():
+    """The end of U2: translate the imported canvas and the `aws_lb` is really
+    there, with no unsupported entry."""
+    imported = parse_hcl_text(_NETWORK_TF)
+    project = generate_tf(canvas_to_stack({"nodes": imported.nodes, "edges": imported.edges}))
+    assert project.unsupported == []
+    assert 'resource "aws_lb" "acme_public"' in project.files["main.tf"]
+    assert 'resource "aws_subnet" "public"' in project.files["main.tf"]
+    assert "subnets = [aws_subnet.public.id]" in project.files["main.tf"]
+
+
+def test_a_load_balancer_whose_subnets_are_not_importable_says_so_at_import_time():
+    tf = (
+        'resource "aws_lb" "front" {\n  name = "front"\n'
+        "  subnets = [aws_subnet.somewhere_else.id]\n}\n"
+    )
+    (warning,) = [w for w in parse_hcl_text(tf).warnings if "containment" in w]
+    assert "not contained inside a Subnet on the canvas" in warning
+    assert "draw a VPC + Subnet" in warning
+
+
+def test_a_subnet_whose_vpc_is_not_importable_says_so_at_import_time():
+    tf = 'resource "aws_subnet" "orphan" {\n  vpc_id = aws_vpc.elsewhere.id\n}\n'
+    (warning,) = [w for w in parse_hcl_text(tf).warnings if "containment" in w]
+    assert "`vpc_id` names no imported aws_vpc" in warning
+
+
+def _rect(node: dict) -> tuple[float, float, float, float]:
+    """The node's rect the way ui/src/lib/containment.ts computes it: explicit
+    size when the importer set one, else the type's default leaf size."""
+    size = node.get("size") or {"width": 220, "height": 120}
+    x, y = node["position"]["x"], node["position"]["y"]
+    return x, y, x + size["width"], y + size["height"]
+
+
+def test_imported_nodes_are_geometrically_inside_their_containers():
+    """The stamps alone aren't enough: the browser re-derives containment from
+    geometry on every measure/drag and would strip a stamp whose node sits
+    outside its box."""
+    by_id = {n["id"]: n for n in parse_hcl_text(_NETWORK_TF).nodes}
+    vx0, vy0, vx1, vy1 = _rect(by_id["net"])
+    sx0, sy0, sx1, sy1 = _rect(by_id["public"])
+    lx0, ly0, lx1, ly1 = _rect(by_id["acme-public"])
+    assert (vx0 <= sx0 and vy0 <= sy0 and sx1 <= vx1 and sy1 <= vy1)  # containsRect
+    center = ((lx0 + lx1) / 2, (ly0 + ly1) / 2)                       # containsPoint
+    assert sx0 <= center[0] <= sx1 and sy0 <= center[1] <= sy1
+    assert all(n["position"]["x"] % 20 == 0 and n["position"]["y"] % 20 == 0
+               for n in by_id.values())
+
+
+def test_a_project_with_no_containers_keeps_the_flat_row():
+    positions = [n["position"] for n in parse_hcl_text(_FULL_TF).nodes]
+    assert sorted(p["x"] for p in positions) == [0, 220, 440, 660]
+    assert all(p["y"] == 0 for p in positions)
 
 
 def test_alb_stays_out_of_the_live_import_path():
