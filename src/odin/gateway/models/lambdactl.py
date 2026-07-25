@@ -87,9 +87,10 @@ from pathlib import Path
 from starlette.responses import Response
 
 from odin.aws.backings import ACCOUNT, REGION
-from odin.compute.functions import DEFAULT_RUNTIME, FunctionRuntime
+from odin.compute.functions import DEFAULT_RUNTIME, FunctionRuntime, container_name
 from odin.gateway import errors
 from odin.gateway.keys import KeyStore, workload_env
+from odin.gateway.models import logsctl
 from odin.gateway.stores import NO_CHANGE, SynthStores
 from odin.runtime.colima import ColimaRuntime
 
@@ -98,6 +99,12 @@ log = logging.getLogger("odin.gateway.lambdactl")
 _DEFAULT_HANDLER = "lambda_function.lambda_handler"
 _DEFAULT_TIMEOUT = 3
 _DEFAULT_MEMORY = 128
+
+# How many trailing lines of the RIE container's output one Invoke reads
+# (`docker logs --tail N`): bounded so a chatty handler can't turn an invoke
+# into an unbounded read, generous enough that a normal handler's whole
+# output for a call fits in one window.
+_LOG_TAIL_LINES = 200
 
 _Handler = Callable[
     [str, str, bytes, SynthStores, float, FunctionRuntime, dict[str, str], KeyStore | None, int | None],
@@ -465,6 +472,36 @@ def _get_function_code_signing_config(resource: str, env: str, body: bytes, stor
 # --- Invoke: the data plane ------------------------------------------------
 
 
+def _ship_logs(stores: SynthStores, env: str, name: str, substrate: FunctionRuntime) -> None:
+    """Ship the function's RIE container tail into `/aws/lambda/{name}` -- the
+    exact group real Lambda writes to, so `odin logs --group /aws/lambda/foo`
+    (and a canvas `aws_cloudwatch_log_group` drawn for that name, which
+    logsctl's CreateLogGroup then ADOPTS) reads what actually ran.
+
+    ONE STREAM PER REAL CONTAINER, named after the container itself -- odin's
+    honest deviation from AWS's `{date}/[$LATEST]{requestId}` stream naming.
+    RIE reuses a single long-lived container for every invoke of a function,
+    so there is no per-request stream boundary to honor and no requestId on
+    the container's own stdout to key one off. That naming is also what makes
+    `ingest_tail`'s cursor stable: the cursor counts how many lines of THIS
+    container's output have been ingested, and a live container's output only
+    ever grows, so re-shipping the same tail after a second invoke appends
+    nothing. The one edge that costs: a redeploy replaces the container and
+    its output restarts at line 1 while the cursor stays put, so the new
+    container's first lines (up to the old cursor) are not re-ingested --
+    accepted rather than papered over, since the alternative is streaming
+    every container continuously.
+
+    No try/except: the read is `FunctionRuntime.logs` -> the driver's
+    `check=False` CLI call, which answers "" for a vanished container instead
+    of raising, so there is no failure mode here that could break an invoke.
+    """
+    logsctl.ingest_tail(
+        stores, env, f"/aws/lambda/{name}", container_name(env, name),
+        substrate.logs(env, name, _LOG_TAIL_LINES),
+    )
+
+
 def _invoke(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     fn = _function(stores, env, resource)
     if fn is None:
@@ -478,6 +515,10 @@ def _invoke(resource: str, env: str, body: bytes, stores: SynthStores, now: floa
         result = substrate.invoke(env, resource, body)
     except Exception as exc:
         return errors.synth_error("lambda", "ServiceException", str(exc), 500)
+    # Both outcomes ship: a handler that RAISED wrote its traceback to the
+    # container's stderr, and that traceback is the whole reason CloudWatch
+    # Logs exists.
+    _ship_logs(stores, env, resource, substrate)
     headers = {"x-amz-function-error": result.function_error} if result.function_error else {}
     return Response(result.payload, status_code=200, media_type="application/json", headers=headers)
 

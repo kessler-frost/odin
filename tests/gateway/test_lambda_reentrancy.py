@@ -66,6 +66,10 @@ class _ReentrantSubstrate:
             reentrant_ok = False
         return InvokeResult(payload=json.dumps({"reentrant_ok": reentrant_ok}).encode(), function_error=None)
 
+    def logs(self, env: str, function_name: str, tail: int = 20) -> str:
+        # W2.1: every Invoke also ships this tail into `/aws/lambda/{fn}`.
+        return "reentrant callback ran\n"
+
 
 @pytest.fixture
 def gateway(tmp_path: Path, monkeypatch):

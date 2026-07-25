@@ -180,6 +180,45 @@ def test_logs_custom_env_and_tail(runner):
 
 
 @respx.mock
+def test_logs_group_reads_a_log_group_with_no_node_argument(runner):
+    respx.get(f"{BASE}/logs", params={"env": "default", "group": "/aws/lambda/fn1", "tail": "100"}).mock(
+        return_value=httpx.Response(200, json={
+            "env": "default", "node": "", "kind": None, "found": True, "running": True,
+            "sources": ["odin-lambda-default-fn1"],
+            "lines": "2026-07-24T00:00:00.000+00:00 hello from the handler", "message": None,
+        })
+    )
+    result = runner.invoke(app, ["logs", "--group", "/aws/lambda/fn1"])
+    assert result.exit_code == 0
+    assert "hello from the handler" in result.stdout
+
+
+@respx.mock
+def test_logs_node_and_group_together_pass_both_through(runner):
+    respx.get(f"{BASE}/logs", params={"env": "prod", "node": "app", "group": "/ecs/app", "tail": "20"}).mock(
+        return_value=httpx.Response(200, json={
+            "env": "prod", "node": "app", "kind": None, "found": True, "running": True,
+            "sources": ["odin-ecs-prod-abc12345-app"], "lines": "task one up", "message": None,
+        })
+    )
+    result = runner.invoke(app, ["logs", "app", "--group", "/ecs/app", "--env", "prod", "--tail", "20"])
+    assert result.exit_code == 0
+    assert "task one up" in result.stdout
+
+
+@respx.mock
+def test_logs_with_neither_node_nor_group_exits_one(runner):
+    respx.get(f"{BASE}/logs", params={"env": "default", "tail": "100"}).mock(
+        return_value=httpx.Response(200, json={
+            "env": "default", "node": "", "error": "node or group is required",
+        })
+    )
+    result = runner.invoke(app, ["logs"])
+    assert result.exit_code == 1
+    assert "node or group is required" in result.stderr
+
+
+@respx.mock
 def test_logs_server_down(runner):
     respx.get(f"{BASE}/logs").mock(side_effect=httpx.ConnectError("refused"))
     result = runner.invoke(app, ["logs", "db"])

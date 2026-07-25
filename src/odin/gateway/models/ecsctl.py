@@ -91,9 +91,10 @@ from collections.abc import Callable
 from starlette.responses import Response
 
 from odin.aws.backings import ACCOUNT, REGION
-from odin.compute.tasks import TaskRuntime
+from odin.compute.tasks import TaskRuntime, container_name
 from odin.gateway import errors
 from odin.gateway.keys import KeyStore, workload_env
+from odin.gateway.models import logsctl
 from odin.gateway.stores import NO_CHANGE, SynthStores
 
 log = logging.getLogger("odin.gateway.ecsctl")
@@ -108,6 +109,12 @@ _DEFAULT_COMPATIBILITIES = ["EC2"]
 # delete), which never goes through the lazy sweep at all (this module
 # already knows the outcome the moment it issues the stop).
 _ESSENTIAL_CONTAINER_EXITED = "Essential container in task exited"
+
+# How many trailing lines of a task container's output ONE sweep reads
+# (`docker logs --tail N`) -- see `_ship_task_logs`: bounded so a chatty
+# container can't turn a `Describe*` into an unbounded read, generous enough
+# that a crash's traceback fits inside one window.
+_LOG_TAIL_LINES = 200
 
 # DeleteService keeps the record around, `status="INACTIVE"`, for this long
 # before actually purging it (mirrors ec2compute.py's
@@ -457,8 +464,39 @@ def _task_wire(task: dict) -> dict:
 # `_maybe_mark_stopped`, module docstring's "GATEWAY-INTERNAL RECONCILE") ---
 
 
+def _ship_task_logs(stores: SynthStores, env: str, task: dict, runtime: TaskRuntime) -> None:
+    """Ship one task container's log tail into `/ecs/{service}` -- the group
+    an `awslogs` log-configuration would name in real ECS, so a crash's output
+    survives the container that produced it.
+
+    ONE STREAM PER REAL TASK CONTAINER, named after the container itself
+    (`odin-ecs-{env}-{task_id8}-{container}`) -- odin's honest deviation from
+    AWS's `{prefix}/{container}/{taskId}` stream naming, and what makes
+    `ingest_tail`'s cursor stable: the cursor counts how many lines of THIS
+    container's output have been ingested, and a task container is never
+    reused (a replacement task gets a new task_id, hence a new stream), so a
+    re-read of the same tail appends nothing.
+
+    Cost: `sweep_tasks` runs on every reconciler tick (`reconcile/
+    tf_status.py`) and every ECS `Describe*`/`ListTasks`, so this is exactly
+    ONE bounded `docker logs --tail N` per task per sweep, with the cursor --
+    not a growing log group -- absorbing the repetition. No try/except: the
+    read is `TaskRuntime.logs` -> the driver's `check=False` CLI call, which
+    answers "" for an already-removed container instead of raising.
+    """
+    logsctl.ingest_tail(
+        stores, env, f"/ecs/{task['service_name']}",
+        container_name(env, task["task_id"], task["container_name"]),
+        runtime.logs(env, task["task_id"], task["container_name"], _LOG_TAIL_LINES),
+    )
+
+
 def sweep_tasks(stores: SynthStores, env: str, runtime: TaskRuntime) -> None:
     for task in _all_tasks(stores, env):
+        # Before (and independent of) the RUNNING-only check below: a task
+        # that already exited on its own still has its FINAL lines sitting in
+        # a stopped container, and those lines ARE the crash diagnostic.
+        _ship_task_logs(stores, env, task, runtime)
         if task["last_status"] != "RUNNING":
             continue
         status = runtime.status(env, task["task_id"], task["container_name"])

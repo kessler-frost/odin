@@ -25,7 +25,7 @@ from odin.aws.backings import REGION
 from odin.compute.tasks import TaskContainerHandle
 from odin.gateway.classify import classify
 from odin.gateway.keys import KeyStore
-from odin.gateway.models import ecsctl
+from odin.gateway.models import ecsctl, logsctl
 from odin.gateway.stores import SynthStores
 from odin.runtime.colima import CONTAINER_HOST
 
@@ -54,6 +54,9 @@ class FakeTaskRuntime:
         self.stopped: list[tuple] = []
         self._status: dict[tuple, str] = {}
         self._exit_codes: dict[tuple, int] = {}
+        # Stands in for each container's own stdout/stderr, as `docker logs
+        # --tail N` would report it (see `print_line`).
+        self._logs: dict[tuple, str] = {}
 
     def run(
         self, env: str, task_id: str, container_def: dict, extra_env: dict[str, str] | None = None,
@@ -78,6 +81,14 @@ class FakeTaskRuntime:
     def stop(self, env: str, task_id: str, container_name: str) -> None:
         self.stopped.append((env, task_id, container_name))
         self._status[(env, task_id, container_name)] = "exited"
+
+    def logs(self, env: str, task_id: str, container_name: str, tail: int = 20) -> str:
+        return self._logs.get((env, task_id, container_name), "")
+
+    def print_line(self, env: str, task_id: str, container_name: str, line: str) -> None:
+        """Test-only: the container writes one more line to its own stdout."""
+        key = (env, task_id, container_name)
+        self._logs[key] = f"{self._logs.get(key, '')}{line}\n"
 
     def mark_exited(self, env: str, task_id: str, container_name: str, exit_code: int = 1) -> None:
         """Test-only: simulate a container crashing/completing ON ITS OWN --
@@ -647,3 +658,61 @@ def test_describe_tasks_lazily_marks_a_spontaneously_exited_container_stopped(si
 
     service = _describe_service(stores, sink, ecs, runtime)
     assert service["runningCount"] == 0
+
+
+# --- W2.1 piece 3: the sweep ships each task's tail into /ecs/{service} ---------
+
+
+def _running_service(sink, ecs, stores) -> tuple[FakeTaskRuntime, str]:
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(stores, sink, ecs, runtime, desiredCount=1)
+    _wait_for_running_count(stores, sink, ecs, runtime, 1)
+    return runtime, runtime.ran[0][1]
+
+
+def _shipped(stores) -> list[dict]:
+    return logsctl.stored_events(stores, ENV, "/ecs/app", 100)
+
+
+def test_sweep_ships_a_task_container_tail_into_the_service_log_group(sink, ecs, stores):
+    runtime, task_id = _running_service(sink, ecs, stores)
+    runtime.print_line(ENV, task_id, "app", "nginx: ready to accept connections")
+
+    _describe_service(stores, sink, ecs, runtime)  # every Describe* sweeps
+
+    events = _shipped(stores)
+    assert [e["message"] for e in events] == ["nginx: ready to accept connections"]
+    # One stream per real task container (ecsctl.py's `_ship_task_logs`).
+    assert {e["stream"] for e in events} == {f"odin-ecs-default-{task_id[:8]}-app"}
+    assert logsctl.group_exists(stores, ENV, "/ecs/app")  # auto-created by ingestion
+
+
+def test_resweeping_the_same_tail_never_duplicates_events(sink, ecs, stores):
+    runtime, task_id = _running_service(sink, ecs, stores)
+    runtime.print_line(ENV, task_id, "app", "started")
+
+    for _ in range(3):  # a Describe* per reconciler tick, over and over
+        _describe_service(stores, sink, ecs, runtime)
+    assert [e["message"] for e in _shipped(stores)] == ["started"]
+
+    runtime.print_line(ENV, task_id, "app", "handled a request")
+    _describe_service(stores, sink, ecs, runtime)
+    assert [e["message"] for e in _shipped(stores)] == ["started", "handled a request"]
+
+
+def test_sweep_captures_the_final_lines_of_a_task_that_already_exited(sink, ecs, stores):
+    """The crash diagnostic: shipping runs BEFORE the RUNNING-only status
+    check, so a container that died on its own still hands over its last
+    output -- and keeps handing over nothing new on later sweeps."""
+    runtime, task_id = _running_service(sink, ecs, stores)
+    runtime.print_line(ENV, task_id, "app", "FATAL: config missing")
+    runtime.mark_exited(ENV, task_id, "app", exit_code=1)
+
+    service = _describe_service(stores, sink, ecs, runtime)
+    assert service["runningCount"] == 0  # the sweep also demoted it, as before
+    assert [e["message"] for e in _shipped(stores)] == ["FATAL: config missing"]
+
+    _describe_service(stores, sink, ecs, runtime)
+    assert len(_shipped(stores)) == 1
