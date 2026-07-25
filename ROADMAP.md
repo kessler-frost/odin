@@ -492,6 +492,41 @@ future decision against these points instead of re-deriving them:
   and `odin doctor` (toolchain checks with exact fixes, disk headroom,
   `--prebake` for the dynalite image). Full binary vendoring into one
   distributable.
+- [x] **Pre-apply admission control.** `/apply-full` and `/tf/apply` both
+  estimate the canvas's memory footprint and check free disk BEFORE spawning a
+  single container or VM, and reject with a `409` whose message names the real
+  numbers (`reconcile/admission.py`). A 3 x t3.medium canvas is refused in ~1s
+  with nothing booted and no env directory created.
+  - **Two DISJOINT pools, because the substrates are** (fixed v0.7.1, field
+    test 2 finding MEDIUM-9 — everything used to be charged against Colima's
+    VM, so a 48 GiB Mac was told "4.0 GiB budget (5.8 GiB total on this
+    host)" and a 5 x t3.micro canvas was wrongly refused):
+    - CONTAINER pool — `rds`/`ecs`/`lambda`/`elasticache`/`alb` plus the shared
+      `s3`/`sqs`/`sns`/`dynamodb` backing containers, charged against the
+      container runtime's own MemTotal (`docker info`, i.e. Colima's VM), and
+      the rejection says exactly that rather than "this host".
+    - HOST/VM pool — an `ec2` node is a REAL Lima VM allocated by
+      Virtualization.framework from the Mac's RAM and consumes zero Colima
+      memory, so it is charged against, and quoted against, real host memory
+      (`os.sysconf` — stdlib, no new dependency, no subprocess).
+  - **The budget** is 70% of each pool's TOTAL memory (not free memory).
+    Overrides: `ODIN_MEMORY_BUDGET_MIB` (container pool, absolute MiB),
+    `ODIN_VM_MEMORY_BUDGET_MIB` (VM pool), `ODIN_MIN_DISK_GIB` (free-disk
+    floor, default 10 GiB — the same figure `odin doctor` checks).
+  - **What it charges:** ec2 = the exact `INSTANCE_TYPES` memory;
+    rds/ecs/lambda/elasticache/alb = a fixed per-node figure equal to that
+    substrate's own real container memory cap; s3/sqs/sns/dynamodb = once per
+    ENV, not per node (they share one backing container);
+    vpc/subnet/sg/iam_role/ecr = zero.
+  - **v1 limits, recorded rather than hidden:** an unknown total for either
+    pool (Colima not running; `os.sysconf` unanswered) SKIPS that pool's check
+    instead of printing a confident wrong number. It is a STATIC per-canvas
+    estimate and does not look at memory actually in use, so two envs can each
+    pass and jointly overcommit — cross-env accounting would mean summing every
+    other env's applied Stack, which is not wired. `odin doctor` reports
+    nothing about memory, so the ceiling is not discoverable before an Apply
+    hits it, and it hardcodes its own disk floor rather than honouring
+    `ODIN_MIN_DISK_GIB`.
 - [ ] **M7 (multi-Mac) — the fleet.** The single-host half is DONE (see
   above: a real lighthouse + real per-VM daemons + a real ping/SG-filter
   proof, all on one Mac). What remains is genuinely cross-machine: a second
