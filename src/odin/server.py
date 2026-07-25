@@ -387,6 +387,20 @@ def create_tf_router(
 _SUPERSEDED = {"error": "superseded by a newer teardown/apply"}
 
 
+def _unhealthy_wire(kind: str, node: str, observed: str, reason: str | None) -> dict:
+    """One post-apply fault, in ONE wire shape across kinds. Lambda calls its
+    field `State` and RDS calls its `DBInstanceStatus` -- each model keeps its
+    own AWS vocabulary internally (`lambdactl.FunctionFault`,
+    `rdsctl.DatabaseFault`), and this is where they become one list a client
+    can read without a per-kind branch."""
+    return {"kind": kind, "node": node, "observed": observed, "reason": reason}
+
+
+def _unhealthy_line(item: dict) -> str:
+    reason = f" ({item['reason']})" if item["reason"] else ""
+    return f"{item['kind']} {item['node']} is {item['observed']}{reason}"
+
+
 def create_apply_full_router(
     store: SpecStore, reconciler_for, runner: TfRunner, keystore: KeyStore, gateway_port, env_epoch: dict[str, int],
     translate_cache: translate_mod.TranslateCache, runtime, stores: SynthStores,
@@ -397,9 +411,11 @@ def create_apply_full_router(
     is a 200 with an honest per-half status -- the reconciler half can
     genuinely succeed while tofu fails ("applied_tf_failed"), and BOTH halves
     can succeed while a service is still short of its desired task count
-    ("applied_services_unhealthy", field test 3); 409 only when a tofu run is
-    already in flight for the env. Only `applied` is a clean apply; every
-    other status is a nonzero exit in `cli/apply.py`."""
+    ("applied_services_unhealthy", field test 3) or while a lambda/rds node
+    this apply tried to converge never came up ("applied_resources_unhealthy");
+    409 only when a tofu run is already in flight for the env. Only `applied`
+    is a clean apply; every other status is a nonzero exit in
+    `cli/apply.py`."""
     router = APIRouter()
 
     @router.post("/apply-full")
@@ -574,7 +590,7 @@ def create_apply_full_router(
         # diff on), so tofu's plan is empty forever. Real Lambda's own control
         # plane replaces a dead sandbox; this is odin's equivalent. Idempotent:
         # only a `Failed` function is re-`ensure`d, an Active one is untouched.
-        lambdactl.converge_functions(stores, env, keystore=keystore, gateway_port=gateway_port())
+        deploying = lambdactl.converge_functions(stores, env, keystore=keystore, gateway_port=gateway_port())
         # W2.7: and the same recovery for rds. A Postgres container is odin's
         # execution substrate for a resource whose terraform config is
         # unchanged (`status` is read-only Computed in the provider's schema),
@@ -583,7 +599,7 @@ def create_apply_full_router(
         # one is re-created and re-`pg_ready`-gated. This is what makes the
         # scenario-2 crash/recover behavior survive the move off the
         # reconciler -- see reconcile/drift.py's rds notes.
-        rdsctl.converge_db_instances(stores, env)
+        booting = rdsctl.converge_db_instances(stores, env)
         # W2.6: and push each live database's SG-compiled firewall into its mesh
         # sidecar. An apply is exactly the right cadence -- security groups are
         # TF-owned, so an edited `db-sg` only reaches the gateway here, and
@@ -619,6 +635,36 @@ def create_apply_full_router(
                 body["note"] = (
                     "desired state committed, but the service(s) above are not running "
                     "their desired task count — fix and re-apply"
+                )
+        # ...and the identical verification for the OTHER two kinds with the
+        # same fire-and-verify-later shape. `converge_functions` and
+        # `converge_db_instances` above each START real work and return, so
+        # without this an apply reported `applied` the instant a redeploy was
+        # spawned -- field test 3's exact bug, in the two places its fix didn't
+        # reach. Concurrently, because they are independent waits and a slow
+        # lambda pull should not be charged on top of a slow database boot; both
+        # return after one store read when nothing is coming up, so a healthy
+        # apply pays approximately nothing. Same `if applied` gate, for the same
+        # reason: a tofu failure has already failed this apply honestly.
+        if body["status"] == "applied":
+            faulted_fns, faulted_dbs = await asyncio.gather(
+                asyncio.to_thread(lambdactl.wait_for_active_functions, stores, env, deploying),
+                asyncio.to_thread(rdsctl.wait_for_available_instances, stores, env, booting),
+            )
+            unhealthy = (
+                [_unhealthy_wire("lambda", f.node, f.state, f.reason) for f in faulted_fns]
+                + [_unhealthy_wire("rds", f.node, f.status, f.reason) for f in faulted_dbs]
+            )
+            if unhealthy:
+                body["status"] = "applied_resources_unhealthy"
+                body["unhealthy_resources"] = unhealthy
+                # Named in the NOTE as well as the structured list: `odin apply`
+                # echoes `note` verbatim, so an operator sees WHICH resource and
+                # WHY without having to read the JSON body.
+                body["note"] = (
+                    "desired state committed, but "
+                    + "; ".join(map(_unhealthy_line, unhealthy))
+                    + " — fix and re-apply"
                 )
         await reconciler.tick()  # kick an immediate pass; the loop continues it
         return JSONResponse(status_code=200, content=body)

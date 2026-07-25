@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import stat
+import time
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -685,3 +686,154 @@ def test_world_keeps_being_projected_while_an_apply_full_is_in_flight(tmp_path, 
     assert phases[-1] == "crashed", f"the world froze at its pre-failure reading: {phases}"
     # ...and the verdict rides along, not just the colour.
     assert store.current_world("default").get("edge").verdict == "no space left on device"
+
+
+# --- the same discipline for lambda + rds: an apply may not report success on
+# --- a function/database this very apply failed to bring up ------------------
+
+
+class _DeadFunctionRuntime:
+    """A FunctionRuntime whose container never comes up -- `ensure` raises the
+    way a real failed RIE boot does, and nothing is ever ready."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def code_dir(self, env, function_name):
+        return Path("/nonexistent") / env / function_name
+
+    def ensure(self, *args, **kwargs):
+        raise RuntimeError("pull access denied for public.ecr.aws/lambda/python:3.12")
+
+
+class _DeadPostgresRds:
+    """A PostgresRds whose container never starts -- `create_db` raises the way
+    a real `docker run` failure does."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def create_db(self, db_id, user, password, db_name="postgres"):
+        raise RuntimeError("docker run failed: no space left on device")
+
+
+def _seed_failed_function(app, env: str = "default") -> None:
+    """A function the reality sweep already marked `Failed` -- exactly the
+    state an Apply is supposed to be the recovery for."""
+    app.state.gateway_stores.lambdactl.set(env, "fn:worker", {
+        "function_name": "worker", "state": "Failed", "state_reason": "container removed outside odin",
+        "state_reason_code": "InternalError", "last_update_status": "Successful",
+        "last_update_status_reason": None, "last_update_status_reason_code": None,
+        "runtime": "python3.12", "handler": "lambda_function.lambda_handler",
+        "environment": {}, "memory_size": 128,
+        "function_arn": "arn:aws:lambda:us-east-1:000000000000:function:worker",
+    })
+
+
+def _seed_failed_database(app, env: str = "default") -> None:
+    app.state.gateway_stores.rdsctl.set(env, "db:app-db", {
+        "db_instance_identifier": "app-db", "status": "failed",
+        "status_reason": "container removed outside odin",
+        "master_username": "app", "master_password": "apppass123", "db_name": "postgres",
+        "vpc_security_group_ids": [], "overlay_ip": None, "endpoint_address": "127.0.0.1",
+        "endpoint_port": 0, "engine": "postgres",
+    })
+
+
+def _patch_dead_substrates(monkeypatch) -> None:
+    monkeypatch.setattr("odin.gateway.models.lambdactl.FunctionRuntime", _DeadFunctionRuntime)
+    monkeypatch.setattr("odin.gateway.models.rdsctl.PostgresRds", _DeadPostgresRds)
+
+
+def test_apply_full_fails_when_a_lambda_this_apply_converged_never_came_back(tmp_path, monkeypatch):
+    """The field-test-3 bug in the place its fix never reached: tofu sees a
+    no-op (an `aws_lambda_function`'s config is unchanged when its container
+    dies), odin's own converge starts a redeploy, and the apply used to report
+    `applied` the instant that thread was spawned."""
+    _patch_dead_substrates(monkeypatch)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: None)
+    _patch_translate(monkeypatch, TranslateResult(files={}, refined=False))
+    app = _app(tmp_path)
+    _seed_failed_function(app)
+    with TestClient(app) as client:
+        resp = client.post("/apply-full", json={"nodes": [], "edges": []})
+    body = resp.json()
+    assert body["status"] == "applied_resources_unhealthy", body
+    assert body["unhealthy_resources"] == [{
+        "kind": "lambda", "node": "worker", "observed": "Failed",
+        "reason": "pull access denied for public.ecr.aws/lambda/python:3.12",
+    }], body
+    # The note is what `odin apply` echoes, so the resource and the real reason
+    # have to be legible without reading the JSON.
+    assert "lambda worker is Failed" in body["note"]
+    assert "pull access denied" in body["note"]
+    assert "fix and re-apply" in body["note"]
+
+
+def test_apply_full_fails_when_an_rds_this_apply_converged_never_came_back(tmp_path, monkeypatch):
+    _patch_dead_substrates(monkeypatch)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: None)
+    _patch_translate(monkeypatch, TranslateResult(files={}, refined=False))
+    app = _app(tmp_path)
+    _seed_failed_database(app)
+    with TestClient(app) as client:
+        resp = client.post("/apply-full", json={"nodes": [], "edges": []})
+    body = resp.json()
+    assert body["status"] == "applied_resources_unhealthy", body
+    assert body["unhealthy_resources"] == [{
+        "kind": "rds", "node": "app-db", "observed": "failed",
+        "reason": "container did not start: docker run failed: no space left on device",
+    }], body
+    assert "rds app-db is failed" in body["note"]
+    assert "no space left on device" in body["note"]
+
+
+def test_apply_full_reports_a_broken_lambda_and_a_broken_database_together(tmp_path, monkeypatch):
+    """One apply, both kinds: the two waits run concurrently, and BOTH faults
+    are named -- fixing one and re-applying must not surface the other as a
+    surprise."""
+    _patch_dead_substrates(monkeypatch)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: None)
+    _patch_translate(monkeypatch, TranslateResult(files={}, refined=False))
+    app = _app(tmp_path)
+    _seed_failed_function(app)
+    _seed_failed_database(app)
+    with TestClient(app) as client:
+        resp = client.post("/apply-full", json={"nodes": [], "edges": []})
+    body = resp.json()
+    assert body["status"] == "applied_resources_unhealthy", body
+    assert [item["node"] for item in body["unhealthy_resources"]] == ["worker", "app-db"], body
+
+
+def test_apply_full_stays_applied_when_no_lambda_or_database_is_broken(tmp_path, monkeypatch):
+    """The good path must not slow down or start failing: no lambda and no rds
+    at all means the check is one store read and the status is untouched."""
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: None)
+    _patch_translate(monkeypatch, TranslateResult(files={}, refined=False))
+    app = _app(tmp_path)
+    with TestClient(app) as client:
+        started = time.monotonic()
+        resp = client.post("/apply-full", json={"nodes": [], "edges": []})
+        elapsed = time.monotonic() - started
+    body = resp.json()
+    assert body["status"] == "applied", body
+    assert "unhealthy_resources" not in body
+    assert elapsed < 5.0, f"a healthy apply took {elapsed:.2f}s -- the verification must cost ~nothing"
+
+
+def test_a_tofu_failure_is_not_also_charged_the_lambda_and_rds_waits(tmp_path, monkeypatch):
+    """Same rule the ECS wait follows: a tofu failure has already failed the
+    apply honestly, and a second verification would only make it slower while
+    replacing the actual diagnosis with a downstream symptom."""
+    _patch_dead_substrates(monkeypatch)
+    _write_fake_tofu(tmp_path, _APPLY_FAILS)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    _patch_translate(monkeypatch, TranslateResult(files=_skeleton_files(), refined=True))
+    app = _app(tmp_path)
+    _seed_failed_function(app)
+    _seed_failed_database(app)
+    with TestClient(app) as client:
+        resp = client.post("/apply-full", json=S3_SQS)
+    body = resp.json()
+    assert body["status"] == "applied_tf_failed", body
+    assert "unhealthy_resources" not in body
