@@ -84,8 +84,17 @@ export default function App() {
     if (!res.ok) { pushToast('error', `Apply failed (HTTP ${res.status})`); return; }
     const body = await res.json().catch(() => ({}));
     const tf = body.tf;
+    // Field test 3: `tf: ok` is not the same as "it works". A service that
+    // ended the apply short of its desired task count is an outage, and this
+    // toast must not read green while one is on the canvas — same rule the CLI
+    // now exits nonzero for.
+    const unhealthy: { node: string; running: number; desired: number; reason?: string }[] = body.unhealthy ?? [];
+    for (const svc of unhealthy) {
+      pushToast('error', `${svc.node}: ${svc.running}/${svc.desired} tasks running${svc.reason ? ` — ${svc.reason}` : ''}`);
+    }
     // tf === null: nothing TF-supported on the canvas — a clean success.
-    if (!tf) pushToast('success', `Applied to ${body.env ?? env}`);
+    if (unhealthy.length) pushToast('error', `Applied to ${body.env ?? env}, but a service is not running — see Events`);
+    else if (!tf) pushToast('success', `Applied to ${body.env ?? env}`);
     else if (tf.status === 'ok') pushToast('success', `Applied to ${body.env ?? env} — Terraform converged`);
     else if (tf.status === 'failed') pushToast('error', `Applied to ${body.env ?? env}, but Terraform failed (exit ${tf.exit_code}) — see Events for output`);
     else pushToast('info', `Applied to ${body.env ?? env} — Terraform skipped: ${tf.error}. Fix: ${tf.fix}`);

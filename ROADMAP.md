@@ -137,8 +137,22 @@ future decision against these points instead of re-deriving them:
     the old tasks serving). Closing that needs the World projection to
     distinguish "serving the previous revision" from "healthy", or a service
     running old tasks would report `healthy` while its deployment failed — a
-    worse lie than the outage. The apply now FAILS loudly either way, so CI
-    stops instead of scoring the outage green. (Fixed: a
+    worse lie than the outage. The apply FAILS loudly either way, so CI
+    stops instead of scoring the outage green — but note it takes **two**
+    guards to make that sentence true, and v0.7.1 shipped only the first.
+    `wait_for_steady_state` is evaluated **only when tofu actually updates the
+    resource**, so field test 3 found the hole: any apply tofu sees as a NO-OP
+    (a re-apply on the already-broken service; an edit that only touches the
+    launch-time `env` map, which is deliberately not in the task definition)
+    skipped the check and reported `applied / tf: ok` at 0-of-3 tasks,
+    reproducibly. FIXED in v0.7.2 by odin's own post-apply verification —
+    `ecsctl.wait_for_steady_services`, run by `/apply-full` after its
+    convergence pass, which fails the apply naming the service, running-vs-
+    desired, and the real underlying reason
+    (`tests/simulate/test_ecs_noop_apply_outage_e2e.py`). Bounded by the same
+    60s budget as `timeouts.update` (`ODIN_ECS_STEADY_TIMEOUT` overrides), and
+    it returns the moment nothing is left pending, so a healthy apply pays one
+    store read. (Fixed: a
     `tags` block on `aws_ecs_service` now plans zero-drift — the gateway stores
     the full tag set and echoes it back, with
     `TagResource`/`UntagResource`/`ListTagsForResource` modeled.)

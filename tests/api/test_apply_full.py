@@ -534,3 +534,91 @@ def test_stale_request_is_superseded_right_before_the_final_commit(tmp_path, mon
     assert resp.json() == STALE_BODY
     assert calls == []
     assert app.state.store.head("default") is None
+
+
+# --- field test 3 (HIGH): a no-op apply may not report success at zero tasks --
+
+
+class _DeadTaskRuntime:
+    """A TaskRuntime whose containers never come up -- `run` raises the way a
+    real bad-image `docker run` does, and nothing is ever `running`."""
+
+    def run(self, env, task_id, container_def, extra_env=None, cpu=None, memory=None):
+        raise RuntimeError(f"pull access denied for {container_def['image']}")
+
+    def status(self, env, task_id, container_name):
+        return "absent"
+
+    def exit_code(self, env, task_id, container_name):
+        return 0
+
+    def stop(self, env, task_id, container_name):
+        pass
+
+    def logs(self, env, task_id, container_name, tail=20):
+        return ""
+
+
+def _seed_broken_service(app, env: str = "default") -> None:
+    """A 3-task ECS service already at zero, exactly as field test 3 found it:
+    the gateway records are what a prior failed deployment left behind."""
+    stores = app.state.gateway_stores
+    stores.ecsctl.set(env, "taskdef:web:1", {
+        "family": "web", "revision": 1, "status": "ACTIVE",
+        "container_definitions": [{"name": "web", "image": "nginx:this-tag-does-not-exist-9z9z"}],
+    })
+    stores.ecsctl.set(env, "service:odin:web", {
+        "cluster_name": "odin", "service_name": "web", "status": "ACTIVE",
+        "desired_count": 3, "node_label": "web", "created_at": 0.0, "events": [],
+        "task_definition_arn": "arn:aws:ecs:us-east-1:000000000000:task-definition/web:1",
+    })
+
+
+def test_apply_full_fails_when_a_service_is_short_of_its_desired_count(tmp_path, monkeypatch):
+    """THE field-test-3 bug: tofu sees a no-op (`tf: ok`, or no tf at all) and
+    the apply reported `applied` while the service sat at 0 of 3 tasks."""
+    monkeypatch.setattr("odin.server.TaskRuntime", _DeadTaskRuntime)
+    monkeypatch.setenv("ODIN_ECS_STEADY_TIMEOUT", "5")
+    _patch_translate(monkeypatch, TranslateResult(files={}, refined=False))
+    app = _app(tmp_path)
+    _seed_broken_service(app)
+    with TestClient(app) as client:
+        resp = client.post("/apply-full", json={"nodes": [], "edges": []})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "applied_services_unhealthy", body
+    assert body["unhealthy"] == [{
+        "node": "web", "running": 0, "desired": 3,
+        "reason": "pull access denied for nginx:this-tag-does-not-exist-9z9z",
+    }], body
+    assert "fix and re-apply" in body["note"]
+
+
+def test_apply_full_stays_applied_when_no_service_is_short(tmp_path, monkeypatch):
+    """The good path must not slow down or start failing: no ECS at all means
+    the check is one store read and the status is untouched."""
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: None)
+    _patch_translate(monkeypatch, TranslateResult(files={}, refined=False))
+    app = _app(tmp_path)
+    with TestClient(app) as client:
+        resp = client.post("/apply-full", json={"nodes": [], "edges": []})
+    body = resp.json()
+    assert body["status"] == "applied", body
+    assert "unhealthy" not in body
+
+
+def test_a_tofu_failure_is_not_also_charged_the_steady_wait(tmp_path, monkeypatch):
+    """A tofu failure already fails the apply honestly -- re-verifying services
+    it never converged would only make that failure slower, and would replace
+    the tofu output (the actual diagnosis) with a downstream symptom."""
+    monkeypatch.setattr("odin.server.TaskRuntime", _DeadTaskRuntime)
+    _write_fake_tofu(tmp_path, _APPLY_FAILS)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    _patch_translate(monkeypatch, TranslateResult(files=_skeleton_files(), refined=True))
+    app = _app(tmp_path)
+    _seed_broken_service(app)
+    with TestClient(app) as client:
+        resp = client.post("/apply-full", json=S3_SQS)
+    body = resp.json()
+    assert body["status"] == "applied_tf_failed", body
+    assert "unhealthy" not in body
