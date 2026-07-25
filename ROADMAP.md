@@ -695,6 +695,28 @@ future decision against these points instead of re-deriving them:
     It DOES regenerate `main.tf`/`override.tf` from the current canvas first
     (the same files an apply regenerates), which is what makes "changes
     present" mean "the canvas and the env disagree".
+- **A failed Lambda invoke reports `FunctionError`, as real AWS does.**
+  `aws lambda invoke` on a handler that raises used to come back
+  `StatusCode: 200` with no `FunctionError` — the documented AWS way to
+  detect a failed invoke — so a CI job scored a crashing function as a
+  success (v0.7.2, field test 3; same failure shape as the exit-0-during-an-
+  outage bug: the truth was available and the success signal didn't reflect
+  it). **Cause:** the real RIE does not send `X-Amz-Function-Error` at all. A
+  raised handler answers `200 OK` with the error document as the BODY and no
+  header; an import failure or runtime exit answers `502` with the same
+  shape. odin read only that header, so the value was always None — and with
+  it `last_invocation_error`, the World verdict's own field (v0.7.1), which
+  is fed from the same value and was therefore also silently dead. odin's
+  fake RIE in the unit tests obligingly sent the header real RIE never sends.
+  `compute/functions.py::_function_error` now reads the invocation outcome
+  off the response RIE actually gives (non-200, or a body carrying BOTH
+  `errorType` and `errorMessage`), one signal feeding both the
+  `x-amz-function-error` response header the SDK parses and the durable
+  record. Always `Unhandled`: RIE collapses AWS's Handled/Unhandled
+  distinction, so odin reports the value an uncaught handler exception gets
+  on real AWS rather than inventing a difference it cannot observe. Proven by
+  `tests/simulate/test_lambda_failure_e2e.py` — real RIE containers, a real
+  gateway, and boto3's own `FunctionError` as the assertion.
 - **`tofu` runs are BOUNDED, and a wedged destroy says why.** `init`/`apply`
   each get `ODIN_TOFU_TIMEOUT` (default 600s); `destroy` gets a smaller
   WHOLE-CALL deadline, `ODIN_TOFU_DESTROY_TIMEOUT` (default 300s, `init`
