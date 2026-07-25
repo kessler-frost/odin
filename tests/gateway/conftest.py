@@ -88,6 +88,11 @@ def ecs(sink: CaptureSink):
     return _client(sink, "ecs")
 
 
+@pytest.fixture
+def elasticache(sink: CaptureSink):
+    return _client(sink, "elasticache")
+
+
 def split_url(url: str) -> tuple[str, dict[str, str]]:
     """path + query dict for classify(), preserving bare markers with no
     `=` (`?location`, `?uploads`, `?acl`, `?delete`) that `parse_qsl` drops

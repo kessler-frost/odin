@@ -172,6 +172,10 @@ class SynthStores:
       `"taskdef:{family}:{revision}"` / `"service:{cluster}:{name}"` /
       `"task:{cluster}:{task_id}"`, persisted at
       `.odin/{env}/gateway/ecsctl.json`.
+    - `cachectl`: the ElastiCache control-plane model's whole state
+      (`gateway/models/cachectl.py`, W2.8) -- flat keys `"cluster:{id}"`,
+      persisted at `.odin/{env}/gateway/cachectl.json`. ElastiCache tags live
+      in the shared `tags` store above, keyed `"elasticache:{arn}"`.
     """
 
     def __init__(self, root: Path) -> None:
@@ -186,3 +190,4 @@ class SynthStores:
         self.ec2compute = JsonStore(root, "ec2compute")
         self.lambdactl = JsonStore(root, "lambdactl")
         self.ecsctl = JsonStore(root, "ecsctl")
+        self.cachectl = JsonStore(root, "cachectl")
