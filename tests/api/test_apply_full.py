@@ -685,3 +685,71 @@ def test_world_keeps_being_projected_while_an_apply_full_is_in_flight(tmp_path, 
     assert phases[-1] == "crashed", f"the world froze at its pre-failure reading: {phases}"
     # ...and the verdict rides along, not just the colour.
     assert store.current_world("default").get("edge").verdict == "no space left on device"
+
+
+# --- v0.7.4: the CI gate is the API's own field, not the CLI's -------------
+#
+# Fresh-user MISLEAD-1 was fixed in v0.7.3 by unioning `skipped` + `unsupported`
+# into `not_covered` -- but the union was computed in `cli/apply.py`, so
+# `curl /apply-full` (an agent, or a CI job without the odin CLI -- an equal
+# citizen per NORTHSTAR directive 8) still got only the two easily-confused
+# arrays and hit the original trap. These tests read the RAW HTTP body.
+
+DROPPED_KINDS = {
+    "nodes": [
+        {"type": "s3", "data": {"label": "uploads"}},
+        {"type": "kinesis", "data": {"label": "stream"}},
+        {"type": "notarealservice", "data": {"label": "typo"}},
+    ],
+    "edges": [],
+}
+
+
+def test_apply_full_publishes_not_covered_for_a_kind_odin_does_not_model(tmp_path, monkeypatch):
+    """The exact gate the README documents, against the raw response body:
+    `.unsupported` is EMPTY while two drawn nodes were dropped, and only
+    `.not_covered` catches it."""
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: None)
+    _patch_translate(monkeypatch, TranslateResult(files=_skeleton_files(), refined=True))
+    app = _app(tmp_path)
+    with TestClient(app) as client:
+        body = client.post("/apply-full", json=DROPPED_KINDS).json()
+    assert body["unsupported"] == []                                # the old gate: still green
+    assert body["skipped"] == ["kinesis", "notarealservice"]
+    assert body["not_covered"] == ["kinesis", "notarealservice"]    # the gate that works
+    assert len(body["not_covered"]) != 0
+
+
+def test_apply_full_not_covered_unions_both_arrays_without_replacing_either(tmp_path, monkeypatch):
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: None)
+    _patch_translate(monkeypatch, TranslateResult(
+        files=_skeleton_files(), refined=True, unsupported=["cache1 (elasticache): unbuilt"],
+    ))
+    app = _app(tmp_path)
+    with TestClient(app) as client:
+        body = client.post("/apply-full", json=DROPPED_KINDS).json()
+    assert body["skipped"] == ["kinesis", "notarealservice"]         # still published verbatim
+    assert body["unsupported"] == ["cache1 (elasticache): unbuilt"]  # ...and so is this
+    assert body["not_covered"] == ["kinesis", "notarealservice", "cache1 (elasticache): unbuilt"]
+
+
+def test_apply_full_publishes_an_empty_not_covered_when_everything_was_covered(tmp_path, monkeypatch):
+    """The field must be PRESENT on the clean path too -- a gate that has to
+    cope with a missing key is a gate that can be written wrong."""
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: None)
+    _patch_translate(monkeypatch, TranslateResult(files=_skeleton_files(), refined=True))
+    app = _app(tmp_path)
+    with TestClient(app) as client:
+        body = client.post("/apply-full", json=S3_SQS).json()
+    assert body["not_covered"] == []
+
+
+def test_plain_apply_publishes_the_same_gate_field(tmp_path):
+    """`/apply` (the reconciler half alone) generates no Terraform, so its
+    union is the skipped list -- under the same name, so one gate shape reads
+    every apply surface."""
+    app = _app(tmp_path)
+    with TestClient(app) as client:
+        body = client.post("/apply", json=DROPPED_KINDS).json()
+    assert body["skipped"] == ["kinesis", "notarealservice"]
+    assert body["not_covered"] == ["kinesis", "notarealservice"]

@@ -4,6 +4,8 @@ round-trip through the real gateway is `test_tf_runner_e2e.py`
 (integration); this file only exercises route<->runner wiring with fakes."""
 from __future__ import annotations
 
+import json
+
 from fastapi.testclient import TestClient
 
 from odin.gateway.keys import OPERATOR_NODE_ID
@@ -12,6 +14,7 @@ from odin.server import create_app
 from odin.simulate.runner import SimulateBusy, TfResult
 from odin.spec.models import FieldValue, ResourceDesired, Stack
 from odin.spec.store import SpecStore
+from odin.spec.translate import canvas_to_stack
 
 
 class FakeRuntime:
@@ -218,3 +221,90 @@ def test_tf_status_for_a_never_applied_env(tmp_path):
     assert body["running"] is False
     assert body["workspace_exists"] is False
     assert body["last"] is None
+
+
+# --- v0.7.4: what "not covered by this plan" actually describes ------------
+#
+# v0.7.3 had `odin tf plan` GET /canvas and derive `skipped` from the canvas
+# drawn NOW, then union it into `not_covered` beside an `unsupported` derived
+# from the LAST-APPLIED Stack -- two different things in one array, with
+# nothing saying so. Both halves are computed here now (one source of truth,
+# and `curl /tf/plan` gets them), and when they no longer describe the same
+# thing the payload says which is which.
+
+TYPO_CANVAS = {
+    "nodes": [
+        {"id": "n0", "type": "s3", "data": {"label": "uploads"}},
+        {"id": "n1", "type": "kinesis", "data": {"label": "stream"}},
+    ],
+    "edges": [],
+}
+
+
+def _plan_app(tmp_path, result: TfResult, canvas: dict | None = None):
+    """An app whose /tf/plan returns `result`, with `canvas` already saved --
+    at the STORE's own canvas path, so this reads the test's canvas and never
+    the checkout's real `.odin/canvas.json`."""
+    app = create_app(runtime=FakeRuntime(), store=SpecStore(tmp_path), rds=FakeRds(), backings=False)
+    app.state.tf_runner.plan = _plan_returning(result)
+    if canvas is not None:
+        (tmp_path / "canvas.json").write_text(json.dumps(canvas))
+    return app
+
+
+def test_tf_plan_publishes_the_gate_field_the_cli_used_to_compute(tmp_path):
+    app = _plan_app(tmp_path, TfResult(ok=True, exit_code=0), TYPO_CANVAS)
+    with TestClient(app) as client:
+        body = client.post("/tf/plan", params={"env": "default"}).json()
+    assert body["skipped"] == ["kinesis"]
+    assert body["not_covered"] == ["kinesis"]
+
+
+def test_tf_plan_says_so_when_the_canvas_is_not_what_this_env_applied(tmp_path):
+    """THE correctness fix. Nothing has been applied to this env, so the plan
+    covers an EMPTY Stack while the saved canvas has two nodes -- the skipped
+    list describes something the plan never saw. The payload names the
+    mismatch instead of quietly presenting them as one thing."""
+    app = _plan_app(tmp_path, TfResult(ok=True, exit_code=0), TYPO_CANVAS)
+    with TestClient(app) as client:
+        body = client.post("/tf/plan", params={"env": "default"}).json()
+    assert body["canvas_drift"] is True
+    assert "not what env 'default' last applied" in body["note"]
+    assert "`skipped` describes the saved canvas" in body["note"]
+
+
+def test_tf_plan_reports_no_drift_when_the_canvas_is_exactly_what_was_applied(tmp_path):
+    """...and no false alarm: apply the canvas first, and the two halves DO
+    describe the same thing, so there is no note to print."""
+    store = SpecStore(tmp_path)
+    store.apply(canvas_to_stack(TYPO_CANVAS, env="default"))  # what an Apply commits
+    app = _plan_app(tmp_path, TfResult(ok=True, exit_code=0), TYPO_CANVAS)
+    with TestClient(app) as client:
+        body = client.post("/tf/plan", params={"env": "default"}).json()
+    assert body["canvas_drift"] is False
+    assert "note" not in body
+    assert body["not_covered"] == ["kinesis"]  # still reported -- it IS outside the plan
+
+
+def test_tf_plan_survives_a_store_with_no_saved_canvas_at_all(tmp_path):
+    app = _plan_app(tmp_path, TfResult(ok=True, exit_code=0))  # nothing drawn yet
+    with TestClient(app) as client:
+        body = client.post("/tf/plan", params={"env": "default"}).json()
+    assert body["skipped"] == []
+    assert body["not_covered"] == []
+    assert body["canvas_drift"] is False
+
+
+def test_tf_apply_publishes_not_covered_too(tmp_path, monkeypatch):
+    """One gate shape across every route: this one applies the STORED Stack, so
+    the union is `unsupported` and there is no canvas half to confuse it with."""
+    store = SpecStore(tmp_path)
+    store.apply(Stack(env="default", resources=(
+        ResourceDesired(id="cache1", kind="elasticache",
+                        fields={"engine": FieldValue(value="memcached", provenance="user")}),
+    )))
+    app = create_app(runtime=FakeRuntime(), store=store, rds=FakeRds(), backings=False)
+    app.state.tf_runner.apply = _plan_returning(TfResult(ok=True, exit_code=0))
+    with TestClient(app) as client:
+        body = client.post("/tf/apply", params={"env": "default"}).json()
+    assert body["not_covered"] == body["unsupported"]
