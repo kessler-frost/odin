@@ -17,6 +17,13 @@ export const defaultPermissions: Record<string, string[]> = {
   // in the catalog's `iamActions` list to tick, but aren't defaults — a
   // workload writing its own logs is the common case, reading them back isn't.
   logs: ['logs:CreateLogStream', 'logs:PutLogEvents'],
+  // W2.4: reading the one secret / parameter it's edged to is the whole point
+  // of a workload having the edge. The write and describe verbs
+  // (PutSecretValue/DescribeSecret, PutParameter, GetParametersByPath) are in
+  // the catalog's `iamActions` list to tick, but a workload that rewrites its
+  // own credentials is the rare case, not the default.
+  secret: ['secretsmanager:GetSecretValue'],
+  ssm: ['ssm:GetParameter'],
 };
 
 // Compute kinds act as IAM principals; permission edges run compute → resource.
