@@ -380,6 +380,117 @@ async def test_apply_and_destroy_pass_the_configured_parallelism_flag(tmp_path, 
     assert any(line.startswith("destroy") and "-parallelism=2" in line for line in lines)
 
 
+# --- field test 3: `plan` -- the safe drift check ------------------------
+#
+# The finding: checking for drift meant hand-running `tofu plan` in
+# `.odin/<env>/tf`, where main.tf carries NO endpoint (it is deliberately
+# portable) -- so a plan run without `AWS_ENDPOINT_URL` talks to REAL AWS.
+# `TfRunner.plan` runs it through the very same machinery apply uses, so the
+# endpoint cannot be gotten wrong.
+
+_PLAN_RECORDS_ENV_AND_ARGS = (
+    _INIT_OK
+    + '\nif [ "$1" = "plan" ]; then echo "$@ | $AWS_ENDPOINT_URL | $AWS_ACCESS_KEY_ID" >> "$RECORDED_ARGS_FILE"; exit 0; fi'
+)
+_PLAN_CHANGES_LINE = 'if [ "$1" = "plan" ]; then echo "Plan: 1 to add"; exit 2; fi'
+_PLAN_NO_CHANGES_LINE = 'if [ "$1" = "plan" ]; then echo "No changes."; exit 0; fi'
+_PLAN_CHANGES = _INIT_OK + "\n" + _PLAN_CHANGES_LINE
+_PLAN_ERRORS = _INIT_OK + '\nif [ "$1" = "plan" ]; then echo "Error: no valid credential sources"; exit 1; fi'
+
+
+async def test_plan_injects_the_gateway_endpoint_and_operator_credentials(tmp_path, monkeypatch):
+    """The whole point: a plan through odin can never reach real AWS, because
+    the endpoint and credentials are injected exactly as they are for apply."""
+    args_file = tmp_path / "args.txt"
+    monkeypatch.setenv("RECORDED_ARGS_FILE", str(args_file))
+    _write_fake_tofu(tmp_path, _PLAN_RECORDS_ENV_AND_ARGS)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    runner = TfRunner(tmp_path, parallelism=3)
+
+    result = await runner.plan("default", _project(), 4266, "ak", "sk")
+
+    assert result.ok is True
+    recorded = args_file.read_text()
+    assert "-detailed-exitcode" in recorded
+    assert "-parallelism=3" in recorded
+    assert "http://127.0.0.1:4266" in recorded
+    assert "| ak" in recorded
+
+
+async def test_plan_with_changes_exits_two_and_is_still_a_successful_run(tmp_path, monkeypatch):
+    """`-detailed-exitcode`: 2 means "changes present", NOT a failed run."""
+    _write_fake_tofu(tmp_path, _PLAN_CHANGES)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    ws = RecordingWs()
+    runner = TfRunner(tmp_path, ws=ws)
+
+    result = await runner.plan("default", _project(), 4266, "ak", "sk")
+
+    assert result.exit_code == 2
+    assert result.ok is True
+    terminal = next(m for m in ws.messages if m.get("phase") == "plan" and "status" in m)
+    assert terminal["status"] == "ok"
+    assert terminal["exit_code"] == 2
+
+
+async def test_plan_error_is_a_failure_with_a_tail(tmp_path, monkeypatch):
+    _write_fake_tofu(tmp_path, _PLAN_ERRORS)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    runner = TfRunner(tmp_path)
+
+    result = await runner.plan("default", _project(), 4266, "ak", "sk")
+
+    assert result.ok is False
+    assert result.exit_code == 1
+    assert "Error: no valid credential sources" in " ".join(result.tail)
+
+
+async def test_plan_never_overwrites_the_last_apply_on_status(tmp_path, monkeypatch):
+    """A plan is a read: `odin tf status` must keep reporting the last real
+    apply/destroy, not a drift check someone ran afterwards."""
+    _write_fake_tofu(tmp_path, _APPLY_OK_TWO_LINES + "\n" + _PLAN_CHANGES_LINE)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    runner = TfRunner(tmp_path)
+
+    await runner.apply("default", _project(), 4266, "ak", "sk")
+    after_apply = runner.status("default")["last"]
+    await runner.plan("default", _project(), 4266, "ak", "sk")
+
+    assert runner.status("default")["last"] == after_apply
+
+
+async def test_plan_secrets_are_scrubbed_from_its_output(tmp_path, monkeypatch):
+    _write_fake_tofu(tmp_path, _INIT_OK + '\nif [ "$1" = "plan" ]; then echo "password = hunter2"; exit 2; fi')
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    runner = TfRunner(tmp_path)
+
+    result = await runner.plan("default", _project(), 4266, "ak", "sk", secrets=frozenset({"hunter2"}))
+
+    assert "hunter2" not in " ".join(result.tail)
+    assert "password = [REDACTED]" in result.tail
+
+
+async def test_plan_while_an_apply_is_running_raises_simulate_busy(tmp_path, monkeypatch):
+    _write_fake_tofu(tmp_path, _APPLY_SLOW + "\n" + _PLAN_NO_CHANGES_LINE)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    runner = TfRunner(tmp_path)
+
+    first = asyncio.create_task(runner.apply("default", _project(), 4266, "ak", "sk"))
+    await asyncio.sleep(0.1)
+
+    with pytest.raises(SimulateBusy):
+        await runner.plan("default", _project(), 4266, "ak", "sk")
+
+    assert (await first).ok is True
+
+
+async def test_plan_raises_tofu_not_installed(tmp_path, monkeypatch):
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: None)
+    runner = TfRunner(tmp_path)
+    with pytest.raises(TofuNotInstalled):
+        await runner.plan("default", _project(), 4266, "ak", "sk")
+
+
 async def test_init_args_never_carry_the_parallelism_flag(tmp_path, monkeypatch):
     # `-parallelism` is not a valid `tofu init` flag -- a fake tofu that
     # rejects any unexpected init arg proves it's never passed there.

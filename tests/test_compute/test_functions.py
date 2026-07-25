@@ -217,7 +217,7 @@ class _RieHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(length) if length else b""
         self.server.received.append(body)  # type: ignore[attr-defined]
         response, error = self.server.response, self.server.function_error  # type: ignore[attr-defined]
-        self.send_response(200)
+        self.send_response(self.server.status)  # type: ignore[attr-defined]
         self.send_header("Content-Type", "application/json")
         if error:
             self.send_header("X-Amz-Function-Error", error)
@@ -235,6 +235,10 @@ def rie_server():
     server.received = []
     server.response = b'{"ok": true}'
     server.function_error = None
+    # Real RIE answers 200 for a handler that RAISES and 502 for an init or
+    # runtime-exit failure -- both configurable here, because that status
+    # (and never a header) is part of how odin now detects a failed invoke.
+    server.status = 200
     thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
     thread.start()
     yield server
@@ -266,6 +270,72 @@ def test_invoke_surfaces_the_function_error_header(tmp_path, rie_server):
     result = rt.invoke(ENV, FN, b"{}")
     assert result.function_error == "Unhandled"
     assert json.loads(result.payload)["errorType"] == "ValueError"
+
+
+# --- field test 3: RIE never sends the header, so read the response --------
+#
+# Verified against a real `public.ecr.aws/lambda/python:3.12` container: a
+# handler that raises comes back `200 OK` with the error payload as the body
+# and NO `X-Amz-Function-Error` header anywhere. odin read only that header,
+# so `function_error` was ALWAYS None -- `aws lambda invoke` on a crashing
+# function looked like a success to any CI job keying on `FunctionError`, and
+# the `last_invocation_error` the World verdict projects was always None too.
+
+
+def _invoker(tmp_path, rie_server) -> FunctionRuntime:
+    runtime = FakeRuntime()
+    runtime.ports[container_name(ENV, FN)] = rie_server.server_address[1]
+    return FunctionRuntime(runtime, root=tmp_path)
+
+
+# The exact bytes a real RIE returns for a Python handler that raises.
+_REAL_RIE_ERROR_BODY = json.dumps({
+    "errorMessage": "boom from odin probe",
+    "errorType": "ValueError",
+    "requestId": "94369cd1-0724-4ea2-87e7-a1c399933fe2",
+    "stackTrace": ['  File "/var/task/app.py", line 2, in handler\n'],
+}).encode()
+
+
+def test_a_raised_handler_is_a_function_error_even_with_no_header(tmp_path, rie_server):
+    rie_server.response = _REAL_RIE_ERROR_BODY
+    rie_server.function_error = None  # real RIE sends no header -- this is the bug
+    rie_server.status = 200
+
+    result = _invoker(tmp_path, rie_server).invoke(ENV, FN, b"{}")
+
+    assert result.function_error == "Unhandled"
+    assert result.payload == _REAL_RIE_ERROR_BODY  # the payload is relayed untouched
+
+
+def test_an_init_or_exit_failure_is_a_function_error_too(tmp_path, rie_server):
+    """RIE answers 502 for an import failure or a runtime exit; real Lambda
+    reports those as a 200 + FunctionError, which is what odin returns."""
+    rie_server.response = json.dumps(
+        {"errorType": "Runtime.ImportModuleError", "errorMessage": "Unable to import module 'app'"}
+    ).encode()
+    rie_server.status = 502
+
+    assert _invoker(tmp_path, rie_server).invoke(ENV, FN, b"{}").function_error == "Unhandled"
+
+
+def test_a_successful_invocation_still_has_no_function_error(tmp_path, rie_server):
+    rie_server.response = json.dumps({"statusCode": 200, "body": "ok"}).encode()
+
+    assert _invoker(tmp_path, rie_server).invoke(ENV, FN, b"{}").function_error is None
+
+
+def test_a_non_json_response_body_is_not_mistaken_for_an_error(tmp_path, rie_server):
+    rie_server.response = b"\x00\x01not json at all"
+
+    assert _invoker(tmp_path, rie_server).invoke(ENV, FN, b"{}").function_error is None
+
+
+def test_a_handler_returning_only_one_error_key_is_not_an_error(tmp_path, rie_server):
+    """Both keys, or it's just a payload that happens to mention an error."""
+    rie_server.response = json.dumps({"errorMessage": "handled internally, returned 200"}).encode()
+
+    assert _invoker(tmp_path, rie_server).invoke(ENV, FN, b"{}").function_error is None
 
 
 def test_invoke_raises_when_the_container_is_not_running(tmp_path):

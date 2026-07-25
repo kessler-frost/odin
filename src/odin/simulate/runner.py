@@ -1,5 +1,5 @@
-"""The tofu runner (S2): `tofu apply`/`destroy` through odin's gateway as a
-server capability, under a per-env OPERATOR principal (full allow within the
+"""The tofu runner (S2): `tofu apply`/`plan`/`destroy` through odin's gateway
+as a server capability, under a per-env OPERATOR principal (full allow within the
 env, no canvas edge required -- see `gateway/app.py`'s
 `GatewayState.statements_for` special-case and `gateway/keys.OPERATOR_NODE_ID`).
 
@@ -12,11 +12,11 @@ the reconciler's backing containers down wholesale) removes whatever a tofu
 apply created too. `/tf/destroy` is tofu's OWN destroy against its
 last-applied state, independent of the canvas.
 
-One `tofu apply`/`destroy` at a time per env: a non-blocking `asyncio.Lock`
+One tofu run at a time per env: a non-blocking `asyncio.Lock`
 per env -- a call arriving while the lock is held raises `SimulateBusy`
 immediately (never queues; the caller gets a clean 409, not a long wait).
 Every invocation streams stdout/stderr line-by-line onto the events pipeline
-as `{type: "tf", env, phase, line}` (phase: "init" | "apply" | "destroy"),
+as `{type: "tf", env, phase, line}` (phase: "init" | "apply" | "plan" | "destroy"),
 then a terminal `{type: "tf", env, phase, status: "ok"|"failed", exit_code,
 [tail]}` -- `tail` (the last `_TAIL_LINES` lines) is attached only on
 failure, enough to show what broke without duplicating the whole log.
@@ -46,6 +46,14 @@ from odin.spec.models import scrub
 _TOFU_INIT_ARGS = ("init", "-input=false")
 _TOFU_APPLY_ARGS = ("apply", "-auto-approve", "-input=false", "-no-color")
 _TOFU_DESTROY_ARGS = ("destroy", "-auto-approve", "-input=false", "-no-color")
+# Field test 3: `-detailed-exitcode` is what makes a plan a CI-usable drift
+# gate -- 0 no changes, 2 changes present, 1 a real error. No `-out`: writing
+# a plan file would be a mutation, and a drift check must leave the workspace
+# exactly as it found it.
+_TOFU_PLAN_ARGS = ("plan", "-detailed-exitcode", "-input=false", "-no-color")
+# ...which also means "exit 2" is a SUCCESSFUL run of tofu, not a failure --
+# the phase's own success set, so the event stream never calls drift a crash.
+_PLAN_OK_CODES = (0, 2)
 _TAIL_LINES = 20
 
 # A shared provider-plugin cache so `tofu init` only downloads
@@ -184,8 +192,41 @@ class TfRunner:
         tofu = _require_tofu()
         async with lock:
             workspace = workspace_mod.materialize(self._root, env, project)
-            return await self._init_then(
+            return self._record(env, await self._init_then(
                 tofu, workspace, gateway_port, access_key, secret_key, env, "apply", self._apply_args(), secrets,
+            ))
+
+    async def plan(
+        self, env: str, project: TfProject, gateway_port: int, access_key: str, secret_key: str,
+        secrets: frozenset[str] = frozenset(),
+    ) -> TfResult:
+        """Field test 3: `tofu plan -detailed-exitcode` through EXACTLY the
+        machinery `apply` uses -- same workspace, same injected
+        `AWS_ENDPOINT_URL`, same per-env OPERATOR credentials, same per-phase
+        timeout, same per-env lock, same secret scrubbing.
+
+        That sameness is the whole point. `main.tf` is deliberately portable
+        (real AWS Terraform: no `endpoints` block, no `127.0.0.1`), so a
+        hand-run `tofu plan` in `.odin/<env>/tf` with the endpoint forgotten
+        talks to REAL AWS -- a field engineer did exactly that and got a
+        genuine `UnrecognizedClientException` back from Amazon. There is no
+        way to get the endpoint wrong through here.
+
+        Read-only: no `-out` plan file, no `wiring.stage`, no Stack commit,
+        and NOT recorded on `status()`'s last-run cache (`_record` is
+        deliberately not called) -- a drift check must never make the last
+        real apply look like it went differently. tofu's own in-memory
+        refresh is the only thing that touches state, and it is not persisted.
+        """
+        lock = self._lock(env)
+        if lock.locked():
+            raise SimulateBusy(env)
+        tofu = _require_tofu()
+        async with lock:
+            workspace = workspace_mod.materialize(self._root, env, project)
+            return await self._init_then(
+                tofu, workspace, gateway_port, access_key, secret_key, env, "plan", self._plan_args(), secrets,
+                ok_codes=_PLAN_OK_CODES,
             )
 
     async def destroy(
@@ -199,19 +240,27 @@ class TfRunner:
         async with lock:
             workspace = workspace_mod.tf_dir(self._root, env)
             if not workspace.exists():
-                result = TfResult(ok=True, exit_code=0)  # nothing was ever applied
-                self._last[env] = result
-                return result
-            return await self._init_then(
+                return self._record(env, TfResult(ok=True, exit_code=0))  # nothing was ever applied
+            return self._record(env, await self._init_then(
                 tofu, workspace, gateway_port, access_key, secret_key, env, "destroy", self._destroy_args(), secrets,
                 budget=self._destroy_timeout, hint=_WEDGED_DESTROY_HINT,
-            )
+            ))
+
+    def _record(self, env: str, result: TfResult) -> TfResult:
+        """The last-run cache `status()` reads. Only the two MUTATING phases
+        record: a `plan` that reports drift must not overwrite what the last
+        apply/destroy actually did."""
+        self._last[env] = result
+        return result
 
     def _apply_args(self) -> tuple[str, ...]:
         return (*_TOFU_APPLY_ARGS, f"-parallelism={self._parallelism}")
 
     def _destroy_args(self) -> tuple[str, ...]:
         return (*_TOFU_DESTROY_ARGS, f"-parallelism={self._parallelism}")
+
+    def _plan_args(self) -> tuple[str, ...]:
+        return (*_TOFU_PLAN_ARGS, f"-parallelism={self._parallelism}")
 
     def status(self, env: str) -> dict:
         last = self._last.get(env)
@@ -225,25 +274,26 @@ class TfRunner:
     async def _init_then(
         self, tofu: str, workspace: Path, gateway_port: int, access_key: str, secret_key: str,
         env: str, phase: str, args: tuple[str, ...], secrets: frozenset[str] = frozenset(),
-        budget: float | None = None, hint: str = "",
+        budget: float | None = None, hint: str = "", ok_codes: tuple[int, ...] = (0,),
     ) -> TfResult:
         """`budget`, when given, is a deadline across BOTH phases (init + the
         real one) rather than a per-phase allowance -- finding B6: `init`
         getting its own full allowance doubled the worst case for one call.
-        `None` keeps the per-phase `self._timeout` behavior apply relies on."""
+        `None` keeps the per-phase `self._timeout` behavior apply relies on.
+
+        `ok_codes` is the phase's success set -- `(0,)` everywhere except
+        `plan`, whose `-detailed-exitcode` 2 means "changes present" on a run
+        that worked perfectly. `init` always keeps the plain `(0,)`."""
         env_vars = _tf_env(gateway_port, access_key, secret_key)
         deadline = None if budget is None else time.monotonic() + budget
         init_result = await self._run(
             tofu, _TOFU_INIT_ARGS, workspace, env_vars, env, "init", secrets, self._remaining(deadline), hint,
         )
         if not init_result.ok:
-            self._last[env] = init_result
             return init_result
-        result = await self._run(
-            tofu, args, workspace, env_vars, env, phase, secrets, self._remaining(deadline), hint,
+        return await self._run(
+            tofu, args, workspace, env_vars, env, phase, secrets, self._remaining(deadline), hint, ok_codes,
         )
-        self._last[env] = result
-        return result
 
     def _remaining(self, deadline: float | None) -> float:
         """Never zero or negative: a deadline already blown still gets a token
@@ -256,6 +306,7 @@ class TfRunner:
     async def _run(
         self, tofu: str, args: tuple[str, ...], cwd: Path, env_vars: dict[str, str], env: str, phase: str,
         secrets: frozenset[str] = frozenset(), timeout: float | None = None, hint: str = "",
+        ok_codes: tuple[int, ...] = (0,),
     ) -> TfResult:
         # `start_new_session=True` (release finding #3): tofu spawns its own
         # provider-plugin child process, so a plain kill of tofu's own pid on
@@ -293,7 +344,7 @@ class TfRunner:
             if hint:
                 tail.append(hint)
 
-        ok = code == 0
+        ok = code in ok_codes
         payload = {"type": "tf", "env": env, "phase": phase, "status": "ok" if ok else "failed", "exit_code": code}
         if not ok:
             payload["tail"] = list(tail)
