@@ -25,9 +25,25 @@ Two halves, deliberately split:
      carry the full `DATABASE_URL`, password included, and a container is free
      to echo its own env into stdout). See tests/agent/test_debugger.py's leak
      test, the analogue of test_translate.py's own.
-   - **Caps.** ~40 log lines and 10 events per node, 20 nodes, and every other
-     string clipped -- the context has to stay small enough to be one cheap
-     prompt, not a log dump.
+   - **Caps.** ~40 log lines and 10 events per node, 20 nodes, 20 env-wide
+     tofu lines, and every other string clipped -- the context has to stay
+     small enough to be one cheap prompt, not a log dump.
+   - **Env-wide evidence.** Per-node evidence alone misses the single most
+     common "what's wrong here?": the user's `tofu apply` just failed. Those
+     events (`simulate/runner.py`'s `{type:"tf"}` stream + its failure `tail`)
+     carry no `resource_id`, so they belong to no node -- `recent_tf` is where
+     they land, capped and scrubbed like everything else.
+
+   What is NOT a separate key, deliberately: DRIFT. `reconcile/drift.py` (the
+   reality sweep: a VM/container deleted outside odin) landed after this module
+   did, but it reports through the verdict channel that already existed --
+   `Reconciler._project_tf_owned` overlays the sweep's sentence as the
+   resource's `verdict`, and the same sentence is written into the store record
+   so `tf_status.project()` keeps projecting it after a restart. A drifted node
+   therefore arrives here as `observed.verdict == "VM odin-ec2-web deleted
+   outside odin -- re-Apply to recreate"`, plus the crash `type:"log"` event
+   keyed to it by `source`. A `drift` key would be a third copy of the same
+   string; test_debugger.py pins that path instead of adding one.
 
 2. `diagnose` -- ONE agent run whose only effect channel is the typed
    `report_diagnosis` tool (the house pattern from `agent/translate.py`: the
@@ -67,6 +83,11 @@ MAX_NODES = 20
 MAX_EVENTS = 10
 MAX_LOG_LINES = 40
 MAX_VALUE_CHARS = 200
+# The env-wide half (`recent_tf`). Deliberately the same 20 as
+# `simulate/runner.py`'s own `_TAIL_LINES`: that's the window odin already
+# decided is "enough to show what broke", and it's ONE budget for the whole
+# env, not per node.
+MAX_TF_LINES = 20
 
 _TRUNCATED = "... (truncated)"
 
@@ -167,14 +188,57 @@ def _event_node(event: dict) -> str | None:
     """Which node an event belongs to. `world_delta`/`access_denied` carry
     `resource_id`; the crash `log` message the reconciler pushes carries the
     node in `source` (api/ws.py + reconciler.py's `_log_message`). An env-wide
-    event (a `tf` apply line) belongs to no node and is deliberately left out
-    -- per-node caps are what keep this context small."""
+    event (a `tf` apply line) belongs to no node -- it is left out of every
+    node's list on purpose and picked up once, at env level, by `_tf_lines`."""
     node = event.get("resource_id") or event.get("source")
     return node if isinstance(node, str) else None
 
 
 def _events_for(events: list[dict], node_id: str) -> list[dict]:
     return [e for e in events if _event_node(e) == node_id][-MAX_EVENTS:]
+
+
+def _tf_lines(events: list[dict]) -> list[str]:
+    """The env-wide half: tofu's own apply/destroy output, flattened to the
+    last `MAX_TF_LINES` plain lines.
+
+    "tofu apply failed with this error" is arguably THE most common thing a
+    user selects a region to ask about, and it reaches no node: every
+    `{type:"tf"}` event `simulate/runner.py` broadcasts is keyed to the ENV
+    only (no `resource_id`, no `source`), so before this it was invisible to
+    the model no matter what the user selected.
+
+    Two event shapes, from `TfRunner._run`:
+      - a stream line -- `{phase, line}`, one per line of tofu stdout/stderr.
+      - the terminal verdict -- `{phase, status, exit_code, [tail]}`, where
+        `tail` is attached only on failure.
+    `tail` is by construction the last 20 lines of the SAME stdout already
+    streamed above, so only the entries not already seen go in (in practice
+    just the synthetic "timed out ... process killed" sentence, which no
+    stream line ever carried) -- and the verdict line goes in LAST, so the
+    exit code is the one thing the cap can never trim away.
+
+    Scrubbing happens at the call site, on the whole list: `runner.py` already
+    scrubs each line against the Stack's `sensitive_values()` before it ever
+    reaches events.jsonl, but this path re-scrubs against the CURRENT Stack
+    anyway -- the two secret sets can differ (a Stack edited since the apply,
+    or a caller that passed none), and the assembler is the last place that
+    can still catch it."""
+    lines: list[str] = []
+    seen: set[str] = set()
+    for event in events:
+        if event.get("type") != "tf":
+            continue
+        phase = str(event.get("phase", "tf"))
+        line = event.get("line")
+        if isinstance(line, str):
+            lines.append(f"{phase}: {line}")
+            seen.add(line)
+            continue
+        tail = event.get("tail") or ()
+        lines.extend(f"{phase}: {t}" for t in tail if isinstance(t, str) and t not in seen)
+        lines.append(f"tofu {phase} {event.get('status')} (exit {event.get('exit_code')})")
+    return lines[-MAX_TF_LINES:]
 
 
 def _log_tail(text: str) -> str:
@@ -193,7 +257,12 @@ def assemble_context(
     `desired: None` -- the canvas can select a stale tile whose node was
     already removed, and its last observed state + logs are exactly what
     explains where it went. Beyond `MAX_NODES` the extra ids are named in
-    `omitted_nodes` rather than silently dropped."""
+    `omitted_nodes` rather than silently dropped.
+
+    `recent_tf` is the one ENV-level section: the last `MAX_TF_LINES` lines of
+    tofu's own apply/destroy output, which belong to no node at all (see
+    `_tf_lines`). It rides through the same `_sanitize` walk as everything
+    else, so it is clipped and scrubbed identically."""
     secrets = stack.sensitive_values()
     unique = list(dict.fromkeys(node_ids))
     selected, omitted = unique[:MAX_NODES], unique[MAX_NODES:]
@@ -211,7 +280,10 @@ def assemble_context(
         }
         for node_id in selected
     }
-    return {"env": stack.env, "nodes": nodes, "omitted_nodes": omitted}
+    return {
+        "env": stack.env, "nodes": nodes, "omitted_nodes": omitted,
+        "recent_tf": _sanitize(_tf_lines(events), secrets),
+    }
 
 
 # --- 2. the diagnosis (one agent run, one typed effect channel) ---------------
@@ -232,6 +304,10 @@ _SYSTEM = (
     "You are given odin's own evidence for a few selected canvas nodes: each node's "
     "desired configuration, its references to other nodes, its observed phase, facts "
     "and crash verdict, its recent events, and a tail of its real logs. "
+    "You are also given `recent_tf`: the last lines of this environment's own "
+    "`tofu apply`/`destroy` output, which belongs to the whole environment rather "
+    "than to any one node. Read it first when it ends in a failure -- an apply "
+    "that failed is often the whole answer, and its error names the resource. "
     "Answer in plain English, in a few sentences, and ground every claim in that "
     "evidence -- quote the exit code, the verdict, or the log line that shows it. "
     "If the evidence does not explain the failure, say so plainly instead of "
@@ -257,7 +333,8 @@ def make_report_tool(collector: list[dict]) -> SdkMcpTool:
 def _prompt(context: dict, question: str) -> str:
     return (
         f"Question: {question}\n\n"
-        "Evidence (odin's desired + observed state for the selected canvas nodes; "
+        "Evidence (odin's desired + observed state for the selected canvas nodes, "
+        "plus `recent_tf` -- this environment's own recent tofu output, env-wide; "
         "secret values and env-var values are redacted, key names only):\n"
         f"```json\n{json.dumps(context, indent=2, default=str)}\n```\n\n"
         "Explain what is wrong here, then call report_diagnosis exactly once."

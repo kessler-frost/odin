@@ -86,8 +86,12 @@ appears with a **What's wrong here?** button and a free-form question box. Odin
 gathers each selected node's desired config, its references to other nodes, its
 observed phase and real crash verdict (an ECS task's `stoppedReason` + exit
 code, an EC2 or Lambda `StateReason`, a Postgres connection error), its last
-few events, and a tail of its real container/VM logs — then one model call
-answers in plain English and names per-node suspects with reasons.
+few events, and a tail of its real container/VM logs — plus the last lines of
+the environment's own `tofu apply`/`destroy` output, which belong to no single
+node — then one model call answers in plain English and names per-node suspects
+with reasons. A node that was deleted out from under odin (`limactl delete`,
+`docker rm`) carries the reality sweep's own verdict, so "your VM is gone —
+re-Apply to recreate" is part of the evidence too.
 
 This is the one place in odin where the AI is load-bearing. Generating
 Terraform from the canvas and reading it back are deterministic code, on
@@ -104,13 +108,13 @@ Honest about what it needs and what it can't do:
   `ODIN_DEBUG_TIMEOUT` (default 90s) bounds the call.
 - Secrets never reach the model: env-var **values** are reduced to key names,
   any field odin flags sensitive is `[REDACTED]`, and every string in the
-  evidence — including log lines and an RDS node's `DATABASE_URL` facts — is
-  scrubbed of known secret values first.
+  evidence — including log lines, tofu's own output, and an RDS node's
+  `DATABASE_URL` facts — is scrubbed of known secret values first.
 - It reads state and returns prose. It cannot change your canvas, your
   Terraform, or anything running.
-- The evidence is capped (40 log lines and 10 events per node, 20 nodes), so a
-  failure whose cause scrolled past that window won't be in the answer. The
-  Logs tab has the full tail.
+- The evidence is capped (40 log lines and 10 events per node, 20 nodes, 20
+  lines of tofu output), so a failure whose cause scrolled past that window
+  won't be in the answer. The Logs tab has the full tail.
 
 ## What's on the canvas today
 
