@@ -172,6 +172,19 @@ def _wait_for_running_count(stores, sink, ecs, runtime, want: int, timeout: floa
     raise AssertionError(f"service never reached runningCount={want} (last seen {last})")
 
 
+def _wait_for_stopped(runtime, task_id: str, timeout: float = 6.0) -> None:
+    """Wait for a DELIBERATE stop of `task_id`. Retiring the previous
+    revision is deliberately the LAST thing a rollout does, behind
+    `ecsctl._ROLLOUT_STABILIZE_SECONDS` (field test 3), so it lands after the
+    replacement has already reached RUNNING."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if any(stopped_id == task_id for _, stopped_id, _ in runtime.stopped):
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"task {task_id} was never stopped (stopped: {runtime.stopped})")
+
+
 # --- Cluster -----------------------------------------------------------------
 
 
@@ -428,7 +441,10 @@ def test_update_service_task_definition_replaces_stale_tasks(sink, ecs, stores):
     _answer(stores, req, runtime)
     _wait_for_running_count(stores, sink, ecs, runtime, 1)
 
-    assert any(task_id == old_task_id for _, task_id, _ in runtime.stopped)
+    # Field test 3: the stale task is retired AFTER the replacement is up
+    # (surge first, retire second), so the replacement reaching RUNNING no
+    # longer implies the old one is already gone -- hence the wait.
+    _wait_for_stopped(runtime, old_task_id)
     tasks_req = sink.call(lambda: ecs.list_tasks(cluster="odin", serviceName="app"))
     (task_arn,) = _parse("ListTasks", _answer(stores, tasks_req, runtime))["taskArns"]
     describe_req = sink.call(lambda: ecs.describe_tasks(cluster="odin", tasks=[task_arn]))

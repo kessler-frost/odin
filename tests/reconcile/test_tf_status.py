@@ -467,8 +467,22 @@ class FakeTaskRuntime:
         return self._logs.get(task_id, "")
 
 
-def _ecs_service(cluster: str, name: str, desired: int, status: str = "ACTIVE", node_label: str | None = None) -> dict:
-    rec = {"cluster_name": cluster, "service_name": name, "desired_count": desired, "status": status}
+# Field test 3: the projection is now revision-aware (a service left serving
+# its PREVIOUS revision by a failed deployment must not read `healthy`), so
+# both fixtures carry a task-definition arn. They default to the SAME
+# revision, which is the "nothing mid-rollout" shape every pre-existing test
+# here means.
+_TASKDEF_ARN = "arn:aws:ecs:us-east-1:000000000000:task-definition/app:1"
+
+
+def _ecs_service(
+    cluster: str, name: str, desired: int, status: str = "ACTIVE", node_label: str | None = None,
+    task_definition_arn: str = _TASKDEF_ARN,
+) -> dict:
+    rec = {
+        "cluster_name": cluster, "service_name": name, "desired_count": desired, "status": status,
+        "task_definition_arn": task_definition_arn,
+    }
     if node_label is not None:
         rec["node_label"] = node_label
     return rec
@@ -477,12 +491,13 @@ def _ecs_service(cluster: str, name: str, desired: int, status: str = "ACTIVE", 
 def _ecs_task(
     cluster: str, service: str, task_id: str, last_status: str,
     container_name: str = "app", stopped_reason: str | None = None, exit_code: int | None = None,
-    stopped_at: float | None = None,
+    stopped_at: float | None = None, task_definition_arn: str = _TASKDEF_ARN,
 ) -> dict:
     return {
         "cluster_name": cluster, "service_name": service, "task_id": task_id,
         "last_status": last_status, "container_name": container_name,
         "stopped_reason": stopped_reason, "exit_code": exit_code, "stopped_at": stopped_at,
+        "task_definition_arn": task_definition_arn,
     }
 
 
