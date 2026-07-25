@@ -524,6 +524,102 @@ def test_a_taskdef_update_that_cannot_start_keeps_reporting_a_failed_deployment(
     assert service["events"], "a failed deployment posts a real service event"
 
 
+def test_a_failed_taskdef_update_keeps_the_previous_revision_serving(sink, ecs, stores):
+    """FIELD TEST 3, the flagship claim. Measured before this fix: three
+    healthy tasks went to ZERO about four seconds into the apply, because
+    `_reconcile_service_tasks` stopped every stale task BEFORE launching a
+    single replacement -- so a deployment that could never succeed still
+    destroyed the one that had.
+
+    With `minimumHealthyPercent` honored (surge first, retire second), zero
+    replacements RUNNING means zero stale tasks retired: the previous
+    revision keeps serving for the whole failed apply. Nothing about the
+    failure is softened -- see the two asserts on `runningCount` /
+    `rolloutState` at the end, which are v0.7.1's loud-failure behavior
+    unchanged."""
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)  # rev 1
+    _create_service(stores, sink, ecs, runtime, desiredCount=3)
+    _wait_for_running_count(stores, sink, ecs, runtime, 3)
+    serving = {entry[1] for entry in runtime.ran}
+
+    _register_taskdef(stores, sink, ecs, runtime, containerDefinitions=[{
+        "name": "app", "image": "nginx:this-tag-does-not-exist-9z9z", "essential": True,
+    }])  # rev 2
+    runtime.fail_run = True  # the new image cannot be pulled
+    req = sink.call(lambda: ecs.update_service(cluster="odin", service="app", taskDefinition="app:2"))
+    _answer(stores, req, runtime)
+
+    # Well past `_ROLLOUT_STABILIZE_SECONDS`: the retirement decision has been
+    # made and declined, not merely not-yet-reached.
+    time.sleep(ecsctl._ROLLOUT_STABILIZE_SECONDS + 1.0)
+    stopped = {task_id for _, task_id, _ in runtime.stopped}
+    assert not (serving & stopped), f"the previous revision was retired anyway: {serving & stopped}"
+    tasks_req = sink.call(lambda: ecs.list_tasks(cluster="odin", serviceName="app", desiredStatus="RUNNING"))
+    running = _parse("ListTasks", _answer(stores, tasks_req, runtime))["taskArns"]
+    assert len(running) == 3, "all three previous-revision tasks must still be serving"
+
+    # ... and the apply still fails loudly, on the same clock as v0.7.1.
+    service = _describe_service(stores, sink, ecs, runtime)
+    assert service["runningCount"] == 0, "current-revision accounting must stay revision-blind-free"
+    assert service["deployments"][0]["rolloutState"] == "FAILED", service
+
+
+def test_a_zero_percent_floor_retires_the_previous_revision_immediately(sink, ecs, stores):
+    """The floor is genuinely READ, not assumed: a service that asks for
+    `minimumHealthyPercent = 0` gets the old take-everything-down-first
+    behavior, which is what proves the 100% default is doing the work."""
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)  # rev 1
+    _create_service(
+        stores, sink, ecs, runtime, desiredCount=2,
+        deploymentConfiguration={"minimumHealthyPercent": 0, "maximumPercent": 100},
+    )
+    _wait_for_running_count(stores, sink, ecs, runtime, 2)
+    old = {entry[1] for entry in runtime.ran}
+
+    _register_taskdef(stores, sink, ecs, runtime, containerDefinitions=[{
+        "name": "app", "image": "nginx:this-tag-does-not-exist-9z9z", "essential": True,
+    }])  # rev 2
+    runtime.fail_run = True
+    req = sink.call(lambda: ecs.update_service(cluster="odin", service="app", taskDefinition="app:2"))
+    _answer(stores, req, runtime)
+
+    deadline = time.monotonic() + 6.0
+    while time.monotonic() < deadline and not old <= {t for _, t, _ in runtime.stopped}:
+        time.sleep(0.02)
+    assert old <= {task_id for _, task_id, _ in runtime.stopped}, "a 0% floor keeps nothing serving"
+
+
+def test_deployment_configuration_is_echoed_from_what_was_submitted(sink, ecs, stores):
+    """It is what the scheduler reads, so DescribeServices must not report a
+    number it ignored (the pre-fix hardcoded 200/100 echo was true only by
+    coincidence)."""
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    created = _create_service(
+        stores, sink, ecs, runtime, desiredCount=2,
+        deploymentConfiguration={"minimumHealthyPercent": 50, "maximumPercent": 150},
+    )
+    assert created["deploymentConfiguration"] == {"minimumHealthyPercent": 50, "maximumPercent": 150}
+
+    # Absent on a later call, the service keeps what it has (real ECS's rule).
+    req = sink.call(lambda: ecs.update_service(cluster="odin", service="app", desiredCount=3))
+    updated = _parse("UpdateService", _answer(stores, req, runtime))["service"]
+    assert updated["deploymentConfiguration"] == {"minimumHealthyPercent": 50, "maximumPercent": 150}
+
+
+def test_default_deployment_configuration_matches_real_aws(sink, ecs, stores):
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    created = _create_service(stores, sink, ecs, runtime, desiredCount=1)
+    assert created["deploymentConfiguration"] == {"minimumHealthyPercent": 100, "maximumPercent": 200}
+
+
 def test_a_successful_taskdef_update_still_reaches_steady_state(sink, ecs, stores):
     """The counterweight to the two above: current-revision-only accounting must
     still CONVERGE, or every healthy update would hang until its timeout."""
@@ -532,6 +628,7 @@ def test_a_successful_taskdef_update_still_reaches_steady_state(sink, ecs, store
     _register_taskdef(stores, sink, ecs, runtime)  # rev 1
     _create_service(stores, sink, ecs, runtime, desiredCount=2)
     _wait_for_running_count(stores, sink, ecs, runtime, 2)
+    old = [entry[1] for entry in runtime.ran]
 
     _register_taskdef(stores, sink, ecs, runtime, containerDefinitions=[{
         "name": "app", "image": "nginx:1.27-alpine", "essential": True,
@@ -543,6 +640,10 @@ def test_a_successful_taskdef_update_still_reaches_steady_state(sink, ecs, store
     (deployment,) = final["deployments"]
     assert deployment["rolloutState"] == "COMPLETED", final
     assert deployment["taskDefinition"].endswith(":2")
+    # Field test 3: a GOOD update still fully retires the previous revision --
+    # keeping the old tasks serving is a failure path, never a leak.
+    for task_id in old:
+        _wait_for_stopped(runtime, task_id)
 
 
 def test_delete_service_stops_all_its_tasks(sink, ecs, stores):

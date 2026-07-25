@@ -576,6 +576,110 @@ def test_ecs_sweep_promotes_a_spontaneously_exited_container_before_projecting(t
     assert stores.ecsctl.get(ENV, "task:odin:t1")["last_status"] == "STOPPED"
 
 
+# --- ecs: the revision-aware half (field test 3) -------------------------
+# Keeping the previous revision alive through a failed deployment
+# (ecsctl.py's `_retire_stale`) is only honest if the projection REFUSES to
+# call that healthy. These four pin the distinction odin can actually make:
+# "N serving the previous revision, the new one failed" is not "N serving the
+# current revision" and is not "zero tasks, dead".
+_PREVIOUS_ARN = "arn:aws:ecs:us-east-1:000000000000:task-definition/app:1"
+_CURRENT_ARN = "arn:aws:ecs:us-east-1:000000000000:task-definition/app:2"
+
+
+def _rolled_over(stores, *, desired: int, previous_running: int, image: str = "nginx:typo-9z9z") -> None:
+    """A service pointed at revision 2, whose replacements all failed, with
+    `previous_running` revision-1 tasks still serving -- exactly the state
+    field test 3's typo'd tag now leaves behind."""
+    stores.ecsctl.set(ENV, "taskdef:app:2", {
+        "family": "app", "revision": 2, "status": "ACTIVE",
+        "container_definitions": [{"name": "app", "image": image}],
+    })
+    stores.ecsctl.set(ENV, "service:odin:app", _ecs_service(
+        "odin", "app", desired=desired, task_definition_arn=_CURRENT_ARN,
+    ))
+    for i in range(previous_running):
+        stores.ecsctl.set(ENV, f"task:odin:old{i}", _ecs_task(
+            "odin", "app", f"old{i}", "RUNNING", task_definition_arn=_PREVIOUS_ARN,
+        ))
+    stores.ecsctl.set(ENV, "task:odin:new1", _ecs_task(
+        "odin", "app", "new1", "STOPPED", task_definition_arn=_CURRENT_ARN,
+        stopped_reason=f"no such image: {image}", stopped_at=100.0,
+    ))
+
+
+def test_ecs_serving_the_previous_revision_is_neither_healthy_nor_crashed(tmp_path):
+    stores = SynthStores(tmp_path)
+    _rolled_over(stores, desired=2, previous_running=2)
+
+    kind, phase, _, verdict = project(stores, ENV, ecs_runtime=FakeTaskRuntime())["app"]
+
+    assert kind == "ecs"
+    # THE point: two tasks are serving, so this is not an outage -- and the
+    # revision the operator asked for is not running, so it is not healthy.
+    assert phase == "error", "a failed deployment behind a serving old revision must not read healthy"
+    assert verdict == (
+        "2 tasks serving the previous revision; "
+        "deployment of nginx:typo-9z9z failed: no such image: nginx:typo-9z9z"
+    ), verdict
+
+
+def test_ecs_serving_previous_revision_verdict_counts_and_names_concretely(tmp_path):
+    # One task left: singular, and the image the FAILED deployment asked for.
+    stores = SynthStores(tmp_path)
+    _rolled_over(stores, desired=3, previous_running=1, image="ghcr.io/acme/api:v9-typo")
+
+    _, phase, _, verdict = project(stores, ENV, ecs_runtime=FakeTaskRuntime())["app"]
+
+    assert phase == "error"
+    assert verdict.startswith("1 task serving the previous revision; ")
+    assert "ghcr.io/acme/api:v9-typo" in verdict
+
+
+def test_ecs_zero_tasks_left_is_still_crashed_not_a_degraded_reading(tmp_path):
+    # The counterweight: with nothing serving, `error` would UNDERSTATE a real
+    # outage. Same failed deployment, no survivors -> crashed, as before.
+    stores = SynthStores(tmp_path)
+    _rolled_over(stores, desired=2, previous_running=0)
+
+    _, phase, _, verdict = project(stores, ENV, ecs_runtime=FakeTaskRuntime())["app"]
+
+    assert phase == "crashed"
+    assert verdict == "no such image: nginx:typo-9z9z"
+
+
+def test_ecs_stale_task_still_draining_behind_a_converged_rollout_reads_healthy(tmp_path):
+    # The other counterweight: a GOOD rollout briefly runs both revisions at
+    # once (200% surge). Once the current revision is at desired, the service
+    # genuinely is healthy -- a leftover draining task must not demote it.
+    stores = SynthStores(tmp_path)
+    stores.ecsctl.set(ENV, "service:odin:app", _ecs_service(
+        "odin", "app", desired=2, task_definition_arn=_CURRENT_ARN,
+    ))
+    stores.ecsctl.set(ENV, "task:odin:new1", _ecs_task(
+        "odin", "app", "new1", "RUNNING", task_definition_arn=_CURRENT_ARN))
+    stores.ecsctl.set(ENV, "task:odin:new2", _ecs_task(
+        "odin", "app", "new2", "RUNNING", task_definition_arn=_CURRENT_ARN))
+    stores.ecsctl.set(ENV, "task:odin:old1", _ecs_task(
+        "odin", "app", "old1", "RUNNING", task_definition_arn=_PREVIOUS_ARN))
+
+    assert project(stores, ENV, ecs_runtime=FakeTaskRuntime())["app"] == ("ecs", "healthy", {}, None)
+
+
+def test_ecs_replacements_not_yet_up_read_starting_not_error(tmp_path):
+    # Mid-rollout with nothing failed yet is honest asynchrony, not a failure:
+    # `error` is reserved for a deployment that actually died.
+    stores = SynthStores(tmp_path)
+    stores.ecsctl.set(ENV, "service:odin:app", _ecs_service(
+        "odin", "app", desired=2, task_definition_arn=_CURRENT_ARN,
+    ))
+    stores.ecsctl.set(ENV, "task:odin:new1", _ecs_task(
+        "odin", "app", "new1", "PROVISIONING", task_definition_arn=_CURRENT_ARN))
+    stores.ecsctl.set(ENV, "task:odin:old1", _ecs_task(
+        "odin", "app", "old1", "RUNNING", task_definition_arn=_PREVIOUS_ARN))
+
+    assert project(stores, ENV, ecs_runtime=FakeTaskRuntime())["app"] == ("ecs", "starting", {}, None)
+
+
 def test_ecs_inactive_service_is_excluded_entirely(tmp_path):
     # A deleted service is kept around INACTIVE for a grace window
     # (ecsctl.py's own delete-waiter shim) -- it must not still read as

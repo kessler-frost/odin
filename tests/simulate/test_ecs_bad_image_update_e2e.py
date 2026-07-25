@@ -21,6 +21,15 @@ re-Apply whose only change is a bogus image tag, must
     deployment's `rolloutStateReason`, the service's ECS event, the task's
     `stoppedReason`, and the node's World verdict.
 
+FIELD TEST 3 added the third claim: the loud failure must no longer cost an
+outage. Measured before that fix, the same typo'd tag took three healthy
+tasks to ZERO in about four seconds and left them there, ~59 seconds before
+the apply admitted anything. The previous revision now keeps serving
+(`ecsctl._retire_stale`) and the node reads `error` -- serving, but not what
+was asked for -- rather than a false `healthy` or a `crashed` that would
+overstate a service still answering requests. See
+test_ecs_failed_update_keeps_serving_e2e.py for the sampled outage window.
+
 Deliberately no ALB here: `aws_lb` creation burns ~60s of provider pre-poll and
 adds nothing to the claim under test.
 """
@@ -150,11 +159,20 @@ def test_a_bad_image_update_fails_apply_and_names_the_image(tmp_path, monkeypatc
         assert stopped, "the replacement tasks really did fail to start"
         assert any(BAD_IMAGE in (t.get("stopped_reason") or "") for t in stopped), stopped
 
+        # FIELD TEST 3: the previous revision is still SERVING (v0.7.2's
+        # `minimumHealthyPercent` floor), so the node must read neither
+        # `healthy` (the requested revision is not running) nor `crashed`
+        # (traffic is being served) -- and the verdict must say which.
+        running = [t for t in _task_records(store.root) if t["last_status"] == "RUNNING"]
+        assert len(running) == int(COUNT), f"the previous revision stopped serving: {running}"
+        assert all(t["task_definition_arn"] == good_revision for t in running), running
+
         verdict = next(
             (r for r in client.get("/world", params={"env": ENV}).json()["resources"] if r["id"] == NODE), None,
         )
-        assert verdict is not None and verdict["phase"] == "crashed", verdict
+        assert verdict is not None and verdict["phase"] == "error", verdict
         assert BAD_IMAGE in (verdict.get("verdict") or ""), verdict
+        assert "serving the previous revision" in (verdict.get("verdict") or ""), verdict
 
         # --- 4. teardown still completes promptly ---------------------------
         destroy_start = time.monotonic()
