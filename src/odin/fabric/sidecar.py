@@ -233,6 +233,11 @@ class MeshSidecar:
         config = manager.generate_config(
             lighthouse_ip=overlay.lighthouse_ip, lighthouse_underlay=underlay,
             firewall=firewall, is_lighthouse=False, relay_enabled=True,
+            # This env's own lighthouse port, never the machine-global 4342
+            # (fabric/nebula.py's B8 note). A port that MOVED (because
+            # something else took the recorded one) changes this config, which
+            # is exactly what makes the sidecar re-join on the new one.
+            lighthouse_port=overlay.lighthouse_port,
         )
         directory = self._member_dir(member)
         directory.mkdir(parents=True, exist_ok=True)

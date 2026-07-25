@@ -598,3 +598,105 @@ def test_mesh_state_reports_lighthouse_running(tmp_path):
     pidfile.parent.mkdir(parents=True)
     pidfile.write_text(str(os.getpid()))
     assert mesh_state(tmp_path, "prod").lighthouse_running is True
+
+
+# --- one lighthouse port per ENV, not per machine (field test 2 B8) ----------
+
+
+@pytest.fixture
+def free_ports(monkeypatch):
+    """Which ports the machine says are bindable, under test control -- the
+    real probe is a live UDP bind, which would make these assertions depend on
+    whatever else happens to be running."""
+    state = {"busy": set()}
+    monkeypatch.setattr(nebula_module, "_port_free", lambda port: port not in state["busy"])
+    return state
+
+
+def test_ensure_network_allocates_and_persists_this_envs_own_port(tmp_path, free_ports):
+    overlay = ensure_network(tmp_path, "prod", "1.2.3.4", runner=FakeRunner())
+    assert overlay.lighthouse_port == nebula_module.LIGHTHOUSE_PORT
+    stored = json.loads((tmp_path / "prod" / "nebula" / "overlay.json").read_text())
+    assert stored["lighthouse_port"] == nebula_module.LIGHTHOUSE_PORT
+    # Sticky: every member's static_host_map embeds it, so it must not move on
+    # a re-apply.
+    assert ensure_network(tmp_path, "prod", "1.2.3.4", runner=FakeRunner()).lighthouse_port == overlay.lighthouse_port
+
+
+def test_two_envs_in_one_store_never_get_the_same_port(tmp_path, free_ports):
+    """THE bug: `LIGHTHOUSE_PORT` was one machine-global constant, so the
+    second env's `nebula` exited 1 on a port the first already held -- while
+    odin kept publishing that env's SG-gated mesh addresses."""
+    first = ensure_network(tmp_path, "prod", "1.2.3.4", runner=FakeRunner())
+    second = ensure_network(tmp_path, "staging", "1.2.3.4", runner=FakeRunner())
+    assert first.lighthouse_port != second.lighthouse_port
+    assert second.lighthouse_port in nebula_module.LIGHTHOUSE_PORTS
+
+
+def test_allocation_skips_a_port_something_else_is_holding(tmp_path, free_ports):
+    free_ports["busy"] = {nebula_module.LIGHTHOUSE_PORT, nebula_module.LIGHTHOUSE_PORT + 1}
+    assert ensure_network(tmp_path, "prod", "1.2.3.4", runner=FakeRunner()).lighthouse_port == (
+        nebula_module.LIGHTHOUSE_PORT + 2
+    )
+
+
+def test_allocation_stays_in_the_reserved_range_no_guest_listens_on(tmp_path, free_ports):
+    """Deliberately not the ephemeral range: a Lima guest's own outbound
+    sockets land there, and Lima force-forwards a guest's listeners onto the
+    host's loopback (the reason a lighthouse needed its own port at all)."""
+    port = ensure_network(tmp_path, "prod", "1.2.3.4", runner=FakeRunner()).lighthouse_port
+    assert port in nebula_module.LIGHTHOUSE_PORTS
+    assert nebula_module.LIGHTHOUSE_PORTS.stop < 49152
+
+
+def test_an_explicit_pin_is_honoured_verbatim(tmp_path, free_ports, monkeypatch):
+    monkeypatch.setenv("ODIN_LIGHTHOUSE_PORT", "4999")
+    free_ports["busy"] = {4999}  # busy or not, the user asked for this one
+    assert ensure_network(tmp_path, "prod", "1.2.3.4", runner=FakeRunner()).lighthouse_port == 4999
+
+
+def test_the_configs_agree_on_the_port_the_lighthouse_binds(tmp_path, free_ports):
+    """A member dials the lighthouse at exactly the port the lighthouse binds
+    -- one number, from the env's own overlay.json, on both sides."""
+    mgr = NebulaManager(tmp_path / "nebula", runner=FakeRunner())
+    light = yaml.safe_load(mgr.generate_config(
+        "10.42.0.1", "192.168.64.1", DEFAULT_FIREWALL, is_lighthouse=True, lighthouse_port=4357,
+    ))
+    member = yaml.safe_load(mgr.generate_config(
+        "10.42.0.1", "192.168.64.1", DEFAULT_FIREWALL, lighthouse_port=4357,
+    ))
+    assert light["listen"]["port"] == 4357
+    assert member["static_host_map"] == {"10.42.0.1": ["192.168.64.1:4357"]}
+    assert member["listen"]["port"] == 4242, "members keep their own port"
+
+
+def test_a_legacy_overlay_without_a_port_reads_as_the_historical_4342(tmp_path, free_ports):
+    """An `overlay.json` written before per-env ports existed: members already
+    in the field dial 4342, so that is what "no port recorded" has to mean."""
+    mgr = NebulaManager(tmp_path / "nebula", runner=FakeRunner())
+    config = yaml.safe_load(mgr.generate_config("10.42.0.1", "192.168.64.1", DEFAULT_FIREWALL, is_lighthouse=True))
+    assert config["listen"]["port"] == nebula_module.LIGHTHOUSE_PORT
+
+
+def test_a_lighthouse_whose_recorded_port_got_taken_moves_and_records_the_move(tmp_path, free_ports):
+    """Recovery for a port that was free when the env was created and isn't
+    now (another env's lighthouse, or the user's own process): take a fresh
+    one and WRITE IT DOWN, so the sidecars that regenerate their configs
+    follow us there instead of dialling a lighthouse that isn't listening."""
+    runner = FakeRunner()
+    ensure_network(tmp_path, "prod", "1.2.3.4", runner=runner)
+    free_ports["busy"] = {nebula_module.LIGHTHOUSE_PORT}
+    calls: list[list[str]] = []
+    mgr = LighthouseManager(popen=_fake_popen(calls), runner=runner, nebula_bin="nebula")
+
+    assert mgr.ensure_started(tmp_path, "prod", "192.168.64.1") is True
+    config = yaml.safe_load((tmp_path / "prod" / "nebula" / "lighthouse-config.yml").read_text())
+    moved = nebula_module.LIGHTHOUSE_PORT + 1
+    assert config["listen"]["port"] == moved
+    stored = json.loads((tmp_path / "prod" / "nebula" / "overlay.json").read_text())
+    assert stored["lighthouse_port"] == moved
+
+
+def test_mesh_state_reports_which_port_this_env_owns(tmp_path, free_ports):
+    ensure_network(tmp_path, "prod", "1.2.3.4", runner=FakeRunner())
+    assert mesh_state(tmp_path, "prod").lighthouse_port == nebula_module.LIGHTHOUSE_PORT

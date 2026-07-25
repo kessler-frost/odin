@@ -75,6 +75,14 @@ class MeshNetwork(BaseModel):
     mask: str = "16"
     lighthouse_ip: str = "10.42.0.1"
     lighthouse_underlay_ip: str | None = None
+    # THIS env's own lighthouse UDP port (field test 2 B8): it used to be one
+    # machine-global constant, so only one env's lighthouse could ever bind and
+    # a second env's died with `exit 1` -- silently, while odin kept publishing
+    # that env's SG-gated mesh addresses. Allocated once per env by
+    # `fabric/nebula.py::ensure_network` and sticky from then on (every member's
+    # `static_host_map` embeds it), `None` only for an overlay.json written
+    # before this existed -- which reads as the historical 4342.
+    lighthouse_port: int | None = None
     next_subnet: int = 1
     subnets: dict[str, SubnetAllocation] = {}
 
@@ -140,12 +148,17 @@ class MeshState(BaseModel):
     `lighthouse_running` (R3): whether the env's host lighthouse PROCESS is
     up right now (`fabric/lighthouse.py::LighthouseManager.is_running`) --
     distinct from `lighthouse_underlay` merely being recorded.
+    `lighthouse_port`: which UDP port THIS env's lighthouse owns -- reported
+    because it is now per-env rather than one machine-global constant, and
+    "which env has which port" is exactly what was invisible when two envs
+    fought over 4342 (field test 2 B8).
     """
     network: str
     base_cidr: str = "10.42.0.0/16"
     lighthouse_ip: str = "10.42.0.1"
     lighthouse_underlay: str | None = None
     lighthouse_running: bool = False
+    lighthouse_port: int | None = None
     hosts: list[HostMembership] = []
     resources: list[MeshResource] = []
     vpcs: list[VpcNetwork] = []
