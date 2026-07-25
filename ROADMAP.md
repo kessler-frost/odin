@@ -291,11 +291,51 @@ future decision against these points instead of re-deriving them:
         previously-blocked port probed before and after on the SAME instance,
         `NRestarts=0` and an unchanged `ActiveEnterTimestamp` across the edit
         (`tests/simulate/test_sg_edit_propagation_e2e.py`).
-      - **Moving an instance BETWEEN groups still needs a recreate.** An
-        instance's group MEMBERSHIP is baked into its nebula certificate at
-        first join, and changing it means re-signing and re-distributing that
-        cert. Rule edits propagate; membership edits do not — the same limit
-        `fabric/sidecar.py` records for backings.
+      - **Moving an instance BETWEEN groups reaches it too, and REVOKING is
+        the case that matters.** For one release it did not, silently: an
+        instance's group MEMBERSHIP lives in its nebula CERTIFICATE, not in
+        its config, so the re-render above could never see a group move.
+        Field test 3 HIGH-1 measured the consequence in the worst direction —
+        `web1` was taken OUT of the group `db-sg` admits, Apply returned
+        `applied` with exit 0 and zero warnings, and web1 went on reaching
+        the database on the wire. A security control that fails open and
+        reports success.
+        Every Apply now compares each running instance's CURRENT groups
+        against the ones odin last landed on it and, when they differ,
+        re-issues its certificate (same sticky overlay IP, so nothing
+        published goes stale), lands it on the VM and **RESTARTS** the
+        daemon. A restart, never a SIGHUP: nebula reloads a firewall in
+        place, but every peer caches the certificate of each tunnel it holds
+        open, so only a re-handshake makes a new identity real — dropping the
+        old tunnels is the entire point here, unlike a rule edit.
+        **No recreate**: same VM, same instance id, same address.
+        Proven on the wire with two real VMs and a real Postgres, in the
+        hardest shape of the edit — `web-sg` and `admin-sg` carry IDENTICAL
+        rules, so the move changes not one byte of web1's config and only the
+        certificate can close the path (`tests/simulate/
+        test_sg_membership_revoke_e2e.py`): web1→db refused after the move,
+        web1→admin1:22 still answering at the same instant to prove the
+        overlay is alive, and the path re-opening when web1 is put back.
+        Unchanged membership costs one local file read — no `nebula-cert`,
+        no `limactl`, no signal — and a reordering of the same groups is not
+        a change.
+      - **What a revoke does NOT reach: a connection already open through
+        it.** New connections are refused the moment the peer re-handshakes
+        (sub-second, see the convergence note below). But nebula's firewall
+        keeps a conntrack entry per flow and re-validates it only when its
+        OWN rules change — not when the peer's certificate does — so a
+        long-lived connection that keeps sending can outlive the revoke, up
+        to nebula's conntrack timeout for that protocol. Editing the
+        admitting group's RULES (which does bump the rule version, forcing
+        re-validation) or restarting the admitting member closes it at once.
+        Real AWS security groups behave the same way for established flows.
+      - **A membership change that cannot be applied FAILS the Apply.**
+        `refresh_nebula` still never raises (mesh wiring must not fail an
+        instance boot), but a `failed` is no longer a log line under a green
+        light: `ensure_instance_mesh` raises `MeshRefreshFailed` naming every
+        VM that did not adopt its groups, what is still open because of it,
+        and what to do. A worse-but-honest message beats a green light on an
+        unchanged firewall.
     - **RDS**: the Postgres container is a REAL mesh member (a nebula
       companion container shares its network namespace, so the stock upstream
       image answers on an overlay IP), gated by the SG its canvas node names
@@ -324,6 +364,27 @@ future decision against these points instead of re-deriving them:
       nothing for a resource that publishes no mesh fact. What it does NOT
       prove: that a specific peer is allowed in — that's the SG's job, and a
       refusal there is policy, not a fault.
+    - **A mesh restart no longer leaves a window where the address is
+      advertised but silent.** Field test 3 MED-2 measured it: ~10s (broken
+      17:50:12, restored 17:50:22) after a sidecar restart during which
+      `/world` said `healthy` and published the `*_MESH` fact while the peer's
+      probe timed out — enough that the engineer's first security-group probe
+      failed for BOTH VMs and read as "SG gating is broken". The cause is
+      nebula behaving correctly, not a bug: the peer keeps sending into the
+      tunnel that just died, the restarted member answers `recv_error`, and
+      the peer deliberately ignores the first few of those before tearing the
+      stale tunnel down — which, at a TCP probe's 1s/2s/4s retransmit cadence,
+      is about ten seconds of a silently dead path. The member that restarted
+      now MOVES FIRST instead: one bounded packet toward each peer's overlay
+      address (`fabric/nebula.py::rehandshake_script`), which forces a fresh
+      handshake and, in the same instant, replaces that peer's cached tunnel
+      AND its cached certificate for us. That is also what makes a re-issued
+      certificate take effect in one round trip rather than "eventually".
+      Paid only on a real restart — an unchanged member never reaches it, and
+      an env with no mesh never pays a millisecond. `mesh_health`'s own
+      caveat still stands and is unchanged: probing from inside a member's own
+      namespace cannot observe peer-side staleness, so this closes the window
+      at the source rather than detecting it.
     - **One lighthouse port per ENV, not per machine.** It used to be a single
       fixed 4342, so the second env to start a lighthouse lost the bind, its
       `nebula` exited 1 with only a log line, and its whole mesh silently
