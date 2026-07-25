@@ -105,6 +105,26 @@ drawn resources over the mesh; they do not sandbox your own machine. If you
 want a consumer to be subject to its security group, give it the `*_MESH`
 fact.
 
+### What revoking access does and does not stop
+
+Moving a resource out of a security group on the canvas is real: odin
+re-signs that member's Nebula certificate with its new groups and restarts
+its daemon, so the peer re-handshakes under the new identity and **new
+connections are refused before Apply even returns** (measured at 0.11s).
+A membership change odin cannot apply fails the Apply rather than reporting
+success.
+
+It does **not** kill a connection that is already open through the path you
+just revoked. Nebula's firewall keeps a conntrack entry per flow and
+re-validates it only when its own ruleset version changes — not when a
+peer's certificate does — so a long-lived flow that keeps sending can
+outlive the revoke, up to nebula's `firewall.conntrack` timeouts. Editing
+the admitting group's *rules*, or restarting the admitting member, closes it
+immediately. Real AWS security groups behave the same way for established
+flows, so this is a shared property rather than a substitution gap — but if
+you are revoking access in anger, terminate the existing connection too.
+ROADMAP's security-group section documents the mechanism in full.
+
 ## Secrets
 
 A field like an RDS `password` is stored, and used, in cleartext:
