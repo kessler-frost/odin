@@ -16,7 +16,35 @@ REPORT, DON'T AUTO-HEAL (the wave-2 plan is explicit): tofu owns these
 kinds, so re-creating a VM behind its back would fight its state. A drifted
 resource projects `crashed` with a verdict that NAMES the drift and tells
 the user the fix ("re-Apply to recreate"); the reconciler's existing pipeline
-turns that into a WorldDelta + an error log line, and nothing else happens.
+turns that into a WorldDelta + an error log line. This sweep never calls
+tofu, and never re-creates anything -- the user still drives the recovery.
+
+...BUT TELL TOFU THE TRUTH TOO (the honesty fix W2.2 shipped without): the
+sweep also CORRECTS THE RECORD of a resource it just confirmed gone, because
+that record is what odin's own gateway answers tofu's next refresh with.
+Reporting "re-Apply to recreate" while leaving an ec2 record claiming
+`running` made the advice a LIE: DescribeInstances kept answering `running`
+for a VM that no longer existed, tofu planned nothing, and the resource never
+came back -- exactly the "never promise a recovery that doesn't happen" rule
+in NORTHSTAR directive 5. Correcting the store is not auto-healing; it is the
+minimum honesty that makes the user's Apply actually work. Per kind:
+ - ec2: `ec2compute.mark_instance_terminated` -> the record reads
+   `terminated` with a real `StateReason` naming the out-of-band deletion,
+   which is what real AWS reports for an instance that's gone AND what makes
+   terraform-provider-aws's own Read drop it from state -> the next `tofu
+   apply` plans a create and the VM genuinely returns. The record still
+   projects (`crashed` + that reason, tf_status.py's `drifted` exception), so
+   the honest report and the working recovery are the same fact.
+ - lambda: `lambdactl.mark_function_failed` -> `State: Failed` with the same
+   reason. The record is deliberately NOT deleted: a function's RIE container
+   is its EXECUTION ENVIRONMENT, not a TF resource, and real AWS never deletes
+   a function because a sandbox died (it starts a new one). tofu therefore
+   can't be the fixer here either -- the provider's `aws_lambda_function`
+   schema has no state/status attribute to diff on (verified against the
+   v5.100.0 provider schema), so its plan stays empty -- which is why the
+   recovery is `lambdactl.converge_functions`, an Apply-driven re-`ensure` of
+   the container, exactly parallel to ecs below.
+ - ecs: `ecsctl.mark_task_stopped` -> see the next paragraph.
 
 WHICH KINDS: only the three with a real runtime footprint -- ec2 (a real Lima
 VM), ecs (a real task container), lambda (a real RIE container). vpc/subnet/
@@ -38,20 +66,16 @@ container that limactl/docker hasn't registered YET is not gone -- it's
 starting. Same in reverse for `shutting-down`/`stopping` (mid-delete) and
 `stopped`/`Failed`/`STOPPED` (already crashed, with their own real reasons).
 
-THE ECS EXCEPTION -- why one kind writes reality back into its store instead
-of just overlaying a verdict: an ECS *task* is not a TF resource (real
-terraform never manages one; real ECS's own service scheduler replaces a lost
-task). So for ecs the honest record of "this task's container is gone" is the
-task record itself, marked STOPPED exactly as `ecsctl.sweep_tasks` already
-marks a container that exited on its own -- which (a) gives the crashed
-projection + verdict through the machinery wave 1 already built, and (b) is
-what makes re-Apply actually converge: `ecsctl.converge_services` relaunches
-the missing task, while an `aws_ecs_service` whose config never changed would
-give tofu an empty plan forever. ec2/lambda get a verdict OVERLAY only,
-never a store rewrite: writing `terminated` into an ec2 record would EXCLUDE
-it from the projection entirely (tf_status.py's own release-sweep finding #2)
--- odin would silently forget a VM tofu still believes exists, which is the
-opposite of honest.
+THE ECS SHAPE -- why that kind's correction is a task record and not a TF
+resource state: an ECS *task* is not a TF resource at all (real terraform
+never manages one; real ECS's own service scheduler replaces a lost task). So
+for ecs the honest record of "this task's container is gone" is the task
+record itself, marked STOPPED exactly as `ecsctl.sweep_tasks` already marks a
+container that exited on its own -- which (a) gives the crashed projection +
+verdict through the machinery wave 1 already built, and (b) is what makes
+re-Apply actually converge: `ecsctl.converge_services` relaunches the missing
+task, while an `aws_ecs_service` whose config never changed would give tofu an
+empty plan forever.
 """
 from __future__ import annotations
 
@@ -61,7 +85,9 @@ import os
 from odin.compute.functions import container_name as function_container_name
 from odin.compute.instances import InstanceVm, vm_name
 from odin.compute.tasks import container_name as task_container_name
+from odin.gateway.models.ec2compute import mark_instance_terminated
 from odin.gateway.models.ecsctl import mark_task_stopped
+from odin.gateway.models.lambdactl import mark_function_failed
 from odin.gateway.stores import SynthStores
 from odin.runtime.colima import ColimaRuntime
 
@@ -85,29 +111,33 @@ def _label(tags: dict[str, str], natural: str | None = None) -> str | None:
     return tags.get("odin:node") or natural
 
 
-def _vm_records(stores: SynthStores, env: str) -> list[tuple[str, str]]:
-    """(label, real VM name) for every ec2 record claiming `running`. `ec2`
-    has no AWS-native name field, so the `odin:node` tag is the only route
-    back to a label (tf_status.py's own note) -- an untagged instance isn't
-    projected into World either, so there'd be nothing to report drift on."""
-    out: list[tuple[str, str]] = []
+def _vm_records(stores: SynthStores, env: str) -> list[tuple[str, str, str]]:
+    """(label, instance id, real VM name) for every ec2 record claiming
+    `running`. `ec2` has no AWS-native name field, so the `odin:node` tag is
+    the only route back to a label (tf_status.py's own note) -- an untagged
+    instance isn't projected into World either, so there'd be nothing to
+    report drift on. The instance id rides along because a confirmed-gone VM
+    gets its RECORD corrected too (`mark_instance_terminated`)."""
+    out: list[tuple[str, str, str]] = []
     for key, record in stores.ec2compute.items(env).items():
         if not key.startswith("instance:") or record["state_name"] != "running":
             continue
         label = _label(stores.tags.get(env, f"ec2:{record['instance_id']}", {}))
         if label:
-            out.append((label, vm_name(env, record["instance_id"])))
+            out.append((label, record["instance_id"], vm_name(env, record["instance_id"])))
     return out
 
 
-def _function_records(stores: SynthStores, env: str) -> list[tuple[str, str]]:
-    """(label, RIE container name) for every function claiming `Active` and
-    NOT mid-redeploy. `LastUpdateStatus == "InProgress"` is the exempt
-    window: `FunctionRuntime.ensure` deliberately `stop`s (rm -f) the old
-    container before running the new one, so the container is legitimately
+def _function_records(stores: SynthStores, env: str) -> list[tuple[str, str, str]]:
+    """(label, function name, RIE container name) for every function claiming
+    `Active` and NOT mid-redeploy. `LastUpdateStatus == "InProgress"` is the
+    exempt window: `FunctionRuntime.ensure` deliberately `stop`s (rm -f) the
+    old container before running the new one, so the container is legitimately
     absent for a moment while `State` still reads Active (lambdactl.py's two
-    independent state machines)."""
-    out: list[tuple[str, str]] = []
+    independent state machines). The function name rides along because a
+    confirmed-gone container gets its RECORD corrected too
+    (`mark_function_failed`)."""
+    out: list[tuple[str, str, str]] = []
     for key, record in stores.lambdactl.items(env).items():
         if not key.startswith("fn:") or record["state"] != "Active":
             continue
@@ -117,7 +147,7 @@ def _function_records(stores: SynthStores, env: str) -> list[tuple[str, str]]:
             stores.tags.get(env, f"lambda:{record['function_arn']}", {}), record["function_name"],
         )
         if label:
-            out.append((label, function_container_name(env, record["function_name"])))
+            out.append((label, record["function_name"], function_container_name(env, record["function_name"])))
     return out
 
 
@@ -173,7 +203,14 @@ class DriftSweeper:
         instead -- see the module docstring). Sweeps on the first call and
         every `_sweep_ticks()` calls after; every other call answers from the
         last sweep's cache, so a reported drift stays reported between
-        sweeps instead of flapping back to healthy on the very next tick."""
+        sweeps instead of flapping back to healthy on the very next tick.
+
+        This overlay is the FIRST report, not the lasting one: the same sweep
+        corrects the underlying record, and a corrected record is no longer a
+        candidate -- so the next sweep goes quiet and `tf_status.project()`'s
+        own `crashed` + real-reason projection carries the drift from there
+        on. Both say the same thing; only the store's version survives a
+        restart."""
         count = self._ticks.get(env, 0)
         self._ticks[env] = count + 1
         if count % _sweep_ticks() == 0:
@@ -190,12 +227,20 @@ class DriftSweeper:
         live_vms = _listing(lambda: self._vms.list_names(check=True)) if vms else None
         live_containers = _listing(self._containers.container_names) if functions or tasks else None
         out: dict[str, str] = {}
-        for label, name in vms:
+        for label, instance_id, name in vms:
             if live_vms is not None and name not in live_vms:
                 out[label] = f"VM {name} deleted outside odin — re-Apply to recreate"
-        for label, name in functions:
+                # The same sentence goes into the RECORD, so tofu's next
+                # refresh learns the instance is gone and re-Apply really does
+                # recreate it (see the module docstring).
+                mark_instance_terminated(stores, env, instance_id, out[label])
+        for label, function_name, name in functions:
             if live_containers is not None and name not in live_containers:
                 out[label] = f"container {name} removed outside odin — re-Apply to recreate"
+                # Same sentence into the RECORD: a function whose sandbox is
+                # gone is `Failed`, and an Apply's `converge_functions` is what
+                # actually brings it back (see the module docstring).
+                mark_function_failed(stores, env, function_name, out[label])
         for cluster, task_id, name in tasks:
             if live_containers is not None and name not in live_containers:
                 mark_task_stopped(

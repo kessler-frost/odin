@@ -269,6 +269,81 @@ def _spawn(target: Callable[..., None], *args: object) -> None:
     threading.Thread(target=target, args=args, daemon=True).start()
 
 
+# --- the reality sweep's seam + the Apply-driven recovery (W2.2's honesty
+# fix) --------------------------------------------------------------------
+
+
+def mark_function_failed(stores: SynthStores, env: str, name: str, reason: str) -> None:
+    """Public seam for the reality sweep (`reconcile/drift.py`): this
+    function's RIE container -- its EXECUTION ENVIRONMENT -- is gone, so
+    `State` is `Failed` with `reason`, the same terminal shape
+    `_finish_deploy`'s own failure path writes. A function whose sandbox
+    doesn't exist genuinely cannot run: Invoke already answers
+    `ResourceNotReadyException` off this state, and `reconcile/tf_status.py`
+    projects it as `crashed` with `reason` as the verdict.
+
+    What is NOT done here, deliberately: the function RECORD is not deleted.
+    Real AWS never deletes a function because an execution environment died --
+    it starts a new one -- so deleting would be a bigger lie than the one being
+    fixed, and it would drop the node off the canvas instead of saying why it's
+    down. `LastUpdateStatus` is left alone too: the last DEPLOY really did
+    succeed; what failed is the environment.
+
+    That does mean tofu cannot be the one to fix this (an
+    `aws_lambda_function`'s config is unchanged, and the provider's schema has
+    no state/status attribute to diff on -- verified against the v5.100.0
+    provider schema -- so its plan is empty forever). `converge_functions`
+    below is what makes the "re-Apply to recreate" verdict true."""
+    _update_function(
+        stores, env, name, state="Failed",
+        state_reason=reason, state_reason_code="InternalError",
+    )
+
+
+def converge_functions(
+    stores: SynthStores, env: str, substrate: FunctionRuntime | None = None,
+    keystore: KeyStore | None = None, gateway_port: int | None = None,
+) -> None:
+    """Re-create the REAL container of every `Failed` function -- the exact
+    `_finish_deploy` pass CreateFunction/UpdateFunctionCode already spawn,
+    driven by an APPLY (server.py's /apply-full) rather than by an AWS
+    mutation. `ecsctl.converge_services`' twin, for the same reason: a
+    function's execution environment is not a terraform resource, so nothing
+    in an `aws_lambda_function`'s config changes when its container is
+    destroyed out of band and tofu's plan is empty forever. In real AWS,
+    Lambda's own control plane (never terraform) replaces a dead sandbox; this
+    is odin's equivalent, deliberately triggered by the user's Apply instead of
+    a background timer -- the module's "no scheduler loop of our own" limit
+    stays.
+
+    Code-only, never config: the existing `code_dir` is reused (the
+    UpdateFunctionConfiguration path's "same code, restarted container"), so
+    this can only ever restore what the last deploy already established.
+
+    Idempotent, and never a racing second deploy: an `Active` function is left
+    completely alone, and a function whose `LastUpdateStatus` is `InProgress`
+    (e.g. the UpdateFunctionCode THIS apply just made, still booting) is
+    skipped so two `ensure` calls can't fight over one container."""
+    runtime = substrate or FunctionRuntime(ColimaRuntime(), stores.root)
+    for key, fn in stores.lambdactl.items(env).items():
+        if not key.startswith("fn:") or fn["state"] != "Failed" or fn["last_update_status"] == "InProgress":
+            continue
+        name = fn["function_name"]
+        # Claim the redeploy in the store BEFORE spawning it: a second Apply
+        # arriving while this one is still booting the container sees
+        # `InProgress` and skips (the same claim-then-act shape
+        # ec2compute's `_claim_delete_retry` uses).
+        _update_function(
+            stores, env, name, last_update_status="InProgress",
+            last_update_status_reason=None, last_update_status_reason_code=None,
+        )
+        log.info("converging lambda %s (env %s): re-creating its container", name, env)
+        _spawn(
+            _finish_deploy, stores, env, name, fn["runtime"], fn["handler"], fn["environment"],
+            runtime.code_dir(env, name), runtime, keystore, gateway_port, fn["memory_size"],
+        )
+
+
 # --- CreateFunction / GetFunction / DeleteFunction ------------------------
 
 

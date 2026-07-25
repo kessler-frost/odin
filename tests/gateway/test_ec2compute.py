@@ -396,6 +396,40 @@ def test_terminate_transitions_then_sweeps_after_grace_window(sink, ec2, stores)
     assert parsed["Error"]["Code"] == "InvalidInstanceID.NotFound"
 
 
+def test_mark_instance_terminated_is_what_tofu_reads_after_an_out_of_band_vm_delete(sink, ec2, stores):
+    """W2.2's honesty fix -- the reality sweep's seam (`reconcile/drift.py`):
+    once odin has CONFIRMED the Lima VM is gone, DescribeInstances must answer
+    `terminated` with a real StateReason, because that answer is the only thing
+    that makes the "re-Apply to recreate" verdict TRUE (terraform-provider-aws
+    drops a terminated instance from state and plans a create; a record still
+    claiming `running` gives tofu an empty plan forever and the VM never comes
+    back). The record is also reclaimed by the normal lazy sweep afterwards --
+    no new lifecycle, just the existing terminal one."""
+    subnet_id = _subnet(stores, sink, ec2)
+    vm = FakeInstanceVm()
+    instance_id = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)["Instances"][0]["InstanceId"]
+    _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+
+    ec2compute.mark_instance_terminated(
+        stores, ENV, instance_id,
+        f"VM odin-ec2-{ENV}-{instance_id} deleted outside odin — re-Apply to recreate",
+    )
+
+    req = sink.call(lambda: ec2.describe_instances(InstanceIds=[instance_id]))
+    instance = _parse("DescribeInstances", _answer(stores, req, vm))["Reservations"][0]["Instances"][0]
+    assert instance["State"]["Name"] == "terminated"
+    assert instance["StateReason"]["Code"] == "Client.UserInitiatedShutdown"
+    assert "deleted outside odin" in instance["StateReason"]["Message"]
+    assert vm.deleted == [], "the sweep records reality -- it never deletes a VM itself"
+
+    # ...and the record is reclaimed by the SAME grace window a real terminate
+    # uses, never parked in the store forever.
+    path, query = split_url(req.url)
+    action, resource = classify("ec2", req.method, path, query, req.headers, req.body)
+    late = ec2compute.pure_answer(action, resource, ENV, req.body, stores, time.monotonic() + 120.0, vm)
+    assert _parse("DescribeInstances", late, error=True)["Error"]["Code"] == "InvalidInstanceID.NotFound"
+
+
 def test_terminate_delete_failure_keeps_shutting_down_with_reason_and_retries(sink, ec2, stores):
     """Release finding #4 -- VM delete honesty: a failed `vm.delete` must
     NOT be reported as a clean `terminated`. The record stays

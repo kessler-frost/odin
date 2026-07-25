@@ -48,15 +48,16 @@ from odin.gateway.stores import SynthStores
 TF_OWNED_KINDS = frozenset({"vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr", "logs"})
 
 # EC2's real instance-state machine (gateway/models/ec2compute.py's own
-# `_STATE_CODES` keys) -> the World Phase enum. `terminated` is deliberately
-# absent: a terminated instance is GONE (its Lima VM deleted) and is EXCLUDED
-# from the projection in `_ec2_instances` below, not mapped to a phase -- see
-# that function's own note (release sweep finding #2). `stopped` (an
-# intentional Stop, the VM still exists) does read "crashed"; `shutting-down`
-# stays visible (`starting`) because a delete can fail and the VM outlive it.
+# `_STATE_CODES` keys) -> the World Phase enum. `stopped` (an intentional
+# Stop, the VM still exists) reads "crashed"; `shutting-down` stays visible
+# (`starting`) because a delete can fail and the VM outlive it. `terminated`
+# only ever REACHES this mapping when the record is `drifted` (the reality
+# sweep found its VM deleted outside odin) -- every other terminated record is
+# excluded from the projection entirely in `_ec2_instances` below, so this row
+# never resurrects the phantom the v0.5.2 fix removed.
 _EC2_PHASE = {
     "pending": "starting", "running": "healthy", "stopping": "starting",
-    "stopped": "crashed", "shutting-down": "starting",
+    "stopped": "crashed", "shutting-down": "starting", "terminated": "crashed",
 }
 
 # Lambda's two independent state machines (lambdactl.py's module docstring)
@@ -151,9 +152,14 @@ def _ec2_verdict(record: dict) -> str | None:
 
 def _ec2_instances(stores: SynthStores, env: str) -> Projected:
     out: Projected = {}
-    for key, record in stores.ec2compute.items(env).items():
-        if not key.startswith("instance:"):
-            continue
+    instances = [r for k, r in stores.ec2compute.items(env).items() if k.startswith("instance:")]
+    # Terminated records FIRST, so a live instance sharing their label
+    # overwrites them: a re-Apply that recovers drift mints a NEW instance
+    # while the drifted one is still inside its 60s lazy-sweep window
+    # (ec2compute's `_sweep_terminated`), and the recovered node must never
+    # read `crashed` off the corpse it replaced. `sorted` is stable, so
+    # same-state records keep store order.
+    for record in sorted(instances, key=lambda r: r["state_name"] != "terminated"):
         # Release sweep finding #2: a `terminated` instance is GONE (VM deleted
         # by tofu destroy / empty-canvas Apply / a boot failure). Exclude it so
         # the reconciler prunes it from World immediately (the ECS INACTIVE
@@ -161,7 +167,17 @@ def _ec2_instances(stores: SynthStores, env: str) -> Projected:
         # triggers ec2compute's Describe-driven lazy sweep, so projecting a
         # terminated record would strand a phantom `crashed` node in /world
         # forever, breaking the "empty canvas + Apply => /world empty" promise.
-        if record["state_name"] == "terminated":
+        #
+        # A `drifted` record is the ONE exception (W2.2 honesty fix): the
+        # reality sweep marked it terminated because its VM was deleted
+        # outside odin, and that terminated record is exactly what makes the
+        # next Apply recreate the VM (ec2compute's `mark_instance_terminated`).
+        # Dropping it here would trade one dishonesty for another -- odin
+        # would quietly forget a node the user still has on the canvas instead
+        # of showing WHY it's down -- so it projects `crashed` + the real
+        # StateReason, and the recovery apply's own describes are what
+        # eventually sweep the record away.
+        if record["state_name"] == "terminated" and not record.get("drifted"):
             continue
         tags = stores.tags.get(env, f"ec2:{record['instance_id']}", {})
         label = tags.get("odin:node")  # no AWS-native name field to fall back to

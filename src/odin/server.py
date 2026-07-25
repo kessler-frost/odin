@@ -34,7 +34,7 @@ from odin.fabric.nebula import mesh_state
 from odin.gateway import DEFAULT_GATEWAY_PORT, GATEWAY_PORT_ENV
 from odin.gateway.app import GatewayState, create_gateway_app, serve_in_thread, stop_in_thread
 from odin.gateway.keys import OPERATOR_NODE_ID, KeyStore, Principal
-from odin.gateway.models import ec2compute, ecsctl
+from odin.gateway.models import ec2compute, ecsctl, lambdactl
 from odin.gateway.stores import SynthStores
 from odin.reconcile import admission
 from odin.reconcile.drift import DriftSweeper
@@ -459,6 +459,14 @@ def create_apply_full_router(
         # must be the SAME substrate that launched these containers, and
         # ecsctl's own `runtime or TaskRuntime()` default is what did.
         ecsctl.converge_services(stores, env, TaskRuntime(), keystore, gateway_port())
+        # The same recovery for lambda, and for the same reason: a function's
+        # RIE container is its EXECUTION ENVIRONMENT, not a TF resource -- an
+        # `aws_lambda_function`'s config doesn't change when its container is
+        # destroyed out of band (and the provider has no state attribute to
+        # diff on), so tofu's plan is empty forever. Real Lambda's own control
+        # plane replaces a dead sandbox; this is odin's equivalent. Idempotent:
+        # only a `Failed` function is re-`ensure`d, an Active one is untouched.
+        lambdactl.converge_functions(stores, env, keystore=keystore, gateway_port=gateway_port())
         await reconciler.tick()  # kick an immediate pass; the loop continues it
         return JSONResponse(status_code=200, content=body)
 
