@@ -12,6 +12,7 @@ import pytest
 import typer
 
 from odin import __main__ as main_mod, util
+from odin.gateway.stores import SynthStores
 
 
 def test_default_host_constant_is_loopback():
@@ -324,6 +325,69 @@ def test_clean_all_still_wipes_the_store_when_nothing_is_running(tmp_path, monke
     main_mod.clean(all=True)
     assert "full reset" in capsys.readouterr().out
     assert not (tmp_path / ".odin" / "world.json").exists()
+
+
+# --- ...and the store is the only record of what odin owns (field test 4) ---
+#
+# The engineer wiped a scratch store and then had to `docker rm` an
+# `odin-aws-*-sneak` container BY HAND, BY EXACT NAME: no odin command could
+# find it any more, because the thing that knew was what they deleted. A "full
+# reset" that leaves real containers running is a leak with a friendly name.
+
+
+def _fake_machine(monkeypatch, containers: list[str] = (), vms: list[str] = ()):
+    """`docker ps` / `limactl list` without a machine -- the two shell-outs
+    `clean --all`'s resource check makes, and nothing else."""
+    def run(argv, input=None):
+        if argv[0] == "docker":
+            return util.CommandResult(0, "\n".join(containers) + "\n")
+        return util.CommandResult(0, "\n".join(vms) + "\n")
+
+    monkeypatch.setattr(main_mod, "run_command", run)
+
+
+def test_clean_all_refuses_while_an_env_still_has_real_containers(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".odin" / "sneak").mkdir(parents=True)
+    _fake_machine(monkeypatch, containers=["odin-aws-rustfs-sneak", "odin-aws-goaws-sneak"])
+
+    with pytest.raises(typer.Exit) as exit_info:
+        main_mod.clean(all=True)
+
+    assert exit_info.value.exit_code == 1
+    captured = capsys.readouterr()
+    assert "only record of them" in captured.out
+    assert "odin-aws-rustfs-sneak" in captured.out and "odin-aws-goaws-sneak" in captured.out
+    assert "`odin destroy --env sneak`" in captured.err   # the supported command, while it still works
+    assert (tmp_path / ".odin" / "sneak").exists()        # nothing deleted
+
+
+def test_clean_all_names_the_envs_real_vms_too(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".odin" / "sneak").mkdir(parents=True)
+    stores = SynthStores(tmp_path / ".odin")
+    stores.ec2compute.set("sneak", "instance:i-abc", {"instance_id": "i-abc"})
+    # A VM this store claims, one it does not, and the user's own machine.
+    _fake_machine(monkeypatch, vms=["odin-ec2-sneak-i-abc", "odin-ec2-other-i-zzz", "veronica"])
+
+    with pytest.raises(typer.Exit):
+        main_mod.clean(all=True)
+
+    out = capsys.readouterr().out
+    assert "odin-ec2-sneak-i-abc" in out
+    # Exact names from this store's own records, never a prefix sweep: a VM
+    # belonging to another env -- or to the user -- is never even a candidate.
+    assert "odin-ec2-other-i-zzz" not in out
+    assert "veronica" not in out
+
+
+def test_clean_all_proceeds_when_the_envs_own_nothing(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".odin" / "spent").mkdir(parents=True)
+    _fake_machine(monkeypatch)
+    main_mod.clean(all=True)
+    assert "full reset" in capsys.readouterr().out
+    assert not (tmp_path / ".odin" / "spent").exists()
 
 
 def test_start_foreground_writes_and_removes_the_pidfile(tmp_path, monkeypatch):
