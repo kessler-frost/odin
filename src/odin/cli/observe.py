@@ -35,11 +35,30 @@ def world(env: str = http.ENV, url: str = http.URL, output: OutputFormat = http.
     http.emit(body, output, _render_world)
 
 
+def _render_envs(body: dict) -> None:
+    """One env per line on stdout, nothing else -- `odin envs | while read e`
+    has to keep working. The empty case used to print a single blank line and
+    exit 0, which reads like a broken command rather than an answer, so the
+    explanation goes to stderr where it can't get into that loop."""
+    for env in body["envs"]:
+        typer.echo(env)
+    if not body["envs"]:
+        typer.echo(
+            "no environments yet — an env exists once something has been applied to it. "
+            "`odin apply` and the canvas both default to env 'default'.",
+            err=True,
+        )
+
+
 @app.command()
 def envs(url: str = http.URL, output: OutputFormat = http.OUTPUT) -> None:
-    """List the environments the server knows about."""
+    """List the environments the server knows about (one per line).
+
+    An env comes into existence when a canvas is applied to it, so a fresh
+    odin lists none — not an error, and exit 0 either way.
+    """
     body = http.body_or_fail(http.request("GET", url, "/envs"))
-    http.emit(body, output, lambda b: typer.echo("\n".join(b["envs"])))
+    http.emit(body, output, _render_envs)
 
 
 def _render_events(events_list: list[dict]) -> None:

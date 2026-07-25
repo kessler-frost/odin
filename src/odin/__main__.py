@@ -57,6 +57,29 @@ def _warn_if_non_loopback(host: str) -> None:
         )
 
 
+def _already_running() -> bool:
+    """True when a live pidfile server means this `start` must not launch a
+    second one -- printed, and NOT an error.
+
+    Exit 0 is deliberate here, and the odd one out among the exit-code fixes:
+    `odin start` asks for an end state (odin up) and that end state holds, so
+    an idempotent `odin start && odin apply` in a script should keep working.
+    What a second `start` cannot honour is a different `--port`/`--host`, so
+    it says so out loud rather than letting the flags look applied.
+    """
+    if not PID_FILE.exists():
+        return False
+    pid = int(PID_FILE.read_text().strip())
+    if not pid_alive(pid):
+        PID_FILE.unlink()
+        return False
+    typer.echo(
+        f"Odin is already running (pid {pid}) — nothing was started, and any --port/--host "
+        "you passed was NOT applied. Run `odin stop` first to restart it with new flags."
+    )
+    return True
+
+
 def _build_ui() -> None:
     if (Path(__file__).resolve().parent / "_ui").exists():
         return  # UI ships bundled with the installed package
@@ -86,12 +109,8 @@ def start(
         _start_dev(port, host)
         return
 
-    if PID_FILE.exists():
-        pid = int(PID_FILE.read_text().strip())
-        if pid_alive(pid):
-            typer.echo(f"Odin is already running (pid {pid}). Use `odin stop` first.")
-            return
-        PID_FILE.unlink()
+    if _already_running():
+        return
 
     _build_ui()
     typer.echo(f"Starting Odin on http://{host}:{port}")
@@ -125,12 +144,8 @@ def start(
 
 def _start_dev(port: int, host: str = DEFAULT_HOST) -> None:
     """Dev mode startup."""
-    if PID_FILE.exists():
-        pid = int(PID_FILE.read_text().strip())
-        if pid_alive(pid):
-            typer.echo(f"Odin is already running (pid {pid}). Use `odin stop` first.")
-            return
-        PID_FILE.unlink()
+    if _already_running():
+        return
 
     typer.echo(f"Starting Odin dev mode on http://{host}:{port}")
     typer.echo(f"  Vite  → :{port}  (HMR)")
@@ -192,7 +207,13 @@ def _clear_stale_pidfile() -> str:
 
 @app.command()
 def stop() -> None:
-    """Stop the Odin server."""
+    """Stop the Odin server. Exit 0 once odin is down, 1 if it is still up.
+
+    Nothing running is exit 0 on purpose, unlike `odin status`: `stop` asks
+    for an end state rather than a fact, and that end state holds. The one
+    non-zero case is the one where it does not -- a server odin can see but
+    cannot signal.
+    """
     server = live_server(ODIN_DIR)
     if server is None:
         typer.echo(f"Odin is not running{_clear_stale_pidfile()}.")
@@ -203,7 +224,7 @@ def stop() -> None:
         # field engineer to kill their own shell, and no message is worth that.
         typer.echo(f"Odin is running ({server.detail}), but odin cannot identify the process.")
         typer.echo(f"Stop it by {server.how_to_stop}.")
-        return
+        raise typer.Exit(1)  # odin is still up, and this command said so
     # A server the user launched themselves (no pidfile -- `uvicorn
     # odin.server:create_app`, the command the README documents) is still THIS
     # store's server, so `odin stop` stops it rather than claiming nothing is
@@ -216,11 +237,18 @@ def stop() -> None:
 
 @app.command()
 def status() -> None:
-    """Check if Odin is running."""
+    """Is Odin running? Exit 0 if it is, 1 if it is not.
+
+    `status` is a question, so the exit code is the answer -- the shell
+    convention every other predicate follows (`test`, `pgrep`, `systemctl
+    is-active`). Through v0.7.3 it printed "Odin is not running." and exited
+    0, which made `odin status && odin apply` apply against a server that
+    wasn't there and gave a CI gate nothing to check but the sentence.
+    """
     server = live_server(ODIN_DIR)
     if server is None:
         typer.echo(f"Odin is not running{_clear_stale_pidfile()}.")
-        return
+        raise typer.Exit(1)
     typer.echo(f"Odin is running ({server.detail}).")
 
 
