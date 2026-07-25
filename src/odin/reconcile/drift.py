@@ -259,7 +259,7 @@ class DriftSweeper:
         self._ticks: dict[str, int] = {}
         self._cache: dict[str, dict[str, str]] = {}
 
-    def verdicts(self, stores: SynthStores, env: str) -> dict[str, str]:
+    def verdicts(self, stores: SynthStores, env: str, sweep: bool = True) -> dict[str, str]:
         """`label -> drift verdict` for every ec2/lambda/rds resource whose real
         VM/container is GONE, or whose database has stopped answering (ecs
         reports through its own task records instead -- see the module
@@ -268,6 +268,15 @@ class DriftSweeper:
         last sweep's cache, so a reported drift stays reported between
         sweeps instead of flapping back to healthy on the very next tick.
 
+        `sweep=False` is cache-ONLY, and it costs nothing: v0.7.3's
+        observe-during-apply tick (`Reconciler._watch`) reports what the last
+        sweep found without taking a new one, because a sweep does not just
+        look -- it CORRECTS records, and doing that off a sample taken while
+        tofu has the daemon pinned is the hazard `_sweep_databases`'s own
+        confirm-before-correcting note describes. The cadence counter is not
+        advanced either, so a suspended apply neither delays nor triggers the
+        next real sweep.
+
         This overlay is the FIRST report, not the lasting one: the same sweep
         corrects the underlying record, and a corrected record is no longer a
         candidate -- so the next sweep goes quiet and `tf_status.project()`'s
@@ -275,9 +284,10 @@ class DriftSweeper:
         on. Both say the same thing; only the store's version survives a
         restart."""
         count = self._ticks.get(env, 0)
-        self._ticks[env] = count + 1
-        if count % _sweep_ticks() == 0:
-            self._cache[env] = self._sweep(stores, env)
+        if sweep:
+            self._ticks[env] = count + 1
+            if count % _sweep_ticks() == 0:
+                self._cache[env] = self._sweep(stores, env)
         return self._cache.get(env, {})
 
     def _sweep(self, stores: SynthStores, env: str) -> dict[str, str]:

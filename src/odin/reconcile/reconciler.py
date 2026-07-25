@@ -22,6 +22,14 @@ sweep + an Apply-driven `converge_db_instances`, the shape W2.2 already
 established for ecs/lambda. What's left of rds in this file is the same thing
 that's left of every TF-owned kind: projection and pruning.
 
+A tick has two halves, and v0.7.3 made the difference load-bearing: it
+ACTS (plan/execute, gc, the gateway push, the World prune) and it OBSERVES
+(projecting the TF-owned kinds and broadcasting WorldDeltas). `hold()`
+suspends only the first, so `/world` and the canvas stay live for the whole
+of an apply instead of freezing at their last pre-apply reading -- see
+`hold()` and `_watch()`, which carry the argument and the field-test
+measurement behind it.
+
 Per-node credential injection (a workload container's env bound to
 keystore-issued creds + the gateway endpoint, formerly `_run_service`) is
 deferred with the app-workload layer (NORTHSTAR.md, tag app-layer-parked) —
@@ -89,6 +97,10 @@ class Reconciler:
         # endpoints; it yields at every to_thread, so unserialized ticks plan
         # on the same pre-execute world and double-run containers.
         self._tick_lock = asyncio.Lock()
+        # How many `hold()`s are currently open (see hold(): actions off, eyes
+        # on). Read and written ONLY under `_tick_lock` -- that is the whole
+        # safety argument, so never touch it from anywhere else.
+        self._suspended = 0
 
     # ---- lifecycle ----
     async def start(self) -> None:
@@ -111,30 +123,112 @@ class Reconciler:
 
     @asynccontextmanager
     async def hold(self):
-        """Block the background loop's ticks while an external author
-        mutates the env (the /apply-full route: ensure backings + tofu +
-        store commit). Without this, a tick against the not-yet-committed
-        stack gc's the very backing containers the ensure phase is booting
-        (fresh env: old stack is empty, so gc(set()) stops everything)."""
+        """Suspend this loop's ACTIONS while an external author mutates the
+        env (the /apply-full route: ensure backings + tofu + store commit; the
+        /destroy route: ensure + tofu destroy + the empty-Stack commit).
+        Ticks keep running -- they just stop touching anything.
+
+        v0.7.3 split two things this used to conflate, because only ONE of
+        them ever needed to pause:
+
+        * ACTIONS -- gc, provision/deprovision, the gateway policy/port push,
+          and the World prune -- genuinely must. gc's whole job is "stop the
+          backings no active kind needs", judged against the OLD, not-yet-
+          committed stack (empty on a fresh env, so `gc(set())` stops
+          EVERYTHING), so a tick landing between `ensure_backings` and tofu
+          finishing kills the very container tofu is mid-conversation with:
+          the S5 "rustfs never became ready, empty logs" failure and field
+          test 2's B6 8m26s destroy hang. The gateway push is the same shape
+          from the other side -- `ensure_backings` has already registered THIS
+          apply's compiled policies and backing ports, and a tick would
+          overwrite them with the old stack's mid-tofu.
+        * OBSERVATION -- projecting the TF-owned kinds into World and
+          broadcasting the WorldDeltas -- never did. It creates nothing,
+          destroys nothing, and touches no backing; it only reads odin's own
+          synth stores and reports. Pausing it is what froze `/world` for the
+          entire ~60s of a real apply. Field test 3 measured it with a 2s
+          sampler: `/world` still read `healthy` at t=64.0s for a service
+          whose deployment had died at t≈4s. That stale reading has now
+          concealed both a total outage (pre-v0.7.2) and a rollout that never
+          stopped serving (post-v0.7.2) -- opposite lies from the same blind
+          spot, at the one moment an operator is actually watching.
+
+        THE SAFETY ARGUMENT, and it is the whole reason this is only a flag:
+        `_suspended` is flipped UNDER `_tick_lock`, and a tick's entire body
+        runs under that same lock. So every tick is atomically either wholly
+        BEFORE this suspension (its gc ran while the caller had not yet
+        ensured anything) or wholly AFTER it (its gc is suppressed). There is
+        no interleaving in which a tick reads "not suspended" and then acts --
+        which is exactly the race the original whole-lock hold was introduced
+        to close. Nesting is safe (a depth, not a boolean).
+
+        The asymmetry is deliberate: TAKING the suspension needs the lock
+        (nothing may act after the caller has started mutating), RELEASING it
+        does not. "Actions may resume" carries no ordering requirement --
+        resuming one tick later is harmless, and both routes kick an explicit
+        `tick()` straight after the hold anyway -- so the release is a bare
+        decrement with no await in it. That matters on the unwind path: a
+        `finally` that awaits a lock is one a cancelled request (a shutdown,
+        a connection dropped 40s into a tofu run) can stall in, and a
+        suspension that never lifts is an env whose reconciler silently stops
+        acting."""
         async with self._tick_lock:
+            self._suspended += 1
+        try:
             yield
+        finally:
+            self._suspended -= 1
 
     async def tick(self) -> None:
         async with self._tick_lock:
-            stack = self._store.get_stack(self._env)
-            await self._observe(stack)
-            world = self._store.current_world(self._env)
-            for action in plan(stack, world):
-                await self._execute(action, stack)
-            if self._aws is not None:  # stop backings no active kind needs anymore
-                await asyncio.to_thread(self._aws.gc, {r.kind for r in stack.resources})
-            if self._gateway is not None:  # policies/ports always track the applied Stack
-                ports = await asyncio.to_thread(self._aws.backing_ports) if self._aws is not None else {}
-                self._gateway.update(self._env, compile_policies(stack), ports)
-            if self._stores is not None:  # fix-wave 2b finding #1: project tofu's own creations into World
-                await self._project_tf_owned()
+            step = self._watch if self._suspended else self._converge
+            await step()
 
-    async def _project_tf_owned(self) -> None:
+    async def _converge(self) -> None:
+        """The whole tick: observe, plan, execute, gc, push, project."""
+        stack = self._store.get_stack(self._env)
+        await self._observe(stack)
+        world = self._store.current_world(self._env)
+        for action in plan(stack, world):
+            await self._execute(action, stack)
+        if self._aws is not None:  # stop backings no active kind needs anymore
+            await asyncio.to_thread(self._aws.gc, {r.kind for r in stack.resources})
+        if self._gateway is not None:  # policies/ports always track the applied Stack
+            ports = await asyncio.to_thread(self._aws.backing_ports) if self._aws is not None else {}
+            self._gateway.update(self._env, compile_policies(stack), ports)
+        if self._stores is not None:  # fix-wave 2b finding #1: project tofu's own creations into World
+            await self._project_tf_owned()
+
+    async def _watch(self) -> None:
+        """A tick with its hands tied: the projection, and nothing else --
+        what an in-flight apply (`hold()`) leaves running.
+
+        Three things `_converge` does are deliberately absent, each because it
+        would ACT rather than look:
+
+        * plan/execute + gc + the gateway push -- the actions hold() exists
+          for, argued in hold()'s own docstring.
+        * `_observe` of the PROVISIONED kinds (s3/sqs/sns/dynamodb). It is not
+          read-only (sns re-subscribes missing queues through `provision`), and
+          its existence check runs against the very backing tofu is creating
+          and deleting inside right now -- a bucket mid-replacement would read
+          `crashed`, which is a manufactured lie, not an observation. Nothing
+          is lost: no PROVISIONED kind has a runtime failure mode that only
+          shows up DURING an apply, and every kind field test 3 was watching
+          (ecs/ec2/lambda/rds/alb) is projected, not observed.
+        * the prune half of `_project_tf_owned` (see `act`). Pruning is the one
+          World-MUTATING removal, and it is driven by a snapshot tofu is
+          rewriting: any replace is a delete-then-create, so a prune landing in
+          between emits `draft` for a label that returns seconds later --
+          precisely the flap v0.7.1 killed (field test 2 finding #3). The
+          trailing `tick()` both routes already run right after the hold prunes
+          whatever genuinely went away. The freeze this fix removes was about
+          watching a resource go BAD, never about seeing one disappear a few
+          seconds sooner."""
+        if self._stores is not None:
+            await self._project_tf_owned(act=False)
+
+    async def _project_tf_owned(self, act: bool = True) -> None:
         """`tf_status.project()` is the whole snapshot; diff it against the
         current World and emit only what changed (`_emit`'s own dedupe) plus
         prune any label that dropped out (tofu destroyed it -- this loop
@@ -153,21 +247,36 @@ class Reconciler:
         back as a `label -> verdict` overlay that turns a record still
         claiming to be up into an honest `crashed` + why. `_emit`'s existing
         crashed path is what then broadcasts both the WorldDelta and the
-        `type:"log"` error line -- drift needs no pipeline of its own."""
-        drifted = await self._drift_verdicts()
+        `type:"log"` error line -- drift needs no pipeline of its own.
+
+        `act=False` is the observe-only form an in-flight apply runs under
+        (`_watch`): report everything, prune nothing, and read the drift
+        sweep's CACHE instead of taking a fresh sweep. Both halves are about
+        not ACTING while an external author holds the env -- the prune for the
+        reason `_watch` gives, the sweep because it is not a passive listing
+        either: it CORRECTS records (`mark_task_stopped`,
+        `mark_instance_terminated`, `rdsctl.mark_instance_failed`) off a
+        `docker ps`/`limactl list`/`pg_ready` sample taken while tofu is
+        pulling images and booting VMs -- the exact busy-daemon load
+        drift.py's own confirm-before-correcting note names as the hazard.
+        The cache still carries any drift reported BEFORE the apply, so
+        nothing already known goes quiet mid-apply."""
+        drifted = await self._drift_verdicts(act)
         projected = await asyncio.to_thread(project_tf_owned, self._stores, self._env)
         for label, (kind, phase, facts, verdict) in projected.items():
             phase, verdict = ("crashed", drifted[label]) if label in drifted else (phase, verdict)
             await self._emit(label, kind, phase, facts=facts, verdict=verdict)
+        if not act:
+            return
         world = self._store.current_world(self._env)
         for observed in world.resources:
             if observed.kind in TF_OWNED_KINDS and observed.id not in projected:
                 await self._prune(observed.id)
 
-    async def _drift_verdicts(self) -> dict[str, str]:
+    async def _drift_verdicts(self, sweep: bool = True) -> dict[str, str]:
         if self._drift is None:
             return {}
-        return await asyncio.to_thread(self._drift.verdicts, self._stores, self._env)
+        return await asyncio.to_thread(self._drift.verdicts, self._stores, self._env, sweep)
 
     async def ensure_backings(self, stack: Stack) -> None:
         """Boot (but don't create any resource on) the backing containers

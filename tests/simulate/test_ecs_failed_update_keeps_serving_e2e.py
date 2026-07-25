@@ -23,7 +23,7 @@ failure needing operator action. Both halves ship together
 This test is the sampled proof of the pair:
  1. across the ENTIRE failed apply, every previous-revision task keeps
     answering HTTP 200 -- the outage window is zero seconds;
- 2. once `/world` is projected again it reads `error` -- never `crashed`
+ 2. `/world` reads `error` WHILE the apply is still running -- never `crashed`
     (the service is serving) and never back to `healthy` -- with a verdict
     naming the surviving task count AND the image that failed;
  3. the apply still fails loudly (`applied_tf_failed`) -- v0.7.1's behavior
@@ -39,14 +39,16 @@ Deliberately no ALB: each task publishes its own host port, so reachability is
 measured directly against the tasks that are (or are not) serving -- which is
 how the original field-test measurement was taken ("all ports refusing").
 
-STILL OPEN, and this test's sampling shows it plainly: `/apply-full` holds
-`Reconciler.hold()` for the whole tofu run, so NO tick projects World while an
-apply is in flight and `/world` stays frozen at its last pre-apply reading for
-~60s. That is the "operator isn't told for ~59 seconds" half of the field-test
-finding, it lives in reconcile/reconciler.py (not in this fix's scope), and it
-is unchanged here. What DID change is what the frozen reading conceals: it used
-to paper over a 100% outage, and now papers over a rollout whose old revision
-is still serving every request. Recorded rather than asserted away.
+CLOSED IN v0.7.3, and this test's own sampling is what measures it. `/world`
+used to be FROZEN for the whole tofu run -- `Reconciler.hold()` blocked every
+tick, so the first non-`healthy` sample landed at t=62.3s on a 62.0s apply,
+i.e. only once the hold released. That was the "operator isn't told for ~59
+seconds" half of the field-test finding, and it was the same blind spot in
+both directions: before v0.7.2 the stale reading papered over a 100% outage;
+after it, over a rollout that never stopped serving. `hold()` now suspends the
+reconciler's ACTIONS (gc, provisioning, the gateway push, pruning) and leaves
+its EYES open, so the same measurement now reads `error` at **t=4.1s of a
+61.9s apply** -- when it actually happened. Asserted below, not just recorded.
 """
 from __future__ import annotations
 
@@ -95,6 +97,15 @@ def _task_records(root: Path) -> list[dict]:
     path = root / ENV / "gateway" / "ecsctl.json"
     state = json.loads(path.read_text()) if path.exists() else {}
     return [task for key, task in state.items() if key.startswith("task:")]
+
+
+def _node_event_count(root: Path) -> int:
+    """Every event this env has broadcast about the service so far -- the
+    durable half of the WebSocket stream (`api/ws.py`), which is exactly what a
+    badge storm would show up in."""
+    path = root / ENV / "events.jsonl"
+    events = [json.loads(line) for line in path.read_text().splitlines() if line.strip()] if path.exists() else []
+    return sum(1 for event in events if event.get("resource_id") == NODE or event.get("source") == NODE)
 
 
 def _serving_ports(root: Path) -> list[int]:
@@ -204,6 +215,7 @@ def test_a_failed_image_update_never_stops_serving_and_never_reads_healthy(tmp_p
         assert all(_http_ok(p) for p in ports), f"baseline is not actually serving: {ports}"
 
         # --- 2. one typo'd tag, sampled across the WHOLE apply --------------
+        before_events = _node_event_count(store.root)
         with Sampler(base=base, root=store.root) as sampler:
             bad_start = time.monotonic()
             second = httpx.post(f"{base}/apply-full", params={"env": ENV}, json=_canvas(BAD_IMAGE), timeout=600)
@@ -213,6 +225,7 @@ def test_a_failed_image_update_never_stops_serving_and_never_reads_healthy(tmp_p
             # left in matters as much as the state during.
             time.sleep(SAMPLE_INTERVAL * 2)
         sampler.report(f"bad-image update ({bad_elapsed:.1f}s apply)")
+        node_events = _node_event_count(store.root)
 
         # v0.7.1, unregressed: the apply still fails, loudly.
         assert second.status_code == 200, second.text
@@ -229,15 +242,31 @@ def test_a_failed_image_update_never_stops_serving_and_never_reads_healthy(tmp_p
         )
 
         # ... and the projection is honest about it, in BOTH directions.
-        # NOTE on the leading `healthy` samples: World is FROZEN for the whole
-        # apply (`Reconciler.hold()` -- see the module docstring), so those are
-        # the last pre-apply reading, not a fresh wrong answer. The claim under
-        # test is what the first re-projection says, and that it never reverts.
         phases = [s.phase for s in sampler.samples]
         assert "crashed" not in phases, f"a service still serving must not read crashed: {phases}"
         first_error = next((i for i, p in enumerate(phases) if p == "error"), None)
         assert first_error is not None, f"a failed deployment must surface: {phases}"
         assert "healthy" not in phases[first_error:], f"read healthy after the deployment failed: {phases}"
+
+        # THE v0.7.3 measurement (module docstring): the operator is told
+        # DURING the apply, not after it. The leading `healthy` samples are the
+        # seconds before tofu's UpdateService had even landed -- honest, not
+        # frozen. Anchored to the apply's own duration rather than a wall-clock
+        # constant: what regressed before was that NOTHING was reported until
+        # the hold released, so the gap is the claim.
+        first_bad = next(s for s in sampler.samples if s.phase != "healthy")
+        assert first_bad.at < bad_elapsed - 20, (
+            f"/world froze for the apply again: first non-healthy sample at {first_bad.at:.1f}s "
+            f"of a {bad_elapsed:.1f}s apply"
+        )
+        # ...and observing throughout is not the same as chattering throughout:
+        # ~30 extra ticks of projection must not become ~30 events. v0.7.1
+        # killed a draft/healthy flap worth 43% of one env's whole event log;
+        # `_emit`'s change-only dedupe is what keeps this fix from re-creating
+        # it (a burst here would be dozens, not a handful).
+        assert node_events - before_events <= 5, (
+            f"an ordinary failed apply emitted {node_events - before_events} events for {NODE}"
+        )
 
         final = sampler.samples[-1]
         assert final.phase == "error", final
