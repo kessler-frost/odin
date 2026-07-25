@@ -177,15 +177,40 @@ def _add_bytes(tar: tarfile.TarFile, name: str, payload: bytes) -> None:
     tar.addfile(info, io.BytesIO(payload))
 
 
+@contextmanager
+def _readable_archive(archive: Path) -> Iterator[tarfile.TarFile]:
+    """Every read of an archive goes through here, so tar's own failures come
+    out as refusals like every other bad input.
+
+    The field test hit this on the disaster-recovery path, the moment a user is
+    most likely to be holding a half-copied backup: a truncated archive printed
+    an empty message then `Aborted.`, and a non-gzip file dumped ~120 lines of
+    raw Python traceback. Both are the same answer to the user -- this file
+    isn't a readable archive -- so they get one clear message with tar's own
+    diagnosis quoted, and code 2 ("this odin can't read that"), matching the
+    valid-tarball-but-not-an-odin-export refusal next door. The `with` covers
+    the whole body deliberately: truncation is usually only discovered while
+    READING a member, long after `tarfile.open` succeeded."""
+    if not archive.is_file():
+        raise BackupError(f"no such archive: {archive}")
+    try:
+        with tarfile.open(archive, "r:gz") as tar:
+            yield tar
+    except (tarfile.TarError, EOFError, OSError) as exc:
+        raise BackupError(
+            f"{archive} is not a readable .tar.gz archive ({exc}). If it is an odin "
+            "export it is truncated or corrupt -- re-copy it from wherever it came "
+            "from and try again.", 2,
+        ) from None
+
+
 def _names(archive: Path) -> list[str]:
-    with tarfile.open(archive, "r:gz") as tar:
+    with _readable_archive(archive) as tar:
         return tar.getnames()
 
 
 def read_manifest(archive: Path) -> Manifest:
-    if not archive.is_file():
-        raise BackupError(f"no such archive: {archive}")
-    with tarfile.open(archive, "r:gz") as tar:
+    with _readable_archive(archive) as tar:
         return _manifest(tar, archive)
 
 
@@ -261,7 +286,7 @@ def import_archive(
             f"environment {target_env!r} already exists at {target} — refusing to overwrite it. "
             "Re-run with --force to replace it, or --env <name> to restore alongside it."
         )
-    with tarfile.open(archive, "r:gz") as tar:
+    with _readable_archive(archive) as tar:
         members = [m for m in tar.getmembers() if m.name != MANIFEST_NAME]
         restore = [
             (member, dest)

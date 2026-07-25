@@ -312,6 +312,51 @@ def test_a_tarball_that_is_not_an_odin_export_exits_2(runner, tmp_path, monkeypa
     assert "not an odin export" in result.stderr
 
 
+def test_a_truncated_archive_fails_with_a_clear_message(runner, tmp_path, monkeypatch):
+    """Field test (MEDIUM-7): a half-copied backup printed an EMPTY message and
+    `Aborted.` — on the one path a user reaches for when things have already
+    gone wrong. It must name the file, say what's wrong, and say what to do."""
+    monkeypatch.chdir(tmp_path)
+    good = _write_archive(tmp_path / "good.tar.gz", GOOD_MANIFEST, {f"{ENV_PREFIX}/HEAD": b"abc"})
+    truncated = tmp_path / "half.tar.gz"
+    truncated.write_bytes(good.read_bytes()[:60])
+    result = runner.invoke(app, ["import", str(truncated)])
+    assert result.exit_code == 2
+    assert "half.tar.gz" in result.stderr
+    assert "truncated" in result.stderr and "re-copy" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_a_file_that_is_not_gzip_at_all_fails_with_a_clear_message(runner, tmp_path, monkeypatch):
+    """Same finding: this one dumped ~120 lines of raw Python traceback
+    (`tarfile.ReadError: not a gzip file`) instead of a refusal."""
+    monkeypatch.chdir(tmp_path)
+    plain = tmp_path / "notes.txt.gz"
+    plain.write_text("this is not a gzip file at all\n")
+    result = runner.invoke(app, ["import", str(plain)])
+    assert result.exit_code == 2
+    assert "notes.txt.gz" in result.stderr
+    assert "not a readable .tar.gz" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_an_empty_file_fails_with_a_clear_message(runner, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    empty = tmp_path / "empty.tar.gz"
+    empty.write_bytes(b"")
+    result = runner.invoke(app, ["import", str(empty)])
+    assert result.exit_code == 2
+    assert "not a readable .tar.gz" in result.stderr and "Traceback" not in result.stderr
+
+
+def test_a_directory_given_where_an_archive_belongs_fails_cleanly(runner, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "adir").mkdir()
+    result = runner.invoke(app, ["import", str(tmp_path / "adir")])
+    assert result.exit_code == 1
+    assert "no such archive" in result.stderr and "Traceback" not in result.stderr
+
+
 def test_a_corrupt_manifest_exits_2(runner, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     archive = _write_archive(tmp_path / "bad.tar.gz", {"format": 1}, {})  # missing every other field
