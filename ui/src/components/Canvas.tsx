@@ -138,13 +138,16 @@ interface CanvasProps {
   configUpdate?: { nodeId: string; data: Record<string, any> } | null;
   onCanvasSave?: (graph: { nodes: any[]; edges: any[] }) => void;
   onResetDrafts?: React.MutableRefObject<(() => void) | null>;
-  onNotice?: (text: string) => void;
 }
 
-function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, nodeUpdates, edgeUpdates, onStatusUpdate, configUpdate, onCanvasSave, onResetDrafts, onNotice }: CanvasProps) {
+function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, nodeUpdates, edgeUpdates, onStatusUpdate, configUpdate, onCanvasSave, onResetDrafts }: CanvasProps) {
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   const [loaded, setLoaded] = useState(false);
+  // How many nodes the canvas had to place itself on the last load. Stays on
+  // screen until dismissed: the fix for it was a toast that faded after 4.5s,
+  // which is the same as saying nothing to anyone who looked a moment later.
+  const [placed, setPlaced] = useState(0);
   const { screenToFlowPosition, fitView } = useReactFlow();
   const [shiftHeld, setShiftHeld] = useState(false);
 
@@ -181,13 +184,12 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
       // A canvas authored outside the UI (`odin canvas set`, an agent, the
       // README's own example) may carry no `position`. ReactFlow dereferences
       // node.position.x, so one such node used to blank the WHOLE canvas to
-      // solid black with nothing said anywhere (fresh-user BLOCK-3). Lay those
-      // out on the 20px grid, in canvas order, and say so — a node the user
-      // can see and drag beats a black rectangle and a console TypeError.
-      // The grid v0.7.3 laid them out on was blind, though: field test 4's
-      // DynamoDB table landed exactly on top of an SQS queue the author HAD
-      // positioned, hiding it completely. `placeUnpositioned` skips space
-      // that is already taken.
+      // solid black with nothing said anywhere (fresh-user BLOCK-3).
+      // `placeUnpositioned` lays those out on the 20px grid, in canvas order,
+      // skipping space another node already occupies (field test 4: a table
+      // dropped exactly on top of a queue, hiding it) — and the count comes
+      // back so the canvas can SAY it moved them, instead of relocating a
+      // user's nodes in silence.
       const fromDisk: LoadedNode[] = (canvasRes.nodes ?? []).map((n: any) => ({
         id: n.id,
         type: n.type,
@@ -196,10 +198,8 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
         data: { ...defaultDataForType[n.type], ...n.data },
         style: { ...defaultStyleForType[n.type], ...n.size },
       }));
-      const { nodes: rfNodes, placed } = placeUnpositioned(fromDisk);
-      if (placed > 0) {
-        onNotice?.(`${placed} node${placed === 1 ? '' : 's'} had no "position" — laid out on the grid. Move one and it sticks.`);
-      }
+      const { nodes: rfNodes, placed: placedCount } = placeUnpositioned(fromDisk);
+      setPlaced(placedCount);
 
       const rfEdges: Edge[] = (canvasRes.edges ?? []).map((e: any) => {
         const eType = e.data?.edgeType ?? 'network';
@@ -228,7 +228,7 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
       setLoaded(true);
     };
     load();
-  }, [setNodes, setEdges, onNotice]);
+  }, [setNodes, setEdges]);
 
   // --- Rehydrate node badges from the observed World, on mount and on env change ---
   // (a live world_delta over the WebSocket always arrives after this and wins).
@@ -742,16 +742,35 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
           style={{ width: 140, height: 90 }}
         />
       </ReactFlow>
+      {/* The canvas moved something the user didn't: say so, in the same pill
+          bar RegionAsk uses (40px tall, 20px off the edge), and leave it up
+          until it's dismissed. */}
+      {placed > 0 && (
+        <div className="absolute top-0 left-0 right-0 z-30 flex items-center gap-2 px-3 py-2.5 bg-bg-secondary border-b border-border-bright shadow-lg">
+          <span className="font-mono text-[10px] leading-5 text-neon-amber uppercase tracking-[1px] whitespace-nowrap">Placed</span>
+          <span className="flex-1 min-w-0 font-mono text-[11px] leading-5 text-text-secondary">
+            {placed} node{placed === 1 ? '' : 's'} had no <span className="text-text-primary">position</span> — odin
+            put {placed === 1 ? 'it' : 'them'} on the grid, clear of your other nodes, and saved the layout.
+          </span>
+          <button
+            onClick={() => setPlaced(0)}
+            title="Dismiss"
+            className="font-mono text-[10px] h-5 px-2.5 border border-border bg-bg-tertiary text-text-muted uppercase tracking-[1px] cursor-pointer transition-colors duration-200 hover:text-text-primary hover:border-border-bright"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
       {/* Outside <ReactFlow> so canvas pan/zoom gestures never eat its clicks. */}
       <RegionAsk selectedIds={selectedLabels} env={env ?? 'default'} />
     </div>
   );
 }
 
-export default function Canvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, nodeUpdates, edgeUpdates, onStatusUpdate, configUpdate, onCanvasSave, onResetDrafts, onNotice }: CanvasProps) {
+export default function Canvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, nodeUpdates, edgeUpdates, onStatusUpdate, configUpdate, onCanvasSave, onResetDrafts }: CanvasProps) {
   return (
     <ReactFlowProvider>
-      <InnerCanvas env={env} onNodeSelect={onNodeSelect} onEdgeSelect={onEdgeSelect} onNodeLabelsChange={onNodeLabelsChange} nodeUpdates={nodeUpdates} edgeUpdates={edgeUpdates} onStatusUpdate={onStatusUpdate} configUpdate={configUpdate} onCanvasSave={onCanvasSave} onResetDrafts={onResetDrafts} onNotice={onNotice} />
+      <InnerCanvas env={env} onNodeSelect={onNodeSelect} onEdgeSelect={onEdgeSelect} onNodeLabelsChange={onNodeLabelsChange} nodeUpdates={nodeUpdates} edgeUpdates={edgeUpdates} onStatusUpdate={onStatusUpdate} configUpdate={configUpdate} onCanvasSave={onCanvasSave} onResetDrafts={onResetDrafts} />
     </ReactFlowProvider>
   );
 }
