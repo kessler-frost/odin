@@ -109,6 +109,34 @@ def test_env_wide_events_are_not_attributed_to_any_node():
         assert all(e["type"] != "tf" for e in node["events"])
 
 
+# --- the assembler: drift (no key of its own, by design) ---------------------
+
+
+def test_a_drift_verdict_reaches_the_context_through_the_verdict_channel():
+    """`reconcile/drift.py` landed after M8 and needs NO new key: the sweep's
+    sentence is overlaid as the resource's `verdict` by
+    `Reconciler._project_tf_owned` (and written into the store record, so
+    `tf_status.project()` keeps projecting it after a restart). This pins that
+    the existing `observed.verdict` path is what carries it."""
+    reason = "VM odin-ec2-web deleted outside odin — re-Apply to recreate"
+    world = World(env="dbg", resources=(
+        ResourceObserved(id="web", kind="ec2", phase="crashed", verdict=reason),
+    ))
+    node = assemble_context(Stack(env="dbg"), world, [], _logs, ["web"])["nodes"]["web"]
+    assert node["observed"]["verdict"] == reason
+    assert node["observed"]["phase"] == "crashed"
+
+
+def test_the_drift_crash_log_event_reaches_the_node_too():
+    """The second copy, for free: `Reconciler._emit`'s crashed path broadcasts
+    the verdict as a `type:"log"` event whose `source` is the node, which
+    `_event_node` already attributes correctly."""
+    reason = "container odin-lambda-dbg-fn removed outside odin — re-Apply to recreate"
+    events = [{"type": "log", "env": "dbg", "source": "fn", "text": reason, "level": "error"}]
+    node = assemble_context(Stack(env="dbg"), World(env="dbg"), events, _logs, ["fn"])["nodes"]["fn"]
+    assert [e["text"] for e in node["events"]] == [reason]
+
+
 def test_the_env_is_carried_and_duplicate_ids_collapse():
     context = _context(node_ids=("api", "api", "db"))
     assert context["env"] == "dbg"

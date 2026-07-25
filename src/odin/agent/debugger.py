@@ -29,6 +29,17 @@ Two halves, deliberately split:
      string clipped -- the context has to stay small enough to be one cheap
      prompt, not a log dump.
 
+   What is NOT a separate key, deliberately: DRIFT. `reconcile/drift.py` (the
+   reality sweep: a VM/container deleted outside odin) landed after this module
+   did, but it reports through the verdict channel that already existed --
+   `Reconciler._project_tf_owned` overlays the sweep's sentence as the
+   resource's `verdict`, and the same sentence is written into the store record
+   so `tf_status.project()` keeps projecting it after a restart. A drifted node
+   therefore arrives here as `observed.verdict == "VM odin-ec2-web deleted
+   outside odin -- re-Apply to recreate"`, plus the crash `type:"log"` event
+   keyed to it by `source`. A `drift` key would be a third copy of the same
+   string; test_debugger.py pins that path instead of adding one.
+
 2. `diagnose` -- ONE agent run whose only effect channel is the typed
    `report_diagnosis` tool (the house pattern from `agent/translate.py`: the
    agent NEVER writes files or state, it returns structured output odin
