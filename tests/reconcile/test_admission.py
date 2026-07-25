@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from odin.reconcile import admission
 from odin.reconcile.admission import (
+    CACHE_MEMORY_MIB,
     AdmissionResult,
     check_admission,
     default_memory_budget_mib,
@@ -41,6 +42,16 @@ def test_rds_ecs_lambda_are_charged_per_node():
         ResourceDesired(id="fn1", kind="lambda"),
     ))
     assert estimate_stack_memory_mib(stack) == 2 * 256.0 + 512.0 + 256.0
+
+
+def test_elasticache_is_charged_per_node_at_its_real_container_cap():
+    # W2.8: each cache cluster is its OWN redis container, capped at
+    # aws/cache.py's DEFAULT_MEMORY_MIB -- estimate and real ceiling agree.
+    stack = Stack(resources=(
+        ResourceDesired(id="c1", kind="elasticache"),
+        ResourceDesired(id="c2", kind="elasticache"),
+    ))
+    assert estimate_stack_memory_mib(stack) == 2 * CACHE_MEMORY_MIB
 
 
 def test_backing_kinds_are_charged_once_per_env_not_per_node():
