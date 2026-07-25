@@ -10,6 +10,7 @@ file-writing FakeRunner trick (a real `sign_cert`/`create_ca` writes files at
 """
 from __future__ import annotations
 
+import json
 import threading
 import time
 from pathlib import Path
@@ -24,6 +25,7 @@ from odin.compute.instances import (
     _default_max_concurrent_boots,
     _Proc,
     _pick_shared_ip,
+    instance_config_path,
     vm_name,
 )
 from odin.compute.models import get_instance_type
@@ -419,6 +421,128 @@ def test_activate_nebula_never_raises_even_if_lighthouse_manager_blows_up(tmp_pa
     nebula = NebulaJoin(root=tmp_path, env="myenv", host_id="i-explode")
     ip = vm.boot(NAME, get_instance_type("t3.micro"), hostname="i-explode", nebula=nebula)
     assert ip == "192.168.64.20"  # never raised out of boot()
+
+
+# --- refresh_nebula: an SG edit reaching an ALREADY-RUNNING VM (HIGH-1) ------
+
+
+def _booted_vm(tmp_path, firewall=None, host_id="i-refresh"):
+    """A VM that has really been through `boot()` -- so the env's mesh is
+    bootstrapped and odin has recorded the config it put on the VM, which is
+    the state every refresh starts from."""
+    runner = FakeRunner()
+    runner.responses["hostname -I"] = _Proc(0, "192.168.64.20")
+    runner.responses["ifconfig"] = _ifconfig_response("192.168.64.1")
+    vm = InstanceVm(runner=runner, lighthouse=FakeLighthouseManager())
+    nebula = NebulaJoin(root=tmp_path, env="myenv", host_id=host_id, firewall=firewall)
+    vm.boot(NAME, get_instance_type("t3.micro"), hostname=host_id, nebula=nebula)
+    runner.calls.clear()
+    return vm, runner, nebula
+
+
+def _rules(*ports: str) -> FirewallRules:
+    return FirewallRules(inbound=[FirewallRule(port=p, proto="tcp", cidr="0.0.0.0/0") for p in ports])
+
+
+def test_refresh_nebula_does_nothing_at_all_when_the_rules_are_unchanged(tmp_path):
+    """NO CHURN: this runs for every running instance on every Apply, so an
+    unchanged firewall must cost one local file read -- no `limactl`, no
+    signal, no restarted tunnel."""
+    vm, runner, nebula = _booted_vm(tmp_path, firewall=_rules("22"))
+
+    assert vm.refresh_nebula(NAME, nebula) == "unchanged"
+    assert runner.calls == []
+
+
+def test_refresh_nebula_reloads_a_running_vm_when_a_security_group_rule_is_added(tmp_path):
+    """Field test 2 HIGH-1: `tcp:8080` added to `web-sg`, Apply says
+    `applied`, and the already-running VM kept enforcing port 22 only
+    (`NRestarts=0`). SIGHUP, not restart: nebula reloads firewall rules in
+    place (verified live), so the VM's existing tunnels are never dropped to
+    widen a rule."""
+    vm, runner, nebula = _booted_vm(tmp_path, firewall=_rules("22"))
+
+    widened = NebulaJoin(root=nebula.root, env=nebula.env, host_id=nebula.host_id, firewall=_rules("22", "8080"))
+    assert vm.refresh_nebula(NAME, widened) == "reloaded"
+
+    tee = next(c for c in runner.calls if "tee" in c)
+    assert tee == ["limactl", "shell", NAME, "--", "sudo", "tee", "/etc/nebula/config.yml"]
+    signal = next(c for c in runner.calls if "kill" in c)
+    assert signal == ["limactl", "shell", NAME, "--", "sudo", "systemctl", "kill", "-s", "HUP", "nebula"]
+    assert not any("restart" in c for c in runner.calls), "widening a rule must not drop the tunnel"
+
+    recorded = yaml.safe_load(instance_config_path(tmp_path, "myenv", "i-refresh").read_text())
+    assert {r["port"] for r in recorded["firewall"]["inbound"]} == {"22", "8080"}
+    # ...and now it IS the current state, so the next Apply is a no-op again.
+    runner.calls.clear()
+    assert vm.refresh_nebula(NAME, widened) == "unchanged"
+    assert runner.calls == []
+
+
+def test_refresh_nebula_restarts_when_something_reload_cannot_cover_changed(tmp_path):
+    """A MOVED LIGHTHOUSE PORT changes `static_host_map`, which nebula does
+    NOT reload on SIGHUP -- so a HUP here would be a lie. A restart is honest
+    and costs nothing: in the only case that produces this, the VM's tunnel to
+    the lighthouse is already dead."""
+    vm, runner, nebula = _booted_vm(tmp_path, firewall=_rules("22"))
+    overlay_path = tmp_path / "myenv" / "nebula" / "overlay.json"
+    overlay = json.loads(overlay_path.read_text())
+    overlay["lighthouse_port"] = overlay["lighthouse_port"] + 7
+    overlay_path.write_text(json.dumps(overlay))
+
+    assert vm.refresh_nebula(NAME, nebula) == "restarted"
+    restart = next(c for c in runner.calls if "restart" in c)
+    assert restart == ["limactl", "shell", NAME, "--", "sudo", "systemctl", "restart", "nebula"]
+    assert not any("HUP" in c for c in runner.calls)
+    pushed = yaml.safe_load(instance_config_path(tmp_path, "myenv", "i-refresh").read_text())
+    assert pushed["static_host_map"] == {"10.42.0.1": [f"192.168.64.1:{overlay['lighthouse_port']}"]}
+
+
+def test_refresh_nebula_reads_the_vm_itself_when_odin_has_no_record(tmp_path):
+    """A VM booted before this existed has no recorded config -- so ask the VM
+    what it is actually running rather than restarting it on no evidence."""
+    vm, runner, nebula = _booted_vm(tmp_path, firewall=_rules("22"))
+    on_the_vm = instance_config_path(tmp_path, "myenv", "i-refresh").read_text()
+    instance_config_path(tmp_path, "myenv", "i-refresh").unlink()
+    runner.responses["cat /etc/nebula/config.yml"] = _Proc(0, on_the_vm)
+
+    assert vm.refresh_nebula(NAME, nebula) == "unchanged"
+    assert not any("tee" in c or "systemctl" in c for c in runner.calls)
+
+
+def test_refresh_nebula_restarts_when_the_vm_cannot_be_read_at_all(tmp_path):
+    vm, runner, nebula = _booted_vm(tmp_path, firewall=_rules("22"))
+    instance_config_path(tmp_path, "myenv", "i-refresh").unlink()
+    runner.responses["cat /etc/nebula/config.yml"] = _Proc(1, "", "connection refused")
+
+    assert vm.refresh_nebula(NAME, nebula) == "restarted"
+
+
+def test_refresh_nebula_skips_an_env_with_no_mesh_bootstrapped(tmp_path):
+    runner = FakeRunner()
+    vm = InstanceVm(runner=runner, lighthouse=FakeLighthouseManager())
+    nebula = NebulaJoin(root=tmp_path, env="no-mesh", host_id="i-nomesh")
+    assert vm.refresh_nebula(NAME, nebula) == "skipped"
+    assert runner.calls == []
+
+
+def test_refresh_nebula_never_raises(tmp_path):
+    """Same rule as `_activate_nebula`: mesh wiring must never fail an Apply."""
+    class Exploding(FakeRunner):
+        def __call__(self, args, input=None):
+            raise RuntimeError("limactl is not on PATH")
+
+    vm, _runner, nebula = _booted_vm(tmp_path, firewall=_rules("22"))
+    broken = InstanceVm(runner=Exploding(), lighthouse=FakeLighthouseManager())
+    widened = NebulaJoin(root=nebula.root, env=nebula.env, host_id=nebula.host_id, firewall=_rules("22", "8080"))
+    assert broken.refresh_nebula(NAME, widened) == "failed"
+
+
+def test_a_failed_signal_is_reported_not_swallowed(tmp_path):
+    vm, runner, nebula = _booted_vm(tmp_path, firewall=_rules("22"))
+    runner.responses["systemctl kill"] = _Proc(1, "", "Unit nebula.service not loaded")
+    widened = NebulaJoin(root=nebula.root, env=nebula.env, host_id=nebula.host_id, firewall=_rules("22", "8080"))
+    assert vm.refresh_nebula(NAME, widened) == "failed"
 
 
 # --- boot concurrency (owner directive B2): bound how many VMs may be

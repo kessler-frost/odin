@@ -961,6 +961,44 @@ def _reaper_enabled() -> bool:
     return os.environ.get("ODIN_REAP_EC2_VMS", "1").strip().lower() not in _REAPER_OFF_VALUES
 
 
+def ensure_instance_mesh(stores: SynthStores, env: str, vm: InstanceVm | None = None) -> dict[str, str]:
+    """Push each RUNNING instance's CURRENT compiled security groups into its
+    already-booted VM -- `rdsctl.ensure_db_mesh`'s exact twin, for the exact
+    same reason, and it is the half that was missing.
+
+    Field test 2 HIGH-1: security groups are TF-owned, so an edited `web-sg`
+    reaches the gateway only through an Apply -- and an instance's nebula
+    config was written ONCE, at boot. The gateway model recorded the new rule,
+    `Plan: 0 to add, 1 to change` said the apply worked, and the running VM
+    kept enforcing its boot-time firewall forever. Two VMs in the SAME drawn
+    group therefore enforced DIFFERENT rules depending on when each was
+    created -- exactly what security groups exist to prevent, and ROADMAP
+    claimed the union of a node's compiled rules simply IS its firewall, with
+    no "as of first boot" caveat.
+
+    Firewall recompilation is `_instance_firewall`, the same function
+    RunInstances uses, so a running instance and one launched a second later
+    can never disagree about what its groups mean. Returns
+    `{vm name -> what happened}` (`InstanceVm.refresh_nebula`'s own words) for
+    logging; an instance that is not `running`, or has no VPC, is skipped
+    entirely -- there is no daemon to talk to."""
+    machine = vm or InstanceVm()
+    actions: dict[str, str] = {}
+    for record in _records(stores, env, "instance"):
+        vpc = stores.ec2net.get(env, f"vpc:{record['vpc_id']}") if record.get("vpc_id") else None
+        if record["state_name"] != "running" or vpc is None:
+            continue
+        group_ids = record.get("security_group_ids") or []
+        nebula = NebulaJoin(
+            root=stores.root, env=env, host_id=record["instance_id"],
+            firewall=_instance_firewall(stores, env, vpc, group_ids), groups=tuple(group_ids),
+        )
+        actions[vm_name(env, record["instance_id"])] = machine.refresh_nebula(
+            vm_name(env, record["instance_id"]), nebula,
+        )
+    return actions
+
+
 def reap_orphaned_vms(root: Path, envs: list[str], vm: InstanceVm | None = None) -> list[str]:
     """A one-shot startup safety net for a VM that's on disk with NO
     matching store record anywhere -- e.g. a crash between `vm.delete`
