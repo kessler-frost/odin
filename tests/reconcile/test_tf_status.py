@@ -7,16 +7,28 @@ facts, verdict)`. Hand-built `SynthStores`, no reconciler/asyncio involved
 integration (emitting WorldDeltas + pruning)."""
 from __future__ import annotations
 
+from odin.gateway.models import secretsctl, ssmctl
 from odin.gateway.stores import SynthStores
 from odin.reconcile.tf_status import TF_OWNED_KINDS, project
 
 ENV = "default"
 
 
+def _param(name: str, value: str = "v") -> dict:
+    """An ssmctl `param:` record, as `PutParameter` writes it."""
+    return {
+        "name": name, "arn": ssmctl.parameter_arn(name), "type": "SecureString", "value": value,
+        "version": 1, "description": None, "key_id": None, "allowed_pattern": None,
+        "tier": "Standard", "data_type": "text", "policies": None, "last_modified_date": 1.0,
+    }
+
+
 def test_tf_owned_kinds_excludes_reconciler_owned_kinds():
     # s3/sqs/sns/dynamodb already get real World entries via the reconciler's
     # own PROVISIONED path -- this projection must never double-own them.
-    assert TF_OWNED_KINDS == {"vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr", "logs"}
+    assert TF_OWNED_KINDS == {
+        "vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr", "logs", "secret", "ssm",
+    }
 
 
 # --- vpc/subnet/sg: no AWS-native name field, so the odin:node tag is the
@@ -132,6 +144,76 @@ def test_log_streams_events_and_cursors_are_not_projected_as_resources(tmp_path)
     stores.logsctl.set(ENV, "events:/odin/app", [{"stream": "s1", "timestamp": 1, "message": "hi"}])
     stores.logsctl.set(ENV, "cursor:/odin/app:s1", 1)
     assert set(project(stores, ENV)) == {"/odin/app"}
+
+
+# --- secret + ssm (W2.4): healthy on existence, and NO FACTS EVER (a fact
+# rides the WorldDelta onto the WebSocket and into world.json -- a secret's
+# value must never travel either). ------------------------------------------
+
+
+def test_a_secret_projects_healthy_with_no_facts(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.secretsctl.set(ENV, "secret:db-password", {
+        "name": "db-password", "arn": secretsctl.secret_arn("db-password"),
+        "description": None, "kms_key_id": None, "resource_policy": None,
+        "created_date": 1.0, "last_changed_date": 1.0,
+    })
+    stores.tags.set(ENV, f"secretsmanager:{secretsctl.secret_arn('db-password')}", {"odin:node": "the-canvas-label"})
+    result = project(stores, ENV)
+    assert result["the-canvas-label"] == ("secret", "healthy", {}, None)
+    assert "db-password" not in result
+
+
+def test_a_secret_falls_back_to_its_own_name_when_untagged(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.secretsctl.set(ENV, "secret:db-password", {
+        "name": "db-password", "arn": secretsctl.secret_arn("db-password"),
+        "description": None, "kms_key_id": None, "resource_policy": None,
+        "created_date": 1.0, "last_changed_date": 1.0,
+    })
+    assert project(stores, ENV)["db-password"] == ("secret", "healthy", {}, None)
+
+
+def test_secret_versions_are_not_projected_as_resources_and_no_value_leaks(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.secretsctl.set(ENV, "secret:db-password", {
+        "name": "db-password", "arn": secretsctl.secret_arn("db-password"),
+        "description": None, "kms_key_id": None, "resource_policy": None,
+        "created_date": 1.0, "last_changed_date": 1.0,
+    })
+    stores.secretsctl.set(ENV, "version:db-password:v1", {
+        "secret_name": "db-password", "version_id": "v1", "secret_string": "hunter2-long",
+        "secret_binary": None, "version_stages": ["AWSCURRENT"], "created_date": 1.0,
+    })
+    result = project(stores, ENV)
+    assert set(result) == {"db-password"}
+    assert "hunter2-long" not in repr(result)
+
+
+def test_an_ssm_parameter_projects_healthy_with_no_facts(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.ssmctl.set(ENV, "param:/odin/api-key", _param("/odin/api-key"))
+    stores.tags.set(ENV, "ssm:/odin/api-key", {"odin:node": "the-canvas-label"})
+    result = project(stores, ENV)
+    assert result["the-canvas-label"] == ("ssm", "healthy", {}, None)
+    assert "/odin/api-key" not in result
+
+
+def test_an_ssm_parameter_falls_back_to_its_own_name_and_never_carries_its_value(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.ssmctl.set(ENV, "param:/odin/api-key", _param("/odin/api-key", value="abc123456"))
+    result = project(stores, ENV)
+    assert result["/odin/api-key"] == ("ssm", "healthy", {}, None)
+    assert "abc123456" not in repr(result)
+
+
+def test_a_root_level_parameters_tag_key_is_the_canonical_name(tmp_path):
+    # The tags store is keyed by the CANONICAL name (ssmctl.canonical_name), so
+    # a `/db-url`-written parameter still resolves its odin:node tag.
+    stores = SynthStores(tmp_path)
+    stores.ssmctl.set(ENV, "param:db-url", _param("/db-url"))
+    stores.tags.set(ENV, "ssm:db-url", {"odin:node": "the-canvas-label"})
+    assert project(stores, ENV)["the-canvas-label"] == ("ssm", "healthy", {}, None)
 
 
 # --- ec2: the flagship case -- a real Lima VM state machine mapped onto the

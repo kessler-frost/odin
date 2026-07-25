@@ -17,8 +17,8 @@ _REF = re.compile(r"^\$\{\{\s*([\w-]+)\.([\w-]+)\s*\}\}$")
 # are AWS-shaped resources provisioned in per-env backing containers.
 # vpc/subnet/sg are the V1 network containers: their containment-stamped
 # data.vpc/data.subnet fields flow through `_resource` like any other field.
-# iam_role/ecr (V2c), ec2 (V3c), lambda (V4c), ecs (V5c), and logs (W2.1) are
-# pure gateway-model kinds like vpc/subnet/sg -- no reconciler-driven
+# iam_role/ecr (V2c), ec2 (V3c), lambda (V4c), ecs (V5c), logs (W2.1) and
+# secret/ssm (W2.4) are pure gateway-model kinds like vpc/subnet/sg -- no reconciler-driven
 # provisioning at all (plan.py NoOps them; see reconcile/plan.py +
 # aws/backings.py::ENSURE_KINDS), just fields flowing through generically for
 # hcl.py's builders to read. ec2's REAL lifecycle (a Lima VM) is driven
@@ -28,8 +28,23 @@ _REF = re.compile(r"^\$\{\{\s*([\w-]+)\.([\w-]+)\s*\}\}$")
 # (gateway/models/lambdactl.py); ecs's (per-task Colima containers) via
 # CreateService/UpdateService (gateway/models/ecsctl.py); logs' (a group +
 # streams + events in a per-env JSON sidecar) via CreateLogGroup
-# (gateway/models/logsctl.py) -- the reconciler never touches any of them,
-# same as vpc/subnet/sg.
+# (gateway/models/logsctl.py); secret's (a record + versions in a 0600 JSON
+# sidecar) via CreateSecret/PutSecretValue (gateway/models/secretsctl.py) and
+# ssm's via PutParameter (gateway/models/ssmctl.py) -- the reconciler never
+# touches any of them, same as vpc/subnet/sg.
+# (kind, field) pairs whose value is a CREDENTIAL BY CONSTRUCTION, whatever the
+# field happens to be called (W2.4). `is_sensitive_field_name` catches names
+# that LOOK secret-ish -- it would catch `secretString` by luck, and would miss
+# an ssm parameter's `paramValue` entirely -- so the two kinds whose whole
+# purpose is holding a secret say so explicitly here instead. The flag never
+# changes how the value is USED (tofu needs the real thing); it's what keeps it
+# out of the translation agent's prompt and out of every streamed `tofu` log
+# line. See spec/models.py::FieldValue.sensitive.
+_SENSITIVE_FIELDS = {
+    "secret": frozenset({"secretString"}),
+    "ssm": frozenset({"paramValue"}),
+}
+
 _KIND = {
     "rds": "rds",
     "s3": "s3",
@@ -45,6 +60,8 @@ _KIND = {
     "lambda": "lambda",
     "ecs": "ecs",
     "logs": "logs",
+    "secret": "secret",
+    "ssm": "ssm",
 }
 
 
@@ -82,7 +99,8 @@ def _resource(node: dict) -> ResourceDesired | None:
         if ref is not None:  # a top-level ${{node.attr}} field becomes a Ref
             refs.append(ref)
         else:
-            fields[key] = FieldValue(value=value, provenance="user", sensitive=is_sensitive_field_name(key))
+            sensitive = is_sensitive_field_name(key) or key in _SENSITIVE_FIELDS.get(kind, ())
+            fields[key] = FieldValue(value=value, provenance="user", sensitive=sensitive)
     if static_env:
         # Security finding #3: the whole `env` field is flagged sensitive if
         # ANY entry looks like a secret (coarse -- fine for the LLM-prompt
