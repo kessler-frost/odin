@@ -537,3 +537,33 @@ def test_a_database_with_no_endpoint_yet_is_never_probed(tmp_path):
     probe = FakeProbe(ok=False)
     assert _sweeper(probe=probe).verdicts(stores, ENV) == {}
     assert probe.calls == []
+
+
+def test_a_single_bad_sample_is_a_blip_not_drift(tmp_path, monkeypatch):
+    """CONFIRM BEFORE CORRECTING (found running the real thing): under a busy
+    docker daemon -- a `tofu apply` pulling a 250MB image -- one probe can fail
+    AND `docker inspect` can come back empty for a container that's perfectly
+    alive. Writing `failed` on that single sample corrupts the record, and only
+    a human Apply undoes it. Both questions are asked again before the record is
+    ever touched."""
+    monkeypatch.setattr("odin.reconcile.drift._CONFIRM_DELAY", 0.0)
+    stores = SynthStores(tmp_path)
+    name = _db(stores, "app-db", "app-db")
+
+    class Blip(FakeContainers):
+        """`status` lies once (the blip), then tells the truth."""
+
+        def status(self, container: str) -> str:
+            self.status_calls.append(container)
+            return "absent" if len(self.status_calls) == 1 else "running"
+
+    class ProbeBlip(FakeProbe):
+        def __call__(self, *args, **kwargs):
+            self.calls.append(args)
+            return PgReady(ok=len(self.calls) > 1, error=None if len(self.calls) > 1 else "timeout")
+
+    verdicts = _sweeper(containers=Blip(names=[name]), probe=ProbeBlip()).verdicts(stores, ENV)
+
+    assert verdicts == {}, "a single bad sample must not be reported as drift"
+    record = stores.rdsctl.get(ENV, "db:app-db")
+    assert (record["status"], record["status_reason"]) == ("available", None)

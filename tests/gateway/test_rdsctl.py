@@ -72,29 +72,40 @@ class FailingDelete(FakePostgresRds):
         raise RuntimeError("docker rm failed")
 
 
+_READY: dict[str, bool] = {}
+_PROBES: dict[str, int] = {}
+
+
+def _fake_probe(host, port, user, password, db="postgres") -> PgReady:
+    """`pg_ready_sync`'s answer, counted. `flap` makes the SECOND probe fail
+    once -- the postgres init-then-restart shape `_wait_available`'s
+    consecutive-success rule exists for."""
+    _PROBES["n"] = _PROBES.get("n", 0) + 1
+    ok = _READY.get("ok", True)
+    if ok and _READY.get("flap") and _PROBES["n"] == 2:
+        ok = False
+    return PgReady(ok=ok, error=None if ok else "connection refused")
+
+
 @pytest.fixture(autouse=True)
 def fast_probe(monkeypatch):
-    """`pg_ready_sync` answers instantly from the fake substrate's `ready`
-    flag -- the ONE thing a unit test can't do for real. `_POLL_INTERVAL` and
-    `_CREATE_TIMEOUT` shrink so the "never becomes ready" path finishes in
-    well under a second instead of three minutes."""
+    """`pg_ready_sync` answers instantly from the `_READY` flags -- the ONE
+    thing a unit test can't do for real. `_POLL_INTERVAL` and `_CREATE_TIMEOUT`
+    shrink so the "never becomes ready" path finishes in well under a second
+    instead of three minutes."""
     monkeypatch.setattr(rdsctl, "_POLL_INTERVAL", 0.01)
     monkeypatch.setattr(rdsctl, "_CREATE_TIMEOUT", 0.5)
-    monkeypatch.setattr(
-        rdsctl, "pg_ready_sync",
-        lambda host, port, user, password, db="postgres": PgReady(ok=_READY.get("ok", True), error=None if _READY.get("ok", True) else "connection refused"),
-    )
-
-
-_READY: dict[str, bool] = {}
+    monkeypatch.setattr(rdsctl, "pg_ready_sync", _fake_probe)
 
 
 @pytest.fixture(autouse=True)
 def reset_ready():
     _READY.clear()
+    _PROBES.clear()
     _READY["ok"] = True
     yield
     _READY.clear()
+    _PROBES.clear()
 
 
 def _stores(tmp_path: Path) -> SynthStores:
@@ -194,6 +205,22 @@ def test_available_is_gated_on_a_real_pg_ready_probe_not_on_docker_run(tmp_path,
     assert failed["DBInstanceStatus"] == "failed"
     record = rdsctl.records(stores, ENV)[0]
     assert "connection refused" in record["status_reason"]
+
+
+def test_available_needs_two_consecutive_probes_so_a_restarting_postgres_isnt_ready(tmp_path, sink, rds):
+    """The postgres image inits behind a TEMPORARY server, then shuts it down
+    and starts the real one. A single lucky probe against that temp server would
+    publish a DATABASE_URL that stops answering a moment later, so `available`
+    requires two successes in a row."""
+    stores, fake = _stores(tmp_path), FakePostgresRds()
+    _READY["ok"] = True
+    _READY["flap"] = True  # ok, then not ok, then ok forever (see the fixture)
+    _create(sink, rds, stores, fake)
+    available = _await_status(sink, rds, stores, fake, "available")
+    assert available["DBInstanceStatus"] == "available"
+    # The flap means the FIRST success was discarded -- more than the two
+    # minimum probes were needed to get a clean consecutive pair.
+    assert _PROBES["n"] > rdsctl._CONSECUTIVE_PROBES
 
 
 def test_a_container_that_never_starts_lands_failed_with_the_real_reason(tmp_path, sink, rds):

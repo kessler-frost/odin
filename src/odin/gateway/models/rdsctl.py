@@ -20,11 +20,13 @@ built for exactly this latency, so no timing hack is needed anywhere.
 
 `available` is gated on a REAL health assertion, not on `docker run`
 returning: `_finish_create` waits for a published host port and then for
-`reconcile.assertions.pg_ready_sync` to succeed (a genuine connection +
-`SELECT 1`). This is the same probe that used to gate the reconciler's
-`healthy` phase, moved rather than dropped -- and it now means a Postgres
-that boots but never accepts connections FAILS THE APPLY (bounded by
-`_CREATE_TIMEOUT`) instead of being reported as up.
+`reconcile.assertions.pg_ready_sync` to succeed twice in a row (a genuine
+connection + `SELECT 1`; see `_wait_available` for why once isn't enough
+against the postgres image's own init-then-restart dance). This is the same
+probe that used to gate the reconciler's `healthy` phase, moved rather than
+dropped -- and it now means a Postgres that boots but never accepts
+connections FAILS THE APPLY (bounded by `_CREATE_TIMEOUT`) instead of being
+reported as up.
 
 Wire shape: RDS is botocore's `query` protocol (verified against botocore's
 own `rds` service model: protocol `query`, xmlNamespace
@@ -106,6 +108,10 @@ _REQUEST_ID = "00000000-0000-0000-0000-000000000000"
 # behind `_ECS_CONVERGE_TIMEOUT` in agent/hcl.py).
 _CREATE_TIMEOUT = 180.0
 _POLL_INTERVAL = 0.5
+# Consecutive successful `pg_ready` probes required before reporting
+# `available` -- see `_wait_available` for the postgres-entrypoint restart this
+# exists to straddle.
+_CONSECUTIVE_PROBES = 2
 
 # The lifecycle states this module ever writes. `creating` -> `available` is
 # what the provider's create waiter absorbs; `deleting` is what its delete
@@ -373,17 +379,30 @@ def _substrate(env: str, rds: PostgresRds | None) -> PostgresRds:
 
 def _wait_available(rds: PostgresRds, identifier: str, user: str, password: str, deadline: float) -> tuple[int, str | None]:
     """Poll until the container publishes a host port AND `pg_ready_sync`
-    succeeds against it. Returns `(port, error)` -- `error` is None on
-    success, otherwise the LAST real failure text (never an invented one), so
-    `failed`'s reason says what actually went wrong."""
+    succeeds TWICE IN A ROW against it. Returns `(port, error)` -- `error` is
+    None on success, otherwise the LAST real failure text (never an invented
+    one), so `failed`'s reason says what actually went wrong.
+
+    Two consecutive successes, not one, because of how the postgres image
+    actually boots (observed against the real container): the entrypoint runs
+    initdb behind a TEMPORARY server, applies `POSTGRES_DB`/`POSTGRES_USER`,
+    then SHUTS THAT SERVER DOWN and starts the real one. A single probe can
+    land on the temporary server and report ready a moment before the
+    restart -- so `available` would briefly name a database that is about to
+    stop answering, and any consumer handed the DATABASE_URL fact in that
+    window would fail. `_CONSECUTIVE_PROBES` samples spread over
+    `_POLL_INTERVAL` straddle the restart instead of landing inside it."""
     error = "timed out waiting for a published port"
+    streak = 0
     while time.monotonic() < deadline:
         endpoint = rds.endpoint(identifier)
         if endpoint is not None:
             probe = pg_ready_sync(endpoint[0], endpoint[1], user, password)
-            if probe.ok:
+            streak = streak + 1 if probe.ok else 0
+            if streak >= _CONSECUTIVE_PROBES:
                 return endpoint[1], None
-            error = probe.error or "pg_ready failed"
+            if not probe.ok:
+                error = probe.error or "pg_ready failed"
         time.sleep(_POLL_INTERVAL)
     return 0, error
 

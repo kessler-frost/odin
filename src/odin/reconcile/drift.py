@@ -111,6 +111,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 from odin.aws.rds import container_name as db_container_name
 from odin.compute.functions import container_name as function_container_name
@@ -127,6 +128,13 @@ from odin.runtime.colima import ColimaRuntime
 log = logging.getLogger("odin.reconcile.drift")
 
 _DEFAULT_SWEEP_TICKS = 10
+
+# How long the rds half waits before re-asking "is it really down?" (see
+# `_sweep_databases`). Short enough that a genuinely dead database is still
+# reported on this same sweep, long enough to outlast a busy-daemon blip. Only
+# ever paid on the failure path, and the whole sweep already runs off the event
+# loop (`Reconciler._drift_verdicts` uses asyncio.to_thread).
+_CONFIRM_DELAY = 1.0
 
 
 def _sweep_ticks() -> int:
@@ -305,16 +313,18 @@ class DriftSweeper:
         self._sweep_databases(stores, env, out)
         return out
 
+    def _probe_db(self, record: dict):
+        return self._probe(
+            "127.0.0.1", record["endpoint_port"],
+            record["master_username"], record["master_password"],
+        )
+
     def _sweep_databases(self, stores: SynthStores, env: str, out: dict[str, str]) -> None:
-        """rds's half: one real `pg_ready` per available instance, and a single
+        """rds's half: one real `pg_ready` per available instance, and a
         `status` call only when that fails (see the module docstring for why a
         listing can't answer this)."""
         for label, record in _db_records(stores, env):
-            probe = self._probe(
-                "127.0.0.1", record["endpoint_port"],
-                record["master_username"], record["master_password"],
-            )
-            if probe.ok:
+            if self._probe_db(record).ok:
                 continue
             identifier = record["db_instance_identifier"]
             name = db_container_name(env, identifier)
@@ -322,11 +332,27 @@ class DriftSweeper:
                 # The container is up but Postgres isn't answering. Reported,
                 # NOT written into the record: this may be transient, and a
                 # corrected record would need a human Apply to undo.
-                out[label] = f"Postgres on {name} is not accepting connections: {probe.error}"
+                out[label] = f"Postgres on {name} is not accepting connections: {self._probe_db(record).error}"
+                continue
+            # CONFIRM BEFORE CORRECTING (found running the real thing): a
+            # single failed sample is not proof. Under real load -- a `tofu
+            # apply` pulling a 250MB image while the daemon is busy -- a probe
+            # can fail AND `docker inspect` can come back empty (which
+            # `ColimaRuntime.status` honestly reports as "absent", since it
+            # cannot tell "no such container" from "docker didn't answer") for
+            # a container that is perfectly alive. Writing `failed` on that
+            # sample corrupts the record, and only a human Apply undoes it --
+            # the exact failure mode `_listing`'s "unknown is not gone" rule
+            # exists to prevent, which this path has to honor too. So: sleep a
+            # beat and ask BOTH questions again, and only correct the record
+            # when both still say down.
+            time.sleep(_CONFIRM_DELAY)
+            if self._probe_db(record).ok or self._containers.status(name) == "running":
+                log.info("drift sweep: %s answered on re-check; treating the first sample as a blip", name)
                 continue
             exit_code = self._containers.exit_code(name)
             out[label] = f"container {name} is not running (exit {exit_code}) — re-Apply to recreate"
-            # A real death: the same sentence goes into the RECORD, so the
+            # A confirmed death: the same sentence goes into the RECORD, so the
             # canvas keeps showing it after a restart and the next Apply's
             # `converge_db_instances` genuinely re-creates the database.
             rdsctl.mark_instance_failed(stores, env, identifier, out[label])
