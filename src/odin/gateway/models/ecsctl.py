@@ -96,6 +96,7 @@ from odin.gateway import errors
 from odin.gateway.keys import KeyStore, workload_env
 from odin.gateway.models import elbv2ctl, logsctl
 from odin.gateway.stores import NO_CHANGE, SynthStores
+from odin.gateway.wiring import node_env
 from odin.runtime.colima import CONTAINER_HOST
 
 log = logging.getLogger("odin.gateway.ecsctl")
@@ -618,7 +619,7 @@ def mark_task_stopped(stores: SynthStores, env: str, cluster_name: str, task_id:
 
 def _launch_task(
     stores: SynthStores, env: str, cluster_name: str, service_name: str, taskdef: dict, runtime: TaskRuntime,
-    extra_env: dict[str, str] | None = None,
+    extra_env: dict[str, str] | None = None, node_label: str = "",
 ) -> None:
     container_def = taskdef["container_definitions"][0]  # v1: single-container taskdefs (V5c)
     task_id = uuid.uuid4().hex
@@ -641,8 +642,21 @@ def _launch_task(
     }
     stores.ecsctl.set(env, _task_key(cluster_name, task_id), task)
     try:
+        # CANVAS WIRING (field test 2, the product hole): the node's own `env`
+        # map -- static entries plus every `${{producer.ATTR}}` ref resolved to a
+        # live value -- delivered into the REAL container here rather than baked
+        # into the taskdef, which would put resolved connection strings
+        # (passwords included) into terraform.tfstate and drift on every plan
+        # (see gateway/wiring.py for the full rationale). Resolved BEFORE the
+        # issued credentials are layered on, so odin's own four AWS_* vars
+        # always win over a canvas that happens to name one of them.
+        # An `UnresolvedRef` lands in the SAME `except` as a failed
+        # `docker run`: the task goes STOPPED with the real reason, which is
+        # what makes a bad ref a `crashed` node with a naming verdict AND a
+        # failed apply (the service never reaches steady state).
+        launch_env = {**node_env(stores, env, node_label), **(extra_env or {})} if node_label else extra_env
         handle = runtime.run(
-            env, task_id, container_def, extra_env=extra_env,
+            env, task_id, container_def, extra_env=launch_env,
             cpu=taskdef.get("cpu"), memory=taskdef.get("memory"),
         )
     except Exception as exc:
@@ -707,9 +721,10 @@ def _reconcile_service_tasks(
             _stop_task(stores, env, task, runtime)
 
         desired = service["desired_count"]
+        node_label = service.get("node_label") or ""
         if len(fresh) < desired:
             for _ in range(desired - len(fresh)):
-                _launch_task(stores, env, cluster_name, service_name, taskdef, runtime, extra_env)
+                _launch_task(stores, env, cluster_name, service_name, taskdef, runtime, extra_env, node_label)
         elif len(fresh) > desired:
             # Newest-task-first scale-down (the digest's own ordering).
             excess = sorted(fresh, key=lambda t: t["started_at"] or 0, reverse=True)[: len(fresh) - desired]

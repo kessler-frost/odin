@@ -28,6 +28,8 @@ from odin.gateway.keys import KeyStore
 from odin.gateway.models import ecsctl, logsctl
 from odin.gateway.stores import SynthStores
 from odin.runtime.colima import CONTAINER_HOST
+from odin.spec.store import SpecStore
+from odin.spec.translate import canvas_to_stack
 
 from .conftest import split_url
 
@@ -645,6 +647,106 @@ def test_create_service_without_keystore_keeps_prior_behavior(sink, ecs, stores)
 
     (_, _, _, extra_env, _, _) = runtime.ran[0]
     assert not extra_env
+
+
+# --- Canvas WIRING: the node's own `env` map reaches the real container -------
+
+
+def _seed_db_and_stack(stores, tmp_path, env_map: dict) -> None:
+    """A real, `available` rds record in the gateway's own store plus an applied
+    Stack whose ecs node carries `env_map` -- the two inputs
+    `gateway/wiring.py` resolves against."""
+    stores.rdsctl.set(ENV, "db:appdb", {
+        "db_instance_identifier": "appdb", "master_username": "app", "master_password": "s3cret",
+        "db_name": "shop", "status": "available", "endpoint_port": 33366,
+    })
+    SpecStore(tmp_path).apply(canvas_to_stack({
+        "nodes": [
+            {"id": "n1", "type": "rds", "data": {"label": "appdb"}},
+            {"id": "n2", "type": "ecs", "data": {"label": "myservice", "image": "nginx:alpine", "env": env_map}},
+        ],
+        "edges": [],
+    }, env=ENV))
+
+
+def test_task_containers_launch_with_the_nodes_env_and_resolved_refs(sink, ecs, stores, keystore, tmp_path):
+    """Field test 2, "the product hole": an ECS node's `env` -- static entries
+    AND `${{producer.ATTR}}` refs -- was silently dropped, so there was no
+    canvas-driven way to hand a container its connection strings. It now rides
+    the same launch-time seam the issued credentials already use, so nothing
+    resolved ever enters the taskdef (and therefore tofu state)."""
+    _seed_db_and_stack(stores, tmp_path, {"DATABASE_URL": "${{appdb.DATABASE_URL}}", "APP_TIER": "web"})
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(
+        stores, sink, ecs, runtime, keystore=keystore, gateway_port=4266,
+        tags=[{"key": "odin:node", "value": "myservice"}],
+    )
+    _wait_for_running_count(stores, sink, ecs, runtime, 1)
+
+    (_, _, container_def, extra_env, _, _) = runtime.ran[0]
+    assert extra_env["DATABASE_URL"] == f"postgresql://app:s3cret@{CONTAINER_HOST}:33366/shop"
+    assert extra_env["APP_TIER"] == "web"
+    # The issued creds still win, and the taskdef is still byte-for-byte clean:
+    # a resolved connection string carries the DB PASSWORD, and the taskdef is
+    # echoed into tofu state verbatim.
+    assert extra_env["AWS_ACCESS_KEY_ID"] == keystore.issue(ENV, "myservice")[0]
+    assert container_def.get("environment") is None
+
+
+def test_odins_own_aws_vars_win_over_a_canvas_that_names_them(sink, ecs, stores, keystore, tmp_path):
+    _seed_db_and_stack(stores, tmp_path, {"AWS_DEFAULT_REGION": "eu-west-1"})
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(
+        stores, sink, ecs, runtime, keystore=keystore, gateway_port=4266,
+        tags=[{"key": "odin:node", "value": "myservice"}],
+    )
+    _wait_for_running_count(stores, sink, ecs, runtime, 1)
+
+    (_, _, _, extra_env, _, _) = runtime.ran[0]
+    assert extra_env["AWS_DEFAULT_REGION"] == REGION, "the gateway wiring must not be overridable"
+
+
+def test_an_unresolvable_ref_fails_the_task_with_a_naming_reason(sink, ecs, stores, keystore, tmp_path):
+    """Never an empty string: the task goes STOPPED with the real reason, which
+    makes the node `crashed` with a naming verdict AND (since the service is
+    short of desired) fails the apply."""
+    stores.rdsctl.set(ENV, "db:appdb", {
+        "db_instance_identifier": "appdb", "master_username": "app", "master_password": "s3cret",
+        "db_name": "shop", "status": "creating", "endpoint_port": 0,  # NOT available yet
+    })
+    SpecStore(tmp_path).apply(canvas_to_stack({
+        "nodes": [
+            {"id": "n1", "type": "rds", "data": {"label": "appdb"}},
+            {"id": "n2", "type": "ecs", "data": {
+                "label": "myservice", "image": "nginx:alpine",
+                "env": {"DATABASE_URL": "${{appdb.DATABASE_URL}}"}}},
+        ],
+        "edges": [],
+    }, env=ENV))
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(
+        stores, sink, ecs, runtime, keystore=keystore, gateway_port=4266,
+        tags=[{"key": "odin:node", "value": "myservice"}],
+    )
+
+    deadline = time.monotonic() + 2.0
+    service = None
+    while time.monotonic() < deadline:
+        service = _describe_service(stores, sink, ecs, runtime)
+        if service["deployments"][0]["rolloutState"] == "FAILED":
+            break
+        time.sleep(0.02)
+    (deployment,) = service["deployments"]
+    assert deployment["rolloutState"] == "FAILED", service
+    assert "DATABASE_URL" in deployment["rolloutStateReason"], deployment
+    assert "appdb" in deployment["rolloutStateReason"], deployment
+    assert not runtime.ran, "no container may be started with a hole in its environment"
 
 
 def test_create_service_without_tags_launches_with_no_injected_creds(sink, ecs, stores, keystore):

@@ -33,7 +33,7 @@ from odin.compute.tasks import TaskRuntime
 from odin.fabric.localhost import LocalhostFabric
 from odin.fabric.nebula import mesh_state
 from odin.fabric.sidecar import MeshSidecar
-from odin.gateway import DEFAULT_GATEWAY_PORT, GATEWAY_PORT_ENV
+from odin.gateway import DEFAULT_GATEWAY_PORT, GATEWAY_PORT_ENV, wiring
 from odin.gateway.app import GatewayState, create_gateway_app, serve_in_thread, stop_in_thread
 from odin.gateway.keys import OPERATOR_NODE_ID, KeyStore, Principal
 from odin.gateway.models import ec2compute, ecsctl, lambdactl, rdsctl
@@ -226,7 +226,7 @@ class ImportTfRequest(BaseModel):
 
 def create_tf_router(
     store: SpecStore, runner: TfRunner, keystore: KeyStore, gateway_port,
-    translate_cache: translate_mod.TranslateCache, runtime,
+    translate_cache: translate_mod.TranslateCache, runtime, stores: SynthStores,
 ) -> APIRouter:
     """`/tf/*` -- Simulate's own apply/destroy/status, independent of the
     canvas `/apply`/`/destroy` above (S2 CONTRACT ADDENDUM: routes named
@@ -248,6 +248,10 @@ def create_tf_router(
         if rejection is not None:
             return rejection
         project = generate_tf(stack)
+        # Canvas wiring: same publish `/apply-full` does, from the stack this
+        # route applies -- otherwise a Simulate run would launch containers
+        # against whatever the LAST /apply-full staged.
+        wiring.stage(stores, env, stack)
         access_key, secret_key = _issue_operator(env)
         try:
             result = await runner.apply(
@@ -447,6 +451,13 @@ def create_apply_full_router(
                 if env_epoch.get(env, 0) != my_epoch:
                     return JSONResponse(status_code=409, content=_SUPERSEDED)
                 await reconciler.ensure_backings(stack)
+                # Canvas wiring (field test 2, the product hole): publish the
+                # authored `env`/refs where the GATEWAY can read them DURING
+                # this tofu run -- CreateService/CreateFunction launch the real
+                # container that consumes them, and `store.apply(stack)` below
+                # deliberately does not happen until tofu has succeeded. See
+                # `gateway/wiring.py::stage`.
+                wiring.stage(stores, env, stack)
                 project = TfProject(
                     files=translated.files, unsupported=translated.unsupported,
                     binary_files=translated.binary_files,
@@ -694,7 +705,10 @@ def create_app(
         create_apply_router(_store, reconciler_for, gateway_keystore, tf_runner, lambda: gateway_port_actual, env_epoch)
     )
     app.include_router(
-        create_tf_router(_store, tf_runner, gateway_keystore, lambda: gateway_port_actual, translate_cache, _runtime)
+        create_tf_router(
+            _store, tf_runner, gateway_keystore, lambda: gateway_port_actual,
+            translate_cache, _runtime, gateway_stores,
+        )
     )
     app.include_router(
         create_apply_full_router(

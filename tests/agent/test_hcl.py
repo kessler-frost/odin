@@ -793,6 +793,82 @@ def test_tofu_fmt_accepts_lambda_output(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+# --- canvas wiring: depends_on, no values (field test 2, the product hole) ----
+
+_WIRED_CANVAS = {
+    "nodes": [
+        {"id": "n1", "type": "rds", "data": {"label": "app-db", "password": "pw123"}},
+        {"id": "n2", "type": "elasticache", "data": {"label": "cache"}},
+        {"id": "n3", "type": "ecs", "data": {
+            "label": "web", "image": "nginx:alpine",
+            "env": {"DATABASE_URL": "${{app-db.DATABASE_URL}}", "REDIS_URL": "${{cache.REDIS_URL}}"},
+        }},
+    ],
+    "edges": [],
+}
+
+
+def test_a_wired_ecs_service_depends_on_its_producers_but_carries_no_values():
+    """The values are injected at container launch (`gateway/wiring.py`) so a
+    resolved DATABASE_URL -- which embeds the DB PASSWORD -- never lands in
+    main.tf or terraform.tfstate. `depends_on` buys back the one thing an
+    interpolated value would have given for free: ordering."""
+    proj = generate_tf(canvas_to_stack(_WIRED_CANVAS))
+    main_tf = proj.files["main.tf"]
+    assert "depends_on = [aws_db_instance.app_db, aws_elasticache_cluster.cache]" in main_tf
+    assert "environment" not in main_tf, "no env values in the HCL -- that is the whole point"
+    # The rds `password` argument is the ONE legitimate place the plaintext
+    # appears (tofu has to send it); the resolved DATABASE_URL would have been a
+    # second copy, in the service's own block and in tofu state.
+    assert main_tf.count("pw123") == 1, main_tf
+    assert proj.unsupported == []
+
+
+def test_a_wired_lambda_depends_on_its_producers():
+    canvas = {
+        "nodes": [
+            {"id": "n1", "type": "rds", "data": {"label": "app-db"}},
+            {"id": "n2", "type": "lambda", "data": {
+                "label": "fn1", "env": {"DATABASE_URL": "${{app-db.DATABASE_URL}}"}}},
+        ],
+        "edges": [],
+    }
+    main_tf = generate_tf(canvas_to_stack(canvas)).files["main.tf"]
+    assert "depends_on = [aws_db_instance.app_db]" in main_tf
+
+
+def test_an_unwired_ecs_node_emits_no_depends_on():
+    stack = Stack(resources=(ResourceDesired(id="app", kind="ecs"),))
+    assert "depends_on" not in generate_tf(stack).files["main.tf"]
+
+
+def test_a_ref_to_a_node_that_is_not_on_the_canvas_is_reported_not_dropped():
+    """Northstar directive 5: a typo'd producer name can never be wired, so say
+    so in the apply response instead of silently omitting the variable and
+    letting the container fail far from the cause. The service itself is still
+    built -- the rest of it is valid."""
+    canvas = {
+        "nodes": [{"id": "n1", "type": "ecs", "data": {
+            "label": "web", "env": {"DATABASE_URL": "${{typo-db.DATABASE_URL}}"}}}],
+        "edges": [],
+    }
+    proj = generate_tf(canvas_to_stack(canvas))
+    assert 'resource "aws_ecs_service" "web"' in proj.files["main.tf"]
+    assert "depends_on" not in proj.files["main.tf"]
+    (note,) = proj.unsupported
+    assert "typo-db" in note and "DATABASE_URL" in note and "web" in note
+
+
+def test_tofu_fmt_accepts_a_wired_service(tmp_path):
+    tofu = shutil.which("tofu")
+    if tofu is None:
+        return  # skip cleanly -- no tofu on PATH in this environment
+    main_tf = tmp_path / "main.tf"
+    main_tf.write_text(generate_tf(canvas_to_stack(_WIRED_CANVAS)).files["main.tf"])
+    result = subprocess.run([tofu, "fmt", "-check", "-diff", str(main_tf)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 # --- ecs (V5c) ---------------------------------------------------------------
 
 

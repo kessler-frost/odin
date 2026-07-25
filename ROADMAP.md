@@ -165,7 +165,8 @@ future decision against these points instead of re-deriving them:
     yet gate host containers either. Endpoint reachability is per-consumer the
     same way RDS's is: a container consumes `${{cache.REDIS_URL}}`
     (`host.docker.internal`), an EC2 (Lima VM) consumer must use
-    `${{cache.REDIS_URL_VM}}` (`host.lima.internal`).
+    `${{cache.REDIS_URL_VM}}` (`host.lima.internal`) — and "consumes" is
+    literal since v0.7.1: see **Canvas wiring** below.
   - RDS is Terraform-managed (W2.7 — this used to read "RDS stays off
     Terraform"): an `rds` node compiles to `aws_db_instance`, and the gateway's
     own RDS model (`gateway/models/rdsctl.py`) fulfils CreateDBInstance with
@@ -203,6 +204,49 @@ future decision against these points instead of re-deriving them:
     can't resolve the container-host alias. odin publishes BOTH facts (v0.5.4,
     finding #5); picking the right one per consumer type is manual — automatic
     ref-routing by consumer kind is deferred.
+- [x] **Canvas wiring — a node's `env` actually reaches its container.** An
+  `ecs` or `lambda` node's `env` map (static entries plus
+  `${{producer.ATTR}}` references) is delivered into the REAL container. Until
+  v0.7.1 the two bullets above ("a container consumes `${{cache.REDIS_URL}}`",
+  "a CONTAINER consumes `${{db.DATABASE_URL}}`") were **not achievable**: both
+  field-test agents confirmed the map was silently dropped — `spec/translate.py`
+  parsed it and lifted refs onto `ResourceDesired.refs`, but `agent/hcl.py`
+  emitted no `environment` block at all, `fabric.resolve` had no production
+  caller, and the container came up with the four `AWS_*` vars and nothing else.
+  So you could provision the whole production stack with no canvas-driven way
+  to hand the app its connection strings. Proven end to end by
+  `tests/simulate/test_ecs_env_wiring_e2e.py`: a real ECS task container speaks
+  a real Postgres SSLRequest and a real Redis `PING` to the addresses its
+  canvas `env` refs resolved to.
+  - **Injected at container LAUNCH, not through the generated HCL**
+    (`gateway/wiring.py`), on the same seam that already injects the workload's
+    issued gateway credentials, keyed off the `odin:node` tag. A resolved
+    `DATABASE_URL` carries the database password, so putting it in
+    `container_definitions`/`environment` would write it in plaintext into
+    `main.tf` AND `terraform.tfstate`; it would also drift on every plan (the
+    value embeds a Docker-assigned host port) and freeze a stale port into
+    state. Facts come from the gateway's own live records, not from World,
+    because World is not written until the reconciler's next tick — after the
+    apply that creates both nodes.
+  - **Ordering** comes from a real `depends_on` on the consumer's resource —
+    the one thing an interpolated value would have given for free — so it
+    carries no values.
+  - **A ref that cannot be resolved fails honestly**, never an empty string: the
+    ECS task goes STOPPED / the Lambda `State: Failed` with a reason naming the
+    variable, the producer and what the producer does publish, which surfaces as
+    a `crashed` node with that verdict AND (since the service stays short of
+    desired) a FAILED apply. A ref naming a node that isn't on the canvas at all
+    is reported in the apply response's `unsupported` at build time.
+  - **v1 limits, recorded rather than hidden:** there is still no `env` editor
+    in the UI's ConfigPanel for an ecs node — the map must be authored in the
+    canvas JSON (`odin canvas set`). Only `rds`, `elasticache` and `alb`
+    publish facts, so only those can be referenced. Values are read at LAUNCH,
+    so editing a node's `env` only reaches a task once that task is replaced
+    (real ECS behaves the same way — a taskdef change forces a new deployment);
+    a re-Apply that changes nothing tofu can see will not restart it.
+    `ResourceDesired.refs` does not record whether a ref came from `env` or from
+    a top-level field, so a top-level `${{...}}` field also arrives as an env
+    var named after that field.
   - Security groups: what IS enforced (W2.6) and what is not.
     - **EC2 VMs**: an instance's ASSIGNED security groups gate its overlay
       traffic — the UNION of their compiled rules is its nebula firewall

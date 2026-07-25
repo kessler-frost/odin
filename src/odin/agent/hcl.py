@@ -220,6 +220,57 @@ _DEFAULT_EGRESS = (
 )
 
 
+# CANVAS WIRING ordering (field test 2, the product hole). A workload node's
+# `env` refs (`${{db.DATABASE_URL}}`) are delivered into the REAL container at
+# LAUNCH TIME, by `gateway/wiring.py`, deliberately NOT interpolated into the
+# generated HCL -- a resolved DATABASE_URL carries the database password, and
+# putting it in `container_definitions`/`environment` would write it into
+# `terraform.tfstate` in plaintext AND drift on every plan (the resolved value
+# embeds a Docker-assigned host port). See gateway/wiring.py for the full
+# rationale.
+#
+# The cost of that choice is the one thing an interpolated value would have
+# given for free: ORDERING. With no reference in the HCL, tofu is free to create
+# the service in parallel with the database, and the task would launch before
+# any endpoint exists. `depends_on` buys exactly the ordering back and carries
+# NO VALUES -- a real, portable Terraform argument -- so the producer is fully
+# created (and, for rds/elasticache, `available`) before the consumer exists.
+_WIRED_KINDS = ("ecs", "lambda")
+
+
+def _ref_dependencies(res: ResourceDesired, refs: Refs) -> list[str]:
+    """`[<tf type>.<hcl name>, ...]` for every DISTINCT node this resource's
+    `${{...}}` refs point at, sorted for determinism. A ref whose target isn't a
+    buildable canvas resource contributes nothing here and is reported by
+    `_unwired_refs` instead of silently vanishing."""
+    addresses = []
+    for target_id in sorted({ref.target_id for ref in res.refs}):
+        kind, name = refs.get(target_id, ("", ""))
+        tf_type = _TF_TYPES.get(kind)
+        if tf_type is not None:
+            addresses.append(f"{tf_type}.{name}")
+    return addresses
+
+
+def _depends_on_block(res: ResourceDesired, refs: Refs) -> str:
+    addresses = _ref_dependencies(res, refs)
+    return f"  depends_on = [{', '.join(addresses)}]" if addresses else ""
+
+
+def _unwired_refs(res: ResourceDesired, refs: Refs) -> list[str]:
+    """Human reasons for every ref this canvas CANNOT wire -- a ref naming a
+    node that isn't on the canvas (a typo, or a node since deleted). Reported
+    rather than dropped (northstar directive 5): the apply response carries
+    these, so `${{typo.DATABASE_URL}}` is visible at build time instead of only
+    as a crashed container later."""
+    return [
+        f"{res.id} ({res.kind}): env ref {'${{' + f'{ref.target_id}.{ref.target_attr}' + '}}'} "
+        f"names {ref.target_id!r}, which is not a resource on this canvas — the variable "
+        f"{ref.var} will NOT be set and the workload will fail to start"
+        for ref in res.refs if _TF_TYPES.get(refs.get(ref.target_id, ("", ""))[0]) is None
+    ]
+
+
 def _vpc_ref(res: ResourceDesired, refs: Refs) -> str | None:
     """`aws_vpc.<name>.id` for res's containment-stamped `vpc` field (the
     containing VPC's canvas label == its Stack resource id), or None when the
@@ -510,7 +561,9 @@ def _lambda(res: ResourceDesired, refs: Refs) -> Built:
         "filename": zip_name,
         "source_code_hash": f"filebase64sha256({zip_name})",
     }
-    return attrs, ""
+    # No `environment` block: the node's env map is injected at container launch
+    # (`gateway/wiring.py`); this only orders the producers ahead of it.
+    return attrs, _depends_on_block(res, refs)
 
 
 # V5c: ECS services (real per-task Colima containers, gateway/models/
@@ -572,6 +625,13 @@ def _ecs(res: ResourceDesired, refs: Refs) -> Built:
         f'    delete = {quote(_ECS_CONVERGE_TIMEOUT)}\n'
         "  }"
     ]
+    # Canvas wiring: order every `${{producer.ATTR}}` target ahead of this
+    # service, so its tasks never launch before the endpoint they consume
+    # exists. The VALUES arrive at container launch, not through the HCL --
+    # `_WIRED_KINDS` above.
+    depends_on = _depends_on_block(res, refs)
+    if depends_on:
+        blocks.append(depends_on)
     # W2.5: an `alb` node edged to this service fronts it -- which in real AWS
     # is a `load_balancer` block on the SERVICE (the ECS scheduler then
     # registers each task with that target group), not a
@@ -974,6 +1034,15 @@ def generate_tf(stack: Stack) -> TfProject:
         block = _block(_TF_TYPES[res.kind], hcl_name_by_id[res.id], attrs, nested)
         blocks.append(((res.kind, res.id), block))
         built_ids.add(res.id)
+
+    # Canvas wiring, the honesty half: a workload node whose `env` references a
+    # node that isn't on the canvas can never have that variable set, and the
+    # `depends_on` above silently omits it. Say so in the apply response instead
+    # (northstar directive 5) -- the resource itself is still built, because the
+    # rest of it is perfectly valid.
+    for res in ordered:
+        if res.kind in _WIRED_KINDS and res.id in built_ids:
+            unsupported.extend(_unwired_refs(res, refs))
 
     for edge in sorted(stack.edges, key=lambda e: (e.src, e.dst)):
         topic, queue = by_id.get(edge.src), by_id.get(edge.dst)
