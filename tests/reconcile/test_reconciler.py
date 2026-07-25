@@ -893,3 +893,47 @@ async def test_drift_is_off_when_no_sweeper_is_wired(tmp_path):
     await recon.tick()
 
     assert store.current_world().get("server").phase == "healthy"
+
+
+async def test_a_fact_arriving_after_the_phase_settles_still_reaches_world(tmp_path):
+    """Field test 4: an rds node reaches `healthy` BEFORE its mesh join records
+    an overlay_ip, so with facts outside change detection `DATABASE_URL_MESH`
+    could never enter World on a first apply -- no later phase change ever came
+    to carry it. That made README's central security advice (point VM consumers
+    at the SG-gated `_MESH` ref) impossible to follow, silently leaving them on
+    the ungated `_VM` path."""
+    r = Reconciler(store=SpecStore(tmp_path), runtime=FakeRuntime(), env="e")
+
+    await r._emit("db", "rds", "healthy", facts={"DATABASE_URL": "postgresql://x"})
+    await r._emit("db", "rds", "healthy",
+                  facts={"DATABASE_URL": "postgresql://x", "DATABASE_URL_MESH": "postgresql://10.42.1.3"})
+
+    assert r._store.current_world("e").get("db").facts["DATABASE_URL_MESH"] == "postgresql://10.42.1.3"
+
+
+async def test_an_unchanged_reading_still_emits_nothing(tmp_path):
+    """The guard this fix loosened is what killed a 43%-of-all-events flap.
+    Identical facts must stay silent, or that bug returns."""
+    r = Reconciler(store=SpecStore(tmp_path), runtime=FakeRuntime(), env="e")
+    facts = {"DATABASE_URL": "postgresql://x", "endpoint": "h:5432"}
+
+    await r._emit("db", "rds", "healthy", facts=facts)
+    assert r._store.current_world("e").get("db") is not None
+    emitted = []
+    r._store.apply_delta = lambda d: emitted.append(d)
+    for _ in range(20):
+        await r._emit("db", "rds", "healthy", facts=dict(facts))
+
+    assert emitted == [], "20 identical readings must produce no deltas"
+
+
+async def test_a_changing_logtail_alone_does_not_re_emit(tmp_path):
+    """logtail is diagnostic, not identity: two reads of the same dead
+    container can differ, and re-emitting for that is the noise the guard
+    exists to stop."""
+    r = Reconciler(store=SpecStore(tmp_path), runtime=FakeRuntime(), env="e")
+    await r._emit("q", "sqs", "crashed", facts={"logtail": "line one"}, verdict="gone")
+    emitted = []
+    r._store.apply_delta = lambda d: emitted.append(d)
+    await r._emit("q", "sqs", "crashed", facts={"logtail": "line one\nline two"}, verdict="gone")
+    assert emitted == []
