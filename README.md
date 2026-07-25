@@ -362,6 +362,24 @@ an absolute path, a `..` traversal, or a symlink member. `odin status` and
 travels in the archive but is restored only under `--with-canvas` — a restore
 should never silently replace the canvas you're drawing on.
 
+**How odin knows a server is up**, since a wrong answer here is expensive in
+both directions: a running control app holds an exclusive lock on
+`.odin/lock` for its whole life, and `odin status`/`stop`/`import` ask the
+kernel who holds it. Nothing parses `ps` output or matches command lines — a
+script with `uvicorn odin.server:create_app` in its own argv (an ops wrapper
+that restores a backup and *then* starts the app is exactly that) is not a
+server, and odin will not tell you to kill it. The lock dies with the
+process, `kill -9` included, so a crashed odin never leaves a restore
+blocked. Two consequences worth knowing:
+
+- A server that is still shutting down still holds the store, so `odin import`
+  **waits** up to 20 seconds for it to let go rather than refusing on your
+  timing. `odin stop && odin import backup.tgz` in one script just works; no
+  `sleep` needed.
+- If odin ever refuses a restore you're sure is safe, `odin import
+  --ignore-live-server` skips the check outright. It's in the refusal message
+  too. A restore is the worst possible moment to be stuck behind a guard.
+
 The archive contains the env's credentials in cleartext. It's written `0600`,
 and every file inside it is stored `0600` so a restore can only tighten a
 store's modes — but treat the file like a private key anyway, because copying

@@ -187,9 +187,12 @@ def _lock_holder(root: Path) -> LiveServer | None:
     free = _flock(fd)
     os.close(fd)  # drops the lock again if we were the ones who just took it
     raw = path.read_text().strip()
+    # Both halves of the evidence are things just observed, never inferred:
+    # somebody holds this lock, and there is no pidfile naming them (so `odin
+    # stop` is not the fix and this is not a server `odin start` launched).
     return None if free else LiveServer(
         pid=int(raw) if raw.isdigit() else None,
-        evidence=f"holding the store lock {path} (started outside `odin start`)",
+        evidence=f"holding the store lock {path}, no pidfile",
     )
 
 

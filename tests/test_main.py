@@ -149,7 +149,8 @@ def test_status_is_honest_about_a_server_odin_did_not_start(tmp_path, monkeypatc
     monkeypatch.chdir(tmp_path)
     main_mod.status()
     out = capsys.readouterr().out
-    assert "Odin is running" in out and str(os.getpid()) in out and "outside `odin start`" in out
+    assert "Odin is running" in out and str(os.getpid()) in out
+    assert "store lock" in out and "no pidfile" in out
 
 
 def test_status_says_nothing_is_running_for_a_process_that_only_looks_like_one(
