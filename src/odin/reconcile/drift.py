@@ -350,8 +350,16 @@ class DriftSweeper:
             if self._probe_db(record).ok or self._containers.status(name) == "running":
                 log.info("drift sweep: %s answered on re-check; treating the first sample as a blip", name)
                 continue
+            # Field test 2 LOW-17: say the same thing the ecs/lambda halves
+            # above say when the container is GONE, and never invent an exit
+            # code that was never reported -- `exit_code`'s negative sentinel
+            # means "there was nothing to read", which for a container that no
+            # longer exists is the truth, not "exit -1".
             exit_code = self._containers.exit_code(name)
-            out[label] = f"container {name} is not running (exit {exit_code}) — re-Apply to recreate"
+            out[label] = (
+                f"container {name} removed outside odin — re-Apply to recreate" if exit_code < 0
+                else f"container {name} is not running (exit {exit_code}) — re-Apply to recreate"
+            )
             # A confirmed death: the same sentence goes into the RECORD, so the
             # canvas keeps showing it after a restart and the next Apply's
             # `converge_db_instances` genuinely re-creates the database.

@@ -131,6 +131,31 @@ def test_ec2_resolves_instance_by_tag_and_reads_vm_logs(tmp_path, monkeypatch):
     assert result.lines == "journal for odin-ec2-default-i-1"
 
 
+def test_a_deleted_vms_message_does_not_contradict_itself(tmp_path, monkeypatch):
+    """Field test 2 LOW-12: `odin-ec2-… is not running (state: running)` -- the
+    real check found the VM gone, the parenthetical printed the stale model
+    state. Each half must be attributed to whoever said it."""
+    store = _store(tmp_path, (ResourceDesired(id="web2", kind="ec2"),))
+    stores = SynthStores(tmp_path)
+    stores.ec2compute.set(ENV, "instance:i-9", {"instance_id": "i-9", "state_name": "running"})
+    stores.tags.set(ENV, "ec2:i-9", {"odin:node": "web2"})
+
+    class DeletedVm:
+        def status(self, name):
+            return "absent"  # reality: `limactl list` doesn't have it
+
+        def logs(self, name, tail=20):
+            raise AssertionError("an absent VM's journal must not be read")
+
+    monkeypatch.setattr("odin.api.logs.ec2_compute.InstanceVm", DeletedVm)
+    result = fetch_logs(store, stores, FakeRuntime(), ENV, "web2")
+
+    assert result.running is False and result.lines == ""
+    assert result.message == (
+        "odin-ec2-default-i-9 is not running (VM state: absent; odin's record says running)"
+    )
+
+
 def test_ec2_no_instance_yet_is_honest_not_found(tmp_path):
     store = _store(tmp_path, (ResourceDesired(id="server", kind="ec2"),))
     stores = SynthStores(tmp_path)

@@ -232,9 +232,19 @@ def fetch_logs(
             return LogsResponse(env=env, node=node, kind=kind, found=True, message=f"no EC2 instance backs node {node!r} yet")
         name = ec2_compute.vm_name(env, instance["instance_id"])
         vm = ec2_compute.InstanceVm()
-        running = vm.status(name) == "running"
-        lines = vm.logs(name, tail) if vm.status(name) != "absent" else ""
-        message = None if running else f"{name} is not running (state: {instance['state_name']})"
+        # ONE real status read, and the message attributes each half to
+        # whoever said it (field test 2, LOW-12): this used to report `is not
+        # running (state: running)` for a deleted VM -- the "not running" came
+        # from the live `limactl` check, the "running" from odin's own record,
+        # and the sentence contradicted itself. Both are worth showing (a
+        # disagreement between them IS the diagnosis), neither may be printed
+        # as if it were the other's answer.
+        state = vm.status(name)
+        running = state == "running"
+        lines = vm.logs(name, tail) if state != "absent" else ""
+        message = None if running else (
+            f"{name} is not running (VM state: {state}; odin's record says {instance['state_name']})"
+        )
         return LogsResponse(
             env=env, node=node, kind=kind, found=True, running=running,
             sources=[name], lines=lines, message=message,
