@@ -40,14 +40,17 @@ state.
 from __future__ import annotations
 
 import io
+import os
 import shutil
 import tarfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 
 from pydantic import BaseModel, ValidationError
 
-from odin.util import odin_version, pid_alive
+from odin.util import SECRET_FILE_MODE, atomic_write_bytes, odin_version, pid_alive
 
 MANIFEST_NAME = "manifest.json"
 ENV_PREFIX = "env"
@@ -125,10 +128,11 @@ def export_env(root: Path, env: str, dest: Path) -> ExportResult:
     )
     canvas = root / CANVAS_NAME
     dest.parent.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(dest, "w:gz") as tar:
+    with _private_archive(dest) as tar:
         _add_bytes(tar, MANIFEST_NAME, manifest.model_dump_json(indent=2).encode())
         for path in _exportable_files(env_dir):
-            tar.add(path, arcname=f"{ENV_PREFIX}/{path.relative_to(env_dir).as_posix()}")
+            tar.add(path, arcname=f"{ENV_PREFIX}/{path.relative_to(env_dir).as_posix()}",
+                    filter=_owner_only)
         _add_canvas(tar, canvas)
     return ExportResult(
         archive=str(dest), env=env, size=dest.stat().st_size,
@@ -136,9 +140,34 @@ def export_env(root: Path, env: str, dest: Path) -> ExportResult:
     )
 
 
+@contextmanager
+def _private_archive(dest: Path) -> Iterator[tarfile.TarFile]:
+    """The archive, created 0600 before a single byte of it exists.
+
+    `odin export` tells the user to "treat it like a private key file" and it
+    genuinely is one -- it carries `keys.json`'s operator credentials and every
+    canvas secret in cleartext -- but under the default umask `tarfile.open`
+    made it 0644 (v0.7.0's leak). The `fchmod` covers the case where `dest`
+    already existed with a looser mode, since O_CREAT's mode applies only to a
+    file it actually creates.
+    """
+    fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, SECRET_FILE_MODE)
+    os.fchmod(fd, SECRET_FILE_MODE)
+    with os.fdopen(fd, "wb") as raw, tarfile.open(fileobj=raw, mode="w:gz") as tar:
+        yield tar
+
+
+def _owner_only(info: tarfile.TarInfo) -> tarfile.TarInfo:
+    """Every member goes in 0600 regardless of its mode on disk: the archive is
+    a private-key-grade file as a whole, and an archive written from a store an
+    older odin left loose must not carry those loose modes into the restore."""
+    info.mode = SECRET_FILE_MODE
+    return info
+
+
 def _add_canvas(tar: tarfile.TarFile, canvas: Path) -> None:
     if canvas.is_file():
-        tar.add(canvas, arcname=CANVAS_NAME)
+        tar.add(canvas, arcname=CANVAS_NAME, filter=_owner_only)
 
 
 def _add_bytes(tar: tarfile.TarFile, name: str, payload: bytes) -> None:
@@ -255,11 +284,13 @@ def import_archive(
 
 
 def _write(tar: tarfile.TarFile, member: tarfile.TarInfo, dest: Path) -> None:
-    """One member's bytes, at its archived permissions — keys.json and the
-    stack revisions come back 0600, exactly as they were written."""
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_bytes(tar.extractfile(member).read())
-    dest.chmod(member.mode & 0o777)
+    """One member's bytes, at its archived permissions MINUS every group/other
+    bit — so keys.json and the stack revisions come back 0600 exactly as they
+    were written, and a member an older odin archived world-readable (`tf/
+    main.tf` and `terraform.tfstate` were 0644 through v0.7.0) does NOT come
+    back world-readable. Restoring is also the moment to tighten a store, never
+    to loosen one; the `& 0o700` mask is what makes that direction-only."""
+    atomic_write_bytes(dest, tar.extractfile(member).read(), mode=member.mode & 0o700)
 
 
 def _refuse_live_server(root: Path) -> None:

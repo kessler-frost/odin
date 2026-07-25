@@ -313,8 +313,10 @@ path, a `..` traversal, or a symlink member. The shared `.odin/canvas.json`
 travels in the archive but is restored only under `--with-canvas` — a restore
 should never silently replace the canvas you're drawing on.
 
-The archive contains the env's credentials in cleartext. Treat the file like
-a private key — see [SECURITY.md](SECURITY.md#secrets).
+The archive contains the env's credentials in cleartext. It's written `0600`,
+and every file inside it is stored `0600` so a restore can only tighten a
+store's modes — but treat the file like a private key anyway, because copying
+it anywhere else won't preserve that. See [SECURITY.md](SECURITY.md#secrets).
 
 ## Security
 
@@ -322,7 +324,14 @@ Odin has no authentication of its own — the control app binds to
 `127.0.0.1` by default, and applying a canvas runs whatever's on it for
 real (container images, EC2 user-data as root, Lambda code). That's the
 point of the tool, not a bug, but it means a canvas from someone else
-should be treated like a shell script you're about to run. See
+should be treated like a shell script you're about to run.
+
+A canvas secret (an RDS `password`, a `secret` or `ssm` node's value) is
+stored and used in cleartext, in more than one file: the canvas, every Stack
+revision, `world.json`, `events.jsonl`, and the generated Terraform plus its
+state. All of them are `0600`, in `0700` directories, and that file mode is
+the entire protection — there is no encryption at rest and no KMS. SECURITY.md
+lists every file by name; treat canvas secrets as dev/test-grade. See
 [SECURITY.md](SECURITY.md) for the full threat model and how to report a
 vulnerability.
 
