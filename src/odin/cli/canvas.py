@@ -17,6 +17,7 @@ import typer
 from odin.cli import http
 from odin.cli.app import app
 from odin.cli.http import OutputFormat
+from odin.spec.translate import canvas_problems
 
 canvas_app = typer.Typer(
     help="Read/write the saved canvas (one global canvas.json — no env scoping).",
@@ -68,6 +69,18 @@ def canvas_set(
 ) -> None:
     """Save a canvas JSON ({"nodes": [...], "edges": [...]}) as THE canvas."""
     graph = http.parse_json_arg(http.read_text_arg(file), file)
+    # Field test 4, P4-5: this used to store anything that was valid JSON, so a
+    # canvas that could never be applied sat on disk until the next translate
+    # or apply tripped over it. The check is the SERVER's own
+    # (`spec/translate.py::canvas_problems`, what POST /canvas enforces) run one
+    # step earlier, so the failure names the file the user just wrote rather
+    # than an HTTP status. It is deliberately narrow -- see that function: a
+    # node whose KIND odin can't build is NOT a problem (it applies, and is
+    # reported as skipped), and a missing `position` is repaired below, not
+    # refused.
+    problems = canvas_problems(graph)
+    if problems:
+        raise http.fail("\n".join([f"{file} is not a usable canvas:", *(f"  {p}" for p in problems)]))
     placed = place_unpositioned(graph)
     if placed:
         typer.echo(
