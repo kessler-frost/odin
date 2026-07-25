@@ -44,6 +44,7 @@ from odin.cli.app import app as cli
 from odin.runtime.colima import ColimaRuntime
 from odin.server import create_app
 from odin.spec.store import SpecStore
+from tests.containers import own_containers
 
 pytestmark = pytest.mark.integration
 
@@ -60,19 +61,12 @@ OBJECT_KEY = "receipt.txt"
 
 
 def _own_containers(rt: ColimaRuntime) -> list[str]:
-    """Only the containers THIS test can have made, matched by odin's own
-    per-env naming: `odin-aws-{backing}-{env}` (suffix) and
-    `odin-rds-{env}-{id}` / `odin-ecs-{env}-…` / `odin-lambda-{env}-…`
-    (infix). Both forms are anchored on `-` so a longer env sharing this
-    one's prefix -- `bak2` -- is never matched.
-
-    This used to be `rt.list_odin()`, i.e. EVERY `odin=1` container on the
-    machine. During the v0.7.0 field test that made the fixture capable of
-    force-removing a concurrently-running agent's backings, and re-running
-    this file safely meant first checking by hand that the machine was
-    clear. Nothing here needs that reach: the test creates containers in one
-    env and `aws.gc` already tears them down by env-scoped exact name."""
-    return [n for n in rt.container_names() if n.endswith(f"-{ENV}") or f"-{ENV}-" in n]
+    """Only the containers THIS test can have made -- it creates them in one
+    env, and `aws.gc` already tears them down by env-scoped exact name, so
+    the fixture needs no wider reach either. The naming rules (and why the
+    unscoped `rt.list_odin()` this replaced was dangerous) live in
+    `tests/containers.py`, shared with every other integration file."""
+    return own_containers(rt, ENV)
 
 
 @pytest.fixture

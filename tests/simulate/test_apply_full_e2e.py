@@ -23,6 +23,7 @@ from odin.aws.backings import BackingAws
 from odin.runtime.colima import ColimaRuntime
 from odin.server import create_app
 from odin.spec.store import SpecStore
+from tests.containers import own_containers
 
 pytestmark = pytest.mark.integration
 
@@ -48,8 +49,8 @@ _FIVE = ("uploads", "jobs", "alerts", "items", "db")
 def runtime():
     rt = ColimaRuntime()
     yield rt
-    for cid in rt.list_odin():
-        rt.stop(cid)
+    for name in own_containers(rt, ENV):
+        rt.stop(name)
 
 
 def _phases(client) -> dict:
@@ -138,4 +139,4 @@ def test_apply_full_converges_reapplies_zero_drift_and_tears_down(tmp_path, runt
 
         aws.gc(set())  # stop this env's backing containers -- nothing else owns them
 
-    assert runtime.list_odin() == []
+    assert own_containers(runtime, ENV) == [], "every container this test made is gone"

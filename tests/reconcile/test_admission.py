@@ -3,6 +3,7 @@ estimated memory footprint against real host headroom, and free disk on the
 store volume, BEFORE Apply spawns anything."""
 from __future__ import annotations
 
+from odin.compute.instances import max_env_name_len
 from odin.reconcile import admission
 from odin.reconcile.admission import (
     CACHE_MEMORY_MIB,
@@ -273,3 +274,86 @@ def test_check_admission_tolerates_a_store_root_that_does_not_exist_yet(tmp_path
     stack = Stack(resources=(ResourceDesired(id="uploads", kind="s3"),))
     result = check_admission(stack, HostFacts(total_mem_mib=64_000.0), never_created)
     assert isinstance(result.free_disk_gib, float) and result.free_disk_gib > 0
+
+
+# --- env-name length: the trap that made every EC2 boot fail with a raw
+# limactl error, ~60s after Apply, naming nothing the user chose -------------
+
+
+def _ec2_stack(env: str) -> Stack:
+    return Stack(env=env, resources=(ResourceDesired(id="web1", kind="ec2"),))
+
+
+def _long_env(monkeypatch) -> str:
+    """One character past what this machine can boot. Derived from the same
+    path arithmetic the check uses -- never a hardcoded 23."""
+    monkeypatch.setenv("LIMA_HOME", "/Users/somebody/.lima")
+    return "e" * (max_env_name_len() + 1)
+
+
+def test_an_env_too_long_for_a_lima_vm_name_is_refused_before_anything_boots(tmp_path, monkeypatch):
+    env = _long_env(monkeypatch)
+    result = check_admission(_ec2_stack(env), HostFacts(total_mem_mib=64_000.0), tmp_path, host_mem_mib=49_152.0)
+    assert result.ok is False
+
+
+def test_the_refusal_names_the_length_the_limit_and_the_real_constraint(tmp_path, monkeypatch):
+    """The whole point: the raw limactl error names a socket path and
+    UNIX_PATH_MAX, neither of which the user chose. This one has to name what
+    they DID choose (the env name and its length), the actual number to get
+    under, and why."""
+    env = _long_env(monkeypatch)
+    limit = max_env_name_len()
+    result = check_admission(_ec2_stack(env), HostFacts(total_mem_mib=64_000.0), tmp_path, host_mem_mib=49_152.0)
+    assert env in result.reason
+    assert str(len(env)) in result.reason
+    assert str(limit) in result.reason
+    assert "ec2" in result.reason.lower()
+    assert "UNIX_PATH_MAX" in result.reason
+    assert "LIMA_HOME" in result.reason  # the other way out, for a user who can't rename
+
+
+def test_a_canvas_with_no_ec2_node_is_never_blocked_by_the_env_name(tmp_path, monkeypatch):
+    """Nothing will boot a VM, so nothing can hit the limit -- a long env is
+    perfectly fine for a bucket."""
+    env = _long_env(monkeypatch)
+    stack = Stack(env=env, resources=(ResourceDesired(id="uploads", kind="s3"),))
+    result = check_admission(stack, HostFacts(total_mem_mib=64_000.0), tmp_path, host_mem_mib=49_152.0)
+    assert result.ok is True, result.reason
+
+
+def test_an_env_exactly_at_the_limit_is_admitted(tmp_path, monkeypatch):
+    """The boundary is inclusive: `max_env_name_len()` characters BOOT
+    (verified against a real limactl -- 103 bytes of socket path is accepted,
+    104 is not), so refusing it here would be a false alarm."""
+    monkeypatch.setenv("LIMA_HOME", "/Users/somebody/.lima")
+    env = "e" * max_env_name_len()
+    result = check_admission(_ec2_stack(env), HostFacts(total_mem_mib=64_000.0), tmp_path, host_mem_mib=49_152.0)
+    assert result.ok is True, result.reason
+
+
+def test_a_longer_lima_home_makes_a_previously_fine_env_refused(tmp_path, monkeypatch):
+    """Machine-specific by construction: the identical canvas is admitted for
+    one user and refused for another whose home path is longer. This is why
+    the limit is derived rather than hardcoded."""
+    monkeypatch.setenv("LIMA_HOME", "/Users/somebody/.lima")
+    env = "e" * max_env_name_len()
+    facts, disk = HostFacts(total_mem_mib=64_000.0), tmp_path
+    assert check_admission(_ec2_stack(env), facts, disk, host_mem_mib=49_152.0).ok is True
+
+    monkeypatch.setenv("LIMA_HOME", "/Users/somebody-with-a-much-longer-name/.lima")
+    assert check_admission(_ec2_stack(env), facts, disk, host_mem_mib=49_152.0).ok is False
+
+
+def test_the_env_name_is_refused_ahead_of_a_memory_rejection(tmp_path, monkeypatch):
+    """Ordering, deliberately: an over-budget canvas can be applied after
+    freeing RAM, while this one can NEVER work as drawn -- so the terminal
+    problem is the one worth naming."""
+    env = _long_env(monkeypatch)
+    stack = Stack(env=env, resources=tuple(
+        ResourceDesired(id=f"web{i}", kind="ec2", fields={"instanceType": FieldValue(value="t3.medium")})
+        for i in range(20)
+    ))
+    result = check_admission(stack, HostFacts(total_mem_mib=64_000.0), tmp_path, host_mem_mib=8_192.0)
+    assert result.ok is False
+    assert "UNIX_PATH_MAX" in result.reason

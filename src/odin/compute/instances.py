@@ -140,6 +140,69 @@ def vm_name(env: str, instance_id: str) -> str:
     return f"odin-ec2-{env}-{instance_id}"
 
 
+# --- how long an env name may be, before limactl refuses every boot ---------
+#
+# `limactl` refuses an instance whose SSH control socket would not fit in a
+# unix socket address:
+#
+#   instance name "odin-ec2-<env>-<id>" too long: "/Users/you/.lima/
+#   odin-ec2-<env>-<id>/ssh.sock.1234567890123456" must be less than
+#   UNIX_PATH_MAX=104 characters, but is 107
+#
+# It is a HARD, TOTAL failure of every EC2 boot in that env -- and the message
+# names nothing the user chose, arriving only after a ~60s boot that was never
+# going to work. `max_env_name_len` is what lets Apply refuse it up front
+# instead (`reconcile/admission.py`).
+#
+# DERIVED, never hardcoded, because the limit is machine-specific: it is
+# `104` minus `$LIMA_HOME` (default `~/.lima`, so it moves with the username),
+# minus the two `/` separators, minus Lima's socket filename, minus odin's own
+# `odin-ec2-` + `-` + instance id. On a `/Users/fimbulwinter/.lima` home that
+# works out to 22 -- exactly the value the mesh work measured by hand.
+LIMA_UNIX_PATH_MAX = 104
+
+# Lima's SSH control socket, with the 16-digit suffix its own check appends.
+# The literal digits are Lima's placeholder, not a real value: only the LENGTH
+# is load-bearing here.
+LIMA_SSH_SOCK = "ssh.sock.1234567890123456"
+
+# Lima's own identifier cap, reported as `greater than maximum length (76
+# characters)`. In practice the socket-path rule above always bites first (any
+# non-empty LIMA_HOME makes it tighter), but taking the min keeps this honest
+# if Lima ever moves its sockets elsewhere.
+LIMA_MAX_IDENTIFIER_LEN = 76
+
+# An EC2 instance id is `i-` + 17 hex characters -- AWS's own modern shape,
+# minted by `gateway/models/ec2compute.py::_mint`. Pinned by
+# `tests/test_compute/test_vm_name_limit.py`, so the derivation can't drift
+# from the ids actually minted.
+INSTANCE_ID_LEN = 19
+
+
+def lima_home() -> Path:
+    """Where `limactl` keeps its instances: `$LIMA_HOME`, else `~/.lima` --
+    Lima's own resolution order, and the variable half of the length limit."""
+    return Path(os.environ.get("LIMA_HOME") or Path.home() / ".lima")
+
+
+def max_vm_name_len(home: Path | None = None) -> int:
+    """The longest instance name `limactl` will accept on this machine.
+
+    `len(f"{LIMA_HOME}/{name}/{LIMA_SSH_SOCK}") < LIMA_UNIX_PATH_MAX`, i.e.
+    at most `LIMA_UNIX_PATH_MAX - 1` bytes of path -- rearranged for `name`,
+    and capped by Lima's identifier limit."""
+    root = str(lima_home() if home is None else home)
+    fits_socket = LIMA_UNIX_PATH_MAX - 1 - len(root) - 2 - len(LIMA_SSH_SOCK)
+    return min(fits_socket, LIMA_MAX_IDENTIFIER_LEN)
+
+
+def max_env_name_len(home: Path | None = None) -> int:
+    """The longest env name whose EC2 VMs can boot on this machine -- the VM
+    name limit less everything `vm_name` adds around the env (`odin-ec2-`,
+    the separator, and the instance id)."""
+    return max_vm_name_len(home) - len(vm_name("", "")) - INSTANCE_ID_LEN
+
+
 def instance_config_path(root: Path, env: str, host_id: str) -> Path:
     """Where odin records the nebula config it LAST PUT ON a given VM.
 

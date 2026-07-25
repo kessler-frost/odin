@@ -34,6 +34,7 @@ from odin.runtime.colima import ColimaRuntime
 from odin.server import create_app
 from odin.spec.store import SpecStore
 from odin.spec.translate import canvas_to_stack
+from tests.containers import own_containers
 
 pytestmark = pytest.mark.integration
 
@@ -55,8 +56,8 @@ CANVAS = {
 def runtime():
     rt = ColimaRuntime()
     yield rt
-    for cid in rt.list_odin():
-        rt.stop(cid)
+    for name in own_containers(rt, ENV):
+        rt.stop(name)
     shutil.rmtree(_ODIN_ENV_DIR, ignore_errors=True)
 
 
@@ -123,5 +124,5 @@ def test_tf_apply_zero_drift_destroy(tmp_path, runtime):
 
         aws.gc(set())  # stop the backing containers -- nothing else owns them for this env
 
-    assert runtime.list_odin() == []
+    assert own_containers(runtime, ENV) == [], "every container this test made is gone"
     print(f"\ntofu apply wall time: {wall_apply:.2f}s")

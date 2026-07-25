@@ -63,6 +63,7 @@ from pathlib import Path
 from shutil import disk_usage
 
 from odin.aws.cache import DEFAULT_MEMORY_MIB as CACHE_MEMORY_MIB
+from odin.compute.instances import LIMA_UNIX_PATH_MAX, lima_home, max_env_name_len, vm_name
 from odin.compute.models import get_instance_type
 from odin.runtime.driver import HostFacts
 from odin.spec.models import ResourceDesired, Stack
@@ -276,6 +277,51 @@ def _pools(footprint: StackFootprint, host: HostFacts, host_mem_mib: float) -> t
     )
 
 
+def env_name_rejection(stack: Stack) -> str | None:
+    """The env name is too long for the Lima VM names its `ec2` nodes need --
+    or None, which is every other case.
+
+    THE TRAP, found while building the mesh proof: an `ec2` node becomes a
+    real Lima VM called `odin-ec2-{env}-{instance_id}`, and `limactl` refuses
+    any instance whose SSH control-socket path would not fit a unix socket
+    address. Past a certain env-name length EVERY boot in that env fails --
+    reliably and completely, which is the good part -- with a raw
+
+        instance name "..." too long: ".../ssh.sock.1234567890123456" must be
+        less than UNIX_PATH_MAX=104 characters, but is 107
+
+    that names a socket path, a Lima constant and a byte count, none of which
+    the user chose, ~60s into a boot that was never going to work. Refusing
+    at Apply, while they can still rename, is the whole point: this belongs
+    with the memory/disk guardrails for the same reason and in the same tone
+    -- state the number, state the fix.
+
+    ONLY WHEN AN EC2 NODE IS DRAWN. Nothing else in odin mints a VM name, so
+    a long env is perfectly fine for a canvas of buckets and queues and must
+    not be blocked.
+
+    The limit is MACHINE-SPECIFIC and derived, never hardcoded
+    (`compute/instances.py::max_env_name_len`): it moves with `$LIMA_HOME`
+    (default `~/.lima`, so with the username's length). Hardcoding the 22
+    that was measured on one Mac would refuse valid canvases on another and
+    admit doomed ones on a third."""
+    if not any(res.kind == "ec2" for res in stack.resources):
+        return None
+    limit = max_env_name_len()
+    if len(stack.env) <= limit:
+        return None
+    example = f"{lima_home()}/{vm_name(stack.env, 'i-<17 hex>')}/ssh.sock.<16 digits>"
+    return (
+        f"the environment name {stack.env!r} is {len(stack.env)} characters; an env with an ec2 node "
+        f"must be at most {limit} on this machine. Every ec2 node is a real Lima VM named "
+        f"`{vm_name('<env>', '<instance-id>')}`, and limactl refuses a name whose control-socket path "
+        f"({example}) would reach UNIX_PATH_MAX={LIMA_UNIX_PATH_MAX} bytes -- so every boot in this env "
+        f"would fail after ~60s with a limactl error naming none of this. Rename the env to {limit} "
+        f"characters or fewer, or point LIMA_HOME at a shorter path (the limit is {limit} because "
+        f"{lima_home()} is {len(str(lima_home()))} characters long)"
+    )
+
+
 def _existing_ancestor(path: Path) -> Path:
     """`disk_usage` needs a path that actually exists; the store root
     (`.odin/`) may not yet -- a brand-new install's very first Apply, before
@@ -323,6 +369,14 @@ def check_admission(
         "vm_mib": footprint.vm_mib,
         "vm_budget_mib": vm_pool.budget_mib,
     }
+
+    # FIRST, ahead of both memory pools: an over-budget canvas can be applied
+    # after freeing RAM, but this one can never work as drawn, so it is the
+    # more useful thing to be told. It is also free for every canvas without
+    # an ec2 node.
+    name_reason = env_name_rejection(stack)
+    if name_reason is not None:
+        return AdmissionResult(ok=False, reason=name_reason, budget_mib=container_pool.budget_mib, **numbers)
 
     rejected = next((pool for pool in pools if pool.exceeded), None)
     if rejected is not None:

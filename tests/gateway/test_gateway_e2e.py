@@ -11,7 +11,8 @@ Every test boots a real `create_app()` (real ColimaRuntime, real
 BackingAws-provisioned RustFS/goaws/dynalite, real gateway listener on
 ODIN_GATEWAY_PORT=0), applies a canvas, waits for /world healthy, drives
 real boto3/aws-cli SigV4 traffic through the gateway, destroys, and asserts
-zero odin containers survive. Marked `integration`: needs Colima/Docker
+every container IT created is gone (scoped to `OWN_ENVS` -- never the whole
+machine; see tests/containers.py). Marked `integration`: needs Colima/Docker
 with the backing + aws-cli images pulled.
 """
 from __future__ import annotations
@@ -30,8 +31,14 @@ from odin.aws.backings import BackingAws
 from odin.runtime.colima import ColimaRuntime
 from odin.server import create_app
 from odin.spec.store import SpecStore
+from tests.containers import own_containers
 
 pytestmark = pytest.mark.integration
+
+# Every env this file applies to -- and therefore everything its teardown is
+# allowed to stop. `default` is the implicit env of most slices; `a` and `b`
+# are the pair the foreign-creds slice creates by name.
+OWN_ENVS = ("default", "a", "b")
 
 # A phantom "worker" node stands in for a workload identity: unknown canvas
 # kind (dropped from Stack.resources by translate.py), but its iam edge to
@@ -131,8 +138,8 @@ def _run_aws_cli(port: int, access_key: str, secret_key: str, args: list[str]) -
 def runtime():
     rt = ColimaRuntime()
     yield rt
-    for cid in rt.list_odin():
-        rt.stop(cid)
+    for name in own_containers(rt, *OWN_ENVS):
+        rt.stop(name)
 
 
 def test_edge_grants_and_absence_denies(tmp_path, runtime):
@@ -161,7 +168,7 @@ def test_edge_grants_and_absence_denies(tmp_path, runtime):
         ), denied
 
         _destroy(client)
-    assert runtime.list_odin() == []
+    assert own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"
 
 
 def test_foreign_env_creds_denied(tmp_path, runtime):
@@ -189,7 +196,7 @@ def test_foreign_env_creds_denied(tmp_path, runtime):
 
         _destroy(client, env="a")
         _destroy(client, env="b")
-    assert runtime.list_odin() == []
+    assert own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"
 
 
 def test_container_crosses_to_gateway(tmp_path, runtime):
@@ -210,7 +217,7 @@ def test_container_crosses_to_gateway(tmp_path, runtime):
         assert "AccessDenied" in denied.stderr
 
         _destroy(client)
-    assert runtime.list_odin() == []
+    assert own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"
 
 
 def test_sqs_sns_dynamodb_through_gateway(tmp_path, runtime):
@@ -262,7 +269,7 @@ def test_sqs_sns_dynamodb_through_gateway(tmp_path, runtime):
         assert ddb_exc.value.response["Error"]["Code"] == "AccessDeniedException"
 
         _destroy(client)
-    assert runtime.list_odin() == []
+    assert own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"
 
 
 def test_latency_overhead(tmp_path, runtime):
@@ -301,4 +308,4 @@ def test_latency_overhead(tmp_path, runtime):
         )
 
         _destroy(client)
-    assert runtime.list_odin() == []
+    assert own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"

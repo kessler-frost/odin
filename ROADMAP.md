@@ -267,52 +267,6 @@ future decision against these points instead of re-deriving them:
       `DATABASE_URL_MESH`, whose overlay IP and port (5432) are BOTH sticky
       across recreation. Stabilising the host port is not planned: the mesh
       address is the stable one by design.
-- [x] **Canvas wiring — a node's `env` actually reaches its container.** An
-  `ecs` or `lambda` node's `env` map (static entries plus
-  `${{producer.ATTR}}` references) is delivered into the REAL container. Until
-  v0.7.1 the two bullets above ("a container consumes `${{cache.REDIS_URL}}`",
-  "a CONTAINER consumes `${{db.DATABASE_URL}}`") were **not achievable**: both
-  field-test agents confirmed the map was silently dropped — `spec/translate.py`
-  parsed it and lifted refs onto `ResourceDesired.refs`, but `agent/hcl.py`
-  emitted no `environment` block at all, `fabric.resolve` had no production
-  caller, and the container came up with the four `AWS_*` vars and nothing else.
-  So you could provision the whole production stack with no canvas-driven way
-  to hand the app its connection strings. Proven end to end by
-  `tests/simulate/test_ecs_env_wiring_e2e.py`: a real ECS task container speaks
-  a real Postgres SSLRequest and a real Redis `PING` to the addresses its
-  canvas `env` refs resolved to.
-  - **Injected at container LAUNCH, not through the generated HCL**
-    (`gateway/wiring.py`), on the same seam that already injects the workload's
-    issued gateway credentials, keyed off the `odin:node` tag. A resolved
-    `DATABASE_URL` carries the database password, so putting it in
-    `container_definitions`/`environment` would write it in plaintext into
-    `main.tf` AND `terraform.tfstate`; it would also drift on every plan (the
-    value embeds a Docker-assigned host port) and freeze a stale port into
-    state. Facts come from the gateway's own live records, not from World,
-    because World is not written until the reconciler's next tick — after the
-    apply that creates both nodes.
-  - **Ordering** comes from a real `depends_on` on the consumer's resource —
-    the one thing an interpolated value would have given for free — so it
-    carries no values.
-  - **A ref that cannot be resolved fails honestly**, never an empty string: the
-    ECS task goes STOPPED / the Lambda `State: Failed` with a reason naming the
-    variable, the producer and what the producer does publish, which surfaces as
-    a `crashed` node with that verdict AND (since the service stays short of
-    desired) a FAILED apply. A ref naming a node that isn't on the canvas at all
-    is reported in the apply response's `unsupported` at build time.
-  - **v1 limits, recorded rather than hidden:** there is still no `env` editor
-    in the UI's ConfigPanel for an ecs node — the map must be authored in the
-    canvas JSON (`odin canvas set`). Only `rds`, `elasticache` and `alb`
-    publish facts the injector resolves, so only those can be referenced from
-    `env` — an `ec2` node's `${{web1.PRIVATE_IP}}` / `${{web1.MESH_IP}}`
-    (added the same release, see the mesh bullets below) are World facts only,
-    and `gateway/wiring.py` does not resolve them. Values are read at LAUNCH,
-    so editing a node's `env` only reaches a task once that task is replaced
-    (real ECS behaves the same way — a taskdef change forces a new deployment);
-    a re-Apply that changes nothing tofu can see will not restart it.
-    `ResourceDesired.refs` does not record whether a ref came from `env` or from
-    a top-level field, so a top-level `${{...}}` field also arrives as an env
-    var named after that field.
   - Security groups: what IS enforced (W2.6) and what is not.
     - **EC2 VMs**: an instance's ASSIGNED security groups gate its overlay
       traffic — the UNION of their compiled rules is its nebula firewall
@@ -491,6 +445,59 @@ future decision against these points instead of re-deriving them:
     SG-rule-filtered connection — the host itself has no overlay presence
     to test from. Cross-Mac reachability (a second machine's mesh) is still
     open — see M7.
+- [x] **Canvas wiring — a node's `env` actually reaches its container.** An
+  `ecs` or `lambda` node's `env` map (static entries plus
+  `${{producer.ATTR}}` references) is delivered into the REAL container. Until
+  v0.7.1 the two bullets above ("a container consumes `${{cache.REDIS_URL}}`",
+  "a CONTAINER consumes `${{db.DATABASE_URL}}`") were **not achievable**: both
+  field-test agents confirmed the map was silently dropped — `spec/translate.py`
+  parsed it and lifted refs onto `ResourceDesired.refs`, but `agent/hcl.py`
+  emitted no `environment` block at all, `fabric.resolve` had no production
+  caller, and the container came up with the four `AWS_*` vars and nothing else.
+  So you could provision the whole production stack with no canvas-driven way
+  to hand the app its connection strings. Proven end to end by
+  `tests/simulate/test_ecs_env_wiring_e2e.py`: a real ECS task container speaks
+  a real Postgres SSLRequest and a real Redis `PING` to the addresses its
+  canvas `env` refs resolved to.
+  - **Injected at container LAUNCH, not through the generated HCL**
+    (`gateway/wiring.py`), on the same seam that already injects the workload's
+    issued gateway credentials, keyed off the `odin:node` tag. A resolved
+    `DATABASE_URL` carries the database password, so putting it in
+    `container_definitions`/`environment` would write it in plaintext into
+    `main.tf` AND `terraform.tfstate`; it would also drift on every plan (the
+    value embeds a Docker-assigned host port) and freeze a stale port into
+    state. Facts come from the gateway's own live records, not from World,
+    because World is not written until the reconciler's next tick — after the
+    apply that creates both nodes.
+  - **Ordering** comes from a real `depends_on` on the consumer's resource —
+    the one thing an interpolated value would have given for free — so it
+    carries no values.
+  - **A ref that cannot be resolved fails honestly**, never an empty string: the
+    ECS task goes STOPPED / the Lambda `State: Failed` with a reason naming the
+    variable, the producer and what the producer does publish, which surfaces as
+    a `crashed` node with that verdict AND (since the service stays short of
+    desired) a FAILED apply. A ref naming a node that isn't on the canvas at all
+    is reported in the apply response's `unsupported` at build time.
+  - **v1 limits, recorded rather than hidden:** there is still no `env` editor
+    in the UI's ConfigPanel for an ecs node — the map must be authored in the
+    canvas JSON (`odin canvas set`). Only `rds`, `elasticache`, `alb` and
+    `ec2` publish facts the injector resolves, so only those can be referenced
+    from `env`. **`ec2` was the one that had to be added afterwards**: the
+    mesh work published `${{web1.PRIVATE_IP}}` / `${{web1.MESH_IP}}` into
+    World and the wiring work built the injector IN PARALLEL, coordinating
+    only on the names — so for one release the facts demonstrably existed and
+    no workload could consume them. The injector now applies the projection's
+    own gates verbatim (running-only, `odin:node`-tagged, and
+    `reconcile/mesh_health.py` deciding whether `MESH_IP` survives), so a ref
+    resolves exactly when `/world` shows that fact — and a withheld `MESH_IP`
+    (dead lighthouse) fails the ref honestly rather than injecting an empty or
+    stale address. Values are read at LAUNCH,
+    so editing a node's `env` only reaches a task once that task is replaced
+    (real ECS behaves the same way — a taskdef change forces a new deployment);
+    a re-Apply that changes nothing tofu can see will not restart it.
+    `ResourceDesired.refs` does not record whether a ref came from `env` or from
+    a top-level field, so a top-level `${{...}}` field also arrives as an env
+    var named after that field.
 - [x] **CloudWatch Logs — the log sink (W2.1).** DONE 2026-07-24: the `logs`
   node is real. `aws_cloudwatch_log_group` is a full gateway model
   (Create/Delete/DescribeLogGroups, Put/DeleteRetentionPolicy, tag CRUD →
@@ -768,6 +775,23 @@ future decision against these points instead of re-deriving them:
     substrate's own real container memory cap; s3/sqs/sns/dynamodb = once per
     ENV, not per node (they share one backing container);
     vpc/subnet/sg/iam_role/ecr = zero.
+  - **It also refuses an env name too long to make a Lima VM name** (v0.7.1,
+    found while building the mesh proof). An `ec2` node becomes a real Lima VM
+    called `odin-ec2-{env}-{instance-id}`, and `limactl` refuses any instance
+    whose SSH control-socket path (`$LIMA_HOME/<vm>/ssh.sock.<16 digits>`)
+    would reach `UNIX_PATH_MAX=104` bytes. Past a certain env length EVERY
+    boot in that env failed — reliably, which is the good part — with a raw
+    limactl error naming a socket path and a Lima constant, ~60s into a boot
+    that was never going to work. Apply now refuses up front, naming the env,
+    its length, the actual limit and both ways out (rename, or a shorter
+    `LIMA_HOME`). **The limit is DERIVED, not hardcoded**
+    (`compute/instances.py::max_env_name_len`), because it is machine-specific:
+    it is 104 less `$LIMA_HOME` — whose default `~/.lima` moves with the
+    username's length — less the separators, Lima's socket filename, odin's
+    `odin-ec2-` prefix and the 19-character instance id. That works out to **22
+    on a `/Users/fimbulwinter/.lima` home**, exactly the figure the mesh work
+    measured by hand; a longer home name gives a shorter limit. A canvas with
+    no `ec2` node is never blocked by it — nothing else mints a VM name.
   - **v1 limits, recorded rather than hidden:** an unknown total for either
     pool (Colima not running; `os.sysconf` unanswered) SKIPS that pool's check
     instead of printing a confident wrong number. It is a STATIC per-canvas
