@@ -68,7 +68,7 @@ def test_apply_json_mode_prints_full_body(runner):
     respx.post(f"{BASE}/apply-full").mock(return_value=httpx.Response(200, json=APPLIED))
     result = runner.invoke(app, ["apply", "-o", "json"])
     assert result.exit_code == 0
-    assert json.loads(result.stdout) == APPLIED
+    assert json.loads(result.stdout) == {**APPLIED, "not_covered": []}
 
 
 @respx.mock
@@ -90,7 +90,7 @@ def test_apply_tf_failed_json_mode_still_exits_nonzero(runner):
     respx.post(f"{BASE}/apply-full").mock(return_value=httpx.Response(200, json=TF_FAILED))
     result = runner.invoke(app, ["apply", "-o", "json"])
     assert result.exit_code == 1
-    assert json.loads(result.stdout) == TF_FAILED
+    assert json.loads(result.stdout) == {**TF_FAILED, "not_covered": ["note", "ecs"]}
 
 
 @respx.mock
@@ -114,7 +114,33 @@ def test_apply_unhealthy_json_mode_still_exits_nonzero(runner):
     respx.post(f"{BASE}/apply-full").mock(return_value=httpx.Response(200, json=SERVICES_UNHEALTHY))
     result = runner.invoke(app, ["apply", "-o", "json"])
     assert result.exit_code == 1
-    assert json.loads(result.stdout) == SERVICES_UNHEALTHY
+    assert json.loads(result.stdout) == {**SERVICES_UNHEALTHY, "not_covered": []}
+
+
+@respx.mock
+def test_the_documented_ci_gate_catches_a_skipped_node(runner):
+    """MISLEAD-1: the README told CI to gate on `.unsupported`, but a node
+    whose KIND odin doesn't model lands in `.skipped` -- so
+    `jq -e '.unsupported | length == 0'` was TRUE, exit 0, while two drawn
+    nodes were silently dropped. One field now carries both."""
+    dropped = {**APPLIED, "skipped": ["kinesis", "notarealservice"]}
+    respx.get(f"{BASE}/canvas").mock(return_value=httpx.Response(200, json=GRAPH))
+    respx.post(f"{BASE}/apply-full").mock(return_value=httpx.Response(200, json=dropped))
+    body = json.loads(runner.invoke(app, ["apply", "-o", "json"]).stdout)
+    assert body["unsupported"] == []                       # the old gate: still empty
+    assert body["not_covered"] == ["kinesis", "notarealservice"]   # the gate that works
+    assert len(body["not_covered"]) != 0
+
+
+@respx.mock
+def test_not_covered_unions_both_arrays_without_replacing_either(runner):
+    both = {**APPLIED, "skipped": ["kinesis"], "unsupported": ["db1 (rds): mysql not supported"]}
+    respx.get(f"{BASE}/canvas").mock(return_value=httpx.Response(200, json=GRAPH))
+    respx.post(f"{BASE}/apply-full").mock(return_value=httpx.Response(200, json=both))
+    body = json.loads(runner.invoke(app, ["apply", "-o", "json"]).stdout)
+    assert body["skipped"] == ["kinesis"]
+    assert body["unsupported"] == ["db1 (rds): mysql not supported"]
+    assert body["not_covered"] == ["kinesis", "db1 (rds): mysql not supported"]
 
 
 @respx.mock

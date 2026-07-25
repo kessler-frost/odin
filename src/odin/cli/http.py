@@ -41,6 +41,15 @@ OUTPUT = typer.Option(
     help="Output format: human-readable text, or raw JSON on stdout for piping.",
 )
 
+# For commands whose OUTPUT IS a document rather than a report. `odin canvas
+# get` defaulted to a one-line summary, so the README's own
+# `odin canvas get | jq …` example died on the first pipe (fresh-user
+# FRICTION-1) -- a default that breaks the documented use of the command.
+JSON_OUTPUT = typer.Option(
+    OutputFormat.json, "-o", "--output",
+    help="Output format: raw JSON on stdout (the default — this command's output is a document), or `-o text` for a summary.",
+)
+
 
 def fail(message: str, code: int = 1) -> typer.Exit:
     """Echo `message` to stderr and return an Exit for the caller to raise."""
