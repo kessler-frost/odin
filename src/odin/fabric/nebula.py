@@ -132,6 +132,13 @@ _PORT_PIN_ENV = "ODIN_LIGHTHOUSE_PORT"
 # for a loaded box, not a boot-time budget.
 _LIGHTHOUSE_START_TIMEOUT = 1.0
 
+# The lighthouse's own config file, inside its env's nebula directory. Named
+# once because it is now load-bearing in TWO directions: `LighthouseManager`
+# writes it, and `orphaned_lighthouses` identifies a leaked process by the
+# fact that its `-config` argument points at a copy of this file that no
+# longer exists.
+LIGHTHOUSE_CONFIG = "lighthouse-config.yml"
+
 # A documented allow-all default. Real per-kind/group ACLs (derived from canvas
 # security-group / IAM edges via sg_rules_to_firewall) are an M7 hardening item;
 # PKI already gives the per-env boundary, the firewall scopes traffic on-mesh.
@@ -654,7 +661,7 @@ class LighthouseManager:
         return _nebula_dir(root, env) / "lighthouse.pid"
 
     def _config_path(self, root: Path, env: str) -> Path:
-        return _nebula_dir(root, env) / "lighthouse-config.yml"
+        return _nebula_dir(root, env) / LIGHTHOUSE_CONFIG
 
     def _log_path(self, root: Path, env: str) -> Path:
         return _nebula_dir(root, env) / "lighthouse.log"
@@ -800,6 +807,60 @@ class LighthouseManager:
                 pass
         pidfile.unlink(missing_ok=True)
         log.info("stopped nebula lighthouse for env %r", env)
+
+
+def orphaned_lighthouses(root: Path, runner=None) -> list[tuple[int, Path]]:
+    """`(pid, config path)` for every live `nebula` lighthouse process THIS
+    store started whose config file is GONE -- an env destroyed out from under
+    a process that is still holding its UDP port.
+
+    Field test 3 HIGH-A: a VPC + a single S3 bucket (no EC2 at all) leaked one
+    lighthouse and one port on EVERY apply/destroy cycle -- three orphans
+    measured on `*:4343`, `*:4344`, `*:4345`, one of them 8m20s old. About a
+    hundred cycles would exhaust the 4342-4441 pool, i.e. re-create by
+    accumulation exactly the class of failure per-env ports exist to prevent.
+    The primary fix is that teardown now stops the lighthouse before deleting
+    its directory (`gateway/models/ec2net.py::_delete_vpc`); THIS is the
+    backstop for one that already leaked, and for a crash between the two.
+
+    Identified by evidence, never by name: the process's own `-config`
+    argument must point INSIDE this store's root, must be a
+    `LIGHTHOUSE_CONFIG` file, and that file must no longer exist. A live env's
+    lighthouse can therefore never match, another odin store's can never
+    match, and a user's own unrelated `nebula` can never match. The pid comes
+    from the same `ps` read that proved the process is nebula, so it cannot be
+    a recycled pid belonging to something else -- which is more than the
+    pidfile path can say."""
+    marker = f"{Path(root).resolve()}/"
+    proc = (runner or _default_runner)(["ps", "-Ao", "pid=,args="])
+    found: list[tuple[int, Path]] = []
+    for line in proc.stdout.splitlines():
+        pid, _, args = line.strip().partition(" ")
+        tokens = args.split()
+        if not pid.isdigit() or "-config" not in tokens[:-1] or Path(tokens[0]).name != "nebula":
+            continue
+        config = tokens[tokens.index("-config") + 1]
+        if config.startswith(marker) and config.endswith(f"/{LIGHTHOUSE_CONFIG}") and not Path(config).exists():
+            found.append((int(pid), Path(config)))
+    return found
+
+
+def reap_orphaned_lighthouses(root: Path, runner=None) -> list[int]:
+    """SIGTERM every `orphaned_lighthouses` process, returning the pids it
+    reaped. Run at server startup (`odin.server`), the same one-shot
+    crash-recovery cadence as `ec2compute.reap_orphaned_vms` -- and, like it,
+    never able to touch anything it has not positively identified as odin's
+    own leak."""
+    reaped = []
+    for pid, config in orphaned_lighthouses(root, runner):
+        log.warning("reaping orphaned nebula lighthouse pid %s (its config %s is gone)", pid, config)
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError) as exc:
+            log.warning("could not stop orphaned lighthouse pid %s: %s", pid, exc)
+            continue
+        reaped.append(pid)
+    return reaped
 
 
 def _ec2net_networks(root: Path, env: str) -> tuple[list[VpcNetwork], list[SgFirewall]]:

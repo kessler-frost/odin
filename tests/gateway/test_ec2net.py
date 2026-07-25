@@ -22,6 +22,7 @@ from starlette.responses import Response
 
 from odin.gateway import synth
 from odin.gateway.classify import classify
+from odin.gateway.models import ec2net as ec2net_mod
 from odin.gateway.stores import SynthStores
 
 from .conftest import split_url
@@ -334,6 +335,27 @@ def test_delete_last_vpc_drops_the_envs_nebula_ca(sink, ec2, stores):
 
     assert _answer(stores, sink.call(lambda: ec2.delete_vpc(VpcId=vpc_b))).status_code == 200
     assert not nebula_dir.exists()
+
+
+def test_delete_last_vpc_stops_the_envs_lighthouse_before_deleting_its_config(sink, ec2, stores, monkeypatch):
+    """Field test 3 HIGH-A: this used to delete the directory and walk away,
+    stranding a REAL nebula process holding a REAL UDP port -- once per
+    apply/destroy cycle, on an env with no EC2 at all (so the "last VM leaves"
+    stop never ran). ~100 cycles exhausts the 4342-4441 pool.
+
+    Ordering is the whole fix: `ensure_stopped` finds the process through the
+    pidfile INSIDE that directory, so it has to run while it still exists."""
+    stopped: list[tuple] = []
+
+    def spy(self, root, env):
+        stopped.append((Path(root), env, (Path(root) / env / "nebula").exists()))
+
+    monkeypatch.setattr(ec2net_mod.LighthouseManager, "ensure_stopped", spy)
+    vpc_id = _create_vpc(stores, sink, ec2)
+
+    assert _answer(stores, sink.call(lambda: ec2.delete_vpc(VpcId=vpc_id))).status_code == 200
+    assert stopped == [(stores.root, ENV, True)], "stopped, and while its pidfile could still be found"
+    assert not (stores.root / ENV / "nebula").exists()
 
 
 # --- Tags (EC2's own wire shape) ------------------------------------------------

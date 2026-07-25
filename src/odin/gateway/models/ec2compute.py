@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import logging
 import os
 import secrets
@@ -95,6 +96,7 @@ from odin.gateway import errors
 from odin.gateway.keys import KeyStore, workload_env
 from odin.gateway.models import ec2net
 from odin.gateway.stores import NO_CHANGE, SynthStores
+from odin.simulate.workspace import tf_dir
 
 log = logging.getLogger("odin.gateway.ec2compute")
 
@@ -1035,6 +1037,114 @@ def _refuse_to_report_success(env: str, stores: SynthStores, actions: dict[str, 
         f"change. Cause is in the odin server log (`nebula ... failed on <vm>`) and in "
         f"`{Path(stores.root) / env / 'nebula'}`."
     )
+
+
+class ReclaimFailed(RuntimeError):
+    """`/destroy` could not delete a VM it is responsible for, so the env is
+    NOT destroyed. Field test 3 HIGH-B's headline: three real Lima VMs kept
+    Running while destroy answered `destroyed / tf ok` in 1.7 seconds."""
+
+
+def reclaim_env_instances(stores: SynthStores, env: str, vm: InstanceVm | None = None) -> list[str]:
+    """Delete every VM this env's gateway store still claims, and forget the
+    records. Returns the VM names it reclaimed. RAISES `ReclaimFailed` if any
+    VM could not be deleted -- teardown does not get to report success over a
+    machine that is still running.
+
+    This is `/destroy`'s teardown backstop, and field test 3 HIGH-B is why it
+    has to exist. `kill -9` on tofu mid-apply (Ctrl-C, an OOM, a laptop going
+    to sleep) leaves tofu's state empty while the VMs it already created keep
+    Running. `tofu destroy` then has nothing to destroy and honestly reports
+    success -- so destroy returned `destroyed / tf ok` in 1.7s with three real
+    VMs up, `/world` still listing them, and NO supported command able to
+    reclaim them: a second destroy, the empty-canvas Apply, and a server
+    restart all spared them, because `reap_orphaned_vms` builds its "expected"
+    set from the very store that still claimed them. Only `limactl delete` by
+    hand worked.
+
+    Destroy is unambiguous about intent -- the whole env is going away -- so
+    it does not need tofu's state to know what to reclaim: anything the
+    gateway store still holds is by definition no longer wanted. Idempotent
+    (`InstanceVm.delete` is a no-op on an absent name), exact-name only, and
+    it never looks at a VM this env's store does not name.
+    """
+    machine = vm or InstanceVm()
+    reclaimed, failed = [], []
+    for record in _records(stores, env, "instance"):
+        instance_id = record["instance_id"]
+        name = vm_name(env, instance_id)
+        try:
+            machine.delete(name)
+        except Exception as exc:  # noqa: BLE001 -- reported, never swallowed; see ReclaimFailed
+            log.error("destroy could not reclaim VM %s (env %s): %s", name, env, exc)
+            failed.append(f"{name} ({exc})")
+            continue
+        stores.tags.set(env, f"ec2:{instance_id}", {})
+        stores.ec2compute.delete(env, _key("instance", instance_id))
+        reclaimed.append(name)
+    if reclaimed:
+        log.warning("destroy reclaimed %d EC2 VM(s) tofu no longer knew about: %s", len(reclaimed), reclaimed)
+    if failed:
+        raise ReclaimFailed(
+            f"env {env!r} is NOT destroyed: {len(failed)} EC2 VM(s) are still running and could not be "
+            f"deleted -- {'; '.join(failed)}. They are real Lima VMs holding real memory and disk. "
+            f"Retry `odin destroy`, or remove them by exact name with `limactl delete --force <name>`."
+        )
+    return reclaimed
+
+
+def tf_forgotten_instances(stores: SynthStores, env: str) -> list[str]:
+    """Instance ids this env's gateway store still claims that tofu's OWN
+    state no longer holds -- unreachable by any terraform operation, forever,
+    and therefore real VMs nothing will ever clean up.
+
+    The crux field test 3 HIGH-B named: `reap_orphaned_vms` builds its
+    "expected" set from the store, so when reality and the store disagree the
+    store is trusted -- and after an interrupted apply the store is precisely
+    the thing that is wrong. tofu's state is the second witness. Read
+    STRICTLY: a state file that is missing or unreadable is NO evidence (a
+    fresh env, a workspace never materialized) and yields nothing; only a
+    state tofu itself wrote, which parses, and which really does not name the
+    instance, counts."""
+    state = tf_dir(stores.root, env) / "terraform.tfstate"
+    if not state.exists():
+        return []
+    text = state.read_text().strip()
+    if not text:
+        return []  # pre-created 0600 but never written: tofu has said nothing yet
+    parsed = json.loads(text)
+    known = {
+        instance.get("attributes", {}).get("id")
+        for resource in parsed.get("resources", []) if resource.get("type") == "aws_instance"
+        for instance in resource.get("instances", [])
+    }
+    return [r["instance_id"] for r in _records(stores, env, "instance") if r["instance_id"] not in known]
+
+
+def reclaim_tf_forgotten_vms(stores: SynthStores, envs: list[str], vm: InstanceVm | None = None) -> list[str]:
+    """Startup half of the same fix: delete the VMs of instances tofu's state
+    has forgotten, and forget their records, so `/world` and the store agree
+    with reality again. Runs beside `reap_orphaned_vms` -- that one reclaims a
+    VM no record names, this one reclaims a record no TERRAFORM STATE names,
+    and between them the two disagreements a crashed apply can leave are both
+    covered. Takes the app's OWN `SynthStores` (never a fresh one over the
+    same directory) so the records it forgets are forgotten everywhere at
+    once. Never raises: a startup safety net must not stop a server from
+    starting (unlike `/destroy`, which the user is watching)."""
+    machine = vm or InstanceVm()
+    reclaimed = []
+    for env in envs:
+        for instance_id in tf_forgotten_instances(stores, env):
+            name = vm_name(env, instance_id)
+            log.warning(
+                "reclaiming EC2 VM %r: env %r's gateway store claims it, but tofu's state does not -- "
+                "no terraform operation can ever reach it again (an interrupted apply)", name, env,
+            )
+            machine.delete(name)
+            stores.tags.set(env, f"ec2:{instance_id}", {})
+            stores.ec2compute.delete(env, _key("instance", instance_id))
+            reclaimed.append(name)
+    return reclaimed
 
 
 def reap_orphaned_vms(root: Path, envs: list[str], vm: InstanceVm | None = None) -> list[str]:

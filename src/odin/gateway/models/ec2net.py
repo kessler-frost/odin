@@ -84,7 +84,7 @@ from starlette.responses import Response
 
 from odin.aws.backings import ACCOUNT, REGION
 from odin.fabric.models import FirewallRules
-from odin.fabric.nebula import ensure_network, sg_rules_to_firewall
+from odin.fabric.nebula import LighthouseManager, ensure_network, sg_rules_to_firewall
 from odin.gateway import errors
 from odin.gateway.stores import SynthStores
 
@@ -459,6 +459,18 @@ def _delete_vpc(params: dict[str, str], env: str, stores: SynthStores) -> Respon
     # lives at .odin/{env}/nebula/ and belongs to the env's VPCs. When the
     # last VPC goes, the CA goes too -- a recreated VPC mints a fresh one.
     if not _records(stores, env, "vpc"):
+        # ...and so does the lighthouse PROCESS, which must be stopped BEFORE
+        # its directory disappears: `ensure_stopped` finds it through the
+        # pidfile that lives in there, so deleting first strands a real
+        # process holding a real UDP port with nothing left able to name it.
+        # Field test 3 HIGH-A: an env of a VPC + one S3 bucket (no EC2 at all,
+        # so `ec2compute._finish_terminate`'s "last VM leaves" stop never ran)
+        # leaked one lighthouse and one port per apply/destroy cycle -- three
+        # orphans measured, and ~100 cycles would exhaust the whole 4342-4441
+        # range. `fabric/nebula.py::reap_orphaned_lighthouses` is the startup
+        # backstop for one that leaked before this existed, or for a crash
+        # between these two lines.
+        LighthouseManager().ensure_stopped(stores.root, env)
         shutil.rmtree(stores.root / env / "nebula", ignore_errors=True)
     return _response("DeleteVpc", "<return>true</return>")
 

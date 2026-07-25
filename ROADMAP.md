@@ -321,14 +321,23 @@ future decision against these points instead of re-deriving them:
         a change.
       - **What a revoke does NOT reach: a connection already open through
         it.** New connections are refused the moment the peer re-handshakes
-        (sub-second, see the convergence note below). But nebula's firewall
-        keeps a conntrack entry per flow and re-validates it only when its
-        OWN rules change — not when the peer's certificate does — so a
-        long-lived connection that keeps sending can outlive the revoke, up
-        to nebula's conntrack timeout for that protocol. Editing the
-        admitting group's RULES (which does bump the rule version, forcing
-        re-validation) or restarting the admitting member closes it at once.
-        Real AWS security groups behave the same way for established flows.
+        — measured at 0.11s in the test above, i.e. before Apply has even
+        returned. But nebula's firewall keeps a conntrack entry per flow and
+        re-validates it only when its OWN ruleset version changes, not when a
+        peer's certificate does (the shipped binary's own diagnostics say so:
+        `keeping old conntrack entry, does match new ruleset` vs `dropping
+        old conntrack entry, does not match new ruleset`, and
+        `firewall rulesVersion has overflowed, resetting conntrack`). So a
+        long-lived flow that keeps sending can outlive the revoke on the
+        ADMITTING member, up to `firewall.conntrack.tcp_timeout` /
+        `udp_timeout` / `default_timeout` — nebula's defaults, which odin
+        does not override. Editing the admitting group's RULES (that DOES
+        bump the ruleset version, forcing re-validation against the peer's
+        new certificate) or restarting the admitting member closes it
+        immediately. Real AWS security groups have the same property for
+        established flows, so this is a shared limit rather than a
+        substitution gap — but it is the one thing "revoked" does not mean
+        here, and it is stated rather than assumed.
       - **A membership change that cannot be applied FAILS the Apply.**
         `refresh_nebula` still never raises (mesh wiring must not fail an
         instance boot), but a `failed` is no longer a log line under a green
