@@ -371,6 +371,80 @@ def test_ingest_tail_is_per_stream(stores):
     assert [e["message"] for e in logsctl.stored_events(stores, ENV, "/ecs/web", 10)] == ["a1", "b1"]
 
 
+# --- ingest_tail re-synchronises on CONTENT, not on a line count -----------
+#
+# v0.7.1. The cursor used to be "how many lines of this stream have I seen",
+# which silently assumed line N of this tail is line N of the last one. Two
+# real events break that assumption, and both are covered below.
+
+
+def test_ingest_tail_does_not_duplicate_when_earlier_lines_gain_neighbours(stores):
+    """The exact shift v0.7.1's stderr fix caused: `docker logs` used to be
+    read stdout-only, so a stream's history is stdout lines alone; the next
+    read of the SAME container now returns both streams merged, and the
+    already-shipped lines are no longer at the offsets a line count recorded.
+
+    Nothing already shipped may be duplicated, and output produced AFTER the
+    last ingest must still land."""
+    logsctl.ingest_tail(stores, ENV, GROUP, STREAM, "out1\nout2\nout3\n")
+
+    merged = "out1\nERR-a\nout2\nERR-b\nout3\nERR-c\n"
+    assert logsctl.ingest_tail(stores, ENV, GROUP, STREAM, merged) == 1
+
+    # `ERR-c` is genuinely new (it follows the last line we had). `ERR-a`/
+    # `ERR-b` are BACKLOG the merged read revealed retroactively -- history
+    # odin structurally never had, deliberately not spliced in at "now".
+    assert [e["message"] for e in logsctl.stored_events(stores, ENV, GROUP, 10)] == [
+        "out1", "out2", "out3", "ERR-c",
+    ]
+    # ...and the re-read is still idempotent afterwards.
+    assert logsctl.ingest_tail(stores, ENV, GROUP, STREAM, merged) == 0
+
+
+def test_ingest_tail_keeps_shipping_after_the_tail_window_slides(stores):
+    """A bounded `docker logs --tail N` read slides once a container has
+    printed more than N lines: the tail's FIRST line is no longer the
+    stream's first line. A line-count cursor reads `lines[N:]` of an N-line
+    tail -- empty -- and the stream goes permanently deaf. Anchoring on
+    content re-synchronises on the overlap instead."""
+    logsctl.ingest_tail(stores, ENV, GROUP, STREAM, "l1\nl2\nl3\n")
+
+    assert logsctl.ingest_tail(stores, ENV, GROUP, STREAM, "l2\nl3\nl4\n") == 1
+    assert logsctl.ingest_tail(stores, ENV, GROUP, STREAM, "l3\nl4\nl5\n") == 1
+    assert [e["message"] for e in logsctl.stored_events(stores, ENV, GROUP, 10)] == [
+        "l1", "l2", "l3", "l4", "l5",
+    ]
+
+
+def test_ingest_tail_ships_everything_when_a_replacement_shares_no_lines(stores):
+    logsctl.ingest_tail(stores, ENV, GROUP, STREAM, "old1\nold2\n")
+    assert logsctl.ingest_tail(stores, ENV, GROUP, STREAM, "new1\nnew2\n") == 2
+    assert [e["message"] for e in logsctl.stored_events(stores, ENV, GROUP, 10)] == [
+        "old1", "old2", "new1", "new2",
+    ]
+
+
+def test_reset_cursor_lets_a_replaced_container_reship_identical_output(stores):
+    """A redeploy's fresh container often prints a byte-identical banner, which
+    content anchoring would otherwise read as "already seen". `reset_cursor` is
+    the explicit signal that the history before it belongs to a container that
+    is gone -- it voids the ANCHOR, never the stored log."""
+    logsctl.ingest_tail(stores, ENV, GROUP, STREAM, "boot\nready\n")
+    logsctl.reset_cursor(stores, ENV, GROUP, STREAM)
+
+    assert logsctl.ingest_tail(stores, ENV, GROUP, STREAM, "boot\nready\n") == 2
+    assert [e["message"] for e in logsctl.stored_events(stores, ENV, GROUP, 10)] == [
+        "boot", "ready", "boot", "ready",
+    ]
+    # ...and the fresh container's own re-reads dedup normally again.
+    assert logsctl.ingest_tail(stores, ENV, GROUP, STREAM, "boot\nready\nserved\n") == 1
+
+
+def test_reset_cursor_on_a_stream_that_never_shipped_anything_is_harmless(stores):
+    logsctl.reset_cursor(stores, ENV, GROUP, STREAM)
+    assert logsctl.ingest_tail(stores, ENV, GROUP, STREAM, "first\n") == 1
+
+
 def test_ring_buffer_caps_stored_events_per_group_dropping_the_oldest(stores, monkeypatch):
     monkeypatch.setattr(logsctl, "MAX_EVENTS_PER_GROUP", 3)
     logsctl.ingest(stores, ENV, GROUP, STREAM, [f"m{i}" for i in range(5)])

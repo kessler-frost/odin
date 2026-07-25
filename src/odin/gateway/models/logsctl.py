@@ -141,8 +141,13 @@ def _events_key(group: str) -> str:
     return f"events:{group}"
 
 
-def _cursor_key(group: str, stream: str) -> str:
-    return f"cursor:{group}:{stream}"
+def _barrier_key(group: str, stream: str) -> str:
+    """How many of a stream's stored events predate the container currently
+    behind it -- see `reset_cursor`. NOT the old `cursor:` key, deliberately:
+    that one held a LINE COUNT with incompatible meaning, so a store written
+    before v0.7.1 must not have it read as a barrier. Legacy `cursor:` keys
+    are inert (nothing reads them) and swept by `_delete_log_group`."""
+    return f"barrier:{group}:{stream}"
 
 
 def _group(stores: SynthStores, env: str, name: str) -> dict | None:
@@ -237,8 +242,9 @@ def _delete_log_group(payload: dict, env: str, stores: SynthStores, now: float) 
     name = payload.get("logGroupName") or ""
     if _group(stores, env, name) is None:
         return _not_found(f"The specified log group does not exist: {name}")
+    owned = (f"stream:{name}:", f"barrier:{name}:", f"cursor:{name}:")  # `cursor:` is pre-v0.7.1 residue
     for key in list(stores.logsctl.items(env)):
-        if key in (_group_key(name), _events_key(name)) or key.startswith(f"stream:{name}:") or key.startswith(f"cursor:{name}:"):
+        if key in (_group_key(name), _events_key(name)) or key.startswith(owned):
             stores.logsctl.delete(env, key)
     _set_tags(stores, env, name, {})
     return _json({})
@@ -518,47 +524,98 @@ def ingest(stores: SynthStores, env: str, group: str, stream: str, lines: list[s
     return len(lines)
 
 
+def _subsequence_end(needle: list[str], haystack: list[str]) -> int | None:
+    """Where `needle` finishes inside `haystack` when matched greedily, in
+    order, but NOT necessarily contiguously -- the index just past its last
+    element, or None when `needle` isn't a subsequence of `haystack` at all.
+    An empty `needle` finishes at 0."""
+    position = 0
+    for item in needle:
+        while position < len(haystack) and haystack[position] != item:
+            position += 1
+        if position == len(haystack):
+            return None
+        position += 1
+    return position
+
+
+def _fresh_lines(seen: list[str], lines: list[str]) -> list[str]:
+    """The part of tail `lines` that is genuinely new given `seen`, the lines
+    already ingested for this stream.
+
+    ONE rule, which is why there are no branches here: find where the most of
+    `seen` we can account for finishes inside `lines`, and everything after
+    that point is new. Dropping leading entries of `seen` covers a tail window
+    that slid; matching non-contiguously covers a tail whose earlier content
+    gained neighbours. `start == len(seen)` always matches (an empty needle),
+    so `next` always finds an answer -- that case is "this tail shares nothing
+    with what we have", i.e. all of it is new."""
+    ends = (_subsequence_end(seen[start:], lines) for start in range(len(seen) + 1))
+    return lines[next(end for end in ends if end is not None):]
+
+
+def _anchor(stores: SynthStores, env: str, group: str, stream: str, width: int) -> list[str]:
+    """The last `width` messages ingested for `stream` since its barrier, in
+    ingestion order -- what a fresh tail is re-synchronised against. Capped at
+    `width` (the tail's own length) purely as work saved: a tail cannot
+    overlap more of the history than it has room for."""
+    messages = [e["message"] for e in _events(stores, env, group) if e["stream"] == stream]
+    barrier = int(stores.logsctl.get(env, _barrier_key(group, stream), 0))
+    return messages[barrier:][-width:]
+
+
 def ingest_tail(stores: SynthStores, env: str, group: str, stream: str, text: str) -> int:
     """Ship a container's log TAIL into `group`/`stream`, appending only the
     lines this stream hasn't seen before -- the dedup every repeated
     sweep/invoke needs.
 
-    The cursor is simply "how many lines of this container's output have
-    already been ingested" (`cursor:{group}:{stream}`), and `text` is a
-    bounded `docker logs --tail N` read, so:
-      - a re-read of the same tail appends NOTHING (the common case: an ECS
-        sweep every reconciler tick, a lambda invoked twice);
-      - a burst LARGER than the caller's tail window loses the oldest lines
-        of that burst rather than duplicating anything -- the deliberate
-        trade-off of keeping the cursor a plain line count instead of
-        streaming every container continuously.
+    Re-synchronisation is on CONTENT, against the lines already stored for
+    this stream (`_anchor`/`_fresh_lines`). It was a plain line count until
+    v0.7.1 -- "how many lines of this container have I ingested", then
+    `lines[cursor:]` -- which assumed line N of this tail is line N of the
+    last one. Two ordinary things break that assumption, and both were real:
 
-    A cursor is only valid for as long as the container behind the stream is:
-    a REPLACED container starts its output back at line 1, so whoever replaces
-    it must call `reset_cursor` (see `lambdactl.py`'s redeploy path) or the new
-    container's first lines would be mistaken for already-ingested ones.
+      - **The tail window slides.** `text` is a bounded `docker logs --tail N`
+        read, so once a container has printed more than N lines the tail's
+        first line is no longer the stream's first line. A line count then
+        reads `lines[N:]` of an N-line tail -- empty -- forever: the stream
+        went permanently DEAF, not merely lossy as the old docstring claimed.
+      - **The same output re-renders.** v0.7.1's stderr fix (`docker logs`
+        was being read stdout-only, dropping the stream Postgres and nginx
+        actually log to) means the next read of an unchanged container
+        returns lines at different offsets. A line count duplicates or skips
+        exactly once at that boundary; content anchoring doesn't notice.
+
+    What the rule does NOT do is splice retroactively-revealed BACKLOG into
+    the middle of a stream -- stderr lines that were interleaved BEFORE the
+    last line odin already has are left out rather than appended at "now",
+    where they would read as having happened after events that preceded them.
+    New output (anything past that last line) always lands.
+
+    Cost is `O(len(anchor) x len(lines))` worst case with both bounded by the
+    caller's tail window (200 lines for both substrates), and the common case
+    -- an unchanged or merely longer tail -- matches on the first try in one
+    pass.
     """
     lines = text.splitlines()
-    cursor = int(stores.logsctl.get(env, _cursor_key(group, stream), 0))
-    fresh = lines[cursor:]
-    if not fresh:
+    if not lines:
         return 0
-    appended = ingest(stores, env, group, stream, fresh)
-    stores.logsctl.set(env, _cursor_key(group, stream), cursor + appended)
-    return appended
+    return ingest(stores, env, group, stream, _fresh_lines(_anchor(stores, env, group, stream, len(lines)), lines))
 
 
 def reset_cursor(stores: SynthStores, env: str, group: str, stream: str) -> None:
-    """Forget how many lines of `stream` have been ingested -- called by
-    whoever REPLACES the real container behind that stream (a Lambda
-    redeploy), whose fresh output starts back at line 1. Without it,
-    `ingest_tail` would skip the new container's first lines; with it, no line
-    is lost and none is duplicated (the events already stored stay put -- this
-    resets the READ position, never the log). A stream with no cursor yet (the
-    first deploy of a function) is left completely alone rather than
-    rewriting the whole sidecar for a key that isn't there."""
-    if stores.logsctl.get(env, _cursor_key(group, stream)) is not None:
-        stores.logsctl.delete(env, _cursor_key(group, stream))
+    """Declare that everything `stream` has stored so far belongs to a
+    container that is GONE -- called by whoever REPLACES the real container
+    behind the stream (a Lambda redeploy, `lambdactl.py`'s deploy path).
+
+    A fresh container commonly prints a byte-identical banner, which content
+    anchoring would otherwise recognise as already-seen and swallow. Recording
+    the stream's current event count as its barrier empties the anchor, so the
+    replacement's first tail is ingested whole -- no line lost, none
+    duplicated. The events already stored stay exactly where they are: this
+    resets the READ position, never the log."""
+    stored = len([e for e in _events(stores, env, group) if e["stream"] == stream])
+    stores.logsctl.set(env, _barrier_key(group, stream), stored)
 
 
 def stored_events(stores: SynthStores, env: str, group: str, tail: int) -> list[dict]:
