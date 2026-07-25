@@ -764,8 +764,10 @@ class FakeReaperVm:
     def __init__(self, names: list[str]) -> None:
         self._names = list(names)
         self.deleted: list[str] = []
+        self.listed = 0
 
     def list_names(self) -> list[str]:
+        self.listed += 1
         return list(self._names)
 
     def delete(self, name: str) -> None:
@@ -807,3 +809,33 @@ def test_reap_orphaned_vms_is_a_no_op_when_everything_matches(tmp_path):
 def test_reap_orphaned_vms_with_no_vms_at_all_is_a_no_op(tmp_path):
     vm = FakeReaperVm(names=[])
     assert ec2compute.reap_orphaned_vms(tmp_path, ["default"], vm=vm) == []
+
+
+# --- ODIN_REAP_EC2_VMS: the opt-out a second instance needs (v0.7.1) -------
+
+
+@pytest.mark.parametrize("value", ["0", "false", "no", "off", "OFF", " 0 "])
+def test_reap_orphaned_vms_is_off_when_odin_reap_ec2_vms_says_so(tmp_path, monkeypatch, value):
+    """A second odin on the same Mac must be able to leave the FIRST one's VMs
+    alone: they are orphans by ITS store, which knows nothing about them."""
+    monkeypatch.setenv("ODIN_REAP_EC2_VMS", value)
+    vm = FakeReaperVm(names=["odin-ec2-default-i-someone-elses"])
+
+    assert ec2compute.reap_orphaned_vms(tmp_path, ["default"], vm=vm) == []
+    assert vm.deleted == []
+    # Not merely "deletes nothing" -- it must not even ENUMERATE, so the
+    # opt-out holds on a machine where listing VMs is itself unwanted.
+    assert vm.listed == 0
+
+
+@pytest.mark.parametrize("value", ["1", "true", "yes", "on", "", "anything-else"])
+def test_reap_orphaned_vms_stays_on_for_every_other_value(tmp_path, monkeypatch, value):
+    monkeypatch.setenv("ODIN_REAP_EC2_VMS", value)
+    vm = FakeReaperVm(names=["odin-ec2-default-i-orphaned"])
+    assert ec2compute.reap_orphaned_vms(tmp_path, ["default"], vm=vm) == ["odin-ec2-default-i-orphaned"]
+
+
+def test_reap_orphaned_vms_is_on_when_the_variable_is_unset(tmp_path, monkeypatch):
+    monkeypatch.delenv("ODIN_REAP_EC2_VMS", raising=False)
+    vm = FakeReaperVm(names=["odin-ec2-default-i-orphaned"])
+    assert ec2compute.reap_orphaned_vms(tmp_path, ["default"], vm=vm) == ["odin-ec2-default-i-orphaned"]

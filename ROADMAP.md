@@ -186,13 +186,25 @@ future decision against these points instead of re-deriving them:
     workload with an `rds` edge can call
     `DescribeDBInstances(DBInstanceIdentifier="db")` but NOT bare
     `DescribeDBInstances()`; likewise `DescribeCacheClusters(CacheClusterId=…)`
-    versus `DescribeCacheClusters()`. This is correct and AWS-ish — an edge
-    grants an action on the ONE resource it points at, and a wildcard list is a
-    different permission — but it is the first thing an engineer tries, the
-    denial says only "not authorized", and it cost a field tester a confusing
-    hour. Written down here rather than fixed: naming the resource is the
-    intended usage, and the endpoint you actually want is also published as a
-    World fact (`${{db.DATABASE_URL}}` and friends).
+    versus `DescribeCacheClusters()`. Both services behave identically, and
+    the deny happens in `app.py` before either model is reached.
+    **The mechanism, precisely** (re-verified against the code in v0.7.1, and
+    worth stating because the intuitive explanation is not quite what
+    happens): a call that names no resource classifies to the LITERAL resource
+    `"*"` (`classify.py::_rds_resource` / `_classify_elasticache`), while an
+    IAM edge compiles to a statement naming one literal node label
+    (`policy.py::compile_policies`). Wildcards are expanded on the STATEMENT
+    side only, so `"db"` does not match the string `"*"` and default-deny
+    applies. The same fallback is why `tofu` is never blocked: the operator's
+    statement really is `*`/`*`, which matches anything including `"*"`.
+    **The denial names the action but never the resource** —
+    `User is not authorized to perform: rds:DescribeDBInstances` — which is
+    exactly why it reads as a contradiction: you are told the action you hold
+    an edge for was denied, with no hint that the resource resolved to `"*"`.
+    That, not the policy decision, is what cost a field tester a confusing
+    hour. Written down rather than fixed: naming the resource is the intended
+    usage, and the endpoint you actually want is also published as a World
+    fact (`${{db.DATABASE_URL}}` and friends).
   - RDS is Terraform-managed (W2.7 — this used to read "RDS stays off
     Terraform"): an `rds` node compiles to `aws_db_instance`, and the gateway's
     own RDS model (`gateway/models/rdsctl.py`) fulfils CreateDBInstance with
@@ -386,6 +398,27 @@ future decision against these points instead of re-deriving them:
     the same CWD-relative `.odin` store (the second binds-conflicts on the
     gateway port and would resume/reconcile the first's envs). Run a second
     instance only from a separate working directory with its own store.
+    - **`ODIN_REAP_EC2_VMS=0` is what makes that second instance actually
+      safe** (v0.7.1, field test U7). On startup odin deletes every Lima VM
+      named `odin-ec2-*` that no env's store expects — and a second instance's
+      store expects NONE of the first's, so it would reap them all. Until
+      v0.7.1 the only seam was the `create_app(reap_ec2_vms=False)` keyword,
+      so the documented "run a second instance" advice meant bypassing the
+      `odin` CLI with a hand-written factory wrapper. The variable is read
+      inside the reaper itself (`gateway/models/ec2compute.py`), so it holds
+      for `odin start`, a bare `uvicorn`, and any other caller alike.
+      Accepts `0`/`false`/`no`/`off`; **anything else, including unset or a
+      typo, leaves the reaper ON** — a safety net you disabled by mistyping
+      is not a safety net.
+    - **What you give up:** the crash-recovery backstop. The reaper exists
+      for the window where odin dies between `vm.delete` succeeding and the
+      store update landing; with it off, that leftover VM stays on disk
+      burning memory and disk until you `limactl delete` it by hand. It is
+      the ONLY thing the reaper does — it never touches a VM some env's store
+      still expects, and only ever considers names matching odin's own
+      `odin-ec2-` convention, so your own Lima VMs were never at risk either
+      way. Leave it ON unless a second odin (or another agent's VMs) shares
+      the machine.
   - Nebula: single-host mesh is REAL end-to-end — a real host lighthouse
     process (`fabric/nebula.py::LighthouseManager`) and a real `nebula`
     daemon inside every VPC-joined EC2 VM, the VPC's compiled SG firewall
@@ -592,20 +625,18 @@ future decision against these points instead of re-deriving them:
   - The proxy container is NOT covered by W2.2's drift sweep yet — `docker rm`
     it out of band and the load balancer still reports `active` until the next
     Apply re-converges it.
-- **KNOWN INCONSISTENCY — the account id STS reports is not the one in odin's
-  ARNs.** `sts:GetCallerIdentity` answers with a per-env id derived from the env
-  name (`gateway/synth.py::account_for_env` — sha256 of the env, mod 10^12,
-  e.g. `561031708110`), while every ARN odin builds uses the fixed
-  `aws/backings.py::ACCOUNT` = `000000000000`. So a client that builds ARNs from
-  its own caller identity — a very common pattern — builds ARNs odin will not
-  recognise. `account_for_env`'s docstring already records the deferral ("used
-  ONLY for STS's `Account` field for now … unifying the two is deferred"); what
-  was missing is that it's a REAL trap for a workload, not just an internal
-  inconsistency. Fixing it means either making STS return `ACCOUNT` (two lines
-  in `synth.py` plus four assertions in `tests/gateway/test_synth.py`) or
-  threading `env` through every ARN builder in `gateway/models/*` (~20 files,
-  ~40 tests) — the first is the obvious v1 answer, since nothing in odin
-  actually needs per-env account ids. Found by the v0.7.0 field test (U6).
+- **ONE account id, everywhere** — `000000000000` (`aws/backings.py::ACCOUNT`).
+  `sts:GetCallerIdentity` reports exactly the account that appears inside every
+  ARN odin builds, so the ordinary workload pattern (ask STS who you are, build
+  an ARN from the answer) builds an ARN odin recognises. FIXED in v0.7.1: STS
+  used to answer with a per-env sha256-derived id
+  (`gateway/synth.py::account_for_env`, e.g. `561031708110`) while every ARN
+  used `ACCOUNT`, so that pattern silently produced unmatchable ARNs (v0.7.0
+  field test, U6). Unified toward `ACCOUNT` rather than making ARNs per-env
+  because nothing in odin needs per-env account ids — envs are already isolated
+  by their own stores and backing containers — and ~15 modules bake `ACCOUNT`
+  into ARNs. The TF provider never noticed either way
+  (`skip_requesting_account_id = true`); only workload STS callers did.
 - **`tofu` runs are BOUNDED, and a wedged destroy says why.** `init`/`apply`
   each get `ODIN_TOFU_TIMEOUT` (default 600s); `destroy` gets a smaller
   WHOLE-CALL deadline, `ODIN_TOFU_DESTROY_TIMEOUT` (default 300s, `init`

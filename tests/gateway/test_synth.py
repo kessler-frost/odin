@@ -17,6 +17,7 @@ import pytest
 from botocore.parsers import create_parser
 from starlette.responses import Response
 
+from odin.aws.backings import ACCOUNT
 from odin.gateway import synth
 from odin.gateway.keys import Principal
 from odin.gateway.stores import SynthStores
@@ -47,37 +48,67 @@ def stores(tmp_path: Path) -> SynthStores:
     return SynthStores(tmp_path)
 
 
-# --- account_for_env / get_caller_identity ----------------------------------
+# --- get_caller_identity: ONE account id, everywhere -------------------------
+#
+# v0.7.1, field test U6. There used to be a second, per-env account id here
+# (`account_for_env`: sha256(env) % 10^12, e.g. `561031708110` for a env named
+# `wa`) used for STS's `Account` field alone, while every ARN odin builds --
+# QueueArn, TopicArn, secret ARN, log-group ARN, all of them -- used the fixed
+# `backings.ACCOUNT`. A workload that did the ordinary thing (ask STS who it
+# is, build an ARN from the answer) built an ARN odin would never match. The
+# tests below pin the invariant that replaced it: there is exactly one account
+# id in the system, and STS reports THAT one.
 
 
-def test_account_for_env_default_is_the_fixed_account():
-    assert synth.account_for_env("default") == "000000000000"
-
-
-def test_account_for_env_is_twelve_digits_and_stable():
-    account = synth.account_for_env("staging")
-    assert len(account) == 12 and account.isdigit()
-    assert synth.account_for_env("staging") == account
-
-
-def test_account_for_env_differs_per_env():
-    assert synth.account_for_env("a") != synth.account_for_env("b")
-
-
-def test_get_caller_identity_parses_and_carries_env_account(sts):
+def test_get_caller_identity_parses_and_reports_the_one_account(sts):
     principal = Principal(env="staging", node_id="worker")
     response = synth.get_caller_identity("staging", principal)
 
     parsed = _parse("sts", "GetCallerIdentity", response)
-    assert parsed["Account"] == synth.account_for_env("staging")
+    assert parsed["Account"] == ACCOUNT
     assert parsed["UserId"] == "worker"
-    assert parsed["Arn"].endswith(":user/worker")
+    assert parsed["Arn"] == f"arn:aws:iam::{ACCOUNT}:user/worker"
 
 
-def test_get_caller_identity_default_env_uses_fixed_account():
-    response = synth.get_caller_identity("default", Principal(env="default", node_id="api"))
-    parsed = _parse("sts", "GetCallerIdentity", response)
-    assert parsed["Account"] == "000000000000"
+def test_get_caller_identity_account_does_not_vary_by_env():
+    accounts = {
+        _parse("sts", "GetCallerIdentity", synth.get_caller_identity(env, Principal(env=env, node_id="api")))["Account"]
+        for env in ("default", "staging", "a", "b", "wa")
+    }
+    assert accounts == {ACCOUNT}
+
+
+def test_get_caller_identity_account_matches_the_account_inside_a_returned_arn(sink, sqs, stores):
+    """The whole point of unifying the two: a client that builds an ARN out of
+    its OWN caller identity -- a very common pattern -- must build one odin
+    recognises. Asserted end-to-end in a NON-default env (the case that used
+    to be broken), against an ARN synth really put on the wire rather than
+    against the constant."""
+    env = "staging"
+    identity = _parse(
+        "sts", "GetCallerIdentity",
+        synth.get_caller_identity(env, Principal(env=env, node_id="worker")),
+    )
+
+    create_req = sink.call(lambda: sqs.create_queue(QueueName="jobs"))
+    synth.postprocess(
+        "sqs:CreateQueue", "jobs", env, create_req.body,
+        b'{"QueueUrl": "http://us-east-1.goaws.com:4100/000000000000/jobs"}',
+        stores, "127.0.0.1:4266", 0.0,
+    )
+    get_req = sink.call(
+        lambda: sqs.get_queue_attributes(
+            QueueUrl=f"{sink.endpoint}/000000000000/jobs", AttributeNames=["QueueArn"]
+        )
+    )
+    queue_arn = _parse(
+        "sqs", "GetQueueAttributes",
+        synth.pure_answer("sqs:GetQueueAttributes", "jobs", env, get_req.body, stores, 0.0),
+    )["Attributes"]["QueueArn"]
+
+    # arn:aws:sqs:{region}:{account}:{name} -- field 4 is the account.
+    assert queue_arn.split(":")[4] == identity["Account"]
+    assert identity["Arn"].split(":")[4] == identity["Account"]
 
 
 # --- SQS: tag CRUD -----------------------------------------------------------
