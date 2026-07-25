@@ -86,7 +86,7 @@ from odin.fabric.models import (
     VpcNetwork,
 )
 from odin.spec.models import World
-from odin.util import atomic_write_text, run_command
+from odin.util import atomic_write_text, private_mkdir, run_command
 
 log = logging.getLogger("odin.fabric.nebula")
 
@@ -264,12 +264,11 @@ class NebulaManager:
         return self._dir / "ca.key"
 
     def _hosts_dir(self) -> Path:
-        d = self._dir / "hosts"
-        d.mkdir(parents=True, exist_ok=True)
-        return d
+        # Signed host keys land here; 0700 like everything else under `.odin`.
+        return private_mkdir(self._dir / "hosts")
 
     def create_ca(self, network: str) -> CaInfo:
-        self._dir.mkdir(parents=True, exist_ok=True)
+        private_mkdir(self._dir)  # ca.key is written into it
         proc = self._run([
             "nebula-cert", "ca", "-name", network,
             "-out-crt", str(self._ca_crt), "-out-key", str(self._ca_key),
@@ -761,7 +760,7 @@ class LighthouseManager:
         config_path = self._config_path(root, env)
         atomic_write_text(config_path, config_text)
         pidfile = self._pidfile(root, env)
-        pidfile.parent.mkdir(parents=True, exist_ok=True)
+        private_mkdir(pidfile.parent)
         log_path = self._log_path(root, env)
         try:
             with log_path.open("ab") as handle:

@@ -48,6 +48,7 @@ from pathlib import Path
 import httpx
 
 from odin.runtime.colima import ColimaRuntime, ContainerSpec
+from odin.util import private_mkdir
 
 # AWS's own base images (Apache-2.0 RIE built in, research-verified). Only
 # the runtimes odin's HCL layer offers on the canvas (agent/hcl.py's
@@ -156,7 +157,7 @@ class FunctionRuntime:
         patch)."""
         code_dir = self.code_dir(env, function_name)
         shutil.rmtree(code_dir, ignore_errors=True)
-        code_dir.mkdir(parents=True, exist_ok=True)
+        private_mkdir(code_dir)  # under .odin/<env>/gateway — 0700 like the rest
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as archive:
             archive.extractall(code_dir)
         return code_dir

@@ -275,18 +275,29 @@ def await_server_exit(root: Path, timeout: float = SHUTDOWN_GRACE) -> LiveServer
 
 
 def private_mkdir(directory: Path) -> Path:
-    """`mkdir -p`, except every directory this call CREATES is 0700.
+    """`mkdir -p`, except the directory ends up owner-only (0700) either way.
 
     Directory modes are the second half of the file-mode defense: without
     traverse permission on `.odin/<env>/`, a file inside it that some future
     writer forgets to lock down is still unreadable by another local account.
-    Only the missing levels are created (and each is created 0700 outright,
-    never chmod'd after the fact -- no window where it exists world-readable);
-    an EXISTING directory's mode is left exactly as the user has it.
+    Missing levels are created 0700 outright, never chmod'd after the fact --
+    no window where they exist world-readable.
+
+    An EXISTING directory that is group/world-accessible is TIGHTENED, which
+    the fresh-user audit forced: SECURITY.md states "the directories holding
+    them are 0700" absolutely, while `.odin/` and `.odin/<env>/` were 0755
+    whenever a plain `mkdir` (the goaws config writer, `odin start`'s pidfile
+    dir) happened to create them before this helper did. Two code paths, one
+    claim, and the claim lost. Healing here is the same move
+    `ensure_private_file` already makes for a file mode an older odin left
+    loose -- and it is deliberately only THIS directory, never its parents,
+    which odin does not own.
     """
     missing = [p for p in (directory, *directory.parents) if not p.exists()]
     for parent in reversed(missing):
         parent.mkdir(mode=PRIVATE_DIR_MODE, exist_ok=True)
+    if directory.stat().st_mode & 0o077:
+        directory.chmod(PRIVATE_DIR_MODE)
     return directory
 
 
