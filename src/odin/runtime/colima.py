@@ -185,6 +185,15 @@ class _ContainerRuntime:
             logtail=self.logs(name, tail=5) if status != "absent" else "",
         )
 
+    def signal(self, name: str, sig: str) -> None:
+        """Send UNIX signal `sig` to the container's main process (`docker kill
+        -s`). W2.5: how a load-balancer proxy container is told to re-read its
+        rewritten config (nginx reloads on SIGHUP) WITHOUT `docker exec` and
+        without recreating the container -- so an upstream change never drops
+        an in-flight request. `check=False`: signalling an already-gone
+        container is a no-op, exactly like `stop`."""
+        self._cli("kill", "-s", sig, name, check=False)
+
     def stop(self, name: str) -> None:
         # -v: drop the container's anonymous volumes with it (postgres creates
         # one per boot; without this a churn loop leaks gigabytes).

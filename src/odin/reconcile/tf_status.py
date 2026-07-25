@@ -1,5 +1,5 @@
 """Fix-wave 2b finding #1 -- a pure, read-only projection of the TF-owned
-resource kinds (vpc/subnet/sg/ec2/ecs/lambda/iam_role/ecr/logs/secret/ssm: the kinds
+resource kinds (vpc/subnet/sg/ec2/ecs/lambda/iam_role/ecr/logs/secret/ssm/alb: the kinds
 `agent/hcl.py` can build and only `tofu apply`/`tofu destroy` ever
 creates/destroys -- s3/sqs/sns/dynamodb are excluded, those already get real
 World entries via the reconciler's own PROVISIONED path in plan.py) from the
@@ -42,13 +42,19 @@ simply not projected yet, rather than guessing.
 from __future__ import annotations
 
 from odin.compute.tasks import TaskRuntime
-from odin.gateway.models import logsctl, ssmctl
+from odin.gateway.models import elbv2ctl, logsctl, ssmctl
 from odin.gateway.models.ecsctl import sweep_tasks
 from odin.gateway.stores import SynthStores
 
 TF_OWNED_KINDS = frozenset({
-    "vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr", "logs", "secret", "ssm",
+    "vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr", "logs", "secret", "ssm", "alb",
 })
+
+# elbv2's own load-balancer state machine (gateway/models/elbv2ctl.py) -> the
+# World Phase enum. `provisioning` is honest asynchrony (the real nginx
+# container is coming up on a daemon thread); `failed` is the state a real
+# `docker run` failure records, with the driver's own error as the verdict.
+_ALB_PHASE = {"provisioning": "starting", "active": "healthy", "failed": "crashed"}
 
 # EC2's real instance-state machine (gateway/models/ec2compute.py's own
 # `_STATE_CODES` keys) -> the World Phase enum. `stopped` (an intentional
@@ -169,6 +175,36 @@ def _ssm_parameters(stores: SynthStores, env: str) -> Projected:
         label = _label(tags, record["name"])
         if label:
             out[label] = ("ssm", "healthy", {}, None)
+    return out
+
+
+def _load_balancers(stores: SynthStores, env: str) -> Projected:
+    """W2.5: an `alb` node exists once tofu's CreateLoadBalancer landed, and is
+    `healthy` once its REAL nginx proxy container is up (elbv2ctl flips the
+    record to `active` from the thread that ran `docker run`, so this reads a
+    measured state rather than asserting one).
+
+    THE ONE KIND THAT PROJECTS FACTS: a load balancer's whole point is an
+    address, and `DNSName` can't carry the dynamic host port odin publishes the
+    proxy on (elbv2ctl.py's `_DNS_NAME` note). So the genuinely reachable
+    `http://127.0.0.1:{port}` rides out as a fact -- onto the WebSocket, into
+    `.odin/{env}/world.json`, and resolvable by another node's
+    `${{lb.ALB_ENDPOINT}}` reference through the fabric. Nothing secret is in
+    it (contrast `_secrets`/`_ssm_parameters`, which project no facts at all).
+    """
+    out: Projected = {}
+    for key, record in stores.elbv2ctl.items(env).items():
+        if not key.startswith("lb:"):
+            continue
+        tags = stores.tags.get(env, f"{elbv2ctl.SERVICE}:{record['arn']}", {})
+        label = _label(tags, record["name"])
+        if not label:
+            continue
+        phase = _ALB_PHASE.get(record["state"], "starting")
+        endpoint = elbv2ctl.endpoint_url(record)
+        facts = {"ALB_ENDPOINT": endpoint} if endpoint else {}
+        verdict = (record.get("state_reason") or None) if phase == "crashed" else None
+        out[label] = ("alb", phase, facts, verdict)
     return out
 
 
@@ -299,6 +335,7 @@ def project(stores: SynthStores, env: str, ecs_runtime: TaskRuntime | None = Non
     out.update(_log_groups(stores, env))
     out.update(_secrets(stores, env))
     out.update(_ssm_parameters(stores, env))
+    out.update(_load_balancers(stores, env))
     out.update(_ec2_instances(stores, env))
     out.update(_lambda_functions(stores, env))
     out.update(_ecs_services(stores, env, ecs_runtime))

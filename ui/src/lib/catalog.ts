@@ -247,16 +247,31 @@ export const CATALOG: ServiceDef[] = [
     fields: [{ key: 'label', label: 'Name', editable: true }, { key: 'igwId', label: 'Gateway ID' }],
     defaultData: { label: 'new-igw', igwId: '' },
   },
+  // W2.5: a REAL load balancer -- one node expands to aws_lb +
+  // aws_lb_target_group + aws_lb_listener (agent/hcl.py's `_alb`), and the
+  // substrate is an actual nginx reverse-proxy container per load balancer
+  // (compute/proxy.py) whose upstreams are the target group's registered
+  // targets. Draw it INSIDE a Subnet (containment is what gives aws_lb its
+  // subnets and the target group its vpc_id), then draw a NETWORK edge from it
+  // to the ECS service it fronts -- that edge is what registers the service's
+  // tasks as targets. Only `application` is supported in v1; `network` (an NLB)
+  // reports itself unsupported on Apply rather than silently becoming an ALB.
+  // The reachable address is NOT the ARN/DNS name: odin publishes the proxy on
+  // a dynamic host port, surfaced as the node's ALB_ENDPOINT fact.
   {
-    type: 'alb', abbr: 'ALB', label: 'Load Balancer', sublabel: 'Application/Network LB',
+    type: 'alb', abbr: 'ALB', label: 'Load Balancer', sublabel: 'Application LB (real proxy)',
     category: 'Networking', color: 'rose', width: 220,
     fields: [
       { key: 'label', label: 'Name', editable: true },
       { key: 'lbType', label: 'Type', editable: true, select: ['application', 'network'] },
-      { key: 'arn', label: 'ARN' },
+      { key: 'listenerPort', label: 'Listener Port', editable: true },
+      { key: 'port', label: 'Target Port', editable: true },
+      { key: 'healthCheckPath', label: 'Health Check Path', editable: true },
     ],
-    defaultData: { label: 'new-lb', lbType: 'application', arn: '' },
-    primary: { key: 'lbType', label: 'Type' },
+    defaultData: {
+      label: 'new-lb', lbType: 'application', listenerPort: '80', port: '80', healthCheckPath: '/',
+    },
+    primary: { key: 'listenerPort', label: 'Listener' },
   },
 ];
 

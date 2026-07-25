@@ -31,7 +31,12 @@ _REF = re.compile(r"^\$\{\{\s*([\w-]+)\.([\w-]+)\s*\}\}$")
 # (gateway/models/logsctl.py); secret's (a record + versions in a 0600 JSON
 # sidecar) via CreateSecret/PutSecretValue (gateway/models/secretsctl.py) and
 # ssm's via PutParameter (gateway/models/ssmctl.py) -- the reconciler never
-# touches any of them, same as vpc/subnet/sg.
+# touches any of them, same as vpc/subnet/sg. alb (W2.5) is the same shape
+# again: one canvas node expands to aws_lb + aws_lb_target_group +
+# aws_lb_listener (agent/hcl.py), and its REAL substrate -- an nginx reverse
+# proxy container whose upstreams are the target group's registered targets --
+# is driven by the gateway's CreateLoadBalancer/CreateListener/RegisterTargets
+# handlers (gateway/models/elbv2ctl.py + compute/proxy.py).
 
 # (kind, field) pairs whose value is a CREDENTIAL BY CONSTRUCTION, whatever the
 # field happens to be called (W2.4). `is_sensitive_field_name` catches names
@@ -63,6 +68,7 @@ _KIND = {
     "logs": "logs",
     "secret": "secret",
     "ssm": "ssm",
+    "alb": "alb",
 }
 
 

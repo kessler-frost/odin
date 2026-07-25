@@ -60,7 +60,17 @@ from starlette.responses import Response
 from odin.aws.backings import ACCOUNT, REGION
 from odin.gateway import errors
 from odin.gateway.keys import KeyStore, Principal
-from odin.gateway.models import ec2compute, ecr, ecsctl, iamctl, lambdactl, logsctl, secretsctl, ssmctl
+from odin.gateway.models import (
+    ec2compute,
+    ecr,
+    ecsctl,
+    elbv2ctl,
+    iamctl,
+    lambdactl,
+    logsctl,
+    secretsctl,
+    ssmctl,
+)
 from odin.gateway.stores import SynthStores
 
 _SNS_NS = "http://sns.amazonaws.com/doc/2010-03-31/"
@@ -389,7 +399,13 @@ def pure_answer(
     docstring records the limit), and a value only ever leaves through a
     GetSecretValue/GetParameter that evaluate() already allowed -- which,
     since both classify to the canvas node's label, means an IAM EDGE is what
-    grants it."""
+    grants it.
+    `elasticloadbalancing:*` (task W2.5) is all-synth too, and the ONE modeled
+    family whose substrate is a REVERSE PROXY: an nginx container per load
+    balancer (`compute/proxy.py`), whose upstreams are the target group's
+    actually-registered targets. Like ecs's TaskRuntime it needs no live fact
+    threaded through here -- `gateway/models/elbv2ctl.py` defaults its own
+    `LoadBalancerProxy`."""
     if action.startswith("ec2:"):
         return ec2compute.pure_answer(action, resource, env, body, stores, now, keystore=keystore, gateway_port=gateway_port)
     if action.startswith("iam:"):
@@ -406,6 +422,8 @@ def pure_answer(
         return secretsctl.pure_answer(action, resource, env, body, stores, now)
     if action.startswith("ssm:"):
         return ssmctl.pure_answer(action, resource, env, body, stores, now)
+    if action.startswith("elasticloadbalancing:"):
+        return elbv2ctl.pure_answer(action, resource, env, body, stores, now)
     handler = _PURE_HANDLERS.get(action)
     return handler(resource, env, body, stores, now) if handler else None
 

@@ -195,6 +195,16 @@ class SynthStores:
       the parameter NAME as `ResourceId`, not an ARN). A `SecureString`
       parameter's value lives here in cleartext too -- odin has no KMS; 0600
       is the protection, recorded as a limit rather than implied away.
+    - `elbv2ctl`: the Elastic Load Balancing v2 model's whole state
+      (`gateway/models/elbv2ctl.py`, task W2.5) -- flat keys `"lb:{name}"` /
+      `"tg:{name}"` / `"listener:{listenerId}"` / `"targets:{tgName}"` (a
+      target group's registered targets), persisted at
+      `.odin/{env}/gateway/elbv2ctl.json`. Load-balancer / target-group /
+      listener tags live in the shared `tags` store above, keyed
+      `"elasticloadbalancing:{arn}"` (elbv2's tag API is ARN-only: AddTags/
+      RemoveTags/DescribeTags all take `ResourceArns`, never a typed id). The
+      REAL substrate this state describes is an nginx container per load
+      balancer (`compute/proxy.py`), never anything in this file.
     """
 
     def __init__(self, root: Path) -> None:
@@ -212,3 +222,4 @@ class SynthStores:
         self.logsctl = JsonStore(root, "logsctl")
         self.secretsctl = JsonStore(root, "secretsctl")
         self.ssmctl = JsonStore(root, "ssmctl")
+        self.elbv2ctl = JsonStore(root, "elbv2ctl")

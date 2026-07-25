@@ -27,7 +27,7 @@ def test_tf_owned_kinds_excludes_reconciler_owned_kinds():
     # s3/sqs/sns/dynamodb already get real World entries via the reconciler's
     # own PROVISIONED path -- this projection must never double-own them.
     assert TF_OWNED_KINDS == {
-        "vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr", "logs", "secret", "ssm",
+        "vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr", "logs", "secret", "ssm", "alb",
     }
 
 
