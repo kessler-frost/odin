@@ -5,6 +5,7 @@ caller opts into anything wider."""
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 
 import pytest
@@ -124,35 +125,55 @@ def test_dev_mode_backend_subprocess_gets_the_host_argv(tmp_path, monkeypatch):
     assert backend_argv[backend_argv.index("--host") + 1] == "203.0.113.9"
 
 
-# --- `odin status`/`stop` honesty for BOTH launch paths (field test B5) -------
+# --- `odin status`/`stop` honesty for BOTH launch paths (field tests B5, 3) ---
 # v0.7.0 read `.odin/pid` and nothing else, so a server started the way the
 # README documents (`uvicorn odin.server:create_app --factory`) made `odin
 # status` print "Odin is not running" while `/health` answered ok -- and that
-# same blind spot let `odin import` restore into the live store.
-
-_UVICORN_ARGV = "/x/.venv/bin/python -m uvicorn odin.server:create_app --factory --port 4310"
-
-
-def _fake_probes(monkeypatch, ps, cwd):
-    """Fake the one OS seam `live_server` uses (`ps` + `lsof`)."""
-    def fake(args):
-        stdout = f"p1\nfcwd\nn{cwd}\n" if args[0] == "lsof" else ps
-        return type("P", (), {"returncode": 0, "stdout": stdout, "stderr": ""})
-
-    monkeypatch.setattr(util, "_proc_run", fake)
+# same blind spot let `odin import` restore into the live store. v0.7.1 fixed
+# that by matching `odin.server:create_app` against every process's command
+# line, and then called an engineer's own shell a live server. So liveness is
+# now the store lock a real server holds (util.hold_store_lock), and these tests
+# hold a real one rather than faking any seam.
 
 
-def test_status_is_honest_about_a_server_odin_did_not_start(tmp_path, monkeypatch, capsys):
+@pytest.fixture
+def store_lock(tmp_path):
+    """What a server started outside `odin start` leaves behind for odin to
+    find: an exclusive lock on this store, held by a live process."""
+    lock = util.hold_store_lock(tmp_path / ".odin")
+    yield lock
+    lock.release()
+
+
+def test_status_is_honest_about_a_server_odin_did_not_start(tmp_path, monkeypatch, capsys, store_lock):
     monkeypatch.chdir(tmp_path)
-    _fake_probes(monkeypatch, ps=f" 4242 {_UVICORN_ARGV}\n", cwd=str(tmp_path))
     main_mod.status()
     out = capsys.readouterr().out
-    assert "Odin is running" in out and "4242" in out and "outside `odin start`" in out
+    assert "Odin is running" in out and str(os.getpid()) in out and "outside `odin start`" in out
+
+
+def test_status_says_nothing_is_running_for_a_process_that_only_looks_like_one(
+    tmp_path, monkeypatch, capsys
+):
+    """Field test 3: with no server anywhere, `odin status` must say so --
+    even while a process (an ops wrapper, or the operator's own shell) has
+    `odin.server:create_app` sitting in its argv."""
+    monkeypatch.chdir(tmp_path)
+    decoy = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)",
+         "uvicorn odin.server:create_app --factory --port 4510"],
+        cwd=tmp_path,
+    )
+    try:
+        main_mod.status()
+        assert "Odin is not running" in capsys.readouterr().out
+    finally:
+        decoy.kill()
+        decoy.wait()
 
 
 def test_status_reports_the_pidfile_path_as_managed(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
-    _fake_probes(monkeypatch, ps="", cwd=str(tmp_path))
     main_mod.ODIN_DIR.mkdir()
     main_mod.PID_FILE.write_text(str(os.getpid()))
     main_mod.status()
@@ -161,7 +182,6 @@ def test_status_reports_the_pidfile_path_as_managed(tmp_path, monkeypatch, capsy
 
 def test_status_cleans_a_stale_pidfile_and_says_so(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
-    _fake_probes(monkeypatch, ps="", cwd=str(tmp_path))
     main_mod.ODIN_DIR.mkdir()
     main_mod.PID_FILE.write_text("999999")
     main_mod.status()
@@ -169,14 +189,30 @@ def test_status_cleans_a_stale_pidfile_and_says_so(tmp_path, monkeypatch, capsys
     assert not main_mod.PID_FILE.exists()
 
 
-def test_stop_signals_a_server_odin_did_not_start(tmp_path, monkeypatch, capsys):
+def test_stop_signals_a_server_odin_did_not_start(tmp_path, monkeypatch, capsys, store_lock):
     monkeypatch.chdir(tmp_path)
-    _fake_probes(monkeypatch, ps=f" 4242 {_UVICORN_ARGV}\n", cwd=str(tmp_path))
     killed = []
     monkeypatch.setattr(main_mod.os, "kill", lambda pid, sig: killed.append((pid, sig)))
     main_mod.stop()
-    assert killed == [(4242, main_mod.signal.SIGTERM)]
+    assert killed == [(os.getpid(), main_mod.signal.SIGTERM)]
     assert "Stopped." in capsys.readouterr().out
+
+
+def test_stop_never_signals_a_pid_it_cannot_vouch_for(tmp_path, monkeypatch, capsys):
+    """The lock is held (so a server IS up) but the pid stamp is unreadable --
+    the one window where odin knows something is there and not what. It says
+    that instead of signalling a guess: v0.7.1 guessed, and named a shell."""
+    monkeypatch.chdir(tmp_path)
+    lock = util.hold_store_lock(tmp_path / ".odin")
+    (tmp_path / ".odin" / util.STORE_LOCK_NAME).write_text("")
+    killed = []
+    monkeypatch.setattr(main_mod.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    try:
+        main_mod.stop()
+    finally:
+        lock.release()
+    out = capsys.readouterr().out
+    assert killed == [] and "cannot identify the process" in out and "lsof" in out
 
 
 def test_version_flag_prints_the_real_version(capsys):

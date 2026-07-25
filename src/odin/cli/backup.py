@@ -20,6 +20,7 @@ from odin.backup import BackupError, default_archive_name, export_env, import_ar
 from odin.cli import http
 from odin.cli.app import app
 from odin.cli.http import OutputFormat
+from odin.util import SHUTDOWN_GRACE, LiveServer
 
 ROOT = Path(".odin")
 
@@ -100,6 +101,12 @@ def import_command(
         False, "--with-canvas",
         help="Also restore the shared .odin/canvas.json, REPLACING the current canvas.",
     ),
+    ignore_live_server: bool = typer.Option(
+        False, "--ignore-live-server",
+        help="Skip the live-server check entirely. The escape hatch for a restore "
+             "that odin wrongly believes is unsafe — only when you have checked "
+             "yourself that no odin is running against this store.",
+    ),
     output: OutputFormat = JSON_OR_TEXT,
 ) -> None:
     """Restore an environment from an `odin export` archive — offline.
@@ -108,12 +115,29 @@ def import_command(
     an existing env directory without `--force`, and refuses any archive with
     an absolute, `..`-traversing, or link member.
 
+    A server that is still SHUTTING DOWN is waited for, not refused: uvicorn
+    with odin's reconcilers in its lifespan takes well over 6 seconds to let go
+    of the store, so `odin stop && odin import` in one script just works.
+
     Restoring state does NOT start containers: it puts odin's model of the
     world back, then `odin start` + Apply converges reality to it.
     """
     http.emit(
-        _run(lambda: import_archive(archive, ROOT, env=env, force=force, with_canvas=with_canvas)),
+        _run(lambda: import_archive(
+            archive, ROOT, env=env, force=force, with_canvas=with_canvas,
+            ignore_live_server=ignore_live_server, on_wait=_wait_notice,
+        )),
         output, _render_import,
+    )
+
+
+def _wait_notice(server: LiveServer) -> None:
+    """Never stall silently: if the store is busy, say so and say for how long,
+    on stderr so `--output json` on stdout stays pipeable."""
+    typer.echo(
+        f"odin is running ({server.detail}) — waiting up to {SHUTDOWN_GRACE:.0f}s "
+        "for it to release this store …",
+        err=True,
     )
 
 

@@ -46,7 +46,7 @@ from odin.simulate.runner import SimulateBusy, TfRunner, TofuNotInstalled
 from odin.spec.models import Stack
 from odin.spec.store import SpecStore
 from odin.spec.translate import canvas_to_stack, skipped_node_types
-from odin.util import odin_version
+from odin.util import hold_store_lock, odin_version
 
 ODIN_DIR = Path(".odin")
 CANVAS_PATH = ODIN_DIR / "canvas.json"
@@ -693,6 +693,13 @@ def create_app(
         # envs resumed on restart) need the ACTUAL resolved port to point
         # BackingAws's goaws.yaml at.
         gateway_server, gateway_thread, gateway_port_actual = serve_in_thread(gateway_app, port=_resolved_gateway_port)
+        # The one piece of evidence that proves THIS store has a live server, to
+        # anyone who asks the kernel rather than `ps`: `odin status`/`stop` and
+        # `odin import`'s live-store refusal. Held for the whole run; released
+        # below AFTER the reconcilers stop, so the store is only advertised free
+        # once nothing is writing to it. (Never a reason to fail startup: an
+        # unlockable store answers "free", see util._flock.)
+        store_lock = hold_store_lock(_store.root)
         envs = _store.list_envs()
         if _reap_ec2_vms:
             await _reap_orphaned_ec2_vms(_store.root, envs)
@@ -704,6 +711,7 @@ def create_app(
             for reconciler in reconcilers.values():
                 await reconciler.stop()
             stop_in_thread(gateway_server, gateway_thread)
+            store_lock.release()
 
     app = FastAPI(title="odin", version=odin_version(), lifespan=lifespan)
     app.middleware("http")(_csrf_guard)
