@@ -139,7 +139,7 @@ def workload_env(keystore: KeyStore, env: str, node_label: str, gateway_port: in
     `AWS_ENDPOINT_URL` uses `CONTAINER_HOST` (`host.docker.internal`), never
     `127.0.0.1` -- from inside a container/VM that's the container/VM's own
     loopback, not the Mac running the gateway (the same reasoning
-    `Reconciler._observe_rds`'s DATABASE_URL fact and `aws/backings.py`'s
+    `tf_status._db_facts`'s DATABASE_URL fact and `aws/backings.py`'s
     goaws QUEUE_URL already apply)."""
     access_key, secret_key = keystore.issue(env, node_label)
     return {

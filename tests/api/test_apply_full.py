@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 from odin.agent.hcl import generate_tf
 from odin.agent.translate import TranslateResult
 from odin.runtime.colima import ContainerFacts, HostFacts, RunHandle
-from odin.server import create_app
+from odin.server import _TOFU_NOT_INSTALLED, create_app
 from odin.simulate.runner import SimulateBusy
 from odin.simulate.workspace import tf_dir
 from odin.spec.store import SpecStore
@@ -163,11 +163,13 @@ def test_apply_full_admits_a_small_stack_that_fits_the_budget(tmp_path, monkeypa
     assert resp.status_code == 200  # unaffected: nothing regressed on the ordinary path
 
 
-def test_rds_only_canvas_skips_tofu_cleanly(tmp_path, monkeypatch):
-    # The REAL translate is used: an rds-only stack has zero TF-supported
-    # resources, so translate() short-circuits before ever touching the SDK.
-    # which -> None makes any wrongful trip into the tofu path show up as
-    # "unavailable" instead of silently passing.
+def test_rds_only_canvas_now_goes_THROUGH_tofu(tmp_path, monkeypatch):
+    """W2.7 inverted this test. An rds-only canvas used to be the one shape
+    with ZERO TF-supported resources -- translate() short-circuited, tofu was
+    never invoked, and the reconciler created the database itself. `rds` is an
+    `aws_db_instance` now, so the SAME canvas must reach tofu (and the
+    reconciler must create nothing). `which -> None` makes that visible as a
+    real "unavailable" verdict rather than a silent pass."""
     monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: None)
     rds, aws = FakeRds(), FakeAws()
     app = _app(tmp_path, rds=rds, aws=aws)
@@ -175,15 +177,20 @@ def test_rds_only_canvas_skips_tofu_cleanly(tmp_path, monkeypatch):
         resp = client.post("/apply-full", json=RDS_ONLY)
     assert resp.status_code == 200
     body = resp.json()
-    assert body["status"] == "applied"
-    assert body["tf"] is None
+    # `applied_tf_failed`, not `applied`: with rds inside Terraform, tofu being
+    # missing is now a real failure for this canvas rather than irrelevant to it.
+    assert body["status"] == "applied_tf_failed"
+    assert body["tf"] == {"status": "unavailable", "exit_code": None, **_TOFU_NOT_INSTALLED}
+    # tofu being ABSENT still commits the desired state (unlike a tofu run that
+    # actually failed) -- the pre-existing rule, unchanged by W2.7.
     assert body["rev"]
     assert body["env"] == "default"
     assert body["skipped"] == []
-    assert body["refined"] is False
-    assert body["unsupported"] == ["db (rds): Simulate v1 — stays on the reconciler path"]
-    assert rds.created == ["db"]  # the reconciler half really ran
-    assert aws.ensured == []  # nothing TF-supported -- ensure_backings is never called
+    assert body["unsupported"] == []  # no longer the documented exception
+    assert rds.created == []  # the reconciler no longer creates the database
+    # rds needs no shared BACKING container (its substrate is its own Postgres),
+    # so ensure_backings still has nothing to boot for this canvas.
+    assert aws.ensured == []
 
 
 def test_no_tofu_installed_reports_tf_unavailable_but_reconciler_applied(tmp_path, monkeypatch):

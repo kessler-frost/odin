@@ -388,14 +388,14 @@ def _wait_available(rds: PostgresRds, identifier: str, user: str, password: str,
     return 0, error
 
 
-def _finish_create(stores: SynthStores, env: str, identifier: str, user: str, password: str, rds: PostgresRds) -> None:
+def _finish_create(stores: SynthStores, env: str, identifier: str, user: str, password: str, db_name: str, rds: PostgresRds) -> None:
     # Deliberately broad, for `ec2compute._finish_boot`'s exact reason: this
     # runs on a daemon thread with no caller to propagate to, and an uncaught
     # exception would strand the instance `creating` forever -- the provider's
     # create waiter would then spin until ITS timeout with no explanation.
     # Any failure becomes a real, provider-visible `failed` status instead.
     try:
-        rds.create_db(identifier, user, password)
+        rds.create_db(identifier, user, password, db_name)
     except Exception as exc:
         log.warning("rds create failed for %s (env %s): %s", identifier, env, exc)
         _update(stores, env, identifier, status=FAILED, status_reason=f"container did not start: {exc}")
@@ -470,7 +470,7 @@ def _create_db_instance(params: dict[str, str], env: str, stores: SynthStores, n
     # otherwise flip it to `available` mid-render -- ec2compute's own
     # documented race).
     response = _instance_response("CreateDBInstance", stores, env, record)
-    _spawn(_finish_create, stores, env, identifier, user, password, rds)
+    _spawn(_finish_create, stores, env, identifier, user, password, record["db_name"], rds)
     return response
 
 
@@ -618,7 +618,7 @@ def converge_db_instances(
         log.info("converging rds %s (env %s): re-creating its container", identifier, env)
         _spawn(
             _finish_create, stores, env, identifier,
-            record["master_username"], record["master_password"], rds,
+            record["master_username"], record["master_password"], record["db_name"], rds,
         )
 
 

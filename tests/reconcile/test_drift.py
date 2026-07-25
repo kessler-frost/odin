@@ -7,9 +7,12 @@ and tests/simulate/test_ecs_drift_e2e.py for the one real-container proof.
 """
 from __future__ import annotations
 
+from odin.aws.rds import container_name as db_container_name
 from odin.compute.instances import vm_name
 from odin.compute.tasks import container_name as task_container_name
+from odin.gateway.models import rdsctl
 from odin.gateway.stores import SynthStores
+from odin.reconcile.assertions import PgReady
 from odin.reconcile.drift import DriftSweeper
 from odin.reconcile.tf_status import project
 
@@ -34,12 +37,20 @@ class FakeVms:
 
 
 class FakeContainers:
-    """`_ContainerRuntime.container_names()`'s shape."""
+    """`_ContainerRuntime.container_names()`'s shape, plus the per-name
+    `status`/`exit_code` calls the rds half makes ONLY on a failed health probe
+    (W2.7) -- `running` names them, `exited` maps to a real exit code, anything
+    absent reads `absent`."""
 
-    def __init__(self, names: list[str] | None = None, error: Exception | None = None) -> None:
+    def __init__(
+        self, names: list[str] | None = None, error: Exception | None = None,
+        exited: dict[str, int] | None = None,
+    ) -> None:
         self.names = names if names is not None else []
         self.error = error
+        self.exited = exited or {}
         self.calls = 0
+        self.status_calls: list[str] = []
 
     def container_names(self) -> list[str]:
         self.calls += 1
@@ -47,9 +58,35 @@ class FakeContainers:
             raise self.error
         return list(self.names)
 
+    def status(self, name: str) -> str:
+        self.status_calls.append(name)
+        if name in self.names:
+            return "running"
+        return "exited" if name in self.exited else "absent"
 
-def _sweeper(vms=None, containers=None) -> DriftSweeper:
-    return DriftSweeper(containers=containers or FakeContainers(), vms=vms or FakeVms())
+    def exit_code(self, name: str) -> int:
+        return self.exited.get(name, -1)
+
+
+class FakeProbe:
+    """`pg_ready_sync`'s shape. `ok` is what every probe answers; the test
+    flips it to simulate a database that stopped responding."""
+
+    def __init__(self, ok: bool = True, error: str = "connection refused") -> None:
+        self.ok = ok
+        self.error = error
+        self.calls: list[tuple] = []
+
+    def __call__(self, host, port, user, password, db="postgres") -> PgReady:
+        self.calls.append((host, port, user, password))
+        return PgReady(ok=self.ok, error=None if self.ok else self.error)
+
+
+def _sweeper(vms=None, containers=None, probe=None) -> DriftSweeper:
+    return DriftSweeper(
+        containers=containers or FakeContainers(), vms=vms or FakeVms(),
+        probe=probe or FakeProbe(),
+    )
 
 
 def _ec2(stores: SynthStores, label: str, instance_id: str, state_name: str = "running") -> str:
@@ -406,3 +443,97 @@ def test_vpc_subnet_sg_iam_role_and_ecr_records_are_never_swept(tmp_path):
 
     assert _sweeper(vms=vms, containers=containers).verdicts(stores, ENV) == {}
     assert (vms.calls, containers.calls) == (0, 0)
+
+
+# --- rds (W2.7): checked by its real health probe, not by a listing ---------
+
+
+def _db(stores: SynthStores, label: str, identifier: str, status: str = "available", port: int = 54321) -> str:
+    stores.rdsctl.set(ENV, f"db:{identifier}", {
+        "db_instance_identifier": identifier, "status": status, "status_reason": None,
+        "master_username": "app", "master_password": "apppass123", "db_name": "postgres",
+        "endpoint_address": "host.docker.internal", "endpoint_port": port,
+    })
+    stores.tags.set(ENV, f"rds:{rdsctl.db_arn(identifier)}", {"odin:node": label})
+    return db_container_name(ENV, identifier)
+
+
+def test_a_healthy_database_is_no_drift_and_costs_zero_subprocess_calls(tmp_path):
+    stores = SynthStores(tmp_path)
+    _db(stores, "app-db", "app-db")
+    containers, probe = FakeContainers(names=[]), FakeProbe(ok=True)
+
+    assert _sweeper(containers=containers, probe=probe).verdicts(stores, ENV) == {}
+    # ONE real connection, and no `docker` call at all on the happy path.
+    assert probe.calls == [("127.0.0.1", 54321, "app", "apppass123")]
+    assert (containers.calls, containers.status_calls) == (0, [])
+
+
+def test_a_killed_container_is_real_drift_and_the_record_is_corrected(tmp_path):
+    """`docker kill` -- the canonical way a database dies -- leaves an EXITED
+    container that `container_names` still lists, which is exactly why rds is
+    probed instead of listed. The verdict carries the container's real exit
+    code, and the record goes `failed` so an Apply's converge recreates it."""
+    stores = SynthStores(tmp_path)
+    name = _db(stores, "app-db", "app-db")
+    containers = FakeContainers(names=[], exited={name: 137})  # 137 = SIGKILL
+
+    verdicts = _sweeper(containers=containers, probe=FakeProbe(ok=False)).verdicts(stores, ENV)
+
+    assert verdicts["app-db"] == f"container {name} is not running (exit 137) \u2014 re-Apply to recreate"
+    record = stores.rdsctl.get(ENV, "db:app-db")
+    assert record["status"] == "failed"
+    assert record["status_reason"] == verdicts["app-db"]
+
+
+def test_the_world_stops_claiming_healthy_and_stops_publishing_a_dead_database_url(tmp_path):
+    """The projection-level point: a dead database must not keep advertising a
+    DATABASE_URL nothing can connect to -- that stale fact is what the Fabric
+    would hand a consumer."""
+    stores = SynthStores(tmp_path)
+    name = _db(stores, "app-db", "app-db")
+    _kind, phase, facts, _verdict = project(stores, ENV)["app-db"]
+    assert (phase, facts["DATABASE_URL"]) == (
+        "healthy", "postgresql://app:apppass123@host.docker.internal:54321/postgres",
+    )
+
+    _sweeper(containers=FakeContainers(names=[], exited={name: 137}), probe=FakeProbe(ok=False)).verdicts(stores, ENV)
+
+    kind, phase, facts, verdict = project(stores, ENV)["app-db"]
+    assert (kind, phase, facts) == ("rds", "crashed", {})
+    assert "is not running (exit 137)" in verdict
+
+
+def test_a_wedged_but_running_container_is_reported_without_corrupting_the_record(tmp_path):
+    """A probe failure against a container that IS up may be transient, so it's
+    reported and left to self-heal on the next sweep -- never written into the
+    record, which would need a human Apply to undo. (The pre-W2.7 reconciler
+    drew exactly this line: it only cleared the container on a real exit.)"""
+    stores = SynthStores(tmp_path)
+    name = _db(stores, "app-db", "app-db")
+    containers = FakeContainers(names=[name])
+
+    verdicts = _sweeper(containers=containers, probe=FakeProbe(ok=False, error="too many clients")).verdicts(stores, ENV)
+
+    assert verdicts["app-db"] == f"Postgres on {name} is not accepting connections: too many clients"
+    record = stores.rdsctl.get(ENV, "db:app-db")
+    assert (record["status"], record["status_reason"]) == ("available", None)
+
+
+def test_a_creating_deleting_or_failed_database_is_never_probed(tmp_path):
+    """Mid-boot is not drift: `rdsctl._finish_create` is still running its own
+    `pg_ready` loop, and `deleting`/`failed` are already terminal."""
+    for status in ("creating", "deleting", "failed"):
+        stores = SynthStores(tmp_path / status)
+        _db(stores, "app-db", "app-db", status=status)
+        probe = FakeProbe(ok=False)
+        assert _sweeper(probe=probe).verdicts(stores, ENV) == {}
+        assert probe.calls == []
+
+
+def test_a_database_with_no_endpoint_yet_is_never_probed(tmp_path):
+    stores = SynthStores(tmp_path)
+    _db(stores, "app-db", "app-db", port=0)
+    probe = FakeProbe(ok=False)
+    assert _sweeper(probe=probe).verdicts(stores, ENV) == {}
+    assert probe.calls == []

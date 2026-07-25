@@ -1,9 +1,10 @@
 """odin FastAPI app factory.
 
 The canvas authors a desired-state Stack; a continuous Reconciler drives reality
-(real Postgres for rds nodes, and per-env backing containers for the
-AWS-shaped resources, both via Colima); the World projects back to the canvas
-over WebSocket.
+(per-env backing containers for the AWS-shaped resources, via Colima) and
+projects what `tofu apply` created through the gateway (every TF-owned kind,
+`rds` among them since W2.7); the World projects back to the canvas over
+WebSocket.
 """
 from __future__ import annotations
 
@@ -27,14 +28,13 @@ from odin.api.canvas import CanvasGraph, create_canvas_router
 from odin.api.logs import create_logs_router
 from odin.api.ws import ConnectionManager
 from odin.aws.backings import BackingAws
-from odin.aws.rds import PostgresRds
 from odin.compute.tasks import TaskRuntime
 from odin.fabric.localhost import LocalhostFabric
 from odin.fabric.nebula import mesh_state
 from odin.gateway import DEFAULT_GATEWAY_PORT, GATEWAY_PORT_ENV
 from odin.gateway.app import GatewayState, create_gateway_app, serve_in_thread, stop_in_thread
 from odin.gateway.keys import OPERATOR_NODE_ID, KeyStore, Principal
-from odin.gateway.models import ec2compute, ecsctl, lambdactl
+from odin.gateway.models import ec2compute, ecsctl, lambdactl, rdsctl
 from odin.gateway.stores import SynthStores
 from odin.reconcile import admission
 from odin.reconcile.drift import DriftSweeper
@@ -467,6 +467,15 @@ def create_apply_full_router(
         # plane replaces a dead sandbox; this is odin's equivalent. Idempotent:
         # only a `Failed` function is re-`ensure`d, an Active one is untouched.
         lambdactl.converge_functions(stores, env, keystore=keystore, gateway_port=gateway_port())
+        # W2.7: and the same recovery for rds. A Postgres container is odin's
+        # execution substrate for a resource whose terraform config is
+        # unchanged (`status` is read-only Computed in the provider's schema),
+        # so tofu's plan is empty and only this can bring a killed database
+        # back. Idempotent: an `available` instance is untouched, a `failed`
+        # one is re-created and re-`pg_ready`-gated. This is what makes the
+        # scenario-2 crash/recover behavior survive the move off the
+        # reconciler -- see reconcile/drift.py's rds notes.
+        rdsctl.converge_db_instances(stores, env)
         await reconciler.tick()  # kick an immediate pass; the loop continues it
         return JSONResponse(status_code=200, content=body)
 
@@ -539,14 +548,16 @@ def create_app(
     translate_cache = translate_mod.TranslateCache()
 
     # One reconciler per environment, created lazily. Each gets its own
-    # env-scoped rds runner + backing containers, so AWS state stays isolated.
+    # env-scoped backing containers, so AWS state stays isolated. (The rds
+    # substrate is no longer one of them -- W2.7 moved it to the gateway, whose
+    # own model builds one per env; see the `rds=` argument to
+    # create_gateway_app below.)
     reconcilers: dict[str, Reconciler] = {}
 
     def _make_reconciler(env: str) -> Reconciler:
-        env_rds = rds or PostgresRds(_runtime, env)
         env_aws = aws or (BackingAws(_runtime, env, gateway_port=gateway_port_actual) if backings else None)
         return Reconciler(
-            _store, _runtime, env_rds, aws=env_aws, gateway=gateway_state, fabric=LocalhostFabric(),
+            _store, _runtime, aws=env_aws, gateway=gateway_state, fabric=LocalhostFabric(),
             ws=ws_manager, env=env, poll_interval=1.0, stores=gateway_stores,
             # W2.2's reality sweep shells out to the REAL `limactl`/`docker`,
             # so it's gated on the same `backings` flag every other real-

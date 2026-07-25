@@ -1,12 +1,13 @@
 """Fix-wave 2b finding #1 -- reconcile/tf_status.py: a pure, read-only
 projection of TF-owned resources (vpc/subnet/sg/ec2/ecs/lambda/iam_role/ecr/
-logs -- kinds only tofu ever creates/destroys, never entered into World before
-this fix) from the gateway's synth stores into `label -> (kind, phase,
+logs/rds -- kinds only tofu ever creates/destroys, never entered into World
+before this fix) from the gateway's synth stores into `label -> (kind, phase,
 facts, verdict)`. Hand-built `SynthStores`, no reconciler/asyncio involved
 -- see tests/reconcile/test_reconciler.py for the Reconciler-level
 integration (emitting WorldDeltas + pruning)."""
 from __future__ import annotations
 
+from odin.gateway.models import rdsctl
 from odin.gateway.stores import SynthStores
 from odin.reconcile.tf_status import TF_OWNED_KINDS, project
 
@@ -16,7 +17,9 @@ ENV = "default"
 def test_tf_owned_kinds_excludes_reconciler_owned_kinds():
     # s3/sqs/sns/dynamodb already get real World entries via the reconciler's
     # own PROVISIONED path -- this projection must never double-own them.
-    assert TF_OWNED_KINDS == {"vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr", "logs"}
+    assert TF_OWNED_KINDS == {
+        "vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr", "logs", "rds",
+    }
 
 
 # --- vpc/subnet/sg: no AWS-native name field, so the odin:node tag is the
@@ -453,3 +456,88 @@ def test_multiple_kinds_project_independently(tmp_path):
 
     result = project(stores, ENV)
     assert set(result) == {"net", "r1", "fn1"}
+
+
+# --- rds (W2.7): the first projected kind that carries real FACTS -----------
+
+
+def _db_record(identifier: str, status: str = "available", port: int = 54321, **extra) -> dict:
+    return {
+        "db_instance_identifier": identifier, "status": status, "status_reason": None,
+        "master_username": "app", "master_password": "apppass123", "db_name": "postgres",
+        "endpoint_address": "host.docker.internal", "endpoint_port": port, **extra,
+    }
+
+
+def _db(stores: SynthStores, label: str, identifier: str, **kwargs) -> None:
+    stores.rdsctl.set(ENV, f"db:{identifier}", _db_record(identifier, **kwargs))
+    stores.tags.set(ENV, f"rds:{rdsctl.db_arn(identifier)}", {"odin:node": label})
+
+
+def test_an_available_database_projects_healthy_with_both_database_url_forms(tmp_path):
+    """THE contract the move onto Terraform had to preserve byte-for-byte:
+    existing canvases reference `${{db.DATABASE_URL}}` (containers) and
+    `${{db.DATABASE_URL_VM}}` (an EC2 Lima VM, v0.5.4 finding #5) by name, and
+    `fabric/` resolves both out of exactly these World facts."""
+    stores = SynthStores(tmp_path)
+    _db(stores, "app-db", "app-db")
+
+    kind, phase, facts, verdict = project(stores, ENV)["app-db"]
+
+    assert (kind, phase, verdict) == ("rds", "healthy", None)
+    assert facts == {
+        "DATABASE_URL": "postgresql://app:apppass123@host.docker.internal:54321/postgres",
+        "endpoint": "host.docker.internal:54321",
+        "DATABASE_URL_VM": "postgresql://app:apppass123@host.lima.internal:54321/postgres",
+        "endpoint_vm": "host.lima.internal:54321",
+    }
+
+
+def test_the_database_url_path_is_the_instances_real_db_name(tmp_path):
+    """`db_name` is a real `POSTGRES_DB` the substrate creates (aws/rds.py), so
+    the URL points at a database that exists rather than at a label."""
+    stores = SynthStores(tmp_path)
+    stores.rdsctl.set(ENV, "db:app-db", _db_record("app-db", db_name="orders"))
+    stores.tags.set(ENV, f"rds:{rdsctl.db_arn('app-db')}", {"odin:node": "app-db"})
+
+    facts = project(stores, ENV)["app-db"][2]
+
+    assert facts["DATABASE_URL"].endswith("/orders")
+    assert facts["DATABASE_URL_VM"].endswith("/orders")
+
+
+def test_a_creating_database_is_starting_with_no_facts_yet(tmp_path):
+    """A half-booted database must not advertise an endpoint that isn't
+    serving -- the provider's create waiter is still polling at this point."""
+    stores = SynthStores(tmp_path)
+    _db(stores, "app-db", "app-db", status="creating", port=0)
+
+    assert project(stores, ENV)["app-db"] == ("rds", "starting", {}, None)
+
+
+def test_a_deleting_database_stays_visible_until_its_record_is_gone(tmp_path):
+    # ec2's `shutting-down` reasoning: a delete can fail and the container
+    # outlive it, so the node must not vanish off the canvas early.
+    stores = SynthStores(tmp_path)
+    _db(stores, "app-db", "app-db", status="deleting")
+
+    assert project(stores, ENV)["app-db"] == ("rds", "starting", {}, None)
+
+
+def test_a_failed_database_projects_crashed_with_the_real_reason_and_no_stale_url(tmp_path):
+    stores = SynthStores(tmp_path)
+    _db(stores, "app-db", "app-db", status="failed", status_reason="Postgres never became ready: timeout")
+
+    assert project(stores, ENV)["app-db"] == (
+        "rds", "crashed", {}, "Postgres never became ready: timeout",
+    )
+
+
+def test_an_untagged_database_still_projects_under_its_identifier(tmp_path):
+    """Unlike vpc/subnet/ec2, rds HAS an AWS-native name -- the
+    DBInstanceIdentifier, which agent/hcl.py sets to the canvas label -- so an
+    untagged instance (imported out of band) is still projectable."""
+    stores = SynthStores(tmp_path)
+    stores.rdsctl.set(ENV, "db:app-db", _db_record("app-db"))
+
+    assert project(stores, ENV)["app-db"][0] == "rds"

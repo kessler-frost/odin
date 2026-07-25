@@ -43,7 +43,13 @@ class PostgresRds:
     def container_name(self, db_id: str) -> str:
         return container_name(self._env, db_id)
 
-    def create_db(self, db_id: str, user: str, password: str) -> None:
+    def create_db(self, db_id: str, user: str, password: str, db_name: str = "postgres") -> None:
+        """`db_name` is REAL (W2.7): it becomes `POSTGRES_DB`, so the database
+        an `aws_db_instance`'s `db_name` names actually exists and the
+        DATABASE_URL fact can point at it. Defaults to `postgres` -- the
+        database the image always creates anyway -- so an existing canvas with
+        no `dbName` field gets byte-identical behavior and a byte-identical
+        DATABASE_URL."""
         name = self.container_name(db_id)
         if self._rt.status(name) == "running":
             return  # idempotent: already up
@@ -56,7 +62,7 @@ class PostgresRds:
         self._rt.run_container(ContainerSpec(
             name=name,
             image=POSTGRES_IMAGE,
-            env={"POSTGRES_USER": user, "POSTGRES_PASSWORD": password},
+            env={"POSTGRES_USER": user, "POSTGRES_PASSWORD": password, "POSTGRES_DB": db_name},
             ports={5432: 0},
             labels={"odin-env": self._env},
         ))

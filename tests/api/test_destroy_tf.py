@@ -127,8 +127,10 @@ def test_destroy_409_when_a_tofu_run_is_already_in_progress(tmp_path):
         resp = client.post("/destroy")
     assert resp.status_code == 409
     assert "already in progress" in resp.json()["error"]
-    # nothing was pruned -- the busy guard runs before any mutation
-    assert client.get("/world").json()["resources"] != []
+    # Nothing was torn down -- the busy guard runs before ANY mutation. Asserted
+    # against the desired state rather than World: since W2.7 the rds node in
+    # CANVAS is TF-owned, so /apply alone never puts it in World to begin with.
+    assert app.state.store.get_stack("default").resources != ()
 
 
 def test_destroy_409_when_a_run_races_in_after_the_guard(tmp_path):

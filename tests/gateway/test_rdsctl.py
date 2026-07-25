@@ -42,7 +42,7 @@ class FakePostgresRds:
         self.port = port
         self.fail_create = fail_create
         self.ready = ready
-        self.created: list[tuple[str, str, str]] = []
+        self.created: list[tuple[str, str, str, str]] = []
         self.deleted: list[str] = []
         self.passwords: list[tuple[str, str]] = []
         self.up: set[str] = set()
@@ -50,8 +50,8 @@ class FakePostgresRds:
     def container_name(self, db_id: str) -> str:
         return f"odin-rds-{ENV}-{db_id}"
 
-    def create_db(self, db_id: str, user: str, password: str) -> None:
-        self.created.append((db_id, user, password))
+    def create_db(self, db_id: str, user: str, password: str, db_name: str = "postgres") -> None:
+        self.created.append((db_id, user, password, db_name))
         if self.fail_create:
             raise RuntimeError("docker run failed")
         self.up.add(db_id)
@@ -180,7 +180,7 @@ def test_create_returns_creating_immediately_and_boots_in_the_background(tmp_pat
     available = _await_status(sink, rds, stores, fake, "available")
     assert available["Endpoint"] == {"Address": "host.docker.internal", "Port": 54321, "HostedZoneId": "Z2R2ITUGPM61AM"}
     assert available["DbInstancePort"] == 54321
-    assert fake.created == [(DB, USER, PASSWORD)]
+    assert fake.created == [(DB, USER, PASSWORD, "postgres")]
 
 
 def test_available_is_gated_on_a_real_pg_ready_probe_not_on_docker_run(tmp_path, sink, rds):
@@ -314,7 +314,7 @@ def test_modify_records_metadata_changes_and_echoes_them_back(tmp_path, sink, rd
     assert parsed["DBInstance"]["DBInstanceClass"] == "db.t3.small"
     # Metadata only -- the container is untouched (a documented limit, not a
     # silent resize).
-    assert fake.created == [(DB, USER, PASSWORD)]
+    assert fake.created == [(DB, USER, PASSWORD, "postgres")]
 
 
 def test_modify_password_runs_a_real_alter_user(tmp_path, sink, rds):
@@ -424,7 +424,7 @@ def test_mark_instance_failed_then_converge_recreates_the_container(tmp_path, si
     rdsctl.converge_db_instances(stores, ENV, substrate=fake)
     recovered = _await_status(sink, rds, stores, fake, "available")
     assert recovered["Endpoint"]["Port"] == 54321
-    assert fake.created == [(DB, USER, PASSWORD), (DB, USER, PASSWORD)]
+    assert fake.created == [(DB, USER, PASSWORD, "postgres"), (DB, USER, PASSWORD, "postgres")]
     assert rdsctl.records(stores, ENV)[0]["status_reason"] is None
 
 
@@ -434,7 +434,7 @@ def test_converge_leaves_available_and_creating_instances_alone(tmp_path, sink, 
     _await_status(sink, rds, stores, fake, "available")
     rdsctl.converge_db_instances(stores, ENV, substrate=fake)
     rdsctl.converge_db_instances(stores, ENV, substrate=fake)
-    assert fake.created == [(DB, USER, PASSWORD)]
+    assert fake.created == [(DB, USER, PASSWORD, "postgres")]
 
 
 # --- dispatch --------------------------------------------------------------

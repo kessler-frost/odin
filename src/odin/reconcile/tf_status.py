@@ -1,9 +1,16 @@
 """Fix-wave 2b finding #1 -- a pure, read-only projection of the TF-owned
-resource kinds (vpc/subnet/sg/ec2/ecs/lambda/iam_role/ecr/logs: the kinds
+resource kinds (vpc/subnet/sg/ec2/ecs/lambda/iam_role/ecr/logs/rds: the kinds
 `agent/hcl.py` can build and only `tofu apply`/`tofu destroy` ever
 creates/destroys -- s3/sqs/sns/dynamodb are excluded, those already get real
 World entries via the reconciler's own PROVISIONED path in plan.py) from the
 gateway's synth stores into `label -> (kind, phase, facts, verdict)`.
+
+W2.7 added `rds`, and with it the first projected kind that carries real
+FACTS rather than an empty dict: an rds node's `DATABASE_URL` /
+`DATABASE_URL_VM` (see `_db_facts`) are what `fabric/` resolves every
+`${{db.VAR}}` reference from, so they had to keep working byte-for-byte when
+the database moved from the reconciler onto Terraform. Publishing them here,
+off the gateway's own DB-instance record, is what makes that true.
 
 Before this fix these kinds never entered World at all: the canvas showed
 a permanently stale DRAFT badge even once tofu had a real VM/service/
@@ -41,11 +48,15 @@ simply not projected yet, rather than guessing.
 from __future__ import annotations
 
 from odin.compute.tasks import TaskRuntime
-from odin.gateway.models import logsctl
+from odin.gateway.models import logsctl, rdsctl
 from odin.gateway.models.ecsctl import sweep_tasks
 from odin.gateway.stores import SynthStores
+from odin.runtime.colima import CONTAINER_HOST
+from odin.runtime.lima import LIMA_HOST
 
-TF_OWNED_KINDS = frozenset({"vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr", "logs"})
+TF_OWNED_KINDS = frozenset({
+    "vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr", "logs", "rds",
+})
 
 # EC2's real instance-state machine (gateway/models/ec2compute.py's own
 # `_STATE_CODES` keys) -> the World Phase enum. `stopped` (an intentional
@@ -66,6 +77,16 @@ _EC2_PHASE = {
 # function stays "healthy" (its container is still serving the OLD code)
 # through a redeploy regardless.
 _LAMBDA_PHASE = {"Pending": "starting", "Active": "healthy", "Failed": "crashed"}
+
+# RDS's own DBInstanceStatus values (gateway/models/rdsctl.py) -> Phase.
+# `deleting` reads `starting` for the SAME reason ec2's `shutting-down` does:
+# a delete can fail and the container outlive it, so the node stays visible
+# until the record actually disappears (and the prune in reconciler.py clears
+# it then).
+_RDS_PHASE = {
+    "creating": "starting", "available": "healthy",
+    "deleting": "starting", "failed": "crashed",
+}
 
 # label -> (kind, phase, facts, verdict) -- verdict is populated only for a
 # "crashed" phase, from whatever real reason the underlying model recorded.
@@ -135,6 +156,59 @@ def _log_groups(stores: SynthStores, env: str) -> Projected:
         label = _label(tags, name)
         if label:
             out[label] = ("logs", "healthy", {}, None)
+    return out
+
+
+def _db_facts(record: dict) -> dict:
+    """The rds facts the Fabric resolves `${{db.DATABASE_URL}}` from -- the
+    EXACT four keys (and the exact two host forms) the reconciler's own
+    `_observe_rds` published before W2.7, because existing canvases reference
+    them by name:
+
+      - `DATABASE_URL` / `endpoint` on `host.docker.internal` -- what a
+        CONTAINER consumer needs (inside a container, "localhost" is the
+        container, not the Mac; host.docker.internal is the host, same as AWS).
+      - `DATABASE_URL_VM` / `endpoint_vm` on `host.lima.internal` -- v0.5.4
+        finding #5: an EC2 Lima VM does NOT resolve host.docker.internal, so
+        an ec2 node consumes `${{db.DATABASE_URL_VM}}` while containers keep
+        `${{db.DATABASE_URL}}` (per-consumer-type ref routing is still
+        deferred; two facts remain the honest, smaller answer).
+
+    Both point at the SAME real Postgres, on the container's actually-published
+    host port, with the instance's real master credentials and its real
+    `db_name` (a `POSTGRES_DB` the substrate genuinely creates -- so the path
+    in this URL is a database that exists, not a label).
+    """
+    port = record.get("endpoint_port")
+    if not port:
+        return {}
+    user, password, db = record["master_username"], record["master_password"], record["db_name"]
+    addr, vm_addr = f"{CONTAINER_HOST}:{port}", f"{LIMA_HOST}:{port}"
+    return {
+        "DATABASE_URL": f"postgresql://{user}:{password}@{addr}/{db}",
+        "endpoint": addr,
+        "DATABASE_URL_VM": f"postgresql://{user}:{password}@{vm_addr}/{db}",
+        "endpoint_vm": vm_addr,
+    }
+
+
+def _db_instances(stores: SynthStores, env: str) -> Projected:
+    """W2.7: rds joins the projection instead of being provisioned+observed by
+    the reconciler. Facts are published ONLY for an `available` instance -- a
+    `failed` one has no working endpoint, and advertising the last known
+    DATABASE_URL for a dead database is exactly the kind of stale-green lie the
+    reality sweep exists to kill. The verdict then carries WHY."""
+    out: Projected = {}
+    for record in rdsctl.records(stores, env):
+        identifier = record["db_instance_identifier"]
+        tags = stores.tags.get(env, f"rds:{rdsctl.db_arn(identifier)}", {})
+        label = _label(tags, identifier)
+        if not label:
+            continue
+        phase = _RDS_PHASE.get(record["status"], "starting")
+        facts = _db_facts(record) if record["status"] == rdsctl.AVAILABLE else {}
+        verdict = (record.get("status_reason") or None) if phase == "crashed" else None
+        out[label] = ("rds", phase, facts, verdict)
     return out
 
 
@@ -263,6 +337,7 @@ def project(stores: SynthStores, env: str, ecs_runtime: TaskRuntime | None = Non
     out.update(_iam_roles(stores, env))
     out.update(_ecr_repos(stores, env))
     out.update(_log_groups(stores, env))
+    out.update(_db_instances(stores, env))
     out.update(_ec2_instances(stores, env))
     out.update(_lambda_functions(stores, env))
     out.update(_ecs_services(stores, env, ecs_runtime))
