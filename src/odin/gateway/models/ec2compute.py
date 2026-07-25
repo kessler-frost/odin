@@ -961,6 +961,21 @@ def _reaper_enabled() -> bool:
     return os.environ.get("ODIN_REAP_EC2_VMS", "1").strip().lower() not in _REAPER_OFF_VALUES
 
 
+class MeshRefreshFailed(RuntimeError):
+    """An Apply could not push a running instance's CURRENT security state into
+    its VM -- and therefore must not report success.
+
+    Field test 3 HIGH-1's second half. `InstanceVm.refresh_nebula` never
+    raises (mesh wiring must not fail an instance boot), so a `failed` was for
+    one release a log line and nothing else: the Apply returned `applied`,
+    exit 0, no warnings, while a VM went on enforcing the groups it was born
+    with. In the GRANT direction that is an annoyance. In the REVOKE
+    direction -- the single most safety-critical edit a user can make -- it is
+    an unchanged firewall behind a green light, so this is deliberately the
+    one mesh failure that is allowed to fail an Apply. It names the VM, what
+    could not be applied, and what to do about it."""
+
+
 def ensure_instance_mesh(stores: SynthStores, env: str, vm: InstanceVm | None = None) -> dict[str, str]:
     """Push each RUNNING instance's CURRENT compiled security groups into its
     already-booted VM -- `rdsctl.ensure_db_mesh`'s exact twin, for the exact
@@ -978,10 +993,17 @@ def ensure_instance_mesh(stores: SynthStores, env: str, vm: InstanceVm | None = 
 
     Firewall recompilation is `_instance_firewall`, the same function
     RunInstances uses, so a running instance and one launched a second later
-    can never disagree about what its groups mean. Returns
-    `{vm name -> what happened}` (`InstanceVm.refresh_nebula`'s own words) for
-    logging; an instance that is not `running`, or has no VPC, is skipped
-    entirely -- there is no daemon to talk to."""
+    can never disagree about what its groups mean. Both halves of an
+    instance's security state travel here: its groups' RULES (the compiled
+    firewall) and its own MEMBERSHIP of those groups (its cert groups, field
+    test 3 HIGH-1 -- `InstanceVm._reissue_cert`). Returns `{vm name -> what
+    happened}` (`InstanceVm.refresh_nebula`'s own words) for logging; an
+    instance that is not `running`, or has no VPC, is skipped entirely --
+    there is no daemon to talk to.
+
+    RAISES `MeshRefreshFailed` if any running VM did not take its update. That
+    is the whole point: a security control that cannot be applied must not be
+    reported as applied."""
     machine = vm or InstanceVm()
     actions: dict[str, str] = {}
     for record in _records(stores, env, "instance"):
@@ -996,7 +1018,23 @@ def ensure_instance_mesh(stores: SynthStores, env: str, vm: InstanceVm | None = 
         actions[vm_name(env, record["instance_id"])] = machine.refresh_nebula(
             vm_name(env, record["instance_id"]), nebula,
         )
+    _refuse_to_report_success(env, stores, actions)
     return actions
+
+
+def _refuse_to_report_success(env: str, stores: SynthStores, actions: dict[str, str]) -> None:
+    failed = sorted(name for name, action in actions.items() if action == "failed")
+    if not failed:
+        return
+    raise MeshRefreshFailed(
+        f"{len(failed)} running EC2 instance(s) in env {env!r} did NOT adopt the security groups this "
+        f"Apply gave them: {', '.join(failed)}. Their nebula daemons are still enforcing their previous "
+        f"rules and identity, so any access this Apply REVOKED is still open on the overlay. The apply "
+        f"itself succeeded -- odin's records and Terraform state are correct; only the running VMs are "
+        f"behind. Re-run Apply to retry, or terminate and re-create the listed instance(s) to force the "
+        f"change. Cause is in the odin server log (`nebula ... failed on <vm>`) and in "
+        f"`{Path(stores.root) / env / 'nebula'}`."
+    )
 
 
 def reap_orphaned_vms(root: Path, envs: list[str], vm: InstanceVm | None = None) -> list[str]:

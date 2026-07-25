@@ -635,6 +635,33 @@ def test_ensure_instance_mesh_pushes_the_current_rules_into_a_running_vm(sink, e
     assert actions == {name: "reloaded"}
 
 
+def test_ensure_instance_mesh_refuses_to_report_success_when_a_vm_did_not_take_it(sink, ec2, stores):
+    """Field test 3 HIGH-1's second half: `refresh_nebula` never raises (mesh
+    wiring must not fail an instance boot), so a `failed` used to be a log line
+    while the Apply returned `applied` and exit 0 -- with the VM still
+    enforcing the groups it was born with. A security control that could not be
+    applied must not be reported as applied, and the message must name the VM."""
+    vpc_id = _create_vpc(stores, sink, ec2)
+    subnet_id = _create_subnet(stores, sink, ec2, vpc_id)
+    web_sg = _create_sg(stores, sink, ec2, vpc_id, name="web-sg")
+
+    class BrokenVm(RefreshingInstanceVm):
+        def refresh_nebula(self, name, nebula):
+            self.refreshed.append((name, nebula))
+            return "failed"
+
+    vm = BrokenVm()
+    parsed = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, SecurityGroupIds=[web_sg])
+    instance_id = parsed["Instances"][0]["InstanceId"]
+    _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+
+    with pytest.raises(ec2compute.MeshRefreshFailed) as raised:
+        ec2compute.ensure_instance_mesh(stores, ENV, vm)
+    message = str(raised.value)
+    assert f"odin-ec2-{ENV}-{instance_id}" in message
+    assert "REVOKED" in message and "Re-run Apply" in message
+
+
 def test_ensure_instance_mesh_skips_instances_with_no_running_vm_to_talk_to(sink, ec2, stores):
     """A stopped instance has no daemon to signal, and an instance with no VPC
     was never on a mesh at all -- neither is a candidate."""

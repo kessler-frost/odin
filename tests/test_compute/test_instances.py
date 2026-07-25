@@ -327,7 +327,11 @@ def test_boot_signs_the_instances_security_groups_as_cert_groups(tmp_path):
     vm.boot(NAME, get_instance_type("t3.micro"), hostname="i-0123456789abcdef0", nebula=nebula)
 
     sign_call = next(c for c in runner.calls if "sign" in c and "i-0123456789abcdef0" in c)
-    assert sign_call[sign_call.index("-groups") + 1] == "ec2,sg-web00000000000000,sg-ops00000000000000"
+    # SORTED, deliberately (field test 3 HIGH-1): membership is now compared
+    # across Applies to decide whether to re-issue this cert, and the order the
+    # gateway lists an instance's groups in is not meaningful -- an unsorted
+    # comparison would restart a daemon over a reorder.
+    assert sign_call[sign_call.index("-groups") + 1] == "ec2,sg-ops00000000000000,sg-web00000000000000"
 
 
 def test_boot_without_nebula_never_touches_the_fabric():
@@ -426,7 +430,7 @@ def test_activate_nebula_never_raises_even_if_lighthouse_manager_blows_up(tmp_pa
 # --- refresh_nebula: an SG edit reaching an ALREADY-RUNNING VM (HIGH-1) ------
 
 
-def _booted_vm(tmp_path, firewall=None, host_id="i-refresh"):
+def _booted_vm(tmp_path, firewall=None, host_id="i-refresh", groups=()):
     """A VM that has really been through `boot()` -- so the env's mesh is
     bootstrapped and odin has recorded the config it put on the VM, which is
     the state every refresh starts from."""
@@ -434,7 +438,7 @@ def _booted_vm(tmp_path, firewall=None, host_id="i-refresh"):
     runner.responses["hostname -I"] = _Proc(0, "192.168.64.20")
     runner.responses["ifconfig"] = _ifconfig_response("192.168.64.1")
     vm = InstanceVm(runner=runner, lighthouse=FakeLighthouseManager())
-    nebula = NebulaJoin(root=tmp_path, env="myenv", host_id=host_id, firewall=firewall)
+    nebula = NebulaJoin(root=tmp_path, env="myenv", host_id=host_id, firewall=firewall, groups=groups)
     vm.boot(NAME, get_instance_type("t3.micro"), hostname=host_id, nebula=nebula)
     runner.calls.clear()
     return vm, runner, nebula
@@ -536,6 +540,127 @@ def test_refresh_nebula_never_raises(tmp_path):
     broken = InstanceVm(runner=Exploding(), lighthouse=FakeLighthouseManager())
     widened = NebulaJoin(root=nebula.root, env=nebula.env, host_id=nebula.host_id, firewall=_rules("22", "8080"))
     assert broken.refresh_nebula(NAME, widened) == "failed"
+
+
+# --- membership: moving an instance BETWEEN groups (field test 3 HIGH-1) ----
+#
+# The REVOKE direction is what makes this a security fix rather than a
+# convenience one: the engineer moved `web1` out of `web-sg` (the group the
+# database admits) and into `admin-sg`, Apply returned `applied` with zero
+# warnings, and web1 went on reaching the database -- because an instance's
+# membership lives in its CERTIFICATE, which nothing re-issued.
+
+
+def _sign_groups(runner) -> list[str]:
+    sign = next(c for c in runner.calls if "nebula-cert" in c and "sign" in c)
+    return sign[sign.index("-groups") + 1].split(",")
+
+
+def _moved(nebula, *groups: str) -> NebulaJoin:
+    return NebulaJoin(
+        root=nebula.root, env=nebula.env, host_id=nebula.host_id,
+        firewall=nebula.firewall, groups=groups,
+    )
+
+
+def test_revoking_a_groups_membership_reissues_the_cert_and_restarts_the_daemon(tmp_path):
+    """THE fix. `web1` leaves `web-sg`: a new certificate WITHOUT that group is
+    signed and landed on the VM, and the daemon is restarted -- a SIGHUP would
+    reload the firewall while every peer went on holding the OLD identity it
+    cached at handshake time, which is precisely a revoke that does nothing."""
+    vm, runner, nebula = _booted_vm(tmp_path, firewall=_rules("22"), groups=("sg-web",))
+
+    assert vm.refresh_nebula(NAME, _moved(nebula)) == "recertified"
+
+    assert _sign_groups(runner) == ["ec2"], "the revoked group must be gone from the new cert"
+    landed = next(c for c in runner.calls if c[-3:] == ["sudo", "bash", "-s"])
+    assert landed[:4] == ["limactl", "shell", NAME, "--"]
+    assert any("restart" in c for c in runner.calls), "a re-issued cert only reaches the wire on a restart"
+    assert not any("HUP" in c for c in runner.calls)
+
+
+def test_granting_a_group_reissues_the_cert_too(tmp_path):
+    """Revoke must be no less reliable than grant, so both go down the same
+    path -- the direction is not even visible to this code."""
+    vm, runner, nebula = _booted_vm(tmp_path, firewall=_rules("22"))
+
+    assert vm.refresh_nebula(NAME, _moved(nebula, "sg-web")) == "recertified"
+    assert _sign_groups(runner) == ["ec2", "sg-web"]
+
+
+def test_an_unchanged_membership_re_issues_nothing(tmp_path):
+    """NO CHURN: re-issuing a cert restarts a daemon and drops every live
+    tunnel, so it must happen only on a REAL membership change -- and the
+    check for one must stay a single local file read."""
+    vm, runner, nebula = _booted_vm(tmp_path, firewall=_rules("22"), groups=("sg-web",))
+
+    assert vm.refresh_nebula(NAME, nebula) == "unchanged"
+    assert runner.calls == []
+
+
+def test_reordered_groups_are_not_a_membership_change(tmp_path):
+    """The gateway's group ORDER is not meaningful; treating a reorder as a
+    move would restart a running VM's nebula on every Apply."""
+    vm, runner, nebula = _booted_vm(tmp_path, firewall=_rules("22"), groups=("sg-web", "sg-ops"))
+
+    assert vm.refresh_nebula(NAME, _moved(nebula, "sg-ops", "sg-web")) == "unchanged"
+    assert runner.calls == []
+
+
+def test_a_rule_edit_alone_still_reloads_without_touching_the_cert(tmp_path):
+    """v0.7.1's fix must not regress into a restart: widening a rule leaves
+    membership alone, so it stays a SIGHUP with live tunnels intact."""
+    vm, runner, nebula = _booted_vm(tmp_path, firewall=_rules("22"), groups=("sg-web",))
+
+    widened = NebulaJoin(
+        root=nebula.root, env=nebula.env, host_id=nebula.host_id,
+        firewall=_rules("22", "8080"), groups=("sg-web",),
+    )
+    assert vm.refresh_nebula(NAME, widened) == "reloaded"
+    assert not any("nebula-cert" in c for c in runner.calls)
+    assert not any("restart" in c for c in runner.calls)
+
+
+def test_a_cert_that_cannot_be_landed_on_the_vm_fails_the_refresh(tmp_path):
+    """And leaves NO record, so the next Apply tries again -- recording a
+    membership odin only half-applied would re-create the original bug in a
+    subtler form (the VM keeps the old identity, and odin believes it doesn't)."""
+    vm, runner, nebula = _booted_vm(tmp_path, firewall=_rules("22"), groups=("sg-web",))
+    runner.responses["bash -s"] = _Proc(1, "", "connection refused")
+
+    assert vm.refresh_nebula(NAME, _moved(nebula)) == "failed"
+    assert not any("systemctl" in c for c in runner.calls), "nothing was adopted, so nothing was signalled"
+    # ...and the next Apply still sees a membership change to apply.
+    runner.responses.pop("bash -s")
+    runner.calls.clear()
+    assert vm.refresh_nebula(NAME, _moved(nebula)) == "recertified"
+
+
+def test_a_restart_pokes_every_peer_to_re_handshake_immediately(tmp_path):
+    """Field test 3 MED-2: after a mesh restart there is a ~10-60s window where
+    peers keep using the tunnel that just died before nebula drops it, so the
+    address does not answer while `/world` says healthy. The restarted member
+    moves first instead."""
+    vm, runner, nebula = _booted_vm(tmp_path, firewall=_rules("22"), groups=("sg-web",))
+    overlay_path = tmp_path / "myenv" / "nebula" / "overlay.json"
+    overlay = json.loads(overlay_path.read_text())
+    overlay["subnets"]["hosts"]["assignments"]["odin-rds-myenv-db"] = "10.42.1.9"
+    overlay_path.write_text(json.dumps(overlay))
+
+    assert vm.refresh_nebula(NAME, _moved(nebula)) == "recertified"
+
+    pokes = [c for c in runner.calls if c[-3:] == ["sudo", "bash", "-s"]]
+    assert len(pokes) == 2, "the cert push and the convergence poke"
+
+
+def test_a_reload_never_pokes_because_it_never_dropped_a_tunnel(tmp_path):
+    vm, runner, nebula = _booted_vm(tmp_path, firewall=_rules("22"), groups=("sg-web",))
+    widened = NebulaJoin(
+        root=nebula.root, env=nebula.env, host_id=nebula.host_id,
+        firewall=_rules("22", "8080"), groups=("sg-web",),
+    )
+    assert vm.refresh_nebula(NAME, widened) == "reloaded"
+    assert not any(c[-3:] == ["sudo", "bash", "-s"] for c in runner.calls)
 
 
 def test_a_failed_signal_is_reported_not_swallowed(tmp_path):
