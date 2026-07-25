@@ -205,6 +205,16 @@ places, plus one more:
   store's modes, never loosen them. Treat it like a private key file — and
   note that the mode does not survive the things people do to archives: `scp`,
   a chat upload, or an object store will give the copy whatever mode it likes.
+- **`odin import` refuses to restore into a live store**, because a running
+  odin holds reconcilers and an in-memory World that would keep reconciling
+  against a store they never read. Liveness is proved, not guessed: a running
+  server holds an exclusive lock on `.odin/lock`, and the guard asks the
+  kernel who holds it. It reads no process's command line — v0.7.1 did, and
+  called an operator's own shell a live server mid-restore. The lock file
+  holds only a pid; it is not a secret, and it is not a security boundary
+  either. Anyone who can write your `.odin/` can already do worse than take
+  a lock, and `--ignore-live-server` deliberately skips the check, so treat
+  the refusal as a safety interlock for you, never as access control.
 
 If you need real secret hygiene (rotation, least-privilege access,
 encryption at rest), odin's local `.odin/` store is not that system — treat

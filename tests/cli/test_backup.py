@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from odin import backup
 from odin.backup import CANVAS_NAME, ENV_PREFIX, MANIFEST_NAME, BackupError, import_archive
 from odin.cli.app import app
 
@@ -259,6 +260,7 @@ def test_force_import_replaces_rather_than_merges(runner, tmp_path, monkeypatch)
 
 def test_import_refuses_a_live_server(runner, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(backup, "SHUTDOWN_GRACE", 0.5)  # don't spend the real grace period here
     root = tmp_path / ".odin"
     _seed(root)
     assert runner.invoke(app, ["export", "--env", ENV]).exit_code == 0
@@ -268,7 +270,26 @@ def test_import_refuses_a_live_server(runner, tmp_path, monkeypatch):
     result = runner.invoke(app, ["import", f"odin-{ENV}-export.tar.gz"])
     assert result.exit_code == 1
     assert "odin is running" in result.stderr and "odin stop" in result.stderr
+    assert "waiting up to" in result.stderr  # never a silent stall
     assert not (root / ENV).exists()  # nothing written
+
+
+def test_import_can_be_forced_past_the_live_server_check(runner, tmp_path, monkeypatch):
+    """The escape hatch. Field test 3 had a phantom "live server" (the marker in
+    an ops script's own argv) block a restore outright, which is strictly worse
+    than the missed-server bug it came from: the operator was mid-recovery with
+    no way forward. Whatever this guard ever gets wrong, `--ignore-live-server`
+    is the way past it."""
+    monkeypatch.chdir(tmp_path)
+    root = tmp_path / ".odin"
+    _seed(root)
+    assert runner.invoke(app, ["export", "--env", ENV]).exit_code == 0
+    shutil.rmtree(root / ENV)
+    (root / "pid").write_text(str(os.getpid()))
+
+    result = runner.invoke(app, ["import", f"odin-{ENV}-export.tar.gz", "--ignore-live-server"])
+    assert result.exit_code == 0, result.output
+    assert (root / ENV / "HEAD").read_text() == "abc123"
 
 
 def test_import_proceeds_past_a_stale_pidfile(runner, tmp_path, monkeypatch):
