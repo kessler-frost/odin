@@ -50,7 +50,7 @@ from pathlib import Path, PurePosixPath
 
 from pydantic import BaseModel, ValidationError
 
-from odin.util import SECRET_FILE_MODE, atomic_write_bytes, odin_version, pid_alive
+from odin.util import SECRET_FILE_MODE, atomic_write_bytes, live_server, odin_version
 
 MANIFEST_NAME = "manifest.json"
 ENV_PREFIX = "env"
@@ -297,11 +297,16 @@ def _refuse_live_server(root: Path) -> None:
     """A running odin holds live per-env Reconcilers, BackingAws instances and
     an in-memory World; swapping the store out from under them would leave it
     reconciling against state it never read. Restore is a server-DOWN
-    operation, full stop — no partial-liveness special cases to reason about."""
-    pidfile = root / "pid"
-    raw = pidfile.read_text().strip() if pidfile.is_file() else ""
-    if raw.isdigit() and pid_alive(int(raw)):
+    operation, full stop — no partial-liveness special cases to reason about.
+
+    Liveness comes from `util.live_server`, which does NOT depend on who
+    started the server: v0.7.0 tested only `.odin/pid` (written by `odin start`
+    alone), so this refusal was inert for anyone running the app the way the
+    README documents, and a field test restored straight into a live store."""
+    server = live_server(root)
+    if server is not None:
         raise BackupError(
-            f"odin is running (pid {raw}) — refusing to import into a live store. "
-            "Run `odin stop` first, then `odin import` (restore is a server-down operation)."
+            f"odin is running ({server.detail}) — refusing to import into a live store. "
+            f"Stop it with {server.how_to_stop}, then re-run `odin import` "
+            "(restore is a server-down operation)."
         )

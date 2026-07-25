@@ -308,8 +308,11 @@ world back; `odin start` plus one Apply converges reality to it.
 
 Guardrails, because both of these are destructive by nature: `import` refuses
 to overwrite an existing env directory unless you pass `--force`, refuses to
-run at all while odin is up, and rejects any archive containing an absolute
-path, a `..` traversal, or a symlink member. The shared `.odin/canvas.json`
+run at all while odin is up — however you started it, `odin start` or
+`uvicorn odin.server:create_app` by hand — and rejects any archive containing
+an absolute path, a `..` traversal, or a symlink member. `odin status` and
+`odin stop` see the same servers the refusal does; a server running against a
+*different* store directory doesn't get in your way. The shared `.odin/canvas.json`
 travels in the archive but is restored only under `--with-canvas` — a restore
 should never silently replace the canvas you're drawing on.
 

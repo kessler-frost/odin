@@ -13,7 +13,7 @@ import typer
 from odin.cli import commands as _commands  # noqa: F401  (registers the control-surface commands)
 from odin.cli import doctor as _doctor  # noqa: F401  (registers `odin doctor`)
 from odin.cli.app import app
-from odin.util import pid_alive
+from odin.util import live_server, pid_alive
 
 ODIN_DIR = Path(".odin")
 PID_FILE = ODIN_DIR / "pid"
@@ -79,7 +79,15 @@ def start(
 
     if foreground:
         import uvicorn
+        # A foreground server is just as live as a backgrounded one, so it gets
+        # the same pidfile: without it `odin status`/`odin stop` from a second
+        # terminal, and `odin import`'s live-store refusal, had nothing cheap to
+        # find. (`live_server` would still catch it by process scan, but only
+        # because uvicorn.run reuses this process -- the pidfile is exact.)
+        ODIN_DIR.mkdir(parents=True, exist_ok=True)
+        PID_FILE.write_text(str(os.getpid()))
         uvicorn.run("odin.server:create_app", factory=True, host=host, port=port)
+        PID_FILE.unlink(missing_ok=True)
     else:
         ODIN_DIR.mkdir(parents=True, exist_ok=True)
         log_path = ODIN_DIR / "server.log"
@@ -156,19 +164,26 @@ def _start_dev(port: int, host: str = DEFAULT_HOST) -> None:
         p.wait()
 
 
+def _clear_stale_pidfile() -> str:
+    """Nothing is running, so a leftover pidfile is stale by definition."""
+    stale = PID_FILE.exists()
+    PID_FILE.unlink(missing_ok=True)
+    return " (cleaned up a stale PID file)" if stale else ""
+
+
 @app.command()
 def stop() -> None:
     """Stop the Odin server."""
-    if not PID_FILE.exists():
-        typer.echo("Odin is not running (no PID file found).")
+    server = live_server(ODIN_DIR)
+    if server is None:
+        typer.echo(f"Odin is not running{_clear_stale_pidfile()}.")
         return
-    pid = int(PID_FILE.read_text().strip())
-    if not pid_alive(pid):
-        PID_FILE.unlink(missing_ok=True)
-        typer.echo(f"Odin is not running (cleaned up stale pid {pid}).")
-        return
-    typer.echo(f"Stopping Odin (pid {pid}) …")
-    os.kill(pid, signal.SIGTERM)
+    # A server the user launched themselves (no pidfile -- `uvicorn
+    # odin.server:create_app`, the command the README documents) is still THIS
+    # store's server, so `odin stop` stops it rather than claiming nothing is
+    # running: same SIGTERM uvicorn's own Ctrl-C sends.
+    typer.echo(f"Stopping Odin ({server.detail}) …")
+    os.kill(server.pid, signal.SIGTERM)
     PID_FILE.unlink(missing_ok=True)
     typer.echo("Stopped.")
 
@@ -176,15 +191,11 @@ def stop() -> None:
 @app.command()
 def status() -> None:
     """Check if Odin is running."""
-    if not PID_FILE.exists():
-        typer.echo("Odin is not running.")
+    server = live_server(ODIN_DIR)
+    if server is None:
+        typer.echo(f"Odin is not running{_clear_stale_pidfile()}.")
         return
-    pid = int(PID_FILE.read_text().strip())
-    if pid_alive(pid):
-        typer.echo(f"Odin is running (pid {pid}).")
-    else:
-        typer.echo("Odin is not running (stale PID file). Cleaning up.")
-        PID_FILE.unlink(missing_ok=True)
+    typer.echo(f"Odin is running ({server.detail}).")
 
 
 @app.command()

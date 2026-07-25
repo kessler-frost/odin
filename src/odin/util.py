@@ -27,6 +27,7 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 
@@ -57,6 +58,87 @@ def pid_alive(pid: int) -> bool:
     """Whether a process with this PID exists (signal 0 probes without
     delivering anything)."""
     return subprocess.run(["kill", "-0", str(pid)], capture_output=True).returncode == 0
+
+
+# The one string that identifies an odin control app no matter who launched it:
+# the ASGI factory every path names on its command line -- `odin start`'s own
+# `python -m uvicorn odin.server:create_app --factory`, and the
+# `uvicorn odin.server:create_app --factory` that README and CLAUDE.md document
+# for running the real app by hand.
+_SERVER_ARGV_MARKER = "odin.server:create_app"
+
+
+@dataclass(frozen=True)
+class LiveServer:
+    """A control app running against a given store. `managed` = odin started it
+    (there's a pidfile), so `odin stop` can stop it; otherwise the user launched
+    uvicorn themselves and only their own kill/Ctrl-C will."""
+
+    pid: int
+    command: str = ""
+    managed: bool = False
+
+    @property
+    def detail(self) -> str:
+        started = "pidfile" if self.managed else f"started outside `odin start`: {self.command}"
+        return f"pid {self.pid}, {started}"
+
+    @property
+    def how_to_stop(self) -> str:
+        return "`odin stop`" if self.managed else f"kill {self.pid} (or Ctrl-C in its terminal)"
+
+
+def _proc_run(args: list[str]) -> subprocess.CompletedProcess[str]:
+    """The single OS seam for liveness probing -- one place to fake in tests."""
+    return subprocess.run(args, capture_output=True, text=True)
+
+
+def _pidfile_server(root: Path) -> LiveServer | None:
+    pidfile = root / "pid"
+    raw = pidfile.read_text().strip() if pidfile.is_file() else ""
+    alive = raw.isdigit() and pid_alive(int(raw))
+    return LiveServer(pid=int(raw), managed=True) if alive else None
+
+
+def _process_cwd(pid: int) -> Path | None:
+    """A running process's working directory, or None if we can't tell (no
+    `lsof`, or it refused). Callers treat None as "assume it's ours" -- for a
+    destructive operation, an unknowable answer must fail safe."""
+    proc = _proc_run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"])
+    names = [line[1:] for line in proc.stdout.splitlines() if line.startswith("n")]
+    return Path(names[0]) if names else None
+
+
+def _serves(root: Path, pid: int) -> bool:
+    cwd = _process_cwd(pid)
+    return cwd is None or (cwd / root.name).resolve() == root.resolve()
+
+
+def _scanned_server(root: Path) -> LiveServer | None:
+    """Any of MY processes whose command line names odin's ASGI factory and
+    whose working directory makes `root` its store. Own-uid only (`ps -x`), and
+    store-scoped, so a second instance in another directory -- which the
+    ROADMAP explicitly blesses -- stays out of the way."""
+    listed = _proc_run(["ps", "-xo", "pid=,command="]).stdout.splitlines()
+    for line in listed:
+        pid, _, command = line.strip().partition(" ")
+        if _SERVER_ARGV_MARKER in command and pid.isdigit() and _serves(root, int(pid)):
+            return LiveServer(pid=int(pid), command=command)
+    return None
+
+
+def live_server(root: Path) -> LiveServer | None:
+    """The control app running against the store at `root`, if any.
+
+    Liveness must NOT depend on who started the process. v0.7.0 tested only
+    `.odin/pid`, which only `odin start` writes -- so for anyone following the
+    README's own `uvicorn odin.server:create_app --factory`, `odin status` lied
+    and `odin import` happily restored into a live store (field test B5). The
+    pidfile stays the first answer (cheap, exact, and it tells us `odin stop`
+    will work); a process scan is the fallback that catches every other launch
+    path.
+    """
+    return _pidfile_server(root) or _scanned_server(root)
 
 
 def private_mkdir(directory: Path) -> Path:
