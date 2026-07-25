@@ -713,12 +713,17 @@ async def test_drifted_ecs_task_makes_the_service_crash_with_a_drift_verdict(tmp
     store = SpecStore(tmp_path)
     store.apply(Stack(resources=(ResourceDesired(id="app", kind="ecs"),)))
     stores = SynthStores(tmp_path)
+    # The projection is revision-aware (field test 3), so both records carry
+    # the task-definition arn a real CreateService/`_launch_task` pair writes.
+    taskdef_arn = "arn:aws:ecs:us-east-1:000000000000:task-definition/app:1"
     stores.ecsctl.set("default", "service:odin:app", {
         "cluster_name": "odin", "service_name": "app", "desired_count": 1, "status": "ACTIVE",
+        "task_definition_arn": taskdef_arn,
     })
     stores.ecsctl.set("default", "task:odin:t1", {
         "cluster_name": "odin", "service_name": "app", "task_id": "t1", "container_name": "app",
         "last_status": "RUNNING", "stopped_reason": None, "exit_code": None, "stopped_at": None,
+        "task_definition_arn": taskdef_arn,
     })
     recon = Reconciler(
         store, rt, poll_interval=0, stores=stores, drift=_drift(),

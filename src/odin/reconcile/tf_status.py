@@ -25,7 +25,12 @@ never by this projection or the reconciler itself).
 Observability v1 (w1): `verdict` carries WHY a TF-owned resource is
 `crashed` -- ec2's real `StateReason`, lambda's real `StateReason`, ecs's
 real `stoppedReason` + exit code -- the same fields the AWS API itself would
-show, never invented text. `_ecs_services` also calls ecsctl's own
+show, never invented text. Field test 3 added ONE non-`crashed` verdict, for
+the same reason: an ecs service whose new deployment failed while the
+PREVIOUS revision keeps serving (ecsctl's `_retire_stale`) is neither
+`healthy` nor `crashed`, so it projects `error` and the verdict says which --
+"N tasks serving the previous revision; deployment of <image> failed: <why>",
+every part of it read from real task/taskdef records. `_ecs_services` also calls ecsctl's own
 `sweep_tasks` once per projection: the ONE deliberate, idempotent mutation
 this otherwise-pure module makes, syncing a service's task records against
 their REAL container status (a task whose container already exited on its
@@ -56,7 +61,7 @@ from odin.aws.rds import POSTGRES_PORT
 from odin.aws.rds import container_name as db_container_name
 from odin.compute.tasks import TaskRuntime
 from odin.fabric.nebula import NebulaManager
-from odin.gateway.models import cachectl, elbv2ctl, logsctl, rdsctl, ssmctl
+from odin.gateway.models import cachectl, ecsctl, elbv2ctl, logsctl, rdsctl, ssmctl
 from odin.gateway.models.ecsctl import sweep_tasks, task_verdict
 from odin.gateway.stores import SynthStores
 from odin.reconcile import mesh_health
@@ -509,6 +514,19 @@ def _ecs_tasks_for(stores: SynthStores, env: str, cluster_name: str, service_nam
     ]
 
 
+def _serving_previous_verdict(stores: SynthStores, env: str, service: dict, previous: int, failed: dict) -> str:
+    """The verdict for a service that a FAILED deployment left serving its
+    PREVIOUS revision -- concrete about both halves, because either half alone
+    misleads: "N tasks serving the previous revision" without the failure
+    reads like a healthy service, and the failure without the N reads like an
+    outage. Names the image the failed deployment asked for (the typo'd tag
+    IS the diagnosis in the field-test case) plus the real stop reason."""
+    image = ecsctl.service_image(stores, env, service)
+    plural = "task" if previous == 1 else "tasks"
+    target = f" of {image}" if image else ""
+    return f"{previous} {plural} serving the previous revision; deployment{target} failed: {task_verdict(failed)}"
+
+
 def _ecs_services(stores: SynthStores, env: str, runtime: TaskRuntime | None = None) -> Projected:
     out: Projected = {}
     # Keep task state honest against real containers BEFORE reading it below
@@ -525,18 +543,35 @@ def _ecs_services(stores: SynthStores, env: str, runtime: TaskRuntime | None = N
             continue
         label = record.get("node_label") or record["service_name"]
         tasks = _ecs_tasks_for(stores, env, record["cluster_name"], record["service_name"])
-        running = sum(1 for t in tasks if t["last_status"] == "RUNNING")
+        # REVISION-AWARE (field test 3). `minimumHealthyPercent` now keeps the
+        # previous revision serving through a failed deployment
+        # (ecsctl.py's `_retire_stale`), which would read as plain `healthy`
+        # under a revision-blind count -- "the service is fine" while the
+        # deployment the operator just asked for is dead. So the projection
+        # splits by revision using ecsctl's OWN rule: only tasks on the
+        # revision the service currently points at count toward desired.
+        current = ecsctl.on_current_revision(record, tasks)
+        running = sum(1 for t in current if t["last_status"] == "RUNNING")
+        previous = sum(1 for t in tasks if t["last_status"] == "RUNNING" and t not in current)
         # A STOPPED task record surviving in the store is ALWAYS a real
         # failure: a deliberate stop (scale-down / stale-taskdef replacement
         # / service delete) deletes the record outright (ecsctl.py's
         # `_stop_task`) rather than leaving it STOPPED -- so every STOPPED
         # record here came from either the lazy sweep catching a spontaneous
         # container exit, or a launch that failed outright.
-        failed = [t for t in tasks if t["last_status"] == "STOPPED"]
+        failed = [t for t in current if t["last_status"] == "STOPPED"]
+        latest = max(failed, key=lambda t: t.get("stopped_at") or 0) if failed else None
         if running == record["desired_count"]:
             out[label] = ("ecs", "healthy", {}, None)
-        elif failed:
-            latest = max(failed, key=lambda t: t.get("stopped_at") or 0)
+
+        elif latest is not None and previous:
+            # NOT `healthy` (the requested revision is not running) and NOT
+            # `crashed` (traffic is still being served) -- `error` is the
+            # Phase that already means a terminal failure needing operator
+            # action, which a deployment that will never converge on its own
+            # is. The UI renders it red and surfaces the verdict on hover.
+            out[label] = ("ecs", "error", {}, _serving_previous_verdict(stores, env, record, previous, latest))
+        elif latest is not None:
             out[label] = ("ecs", "crashed", {}, task_verdict(latest))
         else:
             out[label] = ("ecs", "starting", {}, None)

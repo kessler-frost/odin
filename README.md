@@ -136,6 +136,15 @@ Known v1 limits, recorded rather than hidden:
   needs none; a task that dies between API calls isn't auto-replaced until
   the next Apply reconciles the service; a `tags` block on the service can
   show as drift on a subsequent `tofu plan` (tags aren't echoed back yet).
+  A **failed image update keeps your old tasks serving** — odin honors
+  `deployment_minimum_healthy_percent = 100`, launching replacements before
+  retiring anything, so a typo'd tag costs zero downtime (measured: 3 tasks
+  and 3 HTTP 200s on every 2-second sample across a 62s failed apply) while
+  the apply still exits non-zero. The node then reads **`error`**, not
+  `healthy` — "2 tasks serving the previous revision; deployment of
+  `<image>` failed" — because a service running the *old* code is not the
+  service you asked for. Caveat: `/world` doesn't refresh at all while an
+  apply is running (~60s), so you see this once the apply returns, not during.
 - **SNS→SQS subscriptions**: adding the edge to an *already-healthy* topic
   doesn't retroactively re-provision the subscription — remove and re-add the
   topic (or its edge) to force it. Fixed on create; the live-edit path is a
