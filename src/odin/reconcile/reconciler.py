@@ -22,6 +22,14 @@ sweep + an Apply-driven `converge_db_instances`, the shape W2.2 already
 established for ecs/lambda. What's left of rds in this file is the same thing
 that's left of every TF-owned kind: projection and pruning.
 
+A tick has two halves, and v0.7.3 made the difference load-bearing: it
+ACTS (plan/execute, gc, the gateway push, the World prune) and it OBSERVES
+(projecting the TF-owned kinds and broadcasting WorldDeltas). `hold()`
+suspends only the first, so `/world` and the canvas stay live for the whole
+of an apply instead of freezing at their last pre-apply reading -- see
+`hold()` and `_watch()`, which carry the argument and the field-test
+measurement behind it.
+
 Per-node credential injection (a workload container's env bound to
 keystore-issued creds + the gateway endpoint, formerly `_run_service`) is
 deferred with the app-workload layer (NORTHSTAR.md, tag app-layer-parked) —
@@ -182,8 +190,8 @@ class Reconciler:
             await self._project_tf_owned()
 
     async def _watch(self) -> None:
-        """A tick with its hands tied: the projection, and nothing else.
-        What an apply is in flight (`hold()`) leaves running.
+        """A tick with its hands tied: the projection, and nothing else --
+        what an in-flight apply (`hold()`) leaves running.
 
         Three things `_converge` does are deliberately absent, each because it
         would ACT rather than look:
