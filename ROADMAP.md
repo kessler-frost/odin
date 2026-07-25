@@ -253,6 +253,27 @@ future decision against these points instead of re-deriving them:
     the same CWD-relative `.odin` store (the second binds-conflicts on the
     gateway port and would resume/reconcile the first's envs). Run a second
     instance only from a separate working directory with its own store.
+    - **`ODIN_REAP_EC2_VMS=0` is what makes that second instance actually
+      safe** (v0.7.1, field test U7). On startup odin deletes every Lima VM
+      named `odin-ec2-*` that no env's store expects — and a second instance's
+      store expects NONE of the first's, so it would reap them all. Until
+      v0.7.1 the only seam was the `create_app(reap_ec2_vms=False)` keyword,
+      so the documented "run a second instance" advice meant bypassing the
+      `odin` CLI with a hand-written factory wrapper. The variable is read
+      inside the reaper itself (`gateway/models/ec2compute.py`), so it holds
+      for `odin start`, a bare `uvicorn`, and any other caller alike.
+      Accepts `0`/`false`/`no`/`off`; **anything else, including unset or a
+      typo, leaves the reaper ON** — a safety net you disabled by mistyping
+      is not a safety net.
+    - **What you give up:** the crash-recovery backstop. The reaper exists
+      for the window where odin dies between `vm.delete` succeeding and the
+      store update landing; with it off, that leftover VM stays on disk
+      burning memory and disk until you `limactl delete` it by hand. It is
+      the ONLY thing the reaper does — it never touches a VM some env's store
+      still expects, and only ever considers names matching odin's own
+      `odin-ec2-` convention, so your own Lima VMs were never at risk either
+      way. Leave it ON unless a second odin (or another agent's VMs) shares
+      the machine.
   - Nebula: single-host mesh is REAL end-to-end — a real host lighthouse
     process (`fabric/nebula.py::LighthouseManager`) and a real `nebula`
     daemon inside every VPC-joined EC2 VM, the VPC's compiled SG firewall

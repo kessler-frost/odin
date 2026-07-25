@@ -72,6 +72,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import logging
+import os
 import secrets
 import subprocess
 import tempfile
@@ -934,6 +935,31 @@ def _delete_key_pair(params: dict[str, str], env: str, stores: SynthStores, now:
 
 # --- startup reaper (release finding #4) ------------------------------------
 
+# Anything else -- including unset, `1`, or a typo -- leaves the reaper ON.
+# A safety net you disabled by mistyping the value is not a safety net.
+_REAPER_OFF_VALUES = ("0", "false", "no", "off")
+
+
+def _reaper_enabled() -> bool:
+    """`ODIN_REAP_EC2_VMS=0` (or `false`/`no`/`off`) turns the startup reaper
+    off; it is ON by default.
+
+    Read HERE rather than at the `create_app` call site so it holds for every
+    caller -- the `odin` CLI included, which is the whole point: before this,
+    `create_app(reap_ec2_vms=False)` was the only seam, so running a second
+    isolated odin on one Mac meant bypassing the CLI with a factory wrapper
+    (v0.7.0 field test, U7). A second instance has its OWN store, which knows
+    nothing about the first instance's instances, so every one of them looks
+    orphaned to it.
+
+    What you give up by setting it: the crash-recovery backstop. If odin dies
+    between `vm.delete` succeeding and the store update landing, the leftover
+    Lima VM stays on disk burning memory and disk until you
+    `limactl delete` it yourself. That is the ONLY thing the reaper does --
+    it never touches a VM any env's store still expects, and never one
+    outside this module's own `odin-ec2-` naming."""
+    return os.environ.get("ODIN_REAP_EC2_VMS", "1").strip().lower() not in _REAPER_OFF_VALUES
+
 
 def reap_orphaned_vms(root: Path, envs: list[str], vm: InstanceVm | None = None) -> list[str]:
     """A one-shot startup safety net for a VM that's on disk with NO
@@ -948,7 +974,14 @@ def reap_orphaned_vms(root: Path, envs: list[str], vm: InstanceVm | None = None)
     calling the SAME `vm_name(env, instance_id)` every real creation uses,
     never a prefix/wildcard match on the delete side -- a user's own Lima
     VM (e.g. `veronica`) or another odin subsystem's is never even a
-    candidate, let alone touched. Returns the names of VMs it deleted."""
+    candidate, let alone touched. Returns the names of VMs it deleted.
+
+    `ODIN_REAP_EC2_VMS=0` skips the whole pass -- see `_reaper_enabled` for
+    what that buys and what it costs. The check is first, so a disabled
+    reaper does not so much as enumerate the machine's VMs."""
+    if not _reaper_enabled():
+        log.info("startup reaper: disabled by ODIN_REAP_EC2_VMS -- leaving every EC2 VM on this machine alone")
+        return []
     vm = vm or InstanceVm()
     stores = SynthStores(root)
     expected = {
