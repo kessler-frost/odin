@@ -88,6 +88,10 @@ future decision against these points instead of re-deriving them:
      pending→running waiter absorbs it; zero-drift)
   4. Lambda (real AWS RIE container, Apache-2.0; apply ~6s, invoke ~40ms)
   5. ECS (real Colima containers; scale up/down re-applies cleanly)
+  6. ElastiCache (wave 2, W2.8): `aws_elasticache_cluster` → a real
+     `redis:7-alpine` container per cluster, the published port advertised as
+     the cluster's node endpoint and published as `REDIS_URL`/`REDIS_URL_VM`
+     World facts; single-node redis only (see the limits below)
 
   **v1 limits, recorded rather than hidden** (northstar directive 5's honesty
   rule):
@@ -108,6 +112,27 @@ future decision against these points instead of re-deriving them:
   - SNS→SQS live-edit: FIXED (v0.5.0) — adding a subscription edge to an
     already-healthy topic lands on the next Apply via the reconciler's
     observe pass (proven by real fanout to both queues).
+  - ElastiCache (W2.8): **single node, redis only.** `aws_elasticache_cluster`
+    is real — a `redis:7-alpine` container per cluster, its published port
+    advertised as the cluster's node endpoint, zero-drift re-plan — but
+    `num_cache_nodes` must be 1 and `engine` must be `redis`; anything else is
+    a real `InvalidParameterValue`, never a silent collapse to one node. No
+    replication groups, no cluster mode, no memcached (which would need a
+    different substrate and a `ConfigurationEndpoint` odin doesn't emit), no
+    snapshots/parameter groups beyond the metadata the provider reads back.
+    `node_type` is accepted verbatim and maps to nothing real (every cluster
+    gets the same fixed container memory cap) — it exists so the HCL
+    round-trips, not because odin sizes anything from it.
+  - **ElastiCache IAM edges gate the CONTROL plane only.** Redis's own wire
+    protocol is not SigV4-signed and carries no AWS identity, so `GET`/`SET`
+    traffic never reaches odin's gateway at all — exactly as on real AWS. An
+    `elasticache` edge therefore grants Describe/Modify/Delete/tags and
+    nothing more; whether a workload can actually *reach* the cache is a
+    network question (security groups), and per the limit above those don't
+    yet gate host containers either. Endpoint reachability is per-consumer the
+    same way RDS's is: a container consumes `${{cache.REDIS_URL}}`
+    (`host.docker.internal`), an EC2 (Lima VM) consumer must use
+    `${{cache.REDIS_URL_VM}}` (`host.lima.internal`).
   - RDS stays off Terraform — the reconciler's real Postgres container, not
     a `tofu`-managed resource, until an RDS gateway model lands.
   - RDS endpoint reachability is per-consumer: a CONTAINER consumes

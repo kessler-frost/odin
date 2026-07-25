@@ -31,7 +31,9 @@ _REF = re.compile(r"^\$\{\{\s*([\w-]+)\.([\w-]+)\s*\}\}$")
 # (gateway/models/logsctl.py); secret's (a record + versions in a 0600 JSON
 # sidecar) via CreateSecret/PutSecretValue (gateway/models/secretsctl.py) and
 # ssm's via PutParameter (gateway/models/ssmctl.py) -- the reconciler never
-# touches any of them, same as vpc/subnet/sg.
+# touches any of them, same as vpc/subnet/sg. elasticache (W2.8) is the newest
+# of these: its REAL lifecycle (a per-cluster redis:7-alpine container) is
+# driven by CreateCacheCluster/DeleteCacheCluster in gateway/models/cachectl.py.
 
 # (kind, field) pairs whose value is a CREDENTIAL BY CONSTRUCTION, whatever the
 # field happens to be called (W2.4). `is_sensitive_field_name` catches names
@@ -63,6 +65,7 @@ _KIND = {
     "logs": "logs",
     "secret": "secret",
     "ssm": "ssm",
+    "elasticache": "elasticache",
 }
 
 

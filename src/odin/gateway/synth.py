@@ -60,7 +60,7 @@ from starlette.responses import Response
 from odin.aws.backings import ACCOUNT, REGION
 from odin.gateway import errors
 from odin.gateway.keys import KeyStore, Principal
-from odin.gateway.models import ec2compute, ecr, ecsctl, iamctl, lambdactl, logsctl, secretsctl, ssmctl
+from odin.gateway.models import cachectl, ec2compute, ecr, ecsctl, iamctl, lambdactl, logsctl, secretsctl, ssmctl
 from odin.gateway.stores import SynthStores
 
 _SNS_NS = "http://sns.amazonaws.com/doc/2010-03-31/"
@@ -367,6 +367,11 @@ def pure_answer(
     all-synth the same way, with its own REAL Colima-container substrate
     (`compute/tasks.py::TaskRuntime`, defaulted inside ecsctl.py itself --
     it needs no live fact threaded through here, unlike ecr's backing_port).
+    `elasticache:*` (W2.8) is all-synth the same way, with its own REAL
+    per-cluster `redis:7-alpine` container substrate (`aws/cache.py::
+    RedisCache`, defaulted inside cachectl.py itself -- it needs no live fact
+    threaded through here, unlike ecr's backing_port, and no workload identity
+    either: Redis is not SigV4-signed, so a cache never calls the gateway).
     `keystore`/`gateway_port` (fix-wave 2b finding #2) are threaded to the
     THREE substrate-launching models only (ec2/ecs/lambda -- iam/ecr never
     launch a workload runtime of their own): each resolves the launching
@@ -406,6 +411,8 @@ def pure_answer(
         return secretsctl.pure_answer(action, resource, env, body, stores, now)
     if action.startswith("ssm:"):
         return ssmctl.pure_answer(action, resource, env, body, stores, now)
+    if action.startswith("elasticache:"):
+        return cachectl.pure_answer(action, resource, env, body, stores, now)
     handler = _PURE_HANDLERS.get(action)
     return handler(resource, env, body, stores, now) if handler else None
 

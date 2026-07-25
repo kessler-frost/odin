@@ -517,6 +517,29 @@ def _ecs(res: ResourceDesired, refs: Refs) -> Built:
     return attrs, nested
 
 
+# W2.8: ElastiCache (redis) clusters -- a REAL `redis:7-alpine` container per
+# cluster (gateway/models/cachectl.py + aws/cache.py). SINGLE NODE in v1
+# (`num_cache_nodes = 1`, hardcoded rather than offered as a canvas field that
+# would only ever be rejected -- cachectl.py returns a real
+# InvalidParameterValue for anything else, and ROADMAP records the limit).
+#
+# Deliberately NOT emitted: `port` and `engine_version`. Both are
+# Optional+Computed on `aws_elasticache_cluster`, and the REAL published host
+# port is whatever Docker picked -- pinning `port = 6379` in the config while
+# the API honestly reports the published port is a guaranteed plan diff on
+# every apply. Left computed, they read back from the API and plan clean.
+_DEFAULT_CACHE_NODE_TYPE = "cache.t3.micro"
+
+
+def _elasticache(res: ResourceDesired, refs: Refs) -> Built:
+    return {
+        "cluster_id": quote(res.id),
+        "engine": quote("redis"),
+        "node_type": quote(_field(res, "nodeType", _DEFAULT_CACHE_NODE_TYPE)),
+        "num_cache_nodes": "1",
+    }, ""
+
+
 def _ecs_container_definitions(res: ResourceDesired) -> list[dict]:
     port = _field(res, "port", _DEFAULT_ECS_PORT)
     port_int = int(port) if port.isdigit() else int(_DEFAULT_ECS_PORT)
@@ -619,6 +642,7 @@ _TF_TYPES = {
     "logs": "aws_cloudwatch_log_group",
     "secret": "aws_secretsmanager_secret",
     "ssm": "aws_ssm_parameter",
+    "elasticache": "aws_elasticache_cluster",
 }
 
 _BUILDERS = {
@@ -637,6 +661,7 @@ _BUILDERS = {
     "logs": _logs,
     "secret": _secret,
     "ssm": _ssm,
+    "elasticache": _elasticache,
 }
 
 

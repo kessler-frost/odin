@@ -72,12 +72,12 @@ def test_grid_positions_are_on_the_20px_grid_in_220px_steps():
 
 
 def test_unsupported_type_never_dropped_even_when_alone():
-    result = parse_hcl_text('resource "aws_elasticache_cluster" "cache" {\n  cluster_id = "cache"\n}\n')
+    result = parse_hcl_text('resource "aws_lambda_function" "fn" {\n  function_name = "fn"\n}\n')
     assert result.nodes == []
     assert result.edges == []
     assert len(result.unsupported) == 1
-    assert result.unsupported[0].type == "aws_elasticache_cluster"
-    assert result.unsupported[0].name == "cache"
+    assert result.unsupported[0].type == "aws_lambda_function"
+    assert result.unsupported[0].name == "fn"
     assert "not supported" in result.unsupported[0].reason
 
 
@@ -107,7 +107,7 @@ def test_malformed_hcl_sets_parse_error_not_unsupported():
 
 
 def test_valid_file_with_only_unsupported_resources_has_no_parse_error():
-    result = parse_hcl_text('resource "aws_elasticache_cluster" "cache" {\n  cluster_id = "cache"\n}\n')
+    result = parse_hcl_text('resource "aws_lambda_function" "fn" {\n  function_name = "fn"\n}\n')
     assert result.parse_error is None
     assert len(result.unsupported) == 1
 
@@ -357,3 +357,50 @@ def test_import_id_sqs_builds_a_gateway_routed_queue_url():
 def test_import_id_sns_builds_an_arn():
     result = _import_id(LiveResource(type="sns", id="alerts"), gateway_port=4266)
     assert result == "arn:aws:sns:us-east-1:000000000000:alerts"
+
+
+# --- W2.8: elasticache -------------------------------------------------------
+
+_CACHE_TF = '''
+resource "aws_elasticache_cluster" "sessions" {
+  cluster_id      = "sessions"
+  engine          = "redis"
+  node_type       = "cache.t3.small"
+  num_cache_nodes = 1
+
+  tags = {
+    "odin:node" = "sessions"
+  }
+}
+'''
+
+
+def test_elasticache_cluster_imports_as_an_elasticache_node():
+    result = parse_hcl_text(_CACHE_TF)
+    (node,) = result.nodes
+    assert (node["id"], node["type"]) == ("sessions", "elasticache")
+    assert node["data"]["nodeType"] == "cache.t3.small"
+    assert not any(u.type == "aws_elasticache_cluster" for u in result.unsupported)
+    assert result.warnings == []  # every argument hcl.py emits is carried
+
+
+def test_elasticache_round_trips_back_through_generate_tf():
+    imported = parse_hcl_text(_CACHE_TF)
+    canvas = {"nodes": imported.nodes, "edges": imported.edges}
+    regenerated = generate_tf(canvas_to_stack(canvas)).files["main.tf"]
+    assert 'resource "aws_elasticache_cluster" "sessions"' in regenerated
+    assert '  cluster_id      = "sessions"' in regenerated
+    assert '  node_type       = "cache.t3.small"' in regenerated
+    assert "  num_cache_nodes = 1" in regenerated
+
+
+def test_elasticache_label_falls_back_to_the_hcl_name_when_cluster_id_is_computed():
+    tf = 'resource "aws_elasticache_cluster" "generated" {\n  cluster_id = "${var.prefix}-cache"\n}\n'
+    assert parse_hcl_text(tf).nodes[0]["id"] == "generated"
+
+
+def test_elasticache_stays_out_of_the_live_import_path():
+    # No `_import_id` shape can resolve a cluster from outside a canvas Apply
+    # (it exists only as a gateway-model record + a real container), so mode
+    # (b) reports it unsupported rather than generating a bogus import block.
+    assert "elasticache" not in _TF_TYPE

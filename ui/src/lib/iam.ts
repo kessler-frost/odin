@@ -24,6 +24,11 @@ export const defaultPermissions: Record<string, string[]> = {
   // own credentials is the rare case, not the default.
   secret: ['secretsmanager:GetSecretValue'],
   ssm: ['ssm:GetParameter'],
+  // CONTROL plane only. ElastiCache's data plane is the raw Redis protocol —
+  // not AWS-signed, never routed through odin's gateway — so an edge here
+  // grants Describe/Modify, and nothing odin does at the IAM layer can gate a
+  // GET/SET (that's a security-group question). See ROADMAP's limits.
+  elasticache: ['elasticache:DescribeCacheClusters'],
 };
 
 // Compute kinds act as IAM principals; permission edges run compute → resource.

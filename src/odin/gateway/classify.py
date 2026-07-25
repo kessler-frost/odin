@@ -64,6 +64,18 @@ reasoning as ec2/iam/ecr: extraction only needs to never return None for a
 route it recognizes; an unrecognized (method, path) pair returns None
 (unmappable, closed-world deny) rather than guessing.
 
+ELASTICACHE (W2.8) SHARES SNS/IAM's QUERY-PROTOCOL WIRE and IAM/ECR's
+OPERATOR-only REASONING: `_classify_elasticache` reads the `Action` form param
+and extracts `CacheClusterId` when the request carries one, else the cluster id
+out of a tag call's `ResourceName` ARN (`arn:...:cluster:<id>` -> the last
+colon-segment, the same bare-label strip `_sns_resource` does), else `"*"`.
+The only principal driving elasticache calls in v1 is the OPERATOR (TF-authored
+clusters), so extraction only needs to never return None. NOTE the scope of
+what this classification can ever govern: ElastiCache's DATA plane is the raw
+Redis protocol, which is not SigV4-signed and never reaches this gateway at
+all, so an `elasticache:*` action is always a CONTROL-plane action -- see
+gateway/models/cachectl.py's module docstring.
+
 ECS (task V5a) SHARES ECR's JSON-target SHAPE, IAM/ECR's OPERATOR-only
 REASONING: `_classify_ecs` extracts a real id when the request carries one
 (clusterName/serviceName/family, or the last path segment of an ARN) and
@@ -253,6 +265,8 @@ def classify(
         return _classify_secretsmanager(lower_headers, body)
     if service == "ssm":
         return _classify_ssm(lower_headers, body)
+    if service == "elasticache":
+        return _classify_elasticache(body)
     return None
 
 
@@ -347,6 +361,20 @@ def _classify_iam(body: bytes) -> tuple[str, str] | None:
         return None
     resource = next((params[key] for key in _IAM_ID_PARAMS if params.get(key)), "*")
     return f"iam:{action_name}", resource
+
+
+def _classify_elasticache(body: bytes) -> tuple[str, str] | None:
+    try:
+        params = dict(parse_qsl(body.decode("utf-8"), keep_blank_values=True))
+    except UnicodeDecodeError:
+        return None
+    action_name = params.get("Action")
+    if not action_name:
+        return None
+    cluster_id = params.get("CacheClusterId")
+    resource_name = params.get("ResourceName")
+    resource = cluster_id or (resource_name.rsplit(":", 1)[-1] if resource_name else "*")
+    return f"elasticache:{action_name}", resource or "*"
 
 
 def _ecr_resource(payload: dict) -> str:

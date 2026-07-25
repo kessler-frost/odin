@@ -164,6 +164,60 @@ def test_lambda_resolves_by_function_name_and_reads_rie_container(tmp_path, monk
     assert result.lines == "RIE listening"
 
 
+# --- elasticache: the cluster's own redis container (W2.8) -------------------
+
+
+def _cache_record(cluster_id: str, status: str = "available") -> dict:
+    return {
+        "cache_cluster_id": cluster_id, "status": status,
+        "arn": f"arn:aws:elasticache:us-east-1:000000000000:cluster:{cluster_id}",
+    }
+
+
+def test_elasticache_reads_its_redis_container_logs(tmp_path, monkeypatch):
+    store = _store(tmp_path, (ResourceDesired(id="cache", kind="elasticache"),))
+    stores = SynthStores(tmp_path)
+    stores.cachectl.set(ENV, "cluster:cache", _cache_record("cache"))
+
+    class FakeColima:
+        def status(self, name):
+            return "running"
+
+        def logs(self, name, tail=20):
+            return "Ready to accept connections tcp"
+
+    monkeypatch.setattr("odin.api.logs.ColimaRuntime", FakeColima)
+    result = fetch_logs(store, stores, FakeRuntime(), ENV, "cache")
+
+    assert result.sources == ["odin-cache-default-cache"]
+    assert result.lines == "Ready to accept connections tcp"
+    assert result.running is True
+
+
+def test_elasticache_with_no_cluster_yet_is_honest_not_a_500(tmp_path):
+    store = _store(tmp_path, (ResourceDesired(id="cache", kind="elasticache"),))
+    result = fetch_logs(store, SynthStores(tmp_path), FakeRuntime(), ENV, "cache")
+    assert result.found is True and result.error is None
+    assert "no cache cluster backs" in result.message
+
+
+def test_elasticache_absent_container_reports_the_cluster_status(tmp_path, monkeypatch):
+    store = _store(tmp_path, (ResourceDesired(id="cache", kind="elasticache"),))
+    stores = SynthStores(tmp_path)
+    stores.cachectl.set(ENV, "cluster:cache", _cache_record("cache", status="creating"))
+
+    class FakeColima:
+        def status(self, name):
+            return "absent"
+
+        def logs(self, name, tail=20):
+            return ""
+
+    monkeypatch.setattr("odin.api.logs.ColimaRuntime", FakeColima)
+    result = fetch_logs(store, stores, FakeRuntime(), ENV, "cache")
+    assert "cluster status: creating" in result.message
+
+
 # --- ecs: every task container for the service ------------------------------
 
 

@@ -195,6 +195,10 @@ class SynthStores:
       the parameter NAME as `ResourceId`, not an ARN). A `SecureString`
       parameter's value lives here in cleartext too -- odin has no KMS; 0600
       is the protection, recorded as a limit rather than implied away.
+    - `cachectl`: the ElastiCache control-plane model's whole state
+      (`gateway/models/cachectl.py`, W2.8) -- flat keys `"cluster:{id}"`,
+      persisted at `.odin/{env}/gateway/cachectl.json`. ElastiCache tags live
+      in the shared `tags` store above, keyed `"elasticache:{arn}"`.
     """
 
     def __init__(self, root: Path) -> None:
@@ -212,3 +216,4 @@ class SynthStores:
         self.logsctl = JsonStore(root, "logsctl")
         self.secretsctl = JsonStore(root, "secretsctl")
         self.ssmctl = JsonStore(root, "ssmctl")
+        self.cachectl = JsonStore(root, "cachectl")

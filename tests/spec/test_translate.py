@@ -254,3 +254,19 @@ def test_a_secret_or_ssm_nodes_other_fields_are_not_flagged_sensitive():
     by_id = {r.id: r for r in canvas_to_stack(canvas).resources}
     assert by_id["db-password"].fields["description"].sensitive is False
     assert by_id["flag"].fields["paramType"].sensitive is False
+
+
+def test_elasticache_translates_generically_and_is_never_skipped():
+    # W2.8: elasticache is a pure gateway-model kind like iam_role/ecr --
+    # `_resource` needs no special-casing, just the _KIND mapping. The
+    # skipped-types check is the northstar directive-5 half: a drawable kind
+    # must be BACKED or explicitly skipped, never silently ignored.
+    canvas = {
+        "nodes": [{"id": "n1", "type": "elasticache", "data": {"label": "cache", "nodeType": "cache.t3.small"}}],
+        "edges": [],
+    }
+    stack = canvas_to_stack(canvas)
+    (res,) = stack.resources
+    assert (res.id, res.kind) == ("cache", "elasticache")
+    assert res.fields["nodeType"].value == "cache.t3.small"
+    assert skipped_node_types(canvas) == []

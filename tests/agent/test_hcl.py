@@ -933,3 +933,51 @@ def test_tofu_fmt_accepts_secret_and_ssm_output(tmp_path):
     main_tf.write_text(generate_tf(stack).files["main.tf"])
     result = subprocess.run([tofu, "fmt", "-check", "-diff", str(main_tf)], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+# --- W2.8: elasticache -----------------------------------------------------
+
+
+def test_elasticache_emits_a_single_node_redis_cluster():
+    stack = Stack(resources=(
+        ResourceDesired(id="cache", kind="elasticache", fields=_fields(nodeType="cache.t3.small")),
+    ))
+    proj = generate_tf(stack)
+    main_tf = proj.files["main.tf"]
+    assert 'resource "aws_elasticache_cluster" "cache"' in main_tf
+    assert '  cluster_id      = "cache"' in main_tf
+    assert '  engine          = "redis"' in main_tf
+    assert '  node_type       = "cache.t3.small"' in main_tf
+    assert "  num_cache_nodes = 1" in main_tf  # v1 is single-node; the gateway rejects anything else
+    assert '    "odin:node" = "cache"' in main_tf
+    assert proj.unsupported == []
+
+
+def test_elasticache_defaults_the_node_type_when_the_field_is_absent():
+    stack = Stack(resources=(ResourceDesired(id="cache", kind="elasticache"),))
+    assert '  node_type       = "cache.t3.micro"' in generate_tf(stack).files["main.tf"]
+
+
+def test_elasticache_omits_port_and_engine_version_so_they_stay_computed():
+    # Pinning `port` in the config while the API honestly reports the REAL
+    # published host port is a guaranteed plan diff on every apply -- both are
+    # Optional+Computed, so leaving them out is what keeps plan zero-drift.
+    main_tf = generate_tf(Stack(resources=(ResourceDesired(id="cache", kind="elasticache"),))).files["main.tf"]
+    assert "port" not in main_tf
+    assert "engine_version" not in main_tf
+
+
+def test_tofu_fmt_accepts_elasticache_output(tmp_path):
+    tofu = shutil.which("tofu")
+    if tofu is None:
+        return  # skip cleanly -- no tofu on PATH in this environment
+    stack = Stack(resources=(
+        ResourceDesired(id="cache", kind="elasticache", fields=_fields(nodeType="cache.t3.micro")),
+    ))
+    main_tf = tmp_path / "main.tf"
+    main_tf.write_text(generate_tf(stack).files["main.tf"])
+    result = subprocess.run(
+        [tofu, "fmt", "-check", "-diff", str(main_tf)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

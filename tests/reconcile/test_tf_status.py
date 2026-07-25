@@ -10,6 +10,8 @@ from __future__ import annotations
 from odin.gateway.models import secretsctl, ssmctl
 from odin.gateway.stores import SynthStores
 from odin.reconcile.tf_status import TF_OWNED_KINDS, project
+from odin.runtime.colima import CONTAINER_HOST
+from odin.runtime.lima import LIMA_HOST
 
 ENV = "default"
 
@@ -28,6 +30,7 @@ def test_tf_owned_kinds_excludes_reconciler_owned_kinds():
     # own PROVISIONED path -- this projection must never double-own them.
     assert TF_OWNED_KINDS == {
         "vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr", "logs", "secret", "ssm",
+        "elasticache",
     }
 
 
@@ -523,6 +526,57 @@ def test_the_ecs_sweeps_own_auto_created_log_group_never_enters_world(tmp_path):
     assert project(stores, ENV, ecs_runtime=runtime).keys() == {"app"}  # still absent next tick
 
 
+# --- elasticache (W2.8): the ONE kind here that publishes real facts -- the
+# cluster's redis endpoint, in both the container- and VM-reachable forms. ---
+
+
+def _cache_cluster(cluster_id: str, status: str, port: int | None = None, status_reason: str | None = None) -> dict:
+    return {
+        "cache_cluster_id": cluster_id, "status": status, "status_reason": status_reason,
+        "arn": f"arn:aws:elasticache:us-east-1:000000000000:cluster:{cluster_id}",
+        "address": CONTAINER_HOST if port else None, "port": port,
+    }
+
+
+def test_elasticache_available_is_healthy_and_publishes_both_endpoint_forms(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.cachectl.set(ENV, "cluster:cache", _cache_cluster("cache", "available", port=51234))
+
+    kind, phase, facts, verdict = project(stores, ENV)["cache"]
+
+    assert (kind, phase, verdict) == ("elasticache", "healthy", None)
+    assert facts["REDIS_URL"] == f"redis://{CONTAINER_HOST}:51234"
+    assert facts["REDIS_URL_VM"] == f"redis://{LIMA_HOST}:51234"  # finding #5: a Lima VM can't resolve the container host
+    assert facts["endpoint"] == f"{CONTAINER_HOST}:51234"
+
+
+def test_elasticache_creating_and_deleting_are_starting_with_no_facts_yet(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.cachectl.set(ENV, "cluster:c1", _cache_cluster("c1", "creating"))
+    stores.cachectl.set(ENV, "cluster:c2", _cache_cluster("c2", "deleting", port=51234))
+
+    result = project(stores, ENV)
+    assert result["c1"] == ("elasticache", "starting", {}, None)  # nothing to advertise until it's up
+    assert result["c2"][1] == "starting"  # a delete can fail: stays visible until the record is gone
+
+
+def test_elasticache_create_failed_is_crashed_with_the_real_reason_as_verdict(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.cachectl.set(ENV, "cluster:c1", _cache_cluster("c1", "create-failed", status_reason="redis never became ready"))
+    assert project(stores, ENV)["c1"] == ("elasticache", "crashed", {}, "redis never became ready")
+
+
+def test_elasticache_prefers_the_odin_node_tag_over_the_cluster_id(tmp_path):
+    stores = SynthStores(tmp_path)
+    cluster = _cache_cluster("cache", "available", port=51234)
+    stores.cachectl.set(ENV, "cluster:cache", cluster)
+    stores.tags.set(ENV, f"elasticache:{cluster['arn']}", {"odin:node": "the-canvas-label"})
+
+    result = project(stores, ENV)
+    assert "the-canvas-label" in result
+    assert "cache" not in result
+
+
 # --- multi-kind smoke: nothing clobbers anything else's label namespace ---
 
 
@@ -532,6 +586,7 @@ def test_multiple_kinds_project_independently(tmp_path):
     stores.tags.set(ENV, "ec2:vpc-1", {"odin:node": "net"})
     stores.iamctl.set(ENV, "role:r1", {"role_name": "r1", "arn": "arn:aws:iam::000000000000:role/r1"})
     stores.lambdactl.set(ENV, "fn:fn1", _lambda_fn("fn1", "Active"))
+    stores.cachectl.set(ENV, "cluster:cache", _cache_cluster("cache", "available", port=51234))
 
     result = project(stores, ENV)
-    assert set(result) == {"net", "r1", "fn1"}
+    assert set(result) == {"net", "r1", "fn1", "cache"}

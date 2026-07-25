@@ -51,19 +51,25 @@ _KIND = {
     "aws_cloudwatch_log_group": "logs",
     "aws_secretsmanager_secret": "secret",
     "aws_ssm_parameter": "ssm",
+    "aws_elasticache_cluster": "elasticache",
 }
 # The attribute each supported type's human-facing name lives in (mirrors
-# hcl.py's builders: s3 uses `bucket`, everything else uses `name`).
+# hcl.py's builders: s3 uses `bucket`, elasticache uses `cluster_id`,
+# everything else uses `name`).
 _NAME_ATTR = {
     "aws_s3_bucket": "bucket", "aws_sqs_queue": "name", "aws_sns_topic": "name",
     "aws_dynamodb_table": "name", "aws_iam_role": "name",
     "aws_cloudwatch_log_group": "name",
     "aws_secretsmanager_secret": "name", "aws_ssm_parameter": "name",
+    "aws_elasticache_cluster": "cluster_id",
 }
 # canvas kind -> aws_* type, for mode (b) (the inverse of `_KIND`). iam_role,
 # logs, secret and ssm have no backing to enumerate live resources from (all
-# four are pure gateway models), so they stay out of the live path.
-_NO_LIVE_IMPORT = {"iam_role", "logs", "secret", "ssm"}
+# four are pure gateway models), so they stay out of the live path --
+# elasticache likewise: its clusters exist only as gateway-model records plus a
+# real container, and there's no `_import_id` shape to resolve one from outside
+# a canvas Apply (mode (a), reading an existing HCL project, works fine).
+_NO_LIVE_IMPORT = {"iam_role", "logs", "secret", "ssm", "elasticache"}
 _TF_TYPE = {kind: rtype for rtype, kind in _KIND.items() if kind not in _NO_LIVE_IMPORT}
 
 # The HCL arguments each kind CARRIES into the canvas -- so a round-trip through
@@ -85,6 +91,10 @@ _CARRIED_ATTRS = {
     # aws_secretsmanager_secret_version resource, assembled separately below.
     "secret": {"name", "description", "recovery_window_in_days", "tags"},
     "ssm": {"name", "type", "value", "description", "tags"},
+    # engine/num_cache_nodes are carried because hcl.py always re-emits them
+    # (redis, 1) -- so a round-trip reproduces the resource without warning
+    # about arguments odin does model, just doesn't need on the node.
+    "elasticache": {"cluster_id", "engine", "node_type", "num_cache_nodes", "tags"},
 }
 # The kinds whose user `tags` map survives the round trip as node data (hcl.py's
 # `_tags_block` merges a node's own `tags` field back in for EVERY primary
@@ -216,6 +226,10 @@ def _node_data(kind: str, label: str, attrs: dict) -> dict:
         tags = _tags(attrs)
         if tags:
             data["tags"] = tags
+    if kind == "elasticache":
+        node_type = hcl.unquote(attrs.get("node_type"))
+        if isinstance(node_type, str):
+            data["nodeType"] = node_type
     return data
 
 

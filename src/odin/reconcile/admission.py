@@ -10,16 +10,18 @@ Memory estimation, by kind:
 - `ec2`: the real per-instance-type memory (`compute.models.INSTANCE_TYPES`,
   the SAME table `gateway/models/ec2compute.py` uses for the real Lima VM) --
   this is exact, not a guess.
-- `rds`/`ecs`/`lambda`: a modest FIXED estimate per node -- each spawns its
-  OWN container (a Postgres, a task container, an RIE container), so per-node
-  charging is right. The ecs figure mirrors `compute/tasks.py`'s own default
-  container memory cap, so the estimate and the actual runtime ceiling agree.
+- `rds`/`ecs`/`lambda`/`elasticache`: a modest FIXED estimate per node -- each
+  spawns its OWN container (a Postgres, a task container, an RIE container, a
+  Redis), so per-node charging is right. The ecs and elasticache figures
+  mirror `compute/tasks.py`'s and `aws/cache.py`'s own default container
+  memory caps, so the estimate and the actual runtime ceiling agree.
 - `s3`/`sqs`/`sns`/`dynamodb`: charged ONCE PER ENV, not per node -- these
   ride a single shared per-env backing container (RustFS/goaws/dynalite)
   regardless of how many buckets/queues/topics/tables are drawn, so per-node
   charging would wildly over-count a canvas with many small resources.
 - `vpc`/`subnet`/`sg`/`iam_role`/`ecr`: no separate container/VM of their
-  own (Nebula/gateway-model bookkeeping only) -- zero footprint.
+  own (Nebula/gateway-model bookkeeping only) -- zero footprint. (`ecr`'s
+  registry:2 is a shared per-env backing, not charged per node.)
 
 The budget itself is against `HostFacts.total_mem_mib` (`runtime.ensure_host()`
 -- collected today, never used until now) -- a percentage of TOTAL memory,
@@ -34,17 +36,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from shutil import disk_usage
 
+from odin.aws.cache import DEFAULT_MEMORY_MIB as CACHE_MEMORY_MIB
 from odin.compute.models import get_instance_type
 from odin.runtime.driver import HostFacts
 from odin.spec.models import ResourceDesired, Stack
 
-# rds/ecs/lambda: a modest fixed estimate per NODE (each spawns its own
-# container). ecs's figure matches compute/tasks.py's own `_DEFAULT_MEMORY_MIB`
-# fallback cap -- the estimate and the real runtime ceiling agree.
+# rds/ecs/lambda/elasticache: a modest fixed estimate per NODE (each spawns
+# its own container). ecs's figure matches compute/tasks.py's own
+# `_DEFAULT_MEMORY_MIB` fallback cap and elasticache's matches
+# `aws/cache.py::DEFAULT_MEMORY_MIB` -- the estimate and the real runtime
+# ceiling agree.
 _PER_NODE_MEMORY_MIB: dict[str, float] = {
     "rds": 256.0,
     "ecs": 512.0,
     "lambda": 256.0,
+    "elasticache": CACHE_MEMORY_MIB,
 }
 
 # s3/sqs/sns/dynamodb: a modest fixed estimate per ENV (a SHARED backing
