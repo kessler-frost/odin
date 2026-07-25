@@ -90,8 +90,12 @@ def enabled() -> bool:
 def _default_timeout() -> float:
     """This pass IS on the request's critical path (a human is waiting on the
     answer), unlike translate's background refine -- so the budget is a UI
-    budget, not a batch one. `ODIN_DEBUG_TIMEOUT` overrides it."""
-    return float(os.environ.get("ODIN_DEBUG_TIMEOUT", "60"))
+    budget, not a batch one. 90s because it has to cover a COLD start: measured
+    on a real M8 run, the first nested-CLI launch took ~65s wall-clock end to
+    end and a warm one ~49s, so a 60s budget turned a perfectly good diagnosis
+    into "agent unavailable" purely on startup cost. `ODIN_DEBUG_TIMEOUT`
+    overrides it."""
+    return float(os.environ.get("ODIN_DEBUG_TIMEOUT", "90"))
 
 
 # --- 1. the context assembler (pure) -----------------------------------------
