@@ -32,6 +32,7 @@ _REF = re.compile(r"^\$\{\{\s*([\w-]+)\.([\w-]+)\s*\}\}$")
 # sidecar) via CreateSecret/PutSecretValue (gateway/models/secretsctl.py) and
 # ssm's via PutParameter (gateway/models/ssmctl.py) -- the reconciler never
 # touches any of them, same as vpc/subnet/sg.
+
 # (kind, field) pairs whose value is a CREDENTIAL BY CONSTRUCTION, whatever the
 # field happens to be called (W2.4). `is_sensitive_field_name` catches names
 # that LOOK secret-ish -- it would catch `secretString` by luck, and would miss
