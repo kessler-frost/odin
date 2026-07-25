@@ -218,6 +218,11 @@ def create_apply_router(
 _TOFU_NOT_INSTALLED = {"error": "tofu not installed", "fix": "brew install opentofu"}
 
 
+# `tofu plan -detailed-exitcode`, as odin's own vocabulary. Anything not in
+# here (1, a signal, ...) is a real error -- see `/tf/plan`.
+_PLAN_STATUS = {0: "no_changes", 2: "changes"}
+
+
 class ImportTfRequest(BaseModel):
     source: Literal["hcl", "live"]
     hcl: str = ""
@@ -267,6 +272,41 @@ def create_tf_router(
         }
         if not result.ok:
             body["tail"] = list(result.tail)
+        return JSONResponse(status_code=200 if result.ok else 500, content=body)
+
+    @router.post("/tf/plan")
+    async def tf_plan(env: str = ENV) -> JSONResponse:
+        """Field test 3 (safety): the SAFE drift check. Everything `/tf/apply`
+        does to keep tofu pointed at odin's own gateway -- the injected
+        `AWS_ENDPOINT_URL`, this env's operator credentials, the same
+        workspace -- with `tofu plan -detailed-exitcode` in place of the
+        apply. The alternative a user is otherwise pushed to (hand-running
+        `tofu plan` in `.odin/<env>/tf`, whose main.tf is deliberately
+        portable and therefore endpoint-less) reaches REAL AWS.
+
+        Read-only, unlike `/tf/apply`: no admission control (nothing is
+        provisioned), no `wiring.stage`, no Stack commit -- the only writes
+        are the regenerated `main.tf`/`override.tf` (so the plan is against
+        the CURRENT canvas, which is what makes drift meaningful) and tofu's
+        own refresh, which it does not persist.
+
+        `exit_code` rides through verbatim so a CI gate can use tofu's own
+        contract: 0 no changes, 2 changes present, anything else an error."""
+        stack = store.get_stack(env)
+        project = generate_tf(stack)
+        access_key, secret_key = _issue_operator(env)
+        try:
+            result = await runner.plan(
+                env, project, gateway_port(), access_key, secret_key, secrets=stack.sensitive_values(),
+            )
+        except TofuNotInstalled:
+            return JSONResponse(status_code=409, content=_TOFU_NOT_INSTALLED)
+        except SimulateBusy as exc:
+            return JSONResponse(status_code=409, content={"error": str(exc)})
+        body = {
+            "status": _PLAN_STATUS.get(result.exit_code, "failed"), "env": env,
+            "exit_code": result.exit_code, "unsupported": project.unsupported, "tail": list(result.tail),
+        }
         return JSONResponse(status_code=200 if result.ok else 500, content=body)
 
     @router.post("/tf/destroy")

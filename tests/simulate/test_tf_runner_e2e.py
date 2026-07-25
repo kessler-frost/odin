@@ -19,9 +19,7 @@ cleaned up at the end.
 """
 from __future__ import annotations
 
-import os
 import shutil
-import subprocess
 import time
 from pathlib import Path
 
@@ -29,7 +27,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from odin.aws.backings import BackingAws
-from odin.gateway.keys import OPERATOR_NODE_ID
 from odin.runtime.colima import ColimaRuntime
 from odin.server import create_app
 from odin.spec.store import SpecStore
@@ -51,6 +48,13 @@ CANVAS = {
     "edges": [{"source": "n3", "target": "n2"}],  # alerts -> jobs subscription
 }
 
+# The same canvas plus one bucket -- the "someone edited the canvas" half of
+# the drift check (field test 3): `odin tf plan` must answer exit 2.
+EDITED_CANVAS = {
+    "nodes": [*CANVAS["nodes"], {"id": "n5", "type": "s3", "data": {"label": "reports"}}],
+    "edges": CANVAS["edges"],
+}
+
 
 @pytest.fixture
 def runtime():
@@ -59,18 +63,6 @@ def runtime():
     for name in own_containers(rt, ENV):
         rt.stop(name)
     shutil.rmtree(_ODIN_ENV_DIR, ignore_errors=True)
-
-
-def _tf_env(gateway_port: int, access_key: str, secret_key: str) -> dict[str, str]:
-    return {
-        **os.environ,
-        "AWS_ENDPOINT_URL": f"http://127.0.0.1:{gateway_port}",
-        "AWS_ACCESS_KEY_ID": access_key,
-        "AWS_SECRET_ACCESS_KEY": secret_key,
-        "AWS_DEFAULT_REGION": "us-east-1",
-        "TF_IN_AUTOMATION": "1",
-        "TF_INPUT": "0",
-    }
 
 
 def test_tf_apply_zero_drift_destroy(tmp_path, runtime):
@@ -103,16 +95,26 @@ def test_tf_apply_zero_drift_destroy(tmp_path, runtime):
         assert aws.exists("dynamodb", "items")
 
         # zero drift: a plan against the just-applied state changes nothing
-        # (the research bar -- "apply -> zero-drift plan -> destroy").
-        access_key, secret_key = app.state.gateway_keys.issue(ENV, OPERATOR_NODE_ID)
-        workspace = store.root / ENV / "tf"
-        plan = subprocess.run(
-            ["tofu", "plan", "-input=false", "-no-color", "-detailed-exitcode"],
-            cwd=workspace, env=_tf_env(gateway_port, access_key, secret_key),
-            capture_output=True, text=True, timeout=120,
-        )
-        assert plan.returncode == 0, f"drift detected (exit {plan.returncode}):\n{plan.stdout}\n{plan.stderr}"
+        # (the research bar -- "apply -> zero-drift plan -> destroy"). Through
+        # `/tf/plan`, which is the field-test-3 fix: the hand-run `tofu plan`
+        # this used to be is exactly the mistake that reached real AWS, because
+        # main.tf (deliberately portable) carries no endpoint.
+        plan_resp = client.post("/tf/plan", params={"env": ENV})
+        assert plan_resp.status_code == 200, plan_resp.json()
+        assert plan_resp.json()["status"] == "no_changes", plan_resp.json()
+        assert plan_resp.json()["exit_code"] == 0, plan_resp.json()
 
+        # ...and the same plan sees a canvas edit as changes: exit 2, tofu's
+        # own `-detailed-exitcode` contract, straight through to the caller.
+        store.apply(canvas_to_stack(EDITED_CANVAS, env=ENV))
+        drift_resp = client.post("/tf/plan", params={"env": ENV})
+        assert drift_resp.status_code == 200, drift_resp.json()
+        assert drift_resp.json()["status"] == "changes", drift_resp.json()
+        assert drift_resp.json()["exit_code"] == 2, drift_resp.json()
+        # the plan itself created nothing -- it is a read
+        assert not aws.exists("s3", "reports")
+
+        store.apply(stack)  # back to the applied canvas, so destroy tears down what exists
         destroy_resp = client.post("/tf/destroy", params={"env": ENV})
         assert destroy_resp.status_code == 200, destroy_resp.json()
         assert destroy_resp.json()["status"] == "destroyed"

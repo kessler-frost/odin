@@ -54,6 +54,39 @@ _OVERRIDE_ATTRS = {
 }
 
 
+# Field test 3: a field engineer opened this directory to check for drift,
+# ran `tofu plan` by hand without the injected endpoint, and tofu talked to
+# REAL AWS (it came back with a genuine `UnrecognizedClientException` from
+# Amazon; on a machine with real credentials in the environment it would have
+# planned against the real account). main.tf staying portable is deliberate --
+# odin emits real AWS Terraform, and the translation guardrail forbids
+# `endpoints`/`localhost` in it -- so the warning goes where the person is
+# standing when they're about to make that mistake: in the workspace itself.
+# Not a `.tf` file, so tofu never loads it.
+_README_NAME = "README.md"
+_README = """\
+# odin's OpenTofu workspace for env `{env}`
+
+**Running tofu by hand in this directory talks to REAL AWS.**
+
+`main.tf` is portable, real-AWS Terraform on purpose: no `endpoints` block,
+no `127.0.0.1`, no credentials. odin injects all of that at run time
+(`AWS_ENDPOINT_URL` pointing at odin's own gateway, plus this env's operator
+`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`) every time it runs tofu for you.
+A hand-run `tofu plan`/`apply` here has none of it, so it goes to Amazon --
+and with real credentials in your environment, to your real account.
+
+Let odin run it instead; the endpoint cannot be gotten wrong that way:
+
+    odin tf plan --env {env}       # drift check -- exit 0 none, 2 changes, 1 error
+    odin apply --env {env}         # the apply
+    odin tf destroy --env {env}    # tofu's own teardown
+
+`main.tf`, `override.tf`, and this file are regenerated from the canvas on
+every apply and every plan -- edits here are overwritten, not applied.
+"""
+
+
 def _override_tf() -> str:
     width = max(len(key) for key in _OVERRIDE_ATTRS)
     lines = "\n".join(f"  {key.ljust(width)} = {value}" for key, value in _OVERRIDE_ATTRS.items())
@@ -70,14 +103,17 @@ def tf_dir(root: Path, env: str) -> Path:
 def materialize(root: Path, env: str, project: TfProject) -> Path:
     """Write `project.files` (main.tf) + `project.binary_files` (V4c: a
     lambda node's zip'd deployment package, referenced by `filename` from
-    its own aws_lambda_function block) + the generated override.tf into the
-    env's TF workspace, creating it if needed. Returns the workspace dir."""
+    its own aws_lambda_function block) + the generated override.tf + the
+    README that warns a human off hand-running tofu here (field test 3)
+    into the env's TF workspace, creating it if needed. Returns the
+    workspace dir."""
     workspace = private_mkdir(tf_dir(root, env))
     for name, content in project.files.items():
         atomic_write_text(workspace / name, content, mode=SECRET_FILE_MODE)
     for name, content in project.binary_files.items():
         atomic_write_bytes(workspace / name, content, mode=SECRET_FILE_MODE)
     atomic_write_text(workspace / "override.tf", OVERRIDE_TF, mode=SECRET_FILE_MODE)
+    atomic_write_text(workspace / _README_NAME, _README.format(env=env), mode=SECRET_FILE_MODE)
     _lock_down(workspace)
     return workspace
 

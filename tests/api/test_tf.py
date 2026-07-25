@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from odin.gateway.keys import OPERATOR_NODE_ID
 from odin.runtime.colima import ContainerFacts, HostFacts, RunHandle
 from odin.server import create_app
-from odin.simulate.runner import SimulateBusy
+from odin.simulate.runner import SimulateBusy, TfResult
 from odin.spec.models import FieldValue, ResourceDesired, Stack
 from odin.spec.store import SpecStore
 
@@ -123,6 +123,88 @@ def test_tf_apply_409_when_the_stack_exceeds_the_memory_budget(tmp_path):
     body = resp.json()
     assert "GiB" in body["error"] and "reduce instance sizes or apply fewer nodes" in body["error"]
     assert body["estimated_mib"] > body["budget_mib"]
+
+
+# --- field test 3: /tf/plan, the safe drift check --------------------------
+
+
+def _plan_returning(result: TfResult):
+    async def _plan(*args, **kwargs):
+        return result
+
+    return _plan
+
+
+def test_tf_plan_409_when_tofu_not_installed(tmp_path, monkeypatch):
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: None)
+    app = _app(tmp_path)
+    with TestClient(app) as client:
+        resp = client.post("/tf/plan", params={"env": "default"})
+    assert resp.status_code == 409
+    assert resp.json() == {"error": "tofu not installed", "fix": "brew install opentofu"}
+
+
+def test_tf_plan_409_when_a_run_is_already_in_flight(tmp_path):
+    app = _app(tmp_path)
+
+    async def _busy(*args, **kwargs):
+        raise SimulateBusy("default")
+
+    app.state.tf_runner.plan = _busy
+    with TestClient(app) as client:
+        resp = client.post("/tf/plan", params={"env": "default"})
+    assert resp.status_code == 409
+    assert "already in progress" in resp.json()["error"]
+
+
+def test_tf_plan_reports_no_changes_on_exit_zero(tmp_path):
+    app = _app(tmp_path)
+    app.state.tf_runner.plan = _plan_returning(TfResult(ok=True, exit_code=0, tail=("No changes.",)))
+    with TestClient(app) as client:
+        resp = client.post("/tf/plan", params={"env": "default"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "no_changes"
+    assert body["exit_code"] == 0
+    assert body["tail"] == ["No changes."]
+
+
+def test_tf_plan_reports_changes_on_exit_two(tmp_path):
+    """`-detailed-exitcode`'s 2 is drift, not a failed command -- so it is a
+    200 with `status: changes`, and the exit code rides through untouched."""
+    app = _app(tmp_path)
+    app.state.tf_runner.plan = _plan_returning(TfResult(ok=True, exit_code=2, tail=("Plan: 1 to add",)))
+    with TestClient(app) as client:
+        resp = client.post("/tf/plan", params={"env": "default"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "changes"
+    assert body["exit_code"] == 2
+
+
+def test_tf_plan_reports_failed_on_a_real_error(tmp_path):
+    app = _app(tmp_path)
+    app.state.tf_runner.plan = _plan_returning(TfResult(ok=False, exit_code=1, tail=("Error: boom",)))
+    with TestClient(app) as client:
+        resp = client.post("/tf/plan", params={"env": "default"})
+    assert resp.status_code == 500
+    body = resp.json()
+    assert body["status"] == "failed"
+    assert body["tail"] == ["Error: boom"]
+
+
+def test_tf_plan_commits_no_stack_revision(tmp_path):
+    """A drift check must not mutate the spec store: same HEAD before/after."""
+    store = SpecStore(tmp_path)
+    store.apply(Stack(env="default", resources=(ResourceDesired(id="uploads", kind="s3"),)))
+    app = create_app(runtime=FakeRuntime(), store=store, rds=FakeRds(), backings=False)
+    app.state.tf_runner.plan = _plan_returning(TfResult(ok=True, exit_code=0))
+    before = store.head("default")
+
+    with TestClient(app) as client:
+        assert client.post("/tf/plan", params={"env": "default"}).status_code == 200
+
+    assert store.head("default") == before
 
 
 def test_tf_status_for_a_never_applied_env(tmp_path):

@@ -288,6 +288,7 @@ odin translate --file draft.json    # ...or an unsaved canvas file
 odin apply --env dev                # the Apply button, as a command
 odin world --env dev                # live resource phases
 odin events --env dev               # the event stream, one JSON line each
+odin tf plan --env dev              # drift check — the SAFE way to plan
 odin tf status --env dev            # tofu-side state
 odin destroy --env dev              # full teardown (tofu half included)
 odin import-tf existing.tf          # TF -> canvas JSON (pipe into canvas set -)
@@ -298,7 +299,10 @@ odin --version                      # which odin this is
 ```
 
 Exit codes are the contract: `0` success, `1` a refusal or a real failure, `2`
-a usage/format error. One thing an exit-code-only check misses — a node Apply
+a usage/format error (or an unreachable server). The one deliberate exception
+is `odin tf plan`, which mirrors `tofu plan -detailed-exitcode` instead — see
+[Checking for drift](#checking-for-drift--and-why-not-to-run-tofu-by-hand)
+below. One thing an exit-code-only check misses — a node Apply
 skipped as unsupported still exits `0`, so gate on the payload instead:
 
 ```bash
@@ -311,6 +315,41 @@ A round-trip example an agent might run:
 odin canvas get | jq '.nodes += [{"id":"x1","type":"s3","data":{"label":"backups"}}]' | odin canvas set -
 odin apply --env dev
 ```
+
+### Checking for drift — and why not to run tofu by hand
+
+**Running `tofu` yourself inside `.odin/<env>/tf` talks to REAL AWS.** The
+`main.tf` odin generates there is portable, real-AWS Terraform on purpose —
+no `endpoints` block, no `127.0.0.1`, no credentials in the file. odin
+injects the endpoint (its own gateway) and this env's operator credentials
+at run time. A hand-run `tofu plan` has none of that, so it goes to Amazon;
+with real credentials in your environment, it plans against your real
+account. (A field engineer did exactly this and got a genuine
+`UnrecognizedClientException` back from AWS. Every workspace now carries a
+`README.md` saying so.)
+
+`odin tf plan` is the safe path — same workspace, same injected endpoint,
+same credentials as Apply, and it changes nothing:
+
+```bash
+odin tf plan --env dev              # human-readable
+odin tf plan --env dev -o json      # for a pipeline
+```
+
+Its exit codes mirror `tofu plan -detailed-exitcode`, so a CI drift gate is
+the command and nothing else:
+
+| exit | meaning |
+| ---- | ------- |
+| `0`  | no changes — the env matches the canvas |
+| `2`  | changes present (drift, or an unapplied canvas edit) |
+| `1`  | a real error, or a refusal (a run already in flight, no tofu) |
+| `3`  | the odin server is unreachable — **not** `2`, so a down server can't be read as drift |
+
+One caveat the exit code can't carry: `no_changes` means "no drift in what
+odin can generate". A node odin has no Terraform for was never in the plan;
+the command names those separately (and `-o json` puts them in
+`.unsupported`).
 
 ## Backup and restore
 

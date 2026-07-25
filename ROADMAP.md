@@ -669,6 +669,32 @@ future decision against these points instead of re-deriving them:
   by their own stores and backing containers — and ~15 modules bake `ACCOUNT`
   into ARNs. The TF provider never noticed either way
   (`skip_requesting_account_id = true`); only workload STS callers did.
+- **Drift is checked with `odin tf plan`, never by hand.** The generated
+  `main.tf` under `.odin/<env>/tf` is PORTABLE by design (real AWS Terraform —
+  the translation guardrail forbids `endpoints`/`localhost` in it), and the
+  endpoint + operator credentials are injected by the runner at invoke time.
+  So a hand-run `tofu plan` in that directory **talks to real AWS** — a field
+  engineer's first attempt did exactly that and came back with a genuine
+  `UnrecognizedClientException` from Amazon; on a machine with real
+  credentials in the environment it would have planned against the real
+  account (v0.7.2, field test 3; field test 2's U8 asked for this first).
+  Portability was kept and the safe path was made the obvious one instead:
+  `POST /tf/plan` / `odin tf plan` run through the same machinery `/tf/apply`
+  uses (same workspace, same injected `AWS_ENDPOINT_URL`, same per-env
+  OPERATOR credentials, same lock, same secret scrubbing) with
+  `tofu plan -detailed-exitcode`, and every materialized workspace now carries
+  a `README.md` that says the hazard out loud where someone would `cd`.
+  - **Exit codes are the product**: 0 no changes, 2 changes present, 1 a real
+    error or refusal — and 3, not 2, for an unreachable server, because 2
+    already means drift here and a down odin must not read as a clean
+    detection. (`odin tf plan` is the only command that deviates from the
+    repo-wide 0/1/2 contract, deliberately.)
+  - **Read-only**: no `-out` plan file, no `wiring.stage`, no Stack commit,
+    and it is NOT recorded on `odin tf status`'s last-run cache — a drift
+    check must not make the last real apply look like it went differently.
+    It DOES regenerate `main.tf`/`override.tf` from the current canvas first
+    (the same files an apply regenerates), which is what makes "changes
+    present" mean "the canvas and the env disagree".
 - **`tofu` runs are BOUNDED, and a wedged destroy says why.** `init`/`apply`
   each get `ODIN_TOFU_TIMEOUT` (default 600s); `destroy` gets a smaller
   WHOLE-CALL deadline, `ODIN_TOFU_DESTROY_TIMEOUT` (default 300s, `init`
