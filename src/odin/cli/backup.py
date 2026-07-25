@@ -23,9 +23,10 @@ from odin.cli.http import OutputFormat
 
 ROOT = Path(".odin")
 
-# `-o` is the archive path here (the `tar`/`cc` convention the task's own
-# spelling asks for), so the two-mode output switch is long-form only on
-# these two commands -- deliberately different from the rest of the CLI.
+# `-o` means "output FILE" on these two commands (the `tar`/`cc` convention --
+# what anyone reaching for a backup tool will type), so the CLI's usual
+# `-o/--output` format switch is long-form only here. Deliberately different
+# from the rest of the CLI, and called out in `--out`'s own help.
 JSON_OR_TEXT = typer.Option(
     OutputFormat.text, "--output",
     help="Output format: human-readable text, or raw JSON on stdout for piping.",
@@ -125,10 +126,10 @@ def _render_import(body: dict) -> None:
     typer.echo("Canvas restored: .odin/canvas.json replaced." if body["canvas_restored"] else
                "Canvas left alone (pass --with-canvas to restore it too).")
     typer.echo(
-        "\nNext steps:\n"
-        "  odin start\n"
-        "  then hit Apply (or `odin apply --env " + body["env"] + "`) to reconcile the substrates.\n"
-        "Importing state does not boot containers — the reconciler plus one Apply\n"
-        "converges reality to the restored desired state (backings come back empty:\n"
-        "odin exports control-plane state, not container volumes)."
+        f"\nNext steps:\n"
+        f"  odin start\n"
+        f"  then hit Apply (or `odin apply --env {body['env']}`) to reconcile the substrates.\n"
+        f"Importing state does not boot containers — the reconciler plus one Apply\n"
+        f"converges reality to the restored desired state (backings come back empty:\n"
+        f"odin exports control-plane state, not container volumes)."
     )
