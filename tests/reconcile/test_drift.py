@@ -11,6 +11,7 @@ from odin.compute.instances import vm_name
 from odin.compute.tasks import container_name as task_container_name
 from odin.gateway.stores import SynthStores
 from odin.reconcile.drift import DriftSweeper
+from odin.reconcile.tf_status import project
 
 ENV = "default"
 
@@ -92,10 +93,48 @@ def test_deleted_vm_yields_a_crashed_verdict_naming_the_drift(tmp_path):
     assert verdicts["web"] == f"VM {name} deleted outside odin — re-Apply to recreate"
 
 
+def test_deleted_vm_marks_the_record_terminated_so_re_apply_really_recreates_it(tmp_path):
+    """The honesty fix W2.2 shipped without: telling the user "re-Apply to
+    recreate" is only true if TOFU is told too. A record left claiming
+    `running` answers DescribeInstances with a VM that doesn't exist -> empty
+    plan -> the VM never comes back. `terminated` (+ a real StateReason) is
+    what makes the provider drop it from state and plan a create."""
+    stores = SynthStores(tmp_path)
+    name = _ec2(stores, "web", "i-1")
+
+    _sweeper(vms=FakeVms(names=[])).verdicts(stores, ENV)
+
+    record = stores.ec2compute.get(ENV, "instance:i-1")
+    assert record["state_name"] == "terminated"
+    assert record["state_reason"] == {
+        "code": "Client.UserInitiatedShutdown",
+        "message": f"VM {name} deleted outside odin — re-Apply to recreate",
+    }
+    assert record["drifted"] is True
+    assert record["terminated_at"] is not None, "the normal lazy sweep must still reclaim it"
+
+
+def test_the_world_stops_claiming_healthy_for_a_deleted_vm(tmp_path):
+    """The whole point, at the projection level: before the sweep the node
+    reads `healthy` off a record nothing cross-checked; after it, `crashed`
+    with the real reason -- and never `draft`, which would be odin quietly
+    forgetting a node the user still has on the canvas."""
+    stores = SynthStores(tmp_path)
+    name = _ec2(stores, "web", "i-1")
+    assert project(stores, ENV)["web"] == ("ec2", "healthy", {}, None)
+
+    _sweeper(vms=FakeVms(names=[])).verdicts(stores, ENV)
+
+    kind, phase, _, verdict = project(stores, ENV)["web"]
+    assert (kind, phase) == ("ec2", "crashed")
+    assert f"VM {name} deleted outside odin" in verdict
+
+
 def test_live_vm_reports_no_drift(tmp_path):
     stores = SynthStores(tmp_path)
     name = _ec2(stores, "web", "i-1")
     assert _sweeper(vms=FakeVms(names=[name])).verdicts(stores, ENV) == {}
+    assert stores.ec2compute.get(ENV, "instance:i-1")["state_name"] == "running"
 
 
 def test_mid_boot_and_mid_delete_ec2_records_are_exempt(tmp_path):
@@ -108,6 +147,12 @@ def test_mid_boot_and_mid_delete_ec2_records_are_exempt(tmp_path):
         vms = FakeVms(names=[])
         assert _sweeper(vms=vms).verdicts(stores, ENV) == {}, state
         assert vms.calls == 0, f"{state}: no candidate, so no limactl call at all"
+        # ...and the record itself is left completely alone: the store write is
+        # only ever for a VM the sweep CONFIRMED gone, never for one that's
+        # merely not registered yet.
+        assert stores.ec2compute.get(ENV, "instance:i-1") == {
+            "instance_id": "i-1", "state_name": state, "state_reason": None,
+        }, state
 
 
 def test_untagged_ec2_record_is_not_reported(tmp_path):
@@ -226,21 +271,34 @@ def test_non_sweep_ticks_make_no_runtime_calls_and_keep_the_verdict(tmp_path, mo
     assert sweeper.verdicts(stores, ENV) == first  # tick 3: cached
     assert vms.calls == 1, "a non-sweep tick must not shell out at all"
 
-    assert sweeper.verdicts(stores, ENV) == first  # tick 4: sweeps again
-    assert vms.calls == 2
+    # Tick 4 sweeps again -- and finds nothing to report, because tick 1
+    # already corrected the RECORD (`state_name == "terminated"`, which every
+    # sweep exempts). The report doesn't disappear, it changes owner: the
+    # store's own StateReason is what /world reads from here on
+    # (test_the_world_stops_claiming_healthy_for_a_deleted_vm), and that
+    # handoff is exactly what a re-Apply needs to see -- and with no candidate
+    # left, tick 4 doesn't even shell out.
+    assert sweeper.verdicts(stores, ENV) == {}
+    assert vms.calls == 1
+    assert project(stores, ENV)["web"][1] == "crashed"
 
 
-def test_a_healed_resource_clears_on_the_next_sweep(tmp_path, monkeypatch):
+def test_a_recovered_resource_is_no_longer_reported(tmp_path, monkeypatch):
+    """The recovery path for real: a re-Apply doesn't resurrect the drifted
+    instance, it creates a NEW one (the provider dropped the terminated record
+    from state), so the sweep goes quiet and the projection reads the live
+    record instead of its predecessor."""
     monkeypatch.setenv("ODIN_DRIFT_SWEEP_TICKS", "2")
     stores = SynthStores(tmp_path)
-    name = _ec2(stores, "web", "i-1")
     vms = FakeVms(names=[])
     sweeper = _sweeper(vms=vms)
+    _ec2(stores, "web", "i-1")
     assert "web" in sweeper.verdicts(stores, ENV)
 
-    vms.names = [name]  # a re-Apply recreated the VM
+    vms.names = [_ec2(stores, "web", "i-2")]  # what a re-Apply actually does
     sweeper.verdicts(stores, ENV)  # cached tick: still reported
     assert sweeper.verdicts(stores, ENV) == {}  # next sweep: clean
+    assert project(stores, ENV)["web"] == ("ec2", "healthy", {}, None)
 
 
 def test_per_env_cadence_and_cache_are_independent(tmp_path):
@@ -264,6 +322,10 @@ def test_a_failed_vm_listing_reports_no_drift(tmp_path):
     _ec2(stores, "web", "i-1")
     vms = FakeVms(error=RuntimeError("limactl list --json failed: not installed"))
     assert _sweeper(vms=vms).verdicts(stores, ENV) == {}
+    # ...and NOTHING is written into the store either: marking a live instance
+    # `terminated` over a limactl hiccup would make tofu recreate a VM that
+    # was never gone.
+    assert stores.ec2compute.get(ENV, "instance:i-1")["state_name"] == "running"
 
 
 def test_a_failed_container_listing_reports_no_drift_and_touches_no_record(tmp_path):

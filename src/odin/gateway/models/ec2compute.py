@@ -550,6 +550,38 @@ def _sweep_terminated(stores: SynthStores, env: str, now: float) -> None:
             stores.ec2compute.delete(env, _key("instance", instance["instance_id"]))
 
 
+def mark_instance_terminated(stores: SynthStores, env: str, instance_id: str, reason: str) -> None:
+    """Public seam for the reality sweep (`reconcile/drift.py`): this
+    instance's Lima VM is GONE (deleted outside odin), so the record says
+    `terminated` with `reason` -- the SAME terminal shape `_finish_boot`'s
+    failure path and `_finish_terminate` already write, through the same
+    `_update_instance` guard (a terminate already winning the race is never
+    pulled back out).
+
+    THIS is what makes "re-Apply to recreate" true rather than a comforting
+    lie (NORTHSTAR directive 5): terraform-provider-aws's own Read treats a
+    `terminated` instance as gone and drops it from state, so the next
+    `tofu apply` plans a create and the VM genuinely comes back. A record
+    still claiming `running` answers DescribeInstances with a VM that doesn't
+    exist, tofu plans nothing, and the resource never returns.
+
+    `drifted` is the flag that keeps World honest at the same time: a plain
+    `terminated` record is EXCLUDED from the projection (reconcile/
+    tf_status.py -- the v0.5.2 phantom-EC2 fix), while a drifted one projects
+    `crashed` + this reason instead of silently vanishing off the canvas.
+    `terminated_at` is set so the normal lazy sweep (`_sweep_terminated`)
+    still reclaims the record on the recovery apply's own describes.
+
+    `Client.UserInitiatedShutdown` is a REAL EC2 state-reason code, and the
+    accurate one: something outside odin (a human, another tool) did delete
+    the VM -- never an invented code."""
+    _update_instance(
+        stores, env, instance_id, state_name="terminated",
+        state_reason={"code": "Client.UserInitiatedShutdown", "message": reason},
+        terminated_at=time.monotonic(), drifted=True,
+    )
+
+
 def _vpc_default_firewall(stores: SynthStores, env: str, vpc: dict) -> FirewallRules | None:
     """R3: the containing VPC's default security group's ALREADY-compiled
     Nebula firewall (`ec2net.py::_compiled_firewall`, recomputed on every SG

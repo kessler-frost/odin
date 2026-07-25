@@ -187,6 +187,45 @@ def test_terminated_ec2_instance_is_excluded_entirely(tmp_path):
     assert project(stores, ENV) == {}
 
 
+def test_a_drifted_terminated_instance_projects_crashed_with_its_real_reason(tmp_path):
+    """W2.2's honesty fix (reconcile/drift.py): the reality sweep marks an
+    instance whose VM was deleted OUTSIDE odin `terminated`, because that is
+    what makes the next Apply recreate it. Dropping such a record here (the
+    rule for every other terminated instance) would trade one dishonesty for
+    another -- odin would quietly forget a node still on the canvas instead of
+    showing WHY it's down -- so a `drifted` record projects `crashed`."""
+    stores = SynthStores(tmp_path)
+    record = _ec2_instance("i-1", "terminated", {
+        "code": "Client.UserInitiatedShutdown",
+        "message": "VM odin-ec2-default-i-1 deleted outside odin — re-Apply to recreate",
+    })
+    stores.ec2compute.set(ENV, "instance:i-1", {**record, "drifted": True})
+    stores.tags.set(ENV, "ec2:i-1", {"odin:node": "server"})
+
+    assert project(stores, ENV)["server"] == (
+        "ec2", "crashed", {},
+        "Client.UserInitiatedShutdown: VM odin-ec2-default-i-1 deleted outside odin — re-Apply to recreate",
+    )
+
+
+def test_a_recreated_instance_wins_its_label_over_the_drifted_one_it_replaced(tmp_path):
+    """The recovery apply mints a NEW instance while the drifted record can
+    still be inside ec2compute's 60s lazy-sweep window, so both briefly carry
+    the same `odin:node` label. The live one must win, whatever order the
+    store happens to hold them in -- a recovered node reading `crashed` off
+    the corpse it replaced would be the same false badge in reverse."""
+    stores = SynthStores(tmp_path)
+    stores.ec2compute.set(ENV, "instance:i-new", _ec2_instance("i-new", "running"))
+    stores.tags.set(ENV, "ec2:i-new", {"odin:node": "server"})
+    stores.ec2compute.set(ENV, "instance:i-old", {
+        **_ec2_instance("i-old", "terminated", {"code": "Client.UserInitiatedShutdown", "message": "gone"}),
+        "drifted": True,
+    })
+    stores.tags.set(ENV, "ec2:i-old", {"odin:node": "server"})
+
+    assert project(stores, ENV)["server"] == ("ec2", "healthy", {}, None)
+
+
 def test_ec2_instance_with_no_odin_node_tag_is_not_projected(tmp_path):
     # No AWS-native "Name" field on a real EC2 instance either -- untagged
     # means unmappable, same as vpc/subnet.
