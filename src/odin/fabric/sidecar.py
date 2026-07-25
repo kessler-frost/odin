@@ -54,13 +54,21 @@ host-tun design.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
+from collections.abc import Iterable
 from pathlib import Path
 
 from odin.compute.cloud_init import NEBULA_VERSION
 from odin.fabric.models import FirewallRules
-from odin.fabric.nebula import DEFAULT_FIREWALL, LighthouseManager, NebulaManager
+from odin.fabric.nebula import (
+    DEFAULT_FIREWALL,
+    LighthouseManager,
+    NebulaManager,
+    peer_overlay_ips,
+    rehandshake_script,
+)
 from odin.runtime.colima import ContainerSpec
 from odin.util import atomic_write_text
 
@@ -103,8 +111,22 @@ HOST_GATEWAY_IP = "192.168.5.2"
 _DISABLE_ENV = "ODIN_BACKING_MESH"
 
 
+# The groups baked into the certificate this member is currently holding,
+# recorded beside the config/cert it was given. `compute/instances.py::
+# instance_membership_path` is the EC2 half of the same idea, and its docstring
+# has the reasoning: membership lives in a CERT, so without a record of it
+# there is nothing a config comparison can notice when the canvas moves a
+# member between groups (field test 3 HIGH-1).
+_GROUPS_FILE = "groups.json"
+
+
 def underlay_ip() -> str:
     return os.environ.get("ODIN_MESH_UNDERLAY") or HOST_GATEWAY_IP
+
+
+def _recorded_groups(member_dir: Path) -> list[str] | None:
+    path = member_dir / _GROUPS_FILE
+    return json.loads(path.read_text()) if path.exists() else None
 
 
 def _shares_namespace(network_mode: str, target_id: str) -> bool:
@@ -202,6 +224,18 @@ class MeshSidecar:
         only at start, and so does a REPLACED target (see `attached_to` --
         the field-test HIGH-2 bug: without that half, a killed-and-recreated
         database was never re-joined by any number of Applies).
+
+        ...and so does a changed `groups` (field test 3 HIGH-1): a member's
+        MEMBERSHIP lives in its certificate, so it is not visible in the
+        config at all and used to be fixed forever at first join. It is now
+        re-issued whenever it changes -- the same fix, with the same
+        semantics, as `InstanceVm._reissue_cert` gives an EC2 VM, so the two
+        kinds of mesh member cannot disagree about what a group move means.
+        (No production caller passes `groups` for a backing yet: an
+        `aws_db_instance`'s SGs reach it as its INBOUND firewall, and nothing
+        names a backing as the SOURCE of another group's rule. This is what
+        makes that possible rather than a second silent limit.)
+
         Never raises -- like `InstanceVm._activate_nebula`, mesh wiring must
         not fail an otherwise-healthy backing (the host path still works)."""
         if not self.enabled():
@@ -223,13 +257,22 @@ class MeshSidecar:
         if overlay is None:
             return None
         cert_ip = manager.allocate_host_ip(member)  # sticky: same IP every join
-        # Signed ONCE per member (this runs on every ensure_backing / every
-        # reconciler tick for a live rds -- a `nebula-cert` subprocess each
-        # time would be pure waste). A member's groups are fixed at first
-        # join; changing them means revoking the cert, which nothing does yet.
-        cert = manager.cert_paths(member)
-        if not cert.crt.exists():
-            cert = manager.sign_cert(member, cert_ip, groups=["backing", *groups])
+        # Signed ONCE per member, and RE-signed only when its membership really
+        # changed (this runs on every ensure_backing / every reconciler tick
+        # for a live rds -- a `nebula-cert` subprocess each time would be pure
+        # waste). Recorded groups, not the cert itself, are what makes that
+        # comparison a local file read: `compute/instances.py::
+        # instance_membership_path` records an EC2 VM's the same way and for
+        # the same reason.
+        directory = self._member_dir(member)
+        desired = ["backing", *sorted(groups)]
+        recertified = (
+            _recorded_groups(directory) != desired or not manager.cert_paths(member).crt.exists()
+        )
+        cert = (
+            manager.reissue_cert(member, cert_ip, desired) if recertified
+            else manager.cert_paths(member)
+        )
         config = manager.generate_config(
             lighthouse_ip=overlay.lighthouse_ip, lighthouse_underlay=underlay,
             firewall=firewall, is_lighthouse=False, relay_enabled=True,
@@ -239,7 +282,6 @@ class MeshSidecar:
             # is exactly what makes the sidecar re-join on the new one.
             lighthouse_port=overlay.lighthouse_port,
         )
-        directory = self._member_dir(member)
         directory.mkdir(parents=True, exist_ok=True)
         for name, text in (
             ("ca.crt", cert.ca_crt.read_text()),
@@ -248,17 +290,18 @@ class MeshSidecar:
         ):
             atomic_write_text(directory / name, text)
         config_path = directory / "config.yml"
-        unchanged = config_path.exists() and config_path.read_text() == config
+        unchanged = not recertified and config_path.exists() and config_path.read_text() == config
         atomic_write_text(config_path, config)
+        atomic_write_text(directory / _GROUPS_FILE, json.dumps(desired))
         # `attached_to(...) is not False`: a definite NO (the target was
         # replaced) is the one case that must re-join; None (no evidence) keeps
         # the no-churn contract -- see `attached_to`.
         if unchanged and self.running(target) and self.attached_to(target) is not False:
             return cert_ip.split("/")[0]
-        self._start(target, directory)
+        self._start(target, directory, peer_overlay_ips(overlay, member))
         return cert_ip.split("/")[0]
 
-    def _start(self, target: str, config_dir: Path) -> None:
+    def _start(self, target: str, config_dir: Path, peers: Iterable[str] = ()) -> None:
         name = self.sidecar_name(target)
         self._rt.stop(name)  # clear a remnant / an old config's daemon
         if not self._rt.image_exists(NEBULA_IMAGE):
@@ -274,6 +317,24 @@ class MeshSidecar:
             volumes={str(config_dir.resolve()): "/etc/nebula"},
         ))
         log.info("joined %s to the %r mesh (sidecar %s)", target, self._env, name)
+        self._converge(name, peers)
+
+    def _converge(self, sidecar: str, peers: Iterable[str]) -> None:
+        """Re-establish this member's tunnels NOW, from inside its own network
+        namespace, instead of leaving every peer to time its stale tunnel out
+        on nebula's own (deliberately unhurried) schedule.
+
+        This is field test 3 MED-2, measured on a sidecar restart exactly like
+        this one: a ~10s window in which `/world` said `healthy` and advertised
+        the overlay address while nothing answered on it -- long enough that
+        the engineer's first security-group probe failed for BOTH VMs and read
+        as "SG gating is broken". `fabric/nebula.py::rehandshake_script` has
+        the mechanism. Best-effort by construction (`exec_sh` swallows a failed
+        exec and the script is self-bounding), and only ever paid on a real
+        (re)start -- an unchanged member never reaches `_start` at all."""
+        ips = list(peers)
+        if ips:
+            self._rt.exec_sh(sidecar, rehandshake_script(ips))
 
     def stop(self, target: str) -> None:
         """Take `target` off the mesh. Idempotent, and safe to call for a

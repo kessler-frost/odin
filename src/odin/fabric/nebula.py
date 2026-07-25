@@ -132,6 +132,13 @@ _PORT_PIN_ENV = "ODIN_LIGHTHOUSE_PORT"
 # for a loaded box, not a boot-time budget.
 _LIGHTHOUSE_START_TIMEOUT = 1.0
 
+# The lighthouse's own config file, inside its env's nebula directory. Named
+# once because it is now load-bearing in TWO directions: `LighthouseManager`
+# writes it, and `orphaned_lighthouses` identifies a leaked process by the
+# fact that its `-config` argument points at a copy of this file that no
+# longer exists.
+LIGHTHOUSE_CONFIG = "lighthouse-config.yml"
+
 # A documented allow-all default. Real per-kind/group ACLs (derived from canvas
 # security-group / IAM edges via sg_rules_to_firewall) are an M7 hardening item;
 # PKI already gives the per-env boundary, the firewall scopes traffic on-mesh.
@@ -300,6 +307,34 @@ class NebulaManager:
         (self._hosts_dir() / f"{hostname}.crt").unlink(missing_ok=True)
         (self._hosts_dir() / f"{hostname}.key").unlink(missing_ok=True)
 
+    def reissue_cert(self, hostname: str, ip: str, groups: list[str]) -> CertPaths:
+        """Sign `hostname` a NEW certificate carrying `groups`, replacing
+        whatever it holds now. `ip` is its EXISTING sticky overlay address, so
+        nothing already published goes stale.
+
+        Membership is not configuration, and that distinction is this
+        function's whole reason to exist. A member's security-group membership
+        lives in its CERTIFICATE (`sign_cert`'s `-groups`) -- that is what
+        every OTHER member's `group:` firewall rule is matched against. So
+        moving a resource between groups is a re-issue, not a config edit, and
+        comparing rendered configs (which is all `InstanceVm.refresh_nebula`
+        and `MeshSidecar.ensure` used to do) can never see a group move at
+        all. Field test 3 HIGH-1: an instance moved OUT of the group a
+        database admitted kept reaching that database, with the Apply
+        reporting success.
+
+        `nebula-cert sign` refuses to overwrite an existing cert, so the old
+        identity is deliberately DESTROYED first -- a re-issue is a
+        replacement, never an addition.
+
+        The wire half belongs to the caller: a running daemon holds its cert
+        in memory and its PEERS cache the identity of every tunnel they have
+        open, so a re-issued cert only takes effect when the daemon RESTARTS
+        and every tunnel re-handshakes under the new identity (a SIGHUP is not
+        enough -- see `compute/instances.py::InstanceVm._refresh`)."""
+        self.revoke_cert(hostname)
+        return self.sign_cert(hostname, ip, groups=groups)
+
     def generate_config(
         self,
         lighthouse_ip: str,
@@ -423,6 +458,62 @@ class NebulaManager:
             ip = overlay.cert_ip(host_id)
             self.save_overlay(overlay)
             return ip
+
+
+# nebula's own default tun device name on Linux (`tun.dev`, which odin never
+# overrides) -- the one file-system-visible proof that the daemon is up and has
+# configured its interface, readable with no tool at all inside either a Lima
+# VM or the busybox sidecar.
+NEBULA_TUN = "nebula1"
+# How long `rehandshake_script` waits for that device after a (re)start before
+# poking anyway: 1s ticks, POSIX `sleep` only (busybox's fractional sleep is a
+# compile-time option, and this script runs in alpine as well as Ubuntu).
+_TUN_WAIT_TICKS = 10
+
+
+def rehandshake_script(peers: Iterable[str]) -> str:
+    """A member that just RESTARTED its nebula daemon, re-establishing every
+    tunnel immediately instead of waiting for its peers to notice.
+
+    Field test 3 MED-2 measured the cost of not doing this: a 10-60s window
+    after a mesh restart where the member's overlay address simply did not
+    answer, while `/world` said `healthy` and kept advertising it. The cause is
+    nebula's own (correct) anti-DoS behaviour, not a bug: when a peer keeps
+    sending into the tunnel this member just tore down, the member answers
+    `recv_error`, and the peer deliberately IGNORES the first few before
+    dropping its stale tunnel and re-handshaking. With a TCP probe's
+    1s/2s/4s retransmit cadence that is ~10 seconds of a silently dead path.
+
+    The fix is to make the RESTARTED side move first: one packet toward each
+    peer forces a fresh handshake, and a completed handshake replaces the
+    peer's cached tunnel (and therefore its cached CERTIFICATE for us) in the
+    same instant. So the window closes in one round trip, in both directions,
+    which is what makes a re-issued certificate take effect promptly rather
+    than "eventually".
+
+    ICMP is enough and is deliberately unprivileged: the peer's inbound
+    firewall will very likely DROP the ping itself -- that is fine and even
+    expected (it is the whole point of a security group), because the nebula
+    HANDSHAKE happens below the firewall. We are buying tunnel state, not a
+    reply. Self-bounding throughout (`-c 1 -W 1`, a capped wait loop, `exit 0`)
+    so it can never hang an Apply, and it is only ever run on a real restart --
+    an unchanged member never pays a millisecond of it."""
+    pokes = "\n".join(f"ping -c 1 -W 1 {ip} >/dev/null 2>&1" for ip in peers)
+    return (
+        f"i=0; while [ $i -lt {_TUN_WAIT_TICKS} ]; do "
+        f"[ -d /sys/class/net/{NEBULA_TUN} ] && break; i=$((i+1)); sleep 1; done\n"
+        f"{pokes}\nexit 0\n"
+    )
+
+
+def peer_overlay_ips(network: MeshNetwork, member: str) -> list[str]:
+    """Every OTHER member's sticky overlay address in this env's mesh --
+    `rehandshake_script`'s input. The lighthouse is deliberately not in it: it
+    is not a data-plane member (`tun: disabled: true`), and the restarting
+    member re-registers with it as its very first act anyway."""
+    hosts = network.subnets.get("hosts")
+    assignments = hosts.assignments if hosts else {}
+    return [ip for host, ip in assignments.items() if host != member]
 
 
 def _rule_to_dict(rule: FirewallRule) -> dict:
@@ -570,7 +661,7 @@ class LighthouseManager:
         return _nebula_dir(root, env) / "lighthouse.pid"
 
     def _config_path(self, root: Path, env: str) -> Path:
-        return _nebula_dir(root, env) / "lighthouse-config.yml"
+        return _nebula_dir(root, env) / LIGHTHOUSE_CONFIG
 
     def _log_path(self, root: Path, env: str) -> Path:
         return _nebula_dir(root, env) / "lighthouse.log"
@@ -716,6 +807,60 @@ class LighthouseManager:
                 pass
         pidfile.unlink(missing_ok=True)
         log.info("stopped nebula lighthouse for env %r", env)
+
+
+def orphaned_lighthouses(root: Path, runner=None) -> list[tuple[int, Path]]:
+    """`(pid, config path)` for every live `nebula` lighthouse process THIS
+    store started whose config file is GONE -- an env destroyed out from under
+    a process that is still holding its UDP port.
+
+    Field test 3 HIGH-A: a VPC + a single S3 bucket (no EC2 at all) leaked one
+    lighthouse and one port on EVERY apply/destroy cycle -- three orphans
+    measured on `*:4343`, `*:4344`, `*:4345`, one of them 8m20s old. About a
+    hundred cycles would exhaust the 4342-4441 pool, i.e. re-create by
+    accumulation exactly the class of failure per-env ports exist to prevent.
+    The primary fix is that teardown now stops the lighthouse before deleting
+    its directory (`gateway/models/ec2net.py::_delete_vpc`); THIS is the
+    backstop for one that already leaked, and for a crash between the two.
+
+    Identified by evidence, never by name: the process's own `-config`
+    argument must point INSIDE this store's root, must be a
+    `LIGHTHOUSE_CONFIG` file, and that file must no longer exist. A live env's
+    lighthouse can therefore never match, another odin store's can never
+    match, and a user's own unrelated `nebula` can never match. The pid comes
+    from the same `ps` read that proved the process is nebula, so it cannot be
+    a recycled pid belonging to something else -- which is more than the
+    pidfile path can say."""
+    marker = f"{Path(root).resolve()}/"
+    proc = (runner or _default_runner)(["ps", "-Ao", "pid=,args="])
+    found: list[tuple[int, Path]] = []
+    for line in proc.stdout.splitlines():
+        pid, _, args = line.strip().partition(" ")
+        tokens = args.split()
+        if not pid.isdigit() or "-config" not in tokens[:-1] or Path(tokens[0]).name != "nebula":
+            continue
+        config = tokens[tokens.index("-config") + 1]
+        if config.startswith(marker) and config.endswith(f"/{LIGHTHOUSE_CONFIG}") and not Path(config).exists():
+            found.append((int(pid), Path(config)))
+    return found
+
+
+def reap_orphaned_lighthouses(root: Path, runner=None) -> list[int]:
+    """SIGTERM every `orphaned_lighthouses` process, returning the pids it
+    reaped. Run at server startup (`odin.server`), the same one-shot
+    crash-recovery cadence as `ec2compute.reap_orphaned_vms` -- and, like it,
+    never able to touch anything it has not positively identified as odin's
+    own leak."""
+    reaped = []
+    for pid, config in orphaned_lighthouses(root, runner):
+        log.warning("reaping orphaned nebula lighthouse pid %s (its config %s is gone)", pid, config)
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError) as exc:
+            log.warning("could not stop orphaned lighthouse pid %s: %s", pid, exc)
+            continue
+        reaped.append(pid)
+    return reaped
 
 
 def _ec2net_networks(root: Path, env: str) -> tuple[list[VpcNetwork], list[SgFirewall]]:

@@ -305,11 +305,60 @@ future decision against these points instead of re-deriving them:
         previously-blocked port probed before and after on the SAME instance,
         `NRestarts=0` and an unchanged `ActiveEnterTimestamp` across the edit
         (`tests/simulate/test_sg_edit_propagation_e2e.py`).
-      - **Moving an instance BETWEEN groups still needs a recreate.** An
-        instance's group MEMBERSHIP is baked into its nebula certificate at
-        first join, and changing it means re-signing and re-distributing that
-        cert. Rule edits propagate; membership edits do not — the same limit
-        `fabric/sidecar.py` records for backings.
+      - **Moving an instance BETWEEN groups reaches it too, and REVOKING is
+        the case that matters.** For one release it did not, silently: an
+        instance's group MEMBERSHIP lives in its nebula CERTIFICATE, not in
+        its config, so the re-render above could never see a group move.
+        Field test 3 HIGH-1 measured the consequence in the worst direction —
+        `web1` was taken OUT of the group `db-sg` admits, Apply returned
+        `applied` with exit 0 and zero warnings, and web1 went on reaching
+        the database on the wire. A security control that fails open and
+        reports success.
+        Every Apply now compares each running instance's CURRENT groups
+        against the ones odin last landed on it and, when they differ,
+        re-issues its certificate (same sticky overlay IP, so nothing
+        published goes stale), lands it on the VM and **RESTARTS** the
+        daemon. A restart, never a SIGHUP: nebula reloads a firewall in
+        place, but every peer caches the certificate of each tunnel it holds
+        open, so only a re-handshake makes a new identity real — dropping the
+        old tunnels is the entire point here, unlike a rule edit.
+        **No recreate**: same VM, same instance id, same address.
+        Proven on the wire with two real VMs and a real Postgres, in the
+        hardest shape of the edit — `web-sg` and `admin-sg` carry IDENTICAL
+        rules, so the move changes not one byte of web1's config and only the
+        certificate can close the path (`tests/simulate/
+        test_sg_membership_revoke_e2e.py`): web1→db refused after the move,
+        web1→admin1:22 still answering at the same instant to prove the
+        overlay is alive, and the path re-opening when web1 is put back.
+        Unchanged membership costs one local file read — no `nebula-cert`,
+        no `limactl`, no signal — and a reordering of the same groups is not
+        a change.
+      - **What a revoke does NOT reach: a connection already open through
+        it.** New connections are refused the moment the peer re-handshakes
+        — measured at 0.11s in the test above, i.e. before Apply has even
+        returned. But nebula's firewall keeps a conntrack entry per flow and
+        re-validates it only when its OWN ruleset version changes, not when a
+        peer's certificate does (the shipped binary's own diagnostics say so:
+        `keeping old conntrack entry, does match new ruleset` vs `dropping
+        old conntrack entry, does not match new ruleset`, and
+        `firewall rulesVersion has overflowed, resetting conntrack`). So a
+        long-lived flow that keeps sending can outlive the revoke on the
+        ADMITTING member, up to `firewall.conntrack.tcp_timeout` /
+        `udp_timeout` / `default_timeout` — nebula's defaults, which odin
+        does not override. Editing the admitting group's RULES (that DOES
+        bump the ruleset version, forcing re-validation against the peer's
+        new certificate) or restarting the admitting member closes it
+        immediately. Real AWS security groups have the same property for
+        established flows, so this is a shared limit rather than a
+        substitution gap — but it is the one thing "revoked" does not mean
+        here, and it is stated rather than assumed.
+      - **A membership change that cannot be applied FAILS the Apply.**
+        `refresh_nebula` still never raises (mesh wiring must not fail an
+        instance boot), but a `failed` is no longer a log line under a green
+        light: `ensure_instance_mesh` raises `MeshRefreshFailed` naming every
+        VM that did not adopt its groups, what is still open because of it,
+        and what to do. A worse-but-honest message beats a green light on an
+        unchanged firewall.
     - **RDS**: the Postgres container is a REAL mesh member (a nebula
       companion container shares its network namespace, so the stock upstream
       image answers on an overlay IP), gated by the SG its canvas node names
@@ -338,6 +387,27 @@ future decision against these points instead of re-deriving them:
       nothing for a resource that publishes no mesh fact. What it does NOT
       prove: that a specific peer is allowed in — that's the SG's job, and a
       refusal there is policy, not a fault.
+    - **A mesh restart no longer leaves a window where the address is
+      advertised but silent.** Field test 3 MED-2 measured it: ~10s (broken
+      17:50:12, restored 17:50:22) after a sidecar restart during which
+      `/world` said `healthy` and published the `*_MESH` fact while the peer's
+      probe timed out — enough that the engineer's first security-group probe
+      failed for BOTH VMs and read as "SG gating is broken". The cause is
+      nebula behaving correctly, not a bug: the peer keeps sending into the
+      tunnel that just died, the restarted member answers `recv_error`, and
+      the peer deliberately ignores the first few of those before tearing the
+      stale tunnel down — which, at a TCP probe's 1s/2s/4s retransmit cadence,
+      is about ten seconds of a silently dead path. The member that restarted
+      now MOVES FIRST instead: one bounded packet toward each peer's overlay
+      address (`fabric/nebula.py::rehandshake_script`), which forces a fresh
+      handshake and, in the same instant, replaces that peer's cached tunnel
+      AND its cached certificate for us. That is also what makes a re-issued
+      certificate take effect in one round trip rather than "eventually".
+      Paid only on a real restart — an unchanged member never reaches it, and
+      an env with no mesh never pays a millisecond. `mesh_health`'s own
+      caveat still stands and is unchanged: probing from inside a member's own
+      namespace cannot observe peer-side staleness, so this closes the window
+      at the source rather than detecting it.
     - **One lighthouse port per ENV, not per machine.** It used to be a single
       fixed 4342, so the second env to start a lighthouse lost the bind, its
       `nebula` exited 1 with only a log line, and its whole mesh silently
@@ -351,6 +421,28 @@ future decision against these points instead of re-deriving them:
       by the same Apply-time refresh the SG-edit fix added (a restart, not a
       SIGHUP, because nebula does not reload that section — and a member whose
       lighthouse moved has no working tunnel to lose).
+    - **...and teardown really stops it.** For one release every
+      apply/destroy cycle leaked a live lighthouse and one held port, and the
+      minimal canvas that did it had no EC2 at all — a VPC plus a single S3
+      bucket (field test 3 HIGH-A). `odin destroy` reported "destroyed" and
+      deleted `.odin/<env>/nebula/`, taking with it the pidfile that was the
+      only way to name the process still running against it; three orphans
+      were measured on `*:4343`/`*:4344`/`*:4345`, one 8m20s old. It did NOT
+      leak on an env with VMs, which was the tell: the only stop was
+      `ec2compute._finish_terminate`'s "last VM leaves", which an env without
+      VMs never reaches. Now `_delete_vpc` stops the lighthouse BEFORE
+      deleting its directory (ordering is the fix — `ensure_stopped` finds the
+      process through the pidfile in there), and
+      `fabric/nebula.py::reap_orphaned_lighthouses` is the startup backstop
+      for one that leaked earlier or for a crash between those two steps. It
+      identifies a leak by EVIDENCE, never by name: the process's own
+      `-config` argument must point inside this store's root at a
+      `lighthouse-config.yml` that no longer exists, so a live env's
+      lighthouse, another odin store's, and a user's own `nebula` can none of
+      them match. Proven by three real apply/destroy cycles on that exact
+      canvas: zero surviving `nebula` processes, the port bindable again after
+      each, and every cycle reusing 4342 rather than walking up the range
+      (`tests/simulate/test_lighthouse_no_leak_e2e.py`).
     - **EC2 nodes publish addresses too** (they published nothing before):
       `${{web1.PRIVATE_IP}}` (host-reachable, ungated) and
       `${{web1.MESH_IP}}` (the SG-gated overlay address, sticky across
@@ -358,6 +450,33 @@ future decision against these points instead of re-deriving them:
       withheld when the env's lighthouse is down. For a VM that lighthouse
       check is ALL that is verified: its nebula is a systemd unit inside a
       Lima VM, and a `limactl shell` per VM per sweep is not a tick's price.
+    - **An INTERRUPTED apply no longer strands VMs nothing can reclaim.**
+      Field test 3 HIGH-B, and the one a user hits by closing their laptop:
+      `kill -9` on tofu mid-apply (equally Ctrl-C, or an OOM) leaves tofu's
+      state empty while the VMs it already created keep Running. `odin
+      destroy` then answered `destroyed / tf ok` in 1.7s with three real VMs
+      up and `/world` still listing seven resources — and a second destroy,
+      the empty-canvas Apply, and a server restart all spared them, because
+      `reap_orphaned_vms` builds its "expected" set from the very store that
+      still claimed them. Reality and the store disagreed and the store was
+      trusted. Only `limactl delete` by hand worked.
+      Two fixes, because there are two moments. **`/destroy` now reclaims
+      directly**: destroy is unambiguous about intent, so anything the
+      gateway store still claims is deleted by exact name and forgotten —
+      instances (`ec2compute.reclaim_env_instances`) and the VPC/subnet/SG
+      records the same interruption stranded (`ec2net.purge_env`, which also
+      stops the lighthouse those records were keeping alive). If a VM cannot
+      be deleted, destroy REFUSES to say `destroyed` and names it. **And
+      startup reclaims what an older odin left**: `reclaim_tf_forgotten_vms`
+      takes tofu's own state as the second witness — an instance the store
+      claims and the state has forgotten can never be reached by any
+      terraform operation again, so it is deleted and forgotten. Read
+      strictly: a state file that is missing or empty is NO evidence and
+      reclaims nothing.
+      Proven by SIGKILLing the real `tofu` process mid-apply (identified by
+      its working directory, so nothing else on the machine can be touched)
+      and then requiring a supported command to clean up
+      (`tests/simulate/test_interrupted_apply_reclaim_e2e.py`).
     - **RESIDUAL GAP, stated plainly: the raw host port is still open and
       SGs do NOT gate it.** Mesh membership is ADDITIVE — every backing keeps
       its published Docker port, because the gateway forwards AWS calls to

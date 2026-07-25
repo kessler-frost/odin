@@ -33,6 +33,19 @@ that restarted daemons behind the user's back would fight it. What this does
 instead is refuse to keep publishing an address that doesn't answer, and say
 why.
 
+WHAT THIS STILL CANNOT SEE, and where that is handled instead. Check 4 stands
+in the member's OWN namespace, so by construction it cannot observe a PEER
+holding a stale tunnel to this member -- which is exactly the shape field test
+3 MED-2 measured: for ~10s after a mesh restart, `/world` said `healthy` and
+advertised the address while a peer's probe timed out, because that peer was
+still sending into the tunnel that had just died (nebula deliberately ignores
+the first few `recv_error`s before dropping a tunnel -- correct anti-DoS
+behaviour, ~10s at a TCP probe's retransmit cadence). No probe run from here
+could ever catch it. It is fixed at the source instead: a member that restarts
+now pokes every peer into re-handshaking immediately
+(`fabric/nebula.py::rehandshake_script`), so the window closes in one round
+trip rather than being detected after the fact.
+
 COST. Cached per (root, env, member) with two TTLs: a passing member is
 re-checked every `ODIN_MESH_SWEEP_SECONDS` (default 30), a FAILING one every
 `ODIN_MESH_RECHECK_SECONDS` (default 5) so a recovery shows up promptly

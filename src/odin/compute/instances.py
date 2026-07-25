@@ -76,6 +76,20 @@ never dropping), a restart for anything else, because nebula's reload
 deliberately does NOT cover `static_host_map`/`lighthouse`/`relay` -- and the
 only thing that changes those is a moved lighthouse port, where the tunnel is
 already dead and a restart costs nothing.
+
+Field test 3 HIGH-1 found the hole `refresh_nebula` left, and it was the worst
+possible one: an instance MOVED BETWEEN groups. A group's RULES live in the
+config, but an instance's MEMBERSHIP lives in its nebula CERTIFICATE, so
+re-rendering a config could never see the change -- Apply reported `applied`
+with zero warnings while the VM kept the cert (and therefore the access) it
+was born with. In the REVOKE direction that is a security hole, not an
+annoyance: the engineer took `web1` out of the group `db-sg` admits and web1
+went on reaching the database. `_reissue_cert` closes it -- the instance is
+signed a NEW certificate carrying its current groups (same sticky overlay IP,
+so nothing published goes stale), the new identity is landed on the VM, and
+the daemon is RESTARTED, because a cert only reaches the wire when every
+tunnel re-handshakes under it. Nothing is recreated: same VM, same instance
+id, same address.
 """
 from __future__ import annotations
 
@@ -95,7 +109,14 @@ from odin.compute.cloud_init import generate_cloud_init
 from odin.compute.lima_yaml import generate_lima_yaml
 from odin.compute.models import VmConfig
 from odin.fabric.models import FirewallRules
-from odin.fabric.nebula import DEFAULT_FIREWALL, LighthouseManager, NebulaManager, ensure_network
+from odin.fabric.nebula import (
+    DEFAULT_FIREWALL,
+    LighthouseManager,
+    NebulaManager,
+    ensure_network,
+    peer_overlay_ips,
+    rehandshake_script,
+)
 from odin.util import atomic_write_text
 
 log = logging.getLogger("odin.compute.instances")
@@ -214,6 +235,25 @@ def instance_config_path(root: Path, env: str, host_id: str) -> Path:
     return Path(root) / env / "nebula" / "instances" / host_id / "config.yml"
 
 
+def instance_membership_path(root: Path, env: str, host_id: str) -> Path:
+    """`instance_config_path`'s twin for the OTHER half of an instance's
+    security state: the security-group ids baked into the certificate odin
+    last successfully LANDED on this VM.
+
+    Membership cannot be read back out of the config -- it is in the cert -- so
+    without a record of it there is nothing to compare a canvas edit against,
+    which is exactly why a revoked group used to be invisible (field test 3
+    HIGH-1). Recording the groups rather than the cert keeps the no-churn
+    contract intact: an unchanged membership stays ONE local file read, no
+    `nebula-cert` subprocess and no `limactl`.
+
+    Written only AFTER the new cert is on the VM, so a push that failed
+    half-way is retried by the next Apply instead of being remembered as done.
+    No record at all (a VM booted before this existed) is not evidence of
+    anything, and `_reissue_cert` treats it the safe way: re-issue."""
+    return instance_config_path(root, env, host_id).with_name("membership.json")
+
+
 @dataclass(frozen=True)
 class NebulaJoin:
     """What `InstanceVm.boot` needs to land THIS instance's cert+config onto
@@ -273,6 +313,28 @@ def _firewall_only_change(before: str | None, after: str) -> bool:
     old.pop("firewall", None)
     new.pop("firewall", None)
     return old == new
+
+
+def _cert_groups(nebula: NebulaJoin) -> list[str]:
+    """The groups this instance's certificate must carry: `ec2` plus its
+    CURRENT security-group ids. Sorted, because the order the gateway happens
+    to list an instance's groups in is not meaningful -- and treating a reorder
+    as a membership change would re-issue a cert and restart a daemon on every
+    Apply, which is exactly the churn `refresh_nebula` promises never to
+    cause."""
+    return ["ec2", *sorted(nebula.groups)]
+
+
+def _record_membership(nebula: NebulaJoin) -> None:
+    atomic_write_text(
+        instance_membership_path(nebula.root, nebula.env, nebula.host_id),
+        json.dumps(_cert_groups(nebula)),
+    )
+
+
+def _recorded_membership(nebula: NebulaJoin) -> list[str] | None:
+    path = instance_membership_path(nebula.root, nebula.env, nebula.host_id)
+    return json.loads(path.read_text()) if path.exists() else None
 
 
 def _extra_provision_script(nebula_files: dict[str, str] | None, user_data: str | None) -> str | None:
@@ -388,7 +450,11 @@ class InstanceVm:
         # matches a peer's `group:` firewall rule against THIS cert's groups,
         # so the sg ids have to be baked in at signing time -- they're what
         # another node's "allow 5432 from sg-web" rule tests against.
-        cert = manager.sign_cert(nebula.host_id, overlay_ip, groups=["ec2", *nebula.groups])
+        cert = manager.sign_cert(nebula.host_id, overlay_ip, groups=_cert_groups(nebula))
+        # What this VM is about to be born holding -- recorded HERE so the very
+        # next Apply can tell an unchanged membership from a changed one
+        # without a single subprocess (see `instance_membership_path`).
+        _record_membership(nebula)
         return {
             "ca.crt": cert.ca_crt.read_text(),
             "host.crt": cert.crt.read_text(),
@@ -473,9 +539,10 @@ class InstanceVm:
         return proc.stdout if proc.returncode == 0 and proc.stdout.strip() else None
 
     def refresh_nebula(self, name: str, nebula: NebulaJoin) -> str:
-        """Bring a RUNNING VM's nebula config up to date with the canvas, and
-        make the running daemon actually adopt it. Returns what it did:
-        `unchanged` / `reloaded` / `restarted` / `skipped` / `failed`.
+        """Bring a RUNNING VM's nebula config AND certificate up to date with
+        the canvas, and make the running daemon actually adopt them. Returns
+        what it did: `unchanged` / `reloaded` / `recertified` / `restarted` /
+        `skipped` / `failed`.
 
         This is field test 2 HIGH-1. A security-group rule edit is TF-owned, so
         it reaches the gateway only through an Apply -- and every nebula config
@@ -496,14 +563,23 @@ class InstanceVm:
         tunnel is ALREADY dead, so a restart costs nothing and a SIGHUP would
         be a lie. So: firewall-only diff -> SIGHUP; anything else -> restart.
 
-        NOT covered, deliberately and honestly: an instance's SG MEMBERSHIP
-        (its cert groups) is fixed at first join, because changing it means
-        re-signing and re-distributing a cert. Editing a group's RULES
-        propagates; moving an instance between groups still needs a recreate --
-        the same limit `fabric/sidecar.py` records for backings.
+        MEMBERSHIP (field test 3 HIGH-1) is the third case, and the one that
+        used to be missing entirely. An instance's security groups are baked
+        into its CERTIFICATE, not its config, so no amount of config comparison
+        could ever see a group move -- Apply said `applied`, nothing warned,
+        and a `web1` taken OUT of `web-sg` went on reaching a database that
+        only admits `web-sg`. `_reissue_cert` re-signs it (same sticky overlay
+        IP) and lands the new identity on the VM, and this path then always
+        RESTARTS: nebula's SIGHUP reloads the firewall, but a peer caches the
+        certificate of every tunnel it holds open, so only a re-handshake --
+        which only a restart forces -- makes the new identity real on the
+        wire. A restart is honest here in a way it is not for a rule edit: the
+        whole point is that the old tunnels must die.
 
         Never raises: mesh wiring must not fail an Apply (`_activate_nebula`'s
-        rule)."""
+        rule). But `failed` is no longer a shrug -- `gateway/models/
+        ec2compute.py::ensure_instance_mesh` refuses to let an Apply report
+        success over it."""
         try:
             return self._refresh(name, nebula)
         except Exception as exc:  # noqa: BLE001 -- deliberately broad, see docstring
@@ -518,10 +594,15 @@ class InstanceVm:
             return "skipped"  # this env has no bootstrapped mesh to be out of date with
         config = self._render_config(nebula, network, underlay)
         current = self._vm_config(name, nebula)
-        if current == config:
+        recertified = self._reissue_cert(name, nebula, manager)
+        if current == config and not recertified:
             return "unchanged"
         self._push_config(name, nebula, config)
-        action = "reloaded" if _firewall_only_change(current, config) else "restarted"
+        action = (
+            "recertified" if recertified
+            else "reloaded" if _firewall_only_change(current, config)
+            else "restarted"
+        )
         command = (
             ["sudo", "systemctl", "kill", "-s", "HUP", "nebula"] if action == "reloaded"
             else ["sudo", "systemctl", "restart", "nebula"]
@@ -530,8 +611,57 @@ class InstanceVm:
         if proc.returncode != 0:
             log.warning("nebula %s failed on %s: %s", action, name, proc.stderr.strip() or "no output")
             return "failed"
+        _record_membership(nebula)
+        self._converge(name, nebula, network, action)
         log.info("nebula config %s on %s (its security groups changed)", action, name)
         return action
+
+    def _reissue_cert(self, name: str, nebula: NebulaJoin, manager: NebulaManager) -> bool:
+        """Has this instance's security-group MEMBERSHIP changed, and if so,
+        give it a certificate that says so. Returns whether it re-issued.
+
+        Compared against odin's own record of what it last landed on the VM
+        (`instance_membership_path`) -- one local file read for the
+        overwhelmingly common no-change case, no `nebula-cert`, no `limactl`.
+        A missing record (a VM booted before this existed) re-issues once, on
+        the safe side: odin cannot prove what identity that VM holds, and the
+        alternative is trusting a certificate it never saw.
+
+        RAISES if the new cert cannot be landed on the VM, and the record is
+        deliberately NOT updated in that case (`_refresh` writes it only after
+        the daemon has taken the change). The caller turns that into `failed`
+        and `ensure_instance_mesh` turns THAT into a failed Apply -- because
+        an unapplied revoke that reports success is the exact defect this
+        exists to fix."""
+        desired = _cert_groups(nebula)
+        if _recorded_membership(nebula) == desired:
+            return False
+        cert = manager.reissue_cert(nebula.host_id, manager.allocate_host_ip(nebula.host_id), desired)
+        script = _write_files_script({"host.crt": cert.crt.read_text(), "host.key": cert.key.read_text()})
+        proc = self._lima("shell", name, "--", "sudo", "bash", "-s", input=script, check=False)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"could not land {nebula.host_id}'s re-issued certificate (groups {desired}) on {name}: "
+                f"{proc.stderr.strip() or 'no output'}"
+            )
+        log.info("re-issued %s's nebula certificate on %s with groups %s", nebula.host_id, name, desired)
+        return True
+
+    def _converge(self, name: str, nebula: NebulaJoin, network, action: str) -> None:
+        """After a RESTART, make this VM re-establish its tunnels now instead
+        of leaving peers to discover the change on their own schedule -- see
+        `fabric/nebula.py::rehandshake_script` for the 10-60s window this
+        closes and why nebula's own behaviour creates it.
+
+        Skipped entirely for a SIGHUP (`reloaded`): a firewall reload never
+        drops a tunnel, so there is nothing to re-establish, and skipped when
+        this member is alone on the mesh. Best-effort and self-bounding: a
+        convergence poke that fails leaves the mesh exactly where a restart
+        alone would have."""
+        peers = peer_overlay_ips(network, nebula.host_id)
+        if action == "reloaded" or not peers:
+            return
+        self._lima("shell", name, "--", "sudo", "bash", "-s", input=rehandshake_script(peers), check=False)
 
     def _discover_ip(self, name: str, timeout: float) -> str:
         deadline = time.monotonic() + timeout

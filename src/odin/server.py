@@ -31,12 +31,12 @@ from odin.api.ws import ConnectionManager
 from odin.aws.backings import BackingAws
 from odin.compute.tasks import TaskRuntime
 from odin.fabric.localhost import LocalhostFabric
-from odin.fabric.nebula import mesh_state
+from odin.fabric.nebula import mesh_state, reap_orphaned_lighthouses
 from odin.fabric.sidecar import MeshSidecar
 from odin.gateway import DEFAULT_GATEWAY_PORT, GATEWAY_PORT_ENV, wiring
 from odin.gateway.app import GatewayState, create_gateway_app, serve_in_thread, stop_in_thread
 from odin.gateway.keys import OPERATOR_NODE_ID, KeyStore, Principal
-from odin.gateway.models import ec2compute, ecsctl, lambdactl, rdsctl
+from odin.gateway.models import ec2compute, ec2net, ecsctl, lambdactl, rdsctl
 from odin.gateway.stores import SynthStores
 from odin.reconcile import admission
 from odin.reconcile.drift import DriftSweeper
@@ -115,6 +115,7 @@ async def _admission_rejection(runtime, store: SpecStore, stack: Stack) -> JSONR
 
 def create_apply_router(
     store: SpecStore, reconciler_for, keystore: KeyStore, runner: TfRunner, gateway_port, env_epoch: dict[str, int],
+    stores: SynthStores,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -191,6 +192,27 @@ def create_apply_router(
                     body["tf"] = {"status": "ok" if result.ok else "failed", "exit_code": result.exit_code}
                     if not result.ok:
                         body["tf"]["tail"] = list(result.tail)
+
+            # Field test 3 HIGH-B: whatever tofu did or did not manage to
+            # destroy, an EC2 instance this env's gateway store still claims
+            # is a REAL Lima VM burning the user's RAM and disk -- and after
+            # an interrupted apply (Ctrl-C, an OOM, a closed laptop) tofu's
+            # state is empty, so `tofu destroy` honestly destroys nothing and
+            # reports success. Destroy is unambiguous about intent, so it
+            # reclaims them directly; if it CANNOT, it refuses to say
+            # `destroyed` (`ReclaimFailed` -> 500 with the VM names).
+            reclaimed = await asyncio.to_thread(ec2compute.reclaim_env_instances, stores, env)
+            if reclaimed:
+                body["reclaimed_vms"] = reclaimed
+            # ...and the network records the same interruption left behind,
+            # which `tofu destroy` likewise never reaches. They are what kept
+            # `/world` listing a VPC and subnets for a destroyed env -- and,
+            # because the lighthouse stop hangs off the VPC-delete path, a VPC
+            # record that is never deleted is a lighthouse never stopped
+            # (HIGH-A through HIGH-B's back door).
+            forgotten = await asyncio.to_thread(ec2net.purge_env, stores, env)
+            if forgotten:
+                body["reclaimed_network_records"] = forgotten
 
             store.apply(Stack(env=env))  # empty desired state -> the tick below prunes all
 
@@ -604,7 +626,7 @@ def create_apply_full_router(
     return router
 
 
-async def _reap_orphaned_ec2_vms(root: Path, envs: list[str]) -> None:
+async def _reap_orphaned_ec2_vms(root: Path, envs: list[str], stores: SynthStores) -> None:
     """Best-effort (release finding #4): `limactl` being unavailable, or
     any other reaper failure, must never block server startup -- this is a
     one-shot cleanup pass, not something reconciling depends on. Runs off
@@ -614,6 +636,22 @@ async def _reap_orphaned_ec2_vms(root: Path, envs: list[str]) -> None:
         reaped = await asyncio.to_thread(ec2compute.reap_orphaned_vms, root, envs)
         if reaped:
             log.warning("startup reaper deleted %d orphaned EC2 VM(s): %s", len(reaped), reaped)
+        # Field test 3 HIGH-B: the reaper above builds its "expected" set from
+        # the gateway store, so an interrupted apply -- which leaves VMs
+        # Running and tofu's state empty -- is exactly the case it spares. The
+        # second witness is tofu's own state; anything the store claims and
+        # the state has forgotten is unreachable by terraform forever.
+        forgotten = await asyncio.to_thread(ec2compute.reclaim_tf_forgotten_vms, stores, envs)
+        if forgotten:
+            log.warning(
+                "startup reclaimed %d EC2 VM(s) tofu's state no longer knew about: %s", len(forgotten), forgotten,
+            )
+        # Field test 3 HIGH-A: and the lighthouse PROCESSES of envs that were
+        # destroyed before teardown learned to stop them -- each one still
+        # holding a port out of the 4342-4441 pool.
+        lighthouses = await asyncio.to_thread(reap_orphaned_lighthouses, root)
+        if lighthouses:
+            log.warning("startup reaper stopped %d orphaned nebula lighthouse(s): %s", len(lighthouses), lighthouses)
     except Exception:
         log.exception("startup EC2 VM reaper failed (continuing without it)")
 
@@ -761,7 +799,7 @@ def create_app(
         gateway_server, gateway_thread, gateway_port_actual = serve_in_thread(gateway_app, port=_resolved_gateway_port)
         envs = _store.list_envs()
         if _reap_ec2_vms:
-            await _reap_orphaned_ec2_vms(_store.root, envs)
+            await _reap_orphaned_ec2_vms(_store.root, envs, gateway_stores)
         for env in envs:  # resume reconciling existing environments
             await reconciler_for(env)
         try:
@@ -775,7 +813,10 @@ def create_app(
     app.middleware("http")(_csrf_guard)
     app.include_router(create_canvas_router(CANVAS_PATH))
     app.include_router(
-        create_apply_router(_store, reconciler_for, gateway_keystore, tf_runner, lambda: gateway_port_actual, env_epoch)
+        create_apply_router(
+            _store, reconciler_for, gateway_keystore, tf_runner, lambda: gateway_port_actual, env_epoch,
+            gateway_stores,
+        )
     )
     app.include_router(
         create_tf_router(

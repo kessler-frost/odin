@@ -15,7 +15,7 @@ from pathlib import Path
 import yaml
 
 from odin.fabric.models import FirewallRule, FirewallRules
-from odin.fabric.nebula import ensure_network
+from odin.fabric.nebula import NebulaManager, ensure_network
 from odin.fabric.sidecar import NEBULA_IMAGE, MeshSidecar
 from odin.runtime.colima import ContainerSpec
 
@@ -318,6 +318,74 @@ def test_certs_are_signed_once_per_member(tmp_path):
     mesh.ensure(TARGET, MEMBER)
     mesh.ensure(TARGET, MEMBER)
     assert len([c for c in runner.calls if "sign" in c and MEMBER in c]) == 1
+
+
+def test_a_changed_membership_re_issues_the_cert_and_restarts_the_sidecar(tmp_path):
+    """Field test 3 HIGH-1, the backing half. A member's groups are what a
+    PEER's `group:` rule is matched against, and they live in its certificate
+    -- so a group move is invisible in the config and used to be fixed forever
+    at first join. Handled exactly as `InstanceVm._reissue_cert` handles an EC2
+    VM's: re-sign, then restart, because a peer caches the identity of every
+    tunnel it holds."""
+    runner = FakeRunner()
+    ensure_network(tmp_path, ENV, "127.0.0.1", runner=runner)
+    runtime = FakeRuntime()
+    runtime.start_target(TARGET)
+    mesh = _sidecar(tmp_path, runtime, runner=runner)
+    mesh.ensure(TARGET, MEMBER, groups=("sg-db",), firewall=DB_FIREWALL)
+    signed = [c for c in runner.calls if "sign" in c and MEMBER in c]
+    assert signed[0][signed[0].index("-groups") + 1] == "backing,sg-db"
+
+    mesh.ensure(TARGET, MEMBER, groups=("sg-internal",), firewall=DB_FIREWALL)
+
+    signed = [c for c in runner.calls if "sign" in c and MEMBER in c]
+    assert len(signed) == 2, "the moved member must be re-signed"
+    assert signed[1][signed[1].index("-groups") + 1] == "backing,sg-internal"
+    assert len(runtime.specs) == 2, "a re-issued cert only reaches the wire on a restart"
+    # ...and the IP is untouched, so every published endpoint stays valid.
+    assert signed[0][signed[0].index("-ip") + 1] == signed[1][signed[1].index("-ip") + 1]
+
+
+def test_an_unchanged_membership_does_not_re_issue_or_restart(tmp_path):
+    runner = FakeRunner()
+    ensure_network(tmp_path, ENV, "127.0.0.1", runner=runner)
+    runtime = FakeRuntime()
+    runtime.start_target(TARGET)
+    mesh = _sidecar(tmp_path, runtime, runner=runner)
+    for _ in range(3):
+        mesh.ensure(TARGET, MEMBER, groups=("sg-db", "sg-ops"), firewall=DB_FIREWALL)
+    # ...and neither does a reorder of the same groups.
+    mesh.ensure(TARGET, MEMBER, groups=("sg-ops", "sg-db"), firewall=DB_FIREWALL)
+    assert len([c for c in runner.calls if "sign" in c and MEMBER in c]) == 1
+    assert len(runtime.specs) == 1
+
+
+def test_a_restarted_sidecar_pokes_its_peers_to_re_handshake(tmp_path):
+    """Field test 3 MED-2, measured on exactly this restart: ~10s where the
+    overlay address did not answer because peers were still using the tunnel
+    that had just died. The restarted member moves first."""
+    runner = FakeRunner()
+    ensure_network(tmp_path, ENV, "127.0.0.1", runner=runner)
+    runtime = FakeRuntime()
+    runtime.start_target(TARGET)
+    mesh = _sidecar(tmp_path, runtime, runner=runner)
+    NebulaManager(tmp_path / ENV / "nebula", runner=runner).allocate_host_ip("i-web")
+
+    mesh.ensure(TARGET, MEMBER, firewall=DB_FIREWALL)
+
+    ((sidecar, script),) = runtime.probes
+    assert sidecar == f"{TARGET}-mesh"
+    assert "ping -c 1 -W 1 10.42.1." in script
+    assert "/sys/class/net/nebula1" in script, "wait for the daemon's own tun before poking"
+
+
+def test_a_lone_member_has_nobody_to_poke(tmp_path):
+    runner = FakeRunner()
+    ensure_network(tmp_path, ENV, "127.0.0.1", runner=runner)
+    runtime = FakeRuntime()
+    runtime.start_target(TARGET)
+    _sidecar(tmp_path, runtime, runner=runner).ensure(TARGET, MEMBER, firewall=DB_FIREWALL)
+    assert runtime.probes == []
 
 
 # --- leaving + failure behavior ------------------------------------------------
