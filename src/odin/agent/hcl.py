@@ -550,6 +550,56 @@ def _logs(res: ResourceDesired, refs: Refs) -> Built:
     return attrs, ""
 
 
+# W2.4: Secrets Manager secrets (gateway/models/secretsctl.py) and SSM
+# parameters (gateway/models/ssmctl.py) -- the two kinds whose FIELD IS A
+# SECRET. The canvas label IS the secret/parameter name, deliberately, for the
+# same reason logs' label is its group name: `classify.py` reports that bare
+# name as the IAM resource, so an edge drawn to this node only enforces while
+# name == label.
+#
+# The generated HCL is the ONE place a secret's plaintext legitimately appears
+# (tofu has to send it), which is why `spec/translate.py` marks these fields
+# sensitive: that flag is what keeps the same value out of the translation
+# agent's prompt and out of every streamed `tofu` log line
+# (spec/models.py::scrub, simulate/runner.py).
+#
+# `recovery_window_in_days = 0` is emitted always: odin's DeleteSecret is
+# immediate (secretsctl.py's deviation 1), and saying so in the HCL keeps the
+# generated project honest -- applied against real AWS it would behave the same
+# way odin does, instead of scheduling a 30-day window odin doesn't have.
+_SECRET_RECOVERY_WINDOW = "0"
+# Kept in lock-step with gateway/models/ssmctl.py's VALID_TYPES (imported
+# nowhere: the deterministic translator stays independent of the gateway).
+_SSM_TYPES = ("String", "StringList", "SecureString")
+_SSM_NEEDS_VALUE = "needs a Value (an SSM parameter can't exist without one)"
+_BAD_SSM_TYPE = f"type must be one of {', '.join(_SSM_TYPES)}"
+
+
+def _secret(res: ResourceDesired, refs: Refs) -> Built:
+    attrs = {"name": quote(res.id), "recovery_window_in_days": _SECRET_RECOVERY_WINDOW}
+    description = _field(res, "description", "")
+    if description:
+        attrs["description"] = quote(description)
+    return attrs, ""
+
+
+def _ssm(res: ResourceDesired, refs: Refs) -> Built:
+    # NOT stripped: leading/trailing whitespace is part of a secret value, so
+    # emptiness here is plain falsiness rather than the `.strip()` every other
+    # builder's optional-field check uses.
+    value = _field(res, "paramValue", "")
+    if not value:
+        return _SSM_NEEDS_VALUE
+    param_type = _field(res, "paramType", "String")
+    if param_type not in _SSM_TYPES:
+        return _BAD_SSM_TYPE
+    attrs = {"name": quote(res.id), "type": quote(param_type), "value": quote(value)}
+    description = _field(res, "description", "")
+    if description:
+        attrs["description"] = quote(description)
+    return attrs, ""
+
+
 # kind -> terraform resource type; kept separate from _BUILDERS so pass 1 of
 # generate_tf can assign HCL names (scoped per resource type) without running
 # any builder.
@@ -567,6 +617,8 @@ _TF_TYPES = {
     "lambda": "aws_lambda_function",
     "ecs": "aws_ecs_service",
     "logs": "aws_cloudwatch_log_group",
+    "secret": "aws_secretsmanager_secret",
+    "ssm": "aws_ssm_parameter",
 }
 
 _BUILDERS = {
@@ -583,6 +635,8 @@ _BUILDERS = {
     "lambda": _lambda,
     "ecs": _ecs,
     "logs": _logs,
+    "secret": _secret,
+    "ssm": _ssm,
 }
 
 
@@ -709,6 +763,28 @@ def generate_tf(stack: Stack) -> TfProject:
         nested = f"  assume_role_policy = {_LAMBDA_TRUST_POLICY}"
         block = _block("aws_iam_role", role_name, {"name": quote(f"{res.id}-role")}, nested)
         blocks.append((("aws_iam_role", res.id), block))
+
+    # W2.4: a secret node's VALUE becomes a companion
+    # `aws_secretsmanager_secret_version` -- the same one-canvas-node-to-two-
+    # tf-resources shape as aws_key_pair above, and it's how the AWS provider
+    # models it too (the secret is the container, the version holds the bytes).
+    # A secret with an empty value emits NO version block at all: an
+    # existing-but-valueless secret is a real, legitimate AWS state (put the
+    # value in later with `aws secretsmanager put-secret-value`), whereas
+    # emitting `secret_string = ""` would assert a value nobody typed.
+    for res in ordered:
+        if res.kind != "secret":
+            continue
+        value = _field(res, "secretString", "")
+        secret_name = hcl_name_by_id.get(res.id)
+        if not value or secret_name is None:
+            continue
+        attrs = {
+            "secret_id": f"aws_secretsmanager_secret.{secret_name}.id",
+            "secret_string": quote(value),
+        }
+        block = _block("aws_secretsmanager_secret_version", f"{secret_name}_version", attrs)
+        blocks.append((("aws_secretsmanager_secret_version", res.id), block))
 
     # V5c: the one shared `aws_ecs_cluster` -- emitted only if some ecs node
     # actually reserved it in pass 1 (never a dangling resource on a canvas

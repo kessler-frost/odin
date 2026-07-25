@@ -1,5 +1,5 @@
 """Fix-wave 2b finding #1 -- a pure, read-only projection of the TF-owned
-resource kinds (vpc/subnet/sg/ec2/ecs/lambda/iam_role/ecr/logs: the kinds
+resource kinds (vpc/subnet/sg/ec2/ecs/lambda/iam_role/ecr/logs/secret/ssm: the kinds
 `agent/hcl.py` can build and only `tofu apply`/`tofu destroy` ever
 creates/destroys -- s3/sqs/sns/dynamodb are excluded, those already get real
 World entries via the reconciler's own PROVISIONED path in plan.py) from the
@@ -30,7 +30,8 @@ Label resolution is uniform across every kind: prefer the `odin:node` tag
 `agent/hcl.py::_tags_block` stamps on every canvas-node-backed resource,
 falling back to the resource's own AWS-native name field where one exists
 (sg's GroupName, iam_role's RoleName, ecr's repositoryName, lambda's
-FunctionName, ecs's serviceName, a log group's logGroupName -- all of which
+FunctionName, ecs's serviceName, a log group's logGroupName, a secret's Name, an
+SSM parameter's Name -- all of which
 already equal the canvas label by construction, per hcl.py's own builders and
 `classify.py`'s LOGS note) -- vpc/subnet/ec2 have NO
 such native field (real CreateVpc/CreateSubnet/RunInstances take no `Name`
@@ -41,11 +42,13 @@ simply not projected yet, rather than guessing.
 from __future__ import annotations
 
 from odin.compute.tasks import TaskRuntime
-from odin.gateway.models import logsctl
+from odin.gateway.models import logsctl, ssmctl
 from odin.gateway.models.ecsctl import sweep_tasks
 from odin.gateway.stores import SynthStores
 
-TF_OWNED_KINDS = frozenset({"vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr", "logs"})
+TF_OWNED_KINDS = frozenset({
+    "vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr", "logs", "secret", "ssm",
+})
 
 # EC2's real instance-state machine (gateway/models/ec2compute.py's own
 # `_STATE_CODES` keys) -> the World Phase enum. `stopped` (an intentional
@@ -135,6 +138,37 @@ def _log_groups(stores: SynthStores, env: str) -> Projected:
         label = _label(tags, name)
         if label:
             out[label] = ("logs", "healthy", {}, None)
+    return out
+
+
+def _secrets(stores: SynthStores, env: str) -> Projected:
+    """W2.4: a `secret` node exists once tofu's CreateSecret landed. NO FACTS
+    ARE PROJECTED -- deliberately: `facts` ride the WorldDelta onto the
+    WebSocket and into `.odin/{env}/world.json`, and a secret's value must
+    never travel either. Existence + phase is the whole honest projection; the
+    value leaves only through a `GetSecretValue` an IAM edge allowed."""
+    out: Projected = {}
+    for key, record in stores.secretsctl.items(env).items():
+        if not key.startswith("secret:"):
+            continue
+        tags = stores.tags.get(env, f"secretsmanager:{record['arn']}", {})
+        label = _label(tags, record["name"])
+        if label:
+            out[label] = ("secret", "healthy", {}, None)
+    return out
+
+
+def _ssm_parameters(stores: SynthStores, env: str) -> Projected:
+    """W2.4, same no-facts rule as `_secrets` above (a SecureString parameter's
+    value is a secret, and a String one is nobody's business either)."""
+    out: Projected = {}
+    for key, record in stores.ssmctl.items(env).items():
+        if not key.startswith("param:"):
+            continue
+        tags = stores.tags.get(env, f"ssm:{ssmctl.canonical_name(record['name'])}", {})
+        label = _label(tags, record["name"])
+        if label:
+            out[label] = ("ssm", "healthy", {}, None)
     return out
 
 
@@ -263,6 +297,8 @@ def project(stores: SynthStores, env: str, ecs_runtime: TaskRuntime | None = Non
     out.update(_iam_roles(stores, env))
     out.update(_ecr_repos(stores, env))
     out.update(_log_groups(stores, env))
+    out.update(_secrets(stores, env))
+    out.update(_ssm_parameters(stores, env))
     out.update(_ec2_instances(stores, env))
     out.update(_lambda_functions(stores, env))
     out.update(_ecs_services(stores, env, ecs_runtime))

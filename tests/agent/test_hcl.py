@@ -823,3 +823,113 @@ def test_tofu_fmt_accepts_ecs_output(tmp_path):
         capture_output=True, text=True,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+# --- secret + ssm (W2.4) -----------------------------------------------------
+
+
+def test_secret_emits_the_name_an_immediate_recovery_window_and_the_odin_tag():
+    # The canvas label IS the secret name -- the gateway classifies every
+    # secretsmanager:* call by bare name, so an IAM edge drawn to this node only
+    # enforces while the two are the same string.
+    proj = generate_tf(Stack(resources=(ResourceDesired(id="db-password", kind="secret"),)))
+    main_tf = proj.files["main.tf"]
+    assert 'resource "aws_secretsmanager_secret" "db_password"' in main_tf
+    assert 'name                    = "db-password"' in main_tf
+    # odin's DeleteSecret is immediate, and the HCL says so rather than
+    # implying a 30-day window odin doesn't have.
+    assert "recovery_window_in_days = 0" in main_tf
+    assert '"odin:node" = "db-password"' in main_tf
+    assert proj.unsupported == []
+
+
+def test_a_secret_with_a_value_emits_a_companion_version_resource():
+    stack = Stack(resources=(
+        ResourceDesired(id="db-password", kind="secret", fields=_fields(secretString="hunter2-and-then-some")),
+    ))
+    files = generate_tf(stack).files
+    attrs = resource_attrs(files)[("aws_secretsmanager_secret_version", "db_password_version")]
+    assert unquote(attrs["secret_string"]) == "hunter2-and-then-some"
+    assert attrs["secret_id"] == "${aws_secretsmanager_secret.db_password.id}"
+
+
+def test_a_secret_with_no_value_emits_no_version_resource_at_all():
+    # An existing-but-valueless secret is a real AWS state; `secret_string = ""`
+    # would assert a value nobody typed.
+    main_tf = generate_tf(Stack(resources=(ResourceDesired(id="db-password", kind="secret"),))).files["main.tf"]
+    assert "aws_secretsmanager_secret_version" not in main_tf
+
+
+def test_a_secret_value_keeps_its_surrounding_whitespace():
+    # Every other optional field is `.strip()`ed for emptiness; a secret's
+    # whitespace is part of the secret, so this one deliberately isn't.
+    stack = Stack(resources=(ResourceDesired(id="s", kind="secret", fields=_fields(secretString="  padded  ")),))
+    attrs = resource_attrs(generate_tf(stack).files)[("aws_secretsmanager_secret_version", "s_version")]
+    assert unquote(attrs["secret_string"]) == "  padded  "
+
+
+def test_secret_description_is_emitted_only_when_set():
+    with_desc = generate_tf(Stack(resources=(
+        ResourceDesired(id="s", kind="secret", fields=_fields(description="the db password")),
+    ))).files["main.tf"]
+    without = generate_tf(Stack(resources=(ResourceDesired(id="s", kind="secret"),))).files["main.tf"]
+    assert 'description             = "the db password"' in with_desc
+    assert "description" not in without
+
+
+def test_ssm_emits_name_type_and_value():
+    stack = Stack(resources=(
+        ResourceDesired(id="/odin/api-key", kind="ssm", fields=_fields(paramType="SecureString", paramValue="abc123")),
+    ))
+    proj = generate_tf(stack)
+    files = proj.files
+    attrs = resource_attrs(files)[("aws_ssm_parameter", "_odin_api_key")]
+    assert unquote(attrs["name"]) == "/odin/api-key"
+    assert unquote(attrs["type"]) == "SecureString"
+    assert unquote(attrs["value"]) == "abc123"
+    assert '"odin:node" = "/odin/api-key"' in files["main.tf"]
+    assert proj.unsupported == []
+
+
+def test_ssm_defaults_to_a_plain_string_parameter():
+    stack = Stack(resources=(ResourceDesired(id="flag", kind="ssm", fields=_fields(paramValue="on")),))
+    attrs = resource_attrs(generate_tf(stack).files)[("aws_ssm_parameter", "flag")]
+    assert unquote(attrs["type"]) == "String"
+
+
+def test_ssm_without_a_value_lands_in_unsupported():
+    proj = generate_tf(Stack(resources=(ResourceDesired(id="flag", kind="ssm"),)))
+    assert proj.unsupported == ["flag (ssm): needs a Value (an SSM parameter can't exist without one)"]
+    assert "aws_ssm_parameter" not in proj.files["main.tf"]
+
+
+def test_ssm_with_an_unknown_type_lands_in_unsupported():
+    stack = Stack(resources=(
+        ResourceDesired(id="flag", kind="ssm", fields=_fields(paramType="Encrypted", paramValue="on")),
+    ))
+    proj = generate_tf(stack)
+    assert proj.unsupported == ["flag (ssm): type must be one of String, StringList, SecureString"]
+
+
+def test_a_secret_version_carries_no_odin_node_tag():
+    # Companion resources aren't canvas nodes (and aws_secretsmanager_secret_
+    # version has no tags argument at all).
+    stack = Stack(resources=(ResourceDesired(id="s", kind="secret", fields=_fields(secretString="value123")),))
+    main_tf = generate_tf(stack).files["main.tf"]
+    version_block = main_tf.split('resource "aws_secretsmanager_secret_version"')[1].split("\nresource")[0]
+    assert "tags" not in version_block
+
+
+def test_tofu_fmt_accepts_secret_and_ssm_output(tmp_path):
+    tofu = shutil.which("tofu")
+    if tofu is None:
+        return  # skip cleanly -- no tofu on PATH in this environment
+    stack = Stack(resources=(
+        ResourceDesired(id="db-password", kind="secret", fields=_fields(secretString="v", description="d")),
+        ResourceDesired(id="bare", kind="secret"),
+        ResourceDesired(id="/odin/api-key", kind="ssm", fields=_fields(paramType="SecureString", paramValue="abc")),
+    ))
+    main_tf = tmp_path / "main.tf"
+    main_tf.write_text(generate_tf(stack).files["main.tf"])
+    result = subprocess.run([tofu, "fmt", "-check", "-diff", str(main_tf)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr

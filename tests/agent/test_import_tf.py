@@ -4,7 +4,7 @@ tests/simulate/test_import_tf_e2e.py (integration, needs Colima/tofu)."""
 from __future__ import annotations
 
 from odin.agent.hcl import generate_tf
-from odin.agent.import_tf import LiveResource, _import_id, parse_hcl_dir, parse_hcl_text
+from odin.agent.import_tf import _TF_TYPE, LiveResource, _import_id, parse_hcl_dir, parse_hcl_text
 from odin.spec.translate import canvas_to_stack
 
 _FULL_TF = '''
@@ -225,6 +225,106 @@ def test_log_group_round_trip_reproduces_name_and_retention():
     assert "retention_in_days = 14" in regenerated
     assert 'name = "/odin/forever"' in regenerated
     assert regenerated.count("retention_in_days") == 1  # the never-expire group stays unset
+
+
+# --- secret + ssm (W2.4): aws_secretsmanager_secret(+_version) <-> the
+# `secret` kind, aws_ssm_parameter <-> the `ssm` kind. The VERSION resource is
+# a COMPANION: it folds into its secret node's own value field (the exact
+# inverse of hcl.py's companion pass), never a node of its own. ---------------
+
+
+_SECRETS_TF = '''
+resource "aws_secretsmanager_secret" "db_password" {
+  name                    = "db-password"
+  description             = "the db password"
+  recovery_window_in_days = 0
+
+  tags = {
+    "odin:node" = "db-password"
+    "team"      = "core"
+  }
+}
+
+resource "aws_secretsmanager_secret_version" "db_password" {
+  secret_id     = aws_secretsmanager_secret.db_password.id
+  secret_string = "hunter2-and-then-some"
+}
+
+resource "aws_secretsmanager_secret" "empty" {
+  name = "no-value-yet"
+}
+
+resource "aws_ssm_parameter" "api_key" {
+  name  = "/odin/api-key"
+  type  = "SecureString"
+  value = "abc123456"
+}
+'''
+
+
+def test_secret_and_ssm_import_as_their_canvas_kinds():
+    result = parse_hcl_text(_SECRETS_TF)
+    by_id = {n["id"]: n for n in result.nodes}
+    assert set(by_id) == {"db-password", "no-value-yet", "/odin/api-key"}
+    assert by_id["db-password"]["type"] == "secret"
+    assert by_id["db-password"]["data"]["description"] == "the db password"
+    # The user tag survives; odin's own management tag never surfaces as one.
+    assert by_id["db-password"]["data"]["tags"] == {"team": "core"}
+    assert by_id["/odin/api-key"]["type"] == "ssm"
+    assert by_id["/odin/api-key"]["data"]["paramType"] == "SecureString"
+    assert by_id["/odin/api-key"]["data"]["paramValue"] == "abc123456"
+    assert result.unsupported == []
+    assert result.warnings == []
+
+
+def test_a_secret_version_folds_into_its_secret_nodes_value_field():
+    by_id = {n["id"]: n for n in parse_hcl_text(_SECRETS_TF).nodes}
+    assert by_id["db-password"]["data"]["secretString"] == "hunter2-and-then-some"
+    # A secret with no version stays valueless rather than gaining an empty one.
+    assert "secretString" not in by_id["no-value-yet"]["data"]
+
+
+def test_secret_and_ssm_round_trip_reproduces_the_value_resources():
+    imported = parse_hcl_text(_SECRETS_TF)
+    regenerated = generate_tf(canvas_to_stack({"nodes": imported.nodes, "edges": imported.edges})).files["main.tf"]
+    assert 'resource "aws_secretsmanager_secret" "db_password"' in regenerated
+    assert 'secret_string = "hunter2-and-then-some"' in regenerated
+    assert 'resource "aws_ssm_parameter" "_odin_api_key"' in regenerated
+    assert 'value = "abc123456"' in regenerated
+    # ...and the valueless secret still emits no version block of its own.
+    assert regenerated.count("aws_secretsmanager_secret_version") == 1
+
+
+def test_a_secret_version_pointing_outside_the_supported_set_is_reported_not_dropped():
+    tf = (
+        'resource "aws_secretsmanager_secret_version" "orphan" {\n'
+        '  secret_id     = aws_secretsmanager_secret.elsewhere.id\n'
+        '  secret_string = "x"\n'
+        "}\n"
+    )
+    result = parse_hcl_text(tf)
+    assert result.nodes == []
+    assert [(u.type, u.name) for u in result.unsupported] == [("aws_secretsmanager_secret_version", "orphan")]
+
+
+def test_a_computed_secret_value_is_reported_rather_than_imported_verbatim():
+    tf = (
+        'resource "aws_secretsmanager_secret" "s" {\n  name = "s"\n}\n\n'
+        'resource "aws_secretsmanager_secret_version" "s" {\n'
+        "  secret_id     = aws_secretsmanager_secret.s.id\n"
+        "  secret_string = var.db_password\n"
+        "}\n"
+    )
+    result = parse_hcl_text(tf)
+    assert "secretString" not in result.nodes[0]["data"]
+    assert result.unsupported[0].type == "aws_secretsmanager_secret_version"
+
+
+def test_secret_and_ssm_stay_out_of_the_live_import_path():
+    # Neither has a backing to enumerate live resources from (both are pure
+    # gateway models), so mode (b) reports them instead of pretending.
+    assert "secret" not in _TF_TYPE
+    assert "ssm" not in _TF_TYPE
 
 
 def test_bucket_with_computed_name_falls_back_to_hcl_resource_name_as_label():

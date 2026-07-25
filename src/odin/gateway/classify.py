@@ -85,6 +85,30 @@ denied via `unmappable-action` (the ec2/iam/ecr reasoning), while a workload
 principal without a matching statement still denies through ordinary
 default-deny.
 
+SECRETS MANAGER + SSM (task W2.4) ARE THE PAYOFF CASE for the LOGS reasoning
+above: both share ECR's JSON-target wire shape, and for both the resource IS
+the canvas node's label -- a `secret` node's label is its secret name
+(`agent/hcl.py`'s `_secret` emits `name = <label>`), an `ssm` node's label is
+its parameter name (`_ssm` emits the same). So `_secretsmanager_resource` /
+`_ssm_resource` returning the bare name is exactly what
+`policy.compile_policies` puts in an iam edge's statement: draw
+`lambda -> secret` with `secretsmanager:GetSecretValue` and the gateway
+enforces it for real, with no secrets-specific code in the policy layer, while
+a workload with no such edge gets an ordinary default-deny
+`AccessDeniedException`. Both accept an ARN wherever a name can appear (a
+`SecretId` is an ARN whenever terraform passes
+`aws_secretsmanager_secret.x.id`) and reduce it to the same bare label; SSM
+additionally canonicalizes the leading slash exactly as
+`gateway/models/ssmctl.py::canonical_name` does (kept in lock-step: root-level
+`/db` == `db`, hierarchical `/odin/db` keeps its slash). A call carrying no
+identifier at all (`ListSecrets`, a bare `DescribeParameters`) falls back to
+`"*"` -- never None, so the OPERATOR is never denied via `unmappable-action`.
+One bounded gap, the same one `_ecr_resource`/`_ecs_resource` already carry for
+every list-carrying call: a BATCH `GetParameters(Names=[a, b])` is authorized
+against `a` alone, so an edge to `a` (and none to `b`) would let both through.
+Recorded in ROADMAP.md; the single-name reads a workload actually makes
+(`GetParameter`, `GetSecretValue`) are exact.
+
 S3 BUCKET-CONFIG READS (S2, discovered running real tofu through the real
 gateway): the TF AWS provider's `aws_s3_bucket` refresh probes bucket-config
 subresources -- `?policy`, `?tagging`, `?acl`, `?cors`, `?versioning`, etc.
@@ -225,6 +249,10 @@ def classify(
         return _classify_ecs(lower_headers, body)
     if service == "logs":
         return _classify_logs(lower_headers, body)
+    if service == "secretsmanager":
+        return _classify_secretsmanager(lower_headers, body)
+    if service == "ssm":
+        return _classify_ssm(lower_headers, body)
     return None
 
 
@@ -421,6 +449,67 @@ def _classify_logs(lower_headers: dict[str, str], body: bytes) -> tuple[str, str
     except (json.JSONDecodeError, UnicodeDecodeError):
         return None
     return f"logs:{op}", _logs_resource(payload)
+
+
+def _secretsmanager_resource(payload: dict) -> str:
+    """The bare SECRET NAME -- which for a `secret` canvas node IS its label
+    (see the module docstring's W2.4 note). `SecretId` is an ARN whenever
+    terraform passes `aws_secretsmanager_secret.x.id`, reduced here the same
+    way `gateway/models/secretsctl.py::_secret_name` reduces it (kept in
+    lock-step)."""
+    for key in ("SecretId", "Name"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            _prefix, sep, name = value.partition(":secret:")
+            return name if sep else value
+    return "*"  # ListSecrets & co. name no secret at all
+
+
+def _classify_secretsmanager(lower_headers: dict[str, str], body: bytes) -> tuple[str, str] | None:
+    target = lower_headers.get("x-amz-target")
+    if target is None or "." not in target:
+        return None
+    op = target.rsplit(".", 1)[1]
+    try:
+        payload = json.loads(body) if body else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return f"secretsmanager:{op}", _secretsmanager_resource(payload)
+
+
+def _ssm_canonical(value: str) -> str:
+    """Kept in lock-step with `gateway/models/ssmctl.py::canonical_name` --
+    AWS treats a root-level parameter's leading slash as optional, a
+    hierarchical name's as part of the name; an ARN reduces to the same form."""
+    _prefix, sep, path = value.partition(":parameter")
+    bare = (path if sep else value).lstrip("/")
+    return bare if "/" not in bare else f"/{bare}"
+
+
+def _ssm_resource(payload: dict) -> str:
+    """The canonical PARAMETER NAME -- which for an `ssm` canvas node IS its
+    label. `ResourceId` is SSM's tag-API carrier (a bare name, not an ARN);
+    `Names`/`Path` cover the batch reads."""
+    for key in ("Name", "ResourceId", "Path"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return _ssm_canonical(value)
+    names = payload.get("Names")
+    if isinstance(names, list) and names and isinstance(names[0], str):
+        return _ssm_canonical(names[0])
+    return "*"  # a bare DescribeParameters names no parameter at all
+
+
+def _classify_ssm(lower_headers: dict[str, str], body: bytes) -> tuple[str, str] | None:
+    target = lower_headers.get("x-amz-target")
+    if target is None or "." not in target:
+        return None
+    op = target.rsplit(".", 1)[1]
+    try:
+        payload = json.loads(body) if body else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return f"ssm:{op}", _ssm_resource(payload)
 
 
 def _classify_ecs(lower_headers: dict[str, str], body: bytes) -> tuple[str, str] | None:

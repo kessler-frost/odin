@@ -87,12 +87,25 @@ export const CATALOG: ServiceDef[] = [
     primary: { key: 'engine', label: 'Engine' },
     iamActions: ['rds-db:connect', 'rds:DescribeDBInstances', 'rds:*'],
   },
+  // W2.4: real Secrets Manager -- the node's Name IS the secret name (the
+  // gateway classifies every secretsmanager:* call by that bare name, so an
+  // IAM edge drawn to this node only enforces while the two match). Value is
+  // the secret's initial version; it is stored CLEARTEXT in a 0600 per-env
+  // JSON sidecar -- there is no KMS in odin, so nothing here is encrypted at
+  // rest. Read SECURITY.md's Secrets section before typing a real credential.
   {
     type: 'secret', abbr: 'SEC', label: 'Secret', sublabel: 'Secrets Manager',
-    category: 'Security', color: 'lime', width: 200,
-    fields: [{ key: 'label', label: 'Name', editable: true }, { key: 'arn', label: 'ARN' }],
-    defaultData: { label: 'new-secret', arn: '' },
-    iamActions: ['secretsmanager:GetSecretValue', 'secretsmanager:*'],
+    category: 'Security', color: 'lime', width: 220,
+    fields: [
+      { key: 'label', label: 'Name', editable: true },
+      { key: 'description', label: 'Description', editable: true },
+      { key: 'secretString', label: 'Value', editable: true },
+    ],
+    defaultData: { label: 'new-secret', description: '', secretString: '' },
+    iamActions: [
+      'secretsmanager:GetSecretValue', 'secretsmanager:DescribeSecret',
+      'secretsmanager:PutSecretValue', 'secretsmanager:*',
+    ],
   },
   {
     type: 'kms', abbr: 'KMS', label: 'KMS Key', sublabel: 'Encryption key',
@@ -162,15 +175,27 @@ export const CATALOG: ServiceDef[] = [
     defaultData: { label: 'new-service', image: 'nginx:alpine', count: '1', port: '80' },
     primary: { key: 'count', label: 'tasks' },
   },
+  // W2.4: real SSM Parameter Store -- the node's Name IS the parameter name,
+  // slashes and all (the gateway classifies every ssm:* call by that bare
+  // name, so an IAM edge drawn to this node only enforces while the two
+  // match). SecureString is NOT encrypted: there is no KMS in odin, so it is
+  // stored byte-for-byte like a String would be, CLEARTEXT in a 0600 per-env
+  // JSON sidecar -- see SECURITY.md's Secrets section. A parameter can't exist
+  // without a Value, hence the placeholder default rather than an empty one.
   {
     type: 'ssm', abbr: 'SSM', label: 'SSM Parameter', sublabel: 'Parameter store',
-    category: 'Management', color: 'indigo', width: 200,
+    category: 'Management', color: 'indigo', width: 220,
     fields: [
       { key: 'label', label: 'Name', editable: true },
+      { key: 'paramType', label: 'Type', editable: true, select: ['String', 'StringList', 'SecureString'] },
       { key: 'paramValue', label: 'Value', editable: true },
     ],
-    defaultData: { label: 'new-param', paramValue: 'changeme' },
-    iamActions: ['ssm:GetParameter', 'ssm:GetParameters', 'ssm:*'],
+    defaultData: { label: '/odin/param', paramType: 'String', paramValue: 'changeme' },
+    primary: { key: 'paramType', label: 'Type' },
+    iamActions: [
+      'ssm:GetParameter', 'ssm:GetParameters', 'ssm:GetParametersByPath',
+      'ssm:PutParameter', 'ssm:*',
+    ],
   },
   // W2.1: real CloudWatch Logs -- the node's Name IS the log group name (the
   // gateway classifies every logs:* call by bare group name, so an IAM edge

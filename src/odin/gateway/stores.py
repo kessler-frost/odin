@@ -179,6 +179,22 @@ class SynthStores:
       cursor), persisted at `.odin/{env}/gateway/logsctl.json`. Log-group tags
       live in the shared `tags` store above, keyed `"logs:{logGroupArn}"` (the
       wildcard-less ARN form -- see logsctl.py's own ARN note).
+    - `secretsctl`: the Secrets Manager model's whole state
+      (`gateway/models/secretsctl.py`, task W2.4) -- flat keys
+      `"secret:{name}"` / `"version:{name}:{versionId}"`, persisted at
+      `.odin/{env}/gateway/secretsctl.json`. Secret tags live in the shared
+      `tags` store above, keyed `"secretsmanager:{secretArn}"`. This sidecar
+      holds secret VALUES in cleartext -- `_persist_locked`'s `mode=0o600`
+      below is what keeps it owner-only, the same protection `keys.json` gets
+      (see secretsctl.py's PLAINTEXT RULE and SECURITY.md's Secrets section).
+    - `ssmctl`: the SSM Parameter Store model's whole state
+      (`gateway/models/ssmctl.py`, task W2.4) -- flat keys `"param:{name}"`
+      (the canonicalized name -- see `ssmctl.canonical_name`), persisted at
+      `.odin/{env}/gateway/ssmctl.json`. Parameter tags live in the shared
+      `tags` store above, keyed `"ssm:{canonicalName}"` (SSM's tag API carries
+      the parameter NAME as `ResourceId`, not an ARN). A `SecureString`
+      parameter's value lives here in cleartext too -- odin has no KMS; 0600
+      is the protection, recorded as a limit rather than implied away.
     """
 
     def __init__(self, root: Path) -> None:
@@ -194,3 +210,5 @@ class SynthStores:
         self.lambdactl = JsonStore(root, "lambdactl")
         self.ecsctl = JsonStore(root, "ecsctl")
         self.logsctl = JsonStore(root, "logsctl")
+        self.secretsctl = JsonStore(root, "secretsctl")
+        self.ssmctl = JsonStore(root, "ssmctl")
