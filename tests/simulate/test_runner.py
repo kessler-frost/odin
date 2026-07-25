@@ -199,6 +199,78 @@ async def test_wedged_apply_is_killed_at_the_timeout_and_reported_failed(tmp_pat
     assert runner.status("default")["running"] is False
 
 
+# --- field test 2 finding B6: a wedged DESTROY is bounded, and says why ----
+
+_DESTROY_WEDGED = _INIT_OK + '\nif [ "$1" = "destroy" ]; then echo "Destroying..."; sleep 30; exit 0; fi'
+_INIT_WEDGED = 'if [ "$1" = "init" ]; then echo "Initializing..."; sleep 30; exit 0; fi'
+
+
+def test_destroy_timeout_defaults_below_the_apply_timeout(monkeypatch):
+    monkeypatch.delenv("ODIN_TOFU_DESTROY_TIMEOUT", raising=False)
+    monkeypatch.delenv("ODIN_TOFU_TIMEOUT", raising=False)
+    assert runner_mod._default_destroy_timeout() < runner_mod._default_tofu_timeout()
+    assert runner_mod._default_destroy_timeout() == 300.0
+
+
+def test_destroy_timeout_reads_its_own_env_var(monkeypatch):
+    monkeypatch.setenv("ODIN_TOFU_DESTROY_TIMEOUT", "77")
+    assert runner_mod._default_destroy_timeout() == 77.0
+
+
+async def test_a_wedged_destroy_is_killed_and_names_the_likely_cause(tmp_path, monkeypatch):
+    """Field-test 2 finding B6: `odin destroy` on a RESTORED env (which boots no
+    backing containers) was killed by hand at 8m26s with no progress. Nothing
+    was broken about the timeout -- 8m26s is 506s, under the 600s
+    `ODIN_TOFU_TIMEOUT` -- but 600s per phase is not a bound anyone waits out,
+    and the failure said nothing about the real cause: every AWS call the
+    destroy makes 503s (no backing is running) and the provider retries each
+    one ~25 times with backoff."""
+    _write_fake_tofu(tmp_path, _DESTROY_WEDGED)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    (tmp_path / "default" / "tf").mkdir(parents=True)
+    ws = RecordingWs()
+    runner = TfRunner(tmp_path, ws=ws, timeout=30, destroy_timeout=0.3)
+
+    start = time.monotonic()
+    result = await runner.destroy("default", 4266, "ak", "sk")
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 5, "the destroy should have been killed, not left to sleep out its 30s"
+    assert result.ok is False
+    tail = " ".join(result.tail)
+    assert "timed out" in tail
+    assert "backing" in tail, tail
+    assert "odin apply" in tail, tail  # the documented recovery, named
+    assert runner.status("default")["running"] is False
+
+
+async def test_the_destroy_budget_covers_init_too(tmp_path, monkeypatch):
+    """`_init_then` runs `init` FIRST with its own full budget, so a
+    per-phase-only bound made the worst case 2x the number anyone was told.
+    The destroy budget is a single deadline across both phases."""
+    _write_fake_tofu(tmp_path, _INIT_WEDGED)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    (tmp_path / "default" / "tf").mkdir(parents=True)
+    runner = TfRunner(tmp_path, timeout=30, destroy_timeout=0.3)
+
+    start = time.monotonic()
+    result = await runner.destroy("default", 4266, "ak", "sk")
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 5, "init must be bounded by the destroy budget, not the apply timeout"
+    assert result.ok is False
+
+
+async def test_a_normal_destroy_is_unaffected_by_the_destroy_budget(tmp_path, monkeypatch):
+    _write_fake_tofu(tmp_path, _INIT_OK + '\nif [ "$1" = "destroy" ]; then echo "gone"; exit 0; fi')
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    (tmp_path / "default" / "tf").mkdir(parents=True)
+    runner = TfRunner(tmp_path, timeout=30, destroy_timeout=30)
+    result = await runner.destroy("default", 4266, "ak", "sk")
+    assert result.ok is True
+    assert result.exit_code == 0
+
+
 # --- security finding #3: tofu's own log output is scrubbed for secrets ---
 
 

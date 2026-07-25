@@ -461,6 +461,29 @@ future decision against these points instead of re-deriving them:
   - The proxy container is NOT covered by W2.2's drift sweep yet — `docker rm`
     it out of band and the load balancer still reports `active` until the next
     Apply re-converges it.
+- **`tofu` runs are BOUNDED, and a wedged destroy says why.** `init`/`apply`
+  each get `ODIN_TOFU_TIMEOUT` (default 600s); `destroy` gets a smaller
+  WHOLE-CALL deadline, `ODIN_TOFU_DESTROY_TIMEOUT` (default 300s, `init`
+  included), after which the process GROUP is killed and the failure tail names
+  the cause plus the recovery (v0.7.1, field test 2 finding B6 — a destroy on a
+  restored env was killed by hand at 8m26s with no progress).
+  - **Why a destroy wedges at all, stated plainly:** the gateway answers every
+    AWS call with a real `503 ServiceUnavailable` when the env has no running
+    backing container, and aws-sdk-go-v2 treats that as retryable — ~25
+    attempts with exponential backoff per call, none of which prints anything
+    on tofu's stdout, so it looks like a silent hang. A restored env boots no
+    containers (documented) and `/destroy` does not start them, so
+    **destroy-first on a restored env wedges: `odin apply` first, then
+    destroy.**
+  - **Residual gap, stated plainly:** a DOWN backing is still reported through
+    the `access_denied` event stream with `reason: "backing-unavailable"`,
+    which is protocol-wrong (it is a service-unavailable condition, not an
+    authorization one) and pollutes the exact stream a security review reads
+    for real denials. Giving it its own event type/classification, and having
+    `/destroy` boot the backings it is about to talk to (or capping the
+    provider's `max_retries` in the generated `override.tf`), are the real
+    fixes; they live in `gateway/app.py`, `gateway/errors.py`, `server.py` and
+    `simulate/workspace.py`.
 - **Recorded as UNSUPPORTED for now** (northstar directive 5's honesty rule):
   EKS, CloudFormation, autoscaling, and KMS (the `kms` catalog node is an
   unbacked placeholder — no substitute, no gateway model, and as of W2.6 it
