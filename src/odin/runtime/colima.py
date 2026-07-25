@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import subprocess
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 from odin.spec.models import Phase
 
@@ -97,6 +98,66 @@ def _to_mib(value: str) -> float:
     return 0.0
 
 
+# A line the runtime never stamped sorts FIRST rather than being dropped (see
+# `_merge_log_streams`). Timezone-aware so it compares against real stamps.
+_UNSTAMPED = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _stamp(token: str) -> datetime | None:
+    """The `--timestamps` prefix `docker`/`nerdctl` puts in front of every log
+    line, as a sortable value -- None when this token isn't one.
+
+    The `"T"` guard is load-bearing: a Postgres line carries its OWN leading
+    date (`2026-07-25 14:00:01.123 UTC [1] LOG: ...`), whose first token
+    `fromisoformat` parses perfectly well, and treating that as the runtime's
+    stamp would silently eat the date out of every Postgres log line. A real
+    RFC3339 stamp always has the date/time separator."""
+    if "T" not in token:
+        return None
+    try:
+        parsed = datetime.fromisoformat(token)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def _log_line(line: str) -> tuple[datetime, str]:
+    stamp, _, rest = line.partition(" ")
+    parsed = _stamp(stamp)
+    return (_UNSTAMPED, line) if parsed is None else (parsed, rest)
+
+
+def _merge_log_streams(stdout: str, stderr: str, tail: int) -> str:
+    """One container's two log streams, back together as one chronological
+    block of `tail` lines (field test 2, HIGH-3).
+
+    `docker logs`/`nerdctl logs` write the container's stdout to THEIR stdout
+    and its stderr to THEIR stderr, and `--tail N` selects the last N lines
+    across BOTH. Reading only stdout therefore discarded whatever share of
+    those N lines the process wrote to stderr -- measured on one live
+    container: `--tail 10` was 0 bytes of stdout and 943 bytes of stderr, so
+    `odin logs` reported an EMPTY log for a Lambda failing every invocation,
+    and 0 bytes for a settled Postgres and an nginx (both log only to stderr).
+
+    THE INTERLEAVING GUARANTEE, stated precisely. `--timestamps` makes the
+    runtime prefix each line with the time ITS OWN log driver recorded when it
+    read that line off the container's fd, so this merge is chronological with
+    respect to the runtime's observation order -- at microsecond resolution
+    (`datetime.fromisoformat` truncates the nanosecond field), with equal
+    stamps keeping stdout-before-stderr because the sort is stable. It is NOT
+    a guarantee about the writer's own ordering: a process whose stdout is
+    block-buffered while its stderr is unbuffered genuinely IS observed out of
+    write order, and no reader of `docker logs` can undo that.
+
+    A line the runtime did NOT stamp is kept (first, in its own stream's
+    order), never dropped: silently dropping log lines is the bug being fixed,
+    so an unstamped runtime must degrade to "ordering unknown", not to "gone".
+    """
+    lines = [_log_line(line) for stream in (stdout, stderr) for line in stream.splitlines()]
+    lines.sort(key=lambda pair: pair[0])
+    return "\n".join(text for _stamp_value, text in lines[-tail:])
+
+
 @dataclass
 class _Proc:
     returncode: int
@@ -110,15 +171,27 @@ def _default_runner(args: list[str], input: str | None = None) -> _Proc:
 
 
 class _ContainerRuntime:
-    """Run/inspect/stop labelled containers. Subclasses supply `_cli` (the
+    """Run/inspect/stop labelled containers. Subclasses supply `_argv` (the
     container-CLI seam) and optionally `_run_flags` (runtime-specific run args).
     The subprocess runner is injectable, so subclasses are unit-testable."""
 
     def __init__(self, runner=None) -> None:
         self._run = runner or _default_runner
 
-    def _cli(self, *args: str, check: bool = True, input: str | None = None) -> str:
+    def _argv(self, *args: str) -> list[str]:
+        """This runtime's full argv for one container-CLI command (`docker …`
+        vs `limactl shell <vm> sudo nerdctl …`). It's a separate seam from
+        `_cli` so `logs` can run the same command while keeping BOTH streams
+        (`_cli` deliberately keeps only stdout, because for every other command
+        stderr really is the error channel)."""
         raise NotImplementedError
+
+    def _cli(self, *args: str, check: bool = True, input: str | None = None) -> str:
+        argv = self._argv(*args)
+        proc = self._run(argv, input=input)
+        if check and proc.returncode != 0:
+            raise RuntimeError(f"{' '.join(argv)} failed: {proc.stderr.strip()}")
+        return proc.stdout.strip()
 
     def _run_flags(self) -> list[str]:
         return []
@@ -182,7 +255,17 @@ class _ContainerRuntime:
         return int(out.splitlines()[0].rsplit(":", 1)[-1]) if out else 0
 
     def logs(self, name: str, tail: int = 20) -> str:
-        return self._cli("logs", "--tail", str(tail), name, check=False)
+        """The container's last `tail` lines -- BOTH streams, merged, tailed
+        after merging, so `--tail N` means N real lines (see
+        `_merge_log_streams` for the bug this closes and the exact interleaving
+        guarantee). The one command that does NOT go through `_cli`: there,
+        stderr is the error channel; here, half the log lives on it.
+
+        A failed read (a container that vanished between `status` and here) is
+        "" exactly as before, rather than the CLI's own "No such container"
+        text -- that would present a diagnostic as container output."""
+        proc = self._run(self._argv("logs", "--timestamps", "--tail", str(tail), name))
+        return _merge_log_streams(proc.stdout, proc.stderr, tail) if proc.returncode == 0 else ""
 
     def stats(self, name: str) -> dict[str, float]:
         """One-shot cpu% + memory (MiB) for a running container."""
@@ -252,11 +335,8 @@ class _ContainerRuntime:
 class ColimaRuntime(_ContainerRuntime):
     """Drives `docker` (Colima) directly on the host."""
 
-    def _cli(self, *args: str, check: bool = True, input: str | None = None) -> str:
-        proc = self._run(["docker", *args], input=input)
-        if check and proc.returncode != 0:
-            raise RuntimeError(f"docker {' '.join(args)} failed: {proc.stderr.strip()}")
-        return proc.stdout.strip()
+    def _argv(self, *args: str) -> list[str]:
+        return ["docker", *args]
 
     def _run_flags(self) -> list[str]:
         # Reach the host-side AWS embed + RDS from inside containers.
