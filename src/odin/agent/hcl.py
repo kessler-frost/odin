@@ -600,6 +600,19 @@ _BAD_ECS_PORT = "port must be a whole number (e.g. 80)"
 # trade-off for never silently shipping a broken service.
 _ECS_CONVERGE_TIMEOUT = "60s"
 
+# Field test 3: the rolling-update contract, emitted EXPLICITLY rather than
+# left to the provider's schema defaults. `minimum_healthy_percent = 100` is
+# what odin's own ECS scheduler reads (gateway/models/ecsctl.py's
+# `_serving_floor` / `_retire_stale`) to keep the PREVIOUS revision's tasks
+# serving while a new one comes up -- without it, a typo'd image tag took a
+# healthy 3-task service to zero tasks in ~4 seconds and left it there. The
+# 200% ceiling is the surge headroom that makes that possible (a 3-task
+# service may run 6 tasks mid-rollout). Same values the provider defaults to,
+# so this changes no plan; written down because the behavior is now
+# load-bearing and a silent default is a bad place for it.
+_ECS_MIN_HEALTHY_PERCENT = "100"
+_ECS_MAX_PERCENT = "200"
+
 
 def _ecs(res: ResourceDesired, refs: Refs) -> Built:
     count = _field(res, "count", _DEFAULT_ECS_COUNT)
@@ -617,6 +630,8 @@ def _ecs(res: ResourceDesired, refs: Refs) -> Built:
         "desired_count": count,
         "launch_type": quote("EC2"),
         "wait_for_steady_state": "true",
+        "deployment_minimum_healthy_percent": _ECS_MIN_HEALTHY_PERCENT,
+        "deployment_maximum_percent": _ECS_MAX_PERCENT,
     }
     blocks = [
         "  timeouts {\n"

@@ -74,6 +74,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import secrets
 import shutil
 from collections.abc import Callable
@@ -84,9 +85,11 @@ from starlette.responses import Response
 
 from odin.aws.backings import ACCOUNT, REGION
 from odin.fabric.models import FirewallRules
-from odin.fabric.nebula import ensure_network, sg_rules_to_firewall
+from odin.fabric.nebula import LighthouseManager, ensure_network, sg_rules_to_firewall
 from odin.gateway import errors
 from odin.gateway.stores import SynthStores
+
+log = logging.getLogger("odin.gateway.ec2net")
 
 _EC2_NS = "http://ec2.amazonaws.com/doc/2016-11-15/"
 _REQUEST_ID = "00000000-0000-0000-0000-000000000000"
@@ -441,6 +444,35 @@ def _describe_vpc_attribute(params: dict[str, str], env: str, stores: SynthStore
     )
 
 
+def purge_env(stores: SynthStores, env: str) -> list[str]:
+    """Forget every VPC / subnet / security-group record this env holds, and
+    take its Nebula network down with them. Returns the keys it forgot.
+
+    `/destroy`'s network half, and the other end of field test 3 HIGH-B. When
+    an apply is interrupted (`kill -9` on tofu, an OOM, a closed laptop), the
+    gateway has already created these records but tofu's state has not
+    recorded them -- so `tofu destroy` has nothing to destroy, `_delete_vpc`
+    is never called, and they survive every subsequent destroy forever. That
+    is why `/world` went on listing a VPC and subnets that no longer exist for
+    an env the user had destroyed. It also quietly re-opened HIGH-A: the
+    lighthouse stop lives on the VPC-delete path, so a VPC record that never
+    gets deleted is a lighthouse that never gets stopped.
+
+    A no-op for a NORMAL destroy, where tofu deleted each of these through
+    `_delete_vpc` already and there is nothing left to forget."""
+    keys = [k for k in stores.ec2net.items(env) if k.split(":", 1)[0] in ("vpc", "subnet", "sg")]
+    for key in keys:
+        stores.tags.set(env, f"ec2:{key.split(':', 1)[1]}", {})
+        stores.ec2net.delete(env, key)
+    if keys:
+        log.warning("destroy forgot %d orphaned ec2 network record(s) for env %r: %s", len(keys), env, keys)
+    # Same order as `_delete_vpc`, for the same reason: the pidfile that names
+    # the lighthouse process lives inside the directory being removed.
+    LighthouseManager().ensure_stopped(stores.root, env)
+    shutil.rmtree(stores.root / env / "nebula", ignore_errors=True)
+    return keys
+
+
 def _delete_vpc(params: dict[str, str], env: str, stores: SynthStores) -> Response:
     vpc_id = params.get("VpcId", "")
     vpc = _get(stores, env, "vpc", vpc_id)
@@ -459,6 +491,18 @@ def _delete_vpc(params: dict[str, str], env: str, stores: SynthStores) -> Respon
     # lives at .odin/{env}/nebula/ and belongs to the env's VPCs. When the
     # last VPC goes, the CA goes too -- a recreated VPC mints a fresh one.
     if not _records(stores, env, "vpc"):
+        # ...and so does the lighthouse PROCESS, which must be stopped BEFORE
+        # its directory disappears: `ensure_stopped` finds it through the
+        # pidfile that lives in there, so deleting first strands a real
+        # process holding a real UDP port with nothing left able to name it.
+        # Field test 3 HIGH-A: an env of a VPC + one S3 bucket (no EC2 at all,
+        # so `ec2compute._finish_terminate`'s "last VM leaves" stop never ran)
+        # leaked one lighthouse and one port per apply/destroy cycle -- three
+        # orphans measured, and ~100 cycles would exhaust the whole 4342-4441
+        # range. `fabric/nebula.py::reap_orphaned_lighthouses` is the startup
+        # backstop for one that leaked before this existed, or for a crash
+        # between these two lines.
+        LighthouseManager().ensure_stopped(stores.root, env)
         shutil.rmtree(stores.root / env / "nebula", ignore_errors=True)
     return _response("DeleteVpc", "<return>true</return>")
 

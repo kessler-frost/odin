@@ -730,3 +730,85 @@ def test_two_concurrent_boots_in_one_env_start_exactly_one_lighthouse(tmp_path, 
 def test_mesh_state_reports_which_port_this_env_owns(tmp_path, free_ports):
     ensure_network(tmp_path, "prod", "1.2.3.4", runner=FakeRunner())
     assert mesh_state(tmp_path, "prod").lighthouse_port == nebula_module.LIGHTHOUSE_PORT
+
+
+# --- the leaked-lighthouse backstop (field test 3 HIGH-A) -------------------
+#
+# An env of a VPC + one S3 bucket -- no EC2 at all, so `ec2compute.
+# _finish_terminate`'s "last VM leaves" stop never ran -- leaked one live
+# lighthouse and one held UDP port on EVERY apply/destroy cycle: teardown
+# deleted `.odin/<env>/nebula/` out from under a real process, taking the
+# pidfile that was the only way to name it. Three orphans were measured on
+# *:4343/4344/4345, one of them 8m20s old; ~100 cycles exhausts 4342-4441.
+
+
+class FakePs:
+    """A `ps -Ao pid=,args=` stand-in. Everything else the module might run
+    answers empty, so a test only has to describe the process table."""
+
+    def __init__(self, lines: list[str]) -> None:
+        self.lines = lines
+
+    def __call__(self, args):
+        from odin.fabric.nebula import _Proc
+        return _Proc(0, "\n".join(self.lines) if args[:2] == ["ps", "-Ao"] else "")
+
+
+def _lighthouse_line(pid: int, config, binary: str = "/opt/homebrew/bin/nebula") -> str:
+    return f"{pid} {binary} -config {config}"
+
+
+def test_orphaned_lighthouses_finds_a_process_whose_env_was_destroyed(tmp_path):
+    gone = tmp_path / "prod" / "nebula" / nebula_module.LIGHTHOUSE_CONFIG  # never created: the env was destroyed
+    ps = FakePs([_lighthouse_line(4242, gone)])
+    assert nebula_module.orphaned_lighthouses(tmp_path, runner=ps) == [(4242, gone)]
+
+
+def test_a_live_envs_lighthouse_is_never_an_orphan(tmp_path):
+    """The one thing this must never do: kill the lighthouse of an env that
+    is still up. Its config file existing IS the evidence it is still wanted."""
+    live = tmp_path / "prod" / "nebula" / nebula_module.LIGHTHOUSE_CONFIG
+    live.parent.mkdir(parents=True)
+    live.write_text("pki: {}\n")
+    assert nebula_module.orphaned_lighthouses(tmp_path, runner=FakePs([_lighthouse_line(4242, live)])) == []
+
+
+def test_another_stores_lighthouse_is_never_an_orphan(tmp_path):
+    """A second odin on this Mac (its own `.odin`) owns its own processes --
+    and its deleted config is none of our business."""
+    other = tmp_path.parent / "somebody-elses" / "prod" / "nebula" / nebula_module.LIGHTHOUSE_CONFIG
+    assert nebula_module.orphaned_lighthouses(tmp_path, runner=FakePs([_lighthouse_line(999, other)])) == []
+
+
+def test_a_non_nebula_process_is_never_an_orphan(tmp_path):
+    """`-config <a deleted path>` is an ordinary thing for a program to carry."""
+    gone = tmp_path / "prod" / "nebula" / nebula_module.LIGHTHOUSE_CONFIG
+    lines = [
+        _lighthouse_line(1, gone, binary="/usr/local/bin/some-editor"),
+        f"2 /opt/homebrew/bin/nebula -config {tmp_path / 'prod' / 'nebula' / 'config.yml'}",  # a MEMBER's config
+        "3 /opt/homebrew/bin/nebula",  # no -config at all
+    ]
+    assert nebula_module.orphaned_lighthouses(tmp_path, runner=FakePs(lines)) == []
+
+
+def test_reap_orphaned_lighthouses_signals_exactly_the_orphans(tmp_path, monkeypatch):
+    gone = tmp_path / "gone" / "nebula" / nebula_module.LIGHTHOUSE_CONFIG
+    live = tmp_path / "live" / "nebula" / nebula_module.LIGHTHOUSE_CONFIG
+    live.parent.mkdir(parents=True)
+    live.write_text("pki: {}\n")
+    signalled: list[tuple[int, int]] = []
+    monkeypatch.setattr(nebula_module.os, "kill", lambda pid, sig: signalled.append((pid, sig)))
+
+    ps = FakePs([_lighthouse_line(11, gone), _lighthouse_line(22, live)])
+    assert nebula_module.reap_orphaned_lighthouses(tmp_path, runner=ps) == [11]
+    assert signalled == [(11, nebula_module.signal.SIGTERM)]
+
+
+def test_reaping_a_pid_that_already_died_is_not_an_error(tmp_path, monkeypatch):
+    gone = tmp_path / "gone" / "nebula" / nebula_module.LIGHTHOUSE_CONFIG
+
+    def exploding_kill(pid, sig):
+        raise ProcessLookupError(pid)
+
+    monkeypatch.setattr(nebula_module.os, "kill", exploding_kill)
+    assert nebula_module.reap_orphaned_lighthouses(tmp_path, runner=FakePs([_lighthouse_line(11, gone)])) == []

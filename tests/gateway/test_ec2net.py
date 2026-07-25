@@ -22,6 +22,7 @@ from starlette.responses import Response
 
 from odin.gateway import synth
 from odin.gateway.classify import classify
+from odin.gateway.models import ec2net as ec2net_mod
 from odin.gateway.stores import SynthStores
 
 from .conftest import split_url
@@ -334,6 +335,54 @@ def test_delete_last_vpc_drops_the_envs_nebula_ca(sink, ec2, stores):
 
     assert _answer(stores, sink.call(lambda: ec2.delete_vpc(VpcId=vpc_b))).status_code == 200
     assert not nebula_dir.exists()
+
+
+def test_delete_last_vpc_stops_the_envs_lighthouse_before_deleting_its_config(sink, ec2, stores, monkeypatch):
+    """Field test 3 HIGH-A: this used to delete the directory and walk away,
+    stranding a REAL nebula process holding a REAL UDP port -- once per
+    apply/destroy cycle, on an env with no EC2 at all (so the "last VM leaves"
+    stop never ran). ~100 cycles exhausts the 4342-4441 pool.
+
+    Ordering is the whole fix: `ensure_stopped` finds the process through the
+    pidfile INSIDE that directory, so it has to run while it still exists."""
+    stopped: list[tuple] = []
+
+    def spy(self, root, env):
+        stopped.append((Path(root), env, (Path(root) / env / "nebula").exists()))
+
+    monkeypatch.setattr(ec2net_mod.LighthouseManager, "ensure_stopped", spy)
+    vpc_id = _create_vpc(stores, sink, ec2)
+
+    assert _answer(stores, sink.call(lambda: ec2.delete_vpc(VpcId=vpc_id))).status_code == 200
+    assert stopped == [(stores.root, ENV, True)], "stopped, and while its pidfile could still be found"
+    assert not (stores.root / ENV / "nebula").exists()
+
+
+def test_purge_env_forgets_the_network_records_an_interrupted_apply_stranded(sink, ec2, stores, monkeypatch):
+    """Field test 3 HIGH-B's other half. `kill -9` on tofu mid-apply leaves
+    these records created and tofu's state empty, so `tofu destroy` has
+    nothing to destroy, `_delete_vpc` never runs, and they outlive every
+    subsequent destroy -- which is why `/world` went on listing a VPC and
+    subnets for an env the user had destroyed. It also re-opened HIGH-A
+    through the back door: the lighthouse stop hangs off the VPC-delete path."""
+    stopped: list[tuple] = []
+    monkeypatch.setattr(
+        ec2net_mod.LighthouseManager, "ensure_stopped",
+        lambda self, root, env: stopped.append((Path(root), env)),
+    )
+    vpc_id = _create_vpc(stores, sink, ec2)
+    _create_sg(stores, sink, ec2, vpc_id, name="web")
+    req = sink.call(lambda: ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.0.1.0/24"))
+    _parse("CreateSubnet", _answer(stores, req))
+
+    forgotten = ec2net_mod.purge_env(stores, ENV)
+
+    assert {k.split(":", 1)[0] for k in forgotten} == {"vpc", "subnet", "sg"}
+    assert stores.ec2net.items(ENV) == {}
+    assert stopped == [(stores.root, ENV)]
+    assert not (stores.root / ENV / "nebula").exists()
+    # A NORMAL destroy (tofu already deleted everything) finds nothing to do.
+    assert ec2net_mod.purge_env(stores, ENV) == []
 
 
 # --- Tags (EC2's own wire shape) ------------------------------------------------

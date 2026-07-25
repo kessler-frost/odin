@@ -29,11 +29,20 @@ controls.
 
 Clicking Apply materializes and runs a canvas's nodes for real:
 
-- **Container images and commands** — any ECS task's `image` and `command`
-  fields (`compute/tasks.py`), any Lambda's inline code (`compute/
-  functions.py`, `agent/hcl.py`) are pulled/zipped and executed verbatim.
-  Nothing sandboxes or scans them; odin trusts them the way `docker run
-  <image>` trusts an image.
+- **Container images** — an ECS node's `image` field is pulled and run
+  verbatim (`agent/hcl.py` → the gateway → `compute/tasks.py`), with the
+  image's **own entrypoint**: odin's generated task definition carries only
+  `name`/`image`/`essential`/`portMappings`, and the canvas has no `command`
+  field for ecs, so a canvas cannot supply the process to run — only the
+  image that supplies it. (`compute/tasks.py` *would* honour a `command` in a
+  task definition, and a task definition registered against odin's gateway by
+  something other than the canvas — a direct AWS-SDK `RegisterTaskDefinition`
+  call — can therefore run one. That is the same trust boundary as every
+  other gateway call: the machine.) Nothing sandboxes or scans the image;
+  odin trusts it the way `docker run <image>` trusts an image.
+- **Lambda code** — any Lambda node's inline code (`agent/hcl.py`,
+  `compute/functions.py`) is zipped and executed verbatim inside the
+  function's runtime container. Same absence of sandboxing or scanning.
 - **EC2 user-data as root** — an EC2 node's `userData` field
   (`agent/hcl.py`) becomes a cloud-init script (`compute/cloud_init.py`)
   that runs as **root** inside a real Lima VM on first boot. There is no
@@ -95,6 +104,26 @@ outright. So the honest boundary is: security groups govern traffic between
 drawn resources over the mesh; they do not sandbox your own machine. If you
 want a consumer to be subject to its security group, give it the `*_MESH`
 fact.
+
+### What revoking access does and does not stop
+
+Moving a resource out of a security group on the canvas is real: odin
+re-signs that member's Nebula certificate with its new groups and restarts
+its daemon, so the peer re-handshakes under the new identity and **new
+connections are refused before Apply even returns** (measured at 0.11s).
+A membership change odin cannot apply fails the Apply rather than reporting
+success.
+
+It does **not** kill a connection that is already open through the path you
+just revoked. Nebula's firewall keeps a conntrack entry per flow and
+re-validates it only when its own ruleset version changes — not when a
+peer's certificate does — so a long-lived flow that keeps sending can
+outlive the revoke, up to nebula's `firewall.conntrack` timeouts. Editing
+the admitting group's *rules*, or restarting the admitting member, closes it
+immediately. Real AWS security groups behave the same way for established
+flows, so this is a shared property rather than a substitution gap — but if
+you are revoking access in anger, terminate the existing connection too.
+ROADMAP's security-group section documents the mechanism in full.
 
 ## Secrets
 
@@ -176,6 +205,16 @@ places, plus one more:
   store's modes, never loosen them. Treat it like a private key file — and
   note that the mode does not survive the things people do to archives: `scp`,
   a chat upload, or an object store will give the copy whatever mode it likes.
+- **`odin import` refuses to restore into a live store**, because a running
+  odin holds reconcilers and an in-memory World that would keep reconciling
+  against a store they never read. Liveness is proved, not guessed: a running
+  server holds an exclusive lock on `.odin/lock`, and the guard asks the
+  kernel who holds it. It reads no process's command line — v0.7.1 did, and
+  called an operator's own shell a live server mid-restore. The lock file
+  holds only a pid; it is not a secret, and it is not a security boundary
+  either. Anyone who can write your `.odin/` can already do worse than take
+  a lock, and `--ignore-live-server` deliberately skips the check, so treat
+  the refusal as a safety interlock for you, never as access control.
 
 If you need real secret hygiene (rotation, least-privilege access,
 encryption at rest), odin's local `.odin/` store is not that system — treat

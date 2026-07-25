@@ -37,6 +37,7 @@ own local-testing convention for these base images
 from __future__ import annotations
 
 import io
+import json
 import shutil
 import socket
 import time
@@ -73,7 +74,54 @@ def container_name(env: str, function_name: str) -> str:
 @dataclass(frozen=True)
 class InvokeResult:
     payload: bytes
-    function_error: str | None  # the X-Amz-Function-Error header value, or None
+    function_error: str | None  # the X-Amz-Function-Error value, or None
+
+
+# Field test 3: `aws lambda invoke` on a function whose handler RAISES came
+# back `StatusCode: 200` with no `FunctionError` -- the documented AWS way to
+# detect a failed invoke -- so a CI job scored a crashing function as a
+# success. Root cause, verified against a real
+# `public.ecr.aws/lambda/python:3.12` container: RIE does NOT send
+# `X-Amz-Function-Error`. A raised handler answers `200 OK` with body
+# `{"errorMessage", "errorType", "requestId", "stackTrace"}` and no such
+# header; an import failure or a runtime exit answers `502` with the same
+# shape. Reading only the header therefore reported EVERY invocation as
+# clean -- including for `last_invocation_error`, the field v0.7.1 added for
+# the World verdict, which is fed from this same value and so was also always
+# None. One signal, read off the response RIE actually sends.
+_ERROR_PAYLOAD_KEYS = ("errorType", "errorMessage")
+
+# Real Lambda's two values are `Handled` and `Unhandled` (who noticed the
+# error: the function's runtime, or Lambda itself). RIE collapses that
+# distinction -- it reports every failure the same way, in the body, with no
+# out-of-band marker -- so odin reports the one an uncaught handler exception
+# gets on real AWS rather than inventing a difference it cannot observe.
+_UNHANDLED = "Unhandled"
+
+
+def _payload_object(payload: bytes) -> dict:
+    """The response body as a JSON object, or `{}` for anything else -- a
+    handler may legitimately return a list, a bare scalar, or raw bytes."""
+    try:
+        parsed = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _function_error(response: httpx.Response) -> str | None:
+    """`Unhandled` when this invocation failed, else None.
+
+    Failed means either RIE refused the invoke outright (any non-200: an
+    init failure, a runtime exit) or it answered 200 with the runtime's own
+    error document -- BOTH of `errorType`/`errorMessage`, so a handler that
+    merely returns something error-shaped isn't accused of crashing. The
+    header is still honored first, in case a future RIE starts sending it.
+    """
+    failed = response.status_code != 200 or all(
+        key in _payload_object(response.content) for key in _ERROR_PAYLOAD_KEYS
+    )
+    return response.headers.get("X-Amz-Function-Error") or (_UNHANDLED if failed else None)
 
 
 class FunctionRuntime:
@@ -154,13 +202,15 @@ class FunctionRuntime:
     def invoke(self, env: str, function_name: str, payload: bytes, timeout: float = 30.0) -> InvokeResult:
         """The data plane: forward `payload` bytes straight to the
         function's own RIE container and hand back its response bytes
-        verbatim, plus the FunctionError header if the handler raised --
-        the gateway's Invoke handler is a pure pass-through of both."""
+        verbatim, plus the FunctionError if the handler raised (see
+        `_function_error` -- RIE sends no header, so it is read off the
+        response) -- the gateway's Invoke handler is a pure pass-through of
+        both."""
         port = self._rt.host_port(container_name(env, function_name), _RIE_PORT)
         if not port:
             raise RuntimeError(f"{container_name(env, function_name)} is not running")
         response = httpx.post(f"http://127.0.0.1:{port}{_INVOKE_PATH}", content=payload, timeout=timeout)
-        return InvokeResult(payload=response.content, function_error=response.headers.get("X-Amz-Function-Error"))
+        return InvokeResult(payload=response.content, function_error=_function_error(response))
 
     def delete(self, env: str, function_name: str) -> None:
         self._rt.stop(container_name(env, function_name))

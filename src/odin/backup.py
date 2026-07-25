@@ -43,14 +43,22 @@ import io
 import os
 import shutil
 import tarfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 
 from pydantic import BaseModel, ValidationError
 
-from odin.util import SECRET_FILE_MODE, atomic_write_bytes, live_server, odin_version
+from odin.util import (
+    SECRET_FILE_MODE,
+    SHUTDOWN_GRACE,
+    LiveServer,
+    atomic_write_bytes,
+    await_server_exit,
+    live_server,
+    odin_version,
+)
 
 MANIFEST_NAME = "manifest.json"
 ENV_PREFIX = "env"
@@ -273,11 +281,13 @@ def _destination(
 def import_archive(
     archive: Path, root: Path, env: str | None = None,
     force: bool = False, with_canvas: bool = False,
+    ignore_live_server: bool = False,
+    on_wait: Callable[[LiveServer], None] = lambda _: None,
 ) -> ImportResult:
     """Restore an archive into `root`, as `env` (default: the manifest's own
     env). Refuses a live server, an existing env dir without `force`, and any
     unsafe archive member — validating EVERY member before writing a byte."""
-    _refuse_live_server(root)
+    _refuse_live_server(root, ignore_live_server, on_wait)
     manifest = read_manifest(archive)
     target_env = env or manifest.env
     target = root / target_env
@@ -318,20 +328,39 @@ def _write(tar: tarfile.TarFile, member: tarfile.TarInfo, dest: Path) -> None:
     atomic_write_bytes(dest, tar.extractfile(member).read(), mode=member.mode & 0o700)
 
 
-def _refuse_live_server(root: Path) -> None:
+def _refuse_live_server(
+    root: Path, ignore: bool, on_wait: Callable[[LiveServer], None]
+) -> None:
     """A running odin holds live per-env Reconcilers, BackingAws instances and
     an in-memory World; swapping the store out from under them would leave it
     reconciling against state it never read. Restore is a server-DOWN
     operation, full stop — no partial-liveness special cases to reason about.
 
-    Liveness comes from `util.live_server`, which does NOT depend on who
-    started the server: v0.7.0 tested only `.odin/pid` (written by `odin start`
-    alone), so this refusal was inert for anyone running the app the way the
-    README documents, and a field test restored straight into a live store."""
-    server = live_server(root)
-    if server is not None:
-        raise BackupError(
-            f"odin is running ({server.detail}) — refusing to import into a live store. "
-            f"Stop it with {server.how_to_stop}, then re-run `odin import` "
-            "(restore is a server-down operation)."
-        )
+    Liveness comes from `util.live_server`, which does NOT depend on who started
+    the server and does NOT read anyone's command line: v0.7.0 tested only
+    `.odin/pid` (written by `odin start` alone), so this refusal was inert for
+    anyone running the app the way the README documents; v0.7.1 fixed that by
+    grepping `ps` for `odin.server:create_app` and promptly refused a restore
+    because the OPERATOR'S OWN SHELL had that string in its argv — on the
+    disaster-recovery path, naming their shell as the thing to kill.
+
+    Which is why the two rules here are asymmetric. A missed live server
+    corrupts one store; a phantom live server blocks a restore, and the person
+    running a restore has already lost something. So the evidence has to be a
+    thing only a real server can produce, and when it's still there we WAIT for
+    it — a stop the operator issued seconds ago is a server on its way out, not
+    a reason to refuse — and when we refuse we say what we observed and how to
+    override it."""
+    if ignore or (server := live_server(root)) is None:
+        return
+    on_wait(server)
+    remaining = await_server_exit(root, SHUTDOWN_GRACE)
+    if remaining is None:
+        return
+    raise BackupError(
+        f"odin is running ({remaining.detail}) — refusing to import into a live store. "
+        f"Waited {SHUTDOWN_GRACE:.0f}s for it to exit and it is still holding this store. "
+        f"Stop it with {remaining.how_to_stop}, then re-run `odin import` "
+        "(restore is a server-down operation). If you are certain nothing is "
+        "running, re-run with --ignore-live-server."
+    )

@@ -31,12 +31,12 @@ from odin.api.ws import ConnectionManager
 from odin.aws.backings import BackingAws
 from odin.compute.tasks import TaskRuntime
 from odin.fabric.localhost import LocalhostFabric
-from odin.fabric.nebula import mesh_state
+from odin.fabric.nebula import mesh_state, reap_orphaned_lighthouses
 from odin.fabric.sidecar import MeshSidecar
 from odin.gateway import DEFAULT_GATEWAY_PORT, GATEWAY_PORT_ENV, wiring
 from odin.gateway.app import GatewayState, create_gateway_app, serve_in_thread, stop_in_thread
 from odin.gateway.keys import OPERATOR_NODE_ID, KeyStore, Principal
-from odin.gateway.models import ec2compute, ecsctl, lambdactl, rdsctl
+from odin.gateway.models import ec2compute, ec2net, ecsctl, lambdactl, rdsctl
 from odin.gateway.stores import SynthStores
 from odin.reconcile import admission
 from odin.reconcile.drift import DriftSweeper
@@ -46,7 +46,7 @@ from odin.simulate.runner import SimulateBusy, TfRunner, TofuNotInstalled
 from odin.spec.models import Stack
 from odin.spec.store import SpecStore
 from odin.spec.translate import canvas_to_stack, skipped_node_types
-from odin.util import odin_version
+from odin.util import hold_store_lock, odin_version
 
 ODIN_DIR = Path(".odin")
 CANVAS_PATH = ODIN_DIR / "canvas.json"
@@ -115,6 +115,7 @@ async def _admission_rejection(runtime, store: SpecStore, stack: Stack) -> JSONR
 
 def create_apply_router(
     store: SpecStore, reconciler_for, keystore: KeyStore, runner: TfRunner, gateway_port, env_epoch: dict[str, int],
+    stores: SynthStores,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -192,6 +193,27 @@ def create_apply_router(
                     if not result.ok:
                         body["tf"]["tail"] = list(result.tail)
 
+            # Field test 3 HIGH-B: whatever tofu did or did not manage to
+            # destroy, an EC2 instance this env's gateway store still claims
+            # is a REAL Lima VM burning the user's RAM and disk -- and after
+            # an interrupted apply (Ctrl-C, an OOM, a closed laptop) tofu's
+            # state is empty, so `tofu destroy` honestly destroys nothing and
+            # reports success. Destroy is unambiguous about intent, so it
+            # reclaims them directly; if it CANNOT, it refuses to say
+            # `destroyed` (`ReclaimFailed` -> 500 with the VM names).
+            reclaimed = await asyncio.to_thread(ec2compute.reclaim_env_instances, stores, env)
+            if reclaimed:
+                body["reclaimed_vms"] = reclaimed
+            # ...and the network records the same interruption left behind,
+            # which `tofu destroy` likewise never reaches. They are what kept
+            # `/world` listing a VPC and subnets for a destroyed env -- and,
+            # because the lighthouse stop hangs off the VPC-delete path, a VPC
+            # record that is never deleted is a lighthouse never stopped
+            # (HIGH-A through HIGH-B's back door).
+            forgotten = await asyncio.to_thread(ec2net.purge_env, stores, env)
+            if forgotten:
+                body["reclaimed_network_records"] = forgotten
+
             store.apply(Stack(env=env))  # empty desired state -> the tick below prunes all
 
         await reconciler.tick()
@@ -216,6 +238,11 @@ def create_apply_router(
 
 
 _TOFU_NOT_INSTALLED = {"error": "tofu not installed", "fix": "brew install opentofu"}
+
+
+# `tofu plan -detailed-exitcode`, as odin's own vocabulary. Anything not in
+# here (1, a signal, ...) is a real error -- see `/tf/plan`.
+_PLAN_STATUS = {0: "no_changes", 2: "changes"}
 
 
 class ImportTfRequest(BaseModel):
@@ -267,6 +294,41 @@ def create_tf_router(
         }
         if not result.ok:
             body["tail"] = list(result.tail)
+        return JSONResponse(status_code=200 if result.ok else 500, content=body)
+
+    @router.post("/tf/plan")
+    async def tf_plan(env: str = ENV) -> JSONResponse:
+        """Field test 3 (safety): the SAFE drift check. Everything `/tf/apply`
+        does to keep tofu pointed at odin's own gateway -- the injected
+        `AWS_ENDPOINT_URL`, this env's operator credentials, the same
+        workspace -- with `tofu plan -detailed-exitcode` in place of the
+        apply. The alternative a user is otherwise pushed to (hand-running
+        `tofu plan` in `.odin/<env>/tf`, whose main.tf is deliberately
+        portable and therefore endpoint-less) reaches REAL AWS.
+
+        Read-only, unlike `/tf/apply`: no admission control (nothing is
+        provisioned), no `wiring.stage`, no Stack commit -- the only writes
+        are the regenerated `main.tf`/`override.tf` (so the plan is against
+        the CURRENT canvas, which is what makes drift meaningful) and tofu's
+        own refresh, which it does not persist.
+
+        `exit_code` rides through verbatim so a CI gate can use tofu's own
+        contract: 0 no changes, 2 changes present, anything else an error."""
+        stack = store.get_stack(env)
+        project = generate_tf(stack)
+        access_key, secret_key = _issue_operator(env)
+        try:
+            result = await runner.plan(
+                env, project, gateway_port(), access_key, secret_key, secrets=stack.sensitive_values(),
+            )
+        except TofuNotInstalled:
+            return JSONResponse(status_code=409, content=_TOFU_NOT_INSTALLED)
+        except SimulateBusy as exc:
+            return JSONResponse(status_code=409, content={"error": str(exc)})
+        body = {
+            "status": _PLAN_STATUS.get(result.exit_code, "failed"), "env": env,
+            "exit_code": result.exit_code, "unsupported": project.unsupported, "tail": list(result.tail),
+        }
         return JSONResponse(status_code=200 if result.ok else 500, content=body)
 
     @router.post("/tf/destroy")
@@ -333,8 +395,11 @@ def create_apply_full_router(
     semantics, then translate (S3b) and, when the canvas has TF-supported
     resources, `tofu apply` through the gateway (S2). Every non-busy outcome
     is a 200 with an honest per-half status -- the reconciler half can
-    genuinely succeed while tofu fails ("applied_tf_failed"); 409 only when a
-    tofu run is already in flight for the env."""
+    genuinely succeed while tofu fails ("applied_tf_failed"), and BOTH halves
+    can succeed while a service is still short of its desired task count
+    ("applied_services_unhealthy", field test 3); 409 only when a tofu run is
+    already in flight for the env. Only `applied` is a clean apply; every
+    other status is a nonzero exit in `cli/apply.py`."""
     router = APIRouter()
 
     @router.post("/apply-full")
@@ -501,7 +566,7 @@ def create_apply_full_router(
         # A bare `TaskRuntime()` (not this app's `runtime`) deliberately: it
         # must be the SAME substrate that launched these containers, and
         # ecsctl's own `runtime or TaskRuntime()` default is what did.
-        ecsctl.converge_services(stores, env, TaskRuntime(), keystore, gateway_port())
+        converging = ecsctl.converge_services(stores, env, TaskRuntime(), keystore, gateway_port())
         # The same recovery for lambda, and for the same reason: a function's
         # RIE container is its EXECUTION ENVIRONMENT, not a TF resource -- an
         # `aws_lambda_function`'s config doesn't change when its container is
@@ -532,13 +597,36 @@ def create_apply_full_router(
         # compiled rules are unchanged is one local file comparison -- no
         # `limactl`, no signal. See ec2compute.ensure_instance_mesh.
         await asyncio.to_thread(ec2compute.ensure_instance_mesh, stores, env)
+        # Field test 3 (HIGH): an Apply may not report success while a service
+        # is short of its desired task count. tofu's own `wait_for_steady_state`
+        # only runs when tofu UPDATES the service, so every apply tofu sees as a
+        # NO-OP -- a re-apply on an already-broken service, or an edit that only
+        # touches the launch-time `env` map -- reported `applied / tf: ok` at
+        # 0-of-3 tasks. Nothing tofu-side can close that (tofu has nothing to
+        # do), so this is odin's own post-apply verification, placed LAST so the
+        # convergence above overlaps every other recovery pass and a healthy env
+        # costs one store read. Only when everything else went clean: a tofu
+        # failure has already failed this apply, and adding a second wait to it
+        # would only make an already-honest failure slower. Off the event loop:
+        # `wait_for_steady_services` joins real threads and sleeps.
+        if body["status"] == "applied":
+            shortfalls = await asyncio.to_thread(
+                ecsctl.wait_for_steady_services, stores, env, TaskRuntime(), converging,
+            )
+            if shortfalls:
+                body["status"] = "applied_services_unhealthy"
+                body["unhealthy"] = [s._asdict() for s in shortfalls]
+                body["note"] = (
+                    "desired state committed, but the service(s) above are not running "
+                    "their desired task count — fix and re-apply"
+                )
         await reconciler.tick()  # kick an immediate pass; the loop continues it
         return JSONResponse(status_code=200, content=body)
 
     return router
 
 
-async def _reap_orphaned_ec2_vms(root: Path, envs: list[str]) -> None:
+async def _reap_orphaned_ec2_vms(root: Path, envs: list[str], stores: SynthStores) -> None:
     """Best-effort (release finding #4): `limactl` being unavailable, or
     any other reaper failure, must never block server startup -- this is a
     one-shot cleanup pass, not something reconciling depends on. Runs off
@@ -548,6 +636,22 @@ async def _reap_orphaned_ec2_vms(root: Path, envs: list[str]) -> None:
         reaped = await asyncio.to_thread(ec2compute.reap_orphaned_vms, root, envs)
         if reaped:
             log.warning("startup reaper deleted %d orphaned EC2 VM(s): %s", len(reaped), reaped)
+        # Field test 3 HIGH-B: the reaper above builds its "expected" set from
+        # the gateway store, so an interrupted apply -- which leaves VMs
+        # Running and tofu's state empty -- is exactly the case it spares. The
+        # second witness is tofu's own state; anything the store claims and
+        # the state has forgotten is unreachable by terraform forever.
+        forgotten = await asyncio.to_thread(ec2compute.reclaim_tf_forgotten_vms, stores, envs)
+        if forgotten:
+            log.warning(
+                "startup reclaimed %d EC2 VM(s) tofu's state no longer knew about: %s", len(forgotten), forgotten,
+            )
+        # Field test 3 HIGH-A: and the lighthouse PROCESSES of envs that were
+        # destroyed before teardown learned to stop them -- each one still
+        # holding a port out of the 4342-4441 pool.
+        lighthouses = await asyncio.to_thread(reap_orphaned_lighthouses, root)
+        if lighthouses:
+            log.warning("startup reaper stopped %d orphaned nebula lighthouse(s): %s", len(lighthouses), lighthouses)
     except Exception:
         log.exception("startup EC2 VM reaper failed (continuing without it)")
 
@@ -693,9 +797,16 @@ def create_app(
         # envs resumed on restart) need the ACTUAL resolved port to point
         # BackingAws's goaws.yaml at.
         gateway_server, gateway_thread, gateway_port_actual = serve_in_thread(gateway_app, port=_resolved_gateway_port)
+        # The one piece of evidence that proves THIS store has a live server, to
+        # anyone who asks the kernel rather than `ps`: `odin status`/`stop` and
+        # `odin import`'s live-store refusal. Held for the whole run; released
+        # below AFTER the reconcilers stop, so the store is only advertised free
+        # once nothing is writing to it. (Never a reason to fail startup: an
+        # unlockable store answers "free", see util._flock.)
+        store_lock = hold_store_lock(_store.root)
         envs = _store.list_envs()
         if _reap_ec2_vms:
-            await _reap_orphaned_ec2_vms(_store.root, envs)
+            await _reap_orphaned_ec2_vms(_store.root, envs, gateway_stores)
         for env in envs:  # resume reconciling existing environments
             await reconciler_for(env)
         try:
@@ -704,12 +815,16 @@ def create_app(
             for reconciler in reconcilers.values():
                 await reconciler.stop()
             stop_in_thread(gateway_server, gateway_thread)
+            store_lock.release()
 
     app = FastAPI(title="odin", version=odin_version(), lifespan=lifespan)
     app.middleware("http")(_csrf_guard)
     app.include_router(create_canvas_router(CANVAS_PATH))
     app.include_router(
-        create_apply_router(_store, reconciler_for, gateway_keystore, tf_runner, lambda: gateway_port_actual, env_epoch)
+        create_apply_router(
+            _store, reconciler_for, gateway_keystore, tf_runner, lambda: gateway_port_actual, env_epoch,
+            gateway_stores,
+        )
     )
     app.include_router(
         create_tf_router(

@@ -12,6 +12,7 @@ V3d's integration test is the only one that boots anything real.
 """
 from __future__ import annotations
 
+import json
 import threading
 import time
 from pathlib import Path
@@ -26,6 +27,7 @@ from odin.gateway.classify import classify
 from odin.gateway.keys import KeyStore
 from odin.gateway.models import ec2compute
 from odin.gateway.stores import SynthStores
+from odin.simulate.workspace import tf_dir
 
 from .conftest import split_url
 
@@ -635,6 +637,33 @@ def test_ensure_instance_mesh_pushes_the_current_rules_into_a_running_vm(sink, e
     assert actions == {name: "reloaded"}
 
 
+def test_ensure_instance_mesh_refuses_to_report_success_when_a_vm_did_not_take_it(sink, ec2, stores):
+    """Field test 3 HIGH-1's second half: `refresh_nebula` never raises (mesh
+    wiring must not fail an instance boot), so a `failed` used to be a log line
+    while the Apply returned `applied` and exit 0 -- with the VM still
+    enforcing the groups it was born with. A security control that could not be
+    applied must not be reported as applied, and the message must name the VM."""
+    vpc_id = _create_vpc(stores, sink, ec2)
+    subnet_id = _create_subnet(stores, sink, ec2, vpc_id)
+    web_sg = _create_sg(stores, sink, ec2, vpc_id, name="web-sg")
+
+    class BrokenVm(RefreshingInstanceVm):
+        def refresh_nebula(self, name, nebula):
+            self.refreshed.append((name, nebula))
+            return "failed"
+
+    vm = BrokenVm()
+    parsed = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, SecurityGroupIds=[web_sg])
+    instance_id = parsed["Instances"][0]["InstanceId"]
+    _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+
+    with pytest.raises(ec2compute.MeshRefreshFailed) as raised:
+        ec2compute.ensure_instance_mesh(stores, ENV, vm)
+    message = str(raised.value)
+    assert f"odin-ec2-{ENV}-{instance_id}" in message
+    assert "REVOKED" in message and "Re-run Apply" in message
+
+
 def test_ensure_instance_mesh_skips_instances_with_no_running_vm_to_talk_to(sink, ec2, stores):
     """A stopped instance has no daemon to signal, and an instance with no VPC
     was never on a mesh at all -- neither is a candidate."""
@@ -900,3 +929,102 @@ def test_reap_orphaned_vms_is_on_when_the_variable_is_unset(tmp_path, monkeypatc
     monkeypatch.delenv("ODIN_REAP_EC2_VMS", raising=False)
     vm = FakeReaperVm(names=["odin-ec2-default-i-orphaned"])
     assert ec2compute.reap_orphaned_vms(tmp_path, ["default"], vm=vm) == ["odin-ec2-default-i-orphaned"]
+
+
+# --- reclaiming VMs an interrupted apply stranded (field test 3 HIGH-B) -----
+#
+# `kill -9` on tofu mid-apply (Ctrl-C, an OOM, a laptop going to sleep) leaves
+# tofu's state empty while the VMs it already created keep Running. `tofu
+# destroy` then honestly destroys nothing -- so destroy returned `destroyed /
+# tf ok` in 1.7s with three real Lima VMs up, `/world` still listing them, and
+# NOTHING able to reclaim them: a second destroy, the empty-canvas Apply and a
+# server restart all spared them, because `reap_orphaned_vms` builds its
+# "expected" set from the very store that still claimed them.
+
+
+def _running_instance(sink, ec2, stores, vm) -> str:
+    vpc_id = _create_vpc(stores, sink, ec2)
+    subnet_id = _create_subnet(stores, sink, ec2, vpc_id)
+    parsed = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)
+    instance_id = parsed["Instances"][0]["InstanceId"]
+    _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+    return instance_id
+
+
+def test_destroy_reclaims_every_vm_the_store_still_claims(sink, ec2, stores):
+    """Destroy is unambiguous about intent, so it does not need tofu's state
+    to know what to reclaim -- and the store must agree with reality after."""
+    vm = FakeInstanceVm()
+    instance_id = _running_instance(sink, ec2, stores, vm)
+
+    reclaimed = ec2compute.reclaim_env_instances(stores, ENV, vm)
+
+    assert reclaimed == [f"odin-ec2-{ENV}-{instance_id}"]
+    assert vm.deleted == [f"odin-ec2-{ENV}-{instance_id}"]
+    assert ec2compute._records(stores, ENV, "instance") == [], "/world must stop listing what is gone"
+    # ...and it is idempotent: a second destroy has nothing left to do.
+    assert ec2compute.reclaim_env_instances(stores, ENV, vm) == []
+
+
+def test_destroy_refuses_to_report_success_over_a_vm_it_could_not_delete(sink, ec2, stores):
+    """`destroyed / tf ok` while three real VMs keep running is the whole bug.
+    If the VM cannot go, the record STAYS (so the next destroy tries again)
+    and the caller is told, by name."""
+    vm = FakeInstanceVm()
+    instance_id = _running_instance(sink, ec2, stores, vm)
+
+    def exploding_delete(name):
+        raise RuntimeError("limactl: instance is busy")
+
+    vm.delete = exploding_delete
+    with pytest.raises(ec2compute.ReclaimFailed) as raised:
+        ec2compute.reclaim_env_instances(stores, ENV, vm)
+
+    assert f"odin-ec2-{ENV}-{instance_id}" in str(raised.value)
+    assert "limactl delete --force" in str(raised.value)
+    assert len(ec2compute._records(stores, ENV, "instance")) == 1, "not deleted means not forgotten"
+
+
+def _write_tf_state(root, env: str, instance_ids: list[str]) -> None:
+    state = tf_dir(root, env) / "terraform.tfstate"
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.write_text(json.dumps({"resources": [
+        {"type": "aws_instance", "instances": [{"attributes": {"id": i}} for i in instance_ids]},
+    ]}))
+
+
+def test_an_instance_tofu_still_knows_about_is_never_forgotten(sink, ec2, stores):
+    vm = FakeInstanceVm()
+    instance_id = _running_instance(sink, ec2, stores, vm)
+    _write_tf_state(stores.root, ENV, [instance_id])
+    assert ec2compute.tf_forgotten_instances(stores, ENV) == []
+
+
+def test_an_instance_tofus_state_has_forgotten_is_unreachable_forever(sink, ec2, stores):
+    """The crux: reality and the store disagree, and the store is the thing
+    that is wrong. tofu's own state is the second witness -- an instance it
+    does not name can never be reached by any terraform operation again."""
+    vm = FakeInstanceVm()
+    instance_id = _running_instance(sink, ec2, stores, vm)
+    _write_tf_state(stores.root, ENV, [])  # what `tofu destroy` writes after a crashed apply
+
+    assert ec2compute.tf_forgotten_instances(stores, ENV) == [instance_id]
+    assert ec2compute.reclaim_tf_forgotten_vms(stores, [ENV], vm) == [f"odin-ec2-{ENV}-{instance_id}"]
+    assert vm.deleted == [f"odin-ec2-{ENV}-{instance_id}"]
+    assert ec2compute._records(stores, ENV, "instance") == []
+
+
+def test_no_readable_tofu_state_is_no_evidence_and_forgets_nothing(sink, ec2, stores):
+    """A state file that is missing (a fresh env) or empty (pre-created 0600
+    but never written) must never be read as "tofu knows about nothing" --
+    that would delete the VMs of an env that is perfectly healthy."""
+    vm = FakeInstanceVm()
+    _running_instance(sink, ec2, stores, vm)
+    assert ec2compute.tf_forgotten_instances(stores, ENV) == []  # no file at all
+
+    state = tf_dir(stores.root, ENV) / "terraform.tfstate"
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.write_text("")
+    assert ec2compute.tf_forgotten_instances(stores, ENV) == []
+    assert ec2compute.reclaim_tf_forgotten_vms(stores, [ENV], vm) == []
+    assert vm.deleted == []

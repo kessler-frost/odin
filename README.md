@@ -136,6 +136,15 @@ Known v1 limits, recorded rather than hidden:
   needs none; a task that dies between API calls isn't auto-replaced until
   the next Apply reconciles the service; a `tags` block on the service can
   show as drift on a subsequent `tofu plan` (tags aren't echoed back yet).
+  A **failed image update keeps your old tasks serving** — odin honors
+  `deployment_minimum_healthy_percent = 100`, launching replacements before
+  retiring anything, so a typo'd tag costs zero downtime (measured: 3 tasks
+  and 3 HTTP 200s on every 2-second sample across a 62s failed apply) while
+  the apply still exits non-zero. The node then reads **`error`**, not
+  `healthy` — "2 tasks serving the previous revision; deployment of
+  `<image>` failed" — because a service running the *old* code is not the
+  service you asked for. Caveat: `/world` doesn't refresh at all while an
+  apply is running (~60s), so you see this once the apply returns, not during.
 - **SNS→SQS subscriptions**: adding the edge to an *already-healthy* topic
   doesn't retroactively re-provision the subscription — remove and re-add the
   topic (or its edge) to force it. Fixed on create; the live-edit path is a
@@ -288,6 +297,7 @@ odin translate --file draft.json    # ...or an unsaved canvas file
 odin apply --env dev                # the Apply button, as a command
 odin world --env dev                # live resource phases
 odin events --env dev               # the event stream, one JSON line each
+odin tf plan --env dev              # drift check — the SAFE way to plan
 odin tf status --env dev            # tofu-side state
 odin destroy --env dev              # full teardown (tofu half included)
 odin import-tf existing.tf          # TF -> canvas JSON (pipe into canvas set -)
@@ -298,7 +308,10 @@ odin --version                      # which odin this is
 ```
 
 Exit codes are the contract: `0` success, `1` a refusal or a real failure, `2`
-a usage/format error. One thing an exit-code-only check misses — a node Apply
+a usage/format error (or an unreachable server). The one deliberate exception
+is `odin tf plan`, which mirrors `tofu plan -detailed-exitcode` instead — see
+[Checking for drift](#checking-for-drift--and-why-not-to-run-tofu-by-hand)
+below. One thing an exit-code-only check misses — a node Apply
 skipped as unsupported still exits `0`, so gate on the payload instead:
 
 ```bash
@@ -311,6 +324,41 @@ A round-trip example an agent might run:
 odin canvas get | jq '.nodes += [{"id":"x1","type":"s3","data":{"label":"backups"}}]' | odin canvas set -
 odin apply --env dev
 ```
+
+### Checking for drift — and why not to run tofu by hand
+
+**Running `tofu` yourself inside `.odin/<env>/tf` talks to REAL AWS.** The
+`main.tf` odin generates there is portable, real-AWS Terraform on purpose —
+no `endpoints` block, no `127.0.0.1`, no credentials in the file. odin
+injects the endpoint (its own gateway) and this env's operator credentials
+at run time. A hand-run `tofu plan` has none of that, so it goes to Amazon;
+with real credentials in your environment, it plans against your real
+account. (A field engineer did exactly this and got a genuine
+`UnrecognizedClientException` back from AWS. Every workspace now carries a
+`README.md` saying so.)
+
+`odin tf plan` is the safe path — same workspace, same injected endpoint,
+same credentials as Apply, and it changes nothing:
+
+```bash
+odin tf plan --env dev              # human-readable
+odin tf plan --env dev -o json      # for a pipeline
+```
+
+Its exit codes mirror `tofu plan -detailed-exitcode`, so a CI drift gate is
+the command and nothing else:
+
+| exit | meaning |
+| ---- | ------- |
+| `0`  | no changes — the env matches the canvas |
+| `2`  | changes present (drift, or an unapplied canvas edit) |
+| `1`  | a real error, or a refusal (a run already in flight, no tofu) |
+| `3`  | the odin server is unreachable — **not** `2`, so a down server can't be read as drift |
+
+One caveat the exit code can't carry: `no_changes` means "no drift in what
+odin can generate". A node odin has no Terraform for was never in the plan;
+the command names those separately (and `-o json` puts them in
+`.unsupported`).
 
 ## Backup and restore
 
@@ -361,6 +409,24 @@ an absolute path, a `..` traversal, or a symlink member. `odin status` and
 *different* store directory doesn't get in your way. The shared `.odin/canvas.json`
 travels in the archive but is restored only under `--with-canvas` — a restore
 should never silently replace the canvas you're drawing on.
+
+**How odin knows a server is up**, since a wrong answer here is expensive in
+both directions: a running control app holds an exclusive lock on
+`.odin/lock` for its whole life, and `odin status`/`stop`/`import` ask the
+kernel who holds it. Nothing parses `ps` output or matches command lines — a
+script with `uvicorn odin.server:create_app` in its own argv (an ops wrapper
+that restores a backup and *then* starts the app is exactly that) is not a
+server, and odin will not tell you to kill it. The lock dies with the
+process, `kill -9` included, so a crashed odin never leaves a restore
+blocked. Two consequences worth knowing:
+
+- A server that is still shutting down still holds the store, so `odin import`
+  **waits** up to 20 seconds for it to let go rather than refusing on your
+  timing. `odin stop && odin import backup.tgz` in one script just works; no
+  `sleep` needed.
+- If odin ever refuses a restore you're sure is safe, `odin import
+  --ignore-live-server` skips the check outright. It's in the refusal message
+  too. A restore is the worst possible moment to be stuck behind a guard.
 
 The archive contains the env's credentials in cleartext. It's written `0600`,
 and every file inside it is stored `0600` so a restore can only tighten a

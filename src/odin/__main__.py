@@ -197,6 +197,13 @@ def stop() -> None:
     if server is None:
         typer.echo(f"Odin is not running{_clear_stale_pidfile()}.")
         return
+    if server.pid is None:
+        # Something holds the store lock but hasn't stamped a pid we can trust.
+        # Say that, rather than signal a pid we guessed -- v0.7.1's guard told a
+        # field engineer to kill their own shell, and no message is worth that.
+        typer.echo(f"Odin is running ({server.detail}), but odin cannot identify the process.")
+        typer.echo(f"Stop it by {server.how_to_stop}.")
+        return
     # A server the user launched themselves (no pidfile -- `uvicorn
     # odin.server:create_app`, the command the README documents) is still THIS
     # store's server, so `odin stop` stops it rather than claiming nothing is

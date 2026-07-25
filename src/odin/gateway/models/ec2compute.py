@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import logging
 import os
 import secrets
@@ -95,6 +96,7 @@ from odin.gateway import errors
 from odin.gateway.keys import KeyStore, workload_env
 from odin.gateway.models import ec2net
 from odin.gateway.stores import NO_CHANGE, SynthStores
+from odin.simulate.workspace import tf_dir
 
 log = logging.getLogger("odin.gateway.ec2compute")
 
@@ -961,6 +963,21 @@ def _reaper_enabled() -> bool:
     return os.environ.get("ODIN_REAP_EC2_VMS", "1").strip().lower() not in _REAPER_OFF_VALUES
 
 
+class MeshRefreshFailed(RuntimeError):
+    """An Apply could not push a running instance's CURRENT security state into
+    its VM -- and therefore must not report success.
+
+    Field test 3 HIGH-1's second half. `InstanceVm.refresh_nebula` never
+    raises (mesh wiring must not fail an instance boot), so a `failed` was for
+    one release a log line and nothing else: the Apply returned `applied`,
+    exit 0, no warnings, while a VM went on enforcing the groups it was born
+    with. In the GRANT direction that is an annoyance. In the REVOKE
+    direction -- the single most safety-critical edit a user can make -- it is
+    an unchanged firewall behind a green light, so this is deliberately the
+    one mesh failure that is allowed to fail an Apply. It names the VM, what
+    could not be applied, and what to do about it."""
+
+
 def ensure_instance_mesh(stores: SynthStores, env: str, vm: InstanceVm | None = None) -> dict[str, str]:
     """Push each RUNNING instance's CURRENT compiled security groups into its
     already-booted VM -- `rdsctl.ensure_db_mesh`'s exact twin, for the exact
@@ -978,10 +995,17 @@ def ensure_instance_mesh(stores: SynthStores, env: str, vm: InstanceVm | None = 
 
     Firewall recompilation is `_instance_firewall`, the same function
     RunInstances uses, so a running instance and one launched a second later
-    can never disagree about what its groups mean. Returns
-    `{vm name -> what happened}` (`InstanceVm.refresh_nebula`'s own words) for
-    logging; an instance that is not `running`, or has no VPC, is skipped
-    entirely -- there is no daemon to talk to."""
+    can never disagree about what its groups mean. Both halves of an
+    instance's security state travel here: its groups' RULES (the compiled
+    firewall) and its own MEMBERSHIP of those groups (its cert groups, field
+    test 3 HIGH-1 -- `InstanceVm._reissue_cert`). Returns `{vm name -> what
+    happened}` (`InstanceVm.refresh_nebula`'s own words) for logging; an
+    instance that is not `running`, or has no VPC, is skipped entirely --
+    there is no daemon to talk to.
+
+    RAISES `MeshRefreshFailed` if any running VM did not take its update. That
+    is the whole point: a security control that cannot be applied must not be
+    reported as applied."""
     machine = vm or InstanceVm()
     actions: dict[str, str] = {}
     for record in _records(stores, env, "instance"):
@@ -996,7 +1020,131 @@ def ensure_instance_mesh(stores: SynthStores, env: str, vm: InstanceVm | None = 
         actions[vm_name(env, record["instance_id"])] = machine.refresh_nebula(
             vm_name(env, record["instance_id"]), nebula,
         )
+    _refuse_to_report_success(env, stores, actions)
     return actions
+
+
+def _refuse_to_report_success(env: str, stores: SynthStores, actions: dict[str, str]) -> None:
+    failed = sorted(name for name, action in actions.items() if action == "failed")
+    if not failed:
+        return
+    raise MeshRefreshFailed(
+        f"{len(failed)} running EC2 instance(s) in env {env!r} did NOT adopt the security groups this "
+        f"Apply gave them: {', '.join(failed)}. Their nebula daemons are still enforcing their previous "
+        f"rules and identity, so any access this Apply REVOKED is still open on the overlay. The apply "
+        f"itself succeeded -- odin's records and Terraform state are correct; only the running VMs are "
+        f"behind. Re-run Apply to retry, or terminate and re-create the listed instance(s) to force the "
+        f"change. Cause is in the odin server log (`nebula ... failed on <vm>`) and in "
+        f"`{Path(stores.root) / env / 'nebula'}`."
+    )
+
+
+class ReclaimFailed(RuntimeError):
+    """`/destroy` could not delete a VM it is responsible for, so the env is
+    NOT destroyed. Field test 3 HIGH-B's headline: three real Lima VMs kept
+    Running while destroy answered `destroyed / tf ok` in 1.7 seconds."""
+
+
+def reclaim_env_instances(stores: SynthStores, env: str, vm: InstanceVm | None = None) -> list[str]:
+    """Delete every VM this env's gateway store still claims, and forget the
+    records. Returns the VM names it reclaimed. RAISES `ReclaimFailed` if any
+    VM could not be deleted -- teardown does not get to report success over a
+    machine that is still running.
+
+    This is `/destroy`'s teardown backstop, and field test 3 HIGH-B is why it
+    has to exist. `kill -9` on tofu mid-apply (Ctrl-C, an OOM, a laptop going
+    to sleep) leaves tofu's state empty while the VMs it already created keep
+    Running. `tofu destroy` then has nothing to destroy and honestly reports
+    success -- so destroy returned `destroyed / tf ok` in 1.7s with three real
+    VMs up, `/world` still listing them, and NO supported command able to
+    reclaim them: a second destroy, the empty-canvas Apply, and a server
+    restart all spared them, because `reap_orphaned_vms` builds its "expected"
+    set from the very store that still claimed them. Only `limactl delete` by
+    hand worked.
+
+    Destroy is unambiguous about intent -- the whole env is going away -- so
+    it does not need tofu's state to know what to reclaim: anything the
+    gateway store still holds is by definition no longer wanted. Idempotent
+    (`InstanceVm.delete` is a no-op on an absent name), exact-name only, and
+    it never looks at a VM this env's store does not name.
+    """
+    machine = vm or InstanceVm()
+    reclaimed, failed = [], []
+    for record in _records(stores, env, "instance"):
+        instance_id = record["instance_id"]
+        name = vm_name(env, instance_id)
+        try:
+            machine.delete(name)
+        except Exception as exc:  # noqa: BLE001 -- reported, never swallowed; see ReclaimFailed
+            log.error("destroy could not reclaim VM %s (env %s): %s", name, env, exc)
+            failed.append(f"{name} ({exc})")
+            continue
+        stores.tags.set(env, f"ec2:{instance_id}", {})
+        stores.ec2compute.delete(env, _key("instance", instance_id))
+        reclaimed.append(name)
+    if reclaimed:
+        log.warning("destroy reclaimed %d EC2 VM(s) tofu no longer knew about: %s", len(reclaimed), reclaimed)
+    if failed:
+        raise ReclaimFailed(
+            f"env {env!r} is NOT destroyed: {len(failed)} EC2 VM(s) are still running and could not be "
+            f"deleted -- {'; '.join(failed)}. They are real Lima VMs holding real memory and disk. "
+            f"Retry `odin destroy`, or remove them by exact name with `limactl delete --force <name>`."
+        )
+    return reclaimed
+
+
+def tf_forgotten_instances(stores: SynthStores, env: str) -> list[str]:
+    """Instance ids this env's gateway store still claims that tofu's OWN
+    state no longer holds -- unreachable by any terraform operation, forever,
+    and therefore real VMs nothing will ever clean up.
+
+    The crux field test 3 HIGH-B named: `reap_orphaned_vms` builds its
+    "expected" set from the store, so when reality and the store disagree the
+    store is trusted -- and after an interrupted apply the store is precisely
+    the thing that is wrong. tofu's state is the second witness. Read
+    STRICTLY: a state file that is missing or unreadable is NO evidence (a
+    fresh env, a workspace never materialized) and yields nothing; only a
+    state tofu itself wrote, which parses, and which really does not name the
+    instance, counts."""
+    state = tf_dir(stores.root, env) / "terraform.tfstate"
+    if not state.exists():
+        return []
+    text = state.read_text().strip()
+    if not text:
+        return []  # pre-created 0600 but never written: tofu has said nothing yet
+    parsed = json.loads(text)
+    known = {
+        instance.get("attributes", {}).get("id")
+        for resource in parsed.get("resources", []) if resource.get("type") == "aws_instance"
+        for instance in resource.get("instances", [])
+    }
+    return [r["instance_id"] for r in _records(stores, env, "instance") if r["instance_id"] not in known]
+
+
+def reclaim_tf_forgotten_vms(stores: SynthStores, envs: list[str], vm: InstanceVm | None = None) -> list[str]:
+    """Startup half of the same fix: delete the VMs of instances tofu's state
+    has forgotten, and forget their records, so `/world` and the store agree
+    with reality again. Runs beside `reap_orphaned_vms` -- that one reclaims a
+    VM no record names, this one reclaims a record no TERRAFORM STATE names,
+    and between them the two disagreements a crashed apply can leave are both
+    covered. Takes the app's OWN `SynthStores` (never a fresh one over the
+    same directory) so the records it forgets are forgotten everywhere at
+    once. Never raises: a startup safety net must not stop a server from
+    starting (unlike `/destroy`, which the user is watching)."""
+    machine = vm or InstanceVm()
+    reclaimed = []
+    for env in envs:
+        for instance_id in tf_forgotten_instances(stores, env):
+            name = vm_name(env, instance_id)
+            log.warning(
+                "reclaiming EC2 VM %r: env %r's gateway store claims it, but tofu's state does not -- "
+                "no terraform operation can ever reach it again (an interrupted apply)", name, env,
+            )
+            machine.delete(name)
+            stores.tags.set(env, f"ec2:{instance_id}", {})
+            stores.ec2compute.delete(env, _key("instance", instance_id))
+            reclaimed.append(name)
+    return reclaimed
 
 
 def reap_orphaned_vms(root: Path, envs: list[str], vm: InstanceVm | None = None) -> list[str]:

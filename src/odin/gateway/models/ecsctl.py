@@ -27,7 +27,12 @@ Reconciler loop): CreateService/UpdateService spawn a background thread
 ec2compute/lambdactl already use) that converges the service's REAL task
 containers toward `desiredCount` -- launch when short, newest-task-first
 scale-down when over (the digest's own ordering), and replace any task
-still running a STALE `taskDefinition` revision. This does NOT live in
+still running a STALE `taskDefinition` revision. That replacement SURGES
+FIRST and RETIRES SECOND, honoring the service's own
+`deploymentConfiguration`: the previous revision keeps serving until enough
+replacements are genuinely RUNNING to hold the `minimumHealthyPercent`
+floor, so a deployment that can never succeed no longer destroys the one
+that works (field test 3 -- see `_retire_stale`). This does NOT live in
 `reconcile/reconciler.py`'s main tick: the gateway model owns ALL of ECS's
 state end to end, and it's the AWS provider's own repeated `Describe*` READ
 calls during `apply`/`plan` (its create/update waiters) that drive
@@ -82,11 +87,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 import uuid
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from typing import NamedTuple
 
 from starlette.responses import Response
 
@@ -130,6 +137,21 @@ _LOG_TAIL_LINES = 200
 # the record outright (this module's first cut) hung a real `tofu destroy`
 # indefinitely; this grace window is what makes the delete observable.
 _INACTIVE_SERVICE_SWEEP_SECONDS = 60.0
+
+# --- the rolling-update contract (field test 3) --------------------------
+# Real AWS's own `deploymentConfiguration` defaults, which are also
+# terraform-provider-aws's schema defaults for
+# `deployment_minimum_healthy_percent` / `deployment_maximum_percent`. They
+# are not decoration: `_reconcile_service_tasks` HONORS them (surge first,
+# retire second -- `_retire_stale`), which is what stops a failed image
+# update taking the service to zero.
+_DEFAULT_MIN_HEALTHY_PERCENT = 100
+_DEFAULT_MAX_PERCENT = 200
+
+# How long the replacements get to prove they STAY up before the previous
+# revision is retired (`_stabilize`). Paid only when there IS a previous
+# revision to retire, and off the apply's critical path -- see `_stabilize`.
+_ROLLOUT_STABILIZE_SECONDS = 2.0
 
 # Trailing keystore/gateway_port are threaded to EVERY handler even where
 # unused (the same convention `runtime` itself follows): only the service
@@ -369,6 +391,24 @@ def _on_current_revision(service: dict, tasks: list[dict]) -> list[dict]:
     return [t for t in tasks if t["task_definition_arn"] == service["task_definition_arn"]]
 
 
+def service_image(stores: SynthStores, env: str, service: dict) -> str:
+    """The container image the service's CURRENT task definition asks for --
+    public because `reconcile/tf_status.py` names it in the World verdict when
+    a deployment of that image failed while the previous revision keeps
+    serving. Empty when the taskdef was deregistered out from under the
+    service (no image to honestly name)."""
+    taskdef = _resolve_taskdef_ref(stores, env, service["task_definition_arn"])
+    definitions = (taskdef or {}).get("container_definitions") or [{}]
+    return definitions[0].get("image", "")
+
+
+def on_current_revision(service: dict, tasks: list[dict]) -> list[dict]:
+    """Public seam over `_on_current_revision` for `reconcile/tf_status.py`,
+    so the World projection splits tasks by revision using the SAME rule the
+    wire-level `runningCount` does rather than a second copy of it."""
+    return _on_current_revision(service, tasks)
+
+
 def _rollout(service: dict, tasks: list[dict], deployment_id: str) -> tuple[str, str]:
     """The deployment's honest `(rolloutState, rolloutStateReason)` from the
     REAL task outcomes (field-test finding #3). A STOPPED task in the store is
@@ -443,7 +483,15 @@ def _service_wire(stores: SynthStores, env: str, service: dict) -> dict:
         "pendingCount": pending,
         "launchType": service["launch_type"],
         "taskDefinition": service["task_definition_arn"],
-        "deploymentConfiguration": {"maximumPercent": 200, "minimumHealthyPercent": 100},
+        # Echoed from the record, not hardcoded: these two percentages are
+        # what `_reconcile_service_tasks` actually SCHEDULES by
+        # (`_serving_floor` / `_surge_budget`), so reporting a number the
+        # scheduler ignored would be its own small lie. `.get` keeps records
+        # written before the fields existed reading as the AWS defaults.
+        "deploymentConfiguration": {
+            "maximumPercent": service.get("max_percent", _DEFAULT_MAX_PERCENT),
+            "minimumHealthyPercent": service.get("min_healthy_percent", _DEFAULT_MIN_HEALTHY_PERCENT),
+        },
         "deployments": [deployment],
         "events": events,
         "createdAt": service["created_at"],
@@ -696,6 +744,108 @@ def _stop_task(stores: SynthStores, env: str, task: dict, runtime: TaskRuntime) 
     stores.ecsctl.delete(env, _task_key(task["cluster_name"], task["task_id"]))
 
 
+def _deployment_config(payload: dict, current: dict) -> dict:
+    """The two scheduling percentages off a Create/UpdateService payload's
+    `deploymentConfiguration`, falling back to whatever the service already
+    carries and then to real AWS's own defaults."""
+    block = payload.get("deploymentConfiguration") or {}
+    return {
+        "min_healthy_percent": int(block.get(
+            "minimumHealthyPercent", current.get("min_healthy_percent", _DEFAULT_MIN_HEALTHY_PERCENT),
+        )),
+        "max_percent": int(block.get(
+            "maximumPercent", current.get("max_percent", _DEFAULT_MAX_PERCENT),
+        )),
+    }
+
+
+def _serving_floor(service: dict) -> int:
+    """How many tasks must stay serving THROUGHOUT a rolling replacement:
+    `ceil(desiredCount * minimumHealthyPercent / 100)`, real ECS's own rule.
+    `.get` covers service records written before this field existed."""
+    percent = service.get("min_healthy_percent", _DEFAULT_MIN_HEALTHY_PERCENT)
+    return -(-service["desired_count"] * percent // 100)
+
+
+def _surge_budget(service: dict, live: int) -> int:
+    """How many MORE tasks may exist right now: `desiredCount *
+    maximumPercent / 100` minus what is already live. This headroom is what
+    lets the replacements come up BEFORE the previous revision is retired --
+    at the 200% default a 3-task service may run 6 tasks mid-rollout."""
+    percent = service.get("max_percent", _DEFAULT_MAX_PERCENT)
+    return service["desired_count"] * percent // 100 - live
+
+
+def _stabilize(stores: SynthStores, env: str, runtime: TaskRuntime) -> None:
+    """Give the just-launched replacements a bounded window to prove they
+    actually STAY up, then re-read every task's REAL container state, so a
+    replacement that exited on its own inside the window is already STOPPED
+    when `_retire_stale` counts who is serving.
+
+    Off the apply's critical path, and paid only when there IS a previous
+    revision to retire: the provider's steady-state waiter keys on
+    `runningCount`, which is current-revision-only (`_on_current_revision`)
+    and was already satisfied by the launches above, so a good update's apply
+    time is unchanged -- the retirement finishes behind it on this same
+    daemon thread.
+
+    LIMIT, recorded: a replacement that takes LONGER than this window to
+    crash is still counted as serving and the previous revision is retired
+    anyway. That is real ECS's own behavior for a service with no health
+    check configured (a task counts as RUNNING the moment its container
+    starts), and it is why this is a window rather than a promise."""
+    time.sleep(_ROLLOUT_STABILIZE_SECONDS)
+    sweep_tasks(stores, env, runtime)
+
+
+def _stale_tasks(stores: SynthStores, env: str, service: dict) -> list[dict]:
+    """The service's still-live tasks running a revision it has moved off."""
+    return [
+        task for task in _tasks_for_service(stores, env, service["cluster_name"], service["service_name"])
+        if task["last_status"] != "STOPPED" and task["task_definition_arn"] != service["task_definition_arn"]
+    ]
+
+
+def _retire_stale(stores: SynthStores, env: str, service: dict, runtime: TaskRuntime) -> None:
+    """Stop the previous revision's tasks -- but only down to the
+    `minimumHealthyPercent` floor, and only counting replacements that are
+    genuinely RUNNING.
+
+    FIELD TEST 3 measured what the old "stop every stale task FIRST, then
+    launch" ordering cost: three healthy tasks serving HTTP 200, one typo'd
+    image tag, and the service was at ZERO tasks ~4 seconds after the apply
+    started -- every port refusing -- while the operator was told nothing for
+    another ~59 seconds, and nothing self-healed afterwards. The stop loop ran
+    unconditionally before a single replacement had been attempted, so a
+    deployment that could never succeed still destroyed the one that had.
+
+    Honoring the floor makes the failed case a NON-EVENT for traffic: with
+    the default 100% floor, zero replacements RUNNING means zero stale tasks
+    retired, so the previous revision keeps serving for the whole failed
+    apply. The apply still fails loudly and on the same clock -- `runningCount`
+    counts the CURRENT revision only (`_on_current_revision`), so the
+    provider's bounded steady-state waiter times out exactly as it did before.
+
+    The honesty half lives in `reconcile/tf_status.py::_ecs_services`: a
+    service left serving the previous revision reads `error`, never `healthy`.
+    Keeping the old tasks alive WITHOUT that projection change would have
+    traded an outage for a false green, which is why the two ship together."""
+    if not _stale_tasks(stores, env, service):
+        return
+    _stabilize(stores, env, runtime)
+    # Re-derived AFTER the window: a stale task that died on its own during it
+    # is already STOPPED, and neither counts as serving nor needs stopping.
+    stale = _stale_tasks(stores, env, service)
+    serving = [
+        task for task in _tasks_for_service(stores, env, service["cluster_name"], service["service_name"])
+        if task["last_status"] == "RUNNING" and task["task_definition_arn"] == service["task_definition_arn"]
+    ]
+    keep = max(_serving_floor(service) - len(serving), 0)
+    # Oldest-first: the previous revision drains from its longest-lived task.
+    for task in sorted(stale, key=lambda t: t["started_at"] or 0)[: max(len(stale) - keep, 0)]:
+        _stop_task(stores, env, task, runtime)
+
+
 def _reconcile_service_tasks(
     stores: SynthStores, env: str, cluster_name: str, service_name: str, runtime: TaskRuntime,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
@@ -717,29 +867,34 @@ def _reconcile_service_tasks(
         live = [t for t in _tasks_for_service(stores, env, cluster_name, service_name) if t["last_status"] != "STOPPED"]
         stale = [t for t in live if t["task_definition_arn"] != service["task_definition_arn"]]
         fresh = [t for t in live if t not in stale]
-        for task in stale:
-            _stop_task(stores, env, task, runtime)
 
         desired = service["desired_count"]
         node_label = service.get("node_label") or ""
+        # SURGE FIRST, RETIRE SECOND (field test 3). The previous revision is
+        # NOT stopped here -- `_retire_stale` below does it, and only once the
+        # replacements are genuinely serving. See its docstring for the
+        # measured outage this ordering closes.
         if len(fresh) < desired:
-            for _ in range(desired - len(fresh)):
+            for _ in range(min(desired - len(fresh), max(_surge_budget(service, len(live)), 0))):
                 _launch_task(stores, env, cluster_name, service_name, taskdef, runtime, extra_env, node_label)
         elif len(fresh) > desired:
             # Newest-task-first scale-down (the digest's own ordering).
             excess = sorted(fresh, key=lambda t: t["started_at"] or 0, reverse=True)[: len(fresh) - desired]
             for task in excess:
                 _stop_task(stores, env, task, runtime)
+        _retire_stale(stores, env, service, runtime)
 
 
-def _spawn(target: Callable[..., None], *args: object) -> None:
-    threading.Thread(target=target, args=args, daemon=True).start()
+def _spawn(target: Callable[..., None], *args: object) -> threading.Thread:
+    thread = threading.Thread(target=target, args=args, daemon=True)
+    thread.start()
+    return thread
 
 
 def converge_services(
     stores: SynthStores, env: str, runtime: TaskRuntime,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
-) -> None:
+) -> list[threading.Thread]:
     """Re-converge every ACTIVE service's REAL task containers toward
     `desiredCount` -- the exact `_reconcile_service_tasks` pass CreateService/
     UpdateService already spawn, driven by an APPLY (server.py's /apply-full)
@@ -753,14 +908,130 @@ def converge_services(
     is odin's equivalent, deliberately triggered by the user's Apply instead
     of a background timer (the module docstring's "TF's read calls drive
     convergence, not a timer" limit stays: no new scheduler loop). Idempotent
-    -- a service already at desiredCount launches nothing."""
-    for service in _all_services(stores, env):
-        if service["status"] != "ACTIVE":
-            continue
+    -- a service already at desiredCount launches nothing.
+
+    Returns the spawned threads so the caller can WAIT for the convergence it
+    just asked for (`wait_for_steady_services`) instead of guessing at it.
+
+    The leading `sweep_tasks` is load-bearing (field test 3): a container that
+    exited on its own still reads RUNNING in the store until something sweeps
+    it, so without this the reconcile below counted a dead task as live and
+    launched nothing -- the Apply-is-the-recovery promise silently did nothing
+    for the most common failure there is. One sweep per Apply, the same
+    idempotent pass every World projection already runs."""
+    sweep_tasks(stores, env, runtime)
+    return [
         _spawn(
             _reconcile_service_tasks, stores, env, service["cluster_name"],
             service["service_name"], runtime, keystore, gateway_port,
         )
+        for service in _all_services(stores, env) if service["status"] == "ACTIVE"
+    ]
+
+
+# --- post-apply verification: an Apply may not report success at zero tasks --
+
+# Field test 3 (HIGH): `odin apply` exited 0 with `status: applied / tf: ok`
+# while the service sat at 0 of 3 tasks with every task failing. The v0.7.1
+# guard (`wait_for_steady_state` + a bounded `timeouts` on the tf resource) is
+# only ever evaluated when tofu actually UPDATES the service -- so any apply
+# tofu sees as a NO-OP (a re-apply on an already-broken service; an edit that
+# only touches the launch-time `env` map, which is deliberately not in the
+# task definition) skipped the check entirely and scored a full outage green.
+# Nothing in tofu can close that, by definition: tofu has nothing to do. So
+# odin verifies it itself, right after its own convergence pass.
+_STEADY_POLL_SECONDS = 0.5
+_STEADY_TIMEOUT_ENV = "ODIN_ECS_STEADY_TIMEOUT"
+
+
+def steady_timeout() -> float:
+    """The post-apply convergence budget, in seconds. Deliberately the SAME 60s
+    as `agent/hcl.py`'s `timeouts.update` (the tf-side twin of this check) --
+    one number for "how long may a task legitimately take to come up", not two.
+    `ODIN_ECS_STEADY_TIMEOUT` overrides, matching every other odin timeout."""
+    return float(os.environ.get(_STEADY_TIMEOUT_ENV, "60"))
+
+
+class ServiceShortfall(NamedTuple):
+    """One service that is below its desired task count: WHICH service, WHAT
+    was observed, and the real underlying reason when odin knows one (field
+    test 3's caveat: the failing image named only in /world and events was
+    never in the apply's own output)."""
+
+    node: str
+    running: int
+    desired: int
+    reason: str | None
+
+
+def task_verdict(task: dict) -> str:
+    """A STOPPED task's real reason as one human line -- the `docker` error
+    naming a bad image, an `UnresolvedRef` naming a broken `${{...}}`, or the
+    essential-container-exited reason plus its exit code. Shared with
+    `reconcile/tf_status.py`, which renders the same string as the node's
+    World verdict: the apply output and World must not disagree."""
+    reason = task.get("stopped_reason") or "task stopped"
+    exit_code = task.get("exit_code")
+    return f"{reason} (exit {exit_code})" if exit_code is not None else reason
+
+
+def _shortfall(stores: SynthStores, env: str, service: dict) -> tuple[ServiceShortfall, int] | None:
+    """`(shortfall, pending)` when this service is below desired, else None.
+    CURRENT-REVISION tasks only, for the same reason `_on_current_revision`
+    records: a stale task from the previous deployment is neither progress
+    toward this one nor a failure of it."""
+    tasks = _on_current_revision(service, _tasks_for_service(
+        stores, env, service["cluster_name"], service["service_name"],
+    ))
+    running = sum(1 for t in tasks if t["last_status"] == "RUNNING")
+    if running >= service["desired_count"]:
+        return None
+    stopped = [t for t in tasks if t["last_status"] == "STOPPED"]
+    latest = max(stopped, key=lambda t: t.get("stopped_at") or 0, default=None)
+    return ServiceShortfall(
+        node=service.get("node_label") or service["service_name"],
+        running=running, desired=service["desired_count"],
+        reason=task_verdict(latest) if latest is not None else None,
+    ), sum(1 for t in tasks if t["last_status"] not in ("RUNNING", "STOPPED"))
+
+
+def wait_for_steady_services(
+    stores: SynthStores, env: str, runtime: TaskRuntime,
+    converging: Iterable[threading.Thread] = (), timeout: float | None = None,
+) -> list[ServiceShortfall]:
+    """Every ACTIVE service still short of its desired task count once the
+    Apply's convergence has had its bounded chance -- empty means the whole
+    env's ECS surface is genuinely at desired count, which is the only state
+    an Apply may report success in.
+
+    Bounded three ways, so this never becomes a hang and never fails a service
+    that is legitimately still starting:
+      1. it JOINS `converging` (the threads `converge_services` just spawned),
+         so a slow first image pull is waited on rather than raced;
+      2. it returns the instant nothing is left PENDING -- a service short of
+         desired with no task still coming up cannot converge without another
+         Apply, so waiting out the budget would only make the failure slower;
+      3. it returns at `steady_timeout()` regardless.
+    A freshly created or scaled-up service never reaches here short: tofu's own
+    `wait_for_steady_state` already blocked on it, and a tofu failure has
+    already failed the apply before this runs.
+
+    `sweep_tasks` each pass for the same reason every World projection runs it:
+    a task whose container already exited still reads RUNNING in the store, and
+    counting that as healthy is precisely the lie this closes."""
+    deadline = time.monotonic() + (steady_timeout() if timeout is None else timeout)
+    for thread in converging:
+        thread.join(max(0.0, deadline - time.monotonic()))
+    while True:
+        sweep_tasks(stores, env, runtime)
+        short = [
+            found for service in _all_services(stores, env) if service["status"] == "ACTIVE"
+            for found in [_shortfall(stores, env, service)] if found is not None
+        ]
+        settled = all(pending == 0 for _, pending in short)
+        if not short or settled or time.monotonic() >= deadline:
+            return [shortfall for shortfall, _ in short]
+        time.sleep(_STEADY_POLL_SECONDS)
 
 
 # Per-(SynthStores, env, cluster, service) lock, serializing
@@ -958,6 +1229,7 @@ def _create_service(
         "created_at": time.time(),
         "status": "ACTIVE",
         "deleted_at": None,
+        **_deployment_config(payload, {}),
     }
     stores.ecsctl.set(env, _service_key(cluster_name, service_name), service)
     # The FULL tag dict is persisted (shared `stores.tags`, lambdactl's
@@ -1011,6 +1283,10 @@ def _update_service(
         if taskdef is None:
             return _not_found_taskdef(payload["taskDefinition"])
         service["task_definition_arn"] = _taskdef_arn(taskdef["family"], taskdef["revision"])
+    # A rolling update is exactly when the deployment percentages matter, so
+    # UpdateService honors an edited `deploymentConfiguration` too (real ECS
+    # accepts one on this call); absent, the service keeps what it has.
+    service.update(_deployment_config(payload, service))
     stores.ecsctl.set(env, _service_key(cluster_name, service_name), service)
     response = _json({"service": _service_wire(stores, env, service)})
     _spawn(_reconcile_service_tasks, stores, env, cluster_name, service_name, runtime, keystore, gateway_port)

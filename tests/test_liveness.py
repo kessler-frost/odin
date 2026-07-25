@@ -1,50 +1,45 @@
-"""Field-test finding (v0.7.0, agent A "B5"): the documented "import refuses to
-run while odin is up" guardrail never fired.
+"""Two field-test findings about the same guard, one release apart.
 
-The engineer's server was up and healthy (`/health` -> ok) but `odin status`
-said "Odin is not running", so `odin import` restored into a LIVE store, exit 0,
-no warning, and the running server adopted the env immediately -- the exact
-corruption `_refuse_live_server`'s docstring exists to prevent. Cause: the check
-read only `.odin/pid`, which ONLY `odin start` writes, while the repo's own
-README and CLAUDE.md document running the app as
-`uvicorn odin.server:create_app --factory`.
+v0.7.0 (agent A, "B5"): the documented "import refuses to run while odin is up"
+guardrail never fired. The engineer's server was up and healthy but `odin
+status` said "Odin is not running", so `odin import` restored into a LIVE store,
+exit 0, no warning. Cause: the check read only `.odin/pid`, which ONLY `odin
+start` writes, while the README documents running the app as `uvicorn
+odin.server:create_app --factory`.
 
-So both launch paths are tested here, and the process-scan path is tested for
-the thing that makes it safe as well as the thing that makes it work: a server
-running against a DIFFERENT store must not block this store's restore.
+v0.7.1 (field test 3): the fix for that scanned `ps` for the literal string
+`odin.server:create_app` and refused an import because the engineer's own SHELL
+had that string in its argv -- with no server running anywhere and port 4510
+dead -- and told them to `kill 26940`, their own shell. Moving the server
+command into a file made the identical import exit 0. The natural trigger is an
+ops wrapper script that restores a backup and then starts the app: the start
+command sits in its own argv. So the failure landed exactly on the
+disaster-recovery path.
 
-The OS is faked at exactly one seam (`util._proc_run`, the only place either
-`ps` or `lsof` is invoked); everything above it is the production code path.
+Hence the shape of this file. Liveness is evidence, never inference, and the two
+directions are not symmetric: a missed live server corrupts one store, while a
+phantom live server blocks a restore for someone who has already lost something.
+So `test_a_process_that_merely_mentions_the_server_is_not_one` runs a REAL
+process with the marker in its argv, and every positive test holds a REAL kernel
+lock on the store -- no process text is parsed anywhere, and nothing is faked at
+any seam.
 """
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
-from odin import util
+from odin import backup, util
 from odin.backup import BackupError, export_env, import_archive
 
-UVICORN = "/x/.venv/bin/python -m uvicorn odin.server:create_app --factory --host 127.0.0.1 --port 4310"
-
-
-@dataclass
-class FakeProc:
-    returncode: int = 0
-    stdout: str = ""
-    stderr: str = ""
-
-
-def _fake_os(monkeypatch: pytest.MonkeyPatch, ps: str, cwd: str | None) -> None:
-    """`ps` output for the process scan, and the cwd `lsof` reports for any pid.
-    `cwd=None` = lsof answered nothing (not installed, or refused)."""
-    lsof = FakeProc(stdout=f"p1234\nfcwd\nn{cwd}\n") if cwd is not None else FakeProc(returncode=1)
-    monkeypatch.setattr(
-        util, "_proc_run",
-        lambda args: lsof if args[0] == "lsof" else FakeProc(stdout=ps),
-    )
+# The exact command line the README documents -- the one v0.7.1 grepped for.
+UVICORN = "/x/.venv/bin/python -m uvicorn odin.server:create_app --factory --host 127.0.0.1 --port 4510"
 
 
 def _store(tmp_path: Path) -> Path:
@@ -54,63 +49,147 @@ def _store(tmp_path: Path) -> Path:
     return root
 
 
-def test_no_server_no_refusal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    _fake_os(monkeypatch, ps="  501 /usr/bin/vim notes.txt\n", cwd=None)
+@pytest.fixture
+def held_lock():
+    """A store lock held for the test, like a server holds it, released after."""
+    locks: list[util.StoreLock] = []
+
+    def hold(root: Path) -> util.StoreLock:
+        locks.append(util.hold_store_lock(root))
+        return locks[-1]
+
+    yield hold
+    for lock in locks:
+        lock.release()
+
+
+def test_no_server_no_refusal(tmp_path: Path):
     assert util.live_server(_store(tmp_path)) is None
 
 
-def test_odin_start_path_is_detected_via_the_pidfile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """Launch path A: `odin start` (background or dev) writes `.odin/pid`."""
-    _fake_os(monkeypatch, ps="", cwd=None)
+def test_odin_start_path_is_detected_via_the_pidfile(tmp_path: Path):
+    """Launch path A: `odin start` (background or dev) writes `.odin/pid`. It
+    stays the first answer -- it is also what covers the second or two between
+    `odin start` forking uvicorn and uvicorn's lifespan taking the store lock."""
     root = _store(tmp_path)
     (root / "pid").write_text(str(os.getpid()))
     server = util.live_server(root)
     assert server is not None and server.pid == os.getpid() and server.managed
 
 
-def test_stale_pidfile_is_not_a_live_server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    _fake_os(monkeypatch, ps="", cwd=None)
+def test_stale_pidfile_is_not_a_live_server(tmp_path: Path):
     root = _store(tmp_path)
     (root / "pid").write_text("999999")  # never alive
     assert util.live_server(root) is None
 
 
-def test_uvicorn_path_is_detected_with_no_pidfile_at_all(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """Launch path B: the command the README documents. No pidfile exists."""
+def test_uvicorn_path_is_detected_with_no_pidfile_at_all(tmp_path: Path, held_lock):
+    """Launch path B: the command the README documents. No pidfile exists --
+    the server itself is holding the store lock, which is what odin observes."""
     root = _store(tmp_path)
-    _fake_os(monkeypatch, ps=f" 4242 {UVICORN}\n", cwd=str(tmp_path))
+    held_lock(root)
     server = util.live_server(root)
     assert server is not None
-    assert server.pid == 4242 and not server.managed and "uvicorn" in server.command
+    assert server.pid == os.getpid() and not server.managed
+    assert "store lock" in server.detail and f"kill {os.getpid()}" in server.how_to_stop
 
 
-def test_a_server_on_another_store_does_not_block_this_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """The second-instance case the ROADMAP explicitly blesses ("a separate
-    working directory with its own store") must stay restorable."""
+def test_a_process_that_merely_mentions_the_server_is_not_one(tmp_path: Path):
+    """FIELD TEST 3, the regression this file exists for. A real process whose
+    argv contains `odin.server:create_app` -- the ops wrapper script that
+    restores a backup and then starts the app, or the shell it runs in -- with
+    nothing listening and no lock held. v0.7.1 called this a live server and
+    told the operator to kill it."""
     root = _store(tmp_path)
-    _fake_os(monkeypatch, ps=f" 4242 {UVICORN}\n", cwd=str(tmp_path / "elsewhere"))
+    wrapper = subprocess.Popen(
+        # A long-lived process carrying the marker in its argv and nothing else:
+        # what an ops wrapper (`restore.sh` -> `odin import` -> start the app)
+        # looks like to `ps` while the import is running.
+        [sys.executable, "-c", "import time; time.sleep(30)", UVICORN],
+        cwd=tmp_path,
+    )
+    try:
+        listed = subprocess.run(["ps", "-xo", "pid=,command="], capture_output=True, text=True).stdout
+        assert "odin.server:create_app" in listed, "the decoy must really be visible to a ps scan"
+        assert util.live_server(root) is None
+    finally:
+        wrapper.kill()
+        wrapper.wait()
+
+
+def test_a_server_on_another_store_does_not_block_this_one(tmp_path: Path, held_lock):
+    """The second-instance case the ROADMAP explicitly blesses ("a separate
+    working directory with its own store") must stay restorable. The lock is
+    per-store by construction, so this is structural rather than a heuristic."""
+    root = _store(tmp_path)
+    elsewhere = tmp_path / "elsewhere" / ".odin"
+    held_lock(elsewhere)
     assert util.live_server(root) is None
 
 
-def test_an_unknowable_cwd_fails_safe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """No lsof (or no permission): a destructive restore must assume the worst
-    rather than assume the server is someone else's."""
+def test_a_lock_file_nobody_holds_is_not_a_live_server(tmp_path: Path):
+    """The stale-evidence direction: the lock file outlives the server (it is a
+    file), the LOCK does not (the kernel drops it when the process dies, `kill
+    -9` included). A restore after a crash must not be blocked by leftovers."""
     root = _store(tmp_path)
-    _fake_os(monkeypatch, ps=f" 4242 {UVICORN}\n", cwd=None)
-    assert util.live_server(root) is not None
+    util.hold_store_lock(root).release()
+    assert (root / util.STORE_LOCK_NAME).is_file()
+    assert util.live_server(root) is None
 
 
-def test_import_refuses_the_uvicorn_launch_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """The whole point: B5's exact scenario now refuses, with a fix that works
-    for a server `odin stop` cannot help with."""
+def test_an_unlockable_store_does_not_block_a_restore(tmp_path: Path):
+    """The fail-open rule, at the one place the OS's answer is interpreted.
+    v0.7.1 shelled out to `lsof` and treated "no lsof" as "assume it's ours",
+    so a machine without lsof could not restore at all. Nothing shells out now,
+    and anything short of a definite EWOULDBLOCK answers "nothing was proven"."""
+    fd = os.open(tmp_path, os.O_RDONLY)
+    os.close(fd)
+    assert util._flock(fd) is True  # EBADF -- unknowable, so never a refusal
+
+
+def test_import_refuses_the_uvicorn_launch_path(
+    tmp_path: Path, held_lock, monkeypatch: pytest.MonkeyPatch
+):
+    """B5's exact scenario still refuses, with a fix `odin stop` cannot give --
+    and the pid it names is the one the KERNEL says holds the store."""
+    monkeypatch.setattr(backup, "SHUTDOWN_GRACE", 0.5)  # a server that stays is not worth 20s here
     root = _store(tmp_path)
     archive = tmp_path / "e.tar.gz"
-    _fake_os(monkeypatch, ps="", cwd=None)
     export_env(root, "e", archive)
 
-    _fake_os(monkeypatch, ps=f" 4242 {UVICORN}\n", cwd=str(tmp_path))
+    held_lock(root)
     with pytest.raises(BackupError) as exc:
         import_archive(archive, root, env="restored")
     message = str(exc.value)
-    assert "4242" in message and "kill 4242" in message  # a fix `odin stop` can't give
+    assert f"kill {os.getpid()}" in message and "--ignore-live-server" in message
     assert not (root / "restored").exists()
+
+
+def test_import_waits_out_a_server_that_is_shutting_down(tmp_path: Path):
+    """The timing trap the field hit: uvicorn with the reconciler in its
+    lifespan takes >6s to let go, so `odin stop; sleep 6; odin import` legitimately
+    still saw the old server and the refusal "felt arbitrary". A restore now
+    waits for the store to be released instead of refusing on a stopwatch."""
+    root = _store(tmp_path)
+    archive = tmp_path / "e.tar.gz"
+    export_env(root, "e", archive)
+
+    lock = util.hold_store_lock(root)
+    threading.Timer(1.0, lock.release).start()
+    waited: list[util.LiveServer] = []
+    started = time.monotonic()
+    result = import_archive(archive, root, env="restored", on_wait=waited.append)
+    assert result.env == "restored" and (root / "restored" / "HEAD").is_file()
+    assert waited, "the caller is told it is waiting, never a silent stall"
+    assert 0.5 < time.monotonic() - started < util.SHUTDOWN_GRACE
+
+
+def test_ignore_live_server_is_the_escape_hatch(tmp_path: Path, held_lock):
+    """Whatever else this guard gets wrong, it must never be the last word on
+    someone's restore."""
+    root = _store(tmp_path)
+    archive = tmp_path / "e.tar.gz"
+    export_env(root, "e", archive)
+    held_lock(root)
+    result = import_archive(archive, root, env="restored", ignore_live_server=True)
+    assert (root / "restored" / "HEAD").read_text() == "rev" and result.env == "restored"
