@@ -593,6 +593,67 @@ def test_run_instances_without_a_subnet_gets_no_nebula_join(sink, ec2, stores):
     assert nebula is None
 
 
+# --- ensure_instance_mesh: an SG EDIT reaching an already-running VM --------
+
+
+class RefreshingInstanceVm(FakeInstanceVm):
+    """Records what `ensure_instance_mesh` asked each VM to adopt."""
+
+    def __init__(self, ip: str = "192.168.64.10") -> None:
+        super().__init__(ip=ip)
+        self.refreshed: list[tuple] = []
+
+    def refresh_nebula(self, name, nebula):
+        self.refreshed.append((name, nebula))
+        return "reloaded"
+
+
+def test_ensure_instance_mesh_pushes_the_current_rules_into_a_running_vm(sink, ec2, stores):
+    """Field test 2 HIGH-1: `web-sg` gains `tcp:8080` AFTER the VM is up.
+    The gateway recorded it and a VM created later got it, but the running one
+    never did -- one drawn group, two firewalls on the wire. An Apply must
+    hand the running VM its CURRENT compiled union."""
+    vpc_id = _create_vpc(stores, sink, ec2)
+    subnet_id = _create_subnet(stores, sink, ec2, vpc_id)
+    web_sg = _create_sg(stores, sink, ec2, vpc_id, name="web-sg")
+    _authorize(stores, sink, ec2, web_sg, 22)
+
+    vm = RefreshingInstanceVm()
+    parsed = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, SecurityGroupIds=[web_sg])
+    instance_id = parsed["Instances"][0]["InstanceId"]
+    _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+    booted_ports = {(r.port, r.proto) for r in vm.booted[0][4].firewall.inbound}
+    assert booted_ports == {("22", "tcp")}
+
+    _authorize(stores, sink, ec2, web_sg, 8080)  # the canvas edit
+    actions = ec2compute.ensure_instance_mesh(stores, ENV, vm)
+
+    ((name, nebula),) = vm.refreshed
+    assert name == f"odin-ec2-{ENV}-{instance_id}"
+    assert {(r.port, r.proto) for r in nebula.firewall.inbound} == {("22", "tcp"), ("8080", "tcp")}
+    assert nebula.groups == (web_sg,) and nebula.host_id == instance_id
+    assert actions == {name: "reloaded"}
+
+
+def test_ensure_instance_mesh_skips_instances_with_no_running_vm_to_talk_to(sink, ec2, stores):
+    """A stopped instance has no daemon to signal, and an instance with no VPC
+    was never on a mesh at all -- neither is a candidate."""
+    vpc_id = _create_vpc(stores, sink, ec2)
+    subnet_id = _create_subnet(stores, sink, ec2, vpc_id)
+    vm = RefreshingInstanceVm()
+    parsed = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)
+    instance_id = parsed["Instances"][0]["InstanceId"]
+    _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+    _run_instance(stores, sink, ec2, vm)  # no subnet => no VPC => no mesh
+
+    req = sink.call(lambda: ec2.stop_instances(InstanceIds=[instance_id]))
+    assert _answer(stores, req, vm).status_code == 200
+    _wait_for_state(stores, sink, ec2, instance_id, "stopped", vm)
+
+    assert ec2compute.ensure_instance_mesh(stores, ENV, vm) == {}
+    assert vm.refreshed == []
+
+
 def test_terminate_last_vpc_instance_stops_the_lighthouse(sink, ec2, stores, monkeypatch):
     stopped = []
 

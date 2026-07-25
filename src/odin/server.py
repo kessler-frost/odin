@@ -525,6 +525,13 @@ def create_apply_full_router(
         # nebula reads its firewall at startup. Also heals a sidecar that was
         # killed under a still-running database. See rdsctl.ensure_db_mesh.
         rdsctl.ensure_db_mesh(stores, env)
+        # ...and the same push for every RUNNING EC2 VM (field test 2 HIGH-1).
+        # An SG edit reached the gateway and the newly-created VMs but never
+        # the already-running ones, so one drawn group enforced two different
+        # firewalls on the wire. Idempotent and cheap: an instance whose
+        # compiled rules are unchanged is one local file comparison -- no
+        # `limactl`, no signal. See ec2compute.ensure_instance_mesh.
+        await asyncio.to_thread(ec2compute.ensure_instance_mesh, stores, env)
         await reconciler.tick()  # kick an immediate pass; the loop continues it
         return JSONResponse(status_code=200, content=body)
 

@@ -276,6 +276,26 @@ future decision against these points instead of re-deriving them:
       difference is their drawn SG: one port allowed, the same port refused
       on the other, and a third port allowed in the refusing direction to
       rule out a dead tunnel (`tests/simulate/test_ec2_assigned_sg_e2e.py`).
+      - **Editing a group's RULES reaches instances that are already
+        running** — this used to be false, and silently so (field test 2
+        HIGH-1: Apply said `applied`, the gateway had the new rule, and the
+        running VM kept its boot-time firewall forever, so two VMs in one
+        drawn group enforced different rules on the wire). Every Apply now
+        re-renders each running instance's nebula config and, when it really
+        changed, pushes it and makes the daemon adopt it: a **SIGHUP** for a
+        firewall-only edit — nebula reloads firewall rules in place, so live
+        tunnels are never dropped — and a restart for anything a reload
+        cannot cover (only a moved lighthouse port does that, and there the
+        tunnel is already dead). Unchanged rules cost one local file
+        comparison: no `limactl`, no signal. Proven on two real VMs with the
+        previously-blocked port probed before and after on the SAME instance,
+        `NRestarts=0` and an unchanged `ActiveEnterTimestamp` across the edit
+        (`tests/simulate/test_sg_edit_propagation_e2e.py`).
+      - **Moving an instance BETWEEN groups still needs a recreate.** An
+        instance's group MEMBERSHIP is baked into its nebula certificate at
+        first join, and changing it means re-signing and re-distributing that
+        cert. Rule edits propagate; membership edits do not — the same limit
+        `fabric/sidecar.py` records for backings.
     - **RDS**: the Postgres container is a REAL mesh member (a nebula
       companion container shares its network namespace, so the stock upstream
       image answers on an overlay IP), gated by the SG its canvas node names
@@ -312,6 +332,11 @@ future decision against these points instead of re-deriving them:
       `lighthouse_port`, embedded in every member's `static_host_map`), skips
       ports other envs in the store hold, and moves itself if the recorded one
       has since been taken. `ODIN_LIGHTHOUSE_PORT` pins it. Still rootless.
+      A move reaches every member: sidecars re-join on the changed config, and
+      already-running VMs are pushed the new `static_host_map` and RESTARTED
+      by the same Apply-time refresh the SG-edit fix added (a restart, not a
+      SIGHUP, because nebula does not reload that section — and a member whose
+      lighthouse moved has no working tunnel to lose).
     - **EC2 nodes publish addresses too** (they published nothing before):
       `${{web1.PRIVATE_IP}}` (host-reachable, ungated) and
       `${{web1.MESH_IP}}` (the SG-gated overlay address, sticky across
