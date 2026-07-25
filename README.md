@@ -15,28 +15,11 @@ direction this is built toward.
 
 ![Odin — a VPC/Subnet/EC2 stack, an SG, S3/SQS/SNS/DynamoDB/RDS, a Lambda, an ECS service, an IAM role and an ECR repo, drawn on the canvas with an IAM permission edge (EC2 → S3, GetObject/PutObject/ListBucket)](assets/odin-canvas.png)
 
-## Requirements
-
-- **macOS with [Homebrew](https://brew.sh)** — the install script assumes it
-- Python 3.12+ and [uv](https://github.com/astral-sh/uv)
-- [Colima](https://github.com/abiosoft/colima) for the container runtime
-- **The `docker` CLI.** Colima does not bring one: `brew deps colima` is just
-  `lima`, and `docker` is a separate formula. Everything in odin shells out to
-  it, so install it alongside colima.
-- [OpenTofu](https://opentofu.org/) on your `PATH` (Apply shells out to it)
-- [Lima](https://lima-vm.io/) (`limactl`) — needed for any canvas with an
-  **EC2** node, since each one is a real Lima VM, and for running containers
-  inside a VM instead of on Colima directly. Nothing else needs it.
-- [bun](https://bun.sh/) — only if you're building the UI from a clone; the
-  released package ships a pre-built UI
-
-`odin doctor` checks every one of these and prints the exact command to fix
-whatever is missing.
-
 ## Install
 
-One command, if you have Homebrew. It installs colima/docker/opentofu/uv/lima,
-starts colima, installs odin, and runs `odin doctor`:
+macOS with [Homebrew](https://brew.sh). One command: it installs
+colima/docker/opentofu/uv/lima, starts colima, installs odin, and runs
+`odin doctor`.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kessler-frost/odin/main/scripts/install.sh | sh
@@ -55,6 +38,26 @@ odin's own built images and its `~/.cache/odin` OpenTofu plugin cache
 `--dry-run` shows everything it would remove; `--all-envs` widens the container
 sweep from this project's envs to every odin container on the machine;
 `--images` also removes the third-party backing images odin pulled.
+
+### What it needs
+
+The script installs all of this for you; the list is here for anyone doing it
+by hand. `odin doctor` checks every entry and prints the exact command to fix
+whatever is missing.
+
+| | |
+| --- | --- |
+| Python 3.12+ and [uv](https://github.com/astral-sh/uv) | odin itself |
+| [Colima](https://github.com/abiosoft/colima) | the container runtime |
+| the `docker` CLI | **a separate formula.** `brew deps colima` is just `lima`, so colima alone leaves you without one, and everything in odin shells out to it |
+| [OpenTofu](https://opentofu.org/) | Apply runs `tofu` |
+| [Lima](https://lima-vm.io/) (`limactl`) | only for a canvas with an **EC2** node, since each one is a real Lima VM, or to run containers inside a VM instead of on Colima directly |
+| [bun](https://bun.sh/) | only to build the UI from a clone; the released package ships one prebuilt |
+
+If your first canvas will have a DynamoDB table on it, `odin doctor --prebake`
+builds the [dynalite](https://github.com/mhart/dynalite) image now (a one-time
+`npm install` inside a container) instead of making your first Apply wait for
+it. Everything else odin needs is a public image it pulls on demand.
 
 ### The three install paths share one `odin` command
 
@@ -88,14 +91,17 @@ curl -fsSL .../scripts/install.sh | sh -s -- --force
 odin start            # build the UI (first run) and serve on http://localhost:4200, in the background
 odin start --dev      # Vite HMR + uvicorn --reload; runs in the FOREGROUND (Ctrl+C to stop)
 odin stop             # stop a background `odin start`
-odin status           # is it running?
+odin status           # is it running? exit 0 if yes, 1 if no
 odin clean            # remove test artifacts/logs (--all wipes .odin/ entirely)
 ```
 
 Two things worth knowing before you hit `--dev`: it doesn't background itself
-like plain `start` does — it stays attached to your terminal. And `-p/--port`
+like plain `start` does, it stays attached to your terminal. And `-p/--port`
 in `--dev` mode only repositions the Vite frontend; the backend always binds
 `:4201` there. Plain `start` has no such split.
+
+A second `odin start` while one is already up starts nothing and does not
+adopt a new `--port`/`--host`; stop it first if you want to change them.
 
 Once it's up: draw something from the sidebar, click **Apply**, watch the
 Events tab stream the `tofu apply` output and the node badges go `healthy`.
@@ -121,9 +127,8 @@ There is one button. Draw nodes, wire edges, click **Apply**:
   a real [AWS RIE](https://github.com/aws/aws-lambda-runtime-interface-emulator)
   container, ECR → a [`registry:2`](https://github.com/distribution/distribution)
   container, RDS → a real Postgres container). Every drawable kind is on
-  Terraform now; anything a canvas asks for that odin can't stand behind (a
-  MySQL engine, say) is listed in the code panel with the reason instead of
-  being dropped.
+  Terraform now. Anything a canvas asks for that odin can't stand behind, a
+  MySQL engine say, is listed in the code panel with the reason.
 - Every workload node (EC2, ECS, Lambda) is issued its own AWS keypair and
   gets it automatically — baked into EC2's cloud-init, injected into each ECS
   task's and Lambda's container environment. It only has whatever permissions
@@ -169,9 +174,8 @@ EC2 inside a Subnet inside a VPC — nesting is spatial, not a special
 connector; drag a node's corner into a container and it belongs to it).
 Storage/data: S3, DynamoDB, RDS. Messaging: SQS, SNS. Identity/registry: IAM
 Role, ECR. Everything else in the sidebar is drawable but not yet backed by
-Terraform generation — Apply reports those as unsupported instead of
-pretending they applied. The v1 limits of each kind are listed under
-[Known limits](#known-limits) below.
+Terraform generation; Apply reports those as unsupported. The v1 limits of
+each kind are listed under [Known limits](#known-limits) below.
 
 ## "What's wrong here?"
 
@@ -197,7 +201,7 @@ What it needs and what it can't do:
 
 - It requires the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python)
   — the `claude` CLI on your `PATH`, signed in. Without it the answer is
-  literally `agent unavailable` and the panel says so. Nothing else in odin
+  `agent unavailable`, and the panel says so. Nothing else in odin
   needs it; `ODIN_DEBUG_AGENT=0` turns the feature off outright, and
   `ODIN_DEBUG_TIMEOUT` (default 90s) bounds the call.
 - Secrets never reach the model: env-var **values** are reduced to key names,
@@ -212,35 +216,40 @@ What it needs and what it can't do:
 
 ## The CLI is the same product
 
-Everything the canvas does is drivable from a terminal — which also means
-an agent (Claude Code, or anything that can run commands) can operate odin
+Everything the canvas does is drivable from a terminal, which also means an
+agent — Claude Code, or anything that can run commands — can operate odin
 directly. All commands take `--url`/`ODIN_URL` (default `localhost:4200`)
 and `-o json` for machine-readable output.
 
 ```bash
-odin canvas get                     # the drawn canvas, as JSON on stdout
-odin canvas set my-canvas.json      # replace it (or pipe: ... | odin canvas set -)
-odin translate                      # print the Terraform the SAVED canvas becomes
-odin translate --file draft.json    # ...or an unsaved canvas file
-odin apply --env dev                # the Apply button, as a command
-odin world --env dev                # live resource phases
-odin events --env dev               # the event stream, one JSON line each
-odin tf plan --env dev              # drift check — the SAFE way to plan
-odin tf status --env dev            # tofu-side state
-odin destroy --env dev              # full teardown (tofu half included)
-odin import-tf existing.tf          # TF -> canvas JSON (pipe into canvas set -)
-odin export --env dev               # back an env's state up to a tar.gz
-odin import odin-dev-export.tar.gz  # restore it (works with odin down)
-odin doctor                         # toolchain health, with exact fixes
-odin --version                      # which odin this is
+odin canvas get                          # the drawn canvas, as JSON on stdout
+odin canvas set my-canvas.json           # replace it (or pipe: ... | odin canvas set -)
+odin translate                           # print the Terraform the SAVED canvas becomes
+odin translate --file draft.json         # ...or an unsaved canvas file
+odin apply                               # the Apply button, as a command
+odin world                               # live resource phases
+odin events                              # the event stream, one JSON line each
+odin logs my-service                     # real logs off a node's container or VM
+odin tf plan                             # drift check — the SAFE way to plan
+odin tf status                           # tofu-side state
+odin destroy                             # full teardown (tofu half included)
+odin import-tf existing.tf               # TF -> canvas JSON (pipe into canvas set -)
+odin export                              # back this env's state up to a tar.gz
+odin import odin-default-export.tar.gz   # restore it (works with odin down)
+odin envs                                # every env that has had something applied
+odin doctor                              # toolchain health, with exact fixes
+odin --version                           # which odin this is
 ```
 
-**The CLI and the canvas pick environments separately.** These examples use
-`--env dev`; the browser UI starts on `default` and remembers whatever you last
-typed in its top-bar selector. Apply from the CLI to `dev`, open the canvas on
-`default`, and every node reads `DRAFT` with nothing running — the resources are
-real, you're just looking at a different environment. Type the same env name
-into the top bar and the badges flip to `healthy` with live facts.
+**Environments.** Every command above that touches one takes `--env`, and it
+defaults to `default` — the same env the browser opens on, so these commands
+and the canvas in front of you are looking at the same place. Work somewhere
+else by passing `--env staging` *and* typing `staging` into the top-bar
+selector. Getting those two out of step is the most convincing way to make
+odin look broken: apply from the CLI to one env, watch the canvas on another,
+and every node reads `DRAFT` with nothing running while the resources are up
+and healthy in the env you actually applied to. `odin envs` lists the ones
+that exist.
 
 A round-trip an agent might run:
 
@@ -248,7 +257,7 @@ A round-trip an agent might run:
 odin canvas get \
   | jq '.nodes += [{"id":"x1","type":"s3","position":{"x":80,"y":80},"data":{"label":"backups"}}]' \
   | odin canvas set -
-odin apply --env dev
+odin apply
 ```
 
 ### The canvas JSON schema
@@ -298,16 +307,27 @@ treated as `iam`.
 ### Exit codes, and the one thing they don't carry
 
 Exit codes are the contract: `0` success, `1` a refusal or a real failure, `2`
-a usage/format error (or an unreachable server). The one deliberate exception
-is `odin tf plan`, which mirrors `tofu plan -detailed-exitcode` — see
-[Checking for drift](#checking-for-drift--and-why-not-to-run-tofu-by-hand).
+a usage/format error (or an unreachable server). Two commands answer a
+question rather than perform an action, and there the code *is* the answer:
+
+| command | `0` | non-zero |
+| ------- | --- | -------- |
+| `odin status` | odin is running | `1` — odin is not running |
+| `odin tf plan` | no changes | `2` changes, `1` error/refusal, `3` server unreachable ([why](#checking-for-drift--and-why-not-to-run-tofu-by-hand)) |
+
+`odin stop` is the deliberate mirror image of `status`: nothing running is
+exit `0`, because "odin is down" is the end state it was asked for. Its one
+non-zero case is a server it can see but cannot signal, where odin is still
+up. `odin start` against an already-running odin is likewise exit `0` — the
+state you asked for holds — but it starts nothing, so a `--port`/`--host`
+you passed is not in effect and it says so.
 
 A node odin didn't act on does **not** make Apply exit nonzero, so a CI gate
 has to read the payload. There is one field for it:
 
 ```bash
-odin apply --env dev -o json | jq -e '.not_covered | length == 0'
-odin tf plan --env dev -o json | jq -e '.not_covered | length == 0'
+odin apply -o json | jq -e '.not_covered | length == 0'
+odin tf plan -o json | jq -e '.not_covered | length == 0'
 ```
 
 `not_covered` is the union of two things that are easy to confuse and equally
@@ -332,8 +352,9 @@ account. (A field engineer did exactly this and got a genuine
 same credentials as Apply, and it changes nothing:
 
 ```bash
-odin tf plan --env dev              # human-readable
-odin tf plan --env dev -o json      # for a pipeline
+odin tf plan                # human-readable
+odin tf plan -o json        # for a pipeline
+odin tf plan --env staging  # any env you like; default is `default`
 ```
 
 Its exit codes mirror `tofu plan -detailed-exitcode`, so a CI drift gate is
@@ -359,12 +380,13 @@ startup reaper run, seeing no envs, deletes every odin VM. So take a
 snapshot:
 
 ```bash
-odin export --env dev                       # -> odin-dev-export.tar.gz
-odin export --env dev -o ~/backups/dev.tgz  # or wherever you want it
+odin export                                    # -> odin-default-export.tar.gz
+odin export -o ~/backups/default.tgz           # or wherever you want it
+odin export --env staging                      # -> odin-staging-export.tar.gz
 
-odin stop                                   # restore is a server-down operation
-odin import odin-dev-export.tar.gz          # back into env `dev`
-odin import odin-dev-export.tar.gz --env dev2   # or alongside, under a new name
+odin stop                                      # restore is a server-down operation
+odin import odin-default-export.tar.gz         # back into the env it came from
+odin import odin-default-export.tar.gz --env scratch  # or alongside, under a new name
 ```
 
 Both commands work directly on the filesystem — no server, no HTTP — because
@@ -460,8 +482,8 @@ it anywhere else won't preserve that. See [SECURITY.md](SECURITY.md#secrets).
 - **ECS**: `network_configuration` (awsvpc/Fargate-style ENIs) isn't modeled —
   odin's tasks run `launch_type = "EC2"` / `network_mode = "bridge"`, which
   needs none; a task that dies between API calls isn't auto-replaced until
-  the next Apply reconciles the service; a `tags` block on the service can
-  show as drift on a subsequent `tofu plan` (tags aren't echoed back yet).
+  the next mutating call or Apply reconciles the service, since nothing
+  watches for a spontaneous crash in between.
   A **failed image update keeps your old tasks serving** — odin honors
   `deployment_minimum_healthy_percent = 100`, launching replacements before
   retiring anything, so a typo'd tag costs zero downtime (measured: 3 tasks
@@ -469,27 +491,36 @@ it anywhere else won't preserve that. See [SECURITY.md](SECURITY.md#secrets).
   the apply still exits non-zero. The node then reads **`error`**, not
   `healthy` — "2 tasks serving the previous revision; deployment of
   `<image>` failed" — because a service running the *old* code is not the
-  service you asked for. Caveat: `/world` doesn't refresh at all while an
-  apply is running (~60s), so you see this once the apply returns, not during.
-- **SNS→SQS subscriptions**: adding the edge to an *already-healthy* topic
-  doesn't retroactively re-provision the subscription — remove and re-add the
-  topic (or its edge) to force it. Fixed on create; the live-edit path is a
-  known gap. Every subscription odin generates also sets
-  `raw_message_delivery = true` — the queue gets the published body verbatim,
-  not SNS's JSON envelope — including on an import round trip where your `.tf`
-  didn't have it. It's deliberate (odin's own SQS/SNS substitute is subscribed
-  the same way, so `tofu apply` and Apply deliver identically), but it changes
-  what a consumer reads.
+  service you asked for. You see that flip *while* the apply is still
+  running, a few seconds in: an apply suspends the reconciler's actions but
+  not its observation, so `/world` and the badges keep updating throughout
+  (measured at ~3–4s into a ~62s failed apply; through v0.7.2 the same
+  reading was frozen until the apply returned).
+  One operational trap: removing a local image tag — `docker system prune`,
+  or a manual `docker rmi` — next to a live ECS service leaves the service
+  serving happily but un-appliable, because re-applying even the *exact*
+  image those tasks are already running can no longer resolve the tag, and
+  each attempt burns the full ~60s deployment timeout first. The verdict
+  names the missing image; restoring the tag fixes it immediately.
+- **SNS→SQS subscriptions**: every subscription odin generates sets
+  `raw_message_delivery = true`, so the queue gets the published body
+  verbatim, not SNS's JSON envelope — including on an import round trip where
+  your `.tf` didn't have it. It's deliberate (odin's own SQS/SNS substitute is
+  subscribed the same way, so `tofu apply` and Apply deliver identically), but
+  it changes what a consumer reads.
 - **Importing Terraform**: `odin import-tf` takes a file or a whole directory
-  (every `*.tf` in it becomes one canvas). Every argument odin doesn't model is
-  named on stderr rather than dropped, and a few are re-emitted with
-  odin's own value (`internal`, `force_destroy`, `skip_final_snapshot`,
-  `recovery_window_in_days`) — those warn too when your value differs. Every
-  resource also gains an `odin:node` tag, so a byte-identical round trip is
-  impossible by design.
+  (every `*.tf` in it becomes one canvas). Every argument odin doesn't model
+  is named on stderr, and a handful of others are re-emitted with odin's own
+  value whatever you wrote — `internal` on an ALB, an ALB's
+  `load_balancer_type`, a target group's `protocol`/`target_type`, a
+  listener's `protocol`, `force_destroy` on a bucket, `skip_final_snapshot`
+  and `recovery_window_in_days`. The ones odin still models a field for warn
+  when your value differs; the rest are silent by design. Every resource also
+  gains an `odin:node` tag, so a byte-identical round trip is impossible by
+  design.
 - **RDS** is Terraform-managed (`aws_db_instance` → a real Postgres
-  container), but Postgres-only: choosing MySQL or MariaDB is declined with
-  a reason rather than quietly given a Postgres. `allocated_storage` and
+  container), but Postgres-only: choosing MySQL or MariaDB is declined, with
+  the reason. `allocated_storage` and
   `instance_class` round-trip faithfully but resize nothing, there are no
   snapshots, and a node's name must be a valid RDS identifier (lowercase,
   hyphen-separated).
@@ -511,17 +542,17 @@ it anywhere else won't preserve that. See [SECURITY.md](SECURITY.md#secrets).
   at `${{db.DATABASE_URL_MESH}}`; `_VM` is kept for envs with no VPC and for
   existing canvases, not because it is the safe default. Same for
   `REDIS_URL_VM` — ElastiCache has no mesh fact yet, so a cache has no gated
-  path at all. odin verifies a mesh address before publishing it: if the
-  overlay path is down the fact is withheld and the node reports `crashed`
-  with the reason, instead of advertising an endpoint nothing answers on.
+  path at all. A mesh address is verified before it is published: if the
+  overlay path is down, the fact is withheld and the node reports `crashed`
+  with the reason.
 
 ## Security
 
-Odin has no authentication of its own — the control app binds to
-`127.0.0.1` by default, and applying a canvas runs whatever's on it for
-real (container images, EC2 user-data as root, Lambda code). That's the
-point of the tool, not a bug, but it means a canvas from someone else
-should be treated like a shell script you're about to run.
+Odin has no authentication of its own. The control app binds to `127.0.0.1`
+by default, and applying a canvas runs whatever is on it for real: container
+images, EC2 user-data as root, Lambda code. That is what the tool is for, and
+it means a canvas from someone else should be treated like a shell script you
+are about to run.
 
 A canvas secret (an RDS `password`, a `secret` or `ssm` node's value) is
 stored and used in cleartext, in more than one file: the canvas, every Stack
@@ -534,31 +565,30 @@ vulnerability.
 
 ## Verification
 
-The claims above are exercised end to end by the test suite —
-`tests/gateway/test_gateway_e2e.py`, `tests/simulate/test_*_tf_e2e.py`,
-`tests/test_file_modes.py` — which runs against real containers, a real
-gateway and a real `tofu`, not mocks.
+What is checked on every commit: 1831 unit tests, `ruff`, and a UI typecheck
+plus build. What is checked on demand, because it needs a machine with Colima
+on it: the integration suite, which drives real containers, a real gateway and
+a real `tofu` rather than mocks — `tests/gateway/test_gateway_e2e.py`,
+`tests/simulate/test_*_tf_e2e.py`, `tests/test_file_modes.py`.
 
-The 0.4.0 release was additionally checked by hand against a live instance:
-the full canvas in the screenshot applied end-to-end (`tofu apply` exit 0,
-every resource — including the ones Terraform owns — landing in `/world` as
-`healthy`), real containers confirmed with `docker ps` (`odin-lambda-*`
-running the actual `public.ecr.aws/lambda/python:3.12` image, two `odin-ecs-*`
-task containers for a task-count-2 service, a real `postgres:16-alpine` for
-RDS, the RustFS/goaws/dynalite/registry:2 backings), the IAM deny-check above
-run against the live gateway, and a full teardown that destroyed all 14
-Terraform resources (down to a real 45-second SQS purge-then-delete wait) and
-left `docker ps` empty. Environment isolation was checked with a second env
-applying and tearing down its own S3 bucket independently.
+```bash
+uv run pytest                  # unit
+uv run pytest -m integration   # real containers, slow
+```
 
-Releases since then have been checked the same way, one subsystem at a time,
-rather than as a single full-stack pass — so treat the hand-verified list as
-0.4.0's, and the test suite as the current one.
+Beyond the suite, each release is exercised by hand against a live instance,
+one subsystem at a time — the numbers quoted in [Known
+limits](#known-limits) (a 62-second failed ECS apply serving 3 tasks
+throughout, a 45-second SQS purge-then-delete) come from those runs. The last
+single pass over the *whole* stack at once — the full canvas in the
+screenshot applied, every resource `healthy`, the IAM deny-check above run
+against the live gateway, then a teardown that destroyed all 14 Terraform
+resources and left `docker ps` empty — was 0.4.0's. Treat the suite as the
+current guarantee.
 
 ## Acknowledgements
 
-Odin stands on the shoulders of open source giants — most of what makes it work is
-other people's excellent work, and a lot of the thanks belongs to them:
+Most of what makes odin work is other people's excellent work:
 
 - **[OpenTofu](https://opentofu.org/)** + the [Terraform AWS provider](https://github.com/hashicorp/terraform-provider-aws) — the apply engine odin's gateway sits behind
 - **[Colima](https://github.com/abiosoft/colima)** + **[Lima](https://lima-vm.io/)** — containers and VMs on the Mac
@@ -571,7 +601,9 @@ other people's excellent work, and a lot of the thanks belongs to them:
 - **[FastAPI](https://fastapi.tiangolo.com/)**, **[Pydantic](https://pydantic.dev/)**, **[boto3](https://github.com/boto/boto3)**, **[python-hcl2](https://github.com/amplify-education/python-hcl2)** — the backend
 - **[React](https://react.dev/)** + **[React Flow](https://reactflow.dev/)** + **[Tailwind CSS](https://tailwindcss.com/)** + **[Vite](https://vitejs.dev/)** — the canvas UI
 - **[uv](https://github.com/astral-sh/uv)** + **[bun](https://bun.sh/)** — the toolchain
+- **[Inter](https://github.com/rsms/inter)** + **[JetBrains Mono](https://github.com/JetBrains/JetBrainsMono)** — the two typefaces, bundled into the UI build so the canvas loads with no external request
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE).
+Apache License 2.0. See [LICENSE](LICENSE). The fonts odin redistributes in
+its UI build are SIL Open Font License 1.1; [NOTICE](NOTICE) records them.
