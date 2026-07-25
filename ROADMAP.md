@@ -155,6 +155,40 @@ future decision against these points instead of re-deriving them:
     SG-rule-filtered connection — the host itself has no overlay presence
     to test from. Cross-Mac reachability (a second machine's mesh) is still
     open — see M7.
+- [x] **CloudWatch Logs — the log sink (W2.1).** DONE 2026-07-24: the `logs`
+  node is real. `aws_cloudwatch_log_group` is a full gateway model
+  (Create/Delete/DescribeLogGroups, Put/DeleteRetentionPolicy, tag CRUD →
+  zero-drift plans) plus the DATA plane (CreateLogStream, PutLogEvents,
+  GetLogEvents, FilterLogEvents, DescribeLogStreams), and the substrates ship
+  their real output INTO it: a Lambda invoke's RIE container tail →
+  `/aws/lambda/{fn}`, ECS task containers → `/ecs/{service}` on every sweep.
+  So `odin logs <node>` (and `odin logs --group /aws/lambda/foo`) reads ONE
+  place regardless of kind, and an IAM edge drawn to a log group is what lets
+  a workload read its own lines (proven end-to-end: the function's own creds
+  read the line it printed; a principal with no edge gets a real
+  AccessDenied).
+
+  **v1 limits, recorded rather than hidden:**
+  - Storage is a per-env JSON sidecar (`.odin/{env}/gateway/logsctl.json`),
+    dev-scale by design: each group keeps at most 10 000 events in a ring
+    buffer (appending past the cap drops the OLDEST events, never the
+    newest). A real backing store lands only if volume demands it.
+  - `filterPattern` is a plain SUBSTRING match; CloudWatch's full
+    filter-pattern grammar (JSON selectors, space-delimited field positions,
+    term composition) is not modeled — an unmodeled construct simply doesn't
+    match rather than being reinterpreted.
+  - Substrate shipping is a bounded `docker logs --tail` read per
+    invoke/sweep, deduped by a per-stream line cursor: repeated sweeps never
+    duplicate a line, but a burst LARGER than that tail window loses its
+    oldest lines (no continuous log streaming daemon in v1).
+  - One stream per real container, named after it — not AWS's
+    `{date}/[$LATEST]{requestId}` convention.
+  - Metric filters, subscription filters, Logs Insights queries, export
+    tasks and `logGroupClass` variants beyond STANDARD are unsupported.
+  - Substrate ingestion auto-creates a missing group (like real Lambda), and
+    an explicit `CreateLogGroup` then ADOPTS that group instead of failing
+    `ResourceAlreadyExists` — a deliberate deviation so Apply always
+    converges after an invoke-before-you-drew-it.
 - **Recorded as UNSUPPORTED for now** (northstar directive 5's honesty rule):
   ALB/ELBv2, EKS, CloudFormation, autoscaling, and RDS-via-Terraform (rds
   nodes stay on the reconciler path until an RDS API model lands).
