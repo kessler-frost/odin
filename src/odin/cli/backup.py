@@ -67,8 +67,18 @@ def export_command(
     were in a bucket are not in the archive.
     """
     dest = out or Path(default_archive_name(env))
+    result = _run(lambda: export_env(ROOT, env, dest))
+    # The archive carries the env's issued gateway credentials and every canvas
+    # secret, in cleartext, in a file that's trivial to email. Say so where the
+    # user will actually see it -- on stderr, in both output modes, never
+    # polluting the JSON on stdout (same discipline as `odin keys issue`).
+    typer.echo(
+        f"note: {dest} contains this env's issued credentials and any canvas secrets "
+        "in cleartext -- treat it like a private key file.",
+        err=True,
+    )
     http.emit(
-        _run(lambda: export_env(ROOT, env, dest)), output,
+        result, output,
         lambda b: typer.echo(
             f"Exported env {b['env']!r} → {b['archive']} "
             f"({len(b['members'])} entries, {b['size'] / 1024:.1f} KiB)"

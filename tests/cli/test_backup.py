@@ -130,6 +130,20 @@ def test_export_honours_the_out_path_and_json_output(runner, tmp_path, monkeypat
     assert dest.is_file()
 
 
+def test_export_warns_that_the_archive_holds_credentials(runner, tmp_path, monkeypatch):
+    # The archive is a cleartext copy of keys.json + every canvas secret, in a
+    # file that's trivial to email. Warned on stderr in BOTH output modes, so
+    # `--output json`'s stdout stays pipeable.
+    monkeypatch.chdir(tmp_path)
+    _seed(tmp_path / ".odin")
+    for args in (["export", "--env", ENV], ["export", "--env", ENV, "--output", "json"]):
+        result = runner.invoke(app, args)
+        assert result.exit_code == 0, result.output
+        assert "private key file" in result.stderr
+        assert "credentials" in result.stderr
+    assert json.loads(runner.invoke(app, ["export", "--env", ENV, "--output", "json"]).stdout)
+
+
 def test_export_of_an_unknown_env_fails_with_the_known_ones(runner, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     _seed(tmp_path / ".odin")
