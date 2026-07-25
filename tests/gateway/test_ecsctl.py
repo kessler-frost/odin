@@ -783,3 +783,106 @@ def test_sweep_captures_the_final_lines_of_a_task_that_already_exited(sink, ecs,
 
     _describe_service(stores, sink, ecs, runtime)
     assert len(_shipped(stores)) == 1
+
+
+# --- W2.5: the service scheduler's load-balancer half ---------------------------
+# Real ECS (never terraform) registers a TASK with the target groups its service
+# names, and deregisters it when the task goes away. These tests pin the contract
+# ecsctl OWNS -- which target group, and which REAL published host port -- with
+# elbv2ctl's own side stubbed out, so no nginx container is involved. elbv2ctl's
+# half (upstream rendering, proxy reload) is tested in test_elbv2ctl.py.
+
+_TG_ARN = "arn:aws:elasticloadbalancing:us-east-1:000000000000:targetgroup/web-lb-tg/abc123"
+_LOAD_BALANCERS = [{"targetGroupArn": _TG_ARN, "containerName": "app", "containerPort": 80}]
+
+
+@pytest.fixture
+def target_calls(monkeypatch) -> dict[str, list[tuple]]:
+    calls: dict[str, list[tuple]] = {"register": [], "deregister": []}
+    monkeypatch.setattr(
+        ecsctl.elbv2ctl, "register_target",
+        lambda stores, env, arn, target_id, port: calls["register"].append((env, arn, target_id, port)),
+    )
+    monkeypatch.setattr(
+        ecsctl.elbv2ctl, "deregister_target",
+        lambda stores, env, arn, target_id, port: calls["deregister"].append((env, arn, target_id, port)),
+    )
+    return calls
+
+
+def _lb_service(sink, ecs, stores, desired: int = 1) -> FakeTaskRuntime:
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(stores, sink, ecs, runtime, desiredCount=desired, loadBalancers=_LOAD_BALANCERS)
+    _wait_for_running_count(stores, sink, ecs, runtime, desired)
+    return runtime
+
+
+def test_describe_services_echoes_the_load_balancers_it_was_created_with(sink, ecs, stores, target_calls):
+    """Hardcoding `loadBalancers: []` (this module's own first cut) drifts an
+    `aws_ecs_service` with a `load_balancer` block on every subsequent plan."""
+    runtime = _lb_service(sink, ecs, stores)
+    service = _describe_service(stores, sink, ecs, runtime)
+    assert service["loadBalancers"] == _LOAD_BALANCERS
+
+
+def test_launching_a_task_registers_its_real_published_port_as_a_target(sink, ecs, stores, target_calls):
+    _lb_service(sink, ecs, stores, desired=2)
+    # The FakeTaskRuntime publishes containerPort 80 on 10001 / 10002.
+    assert sorted(target_calls["register"]) == [
+        (ENV, _TG_ARN, CONTAINER_HOST, 10_001),
+        (ENV, _TG_ARN, CONTAINER_HOST, 10_002),
+    ]
+    assert target_calls["deregister"] == []
+
+
+def test_a_service_with_no_load_balancers_never_touches_elbv2(sink, ecs, stores, target_calls):
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(stores, sink, ecs, runtime, desiredCount=1)
+    _wait_for_running_count(stores, sink, ecs, runtime, 1)
+    assert target_calls == {"register": [], "deregister": []}
+
+
+def test_scaling_down_deregisters_the_stopped_task(sink, ecs, stores, target_calls):
+    runtime = _lb_service(sink, ecs, stores, desired=2)
+    req = sink.call(lambda: ecs.update_service(cluster="odin", service="app", desiredCount=1))
+    _parse("UpdateService", _answer(stores, req, runtime))
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and not target_calls["deregister"]:
+        time.sleep(0.02)
+    # Newest-task-first scale-down, so the SECOND task's port leaves rotation.
+    assert target_calls["deregister"] == [(ENV, _TG_ARN, CONTAINER_HOST, 10_002)]
+
+
+def test_deleting_the_service_deregisters_every_task(sink, ecs, stores, target_calls):
+    runtime = _lb_service(sink, ecs, stores, desired=2)
+    req = sink.call(lambda: ecs.delete_service(cluster="odin", service="app", force=True))
+    _parse("DeleteService", _answer(stores, req, runtime))
+    assert sorted(target_calls["deregister"]) == [
+        (ENV, _TG_ARN, CONTAINER_HOST, 10_001),
+        (ENV, _TG_ARN, CONTAINER_HOST, 10_002),
+    ]
+
+
+def test_a_task_that_dies_on_its_own_leaves_the_rotation(sink, ecs, stores, target_calls):
+    """A dead container left in the upstream list is a real load-balancer bug --
+    the sweep that demotes it to STOPPED must also take it out."""
+    runtime = _lb_service(sink, ecs, stores)
+    task_id = runtime.ran[0][1]
+    runtime.mark_exited(ENV, task_id, "app", exit_code=137)
+    service = _describe_service(stores, sink, ecs, runtime)
+    assert service["runningCount"] == 0
+    assert target_calls["deregister"] == [(ENV, _TG_ARN, CONTAINER_HOST, 10_001)]
+    # Only once -- a later sweep sees a task that's already STOPPED.
+    _describe_service(stores, sink, ecs, runtime)
+    assert len(target_calls["deregister"]) == 1
+
+
+def test_drift_marking_a_task_stopped_also_deregisters_it(sink, ecs, stores, target_calls):
+    runtime = _lb_service(sink, ecs, stores)
+    task_id = runtime.ran[0][1]
+    ecsctl.mark_task_stopped(stores, ENV, "odin", task_id, "container removed outside odin")
+    assert target_calls["deregister"] == [(ENV, _TG_ARN, CONTAINER_HOST, 10_001)]

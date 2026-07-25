@@ -37,7 +37,11 @@ of them). Per resource:
    DescribeTargetGroupAttributes, ModifyTargetGroupAttributes, ModifyTargetGroup,
    DescribeTags, AddTags/RemoveTags, DeleteTargetGroup.
  - `aws_lb_listener`: CreateListener, DescribeListeners, ModifyListener,
-   DescribeTags, AddTags/RemoveTags, DeleteListener.
+   **DescribeListenerAttributes** / ModifyListenerAttributes, DescribeTags,
+   AddTags/RemoveTags, DeleteListener. That bolded one is exactly the audit's
+   point: it appears in no obvious place in the resource's documentation, it is
+   called on EVERY listener read, and leaving it unmodeled failed the very first
+   real apply outright (see `_describe_listener_attributes`).
  - the data plane odin itself drives: RegisterTargets / DeregisterTargets /
    DescribeTargetHealth.
 
@@ -579,7 +583,14 @@ def _spawn(stores: SynthStores, env: str, lb_name: str, proxy: LoadBalancerProxy
 
 def _converge_target_group(stores: SynthStores, env: str, tg_name: str, proxy: LoadBalancerProxy, spawn: bool) -> None:
     """Re-converge every load balancer whose listener forwards to `tg_name` --
-    what a target change actually has to touch."""
+    what a target change actually has to touch.
+
+    `spawn=False` (the ECS task-launch path, already on its own thread) still
+    goes through `_converge_safely`, NOT bare `converge_proxy`: a real `docker
+    cp`/`docker run` failure there would otherwise propagate into
+    `ecsctl._launch_task`'s caller and kill that daemon thread outright, leaving
+    a RUNNING task nothing ever registers. Same "a silent hang is forbidden"
+    contract, one function."""
     tg = _tg(stores, env, tg_name)
     arn = (tg or {}).get("arn")
     lb_names = {
@@ -587,7 +598,7 @@ def _converge_target_group(stores: SynthStores, env: str, tg_name: str, proxy: L
         if any(a.get("TargetGroupArn") == arn for a in listener["default_actions"])
     }
     for lb_name in sorted(lb_names):
-        (_spawn if spawn else converge_proxy)(stores, env, lb_name, proxy)
+        (_spawn if spawn else _converge_safely)(stores, env, lb_name, proxy)
 
 
 # --- the internal registration API the ECS substrate uses (never the wire) --
@@ -928,6 +939,8 @@ def _create_listener(params: dict[str, str], env: str, stores: SynthStores, prox
         "port": int(params["Port"]) if params.get("Port", "").isdigit() else IDLE_LISTEN_PORT,
         "protocol": params.get("Protocol") or "HTTP",
         "default_actions": actions,
+        # Empty by design -- see `_describe_listener_attributes`.
+        "attributes": {},
     }
     stores.elbv2ctl.set(env, _listener_key(listener_id), record)
     _set_tags(stores, env, record["arn"], _tags(params))
@@ -972,6 +985,37 @@ def _modify_listener(params: dict[str, str], env: str, stores: SynthStores, prox
     response = _response("ModifyListener", _members("Listeners", [_listener_xml(updated)]))
     _spawn(stores, env, record["lb_name"], proxy)
     return response
+
+
+def _describe_listener_attributes(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
+    """FOUND EMPIRICALLY, not from the resource's documented surface: the first
+    real `tofu apply` through the real gateway failed at
+    `aws_lb_listener` create with "reading ELBv2 Listener attributes:
+    InvalidAction: DescribeListenerAttributes" -- terraform-provider-aws 5.100
+    calls this on EVERY listener read regardless of load-balancer type. Exactly
+    the class of unmodeled READ the W2.4 audit warned breaks every apply, which
+    is why the harness ran before this module was called finished.
+
+    The attribute set is EMPTY for an application HTTP listener, matching real
+    AWS: the only listener attribute AWS defines today
+    (`tcp.idle_timeout.seconds`) belongs to NETWORK load balancers, which v1
+    doesn't model at all -- so inventing a value here would be fiction, and the
+    provider only reads that key for an NLB listener anyway."""
+    arn = params.get("ListenerArn", "")
+    record = next((r for r in _all_listeners(stores, env) if r["arn"] == arn), None)
+    if record is None:
+        return _not_found("ListenerNotFound", f"Listener '{arn}' not found")
+    return _response("DescribeListenerAttributes", _attributes_xml(record.get("attributes") or {}))
+
+
+def _modify_listener_attributes(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
+    arn = params.get("ListenerArn", "")
+    record = next((r for r in _all_listeners(stores, env) if r["arn"] == arn), None)
+    if record is None:
+        return _not_found("ListenerNotFound", f"Listener '{arn}' not found")
+    attributes = {**(record.get("attributes") or {}), **_attribute_pairs(params)}
+    stores.elbv2ctl.set(env, _listener_key(record["listener_id"]), {**record, "attributes": attributes})
+    return _response("ModifyListenerAttributes", _attributes_xml(attributes))
 
 
 def _delete_listener(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
@@ -1100,6 +1144,8 @@ _HANDLERS: dict[str, _Handler] = {
     "CreateListener": _create_listener,
     "DescribeListeners": _describe_listeners,
     "ModifyListener": _modify_listener,
+    "DescribeListenerAttributes": _describe_listener_attributes,
+    "ModifyListenerAttributes": _modify_listener_attributes,
     "DeleteListener": _delete_listener,
     "RegisterTargets": _register_targets,
     "DeregisterTargets": _deregister_targets,

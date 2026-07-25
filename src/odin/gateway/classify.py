@@ -543,10 +543,20 @@ def _elbv2_name(value: str) -> str:
     return value
 
 
-# The id-carrying params, in order: a create call carries `Name`, everything
-# else carries one of these ARNs (or, for the ARN-only tag API, the first
-# `ResourceArns` entry).
-_ELBV2_ARN_PARAMS = ("LoadBalancerArn", "TargetGroupArn", "ListenerArn", "ResourceArns.member.1")
+# The id-carrying params, MOST SPECIFIC FIRST: a create call carries `Name`;
+# everything else carries one of these ARNs, in singular or `.member.1` list
+# form (the provider's own reads use the LIST spellings --
+# `DescribeLoadBalancers(LoadBalancerArns=[...])` etc.). Target-group params
+# precede load-balancer ones so a target-group read filtered BY a load balancer
+# (`DescribeTargetGroups(LoadBalancerArn=...)`) still reports the group it's
+# actually about. `ResourceArns.member.1` is last: it's the ARN-only tag API,
+# which never carries a typed id at all.
+_ELBV2_ARN_PARAMS = (
+    "TargetGroupArn", "TargetGroupArns.member.1",
+    "ListenerArn", "ListenerArns.member.1",
+    "LoadBalancerArn", "LoadBalancerArns.member.1",
+    "ResourceArns.member.1",
+)
 
 
 def _elbv2_resource(params: dict[str, str]) -> str:

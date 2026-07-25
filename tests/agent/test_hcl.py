@@ -6,8 +6,9 @@ import shutil
 import subprocess
 import zipfile
 
-from odin.agent.hcl import generate_tf, resource_attrs, resource_set, unquote
-from odin.spec.models import FieldValue, ResourceDesired, Stack
+
+from odin.agent.hcl import _ALB_NLB_UNSUPPORTED, generate_tf, resource_attrs, resource_set, unquote
+from odin.spec.models import Edge, FieldValue, ResourceDesired, Stack
 from odin.spec.translate import canvas_to_stack
 
 _FULL_CANVAS = {
@@ -929,6 +930,209 @@ def test_tofu_fmt_accepts_secret_and_ssm_output(tmp_path):
         ResourceDesired(id="bare", kind="secret"),
         ResourceDesired(id="/odin/api-key", kind="ssm", fields=_fields(paramType="SecureString", paramValue="abc")),
     ))
+    main_tf = tmp_path / "main.tf"
+    main_tf.write_text(generate_tf(stack).files["main.tf"])
+    result = subprocess.run([tofu, "fmt", "-check", "-diff", str(main_tf)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+# --- alb (W2.5) --------------------------------------------------------------
+#
+# ONE `alb` canvas node expands to THREE tf resources -- the primary `aws_lb`
+# plus a companion `aws_lb_target_group` and `aws_lb_listener`, built in their
+# own pass (the same one-canvas-node-to-N-tf-resources shape as an ecs task
+# definition or a secret's version). Containment is a SUBNET, like `_ec2`: the
+# subnet is what gives `aws_lb.subnets` a value and, transitively, the target
+# group its `vpc_id` (the canvas stamps BOTH `vpc` and `subnet` on a leaf drawn
+# inside a subnet box).
+
+
+def test_alb_in_a_subnet_expands_into_a_load_balancer_target_group_and_listener():
+    stack = _subnet_stack(ResourceDesired(
+        id="front", kind="alb",
+        fields=_fields(vpc="net", subnet="web", listenerPort="8080", port="3000", healthCheckPath="/healthz"),
+    ))
+    proj = generate_tf(stack)
+    main_tf = proj.files["main.tf"]
+    # exactly three -- one primary + two companions, no more
+    assert sorted(r for r in resource_set(proj.files) if r[0].startswith("aws_lb")) == [
+        ("aws_lb", "front"), ("aws_lb_listener", "front_listener"), ("aws_lb_target_group", "front_tg"),
+    ]
+    assert 'resource "aws_lb" "front"' in main_tf
+    assert 'name               = "front"' in main_tf
+    # odin has no internet gateway, so an internet-facing scheme would be a
+    # claim nothing backs -- `internal` is emitted explicitly, always.
+    assert "internal           = true" in main_tf
+    assert 'load_balancer_type = "application"' in main_tf
+    assert "subnets = [aws_subnet.web.id]" in main_tf
+    assert 'resource "aws_lb_target_group" "front_tg"' in main_tf
+    assert 'name        = "front-tg"' in main_tf
+    assert "port        = 3000" in main_tf
+    assert "vpc_id      = aws_vpc.net.id" in main_tf
+    assert 'target_type = "instance"' in main_tf
+    assert '  health_check {\n    path = "/healthz"\n  }' in main_tf
+    assert 'resource "aws_lb_listener" "front_listener"' in main_tf
+    assert "load_balancer_arn = aws_lb.front.arn" in main_tf
+    assert "port              = 8080" in main_tf
+    assert '    type             = "forward"' in main_tf
+    assert "    target_group_arn = aws_lb_target_group.front_tg.arn" in main_tf
+    assert proj.unsupported == []
+
+
+def test_alb_defaults_both_ports_to_80_and_the_health_check_to_root():
+    stack = _subnet_stack(ResourceDesired(id="front", kind="alb", fields=_fields(vpc="net", subnet="web")))
+    main_tf = generate_tf(stack).files["main.tf"]
+    assert "port              = 80" in main_tf  # the listener
+    assert "port        = 80" in main_tf        # the target group
+    assert '  health_check {\n    path = "/"\n  }' in main_tf
+
+
+def test_only_the_load_balancer_carries_the_odin_node_tag():
+    # The two companions aren't canvas nodes, so they get no tag of their own
+    # (same rule as a secret's version / an ecs task definition) -- `aws_lb` is
+    # the ONE block that carries the trio back to the canvas label.
+    stack = _subnet_stack(ResourceDesired(id="front", kind="alb", fields=_fields(vpc="net", subnet="web")))
+    main_tf = generate_tf(stack).files["main.tf"]
+    lb_block = main_tf.split('resource "aws_lb" "front"')[1].split("\nresource")[0]
+    assert '"odin:node" = "front"' in lb_block
+    for companion in ("aws_lb_target_group", "aws_lb_listener"):
+        block = main_tf.split(f'resource "{companion}"')[1].split("\nresource")[0]
+        assert "tags" not in block, companion
+
+
+def test_alb_outside_a_subnet_lands_in_unsupported():
+    proj = generate_tf(Stack(resources=(ResourceDesired(id="stray", kind="alb"),)))
+    assert proj.unsupported == [
+        "stray (alb): not contained inside a Subnet on the canvas (drag it into a Subnet box)"
+    ]
+    assert 'resource "aws_lb"' not in proj.files["main.tf"]
+
+
+def test_alb_of_type_network_lands_in_unsupported():
+    # An NLB would need nginx's stream module and a TCP-only proxy shape, so a
+    # `network` node reports itself rather than quietly getting an ALB.
+    stack = _subnet_stack(ResourceDesired(
+        id="front", kind="alb", fields=_fields(vpc="net", subnet="web", lbType="network"),
+    ))
+    proj = generate_tf(stack)
+    assert proj.unsupported == [f"front (alb): {_ALB_NLB_UNSUPPORTED}"]
+    assert 'resource "aws_lb"' not in proj.files["main.tf"]
+
+
+def test_an_opted_out_alb_emits_no_orphan_companion_resources():
+    """Regression, found in review: the companion pass used to re-derive `_alb`'s
+    opt-out conditions instead of asking whether pass 2 had actually emitted the
+    `aws_lb`, so a WITHHELD load balancer still got its target group + listener
+    -- and `aws_lb_listener.load_balancer_arn` then pointed at a block that was
+    never written, which fails `tofu plan` for the WHOLE project rather than just
+    dropping one node. `generate_tf`'s `built_ids` set is the fix."""
+    # Both ways `_alb` can opt a node out while the ports still parse and a vpc
+    # ref still resolves -- a `network` type, and a node drawn inside a VPC but
+    # not inside a Subnet.
+    stacks = (
+        _subnet_stack(ResourceDesired(
+            id="front", kind="alb", fields=_fields(vpc="net", subnet="web", lbType="network"),
+        )),
+        Stack(resources=(
+            ResourceDesired(id="net", kind="vpc"),
+            ResourceDesired(id="front", kind="alb", fields=_fields(vpc="net")),
+        )),
+    )
+    for stack in stacks:
+        main_tf = generate_tf(stack).files["main.tf"]
+        assert "aws_lb_target_group" not in main_tf
+        assert "aws_lb_listener" not in main_tf
+
+
+def test_alb_with_non_numeric_listener_port_lands_in_unsupported():
+    stack = _subnet_stack(ResourceDesired(
+        id="front", kind="alb", fields=_fields(vpc="net", subnet="web", listenerPort="http"),
+    ))
+    proj = generate_tf(stack)
+    assert proj.unsupported == ["front (alb): listenerPort must be a whole number (e.g. 80)"]
+    assert 'resource "aws_lb"' not in proj.files["main.tf"]
+
+
+def test_alb_with_non_numeric_target_port_lands_in_unsupported():
+    stack = _subnet_stack(ResourceDesired(
+        id="front", kind="alb", fields=_fields(vpc="net", subnet="web", port="eighty"),
+    ))
+    proj = generate_tf(stack)
+    assert proj.unsupported == ["front (alb): port must be a whole number (e.g. 80)"]
+    assert 'resource "aws_lb"' not in proj.files["main.tf"]
+
+
+def _alb_ecs_stack(edge: Edge) -> Stack:
+    return Stack(
+        resources=(
+            ResourceDesired(id="net", kind="vpc"),
+            ResourceDesired(id="web", kind="subnet", fields=_fields(vpc="net")),
+            ResourceDesired(id="front", kind="alb", fields=_fields(vpc="net", subnet="web")),
+            ResourceDesired(id="app", kind="ecs", fields=_fields(port="3000")),
+        ),
+        edges=(edge,),
+    )
+
+
+def test_an_alb_target_edge_puts_a_load_balancer_block_on_the_ecs_service():
+    # In real AWS the fronting relationship is a `load_balancer` block on the
+    # SERVICE (the ECS scheduler registers each task itself), not an
+    # `aws_lb_target_group_attachment` tofu would have to know the tasks for.
+    proj = generate_tf(_alb_ecs_stack(Edge(src="front", dst="app", kind="network")))
+    main_tf = proj.files["main.tf"]
+    assert (
+        "  load_balancer {\n"
+        "    target_group_arn = aws_lb_target_group.front_tg.arn\n"
+        '    container_name   = "app"\n'
+        "    container_port   = 3000\n"
+        "  }"
+    ) in main_tf
+    assert proj.unsupported == []
+
+
+def test_an_alb_target_edge_drawn_the_other_way_round_means_the_same_thing():
+    # Which end the user started dragging from carries no meaning, so both
+    # directions produce byte-identical HCL.
+    forward = generate_tf(_alb_ecs_stack(Edge(src="front", dst="app", kind="network")))
+    reverse = generate_tf(_alb_ecs_stack(Edge(src="app", dst="front", kind="network")))
+    assert "target_group_arn = aws_lb_target_group.front_tg.arn" in reverse.files["main.tf"]
+    assert reverse.files["main.tf"] == forward.files["main.tf"]
+    assert reverse.unsupported == []
+
+
+def test_an_ecs_service_with_no_alb_edge_gets_no_load_balancer_block():
+    stack = Stack(resources=(ResourceDesired(id="app", kind="ecs"),))
+    main_tf = generate_tf(stack).files["main.tf"]
+    assert "load_balancer {" not in main_tf
+    assert "aws_lb_target_group" not in main_tf
+
+
+def test_an_alb_target_edge_to_an_ec2_node_lands_in_unsupported_exactly_once():
+    # An ec2 target would need an `aws_lb_target_group_attachment` -- recorded
+    # as an unbuilt limit instead of silently doing nothing with the edge the
+    # user drew. Pass 1.5 tries BOTH edge directions, so the reason must not be
+    # recorded twice for one edge.
+    stack = Stack(
+        resources=(
+            ResourceDesired(id="net", kind="vpc"),
+            ResourceDesired(id="web", kind="subnet", fields=_fields(vpc="net")),
+            ResourceDesired(id="front", kind="alb", fields=_fields(vpc="net", subnet="web")),
+            ResourceDesired(id="server", kind="ec2", fields=_fields(subnet="web")),
+        ),
+        edges=(Edge(src="front", dst="server", kind="network"),),
+    )
+    proj = generate_tf(stack)
+    assert proj.unsupported == [
+        "front (alb): target edge to server (ec2) — only ecs nodes can be load-balancer targets in Simulate v1"
+    ]
+    assert "load_balancer {" not in proj.files["main.tf"]
+
+
+def test_tofu_fmt_accepts_alb_output(tmp_path):
+    tofu = shutil.which("tofu")
+    if tofu is None:
+        return  # skip cleanly -- no tofu on PATH in this environment
+    stack = _alb_ecs_stack(Edge(src="front", dst="app", kind="network"))
     main_tf = tmp_path / "main.tf"
     main_tf.write_text(generate_tf(stack).files["main.tf"])
     result = subprocess.run([tofu, "fmt", "-check", "-diff", str(main_tf)], capture_output=True, text=True)

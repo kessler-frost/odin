@@ -794,6 +794,21 @@ def generate_tf(stack: Stack) -> TfProject:
     # Pass 2 — build blocks with the name table complete. A builder may still
     # opt out for THIS resource (returns the reason string) — e.g. a subnet
     # not drawn inside any VPC — which lands in `unsupported`, never dropped.
+    #
+    # `built_ids` records what pass 2 ACTUALLY emitted, and it is the only
+    # honest gate for a companion pass whose block REFERENCES its primary
+    # (`aws_lb_listener.load_balancer_arn`,
+    # `aws_secretsmanager_secret_version.secret_id`). Re-deriving the primary
+    # builder's opt-out conditions in the companion pass instead was a real bug
+    # found in review: an alb with `lbType = "network"`, or one drawn in a VPC
+    # but not a Subnet, withheld its `aws_lb` while the companion pass still
+    # emitted a listener pointing at `aws_lb.<name>.arn` — an unresolvable
+    # reference, which fails `tofu plan` for the WHOLE project and so stops
+    # every other resource on the canvas from applying. The companions that do
+    # NOT reference their primary (an ecs task definition, a lambda auto-role,
+    # an `aws_key_pair`) are deliberately left ungated: without their primary
+    # they're merely unused, never invalid.
+    built_ids: set[str] = set()
     for res in ordered:
         if res.kind not in _BUILDERS:
             continue
@@ -805,6 +820,7 @@ def generate_tf(stack: Stack) -> TfProject:
         nested = "\n\n".join(part for part in (nested, _tags_block(res)) if part)
         block = _block(_TF_TYPES[res.kind], hcl_name_by_id[res.id], attrs, nested)
         blocks.append(((res.kind, res.id), block))
+        built_ids.add(res.id)
 
     for edge in sorted(stack.edges, key=lambda e: (e.src, e.dst)):
         topic, queue = by_id.get(edge.src), by_id.get(edge.dst)
@@ -888,7 +904,7 @@ def generate_tf(stack: Stack) -> TfProject:
     # value in later with `aws secretsmanager put-secret-value`), whereas
     # emitting `secret_string = ""` would assert a value nobody typed.
     for res in ordered:
-        if res.kind != "secret":
+        if res.kind != "secret" or res.id not in built_ids:  # `built_ids`: see pass 2
             continue
         value = _field(res, "secretString", "")
         secret_name = hcl_name_by_id.get(res.id)
@@ -941,12 +957,14 @@ def generate_tf(stack: Stack) -> TfProject:
     # refs and the two port fields parse, so nothing here can fail.
     for res in ordered:
         own_name = hcl_name_by_id.get(res.id)
-        if res.kind != "alb" or own_name is None:
+        # `res.id in built_ids` is the ONLY gate here (see pass 2's note): pass 2
+        # emitting the `aws_lb` is exactly the condition under which a listener
+        # may reference it, and re-deriving `_alb`'s own opt-out checks instead
+        # let a withheld load balancer keep its companions.
+        if res.kind != "alb" or own_name is None or res.id not in built_ids:
             continue
-        ports, vpc_id = _alb_ports(res), _vpc_ref(res, refs)
-        if isinstance(ports, str) or vpc_id is None:
-            continue  # `_alb` already reported this node as unsupported
-        listener_port, target_port = ports
+        listener_port, target_port = _alb_ports(res)  # pass 2 already proved these parse
+        vpc_id = _vpc_ref(res, refs)  # and that this resolves
         target_group = _block(
             "aws_lb_target_group", f"{own_name}_tg",
             {

@@ -10,10 +10,11 @@ Memory estimation, by kind:
 - `ec2`: the real per-instance-type memory (`compute.models.INSTANCE_TYPES`,
   the SAME table `gateway/models/ec2compute.py` uses for the real Lima VM) --
   this is exact, not a guess.
-- `rds`/`ecs`/`lambda`: a modest FIXED estimate per node -- each spawns its
-  OWN container (a Postgres, a task container, an RIE container), so per-node
-  charging is right. The ecs figure mirrors `compute/tasks.py`'s own default
-  container memory cap, so the estimate and the actual runtime ceiling agree.
+- `rds`/`ecs`/`lambda`/`alb`: a modest FIXED estimate per node -- each spawns
+  its OWN container (a Postgres, a task container, an RIE container, an nginx
+  reverse proxy), so per-node charging is right. The ecs and alb figures mirror
+  `compute/tasks.py`'s and `compute/proxy.py`'s own container memory caps, so
+  each estimate and the actual runtime ceiling agree.
 - `s3`/`sqs`/`sns`/`dynamodb`: charged ONCE PER ENV, not per node -- these
   ride a single shared per-env backing container (RustFS/goaws/dynalite)
   regardless of how many buckets/queues/topics/tables are drawn, so per-node
@@ -45,6 +46,10 @@ _PER_NODE_MEMORY_MIB: dict[str, float] = {
     "rds": 256.0,
     "ecs": 512.0,
     "lambda": 256.0,
+    # W2.5: one nginx reverse-proxy container per load balancer
+    # (compute/proxy.py) -- this figure IS that module's own `_MEMORY_MIB` cap,
+    # so the estimate and the real runtime ceiling agree, same rule as ecs.
+    "alb": 64.0,
 }
 
 # s3/sqs/sns/dynamodb: a modest fixed estimate per ENV (a SHARED backing

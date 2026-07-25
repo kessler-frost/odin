@@ -38,14 +38,22 @@ interval". The path/matcher are still stored and echoed (that is what keeps
 odin-performed probe of the target's real address (elbv2ctl.py's
 `_probe_target`), never from an invented "healthy".
 
-CONFIG DELIVERY: the rendered config lives at
-`.odin/{env}/gateway/alb/{lb_name}/default.conf` and the **directory** is
-bind-mounted at `/etc/nginx/conf.d` (nginx:alpine's stock nginx.conf already
-`include`s `/etc/nginx/conf.d/*.conf` from inside its `http {}` block, and our
-mount shadows the image's own `default.conf`). Mounting the DIRECTORY rather
-than the file is load-bearing: `atomic_write_text` replaces the file by
-rename, which gives it a new inode -- a single-file bind mount would keep
-showing the container the OLD inode forever.
+CONFIG DELIVERY IS `docker cp`, NOT A BIND MOUNT -- found the hard way. The
+rendered config lives at `.odin/{env}/gateway/alb/{lb_name}/odin.conf` and is
+copied into the container at `/etc/nginx/conf.d/odin.conf` (nginx:alpine's
+stock nginx.conf already `include`s `/etc/nginx/conf.d/*.conf` from inside its
+`http {}` block). A `-v` of that host directory LOOKED right and failed
+silently: under Colima's virtiofs a path beneath macOS's per-user temp dir
+(`/private/var/folders/...`) mounts as an EMPTY directory -- the path exists
+inside the VM, so nothing errors -- and nginx came up with no server block at
+all, accepting then dropping every connection. `docker cp` streams through the
+daemon, so it depends on no mount configuration whatsoever.
+
+The container's command is a two-line shell prologue -- delete the image's own
+`default.conf`, wait for `odin.conf` to arrive, then `exec nginx` -- so nginx
+NEVER serves the nginx welcome page in the window between `docker run` and the
+copy. `exec` also keeps nginx as PID 1, which is what makes `docker kill -s
+HUP` reach it.
 """
 from __future__ import annotations
 
@@ -57,7 +65,18 @@ from odin.runtime.colima import CONTAINER_HOST, ColimaRuntime, ContainerSpec
 from odin.util import atomic_write_text
 
 IMAGE = "nginx:alpine"
-CONF_FILENAME = "default.conf"
+CONF_FILENAME = "odin.conf"
+CONF_DIR_IN_CONTAINER = "/etc/nginx/conf.d"
+CONF_PATH_IN_CONTAINER = f"{CONF_DIR_IN_CONTAINER}/{CONF_FILENAME}"
+# Drop the image's own server block, wait for `docker cp` to deliver ours, then
+# become nginx (module docstring: no welcome-page window, and nginx ends up as
+# PID 1 so SIGHUP reaches it).
+_ENTRY_COMMAND = (
+    "sh", "-c",
+    f"rm -f {CONF_DIR_IN_CONTAINER}/default.conf; "
+    f"while [ ! -f {CONF_PATH_IN_CONTAINER} ]; do sleep 0.1; done; "
+    "exec nginx -g 'daemon off;'",
+)
 # The signal nginx re-reads its configuration on.
 RELOAD_SIGNAL = "HUP"
 # The port the proxy listens on when the load balancer has NO listener yet
@@ -72,23 +91,35 @@ _MEMORY_MIB = 64.0
 _CPUS = 0.5
 
 
-_UNSAFE_IN_CONTAINER_NAME = re.compile(r"[^A-Za-z0-9_.-]")
+_UNSAFE_IN_NAME = re.compile(r"[^A-Za-z0-9_.-]")
+
+
+def safe_name(lb_name: str) -> str:
+    """A load-balancer name reduced to characters that are safe as BOTH a Docker
+    container name and a single path segment.
+
+    Real elbv2 restricts names to `[A-Za-z0-9-]` (a strict subset of what either
+    needs), but odin's own model accepts a name VERBATIM rather than validating
+    it (`gateway/models/elbv2ctl.py`'s "accepted, never validated" rule), so
+    every name that reaches the substrate goes through here. Used by BOTH
+    `container_name` and `conf_path` deliberately: sanitizing only one of them
+    let `my/lb` and `my-lb` share a container while writing two DIFFERENT config
+    files (they would fight over it), and let a `..` segment walk the config out
+    of its own directory."""
+    return _UNSAFE_IN_NAME.sub("-", lb_name)
 
 
 def container_name(env: str, lb_name: str) -> str:
     """`odin-alb-{env}-{lb_name}` -- the ONLY name this module passes to the
-    runtime driver. Real elbv2 restricts load-balancer names to `[A-Za-z0-9-]`
-    (a strict subset of what Docker accepts), but odin's own model accepts a
-    name VERBATIM rather than validating it (gateway/models/elbv2ctl.py's
-    "accepted, never validated" rule), so anything Docker would reject is
-    folded to `-` here instead of producing an unrunnable container."""
-    return f"odin-alb-{env}-{_UNSAFE_IN_CONTAINER_NAME.sub('-', lb_name)}"
+    runtime driver."""
+    return f"odin-alb-{env}-{safe_name(lb_name)}"
 
 
-def conf_dir(root: Path, env: str, lb_name: str) -> Path:
-    """The bind-mounted directory holding this proxy's rendered config (module
-    docstring: a DIRECTORY, never the file itself)."""
-    return root / env / "gateway" / "alb" / lb_name
+def conf_path(root: Path, env: str, lb_name: str) -> Path:
+    """Where this proxy's rendered config lives ON THE HOST, before being
+    `docker cp`'d into the container (module docstring). Same `safe_name`
+    reduction as the container -- see its docstring for why that matters."""
+    return root / env / "gateway" / "alb" / safe_name(lb_name) / CONF_FILENAME
 
 
 @dataclass(frozen=True)
@@ -156,30 +187,35 @@ class LoadBalancerProxy:
         """Converge the real proxy container onto `listeners` and return
         `{listen_port: published host port}`.
 
-        ONE deterministic rule, no hidden state: write the config, then
+        ONE deterministic rule, no hidden state: render the config, then
         - the container is running AND every wanted port is already published
-          => rewrite + SIGHUP (a target change; zero downtime);
+          => copy the config in + SIGHUP (a target change; zero downtime, no
+          in-flight request dropped);
         - otherwise => remove and re-run it (first create, or the LISTENER SET
-          itself changed, which is a published-port change Docker can't apply
+          itself changed, which is a published-port change Docker cannot apply
           to a live container).
         Idempotent: called after every elbv2 mutation that can change what the
-        proxy should serve, and a no-change call is one config write plus one
-        signal."""
+        proxy should serve, and a no-change call is one copy plus one signal."""
         name = container_name(env, lb_name)
         ports = tuple(listener.port for listener in listeners) or (IDLE_LISTEN_PORT,)
-        atomic_write_text(conf_dir(root, env, lb_name) / CONF_FILENAME, render_conf(listeners))
+        host_conf = conf_path(root, env, lb_name)
+        atomic_write_text(host_conf, render_conf(listeners))
         published = {port: self._rt.host_port(name, port) for port in ports}
         if self._rt.status(name) == "running" and all(published.values()):
+            self._rt.copy_in(name, str(host_conf), CONF_PATH_IN_CONTAINER)
             self._rt.signal(name, RELOAD_SIGNAL)
             return published
         self._rt.stop(name)
         self._rt.run_container(ContainerSpec(
             name=name, image=IMAGE,
             ports={port: 0 for port in ports},  # 0 => Docker picks a free host port
-            volumes={str(conf_dir(root, env, lb_name)): "/etc/nginx/conf.d"},
             labels={"odin-env": env, "odin-alb": lb_name},
+            command=_ENTRY_COMMAND,
             memory_mib=_MEMORY_MIB, cpus=_CPUS,
         ))
+        # The container is up running `_ENTRY_COMMAND`'s wait loop; THIS copy is
+        # what lets nginx actually start (module docstring).
+        self._rt.copy_in(name, str(host_conf), CONF_PATH_IN_CONTAINER)
         return {port: self._rt.host_port(name, port) for port in ports}
 
     def status(self, env: str, lb_name: str) -> str:

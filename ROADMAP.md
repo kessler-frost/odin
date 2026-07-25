@@ -241,9 +241,82 @@ future decision against these points instead of re-deriving them:
     single-name reads a workload actually makes (`GetParameter`,
     `GetSecretValue`) are exact. Same bounded gap the ecr/ecs classifiers
     already carry.
+- [x] **ALB — a load balancer backed by a REAL reverse proxy (W2.5).**
+  DONE 2026-07-25: the `alb` node is real. One canvas node expands to
+  `aws_lb` + `aws_lb_target_group` + `aws_lb_listener`, the gateway answers
+  the whole `elasticloadbalancing:*` surface the TF provider drives (create/
+  describe/delete for all three, load-balancer and target-group and LISTENER
+  attributes, `ModifyTargetGroup`, `RegisterTargets`/`DeregisterTargets`/
+  `DescribeTargetHealth`, and the ARN-only tag API), and the substrate is an
+  actual **nginx:alpine container per load balancer** whose upstreams are the
+  target group's registered targets. Draw a network edge from an `alb` to an
+  `ecs` node and that service's tasks become the targets — registered by
+  odin's ECS model as each task launches, exactly as real ECS's own service
+  scheduler does it. Proven end to end: two ECS tasks behind one ALB, `curl`
+  the LB's real published port for a 200, `docker rm -f` one task, the LB
+  keeps serving 200s from the survivor, `tofu plan -detailed-exitcode` clean,
+  empty-canvas Apply tears everything down
+  (`tests/simulate/test_alb_tf_e2e.py`).
+
+  *nginx, not Caddy* (both permissive, so licence wasn't the tiebreaker):
+  ~10MB image, a config that's one `server` line per target, reload is a
+  plain SIGHUP (so `docker kill -s HUP` — no `docker exec` seam and no
+  admin-API dance; Caddy v2 dropped v1's signal reload), and
+  `proxy_next_upstream` gives request-level failover, which is the behaviour
+  that makes the kill-one-task proof work.
+
+  **v1 limits, recorded rather than hidden:**
+  - **Health checks are PASSIVE.** Open-source nginx has no active upstream
+    checking (`health_check` with a URI/interval is NGINX Plus), so the target
+    group's `HealthCheckPath` is **not polled by the proxy**. The honest
+    mapping is `max_fails=1` + `fail_timeout` ← `HealthCheckIntervalSeconds`:
+    one failed real request takes a target out of rotation for one interval.
+    `DescribeTargetHealth` therefore answers from a REAL odin-performed HTTP
+    GET against the target's real address on that path (compared to
+    `Matcher.HttpCode`), never from an invented "healthy" — a refused
+    connection reports `unhealthy` with the actual error.
+  - **The reachable address is not the DNS name.** odin publishes the proxy on
+    a DYNAMIC host port (a fixed 80 would collide across load balancers and
+    across envs), and `DNSName` has nowhere to put a port. So `DNSName` is
+    `127.0.0.1` and the real endpoint lives where a port belongs: the
+    `ALB_ENDPOINT` World fact on the canvas node, and an odin-only
+    `odin.endpoint.url` load-balancer attribute.
+  - HTTP only: no HTTPS, no ACM certificates, no `SslPolicy`, no ALPN, no
+    mutual TLS. `aws_lb_listener_certificate` is unmodeled.
+  - One listener per load balancer is what the canvas authors (the model
+    itself supports several, each published on its own host port; adding or
+    removing one RECREATES the proxy container, since Docker can't change a
+    live container's published ports — a target change is a zero-downtime
+    SIGHUP reload instead).
+  - **Default action only, and only `forward`.** No `aws_lb_listener_rule`, no
+    path/host routing, no weighted or sticky target groups. `redirect`,
+    `fixed-response` and `authenticate-*` actions are REFUSED with a real
+    `ValidationError` rather than accepted and silently not served.
+  - `application` type only. A `network` LB (NLB) reports itself unsupported
+    on Apply instead of quietly becoming an ALB; `internal = true` always
+    (odin has no internet gateway to be internet-facing through).
+  - Targets: an `ecs` node is the only canvas kind that can be a target in v1
+    (an alb→`ec2` edge is reported as unsupported). The model's
+    `RegisterTargets` itself is generic — an `i-…` id resolves through the
+    EC2-compute store to the VM's real address — so `aws_lb_target_group_
+    attachment` is a small follow-up, not a redesign. A task target is
+    `(host.docker.internal, its real published host port)`: the honest local
+    analogue of an `ip` target for a bridge-mode container, not a fiction
+    about instance ids.
+  - Cross-zone/AZ behaviour, access logs, WAF, deletion protection and every
+    other load-balancer attribute are STORED AND ECHOED for zero-drift
+    fidelity and do nothing. AWS's own "an ALB needs ≥2 subnets in different
+    AZs" validation is not enforced (the canvas gives one containing subnet).
+  - `tofu apply` spends ~60s on `aws_lb` creation regardless of how fast the
+    real container comes up: that's terraform-provider-aws's own fixed
+    pre-poll delay in its `LoadBalancerActive` waiter, tuned for real AWS's
+    multi-minute provisioning. Nothing odin returns can shorten it.
+  - The proxy container is NOT covered by W2.2's drift sweep yet — `docker rm`
+    it out of band and the load balancer still reports `active` until the next
+    Apply re-converges it.
 - **Recorded as UNSUPPORTED for now** (northstar directive 5's honesty rule):
-  ALB/ELBv2, EKS, CloudFormation, autoscaling, and RDS-via-Terraform (rds
-  nodes stay on the reconciler path until an RDS API model lands).
+  EKS, CloudFormation, autoscaling, and RDS-via-Terraform (rds nodes stay on
+  the reconciler path until an RDS API model lands).
 - [x] **Nebula network layer (single-host), fully activated.** Security
   groups and VPCs drawn on the canvas compile to real Nebula network +
   firewall primitives (`fabric/nebula.py::sg_rules_to_firewall`,
