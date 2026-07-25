@@ -512,6 +512,15 @@ future decision against these points instead of re-deriving them:
     `ResourceDesired.refs` does not record whether a ref came from `env` or from
     a top-level field, so a top-level `${{...}}` field also arrives as an env
     var named after that field.
+  - **Not built: an ECS `command`.** The canvas has no `command` field for
+    `ecs` and `hcl.py::_ecs_container_definitions` emits only
+    `name`/`image`/`essential`/`portMappings`, so a task always runs its
+    image's own entrypoint (`compute/tasks.py` would honour a `command` in a
+    task definition, but nothing on the canvas path ever puts one there —
+    locked by `test_ecs_container_definitions_never_carry_a_command`). Worth
+    adding alongside the missing `env` editor if a real canvas needs to
+    override an entrypoint; SECURITY.md's "what odin executes" section must be
+    updated in the same change.
 - [x] **CloudWatch Logs — the log sink (W2.1).** DONE 2026-07-24: the `logs`
   node is real. `aws_cloudwatch_log_group` is a full gateway model
   (Create/Delete/DescribeLogGroups, Put/DeleteRetentionPolicy, tag CRUD →

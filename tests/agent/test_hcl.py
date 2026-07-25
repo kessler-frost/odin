@@ -8,7 +8,14 @@ import time
 import zipfile
 
 
-from odin.agent.hcl import _ALB_NLB_UNSUPPORTED, generate_tf, resource_attrs, resource_set, unquote
+from odin.agent.hcl import (
+    _ALB_NLB_UNSUPPORTED,
+    _ecs_container_definitions,
+    generate_tf,
+    resource_attrs,
+    resource_set,
+    unquote,
+)
 from odin.spec.models import Edge, FieldValue, ResourceDesired, Stack
 from odin.spec.translate import canvas_to_stack
 
@@ -893,6 +900,21 @@ def test_ecs_emits_service_taskdef_and_one_shared_cluster():
     assert 'family                   = "app"' in main_tf
     assert '\\"image\\": \\"nginx:alpine\\"' in main_tf
     assert '\\"containerPort\\": 80' in main_tf
+
+
+def test_ecs_container_definitions_never_carry_a_command():
+    """SECURITY.md's "what odin executes" claim, locked to the code (field
+    test 3, MINOR): it said an ECS task's `command` field is executed. The
+    canvas has no `command` field for ecs and `_ecs_container_definitions`
+    emits only name/image/essential/portMappings, so a canvas can only ever run
+    an image's OWN entrypoint. If this ever changes, SECURITY.md changes with
+    it -- that document is only worth anything while it is exact."""
+    stack = Stack(resources=(
+        ResourceDesired(id="app", kind="ecs", fields=_fields(image="nginx:alpine", command="rm -rf /")),
+    ))
+    definitions = _ecs_container_definitions(stack.resources[0])
+    assert [sorted(d) for d in definitions] == [["essential", "image", "name", "portMappings"]]
+    assert "command" not in generate_tf(stack).files["main.tf"]
 
 
 def test_ecs_defaults_image_count_and_port_when_fields_absent():

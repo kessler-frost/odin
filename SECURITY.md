@@ -29,11 +29,20 @@ controls.
 
 Clicking Apply materializes and runs a canvas's nodes for real:
 
-- **Container images and commands** — any ECS task's `image` and `command`
-  fields (`compute/tasks.py`), any Lambda's inline code (`compute/
-  functions.py`, `agent/hcl.py`) are pulled/zipped and executed verbatim.
-  Nothing sandboxes or scans them; odin trusts them the way `docker run
-  <image>` trusts an image.
+- **Container images** — an ECS node's `image` field is pulled and run
+  verbatim (`agent/hcl.py` → the gateway → `compute/tasks.py`), with the
+  image's **own entrypoint**: odin's generated task definition carries only
+  `name`/`image`/`essential`/`portMappings`, and the canvas has no `command`
+  field for ecs, so a canvas cannot supply the process to run — only the
+  image that supplies it. (`compute/tasks.py` *would* honour a `command` in a
+  task definition, and a task definition registered against odin's gateway by
+  something other than the canvas — a direct AWS-SDK `RegisterTaskDefinition`
+  call — can therefore run one. That is the same trust boundary as every
+  other gateway call: the machine.) Nothing sandboxes or scans the image;
+  odin trusts it the way `docker run <image>` trusts an image.
+- **Lambda code** — any Lambda node's inline code (`agent/hcl.py`,
+  `compute/functions.py`) is zipped and executed verbatim inside the
+  function's runtime container. Same absence of sandboxing or scanning.
 - **EC2 user-data as root** — an EC2 node's `userData` field
   (`agent/hcl.py`) becomes a cloud-init script (`compute/cloud_init.py`)
   that runs as **root** inside a real Lima VM on first boot. There is no
