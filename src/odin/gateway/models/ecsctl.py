@@ -472,6 +472,21 @@ def sweep_tasks(stores: SynthStores, env: str, runtime: TaskRuntime) -> None:
         )
 
 
+def mark_task_stopped(stores: SynthStores, env: str, cluster_name: str, task_id: str, reason: str) -> None:
+    """Public seam for W2.2's reality sweep (`reconcile/drift.py`): a task
+    whose container was REMOVED outside odin, marked STOPPED with `reason`.
+    Same terminal shape `sweep_tasks` gives a container that exited on its
+    own -- minus an `exit_code`, because a container that no longer exists
+    never reported one (an invented 0/137 would be a lie). Keeping the store
+    honest is also what makes the recovery real: `converge_services` (an
+    Apply) relaunches a STOPPED task, while a RUNNING record whose container
+    is gone would have it wait forever for a task nothing will replace."""
+    _update_task(
+        stores, env, cluster_name, task_id,
+        last_status="STOPPED", stopped_at=time.time(), stopped_reason=reason,
+    )
+
+
 # --- background completion: the reconcile-on-mutation shape (module
 # docstring's "GATEWAY-INTERNAL RECONCILE" -- the same daemon-thread pattern
 # ec2compute/lambdactl already use for real, possibly-slow substrate work) --
@@ -572,6 +587,33 @@ def _reconcile_service_tasks(
 
 def _spawn(target: Callable[..., None], *args: object) -> None:
     threading.Thread(target=target, args=args, daemon=True).start()
+
+
+def converge_services(
+    stores: SynthStores, env: str, runtime: TaskRuntime,
+    keystore: KeyStore | None = None, gateway_port: int | None = None,
+) -> None:
+    """Re-converge every ACTIVE service's REAL task containers toward
+    `desiredCount` -- the exact `_reconcile_service_tasks` pass CreateService/
+    UpdateService already spawn, driven by an APPLY (server.py's /apply-full)
+    rather than by an AWS mutation.
+
+    This is what makes "re-Apply" the honest recovery for the drift W2.2's
+    reality sweep reports. A task is NOT a terraform resource: nothing about
+    an `aws_ecs_service`'s config changes when its container is destroyed out
+    of band, so tofu's plan is empty and tofu will never fix it -- in real
+    AWS the SERVICE SCHEDULER (not terraform) replaces a lost task, and this
+    is odin's equivalent, deliberately triggered by the user's Apply instead
+    of a background timer (the module docstring's "TF's read calls drive
+    convergence, not a timer" limit stays: no new scheduler loop). Idempotent
+    -- a service already at desiredCount launches nothing."""
+    for service in _all_services(stores, env):
+        if service["status"] != "ACTIVE":
+            continue
+        _spawn(
+            _reconcile_service_tasks, stores, env, service["cluster_name"],
+            service["service_name"], runtime, keystore, gateway_port,
+        )
 
 
 # Per-(SynthStores, env, cluster, service) lock, serializing

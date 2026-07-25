@@ -194,6 +194,19 @@ class _ContainerRuntime:
         out = self._cli("ps", "-aq", "--filter", f"label={LABEL}=1", check=False)
         return [line for line in out.splitlines() if line]
 
+    def container_names(self) -> list[str]:
+        """Every odin-labelled container's NAME -- running or exited, ONE
+        `docker ps` call regardless of how many there are (W2.2's drift sweep
+        compares whole synth stores against this single listing, never one
+        `inspect` per resource).
+
+        `check=True`, deliberately: this is the one listing whose EMPTY answer
+        is load-bearing (absent from it == the container was really removed),
+        so a failed CLI call must raise rather than come back as an innocent
+        empty list -- see `reconcile/drift.py::_listing`."""
+        out = self._cli("ps", "-a", "--format", "{{.Names}}", "--filter", f"label={LABEL}=1")
+        return [line for line in out.splitlines() if line]
+
 
 class ColimaRuntime(_ContainerRuntime):
     """Drives `docker` (Colima) directly on the host."""

@@ -378,14 +378,19 @@ class InstanceVm:
                 return str(record.get("status", "Unknown")).lower()
         return "absent"
 
-    def list_names(self) -> list[str]:
+    def list_names(self, check: bool = False) -> list[str]:
         """Every VM name `limactl list --json` currently reports -- read-only
         (never touches a VM), the one non-exact-name limactl call this class
         makes. The startup reaper
-        (`gateway/models/ec2compute.py::reap_orphaned_vms`) is the only
-        caller; it still only ever calls `delete(name)` with an exact name
-        it has already validated against the store."""
-        out = self._lima("list", "--json", check=False).stdout
+        (`gateway/models/ec2compute.py::reap_orphaned_vms`) is one caller; it
+        still only ever calls `delete(name)` with an exact name it has already
+        validated against the store.
+
+        `check=True` (W2.2's drift sweep, `reconcile/drift.py`) raises instead
+        of swallowing a `limactl` failure: that caller treats "absent from
+        this listing" as "the VM was really deleted", so it must be able to
+        tell a genuinely empty machine from a limactl that didn't answer."""
+        out = self._lima("list", "--json", check=check).stdout
         names = []
         for line in out.splitlines():
             if not line.strip():

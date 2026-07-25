@@ -37,6 +37,7 @@ from odin.gateway.keys import OPERATOR_NODE_ID, KeyStore, Principal
 from odin.gateway.models import ec2compute
 from odin.gateway.stores import SynthStores
 from odin.reconcile import admission
+from odin.reconcile.drift import DriftSweeper
 from odin.reconcile.reconciler import Reconciler
 from odin.runtime.colima import ColimaRuntime
 from odin.simulate.runner import SimulateBusy, TfRunner, TofuNotInstalled
@@ -541,6 +542,13 @@ def create_app(
         return Reconciler(
             _store, _runtime, env_rds, aws=env_aws, gateway=gateway_state, fabric=LocalhostFabric(),
             ws=ws_manager, env=env, poll_interval=1.0, stores=gateway_stores,
+            # W2.2's reality sweep shells out to the REAL `limactl`/`docker`,
+            # so it's gated on the same `backings` flag every other real-
+            # runtime dependency is: an app built with `backings=False` is
+            # explicitly the fake-substrate one (every non-integration test),
+            # and its hand-seeded synth records must not be measured against
+            # this machine's actual VMs/containers.
+            drift=DriftSweeper() if backings else None,
         )
 
     async def reconciler_for(env: str) -> Reconciler:
