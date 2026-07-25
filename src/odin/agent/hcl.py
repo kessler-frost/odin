@@ -447,6 +447,34 @@ _DEFAULT_LAMBDA_RUNTIME = "python3.12"
 _DEFAULT_LAMBDA_CODE = "def lambda_handler(event, context):\n    return event\n"
 _BAD_ROLE_REF = "role names something that isn't an IAM Role on the canvas"
 
+# Field-test 2, finding HIGH-4: the deployment zip must be a pure function of
+# the code, because `source_code_hash = filebase64sha256(<zip>)` hashes the
+# ARCHIVE, not the source. `ZipFile.writestr(name, data)` stamps the CURRENT
+# WALL CLOCK into the entry, so two translates of an unchanged canvas produced
+# different bytes -> a different hash -> `Plan: 0 to add, 1 to change` forever,
+# a function redeploy on every Apply, and `tofu plan -detailed-exitcode`
+# useless as a drift check for any canvas with a Lambda. An explicit `ZipInfo`
+# pins every host-dependent field instead: the ZIP epoch (the earliest
+# timestamp the DOS format can express -- what reproducible-build tooling
+# uses), 0644 permissions, and the unix create_system, so nothing about WHEN or
+# WHERE the translate ran leaks into the archive. Member ORDER is stable too:
+# v1 taskdefs/packages are single-entry, and the one entry's name is derived
+# from `_lambda_entry` rather than a directory walk.
+_ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
+_ZIP_FILE_MODE = 0o100644  # regular file, rw-r--r--
+_ZIP_UNIX = 3  # ZipInfo.create_system
+
+
+def _deterministic_zip(entry_filename: str, code: str) -> bytes:
+    info = zipfile.ZipInfo(entry_filename, date_time=_ZIP_EPOCH)
+    info.compress_type = zipfile.ZIP_DEFLATED
+    info.external_attr = _ZIP_FILE_MODE << 16
+    info.create_system = _ZIP_UNIX
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr(info, code)
+    return buf.getvalue()
+
 
 def _lambda_entry(runtime: str) -> tuple[str, str]:
     return _LAMBDA_RUNTIME_ENTRY.get(runtime, _LAMBDA_RUNTIME_ENTRY[_DEFAULT_LAMBDA_RUNTIME])
@@ -1128,7 +1156,9 @@ def generate_tf(stack: Stack) -> TfProject:
     # block references by filename -- odin owns this pre-tofu, not a
     # `data archive_file` round-trip (module docstring). The entry filename
     # MUST match `_lambda_entry`'s choice for the SAME runtime, or the
-    # deployed zip and the `handler` string would disagree.
+    # deployed zip and the `handler` string would disagree. BYTE-DETERMINISTIC
+    # (`_deterministic_zip`): identical code must produce an identical archive,
+    # or `source_code_hash` churns on every translate.
     binary_files: dict[str, bytes] = {}
     for res in ordered:
         name = hcl_name_by_id.get(res.id)
@@ -1137,9 +1167,6 @@ def generate_tf(stack: Stack) -> TfProject:
         runtime = _field(res, "runtime", _DEFAULT_LAMBDA_RUNTIME)
         entry_filename, _ = _lambda_entry(runtime)
         code = _field(res, "code", "") or _DEFAULT_LAMBDA_CODE
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr(entry_filename, code)
-        binary_files[f"{name}.zip"] = buf.getvalue()
+        binary_files[f"{name}.zip"] = _deterministic_zip(entry_filename, code)
 
     return TfProject(files={"main.tf": main_tf}, unsupported=unsupported, binary_files=binary_files)

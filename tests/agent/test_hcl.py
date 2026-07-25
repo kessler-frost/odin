@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import shutil
 import subprocess
+import time
 import zipfile
 
 
@@ -739,6 +740,34 @@ def test_lambda_with_no_code_field_defaults_to_the_echo_handler():
     proj = generate_tf(stack)
     with zipfile.ZipFile(io.BytesIO(proj.binary_files["fn1.zip"])) as archive:
         assert "return event" in archive.read("lambda_function.py").decode()
+
+
+def test_lambda_zip_is_byte_identical_across_translates():
+    """Field-test 2 finding HIGH-4: the zip is what `source_code_hash =
+    filebase64sha256(...)` hashes, so a zip whose bytes move between two
+    translates of the SAME canvas makes every plan report `1 to change` and
+    every Apply redeploy the function -- and `tofu plan -detailed-exitcode`
+    useless as a drift check for any canvas with a Lambda."""
+    stack = Stack(resources=(
+        ResourceDesired(id="fn1", kind="lambda", fields=_fields(code="def lambda_handler(e, c):\n    return 1\n")),
+    ))
+    first = generate_tf(stack).binary_files["fn1.zip"]
+    time.sleep(1.1)  # long enough to cross a DOS-timestamp (2s) boundary
+    second = generate_tf(stack).binary_files["fn1.zip"]
+    assert first == second
+
+
+def test_lambda_zip_entry_metadata_is_fixed_not_wall_clock():
+    """The mechanism behind the test above, asserted directly: a fixed
+    timestamp (the ZIP epoch) and fixed 0644 permissions, so nothing about
+    WHEN or WHERE the translate ran leaks into the archive."""
+    stack = Stack(resources=(ResourceDesired(id="fn1", kind="lambda"),))
+    proj = generate_tf(stack)
+    with zipfile.ZipFile(io.BytesIO(proj.binary_files["fn1.zip"])) as archive:
+        (info,) = archive.infolist()
+        assert info.date_time == (1980, 1, 1, 0, 0, 0)
+        assert info.external_attr >> 16 == 0o100644
+        assert info.create_system == 3  # unix, not "whatever host built it"
 
 
 def test_lambda_nodejs_runtime_zips_index_js():
