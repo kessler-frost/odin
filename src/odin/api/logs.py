@@ -26,6 +26,7 @@ Kind -> real backing:
   than one real container when desiredCount > 1, or a crash-looping task
   that's been replaced. Also always on Colima, matching TaskRuntime's own
   default.
+- elasticache: the cluster's own `redis:7-alpine` container (aws/cache.py).
 - vpc/subnet/sg/iam_role/ecr: no runnable backing at all.
 """
 from __future__ import annotations
@@ -33,11 +34,13 @@ from __future__ import annotations
 from fastapi import APIRouter
 from pydantic import BaseModel
 
+from odin.aws import cache as cache_compute
 from odin.aws.backings import PROVISIONED, BackingAws
 from odin.aws.rds import PostgresRds
 from odin.compute import functions as lambda_compute
 from odin.compute import instances as ec2_compute
 from odin.compute import tasks as ecs_compute
+from odin.gateway.models import cachectl
 from odin.gateway.stores import SynthStores
 from odin.runtime.colima import ColimaRuntime
 from odin.spec.store import SpecStore
@@ -104,6 +107,13 @@ def _find_ecs_service(stores: SynthStores, env: str, node: str) -> dict | None:
             continue
         label = record.get("node_label") or record["service_name"]
         if label == node:
+            return record
+    return None
+
+
+def _find_cache_cluster(stores: SynthStores, env: str, node: str) -> dict | None:
+    for record in cachectl.clusters(stores, env):
+        if _tagged_label(stores, env, f"elasticache:{record['arn']}", record["cache_cluster_id"]) == node:
             return record
     return None
 
@@ -200,6 +210,18 @@ def fetch_logs(
         colima = ColimaRuntime()
         names = [ecs_compute.container_name(env, task_id, cdef_name) for task_id, cdef_name in containers]
         return _from_containers(env, node, kind, colima, names, tail)
+
+    if kind == "elasticache":
+        cluster = _find_cache_cluster(stores, env, node)
+        if cluster is None:
+            return LogsResponse(env=env, node=node, kind=kind, found=True, message=f"no cache cluster backs node {node!r} yet")
+        name = cache_compute.container_name(env, cluster["cache_cluster_id"])
+        # Always Colima, matching RedisCache's own default runtime (the same
+        # reasoning the lambda/ecs branches above record).
+        return _from_containers(
+            env, node, kind, ColimaRuntime(), [name], tail,
+            absent_message=f"{name} is not running (cluster status: {cluster['status']})",
+        )
 
     return LogsResponse(env=env, node=node, kind=kind, found=True, message=f"no logs available for kind {kind!r}")
 

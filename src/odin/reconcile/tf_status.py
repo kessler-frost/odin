@@ -1,11 +1,11 @@
 """Fix-wave 2b finding #1 -- a pure, read-only projection of the TF-owned
-resource kinds (vpc/subnet/sg/ec2/ecs/lambda/iam_role/ecr: the kinds
+resource kinds (vpc/subnet/sg/ec2/ecs/lambda/iam_role/ecr/elasticache: the kinds
 `agent/hcl.py` can build and only `tofu apply`/`tofu destroy` ever
 creates/destroys -- s3/sqs/sns/dynamodb are excluded, those already get real
 World entries via the reconciler's own PROVISIONED path in plan.py) from the
 gateway's synth stores into `label -> (kind, phase, facts, verdict)`.
 
-Before this fix these 8 kinds never entered World at all: the canvas showed
+Before this fix these kinds never entered World at all: the canvas showed
 a permanently stale DRAFT badge even once tofu had a real VM/service/
 function/role/repo/network up. `Reconciler.tick()` calls `project()` once
 per tick (see reconcile/reconciler.py) and diffs the result against the
@@ -30,8 +30,9 @@ Label resolution is uniform across every kind: prefer the `odin:node` tag
 `agent/hcl.py::_tags_block` stamps on every canvas-node-backed resource,
 falling back to the resource's own AWS-native name field where one exists
 (sg's GroupName, iam_role's RoleName, ecr's repositoryName, lambda's
-FunctionName, ecs's serviceName -- all of which already equal the canvas
-label by construction, per hcl.py's own builders) -- vpc/subnet/ec2 have NO
+FunctionName, ecs's serviceName, elasticache's CacheClusterId -- all of which
+already equal the canvas label by construction, per hcl.py's own builders)
+-- vpc/subnet/ec2 have NO
 such native field (real CreateVpc/CreateSubnet/RunInstances take no `Name`
 argument), so the tag is their ONLY route back to a label; an untagged
 vpc/subnet/ec2 (e.g. a resource applied before this feature existed) is
@@ -40,10 +41,11 @@ simply not projected yet, rather than guessing.
 from __future__ import annotations
 
 from odin.compute.tasks import TaskRuntime
+from odin.gateway.models import cachectl
 from odin.gateway.models.ecsctl import sweep_tasks
 from odin.gateway.stores import SynthStores
 
-TF_OWNED_KINDS = frozenset({"vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr"})
+TF_OWNED_KINDS = frozenset({"vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr", "elasticache"})
 
 # EC2's real instance-state machine (gateway/models/ec2compute.py's own
 # `_STATE_CODES` keys) -> the World Phase enum. `terminated` is deliberately
@@ -161,6 +163,37 @@ def _lambda_functions(stores: SynthStores, env: str) -> Projected:
     return out
 
 
+# ElastiCache's cluster statuses (gateway/models/cachectl.py) -> World Phase.
+# `deleting` maps to `starting` for the same reason ec2's `shutting-down` does:
+# a delete can fail and the container outlive it, so the node stays visible
+# until the record is actually gone (which is what prunes it from World).
+# `create-failed` is odin's own status for "the Redis container never came up"
+# -- see cachectl.py's docstring for why it isn't one of AWS's.
+_CACHE_PHASE = {
+    cachectl.STATUS_CREATING: "starting",
+    cachectl.STATUS_AVAILABLE: "healthy",
+    cachectl.STATUS_DELETING: "starting",
+    cachectl.STATUS_CREATE_FAILED: "crashed",
+}
+
+
+def _cache_clusters(stores: SynthStores, env: str) -> Projected:
+    """W2.8. The ONLY projection here that publishes real FACTS: an `available`
+    cluster's `REDIS_URL`/`REDIS_URL_VM` endpoints, so a consumer's
+    `${{cache.REDIS_URL}}` ref resolves through the Fabric off World exactly
+    the way rds's `DATABASE_URL` does (`cachectl.facts`)."""
+    out: Projected = {}
+    for record in cachectl.clusters(stores, env):
+        tags = stores.tags.get(env, f"elasticache:{record['arn']}", {})
+        label = _label(tags, record["cache_cluster_id"])
+        if not label:
+            continue
+        phase = _CACHE_PHASE.get(record["status"], "starting")
+        verdict = (record.get("status_reason") or None) if phase == "crashed" else None
+        out[label] = ("elasticache", phase, cachectl.facts(record), verdict)
+    return out
+
+
 def _ecs_tasks_for(stores: SynthStores, env: str, cluster_name: str, service_name: str) -> list[dict]:
     prefix = f"task:{cluster_name}:"
     return [
@@ -223,4 +256,5 @@ def project(stores: SynthStores, env: str, ecs_runtime: TaskRuntime | None = Non
     out.update(_ec2_instances(stores, env))
     out.update(_lambda_functions(stores, env))
     out.update(_ecs_services(stores, env, ecs_runtime))
+    out.update(_cache_clusters(stores, env))
     return out

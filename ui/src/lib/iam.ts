@@ -12,6 +12,11 @@ export const defaultPermissions: Record<string, string[]> = {
   sqs: ['sqs:SendMessage', 'sqs:ReceiveMessage'],
   sns: ['sns:Publish'],
   rds: ['rds-db:connect'],
+  // CONTROL plane only. ElastiCache's data plane is the raw Redis protocol —
+  // not AWS-signed, never routed through odin's gateway — so an edge here
+  // grants Describe/Modify, and nothing odin does at the IAM layer can gate a
+  // GET/SET (that's a security-group question). See ROADMAP's limits.
+  elasticache: ['elasticache:DescribeCacheClusters'],
 };
 
 // Compute kinds act as IAM principals; permission edges run compute → resource.

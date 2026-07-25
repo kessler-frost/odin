@@ -4,9 +4,10 @@ Two modes (research-verified, docs/superpowers/research/research-tofu-provider.m
 §5 "Import direction"):
 
 (a) **deterministic** (`parse_hcl*`): parse an existing project's HCL for the
-    5 supported resource types (aws_s3_bucket, aws_sqs_queue, aws_sns_topic,
-    aws_sns_topic_subscription, aws_dynamodb_table) into canvas nodes+edges.
-    Unsupported types are LISTED, never dropped (northstar directive 5).
+    supported resource types (aws_s3_bucket, aws_sqs_queue, aws_sns_topic,
+    aws_sns_topic_subscription, aws_dynamodb_table, aws_iam_role,
+    aws_elasticache_cluster) into canvas nodes+edges. Unsupported types are
+    LISTED, never dropped (northstar directive 5).
 
 (b) **live-state import** (`import_live`): resources already exist in the
     env's backings (created out-of-band, or by a prior tofu apply) but were
@@ -46,16 +47,23 @@ _KIND = {
     "aws_sns_topic": "sns",
     "aws_dynamodb_table": "dynamodb",
     "aws_iam_role": "iam_role",
+    "aws_elasticache_cluster": "elasticache",
 }
 # The attribute each supported type's human-facing name lives in (mirrors
-# hcl.py's builders: s3 uses `bucket`, everything else uses `name`).
+# hcl.py's builders: s3 uses `bucket`, elasticache uses `cluster_id`,
+# everything else uses `name`).
 _NAME_ATTR = {
     "aws_s3_bucket": "bucket", "aws_sqs_queue": "name", "aws_sns_topic": "name",
     "aws_dynamodb_table": "name", "aws_iam_role": "name",
+    "aws_elasticache_cluster": "cluster_id",
 }
 # canvas kind -> aws_* type, for mode (b) (the inverse of `_KIND`). iam_role has
-# no backing to live-import against, so it stays out of the live path.
-_TF_TYPE = {kind: rtype for rtype, kind in _KIND.items() if kind != "iam_role"}
+# no backing to live-import against, so it stays out of the live path --
+# elasticache likewise: its clusters exist only as gateway-model records plus a
+# real container, and there's no `_import_id` shape to resolve one from outside
+# a canvas Apply (mode (a), reading an existing HCL project, works fine).
+_LIVE_EXCLUDED = ("iam_role", "elasticache")
+_TF_TYPE = {kind: rtype for rtype, kind in _KIND.items() if kind not in _LIVE_EXCLUDED}
 
 # The HCL arguments each kind CARRIES into the canvas -- so a round-trip through
 # generate_tf reproduces them (finding #6). Any OTHER argument present on the
@@ -68,6 +76,10 @@ _CARRIED_ATTRS = {
     "sns": {"name"},
     "dynamodb": {"name", "hash_key", "range_key", "attribute"},
     "iam_role": {"name"},  # assume_role_policy/inline policies are NOT carried -> warned
+    # engine/num_cache_nodes are carried because hcl.py always re-emits them
+    # (redis, 1) -- so a round-trip reproduces the resource without warning
+    # about arguments odin does model, just doesn't need on the node.
+    "elasticache": {"cluster_id", "engine", "node_type", "num_cache_nodes", "tags"},
 }
 
 
@@ -176,6 +188,10 @@ def _node_data(kind: str, label: str, attrs: dict) -> dict:
         tags = _tags(attrs)
         if tags:
             data["tags"] = tags
+    if kind == "elasticache":
+        node_type = hcl.unquote(attrs.get("node_type"))
+        if isinstance(node_type, str):
+            data["nodeType"] = node_type
     return data
 
 

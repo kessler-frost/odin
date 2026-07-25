@@ -27,7 +27,9 @@ _REF = re.compile(r"^\$\{\{\s*([\w-]+)\.([\w-]+)\s*\}\}$")
 # way via CreateFunction (gateway/models/lambdactl.py); ecs's (per-task
 # Colima containers) via CreateService/UpdateService
 # (gateway/models/ecsctl.py) -- the reconciler never touches any of them,
-# same as vpc/subnet/sg.
+# same as vpc/subnet/sg. elasticache (W2.8) is the newest of these: its REAL
+# lifecycle (a per-cluster redis:7-alpine container) is driven by
+# CreateCacheCluster/DeleteCacheCluster in gateway/models/cachectl.py.
 _KIND = {
     "rds": "rds",
     "s3": "s3",
@@ -42,6 +44,7 @@ _KIND = {
     "ec2": "ec2",
     "lambda": "lambda",
     "ecs": "ecs",
+    "elasticache": "elasticache",
 }
 
 

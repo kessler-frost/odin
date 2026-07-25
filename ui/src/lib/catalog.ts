@@ -87,6 +87,26 @@ export const CATALOG: ServiceDef[] = [
     primary: { key: 'engine', label: 'Engine' },
     iamActions: ['rds-db:connect', 'rds:DescribeDBInstances', 'rds:*'],
   },
+  // elasticache (W2.8) is a REAL, gateway-modeled service (NORTHSTAR directive
+  // 5): the drawn node IS one `aws_elasticache_cluster`, backed by a real
+  // redis:7-alpine container whose published port is advertised as the
+  // cluster's node endpoint (${{<node>.REDIS_URL}} from a container consumer,
+  // ${{<node>.REDIS_URL_VM}} from an EC2 one). SINGLE NODE in v1 — no node-count
+  // field, because the gateway rejects anything but 1 (see ROADMAP's limits).
+  // The `iamActions` below gate the CONTROL plane only: Redis's own wire
+  // protocol isn't AWS-signed, so no IAM edge can ever gate a GET/SET.
+  // Renders via the generic ServiceNode, no bespoke component.
+  {
+    type: 'elasticache', abbr: 'ELC', label: 'ElastiCache', sublabel: 'Redis cache cluster',
+    category: 'Database', color: 'teal', width: 220,
+    fields: [
+      { key: 'label', label: 'Cluster ID', editable: true },
+      { key: 'nodeType', label: 'Node Type', editable: true },
+    ],
+    defaultData: { label: 'cache', nodeType: 'cache.t3.micro' },
+    primary: { key: 'nodeType', label: 'Node' },
+    iamActions: ['elasticache:DescribeCacheClusters', 'elasticache:ModifyCacheCluster', 'elasticache:*'],
+  },
   {
     type: 'secret', abbr: 'SEC', label: 'Secret', sublabel: 'Secrets Manager',
     category: 'Security', color: 'lime', width: 200,

@@ -4,7 +4,7 @@ tests/simulate/test_import_tf_e2e.py (integration, needs Colima/tofu)."""
 from __future__ import annotations
 
 from odin.agent.hcl import generate_tf
-from odin.agent.import_tf import LiveResource, _import_id, parse_hcl_dir, parse_hcl_text
+from odin.agent.import_tf import _TF_TYPE, LiveResource, _import_id, parse_hcl_dir, parse_hcl_text
 from odin.spec.translate import canvas_to_stack
 
 _FULL_TF = '''
@@ -221,3 +221,50 @@ def test_import_id_sqs_builds_a_gateway_routed_queue_url():
 def test_import_id_sns_builds_an_arn():
     result = _import_id(LiveResource(type="sns", id="alerts"), gateway_port=4266)
     assert result == "arn:aws:sns:us-east-1:000000000000:alerts"
+
+
+# --- W2.8: elasticache -------------------------------------------------------
+
+_CACHE_TF = '''
+resource "aws_elasticache_cluster" "sessions" {
+  cluster_id      = "sessions"
+  engine          = "redis"
+  node_type       = "cache.t3.small"
+  num_cache_nodes = 1
+
+  tags = {
+    "odin:node" = "sessions"
+  }
+}
+'''
+
+
+def test_elasticache_cluster_imports_as_an_elasticache_node():
+    result = parse_hcl_text(_CACHE_TF)
+    (node,) = result.nodes
+    assert (node["id"], node["type"]) == ("sessions", "elasticache")
+    assert node["data"]["nodeType"] == "cache.t3.small"
+    assert not any(u.type == "aws_elasticache_cluster" for u in result.unsupported)
+    assert result.warnings == []  # every argument hcl.py emits is carried
+
+
+def test_elasticache_round_trips_back_through_generate_tf():
+    imported = parse_hcl_text(_CACHE_TF)
+    canvas = {"nodes": imported.nodes, "edges": imported.edges}
+    regenerated = generate_tf(canvas_to_stack(canvas)).files["main.tf"]
+    assert 'resource "aws_elasticache_cluster" "sessions"' in regenerated
+    assert '  cluster_id      = "sessions"' in regenerated
+    assert '  node_type       = "cache.t3.small"' in regenerated
+    assert "  num_cache_nodes = 1" in regenerated
+
+
+def test_elasticache_label_falls_back_to_the_hcl_name_when_cluster_id_is_computed():
+    tf = 'resource "aws_elasticache_cluster" "generated" {\n  cluster_id = "${var.prefix}-cache"\n}\n'
+    assert parse_hcl_text(tf).nodes[0]["id"] == "generated"
+
+
+def test_elasticache_stays_out_of_the_live_import_path():
+    # No `_import_id` shape can resolve a cluster from outside a canvas Apply
+    # (it exists only as a gateway-model record + a real container), so mode
+    # (b) reports it unsupported rather than generating a bogus import block.
+    assert "elasticache" not in _TF_TYPE

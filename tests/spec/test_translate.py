@@ -1,7 +1,7 @@
 """S2.5 — canvas graph -> desired Stack (kinds, fields, refs)."""
 from __future__ import annotations
 
-from odin.spec.translate import canvas_to_stack, parse_ref
+from odin.spec.translate import canvas_to_stack, parse_ref, skipped_node_types
 
 
 def test_parse_ref():
@@ -169,3 +169,19 @@ def test_iam_role_and_ecr_translate_with_fields_passed_generically():
     assert by_id["lambda-exec"].fields["inlinePolicy"].value == '{"Version": "2012-10-17"}'
 
     assert by_id["app-image"].kind == "ecr"
+
+
+def test_elasticache_translates_generically_and_is_never_skipped():
+    # W2.8: elasticache is a pure gateway-model kind like iam_role/ecr --
+    # `_resource` needs no special-casing, just the _KIND mapping. The
+    # skipped-types check is the northstar directive-5 half: a drawable kind
+    # must be BACKED or explicitly skipped, never silently ignored.
+    canvas = {
+        "nodes": [{"id": "n1", "type": "elasticache", "data": {"label": "cache", "nodeType": "cache.t3.small"}}],
+        "edges": [],
+    }
+    stack = canvas_to_stack(canvas)
+    (res,) = stack.resources
+    assert (res.id, res.kind) == ("cache", "elasticache")
+    assert res.fields["nodeType"].value == "cache.t3.small"
+    assert skipped_node_types(canvas) == []
