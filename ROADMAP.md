@@ -120,6 +120,18 @@ future decision against these points instead of re-deriving them:
   - SNS→SQS live-edit: FIXED (v0.5.0) — adding a subscription edge to an
     already-healthy topic lands on the next Apply via the reconciler's
     observe pass (proven by real fanout to both queues).
+  - **Every odin-generated SNS→SQS subscription sets
+    `raw_message_delivery = true`, including on an import round trip where the
+    source didn't have it.** Stated here because it CHANGES DELIVERY SEMANTICS:
+    the queue receives the published body verbatim instead of SNS's JSON
+    envelope, so a consumer that parses `Message` out of an envelope will not
+    find one. It is deliberate and load-bearing rather than cosmetic — the
+    reconciler's own `provision()` path subscribes with
+    `Attributes={"RawMessageDelivery": "true"}` (`aws/backings.py`) and goaws
+    honours it, so dropping it from the generated HCL would make a
+    tofu-applied stack deliver differently from an `/apply`-provisioned one.
+    A source `.tf` that wants the envelope has no way to say so today; the
+    round trip will add the attribute back (v0.7.1, field test U3).
   - ElastiCache (W2.8): **single node, redis only.** `aws_elasticache_cluster`
     is real — a `redis:7-alpine` container per cluster, its published port
     advertised as the cluster's node endpoint, zero-drift re-plan — but
@@ -141,6 +153,17 @@ future decision against these points instead of re-deriving them:
     same way RDS's is: a container consumes `${{cache.REDIS_URL}}`
     (`host.docker.internal`), an EC2 (Lima VM) consumer must use
     `${{cache.REDIS_URL_VM}}` (`host.lima.internal`).
+  - **An UNSCOPED list/describe call is denied even with an edge drawn.** A
+    workload with an `rds` edge can call
+    `DescribeDBInstances(DBInstanceIdentifier="db")` but NOT bare
+    `DescribeDBInstances()`; likewise `DescribeCacheClusters(CacheClusterId=…)`
+    versus `DescribeCacheClusters()`. This is correct and AWS-ish — an edge
+    grants an action on the ONE resource it points at, and a wildcard list is a
+    different permission — but it is the first thing an engineer tries, the
+    denial says only "not authorized", and it cost a field tester a confusing
+    hour. Written down here rather than fixed: naming the resource is the
+    intended usage, and the endpoint you actually want is also published as a
+    World fact (`${{db.DATABASE_URL}}` and friends).
   - RDS is Terraform-managed (W2.7 — this used to read "RDS stays off
     Terraform"): an `rds` node compiles to `aws_db_instance`, and the gateway's
     own RDS model (`gateway/models/rdsctl.py`) fulfils CreateDBInstance with
@@ -436,6 +459,20 @@ future decision against these points instead of re-deriving them:
   - The proxy container is NOT covered by W2.2's drift sweep yet — `docker rm`
     it out of band and the load balancer still reports `active` until the next
     Apply re-converges it.
+- **KNOWN INCONSISTENCY — the account id STS reports is not the one in odin's
+  ARNs.** `sts:GetCallerIdentity` answers with a per-env id derived from the env
+  name (`gateway/synth.py::account_for_env` — sha256 of the env, mod 10^12,
+  e.g. `561031708110`), while every ARN odin builds uses the fixed
+  `aws/backings.py::ACCOUNT` = `000000000000`. So a client that builds ARNs from
+  its own caller identity — a very common pattern — builds ARNs odin will not
+  recognise. `account_for_env`'s docstring already records the deferral ("used
+  ONLY for STS's `Account` field for now … unifying the two is deferred"); what
+  was missing is that it's a REAL trap for a workload, not just an internal
+  inconsistency. Fixing it means either making STS return `ACCOUNT` (two lines
+  in `synth.py` plus four assertions in `tests/gateway/test_synth.py`) or
+  threading `env` through every ARN builder in `gateway/models/*` (~20 files,
+  ~40 tests) — the first is the obvious v1 answer, since nothing in odin
+  actually needs per-env account ids. Found by the v0.7.0 field test (U6).
 - **Recorded as UNSUPPORTED for now** (northstar directive 5's honesty rule):
   EKS, CloudFormation, autoscaling, and KMS (the `kms` catalog node is an
   unbacked placeholder — no substitute, no gateway model, and as of W2.6 it
@@ -462,6 +499,29 @@ future decision against these points instead of re-deriving them:
   process control (`start`/`stop`/`status`/`clean`/`doctor`) plus the full
   canvas surface (`canvas get/set`, `translate`, `apply`, `world`, `envs`,
   `events`, `tf`, `import-tf`, `destroy`, `keys issue`), all with `-o json`.
+- [x] **Backup/restore (W2.3) — control plane, not data.** `odin export` /
+  `odin import` tar one env's `.odin/<env>/` (Stack lineage + HEAD,
+  `world.json`, `keys.json`, the gateway's synth stores + lambda zips, the tofu
+  workspace INCLUDING `terraform.tfstate`; `tf/.terraform/`'s provider cache is
+  the one deliberate exclusion). Both work with the server DOWN, which is the
+  whole point. What that means precisely:
+  - **Data-plane state is NOT in the archive.** Restore + Apply gives you fresh
+    backing containers matching the archived desired state: a bucket comes back
+    empty, an RDS table you created is gone.
+  - **One asymmetry worth knowing** (v0.7.1, field test): **CloudWatch
+    log-group events SURVIVE** an export → wipe → import cycle, because odin's
+    log sink is a control-plane sidecar (`gateway/logsctl.json`) rather than a
+    backing container's volume. So log history persists while bucket objects
+    don't — the opposite of what the "control plane, not data" rule leads you
+    to expect for anything that looks like data.
+  - **Guardrails:** refuses an existing env dir without `--force`, refuses any
+    absolute/`..`/link member, and refuses to run while odin is up — as of
+    v0.7.1 detected however the server was started (`odin start` OR a bare
+    `uvicorn odin.server:create_app`), because the pidfile-only check was inert
+    for the launch path the README itself documents.
+  - **The archive is credential-grade**: `keys.json` and every canvas secret in
+    cleartext. Written `0600`, every member stored `0600`, and a restore masks
+    off group/other bits so it can only ever tighten a store's modes.
 - [x] **Packaging (pragmatic scope).** DONE 2026-07-24 (v0.5.0):
   `scripts/install.sh` (one command: brew tools + colima up + odin + doctor)
   and `odin doctor` (toolchain checks with exact fixes, disk headroom,
