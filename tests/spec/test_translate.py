@@ -1,7 +1,9 @@
 """S2.5 — canvas graph -> desired Stack (kinds, fields, refs)."""
 from __future__ import annotations
 
-from odin.spec.translate import canvas_to_stack, parse_ref, skipped_node_types
+import pytest
+
+from odin.spec.translate import canvas_problems, canvas_to_stack, parse_ref, skipped_node_types
 
 
 def test_parse_ref():
@@ -270,3 +272,73 @@ def test_elasticache_translates_generically_and_is_never_skipped():
     assert (res.id, res.kind) == ("cache", "elasticache")
     assert res.fields["nodeType"].value == "cache.t3.small"
     assert skipped_node_types(canvas) == []
+
+
+# --- canvas_problems: the structural contract (field test 4, P4-5) ---
+
+
+def test_the_malformed_canvas_that_used_to_500_is_a_reported_problem():
+    """Field test 4's own repro: `data.label` a list, with an IAM edge pointing
+    at the node. This reached `Edge(dst=[...])` and died as an unhandled
+    ValidationError under the request handler."""
+    canvas = {
+        "nodes": [{"id": "s3", "type": "s3", "data": {"label": ["s3", "p2-assets"]}}],
+        "edges": [{"source": "s3", "target": "s3", "data": {"edgeType": "iam", "permissions": ["s3:GetObject"]}}],
+    }
+    (problem,) = canvas_problems(canvas)
+    assert "node[0]" in problem and "'s3'" in problem       # WHICH node
+    assert "data.label" in problem and "must be a string" in problem  # WHICH field, and why
+    # And the claim the message makes is true: this canvas really is untranslatable.
+    with pytest.raises(Exception):
+        canvas_to_stack(canvas)
+
+
+@pytest.mark.parametrize("canvas, expected", [
+    ("nodes", "a canvas must be an object"),
+    ({"nodes": {"a": 1}}, "nodes must be a list"),
+    ({"nodes": ["s3"]}, "node[0] must be an object"),
+    ({"nodes": [{"id": ["a"], "type": "s3"}]}, "id must be a string"),
+    ({"nodes": [{"id": "a", "type": ["s3"]}]}, "type must be a string"),
+    ({"nodes": [{"id": "a", "type": "s3", "data": []}]}, "data must be an object"),
+    ({"nodes": [{"id": "a", "type": "s3", "data": {"env": ["A=1"]}}]}, "data.env must be an object"),
+    ({"nodes": [{"type": "s3", "data": {"other": "x"}}]}, 'no "id" and no "data.label"'),
+    ({"nodes": [{"id": "a", "data": {"label": "b"}}]}, 'no "type"'),
+    ({"edges": [{"source": ["a"], "target": "b"}]}, "source must be a string"),
+    ({"edges": [{"source": "a", "target": {"x": 1}}]}, "target must be a string"),
+    ({"edges": [{"source": "a", "target": "b", "data": {"permissions": "s3:*"}}]},
+     "data.permissions must be a list"),
+])
+def test_structurally_invalid_canvases_are_reported(canvas, expected):
+    problems = canvas_problems(canvas)
+    assert any(expected in p for p in problems), problems
+
+
+@pytest.mark.parametrize("canvas", [
+    {},
+    {"nodes": [], "edges": []},
+    # THE BOUNDARY THAT MUST NOT MOVE: a kind odin cannot build is well-formed.
+    # It applies, and is reported through `skipped`/`not_covered` instead.
+    {"nodes": [{"id": "k1", "type": "kinesis", "data": {"label": "stream"}}], "edges": []},
+    # A missing `position` is repaired by `odin canvas set`, never refused.
+    {"nodes": [{"id": "x1", "type": "s3", "data": {"label": "backups"}}], "edges": []},
+    # Any other `data.*` key may hold any JSON value -- it becomes a FieldValue.
+    {"nodes": [{"id": "x1", "type": "ecs", "data": {"label": "api", "ports": [80, 443],
+                                                    "healthCheck": {"path": "/"}, "count": 3}}]},
+    # An edge may name a node that isn't on the canvas (translate keeps the raw id).
+    {"nodes": [], "edges": [{"source": "ghost", "target": "other"}]},
+    # `null` is "not given", the same way translate reads it.
+    {"nodes": [{"id": "x1", "type": "s3", "data": {"label": "b", "env": None}}], "edges": None},
+])
+def test_well_formed_canvases_are_left_alone(canvas):
+    assert canvas_problems(canvas) == []
+    canvas_to_stack(canvas)  # and the claim holds: it really does translate
+
+
+def test_an_unsupported_kind_still_translates_and_still_reports_as_skipped():
+    canvas = {"nodes": [
+        {"id": "k1", "type": "kinesis", "data": {"label": "stream"}},
+        {"id": "b1", "type": "s3", "data": {"label": "bucket"}},
+    ], "edges": []}
+    assert canvas_problems(canvas) == []
+    assert [r.id for r in canvas_to_stack(canvas).resources] == ["bucket"]
+    assert skipped_node_types(canvas) == ["kinesis"]

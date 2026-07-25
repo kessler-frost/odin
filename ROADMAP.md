@@ -191,6 +191,46 @@ future decision against these points instead of re-deriving them:
     `tags` block on `aws_ecs_service` now plans zero-drift — the gateway stores
     the full tag set and echoes it back, with
     `TagResource`/`UntagResource`/`ListTagsForResource` modeled.)
+  - **DURING an apply, `/world` is part live and part cache — which part, and
+    for how long** (field test 4, P4-4; this limit previously existed only as a
+    source comment, which is precisely what northstar directive 5 forbids).
+    Everything `tf_status.project()` computes from the gateway's own records is
+    LIVE on every observation tick (~1s) — that is the blind window closed
+    above — and so is the real state of every **ECS task**, because the
+    projection re-runs `ecsctl.sweep_tasks` on each of those ticks and that
+    sweep now recognises a container that has VANISHED (`absent`), not just one
+    that exited. What is NOT live is the reality sweep for the other three
+    kinds with a runtime footprint:
+    - **ec2** — the Lima VM, checked by a bulk `limactl list`;
+    - **lambda** — the RIE container, checked by a bulk `docker ps`;
+    - **rds** — the Postgres container, checked by a real `pg_ready` connection.
+    For those three an in-flight apply reads the LAST SWEEP'S CACHE
+    (`reconcile/reconciler.py::_project_tf_owned(act=False)`), deliberately and
+    not as an oversight: a sweep does not merely look, it CORRECTS records
+    (`mark_instance_terminated` / `mark_function_failed` /
+    `rdsctl.mark_instance_failed`) off a sample taken while tofu is pulling
+    images and booting VMs — the busy-daemon hazard `reconcile/drift.py`'s
+    confirm-before-correcting note describes, where a false `failed` needs a
+    human Apply to undo. **How long it can be stale:** the rest of the apply,
+    plus up to one sweep cadence after it returns — `ODIN_DRIFT_SWEEP_TICKS`,
+    default 10 ticks ≈ 10s at the production 1s poll — because the cadence
+    counter does not advance while suspended and the tick both routes run right
+    after the hold does not force a sweep. Field test 4 measured exactly that
+    shape before the ECS half was closed: a container removed 20s into a 63.4s
+    apply was still counted at 3-of-3 for 57s, 14 of them after the apply had
+    returned. Drift reported BEFORE the apply keeps being reported throughout —
+    the cache is stale, never empty. **Also suspended for the same
+    "don't act mid-apply" reason:** the observe pass for the PROVISIONED kinds
+    (s3/sqs/sns/dynamodb — it re-subscribes SNS topics, so it is not read-only,
+    and it would inspect the very backing tofu is creating inside), and the
+    World PRUNE of a label tofu destroyed; both resume on the tick right after.
+    **If you need certainty about an ec2/lambda/rds resource, don't read
+    `/world` mid-apply** — wait for the apply to return and give it one sweep
+    (~10s), or ask the substrate directly: `odin doctor`, `docker ps`,
+    `limactl list` and a `psql` connection all bypass this cache entirely.
+    (Pinned by `tests/reconcile/test_reconciler.py`'s
+    `test_a_task_container_removed_mid_apply_is_seen_within_one_tick` and
+    `test_a_deleted_ec2_vm_is_NOT_seen_until_the_apply_releases`.)
   - SNS→SQS live-edit: FIXED (v0.5.0) — adding a subscription edge to an
     already-healthy topic lands on the next Apply via the reconciler's
     observe pass (proven by real fanout to both queues).
