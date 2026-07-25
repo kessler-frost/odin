@@ -13,8 +13,9 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from odin.agent import debugger
-from odin.api.debug import build_context, create_debug_router
+from odin.api.debug import build_context, create_debug_router, issued_credentials
 from odin.api.ws import ConnectionManager
+from odin.gateway.keys import KeyStore
 from odin.gateway.stores import SynthStores
 from odin.runtime.colima import ContainerFacts, HostFacts
 from odin.server import create_app
@@ -223,6 +224,34 @@ def test_a_secret_typed_on_the_canvas_never_reaches_the_agent(app_client, monkey
     app_client.post("/agent/debug", json={"env": ENV, "node_ids": ["db"]})
     assert "hunter2-secret-value" not in json.dumps(seen[-1]["context"])
     assert seen[-1]["context"]["nodes"]["db"]["desired"]["fields"]["password"]["value"] == "[REDACTED]"
+
+
+def test_a_gateway_issued_credential_never_reaches_the_agent(tmp_path):
+    """Field test 2 finding #6, end to end through the route's own assembly: a
+    REAL key pair minted by the REAL KeyStore, planted in the crash verdict the
+    way a failed `docker run` used to put it there, must be redacted -- by name,
+    not by the 200-char clip that was covering it with 35 characters to spare."""
+    store = SpecStore(tmp_path)
+    store.apply(Stack(env=ENV))
+    access_key, secret_key = KeyStore(store.root).issue(ENV, "web-svc")
+    assert len(secret_key) == 40  # a real issued pair, not a stand-in
+    store.apply_delta(WorldDelta(
+        env=ENV, resource_id="web-svc", kind="ecs", phase="crashed",
+        verdict=f"docker run odin-ecs-{ENV}-web-svc failed: -e AWS_SECRET_ACCESS_KEY={secret_key}",
+        facts={"logtail": f"AWS_ACCESS_KEY_ID={access_key}"},
+    ))
+
+    context = build_context(
+        store, SynthStores(tmp_path), LoggingRuntime(), ConnectionManager(tmp_path), ENV, ["web-svc"],
+    )
+
+    dumped = json.dumps(context)
+    assert secret_key not in dumped and access_key not in dumped
+    assert "docker run odin-ecs-dbg-web-svc failed" in dumped  # the diagnostic itself survives
+
+
+def test_the_issued_credential_scrub_set_is_empty_for_an_env_that_issued_nothing(tmp_path):
+    assert issued_credentials(SpecStore(tmp_path).root, ENV) == frozenset()
 
 
 def test_build_context_is_usable_without_the_route(tmp_path):

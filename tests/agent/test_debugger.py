@@ -274,6 +274,50 @@ def test_the_prompt_itself_carries_no_secret():
     assert "busybox:latest" in prompt  # non-sensitive evidence is still shown, unredacted
 
 
+# --- field test 2 finding #6: credentials odin ISSUED, not ones it was given --
+
+ISSUED_ACCESS = "AKODINFAKEFAKEFAKEFA"
+ISSUED_SECRET = "fake-issued-secret-000000000000000000000"
+
+
+def test_a_gateway_issued_credential_is_scrubbed_from_the_context():
+    """`Stack.sensitive_values()` can NEVER contain a gateway-issued key: it is
+    built from canvas-authored fields, and these are minted by
+    `gateway/keys.py::KeyStore.issue`. Until now the only thing keeping a
+    workload's live credentials out of the prompt was the 200-char clip -- and
+    in the real verdict field test 2 measured, the access key began at
+    character 235. `extra_secrets` closes that by name instead of by luck."""
+    world = World(env="dbg", resources=(
+        ResourceObserved(
+            id="api", kind="ecs", phase="crashed",
+            verdict=f"docker run odin-ecs-dbg-web failed: AWS_SECRET_ACCESS_KEY={ISSUED_SECRET}",
+            facts={"logtail": f"boot with AWS_ACCESS_KEY_ID={ISSUED_ACCESS}"},
+        ),
+    ))
+    context = assemble_context(
+        STACK, world, [], lambda _n: f"exported AWS_SECRET_ACCESS_KEY={ISSUED_SECRET}", ["api"],
+        extra_secrets=frozenset({ISSUED_ACCESS, ISSUED_SECRET}),
+    )
+    dumped = json.dumps(context)
+    assert ISSUED_SECRET not in dumped and ISSUED_ACCESS not in dumped
+    assert REDACTED in dumped
+    assert "docker run odin-ecs-dbg-web failed" in dumped  # the diagnostic survives
+
+
+def test_a_secret_is_scrubbed_before_the_clip_not_after():
+    """Ordering matters: clipping FIRST can cut a secret in half, and the
+    surviving prefix is no longer a substring `scrub` can match -- a partial
+    credential is still a leak."""
+    long_verdict = "x" * (debugger.MAX_VALUE_CHARS - 10) + ISSUED_SECRET
+    world = World(env="dbg", resources=(
+        ResourceObserved(id="api", kind="ecs", phase="crashed", verdict=long_verdict),
+    ))
+    context = assemble_context(
+        STACK, world, [], _logs, ["api"], extra_secrets=frozenset({ISSUED_SECRET}),
+    )
+    assert ISSUED_SECRET[:10] not in json.dumps(context)
+
+
 # --- the assembler: caps ----------------------------------------------------
 
 

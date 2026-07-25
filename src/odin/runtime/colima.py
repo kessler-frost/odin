@@ -158,6 +158,26 @@ def _merge_log_streams(stdout: str, stderr: str, tail: int) -> str:
     return "\n".join(text for _stamp_value, text in lines[-tail:])
 
 
+def _command_label(args: tuple[str, ...]) -> str:
+    """WHICH command failed, in the shortest honest form: the subcommand plus
+    the container it named (`run odin-ecs-wa-…-web-svc`, `cp`).
+
+    NEVER the full argv, which is what this message used to be. A workload
+    container's argv carries its whole ENVIRONMENT -- the gateway credentials
+    `gateway/keys.py::workload_env` injects as `-e AWS_SECRET_ACCESS_KEY=…`, an
+    rds `POSTGRES_PASSWORD`, a resolved `DATABASE_URL` -- and this message does
+    not stay local: `gateway/models/ecsctl.py` records `str(exc)` as the task's
+    `stopped_reason`, `tf_status.py` projects that as the World verdict, and the
+    reconciler broadcasts it on the WebSocket and appends it to
+    `.odin/{env}/events.jsonl` (field test 2 finding #6 -- a real workload
+    secret key was found in four durable log entries). The argv was also what
+    pushed the real docker error past the 200-char clip in
+    `agent/debugger.py`, so the diagnosis lost the one line that explained the
+    failure. Now the error text leads with the reason."""
+    named = args.index("--name") + 1 if "--name" in args else 0
+    return " ".join(part for part in (args[0], args[named] if named else "") if part)
+
+
 @dataclass
 class _Proc:
     returncode: int
@@ -175,6 +195,9 @@ class _ContainerRuntime:
     container-CLI seam) and optionally `_run_flags` (runtime-specific run args).
     The subprocess runner is injectable, so subclasses are unit-testable."""
 
+    # The container CLI's name, for failure messages (`_command_label`).
+    CLI = "container"
+
     def __init__(self, runner=None) -> None:
         self._run = runner or _default_runner
 
@@ -187,10 +210,9 @@ class _ContainerRuntime:
         raise NotImplementedError
 
     def _cli(self, *args: str, check: bool = True, input: str | None = None) -> str:
-        argv = self._argv(*args)
-        proc = self._run(argv, input=input)
+        proc = self._run(self._argv(*args), input=input)
         if check and proc.returncode != 0:
-            raise RuntimeError(f"{' '.join(argv)} failed: {proc.stderr.strip()}")
+            raise RuntimeError(f"{self.CLI} {_command_label(args)} failed: {proc.stderr.strip()}")
         return proc.stdout.strip()
 
     def _run_flags(self) -> list[str]:
@@ -334,6 +356,8 @@ class _ContainerRuntime:
 
 class ColimaRuntime(_ContainerRuntime):
     """Drives `docker` (Colima) directly on the host."""
+
+    CLI = "docker"
 
     def _argv(self, *args: str) -> list[str]:
         return ["docker", *args]

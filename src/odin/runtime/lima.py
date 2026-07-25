@@ -46,6 +46,7 @@ LIMA_HOST = "host.lima.internal"
 
 class LimaRuntime(_ContainerRuntime):
     VM = "odin-host"
+    CLI = "nerdctl"
 
     def _lima(self, *args: str, check: bool = True, input: str | None = None) -> str:
         proc = self._run(["limactl", *args], input=input)

@@ -13,6 +13,8 @@ was talking constantly.
 """
 from __future__ import annotations
 
+import pytest
+
 from odin.runtime.colima import ColimaRuntime, ContainerSpec, _Proc
 
 
@@ -137,6 +139,43 @@ def test_a_postgres_lines_own_leading_date_is_never_mistaken_for_the_stamp():
         "2026-07-25T14:00:01.000000000Z 2026-07-25 14:00:01.123 UTC [1] LOG:  ready\n"
     ))
     assert ColimaRuntime(runner=runner).logs("pg") == "2026-07-25 14:00:01.123 UTC [1] LOG:  ready"
+
+
+def test_a_failed_run_names_the_container_and_the_error_never_the_credentials():
+    """Field test 2 finding #6 (security): this exception text becomes an ECS
+    task's `stopped_reason`, and from there the World verdict -> the WebSocket
+    -> the durable `events.jsonl`. The old message was the whole argv, which
+    for any workload container carries `-e AWS_SECRET_ACCESS_KEY=…` (issued by
+    `gateway/keys.py::workload_env`) -- and pushed the actual docker error past
+    every downstream truncation."""
+    def runner(args, input=None):
+        return _Proc(1, "", "Unable to find image 'nginx:bogus-9z9z' locally")
+
+    rt = ColimaRuntime(runner=runner)
+    with pytest.raises(RuntimeError) as raised:
+        rt.run_container(ContainerSpec(
+            name="odin-ecs-wa-a53adf2b-web-svc", image="nginx:bogus-9z9z",
+            env={"AWS_ACCESS_KEY_ID": "AKODINFAKEFAKEFAKEFA",
+                 "AWS_SECRET_ACCESS_KEY": "fake-issued-secret-000000000000000000000",
+                 "DATABASE_URL": "postgresql://app:fake-db-password@host.docker.internal:33366/appdb"},
+        ))
+    message = str(raised.value)
+    assert "AKODINFAKEFAKEFAKEFA" not in message
+    assert "fake-issued-secret-000000000000000000000" not in message
+    assert "fake-db-password" not in message
+    # …and it still says which container died and why, up front.
+    assert message == (
+        "docker run odin-ecs-wa-a53adf2b-web-svc failed: "
+        "Unable to find image 'nginx:bogus-9z9z' locally"
+    )
+
+
+def test_a_failed_command_with_no_named_container_still_names_the_subcommand():
+    def runner(args, input=None):
+        return _Proc(1, "", "no such directory")
+
+    with pytest.raises(RuntimeError, match=r"^docker cp failed: no such directory$"):
+        ColimaRuntime(runner=runner).copy_in("job", "/host/odin.conf", "/etc/nginx/odin.conf")
 
 
 def test_a_failed_log_read_is_empty_not_the_clis_own_error_text():

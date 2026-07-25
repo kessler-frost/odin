@@ -20,11 +20,14 @@ Two halves, deliberately split:
    - **Secrecy.** Env-var VALUES never enter the context (key names only), and
      any `FieldValue.sensitive` field (v0.6.0) is `[REDACTED]`. On top of
      that, every string in the assembled tree -- facts, verdicts, event text,
-     the log tail -- is `scrub()`ed against `Stack.sensitive_values()`, because
-     a real secret rides out on those surfaces too (an rds node's `facts`
-     carry the full `DATABASE_URL`, password included, and a container is free
-     to echo its own env into stdout). See tests/agent/test_debugger.py's leak
-     test, the analogue of test_translate.py's own.
+     the log tail -- is `scrub()`ed against `Stack.sensitive_values()` PLUS the
+     credentials odin itself issued (`extra_secrets`, from
+     `api/debug.py::issued_credentials`), because a real secret rides out on
+     those surfaces too (an rds node's `facts` carry the full `DATABASE_URL`,
+     password included, and a container is free to echo its own env into
+     stdout). Scrubbing happens BEFORE the length clip, so a clip can never
+     leave half a credential behind. See tests/agent/test_debugger.py's leak
+     tests, the analogue of test_translate.py's own.
    - **Caps.** ~40 log lines and 10 events per node, 20 nodes, 20 env-wide
      tofu lines, and every other string clipped -- the context has to stay
      small enough to be one cheap prompt, not a log dump.
@@ -132,12 +135,16 @@ def _clip(value: Any) -> Any:
 
 def _sanitize(value: Any, secrets: frozenset[str]) -> Any:
     """One deep walk that enforces both invariants on every string in the
-    tree: clipped to `MAX_VALUE_CHARS`, then scrubbed of every known-sensitive
-    raw value. Applied to the whole assembled node record (desired fields,
-    observed facts, verdicts, events) so no new surface can be added later
-    that silently skips redaction."""
+    tree: scrubbed of every known-sensitive raw value, then clipped to
+    `MAX_VALUE_CHARS`. Applied to the whole assembled node record (desired
+    fields, observed facts, verdicts, events) so no new surface can be added
+    later that silently skips redaction.
+
+    SCRUB BEFORE CLIP, deliberately (field test 2 finding #6): clipping first
+    can cut a secret in half, and the surviving prefix is no longer a substring
+    `scrub` can match -- a half credential in a model prompt is still a leak."""
     if isinstance(value, str):
-        return scrub(_clip(value), secrets)
+        return _clip(scrub(value, secrets))
     if isinstance(value, dict):
         return {str(k): _sanitize(v, secrets) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -247,6 +254,7 @@ def _log_tail(text: str) -> str:
 
 def assemble_context(
     stack: Stack, world: World, events: list[dict], logs: Callable[[str], str], node_ids: list[str],
+    extra_secrets: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """The pure half. `logs(node_id) -> str` is the caller's resolver (in
     production `api/debug.py` wraps the wave-1 `/logs` per-kind resolution,
@@ -262,8 +270,17 @@ def assemble_context(
     `recent_tf` is the one ENV-level section: the last `MAX_TF_LINES` lines of
     tofu's own apply/destroy output, which belong to no node at all (see
     `_tf_lines`). It rides through the same `_sanitize` walk as everything
-    else, so it is clipped and scrubbed identically."""
-    secrets = stack.sensitive_values()
+    else, so it is clipped and scrubbed identically.
+
+    `extra_secrets` is the scrub set the STACK cannot supply: credentials odin
+    ITSELF issued (`gateway/keys.py::KeyStore`), which by construction are in no
+    canvas field and so can never appear in `Stack.sensitive_values()`. A
+    workload's live access/secret pair reaches these surfaces for real -- a
+    failed `docker run`'s error, a container echoing its own environment -- and
+    field test 2 found the only thing keeping it out of the prompt was the
+    200-char clip, with 35 characters to spare. `api/debug.py` passes the env's
+    issued pairs; a caller that passes none is no worse off than before."""
+    secrets = stack.sensitive_values() | extra_secrets
     unique = list(dict.fromkeys(node_ids))
     selected, omitted = unique[:MAX_NODES], unique[MAX_NODES:]
     nodes = {
