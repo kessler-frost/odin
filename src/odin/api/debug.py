@@ -26,8 +26,10 @@ send no `Origin`, so the guard never sees them.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 
 from fastapi import APIRouter
 from pydantic import BaseModel
@@ -79,6 +81,27 @@ def _logs_reader(store: SpecStore, stores: SynthStores, runtime, env: str):
     return read
 
 
+def issued_credentials(root: Path, env: str) -> frozenset[str]:
+    """Every credential odin ISSUED for this env, as a scrub set for the model
+    prompt (field test 2 finding #6).
+
+    `gateway/keys.py::KeyStore` persists `{node_id: [access_key, secret_key]}`
+    to `<root>/<env>/keys.json` on every mutation, and `server.py` builds that
+    KeyStore on the SpecStore's own root -- so the file is the complete,
+    always-current record without threading a second object through this
+    route. Both halves go in: the access key identifies the principal and the
+    secret authenticates it, and neither belongs in a prompt.
+
+    Read-only and best-effort BY DESIGN: an env that has issued nothing has no
+    file, and a diagnosis must never fail because a scrub set was empty --
+    `assemble_context` still scrubs the Stack's own secrets either way."""
+    path = root / env / "keys.json"
+    if not path.exists():
+        return frozenset()
+    pairs: dict[str, list[str]] = json.loads(path.read_text())
+    return frozenset(value for pair in pairs.values() for value in pair if value)
+
+
 def build_context(
     store: SpecStore, stores: SynthStores, runtime, ws_manager: ConnectionManager, env: str, node_ids: list[str],
 ) -> dict:
@@ -90,7 +113,10 @@ def build_context(
     stack = store.get_stack(env)
     world = store.current_world(env)
     events = ws_manager.get_events(env)
-    return debugger.assemble_context(stack, world, events, _logs_reader(store, stores, runtime, env), node_ids)
+    return debugger.assemble_context(
+        stack, world, events, _logs_reader(store, stores, runtime, env), node_ids,
+        extra_secrets=issued_credentials(store.root, env),
+    )
 
 
 def create_debug_router(
@@ -107,7 +133,12 @@ def create_debug_router(
         context = await asyncio.to_thread(
             build_context, store, stores, runtime, ws_manager, body.env, body.node_ids,
         )
-        result = await (diagnose or debugger.diagnose)(context, body.question or DEFAULT_QUESTION)
+        # Every selected id unknown to odin => an honest answer naming them,
+        # and NO model call: there is no evidence, so the only thing a run
+        # could produce is confident noise (field test 2 finding #8).
+        result = debugger.no_evidence_answer(context, body.node_ids) or await (
+            diagnose or debugger.diagnose
+        )(context, body.question or DEFAULT_QUESTION)
         return DebugResponse(
             env=body.env,
             answer=str(result.get("answer", "")),

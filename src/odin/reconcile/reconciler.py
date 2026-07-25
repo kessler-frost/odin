@@ -140,6 +140,12 @@ class Reconciler:
         prune any label that dropped out (tofu destroyed it -- this loop
         never destroys a TF-owned resource itself).
 
+        This prune is the SOLE authority on a TF-owned label leaving World
+        (see `_execute`'s StopContainer branch): "the desired Stack no longer
+        wants it" is not the same question as "it no longer exists", and
+        answering the second one with the first is what made every
+        odin-synthesized resource flap (field test 2 finding #3).
+
         W2.2: the drift sweep runs FIRST, deliberately -- its ecs half writes
         reality back into the task records (reconcile/drift.py's module
         docstring), so a container removed outside odin surfaces on THIS
@@ -285,16 +291,24 @@ class Reconciler:
         elif isinstance(action, StopContainer):
             if action.kind in PROVISIONED:
                 await asyncio.to_thread(self._aws.deprovision, action.kind, action.id)
-            elif action.kind in TF_OWNED_KINDS:
+            elif action.kind in TF_OWNED_KINDS and self._stores is not None:
                 # tofu (never this reconciler) owns create/destroy for a
-                # TF-managed kind -- a StopContainer here only means a stale
-                # World entry (the canvas node was removed but tofu hasn't
-                # destroyed the real resource yet); `action.name` is a
-                # label, not a real container name, so `self._rt.stop`
-                # would be a no-op at best. Just let the prune below clear
-                # the stale entry; the NEXT tick's projection re-adds it
-                # (still accurately) if the real resource is still there.
-                pass
+                # TF-managed kind, and `_project_tf_owned` -- which prunes any
+                # projected-kind label that has dropped out of the snapshot --
+                # is the ONLY authority on whether the real resource is still
+                # there. So this branch does nothing at all, prune included.
+                #
+                # Pruning here instead was field test 2 finding #3: a resource
+                # odin SYNTHESIZED (a VPC's auto-created `default` security
+                # group, a Lambda's auto-generated execution role) is real,
+                # projected every tick, and in no canvas -- so plan() called it
+                # "observed but not desired" and pruned it, the projection
+                # re-added it, and the pair flapped `draft`/`healthy` forever:
+                # ~1.8 events/second into the WebSocket and the append-only
+                # events.jsonl, burying real crash events. `action.name` is a
+                # label rather than a container name anyway, so there was never
+                # anything for `self._rt.stop` to do here either.
+                return
             else:
                 self._rt.stop(action.name)
             await self._prune(action.id)

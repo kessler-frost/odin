@@ -274,6 +274,100 @@ def test_the_prompt_itself_carries_no_secret():
     assert "busybox:latest" in prompt  # non-sensitive evidence is still shown, unredacted
 
 
+# --- field test 2 finding #8: ids odin has never heard of --------------------
+
+
+def test_an_id_with_no_record_anywhere_is_flagged_unknown():
+    context = _context(node_ids=("db", "d1"))
+    assert context["unknown_nodes"] == ["d1"]
+    assert context["known_nodes"] == ["api", "db"]
+
+
+def test_an_observed_or_event_only_id_counts_as_known():
+    # "Selected but not in the applied stack" is the deliberate desired-None
+    # case, NOT an unknown id: World and the event log are records too.
+    world = World(env="dbg", resources=(ResourceObserved(id="gone", kind="ecs", phase="crashed"),))
+    events = [{"type": "access_denied", "env": "dbg", "resource_id": "principal"}]
+    context = assemble_context(Stack(env="dbg"), world, events, _logs, ["gone", "principal"])
+    assert context["unknown_nodes"] == []
+    assert context["nodes"]["gone"]["desired"] is None
+
+
+def test_the_refusal_names_every_unknown_id_and_the_labels_that_do_exist():
+    context = _context(node_ids=("d1", "e1"))
+    answer = debugger.no_evidence_answer(context, ["d1", "e1"])
+    assert answer["suspects"] == []
+    assert "'d1'" in answer["answer"] and "'e1'" in answer["answer"]
+    assert "no such node" in answer["answer"] and "env 'dbg'" in answer["answer"]
+    assert "api, db" in answer["answer"]
+
+
+def test_a_request_with_one_real_id_is_worth_a_model_call():
+    context = _context(node_ids=("db", "d1"))
+    assert debugger.no_evidence_answer(context, ["db", "d1"]) is None
+
+
+def test_an_empty_selection_is_an_env_wide_question_not_a_refusal():
+    # `node_ids: []` + a failed apply in `recent_tf` is a legitimate
+    # "what's wrong with this environment?" -- there is nothing to refuse.
+    context = _context(node_ids=())
+    assert debugger.no_evidence_answer(context, []) is None
+
+
+def test_the_refusal_says_so_plainly_when_the_env_has_nothing_applied():
+    context = assemble_context(Stack(env="dbg"), World(env="dbg"), [], _logs, ["d1"])
+    answer = debugger.no_evidence_answer(context, ["d1"])
+    assert "no applied nodes at all" in answer["answer"]
+
+
+def test_the_prompt_tells_the_agent_to_call_out_unknown_ids():
+    assert "unknown_nodes" in debugger._SYSTEM
+
+
+# --- field test 2 finding #6: credentials odin ISSUED, not ones it was given --
+
+ISSUED_ACCESS = "AKODINFAKEFAKEFAKEFA"
+ISSUED_SECRET = "fake-issued-secret-000000000000000000000"
+
+
+def test_a_gateway_issued_credential_is_scrubbed_from_the_context():
+    """`Stack.sensitive_values()` can NEVER contain a gateway-issued key: it is
+    built from canvas-authored fields, and these are minted by
+    `gateway/keys.py::KeyStore.issue`. Until now the only thing keeping a
+    workload's live credentials out of the prompt was the 200-char clip -- and
+    in the real verdict field test 2 measured, the access key began at
+    character 235. `extra_secrets` closes that by name instead of by luck."""
+    world = World(env="dbg", resources=(
+        ResourceObserved(
+            id="api", kind="ecs", phase="crashed",
+            verdict=f"docker run odin-ecs-dbg-web failed: AWS_SECRET_ACCESS_KEY={ISSUED_SECRET}",
+            facts={"logtail": f"boot with AWS_ACCESS_KEY_ID={ISSUED_ACCESS}"},
+        ),
+    ))
+    context = assemble_context(
+        STACK, world, [], lambda _n: f"exported AWS_SECRET_ACCESS_KEY={ISSUED_SECRET}", ["api"],
+        extra_secrets=frozenset({ISSUED_ACCESS, ISSUED_SECRET}),
+    )
+    dumped = json.dumps(context)
+    assert ISSUED_SECRET not in dumped and ISSUED_ACCESS not in dumped
+    assert REDACTED in dumped
+    assert "docker run odin-ecs-dbg-web failed" in dumped  # the diagnostic survives
+
+
+def test_a_secret_is_scrubbed_before_the_clip_not_after():
+    """Ordering matters: clipping FIRST can cut a secret in half, and the
+    surviving prefix is no longer a substring `scrub` can match -- a partial
+    credential is still a leak."""
+    long_verdict = "x" * (debugger.MAX_VALUE_CHARS - 10) + ISSUED_SECRET
+    world = World(env="dbg", resources=(
+        ResourceObserved(id="api", kind="ecs", phase="crashed", verdict=long_verdict),
+    ))
+    context = assemble_context(
+        STACK, world, [], _logs, ["api"], extra_secrets=frozenset({ISSUED_SECRET}),
+    )
+    assert ISSUED_SECRET[:10] not in json.dumps(context)
+
+
 # --- the assembler: caps ----------------------------------------------------
 
 

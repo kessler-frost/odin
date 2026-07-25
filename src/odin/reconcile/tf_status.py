@@ -357,6 +357,32 @@ def _ec2_instances(stores: SynthStores, env: str) -> Projected:
     return out
 
 
+def _invocation_verdict(record: dict) -> str | None:
+    """Field test 2 finding #4: a Lambda reported `healthy` while failing every
+    single invocation (the canvas code defined `handler`, the entry point looked
+    for `lambda_handler`, so every call raised `Runtime.HandlerNotFound`).
+
+    The PHASE stays `healthy`, deliberately: the deploy genuinely succeeded and
+    the function really is deployed and serving requests -- calling that
+    `crashed` would be a different lie, and it would make an Apply look like it
+    failed when it didn't. What was actually missing is that odin KNOWS the
+    invocations failed (`lambdactl._invoke` records the FunctionError the RIE
+    reported) and said nothing. So the invocation outcome rides out as the
+    verdict, which is exactly the channel a phase-less truth belongs in: it
+    reaches the WebSocket, `world.json`, `events.jsonl` and M8's evidence
+    bundle, and `Reconciler._emit` already suppresses everything but a CHANGE,
+    so a function failing in a loop costs one delta, not one per invocation.
+
+    Only the LAST invocation's outcome, and no counters in the text: a
+    function that starts working again clears the verdict on its own, and a
+    cold function nobody has invoked yet (no key at all) says nothing rather
+    than raising a false alarm."""
+    error = record.get("last_invocation_error")
+    if not error:
+        return None
+    return f"the last invocation failed ({error}) — the deploy succeeded, the handler did not"
+
+
 def _lambda_functions(stores: SynthStores, env: str) -> Projected:
     out: Projected = {}
     for key, record in stores.lambdactl.items(env).items():
@@ -366,7 +392,10 @@ def _lambda_functions(stores: SynthStores, env: str) -> Projected:
         label = _label(tags, record["function_name"])
         if label:
             phase = _LAMBDA_PHASE.get(record["state"], "starting")
-            verdict = (record.get("state_reason") or None) if phase == "crashed" else None
+            verdict = (
+                (record.get("state_reason") or None) if phase == "crashed"
+                else _invocation_verdict(record)
+            )
             out[label] = ("lambda", phase, {}, verdict)
     return out
 

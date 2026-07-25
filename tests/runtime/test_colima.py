@@ -8,7 +8,11 @@ import time
 
 import pytest
 
+from odin.api.logs import fetch_logs
+from odin.gateway.stores import SynthStores
 from odin.runtime.colima import ColimaRuntime, ContainerSpec
+from odin.spec.models import ResourceDesired, Stack
+from odin.spec.store import SpecStore
 
 pytestmark = pytest.mark.integration
 
@@ -46,3 +50,46 @@ def test_run_status_port_stats_stop(runtime):
 
     runtime.stop(NAME)
     assert runtime.status(NAME) == "absent"
+
+
+# --- field test 2, HIGH-3: the stderr half of a REAL container's log ---------
+
+PG = "odin-rds-logproof-appdb"
+
+
+@pytest.fixture
+def postgres():
+    """A REAL Postgres -- the field-verified stderr-only logger. Named exactly
+    the way `aws/rds.py::PostgresRds` names an rds node's container, so
+    `api/logs.py::fetch_logs` (the function both `odin logs` and the UI reach
+    through `GET /logs`) resolves it for a node labelled `appdb` in env
+    `logproof`, with no tofu/gateway involved."""
+    rt = ColimaRuntime()
+    rt.stop(PG)
+    yield rt
+    rt.stop(PG)
+
+
+def test_a_container_that_logs_only_to_stderr_still_yields_real_lines(postgres, tmp_path):
+    postgres.run_container(ContainerSpec(
+        name=PG, image="postgres:16-alpine", ports={5432: 0},
+        env={"POSTGRES_PASSWORD": "proof", "POSTGRES_DB": "appdb"},
+    ))
+    _wait_running(postgres, PG)
+    # A settled Postgres writes its server log (ready / checkpoint / errors) to
+    # stderr; wait for it to get past initdb's stdout half.
+    time.sleep(12)
+
+    raw = postgres._run(["docker", "logs", "--tail", "10", PG])
+    assert raw.stderr.strip(), "the field premise: this container's log tail is on stderr"
+
+    ten = postgres.logs(PG, tail=10)
+    assert ten.strip(), "odin must not report an empty log for a container that logs on stderr"
+    assert len(ten.splitlines()) == 10, "--tail 10 must mean 10 real lines, not 10-minus-stderr"
+
+    store = SpecStore(tmp_path)
+    store.apply(Stack(env="logproof", resources=(ResourceDesired(id="appdb", kind="rds"),)))
+    result = fetch_logs(store, SynthStores(tmp_path), postgres, "logproof", "appdb", tail=10)
+    assert result.found and result.running and result.sources == [PG]
+    assert len(result.lines.splitlines()) == 10
+    assert "database system is ready to accept connections" in result.lines

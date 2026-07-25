@@ -480,6 +480,103 @@ async def test_stale_tf_owned_world_entry_never_calls_runtime_stop(tmp_path):
     assert rt.stopped == []
 
 
+# --- field test 2 finding #3: a resource odin SYNTHESIZED (a VPC's `default`
+# security group, a Lambda's auto-generated execution role) exists in observed
+# reality with no canvas node behind it. plan() pruned it every tick (observed
+# but not desired) and the projection re-added it every tick -- two deltas a
+# tick, forever: 537 of 1263 events in one 8-minute env, ~840 KiB/hour into an
+# append-only log, and a real ECS crash event buried under it. ---------------
+
+
+def _synthesized_sg_stores(tmp_path):
+    """The auto-created `default` security group: a REAL record in the gateway's
+    store, resolved to a label by its own GroupName, with no `odin:node` tag
+    because no canvas node ever drew it."""
+    stores = SynthStores(tmp_path)
+    stores.ec2net.set("default", "vpc:vpc-1", {"vpc_id": "vpc-1"})
+    stores.tags.set("default", "ec2:vpc-1", {"odin:node": "net"})
+    stores.ec2net.set("default", "sg:sg-1", {"group_id": "sg-1", "group_name": "default"})
+    return stores
+
+
+async def test_a_synthesized_resource_emits_one_delta_across_many_ticks(tmp_path):
+    rt, ws = FakeRuntime(), FakeWS()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(ResourceDesired(id="net", kind="vpc"),)))
+    recon = Reconciler(store, rt, ws=ws, poll_interval=0, stores=_synthesized_sg_stores(tmp_path))
+
+    for _ in range(10):
+        await recon.tick()
+
+    deltas = [m for m in ws.sent if m.get("resource_id") == "default"]
+    assert [m["phase"] for m in deltas] == ["healthy"], "nothing about it changed: one delta, ever"
+
+
+async def test_a_synthesized_resource_stays_in_world_instead_of_flapping_to_draft(tmp_path):
+    rt = FakeRuntime()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(ResourceDesired(id="net", kind="vpc"),)))
+    stores = _synthesized_sg_stores(tmp_path)
+    recon = Reconciler(store, rt, poll_interval=0, stores=stores)
+
+    for _ in range(3):
+        await recon.tick()
+
+    observed = store.current_world().get("default")
+    assert observed is not None and observed.phase == "healthy"  # it really does exist
+
+    # ...and the projection is still the authority on when it's gone: tofu
+    # destroying it (the record disappears) prunes it exactly once.
+    stores.ec2net.delete("default", "sg:sg-1")
+    await recon.tick()
+    assert store.current_world().get("default") is None
+
+
+async def test_a_tf_owned_node_removed_from_the_canvas_is_pruned_once_tofu_destroys_it(tmp_path):
+    # The other side of the same coin: the World entry for a REAL resource must
+    # not be pruned while the resource still exists (that was the flap), but it
+    # must still be pruned -- with the `draft` reset the canvas needs -- as soon
+    # as the resource is genuinely gone.
+    rt, ws = FakeRuntime(), FakeWS()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(ResourceDesired(id="net", kind="vpc"),)))
+    stores = SynthStores(tmp_path)
+    stores.ec2net.set("default", "vpc:vpc-1", {"vpc_id": "vpc-1"})
+    stores.tags.set("default", "ec2:vpc-1", {"odin:node": "net"})
+    recon = Reconciler(store, rt, ws=ws, poll_interval=0, stores=stores)
+    await recon.tick()
+
+    store.apply(Stack())  # the canvas node is gone; tofu hasn't destroyed it yet
+    for _ in range(4):
+        await recon.tick()
+    assert not [m for m in ws.sent if m.get("resource_id") == "net" and m.get("phase") == "draft"]
+
+    stores.ec2net.delete("default", "vpc:vpc-1")  # tofu destroy ran
+    await recon.tick()
+    resets = [m for m in ws.sent if m.get("resource_id") == "net" and m.get("phase") == "draft"]
+    assert len(resets) == 1
+    assert store.current_world().get("net") is None
+
+
+async def test_without_stores_a_stale_tf_owned_entry_is_still_pruned(tmp_path):
+    # No projection wired means nothing else can ever clear the entry, so
+    # plan()'s prune stays in charge -- there is no flap to cause either.
+    rt = FakeRuntime()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(ResourceDesired(id="net", kind="vpc"),)))
+    stores = SynthStores(tmp_path)
+    stores.ec2net.set("default", "vpc:vpc-1", {"vpc_id": "vpc-1"})
+    stores.tags.set("default", "ec2:vpc-1", {"odin:node": "net"})
+    Reconciler(store, rt, poll_interval=0, stores=stores)
+    await Reconciler(store, rt, poll_interval=0, stores=stores).tick()
+    assert store.current_world().get("net") is not None
+
+    store.apply(Stack())
+    await Reconciler(store, rt, poll_interval=0).tick()  # stores=None
+
+    assert store.current_world().get("net") is None
+
+
 async def test_no_stores_configured_does_not_crash_tick(tmp_path):
     rt = FakeRuntime()
     store = SpecStore(tmp_path)

@@ -359,6 +359,42 @@ def test_lambda_failed_state_reason_becomes_the_verdict(tmp_path):
     )
 
 
+# --- field test 2 finding #4: a DEPLOYED function whose invocations all fail --
+
+
+def test_a_deployed_function_whose_last_invocation_failed_says_so_in_its_verdict(tmp_path):
+    # M8 found this unprompted: the handler was named `handler` while the entry
+    # point looked for `lambda_handler`, so every invocation raised
+    # Runtime.HandlerNotFound -- and /world said `healthy` throughout.
+    stores = SynthStores(tmp_path)
+    record = _lambda_fn("fn1", "Active") | {"last_invocation_error": "Unhandled"}
+    stores.lambdactl.set(ENV, "fn:fn1", record)
+
+    kind, phase, facts, verdict = project(stores, ENV)["fn1"]
+    assert (kind, phase, facts) == ("lambda", "healthy", {})  # the DEPLOY really did succeed
+    assert verdict == "the last invocation failed (Unhandled) — the deploy succeeded, the handler did not"
+
+
+def test_a_cold_function_that_has_never_been_invoked_raises_no_alarm(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.lambdactl.set(ENV, "fn:fn1", _lambda_fn("fn1", "Active"))
+    assert project(stores, ENV)["fn1"] == ("lambda", "healthy", {}, None)
+
+
+def test_a_function_whose_last_invocation_succeeded_raises_no_alarm(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.lambdactl.set(ENV, "fn:fn1", _lambda_fn("fn1", "Active") | {"last_invocation_error": None})
+    assert project(stores, ENV)["fn1"] == ("lambda", "healthy", {}, None)
+
+
+def test_a_failed_deploy_still_reports_the_deploy_reason_not_the_invocation_one(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.lambdactl.set(ENV, "fn:fn1", _lambda_fn("fn1", "Failed", "container never became ready") | {
+        "last_invocation_error": "Unhandled",
+    })
+    assert project(stores, ENV)["fn1"] == ("lambda", "crashed", {}, "container never became ready")
+
+
 # --- ecs: healthy iff runningCount == desiredCount; a STOPPED task (always
 # a real failure -- a deliberate stop deletes its record outright) makes an
 # under-capacity service read `crashed` with a real verdict, never a
