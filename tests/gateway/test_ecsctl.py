@@ -1024,6 +1024,12 @@ def test_describe_services_echoes_the_load_balancers_it_was_created_with(sink, e
 
 def test_launching_a_task_registers_its_real_published_port_as_a_target(sink, ecs, stores, target_calls):
     _lb_service(sink, ecs, stores, desired=2)
+    # Registration TRAILS the running count: a task is running for a moment
+    # before it joins the rotation (real ECS behaves the same way), so waiting
+    # on `runningCount` alone raced and saw only the first port ~1 run in 4.
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and len(target_calls["register"]) < 2:
+        time.sleep(0.02)
     # The FakeTaskRuntime publishes containerPort 80 on 10001 / 10002.
     assert sorted(target_calls["register"]) == [
         (ENV, _TG_ARN, CONTAINER_HOST, 10_001),
