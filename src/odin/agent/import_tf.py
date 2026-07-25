@@ -4,9 +4,11 @@ Two modes (research-verified, docs/superpowers/research/research-tofu-provider.m
 §5 "Import direction"):
 
 (a) **deterministic** (`parse_hcl*`): parse an existing project's HCL for the
-    5 supported resource types (aws_s3_bucket, aws_sqs_queue, aws_sns_topic,
-    aws_sns_topic_subscription, aws_dynamodb_table) into canvas nodes+edges.
-    Unsupported types are LISTED, never dropped (northstar directive 5).
+    supported resource types (see `_KIND` -- aws_s3_bucket, aws_sqs_queue,
+    aws_sns_topic, aws_sns_topic_subscription, aws_dynamodb_table,
+    aws_iam_role, aws_cloudwatch_log_group and, since W2.7, aws_db_instance)
+    into canvas nodes+edges. Unsupported types are LISTED, never dropped
+    (northstar directive 5).
 
 (b) **live-state import** (`import_live`): resources already exist in the
     env's backings (created out-of-band, or by a prior tofu apply) but were
@@ -47,17 +49,25 @@ _KIND = {
     "aws_dynamodb_table": "dynamodb",
     "aws_iam_role": "iam_role",
     "aws_cloudwatch_log_group": "logs",
+    "aws_db_instance": "rds",
 }
 # The attribute each supported type's human-facing name lives in (mirrors
-# hcl.py's builders: s3 uses `bucket`, everything else uses `name`).
+# hcl.py's builders: s3 uses `bucket`, rds uses `identifier`, everything else
+# uses `name`).
 _NAME_ATTR = {
     "aws_s3_bucket": "bucket", "aws_sqs_queue": "name", "aws_sns_topic": "name",
     "aws_dynamodb_table": "name", "aws_iam_role": "name",
     "aws_cloudwatch_log_group": "name",
+    "aws_db_instance": "identifier",
 }
 # canvas kind -> aws_* type, for mode (b) (the inverse of `_KIND`). iam_role and
 # logs have no backing to enumerate live resources from (both are pure gateway
-# models), so they stay out of the live path.
+# models), so they stay out of the live path. `rds` DOES stay in it: an
+# `aws_db_instance`'s import id is its bare DBInstanceIdentifier (the `_import_id`
+# default branch) and the gateway answers DescribeDBInstances for real -- the one
+# thing `tofu plan -generate-config-out` cannot recover is the master `password`
+# (no AWS API ever returns it), so a live-imported database comes back with
+# hcl.py's default password rather than the original one.
 _NO_LIVE_IMPORT = {"iam_role", "logs"}
 _TF_TYPE = {kind: rtype for rtype, kind in _KIND.items() if kind not in _NO_LIVE_IMPORT}
 
@@ -73,11 +83,18 @@ _CARRIED_ATTRS = {
     "dynamodb": {"name", "hash_key", "range_key", "attribute"},
     "iam_role": {"name"},  # assume_role_policy/inline policies are NOT carried -> warned
     "logs": {"name", "retention_in_days", "tags"},
+    # `password` IS carried (unlike every other secret odin touches): dropping
+    # it would make a round-trip through generate_tf silently substitute the
+    # DEFAULT password, i.e. a real credential change on the next apply.
+    "rds": {
+        "identifier", "engine", "instance_class", "allocated_storage", "db_name",
+        "username", "password", "skip_final_snapshot", "tags",
+    },
 }
 # The kinds whose user `tags` map survives the round trip as node data (hcl.py's
 # `_tags_block` merges a node's own `tags` field back in for EVERY primary
 # builder, so this is purely about which imports bother to read them).
-_TAGGED_KINDS = {"s3", "logs"}
+_TAGGED_KINDS = {"s3", "logs", "rds"}
 
 
 class Unsupported(BaseModel):
@@ -187,6 +204,16 @@ def _node_data(kind: str, label: str, attrs: dict) -> dict:
         retention = attrs.get("retention_in_days")
         if isinstance(retention, int):
             data["retentionInDays"] = str(retention)
+    if kind == "rds":
+        # python-hcl2 parses an unquoted `allocated_storage = 20` as a real int
+        # (the same thing logs' retention does); the canvas fields are text.
+        storage = attrs.get("allocated_storage")
+        data["allocatedStorage"] = str(storage) if isinstance(storage, int) else "20"
+        for attr, field in (("engine", "engine"), ("instance_class", "instanceClass"),
+                            ("db_name", "dbName"), ("username", "username"), ("password", "password")):
+            value = hcl.unquote(attrs.get(attr))
+            if isinstance(value, str):
+                data[field] = value
     if kind in _TAGGED_KINDS:
         tags = _tags(attrs)
         if tags:

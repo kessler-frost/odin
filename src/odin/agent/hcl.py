@@ -26,10 +26,13 @@ _REGION = "us-east-1"
 _SANITIZE = re.compile(r"[^a-z0-9_]")
 
 # kind -> human reason it can't be simulated yet. Anything not in the map (and
-# not one of the supported kinds below) gets a generic fallback reason.
-_UNSUPPORTED_REASONS = {
-    "rds": "Simulate v1 — stays on the reconciler path",
-}
+# not one of the supported kinds below) gets a generic fallback reason. Empty
+# today: W2.7 moved the last entry (`rds`) onto Terraform, so every kind
+# `spec/translate.py` knows about has a builder below. Kept (rather than
+# deleted) because it's the per-kind half of the two-level honesty rule
+# `generate_tf` implements -- a whole kind with no builder, versus one
+# resource a builder declines (see `Built`).
+_UNSUPPORTED_REASONS: dict[str, str] = {}
 
 # Public: the translation agent (S3b) and TF import (S4) both need the
 # terraform{} header (a live-import scratch project builds one from scratch)
@@ -550,6 +553,64 @@ def _logs(res: ResourceDesired, refs: Refs) -> Built:
     return attrs, ""
 
 
+# W2.7: RDS instances (a real Postgres container per instance, gateway/models/
+# rdsctl.py). Two things make this builder unlike the others:
+#
+# 1. The canvas label IS the `identifier`, which real RDS constrains harder
+#    than any other name odin emits (letters/digits/hyphens, must start with a
+#    letter, no trailing or doubled hyphen -- terraform-provider-aws validates
+#    it client-side, so a bad one fails at plan time, before the gateway is
+#    even reached). Rather than let that surface as a raw provider error, or
+#    quietly rename the node behind the user's back (which would break the
+#    `${{db.DATABASE_URL}}` ref path AND the container name), the resource is
+#    declined with a reason that says exactly what to fix.
+# 2. `engine` is honest, not decorative. The substrate is Postgres; a canvas
+#    that asks for mysql/mariadb gets declined rather than silently handed a
+#    Postgres container (the pre-W2.7 reconciler path did exactly that).
+_RDS_IDENTIFIER = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$")
+_RDS_ENGINE = "postgres"
+_DEFAULT_DB_INSTANCE_CLASS = "db.t3.micro"
+_DEFAULT_ALLOCATED_STORAGE = "20"
+_DEFAULT_DB_USERNAME = "app"
+_DEFAULT_DB_PASSWORD = "apppass123"
+_DEFAULT_DB_NAME = "postgres"
+_BAD_RDS_IDENTIFIER = (
+    "an RDS name must be lowercase letters/digits separated by single hyphens "
+    "and start with a letter (e.g. app-db) — rename the node"
+)
+_BAD_RDS_STORAGE = "allocatedStorage must be a whole number of GiB (e.g. 20)"
+
+
+def _rds_engine_unsupported(engine: str) -> str:
+    return f"engine {engine!r} has no local substrate — odin runs a real Postgres, so only postgres is supported"
+
+
+def _rds(res: ResourceDesired, refs: Refs) -> Built:
+    if not _RDS_IDENTIFIER.match(res.id):
+        return _BAD_RDS_IDENTIFIER
+    engine = _field(res, "engine", _RDS_ENGINE)
+    if engine != _RDS_ENGINE:
+        return _rds_engine_unsupported(engine)
+    storage = _field(res, "allocatedStorage", _DEFAULT_ALLOCATED_STORAGE).strip()
+    if not storage.isdigit():
+        return _BAD_RDS_STORAGE
+    return {
+        "identifier": quote(res.id),
+        "engine": quote(engine),
+        "instance_class": quote(_field(res, "instanceClass", _DEFAULT_DB_INSTANCE_CLASS)),
+        "allocated_storage": storage,
+        "db_name": quote(_field(res, "dbName", _DEFAULT_DB_NAME)),
+        "username": quote(_field(res, "username", _DEFAULT_DB_USERNAME)),
+        "password": quote(_field(res, "password", _DEFAULT_DB_PASSWORD)),
+        # A final snapshot is meaningless for a local dev database (there is no
+        # snapshot surface at all -- gateway/models/rdsctl.py's own limit), and
+        # leaving it false makes `tofu destroy` refuse without a
+        # `final_snapshot_identifier`: the same spirit as s3's `force_destroy`,
+        # and what keeps "empty canvas + Apply = full teardown" true.
+        "skip_final_snapshot": "true",
+    }, ""
+
+
 # kind -> terraform resource type; kept separate from _BUILDERS so pass 1 of
 # generate_tf can assign HCL names (scoped per resource type) without running
 # any builder.
@@ -567,6 +628,7 @@ _TF_TYPES = {
     "lambda": "aws_lambda_function",
     "ecs": "aws_ecs_service",
     "logs": "aws_cloudwatch_log_group",
+    "rds": "aws_db_instance",
 }
 
 _BUILDERS = {
@@ -583,6 +645,7 @@ _BUILDERS = {
     "lambda": _lambda,
     "ecs": _ecs,
     "logs": _logs,
+    "rds": _rds,
 }
 
 

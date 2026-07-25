@@ -16,7 +16,7 @@ _FULL_CANVAS = {
         {"id": "n2", "type": "sqs", "data": {"label": "jobs"}},
         {"id": "n3", "type": "sns", "data": {"label": "alerts"}},
         {"id": "n4", "type": "dynamodb", "data": {"label": "items", "hashKey": "pk"}},
-        {"id": "n5", "type": "rds", "data": {"label": "db", "engine": "postgres"}},
+        {"id": "n5", "type": "rds", "data": {"label": "app-db", "engine": "postgres"}},
     ],
     "edges": [{"source": "n3", "target": "n2"}],
 }
@@ -48,6 +48,21 @@ resource "aws_dynamodb_table" "items" {
 
   tags = {
     "odin:node" = "items"
+  }
+}
+
+resource "aws_db_instance" "app_db" {
+  identifier          = "app-db"
+  engine              = "postgres"
+  instance_class      = "db.t3.micro"
+  allocated_storage   = 20
+  db_name             = "postgres"
+  username            = "app"
+  password            = "apppass123"
+  skip_final_snapshot = true
+
+  tags = {
+    "odin:node" = "app-db"
   }
 }
 
@@ -98,11 +113,66 @@ def test_s3_bucket_gets_force_destroy():
     assert "force_destroy = true" in main_tf
 
 
-def test_rds_listed_unsupported_with_reason_never_dropped():
-    stack = canvas_to_stack(_FULL_CANVAS)
-    proj = generate_tf(stack)
-    assert proj.unsupported == ["db (rds): Simulate v1 — stays on the reconciler path"]
+def test_rds_is_a_real_aws_db_instance_now_not_an_unsupported_kind():
+    """W2.7: the LAST kind outside Terraform came inside. `skip_final_snapshot`
+    is what keeps `tofu destroy` (empty canvas + Apply) from refusing -- s3's
+    `force_destroy` for databases."""
+    proj = generate_tf(canvas_to_stack(_FULL_CANVAS))
+    assert proj.unsupported == []
+    attrs = resource_attrs(proj.files)[("aws_db_instance", "app_db")]
+    assert unquote(attrs["identifier"]) == "app-db"
+    assert unquote(attrs["engine"]) == "postgres"
+    assert attrs["allocated_storage"] == 20
+    assert attrs["skip_final_snapshot"] is True
+
+
+def test_rds_carries_every_canvas_field_it_has():
+    res = ResourceDesired(id="app-db", kind="rds", fields={
+        "engine": FieldValue(value="postgres"),
+        "instanceClass": FieldValue(value="db.t3.small"),
+        "allocatedStorage": FieldValue(value="50"),
+        "dbName": FieldValue(value="orders"),
+        "username": FieldValue(value="svc"),
+        "password": FieldValue(value="s3cr3t-pw", sensitive=True),
+    })
+    attrs = resource_attrs(generate_tf(Stack(resources=(res,))).files)[("aws_db_instance", "app_db")]
+    assert unquote(attrs["instance_class"]) == "db.t3.small"
+    assert attrs["allocated_storage"] == 50
+    assert unquote(attrs["db_name"]) == "orders"
+    assert unquote(attrs["username"]) == "svc"
+    assert unquote(attrs["password"]) == "s3cr3t-pw"
+
+
+def test_rds_with_a_non_postgres_engine_is_declined_not_silently_postgres():
+    """The pre-W2.7 reconciler path ran a Postgres container no matter what
+    `engine` said. Honest now: no local substrate, no HCL."""
+    res = ResourceDesired(id="app-db", kind="rds", fields={"engine": FieldValue(value="mysql")})
+    proj = generate_tf(Stack(resources=(res,)))
+    assert proj.unsupported == [
+        "app-db (rds): engine 'mysql' has no local substrate — odin runs a real "
+        "Postgres, so only postgres is supported",
+    ]
     assert "aws_db_instance" not in proj.files["main.tf"]
+
+
+def test_rds_label_that_is_not_a_valid_identifier_is_declined_with_the_fix():
+    """terraform-provider-aws validates `identifier` client-side, so a bad
+    label would fail at plan time with a raw provider error. Declined here
+    instead, with a sentence that says what to rename it to -- never silently
+    renamed (that would break the container name AND the ${{db.VAR}} ref)."""
+    for label in ("app_db", "App-DB", "-db", "db-", "app--db", "1db"):
+        proj = generate_tf(Stack(resources=(ResourceDesired(id=label, kind="rds"),)))
+        assert proj.unsupported == [
+            f"{label} (rds): an RDS name must be lowercase letters/digits separated by "
+            "single hyphens and start with a letter (e.g. app-db) — rename the node",
+        ], label
+        assert "aws_db_instance" not in proj.files["main.tf"]
+
+
+def test_rds_allocated_storage_must_be_a_number():
+    res = ResourceDesired(id="app-db", kind="rds", fields={"allocatedStorage": FieldValue(value="lots")})
+    proj = generate_tf(Stack(resources=(res,)))
+    assert proj.unsupported == ["app-db (rds): allocatedStorage must be a whole number of GiB (e.g. 20)"]
 
 
 def test_generic_unsupported_kind_gets_a_fallback_reason():
@@ -190,12 +260,18 @@ def test_generated_hcl_never_contains_local_endpoints_or_credentials():
     # Global Constraint (2026-07-22-s-simulate-translation.md): portable TF
     # only -- no `endpoints {}` provider overrides, no skip_* flags, no local
     # URLs, no creds. Those live in odin's runtime-generated override.tf,
-    # never in agent/generator output. (The subscription resource's own
-    # `endpoint = aws_sqs_queue...` argument is a legitimate TF schema field,
-    # not a local-endpoint override, so it's excluded from this check.)
+    # never in agent/generator output. (Two RESOURCE arguments that merely
+    # look like the banned provider ones are excluded, being legitimate TF
+    # schema fields: the subscription's `endpoint = aws_sqs_queue...`, and
+    # `aws_db_instance.skip_final_snapshot` -- so the `skip_*` check names the
+    # four real PROVIDER args odin's own override.tf carries, not the prefix.)
     stack = canvas_to_stack(_FULL_CANVAS)
     main_tf = generate_tf(stack).files["main.tf"].lower()
-    forbidden = ("endpoints {", "skip_", "access_key", "secret_key", "127.0.0.1", "localhost")
+    forbidden = (
+        "endpoints {", "access_key", "secret_key", "127.0.0.1", "localhost",
+        "skip_credentials_validation", "skip_metadata_api_check",
+        "skip_region_validation", "skip_requesting_account_id",
+    )
     for token in forbidden:
         assert token not in main_tf, token
 
