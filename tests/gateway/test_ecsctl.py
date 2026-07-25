@@ -25,7 +25,7 @@ from odin.aws.backings import REGION
 from odin.compute.tasks import TaskContainerHandle
 from odin.gateway.classify import classify
 from odin.gateway.keys import KeyStore
-from odin.gateway.models import ecsctl
+from odin.gateway.models import ecsctl, logsctl
 from odin.gateway.stores import SynthStores
 from odin.runtime.colima import CONTAINER_HOST
 
@@ -54,6 +54,9 @@ class FakeTaskRuntime:
         self.stopped: list[tuple] = []
         self._status: dict[tuple, str] = {}
         self._exit_codes: dict[tuple, int] = {}
+        # Stands in for each container's own stdout/stderr, as `docker logs
+        # --tail N` would report it (see `print_line`).
+        self._logs: dict[tuple, str] = {}
 
     def run(
         self, env: str, task_id: str, container_def: dict, extra_env: dict[str, str] | None = None,
@@ -78,6 +81,14 @@ class FakeTaskRuntime:
     def stop(self, env: str, task_id: str, container_name: str) -> None:
         self.stopped.append((env, task_id, container_name))
         self._status[(env, task_id, container_name)] = "exited"
+
+    def logs(self, env: str, task_id: str, container_name: str, tail: int = 20) -> str:
+        return self._logs.get((env, task_id, container_name), "")
+
+    def print_line(self, env: str, task_id: str, container_name: str, line: str) -> None:
+        """Test-only: the container writes one more line to its own stdout."""
+        key = (env, task_id, container_name)
+        self._logs[key] = f"{self._logs.get(key, '')}{line}\n"
 
     def mark_exited(self, env: str, task_id: str, container_name: str, exit_code: int = 1) -> None:
         """Test-only: simulate a container crashing/completing ON ITS OWN --
@@ -647,3 +658,231 @@ def test_describe_tasks_lazily_marks_a_spontaneously_exited_container_stopped(si
 
     service = _describe_service(stores, sink, ecs, runtime)
     assert service["runningCount"] == 0
+
+
+# --- W2.2: an Apply re-converges a service whose task is gone. A task is not
+# a TF resource, so tofu's plan for an unchanged `aws_ecs_service` is empty
+# and only this pass can bring the container back. --------------------------
+
+
+def test_mark_task_stopped_records_the_drift_reason_with_no_invented_exit_code(sink, ecs, stores):
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(stores, sink, ecs, runtime, desiredCount=1)
+    _wait_for_running_count(stores, sink, ecs, runtime, 1)
+    _, task_id, _, _, _, _ = runtime.ran[0]
+
+    ecsctl.mark_task_stopped(stores, ENV, "odin", task_id, "container gone — re-Apply to recreate")
+
+    task = stores.ecsctl.get(ENV, f"task:odin:{task_id}")
+    assert task["last_status"] == "STOPPED"
+    assert task["stopped_reason"] == "container gone — re-Apply to recreate"
+    assert task["exit_code"] is None  # a container that no longer exists never reported one
+    assert _describe_service(stores, sink, ecs, runtime)["runningCount"] == 0
+
+
+def test_converge_services_relaunches_a_task_whose_container_is_gone(sink, ecs, stores):
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(stores, sink, ecs, runtime, desiredCount=1)
+    _wait_for_running_count(stores, sink, ecs, runtime, 1)
+    _, task_id, _, _, _, _ = runtime.ran[0]
+    ecsctl.mark_task_stopped(stores, ENV, "odin", task_id, "removed outside odin")
+
+    ecsctl.converge_services(stores, ENV, runtime)  # what an Apply now does
+
+    _wait_for_running_count(stores, sink, ecs, runtime, 1)
+    assert len(runtime.ran) == 2, "the missing task must be relaunched, not left short"
+
+
+def test_converge_services_is_a_no_op_at_desired_count(sink, ecs, stores):
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(stores, sink, ecs, runtime, desiredCount=2)
+    _wait_for_running_count(stores, sink, ecs, runtime, 2)
+
+    ecsctl.converge_services(stores, ENV, runtime)
+    _wait_for_running_count(stores, sink, ecs, runtime, 2)
+
+    assert len(runtime.ran) == 2  # idempotent: every Apply must not stack up containers
+    assert runtime.stopped == []
+
+
+def test_converge_services_leaves_a_deleted_service_alone(sink, ecs, stores):
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(stores, sink, ecs, runtime, desiredCount=1)
+    _wait_for_running_count(stores, sink, ecs, runtime, 1)
+    delete_req = sink.call(lambda: ecs.delete_service(cluster="odin", service="app", force=True))
+    _parse("DeleteService", _answer(stores, delete_req, runtime))
+    launched = len(runtime.ran)
+
+    ecsctl.converge_services(stores, ENV, runtime)  # an empty-canvas Apply's teardown
+
+    time.sleep(0.1)
+    assert len(runtime.ran) == launched, "an INACTIVE service must never be re-launched"
+
+
+# --- W2.1 piece 3: the sweep ships each task's tail into /ecs/{service} ---------
+
+
+def _running_service(sink, ecs, stores) -> tuple[FakeTaskRuntime, str]:
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(stores, sink, ecs, runtime, desiredCount=1)
+    _wait_for_running_count(stores, sink, ecs, runtime, 1)
+    return runtime, runtime.ran[0][1]
+
+
+def _shipped(stores) -> list[dict]:
+    return logsctl.stored_events(stores, ENV, "/ecs/app", 100)
+
+
+def test_sweep_ships_a_task_container_tail_into_the_service_log_group(sink, ecs, stores):
+    runtime, task_id = _running_service(sink, ecs, stores)
+    runtime.print_line(ENV, task_id, "app", "nginx: ready to accept connections")
+
+    _describe_service(stores, sink, ecs, runtime)  # every Describe* sweeps
+
+    events = _shipped(stores)
+    assert [e["message"] for e in events] == ["nginx: ready to accept connections"]
+    # One stream per real task container (ecsctl.py's `_ship_task_logs`).
+    assert {e["stream"] for e in events} == {f"odin-ecs-default-{task_id[:8]}-app"}
+    assert logsctl.group_exists(stores, ENV, "/ecs/app")  # auto-created by ingestion
+
+
+def test_resweeping_the_same_tail_never_duplicates_events(sink, ecs, stores):
+    runtime, task_id = _running_service(sink, ecs, stores)
+    runtime.print_line(ENV, task_id, "app", "started")
+
+    for _ in range(3):  # a Describe* per reconciler tick, over and over
+        _describe_service(stores, sink, ecs, runtime)
+    assert [e["message"] for e in _shipped(stores)] == ["started"]
+
+    runtime.print_line(ENV, task_id, "app", "handled a request")
+    _describe_service(stores, sink, ecs, runtime)
+    assert [e["message"] for e in _shipped(stores)] == ["started", "handled a request"]
+
+
+def test_sweep_captures_the_final_lines_of_a_task_that_already_exited(sink, ecs, stores):
+    """The crash diagnostic: shipping runs BEFORE the RUNNING-only status
+    check, so a container that died on its own still hands over its last
+    output -- and keeps handing over nothing new on later sweeps."""
+    runtime, task_id = _running_service(sink, ecs, stores)
+    runtime.print_line(ENV, task_id, "app", "FATAL: config missing")
+    runtime.mark_exited(ENV, task_id, "app", exit_code=1)
+
+    service = _describe_service(stores, sink, ecs, runtime)
+    assert service["runningCount"] == 0  # the sweep also demoted it, as before
+    assert [e["message"] for e in _shipped(stores)] == ["FATAL: config missing"]
+
+    _describe_service(stores, sink, ecs, runtime)
+    assert len(_shipped(stores)) == 1
+
+
+# --- W2.5: the service scheduler's load-balancer half ---------------------------
+# Real ECS (never terraform) registers a TASK with the target groups its service
+# names, and deregisters it when the task goes away. These tests pin the contract
+# ecsctl OWNS -- which target group, and which REAL published host port -- with
+# elbv2ctl's own side stubbed out, so no nginx container is involved. elbv2ctl's
+# half (upstream rendering, proxy reload) is tested in test_elbv2ctl.py.
+
+_TG_ARN = "arn:aws:elasticloadbalancing:us-east-1:000000000000:targetgroup/web-lb-tg/abc123"
+_LOAD_BALANCERS = [{"targetGroupArn": _TG_ARN, "containerName": "app", "containerPort": 80}]
+
+
+@pytest.fixture
+def target_calls(monkeypatch) -> dict[str, list[tuple]]:
+    calls: dict[str, list[tuple]] = {"register": [], "deregister": []}
+    monkeypatch.setattr(
+        ecsctl.elbv2ctl, "register_target",
+        lambda stores, env, arn, target_id, port: calls["register"].append((env, arn, target_id, port)),
+    )
+    monkeypatch.setattr(
+        ecsctl.elbv2ctl, "deregister_target",
+        lambda stores, env, arn, target_id, port: calls["deregister"].append((env, arn, target_id, port)),
+    )
+    return calls
+
+
+def _lb_service(sink, ecs, stores, desired: int = 1) -> FakeTaskRuntime:
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(stores, sink, ecs, runtime, desiredCount=desired, loadBalancers=_LOAD_BALANCERS)
+    _wait_for_running_count(stores, sink, ecs, runtime, desired)
+    return runtime
+
+
+def test_describe_services_echoes_the_load_balancers_it_was_created_with(sink, ecs, stores, target_calls):
+    """Hardcoding `loadBalancers: []` (this module's own first cut) drifts an
+    `aws_ecs_service` with a `load_balancer` block on every subsequent plan."""
+    runtime = _lb_service(sink, ecs, stores)
+    service = _describe_service(stores, sink, ecs, runtime)
+    assert service["loadBalancers"] == _LOAD_BALANCERS
+
+
+def test_launching_a_task_registers_its_real_published_port_as_a_target(sink, ecs, stores, target_calls):
+    _lb_service(sink, ecs, stores, desired=2)
+    # The FakeTaskRuntime publishes containerPort 80 on 10001 / 10002.
+    assert sorted(target_calls["register"]) == [
+        (ENV, _TG_ARN, CONTAINER_HOST, 10_001),
+        (ENV, _TG_ARN, CONTAINER_HOST, 10_002),
+    ]
+    assert target_calls["deregister"] == []
+
+
+def test_a_service_with_no_load_balancers_never_touches_elbv2(sink, ecs, stores, target_calls):
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(stores, sink, ecs, runtime, desiredCount=1)
+    _wait_for_running_count(stores, sink, ecs, runtime, 1)
+    assert target_calls == {"register": [], "deregister": []}
+
+
+def test_scaling_down_deregisters_the_stopped_task(sink, ecs, stores, target_calls):
+    runtime = _lb_service(sink, ecs, stores, desired=2)
+    req = sink.call(lambda: ecs.update_service(cluster="odin", service="app", desiredCount=1))
+    _parse("UpdateService", _answer(stores, req, runtime))
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and not target_calls["deregister"]:
+        time.sleep(0.02)
+    # Newest-task-first scale-down, so the SECOND task's port leaves rotation.
+    assert target_calls["deregister"] == [(ENV, _TG_ARN, CONTAINER_HOST, 10_002)]
+
+
+def test_deleting_the_service_deregisters_every_task(sink, ecs, stores, target_calls):
+    runtime = _lb_service(sink, ecs, stores, desired=2)
+    req = sink.call(lambda: ecs.delete_service(cluster="odin", service="app", force=True))
+    _parse("DeleteService", _answer(stores, req, runtime))
+    assert sorted(target_calls["deregister"]) == [
+        (ENV, _TG_ARN, CONTAINER_HOST, 10_001),
+        (ENV, _TG_ARN, CONTAINER_HOST, 10_002),
+    ]
+
+
+def test_a_task_that_dies_on_its_own_leaves_the_rotation(sink, ecs, stores, target_calls):
+    """A dead container left in the upstream list is a real load-balancer bug --
+    the sweep that demotes it to STOPPED must also take it out."""
+    runtime = _lb_service(sink, ecs, stores)
+    task_id = runtime.ran[0][1]
+    runtime.mark_exited(ENV, task_id, "app", exit_code=137)
+    service = _describe_service(stores, sink, ecs, runtime)
+    assert service["runningCount"] == 0
+    assert target_calls["deregister"] == [(ENV, _TG_ARN, CONTAINER_HOST, 10_001)]
+    # Only once -- a later sweep sees a task that's already STOPPED.
+    _describe_service(stores, sink, ecs, runtime)
+    assert len(target_calls["deregister"]) == 1
+
+
+def test_drift_marking_a_task_stopped_also_deregisters_it(sink, ecs, stores, target_calls):
+    runtime = _lb_service(sink, ecs, stores)
+    task_id = runtime.ran[0][1]
+    ecsctl.mark_task_stopped(stores, ENV, "odin", task_id, "container removed outside odin")
+    assert target_calls["deregister"] == [(ENV, _TG_ARN, CONTAINER_HOST, 10_001)]

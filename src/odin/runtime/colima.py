@@ -40,6 +40,15 @@ class ContainerSpec:
     # function's MemorySize) sets none.
     memory_mib: float | None = None
     cpus: float | None = None
+    # W2.6 (fabric/sidecar.py): a nebula companion container joins its
+    # BACKING's network namespace (`network="container:<name>"`), which is
+    # what puts the overlay tun device inside the backing's namespace so an
+    # unmodified upstream image answers on the mesh. `cap_add`/`devices` are
+    # what nebula needs to create that tun -- container capabilities from the
+    # container runtime, never host root (see sidecar.py's docstring).
+    network: str | None = None
+    cap_add: tuple[str, ...] = ()
+    devices: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -130,10 +139,20 @@ class _ContainerRuntime:
         self._cli("build", "-t", tag, "-", input=dockerfile)
 
     def run_container(self, spec: ContainerSpec) -> RunHandle:
+        # A namespace-sharing container takes no `_run_flags`: docker rejects
+        # `--add-host` together with `--network container:` outright ("conflicting
+        # options"), and it needs none -- it inherits the target's /etc/hosts-less
+        # networking wholesale (fabric/sidecar.py).
         args = [
-            "run", "-d", "--name", spec.name, *self._run_flags(),
+            "run", "-d", "--name", spec.name, *([] if spec.network else self._run_flags()),
             "--label", f"{LABEL}=1", "--label", f"{LABEL}.name={spec.name}",
         ]
+        if spec.network:
+            args += ["--network", spec.network]
+        for capability in spec.cap_add:
+            args += ["--cap-add", capability]
+        for device in spec.devices:
+            args += ["--device", device]
         for key, value in spec.labels.items():
             args += ["--label", f"{key}={value}"]
         for key, value in spec.env.items():
@@ -185,6 +204,28 @@ class _ContainerRuntime:
             logtail=self.logs(name, tail=5) if status != "absent" else "",
         )
 
+    def copy_in(self, name: str, host_path: str, container_path: str) -> None:
+        """Copy a host file INTO a running container (`docker cp`).
+
+        W2.5 uses this instead of a bind mount to deliver a load-balancer
+        proxy's rendered config, and the reason is empirical: a `-v` of a path
+        under macOS's per-user temp dir (`/private/var/folders/...`) silently
+        mounts an EMPTY directory under Colima's virtiofs -- the path exists in
+        the VM, so nothing errors; nginx simply came up with no config and
+        accepted-then-dropped every connection. `docker cp` streams through the
+        daemon, so it works regardless of which host paths the runtime VM
+        happens to share."""
+        self._cli("cp", host_path, f"{name}:{container_path}")
+
+    def signal(self, name: str, sig: str) -> None:
+        """Send UNIX signal `sig` to the container's main process (`docker kill
+        -s`). W2.5: how a load-balancer proxy container is told to re-read its
+        rewritten config (nginx reloads on SIGHUP) WITHOUT `docker exec` and
+        without recreating the container -- so an upstream change never drops
+        an in-flight request. `check=False`: signalling an already-gone
+        container is a no-op, exactly like `stop`."""
+        self._cli("kill", "-s", sig, name, check=False)
+
     def stop(self, name: str) -> None:
         # -v: drop the container's anonymous volumes with it (postgres creates
         # one per boot; without this a churn loop leaks gigabytes).
@@ -192,6 +233,19 @@ class _ContainerRuntime:
 
     def list_odin(self) -> list[str]:
         out = self._cli("ps", "-aq", "--filter", f"label={LABEL}=1", check=False)
+        return [line for line in out.splitlines() if line]
+
+    def container_names(self) -> list[str]:
+        """Every odin-labelled container's NAME -- running or exited, ONE
+        `docker ps` call regardless of how many there are (W2.2's drift sweep
+        compares whole synth stores against this single listing, never one
+        `inspect` per resource).
+
+        `check=True`, deliberately: this is the one listing whose EMPTY answer
+        is load-bearing (absent from it == the container was really removed),
+        so a failed CLI call must raise rather than come back as an innocent
+        empty list -- see `reconcile/drift.py::_listing`."""
+        out = self._cli("ps", "-a", "--format", "{{.Names}}", "--filter", f"label={LABEL}=1")
         return [line for line in out.splitlines() if line]
 
 

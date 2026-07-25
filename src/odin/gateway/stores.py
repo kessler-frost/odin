@@ -172,6 +172,51 @@ class SynthStores:
       `"taskdef:{family}:{revision}"` / `"service:{cluster}:{name}"` /
       `"task:{cluster}:{task_id}"`, persisted at
       `.odin/{env}/gateway/ecsctl.json`.
+    - `logsctl`: the CloudWatch Logs model's whole state
+      (`gateway/models/logsctl.py`, task W2.1) -- flat keys `"group:{name}"` /
+      `"stream:{group}:{stream}"` / `"events:{group}"` (the per-group ring
+      buffer) / `"cursor:{group}:{stream}"` (the substrate log-shipping dedup
+      cursor), persisted at `.odin/{env}/gateway/logsctl.json`. Log-group tags
+      live in the shared `tags` store above, keyed `"logs:{logGroupArn}"` (the
+      wildcard-less ARN form -- see logsctl.py's own ARN note).
+    - `secretsctl`: the Secrets Manager model's whole state
+      (`gateway/models/secretsctl.py`, task W2.4) -- flat keys
+      `"secret:{name}"` / `"version:{name}:{versionId}"`, persisted at
+      `.odin/{env}/gateway/secretsctl.json`. Secret tags live in the shared
+      `tags` store above, keyed `"secretsmanager:{secretArn}"`. This sidecar
+      holds secret VALUES in cleartext -- `_persist_locked`'s `mode=0o600`
+      below is what keeps it owner-only, the same protection `keys.json` gets
+      (see secretsctl.py's PLAINTEXT RULE and SECURITY.md's Secrets section).
+    - `ssmctl`: the SSM Parameter Store model's whole state
+      (`gateway/models/ssmctl.py`, task W2.4) -- flat keys `"param:{name}"`
+      (the canonicalized name -- see `ssmctl.canonical_name`), persisted at
+      `.odin/{env}/gateway/ssmctl.json`. Parameter tags live in the shared
+      `tags` store above, keyed `"ssm:{canonicalName}"` (SSM's tag API carries
+      the parameter NAME as `ResourceId`, not an ARN). A `SecureString`
+      parameter's value lives here in cleartext too -- odin has no KMS; 0600
+      is the protection, recorded as a limit rather than implied away.
+    - `cachectl`: the ElastiCache control-plane model's whole state
+      (`gateway/models/cachectl.py`, W2.8) -- flat keys `"cluster:{id}"`,
+      persisted at `.odin/{env}/gateway/cachectl.json`. ElastiCache tags live
+      in the shared `tags` store above, keyed `"elasticache:{arn}"`.
+    - `rdsctl`: the RDS model's whole state (`gateway/models/rdsctl.py`, task
+      W2.7) -- flat keys `"db:{identifier}"`, persisted at
+      `.odin/{env}/gateway/rdsctl.json`. DB-instance tags live in the shared
+      `tags` store above, keyed `"rds:{dbInstanceArn}"`. This record carries the
+      instance's MASTER PASSWORD (the DATABASE_URL World fact is built from it
+      and the drift sweep's health probe authenticates with it) -- the same
+      cleartext value the Stack revision on disk already holds, and this
+      sidecar is written 0600 like every other one.
+    - `elbv2ctl`: the Elastic Load Balancing v2 model's whole state
+      (`gateway/models/elbv2ctl.py`, task W2.5) -- flat keys `"lb:{name}"` /
+      `"tg:{name}"` / `"listener:{listenerId}"` / `"targets:{tgName}"` (a
+      target group's registered targets), persisted at
+      `.odin/{env}/gateway/elbv2ctl.json`. Load-balancer / target-group /
+      listener tags live in the shared `tags` store above, keyed
+      `"elasticloadbalancing:{arn}"` (elbv2's tag API is ARN-only: AddTags/
+      RemoveTags/DescribeTags all take `ResourceArns`, never a typed id). The
+      REAL substrate this state describes is an nginx container per load
+      balancer (`compute/proxy.py`), never anything in this file.
     """
 
     def __init__(self, root: Path) -> None:
@@ -186,3 +231,9 @@ class SynthStores:
         self.ec2compute = JsonStore(root, "ec2compute")
         self.lambdactl = JsonStore(root, "lambdactl")
         self.ecsctl = JsonStore(root, "ecsctl")
+        self.logsctl = JsonStore(root, "logsctl")
+        self.secretsctl = JsonStore(root, "secretsctl")
+        self.ssmctl = JsonStore(root, "ssmctl")
+        self.cachectl = JsonStore(root, "cachectl")
+        self.rdsctl = JsonStore(root, "rdsctl")
+        self.elbv2ctl = JsonStore(root, "elbv2ctl")

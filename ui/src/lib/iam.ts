@@ -12,7 +12,40 @@ export const defaultPermissions: Record<string, string[]> = {
   sqs: ['sqs:SendMessage', 'sqs:ReceiveMessage'],
   sns: ['sns:Publish'],
   rds: ['rds-db:connect'],
+  // W2.1: what a workload actually needs to WRITE to a log group it's edged
+  // to. The read verbs (GetLogEvents/FilterLogEvents/DescribeLogStreams) are
+  // in the catalog's `iamActions` list to tick, but aren't defaults — a
+  // workload writing its own logs is the common case, reading them back isn't.
+  logs: ['logs:CreateLogStream', 'logs:PutLogEvents'],
+  // W2.4: reading the one secret / parameter it's edged to is the whole point
+  // of a workload having the edge. The write and describe verbs
+  // (PutSecretValue/DescribeSecret, PutParameter, GetParametersByPath) are in
+  // the catalog's `iamActions` list to tick, but a workload that rewrites its
+  // own credentials is the rare case, not the default.
+  secret: ['secretsmanager:GetSecretValue'],
+  ssm: ['ssm:GetParameter'],
+  // CONTROL plane only. ElastiCache's data plane is the raw Redis protocol —
+  // not AWS-signed, never routed through odin's gateway — so an edge here
+  // grants Describe/Modify, and nothing odin does at the IAM layer can gate a
+  // GET/SET (that's a security-group question). See ROADMAP's limits.
+  elasticache: ['elasticache:DescribeCacheClusters'],
+  // W2.5 note: `alb` is deliberately ABSENT here and from `iamActionsForTarget`.
+  // A load balancer is not an IAM data-plane target -- you don't "call" an ALB
+  // with signed AWS requests, you send it plain HTTP, and no IAM policy gates
+  // that. The elasticloadbalancing:* namespace is a CONTROL plane only tofu (the
+  // operator principal) ever touches, so listing it here would offer users
+  // permissions that change nothing. What an alb<->compute edge DOES mean is
+  // below: it's a network/target edge.
 };
+
+// W2.5: an alb <-> compute edge is a TARGET edge -- "this load balancer fronts
+// that service" -- carried as the `network` edge type (agent/hcl.py's pass 1.5
+// reads it and stamps a `load_balancer` block onto the aws_ecs_service, which
+// is how real ECS attaches to a target group). Registered explicitly rather
+// than relying on the `?? ['network']` fallback so the meaning is written down
+// where the edge registry lives; keeping alb out of iamActionsForTarget above is
+// what stops the IAM loop from claiming this pair first.
+export const albTargetTypes = new Set(['ecs']);
 
 // Compute kinds act as IAM principals; permission edges run compute → resource.
 // The app-workload kinds (service/dep/batch/llm) are parked (see NORTHSTAR.md,
@@ -46,6 +79,8 @@ const edgeTypesForPair: Record<string, string[]> = {};
 for (const target of Object.keys(iamActionsForTarget)) {
   for (const workload of computeTypes) edgeTypesForPair[pairKey(workload, target)] = ['iam'];
 }
+// W2.5: alb <-> compute is a target edge (see `albTargetTypes` above).
+for (const target of albTargetTypes) edgeTypesForPair[pairKey('alb', target)] = ['network'];
 
 export function detectEdgeTypes(nodeTypeA: string, nodeTypeB: string): string[] {
   return edgeTypesForPair[pairKey(nodeTypeA, nodeTypeB)] ?? ['network'];

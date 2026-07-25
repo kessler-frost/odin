@@ -87,9 +87,10 @@ from pathlib import Path
 from starlette.responses import Response
 
 from odin.aws.backings import ACCOUNT, REGION
-from odin.compute.functions import DEFAULT_RUNTIME, FunctionRuntime
+from odin.compute.functions import DEFAULT_RUNTIME, FunctionRuntime, container_name
 from odin.gateway import errors
 from odin.gateway.keys import KeyStore, workload_env
+from odin.gateway.models import logsctl
 from odin.gateway.stores import NO_CHANGE, SynthStores
 from odin.runtime.colima import ColimaRuntime
 
@@ -98,6 +99,12 @@ log = logging.getLogger("odin.gateway.lambdactl")
 _DEFAULT_HANDLER = "lambda_function.lambda_handler"
 _DEFAULT_TIMEOUT = 3
 _DEFAULT_MEMORY = 128
+
+# How many trailing lines of the RIE container's output one Invoke reads
+# (`docker logs --tail N`): bounded so a chatty handler can't turn an invoke
+# into an unbounded read, generous enough that a normal handler's whole
+# output for a call fits in one window.
+_LOG_TAIL_LINES = 200
 
 _Handler = Callable[
     [str, str, bytes, SynthStores, float, FunctionRuntime, dict[str, str], KeyStore | None, int | None],
@@ -229,6 +236,13 @@ def _finish_deploy(
     container_env = dict(env_vars)
     if keystore is not None and gateway_port is not None and label:
         container_env.update(workload_env(keystore, env, label, gateway_port))
+    # `ensure` REPLACES the container (`FunctionRuntime.ensure` stops any
+    # remnant first), so its output starts back at line 1 -- the log-shipping
+    # cursor for that stream has to be forgotten here or `_ship_logs` would
+    # mistake the new container's first lines for already-ingested ones
+    # (logsctl.py's `ingest_tail`/`reset_cursor`). Already-stored events are
+    # untouched: this resets the read position, not the log.
+    logsctl.reset_cursor(stores, env, f"/aws/lambda/{name}", container_name(env, name))
     # Deliberately broad: this runs on a daemon thread with no caller to
     # propagate an exception to -- see ec2compute.py's `_finish_boot` for
     # the identical "silent hang is forbidden" reasoning.
@@ -253,6 +267,81 @@ def _finish_deploy(
 
 def _spawn(target: Callable[..., None], *args: object) -> None:
     threading.Thread(target=target, args=args, daemon=True).start()
+
+
+# --- the reality sweep's seam + the Apply-driven recovery (W2.2's honesty
+# fix) --------------------------------------------------------------------
+
+
+def mark_function_failed(stores: SynthStores, env: str, name: str, reason: str) -> None:
+    """Public seam for the reality sweep (`reconcile/drift.py`): this
+    function's RIE container -- its EXECUTION ENVIRONMENT -- is gone, so
+    `State` is `Failed` with `reason`, the same terminal shape
+    `_finish_deploy`'s own failure path writes. A function whose sandbox
+    doesn't exist genuinely cannot run: Invoke already answers
+    `ResourceNotReadyException` off this state, and `reconcile/tf_status.py`
+    projects it as `crashed` with `reason` as the verdict.
+
+    What is NOT done here, deliberately: the function RECORD is not deleted.
+    Real AWS never deletes a function because an execution environment died --
+    it starts a new one -- so deleting would be a bigger lie than the one being
+    fixed, and it would drop the node off the canvas instead of saying why it's
+    down. `LastUpdateStatus` is left alone too: the last DEPLOY really did
+    succeed; what failed is the environment.
+
+    That does mean tofu cannot be the one to fix this (an
+    `aws_lambda_function`'s config is unchanged, and the provider's schema has
+    no state/status attribute to diff on -- verified against the v5.100.0
+    provider schema -- so its plan is empty forever). `converge_functions`
+    below is what makes the "re-Apply to recreate" verdict true."""
+    _update_function(
+        stores, env, name, state="Failed",
+        state_reason=reason, state_reason_code="InternalError",
+    )
+
+
+def converge_functions(
+    stores: SynthStores, env: str, substrate: FunctionRuntime | None = None,
+    keystore: KeyStore | None = None, gateway_port: int | None = None,
+) -> None:
+    """Re-create the REAL container of every `Failed` function -- the exact
+    `_finish_deploy` pass CreateFunction/UpdateFunctionCode already spawn,
+    driven by an APPLY (server.py's /apply-full) rather than by an AWS
+    mutation. `ecsctl.converge_services`' twin, for the same reason: a
+    function's execution environment is not a terraform resource, so nothing
+    in an `aws_lambda_function`'s config changes when its container is
+    destroyed out of band and tofu's plan is empty forever. In real AWS,
+    Lambda's own control plane (never terraform) replaces a dead sandbox; this
+    is odin's equivalent, deliberately triggered by the user's Apply instead of
+    a background timer -- the module's "no scheduler loop of our own" limit
+    stays.
+
+    Code-only, never config: the existing `code_dir` is reused (the
+    UpdateFunctionConfiguration path's "same code, restarted container"), so
+    this can only ever restore what the last deploy already established.
+
+    Idempotent, and never a racing second deploy: an `Active` function is left
+    completely alone, and a function whose `LastUpdateStatus` is `InProgress`
+    (e.g. the UpdateFunctionCode THIS apply just made, still booting) is
+    skipped so two `ensure` calls can't fight over one container."""
+    runtime = substrate or FunctionRuntime(ColimaRuntime(), stores.root)
+    for key, fn in stores.lambdactl.items(env).items():
+        if not key.startswith("fn:") or fn["state"] != "Failed" or fn["last_update_status"] == "InProgress":
+            continue
+        name = fn["function_name"]
+        # Claim the redeploy in the store BEFORE spawning it: a second Apply
+        # arriving while this one is still booting the container sees
+        # `InProgress` and skips (the same claim-then-act shape
+        # ec2compute's `_claim_delete_retry` uses).
+        _update_function(
+            stores, env, name, last_update_status="InProgress",
+            last_update_status_reason=None, last_update_status_reason_code=None,
+        )
+        log.info("converging lambda %s (env %s): re-creating its container", name, env)
+        _spawn(
+            _finish_deploy, stores, env, name, fn["runtime"], fn["handler"], fn["environment"],
+            runtime.code_dir(env, name), runtime, keystore, gateway_port, fn["memory_size"],
+        )
 
 
 # --- CreateFunction / GetFunction / DeleteFunction ------------------------
@@ -465,6 +554,36 @@ def _get_function_code_signing_config(resource: str, env: str, body: bytes, stor
 # --- Invoke: the data plane ------------------------------------------------
 
 
+def _ship_logs(stores: SynthStores, env: str, name: str, substrate: FunctionRuntime) -> None:
+    """Ship the function's RIE container tail into `/aws/lambda/{name}` -- the
+    exact group real Lambda writes to, so `odin logs --group /aws/lambda/foo`
+    (and a canvas `aws_cloudwatch_log_group` drawn for that name, which
+    logsctl's CreateLogGroup then ADOPTS) reads what actually ran.
+
+    ONE STREAM PER REAL CONTAINER, named after the container itself -- odin's
+    honest deviation from AWS's `{date}/[$LATEST]{requestId}` stream naming.
+    RIE reuses a single long-lived container for every invoke of a function,
+    so there is no per-request stream boundary to honor and no requestId on
+    the container's own stdout to key one off. That naming is also what makes
+    `ingest_tail`'s cursor stable: the cursor counts how many lines of THIS
+    container's output have been ingested, and a live container's output only
+    ever grows, so re-shipping the same tail after a second invoke appends
+    nothing. The one edge that costs: a redeploy replaces the container and
+    its output restarts at line 1 while the cursor stays put, so the new
+    container's first lines (up to the old cursor) are not re-ingested --
+    accepted rather than papered over, since the alternative is streaming
+    every container continuously.
+
+    No try/except: the read is `FunctionRuntime.logs` -> the driver's
+    `check=False` CLI call, which answers "" for a vanished container instead
+    of raising, so there is no failure mode here that could break an invoke.
+    """
+    logsctl.ingest_tail(
+        stores, env, f"/aws/lambda/{name}", container_name(env, name),
+        substrate.logs(env, name, _LOG_TAIL_LINES),
+    )
+
+
 def _invoke(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     fn = _function(stores, env, resource)
     if fn is None:
@@ -478,6 +597,10 @@ def _invoke(resource: str, env: str, body: bytes, stores: SynthStores, now: floa
         result = substrate.invoke(env, resource, body)
     except Exception as exc:
         return errors.synth_error("lambda", "ServiceException", str(exc), 500)
+    # Both outcomes ship: a handler that RAISED wrote its traceback to the
+    # container's stderr, and that traceback is the whole reason CloudWatch
+    # Logs exists.
+    _ship_logs(stores, env, resource, substrate)
     headers = {"x-amz-function-error": result.function_error} if result.function_error else {}
     return Response(result.payload, status_code=200, media_type="application/json", headers=headers)
 

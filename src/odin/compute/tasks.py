@@ -104,5 +104,12 @@ class TaskRuntime:
     def exit_code(self, env: str, task_id: str, container_def_name: str) -> int:
         return self._rt.exit_code(container_name(env, task_id, container_def_name))
 
+    def logs(self, env: str, task_id: str, container_def_name: str, tail: int = 20) -> str:
+        """The task container's own log tail -- what `gateway/models/
+        ecsctl.py`'s sweep ships into `/ecs/{service}`. Never raises: the
+        driver's `logs` is a `check=False` CLI call, so an already-removed
+        container answers with "" (`_ContainerRuntime.logs`'s contract)."""
+        return self._rt.logs(container_name(env, task_id, container_def_name), tail)
+
     def stop(self, env: str, task_id: str, container_def_name: str) -> None:
         self._rt.stop(container_name(env, task_id, container_def_name))

@@ -89,7 +89,7 @@ from odin.aws.backings import ACCOUNT, REGION
 from odin.compute.instances import InstanceVm, NebulaJoin, vm_name
 from odin.compute.models import INSTANCE_TYPES, get_instance_type
 from odin.fabric.models import FirewallRules
-from odin.fabric.nebula import LighthouseManager
+from odin.fabric.nebula import LighthouseManager, union_firewalls
 from odin.gateway import errors
 from odin.gateway.keys import KeyStore, workload_env
 from odin.gateway.models import ec2net
@@ -550,17 +550,60 @@ def _sweep_terminated(stores: SynthStores, env: str, now: float) -> None:
             stores.ec2compute.delete(env, _key("instance", instance["instance_id"]))
 
 
-def _vpc_default_firewall(stores: SynthStores, env: str, vpc: dict) -> FirewallRules | None:
-    """R3: the containing VPC's default security group's ALREADY-compiled
-    Nebula firewall (`ec2net.py::_compiled_firewall`, recomputed on every SG
-    mutation and stored on the SG record itself -- read here, not
-    recomputed, matching `fabric.nebula.mesh_state`'s own "read the sidecar,
-    don't reach into ec2net" boundary). v1 doesn't model RunInstances'
-    SecurityGroupIds (ROADMAP's own recorded limit), so every instance
-    inherits its VPC's default SG -- exactly what real AWS does for an
-    instance launched with none specified."""
-    sg = stores.ec2net.get(env, f"sg:{vpc['default_sg_id']}")
-    return FirewallRules.model_validate(sg["firewall"]) if sg and sg.get("firewall") else None
+def mark_instance_terminated(stores: SynthStores, env: str, instance_id: str, reason: str) -> None:
+    """Public seam for the reality sweep (`reconcile/drift.py`): this
+    instance's Lima VM is GONE (deleted outside odin), so the record says
+    `terminated` with `reason` -- the SAME terminal shape `_finish_boot`'s
+    failure path and `_finish_terminate` already write, through the same
+    `_update_instance` guard (a terminate already winning the race is never
+    pulled back out).
+
+    THIS is what makes "re-Apply to recreate" true rather than a comforting
+    lie (NORTHSTAR directive 5): terraform-provider-aws's own Read treats a
+    `terminated` instance as gone and drops it from state, so the next
+    `tofu apply` plans a create and the VM genuinely comes back. A record
+    still claiming `running` answers DescribeInstances with a VM that doesn't
+    exist, tofu plans nothing, and the resource never returns.
+
+    `drifted` is the flag that keeps World honest at the same time: a plain
+    `terminated` record is EXCLUDED from the projection (reconcile/
+    tf_status.py -- the v0.5.2 phantom-EC2 fix), while a drifted one projects
+    `crashed` + this reason instead of silently vanishing off the canvas.
+    `terminated_at` is set so the normal lazy sweep (`_sweep_terminated`)
+    still reclaims the record on the recovery apply's own describes.
+
+    `Client.UserInitiatedShutdown` is a REAL EC2 state-reason code, and the
+    accurate one: something outside odin (a human, another tool) did delete
+    the VM -- never an invented code."""
+    _update_instance(
+        stores, env, instance_id, state_name="terminated",
+        state_reason={"code": "Client.UserInitiatedShutdown", "message": reason},
+        terminated_at=time.monotonic(), drifted=True,
+    )
+
+
+def _instance_firewall(stores: SynthStores, env: str, vpc: dict, security_group_ids: list[str]) -> FirewallRules | None:
+    """W2.6 piece 1: the firewall an instance's VM actually gets -- the UNION
+    of its ASSIGNED security groups (AWS's own semantics: SG rules are
+    permissive-only, so a resource's effective rule set is every attached
+    group's rules combined -- `fabric.nebula.union_firewalls`).
+
+    Falls back to the containing VPC's DEFAULT security group only when the
+    instance was launched with none, which is exactly what real AWS does in
+    that case. Before this, EVERY instance got the VPC default SG's firewall
+    even when the canvas explicitly assigned it others (v0.5.4 made
+    `SecurityGroupIds` reflect in DescribeInstances for zero-drift, but the
+    firewall was still compiled from the default group) -- so a drawn
+    per-instance SG was decorative on the wire. An assigned group whose
+    record is missing/uncompiled contributes nothing rather than silently
+    widening the instance to the VPC default."""
+    assigned = [
+        f for gid in security_group_ids
+        if (f := ec2net.compiled_firewall(stores, env, gid)) is not None
+    ]
+    if assigned:
+        return union_firewalls(assigned)
+    return ec2net.compiled_firewall(stores, env, vpc["default_sg_id"])
 
 
 def _run_instances(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
@@ -622,7 +665,15 @@ def _run_instances(params: dict[str, str], env: str, stores: SynthStores, now: f
     # back on a fast (fake-VM) boot, a real race, not a test artifact.
     response = _response("RunInstances", _reservation_inner_xml(stores, env, instance))
 
-    nebula = NebulaJoin(root=stores.root, env=env, host_id=instance_id, firewall=_vpc_default_firewall(stores, env, vpc)) if vpc else None
+    nebula = NebulaJoin(
+        root=stores.root, env=env, host_id=instance_id,
+        firewall=_instance_firewall(stores, env, vpc, security_group_ids),
+        # W2.6: the instance's own SG ids become its nebula cert GROUPS, which
+        # is what makes another node's "allow 5432 from sg-web" rule (an AWS
+        # UserIdGroupPairs rule -- `sg_rules_to_firewall` compiles it to
+        # `group: sg-...`) actually match this instance on the wire.
+        groups=tuple(security_group_ids),
+    ) if vpc else None
     ssh_pubkey = keypair.get("public_key") if keypair else None
     user_data = base64.b64decode(user_data_b64).decode("utf-8", "replace") if user_data_b64 else None
     name = vm_name(env, instance_id)

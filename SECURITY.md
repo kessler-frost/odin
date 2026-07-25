@@ -100,9 +100,38 @@ A field like an RDS `password` is stored, and used, in cleartext:
   json`'s ref-resolution facts) — redacting those would just break the
   feature while giving a false sense of security.
 
+A `secret` node (Secrets Manager) and an `ssm` node hold values that **are**
+the secret — that's the whole point of the node — and they land in the same
+places, plus one more:
+
+- The canvas JSON, every immutable Stack revision, and now the per-env
+  gateway sidecars the values actually live in (`secretsctl.json` and
+  `ssmctl.json` under `.odin/<env>/gateway/`), all written `0600`.
+- **A `SecureString` is not encrypted at rest.** There is no KMS in odin: a
+  SecureString parameter is stored byte-for-byte like a plain String one, and
+  `KmsKeyId`/`KeyId` are accepted and echoed back for Terraform fidelity
+  while encrypting nothing. `SecureString` buys you the file mode and nothing
+  else. It's stated plainly rather than implied away, because it's the single
+  assumption people are most likely to bring to odin and be wrong about.
+- What **does** protect a value: it never enters a World fact, so it never
+  travels on the WebSocket or into `world.json` or `events.jsonl`; it's
+  redacted out of the translation agent's prompt and out of every streamed
+  `tofu` log line; and reading it back through the gateway requires a
+  principal an IAM edge allows — no edge, real `AccessDenied`. The generated
+  Terraform is the one place the plaintext legitimately appears, because
+  `tofu` has to send it.
+
+- An `odin export` archive is a copy of all of the above: it contains the
+  env's issued gateway credentials (`keys.json`), the gateway's secret and
+  parameter sidecars, and every canvas secret in the stack revisions and
+  `world.json`, unencrypted, in a file that is easy to email or drop in cloud
+  storage. Treat it like a private key file.
+
 If you need real secret hygiene (rotation, least-privilege access,
 encryption at rest), odin's local `.odin/` store is not that system — treat
-canvas secrets as dev/test-grade, not production credentials.
+canvas secrets as dev/test-grade, not production credentials. That holds for
+a `secret` or `ssm` node exactly as much as for an RDS `password`: it's a
+faithful API surface for the thing you drew, not a vault.
 
 ## Reporting a vulnerability
 

@@ -88,6 +88,38 @@ def ecs(sink: CaptureSink):
     return _client(sink, "ecs")
 
 
+@pytest.fixture
+def logs(sink: CaptureSink):
+    return _client(sink, "logs")
+
+
+@pytest.fixture
+def secretsmanager(sink: CaptureSink):
+    return _client(sink, "secretsmanager")
+
+
+@pytest.fixture
+def ssm(sink: CaptureSink):
+    return _client(sink, "ssm")
+
+
+@pytest.fixture
+def elasticache(sink: CaptureSink):
+    return _client(sink, "elasticache")
+
+
+@pytest.fixture
+def rds(sink: CaptureSink):
+    return _client(sink, "rds")
+
+
+@pytest.fixture
+def elbv2(sink: CaptureSink):
+    # botocore names the service model `elbv2`; its SigV4 credential scope (and
+    # so `classify()`'s `service`) is `elasticloadbalancing`.
+    return _client(sink, "elbv2")
+
+
 def split_url(url: str) -> tuple[str, dict[str, str]]:
     """path + query dict for classify(), preserving bare markers with no
     `=` (`?location`, `?uploads`, `?acl`, `?delete`) that `parse_qsl` drops

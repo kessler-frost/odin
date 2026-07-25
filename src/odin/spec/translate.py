@@ -17,17 +17,43 @@ _REF = re.compile(r"^\$\{\{\s*([\w-]+)\.([\w-]+)\s*\}\}$")
 # are AWS-shaped resources provisioned in per-env backing containers.
 # vpc/subnet/sg are the V1 network containers: their containment-stamped
 # data.vpc/data.subnet fields flow through `_resource` like any other field.
-# iam_role/ecr (V2c), ec2 (V3c), lambda (V4c), and ecs (V5c) are pure
-# gateway-model kinds like vpc/subnet/sg -- no reconciler-driven provisioning
-# at all (plan.py NoOps them; see reconcile/plan.py + aws/backings.py::
-# ENSURE_KINDS), just fields flowing through generically for hcl.py's
-# builders to read. ec2's REAL lifecycle (a Lima VM) is driven entirely by
-# the gateway's RunInstances handler (gateway/models/ec2compute.py) once
-# `tofu apply` reaches it; lambda's (a per-function RIE container) the same
-# way via CreateFunction (gateway/models/lambdactl.py); ecs's (per-task
-# Colima containers) via CreateService/UpdateService
-# (gateway/models/ecsctl.py) -- the reconciler never touches any of them,
-# same as vpc/subnet/sg.
+# iam_role/ecr (V2c), ec2 (V3c), lambda (V4c), ecs (V5c), logs (W2.1) and
+# secret/ssm (W2.4) are pure gateway-model kinds like vpc/subnet/sg -- no reconciler-driven
+# provisioning at all (plan.py NoOps them; see reconcile/plan.py +
+# aws/backings.py::ENSURE_KINDS), just fields flowing through generically for
+# hcl.py's builders to read. ec2's REAL lifecycle (a Lima VM) is driven
+# entirely by the gateway's RunInstances handler
+# (gateway/models/ec2compute.py) once `tofu apply` reaches it; lambda's (a
+# per-function RIE container) the same way via CreateFunction
+# (gateway/models/lambdactl.py); ecs's (per-task Colima containers) via
+# CreateService/UpdateService (gateway/models/ecsctl.py); logs' (a group +
+# streams + events in a per-env JSON sidecar) via CreateLogGroup
+# (gateway/models/logsctl.py); secret's (a record + versions in a 0600 JSON
+# sidecar) via CreateSecret/PutSecretValue (gateway/models/secretsctl.py) and
+# ssm's via PutParameter (gateway/models/ssmctl.py) -- the reconciler never
+# touches any of them, same as vpc/subnet/sg. elasticache (W2.8) is the newest
+# of these: its REAL lifecycle (a per-cluster redis:7-alpine container) is
+# driven by CreateCacheCluster/DeleteCacheCluster in gateway/models/cachectl.py.
+# alb (W2.5) is the same shape
+# again: one canvas node expands to aws_lb + aws_lb_target_group +
+# aws_lb_listener (agent/hcl.py), and its REAL substrate -- an nginx reverse
+# proxy container whose upstreams are the target group's registered targets --
+# is driven by the gateway's CreateLoadBalancer/CreateListener/RegisterTargets
+# handlers (gateway/models/elbv2ctl.py + compute/proxy.py).
+
+# (kind, field) pairs whose value is a CREDENTIAL BY CONSTRUCTION, whatever the
+# field happens to be called (W2.4). `is_sensitive_field_name` catches names
+# that LOOK secret-ish -- it would catch `secretString` by luck, and would miss
+# an ssm parameter's `paramValue` entirely -- so the two kinds whose whole
+# purpose is holding a secret say so explicitly here instead. The flag never
+# changes how the value is USED (tofu needs the real thing); it's what keeps it
+# out of the translation agent's prompt and out of every streamed `tofu` log
+# line. See spec/models.py::FieldValue.sensitive.
+_SENSITIVE_FIELDS = {
+    "secret": frozenset({"secretString"}),
+    "ssm": frozenset({"paramValue"}),
+}
+
 _KIND = {
     "rds": "rds",
     "s3": "s3",
@@ -42,6 +68,11 @@ _KIND = {
     "ec2": "ec2",
     "lambda": "lambda",
     "ecs": "ecs",
+    "logs": "logs",
+    "secret": "secret",
+    "ssm": "ssm",
+    "elasticache": "elasticache",
+    "alb": "alb",
 }
 
 
@@ -79,7 +110,8 @@ def _resource(node: dict) -> ResourceDesired | None:
         if ref is not None:  # a top-level ${{node.attr}} field becomes a Ref
             refs.append(ref)
         else:
-            fields[key] = FieldValue(value=value, provenance="user", sensitive=is_sensitive_field_name(key))
+            sensitive = is_sensitive_field_name(key) or key in _SENSITIVE_FIELDS.get(kind, ())
+            fields[key] = FieldValue(value=value, provenance="user", sensitive=sensitive)
     if static_env:
         # Security finding #3: the whole `env` field is flagged sensitive if
         # ANY entry looks like a secret (coarse -- fine for the LLM-prompt

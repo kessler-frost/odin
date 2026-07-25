@@ -46,6 +46,28 @@ def test_world_text_renders_phase_table(runner):
 
 
 @respx.mock
+def test_world_text_renders_a_drift_verdict(runner):
+    """W2.2: the reality sweep's verdict is the whole point of `odin world`
+    for a drifted resource -- "crashed" alone doesn't tell anyone their VM was
+    deleted out of band, or that re-Apply is the fix. It rides
+    WorldDelta -> world.json -> /world, so this asserts the CLI actually
+    prints it rather than dropping it on the floor."""
+    verdict = "VM odin-ec2-prod-i-1 deleted outside odin — re-Apply to recreate"
+    respx.get(f"{BASE}/world", params={"env": "prod"}).mock(return_value=httpx.Response(200, json={
+        "env": "prod",
+        "resources": [
+            {"id": "server", "kind": "ec2", "phase": "crashed", "facts": {},
+             "verdict": verdict, "restarts": 0},
+        ],
+    }))
+    result = runner.invoke(app, ["world", "--env", "prod"])
+    assert result.exit_code == 0
+    (line,) = result.stdout.splitlines()
+    assert "server" in line and "ec2" in line and "crashed" in line
+    assert verdict in line
+
+
+@respx.mock
 def test_world_text_empty(runner):
     respx.get(f"{BASE}/world", params={"env": "default"}).mock(
         return_value=httpx.Response(200, json={"env": "default", "resources": []})
@@ -177,6 +199,45 @@ def test_logs_custom_env_and_tail(runner):
     result = runner.invoke(app, ["logs", "app", "--env", "prod", "--tail", "50"])
     assert result.exit_code == 0
     assert "starting up" in result.stdout
+
+
+@respx.mock
+def test_logs_group_reads_a_log_group_with_no_node_argument(runner):
+    respx.get(f"{BASE}/logs", params={"env": "default", "group": "/aws/lambda/fn1", "tail": "100"}).mock(
+        return_value=httpx.Response(200, json={
+            "env": "default", "node": "", "kind": None, "found": True, "running": True,
+            "sources": ["odin-lambda-default-fn1"],
+            "lines": "2026-07-24T00:00:00.000+00:00 hello from the handler", "message": None,
+        })
+    )
+    result = runner.invoke(app, ["logs", "--group", "/aws/lambda/fn1"])
+    assert result.exit_code == 0
+    assert "hello from the handler" in result.stdout
+
+
+@respx.mock
+def test_logs_node_and_group_together_pass_both_through(runner):
+    respx.get(f"{BASE}/logs", params={"env": "prod", "node": "app", "group": "/ecs/app", "tail": "20"}).mock(
+        return_value=httpx.Response(200, json={
+            "env": "prod", "node": "app", "kind": None, "found": True, "running": True,
+            "sources": ["odin-ecs-prod-abc12345-app"], "lines": "task one up", "message": None,
+        })
+    )
+    result = runner.invoke(app, ["logs", "app", "--group", "/ecs/app", "--env", "prod", "--tail", "20"])
+    assert result.exit_code == 0
+    assert "task one up" in result.stdout
+
+
+@respx.mock
+def test_logs_with_neither_node_nor_group_exits_one(runner):
+    respx.get(f"{BASE}/logs", params={"env": "default", "tail": "100"}).mock(
+        return_value=httpx.Response(200, json={
+            "env": "default", "node": "", "error": "node or group is required",
+        })
+    )
+    result = runner.invoke(app, ["logs"])
+    assert result.exit_code == 1
+    assert "node or group is required" in result.stderr
 
 
 @respx.mock

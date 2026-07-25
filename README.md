@@ -30,9 +30,10 @@ There is one button. Draw nodes, wire edges, click **Apply**:
   VM, ECS → [Colima](https://github.com/abiosoft/colima) containers, Lambda →
   a real [AWS RIE](https://github.com/aws/aws-lambda-runtime-interface-emulator)
   container, ECR → a [`registry:2`](https://github.com/distribution/distribution)
-  container). RDS isn't on Terraform yet — it's provisioned directly as a
-  real Postgres container by odin's reconciler, and the code panel says so
-  instead of silently dropping it.
+  container, RDS → a real Postgres container). Every drawable kind is on
+  Terraform now; anything a canvas asks for that odin can't stand behind
+  (a MySQL engine, say) is listed in the code panel with the reason
+  instead of being silently dropped.
 - Every workload node (EC2, ECS, Lambda) is issued its own AWS keypair and
   gets it automatically — baked into EC2's cloud-init, injected into each ECS
   task's and Lambda's container environment. It only has whatever permissions
@@ -78,6 +79,43 @@ Network reachability (who can talk to whom on the wire) is a separate concern,
 handled by [Nebula](https://github.com/slackhq/nebula) — VPCs and Security
 Groups drawn on the canvas compile to real Nebula network + firewall config.
 
+## "What's wrong here?"
+
+Select one or more nodes on the canvas (click, or Cmd-drag a region) and a bar
+appears with a **What's wrong here?** button and a free-form question box. Odin
+gathers each selected node's desired config, its references to other nodes, its
+observed phase and real crash verdict (an ECS task's `stoppedReason` + exit
+code, an EC2 or Lambda `StateReason`, a Postgres connection error), its last
+few events, and a tail of its real container/VM logs — plus the last lines of
+the environment's own `tofu apply`/`destroy` output, which belong to no single
+node — then one model call answers in plain English and names per-node suspects
+with reasons. A node that was deleted out from under odin (`limactl delete`,
+`docker rm`) carries the reality sweep's own verdict, so "your VM is gone —
+re-Apply to recreate" is part of the evidence too.
+
+This is the one place in odin where the AI is load-bearing. Generating
+Terraform from the canvas and reading it back are deterministic code, on
+purpose; there is no deterministic function from *exit code 1 + forty lines of
+stdout* to *"this task exits because the config it expects was never
+supplied"*. The compiler builds; the agent explains.
+
+Honest about what it needs and what it can't do:
+
+- It requires the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python)
+  — the `claude` CLI on your `PATH`, signed in. Without it the answer is
+  literally `agent unavailable` and the panel says so. Nothing else in odin
+  needs it; `ODIN_DEBUG_AGENT=0` turns the feature off outright, and
+  `ODIN_DEBUG_TIMEOUT` (default 90s) bounds the call.
+- Secrets never reach the model: env-var **values** are reduced to key names,
+  any field odin flags sensitive is `[REDACTED]`, and every string in the
+  evidence — including log lines, tofu's own output, and an RDS node's
+  `DATABASE_URL` facts — is scrubbed of known secret values first.
+- It reads state and returns prose. It cannot change your canvas, your
+  Terraform, or anything running.
+- The evidence is capped (40 log lines and 10 events per node, 20 nodes, 20
+  lines of tofu output), so a failure whose cause scrolled past that window
+  won't be in the answer. The Logs tab has the full tail.
+
 ## What's on the canvas today
 
 Compute: EC2, Lambda, ECS. Networking: VPC, Subnet, Security Group (draw an
@@ -102,8 +140,12 @@ Known v1 limits, recorded rather than hidden:
   doesn't retroactively re-provision the subscription — remove and re-add the
   topic (or its edge) to force it. Fixed on create; the live-edit path is a
   known gap.
-- **RDS** stays off Terraform — it's the reconciler's real Postgres
-  container, not a `tofu`-managed resource, until an RDS gateway model lands.
+- **RDS** is Terraform-managed (`aws_db_instance` → a real Postgres
+  container), but Postgres-only: choosing MySQL or MariaDB is declined with
+  a reason rather than quietly given a Postgres. `allocated_storage` and
+  `instance_class` round-trip faithfully but resize nothing, there are no
+  snapshots, and a node's name must be a valid RDS identifier (lowercase,
+  hyphen-separated).
 - **Nebula** is live single-host: VPC/SG config compiles to real Nebula
   network + firewall primitives, the host runs a real (and fully
   unprivileged — no root, no sudo, no one-time setup) lighthouse process,
@@ -128,14 +170,16 @@ Known v1 limits, recorded rather than hidden:
   default) can review the generated file and add comments or tags; every
   return is re-validated against the skeleton (same resource set, every
   argument's value byte-identical) and discarded on any deviation, so it
-  cannot change what gets applied.
+  cannot change what gets applied. The one genuinely agent-shaped job in here
+  is failure explanation (`agent/debugger.py`, `POST /agent/debug`) — see
+  ["What's wrong here?"](#whats-wrong-here) above.
 - **Runtime:** real containers via Colima (default) or inside a Lima VM
   (`src/odin/runtime/`), and a real Lima VM for EC2 (`src/odin/compute/`).
 - **Control loop:** a Spec Store (Stack = desired, World = observed) with a
-  pure, idempotent `plan(Stack, World) → [Action]` reconciler that still
-  drives the non-Terraform resources (RDS, and the AWS-shaped backings) and
-  projects Terraform-owned resources' live status back into World too, so
-  every node's badge reflects reality regardless of which path provisioned it.
+  pure, idempotent `plan(Stack, World) → [Action]` reconciler that drives
+  the non-Terraform resources (the AWS-shaped backings) and projects
+  Terraform-owned resources' live status back into World too, so every
+  node's badge reflects reality regardless of which path provisioned it.
 
 ## Requirements
 
@@ -215,6 +259,8 @@ odin events --env dev               # the event stream, one JSON line each
 odin tf status --env dev            # tofu-side state
 odin destroy --env dev              # full teardown (tofu half included)
 odin import-tf existing.tf          # TF -> canvas JSON (pipe into canvas set -)
+odin export --env dev               # back an env's state up to a tar.gz
+odin import odin-dev-export.tar.gz  # restore it (works with odin down)
 odin doctor                         # toolchain health, with exact fixes
 ```
 
@@ -224,6 +270,51 @@ A round-trip example an agent might run:
 odin canvas get | jq '.nodes += [{"id":"x1","type":"s3","data":{"label":"backups"}}]' | odin canvas set -
 odin apply --env dev
 ```
+
+## Backup and restore
+
+`.odin/` is the only record that an env exists. Lose it and every container
+that env owns is orphaned — nothing left knows they're odin's — and the next
+startup reaper run, seeing no envs, deletes every odin VM. So take a
+snapshot:
+
+```bash
+odin export --env dev                       # -> odin-dev-export.tar.gz
+odin export --env dev -o ~/backups/dev.tgz  # or wherever you want it
+
+odin stop                                   # restore is a server-down operation
+odin import odin-dev-export.tar.gz          # back into env `dev`
+odin import odin-dev-export.tar.gz --env dev2   # or alongside, under a new name
+```
+
+Both commands work directly on the filesystem — no server, no HTTP — because
+the failure they exist for is the one where odin can't start.
+
+**What's in the archive:** the env's whole control plane. The Stack revision
+lineage and `HEAD`, `world.json`, the env's issued gateway credentials, the
+gateway's synth stores and Lambda zips, and the tofu workspace including
+`terraform.tfstate`. Plus a `manifest.json` recording the odin version, env
+name, and timestamp. The only thing deliberately left out is
+`tf/.terraform/` — `tofu init` rebuilds the provider cache from the same
+`main.tf`, and it's hundreds of megabytes.
+
+**What isn't:** data. This is control-plane state — it records that a bucket
+named `uploads` should exist, never the objects inside it. Restore an env and
+you get fresh, empty backings matching the archived desired state; a file you
+had put in that bucket is gone. Container volumes are not backed up.
+
+Importing state doesn't boot anything either. It puts odin's model of the
+world back; `odin start` plus one Apply converges reality to it.
+
+Guardrails, because both of these are destructive by nature: `import` refuses
+to overwrite an existing env directory unless you pass `--force`, refuses to
+run at all while odin is up, and rejects any archive containing an absolute
+path, a `..` traversal, or a symlink member. The shared `.odin/canvas.json`
+travels in the archive but is restored only under `--with-canvas` — a restore
+should never silently replace the canvas you're drawing on.
+
+The archive contains the env's credentials in cleartext. Treat the file like
+a private key — see [SECURITY.md](SECURITY.md#secrets).
 
 ## Security
 

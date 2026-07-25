@@ -1,7 +1,7 @@
 """S2.5 — canvas graph -> desired Stack (kinds, fields, refs)."""
 from __future__ import annotations
 
-from odin.spec.translate import canvas_to_stack, parse_ref
+from odin.spec.translate import canvas_to_stack, parse_ref, skipped_node_types
 
 
 def test_parse_ref():
@@ -169,3 +169,104 @@ def test_iam_role_and_ecr_translate_with_fields_passed_generically():
     assert by_id["lambda-exec"].fields["inlinePolicy"].value == '{"Version": "2012-10-17"}'
 
     assert by_id["app-image"].kind == "ecr"
+
+
+def test_logs_translates_as_a_gateway_model_kind_and_is_never_skipped():
+    # W2.1: `logs` joins iam_role/ecr/ec2/lambda/ecs -- plan.py NoOps it and the
+    # gateway model owns its whole lifecycle, so the translator needs nothing
+    # but the _KIND entry. It must NOT read as an unsupported node type: that's
+    # what Apply/Preview show the user as "silently dropped".
+    canvas = {
+        "nodes": [{"id": "n1", "type": "logs", "data": {"label": "/odin/app", "retentionInDays": "14"}}],
+        "edges": [],
+    }
+    stack = canvas_to_stack(canvas)
+    (group,) = stack.resources
+    assert group.id == "/odin/app"  # the label IS the log group name
+    assert group.kind == "logs"
+    assert group.fields["retentionInDays"].value == "14"
+    assert skipped_node_types(canvas) == []
+
+
+def test_logs_with_a_blank_retention_field_carries_no_retention_at_all():
+    # The catalog's default is '' (unset = AWS's never-expire), and the
+    # translator drops empty fields -- so hcl.py's builder omits the argument.
+    canvas = {"nodes": [{"type": "logs", "data": {"label": "/odin/app", "retentionInDays": ""}}], "edges": []}
+    (group,) = canvas_to_stack(canvas).resources
+    assert "retentionInDays" not in group.fields
+
+
+def test_secret_and_ssm_translate_as_gateway_model_kinds_and_are_never_skipped():
+    # W2.4: both were drawable-only (Apply silently dropped them); now they join
+    # iam_role/ecr/ec2/lambda/ecs/logs -- plan.py NoOps them and the gateway
+    # model owns their whole lifecycle.
+    canvas = {
+        "nodes": [
+            {"id": "n1", "type": "secret", "data": {"label": "db-password", "secretString": "hunter2-long"}},
+            {"id": "n2", "type": "ssm", "data": {
+                "label": "/odin/api-key", "paramType": "SecureString", "paramValue": "abc123",
+            }},
+        ],
+        "edges": [],
+    }
+    stack = canvas_to_stack(canvas)
+    by_id = {r.id: r for r in stack.resources}
+    assert by_id["db-password"].kind == "secret"  # the label IS the secret name
+    assert by_id["/odin/api-key"].kind == "ssm"   # ...and the parameter name
+    assert by_id["/odin/api-key"].fields["paramValue"].value == "abc123"
+    assert skipped_node_types(canvas) == []
+
+
+def test_a_secret_nodes_value_is_flagged_sensitive():
+    # W2.4 + security finding #3: the flag is what keeps the plaintext out of
+    # the translation agent's prompt and out of every streamed tofu log line.
+    canvas = {
+        "nodes": [{"type": "secret", "data": {"label": "db-password", "secretString": "hunter2-long"}}],
+        "edges": [],
+    }
+    (secret,) = canvas_to_stack(canvas).resources
+    assert secret.fields["secretString"].sensitive is True
+    assert secret.sensitive_values() == frozenset({"hunter2-long"})
+
+
+def test_an_ssm_parameters_value_is_flagged_sensitive_despite_its_field_name():
+    # `paramValue` matches none of `is_sensitive_field_name`'s hints -- the
+    # (kind, field) rule in translate.py is what catches it, which is the whole
+    # reason that rule exists.
+    canvas = {
+        "nodes": [{"type": "ssm", "data": {"label": "/odin/api-key", "paramValue": "abc123456"}}],
+        "edges": [],
+    }
+    (param,) = canvas_to_stack(canvas).resources
+    assert param.fields["paramValue"].sensitive is True
+    assert param.sensitive_values() == frozenset({"abc123456"})
+
+
+def test_a_secret_or_ssm_nodes_other_fields_are_not_flagged_sensitive():
+    # Over-flagging would scrub innocent words out of every tofu log line.
+    canvas = {
+        "nodes": [
+            {"type": "secret", "data": {"label": "db-password", "description": "the db password"}},
+            {"type": "ssm", "data": {"label": "flag", "paramType": "String", "paramValue": "on-and-on"}},
+        ],
+        "edges": [],
+    }
+    by_id = {r.id: r for r in canvas_to_stack(canvas).resources}
+    assert by_id["db-password"].fields["description"].sensitive is False
+    assert by_id["flag"].fields["paramType"].sensitive is False
+
+
+def test_elasticache_translates_generically_and_is_never_skipped():
+    # W2.8: elasticache is a pure gateway-model kind like iam_role/ecr --
+    # `_resource` needs no special-casing, just the _KIND mapping. The
+    # skipped-types check is the northstar directive-5 half: a drawable kind
+    # must be BACKED or explicitly skipped, never silently ignored.
+    canvas = {
+        "nodes": [{"id": "n1", "type": "elasticache", "data": {"label": "cache", "nodeType": "cache.t3.small"}}],
+        "edges": [],
+    }
+    stack = canvas_to_stack(canvas)
+    (res,) = stack.resources
+    assert (res.id, res.kind) == ("cache", "elasticache")
+    assert res.fields["nodeType"].value == "cache.t3.small"
+    assert skipped_node_types(canvas) == []

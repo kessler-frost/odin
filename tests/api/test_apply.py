@@ -52,17 +52,23 @@ CANVAS = {
 }
 
 
-def test_apply_translates_stores_and_reconciles(tmp_path):
+def test_apply_stores_the_stack_and_never_creates_a_tf_owned_resource(tmp_path):
+    """`/apply` is the reconciler-only half of the pipeline. W2.7 made `rds`
+    TF-owned, so this route must commit the desired state and STOP -- creating
+    the database here would race the `tofu apply` that `/apply-full` runs (the
+    exact class of bug /apply-full's deferred store commit exists to avoid)."""
     rt, rds = FakeRuntime(), FakeRds()
     app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, backings=False)
     with TestClient(app) as client:
         resp = client.post("/apply", json=CANVAS)
         assert resp.json()["status"] == "applied" and resp.json()["rev"]
+        assert app.state.store.get_stack("default").resources[0].kind == "rds"
 
-        world = client.get("/world").json()
-        phases = {r["id"]: r["phase"] for r in world["resources"]}
-        assert rds.created == ["db"]          # rds creation was driven
-        assert phases["db"] == "starting"
+        assert rds.created == []               # tofu's CreateDBInstance owns this now
+        assert rt.runs == []
+        # And nothing entered World: only tf_status.project() (fed by the
+        # gateway's own DB-instance record) can put an rds node there.
+        assert client.get("/world").json()["resources"] == []
 
 
 def test_mesh_endpoint_returns_empty_network(tmp_path):

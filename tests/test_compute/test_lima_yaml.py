@@ -67,3 +67,18 @@ def test_no_shared_network_by_default():
     config = VmConfig(cpus=1, memory="1GiB", disk="10GiB")
     parsed = yaml.safe_load(generate_lima_yaml(config))
     assert "networks" not in parsed
+
+
+def test_nebulas_port_is_never_forwarded_to_the_host():
+    """W2.6, found live: Lima forwards every guest listener to the host's
+    127.0.0.1, so a VM's `nebula` daemon made `limactl` hold UDP
+    127.0.0.1:4242 -- the very address a backing CONTAINER reaches the host
+    lighthouse at (Colima maps host.docker.internal onto the host loopback).
+    Every backing↔VM handshake was silently forwarded INTO a VM instead. A
+    mesh data-plane port must never be host-forwarded."""
+    config = VmConfig(cpus=1, memory="1GiB", disk="10GiB")
+    parsed = yaml.safe_load(generate_lima_yaml(config, shared_network=True))
+    assert parsed["portForwards"] == [
+        {"guestPort": 4242, "proto": "udp", "ignore": True},
+        {"guestPort": 4242, "proto": "tcp", "ignore": True},
+    ]

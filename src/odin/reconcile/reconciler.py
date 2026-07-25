@@ -3,12 +3,24 @@
 Each tick: (1) observe — refresh the World from runtime facts + assertions,
 advancing started resources to healthy/crashed; (2) plan(Stack, World) → Actions;
 (3) execute — provision/stop; (4) project the gateway's TF-owned resources
-(vpc/subnet/sg/ec2/ecs/lambda/iam_role/ecr) into World too (fix-wave 2b
-finding #1 -- see reconcile/tf_status.py). The pure plan() decides intent for
-rds + the AWS-shaped PROVISIONED resources; this executor builds specs
-(resolving refs via the Fabric) and runs them; TF_OWNED_KINDS never go
-through plan/execute at all -- tofu is their sole creator/destroyer, this
-loop only OBSERVES what tofu already did.
+(vpc/subnet/sg/ec2/ecs/lambda/iam_role/ecr/logs/rds) into World too (fix-wave
+2b finding #1 -- see reconcile/tf_status.py), cross-checked against REALITY on
+a bounded cadence (W2.2 -- see reconcile/drift.py: a VM/container/database
+deleted out of band projects `crashed` with a verdict instead of a permanent
+stale `healthy`).
+The pure plan() decides intent for the AWS-shaped PROVISIONED resources only;
+this executor builds specs (resolving refs via the Fabric) and runs them;
+TF_OWNED_KINDS never go through plan/execute at all -- tofu is their sole
+creator/destroyer, this loop only OBSERVES what tofu already did.
+
+W2.7 retired the last non-TF path here: `rds` was provisioned and supervised
+by this loop (its own `_observe_rds`, its own `pg_ready` seam, its own
+crash-clear-and-recreate). All three moved -- creation to tofu's
+CreateDBInstance (`gateway/models/rdsctl.py`), the `pg_ready` assertion into
+that model's create waiter, and the crash/recover story into the reality
+sweep + an Apply-driven `converge_db_instances`, the shape W2.2 already
+established for ecs/lambda. What's left of rds in this file is the same thing
+that's left of every TF-owned kind: projection and pruning.
 
 Per-node credential injection (a workload container's env bound to
 keystore-issued creds + the gateway endpoint, formerly `_run_service`) is
@@ -28,12 +40,10 @@ from odin.aws.backings import ENSURE_KINDS, PROVISIONED
 from odin.fabric.localhost import LocalhostFabric
 from odin.gateway.policy import compile_policies
 from odin.gateway.stores import SynthStores
-from odin.reconcile import assertions
 from odin.reconcile.actions import NoOp, ProvisionResource, StopContainer
+from odin.reconcile.drift import DriftSweeper
 from odin.reconcile.plan import plan
 from odin.reconcile.tf_status import TF_OWNED_KINDS, project as project_tf_owned
-from odin.runtime.colima import CONTAINER_HOST
-from odin.runtime.lima import LIMA_HOST
 from odin.spec.models import ResourceDesired, Stack, World, WorldDelta
 
 log = logging.getLogger("odin.reconcile")
@@ -44,25 +54,22 @@ class Reconciler:
         self,
         store,
         runtime,
-        rds,
         aws=None,
         gateway=None,
         fabric: LocalhostFabric | None = None,
         ws=None,
         env: str = "default",
-        pg_ready=assertions.pg_ready,
         poll_interval: float = 2.0,
         stores: SynthStores | None = None,
+        drift: DriftSweeper | None = None,
     ) -> None:
         self._store = store
         self._rt = runtime
-        self._rds = rds
         self._aws = aws
         self._gateway = gateway
         self._fabric = fabric or LocalhostFabric()
         self._ws = ws
         self._env = env
-        self._pg_ready = pg_ready
         self._poll = poll_interval
         # The gateway's synth stores (tags/ec2net/iamctl/ecr/ec2compute/
         # lambdactl/ecsctl) -- read-only here, for the TF-owned-status
@@ -70,6 +77,12 @@ class Reconciler:
         # every test that doesn't care; server.py's real wiring always
         # passes the SAME SynthStores instance the gateway itself uses.
         self._stores = stores
+        # W2.2's reality sweep (reconcile/drift.py) -- the same optional-seam
+        # shape as `stores`/`aws`/`gateway`: None means "no reality check"
+        # (every unit test that hand-seeds synth records and doesn't want a
+        # real `limactl list`/`docker ps` leaves it out), and create_app's
+        # real, runtime-backed wiring always passes one.
+        self._drift = drift
         self._task: asyncio.Task | None = None
         self._stop = False
         # tick() is called by BOTH the background loop and the /apply//destroy
@@ -125,14 +138,30 @@ class Reconciler:
         """`tf_status.project()` is the whole snapshot; diff it against the
         current World and emit only what changed (`_emit`'s own dedupe) plus
         prune any label that dropped out (tofu destroyed it -- this loop
-        never destroys a TF-owned resource itself)."""
+        never destroys a TF-owned resource itself).
+
+        W2.2: the drift sweep runs FIRST, deliberately -- its ecs half writes
+        reality back into the task records (reconcile/drift.py's module
+        docstring), so a container removed outside odin surfaces on THIS
+        tick's projection rather than the next one; its ec2/lambda half comes
+        back as a `label -> verdict` overlay that turns a record still
+        claiming to be up into an honest `crashed` + why. `_emit`'s existing
+        crashed path is what then broadcasts both the WorldDelta and the
+        `type:"log"` error line -- drift needs no pipeline of its own."""
+        drifted = await self._drift_verdicts()
         projected = await asyncio.to_thread(project_tf_owned, self._stores, self._env)
         for label, (kind, phase, facts, verdict) in projected.items():
+            phase, verdict = ("crashed", drifted[label]) if label in drifted else (phase, verdict)
             await self._emit(label, kind, phase, facts=facts, verdict=verdict)
         world = self._store.current_world(self._env)
         for observed in world.resources:
             if observed.kind in TF_OWNED_KINDS and observed.id not in projected:
                 await self._prune(observed.id)
+
+    async def _drift_verdicts(self) -> dict[str, str]:
+        if self._drift is None:
+            return {}
+        return await asyncio.to_thread(self._drift.verdicts, self._stores, self._env)
 
     async def ensure_backings(self, stack: Stack) -> None:
         """Boot (but don't create any resource on) the backing containers
@@ -162,9 +191,6 @@ class Reconciler:
             self._gateway.update(self._env, compile_policies(stack), ports)
 
     # ---- helpers ----
-    def _res(self, stack: Stack, rid: str) -> ResourceDesired:
-        return next(r for r in stack.resources if r.id == rid)
-
     def _kind_of(self, stack: Stack, rid: str) -> str | None:
         return next((r.kind for r in stack.resources if r.id == rid), None)
 
@@ -173,11 +199,6 @@ class Reconciler:
         must fan out to."""
         return tuple(e.dst for e in stack.edges
                      if e.src == sns_id and self._kind_of(stack, e.dst) == "sqs")
-
-    def _creds(self, res: ResourceDesired) -> tuple[str, str]:
-        user = res.fields["username"].value if "username" in res.fields else "app"
-        pw = res.fields["password"].value if "password" in res.fields else "apppass123"
-        return str(user), str(pw)
 
     async def _emit(self, rid, kind, phase, facts=None, verdict=None) -> None:
         # Skip unchanged status: observe runs every tick and the cpu/ram facts
@@ -212,9 +233,7 @@ class Reconciler:
             observed = world.get(res.id)
             if observed is None:
                 continue
-            if res.kind == "rds" and observed.phase in ("starting", "healthy"):
-                await self._observe_rds(res)
-            elif res.kind in PROVISIONED and observed.phase in ("starting", "healthy"):
+            if res.kind in PROVISIONED and observed.phase in ("starting", "healthy"):
                 await self._observe_provisioned(stack, res, observed.phase)
 
     async def _observe_provisioned(self, stack: Stack, res: ResourceDesired, phase: str) -> None:
@@ -255,73 +274,16 @@ class Reconciler:
         container_name = getattr(self._aws, "container_name", None)
         return self._rt.logs(container_name(kind)) if container_name is not None else ""
 
-    async def _observe_rds(self, res: ResourceDesired) -> None:
-        cname = self._rds.container_name(res.id)
-        if self._rt.facts(cname).phase == "crashed":
-            # Clear the dead container so the recreate boots a fresh Postgres.
-            exit_code = self._rt.exit_code(cname)
-            logtail = self._rt.logs(cname)
-            await asyncio.to_thread(self._rds.delete_db, res.id)
-            await self._emit(
-                res.id, "rds", "crashed",
-                facts={"logtail": logtail} if logtail else {},
-                verdict=f"container exited (code {exit_code})",
-            )
-            return
-        endpoint = self._rds.endpoint(res.id)
-        if endpoint is None:
-            return  # still creating
-        user, pw = self._creds(res)
-        result = await self._pg_ready(endpoint[0], endpoint[1], user, pw)  # host-side probe
-        if not result.ok:
-            # Not necessarily a crash (Postgres may simply still be booting)
-            # -- phase stays "starting", but WHY the health check keeps
-            # failing must not vanish silently (observability v1). _emit's
-            # own dedupe on (phase, verdict) means this only broadcasts once
-            # per distinct error, never spams every tick.
-            if result.error:
-                await self._emit(res.id, "rds", "starting", verdict=f"not ready: {result.error}")
-            return
-        # Publish a CONTAINER-reachable address: a consumer gets this verbatim
-        # as DATABASE_URL, and "localhost" inside a container is the container
-        # itself, not the Mac. host.docker.internal is the host (same as AWS).
-        addr = f"{CONTAINER_HOST}:{endpoint[1]}"
-        url = f"postgresql://{user}:{pw}@{addr}/postgres"
-        # A container consumer resolves host.docker.internal; an EC2 Lima VM
-        # does NOT (finding #5) -- it resolves host.lima.internal. Publish a
-        # SECOND, VM-reachable form pointing at the SAME Postgres, so an ec2
-        # node consumes ${{db.DATABASE_URL_VM}} while containers keep
-        # ${{db.DATABASE_URL}} (per-consumer-type ref routing is deferred --
-        # a distinct fact is the honest, smaller fix).
-        vm_addr = f"{LIMA_HOST}:{endpoint[1]}"
-        vm_url = f"postgresql://{user}:{pw}@{vm_addr}/postgres"
-        stats = self._rt.stats(cname)
-        await self._emit(
-            res.id, "rds", "healthy",
-            facts={
-                "DATABASE_URL": url, "endpoint": addr,
-                "DATABASE_URL_VM": vm_url, "endpoint_vm": vm_addr,
-                **stats,
-            },
-        )
-
     # ---- execute ----
     async def _execute(self, action, stack: Stack) -> None:
         if isinstance(action, ProvisionResource):
-            res = self._res(stack, action.id)
-            if action.service == "rds":
-                user, pw = self._creds(res)
-                await asyncio.to_thread(self._rds.create_db, action.id, user, pw)
-                await self._emit(action.id, "rds", "starting")
-            else:  # AWS-shaped resource in a shared backing (s3/sqs/sns/dynamodb)
-                subs = self._desired_subs(stack, action.id) if action.service == "sns" else ()
-                await asyncio.to_thread(self._aws.provision, action.service, action.id, subs)
-                await self._emit(action.id, action.service, "starting")
+            # Only ever an AWS-shaped resource in a shared backing
+            # (s3/sqs/sns/dynamodb) -- plan() emits nothing else (W2.7).
+            subs = self._desired_subs(stack, action.id) if action.service == "sns" else ()
+            await asyncio.to_thread(self._aws.provision, action.service, action.id, subs)
+            await self._emit(action.id, action.service, "starting")
         elif isinstance(action, StopContainer):
-            if action.kind == "rds":
-                self._rds.delete_db(action.id)  # stop the DB container so re-apply re-boots
-                self._rt.stop(self._rds.container_name(action.id))
-            elif action.kind in PROVISIONED:
+            if action.kind in PROVISIONED:
                 await asyncio.to_thread(self._aws.deprovision, action.kind, action.id)
             elif action.kind in TF_OWNED_KINDS:
                 # tofu (never this reconciler) owns create/destroy for a

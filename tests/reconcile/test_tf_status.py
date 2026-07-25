@@ -1,22 +1,37 @@
 """Fix-wave 2b finding #1 -- reconcile/tf_status.py: a pure, read-only
-projection of TF-owned resources (vpc/subnet/sg/ec2/ecs/lambda/iam_role/ecr
--- kinds only tofu ever creates/destroys, never entered into World before
-this fix) from the gateway's synth stores into `label -> (kind, phase,
+projection of TF-owned resources (vpc/subnet/sg/ec2/ecs/lambda/iam_role/ecr/
+logs/rds -- kinds only tofu ever creates/destroys, never entered into World
+before this fix) from the gateway's synth stores into `label -> (kind, phase,
 facts, verdict)`. Hand-built `SynthStores`, no reconciler/asyncio involved
 -- see tests/reconcile/test_reconciler.py for the Reconciler-level
 integration (emitting WorldDeltas + pruning)."""
 from __future__ import annotations
 
+from odin.gateway.models import elbv2ctl, rdsctl, secretsctl, ssmctl
 from odin.gateway.stores import SynthStores
 from odin.reconcile.tf_status import TF_OWNED_KINDS, project
+from odin.runtime.colima import CONTAINER_HOST
+from odin.runtime.lima import LIMA_HOST
 
 ENV = "default"
+
+
+def _param(name: str, value: str = "v") -> dict:
+    """An ssmctl `param:` record, as `PutParameter` writes it."""
+    return {
+        "name": name, "arn": ssmctl.parameter_arn(name), "type": "SecureString", "value": value,
+        "version": 1, "description": None, "key_id": None, "allowed_pattern": None,
+        "tier": "Standard", "data_type": "text", "policies": None, "last_modified_date": 1.0,
+    }
 
 
 def test_tf_owned_kinds_excludes_reconciler_owned_kinds():
     # s3/sqs/sns/dynamodb already get real World entries via the reconciler's
     # own PROVISIONED path -- this projection must never double-own them.
-    assert TF_OWNED_KINDS == {"vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr"}
+    assert TF_OWNED_KINDS == {
+        "vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr", "logs", "secret", "ssm",
+        "elasticache", "rds", "alb",
+    }
 
 
 # --- vpc/subnet/sg: no AWS-native name field, so the odin:node tag is the
@@ -75,6 +90,135 @@ def test_ecr_healthy_and_falls_back_to_repository_name(tmp_path):
     assert project(stores, ENV)["app-image"] == ("ecr", "healthy", {}, None)
 
 
+# --- logs (W2.1): healthy on existence, tag-then-group-name label -- except an
+# `auto` group, which the SUBSTRATE created and the canvas never drew. --------
+
+
+def _log_group(name: str, auto: bool = False, retention: int | None = None) -> dict:
+    return {
+        "log_group_name": name, "creation_time": 1_700_000_000_000,
+        "retention_in_days": retention, "auto": auto,
+    }
+
+
+def test_log_group_projects_healthy_under_its_odin_node_tag(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.logsctl.set(ENV, "group:/odin/app", _log_group("/odin/app", retention=14))
+    stores.tags.set(
+        ENV, "logs:arn:aws:logs:us-east-1:000000000000:log-group:/odin/app",
+        {"odin:node": "the-canvas-label"},
+    )
+    result = project(stores, ENV)
+    assert result["the-canvas-label"] == ("logs", "healthy", {}, None)
+    assert "/odin/app" not in result
+
+
+def test_log_group_falls_back_to_its_own_group_name_when_untagged(tmp_path):
+    # The group name already IS the canvas label by construction (hcl.py's
+    # `_logs` builder), so the fallback is exact, not a guess.
+    stores = SynthStores(tmp_path)
+    stores.logsctl.set(ENV, "group:/odin/app", _log_group("/odin/app"))
+    assert project(stores, ENV)["/odin/app"] == ("logs", "healthy", {}, None)
+
+
+def test_auto_created_log_group_is_not_projected(tmp_path):
+    # A substrate-created `/aws/lambda/{fn}` group is bookkeeping, not a canvas
+    # node -- projecting it would strand a phantom World resource nothing can
+    # ever prune (no Stack resource carries that label).
+    stores = SynthStores(tmp_path)
+    stores.logsctl.set(ENV, "group:/aws/lambda/fn1", _log_group("/aws/lambda/fn1", auto=True))
+    assert project(stores, ENV) == {}
+
+
+def test_adopted_log_group_projects_once_tofu_owns_it(tmp_path):
+    # CreateLogGroup ADOPTS an auto group (logsctl.py's deviation 2), clearing
+    # the flag -- from that point the canvas owns it and World must show it.
+    stores = SynthStores(tmp_path)
+    stores.logsctl.set(ENV, "group:/aws/lambda/fn1", _log_group("/aws/lambda/fn1", auto=False))
+    assert project(stores, ENV)["/aws/lambda/fn1"] == ("logs", "healthy", {}, None)
+
+
+def test_log_streams_events_and_cursors_are_not_projected_as_resources(tmp_path):
+    # The logsctl store also holds the DATA plane (streams, event ring buffers,
+    # tail cursors) -- only `group:` records are World resources.
+    stores = SynthStores(tmp_path)
+    stores.logsctl.set(ENV, "group:/odin/app", _log_group("/odin/app"))
+    stores.logsctl.set(ENV, "stream:/odin/app:s1", {"log_group": "/odin/app", "log_stream_name": "s1"})
+    stores.logsctl.set(ENV, "events:/odin/app", [{"stream": "s1", "timestamp": 1, "message": "hi"}])
+    stores.logsctl.set(ENV, "cursor:/odin/app:s1", 1)
+    assert set(project(stores, ENV)) == {"/odin/app"}
+
+
+# --- secret + ssm (W2.4): healthy on existence, and NO FACTS EVER (a fact
+# rides the WorldDelta onto the WebSocket and into world.json -- a secret's
+# value must never travel either). ------------------------------------------
+
+
+def test_a_secret_projects_healthy_with_no_facts(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.secretsctl.set(ENV, "secret:db-password", {
+        "name": "db-password", "arn": secretsctl.secret_arn("db-password"),
+        "description": None, "kms_key_id": None, "resource_policy": None,
+        "created_date": 1.0, "last_changed_date": 1.0,
+    })
+    stores.tags.set(ENV, f"secretsmanager:{secretsctl.secret_arn('db-password')}", {"odin:node": "the-canvas-label"})
+    result = project(stores, ENV)
+    assert result["the-canvas-label"] == ("secret", "healthy", {}, None)
+    assert "db-password" not in result
+
+
+def test_a_secret_falls_back_to_its_own_name_when_untagged(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.secretsctl.set(ENV, "secret:db-password", {
+        "name": "db-password", "arn": secretsctl.secret_arn("db-password"),
+        "description": None, "kms_key_id": None, "resource_policy": None,
+        "created_date": 1.0, "last_changed_date": 1.0,
+    })
+    assert project(stores, ENV)["db-password"] == ("secret", "healthy", {}, None)
+
+
+def test_secret_versions_are_not_projected_as_resources_and_no_value_leaks(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.secretsctl.set(ENV, "secret:db-password", {
+        "name": "db-password", "arn": secretsctl.secret_arn("db-password"),
+        "description": None, "kms_key_id": None, "resource_policy": None,
+        "created_date": 1.0, "last_changed_date": 1.0,
+    })
+    stores.secretsctl.set(ENV, "version:db-password:v1", {
+        "secret_name": "db-password", "version_id": "v1", "secret_string": "hunter2-long",
+        "secret_binary": None, "version_stages": ["AWSCURRENT"], "created_date": 1.0,
+    })
+    result = project(stores, ENV)
+    assert set(result) == {"db-password"}
+    assert "hunter2-long" not in repr(result)
+
+
+def test_an_ssm_parameter_projects_healthy_with_no_facts(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.ssmctl.set(ENV, "param:/odin/api-key", _param("/odin/api-key"))
+    stores.tags.set(ENV, "ssm:/odin/api-key", {"odin:node": "the-canvas-label"})
+    result = project(stores, ENV)
+    assert result["the-canvas-label"] == ("ssm", "healthy", {}, None)
+    assert "/odin/api-key" not in result
+
+
+def test_an_ssm_parameter_falls_back_to_its_own_name_and_never_carries_its_value(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.ssmctl.set(ENV, "param:/odin/api-key", _param("/odin/api-key", value="abc123456"))
+    result = project(stores, ENV)
+    assert result["/odin/api-key"] == ("ssm", "healthy", {}, None)
+    assert "abc123456" not in repr(result)
+
+
+def test_a_root_level_parameters_tag_key_is_the_canonical_name(tmp_path):
+    # The tags store is keyed by the CANONICAL name (ssmctl.canonical_name), so
+    # a `/db-url`-written parameter still resolves its odin:node tag.
+    stores = SynthStores(tmp_path)
+    stores.ssmctl.set(ENV, "param:db-url", _param("/db-url"))
+    stores.tags.set(ENV, "ssm:db-url", {"odin:node": "the-canvas-label"})
+    assert project(stores, ENV)["the-canvas-label"] == ("ssm", "healthy", {}, None)
+
+
 # --- ec2: the flagship case -- a real Lima VM state machine mapped onto the
 # World Phase enum. --------------------------------------------------------
 
@@ -126,6 +270,45 @@ def test_terminated_ec2_instance_is_excluded_entirely(tmp_path):
     stores.ec2compute.set(ENV, "instance:i-1", _ec2_instance("i-1", "terminated"))
     stores.tags.set(ENV, "ec2:i-1", {"odin:node": "server"})
     assert project(stores, ENV) == {}
+
+
+def test_a_drifted_terminated_instance_projects_crashed_with_its_real_reason(tmp_path):
+    """W2.2's honesty fix (reconcile/drift.py): the reality sweep marks an
+    instance whose VM was deleted OUTSIDE odin `terminated`, because that is
+    what makes the next Apply recreate it. Dropping such a record here (the
+    rule for every other terminated instance) would trade one dishonesty for
+    another -- odin would quietly forget a node still on the canvas instead of
+    showing WHY it's down -- so a `drifted` record projects `crashed`."""
+    stores = SynthStores(tmp_path)
+    record = _ec2_instance("i-1", "terminated", {
+        "code": "Client.UserInitiatedShutdown",
+        "message": "VM odin-ec2-default-i-1 deleted outside odin — re-Apply to recreate",
+    })
+    stores.ec2compute.set(ENV, "instance:i-1", {**record, "drifted": True})
+    stores.tags.set(ENV, "ec2:i-1", {"odin:node": "server"})
+
+    assert project(stores, ENV)["server"] == (
+        "ec2", "crashed", {},
+        "Client.UserInitiatedShutdown: VM odin-ec2-default-i-1 deleted outside odin — re-Apply to recreate",
+    )
+
+
+def test_a_recreated_instance_wins_its_label_over_the_drifted_one_it_replaced(tmp_path):
+    """The recovery apply mints a NEW instance while the drifted record can
+    still be inside ec2compute's 60s lazy-sweep window, so both briefly carry
+    the same `odin:node` label. The live one must win, whatever order the
+    store happens to hold them in -- a recovered node reading `crashed` off
+    the corpse it replaced would be the same false badge in reverse."""
+    stores = SynthStores(tmp_path)
+    stores.ec2compute.set(ENV, "instance:i-new", _ec2_instance("i-new", "running"))
+    stores.tags.set(ENV, "ec2:i-new", {"odin:node": "server"})
+    stores.ec2compute.set(ENV, "instance:i-old", {
+        **_ec2_instance("i-old", "terminated", {"code": "Client.UserInitiatedShutdown", "message": "gone"}),
+        "drifted": True,
+    })
+    stores.tags.set(ENV, "ec2:i-old", {"odin:node": "server"})
+
+    assert project(stores, ENV)["server"] == ("ec2", "healthy", {}, None)
 
 
 def test_ec2_instance_with_no_odin_node_tag_is_not_projected(tmp_path):
@@ -185,17 +368,28 @@ def test_lambda_failed_state_reason_becomes_the_verdict(tmp_path):
 
 class FakeTaskRuntime:
     """`sweep_tasks`'s injectable seam -- reports whatever container status/
-    exit code the test pre-seeds, no real Colima involved."""
+    exit code/log tail the test pre-seeds, no real Colima involved."""
 
-    def __init__(self, statuses: dict[str, str] | None = None, exit_codes: dict[str, int] | None = None):
+    def __init__(
+        self, statuses: dict[str, str] | None = None, exit_codes: dict[str, int] | None = None,
+        logs: dict[str, str] | None = None,
+    ):
         self._statuses = statuses or {}
         self._exit_codes = exit_codes or {}
+        self._logs = logs or {}
 
     def status(self, env, task_id, container_name):
         return self._statuses.get(task_id, "running")
 
     def exit_code(self, env, task_id, container_name):
         return self._exit_codes.get(task_id, 0)
+
+    def logs(self, env, task_id, container_name, tail=20):
+        # W2.1: the sweep now also ships each task container's tail into
+        # `/ecs/{service}` (ecsctl.py's `_ship_task_logs`), so this seam has to
+        # answer for a log read too. "" (nothing seeded) is a real container's
+        # own answer once it has been removed, so it needs no special case.
+        return self._logs.get(task_id, "")
 
 
 def _ecs_service(cluster: str, name: str, desired: int, status: str = "ACTIVE", node_label: str | None = None) -> dict:
@@ -316,6 +510,137 @@ def test_ecs_service_falls_back_to_service_name_without_node_label(tmp_path):
     assert "app" in project(stores, ENV)
 
 
+def test_the_ecs_sweeps_own_auto_created_log_group_never_enters_world(tmp_path):
+    # The `auto` skip against its real producer, not a hand-set flag: shipping a
+    # task's tail really does create `/ecs/app` (logsctl's `ensure_group`), and
+    # that group must stay OUT of World -- nobody drew it on the canvas.
+    stores = SynthStores(tmp_path)
+    stores.ecsctl.set(ENV, "service:odin:app", _ecs_service("odin", "app", desired=1))
+    stores.ecsctl.set(ENV, "task:odin:t1", _ecs_task("odin", "app", "t1", "RUNNING"))
+    runtime = FakeTaskRuntime(logs={"t1": "hello from the task\n"})
+
+    result = project(stores, ENV, ecs_runtime=runtime)
+
+    assert stores.logsctl.get(ENV, "group:/ecs/app")["auto"] is True
+    assert set(result) == {"app"}
+    assert project(stores, ENV, ecs_runtime=runtime).keys() == {"app"}  # still absent next tick
+
+
+# --- elasticache (W2.8): a kind here that publishes real facts -- the
+# cluster's redis endpoint, in both the container- and VM-reachable forms. ---
+
+
+def _cache_cluster(cluster_id: str, status: str, port: int | None = None, status_reason: str | None = None) -> dict:
+    return {
+        "cache_cluster_id": cluster_id, "status": status, "status_reason": status_reason,
+        "arn": f"arn:aws:elasticache:us-east-1:000000000000:cluster:{cluster_id}",
+        "address": CONTAINER_HOST if port else None, "port": port,
+    }
+
+
+def test_elasticache_available_is_healthy_and_publishes_both_endpoint_forms(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.cachectl.set(ENV, "cluster:cache", _cache_cluster("cache", "available", port=51234))
+
+    kind, phase, facts, verdict = project(stores, ENV)["cache"]
+
+    assert (kind, phase, verdict) == ("elasticache", "healthy", None)
+    assert facts["REDIS_URL"] == f"redis://{CONTAINER_HOST}:51234"
+    assert facts["REDIS_URL_VM"] == f"redis://{LIMA_HOST}:51234"  # finding #5: a Lima VM can't resolve the container host
+    assert facts["endpoint"] == f"{CONTAINER_HOST}:51234"
+
+
+def test_elasticache_creating_and_deleting_are_starting_with_no_facts_yet(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.cachectl.set(ENV, "cluster:c1", _cache_cluster("c1", "creating"))
+    stores.cachectl.set(ENV, "cluster:c2", _cache_cluster("c2", "deleting", port=51234))
+
+    result = project(stores, ENV)
+    assert result["c1"] == ("elasticache", "starting", {}, None)  # nothing to advertise until it's up
+    assert result["c2"][1] == "starting"  # a delete can fail: stays visible until the record is gone
+
+
+def test_elasticache_create_failed_is_crashed_with_the_real_reason_as_verdict(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.cachectl.set(ENV, "cluster:c1", _cache_cluster("c1", "create-failed", status_reason="redis never became ready"))
+    assert project(stores, ENV)["c1"] == ("elasticache", "crashed", {}, "redis never became ready")
+
+
+def test_elasticache_prefers_the_odin_node_tag_over_the_cluster_id(tmp_path):
+    stores = SynthStores(tmp_path)
+    cluster = _cache_cluster("cache", "available", port=51234)
+    stores.cachectl.set(ENV, "cluster:cache", cluster)
+    stores.tags.set(ENV, f"elasticache:{cluster['arn']}", {"odin:node": "the-canvas-label"})
+
+    result = project(stores, ENV)
+    assert "the-canvas-label" in result
+    assert "cache" not in result
+
+
+# --- W2.5: alb -- another kind that projects FACTS ----------------------------
+
+
+def _lb(name: str, state: str = "active", endpoints: dict | None = None, reason: str | None = None) -> dict:
+    """An elbv2ctl `lb:` record, as CreateLoadBalancer writes it and
+    `converge_proxy` then updates it."""
+    return {
+        "name": name, "lb_id": "abc123", "arn": elbv2ctl.lb_arn(name, "abc123"),
+        "scheme": "internal", "type": "application", "ip_address_type": "ipv4",
+        "vpc_id": "vpc-1", "subnets": ["subnet-1"], "security_groups": [],
+        "availability_zones": [], "created_time": "2026-07-25T00:00:00+00:00",
+        "state": state, "state_reason": reason, "attributes": {},
+        "endpoints": endpoints if endpoints is not None else {"80": 41234},
+    }
+
+
+def test_an_active_load_balancer_projects_healthy_with_its_real_endpoint(tmp_path):
+    """A load balancer's whole point is an address, and `DNSName` has nowhere to
+    put the dynamic host port odin publishes the proxy on -- so the reachable URL
+    is the one fact this projection carries."""
+    stores = SynthStores(tmp_path)
+    stores.elbv2ctl.set(ENV, "lb:web-lb", _lb("web-lb"))
+    stores.tags.set(ENV, f"elasticloadbalancing:{elbv2ctl.lb_arn('web-lb', 'abc123')}", {"odin:node": "the-canvas-label"})
+
+    result = project(stores, ENV)
+    assert result["the-canvas-label"] == ("alb", "healthy", {"ALB_ENDPOINT": "http://127.0.0.1:41234"}, None)
+    assert "web-lb" not in result
+
+
+def test_a_provisioning_load_balancer_projects_starting_not_healthy(tmp_path):
+    # Honest asynchrony: the real nginx container is still coming up.
+    stores = SynthStores(tmp_path)
+    stores.elbv2ctl.set(ENV, "lb:web-lb", _lb("web-lb", state="provisioning", endpoints={}))
+    assert project(stores, ENV)["web-lb"] == ("alb", "starting", {}, None)
+
+
+def test_a_failed_load_balancer_projects_crashed_with_the_real_docker_reason(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.elbv2ctl.set(ENV, "lb:web-lb", _lb(
+        "web-lb", state="failed", endpoints={}, reason="docker run failed: no space left on device",
+    ))
+    assert project(stores, ENV)["web-lb"] == (
+        "alb", "crashed", {}, "docker run failed: no space left on device",
+    )
+
+
+def test_a_load_balancer_falls_back_to_its_own_name_when_untagged(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.elbv2ctl.set(ENV, "lb:web-lb", _lb("web-lb"))
+    assert project(stores, ENV)["web-lb"][0] == "alb"
+
+
+def test_target_groups_listeners_and_targets_are_not_projected_as_resources(tmp_path):
+    """One `alb` canvas node expands to three tf resources; only the load
+    balancer is the node. Projecting the companions would strand World entries
+    no Stack resource can ever prune."""
+    stores = SynthStores(tmp_path)
+    stores.elbv2ctl.set(ENV, "lb:web-lb", _lb("web-lb"))
+    stores.elbv2ctl.set(ENV, "tg:web-lb-tg", {"name": "web-lb-tg", "arn": "arn:tg"})
+    stores.elbv2ctl.set(ENV, "listener:deadbeef", {"listener_id": "deadbeef", "lb_name": "web-lb"})
+    stores.elbv2ctl.set(ENV, "targets:web-lb-tg", [{"id": "host.docker.internal", "port": 32768}])
+    assert set(project(stores, ENV)) == {"web-lb"}
+
+
 # --- multi-kind smoke: nothing clobbers anything else's label namespace ---
 
 
@@ -325,6 +650,121 @@ def test_multiple_kinds_project_independently(tmp_path):
     stores.tags.set(ENV, "ec2:vpc-1", {"odin:node": "net"})
     stores.iamctl.set(ENV, "role:r1", {"role_name": "r1", "arn": "arn:aws:iam::000000000000:role/r1"})
     stores.lambdactl.set(ENV, "fn:fn1", _lambda_fn("fn1", "Active"))
+    stores.cachectl.set(ENV, "cluster:cache", _cache_cluster("cache", "available", port=51234))
+    stores.elbv2ctl.set(ENV, "lb:web-lb", _lb("web-lb"))
 
     result = project(stores, ENV)
-    assert set(result) == {"net", "r1", "fn1"}
+    assert set(result) == {"net", "r1", "fn1", "cache", "web-lb"}
+
+
+# --- rds (W2.7): a projected kind that carries real FACTS -------------------
+
+
+def _db_record(identifier: str, status: str = "available", port: int = 54321, **extra) -> dict:
+    return {
+        "db_instance_identifier": identifier, "status": status, "status_reason": None,
+        "master_username": "app", "master_password": "apppass123", "db_name": "postgres",
+        "endpoint_address": "host.docker.internal", "endpoint_port": port, **extra,
+    }
+
+
+def _db(stores: SynthStores, label: str, identifier: str, **kwargs) -> None:
+    stores.rdsctl.set(ENV, f"db:{identifier}", _db_record(identifier, **kwargs))
+    stores.tags.set(ENV, f"rds:{rdsctl.db_arn(identifier)}", {"odin:node": label})
+
+
+def test_an_available_database_projects_healthy_with_both_database_url_forms(tmp_path):
+    """THE contract the move onto Terraform had to preserve byte-for-byte:
+    existing canvases reference `${{db.DATABASE_URL}}` (containers) and
+    `${{db.DATABASE_URL_VM}}` (an EC2 Lima VM, v0.5.4 finding #5) by name, and
+    `fabric/` resolves both out of exactly these World facts."""
+    stores = SynthStores(tmp_path)
+    _db(stores, "app-db", "app-db")
+
+    kind, phase, facts, verdict = project(stores, ENV)["app-db"]
+
+    assert (kind, phase, verdict) == ("rds", "healthy", None)
+    assert facts == {
+        "DATABASE_URL": "postgresql://app:apppass123@host.docker.internal:54321/postgres",
+        "endpoint": "host.docker.internal:54321",
+        "DATABASE_URL_VM": "postgresql://app:apppass123@host.lima.internal:54321/postgres",
+        "endpoint_vm": "host.lima.internal:54321",
+    }
+
+
+def test_a_database_on_the_mesh_also_publishes_its_gated_overlay_address(tmp_path):
+    """W2.6: the overlay address is an ADDITIONAL fact. The two host-reachable
+    forms above are untouched (the gateway, the create waiter's probe and every
+    host-side client ride them), and `DATABASE_URL_MESH` is the SG-gated path a
+    mesh member uses -- on the container's OWN 5432, not the published host
+    port, because the mesh sidecar shares its network namespace."""
+    stores = SynthStores(tmp_path)
+    _db(stores, "app-db", "app-db", overlay_ip="10.42.1.4")
+
+    facts = project(stores, ENV)["app-db"][2]
+
+    assert facts["endpoint_mesh"] == "10.42.1.4:5432"
+    assert facts["DATABASE_URL_MESH"] == "postgresql://app:apppass123@10.42.1.4:5432/postgres"
+    assert facts["endpoint"] == "host.docker.internal:54321"  # the host path, unchanged
+    assert facts["DATABASE_URL_VM"] == "postgresql://app:apppass123@host.lima.internal:54321/postgres"
+
+
+def test_a_database_with_no_mesh_publishes_no_overlay_facts(tmp_path):
+    """An env with no Nebula network (no VPC drawn) publishes exactly the facts
+    it always did -- no empty or placeholder mesh keys."""
+    stores = SynthStores(tmp_path)
+    _db(stores, "app-db", "app-db", overlay_ip=None)
+
+    facts = project(stores, ENV)["app-db"][2]
+
+    assert "DATABASE_URL_MESH" not in facts and "endpoint_mesh" not in facts
+
+
+def test_the_database_url_path_is_the_instances_real_db_name(tmp_path):
+    """`db_name` is a real `POSTGRES_DB` the substrate creates (aws/rds.py), so
+    the URL points at a database that exists rather than at a label."""
+    stores = SynthStores(tmp_path)
+    stores.rdsctl.set(ENV, "db:app-db", _db_record("app-db", db_name="orders"))
+    stores.tags.set(ENV, f"rds:{rdsctl.db_arn('app-db')}", {"odin:node": "app-db"})
+
+    facts = project(stores, ENV)["app-db"][2]
+
+    assert facts["DATABASE_URL"].endswith("/orders")
+    assert facts["DATABASE_URL_VM"].endswith("/orders")
+
+
+def test_a_creating_database_is_starting_with_no_facts_yet(tmp_path):
+    """A half-booted database must not advertise an endpoint that isn't
+    serving -- the provider's create waiter is still polling at this point."""
+    stores = SynthStores(tmp_path)
+    _db(stores, "app-db", "app-db", status="creating", port=0)
+
+    assert project(stores, ENV)["app-db"] == ("rds", "starting", {}, None)
+
+
+def test_a_deleting_database_stays_visible_until_its_record_is_gone(tmp_path):
+    # ec2's `shutting-down` reasoning: a delete can fail and the container
+    # outlive it, so the node must not vanish off the canvas early.
+    stores = SynthStores(tmp_path)
+    _db(stores, "app-db", "app-db", status="deleting")
+
+    assert project(stores, ENV)["app-db"] == ("rds", "starting", {}, None)
+
+
+def test_a_failed_database_projects_crashed_with_the_real_reason_and_no_stale_url(tmp_path):
+    stores = SynthStores(tmp_path)
+    _db(stores, "app-db", "app-db", status="failed", status_reason="Postgres never became ready: timeout")
+
+    assert project(stores, ENV)["app-db"] == (
+        "rds", "crashed", {}, "Postgres never became ready: timeout",
+    )
+
+
+def test_an_untagged_database_still_projects_under_its_identifier(tmp_path):
+    """Unlike vpc/subnet/ec2, rds HAS an AWS-native name -- the
+    DBInstanceIdentifier, which agent/hcl.py sets to the canvas label -- so an
+    untagged instance (imported out of band) is still projectable."""
+    stores = SynthStores(tmp_path)
+    stores.rdsctl.set(ENV, "db:app-db", _db_record("app-db"))
+
+    assert project(stores, ENV)["app-db"][0] == "rds"

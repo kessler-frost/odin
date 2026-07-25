@@ -6,8 +6,9 @@ import shutil
 import subprocess
 import zipfile
 
-from odin.agent.hcl import generate_tf
-from odin.spec.models import FieldValue, ResourceDesired, Stack
+
+from odin.agent.hcl import _ALB_NLB_UNSUPPORTED, generate_tf, resource_attrs, resource_set, unquote
+from odin.spec.models import Edge, FieldValue, ResourceDesired, Stack
 from odin.spec.translate import canvas_to_stack
 
 _FULL_CANVAS = {
@@ -16,7 +17,7 @@ _FULL_CANVAS = {
         {"id": "n2", "type": "sqs", "data": {"label": "jobs"}},
         {"id": "n3", "type": "sns", "data": {"label": "alerts"}},
         {"id": "n4", "type": "dynamodb", "data": {"label": "items", "hashKey": "pk"}},
-        {"id": "n5", "type": "rds", "data": {"label": "db", "engine": "postgres"}},
+        {"id": "n5", "type": "rds", "data": {"label": "app-db", "engine": "postgres"}},
     ],
     "edges": [{"source": "n3", "target": "n2"}],
 }
@@ -48,6 +49,21 @@ resource "aws_dynamodb_table" "items" {
 
   tags = {
     "odin:node" = "items"
+  }
+}
+
+resource "aws_db_instance" "app_db" {
+  identifier          = "app-db"
+  engine              = "postgres"
+  instance_class      = "db.t3.micro"
+  allocated_storage   = 20
+  db_name             = "postgres"
+  username            = "app"
+  password            = "apppass123"
+  skip_final_snapshot = true
+
+  tags = {
+    "odin:node" = "app-db"
   }
 }
 
@@ -98,11 +114,99 @@ def test_s3_bucket_gets_force_destroy():
     assert "force_destroy = true" in main_tf
 
 
-def test_rds_listed_unsupported_with_reason_never_dropped():
-    stack = canvas_to_stack(_FULL_CANVAS)
-    proj = generate_tf(stack)
-    assert proj.unsupported == ["db (rds): Simulate v1 — stays on the reconciler path"]
+def test_rds_is_a_real_aws_db_instance_now_not_an_unsupported_kind():
+    """W2.7: the LAST kind outside Terraform came inside. `skip_final_snapshot`
+    is what keeps `tofu destroy` (empty canvas + Apply) from refusing -- s3's
+    `force_destroy` for databases."""
+    proj = generate_tf(canvas_to_stack(_FULL_CANVAS))
+    assert proj.unsupported == []
+    attrs = resource_attrs(proj.files)[("aws_db_instance", "app_db")]
+    assert unquote(attrs["identifier"]) == "app-db"
+    assert unquote(attrs["engine"]) == "postgres"
+    assert attrs["allocated_storage"] == 20
+    assert attrs["skip_final_snapshot"] is True
+
+
+def test_rds_carries_every_canvas_field_it_has():
+    res = ResourceDesired(id="app-db", kind="rds", fields={
+        "engine": FieldValue(value="postgres"),
+        "instanceClass": FieldValue(value="db.t3.small"),
+        "allocatedStorage": FieldValue(value="50"),
+        "dbName": FieldValue(value="orders"),
+        "username": FieldValue(value="svc"),
+        "password": FieldValue(value="s3cr3t-pw", sensitive=True),
+    })
+    attrs = resource_attrs(generate_tf(Stack(resources=(res,))).files)[("aws_db_instance", "app_db")]
+    assert unquote(attrs["instance_class"]) == "db.t3.small"
+    assert attrs["allocated_storage"] == 50
+    assert unquote(attrs["db_name"]) == "orders"
+    assert unquote(attrs["username"]) == "svc"
+    assert unquote(attrs["password"]) == "s3cr3t-pw"
+
+
+def test_rds_security_groups_field_becomes_vpc_security_group_ids():
+    """W2.6: the SG a canvas draws for its database travels to the gateway
+    through TERRAFORM, exactly as an ec2 node's does (same field, same builder)
+    -- which is what lets `rdsctl` gate the real Postgres container's mesh
+    membership by those groups' compiled firewall, and what puts the attachment
+    in `tofu plan`."""
+    stack = Stack(resources=(
+        ResourceDesired(id="net", kind="vpc"),
+        ResourceDesired(id="db-sg", kind="sg", fields=_fields(vpc="net", ingressRules="tcp:5432:web-sg")),
+        ResourceDesired(id="web-sg", kind="sg", fields=_fields(vpc="net", ingressRules="tcp:22:0.0.0.0/0")),
+        ResourceDesired(id="app-db", kind="rds", fields=_fields(engine="postgres", securityGroups="db-sg")),
+    ))
+    main_tf = generate_tf(stack).files["main.tf"]
+    assert "vpc_security_group_ids = [aws_security_group.db_sg.id]" in main_tf
+
+
+def test_rds_with_no_security_groups_field_omits_the_argument():
+    """An rds node with nothing drawn keeps compiling byte-identical HCL -- the
+    gateway then joins it to the mesh ungated (nebula's allow-all), never
+    deny-all."""
+    main_tf = generate_tf(Stack(resources=(ResourceDesired(id="app-db", kind="rds"),))).files["main.tf"]
+    assert "aws_db_instance" in main_tf and "vpc_security_group_ids" not in main_tf
+
+
+def test_rds_with_an_unknown_security_group_label_lands_in_unsupported():
+    res = ResourceDesired(id="app-db", kind="rds", fields=_fields(securityGroups="ghost"))
+    proj = generate_tf(Stack(resources=(res,)))
+    assert proj.unsupported == [
+        "app-db (rds): securityGroups names something that isn't a Security Group on the canvas"
+    ]
     assert "aws_db_instance" not in proj.files["main.tf"]
+
+
+def test_rds_with_a_non_postgres_engine_is_declined_not_silently_postgres():
+    """The pre-W2.7 reconciler path ran a Postgres container no matter what
+    `engine` said. Honest now: no local substrate, no HCL."""
+    res = ResourceDesired(id="app-db", kind="rds", fields={"engine": FieldValue(value="mysql")})
+    proj = generate_tf(Stack(resources=(res,)))
+    assert proj.unsupported == [
+        "app-db (rds): engine 'mysql' has no local substrate — odin runs a real "
+        "Postgres, so only postgres is supported",
+    ]
+    assert "aws_db_instance" not in proj.files["main.tf"]
+
+
+def test_rds_label_that_is_not_a_valid_identifier_is_declined_with_the_fix():
+    """terraform-provider-aws validates `identifier` client-side, so a bad
+    label would fail at plan time with a raw provider error. Declined here
+    instead, with a sentence that says what to rename it to -- never silently
+    renamed (that would break the container name AND the ${{db.VAR}} ref)."""
+    for label in ("app_db", "App-DB", "-db", "db-", "app--db", "1db"):
+        proj = generate_tf(Stack(resources=(ResourceDesired(id=label, kind="rds"),)))
+        assert proj.unsupported == [
+            f"{label} (rds): an RDS name must be lowercase letters/digits separated by "
+            "single hyphens and start with a letter (e.g. app-db) — rename the node",
+        ], label
+        assert "aws_db_instance" not in proj.files["main.tf"]
+
+
+def test_rds_allocated_storage_must_be_a_number():
+    res = ResourceDesired(id="app-db", kind="rds", fields={"allocatedStorage": FieldValue(value="lots")})
+    proj = generate_tf(Stack(resources=(res,)))
+    assert proj.unsupported == ["app-db (rds): allocatedStorage must be a whole number of GiB (e.g. 20)"]
 
 
 def test_generic_unsupported_kind_gets_a_fallback_reason():
@@ -190,12 +294,18 @@ def test_generated_hcl_never_contains_local_endpoints_or_credentials():
     # Global Constraint (2026-07-22-s-simulate-translation.md): portable TF
     # only -- no `endpoints {}` provider overrides, no skip_* flags, no local
     # URLs, no creds. Those live in odin's runtime-generated override.tf,
-    # never in agent/generator output. (The subscription resource's own
-    # `endpoint = aws_sqs_queue...` argument is a legitimate TF schema field,
-    # not a local-endpoint override, so it's excluded from this check.)
+    # never in agent/generator output. (Two RESOURCE arguments that merely
+    # look like the banned provider ones are excluded, being legitimate TF
+    # schema fields: the subscription's `endpoint = aws_sqs_queue...`, and
+    # `aws_db_instance.skip_final_snapshot` -- so the `skip_*` check names the
+    # four real PROVIDER args odin's own override.tf carries, not the prefix.)
     stack = canvas_to_stack(_FULL_CANVAS)
     main_tf = generate_tf(stack).files["main.tf"].lower()
-    forbidden = ("endpoints {", "skip_", "access_key", "secret_key", "127.0.0.1", "localhost")
+    forbidden = (
+        "endpoints {", "access_key", "secret_key", "127.0.0.1", "localhost",
+        "skip_credentials_validation", "skip_metadata_api_check",
+        "skip_region_validation", "skip_requesting_account_id",
+    )
     for token in forbidden:
         assert token not in main_tf, token
 
@@ -307,8 +417,50 @@ def test_sg_with_malformed_ingress_rule_lands_in_unsupported():
     ))
     proj = generate_tf(stack)
     assert proj.unsupported == [
-        'bad (sg): invalid ingress rule — expected one "protocol:port:cidr" per line, e.g. tcp:443:0.0.0.0/0'
+        'bad (sg): invalid ingress rule — expected one "protocol:port:source" per line, e.g. tcp:443:0.0.0.0/0'
     ]
+
+
+def test_sg_ingress_can_name_another_sg_as_its_source():
+    """W2.6: "5432, from the web tier only" -- the AWS-idiomatic
+    UserIdGroupPairs rule, which is the ONLY source form that gates by
+    identity (a nebula `group:` rule matched against the peer's cert)
+    rather than by address."""
+    stack = Stack(resources=(
+        ResourceDesired(id="net", kind="vpc"),
+        ResourceDesired(id="web-sg", kind="sg", fields=_fields(vpc="net", ingressRules="tcp:80:0.0.0.0/0")),
+        ResourceDesired(id="db-sg", kind="sg", fields=_fields(vpc="net", ingressRules="tcp:5432:web-sg")),
+    ))
+    proj = generate_tf(stack)
+    assert proj.unsupported == []
+    body = proj.files["main.tf"]
+    assert "    security_groups = [aws_security_group.web_sg.id]" in body
+    assert "tcp:5432:web-sg" not in body  # the rule is compiled, not pasted
+
+
+def test_sg_ingress_naming_a_non_sg_source_lands_in_unsupported():
+    stack = Stack(resources=(
+        ResourceDesired(id="net", kind="vpc"),
+        ResourceDesired(id="db-sg", kind="sg", fields=_fields(vpc="net", ingressRules="tcp:5432:web-tier")),
+    ))
+    proj = generate_tf(stack)
+    assert proj.unsupported == [
+        "db-sg (sg): ingress rule source 'web-tier' is neither a CIDR (like 10.0.0.0/16) "
+        "nor the name of another Security Group node on the canvas"
+    ]
+
+
+def test_sg_ingress_naming_itself_is_unsupported_not_a_tf_cycle():
+    """A same-SG self-reference is real AWS (and needs TF's `self = true`) --
+    unmodeled, so it must be REPORTED, never emitted as an HCL self-reference
+    (which tofu rejects as a cycle)."""
+    stack = Stack(resources=(
+        ResourceDesired(id="net", kind="vpc"),
+        ResourceDesired(id="app-sg", kind="sg", fields=_fields(vpc="net", ingressRules="tcp:5432:app-sg")),
+    ))
+    proj = generate_tf(stack)
+    assert proj.unsupported and proj.unsupported[0].startswith("app-sg (sg): ingress rule source 'app-sg'")
+    assert "aws_security_group" not in proj.files["main.tf"]
 
 
 def test_iam_role_emits_name_and_the_lambda_trust_policy():
@@ -675,6 +827,78 @@ def test_ecs_with_non_numeric_port_lands_in_unsupported():
     assert "aws_ecs_service" not in proj.files["main.tf"]
 
 
+# --- logs (W2.1) -------------------------------------------------------------
+
+
+def test_logs_emits_the_group_name_and_the_odin_node_tag():
+    # The canvas label IS the log group name -- the gateway classifies every
+    # logs:* call by bare group name, so an IAM edge drawn to this node only
+    # enforces while the two are the same string.
+    stack = Stack(resources=(ResourceDesired(id="/odin/app", kind="logs"),))
+    proj = generate_tf(stack)
+    main_tf = proj.files["main.tf"]
+    assert 'resource "aws_cloudwatch_log_group" "_odin_app"' in main_tf
+    assert '  name = "/odin/app"' in main_tf
+    assert '"odin:node" = "/odin/app"' in main_tf
+    assert proj.unsupported == []
+
+
+def test_logs_without_a_retention_field_omits_retention_in_days():
+    # AWS's own default is "never expire" -- an invented number would silently
+    # start deleting the user's logs.
+    main_tf = generate_tf(Stack(resources=(ResourceDesired(id="app-logs", kind="logs"),))).files["main.tf"]
+    assert "retention_in_days" not in main_tf
+
+
+def test_logs_retention_field_becomes_retention_in_days():
+    stack = Stack(resources=(ResourceDesired(id="app-logs", kind="logs", fields=_fields(retentionInDays="14")),))
+    main_tf = generate_tf(stack).files["main.tf"]
+    assert 'name              = "app-logs"' in main_tf
+    assert "retention_in_days = 14" in main_tf
+
+
+def test_logs_with_non_numeric_retention_lands_in_unsupported():
+    stack = Stack(resources=(ResourceDesired(id="app-logs", kind="logs", fields=_fields(retentionInDays="two weeks")),))
+    proj = generate_tf(stack)
+    assert proj.unsupported == ["app-logs (logs): retentionInDays must be a whole number of days (e.g. 14)"]
+    assert "aws_cloudwatch_log_group" not in proj.files["main.tf"]
+
+
+def test_logs_with_fractional_retention_lands_in_unsupported():
+    stack = Stack(resources=(ResourceDesired(id="app-logs", kind="logs", fields=_fields(retentionInDays="14.5")),))
+    proj = generate_tf(stack)
+    assert proj.unsupported == ["app-logs (logs): retentionInDays must be a whole number of days (e.g. 14)"]
+
+
+def test_logs_block_parses_back_as_a_log_group_resource():
+    # Zero-drift structural check: S3b's guardrail compares the skeleton's
+    # resource SET against the agent's refinement, so a logs block must read
+    # back through parse_tf under the identity generate_tf assigned it.
+    stack = Stack(resources=(ResourceDesired(id="app-logs", kind="logs", fields=_fields(retentionInDays="14")),))
+    files = generate_tf(stack).files
+    assert ("aws_cloudwatch_log_group", "app_logs") in resource_set(files)
+    attrs = resource_attrs(files)[("aws_cloudwatch_log_group", "app_logs")]
+    assert unquote(attrs["name"]) == "app-logs"
+    assert attrs["retention_in_days"] == 14  # hcl2 parses an unquoted number as an int
+
+
+def test_tofu_fmt_accepts_logs_output(tmp_path):
+    tofu = shutil.which("tofu")
+    if tofu is None:
+        return  # skip cleanly -- no tofu on PATH in this environment
+    stack = Stack(resources=(
+        ResourceDesired(id="/odin/app", kind="logs", fields=_fields(retentionInDays="14")),
+        ResourceDesired(id="app-logs", kind="logs"),  # the no-retention (single-attr) shape too
+    ))
+    main_tf = tmp_path / "main.tf"
+    main_tf.write_text(generate_tf(stack).files["main.tf"])
+    result = subprocess.run(
+        [tofu, "fmt", "-check", "-diff", str(main_tf)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 # --- odin:node tagging (fix-wave 2b finding #2 prerequisite) ---------------
 #
 # Every primary node-backed resource carries `tags = { "odin:node" = <label> }`
@@ -702,7 +926,7 @@ def test_vpc_subnet_and_ec2_get_the_odin_node_tag():
     assert '"odin:node" = "server"' in ec2_block
 
 
-def test_s3_sqs_sns_dynamodb_sg_iam_role_ecr_lambda_ecs_all_get_the_tag():
+def test_every_named_kind_with_a_builder_gets_the_tag():
     stack = Stack(resources=(
         ResourceDesired(id="uploads", kind="s3"),
         ResourceDesired(id="jobs", kind="sqs"),
@@ -714,9 +938,11 @@ def test_s3_sqs_sns_dynamodb_sg_iam_role_ecr_lambda_ecs_all_get_the_tag():
         ResourceDesired(id="app-image", kind="ecr"),
         ResourceDesired(id="fn1", kind="lambda", fields=_fields(role="lambda-exec")),
         ResourceDesired(id="svc", kind="ecs"),
+        ResourceDesired(id="app-logs", kind="logs"),
     ))
     main_tf = generate_tf(stack).files["main.tf"]
-    for label in ("uploads", "jobs", "alerts", "items", "web-sg", "lambda-exec", "app-image", "fn1", "svc"):
+    for label in ("uploads", "jobs", "alerts", "items", "web-sg", "lambda-exec",
+                  "app-image", "fn1", "svc", "app-logs"):
         assert f'"odin:node" = "{label}"' in main_tf, label
     assert '"odin:node" = "net"' in main_tf
 
@@ -748,4 +974,365 @@ def test_tofu_fmt_accepts_ecs_output(tmp_path):
         [tofu, "fmt", "-check", "-diff", str(main_tf)],
         capture_output=True, text=True,
     )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+# --- secret + ssm (W2.4) -----------------------------------------------------
+
+
+def test_secret_emits_the_name_an_immediate_recovery_window_and_the_odin_tag():
+    # The canvas label IS the secret name -- the gateway classifies every
+    # secretsmanager:* call by bare name, so an IAM edge drawn to this node only
+    # enforces while the two are the same string.
+    proj = generate_tf(Stack(resources=(ResourceDesired(id="db-password", kind="secret"),)))
+    main_tf = proj.files["main.tf"]
+    assert 'resource "aws_secretsmanager_secret" "db_password"' in main_tf
+    assert 'name                    = "db-password"' in main_tf
+    # odin's DeleteSecret is immediate, and the HCL says so rather than
+    # implying a 30-day window odin doesn't have.
+    assert "recovery_window_in_days = 0" in main_tf
+    assert '"odin:node" = "db-password"' in main_tf
+    assert proj.unsupported == []
+
+
+def test_a_secret_with_a_value_emits_a_companion_version_resource():
+    stack = Stack(resources=(
+        ResourceDesired(id="db-password", kind="secret", fields=_fields(secretString="hunter2-and-then-some")),
+    ))
+    files = generate_tf(stack).files
+    attrs = resource_attrs(files)[("aws_secretsmanager_secret_version", "db_password_version")]
+    assert unquote(attrs["secret_string"]) == "hunter2-and-then-some"
+    assert attrs["secret_id"] == "${aws_secretsmanager_secret.db_password.id}"
+
+
+def test_a_secret_with_no_value_emits_no_version_resource_at_all():
+    # An existing-but-valueless secret is a real AWS state; `secret_string = ""`
+    # would assert a value nobody typed.
+    main_tf = generate_tf(Stack(resources=(ResourceDesired(id="db-password", kind="secret"),))).files["main.tf"]
+    assert "aws_secretsmanager_secret_version" not in main_tf
+
+
+def test_a_secret_value_keeps_its_surrounding_whitespace():
+    # Every other optional field is `.strip()`ed for emptiness; a secret's
+    # whitespace is part of the secret, so this one deliberately isn't.
+    stack = Stack(resources=(ResourceDesired(id="s", kind="secret", fields=_fields(secretString="  padded  ")),))
+    attrs = resource_attrs(generate_tf(stack).files)[("aws_secretsmanager_secret_version", "s_version")]
+    assert unquote(attrs["secret_string"]) == "  padded  "
+
+
+def test_secret_description_is_emitted_only_when_set():
+    with_desc = generate_tf(Stack(resources=(
+        ResourceDesired(id="s", kind="secret", fields=_fields(description="the db password")),
+    ))).files["main.tf"]
+    without = generate_tf(Stack(resources=(ResourceDesired(id="s", kind="secret"),))).files["main.tf"]
+    assert 'description             = "the db password"' in with_desc
+    assert "description" not in without
+
+
+def test_ssm_emits_name_type_and_value():
+    stack = Stack(resources=(
+        ResourceDesired(id="/odin/api-key", kind="ssm", fields=_fields(paramType="SecureString", paramValue="abc123")),
+    ))
+    proj = generate_tf(stack)
+    files = proj.files
+    attrs = resource_attrs(files)[("aws_ssm_parameter", "_odin_api_key")]
+    assert unquote(attrs["name"]) == "/odin/api-key"
+    assert unquote(attrs["type"]) == "SecureString"
+    assert unquote(attrs["value"]) == "abc123"
+    assert '"odin:node" = "/odin/api-key"' in files["main.tf"]
+    assert proj.unsupported == []
+
+
+def test_ssm_defaults_to_a_plain_string_parameter():
+    stack = Stack(resources=(ResourceDesired(id="flag", kind="ssm", fields=_fields(paramValue="on")),))
+    attrs = resource_attrs(generate_tf(stack).files)[("aws_ssm_parameter", "flag")]
+    assert unquote(attrs["type"]) == "String"
+
+
+def test_ssm_without_a_value_lands_in_unsupported():
+    proj = generate_tf(Stack(resources=(ResourceDesired(id="flag", kind="ssm"),)))
+    assert proj.unsupported == ["flag (ssm): needs a Value (an SSM parameter can't exist without one)"]
+    assert "aws_ssm_parameter" not in proj.files["main.tf"]
+
+
+def test_ssm_with_an_unknown_type_lands_in_unsupported():
+    stack = Stack(resources=(
+        ResourceDesired(id="flag", kind="ssm", fields=_fields(paramType="Encrypted", paramValue="on")),
+    ))
+    proj = generate_tf(stack)
+    assert proj.unsupported == ["flag (ssm): type must be one of String, StringList, SecureString"]
+
+
+def test_a_secret_version_carries_no_odin_node_tag():
+    # Companion resources aren't canvas nodes (and aws_secretsmanager_secret_
+    # version has no tags argument at all).
+    stack = Stack(resources=(ResourceDesired(id="s", kind="secret", fields=_fields(secretString="value123")),))
+    main_tf = generate_tf(stack).files["main.tf"]
+    version_block = main_tf.split('resource "aws_secretsmanager_secret_version"')[1].split("\nresource")[0]
+    assert "tags" not in version_block
+
+
+def test_tofu_fmt_accepts_secret_and_ssm_output(tmp_path):
+    tofu = shutil.which("tofu")
+    if tofu is None:
+        return  # skip cleanly -- no tofu on PATH in this environment
+    stack = Stack(resources=(
+        ResourceDesired(id="db-password", kind="secret", fields=_fields(secretString="v", description="d")),
+        ResourceDesired(id="bare", kind="secret"),
+        ResourceDesired(id="/odin/api-key", kind="ssm", fields=_fields(paramType="SecureString", paramValue="abc")),
+    ))
+    main_tf = tmp_path / "main.tf"
+    main_tf.write_text(generate_tf(stack).files["main.tf"])
+    result = subprocess.run([tofu, "fmt", "-check", "-diff", str(main_tf)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+# --- W2.8: elasticache -----------------------------------------------------
+
+
+def test_elasticache_emits_a_single_node_redis_cluster():
+    stack = Stack(resources=(
+        ResourceDesired(id="cache", kind="elasticache", fields=_fields(nodeType="cache.t3.small")),
+    ))
+    proj = generate_tf(stack)
+    main_tf = proj.files["main.tf"]
+    assert 'resource "aws_elasticache_cluster" "cache"' in main_tf
+    assert '  cluster_id      = "cache"' in main_tf
+    assert '  engine          = "redis"' in main_tf
+    assert '  node_type       = "cache.t3.small"' in main_tf
+    assert "  num_cache_nodes = 1" in main_tf  # v1 is single-node; the gateway rejects anything else
+    assert '    "odin:node" = "cache"' in main_tf
+    assert proj.unsupported == []
+
+
+def test_elasticache_defaults_the_node_type_when_the_field_is_absent():
+    stack = Stack(resources=(ResourceDesired(id="cache", kind="elasticache"),))
+    assert '  node_type       = "cache.t3.micro"' in generate_tf(stack).files["main.tf"]
+
+
+def test_elasticache_omits_port_and_engine_version_so_they_stay_computed():
+    # Pinning `port` in the config while the API honestly reports the REAL
+    # published host port is a guaranteed plan diff on every apply -- both are
+    # Optional+Computed, so leaving them out is what keeps plan zero-drift.
+    main_tf = generate_tf(Stack(resources=(ResourceDesired(id="cache", kind="elasticache"),))).files["main.tf"]
+    assert "port" not in main_tf
+    assert "engine_version" not in main_tf
+
+
+def test_tofu_fmt_accepts_elasticache_output(tmp_path):
+    tofu = shutil.which("tofu")
+    if tofu is None:
+        return  # skip cleanly -- no tofu on PATH in this environment
+    stack = Stack(resources=(
+        ResourceDesired(id="cache", kind="elasticache", fields=_fields(nodeType="cache.t3.micro")),
+    ))
+    main_tf = tmp_path / "main.tf"
+    main_tf.write_text(generate_tf(stack).files["main.tf"])
+    result = subprocess.run(
+        [tofu, "fmt", "-check", "-diff", str(main_tf)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+# --- alb (W2.5) --------------------------------------------------------------
+#
+# ONE `alb` canvas node expands to THREE tf resources -- the primary `aws_lb`
+# plus a companion `aws_lb_target_group` and `aws_lb_listener`, built in their
+# own pass (the same one-canvas-node-to-N-tf-resources shape as an ecs task
+# definition or a secret's version). Containment is a SUBNET, like `_ec2`: the
+# subnet is what gives `aws_lb.subnets` a value and, transitively, the target
+# group its `vpc_id` (the canvas stamps BOTH `vpc` and `subnet` on a leaf drawn
+# inside a subnet box).
+
+
+def test_alb_in_a_subnet_expands_into_a_load_balancer_target_group_and_listener():
+    stack = _subnet_stack(ResourceDesired(
+        id="front", kind="alb",
+        fields=_fields(vpc="net", subnet="web", listenerPort="8080", port="3000", healthCheckPath="/healthz"),
+    ))
+    proj = generate_tf(stack)
+    main_tf = proj.files["main.tf"]
+    # exactly three -- one primary + two companions, no more
+    assert sorted(r for r in resource_set(proj.files) if r[0].startswith("aws_lb")) == [
+        ("aws_lb", "front"), ("aws_lb_listener", "front_listener"), ("aws_lb_target_group", "front_tg"),
+    ]
+    assert 'resource "aws_lb" "front"' in main_tf
+    assert 'name               = "front"' in main_tf
+    # odin has no internet gateway, so an internet-facing scheme would be a
+    # claim nothing backs -- `internal` is emitted explicitly, always.
+    assert "internal           = true" in main_tf
+    assert 'load_balancer_type = "application"' in main_tf
+    assert "subnets = [aws_subnet.web.id]" in main_tf
+    assert 'resource "aws_lb_target_group" "front_tg"' in main_tf
+    assert 'name        = "front-tg"' in main_tf
+    assert "port        = 3000" in main_tf
+    assert "vpc_id      = aws_vpc.net.id" in main_tf
+    assert 'target_type = "instance"' in main_tf
+    assert '  health_check {\n    path = "/healthz"\n  }' in main_tf
+    assert 'resource "aws_lb_listener" "front_listener"' in main_tf
+    assert "load_balancer_arn = aws_lb.front.arn" in main_tf
+    assert "port              = 8080" in main_tf
+    assert '    type             = "forward"' in main_tf
+    assert "    target_group_arn = aws_lb_target_group.front_tg.arn" in main_tf
+    assert proj.unsupported == []
+
+
+def test_alb_defaults_both_ports_to_80_and_the_health_check_to_root():
+    stack = _subnet_stack(ResourceDesired(id="front", kind="alb", fields=_fields(vpc="net", subnet="web")))
+    main_tf = generate_tf(stack).files["main.tf"]
+    assert "port              = 80" in main_tf  # the listener
+    assert "port        = 80" in main_tf        # the target group
+    assert '  health_check {\n    path = "/"\n  }' in main_tf
+
+
+def test_only_the_load_balancer_carries_the_odin_node_tag():
+    # The two companions aren't canvas nodes, so they get no tag of their own
+    # (same rule as a secret's version / an ecs task definition) -- `aws_lb` is
+    # the ONE block that carries the trio back to the canvas label.
+    stack = _subnet_stack(ResourceDesired(id="front", kind="alb", fields=_fields(vpc="net", subnet="web")))
+    main_tf = generate_tf(stack).files["main.tf"]
+    lb_block = main_tf.split('resource "aws_lb" "front"')[1].split("\nresource")[0]
+    assert '"odin:node" = "front"' in lb_block
+    for companion in ("aws_lb_target_group", "aws_lb_listener"):
+        block = main_tf.split(f'resource "{companion}"')[1].split("\nresource")[0]
+        assert "tags" not in block, companion
+
+
+def test_alb_outside_a_subnet_lands_in_unsupported():
+    proj = generate_tf(Stack(resources=(ResourceDesired(id="stray", kind="alb"),)))
+    assert proj.unsupported == [
+        "stray (alb): not contained inside a Subnet on the canvas (drag it into a Subnet box)"
+    ]
+    assert 'resource "aws_lb"' not in proj.files["main.tf"]
+
+
+def test_alb_of_type_network_lands_in_unsupported():
+    # An NLB would need nginx's stream module and a TCP-only proxy shape, so a
+    # `network` node reports itself rather than quietly getting an ALB.
+    stack = _subnet_stack(ResourceDesired(
+        id="front", kind="alb", fields=_fields(vpc="net", subnet="web", lbType="network"),
+    ))
+    proj = generate_tf(stack)
+    assert proj.unsupported == [f"front (alb): {_ALB_NLB_UNSUPPORTED}"]
+    assert 'resource "aws_lb"' not in proj.files["main.tf"]
+
+
+def test_an_opted_out_alb_emits_no_orphan_companion_resources():
+    """Regression, found in review: the companion pass used to re-derive `_alb`'s
+    opt-out conditions instead of asking whether pass 2 had actually emitted the
+    `aws_lb`, so a WITHHELD load balancer still got its target group + listener
+    -- and `aws_lb_listener.load_balancer_arn` then pointed at a block that was
+    never written, which fails `tofu plan` for the WHOLE project rather than just
+    dropping one node. `generate_tf`'s `built_ids` set is the fix."""
+    # Both ways `_alb` can opt a node out while the ports still parse and a vpc
+    # ref still resolves -- a `network` type, and a node drawn inside a VPC but
+    # not inside a Subnet.
+    stacks = (
+        _subnet_stack(ResourceDesired(
+            id="front", kind="alb", fields=_fields(vpc="net", subnet="web", lbType="network"),
+        )),
+        Stack(resources=(
+            ResourceDesired(id="net", kind="vpc"),
+            ResourceDesired(id="front", kind="alb", fields=_fields(vpc="net")),
+        )),
+    )
+    for stack in stacks:
+        main_tf = generate_tf(stack).files["main.tf"]
+        assert "aws_lb_target_group" not in main_tf
+        assert "aws_lb_listener" not in main_tf
+
+
+def test_alb_with_non_numeric_listener_port_lands_in_unsupported():
+    stack = _subnet_stack(ResourceDesired(
+        id="front", kind="alb", fields=_fields(vpc="net", subnet="web", listenerPort="http"),
+    ))
+    proj = generate_tf(stack)
+    assert proj.unsupported == ["front (alb): listenerPort must be a whole number (e.g. 80)"]
+    assert 'resource "aws_lb"' not in proj.files["main.tf"]
+
+
+def test_alb_with_non_numeric_target_port_lands_in_unsupported():
+    stack = _subnet_stack(ResourceDesired(
+        id="front", kind="alb", fields=_fields(vpc="net", subnet="web", port="eighty"),
+    ))
+    proj = generate_tf(stack)
+    assert proj.unsupported == ["front (alb): port must be a whole number (e.g. 80)"]
+    assert 'resource "aws_lb"' not in proj.files["main.tf"]
+
+
+def _alb_ecs_stack(edge: Edge) -> Stack:
+    return Stack(
+        resources=(
+            ResourceDesired(id="net", kind="vpc"),
+            ResourceDesired(id="web", kind="subnet", fields=_fields(vpc="net")),
+            ResourceDesired(id="front", kind="alb", fields=_fields(vpc="net", subnet="web")),
+            ResourceDesired(id="app", kind="ecs", fields=_fields(port="3000")),
+        ),
+        edges=(edge,),
+    )
+
+
+def test_an_alb_target_edge_puts_a_load_balancer_block_on_the_ecs_service():
+    # In real AWS the fronting relationship is a `load_balancer` block on the
+    # SERVICE (the ECS scheduler registers each task itself), not an
+    # `aws_lb_target_group_attachment` tofu would have to know the tasks for.
+    proj = generate_tf(_alb_ecs_stack(Edge(src="front", dst="app", kind="network")))
+    main_tf = proj.files["main.tf"]
+    assert (
+        "  load_balancer {\n"
+        "    target_group_arn = aws_lb_target_group.front_tg.arn\n"
+        '    container_name   = "app"\n'
+        "    container_port   = 3000\n"
+        "  }"
+    ) in main_tf
+    assert proj.unsupported == []
+
+
+def test_an_alb_target_edge_drawn_the_other_way_round_means_the_same_thing():
+    # Which end the user started dragging from carries no meaning, so both
+    # directions produce byte-identical HCL.
+    forward = generate_tf(_alb_ecs_stack(Edge(src="front", dst="app", kind="network")))
+    reverse = generate_tf(_alb_ecs_stack(Edge(src="app", dst="front", kind="network")))
+    assert "target_group_arn = aws_lb_target_group.front_tg.arn" in reverse.files["main.tf"]
+    assert reverse.files["main.tf"] == forward.files["main.tf"]
+    assert reverse.unsupported == []
+
+
+def test_an_ecs_service_with_no_alb_edge_gets_no_load_balancer_block():
+    stack = Stack(resources=(ResourceDesired(id="app", kind="ecs"),))
+    main_tf = generate_tf(stack).files["main.tf"]
+    assert "load_balancer {" not in main_tf
+    assert "aws_lb_target_group" not in main_tf
+
+
+def test_an_alb_target_edge_to_an_ec2_node_lands_in_unsupported_exactly_once():
+    # An ec2 target would need an `aws_lb_target_group_attachment` -- recorded
+    # as an unbuilt limit instead of silently doing nothing with the edge the
+    # user drew. Pass 1.5 tries BOTH edge directions, so the reason must not be
+    # recorded twice for one edge.
+    stack = Stack(
+        resources=(
+            ResourceDesired(id="net", kind="vpc"),
+            ResourceDesired(id="web", kind="subnet", fields=_fields(vpc="net")),
+            ResourceDesired(id="front", kind="alb", fields=_fields(vpc="net", subnet="web")),
+            ResourceDesired(id="server", kind="ec2", fields=_fields(subnet="web")),
+        ),
+        edges=(Edge(src="front", dst="server", kind="network"),),
+    )
+    proj = generate_tf(stack)
+    assert proj.unsupported == [
+        "front (alb): target edge to server (ec2) — only ecs nodes can be load-balancer targets in Simulate v1"
+    ]
+    assert "load_balancer {" not in proj.files["main.tf"]
+
+
+def test_tofu_fmt_accepts_alb_output(tmp_path):
+    tofu = shutil.which("tofu")
+    if tofu is None:
+        return  # skip cleanly -- no tofu on PATH in this environment
+    stack = _alb_ecs_stack(Edge(src="front", dst="app", kind="network"))
+    main_tf = tmp_path / "main.tf"
+    main_tf.write_text(generate_tf(stack).files["main.tf"])
+    result = subprocess.run([tofu, "fmt", "-check", "-diff", str(main_tf)], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr

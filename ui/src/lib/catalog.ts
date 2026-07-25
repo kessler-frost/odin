@@ -8,7 +8,13 @@
 // Class strings are written out in full (not constructed) so Tailwind's scanner
 // keeps them.
 
-export type CatalogField = { key: string; label: string; editable?: boolean; select?: string[] };
+// `multiline`/`placeholder` mirror ConfigPanel's own FieldDef (catalogFields
+// spreads straight into it), so a catalog entry can declare a textarea field
+// -- e.g. an rds node's one-SG-label-per-line `securityGroups`.
+export type CatalogField = {
+  key: string; label: string; editable?: boolean; select?: string[];
+  multiline?: boolean; placeholder?: string;
+};
 
 export type ColorBundle = {
   text: string;     // badge / label text color
@@ -75,31 +81,89 @@ export const CATALOG: ServiceDef[] = [
     iamActions: ['kinesis:PutRecord', 'kinesis:GetRecords', 'kinesis:*'],
   },
   {
+    // W2.7: a real `aws_db_instance` (a real Postgres container behind it), so
+    // every argument the HCL builder emits is editable here. `engine` lists
+    // only postgres: that IS the substrate, and an honest Apply declines any
+    // other engine rather than quietly handing you a Postgres (agent/hcl.py).
+    // The name must be a valid RDS identifier (lowercase, hyphen-separated).
     type: 'rds', abbr: 'RDS', label: 'RDS Database', sublabel: 'Relational DB',
     category: 'Database', color: 'sky', width: 220,
     fields: [
       { key: 'label', label: 'Name', editable: true },
-      { key: 'engine', label: 'Engine', editable: true, select: ['postgres', 'mysql', 'mariadb'] },
+      { key: 'engine', label: 'Engine', editable: true, select: ['postgres'] },
       { key: 'instanceClass', label: 'Instance Class', editable: true },
+      { key: 'allocatedStorage', label: 'Storage (GiB)', editable: true },
+      { key: 'dbName', label: 'Database', editable: true },
+      { key: 'username', label: 'Username', editable: true },
+      { key: 'password', label: 'Password', editable: true },
+      // W2.6: the DB really is gated by the SGs named here -- they become the
+      // `aws_db_instance`'s `vpc_security_group_ids` (agent/hcl.py), and the
+      // gateway puts its Postgres on the env's Nebula mesh behind their
+      // compiled firewall (gateway/models/rdsctl.py::_db_firewall). Same
+      // one-label-per-line convention as an ec2 node's.
+      { key: 'securityGroups', label: 'Security Groups (one label per line)', editable: true, multiline: true },
       { key: 'arn', label: 'ARN' },
     ],
-    defaultData: { label: 'db', engine: 'postgres', instanceClass: 'db.t3.micro', arn: '' },
+    defaultData: {
+      label: 'app-db', engine: 'postgres', instanceClass: 'db.t3.micro',
+      allocatedStorage: '20', dbName: 'postgres', username: 'app',
+      password: 'apppass123', securityGroups: '', arn: '',
+    },
     primary: { key: 'engine', label: 'Engine' },
     iamActions: ['rds-db:connect', 'rds:DescribeDBInstances', 'rds:*'],
   },
+  // elasticache (W2.8) is a REAL, gateway-modeled service (NORTHSTAR directive
+  // 5): the drawn node IS one `aws_elasticache_cluster`, backed by a real
+  // redis:7-alpine container whose published port is advertised as the
+  // cluster's node endpoint (${{<node>.REDIS_URL}} from a container consumer,
+  // ${{<node>.REDIS_URL_VM}} from an EC2 one). SINGLE NODE in v1 — no node-count
+  // field, because the gateway rejects anything but 1 (see ROADMAP's limits).
+  // The `iamActions` below gate the CONTROL plane only: Redis's own wire
+  // protocol isn't AWS-signed, so no IAM edge can ever gate a GET/SET.
+  // Renders via the generic ServiceNode, no bespoke component.
+  {
+    type: 'elasticache', abbr: 'ELC', label: 'ElastiCache', sublabel: 'Redis cache cluster',
+    category: 'Database', color: 'teal', width: 220,
+    fields: [
+      { key: 'label', label: 'Cluster ID', editable: true },
+      { key: 'nodeType', label: 'Node Type', editable: true },
+    ],
+    defaultData: { label: 'cache', nodeType: 'cache.t3.micro' },
+    primary: { key: 'nodeType', label: 'Node' },
+    iamActions: ['elasticache:DescribeCacheClusters', 'elasticache:ModifyCacheCluster', 'elasticache:*'],
+  },
+  // W2.4: real Secrets Manager -- the node's Name IS the secret name (the
+  // gateway classifies every secretsmanager:* call by that bare name, so an
+  // IAM edge drawn to this node only enforces while the two match). Value is
+  // the secret's initial version; it is stored CLEARTEXT in a 0600 per-env
+  // JSON sidecar -- there is no KMS in odin, so nothing here is encrypted at
+  // rest. Read SECURITY.md's Secrets section before typing a real credential.
   {
     type: 'secret', abbr: 'SEC', label: 'Secret', sublabel: 'Secrets Manager',
-    category: 'Security', color: 'lime', width: 200,
-    fields: [{ key: 'label', label: 'Name', editable: true }, { key: 'arn', label: 'ARN' }],
-    defaultData: { label: 'new-secret', arn: '' },
-    iamActions: ['secretsmanager:GetSecretValue', 'secretsmanager:*'],
+    category: 'Security', color: 'lime', width: 220,
+    fields: [
+      { key: 'label', label: 'Name', editable: true },
+      { key: 'description', label: 'Description', editable: true },
+      { key: 'secretString', label: 'Value', editable: true },
+    ],
+    defaultData: { label: 'new-secret', description: '', secretString: '' },
+    iamActions: [
+      'secretsmanager:GetSecretValue', 'secretsmanager:DescribeSecret',
+      'secretsmanager:PutSecretValue', 'secretsmanager:*',
+    ],
   },
+  // kms: an UNBACKED placeholder (like 'iamrole' below) -- odin has no KMS
+  // substitute and the gateway classifies no `kms:*` action, so it is not in
+  // translate.py's _KIND and Apply skips it (see skipped_node_types).
+  // Deliberately NO `iamActions`: advertising kms:Encrypt/Decrypt let a user
+  // draw an IAM edge and tick permissions that could never be enforced or
+  // even reached -- a promise the engine cannot keep. They come back with a
+  // real KMS model, not before.
   {
-    type: 'kms', abbr: 'KMS', label: 'KMS Key', sublabel: 'Encryption key',
+    type: 'kms', abbr: 'KMS', label: 'KMS Key', sublabel: 'Encryption key (placeholder)',
     category: 'Security', color: 'teal', width: 200,
     fields: [{ key: 'label', label: 'Description', editable: true }, { key: 'arn', label: 'Key ARN' }],
     defaultData: { label: 'new-key', arn: '' },
-    iamActions: ['kms:Encrypt', 'kms:Decrypt', 'kms:GenerateDataKey', 'kms:*'],
   },
   {
     type: 'iamrole', abbr: 'IAM', label: 'IAM Role', sublabel: 'Identity role',
@@ -162,22 +226,44 @@ export const CATALOG: ServiceDef[] = [
     defaultData: { label: 'new-service', image: 'nginx:alpine', count: '1', port: '80' },
     primary: { key: 'count', label: 'tasks' },
   },
+  // W2.4: real SSM Parameter Store -- the node's Name IS the parameter name,
+  // slashes and all (the gateway classifies every ssm:* call by that bare
+  // name, so an IAM edge drawn to this node only enforces while the two
+  // match). SecureString is NOT encrypted: there is no KMS in odin, so it is
+  // stored byte-for-byte like a String would be, CLEARTEXT in a 0600 per-env
+  // JSON sidecar -- see SECURITY.md's Secrets section. A parameter can't exist
+  // without a Value, hence the placeholder default rather than an empty one.
   {
     type: 'ssm', abbr: 'SSM', label: 'SSM Parameter', sublabel: 'Parameter store',
-    category: 'Management', color: 'indigo', width: 200,
+    category: 'Management', color: 'indigo', width: 220,
     fields: [
       { key: 'label', label: 'Name', editable: true },
+      { key: 'paramType', label: 'Type', editable: true, select: ['String', 'StringList', 'SecureString'] },
       { key: 'paramValue', label: 'Value', editable: true },
     ],
-    defaultData: { label: 'new-param', paramValue: 'changeme' },
-    iamActions: ['ssm:GetParameter', 'ssm:GetParameters', 'ssm:*'],
+    defaultData: { label: '/odin/param', paramType: 'String', paramValue: 'changeme' },
+    primary: { key: 'paramType', label: 'Type' },
+    iamActions: [
+      'ssm:GetParameter', 'ssm:GetParameters', 'ssm:GetParametersByPath',
+      'ssm:PutParameter', 'ssm:*',
+    ],
   },
+  // W2.1: real CloudWatch Logs -- the node's Name IS the log group name (the
+  // gateway classifies every logs:* call by bare group name, so an IAM edge
+  // only enforces while the two match). Retention is left blank by default =
+  // AWS's own "never expire"; a value is emitted as `retention_in_days`.
   {
     type: 'logs', abbr: 'LOG', label: 'Log Group', sublabel: 'CloudWatch Logs',
     category: 'Monitoring', color: 'amber', width: 200,
-    fields: [{ key: 'label', label: 'Name', editable: true }, { key: 'arn', label: 'ARN' }],
-    defaultData: { label: '/odin/logs', arn: '' },
-    iamActions: ['logs:CreateLogStream', 'logs:PutLogEvents', 'logs:*'],
+    fields: [
+      { key: 'label', label: 'Name', editable: true },
+      { key: 'retentionInDays', label: 'Retention (days)', editable: true },
+    ],
+    defaultData: { label: '/odin/logs', retentionInDays: '' },
+    iamActions: [
+      'logs:CreateLogStream', 'logs:PutLogEvents', 'logs:GetLogEvents',
+      'logs:FilterLogEvents', 'logs:DescribeLogStreams', 'logs:*',
+    ],
   },
   {
     type: 'events', abbr: 'EVT', label: 'EventBridge', sublabel: 'Event rule',
@@ -212,16 +298,31 @@ export const CATALOG: ServiceDef[] = [
     fields: [{ key: 'label', label: 'Name', editable: true }, { key: 'igwId', label: 'Gateway ID' }],
     defaultData: { label: 'new-igw', igwId: '' },
   },
+  // W2.5: a REAL load balancer -- one node expands to aws_lb +
+  // aws_lb_target_group + aws_lb_listener (agent/hcl.py's `_alb`), and the
+  // substrate is an actual nginx reverse-proxy container per load balancer
+  // (compute/proxy.py) whose upstreams are the target group's registered
+  // targets. Draw it INSIDE a Subnet (containment is what gives aws_lb its
+  // subnets and the target group its vpc_id), then draw a NETWORK edge from it
+  // to the ECS service it fronts -- that edge is what registers the service's
+  // tasks as targets. Only `application` is supported in v1; `network` (an NLB)
+  // reports itself unsupported on Apply rather than silently becoming an ALB.
+  // The reachable address is NOT the ARN/DNS name: odin publishes the proxy on
+  // a dynamic host port, surfaced as the node's ALB_ENDPOINT fact.
   {
-    type: 'alb', abbr: 'ALB', label: 'Load Balancer', sublabel: 'Application/Network LB',
+    type: 'alb', abbr: 'ALB', label: 'Load Balancer', sublabel: 'Application LB (real proxy)',
     category: 'Networking', color: 'rose', width: 220,
     fields: [
       { key: 'label', label: 'Name', editable: true },
       { key: 'lbType', label: 'Type', editable: true, select: ['application', 'network'] },
-      { key: 'arn', label: 'ARN' },
+      { key: 'listenerPort', label: 'Listener Port', editable: true },
+      { key: 'port', label: 'Target Port', editable: true },
+      { key: 'healthCheckPath', label: 'Health Check Path', editable: true },
     ],
-    defaultData: { label: 'new-lb', lbType: 'application', arn: '' },
-    primary: { key: 'lbType', label: 'Type' },
+    defaultData: {
+      label: 'new-lb', lbType: 'application', listenerPort: '80', port: '80', healthCheckPath: '/',
+    },
+    primary: { key: 'listenerPort', label: 'Listener' },
   },
 ];
 

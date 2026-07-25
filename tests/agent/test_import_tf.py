@@ -4,7 +4,7 @@ tests/simulate/test_import_tf_e2e.py (integration, needs Colima/tofu)."""
 from __future__ import annotations
 
 from odin.agent.hcl import generate_tf
-from odin.agent.import_tf import LiveResource, _import_id, parse_hcl_dir, parse_hcl_text
+from odin.agent.import_tf import _TF_TYPE, LiveResource, _import_id, parse_hcl_dir, parse_hcl_text
 from odin.spec.translate import canvas_to_stack
 
 _FULL_TF = '''
@@ -72,12 +72,12 @@ def test_grid_positions_are_on_the_20px_grid_in_220px_steps():
 
 
 def test_unsupported_type_never_dropped_even_when_alone():
-    result = parse_hcl_text('resource "aws_cloudwatch_log_group" "logs" {\n  name = "logs"\n}\n')
+    result = parse_hcl_text('resource "aws_lambda_function" "fn" {\n  function_name = "fn"\n}\n')
     assert result.nodes == []
     assert result.edges == []
     assert len(result.unsupported) == 1
-    assert result.unsupported[0].type == "aws_cloudwatch_log_group"
-    assert result.unsupported[0].name == "logs"
+    assert result.unsupported[0].type == "aws_lambda_function"
+    assert result.unsupported[0].name == "fn"
     assert "not supported" in result.unsupported[0].reason
 
 
@@ -107,7 +107,7 @@ def test_malformed_hcl_sets_parse_error_not_unsupported():
 
 
 def test_valid_file_with_only_unsupported_resources_has_no_parse_error():
-    result = parse_hcl_text('resource "aws_cloudwatch_log_group" "logs" {\n  name = "logs"\n}\n')
+    result = parse_hcl_text('resource "aws_lambda_function" "fn" {\n  function_name = "fn"\n}\n')
     assert result.parse_error is None
     assert len(result.unsupported) == 1
 
@@ -191,6 +191,192 @@ def test_round_trip_preserves_composite_key_and_tags():
     assert 'resource "aws_iam_role" "exec"' in regenerated
 
 
+# --- logs (W2.1): aws_cloudwatch_log_group <-> the `logs` canvas kind --------
+
+
+_LOGS_TF = '''
+resource "aws_cloudwatch_log_group" "app" {
+  name              = "/odin/app"
+  retention_in_days = 14
+}
+
+resource "aws_cloudwatch_log_group" "forever" {
+  name = "/odin/forever"
+}
+'''
+
+
+def test_log_group_imports_as_a_logs_node_with_the_group_name_as_its_label():
+    result = parse_hcl_text(_LOGS_TF)
+    by_id = {n["id"]: n for n in result.nodes}
+    assert set(by_id) == {"/odin/app", "/odin/forever"}
+    assert by_id["/odin/app"]["type"] == "logs"
+    assert by_id["/odin/app"]["data"]["retentionInDays"] == "14"
+    # No retention on the wire = AWS's "never expire"; the canvas field stays unset.
+    assert "retentionInDays" not in by_id["/odin/forever"]["data"]
+    assert result.unsupported == []
+    assert result.warnings == []
+
+
+def test_log_group_round_trip_reproduces_name_and_retention():
+    imported = parse_hcl_text(_LOGS_TF)
+    regenerated = generate_tf(canvas_to_stack({"nodes": imported.nodes, "edges": imported.edges})).files["main.tf"]
+    assert 'name              = "/odin/app"' in regenerated
+    assert "retention_in_days = 14" in regenerated
+    assert 'name = "/odin/forever"' in regenerated
+    assert regenerated.count("retention_in_days") == 1  # the never-expire group stays unset
+
+
+# --- secret + ssm (W2.4): aws_secretsmanager_secret(+_version) <-> the
+# `secret` kind, aws_ssm_parameter <-> the `ssm` kind. The VERSION resource is
+# a COMPANION: it folds into its secret node's own value field (the exact
+# inverse of hcl.py's companion pass), never a node of its own. ---------------
+
+
+_SECRETS_TF = '''
+resource "aws_secretsmanager_secret" "db_password" {
+  name                    = "db-password"
+  description             = "the db password"
+  recovery_window_in_days = 0
+
+  tags = {
+    "odin:node" = "db-password"
+    "team"      = "core"
+  }
+}
+
+resource "aws_secretsmanager_secret_version" "db_password" {
+  secret_id     = aws_secretsmanager_secret.db_password.id
+  secret_string = "hunter2-and-then-some"
+}
+
+resource "aws_secretsmanager_secret" "empty" {
+  name = "no-value-yet"
+}
+
+resource "aws_ssm_parameter" "api_key" {
+  name  = "/odin/api-key"
+  type  = "SecureString"
+  value = "abc123456"
+}
+'''
+
+
+def test_secret_and_ssm_import_as_their_canvas_kinds():
+    result = parse_hcl_text(_SECRETS_TF)
+    by_id = {n["id"]: n for n in result.nodes}
+    assert set(by_id) == {"db-password", "no-value-yet", "/odin/api-key"}
+    assert by_id["db-password"]["type"] == "secret"
+    assert by_id["db-password"]["data"]["description"] == "the db password"
+    # The user tag survives; odin's own management tag never surfaces as one.
+    assert by_id["db-password"]["data"]["tags"] == {"team": "core"}
+    assert by_id["/odin/api-key"]["type"] == "ssm"
+    assert by_id["/odin/api-key"]["data"]["paramType"] == "SecureString"
+    assert by_id["/odin/api-key"]["data"]["paramValue"] == "abc123456"
+    assert result.unsupported == []
+    assert result.warnings == []
+
+
+# --- rds (W2.7): aws_db_instance <-> the `rds` canvas kind --------------------
+
+
+_RDS_TF = '''
+resource "aws_db_instance" "orders" {
+  identifier          = "orders-db"
+  engine              = "postgres"
+  instance_class      = "db.t3.small"
+  allocated_storage   = 50
+  db_name             = "orders"
+  username            = "svc"
+  password            = "s3cr3t-pw"
+  skip_final_snapshot = true
+
+  tags = {
+    "team" = "core"
+  }
+}
+'''
+
+
+def test_db_instance_imports_as_an_rds_node_keyed_by_its_identifier():
+    result = parse_hcl_text(_RDS_TF)
+    assert len(result.nodes) == 1
+    node = result.nodes[0]
+    assert node["id"] == "orders-db"
+    assert node["type"] == "rds"
+    assert node["data"] == {
+        "label": "orders-db", "allocatedStorage": "50", "engine": "postgres",
+        "instanceClass": "db.t3.small", "dbName": "orders", "username": "svc",
+        "password": "s3cr3t-pw", "tags": {"team": "core"},
+    }
+    assert result.unsupported == []
+    assert result.warnings == []
+
+
+def test_a_secret_version_folds_into_its_secret_nodes_value_field():
+    by_id = {n["id"]: n for n in parse_hcl_text(_SECRETS_TF).nodes}
+    assert by_id["db-password"]["data"]["secretString"] == "hunter2-and-then-some"
+    # A secret with no version stays valueless rather than gaining an empty one.
+    assert "secretString" not in by_id["no-value-yet"]["data"]
+
+
+def test_secret_and_ssm_round_trip_reproduces_the_value_resources():
+    imported = parse_hcl_text(_SECRETS_TF)
+    regenerated = generate_tf(canvas_to_stack({"nodes": imported.nodes, "edges": imported.edges})).files["main.tf"]
+    assert 'resource "aws_secretsmanager_secret" "db_password"' in regenerated
+    assert 'secret_string = "hunter2-and-then-some"' in regenerated
+    assert 'resource "aws_ssm_parameter" "_odin_api_key"' in regenerated
+    assert 'value = "abc123456"' in regenerated
+    # ...and the valueless secret still emits no version block of its own.
+    assert regenerated.count("aws_secretsmanager_secret_version") == 1
+
+
+def test_a_secret_version_pointing_outside_the_supported_set_is_reported_not_dropped():
+    tf = (
+        'resource "aws_secretsmanager_secret_version" "orphan" {\n'
+        '  secret_id     = aws_secretsmanager_secret.elsewhere.id\n'
+        '  secret_string = "x"\n'
+        "}\n"
+    )
+    result = parse_hcl_text(tf)
+    assert result.nodes == []
+    assert [(u.type, u.name) for u in result.unsupported] == [("aws_secretsmanager_secret_version", "orphan")]
+
+
+def test_a_computed_secret_value_is_reported_rather_than_imported_verbatim():
+    tf = (
+        'resource "aws_secretsmanager_secret" "s" {\n  name = "s"\n}\n\n'
+        'resource "aws_secretsmanager_secret_version" "s" {\n'
+        "  secret_id     = aws_secretsmanager_secret.s.id\n"
+        "  secret_string = var.db_password\n"
+        "}\n"
+    )
+    result = parse_hcl_text(tf)
+    assert "secretString" not in result.nodes[0]["data"]
+    assert result.unsupported[0].type == "aws_secretsmanager_secret_version"
+
+
+def test_secret_and_ssm_stay_out_of_the_live_import_path():
+    # Neither has a backing to enumerate live resources from (both are pure
+    # gateway models), so mode (b) reports them instead of pretending.
+    assert "secret" not in _TF_TYPE
+    assert "ssm" not in _TF_TYPE
+
+
+def test_db_instance_round_trip_reproduces_every_argument_including_the_password():
+    """A dropped `password` would silently substitute hcl.py's default on the
+    next apply -- a real credential change, so it round-trips."""
+    imported = parse_hcl_text(_RDS_TF)
+    regenerated = generate_tf(canvas_to_stack({"nodes": imported.nodes, "edges": imported.edges})).files["main.tf"]
+    for line in (
+        'identifier          = "orders-db"', 'instance_class      = "db.t3.small"',
+        "allocated_storage   = 50", 'db_name             = "orders"',
+        'username            = "svc"', 'password            = "s3cr3t-pw"',
+        "skip_final_snapshot = true", '"team"      = "core"',
+    ):
+        assert line in regenerated, line
+
+
 def test_bucket_with_computed_name_falls_back_to_hcl_resource_name_as_label():
     tf = 'resource "aws_s3_bucket" "generated" {\n  bucket = "${var.prefix}-uploads"\n}\n'
     result = parse_hcl_text(tf)
@@ -221,3 +407,187 @@ def test_import_id_sqs_builds_a_gateway_routed_queue_url():
 def test_import_id_sns_builds_an_arn():
     result = _import_id(LiveResource(type="sns", id="alerts"), gateway_port=4266)
     assert result == "arn:aws:sns:us-east-1:000000000000:alerts"
+
+
+# --- W2.8: elasticache -------------------------------------------------------
+
+_CACHE_TF = '''
+resource "aws_elasticache_cluster" "sessions" {
+  cluster_id      = "sessions"
+  engine          = "redis"
+  node_type       = "cache.t3.small"
+  num_cache_nodes = 1
+
+  tags = {
+    "odin:node" = "sessions"
+  }
+}
+'''
+
+
+# --- alb (W2.5): aws_lb(+_target_group +_listener) <-> the `alb` canvas kind.
+# BOTH companions fold onto the aws_lb's node (the exact inverse of hcl.py's own
+# companion pass, so one canvas node stays one canvas node instead of
+# multiplying into three). The LISTENER is what ties the trio together: it names
+# its load balancer directly and its target group through the forward action. ---
+
+
+_ALB_TF = '''
+resource "aws_lb" "front" {
+  name               = "front"
+  internal           = true
+  load_balancer_type = "application"
+
+  tags = {
+    "odin:node" = "front"
+    "team"      = "core"
+  }
+}
+
+resource "aws_lb_target_group" "front_tg" {
+  name        = "front-tg"
+  port        = 3000
+  protocol    = "HTTP"
+  vpc_id      = aws_vpc.net.id
+  target_type = "instance"
+
+  health_check {
+    path = "/healthz"
+  }
+}
+
+resource "aws_lb_listener" "front_listener" {
+  load_balancer_arn = aws_lb.front.arn
+  port              = 8080
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.front_tg.arn
+  }
+}
+'''
+
+
+def test_elasticache_cluster_imports_as_an_elasticache_node():
+    result = parse_hcl_text(_CACHE_TF)
+    (node,) = result.nodes
+    assert (node["id"], node["type"]) == ("sessions", "elasticache")
+    assert node["data"]["nodeType"] == "cache.t3.small"
+    assert not any(u.type == "aws_elasticache_cluster" for u in result.unsupported)
+    assert result.warnings == []  # every argument hcl.py emits is carried
+
+
+def test_elasticache_round_trips_back_through_generate_tf():
+    imported = parse_hcl_text(_CACHE_TF)
+    canvas = {"nodes": imported.nodes, "edges": imported.edges}
+    regenerated = generate_tf(canvas_to_stack(canvas)).files["main.tf"]
+    assert 'resource "aws_elasticache_cluster" "sessions"' in regenerated
+    assert '  cluster_id      = "sessions"' in regenerated
+    assert '  node_type       = "cache.t3.small"' in regenerated
+    assert "  num_cache_nodes = 1" in regenerated
+
+
+def test_elasticache_label_falls_back_to_the_hcl_name_when_cluster_id_is_computed():
+    tf = 'resource "aws_elasticache_cluster" "generated" {\n  cluster_id = "${var.prefix}-cache"\n}\n'
+    assert parse_hcl_text(tf).nodes[0]["id"] == "generated"
+
+
+def test_elasticache_stays_out_of_the_live_import_path():
+    # No `_import_id` shape can resolve a cluster from outside a canvas Apply
+    # (it exists only as a gateway-model record + a real container), so mode
+    # (b) reports it unsupported rather than generating a bogus import block.
+    assert "elasticache" not in _TF_TYPE
+
+
+def test_the_alb_trio_imports_as_one_node_carrying_both_ports_and_the_health_check():
+    result = parse_hcl_text(_ALB_TF)
+    (node,) = result.nodes  # the two companions produce no node of their own
+    assert node["id"] == "front"  # the aws_lb's `name`, not the HCL resource name
+    assert node["type"] == "alb"
+    assert node["data"]["listenerPort"] == "8080"  # from the listener
+    assert node["data"]["port"] == "3000"          # from the target group
+    assert node["data"]["healthCheckPath"] == "/healthz"
+    assert result.unsupported == []
+
+
+def test_alb_round_trips_through_generate_and_back_reproducing_every_field():
+    canvas = {
+        "nodes": [
+            {"id": "n1", "type": "vpc", "data": {"label": "net"}},
+            {"id": "n2", "type": "subnet", "data": {"label": "web", "vpc": "net"}},
+            {"id": "n3", "type": "alb", "data": {
+                "label": "front", "vpc": "net", "subnet": "web",
+                "listenerPort": "8080", "port": "3000", "healthCheckPath": "/healthz",
+            }},
+        ],
+        "edges": [],
+    }
+    generated = generate_tf(canvas_to_stack(canvas)).files["main.tf"]
+    (node,) = [n for n in parse_hcl_text(generated).nodes if n["type"] == "alb"]
+    assert node["id"] == "front"
+    assert node["data"]["listenerPort"] == "8080"
+    assert node["data"]["port"] == "3000"
+    assert node["data"]["healthCheckPath"] == "/healthz"
+
+
+def test_a_listener_naming_a_load_balancer_outside_the_supported_set_is_reported():
+    tf = (
+        'resource "aws_lb_listener" "orphan" {\n'
+        "  load_balancer_arn = aws_lb.elsewhere.arn\n"
+        "  port              = 80\n"
+        "\n"
+        "  default_action {\n"
+        '    type             = "forward"\n'
+        "    target_group_arn = aws_lb_target_group.tg.arn\n"
+        "  }\n"
+        "}\n"
+    )
+    result = parse_hcl_text(tf)
+    assert result.nodes == []
+    assert [(u.type, u.name) for u in result.unsupported] == [("aws_lb_listener", "orphan")]
+    assert "outside the supported set" in result.unsupported[0].reason
+
+
+def test_a_target_group_no_listener_forwards_to_is_reported_not_dropped():
+    # It can't be attributed to any load balancer, so it's reported rather than
+    # guessed at (the subscription pass's rule).
+    tf = (
+        'resource "aws_lb" "front" {\n  name = "front"\n}\n\n'
+        'resource "aws_lb_target_group" "lonely" {\n  name = "lonely-tg"\n  port = 80\n}\n'
+    )
+    result = parse_hcl_text(tf)
+    assert [n["id"] for n in result.nodes] == ["front"]
+    (dropped,) = result.unsupported
+    assert (dropped.type, dropped.name) == ("aws_lb_target_group", "lonely")
+    assert "not the forward target of any imported listener" in dropped.reason
+
+
+def test_alb_carries_user_tags_but_not_odins_own():
+    (node,) = parse_hcl_text(_ALB_TF).nodes
+    assert node["data"]["tags"] == {"team": "core"}  # odin:node excluded
+
+
+def test_alb_name_scheme_type_and_tags_are_carried_while_other_arguments_warn():
+    # `internal`/`load_balancer_type` are values odin always emits itself, so a
+    # differing imported one is deliberately NOT surfaced as a dropped
+    # attribute -- but a genuinely unmodeled argument still has to be honest.
+    tf = (
+        'resource "aws_lb" "front" {\n'
+        '  name               = "front"\n'
+        "  internal           = true\n"
+        '  load_balancer_type = "application"\n'
+        "  idle_timeout       = 120\n"
+        "\n"
+        '  tags = {\n    "team" = "core"\n  }\n'
+        "}\n"
+    )
+    result = parse_hcl_text(tf)
+    assert result.warnings == ["front (alb): imported without unmodeled attribute(s): idle_timeout"]
+    assert result.unsupported == []
+
+
+def test_alb_stays_out_of_the_live_import_path():
+    # Mode (b) enumerates live resources from a BACKING; an alb's substrate is
+    # the gateway's own nginx proxy, so it reports itself instead of pretending.
+    assert "alb" not in _TF_TYPE

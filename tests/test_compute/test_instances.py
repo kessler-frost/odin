@@ -308,6 +308,26 @@ def test_boot_with_nebula_signs_a_cert_and_installs_the_binary_via_cloud_init(tm
     assert "systemctl enable --now nebula" not in runner.script  # not started yet
 
 
+def test_boot_signs_the_instances_security_groups_as_cert_groups(tmp_path):
+    """W2.6: `NebulaJoin.groups` (the instance's sg ids) ride into
+    `nebula-cert sign -groups`, alongside the standing "ec2" group -- nebula
+    matches a peer's `group:` firewall rule against THESE, so an SG-to-SG
+    rule ("allow 5432 from sg-web") can only ever match if the sg id is in
+    the peer's certificate."""
+    runner = FakeRunner()
+    runner.responses["hostname -I"] = _Proc(0, "192.168.64.20")
+    vm = InstanceVm(runner=runner, lighthouse=FakeLighthouseManager())
+
+    nebula = NebulaJoin(
+        root=tmp_path, env="myenv", host_id="i-0123456789abcdef0",
+        groups=("sg-web00000000000000", "sg-ops00000000000000"),
+    )
+    vm.boot(NAME, get_instance_type("t3.micro"), hostname="i-0123456789abcdef0", nebula=nebula)
+
+    sign_call = next(c for c in runner.calls if "sign" in c and "i-0123456789abcdef0" in c)
+    assert sign_call[sign_call.index("-groups") + 1] == "ec2,sg-web00000000000000,sg-ops00000000000000"
+
+
 def test_boot_without_nebula_never_touches_the_fabric():
     runner = FakeRunner()
     runner.responses["hostname -I"] = _Proc(0, "192.168.64.20")
@@ -346,7 +366,9 @@ def test_activate_nebula_derives_underlay_and_writes_final_config(tmp_path):
 
     assert lighthouse.started == [(tmp_path, "myenv", "192.168.64.1")]
     config = yaml.safe_load(runner.config_input)
-    assert config["static_host_map"] == {"10.42.0.1": ["192.168.64.1:4242"]}
+    # 4342, not the members' own 4242: Lima forwards a VM's 4242 to the host's
+    # loopback, stealing it from the lighthouse (fabric/nebula.py::LIGHTHOUSE_PORT).
+    assert config["static_host_map"] == {"10.42.0.1": ["192.168.64.1:4342"]}
     assert config["firewall"]["inbound"] == [{"port": "8080", "proto": "tcp", "cidr": "0.0.0.0/0"}]
     # R5: stock Lima vz has no VM-to-VM underlay path -- every VM routes to
     # every other VM through the lighthouse acting as a relay.

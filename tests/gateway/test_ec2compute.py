@@ -396,6 +396,40 @@ def test_terminate_transitions_then_sweeps_after_grace_window(sink, ec2, stores)
     assert parsed["Error"]["Code"] == "InvalidInstanceID.NotFound"
 
 
+def test_mark_instance_terminated_is_what_tofu_reads_after_an_out_of_band_vm_delete(sink, ec2, stores):
+    """W2.2's honesty fix -- the reality sweep's seam (`reconcile/drift.py`):
+    once odin has CONFIRMED the Lima VM is gone, DescribeInstances must answer
+    `terminated` with a real StateReason, because that answer is the only thing
+    that makes the "re-Apply to recreate" verdict TRUE (terraform-provider-aws
+    drops a terminated instance from state and plans a create; a record still
+    claiming `running` gives tofu an empty plan forever and the VM never comes
+    back). The record is also reclaimed by the normal lazy sweep afterwards --
+    no new lifecycle, just the existing terminal one."""
+    subnet_id = _subnet(stores, sink, ec2)
+    vm = FakeInstanceVm()
+    instance_id = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)["Instances"][0]["InstanceId"]
+    _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+
+    ec2compute.mark_instance_terminated(
+        stores, ENV, instance_id,
+        f"VM odin-ec2-{ENV}-{instance_id} deleted outside odin — re-Apply to recreate",
+    )
+
+    req = sink.call(lambda: ec2.describe_instances(InstanceIds=[instance_id]))
+    instance = _parse("DescribeInstances", _answer(stores, req, vm))["Reservations"][0]["Instances"][0]
+    assert instance["State"]["Name"] == "terminated"
+    assert instance["StateReason"]["Code"] == "Client.UserInitiatedShutdown"
+    assert "deleted outside odin" in instance["StateReason"]["Message"]
+    assert vm.deleted == [], "the sweep records reality -- it never deletes a VM itself"
+
+    # ...and the record is reclaimed by the SAME grace window a real terminate
+    # uses, never parked in the store forever.
+    path, query = split_url(req.url)
+    action, resource = classify("ec2", req.method, path, query, req.headers, req.body)
+    late = ec2compute.pure_answer(action, resource, ENV, req.body, stores, time.monotonic() + 120.0, vm)
+    assert _parse("DescribeInstances", late, error=True)["Error"]["Code"] == "InvalidInstanceID.NotFound"
+
+
 def test_terminate_delete_failure_keeps_shutting_down_with_reason_and_retries(sink, ec2, stores):
     """Release finding #4 -- VM delete honesty: a failed `vm.delete` must
     NOT be reported as a clean `terminated`. The record stays
@@ -466,17 +500,15 @@ def test_terminate_unknown_instance_is_not_found(sink, ec2, stores):
     assert response.status_code == 400
 
 
-# --- R3: the VPC default SG's firewall + the lighthouse start/stop lifecycle ----
+# --- R3/W2.6: the assigned-SG firewall + the lighthouse start/stop lifecycle ----
 
 
 def test_run_instances_threads_the_vpc_default_sg_firewall_into_nebula_join(sink, ec2, stores):
     """An instance launched with NO SecurityGroupIds inherits its VPC's default
     SG, exactly like real AWS. An ingress rule authorized on that default SG
-    must show up on the `NebulaJoin` `InstanceVm.boot` receives. (The Nebula
-    firewall always compiles from the VPC DEFAULT SG regardless of any assigned
-    groups -- finding #2 wires assigned SGs through the DescribeInstances wire
-    for zero-drift re-apply, but gating the VM's mesh firewall by the assigned
-    SG is a separately-tracked limit.)"""
+    must show up on the `NebulaJoin` `InstanceVm.boot` receives. (W2.6 made the
+    ASSIGNED groups the primary source -- this is the fallback path for an
+    instance that has none, which real AWS resolves the same way.)"""
     subnet_id = _subnet(stores, sink, ec2)
     vpc_id = stores.ec2net.get(ENV, f"subnet:{subnet_id}")["vpc_id"]
     default_sg_id = stores.ec2net.get(ENV, f"vpc:{vpc_id}")["default_sg_id"]
@@ -490,6 +522,68 @@ def test_run_instances_threads_the_vpc_default_sg_firewall_into_nebula_join(sink
     ((_name, _hostname, _ssh_pubkey, _user_data, nebula, _env_vars),) = vm.booted
     assert nebula is not None and nebula.firewall is not None
     assert FirewallRule(port="8080", proto="tcp", cidr="0.0.0.0/0") in nebula.firewall.inbound
+
+
+def _authorize(stores, sink, ec2, group_id: str, port: int) -> None:
+    req = sink.call(lambda: ec2.authorize_security_group_ingress(GroupId=group_id, IpPermissions=[
+        {"IpProtocol": "tcp", "FromPort": port, "ToPort": port, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+    ]))
+    assert _answer(stores, req).status_code == 200
+
+
+def test_run_instances_compiles_the_union_of_its_assigned_sgs_not_the_vpc_default(sink, ec2, stores):
+    """W2.6 piece 1: the VM's nebula firewall comes from the instance's OWN
+    security groups (all of them -- AWS rules are permissive-only, so the
+    effective set is their union), NOT from the VPC's default SG. Before this,
+    a canvas that assigned `web-sg` to an instance got the default SG's rules
+    baked into the VM regardless -- the drawn group was decorative on the
+    wire."""
+    vpc_id = _create_vpc(stores, sink, ec2)
+    subnet_id = _create_subnet(stores, sink, ec2, vpc_id)
+    default_sg_id = stores.ec2net.get(ENV, f"vpc:{vpc_id}")["default_sg_id"]
+    web_sg = _create_sg(stores, sink, ec2, vpc_id, name="web-sg")
+    ops_sg = _create_sg(stores, sink, ec2, vpc_id, name="ops-sg")
+    _authorize(stores, sink, ec2, default_sg_id, 7070)  # must NOT reach the VM
+    _authorize(stores, sink, ec2, web_sg, 8080)
+    _authorize(stores, sink, ec2, ops_sg, 9090)
+
+    vm = FakeInstanceVm()
+    _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, SecurityGroupIds=[web_sg, ops_sg])
+    ((_name, _hostname, _ssh_pubkey, _user_data, nebula, _env_vars),) = vm.booted
+    assert nebula is not None and nebula.firewall is not None
+    ports = {(r.port, r.proto) for r in nebula.firewall.inbound}
+    assert ("8080", "tcp") in ports, "the first assigned SG's rule must gate the VM"
+    assert ("9090", "tcp") in ports, "the second assigned SG's rule must gate the VM too (union)"
+    assert ("7070", "tcp") not in ports, "the VPC default SG must NOT leak in once groups are assigned"
+
+
+def test_run_instances_stamps_assigned_sg_ids_as_nebula_cert_groups(sink, ec2, stores):
+    """The other half of SG-to-SG rules: nebula matches a peer's `group:` rule
+    against that peer's CERTIFICATE groups, so an instance's sg ids have to
+    ride into cert signing (`InstanceVm._nebula_files`)."""
+    vpc_id = _create_vpc(stores, sink, ec2)
+    subnet_id = _create_subnet(stores, sink, ec2, vpc_id)
+    web_sg = _create_sg(stores, sink, ec2, vpc_id, name="web-sg")
+
+    vm = FakeInstanceVm()
+    _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, SecurityGroupIds=[web_sg])
+    ((_name, _hostname, _ssh_pubkey, _user_data, nebula, _env_vars),) = vm.booted
+    assert nebula.groups == (web_sg,)
+
+
+def test_run_instances_with_an_unknown_sg_falls_back_to_the_vpc_default(sink, ec2, stores):
+    """A SecurityGroupId with no record contributes no rules -- the instance
+    falls back to its VPC default rather than silently booting with an empty
+    (deny-everything) or invented firewall."""
+    vpc_id = _create_vpc(stores, sink, ec2)
+    subnet_id = _create_subnet(stores, sink, ec2, vpc_id)
+    default_sg_id = stores.ec2net.get(ENV, f"vpc:{vpc_id}")["default_sg_id"]
+    _authorize(stores, sink, ec2, default_sg_id, 7070)
+
+    vm = FakeInstanceVm()
+    _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, SecurityGroupIds=["sg-00000000000000000"])
+    ((_name, _hostname, _ssh_pubkey, _user_data, nebula, _env_vars),) = vm.booted
+    assert FirewallRule(port="7070", proto="tcp", cidr="0.0.0.0/0") in nebula.firewall.inbound
 
 
 def test_run_instances_without_a_subnet_gets_no_nebula_join(sink, ec2, stores):

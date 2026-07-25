@@ -91,10 +91,12 @@ from collections.abc import Callable
 from starlette.responses import Response
 
 from odin.aws.backings import ACCOUNT, REGION
-from odin.compute.tasks import TaskRuntime
+from odin.compute.tasks import TaskRuntime, container_name
 from odin.gateway import errors
 from odin.gateway.keys import KeyStore, workload_env
+from odin.gateway.models import elbv2ctl, logsctl
 from odin.gateway.stores import NO_CHANGE, SynthStores
+from odin.runtime.colima import CONTAINER_HOST
 
 log = logging.getLogger("odin.gateway.ecsctl")
 
@@ -108,6 +110,12 @@ _DEFAULT_COMPATIBILITIES = ["EC2"]
 # delete), which never goes through the lazy sweep at all (this module
 # already knows the outcome the moment it issues the stop).
 _ESSENTIAL_CONTAINER_EXITED = "Essential container in task exited"
+
+# How many trailing lines of a task container's output ONE sweep reads
+# (`docker logs --tail N`) -- see `_ship_task_logs`: bounded so a chatty
+# container can't turn a `Describe*` into an unbounded read, generous enough
+# that a crash's traceback fits inside one window.
+_LOG_TAIL_LINES = 200
 
 # DeleteService keeps the record around, `status="INACTIVE"`, for this long
 # before actually purging it (mirrors ec2compute.py's
@@ -391,7 +399,11 @@ def _service_wire(stores: SynthStores, env: str, service: dict) -> dict:
         "serviceArn": arn,
         "serviceName": service["service_name"],
         "clusterArn": _cluster_arn(service["cluster_name"]),
-        "loadBalancers": [],
+        # W2.5: echoed VERBATIM from what CreateService submitted (the same
+        # byte-for-byte rule this module's docstring sets for
+        # containerDefinitions) -- an `aws_ecs_service` with a `load_balancer`
+        # block drifts on every subsequent plan if this stays hardcoded `[]`.
+        "loadBalancers": service.get("load_balancers") or [],
         "serviceRegistries": [],
         "status": service["status"],
         "desiredCount": service["desired_count"],
@@ -453,12 +465,85 @@ def _task_wire(task: dict) -> dict:
     }
 
 
+# --- W2.5: the service scheduler's load-balancer half --------------------
+# Real ECS (not terraform) is what registers a TASK with the target groups
+# named in its service's `loadBalancers` block, and deregisters it when the
+# task goes away. These two helpers are odin's equivalent, called from the
+# same three places a task's real lifecycle turns over: `_launch_task`,
+# `_stop_task` (a deliberate stop) and the lazy sweep / drift correction (a
+# container that died on its own). A service with no `loadBalancers` runs the
+# loop body zero times, so this costs nothing for the ECS-without-an-ALB case.
+
+
+def _task_targets(
+    stores: SynthStores, env: str, cluster_name: str, service_name: str, host_ports: dict | None,
+) -> list[tuple[str, int]]:
+    """`[(targetGroupArn, published host port), ...]` for one task: each of the
+    service's load balancers, paired with the REAL host port Docker published
+    for the container port that load balancer names. An odin ECS task is a
+    bridge-mode container, so its address is (`host.docker.internal`, that
+    published port) -- see elbv2ctl.py's TARGET ADDRESSES note. `host_ports`
+    keys are ints in memory but strings once the store has round-tripped
+    through JSON, hence the `str()` normalization."""
+    service = _service(stores, env, cluster_name, service_name)
+    published = {str(port): host_port for port, host_port in (host_ports or {}).items()}
+    return [
+        (lb["targetGroupArn"], int(published[str(lb.get("containerPort"))]))
+        for lb in (service or {}).get("load_balancers") or []
+        if lb.get("targetGroupArn") and published.get(str(lb.get("containerPort")))
+    ]
+
+
+def _register_task_targets(
+    stores: SynthStores, env: str, cluster_name: str, service_name: str, host_ports: dict | None,
+) -> None:
+    for target_group_arn, host_port in _task_targets(stores, env, cluster_name, service_name, host_ports):
+        elbv2ctl.register_target(stores, env, target_group_arn, CONTAINER_HOST, host_port)
+
+
+def _deregister_task_targets(stores: SynthStores, env: str, task: dict) -> None:
+    targets = _task_targets(stores, env, task["cluster_name"], task["service_name"], task.get("host_ports"))
+    for target_group_arn, host_port in targets:
+        elbv2ctl.deregister_target(stores, env, target_group_arn, CONTAINER_HOST, host_port)
+
+
 # --- lazy sweep: real container status -> task lastStatus (research §2.6's
 # `_maybe_mark_stopped`, module docstring's "GATEWAY-INTERNAL RECONCILE") ---
 
 
+def _ship_task_logs(stores: SynthStores, env: str, task: dict, runtime: TaskRuntime) -> None:
+    """Ship one task container's log tail into `/ecs/{service}` -- the group
+    an `awslogs` log-configuration would name in real ECS, so a crash's output
+    survives the container that produced it.
+
+    ONE STREAM PER REAL TASK CONTAINER, named after the container itself
+    (`odin-ecs-{env}-{task_id8}-{container}`) -- odin's honest deviation from
+    AWS's `{prefix}/{container}/{taskId}` stream naming, and what makes
+    `ingest_tail`'s cursor stable: the cursor counts how many lines of THIS
+    container's output have been ingested, and a task container is never
+    reused (a replacement task gets a new task_id, hence a new stream), so a
+    re-read of the same tail appends nothing.
+
+    Cost: `sweep_tasks` runs on every reconciler tick (`reconcile/
+    tf_status.py`) and every ECS `Describe*`/`ListTasks`, so this is exactly
+    ONE bounded `docker logs --tail N` per task per sweep, with the cursor --
+    not a growing log group -- absorbing the repetition. No try/except: the
+    read is `TaskRuntime.logs` -> the driver's `check=False` CLI call, which
+    answers "" for an already-removed container instead of raising.
+    """
+    logsctl.ingest_tail(
+        stores, env, f"/ecs/{task['service_name']}",
+        container_name(env, task["task_id"], task["container_name"]),
+        runtime.logs(env, task["task_id"], task["container_name"], _LOG_TAIL_LINES),
+    )
+
+
 def sweep_tasks(stores: SynthStores, env: str, runtime: TaskRuntime) -> None:
     for task in _all_tasks(stores, env):
+        # Before (and independent of) the RUNNING-only check below: a task
+        # that already exited on its own still has its FINAL lines sitting in
+        # a stopped container, and those lines ARE the crash diagnostic.
+        _ship_task_logs(stores, env, task, runtime)
         if task["last_status"] != "RUNNING":
             continue
         status = runtime.status(env, task["task_id"], task["container_name"])
@@ -470,6 +555,29 @@ def sweep_tasks(stores: SynthStores, env: str, runtime: TaskRuntime) -> None:
             last_status="STOPPED", stopped_at=time.time(), exit_code=exit_code,
             stopped_reason=_ESSENTIAL_CONTAINER_EXITED,
         )
+        # W2.5: a task that died on its own must leave its load balancer's
+        # upstream list too, or the proxy keeps a dead server in rotation. Runs
+        # once, on the RUNNING->STOPPED transition (this loop only reaches here
+        # for a task the store still calls RUNNING), never every sweep.
+        _deregister_task_targets(stores, env, task)
+
+
+def mark_task_stopped(stores: SynthStores, env: str, cluster_name: str, task_id: str, reason: str) -> None:
+    """Public seam for W2.2's reality sweep (`reconcile/drift.py`): a task
+    whose container was REMOVED outside odin, marked STOPPED with `reason`.
+    Same terminal shape `sweep_tasks` gives a container that exited on its
+    own -- minus an `exit_code`, because a container that no longer exists
+    never reported one (an invented 0/137 would be a lie). Keeping the store
+    honest is also what makes the recovery real: `converge_services` (an
+    Apply) relaunches a STOPPED task, while a RUNNING record whose container
+    is gone would have it wait forever for a task nothing will replace."""
+    _update_task(
+        stores, env, cluster_name, task_id,
+        last_status="STOPPED", stopped_at=time.time(), stopped_reason=reason,
+    )
+    task = stores.ecsctl.get(env, _task_key(cluster_name, task_id))
+    if task is not None:  # W2.5: a vanished container leaves the LB's rotation too
+        _deregister_task_targets(stores, env, task)
 
 
 # --- background completion: the reconcile-on-mutation shape (module
@@ -520,6 +628,11 @@ def _launch_task(
         stores, env, cluster_name, task_id,
         last_status="RUNNING", started_at=time.time(), host_ports=handle.host_ports,
     )
+    # W2.5: the task is now genuinely serving, so it joins its service's target
+    # groups -- which re-renders the load balancer's nginx config and reloads
+    # it. Synchronous on purpose: this whole function already runs on a daemon
+    # thread, and a task must be in rotation before anything reports it healthy.
+    _register_task_targets(stores, env, cluster_name, service_name, handle.host_ports)
 
 
 def _stop_task(stores: SynthStores, env: str, task: dict, runtime: TaskRuntime) -> None:
@@ -528,6 +641,9 @@ def _stop_task(stores: SynthStores, env: str, task: dict, runtime: TaskRuntime) 
     this module already knows the outcome the moment it issues the stop, so
     the task record is removed outright rather than parked in a transitional
     state nothing will ever sweep away."""
+    # W2.5: out of the load balancer's rotation FIRST, so the proxy stops
+    # sending it traffic before the container actually dies.
+    _deregister_task_targets(stores, env, task)
     try:
         runtime.stop(env, task["task_id"], task["container_name"])
     except Exception as exc:
@@ -572,6 +688,33 @@ def _reconcile_service_tasks(
 
 def _spawn(target: Callable[..., None], *args: object) -> None:
     threading.Thread(target=target, args=args, daemon=True).start()
+
+
+def converge_services(
+    stores: SynthStores, env: str, runtime: TaskRuntime,
+    keystore: KeyStore | None = None, gateway_port: int | None = None,
+) -> None:
+    """Re-converge every ACTIVE service's REAL task containers toward
+    `desiredCount` -- the exact `_reconcile_service_tasks` pass CreateService/
+    UpdateService already spawn, driven by an APPLY (server.py's /apply-full)
+    rather than by an AWS mutation.
+
+    This is what makes "re-Apply" the honest recovery for the drift W2.2's
+    reality sweep reports. A task is NOT a terraform resource: nothing about
+    an `aws_ecs_service`'s config changes when its container is destroyed out
+    of band, so tofu's plan is empty and tofu will never fix it -- in real
+    AWS the SERVICE SCHEDULER (not terraform) replaces a lost task, and this
+    is odin's equivalent, deliberately triggered by the user's Apply instead
+    of a background timer (the module docstring's "TF's read calls drive
+    convergence, not a timer" limit stays: no new scheduler loop). Idempotent
+    -- a service already at desiredCount launches nothing."""
+    for service in _all_services(stores, env):
+        if service["status"] != "ACTIVE":
+            continue
+        _spawn(
+            _reconcile_service_tasks, stores, env, service["cluster_name"],
+            service["service_name"], runtime, keystore, gateway_port,
+        )
 
 
 # Per-(SynthStores, env, cluster, service) lock, serializing
@@ -756,6 +899,13 @@ def _create_service(
         "cluster_name": cluster_name,
         "service_name": service_name,
         "node_label": tags.get("odin:node"),
+        # W2.5: `[{targetGroupArn, containerName, containerPort}, ...]`, stored
+        # verbatim. This is what makes odin's ECS behave like real ECS's own
+        # SERVICE SCHEDULER: launching a task registers it with these target
+        # groups, stopping one deregisters it (`_task_targets` below) -- so a
+        # load balancer's upstream list tracks the real task fleet, and
+        # terraform never sees (or manages) an individual task target.
+        "load_balancers": payload.get("loadBalancers") or [],
         "task_definition_arn": _taskdef_arn(taskdef["family"], taskdef["revision"]),
         "desired_count": int(payload.get("desiredCount") or 0),
         "launch_type": payload.get("launchType") or _DEFAULT_LAUNCH_TYPE,

@@ -48,8 +48,11 @@ const fieldsForType: Record<string, FieldDef[]> = {
   sg: [
     { key: 'label', label: 'Name', editable: true },
     {
-      key: 'ingressRules', label: 'Ingress Rules (protocol:port:cidr, one per line)',
-      editable: true, multiline: true, placeholder: 'tcp:443:0.0.0.0/0',
+      // The source is a CIDR *or* another Security Group node's name -- the
+      // "only the web tier may reach me" rule, which is what actually gates
+      // mesh traffic (agent/hcl.py::_ingress_source).
+      key: 'ingressRules', label: 'Ingress Rules (protocol:port:cidr-or-SG-name, one per line)',
+      editable: true, multiline: true, placeholder: 'tcp:443:0.0.0.0/0\ntcp:5432:web-sg',
     },
     { key: 'vpc', label: 'VPC (containment)' },
     { key: 'subnet', label: 'Subnet (containment)' },

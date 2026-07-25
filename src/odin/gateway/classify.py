@@ -64,12 +64,81 @@ reasoning as ec2/iam/ecr: extraction only needs to never return None for a
 route it recognizes; an unrecognized (method, path) pair returns None
 (unmappable, closed-world deny) rather than guessing.
 
+ELASTICACHE (W2.8) SHARES SNS/IAM's QUERY-PROTOCOL WIRE and IAM/ECR's
+OPERATOR-only REASONING: `_classify_elasticache` reads the `Action` form param
+and extracts `CacheClusterId` when the request carries one, else the cluster id
+out of a tag call's `ResourceName` ARN (`arn:...:cluster:<id>` -> the last
+colon-segment, the same bare-label strip `_sns_resource` does), else `"*"`.
+The only principal driving elasticache calls in v1 is the OPERATOR (TF-authored
+clusters), so extraction only needs to never return None. NOTE the scope of
+what this classification can ever govern: ElastiCache's DATA plane is the raw
+Redis protocol, which is not SigV4-signed and never reaches this gateway at
+all, so an `elasticache:*` action is always a CONTROL-plane action -- see
+gateway/models/cachectl.py's module docstring.
+
 ECS (task V5a) SHARES ECR's JSON-target SHAPE, IAM/ECR's OPERATOR-only
 REASONING: `_classify_ecs` extracts a real id when the request carries one
 (clusterName/serviceName/family, or the last path segment of an ARN) and
 falls back to `"*"` rather than ever returning None -- the only principal
 driving ECS calls in v1 is the OPERATOR (TF-authored clusters/services), so
 this only needs to never deny it via `unmappable-action`.
+
+LOGS (task W2.1) SHARES ECR's JSON-target SHAPE but is the FIRST modeled
+service whose resource is a real WORKLOAD-FACING label again (like s3/sqs/
+sns/dynamodb, unlike the operator-only ec2/iam/ecr/lambda/ecs families): a
+`logs` canvas node's label IS its log-group name (agent/hcl.py's `_logs`
+builder emits `name = <label>`), so `_logs_resource` returning the bare group
+name is exactly what `policy.compile_policies` puts in an iam edge's
+statement -- draw `lambda -> log-group` with `logs:PutLogEvents` and the
+gateway enforces it for real, with no logs-specific code in the policy layer.
+A call that carries no group at all (a bare `DescribeLogGroups`) falls back to
+its `logGroupNamePrefix`, else `"*"` -- never None, so the OPERATOR is never
+denied via `unmappable-action` (the ec2/iam/ecr reasoning), while a workload
+principal without a matching statement still denies through ordinary
+default-deny.
+
+SECRETS MANAGER + SSM (task W2.4) ARE THE PAYOFF CASE for the LOGS reasoning
+above: both share ECR's JSON-target wire shape, and for both the resource IS
+the canvas node's label -- a `secret` node's label is its secret name
+(`agent/hcl.py`'s `_secret` emits `name = <label>`), an `ssm` node's label is
+its parameter name (`_ssm` emits the same). So `_secretsmanager_resource` /
+`_ssm_resource` returning the bare name is exactly what
+`policy.compile_policies` puts in an iam edge's statement: draw
+`lambda -> secret` with `secretsmanager:GetSecretValue` and the gateway
+enforces it for real, with no secrets-specific code in the policy layer, while
+a workload with no such edge gets an ordinary default-deny
+`AccessDeniedException`. Both accept an ARN wherever a name can appear (a
+`SecretId` is an ARN whenever terraform passes
+`aws_secretsmanager_secret.x.id`) and reduce it to the same bare label; SSM
+additionally canonicalizes the leading slash exactly as
+`gateway/models/ssmctl.py::canonical_name` does (kept in lock-step: root-level
+`/db` == `db`, hierarchical `/odin/db` keeps its slash). A call carrying no
+identifier at all (`ListSecrets`, a bare `DescribeParameters`) falls back to
+`"*"` -- never None, so the OPERATOR is never denied via `unmappable-action`.
+One bounded gap, the same one `_ecr_resource`/`_ecs_resource` already carry for
+every list-carrying call: a BATCH `GetParameters(Names=[a, b])` is authorized
+against `a` alone, so an edge to `a` (and none to `b`) would let both through.
+Recorded in ROADMAP.md; the single-name reads a workload actually makes
+(`GetParameter`, `GetSecretValue`) are exact.
+
+RDS (task W2.7) is the QUERY protocol (form-encoded `Action=`, like sns/ec2/
+iam -- not a JSON target header), and its resource is workload-facing like
+logs': an `rds` canvas node's label IS its `DBInstanceIdentifier`
+(agent/hcl.py's `_rds` builder emits `identifier = <label>`), so an
+`rds-db:connect` edge drawn to that node compiles to a statement the gateway
+enforces with no rds-specific code in the policy layer.
+
+ELBV2 (task W2.5) IS THE QUERY PROTOCOL, like sns/ec2/iam -- the operation
+rides in the `Action` form param, not an `X-Amz-Target` header (verified
+against botocore's own `elbv2` model: `protocol: query`, `endpointPrefix:
+elasticloadbalancing`, which is also the SigV4 credential-scope service name
+this module dispatches on). Its resource is the bare LOAD-BALANCER or
+TARGET-GROUP name (`_elbv2_resource`), extracted from `Name` on a create and
+from whichever ARN the call carries otherwise, falling back to `"*"` -- the
+same OPERATOR-only "never return None" reasoning ec2/iam/ecr/ecs use, and for
+the same reason: a load balancer is not an IAM data-plane target on odin's
+canvas (see `_elbv2_resource`'s own docstring), so tofu is the only principal
+that ever gets here.
 
 S3 BUCKET-CONFIG READS (S2, discovered running real tofu through the real
 gateway): the TF AWS provider's `aws_s3_bucket` refresh probes bucket-config
@@ -209,6 +278,18 @@ def classify(
         return _classify_lambda(method, path, body)
     if service == "ecs":
         return _classify_ecs(lower_headers, body)
+    if service == "logs":
+        return _classify_logs(lower_headers, body)
+    if service == "secretsmanager":
+        return _classify_secretsmanager(lower_headers, body)
+    if service == "ssm":
+        return _classify_ssm(lower_headers, body)
+    if service == "elasticache":
+        return _classify_elasticache(body)
+    if service == "rds":
+        return _classify_rds(body)
+    if service == "elasticloadbalancing":
+        return _classify_elbv2(body)
     return None
 
 
@@ -305,6 +386,20 @@ def _classify_iam(body: bytes) -> tuple[str, str] | None:
     return f"iam:{action_name}", resource
 
 
+def _classify_elasticache(body: bytes) -> tuple[str, str] | None:
+    try:
+        params = dict(parse_qsl(body.decode("utf-8"), keep_blank_values=True))
+    except UnicodeDecodeError:
+        return None
+    action_name = params.get("Action")
+    if not action_name:
+        return None
+    cluster_id = params.get("CacheClusterId")
+    resource_name = params.get("ResourceName")
+    resource = cluster_id or (resource_name.rsplit(":", 1)[-1] if resource_name else "*")
+    return f"elasticache:{action_name}", resource or "*"
+
+
 def _ecr_resource(payload: dict) -> str:
     name = payload.get("repositoryName")
     if isinstance(name, str) and name:
@@ -363,6 +458,214 @@ def _ecs_resource(op: str, payload: dict) -> str:
         tasks = payload.get("tasks")
         return _bare_id(tasks[0]) if isinstance(tasks, list) and tasks else "*"
     return "*"
+
+
+def _logs_resource(payload: dict) -> str:
+    """The bare LOG GROUP NAME -- which for a `logs` canvas node IS its label
+    (agent/hcl.py's `_logs` builder sets `name = <label>`), so an iam edge
+    drawn to that node gates every call here through the ordinary
+    `evaluate(statements, action, resource)` path with no logs-specific
+    plumbing (see the module docstring's LOGS note). `logGroupIdentifier` /
+    `resourceArn` carry an ARN instead of a name -- reduced to the same bare
+    group name, the way `_sns_resource`/`_ecr_resource` already strip theirs.
+    """
+    for key in ("logGroupName", "logGroupIdentifier", "resourceArn"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return _bare_log_group(value)
+    identifiers = payload.get("logGroupIdentifiers")
+    if isinstance(identifiers, list) and identifiers and isinstance(identifiers[0], str):
+        return _bare_log_group(identifiers[0])
+    prefix = payload.get("logGroupNamePrefix")
+    return prefix if isinstance(prefix, str) and prefix else "*"
+
+
+def _bare_log_group(value: str) -> str:
+    """`arn:aws:logs:...:log-group:/aws/lambda/f[:*]` -> `/aws/lambda/f`; a
+    value that isn't an ARN comes back unchanged. Kept in lock-step with
+    `gateway/models/logsctl.py::_group_from_arn` (same two ARN forms: real
+    CloudWatch reports the `:*` wildcard suffix, the TF provider trims it)."""
+    trimmed = value[:-2] if value.endswith(":*") else value
+    _prefix, sep, name = trimmed.partition(":log-group:")
+    return name.split(":log-stream:")[0] if sep else trimmed
+
+
+def _rds_resource(params: dict[str, str]) -> str:
+    """The bare DB-instance IDENTIFIER -- which for an `rds` canvas node IS
+    its label (agent/hcl.py's `_rds` builder emits `identifier = <label>`), so
+    an `rds-db:connect` / `rds:DescribeDBInstances` edge drawn to that node
+    gates through the ordinary `evaluate(statements, action, resource)` path
+    with no rds-specific plumbing (the same identity rule s3's bucket, sqs's
+    queue name and a log group's name already carry). The tag calls carry a
+    full ARN in `ResourceName` instead -- reduced to the same bare identifier,
+    the way `_sns_resource`/`_ecr_resource` strip theirs."""
+    identifier = params.get("DBInstanceIdentifier")
+    if identifier:
+        return identifier
+    resource_name = params.get("ResourceName", "")
+    _prefix, sep, name = resource_name.rpartition(":db:")
+    if sep and name:
+        return name
+    return "*"
+
+
+def _classify_rds(body: bytes) -> tuple[str, str] | None:
+    """RDS is the query protocol (form-encoded `Action=`), like sns/ec2/iam --
+    not a JSON target header. Never returns None for a request that carries an
+    `Action`: the fallback resource is `"*"` (the operator-only reasoning
+    ec2/iam/ecr/ecs already use), so a `tofu apply`'s bare
+    `DescribeDBInstances` is never denied as unmappable."""
+    try:
+        params = dict(parse_qsl(body.decode("utf-8"), keep_blank_values=True))
+    except UnicodeDecodeError:
+        return None
+    action_name = params.get("Action")
+    if not action_name:
+        return None
+    return f"rds:{action_name}", _rds_resource(params)
+
+
+def _classify_logs(lower_headers: dict[str, str], body: bytes) -> tuple[str, str] | None:
+    target = lower_headers.get("x-amz-target")
+    if target is None or "." not in target:
+        return None
+    op = target.rsplit(".", 1)[1]
+    try:
+        payload = json.loads(body) if body else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return f"logs:{op}", _logs_resource(payload)
+
+
+def _secretsmanager_resource(payload: dict) -> str:
+    """The bare SECRET NAME -- which for a `secret` canvas node IS its label
+    (see the module docstring's W2.4 note). `SecretId` is an ARN whenever
+    terraform passes `aws_secretsmanager_secret.x.id`, reduced here the same
+    way `gateway/models/secretsctl.py::_secret_name` reduces it (kept in
+    lock-step)."""
+    for key in ("SecretId", "Name"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            _prefix, sep, name = value.partition(":secret:")
+            return name if sep else value
+    return "*"  # ListSecrets & co. name no secret at all
+
+
+def _classify_secretsmanager(lower_headers: dict[str, str], body: bytes) -> tuple[str, str] | None:
+    target = lower_headers.get("x-amz-target")
+    if target is None or "." not in target:
+        return None
+    op = target.rsplit(".", 1)[1]
+    try:
+        payload = json.loads(body) if body else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return f"secretsmanager:{op}", _secretsmanager_resource(payload)
+
+
+def _ssm_canonical(value: str) -> str:
+    """Kept in lock-step with `gateway/models/ssmctl.py::canonical_name` --
+    AWS treats a root-level parameter's leading slash as optional, a
+    hierarchical name's as part of the name; an ARN reduces to the same form."""
+    _prefix, sep, path = value.partition(":parameter")
+    bare = (path if sep else value).lstrip("/")
+    return bare if "/" not in bare else f"/{bare}"
+
+
+def _ssm_resource(payload: dict) -> str:
+    """The canonical PARAMETER NAME -- which for an `ssm` canvas node IS its
+    label. `ResourceId` is SSM's tag-API carrier (a bare name, not an ARN);
+    `Names`/`Path` cover the batch reads."""
+    for key in ("Name", "ResourceId", "Path"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return _ssm_canonical(value)
+    names = payload.get("Names")
+    if isinstance(names, list) and names and isinstance(names[0], str):
+        return _ssm_canonical(names[0])
+    return "*"  # a bare DescribeParameters names no parameter at all
+
+
+def _classify_ssm(lower_headers: dict[str, str], body: bytes) -> tuple[str, str] | None:
+    target = lower_headers.get("x-amz-target")
+    if target is None or "." not in target:
+        return None
+    op = target.rsplit(".", 1)[1]
+    try:
+        payload = json.loads(body) if body else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return f"ssm:{op}", _ssm_resource(payload)
+
+
+def _elbv2_name(value: str) -> str:
+    """The bare NAME an elbv2 ARN carries -- kept in lock-step with
+    `gateway/models/elbv2ctl.py::name_from_arn`. A `loadbalancer/app/{name}/
+    {id}` or `listener/app/{lb}/{lbid}/{id}` ARN yields the LOAD BALANCER's
+    name (a listener isn't a canvas node of its own -- one `alb` node expands
+    to lb + target group + listener, so all three classify to the same label);
+    `targetgroup/{name}/{id}` yields the target group's. A value that isn't an
+    ARN comes back unchanged."""
+    tail = value.rsplit(":", 1)[-1]
+    parts = tail.split("/")
+    if parts[0] in ("loadbalancer", "listener") and len(parts) >= 3:
+        return parts[2]
+    if parts[0] == "targetgroup" and len(parts) >= 2:
+        return parts[1]
+    return value
+
+
+# The id-carrying params, MOST SPECIFIC FIRST: a create call carries `Name`;
+# everything else carries one of these ARNs, in singular or `.member.1` list
+# form (the provider's own reads use the LIST spellings --
+# `DescribeLoadBalancers(LoadBalancerArns=[...])` etc.). Target-group params
+# precede load-balancer ones so a target-group read filtered BY a load balancer
+# (`DescribeTargetGroups(LoadBalancerArn=...)`) still reports the group it's
+# actually about. `ResourceArns.member.1` is last: it's the ARN-only tag API,
+# which never carries a typed id at all.
+_ELBV2_ARN_PARAMS = (
+    "TargetGroupArn", "TargetGroupArns.member.1",
+    "ListenerArn", "ListenerArns.member.1",
+    "LoadBalancerArn", "LoadBalancerArns.member.1",
+    "ResourceArns.member.1",
+)
+
+
+def _elbv2_resource(params: dict[str, str]) -> str:
+    """The bare load-balancer / target-group name, in the OPERATOR-only style
+    `_classify_iam`/`_classify_ecr`/`_classify_ecs` already use: extract a real
+    value when the request carries one, `"*"` otherwise -- never None, so the
+    operator (tofu) is never denied via `unmappable-action`. An `alb` canvas
+    node's label IS its load-balancer name (`agent/hcl.py`'s `_alb` emits
+    `name = <label>`), so this value is also what an iam edge's compiled
+    statement would name -- but note the deliberate design choice in
+    `ui/src/lib/iam.ts`: `alb` is NOT an IAM target on the canvas (nothing a
+    workload "calls" on a load balancer; you send it HTTP, which no IAM policy
+    gates), so in practice only the operator ever reaches these actions."""
+    name = params.get("Name")
+    if name:
+        return name
+    for key in _ELBV2_ARN_PARAMS:
+        value = params.get(key)
+        if value:
+            return _elbv2_name(value)
+    names = params.get("Names.member.1")
+    return names if names else "*"
+
+
+def _classify_elbv2(body: bytes) -> tuple[str, str] | None:
+    """elbv2 is the query protocol like sns/ec2/iam -- the operation rides in
+    the `Action` form param, NOT an `X-Amz-Target` header (verified against
+    botocore's own `elbv2` model: `protocol: query`). Its list serialization is
+    AWS's standard `Prefix.member.N`, unlike EC2's `Prefix.N`."""
+    try:
+        params = dict(parse_qsl(body.decode("utf-8"), keep_blank_values=True))
+    except UnicodeDecodeError:
+        return None
+    action_name = params.get("Action")
+    if not action_name:
+        return None
+    return f"elasticloadbalancing:{action_name}", _elbv2_resource(params)
 
 
 def _classify_ecs(lower_headers: dict[str, str], body: bytes) -> tuple[str, str] | None:

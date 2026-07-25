@@ -3,10 +3,15 @@
 Two modes (research-verified, docs/superpowers/research/research-tofu-provider.md
 §5 "Import direction"):
 
-(a) **deterministic** (`parse_hcl*`): parse an existing project's HCL for the
-    5 supported resource types (aws_s3_bucket, aws_sqs_queue, aws_sns_topic,
-    aws_sns_topic_subscription, aws_dynamodb_table) into canvas nodes+edges.
-    Unsupported types are LISTED, never dropped (northstar directive 5).
+(a) **deterministic** (`parse_hcl*`): parse an existing project's HCL for every
+    supported resource type (`_KIND` below, plus the two COMPANION types that
+    fold into a node rather than becoming one: aws_sns_topic_subscription ->
+    an edge, aws_secretsmanager_secret_version -> its secret node's value)
+    into canvas nodes+edges. Unsupported types are LISTED, never dropped
+    (northstar directive 5). W2.5 adds two more companions of the same shape:
+    aws_lb_target_group + aws_lb_listener fold onto their aws_lb's `alb` node
+    (one canvas node, three tf resources -- the inverse of hcl.py's own alb
+    expansion, so generate -> import -> generate round-trips).
 
 (b) **live-state import** (`import_live`): resources already exist in the
     env's backings (created out-of-band, or by a prior tofu apply) but were
@@ -46,16 +51,46 @@ _KIND = {
     "aws_sns_topic": "sns",
     "aws_dynamodb_table": "dynamodb",
     "aws_iam_role": "iam_role",
+    "aws_cloudwatch_log_group": "logs",
+    "aws_secretsmanager_secret": "secret",
+    "aws_ssm_parameter": "ssm",
+    "aws_elasticache_cluster": "elasticache",
+    "aws_db_instance": "rds",
+    "aws_lb": "alb",
 }
+# W2.5: the two OTHER types an `alb` canvas node expands to. Neither becomes a
+# node of its own -- they fold ONTO the alb node the same way
+# aws_secretsmanager_secret_version folds onto its secret, which is what makes
+# generate -> import -> generate round-trip instead of multiplying resources.
+_ALB_COMPANION_TYPES = ("aws_lb_target_group", "aws_lb_listener")
 # The attribute each supported type's human-facing name lives in (mirrors
-# hcl.py's builders: s3 uses `bucket`, everything else uses `name`).
+# hcl.py's builders: s3 uses `bucket`, elasticache uses `cluster_id`, rds uses
+# `identifier`, everything else uses `name`).
 _NAME_ATTR = {
     "aws_s3_bucket": "bucket", "aws_sqs_queue": "name", "aws_sns_topic": "name",
     "aws_dynamodb_table": "name", "aws_iam_role": "name",
+    "aws_cloudwatch_log_group": "name",
+    "aws_secretsmanager_secret": "name", "aws_ssm_parameter": "name",
+    "aws_elasticache_cluster": "cluster_id",
+    "aws_db_instance": "identifier",
+    "aws_lb": "name",
 }
-# canvas kind -> aws_* type, for mode (b) (the inverse of `_KIND`). iam_role has
-# no backing to live-import against, so it stays out of the live path.
-_TF_TYPE = {kind: rtype for rtype, kind in _KIND.items() if kind != "iam_role"}
+# canvas kind -> aws_* type, for mode (b) (the inverse of `_KIND`). iam_role,
+# logs, secret and ssm have no backing to enumerate live resources from (all
+# four are pure gateway models), so they stay out of the live path --
+# elasticache likewise: its clusters exist only as gateway-model records plus a
+# real container, and there's no `_import_id` shape to resolve one from outside
+# a canvas Apply (mode (a), reading an existing HCL project, works fine).
+# `rds` DOES stay in it: an `aws_db_instance`'s import id is its bare
+# DBInstanceIdentifier (the `_import_id` default branch) and the gateway answers
+# DescribeDBInstances for real -- the one thing `tofu plan
+# -generate-config-out` cannot recover is the master `password` (no AWS API ever
+# returns it), so a live-imported database comes back with hcl.py's default
+# password rather than the original one. `alb` (W2.5) stays out of the live path
+# too -- one canvas node is three aws_* resources, so there is no single live
+# resource to import it from (mode (a), reading an existing HCL project, works).
+_NO_LIVE_IMPORT = {"iam_role", "logs", "secret", "ssm", "elasticache", "alb"}
+_TF_TYPE = {kind: rtype for rtype, kind in _KIND.items() if kind not in _NO_LIVE_IMPORT}
 
 # The HCL arguments each kind CARRIES into the canvas -- so a round-trip through
 # generate_tf reproduces them (finding #6). Any OTHER argument present on the
@@ -68,7 +103,36 @@ _CARRIED_ATTRS = {
     "sns": {"name"},
     "dynamodb": {"name", "hash_key", "range_key", "attribute"},
     "iam_role": {"name"},  # assume_role_policy/inline policies are NOT carried -> warned
+    "logs": {"name", "retention_in_days", "tags"},
+    # W2.4: `recovery_window_in_days` is carried in the sense that odin always
+    # emits its own value (0 -- see hcl.py's `_secret`), so a differing imported
+    # one is deliberately NOT surfaced as a dropped attribute the user must act
+    # on. The VALUE isn't here at all: it lives on the companion
+    # aws_secretsmanager_secret_version resource, assembled separately below.
+    "secret": {"name", "description", "recovery_window_in_days", "tags"},
+    "ssm": {"name", "type", "value", "description", "tags"},
+    # engine/num_cache_nodes are carried because hcl.py always re-emits them
+    # (redis, 1) -- so a round-trip reproduces the resource without warning
+    # about arguments odin does model, just doesn't need on the node.
+    "elasticache": {"cluster_id", "engine", "node_type", "num_cache_nodes", "tags"},
+    # `password` IS carried (unlike every other secret odin touches): dropping
+    # it would make a round-trip through generate_tf silently substitute the
+    # DEFAULT password, i.e. a real credential change on the next apply.
+    "rds": {
+        "identifier", "engine", "instance_class", "allocated_storage", "db_name",
+        "username", "password", "skip_final_snapshot", "tags",
+    },
+    # W2.5: `internal`/`load_balancer_type` are values odin always emits itself
+    # (hcl.py's `_alb`: internal, application), so a differing imported one is
+    # deliberately not surfaced as a dropped attribute. `subnets` is CONTAINMENT
+    # on the canvas (the node is drawn inside the subnet box), not node data --
+    # so an import can't reconstruct it and says so via a warning instead.
+    "alb": {"name", "internal", "load_balancer_type", "tags"},
 }
+# The kinds whose user `tags` map survives the round trip as node data (hcl.py's
+# `_tags_block` merges a node's own `tags` field back in for EVERY primary
+# builder, so this is purely about which imports bother to read them).
+_TAGGED_KINDS = {"s3", "logs", "secret", "ssm", "rds", "alb"}
 
 
 class Unsupported(BaseModel):
@@ -154,6 +218,38 @@ def _tags(attrs: dict) -> dict[str, str]:
     return out
 
 
+def _int_attr(value: object, default: int) -> int:
+    """python-hcl2 parses an unquoted `port = 80` as a real int and a quoted
+    `"80"` as a 4-character string (verified empirically -- see `unquote`), so
+    both spellings have to reduce to the same number."""
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    unquoted = hcl.unquote(value)
+    return int(unquoted) if isinstance(unquoted, str) and unquoted.isdigit() else default
+
+
+def _forward_target_group(listener_attrs: dict) -> str | None:
+    """`aws_lb_target_group.<name>` from a listener's `default_action {}` block
+    (python-hcl2 parses a repeated block into a list of dicts). v1 reads the
+    FIRST action carrying a `target_group_arn` -- the only shape hcl.py emits
+    and the only one elbv2ctl models."""
+    for block in listener_attrs.get("default_action") or []:
+        target = _ref_target(block.get("target_group_arn"))
+        if target:
+            return f"aws_lb_target_group.{target}"
+    return None
+
+
+def _health_check_path(tg_attrs: dict) -> str:
+    for block in tg_attrs.get("health_check") or []:
+        path = hcl.unquote(block.get("path"))
+        if isinstance(path, str) and path:
+            return path
+    return "/"
+
+
 def _dropped_attrs(kind: str, attrs: dict) -> list[str]:
     carried = _CARRIED_ATTRS.get(kind, set())
     return sorted(k for k in attrs if k not in carried and k not in _IGNORED_ATTRS)
@@ -172,10 +268,43 @@ def _node_data(kind: str, label: str, attrs: dict) -> dict:
             data["rangeKey"] = range_key
             if range_key in types:
                 data["rangeKeyType"] = types[range_key]
-    if kind == "s3":
+    if kind == "logs":
+        # python-hcl2 parses an unquoted `retention_in_days = 14` as a real int
+        # (verified empirically) -- the canvas field is text, so stringify it.
+        retention = attrs.get("retention_in_days")
+        if isinstance(retention, int):
+            data["retentionInDays"] = str(retention)
+    if kind == "ssm":
+        # W2.4: the parameter's VALUE comes across as canvas data -- the same
+        # trust model as any other import (SECURITY.md: treat an imported .tf
+        # like a shell script), and it's the only way a round trip through
+        # `generate_tf` can reproduce the parameter at all.
+        for attr, field in (("type", "paramType"), ("value", "paramValue")):
+            value = hcl.unquote(attrs.get(attr))
+            if isinstance(value, str):
+                data[field] = value
+    if kind in ("secret", "ssm"):
+        description = hcl.unquote(attrs.get("description"))
+        if isinstance(description, str):
+            data["description"] = description
+    if kind == "rds":
+        # python-hcl2 parses an unquoted `allocated_storage = 20` as a real int
+        # (the same thing logs' retention does); the canvas fields are text.
+        storage = attrs.get("allocated_storage")
+        data["allocatedStorage"] = str(storage) if isinstance(storage, int) else "20"
+        for attr, field in (("engine", "engine"), ("instance_class", "instanceClass"),
+                            ("db_name", "dbName"), ("username", "username"), ("password", "password")):
+            value = hcl.unquote(attrs.get(attr))
+            if isinstance(value, str):
+                data[field] = value
+    if kind in _TAGGED_KINDS:
         tags = _tags(attrs)
         if tags:
             data["tags"] = tags
+    if kind == "elasticache":
+        node_type = hcl.unquote(attrs.get("node_type"))
+        if isinstance(node_type, str):
+            data["nodeType"] = node_type
     return data
 
 
@@ -194,11 +323,20 @@ def parse_hcl(files: dict[str, str]) -> ImportResult:
     unsupported: list[Unsupported] = []
     warnings: list[str] = []
     subscriptions: list[tuple[str, dict]] = []
+    secret_versions: list[tuple[str, dict]] = []
+    alb_companions: list[tuple[str, str, dict]] = []
+    node_by_label: dict[str, dict] = {}
     index = 0
 
     for rtype, rname, attrs in triples:
         if rtype == "aws_sns_topic_subscription":
             subscriptions.append((rname, attrs))
+            continue
+        if rtype == "aws_secretsmanager_secret_version":
+            secret_versions.append((rname, attrs))
+            continue
+        if rtype in _ALB_COMPANION_TYPES:
+            alb_companions.append((rtype, rname, attrs))
             continue
         kind = _KIND.get(rtype)
         if kind is None:
@@ -206,15 +344,76 @@ def parse_hcl(files: dict[str, str]) -> ImportResult:
             continue
         label = _label(rtype, rname, attrs)
         by_hcl_name[f"{rtype}.{rname}"] = label
-        nodes.append({
+        node = {
             "id": label, "type": kind,
             "position": {"x": index * _GRID_STEP, "y": 0},
             "data": _node_data(kind, label, attrs),
-        })
+        }
+        nodes.append(node)
+        node_by_label[label] = node
         dropped = _dropped_attrs(kind, attrs)
         if dropped:
             warnings.append(f"{label} ({kind}): imported without unmodeled attribute(s): {', '.join(dropped)}")
         index += 1
+
+    # W2.4: a companion `aws_secretsmanager_secret_version` carries the VALUE,
+    # which on the canvas is a field of the secret node itself -- so it's
+    # assembled ONTO that node rather than imported as a node of its own (the
+    # exact inverse of hcl.py's own companion pass, so generate -> import ->
+    # generate round-trips). Mirrors the subscription pass below: an
+    # unresolvable reference is reported, never silently dropped.
+    for rname, attrs in secret_versions:
+        target = _ref_target(attrs.get("secret_id"))
+        label = by_hcl_name.get(f"aws_secretsmanager_secret.{target}") if target else None
+        node = node_by_label.get(label) if label else None
+        value = hcl.unquote(attrs.get("secret_string"))
+        # Only a plain literal is a real value; a computed one ("${...}", e.g.
+        # `secret_string = jsonencode(...)` or a var reference) can't be carried.
+        if node is not None and isinstance(value, str) and "${" not in value:
+            node["data"]["secretString"] = value
+            continue
+        unsupported.append(Unsupported(
+            type="aws_secretsmanager_secret_version", name=rname,
+            reason="secret value not carried -- it references a secret outside the supported set, or isn't a literal",
+        ))
+
+    # W2.5: fold the alb's two companion resources onto its node. A LISTENER
+    # names its load balancer directly (`load_balancer_arn`) and, through its
+    # forward action's `target_group_arn`, the target group -- so the listener
+    # is what ties the trio together and is walked first. A target group with no
+    # listener pointing at it can't be attributed to any load balancer, so it's
+    # reported rather than guessed at (the subscription pass's rule).
+    target_groups = {f"aws_lb_target_group.{rname}": attrs for rtype, rname, attrs in alb_companions if rtype == "aws_lb_target_group"}
+    claimed_target_groups: set[str] = set()
+    for rtype, rname, attrs in alb_companions:
+        if rtype != "aws_lb_listener":
+            continue
+        alb_target = _ref_target(attrs.get("load_balancer_arn"))
+        node = node_by_label.get(by_hcl_name.get(f"aws_lb.{alb_target}", "")) if alb_target else None
+        if node is None:
+            unsupported.append(Unsupported(
+                type=rtype, name=rname,
+                reason="listener references a load balancer outside the supported set",
+            ))
+            continue
+        node["data"]["listenerPort"] = str(_int_attr(attrs.get("port"), 80))
+        tg_key = _forward_target_group(attrs)
+        tg_attrs = target_groups.get(tg_key) if tg_key else None
+        if tg_attrs is None:
+            unsupported.append(Unsupported(
+                type=rtype, name=rname,
+                reason="listener's forward action names no importable target group -- port/health check not carried",
+            ))
+            continue
+        claimed_target_groups.add(tg_key)
+        node["data"]["port"] = str(_int_attr(tg_attrs.get("port"), 80))
+        node["data"]["healthCheckPath"] = _health_check_path(tg_attrs)
+    for rtype, rname, attrs in alb_companions:
+        if rtype == "aws_lb_target_group" and f"aws_lb_target_group.{rname}" not in claimed_target_groups:
+            unsupported.append(Unsupported(
+                type=rtype, name=rname,
+                reason="target group is not the forward target of any imported listener -- not folded onto a load balancer",
+            ))
 
     edges: list[dict] = []
     for rname, attrs in subscriptions:

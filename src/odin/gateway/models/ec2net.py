@@ -83,6 +83,7 @@ from xml.sax.saxutils import escape
 from starlette.responses import Response
 
 from odin.aws.backings import ACCOUNT, REGION
+from odin.fabric.models import FirewallRules
 from odin.fabric.nebula import ensure_network, sg_rules_to_firewall
 from odin.gateway import errors
 from odin.gateway.stores import SynthStores
@@ -563,6 +564,22 @@ def _compiled_firewall(sg: dict) -> dict:
     group and `mesh_state` reads it without importing gateway code."""
     ingress = [r for r in sg["rules"].values() if not r["is_egress"]]
     return sg_rules_to_firewall(aggregate_permissions(ingress)).model_dump()
+
+
+def compiled_firewall(stores: SynthStores, env: str, group_id: str) -> FirewallRules | None:
+    """One security group's ALREADY-compiled Nebula firewall, read back off the
+    SG record (`_compiled_firewall` above recomputes it on every rule
+    mutation). None when the group doesn't exist yet or carries no compiled
+    firewall.
+
+    Public because TWO gateway models gate real substrates with it -- an EC2
+    instance's VM (`ec2compute.py::_instance_firewall`) and an RDS instance's
+    Postgres container (`rdsctl.py::_db_firewall`) -- and both must read the
+    SAME bytes, so a database and a VM in one group get byte-identical rules.
+    It lives here, with the store that owns the record, rather than being
+    reached into from either model."""
+    sg = stores.ec2net.get(env, _key("sg", group_id))
+    return FirewallRules.model_validate(sg["firewall"]) if sg and sg.get("firewall") else None
 
 
 def _new_sg(stores: SynthStores, env: str, vpc_id: str, name: str, description: str, is_default: bool) -> dict:

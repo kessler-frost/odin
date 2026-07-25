@@ -60,7 +60,19 @@ from starlette.responses import Response
 from odin.aws.backings import ACCOUNT, REGION
 from odin.gateway import errors
 from odin.gateway.keys import KeyStore, Principal
-from odin.gateway.models import ec2compute, ecr, ecsctl, iamctl, lambdactl
+from odin.gateway.models import (
+    cachectl,
+    ec2compute,
+    ecr,
+    ecsctl,
+    elbv2ctl,
+    iamctl,
+    lambdactl,
+    logsctl,
+    rdsctl,
+    secretsctl,
+    ssmctl,
+)
 from odin.gateway.stores import SynthStores
 
 _SNS_NS = "http://sns.amazonaws.com/doc/2010-03-31/"
@@ -346,6 +358,7 @@ def pure_answer(
     action: str, resource: str, env: str, body: bytes, stores: SynthStores, now: float,
     backing_port: int | None = None, query: dict[str, str] | None = None,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
+    rds=None,
 ) -> Response | None:
     """A direct synth answer for a PURE/CONDITIONAL action, or None if
     `action` isn't synth-owned for this call -- the caller (app.py) forwards
@@ -367,13 +380,46 @@ def pure_answer(
     all-synth the same way, with its own REAL Colima-container substrate
     (`compute/tasks.py::TaskRuntime`, defaulted inside ecsctl.py itself --
     it needs no live fact threaded through here, unlike ecr's backing_port).
+    `elasticache:*` (W2.8) is all-synth the same way, with its own REAL
+    per-cluster `redis:7-alpine` container substrate (`aws/cache.py::
+    RedisCache`, defaulted inside cachectl.py itself -- it needs no live fact
+    threaded through here, unlike ecr's backing_port, and no workload identity
+    either: Redis is not SigV4-signed, so a cache never calls the gateway).
     `keystore`/`gateway_port` (fix-wave 2b finding #2) are threaded to the
     THREE substrate-launching models only (ec2/ecs/lambda -- iam/ecr never
     launch a workload runtime of their own): each resolves the launching
     resource's own `odin:node` tag and calls `gateway.keys.workload_env` to
     inject the workload's keystore identity into the real container/VM it's
     booting. Both are None in every test that doesn't care (app.py's
-    production caller always supplies both)."""
+    production caller always supplies both).
+    `logs:*` (task W2.1) is all-synth too, and the ONE modeled family whose
+    substrate is odin's own JSON sidecar rather than a container: the
+    CloudWatch Logs control plane (`aws_cloudwatch_log_group`) plus its data
+    plane (Put/Get/FilterLogEvents, DescribeLogStreams, CreateLogStream) --
+    the SINK the Lambda/ECS substrates ship their real container output into,
+    so `odin logs` reads one place regardless of kind (gateway/models/
+    logsctl.py).
+    `secretsmanager:*` and `ssm:*` (task W2.4) are all-synth on the same
+    JSON-sidecar substrate: the Secrets Manager control+value plane
+    (gateway/models/secretsctl.py) and the SSM Parameter Store
+    (gateway/models/ssmctl.py). These two are the only models whose store
+    holds user SECRETS in cleartext (0600, no KMS -- each module's own
+    docstring records the limit), and a value only ever leaves through a
+    GetSecretValue/GetParameter that evaluate() already allowed -- which,
+    since both classify to the canvas node's label, means an IAM EDGE is what
+    grants it.
+    `rds:*` (task W2.7) is all-synth as well, with a REAL Postgres container
+    per instance as its substrate (`aws/rds.py::PostgresRds`) -- `rds` is the
+    injectable seam for it, threaded from app.py's `create_app(rds=...)` the
+    way `keystore`/`gateway_port` are, and None in production (the model then
+    builds a per-ENV substrate from the request's own env -- see
+    rdsctl.py::_substrate).
+    `elasticloadbalancing:*` (task W2.5) is all-synth too, and the ONE modeled
+    family whose substrate is a REVERSE PROXY: an nginx container per load
+    balancer (`compute/proxy.py`), whose upstreams are the target group's
+    actually-registered targets. Like ecs's TaskRuntime it needs no live fact
+    threaded through here -- `gateway/models/elbv2ctl.py` defaults its own
+    `LoadBalancerProxy`."""
     if action.startswith("ec2:"):
         return ec2compute.pure_answer(action, resource, env, body, stores, now, keystore=keystore, gateway_port=gateway_port)
     if action.startswith("iam:"):
@@ -384,6 +430,18 @@ def pure_answer(
         return lambdactl.pure_answer(action, resource, env, body, stores, now, query=query, keystore=keystore, gateway_port=gateway_port)
     if action.startswith("ecs:"):
         return ecsctl.pure_answer(action, resource, env, body, stores, now, keystore=keystore, gateway_port=gateway_port)
+    if action.startswith("logs:"):
+        return logsctl.pure_answer(action, resource, env, body, stores, now)
+    if action.startswith("secretsmanager:"):
+        return secretsctl.pure_answer(action, resource, env, body, stores, now)
+    if action.startswith("ssm:"):
+        return ssmctl.pure_answer(action, resource, env, body, stores, now)
+    if action.startswith("elasticache:"):
+        return cachectl.pure_answer(action, resource, env, body, stores, now)
+    if action.startswith("rds:"):
+        return rdsctl.pure_answer(action, resource, env, body, stores, now, rds=rds)
+    if action.startswith("elasticloadbalancing:"):
+        return elbv2ctl.pure_answer(action, resource, env, body, stores, now)
     handler = _PURE_HANDLERS.get(action)
     return handler(resource, env, body, stores, now) if handler else None
 

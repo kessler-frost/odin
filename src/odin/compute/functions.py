@@ -169,6 +169,14 @@ class FunctionRuntime:
     def status(self, env: str, function_name: str) -> str:
         return self._rt.status(container_name(env, function_name))
 
+    def logs(self, env: str, function_name: str, tail: int = 20) -> str:
+        """The RIE container's own log tail -- the function's stdout/stderr,
+        which is what `gateway/models/lambdactl.py` ships into
+        `/aws/lambda/{name}` after every Invoke. Never raises: the driver's
+        `logs` is a `check=False` CLI call, so a container that's gone
+        answers with "" (`_ContainerRuntime.logs`'s contract)."""
+        return self._rt.logs(container_name(env, function_name), tail)
+
 
 def _tcp_open(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:

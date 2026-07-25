@@ -1,9 +1,10 @@
 """odin FastAPI app factory.
 
 The canvas authors a desired-state Stack; a continuous Reconciler drives reality
-(real Postgres for rds nodes, and per-env backing containers for the
-AWS-shaped resources, both via Colima); the World projects back to the canvas
-over WebSocket.
+(per-env backing containers for the AWS-shaped resources, via Colima) and
+projects what `tofu apply` created through the gateway (every TF-owned kind,
+`rds` among them since W2.7); the World projects back to the canvas over
+WebSocket.
 """
 from __future__ import annotations
 
@@ -11,7 +12,6 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
-from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
@@ -25,45 +25,34 @@ from odin.agent import import_tf as import_tf_mod
 from odin.agent import translate as translate_mod
 from odin.agent.hcl import TfProject, generate_tf, resource_set
 from odin.api.canvas import CanvasGraph, create_canvas_router
+from odin.api.debug import create_debug_router
 from odin.api.logs import create_logs_router
 from odin.api.ws import ConnectionManager
 from odin.aws.backings import BackingAws
-from odin.aws.rds import PostgresRds
+from odin.compute.tasks import TaskRuntime
 from odin.fabric.localhost import LocalhostFabric
 from odin.fabric.nebula import mesh_state
+from odin.fabric.sidecar import MeshSidecar
 from odin.gateway import DEFAULT_GATEWAY_PORT, GATEWAY_PORT_ENV
 from odin.gateway.app import GatewayState, create_gateway_app, serve_in_thread, stop_in_thread
 from odin.gateway.keys import OPERATOR_NODE_ID, KeyStore, Principal
-from odin.gateway.models import ec2compute
+from odin.gateway.models import ec2compute, ecsctl, lambdactl, rdsctl
 from odin.gateway.stores import SynthStores
 from odin.reconcile import admission
+from odin.reconcile.drift import DriftSweeper
 from odin.reconcile.reconciler import Reconciler
 from odin.runtime.colima import ColimaRuntime
 from odin.simulate.runner import SimulateBusy, TfRunner, TofuNotInstalled
 from odin.spec.models import Stack
 from odin.spec.store import SpecStore
 from odin.spec.translate import canvas_to_stack, skipped_node_types
+from odin.util import odin_version
 
 ODIN_DIR = Path(".odin")
 CANVAS_PATH = ODIN_DIR / "canvas.json"
 ENV = "default"
 
 log = logging.getLogger("odin")
-
-# Single source of truth for the running version: the installed package's own
-# metadata (kept in lockstep with pyproject.toml's `version` by the build).
-# The literal fallback only fires for an editable/unpackaged checkout where
-# `importlib.metadata` has nothing to look up -- it still needs to say
-# SOMETHING plausible rather than raise out of app startup.
-_FALLBACK_VERSION = "0.4.0"
-
-
-def _odin_version() -> str:
-    try:
-        return _pkg_version("odin")
-    except PackageNotFoundError:
-        return _FALLBACK_VERSION
-
 
 # Security finding #1c: CSRF defense-in-depth. odin has no authentication
 # of its own (see __main__.py's loopback-default fix) -- a browser tab open
@@ -304,7 +293,7 @@ _SUPERSEDED = {"error": "superseded by a newer teardown/apply"}
 
 def create_apply_full_router(
     store: SpecStore, reconciler_for, runner: TfRunner, keystore: KeyStore, gateway_port, env_epoch: dict[str, int],
-    translate_cache: translate_mod.TranslateCache, runtime,
+    translate_cache: translate_mod.TranslateCache, runtime, stores: SynthStores,
 ) -> APIRouter:
     """S5 -- the UI's single Apply button: /apply's exact canvas->Stack->tick
     semantics, then translate (S3b) and, when the canvas has TF-supported
@@ -460,6 +449,41 @@ def create_apply_full_router(
                 body["note"] = "desired state not committed; fix and re-apply"
             else:
                 body["rev"] = store.apply(stack)  # the desired state goes live before any tick can run
+        # W2.2: an Apply is also the recovery for drift the reality sweep
+        # reported. An ECS task is not a TF resource -- nothing in an
+        # `aws_ecs_service`'s config changes when its container is destroyed
+        # out of band, so tofu's plan is empty and tofu will never fix it (in
+        # real AWS the service SCHEDULER, not terraform, replaces a lost
+        # task). This is odin's equivalent, triggered by the user's Apply
+        # rather than a background timer, and idempotent: a service already at
+        # desiredCount launches nothing.
+        # A bare `TaskRuntime()` (not this app's `runtime`) deliberately: it
+        # must be the SAME substrate that launched these containers, and
+        # ecsctl's own `runtime or TaskRuntime()` default is what did.
+        ecsctl.converge_services(stores, env, TaskRuntime(), keystore, gateway_port())
+        # The same recovery for lambda, and for the same reason: a function's
+        # RIE container is its EXECUTION ENVIRONMENT, not a TF resource -- an
+        # `aws_lambda_function`'s config doesn't change when its container is
+        # destroyed out of band (and the provider has no state attribute to
+        # diff on), so tofu's plan is empty forever. Real Lambda's own control
+        # plane replaces a dead sandbox; this is odin's equivalent. Idempotent:
+        # only a `Failed` function is re-`ensure`d, an Active one is untouched.
+        lambdactl.converge_functions(stores, env, keystore=keystore, gateway_port=gateway_port())
+        # W2.7: and the same recovery for rds. A Postgres container is odin's
+        # execution substrate for a resource whose terraform config is
+        # unchanged (`status` is read-only Computed in the provider's schema),
+        # so tofu's plan is empty and only this can bring a killed database
+        # back. Idempotent: an `available` instance is untouched, a `failed`
+        # one is re-created and re-`pg_ready`-gated. This is what makes the
+        # scenario-2 crash/recover behavior survive the move off the
+        # reconciler -- see reconcile/drift.py's rds notes.
+        rdsctl.converge_db_instances(stores, env)
+        # W2.6: and push each live database's SG-compiled firewall into its mesh
+        # sidecar. An apply is exactly the right cadence -- security groups are
+        # TF-owned, so an edited `db-sg` only reaches the gateway here, and
+        # nebula reads its firewall at startup. Also heals a sidecar that was
+        # killed under a still-running database. See rdsctl.ensure_db_mesh.
+        rdsctl.ensure_db_mesh(stores, env)
         await reconciler.tick()  # kick an immediate pass; the loop continues it
         return JSONResponse(status_code=200, content=body)
 
@@ -532,15 +556,36 @@ def create_app(
     translate_cache = translate_mod.TranslateCache()
 
     # One reconciler per environment, created lazily. Each gets its own
-    # env-scoped rds runner + backing containers, so AWS state stays isolated.
+    # env-scoped backing containers, so AWS state stays isolated. (The rds
+    # substrate is no longer one of them -- W2.7 moved it to the gateway, whose
+    # own model builds one per env; see the `rds=` argument to
+    # create_gateway_app below.)
     reconcilers: dict[str, Reconciler] = {}
 
     def _make_reconciler(env: str) -> Reconciler:
-        env_rds = rds or PostgresRds(_runtime, env)
-        env_aws = aws or (BackingAws(_runtime, env, gateway_port=gateway_port_actual) if backings else None)
+        # W2.6: the env's backing containers join its Nebula overlay through a
+        # sidecar (`fabric/sidecar.py`). The sidecar's root is the STORE root,
+        # since that's where the env's Nebula CA/overlay actually live
+        # (`ensure_network(stores.root, ...)` in the gateway's VPC model) --
+        # injected rather than defaulted so `BackingAws._root` keeps its own
+        # meaning (the goaws config mount, deliberately CWD-relative)
+        # untouched. The rds substrate joins the SAME mesh, but it isn't built
+        # here any more (W2.7): `rdsctl` builds it per request off
+        # `stores.root`, which is that same directory.
+        env_aws = aws or (BackingAws(
+            _runtime, env, gateway_port=gateway_port_actual,
+            mesh=MeshSidecar(_runtime, env, _store.root),
+        ) if backings else None)
         return Reconciler(
-            _store, _runtime, env_rds, aws=env_aws, gateway=gateway_state, fabric=LocalhostFabric(),
+            _store, _runtime, aws=env_aws, gateway=gateway_state, fabric=LocalhostFabric(),
             ws=ws_manager, env=env, poll_interval=1.0, stores=gateway_stores,
+            # W2.2's reality sweep shells out to the REAL `limactl`/`docker`,
+            # so it's gated on the same `backings` flag every other real-
+            # runtime dependency is: an app built with `backings=False` is
+            # explicitly the fake-substrate one (every non-integration test),
+            # and its hand-seeded synth records must not be measured against
+            # this machine's actual VMs/containers.
+            drift=DriftSweeper() if backings else None,
         )
 
     async def reconciler_for(env: str) -> Reconciler:
@@ -562,6 +607,12 @@ def create_app(
     gateway_app = create_gateway_app(
         gateway_state, gateway_keystore, gateway_stores, on_deny,
         gateway_port=lambda: gateway_port_actual,
+        # W2.7: `rds` used to be the RECONCILER's Postgres provisioner; it's
+        # now the gateway's RDS-model substrate, because `aws_db_instance` is
+        # what creates a database today. A caller's stand-in (every api test)
+        # lands here; None (production) lets rdsctl build a per-env real
+        # `PostgresRds` from the request's own env.
+        rds=rds,
     )
     gateway_server = None
     gateway_thread = None
@@ -585,7 +636,7 @@ def create_app(
                 await reconciler.stop()
             stop_in_thread(gateway_server, gateway_thread)
 
-    app = FastAPI(title="odin", version=_odin_version(), lifespan=lifespan)
+    app = FastAPI(title="odin", version=odin_version(), lifespan=lifespan)
     app.middleware("http")(_csrf_guard)
     app.include_router(create_canvas_router(CANVAS_PATH))
     app.include_router(
@@ -597,10 +648,13 @@ def create_app(
     app.include_router(
         create_apply_full_router(
             _store, reconciler_for, tf_runner, gateway_keystore, lambda: gateway_port_actual, env_epoch,
-            translate_cache, _runtime,
+            translate_cache, _runtime, gateway_stores,
         )
     )
     app.include_router(create_logs_router(_store, gateway_stores, _runtime))
+    # W2.9/M8: "what's wrong here?" -- reads the same store/stores/runtime the
+    # logs route does, plus the ws_manager's durable per-env event log.
+    app.include_router(create_debug_router(_store, gateway_stores, _runtime, ws_manager))
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):

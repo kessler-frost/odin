@@ -3,6 +3,7 @@ from __future__ import annotations
 import yaml
 
 from odin.compute.models import VmConfig
+from odin.fabric.nebula import NEBULA_PORT
 
 UBUNTU_IMAGES = [
     {
@@ -45,6 +46,23 @@ def generate_lima_yaml(
         # templates/default.yaml.
         doc["vmType"] = "vz"
         doc["networks"] = [{"vzNAT": True}]
+
+    # W2.6 -- a REAL finding, found live: Lima automatically forwards every
+    # port a guest listens on to the HOST's 127.0.0.1, and that includes the
+    # `nebula` daemon's own UDP 4242 inside an EC2 VM. `limactl` then HOLDS
+    # 127.0.0.1:4242 on the host (confirmed with lsof: `limactl ... UDP
+    # 127.0.0.1:4242` right next to the host lighthouse's own `[::]:4242`),
+    # which silently steals the exact address a CONTAINER reaches the
+    # lighthouse at: Colima's user-mode network maps `host.docker.internal`
+    # (192.168.5.2) onto the host's loopback, so every backing sidecar's
+    # handshake packet was being forwarded INTO a VM instead of to the
+    # lighthouse -- backing↔VM mesh traffic could never work while an EC2 VM
+    # existed, even though VM↔VM (which rides the vzNAT address, not
+    # loopback) was fine. Forwarding a mesh data-plane port to the host was
+    # never wanted in the first place, so it is ignored explicitly.
+    doc["portForwards"] = [
+        {"guestPort": NEBULA_PORT, "proto": proto, "ignore": True} for proto in ("udp", "tcp")
+    ]
 
     provision = []
     if cloud_init_script:

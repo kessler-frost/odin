@@ -1,5 +1,6 @@
 """w1 observability -- GET /logs: resolve a canvas node label to its real
-backing container(s)/VM and return their logs. `fetch_logs` is tested
+backing container(s)/VM and return their logs, or (W2.1) read one CloudWatch
+log GROUP out of odin's own sink. `fetch_logs`/`fetch_group_logs` are tested
 directly (fast, precise per-kind resolution); a couple of TestClient smoke
 tests lock the route's wiring end to end.
 """
@@ -7,7 +8,8 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-from odin.api.logs import NO_BACKING_KINDS, fetch_logs
+from odin.api.logs import NO_BACKING_KINDS, fetch_group_logs, fetch_logs
+from odin.gateway.models import logsctl
 from odin.gateway.stores import SynthStores
 from odin.server import create_app
 from odin.spec.models import ResourceDesired, Stack
@@ -162,6 +164,60 @@ def test_lambda_resolves_by_function_name_and_reads_rie_container(tmp_path, monk
     assert result.lines == "RIE listening"
 
 
+# --- elasticache: the cluster's own redis container (W2.8) -------------------
+
+
+def _cache_record(cluster_id: str, status: str = "available") -> dict:
+    return {
+        "cache_cluster_id": cluster_id, "status": status,
+        "arn": f"arn:aws:elasticache:us-east-1:000000000000:cluster:{cluster_id}",
+    }
+
+
+def test_elasticache_reads_its_redis_container_logs(tmp_path, monkeypatch):
+    store = _store(tmp_path, (ResourceDesired(id="cache", kind="elasticache"),))
+    stores = SynthStores(tmp_path)
+    stores.cachectl.set(ENV, "cluster:cache", _cache_record("cache"))
+
+    class FakeColima:
+        def status(self, name):
+            return "running"
+
+        def logs(self, name, tail=20):
+            return "Ready to accept connections tcp"
+
+    monkeypatch.setattr("odin.api.logs.ColimaRuntime", FakeColima)
+    result = fetch_logs(store, stores, FakeRuntime(), ENV, "cache")
+
+    assert result.sources == ["odin-cache-default-cache"]
+    assert result.lines == "Ready to accept connections tcp"
+    assert result.running is True
+
+
+def test_elasticache_with_no_cluster_yet_is_honest_not_a_500(tmp_path):
+    store = _store(tmp_path, (ResourceDesired(id="cache", kind="elasticache"),))
+    result = fetch_logs(store, SynthStores(tmp_path), FakeRuntime(), ENV, "cache")
+    assert result.found is True and result.error is None
+    assert "no cache cluster backs" in result.message
+
+
+def test_elasticache_absent_container_reports_the_cluster_status(tmp_path, monkeypatch):
+    store = _store(tmp_path, (ResourceDesired(id="cache", kind="elasticache"),))
+    stores = SynthStores(tmp_path)
+    stores.cachectl.set(ENV, "cluster:cache", _cache_record("cache", status="creating"))
+
+    class FakeColima:
+        def status(self, name):
+            return "absent"
+
+        def logs(self, name, tail=20):
+            return ""
+
+    monkeypatch.setattr("odin.api.logs.ColimaRuntime", FakeColima)
+    result = fetch_logs(store, stores, FakeRuntime(), ENV, "cache")
+    assert "cluster status: creating" in result.message
+
+
 # --- ecs: every task container for the service ------------------------------
 
 
@@ -204,6 +260,94 @@ def test_ecs_no_service_yet_is_honest_not_found(tmp_path):
     assert "no ECS service" in result.message
 
 
+# --- logs (W2.1): the node IS the sink -- its own group's stored events -----
+
+
+def test_logs_node_returns_its_own_groups_stored_events(tmp_path):
+    store = _store(tmp_path, (ResourceDesired(id="/odin/app", kind="logs"),))
+    stores = SynthStores(tmp_path)
+    logsctl.ingest(stores, ENV, "/odin/app", "stream-a", ["first", "second"])
+
+    result = fetch_logs(store, stores, FakeRuntime(), ENV, "/odin/app")
+
+    assert result.found and result.kind == "logs"
+    assert result.running is True  # the group exists; a sink has no process to be up
+    assert result.sources == ["stream-a"]
+    assert result.message is None
+    lines = result.lines.splitlines()
+    assert len(lines) == 2
+    assert lines[0].endswith(" first") and lines[1].endswith(" second")  # newest last
+    assert lines[0].startswith("20")  # ISO-8601 UTC timestamp prefix
+    assert "[stream-a]" not in result.lines  # single stream: no stream prefix
+
+
+def test_logs_node_with_no_group_yet_is_honest_not_an_error(tmp_path):
+    store = _store(tmp_path, (ResourceDesired(id="/odin/app", kind="logs"),))
+    stores = SynthStores(tmp_path)
+
+    result = fetch_logs(store, stores, FakeRuntime(), ENV, "/odin/app")
+
+    assert result.found is True and result.error is None
+    assert result.running is False
+    assert result.lines == ""
+    assert "no log group" in result.message
+
+
+def test_logs_node_whose_group_exists_but_is_empty_says_so(tmp_path):
+    store = _store(tmp_path, (ResourceDesired(id="/odin/app", kind="logs"),))
+    stores = SynthStores(tmp_path)
+    logsctl.ensure_group(stores, ENV, "/odin/app")
+
+    result = fetch_logs(store, stores, FakeRuntime(), ENV, "/odin/app")
+
+    assert result.running is True
+    assert "no events yet" in result.message
+
+
+# --- ?group=: any group, including the substrate-created ones ---------------
+
+
+def test_group_read_reaches_a_substrate_created_group(tmp_path):
+    stores = SynthStores(tmp_path)
+    logsctl.ingest(stores, ENV, "/aws/lambda/fn1", "odin-lambda-default-fn1", ["hello from the handler"])
+
+    result = fetch_group_logs(stores, ENV, "/aws/lambda/fn1")
+
+    assert result.found and result.running
+    assert result.sources == ["odin-lambda-default-fn1"]
+    assert result.lines.endswith(" hello from the handler")
+    assert result.node == ""  # no node involved at all
+
+
+def test_group_read_labels_each_line_when_the_group_has_several_streams(tmp_path):
+    # `/ecs/{service}` gets one stream per task -- unlabelled, two tasks'
+    # output would interleave unattributably.
+    stores = SynthStores(tmp_path)
+    logsctl.ingest(stores, ENV, "/ecs/app", "odin-ecs-default-t1-app", ["task one up"])
+    logsctl.ingest(stores, ENV, "/ecs/app", "odin-ecs-default-t2-app", ["task two up"])
+
+    result = fetch_group_logs(stores, ENV, "/ecs/app")
+
+    assert result.sources == ["odin-ecs-default-t1-app", "odin-ecs-default-t2-app"]
+    assert "[odin-ecs-default-t1-app] task one up" in result.lines
+    assert "[odin-ecs-default-t2-app] task two up" in result.lines
+
+
+def test_group_read_honours_tail(tmp_path):
+    stores = SynthStores(tmp_path)
+    logsctl.ingest(stores, ENV, "/ecs/app", "s", [f"line {i}" for i in range(10)])
+    result = fetch_group_logs(stores, ENV, "/ecs/app", tail=3)
+    assert [line.split(" ", 1)[1] for line in result.lines.splitlines()] == ["line 7", "line 8", "line 9"]
+
+
+def test_group_read_of_an_unknown_group_is_honest_not_an_error(tmp_path):
+    stores = SynthStores(tmp_path)
+    result = fetch_group_logs(stores, ENV, "/aws/lambda/ghost")
+    assert result.found is True and result.error is None
+    assert result.running is False
+    assert "no log group" in result.message
+
+
 # --- kinds with no runnable backing at all ----------------------------------
 
 
@@ -231,7 +375,7 @@ def test_logs_route_returns_200_never_500_for_an_unknown_node(tmp_path):
         assert resp.json()["error"]
 
 
-def test_logs_route_missing_node_param_is_an_honest_error(tmp_path):
+def test_logs_route_with_neither_node_nor_group_is_an_honest_error(tmp_path):
     from tests.api.test_apply import FakeRds
     from tests.api.test_apply import FakeRuntime as ServerFakeRuntime
 
@@ -239,4 +383,22 @@ def test_logs_route_missing_node_param_is_an_honest_error(tmp_path):
     with TestClient(app) as client:
         resp = client.get("/logs")
         assert resp.status_code == 200
-        assert resp.json()["error"]
+        assert "group" in resp.json()["error"]  # both params are optional, one is required
+
+
+def test_logs_route_group_param_reads_the_sink_with_no_node_at_all(tmp_path):
+    from tests.api.test_apply import FakeRds
+    from tests.api.test_apply import FakeRuntime as ServerFakeRuntime
+
+    app = create_app(runtime=ServerFakeRuntime(), store=SpecStore(tmp_path), rds=FakeRds(), backings=False)
+    with TestClient(app) as client:
+        # The app's own stores live under its configured root -- reach them the
+        # same way the route does, then read back over real HTTP.
+        stores = app.state.gateway_stores
+        logsctl.ingest(stores, ENV, "/aws/lambda/fn1", "odin-lambda-default-fn1", ["shipped by an invoke"])
+        resp = client.get("/logs", params={"group": "/aws/lambda/fn1"})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["error"] is None
+        assert body["sources"] == ["odin-lambda-default-fn1"]
+        assert body["lines"].endswith(" shipped by an invoke")

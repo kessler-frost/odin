@@ -7,16 +7,20 @@ from odin.server import create_app
 from odin.spec.store import SpecStore
 from tests.api.test_apply import FakeRds, FakeRuntime
 
-TWO_DBS = {"nodes": [{"type": "rds", "data": {"label": "db"}},
-                     {"type": "rds", "data": {"label": "db2"}}], "edges": []}
-DB_ONLY = {"nodes": [{"type": "rds", "data": {"label": "db"}}], "edges": []}
-S3_ONLY = {"nodes": [{"type": "s3", "data": {"label": "uploads"}}], "edges": []}
+# W2.7: the isolation test drives s3 nodes, not rds -- an rds node is TF-owned
+# now, so `/apply` alone never enters one into World (see
+# tests/api/test_apply.py). What's proven here is per-env World separation,
+# which any reconciler-owned kind demonstrates just as well.
+TWO_BUCKETS = {"nodes": [{"type": "s3", "data": {"label": "uploads"}},
+                         {"type": "s3", "data": {"label": "uploads2"}}], "edges": []}
+BUCKET_ONLY = {"nodes": [{"type": "s3", "data": {"label": "uploads"}}], "edges": []}
+S3_ONLY = BUCKET_ONLY
 
 
 class FakeAws:
     """Per-env stand-in for BackingAws (same constructor signature)."""
 
-    def __init__(self, runtime, env="default", gateway_port=4266):
+    def __init__(self, runtime, env="default", gateway_port=4266, mesh=None):
         self.env = env
         self.provisioned = []
 
@@ -39,16 +43,16 @@ class FakeAws:
         return {}
 
 
-def test_environments_are_isolated_and_listed(tmp_path):
-    app = create_app(runtime=FakeRuntime(), store=SpecStore(tmp_path),
-                     rds=FakeRds(), backings=False)
+def test_environments_are_isolated_and_listed(tmp_path, monkeypatch):
+    monkeypatch.setattr("odin.server.BackingAws", FakeAws)
+    app = create_app(runtime=FakeRuntime(), store=SpecStore(tmp_path), rds=FakeRds())
     with TestClient(app) as client:
-        client.post("/apply?env=staging", json=TWO_DBS)     # db + db2
-        client.post("/apply?env=production", json=DB_ONLY)  # db only
+        client.post("/apply?env=staging", json=TWO_BUCKETS)      # uploads + uploads2
+        client.post("/apply?env=production", json=BUCKET_ONLY)   # uploads only
 
         staging = {r["id"] for r in client.get("/world?env=staging").json()["resources"]}
         production = {r["id"] for r in client.get("/world?env=production").json()["resources"]}
-        assert "db2" in staging and "db2" not in production  # isolated desired state
+        assert "uploads2" in staging and "uploads2" not in production  # isolated desired state
 
         envs = client.get("/envs").json()["envs"]
         assert "staging" in envs and "production" in envs
