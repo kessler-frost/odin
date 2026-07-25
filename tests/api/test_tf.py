@@ -110,7 +110,9 @@ class _LowMemRuntime(FakeRuntime):
         return HostFacts(total_mem_mib=1000.0)
 
 
-def test_tf_apply_409_when_the_stack_exceeds_the_memory_budget(tmp_path):
+def test_tf_apply_409_when_the_stack_exceeds_the_memory_budget(tmp_path, monkeypatch):
+    # See the twin in test_apply_full.py: the VM pool reads real host RAM.
+    monkeypatch.setenv("ODIN_VM_MEMORY_BUDGET_MIB", "1000")
     app = create_app(runtime=_LowMemRuntime(), store=SpecStore(tmp_path), rds=FakeRds(), backings=False)
     stack = Stack(env="default", resources=tuple(
         ResourceDesired(id=f"web{i}", kind="ec2", fields={"instanceType": FieldValue(value="t3.medium")})

@@ -142,6 +142,10 @@ BIG_EC2 = {
 
 
 def test_apply_full_rejects_before_touching_anything_when_over_the_memory_budget(tmp_path, monkeypatch):
+    # ec2 is charged against REAL host RAM (os.sysconf), which no fixture can
+    # fake, so without this the 50 t3.medium (200 GiB) fit on a big machine and
+    # the 409 never came -- the suite passed only under ~286 GiB of RAM.
+    monkeypatch.setenv("ODIN_VM_MEMORY_BUDGET_MIB", "1000")
     calls = _patch_translate(monkeypatch, TranslateResult(files={}, refined=False))
     app = create_app(runtime=_LowMemRuntime(), store=SpecStore(tmp_path), rds=FakeRds(), aws=FakeAws(), backings=False)
     with TestClient(app) as client:
