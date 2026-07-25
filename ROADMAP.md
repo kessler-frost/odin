@@ -455,11 +455,18 @@ future decision against these points instead of re-deriving them:
     is reported in the apply response's `unsupported` at build time.
   - **v1 limits, recorded rather than hidden:** there is still no `env` editor
     in the UI's ConfigPanel for an ecs node — the map must be authored in the
-    canvas JSON (`odin canvas set`). Only `rds`, `elasticache` and `alb`
-    publish facts the injector resolves, so only those can be referenced from
-    `env` — an `ec2` node's `${{web1.PRIVATE_IP}}` / `${{web1.MESH_IP}}`
-    (added the same release, see the mesh bullets above) are World facts only,
-    and `gateway/wiring.py` does not resolve them. Values are read at LAUNCH,
+    canvas JSON (`odin canvas set`). Only `rds`, `elasticache`, `alb` and
+    `ec2` publish facts the injector resolves, so only those can be referenced
+    from `env`. **`ec2` was the one that had to be added afterwards**: the
+    mesh work published `${{web1.PRIVATE_IP}}` / `${{web1.MESH_IP}}` into
+    World and the wiring work built the injector IN PARALLEL, coordinating
+    only on the names — so for one release the facts demonstrably existed and
+    no workload could consume them. The injector now applies the projection's
+    own gates verbatim (running-only, `odin:node`-tagged, and
+    `reconcile/mesh_health.py` deciding whether `MESH_IP` survives), so a ref
+    resolves exactly when `/world` shows that fact — and a withheld `MESH_IP`
+    (dead lighthouse) fails the ref honestly rather than injecting an empty or
+    stale address. Values are read at LAUNCH,
     so editing a node's `env` only reaches a task once that task is replaced
     (real ECS behaves the same way — a taskdef change forces a new deployment);
     a re-Apply that changes nothing tofu can see will not restart it.

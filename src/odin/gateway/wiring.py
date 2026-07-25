@@ -55,6 +55,17 @@ call sites turn into their existing terminal-failure shape (an ECS task STOPPED
 with the reason; a Lambda `State: Failed` with it), so it surfaces as a
 `crashed` node with a verdict naming the ref -- and, because a short service
 never reaches steady state, as a FAILED apply.
+
+WHICH KINDS PRODUCE: rds, elasticache, alb and ec2 -- the same four
+`reconcile/tf_status.py` projects facts for, held to the same gates (see
+`producer_facts`). ec2 arrived a beat late and is worth recording as a lesson:
+the mesh work published `PRIVATE_IP`/`MESH_IP` into World while this injector
+was being built in parallel, the two halves coordinated only on the NAMES, and
+the result was a fact that visibly existed in `/world` and could not be
+consumed by anything. The rule that closed it is the one to keep -- a ref
+resolves if and only if `/world` shows that fact on that node, asserted by
+holding the two projections to each other rather than to a hand-written
+expectation.
 """
 from __future__ import annotations
 
@@ -62,8 +73,10 @@ import json
 from pathlib import Path
 
 from odin.aws.rds import POSTGRES_PORT
+from odin.fabric.nebula import NebulaManager
 from odin.gateway.models import cachectl, elbv2ctl, rdsctl
 from odin.gateway.stores import SynthStores
+from odin.reconcile import mesh_health
 from odin.runtime.colima import CONTAINER_HOST
 from odin.runtime.lima import LIMA_HOST
 from odin.spec.models import Ref, Stack
@@ -123,16 +136,90 @@ def _label(tags: dict, native_name: str) -> str:
     return tags.get(_NODE_TAG) or native_name
 
 
+# An ec2 node's two published addresses -- DUPLICATED, DELIBERATELY, from
+# `reconcile/tf_status.py::_ec2_facts` for the same import-cycle reason
+# `db_facts` above is, and guarded the same way (`tests/gateway/
+# test_wiring.py` holds the pair to identical output).
+#   PRIVATE_IP -- the VM's real private address. Host-reachable, NOT SG-gated.
+#   MESH_IP    -- its Nebula overlay address: sticky across recreation, and
+#                 the ONE path a drawn security group actually gates.
+_EC2_RUNNING = "running"
+_EC2_MESH_KEYS = ("MESH_IP",)
+
+
+def ec2_facts(record: dict, overlay: dict[str, str]) -> dict[str, str]:
+    private_ip, overlay_ip = record.get("private_ip"), overlay.get(record["instance_id"])
+    return {
+        **({"PRIVATE_IP": private_ip} if private_ip else {}),
+        **({"MESH_IP": overlay_ip} if overlay_ip else {}),
+    }
+
+
+def _overlay_assignments(stores: SynthStores, env: str) -> dict[str, str]:
+    """host_id -> overlay IP for this env. Read-only: no mkdir, no allocation
+    -- `NebulaManager.load_overlay`'s own contract, and the same read
+    `tf_status` does per projection."""
+    overlay = NebulaManager(Path(stores.root) / env / "nebula").load_overlay()
+    hosts = overlay.subnets.get("hosts") if overlay else None
+    return dict(hosts.assignments) if hosts else {}
+
+
+def _ec2_producers(stores: SynthStores, env: str) -> dict[str, dict[str, str]]:
+    """The RUNNING, canvas-labelled instances and the addresses each publishes.
+
+    Every gate `tf_status._ec2_instances` applies before a fact reaches World
+    is applied here too, so a ref resolves if and only if `/world` shows that
+    fact on that node:
+
+      - only `running` publishes anything. `pending`/`stopping` project no
+        facts at all, and `stopped`/`terminated` are dead or gone -- which
+        also means the terminated-record handling `tf_status` needs for the
+        World BADGE (a drifted corpse must still show `crashed`) is moot here:
+        a corpse has no address worth handing out either way.
+      - no `odin:node` tag, no producer: a ref is written against the canvas
+        label, and EC2 has no AWS-native name field to fall back to.
+      - `mesh_health.gate` decides whether `MESH_IP` survives. If the env's
+        lighthouse is down, no peer can find or relay to the overlay address,
+        so it is WITHHELD rather than injected -- and the consumer's ref then
+        fails honestly through `_resolve`, exactly like any other
+        unresolvable ref. `PRIVATE_IP` is untouched: the VM really is still
+        reachable that way. The check is cached process-wide on the same
+        (root, env, member) key the projection uses, so a launch that happens
+        between two reconciler ticks re-uses the tick's verdict instead of
+        probing again -- and costs nothing at all for an env with no mesh."""
+    instances = [
+        (label, record)
+        for key, record in stores.ec2compute.items(env).items()
+        if key.startswith("instance:") and record["state_name"] == _EC2_RUNNING
+        for label in [stores.tags.get(env, f"ec2:{record['instance_id']}", {}).get(_NODE_TAG)]
+        if label
+    ]
+    if not instances:
+        return {}
+    overlay = _overlay_assignments(stores, env)
+    published: dict[str, dict[str, str]] = {}
+    for label, record in instances:
+        candidate = ec2_facts(record, overlay)
+        _kind, _phase, gated, _verdict = mesh_health.gate(
+            ("ec2", "healthy", candidate, None), root=stores.root, env=env,
+            member=record["instance_id"], overlay_ip=candidate.get("MESH_IP"),
+            mesh_keys=_EC2_MESH_KEYS,
+        )
+        published[label] = gated
+    return published
+
+
 def producer_facts(stores: SynthStores, env: str) -> dict[str, dict[str, str]]:
     """`node label -> published facts`, for every kind that publishes any: rds,
-    elasticache and alb (the same three `reconcile/tf_status.py` projects facts
-    for -- every other kind projects `{}`).
+    elasticache, alb and ec2 (the same four `reconcile/tf_status.py` projects
+    facts for -- every other kind projects `{}`).
 
     GATED ON REALLY BEING UP, per kind: an rds record with no `endpoint_port`
-    or a status other than `available`, and a cache cluster that isn't
-    `available`, publish NOTHING -- so a consumer referencing them fails
-    honestly instead of receiving a half-built address. Same rule
-    `tf_status` applies before publishing facts into World."""
+    or a status other than `available`, a cache cluster that isn't
+    `available`, and an instance that isn't `running` publish NOTHING -- so a
+    consumer referencing them fails honestly instead of receiving a half-built
+    address. Same rule `tf_status` applies before publishing facts into
+    World."""
     facts: dict[str, dict[str, str]] = {}
     for record in rdsctl.records(stores, env):
         identifier = record["db_instance_identifier"]
@@ -151,6 +238,7 @@ def producer_facts(stores: SynthStores, env: str) -> dict[str, dict[str, str]]:
             continue
         tags = stores.tags.get(env, f"{elbv2ctl.SERVICE}:{record['arn']}", {})
         facts[_label(tags, record["name"])] = {"ALB_ENDPOINT": endpoint}
+    facts.update(_ec2_producers(stores, env))
     return facts
 
 
@@ -160,7 +248,7 @@ def _resolve(ref: Ref, facts: dict[str, dict[str, str]]) -> str:
         raise UnresolvedRef(
             f"{ref.var} references {_ref_text(ref)}, but {ref.target_id!r} publishes no endpoint "
             "in this env yet -- it is either not healthy yet or a kind that publishes no facts "
-            "(only rds, elasticache and alb do)"
+            "(only rds, elasticache, alb and ec2 do)"
         )
     value = producer.get(ref.target_attr)
     if value is None:
