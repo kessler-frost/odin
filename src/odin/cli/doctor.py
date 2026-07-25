@@ -209,7 +209,9 @@ def _prebake() -> None:
 def doctor(
     prebake: bool = typer.Option(
         False, "--prebake",
-        help=f"Build the {DYNALITE_IMAGE} image now instead of on the first DynamoDB Apply.",
+        help=f"Build the {DYNALITE_IMAGE} image now (a one-time npm install inside a "
+             "container) instead of making the first DynamoDB Apply wait for it. Builds "
+             "and exits -- it runs no checks. Documented in the README under Install.",
     ),
 ) -> None:
     """Preflight: verify this machine has everything Odin needs to run."""

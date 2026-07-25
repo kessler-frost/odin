@@ -238,6 +238,7 @@ odin export                              # back this env's state up to a tar.gz
 odin import odin-default-export.tar.gz   # restore it (works with odin down)
 odin envs                                # every env that has had something applied
 odin doctor                              # toolchain health, with exact fixes
+odin doctor --prebake                    # build the dynalite image now, not on first Apply
 odin --version                           # which odin this is
 ```
 
