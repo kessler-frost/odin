@@ -99,6 +99,13 @@ class FakeTaskRuntime:
         self._status[(env, task_id, container_name)] = "exited"
         self._exit_codes[(env, task_id, container_name)] = exit_code
 
+    def vanish(self, env: str, task_id: str, container_name: str) -> None:
+        """Test-only: the container is REMOVED (`docker rm -f`) rather than
+        exited -- the real runtime reports `absent` for a name it can't
+        inspect, and no exit code exists to read."""
+        self._status[(env, task_id, container_name)] = "absent"
+        self._exit_codes.pop((env, task_id, container_name), None)
+
 
 def _parse(operation: str, response: Response, *, error: bool = False):
     model = _SESSION.get_service_model("ecs")
@@ -1306,3 +1313,25 @@ def test_drift_marking_a_task_stopped_also_deregisters_it(sink, ecs, stores, tar
     task_id = runtime.ran[0][1]
     ecsctl.mark_task_stopped(stores, ENV, "odin", task_id, "container removed outside odin")
     assert target_calls["deregister"] == [(ENV, _TG_ARN, CONTAINER_HOST, 10_001)]
+
+
+def test_sweep_marks_a_task_whose_container_vanished(sink, ecs, stores):
+    """Field test 4: one of three serving containers was `docker rm -f`'d 20s
+    into a 63s apply and `/world` still said 3 for 57s. The drift sweep is the
+    only other thing that notices a vanished container, and during an apply it
+    serves a cache -- so this passive read has to catch it."""
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(stores, sink, ecs, runtime, desiredCount=1)
+    _wait_for_running_count(stores, sink, ecs, runtime, 1)
+    _, task_id, _, _, _, _ = runtime.ran[0]
+
+    runtime.vanish(ENV, task_id, "app")  # gone, not exited
+    ecsctl.sweep_tasks(stores, ENV, runtime)
+
+    task = stores.ecsctl.get(ENV, f"task:odin:{task_id}")
+    assert task["last_status"] == "STOPPED"
+    assert task["exit_code"] is None, "a container that no longer exists never reported one"
+    assert "removed outside odin" in task["stopped_reason"]
+    assert _describe_service(stores, sink, ecs, runtime)["runningCount"] == 0
