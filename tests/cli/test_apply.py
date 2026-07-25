@@ -21,6 +21,19 @@ TF_FAILED = {
     "tf": {"status": "failed", "exit_code": 1, "tail": ["Error: BucketAlreadyExists", "apply failed"]},
     "note": "desired state not committed; fix and re-apply",
 }
+# Field test 3 (HIGH): tofu had nothing to do, so `tf: ok` -- and the service
+# was at 0 of 3 tasks the whole time. Exit 0 here was the bug.
+SERVICES_UNHEALTHY = {
+    "status": "applied_services_unhealthy", "rev": "abc123", "env": "default",
+    "skipped": [], "refined": False, "unsupported": [],
+    "tf": {"status": "ok", "exit_code": 0},
+    "unhealthy": [{
+        "node": "web", "running": 0, "desired": 3,
+        "reason": "pull access denied for nginx:this-tag-does-not-exist-9z9z",
+    }],
+    "note": "desired state committed, but the service(s) above are not running "
+            "their desired task count — fix and re-apply",
+}
 
 
 @respx.mock
@@ -78,6 +91,30 @@ def test_apply_tf_failed_json_mode_still_exits_nonzero(runner):
     result = runner.invoke(app, ["apply", "-o", "json"])
     assert result.exit_code == 1
     assert json.loads(result.stdout) == TF_FAILED
+
+
+@respx.mock
+def test_apply_names_the_short_service_and_exits_nonzero(runner):
+    """`tf: ok` must not be enough to exit 0: the output has to name WHICH
+    service, WHAT it observed (running vs desired) and the real reason -- which
+    field test 3 could only find in /world and events, never in apply itself."""
+    respx.get(f"{BASE}/canvas").mock(return_value=httpx.Response(200, json=GRAPH))
+    respx.post(f"{BASE}/apply-full").mock(return_value=httpx.Response(200, json=SERVICES_UNHEALTHY))
+    result = runner.invoke(app, ["apply"])
+    assert result.exit_code == 1
+    assert "status: applied_services_unhealthy" in result.stdout
+    assert "tf: ok" in result.stdout
+    assert "unhealthy: web — 0/3 tasks running" in result.stdout
+    assert "nginx:this-tag-does-not-exist-9z9z" in result.stdout
+
+
+@respx.mock
+def test_apply_unhealthy_json_mode_still_exits_nonzero(runner):
+    respx.get(f"{BASE}/canvas").mock(return_value=httpx.Response(200, json=GRAPH))
+    respx.post(f"{BASE}/apply-full").mock(return_value=httpx.Response(200, json=SERVICES_UNHEALTHY))
+    result = runner.invoke(app, ["apply", "-o", "json"])
+    assert result.exit_code == 1
+    assert json.loads(result.stdout) == SERVICES_UNHEALTHY
 
 
 @respx.mock

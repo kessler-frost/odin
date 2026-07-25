@@ -333,8 +333,11 @@ def create_apply_full_router(
     semantics, then translate (S3b) and, when the canvas has TF-supported
     resources, `tofu apply` through the gateway (S2). Every non-busy outcome
     is a 200 with an honest per-half status -- the reconciler half can
-    genuinely succeed while tofu fails ("applied_tf_failed"); 409 only when a
-    tofu run is already in flight for the env."""
+    genuinely succeed while tofu fails ("applied_tf_failed"), and BOTH halves
+    can succeed while a service is still short of its desired task count
+    ("applied_services_unhealthy", field test 3); 409 only when a tofu run is
+    already in flight for the env. Only `applied` is a clean apply; every
+    other status is a nonzero exit in `cli/apply.py`."""
     router = APIRouter()
 
     @router.post("/apply-full")
@@ -501,7 +504,7 @@ def create_apply_full_router(
         # A bare `TaskRuntime()` (not this app's `runtime`) deliberately: it
         # must be the SAME substrate that launched these containers, and
         # ecsctl's own `runtime or TaskRuntime()` default is what did.
-        ecsctl.converge_services(stores, env, TaskRuntime(), keystore, gateway_port())
+        converging = ecsctl.converge_services(stores, env, TaskRuntime(), keystore, gateway_port())
         # The same recovery for lambda, and for the same reason: a function's
         # RIE container is its EXECUTION ENVIRONMENT, not a TF resource -- an
         # `aws_lambda_function`'s config doesn't change when its container is
@@ -532,6 +535,29 @@ def create_apply_full_router(
         # compiled rules are unchanged is one local file comparison -- no
         # `limactl`, no signal. See ec2compute.ensure_instance_mesh.
         await asyncio.to_thread(ec2compute.ensure_instance_mesh, stores, env)
+        # Field test 3 (HIGH): an Apply may not report success while a service
+        # is short of its desired task count. tofu's own `wait_for_steady_state`
+        # only runs when tofu UPDATES the service, so every apply tofu sees as a
+        # NO-OP -- a re-apply on an already-broken service, or an edit that only
+        # touches the launch-time `env` map -- reported `applied / tf: ok` at
+        # 0-of-3 tasks. Nothing tofu-side can close that (tofu has nothing to
+        # do), so this is odin's own post-apply verification, placed LAST so the
+        # convergence above overlaps every other recovery pass and a healthy env
+        # costs one store read. Only when everything else went clean: a tofu
+        # failure has already failed this apply, and adding a second wait to it
+        # would only make an already-honest failure slower. Off the event loop:
+        # `wait_for_steady_services` joins real threads and sleeps.
+        if body["status"] == "applied":
+            shortfalls = await asyncio.to_thread(
+                ecsctl.wait_for_steady_services, stores, env, TaskRuntime(), converging,
+            )
+            if shortfalls:
+                body["status"] = "applied_services_unhealthy"
+                body["unhealthy"] = [s._asdict() for s in shortfalls]
+                body["note"] = (
+                    "desired state committed, but the service(s) above are not running "
+                    "their desired task count — fix and re-apply"
+                )
         await reconciler.tick()  # kick an immediate pass; the loop continues it
         return JSONResponse(status_code=200, content=body)
 

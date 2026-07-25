@@ -57,7 +57,7 @@ from odin.aws.rds import container_name as db_container_name
 from odin.compute.tasks import TaskRuntime
 from odin.fabric.nebula import NebulaManager
 from odin.gateway.models import cachectl, elbv2ctl, logsctl, rdsctl, ssmctl
-from odin.gateway.models.ecsctl import sweep_tasks
+from odin.gateway.models.ecsctl import sweep_tasks, task_verdict
 from odin.gateway.stores import SynthStores
 from odin.reconcile import mesh_health
 from odin.runtime.colima import CONTAINER_HOST
@@ -509,12 +509,6 @@ def _ecs_tasks_for(stores: SynthStores, env: str, cluster_name: str, service_nam
     ]
 
 
-def _ecs_verdict(task: dict) -> str:
-    reason = task.get("stopped_reason") or "task stopped"
-    exit_code = task.get("exit_code")
-    return f"{reason} (exit {exit_code})" if exit_code is not None else reason
-
-
 def _ecs_services(stores: SynthStores, env: str, runtime: TaskRuntime | None = None) -> Projected:
     out: Projected = {}
     # Keep task state honest against real containers BEFORE reading it below
@@ -543,7 +537,7 @@ def _ecs_services(stores: SynthStores, env: str, runtime: TaskRuntime | None = N
             out[label] = ("ecs", "healthy", {}, None)
         elif failed:
             latest = max(failed, key=lambda t: t.get("stopped_at") or 0)
-            out[label] = ("ecs", "crashed", {}, _ecs_verdict(latest))
+            out[label] = ("ecs", "crashed", {}, task_verdict(latest))
         else:
             out[label] = ("ecs", "starting", {}, None)
     return out

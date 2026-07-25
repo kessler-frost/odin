@@ -922,6 +922,108 @@ def test_converge_services_leaves_a_deleted_service_alone(sink, ecs, stores):
     assert len(runtime.ran) == launched, "an INACTIVE service must never be re-launched"
 
 
+def test_converge_services_relaunches_a_task_whose_container_exited(sink, ecs, stores):
+    """Field test 3 (HIGH): the Apply's own convergence pass must SEE reality
+    before it decides there is nothing to do -- a container that exited on its
+    own still reads RUNNING in the store until something sweeps it, so without
+    the sweep at the head of `converge_services` the Apply looked at a full
+    task list and launched nothing while the service was really at zero."""
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(stores, sink, ecs, runtime, desiredCount=1)
+    _wait_for_running_count(stores, sink, ecs, runtime, 1)
+    _, task_id, _, _, _, _ = runtime.ran[0]
+    runtime.mark_exited(ENV, task_id, "app", exit_code=137)  # crashed on its own
+
+    ecsctl.converge_services(stores, ENV, runtime)
+
+    _wait_for_running_count(stores, sink, ecs, runtime, 1)
+    assert len(runtime.ran) == 2, "the exited task must be swept STOPPED, then relaunched"
+
+
+# --- Field test 3 (HIGH): a no-op Apply must not report success at zero tasks ---
+
+
+def test_wait_for_steady_services_is_silent_at_desired_count(sink, ecs, stores):
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(stores, sink, ecs, runtime, desiredCount=2)
+    _wait_for_running_count(stores, sink, ecs, runtime, 2)
+
+    started = time.monotonic()
+    assert ecsctl.wait_for_steady_services(stores, ENV, runtime) == []
+    assert time.monotonic() - started < 1.0, "a healthy service must not cost the apply a wait"
+
+
+def test_wait_for_steady_services_names_the_service_the_counts_and_the_reason(sink, ecs, stores):
+    """THE field-test-3 bug: an Apply tofu sees as a no-op, on a service that
+    is already short of desired. The shortfall must name the node, what it
+    observed (running vs desired) and the real underlying reason."""
+    runtime = FakeTaskRuntime(fail_run=True)
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(stores, sink, ecs, runtime, desiredCount=3)
+    _wait_for_running_count(stores, sink, ecs, runtime, 0)
+
+    started = time.monotonic()
+    (short,) = ecsctl.wait_for_steady_services(stores, ENV, runtime)
+    elapsed = time.monotonic() - started
+
+    assert short.node == "app"
+    assert (short.running, short.desired) == (0, 3)
+    assert "container failed to start" in (short.reason or ""), short
+    assert elapsed < 10, f"nothing is pending -- this must fail fast, took {elapsed:.1f}s"
+
+
+def test_wait_for_steady_services_waits_out_a_slow_start(sink, ecs, stores):
+    """A task legitimately takes seconds to come up: the wait must join the
+    convergence it is verifying instead of failing a service that is still
+    launching."""
+    block = threading.Event()
+    runtime = FakeTaskRuntime(block=block)
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(stores, sink, ecs, runtime, desiredCount=1)
+    threading.Timer(0.3, block.set).start()
+
+    converging = ecsctl.converge_services(stores, ENV, runtime)
+    assert ecsctl.wait_for_steady_services(stores, ENV, runtime, converging) == []
+
+
+def test_wait_for_steady_services_is_bounded(sink, ecs, stores, monkeypatch):
+    """A service that never converges fails the apply inside the budget rather
+    than hanging it -- `ODIN_ECS_STEADY_TIMEOUT` is the knob."""
+    monkeypatch.setenv("ODIN_ECS_STEADY_TIMEOUT", "0.5")
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(stores, sink, ecs, runtime, desiredCount=1)
+    _wait_for_running_count(stores, sink, ecs, runtime, 1)
+    # A task stuck PROVISIONING forever: pending, so the fast path can't fire.
+    task_key = next(k for k in stores.ecsctl.items(ENV) if k.startswith("task:"))
+    stores.ecsctl.set(ENV, task_key, {**stores.ecsctl.get(ENV, task_key), "last_status": "PROVISIONING"})
+
+    started = time.monotonic()
+    (short,) = ecsctl.wait_for_steady_services(stores, ENV, runtime)
+    assert time.monotonic() - started < 5.0
+    assert (short.running, short.desired) == (0, 1)
+    assert short.reason is None, "nothing has failed yet -- inventing a reason would be a lie"
+
+
+def test_wait_for_steady_services_ignores_a_deleted_service(sink, ecs, stores):
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(stores, sink, ecs, runtime, desiredCount=1)
+    _wait_for_running_count(stores, sink, ecs, runtime, 1)
+    delete_req = sink.call(lambda: ecs.delete_service(cluster="odin", service="app", force=True))
+    _parse("DeleteService", _answer(stores, delete_req, runtime))
+
+    assert ecsctl.wait_for_steady_services(stores, ENV, runtime) == []
+
+
 # --- W2.1 piece 3: the sweep ships each task's tail into /ecs/{service} ---------
 
 
