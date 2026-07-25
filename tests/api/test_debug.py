@@ -115,6 +115,44 @@ def test_the_observed_world_and_the_event_log_reach_the_agent(tmp_path):
     assert [e["text"] for e in node["events"]] == ["boom"]
 
 
+def test_a_failed_tofu_apply_reaches_the_agent_env_wide(tmp_path):
+    """The gap `resource_id`-keyed events can't close: a `{type:"tf"}` event
+    belongs to the ENV, so "your apply failed with this error" reached no node.
+    Driven through a REAL `broadcast` -> `events.jsonl` -> `get_events`
+    round-trip, which is the only path the route ever reads."""
+    store = SpecStore(tmp_path)
+    store.apply(Stack(env=ENV))
+    ws = ConnectionManager(tmp_path)
+    seen: list[dict] = []
+    app = FastAPI()
+    app.include_router(create_debug_router(store, SynthStores(tmp_path), LoggingRuntime(), ws, diagnose=_fake_diagnose(seen)))
+    error = "Error: creating S3 Bucket (assets): BucketAlreadyOwnedByYou"
+    with TestClient(app) as client:
+        client.portal.call(ws.broadcast, {"type": "tf", "env": ENV, "phase": "apply", "line": error})
+        client.portal.call(ws.broadcast, {
+            "type": "tf", "env": ENV, "phase": "apply", "status": "failed", "exit_code": 1, "tail": [error],
+        })
+        client.post("/agent/debug", json={"env": ENV, "node_ids": ["db"]})
+    assert seen[-1]["context"]["recent_tf"] == [f"apply: {error}", "tofu apply failed (exit 1)"]
+
+
+def test_a_secret_in_a_tofu_line_never_reaches_the_agent(app_client, monkeypatch):
+    """`simulate/runner.py` already scrubs tofu's stream before it reaches
+    events.jsonl -- this pins the assembler's own second pass, which is what
+    covers a line that was logged with a different (or empty) secret set."""
+    seen: list[dict] = []
+    monkeypatch.setattr(debugger, "diagnose", _fake_diagnose(seen))
+    app_client.post("/apply", params={"env": ENV}, json=CANVAS)
+    ws = app_client.app.state.ws_manager  # the same durable log the context is built from
+    app_client.portal.call(ws.broadcast, {
+        "type": "tf", "env": ENV, "phase": "apply", "line": '  + password = "hunter2-secret-value"',
+    })
+    app_client.post("/agent/debug", json={"env": ENV, "node_ids": ["db"]})
+    context = seen[-1]["context"]
+    assert context["recent_tf"], "the tf line must have reached the context for this to mean anything"
+    assert "hunter2-secret-value" not in json.dumps(context)
+
+
 def test_an_unknown_node_is_a_200_with_no_desired_config(wired):
     client, _store, seen = wired
     resp = client.post("/agent/debug", json={"env": ENV, "node_ids": ["nope"]})

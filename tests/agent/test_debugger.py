@@ -58,7 +58,8 @@ EVENTS = [
     {"type": "world_delta", "env": "dbg", "resource_id": "db", "phase": "healthy"},
     {"type": "world_delta", "env": "dbg", "resource_id": "api", "phase": "crashed"},
     {"type": "log", "env": "dbg", "source": "api", "text": "FATAL: config missing", "level": "error"},
-    {"type": "tf", "env": "dbg", "phase": "apply", "status": "ok", "exit_code": 0},  # env-wide: belongs to no node
+    # env-wide: belongs to no node, so it lands in `recent_tf` instead.
+    {"type": "tf", "env": "dbg", "phase": "apply", "status": "ok", "exit_code": 0},
 ]
 
 LOGS = {"api": "starting\nFATAL: config missing\n", "db": "database system is ready to accept connections\n"}
@@ -107,6 +108,103 @@ def test_env_wide_events_are_not_attributed_to_any_node():
     context = _context()
     for node in context["nodes"].values():
         assert all(e["type"] != "tf" for e in node["events"])
+
+
+# --- the assembler: the env-wide tofu section --------------------------------
+
+
+def _tf_events(*, status: str = "failed", exit_code: int = 1, tail=("Error: creating S3 Bucket: BucketAlreadyOwned",)):
+    """The exact two shapes `simulate/runner.py::TfRunner._run` broadcasts."""
+    return [
+        {"type": "tf", "env": "dbg", "phase": "init", "line": "OpenTofu has been successfully initialized!"},
+        {"type": "tf", "env": "dbg", "phase": "init", "status": "ok", "exit_code": 0},
+        {"type": "tf", "env": "dbg", "phase": "apply", "line": "aws_s3_bucket.assets: Creating..."},
+        *({"type": "tf", "env": "dbg", "phase": "apply", "line": line} for line in tail),
+        {"type": "tf", "env": "dbg", "phase": "apply", "status": status, "exit_code": exit_code, "tail": list(tail)},
+    ]
+
+
+def test_a_failed_tofu_apply_reaches_the_context_env_wide():
+    # THE most common "what's wrong here?": the user's apply just failed. That
+    # evidence carries no resource_id, so before `recent_tf` it reached nothing.
+    context = _context(events=_tf_events())
+    assert "apply: Error: creating S3 Bucket: BucketAlreadyOwned" in context["recent_tf"]
+    assert context["recent_tf"][-1] == "tofu apply failed (exit 1)"
+
+
+def test_the_tf_section_is_env_level_not_per_node():
+    context = _context(events=_tf_events())
+    for node in context["nodes"].values():
+        assert node["events"] == []
+
+
+def test_a_successful_apply_still_reports_its_verdict():
+    context = _context(events=_tf_events(status="ok", exit_code=0, tail=()))
+    assert context["recent_tf"][-1] == "tofu apply ok (exit 0)"
+
+
+def test_the_failure_tail_is_not_duplicated_by_the_stream_lines_it_repeats():
+    # `tail` IS the last lines of the same stdout already streamed as `line`
+    # events, so re-adding them would spend the whole cap on a repeat.
+    lines = _context(events=_tf_events())["recent_tf"]
+    assert lines.count("apply: Error: creating S3 Bucket: BucketAlreadyOwned") == 1
+
+
+def test_a_tail_entry_no_stream_line_carried_is_kept():
+    # The timeout path: `TfRunner._run` appends a synthetic sentence to the
+    # tail that was never emitted as a line event, and it is the whole reason
+    # for the failure.
+    timed_out = "tofu apply timed out after 600s -- process killed"
+    context = _context(events=[
+        {"type": "tf", "env": "dbg", "phase": "apply", "line": "aws_instance.web: Still creating... [9m50s elapsed]"},
+        {"type": "tf", "env": "dbg", "phase": "apply", "status": "failed", "exit_code": -9, "tail": [timed_out]},
+    ])
+    assert context["recent_tf"] == [
+        "apply: aws_instance.web: Still creating... [9m50s elapsed]",
+        f"apply: {timed_out}",
+        "tofu apply failed (exit -9)",
+    ]
+
+
+def test_the_tf_section_is_capped_at_the_last_twenty_lines():
+    events = [{"type": "tf", "env": "dbg", "phase": "apply", "line": f"tf-line-{i}"} for i in range(200)]
+    lines = _context(events=events)["recent_tf"]
+    assert len(lines) == debugger.MAX_TF_LINES
+    assert lines[0] == "apply: tf-line-180" and lines[-1] == "apply: tf-line-199"
+
+
+def test_a_very_long_tf_line_is_clipped_like_every_other_string():
+    events = [{"type": "tf", "env": "dbg", "phase": "apply", "line": "z" * 9000}]
+    line = _context(events=events)["recent_tf"][0]
+    assert len(line) < 9000 and line.endswith("(truncated)")
+
+
+def test_an_env_with_no_tofu_output_carries_an_empty_section():
+    assert _context(events=[])["recent_tf"] == []
+    # ...and an env whose only tf event is a clean apply says exactly that.
+    assert _context()["recent_tf"] == ["tofu apply ok (exit 0)"]
+
+
+def test_no_secret_survives_the_tf_section():
+    # `simulate/runner.py` already scrubs each line before it reaches
+    # events.jsonl, but the assembler re-scrubs against the CURRENT Stack --
+    # the two secret sets can differ (a Stack edited since the apply, a caller
+    # that passed none), and this is the last place that can still catch it.
+    events = [
+        {"type": "tf", "env": "dbg", "phase": "apply", "line": f'  + password = "{PASSWORD}"'},
+        {"type": "tf", "env": "dbg", "phase": "apply", "status": "failed", "exit_code": 1,
+         "tail": [f"Error: invalid credentials for {PASSWORD}"]},
+    ]
+    context = assemble_context(STACK, WORLD, events, _logs, ["db"])
+    assert context["recent_tf"], "the section must exist for this test to mean anything"
+    assert PASSWORD not in json.dumps(context)
+    assert REDACTED in json.dumps(context["recent_tf"])
+
+
+def test_the_prompt_tells_the_agent_about_the_env_wide_tofu_evidence():
+    prompt = debugger._prompt(_context(events=_tf_events()), "what's wrong here?")
+    assert "recent_tf" in prompt and "recent_tf" in debugger._SYSTEM
+    assert "BucketAlreadyOwned" in prompt
 
 
 # --- the assembler: drift (no key of its own, by design) ---------------------
