@@ -84,6 +84,41 @@ def pid_alive(pid: int) -> bool:
     return subprocess.run(["kill", "-0", str(pid)], capture_output=True).returncode == 0
 
 
+# The shell's own exit code for "command not found". Every tool odin shells out
+# to -- docker, limactl, nebula, nebula-cert -- is a thing a user may simply not
+# have installed yet, and that is a FINDING, never a crash.
+COMMAND_NOT_FOUND = 127
+
+
+@dataclass(frozen=True)
+class CommandResult:
+    """The three fields every runner seam in odin consumes."""
+
+    returncode: int
+    stdout: str
+    stderr: str = ""
+
+
+def run_command(args: list[str], input: str | None = None) -> CommandResult:
+    """`subprocess.run(capture_output=True, text=True)`, except a binary that
+    isn't on PATH comes back as a RESULT (rc 127, "command not found" on
+    stderr) instead of raising `FileNotFoundError`.
+
+    Fresh-user finding BLOCK-2: `odin doctor` on a Mac with Colima but no
+    `docker` CLI died with a 60-line traceback out of `_check_memory` and
+    printed not one check row -- the tool whose whole job is to report a
+    missing prerequisite crashed on the most common missing prerequisite. The
+    fix belongs at the seam, not in each caller: `brew install colima` pulls
+    only `lima`, so "the binary is absent" is an ordinary state of a healthy
+    machine and every caller already handles a nonzero return code.
+    """
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, input=input)
+    except FileNotFoundError:
+        return CommandResult(COMMAND_NOT_FOUND, "", f"{args[0]}: command not found")
+    return CommandResult(proc.returncode, proc.stdout, proc.stderr)
+
+
 # The store lock. A running control app holds an exclusive `flock` on this file
 # for its entire lifetime (odin.server's lifespan takes it), so "is a server up
 # against THIS store?" is answered by trying to take the same lock: the kernel

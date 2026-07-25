@@ -86,7 +86,7 @@ from odin.fabric.models import (
     VpcNetwork,
 )
 from odin.spec.models import World
-from odin.util import atomic_write_text
+from odin.util import atomic_write_text, run_command
 
 log = logging.getLogger("odin.fabric.nebula")
 
@@ -156,7 +156,9 @@ class _Proc:
 
 
 def _default_runner(args: list[str]) -> _Proc:
-    proc = subprocess.run(args, capture_output=True, text=True)
+    # `run_command`: `nebula`/`nebula-cert` are downloaded on demand, so an
+    # absent binary is an ordinary state -- rc 127, not a traceback.
+    proc = run_command(args)
     return _Proc(proc.returncode, proc.stdout, proc.stderr)
 
 

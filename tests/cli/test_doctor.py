@@ -204,6 +204,51 @@ def test_cli_exit_one_on_required_failure(monkeypatch):
     assert "fix: brew install opentofu" in result.output
 
 
+def test_docker_absent_prints_every_row_and_exits_one(monkeypatch):
+    """Fresh-user BLOCK-2: `brew install colima` brings only `lima`, so a Mac
+    that ran the install one-liner has no `docker` -- and doctor died there with
+    a FileNotFoundError traceback out of `_check_memory`, printing ZERO rows.
+    Every check must still be reported, docker named as the failure, with the
+    remedy that actually installs it."""
+    patch_disk(monkeypatch)
+    monkeypatch.setattr(doctor_mod, "_subprocess_run", make_run({"which docker": FakeProc(1)}))
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 1
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    for name in ALL_CHECKS:  # the FULL table, not a stack trace
+        assert f" {name:<15}" in result.output
+    assert "✗ docker" in result.output
+    assert "fix: brew install docker" in result.output
+    assert "1 required check(s) failed." in result.output
+
+
+def test_memory_names_the_missing_docker_cli_not_colima_start(monkeypatch):
+    """The memory row's remedy has to match its cause: with no docker CLI
+    there is nothing to ask, and `colima start` is a dead end."""
+    patch_disk(monkeypatch)
+    memory = by_name(run_checks(["memory"], make_run({"which docker": FakeProc(1)})))["memory"]
+    assert (memory.status, memory.required, memory.fix) == ("skip", False, "brew install docker")
+    assert "no `docker` CLI on PATH" in memory.detail
+
+
+def test_colima_failure_carries_colimas_own_words(monkeypatch):
+    """FRICTION-4: colima's real complaint ("dependency check failed for VM:
+    lima not found") was collapsed to "installed but not running", so the user
+    ran `colima start` and got a different error."""
+    said = "FATA[0000] dependency check failed for VM: lima not found, run 'brew install lima'"
+    colima = by_name(run_checks(["colima"], make_run({"colima status": FakeProc(1, "", said)})))["colima"]
+    assert colima.status == "fail"
+    assert "lima not found" in colima.detail
+
+
+def test_prebake_without_docker_refuses_instead_of_crashing(monkeypatch):
+    monkeypatch.setattr(doctor_mod, "_subprocess_run", make_run({"which docker": FakeProc(1)}))
+    result = runner.invoke(app, ["doctor", "--prebake"])
+    assert result.exit_code == 1
+    assert "docker not found on PATH" in result.output
+    assert "brew install docker" in result.output
+
+
 def test_cli_all_ok(monkeypatch):
     patch_disk(monkeypatch)
     monkeypatch.setattr(doctor_mod, "_subprocess_run", make_run())
