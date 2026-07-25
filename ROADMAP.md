@@ -39,8 +39,8 @@ future decision against these points instead of re-deriving them:
 - **Canvas UI** — ReactFlow drag/drop/resize/connect, config panel, env
   switcher, live status over WebSocket.
 - **Real AWS-shaped substitutes** — RustFS (S3), goaws (SQS+SNS), dynalite
-  (DynamoDB), real Postgres (RDS) — provisioned per env, supervised,
-  crash-recovering, integration-tested today.
+  (DynamoDB), real Postgres (RDS, `tofu`-managed since W2.7) — per env,
+  supervised, crash-recovering, integration-tested today.
 - **Runtime drivers** — Colima (containers) and Lima (VMs) behind one
   `RuntimeDriver` protocol, the execution substrate EC2/ECS/Lambda substitutes
   will run on.
@@ -133,8 +133,37 @@ future decision against these points instead of re-deriving them:
     same way RDS's is: a container consumes `${{cache.REDIS_URL}}`
     (`host.docker.internal`), an EC2 (Lima VM) consumer must use
     `${{cache.REDIS_URL_VM}}` (`host.lima.internal`).
-  - RDS stays off Terraform — the reconciler's real Postgres container, not
-    a `tofu`-managed resource, until an RDS gateway model lands.
+  - RDS is Terraform-managed (W2.7 — this used to read "RDS stays off
+    Terraform"): an `rds` node compiles to `aws_db_instance`, and the gateway's
+    own RDS model (`gateway/models/rdsctl.py`) fulfils CreateDBInstance with
+    the same real `odin-rds-{env}-{id}` Postgres container, gating `available`
+    on a real `pg_ready` connection. Its remaining limits:
+    - **Postgres only.** Selecting mysql/mariadb is declined with a reason
+      rather than silently handed a Postgres container (which is what the old
+      reconciler path did).
+    - **A node's label must be a valid RDS identifier** (lowercase letters/
+      digits, single hyphens, starts with a letter) — the provider validates
+      `identifier` client-side, so a label like `app_db` is declined at build
+      time with the fix instead of failing inside tofu. Existing canvases with
+      such labels must rename the node.
+    - **`allocated_storage` / `instance_class` are metadata**: they round-trip
+      faithfully (clean plans, faithful imports) but resize nothing — a local
+      container has the host's disk and no instance sizing.
+    - **No snapshots at all.** `skip_final_snapshot = true` is always emitted
+      (without it `tofu destroy` refuses, breaking "empty canvas = full
+      teardown"), and there is no DescribeDBSnapshots/CreateDBSnapshot surface.
+    - **No cpu/ram facts.** The reconciler used to attach live `docker stats`
+      to an rds node every tick; the TF-owned projection is a pure store read,
+      so those two numbers are gone from an rds node's World facts (every other
+      fact is unchanged). `odin logs`/`docker stats` still show them.
+    - **A crash's log tail isn't attached to the WorldDelta** — the verdict
+      names the container and its real exit code, and the log body is one
+      `odin logs` away, rather than being read inside the projection.
+    - The instance's **master password is stored** in
+      `.odin/{env}/gateway/rdsctl.json` (0600) — the DATABASE_URL fact is built
+      from it and the drift probe authenticates with it; the Stack revision on
+      disk already holds the same value. `ModifyDBInstance` applies a password
+      change for real (`ALTER USER`), so the published fact never lies.
   - RDS endpoint reachability is per-consumer: a CONTAINER consumes
     `${{db.DATABASE_URL}}` (`host.docker.internal`); an EC2 (Lima VM) consumer
     must use `${{db.DATABASE_URL_VM}}` (`host.lima.internal`), since a Lima VM
@@ -267,8 +296,9 @@ future decision against these points instead of re-deriving them:
     `GetSecretValue`) are exact. Same bounded gap the ecr/ecs classifiers
     already carry.
 - **Recorded as UNSUPPORTED for now** (northstar directive 5's honesty rule):
-  ALB/ELBv2, EKS, CloudFormation, autoscaling, and RDS-via-Terraform (rds
-  nodes stay on the reconciler path until an RDS API model lands).
+  ALB/ELBv2, EKS, CloudFormation, and autoscaling. (RDS-via-Terraform was on
+  this list until W2.7 — `aws_db_instance` is real now; see the RDS limits
+  above for what's still missing inside it.)
 - [x] **Nebula network layer (single-host), fully activated.** Security
   groups and VPCs drawn on the canvas compile to real Nebula network +
   firewall primitives (`fabric/nebula.py::sg_rules_to_firewall`,

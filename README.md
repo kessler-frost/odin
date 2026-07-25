@@ -30,9 +30,10 @@ There is one button. Draw nodes, wire edges, click **Apply**:
   VM, ECS → [Colima](https://github.com/abiosoft/colima) containers, Lambda →
   a real [AWS RIE](https://github.com/aws/aws-lambda-runtime-interface-emulator)
   container, ECR → a [`registry:2`](https://github.com/distribution/distribution)
-  container). RDS isn't on Terraform yet — it's provisioned directly as a
-  real Postgres container by odin's reconciler, and the code panel says so
-  instead of silently dropping it.
+  container, RDS → a real Postgres container). Every drawable kind is on
+  Terraform now; anything a canvas asks for that odin can't stand behind
+  (a MySQL engine, say) is listed in the code panel with the reason
+  instead of being silently dropped.
 - Every workload node (EC2, ECS, Lambda) is issued its own AWS keypair and
   gets it automatically — baked into EC2's cloud-init, injected into each ECS
   task's and Lambda's container environment. It only has whatever permissions
@@ -102,8 +103,12 @@ Known v1 limits, recorded rather than hidden:
   doesn't retroactively re-provision the subscription — remove and re-add the
   topic (or its edge) to force it. Fixed on create; the live-edit path is a
   known gap.
-- **RDS** stays off Terraform — it's the reconciler's real Postgres
-  container, not a `tofu`-managed resource, until an RDS gateway model lands.
+- **RDS** is Terraform-managed (`aws_db_instance` → a real Postgres
+  container), but Postgres-only: choosing MySQL or MariaDB is declined with
+  a reason rather than quietly given a Postgres. `allocated_storage` and
+  `instance_class` round-trip faithfully but resize nothing, there are no
+  snapshots, and a node's name must be a valid RDS identifier (lowercase,
+  hyphen-separated).
 - **Nebula** is live single-host: VPC/SG config compiles to real Nebula
   network + firewall primitives, the host runs a real (and fully
   unprivileged — no root, no sudo, no one-time setup) lighthouse process,
@@ -132,10 +137,10 @@ Known v1 limits, recorded rather than hidden:
 - **Runtime:** real containers via Colima (default) or inside a Lima VM
   (`src/odin/runtime/`), and a real Lima VM for EC2 (`src/odin/compute/`).
 - **Control loop:** a Spec Store (Stack = desired, World = observed) with a
-  pure, idempotent `plan(Stack, World) → [Action]` reconciler that still
-  drives the non-Terraform resources (RDS, and the AWS-shaped backings) and
-  projects Terraform-owned resources' live status back into World too, so
-  every node's badge reflects reality regardless of which path provisioned it.
+  pure, idempotent `plan(Stack, World) → [Action]` reconciler that drives
+  the non-Terraform resources (the AWS-shaped backings) and projects
+  Terraform-owned resources' live status back into World too, so every
+  node's badge reflects reality regardless of which path provisioned it.
 
 ## Requirements
 

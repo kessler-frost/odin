@@ -52,16 +52,18 @@ _KIND = {
     "aws_secretsmanager_secret": "secret",
     "aws_ssm_parameter": "ssm",
     "aws_elasticache_cluster": "elasticache",
+    "aws_db_instance": "rds",
 }
 # The attribute each supported type's human-facing name lives in (mirrors
-# hcl.py's builders: s3 uses `bucket`, elasticache uses `cluster_id`,
-# everything else uses `name`).
+# hcl.py's builders: s3 uses `bucket`, elasticache uses `cluster_id`, rds uses
+# `identifier`, everything else uses `name`).
 _NAME_ATTR = {
     "aws_s3_bucket": "bucket", "aws_sqs_queue": "name", "aws_sns_topic": "name",
     "aws_dynamodb_table": "name", "aws_iam_role": "name",
     "aws_cloudwatch_log_group": "name",
     "aws_secretsmanager_secret": "name", "aws_ssm_parameter": "name",
     "aws_elasticache_cluster": "cluster_id",
+    "aws_db_instance": "identifier",
 }
 # canvas kind -> aws_* type, for mode (b) (the inverse of `_KIND`). iam_role,
 # logs, secret and ssm have no backing to enumerate live resources from (all
@@ -69,6 +71,12 @@ _NAME_ATTR = {
 # elasticache likewise: its clusters exist only as gateway-model records plus a
 # real container, and there's no `_import_id` shape to resolve one from outside
 # a canvas Apply (mode (a), reading an existing HCL project, works fine).
+# `rds` DOES stay in it: an `aws_db_instance`'s import id is its bare
+# DBInstanceIdentifier (the `_import_id` default branch) and the gateway answers
+# DescribeDBInstances for real -- the one thing `tofu plan
+# -generate-config-out` cannot recover is the master `password` (no AWS API ever
+# returns it), so a live-imported database comes back with hcl.py's default
+# password rather than the original one.
 _NO_LIVE_IMPORT = {"iam_role", "logs", "secret", "ssm", "elasticache"}
 _TF_TYPE = {kind: rtype for rtype, kind in _KIND.items() if kind not in _NO_LIVE_IMPORT}
 
@@ -95,11 +103,18 @@ _CARRIED_ATTRS = {
     # (redis, 1) -- so a round-trip reproduces the resource without warning
     # about arguments odin does model, just doesn't need on the node.
     "elasticache": {"cluster_id", "engine", "node_type", "num_cache_nodes", "tags"},
+    # `password` IS carried (unlike every other secret odin touches): dropping
+    # it would make a round-trip through generate_tf silently substitute the
+    # DEFAULT password, i.e. a real credential change on the next apply.
+    "rds": {
+        "identifier", "engine", "instance_class", "allocated_storage", "db_name",
+        "username", "password", "skip_final_snapshot", "tags",
+    },
 }
 # The kinds whose user `tags` map survives the round trip as node data (hcl.py's
 # `_tags_block` merges a node's own `tags` field back in for EVERY primary
 # builder, so this is purely about which imports bother to read them).
-_TAGGED_KINDS = {"s3", "logs", "secret", "ssm"}
+_TAGGED_KINDS = {"s3", "logs", "secret", "ssm", "rds"}
 
 
 class Unsupported(BaseModel):
@@ -222,6 +237,16 @@ def _node_data(kind: str, label: str, attrs: dict) -> dict:
         description = hcl.unquote(attrs.get("description"))
         if isinstance(description, str):
             data["description"] = description
+    if kind == "rds":
+        # python-hcl2 parses an unquoted `allocated_storage = 20` as a real int
+        # (the same thing logs' retention does); the canvas fields are text.
+        storage = attrs.get("allocated_storage")
+        data["allocatedStorage"] = str(storage) if isinstance(storage, int) else "20"
+        for attr, field in (("engine", "engine"), ("instance_class", "instanceClass"),
+                            ("db_name", "dbName"), ("username", "username"), ("password", "password")):
+            value = hcl.unquote(attrs.get(attr))
+            if isinstance(value, str):
+                data[field] = value
     if kind in _TAGGED_KINDS:
         tags = _tags(attrs)
         if tags:

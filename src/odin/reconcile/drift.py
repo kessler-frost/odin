@@ -46,16 +46,46 @@ minimum honesty that makes the user's Apply actually work. Per kind:
    the container, exactly parallel to ecs below.
  - ecs: `ecsctl.mark_task_stopped` -> see the next paragraph.
 
-WHICH KINDS: only the three with a real runtime footprint -- ec2 (a real Lima
-VM), ecs (a real task container), lambda (a real RIE container). vpc/subnet/
-sg/iam_role have NO runtime footprint at all (a VPC is a Nebula network
-config + a JSON record, an SG is a compiled firewall, an IAM role is a policy
-document -- there is nothing to `docker ps` or `limactl list` for them, so a
-reality sweep could neither confirm nor deny them). `ecr` is out too: an ECR
-*repository* is a control-plane record (gateway/models/ecr.py), and the
-registry:2 CONTAINER its image bytes live in is a per-env BACKING, already
-supervised by `aws/backings.py`'s own ensure/gc lifecycle -- not this
-projection's business.
+ - rds (W2.7): `rdsctl.mark_instance_failed` -> `failed` with the same kind of
+   reason, and `rdsctl.converge_db_instances` is the Apply-driven recovery, for
+   lambda's exact reason (the provider exposes `status` as read-only Computed,
+   so an `aws_db_instance` whose container died has an empty plan forever).
+   Its CHECK is different from every other kind here, deliberately -- see the
+   next paragraph.
+
+WHICH KINDS: only the four with a real runtime footprint -- ec2 (a real Lima
+VM), ecs (a real task container), lambda (a real RIE container), rds (a real
+Postgres container). vpc/subnet/sg/iam_role have NO runtime footprint at all
+(a VPC is a Nebula network config + a JSON record, an SG is a compiled
+firewall, an IAM role is a policy document -- there is nothing to `docker ps`
+or `limactl list` for them, so a reality sweep could neither confirm nor deny
+them). `ecr` is out too: an ECR *repository* is a control-plane record
+(gateway/models/ecr.py), and the registry:2 CONTAINER its image bytes live in
+is a per-env BACKING, already supervised by `aws/backings.py`'s own ensure/gc
+lifecycle -- not this projection's business.
+
+RDS IS CHECKED BY ITS HEALTH PROBE, NOT BY A LISTING -- the one deliberate
+departure from the bulk-listing shape, and it's what preserves the pre-W2.7
+crash/recover behavior exactly (the reconciler used to run `pg_ready` against
+every rds node on EVERY tick; running it on the sweep cadence is strictly
+cheaper). Two reasons a listing can't do this job:
+  - `ColimaRuntime.container_names` lists exited containers too, so a
+    `docker kill`ed Postgres -- the canonical way a database dies -- would look
+    perfectly present in it.
+  - A container that's up while Postgres inside it is wedged is ALSO down as
+    far as any consumer of the DATABASE_URL fact is concerned, and only a real
+    connection can tell.
+So each `available` instance gets one `pg_ready_sync` against its stored port
+(no subprocess at all), and only when that FAILS does the sweep spend a single
+`status` call to find out which failure it is:
+  - container gone/exited -> a real crash: the record is corrected to `failed`
+    (with the container's real exit code) and the next Apply's converge
+    genuinely brings it back.
+  - container still running -> reported as a verdict but the RECORD IS LEFT
+    ALONE, so a transient probe failure self-heals on the next sweep instead of
+    needing a human Apply. (This mirrors the old reconciler exactly: it only
+    cleared and recreated the container on a real exit, and otherwise just
+    surfaced the connection error.)
 
 MID-BOOT IS NOT DRIFT (the sharpest edge here): a record is only swept when
 it CLAIMS to be up -- ec2 `running`, lambda `Active` and not mid-redeploy,
@@ -81,19 +111,30 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
+from odin.aws.rds import container_name as db_container_name
 from odin.compute.functions import container_name as function_container_name
 from odin.compute.instances import InstanceVm, vm_name
 from odin.compute.tasks import container_name as task_container_name
+from odin.gateway.models import rdsctl
 from odin.gateway.models.ec2compute import mark_instance_terminated
 from odin.gateway.models.ecsctl import mark_task_stopped
 from odin.gateway.models.lambdactl import mark_function_failed
 from odin.gateway.stores import SynthStores
+from odin.reconcile.assertions import pg_ready_sync
 from odin.runtime.colima import ColimaRuntime
 
 log = logging.getLogger("odin.reconcile.drift")
 
 _DEFAULT_SWEEP_TICKS = 10
+
+# How long the rds half waits before re-asking "is it really down?" (see
+# `_sweep_databases`). Short enough that a genuinely dead database is still
+# reported on this same sweep, long enough to outlast a busy-daemon blip. Only
+# ever paid on the failure path, and the whole sweep already runs off the event
+# loop (`Reconciler._drift_verdicts` uses asyncio.to_thread).
+_CONFIRM_DELAY = 1.0
 
 
 def _sweep_ticks() -> int:
@@ -166,6 +207,23 @@ def _task_records(stores: SynthStores, env: str) -> list[tuple[str, str, str]]:
     return out
 
 
+def _db_records(stores: SynthStores, env: str) -> list[tuple[str, dict]]:
+    """(label, record) for every DB instance claiming `available` and carrying a
+    real endpoint port. `creating` is mid-boot (`rdsctl._finish_create` is still
+    polling its own `pg_ready`), `deleting` is mid-teardown and `failed` is
+    already terminal -- the same "only sweep what CLAIMS to be up" rule every
+    other kind here follows."""
+    out: list[tuple[str, dict]] = []
+    for record in rdsctl.records(stores, env):
+        if record["status"] != rdsctl.AVAILABLE or not record.get("endpoint_port"):
+            continue
+        identifier = record["db_instance_identifier"]
+        label = _label(stores.tags.get(env, f"rds:{rdsctl.db_arn(identifier)}", {}), identifier)
+        if label:
+            out.append((label, record))
+    return out
+
+
 def _listing(read) -> frozenset[str] | None:
     """One bulk listing, or None when the CLI call itself failed. LOAD-
     BEARING: an empty listing and a failed listing are NOT the same thing --
@@ -191,16 +249,21 @@ class DriftSweeper:
     Colima, per `TaskRuntime`/`FunctionRuntime`'s own defaults) and a real
     `InstanceVm` (limactl)."""
 
-    def __init__(self, containers=None, vms=None) -> None:
+    def __init__(self, containers=None, vms=None, probe=None) -> None:
         self._containers = containers or ColimaRuntime()
         self._vms = vms or InstanceVm()
+        # W2.7: rds's reality check is a real Postgres connection, not a
+        # listing (module docstring). Injectable for the same reason the two
+        # above are -- a unit test proves the sweep with no database running.
+        self._probe = probe or pg_ready_sync
         self._ticks: dict[str, int] = {}
         self._cache: dict[str, dict[str, str]] = {}
 
     def verdicts(self, stores: SynthStores, env: str) -> dict[str, str]:
-        """`label -> drift verdict` for every ec2/lambda resource whose real
-        VM/container is GONE (ecs reports through its own task records
-        instead -- see the module docstring). Sweeps on the first call and
+        """`label -> drift verdict` for every ec2/lambda/rds resource whose real
+        VM/container is GONE, or whose database has stopped answering (ecs
+        reports through its own task records instead -- see the module
+        docstring). Sweeps on the first call and
         every `_sweep_ticks()` calls after; every other call answers from the
         last sweep's cache, so a reported drift stays reported between
         sweeps instead of flapping back to healthy on the very next tick.
@@ -247,4 +310,49 @@ class DriftSweeper:
                     stores, env, cluster, task_id,
                     f"container {name} removed outside odin — re-Apply to recreate",
                 )
+        self._sweep_databases(stores, env, out)
         return out
+
+    def _probe_db(self, record: dict):
+        return self._probe(
+            "127.0.0.1", record["endpoint_port"],
+            record["master_username"], record["master_password"],
+        )
+
+    def _sweep_databases(self, stores: SynthStores, env: str, out: dict[str, str]) -> None:
+        """rds's half: one real `pg_ready` per available instance, and a
+        `status` call only when that fails (see the module docstring for why a
+        listing can't answer this)."""
+        for label, record in _db_records(stores, env):
+            if self._probe_db(record).ok:
+                continue
+            identifier = record["db_instance_identifier"]
+            name = db_container_name(env, identifier)
+            if self._containers.status(name) == "running":
+                # The container is up but Postgres isn't answering. Reported,
+                # NOT written into the record: this may be transient, and a
+                # corrected record would need a human Apply to undo.
+                out[label] = f"Postgres on {name} is not accepting connections: {self._probe_db(record).error}"
+                continue
+            # CONFIRM BEFORE CORRECTING (found running the real thing): a
+            # single failed sample is not proof. Under real load -- a `tofu
+            # apply` pulling a 250MB image while the daemon is busy -- a probe
+            # can fail AND `docker inspect` can come back empty (which
+            # `ColimaRuntime.status` honestly reports as "absent", since it
+            # cannot tell "no such container" from "docker didn't answer") for
+            # a container that is perfectly alive. Writing `failed` on that
+            # sample corrupts the record, and only a human Apply undoes it --
+            # the exact failure mode `_listing`'s "unknown is not gone" rule
+            # exists to prevent, which this path has to honor too. So: sleep a
+            # beat and ask BOTH questions again, and only correct the record
+            # when both still say down.
+            time.sleep(_CONFIRM_DELAY)
+            if self._probe_db(record).ok or self._containers.status(name) == "running":
+                log.info("drift sweep: %s answered on re-check; treating the first sample as a blip", name)
+                continue
+            exit_code = self._containers.exit_code(name)
+            out[label] = f"container {name} is not running (exit {exit_code}) — re-Apply to recreate"
+            # A confirmed death: the same sentence goes into the RECORD, so the
+            # canvas keeps showing it after a restart and the next Apply's
+            # `converge_db_instances` genuinely re-creates the database.
+            rdsctl.mark_instance_failed(stores, env, identifier, out[label])

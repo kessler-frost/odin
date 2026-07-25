@@ -277,6 +277,42 @@ def test_secret_and_ssm_import_as_their_canvas_kinds():
     assert result.warnings == []
 
 
+# --- rds (W2.7): aws_db_instance <-> the `rds` canvas kind --------------------
+
+
+_RDS_TF = '''
+resource "aws_db_instance" "orders" {
+  identifier          = "orders-db"
+  engine              = "postgres"
+  instance_class      = "db.t3.small"
+  allocated_storage   = 50
+  db_name             = "orders"
+  username            = "svc"
+  password            = "s3cr3t-pw"
+  skip_final_snapshot = true
+
+  tags = {
+    "team" = "core"
+  }
+}
+'''
+
+
+def test_db_instance_imports_as_an_rds_node_keyed_by_its_identifier():
+    result = parse_hcl_text(_RDS_TF)
+    assert len(result.nodes) == 1
+    node = result.nodes[0]
+    assert node["id"] == "orders-db"
+    assert node["type"] == "rds"
+    assert node["data"] == {
+        "label": "orders-db", "allocatedStorage": "50", "engine": "postgres",
+        "instanceClass": "db.t3.small", "dbName": "orders", "username": "svc",
+        "password": "s3cr3t-pw", "tags": {"team": "core"},
+    }
+    assert result.unsupported == []
+    assert result.warnings == []
+
+
 def test_a_secret_version_folds_into_its_secret_nodes_value_field():
     by_id = {n["id"]: n for n in parse_hcl_text(_SECRETS_TF).nodes}
     assert by_id["db-password"]["data"]["secretString"] == "hunter2-and-then-some"
@@ -325,6 +361,20 @@ def test_secret_and_ssm_stay_out_of_the_live_import_path():
     # gateway models), so mode (b) reports them instead of pretending.
     assert "secret" not in _TF_TYPE
     assert "ssm" not in _TF_TYPE
+
+
+def test_db_instance_round_trip_reproduces_every_argument_including_the_password():
+    """A dropped `password` would silently substitute hcl.py's default on the
+    next apply -- a real credential change, so it round-trips."""
+    imported = parse_hcl_text(_RDS_TF)
+    regenerated = generate_tf(canvas_to_stack({"nodes": imported.nodes, "edges": imported.edges})).files["main.tf"]
+    for line in (
+        'identifier          = "orders-db"', 'instance_class      = "db.t3.small"',
+        "allocated_storage   = 50", 'db_name             = "orders"',
+        'username            = "svc"', 'password            = "s3cr3t-pw"',
+        "skip_final_snapshot = true", '"team"      = "core"',
+    ):
+        assert line in regenerated, line
 
 
 def test_bucket_with_computed_name_falls_back_to_hcl_resource_name_as_label():

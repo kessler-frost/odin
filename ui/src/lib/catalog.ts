@@ -75,15 +75,28 @@ export const CATALOG: ServiceDef[] = [
     iamActions: ['kinesis:PutRecord', 'kinesis:GetRecords', 'kinesis:*'],
   },
   {
+    // W2.7: a real `aws_db_instance` (a real Postgres container behind it), so
+    // every argument the HCL builder emits is editable here. `engine` lists
+    // only postgres: that IS the substrate, and an honest Apply declines any
+    // other engine rather than quietly handing you a Postgres (agent/hcl.py).
+    // The name must be a valid RDS identifier (lowercase, hyphen-separated).
     type: 'rds', abbr: 'RDS', label: 'RDS Database', sublabel: 'Relational DB',
     category: 'Database', color: 'sky', width: 220,
     fields: [
       { key: 'label', label: 'Name', editable: true },
-      { key: 'engine', label: 'Engine', editable: true, select: ['postgres', 'mysql', 'mariadb'] },
+      { key: 'engine', label: 'Engine', editable: true, select: ['postgres'] },
       { key: 'instanceClass', label: 'Instance Class', editable: true },
+      { key: 'allocatedStorage', label: 'Storage (GiB)', editable: true },
+      { key: 'dbName', label: 'Database', editable: true },
+      { key: 'username', label: 'Username', editable: true },
+      { key: 'password', label: 'Password', editable: true },
       { key: 'arn', label: 'ARN' },
     ],
-    defaultData: { label: 'db', engine: 'postgres', instanceClass: 'db.t3.micro', arn: '' },
+    defaultData: {
+      label: 'app-db', engine: 'postgres', instanceClass: 'db.t3.micro',
+      allocatedStorage: '20', dbName: 'postgres', username: 'app',
+      password: 'apppass123', arn: '',
+    },
     primary: { key: 'engine', label: 'Engine' },
     iamActions: ['rds-db:connect', 'rds:DescribeDBInstances', 'rds:*'],
   },

@@ -12,6 +12,7 @@ build/
 .odin-v4d-test/
 .odin-w21-test/
 .odin-w24-test/
+.odin-w27-test/
 node_modules/
 bun.lock
 .vite/

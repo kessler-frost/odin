@@ -14,7 +14,10 @@ genuine error (an `error` field, so `cli/http.py::body_or_fail` treats it as
 a hard failure the same way every other odin command already does).
 
 Kind -> real backing:
-- rds: the direct Postgres container (aws/rds.py::PostgresRds).
+- rds: the instance's own Postgres container (aws/rds.py::PostgresRds) --
+  still resolved by node LABEL, which is the DBInstanceIdentifier tofu
+  created it under (agent/hcl.py's `_rds`), so W2.7 moving rds onto
+  Terraform changed nothing here.
 - s3/sqs/sns/dynamodb: the env's shared backing container (aws/backings.py).
 - ec2: the instance's own Lima VM -- no single process to `docker logs`, so
   this reads its systemd journal (compute/instances.py::InstanceVm.logs).

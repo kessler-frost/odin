@@ -199,6 +199,14 @@ class SynthStores:
       (`gateway/models/cachectl.py`, W2.8) -- flat keys `"cluster:{id}"`,
       persisted at `.odin/{env}/gateway/cachectl.json`. ElastiCache tags live
       in the shared `tags` store above, keyed `"elasticache:{arn}"`.
+    - `rdsctl`: the RDS model's whole state (`gateway/models/rdsctl.py`, task
+      W2.7) -- flat keys `"db:{identifier}"`, persisted at
+      `.odin/{env}/gateway/rdsctl.json`. DB-instance tags live in the shared
+      `tags` store above, keyed `"rds:{dbInstanceArn}"`. This record carries the
+      instance's MASTER PASSWORD (the DATABASE_URL World fact is built from it
+      and the drift sweep's health probe authenticates with it) -- the same
+      cleartext value the Stack revision on disk already holds, and this
+      sidecar is written 0600 like every other one.
     """
 
     def __init__(self, root: Path) -> None:
@@ -217,3 +225,4 @@ class SynthStores:
         self.secretsctl = JsonStore(root, "secretsctl")
         self.ssmctl = JsonStore(root, "ssmctl")
         self.cachectl = JsonStore(root, "cachectl")
+        self.rdsctl = JsonStore(root, "rdsctl")
