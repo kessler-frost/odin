@@ -65,6 +65,7 @@ import signal
 import subprocess
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -358,6 +359,28 @@ def sg_rules_to_firewall(permissions: list[dict]) -> FirewallRules:
         if not perm.get("IpRanges") and not perm.get("UserIdGroupPairs"):
             inbound.append(FirewallRule(port=nebula_port, proto=nebula_proto))
     return FirewallRules(inbound=inbound, outbound=[FirewallRule(port="any", proto="any")])
+
+
+def union_firewalls(firewalls: Iterable[FirewallRules]) -> FirewallRules:
+    """The effective firewall for a node carrying SEVERAL security groups.
+
+    AWS's own semantics: security groups are permissive-only (there is no
+    deny rule), so a resource's effective rule set is the UNION of every
+    group attached to it -- W2.6 piece 1, where an EC2 instance's ASSIGNED
+    groups (not merely its VPC's default) compile into its nebula config.
+    De-duplicated (two groups authorizing the identical port/proto/source is
+    one nebula rule, not two) and order-preserving, so the generated config
+    is stable across re-applies. An empty input yields an empty inbound list
+    -- deny-all-inbound, which is exactly what a compiled SG with no ingress
+    rules already means to nebula; the caller decides whether "no groups at
+    all" should instead fall back to something else."""
+    inbound: dict[tuple, FirewallRule] = {}
+    outbound: dict[tuple, FirewallRule] = {}
+    for firewall in firewalls:
+        for side, rules in ((inbound, firewall.inbound), (outbound, firewall.outbound)):
+            for rule in rules:
+                side.setdefault((rule.port, rule.proto, rule.cidr, rule.group), rule)
+    return FirewallRules(inbound=list(inbound.values()), outbound=list(outbound.values()))
 
 
 def _nebula_dir(root: Path, env: str) -> Path:

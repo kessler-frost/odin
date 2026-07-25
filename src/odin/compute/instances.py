@@ -127,17 +127,24 @@ class NebulaJoin:
     the VM's disk -- `root`/`env` locate the env's Nebula network (V1b: one
     per VPC, keyed by env -- see `ec2net.py`'s module docstring), `host_id`
     is the instance id (the cert's `-name`, and the sticky-IP allocation
-    key). `firewall` (R3) is the containing VPC's default security group's
-    ALREADY-compiled Nebula firewall (`ec2net.py::_compiled_firewall`,
-    resolved by `gateway/models/ec2compute.py`'s boot path) -- `None` falls
-    back to `DEFAULT_FIREWALL` (allow-all), matching v1's own "no
-    SecurityGroupIds modeled yet, every instance inherits the VPC default
-    SG" limit exactly as real AWS does for an instance launched with none
-    specified."""
+    key). `firewall` is the ALREADY-compiled Nebula firewall of this
+    instance's ASSIGNED security groups, unioned (W2.6 piece 1 --
+    `ec2compute.py::_instance_firewall`, which falls back to the containing
+    VPC's DEFAULT security group for an instance launched with none, exactly
+    as real AWS does); `None` falls back to `DEFAULT_FIREWALL` (allow-all)
+    for an instance whose groups have no compiled firewall at all.
+
+    `groups` are the instance's security-group IDS, which become its nebula
+    CERT groups (`_nebula_files`). That's the other half of making SG-to-SG
+    rules real: another node's "allow 5432 from sg-web" compiles to a nebula
+    `group: sg-web` rule, and nebula matches that against the PEER's
+    certificate groups -- so without this, an SG-referencing rule could never
+    match anything."""
     root: Path
     env: str
     host_id: str
     firewall: FirewallRules | None = None
+    groups: tuple[str, ...] = ()
 
 
 def _pick_shared_ip(hostname_i_output: str) -> str | None:
@@ -270,7 +277,11 @@ class InstanceVm:
         underlay = (existing.lighthouse_underlay_ip if existing else None) or "127.0.0.1"
         ensure_network(nebula.root, nebula.env, underlay, runner=self._run)
         overlay_ip = manager.allocate_host_ip(nebula.host_id)
-        cert = manager.sign_cert(nebula.host_id, overlay_ip, groups=["ec2"])
+        # "ec2" plus this instance's own security-group ids (W2.6): nebula
+        # matches a peer's `group:` firewall rule against THIS cert's groups,
+        # so the sg ids have to be baked in at signing time -- they're what
+        # another node's "allow 5432 from sg-web" rule tests against.
+        cert = manager.sign_cert(nebula.host_id, overlay_ip, groups=["ec2", *nebula.groups])
         return {
             "ca.crt": cert.ca_crt.read_text(),
             "host.crt": cert.crt.read_text(),

@@ -23,6 +23,7 @@ from odin.fabric.nebula import (
     ensure_network,
     mesh_state,
     sg_rules_to_firewall,
+    union_firewalls,
 )
 from odin.spec.models import Ref, ResourceObserved, World
 
@@ -280,6 +281,42 @@ def test_sg_rules_to_firewall_icmp_has_no_ports(tmp_path):
     mgr = NebulaManager(tmp_path / "nebula", runner=FakeRunner())
     config = yaml.safe_load(mgr.generate_config("10.42.0.1", "127.0.0.1", rules))
     assert config["firewall"]["inbound"][0] == {"port": "any", "proto": "icmp", "cidr": "0.0.0.0/0"}
+
+
+# --- W2.6 piece 1: the union of a node's ASSIGNED security groups ---
+
+
+def test_union_firewalls_merges_every_assigned_group():
+    """AWS SG rules are permissive-only, so a node carrying several groups
+    gets the UNION of their rules -- that's what an instance's assigned
+    groups compile to (`ec2compute.py::_instance_firewall`)."""
+    web = sg_rules_to_firewall([
+        {"IpProtocol": "tcp", "FromPort": 8080, "ToPort": 8080, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+    ])
+    ops = sg_rules_to_firewall([
+        {"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": [{"CidrIp": "10.0.0.0/8"}]},
+    ])
+    merged = union_firewalls([web, ops])
+    assert merged.inbound == [
+        FirewallRule(port="8080", proto="tcp", cidr="0.0.0.0/0"),
+        FirewallRule(port="22", proto="tcp", cidr="10.0.0.0/8"),
+    ]
+    assert merged.outbound == [FirewallRule(port="any", proto="any")]  # deduped, not doubled
+
+
+def test_union_firewalls_dedupes_identical_rules():
+    same = sg_rules_to_firewall([
+        {"IpProtocol": "tcp", "FromPort": 5432, "ToPort": 5432, "UserIdGroupPairs": [{"GroupId": "sg-web"}]},
+    ])
+    merged = union_firewalls([same, same])
+    assert merged.inbound == [FirewallRule(port="5432", proto="tcp", group="sg-web")]
+
+
+def test_union_firewalls_of_nothing_is_deny_all_inbound():
+    """An empty union is an empty inbound list -- exactly what a compiled SG
+    with no ingress rules already means to nebula. Callers that want a
+    fallback (the VPC default SG) must choose it explicitly."""
+    assert union_firewalls([]) == FirewallRules(inbound=[], outbound=[])
 
 
 # --- mesh read model (the UI hook) + lazy bootstrap ---
