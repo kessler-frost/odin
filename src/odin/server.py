@@ -11,7 +11,6 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
-from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
@@ -43,27 +42,13 @@ from odin.simulate.runner import SimulateBusy, TfRunner, TofuNotInstalled
 from odin.spec.models import Stack
 from odin.spec.store import SpecStore
 from odin.spec.translate import canvas_to_stack, skipped_node_types
+from odin.util import odin_version
 
 ODIN_DIR = Path(".odin")
 CANVAS_PATH = ODIN_DIR / "canvas.json"
 ENV = "default"
 
 log = logging.getLogger("odin")
-
-# Single source of truth for the running version: the installed package's own
-# metadata (kept in lockstep with pyproject.toml's `version` by the build).
-# The literal fallback only fires for an editable/unpackaged checkout where
-# `importlib.metadata` has nothing to look up -- it still needs to say
-# SOMETHING plausible rather than raise out of app startup.
-_FALLBACK_VERSION = "0.4.0"
-
-
-def _odin_version() -> str:
-    try:
-        return _pkg_version("odin")
-    except PackageNotFoundError:
-        return _FALLBACK_VERSION
-
 
 # Security finding #1c: CSRF defense-in-depth. odin has no authentication
 # of its own (see __main__.py's loopback-default fix) -- a browser tab open
@@ -585,7 +570,7 @@ def create_app(
                 await reconciler.stop()
             stop_in_thread(gateway_server, gateway_thread)
 
-    app = FastAPI(title="odin", version=_odin_version(), lifespan=lifespan)
+    app = FastAPI(title="odin", version=odin_version(), lifespan=lifespan)
     app.middleware("http")(_csrf_guard)
     app.include_router(create_canvas_router(CANVAS_PATH))
     app.include_router(

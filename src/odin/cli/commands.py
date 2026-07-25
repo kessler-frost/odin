@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from odin.cli import (  # noqa: F401  (registration side effects)
     apply,
+    backup,
     canvas,
     keys,
     observe,

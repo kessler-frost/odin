@@ -13,6 +13,7 @@ import typer
 from odin.cli import commands as _commands  # noqa: F401  (registers the control-surface commands)
 from odin.cli import doctor as _doctor  # noqa: F401  (registers `odin doctor`)
 from odin.cli.app import app
+from odin.util import pid_alive
 
 ODIN_DIR = Path(".odin")
 PID_FILE = ODIN_DIR / "pid"
@@ -48,12 +49,6 @@ def _build_ui() -> None:
         typer.echo("UI already built (ui/dist exists). Run `bun run build` in ui/ to rebuild.")
 
 
-def _pid_exists(pid: int) -> bool:
-    """Check whether a process with the given PID is alive."""
-    result = subprocess.run(["kill", "-0", str(pid)], capture_output=True)
-    return result.returncode == 0
-
-
 @app.command()
 def start(
     port: int = typer.Option(DEFAULT_PORT, "-p", "--port", help="Port (default: 4200)"),
@@ -74,7 +69,7 @@ def start(
 
     if PID_FILE.exists():
         pid = int(PID_FILE.read_text().strip())
-        if _pid_exists(pid):
+        if pid_alive(pid):
             typer.echo(f"Odin is already running (pid {pid}). Use `odin stop` first.")
             return
         PID_FILE.unlink()
@@ -105,7 +100,7 @@ def _start_dev(port: int, host: str = DEFAULT_HOST) -> None:
     """Dev mode startup."""
     if PID_FILE.exists():
         pid = int(PID_FILE.read_text().strip())
-        if _pid_exists(pid):
+        if pid_alive(pid):
             typer.echo(f"Odin is already running (pid {pid}). Use `odin stop` first.")
             return
         PID_FILE.unlink()
@@ -168,7 +163,7 @@ def stop() -> None:
         typer.echo("Odin is not running (no PID file found).")
         return
     pid = int(PID_FILE.read_text().strip())
-    if not _pid_exists(pid):
+    if not pid_alive(pid):
         PID_FILE.unlink(missing_ok=True)
         typer.echo(f"Odin is not running (cleaned up stale pid {pid}).")
         return
@@ -185,7 +180,7 @@ def status() -> None:
         typer.echo("Odin is not running.")
         return
     pid = int(PID_FILE.read_text().strip())
-    if _pid_exists(pid):
+    if pid_alive(pid):
         typer.echo(f"Odin is running (pid {pid}).")
     else:
         typer.echo("Odin is not running (stale PID file). Cleaning up.")
@@ -228,7 +223,7 @@ def clean(all: bool = typer.Option(False, "--all", help="Wipe entire .odin/ dire
 
     if PID_FILE.exists():
         pid = int(PID_FILE.read_text().strip())
-        if not _pid_exists(pid):
+        if not pid_alive(pid):
             PID_FILE.unlink()
             removed.append(".odin/pid")
 

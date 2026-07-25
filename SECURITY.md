@@ -100,6 +100,11 @@ A field like an RDS `password` is stored, and used, in cleartext:
   json`'s ref-resolution facts) — redacting those would just break the
   feature while giving a false sense of security.
 
+- An `odin export` archive is a copy of all of the above: it contains the
+  env's issued gateway credentials (`keys.json`) and every canvas secret in
+  the stack revisions and `world.json`, unencrypted, in a file that is easy
+  to email or drop in cloud storage. Treat it like a private key file.
+
 If you need real secret hygiene (rotation, least-privilege access,
 encryption at rest), odin's local `.odin/` store is not that system — treat
 canvas secrets as dev/test-grade, not production credentials.

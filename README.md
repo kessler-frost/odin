@@ -215,6 +215,8 @@ odin events --env dev               # the event stream, one JSON line each
 odin tf status --env dev            # tofu-side state
 odin destroy --env dev              # full teardown (tofu half included)
 odin import-tf existing.tf          # TF -> canvas JSON (pipe into canvas set -)
+odin export --env dev               # back an env's state up to a tar.gz
+odin import odin-dev-export.tar.gz  # restore it (works with odin down)
 odin doctor                         # toolchain health, with exact fixes
 ```
 
@@ -224,6 +226,51 @@ A round-trip example an agent might run:
 odin canvas get | jq '.nodes += [{"id":"x1","type":"s3","data":{"label":"backups"}}]' | odin canvas set -
 odin apply --env dev
 ```
+
+## Backup and restore
+
+`.odin/` is the only record that an env exists. Lose it and every container
+that env owns is orphaned — nothing left knows they're odin's — and the next
+startup reaper run, seeing no envs, deletes every odin VM. So take a
+snapshot:
+
+```bash
+odin export --env dev                       # -> odin-dev-export.tar.gz
+odin export --env dev -o ~/backups/dev.tgz  # or wherever you want it
+
+odin stop                                   # restore is a server-down operation
+odin import odin-dev-export.tar.gz          # back into env `dev`
+odin import odin-dev-export.tar.gz --env dev2   # or alongside, under a new name
+```
+
+Both commands work directly on the filesystem — no server, no HTTP — because
+the failure they exist for is the one where odin can't start.
+
+**What's in the archive:** the env's whole control plane. The Stack revision
+lineage and `HEAD`, `world.json`, the env's issued gateway credentials, the
+gateway's synth stores and Lambda zips, and the tofu workspace including
+`terraform.tfstate`. Plus a `manifest.json` recording the odin version, env
+name, and timestamp. The only thing deliberately left out is
+`tf/.terraform/` — `tofu init` rebuilds the provider cache from the same
+`main.tf`, and it's hundreds of megabytes.
+
+**What isn't:** data. This is control-plane state — it records that a bucket
+named `uploads` should exist, never the objects inside it. Restore an env and
+you get fresh, empty backings matching the archived desired state; a file you
+had put in that bucket is gone. Container volumes are not backed up.
+
+Importing state doesn't boot anything either. It puts odin's model of the
+world back; `odin start` plus one Apply converges reality to it.
+
+Guardrails, because both of these are destructive by nature: `import` refuses
+to overwrite an existing env directory unless you pass `--force`, refuses to
+run at all while odin is up, and rejects any archive containing an absolute
+path, a `..` traversal, or a symlink member. The shared `.odin/canvas.json`
+travels in the archive but is restored only under `--with-canvas` — a restore
+should never silently replace the canvas you're drawing on.
+
+The archive contains the env's credentials in cleartext. Treat the file like
+a private key — see [SECURITY.md](SECURITY.md#secrets).
 
 ## Security
 
