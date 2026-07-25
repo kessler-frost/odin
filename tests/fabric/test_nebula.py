@@ -697,6 +697,36 @@ def test_a_lighthouse_whose_recorded_port_got_taken_moves_and_records_the_move(t
     assert stored["lighthouse_port"] == moved
 
 
+def test_two_concurrent_boots_in_one_env_start_exactly_one_lighthouse(tmp_path, free_ports):
+    """Two VMs in one env boot on their own threads, and a backing can join at
+    the same moment -- so `ensure_started` must be serialized per env. With a
+    per-env port an unserialized loser would MOVE the env to a fresh port,
+    spawn a SECOND lighthouse and overwrite the winner's pidfile, leaking the
+    winner (caught in the field as a stray `nebula` process after a two-VM
+    integration test)."""
+    runner = FakeRunner()
+    ensure_network(tmp_path, "prod", "1.2.3.4", runner=runner)
+    calls: list[list[str]] = []
+    # A pid that is genuinely alive, so the second caller's own `is_running`
+    # sees what it would see in production: the winner's live process.
+    mgr = LighthouseManager(popen=_fake_popen(calls, pid=os.getpid()), runner=runner, nebula_bin="nebula")
+    results: list[bool] = []
+
+    def boot():
+        results.append(mgr.ensure_started(tmp_path, "prod", "192.168.64.1"))
+
+    threads = [threading.Thread(target=boot) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert results == [True, True]
+    assert len(calls) == 1, f"exactly one nebula process, got {calls}"
+    stored = json.loads((tmp_path / "prod" / "nebula" / "overlay.json").read_text())
+    assert stored["lighthouse_port"] == nebula_module.LIGHTHOUSE_PORT, "and the port never moved"
+
+
 def test_mesh_state_reports_which_port_this_env_owns(tmp_path, free_ports):
     ensure_network(tmp_path, "prod", "1.2.3.4", runner=FakeRunner())
     assert mesh_state(tmp_path, "prod").lighthouse_port == nebula_module.LIGHTHOUSE_PORT

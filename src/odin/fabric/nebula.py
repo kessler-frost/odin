@@ -615,11 +615,14 @@ class LighthouseManager:
             "lighthouse port %s for env %r is already in use; moving this env to %s "
             "(mesh members pick it up on their next re-join)", recorded, env, fresh,
         )
-        with _lock_for_dir(manager._dir):
-            current = manager.load_overlay()
-            if current is not None:
-                current.lighthouse_port = fresh
-                manager.save_overlay(current)
+        # No lock of its own: every caller reaches this while already holding
+        # THIS env's nebula-dir lock (`ensure_started`), which is what makes
+        # "read the port, maybe move it, spawn, write the pidfile" one critical
+        # section instead of a race.
+        current = manager.load_overlay()
+        if current is not None:
+            current.lighthouse_port = fresh
+            manager.save_overlay(current)
         return fresh
 
     def ensure_started(self, root: Path, env: str, underlay: str) -> bool:
@@ -627,7 +630,22 @@ class LighthouseManager:
         False when the network isn't bootstrapped yet, `nebula` isn't on
         PATH, or it exits immediately (bad cert/config); the caller logs and
         moves on rather than failing an otherwise-successful instance boot
-        over mesh wiring."""
+        over mesh wiring.
+
+        SERIALIZED PER ENV, and that is load-bearing: two VMs in one env boot
+        on their own threads (`compute/instances.py::_activate_nebula`) and a
+        backing can join at the same moment (`fabric/sidecar.py`), so without
+        this both can see `is_running()` False and spawn. That used to be
+        self-limiting -- the loser lost the bind on the one fixed port and
+        exited -- but with a per-env port the loser would instead MOVE the env
+        to a fresh port, spawn a second lighthouse, and overwrite the winner's
+        pidfile, leaking the winner (found by a stray `nebula` process after a
+        two-VM integration test). Inside the lock the loser simply sees a
+        running lighthouse and returns True."""
+        with _lock_for_dir(_nebula_dir(root, env)):
+            return self._start_locked(root, env, underlay)
+
+    def _start_locked(self, root: Path, env: str, underlay: str) -> bool:
         if self.is_running(root, env):
             return True
         manager = NebulaManager(_nebula_dir(root, env), runner=self._run)
