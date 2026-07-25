@@ -13,7 +13,9 @@ import time
 
 from odin.gateway.policy import compile_policies
 from odin.gateway.stores import SynthStores
-from odin.reconcile.drift import DriftSweeper
+from odin.compute.tasks import container_name as task_container_name
+from odin.reconcile import tf_status
+from odin.reconcile.drift import DriftSweeper, _sweep_ticks
 from odin.reconcile.reconciler import Reconciler
 from odin.runtime.colima import _STATUS_TO_PHASE, ContainerFacts, HostFacts, RunHandle
 from odin.spec.models import Edge, FieldValue, ResourceDesired, Stack
@@ -413,6 +415,109 @@ async def test_hold_reports_known_drift_without_sweeping_for_more(tmp_path):
         )
     await recon.tick()
     assert store.current_world().get("server").phase == "crashed"  # the real sweep still runs after
+
+
+class FakeTaskContainers:
+    """A `TaskRuntime` stand-in for the ECS half of the projection, keyed by
+    task id. `absent` is what `ColimaRuntime.status` answers for a container
+    that no longer exists."""
+
+    def __init__(self, statuses: dict[str, str]) -> None:
+        self._statuses = statuses
+
+    def status(self, env, task_id, container_name):
+        return self._statuses.get(task_id, "running")
+
+    def exit_code(self, env, task_id, container_name):
+        return 0
+
+    def logs(self, env, task_id, container_name, tail=20):
+        return ""
+
+
+def _ecs_service_stores(tmp_path, task_ids):
+    stores = SynthStores(tmp_path)
+    taskdef_arn = "arn:aws:ecs:us-east-1:000000000000:task-definition/app:1"
+    stores.ecsctl.set("default", "service:odin:app", {
+        "cluster_name": "odin", "service_name": "app", "desired_count": len(task_ids),
+        "status": "ACTIVE", "task_definition_arn": taskdef_arn,
+    })
+    for task_id in task_ids:
+        stores.ecsctl.set("default", f"task:odin:{task_id}", {
+            "cluster_name": "odin", "service_name": "app", "task_id": task_id, "container_name": "app",
+            "last_status": "RUNNING", "stopped_reason": None, "exit_code": None, "stopped_at": None,
+            "task_definition_arn": taskdef_arn,
+        })
+    return stores
+
+
+async def test_a_task_container_removed_mid_apply_is_seen_within_one_tick(tmp_path, monkeypatch):
+    """FIELD TEST 4, P4-4, re-measured after the `absent` fix.
+
+    The drift SWEEP is cache-only during an apply (the test above), but the ECS
+    half of observation never went through it: `tf_status.project` runs
+    `ecsctl.sweep_tasks` LIVE on every observing tick, hold or no hold. That
+    sweep used to recognise only `exited`/`dead`/`removing`, so a container
+    that was GONE matched nothing and the task kept reading RUNNING for the
+    rest of the apply — 57 seconds stale in the field test, 14 of them after
+    the apply had already returned. Recognising `absent` closes it on the
+    passive path: no `docker ps`, no record correction by the sweeper, just the
+    per-task `status` call the projection was already making."""
+    rt = FakeRuntime()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(ResourceDesired(id="app", kind="ecs"),)))
+    stores = _ecs_service_stores(tmp_path, ["t1", "t2"])
+    monkeypatch.setattr(
+        tf_status, "TaskRuntime", lambda: FakeTaskContainers({"t1": "running", "t2": "running"}),
+    )
+    # The drift sweeper sees BOTH containers, so it is not what reports this.
+    recon = Reconciler(
+        store, rt, poll_interval=0, stores=stores,
+        drift=_drift(container_names=[task_container_name("default", t, "app") for t in ("t1", "t2")]),
+    )
+    await recon.tick()
+    assert store.current_world().get("app").phase == "healthy"
+
+    async with recon.hold():  # an apply is now in flight, actions suspended
+        monkeypatch.setattr(
+            tf_status, "TaskRuntime", lambda: FakeTaskContainers({"t1": "running", "t2": "absent"}),
+        )
+        await recon.tick()
+
+        observed = store.current_world().get("app")
+        assert observed.phase == "crashed", "an out-of-band removal was invisible for the whole apply"
+        assert stores.ecsctl.get("default", "task:odin:t2")["last_status"] == "STOPPED"
+
+
+async def test_a_deleted_ec2_vm_is_NOT_seen_until_the_apply_releases(tmp_path):
+    """The other half of P4-4, and the part that is still true: ec2/lambda/rds
+    are checked ONLY by the drift sweep, which an in-flight apply reads from
+    cache. Recorded as a test (and in ROADMAP's v1 limits) rather than fixed —
+    a sweep CORRECTS records off a sample taken while tofu has the daemon
+    pinned, which is the busy-daemon hazard `drift.py` exists to avoid."""
+    rt = FakeRuntime()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(ResourceDesired(id="server", kind="ec2"),)))
+    stores = _ec2_stores(tmp_path)
+    recon = Reconciler(store, rt, poll_interval=0, stores=stores, drift=_drift(vm_names=["odin-ec2-default-i-1"]))
+    await recon.tick()
+    assert store.current_world().get("server").phase == "healthy"
+
+    async with recon.hold():
+        recon._drift._vms = FakeVms(names=[])  # the VM is deleted out of band, mid-apply
+        for _ in range(30):  # 30 ticks — a whole apply's worth
+            await recon.tick()
+        assert store.current_world().get("server").phase == "healthy", "the sweep ran mid-apply"
+
+    # ...and the tail the field test measured: the trailing tick both routes run
+    # after the hold does NOT force a sweep either — the cadence counter never
+    # advanced while suspended, so the truth lands on the next SWEEP, up to
+    # `ODIN_DRIFT_SWEEP_TICKS` (10, ~10s) ticks later.
+    await recon.tick()
+    assert store.current_world().get("server").phase == "healthy"
+    for _ in range(_sweep_ticks()):
+        await recon.tick()
+    assert store.current_world().get("server").phase == "crashed"
 
 
 async def test_an_ordinary_apply_does_not_burst_deltas(tmp_path):

@@ -272,7 +272,21 @@ class Reconciler:
         pulling images and booting VMs -- the exact busy-daemon load
         drift.py's own confirm-before-correcting note names as the hazard.
         The cache still carries any drift reported BEFORE the apply, so
-        nothing already known goes quiet mid-apply."""
+        nothing already known goes quiet mid-apply.
+
+        WHAT THAT COSTS, and where it is written down (field test 4, P4-4):
+        the cached half covers ec2, lambda and rds ONLY. ECS is not affected --
+        `project_tf_owned` runs `ecsctl.sweep_tasks` live on every one of these
+        ticks, and that sweep recognises a VANISHED container (`absent`), so a
+        task container removed out of band mid-apply is caught on the next
+        tick, not after the apply. For the other three the staleness lasts the
+        rest of the apply plus up to one sweep cadence (default 10 ticks, ~10s)
+        after it returns, since the cadence counter never advanced while
+        suspended. That is a REAL LIMIT a user can hit, so it lives in
+        ROADMAP's "v1 limits, recorded rather than hidden" list -- not only
+        here. Field test 4 hit it as 57s of a stale task count, and the two
+        `tests/reconcile/test_reconciler.py` tests named in that entry pin both
+        halves."""
         drifted = await self._drift_verdicts(act)
         projected = await asyncio.to_thread(project_tf_owned, self._stores, self._env)
         for label, (kind, phase, facts, verdict) in projected.items():

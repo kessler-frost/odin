@@ -275,7 +275,11 @@ class DriftSweeper:
         tofu has the daemon pinned is the hazard `_sweep_databases`'s own
         confirm-before-correcting note describes. The cadence counter is not
         advanced either, so a suspended apply neither delays nor triggers the
-        next real sweep.
+        next real sweep. What that costs -- ec2/lambda/rds go unchecked for the
+        rest of the apply plus up to one cadence after it, while ECS does not
+        (a vanished task container is caught live by `ecsctl.sweep_tasks`
+        inside `tf_status.project` itself) -- is written down as a limit in
+        ROADMAP, not just here (field test 4, P4-4).
 
         This overlay is the FIRST report, not the lasting one: the same sweep
         corrects the underlying record, and a corrected record is no longer a
