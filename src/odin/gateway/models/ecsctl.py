@@ -27,7 +27,12 @@ Reconciler loop): CreateService/UpdateService spawn a background thread
 ec2compute/lambdactl already use) that converges the service's REAL task
 containers toward `desiredCount` -- launch when short, newest-task-first
 scale-down when over (the digest's own ordering), and replace any task
-still running a STALE `taskDefinition` revision. This does NOT live in
+still running a STALE `taskDefinition` revision. That replacement SURGES
+FIRST and RETIRES SECOND, honoring the service's own
+`deploymentConfiguration`: the previous revision keeps serving until enough
+replacements are genuinely RUNNING to hold the `minimumHealthyPercent`
+floor, so a deployment that can never succeed no longer destroys the one
+that works (field test 3 -- see `_retire_stale`). This does NOT live in
 `reconcile/reconciler.py`'s main tick: the gateway model owns ALL of ECS's
 state end to end, and it's the AWS provider's own repeated `Describe*` READ
 calls during `apply`/`plan` (its create/update waiters) that drive

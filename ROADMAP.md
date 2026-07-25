@@ -131,14 +131,44 @@ future decision against these points instead of re-deriving them:
     also counts draining old-revision tasks, but it distinguishes them with a
     SECOND deployment record, which odin does not model — with one deployment
     record, current-revision-only is the sole self-consistent choice.
-    **Residual gap, stated plainly:** odin retires the stale tasks before
-    launching replacements, so a failed image update still takes the service to
-    zero until the next Apply (real ECS's `minimumHealthyPercent = 100` keeps
-    the old tasks serving). Closing that needs the World projection to
-    distinguish "serving the previous revision" from "healthy", or a service
-    running old tasks would report `healthy` while its deployment failed — a
-    worse lie than the outage. The apply now FAILS loudly either way, so CI
-    stops instead of scoring the outage green. (Fixed: a
+    **The outage this used to cost, and the fix (v0.7.2, field test 3).** Until
+    v0.7.2 odin stopped every stale task BEFORE launching a single replacement.
+    Measured, not estimated — three healthy tasks serving HTTP 200, one typo'd
+    image tag, sampled every 2 seconds: **the service went from 3 tasks to 0
+    about four seconds after the apply started**, 108 consecutive samples at
+    zero with every port refusing, and **the operator was told nothing for
+    ~59 more seconds** while CI showed "running" against a service that was
+    100% down. Nothing self-healed: 90+ further seconds of watching left the
+    world `crashed`, and only another Apply brought it back. One typo, total
+    outage in four seconds, no signal for a minute, down indefinitely.
+    That was previously deferred as a genuine dichotomy — `minimumHealthyPercent
+    = 100` would keep the old tasks serving, but a revision-blind projection
+    would then report `healthy` while the deployment was dead, "a worse lie
+    than the outage". **The dichotomy was false**, because the B1 fix above had
+    already added per-task current-revision accounting: "N tasks serving the
+    PREVIOUS revision, the new deployment failed" is computable from what odin
+    already stores. So both halves now ship together — the scheduler surges
+    first and retires second, honoring a real per-service
+    `deploymentConfiguration` (`ecsctl._retire_stale` / `_serving_floor`,
+    emitted explicitly as `deployment_minimum_healthy_percent = 100` /
+    `deployment_maximum_percent = 200`), and the World projection is
+    revision-aware, so a service left serving its previous revision reads
+    **`error`** — never `healthy`, never `crashed` — with a verdict like
+    `2 tasks serving the previous revision; deployment of <image> failed: <why>`.
+    Sampled proof with real containers
+    (`tests/simulate/test_ecs_failed_update_keeps_serving_e2e.py`): across a
+    62.4s failed apply, **3 tasks and 3 HTTP 200s on every single sample —
+    outage window zero seconds** — and a good update still applies in 4.6s,
+    briefly running 6 tasks (the 200% surge), all of them serving.
+    **Residual gap, stated plainly:** `/apply-full` holds the reconciler's tick
+    lock for the whole tofu run, so `/world` is FROZEN at its last pre-apply
+    reading for ~60s. The ~59-second blind window the field test measured is
+    therefore unchanged — what changed is that it now conceals a rollout whose
+    old revision is still serving every request, instead of concealing a total
+    outage. Also: a replacement that takes longer than
+    `ecsctl._ROLLOUT_STABILIZE_SECONDS` to crash is counted as serving and the
+    old revision is retired anyway (real ECS behaves the same for a service
+    with no health check configured). (Fixed: a
     `tags` block on `aws_ecs_service` now plans zero-drift — the gateway stores
     the full tag set and echoes it back, with
     `TagResource`/`UntagResource`/`ListTagsForResource` modeled.)

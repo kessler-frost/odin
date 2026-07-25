@@ -25,7 +25,12 @@ never by this projection or the reconciler itself).
 Observability v1 (w1): `verdict` carries WHY a TF-owned resource is
 `crashed` -- ec2's real `StateReason`, lambda's real `StateReason`, ecs's
 real `stoppedReason` + exit code -- the same fields the AWS API itself would
-show, never invented text. `_ecs_services` also calls ecsctl's own
+show, never invented text. Field test 3 added ONE non-`crashed` verdict, for
+the same reason: an ecs service whose new deployment failed while the
+PREVIOUS revision keeps serving (ecsctl's `_retire_stale`) is neither
+`healthy` nor `crashed`, so it projects `error` and the verdict says which --
+"N tasks serving the previous revision; deployment of <image> failed: <why>",
+every part of it read from real task/taskdef records. `_ecs_services` also calls ecsctl's own
 `sweep_tasks` once per projection: the ONE deliberate, idempotent mutation
 this otherwise-pure module makes, syncing a service's task records against
 their REAL container status (a task whose container already exited on its
