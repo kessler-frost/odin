@@ -377,6 +377,49 @@ def test_invoke_surfaces_function_error_header(sink, lambda_, stores):
     assert parsed["FunctionError"] == "Unhandled"
 
 
+def test_a_failing_invocation_is_recorded_on_the_function_record(sink, lambda_, stores):
+    """Field test 2 finding #4: a function failing EVERY invocation reported
+    `healthy` and nothing else, because the FunctionError the RIE reported went
+    into the response header and nowhere else. `reconcile/tf_status.py` turns
+    this field into the node's verdict."""
+    substrate = FakeFunctionRuntime(invoke_response=b'{"errorType": "Runtime.HandlerNotFound"}', invoke_error="Unhandled")
+    _create(stores, sink, lambda_, substrate)
+    _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
+    assert stores.lambdactl.get(ENV, "fn:fn1")["last_invocation_error"] is None  # cold: no alarm
+
+    _invoke_once(stores, sink, lambda_, substrate)
+
+    assert stores.lambdactl.get(ENV, "fn:fn1")["last_invocation_error"] == "Unhandled"
+
+
+def test_a_redeploy_clears_the_recorded_invocation_failure(sink, lambda_, stores):
+    # Fixing the handler and re-Applying must not leave the old deployment's
+    # failure verdict standing: this deployment hasn't been invoked yet.
+    substrate = FakeFunctionRuntime(invoke_response=b"{}", invoke_error="Unhandled")
+    _create(stores, sink, lambda_, substrate)
+    _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
+    _invoke_once(stores, sink, lambda_, substrate)
+    assert stores.lambdactl.get(ENV, "fn:fn1")["last_invocation_error"] == "Unhandled"
+
+    req = sink.call(lambda: lambda_.update_function_code(FunctionName="fn1", ZipFile=b"PK\x03\x04fixed"))
+    _answer(stores, req, substrate)
+
+    assert stores.lambdactl.get(ENV, "fn:fn1")["last_invocation_error"] is None
+
+
+def test_a_recovering_invocation_clears_the_recorded_failure(sink, lambda_, stores):
+    substrate = FakeFunctionRuntime(invoke_response=b"{}", invoke_error="Unhandled")
+    _create(stores, sink, lambda_, substrate)
+    _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
+    _invoke_once(stores, sink, lambda_, substrate)
+    assert stores.lambdactl.get(ENV, "fn:fn1")["last_invocation_error"] == "Unhandled"
+
+    substrate.invoke_error = None  # the handler was fixed and redeployed
+    _invoke_once(stores, sink, lambda_, substrate)
+
+    assert stores.lambdactl.get(ENV, "fn:fn1")["last_invocation_error"] is None
+
+
 def test_invoke_before_active_is_not_ready(sink, lambda_, stores):
     substrate = FakeFunctionRuntime(block=threading.Event())  # never released -- stays Pending
     _create(stores, sink, lambda_, substrate)

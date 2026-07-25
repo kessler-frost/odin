@@ -386,6 +386,11 @@ def _create_function(resource: str, env: str, body: bytes, stores: SynthStores, 
         "last_update_status": "InProgress",
         "last_update_status_reason": None,
         "last_update_status_reason_code": None,
+        # The most recent Invoke's `FunctionError`, or None when the last one
+        # succeeded (field test 2 finding #4 -- see `_invoke`). Present from
+        # creation so a never-invoked function is honestly "no failure" rather
+        # than "unknown".
+        "last_invocation_error": None,
         "revision_id": str(uuid.uuid4()),
     }
     stores.lambdactl.set(env, _key(name), fn)
@@ -450,6 +455,12 @@ def _redeploy_fields(extra: dict[str, object]) -> dict[str, object]:
         "last_update_status": "InProgress",
         "last_update_status_reason": None,
         "last_update_status_reason_code": None,
+        # A redeploy replaces the code/config, so an outcome recorded for the
+        # PREVIOUS deployment no longer describes the deployed function: this
+        # one hasn't been invoked yet (field test 2 finding #4). Without the
+        # reset, fixing a handler and re-Applying would leave the old
+        # invocation-failure verdict standing until the next invoke.
+        "last_invocation_error": None,
         "revision_id": str(uuid.uuid4()),
         **extra,
     }
@@ -601,6 +612,13 @@ def _invoke(resource: str, env: str, body: bytes, stores: SynthStores, now: floa
     # container's stderr, and that traceback is the whole reason CloudWatch
     # Logs exists.
     _ship_logs(stores, env, resource, substrate)
+    # ...and both outcomes are RECORDED, which is the honesty half (field test
+    # 2 finding #4): a function failing every single invocation used to report
+    # `healthy` and nothing else, because `FunctionError` went into the response
+    # header and nowhere durable. `reconcile/tf_status.py::_invocation_verdict`
+    # projects this field as the node's verdict -- the phase stays `healthy`
+    # (the deploy really did succeed) while the verdict says the handler didn't.
+    _update_function(stores, env, resource, last_invocation_error=result.function_error)
     headers = {"x-amz-function-error": result.function_error} if result.function_error else {}
     return Response(result.payload, status_code=200, media_type="application/json", headers=headers)
 
