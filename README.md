@@ -78,6 +78,39 @@ Network reachability (who can talk to whom on the wire) is a separate concern,
 handled by [Nebula](https://github.com/slackhq/nebula) — VPCs and Security
 Groups drawn on the canvas compile to real Nebula network + firewall config.
 
+## "What's wrong here?"
+
+Select one or more nodes on the canvas (click, or Cmd-drag a region) and a bar
+appears with a **What's wrong here?** button and a free-form question box. Odin
+gathers each selected node's desired config, its references to other nodes, its
+observed phase and real crash verdict (an ECS task's `stoppedReason` + exit
+code, an EC2 or Lambda `StateReason`, a Postgres connection error), its last
+few events, and a tail of its real container/VM logs — then one model call
+answers in plain English and names per-node suspects with reasons.
+
+This is the one place in odin where the AI is load-bearing. Generating
+Terraform from the canvas and reading it back are deterministic code, on
+purpose; there is no deterministic function from *exit code 1 + forty lines of
+stdout* to *"this task exits because the config it expects was never
+supplied"*. The compiler builds; the agent explains.
+
+Honest about what it needs and what it can't do:
+
+- It requires the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python)
+  — the `claude` CLI on your `PATH`, signed in. Without it the answer is
+  literally `agent unavailable` and the panel says so. Nothing else in odin
+  needs it; `ODIN_DEBUG_AGENT=0` turns the feature off outright, and
+  `ODIN_DEBUG_TIMEOUT` (default 90s) bounds the call.
+- Secrets never reach the model: env-var **values** are reduced to key names,
+  any field odin flags sensitive is `[REDACTED]`, and every string in the
+  evidence — including log lines and an RDS node's `DATABASE_URL` facts — is
+  scrubbed of known secret values first.
+- It reads state and returns prose. It cannot change your canvas, your
+  Terraform, or anything running.
+- The evidence is capped (40 log lines and 10 events per node, 20 nodes), so a
+  failure whose cause scrolled past that window won't be in the answer. The
+  Logs tab has the full tail.
+
 ## What's on the canvas today
 
 Compute: EC2, Lambda, ECS. Networking: VPC, Subnet, Security Group (draw an
@@ -128,7 +161,9 @@ Known v1 limits, recorded rather than hidden:
   default) can review the generated file and add comments or tags; every
   return is re-validated against the skeleton (same resource set, every
   argument's value byte-identical) and discarded on any deviation, so it
-  cannot change what gets applied.
+  cannot change what gets applied. The one genuinely agent-shaped job in here
+  is failure explanation (`agent/debugger.py`, `POST /agent/debug`) — see
+  ["What's wrong here?"](#whats-wrong-here) above.
 - **Runtime:** real containers via Colima (default) or inside a Lima VM
   (`src/odin/runtime/`), and a real Lima VM for EC2 (`src/odin/compute/`).
 - **Control loop:** a Spec Store (Stack = desired, World = observed) with a
