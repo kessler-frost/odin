@@ -95,6 +95,7 @@ from odin.fabric.models import FirewallRules
 from odin.fabric.nebula import union_firewalls
 from odin.gateway import errors
 from odin.gateway.models import ec2net
+from odin.gateway.models.ec2compute import membership_revision
 from odin.gateway.stores import NO_CHANGE, SynthStores
 from odin.reconcile.assertions import pg_ready_sync
 from odin.runtime.colima import CONTAINER_HOST, ColimaRuntime
@@ -453,7 +454,12 @@ def _join_mesh(stores: SynthStores, env: str, identifier: str, rds: PostgresRds)
     if record is None:
         return
     firewall = _db_firewall(stores, env, record.get("vpc_security_group_ids") or [])
-    _update(stores, env, identifier, overlay_ip=rds.join_mesh(identifier, firewall))
+    # Field test 4: the database is the ADMITTING member, so it is the one that
+    # must re-check flows it ALREADY admitted when a client's group is revoked.
+    # `membership_revision` is what makes its reload count -- see
+    # `fabric/nebula.py::FIREWALL_REVISION_KEY`.
+    revision = membership_revision(stores, env)
+    _update(stores, env, identifier, overlay_ip=rds.join_mesh(identifier, firewall, revision))
 
 
 def _wait_available(rds: PostgresRds, identifier: str, user: str, password: str, deadline: float) -> tuple[int, str | None]:
@@ -757,9 +763,15 @@ def ensure_db_mesh(
 
     Cheap and idempotent by construction (`MeshSidecar.ensure`): an unchanged
     firewall with a running sidecar is a couple of file reads plus one
-    container-status call, and only a genuinely CHANGED config restarts the
-    daemon. `failed` instances are `converge_db_instances`' business -- their
-    re-create joins the mesh on its own."""
+    container-status call; a firewall-only change is a SIGHUP that drops no
+    tunnel, and only a deeper change replaces the daemon. `failed` instances
+    are `converge_db_instances`' business -- their re-create joins the mesh on
+    its own.
+
+    Runs AFTER `ec2compute.ensure_instance_mesh` (server.py), because a
+    database is the ADMITTING member of the SG rules that matter and it has to
+    see a revoked client's NEW certificate before it re-checks the flows it
+    already granted -- field test 4, `membership_revision`."""
     rds = substrate or PostgresRds(ColimaRuntime(), env, root=stores.root)
     for record in records(stores, env):
         if record["status"] == AVAILABLE:

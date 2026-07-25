@@ -584,19 +584,30 @@ def create_apply_full_router(
         # scenario-2 crash/recover behavior survive the move off the
         # reconciler -- see reconcile/drift.py's rds notes.
         rdsctl.converge_db_instances(stores, env)
-        # W2.6: and push each live database's SG-compiled firewall into its mesh
-        # sidecar. An apply is exactly the right cadence -- security groups are
-        # TF-owned, so an edited `db-sg` only reaches the gateway here, and
-        # nebula reads its firewall at startup. Also heals a sidecar that was
-        # killed under a still-running database. See rdsctl.ensure_db_mesh.
-        rdsctl.ensure_db_mesh(stores, env)
-        # ...and the same push for every RUNNING EC2 VM (field test 2 HIGH-1).
-        # An SG edit reached the gateway and the newly-created VMs but never
-        # the already-running ones, so one drawn group enforced two different
-        # firewalls on the wire. Idempotent and cheap: an instance whose
-        # compiled rules are unchanged is one local file comparison -- no
-        # `limactl`, no signal. See ec2compute.ensure_instance_mesh.
+        # W2.6/field test 2 HIGH-1: push every RUNNING EC2 VM's CURRENT
+        # security groups into its already-booted VM. An SG edit reached the
+        # gateway and the newly-created VMs but never the already-running ones,
+        # so one drawn group enforced two different firewalls on the wire.
+        # Idempotent and cheap: an instance whose compiled rules and membership
+        # are unchanged is one local file comparison -- no `limactl`, no
+        # signal. See ec2compute.ensure_instance_mesh.
+        #
+        # BEFORE the database pass, and that order is load-bearing (field test
+        # 4). A revoke closes an ALREADY-OPEN flow by making the ADMITTING
+        # member re-check it against the peer's CURRENT certificate -- so the
+        # peer (the VM) has to be holding its new certificate before the
+        # admitter (usually the database) reloads. This pass re-signs the VM,
+        # restarts its daemon and pokes it into re-handshaking with every peer,
+        # all synchronously, so by the time it returns the database is looking
+        # at the new identity.
         await asyncio.to_thread(ec2compute.ensure_instance_mesh, stores, env)
+        # ...then push each live database's SG-compiled firewall into its mesh
+        # sidecar. An apply is exactly the right cadence -- security groups are
+        # TF-owned, so an edited `db-sg` only reaches the gateway here. Also
+        # heals a sidecar that was killed under a still-running database, and
+        # carries the membership revision that closes the flows above. See
+        # rdsctl.ensure_db_mesh.
+        rdsctl.ensure_db_mesh(stores, env)
         # Field test 3 (HIGH): an Apply may not report success while a service
         # is short of its desired task count. tofu's own `wait_for_steady_state`
         # only runs when tofu UPDATES the service, so every apply tofu sees as a

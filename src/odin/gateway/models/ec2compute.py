@@ -88,7 +88,7 @@ from xml.sax.saxutils import escape
 from starlette.responses import Response
 
 from odin.aws.backings import ACCOUNT, REGION
-from odin.compute.instances import InstanceVm, NebulaJoin, vm_name
+from odin.compute.instances import InstanceVm, NebulaJoin, membership_changed, vm_name
 from odin.compute.models import INSTANCE_TYPES, get_instance_type
 from odin.fabric.models import FirewallRules
 from odin.fabric.nebula import LighthouseManager, union_firewalls
@@ -676,6 +676,11 @@ def _run_instances(params: dict[str, str], env: str, stores: SynthStores, now: f
         # UserIdGroupPairs rule -- `sg_rules_to_firewall` compiles it to
         # `group: sg-...`) actually match this instance on the wire.
         groups=tuple(security_group_ids),
+        # Computed AFTER this instance's own record is stored, so it is the
+        # same digest `ensure_instance_mesh` computes on the next Apply -- a VM
+        # that boots and is then left alone renders a byte-identical config
+        # forever, and costs one local file compare per Apply.
+        revision=membership_revision(stores, env),
     ) if vpc else None
     ssh_pubkey = keypair.get("public_key") if keypair else None
     user_data = base64.b64decode(user_data_b64).decode("utf-8", "replace") if user_data_b64 else None
@@ -978,6 +983,37 @@ class MeshRefreshFailed(RuntimeError):
     could not be applied, and what to do about it."""
 
 
+def membership_revision(stores: SynthStores, env: str) -> str:
+    """A digest of WHO IS IN WHICH SECURITY GROUP across this whole env.
+
+    Field test 4, and the one number that makes a revoke reach flows that are
+    already open. Every mesh member renders this inside its nebula `firewall`
+    block (`fabric/nebula.py::FIREWALL_REVISION_KEY`), where nebula ignores the
+    value but a CHANGE to it makes a reload count -- and a counted reload is
+    what makes nebula re-validate the conntrack entries it is already holding
+    against each peer's CURRENT certificate. Without it, revoking `web1`'s
+    group closed every NEW connection to the database and left the session
+    `web1` already had wide open.
+
+    Deliberately a function of the DESIRED roster, read here, rather than a
+    counter someone bumps: every member computes it from the same store at the
+    same Apply, so it cannot matter which member is refreshed first, and two
+    Applies over an unchanged canvas produce identical bytes -- an env whose
+    membership did not move pays nothing at all (one local file compare per
+    member, no signal, no restart).
+
+    Only EC2 instances appear: they are the only members whose certificate
+    groups can change (a backing's are the constant `["backing"]` --
+    `fabric/sidecar.py::_join`). Terminated instances are left out; their VMs
+    are gone, so their identities can admit nothing."""
+    roster = {
+        record["instance_id"]: sorted(record.get("security_group_ids") or [])
+        for record in _records(stores, env, "instance")
+        if record.get("state_name") != "terminated"
+    }
+    return hashlib.sha256(json.dumps(roster, sort_keys=True).encode()).hexdigest()[:16]
+
+
 def ensure_instance_mesh(stores: SynthStores, env: str, vm: InstanceVm | None = None) -> dict[str, str]:
     """Push each RUNNING instance's CURRENT compiled security groups into its
     already-booted VM -- `rdsctl.ensure_db_mesh`'s exact twin, for the exact
@@ -1003,22 +1039,35 @@ def ensure_instance_mesh(stores: SynthStores, env: str, vm: InstanceVm | None = 
     instance that is not `running`, or has no VPC, is skipped entirely --
     there is no daemon to talk to.
 
+    RE-CERTIFICATION GOES FIRST, and that ordering is the third half (field
+    test 4). An admitting member closes a flow it already permitted by
+    re-checking it against the peer's CURRENT certificate -- so the peer must
+    already be holding the new one. An instance whose membership moved is
+    therefore refreshed (re-signed, restarted, and poked into re-handshaking
+    with every peer) before any instance that merely reloads, and
+    `server.py` runs this whole pass BEFORE `rdsctl.ensure_db_mesh` for
+    exactly the same reason: the database is usually the admitting member.
+
     RAISES `MeshRefreshFailed` if any running VM did not take its update. That
     is the whole point: a security control that cannot be applied must not be
     reported as applied."""
     machine = vm or InstanceVm()
-    actions: dict[str, str] = {}
+    revision = membership_revision(stores, env)
+    joins: list[NebulaJoin] = []
     for record in _records(stores, env, "instance"):
         vpc = stores.ec2net.get(env, f"vpc:{record['vpc_id']}") if record.get("vpc_id") else None
         if record["state_name"] != "running" or vpc is None:
             continue
         group_ids = record.get("security_group_ids") or []
-        nebula = NebulaJoin(
+        joins.append(NebulaJoin(
             root=stores.root, env=env, host_id=record["instance_id"],
             firewall=_instance_firewall(stores, env, vpc, group_ids), groups=tuple(group_ids),
-        )
-        actions[vm_name(env, record["instance_id"])] = machine.refresh_nebula(
-            vm_name(env, record["instance_id"]), nebula,
+            revision=revision,
+        ))
+    actions: dict[str, str] = {}
+    for nebula in sorted(joins, key=lambda join: not membership_changed(join)):
+        actions[vm_name(env, nebula.host_id)] = machine.refresh_nebula(
+            vm_name(env, nebula.host_id), nebula,
         )
     _refuse_to_report_success(env, stores, actions)
     return actions

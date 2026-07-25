@@ -102,8 +102,6 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-import yaml
-
 from odin.compute.cloud_init import generate_cloud_init
 from odin.compute.lima_yaml import generate_lima_yaml
 from odin.compute.models import VmConfig
@@ -113,6 +111,7 @@ from odin.fabric.nebula import (
     LighthouseManager,
     NebulaManager,
     ensure_network,
+    firewall_only_change,
     peer_overlay_ips,
     rehandshake_script,
 )
@@ -274,12 +273,21 @@ class NebulaJoin:
     rules real: another node's "allow 5432 from sg-web" compiles to a nebula
     `group: sg-web` rule, and nebula matches that against the PEER's
     certificate groups -- so without this, an SG-referencing rule could never
-    match anything."""
+    match anything.
+
+    `revision` is the env's whole MEMBERSHIP roster, digested (field test 4).
+    Rendered inside the firewall block, where nebula ignores it but a change
+    to it makes a reload count -- which is what closes flows this VM had
+    ALREADY admitted from a member that has since left the group
+    (`fabric/nebula.py::FIREWALL_REVISION_KEY`). It is deliberately about the
+    WHOLE env, not this instance: the member that has to act on a revoke is
+    the one that was ADMITTING, and its own groups did not change at all."""
     root: Path
     env: str
     host_id: str
     firewall: FirewallRules | None = None
     groups: tuple[str, ...] = ()
+    revision: str = ""
 
 
 def _pick_shared_ip(hostname_i_output: str) -> str | None:
@@ -303,20 +311,6 @@ def _write_files_script(files: dict[str, str]) -> str:
     return "\n".join(lines)
 
 
-def _firewall_only_change(before: str | None, after: str) -> bool:
-    """Is the ONLY difference between two rendered configs the `firewall`
-    block? That is the one section nebula genuinely reloads on SIGHUP, so it
-    is the one case where a running daemon can adopt the change without
-    dropping its tunnels. No previous config at all (an unreadable VM) is not
-    evidence of anything, so it answers False -- restart, the safe side."""
-    if before is None:
-        return False
-    old, new = yaml.safe_load(before) or {}, yaml.safe_load(after) or {}
-    old.pop("firewall", None)
-    new.pop("firewall", None)
-    return old == new
-
-
 def _cert_groups(nebula: NebulaJoin) -> list[str]:
     """The groups this instance's certificate must carry: `ec2` plus its
     CURRENT security-group ids. Sorted, because the order the gateway happens
@@ -337,6 +331,19 @@ def _record_membership(nebula: NebulaJoin) -> None:
 def _recorded_membership(nebula: NebulaJoin) -> list[str] | None:
     path = instance_membership_path(nebula.root, nebula.env, nebula.host_id)
     return json.loads(path.read_text()) if path.exists() else None
+
+
+def membership_changed(nebula: NebulaJoin) -> bool:
+    """Would `refresh_nebula` have to re-issue this instance's certificate?
+    One local file read, no subprocess -- `_reissue_cert`'s own test, exposed
+    so a CALLER can order its work by it.
+
+    `gateway/models/ec2compute.py::ensure_instance_mesh` is that caller, and
+    the ordering is load-bearing (field test 4): the admitting member re-checks
+    an already-open flow against the PEER'S CURRENT certificate, so the peer
+    has to be holding its new one by then. Re-certify first, reload the
+    admitters after."""
+    return _recorded_membership(nebula) != _cert_groups(nebula)
 
 
 def _extra_provision_script(nebula_files: dict[str, str] | None, user_data: str | None) -> str | None:
@@ -522,6 +529,7 @@ class InstanceVm:
             # machine-global 4342 meant only one env's lighthouse could
             # ever bind, so a second env's mesh silently never worked.
             lighthouse_port=network.lighthouse_port,
+            firewall_revision=nebula.revision,
         )
 
     def _push_config(self, name: str, nebula: NebulaJoin, config: str) -> None:
@@ -564,6 +572,10 @@ class InstanceVm:
         those here is a moved lighthouse port, and in exactly that case the
         tunnel is ALREADY dead, so a restart costs nothing and a SIGHUP would
         be a lie. So: firewall-only diff -> SIGHUP; anything else -> restart.
+        `NebulaJoin.revision` rides inside that same firewall block, so a
+        membership change ELSEWHERE in the env reaches this VM as a reload
+        too -- what closes its already-open flows to the moved member without
+        a restart storm (field test 4).
 
         MEMBERSHIP (field test 3 HIGH-1) is the third case, and the one that
         used to be missing entirely. An instance's security groups are baked
@@ -602,7 +614,7 @@ class InstanceVm:
         self._push_config(name, nebula, config)
         action = (
             "recertified" if recertified
-            else "reloaded" if _firewall_only_change(current, config)
+            else "reloaded" if firewall_only_change(current, config)
             else "restarted"
         )
         command = (

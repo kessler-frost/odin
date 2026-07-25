@@ -12,16 +12,29 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import yaml
 
 from odin.fabric.models import FirewallRule, FirewallRules
-from odin.fabric.nebula import NebulaManager, ensure_network
+from odin.fabric.nebula import FIREWALL_REVISION_KEY, LIGHTHOUSE_PORT, NebulaManager, ensure_network
 from odin.fabric.sidecar import NEBULA_IMAGE, MeshSidecar
 from odin.runtime.colima import ContainerSpec
 
 ENV = "prod"
 TARGET = "odin-rds-prod-db"
 MEMBER = TARGET
+
+
+@pytest.fixture(autouse=True)
+def pinned_lighthouse_port(monkeypatch):
+    """Port allocation PROBES the real machine (`fabric/nebula.py::_port_free`
+    binds a UDP socket), so a rendered `static_host_map` asserted against a
+    literal 4342 fails whenever any live env on this Mac happens to hold that
+    port -- a unit test failing on the state of somebody else's running
+    server. `ODIN_LIGHTHOUSE_PORT` is the seam that already exists for
+    exactly this ("honoured verbatim: no probing, no reallocation"), so
+    pinning it makes these assertions about the RENDERER again."""
+    monkeypatch.setenv("ODIN_LIGHTHOUSE_PORT", str(LIGHTHOUSE_PORT))
 
 
 class FakeRunner:
@@ -51,6 +64,7 @@ class FakeRuntime:
         self.specs: list = []
         self.stopped: list[str] = []
         self.built: list[tuple[str, str]] = []
+        self.signals: list[tuple[str, str]] = []
         self.probes: list[tuple[str, str]] = []
         self.probe_reply = ""
         self._images = set(images)
@@ -79,6 +93,9 @@ class FakeRuntime:
 
     def network_mode(self, name):
         return self._netmode.get(name, "")
+
+    def signal(self, name, sig):
+        self.signals.append((name, sig))
 
     def exec_sh(self, name, script):
         self.probes.append((name, script))
@@ -230,9 +247,15 @@ def test_unchanged_join_does_not_restart_the_sidecar(tmp_path):
     assert len(runtime.specs) == 1, "an unchanged firewall must not churn the daemon every tick"
 
 
-def test_changed_firewall_restarts_the_sidecar(tmp_path):
-    """nebula reads its firewall only at start, so an edited SG has to replace
-    the daemon -- otherwise a canvas edit silently never takes effect."""
+def test_changed_firewall_reloads_the_sidecar_in_place(tmp_path):
+    """An edited SG must reach the running daemon -- but nebula RELOADS its
+    firewall on SIGHUP, so replacing the container (what this used to do) tore
+    down every tunnel the database held for a change nebula can take in place.
+
+    The reload path also stopped being optional with field test 4: the
+    membership revision lives in this same block and moves far more often than
+    a rule does, so a restart here would be a restart on every membership
+    change anywhere in the env."""
     ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
     runtime = FakeRuntime()
     mesh = _sidecar(tmp_path, runtime)
@@ -242,10 +265,71 @@ def test_changed_firewall_restarts_the_sidecar(tmp_path):
         outbound=DB_FIREWALL.outbound,
     )
     mesh.ensure(TARGET, MEMBER, firewall=widened)
-    assert len(runtime.specs) == 2
-    assert runtime.stopped.count(f"{TARGET}-mesh") == 2  # stopped before each (re)start
+    assert len(runtime.specs) == 1, "a firewall edit must not replace the daemon"
+    assert runtime.signals == [(f"{TARGET}-mesh", "HUP")]
     config = yaml.safe_load((tmp_path / ENV / "nebula" / "members" / MEMBER / "config.yml").read_text())
-    assert len(config["firewall"]["inbound"]) == 2
+    assert len(config["firewall"]["inbound"]) == 2, "and the new rules are on disk for it to read"
+
+
+def test_a_change_outside_the_firewall_still_replaces_the_daemon(tmp_path):
+    """SIGHUP covers `firewall` and nothing else -- nebula deliberately does
+    NOT reload `static_host_map`/`lighthouse`/`relay`. A moved lighthouse port
+    is exactly that case, and answering it with a reload would be a lie: the
+    sidecar would go on dialing a port nobody is listening on."""
+    ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
+    runtime = FakeRuntime()
+    mesh = _sidecar(tmp_path, runtime)
+    mesh.ensure(TARGET, MEMBER, firewall=DB_FIREWALL)
+    manager = NebulaManager(tmp_path / ENV / "nebula")
+    overlay = manager.load_overlay()
+    overlay.lighthouse_port = overlay.lighthouse_port + 1
+    manager.save_overlay(overlay)
+
+    mesh.ensure(TARGET, MEMBER, firewall=DB_FIREWALL)
+    assert len(runtime.specs) == 2, "a moved lighthouse port must re-join, not SIGHUP"
+    assert runtime.signals == []
+
+
+def test_the_membership_revision_rides_in_the_firewall_block_and_reloads(tmp_path):
+    """Field test 4. A revoke has to close flows the database ALREADY admitted,
+    and nebula re-validates a conntrack entry only when its OWN ruleset version
+    moves -- never when a peer's certificate changes. `revision` is what moves
+    it: nebula ignores the key, so the rules are provably untouched, and a
+    reload with it changed still counts as a new ruleset.
+
+    All three properties in one test, because they are one contract: the value
+    is rendered where nebula looks for firewall config, an unchanged one costs
+    nothing, and a changed one is a SIGHUP rather than a restart."""
+    ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
+    runtime = FakeRuntime()
+    mesh = _sidecar(tmp_path, runtime)
+    mesh.ensure(TARGET, MEMBER, firewall=DB_FIREWALL, revision="rev-one")
+    config_path = tmp_path / ENV / "nebula" / "members" / MEMBER / "config.yml"
+    assert yaml.safe_load(config_path.read_text())["firewall"][FIREWALL_REVISION_KEY] == "rev-one"
+
+    mesh.ensure(TARGET, MEMBER, firewall=DB_FIREWALL, revision="rev-one")
+    assert runtime.signals == [], "an unchanged roster must not signal anything"
+    assert len(runtime.specs) == 1
+
+    mesh.ensure(TARGET, MEMBER, firewall=DB_FIREWALL, revision="rev-two")
+    assert runtime.signals == [(f"{TARGET}-mesh", "HUP")]
+    assert len(runtime.specs) == 1, "a membership change must never restart the database's daemon"
+    after = yaml.safe_load(config_path.read_text())["firewall"]
+    assert after[FIREWALL_REVISION_KEY] == "rev-two"
+    assert after["inbound"] == [{"port": "5432", "proto": "tcp", "group": "sg-web"}], (
+        "and the RULES are untouched -- that is what makes this reload a no-op with a new version"
+    )
+
+
+def test_no_revision_renders_no_key_at_all(tmp_path):
+    """An env that has never seen a membership change must render exactly the
+    bytes it rendered before this existed -- otherwise shipping the fix would
+    itself churn every sidecar on the first Apply after an upgrade."""
+    ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
+    mesh = _sidecar(tmp_path, FakeRuntime())
+    mesh.ensure(TARGET, MEMBER, firewall=DB_FIREWALL)
+    config = yaml.safe_load((tmp_path / ENV / "nebula" / "members" / MEMBER / "config.yml").read_text())
+    assert FIREWALL_REVISION_KEY not in config["firewall"]
 
 
 def test_a_replaced_target_container_gets_a_fresh_sidecar(tmp_path):

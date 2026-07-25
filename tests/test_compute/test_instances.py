@@ -30,8 +30,21 @@ from odin.compute.instances import (
 )
 from odin.compute.models import get_instance_type
 from odin.fabric.models import FirewallRule, FirewallRules
+from odin.fabric.nebula import LIGHTHOUSE_PORT
 
 NAME = vm_name("default", "i-0123456789abcdef0")
+
+
+@pytest.fixture(autouse=True)
+def pinned_lighthouse_port(monkeypatch):
+    """Port allocation PROBES the real machine (`fabric/nebula.py::_port_free`
+    binds a UDP socket), so a rendered `static_host_map` asserted against a
+    literal 4342 fails whenever any live env on this Mac happens to hold that
+    port -- a unit test failing on the state of somebody else's running
+    server. `ODIN_LIGHTHOUSE_PORT` is the seam that already exists for
+    exactly this ("honoured verbatim: no probing, no reallocation"), so
+    pinning it makes these assertions about the RENDERER again."""
+    monkeypatch.setenv("ODIN_LIGHTHOUSE_PORT", str(LIGHTHOUSE_PORT))
 
 
 class FakeRunner:
