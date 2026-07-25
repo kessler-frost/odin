@@ -236,6 +236,13 @@ def _finish_deploy(
     container_env = dict(env_vars)
     if keystore is not None and gateway_port is not None and label:
         container_env.update(workload_env(keystore, env, label, gateway_port))
+    # `ensure` REPLACES the container (`FunctionRuntime.ensure` stops any
+    # remnant first), so its output starts back at line 1 -- the log-shipping
+    # cursor for that stream has to be forgotten here or `_ship_logs` would
+    # mistake the new container's first lines for already-ingested ones
+    # (logsctl.py's `ingest_tail`/`reset_cursor`). Already-stored events are
+    # untouched: this resets the read position, not the log.
+    logsctl.reset_cursor(stores, env, f"/aws/lambda/{name}", container_name(env, name))
     # Deliberately broad: this runs on a daemon thread with no caller to
     # propagate an exception to -- see ec2compute.py's `_finish_boot` for
     # the identical "silent hang is forbidden" reasoning.

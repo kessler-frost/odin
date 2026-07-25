@@ -324,8 +324,15 @@ def test_concurrent_redeploys_do_not_corrupt_or_drop_each_others_fields(sink, la
     assert not errors
     # None of the 8 concurrent redeploys was silently overwritten by another
     # -- each independently reached `_redeploy_response` and spawned its own
-    # `_finish_deploy` (the fake substrate's `ensure` is synchronous/fast
-    # here, so all 8 plus the initial create have already landed).
+    # `_finish_deploy`. Those run on DAEMON threads, so this waits for all 9
+    # (8 redeploys + the initial create) rather than assuming they've already
+    # landed: the fake substrate's `ensure` is fast, not instantaneous, and
+    # asserting a thread-count immediately after `join()`ing the REQUEST
+    # threads is a race (found empirically once `_finish_deploy` grew one more
+    # store write ahead of `ensure` -- W2.1's log-shipping cursor reset).
+    deadline = time.monotonic() + 2.0
+    while len(substrate.ensured) < 9 and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert len(substrate.ensured) == 9
     # The sidecar itself was never left mid-write/corrupted by the hammering.
     sidecar = tmp_path / ENV / "gateway" / "lambdactl.json"
@@ -453,6 +460,29 @@ def test_handler_error_invoke_still_ships_its_traceback(sink, lambda_, stores):
     parsed = _parse("Invoke", _invoke_once(stores, sink, lambda_, substrate))
     assert parsed["FunctionError"] == "Unhandled"
     assert "ValueError: boom" in "\n".join(e["message"] for e in _shipped(stores))
+
+
+def test_a_redeploy_resets_the_cursor_so_the_new_containers_first_lines_still_ship(sink, lambda_, stores):
+    """A redeploy REPLACES the RIE container, whose output starts back at line
+    1 -- `_finish_deploy` forgets the stream's cursor (logsctl's
+    `reset_cursor`), so the fresh container's first lines are ingested instead
+    of being mistaken for already-seen ones. The events already stored stay
+    put: this resets the read position, never the log."""
+    substrate = FakeFunctionRuntime(log_text="old one\nold two\nold three\n")
+    _create(stores, sink, lambda_, substrate)
+    _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
+    _invoke_once(stores, sink, lambda_, substrate)
+    assert [e["message"] for e in _shipped(stores)] == ["old one", "old two", "old three"]
+
+    # The new container prints FEWER lines than the old cursor counted -- the
+    # exact case a stranded cursor would swallow whole.
+    substrate.log_text = "new one\n"
+    req = sink.call(lambda: lambda_.update_function_code(FunctionName="fn1", ZipFile=b"PK\x03\x04new"))
+    _parse("UpdateFunctionCode", _answer(stores, req, substrate))
+    _wait_for(stores, sink, lambda_, "fn1", "LastUpdateStatus", "Successful", substrate)
+
+    _invoke_once(stores, sink, lambda_, substrate)
+    assert [e["message"] for e in _shipped(stores)] == ["old one", "old two", "old three", "new one"]
 
 
 def test_invoke_before_active_never_reads_the_container_logs(sink, lambda_, stores):

@@ -532,6 +532,11 @@ def ingest_tail(stores: SynthStores, env: str, group: str, stream: str, text: st
         of that burst rather than duplicating anything -- the deliberate
         trade-off of keeping the cursor a plain line count instead of
         streaming every container continuously.
+
+    A cursor is only valid for as long as the container behind the stream is:
+    a REPLACED container starts its output back at line 1, so whoever replaces
+    it must call `reset_cursor` (see `lambdactl.py`'s redeploy path) or the new
+    container's first lines would be mistaken for already-ingested ones.
     """
     lines = text.splitlines()
     cursor = int(stores.logsctl.get(env, _cursor_key(group, stream), 0))
@@ -541,6 +546,19 @@ def ingest_tail(stores: SynthStores, env: str, group: str, stream: str, text: st
     appended = ingest(stores, env, group, stream, fresh)
     stores.logsctl.set(env, _cursor_key(group, stream), cursor + appended)
     return appended
+
+
+def reset_cursor(stores: SynthStores, env: str, group: str, stream: str) -> None:
+    """Forget how many lines of `stream` have been ingested -- called by
+    whoever REPLACES the real container behind that stream (a Lambda
+    redeploy), whose fresh output starts back at line 1. Without it,
+    `ingest_tail` would skip the new container's first lines; with it, no line
+    is lost and none is duplicated (the events already stored stay put -- this
+    resets the READ position, never the log). A stream with no cursor yet (the
+    first deploy of a function) is left completely alone rather than
+    rewriting the whole sidecar for a key that isn't there."""
+    if stores.logsctl.get(env, _cursor_key(group, stream)) is not None:
+        stores.logsctl.delete(env, _cursor_key(group, stream))
 
 
 def stored_events(stores: SynthStores, env: str, group: str, tail: int) -> list[dict]:
