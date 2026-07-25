@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from odin.gateway.models import elbv2ctl, rdsctl, secretsctl, ssmctl
 from odin.gateway.stores import SynthStores
+from odin.reconcile import mesh_health
 from odin.reconcile.tf_status import TF_OWNED_KINDS, project
 from odin.runtime.colima import CONTAINER_HOST
 from odin.runtime.lima import LIMA_HOST
@@ -707,6 +708,30 @@ def test_a_database_on_the_mesh_also_publishes_its_gated_overlay_address(tmp_pat
     assert facts["DATABASE_URL_MESH"] == "postgresql://app:apppass123@10.42.1.4:5432/postgres"
     assert facts["endpoint"] == "host.docker.internal:54321"  # the host path, unchanged
     assert facts["DATABASE_URL_VM"] == "postgresql://app:apppass123@host.lima.internal:54321/postgres"
+
+
+def test_a_dead_mesh_path_withholds_the_overlay_fact_and_ends_healthy(tmp_path):
+    """Field test 2 HIGH-2/B8, at the projection: the database is fine on its
+    published host port, but the address odin ADVERTISES for mesh consumers
+    cannot be reached (here: this env has a Nebula network and no lighthouse
+    process, exactly B8's case). It must stop reading `healthy`, stop handing
+    out that address, and say why -- while the two host forms carry on
+    untouched. `reconcile/mesh_health.py`'s own tests cover every failure mode
+    and the sweep cadence; this one pins that `project` is wired to it."""
+    stores = SynthStores(tmp_path)
+    _db(stores, "app-db", "app-db", overlay_ip="10.42.1.4")
+    nebula = tmp_path / ENV / "nebula"
+    nebula.mkdir(parents=True)
+    (nebula / "ca.crt").write_text("---ca---\n")  # this env HAS a mesh
+
+    mesh_health.reset_cache()
+    _, phase, facts, verdict = project(stores, ENV)["app-db"]
+
+    assert phase == "crashed", "healthy on an unverified overlay address is the bug"
+    assert "DATABASE_URL_MESH" not in facts and "endpoint_mesh" not in facts
+    assert facts["endpoint"] == "host.docker.internal:54321"
+    assert "10.42.1.4:5432 is unreachable" in verdict
+    mesh_health.reset_cache()
 
 
 def test_a_database_with_no_mesh_publishes_no_overlay_facts(tmp_path):

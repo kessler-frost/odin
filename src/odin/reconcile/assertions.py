@@ -4,6 +4,12 @@ Scope: a Postgres (rds) is healthy when a real connection + `SELECT 1`
 succeeds. The AWS-shaped PROVISIONED kinds (s3/sqs/sns/dynamodb) are checked
 directly against their backing (see reconciler._observe_provisioned), not here.
 
+`mesh_ready_sync` is the second assertion, and it exists because EVERY other
+probe in odin dials the published HOST port -- so odin could advertise a
+`*_MESH` endpoint (the SG-gated overlay address, the only governed path) that
+had been dead for minutes while reporting the resource `healthy`. Field test
+2 hit exactly that, twice.
+
 W2.7 moved rds onto Terraform, so this assertion's two callers are now the
 GATEWAY's RDS model (`gateway/models/rdsctl.py` -- its CreateDBInstance
 waiter only reports `available` once this passes, which is what a
@@ -60,3 +66,63 @@ def pg_ready_sync(host: str, port: int, user: str, password: str, db: str = "pos
 
 async def pg_ready(host: str, port: int, user: str, password: str, db: str = "postgres") -> PgReady:
     return await asyncio.to_thread(pg_ready_sync, host, port, user, password, db)
+
+
+@dataclass(frozen=True)
+class MeshReady:
+    """`mesh_ready_sync`'s result. `error` is the probe's REAL output (busybox
+    `nc -v`'s own text), never invented -- it becomes the World verdict a user
+    reads when the overlay path is down."""
+
+    ok: bool
+    error: str | None = None
+
+
+# The success token. `exec_sh` hands back stdout only, so the script PRINTS
+# proof rather than relying on an exit code we'd have to plumb through the
+# runtime port -- and an empty stdout (container gone, exec refused, docker
+# unavailable) is then automatically "not proven", never a false green.
+MESH_PROBE_TOKEN = "odin-mesh-ok"  # noqa: S105 -- a marker string, not a secret
+
+
+def mesh_probe_script(overlay_ip: str, port: int, timeout: float = 3.0) -> str:
+    """The whole probe: one bounded TCP connect to the OVERLAY address.
+
+    `nc -z` (zero-I/O scan) is present in the sidecar image's busybox
+    (verified: BusyBox v1.36.1 on alpine:3.20 -- `-z`, `-v` and `timeout` all
+    supported), so this needs no addition to the image and works on an image
+    already baked on a user's machine. Bounded TWICE on purpose: `-w` bounds
+    nc's own connect, and `timeout` bounds nc itself, so a wedged namespace
+    can never hang a reconciler tick."""
+    return (
+        f"timeout {int(timeout) + 2} nc -vz -w {int(timeout)} {overlay_ip} {port} 2>&1"
+        f" && echo {MESH_PROBE_TOKEN}"
+    )
+
+
+def mesh_ready_sync(runtime, sidecar: str, overlay_ip: str, port: int, timeout: float = 3.0) -> MeshReady:
+    """Does the address odin PUBLISHES as the mesh endpoint actually answer,
+    on the overlay, right now?
+
+    Run from INSIDE the member's own network namespace (the nebula sidecar
+    shares it, `fabric/sidecar.py`), which is the only rootless place a check
+    can stand: the macOS host is deliberately NOT a mesh data-plane member (a
+    host tun device would need a sudoers grant -- see fabric/nebula.py's R4
+    note), so the host itself cannot dial an overlay IP at all.
+
+    WHAT THIS PROVES: the nebula tun device exists in the target's CURRENT
+    namespace with the overlay IP assigned, and the upstream process really is
+    listening on that address -- i.e. `endpoint_mesh` names something alive.
+    It is exactly what was false in field test 2: with the sidecar stranded in
+    a dead container's namespace, the overlay IP was up but nothing answered
+    on it, while the host-port probe stayed green.
+
+    WHAT IT DOES NOT PROVE: that a given REMOTE peer can reach it -- that also
+    needs the env's lighthouse (discovery + relay) and depends on the peer's
+    certificate satisfying this member's compiled SG firewall. Lighthouse
+    liveness is checked separately (`reconcile/mesh_health.py`); the SG part is
+    a policy decision, not a fault, so no probe should ever "fix" it."""
+    out = runtime.exec_sh(sidecar, mesh_probe_script(overlay_ip, port, timeout))
+    if MESH_PROBE_TOKEN in out:
+        return MeshReady(ok=True)
+    return MeshReady(ok=False, error=out.strip() or f"nothing answered at {overlay_ip}:{port} on the overlay")

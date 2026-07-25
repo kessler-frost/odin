@@ -51,10 +51,12 @@ simply not projected yet, rather than guessing.
 from __future__ import annotations
 
 from odin.aws.rds import POSTGRES_PORT
+from odin.aws.rds import container_name as db_container_name
 from odin.compute.tasks import TaskRuntime
 from odin.gateway.models import cachectl, elbv2ctl, logsctl, rdsctl, ssmctl
 from odin.gateway.models.ecsctl import sweep_tasks
 from odin.gateway.stores import SynthStores
+from odin.reconcile import mesh_health
 from odin.runtime.colima import CONTAINER_HOST
 from odin.runtime.lima import LIMA_HOST
 
@@ -201,6 +203,13 @@ def _ssm_parameters(stores: SynthStores, env: str) -> Projected:
     return out
 
 
+# The two rds facts that name the OVERLAY (SG-gated) address rather than the
+# published host port -- withheld together the moment that path stops
+# answering, so odin never hands out an endpoint it hasn't verified
+# (reconcile/mesh_health.py).
+_DB_MESH_KEYS = ("DATABASE_URL_MESH", "endpoint_mesh")
+
+
 def _db_facts(record: dict) -> dict:
     """The rds facts the Fabric resolves `${{db.DATABASE_URL}}` from -- the
     EXACT four keys (and the exact two host forms) the reconciler's own
@@ -260,7 +269,14 @@ def _db_instances(stores: SynthStores, env: str) -> Projected:
     the reconciler. Facts are published ONLY for an `available` instance -- a
     `failed` one has no working endpoint, and advertising the last known
     DATABASE_URL for a dead database is exactly the kind of stale-green lie the
-    reality sweep exists to kill. The verdict then carries WHY."""
+    reality sweep exists to kill. The verdict then carries WHY.
+
+    `mesh_health.gate` extends that same rule to the ONE fact whose path no
+    other probe in odin ever checks: `DATABASE_URL_MESH` names the SG-gated
+    overlay address, and `pg_ready` only ever proves the published HOST port
+    (field test 2 -- a database `healthy` for minutes on a mesh endpoint that
+    had been dead since its container was recreated). It costs nothing for an
+    instance with no mesh fact."""
     out: Projected = {}
     for record in rdsctl.records(stores, env):
         identifier = record["db_instance_identifier"]
@@ -271,7 +287,12 @@ def _db_instances(stores: SynthStores, env: str) -> Projected:
         phase = _RDS_PHASE.get(record["status"], "starting")
         facts = _db_facts(record) if record["status"] == rdsctl.AVAILABLE else {}
         verdict = (record.get("status_reason") or None) if phase == "crashed" else None
-        out[label] = ("rds", phase, facts, verdict)
+        container = db_container_name(env, identifier)
+        out[label] = mesh_health.gate(
+            ("rds", phase, facts, verdict), root=stores.root, env=env,
+            target=container, member=container,  # PostgresRds.mesh_member == the container name
+            overlay_ip=record.get("overlay_ip"), port=POSTGRES_PORT, mesh_keys=_DB_MESH_KEYS,
+        )
     return out
 
 
