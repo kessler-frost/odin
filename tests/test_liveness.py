@@ -137,6 +137,52 @@ def test_a_lock_file_nobody_holds_is_not_a_live_server(tmp_path: Path):
     assert util.live_server(root) is None
 
 
+def test_deleting_the_lock_file_lets_two_processes_hold_one_store(tmp_path: Path, held_lock):
+    """WHY `odin clean --all` now refuses while a server is up (v0.7.4).
+
+    An flock lives on the INODE, not on the name, so unlinking the file
+    releases nothing -- and that is precisely what makes it dangerous. This
+    reproduces both consequences, with real kernel locks and no fakes:
+
+      1. odin goes BLIND: `live_server` finds no lock file, so `odin status`
+         says "not running" and `odin import` restores into a live store --
+         the v0.7.0 bug, re-created by hand.
+      2. EXCLUSION IS LOST: the next `hold_store_lock` creates a NEW inode and
+         takes an uncontended lock on it, so two processes each hold "the"
+         store lock at the same time. Both would reconcile the same envs'
+         real containers.
+    """
+    root = _store(tmp_path)
+    first = held_lock(root)
+    lock_path = root / util.STORE_LOCK_NAME
+    assert util.live_server(root) is not None            # a server is demonstrably up
+
+    lock_path.unlink()                                    # what `clean --all`'s rmtree did
+
+    assert first.fd >= 0                                  # the first holder still has it open
+    assert util.live_server(root) is None, "odin can no longer see its own live server"
+    second = held_lock(root)
+    assert second.fd != first.fd
+    # The proof: the second take SUCCEEDED, on a different inode, while the
+    # first is still held. Under the real lock file this is impossible --
+    # `test_uvicorn_path_is_detected_with_no_pidfile_at_all` is the same call
+    # refusing. Two servers, one store.
+    assert lock_path.read_text().strip() == str(os.getpid())
+
+
+def test_a_second_holder_is_refused_while_the_lock_file_is_intact(tmp_path: Path, held_lock):
+    """The control for the test above: with the file left alone, the kernel
+    hands the store to exactly one holder. `_flock` returning False is the ONLY
+    thing that means "somebody else has it"."""
+    root = _store(tmp_path)
+    held_lock(root)
+    probe = os.open(root / util.STORE_LOCK_NAME, os.O_RDWR)
+    try:
+        assert util._flock(probe) is False   # EWOULDBLOCK: refused, definitively
+    finally:
+        os.close(probe)
+
+
 def test_an_unlockable_store_does_not_block_a_restore(tmp_path: Path):
     """The fail-open rule, at the one place the OS's answer is interpreted.
     v0.7.1 shelled out to `lsof` and treated "no lsof" as "assume it's ours",

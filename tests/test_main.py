@@ -229,6 +229,103 @@ def test_version_callback_is_a_no_op_without_the_flag(capsys):
     assert capsys.readouterr().out == ""
 
 
+# --- v0.7.4: the two lock-lifecycle holes v0.7.3's own author flagged -------
+
+
+def test_start_refuses_when_a_lock_holding_server_left_no_pidfile(tmp_path, monkeypatch, capsys):
+    """The hole: `odin start` read ONLY `.odin/pid`, which only `odin start`
+    writes -- so against a server launched the way the README documents
+    (`uvicorn odin.server:create_app --factory`) it started a SECOND one on the
+    same store, two reconcilers driving the same envs' containers. `odin
+    status`/`stop`/`import` all used the kernel lock already; now this does
+    too."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main_mod, "_build_ui", lambda: None)
+    started = []
+    monkeypatch.setattr(main_mod.subprocess, "Popen", lambda argv, **kw: started.append(argv))
+    lock = util.hold_store_lock(tmp_path / ".odin")
+    try:
+        main_mod.start(port=4200, foreground=False, dev=False, host="127.0.0.1")
+    finally:
+        lock.release()
+    out = capsys.readouterr().out
+    assert started == []                       # no second server
+    assert "Odin is already running" in out
+    assert "store lock" in out                 # ...and it names the evidence, not a guess
+    assert not main_mod.PID_FILE.exists()
+
+
+def test_dev_start_refuses_against_the_same_lock(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    started = []
+    monkeypatch.setattr(main_mod.subprocess, "Popen", lambda argv, **kw: started.append(argv))
+    lock = util.hold_store_lock(tmp_path / ".odin")
+    try:
+        main_mod._start_dev(port=4200, host="127.0.0.1")
+    finally:
+        lock.release()
+    assert started == []
+    assert "Odin is already running" in capsys.readouterr().out
+
+
+def test_start_still_clears_a_stale_pidfile_and_proceeds(tmp_path, monkeypatch):
+    """The other direction, unregressed: a dead pid must not block a start."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main_mod, "_build_ui", lambda: None)
+    main_mod.ODIN_DIR.mkdir()
+    main_mod.PID_FILE.write_text("999999")
+    started = []
+
+    class FakeProc:
+        pid = 4242
+
+    # `pid_alive` really does shell out to `kill -0`, and that is the whole
+    # point of this test -- so the real Popen keeps serving it.
+    real_popen = main_mod.subprocess.Popen
+
+    def fake_popen(argv, **kwargs):
+        if argv[:2] == ["kill", "-0"]:
+            return real_popen(argv, **kwargs)
+        started.append(argv)
+        return FakeProc()
+
+    monkeypatch.setattr(main_mod.subprocess, "Popen", fake_popen)
+    main_mod.start(port=4200, foreground=False, dev=False, host="127.0.0.1")
+    assert started, "a stale pidfile must not block a start"
+    assert main_mod.PID_FILE.read_text() == "4242"
+
+
+def test_clean_all_refuses_to_delete_the_store_a_live_server_holds(tmp_path, monkeypatch, capsys):
+    """`--all` is `rm -rf .odin`, lock file included. See `clean`'s own comment
+    for the three things that breaks; the load-bearing one is that the next
+    server locks a NEW inode and succeeds, so two servers each believe they
+    hold this store."""
+    monkeypatch.chdir(tmp_path)
+    lock = util.hold_store_lock(tmp_path / ".odin")
+    (tmp_path / ".odin" / "keep.json").write_text("{}")
+    try:
+        with pytest.raises(typer.Exit) as exit_info:
+            main_mod.clean(all=True)
+    finally:
+        lock.release()
+    assert exit_info.value.exit_code == 1
+    captured = capsys.readouterr()
+    assert "Refusing" in captured.out and "store lock" in captured.out
+    assert "Stop it with" in captured.err
+    # nothing was touched: the store, and the lock a live server is holding
+    assert (tmp_path / ".odin" / "keep.json").exists()
+    assert (tmp_path / ".odin" / util.STORE_LOCK_NAME).exists()
+
+
+def test_clean_all_still_wipes_the_store_when_nothing_is_running(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".odin").mkdir()
+    (tmp_path / ".odin" / "world.json").write_text("{}")
+    main_mod.clean(all=True)
+    assert "full reset" in capsys.readouterr().out
+    assert not (tmp_path / ".odin" / "world.json").exists()
+
+
 def test_start_foreground_writes_and_removes_the_pidfile(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(main_mod, "_build_ui", lambda: None)

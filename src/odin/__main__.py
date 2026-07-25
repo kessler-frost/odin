@@ -57,6 +57,33 @@ def _warn_if_non_loopback(host: str) -> None:
         )
 
 
+def _already_running() -> bool:
+    """Whether a control app is live against `.odin`, printed and answered the
+    same way `odin status`/`odin stop` answer it.
+
+    v0.7.2 gave the server a kernel `flock` on the store precisely so liveness
+    could be OBSERVED rather than inferred -- but `odin start` kept reading
+    only `.odin/pid`, which ONLY `odin start` itself writes. So the command
+    that starts a second server was the one command still blind to a server
+    the README's own `uvicorn odin.server:create_app --factory` had launched:
+    it would happily start a second one against a store the first already
+    holds, and two reconcilers would drive the same envs' containers.
+    `live_server` asks the kernel, so this check is now the same check
+    everywhere.
+
+    Returning False also means nothing is running, which makes a leftover
+    pidfile stale by definition -- cleared here so the next start isn't
+    blocked by a corpse.
+    """
+    server = live_server(ODIN_DIR)
+    if server is None:
+        _clear_stale_pidfile()
+        return False
+    typer.echo(f"Odin is already running ({server.detail}).")
+    typer.echo(f"Stop it with {server.how_to_stop} first.")
+    return True
+
+
 def _build_ui() -> None:
     if (Path(__file__).resolve().parent / "_ui").exists():
         return  # UI ships bundled with the installed package
@@ -86,12 +113,8 @@ def start(
         _start_dev(port, host)
         return
 
-    if PID_FILE.exists():
-        pid = int(PID_FILE.read_text().strip())
-        if pid_alive(pid):
-            typer.echo(f"Odin is already running (pid {pid}). Use `odin stop` first.")
-            return
-        PID_FILE.unlink()
+    if _already_running():
+        return
 
     _build_ui()
     typer.echo(f"Starting Odin on http://{host}:{port}")
@@ -125,12 +148,8 @@ def start(
 
 def _start_dev(port: int, host: str = DEFAULT_HOST) -> None:
     """Dev mode startup."""
-    if PID_FILE.exists():
-        pid = int(PID_FILE.read_text().strip())
-        if pid_alive(pid):
-            typer.echo(f"Odin is already running (pid {pid}). Use `odin stop` first.")
-            return
-        PID_FILE.unlink()
+    if _already_running():
+        return
 
     typer.echo(f"Starting Odin dev mode on http://{host}:{port}")
     typer.echo(f"  Vite  → :{port}  (HMR)")
@@ -233,6 +252,27 @@ def clean(all: bool = typer.Option(False, "--all", help="Wipe entire .odin/ dire
     odin_dir = root / ".odin"
 
     if all:
+        # `--all` is `rm -rf .odin`, and that includes `.odin/lock` -- the ONE
+        # piece of evidence that a server is up. Deleting it under a live
+        # server breaks three things at once:
+        #   * the running server keeps its lock (flock lives on the INODE, not
+        #     the name), but nothing can find it any more: `odin status` and
+        #     `odin stop` say "not running" and `odin import` restores straight
+        #     into a live store -- the v0.7.0 bug, re-created by hand.
+        #   * the NEXT server takes a lock on a brand-new inode and succeeds, so
+        #     TWO servers each believe they exclusively hold this store, both
+        #     reconciling the same envs' real containers.
+        #   * the store itself (spec revisions, world.json, gateway records,
+        #     tofu workspaces) is pulled out from under a process writing to it.
+        # None of that is recoverable by re-running anything, so this refuses
+        # rather than repairs. The narrower clean below touches no lock and no
+        # store state, so it stays unguarded.
+        server = live_server(ODIN_DIR)
+        if server is not None:
+            typer.echo(f"Refusing: odin is running against .odin/ ({server.detail}).")
+            typer.echo(f"`--all` deletes the store, INCLUDING the lock that server holds. "
+                       f"Stop it with {server.how_to_stop} first.", err=True)
+            raise typer.Exit(1)
         if odin_dir.exists():
             shutil.rmtree(odin_dir)
             private_mkdir(odin_dir)
