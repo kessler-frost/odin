@@ -92,6 +92,7 @@ from odin.gateway import errors
 from odin.gateway.keys import KeyStore, workload_env
 from odin.gateway.models import logsctl
 from odin.gateway.stores import NO_CHANGE, SynthStores
+from odin.gateway.wiring import node_env
 from odin.runtime.colima import ColimaRuntime
 
 log = logging.getLogger("odin.gateway.lambdactl")
@@ -234,8 +235,6 @@ def _finish_deploy(
     arn = f"arn:aws:lambda:{REGION}:{ACCOUNT}:function:{name}"
     label = _tags_for(stores, env, arn).get("odin:node", "")
     container_env = dict(env_vars)
-    if keystore is not None and gateway_port is not None and label:
-        container_env.update(workload_env(keystore, env, label, gateway_port))
     # `ensure` REPLACES the container (`FunctionRuntime.ensure` stops any
     # remnant first), so its output starts back at line 1 -- the log-shipping
     # cursor for that stream has to be forgotten here or `_ship_logs` would
@@ -247,6 +246,17 @@ def _finish_deploy(
     # propagate an exception to -- see ec2compute.py's `_finish_boot` for
     # the identical "silent hang is forbidden" reasoning.
     try:
+        # CANVAS WIRING (field test 2, the product hole) -- inside this `try` on
+        # purpose: an `UnresolvedRef` gets the SAME terminal shape a failed
+        # container does (`State: Failed` with the real reason, projected as
+        # `crashed` with that verdict), instead of a silently empty variable.
+        # Layered BETWEEN the function's declared `Environment.Variables` and
+        # the issued credentials: canvas wiring overrides a declared default,
+        # odin's own four AWS_* vars override everything.
+        if label:
+            container_env.update(node_env(stores, env, label))
+        if keystore is not None and gateway_port is not None and label:
+            container_env.update(workload_env(keystore, env, label, gateway_port))
         substrate.ensure(env, name, runtime, handler, container_env, code_dir, memory_mib=memory_mib)
     except Exception as exc:
         log.warning("lambda container failed for function %s (env %s): %s", name, env, exc)

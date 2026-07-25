@@ -283,7 +283,8 @@ and `-o json` for machine-readable output.
 ```bash
 odin canvas get                     # the drawn canvas, as JSON
 odin canvas set my-canvas.json      # replace it (or pipe: ... | odin canvas set -)
-odin translate                      # print the Terraform your canvas becomes
+odin translate                      # print the Terraform the SAVED canvas becomes
+odin translate --file draft.json    # ...or an unsaved canvas file
 odin apply --env dev                # the Apply button, as a command
 odin world --env dev                # live resource phases
 odin events --env dev               # the event stream, one JSON line each

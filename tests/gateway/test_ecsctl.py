@@ -28,6 +28,8 @@ from odin.gateway.keys import KeyStore
 from odin.gateway.models import ecsctl, logsctl
 from odin.gateway.stores import SynthStores
 from odin.runtime.colima import CONTAINER_HOST
+from odin.spec.store import SpecStore
+from odin.spec.translate import canvas_to_stack
 
 from .conftest import split_url
 
@@ -434,6 +436,99 @@ def test_update_service_task_definition_replaces_stale_tasks(sink, ecs, stores):
     assert task["taskDefinitionArn"].endswith(":2")
 
 
+def test_a_taskdef_update_reports_zero_running_until_the_new_revision_is_up(sink, ecs, stores):
+    """Field-test 2 finding B1 (HIGH): a bad-image ECS *update* reported apply
+    SUCCESS in 2.3s while taking the service to zero tasks and the load balancer
+    to 503.
+
+    Mechanism: terraform-provider-aws's `wait_for_steady_state` waiter keys on
+    `len(deployments) == 1 && desiredCount == runningCount`. `runningCount` used
+    to count EVERY running task regardless of revision, so at the instant
+    UpdateService returned -- before the background reconcile had even started
+    -- the three STALE tasks made `runningCount == desiredCount` and the waiter
+    declared the deployment stable immediately. `runningCount` must therefore
+    count only tasks on the service's CURRENT task definition, so an update is
+    never "already steady" the moment it is requested.
+
+    UpdateService's own response is that exact instant (`_update_service`
+    renders it before spawning the reconcile), which makes this deterministic."""
+    block = threading.Event()  # hold the reconcile thread in `run`
+    runtime = FakeTaskRuntime(block=block)
+    block.set()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)  # rev 1
+    _create_service(stores, sink, ecs, runtime, desiredCount=3)
+    _wait_for_running_count(stores, sink, ecs, runtime, 3)
+
+    _register_taskdef(stores, sink, ecs, runtime, containerDefinitions=[{
+        "name": "app", "image": "nginx:this-tag-does-not-exist-9z9z", "essential": True,
+    }])  # rev 2
+    block.clear()  # the reconcile spawned by UpdateService cannot make progress
+    req = sink.call(lambda: ecs.update_service(cluster="odin", service="app", taskDefinition="app:2"))
+    updated = _parse("UpdateService", _answer(stores, req, runtime))["service"]
+
+    assert updated["desiredCount"] == 3
+    assert updated["runningCount"] == 0, "three stale tasks must not read as the new revision"
+    (deployment,) = updated["deployments"]
+    assert deployment["taskDefinition"].endswith(":2")
+    assert deployment["runningCount"] == 0
+    assert deployment["rolloutState"] != "COMPLETED", updated
+    block.set()
+
+
+def test_a_taskdef_update_that_cannot_start_keeps_reporting_a_failed_deployment(sink, ecs, stores):
+    """The other half of B1: once the replacement tasks genuinely fail, the
+    service must KEEP reporting short-of-desired for as long as it is short --
+    that is what turns the provider's bounded `timeouts.update` into a real,
+    honest apply failure instead of a 2.3s success."""
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)  # rev 1
+    _create_service(stores, sink, ecs, runtime, desiredCount=2)
+    _wait_for_running_count(stores, sink, ecs, runtime, 2)
+
+    _register_taskdef(stores, sink, ecs, runtime, containerDefinitions=[{
+        "name": "app", "image": "nginx:this-tag-does-not-exist-9z9z", "essential": True,
+    }])  # rev 2
+    runtime.fail_run = True  # the new image cannot be pulled
+    req = sink.call(lambda: ecs.update_service(cluster="odin", service="app", taskDefinition="app:2"))
+    _answer(stores, req, runtime)
+
+    deadline = time.monotonic() + 2.0
+    service = None
+    while time.monotonic() < deadline:
+        service = _describe_service(stores, sink, ecs, runtime)
+        if service["deployments"][0]["rolloutState"] == "FAILED":
+            break
+        time.sleep(0.02)
+    (deployment,) = service["deployments"]
+    assert deployment["rolloutState"] == "FAILED", service
+    assert service["runningCount"] != service["desiredCount"], "would read as steady state"
+    assert "failed to start" in deployment["rolloutStateReason"]
+    assert service["events"], "a failed deployment posts a real service event"
+
+
+def test_a_successful_taskdef_update_still_reaches_steady_state(sink, ecs, stores):
+    """The counterweight to the two above: current-revision-only accounting must
+    still CONVERGE, or every healthy update would hang until its timeout."""
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)  # rev 1
+    _create_service(stores, sink, ecs, runtime, desiredCount=2)
+    _wait_for_running_count(stores, sink, ecs, runtime, 2)
+
+    _register_taskdef(stores, sink, ecs, runtime, containerDefinitions=[{
+        "name": "app", "image": "nginx:1.27-alpine", "essential": True,
+    }])  # rev 2
+    req = sink.call(lambda: ecs.update_service(cluster="odin", service="app", taskDefinition="app:2"))
+    _answer(stores, req, runtime)
+
+    final = _wait_for_running_count(stores, sink, ecs, runtime, 2)
+    (deployment,) = final["deployments"]
+    assert deployment["rolloutState"] == "COMPLETED", final
+    assert deployment["taskDefinition"].endswith(":2")
+
+
 def test_delete_service_stops_all_its_tasks(sink, ecs, stores):
     runtime = FakeTaskRuntime()
     _create_cluster(stores, sink, ecs, runtime)
@@ -552,6 +647,106 @@ def test_create_service_without_keystore_keeps_prior_behavior(sink, ecs, stores)
 
     (_, _, _, extra_env, _, _) = runtime.ran[0]
     assert not extra_env
+
+
+# --- Canvas WIRING: the node's own `env` map reaches the real container -------
+
+
+def _seed_db_and_stack(stores, tmp_path, env_map: dict) -> None:
+    """A real, `available` rds record in the gateway's own store plus an applied
+    Stack whose ecs node carries `env_map` -- the two inputs
+    `gateway/wiring.py` resolves against."""
+    stores.rdsctl.set(ENV, "db:appdb", {
+        "db_instance_identifier": "appdb", "master_username": "app", "master_password": "s3cret",
+        "db_name": "shop", "status": "available", "endpoint_port": 33366,
+    })
+    SpecStore(tmp_path).apply(canvas_to_stack({
+        "nodes": [
+            {"id": "n1", "type": "rds", "data": {"label": "appdb"}},
+            {"id": "n2", "type": "ecs", "data": {"label": "myservice", "image": "nginx:alpine", "env": env_map}},
+        ],
+        "edges": [],
+    }, env=ENV))
+
+
+def test_task_containers_launch_with_the_nodes_env_and_resolved_refs(sink, ecs, stores, keystore, tmp_path):
+    """Field test 2, "the product hole": an ECS node's `env` -- static entries
+    AND `${{producer.ATTR}}` refs -- was silently dropped, so there was no
+    canvas-driven way to hand a container its connection strings. It now rides
+    the same launch-time seam the issued credentials already use, so nothing
+    resolved ever enters the taskdef (and therefore tofu state)."""
+    _seed_db_and_stack(stores, tmp_path, {"DATABASE_URL": "${{appdb.DATABASE_URL}}", "APP_TIER": "web"})
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(
+        stores, sink, ecs, runtime, keystore=keystore, gateway_port=4266,
+        tags=[{"key": "odin:node", "value": "myservice"}],
+    )
+    _wait_for_running_count(stores, sink, ecs, runtime, 1)
+
+    (_, _, container_def, extra_env, _, _) = runtime.ran[0]
+    assert extra_env["DATABASE_URL"] == f"postgresql://app:s3cret@{CONTAINER_HOST}:33366/shop"
+    assert extra_env["APP_TIER"] == "web"
+    # The issued creds still win, and the taskdef is still byte-for-byte clean:
+    # a resolved connection string carries the DB PASSWORD, and the taskdef is
+    # echoed into tofu state verbatim.
+    assert extra_env["AWS_ACCESS_KEY_ID"] == keystore.issue(ENV, "myservice")[0]
+    assert container_def.get("environment") is None
+
+
+def test_odins_own_aws_vars_win_over_a_canvas_that_names_them(sink, ecs, stores, keystore, tmp_path):
+    _seed_db_and_stack(stores, tmp_path, {"AWS_DEFAULT_REGION": "eu-west-1"})
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(
+        stores, sink, ecs, runtime, keystore=keystore, gateway_port=4266,
+        tags=[{"key": "odin:node", "value": "myservice"}],
+    )
+    _wait_for_running_count(stores, sink, ecs, runtime, 1)
+
+    (_, _, _, extra_env, _, _) = runtime.ran[0]
+    assert extra_env["AWS_DEFAULT_REGION"] == REGION, "the gateway wiring must not be overridable"
+
+
+def test_an_unresolvable_ref_fails_the_task_with_a_naming_reason(sink, ecs, stores, keystore, tmp_path):
+    """Never an empty string: the task goes STOPPED with the real reason, which
+    makes the node `crashed` with a naming verdict AND (since the service is
+    short of desired) fails the apply."""
+    stores.rdsctl.set(ENV, "db:appdb", {
+        "db_instance_identifier": "appdb", "master_username": "app", "master_password": "s3cret",
+        "db_name": "shop", "status": "creating", "endpoint_port": 0,  # NOT available yet
+    })
+    SpecStore(tmp_path).apply(canvas_to_stack({
+        "nodes": [
+            {"id": "n1", "type": "rds", "data": {"label": "appdb"}},
+            {"id": "n2", "type": "ecs", "data": {
+                "label": "myservice", "image": "nginx:alpine",
+                "env": {"DATABASE_URL": "${{appdb.DATABASE_URL}}"}}},
+        ],
+        "edges": [],
+    }, env=ENV))
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    _create_service(
+        stores, sink, ecs, runtime, keystore=keystore, gateway_port=4266,
+        tags=[{"key": "odin:node", "value": "myservice"}],
+    )
+
+    deadline = time.monotonic() + 2.0
+    service = None
+    while time.monotonic() < deadline:
+        service = _describe_service(stores, sink, ecs, runtime)
+        if service["deployments"][0]["rolloutState"] == "FAILED":
+            break
+        time.sleep(0.02)
+    (deployment,) = service["deployments"]
+    assert deployment["rolloutState"] == "FAILED", service
+    assert "DATABASE_URL" in deployment["rolloutStateReason"], deployment
+    assert "appdb" in deployment["rolloutStateReason"], deployment
+    assert not runtime.ran, "no container may be started with a hole in its environment"
 
 
 def test_create_service_without_tags_launches_with_no_injected_creds(sink, ecs, stores, keystore):

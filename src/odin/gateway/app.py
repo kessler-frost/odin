@@ -11,9 +11,12 @@ forward to the env's backing container. S3 (RustFS) enforces SigV4, so its
 forward is re-signed with the backing's own credentials; sqs/sns/dynamodb
 (goaws/dynalite) ignore auth entirely, so their forward passes the
 caller's original signed headers through untouched (research §Q4). Every
-deny -- auth failure, unmappable request, policy deny, or a backing that
-isn't up -- fires `on_deny` so it becomes a debuggable `access_denied`
-event (PRD R6) rather than a silent failure.
+deny -- auth failure, unmappable request, policy deny -- fires `on_deny` so
+it becomes a debuggable `access_denied` event (PRD R6) rather than a silent
+failure. A backing that ISN'T UP is deliberately NOT one of those (field test
+2, finding B6): the policy check has already passed and the answer is a real
+503, so it fires `on_unavailable` and lands as its own event type instead of
+polluting the authorization audit stream.
 
 The gateway itself holds no data beyond this request-scoped routing table
 (GatewayState) -- rebuilt wholesale by `update()` on every Apply/tick,
@@ -68,6 +71,22 @@ _SIGNING_HEADERS = {"authorization", "x-amz-date", "x-amz-content-sha256"}
 _RESPONSE_HOP_BY_HOP = {"transfer-encoding", "connection"}
 
 OnDeny = Callable[[Principal | None, str | None, str | None, str], Awaitable[None]]
+# Field test 2, finding B6: a BACKING BEING DOWN is not an authorization
+# verdict, and must not ride the `access_denied` stream a security review
+# reads. Same call shape as `OnDeny` (so server.py's two closures are twins),
+# deliberately a SEPARATE seam so the two conditions can never be conflated
+# again -- the policy check has already PASSED by the time this fires.
+OnUnavailable = Callable[[Principal | None, str | None, str | None, str], Awaitable[None]]
+
+
+async def _ignore_unavailable(
+    principal: Principal | None, action: str | None, resource: str | None, service: str,
+) -> None:
+    """The default `on_unavailable`: the ~20 unit tests that only exercise the
+    DENY stream shouldn't each have to pass a second sink. Production
+    (`server.py`) always passes a real one, and
+    `tests/gateway/test_proxy.py::test_backing_unavailable_...` asserts it."""
+    return None
 
 
 @dataclass
@@ -135,6 +154,7 @@ def create_gateway_app(
     forward_client: httpx.AsyncClient | None = None,
     gateway_port: Callable[[], int | None] | None = None,
     rds=None,
+    on_unavailable: OnUnavailable = _ignore_unavailable,
 ) -> Starlette:
     """The gateway ASGI app. `forward_client` lets tests substitute a
     fake-backing transport (httpx.ASGITransport over a recording ASGI
@@ -216,7 +236,14 @@ def create_gateway_app(
             return pure
 
         if backing_port is None:
-            await on_deny(principal, action, resource, "backing-unavailable")
+            # NOT a denial (finding B6): the policy check above already PASSED,
+            # and the response is a real 503/`ServiceUnavailable`. Reporting it
+            # through `on_deny` put a service-unavailable condition in an
+            # authorization costume and flooded the `access_denied` audit
+            # stream during a wedged destroy. `resource` is the AWS resource the
+            # call named; `service` (the last argument) is what is actually
+            # down.
+            await on_unavailable(principal, action, resource, service)
             return errors.service_unavailable(service)
 
         backing_url = f"http://127.0.0.1:{backing_port}{path}" + (f"?{query}" if query else "")

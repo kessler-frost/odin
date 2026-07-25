@@ -192,8 +192,8 @@ def _observed(world: World, node_id: str) -> dict[str, Any] | None:
 
 
 def _event_node(event: dict) -> str | None:
-    """Which node an event belongs to. `world_delta`/`access_denied` carry
-    `resource_id`; the crash `log` message the reconciler pushes carries the
+    """Which node an event belongs to. `world_delta`/`access_denied`/
+    `backing_unavailable` all carry `resource_id`; the crash `log` message the reconciler pushes carries the
     node in `source` (api/ws.py + reconciler.py's `_log_message`). An env-wide
     event (a `tf` apply line) belongs to no node -- it is left out of every
     node's list on purpose and picked up once, at env level, by `_tf_lines`."""

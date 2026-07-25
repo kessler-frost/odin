@@ -33,7 +33,7 @@ from odin.compute.tasks import TaskRuntime
 from odin.fabric.localhost import LocalhostFabric
 from odin.fabric.nebula import mesh_state
 from odin.fabric.sidecar import MeshSidecar
-from odin.gateway import DEFAULT_GATEWAY_PORT, GATEWAY_PORT_ENV
+from odin.gateway import DEFAULT_GATEWAY_PORT, GATEWAY_PORT_ENV, wiring
 from odin.gateway.app import GatewayState, create_gateway_app, serve_in_thread, stop_in_thread
 from odin.gateway.keys import OPERATOR_NODE_ID, KeyStore, Principal
 from odin.gateway.models import ec2compute, ecsctl, lambdactl, rdsctl
@@ -145,25 +145,55 @@ def create_apply_router(
         _bump_epoch(env_epoch, env)  # finding #4: invalidate any older in-flight apply-full for this env
 
         body: dict = {"status": "destroyed", "env": env, "tf": None}
-        if status["workspace_exists"]:
-            access_key, secret_key = keystore.issue(env, OPERATOR_NODE_ID)
-            # Security finding #3: scrub any sensitive field's raw value out
-            # of tofu's own destroy log before it reaches the tail/WS/events.
-            secrets = store.get_stack(env).sensitive_values()
-            try:
-                result = await runner.destroy(env, gateway_port(), access_key, secret_key, secrets=secrets)
-            except TofuNotInstalled:
-                # Not a request-level error: the reconciler half still runs below.
-                body["tf"] = {"status": "unavailable", "exit_code": None, **_TOFU_NOT_INSTALLED}
-            except SimulateBusy as exc:  # a second call won the race after our guard passed
-                return JSONResponse(status_code=409, content={"error": str(exc)})
-            else:
-                body["tf"] = {"status": "ok" if result.ok else "failed", "exit_code": result.exit_code}
-                if not result.ok:
-                    body["tf"]["tail"] = list(result.tail)
-
         reconciler = await reconciler_for(env)
-        store.apply(Stack(env=env))  # empty desired state -> reconciler prunes all
+        # hold(): field test 2, finding B6. `tofu destroy` has to REACH the
+        # backings the resources it is deleting live in -- an s3 bucket is
+        # deleted by a real DeleteBucket forwarded to RustFS -- so this path has
+        # to boot them, exactly like /apply-full's ensure phase. That puts it
+        # squarely in the gc-versus-ensure race hold() exists for, and in the
+        # sharper form: gc's whole job is to stop the backings of an env that's
+        # going away. Holding the tick lock across ensure + the WHOLE destroy +
+        # the empty-Stack commit makes both halves impossible:
+        #   (a) no tick (so no gc) can run between booting a backing and tofu
+        #       finishing with it, and
+        #   (b) the empty Stack is committed INSIDE the hold, so the very first
+        #       tick after it -- the explicit one below -- gc's every backing
+        #       this ensure just started. Nothing is left running.
+        # The trailing tick() is deliberately OUTSIDE the hold: `tick()` takes
+        # the same non-reentrant lock (the /apply-full path has the identical
+        # shape and the identical reason).
+        async with reconciler.hold():
+            if status["workspace_exists"]:
+                access_key, secret_key = keystore.issue(env, OPERATOR_NODE_ID)
+                # Security finding #3: scrub any sensitive field's raw value out
+                # of tofu's own destroy log before it reaches the tail/WS/events.
+                last_applied = store.get_stack(env)
+                secrets = last_applied.sensitive_values()
+                # Without this, a RESTORED env (which boots no containers, as
+                # documented) has no registered `backing_port`, so the gateway
+                # answers every AWS call the destroy makes with a real
+                # 503/ServiceUnavailable and aws-sdk-go-v2 retries each one ~25
+                # times with backoff -- silently, since retries never reach
+                # tofu's stdout. That is the 8m26s "hang with no progress" the
+                # field test hit, and telling the user to Apply first was making
+                # them do by hand what this line does. Same call /apply-full
+                # makes, same no-resource-CRUD guarantee (`ensure_backing` only
+                # starts a container).
+                await reconciler.ensure_backings(last_applied)
+                try:
+                    result = await runner.destroy(env, gateway_port(), access_key, secret_key, secrets=secrets)
+                except TofuNotInstalled:
+                    # Not a request-level error: the reconciler half still runs below.
+                    body["tf"] = {"status": "unavailable", "exit_code": None, **_TOFU_NOT_INSTALLED}
+                except SimulateBusy as exc:  # a second call won the race after our guard passed
+                    return JSONResponse(status_code=409, content={"error": str(exc)})
+                else:
+                    body["tf"] = {"status": "ok" if result.ok else "failed", "exit_code": result.exit_code}
+                    if not result.ok:
+                        body["tf"]["tail"] = list(result.tail)
+
+            store.apply(Stack(env=env))  # empty desired state -> the tick below prunes all
+
         await reconciler.tick()
         keystore.revoke_env(env)  # gateway-issued keys die with the env they belong to
         return JSONResponse(status_code=200, content=body)
@@ -196,7 +226,7 @@ class ImportTfRequest(BaseModel):
 
 def create_tf_router(
     store: SpecStore, runner: TfRunner, keystore: KeyStore, gateway_port,
-    translate_cache: translate_mod.TranslateCache, runtime,
+    translate_cache: translate_mod.TranslateCache, runtime, stores: SynthStores,
 ) -> APIRouter:
     """`/tf/*` -- Simulate's own apply/destroy/status, independent of the
     canvas `/apply`/`/destroy` above (S2 CONTRACT ADDENDUM: routes named
@@ -218,6 +248,10 @@ def create_tf_router(
         if rejection is not None:
             return rejection
         project = generate_tf(stack)
+        # Canvas wiring: same publish `/apply-full` does, from the stack this
+        # route applies -- otherwise a Simulate run would launch containers
+        # against whatever the LAST /apply-full staged.
+        wiring.stage(stores, env, stack)
         access_key, secret_key = _issue_operator(env)
         try:
             result = await runner.apply(
@@ -417,6 +451,13 @@ def create_apply_full_router(
                 if env_epoch.get(env, 0) != my_epoch:
                     return JSONResponse(status_code=409, content=_SUPERSEDED)
                 await reconciler.ensure_backings(stack)
+                # Canvas wiring (field test 2, the product hole): publish the
+                # authored `env`/refs where the GATEWAY can read them DURING
+                # this tofu run -- CreateService/CreateFunction launch the real
+                # container that consumes them, and `store.apply(stack)` below
+                # deliberately does not happen until tofu has succeeded. See
+                # `gateway/wiring.py::stage`.
+                wiring.stage(stores, env, stack)
                 project = TfProject(
                     files=translated.files, unsupported=translated.unsupported,
                     binary_files=translated.binary_files,
@@ -604,9 +645,30 @@ def create_app(
             "reason": reason,
         })
 
+    async def on_backing_unavailable(
+        principal: Principal | None, action: str | None, resource: str | None, service: str,
+    ) -> None:
+        """Field test 2, finding B6: a DOWN backing gets its own event type. It
+        is a service-unavailable condition, not an authorization verdict (the
+        policy check has already passed), and mixing it into `access_denied`
+        polluted the exact stream a security review reads for real denials --
+        agent A watched thousands of them accumulate during a wedged destroy.
+        `recovery` names what actually fixes it, since a down backing always has
+        the same fix."""
+        await ws_manager.broadcast({
+            "type": "backing_unavailable",
+            "env": principal.env if principal else "default",
+            "resource_id": principal.node_id if principal else None,
+            "action": action,
+            "target": resource,
+            "service": service,
+            "recovery": f"no {service} backing container is running for this env -- run Apply (or `odin apply --env {principal.env if principal else 'default'}`) to start it",
+        })
+
     gateway_app = create_gateway_app(
         gateway_state, gateway_keystore, gateway_stores, on_deny,
         gateway_port=lambda: gateway_port_actual,
+        on_unavailable=on_backing_unavailable,
         # W2.7: `rds` used to be the RECONCILER's Postgres provisioner; it's
         # now the gateway's RDS-model substrate, because `aws_db_instance` is
         # what creates a database today. A caller's stand-in (every api test)
@@ -643,7 +705,10 @@ def create_app(
         create_apply_router(_store, reconciler_for, gateway_keystore, tf_runner, lambda: gateway_port_actual, env_epoch)
     )
     app.include_router(
-        create_tf_router(_store, tf_runner, gateway_keystore, lambda: gateway_port_actual, translate_cache, _runtime)
+        create_tf_router(
+            _store, tf_runner, gateway_keystore, lambda: gateway_port_actual,
+            translate_cache, _runtime, gateway_stores,
+        )
     )
     app.include_router(
         create_apply_full_router(

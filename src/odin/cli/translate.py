@@ -18,7 +18,7 @@ from odin.cli.http import OutputFormat
 
 TRANSLATE_FILE = typer.Option(
     None, "--file",
-    help="Preview an UNSAVED canvas JSON file instead of the env's stored stack.",
+    help="Preview an UNSAVED canvas JSON file instead of the canvas saved on the server.",
 )
 LIVE = typer.Option(
     [], "--live",
@@ -29,11 +29,31 @@ IMPORT_ENV = typer.Option(
 )
 
 
+_EMPTY_CANVAS_NOTE = (
+    "note: the saved canvas is empty, so there is no Terraform to print -- "
+    "draw something and `odin canvas set`, or pass --file <canvas.json>"
+)
+
+
 def _render_translate(body: dict) -> None:
     typer.echo(body["files"].get("main.tf", ""), nl=False)
     unsupported = body.get("unsupported") or []
     if unsupported:
         typer.echo(f"unsupported: {', '.join(str(u) for u in unsupported)}", err=True)
+
+
+def _graph(url: str, file: Path | None) -> dict:
+    """Findings B4 / MEDIUM-10: with no `--file`, translate the canvas SAVED ON
+    THE SERVER -- `odin apply`'s own default (`cli/apply.py::_graph`), and what
+    README ("print the Terraform your canvas becomes") and this command's own
+    help ("the code panel's CLI twin") both promise. Posting no body instead
+    made the server translate the env's STORED STACK, which is empty until
+    something has been applied, so `odin canvas set x.json && odin translate >
+    main.tf` produced a valid-looking EMPTY file with exit 0. The code panel
+    previews the canvas, not the last-applied stack; so does this now."""
+    if file is not None:
+        return http.parse_json_arg(file.read_text(), str(file))
+    return http.body_or_fail(http.request("GET", url, "/canvas"))
 
 
 @app.command()
@@ -43,11 +63,21 @@ def translate(
     url: str = http.URL,
     output: OutputFormat = http.OUTPUT,
 ) -> None:
-    """Canvas -> Terraform preview (the code panel's CLI twin). Prints main.tf."""
-    graph = http.parse_json_arg(file.read_text(), str(file)) if file is not None else None
+    """Canvas -> Terraform preview (the code panel's CLI twin). Prints main.tf.
+
+    With no --file this translates the canvas saved on the server -- the same
+    default `odin apply` uses.
+    """
+    graph = _graph(url, file)
     body = http.body_or_fail(
         http.request("POST", url, "/translate", params={"env": env}, body=graph)
     )
+    # An empty canvas genuinely translates to nothing, so this stays exit 0
+    # (`apply` treats an empty canvas as a legitimate teardown) -- but never
+    # SILENTLY, or a CI `translate > main.tf` step scores an empty file as a
+    # clean run (finding U5's "empty output, exit 0" family).
+    if not graph.get("nodes") and output is not OutputFormat.json:
+        typer.echo(_EMPTY_CANVAS_NOTE, err=True)
     http.emit(body, output, _render_translate)
 
 

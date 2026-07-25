@@ -114,18 +114,64 @@ def test_a_small_stack_on_a_healthy_host_is_admitted(tmp_path, monkeypatch):
     assert result.estimated_mib == 256.0
 
 
-def test_a_stack_exceeding_the_memory_budget_is_rejected_with_the_numbers(tmp_path, monkeypatch):
+def test_a_stack_exceeding_the_vm_memory_budget_is_rejected_with_true_numbers(tmp_path, monkeypatch):
+    """Field-test 2 finding MEDIUM-9: the rejection was protective but said
+    "the admission budget is 4.0 GiB (5.8 GiB total on this host)" on a 48 GiB
+    Mac -- 5.8 GiB is COLIMA's VM (`docker info` MemTotal). EC2 instances are
+    Lima VMs on the Mac and consume none of Colima's memory, so they must be
+    charged against, and the message must quote, REAL host memory."""
     monkeypatch.delenv("ODIN_MEMORY_BUDGET_MIB", raising=False)
-    # 20 t3.medium EC2 nodes -> 20 * 4GiB == 80GiB, way past 70% of an 8GiB host.
+    monkeypatch.delenv("ODIN_VM_MEMORY_BUDGET_MIB", raising=False)
+    # 20 t3.medium EC2 nodes -> 20 * 4GiB == 80GiB, way past 70% of a 16GiB host.
     stack = Stack(resources=tuple(
         ResourceDesired(id=f"web{i}", kind="ec2", fields={"instanceType": FieldValue(value="t3.medium")})
         for i in range(20)
     ))
-    result = check_admission(stack, HostFacts(total_mem_mib=8_000.0), tmp_path)
+    result = check_admission(
+        stack, HostFacts(total_mem_mib=8_000.0), tmp_path, host_mem_mib=16_384.0,
+    )
     assert result.ok is False
     assert "80.0 GiB" in result.reason
-    assert "GiB" in result.reason and "5.5 GiB" in result.reason  # 70% of 8000 MiB budget
+    assert "11.2 GiB" in result.reason  # 70% of the 16 GiB HOST, not of Colima's 8 GiB
+    assert "16.0 GiB" in result.reason  # the host total, quoted truthfully
+    assert "Colima" not in result.reason, "an EC2 node never touches the container runtime"
     assert "reduce instance sizes or apply fewer nodes" in result.reason
+    assert result.vm_mib == 20 * 4096.0
+    assert result.container_mib == 0.0
+
+
+def test_a_stack_exceeding_the_container_memory_budget_names_the_container_runtime(tmp_path, monkeypatch):
+    """The other pool: container-backed kinds really do live in Colima's VM, so
+    THAT number is the true one to quote for them -- and it must be described as
+    what it is, never as "total on this host"."""
+    monkeypatch.delenv("ODIN_MEMORY_BUDGET_MIB", raising=False)
+    stack = Stack(resources=tuple(ResourceDesired(id=f"task{i}", kind="ecs") for i in range(20)))
+    result = check_admission(
+        stack, HostFacts(total_mem_mib=5_910.0), tmp_path, host_mem_mib=49_152.0,
+    )
+    assert result.ok is False
+    assert "10.0 GiB" in result.reason  # 20 * 512 MiB
+    assert "container runtime" in result.reason
+    assert "5.8 GiB" in result.reason  # Colima's VM, honestly labelled
+    assert "48.0 GiB total on this host" not in result.reason
+    assert result.container_mib == 20 * 512.0
+    assert result.vm_mib == 0.0
+
+
+def test_a_small_ec2_canvas_on_a_big_mac_is_admitted(tmp_path, monkeypatch):
+    """The practical harm MEDIUM-9 reported: 5 x t3.micro (5 GiB) is trivial for
+    a 48 GiB Mac but was rejected because it was charged against Colima's
+    ~5.8 GiB VM, which those VMs never touch."""
+    monkeypatch.delenv("ODIN_MEMORY_BUDGET_MIB", raising=False)
+    monkeypatch.delenv("ODIN_VM_MEMORY_BUDGET_MIB", raising=False)
+    stack = Stack(resources=tuple(
+        ResourceDesired(id=f"web{i}", kind="ec2", fields={"instanceType": FieldValue(value="t3.micro")})
+        for i in range(5)
+    ))
+    result = check_admission(
+        stack, HostFacts(total_mem_mib=5_910.0), tmp_path, host_mem_mib=49_152.0,
+    )
+    assert result.ok is True, result.reason
 
 
 def test_memory_budget_env_override_is_honored_by_check_admission(tmp_path, monkeypatch):
@@ -134,6 +180,15 @@ def test_memory_budget_env_override_is_honored_by_check_admission(tmp_path, monk
     result = check_admission(stack, HostFacts(total_mem_mib=64_000.0), tmp_path)
     assert result.ok is False
     assert result.budget_mib == 100.0
+
+
+def test_vm_memory_budget_env_override_is_honored(tmp_path, monkeypatch):
+    monkeypatch.setenv("ODIN_VM_MEMORY_BUDGET_MIB", "512")
+    stack = Stack(resources=(ResourceDesired(id="web1", kind="ec2"),))  # t3.micro == 1 GiB
+    result = check_admission(stack, HostFacts(total_mem_mib=64_000.0), tmp_path, host_mem_mib=49_152.0)
+    assert result.ok is False
+    assert result.budget_mib == 512.0
+    assert "ODIN_VM_MEMORY_BUDGET_MIB" in result.reason
 
 
 def test_insufficient_disk_is_rejected_even_when_memory_is_fine(tmp_path, monkeypatch):
@@ -155,18 +210,38 @@ def test_min_disk_env_override_is_honored(tmp_path, monkeypatch):
     assert "need >100 GiB" in result.reason
 
 
-def test_unknown_host_memory_skips_the_memory_check_not_the_disk_check(tmp_path, monkeypatch):
+def test_unknown_container_memory_skips_only_the_container_check(tmp_path, monkeypatch):
     # HostFacts() (all zero) is what ensure_host() returns when `docker
     # info` fails (Colima not running) -- and what every test fake that
     # predates this feature returns. Rejecting on a bogus "0 GiB budget"
     # would be actively misleading; Apply fails with a clearer error later.
+    # Colima being down says NOTHING about the Mac's RAM, so the VM pool's
+    # check is unaffected -- the two pools are independent.
     monkeypatch.delenv("ODIN_MEMORY_BUDGET_MIB", raising=False)
+    stack = Stack(resources=tuple(ResourceDesired(id=f"task{i}", kind="ecs") for i in range(50)))
+    result = check_admission(stack, HostFacts(total_mem_mib=0.0), tmp_path, host_mem_mib=49_152.0)
+    assert result.ok is True
+
+
+def test_unknown_host_memory_skips_only_the_vm_check(tmp_path, monkeypatch):
+    """`os.sysconf` not answering is the VM pool's equivalent of `docker info`
+    failing: skip, rather than print a confident wrong number."""
+    monkeypatch.delenv("ODIN_MEMORY_BUDGET_MIB", raising=False)
+    monkeypatch.delenv("ODIN_VM_MEMORY_BUDGET_MIB", raising=False)
     stack = Stack(resources=tuple(
         ResourceDesired(id=f"web{i}", kind="ec2", fields={"instanceType": FieldValue(value="t3.medium")})
         for i in range(50)  # would obviously blow any real budget
     ))
-    result = check_admission(stack, HostFacts(total_mem_mib=0.0), tmp_path)
+    result = check_admission(stack, HostFacts(total_mem_mib=64_000.0), tmp_path, host_mem_mib=0.0)
     assert result.ok is True
+
+
+def test_the_real_host_total_is_read_and_is_not_the_container_runtime_number():
+    """The number itself must be real: os.sysconf-derived, no new dependency, no
+    subprocess -- and on any machine odin runs on it is a plausible RAM size."""
+    total = admission.host_total_mem_mib()
+    assert total > 512.0, total  # nobody runs odin on half a gig
+    assert total % 1024 == 0 or total > 1024, total
 
 
 def test_an_explicit_budget_override_still_applies_even_with_unknown_host_memory(tmp_path, monkeypatch):
