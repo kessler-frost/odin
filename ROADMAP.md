@@ -775,6 +775,23 @@ future decision against these points instead of re-deriving them:
     substrate's own real container memory cap; s3/sqs/sns/dynamodb = once per
     ENV, not per node (they share one backing container);
     vpc/subnet/sg/iam_role/ecr = zero.
+  - **It also refuses an env name too long to make a Lima VM name** (v0.7.1,
+    found while building the mesh proof). An `ec2` node becomes a real Lima VM
+    called `odin-ec2-{env}-{instance-id}`, and `limactl` refuses any instance
+    whose SSH control-socket path (`$LIMA_HOME/<vm>/ssh.sock.<16 digits>`)
+    would reach `UNIX_PATH_MAX=104` bytes. Past a certain env length EVERY
+    boot in that env failed — reliably, which is the good part — with a raw
+    limactl error naming a socket path and a Lima constant, ~60s into a boot
+    that was never going to work. Apply now refuses up front, naming the env,
+    its length, the actual limit and both ways out (rename, or a shorter
+    `LIMA_HOME`). **The limit is DERIVED, not hardcoded**
+    (`compute/instances.py::max_env_name_len`), because it is machine-specific:
+    it is 104 less `$LIMA_HOME` — whose default `~/.lima` moves with the
+    username's length — less the separators, Lima's socket filename, odin's
+    `odin-ec2-` prefix and the 19-character instance id. That works out to **22
+    on a `/Users/fimbulwinter/.lima` home**, exactly the figure the mesh work
+    measured by hand; a longer home name gives a shorter limit. A canvas with
+    no `ec2` node is never blocked by it — nothing else mints a VM name.
   - **v1 limits, recorded rather than hidden:** an unknown total for either
     pool (Colima not running; `os.sysconf` unanswered) SKIPS that pool's check
     instead of printing a confident wrong number. It is a STATIC per-canvas
