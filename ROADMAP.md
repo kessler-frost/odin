@@ -48,12 +48,20 @@ future decision against these points instead of re-deriving them:
   sticky IPs, `sg_rules_to_firewall` — the substrate for the network layer.
 - **Spec Store** (append-only revisions), per-env isolation, the events/WS
   status pipeline, the integration-test harness, the `odin` CLI skeleton.
-- **claude-agent-sdk** — an optional, off-by-default refine pass over the
-  deterministic canvas→TF translation (`ODIN_TRANSLATE_REFINE`), fenced by a
-  guardrail that rejects any change to the architecture or to a value the
-  canvas set. The agent-shaped work it could genuinely own — HCL for kinds
-  with no builder, least-privilege policy synthesis, plain-English failure
-  explanation (M8) — is roadmap, not shipped.
+- **claude-agent-sdk** — two uses, deliberately different in kind. (1) An
+  optional, off-by-default refine pass over the deterministic canvas→TF
+  translation (`ODIN_TRANSLATE_REFINE`), fenced by a guardrail that rejects any
+  change to the architecture or to a value the canvas set. (2) **SHIPPED
+  (W2.9/M8): plain-English failure explanation** — `agent/debugger.py` +
+  `POST /agent/debug` answer "what's wrong here?" for a selected region from
+  real evidence (desired config, refs, phase, crash verdict, events, log tail),
+  with per-node suspects. ON by default (`ODIN_DEBUG_AGENT=0` disables) because
+  it only reads state and returns prose; secrets and env-var values are
+  redacted before the prompt; an unavailable SDK answers `agent unavailable`
+  rather than failing. Limits: evidence is capped at 40 log lines and 10 events
+  per node and 20 nodes, so a cause that scrolled out of that window won't be
+  in the answer. Still roadmap, not shipped: HCL for kinds with no builder,
+  least-privilege policy synthesis, import of unmodeled resource types.
 
 ## Roadmap (northstar-derived sequence)
 
@@ -467,7 +475,7 @@ What this means:
 
 ### Roadmap (superseded)
 
-- [ ] **M8 — Region-select debugging ("what's wrong here?")** — drag a selection rectangle over a canvas region → context menu ("Debug this" / "What's wrong here?" / "Fix this part" / free-form ask) → a region-scoped agent auto-gathers the enclosed nodes + edges and, for each, its World state (phase/facts/verdict/restarts) + recent events/logs + relevant Stack fields, then investigates or fixes from there. Reuses the existing Cmd+drag selection; new parts are the menu + a context-assembler that turns a selection into the agent prompt. **Point at a region instead of describing it — far less back-and-forth.**
+- [x] **M8 — Region-select debugging ("what's wrong here?")** — SHIPPED 2026-07-25 as W2.9 (`agent/debugger.py`, `POST /agent/debug`, `ui/src/components/RegionAsk.tsx`); the "fix this part" half of the original wording deliberately did NOT ship — the agent explains, it never edits. Original entry: drag a selection rectangle over a canvas region → context menu ("Debug this" / "What's wrong here?" / "Fix this part" / free-form ask) → a region-scoped agent auto-gathers the enclosed nodes + edges and, for each, its World state (phase/facts/verdict/restarts) + recent events/logs + relevant Stack fields, then investigates or fixes from there. Reuses the existing Cmd+drag selection; new parts are the menu + a context-assembler that turns a selection into the agent prompt. **Point at a region instead of describing it — far less back-and-forth.**
 - [ ] **M7 (multi-Mac) — the fleet:** a **self-hosted Nebula mesh** fabric (you own the lighthouse — runs in your private network, programmable, a control-plane/UI can be built on top; chosen over Tailscale, whose SaaS coordination would limit that) + multi-Mac membership (memberlist/raft) + apple-container runtime. The Nebula fabric foundation (cert/lighthouse/config primitives + the `NebulaFabric` resolve seam) is reinstated under `fabric/nebula.py`; cross-Mac placement is the deferred part. Additive, no core change.
 - [ ] **Brain Toolbelt MCP:** make the Brain a candidate-only producer behind a typed `place` + `propose_changeset` + `review_iam` MCP membrane (stricter than today's best-effort completion).
 - [ ] **MiniStack real-container backings** for the remaining stateful AWS services (ElastiCache→Redis, etc.) so apps use them for real, not just the API.

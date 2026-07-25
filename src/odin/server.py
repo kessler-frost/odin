@@ -25,6 +25,7 @@ from odin.agent import import_tf as import_tf_mod
 from odin.agent import translate as translate_mod
 from odin.agent.hcl import TfProject, generate_tf, resource_set
 from odin.api.canvas import CanvasGraph, create_canvas_router
+from odin.api.debug import create_debug_router
 from odin.api.logs import create_logs_router
 from odin.api.ws import ConnectionManager
 from odin.aws.backings import BackingAws
@@ -632,6 +633,9 @@ def create_app(
         )
     )
     app.include_router(create_logs_router(_store, gateway_stores, _runtime))
+    # W2.9/M8: "what's wrong here?" -- reads the same store/stores/runtime the
+    # logs route does, plus the ws_manager's durable per-env event log.
+    app.include_router(create_debug_router(_store, gateway_stores, _runtime, ws_manager))
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):

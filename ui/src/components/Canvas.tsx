@@ -28,6 +28,7 @@ import LambdaNode from './nodes/LambdaNode';
 import S3Node from './nodes/S3Node';
 import DynamodbNode from './nodes/DynamodbNode';
 import ServiceNode from './nodes/ServiceNode';
+import RegionAsk from './RegionAsk';
 import { CATALOG, catalogNodeTypeMap, catalogDefaultData, catalogDefaultStyle, catalogZIndex, catalogByType, COLORS } from '../lib/catalog';
 import { withContainment, isInsideContainer } from '../lib/containment';
 import { computeTypes, defaultPermissions, detectDefaultEdgeType, edgeStyle, edgeTypes } from '../lib/iam';
@@ -634,9 +635,14 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
     restampContainment();
   }, [restampContainment]);
 
+  // W2.9/M8: the selected region, as node LABELS — what /agent/debug (and
+  // everything else server-side) keys resources by, not ReactFlow's ids.
+  const [selectedLabels, setSelectedLabels] = useState<string[]>([]);
+
   const handleSelectionChange = useCallback(({ nodes: selNodes, edges: selEdges }: { nodes: Node[]; edges: Edge[] }) => {
     onNodeSelect?.(selNodes);
     onEdgeSelect?.(selEdges);
+    setSelectedLabels(selNodes.map(n => (n.data as Record<string, string>)?.label).filter(Boolean));
   }, [onNodeSelect, onEdgeSelect]);
 
   const handleEdgeClick = useCallback((_event: React.MouseEvent, edge: Edge) => {
@@ -716,6 +722,8 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
           style={{ width: 140, height: 90 }}
         />
       </ReactFlow>
+      {/* Outside <ReactFlow> so canvas pan/zoom gestures never eat its clicks. */}
+      <RegionAsk selectedIds={selectedLabels} env={env ?? 'default'} />
     </div>
   );
 }

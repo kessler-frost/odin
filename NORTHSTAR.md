@@ -41,10 +41,23 @@ canvas and its configuration.
 *deterministic guardrail (resource-set equality + a value-fidelity check —*
 *every argument the skeleton set must survive unchanged) rejects anything*
 *else and falls back to the skeleton, so it is structurally incapable of*
-*being the thing that decides what gets applied. Genuinely agent-shaped work*
-*this layer doesn't do yet, and could: generating HCL for kinds with no*
-*deterministic builder, least-privilege IAM policy synthesis, and import of*
-*unmodeled resource types — roadmap items, not shipped behavior.*
+*being the thing that decides what gets applied.*
+
+*SHIPPED (W2.9/M8, 2026-07-25) — the agent-shaped job that is now real:*
+*plain-English failure explanation. `agent/debugger.py` + `POST /agent/debug`*
+*take a selected region of the canvas and answer "what's wrong here?" from*
+*real evidence — each node's desired config, refs, observed phase, crash*
+*verdict, recent events and log tail — with per-node suspects. It is the one*
+*place the AI is load-bearing (there is no deterministic function from an exit*
+*code plus log lines to a cause), and it is safe to be load-bearing there:*
+*read-only, prose out, secrets and env-var values redacted before the prompt,*
+*and an honest "agent unavailable" whenever the SDK can't run. ON by default*
+*(`ODIN_DEBUG_AGENT=0` disables), unlike the refine pass above.*
+
+*Genuinely agent-shaped work this layer still doesn't do, and could:*
+*generating HCL for kinds with no deterministic builder, least-privilege IAM*
+*policy synthesis, and import of unmodeled resource types — roadmap items, not*
+*shipped behavior.*
 
 ### 3. Simulate = tofu apply through the gateway
 > Next button I want is **Simulate** — which will generate the code and do
