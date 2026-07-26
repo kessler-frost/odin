@@ -114,6 +114,14 @@ _RDS_PHASE = {
 
 # label -> (kind, phase, facts, verdict) -- verdict is populated only for a
 # "crashed" phase, from whatever real reason the underlying model recorded.
+#
+# `facts` is `dict[str, str]`: every VALUE must be a string. That is enforced
+# at the emit boundary (`Reconciler._assert_string_facts`, which carries the
+# argument) because these dicts round-trip through `world.json` on every tick,
+# and a value that doesn't survive that unchanged -- a tuple read back as a
+# list -- compares unequal to itself forever and storms one delta per tick.
+# Anything numeric gets `str()`d by its builder, as `cachectl.facts` does for
+# `port`.
 Projected = dict[str, tuple[str, str, dict, str | None]]
 
 

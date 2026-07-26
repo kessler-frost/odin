@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import time
 
+import pytest
+
 from odin.aws.backings import BackingUnavailable
 from odin.gateway.policy import compile_policies
 from odin.gateway.stores import SynthStores
@@ -19,7 +21,7 @@ from odin.reconcile import tf_status
 from odin.reconcile.drift import DriftSweeper, _sweep_ticks
 from odin.reconcile.reconciler import Reconciler
 from odin.runtime.colima import _STATUS_TO_PHASE, ContainerFacts, HostFacts, RunHandle
-from odin.spec.models import Edge, FieldValue, ResourceDesired, Stack
+from odin.spec.models import Edge, FieldValue, ResourceDesired, Stack, WorldDelta
 from odin.spec.store import SpecStore
 from tests.reconcile.test_drift import FakeContainers, FakeVms
 
@@ -1110,3 +1112,47 @@ async def test_the_endpoint_is_published_once_the_port_becomes_readable_again(tm
     assert observed.phase == "healthy"
     assert observed.facts["endpoint"] == "http://host.docker.internal:51001"
     assert observed.verdict is None
+
+
+# --- the fact-value invariant: strings, enforced at the emit boundary ---------
+
+
+async def test_a_non_string_fact_value_is_refused_loudly(tmp_path):
+    """The invariant was real and load-bearing but unwritten and unenforced.
+    `prior.facts` is re-parsed from world.json on every `_emit`, so a value
+    JSON reshapes never compares equal to itself again -- one delta per
+    resource per tick, forever. Coercing silently would hide it; the whole
+    point is that it cannot be introduced quietly."""
+    r = Reconciler(store=SpecStore(tmp_path), runtime=FakeRuntime(), env="e")
+    with pytest.raises(TypeError, match=r"ports=\[80, 443\] \(list\)"):
+        await r._emit("lb", "alb", "healthy", facts={"ports": [80, 443]})
+    for value in ((80, 443), 8080, None, {"a": "b"}, True):
+        with pytest.raises(TypeError, match="must be str"):
+            await r._emit("lb", "alb", "healthy", facts={"x": value})
+    assert r._store.current_world("e").get("lb") is None, "nothing durable was written"
+
+
+async def test_the_guard_names_the_resource_and_every_offending_key(tmp_path):
+    r = Reconciler(store=SpecStore(tmp_path), runtime=FakeRuntime(), env="e")
+    with pytest.raises(TypeError) as raised:
+        await r._emit("db", "rds", "healthy", facts={"PORT": 5432, "HOST": "h", "TAGS": ("a",)})
+    message = str(raised.value)
+    assert message.startswith("db: World fact values must be str")
+    assert "PORT=5432 (int)" in message and "TAGS=('a',) (tuple)" in message
+    assert "HOST" not in message  # the good one isn't blamed
+
+
+async def test_a_tuple_valued_fact_would_have_stormed_one_delta_per_tick(tmp_path):
+    """The measurement behind the guard, run against the real store: JSON turns
+    a tuple into a list, so the round-tripped `prior` never matches what the
+    next tick builds. Written as the demonstration it is -- bypassing `_emit`'s
+    guard to show what it prevents."""
+    r = Reconciler(store=SpecStore(tmp_path), runtime=FakeRuntime(), env="e")
+    r._store.apply_delta(WorldDelta(env="e", resource_id="lb", kind="alb",
+                                    phase="healthy", facts={"ports": ("80", "443")}))
+    prior = r._store.current_world("e").get("lb")
+    assert prior.facts["ports"] == ["80", "443"], "a tuple round-trips as a list"
+    assert prior.facts != {"ports": ("80", "443")}, "…so it never equals itself again"
+    # …and the guard is what stops that shape from ever reaching the store.
+    with pytest.raises(TypeError):
+        await r._emit("lb", "alb", "healthy", facts={"ports": ("80", "443")})

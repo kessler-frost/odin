@@ -513,7 +513,13 @@ def facts(cluster: dict) -> dict[str, str]:
     point at the SAME Redis on the same published port, so an ec2 node consumes
     `${{cache.REDIS_URL_VM}}` while containers keep `${{cache.REDIS_URL}}`
     (per-consumer-type ref routing stays deferred -- a distinct fact is the
-    honest, smaller fix). Empty for a cluster that isn't up yet."""
+    honest, smaller fix). Empty for a cluster that isn't up yet.
+
+    EVERY VALUE IS A `str` -- `str(port)` below is not cosmetic. World facts
+    round-trip through `world.json` on every emit, so a value JSON reshapes (a
+    tuple read back as a list) compares unequal to itself forever and storms
+    one delta per tick. `Reconciler._assert_string_facts` enforces that at the
+    boundary and carries the full argument."""
     port = cluster.get("port")
     if not port:
         return {}

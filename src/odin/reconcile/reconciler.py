@@ -69,6 +69,42 @@ def _identity_facts(facts: dict) -> dict:
     return {k: v for k, v in facts.items() if k not in _VOLATILE_FACTS}
 
 
+def _assert_string_facts(rid: str, facts: dict) -> None:
+    """WORLD FACT VALUES ARE STRINGS. Not a style rule -- an invariant the
+    change detection in `_emit` depends on, load-bearing since v0.7.4 brought
+    facts INTO that comparison, and invisible until field test 5's audit named
+    it.
+
+    Why it bites. `prior.facts` is not held in memory: `current_world` re-reads
+    and re-parses `.odin/<env>/world.json` on every single `_emit`. So a fact
+    value only compares equal to itself if it survives a JSON round-trip
+    UNCHANGED -- and most containers don't. `facts={"ports": (80, 443)}` is
+    written as `[80, 443]` and read back as a `list`, which never equals the
+    tuple the next tick builds. Every tick then sees a change and emits a
+    delta: one per resource per poll interval, forever. That is exactly the
+    43%-of-all-events flap v0.7.1 already killed once, and it would arrive
+    with a credential in tow -- `DATABASE_URL` embeds the RDS password
+    (SECURITY.md), so each spurious delta writes another cleartext copy into
+    `world.json`, `events.jsonl` and the WebSocket broadcast.
+
+    `str` is the one JSON type with no such gap, and every fact odin publishes
+    today is one -- `cachectl.facts` spells `str(port)` out precisely for this.
+    This guard is what keeps that true as new builders appear. It sits at the
+    EMIT boundary, the single funnel every fact passes through, rather than in
+    each producer -- trusting every future builder is what let the invariant go
+    unwritten in the first place. And it RAISES rather than coercing: a silent
+    `str(v)` would hide the bug, and the loop's own `except` in `_run` turns a
+    raise into a logged traceback naming the resource and the offending key.
+    """
+    bad = sorted(f"{key}={value!r} ({type(value).__name__})"
+                 for key, value in facts.items() if not isinstance(value, str))
+    if bad:
+        raise TypeError(
+            f"{rid}: World fact values must be str (they round-trip through "
+            f"world.json on every emit) — got {', '.join(bad)}"
+        )
+
+
 class Reconciler:
     def __init__(
         self,
@@ -362,6 +398,13 @@ class Reconciler:
         # `logtail` is excluded because it is diagnostic, not identity: it can
         # differ between reads of the same dead container, and re-emitting for
         # that is the noise this guard exists to stop.
+        #
+        # The comparison below is what makes fact VALUES have to be strings --
+        # `prior` is re-parsed from world.json every time, so anything that
+        # doesn't round-trip through JSON unchanged compares unequal forever.
+        # `_assert_string_facts` states and enforces that, here at the one
+        # boundary every fact crosses.
+        _assert_string_facts(rid, facts or {})
         prior = self._store.current_world(self._env).get(rid)
         if (
             prior is not None
