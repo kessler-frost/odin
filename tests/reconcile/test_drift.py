@@ -37,15 +37,16 @@ class FakeVms:
 
 
 class FakeContainers:
-    """`_ContainerRuntime.container_names()`/`container_states()`'s shapes, plus
-    the per-name `status`/`exit_code` calls the rds probe half makes ONLY on a
-    failed health probe (W2.7).
+    """The two runtime seams the sweeps use -- `container_names()` (one bulk
+    `ps -a`) and the per-name `status()`/`exit_code()` (`inspect`) -- both of
+    which answer identically on docker and on nerdctl-in-Lima, which is why
+    `reconcile/drift.py::_live_states` is built from these two and not from a
+    single `ps --format '{{.State}}'` (that one does not exist on nerdctl).
 
     One source of names: `names` are the containers that are RUNNING, `exited`
-    maps a name to its real exit code, and anything in neither is GONE. The two
-    listings are counted separately (`calls` for the ecs name listing,
-    `state_calls` for the field-test-5 state listing) so the boundedness test
-    can pin both."""
+    maps a name to its real exit code, `paused` are present-but-frozen, and
+    anything in none of them is GONE. `calls` counts listings and `status_calls`
+    counts inspects, so the boundedness test can pin both."""
 
     def __init__(
         self, names: list[str] | None = None, error: Exception | None = None,
@@ -56,7 +57,6 @@ class FakeContainers:
         self.exited = exited or {}
         self.paused = paused or []
         self.calls = 0
-        self.state_calls = 0
         self.status_calls: list[str] = []
 
     def container_names(self) -> list[str]:
@@ -65,20 +65,12 @@ class FakeContainers:
             raise self.error
         return [*self.names, *self.exited, *self.paused]
 
-    def container_states(self) -> dict[str, str]:
-        self.state_calls += 1
-        if self.error is not None:
-            raise self.error
-        return {
-            **{name: "running" for name in self.names},
-            **{name: "exited" for name in self.exited},
-            **{name: "paused" for name in self.paused},
-        }
-
     def status(self, name: str) -> str:
         self.status_calls.append(name)
         if name in self.names:
             return "running"
+        if name in self.paused:
+            return "paused"
         return "exited" if name in self.exited else "absent"
 
     def exit_code(self, name: str) -> int:
@@ -342,11 +334,13 @@ def test_one_listing_per_substrate_regardless_of_resource_count(tmp_path):
     verdicts = _sweeper(vms=vms, containers=containers).verdicts(stores, ENV)
 
     assert len(verdicts) == 10  # 5 ec2 + 5 lambda, all drifted
-    # 15 resources, three bulk calls: one `limactl list` (ec2), one `docker ps`
-    # of STATES (the live lambda/rds half `sweep_compute` owns) and one of NAMES
-    # (the ecs task half). Never one call per resource -- that is the property
-    # this pins, and it holds at any count.
-    assert (vms.calls, containers.state_calls, containers.calls) == (1, 1, 1)
+    # 15 resources, THREE bulk calls: one `limactl list` (ec2) and two
+    # `docker ps` (the live lambda/rds half, then the ecs task half). Never one
+    # call per resource -- that is the property this pins, and it holds at any
+    # count. Zero `inspect` calls here because every container is GONE, and the
+    # listing alone settles that; an inspect is only spent on one that exists.
+    assert (vms.calls, containers.calls) == (1, 2)
+    assert containers.status_calls == []
 
 
 def test_non_sweep_ticks_make_no_runtime_calls_and_keep_the_verdict(tmp_path, monkeypatch):
@@ -463,7 +457,7 @@ def test_vpc_subnet_sg_iam_role_and_ecr_records_are_never_swept(tmp_path):
     vms, containers = FakeVms(names=[]), FakeContainers(names=[])
 
     assert _sweeper(vms=vms, containers=containers).verdicts(stores, ENV) == {}
-    assert (vms.calls, containers.calls, containers.state_calls) == (0, 0, 0)
+    assert (vms.calls, containers.calls, containers.status_calls) == (0, 0, [])
 
 
 # --- rds (W2.7): checked by its container's real STATE (the live half) and
@@ -486,10 +480,10 @@ def test_a_healthy_database_is_no_drift_and_costs_one_bulk_listing_plus_one_prob
     containers, probe = FakeContainers(names=[name]), FakeProbe(ok=True)
 
     assert _sweeper(containers=containers, probe=probe).verdicts(stores, ENV) == {}
-    # ONE real connection plus ONE bulk `docker ps` -- and not a single
-    # per-container `inspect` on the happy path.
+    # ONE real connection, ONE bulk listing, and ONE `inspect` for the one
+    # container this env has -- never a second opinion per resource.
     assert probe.calls == [("127.0.0.1", 54321, "app", "apppass123")]
-    assert (containers.state_calls, containers.calls, containers.status_calls) == (1, 0, [])
+    assert (containers.calls, containers.status_calls) == (1, [name])
 
 
 def test_a_killed_container_is_real_drift_and_the_record_is_corrected(tmp_path):
@@ -646,7 +640,8 @@ def test_the_live_sweep_leaves_a_healthy_pair_completely_alone(tmp_path):
     assert sweep_compute(stores, ENV, containers) == {}
     assert stores.lambdactl.get(ENV, "fn:hello")["state"] == "Active"
     assert stores.rdsctl.get(ENV, "db:app-db")["status"] == "available"
-    assert containers.state_calls == 1, "one bulk listing for the whole env, whatever it holds"
+    assert containers.calls == 1, "one bulk listing for the whole env, whatever it holds"
+    assert sorted(containers.status_calls) == sorted(["odin-lambda-default-hello", name])
 
 
 def test_the_live_sweep_never_calls_docker_when_nothing_claims_to_be_up(tmp_path):
@@ -660,9 +655,32 @@ def test_the_live_sweep_never_calls_docker_when_nothing_claims_to_be_up(tmp_path
     containers = FakeContainers(names=[])
 
     assert sweep_compute(stores, ENV, containers) == {}
-    assert containers.state_calls == 0
+    assert (containers.calls, containers.status_calls) == (0, [])
     assert stores.lambdactl.get(ENV, "fn:deploying")["state"] == "Active"
     assert stores.rdsctl.get(ENV, "db:booting")["status"] == "creating"
+
+
+def test_a_container_the_listing_found_but_inspect_will_not_describe_is_not_a_death(tmp_path):
+    """The second half of "unknown is not gone", one level down. `status` answers
+    `absent` both for "no such container" AND for "docker didn't answer" -- it
+    cannot tell them apart (its own docstring). For a name the bulk listing JUST
+    returned, the honest reading is ambiguity, so nothing is reported and
+    nothing is written; the next tick asks again. Without this, one busy-daemon
+    `inspect` under a `tofu apply` could mark a live database `failed`, and the
+    next apply would delete and recreate it."""
+    stores = SynthStores(tmp_path)
+    _fn(stores, "hello")
+    name = _db(stores, "app-db", "app-db")
+
+    class ListedButUndescribable(FakeContainers):
+        def status(self, container: str) -> str:
+            self.status_calls.append(container)
+            return "absent"
+
+    containers = ListedButUndescribable(names=["odin-lambda-default-hello", name])
+    assert sweep_compute(stores, ENV, containers) == {}
+    assert stores.lambdactl.get(ENV, "fn:hello")["state"] == "Active"
+    assert stores.rdsctl.get(ENV, "db:app-db")["status"] == "available"
 
 
 def test_the_live_sweep_corrects_nothing_when_docker_does_not_answer(tmp_path):
@@ -733,11 +751,13 @@ def test_a_single_bad_sample_is_a_blip_not_drift(tmp_path, monkeypatch):
     name = _db(stores, "app-db", "app-db")
 
     class Blip(FakeContainers):
-        """`status` lies once (the blip), then tells the truth."""
+        """`status` answers the live listing honestly, then lies ONCE to the
+        probe half -- the busy-daemon `inspect` that comes back empty for a
+        container that is perfectly alive."""
 
         def status(self, container: str) -> str:
             self.status_calls.append(container)
-            return "absent" if len(self.status_calls) == 1 else "running"
+            return "absent" if len(self.status_calls) == 2 else "running"
 
     class ProbeBlip(FakeProbe):
         def __call__(self, *args, **kwargs):

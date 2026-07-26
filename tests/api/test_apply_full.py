@@ -885,16 +885,20 @@ def test_apply_full_reports_a_broken_lambda_and_a_broken_database_together(tmp_p
 
 
 class _FakeStates:
-    """`ColimaRuntime.container_states()`'s shape, as `sweep_compute` builds it
-    when no runtime is injected -- `running` names the containers that exist."""
+    """The container runtime `sweep_compute` builds when none is injected --
+    `container_names()` + `status()`, the two seams `drift._live_states` uses.
+    `running` names the containers that exist."""
 
     running: tuple[str, ...] = ()
 
     def __init__(self, *_args, **_kwargs) -> None:
         pass
 
-    def container_states(self) -> dict[str, str]:
-        return {name: "running" for name in type(self).running}
+    def container_names(self) -> list[str]:
+        return list(type(self).running)
+
+    def status(self, name: str) -> str:
+        return "running" if name in type(self).running else "absent"
 
     def exit_code(self, name: str) -> int:
         return -1

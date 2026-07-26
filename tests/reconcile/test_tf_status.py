@@ -27,20 +27,23 @@ ENV = "default"
 
 
 class FakeContainers:
-    """`ColimaRuntime.container_states()`/`exit_code()`'s shape -- the seam
-    `project()`'s own `sweep_compute` reads (field test 5).
+    """`container_names()`/`status()`/`exit_code()`'s shapes -- the seams
+    `project()`'s own `live_verdicts` reads (field test 5).
 
-    A lambda/rds record that CLAIMS to be up is now only projected as up if its
+    A lambda/rds record that CLAIMS to be up now only projects as up if its
     container really is running, so these tests have to say which containers
     exist -- the same thing the ecs tests below already do with
-    `FakeTaskRuntime`. The reality-sync behavior itself (what a gone/exited/
-    paused container does to the record) is tests/reconcile/test_drift.py's."""
+    `FakeTaskRuntime`. What a gone/exited/paused container does is
+    tests/reconcile/test_drift.py's business."""
 
     def __init__(self, *running: str) -> None:
-        self.states = {name: "running" for name in running}
+        self.running = list(running)
 
-    def container_states(self) -> dict[str, str]:
-        return dict(self.states)
+    def container_names(self) -> list[str]:
+        return list(self.running)
+
+    def status(self, name: str) -> str:
+        return "running" if name in self.running else "absent"
 
     def exit_code(self, name: str) -> int:
         return -1
