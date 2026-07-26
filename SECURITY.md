@@ -134,9 +134,16 @@ this, that same session was answered
 
 What that does **not** mean:
 
-- **It is not instant.** The flow dies when the Apply carrying the revoke
-  finishes its mesh passes — 12.8s in the measurement above, and longer on a
-  busy machine or a large environment. Until then the open session keeps
+- **It is not instant, and there is no fixed number.** The flow dies when the
+  Apply carrying the revoke finishes its mesh passes — re-certifying and
+  restarting every member whose groups moved, then reloading every admitting
+  member — so the window is *bounded by that Apply's duration*, and it scales
+  with how many members are involved and how busy the machine is. Two runs on
+  one laptop bracket it: ~2–5s across 20 separate revoked flows (each proven
+  live with a real round trip immediately beforehand, against both kinds of
+  admitting member), and 12.8s for a single flow through an earlier, slower
+  Apply path. Neither figure is a property of odin; a larger environment will
+  be slower than both. Until the passes complete, the open session keeps
   working.
 - **It depends on an ordering odin controls but cannot prove.** The admitting
   member re-checks the flow against the certificate it currently holds for the
