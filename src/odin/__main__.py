@@ -16,7 +16,15 @@ from odin.cli import doctor as _doctor  # noqa: F401  (registers `odin doctor`)
 from odin.cli.app import app
 from odin.compute.instances import vm_name
 from odin.gateway.stores import SynthStores
-from odin.util import live_server, odin_version, pid_alive, private_mkdir, run_command
+from odin.util import (
+    SHUTDOWN_GRACE,
+    await_server_exit,
+    live_server,
+    odin_version,
+    pid_alive,
+    private_mkdir,
+    run_command,
+)
 
 ODIN_DIR = Path(".odin")
 PID_FILE = ODIN_DIR / "pid"
@@ -227,7 +235,7 @@ def stop() -> None:
     Nothing running is exit 0 on purpose, unlike `odin status`: `stop` asks
     for an end state rather than a fact, and that end state holds. The one
     non-zero case is the one where it does not -- a server odin can see but
-    cannot signal.
+    cannot signal, or one that has not finished exiting.
     """
     server = live_server(ODIN_DIR)
     if server is None:
@@ -246,6 +254,31 @@ def stop() -> None:
     # running: same SIGTERM uvicorn's own Ctrl-C sends.
     typer.echo(f"Stopping Odin ({server.detail}) …")
     os.kill(server.pid, signal.SIGTERM)
+    # SIGTERM is a REQUEST, and this command's own --help promises an end
+    # state ("exit 0 once odin is down"). Field test 5 measured the gap:
+    # `Stopped.` and rc=0 at 0.17s, the process alive for another 0.91s --
+    # long enough that two of three `odin stop && odin clean --all` runs were
+    # refused by the guard that points users at THIS command, because the
+    # server still held the store lock. So wait for the signal every other
+    # liveness question in odin uses (the kernel lock, plus the pid while the
+    # pidfile is still there), never a sleep. The server's lifespan stops
+    # every reconciler and the gateway thread before releasing the lock, which
+    # is why the wait is generous.
+    remaining = await_server_exit(ODIN_DIR, SHUTDOWN_GRACE)
+    if remaining is not None:
+        # Still up, so say so and exit 1 -- the pidfile stays, because it is
+        # the evidence `odin status` and the next `odin stop` need.
+        typer.echo(
+            f"Odin did NOT exit within {SHUTDOWN_GRACE:.0f}s of SIGTERM ({remaining.detail}). "
+            "It still holds the store, so `odin clean --all` and `odin import` will refuse.",
+            err=True,
+        )
+        typer.echo(
+            f"It may still be shutting down — check {ODIN_DIR / 'server.log'} and re-run "
+            f"`odin stop`, or `kill -9 {remaining.pid}` if it is wedged.",
+            err=True,
+        )
+        raise typer.Exit(1)
     PID_FILE.unlink(missing_ok=True)
     typer.echo("Stopped.")
 

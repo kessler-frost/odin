@@ -317,11 +317,15 @@ question rather than perform an action, and there the code *is* the answer:
 | `odin tf plan` | no changes | `2` changes, `1` error/refusal, `3` server unreachable ([why](#checking-for-drift--and-why-not-to-run-tofu-by-hand)) |
 
 `odin stop` is the deliberate mirror image of `status`: nothing running is
-exit `0`, because "odin is down" is the end state it was asked for. Its one
-non-zero case is a server it can see but cannot signal, where odin is still
-up. `odin start` against an already-running odin is likewise exit `0` — the
-state you asked for holds — but it starts nothing, so a `--port`/`--host`
-you passed is not in effect and it says so.
+exit `0`, because "odin is down" is the end state it was asked for — and it
+does not answer until that end state actually holds. SIGTERM is a request, so
+`stop` then waits (up to 20 seconds) for the server to release the store lock,
+which is the same signal `status` and `import` read. Its non-zero cases are
+both "odin is still up": a server it can see but cannot signal, and one that
+has not finished exiting within that wait. `odin start` against an
+already-running odin is likewise exit `0` — the state you asked for holds —
+but it starts nothing, so a `--port`/`--host` you passed is not in effect and
+it says so.
 
 A node odin didn't act on does **not** make Apply exit nonzero, so a CI gate
 has to read the payload. There is one field for it:
