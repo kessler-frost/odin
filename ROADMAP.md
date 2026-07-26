@@ -306,7 +306,9 @@ future decision against these points instead of re-deriving them:
       digits, single hyphens, starts with a letter) — the provider validates
       `identifier` client-side, so a label like `app_db` is declined at build
       time with the fix instead of failing inside tofu. Existing canvases with
-      such labels must rename the node.
+      such labels must change the node's `data.label` (the decline message
+      names that field, not "rename the node" -- a CLI author has no rename
+      gesture, only JSON).
     - **`allocated_storage` / `instance_class` are metadata**: they round-trip
       faithfully (clean plans, faithful imports) but resize nothing — a local
       container has the host's disk and no instance sizing.
