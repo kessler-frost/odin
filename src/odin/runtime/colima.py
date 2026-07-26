@@ -318,7 +318,40 @@ class _ContainerRuntime:
             absent    (empty; "no such object" on stderr)                  rc=1
 
         so rc is now a real signal: 0 means the runtime answered, and the
-        answer is in structured JSON rather than parsed out of a text line."""
+        answer is in structured JSON rather than parsed out of a text line.
+
+        AND VERIFIED ON `nerdctl` TOO, which is the half this method inherited
+        on faith. `LimaRuntime` reuses this code against `nerdctl` inside a
+        Lima VM, a different binary with no guarantee of docker's output or
+        exit codes -- so it was probed on a real container in a real VM
+        (nerdctl v2.0.3 / containerd v2.3.2, aarch64):
+
+            published (-p 18080:80)
+                {"80/tcp":[{"HostIp":"0.0.0.0","HostPort":"18080"}]}   rc=0
+            running, nothing published
+                {}                                                     rc=0
+            exited
+                {}                                                     rc=0
+            absent
+                (empty) fatal "1 errors: [no such object <name>]"       rc=1
+
+        Identical contract to docker's. The one cosmetic difference is that
+        docker publishes a second `{"HostIp":"::"}` binding for the same port
+        where nerdctl publishes one -- immaterial, since only `[0]["HostPort"]`
+        is read. `nerdctl port` was confirmed to carry the SAME ambiguity as
+        `docker port` (rc=1 both for "no public port 80/tcp published" and for
+        "no such container"), so the trap this method avoids was real on both
+        runtimes, not just Colima.
+
+        ONE nerdctl-ONLY WRINKLE, and why it is harmless: inspecting an EXITED
+        container makes nerdctl write `level=warning msg="failed to inspect
+        NetNS"` to STDERR while still exiting 0 with a valid `{}` on stdout.
+        This method keys on the exit code alone, so that is read as the real
+        answer it is -- a reader that treated "stderr is non-empty" as failure
+        would raise `PortUnreadable` on every stopped container on Lima.
+
+        Pinned by `tests/runtime/test_lima_integration.py`, which runs all
+        three states against a real VM rather than fabricating these strings."""
         proc = self._run(self._argv("inspect", "-f", "{{json .NetworkSettings.Ports}}", name))
         if proc.returncode != 0:
             raise PortUnreadable(
