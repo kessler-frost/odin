@@ -7,6 +7,7 @@ import httpx
 import respx
 
 from odin.cli.app import app
+from odin.reconcile.reconciler import LoopHealth
 from tests.cli.conftest import BASE
 
 WORLD = {
@@ -267,3 +268,53 @@ def test_logs_server_down(runner):
     result = runner.invoke(app, ["logs", "db"])
     assert result.exit_code == 2
     assert "Could not reach odin server" in result.stderr
+
+
+# --- a dead reconciler has to reach the terminal too ------------------------
+
+# The block `/world` really publishes -- built by the same `LoopHealth` the
+# route serializes, so this cannot drift into a hand-typed shape the server
+# never sends. (The real string comes from a real dead loop in
+# tests/api/test_reconciler_liveness.py and in the e2e proof.)
+DEAD_LOOP = LoopHealth(
+    env="prod", ticking=False, ticks=12, last_tick_seconds_ago=94.0,
+    verdict="odin's reconciler for env 'prod' is NOT converging: its task was CANCELLED. ...",
+).model_dump()
+
+
+@respx.mock
+def test_world_text_says_when_the_reconciler_is_not_converging(runner):
+    """Without this the table is a frozen snapshot printed as if it were live."""
+    respx.get(f"{BASE}/world", params={"env": "prod"}).mock(
+        return_value=httpx.Response(200, json={**WORLD, "reconciler": DEAD_LOOP})
+    )
+    result = runner.invoke(app, ["world", "--env", "prod"])
+    assert result.exit_code == 0
+    assert "RECONCILER DOWN" in result.stderr
+    assert "is NOT converging" in result.stderr
+    assert len(result.stdout.splitlines()) == 2  # the table itself is unchanged
+
+
+@respx.mock
+def test_world_says_the_reconciler_is_down_even_when_the_world_is_empty(runner):
+    """"world is empty" from a loop that never ticked is the same lie as a
+    stale table, so the warning sits ABOVE the empty-world return."""
+    respx.get(f"{BASE}/world", params={"env": "prod"}).mock(
+        return_value=httpx.Response(200, json={"env": "prod", "resources": [], "reconciler": DEAD_LOOP})
+    )
+    result = runner.invoke(app, ["world", "--env", "prod"])
+    assert result.exit_code == 0
+    assert "RECONCILER DOWN" in result.stderr
+    assert "world is empty" in result.stdout
+
+
+@respx.mock
+def test_world_is_silent_about_a_converging_reconciler(runner):
+    respx.get(f"{BASE}/world", params={"env": "prod"}).mock(
+        return_value=httpx.Response(200, json={
+            **WORLD, "reconciler": LoopHealth(env="prod", ticking=True, ticks=99).model_dump(),
+        })
+    )
+    result = runner.invoke(app, ["world", "--env", "prod"])
+    assert result.exit_code == 0
+    assert "RECONCILER" not in result.stderr

@@ -41,7 +41,7 @@ from odin.gateway.models import ec2compute, ec2net, ecsctl, lambdactl, rdsctl
 from odin.gateway.stores import SynthStores
 from odin.reconcile import admission, drift
 from odin.reconcile.drift import DriftSweeper
-from odin.reconcile.reconciler import Reconciler
+from odin.reconcile.reconciler import LoopHealth, Reconciler
 from odin.reconcile.tf_status import stranded_in_tf_state
 from odin.runtime.colima import ColimaRuntime
 from odin.simulate.runner import SimulateBusy, TfRunner, TofuNotInstalled
@@ -395,9 +395,49 @@ _UNKNOWN_DESTROY_CAUSE = (
 )
 
 
+def _loop_health(reconcilers: dict[str, Reconciler], env: str) -> LoopHealth:
+    """This env's reconciler health, WITHOUT creating one.
+
+    `reconciler_for` starts a real loop as a side effect, which a read must
+    never do (`/world?env=typo` would mint a reconciler for an env that does
+    not exist). An env with no reconciler is reported as not ticking with that
+    as the reason -- true, and for a never-applied env its World is empty
+    anyway, so there is no phase for it to mislabel."""
+    reconciler = reconcilers.get(env)
+    if reconciler is None:
+        return LoopHealth(
+            env=env, ticking=False,
+            verdict=f"no reconciler is running for env {env!r} -- nothing is converging it. If "
+                    f"something has been applied to this env, restart odin (`odin stop && odin start`).",
+        )
+    return reconciler.health()
+
+
+def _stale_resource(resource: dict, health: LoopHealth) -> dict:
+    """One `/world` resource, with the loop's staleness carried ON it.
+
+    The top-level `reconciler` block alone is not enough: a reader (or a
+    script) that iterates `resources` and sees `phase: "healthy"` with an empty
+    verdict concludes "converging", which is precisely the wrong conclusion
+    while the loop is dead -- that phase is a frozen snapshot of unknown age.
+    So every resource's verdict carries it too, and the existing verdict is
+    KEPT (prefixed, never replaced): a crashed resource's real reason is not
+    less true because the loop then died. A per-request overlay, like
+    `stranded_in_tf_state` above -- nothing is written to World, because
+    nothing about the resource itself changed."""
+    prior = resource.get("verdict")
+    stale = (
+        f"[STALE: odin's reconciler for env {health.env!r} is not ticking, so this phase is a "
+        f"frozen snapshot last confirmed "
+        f"{'never' if health.last_tick_seconds_ago is None else f'{health.last_tick_seconds_ago:.0f}s ago'}"
+        f", not a live reading]"
+    )
+    return {**resource, "verdict": f"{stale} {prior}" if prior else stale}
+
+
 def create_apply_router(
     store: SpecStore, reconciler_for, keystore: KeyStore, runner: TfRunner, gateway_port, env_epoch: dict[str, int],
-    stores: SynthStores, gateway: GatewayState, runtime,
+    stores: SynthStores, gateway: GatewayState, runtime, reconcilers: dict[str, Reconciler],
 ) -> APIRouter:
     router = APIRouter()
 
@@ -625,13 +665,25 @@ def create_apply_router(
         decides between forwarding a call and refusing it -- so this reports
         exactly the resources the gateway would genuinely refuse right now, and
         nothing during a healthy apply. See `stranded_in_tf_state` for why this
-        is a per-request overlay rather than a World write."""
+        is a per-request overlay rather than a World write.
+
+        ...and `reconciler`, which says whether these phases are LIVE READINGS
+        at all. Every phase here is authored by the reconciler loop, so a loop
+        that is dead, hung or failing every tick makes this whole document a
+        frozen snapshot -- and until now nothing in the response said so, which
+        is why a dead loop looked exactly like a converged env (see
+        `Reconciler.health`). `_stale_resource` carries the same fact down onto
+        each resource, because a reader that iterates `resources` must not be
+        able to miss it."""
         observed = store.current_world(env)
         reachable = {kind for kind in PROVISIONED if gateway.backing_port(env, kind) is not None}
         stranded = stranded_in_tf_state(store.root, env, observed, reachable)
-        return World(
-            env=observed.env, resources=(*observed.resources, *stranded),
-        ).model_dump()
+        health = _loop_health(reconcilers, env)
+        body = World(env=observed.env, resources=(*observed.resources, *stranded)).model_dump()
+        resources = body["resources"] if health.ticking else [
+            _stale_resource(resource, health) for resource in body["resources"]
+        ]
+        return {**body, "resources": resources, "reconciler": health.model_dump()}
 
     @router.get("/mesh")
     def mesh(env: str = ENV) -> dict:
@@ -1224,6 +1276,62 @@ async def _keep_store_lock(lock: StoreLock, interval: float = LOCK_WATCH_INTERVA
             )
 
 
+# How often the server asks its own reconcilers whether they are still
+# ticking. Only the LOG and the WS line wait for this -- `/world`, `/health`
+# and `odin status` each compute `LoopHealth` at read time, so no user-facing
+# surface depends on this cadence having come round (honesty rule 1b).
+RECONCILER_WATCH_INTERVAL = 5.0
+
+
+async def _watch_reconcilers(
+    reconcilers: dict[str, Reconciler], ws: ConnectionManager, interval: float = RECONCILER_WATCH_INTERVAL,
+) -> None:
+    """Say it OUT LOUD when a reconciler stops converging, once per transition.
+
+    The read surfaces cannot cover this on their own: a dead loop is only
+    noticed by somebody who happens to look, and the whole failure mode is that
+    odin looks healthy so nobody does. So this makes the server itself notice
+    -- an ERROR in `.odin/server.log`, plus the same `type:"log"` line the
+    crash path already broadcasts, which puts it in the UI's Logs tab and in
+    the env's durable event log (`odin events`).
+
+    REPORT, NOT RESTART, and deliberately -- the same rule `reconcile/drift.py`
+    keeps for drifted infrastructure. A loop only dies from cancellation or a
+    BaseException, i.e. from an odin BUG, and a bounded auto-restart would keep
+    the lights on while making that bug invisible in exactly the surfaces this
+    change exists to make honest. The remedy the verdict names (`odin stop &&
+    odin start`) is one command and it is the operator's to run.
+
+    Once per TRANSITION, not once per check: a permanent condition reported
+    every 5s is the flap v0.7.1 killed in the delta path, and it would bury the
+    line it is trying to make visible. The recovery is announced too, so a log
+    reader never has to infer that it came back.
+    """
+    down: set[str] = set()
+    while True:
+        await asyncio.sleep(interval)
+        for env, reconciler in list(reconcilers.items()):
+            try:
+                health = reconciler.health()
+                if health.ticking:
+                    if env in down:
+                        down.discard(env)
+                        log.warning("reconciler for env %r is converging again (%d ticks)", env, health.ticks)
+                    continue
+                if env in down:
+                    continue
+                down.add(env)
+                log.error("%s", health.verdict)
+                await ws.broadcast({
+                    "type": "log", "env": env, "text": health.verdict,
+                    "source": "reconciler", "level": "error",
+                })
+            except Exception:
+                # A watchdog that dies silently is the bug being fixed here, so
+                # nothing one env raises may take the whole pass down.
+                log.exception("reconciler watchdog failed for env %r", env)
+
+
 async def _reap_orphaned_ec2_vms(root: Path, envs: list[str], stores: SynthStores) -> None:
     """Best-effort (release finding #4): `limactl` being unavailable, or
     any other reaper failure, must never block server startup -- this is a
@@ -1406,6 +1514,10 @@ def create_app(
         # (field test 4 -- see `_keep_store_lock`). The lock itself survives the
         # deletion; only the evidence odin can find by path does not.
         lock_watch = asyncio.create_task(_keep_store_lock(store_lock))
+        # ...and the same shape for the loops themselves: nothing used to
+        # notice a reconciler that had stopped ticking (see
+        # `_watch_reconcilers` and `Reconciler.health`).
+        loop_watch = asyncio.create_task(_watch_reconcilers(reconcilers, ws_manager))
         envs = _store.list_envs()
         if _reap_ec2_vms:
             await _reap_orphaned_ec2_vms(_store.root, envs, gateway_stores)
@@ -1415,6 +1527,7 @@ def create_app(
             yield
         finally:
             lock_watch.cancel()
+            loop_watch.cancel()
             for reconciler in reconcilers.values():
                 await reconciler.stop()
             stop_in_thread(gateway_server, gateway_thread)
@@ -1433,7 +1546,7 @@ def create_app(
     app.include_router(
         create_apply_router(
             _store, reconciler_for, gateway_keystore, tf_runner, lambda: gateway_port_actual, env_epoch,
-            gateway_stores, gateway_state, _runtime,
+            gateway_stores, gateway_state, _runtime, reconcilers,
         )
     )
     app.include_router(
@@ -1468,7 +1581,16 @@ def create_app(
 
     @app.get("/health")
     def health():
-        return {"ok": True, "gateway": {"port": gateway_port_actual}}
+        """Still 200, and `ok` still means "this HTTP server answered" -- that
+        is what `odin start`'s readiness wait and the UI's Backend LED ask, and
+        a server whose reconciler died is still serving. The reconciler answer
+        is a SEPARATE field rather than a status code, so neither question can
+        be mistaken for the other; `odin status` and the TopBar chip read it."""
+        return {
+            "ok": True,
+            "gateway": {"port": gateway_port_actual},
+            "reconcilers": [reconciler.health().model_dump() for reconciler in reconcilers.values()],
+        }
 
     app.state.store = _store
     app.state.runtime = _runtime

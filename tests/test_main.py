@@ -10,12 +10,15 @@ import sys
 import threading
 import time
 
+import httpx
 import pytest
+import respx
 import typer
 
 from odin import __main__ as main_mod, util
 from odin.cli import doctor as doctor_mod
 from odin.gateway.stores import SynthStores
+from odin.reconcile.reconciler import LoopHealth
 
 
 def test_default_host_constant_is_loopback():
@@ -162,9 +165,16 @@ def store_lock(tmp_path):
     lock.release()
 
 
+# A port nothing serves (RFC 863 discard, unused on macOS). `odin status` asks
+# a live server about its reconcilers over HTTP, and these tests are about the
+# STORE-LOCK half -- pointing them at a URL that cannot answer keeps them from
+# depending on whatever happens to be listening on 4200.
+NO_SERVER_URL = "http://127.0.0.1:9"
+
+
 def test_status_is_honest_about_a_server_odin_did_not_start(tmp_path, monkeypatch, capsys, store_lock):
     monkeypatch.chdir(tmp_path)
-    main_mod.status()
+    main_mod.status(url=NO_SERVER_URL)
     out = capsys.readouterr().out
     assert "Odin is running" in out and str(os.getpid()) in out
     assert "store lock" in out and "no pidfile" in out
@@ -204,7 +214,7 @@ def test_status_exits_nonzero_when_odin_is_not_running(tmp_path, monkeypatch, ca
 
 def test_status_exits_zero_when_odin_is_running(tmp_path, monkeypatch, capsys, store_lock):
     monkeypatch.chdir(tmp_path)
-    main_mod.status()  # no typer.Exit at all == exit 0
+    main_mod.status(url=NO_SERVER_URL)  # no typer.Exit at all == exit 0
     assert "Odin is running" in capsys.readouterr().out
 
 
@@ -212,8 +222,72 @@ def test_status_reports_the_pidfile_path_as_managed(tmp_path, monkeypatch, capsy
     monkeypatch.chdir(tmp_path)
     main_mod.ODIN_DIR.mkdir()
     main_mod.PID_FILE.write_text(str(os.getpid()))
-    main_mod.status()
+    main_mod.status(url=NO_SERVER_URL)
     assert f"Odin is running (pid {os.getpid()}, pidfile)" in capsys.readouterr().out
+
+
+def test_status_calls_reconciler_health_unknown_when_the_server_does_not_answer(
+    tmp_path, monkeypatch, capsys, store_lock
+):
+    """The store lock proves odin is UP; it proves nothing about the loops
+    inside it. Not being able to ask must read as UNKNOWN -- never as healthy,
+    and never as a failure invented from a URL guess (the default is
+    localhost:4200, so a server on another port would otherwise fail a gate
+    that has nothing wrong with it)."""
+    monkeypatch.chdir(tmp_path)
+    main_mod.status(url=NO_SERVER_URL)  # exit 0
+    captured = capsys.readouterr()
+    assert "Odin is running" in captured.out
+    assert "UNKNOWN" in captured.err and "ODIN_URL" in captured.err
+
+
+def test_status_exits_nonzero_and_names_the_env_when_a_reconciler_is_down(
+    tmp_path, monkeypatch, capsys, store_lock
+):
+    """A live server whose loop died is the same false green as a server that
+    isn't there: `odin status && odin apply` must not apply into an env nothing
+    converges."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main_mod, "_reconciler_health", lambda url: [
+        LoopHealth(env="prod", ticking=True, ticks=40).model_dump(),
+        LoopHealth(env="default", ticking=False, verdict="... its task was CANCELLED ...").model_dump(),
+    ])
+    with pytest.raises(typer.Exit) as exit_info:
+        main_mod.status(url=NO_SERVER_URL)
+    assert exit_info.value.exit_code == 1
+    assert "RECONCILER DOWN" in capsys.readouterr().err
+
+
+def test_status_reports_the_converging_reconcilers_by_name(tmp_path, monkeypatch, capsys, store_lock):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main_mod, "_reconciler_health", lambda url: [
+        LoopHealth(env="default", ticking=True, ticks=40).model_dump(),
+        LoopHealth(env="prod", ticking=True, ticks=12).model_dump(),
+    ])
+    main_mod.status(url=NO_SERVER_URL)  # exit 0
+    assert "2 reconciler(s) converging: default, prod" in capsys.readouterr().out
+
+
+def test_reconciler_health_reads_the_real_health_body(monkeypatch):
+    """The parse, against the shape `GET /health` really serves (built here by
+    the same `LoopHealth` the route serializes). The whole round trip -- real
+    server, real route, real `odin status` binary -- is proven in the e2e."""
+    body = {
+        "ok": True, "gateway": {"port": 4599},
+        "reconcilers": [LoopHealth(env="default", ticking=True, ticks=3).model_dump()],
+    }
+    with respx.mock:
+        respx.get("http://odin.test/health").mock(return_value=httpx.Response(200, json=body))
+        assert main_mod._reconciler_health("http://odin.test/") == body["reconcilers"]
+
+
+def test_reconciler_health_is_unknown_rather_than_empty_when_the_field_is_missing():
+    """An answer with no `reconcilers` key says nothing about the loops behind
+    it -- reading that as "none are down" is exactly the inference this whole
+    change exists to remove."""
+    with respx.mock:
+        respx.get("http://odin.test/health").mock(return_value=httpx.Response(200, json={"ok": True}))
+        assert main_mod._reconciler_health("http://odin.test") is None
 
 
 def test_status_cleans_a_stale_pidfile_and_says_so(tmp_path, monkeypatch, capsys):

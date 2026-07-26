@@ -91,7 +91,7 @@ curl -fsSL .../scripts/install.sh | sh -s -- --force
 odin start            # build the UI (first run) and serve on http://localhost:4200, in the background
 odin start --dev      # Vite HMR + uvicorn --reload; runs in the FOREGROUND (Ctrl+C to stop)
 odin stop             # stop a background `odin start`
-odin status           # is it running? exit 0 if yes, 1 if no
+odin status           # is it up AND reconciling? exit 0 if yes, 1 if no
 odin clean            # remove test artifacts/logs (--all wipes .odin/ entirely)
 ```
 
@@ -321,7 +321,7 @@ question rather than perform an action, and there the code *is* the answer:
 
 | command | `0` | non-zero |
 | ------- | --- | -------- |
-| `odin status` | odin is running | `1` — odin is not running |
+| `odin status` | odin is running and every env's reconciler is ticking | `1` — odin is not running, **or** a reconciler has stopped converging ([why](#when-the-reconciler-itself-stops)) |
 | `odin tf plan` | no changes | `2` changes, `1` error/refusal, `3` server unreachable ([why](#checking-for-drift--and-why-not-to-run-tofu-by-hand)) |
 
 `odin stop` is the deliberate mirror image of `status`: nothing running is
@@ -419,6 +419,48 @@ One caveat the exit code can't carry: `no_changes` means "no drift in what
 odin can generate". A node odin has no Terraform for was never in the plan.
 The command names those on its own line, and `-o json` puts them in
 `.not_covered`.
+
+### When the reconciler itself stops
+
+Every phase you see in `/world`, in `odin world` and on the canvas is written
+by one thing: the per-env reconciler loop. If that loop stops, nothing else
+notices on its own — no backing container gets restored, no garbage is
+collected, no out-of-band deletion is detected, and no status is updated. The
+last snapshot just sits there looking converged. odin now refuses to let that
+be quiet:
+
+- **`GET /world`** carries a `reconciler` block (`ticking`, a `verdict`, the
+  age of the last completed tick, the consecutive-failure count and the real
+  error). When it isn't ticking, **every resource's `verdict` is prefixed with
+  `[STALE: …]`** too, so a script that only walks `resources` cannot read a
+  frozen `healthy` as a live one.
+- **`GET /health`** lists the same answer per env under `reconcilers`. It stays
+  HTTP 200 and `ok: true` — that field means "this server answered", which is a
+  different question, and conflating them would break `odin start`'s readiness
+  wait.
+- **`odin status`** exits `1` and prints `RECONCILER DOWN: …` (it asks the
+  server over HTTP, so use `--url`/`ODIN_URL` for a non-default port; if it
+  can't ask, it says the loop state is UNKNOWN rather than assuming health).
+- **`odin world`** prints the same line on stderr, above the table, empty world
+  or not.
+- **The server log** gets one ERROR per transition (never one per check), the
+  UI's Logs tab gets the same line over the WebSocket, and it lands in the
+  env's durable event log (`odin events`). The TopBar shows a red
+  `RECONCILER DOWN` chip off its live `/health` poll.
+
+All three ways a loop can stop are covered, and each is read from a real
+signal: the task is **gone** (cancelled, or killed by a `BaseException` —
+`asyncio.CancelledError` is not an `Exception`, so the loop's own error
+handler never saw it), a tick is **hung** (alive, never finishing), or every
+tick **raises** (alive, logging, converging nothing). The first is reported
+instantly; the other two after `poll_interval + 30s` with no completed tick
+(measured: real ticks take 0.03–0.12s, so the window is ~250× the worst case
+observed).
+
+odin **reports this and does not restart the loop for you**, the same rule the
+reality sweep follows for drifted infrastructure: a dead loop means an odin
+bug, and a silent auto-restart would hide the bug in exactly the surfaces
+above. The remedy is `odin stop && odin start`, which the verdict names.
 
 ## Backup and restore
 
