@@ -125,7 +125,7 @@ from odin.compute.instances import InstanceVm, vm_name
 from odin.compute.tasks import container_name as task_container_name
 from odin.gateway.models import rdsctl
 from odin.gateway.models.ec2compute import mark_instance_terminated
-from odin.gateway.models.ecsctl import mark_task_stopped
+from odin.gateway.models.ecsctl import container_gone_reason, mark_task_stopped
 from odin.gateway.models.lambdactl import mark_function_failed
 from odin.gateway.stores import SynthStores
 from odin.reconcile.assertions import pg_ready_sync
@@ -518,10 +518,9 @@ class DriftSweeper:
                 mark_instance_terminated(stores, env, instance_id, out[label])
         for cluster, task_id, name in tasks:
             if live_containers is not None and name not in live_containers:
-                mark_task_stopped(
-                    stores, env, cluster, task_id,
-                    f"container {name} removed outside odin — re-Apply to recreate",
-                )
+                # Same wording as ecsctl's own passive sweep, which races this
+                # one for the identical event -- see `container_gone_reason`.
+                mark_task_stopped(stores, env, cluster, task_id, container_gone_reason(name))
         self._sweep_databases(stores, env, out)
         return out
 

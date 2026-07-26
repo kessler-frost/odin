@@ -13,6 +13,7 @@ from odin.compute.tasks import container_name as task_container_name
 from odin.gateway.models import rdsctl
 from odin.gateway.stores import SynthStores
 from odin.reconcile.assertions import PgReady
+from odin.gateway.models.ecsctl import container_gone_reason
 from odin.reconcile.drift import DriftSweeper, sweep_compute
 from odin.reconcile.tf_status import project
 
@@ -286,7 +287,11 @@ def test_removed_task_container_marks_the_task_stopped_with_a_drift_reason(tmp_p
     assert verdicts == {}  # ecs reports through its own record, not the overlay
     task = stores.ecsctl.get(ENV, "task:odin:t1")
     assert task["last_status"] == "STOPPED"
-    assert task["stopped_reason"] == f"container {container} removed outside odin — re-Apply to recreate"
+    # Pinned to the SHARED wording, not a hand-copied string: ecsctl's passive
+    # sweep races this path for the identical event, and when the two wrote
+    # different sentences whichever won decided what the user saw -- which made
+    # this very assertion flake under load. One source of truth for both.
+    assert task["stopped_reason"] == container_gone_reason(container)
     assert task["exit_code"] is None  # a container that's GONE never reported one
 
 

@@ -118,10 +118,21 @@ _DEFAULT_COMPATIBILITIES = ["EC2"]
 # delete), which never goes through the lazy sweep at all (this module
 # already knows the outcome the moment it issues the stop).
 _ESSENTIAL_CONTAINER_EXITED = "Essential container in task exited"
-# A container that no longer exists at all -- removed out of band rather than
-# exited on its own. Worth its own reason: "exited" invites a hunt for a crash
-# that never happened.
-_CONTAINER_GONE = "Task container removed outside odin"
+
+
+def container_gone_reason(container_name: str) -> str:
+    """The ONE wording for "this task's container no longer exists".
+
+    Two paths reach that conclusion and RACE to record it: this module's
+    passive `sweep_tasks` (which sees `absent` on a status read) and
+    `reconcile/drift.py`'s reality sweep. They used to write different strings
+    for the identical event, so whichever won decided what the user saw -- and
+    a test asserting one of them flaked intermittently. Both now call this.
+
+    It says its own reason rather than "exited", because "exited" invites a
+    hunt for a crash that never happened, and it names the remedy because the
+    user's next question is always what to do about it."""
+    return f"container {container_name} removed outside odin — re-Apply to recreate"
 
 # How many trailing lines of a task container's output ONE sweep reads
 # (`docker logs --tail N`) -- see `_ship_task_logs`: bounded so a chatty
@@ -648,7 +659,8 @@ def sweep_tasks(stores: SynthStores, env: str, runtime: TaskRuntime) -> None:
         _update_task(
             stores, env, task["cluster_name"], task["task_id"],
             last_status="STOPPED", stopped_at=time.time(), exit_code=exit_code,
-            stopped_reason=_CONTAINER_GONE if gone else _ESSENTIAL_CONTAINER_EXITED,
+            stopped_reason=(container_gone_reason(task["container_name"]) if gone
+                            else _ESSENTIAL_CONTAINER_EXITED),
         )
         # W2.5: a task that died on its own must leave its load balancer's
         # upstream list too, or the proxy keeps a dead server in rotation. Runs

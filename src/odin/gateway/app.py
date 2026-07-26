@@ -270,10 +270,23 @@ def create_gateway_app(
     ])
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+def _bound_socket(host: str, port: int) -> socket.socket:
+    """Bind NOW and hand the live socket to uvicorn, so the port cannot be
+    stolen between choosing it and serving on it.
+
+    `port=0` used to be resolved by binding a throwaway socket, reading its
+    number, and CLOSING it -- uvicorn then bound the same number a moment
+    later. Anything else on the machine could take it in that window, and
+    under parallel runs something did (intermittent EADDRINUSE, and the
+    symptom was a confusing 15s `_wait_until_serving` timeout rather than a
+    bind error). Holding the socket removes the window entirely.
+
+    An explicitly requested port still fails loudly here: a caller who asked
+    for 4266 must not silently be given something else."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((host, port))
+    return sock
 
 
 def _wait_until_serving(port: int, timeout: float = 15.0) -> None:
@@ -305,10 +318,11 @@ def serve_in_thread(app: Starlette, host: str = "0.0.0.0", port: int = 0) -> tup
     request here is SigV4-verified (`catch_all` -> `sigv4.verify`, this
     module's own docstring) before anything is classified or forwarded --
     unlike the control app, which has no equivalent per-request check."""
-    actual_port = port or _free_port()
+    sock = _bound_socket(host, port)
+    actual_port = sock.getsockname()[1]
     config = uvicorn.Config(app, host=host, port=actual_port, log_level="warning")
     server = uvicorn.Server(config)
-    thread = threading.Thread(target=server.run, name="odin-gateway", daemon=True)
+    thread = threading.Thread(target=lambda: server.run(sockets=[sock]), name="odin-gateway", daemon=True)
     thread.start()
     _wait_until_serving(actual_port)
     return server, thread, actual_port
