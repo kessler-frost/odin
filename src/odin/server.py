@@ -295,6 +295,30 @@ def _uncovered_destroys(
     ]
 
 
+def _wiring_rejection(wiring_errors: list[str], env: str) -> JSONResponse:
+    """A canvas wiring reference that names a node which is not on the canvas.
+
+    NOT a coverage problem, and deliberately not reported as one (field test 5,
+    F5-8: it used to ride in `unsupported`, so `not_covered` -- the one field a
+    CI gate reads -- failed under a COVERAGE label for a node odin builds fine).
+    It is a user error, and it is fatal: the workload cannot start without that
+    variable, so `gateway/wiring.py::_resolve` raises `UnresolvedRef` for it at
+    launch and the apply fails anyway. Refusing here reaches the same verdict
+    before any container is created, naming the node and the ref instead of a
+    stopped task."""
+    named = "; ".join(wiring_errors)
+    return JSONResponse(status_code=409, content={
+        "error": (
+            f"refusing to apply: {len(wiring_errors)} canvas wiring reference(s) in env {env!r} "
+            f"name a node that is not on the canvas, so the workload(s) below could never be "
+            f"given those variables and would fail to start: {named}. Fix the reference(s) or "
+            f"add the missing node, then re-apply. Nothing was changed."
+        ),
+        "wiring_errors": wiring_errors,
+        "env": env,
+    })
+
+
 def _uncovered_rejection(uncovered: list[dict], env: str) -> JSONResponse:
     """The refusal itself: names every node, says what about it isn't covered,
     and says plainly what applying anyway would do. `error` is what makes the
@@ -694,6 +718,7 @@ def create_tf_router(
         body = {
             "status": "applied" if result.ok else "failed", "env": env,
             "exit_code": result.exit_code, "unsupported": project.unsupported,
+            "wiring_errors": project.wiring_errors,
             # This route applies the STORED Stack -- no canvas is read, so
             # there is no `skipped` half and the union is `unsupported`. The
             # field is published anyway so one gate shape covers every route.
@@ -750,6 +775,7 @@ def create_tf_router(
         body = {
             "status": _PLAN_STATUS.get(result.exit_code, "failed"), "env": env,
             "exit_code": result.exit_code, "unsupported": project.unsupported, "tail": list(result.tail),
+            "wiring_errors": project.wiring_errors,
             "skipped": skipped, "not_covered": not_covered(skipped, project.unsupported),
             "canvas_drift": canvas_drift,
         }
@@ -882,6 +908,14 @@ def create_apply_full_router(
         )
         if uncovered and not allow_destroying_uncovered:
             return _uncovered_rejection(uncovered, env)
+        # Field test 5, F5-8: a wiring ref naming a node not on the canvas can
+        # NEVER resolve, so the launch path fails the apply anyway
+        # (wiring.py::_resolve -> UnresolvedRef). Refusing here reaches the same
+        # verdict before any container exists, and -- the actual bug -- keeps it
+        # out of `not_covered`, which is a COVERAGE field. Beside the uncovered
+        # refusal so both land before anything is touched.
+        if skeleton.wiring_errors:
+            return _wiring_rejection(skeleton.wiring_errors, env)
 
         # Owner directive B1: reject BEFORE ensure_backings/translate/tofu
         # ever touch a container or VM, not after 20 of them have already
@@ -904,6 +938,7 @@ def create_apply_full_router(
             "status": "applied", "rev": None, "env": env,
             "skipped": skipped,
             "refined": translated.refined, "unsupported": translated.unsupported,
+            "wiring_errors": translated.wiring_errors,
             # The ONE array a CI gate should read -- see `not_covered`'s own
             # docstring for the green-while-dropping-nodes trap it closes.
             "not_covered": not_covered(skipped, translated.unsupported),

@@ -299,3 +299,41 @@ def test_tf_apply_refuses_too(tmp_path):
         resp = client.post("/tf/apply")
     assert resp.status_code == 409, resp.text
     assert [item["node"] for item in resp.json()["would_destroy"]] == ["api"]
+
+
+# --- F5-8: a broken wiring ref is a USER error, not a coverage fact ----------
+
+
+def test_a_broken_wiring_ref_is_refused_and_never_reported_as_coverage(tmp_path, monkeypatch):
+    """Field test 5: a typo'd `${{ghost.ENDPOINT}}` used to ride in
+    `unsupported`, so `not_covered` — the one field v0.7.3 told CI to gate on —
+    failed under a COVERAGE label for a lambda odin builds fine. The refusal is
+    safe because the ref names a node not on the canvas, so it can never
+    resolve at launch either; this reaches the same verdict earlier."""
+    app = _app(tmp_path)
+    canvas = {"nodes": [{"id": "n1", "type": "lambda", "data": {
+        "label": "worker", "env": {"ENDPOINT": "${{ghost.ENDPOINT}}"}}}], "edges": []}
+    with TestClient(app) as client:
+        resp = client.post("/apply-full", params={"env": "w"}, json=canvas)
+
+    assert resp.status_code == 409, "a ref that can never resolve must not reach tofu"
+    body = resp.json()
+    assert "ghost" in body["error"] and "worker" in body["error"]
+    assert body["wiring_errors"], "the refusal must name the wiring problem as its own thing"
+
+
+def test_a_broken_ref_does_not_hide_a_genuinely_uncovered_kind(tmp_path, monkeypatch):
+    """The failure mode of an over-eager fix is UNDER-reporting `not_covered`,
+    which is exactly what CI reads. A canvas carrying BOTH problems must still
+    report the coverage gap."""
+    _patch_translate(monkeypatch, TranslateResult(files={}, refined=False))
+    app = _app(tmp_path)
+    canvas = {"nodes": [
+        {"id": "n1", "type": "kinesis", "data": {"label": "stream"}},
+        {"id": "n2", "type": "s3", "data": {"label": "uploads"}},
+    ], "edges": []}
+    with TestClient(app) as client:
+        body = client.post("/apply-full", params={"env": "w2"}, json=canvas).json()
+
+    assert "kinesis" in body["not_covered"], "a genuinely unsupported kind must still be named"
+    assert body.get("wiring_errors") == [], "and nothing wiring-related should appear"
