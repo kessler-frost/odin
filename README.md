@@ -350,6 +350,20 @@ unbuilt kind, or a typo) and `unsupported` (a resource odin models but can't
 generate Terraform for, with the reason). Both arrays are still published
 separately; gate on `not_covered` and neither can slip past.
 
+`not_covered` answers exactly one question — **"is there a node odin cannot
+build?"** — and nothing else. In particular it is *not* where a broken
+`${{...}}` wiring reference is reported, and it used to be: a typo'd producer
+name (`${{ghost.ENDPOINT}}`) landed in `unsupported`, so `not_covered` failed
+this gate under a coverage label for a node odin covers completely and had just
+applied successfully. A bad reference is a mistake in what you wrote, not a gap
+in what odin covers, and the two need different answers.
+
+A broken reference still fails, on its own terms rather than as a coverage
+problem: the workload it belongs to cannot start without that variable, so it
+comes up `crashed` with the unresolved reference named in its verdict, and the
+apply exits nonzero. So a green `not_covered` means "odin can build everything
+you drew" — it does not mean "everything you drew is correct".
+
 **A node that was ALREADY APPLIED and then becomes uncovered is a different
 story, and Apply refuses it.** Uncovered means "not in this apply", which for
 something that already exists means "deleted": `count: "2"` mistyped as
