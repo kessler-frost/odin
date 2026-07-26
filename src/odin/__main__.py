@@ -7,8 +7,10 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
+import httpx
 import typer
 
 from odin.cli import commands as _commands  # noqa: F401  (registers the control-surface commands)
@@ -30,6 +32,20 @@ DEFAULT_HOST = "127.0.0.1"
 # laptop" into "anyone on this network can run containers on my laptop", so
 # loopback is the only default; a wider bind is opt-in and loud about it.
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+# How long `odin start` waits for the server it just launched to actually
+# answer, and how often it asks. uvicorn accepts connections only AFTER its
+# lifespan startup returns, and odin's lifespan does real work first: it starts
+# the gateway listener, takes the store lock, reaps orphaned EC2 VMs and
+# resumes a reconciler for every env already in the store. So the wait is
+# proportional to what this store holds, and the ceiling is generous on purpose
+# -- a store with several envs to resume is slow, not broken. Timing it out is
+# reported, never assumed (see `_await_serving`).
+READY_TIMEOUT = 120.0
+_READY_POLL = 0.1
+# Enough of the log to show the error uvicorn died on (a port already in use,
+# an import error) without pasting a whole startup transcript into the terminal.
+_LOG_TAIL_LINES = 12
 
 
 def _print_version(value: bool) -> None:
@@ -95,6 +111,82 @@ def _already_running() -> bool:
     return True
 
 
+def _probe_address(host: str, port: int) -> str:
+    """The address to knock on for a server bound to `host`.
+
+    A wildcard bind (`0.0.0.0`, `::`) accepts on every interface but is not
+    itself a destination, so the probe goes to loopback -- which that server is
+    listening on too. IPv6 literals get bracketed, as a URL requires.
+    """
+    probe = {"0.0.0.0": "127.0.0.1", "::": "::1", "": "127.0.0.1"}.get(host, host)
+    authority = f"[{probe}]" if ":" in probe else probe
+    return f"http://{authority}:{port}"
+
+
+def _serving(address: str) -> bool:
+    """Whether odin is answering at `address` RIGHT NOW -- one real GET
+    /health, so a True here is the same round trip `odin world` is about to
+    make, not an inference from a pid or a lock. Nothing listening yet is an
+    ordinary answer (False) while a server is still starting, never an error."""
+    try:
+        return httpx.get(f"{address}/health", timeout=2.0).status_code == 200
+    except httpx.HTTPError:
+        return False
+
+
+def _await_serving(proc: subprocess.Popen, address: str, timeout: float) -> str | None:
+    """Wait for `proc` to answer at `address`. None once it does; otherwise the
+    reason it did not, in the caller's words.
+
+    `odin stop` learned this in v0.7.4 -- it reported success ~0.9s before the
+    process actually died, which broke the documented `odin stop && odin clean
+    --all` remedy -- and `start` had the identical shape at the other end:
+    `subprocess.Popen` returns as soon as the FORK succeeds, which says nothing
+    about whether uvicorn ever bound the port. Measured on this machine with an
+    empty store, `odin start` returned at 0.2s while /health first answered at
+    0.7s (5.0s on a cold import cache), and `odin start && odin world` failed 3
+    times out of 3 with "Could not reach odin server -- is it running? Try
+    `odin start`", naming the command that had just claimed success.
+
+    So this polls the same signal `await_server_exit` polls for the mirror
+    question, differing only in which one is the real one: liveness is the
+    kernel store lock, but SERVING is not -- lifespan takes that lock before it
+    resumes any reconciler and therefore before uvicorn accepts a single
+    connection (measured: lock at 0.661s, /health at 0.714s in the same run).
+    An HTTP answer is the only evidence that the thing the next command needs
+    is there.
+    """
+    deadline = time.monotonic() + timeout
+    while not _serving(address):
+        if proc.poll() is not None:
+            return f"the server process exited with code {proc.returncode} before it served anything"
+        if time.monotonic() >= deadline:
+            return f"the server did not answer {address}/health within {timeout:.0f}s"
+        time.sleep(_READY_POLL)
+    return None
+
+
+def _report_start_failure(reason: str, proc: subprocess.Popen, log_path: Path) -> typer.Exit:
+    """Say what odin observed, show what the server said, and name the next
+    command -- for both shapes of failure, because they need different ones."""
+    typer.echo(f"Odin did not come up: {reason}.", err=True)
+    tail = log_path.read_text().splitlines()[-_LOG_TAIL_LINES:] if log_path.is_file() else []
+    typer.echo(f"Its output ({log_path}):", err=True)
+    for line in tail or ["(the log is empty)"]:
+        typer.echo(f"  {line}", err=True)
+    still_up = proc.poll() is None
+    if not still_up:  # the pid in the file is a corpse, so it is stale by definition
+        PID_FILE.unlink(missing_ok=True)
+    typer.echo(
+        f"The process is still running (pid {proc.pid}) and may yet come up — "
+        f"`odin status` to check again, `odin stop` to shut it down."
+        if still_up else
+        f"Nothing is running now; fix what {log_path} reports and run `odin start` again.",
+        err=True,
+    )
+    return typer.Exit(1)
+
+
 def _build_ui() -> None:
     if (Path(__file__).resolve().parent / "_ui").exists():
         return  # UI ships bundled with the installed package
@@ -151,8 +243,16 @@ def start(
             stdout=log, stderr=log, start_new_session=True,
         )
         PID_FILE.write_text(str(proc.pid))
+        # Popen returned, which proves a fork -- not a server. Say what has
+        # actually happened so far, then wait for the thing the next command in
+        # `odin start && odin apply` needs.
+        address = _probe_address(host, port)
+        typer.echo(f"Launched uvicorn (pid {proc.pid}); waiting for it to answer {address}/health …")
+        failure = _await_serving(proc, address, READY_TIMEOUT)
+        if failure is not None:
+            raise _report_start_failure(failure, proc, log_path)
         typer.echo(
-            f"Odin started in background (pid {proc.pid}). "
+            f"Odin is up and serving at {address} (pid {proc.pid}). "
             f"Logs: {log_path}. Use `odin stop` to shut down."
         )
 
