@@ -176,18 +176,61 @@ future decision against these points instead of re-deriving them:
     60s budget as `timeouts.update` (`ODIN_ECS_STEADY_TIMEOUT` overrides), and
     it returns the moment nothing is left pending, so a healthy apply pays one
     store read. (Fixed: a
-    **Residual gap, stated plainly:** `/apply-full` holds the reconciler's tick
-    lock for the whole tofu run, so `/world` is FROZEN at its last pre-apply
-    reading for ~60s. The ~59-second blind window the field test measured is
-    therefore unchanged — what changed is that it now conceals a rollout whose
-    old revision is still serving every request, instead of concealing a total
-    outage. Also: a replacement that takes longer than
+    **The blind window is CLOSED (v0.7.3).** `/apply-full` used to hold the
+    reconciler's tick lock for the whole tofu run, freezing `/world` at its
+    last pre-apply reading for ~60s. `hold()` now suspends the reconciler's
+    ACTIONS (plan/execute, gc, the policy push, the prune) while leaving
+    OBSERVATION running, so state changes are visible AS THEY HAPPEN: the
+    honest reading arrived at t=62.3s before the fix (after the apply had
+    already returned) and arrives at **t=4.1s** after it, re-measured
+    independently by field test 4 at ~3s. Sixty observation ticks over a
+    steady projection emit zero deltas, so nothing flaps. **Residual:** a replacement that takes longer than
     `ecsctl._ROLLOUT_STABILIZE_SECONDS` to crash is counted as serving and the
     old revision is retired anyway (real ECS behaves the same for a service
     with no health check configured). (Fixed: a
     `tags` block on `aws_ecs_service` now plans zero-drift — the gateway stores
     the full tag set and echoes it back, with
     `TagResource`/`UntagResource`/`ListTagsForResource` modeled.)
+  - **DURING an apply, `/world` is part live and part cache — which part, and
+    for how long** (field test 4, P4-4; this limit previously existed only as a
+    source comment, which is precisely what northstar directive 5 forbids).
+    Everything `tf_status.project()` computes from the gateway's own records is
+    LIVE on every observation tick (~1s) — that is the blind window closed
+    above — and so is the real state of every **ECS task**, because the
+    projection re-runs `ecsctl.sweep_tasks` on each of those ticks and that
+    sweep now recognises a container that has VANISHED (`absent`), not just one
+    that exited. What is NOT live is the reality sweep for the other three
+    kinds with a runtime footprint:
+    - **ec2** — the Lima VM, checked by a bulk `limactl list`;
+    - **lambda** — the RIE container, checked by a bulk `docker ps`;
+    - **rds** — the Postgres container, checked by a real `pg_ready` connection.
+    For those three an in-flight apply reads the LAST SWEEP'S CACHE
+    (`reconcile/reconciler.py::_project_tf_owned(act=False)`), deliberately and
+    not as an oversight: a sweep does not merely look, it CORRECTS records
+    (`mark_instance_terminated` / `mark_function_failed` /
+    `rdsctl.mark_instance_failed`) off a sample taken while tofu is pulling
+    images and booting VMs — the busy-daemon hazard `reconcile/drift.py`'s
+    confirm-before-correcting note describes, where a false `failed` needs a
+    human Apply to undo. **How long it can be stale:** the rest of the apply,
+    plus up to one sweep cadence after it returns — `ODIN_DRIFT_SWEEP_TICKS`,
+    default 10 ticks ≈ 10s at the production 1s poll — because the cadence
+    counter does not advance while suspended and the tick both routes run right
+    after the hold does not force a sweep. Field test 4 measured exactly that
+    shape before the ECS half was closed: a container removed 20s into a 63.4s
+    apply was still counted at 3-of-3 for 57s, 14 of them after the apply had
+    returned. Drift reported BEFORE the apply keeps being reported throughout —
+    the cache is stale, never empty. **Also suspended for the same
+    "don't act mid-apply" reason:** the observe pass for the PROVISIONED kinds
+    (s3/sqs/sns/dynamodb — it re-subscribes SNS topics, so it is not read-only,
+    and it would inspect the very backing tofu is creating inside), and the
+    World PRUNE of a label tofu destroyed; both resume on the tick right after.
+    **If you need certainty about an ec2/lambda/rds resource, don't read
+    `/world` mid-apply** — wait for the apply to return and give it one sweep
+    (~10s), or ask the substrate directly: `odin doctor`, `docker ps`,
+    `limactl list` and a `psql` connection all bypass this cache entirely.
+    (Pinned by `tests/reconcile/test_reconciler.py`'s
+    `test_a_task_container_removed_mid_apply_is_seen_within_one_tick` and
+    `test_a_deleted_ec2_vm_is_NOT_seen_until_the_apply_releases`.)
   - SNS→SQS live-edit: FIXED (v0.5.0) — adding a subscription edge to an
     already-healthy topic lands on the next Apply via the reconciler's
     observe pass (proven by real fanout to both queues).
@@ -365,25 +408,57 @@ future decision against these points instead of re-deriving them:
         Unchanged membership costs one local file read — no `nebula-cert`,
         no `limactl`, no signal — and a reordering of the same groups is not
         a change.
-      - **What a revoke does NOT reach: a connection already open through
-        it.** New connections are refused the moment the peer re-handshakes
-        — measured at 0.11s in the test above, i.e. before Apply has even
-        returned. But nebula's firewall keeps a conntrack entry per flow and
-        re-validates it only when its OWN ruleset version changes, not when a
-        peer's certificate does (the shipped binary's own diagnostics say so:
+      - **A revoke also reaches a connection that is ALREADY OPEN** (field
+        test 4). New connections were already refused the moment the peer
+        re-handshakes — measured at 0.11s, before Apply returns — but an open
+        flow used to survive: field test 4 held a real TCP session to the
+        database across a revoke, pushed a genuine Postgres startup packet
+        down it, and the server ANSWERED. That is nebula's design, not a bug
+        in it: its firewall keeps a conntrack entry per flow and re-validates
+        it only when its OWN ruleset version changes, never when a peer's
+        certificate does (the shipped binary's own diagnostics say so:
         `keeping old conntrack entry, does match new ruleset` vs `dropping
         old conntrack entry, does not match new ruleset`, and
-        `firewall rulesVersion has overflowed, resetting conntrack`). So a
-        long-lived flow that keeps sending can outlive the revoke on the
-        ADMITTING member, up to `firewall.conntrack.tcp_timeout` /
-        `udp_timeout` / `default_timeout` — nebula's defaults, which odin
-        does not override. Editing the admitting group's RULES (that DOES
-        bump the ruleset version, forcing re-validation against the peer's
-        new certificate) or restarting the admitting member closes it
-        immediately. Real AWS security groups have the same property for
-        established flows, so this is a shared limit rather than a
-        substitution gap — but it is the one thing "revoked" does not mean
-        here, and it is stated rather than assumed.
+        `firewall rulesVersion has overflowed, resetting conntrack`).
+        So the lever is the ADMITTING member's own reload — and
+        `reloadFirewall` counts a reload only if the `firewall` config
+        section really changed, which a no-op reload does not. Measured
+        against the shipped 1.10.3 binary, four SIGHUPs at one daemon:
+        an identical config logs `No firewall config change detected`; adding
+        one key nebula ignores (`firewall.odin_membership_revision`) logs
+        `New firewall has been installed ... rulesVersion=1` with
+        `firewallHashes` EQUAL to `oldFirewallHashes`; identical again is a
+        no-op again. Equal rule hashes with a new ruleset version is exactly
+        the no-op-but-versioned reload this needs, with no invented rule that
+        could accidentally permit something. odin renders that key as a digest
+        of the env's whole membership roster
+        (`ec2compute.membership_revision`), so it moves when, and only when,
+        some member's certificate groups move — and it rides inside the
+        firewall block, so every member adopts it by SIGHUP, never a restart.
+        Both member kinds are covered: an EC2 VM (`systemctl kill -s HUP`) and
+        a database, whose sidecar now reloads in place (`docker kill -s HUP`)
+        instead of being replaced. Proven on the wire
+        (`tests/simulate/test_sg_revoke_drops_open_flow_e2e.py`): a real
+        session held open across the revoke timed out on its next genuine
+        protocol packet, while a still-permitted port on the SAME database
+        over the SAME tunnel answered `connection refused` at the same
+        instant, the database's own log shows the equal-hash reload, and its
+        sidecar came through with the same container id, same start time and
+        `RestartCount=0`.
+      - **What that still does not mean.** It is not instant: the flow dies
+        when the Apply's mesh passes finish (12.8s in the measurement above,
+        longer on a loaded machine). And it depends on an ordering — the
+        admitting member re-checks the flow against the certificate it
+        CURRENTLY holds for the peer, so the peer must already have
+        re-handshaked under the new one. odin enforces that (moved members are
+        re-certified, restarted and poked into re-handshaking first, then
+        admitting members reload, then databases — `ensure_instance_mesh`
+        orders its own loop by `membership_changed`, and server.py runs it
+        before `ensure_db_mesh`). If a poke fails, the admitting member can
+        re-validate against the stale certificate, stamp the flow current, and
+        that one flow survives until it closes or nebula's
+        `firewall.conntrack` timeouts expire it; no later Apply revisits it,
+        because the membership has not changed again by then.
       - **A membership change that cannot be applied FAILS the Apply.**
         `refresh_nebula` still never raises (mesh wiring must not fail an
         instance boot), but a `failed` is no longer a log line under a green

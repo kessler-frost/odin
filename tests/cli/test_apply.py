@@ -10,14 +10,20 @@ from odin.cli.app import app
 from tests.cli.conftest import BASE
 
 GRAPH = {"nodes": [{"id": "uploads", "type": "s3"}], "edges": []}
+# Every body here carries `not_covered` because the SERVER does (v0.7.4,
+# `server.not_covered`): the CLI no longer computes it, it passes the field
+# through, so a mocked body that omitted it would be mocking a server that
+# doesn't exist. The API-level proof that the union is right lives in
+# tests/api/test_apply_full.py.
 APPLIED = {
     "status": "applied", "rev": "abc123", "env": "default",
-    "skipped": [], "refined": True, "unsupported": [],
+    "skipped": [], "refined": True, "unsupported": [], "not_covered": [],
     "tf": {"status": "ok", "exit_code": 0},
 }
 TF_FAILED = {
     "status": "applied_tf_failed", "rev": None, "env": "default",
     "skipped": ["note"], "refined": False, "unsupported": ["ecs"],
+    "not_covered": ["note", "ecs"],
     "tf": {"status": "failed", "exit_code": 1, "tail": ["Error: BucketAlreadyExists", "apply failed"]},
     "note": "desired state not committed; fix and re-apply",
 }
@@ -25,7 +31,7 @@ TF_FAILED = {
 # was at 0 of 3 tasks the whole time. Exit 0 here was the bug.
 SERVICES_UNHEALTHY = {
     "status": "applied_services_unhealthy", "rev": "abc123", "env": "default",
-    "skipped": [], "refined": False, "unsupported": [],
+    "skipped": [], "refined": False, "unsupported": [], "not_covered": [],
     "tf": {"status": "ok", "exit_code": 0},
     "unhealthy": [{
         "node": "web", "running": 0, "desired": 3,
@@ -68,7 +74,7 @@ def test_apply_json_mode_prints_full_body(runner):
     respx.post(f"{BASE}/apply-full").mock(return_value=httpx.Response(200, json=APPLIED))
     result = runner.invoke(app, ["apply", "-o", "json"])
     assert result.exit_code == 0
-    assert json.loads(result.stdout) == {**APPLIED, "not_covered": []}
+    assert json.loads(result.stdout) == APPLIED
 
 
 @respx.mock
@@ -90,7 +96,7 @@ def test_apply_tf_failed_json_mode_still_exits_nonzero(runner):
     respx.post(f"{BASE}/apply-full").mock(return_value=httpx.Response(200, json=TF_FAILED))
     result = runner.invoke(app, ["apply", "-o", "json"])
     assert result.exit_code == 1
-    assert json.loads(result.stdout) == {**TF_FAILED, "not_covered": ["note", "ecs"]}
+    assert json.loads(result.stdout) == TF_FAILED
 
 
 @respx.mock
@@ -114,16 +120,22 @@ def test_apply_unhealthy_json_mode_still_exits_nonzero(runner):
     respx.post(f"{BASE}/apply-full").mock(return_value=httpx.Response(200, json=SERVICES_UNHEALTHY))
     result = runner.invoke(app, ["apply", "-o", "json"])
     assert result.exit_code == 1
-    assert json.loads(result.stdout) == {**SERVICES_UNHEALTHY, "not_covered": []}
+    assert json.loads(result.stdout) == SERVICES_UNHEALTHY
 
 
 @respx.mock
-def test_the_documented_ci_gate_catches_a_skipped_node(runner):
+def test_the_documented_ci_gate_reads_the_servers_own_field(runner):
     """MISLEAD-1: the README told CI to gate on `.unsupported`, but a node
     whose KIND odin doesn't model lands in `.skipped` -- so
     `jq -e '.unsupported | length == 0'` was TRUE, exit 0, while two drawn
-    nodes were silently dropped. One field now carries both."""
-    dropped = {**APPLIED, "skipped": ["kinesis", "notarealservice"]}
+    nodes were silently dropped. One field now carries both, and v0.7.4 moved
+    it into the API response: this command PASSES IT THROUGH rather than
+    re-deriving it, so `curl /apply-full` and `odin apply -o json` cannot
+    disagree about what a pipeline is gating on."""
+    dropped = {
+        **APPLIED, "skipped": ["kinesis", "notarealservice"],
+        "not_covered": ["kinesis", "notarealservice"],
+    }
     respx.get(f"{BASE}/canvas").mock(return_value=httpx.Response(200, json=GRAPH))
     respx.post(f"{BASE}/apply-full").mock(return_value=httpx.Response(200, json=dropped))
     body = json.loads(runner.invoke(app, ["apply", "-o", "json"]).stdout)
@@ -133,14 +145,22 @@ def test_the_documented_ci_gate_catches_a_skipped_node(runner):
 
 
 @respx.mock
-def test_not_covered_unions_both_arrays_without_replacing_either(runner):
-    both = {**APPLIED, "skipped": ["kinesis"], "unsupported": ["db1 (rds): mysql not supported"]}
+def test_the_cli_never_invents_a_not_covered_of_its_own(runner):
+    """The regression that would re-open the `curl` hole: if this command
+    recomputed the union, a server that got it wrong (or an older one that
+    published nothing) would be silently papered over here and the API's own
+    consumers would still be trapped. Whatever the server said is what a gate
+    sees -- even when it disagrees with the two arrays beside it."""
+    contradictory = {
+        **APPLIED, "skipped": ["kinesis"], "unsupported": ["db1 (rds): mysql not supported"],
+        "not_covered": ["only what the server said"],
+    }
     respx.get(f"{BASE}/canvas").mock(return_value=httpx.Response(200, json=GRAPH))
-    respx.post(f"{BASE}/apply-full").mock(return_value=httpx.Response(200, json=both))
+    respx.post(f"{BASE}/apply-full").mock(return_value=httpx.Response(200, json=contradictory))
     body = json.loads(runner.invoke(app, ["apply", "-o", "json"]).stdout)
     assert body["skipped"] == ["kinesis"]
     assert body["unsupported"] == ["db1 (rds): mysql not supported"]
-    assert body["not_covered"] == ["kinesis", "db1 (rds): mysql not supported"]
+    assert body["not_covered"] == ["only what the server said"]
 
 
 @respx.mock

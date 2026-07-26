@@ -118,6 +118,10 @@ _DEFAULT_COMPATIBILITIES = ["EC2"]
 # delete), which never goes through the lazy sweep at all (this module
 # already knows the outcome the moment it issues the stop).
 _ESSENTIAL_CONTAINER_EXITED = "Essential container in task exited"
+# A container that no longer exists at all -- removed out of band rather than
+# exited on its own. Worth its own reason: "exited" invites a hunt for a crash
+# that never happened.
+_CONTAINER_GONE = "Task container removed outside odin"
 
 # How many trailing lines of a task container's output ONE sweep reads
 # (`docker logs --tail N`) -- see `_ship_task_logs`: bounded so a chatty
@@ -627,13 +631,24 @@ def sweep_tasks(stores: SynthStores, env: str, runtime: TaskRuntime) -> None:
         if task["last_status"] != "RUNNING":
             continue
         status = runtime.status(env, task["task_id"], task["container_name"])
-        if status not in ("exited", "dead", "removing"):
+        if status not in ("exited", "dead", "removing", "absent"):
             continue
-        exit_code = runtime.exit_code(env, task["task_id"], task["container_name"])
+        # `absent` = the container is GONE, not merely stopped. Reaching it
+        # here is unambiguous because this loop only inspects tasks the store
+        # still calls RUNNING, so "believed running, container missing" can
+        # only mean it was removed out of band. Without this the count stayed
+        # stale for the WHOLE of an in-flight apply: field test 4 removed one
+        # of three serving containers 20s into a 63s apply and `/world` kept
+        # reporting 3 for 57s, because the drift sweep -- the only other thing
+        # that notices a vanished container -- reads a cache while an apply
+        # holds the env, and then runs only every 10 ticks. A gone container
+        # never reported an exit code, so don't invent one.
+        gone = status == "absent"
+        exit_code = None if gone else runtime.exit_code(env, task["task_id"], task["container_name"])
         _update_task(
             stores, env, task["cluster_name"], task["task_id"],
             last_status="STOPPED", stopped_at=time.time(), exit_code=exit_code,
-            stopped_reason=_ESSENTIAL_CONTAINER_EXITED,
+            stopped_reason=_CONTAINER_GONE if gone else _ESSENTIAL_CONTAINER_EXITED,
         )
         # W2.5: a task that died on its own must leave its load balancer's
         # upstream list too, or the proxy keeps a dead server in rotation. Runs

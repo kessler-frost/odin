@@ -254,10 +254,28 @@ def test_a_failed_image_update_never_stops_serving_and_never_reads_healthy(tmp_p
         # frozen. Anchored to the apply's own duration rather than a wall-clock
         # constant: what regressed before was that NOTHING was reported until
         # the hold released, so the gap is the claim.
+        #
+        # The margin SCALES (v0.7.4). `bad_elapsed - 20` encoded an assumption
+        # about how long an apply takes: the moment applies got faster than
+        # ~25s the bound went negative and the test became unsatisfiable -- a
+        # trap for whoever made odin quicker, which is the wrong person to
+        # punish. "Reported inside the first two thirds" is the same claim
+        # without the assumption, and it is no weaker at the duration actually
+        # measured (a third of field test 3's 62.4s apply is 20.8s, against the
+        # old flat 20s). The floor keeps it meaningful for a short apply: the
+        # sampler cannot resolve a margin finer than its own two rounds.
+        #
+        # And the whole bound is floored at one sampling round, so it can never
+        # become unsatisfiable no matter how fast applies get: an apply shorter
+        # than the sampler's own resolution has no observable "during" left,
+        # and the only claim still measurable there -- that the very first
+        # sampling round already reported the failure -- is the one asserted.
+        margin = max(2 * SAMPLE_INTERVAL, bad_elapsed / 3)
+        bound = max(bad_elapsed - margin, SAMPLE_INTERVAL)
         first_bad = next(s for s in sampler.samples if s.phase != "healthy")
-        assert first_bad.at < bad_elapsed - 20, (
+        assert first_bad.at < bound, (
             f"/world froze for the apply again: first non-healthy sample at {first_bad.at:.1f}s "
-            f"of a {bad_elapsed:.1f}s apply"
+            f"of a {bad_elapsed:.1f}s apply (needed it before {bound:.1f}s)"
         )
         # ...and observing throughout is not the same as chattering throughout:
         # ~30 extra ticks of projection must not become ~30 events. v0.7.1

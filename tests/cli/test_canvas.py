@@ -91,6 +91,37 @@ def test_canvas_set_rejects_malformed_json(runner, tmp_path):
 
 
 @respx.mock
+def test_canvas_set_refuses_a_structurally_broken_canvas_without_posting_it(runner, tmp_path):
+    """Field test 4, P4-5: valid JSON that can never be applied was stored
+    anyway, and only blew up on the next translate/apply. Refused here, by name
+    and field, before the server is even asked."""
+    route = respx.post(f"{BASE}/canvas").mock(return_value=httpx.Response(200, json={"status": "saved"}))
+    bad = tmp_path / "c-malformed.json"
+    bad.write_text(json.dumps({
+        "nodes": [{"id": "s3", "type": "s3", "data": {"label": ["s3", "p2-assets"]}}],
+        "edges": [{"source": "s3", "target": "s3", "data": {"edgeType": "iam"}}],
+    }))
+    result = runner.invoke(app, ["canvas", "set", str(bad)])
+    assert result.exit_code == 1
+    assert "is not a usable canvas" in result.stderr
+    assert "node[0]" in result.stderr and "data.label" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not route.called  # nothing was stored
+
+
+@respx.mock
+def test_canvas_set_still_accepts_a_kind_odin_cannot_build(runner):
+    """The boundary that must not move: an unsupported KIND is well-formed --
+    it saves, applies, and is reported as skipped."""
+    route = respx.post(f"{BASE}/canvas").mock(return_value=httpx.Response(200, json={"status": "saved"}))
+    graph = {"nodes": [{"id": "k1", "type": "kinesis", "position": {"x": 0, "y": 0},
+                        "data": {"label": "stream"}}], "edges": []}
+    result = runner.invoke(app, ["canvas", "set", "-"], input=json.dumps(graph))
+    assert result.exit_code == 0
+    assert json.loads(route.calls.last.request.content) == graph
+
+
+@respx.mock
 def test_canvas_set_places_a_node_with_no_position(runner):
     """BLOCK-3: the README's own example node has no `position`; the CLI took
     it, translate and apply both succeeded, and the canvas rendered as a solid

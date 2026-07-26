@@ -1,0 +1,37 @@
+Odin
+Copyright the Odin authors.
+
+This product is licensed under the Apache License 2.0 (see LICENSE).
+
+Odin accepts permissive licenses only (Apache-2.0 / MIT / BSD / MPL / OFL).
+Everything else odin uses is a separate process or container it talks to at
+run time, and is not redistributed here. The list below covers what odin
+copies into its own build output and therefore redistributes.
+
+
+Bundled fonts
+-------------
+
+The web UI (`ui/`) bundles two typefaces so the canvas loads with no external
+request — no CDN, no Google Fonts, nothing that leaks that you opened it. The
+`.woff2` files are emitted into `ui/dist/assets/` by the build and ship inside
+the released package.
+
+Inter
+  Copyright 2016 The Inter Project Authors
+  https://github.com/rsms/inter
+  SIL Open Font License, Version 1.1
+  Full text: ui/node_modules/@fontsource-variable/inter/LICENSE
+             https://openfontlicense.org
+
+JetBrains Mono
+  Copyright 2020 The JetBrains Mono Project Authors
+  https://github.com/JetBrains/JetBrainsMono
+  SIL Open Font License, Version 1.1
+  Full text: ui/node_modules/@fontsource-variable/jetbrains-mono/LICENSE
+             https://openfontlicense.org
+
+Both arrive via the `@fontsource-variable/*` npm packages (MIT-licensed
+packaging around the upstream OFL fonts). JetBrains Mono was Apache-2.0
+through v1.x and relicensed to OFL-1.1 at v2.0; the version bundled here
+carries the OFL-1.1 text quoted above.

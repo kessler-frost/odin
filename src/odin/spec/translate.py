@@ -81,6 +81,104 @@ def parse_ref(var: str, value: str) -> Ref | None:
     return Ref(var=var, target_id=match.group(1), target_attr=match.group(2)) if match else None
 
 
+# --- the structural contract `canvas_to_stack` needs before it can build a
+# Stack at all (field test 4, P4-5) ---
+#
+# WHERE THE LINE IS, because getting it wrong would break something that
+# already works. Odin deliberately ACCEPTS nodes it cannot build: an unknown
+# `type` is a supported situation, not an error -- it is reported by
+# `skipped_node_types` and the translator's `not_covered`, which is how a
+# canvas stays honest about the AWS surface odin hasn't covered yet. So the
+# checks below never look at WHICH type a node has. They only ask whether the
+# handful of fields the translator READS are the type it reads them AS:
+#   * `id` / `data.label` -- the resource's name. `ResourceDesired.id` and
+#     `Edge.src`/`dst` are `str`, and `id` is additionally a dict key in
+#     `canvas_to_stack`'s label map. A list-valued `data.label` is precisely
+#     what made a malformed canvas 500: it flowed into `Edge(dst=[...])` and
+#     surfaced as an unhandled pydantic error two layers below the request.
+#   * `type` -- a dict lookup key in `_KIND` (and what `skipped_node_types`
+#     reports); unhashable means no lookup at all.
+#   * `data` / `data.env` -- iterated as mappings.
+#   * an edge's `source`/`target`/`data`/`data.edgeType`/`data.permissions`.
+# Everything else stays permissive on purpose: any other `data.*` key may hold
+# any JSON value (it becomes a `FieldValue`, whose `value` is `Any`), and a
+# missing `position` is a thing `odin canvas set` REPAIRS, never a rejection.
+_A = {str: "a string", dict: "an object", list: "a list", bool: "a boolean",
+      int: "a number", float: "a number", type(None): "null"}
+
+_NODE_SHAPE = {"id": str, "type": str, "data": dict}
+_NODE_DATA_SHAPE = {"label": str, "env": dict}
+_EDGE_SHAPE = {"source": str, "target": str, "data": dict}
+_EDGE_DATA_SHAPE = {"edgeType": str, "permissions": list}
+
+
+def _got(value: object) -> str:
+    return _A.get(type(value), type(value).__name__)
+
+
+def _mistyped(where: str, holder: dict, shape: dict[str, type]) -> list[str]:
+    """One line per present-but-wrong-typed field. Absent and null are both
+    fine here -- `canvas_to_stack` treats them as "not given"."""
+    return [
+        f"{where}{key} must be {_A[expected]}, not {_got(holder[key])}"
+        for key, expected in shape.items()
+        if holder.get(key) is not None and not isinstance(holder[key], expected)
+    ]
+
+
+def _node_problems(index: int, node: object) -> list[str]:
+    if not isinstance(node, dict):
+        return [f"node[{index}] must be an object, not {_got(node)}"]
+    ident = node.get("id") if isinstance(node.get("id"), str) else None
+    where = f"node[{index}]" + (f" ({ident!r})" if ident else "") + ": "
+    data = node.get("data")
+    problems = _mistyped(where, node, _NODE_SHAPE)
+    problems += _mistyped(f"{where}data.", data, _NODE_DATA_SHAPE) if isinstance(data, dict) else []
+    if problems:  # `_node_id` below can only be trusted once the shape holds
+        return problems
+    return [
+        f"{where}{why}" for ok, why in (
+            (_node_id(node), 'no "id" and no "data.label" — a node needs one of them as its name'),
+            (node.get("type"), 'no "type" — every node needs a kind (an UNKNOWN kind is fine, and is '
+                               "reported as skipped; a missing one is nothing at all)"),
+        ) if not ok
+    ]
+
+
+def _edge_problems(index: int, edge: object) -> list[str]:
+    if not isinstance(edge, dict):
+        return [f"edge[{index}] must be an object, not {_got(edge)}"]
+    where = f"edge[{index}]: "
+    data = edge.get("data")
+    return (
+        _mistyped(where, edge, _EDGE_SHAPE)
+        + (_mistyped(f"{where}data.", data, _EDGE_DATA_SHAPE) if isinstance(data, dict) else [])
+    )
+
+
+def canvas_problems(canvas: object) -> list[str]:
+    """Every structural reason this canvas cannot be translated, in the order
+    a reader would fix them; empty means `canvas_to_stack` can consume it.
+
+    Structural is the operative word -- see the note above `_NODE_SHAPE` for
+    exactly where the line sits and why an unsupported node KIND is on the
+    accepted side of it."""
+    if not isinstance(canvas, dict):
+        return [f'a canvas must be an object with "nodes" and "edges", not {_got(canvas)}']
+    problems = [
+        f"{key} must be a list, not {_got(canvas[key])}"
+        for key in ("nodes", "edges")
+        if canvas.get(key) is not None and not isinstance(canvas[key], list)
+    ]
+    if problems:
+        return problems
+    for index, node in enumerate(canvas.get("nodes") or []):
+        problems += _node_problems(index, node)
+    for index, edge in enumerate(canvas.get("edges") or []):
+        problems += _edge_problems(index, edge)
+    return problems
+
+
 def _node_id(node: dict) -> str:
     data = node.get("data") or {}
     return data.get("label") or node.get("id") or ""

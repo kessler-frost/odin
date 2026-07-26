@@ -114,15 +114,44 @@ connections are refused before Apply even returns** (measured at 0.11s).
 A membership change odin cannot apply fails the Apply rather than reporting
 success.
 
-It does **not** kill a connection that is already open through the path you
-just revoked. Nebula's firewall keeps a conntrack entry per flow and
-re-validates it only when its own ruleset version changes — not when a
-peer's certificate does — so a long-lived flow that keeps sending can
-outlive the revoke, up to nebula's `firewall.conntrack` timeouts. Editing
-the admitting group's *rules*, or restarting the admitting member, closes it
-immediately. Real AWS security groups behave the same way for established
-flows, so this is a shared property rather than a substitution gap — but if
-you are revoking access in anger, terminate the existing connection too.
+It also kills a connection that was **already open** through the path you
+just revoked. That took a second mechanism, because nebula's firewall keeps a
+conntrack entry per flow and re-validates it only when its own ruleset version
+changes — never when a peer's certificate does. So odin also advances the
+*admitting* member's ruleset version whenever anyone's group membership moves
+in that environment: a reload whose rules are byte-for-byte identical, which
+makes nebula re-check every flow it is already holding against the peer's
+current certificate. It is a reload, not a restart — no other tunnel is
+dropped.
+
+Measured end to end, with a real VM holding a real TCP session to a real
+Postgres across the revoke and then pushing a genuine startup packet down it:
+the session **timed out** (dropped), while a still-permitted port on the *same
+database over the same tunnel* answered `connection refused` at the same
+instant — so the silence is a firewall decision, not a dead overlay. Before
+this, that same session was answered
+(`R\x00\x00\x00\x17\x00\x00\x00\nSCRAM-SHA-256`).
+
+What that does **not** mean:
+
+- **It is not instant.** The flow dies when the Apply carrying the revoke
+  finishes its mesh passes — 12.8s in the measurement above, and longer on a
+  busy machine or a large environment. Until then the open session keeps
+  working.
+- **It depends on an ordering odin controls but cannot prove.** The admitting
+  member re-checks the flow against the certificate it currently holds for the
+  peer, so the peer must already have re-handshaked under its new one. odin
+  enforces that (every re-certified member is restarted and pokes each peer
+  before any admitting member is reloaded, all synchronously). If that poke
+  fails, the admitting member can re-validate against the old certificate,
+  stamp the flow as current, and that one flow survives — until it closes on
+  its own or nebula's `firewall.conntrack` timeouts expire it. A later Apply
+  will not revisit it, because nothing about the membership has changed by
+  then; another membership change, or restarting the admitting member, will.
+- **It covers members odin gates.** The admitting member can be an EC2 VM or a
+  database (a backing container with a mesh sidecar); both are handled. The
+  published host port is still not gated at all — see above.
+
 ROADMAP's security-group section documents the mechanism in full.
 
 ## Secrets
@@ -138,14 +167,17 @@ A field like an RDS `password` is stored, and used, in cleartext:
   sent is in the generated `.odin/<env>/tf/main.tf` and comes back in
   `.odin/<env>/tf/terraform.tfstate` (plus `terraform.tfstate.backup`).
 - **Every file odin creates that can carry a secret or a credential is
-  `0600`** (owner read/write only), and the directories holding them are
-  `0700` — the only real protection is that another local account on the same
-  machine can't read them. Anyone with your user account, or root, can. The
-  exhaustive list, because a mode you can't verify is worth nothing:
-  `canvas.json`, `<env>/stacks/*.json`, `<env>/HEAD`, `<env>/world.json`,
-  `<env>/events.jsonl`, `<env>/keys.json`, `<env>/gateway/*.json`,
-  `<env>/tf/*` (including tofu's own `terraform.tfstate` and its `.backup`),
-  `<env>/nebula/*`, and an `odin export` archive.
+  `0600`** (owner read/write only), and **every directory odin creates** to
+  hold one is `0700`: `.odin/` itself, each `.odin/<env>/`, and the
+  `gateway/`, `stacks/`, `tf/` and `nebula/` (plus `nebula/hosts/`)
+  directories inside an env — the only real protection is that another local
+  account on the same machine can't read them. Anyone with your user account,
+  or root, can. The exhaustive file list, because a mode you can't verify is
+  worth nothing: `canvas.json`, `<env>/stacks/*.json`, `<env>/HEAD`,
+  `<env>/world.json`, `<env>/events.jsonl`, `<env>/keys.json`,
+  `<env>/gateway/*.json`, the files in `<env>/tf/` (including tofu's own
+  `terraform.tfstate` and its `.backup`), `<env>/nebula/*`, and an
+  `odin export` archive.
   - Two of those are not odin's files to write: tofu creates and rewrites
     `terraform.tfstate`/`.backup` itself, at `0644` under the default umask.
     Odin pre-creates both `0600` before every `tofu` invocation, which sticks
@@ -167,6 +199,18 @@ A field like an RDS `password` is stored, and used, in cleartext:
     helper, and that helper tightens a directory it finds group- or
     world-accessible, so an existing store is healed rather than left as the
     first writer set it.
+  - One directory under `.odin/` is **not** `0700`, and deliberately so:
+    `<env>/tf/.terraform/`, which is tofu's, not odin's. `tofu init` creates
+    it (`0755` under the default umask) and re-creates it on every run; it
+    holds provider plugins and their metadata — hundreds of files, no canvas
+    value ever among them — so `_lock_down` in `simulate/workspace.py` skips
+    that subtree instead of re-chmod'ing plugins on every apply. The three
+    workspace files that DO carry secrets (`main.tf`, `terraform.tfstate`,
+    `terraform.tfstate.backup`) sit beside it, not inside it, and are `0600`.
+    Concretely: `find .odin -type d ! -perm 700` prints `<env>/tf/.terraform`
+    and its subdirectories, and nothing else — the only other thing that can
+    appear there is a directory a pre-v0.7.3 odin left `0755` and nothing has
+    written to since, which the helper above tightens on the next write.
 - `.odin/` is gitignored, so a normal `git add`/`commit` won't leak it into
   a repo — but nothing stops you from committing it deliberately, so don't.
 - Fields that look like a secret (`password`, `secret`, `token`, `key` in

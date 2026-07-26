@@ -22,7 +22,7 @@ import pytest
 from botocore.parsers import create_parser
 from starlette.responses import Response
 
-from odin.compute.functions import InvokeResult
+from odin.compute.functions import READY_TIMEOUT, InvokeResult
 from odin.gateway.classify import classify
 from odin.gateway.keys import KeyStore, workload_env
 from odin.gateway.models import lambdactl, logsctl
@@ -815,3 +815,84 @@ def test_converge_functions_skips_a_function_mid_deploy(sink, lambda_, stores):
     _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
     _settle()
     assert len(substrate.ensured) == 2, "the redeploy already in flight is the only ensure"
+
+
+# --- the post-apply verification (`ecsctl.wait_for_steady_services`' twin) ---
+
+
+def test_wait_for_active_functions_reports_a_function_whose_redeploy_failed(sink, lambda_, stores):
+    """THE hole this closes: `converge_functions` starts a redeploy and
+    returns, so /apply-full scored `applied` the instant it was spawned even
+    when the container never came back. The wait JOINS that thread and reports
+    what really happened -- naming the function and the REAL reason."""
+    substrate = FakeFunctionRuntime()
+    _create(stores, sink, lambda_, substrate)
+    _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
+    lambdactl.mark_function_failed(stores, ENV, "fn1", "container removed outside odin")
+    substrate.fail_ensure = True  # the redeploy will fail the same way it failed before
+
+    deploying = lambdactl.converge_functions(stores, ENV, substrate)
+    faults = lambdactl.wait_for_active_functions(stores, ENV, deploying)
+
+    assert faults == [lambdactl.FunctionFault(
+        node="fn1", state="Failed", reason="RIE never became ready",
+    )], faults
+
+
+def test_wait_for_active_functions_is_one_store_read_when_everything_is_active(sink, lambda_, stores):
+    """The happy path may not slow down: nothing is deploying, so the wait
+    returns on its first pass without sleeping or polling once."""
+    substrate = FakeFunctionRuntime()
+    _create(stores, sink, lambda_, substrate)
+    _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
+
+    started = time.monotonic()
+    faults = lambdactl.wait_for_active_functions(stores, ENV, [])
+    elapsed = time.monotonic() - started
+
+    assert faults == []
+    assert elapsed < 0.1, f"a healthy env cost {elapsed:.3f}s -- it must cost one store read"
+
+
+def test_wait_for_active_functions_waits_for_a_function_that_is_still_deploying(sink, lambda_, stores):
+    """The trap the ECS version avoids, for lambda: a function that is merely
+    STILL STARTING must never fail an apply. The wait blocks on the in-flight
+    deploy (`Pending`) rather than judging it at that instant."""
+    block = threading.Event()
+    substrate = FakeFunctionRuntime(block=block)
+    _create(stores, sink, lambda_, substrate)
+    pending = _parse("GetFunctionConfiguration", _answer(
+        stores, sink.call(lambda: lambda_.get_function_configuration(FunctionName="fn1")), substrate,
+    ))
+    assert pending["State"] == "Pending", "the create is genuinely still in flight"
+
+    threading.Timer(0.2, block.set).start()
+    faults = lambdactl.wait_for_active_functions(stores, ENV, [], timeout=5.0)
+
+    assert faults == [], "a function that was still coming up must not fail the apply"
+
+
+def test_wait_for_active_functions_gives_up_at_its_budget(sink, lambda_, stores):
+    """Bound 3: a deploy that never finishes is a bounded apply, not a hang.
+    Reported as the transitional state it is really stuck in, never invented."""
+    substrate = FakeFunctionRuntime(block=threading.Event())  # never released
+    _create(stores, sink, lambda_, substrate)
+
+    started = time.monotonic()
+    faults = lambdactl.wait_for_active_functions(stores, ENV, [], timeout=0.6)
+    elapsed = time.monotonic() - started
+
+    assert 0.5 < elapsed < 3.0, elapsed
+    assert faults == [], "a function still mid-deploy at the budget is not (yet) a failure"
+    substrate.block.set()
+
+
+def test_active_timeout_defaults_to_outlasting_the_deploy_it_verifies(monkeypatch):
+    """The budget must be LONGER than `FunctionRuntime.ensure`'s own wait, or
+    the verification would hard-stop while the thread it is verifying is still
+    working and report a transitional state instead of the real reason."""
+    monkeypatch.delenv("ODIN_LAMBDA_ACTIVE_TIMEOUT", raising=False)
+    assert lambdactl.active_timeout() > READY_TIMEOUT
+
+    monkeypatch.setenv("ODIN_LAMBDA_ACTIVE_TIMEOUT", "7")
+    assert lambdactl.active_timeout() == 7.0

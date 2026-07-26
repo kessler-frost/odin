@@ -13,8 +13,14 @@ when a workspace exists, honors the same 409/tofu-unavailable semantics
 """
 from __future__ import annotations
 
+import json
+
+import httpx
+import pytest
+import typer
 from fastapi.testclient import TestClient
 
+from odin.cli import http
 from odin.gateway.keys import OPERATOR_NODE_ID
 from odin.server import create_app
 from odin.simulate.runner import SimulateBusy, TfResult, TofuNotInstalled
@@ -87,11 +93,156 @@ def test_destroy_reports_tofu_failure_but_still_prunes_the_reconciler_half(tmp_p
     with TestClient(app) as client:
         client.post("/apply", json=CANVAS)
         resp = client.post("/destroy")
-    assert resp.status_code == 200
+    assert resp.status_code == 500
     body = resp.json()
     assert body["tf"] == {"status": "failed", "exit_code": 1, "tail": ["boom"]}
     world = client.get("/world").json()
     assert world["resources"] == []  # the reconciler half still pruned
+
+
+# --- field test 4 (HIGH): a destroy that did not destroy may not say it did --
+
+
+class _SurvivingRuntime(FakeRuntime):
+    """A machine that still has containers after the failed destroy -- two for
+    this env and one for a DIFFERENT env, so the residue report is proven to be
+    env-scoped rather than a blanket listing."""
+
+    def container_names(self):
+        return ["odin-rds-default-db", "odin-aws-s3-default", "odin-rds-other-db"]
+
+
+def _surviving_app(tmp_path):
+    return create_app(runtime=_SurvivingRuntime(), store=SpecStore(tmp_path), rds=FakeRds(), backings=False)
+
+
+def _write_state(tmp_path, env: str = "default") -> None:
+    """tofu's own state, as it really looks after a destroy that gave up
+    partway: resources it still owns and a retry would have to delete."""
+    _make_workspace(tmp_path, env)
+    (tmp_path / env / "tf" / "terraform.tfstate").write_text(json.dumps({
+        "version": 4,
+        "resources": [
+            {"mode": "managed", "type": "aws_db_instance", "name": "app_db", "instances": [{}]},
+            {"mode": "managed", "type": "aws_s3_bucket", "name": "uploads", "instances": [{}]},
+            {"mode": "data", "type": "aws_caller_identity", "name": "current", "instances": [{}]},
+        ],
+    }))
+
+
+def _failing_destroy(exit_code: int, tail: tuple[str, ...]):
+    async def _destroy(*args, **kwargs):
+        return TfResult(ok=False, exit_code=exit_code, tail=tail)
+
+    return _destroy
+
+
+def test_a_timed_out_destroy_is_not_reported_as_destroyed(tmp_path):
+    """THE bug: `body["status"]` was set to "destroyed" at the top of the route
+    and never revised, so a destroy killed at its 300s deadline (exit -9)
+    answered `status: destroyed` with `tf: failed` nested inside it, and
+    `odin destroy` exited 0 while everything was still standing."""
+    app = _surviving_app(tmp_path)
+    _write_state(tmp_path)
+    app.state.tf_runner.destroy = _failing_destroy(-9, ("tofu destroy timed out after 300s -- process killed",))
+    with TestClient(app) as client:
+        client.post("/apply", json=CANVAS)
+        resp = client.post("/destroy")
+
+    assert resp.status_code == 500, resp.text
+    body = resp.json()
+    assert body["status"] == "destroy_timed_out", body
+    # A signal is a distinct outcome from tofu erroring: nothing was diagnosed.
+    assert "whole-call deadline" in body["error"]
+    assert "ODIN_TOFU_DESTROY_TIMEOUT" in body["error"]
+
+
+def test_a_failed_destroy_names_what_is_still_standing(tmp_path):
+    """"destroy failed" with no inventory is nearly as unhelpful as the false
+    success: the report names tofu's surviving state AND the real containers,
+    which is exactly what the field test had to go find by hand."""
+    app = _surviving_app(tmp_path)
+    _write_state(tmp_path)
+    app.state.tf_runner.destroy = _failing_destroy(1, ("Error: deleting RDS DB Instance",))
+    with TestClient(app) as client:
+        client.post("/apply", json=CANVAS)
+        resp = client.post("/destroy")
+
+    assert resp.status_code == 500, resp.text
+    body = resp.json()
+    assert body["status"] == "destroy_failed", body
+    # Managed resources only -- a `data` block is not something a retry deletes.
+    assert body["still_standing"]["tf_state"] == ["aws_db_instance.app_db", "aws_s3_bucket.uploads"]
+    assert body["still_standing"]["containers"] == ["odin-aws-s3-default", "odin-rds-default-db"]
+    assert "aws_db_instance.app_db" in body["error"]
+    assert "odin-rds-default-db" in body["error"]
+    assert "odin-rds-other-db" not in body["error"], "another env's container is not this env's residue"
+
+
+def test_a_failed_destroy_exits_nonzero_in_the_cli(tmp_path):
+    """The whole point of the status: `cli/http.body_or_fail` keys on a truthy
+    `error`, so `odin destroy` can no longer exit 0 on a destroy that left the
+    env standing -- the same convention `odin apply` follows."""
+    app = _surviving_app(tmp_path)
+    _write_state(tmp_path)
+    app.state.tf_runner.destroy = _failing_destroy(1, ("boom",))
+    with TestClient(app) as client:
+        client.post("/apply", json=CANVAS)
+        body = client.post("/destroy").json()
+    with pytest.raises(typer.Exit):
+        http.body_or_fail(httpx.Response(500, json=body))
+
+
+def test_a_destroy_that_really_destroyed_still_reports_destroyed(tmp_path):
+    """The guardrail: this must not start failing honest teardowns. A clean
+    tofu destroy is still a 200 with no `error` and no residue report -- and
+    costs no state read or container listing at all."""
+    app = _surviving_app(tmp_path)
+    _write_state(tmp_path)
+
+    async def _destroy(*args, **kwargs):
+        return TfResult(ok=True, exit_code=0)
+
+    app.state.tf_runner.destroy = _destroy
+    with TestClient(app) as client:
+        client.post("/apply", json=CANVAS)
+        resp = client.post("/destroy")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "destroyed", body
+    assert "error" not in body
+    assert "still_standing" not in body
+
+
+def test_a_destroy_with_no_workspace_is_still_a_clean_destroyed(tmp_path):
+    """Nothing was ever applied through tofu, so there is nothing for tofu to
+    fail at -- the optimistic status is correct here and stays."""
+    app = _surviving_app(tmp_path)
+    with TestClient(app) as client:
+        client.post("/apply", json=CANVAS)
+        resp = client.post("/destroy")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "destroyed"
+
+
+def test_tofu_not_installed_is_not_a_failed_destroy(tmp_path):
+    """`unavailable` is not a destroy that ran and lost: the reconciler half
+    genuinely ran and this route's own contract (the test above) is that it
+    proceeds. Reporting it as `destroy_failed` would make an env with no tofu
+    installed permanently un-destroyable from the CLI."""
+    app = _surviving_app(tmp_path)
+    _write_state(tmp_path)
+
+    async def _destroy(*args, **kwargs):
+        raise TofuNotInstalled()
+
+    app.state.tf_runner.destroy = _destroy
+    with TestClient(app) as client:
+        client.post("/apply", json=CANVAS)
+        resp = client.post("/destroy")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "destroyed"
 
 
 def test_destroy_tofu_unavailable_proceeds_with_reconciler_half_only(tmp_path):

@@ -66,6 +66,7 @@ from odin.fabric.nebula import (
     DEFAULT_FIREWALL,
     LighthouseManager,
     NebulaManager,
+    firewall_only_change,
     peer_overlay_ips,
     rehandshake_script,
 )
@@ -211,6 +212,7 @@ class MeshSidecar:
     def ensure(
         self, target: str, member: str, *,
         groups: tuple[str, ...] = (), firewall: FirewallRules | None = None,
+        revision: str = "",
     ) -> str | None:
         """Put `target` (a running backing container) on the mesh as `member`,
         gated by `firewall` (the drawn SG's compiled rules; `None` means
@@ -219,11 +221,13 @@ class MeshSidecar:
 
         Idempotent by config AND by namespace: an already-running sidecar
         whose config file is byte-identical AND which is in the CURRENT
-        target's network namespace is left alone; a CHANGED firewall (the
-        canvas edited the SG) replaces it, since nebula reads its firewall
-        only at start, and so does a REPLACED target (see `attached_to` --
-        the field-test HIGH-2 bug: without that half, a killed-and-recreated
-        database was never re-joined by any number of Applies).
+        target's network namespace is left alone. A change to the FIREWALL
+        block alone (the canvas edited the SG, or `revision` moved) is
+        adopted in place by `_reload` -- nebula reloads its firewall on
+        SIGHUP, so no tunnel is dropped. Anything else, and a REPLACED target
+        (see `attached_to` -- the field-test HIGH-2 bug: without that half, a
+        killed-and-recreated database was never re-joined by any number of
+        Applies), still replaces the daemon.
 
         ...and so does a changed `groups` (field test 3 HIGH-1): a member's
         MEMBERSHIP lives in its certificate, so it is not visible in the
@@ -236,17 +240,29 @@ class MeshSidecar:
         names a backing as the SOURCE of another group's rule. This is what
         makes that possible rather than a second silent limit.)
 
+        `revision` (field test 4) is the env's security-group MEMBERSHIP
+        digest. It is rendered inside the `firewall` block, where nebula
+        ignores it but a CHANGE to it makes a reload count -- which is what
+        drops flows this backing had ALREADY admitted from a member that has
+        since lost the group (`fabric/nebula.py::FIREWALL_REVISION_KEY`). A
+        database is the common admitting member, so this is the case that
+        matters most. `""` renders nothing at all, keeping every config
+        written before this existed byte-identical.
+
         Never raises -- like `InstanceVm._activate_nebula`, mesh wiring must
         not fail an otherwise-healthy backing (the host path still works)."""
         if not self.enabled():
             return None
         try:
-            return self._join(target, member, groups, firewall or DEFAULT_FIREWALL)
+            return self._join(target, member, groups, firewall or DEFAULT_FIREWALL, revision)
         except Exception as exc:  # noqa: BLE001 -- deliberately broad, see docstring
             log.warning("mesh join failed for %s (env %r): %s", target, self._env, exc)
             return None
 
-    def _join(self, target: str, member: str, groups: tuple[str, ...], firewall: FirewallRules) -> str | None:
+    def _join(
+        self, target: str, member: str, groups: tuple[str, ...],
+        firewall: FirewallRules, revision: str = "",
+    ) -> str | None:
         underlay = underlay_ip()
         # The env's lighthouse may not be up yet: backings can be the FIRST
         # mesh members (no EC2 instance drawn at all). Idempotent -- a
@@ -281,6 +297,7 @@ class MeshSidecar:
             # something else took the recorded one) changes this config, which
             # is exactly what makes the sidecar re-join on the new one.
             lighthouse_port=overlay.lighthouse_port,
+            firewall_revision=revision,
         )
         private_mkdir(directory)  # host.key lives here
         for name, text in (
@@ -290,16 +307,47 @@ class MeshSidecar:
         ):
             atomic_write_text(directory / name, text)
         config_path = directory / "config.yml"
-        unchanged = not recertified and config_path.exists() and config_path.read_text() == config
+        previous = config_path.read_text() if config_path.exists() else None
         atomic_write_text(config_path, config)
         atomic_write_text(directory / _GROUPS_FILE, json.dumps(desired))
         # `attached_to(...) is not False`: a definite NO (the target was
         # replaced) is the one case that must re-join; None (no evidence) keeps
         # the no-churn contract -- see `attached_to`.
-        if unchanged and self.running(target) and self.attached_to(target) is not False:
-            return cert_ip.split("/")[0]
+        healthy = self.running(target) and self.attached_to(target) is not False
+        if not recertified and healthy:
+            if previous == config:
+                return cert_ip.split("/")[0]
+            if firewall_only_change(previous, config):
+                self._reload(target)
+                return cert_ip.split("/")[0]
         self._start(target, directory, peer_overlay_ips(overlay, member))
         return cert_ip.split("/")[0]
+
+    def _reload(self, target: str) -> None:
+        """Adopt a FIREWALL-only config change without dropping a single
+        tunnel -- the sidecar's half of what `compute/instances.py::_refresh`
+        already does for a VM (`systemctl kill -s HUP nebula`), and now for the
+        same two reasons.
+
+        The first is the one that was always true: nebula genuinely reloads its
+        firewall on SIGHUP, so an edited security group never needed the
+        heavier hammer this used to reach for -- restarting the sidecar
+        container tears down every overlay tunnel the backing holds and makes
+        every peer re-handshake, for a change nebula can take in place.
+
+        The second is field test 4, and it is why this stopped being optional:
+        a database is the ADMITTING member in the common case, so it is the one
+        that must move when a client's group is revoked. That move is a
+        reload (`FIREWALL_REVISION_KEY`) -- and if it were a restart instead,
+        every membership change anywhere in the env would drop every database
+        tunnel in it. The revision changes far more often than a rule does,
+        so the cheap path had to exist first.
+
+        `docker kill -s HUP` reaches nebula directly: the image's ENTRYPOINT is
+        exec-form, so nebula IS pid 1 in the sidecar, and its config lives on a
+        bind mount that already holds the bytes just written."""
+        self._rt.signal(self.sidecar_name(target), "HUP")
+        log.info("reloaded %s's mesh firewall in place (env %r)", target, self._env)
 
     def _start(self, target: str, config_dir: Path, peers: Iterable[str] = ()) -> None:
         name = self.sidecar_name(target)

@@ -55,6 +55,7 @@ simply not projected yet, rather than guessing.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from odin.aws.rds import POSTGRES_PORT
@@ -67,6 +68,8 @@ from odin.gateway.stores import SynthStores
 from odin.reconcile import mesh_health
 from odin.runtime.colima import CONTAINER_HOST
 from odin.runtime.lima import LIMA_HOST
+from odin.simulate.workspace import tf_dir
+from odin.spec.models import ResourceObserved, World
 
 TF_OWNED_KINDS = frozenset({
     "vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr", "logs", "secret", "ssm",
@@ -599,3 +602,103 @@ def project(stores: SynthStores, env: str, ecs_runtime: TaskRuntime | None = Non
     out.update(_ecs_services(stores, env, ecs_runtime))
     out.update(_cache_clusters(stores, env))
     return out
+
+
+# --- the resources a failed apply leaves in tofu's state and nowhere else ---
+
+_TF_STATE = "terraform.tfstate"
+
+# The AWS-shaped kinds that live INSIDE a shared per-env backing container
+# (rustfs / goaws / dynalite) rather than getting a container of their own, and
+# whose World entries therefore come from the reconciler's PROVISIONED observe
+# path -- not from `project()` above. tofu resource type -> (odin kind, the
+# attribute carrying the resource's own name, which equals the canvas label by
+# construction: see agent/hcl.py's `_s3`/`_sqs`/`_sns`/`_dynamodb`).
+_BACKED_TF_TYPES = {
+    "aws_s3_bucket": ("s3", "bucket"),
+    "aws_sqs_queue": ("sqs", "name"),
+    "aws_sns_topic": ("sns", "name"),
+    "aws_dynamodb_table": ("dynamodb", "name"),
+}
+
+# Deliberately the SAME words `server.on_backing_unavailable` puts on the
+# `backing_unavailable` event, and the same recovery: one down backing, one
+# vocabulary, whichever surface an operator happens to be looking at.
+_STRANDED_VERDICT = (
+    "this resource exists in the env's tofu state, but no {kind} backing container is running "
+    "for this env -- every AWS call to it answers ServiceUnavailable. Apply to start it."
+)
+
+
+def _tf_state(root: Path, env: str) -> dict:
+    """tofu's own state for this env, or `{}` when there is nothing to read.
+
+    STRICT, in the same direction as `ec2compute.tf_forgotten_instances`: a
+    state file that is missing, empty or unparseable is NO evidence, never an
+    error. tofu rewrites state IN PLACE (open, truncate, write -- see
+    util.ensure_private_file), so a reader that lands mid-write sees a
+    truncated file; `/world` is polled throughout an apply and must not 500
+    because it caught tofu at that instant.
+    """
+    state = tf_dir(root, env) / _TF_STATE
+    text = state.read_text().strip() if state.is_file() else ""
+    try:
+        return json.loads(text) if text else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def stranded_in_tf_state(
+    root: Path, env: str, world: World, reachable_kinds: frozenset[str] | set[str],
+) -> tuple[ResourceObserved, ...]:
+    """The resources tofu really created that odin can currently see NOWHERE
+    else -- reported with an honest phase instead of vanishing.
+
+    Field test 3, P2-5. A 22-node canvas whose ECS node never came up failed
+    the apply, and a failed apply does not commit the desired state
+    (`/apply-full`'s `tf_failed` branch, release finding #2). So the env's
+    Stack stayed empty: plan() never provisioned the 12 s3/sqs/sns/dynamodb
+    nodes, the trailing tick's `gc({})` stopped the very backing containers
+    `ensure_backings` had just booted, and the nodes had **no badge at all** in
+    `/world` -- not pending, not crashed, absent -- while tofu's state listed
+    them and every call to them answered `ServiceUnavailable`. A resource that
+    exists and is unreachable must not be invisible; that is "odin can't see
+    itself" again.
+
+    Three conditions, and all three matter:
+
+    * IN TOFU'S STATE. tofu is the only thing that creates or destroys these,
+      so its state is the witness that the resource EXISTS. A resource that
+      genuinely no longer exists (tofu destroy, an empty-canvas Apply) leaves
+      the state and stops being reported here the same instant -- this cannot
+      strand a phantom the way projecting a `terminated` EC2 record did in
+      v0.5.2, because nothing here outlives the state entry.
+    * NOT IN WORLD. World always wins. The moment the reconciler observes the
+      resource for real, this says nothing about it at all.
+    * ITS BACKING IS UNREACHABLE. `reachable_kinds` is the gateway's OWN
+      routing table (`GatewayState.backing_port`) -- the exact thing that
+      decides between forwarding a call and answering `ServiceUnavailable`.
+      So this reports only what the gateway would genuinely refuse, and stays
+      silent through the ordinary window of a HEALTHY apply, where the backing
+      is up from `ensure_backings` and the resource is simply not observed yet.
+
+    Nothing here is written to World and no WorldDelta is emitted: it is a
+    read-model overlay on `GET /world`, computed per request. That is what
+    keeps it away from the draft-flap v0.7.1 killed -- plan() would call any
+    such entry "observed but no longer desired" on the very next tick and
+    prune it straight back out, one WebSocket event per tick, forever.
+    """
+    out: list[ResourceObserved] = []
+    for resource in _tf_state(root, env).get("resources", []):
+        backed = _BACKED_TF_TYPES.get(resource.get("type"))
+        if backed is None or backed[0] in reachable_kinds:
+            continue
+        kind, name_attr = backed
+        for instance in resource.get("instances", []):
+            attributes = instance.get("attributes") or {}
+            label = _label(attributes.get("tags") or {}, attributes.get(name_attr))
+            if label and world.get(label) is None:
+                out.append(ResourceObserved(
+                    id=label, kind=kind, phase="crashed", verdict=_STRANDED_VERDICT.format(kind=kind),
+                ))
+    return tuple(out)

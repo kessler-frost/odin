@@ -98,6 +98,27 @@ def test_envs_text_and_json(runner):
 
 
 @respx.mock
+def test_envs_with_none_yet_explains_itself_without_polluting_stdout(runner):
+    """Fresh-user friction: with nothing applied, `odin envs` printed one
+    blank line and exited 0 -- indistinguishable from a broken command. The
+    answer now goes to stderr, and stdout stays strictly one-env-per-line so
+    `odin envs | while read e` gets zero iterations, not one empty one."""
+    respx.get(f"{BASE}/envs").mock(return_value=httpx.Response(200, json={"envs": []}))
+    result = runner.invoke(app, ["envs"])
+    assert result.exit_code == 0
+    assert result.stdout == ""
+    assert "no environments yet" in result.stderr and "'default'" in result.stderr
+
+
+@respx.mock
+def test_envs_json_stays_pure_json_when_empty(runner):
+    respx.get(f"{BASE}/envs").mock(return_value=httpx.Response(200, json={"envs": []}))
+    result = runner.invoke(app, ["envs", "-o", "json"])
+    assert result.exit_code == 0
+    assert json.loads(result.stdout) == {"envs": []}
+
+
+@respx.mock
 def test_envs_server_down(runner):
     respx.get(f"{BASE}/envs").mock(side_effect=httpx.ConnectError("refused"))
     result = runner.invoke(app, ["envs"])

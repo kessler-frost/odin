@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -13,7 +14,9 @@ import typer
 from odin.cli import commands as _commands  # noqa: F401  (registers the control-surface commands)
 from odin.cli import doctor as _doctor  # noqa: F401  (registers `odin doctor`)
 from odin.cli.app import app
-from odin.util import live_server, odin_version, pid_alive, private_mkdir
+from odin.compute.instances import vm_name
+from odin.gateway.stores import SynthStores
+from odin.util import live_server, odin_version, pid_alive, private_mkdir, run_command
 
 ODIN_DIR = Path(".odin")
 PID_FILE = ODIN_DIR / "pid"
@@ -57,6 +60,41 @@ def _warn_if_non_loopback(host: str) -> None:
         )
 
 
+def _already_running() -> bool:
+    """Whether a control app is live against `.odin` -- printed, and NOT an
+    error.
+
+    Two things had to survive here. The MECHANISM is the kernel `flock`
+    (v0.7.2 gave the server one precisely so liveness could be OBSERVED
+    rather than inferred): `odin start` used to read only `.odin/pid`, which
+    ONLY `odin start` itself writes, so the one command that launches a
+    second server was the one still blind to a server the README's own
+    `uvicorn odin.server:create_app --factory` had started -- two reconcilers
+    driving the same envs' containers. `live_server` asks the kernel, so this
+    is now the same check everywhere.
+
+    The EXIT CODE stays 0, the odd one out among the exit-code fixes:
+    `odin start` asks for an end state (odin up) and that end state holds, so
+    an idempotent `odin start && odin apply` in a script must keep working.
+    What a second `start` cannot honour is a different `--port`/`--host`, so
+    it says so out loud rather than letting the flags look applied.
+
+    Returning False also means nothing is running, which makes a leftover
+    pidfile stale by definition -- cleared here so the next start isn't
+    blocked by a corpse.
+    """
+    server = live_server(ODIN_DIR)
+    if server is None:
+        _clear_stale_pidfile()
+        return False
+    typer.echo(
+        f"Odin is already running ({server.detail}) — nothing was started, and any "
+        "--port/--host you passed was NOT applied."
+    )
+    typer.echo(f"Stop it with {server.how_to_stop} first to restart it with new flags.")
+    return True
+
+
 def _build_ui() -> None:
     if (Path(__file__).resolve().parent / "_ui").exists():
         return  # UI ships bundled with the installed package
@@ -86,12 +124,8 @@ def start(
         _start_dev(port, host)
         return
 
-    if PID_FILE.exists():
-        pid = int(PID_FILE.read_text().strip())
-        if pid_alive(pid):
-            typer.echo(f"Odin is already running (pid {pid}). Use `odin stop` first.")
-            return
-        PID_FILE.unlink()
+    if _already_running():
+        return
 
     _build_ui()
     typer.echo(f"Starting Odin on http://{host}:{port}")
@@ -125,12 +159,8 @@ def start(
 
 def _start_dev(port: int, host: str = DEFAULT_HOST) -> None:
     """Dev mode startup."""
-    if PID_FILE.exists():
-        pid = int(PID_FILE.read_text().strip())
-        if pid_alive(pid):
-            typer.echo(f"Odin is already running (pid {pid}). Use `odin stop` first.")
-            return
-        PID_FILE.unlink()
+    if _already_running():
+        return
 
     typer.echo(f"Starting Odin dev mode on http://{host}:{port}")
     typer.echo(f"  Vite  → :{port}  (HMR)")
@@ -192,7 +222,13 @@ def _clear_stale_pidfile() -> str:
 
 @app.command()
 def stop() -> None:
-    """Stop the Odin server."""
+    """Stop the Odin server. Exit 0 once odin is down, 1 if it is still up.
+
+    Nothing running is exit 0 on purpose, unlike `odin status`: `stop` asks
+    for an end state rather than a fact, and that end state holds. The one
+    non-zero case is the one where it does not -- a server odin can see but
+    cannot signal.
+    """
     server = live_server(ODIN_DIR)
     if server is None:
         typer.echo(f"Odin is not running{_clear_stale_pidfile()}.")
@@ -203,7 +239,7 @@ def stop() -> None:
         # field engineer to kill their own shell, and no message is worth that.
         typer.echo(f"Odin is running ({server.detail}), but odin cannot identify the process.")
         typer.echo(f"Stop it by {server.how_to_stop}.")
-        return
+        raise typer.Exit(1)  # odin is still up, and this command said so
     # A server the user launched themselves (no pidfile -- `uvicorn
     # odin.server:create_app`, the command the README documents) is still THIS
     # store's server, so `odin stop` stops it rather than claiming nothing is
@@ -216,23 +252,135 @@ def stop() -> None:
 
 @app.command()
 def status() -> None:
-    """Check if Odin is running."""
+    """Is Odin running? Exit 0 if it is, 1 if it is not.
+
+    `status` is a question, so the exit code is the answer -- the shell
+    convention every other predicate follows (`test`, `pgrep`, `systemctl
+    is-active`). Through v0.7.3 it printed "Odin is not running." and exited
+    0, which made `odin status && odin apply` apply against a server that
+    wasn't there and gave a CI gate nothing to check but the sentence.
+    """
     server = live_server(ODIN_DIR)
     if server is None:
         typer.echo(f"Odin is not running{_clear_stale_pidfile()}.")
-        return
+        raise typer.Exit(1)
     typer.echo(f"Odin is running ({server.detail}).")
+
+
+# Every container odin creates carries `odin=1` and `odin-env=<env>`, so the
+# machine itself can be asked what an env still owns -- no store lookup, and no
+# name-prefix guessing.
+_ODIN_LABEL = "label=odin=1"
+
+
+def _store_envs(odin_dir: Path) -> list[str]:
+    """The envs THIS store has directories for.
+
+    Deliberately not `SpecStore.list_envs()`, whose `or ["default"]` fallback
+    invents an env for an empty store -- and `odin-env=default` containers may
+    belong to somebody else's store entirely."""
+    return sorted(p.name for p in odin_dir.iterdir() if p.is_dir()) if odin_dir.is_dir() else []
+
+
+def _env_containers(env: str) -> list[str]:
+    result = run_command([
+        "docker", "ps", "-a", "--filter", _ODIN_LABEL, "--filter", f"label=odin-env={env}",
+        "--format", "{{.Names}}",
+    ])
+    return [name for name in result.stdout.splitlines() if name.strip()]
+
+
+def _env_vms(odin_dir: Path, env: str) -> list[str]:
+    """This env's REAL Lima VMs: the exact names `vm_name(env, instance_id)`
+    builds from the store's own instance records, intersected with the VMs that
+    actually exist. Exact names only, never a prefix match -- the same
+    discipline `ec2compute.reap_orphaned_vms` keeps, and what makes it
+    impossible for a user's own VM (`veronica`) to be named here."""
+    stores = SynthStores(odin_dir)
+    expected = {
+        vm_name(env, record["instance_id"])
+        for key, record in stores.ec2compute.items(env).items() if key.startswith("instance:")
+    }
+    existing = set(run_command(["limactl", "list", "-q"]).stdout.split())
+    return sorted(expected & existing)
+
+
+def _refuse_if_the_store_still_owns_anything(odin_dir: Path) -> None:
+    """`--all` deletes the only record that these containers and VMs are
+    odin's.
+
+    FIELD TEST 4's second finding: after wiping a scratch store the engineer
+    had to `docker rm` an `odin-aws-*-sneak` container BY HAND, BY EXACT NAME,
+    because no odin command could find it any more. A "full reset" that leaves
+    real resources running with nothing able to name them is a leak with a
+    friendly name.
+
+    So this refuses and points at `odin destroy`, rather than reclaiming here.
+    Teardown is not `docker rm -f`: `/destroy` also runs `tofu destroy`,
+    reclaims EC2 VMs, purges the env's network records (which is what stops its
+    nebula lighthouse), and revokes the env's gateway keys. Half of that from a
+    file-cleaning command would be a different kind of leak -- and `odin
+    destroy` still WORKS at this point, which is the whole reason to stop
+    before the deletion rather than after it.
+    """
+    owned = {
+        env: (_env_containers(env), _env_vms(odin_dir, env))
+        for env in _store_envs(odin_dir)
+    }
+    live = {env: found for env, found in owned.items() if any(found)}
+    if not live:
+        return
+    typer.echo("Refusing: this store still owns real resources, and .odin/ is the only record of them.")
+    for env, (containers, vms) in live.items():
+        typer.echo(f"  env {env!r}:")
+        if containers:
+            typer.echo(f"    containers: {', '.join(containers)}")
+        if vms:
+            typer.echo(f"    VMs:        {', '.join(vms)}")
+    typer.echo(
+        "Deleting .odin/ would orphan them -- nothing left would know they are odin's.\n"
+        "Tear them down first (start odin, then "
+        f"{', '.join(f'`odin destroy --env {env}`' for env in live)}, then stop odin), "
+        "and run `odin clean --all` again.",
+        err=True,
+    )
+    raise typer.Exit(1)
 
 
 @app.command()
 def clean(all: bool = typer.Option(False, "--all", help="Wipe entire .odin/ directory (canvas, registry, infra, session, everything)")) -> None:
     """Remove test artifacts, stray PNGs, and dev logs. Use --all for full reset."""
-    import shutil
     root = Path.cwd()
     removed = []
     odin_dir = root / ".odin"
 
     if all:
+        # `--all` is `rm -rf .odin`, and that includes `.odin/lock` -- the ONE
+        # piece of evidence that a server is up. Deleting it under a live
+        # server breaks three things at once:
+        #   * the running server keeps its lock (flock lives on the INODE, not
+        #     the name), but nothing can find it any more: `odin status` and
+        #     `odin stop` say "not running" and `odin import` restores straight
+        #     into a live store -- the v0.7.0 bug, re-created by hand.
+        #   * the NEXT server takes a lock on a brand-new inode and succeeds, so
+        #     TWO servers each believe they exclusively hold this store, both
+        #     reconciling the same envs' real containers.
+        #   * the store itself (spec revisions, world.json, gateway records,
+        #     tofu workspaces) is pulled out from under a process writing to it.
+        # None of that is recoverable by re-running anything, so this refuses
+        # rather than repairs. The narrower clean below touches no lock and no
+        # store state, so it stays unguarded.
+        server = live_server(ODIN_DIR)
+        if server is not None:
+            typer.echo(f"Refusing: odin is running against .odin/ ({server.detail}).")
+            typer.echo(f"`--all` deletes the store, INCLUDING the lock that server holds. "
+                       f"Stop it with {server.how_to_stop} first.", err=True)
+            raise typer.Exit(1)
+        # ...and the store is also the only thing that knows which real
+        # containers and VMs belong to odin. Checked AFTER the lock (a live
+        # server is the more urgent hazard) and BEFORE any deletion, which is
+        # the only moment `odin destroy` can still find them.
+        _refuse_if_the_store_still_owns_anything(odin_dir)
         if odin_dir.exists():
             shutil.rmtree(odin_dir)
             private_mkdir(odin_dir)

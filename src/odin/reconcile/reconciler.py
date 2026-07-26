@@ -57,6 +57,18 @@ from odin.spec.models import ResourceDesired, Stack, World, WorldDelta
 log = logging.getLogger("odin.reconcile")
 
 
+# Facts that describe WHAT A RESOURCE IS (endpoint, address, arn) rather than
+# how it happens to be doing right now. Only these take part in change
+# detection -- see `_emit`. `logtail` is the lone exclusion today; add here
+# rather than widening the comparison if a genuinely volatile fact ever
+# returns.
+_VOLATILE_FACTS = ("logtail",)
+
+
+def _identity_facts(facts: dict) -> dict:
+    return {k: v for k, v in facts.items() if k not in _VOLATILE_FACTS}
+
+
 class Reconciler:
     def __init__(
         self,
@@ -260,7 +272,21 @@ class Reconciler:
         pulling images and booting VMs -- the exact busy-daemon load
         drift.py's own confirm-before-correcting note names as the hazard.
         The cache still carries any drift reported BEFORE the apply, so
-        nothing already known goes quiet mid-apply."""
+        nothing already known goes quiet mid-apply.
+
+        WHAT THAT COSTS, and where it is written down (field test 4, P4-4):
+        the cached half covers ec2, lambda and rds ONLY. ECS is not affected --
+        `project_tf_owned` runs `ecsctl.sweep_tasks` live on every one of these
+        ticks, and that sweep recognises a VANISHED container (`absent`), so a
+        task container removed out of band mid-apply is caught on the next
+        tick, not after the apply. For the other three the staleness lasts the
+        rest of the apply plus up to one sweep cadence (default 10 ticks, ~10s)
+        after it returns, since the cadence counter never advanced while
+        suspended. That is a REAL LIMIT a user can hit, so it lives in
+        ROADMAP's "v1 limits, recorded rather than hidden" list -- not only
+        here. Field test 4 hit it as 57s of a stale task count, and the two
+        `tests/reconcile/test_reconciler.py` tests named in that entry pin both
+        halves."""
         drifted = await self._drift_verdicts(act)
         projected = await asyncio.to_thread(project_tf_owned, self._stores, self._env)
         for label, (kind, phase, facts, verdict) in projected.items():
@@ -316,11 +342,33 @@ class Reconciler:
                      if e.src == sns_id and self._kind_of(stack, e.dst) == "sqs")
 
     async def _emit(self, rid, kind, phase, facts=None, verdict=None) -> None:
-        # Skip unchanged status: observe runs every tick and the cpu/ram facts
-        # fluctuate, but only a phase/verdict CHANGE is worth a WorldDelta — else
-        # the event log + WS + events.jsonl fill with identical "healthy" noise.
+        # Skip unchanged status: observe runs every tick, so re-emitting an
+        # identical reading would fill the event log + WS + events.jsonl with
+        # "healthy" noise (43% of all events before v0.7.1 fixed exactly that).
+        #
+        # But FACTS count as a change too. They were left out when the facts of
+        # the day were the parked workload layer's fluctuating cpu/ram; today's
+        # are identity — endpoints, IPs, ARNs — and they can arrive AFTER the
+        # phase settles. Field test 4: an rds node reaches `healthy` before
+        # `rdsctl._join_mesh` records its overlay_ip, so with facts excluded
+        # `DATABASE_URL_MESH` could never enter World on a first apply, and no
+        # later phase change ever came to carry it. That made README's central
+        # security advice (point VM consumers at the SG-gated `_MESH` ref)
+        # impossible to follow, silently downgrading them to the ungated `_VM`,
+        # and left `mesh_health.gate` dead code because the keys it withholds
+        # never arrived. Generally: any fact that changed while a resource
+        # stayed healthy was stale in World forever.
+        #
+        # `logtail` is excluded because it is diagnostic, not identity: it can
+        # differ between reads of the same dead container, and re-emitting for
+        # that is the noise this guard exists to stop.
         prior = self._store.current_world(self._env).get(rid)
-        if prior is not None and prior.phase == phase and prior.verdict == verdict:
+        if (
+            prior is not None
+            and prior.phase == phase
+            and prior.verdict == verdict
+            and _identity_facts(prior.facts) == _identity_facts(facts or {})
+        ):
             return
         delta = WorldDelta(
             env=self._env, resource_id=rid, kind=kind, phase=phase,

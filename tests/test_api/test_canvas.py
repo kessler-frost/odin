@@ -59,6 +59,37 @@ def test_post_canvas_persists_and_overwrites(client, canvas_path):
     assert len(json.loads(canvas_path.read_text())["nodes"]) == 1
 
 
+def test_post_canvas_refuses_a_structurally_broken_canvas_and_stores_nothing(client, canvas_path):
+    """Field test 4, P4-5: `canvas set` used to accept anything that was valid
+    JSON, so a canvas that could never be applied sat on disk until the next
+    translate or apply tripped over it with a 500."""
+    resp = client.post("/canvas", json={
+        "nodes": [{"id": "s3", "type": "s3", "data": {"label": ["s3", "p2-assets"]}}],
+        "edges": [{"source": "s3", "target": "s3", "data": {"edgeType": "iam"}}],
+    })
+    assert resp.status_code == 422
+    assert "data.label" in json.dumps(resp.json())
+    assert not canvas_path.exists()
+
+
+def test_post_canvas_still_accepts_a_kind_odin_cannot_build(client):
+    """The boundary: an unsupported KIND is well-formed. It is stored, applied
+    and reported as skipped -- refusing it here would break that."""
+    canvas = {"nodes": [{"id": "k1", "type": "kinesis", "position": {"x": 0, "y": 0},
+                         "data": {"label": "stream"}}], "edges": []}
+    assert client.post("/canvas", json=canvas).status_code == 200
+    assert client.get("/canvas").json() == canvas
+
+
+def test_get_canvas_returns_a_hand_broken_file_verbatim(client, canvas_path):
+    """`odin canvas get` is the command you REPAIR a bad canvas with, so it
+    must be able to read one back. (POST is where the shape is enforced.)"""
+    broken = {"nodes": [{"id": "s3", "type": "s3", "data": {"label": ["s3", "p2-assets"]}}], "edges": []}
+    canvas_path.write_text(json.dumps(broken))
+    resp = client.get("/canvas")
+    assert resp.status_code == 200 and resp.json() == broken
+
+
 def test_post_canvas_writes_the_file_0600(client, canvas_path):
     # Security finding #3a: a node's fields can carry a cleartext secret
     # (an rds `password`) -- 0600 is the only thing stopping another local

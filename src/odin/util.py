@@ -185,36 +185,95 @@ def _flock(fd: int) -> bool:
         return exc.errno not in (errno.EWOULDBLOCK, errno.EAGAIN)
 
 
-@dataclass(frozen=True)
+def _take(fd: int) -> bool:
+    """Lock `fd` and stamp our pid in it. The pid is written only once the lock
+    is OURS, so a reader that finds the lock held is reading a pid that really
+    holds it -- the file is evidence, never an assertion on its own."""
+    if not _flock(fd):
+        return False
+    os.ftruncate(fd, 0)
+    os.write(fd, f"{os.getpid()}\n".encode())
+    return True
+
+
+@dataclass
 class StoreLock:
-    """The lock a live server holds, released when it exits (or `release()`s)."""
+    """The lock a live server holds, released when it exits (or `release()`s).
+
+    Mutable, and `root` rides along, for `reassert()`: the fd can legitimately
+    be replaced under a running server when the lock FILE is destroyed.
+    """
 
     fd: int
+    root: Path
 
     def release(self) -> None:
         os.close(self.fd)
+
+    def reassert(self) -> bool:
+        """Whether `root/lock` still names the inode this process holds -- and
+        re-establish it when it does not.
+
+        FIELD TEST 4 measured why this exists. An flock lives on the INODE, so
+        `rm -rf .odin` (`odin clean --all`, a stray script, an impatient
+        human) releases NOTHING -- but it makes the lock unreachable by path,
+        and `_lock_holder` can only ask the kernel about a path. The measured
+        consequence was not a missing warning, it was a confident lie followed
+        by real corruption: the server kept serving, `odin status` said "Odin
+        is not running", `odin import` restored into the live store, and the
+        operator started a SECOND server that then shared `world.json`,
+        `events.jsonl` and the gateway stores with the first.
+
+        `clean --all` refusing (see `__main__.clean`) stops odin doing this to
+        itself. This is the other half, for every deleter odin does not
+        control: the holder notices its own evidence is gone and puts it back,
+        so the blind window is a second rather than forever.
+
+        Returns True when nothing needed doing. False means the repair could
+        not be made -- another process already holds the file that replaced
+        ours, i.e. two servers really are on this store -- which is a warning
+        for every caller, not something this can fix.
+        """
+        path = self.root / STORE_LOCK_NAME
+        if path.is_file() and path.stat().st_ino == os.fstat(self.fd).st_ino:
+            return True
+        private_mkdir(self.root)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, SECRET_FILE_MODE)
+        if not _take(fd):
+            os.close(fd)  # somebody else owns whatever replaced our lock file
+            return False
+        # Only now let the old one go: until this point it was still the only
+        # thing making us the exclusive holder. It is unreachable by path
+        # anyway (that is what got us here), so nothing can be waiting on it.
+        os.close(self.fd)
+        self.fd = fd
+        return False
 
 
 def hold_store_lock(root: Path) -> StoreLock:
     """Claim `root/lock` for the life of this process and stamp our pid in it.
 
     The server calls this once, in its lifespan; the kernel drops the lock when
-    the process ends however it ends. The pid is written only once the lock is
-    OURS, so a reader that finds the lock held is reading a pid that really
-    holds it -- the file is evidence, never an assertion on its own.
+    the process ends however it ends.
     """
     private_mkdir(root)
     fd = os.open(root / STORE_LOCK_NAME, os.O_RDWR | os.O_CREAT, SECRET_FILE_MODE)
-    if _flock(fd):
-        os.ftruncate(fd, 0)
-        os.write(fd, f"{os.getpid()}\n".encode())
-    return StoreLock(fd)
+    _take(fd)
+    return StoreLock(fd, root)
 
 
 def _lock_holder(root: Path) -> LiveServer | None:
     """Whoever holds this store's lock, if anyone -- the launch-path-independent
     half of `live_server`, and the half that cannot false-positive: it asks the
-    kernel who holds a lock, not what a command line looks like."""
+    kernel who holds a lock, not what a command line looks like.
+
+    A MISSING lock file answers "nobody", and that is the one direction this
+    cannot prove on its own: an unlinked inode a live server still holds is
+    invisible to every path-based question (field test 4). The two things that
+    close it live elsewhere, because they are the only places that can --
+    `__main__.clean` refuses to delete the file under a live server, and
+    `StoreLock.reassert` (run by the server's own watchdog) puts it back within
+    a second if anything else does."""
     path = root / STORE_LOCK_NAME
     if not path.is_file():
         return None

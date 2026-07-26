@@ -66,32 +66,31 @@ def test_tf_status_server_down(runner):
 # 1 a real error. The server being unreachable is 3 -- deliberately NOT the 2
 # every other command uses, because for THIS command 2 already means drift.
 
+# v0.7.4: `skipped`/`not_covered`/`canvas_drift` are the SERVER's fields. The
+# CLI used to GET /canvas itself and union the two arrays here, which is how it
+# came to report a skipped list derived from the canvas drawn NOW against a plan
+# of the LAST-APPLIED Stack -- see tests/api/test_tf.py for the server-side
+# proof, and `test_tf_plan_prints_the_servers_note_when_they_describe_different_things`
+# below for the visible half.
 PLAN_NO_CHANGES = {
     "status": "no_changes", "env": "default", "exit_code": 0,
     "tail": ["No changes. Your infrastructure matches the configuration."], "unsupported": [],
+    "skipped": [], "not_covered": [], "canvas_drift": False,
 }
-
-
-def mock_canvas(*types: str) -> None:
-    """`odin tf plan` reads the canvas too: a kind odin doesn't model never
-    became a Stack resource, so the plan literally cannot see it (MISLEAD-2)."""
-    nodes = [{"id": f"n{i}", "type": t, "data": {"label": f"n{i}"}} for i, t in enumerate(types)]
-    respx.get(f"{BASE}/canvas").mock(
-        return_value=httpx.Response(200, json={"nodes": nodes, "edges": []})
-    )
 PLAN_CHANGES = {
     "status": "changes", "env": "default", "exit_code": 2,
     "tail": ["Plan: 1 to add, 0 to change, 0 to destroy."], "unsupported": [],
+    "skipped": [], "not_covered": [], "canvas_drift": False,
 }
 PLAN_FAILED = {
     "status": "failed", "env": "default", "exit_code": 1,
     "tail": ["Error: Invalid provider configuration"], "unsupported": [],
+    "skipped": [], "not_covered": [], "canvas_drift": False,
 }
 
 
 @respx.mock
 def test_tf_plan_no_changes_exits_zero(runner):
-    mock_canvas("s3")
     respx.post(f"{BASE}/tf/plan", params={"env": "default"}).mock(
         return_value=httpx.Response(200, json=PLAN_NO_CHANGES)
     )
@@ -103,7 +102,6 @@ def test_tf_plan_no_changes_exits_zero(runner):
 
 @respx.mock
 def test_tf_plan_with_changes_exits_two(runner):
-    mock_canvas("s3")
     respx.post(f"{BASE}/tf/plan", params={"env": "default"}).mock(
         return_value=httpx.Response(200, json=PLAN_CHANGES)
     )
@@ -115,7 +113,6 @@ def test_tf_plan_with_changes_exits_two(runner):
 
 @respx.mock
 def test_tf_plan_error_exits_one(runner):
-    mock_canvas("s3")
     respx.post(f"{BASE}/tf/plan").mock(return_value=httpx.Response(500, json=PLAN_FAILED))
     result = runner.invoke(app, ["tf", "plan"])
     assert result.exit_code == 1
@@ -124,19 +121,18 @@ def test_tf_plan_error_exits_one(runner):
 
 @respx.mock
 def test_tf_plan_json_mode_keeps_the_exit_code(runner):
-    mock_canvas("s3")
     respx.post(f"{BASE}/tf/plan").mock(return_value=httpx.Response(200, json=PLAN_CHANGES))
     result = runner.invoke(app, ["tf", "plan", "-o", "json"])
     assert result.exit_code == 2
-    assert json.loads(result.stdout) == {**PLAN_CHANGES, "skipped": [], "not_covered": []}
+    assert json.loads(result.stdout) == PLAN_CHANGES
 
 
 @respx.mock
 def test_tf_plan_names_nodes_the_plan_could_not_cover(runner):
     """`no_changes` only means "no drift in what odin can generate" -- an
     unsupported node is not in the plan at all, so the check says so."""
-    mock_canvas("s3")
-    body = {**PLAN_NO_CHANGES, "unsupported": ["cache1 (elasticache)"]}
+    body = {**PLAN_NO_CHANGES, "unsupported": ["cache1 (elasticache)"],
+            "not_covered": ["cache1 (elasticache)"]}
     respx.post(f"{BASE}/tf/plan").mock(return_value=httpx.Response(200, json=body))
     result = runner.invoke(app, ["tf", "plan"])
     assert result.exit_code == 0
@@ -149,8 +145,9 @@ def test_tf_plan_names_a_kind_odin_does_not_model_at_all(runner):
     nor `.unsupported` -- they never became Stack resources, so TF generation
     never saw them. A drift gate read `no_changes` while two drawn nodes sat
     outside Terraform entirely."""
-    mock_canvas("s3", "kinesis", "notarealservice")
-    respx.post(f"{BASE}/tf/plan").mock(return_value=httpx.Response(200, json=PLAN_NO_CHANGES))
+    dropped = {**PLAN_NO_CHANGES, "skipped": ["kinesis", "notarealservice"],
+               "not_covered": ["kinesis", "notarealservice"]}
+    respx.post(f"{BASE}/tf/plan").mock(return_value=httpx.Response(200, json=dropped))
     result = runner.invoke(app, ["tf", "plan"])
     assert result.exit_code == 0
     assert "not covered by this plan: kinesis, notarealservice" in result.stdout
@@ -158,11 +155,43 @@ def test_tf_plan_names_a_kind_odin_does_not_model_at_all(runner):
 
 @respx.mock
 def test_tf_plan_json_publishes_the_same_gate_field_as_apply(runner):
-    mock_canvas("s3", "kinesis")
-    respx.post(f"{BASE}/tf/plan").mock(return_value=httpx.Response(200, json=PLAN_NO_CHANGES))
+    dropped = {**PLAN_NO_CHANGES, "skipped": ["kinesis"], "not_covered": ["kinesis"]}
+    respx.post(f"{BASE}/tf/plan").mock(return_value=httpx.Response(200, json=dropped))
     body = json.loads(runner.invoke(app, ["tf", "plan", "-o", "json"]).stdout)
     assert body["skipped"] == ["kinesis"]
     assert body["not_covered"] == ["kinesis"]
+
+
+@respx.mock
+def test_tf_plan_prints_the_servers_note_when_the_two_halves_describe_different_things(runner):
+    """The v0.7.3 correctness hole this closes: `skipped` came from the canvas
+    saved NOW while `unsupported` came from the plan of the LAST-APPLIED Stack,
+    unioned into one array with nothing saying they were two different things.
+    The server detects the mismatch; this is the half the operator actually
+    reads."""
+    drifted = {
+        **PLAN_NO_CHANGES, "skipped": ["kinesis"], "not_covered": ["kinesis"],
+        "canvas_drift": True,
+        "note": "the saved canvas is not what env 'default' last applied — this plan covers the "
+                "last-applied Stack (so `unsupported` describes the plan), while `skipped` "
+                "describes the saved canvas. Apply to make them the same.",
+    }
+    respx.post(f"{BASE}/tf/plan").mock(return_value=httpx.Response(200, json=drifted))
+    result = runner.invoke(app, ["tf", "plan"])
+    assert result.exit_code == 0
+    assert "not covered by this plan: kinesis" in result.stdout
+    assert "note: the saved canvas is not what env 'default' last applied" in result.stdout
+
+
+@respx.mock
+def test_tf_plan_never_calls_the_canvas_route(runner):
+    """One source of truth: v0.7.3 fetched `/canvas` here and derived `skipped`
+    client-side, so `curl /tf/plan` got neither field and the CLI's own answer
+    described a canvas the plan had never seen."""
+    canvas = respx.get(f"{BASE}/canvas").mock(return_value=httpx.Response(200, json={"nodes": [], "edges": []}))
+    respx.post(f"{BASE}/tf/plan").mock(return_value=httpx.Response(200, json=PLAN_NO_CHANGES))
+    assert runner.invoke(app, ["tf", "plan"]).exit_code == 0
+    assert not canvas.called
 
 
 @respx.mock
