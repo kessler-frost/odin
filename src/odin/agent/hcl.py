@@ -204,7 +204,21 @@ Refs = dict[str, tuple[str, str]]
 # routed into `unsupported` exactly like a kind with no builder at all.
 Built = tuple[dict[str, str], str] | str
 
-_NOT_IN_VPC = "not contained inside a VPC on the canvas (drag it into a VPC box)"
+# THE CONTAINMENT FIELDS, and why these messages name them.
+#
+# `vpc` and `subnet` are ordinary fields in a node's canvas JSON. The UI stamps
+# both automatically when you drop a node inside a VPC/Subnet box
+# (`ui/src/lib/containment.ts`), so a UI user never types either one and never
+# sees these messages -- which means the ONLY readers are the hand-authored,
+# `odin import-tf`-generated and CI canvases that a CI gate reads
+# `not_covered` for. Telling that reader to "drag it into a VPC box" names a
+# gesture they cannot make and sends them looking in the wrong place; the field
+# name is the thing they can actually edit. The drag is kept as the parenthesis
+# it is, for the UI reader who arrives here some other way.
+_NOT_IN_VPC = (
+    "vpc is missing or does not name a VPC node on this canvas — set it to the VPC's label "
+    "(on the canvas, dropping the node inside a VPC box sets it)"
+)
 
 # Every aws_security_group implicitly starts with AWS's seeded allow-all
 # egress rule, but the TF provider REMOVES it when the config omits an egress
@@ -403,13 +417,14 @@ def _sg(res: ResourceDesired, refs: Refs) -> Built:
         return _NOT_IN_VPC
     rules = _ingress_rules(res)
     if rules is None:
-        return 'invalid ingress rule — expected one "protocol:port:source" per line, e.g. tcp:443:0.0.0.0/0'
+        return ('ingressRules: expected one "protocol:port:source" rule per line, '
+                "e.g. tcp:443:0.0.0.0/0")
     sources = [_ingress_source(source, res, refs) for _protocol, _port, source in rules]
     if None in sources:
         bad = [r[2] for r, s in zip(rules, sources, strict=True) if s is None]
         return (
-            f"ingress rule source {bad[0]!r} is neither a CIDR (like 10.0.0.0/16) "
-            "nor the name of another Security Group node on the canvas"
+            f"ingressRules: source {bad[0]!r} is neither a CIDR (like 10.0.0.0/16) "
+            "nor the label of another Security Group node on this canvas"
         )
     ingress = [
         (
@@ -428,25 +443,37 @@ def _sg(res: ResourceDesired, refs: Refs) -> Built:
 # V3c: EC2 instances (real Lima VMs, gateway/models/ec2compute.py). Matches
 # that module's own stub-catalog default (documentation only — ImageId is
 # accepted verbatim, never validated) and default instance type.
-_NOT_IN_SUBNET = "not contained inside a Subnet on the canvas (drag it into a Subnet box)"
-_BAD_SECURITY_GROUPS = 'securityGroups names something that isn\'t a Security Group on the canvas'
+_NOT_IN_SUBNET = (  # see `_NOT_IN_VPC` above for why this names the field
+    "subnet is missing or does not name a Subnet node on this canvas — set it to the Subnet's "
+    "label (on the canvas, dropping the node inside a Subnet box sets it)"
+)
 _DEFAULT_AMI = "ami-0c101f26f147fa7fd"
 _DEFAULT_INSTANCE_TYPE = "t3.micro"
 
 
-def _security_group_refs(res: ResourceDesired, refs: Refs) -> list[str] | None:
+def _bad_security_group(label: str) -> str:
+    """Names the OFFENDING LINE, not just the field: `securityGroups` holds one
+    label per line, so "it names something wrong" leaves a multi-line field's
+    reader to diff it by eye."""
+    return (
+        f"securityGroups line {label!r} is not the label of a Security Group node on this canvas "
+        "(the field holds one Security Group label per line)"
+    )
+
+
+def _security_group_refs(res: ResourceDesired, refs: Refs) -> list[str] | str:
     """The ec2 node's `securityGroups` field: one sg canvas label per line
     (SIMPLEST honest v1 — see the V3 brief: no implicit "same containment
     scope" placement, just an explicit list). Returns `aws_security_group.
     <name>.id` refs, `[]` for an empty field (the instance just gets the
-    VPC's default SG, a legitimate case), or None if ANY line names
-    something that isn't a sg resource."""
+    VPC's default SG, a legitimate case), or -- the `_alb_ports` idiom -- the
+    human reason a line can't resolve."""
     lines = [line.strip() for line in _field(res, "securityGroups", "").splitlines() if line.strip()]
     resolved = []
     for label in lines:
         kind, name = refs.get(label, ("", ""))
         if kind != "sg":
-            return None
+            return _bad_security_group(label)
         resolved.append(f"aws_security_group.{name}.id")
     return resolved
 
@@ -456,8 +483,8 @@ def _ec2(res: ResourceDesired, refs: Refs) -> Built:
     if subnet_id is None:
         return _NOT_IN_SUBNET
     sg_ids = _security_group_refs(res, refs)
-    if sg_ids is None:
-        return _BAD_SECURITY_GROUPS
+    if isinstance(sg_ids, str):
+        return sg_ids
     attrs = {
         "ami": quote(_field(res, "ami", _DEFAULT_AMI)),
         "instance_type": quote(_field(res, "instanceType", _DEFAULT_INSTANCE_TYPE)),
@@ -689,9 +716,9 @@ _DEFAULT_ALB_HEALTH_CHECK_PATH = "/"
 _BAD_ALB_LISTENER_PORT = "listenerPort must be a whole number (e.g. 80)"
 _BAD_ALB_TARGET_PORT = "port must be a whole number (e.g. 80)"
 _ALB_NLB_UNSUPPORTED = (
-    "load balancer type 'network' is not supported in Simulate v1 "
-    "(the real substrate is an HTTP reverse proxy) — set Type to 'application'"
-)
+    "lbType 'network' is not supported in Simulate v1 "
+    "(the real substrate is an HTTP reverse proxy) — set lbType to 'application'"
+)  # `Type` is the UI's label for it; `lbType` is the field in the canvas JSON
 
 
 def _alb_target_key(target_id: str) -> str:
@@ -715,12 +742,22 @@ def _alb(res: ResourceDesired, refs: Refs) -> Built:
     """The PRIMARY `aws_lb` block. Gating both the subnet AND the vpc reference
     here is deliberate: the companion target group (built in its own pass
     below) needs `vpc_id`, and a node that gets past this builder is guaranteed
-    to have both, so that pass never has to re-report a containment problem."""
+    to have both, so that pass never has to re-report a containment problem.
+
+    They are gated SEPARATELY because they are two different fields. One
+    `if subnet is None or vpc is None: return _NOT_IN_SUBNET` reported the
+    subnet for both, so an alb carrying `subnet` and missing `vpc` was told to
+    "drag it into a Subnet box" -- a fix it had already applied, for a field
+    that was already correct. A message confidently wrong about the cause is
+    worse than no message: it sends the reader to the wrong field.
+    """
     if _field(res, "lbType", _ALB_TYPE_APPLICATION) != _ALB_TYPE_APPLICATION:
         return _ALB_NLB_UNSUPPORTED
     subnet_id = _subnet_ref(res, refs)
-    if subnet_id is None or _vpc_ref(res, refs) is None:
+    if subnet_id is None:
         return _NOT_IN_SUBNET
+    if _vpc_ref(res, refs) is None:
+        return _NOT_IN_VPC
     ports = _alb_ports(res)
     if isinstance(ports, str):
         return ports
@@ -809,8 +846,11 @@ _SECRET_RECOVERY_WINDOW = "0"
 # Kept in lock-step with gateway/models/ssmctl.py's VALID_TYPES (imported
 # nowhere: the deterministic translator stays independent of the gateway).
 _SSM_TYPES = ("String", "StringList", "SecureString")
-_SSM_NEEDS_VALUE = "needs a Value (an SSM parameter can't exist without one)"
-_BAD_SSM_TYPE = f"type must be one of {', '.join(_SSM_TYPES)}"
+# There is no `Value` field and no `type` field. `Value`/`Type` are the UI's
+# labels; the canvas JSON carries `paramValue` and `paramType`, and a message
+# that names the label sends a CLI reader hunting for a key that does not exist.
+_SSM_NEEDS_VALUE = "paramValue is empty — an SSM parameter cannot exist without a value"
+_BAD_SSM_TYPE = f"paramType must be one of {', '.join(_SSM_TYPES)}"
 
 
 def _secret(res: ResourceDesired, refs: Refs) -> Built:
@@ -861,8 +901,9 @@ _DEFAULT_DB_PASSWORD = "apppass123"
 _DEFAULT_DB_NAME = "postgres"
 _BAD_RDS_IDENTIFIER = (
     "an RDS name must be lowercase letters/digits separated by single hyphens "
-    "and start with a letter (e.g. app-db) — rename the node"
-)
+    "and start with a letter (e.g. app-db) — the node's name IS the identifier, so change "
+    "data.label"
+)  # "rename the node" was a gesture; `data.label` is the key that holds the name
 _BAD_RDS_STORAGE = "allocatedStorage must be a whole number of GiB (e.g. 20)"
 
 
@@ -886,8 +927,8 @@ def _rds(res: ResourceDesired, refs: Refs) -> Built:
     # real Postgres container's mesh membership with those groups' compiled
     # firewall (`gateway/models/rdsctl.py::_db_firewall`).
     sg_ids = _security_group_refs(res, refs)
-    if sg_ids is None:
-        return _BAD_SECURITY_GROUPS
+    if isinstance(sg_ids, str):
+        return sg_ids
     nested = f"  vpc_security_group_ids = [{', '.join(sg_ids)}]" if sg_ids else ""
     return {
         "identifier": quote(res.id),
