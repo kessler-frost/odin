@@ -476,7 +476,7 @@ class Reconciler:
             logtail = await asyncio.to_thread(self._backing_logtail, res.kind)
             await self._emit(
                 res.id, res.kind, "crashed",
-                facts={"logtail": logtail} if logtail else {},
+                facts=self._crash_facts(res.id, logtail),
                 verdict=f"the {res.kind} backing is no longer reachable",
             )
         if res.kind != "sns" or not ok:
@@ -485,6 +485,34 @@ class Reconciler:
         missing = tuple(q for q in self._desired_subs(stack, res.id) if q not in actual)
         if missing:
             await asyncio.to_thread(self._aws.provision, "sns", res.id, missing)
+
+    def _crash_facts(self, rid: str, logtail: str) -> dict:
+        """A crashed resource's facts: the identity it still HAS, plus the
+        diagnostic tail of why it died.
+
+        The crash branch used to replace facts WHOLESALE with
+        `{"logtail": …}`, which destroyed a crashed bucket's `BUCKET` and
+        `endpoint` in World (field test 5's facts audit). That is wrong on its
+        own terms -- a crashed s3 node still IS that bucket; its name did not
+        stop being its name -- and it broke resolution: anything referencing
+        `${{bucket.BUCKET}}` through the Fabric saw the value VANISH the moment
+        the backing hiccuped, and only a full starting->healthy round trip put
+        it back.
+
+        This is NOT the stale-green shape `_cache_clusters`/`_db_instances`
+        gate against, and the line between them is worth stating: those two
+        withhold a REACHABILITY claim (dial this and you get a database) for
+        something that is not up. What survives here is IDENTITY (this node is
+        the bucket named `uploads`), and it ships with `phase="crashed"` plus a
+        verdict saying the backing is gone -- so nothing reads it as green.
+
+        Costs no extra deltas: `logtail` is excluded from change detection
+        (`_VOLATILE_FACTS`) and the identity half is by construction equal to
+        what World already holds, so a resource sitting crashed emits once and
+        then stays silent however many ticks pass over it."""
+        prior = self._store.current_world(self._env).get(rid)
+        identity = _identity_facts(prior.facts) if prior is not None else {}
+        return {**identity, **({"logtail": logtail} if logtail else {})}
 
     def _backing_logtail(self, kind: str) -> str:
         """A short tail off the real backing container for a crash verdict --

@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from odin.aws.backings import BackingUnavailable
+from odin.aws.backings import BackingAws, BackingUnavailable
 from odin.gateway.policy import compile_policies
 from odin.gateway.stores import SynthStores
 from odin.compute.tasks import container_name as task_container_name
@@ -1156,3 +1156,94 @@ async def test_a_tuple_valued_fact_would_have_stormed_one_delta_per_tick(tmp_pat
     # …and the guard is what stops that shape from ever reaching the store.
     with pytest.raises(TypeError):
         await r._emit("lb", "alb", "healthy", facts={"ports": ("80", "443")})
+
+
+# --- a crash must not destroy the resource's identity -------------------------
+
+
+class _PortOnlyRuntime:
+    """Just enough runtime for the REAL `BackingAws.facts` to run, so the
+    identity facts under test are the ones production publishes rather than a
+    hand-written approximation of them."""
+
+    def host_port(self, name, container_port):
+        return 51001
+
+
+def _real_backing_facts(tmp_path, service, name):
+    return BackingAws(_PortOnlyRuntime(), env="default", root=tmp_path).facts(service, name)
+
+
+async def test_a_crashed_resource_keeps_its_identity_and_gains_a_logtail(tmp_path):
+    """Field test 5's facts audit, hazard 4. The crash branch replaced facts
+    WHOLESALE with `{"logtail": …}`, so a crashed bucket's `BUCKET` and
+    `endpoint` were destroyed in World -- and anything resolving
+    `${{uploads.BUCKET}}` saw the value vanish the moment the backing
+    hiccuped, restored only by a full starting->healthy round trip. A crashed
+    resource still IS that bucket."""
+    rt, aws, ws = FakeRuntime(), FakeAws(), FakeWS()
+    rt.set("odin-aws-s3-default", "running", logs="panic: disk full")
+    aws.facts = lambda service, name: _real_backing_facts(tmp_path, service, name)
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(BUCKET,)))
+
+    recon = Reconciler(store, rt, aws=aws, ws=ws, poll_interval=0)
+    await recon.tick()   # provision -> starting
+    await recon.tick()   # -> healthy, with the real identity facts
+    healthy = store.current_world().get("uploads").facts
+    assert healthy["BUCKET"] == "uploads" and healthy["endpoint"].endswith(":51001")
+
+    aws.exists = lambda service, name: False   # the backing lost the resource
+    await recon.tick()   # observe demotes to crashed, then plan re-provisions
+
+    crashed = next(m for m in ws.sent if m.get("resource_id") == "uploads"
+                   and m.get("phase") == "crashed")
+    assert crashed["verdict"] == "the s3 backing is no longer reachable"
+    assert crashed["facts"]["logtail"] == "panic: disk full"    # the diagnosis arrives
+    assert crashed["facts"]["BUCKET"] == healthy["BUCKET"]      # …and identity survives it
+    assert crashed["facts"]["endpoint"] == healthy["endpoint"]
+
+
+async def test_preserving_identity_across_a_crash_costs_no_extra_deltas(tmp_path):
+    """The churn check the fix has to pass. `logtail` is excluded from change
+    detection (`_VOLATILE_FACTS`) and the identity half is by construction
+    equal to what World already holds, so a resource re-read as crashed emits
+    once and then stays silent however many reads follow -- even as the log
+    tail keeps changing under it."""
+    r = Reconciler(store=SpecStore(tmp_path), runtime=FakeRuntime(), env="e")
+    facts = _real_backing_facts(tmp_path, "s3", "uploads")
+    await r._emit("uploads", "s3", "healthy", facts=facts)
+    await r._emit("uploads", "s3", "crashed", verdict="gone",
+                  facts=r._crash_facts("uploads", "panic: disk full"))
+    assert r._store.current_world("e").get("uploads").facts["BUCKET"] == "uploads"
+
+    emitted = []
+    r._store.apply_delta = lambda d: emitted.append(d)
+    for read in range(30):
+        await r._emit("uploads", "s3", "crashed", verdict="gone",
+                      facts=r._crash_facts("uploads", f"panic: disk full\nretry {read}"))
+    assert emitted == [], "30 reads of a settled crash must emit nothing"
+
+
+async def test_many_ticks_over_a_steady_healthy_env_emit_nothing(tmp_path):
+    """The storm re-confirmation for the whole set of fixes: a settled env
+    stays silent. Field test 5 measured a 3-resource apply at exactly the
+    6-event minimum and 90s idle at zero new bytes -- none of these changes
+    may cost that."""
+    rt, aws = FakeRuntime(), FakeAws()
+    aws.facts = lambda service, name: _real_backing_facts(tmp_path, service, name)
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(
+        ResourceDesired(id="uploads", kind="s3"),
+        ResourceDesired(id="jobs", kind="sqs"),
+        ResourceDesired(id="alerts", kind="sns"),
+    )))
+    recon = Reconciler(store, rt, aws=aws, poll_interval=0)
+    await recon.tick()   # 3 x starting
+    await recon.tick()   # 3 x healthy
+
+    emitted = []
+    store.apply_delta = lambda d: emitted.append(d)
+    for _ in range(45):  # 45 ticks ~= 90s at the real 2s poll interval
+        await recon.tick()
+    assert emitted == []
