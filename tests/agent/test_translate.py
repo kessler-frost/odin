@@ -356,11 +356,18 @@ def test_for_display_drops_binary_files_and_is_json_serializable():
 
     result = translate_mod.TranslateResult(
         files={"main.tf": "resource {}"}, notes=["n"], unsupported=["rds"], refined=True,
+        wiring_errors=["web (ecs): env ref ${{ghost.URL}} names 'ghost'"],
         binary_files={"fn.zip": b"PK\x03\x04\xff\xfe not utf-8"},
     )
     display = result.for_display()
     assert "binary_files" not in display
-    assert display == {"files": {"main.tf": "resource {}"}, "notes": ["n"], "unsupported": ["rds"], "refined": True}
+    # `wiring_errors` IS displayed (field test 5): it is text, JSON-serializable,
+    # and a broken canvas ref is exactly what a reader of this panel needs to
+    # see -- it just must never be mistaken for the coverage list beside it.
+    assert display == {
+        "files": {"main.tf": "resource {}"}, "notes": ["n"], "unsupported": ["rds"],
+        "wiring_errors": ["web (ecs): env ref ${{ghost.URL}} names 'ghost'"], "refined": True,
+    }
     json.dumps(display)  # must not raise -- the whole point of the fix
     assert result.binary_files  # the object still carries the bytes /apply-full needs
 

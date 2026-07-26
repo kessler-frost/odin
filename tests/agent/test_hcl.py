@@ -21,8 +21,9 @@ from odin.agent.hcl import (
     resource_set,
     unquote,
 )
+from odin.server import not_covered
 from odin.spec.models import Edge, FieldValue, ResourceDesired, Stack
-from odin.spec.translate import canvas_to_stack
+from odin.spec.translate import canvas_to_stack, skipped_node_types
 
 _FULL_CANVAS = {
     "nodes": [
@@ -870,8 +871,104 @@ def test_a_ref_to_a_node_that_is_not_on_the_canvas_is_reported_not_dropped():
     proj = generate_tf(canvas_to_stack(canvas))
     assert 'resource "aws_ecs_service" "web"' in proj.files["main.tf"]
     assert "depends_on" not in proj.files["main.tf"]
-    (note,) = proj.unsupported
+    (note,) = proj.wiring_errors
     assert "typo-db" in note and "DATABASE_URL" in note and "web" in note
+
+
+# --- field test 5: a wiring typo is not a coverage gap ----------------------
+# An apply with a bad ref put `worker (lambda): env ref ${{ghost.ENDPOINT}}
+# names 'ghost'...` into BOTH `unsupported` and `not_covered` -- for a lambda
+# odin covers completely and had just applied. v0.7.3 made `not_covered` the
+# one field a CI gate should read (`jq -e '.not_covered | length == 0'`), so a
+# wiring typo failed that gate under a COVERAGE label: odin told the user it
+# doesn't support their node when it supports it fine and the reference is
+# wrong. The two questions are now two fields.
+
+
+def test_a_broken_env_ref_is_never_reported_as_a_coverage_gap():
+    """The reported bug, in the shape it was reported in: a `lambda` named
+    `worker` referencing a `ghost` that isn't on the canvas. `unsupported` is
+    what `server.not_covered` unions, so a wiring typo must leave it empty."""
+    canvas = {
+        "nodes": [{"id": "n1", "type": "lambda", "data": {
+            "label": "worker", "env": {"ENDPOINT": "${{ghost.ENDPOINT}}"}}}],
+        "edges": [],
+    }
+    proj = generate_tf(canvas_to_stack(canvas))
+
+    # It IS covered: odin built the function, so nothing about coverage is wrong.
+    assert 'resource "aws_lambda_function" "worker"' in proj.files["main.tf"]
+    assert proj.unsupported == []          # <- the whole bug: this used to carry the ref
+    (note,) = proj.wiring_errors           # <- reported, as what it actually is
+    assert "ghost" in note and "ENDPOINT" in note and "worker" in note
+
+
+def test_a_broken_ref_and_a_genuinely_unsupported_node_stay_in_their_own_fields():
+    """The failure mode of an over-eager fix, pinned. The bug was OVER-reporting
+    in `not_covered`; UNDER-reporting there is worse, because that is the field
+    CI gates on -- a genuinely uncovered node must still land in `unsupported`
+    even when a broken ref is present on the same canvas.
+
+    The uncovered node here is a real decline, not a hypothetical: a `subnet`
+    drawn outside any VPC, whose builder returns `_NOT_IN_VPC`."""
+    canvas = {
+        "nodes": [
+            {"id": "n1", "type": "lambda", "data": {
+                "label": "worker", "env": {"ENDPOINT": "${{ghost.ENDPOINT}}"}}},
+            {"id": "n2", "type": "subnet", "data": {"label": "orphan-subnet"}},
+        ],
+        "edges": [],
+    }
+    proj = generate_tf(canvas_to_stack(canvas))
+
+    (uncovered,) = proj.unsupported
+    assert uncovered == f"orphan-subnet (subnet): {hcl._NOT_IN_VPC}"  # coverage fact, kept
+    (wiring,) = proj.wiring_errors
+    assert "ghost" in wiring and "worker" in wiring                   # user error, separate
+    # Neither list has leaked into the other.
+    assert "ghost" not in uncovered and "subnet" not in wiring
+
+
+def test_not_covered_carries_real_coverage_gaps_and_not_the_wiring_typo():
+    """The gate itself, end to end. `server.not_covered` is what
+    `jq -e '.not_covered | length == 0'` reads, so assert against THAT function
+    rather than re-deriving the union in the test: a wiring typo must not fail
+    it, while both real coverage gaps (an unmodelled `type`, a builder decline)
+    must."""
+    canvas = {
+        "nodes": [
+            {"id": "n1", "type": "lambda", "data": {
+                "label": "worker", "env": {"ENDPOINT": "${{ghost.ENDPOINT}}"}}},
+            {"id": "n2", "type": "subnet", "data": {"label": "orphan-subnet"}},
+            {"id": "n3", "type": "kinesis", "data": {"label": "stream1"}},
+        ],
+        "edges": [],
+    }
+    proj = generate_tf(canvas_to_stack(canvas))
+    gate = not_covered(skipped_node_types(canvas), proj.unsupported)
+
+    assert gate == [
+        "kinesis",                                              # unmodelled type -> skipped
+        f"orphan-subnet (subnet): {hcl._NOT_IN_VPC}",           # builder declined -> unsupported
+    ]
+    assert not any("ghost" in entry for entry in gate)          # the fix
+    assert proj.wiring_errors                                   # still reported, elsewhere
+
+
+def test_a_wiring_typo_alone_leaves_the_ci_gate_green():
+    """The reported symptom, stated as the gate's own contract: a canvas whose
+    ONLY problem is a wiring typo must give CI an EMPTY `not_covered`, because
+    nothing on it is uncovered. The apply still has to fail -- it does, at
+    launch, via `gateway/wiring.py::UnresolvedRef` -- but it must not fail
+    under a coverage label."""
+    canvas = {
+        "nodes": [{"id": "n1", "type": "lambda", "data": {
+            "label": "worker", "env": {"ENDPOINT": "${{ghost.ENDPOINT}}"}}}],
+        "edges": [],
+    }
+    proj = generate_tf(canvas_to_stack(canvas))
+    assert not_covered(skipped_node_types(canvas), proj.unsupported) == []
+    assert len(proj.wiring_errors) == 1
 
 
 def test_tofu_fmt_accepts_a_wired_service(tmp_path):

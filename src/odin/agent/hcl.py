@@ -54,7 +54,23 @@ HEADER = (
 class TfProject(BaseModel):
     model_config = {"frozen": True}
     files: dict[str, str] = {}
+    # COVERAGE ONLY -- "odin cannot build this node", and nothing else. A
+    # resource odin models but can't generate Terraform for (a kind with no
+    # builder, a builder that declined this instance), with the reason. This
+    # is what `server.not_covered` unions into the ONE array a CI gate reads,
+    # so anything filed here is a claim that odin does not support the user's
+    # node. See `wiring_errors` for the thing that is NOT that.
     unsupported: list[str] = []
+    # NOT a coverage fact: the node IS built and IS applied, but a `${{...}}`
+    # in its `env` names a producer that isn't on this canvas. Field test 5
+    # found this sharing `unsupported`, which put a WIRING TYPO into
+    # `not_covered` -- the CI gate v0.7.3 documented -- under a coverage
+    # label, telling the user odin doesn't support a `lambda` it had just
+    # applied successfully. Two different questions ("can odin build this?"
+    # vs "did the user wire this correctly?") need two different fields; a
+    # gate that answers one with the other is a gate you can pass and still
+    # be wrong, which is the exact trap `not_covered` was created to close.
+    wiring_errors: list[str] = []
     # V4c: a lambda node's zip'd deployment package -- filename (relative to
     # the tf workspace, e.g. "fn1.zip") -> raw bytes. NEVER text: `files`
     # stays `dict[str, str]` on purpose (every other builder emits HCL, and
@@ -276,7 +292,25 @@ def _unwired_refs(res: ResourceDesired, refs: Refs) -> list[str]:
     node that isn't on the canvas (a typo, or a node since deleted). Reported
     rather than dropped (northstar directive 5): the apply response carries
     these, so `${{typo.DATABASE_URL}}` is visible at build time instead of only
-    as a crashed container later."""
+    as a crashed container later.
+
+    WHERE THIS GOES, and why it is not `unsupported` (field test 5). These land
+    in `TfProject.wiring_errors`, never in `unsupported`, because they are a
+    USER ERROR on a node odin supports perfectly well -- the resource is built,
+    applied and covered. Filing them under coverage is what put
+    `worker (lambda): env ref ${{ghost.ENDPOINT}} names 'ghost'...` into
+    `not_covered` for an applied lambda, so a wiring typo failed
+    `jq -e '.not_covered | length == 0'` while telling the user odin doesn't
+    support their node.
+
+    IT IS THE SAME ERROR THE GATEWAY ALREADY FAILS ON, CAUGHT EARLIER -- not a
+    third story. A ref naming a node that isn't on the canvas also publishes no
+    facts at launch, so `gateway/wiring.py::_resolve` raises `UnresolvedRef`
+    for it regardless, which `ecsctl`/`lambdactl` turn into a task STOPPED /
+    `State: Failed` with that reason, a `crashed` node, and a FAILED apply.
+    This check reaches the identical verdict from static canvas data, before
+    any container is launched. So a `wiring_errors` entry is never merely
+    advisory: it names a workload that WILL fail."""
     return [
         f"{res.id} ({res.kind}): env ref {'${{' + f'{ref.target_id}.{ref.target_attr}' + '}}'} "
         f"names {ref.target_id!r}, which is not a resource on this canvas — the variable "
@@ -1008,6 +1042,7 @@ def generate_tf(stack: Stack) -> TfProject:
     refs: Refs = {}
     blocks: list[tuple[tuple[str, str], str]] = []
     unsupported: list[str] = []
+    wiring_errors: list[str] = []
 
     # Pass 1 — assign every buildable resource its HCL name BEFORE any builder
     # runs. "subnet" sorts before "vpc", yet aws_subnet.vpc_id must reference
@@ -1095,10 +1130,11 @@ def generate_tf(stack: Stack) -> TfProject:
     # node that isn't on the canvas can never have that variable set, and the
     # `depends_on` above silently omits it. Say so in the apply response instead
     # (northstar directive 5) -- the resource itself is still built, because the
-    # rest of it is perfectly valid.
+    # rest of it is perfectly valid. Which is exactly why this is NOT
+    # `unsupported`: see `_unwired_refs` and `TfProject.wiring_errors`.
     for res in ordered:
         if res.kind in _WIRED_KINDS and res.id in built_ids:
-            unsupported.extend(_unwired_refs(res, refs))
+            wiring_errors.extend(_unwired_refs(res, refs))
 
     for edge in sorted(stack.edges, key=lambda e: (e.src, e.dst)):
         topic, queue = by_id.get(edge.src), by_id.get(edge.dst)
@@ -1294,4 +1330,7 @@ def generate_tf(stack: Stack) -> TfProject:
         code = _field(res, "code", "") or _DEFAULT_LAMBDA_CODE
         binary_files[f"{name}.zip"] = _deterministic_zip(entry_filename, code)
 
-    return TfProject(files={"main.tf": main_tf}, unsupported=unsupported, binary_files=binary_files)
+    return TfProject(
+        files={"main.tf": main_tf}, unsupported=unsupported,
+        wiring_errors=wiring_errors, binary_files=binary_files,
+    )
