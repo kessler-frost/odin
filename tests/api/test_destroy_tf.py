@@ -394,6 +394,24 @@ def test_only_outcomes_added_on_purpose_score_as_a_success(tmp_path):
     assert {k for k, v in _DESTROY_STATUS.items() if v == "destroyed"} == {"ok", "nothing_to_destroy"}
 
 
+# --- field test 5 (LOW): destroying nothing must create nothing ---
+
+
+def test_destroy_on_an_env_that_never_existed_mints_nothing(tmp_path):
+    """`odin destroy --env typo` used to CREATE `.odin/<env>/` with a HEAD, an
+    empty Stack revision and real `keys.json` gateway credentials, after which
+    the env appeared in `odin envs` forever -- a typo'd destroy issuing
+    credentials for an environment that has never existed."""
+    app = _app(tmp_path)
+    with TestClient(app) as client:
+        resp = client.post("/destroy", params={"env": "neverexisted"})
+        envs = client.get("/envs").json()["envs"]
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "nothing_to_destroy"
+    assert not (tmp_path / "neverexisted").exists(), "destroying nothing created an env directory"
+    assert "neverexisted" not in envs
+
+
 def test_destroy_409_when_a_tofu_run_is_already_in_progress(tmp_path):
     app = _app(tmp_path)
     _make_workspace(tmp_path)

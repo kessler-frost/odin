@@ -421,6 +421,21 @@ def create_apply_router(
                 content={"error": f"a tofu run is already in progress for env {env!r}"},
             )
         _bump_epoch(env_epoch, env)  # finding #4: invalidate any older in-flight apply-full for this env
+        # Field test 5 (LOW): destroying nothing must CREATE nothing. `odin
+        # destroy --env typo` used to mint `.odin/<env>/` with a HEAD, an empty
+        # Stack revision and -- through `keystore.revoke_env` -- a real
+        # `keys.json` of gateway credentials, so a typo issued credentials for
+        # an environment that had never existed and put it in `odin envs`
+        # permanently. Everything BELOW this line writes that directory;
+        # everything above it is in-memory or read-only, and the epoch bump in
+        # particular has to stay above it -- the very first apply for an env is
+        # what creates the directory, so a teardown racing it would find no
+        # directory and must still supersede the apply it is racing.
+        if not (store.root / env).exists():
+            return JSONResponse(status_code=200, content={
+                "status": "nothing_to_destroy", "env": env, "tf": None,
+                "note": f"env {env!r} has never existed -- nothing was destroyed, and nothing was created",
+            })
 
         # Field test 5 (HIGH, the FOURTH form of the same lie): `body["status"]`
         # used to be initialised to "destroyed" right here, at the top, and each
