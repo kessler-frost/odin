@@ -56,6 +56,60 @@ work.
 - Permissive licenses only (Apache/MIT/BSD/MPL). Branch work on `develop`; merge to `main` only for releases (locally, no PRs), then push.
 - Lima via `limactl` CLI; containers via Colima `docker` (default) or `nerdctl` in a Lima VM.
 
+## Honesty rules (earned the hard way — four audits, 2026-07-25/26)
+Nearly every serious bug found in odin was the same shape: **odin claiming
+something it had never verified.** These three rules exist so it stops
+recurring. Read them before writing a guard, a status, or a caveat.
+
+1. **A guard must read a signal that actually arrives.** Four separate guards
+   silently never fired: Lambda's `FunctionError` read a header real RIE never
+   sends; the store-liveness check substring-matched process argv; the mesh
+   gate withheld facts that never reached World; the nebula re-handshake poke
+   waited for `/sys/class/net/nebula1` when the device is `tun0`. Each passed
+   review and its own tests. **Probe the real component and print what it
+   returns before you code against it** — that is what the fixes that HELD did
+   (nebula SIGHUP semantics on the wire, tofu's in-place state rewrite, ECS's
+   waiter counting stale-revision tasks). A unit test that fabricates the
+   upstream signal proves the parser, not the integration. **Mutation-test it:**
+   break the guard and confirm a test fails.
+1b. **A guard can read a signal that arrives LATE — and a test can fabricate
+   its promptness.** Rule 1's sibling, found by field test 5. The lambda/rds
+   steady-state checks are real, but both e2e tests set
+   `ODIN_DRIFT_SWEEP_TICKS=1` and *wait for the sweep* before the failing
+   apply — measuring the guard only after the input it depends on has provably
+   arrived, and stepping around the entire residual. Measured without that
+   help: FOUR consecutive `applied`/exit-0 applies over ~8s with zero
+   containers, and `/world` green for the same window — four times worse than
+   the prose that disclosed it. So: if a guard depends on a signal produced on
+   a cadence, **test it at the cadence the user gets**, not one you shortened;
+   and state the window in the docs as a measured number, not a hope.
+
+2. **Never report success you did not achieve, and fix the SHAPE not the
+   instance.** `odin destroy` returned exit 0 in three distinct forms across
+   three releases (interrupted apply, timeout, no-op), each surviving the last
+   fix; `apply` did the same for ecs, then lambda, then rds. Set status from
+   the OUTCOME, never optimistically at the top of a route; key on the real
+   exit code, not parsed text; name **what is still standing** (resource,
+   observed vs desired, real reason). The contract: *a command answering a
+   question returns the answer; a command performing an action returns whether
+   the end state holds.* When you fix one instance, immediately hunt siblings —
+   other kinds, the timeout path, the no-op path. **What finally worked** for
+   `/destroy` after four rounds: stop initialising the status at all. Branches
+   report an *outcome*; the status is derived from a map; an unmapped outcome
+   falls through to failure. A branch that forgets now fails loudly instead of
+   inheriting a lie — patching branches one at a time never got there.
+3. **Caveats outlive their fixes — audit docs against source.** README and
+   ROADMAP both documented the `/world` freeze after it was fixed; an audit
+   found two more stale entries. Grep the docs for the bug's own words when a
+   fix lands. Watch direction: a doc that oversells safety (bind address, file
+   modes, "we verify X") is a claim you cannot back. Verify mode/bind/permission
+   claims with the real command (`find … ! -perm 700`, `lsof`) and make the doc
+   say what that command prints.
+
+**Corollary: reported-fixed ≠ verified.** Have someone who did not write the fix
+try to falsify it. That judgement — "here is where the original proof was weaker
+than claimed" — was the single most valuable output of the field tests.
+
 ## Cleanup / Disk (limited headroom — clean up after EVERY heavy step)
 - **Containers:** every test/run tears down its own; `docker ps -aq --filter label=odin=1 | xargs -r docker rm -f`. Tests use the `runtime` fixture's teardown.
 - **Lima VMs:** the LimaRuntime VM is `odin-host`; integration tests delete it after. Never leave stray VMs (`limactl list -q`); delete by exact name (the user's own VMs like `veronica` are off-limits).

@@ -269,6 +269,43 @@ async def test_a_normal_destroy_is_unaffected_by_the_destroy_budget(tmp_path, mo
     result = await runner.destroy("default", 4266, "ak", "sk")
     assert result.ok is True
     assert result.exit_code == 0
+    assert result.timed_out is False
+
+
+# --- field test 5 (MED): "it timed out" is a claim, so it needs a signal ---
+
+
+async def test_a_real_deadline_kill_sets_timed_out(tmp_path, monkeypatch):
+    """The runner is the only frame that KNOWS -- it is the thing that sent the
+    signal -- so it is the frame that reports it. Against a real subprocess
+    really killed by `_run`'s own timeout branch, not a fabricated result."""
+    _write_fake_tofu(tmp_path, _DESTROY_WEDGED)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    (tmp_path / "default" / "tf").mkdir(parents=True)
+    runner = TfRunner(tmp_path, timeout=30, destroy_timeout=0.3)
+    result = await runner.destroy("default", 4266, "ak", "sk")
+    assert result.timed_out is True
+    assert result.exit_code < 0
+
+
+async def test_an_external_kill_is_a_negative_exit_code_but_not_a_timeout(tmp_path, monkeypatch):
+    """The proxy the route used to infer a timeout from -- `exit_code < 0` --
+    is ambiguous, and this is the ambiguity, produced for real: tofu kills
+    ITSELF with SIGKILL, so the result is exit -9 with no timeout anywhere near
+    it. The field test hit this as an external `kill -9` 0.87s into a destroy
+    that was then reported as a 300-SECOND deadline expiry, sending the operator
+    to tune `ODIN_TOFU_DESTROY_TIMEOUT` for something unrelated."""
+    _write_fake_tofu(
+        tmp_path,
+        _INIT_OK + '\nif [ "$1" = "destroy" ]; then echo "Destroying..."; kill -9 $$; fi',
+    )
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    (tmp_path / "default" / "tf").mkdir(parents=True)
+    runner = TfRunner(tmp_path, timeout=30, destroy_timeout=30)
+    result = await runner.destroy("default", 4266, "ak", "sk")
+    assert result.exit_code == -9, "the ambiguous proxy: an external kill looks exactly like a deadline kill"
+    assert result.timed_out is False
+    assert not any("timed out" in line for line in result.tail)
 
 
 # --- security finding #3: tofu's own log output is scrubbed for secrets ---

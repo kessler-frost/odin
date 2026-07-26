@@ -199,12 +199,23 @@ future decision against these points instead of re-deriving them:
     above — and so is the real state of every **ECS task**, because the
     projection re-runs `ecsctl.sweep_tasks` on each of those ticks and that
     sweep now recognises a container that has VANISHED (`absent`), not just one
-    that exited. What is NOT live is the reality sweep for the other three
-    kinds with a runtime footprint:
-    - **ec2** — the Lima VM, checked by a bulk `limactl list`;
-    - **lambda** — the RIE container, checked by a bulk `docker ps`;
-    - **rds** — the Postgres container, checked by a real `pg_ready` connection.
-    For those three an in-flight apply reads the LAST SWEEP'S CACHE
+    that exited. **Field test 5 put lambda and rds on that same live footing**
+    (v0.7.5): every projection tick, in an apply or not, runs one bulk
+    `docker ps` of container STATES (`reconcile/drift.py::live_verdicts`), so a
+    function's RIE container or a database's Postgres container that is gone,
+    `exited` (a `docker kill`) or `paused` reads `crashed` — with the real
+    reason, and with the dead database's `DATABASE_URL` withheld — on the very
+    next tick rather than on the sweep cadence. That check is READ-ONLY, which
+    is what makes it safe to run mid-apply; and /apply-full runs the same read
+    itself before reporting, so an apply never answers `applied` off a record
+    another loop refreshes on a cadence. What is NOT live:
+    - **ec2** — the Lima VM, checked by a bulk `limactl list`, still
+      cache-bound during an apply;
+    - **rds's `pg_ready`** — the one failure docker's own state cannot see (the
+      container is running and Postgres inside it has wedged) is still found
+      only by the cadence sweep, and is still REPORTED rather than written into
+      the record, so it does not fail an apply.
+    For those an in-flight apply reads the LAST SWEEP'S CACHE
     (`reconcile/reconciler.py::_project_tf_owned(act=False)`), deliberately and
     not as an oversight: a sweep does not merely look, it CORRECTS records
     (`mark_instance_terminated` / `mark_function_failed` /
@@ -224,10 +235,11 @@ future decision against these points instead of re-deriving them:
     (s3/sqs/sns/dynamodb — it re-subscribes SNS topics, so it is not read-only,
     and it would inspect the very backing tofu is creating inside), and the
     World PRUNE of a label tofu destroyed; both resume on the tick right after.
-    **If you need certainty about an ec2/lambda/rds resource, don't read
-    `/world` mid-apply** — wait for the apply to return and give it one sweep
-    (~10s), or ask the substrate directly: `odin doctor`, `docker ps`,
-    `limactl list` and a `psql` connection all bypass this cache entirely.
+    **If you need certainty about an EC2 VM, don't read `/world` mid-apply** —
+    wait for the apply to return and give it one sweep (~10s), or ask the
+    substrate directly: `odin doctor`, `docker ps`, `limactl list` and a `psql`
+    connection all bypass this cache entirely. (lambda and rds no longer belong
+    in that sentence — see the live half above.)
     (Pinned by `tests/reconcile/test_reconciler.py`'s
     `test_a_task_container_removed_mid_apply_is_seen_within_one_tick` and
     `test_a_deleted_ec2_vm_is_NOT_seen_until_the_apply_releases`.)
@@ -306,7 +318,9 @@ future decision against these points instead of re-deriving them:
       digits, single hyphens, starts with a letter) — the provider validates
       `identifier` client-side, so a label like `app_db` is declined at build
       time with the fix instead of failing inside tofu. Existing canvases with
-      such labels must rename the node.
+      such labels must change the node's `data.label` (the decline message
+      names that field, not "rename the node" -- a CLI author has no rename
+      gesture, only JSON).
     - **`allocated_storage` / `instance_class` are metadata**: they round-trip
       faithfully (clean plans, faithful imports) but resize nothing — a local
       container has the host's disk and no instance sizing.

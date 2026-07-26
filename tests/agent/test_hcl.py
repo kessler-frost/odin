@@ -2,12 +2,17 @@
 from __future__ import annotations
 
 import io
+import re
 import shutil
 import subprocess
 import time
 import zipfile
+from pathlib import Path
+
+import pytest
 
 
+from odin.agent import hcl
 from odin.agent.hcl import (
     _ALB_NLB_UNSUPPORTED,
     _ecs_container_definitions,
@@ -16,8 +21,9 @@ from odin.agent.hcl import (
     resource_set,
     unquote,
 )
+from odin.server import not_covered
 from odin.spec.models import Edge, FieldValue, ResourceDesired, Stack
-from odin.spec.translate import canvas_to_stack
+from odin.spec.translate import canvas_to_stack, skipped_node_types
 
 _FULL_CANVAS = {
     "nodes": [
@@ -180,7 +186,8 @@ def test_rds_with_an_unknown_security_group_label_lands_in_unsupported():
     res = ResourceDesired(id="app-db", kind="rds", fields=_fields(securityGroups="ghost"))
     proj = generate_tf(Stack(resources=(res,)))
     assert proj.unsupported == [
-        "app-db (rds): securityGroups names something that isn't a Security Group on the canvas"
+        "app-db (rds): securityGroups line 'ghost' is not the label of a Security Group node on "
+        "this canvas (the field holds one Security Group label per line)"
     ]
     assert "aws_db_instance" not in proj.files["main.tf"]
 
@@ -206,7 +213,8 @@ def test_rds_label_that_is_not_a_valid_identifier_is_declined_with_the_fix():
         proj = generate_tf(Stack(resources=(ResourceDesired(id=label, kind="rds"),)))
         assert proj.unsupported == [
             f"{label} (rds): an RDS name must be lowercase letters/digits separated by "
-            "single hyphens and start with a letter (e.g. app-db) — rename the node",
+            "single hyphens and start with a letter (e.g. app-db) — the node's name IS the "
+            "identifier, so change data.label",
         ], label
         assert "aws_db_instance" not in proj.files["main.tf"]
 
@@ -368,7 +376,7 @@ def test_two_pass_naming_survives_subnet_sorting_before_vpc():
 def test_subnet_without_containing_vpc_lands_in_unsupported():
     proj = generate_tf(Stack(resources=(ResourceDesired(id="orphan", kind="subnet"),)))
     assert proj.unsupported == [
-        "orphan (subnet): not contained inside a VPC on the canvas (drag it into a VPC box)"
+        "orphan (subnet): " + hcl._NOT_IN_VPC
     ]
     assert "aws_subnet" not in proj.files["main.tf"]
 
@@ -380,7 +388,7 @@ def test_subnet_contained_in_a_non_vpc_resource_lands_in_unsupported():
     ))
     proj = generate_tf(stack)
     assert proj.unsupported == [
-        "web (subnet): not contained inside a VPC on the canvas (drag it into a VPC box)"
+        "web (subnet): " + hcl._NOT_IN_VPC
     ]
 
 
@@ -414,7 +422,7 @@ def test_sg_with_no_rules_emits_only_the_default_egress():
 def test_sg_outside_a_vpc_lands_in_unsupported():
     proj = generate_tf(Stack(resources=(ResourceDesired(id="stray", kind="sg"),)))
     assert proj.unsupported == [
-        "stray (sg): not contained inside a VPC on the canvas (drag it into a VPC box)"
+        "stray (sg): " + hcl._NOT_IN_VPC
     ]
 
 
@@ -425,7 +433,8 @@ def test_sg_with_malformed_ingress_rule_lands_in_unsupported():
     ))
     proj = generate_tf(stack)
     assert proj.unsupported == [
-        'bad (sg): invalid ingress rule — expected one "protocol:port:source" per line, e.g. tcp:443:0.0.0.0/0'
+        'bad (sg): ingressRules: expected one "protocol:port:source" rule per line, '
+        "e.g. tcp:443:0.0.0.0/0"
     ]
 
 
@@ -453,8 +462,8 @@ def test_sg_ingress_naming_a_non_sg_source_lands_in_unsupported():
     ))
     proj = generate_tf(stack)
     assert proj.unsupported == [
-        "db-sg (sg): ingress rule source 'web-tier' is neither a CIDR (like 10.0.0.0/16) "
-        "nor the name of another Security Group node on the canvas"
+        "db-sg (sg): ingressRules: source 'web-tier' is neither a CIDR (like 10.0.0.0/16) "
+        "nor the label of another Security Group node on this canvas"
     ]
 
 
@@ -467,7 +476,7 @@ def test_sg_ingress_naming_itself_is_unsupported_not_a_tf_cycle():
         ResourceDesired(id="app-sg", kind="sg", fields=_fields(vpc="net", ingressRules="tcp:5432:app-sg")),
     ))
     proj = generate_tf(stack)
-    assert proj.unsupported and proj.unsupported[0].startswith("app-sg (sg): ingress rule source 'app-sg'")
+    assert proj.unsupported and proj.unsupported[0].startswith("app-sg (sg): ingressRules: source 'app-sg'")
     assert "aws_security_group" not in proj.files["main.tf"]
 
 
@@ -594,7 +603,7 @@ def test_ec2_defaults_ami_and_instance_type_when_fields_absent():
 def test_ec2_outside_a_subnet_lands_in_unsupported():
     proj = generate_tf(Stack(resources=(ResourceDesired(id="stray", kind="ec2"),)))
     assert proj.unsupported == [
-        "stray (ec2): not contained inside a Subnet on the canvas (drag it into a Subnet box)"
+        "stray (ec2): " + hcl._NOT_IN_SUBNET
     ]
     assert "aws_instance" not in proj.files["main.tf"]
 
@@ -615,7 +624,7 @@ def test_ec2_with_unknown_security_group_label_lands_in_unsupported():
     stack = _subnet_stack(ResourceDesired(id="server", kind="ec2", fields=_fields(subnet="web", securityGroups="ghost")))
     proj = generate_tf(stack)
     assert proj.unsupported == [
-        "server (ec2): securityGroups names something that isn't a Security Group on the canvas"
+        "server (ec2): " + hcl._bad_security_group("ghost")
     ]
 
 
@@ -862,8 +871,104 @@ def test_a_ref_to_a_node_that_is_not_on_the_canvas_is_reported_not_dropped():
     proj = generate_tf(canvas_to_stack(canvas))
     assert 'resource "aws_ecs_service" "web"' in proj.files["main.tf"]
     assert "depends_on" not in proj.files["main.tf"]
-    (note,) = proj.unsupported
+    (note,) = proj.wiring_errors
     assert "typo-db" in note and "DATABASE_URL" in note and "web" in note
+
+
+# --- field test 5: a wiring typo is not a coverage gap ----------------------
+# An apply with a bad ref put `worker (lambda): env ref ${{ghost.ENDPOINT}}
+# names 'ghost'...` into BOTH `unsupported` and `not_covered` -- for a lambda
+# odin covers completely and had just applied. v0.7.3 made `not_covered` the
+# one field a CI gate should read (`jq -e '.not_covered | length == 0'`), so a
+# wiring typo failed that gate under a COVERAGE label: odin told the user it
+# doesn't support their node when it supports it fine and the reference is
+# wrong. The two questions are now two fields.
+
+
+def test_a_broken_env_ref_is_never_reported_as_a_coverage_gap():
+    """The reported bug, in the shape it was reported in: a `lambda` named
+    `worker` referencing a `ghost` that isn't on the canvas. `unsupported` is
+    what `server.not_covered` unions, so a wiring typo must leave it empty."""
+    canvas = {
+        "nodes": [{"id": "n1", "type": "lambda", "data": {
+            "label": "worker", "env": {"ENDPOINT": "${{ghost.ENDPOINT}}"}}}],
+        "edges": [],
+    }
+    proj = generate_tf(canvas_to_stack(canvas))
+
+    # It IS covered: odin built the function, so nothing about coverage is wrong.
+    assert 'resource "aws_lambda_function" "worker"' in proj.files["main.tf"]
+    assert proj.unsupported == []          # <- the whole bug: this used to carry the ref
+    (note,) = proj.wiring_errors           # <- reported, as what it actually is
+    assert "ghost" in note and "ENDPOINT" in note and "worker" in note
+
+
+def test_a_broken_ref_and_a_genuinely_unsupported_node_stay_in_their_own_fields():
+    """The failure mode of an over-eager fix, pinned. The bug was OVER-reporting
+    in `not_covered`; UNDER-reporting there is worse, because that is the field
+    CI gates on -- a genuinely uncovered node must still land in `unsupported`
+    even when a broken ref is present on the same canvas.
+
+    The uncovered node here is a real decline, not a hypothetical: a `subnet`
+    drawn outside any VPC, whose builder returns `_NOT_IN_VPC`."""
+    canvas = {
+        "nodes": [
+            {"id": "n1", "type": "lambda", "data": {
+                "label": "worker", "env": {"ENDPOINT": "${{ghost.ENDPOINT}}"}}},
+            {"id": "n2", "type": "subnet", "data": {"label": "orphan-subnet"}},
+        ],
+        "edges": [],
+    }
+    proj = generate_tf(canvas_to_stack(canvas))
+
+    (uncovered,) = proj.unsupported
+    assert uncovered == f"orphan-subnet (subnet): {hcl._NOT_IN_VPC}"  # coverage fact, kept
+    (wiring,) = proj.wiring_errors
+    assert "ghost" in wiring and "worker" in wiring                   # user error, separate
+    # Neither list has leaked into the other.
+    assert "ghost" not in uncovered and "subnet" not in wiring
+
+
+def test_not_covered_carries_real_coverage_gaps_and_not_the_wiring_typo():
+    """The gate itself, end to end. `server.not_covered` is what
+    `jq -e '.not_covered | length == 0'` reads, so assert against THAT function
+    rather than re-deriving the union in the test: a wiring typo must not fail
+    it, while both real coverage gaps (an unmodelled `type`, a builder decline)
+    must."""
+    canvas = {
+        "nodes": [
+            {"id": "n1", "type": "lambda", "data": {
+                "label": "worker", "env": {"ENDPOINT": "${{ghost.ENDPOINT}}"}}},
+            {"id": "n2", "type": "subnet", "data": {"label": "orphan-subnet"}},
+            {"id": "n3", "type": "kinesis", "data": {"label": "stream1"}},
+        ],
+        "edges": [],
+    }
+    proj = generate_tf(canvas_to_stack(canvas))
+    gate = not_covered(skipped_node_types(canvas), proj.unsupported)
+
+    assert gate == [
+        "kinesis",                                              # unmodelled type -> skipped
+        f"orphan-subnet (subnet): {hcl._NOT_IN_VPC}",           # builder declined -> unsupported
+    ]
+    assert not any("ghost" in entry for entry in gate)          # the fix
+    assert proj.wiring_errors                                   # still reported, elsewhere
+
+
+def test_a_wiring_typo_alone_leaves_the_ci_gate_green():
+    """The reported symptom, stated as the gate's own contract: a canvas whose
+    ONLY problem is a wiring typo must give CI an EMPTY `not_covered`, because
+    nothing on it is uncovered. The apply still has to fail -- it does, at
+    launch, via `gateway/wiring.py::UnresolvedRef` -- but it must not fail
+    under a coverage label."""
+    canvas = {
+        "nodes": [{"id": "n1", "type": "lambda", "data": {
+            "label": "worker", "env": {"ENDPOINT": "${{ghost.ENDPOINT}}"}}}],
+        "edges": [],
+    }
+    proj = generate_tf(canvas_to_stack(canvas))
+    assert not_covered(skipped_node_types(canvas), proj.unsupported) == []
+    assert len(proj.wiring_errors) == 1
 
 
 def test_tofu_fmt_accepts_a_wired_service(tmp_path):
@@ -1184,7 +1289,7 @@ def test_ssm_defaults_to_a_plain_string_parameter():
 
 def test_ssm_without_a_value_lands_in_unsupported():
     proj = generate_tf(Stack(resources=(ResourceDesired(id="flag", kind="ssm"),)))
-    assert proj.unsupported == ["flag (ssm): needs a Value (an SSM parameter can't exist without one)"]
+    assert proj.unsupported == ["flag (ssm): paramValue is empty — an SSM parameter cannot exist without a value"]
     assert "aws_ssm_parameter" not in proj.files["main.tf"]
 
 
@@ -1193,7 +1298,7 @@ def test_ssm_with_an_unknown_type_lands_in_unsupported():
         ResourceDesired(id="flag", kind="ssm", fields=_fields(paramType="Encrypted", paramValue="on")),
     ))
     proj = generate_tf(stack)
-    assert proj.unsupported == ["flag (ssm): type must be one of String, StringList, SecureString"]
+    assert proj.unsupported == ["flag (ssm): paramType must be one of String, StringList, SecureString"]
 
 
 def test_a_secret_version_carries_no_odin_node_tag():
@@ -1335,8 +1440,26 @@ def test_only_the_load_balancer_carries_the_odin_node_tag():
 def test_alb_outside_a_subnet_lands_in_unsupported():
     proj = generate_tf(Stack(resources=(ResourceDesired(id="stray", kind="alb"),)))
     assert proj.unsupported == [
-        "stray (alb): not contained inside a Subnet on the canvas (drag it into a Subnet box)"
+        "stray (alb): " + hcl._NOT_IN_SUBNET
     ]
+    assert 'resource "aws_lb"' not in proj.files["main.tf"]
+
+
+def test_alb_with_a_subnet_but_no_vpc_is_told_about_the_vpc():
+    """Field test 5. `_alb` gates on subnet AND vpc (its target group needs
+    `vpc_id`) but reported only the subnet, so an alb carrying `subnet` and
+    missing `vpc` was told it was "not contained inside a Subnet (drag it into
+    a Subnet box)" -- a fix it had already applied, for a field that was
+    already correct. Neither the UI (which stamps both) nor a UI-shaped test
+    could hit it; a hand-authored/import-tf/CI canvas hits it every time."""
+    stack = Stack(resources=(
+        ResourceDesired(id="net", kind="vpc"),
+        ResourceDesired(id="web", kind="subnet", fields=_fields(vpc="net")),
+        ResourceDesired(id="front", kind="alb", fields=_fields(subnet="web")),  # no vpc
+    ))
+    proj = generate_tf(stack)
+    assert proj.unsupported == ["front (alb): " + hcl._NOT_IN_VPC]
+    assert "vpc" in proj.unsupported[0] and "Subnet box" not in proj.unsupported[0]
     assert 'resource "aws_lb"' not in proj.files["main.tf"]
 
 
@@ -1469,3 +1592,56 @@ def test_tofu_fmt_accepts_alb_output(tmp_path):
     main_tf.write_text(generate_tf(stack).files["main.tf"])
     result = subprocess.run([tofu, "fmt", "-check", "-diff", str(main_tf)], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+# --- field test 5: every decline message names a REAL canvas field ----------
+# Two of them named UI concepts that are not canvas fields at all -- an SSM
+# node "needs a Value" (the field is `paramValue`) and an NLB should "set Type
+# to 'application'" (the field is `lbType`) -- and four more named a mouse
+# gesture instead of a field. None of them bite a UI user, because dragging a
+# node stamps `vpc`/`subnet` and the inspector labels the fields for you; they
+# hit exactly the hand-authored, `odin import-tf` and CI canvases that read
+# `not_covered`, where the message IS the whole diagnosis.
+
+# message -> the canvas-JSON key its reader has to edit.
+_DECLINE_FIELDS = (
+    (hcl._NOT_IN_VPC, "vpc"),
+    (hcl._NOT_IN_SUBNET, "subnet"),
+    (hcl._SSM_NEEDS_VALUE, "paramValue"),
+    (hcl._BAD_SSM_TYPE, "paramType"),
+    (hcl._ALB_NLB_UNSUPPORTED, "lbType"),
+    (hcl._BAD_ECS_COUNT, "count"),
+    (hcl._BAD_ECS_PORT, "port"),
+    (hcl._BAD_ALB_LISTENER_PORT, "listenerPort"),
+    (hcl._BAD_ALB_TARGET_PORT, "port"),
+    (hcl._BAD_LOGS_RETENTION, "retentionInDays"),
+    (hcl._BAD_RDS_STORAGE, "allocatedStorage"),
+    (hcl._BAD_ROLE_REF, "role"),
+    (hcl._bad_security_group("ghost"), "securityGroups"),
+    (hcl._rds_engine_unsupported("mysql"), "engine"),
+    # The rds identifier IS the node's name, which canvas JSON carries as
+    # `data.label` -- not a `_field`, so it is spelled out here.
+    (hcl._BAD_RDS_IDENTIFIER, "data.label"),
+)
+
+
+def _fields_hcl_reads() -> set[str]:
+    """Every canvas key a builder in hcl.py actually reads. Derived from the
+    source rather than restated, so a renamed field cannot leave a message
+    pointing at a key that no longer exists."""
+    source = Path(hcl.__file__).read_text()
+    return set(re.findall(r'_field\(res, "(\w+)"', source))
+
+
+@pytest.mark.parametrize("message,field", _DECLINE_FIELDS)
+def test_every_decline_message_names_a_field_that_exists_in_canvas_json(message, field):
+    assert field in _fields_hcl_reads() | {"data.label"}, f"{field} is not a canvas field"
+    assert field in message, f"the message never names {field}: {message}"
+
+
+@pytest.mark.parametrize("message", [m for m, _ in _DECLINE_FIELDS])
+def test_no_decline_message_asks_a_cli_user_to_perform_a_ui_gesture(message):
+    """A gesture is not something a canvas file can do, and telling its author
+    to make one sends them looking in the wrong place."""
+    for gesture in ("drag it into", "rename the node", "needs a Value", "set Type to"):
+        assert gesture not in message, f"{gesture!r} in {message!r}"

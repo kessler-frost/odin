@@ -103,6 +103,14 @@ in `--dev` mode only repositions the Vite frontend; the backend always binds
 A second `odin start` while one is already up starts nothing and does not
 adopt a new `--port`/`--host`; stop it first if you want to change them.
 
+Plain `odin start` backgrounds the server but does **not** return until that
+server answers `GET /health`, so `odin start && odin apply` in a script works
+on the first try rather than racing a uvicorn that is still in its lifespan.
+If the server dies on the way up (a port already in use is the usual one) or
+does not answer within two minutes, `start` says which of those happened,
+prints the tail of `.odin/server.log`, and exits `1` — it never reports a
+server it has not heard from.
+
 Once it's up: draw something from the sidebar, click **Apply**, watch the
 Events tab stream the `tofu apply` output and the node badges go `healthy`.
 Open the `{ }` button in the top bar for the generated Terraform.
@@ -317,11 +325,16 @@ question rather than perform an action, and there the code *is* the answer:
 | `odin tf plan` | no changes | `2` changes, `1` error/refusal, `3` server unreachable ([why](#checking-for-drift--and-why-not-to-run-tofu-by-hand)) |
 
 `odin stop` is the deliberate mirror image of `status`: nothing running is
-exit `0`, because "odin is down" is the end state it was asked for. Its one
-non-zero case is a server it can see but cannot signal, where odin is still
-up. `odin start` against an already-running odin is likewise exit `0` — the
-state you asked for holds — but it starts nothing, so a `--port`/`--host`
-you passed is not in effect and it says so.
+exit `0`, because "odin is down" is the end state it was asked for — and it
+does not answer until that end state actually holds. SIGTERM is a request, so
+`stop` then waits (up to 20 seconds) for the server to release the store lock,
+which is the same signal `status` and `import` read. Its non-zero cases are
+both "odin is still up": a server it can see but cannot signal, and one that
+has not finished exiting within that wait. `odin start` against an
+already-running odin is likewise exit `0` — the state you asked for holds —
+but it starts nothing, so a `--port`/`--host` you passed is not in effect and
+it says so. When it *does* launch one, its exit code is that server's: `0`
+once `/health` answers, `1` if the process died first or never answered.
 
 A node odin didn't act on does **not** make Apply exit nonzero, so a CI gate
 has to read the payload. There is one field for it:
@@ -336,6 +349,40 @@ fatal to a pipeline: `skipped` (a node type odin has no model for at all — an
 unbuilt kind, or a typo) and `unsupported` (a resource odin models but can't
 generate Terraform for, with the reason). Both arrays are still published
 separately; gate on `not_covered` and neither can slip past.
+
+`not_covered` answers exactly one question — **"is there a node odin cannot
+build?"** — and nothing else. In particular it is *not* where a broken
+`${{...}}` wiring reference is reported, and it used to be: a typo'd producer
+name (`${{ghost.ENDPOINT}}`) landed in `unsupported`, so `not_covered` failed
+this gate under a coverage label for a node odin covers completely and had just
+applied successfully. A bad reference is a mistake in what you wrote, not a gap
+in what odin covers, and the two need different answers.
+
+A broken reference still fails, on its own terms rather than as a coverage
+problem: the workload it belongs to cannot start without that variable, so it
+comes up `crashed` with the unresolved reference named in its verdict, and the
+apply exits nonzero. So a green `not_covered` means "odin can build everything
+you drew" — it does not mean "everything you drew is correct".
+
+**A node that was ALREADY APPLIED and then becomes uncovered is a different
+story, and Apply refuses it.** Uncovered means "not in this apply", which for
+something that already exists means "deleted": `count: "2"` mistyped as
+`"two"` on a live ECS node, or `type: "s3"` grown a trailing space, would
+otherwise destroy the service or the bucket — and the data in it — while
+reporting `applied`. So an apply that would remove a resource odin can see is
+still on the canvas exits nonzero, names every affected node and what about it
+isn't covered, and changes nothing:
+
+```
+refusing to apply: 1 resource(s) that env 'prod' really has right now are still on
+the canvas but are NOT covered by this apply, so applying would DESTROY them:
+uploads — its type 's3 ' is not a kind odin models (a typo?) …
+```
+
+Deleting a node from the canvas is unaffected — that is how you tear things
+down, and an empty canvas is still a full destroy. Only a node still drawn is
+protected. `?allow_destroying_uncovered=true` on `/apply-full`, `/apply` or
+`/tf/apply` overrides it if you really do mean it.
 
 ### Checking for drift — and why not to run tofu by hand
 

@@ -244,6 +244,32 @@ def skipped_node_types(canvas: dict) -> list[str]:
     return sorted(set(types))
 
 
+# Every node type `_KIND` maps -- i.e. every type that can become a Stack
+# resource at all. Public so an apply guard can say WHY a drawn node produced
+# nothing ("its type is not a kind odin models") without importing `_KIND`.
+MODELLED_NODE_TYPES = frozenset(_KIND)
+
+
+def drawn_node_types(canvas: dict) -> dict[str, str]:
+    """Every name a canvas node claims -> that node's `type` EXACTLY as it is
+    written on the canvas.
+
+    The deliberate difference from `canvas_to_stack`: NOTHING is dropped. A
+    node whose type odin doesn't model (`"s3 "` with a trailing space, field
+    test 5) never becomes a Stack resource -- but it is still a node the user
+    has drawn and is still asking for, and that is precisely the fact an apply
+    needs in order to tell "the user deleted this node, destroy it" apart from
+    "the user typo'd this node's type, do NOT destroy it".
+
+    The type is returned verbatim (never normalised) so the caller can `!r` it:
+    a one-character typo is only visible with the quotes on."""
+    return {
+        name: str(node.get("type") or "")
+        for node in (canvas.get("nodes") or [])
+        if isinstance(node, dict) and (name := _node_id(node))
+    }
+
+
 def canvas_to_stack(canvas: dict, env: str = "default") -> Stack:
     nodes = canvas.get("nodes") or []
     labels = {n["id"]: _node_id(n) for n in nodes if n.get("id")}

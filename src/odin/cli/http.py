@@ -3,9 +3,10 @@
 Every server-backed command funnels through `request()`, so the "server not
 running" experience is uniform: a friendly pointer to `odin start` on stderr
 and exit code 2. API-level refusals (409 busy / superseded / tofu-not-
-installed) funnel through `body_or_fail()`: stderr + exit code 1. Output is
-two-mode everywhere -- `emit()` prints raw JSON to stdout (nothing else) in
-JSON mode, or delegates to the command's own text renderer.
+installed, and anything FastAPI itself refuses) funnel through
+`body_or_fail()`: stderr + exit code 1. Output is two-mode everywhere --
+`emit()` prints raw JSON to stdout (nothing else) in JSON mode, or delegates
+to the command's own text renderer.
 """
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ import sys
 from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
+from typing import Any
 
 import httpx
 import typer
@@ -77,14 +79,93 @@ def request(
         ) from None
 
 
+# How much of an unrecognised body to quote back. Enough to carry a real
+# message, short enough that a 422 echoing the whole canvas back (FastAPI's
+# `input` field) cannot bury it.
+_SNIPPET = 400
+
+
+def _detail_line(item: object) -> str:
+    """One entry of FastAPI's `detail`, as a sentence a person can act on.
+
+    A 422 carries a LIST of per-field errors: `msg` is the message, `loc`
+    names the field it is about (its first element is always the request part
+    -- "body" -- which tells the user nothing), and `input` echoes the whole
+    document back, which is exactly what must not be printed. Pydantic
+    prefixes a validator's own ValueError with "Value error, ", noise in
+    front of a message written for a human. An HTTPException's `detail` is a
+    plain string and passes straight through."""
+    if not isinstance(item, dict):
+        return str(item)
+    location = " -> ".join(str(part) for part in list(item.get("loc") or [])[1:])
+    message = str(item.get("msg", item)).removeprefix("Value error, ")
+    return f"{location}: {message}" if location else message
+
+
+def _refusal(response: httpx.Response, body: object) -> str:
+    """What the server said, for a response no renderer can be handed."""
+    detail = body.get("detail") if isinstance(body, dict) else None
+    detail = json.dumps(body)[:_SNIPPET] if detail is None else detail
+    lines = detail if isinstance(detail, list) else [detail]
+    return (
+        f"odin server refused this request (HTTP {response.status_code}): "
+        + "; ".join(_detail_line(line) for line in lines)
+    )
+
+
+def _renderable(body: object) -> bool:
+    """Whether an ERROR response's body is still one the caller can use.
+
+    Two shapes qualify, and both are odin's own. `error` is the refusal
+    convention every route in `server.py` uses (409 busy, the 403 CSRF
+    rejection, a failed `/destroy`), which `body_or_fail` below turns into
+    the message. `status` is an odin payload proper: `/tf/plan` and
+    `/tf/destroy` answer 500 with the very tofu tail their commands print.
+    A body with neither came from FastAPI, not from a route."""
+    return isinstance(body, dict) and bool(body.get("error") or "status" in body)
+
+
+def parsed_or_fail(response: httpx.Response) -> Any:
+    """The parsed body of a response a caller can actually render.
+
+    Anything else -- a body that is not JSON at all (a 500's bare "Internal
+    Server Error", a proxy's HTML) or an error status carrying FastAPI's own
+    refusal document -- ends here, on stderr, with exit code 1.
+
+    Field test 5: v0.7.4 taught the server to answer a malformed canvas with
+    422 and a genuinely useful message (`node[0] ('s3-1'): data.label must be
+    a string, not a list`), and the CLI showed none of it. This function only
+    looked at `error`, so the validation document sailed through into the
+    renderer, which died on `KeyError: 'status'` after 39 lines of Rich
+    traceback -- and in `-o json` mode printed the 422 to STDOUT as if it were
+    an apply result. `odin apply --file` and `odin translate --file` POST a
+    file directly, bypassing the client-side check `odin canvas set` runs, so
+    every posting command could reach it.
+
+    An error status alone is NOT the test -- see `_renderable`: odin's own
+    refusals and honest-failure payloads ride on 403/409/500 and stay the
+    caller's to render (and to exit non-zero on)."""
+    try:
+        body = response.json()
+    except ValueError:
+        raise fail(
+            f"odin server returned HTTP {response.status_code} with a non-JSON body: "
+            f"{response.text.strip()[:_SNIPPET]}"
+        ) from None
+    if response.is_success or _renderable(body):
+        return body
+    raise fail(_refusal(response, body))
+
+
 def body_or_fail(response: httpx.Response) -> dict:
-    """The parsed body; a truthy `error` (409 busy / superseded /
-    tofu-not-installed / GET /logs's "no such node") goes to stderr with
-    exit code 1 instead. Checked by VALUE, not just key presence: a typed
-    Pydantic response model (GET /logs's `LogsResponse`) always serializes
-    an `error` key, `null` on the success path -- a presence-only check
-    would wrongly treat every one of those as a failure."""
-    body = response.json()
+    """`parsed_or_fail`, plus odin's own refusal convention: a truthy `error`
+    (409 busy / superseded / tofu-not-installed / a failed `/destroy` /
+    GET /logs's "no such node") goes to stderr with exit code 1. Checked by
+    VALUE, not just key presence: a typed Pydantic response model (GET
+    /logs's `LogsResponse`) always serializes an `error` key, `null` on the
+    success path -- a presence-only check would wrongly treat every one of
+    those as a failure."""
+    body = parsed_or_fail(response)
     if not body.get("error"):
         return body
     raise fail(" — ".join(str(part) for part in (body["error"], body.get("fix")) if part))

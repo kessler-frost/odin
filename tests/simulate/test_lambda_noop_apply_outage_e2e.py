@@ -129,6 +129,14 @@ def test_a_noop_apply_cannot_report_success_on_a_function_that_never_came_back(
     # The reality sweep on EVERY tick, so step 3's removed container is noticed
     # in seconds rather than on the production ~10-tick cadence. It is the same
     # sweep either way -- only its period changes.
+    #
+    # LEGITIMATE HERE, and field test 5 is why that needs saying (honesty rule
+    # 1b). What this test measures is an apply whose CONVERGENCE cannot succeed
+    # -- the redeploy dies on an unresolvable `${{ghost.ENDPOINT}}` -- and a
+    # `Failed` record is that scenario's PRECONDITION, not its guard. Shortening
+    # the cadence only reaches the precondition sooner. The residual this file
+    # used to step around (is the apply honest BEFORE any sweep has run?) is
+    # measured at the full default cadence in test_false_green_window_e2e.py.
     monkeypatch.setenv("ODIN_DRIFT_SWEEP_TICKS", "1")
 
     store = SpecStore(store_root)

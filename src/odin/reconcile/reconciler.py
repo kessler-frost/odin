@@ -44,7 +44,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from odin.aws.backings import ENSURE_KINDS, PROVISIONED
+from odin.aws.backings import BackingUnavailable, ENSURE_KINDS, PROVISIONED
 from odin.fabric.localhost import LocalhostFabric
 from odin.gateway.policy import compile_policies
 from odin.gateway.stores import SynthStores
@@ -67,6 +67,42 @@ _VOLATILE_FACTS = ("logtail",)
 
 def _identity_facts(facts: dict) -> dict:
     return {k: v for k, v in facts.items() if k not in _VOLATILE_FACTS}
+
+
+def _assert_string_facts(rid: str, facts: dict) -> None:
+    """WORLD FACT VALUES ARE STRINGS. Not a style rule -- an invariant the
+    change detection in `_emit` depends on, load-bearing since v0.7.4 brought
+    facts INTO that comparison, and invisible until field test 5's audit named
+    it.
+
+    Why it bites. `prior.facts` is not held in memory: `current_world` re-reads
+    and re-parses `.odin/<env>/world.json` on every single `_emit`. So a fact
+    value only compares equal to itself if it survives a JSON round-trip
+    UNCHANGED -- and most containers don't. `facts={"ports": (80, 443)}` is
+    written as `[80, 443]` and read back as a `list`, which never equals the
+    tuple the next tick builds. Every tick then sees a change and emits a
+    delta: one per resource per poll interval, forever. That is exactly the
+    43%-of-all-events flap v0.7.1 already killed once, and it would arrive
+    with a credential in tow -- `DATABASE_URL` embeds the RDS password
+    (SECURITY.md), so each spurious delta writes another cleartext copy into
+    `world.json`, `events.jsonl` and the WebSocket broadcast.
+
+    `str` is the one JSON type with no such gap, and every fact odin publishes
+    today is one -- `cachectl.facts` spells `str(port)` out precisely for this.
+    This guard is what keeps that true as new builders appear. It sits at the
+    EMIT boundary, the single funnel every fact passes through, rather than in
+    each producer -- trusting every future builder is what let the invariant go
+    unwritten in the first place. And it RAISES rather than coercing: a silent
+    `str(v)` would hide the bug, and the loop's own `except` in `_run` turns a
+    raise into a logged traceback naming the resource and the offending key.
+    """
+    bad = sorted(f"{key}={value!r} ({type(value).__name__})"
+                 for key, value in facts.items() if not isinstance(value, str))
+    if bad:
+        raise TypeError(
+            f"{rid}: World fact values must be str (they round-trip through "
+            f"world.json on every emit) — got {', '.join(bad)}"
+        )
 
 
 class Reconciler:
@@ -362,6 +398,13 @@ class Reconciler:
         # `logtail` is excluded because it is diagnostic, not identity: it can
         # differ between reads of the same dead container, and re-emitting for
         # that is the noise this guard exists to stop.
+        #
+        # The comparison below is what makes fact VALUES have to be strings --
+        # `prior` is re-parsed from world.json every time, so anything that
+        # doesn't round-trip through JSON unchanged compares unequal forever.
+        # `_assert_string_facts` states and enforces that, here at the one
+        # boundary every fact crosses.
+        _assert_string_facts(rid, facts or {})
         prior = self._store.current_world(self._env).get(rid)
         if (
             prior is not None
@@ -413,13 +456,27 @@ class Reconciler:
         currently exist (`not ok`): plan's pending/crashed path owns that."""
         ok = await asyncio.to_thread(self._aws.exists, res.kind, res.id)
         if phase == "starting" and ok:
-            facts = await asyncio.to_thread(self._aws.facts, res.kind, res.id)
-            await self._emit(res.id, res.kind, "healthy", facts=facts)
+            try:
+                facts = await asyncio.to_thread(self._aws.facts, res.kind, res.id)
+            except BackingUnavailable as exc:
+                # Honesty rule 1. `facts()` raises rather than inventing an
+                # endpoint when the backing's published port can't be read
+                # (aws/backings.py::_published_port), and a resource whose
+                # endpoint odin cannot NAME is not healthy -- publishing
+                # `healthy` + `http://host.docker.internal:0` was the field
+                # test 5 hazard, and it was permanent because these facts are
+                # written once on this very transition and never refreshed.
+                # Stay `starting`, carry the real reason, retry next tick.
+                # `_emit`'s dedupe makes a persistent failure exactly ONE
+                # delta, not one per tick.
+                await self._emit(res.id, res.kind, "starting", verdict=str(exc))
+            else:
+                await self._emit(res.id, res.kind, "healthy", facts=facts)
         if phase == "healthy" and not ok:
             logtail = await asyncio.to_thread(self._backing_logtail, res.kind)
             await self._emit(
                 res.id, res.kind, "crashed",
-                facts={"logtail": logtail} if logtail else {},
+                facts=self._crash_facts(res.id, logtail),
                 verdict=f"the {res.kind} backing is no longer reachable",
             )
         if res.kind != "sns" or not ok:
@@ -428,6 +485,34 @@ class Reconciler:
         missing = tuple(q for q in self._desired_subs(stack, res.id) if q not in actual)
         if missing:
             await asyncio.to_thread(self._aws.provision, "sns", res.id, missing)
+
+    def _crash_facts(self, rid: str, logtail: str) -> dict:
+        """A crashed resource's facts: the identity it still HAS, plus the
+        diagnostic tail of why it died.
+
+        The crash branch used to replace facts WHOLESALE with
+        `{"logtail": …}`, which destroyed a crashed bucket's `BUCKET` and
+        `endpoint` in World (field test 5's facts audit). That is wrong on its
+        own terms -- a crashed s3 node still IS that bucket; its name did not
+        stop being its name -- and it broke resolution: anything referencing
+        `${{bucket.BUCKET}}` through the Fabric saw the value VANISH the moment
+        the backing hiccuped, and only a full starting->healthy round trip put
+        it back.
+
+        This is NOT the stale-green shape `_cache_clusters`/`_db_instances`
+        gate against, and the line between them is worth stating: those two
+        withhold a REACHABILITY claim (dial this and you get a database) for
+        something that is not up. What survives here is IDENTITY (this node is
+        the bucket named `uploads`), and it ships with `phase="crashed"` plus a
+        verdict saying the backing is gone -- so nothing reads it as green.
+
+        Costs no extra deltas: `logtail` is excluded from change detection
+        (`_VOLATILE_FACTS`) and the identity half is by construction equal to
+        what World already holds, so a resource sitting crashed emits once and
+        then stays silent however many ticks pass over it."""
+        prior = self._store.current_world(self._env).get(rid)
+        identity = _identity_facts(prior.facts) if prior is not None else {}
+        return {**identity, **({"logtail": logtail} if logtail else {})}
 
     def _backing_logtail(self, kind: str) -> str:
         """A short tail off the real backing container for a crash verdict --

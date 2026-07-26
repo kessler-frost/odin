@@ -7,20 +7,34 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
+import httpx
 import typer
 
 from odin.cli import commands as _commands  # noqa: F401  (registers the control-surface commands)
 from odin.cli import doctor as _doctor  # noqa: F401  (registers `odin doctor`)
 from odin.cli.app import app
+from odin.cli.doctor import BUN_INSTALL
 from odin.compute.instances import vm_name
 from odin.gateway.stores import SynthStores
-from odin.util import live_server, odin_version, pid_alive, private_mkdir, run_command
+from odin.util import (
+    COMMAND_NOT_FOUND,
+    SHUTDOWN_GRACE,
+    await_server_exit,
+    live_server,
+    odin_version,
+    pid_alive,
+    private_mkdir,
+    run_command,
+)
 
 ODIN_DIR = Path(".odin")
 PID_FILE = ODIN_DIR / "pid"
 UI_DIR = Path(__file__).resolve().parent.parent.parent / "ui"
+# The prebuilt UI a released odin ships; present = no bun needed, ever.
+BUNDLED_UI = Path(__file__).resolve().parent / "_ui"
 DEFAULT_PORT = 4200
 BACKEND_DEV_PORT = 4201
 DEFAULT_HOST = "127.0.0.1"
@@ -30,6 +44,20 @@ DEFAULT_HOST = "127.0.0.1"
 # laptop" into "anyone on this network can run containers on my laptop", so
 # loopback is the only default; a wider bind is opt-in and loud about it.
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+# How long `odin start` waits for the server it just launched to actually
+# answer, and how often it asks. uvicorn accepts connections only AFTER its
+# lifespan startup returns, and odin's lifespan does real work first: it starts
+# the gateway listener, takes the store lock, reaps orphaned EC2 VMs and
+# resumes a reconciler for every env already in the store. So the wait is
+# proportional to what this store holds, and the ceiling is generous on purpose
+# -- a store with several envs to resume is slow, not broken. Timing it out is
+# reported, never assumed (see `_await_serving`).
+READY_TIMEOUT = 120.0
+_READY_POLL = 0.1
+# Enough of the log to show the error uvicorn died on (a port already in use,
+# an import error) without pasting a whole startup transcript into the terminal.
+_LOG_TAIL_LINES = 12
 
 
 def _print_version(value: bool) -> None:
@@ -95,15 +123,149 @@ def _already_running() -> bool:
     return True
 
 
+def _probe_address(host: str, port: int) -> str:
+    """The address to knock on for a server bound to `host`.
+
+    A wildcard bind (`0.0.0.0`, `::`) accepts on every interface but is not
+    itself a destination, so the probe goes to loopback -- which that server is
+    listening on too. IPv6 literals get bracketed, as a URL requires.
+    """
+    probe = {"0.0.0.0": "127.0.0.1", "::": "::1", "": "127.0.0.1"}.get(host, host)
+    authority = f"[{probe}]" if ":" in probe else probe
+    return f"http://{authority}:{port}"
+
+
+def _serving(address: str) -> bool:
+    """Whether odin is answering at `address` RIGHT NOW -- one real GET
+    /health, so a True here is the same round trip `odin world` is about to
+    make, not an inference from a pid or a lock. Nothing listening yet is an
+    ordinary answer (False) while a server is still starting, never an error."""
+    try:
+        return httpx.get(f"{address}/health", timeout=2.0).status_code == 200
+    except httpx.HTTPError:
+        return False
+
+
+def _await_serving(proc: subprocess.Popen, address: str, timeout: float) -> str | None:
+    """Wait for `proc` to answer at `address`. None once it does; otherwise the
+    reason it did not, in the caller's words.
+
+    `odin stop` learned this in v0.7.4 -- it reported success ~0.9s before the
+    process actually died, which broke the documented `odin stop && odin clean
+    --all` remedy -- and `start` had the identical shape at the other end:
+    `subprocess.Popen` returns as soon as the FORK succeeds, which says nothing
+    about whether uvicorn ever bound the port. Measured on this machine with an
+    empty store, `odin start` returned at 0.2s while /health first answered at
+    0.7s (5.0s on a cold import cache), and `odin start && odin world` failed 3
+    times out of 3 with "Could not reach odin server -- is it running? Try
+    `odin start`", naming the command that had just claimed success.
+
+    So this polls the same signal `await_server_exit` polls for the mirror
+    question, differing only in which one is the real one: liveness is the
+    kernel store lock, but SERVING is not -- lifespan takes that lock before it
+    resumes any reconciler and therefore before uvicorn accepts a single
+    connection (measured: lock at 0.661s, /health at 0.714s in the same run).
+    An HTTP answer is the only evidence that the thing the next command needs
+    is there.
+    """
+    deadline = time.monotonic() + timeout
+    while not _serving(address):
+        if proc.poll() is not None:
+            return f"the server process exited with code {proc.returncode} before it served anything"
+        if time.monotonic() >= deadline:
+            return f"the server did not answer {address}/health within {timeout:.0f}s"
+        time.sleep(_READY_POLL)
+    return None
+
+
+def _report_start_failure(reason: str, proc: subprocess.Popen, log_path: Path) -> typer.Exit:
+    """Say what odin observed, show what the server said, and name the next
+    command -- for both shapes of failure, because they need different ones."""
+    typer.echo(f"Odin did not come up: {reason}.", err=True)
+    tail = log_path.read_text().splitlines()[-_LOG_TAIL_LINES:] if log_path.is_file() else []
+    typer.echo(f"Its output ({log_path}):", err=True)
+    for line in tail or ["(the log is empty)"]:
+        typer.echo(f"  {line}", err=True)
+    still_up = proc.poll() is None
+    if not still_up:  # the pid in the file is a corpse, so it is stale by definition
+        PID_FILE.unlink(missing_ok=True)
+    typer.echo(
+        f"The process is still running (pid {proc.pid}) and may yet come up — "
+        f"`odin status` to check again, `odin stop` to shut it down."
+        if still_up else
+        f"Nothing is running now; fix what {log_path} reports and run `odin start` again.",
+        err=True,
+    )
+    return typer.Exit(1)
+
+
+def _refuse_without_bun(purpose: str, detail: str) -> typer.Exit:
+    """The sentence + exact command a machine without `bun` gets instead of a
+    traceback.
+
+    `odin start` is the first command anyone runs, and from a clone it shells
+    out to `bun` to build the UI. Through v0.7.4 a machine without bun got a
+    40-line rich traceback ending in `FileNotFoundError: [Errno 2] No such file
+    or directory: 'bun'` (`subprocess.run(..., check=True)`) -- the same shape
+    as the v0.7.3 blocker where `odin doctor` died on a missing `docker`. A
+    tool the user simply has not installed yet is an ordinary state of a
+    healthy machine: a FINDING, never a crash.
+
+    The fix string is `doctor.BUN_INSTALL`, imported rather than retyped, so
+    `odin start` and `odin doctor` cannot drift into two spellings of one
+    remedy.
+    """
+    typer.echo(f"Cannot {purpose}: {detail}.", err=True)
+    typer.echo(f"fix: {BUN_INSTALL}", err=True)
+    typer.echo(
+        "     then open a new shell so PATH picks it up. `odin doctor` re-checks it.\n"
+        "     (A released odin ships the UI prebuilt and needs no bun; this is a clone.)",
+        err=True,
+    )
+    return typer.Exit(1)
+
+
+def _require_bun(purpose: str) -> None:
+    """Ask PATH before shelling out. This is an OBSERVATION, not a guess from
+    an exit code -- and it is what separates "you don't have bun" from "your
+    build broke", two failures that need completely different sentences."""
+    if shutil.which("bun") is None:
+        raise _refuse_without_bun(purpose, "`bun` is not installed (nothing named `bun` on PATH)")
+
+
+def _run_in_ui(args: list[str]) -> int:
+    """`args` in `ui/`, returning its exit code -- and 127 rather than an
+    exception if the binary could not be executed at all, the same translation
+    `util.run_command` makes for every other tool odin shells out to. Output is
+    NOT captured: bun's own error is the diagnosis and belongs on the user's
+    terminal, not inside a traceback frame."""
+    try:
+        return subprocess.run(args, cwd=str(UI_DIR)).returncode
+    except OSError:
+        return COMMAND_NOT_FOUND
+
+
 def _build_ui() -> None:
-    if (Path(__file__).resolve().parent / "_ui").exists():
+    """Make sure there is a UI to serve -- or say which of the three things
+    went wrong and how to fix that one."""
+    if BUNDLED_UI.exists():
         return  # UI ships bundled with the installed package
-    dist = UI_DIR / "dist"
-    if not dist.exists():
-        typer.echo("Building UI …")
-        subprocess.run(["bun", "run", "build"], cwd=str(UI_DIR), check=True)
-    else:
+    if (UI_DIR / "dist").exists():
         typer.echo("UI already built (ui/dist exists). Run `bun run build` in ui/ to rebuild.")
+        return
+    _require_bun("build the UI")
+    typer.echo("Building UI …")
+    code = _run_in_ui(["bun", "run", "build"])
+    if code == COMMAND_NOT_FOUND:
+        # PATH said yes and exec said no -- a dangling shim, a wrong-arch
+        # binary. Same remedy, different evidence, and it must say which.
+        raise _refuse_without_bun("build the UI", "`bun` is on PATH but could not be run")
+    if code != 0:
+        typer.echo(f"Cannot build the UI: `bun run build` failed (exit {code}) in {UI_DIR}.",
+                   err=True)
+        typer.echo("fix: read bun's output above; `bun install` in ui/ is the usual missing step.",
+                   err=True)
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -151,8 +313,16 @@ def start(
             stdout=log, stderr=log, start_new_session=True,
         )
         PID_FILE.write_text(str(proc.pid))
+        # Popen returned, which proves a fork -- not a server. Say what has
+        # actually happened so far, then wait for the thing the next command in
+        # `odin start && odin apply` needs.
+        address = _probe_address(host, port)
+        typer.echo(f"Launched uvicorn (pid {proc.pid}); waiting for it to answer {address}/health …")
+        failure = _await_serving(proc, address, READY_TIMEOUT)
+        if failure is not None:
+            raise _report_start_failure(failure, proc, log_path)
         typer.echo(
-            f"Odin started in background (pid {proc.pid}). "
+            f"Odin is up and serving at {address} (pid {proc.pid}). "
             f"Logs: {log_path}. Use `odin stop` to shut down."
         )
 
@@ -161,6 +331,11 @@ def _start_dev(port: int, host: str = DEFAULT_HOST) -> None:
     """Dev mode startup."""
     if _already_running():
         return
+    # The other `bun` in this file: dev mode runs Vite itself rather than a
+    # built bundle, and a raw `Popen(["bun", ...])` tracebacks identically.
+    # Checked BEFORE the pidfile and the backend are created, so a machine
+    # without bun is refused rather than half-started.
+    _require_bun("run dev mode (it serves the UI through Vite)")
 
     typer.echo(f"Starting Odin dev mode on http://{host}:{port}")
     typer.echo(f"  Vite  → :{port}  (HMR)")
@@ -227,7 +402,7 @@ def stop() -> None:
     Nothing running is exit 0 on purpose, unlike `odin status`: `stop` asks
     for an end state rather than a fact, and that end state holds. The one
     non-zero case is the one where it does not -- a server odin can see but
-    cannot signal.
+    cannot signal, or one that has not finished exiting.
     """
     server = live_server(ODIN_DIR)
     if server is None:
@@ -246,6 +421,31 @@ def stop() -> None:
     # running: same SIGTERM uvicorn's own Ctrl-C sends.
     typer.echo(f"Stopping Odin ({server.detail}) …")
     os.kill(server.pid, signal.SIGTERM)
+    # SIGTERM is a REQUEST, and this command's own --help promises an end
+    # state ("exit 0 once odin is down"). Field test 5 measured the gap:
+    # `Stopped.` and rc=0 at 0.17s, the process alive for another 0.91s --
+    # long enough that two of three `odin stop && odin clean --all` runs were
+    # refused by the guard that points users at THIS command, because the
+    # server still held the store lock. So wait for the signal every other
+    # liveness question in odin uses (the kernel lock, plus the pid while the
+    # pidfile is still there), never a sleep. The server's lifespan stops
+    # every reconciler and the gateway thread before releasing the lock, which
+    # is why the wait is generous.
+    remaining = await_server_exit(ODIN_DIR, SHUTDOWN_GRACE)
+    if remaining is not None:
+        # Still up, so say so and exit 1 -- the pidfile stays, because it is
+        # the evidence `odin status` and the next `odin stop` need.
+        typer.echo(
+            f"Odin did NOT exit within {SHUTDOWN_GRACE:.0f}s of SIGTERM ({remaining.detail}). "
+            "It still holds the store, so `odin clean --all` and `odin import` will refuse.",
+            err=True,
+        )
+        typer.echo(
+            f"It may still be shutting down — check {ODIN_DIR / 'server.log'} and re-run "
+            f"`odin stop`, or `kill -9 {remaining.pid}` if it is wedged.",
+            err=True,
+        )
+        raise typer.Exit(1)
     PID_FILE.unlink(missing_ok=True)
     typer.echo("Stopped.")
 

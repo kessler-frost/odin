@@ -31,14 +31,23 @@ PREVIOUS revision keeps serving (ecsctl's `_retire_stale`) is neither
 `healthy` nor `crashed`, so it projects `error` and the verdict says which --
 "N tasks serving the previous revision; deployment of <image> failed: <why>",
 every part of it read from real task/taskdef records. `_ecs_services` also calls ecsctl's own
-`sweep_tasks` once per projection: the ONE deliberate, idempotent mutation
-this otherwise-pure module makes, syncing a service's task records against
+`sweep_tasks` once per projection: one of the TWO deliberate, idempotent
+mutations this otherwise-pure module makes, syncing a service's task records against
 their REAL container status (a task whose container already exited on its
 own gets marked STOPPED with its real exit code + reason) so a crash-loop is
 visible on the very next reconciler tick instead of only after some
 unrelated `Describe*` call happens to run the sweep first. It never creates
 or destroys anything TF-owned -- same non-negotiable as the rest of this
 module.
+
+Field test 5 gave lambda and rds their equivalent, `project()`'s own
+`live_verdicts` overlay -- the two kinds that had none, so `/world` reported a
+removed container `healthy` for the whole ~10-tick drift-sweep cadence. It is
+the same one-bulk-`docker ps` read /apply-full makes, but READ-ONLY: it
+overrides the phase (and withholds the facts) of a resource whose container
+isn't running, and touches no record. Correcting one here would let the next
+apply silently recreate a database nobody had been told was dead -- see
+reconcile/drift.py's "WHY THE PROJECTION MAY NOT WRITE".
 
 Label resolution is uniform across every kind: prefer the `odin:node` tag
 `agent/hcl.py::_tags_block` stamps on every canvas-node-backed resource,
@@ -66,6 +75,7 @@ from odin.gateway.models import cachectl, ecsctl, elbv2ctl, logsctl, rdsctl, ssm
 from odin.gateway.models.ecsctl import sweep_tasks, task_verdict
 from odin.gateway.stores import SynthStores
 from odin.reconcile import mesh_health
+from odin.reconcile.drift import live_verdicts
 from odin.runtime.colima import CONTAINER_HOST
 from odin.runtime.lima import LIMA_HOST
 from odin.simulate.workspace import tf_dir
@@ -114,6 +124,14 @@ _RDS_PHASE = {
 
 # label -> (kind, phase, facts, verdict) -- verdict is populated only for a
 # "crashed" phase, from whatever real reason the underlying model recorded.
+#
+# `facts` is `dict[str, str]`: every VALUE must be a string. That is enforced
+# at the emit boundary (`Reconciler._assert_string_facts`, which carries the
+# argument) because these dicts round-trip through `world.json` on every tick,
+# and a value that doesn't survive that unchanged -- a tuple read back as a
+# list -- compares unequal to itself forever and storms one delta per tick.
+# Anything numeric gets `str()`d by its builder, as `cachectl.facts` does for
+# `port`.
 Projected = dict[str, tuple[str, str, dict, str | None]]
 
 
@@ -496,7 +514,22 @@ def _cache_clusters(stores: SynthStores, env: str) -> Projected:
     """W2.8. Publishes real FACTS the way `_db_instances` does: an `available`
     cluster's `REDIS_URL`/`REDIS_URL_VM` endpoints, so a consumer's
     `${{cache.REDIS_URL}}` ref resolves through the Fabric off World exactly
-    the way rds's `DATABASE_URL` does (`cachectl.facts`)."""
+    the way rds's `DATABASE_URL` does (`cachectl.facts`).
+
+    "The way `_db_instances` does" now includes the GATE, which is the whole
+    point of the pattern and was the one half missing (field test 5's facts
+    audit). This projected in EVERY phase, so a `deleting` cluster kept
+    advertising a live `REDIS_URL` -- precisely the stale-green lie
+    `_db_instances`'s docstring says its gate exists to prevent, and which
+    `_ec2_instances` gates for too. `cachectl.facts`'s own docstring already
+    said "the facts an AVAILABLE cluster publishes"; only the call site
+    disagreed.
+
+    Gated on the record STATUS rather than the derived phase, following rds
+    (they are equivalent today -- `available` is the only status
+    `_CACHE_PHASE` maps to `healthy` -- and the status form fails SAFE if that
+    ever stops being true: a new status publishes nothing until someone
+    decides it should)."""
     out: Projected = {}
     for record in cachectl.clusters(stores, env):
         tags = stores.tags.get(env, f"elasticache:{record['arn']}", {})
@@ -504,8 +537,9 @@ def _cache_clusters(stores: SynthStores, env: str) -> Projected:
         if not label:
             continue
         phase = _CACHE_PHASE.get(record["status"], "starting")
+        facts = cachectl.facts(record) if record["status"] == cachectl.STATUS_AVAILABLE else {}
         verdict = (record.get("status_reason") or None) if phase == "crashed" else None
-        out[label] = ("elasticache", phase, cachectl.facts(record), verdict)
+        out[label] = ("elasticache", phase, facts, verdict)
     return out
 
 
@@ -581,13 +615,29 @@ def _ecs_services(stores: SynthStores, env: str, runtime: TaskRuntime | None = N
     return out
 
 
-def project(stores: SynthStores, env: str, ecs_runtime: TaskRuntime | None = None) -> Projected:
+def project(
+    stores: SynthStores, env: str, ecs_runtime: TaskRuntime | None = None, containers=None,
+) -> Projected:
     """`label -> (kind, phase, facts, verdict)` for every currently-existing
-    TF-owned resource in the env's synth stores -- a pure snapshot of what
-    tofu has created, save for `_ecs_services`'s own task-state sync (see
-    module docstring). `ecs_runtime` is an injectable seam purely for tests;
-    every real caller leaves it default (a real `TaskRuntime()`, matching
-    ecsctl.py's own `runtime or TaskRuntime()` precedent)."""
+    TF-owned resource in the env's synth stores -- a snapshot of what tofu has
+    created, save for the two record syncs below. `ecs_runtime`/`containers` are
+    injectable seams purely for tests; every real caller leaves them default (a
+    real `TaskRuntime()` / `ColimaRuntime()`, matching ecsctl.py's own
+    `runtime or TaskRuntime()` precedent).
+
+    `live_verdicts` LAST, and it is the field-test-5 fix: a lambda or rds whose
+    container is not running right now reads `crashed` with the real reason and
+    NO FACTS, whatever its record says. Without it these two kinds were honest
+    only on the drift sweep's ~10-tick cadence, so `/world` reported a
+    `docker rm -f`'d function `healthy` -- and published a dead database's
+    DATABASE_URL -- for that whole window. One bulk `docker ps` per projection
+    (none at all for an env with no lambda/rds), off the SAME read /apply-full
+    makes, so the projection and an apply cannot disagree about liveness.
+
+    READ-ONLY, unlike `_ecs_services`' task sync: correcting an rds record here
+    would let the very next apply silently delete and recreate a database
+    nothing had reported dead yet (`reconcile/drift.py`'s own note). The
+    projection reports; only an apply writes."""
     out: Projected = {}
     out.update(_vpc_subnet_sg(stores, env))
     out.update(_iam_roles(stores, env))
@@ -601,6 +651,15 @@ def project(stores: SynthStores, env: str, ecs_runtime: TaskRuntime | None = Non
     out.update(_lambda_functions(stores, env))
     out.update(_ecs_services(stores, env, ecs_runtime))
     out.update(_cache_clusters(stores, env))
+    # The live container check, applied over whatever the records claimed. Facts
+    # go with it: a database that isn't running must stop advertising a
+    # DATABASE_URL nothing can connect to -- the stale-green fact `_db_facts`
+    # exists to prevent, which a phase-only override would leave behind.
+    out.update({
+        label: (out[label][0], "crashed", {}, verdict)
+        for label, verdict in live_verdicts(stores, env, containers).items()
+        if label in out
+    })
     return out
 
 

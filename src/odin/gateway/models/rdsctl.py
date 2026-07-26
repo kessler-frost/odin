@@ -818,6 +818,18 @@ def _db_fault(record: dict) -> DatabaseFault | None:
     )
 
 
+def db_faults(stores: SynthStores, env: str) -> list[DatabaseFault]:
+    """Every database this env's records currently call broken -- ONE store
+    read, no waiting and no probe of its own.
+
+    `lambdactl.function_faults`' twin, and public for the same reason:
+    /apply-full asks this again after `reconcile/drift.py::sweep_compute` has
+    corrected the records against the containers' real state, so an apply
+    establishes a dead database NOW instead of waiting for the drift sweep's
+    cadence to write it down first (field test 5)."""
+    return [fault for r in records(stores, env) for fault in [_db_fault(r)] if fault is not None]
+
+
 def wait_for_available_instances(
     stores: SynthStores, env: str,
     converging: Iterable[threading.Thread] = (), timeout: float | None = None,
@@ -833,20 +845,21 @@ def wait_for_available_instances(
     `available_timeout()` regardless.
 
     Pure store reads -- no `docker` call and no probe of its own, deliberately:
-    `_finish_create` already gated `available` on TWO consecutive real
-    `pg_ready` connections, so the record is the honest answer, and re-probing
-    here would only add a second, differently-timed opinion. Whether a
-    once-available container is still alive is `reconcile/drift.py`'s reality
-    sweep (which marks a vanished one `failed` -- exactly what this then
-    reports on the next Apply)."""
+    what this waits for is the CONVERGENCE, and `_finish_create` already gated
+    `available` on TWO consecutive real `pg_ready` connections, so a second,
+    differently-timed opinion here would only fight it. Whether a
+    once-available container is still alive is asked separately and LIVE:
+    /apply-full runs `reconcile/drift.py::sweep_compute` the moment this
+    returns and re-reads `db_faults`, so a killed or paused Postgres fails the
+    apply that finds it rather than the one after the drift sweep's cadence
+    notices (field test 5)."""
     deadline = time.monotonic() + (available_timeout() if timeout is None else timeout)
     for thread in converging:
         thread.join(max(0.0, deadline - time.monotonic()))
     while True:
         current = records(stores, env)
-        faults = [fault for r in current for fault in [_db_fault(r)] if fault is not None]
         if not any(r["status"] == CREATING for r in current) or time.monotonic() >= deadline:
-            return faults
+            return db_faults(stores, env)
         time.sleep(_AVAILABLE_POLL_SECONDS)
 
 

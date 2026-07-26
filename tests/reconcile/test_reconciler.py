@@ -11,6 +11,9 @@ from __future__ import annotations
 import asyncio
 import time
 
+import pytest
+
+from odin.aws.backings import BackingAws, BackingUnavailable
 from odin.gateway.policy import compile_policies
 from odin.gateway.stores import SynthStores
 from odin.compute.tasks import container_name as task_container_name
@@ -18,7 +21,7 @@ from odin.reconcile import tf_status
 from odin.reconcile.drift import DriftSweeper, _sweep_ticks
 from odin.reconcile.reconciler import Reconciler
 from odin.runtime.colima import _STATUS_TO_PHASE, ContainerFacts, HostFacts, RunHandle
-from odin.spec.models import Edge, FieldValue, ResourceDesired, Stack
+from odin.spec.models import Edge, FieldValue, ResourceDesired, Stack, WorldDelta
 from odin.spec.store import SpecStore
 from tests.reconcile.test_drift import FakeContainers, FakeVms
 
@@ -1041,4 +1044,206 @@ async def test_a_changing_logtail_alone_does_not_re_emit(tmp_path):
     emitted = []
     r._store.apply_delta = lambda d: emitted.append(d)
     await r._emit("q", "sqs", "crashed", facts={"logtail": "line one\nline two"}, verdict="gone")
+    assert emitted == []
+
+
+# --- field test 5 facts audit -------------------------------------------------
+
+
+def _unreadable(reason: str = "docker cannot read odin-aws-rustfs-default's published ports: no daemon"):
+    def facts(service, name):
+        raise BackingUnavailable(reason)
+    return facts
+
+
+async def test_a_backing_whose_port_cannot_be_read_is_not_published_healthy(tmp_path):
+    """Fix 1, at the layer that DURABLY records the lie. `BackingAws.facts`
+    raises rather than naming an endpoint it could not read, and a resource
+    whose endpoint odin cannot name is not healthy. Publishing `healthy` +
+    `http://host.docker.internal:0` was permanent corruption: these facts are
+    written once, on this very transition, and never refreshed."""
+    rt, aws, ws = FakeRuntime(), FakeAws(), FakeWS()
+    aws.facts = _unreadable()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(BUCKET,)))
+
+    recon = Reconciler(store, rt, aws=aws, ws=ws, poll_interval=0)
+    await recon.tick()   # provision -> starting
+    await recon.tick()   # exists() is True, but the endpoint is unreadable
+
+    observed = store.current_world().get("uploads")
+    assert observed.phase == "starting", "an unreadable endpoint must not read healthy"
+    assert observed.facts == {}
+    assert "published ports" in observed.verdict   # the real reason, not a shrug
+    assert ":0" not in str(ws.sent)                # nowhere, in any delta
+
+
+async def test_a_persistent_unreadable_port_costs_exactly_one_delta(tmp_path):
+    """The failure path must not become its own delta storm: `_emit`'s dedupe
+    covers the verdict too, so twenty failing ticks are one event."""
+    rt, aws = FakeRuntime(), FakeAws()
+    aws.facts = _unreadable("unreadable")
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(BUCKET,)))
+    recon = Reconciler(store, rt, aws=aws, poll_interval=0)
+    await recon.tick()
+    await recon.tick()
+
+    emitted = []
+    store.apply_delta = lambda d: emitted.append(d)
+    for _ in range(20):
+        await recon.tick()
+    assert emitted == []
+
+
+async def test_the_endpoint_is_published_once_the_port_becomes_readable_again(tmp_path):
+    rt, aws = FakeRuntime(), FakeAws()
+    aws.facts = _unreadable("unreadable")
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(BUCKET,)))
+    recon = Reconciler(store, rt, aws=aws, poll_interval=0)
+    await recon.tick()
+    await recon.tick()
+
+    aws.facts = lambda service, name: {"BUCKET": name, "endpoint": "http://host.docker.internal:51001"}
+    await recon.tick()
+
+    observed = store.current_world().get("uploads")
+    assert observed.phase == "healthy"
+    assert observed.facts["endpoint"] == "http://host.docker.internal:51001"
+    assert observed.verdict is None
+
+
+# --- the fact-value invariant: strings, enforced at the emit boundary ---------
+
+
+async def test_a_non_string_fact_value_is_refused_loudly(tmp_path):
+    """The invariant was real and load-bearing but unwritten and unenforced.
+    `prior.facts` is re-parsed from world.json on every `_emit`, so a value
+    JSON reshapes never compares equal to itself again -- one delta per
+    resource per tick, forever. Coercing silently would hide it; the whole
+    point is that it cannot be introduced quietly."""
+    r = Reconciler(store=SpecStore(tmp_path), runtime=FakeRuntime(), env="e")
+    with pytest.raises(TypeError, match=r"ports=\[80, 443\] \(list\)"):
+        await r._emit("lb", "alb", "healthy", facts={"ports": [80, 443]})
+    for value in ((80, 443), 8080, None, {"a": "b"}, True):
+        with pytest.raises(TypeError, match="must be str"):
+            await r._emit("lb", "alb", "healthy", facts={"x": value})
+    assert r._store.current_world("e").get("lb") is None, "nothing durable was written"
+
+
+async def test_the_guard_names_the_resource_and_every_offending_key(tmp_path):
+    r = Reconciler(store=SpecStore(tmp_path), runtime=FakeRuntime(), env="e")
+    with pytest.raises(TypeError) as raised:
+        await r._emit("db", "rds", "healthy", facts={"PORT": 5432, "HOST": "h", "TAGS": ("a",)})
+    message = str(raised.value)
+    assert message.startswith("db: World fact values must be str")
+    assert "PORT=5432 (int)" in message and "TAGS=('a',) (tuple)" in message
+    assert "HOST" not in message  # the good one isn't blamed
+
+
+async def test_a_tuple_valued_fact_would_have_stormed_one_delta_per_tick(tmp_path):
+    """The measurement behind the guard, run against the real store: JSON turns
+    a tuple into a list, so the round-tripped `prior` never matches what the
+    next tick builds. Written as the demonstration it is -- bypassing `_emit`'s
+    guard to show what it prevents."""
+    r = Reconciler(store=SpecStore(tmp_path), runtime=FakeRuntime(), env="e")
+    r._store.apply_delta(WorldDelta(env="e", resource_id="lb", kind="alb",
+                                    phase="healthy", facts={"ports": ("80", "443")}))
+    prior = r._store.current_world("e").get("lb")
+    assert prior.facts["ports"] == ["80", "443"], "a tuple round-trips as a list"
+    assert prior.facts != {"ports": ("80", "443")}, "…so it never equals itself again"
+    # …and the guard is what stops that shape from ever reaching the store.
+    with pytest.raises(TypeError):
+        await r._emit("lb", "alb", "healthy", facts={"ports": ("80", "443")})
+
+
+# --- a crash must not destroy the resource's identity -------------------------
+
+
+class _PortOnlyRuntime:
+    """Just enough runtime for the REAL `BackingAws.facts` to run, so the
+    identity facts under test are the ones production publishes rather than a
+    hand-written approximation of them."""
+
+    def host_port(self, name, container_port):
+        return 51001
+
+
+def _real_backing_facts(tmp_path, service, name):
+    return BackingAws(_PortOnlyRuntime(), env="default", root=tmp_path).facts(service, name)
+
+
+async def test_a_crashed_resource_keeps_its_identity_and_gains_a_logtail(tmp_path):
+    """Field test 5's facts audit, hazard 4. The crash branch replaced facts
+    WHOLESALE with `{"logtail": …}`, so a crashed bucket's `BUCKET` and
+    `endpoint` were destroyed in World -- and anything resolving
+    `${{uploads.BUCKET}}` saw the value vanish the moment the backing
+    hiccuped, restored only by a full starting->healthy round trip. A crashed
+    resource still IS that bucket."""
+    rt, aws, ws = FakeRuntime(), FakeAws(), FakeWS()
+    rt.set("odin-aws-s3-default", "running", logs="panic: disk full")
+    aws.facts = lambda service, name: _real_backing_facts(tmp_path, service, name)
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(BUCKET,)))
+
+    recon = Reconciler(store, rt, aws=aws, ws=ws, poll_interval=0)
+    await recon.tick()   # provision -> starting
+    await recon.tick()   # -> healthy, with the real identity facts
+    healthy = store.current_world().get("uploads").facts
+    assert healthy["BUCKET"] == "uploads" and healthy["endpoint"].endswith(":51001")
+
+    aws.exists = lambda service, name: False   # the backing lost the resource
+    await recon.tick()   # observe demotes to crashed, then plan re-provisions
+
+    crashed = next(m for m in ws.sent if m.get("resource_id") == "uploads"
+                   and m.get("phase") == "crashed")
+    assert crashed["verdict"] == "the s3 backing is no longer reachable"
+    assert crashed["facts"]["logtail"] == "panic: disk full"    # the diagnosis arrives
+    assert crashed["facts"]["BUCKET"] == healthy["BUCKET"]      # …and identity survives it
+    assert crashed["facts"]["endpoint"] == healthy["endpoint"]
+
+
+async def test_preserving_identity_across_a_crash_costs_no_extra_deltas(tmp_path):
+    """The churn check the fix has to pass. `logtail` is excluded from change
+    detection (`_VOLATILE_FACTS`) and the identity half is by construction
+    equal to what World already holds, so a resource re-read as crashed emits
+    once and then stays silent however many reads follow -- even as the log
+    tail keeps changing under it."""
+    r = Reconciler(store=SpecStore(tmp_path), runtime=FakeRuntime(), env="e")
+    facts = _real_backing_facts(tmp_path, "s3", "uploads")
+    await r._emit("uploads", "s3", "healthy", facts=facts)
+    await r._emit("uploads", "s3", "crashed", verdict="gone",
+                  facts=r._crash_facts("uploads", "panic: disk full"))
+    assert r._store.current_world("e").get("uploads").facts["BUCKET"] == "uploads"
+
+    emitted = []
+    r._store.apply_delta = lambda d: emitted.append(d)
+    for read in range(30):
+        await r._emit("uploads", "s3", "crashed", verdict="gone",
+                      facts=r._crash_facts("uploads", f"panic: disk full\nretry {read}"))
+    assert emitted == [], "30 reads of a settled crash must emit nothing"
+
+
+async def test_many_ticks_over_a_steady_healthy_env_emit_nothing(tmp_path):
+    """The storm re-confirmation for the whole set of fixes: a settled env
+    stays silent. Field test 5 measured a 3-resource apply at exactly the
+    6-event minimum and 90s idle at zero new bytes -- none of these changes
+    may cost that."""
+    rt, aws = FakeRuntime(), FakeAws()
+    aws.facts = lambda service, name: _real_backing_facts(tmp_path, service, name)
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(
+        ResourceDesired(id="uploads", kind="s3"),
+        ResourceDesired(id="jobs", kind="sqs"),
+        ResourceDesired(id="alerts", kind="sns"),
+    )))
+    recon = Reconciler(store, rt, aws=aws, poll_interval=0)
+    await recon.tick()   # 3 x starting
+    await recon.tick()   # 3 x healthy
+
+    emitted = []
+    store.apply_delta = lambda d: emitted.append(d)
+    for _ in range(45):  # 45 ticks ~= 90s at the real 2s poll interval
+        await recon.tick()
     assert emitted == []

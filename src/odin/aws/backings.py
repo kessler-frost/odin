@@ -32,7 +32,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 from odin.fabric.sidecar import MeshSidecar
 from odin.gateway import DEFAULT_GATEWAY_PORT
-from odin.runtime.colima import CONTAINER_HOST, ContainerSpec
+from odin.runtime.colima import CONTAINER_HOST, ContainerSpec, PortUnreadable
 from odin.util import private_mkdir
 
 
@@ -191,6 +191,49 @@ class BackingAws:
         nothing is actually listening on)."""
         return self._gateway_port if d.name == "goaws" else d.port
 
+    def _published_port(self, d: BackingDef) -> int:
+        """This backing's real published host port, or `BackingUnavailable`
+        naming why there isn't one. The ONE place this class turns a port read
+        into a number, so no caller can re-invent the hazard below.
+
+        THE HAZARD (field test 5's facts audit). `host_port` used to answer any
+        failed `docker port` with 0, and 0 is shaped like a port: `facts()`
+        interpolated it into the durable `endpoint` fact
+        (`http://host.docker.internal:0`), `backing_ports()` handed it to the
+        gateway as a routing target, `aws_env()` into a workload's endpoint
+        vars. The `endpoint` fact is the worst of the three because it is
+        published ONLY on the starting->healthy transition and never refreshed,
+        so one transient hiccup corrupted World permanently and silently.
+
+        So there are exactly two answers here now: a port you can dial, or an
+        exception saying why not -- "nothing published on that inside-port" (a
+        goaws whose creator used a different gateway port, or no container at
+        all) and "the runtime could not be asked" (`PortUnreadable`) are both
+        the second, carrying their own real reason. Never 0."""
+        cname, inside = self._cname(d), self._listen_port(d)
+        try:
+            port = self._rt.host_port(cname, inside)
+        except PortUnreadable as exc:
+            raise BackingUnavailable(str(exc)) from exc
+        if not port:
+            raise BackingUnavailable(
+                f"{cname} publishes no port {inside} — "
+                f"gateway_port mismatch between this BackingAws and the container's creator?"
+            )
+        return port
+
+    def _published_port_or_none(self, d: BackingDef) -> int | None:
+        """`_published_port` for the callers that must OMIT rather than raise:
+        the gateway routing table, the workload endpoint vars, and the two
+        internal readiness/self-heal probes. `backing_ports`'s own contract
+        already says a backing that isn't running is simply ABSENT from the
+        table so the gateway 503s instead of forwarding somewhere wrong --
+        absent is the honest answer for an unreadable one too. 0 never was."""
+        try:
+            return self._published_port(d)
+        except BackingUnavailable:
+            return None
+
     def ensure_backing(self, service: str) -> None:
         d = self._backing_for(service)
         cname = self._cname(d)
@@ -200,7 +243,7 @@ class BackingAws:
         # per kind, in parallel) aren't forced sequential by a single
         # per-instance lock.
         with self._ensure_lock:
-            if self._rt.status(cname) != "running" or self._stranded(d, cname):
+            if self._rt.status(cname) != "running" or self._stranded(d):
                 self._create_backing_container(d, cname)
         self._await_ready(cname, service)
         # W2.6: the backing joins the env's Nebula overlay (a real cert + a
@@ -215,7 +258,7 @@ class BackingAws:
         # which IS VPC-resident, gets its drawn SG (aws/rds.py).
         self._mesh.ensure(cname, cname)
 
-    def _stranded(self, d: BackingDef, cname: str) -> bool:
+    def _stranded(self, d: BackingDef) -> bool:
         """A container that's RUNNING but no longer publishes the inside-port
         this instance needs (W2.2). goaws is the real case: its listener port
         IS the gateway port (`_listen_port`), and that's baked into the
@@ -230,9 +273,15 @@ class BackingAws:
         Deliberately generic rather than `if d.name == "goaws"`: "the port I
         need isn't published" is wrong for any backing, whatever stranded it,
         and it's the exact condition `client()` already fails loud on. Costs
-        one `docker port` per ensure_backing (an Apply/provision path, not the
-        every-tick one — `backing_ports` has its own cache)."""
-        return self._rt.host_port(cname, self._listen_port(d)) == 0
+        one port read per ensure_backing (an Apply/provision path, not the
+        every-tick one — `backing_ports` has its own cache).
+
+        An UNREADABLE port counts as stranded too (`_published_port_or_none`),
+        which is the safe direction: recreating a container we can't get a port
+        for is recoverable, adopting one we can't reach is the stall this
+        method exists to break. It only ever runs on a container `ensure_backing`
+        has just seen `running`, under the same lock."""
+        return self._published_port_or_none(d) is None
 
     def _create_backing_container(self, d: BackingDef, cname: str) -> None:
         self._rt.stop(cname)  # clear any exited remnant (same contract as PostgresRds)
@@ -313,7 +362,7 @@ class BackingAws:
         d = self._backing_for("ecr")
         deadline = time.monotonic() + READY_TIMEOUT
         while time.monotonic() < deadline:
-            port = self._rt.host_port(cname, self._listen_port(d))
+            port = self._published_port_or_none(d)
             try:
                 if port:
                     httpx.get(f"http://127.0.0.1:{port}/v2/", timeout=2.0).raise_for_status()
@@ -324,20 +373,13 @@ class BackingAws:
         raise RuntimeError(f"{cname} never became ready:\n{self._rt.logs(cname)}")
 
     def client(self, service: str):
-        """Host-side client against the backing's published port (tests/e2e)."""
+        """Host-side client against the backing's published port (tests/e2e).
+
+        Fails loud (`BackingUnavailable`, typed so best-effort paths like
+        `deprovision` can swallow it) rather than dialing a made-up port --
+        `_published_port` owns that judgement and the reason text."""
         d = self._backing_for(service)
-        port = self._rt.host_port(self._cname(d), self._listen_port(d))
-        if not port:
-            # Fail loud: a 0 here means the container publishes a DIFFERENT
-            # inside-port than this instance expects (for goaws: a
-            # gateway_port mismatch with the container's creator — construct
-            # with the app's /health gateway.port) or no container at all.
-            # Typed so best-effort paths (deprovision) can swallow it.
-            raise BackingUnavailable(
-                f"{self._cname(d)} publishes no port {self._listen_port(d)} — "
-                f"gateway_port mismatch between this BackingAws and the container's creator?"
-            )
-        endpoint = f"http://127.0.0.1:{port}"
+        endpoint = f"http://127.0.0.1:{self._published_port(d)}"
         if self._client_factory:
             return self._client_factory(service, endpoint)
         config = Config(signature_version="s3v4", s3={"addressing_style": "path"}) \
@@ -422,8 +464,19 @@ class BackingAws:
             pass  # best-effort: the resource or its whole backing may already be gone
 
     def facts(self, service: str, name: str) -> dict:
+        """This resource's World facts. Every value is a `str` -- see
+        `Reconciler._assert_string_facts` for why that is load-bearing rather
+        than stylistic (a fact that doesn't survive a JSON round-trip unchanged
+        is a permanent delta storm).
+
+        Raises `BackingUnavailable` when the backing's published port can't be
+        read, instead of naming an endpoint it does not know. These facts are
+        published exactly ONCE, on the starting->healthy transition, and never
+        refreshed -- so a wrong one here is wrong in `world.json` forever. The
+        reconciler's caller keeps the resource `starting` and carries the
+        reason (reconcile/reconciler.py::_observe_provisioned)."""
         d = self._backing_for(service)
-        endpoint = f"http://{CONTAINER_HOST}:{self._rt.host_port(self._cname(d), self._listen_port(d))}"
+        endpoint = f"http://{CONTAINER_HOST}:{self._published_port(d)}"
         # QUEUE_URL is constructed canonically, pointed at the gateway (not
         # goaws's own direct port) to match the Host/Port baked into
         # goaws.yaml -- the fact and what goaws itself now returns agree.
@@ -436,13 +489,17 @@ class BackingAws:
         }[service]
 
     def aws_env(self) -> dict[str, str]:
+        """The creds + per-service endpoint vars a consumer needs. A backing
+        whose port can't be read contributes NO endpoint var (rather than one
+        pointing at `:0`): an absent override is a visible failure at the first
+        call, a bogus one is a connection refused blamed on the service."""
         env = {"AWS_ACCESS_KEY_ID": ACCESS_KEY, "AWS_SECRET_ACCESS_KEY": SECRET_KEY,
                "AWS_DEFAULT_REGION": REGION}
         running = (d for d in BACKINGS if self._rt.status(self._cname(d)) == "running")
         for d in running:
-            endpoint = f"http://{CONTAINER_HOST}:{self._rt.host_port(self._cname(d), self._listen_port(d))}"
-            for kind in d.kinds:  # goaws yields both _SQS and _SNS from one container
-                env[f"AWS_ENDPOINT_URL_{kind.upper()}"] = endpoint
+            port = self._published_port_or_none(d)
+            for kind in d.kinds if port else ():  # goaws yields both _SQS and _SNS from one container
+                env[f"AWS_ENDPOINT_URL_{kind.upper()}"] = f"http://{CONTAINER_HOST}:{port}"
         return env
 
     def backing_ports(self) -> dict[str, int]:
@@ -450,7 +507,9 @@ class BackingAws:
         GatewayState.update forwards proxied requests against. A backing
         that isn't running (or never started) is simply absent -- the
         gateway then answers with service-unavailable rather than a stale
-        port (PRD: no cache that outlives an Apply). Answers from a
+        port (PRD: no cache that outlives an Apply). A backing whose port
+        cannot be READ is absent by that same rule and for the same reason:
+        service-unavailable is true, a route to port 0 is not. Answers from a
         PORTS_CACHE_TTL cache (invalidated on any real start/stop this
         instance performs); callers treat the dict as read-only."""
         if self._ports_cache is not None and time.monotonic() - self._ports_cache_at < PORTS_CACHE_TTL:
@@ -458,8 +517,8 @@ class BackingAws:
         ports: dict[str, int] = {}
         running = (d for d in BACKINGS if self._rt.status(self._cname(d)) == "running")
         for d in running:
-            port = self._rt.host_port(self._cname(d), self._listen_port(d))
-            for kind in d.kinds:
+            port = self._published_port_or_none(d)
+            for kind in d.kinds if port else ():
                 ports[kind] = port
         self._ports_cache = ports
         self._ports_cache_at = time.monotonic()

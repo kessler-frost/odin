@@ -100,6 +100,12 @@ class TranslateResult(BaseModel):
     files: dict[str, str] = {}
     notes: list[str] = []
     unsupported: list[str] = []
+    # Carried from the skeleton on EVERY return path below, exactly like
+    # `unsupported`: a broken canvas wiring ref is a property of the Stack, not
+    # of whether the optional agent pass ran. Kept separate from `unsupported`
+    # because it means something different -- see `hcl.TfProject.wiring_errors`
+    # (field test 5: a wiring typo must not be reported as a coverage gap).
+    wiring_errors: list[str] = []
     refined: bool = False
     # V4c/release finding #1: a lambda node's zip'd deployment package. The
     # agent never sees it (only main.tf is in its prompt) and can't refine
@@ -270,6 +276,7 @@ def _fallback_result(skeleton: TfProject, notes: list[str]) -> TranslateResult:
     return all share this shape."""
     return TranslateResult(
         files=skeleton.files, unsupported=skeleton.unsupported,
+        wiring_errors=skeleton.wiring_errors,
         binary_files=skeleton.binary_files, notes=notes,
     )
 
@@ -292,7 +299,7 @@ async def _refine_once(skeleton: TfProject, stack: Stack, client_cls: type, time
         return _fallback_result(skeleton, [*notes, f"refinement rejected ({violation}) -- using the deterministic skeleton"])
     return TranslateResult(
         files=formatted, unsupported=skeleton.unsupported, binary_files=skeleton.binary_files,
-        notes=notes, refined=True,
+        wiring_errors=skeleton.wiring_errors, notes=notes, refined=True,
     )
 
 
