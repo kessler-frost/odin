@@ -6,11 +6,19 @@ stores. That makes the canvas honest about what tofu created, but not about
 what's still THERE: `limactl delete odin-ec2-...` a VM or `docker rm -f` an
 ECS task container out of band and the record still reads `running`, so
 /world reported `healthy` forever (the only reality cross-check was the
-startup-only EC2 reaper). This module closes that: one bulk `limactl list`
-+ one bulk `docker ps` per sweep -- TWO subprocess calls TOTAL regardless of
-how many resources exist, on a cadence (default every 10 reconciler ticks,
-~10s at the production 1s poll; `ODIN_DRIFT_SWEEP_TICKS` overrides), with
-every other tick answering from the last sweep's cached result.
+startup-only EC2 reaper). This module closes that with BULK calls -- one
+`limactl list`, one or two `docker ps` -- plus, for the two kinds whose exact
+STATE matters (`_live_states`), one `inspect` per resource that still exists.
+Never a listing per resource, and nothing at all for a kind this env has none of.
+
+TWO HALVES, and the split is the point (field test 5). `live_verdicts` /
+`sweep_compute` are LIVE: no cadence, no cache, called by anything that has to
+be sure right now (`tf_status.project()` and /apply-full). `DriftSweeper` is the
+background half: the same reality check on a cadence (default every 10
+reconciler ticks, ~10s at the production 1s poll; `ODIN_DRIFT_SWEEP_TICKS`
+overrides) with every other tick answering from the last sweep's cached result,
+plus the two checks only it can afford -- `limactl list` for ec2 and a real
+`pg_ready` per database.
 
 REPORT, DON'T AUTO-HEAL (the wave-2 plan is explicit): tofu owns these
 kinds, so re-creating a VM behind its back would fight its state. A drifted
@@ -64,28 +72,25 @@ them). `ecr` is out too: an ECR *repository* is a control-plane record
 is a per-env BACKING, already supervised by `aws/backings.py`'s own ensure/gc
 lifecycle -- not this projection's business.
 
-RDS IS CHECKED BY ITS HEALTH PROBE, NOT BY A LISTING -- the one deliberate
-departure from the bulk-listing shape, and it's what preserves the pre-W2.7
-crash/recover behavior exactly (the reconciler used to run `pg_ready` against
-every rds node on EVERY tick; running it on the sweep cadence is strictly
-cheaper). Two reasons a listing can't do this job:
-  - `ColimaRuntime.container_names` lists exited containers too, so a
-    `docker kill`ed Postgres -- the canonical way a database dies -- would look
-    perfectly present in it.
-  - A container that's up while Postgres inside it is wedged is ALSO down as
-    far as any consumer of the DATABASE_URL fact is concerned, and only a real
-    connection can tell.
-So each `available` instance gets one `pg_ready_sync` against its stored port
-(no subprocess at all), and only when that FAILS does the sweep spend a single
-`status` call to find out which failure it is:
-  - container gone/exited -> a real crash: the record is corrected to `failed`
-    (with the container's real exit code) and the next Apply's converge
-    genuinely brings it back.
-  - container still running -> reported as a verdict but the RECORD IS LEFT
-    ALONE, so a transient probe failure self-heals on the next sweep instead of
-    needing a human Apply. (This mirrors the old reconciler exactly: it only
-    cleared and recreated the container on a real exit, and otherwise just
-    surfaced the connection error.)
+RDS IS CHECKED TWICE, BY TWO DIFFERENT THINGS, because no single check covers
+it. `ColimaRuntime.container_names` lists exited containers too, so a
+`docker kill`ed Postgres -- the canonical way a database dies -- looks
+perfectly present in a NAME listing; and a container that is up while Postgres
+inside it is wedged is ALSO down as far as any consumer of the DATABASE_URL
+fact is concerned, which only a real connection can tell. So:
+  - `sweep_compute` (the LIVE half below) reads the container's real STATE via
+    `_live_states`: gone, `exited`, `paused`, `dead` -- each of them a database
+    that is not serving -- and corrects the record to `failed` so the next
+    Apply's converge genuinely brings it back. Field test 5 is why this is
+    state-based and cadence-free rather than a name listing on a timer.
+  - then each still-`available` instance gets one `pg_ready_sync` against its
+    stored port (no subprocess at all), which catches the one thing docker's
+    own state cannot: a running container whose Postgres has stopped
+    answering. That is reported as a verdict but the RECORD IS LEFT ALONE, so a
+    transient probe failure self-heals on the next sweep instead of needing a
+    human Apply. (This mirrors the old reconciler exactly: it only cleared and
+    recreated the container on a real exit, and otherwise just surfaced the
+    connection error.)
 
 MID-BOOT IS NOT DRIFT (the sharpest edge here): a record is only swept when
 it CLAIMS to be up -- ec2 `running`, lambda `Active` and not mid-redeploy,
@@ -112,6 +117,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from typing import NamedTuple
 
 from odin.aws.rds import container_name as db_container_name
 from odin.compute.functions import container_name as function_container_name
@@ -224,17 +230,213 @@ def _db_records(stores: SynthStores, env: str) -> list[tuple[str, dict]]:
     return out
 
 
-def _listing(read) -> frozenset[str] | None:
+def _listing(read):
     """One bulk listing, or None when the CLI call itself failed. LOAD-
     BEARING: an empty listing and a failed listing are NOT the same thing --
     reading "docker isn't answering" as "every container is gone" would flip
     a whole env to `crashed` over a transient hiccup. None means "unknown",
     and an unknown sweep reports no drift at all."""
     try:
-        return frozenset(read())
+        return read()
     except Exception as exc:  # noqa: BLE001 -- any CLI/parse failure means "unknown"
         log.warning("drift sweep listing failed (%s); reporting no drift this pass", exc)
         return None
+
+
+# --- THE LIVE HALF: no cadence, no cache, one bulk listing -----------------
+#
+# Field test 5, and the reason this module has two halves at all. `DriftSweeper`
+# runs on a CADENCE and is CACHED between sweeps, which is right for a
+# background loop and wrong for anything that has to be sure right now: measured
+# at the default cadence, four consecutive `applied`/exit-0 applies landed over
+# ~8s with the function's container already removed, and `/world` read green for
+# the same window, because both the apply's own verification and the projection
+# read a RECORD this loop only refreshes every ~10 ticks. A guard that depends
+# on a signal produced on a cadence inherits the cadence (.claude/CLAUDE.md
+# honesty rule 1b).
+#
+# `_dead` is that same reality check with the cadence taken out: one bulk
+# listing for EXISTENCE plus one `inspect` per container that exists, no cache,
+# no waiting on anyone else's loop, and nothing at all for an env with no
+# lambda/rds records. TWO CALLERS SHARE THAT ONE READ, and only one of them
+# writes:
+#
+#   * `reconcile/tf_status.py::project()` calls `live_verdicts`, which is
+#     READ-ONLY: `/world` goes honest on the very next tick (~1s) without
+#     touching a single record.
+#   * `server.py`'s /apply-full calls `sweep_compute` -- the same read plus the
+#     record correction -- so an apply establishes liveness ITSELF instead of
+#     believing a stored status, and the correction it writes is what makes the
+#     NEXT apply's `converge_*` actually recreate the resource.
+#
+# WHY THE PROJECTION MAY NOT WRITE, though writing would be convenient:
+# `converge_db_instances` recreates a `failed` database, and recreating a
+# database DESTROYS ITS DATA. If a background tick corrected the record, the
+# very next apply -- an unrelated canvas edit, seconds after something killed
+# the container -- would silently delete and re-create that database and report
+# `applied`, exit 0. So the rule is: NOTHING IS RECREATED UNTIL AN APPLY HAS
+# REPORTED IT DEAD. The apply that finds it says so and stops; the apply after
+# that recovers it (`converge_*`, the "re-Apply to recreate" the verdict
+# promises). A read-only projection is what makes that deterministic instead of
+# a race against the tick.
+#
+# WHY A BULK LISTING IS SAFE TO CORRECT FROM, even mid-apply while the daemon is
+# pinned (the hazard `_sweep_databases`' confirm-before-correcting note names):
+# `docker ps -a` either answers authoritatively or fails, and a failure is read
+# as "unknown" above and corrects nothing. That is categorically different from
+# `docker inspect <name>`, whose empty answer cannot distinguish "no such
+# container" from "docker didn't answer" -- which is why the probe half below
+# still needs its confirm delay and this half does not.
+
+
+# The states that mean "this container exists and is not serving". `paused` is
+# the one field test 5 turned up and the reason this reads a STATE at all: a
+# paused container is present, is listed by a plain `docker ps`, and answers
+# nothing. `created`/`restarting` are deliberately NOT here -- they are a
+# container on its way up, and "still starting" must never fail an apply.
+_NOT_SERVING = frozenset({"exited", "dead", "removing", "paused"})
+
+
+def _not_serving(state: str | None) -> bool:
+    """`None` -- the bulk listing did not return this container at all -- is the
+    honest "it is GONE", and the listing is authoritative about that.
+
+    Everything else has to be IN `_NOT_SERVING` to count. In particular
+    `status`'s own `absent` does not: that is what it answers when `inspect`
+    printed nothing, which it cannot distinguish from "docker didn't answer"
+    (its own docstring), and for a name the listing JUST returned that is an
+    ambiguity, not a death -- skipped, never corrected. `_listing`'s "unknown is
+    not gone" rule, one level down."""
+    return state is None or state in _NOT_SERVING
+
+
+def _live_states(runtime, names: list[str]) -> dict[str, str] | None:
+    """`name -> the container's real state` for the containers asked about, or
+    None when the runtime itself did not answer.
+
+    TWO SEAMS, BOTH PROVEN ON BOTH RUNTIMES -- and that is why it is shaped like
+    this rather than as one `docker ps --format '{{.Names}}\\t{{.State}}'`. That
+    single call works on docker and FAILS OUTRIGHT on nerdctl (probed on a real
+    Lima VM: nerdctl's ps ListItem has no `.State` field at all -- `can't
+    evaluate field State`, rc 1), and `LimaRuntime` inherits every method here.
+    With `check=True` that raises, `_listing` reads it as "unknown", and this
+    whole guard would have silently never fired on Lima -- the exact failure
+    shape it exists to remove (honesty rule 1). nerdctl's `.Status` is not a
+    drop-in either: it says a bare `Paused` where docker says
+    `Up 2 seconds (Paused)`. So:
+
+      * `container_names()` -- one bulk `ps -a --format '{{.Names}}'`, identical
+        on both, and the AUTHORITY on existence: a name it does not return was
+        really removed. It raises on a CLI failure, so a hiccup is "unknown"
+        rather than "everything is gone".
+      * `status()` -- `inspect -f '{{.State.Status}}'`, verified to answer the
+        same `running`/`paused`/`exited` vocabulary on docker AND nerdctl, and
+        asked ONLY for containers the listing just proved exist (so a healthy
+        env pays one listing plus one inspect per lambda/rds node, and a
+        removed container costs no inspect at all)."""
+    present = _listing(lambda: frozenset(runtime.container_names()))
+    if present is None:
+        return None
+    return {name: runtime.status(name) for name in names if name in present}
+
+
+def _dead_verdict(containers, name: str, state: str | None) -> str:
+    """WHY this container isn't serving, in the SAME sentences the cadence half
+    has always used -- one down container, one vocabulary, whichever surface an
+    operator is looking at. `state is None` is the container that no longer
+    exists at all (never an invented exit code for it, `_sweep_databases`' own
+    rule); `exited` is worth the one extra `inspect` its real exit code costs,
+    because 137 vs 1 is the whole diagnosis; anything else names docker's own
+    state (`paused` is the case that defeats every record-trusting check).
+
+    An exit code the runtime would not give up (`exit_code`'s negative sentinel
+    -- a `docker inspect` that answered nothing, or a runtime whose inspect
+    template differs) is reported as no number at all rather than as "exit -1":
+    field test 2 LOW-17's rule, that odin never invents a code nothing
+    reported."""
+    code = containers.exit_code(name) if state == "exited" else -1
+    detail = (
+        "removed outside odin" if state is None
+        else f"is not running (exit {code})" if code >= 0
+        else "is not running" if state == "exited"
+        else f"is {state}"
+    )
+    return f"container {name} {detail} — re-Apply to recreate"
+
+
+class Dead(NamedTuple):
+    """One lambda/rds whose record claims it is up while its container is not
+    running: the canvas LABEL (what /world and an apply both name it by), the
+    identity its own model corrects by (function name / DB identifier), which
+    kind it is, and WHY -- the verdict, already worded."""
+
+    label: str
+    identity: str
+    kind: str
+    verdict: str
+
+
+def _dead(stores: SynthStores, env: str, containers=None) -> list[Dead]:
+    """THE read, shared by both halves so they cannot disagree: `_live_states`
+    against every record that CLAIMS to be up.
+
+    Every transitional state is exempt for the reason the module docstring
+    gives: a function mid-redeploy (`InProgress`) and a database mid-boot
+    (`creating`) genuinely have no container for a moment, and a resource that
+    is merely still starting must never be called dead. `created`/`restarting`
+    are exempt for the same reason (`_NOT_SERVING` lists only the states that
+    mean a container really has stopped serving), and so is a container the
+    listing found but `inspect` then declined to describe -- ambiguity, not
+    death.
+
+    Costs nothing at all for an env with no lambda/rds record, and one bulk
+    listing plus one `inspect` per such record otherwise."""
+    functions = _function_records(stores, env)
+    databases = _db_records(stores, env)
+    if not functions and not databases:
+        return []
+    # (label, identity, kind, the container that has to be running for it)
+    claimed = [(label, function_name, "lambda", name) for label, function_name, name in functions]
+    claimed += [
+        (label, record["db_instance_identifier"], "rds",
+         db_container_name(env, record["db_instance_identifier"]))
+        for label, record in databases
+    ]
+    runtime = containers or ColimaRuntime()
+    states = _live_states(runtime, [container for *_rest, container in claimed])
+    if states is None:  # the runtime didn't answer: unknown is not "gone"
+        return []
+    return [
+        Dead(label, identity, kind, _dead_verdict(runtime, container, states.get(container)))
+        for label, identity, kind, container in claimed
+        if _not_serving(states.get(container))
+    ]
+
+
+def live_verdicts(stores: SynthStores, env: str, containers=None) -> dict[str, str]:
+    """`label -> verdict` for every lambda/rds whose container is not running
+    RIGHT NOW. READ-ONLY: not one record is touched (the module docstring says
+    why the projection must not write). `tf_status.project()`'s caller."""
+    return {entry.label: entry.verdict for entry in _dead(stores, env, containers)}
+
+
+# label -> the model call that writes this kind's failure into its own record.
+_CORRECT = {"lambda": mark_function_failed, "rds": rdsctl.mark_instance_failed}
+
+
+def sweep_compute(stores: SynthStores, env: str, containers=None) -> dict[str, str]:
+    """`live_verdicts` PLUS the record correction -- the same verdict written
+    into the record it just proved wrong, which is what makes "re-Apply to
+    recreate" true (`converge_functions`/`converge_db_instances` only ever act
+    on a `Failed`/`failed` record).
+
+    /apply-full and `DriftSweeper` are its only callers, and they are exactly
+    the two places allowed to write: an apply REPORTING the death is what has to
+    happen before anything recreates the resource."""
+    dead = _dead(stores, env, containers)
+    for entry in dead:
+        _CORRECT[entry.kind](stores, env, entry.identity, entry.verdict)
+    return {entry.label: entry.verdict for entry in dead}
 
 
 class DriftSweeper:
@@ -296,14 +498,17 @@ class DriftSweeper:
 
     def _sweep(self, stores: SynthStores, env: str) -> dict[str, str]:
         vms = _vm_records(stores, env)
-        functions = _function_records(stores, env)
         tasks = _task_records(stores, env)
+        # The lambda + rds container check is the LIVE half above, called here
+        # rather than reimplemented: one function, one set of sentences, one
+        # correction -- so the cadence sweep, the projection and an apply can
+        # never disagree about whether a container is up (field test 5).
+        out: dict[str, str] = dict(sweep_compute(stores, env, self._containers))
         # At most ONE listing per substrate, and none at all when this env has
         # nothing of that shape to check (the common case: a canvas with no
         # ec2 node never shells out to limactl).
-        live_vms = _listing(lambda: self._vms.list_names(check=True)) if vms else None
-        live_containers = _listing(self._containers.container_names) if functions or tasks else None
-        out: dict[str, str] = {}
+        live_vms = _listing(lambda: frozenset(self._vms.list_names(check=True))) if vms else None
+        live_containers = _listing(self._containers.container_names) if tasks else None
         for label, instance_id, name in vms:
             if live_vms is not None and name not in live_vms:
                 out[label] = f"VM {name} deleted outside odin — re-Apply to recreate"
@@ -311,13 +516,6 @@ class DriftSweeper:
                 # refresh learns the instance is gone and re-Apply really does
                 # recreate it (see the module docstring).
                 mark_instance_terminated(stores, env, instance_id, out[label])
-        for label, function_name, name in functions:
-            if live_containers is not None and name not in live_containers:
-                out[label] = f"container {name} removed outside odin — re-Apply to recreate"
-                # Same sentence into the RECORD: a function whose sandbox is
-                # gone is `Failed`, and an Apply's `converge_functions` is what
-                # actually brings it back (see the module docstring).
-                mark_function_failed(stores, env, function_name, out[label])
         for cluster, task_id, name in tasks:
             if live_containers is not None and name not in live_containers:
                 mark_task_stopped(
@@ -334,9 +532,16 @@ class DriftSweeper:
         )
 
     def _sweep_databases(self, stores: SynthStores, env: str, out: dict[str, str]) -> None:
-        """rds's half: one real `pg_ready` per available instance, and a
-        `status` call only when that fails (see the module docstring for why a
-        listing can't answer this)."""
+        """rds's REMAINING half: one real `pg_ready` per available instance, and
+        a `status` call only when that fails.
+
+        `sweep_compute` has already run, so every record still `available` here
+        has a container docker itself calls `running` -- which leaves exactly
+        the one failure a listing genuinely cannot see: the container is up and
+        Postgres inside it is wedged. That case is still REPORTED and never
+        written into the record (a transient probe failure must self-heal
+        rather than need a human Apply), so it remains a verdict on this
+        cadence, not an apply-failing fault -- see ROADMAP's limits."""
         for label, record in _db_records(stores, env):
             if self._probe_db(record).ok:
                 continue

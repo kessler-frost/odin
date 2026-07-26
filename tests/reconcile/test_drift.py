@@ -13,7 +13,7 @@ from odin.compute.tasks import container_name as task_container_name
 from odin.gateway.models import rdsctl
 from odin.gateway.stores import SynthStores
 from odin.reconcile.assertions import PgReady
-from odin.reconcile.drift import DriftSweeper
+from odin.reconcile.drift import DriftSweeper, sweep_compute
 from odin.reconcile.tf_status import project
 
 ENV = "default"
@@ -37,18 +37,25 @@ class FakeVms:
 
 
 class FakeContainers:
-    """`_ContainerRuntime.container_names()`'s shape, plus the per-name
-    `status`/`exit_code` calls the rds half makes ONLY on a failed health probe
-    (W2.7) -- `running` names them, `exited` maps to a real exit code, anything
-    absent reads `absent`."""
+    """The two runtime seams the sweeps use -- `container_names()` (one bulk
+    `ps -a`) and the per-name `status()`/`exit_code()` (`inspect`) -- both of
+    which answer identically on docker and on nerdctl-in-Lima, which is why
+    `reconcile/drift.py::_live_states` is built from these two and not from a
+    single `ps --format '{{.State}}'` (that one does not exist on nerdctl).
+
+    One source of names: `names` are the containers that are RUNNING, `exited`
+    maps a name to its real exit code, `paused` are present-but-frozen, and
+    anything in none of them is GONE. `calls` counts listings and `status_calls`
+    counts inspects, so the boundedness test can pin both."""
 
     def __init__(
         self, names: list[str] | None = None, error: Exception | None = None,
-        exited: dict[str, int] | None = None,
+        exited: dict[str, int] | None = None, paused: list[str] | None = None,
     ) -> None:
         self.names = names if names is not None else []
         self.error = error
         self.exited = exited or {}
+        self.paused = paused or []
         self.calls = 0
         self.status_calls: list[str] = []
 
@@ -56,12 +63,14 @@ class FakeContainers:
         self.calls += 1
         if self.error is not None:
             raise self.error
-        return list(self.names)
+        return [*self.names, *self.exited, *self.paused]
 
     def status(self, name: str) -> str:
         self.status_calls.append(name)
         if name in self.names:
             return "running"
+        if name in self.paused:
+            return "paused"
         return "exited" if name in self.exited else "absent"
 
     def exit_code(self, name: str) -> int:
@@ -306,7 +315,7 @@ def test_provisioning_task_is_exempt(tmp_path):
     assert containers.calls == 0
 
 
-# --- boundedness: two listings per sweep TOTAL, on a cadence -------------
+# --- boundedness: a fixed number of BULK listings per sweep, on a cadence ---
 
 
 def test_one_listing_per_substrate_regardless_of_resource_count(tmp_path):
@@ -325,7 +334,13 @@ def test_one_listing_per_substrate_regardless_of_resource_count(tmp_path):
     verdicts = _sweeper(vms=vms, containers=containers).verdicts(stores, ENV)
 
     assert len(verdicts) == 10  # 5 ec2 + 5 lambda, all drifted
-    assert (vms.calls, containers.calls) == (1, 1)
+    # 15 resources, THREE bulk calls: one `limactl list` (ec2) and two
+    # `docker ps` (the live lambda/rds half, then the ecs task half). Never one
+    # call per resource -- that is the property this pins, and it holds at any
+    # count. Zero `inspect` calls here because every container is GONE, and the
+    # listing alone settles that; an inspect is only spent on one that exists.
+    assert (vms.calls, containers.calls) == (1, 2)
+    assert containers.status_calls == []
 
 
 def test_non_sweep_ticks_make_no_runtime_calls_and_keep_the_verdict(tmp_path, monkeypatch):
@@ -442,10 +457,11 @@ def test_vpc_subnet_sg_iam_role_and_ecr_records_are_never_swept(tmp_path):
     vms, containers = FakeVms(names=[]), FakeContainers(names=[])
 
     assert _sweeper(vms=vms, containers=containers).verdicts(stores, ENV) == {}
-    assert (vms.calls, containers.calls) == (0, 0)
+    assert (vms.calls, containers.calls, containers.status_calls) == (0, 0, [])
 
 
-# --- rds (W2.7): checked by its real health probe, not by a listing ---------
+# --- rds (W2.7): checked by its container's real STATE (the live half) and
+# then by a real health probe -- see drift.py's "RDS IS CHECKED TWICE". ------
 
 
 def _db(stores: SynthStores, label: str, identifier: str, status: str = "available", port: int = 54321) -> str:
@@ -458,21 +474,22 @@ def _db(stores: SynthStores, label: str, identifier: str, status: str = "availab
     return db_container_name(ENV, identifier)
 
 
-def test_a_healthy_database_is_no_drift_and_costs_zero_subprocess_calls(tmp_path):
+def test_a_healthy_database_is_no_drift_and_costs_one_bulk_listing_plus_one_probe(tmp_path):
     stores = SynthStores(tmp_path)
-    _db(stores, "app-db", "app-db")
-    containers, probe = FakeContainers(names=[]), FakeProbe(ok=True)
+    name = _db(stores, "app-db", "app-db")
+    containers, probe = FakeContainers(names=[name]), FakeProbe(ok=True)
 
     assert _sweeper(containers=containers, probe=probe).verdicts(stores, ENV) == {}
-    # ONE real connection, and no `docker` call at all on the happy path.
+    # ONE real connection, ONE bulk listing, and ONE `inspect` for the one
+    # container this env has -- never a second opinion per resource.
     assert probe.calls == [("127.0.0.1", 54321, "app", "apppass123")]
-    assert (containers.calls, containers.status_calls) == (0, [])
+    assert (containers.calls, containers.status_calls) == (1, [name])
 
 
 def test_a_killed_container_is_real_drift_and_the_record_is_corrected(tmp_path):
     """`docker kill` -- the canonical way a database dies -- leaves an EXITED
-    container that `container_names` still lists, which is exactly why rds is
-    probed instead of listed. The verdict carries the container's real exit
+    container that a NAME listing still lists, which is why the live half reads
+    the container's real STATE. The verdict carries the container's real exit
     code, and the record goes `failed` so an Apply's converge recreates it."""
     stores = SynthStores(tmp_path)
     name = _db(stores, "app-db", "app-db")
@@ -503,19 +520,24 @@ def test_a_removed_database_container_reads_like_ecs_not_like_an_invented_exit_c
 
 
 def test_the_world_stops_claiming_healthy_and_stops_publishing_a_dead_database_url(tmp_path):
-    """The projection-level point: a dead database must not keep advertising a
-    DATABASE_URL nothing can connect to -- that stale fact is what the Fabric
-    would hand a consumer."""
+    """The projection-level point, through the CADENCE half: a dead database
+    must not keep advertising a DATABASE_URL nothing can connect to -- that
+    stale fact is what the Fabric would hand a consumer. Once the sweep has
+    corrected the record, the projection reads `crashed` off the record itself,
+    with or without a live check."""
     stores = SynthStores(tmp_path)
     name = _db(stores, "app-db", "app-db")
-    _kind, phase, facts, _verdict = project(stores, ENV)["app-db"]
+    _kind, phase, facts, _verdict = project(stores, ENV, containers=FakeContainers(names=[name]))["app-db"]
     assert (phase, facts["DATABASE_URL"]) == (
         "healthy", "postgresql://app:apppass123@host.docker.internal:54321/postgres",
     )
 
-    _sweeper(containers=FakeContainers(names=[], exited={name: 137}), probe=FakeProbe(ok=False)).verdicts(stores, ENV)
+    _sweeper(
+        containers=FakeContainers(names=[], exited={name: 137}), probe=FakeProbe(ok=False),
+    ).verdicts(stores, ENV)
 
-    kind, phase, facts, verdict = project(stores, ENV)["app-db"]
+    assert stores.rdsctl.get(ENV, "db:app-db")["status"] == "failed"
+    kind, phase, facts, verdict = project(stores, ENV, containers=FakeContainers(names=[name]))["app-db"]
     assert (kind, phase, facts) == ("rds", "crashed", {})
     assert "is not running (exit 137)" in verdict
 
@@ -555,6 +577,168 @@ def test_a_database_with_no_endpoint_yet_is_never_probed(tmp_path):
     assert probe.calls == []
 
 
+# --- field test 5: the LIVE half -- no cadence, no cache, no sweeper -------
+
+
+def test_the_live_sweep_corrects_a_removed_container_with_no_sweeper_at_all(tmp_path):
+    """`sweep_compute` is the whole check, callable by anything that has to be
+    sure RIGHT NOW. Before this the same truth existed only inside
+    `DriftSweeper`, behind a ~10-tick cadence and a cache -- so /apply-full and
+    `/world`, which both read the RECORD, stayed green for the whole window."""
+    stores = SynthStores(tmp_path)
+    _fn(stores, "hello")
+    name = _db(stores, "app-db", "app-db")
+
+    verdicts = sweep_compute(stores, ENV, FakeContainers(names=[]))
+
+    assert verdicts["hello"] == (
+        "container odin-lambda-default-hello removed outside odin — re-Apply to recreate"
+    )
+    assert verdicts["app-db"] == f"container {name} removed outside odin — re-Apply to recreate"
+    assert stores.lambdactl.get(ENV, "fn:hello")["state"] == "Failed"
+    assert stores.rdsctl.get(ENV, "db:app-db")["status"] == "failed"
+
+
+def test_a_paused_container_is_not_serving_and_says_so(tmp_path):
+    """`docker pause` is the case that defeats every record-trusting check AND
+    every name listing: the container is present, `docker ps` lists it, and
+    nothing inside answers a single connection. The state is what tells the
+    truth, and the verdict names docker's own word for it."""
+    stores = SynthStores(tmp_path)
+    _fn(stores, "hello")
+    db = _db(stores, "app-db", "app-db")
+    fn = "odin-lambda-default-hello"
+
+    verdicts = sweep_compute(stores, ENV, FakeContainers(names=[], paused=[fn, db]))
+
+    assert verdicts == {
+        "hello": f"container {fn} is paused — re-Apply to recreate",
+        "app-db": f"container {db} is paused — re-Apply to recreate",
+    }
+    assert stores.lambdactl.get(ENV, "fn:hello")["state"] == "Failed"
+    assert stores.rdsctl.get(ENV, "db:app-db")["status"] == "failed"
+
+
+def test_a_killed_lambda_container_carries_its_real_exit_code(tmp_path):
+    # `docker kill` on the RIE container: present, exited, 137. ECS has always
+    # reported the exit code; lambda saw only "gone or not gone" before.
+    stores = SynthStores(tmp_path)
+    _fn(stores, "hello")
+    name = "odin-lambda-default-hello"
+
+    verdicts = sweep_compute(stores, ENV, FakeContainers(names=[], exited={name: 137}))
+
+    assert verdicts["hello"] == f"container {name} is not running (exit 137) — re-Apply to recreate"
+
+
+def test_the_live_sweep_leaves_a_healthy_pair_completely_alone(tmp_path):
+    stores = SynthStores(tmp_path)
+    _fn(stores, "hello")
+    name = _db(stores, "app-db", "app-db")
+    containers = FakeContainers(names=["odin-lambda-default-hello", name])
+
+    assert sweep_compute(stores, ENV, containers) == {}
+    assert stores.lambdactl.get(ENV, "fn:hello")["state"] == "Active"
+    assert stores.rdsctl.get(ENV, "db:app-db")["status"] == "available"
+    assert containers.calls == 1, "one bulk listing for the whole env, whatever it holds"
+    assert sorted(containers.status_calls) == sorted(["odin-lambda-default-hello", name])
+
+
+def test_the_live_sweep_never_calls_docker_when_nothing_claims_to_be_up(tmp_path):
+    """The happy-path cost rule: an env with no lambda/rds record -- or one
+    whose records are all mid-flight -- pays nothing at all, so putting this on
+    the projection (every tick) and on every apply is free where it is
+    irrelevant."""
+    stores = SynthStores(tmp_path)
+    _fn(stores, "deploying", last_update="InProgress")
+    _db(stores, "booting", "booting", status="creating")
+    containers = FakeContainers(names=[])
+
+    assert sweep_compute(stores, ENV, containers) == {}
+    assert (containers.calls, containers.status_calls) == (0, [])
+    assert stores.lambdactl.get(ENV, "fn:deploying")["state"] == "Active"
+    assert stores.rdsctl.get(ENV, "db:booting")["status"] == "creating"
+
+
+def test_a_container_the_listing_found_but_inspect_will_not_describe_is_not_a_death(tmp_path):
+    """The second half of "unknown is not gone", one level down. `status` answers
+    `absent` both for "no such container" AND for "docker didn't answer" -- it
+    cannot tell them apart (its own docstring). For a name the bulk listing JUST
+    returned, the honest reading is ambiguity, so nothing is reported and
+    nothing is written; the next tick asks again. Without this, one busy-daemon
+    `inspect` under a `tofu apply` could mark a live database `failed`, and the
+    next apply would delete and recreate it."""
+    stores = SynthStores(tmp_path)
+    _fn(stores, "hello")
+    name = _db(stores, "app-db", "app-db")
+
+    class ListedButUndescribable(FakeContainers):
+        def status(self, container: str) -> str:
+            self.status_calls.append(container)
+            return "absent"
+
+    containers = ListedButUndescribable(names=["odin-lambda-default-hello", name])
+    assert sweep_compute(stores, ENV, containers) == {}
+    assert stores.lambdactl.get(ENV, "fn:hello")["state"] == "Active"
+    assert stores.rdsctl.get(ENV, "db:app-db")["status"] == "available"
+
+
+def test_the_live_sweep_corrects_nothing_when_docker_does_not_answer(tmp_path):
+    """Unknown is not "gone" -- `_listing`'s rule, and it has to hold here too:
+    this half runs on EVERY tick and inside every apply, so a daemon hiccup
+    must never write `Failed` into a live resource's record."""
+    stores = SynthStores(tmp_path)
+    _fn(stores, "hello")
+    _db(stores, "app-db", "app-db")
+    containers = FakeContainers(error=RuntimeError("docker ps failed: daemon not running"))
+
+    assert sweep_compute(stores, ENV, containers) == {}
+    assert stores.lambdactl.get(ENV, "fn:hello")["state"] == "Active"
+    assert stores.rdsctl.get(ENV, "db:app-db")["status"] == "available"
+
+
+def test_world_is_not_green_for_a_dead_function_on_the_very_next_projection(tmp_path):
+    """The `/world` half of the fix, with NO DriftSweeper in sight: `project()`
+    runs the live check itself, so the tick after the container disappears
+    reports `crashed` + the real reason instead of `healthy`."""
+    stores = SynthStores(tmp_path)
+    _fn(stores, "hello")
+    assert project(stores, ENV, containers=FakeContainers(names=["odin-lambda-default-hello"]))["hello"] == (
+        "lambda", "healthy", {}, None,
+    )
+
+    kind, phase, _facts, verdict = project(stores, ENV, containers=FakeContainers(names=[]))["hello"]
+
+    assert (kind, phase) == ("lambda", "crashed")
+    assert "removed outside odin" in verdict
+
+
+def test_world_stops_publishing_a_dead_databases_url_without_touching_its_record(tmp_path):
+    """Both halves of the projection's contract in one place.
+
+    IT REPORTS: `crashed`, the real reason, and NO FACTS -- a database that is
+    not running must stop advertising a DATABASE_URL nothing can connect to.
+
+    IT DOES NOT WRITE: the record still says `available`. That is what keeps
+    the recovery honest -- `converge_db_instances` recreates a `failed`
+    database, destroying its data, so nothing may mark it failed until an APPLY
+    has reported the death. A projection that corrected the record would let
+    the next unrelated apply silently recreate the database and report success."""
+    stores = SynthStores(tmp_path)
+    name = _db(stores, "app-db", "app-db")
+
+    kind, phase, facts, verdict = project(
+        stores, ENV, containers=FakeContainers(names=[], exited={name: 137}),
+    )["app-db"]
+
+    assert (kind, phase, facts) == ("rds", "crashed", {})
+    assert "is not running (exit 137)" in verdict
+    record = stores.rdsctl.get(ENV, "db:app-db")
+    assert (record["status"], record["status_reason"]) == ("available", None), (
+        "the projection must report, never correct -- see drift.py's WHY THE PROJECTION MAY NOT WRITE"
+    )
+
+
 def test_a_single_bad_sample_is_a_blip_not_drift(tmp_path, monkeypatch):
     """CONFIRM BEFORE CORRECTING (found running the real thing): under a busy
     docker daemon -- a `tofu apply` pulling a 250MB image -- one probe can fail
@@ -567,11 +751,13 @@ def test_a_single_bad_sample_is_a_blip_not_drift(tmp_path, monkeypatch):
     name = _db(stores, "app-db", "app-db")
 
     class Blip(FakeContainers):
-        """`status` lies once (the blip), then tells the truth."""
+        """`status` answers the live listing honestly, then lies ONCE to the
+        probe half -- the busy-daemon `inspect` that comes back empty for a
+        container that is perfectly alive."""
 
         def status(self, container: str) -> str:
             self.status_calls.append(container)
-            return "absent" if len(self.status_calls) == 1 else "running"
+            return "absent" if len(self.status_calls) == 2 else "running"
 
     class ProbeBlip(FakeProbe):
         def __call__(self, *args, **kwargs):

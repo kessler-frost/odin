@@ -139,6 +139,13 @@ def test_a_noop_apply_cannot_report_success_on_a_database_that_never_answers(
             files=skeleton.files, unsupported=skeleton.unsupported, binary_files=skeleton.binary_files,
         )
     monkeypatch.setattr("odin.server.translate_mod.translate", fake_translate)
+    # Sweep every tick so step 3 reaches its PRECONDITION (a `failed` record,
+    # the state an Apply is supposed to be the recovery for) in seconds rather
+    # than on the ~10-tick cadence. Legitimate here for the reason
+    # test_lambda_noop_apply_outage_e2e.py spells out: the thing under test is
+    # an apply whose recovery cannot work, not how quickly odin notices a dead
+    # container -- that is measured at the full default cadence in
+    # test_false_green_window_e2e.py (honesty rule 1b).
     monkeypatch.setenv("ODIN_DRIFT_SWEEP_TICKS", "1")
     monkeypatch.setattr(rdsctl, "_CREATE_TIMEOUT", CREATE_TIMEOUT)
     monkeypatch.setenv("ODIN_RDS_AVAILABLE_TIMEOUT", str(CREATE_TIMEOUT + 40))

@@ -39,7 +39,7 @@ from odin.gateway.app import GatewayState, create_gateway_app, serve_in_thread, 
 from odin.gateway.keys import OPERATOR_NODE_ID, KeyStore, Principal
 from odin.gateway.models import ec2compute, ec2net, ecsctl, lambdactl, rdsctl
 from odin.gateway.stores import SynthStores
-from odin.reconcile import admission
+from odin.reconcile import admission, drift
 from odin.reconcile.drift import DriftSweeper
 from odin.reconcile.reconciler import Reconciler
 from odin.reconcile.tf_status import stranded_in_tf_state
@@ -1115,10 +1115,30 @@ def create_apply_full_router(
         # apply pays approximately nothing. Same `if applied` gate, for the same
         # reason: a tofu failure has already failed this apply honestly.
         if body["status"] == "applied":
-            faulted_fns, faulted_dbs = await asyncio.gather(
+            await asyncio.gather(
                 asyncio.to_thread(lambdactl.wait_for_active_functions, stores, env, deploying),
                 asyncio.to_thread(rdsctl.wait_for_available_instances, stores, env, booting),
             )
+            # ...and THEN ask reality, once, before believing any of it (field
+            # test 5). The two waits above settle the convergence and answer
+            # off the RECORD, and a record is refreshed by the drift sweep on a
+            # ~10-tick cadence: measured at the default cadence, four
+            # consecutive applies reported `applied` / exit 0 over ~8s with the
+            # function's container already removed, and none of them recreated
+            # it. `sweep_compute` is one bulk `docker ps` (none at all for an
+            # env with no lambda/rds records) that corrects every record whose
+            # container is gone, exited or paused -- so this apply establishes
+            # liveness ITSELF instead of inheriting another loop's cadence.
+            #
+            # AFTER the waits, never before: a container being (re)created by
+            # this very apply is legitimately absent for a moment, and the
+            # honest answer is the one taken once the work it verifies has
+            # finished. `tf_status.project()` calls the SAME function, so
+            # `/world` and this apply read one corrected record rather than two
+            # checks that can disagree.
+            await asyncio.to_thread(drift.sweep_compute, stores, env)
+            faulted_fns = lambdactl.function_faults(stores, env)
+            faulted_dbs = rdsctl.db_faults(stores, env)
             unhealthy = (
                 [_unhealthy_wire("lambda", f.node, f.state, f.reason) for f in faulted_fns]
                 + [_unhealthy_wire("rds", f.node, f.status, f.reason) for f in faulted_dbs]
