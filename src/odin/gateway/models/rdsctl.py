@@ -755,11 +755,11 @@ def ensure_db_mesh(
 
     Two things need it, and an Apply is the honest cadence for both. An SG
     EDIT: security groups are TF-owned, so a changed `db-sg` reaches the
-    gateway ONLY through an apply, and nebula reads its firewall only at
-    startup -- so this is exactly when the recompiled rules must be pushed into
-    the sidecar. And a DEAD SIDECAR: the companion container can be killed
-    while the database itself keeps running, which no create path would ever
-    notice.
+    gateway ONLY through an apply, and a running nebula only picks a new
+    firewall up when it is told to -- so this is exactly when the recompiled
+    rules must be pushed into the sidecar and reloaded. And a DEAD SIDECAR: the
+    companion container can be killed while the database itself keeps running,
+    which no create path would ever notice.
 
     Cheap and idempotent by construction (`MeshSidecar.ensure`): an unchanged
     firewall with a running sidecar is a couple of file reads plus one
