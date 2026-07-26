@@ -14,6 +14,7 @@ import pytest
 import typer
 
 from odin import __main__ as main_mod, util
+from odin.cli import doctor as doctor_mod
 from odin.gateway.stores import SynthStores
 
 
@@ -56,13 +57,28 @@ def test_start_foreground_passes_host_through_to_uvicorn(tmp_path, monkeypatch):
     assert captured == {"host": "0.0.0.0", "port": 4200}
 
 
+class FakeProc:
+    """A launched uvicorn, as `_await_serving` sees it: a pid and a `poll()`
+    that reports whether it is still alive."""
+
+    def __init__(self, pid: int = 12345, exit_code: int | None = None):
+        self.pid = pid
+        self.returncode = exit_code
+
+    def poll(self):
+        return self.returncode
+
+
+def _skip_readiness(monkeypatch):
+    """For the tests that are about the ARGV, not about waiting."""
+    monkeypatch.setattr(main_mod, "_await_serving", lambda *a, **kw: None)
+
+
 def test_start_background_passes_host_through_to_the_subprocess_argv(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(main_mod, "_build_ui", lambda: None)
+    _skip_readiness(monkeypatch)
     captured = {}
-
-    class FakeProc:
-        pid = 12345
 
     def fake_popen(argv, **kwargs):
         captured["argv"] = argv
@@ -80,10 +96,8 @@ def test_start_background_passes_host_through_to_the_subprocess_argv(tmp_path, m
 def test_start_defaults_to_loopback_when_host_not_given(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(main_mod, "_build_ui", lambda: None)
+    _skip_readiness(monkeypatch)
     captured = {}
-
-    class FakeProc:
-        pid = 12345
 
     def fake_popen(argv, **kwargs):
         captured["argv"] = argv
@@ -389,12 +403,10 @@ def test_start_still_clears_a_stale_pidfile_and_proceeds(tmp_path, monkeypatch):
     """The other direction, unregressed: a dead pid must not block a start."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(main_mod, "_build_ui", lambda: None)
+    _skip_readiness(monkeypatch)
     main_mod.ODIN_DIR.mkdir()
     main_mod.PID_FILE.write_text("999999")
     started = []
-
-    class FakeProc:
-        pid = 4242
 
     # `pid_alive` really does shell out to `kill -0`, and that is the whole
     # point of this test -- so the real Popen keeps serving it.
@@ -404,12 +416,225 @@ def test_start_still_clears_a_stale_pidfile_and_proceeds(tmp_path, monkeypatch):
         if argv[:2] == ["kill", "-0"]:
             return real_popen(argv, **kwargs)
         started.append(argv)
-        return FakeProc()
+        return FakeProc(pid=4242)
 
     monkeypatch.setattr(main_mod.subprocess, "Popen", fake_popen)
     main_mod.start(port=4200, foreground=False, dev=False, host="127.0.0.1")
     assert started, "a stale pidfile must not block a start"
     assert main_mod.PID_FILE.read_text() == "4242"
+
+
+# --- v0.7.5: a missing build tool is a finding, not a traceback -------------
+# `odin start` from a clone shells out to `bun`, and without it printed a
+# 40-line rich traceback ending in `FileNotFoundError: [Errno 2] No such file
+# or directory: 'bun'` -- on the first command a newcomer runs, the same shape
+# as the v0.7.3 blocker where `odin doctor` died on a missing `docker`.
+
+
+@pytest.fixture
+def clone_without_bun(tmp_path, monkeypatch):
+    """A clone (no bundled `_ui`), nothing built yet, and no bun on PATH."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main_mod, "BUNDLED_UI", tmp_path / "_ui")
+    monkeypatch.setattr(main_mod, "UI_DIR", tmp_path / "ui")
+    monkeypatch.setattr(main_mod.shutil, "which", lambda tool: None)
+    monkeypatch.setattr(
+        main_mod.subprocess, "run",
+        lambda *a, **kw: pytest.fail("must not shell out to a tool that isn't installed"))
+    return tmp_path
+
+
+def test_start_without_bun_names_the_fix_instead_of_raising(clone_without_bun, capsys):
+    with pytest.raises(typer.Exit) as exc:
+        main_mod.start(port=4200, foreground=False, dev=False, host="127.0.0.1")
+
+    assert exc.value.exit_code == 1
+    err = capsys.readouterr().err
+    assert "`bun` is not installed" in err            # a sentence...
+    assert f"fix: {doctor_mod.BUN_INSTALL}" in err    # ...and the exact command
+    assert "bun.sh/install" in err
+
+
+def test_dev_mode_without_bun_refuses_before_it_starts_anything(clone_without_bun, capsys):
+    """Checked before the pidfile and the backend exist, so a machine without
+    bun is refused rather than half-started."""
+    with pytest.raises(typer.Exit) as exc:
+        main_mod._start_dev(port=4200, host="127.0.0.1")
+
+    assert exc.value.exit_code == 1
+    assert "`bun` is not installed" in capsys.readouterr().err
+    assert not main_mod.PID_FILE.exists()
+
+
+def test_the_bun_fix_is_the_one_doctor_prints(clone_without_bun, capsys):
+    """One remedy, one spelling: `odin doctor`'s bun row and `odin start`'s
+    refusal both come from `doctor.BUN_INSTALL`."""
+    row, = doctor_mod.run_checks(["bun"], lambda args, input=None: util.CommandResult(1, ""))
+    with pytest.raises(typer.Exit):
+        main_mod._require_bun("build the UI")
+    assert row.fix and row.fix in capsys.readouterr().err
+
+
+def test_a_failed_ui_build_is_reported_not_raised(tmp_path, monkeypatch, capsys):
+    """bun IS installed and its build fails -- a different problem, a different
+    sentence, and still no traceback."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main_mod, "BUNDLED_UI", tmp_path / "_ui")
+    monkeypatch.setattr(main_mod, "UI_DIR", tmp_path / "ui")
+    monkeypatch.setattr(main_mod.shutil, "which", lambda tool: "/usr/local/bin/bun")
+    monkeypatch.setattr(main_mod, "_run_in_ui", lambda args: 1)
+
+    with pytest.raises(typer.Exit) as exc:
+        main_mod._build_ui()
+
+    assert exc.value.exit_code == 1
+    err = capsys.readouterr().err
+    assert "`bun run build` failed (exit 1)" in err
+    assert "bun install" in err
+
+
+def test_a_bun_that_cannot_be_executed_is_reported_not_raised(tmp_path, monkeypatch, capsys):
+    """The backstop: PATH says yes, exec says no (a dangling shim, a wrong-arch
+    binary). `_run_in_ui` translates it to 127 the way `util.run_command`
+    does for every other tool, so nothing here can raise."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main_mod, "BUNDLED_UI", tmp_path / "_ui")
+    monkeypatch.setattr(main_mod, "UI_DIR", tmp_path / "ui")
+    monkeypatch.setattr(main_mod.shutil, "which", lambda tool: "/usr/local/bin/bun")
+
+    def exec_fails(args, **kwargs):
+        raise OSError(8, "Exec format error")
+
+    monkeypatch.setattr(main_mod.subprocess, "run", exec_fails)
+
+    with pytest.raises(typer.Exit) as exc:
+        main_mod._build_ui()
+
+    assert exc.value.exit_code == 1
+    assert "could not be run" in capsys.readouterr().err
+
+
+def test_a_bundled_ui_needs_no_bun_at_all(tmp_path, monkeypatch, capsys):
+    """A released odin ships the UI prebuilt, so the bun check must not fire
+    there -- the message says so and this is what makes that true."""
+    monkeypatch.chdir(tmp_path)
+    bundled = tmp_path / "_ui"
+    bundled.mkdir()
+    monkeypatch.setattr(main_mod, "BUNDLED_UI", bundled)
+    monkeypatch.setattr(main_mod.shutil, "which", lambda tool: pytest.fail("must not ask for bun"))
+    main_mod._build_ui()
+    assert capsys.readouterr().err == ""
+
+
+# --- v0.7.5: `odin start` returns only once odin is SERVING -----------------
+# The twin of v0.7.4's `odin stop` fix, at the other end of the lifecycle.
+# `subprocess.Popen` returns when the FORK succeeds, so `start` announced a
+# running server ~0.5-4s before uvicorn had bound anything: measured on this
+# machine, `start` returned at 0.204s while GET /health first answered at
+# 0.714s (2.65s/2.695s cold), and `odin start && odin world` failed 3 of 3
+# with "Could not reach odin server -- is it running? Try `odin start`". After
+# the fix, 3 of 3 passed and /health answered the instant `start` returned.
+
+
+def test_start_does_not_return_until_health_actually_answers(tmp_path, monkeypatch, capsys):
+    """The load-bearing one: `start` must poll a REAL round trip, not a fork."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main_mod, "_build_ui", lambda: None)
+    monkeypatch.setattr(main_mod, "_READY_POLL", 0.0)
+    monkeypatch.setattr(main_mod.subprocess, "Popen", lambda argv, **kw: FakeProc())
+
+    probes = []
+
+    def fake_serving(address):
+        probes.append(address)
+        return len(probes) > 3  # the server takes a few polls to come up
+
+    monkeypatch.setattr(main_mod, "_serving", fake_serving)
+
+    main_mod.start(port=4200, foreground=False, dev=False, host="127.0.0.1")
+
+    assert len(probes) == 4, "start returned before /health answered"
+    assert probes == ["http://127.0.0.1:4200"] * 4
+    out = capsys.readouterr().out
+    assert "up and serving at http://127.0.0.1:4200" in out
+
+
+def test_start_fails_when_the_server_dies_before_it_serves(tmp_path, monkeypatch, capsys):
+    """A port already in use is the everyday case (verified for real: uvicorn
+    exits 1 with "address already in use"). Exit 1, uvicorn's own words, and no
+    pidfile left pointing at a corpse."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main_mod, "_build_ui", lambda: None)
+    monkeypatch.setattr(main_mod, "_serving", lambda address: False)
+    monkeypatch.setattr(main_mod.subprocess, "Popen", lambda argv, **kw: FakeProc(exit_code=1))
+
+    with pytest.raises(typer.Exit) as exc:
+        main_mod.start(port=4200, foreground=False, dev=False, host="127.0.0.1")
+
+    assert exc.value.exit_code == 1
+    err = capsys.readouterr().err
+    assert "did not come up" in err
+    assert "exited with code 1" in err
+    assert "server.log" in err                      # where to look
+    assert "run `odin start` again" in err          # what to do
+    assert not main_mod.PID_FILE.exists()           # the pid in it is dead
+
+
+def test_start_is_honest_when_the_wait_runs_out(tmp_path, monkeypatch, capsys):
+    """A bounded wait that expires reports the bound and leaves the process
+    alone -- it is still running and may yet come up, and saying otherwise
+    would be the same invented success in the opposite direction."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main_mod, "_build_ui", lambda: None)
+    monkeypatch.setattr(main_mod, "_serving", lambda address: False)
+    monkeypatch.setattr(main_mod, "READY_TIMEOUT", 0.05)
+    monkeypatch.setattr(main_mod, "_READY_POLL", 0.0)
+    monkeypatch.setattr(main_mod.subprocess, "Popen", lambda argv, **kw: FakeProc(pid=777))
+
+    with pytest.raises(typer.Exit) as exc:
+        main_mod.start(port=4200, foreground=False, dev=False, host="127.0.0.1")
+
+    assert exc.value.exit_code == 1
+    err = capsys.readouterr().err
+    assert "did not answer http://127.0.0.1:4200/health within 0s" in err
+    assert "still running (pid 777)" in err
+    assert "`odin stop`" in err
+    assert main_mod.PID_FILE.read_text() == "777"   # still stoppable
+
+
+def test_start_on_an_already_running_odin_never_waits(tmp_path, monkeypatch, capsys):
+    """The exit-code decision `_already_running` documents survives the new
+    wait: nothing was launched, so there is nothing to wait FOR, and a script's
+    `odin start && odin apply` must not stall on a `--port` odin never bound."""
+    monkeypatch.chdir(tmp_path)
+    main_mod.ODIN_DIR.mkdir()
+    main_mod.PID_FILE.write_text(str(os.getpid()))
+    monkeypatch.setattr(
+        main_mod, "_await_serving", lambda *a, **kw: pytest.fail("must not wait"))
+
+    main_mod.start(port=9999, foreground=False, dev=False, host=main_mod.DEFAULT_HOST)
+
+    assert "already running" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("host,expected", [
+    ("127.0.0.1", "http://127.0.0.1:4200"),
+    ("localhost", "http://localhost:4200"),
+    ("192.168.1.5", "http://192.168.1.5:4200"),
+    # A wildcard bind accepts everywhere but is not itself a destination.
+    ("0.0.0.0", "http://127.0.0.1:4200"),
+    ("::", "http://[::1]:4200"),
+    ("::1", "http://[::1]:4200"),
+])
+def test_probe_address_is_somewhere_that_bind_really_answers(host, expected):
+    assert main_mod._probe_address(host, 4200) == expected
+
+
+def test_serving_is_false_while_nothing_listens():
+    """A closed port is an ordinary state of a server still starting, so the
+    probe answers rather than raises -- the same call `_await_serving` makes
+    hundreds of times per start."""
+    assert main_mod._serving("http://127.0.0.1:1") is False
 
 
 def test_clean_all_refuses_to_delete_the_store_a_live_server_holds(tmp_path, monkeypatch, capsys):

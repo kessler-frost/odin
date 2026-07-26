@@ -55,6 +55,11 @@ class CheckResult:
     fix: str = ""  # exact shell command to fix, when status != "ok"
 
 
+# The one install command for `bun`, shared with `odin start` -- which shells
+# out to it to build the UI from a clone and has to name the SAME remedy doctor
+# does. Two spellings of one fix is how a user ends up doubting both.
+BUN_INSTALL = "curl -fsSL https://bun.sh/install | bash"
+
 # (name, required, fix, when_optional) for every plain is-it-on-PATH tool check.
 # `when_optional` is the precise consequence of NOT having it -- "optional" on
 # its own was misleading for `limactl` (field test LOW-15), since every EC2 node
@@ -69,7 +74,7 @@ _TOOLS: tuple[tuple[str, bool, str, str], ...] = (
     ("limactl", False, "brew install lima",
      "REQUIRED for any canvas with an EC2 node (each one is a real Lima VM) and for "
      "LimaRuntime; every other kind runs on containers and needs none of it"),
-    ("bun", False, "curl -fsSL https://bun.sh/install | bash",
+    ("bun", False, BUN_INSTALL,
      "needed only to build the UI from a clone -- the released package ships one prebuilt"),
     ("claude", False, "see https://docs.claude.com/claude-code",
      "needed only by \"what's wrong here?\" (POST /agent/debug); translation is deterministic"),

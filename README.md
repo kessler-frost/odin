@@ -103,6 +103,14 @@ in `--dev` mode only repositions the Vite frontend; the backend always binds
 A second `odin start` while one is already up starts nothing and does not
 adopt a new `--port`/`--host`; stop it first if you want to change them.
 
+Plain `odin start` backgrounds the server but does **not** return until that
+server answers `GET /health`, so `odin start && odin apply` in a script works
+on the first try rather than racing a uvicorn that is still in its lifespan.
+If the server dies on the way up (a port already in use is the usual one) or
+does not answer within two minutes, `start` says which of those happened,
+prints the tail of `.odin/server.log`, and exits `1` — it never reports a
+server it has not heard from.
+
 Once it's up: draw something from the sidebar, click **Apply**, watch the
 Events tab stream the `tofu apply` output and the node badges go `healthy`.
 Open the `{ }` button in the top bar for the generated Terraform.
@@ -325,7 +333,8 @@ both "odin is still up": a server it can see but cannot signal, and one that
 has not finished exiting within that wait. `odin start` against an
 already-running odin is likewise exit `0` — the state you asked for holds —
 but it starts nothing, so a `--port`/`--host` you passed is not in effect and
-it says so.
+it says so. When it *does* launch one, its exit code is that server's: `0`
+once `/health` answers, `1` if the process died first or never answered.
 
 A node odin didn't act on does **not** make Apply exit nonzero, so a CI gate
 has to read the payload. There is one field for it:
