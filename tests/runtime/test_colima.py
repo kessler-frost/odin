@@ -10,7 +10,7 @@ import pytest
 
 from odin.api.logs import fetch_logs
 from odin.gateway.stores import SynthStores
-from odin.runtime.colima import ColimaRuntime, ContainerSpec
+from odin.runtime.colima import ColimaRuntime, ContainerSpec, PortUnreadable
 from odin.spec.models import ResourceDesired, Stack
 from odin.spec.store import SpecStore
 
@@ -45,6 +45,14 @@ def test_run_status_port_stats_stop(runtime):
 
     assert runtime.status(NAME) == "running"
     assert runtime.host_port(NAME, 80) > 0
+    # Field test 5's facts audit: the three answers a REAL port read can give,
+    # against a real daemon. A published port; an honest 0 for one the
+    # container publishes nothing on; and a raise -- never a 0 -- when the
+    # object cannot be read at all. That last case is what used to become
+    # `http://host.docker.internal:0` in `world.json`, permanently.
+    assert runtime.host_port(NAME, 9999) == 0
+    with pytest.raises(PortUnreadable):
+        runtime.host_port("odin-test-no-such-container", 80)
     stats = runtime.stats(NAME)
     assert "cpu" in stats and "ram" in stats and stats["ram"] >= 0
 
