@@ -78,16 +78,19 @@ import base64
 import hashlib
 import json
 import logging
+import os
 import threading
+import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 from starlette.responses import Response
 
 from odin.aws.backings import ACCOUNT, REGION
-from odin.compute.functions import DEFAULT_RUNTIME, FunctionRuntime, container_name
+from odin.compute.functions import DEFAULT_RUNTIME, READY_TIMEOUT, FunctionRuntime, container_name
 from odin.gateway import errors
 from odin.gateway.keys import KeyStore, workload_env
 from odin.gateway.models import logsctl
@@ -276,8 +279,10 @@ def _finish_deploy(
     )
 
 
-def _spawn(target: Callable[..., None], *args: object) -> None:
-    threading.Thread(target=target, args=args, daemon=True).start()
+def _spawn(target: Callable[..., None], *args: object) -> threading.Thread:
+    thread = threading.Thread(target=target, args=args, daemon=True)
+    thread.start()
+    return thread
 
 
 # --- the reality sweep's seam + the Apply-driven recovery (W2.2's honesty
@@ -314,7 +319,7 @@ def mark_function_failed(stores: SynthStores, env: str, name: str, reason: str) 
 def converge_functions(
     stores: SynthStores, env: str, substrate: FunctionRuntime | None = None,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
-) -> None:
+) -> list[threading.Thread]:
     """Re-create the REAL container of every `Failed` function -- the exact
     `_finish_deploy` pass CreateFunction/UpdateFunctionCode already spawn,
     driven by an APPLY (server.py's /apply-full) rather than by an AWS
@@ -334,8 +339,13 @@ def converge_functions(
     Idempotent, and never a racing second deploy: an `Active` function is left
     completely alone, and a function whose `LastUpdateStatus` is `InProgress`
     (e.g. the UpdateFunctionCode THIS apply just made, still booting) is
-    skipped so two `ensure` calls can't fight over one container."""
+    skipped so two `ensure` calls can't fight over one container.
+
+    Returns the spawned threads so the caller can WAIT for the convergence it
+    just asked for (`wait_for_active_functions`) instead of guessing at it --
+    `ecsctl.converge_services`' contract, for the same reason."""
     runtime = substrate or FunctionRuntime(ColimaRuntime(), stores.root)
+    spawned = []
     for key, fn in stores.lambdactl.items(env).items():
         if not key.startswith("fn:") or fn["state"] != "Failed" or fn["last_update_status"] == "InProgress":
             continue
@@ -349,10 +359,116 @@ def converge_functions(
             last_update_status_reason=None, last_update_status_reason_code=None,
         )
         log.info("converging lambda %s (env %s): re-creating its container", name, env)
-        _spawn(
+        spawned.append(_spawn(
             _finish_deploy, stores, env, name, fn["runtime"], fn["handler"], fn["environment"],
             runtime.code_dir(env, name), runtime, keystore, gateway_port, fn["memory_size"],
-        )
+        ))
+    return spawned
+
+
+# --- post-apply verification: an Apply may not report success on a function
+# that isn't running ---------------------------------------------------------
+
+# `ecsctl.wait_for_steady_services`' twin, for the kind with the identical
+# fire-and-verify-later shape. `converge_functions` above STARTS a redeploy and
+# returns; without this, /apply-full reported `applied` (and `odin apply` exited
+# 0) the instant it was spawned, so a function whose container never came back
+# -- a broken `${{...}}` ref, a RIE that never listened, a `docker run` that
+# failed outright -- scored a full outage green. tofu cannot close this either,
+# and for a STRICTER reason than ECS's: an `aws_lambda_function`'s config is
+# unchanged when its execution environment dies AND the provider's schema has
+# no state attribute to diff on (`mark_function_failed`'s own note), so tofu's
+# plan is empty forever and its create waiter never runs again.
+_ACTIVE_POLL_SECONDS = 0.5
+_ACTIVE_TIMEOUT_ENV = "ODIN_LAMBDA_ACTIVE_TIMEOUT"
+# `READY_TIMEOUT` (180s) is how long `FunctionRuntime.ensure` itself waits for
+# RIE to answer -- a cold `public.ecr.aws/lambda/*` pull is a real
+# multi-hundred-MB fetch -- so it is already the one number for "how long may a
+# function legitimately take to come up", exactly as `ODIN_ECS_STEADY_TIMEOUT`
+# reuses `hcl.py`'s `timeouts.update`. The margin on top is not slack: this
+# verification has to OUTLAST the work it verifies, or it would hard-stop while
+# `_finish_deploy` is still inside `ensure` and report "still deploying"
+# instead of the real reason that thread is about to record.
+_ACTIVE_MARGIN = 30.0
+
+
+def active_timeout() -> float:
+    """The post-apply readiness budget, in seconds. `ODIN_LAMBDA_ACTIVE_TIMEOUT`
+    overrides, matching every other odin timeout."""
+    return float(os.environ.get(_ACTIVE_TIMEOUT_ENV, str(READY_TIMEOUT + _ACTIVE_MARGIN)))
+
+
+class FunctionFault(NamedTuple):
+    """One function that is not runnable: WHICH function, WHAT state odin
+    observed it in, and the real underlying reason when odin knows one (the
+    `docker` error, the RIE log tail `FunctionRuntime.ensure` raised with, or
+    the `UnresolvedRef` naming a broken `${{...}}`).
+
+    `node` is the function name because for odin they are the same string:
+    `hcl.py::_lambda` emits `function_name = <canvas label>`. `reason` is the
+    SAME `state_reason` `reconcile/tf_status.py` renders as the node's World
+    verdict -- the apply output and World must not disagree."""
+
+    node: str
+    state: str
+    reason: str | None
+
+
+def _fn_records(stores: SynthStores, env: str) -> list[dict]:
+    return [fn for key, fn in stores.lambdactl.items(env).items() if key.startswith("fn:")]
+
+
+def _still_deploying(fn: dict) -> bool:
+    """Is this function on its way up right now? `Pending` is a fresh create
+    still booting; `InProgress` is a deploy (or `converge_functions`' own
+    claim) in flight. Deliberately NOT a fault: a function that is merely
+    still starting must never fail an apply."""
+    return fn["state"] == "Pending" or fn["last_update_status"] == "InProgress"
+
+
+def _fault(fn: dict) -> FunctionFault | None:
+    """The fault this function represents, or None while it is fine OR still
+    on its way up."""
+    if _still_deploying(fn) or fn["state"] == "Active":
+        return None
+    return FunctionFault(node=fn["function_name"], state=fn["state"], reason=fn.get("state_reason"))
+
+
+def wait_for_active_functions(
+    stores: SynthStores, env: str,
+    converging: Iterable[threading.Thread] = (), timeout: float | None = None,
+) -> list[FunctionFault]:
+    """Every function that is not `Active` once the Apply's convergence has had
+    its bounded chance -- empty means every function in the env really does
+    have a live execution environment, which is the only state an Apply may
+    report success in.
+
+    Bounded exactly the three ways `ecsctl.wait_for_steady_services` is:
+      1. it JOINS `converging` (the threads `converge_functions` just spawned),
+         so a slow first image pull is waited on rather than raced;
+      2. it returns the instant nothing is still coming up -- a `Failed`
+         function with no deploy in flight cannot become Active without
+         another Apply, so waiting out the budget would only make the failure
+         slower, and a healthy env returns after ONE store read;
+      3. it returns at `active_timeout()` regardless.
+    A freshly CREATED function never reaches here Failed: the provider's own
+    create waiter blocks on `State: Active` and a tofu failure has already
+    failed the apply before this runs.
+
+    Pure store reads -- no `docker` call, deliberately. Whether the container
+    is still alive is `reconcile/drift.py`'s reality sweep (which marks a
+    vanished one `Failed`, which is exactly what this then reports on the next
+    Apply); what this closes is odin reporting success on a state it had
+    already written down as broken."""
+    deadline = time.monotonic() + (active_timeout() if timeout is None else timeout)
+    for thread in converging:
+        thread.join(max(0.0, deadline - time.monotonic()))
+    while True:
+        records = _fn_records(stores, env)
+        faults = [fault for fn in records for fault in [_fault(fn)] if fault is not None]
+        if not any(map(_still_deploying, records)) or time.monotonic() >= deadline:
+            return faults
+        time.sleep(_ACTIVE_POLL_SECONDS)
 
 
 # --- CreateFunction / GetFunction / DeleteFunction ------------------------

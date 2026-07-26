@@ -45,6 +45,7 @@ from odin.reconcile.reconciler import Reconciler
 from odin.reconcile.tf_status import stranded_in_tf_state
 from odin.runtime.colima import ColimaRuntime
 from odin.simulate.runner import SimulateBusy, TfRunner, TofuNotInstalled
+from odin.simulate.workspace import tf_dir
 from odin.spec.models import Stack, World
 from odin.spec.store import SpecStore
 from odin.spec.translate import canvas_to_stack, skipped_node_types
@@ -138,9 +139,44 @@ async def _admission_rejection(runtime, store: SpecStore, stack: Stack) -> JSONR
     })
 
 
+def _tf_state_addresses(root: Path, env: str) -> list[str]:
+    """Every managed resource tofu's OWN state still holds for `env` -- the
+    authoritative answer to "what is still standing" after a destroy that
+    didn't finish. Read straight out of `terraform.tfstate` (structured JSON)
+    rather than shelled out to `tofu state list`, which would want the very
+    per-env lock the failed run just released and would cost another process.
+    An unreadable/absent state file is honestly nothing to report, not a
+    crash: the caller is already on a failure path."""
+    state = tf_dir(root, env) / "terraform.tfstate"
+    parsed = json.loads(state.read_text() or "{}") if state.exists() else {}
+    return sorted(
+        f"{resource['type']}.{resource['name']}"
+        for resource in parsed.get("resources", []) if resource.get("mode") != "data"
+    )
+
+
+def _surviving_containers(runtime, env: str) -> list[str]:
+    """Odin containers this env still has, by odin's own container naming --
+    `odin-aws-{backing}-{env}` carries the env as a SUFFIX, `odin-rds-{env}-…`
+    / `odin-ecs-{env}-…` / `odin-lambda-{env}-…` as an INFIX, both anchored on
+    `-` so a longer env sharing this one's prefix never matches (the rule
+    tests/containers.py documents and relies on).
+
+    Best-effort by design, and `reconcile/drift.py::_listing`'s exact
+    reasoning: this runs only when a destroy has ALREADY failed, so a docker
+    daemon that won't answer must degrade to "couldn't tell" rather than
+    replace a real failure report with a traceback."""
+    try:
+        names = runtime.container_names()
+    except Exception as exc:  # noqa: BLE001 -- any CLI/parse failure means "unknown"
+        log.warning("could not list containers while reporting a failed destroy (%s)", exc)
+        return []
+    return sorted(name for name in names if name.endswith(f"-{env}") or f"-{env}-" in name)
+
+
 def create_apply_router(
     store: SpecStore, reconciler_for, keystore: KeyStore, runner: TfRunner, gateway_port, env_epoch: dict[str, int],
-    stores: SynthStores, gateway: GatewayState,
+    stores: SynthStores, gateway: GatewayState, runtime,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -224,6 +260,25 @@ def create_apply_router(
                     body["tf"] = {"status": "ok" if result.ok else "failed", "exit_code": result.exit_code}
                     if not result.ok:
                         body["tf"]["tail"] = list(result.tail)
+                        # Field test 4 (HIGH): `body["status"]` was set to
+                        # "destroyed" optimistically at the top of this route
+                        # and NEVER revised, so a `tofu destroy` that failed --
+                        # or was killed at its 300s whole-call deadline, exit
+                        # -9 -- still answered `status: destroyed` and `odin
+                        # destroy` exited 0, with six resources left in state
+                        # and containers still running. `/tf/destroy` next door
+                        # already got this right ("destroyed" if result.ok else
+                        # "failed"); the two paths disagreed, and the wrong one
+                        # was the one the CLI and the UI use.
+                        #
+                        # A negative exit code is a SIGNAL, not tofu's own
+                        # verdict, and on this path there is exactly one thing
+                        # that sends it: `TfRunner._run`'s `killpg` when the
+                        # destroy budget blows. That is a different outcome
+                        # from tofu erroring -- nothing was diagnosed, it just
+                        # ran out of time -- so it gets its own status and its
+                        # own message.
+                        body["status"] = "destroy_timed_out" if result.exit_code < 0 else "destroy_failed"
 
             # Field test 3 HIGH-B: whatever tofu did or did not manage to
             # destroy, an EC2 instance this env's gateway store still claims
@@ -250,7 +305,31 @@ def create_apply_router(
 
         await reconciler.tick()
         keystore.revoke_env(env)  # gateway-issued keys die with the env they belong to
-        return JSONResponse(status_code=200, content=body)
+        if body["status"] == "destroyed":
+            return JSONResponse(status_code=200, content=body)
+        # A destroy that failed says so, and says WHAT SURVIVED -- "destroy
+        # failed" on its own is nearly as unhelpful as the false success it
+        # replaces. Both witnesses, gathered only here on the failure path:
+        # tofu's own state (what terraform still owns and a retry must delete)
+        # and the real containers still on the machine. `error` is what makes
+        # `odin destroy` exit nonzero: `cli/http.body_or_fail` keys on it, the
+        # same convention every other honest failure in this file uses.
+        body["still_standing"] = {
+            "tf_state": _tf_state_addresses(store.root, env),
+            "containers": await asyncio.to_thread(_surviving_containers, runtime, env),
+        }
+        timed_out = body["status"] == "destroy_timed_out"
+        budget = "" if not timed_out else (
+            " -- it was killed at its whole-call deadline (ODIN_TOFU_DESTROY_TIMEOUT), "
+            "so nothing was diagnosed, it ran out of time"
+        )
+        body["error"] = (
+            f"destroy did not finish for env {env!r}: tofu exited {body['tf']['exit_code']}{budget}. "
+            f"still standing: {len(body['still_standing']['tf_state'])} resource(s) in tofu state "
+            f"{body['still_standing']['tf_state']}, "
+            f"{len(body['still_standing']['containers'])} container(s) {body['still_standing']['containers']}"
+        )
+        return JSONResponse(status_code=500, content=body)
 
     @router.get("/world")
     def world(env: str = ENV) -> dict:
@@ -468,6 +547,20 @@ def create_tf_router(
 _SUPERSEDED = {"error": "superseded by a newer teardown/apply"}
 
 
+def _unhealthy_wire(kind: str, node: str, observed: str, reason: str | None) -> dict:
+    """One post-apply fault, in ONE wire shape across kinds. Lambda calls its
+    field `State` and RDS calls its `DBInstanceStatus` -- each model keeps its
+    own AWS vocabulary internally (`lambdactl.FunctionFault`,
+    `rdsctl.DatabaseFault`), and this is where they become one list a client
+    can read without a per-kind branch."""
+    return {"kind": kind, "node": node, "observed": observed, "reason": reason}
+
+
+def _unhealthy_line(item: dict) -> str:
+    reason = f" ({item['reason']})" if item["reason"] else ""
+    return f"{item['kind']} {item['node']} is {item['observed']}{reason}"
+
+
 def create_apply_full_router(
     store: SpecStore, reconciler_for, runner: TfRunner, keystore: KeyStore, gateway_port, env_epoch: dict[str, int],
     translate_cache: translate_mod.TranslateCache, runtime, stores: SynthStores,
@@ -478,9 +571,11 @@ def create_apply_full_router(
     is a 200 with an honest per-half status -- the reconciler half can
     genuinely succeed while tofu fails ("applied_tf_failed"), and BOTH halves
     can succeed while a service is still short of its desired task count
-    ("applied_services_unhealthy", field test 3); 409 only when a tofu run is
-    already in flight for the env. Only `applied` is a clean apply; every
-    other status is a nonzero exit in `cli/apply.py`."""
+    ("applied_services_unhealthy", field test 3) or while a lambda/rds node
+    this apply tried to converge never came up ("applied_resources_unhealthy");
+    409 only when a tofu run is already in flight for the env. Only `applied`
+    is a clean apply; every other status is a nonzero exit in
+    `cli/apply.py`."""
     router = APIRouter()
 
     @router.post("/apply-full")
@@ -659,7 +754,7 @@ def create_apply_full_router(
         # diff on), so tofu's plan is empty forever. Real Lambda's own control
         # plane replaces a dead sandbox; this is odin's equivalent. Idempotent:
         # only a `Failed` function is re-`ensure`d, an Active one is untouched.
-        lambdactl.converge_functions(stores, env, keystore=keystore, gateway_port=gateway_port())
+        deploying = lambdactl.converge_functions(stores, env, keystore=keystore, gateway_port=gateway_port())
         # W2.7: and the same recovery for rds. A Postgres container is odin's
         # execution substrate for a resource whose terraform config is
         # unchanged (`status` is read-only Computed in the provider's schema),
@@ -668,7 +763,7 @@ def create_apply_full_router(
         # one is re-created and re-`pg_ready`-gated. This is what makes the
         # scenario-2 crash/recover behavior survive the move off the
         # reconciler -- see reconcile/drift.py's rds notes.
-        rdsctl.converge_db_instances(stores, env)
+        booting = rdsctl.converge_db_instances(stores, env)
         # W2.6: and push each live database's SG-compiled firewall into its mesh
         # sidecar. An apply is exactly the right cadence -- security groups are
         # TF-owned, so an edited `db-sg` only reaches the gateway here, and
@@ -704,6 +799,36 @@ def create_apply_full_router(
                 body["note"] = (
                     "desired state committed, but the service(s) above are not running "
                     "their desired task count — fix and re-apply"
+                )
+        # ...and the identical verification for the OTHER two kinds with the
+        # same fire-and-verify-later shape. `converge_functions` and
+        # `converge_db_instances` above each START real work and return, so
+        # without this an apply reported `applied` the instant a redeploy was
+        # spawned -- field test 3's exact bug, in the two places its fix didn't
+        # reach. Concurrently, because they are independent waits and a slow
+        # lambda pull should not be charged on top of a slow database boot; both
+        # return after one store read when nothing is coming up, so a healthy
+        # apply pays approximately nothing. Same `if applied` gate, for the same
+        # reason: a tofu failure has already failed this apply honestly.
+        if body["status"] == "applied":
+            faulted_fns, faulted_dbs = await asyncio.gather(
+                asyncio.to_thread(lambdactl.wait_for_active_functions, stores, env, deploying),
+                asyncio.to_thread(rdsctl.wait_for_available_instances, stores, env, booting),
+            )
+            unhealthy = (
+                [_unhealthy_wire("lambda", f.node, f.state, f.reason) for f in faulted_fns]
+                + [_unhealthy_wire("rds", f.node, f.status, f.reason) for f in faulted_dbs]
+            )
+            if unhealthy:
+                body["status"] = "applied_resources_unhealthy"
+                body["unhealthy_resources"] = unhealthy
+                # Named in the NOTE as well as the structured list: `odin apply`
+                # echoes `note` verbatim, so an operator sees WHICH resource and
+                # WHY without having to read the JSON body.
+                body["note"] = (
+                    "desired state committed, but "
+                    + "; ".join(map(_unhealthy_line, unhealthy))
+                    + " — fix and re-apply"
                 )
         await reconciler.tick()  # kick an immediate pass; the loop continues it
         return JSONResponse(status_code=200, content=body)
@@ -949,7 +1074,7 @@ def create_app(
     app.include_router(
         create_apply_router(
             _store, reconciler_for, gateway_keystore, tf_runner, lambda: gateway_port_actual, env_epoch,
-            gateway_stores, gateway_state,
+            gateway_stores, gateway_state, _runtime,
         )
     )
     app.include_router(

@@ -12,6 +12,7 @@ real thing is proven once, in tests/simulate/test_rds_tf_e2e.py.
 """
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 
@@ -84,6 +85,16 @@ class FakePostgresRds:
 class FailingDelete(FakePostgresRds):
     def delete_db(self, db_id: str) -> None:
         raise RuntimeError("docker rm failed")
+
+
+class SlowStart(FakePostgresRds):
+    """`create_db` returns BEFORE the container publishes a port -- the real
+    substrate's normal case (image pull, then initdb), and therefore the
+    "legitimately still coming up" window a test needs to hold open. The port
+    appears when a test adds the id to `up`."""
+
+    def create_db(self, db_id: str, user: str, password: str, db_name: str = "postgres") -> None:
+        self.created.append((db_id, user, password, db_name))
 
 
 _READY: dict[str, bool] = {}
@@ -588,3 +599,92 @@ def test_an_unmodeled_action_is_a_protocol_correct_invalid_action(tmp_path):
     assert response.status_code == 400
     parsed = _parse("CreateDBInstance", response, error=True)
     assert parsed["Error"]["Code"] == "InvalidAction"
+
+
+# --- the post-apply verification (`ecsctl.wait_for_steady_services`' twin) ---
+
+
+def test_wait_for_available_instances_reports_a_database_that_never_came_back(tmp_path, sink, rds):
+    """THE hole this closes: `converge_db_instances` starts a re-create and
+    returns, so /apply-full scored `applied` the instant the thread was spawned
+    even when Postgres never accepted a connection. The wait JOINS that thread
+    and reports what really happened -- naming the instance and the LAST REAL
+    probe failure, never an invented one."""
+    stores, fake = _stores(tmp_path), FakePostgresRds()
+    _create(sink, rds, stores, fake)
+    _await_status(sink, rds, stores, fake, "available")
+    fake.up.discard(DB)
+    rdsctl.mark_instance_failed(stores, ENV, DB, "container removed outside odin")
+    _READY["ok"] = False  # ...and this time Postgres never answers
+
+    booting = rdsctl.converge_db_instances(stores, ENV, substrate=fake)
+    faults = rdsctl.wait_for_available_instances(stores, ENV, booting)
+
+    assert faults == [rdsctl.DatabaseFault(
+        node=DB, status="failed",
+        reason="Postgres never became ready: connection refused",
+    )], faults
+
+
+def test_wait_for_available_instances_names_the_docker_failure_when_that_is_the_reason(tmp_path, sink, rds):
+    """The other real reason, and the higher-quality one: the container never
+    started at all, so the apply names the `docker` error itself."""
+    stores, fake = _stores(tmp_path), FakePostgresRds()
+    _create(sink, rds, stores, fake)
+    _await_status(sink, rds, stores, fake, "available")
+    rdsctl.mark_instance_failed(stores, ENV, DB, "container removed outside odin")
+    fake.fail_create = True
+
+    booting = rdsctl.converge_db_instances(stores, ENV, substrate=fake)
+    faults = rdsctl.wait_for_available_instances(stores, ENV, booting)
+
+    assert faults == [rdsctl.DatabaseFault(
+        node=DB, status="failed", reason="container did not start: docker run failed",
+    )], faults
+
+
+def test_wait_for_available_instances_is_one_store_read_when_everything_is_available(tmp_path, sink, rds):
+    """The happy path may not slow down: nothing is `creating`, so the wait
+    returns on its first pass without sleeping or polling once."""
+    stores, fake = _stores(tmp_path), FakePostgresRds()
+    _create(sink, rds, stores, fake)
+    _await_status(sink, rds, stores, fake, "available")
+
+    started = time.monotonic()
+    faults = rdsctl.wait_for_available_instances(stores, ENV, [])
+    elapsed = time.monotonic() - started
+
+    assert faults == []
+    assert elapsed < 0.1, f"a healthy env cost {elapsed:.3f}s -- it must cost one store read"
+
+
+def test_wait_for_available_instances_waits_for_a_database_that_is_still_creating(tmp_path, sink, rds):
+    """The trap the ECS version avoids, for rds: a database that is merely
+    STILL BOOTING must never fail an apply -- a FRESH one legitimately takes
+    time. The wait blocks on `creating` rather than judging it at that
+    instant."""
+    stores, fake = _stores(tmp_path), SlowStart()
+    _create(sink, rds, stores, fake)
+    # The create thread is genuinely in flight: `_wait_available` polls until
+    # the substrate says the container publishes a port.
+    assert rdsctl.records(stores, ENV)[0]["status"] == "creating"
+
+    threading.Timer(0.05, lambda: fake.up.add(DB)).start()
+    faults = rdsctl.wait_for_available_instances(stores, ENV, [], timeout=5.0)
+
+    assert faults == [], "a database that was still coming up must not fail the apply"
+    assert rdsctl.records(stores, ENV)[0]["status"] == "available"
+
+
+def test_available_timeout_defaults_to_outlasting_the_boot_it_verifies(monkeypatch):
+    """The budget must be LONGER than `_finish_create`'s own `_CREATE_TIMEOUT`,
+    or the verification would hard-stop while the thread it is verifying is
+    still probing and report `creating` instead of the real reason. And it is
+    deliberately far longer than ECS's 60s: a database is slower to become
+    ready than a container."""
+    monkeypatch.delenv("ODIN_RDS_AVAILABLE_TIMEOUT", raising=False)
+    monkeypatch.setattr(rdsctl, "_CREATE_TIMEOUT", 180.0)
+    assert rdsctl.available_timeout() > 180.0
+
+    monkeypatch.setenv("ODIN_RDS_AVAILABLE_TIMEOUT", "7")
+    assert rdsctl.available_timeout() == 7.0

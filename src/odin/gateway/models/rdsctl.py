@@ -79,11 +79,13 @@ DELIBERATE LIMITS, each honest rather than silently wrong:
 from __future__ import annotations
 
 import logging
+import os
 import secrets
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
+from typing import NamedTuple
 from urllib.parse import parse_qsl
 from xml.sax.saxutils import escape
 
@@ -393,8 +395,10 @@ def _update(stores: SynthStores, env: str, identifier: str, **fields: object) ->
     stores.rdsctl.update(env, _key(identifier), mutate)
 
 
-def _spawn(target: Callable[..., None], *args: object) -> None:
-    threading.Thread(target=target, args=args, daemon=True).start()
+def _spawn(target: Callable[..., None], *args: object) -> threading.Thread:
+    thread = threading.Thread(target=target, args=args, daemon=True)
+    thread.start()
+    return thread
 
 
 def _substrate(env: str, stores: SynthStores, rds: PostgresRds | None) -> PostgresRds:
@@ -711,7 +715,7 @@ def mark_instance_failed(stores: SynthStores, env: str, identifier: str, reason:
 
 def converge_db_instances(
     stores: SynthStores, env: str, substrate: PostgresRds | None = None,
-) -> None:
+) -> list[threading.Thread]:
     """Re-create the REAL Postgres container of every `failed` instance -- the
     same `_finish_create` pass CreateDBInstance spawns, driven by an APPLY
     (server.py's /apply-full) rather than by an AWS mutation.
@@ -727,18 +731,117 @@ def converge_db_instances(
     completely alone.
 
     `substrate` is per-ENV, so it's built here rather than passed in from the
-    request path: one `PostgresRds` covers every record in this env."""
+    request path: one `PostgresRds` covers every record in this env.
+
+    Returns the spawned threads so the caller can WAIT for the convergence it
+    just asked for (`wait_for_available_instances`) instead of guessing at it
+    -- `ecsctl.converge_services`' contract, for the same reason."""
     rds = substrate or PostgresRds(ColimaRuntime(), env, root=stores.root)
+    spawned = []
     for record in records(stores, env):
         if record["status"] != FAILED:
             continue
         identifier = record["db_instance_identifier"]
         _update(stores, env, identifier, status=CREATING, endpoint_port=0)
         log.info("converging rds %s (env %s): re-creating its container", identifier, env)
-        _spawn(
+        spawned.append(_spawn(
             _finish_create, stores, env, identifier,
             record["master_username"], record["master_password"], record["db_name"], rds,
-        )
+        ))
+    return spawned
+
+
+# --- post-apply verification: an Apply may not report success on a database
+# that never came up --------------------------------------------------------
+
+# `ecsctl.wait_for_steady_services`' twin, third of three. `converge_db_instances`
+# above STARTS a re-create and returns, and `_finish_create` (the same thread
+# CreateDBInstance spawns) does the real waiting; without this, /apply-full
+# reported `applied` -- and `odin apply` exited 0 -- the instant the thread was
+# spawned, so a database whose Postgres never accepted a connection scored a
+# full outage green. tofu cannot close it: `status` is read-only Computed in
+# the provider's schema (`mark_instance_failed`'s note), so its plan is empty
+# and its create waiter -- the one thing that DOES catch this on a fresh
+# apply -- never runs again.
+_AVAILABLE_POLL_SECONDS = 0.5
+_AVAILABLE_TIMEOUT_ENV = "ODIN_RDS_AVAILABLE_TIMEOUT"
+# Deliberately NOT ECS's 60s. `_CREATE_TIMEOUT` (180s) is already the one
+# number for "how long may THIS substrate legitimately take to become ready",
+# and a database really is slower than a container: a cold `postgres:16-alpine`
+# pull, then initdb, then the entrypoint's temporary-server restart that
+# `_wait_available` deliberately straddles with two consecutive probes. The
+# margin on top is not slack -- this verification has to OUTLAST the work it
+# verifies, or it would hard-stop while `_finish_create` is still probing and
+# report "still creating" instead of the real reason that thread is about to
+# record.
+_AVAILABLE_MARGIN = 30.0
+
+
+def available_timeout() -> float:
+    """The post-apply readiness budget, in seconds. `ODIN_RDS_AVAILABLE_TIMEOUT`
+    overrides, matching every other odin timeout."""
+    return float(os.environ.get(_AVAILABLE_TIMEOUT_ENV, str(_CREATE_TIMEOUT + _AVAILABLE_MARGIN)))
+
+
+class DatabaseFault(NamedTuple):
+    """One database that is not usable: WHICH instance, WHAT status odin
+    observed, and the real underlying reason when odin knows one (the `docker`
+    error that kept the container from starting, or the LAST real `pg_ready`
+    failure text -- never an invented one, see `_wait_available`).
+
+    `node` is the instance identifier because for odin they are the same
+    string: `hcl.py::_rds` emits `identifier = <canvas label>`. `reason` is the
+    SAME `status_reason` `reconcile/tf_status.py` renders as the node's World
+    verdict -- the apply output and World must not disagree."""
+
+    node: str
+    status: str
+    reason: str | None
+
+
+def _db_fault(record: dict) -> DatabaseFault | None:
+    """The fault this instance represents, or None while it is fine, still
+    coming up, or on its way out. `creating` is deliberately not a fault: a
+    database that is merely still starting must never fail an apply. `deleting`
+    isn't either -- it is being torn down on purpose."""
+    if record["status"] != FAILED:
+        return None
+    return DatabaseFault(
+        node=record["db_instance_identifier"], status=record["status"],
+        reason=record.get("status_reason"),
+    )
+
+
+def wait_for_available_instances(
+    stores: SynthStores, env: str,
+    converging: Iterable[threading.Thread] = (), timeout: float | None = None,
+) -> list[DatabaseFault]:
+    """Every database instance left `failed` once the Apply's convergence has
+    had its bounded chance -- empty means every database in the env really is
+    reachable, which is the only state an Apply may report success in.
+
+    Bounded exactly the three ways `ecsctl.wait_for_steady_services` is: it
+    JOINS `converging`, it returns the instant nothing is still `creating` (a
+    `failed` instance with no boot in flight cannot recover without another
+    Apply, and a healthy env returns after ONE store read), and it returns at
+    `available_timeout()` regardless.
+
+    Pure store reads -- no `docker` call and no probe of its own, deliberately:
+    `_finish_create` already gated `available` on TWO consecutive real
+    `pg_ready` connections, so the record is the honest answer, and re-probing
+    here would only add a second, differently-timed opinion. Whether a
+    once-available container is still alive is `reconcile/drift.py`'s reality
+    sweep (which marks a vanished one `failed` -- exactly what this then
+    reports on the next Apply)."""
+    deadline = time.monotonic() + (available_timeout() if timeout is None else timeout)
+    for thread in converging:
+        thread.join(max(0.0, deadline - time.monotonic()))
+    while True:
+        current = records(stores, env)
+        faults = [fault for r in current for fault in [_db_fault(r)] if fault is not None]
+        if not any(r["status"] == CREATING for r in current) or time.monotonic() >= deadline:
+            return faults
+        time.sleep(_AVAILABLE_POLL_SECONDS)
 
 
 def ensure_db_mesh(
