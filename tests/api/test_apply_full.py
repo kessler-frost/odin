@@ -873,6 +873,183 @@ def test_apply_full_reports_a_broken_lambda_and_a_broken_database_together(tmp_p
     assert [item["node"] for item in body["unhealthy_resources"]] == ["worker", "app-db"], body
 
 
+# --- field test 5: the apply may not believe a RECORD another loop refreshes
+# on a cadence. Everything below seeds a resource whose record says it is UP
+# and whose container is not there -- the state v0.7.4's verification read as
+# healthy for the length of the drift sweep's cadence (measured: four
+# consecutive `applied`/exit-0 applies over ~8s with zero containers). These
+# apps are built with `backings=False`, so they have NO DriftSweeper AT ALL:
+# nothing on a cadence exists to correct these records, and the apply has to
+# establish it itself. ------------------------------------------------------
+
+
+class _FakeStates:
+    """`ColimaRuntime.container_states()`'s shape, as `sweep_compute` builds it
+    when no runtime is injected -- `running` names the containers that exist."""
+
+    running: tuple[str, ...] = ()
+
+    def __init__(self, *_args, **_kwargs) -> None:
+        pass
+
+    def container_states(self) -> dict[str, str]:
+        return {name: "running" for name in type(self).running}
+
+    def exit_code(self, name: str) -> int:
+        return -1
+
+
+class _NoMeshPostgresRds(_DeadPostgresRds):
+    """`_DeadPostgresRds` plus the mesh seam `ensure_db_mesh` needs for an
+    `available` record -- joining no mesh, exactly as a mesh-less env does.
+
+    Why a DEAD substrate here: whichever live check notices the missing
+    container first (this apply's own, or the projection tick that beat it to
+    it), any convergence attempt must fail fast and locally rather than reach
+    for a real image -- so these tests pin the apply's ANSWER, never a race."""
+
+    def join_mesh(self, db_id, firewall=None, revision=""):
+        return None
+
+
+def _seed_live_function(app, env: str = "default") -> None:
+    """A function whose record says `Active` -- what the store holds between
+    the moment a container is removed out of band and the moment some sweep
+    notices."""
+    app.state.gateway_stores.lambdactl.set(env, "fn:worker", {
+        "function_name": "worker", "state": "Active", "state_reason": "The function is ready.",
+        "state_reason_code": "Idle", "last_update_status": "Successful",
+        "last_update_status_reason": None, "last_update_status_reason_code": None,
+        "runtime": "python3.12", "handler": "lambda_function.lambda_handler",
+        "environment": {}, "memory_size": 128,
+        "function_arn": "arn:aws:lambda:us-east-1:000000000000:function:worker",
+    })
+
+
+def _seed_live_database(app, env: str = "default") -> None:
+    app.state.gateway_stores.rdsctl.set(env, "db:app-db", {
+        "db_instance_identifier": "app-db", "status": "available", "status_reason": None,
+        "master_username": "app", "master_password": "apppass123", "db_name": "postgres",
+        "vpc_security_group_ids": [], "overlay_ip": None,
+        "endpoint_address": "host.docker.internal", "endpoint_port": 54321, "engine": "postgres",
+    })
+
+
+def _patch_no_containers(monkeypatch) -> None:
+    monkeypatch.setattr("odin.reconcile.drift.ColimaRuntime", _FakeStates)
+    monkeypatch.setattr("odin.gateway.models.rdsctl.PostgresRds", _NoMeshPostgresRds)
+    monkeypatch.setattr("odin.gateway.models.lambdactl.FunctionRuntime", _DeadFunctionRuntime)
+
+
+def _silence_the_projection(monkeypatch) -> None:
+    """Take the reconciler's OWN half of the fix out of the picture, so these
+    tests can only pass if the APPLY establishes liveness itself.
+
+    `project()` runs the same live check on every tick, and at unit speed it
+    routinely wins the race -- which is correct behavior (both halves read one
+    source of truth) but would let /apply-full's own call be deleted with every
+    test still green. `tests/reconcile/test_drift.py` owns the projection half;
+    this file owns the apply's."""
+    monkeypatch.setattr("odin.reconcile.reconciler.project_tf_owned", lambda *args, **kwargs: {})
+
+
+def test_apply_full_fails_on_a_function_whose_container_is_gone_though_the_record_says_active(
+    tmp_path, monkeypatch,
+):
+    """THE field-test-5 regression. The record says `Active`, the container is
+    not there, and no drift sweep has run (this app has none) -- the apply used
+    to answer `applied`, exit 0, four times in a row."""
+    _patch_no_containers(monkeypatch)
+    _silence_the_projection(monkeypatch)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: None)
+    _patch_translate(monkeypatch, TranslateResult(files={}, refined=False))
+    app = _app(tmp_path)
+    _seed_live_function(app)
+    with TestClient(app) as client:
+        resp = client.post("/apply-full", json={"nodes": [], "edges": []})
+    body = resp.json()
+    assert body["status"] == "applied_resources_unhealthy", body
+    assert body["unhealthy_resources"] == [{
+        "kind": "lambda", "node": "worker", "observed": "Failed",
+        "reason": "container odin-lambda-default-worker removed outside odin — re-Apply to recreate",
+    }], body
+    assert "lambda worker is Failed" in body["note"]
+
+
+def test_apply_full_fails_on_a_database_whose_container_is_gone_though_the_record_says_available(
+    tmp_path, monkeypatch,
+):
+    _patch_no_containers(monkeypatch)
+    _silence_the_projection(monkeypatch)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: None)
+    _patch_translate(monkeypatch, TranslateResult(files={}, refined=False))
+    app = _app(tmp_path)
+    _seed_live_database(app)
+    with TestClient(app) as client:
+        resp = client.post("/apply-full", json={"nodes": [], "edges": []})
+    body = resp.json()
+    assert body["status"] == "applied_resources_unhealthy", body
+    assert body["unhealthy_resources"] == [{
+        "kind": "rds", "node": "app-db", "observed": "failed",
+        "reason": "container odin-rds-default-app-db removed outside odin — re-Apply to recreate",
+    }], body
+    # The record the apply corrected is the SAME one `/world` projects, so the
+    # two cannot disagree by construction -- pinned in
+    # tests/reconcile/test_drift.py and, on real containers, in
+    # tests/simulate/test_false_green_window_e2e.py.
+
+
+def test_apply_full_stays_applied_when_the_containers_really_are_there(tmp_path, monkeypatch):
+    """The other direction, and the one that makes the test above mean
+    something: the SAME records, with their containers actually running, stay
+    green. A live check that fails everything would pass the test above too."""
+    _patch_no_containers(monkeypatch)
+    _silence_the_projection(monkeypatch)
+    monkeypatch.setattr(
+        _FakeStates, "running", ("odin-lambda-default-worker", "odin-rds-default-app-db"),
+    )
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: None)
+    _patch_translate(monkeypatch, TranslateResult(files={}, refined=False))
+    app = _app(tmp_path)
+    _seed_live_function(app)
+    _seed_live_database(app)
+    with TestClient(app) as client:
+        resp = client.post("/apply-full", json={"nodes": [], "edges": []})
+    body = resp.json()
+    assert body["status"] == "applied", body
+    assert "unhealthy_resources" not in body
+
+
+def test_apply_full_does_not_fail_a_resource_that_is_merely_still_starting(tmp_path, monkeypatch):
+    """The trap the ECS version avoids and this one has to as well: a function
+    mid-redeploy and a database mid-boot legitimately have no container for a
+    moment. Neither may fail an apply -- and neither costs a `docker` call."""
+    _patch_no_containers(monkeypatch)
+    _silence_the_projection(monkeypatch)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: None)
+    # Nothing will ever finish these two (no substrate is running), so the two
+    # waits legitimately run out their whole budget -- the documented knobs cut
+    # 210s of real waiting the assertion below does not depend on.
+    monkeypatch.setenv("ODIN_LAMBDA_ACTIVE_TIMEOUT", "2")
+    monkeypatch.setenv("ODIN_RDS_AVAILABLE_TIMEOUT", "2")
+    _patch_translate(monkeypatch, TranslateResult(files={}, refined=False))
+    app = _app(tmp_path)
+    _seed_live_function(app)
+    _seed_live_database(app)
+    stores = app.state.gateway_stores
+    stores.lambdactl.set("default", "fn:worker", {
+        **stores.lambdactl.get("default", "fn:worker"), "last_update_status": "InProgress",
+    })
+    stores.rdsctl.set("default", "db:app-db", {
+        **stores.rdsctl.get("default", "db:app-db"), "status": "creating",
+    })
+    with TestClient(app) as client:
+        resp = client.post("/apply-full", json={"nodes": [], "edges": []})
+    body = resp.json()
+    assert body["status"] == "applied", body
+    assert "unhealthy_resources" not in body
+
+
 def test_apply_full_stays_applied_when_no_lambda_or_database_is_broken(tmp_path, monkeypatch):
     """The good path must not slow down or start failing: no lambda and no rds
     at all means the check is one store read and the status is untouched."""
