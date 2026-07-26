@@ -60,7 +60,12 @@ future decision against these points instead of re-deriving them:
   redacted before the prompt; an unavailable SDK answers `agent unavailable`
   rather than failing. Limits: evidence is capped at 40 log lines and 10 events
   per node and 20 nodes, so a cause that scrolled out of that window won't be
-  in the answer. Still roadmap, not shipped: HCL for kinds with no builder,
+  in the answer. **`ODIN_AI=0` turns BOTH of these off at once** (`agent/ai.py`)
+  — one switch for every model call in the process, checked at the SDK boundary
+  as well as at each feature's own flag, and an unrecognised value disables
+  them too rather than silently allowing a call. Everything else stays: the
+  canvas↔Terraform translation is a deterministic compiler and is completely
+  unaffected. Still roadmap, not shipped: HCL for kinds with no builder,
   least-privilege policy synthesis, import of unmodeled resource types.
 
 ## Roadmap (northstar-derived sequence)

@@ -91,7 +91,7 @@ curl -fsSL .../scripts/install.sh | sh -s -- --force
 odin start            # build the UI (first run) and serve on http://localhost:4200, in the background
 odin start --dev      # Vite HMR + uvicorn --reload; runs in the FOREGROUND (Ctrl+C to stop)
 odin stop             # stop a background `odin start`
-odin status           # is it running? exit 0 if yes, 1 if no
+odin status           # is it up AND reconciling? exit 0 if yes, 1 if no
 odin clean            # remove test artifacts/logs (--all wipes .odin/ entirely)
 ```
 
@@ -210,8 +210,9 @@ What it needs and what it can't do:
 - It requires the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python)
   — the `claude` CLI on your `PATH`, signed in. Without it the answer is
   `agent unavailable`, and the panel says so. Nothing else in odin
-  needs it; `ODIN_DEBUG_AGENT=0` turns the feature off outright, and
-  `ODIN_DEBUG_TIMEOUT` (default 90s) bounds the call.
+  needs it; `ODIN_DEBUG_AGENT=0` turns the feature off outright,
+  `ODIN_AI=0` turns off [every model call odin can make](#turning-all-ai-off),
+  and `ODIN_DEBUG_TIMEOUT` (default 90s) bounds the call.
 - Secrets never reach the model: env-var **values** are reduced to key names,
   any field odin flags sensitive is `[REDACTED]`, and every string in the
   evidence — including log lines, tofu's own output, and an RDS node's
@@ -221,6 +222,46 @@ What it needs and what it can't do:
 - The evidence is capped (40 log lines and 10 events per node, 20 nodes, 20
   lines of tofu output), so a failure whose cause scrolled past that window
   won't be in the answer. The Logs tab has the full tail.
+
+## Turning all AI off
+
+**`ODIN_AI=0` turns off every model call odin can make** — one switch, and it
+is the whole list. There are exactly two features that can talk to a model, and
+both go through `claude-agent-sdk` (which spawns the `claude` CLI): the
+optional Terraform *refine* pass (`ODIN_TRANSLATE_REFINE`, off by default
+anyway) and ["What's wrong here?"](#whats-wrong-here) (`ODIN_DEBUG_AGENT`, on
+by default). With `ODIN_AI=0` neither one builds a client, spawns anything or
+waits on anything; the debug route answers its normal honest "agent
+unavailable" 200, naming the switch. Nothing else in odin has ever asked a
+model anything — no Anthropic or OpenAI HTTP call, no local inference endpoint,
+no `ANTHROPIC_*` key read, anywhere.
+
+Values: unset, `1`, `true`, `yes`, `on` allow model calls; `0`, `false`, `no`,
+`off` disable them; **anything odin doesn't recognise also disables them**, with
+a warning naming the value — a typo must not be able to quietly re-enable what
+you asked to switch off.
+
+### What you keep with all AI disabled: everything that applies
+
+**The canvas ↔ Terraform translation is a deterministic compiler, not a model
+call.** `src/odin/agent/hcl.py` compiles the canvas to HCL and
+`src/odin/agent/import_tf.py` parses HCL back into canvas nodes; the same
+canvas always produces byte-identical Terraform, with or without AI. So with
+`ODIN_AI=0`:
+
+- Apply, `odin apply`, `/translate`, `/import-tf`, `tofu plan`/`apply`/`destroy`
+  and every substrate behave exactly as documented.
+- IAM edges are still compiled and still enforced by the gateway.
+- `/world`, drift detection, the reconciler and every status surface are
+  untouched — none of them ever involved a model.
+
+The refine pass was never allowed to change what gets applied even when it *is*
+on: whatever it returns is re-validated against the deterministic skeleton
+(identical resource set, every argument value byte-identical) and discarded on
+any deviation. Turning it off costs comments and tags, never correctness. The
+only feature you actually lose is the prose explanation of a failure — and the
+evidence it would have read (`odin logs`, `odin events`, `/world` verdicts,
+tofu's own tail) is all still there to read yourself.
 
 ## The CLI is the same product
 
@@ -321,7 +362,7 @@ question rather than perform an action, and there the code *is* the answer:
 
 | command | `0` | non-zero |
 | ------- | --- | -------- |
-| `odin status` | odin is running | `1` — odin is not running |
+| `odin status` | odin is running and every env's reconciler is ticking | `1` — odin is not running, **or** a reconciler has stopped converging ([why](#when-the-reconciler-itself-stops)) |
 | `odin tf plan` | no changes | `2` changes, `1` error/refusal, `3` server unreachable ([why](#checking-for-drift--and-why-not-to-run-tofu-by-hand)) |
 
 `odin stop` is the deliberate mirror image of `status`: nothing running is
@@ -420,6 +461,48 @@ odin can generate". A node odin has no Terraform for was never in the plan.
 The command names those on its own line, and `-o json` puts them in
 `.not_covered`.
 
+### When the reconciler itself stops
+
+Every phase you see in `/world`, in `odin world` and on the canvas is written
+by one thing: the per-env reconciler loop. If that loop stops, nothing else
+notices on its own — no backing container gets restored, no garbage is
+collected, no out-of-band deletion is detected, and no status is updated. The
+last snapshot just sits there looking converged. odin now refuses to let that
+be quiet:
+
+- **`GET /world`** carries a `reconciler` block (`ticking`, a `verdict`, the
+  age of the last completed tick, the consecutive-failure count and the real
+  error). When it isn't ticking, **every resource's `verdict` is prefixed with
+  `[STALE: …]`** too, so a script that only walks `resources` cannot read a
+  frozen `healthy` as a live one.
+- **`GET /health`** lists the same answer per env under `reconcilers`. It stays
+  HTTP 200 and `ok: true` — that field means "this server answered", which is a
+  different question, and conflating them would break `odin start`'s readiness
+  wait.
+- **`odin status`** exits `1` and prints `RECONCILER DOWN: …` (it asks the
+  server over HTTP, so use `--url`/`ODIN_URL` for a non-default port; if it
+  can't ask, it says the loop state is UNKNOWN rather than assuming health).
+- **`odin world`** prints the same line on stderr, above the table, empty world
+  or not.
+- **The server log** gets one ERROR per transition (never one per check), the
+  UI's Logs tab gets the same line over the WebSocket, and it lands in the
+  env's durable event log (`odin events`). The TopBar shows a red
+  `RECONCILER DOWN` chip off its live `/health` poll.
+
+All three ways a loop can stop are covered, and each is read from a real
+signal: the task is **gone** (cancelled, or killed by a `BaseException` —
+`asyncio.CancelledError` is not an `Exception`, so the loop's own error
+handler never saw it), a tick is **hung** (alive, never finishing), or every
+tick **raises** (alive, logging, converging nothing). The first is reported
+instantly; the other two after `poll_interval + 30s` with no completed tick
+(measured: real ticks take 0.03–0.12s, so the window is ~250× the worst case
+observed).
+
+odin **reports this and does not restart the loop for you**, the same rule the
+reality sweep follows for drifted infrastructure: a dead loop means an odin
+bug, and a silent auto-restart would hide the bug in exactly the surfaces
+above. The remedy is `odin stop && odin start`, which the verdict names.
+
 ## Backup and restore
 
 `.odin/` is the only record that an env exists. Lose it and every container
@@ -503,10 +586,11 @@ it anywhere else won't preserve that. See [SECURITY.md](SECURITY.md#secrets).
   then either forwards to a real backing or answers from its own per-service
   model store (EC2/VPC/SG/IAM/ECR/Lambda/ECS — nobody makes an open-source AWS
   API for these, so odin owns the model and binds it to a real substrate).
-- **Canvas ↔ Terraform translation** (`src/odin/agent/`): deterministic in
-  both directions — the same canvas always produces the same `.tf`, and
-  `/import-tf` parses HCL (or resolves live resources) back into canvas
-  nodes, no model call in the loop for either. An optional agent pass
+- **Canvas ↔ Terraform translation** (`src/odin/agent/`): a deterministic
+  compiler in both directions — the same canvas always produces the same `.tf`,
+  and `/import-tf` parses HCL (or resolves live resources) back into canvas
+  nodes, no model call in the loop for either, and it all still works with
+  [all AI disabled](#turning-all-ai-off). An optional agent pass
   (`claude-agent-sdk`; set `ODIN_TRANSLATE_REFINE=1` to turn it on — off by
   default) can review the generated file and add comments or tags; every
   return is re-validated against the skeleton (same resource set, every

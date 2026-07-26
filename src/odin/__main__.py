@@ -9,12 +9,14 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Annotated
 
 import httpx
 import typer
 
 from odin.cli import commands as _commands  # noqa: F401  (registers the control-surface commands)
 from odin.cli import doctor as _doctor  # noqa: F401  (registers `odin doctor`)
+from odin.cli import http
 from odin.cli.app import app
 from odin.cli.doctor import BUN_INSTALL
 from odin.compute.instances import vm_name
@@ -450,21 +452,71 @@ def stop() -> None:
     typer.echo("Stopped.")
 
 
+def _reconciler_health(url: str) -> list[dict] | None:
+    """Every reconciler's own liveness answer from `GET /health`, or None if
+    this server could not be asked at `url`.
+
+    None is UNKNOWN and is reported as such -- never as healthy. An absent
+    `reconcilers` key is the same unknown: a body that predates the field
+    proves nothing about the loops behind it."""
+    try:
+        body = httpx.get(f"{url.rstrip('/')}/health", timeout=5.0).json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    return body.get("reconcilers") if isinstance(body.get("reconcilers"), list) else None
+
+
 @app.command()
-def status() -> None:
-    """Is Odin running? Exit 0 if it is, 1 if it is not.
+def status(
+    # The one `Annotated` option in the CLI, and for a real reason: `= http.URL`
+    # makes the DEFAULT a typer `OptionInfo`, which is fine for a command only
+    # ever reached through typer but not for this one -- `status()` is called
+    # directly (tests/test_main.py drives it against a real store lock), and
+    # that call must get a usable string, not an object with no `.rstrip`.
+    url: Annotated[str, typer.Option(
+        "--url", envvar="ODIN_URL", help="Base URL of the running odin server.",
+    )] = http.DEFAULT_URL,
+) -> None:
+    """Is Odin up and reconciling? Exit 0 if it is, 1 if it is not.
 
     `status` is a question, so the exit code is the answer -- the shell
     convention every other predicate follows (`test`, `pgrep`, `systemctl
     is-active`). Through v0.7.3 it printed "Odin is not running." and exited
     0, which made `odin status && odin apply` apply against a server that
     wasn't there and gave a CI gate nothing to check but the sentence.
+
+    A live server whose RECONCILER has stopped ticking is the same class of
+    false green (`Reconciler.health`): odin answers every request, holds the
+    store lock and looks perfect while nothing is being provisioned,
+    garbage-collected or drift-checked. So the question this answers is "up AND
+    reconciling", and a down loop exits 1 -- which is what makes `odin status
+    && odin apply` refuse to apply into an env nothing will converge.
+
+    The store lock is still the liveness evidence; the loops are asked over
+    HTTP, so a server on another port needs `--url`/`ODIN_URL`. Not answering
+    there is reported as UNKNOWN and exits 0: the lock genuinely proves odin is
+    running, and inventing a failure from a URL guess would be the mirror of
+    the lie above.
     """
     server = live_server(ODIN_DIR)
     if server is None:
         typer.echo(f"Odin is not running{_clear_stale_pidfile()}.")
         raise typer.Exit(1)
     typer.echo(f"Odin is running ({server.detail}).")
+    loops = _reconciler_health(url)
+    if loops is None:
+        typer.echo(
+            f"Odin holds this store, but did not answer {url.rstrip('/')}/health -- whether its "
+            f"reconcilers are converging is UNKNOWN (pass --url or ODIN_URL if it is on another port).",
+            err=True,
+        )
+        return
+    down = [loop for loop in loops if not loop.get("ticking")]
+    for loop in down:
+        typer.echo(f"RECONCILER DOWN: {loop.get('verdict')}", err=True)
+    if down:
+        raise typer.Exit(1)
+    typer.echo(f"{len(loops)} reconciler(s) converging: {', '.join(loop['env'] for loop in loops) or 'none yet'}.")
 
 
 # Every container odin creates carries `odin=1` and `odin-env=<env>`, so the

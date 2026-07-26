@@ -57,9 +57,10 @@ Two halves, deliberately split:
    fallback keeps.
 
 Unlike translate's refine pass this is ON by default (`ODIN_DEBUG_AGENT=0`
-turns it off). It has no drift risk to guard against: it only READS state and
-returns prose, so the worst a bad answer costs is a wrong hunch, never a wrong
-apply.
+turns it off; `ODIN_AI=0` turns off every model call odin can make, this one
+included -- see `agent/ai.py`). It has no drift risk to guard against: it only
+READS state and returns prose, so the worst a bad answer costs is a wrong
+hunch, never a wrong apply.
 """
 from __future__ import annotations
 
@@ -72,6 +73,7 @@ from typing import Any, TypedDict
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, SdkMcpTool, create_sdk_mcp_server, tool
 
+from odin.agent import ai
 from odin.spec.models import REDACTED, FieldValue, Stack, World, scrub
 
 log = logging.getLogger("odin.debugger")
@@ -101,14 +103,31 @@ UNAVAILABLE: dict[str, Any] = {"answer": "agent unavailable", "suspects": []}
 _DISABLED = "the failure-explanation agent is off (unset ODIN_DEBUG_AGENT to enable)"
 
 
+def disabled_reason() -> str | None:
+    """Why this feature will not run, in the sentence the route answers with --
+    or None when it will.
+
+    Two switches can hold it back and they must not be confused: `ODIN_AI=0`
+    (every model call in the process, see `agent/ai.py`) and this feature's own
+    `ODIN_DEBUG_AGENT=0`. Naming the wrong one sends the user to a flag that
+    changes nothing, so the more general one is named first and verbatim."""
+    reason = ai.off_reason()
+    if reason is not None:
+        return f"the failure-explanation agent did not run: {reason}"
+    if os.environ.get("ODIN_DEBUG_AGENT", "1").strip().lower() in ("0", "false", "no", "off"):
+        return _DISABLED
+    return None
+
+
 def enabled() -> bool:
     """ON by default -- the deliberate difference from
     `translate.refine_enabled()`. That pass is optional decoration over an
     already-correct deterministic translation, so it opts IN; this one is the
     whole feature, and it cannot corrupt anything (read-only + prose out), so
-    it opts OUT. `ODIN_DEBUG_AGENT=0` (or false/no/off) disables it. Read
-    fresh on every call, same convention as translate's own env reads."""
-    return os.environ.get("ODIN_DEBUG_AGENT", "1").strip().lower() not in ("0", "false", "no", "off")
+    it opts OUT. `ODIN_DEBUG_AGENT=0` (or false/no/off) disables it, and
+    `ODIN_AI=0` disables it along with every other model call odin can make.
+    Read fresh on every call, same convention as translate's own env reads."""
+    return disabled_reason() is None
 
 
 def _default_timeout() -> float:
@@ -450,9 +469,15 @@ async def diagnose(
     unauthenticated, timeout, a run that never called the tool -- returns an
     honest fallback answer instead of raising, because the route must never
     500 for agent reasons."""
-    if not enabled():
-        return {"answer": _DISABLED, "suspects": []}
+    off = disabled_reason()
+    if off is not None:
+        return {"answer": off, "suspects": []}
 
+    # The BOUNDARY, for the reason `agent/ai.py::refuse_if_off` gives: the gate
+    # above is a caller-level check, and this is the one place a client gets
+    # built. `AiDisabled` lands in the same `except` every other SDK failure
+    # does, one frame below.
+    ai.refuse_if_off()
     os.environ.pop("CLAUDECODE", None)  # avoid nested-Claude-Code confusion (translate.py precedent)
     collected: list[dict] = []
     server = create_sdk_mcp_server(name="debugger", tools=[make_report_tool(collected)])

@@ -14,6 +14,16 @@ from odin.cli.http import OutputFormat
 
 
 def _render_world(body: dict) -> None:
+    # The loop that AUTHORS every phase below, first -- a dead or hung
+    # reconciler makes this whole table a frozen snapshot, and printing the
+    # table without saying so is what let a dead loop look like a converged env
+    # (see Reconciler.health). Above the empty-world return too: "world is
+    # empty" from a reconciler that never ticked is the same lie.
+    # stderr, for `_render_envs`'s reason -- stdout stays the table a pipe
+    # expects, and `-o json` carries the whole `reconciler` block for machines.
+    verdict = (body.get("reconciler") or {}).get("verdict")
+    if verdict:
+        typer.echo(f"RECONCILER DOWN: {verdict}", err=True)
     resources = body["resources"]
     if not resources:
         typer.echo(f"env {body['env']}: world is empty")

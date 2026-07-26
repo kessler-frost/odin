@@ -247,6 +247,19 @@ def test_the_route_is_wired_into_the_real_app_and_never_500s_when_the_agent_is_o
     assert body["env"] == ENV and body["suspects"] == [] and "off" in body["answer"]
 
 
+def test_odin_ai_0_answers_honestly_through_the_real_route_without_a_model_call(app_client, monkeypatch):
+    """The one switch for every model call, at the route. Same real
+    `debugger.diagnose`, same honest 200 -- the answer just names `ODIN_AI`,
+    the switch that actually stopped it, rather than this feature's own flag."""
+    monkeypatch.setenv("ODIN_AI", "0")
+    monkeypatch.setenv("ODIN_DEBUG_AGENT", "1")  # the feature is opted IN and still makes no call
+    app_client.post("/apply", params={"env": ENV}, json=CANVAS)
+    resp = app_client.post("/agent/debug", json={"env": ENV, "node_ids": ["db"]})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["suspects"] == [] and "ODIN_AI" in body["answer"]
+
+
 def test_a_cross_origin_post_is_rejected_like_every_other_state_changing_route(app_client):
     # Deliberate (see api/debug.py's own note): the route mutates nothing, but
     # it spends a model call and hands back the env's config/logs/verdicts, so
