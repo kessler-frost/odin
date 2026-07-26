@@ -210,8 +210,9 @@ What it needs and what it can't do:
 - It requires the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python)
   — the `claude` CLI on your `PATH`, signed in. Without it the answer is
   `agent unavailable`, and the panel says so. Nothing else in odin
-  needs it; `ODIN_DEBUG_AGENT=0` turns the feature off outright, and
-  `ODIN_DEBUG_TIMEOUT` (default 90s) bounds the call.
+  needs it; `ODIN_DEBUG_AGENT=0` turns the feature off outright,
+  `ODIN_AI=0` turns off [every model call odin can make](#turning-all-ai-off),
+  and `ODIN_DEBUG_TIMEOUT` (default 90s) bounds the call.
 - Secrets never reach the model: env-var **values** are reduced to key names,
   any field odin flags sensitive is `[REDACTED]`, and every string in the
   evidence — including log lines, tofu's own output, and an RDS node's
@@ -221,6 +222,46 @@ What it needs and what it can't do:
 - The evidence is capped (40 log lines and 10 events per node, 20 nodes, 20
   lines of tofu output), so a failure whose cause scrolled past that window
   won't be in the answer. The Logs tab has the full tail.
+
+## Turning all AI off
+
+**`ODIN_AI=0` turns off every model call odin can make** — one switch, and it
+is the whole list. There are exactly two features that can talk to a model, and
+both go through `claude-agent-sdk` (which spawns the `claude` CLI): the
+optional Terraform *refine* pass (`ODIN_TRANSLATE_REFINE`, off by default
+anyway) and ["What's wrong here?"](#whats-wrong-here) (`ODIN_DEBUG_AGENT`, on
+by default). With `ODIN_AI=0` neither one builds a client, spawns anything or
+waits on anything; the debug route answers its normal honest "agent
+unavailable" 200, naming the switch. Nothing else in odin has ever asked a
+model anything — no Anthropic or OpenAI HTTP call, no local inference endpoint,
+no `ANTHROPIC_*` key read, anywhere.
+
+Values: unset, `1`, `true`, `yes`, `on` allow model calls; `0`, `false`, `no`,
+`off` disable them; **anything odin doesn't recognise also disables them**, with
+a warning naming the value — a typo must not be able to quietly re-enable what
+you asked to switch off.
+
+### What you keep with all AI disabled: everything that applies
+
+**The canvas ↔ Terraform translation is a deterministic compiler, not a model
+call.** `src/odin/agent/hcl.py` compiles the canvas to HCL and
+`src/odin/agent/import_tf.py` parses HCL back into canvas nodes; the same
+canvas always produces byte-identical Terraform, with or without AI. So with
+`ODIN_AI=0`:
+
+- Apply, `odin apply`, `/translate`, `/import-tf`, `tofu plan`/`apply`/`destroy`
+  and every substrate behave exactly as documented.
+- IAM edges are still compiled and still enforced by the gateway.
+- `/world`, drift detection, the reconciler and every status surface are
+  untouched — none of them ever involved a model.
+
+The refine pass was never allowed to change what gets applied even when it *is*
+on: whatever it returns is re-validated against the deterministic skeleton
+(identical resource set, every argument value byte-identical) and discarded on
+any deviation. Turning it off costs comments and tags, never correctness. The
+only feature you actually lose is the prose explanation of a failure — and the
+evidence it would have read (`odin logs`, `odin events`, `/world` verdicts,
+tofu's own tail) is all still there to read yourself.
 
 ## The CLI is the same product
 
@@ -545,10 +586,11 @@ it anywhere else won't preserve that. See [SECURITY.md](SECURITY.md#secrets).
   then either forwards to a real backing or answers from its own per-service
   model store (EC2/VPC/SG/IAM/ECR/Lambda/ECS — nobody makes an open-source AWS
   API for these, so odin owns the model and binds it to a real substrate).
-- **Canvas ↔ Terraform translation** (`src/odin/agent/`): deterministic in
-  both directions — the same canvas always produces the same `.tf`, and
-  `/import-tf` parses HCL (or resolves live resources) back into canvas
-  nodes, no model call in the loop for either. An optional agent pass
+- **Canvas ↔ Terraform translation** (`src/odin/agent/`): a deterministic
+  compiler in both directions — the same canvas always produces the same `.tf`,
+  and `/import-tf` parses HCL (or resolves live resources) back into canvas
+  nodes, no model call in the loop for either, and it all still works with
+  [all AI disabled](#turning-all-ai-off). An optional agent pass
   (`claude-agent-sdk`; set `ODIN_TRANSLATE_REFINE=1` to turn it on — off by
   default) can review the generated file and add comments or tags; every
   return is re-validated against the skeleton (same resource set, every

@@ -27,7 +27,7 @@ from typing import Any, TypedDict
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, SdkMcpTool, create_sdk_mcp_server, tool
 from pydantic import BaseModel
 
-from odin.agent import hcl
+from odin.agent import ai, hcl
 from odin.agent.hcl import TfProject, generate_tf
 from odin.simulate.runner import PLUGIN_CACHE_DIR
 from odin.spec.models import REDACTED, Stack, scrub
@@ -49,7 +49,11 @@ def _default_timeout() -> float:
 
 
 def refine_enabled() -> bool:
-    """`ODIN_TRANSLATE_REFINE` opts IN to the claude-agent-sdk refine pass --
+    """`ODIN_AI=0` wins over everything here (see `agent/ai.py`): it is the one
+    switch for every model call in the process, so a user who set it does not
+    also have to know this flag exists.
+
+    `ODIN_TRANSLATE_REFINE` opts IN to the claude-agent-sdk refine pass --
     OFF by default. The canvas -> Terraform translation (`agent/hcl.py`) is
     fully deterministic; this pass is a best-effort ADD-ON that can only
     attach comments/tags/unset arguments (`validate_refinement`'s
@@ -60,7 +64,11 @@ def refine_enabled() -> bool:
     restart required. Checked ONLY on the cached (production, see
     server.py) path in `translate()` below: without it, a no-API-key
     install used to re-kick a doomed ~`_TIMEOUT_S`-second SDK pass, in the
-    background, on every single `/translate`/`/apply-full` call for nothing."""
+    background, on every single `/translate`/`/apply-full` call for nothing.
+    (`ai.refuse_if_off()` is what covers the UNCACHED path, which has no gate
+    of its own -- see `_refine`.)"""
+    if ai.off_reason() is not None:
+        return False
     return os.environ.get("ODIN_TRANSLATE_REFINE", "").strip().lower() in ("1", "true", "yes", "on")
 
 
@@ -169,7 +177,16 @@ async def _run_agent(prompt: str, options: ClaudeAgentOptions, client_cls: type)
 async def _refine(skeleton: TfProject, stack: Stack, client_cls: type, timeout: float) -> dict | None:
     """Runs the SDK pass; returns the `emit_terraform` payload if the agent
     called it, else None (SDK failure, timeout, or no call — every caller
-    treats these identically: keep the skeleton)."""
+    treats these identically: keep the skeleton).
+
+    `ai.refuse_if_off()` first, and it is the reason `ODIN_AI=0` is a real
+    switch rather than a suggestion: this is the ONE place this module builds a
+    client, and `translate(stack)` without a `cache` reaches it with no
+    `refine_enabled()` check at all. Raising here happens before
+    `create_sdk_mcp_server` and before any client exists, so nothing is spawned
+    and nothing can hang; `_refine_once` turns it into the same
+    keep-the-skeleton result every other failure mode produces."""
+    ai.refuse_if_off()
     os.environ.pop("CLAUDECODE", None)  # avoid nested-Claude-Code confusion (brain.py precedent)
     collected: list[dict] = []
     server = create_sdk_mcp_server(name="translate", tools=[make_emit_tool(collected)])
@@ -269,6 +286,16 @@ _REFINE_DISABLED_NOTE = (
 )
 
 
+def _disabled_note() -> str:
+    """Which flag actually held the refine pass back, in the note the caller
+    prints. Telling a user to set `ODIN_TRANSLATE_REFINE=1` when `ODIN_AI=0` is
+    what really stopped it would send them to a flag that changes nothing."""
+    reason = ai.off_reason()
+    if reason is None:
+        return _REFINE_DISABLED_NOTE
+    return f"no AI refine pass: {reason} -- using the deterministic translation"
+
+
 def _fallback_result(skeleton: TfProject, notes: list[str]) -> TranslateResult:
     """A non-refined result carrying the deterministic skeleton verbatim
     (files + the lambda zip bytes) -- the no-supported-resources short-circuit,
@@ -286,8 +313,17 @@ async def _refine_once(skeleton: TfProject, stack: Stack, client_cls: type, time
     on whatever it returned, and produce either the refined result
     (`refined=True`) or the skeleton fallback (`refined=False`). Never touches
     any cache -- the caller decides whether to await this inline (no cache) or
-    on a background task (`TranslateCache`)."""
-    payload = await _refine(skeleton, stack, client_cls, timeout)
+    on a background task (`TranslateCache`).
+
+    `AiDisabled` is the switch-off boundary refusing (`agent/ai.py`), and it
+    lands in the same place every other non-refinement does: the deterministic
+    skeleton, plus a note naming why. It is caught HERE rather than in
+    `_refine` so the raise cannot escape past any caller -- including the
+    uncached path, whose only gate this is."""
+    try:
+        payload = await _refine(skeleton, stack, client_cls, timeout)
+    except ai.AiDisabled as disabled:
+        return _fallback_result(skeleton, [f"no AI refine pass: {disabled} -- using the deterministic translation"])
     if payload is None:
         return _fallback_result(skeleton, ["agent proposed no refinement -- using the deterministic skeleton"])
 
@@ -385,7 +421,7 @@ async def translate(
         return await _refine_once(skeleton, stack, client_cls, timeout)
 
     if not refine_enabled():
-        return _fallback_result(skeleton, [_REFINE_DISABLED_NOTE])
+        return _fallback_result(skeleton, [_disabled_note()])
 
     rev = rev_of(stack)
     cached = cache.get(rev)
