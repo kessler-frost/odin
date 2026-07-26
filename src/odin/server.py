@@ -24,7 +24,7 @@ from pydantic import BaseModel
 
 from odin.agent import import_tf as import_tf_mod
 from odin.agent import translate as translate_mod
-from odin.agent.hcl import TfProject, generate_tf, resource_set
+from odin.agent.hcl import TfProject, generate_tf, parse_tf, resource_set, unquote
 from odin.api.canvas import CanvasGraph, create_canvas_router
 from odin.api.debug import create_debug_router
 from odin.api.logs import create_logs_router
@@ -48,7 +48,7 @@ from odin.simulate.runner import SimulateBusy, TfRunner, TofuNotInstalled
 from odin.simulate.workspace import tf_dir
 from odin.spec.models import Stack, World
 from odin.spec.store import SpecStore
-from odin.spec.translate import canvas_to_stack, skipped_node_types
+from odin.spec.translate import MODELLED_NODE_TYPES, canvas_to_stack, drawn_node_types, skipped_node_types
 from odin.util import STORE_LOCK_NAME, StoreLock, hold_store_lock, odin_version
 
 ODIN_DIR = Path(".odin")
@@ -139,20 +139,179 @@ async def _admission_rejection(runtime, store: SpecStore, stack: Stack) -> JSONR
     })
 
 
-def _tf_state_addresses(root: Path, env: str) -> list[str]:
-    """Every managed resource tofu's OWN state still holds for `env` -- the
-    authoritative answer to "what is still standing" after a destroy that
-    didn't finish. Read straight out of `terraform.tfstate` (structured JSON)
-    rather than shelled out to `tofu state list`, which would want the very
-    per-env lock the failed run just released and would cost another process.
-    An unreadable/absent state file is honestly nothing to report, not a
-    crash: the caller is already on a failure path."""
+def _tf_state(root: Path, env: str) -> dict:
+    """tofu's OWN state for `env`, or `{}` when there is nothing to read.
+
+    Read straight out of `terraform.tfstate` (structured JSON) rather than
+    shelled out to `tofu state list`, which would want the very per-env lock a
+    failed run just released and would cost another process. STRICT in the same
+    direction as `tf_status._tf_state`: a state file that is missing, empty or
+    caught mid-rewrite is NO evidence, never an error -- every caller here is
+    either already on a failure path or is a pre-apply guard that must not 500
+    because it read the file during a concurrent apply."""
     state = tf_dir(root, env) / "terraform.tfstate"
-    parsed = json.loads(state.read_text() or "{}") if state.exists() else {}
-    return sorted(
-        f"{resource['type']}.{resource['name']}"
-        for resource in parsed.get("resources", []) if resource.get("mode") != "data"
-    )
+    text = state.read_text().strip() if state.is_file() else ""
+    try:
+        return json.loads(text) if text else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def _managed_resources(root: Path, env: str) -> list[dict]:
+    return [r for r in _tf_state(root, env).get("resources", []) if r.get("mode") != "data"]
+
+
+def _tf_state_addresses(root: Path, env: str) -> list[str]:
+    """Every managed resource tofu's own state still holds for `env` -- the
+    authoritative answer to "what is still standing" after a destroy that
+    didn't finish."""
+    return sorted(f"{r['type']}.{r['name']}" for r in _managed_resources(root, env))
+
+
+# The tag `agent/hcl.py::_tags_block` stamps on EVERY primary canvas-node-backed
+# resource block (never on a companion -- a task definition, an sns->sqs
+# subscription, a lambda's auto-role), carrying the canvas label. Already the
+# mechanism `reconcile/tf_status.py` and `gateway/keys.py::workload_env` key
+# off; this is the third reader, and the reason the guard below can answer
+# "which NODE does this terraform resource belong to" without re-deriving
+# hcl.py's private HCL-name assignment.
+_ODIN_NODE_TAG = "odin:node"
+
+
+def _tagged_node(tags: object) -> str:
+    """The canvas node a `tags` map names, or "". python-hcl2 keeps a quoted
+    literal's own quotes on BOTH the map key and the value when it parses HCL
+    (probed against the real parser, not assumed -- see `hcl.unquote`), while
+    the same map read back out of `terraform.tfstate` is plain JSON with no
+    quotes at all. `unquote` is a no-op on the latter, so one reader serves
+    both."""
+    if not isinstance(tags, dict):
+        return ""
+    return next((unquote(v) or "" for k, v in tags.items() if unquote(k) == _ODIN_NODE_TAG), "")
+
+
+def _covered_nodes(files: dict[str, str]) -> set[str]:
+    """The canvas nodes a generated Terraform project ACTUALLY builds a
+    resource for -- i.e. the nodes that will still exist after `tofu apply`
+    runs it.
+
+    Read off the real generated HCL rather than inferred from `unsupported`,
+    which is NOT the same set: `_unwired_refs` and the alb-target check both
+    append entries for resources hcl.py did build, so keying the guard on
+    `unsupported` would refuse applies that destroy nothing (honesty rule 1 --
+    a guard must read a signal that actually means what it is being read to
+    mean). `unsupported` is used for the human REASON only, below."""
+    return {node for _type, _name, attrs in parse_tf(files) if (node := _tagged_node(attrs.get("tags")))}
+
+
+def _tf_state_nodes(root: Path, env: str) -> set[str]:
+    """Every canvas node tofu's own state still holds a real resource for."""
+    return {
+        node
+        for resource in _managed_resources(root, env)
+        for instance in resource.get("instances", [])
+        if (node := _tagged_node((instance.get("attributes") or {}).get("tags")))
+    }
+
+
+def _existing_nodes(store: SpecStore, env: str) -> set[str]:
+    """Every canvas node odin can PROVE exists right now, from its two real
+    witnesses: what the reconciler has actually observed (World) and what
+    tofu's own state holds.
+
+    NOT the last-applied Stack, which is the tempting reading and the wrong
+    one: `/apply-full` commits a Stack whenever tofu SUCCEEDS, and an
+    unbuildable resource does not fail an apply -- so a node that has never
+    existed for a single second is in the last-applied Stack from the very
+    first apply onward. Guarding on that would refuse every subsequent apply
+    of a canvas that has one permanently-unsupported node on it, while
+    protecting nothing. Existence is the thing being protected, so existence
+    is the thing that gets measured."""
+    return {r.id for r in store.current_world(env).resources} | _tf_state_nodes(store.root, env)
+
+
+# Query parameter for the one caller who genuinely means it. Nothing in the UI
+# or the CLI ever sets it, so it cannot be reached by a mis-click or a stale
+# script; the refusal below names it, which is the only place a user learns it
+# exists.
+ALLOW_UNCOVERED = "allow_destroying_uncovered"
+
+
+def _uncovered_reason(node: str, requested_as: str, kind: str | None, unsupported: list[str]) -> str:
+    """WHAT about this node isn't covered, in the user's own vocabulary.
+
+    Two genuinely different failures: the canvas `type` isn't a kind odin
+    models at all (so the node never became a Stack resource -- `!r` because a
+    trailing space is invisible without the quotes), or it did become one and
+    the Terraform builder declined it, in which case hcl.py's own reason is
+    reproduced verbatim. The reason is cosmetic: the guard has already fired on
+    the coverage signal, so a change to hcl.py's message format degrades this
+    line and never the protection."""
+    if kind is None:
+        return (
+            f"its type {requested_as!r} is not a kind odin models"
+            + ("" if requested_as in MODELLED_NODE_TYPES else " (a typo?)")
+            + " -- it is not in the desired state at all"
+        )
+    prefix = f"{node} ({kind}): "
+    declined = [entry.removeprefix(prefix) for entry in unsupported if entry.startswith(prefix)]
+    return declined[0] if declined else f"odin generated no Terraform resource for it ({kind})"
+
+
+def _uncovered_destroys(
+    requested: dict[str, str], existing: set[str], covered: set[str],
+    kinds: dict[str, str], unsupported: list[str],
+) -> list[dict]:
+    """Field test 5 (HIGHEST, silent data loss): the resources this apply would
+    DESTROY without ever being asked to.
+
+    `count: "2"` -> `"two"` on a live ECS node destroyed the service and both
+    task containers; `type: "s3"` -> `"s3 "` destroyed a real bucket, the object
+    inside it and the rustfs backing. Both reported `status: applied`, `tf: ok`,
+    exit 0, in under four seconds. The only signal was a line in `not_covered`,
+    a field whose documented meaning is "a node odin didn't act on".
+
+    The distinction, and it is the whole point:
+
+    * `requested` -- still on the canvas (or, on `/tf/apply`, still in the Stack
+      being applied). A node the user REMOVED is deliberately absent from this
+      map, so removing a node still destroys it: "empty canvas = full teardown"
+      is odin's documented teardown story and is untouched by this.
+    * `existing` -- odin can prove it exists (World or tofu's state). A node
+      that was never successfully applied has nothing to lose, so it stays on
+      today's behavior: skipped, and reported in `not_covered`.
+    * `covered` -- this apply keeps it. Everything else about a node is
+      irrelevant here; the question is only whether it survives.
+
+    Still asked for + really exists + not covered = destruction the user did not
+    ask for. That is a refusal, not a status."""
+    return [
+        {
+            "node": node, "requested_as": requested_as, "kind": kinds.get(node),
+            "reason": _uncovered_reason(node, requested_as, kinds.get(node), unsupported),
+        }
+        for node, requested_as in sorted(requested.items())
+        if node in existing and node not in covered
+    ]
+
+
+def _uncovered_rejection(uncovered: list[dict], env: str) -> JSONResponse:
+    """The refusal itself: names every node, says what about it isn't covered,
+    and says plainly what applying anyway would do. `error` is what makes the
+    CLI exit nonzero (`cli/http.body_or_fail`), the same convention every other
+    honest refusal in this file uses."""
+    named = "; ".join(f"{item['node']} — {item['reason']}" for item in uncovered)
+    return JSONResponse(status_code=409, content={
+        "error": (
+            f"refusing to apply: {len(uncovered)} resource(s) that env {env!r} really has right now "
+            f"are still on the canvas but are NOT covered by this apply, so applying would DESTROY "
+            f"them: {named}. Fix the node(s) above and re-apply. If you genuinely want them gone, "
+            f"delete them from the canvas (that is odin's teardown story and it still works) or "
+            f"re-send with ?{ALLOW_UNCOVERED}=true. Nothing was changed."
+        ),
+        "would_destroy": uncovered,
+        "env": env,
+    })
 
 
 def _surviving_containers(runtime, env: str) -> list[str]:
@@ -181,20 +340,32 @@ def create_apply_router(
     router = APIRouter()
 
     @router.post("/apply")
-    async def apply(graph: CanvasGraph, env: str = ENV) -> dict:
-        reconciler = await reconciler_for(env)
+    async def apply(graph: CanvasGraph, env: str = ENV, allow_destroying_uncovered: bool = False) -> JSONResponse:
         canvas = graph.model_dump()
         stack = canvas_to_stack(canvas, env=env)
+        # Field test 5 (HIGHEST): the same refusal `/apply-full` makes, for the
+        # same reason -- this route commits the desired state too, and the
+        # reconciler's own prune/gc is what deleted the rustfs backing (and the
+        # object inside it) when one node's `type` grew a trailing space. No
+        # Terraform is generated here, so "covered" is simply everything that
+        # became a Stack resource: the reconciler acts on all of them.
+        uncovered = _uncovered_destroys(
+            drawn_node_types(canvas), _existing_nodes(store, env),
+            {r.id for r in stack.resources}, {r.id: r.kind for r in stack.resources}, [],
+        )
+        if uncovered and not allow_destroying_uncovered:
+            return _uncovered_rejection(uncovered, env)
+        reconciler = await reconciler_for(env)
         rev = store.apply(stack)
         await reconciler.tick()  # kick an immediate pass; the loop continues it
         skipped = skipped_node_types(canvas)
         # No `unsupported` half here: this route never generates Terraform, so
         # the union is the skipped list -- still published under the same name
         # every other apply surface uses, so a gate reads ONE field everywhere.
-        return {
+        return JSONResponse(status_code=200, content={
             "status": "applied", "rev": rev, "env": env,
             "skipped": skipped, "not_covered": not_covered(skipped, []),
-        }
+        })
 
     @router.post("/destroy")
     async def destroy(env: str = ENV) -> JSONResponse:
@@ -400,14 +571,25 @@ def create_tf_router(
         return keystore.issue(env, OPERATOR_NODE_ID)
 
     @router.post("/tf/apply")
-    async def tf_apply(env: str = ENV) -> JSONResponse:
+    async def tf_apply(env: str = ENV, allow_destroying_uncovered: bool = False) -> JSONResponse:
         stack = store.get_stack(env)
+        project = generate_tf(stack)
+        # Field test 5 (HIGHEST): the same refusal the canvas routes make. There
+        # is no canvas here -- this route applies the STORED Stack, so the Stack
+        # itself is what the user is still asking for, and a resource in it that
+        # generates no Terraform is one `tofu apply` deletes out of its own state
+        # while the user is asking for it. Same three conditions, same helper.
+        uncovered = _uncovered_destroys(
+            {r.id: r.kind for r in stack.resources}, _existing_nodes(store, env),
+            _covered_nodes(project.files), {r.id: r.kind for r in stack.resources}, project.unsupported,
+        )
+        if uncovered and not allow_destroying_uncovered:
+            return _uncovered_rejection(uncovered, env)
         # Owner directive B1: reject BEFORE tofu ever runs, not after it's
         # already spawned real containers/VMs that then fail one-by-one.
         rejection = await _admission_rejection(runtime, store, stack)
         if rejection is not None:
             return rejection
-        project = generate_tf(stack)
         # Canvas wiring: same publish `/apply-full` does, from the stack this
         # route applies -- otherwise a Simulate run would launch containers
         # against whatever the LAST /apply-full staged.
@@ -579,7 +761,7 @@ def create_apply_full_router(
     router = APIRouter()
 
     @router.post("/apply-full")
-    async def apply_full(graph: CanvasGraph, env: str = ENV) -> JSONResponse:
+    async def apply_full(graph: CanvasGraph, env: str = ENV, allow_destroying_uncovered: bool = False) -> JSONResponse:
         # Busy guard BEFORE any mutation (mirrors SimulateBusy's own message):
         # no reconcile, no store write while a tofu run holds the env's lock.
         if runner.status(env)["running"]:
@@ -589,6 +771,29 @@ def create_apply_full_router(
             )
         canvas = graph.model_dump()
         stack = canvas_to_stack(canvas, env=env)
+
+        # Field test 5 (HIGHEST): refuse an apply that would silently DESTROY a
+        # resource this env really has, because the node describing it stopped
+        # being coverable (a typo'd `type`, a field value that makes its builder
+        # decline). See `_uncovered_destroys` for the removed-versus-uncovered
+        # distinction, which is the whole of it.
+        #
+        # FIRST, and before `_bump_epoch` in particular: this refusal changes
+        # nothing, so it must not supersede an in-flight apply on its way out.
+        # The coverage set comes from `generate_tf` rather than the `translate`
+        # call below because it must be known before the epoch is read, and the
+        # two are the same set by construction: `TranslateResult` carries the
+        # SKELETON's `unsupported` on both its paths, and the agent-refinement
+        # guardrail rejects any output whose resource set differs from the
+        # skeleton's, so the refined files it eventually applies build exactly
+        # these nodes. Deterministic and local -- no agent call, no I/O.
+        skeleton = generate_tf(stack)
+        uncovered = _uncovered_destroys(
+            drawn_node_types(canvas), _existing_nodes(store, env), _covered_nodes(skeleton.files),
+            {r.id: r.kind for r in stack.resources}, skeleton.unsupported,
+        )
+        if uncovered and not allow_destroying_uncovered:
+            return _uncovered_rejection(uncovered, env)
 
         # Owner directive B1: reject BEFORE ensure_backings/translate/tofu
         # ever touch a container or VM, not after 20 of them have already
