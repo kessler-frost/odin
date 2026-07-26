@@ -7,6 +7,8 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
+import time
 
 import pytest
 import typer
@@ -210,13 +212,82 @@ def test_status_cleans_a_stale_pidfile_and_says_so(tmp_path, monkeypatch, capsys
     assert not main_mod.PID_FILE.exists()
 
 
-def test_stop_signals_a_server_odin_did_not_start(tmp_path, monkeypatch, capsys, store_lock):
+def test_stop_signals_a_server_odin_did_not_start(tmp_path, monkeypatch, capsys):
+    """The SIGTERM lands, and the lock comes free the way a real server's
+    does -- by the process the signal reached going away."""
     monkeypatch.chdir(tmp_path)
+    lock = util.hold_store_lock(tmp_path / ".odin")
     killed = []
-    monkeypatch.setattr(main_mod.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+    def exits_on_sigterm(pid, sig):
+        killed.append((pid, sig))
+        lock.release()  # what a real server's death does to its store lock
+
+    monkeypatch.setattr(main_mod.os, "kill", exits_on_sigterm)
     main_mod.stop()
     assert killed == [(os.getpid(), main_mod.signal.SIGTERM)]
     assert "Stopped." in capsys.readouterr().out
+
+
+def test_stop_says_stopped_only_once_the_store_is_really_free(tmp_path, monkeypatch, capsys):
+    """FIELD TEST 5. `odin stop` printed `Stopped.` and returned rc=0 in 0.17s
+    while the server lived another 0.91s -- so `odin stop && odin clean --all`
+    was REFUSED in two of three back-to-back trials, by the very guard that
+    tells users to run `odin stop` first. SIGTERM is a request; this command's
+    own --help promises an end state.
+
+    The wait is on the real signal, never a sleep: the server here releases the
+    store lock late, and `stop` must not return before it does."""
+    monkeypatch.chdir(tmp_path)
+    lock = util.hold_store_lock(tmp_path / ".odin")
+    linger = 0.6
+    released_at = []
+
+    def exits_slowly(pid, sig):
+        def _exit() -> None:
+            released_at.append(time.monotonic())
+            lock.release()
+        threading.Timer(linger, _exit).start()
+
+    monkeypatch.setattr(main_mod.os, "kill", exits_slowly)
+    started = time.monotonic()
+    main_mod.stop()  # no typer.Exit == exit 0, and it is EARNED
+    returned_at = time.monotonic()
+    assert "Stopped." in capsys.readouterr().out
+    assert returned_at - started >= linger  # it waited
+    assert returned_at >= released_at[0]  # ...for THIS, not for a clock
+    assert util.live_server(main_mod.ODIN_DIR) is None  # and the store really is free
+
+
+def test_stop_that_never_comes_down_says_so_and_exits_one(tmp_path, monkeypatch, capsys):
+    """The honest other half: a server that ignores SIGTERM. The contract is
+    "0 once odin is down, 1 if it is still up", so a wait that runs out is a
+    failure with the reason named -- and the pidfile SURVIVES it, because it
+    is the evidence the next `odin status`/`odin stop` needs."""
+    monkeypatch.chdir(tmp_path)
+    lock = util.hold_store_lock(tmp_path / ".odin")
+    main_mod.PID_FILE.write_text(str(os.getpid()))
+    monkeypatch.setattr(main_mod, "SHUTDOWN_GRACE", 0.5)  # a wedged server is not worth 20s here
+    monkeypatch.setattr(main_mod.os, "kill", lambda pid, sig: None)  # SIGTERM ignored
+    try:
+        with pytest.raises(typer.Exit) as exit_info:
+            main_mod.stop()
+    finally:
+        lock.release()
+    assert exit_info.value.exit_code == 1
+    captured = capsys.readouterr()
+    assert "Stopped." not in captured.out
+    assert "did NOT exit within" in captured.err and "clean --all" in captured.err
+    assert main_mod.PID_FILE.exists()
+
+
+def test_stop_waits_the_full_documented_grace(tmp_path, monkeypatch):
+    """The bound is the store-wide one (`util.SHUTDOWN_GRACE`, what `odin
+    import` already waits), not a number invented here: a real server's
+    lifespan stops every reconciler and the gateway thread before it releases
+    the lock, which takes seconds."""
+    assert main_mod.SHUTDOWN_GRACE is util.SHUTDOWN_GRACE
+    assert util.SHUTDOWN_GRACE >= 10
 
 
 def test_stop_never_signals_a_pid_it_cannot_vouch_for(tmp_path, monkeypatch, capsys):

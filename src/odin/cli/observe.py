@@ -69,7 +69,11 @@ def _render_events(events_list: list[dict]) -> None:
 @app.command()
 def events(env: str = http.ENV, url: str = http.URL, output: OutputFormat = http.OUTPUT) -> None:
     """The env's durable event log (world deltas, tf runs, denials) — one line per event."""
-    body = http.request("GET", url, "/events", params={"env": env}).json()
+    # `parsed_or_fail`, not `body_or_fail`: this route answers with a JSON
+    # ARRAY, so there is no `error` field to key on -- but a refusal or a
+    # non-JSON body still has to fail here rather than reach `_render_events`
+    # as a document it cannot iterate.
+    body = http.parsed_or_fail(http.request("GET", url, "/events", params={"env": env}))
     http.emit(body, output, _render_events)
 
 
