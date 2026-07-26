@@ -12,6 +12,7 @@ import pytest
 import typer
 
 from odin import __main__ as main_mod, util
+from odin.cli import doctor as doctor_mod
 from odin.gateway.stores import SynthStores
 
 
@@ -350,6 +351,108 @@ def test_start_still_clears_a_stale_pidfile_and_proceeds(tmp_path, monkeypatch):
     main_mod.start(port=4200, foreground=False, dev=False, host="127.0.0.1")
     assert started, "a stale pidfile must not block a start"
     assert main_mod.PID_FILE.read_text() == "4242"
+
+
+# --- v0.7.5: a missing build tool is a finding, not a traceback -------------
+# `odin start` from a clone shells out to `bun`, and without it printed a
+# 40-line rich traceback ending in `FileNotFoundError: [Errno 2] No such file
+# or directory: 'bun'` -- on the first command a newcomer runs, the same shape
+# as the v0.7.3 blocker where `odin doctor` died on a missing `docker`.
+
+
+@pytest.fixture
+def clone_without_bun(tmp_path, monkeypatch):
+    """A clone (no bundled `_ui`), nothing built yet, and no bun on PATH."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main_mod, "BUNDLED_UI", tmp_path / "_ui")
+    monkeypatch.setattr(main_mod, "UI_DIR", tmp_path / "ui")
+    monkeypatch.setattr(main_mod.shutil, "which", lambda tool: None)
+    monkeypatch.setattr(
+        main_mod.subprocess, "run",
+        lambda *a, **kw: pytest.fail("must not shell out to a tool that isn't installed"))
+    return tmp_path
+
+
+def test_start_without_bun_names_the_fix_instead_of_raising(clone_without_bun, capsys):
+    with pytest.raises(typer.Exit) as exc:
+        main_mod.start(port=4200, foreground=False, dev=False, host="127.0.0.1")
+
+    assert exc.value.exit_code == 1
+    err = capsys.readouterr().err
+    assert "`bun` is not installed" in err            # a sentence...
+    assert f"fix: {doctor_mod.BUN_INSTALL}" in err    # ...and the exact command
+    assert "bun.sh/install" in err
+
+
+def test_dev_mode_without_bun_refuses_before_it_starts_anything(clone_without_bun, capsys):
+    """Checked before the pidfile and the backend exist, so a machine without
+    bun is refused rather than half-started."""
+    with pytest.raises(typer.Exit) as exc:
+        main_mod._start_dev(port=4200, host="127.0.0.1")
+
+    assert exc.value.exit_code == 1
+    assert "`bun` is not installed" in capsys.readouterr().err
+    assert not main_mod.PID_FILE.exists()
+
+
+def test_the_bun_fix_is_the_one_doctor_prints(clone_without_bun, capsys):
+    """One remedy, one spelling: `odin doctor`'s bun row and `odin start`'s
+    refusal both come from `doctor.BUN_INSTALL`."""
+    row, = doctor_mod.run_checks(["bun"], lambda args, input=None: util.CommandResult(1, ""))
+    with pytest.raises(typer.Exit):
+        main_mod._require_bun("build the UI")
+    assert row.fix and row.fix in capsys.readouterr().err
+
+
+def test_a_failed_ui_build_is_reported_not_raised(tmp_path, monkeypatch, capsys):
+    """bun IS installed and its build fails -- a different problem, a different
+    sentence, and still no traceback."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main_mod, "BUNDLED_UI", tmp_path / "_ui")
+    monkeypatch.setattr(main_mod, "UI_DIR", tmp_path / "ui")
+    monkeypatch.setattr(main_mod.shutil, "which", lambda tool: "/usr/local/bin/bun")
+    monkeypatch.setattr(main_mod, "_run_in_ui", lambda args: 1)
+
+    with pytest.raises(typer.Exit) as exc:
+        main_mod._build_ui()
+
+    assert exc.value.exit_code == 1
+    err = capsys.readouterr().err
+    assert "`bun run build` failed (exit 1)" in err
+    assert "bun install" in err
+
+
+def test_a_bun_that_cannot_be_executed_is_reported_not_raised(tmp_path, monkeypatch, capsys):
+    """The backstop: PATH says yes, exec says no (a dangling shim, a wrong-arch
+    binary). `_run_in_ui` translates it to 127 the way `util.run_command`
+    does for every other tool, so nothing here can raise."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main_mod, "BUNDLED_UI", tmp_path / "_ui")
+    monkeypatch.setattr(main_mod, "UI_DIR", tmp_path / "ui")
+    monkeypatch.setattr(main_mod.shutil, "which", lambda tool: "/usr/local/bin/bun")
+
+    def exec_fails(args, **kwargs):
+        raise OSError(8, "Exec format error")
+
+    monkeypatch.setattr(main_mod.subprocess, "run", exec_fails)
+
+    with pytest.raises(typer.Exit) as exc:
+        main_mod._build_ui()
+
+    assert exc.value.exit_code == 1
+    assert "could not be run" in capsys.readouterr().err
+
+
+def test_a_bundled_ui_needs_no_bun_at_all(tmp_path, monkeypatch, capsys):
+    """A released odin ships the UI prebuilt, so the bun check must not fire
+    there -- the message says so and this is what makes that true."""
+    monkeypatch.chdir(tmp_path)
+    bundled = tmp_path / "_ui"
+    bundled.mkdir()
+    monkeypatch.setattr(main_mod, "BUNDLED_UI", bundled)
+    monkeypatch.setattr(main_mod.shutil, "which", lambda tool: pytest.fail("must not ask for bun"))
+    main_mod._build_ui()
+    assert capsys.readouterr().err == ""
 
 
 # --- v0.7.5: `odin start` returns only once odin is SERVING -----------------

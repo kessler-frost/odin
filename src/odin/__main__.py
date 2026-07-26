@@ -16,13 +16,23 @@ import typer
 from odin.cli import commands as _commands  # noqa: F401  (registers the control-surface commands)
 from odin.cli import doctor as _doctor  # noqa: F401  (registers `odin doctor`)
 from odin.cli.app import app
+from odin.cli.doctor import BUN_INSTALL
 from odin.compute.instances import vm_name
 from odin.gateway.stores import SynthStores
-from odin.util import live_server, odin_version, pid_alive, private_mkdir, run_command
+from odin.util import (
+    COMMAND_NOT_FOUND,
+    live_server,
+    odin_version,
+    pid_alive,
+    private_mkdir,
+    run_command,
+)
 
 ODIN_DIR = Path(".odin")
 PID_FILE = ODIN_DIR / "pid"
 UI_DIR = Path(__file__).resolve().parent.parent.parent / "ui"
+# The prebuilt UI a released odin ships; present = no bun needed, ever.
+BUNDLED_UI = Path(__file__).resolve().parent / "_ui"
 DEFAULT_PORT = 4200
 BACKEND_DEV_PORT = 4201
 DEFAULT_HOST = "127.0.0.1"
@@ -187,15 +197,73 @@ def _report_start_failure(reason: str, proc: subprocess.Popen, log_path: Path) -
     return typer.Exit(1)
 
 
+def _refuse_without_bun(purpose: str, detail: str) -> typer.Exit:
+    """The sentence + exact command a machine without `bun` gets instead of a
+    traceback.
+
+    `odin start` is the first command anyone runs, and from a clone it shells
+    out to `bun` to build the UI. Through v0.7.4 a machine without bun got a
+    40-line rich traceback ending in `FileNotFoundError: [Errno 2] No such file
+    or directory: 'bun'` (`subprocess.run(..., check=True)`) -- the same shape
+    as the v0.7.3 blocker where `odin doctor` died on a missing `docker`. A
+    tool the user simply has not installed yet is an ordinary state of a
+    healthy machine: a FINDING, never a crash.
+
+    The fix string is `doctor.BUN_INSTALL`, imported rather than retyped, so
+    `odin start` and `odin doctor` cannot drift into two spellings of one
+    remedy.
+    """
+    typer.echo(f"Cannot {purpose}: {detail}.", err=True)
+    typer.echo(f"fix: {BUN_INSTALL}", err=True)
+    typer.echo(
+        "     then open a new shell so PATH picks it up. `odin doctor` re-checks it.\n"
+        "     (A released odin ships the UI prebuilt and needs no bun; this is a clone.)",
+        err=True,
+    )
+    return typer.Exit(1)
+
+
+def _require_bun(purpose: str) -> None:
+    """Ask PATH before shelling out. This is an OBSERVATION, not a guess from
+    an exit code -- and it is what separates "you don't have bun" from "your
+    build broke", two failures that need completely different sentences."""
+    if shutil.which("bun") is None:
+        raise _refuse_without_bun(purpose, "`bun` is not installed (nothing named `bun` on PATH)")
+
+
+def _run_in_ui(args: list[str]) -> int:
+    """`args` in `ui/`, returning its exit code -- and 127 rather than an
+    exception if the binary could not be executed at all, the same translation
+    `util.run_command` makes for every other tool odin shells out to. Output is
+    NOT captured: bun's own error is the diagnosis and belongs on the user's
+    terminal, not inside a traceback frame."""
+    try:
+        return subprocess.run(args, cwd=str(UI_DIR)).returncode
+    except OSError:
+        return COMMAND_NOT_FOUND
+
+
 def _build_ui() -> None:
-    if (Path(__file__).resolve().parent / "_ui").exists():
+    """Make sure there is a UI to serve -- or say which of the three things
+    went wrong and how to fix that one."""
+    if BUNDLED_UI.exists():
         return  # UI ships bundled with the installed package
-    dist = UI_DIR / "dist"
-    if not dist.exists():
-        typer.echo("Building UI …")
-        subprocess.run(["bun", "run", "build"], cwd=str(UI_DIR), check=True)
-    else:
+    if (UI_DIR / "dist").exists():
         typer.echo("UI already built (ui/dist exists). Run `bun run build` in ui/ to rebuild.")
+        return
+    _require_bun("build the UI")
+    typer.echo("Building UI …")
+    code = _run_in_ui(["bun", "run", "build"])
+    if code == COMMAND_NOT_FOUND:
+        # PATH said yes and exec said no -- a dangling shim, a wrong-arch
+        # binary. Same remedy, different evidence, and it must say which.
+        raise _refuse_without_bun("build the UI", "`bun` is on PATH but could not be run")
+    if code != 0:
+        typer.echo(f"Cannot build the UI: `bun run build` failed (exit {code}) in {UI_DIR}.",
+                   err=True)
+        typer.echo("fix: read bun's output above; `bun install` in ui/ is the usual missing step.",
+                   err=True)
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -261,6 +329,11 @@ def _start_dev(port: int, host: str = DEFAULT_HOST) -> None:
     """Dev mode startup."""
     if _already_running():
         return
+    # The other `bun` in this file: dev mode runs Vite itself rather than a
+    # built bundle, and a raw `Popen(["bun", ...])` tracebacks identically.
+    # Checked BEFORE the pidfile and the backend are created, so a machine
+    # without bun is refused rather than half-started.
+    _require_bun("run dev mode (it serves the UI through Vite)")
 
     typer.echo(f"Starting Odin dev mode on http://{host}:{port}")
     typer.echo(f"  Vite  → :{port}  (HMR)")
