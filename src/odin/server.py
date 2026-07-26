@@ -333,6 +333,44 @@ def _surviving_containers(runtime, env: str) -> list[str]:
     return sorted(name for name in names if name.endswith(f"-{env}") or f"-{env}-" in name)
 
 
+# --- `/destroy`: outcome -> status, the ONE place the status is decided ---
+#
+# Field test 5 (HIGH). The route no longer initialises `status` optimistically
+# and then hopes every branch revises it -- three releases of that shape
+# produced three different `odin destroy` runs that exited 0 over a fully
+# standing env. The status is looked up here, once, from the outcome the tofu
+# half actually reported, and ANYTHING this map has no entry for -- including
+# `None`, i.e. a branch that returned without reporting an outcome at all --
+# falls through to a failure. A new way for a destroy not to happen now fails
+# loudly by default; it can only be scored as success by being added here on
+# purpose.
+_DESTROY_STATUS = {
+    "ok": "destroyed",                 # tofu ran and destroyed everything it owned
+    "nothing_to_destroy": "destroyed",  # tofu owns nothing here: no workspace, or an empty state
+    "failed": "destroy_failed",         # tofu ran, tofu lost
+    "timed_out": "destroy_timed_out",   # THIS runner killed it at its own deadline
+    "unavailable": "destroy_unavailable",  # tofu isn't installed, and its state still holds resources
+}
+
+# What each failing outcome REALLY was, in the words that name the right knob.
+_DESTROY_CAUSE = {
+    "failed": "tofu exited {exit_code}",
+    "timed_out": (
+        "tofu was killed at its whole-call deadline (ODIN_TOFU_DESTROY_TIMEOUT), so nothing was "
+        "diagnosed -- it ran out of time"
+    ),
+    "unavailable": (
+        "`tofu` is not on this server's PATH, so `tofu destroy` never ran at all -- nothing was "
+        "even attempted (install it with `brew install opentofu`; a server started outside a login "
+        "shell often has no /opt/homebrew/bin, so check the PATH odin itself was launched with)"
+    ),
+}
+_UNKNOWN_DESTROY_CAUSE = (
+    "the destroy finished without reporting any outcome, which is an odin bug -- reported as a "
+    "failure rather than assumed to have worked, because nothing here verified that it did"
+)
+
+
 def create_apply_router(
     store: SpecStore, reconciler_for, keystore: KeyStore, runner: TfRunner, gateway_port, env_epoch: dict[str, int],
     stores: SynthStores, gateway: GatewayState, runtime,
@@ -384,7 +422,26 @@ def create_apply_router(
             )
         _bump_epoch(env_epoch, env)  # finding #4: invalidate any older in-flight apply-full for this env
 
-        body: dict = {"status": "destroyed", "env": env, "tf": None}
+        # Field test 5 (HIGH, the FOURTH form of the same lie): `body["status"]`
+        # used to be initialised to "destroyed" right here, at the top, and each
+        # branch that could go wrong was expected to remember to revise it.
+        # Three separate fixes each taught one more branch to remember, and a
+        # fourth branch that hadn't been taught kept inheriting the success --
+        # most recently `TofuNotInstalled`, which set `body["tf"]` and left
+        # `status` alone, so a server launched outside a login shell (no
+        # /opt/homebrew/bin on PATH) answered `destroyed` with every
+        # Terraform-managed resource still in state, and `odin destroy` exited
+        # 0. Keying on the exit code, which fixed the previous form, cannot
+        # reach this one: tofu never ran, so there is no exit code.
+        #
+        # So the status is no longer INITIALISED at all -- it is DERIVED, once,
+        # from `tf_outcome` at the bottom, through `_DESTROY_STATUS`. `None` is
+        # the starting value and means "nothing has reported an outcome", which
+        # maps to a failure. Any future branch that forgets to set an outcome
+        # therefore fails loudly instead of quietly inheriting a success it
+        # never earned; that is the shape, not another branch.
+        tf_outcome: str | None = None
+        body: dict = {"env": env, "tf": None}
         reconciler = await reconciler_for(env)
         # hold(): field test 2, finding B6. `tofu destroy` has to REACH the
         # backings the resources it is deleting live in -- an s3 bucket is
@@ -403,7 +460,9 @@ def create_apply_router(
         # the same non-reentrant lock (the /apply-full path has the identical
         # shape and the identical reason).
         async with reconciler.hold():
-            if status["workspace_exists"]:
+            if not status["workspace_exists"]:
+                tf_outcome = "nothing_to_destroy"  # tofu was never applied for this env
+            else:
                 access_key, secret_key = keystore.issue(env, OPERATOR_NODE_ID)
                 # Security finding #3: scrub any sensitive field's raw value out
                 # of tofu's own destroy log before it reaches the tail/WS/events.
@@ -423,33 +482,26 @@ def create_apply_router(
                 try:
                     result = await runner.destroy(env, gateway_port(), access_key, secret_key, secrets=secrets)
                 except TofuNotInstalled:
-                    # Not a request-level error: the reconciler half still runs below.
                     body["tf"] = {"status": "unavailable", "exit_code": None, **_TOFU_NOT_INSTALLED}
+                    # Field test 5: tofu missing is a destroy that DID NOT
+                    # HAPPEN -- unless tofu's own state proves it owned nothing
+                    # to begin with, which is the one case where "install tofu"
+                    # would be busywork. That witness is read here rather than
+                    # assumed in either direction: the previous code assumed
+                    # harmless and reported success over six live resources; a
+                    # blanket failure would make an env tofu never touched
+                    # un-destroyable without a tofu install it does not need.
+                    tf_outcome = "unavailable" if _tf_state_addresses(store.root, env) else "nothing_to_destroy"
                 except SimulateBusy as exc:  # a second call won the race after our guard passed
                     return JSONResponse(status_code=409, content={"error": str(exc)})
                 else:
                     body["tf"] = {"status": "ok" if result.ok else "failed", "exit_code": result.exit_code}
+                    # A negative exit code is a SIGNAL, not tofu's own verdict,
+                    # and on this path there is one thing that sends it:
+                    # `TfRunner._run`'s `killpg` when the destroy budget blows.
+                    tf_outcome = "ok" if result.ok else ("timed_out" if result.exit_code < 0 else "failed")
                     if not result.ok:
                         body["tf"]["tail"] = list(result.tail)
-                        # Field test 4 (HIGH): `body["status"]` was set to
-                        # "destroyed" optimistically at the top of this route
-                        # and NEVER revised, so a `tofu destroy` that failed --
-                        # or was killed at its 300s whole-call deadline, exit
-                        # -9 -- still answered `status: destroyed` and `odin
-                        # destroy` exited 0, with six resources left in state
-                        # and containers still running. `/tf/destroy` next door
-                        # already got this right ("destroyed" if result.ok else
-                        # "failed"); the two paths disagreed, and the wrong one
-                        # was the one the CLI and the UI use.
-                        #
-                        # A negative exit code is a SIGNAL, not tofu's own
-                        # verdict, and on this path there is exactly one thing
-                        # that sends it: `TfRunner._run`'s `killpg` when the
-                        # destroy budget blows. That is a different outcome
-                        # from tofu erroring -- nothing was diagnosed, it just
-                        # ran out of time -- so it gets its own status and its
-                        # own message.
-                        body["status"] = "destroy_timed_out" if result.exit_code < 0 else "destroy_failed"
 
             # Field test 3 HIGH-B: whatever tofu did or did not manage to
             # destroy, an EC2 instance this env's gateway store still claims
@@ -472,7 +524,23 @@ def create_apply_router(
             if forgotten:
                 body["reclaimed_network_records"] = forgotten
 
-            store.apply(Stack(env=env))  # empty desired state -> the tick below prunes all
+            # THE one derivation. Unset (`None`) is not in the map and is
+            # therefore a failure -- see the note at the top of this route.
+            body["status"] = _DESTROY_STATUS.get(tf_outcome, "destroy_failed")
+            if body["status"] == "destroyed":
+                # ...and the empty desired state is committed ONLY when the
+                # teardown really happened -- the tick below is what prunes on
+                # the strength of it. Field test 5: committing it regardless
+                # BRICKED the env. The next destroy's `ensure_backings(last
+                # applied)` got an empty Stack, started no backing containers,
+                # and every AWS call tofu made 503-retried until the 300s
+                # deadline (measured: 5:00.38); recovery meant re-applying the
+                # original canvas, which assumes the user still has it. It is
+                # also the same rule `/apply-full` already follows in the other
+                # direction ("desired state not committed; fix and re-apply"):
+                # the desired state changes when the action succeeded, never
+                # because it was attempted.
+                store.apply(Stack(env=env))
 
         await reconciler.tick()
         keystore.revoke_env(env)  # gateway-issued keys die with the env they belong to
@@ -489,16 +557,16 @@ def create_apply_router(
             "tf_state": _tf_state_addresses(store.root, env),
             "containers": await asyncio.to_thread(_surviving_containers, runtime, env),
         }
-        timed_out = body["status"] == "destroy_timed_out"
-        budget = "" if not timed_out else (
-            " -- it was killed at its whole-call deadline (ODIN_TOFU_DESTROY_TIMEOUT), "
-            "so nothing was diagnosed, it ran out of time"
+        cause = _DESTROY_CAUSE.get(tf_outcome, _UNKNOWN_DESTROY_CAUSE).format(
+            exit_code=(body["tf"] or {}).get("exit_code"),
         )
         body["error"] = (
-            f"destroy did not finish for env {env!r}: tofu exited {body['tf']['exit_code']}{budget}. "
+            f"destroy did not finish for env {env!r}: {cause}. "
             f"still standing: {len(body['still_standing']['tf_state'])} resource(s) in tofu state "
             f"{body['still_standing']['tf_state']}, "
-            f"{len(body['still_standing']['containers'])} container(s) {body['still_standing']['containers']}"
+            f"{len(body['still_standing']['containers'])} container(s) {body['still_standing']['containers']}. "
+            f"The env's desired state was left as it was, so re-running the destroy once the cause "
+            f"above is fixed picks up exactly here."
         )
         return JSONResponse(status_code=500, content=body)
 
