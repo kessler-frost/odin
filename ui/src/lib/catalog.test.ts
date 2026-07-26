@@ -83,9 +83,12 @@ describe('the whole rendered sidebar', () => {
   const dupes = (values: string[]) =>
     [...new Set(values.filter((v, i) => values.indexOf(v) !== i))].sort();
 
-  test('all 27 tiles are accounted for', () => {
+  test('neither half of the sidebar is missing from the union', () => {
     // Guard the guard: were BUILTINS ever emptied, every assertion below would
     // pass by checking the catalog alone -- the gap this block exists to close.
+    // Named for what it asserts, not for the count it does not: a test whose
+    // name claims more than its body is the same overselling this suite exists
+    // to prevent, one level up.
     expect(BUILTINS.length).toBe(7);
     expect(TILES.length).toBeGreaterThan(20);
   });

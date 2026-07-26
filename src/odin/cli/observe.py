@@ -47,25 +47,29 @@ def world(env: str = http.ENV, url: str = http.URL, output: OutputFormat = http.
 
 def _render_envs(body: dict) -> None:
     """One env per line on stdout, nothing else -- `odin envs | while read e`
-    has to keep working. The empty case used to print a single blank line and
-    exit 0, which reads like a broken command rather than an answer, so the
-    explanation goes to stderr where it can't get into that loop."""
+    has to keep working.
+
+    There is deliberately no "no environments yet" branch any more. It printed
+    "an env exists once something has been applied to it", and it read
+    `body["envs"] == []` -- a signal odin's own `/envs` cannot send:
+    `SpecStore.list_envs` floors at `["default"]`, so the route answers
+    `{"envs": ["default"]}` on a never-used store (measured, see `envs` below).
+    A message keyed on a state that never arrives is the exact shape of the
+    four guards that silently never fired. If this ever prints nothing, that is
+    a server bug worth chasing loudly, not a fresh-odin state to explain away.
+    """
     for env in body["envs"]:
         typer.echo(env)
-    if not body["envs"]:
-        typer.echo(
-            "no environments yet — an env exists once something has been applied to it. "
-            "`odin apply` and the canvas both default to env 'default'.",
-            err=True,
-        )
 
 
 @app.command()
 def envs(url: str = http.URL, output: OutputFormat = http.OUTPUT) -> None:
     """List the environments the server knows about (one per line).
 
-    An env comes into existence when a canvas is applied to it, so a fresh
-    odin lists none — not an error, and exit 0 either way.
+    A never-used odin lists `default` — the env `odin apply` and the canvas
+    both target when you name none — even though nothing has been applied to
+    it yet. Once any env has really been applied to, the list is exactly the
+    envs that exist, so `default` drops out unless it is one of them.
     """
     body = http.body_or_fail(http.request("GET", url, "/envs"))
     http.emit(body, output, _render_envs)

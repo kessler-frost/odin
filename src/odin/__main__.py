@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated
 
@@ -37,6 +38,11 @@ PID_FILE = ODIN_DIR / "pid"
 UI_DIR = Path(__file__).resolve().parent.parent.parent / "ui"
 # The prebuilt UI a released odin ships; present = no bun needed, ever.
 BUNDLED_UI = Path(__file__).resolve().parent / "_ui"
+# The other build prerequisite, next to `doctor.BUN_INSTALL`: bun being
+# installed says nothing about the UI's OWN dependencies being installed, and
+# odin needs both. Spelled `cd ui && ...` because the user is standing in the
+# repo root when `odin start` tells them this.
+UI_DEPS_INSTALL = "cd ui && bun install"
 DEFAULT_PORT = 4200
 BACKEND_DEV_PORT = 4201
 DEFAULT_HOST = "127.0.0.1"
@@ -201,6 +207,17 @@ def _report_start_failure(reason: str, proc: subprocess.Popen, log_path: Path) -
     return typer.Exit(1)
 
 
+def _refuse(purpose: str, detail: str, fix: str, note: str) -> typer.Exit:
+    """The one shape every "you're missing a build prerequisite" refusal takes:
+    what odin could not do, what it OBSERVED, the exact command that fixes
+    that, and a note. One shape so two prerequisites cannot drift into two
+    different-looking failures."""
+    typer.echo(f"Cannot {purpose}: {detail}.", err=True)
+    typer.echo(f"fix: {fix}", err=True)
+    typer.echo(note, err=True)
+    return typer.Exit(1)
+
+
 def _refuse_without_bun(purpose: str, detail: str) -> typer.Exit:
     """The sentence + exact command a machine without `bun` gets instead of a
     traceback.
@@ -217,14 +234,11 @@ def _refuse_without_bun(purpose: str, detail: str) -> typer.Exit:
     `odin start` and `odin doctor` cannot drift into two spellings of one
     remedy.
     """
-    typer.echo(f"Cannot {purpose}: {detail}.", err=True)
-    typer.echo(f"fix: {BUN_INSTALL}", err=True)
-    typer.echo(
+    return _refuse(
+        purpose, detail, BUN_INSTALL,
         "     then open a new shell so PATH picks it up. `odin doctor` re-checks it.\n"
         "     (A released odin ships the UI prebuilt and needs no bun; this is a clone.)",
-        err=True,
     )
-    return typer.Exit(1)
 
 
 def _require_bun(purpose: str) -> None:
@@ -235,37 +249,103 @@ def _require_bun(purpose: str) -> None:
         raise _refuse_without_bun(purpose, "`bun` is not installed (nothing named `bun` on PATH)")
 
 
-def _run_in_ui(args: list[str]) -> int:
-    """`args` in `ui/`, returning its exit code -- and 127 rather than an
-    exception if the binary could not be executed at all, the same translation
-    `util.run_command` makes for every other tool odin shells out to. Output is
-    NOT captured: bun's own error is the diagnosis and belongs on the user's
-    terminal, not inside a traceback frame."""
+def _vite_bin() -> Path:
+    """The binary `ui/package.json`'s own scripts run -- `vite` for `dev`,
+    `vite build` for the bundle (pinned to the real manifest by
+    `test_the_deps_probe_names_the_binary_ui_package_json_actually_runs`).
+    `bun install` is what links it here, so its presence is the closest thing
+    to "the UI's dependencies are installed" that can be OBSERVED, rather than
+    inferred from an exit code a dozen other failures also produce."""
+    return UI_DIR / "node_modules" / ".bin" / "vite"
+
+
+def _refuse_without_ui_deps(purpose: str) -> typer.Exit:
+    """A clone whose `ui/node_modules` was never installed -- the OTHER way the
+    UI build cannot run, and the one odin used to misdiagnose.
+
+    Measured on a fresh clone (bun 1.2.15, on PATH, `bun --version` fine):
+
+        $ bun run build
+        $ vite build
+        /bin/bash: vite: command not found
+        error: script "build" exited with code 127          # exit 127
+
+    bun ran FINE; the script bun ran could not find its own tool. But
+    `_run_in_ui` also translated a failed *exec of bun* into 127, so those two
+    became one number and `_build_ui` read this one as "`bun` is on PATH but
+    could not be run" and printed `curl -fsSL https://bun.sh/install | bash`.
+    Reinstalling bun fixes nothing here: the user lands exactly where they
+    started, with the real missing step (`bun install`) never named.
+
+    So the two are now separated at the source -- `UiRun.launched` says whether
+    bun ever started, and this precondition is observed BEFORE shelling out at
+    all, off the filesystem.
+    """
+    return _refuse(
+        purpose,
+        f"the UI's dependencies are not installed (no {_vite_bin()})",
+        UI_DEPS_INSTALL,
+        "     bun is not the problem -- odin found it on PATH. What's missing is\n"
+        "     the UI's node_modules, which is what `vite: command not found`\n"
+        "     from a `bun run` actually means.\n"
+        "     (A released odin ships the UI prebuilt and needs neither.)",
+    )
+
+
+def _require_ui_deps(purpose: str) -> None:
+    """The sibling of `_require_bun`, and the same discipline: ask the real
+    thing before shelling out, so "your deps aren't installed" can never be
+    guessed from an exit code that a dozen other failures also produce."""
+    if not _vite_bin().exists():
+        raise _refuse_without_ui_deps(purpose)
+
+
+@dataclass(frozen=True)
+class UiRun:
+    """What shelling out into `ui/` actually did.
+
+    `launched` is the distinction the old `-> int` could not carry: it collapsed
+    "bun could not be exec'd at all" (an `OSError`) into 127, which a bun that
+    ran perfectly ALSO returns when its script's own tool is missing. One number
+    for two opposite causes is how a missing `bun install` came out as "reinstall
+    bun". `code` is meaningful only when `launched`.
+    """
+    launched: bool
+    code: int
+
+
+def _run_in_ui(args: list[str]) -> UiRun:
+    """`args` in `ui/`. Output is NOT captured: bun's own error is the diagnosis
+    and belongs on the user's terminal, not inside a traceback frame."""
     try:
-        return subprocess.run(args, cwd=str(UI_DIR)).returncode
+        return UiRun(True, subprocess.run(args, cwd=str(UI_DIR)).returncode)
     except OSError:
-        return COMMAND_NOT_FOUND
+        return UiRun(False, COMMAND_NOT_FOUND)
 
 
 def _build_ui() -> None:
-    """Make sure there is a UI to serve -- or say which of the three things
-    went wrong and how to fix that one."""
+    """Make sure there is a UI to serve -- or say which of the four things went
+    wrong and how to fix that ONE."""
     if BUNDLED_UI.exists():
         return  # UI ships bundled with the installed package
     if (UI_DIR / "dist").exists():
         typer.echo("UI already built (ui/dist exists). Run `bun run build` in ui/ to rebuild.")
         return
     _require_bun("build the UI")
+    _require_ui_deps("build the UI")
     typer.echo("Building UI …")
-    code = _run_in_ui(["bun", "run", "build"])
-    if code == COMMAND_NOT_FOUND:
+    run = _run_in_ui(["bun", "run", "build"])
+    if not run.launched:
         # PATH said yes and exec said no -- a dangling shim, a wrong-arch
-        # binary. Same remedy, different evidence, and it must say which.
+        # binary. Keyed on the exec failure itself, never on 127: a bun that
+        # launched fine returns 127 whenever its script's tool is missing.
         raise _refuse_without_bun("build the UI", "`bun` is on PATH but could not be run")
-    if code != 0:
-        typer.echo(f"Cannot build the UI: `bun run build` failed (exit {code}) in {UI_DIR}.",
+    if run.code != 0:
+        typer.echo(f"Cannot build the UI: `bun run build` failed (exit {run.code}) in {UI_DIR}.",
                    err=True)
-        typer.echo("fix: read bun's output above; `bun install` in ui/ is the usual missing step.",
+        typer.echo("fix: read bun's output above -- it is bun's own diagnosis. odin already "
+                   "checked the two usual suspects: bun is on PATH, and the UI's "
+                   "dependencies are installed.",
                    err=True)
         raise typer.Exit(1)
 
@@ -337,7 +417,18 @@ def _start_dev(port: int, host: str = DEFAULT_HOST) -> None:
     # built bundle, and a raw `Popen(["bun", ...])` tracebacks identically.
     # Checked BEFORE the pidfile and the backend are created, so a machine
     # without bun is refused rather than half-started.
-    _require_bun("run dev mode (it serves the UI through Vite)")
+    #
+    # The deps check is the SIBLING of the `_build_ui` bug, and it needs to be
+    # here for the same reason: measured on a fresh clone, `bun run dev` fails
+    # exactly like `bun run build` does --
+    #     $ vite --port "4311"
+    #     /bin/bash: vite: command not found
+    #     error: script "dev" exited with code 127
+    # -- except dev mode never even looked, so odin used to start the backend and
+    # the pidfile and leave Vite dead in a relayed log line.
+    purpose = "run dev mode (it serves the UI through Vite)"
+    _require_bun(purpose)
+    _require_ui_deps(purpose)
 
     typer.echo(f"Starting Odin dev mode on http://{host}:{port}")
     typer.echo(f"  Vite  → :{port}  (HMR)")
