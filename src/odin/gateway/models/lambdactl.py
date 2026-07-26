@@ -434,6 +434,19 @@ def _fault(fn: dict) -> FunctionFault | None:
     return FunctionFault(node=fn["function_name"], state=fn["state"], reason=fn.get("state_reason"))
 
 
+def function_faults(stores: SynthStores, env: str) -> list[FunctionFault]:
+    """Every function this env's records currently call broken -- ONE store
+    read, no waiting and no docker call of its own.
+
+    Public because /apply-full has to ask this question a SECOND time, after
+    `reconcile/drift.py::sweep_compute` has corrected the records against the
+    containers' real state (field test 5). Before that, the apply's whole
+    verification was "read the record", and a record another loop refreshes on
+    a cadence made a removed container report `applied` for the length of the
+    cadence. The sweep establishes the truth; this reports it."""
+    return [fault for fn in _fn_records(stores, env) for fault in [_fault(fn)] if fault is not None]
+
+
 def wait_for_active_functions(
     stores: SynthStores, env: str,
     converging: Iterable[threading.Thread] = (), timeout: float | None = None,
@@ -455,19 +468,21 @@ def wait_for_active_functions(
     create waiter blocks on `State: Active` and a tofu failure has already
     failed the apply before this runs.
 
-    Pure store reads -- no `docker` call, deliberately. Whether the container
-    is still alive is `reconcile/drift.py`'s reality sweep (which marks a
-    vanished one `Failed`, which is exactly what this then reports on the next
-    Apply); what this closes is odin reporting success on a state it had
-    already written down as broken."""
+    Pure store reads -- no `docker` call, deliberately: this waits for the
+    CONVERGENCE to settle, and what it settles into is the record. Whether the
+    container is actually alive is a separate question, and after field test 5
+    the apply path no longer answers it from a record another loop refreshes on
+    a cadence: /apply-full runs `reconcile/drift.py::sweep_compute` right after
+    this returns and re-reads `function_faults`, so a container that is gone,
+    exited or paused is established LIVE by the apply itself rather than
+    inherited from the drift sweep's ~10-tick cadence."""
     deadline = time.monotonic() + (active_timeout() if timeout is None else timeout)
     for thread in converging:
         thread.join(max(0.0, deadline - time.monotonic()))
     while True:
         records = _fn_records(stores, env)
-        faults = [fault for fn in records for fault in [_fault(fn)] if fault is not None]
         if not any(map(_still_deploying, records)) or time.monotonic() >= deadline:
-            return faults
+            return function_faults(stores, env)
         time.sleep(_ACTIVE_POLL_SECONDS)
 
 

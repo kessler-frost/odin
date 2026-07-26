@@ -31,14 +31,21 @@ PREVIOUS revision keeps serving (ecsctl's `_retire_stale`) is neither
 `healthy` nor `crashed`, so it projects `error` and the verdict says which --
 "N tasks serving the previous revision; deployment of <image> failed: <why>",
 every part of it read from real task/taskdef records. `_ecs_services` also calls ecsctl's own
-`sweep_tasks` once per projection: the ONE deliberate, idempotent mutation
-this otherwise-pure module makes, syncing a service's task records against
+`sweep_tasks` once per projection: one of the TWO deliberate, idempotent
+mutations this otherwise-pure module makes, syncing a service's task records against
 their REAL container status (a task whose container already exited on its
 own gets marked STOPPED with its real exit code + reason) so a crash-loop is
 visible on the very next reconciler tick instead of only after some
 unrelated `Describe*` call happens to run the sweep first. It never creates
 or destroys anything TF-owned -- same non-negotiable as the rest of this
 module.
+
+Field test 5 added the second, `project()`'s own `sweep_compute` call, for the
+two kinds that had no equivalent: a lambda's RIE container and an rds's
+Postgres container were only ever checked by the drift sweep's ~10-tick
+cadence, so `/world` reported a removed container `healthy` for that whole
+window. Same contract as `sweep_tasks` -- correct the record against the real
+container state, never create or destroy anything.
 
 Label resolution is uniform across every kind: prefer the `odin:node` tag
 `agent/hcl.py::_tags_block` stamps on every canvas-node-backed resource,
@@ -66,6 +73,7 @@ from odin.gateway.models import cachectl, ecsctl, elbv2ctl, logsctl, rdsctl, ssm
 from odin.gateway.models.ecsctl import sweep_tasks, task_verdict
 from odin.gateway.stores import SynthStores
 from odin.reconcile import mesh_health
+from odin.reconcile.drift import sweep_compute
 from odin.runtime.colima import CONTAINER_HOST
 from odin.runtime.lima import LIMA_HOST
 from odin.simulate.workspace import tf_dir
@@ -581,13 +589,26 @@ def _ecs_services(stores: SynthStores, env: str, runtime: TaskRuntime | None = N
     return out
 
 
-def project(stores: SynthStores, env: str, ecs_runtime: TaskRuntime | None = None) -> Projected:
+def project(
+    stores: SynthStores, env: str, ecs_runtime: TaskRuntime | None = None, containers=None,
+) -> Projected:
     """`label -> (kind, phase, facts, verdict)` for every currently-existing
-    TF-owned resource in the env's synth stores -- a pure snapshot of what
-    tofu has created, save for `_ecs_services`'s own task-state sync (see
-    module docstring). `ecs_runtime` is an injectable seam purely for tests;
-    every real caller leaves it default (a real `TaskRuntime()`, matching
-    ecsctl.py's own `runtime or TaskRuntime()` precedent)."""
+    TF-owned resource in the env's synth stores -- a snapshot of what tofu has
+    created, save for the two record syncs below. `ecs_runtime`/`containers` are
+    injectable seams purely for tests; every real caller leaves them default (a
+    real `TaskRuntime()` / `ColimaRuntime()`, matching ecsctl.py's own
+    `runtime or TaskRuntime()` precedent).
+
+    `sweep_compute` FIRST, and it is the field-test-5 fix: lambda and rds
+    records are corrected against their containers' REAL state before anything
+    reads them, exactly as `_ecs_services` has always done for tasks. Without
+    it these two kinds were honest only on the drift sweep's ~10-tick cadence,
+    so `/world` reported a `docker rm -f`'d function `healthy` for the whole
+    window -- and the apply path, reading the same record, reported `applied`.
+    One bulk `docker ps` per projection (none at all for an env with no
+    lambda/rds), and the SAME call the apply path makes, so the projection and
+    the apply cannot disagree."""
+    sweep_compute(stores, env, containers)
     out: Projected = {}
     out.update(_vpc_subnet_sg(stores, env))
     out.update(_iam_roles(stores, env))

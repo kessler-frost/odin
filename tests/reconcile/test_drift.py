@@ -37,26 +37,43 @@ class FakeVms:
 
 
 class FakeContainers:
-    """`_ContainerRuntime.container_names()`'s shape, plus the per-name
-    `status`/`exit_code` calls the rds half makes ONLY on a failed health probe
-    (W2.7) -- `running` names them, `exited` maps to a real exit code, anything
-    absent reads `absent`."""
+    """`_ContainerRuntime.container_names()`/`container_states()`'s shapes, plus
+    the per-name `status`/`exit_code` calls the rds probe half makes ONLY on a
+    failed health probe (W2.7).
+
+    One source of names: `names` are the containers that are RUNNING, `exited`
+    maps a name to its real exit code, and anything in neither is GONE. The two
+    listings are counted separately (`calls` for the ecs name listing,
+    `state_calls` for the field-test-5 state listing) so the boundedness test
+    can pin both."""
 
     def __init__(
         self, names: list[str] | None = None, error: Exception | None = None,
-        exited: dict[str, int] | None = None,
+        exited: dict[str, int] | None = None, paused: list[str] | None = None,
     ) -> None:
         self.names = names if names is not None else []
         self.error = error
         self.exited = exited or {}
+        self.paused = paused or []
         self.calls = 0
+        self.state_calls = 0
         self.status_calls: list[str] = []
 
     def container_names(self) -> list[str]:
         self.calls += 1
         if self.error is not None:
             raise self.error
-        return list(self.names)
+        return [*self.names, *self.exited, *self.paused]
+
+    def container_states(self) -> dict[str, str]:
+        self.state_calls += 1
+        if self.error is not None:
+            raise self.error
+        return {
+            **{name: "running" for name in self.names},
+            **{name: "exited" for name in self.exited},
+            **{name: "paused" for name in self.paused},
+        }
 
     def status(self, name: str) -> str:
         self.status_calls.append(name)
@@ -306,7 +323,7 @@ def test_provisioning_task_is_exempt(tmp_path):
     assert containers.calls == 0
 
 
-# --- boundedness: two listings per sweep TOTAL, on a cadence -------------
+# --- boundedness: a fixed number of BULK listings per sweep, on a cadence ---
 
 
 def test_one_listing_per_substrate_regardless_of_resource_count(tmp_path):
@@ -325,7 +342,11 @@ def test_one_listing_per_substrate_regardless_of_resource_count(tmp_path):
     verdicts = _sweeper(vms=vms, containers=containers).verdicts(stores, ENV)
 
     assert len(verdicts) == 10  # 5 ec2 + 5 lambda, all drifted
-    assert (vms.calls, containers.calls) == (1, 1)
+    # 15 resources, three bulk calls: one `limactl list` (ec2), one `docker ps`
+    # of STATES (the live lambda/rds half `sweep_compute` owns) and one of NAMES
+    # (the ecs task half). Never one call per resource -- that is the property
+    # this pins, and it holds at any count.
+    assert (vms.calls, containers.state_calls, containers.calls) == (1, 1, 1)
 
 
 def test_non_sweep_ticks_make_no_runtime_calls_and_keep_the_verdict(tmp_path, monkeypatch):
@@ -442,10 +463,11 @@ def test_vpc_subnet_sg_iam_role_and_ecr_records_are_never_swept(tmp_path):
     vms, containers = FakeVms(names=[]), FakeContainers(names=[])
 
     assert _sweeper(vms=vms, containers=containers).verdicts(stores, ENV) == {}
-    assert (vms.calls, containers.calls) == (0, 0)
+    assert (vms.calls, containers.calls, containers.state_calls) == (0, 0, 0)
 
 
-# --- rds (W2.7): checked by its real health probe, not by a listing ---------
+# --- rds (W2.7): checked by its container's real STATE (the live half) and
+# then by a real health probe -- see drift.py's "RDS IS CHECKED TWICE". ------
 
 
 def _db(stores: SynthStores, label: str, identifier: str, status: str = "available", port: int = 54321) -> str:
@@ -458,21 +480,22 @@ def _db(stores: SynthStores, label: str, identifier: str, status: str = "availab
     return db_container_name(ENV, identifier)
 
 
-def test_a_healthy_database_is_no_drift_and_costs_zero_subprocess_calls(tmp_path):
+def test_a_healthy_database_is_no_drift_and_costs_one_bulk_listing_plus_one_probe(tmp_path):
     stores = SynthStores(tmp_path)
-    _db(stores, "app-db", "app-db")
-    containers, probe = FakeContainers(names=[]), FakeProbe(ok=True)
+    name = _db(stores, "app-db", "app-db")
+    containers, probe = FakeContainers(names=[name]), FakeProbe(ok=True)
 
     assert _sweeper(containers=containers, probe=probe).verdicts(stores, ENV) == {}
-    # ONE real connection, and no `docker` call at all on the happy path.
+    # ONE real connection plus ONE bulk `docker ps` -- and not a single
+    # per-container `inspect` on the happy path.
     assert probe.calls == [("127.0.0.1", 54321, "app", "apppass123")]
-    assert (containers.calls, containers.status_calls) == (0, [])
+    assert (containers.state_calls, containers.calls, containers.status_calls) == (1, 0, [])
 
 
 def test_a_killed_container_is_real_drift_and_the_record_is_corrected(tmp_path):
     """`docker kill` -- the canonical way a database dies -- leaves an EXITED
-    container that `container_names` still lists, which is exactly why rds is
-    probed instead of listed. The verdict carries the container's real exit
+    container that a NAME listing still lists, which is why the live half reads
+    the container's real STATE. The verdict carries the container's real exit
     code, and the record goes `failed` so an Apply's converge recreates it."""
     stores = SynthStores(tmp_path)
     name = _db(stores, "app-db", "app-db")
@@ -505,17 +528,20 @@ def test_a_removed_database_container_reads_like_ecs_not_like_an_invented_exit_c
 def test_the_world_stops_claiming_healthy_and_stops_publishing_a_dead_database_url(tmp_path):
     """The projection-level point: a dead database must not keep advertising a
     DATABASE_URL nothing can connect to -- that stale fact is what the Fabric
-    would hand a consumer."""
+    would hand a consumer.
+
+    And NO SWEEPER IS INVOLVED (field test 5): `project()` runs the live check
+    itself, so `/world` tells the truth on the very next reconciler tick
+    instead of waiting out the drift sweep's ~10-tick cadence."""
     stores = SynthStores(tmp_path)
     name = _db(stores, "app-db", "app-db")
-    _kind, phase, facts, _verdict = project(stores, ENV)["app-db"]
+    _kind, phase, facts, _verdict = project(stores, ENV, containers=FakeContainers(names=[name]))["app-db"]
     assert (phase, facts["DATABASE_URL"]) == (
         "healthy", "postgresql://app:apppass123@host.docker.internal:54321/postgres",
     )
 
-    _sweeper(containers=FakeContainers(names=[], exited={name: 137}), probe=FakeProbe(ok=False)).verdicts(stores, ENV)
-
-    kind, phase, facts, verdict = project(stores, ENV)["app-db"]
+    dead = FakeContainers(names=[], exited={name: 137})
+    kind, phase, facts, verdict = project(stores, ENV, containers=dead)["app-db"]
     assert (kind, phase, facts) == ("rds", "crashed", {})
     assert "is not running (exit 137)" in verdict
 

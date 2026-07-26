@@ -11,6 +11,8 @@ import json
 import os
 from pathlib import Path
 
+from odin.aws.rds import container_name as db_container_name
+from odin.compute.functions import container_name as function_container_name
 from odin.fabric.models import MeshNetwork, SubnetAllocation
 from odin.gateway.models import elbv2ctl, rdsctl, secretsctl, ssmctl
 from odin.gateway.stores import SynthStores
@@ -22,6 +24,34 @@ from odin.simulate.workspace import tf_dir
 from odin.spec.models import ResourceObserved, World
 
 ENV = "default"
+
+
+class FakeContainers:
+    """`ColimaRuntime.container_states()`/`exit_code()`'s shape -- the seam
+    `project()`'s own `sweep_compute` reads (field test 5).
+
+    A lambda/rds record that CLAIMS to be up is now only projected as up if its
+    container really is running, so these tests have to say which containers
+    exist -- the same thing the ecs tests below already do with
+    `FakeTaskRuntime`. The reality-sync behavior itself (what a gone/exited/
+    paused container does to the record) is tests/reconcile/test_drift.py's."""
+
+    def __init__(self, *running: str) -> None:
+        self.states = {name: "running" for name in running}
+
+    def container_states(self) -> dict[str, str]:
+        return dict(self.states)
+
+    def exit_code(self, name: str) -> int:
+        return -1
+
+
+def _fns_up(*function_names: str) -> FakeContainers:
+    return FakeContainers(*(function_container_name(ENV, name) for name in function_names))
+
+
+def _dbs_up(*identifiers: str) -> FakeContainers:
+    return FakeContainers(*(db_container_name(ENV, identifier) for identifier in identifiers))
 
 
 def _param(name: str, value: str = "v") -> dict:
@@ -379,7 +409,7 @@ def test_lambda_pending_active_failed_map_to_starting_healthy_crashed(tmp_path):
     stores.lambdactl.set(ENV, "fn:fn2", _lambda_fn("fn2", "Active"))
     stores.lambdactl.set(ENV, "fn:fn3", _lambda_fn("fn3", "Failed"))
 
-    result = project(stores, ENV)
+    result = project(stores, ENV, containers=_fns_up("fn2"))
     assert result["fn1"] == ("lambda", "starting", {}, None)
     assert result["fn2"] == ("lambda", "healthy", {}, None)
     assert result["fn3"] == ("lambda", "crashed", {}, None)
@@ -388,7 +418,7 @@ def test_lambda_pending_active_failed_map_to_starting_healthy_crashed(tmp_path):
 def test_lambda_falls_back_to_function_name_without_a_tag(tmp_path):
     stores = SynthStores(tmp_path)
     stores.lambdactl.set(ENV, "fn:fn1", _lambda_fn("fn1", "Active"))
-    assert "fn1" in project(stores, ENV)
+    assert "fn1" in project(stores, ENV, containers=_fns_up("fn1"))
 
 
 def test_lambda_failed_state_reason_becomes_the_verdict(tmp_path):
@@ -413,7 +443,7 @@ def test_a_deployed_function_whose_last_invocation_failed_says_so_in_its_verdict
     record = _lambda_fn("fn1", "Active") | {"last_invocation_error": "Unhandled"}
     stores.lambdactl.set(ENV, "fn:fn1", record)
 
-    kind, phase, facts, verdict = project(stores, ENV)["fn1"]
+    kind, phase, facts, verdict = project(stores, ENV, containers=_fns_up("fn1"))["fn1"]
     assert (kind, phase, facts) == ("lambda", "healthy", {})  # the DEPLOY really did succeed
     assert verdict == "the last invocation failed (Unhandled) — the deploy succeeded, the handler did not"
 
@@ -421,13 +451,13 @@ def test_a_deployed_function_whose_last_invocation_failed_says_so_in_its_verdict
 def test_a_cold_function_that_has_never_been_invoked_raises_no_alarm(tmp_path):
     stores = SynthStores(tmp_path)
     stores.lambdactl.set(ENV, "fn:fn1", _lambda_fn("fn1", "Active"))
-    assert project(stores, ENV)["fn1"] == ("lambda", "healthy", {}, None)
+    assert project(stores, ENV, containers=_fns_up("fn1"))["fn1"] == ("lambda", "healthy", {}, None)
 
 
 def test_a_function_whose_last_invocation_succeeded_raises_no_alarm(tmp_path):
     stores = SynthStores(tmp_path)
     stores.lambdactl.set(ENV, "fn:fn1", _lambda_fn("fn1", "Active") | {"last_invocation_error": None})
-    assert project(stores, ENV)["fn1"] == ("lambda", "healthy", {}, None)
+    assert project(stores, ENV, containers=_fns_up("fn1"))["fn1"] == ("lambda", "healthy", {}, None)
 
 
 def test_a_failed_deploy_still_reports_the_deploy_reason_not_the_invocation_one(tmp_path):
@@ -879,7 +909,7 @@ def test_an_available_database_projects_healthy_with_both_database_url_forms(tmp
     stores = SynthStores(tmp_path)
     _db(stores, "app-db", "app-db")
 
-    kind, phase, facts, verdict = project(stores, ENV)["app-db"]
+    kind, phase, facts, verdict = project(stores, ENV, containers=_dbs_up("app-db"))["app-db"]
 
     assert (kind, phase, verdict) == ("rds", "healthy", None)
     assert facts == {
@@ -899,7 +929,7 @@ def test_a_database_on_the_mesh_also_publishes_its_gated_overlay_address(tmp_pat
     stores = SynthStores(tmp_path)
     _db(stores, "app-db", "app-db", overlay_ip="10.42.1.4")
 
-    facts = project(stores, ENV)["app-db"][2]
+    facts = project(stores, ENV, containers=_dbs_up("app-db"))["app-db"][2]
 
     assert facts["endpoint_mesh"] == "10.42.1.4:5432"
     assert facts["DATABASE_URL_MESH"] == "postgresql://app:apppass123@10.42.1.4:5432/postgres"
@@ -922,7 +952,7 @@ def test_a_dead_mesh_path_withholds_the_overlay_fact_and_ends_healthy(tmp_path):
     (nebula / "ca.crt").write_text("---ca---\n")  # this env HAS a mesh
 
     mesh_health.reset_cache()
-    _, phase, facts, verdict = project(stores, ENV)["app-db"]
+    _, phase, facts, verdict = project(stores, ENV, containers=_dbs_up("app-db"))["app-db"]
 
     assert phase == "crashed", "healthy on an unverified overlay address is the bug"
     assert "DATABASE_URL_MESH" not in facts and "endpoint_mesh" not in facts
@@ -937,7 +967,7 @@ def test_a_database_with_no_mesh_publishes_no_overlay_facts(tmp_path):
     stores = SynthStores(tmp_path)
     _db(stores, "app-db", "app-db", overlay_ip=None)
 
-    facts = project(stores, ENV)["app-db"][2]
+    facts = project(stores, ENV, containers=_dbs_up("app-db"))["app-db"][2]
 
     assert "DATABASE_URL_MESH" not in facts and "endpoint_mesh" not in facts
 
@@ -949,7 +979,7 @@ def test_the_database_url_path_is_the_instances_real_db_name(tmp_path):
     stores.rdsctl.set(ENV, "db:app-db", _db_record("app-db", db_name="orders"))
     stores.tags.set(ENV, f"rds:{rdsctl.db_arn('app-db')}", {"odin:node": "app-db"})
 
-    facts = project(stores, ENV)["app-db"][2]
+    facts = project(stores, ENV, containers=_dbs_up("app-db"))["app-db"][2]
 
     assert facts["DATABASE_URL"].endswith("/orders")
     assert facts["DATABASE_URL_VM"].endswith("/orders")
@@ -989,7 +1019,7 @@ def test_an_untagged_database_still_projects_under_its_identifier(tmp_path):
     stores = SynthStores(tmp_path)
     stores.rdsctl.set(ENV, "db:app-db", _db_record("app-db"))
 
-    assert project(stores, ENV)["app-db"][0] == "rds"
+    assert project(stores, ENV, containers=_dbs_up("app-db"))["app-db"][0] == "rds"
 
 
 # --- field test 3, P2-5: the resources a failed apply leaves ONLY in tofu's

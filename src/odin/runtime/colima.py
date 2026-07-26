@@ -387,6 +387,36 @@ class _ContainerRuntime:
         out = self._cli("ps", "-a", "--format", "{{.Names}}", "--filter", f"label={LABEL}=1")
         return [line for line in out.splitlines() if line]
 
+    def container_states(self) -> dict[str, str]:
+        """`name -> state` for every odin-labelled container, in ONE `docker ps`
+        call -- `container_names` plus the single field that separates "it
+        exists" from "it is working".
+
+        Field test 5: a NAME listing cannot answer the question the apply path
+        has to ask. `docker kill` leaves the container present (`exited`), and
+        `docker pause` leaves it present AND listed by a plain `docker ps`
+        (verified against the real daemon: `Up 3 seconds (Paused)`, with
+        `{{.State}}` == `paused`) while nothing inside it answers a single
+        connection. Both read as perfectly alive to a name-only listing, which
+        is why the drift sweep needed a second, per-resource probe to catch them
+        at all -- and why anything that has to be sure RIGHT NOW could not use
+        one bulk call before this.
+
+        The vocabulary is docker's own (`created`/`running`/`paused`/
+        `restarting`/`removing`/`exited`/`dead`), so a caller compares against
+        `running` rather than guessing, and a name missing from the mapping
+        entirely is the honest "that container is GONE" -- distinct from every
+        state in it.
+
+        `check=True` for `container_names`' exact reason: absent-from-this-
+        listing is load-bearing, so a failed CLI call must raise and be read as
+        "unknown", never as "everything is gone" (`reconcile/drift.py::_listing`)."""
+        out = self._cli(
+            "ps", "-a", "--format", "{{.Names}}\t{{.State}}", "--filter", f"label={LABEL}=1",
+        )
+        rows = (line.partition("\t") for line in out.splitlines() if line)
+        return {name: state for name, _, state in rows}
+
 
 class ColimaRuntime(_ContainerRuntime):
     """Drives `docker` (Colima) directly on the host."""
