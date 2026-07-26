@@ -526,13 +526,11 @@ def test_a_removed_database_container_reads_like_ecs_not_like_an_invented_exit_c
 
 
 def test_the_world_stops_claiming_healthy_and_stops_publishing_a_dead_database_url(tmp_path):
-    """The projection-level point: a dead database must not keep advertising a
-    DATABASE_URL nothing can connect to -- that stale fact is what the Fabric
-    would hand a consumer.
-
-    And NO SWEEPER IS INVOLVED (field test 5): `project()` runs the live check
-    itself, so `/world` tells the truth on the very next reconciler tick
-    instead of waiting out the drift sweep's ~10-tick cadence."""
+    """The projection-level point, through the CADENCE half: a dead database
+    must not keep advertising a DATABASE_URL nothing can connect to -- that
+    stale fact is what the Fabric would hand a consumer. Once the sweep has
+    corrected the record, the projection reads `crashed` off the record itself,
+    with or without a live check."""
     stores = SynthStores(tmp_path)
     name = _db(stores, "app-db", "app-db")
     _kind, phase, facts, _verdict = project(stores, ENV, containers=FakeContainers(names=[name]))["app-db"]
@@ -540,8 +538,12 @@ def test_the_world_stops_claiming_healthy_and_stops_publishing_a_dead_database_u
         "healthy", "postgresql://app:apppass123@host.docker.internal:54321/postgres",
     )
 
-    dead = FakeContainers(names=[], exited={name: 137})
-    kind, phase, facts, verdict = project(stores, ENV, containers=dead)["app-db"]
+    _sweeper(
+        containers=FakeContainers(names=[], exited={name: 137}), probe=FakeProbe(ok=False),
+    ).verdicts(stores, ENV)
+
+    assert stores.rdsctl.get(ENV, "db:app-db")["status"] == "failed"
+    kind, phase, facts, verdict = project(stores, ENV, containers=FakeContainers(names=[name]))["app-db"]
     assert (kind, phase, facts) == ("rds", "crashed", {})
     assert "is not running (exit 137)" in verdict
 
@@ -691,6 +693,32 @@ def test_world_is_not_green_for_a_dead_function_on_the_very_next_projection(tmp_
 
     assert (kind, phase) == ("lambda", "crashed")
     assert "removed outside odin" in verdict
+
+
+def test_world_stops_publishing_a_dead_databases_url_without_touching_its_record(tmp_path):
+    """Both halves of the projection's contract in one place.
+
+    IT REPORTS: `crashed`, the real reason, and NO FACTS -- a database that is
+    not running must stop advertising a DATABASE_URL nothing can connect to.
+
+    IT DOES NOT WRITE: the record still says `available`. That is what keeps
+    the recovery honest -- `converge_db_instances` recreates a `failed`
+    database, destroying its data, so nothing may mark it failed until an APPLY
+    has reported the death. A projection that corrected the record would let
+    the next unrelated apply silently recreate the database and report success."""
+    stores = SynthStores(tmp_path)
+    name = _db(stores, "app-db", "app-db")
+
+    kind, phase, facts, verdict = project(
+        stores, ENV, containers=FakeContainers(names=[], exited={name: 137}),
+    )["app-db"]
+
+    assert (kind, phase, facts) == ("rds", "crashed", {})
+    assert "is not running (exit 137)" in verdict
+    record = stores.rdsctl.get(ENV, "db:app-db")
+    assert (record["status"], record["status_reason"]) == ("available", None), (
+        "the projection must report, never correct -- see drift.py's WHY THE PROJECTION MAY NOT WRITE"
+    )
 
 
 def test_a_single_bad_sample_is_a_blip_not_drift(tmp_path, monkeypatch):

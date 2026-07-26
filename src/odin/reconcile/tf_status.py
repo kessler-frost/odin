@@ -40,12 +40,14 @@ unrelated `Describe*` call happens to run the sweep first. It never creates
 or destroys anything TF-owned -- same non-negotiable as the rest of this
 module.
 
-Field test 5 added the second, `project()`'s own `sweep_compute` call, for the
-two kinds that had no equivalent: a lambda's RIE container and an rds's
-Postgres container were only ever checked by the drift sweep's ~10-tick
-cadence, so `/world` reported a removed container `healthy` for that whole
-window. Same contract as `sweep_tasks` -- correct the record against the real
-container state, never create or destroy anything.
+Field test 5 gave lambda and rds their equivalent, `project()`'s own
+`live_verdicts` overlay -- the two kinds that had none, so `/world` reported a
+removed container `healthy` for the whole ~10-tick drift-sweep cadence. It is
+the same one-bulk-`docker ps` read /apply-full makes, but READ-ONLY: it
+overrides the phase (and withholds the facts) of a resource whose container
+isn't running, and touches no record. Correcting one here would let the next
+apply silently recreate a database nobody had been told was dead -- see
+reconcile/drift.py's "WHY THE PROJECTION MAY NOT WRITE".
 
 Label resolution is uniform across every kind: prefer the `odin:node` tag
 `agent/hcl.py::_tags_block` stamps on every canvas-node-backed resource,
@@ -73,7 +75,7 @@ from odin.gateway.models import cachectl, ecsctl, elbv2ctl, logsctl, rdsctl, ssm
 from odin.gateway.models.ecsctl import sweep_tasks, task_verdict
 from odin.gateway.stores import SynthStores
 from odin.reconcile import mesh_health
-from odin.reconcile.drift import sweep_compute
+from odin.reconcile.drift import live_verdicts
 from odin.runtime.colima import CONTAINER_HOST
 from odin.runtime.lima import LIMA_HOST
 from odin.simulate.workspace import tf_dir
@@ -599,16 +601,19 @@ def project(
     real `TaskRuntime()` / `ColimaRuntime()`, matching ecsctl.py's own
     `runtime or TaskRuntime()` precedent).
 
-    `sweep_compute` FIRST, and it is the field-test-5 fix: lambda and rds
-    records are corrected against their containers' REAL state before anything
-    reads them, exactly as `_ecs_services` has always done for tasks. Without
-    it these two kinds were honest only on the drift sweep's ~10-tick cadence,
-    so `/world` reported a `docker rm -f`'d function `healthy` for the whole
-    window -- and the apply path, reading the same record, reported `applied`.
-    One bulk `docker ps` per projection (none at all for an env with no
-    lambda/rds), and the SAME call the apply path makes, so the projection and
-    the apply cannot disagree."""
-    sweep_compute(stores, env, containers)
+    `live_verdicts` LAST, and it is the field-test-5 fix: a lambda or rds whose
+    container is not running right now reads `crashed` with the real reason and
+    NO FACTS, whatever its record says. Without it these two kinds were honest
+    only on the drift sweep's ~10-tick cadence, so `/world` reported a
+    `docker rm -f`'d function `healthy` -- and published a dead database's
+    DATABASE_URL -- for that whole window. One bulk `docker ps` per projection
+    (none at all for an env with no lambda/rds), off the SAME read /apply-full
+    makes, so the projection and an apply cannot disagree about liveness.
+
+    READ-ONLY, unlike `_ecs_services`' task sync: correcting an rds record here
+    would let the very next apply silently delete and recreate a database
+    nothing had reported dead yet (`reconcile/drift.py`'s own note). The
+    projection reports; only an apply writes."""
     out: Projected = {}
     out.update(_vpc_subnet_sg(stores, env))
     out.update(_iam_roles(stores, env))
@@ -622,6 +627,15 @@ def project(
     out.update(_lambda_functions(stores, env))
     out.update(_ecs_services(stores, env, ecs_runtime))
     out.update(_cache_clusters(stores, env))
+    # The live container check, applied over whatever the records claimed. Facts
+    # go with it: a database that isn't running must stop advertising a
+    # DATABASE_URL nothing can connect to -- the stale-green fact `_db_facts`
+    # exists to prevent, which a phase-only override would leave behind.
+    out.update({
+        label: (out[label][0], "crashed", {}, verdict)
+        for label, verdict in live_verdicts(stores, env, containers).items()
+        if label in out
+    })
     return out
 
 

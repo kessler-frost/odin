@@ -878,9 +878,10 @@ def test_apply_full_reports_a_broken_lambda_and_a_broken_database_together(tmp_p
 # and whose container is not there -- the state v0.7.4's verification read as
 # healthy for the length of the drift sweep's cadence (measured: four
 # consecutive `applied`/exit-0 applies over ~8s with zero containers). These
-# apps are built with `backings=False`, so they have NO DriftSweeper AT ALL:
-# nothing on a cadence exists to correct these records, and the apply has to
-# establish it itself. ------------------------------------------------------
+# apps are built with `backings=False`, so they have NO DriftSweeper AT ALL,
+# and the reconciler's own live check is READ-ONLY by design -- so the only
+# thing that can correct these records, and the only thing that can fail these
+# applies, is the apply itself. -----------------------------------------------
 
 
 class _FakeStates:
@@ -941,16 +942,6 @@ def _patch_no_containers(monkeypatch) -> None:
     monkeypatch.setattr("odin.gateway.models.lambdactl.FunctionRuntime", _DeadFunctionRuntime)
 
 
-def _silence_the_projection(monkeypatch) -> None:
-    """Take the reconciler's OWN half of the fix out of the picture, so these
-    tests can only pass if the APPLY establishes liveness itself.
-
-    `project()` runs the same live check on every tick, and at unit speed it
-    routinely wins the race -- which is correct behavior (both halves read one
-    source of truth) but would let /apply-full's own call be deleted with every
-    test still green. `tests/reconcile/test_drift.py` owns the projection half;
-    this file owns the apply's."""
-    monkeypatch.setattr("odin.reconcile.reconciler.project_tf_owned", lambda *args, **kwargs: {})
 
 
 def test_apply_full_fails_on_a_function_whose_container_is_gone_though_the_record_says_active(
@@ -960,7 +951,6 @@ def test_apply_full_fails_on_a_function_whose_container_is_gone_though_the_recor
     not there, and no drift sweep has run (this app has none) -- the apply used
     to answer `applied`, exit 0, four times in a row."""
     _patch_no_containers(monkeypatch)
-    _silence_the_projection(monkeypatch)
     monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: None)
     _patch_translate(monkeypatch, TranslateResult(files={}, refined=False))
     app = _app(tmp_path)
@@ -980,23 +970,24 @@ def test_apply_full_fails_on_a_database_whose_container_is_gone_though_the_recor
     tmp_path, monkeypatch,
 ):
     _patch_no_containers(monkeypatch)
-    _silence_the_projection(monkeypatch)
     monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: None)
     _patch_translate(monkeypatch, TranslateResult(files={}, refined=False))
     app = _app(tmp_path)
     _seed_live_database(app)
     with TestClient(app) as client:
         resp = client.post("/apply-full", json={"nodes": [], "edges": []})
+        world = client.get("/world").json()
     body = resp.json()
     assert body["status"] == "applied_resources_unhealthy", body
     assert body["unhealthy_resources"] == [{
         "kind": "rds", "node": "app-db", "observed": "failed",
         "reason": "container odin-rds-default-app-db removed outside odin — re-Apply to recreate",
     }], body
-    # The record the apply corrected is the SAME one `/world` projects, so the
-    # two cannot disagree by construction -- pinned in
-    # tests/reconcile/test_drift.py and, on real containers, in
-    # tests/simulate/test_false_green_window_e2e.py.
+    # ...and `/world` is not green for it either, off the same live read -- the
+    # projection and the apply cannot disagree about liveness by construction.
+    (observed,) = [r for r in world["resources"] if r["id"] == "app-db"]
+    assert observed["phase"] == "crashed", world
+    assert "removed outside odin" in observed["verdict"], world
 
 
 def test_apply_full_stays_applied_when_the_containers_really_are_there(tmp_path, monkeypatch):
@@ -1004,7 +995,6 @@ def test_apply_full_stays_applied_when_the_containers_really_are_there(tmp_path,
     something: the SAME records, with their containers actually running, stay
     green. A live check that fails everything would pass the test above too."""
     _patch_no_containers(monkeypatch)
-    _silence_the_projection(monkeypatch)
     monkeypatch.setattr(
         _FakeStates, "running", ("odin-lambda-default-worker", "odin-rds-default-app-db"),
     )
@@ -1025,7 +1015,6 @@ def test_apply_full_does_not_fail_a_resource_that_is_merely_still_starting(tmp_p
     mid-redeploy and a database mid-boot legitimately have no container for a
     moment. Neither may fail an apply -- and neither costs a `docker` call."""
     _patch_no_containers(monkeypatch)
-    _silence_the_projection(monkeypatch)
     monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: None)
     # Nothing will ever finish these two (no substrate is running), so the two
     # waits legitimately run out their whole budget -- the documented knobs cut

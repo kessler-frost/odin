@@ -115,6 +115,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from typing import NamedTuple
 
 from odin.aws.rds import container_name as db_container_name
 from odin.compute.functions import container_name as function_container_name
@@ -242,26 +243,40 @@ def _listing(read):
 
 # --- THE LIVE HALF: no cadence, no cache, one bulk listing -----------------
 #
-# Field test 5, and the reason this module now has two halves at all. Everything
-# below `DriftSweeper` runs on a CADENCE and is CACHED between sweeps, which is
-# right for a background loop and wrong for anything that has to be sure right
-# now: measured at the default cadence, four consecutive `applied`/exit-0
-# applies landed over ~8s with the function's container already removed, and
-# `/world` read green for the same window, because both the apply's own
-# verification and the projection read a RECORD this loop only refreshes every
-# ~10 ticks. A guard that reads a signal produced on a cadence inherits the
-# cadence (.claude/CLAUDE.md honesty rule 1b).
+# Field test 5, and the reason this module has two halves at all. `DriftSweeper`
+# runs on a CADENCE and is CACHED between sweeps, which is right for a
+# background loop and wrong for anything that has to be sure right now: measured
+# at the default cadence, four consecutive `applied`/exit-0 applies landed over
+# ~8s with the function's container already removed, and `/world` read green for
+# the same window, because both the apply's own verification and the projection
+# read a RECORD this loop only refreshes every ~10 ticks. A guard that depends
+# on a signal produced on a cadence inherits the cadence (.claude/CLAUDE.md
+# honesty rule 1b).
 #
-# `sweep_compute` is that same reality check with the cadence taken out: ONE
-# `docker ps` (regardless of how many resources exist, and none at all for an
-# env with no lambda/rds records), no cache, correcting the record it just
-# proved wrong. Its callers are the two places that must not inherit a cadence:
-#   * `reconcile/tf_status.py::project()` -- so `/world` is honest on the very
-#     next tick, exactly as `ecsctl.sweep_tasks` already makes ECS honest there;
-#   * `server.py`'s /apply-full -- so an apply establishes liveness ITSELF
-#     instead of believing a stored status.
-# Both then read the SAME corrected record, so the apply and the projection
-# cannot disagree -- there is one source of truth, not two checks.
+# `_dead` is that same reality check with the cadence taken out: ONE `docker ps`
+# reading each container's real STATE (regardless of how many resources exist,
+# and none at all for an env with no lambda/rds records), no cache, no waiting
+# on anyone else's loop. TWO CALLERS SHARE THAT ONE READ, and only one of them
+# writes:
+#
+#   * `reconcile/tf_status.py::project()` calls `live_verdicts`, which is
+#     READ-ONLY: `/world` goes honest on the very next tick (~1s) without
+#     touching a single record.
+#   * `server.py`'s /apply-full calls `sweep_compute` -- the same read plus the
+#     record correction -- so an apply establishes liveness ITSELF instead of
+#     believing a stored status, and the correction it writes is what makes the
+#     NEXT apply's `converge_*` actually recreate the resource.
+#
+# WHY THE PROJECTION MAY NOT WRITE, though writing would be convenient:
+# `converge_db_instances` recreates a `failed` database, and recreating a
+# database DESTROYS ITS DATA. If a background tick corrected the record, the
+# very next apply -- an unrelated canvas edit, seconds after something killed
+# the container -- would silently delete and re-create that database and report
+# `applied`, exit 0. So the rule is: NOTHING IS RECREATED UNTIL AN APPLY HAS
+# REPORTED IT DEAD. The apply that finds it says so and stops; the apply after
+# that recovers it (`converge_*`, the "re-Apply to recreate" the verdict
+# promises). A read-only projection is what makes that deterministic instead of
+# a race against the tick.
 #
 # WHY A BULK LISTING IS SAFE TO CORRECT FROM, even mid-apply while the daemon is
 # pinned (the hazard `_sweep_databases`' confirm-before-correcting note names):
@@ -288,41 +303,76 @@ def _dead_verdict(containers, name: str, state: str | None) -> str:
     return f"container {name} {detail} — re-Apply to recreate"
 
 
-def sweep_compute(stores: SynthStores, env: str, containers=None) -> dict[str, str]:
-    """`label -> verdict` for every lambda/rds whose container is not running
-    RIGHT NOW -- and the record is corrected to match, which is what makes the
-    verdict's "re-Apply to recreate" true (`converge_functions` /
-    `converge_db_instances` only act on a `Failed`/`failed` record).
+class Dead(NamedTuple):
+    """One lambda/rds whose record claims it is up while its container is not
+    running: the canvas LABEL (what /world and an apply both name it by), the
+    identity its own model corrects by (function name / DB identifier), which
+    kind it is, and WHY -- the verdict, already worded."""
 
-    Only records that CLAIM to be up are candidates, and every transitional
-    state is exempt for the reason the module docstring gives: a function
-    mid-redeploy (`InProgress`) and a database mid-boot (`creating`) genuinely
-    have no container for a moment, and a resource that is merely still starting
-    must never be called dead.
+    label: str
+    identity: str
+    kind: str
+    verdict: str
+
+
+def _dead(stores: SynthStores, env: str, containers=None) -> list[Dead]:
+    """THE read, shared by both halves so they cannot disagree: one bulk
+    `docker ps` of container STATES, against every record that CLAIMS to be up.
+
+    Every transitional state is exempt for the reason the module docstring
+    gives: a function mid-redeploy (`InProgress`) and a database mid-boot
+    (`creating`) genuinely have no container for a moment, and a resource that
+    is merely still starting must never be called dead.
 
     Costs one `docker ps` when this env has any such record and NOTHING at all
-    when it doesn't -- so the happy path pays one bulk call, never one per
-    resource."""
+    when it doesn't -- so the projection pays one bulk call per tick where it is
+    relevant, and zero where it isn't."""
     functions = _function_records(stores, env)
     databases = _db_records(stores, env)
     if not functions and not databases:
-        return {}
+        return []
     runtime = containers or ColimaRuntime()
     states = _listing(runtime.container_states)
     if states is None:  # docker didn't answer: unknown is not "gone"
-        return {}
-    out: dict[str, str] = {}
-    for label, function_name, name in functions:
-        if states.get(name) != "running":
-            out[label] = _dead_verdict(runtime, name, states.get(name))
-            mark_function_failed(stores, env, function_name, out[label])
-    for label, record in databases:
-        identifier = record["db_instance_identifier"]
-        name = db_container_name(env, identifier)
-        if states.get(name) != "running":
-            out[label] = _dead_verdict(runtime, name, states.get(name))
-            rdsctl.mark_instance_failed(stores, env, identifier, out[label])
-    return out
+        return []
+    # (label, identity, kind, the container that has to be running for it)
+    claimed = [(label, function_name, "lambda", name) for label, function_name, name in functions]
+    claimed += [
+        (label, record["db_instance_identifier"], "rds",
+         db_container_name(env, record["db_instance_identifier"]))
+        for label, record in databases
+    ]
+    return [
+        Dead(label, identity, kind, _dead_verdict(runtime, container, states.get(container)))
+        for label, identity, kind, container in claimed
+        if states.get(container) != "running"
+    ]
+
+
+def live_verdicts(stores: SynthStores, env: str, containers=None) -> dict[str, str]:
+    """`label -> verdict` for every lambda/rds whose container is not running
+    RIGHT NOW. READ-ONLY: not one record is touched (the module docstring says
+    why the projection must not write). `tf_status.project()`'s caller."""
+    return {entry.label: entry.verdict for entry in _dead(stores, env, containers)}
+
+
+# label -> the model call that writes this kind's failure into its own record.
+_CORRECT = {"lambda": mark_function_failed, "rds": rdsctl.mark_instance_failed}
+
+
+def sweep_compute(stores: SynthStores, env: str, containers=None) -> dict[str, str]:
+    """`live_verdicts` PLUS the record correction -- the same verdict written
+    into the record it just proved wrong, which is what makes "re-Apply to
+    recreate" true (`converge_functions`/`converge_db_instances` only ever act
+    on a `Failed`/`failed` record).
+
+    /apply-full and `DriftSweeper` are its only callers, and they are exactly
+    the two places allowed to write: an apply REPORTING the death is what has to
+    happen before anything recreates the resource."""
+    dead = _dead(stores, env, containers)
+    for entry in dead:
+        _CORRECT[entry.kind](stores, env, entry.identity, entry.verdict)
+    return {entry.label: entry.verdict for entry in dead}
 
 
 class DriftSweeper:
