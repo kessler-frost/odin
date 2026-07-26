@@ -133,6 +133,17 @@ class TfResult:
     ok: bool
     exit_code: int
     tail: tuple[str, ...] = ()
+    # Field test 5 (MED): did THIS runner kill the process because its own
+    # deadline expired? The runner is the only thing that knows -- `_run`'s
+    # `asyncio.TimeoutError` branch is the one place a timeout exists -- and
+    # until this field existed the caller had to infer it from a negative exit
+    # code, on the belief that only odin's own `killpg` produces one. False:
+    # ANY kill gives -9, so an external `kill -9` 0.87s into a destroy was
+    # reported to the user as a 300-second deadline expiry, pointing them at
+    # `ODIN_TOFU_DESTROY_TIMEOUT` for something that had nothing to do with it.
+    # Honesty rule 1: the real signal already existed one layer down; carry it
+    # rather than guess at it from an ambiguous proxy.
+    timed_out: bool = False
 
 
 def _require_tofu() -> str:
@@ -331,9 +342,11 @@ class TfRunner:
             return await proc.wait()
 
         budget = self._timeout if timeout is None else timeout
+        timed_out = False
         try:
             code = await asyncio.wait_for(_drain(), timeout=budget)
         except asyncio.TimeoutError:
+            timed_out = True
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(proc.pid, signal.SIGKILL)
             code = await proc.wait()
@@ -349,7 +362,10 @@ class TfRunner:
         if not ok:
             payload["tail"] = list(tail)
         await self._emit(payload)
-        return TfResult(ok=ok, exit_code=code, tail=tuple(tail))
+        # `timed_out` rides out on the result rather than being re-derived from
+        # `exit_code < 0` by the caller: an externally-killed tofu also exits
+        # -9, and only this frame knows which of the two happened.
+        return TfResult(ok=ok, exit_code=code, tail=tuple(tail), timed_out=timed_out)
 
     async def _emit(self, message: dict) -> None:
         if self._ws is not None:

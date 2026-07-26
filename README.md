@@ -350,6 +350,26 @@ unbuilt kind, or a typo) and `unsupported` (a resource odin models but can't
 generate Terraform for, with the reason). Both arrays are still published
 separately; gate on `not_covered` and neither can slip past.
 
+**A node that was ALREADY APPLIED and then becomes uncovered is a different
+story, and Apply refuses it.** Uncovered means "not in this apply", which for
+something that already exists means "deleted": `count: "2"` mistyped as
+`"two"` on a live ECS node, or `type: "s3"` grown a trailing space, would
+otherwise destroy the service or the bucket — and the data in it — while
+reporting `applied`. So an apply that would remove a resource odin can see is
+still on the canvas exits nonzero, names every affected node and what about it
+isn't covered, and changes nothing:
+
+```
+refusing to apply: 1 resource(s) that env 'prod' really has right now are still on
+the canvas but are NOT covered by this apply, so applying would DESTROY them:
+uploads — its type 's3 ' is not a kind odin models (a typo?) …
+```
+
+Deleting a node from the canvas is unaffected — that is how you tear things
+down, and an empty canvas is still a full destroy. Only a node still drawn is
+protected. `?allow_destroying_uncovered=true` on `/apply-full`, `/apply` or
+`/tf/apply` overrides it if you really do mean it.
+
 ### Checking for drift — and why not to run tofu by hand
 
 **Running `tofu` yourself inside `.odin/<env>/tf` talks to REAL AWS.** The
