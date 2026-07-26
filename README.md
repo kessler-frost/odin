@@ -179,12 +179,13 @@ substrate:
 | Identity and registry | `iam_role` `ecr` |
 | Config and observability | `secret` `ssm` `logs` |
 
-Ten more are drawable placeholders for coverage that does not exist yet:
-`kinesis`, `kms`, `iamrole`, `route53`, `apigateway`, `efs`, `events`, `ebs`,
-`eip`, `igw`. Apply reports them as `skipped` and does not touch them. Note the
-trap in that list: the sidebar's Security group has **two tiles both labelled
-"IAM Role"**. The one whose sublabel reads "Terraform-managed role" is the real
-`iam_role`; "Identity role" is the `iamrole` placeholder, which Apply skips.
+Nine more are drawable placeholders for coverage that does not exist yet:
+`kinesis`, `kms`, `route53`, `apigateway`, `efs`, `events`, `ebs`, `eip`, `igw`.
+Each one's sidebar sublabel ends in **`(placeholder)`**, and that marker means
+exactly one thing in both directions: a marked tile is reported under `skipped`
+and never touched, and an unmarked tile is a service odin really models. A test
+reads the modelled-kinds list out of `translate.py` itself, so the marker cannot
+drift away from what Apply does.
 
 One node can expand to several Terraform resources: an ALB becomes `aws_lb` plus a
 target group plus a listener, an ECS service becomes a service plus a task
