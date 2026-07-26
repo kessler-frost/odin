@@ -44,7 +44,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from odin.aws.backings import ENSURE_KINDS, PROVISIONED
+from odin.aws.backings import BackingUnavailable, ENSURE_KINDS, PROVISIONED
 from odin.fabric.localhost import LocalhostFabric
 from odin.gateway.policy import compile_policies
 from odin.gateway.stores import SynthStores
@@ -413,8 +413,22 @@ class Reconciler:
         currently exist (`not ok`): plan's pending/crashed path owns that."""
         ok = await asyncio.to_thread(self._aws.exists, res.kind, res.id)
         if phase == "starting" and ok:
-            facts = await asyncio.to_thread(self._aws.facts, res.kind, res.id)
-            await self._emit(res.id, res.kind, "healthy", facts=facts)
+            try:
+                facts = await asyncio.to_thread(self._aws.facts, res.kind, res.id)
+            except BackingUnavailable as exc:
+                # Honesty rule 1. `facts()` raises rather than inventing an
+                # endpoint when the backing's published port can't be read
+                # (aws/backings.py::_published_port), and a resource whose
+                # endpoint odin cannot NAME is not healthy -- publishing
+                # `healthy` + `http://host.docker.internal:0` was the field
+                # test 5 hazard, and it was permanent because these facts are
+                # written once on this very transition and never refreshed.
+                # Stay `starting`, carry the real reason, retry next tick.
+                # `_emit`'s dedupe makes a persistent failure exactly ONE
+                # delta, not one per tick.
+                await self._emit(res.id, res.kind, "starting", verdict=str(exc))
+            else:
+                await self._emit(res.id, res.kind, "healthy", facts=facts)
         if phase == "healthy" and not ok:
             logtail = await asyncio.to_thread(self._backing_logtail, res.kind)
             await self._emit(

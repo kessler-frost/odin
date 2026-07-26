@@ -10,6 +10,7 @@ Every container odin runs is labelled ``odin=1``.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -17,6 +18,22 @@ from odin.spec.models import Phase
 from odin.util import run_command
 
 LABEL = "odin"
+
+
+class PortUnreadable(RuntimeError):
+    """`host_port` could not READ the container's published-port map at all --
+    no daemon, no CLI on PATH, no such container. Distinct from reading it and
+    finding nothing published on that inside-port, which is a real answer and
+    still returns 0.
+
+    Field test 5's facts audit: `host_port` used to end
+    `return int(...) if out else 0`, so ANY CLI failure produced 0 -- a value
+    shaped exactly like a real port. `BackingAws.facts` interpolates it, so one
+    transient `docker` hiccup wrote `http://host.docker.internal:0` into the
+    `endpoint` fact of an s3/sqs/sns/dynamodb node, PERMANENTLY: that fact is
+    published only on the starting->healthy transition and is never refreshed.
+    A port of 0 is not a port, it is "I failed to ask" -- so failing to ask
+    now raises instead of masquerading (honesty rule 1)."""
 
 # The host as seen from inside containers: Colima's host-gateway alias (wired
 # by `_run_flags`). Producers publish this instead of localhost so a consumer
@@ -277,8 +294,40 @@ class _ContainerRuntime:
         return int(out) if out.lstrip("-").isdigit() else -1
 
     def host_port(self, name: str, container_port: int) -> int:
-        out = self._cli("port", name, str(container_port), check=False)
-        return int(out.splitlines()[0].rsplit(":", 1)[-1]) if out else 0
+        """The host port `container_port` is published on -- 0 when the runtime
+        ANSWERED and nothing is published there, `PortUnreadable` when it could
+        not be asked at all (see that class for the corruption this closes).
+
+        Reads the whole port MAP off `inspect` rather than running
+        `<cli> port`, because `<cli> port` cannot separate those two cases.
+        Verified against the real docker on this machine:
+
+            $ docker port odin-aws-rustfs-f5notofu2 9999
+            no public port '9999' published for odin-aws-rustfs-f5notofu2   rc=1
+            $ docker port no-such-container 80
+            Error response from daemon: No such container: …              rc=1
+
+        Same exit code, same empty stdout, for "asked and the answer is none"
+        and "could not ask" -- which is precisely why the old
+        `if out else 0` had to guess, and guessed wrong. The port map does
+        separate them:
+
+            running   {"9000/tcp":[{"HostIp":"0.0.0.0","HostPort":"33776"}],
+                       "9001/tcp":null}                                    rc=0
+            exited    {}                                                   rc=0
+            absent    (empty; "no such object" on stderr)                  rc=1
+
+        so rc is now a real signal: 0 means the runtime answered, and the
+        answer is in structured JSON rather than parsed out of a text line."""
+        proc = self._run(self._argv("inspect", "-f", "{{json .NetworkSettings.Ports}}", name))
+        if proc.returncode != 0:
+            raise PortUnreadable(
+                f"{self.CLI} cannot read {name}'s published ports: "
+                f"{proc.stderr.strip() or 'no output'}"
+            )
+        bindings = json.loads(proc.stdout.strip() or "{}") or {}
+        published = bindings.get(f"{container_port}/tcp") or []
+        return int(published[0]["HostPort"]) if published else 0
 
     def logs(self, name: str, tail: int = 20) -> str:
         """The container's last `tail` lines -- BOTH streams, merged, tailed
@@ -304,11 +353,16 @@ class _ContainerRuntime:
         return {"cpu": float(cpu_s.strip().rstrip("%") or 0), "ram": _to_mib(mem_s.split("/")[0].strip())}
 
     def facts(self, name: str, container_port: int = 0) -> ContainerFacts:
+        # An ABSENT container has no port map to read, and `host_port` now says
+        # so by raising -- so don't ask about one. Every other state (running,
+        # created, exited, …) does have a map, so a raise from here is a real
+        # runtime failure and belongs loud, not swallowed into a 0.
         status = self.status(name)
         stats = self.stats(name) if status == "running" else {"cpu": 0.0, "ram": 0.0}
+        readable = container_port and status != "absent"
         return ContainerFacts(
             phase=_STATUS_TO_PHASE.get(status, "pending"),
-            host_port=self.host_port(name, container_port) if container_port else 0,
+            host_port=self.host_port(name, container_port) if readable else 0,
             cpu=stats["cpu"], ram=stats["ram"],
             logtail=self.logs(name, tail=5) if status != "absent" else "",
         )

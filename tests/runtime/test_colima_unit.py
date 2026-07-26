@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import pytest
 
-from odin.runtime.colima import ColimaRuntime, ContainerSpec, _Proc
+from odin.runtime.colima import ColimaRuntime, ContainerSpec, PortUnreadable, _Proc
 
 
 class FakeRunner:
@@ -184,3 +184,68 @@ def test_a_failed_log_read_is_empty_not_the_clis_own_error_text():
     # diagnostic as container output.
     runner = LogRunner(stderr="Error response from daemon: No such container: gone", returncode=1)
     assert ColimaRuntime(runner=runner).logs("gone") == ""
+
+
+# --- field test 5 facts audit: a failed port read must never look like port 0 -
+#
+# Every payload below was captured from the real `docker` on this machine (see
+# `host_port`'s docstring for the transcript) -- these are the runtime's own
+# answers, not a fabricated upstream signal.
+
+
+class PortRunner:
+    """Answers the port-map read with a captured `docker inspect` result."""
+
+    def __init__(self, stdout: str = "", stderr: str = "", returncode: int = 0):
+        self.calls: list[list[str]] = []
+        self._proc = _Proc(returncode, stdout, stderr)
+
+    def __call__(self, args, input=None):
+        self.calls.append(args)
+        return self._proc
+
+
+_RUNNING = ('{"9000/tcp":[{"HostIp":"0.0.0.0","HostPort":"33776"},'
+            '{"HostIp":"::","HostPort":"33776"}],"9001/tcp":null}')
+
+
+def test_host_port_reads_the_structured_port_map_not_a_text_line():
+    runner = PortRunner(stdout=_RUNNING)
+    assert ColimaRuntime(runner=runner).host_port("odin-aws-rustfs-prod", 9000) == 33776
+    assert runner.calls == [
+        ["docker", "inspect", "-f", "{{json .NetworkSettings.Ports}}", "odin-aws-rustfs-prod"],
+    ]
+
+
+def test_a_port_the_container_publishes_nothing_on_is_an_honest_zero():
+    # rc 0 means the runtime ANSWERED; "9001/tcp": null is that answer.
+    assert ColimaRuntime(runner=PortRunner(stdout=_RUNNING)).host_port("rustfs", 9001) == 0
+    # An exited container's whole map is `{}` -- same shape of answer.
+    assert ColimaRuntime(runner=PortRunner(stdout="{}")).host_port("dead", 9000) == 0
+
+
+def test_a_port_read_that_FAILED_raises_instead_of_returning_zero():
+    """THE fix. `host_port` used to end `return int(...) if out else 0`, so any
+    CLI failure produced 0 -- and 0 is shaped like a real port, so
+    `BackingAws.facts` interpolated it into a durable `endpoint` fact that is
+    written once and never refreshed. `docker port` cannot be asked honestly
+    (it exits 1 both for "nothing published there" and for "no such
+    container"); the port MAP can, and a nonzero rc there is a real failure."""
+    runner = PortRunner(stderr="error: no such object: gone", returncode=1)
+    with pytest.raises(PortUnreadable, match="cannot read gone's published ports"):
+        ColimaRuntime(runner=runner).host_port("gone", 9000)
+
+
+def test_facts_never_asks_an_absent_container_for_a_port():
+    """An absent container has no port map, so `facts()` must not ask for one
+    -- the raise above is for a runtime that failed, not for "there is nothing
+    there", which `status` already reports as `pending`."""
+    calls: list[list[str]] = []
+
+    def runner(args, input=None):
+        calls.append(args)
+        return _Proc(1, "", "Error: No such object: gone")
+
+    facts = ColimaRuntime(runner=runner).facts("gone", container_port=9000)
+    assert (facts.phase, facts.host_port) == ("pending", 0)
+    assert not [c for c in calls if "{{json .NetworkSettings.Ports}}" in c]

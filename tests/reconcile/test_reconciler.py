@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import time
 
+from odin.aws.backings import BackingUnavailable
 from odin.gateway.policy import compile_policies
 from odin.gateway.stores import SynthStores
 from odin.compute.tasks import container_name as task_container_name
@@ -1042,3 +1043,70 @@ async def test_a_changing_logtail_alone_does_not_re_emit(tmp_path):
     r._store.apply_delta = lambda d: emitted.append(d)
     await r._emit("q", "sqs", "crashed", facts={"logtail": "line one\nline two"}, verdict="gone")
     assert emitted == []
+
+
+# --- field test 5 facts audit -------------------------------------------------
+
+
+def _unreadable(reason: str = "docker cannot read odin-aws-rustfs-default's published ports: no daemon"):
+    def facts(service, name):
+        raise BackingUnavailable(reason)
+    return facts
+
+
+async def test_a_backing_whose_port_cannot_be_read_is_not_published_healthy(tmp_path):
+    """Fix 1, at the layer that DURABLY records the lie. `BackingAws.facts`
+    raises rather than naming an endpoint it could not read, and a resource
+    whose endpoint odin cannot name is not healthy. Publishing `healthy` +
+    `http://host.docker.internal:0` was permanent corruption: these facts are
+    written once, on this very transition, and never refreshed."""
+    rt, aws, ws = FakeRuntime(), FakeAws(), FakeWS()
+    aws.facts = _unreadable()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(BUCKET,)))
+
+    recon = Reconciler(store, rt, aws=aws, ws=ws, poll_interval=0)
+    await recon.tick()   # provision -> starting
+    await recon.tick()   # exists() is True, but the endpoint is unreadable
+
+    observed = store.current_world().get("uploads")
+    assert observed.phase == "starting", "an unreadable endpoint must not read healthy"
+    assert observed.facts == {}
+    assert "published ports" in observed.verdict   # the real reason, not a shrug
+    assert ":0" not in str(ws.sent)                # nowhere, in any delta
+
+
+async def test_a_persistent_unreadable_port_costs_exactly_one_delta(tmp_path):
+    """The failure path must not become its own delta storm: `_emit`'s dedupe
+    covers the verdict too, so twenty failing ticks are one event."""
+    rt, aws = FakeRuntime(), FakeAws()
+    aws.facts = _unreadable("unreadable")
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(BUCKET,)))
+    recon = Reconciler(store, rt, aws=aws, poll_interval=0)
+    await recon.tick()
+    await recon.tick()
+
+    emitted = []
+    store.apply_delta = lambda d: emitted.append(d)
+    for _ in range(20):
+        await recon.tick()
+    assert emitted == []
+
+
+async def test_the_endpoint_is_published_once_the_port_becomes_readable_again(tmp_path):
+    rt, aws = FakeRuntime(), FakeAws()
+    aws.facts = _unreadable("unreadable")
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(BUCKET,)))
+    recon = Reconciler(store, rt, aws=aws, poll_interval=0)
+    await recon.tick()
+    await recon.tick()
+
+    aws.facts = lambda service, name: {"BUCKET": name, "endpoint": "http://host.docker.internal:51001"}
+    await recon.tick()
+
+    observed = store.current_world().get("uploads")
+    assert observed.phase == "healthy"
+    assert observed.facts["endpoint"] == "http://host.docker.internal:51001"
+    assert observed.verdict is None

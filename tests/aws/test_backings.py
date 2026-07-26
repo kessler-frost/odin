@@ -15,7 +15,7 @@ from botocore.exceptions import ClientError
 from odin.aws import backings
 from odin.aws.backings import ACCESS_KEY, ACCOUNT, BackingAws, REGION, SECRET_KEY
 from odin.gateway import DEFAULT_GATEWAY_PORT
-from odin.runtime.colima import ContainerSpec
+from odin.runtime.colima import ColimaRuntime, ContainerSpec, _Proc
 
 
 @dataclass
@@ -566,3 +566,61 @@ def test_gc_keeps_registry_running_while_ecr_is_active(rt, factory, tmp_path):
     # matching test_gc_stops_backings_whose_kinds_are_all_inactive's pattern.
     _aws(rt, factory, tmp_path).gc({"ecr"})
     assert "odin-aws-registry-default" not in rt.stopped
+
+
+# --- field test 5 facts audit: an unreadable port never becomes an endpoint ---
+#
+# These drive the REAL ColimaRuntime (not FakeRuntime) with only the subprocess
+# seam injected, so the whole real path runs: `docker inspect` fails ->
+# PortUnreadable -> BackingUnavailable -> no `:0` anywhere.
+
+
+class BrokenDockerRunner:
+    """The container CLI, hiccuping. `status` still answers `running` (the
+    container really is up), the port-map read fails -- the exact narrow window
+    the audit is about, and the only one that reaches `facts()` at all."""
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def __call__(self, args, input=None):
+        self.calls.append(args)
+        if "{{.State.Status}}" in args:
+            return _Proc(0, "running")
+        return _Proc(1, "", "Cannot connect to the Docker daemon at unix:///var/run/docker.sock")
+
+
+def _broken_aws(tmp_path, factory):
+    return BackingAws(ColimaRuntime(runner=BrokenDockerRunner()), env="default",
+                      root=tmp_path, client_factory=factory)
+
+
+def test_facts_refuses_to_name_an_endpoint_it_could_not_read(tmp_path, factory):
+    """THE hazard: `host_port` answered any CLI failure with 0, `facts()`
+    interpolated it, and the resulting `http://host.docker.internal:0` went
+    into `world.json` PERMANENTLY -- these facts are published once, on the
+    starting->healthy transition, and never refreshed."""
+    aws = _broken_aws(tmp_path, factory)
+    with pytest.raises(backings.BackingUnavailable) as raised:
+        aws.facts("s3", "uploads")
+    assert "Cannot connect to the Docker daemon" in str(raised.value)  # the REAL reason survives
+    assert ":0" not in str(raised.value)
+
+
+def test_client_still_fails_typed_when_the_port_read_itself_fails(tmp_path, factory):
+    # deprovision and friends swallow BackingUnavailable by name; a raw
+    # PortUnreadable escaping here would turn a best-effort cleanup into a crash.
+    with pytest.raises(backings.BackingUnavailable):
+        _broken_aws(tmp_path, factory).client("s3")
+
+
+def test_the_gateway_routing_table_omits_a_backing_it_cannot_read(tmp_path, factory):
+    # Absent means the gateway answers service-unavailable (true). A 0 entry
+    # meant it forwarded to port 0 and blamed the backing.
+    assert _broken_aws(tmp_path, factory).backing_ports() == {}
+
+
+def test_endpoint_vars_omit_a_backing_whose_port_cannot_be_read(tmp_path, factory):
+    env = _broken_aws(tmp_path, factory).aws_env()
+    assert not [k for k in env if k.startswith("AWS_ENDPOINT_URL_")]
+    assert env["AWS_ACCESS_KEY_ID"] == ACCESS_KEY  # creds are still knowable
