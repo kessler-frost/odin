@@ -1,20 +1,10 @@
-import { CATALOG, COLORS } from '../lib/catalog';
+import { BUILTINS, CATALOG, COLORS } from '../lib/catalog';
 
 type Item = { abbr: string; label: string; sublabel: string; category: string; iconClass: string };
 
-// Built-in (bespoke-node) resources. Catalog services are appended.
-// Exported so `lib/catalog.test.ts` can hold the sidebar's uniqueness invariant
-// over what the user ACTUALLY sees -- these seven plus the catalog -- rather than
-// over the catalog alone, which is only 20 of the 27 tiles.
-export const builtins: Item[] = [
-  { abbr: 'VPC', label: 'VPC', sublabel: 'Virtual Private Cloud', category: 'Networking', iconClass: 'text-neon-purple border-neon-purple' },
-  { abbr: 'SUB', label: 'Subnet', sublabel: 'Network partition', category: 'Networking', iconClass: 'text-neon-blue border-neon-blue' },
-  { abbr: 'SG', label: 'Security Group', sublabel: 'Firewall rules', category: 'Networking', iconClass: 'text-neon-red border-neon-red' },
-  { abbr: 'EC2', label: 'EC2 Instance', sublabel: 'Real Lima VM', category: 'Compute', iconClass: 'text-neon-orange border-neon-orange' },
-  { abbr: 'LAM', label: 'Lambda Function', sublabel: 'Real RIE container', category: 'Compute', iconClass: 'text-neon-yellow border-neon-yellow' },
-  { abbr: 'S3', label: 'S3 Bucket', sublabel: 'Object storage', category: 'Storage', iconClass: 'text-neon-green border-neon-green' },
-  { abbr: 'DDB', label: 'DynamoDB', sublabel: 'NoSQL table', category: 'Database', iconClass: 'text-neon-cyan border-neon-cyan' },
-];
+// The bespoke-node resources, from the single list in catalog.ts (Canvas.tsx
+// derives its `nodeTypeMap` from the same one). Catalog services are appended.
+const builtins: Item[] = BUILTINS;
 
 const catalogItems: Item[] = CATALOG.map((s) => ({
   abbr: s.abbr,

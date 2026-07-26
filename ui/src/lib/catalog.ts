@@ -63,6 +63,45 @@ export type ServiceDef = {
   iamActions?: string[];                // if this is an IAM target
 };
 
+// The seven BESPOKE resources: real, modelled services that render through their
+// own node components instead of the generic ServiceNode, which is why they are
+// not CATALOG entries. They live here anyway for two reasons.
+//
+// One: the sidebar renders `[...BUILTINS, ...CATALOG]`, so the honesty invariant
+// this file owes the user -- a tile either models a real service or says
+// `(placeholder)` -- has to hold over all 27 tiles, not the 20 in CATALOG. That
+// needs a `type` to check against translate.py's `_KIND`, which the sidebar's own
+// tile shape never carried.
+//
+// Two: Sidebar.tsx and Canvas.tsx each used to keep their own hardcoded copy of
+// this list, and Canvas's copy is the load-bearing one -- its `nodeTypeMap`
+// spreads the catalog AFTER these keys, so a catalog entry declaring abbr 'S3'
+// would silently override the bespoke tile and drop the wrong node type. Two
+// copies of a list where one silently wins is a bug waiting for its second
+// author; both now derive from here.
+//
+// `iconClass` is spelled out in full rather than built from COLORS for the same
+// reason every other class string in this file is: Tailwind's scanner only sees
+// literal text.
+export type BuiltinDef = {
+  type: string;         // node type (matches backend node_type)
+  abbr: string;         // sidebar drag key
+  label: string;
+  sublabel: string;
+  category: string;
+  iconClass: string;
+};
+
+export const BUILTINS: BuiltinDef[] = [
+  { type: 'vpc', abbr: 'VPC', label: 'VPC', sublabel: 'Virtual Private Cloud', category: 'Networking', iconClass: 'text-neon-purple border-neon-purple' },
+  { type: 'subnet', abbr: 'SUB', label: 'Subnet', sublabel: 'Network partition', category: 'Networking', iconClass: 'text-neon-blue border-neon-blue' },
+  { type: 'sg', abbr: 'SG', label: 'Security Group', sublabel: 'Firewall rules', category: 'Networking', iconClass: 'text-neon-red border-neon-red' },
+  { type: 'ec2', abbr: 'EC2', label: 'EC2 Instance', sublabel: 'Real Lima VM', category: 'Compute', iconClass: 'text-neon-orange border-neon-orange' },
+  { type: 'lambda', abbr: 'LAM', label: 'Lambda Function', sublabel: 'Real RIE container', category: 'Compute', iconClass: 'text-neon-yellow border-neon-yellow' },
+  { type: 's3', abbr: 'S3', label: 'S3 Bucket', sublabel: 'Object storage', category: 'Storage', iconClass: 'text-neon-green border-neon-green' },
+  { type: 'dynamodb', abbr: 'DDB', label: 'DynamoDB', sublabel: 'NoSQL table', category: 'Database', iconClass: 'text-neon-cyan border-neon-cyan' },
+];
+
 export const CATALOG: ServiceDef[] = [
   {
     type: 'sqs', abbr: 'SQS', label: 'SQS Queue', sublabel: 'Message queue',

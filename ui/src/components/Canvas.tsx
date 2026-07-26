@@ -29,7 +29,7 @@ import S3Node from './nodes/S3Node';
 import DynamodbNode from './nodes/DynamodbNode';
 import ServiceNode from './nodes/ServiceNode';
 import RegionAsk from './RegionAsk';
-import { CATALOG, catalogNodeTypeMap, catalogDefaultData, catalogDefaultStyle, catalogZIndex, catalogByType, COLORS } from '../lib/catalog';
+import { BUILTINS, CATALOG, catalogNodeTypeMap, catalogDefaultData, catalogDefaultStyle, catalogZIndex, catalogByType, COLORS } from '../lib/catalog';
 import { withContainment, isInsideContainer } from '../lib/containment';
 import { placeUnpositioned } from '../lib/placement';
 import { computeTypes, defaultPermissions, detectDefaultEdgeType, edgeStyle, edgeTypes } from '../lib/iam';
@@ -46,14 +46,13 @@ const nodeTypes: NodeTypes = {
   ...Object.fromEntries(CATALOG.map((s) => [s.type, ServiceNode])),
 };
 
+// abbr -> node type, for both halves of the sidebar. The bespoke keys come from
+// catalog.ts's BUILTINS rather than a second hardcoded copy: the catalog spread
+// lands AFTER them, so a catalog entry declaring abbr 'S3' would silently
+// override a bespoke tile and drop the wrong node type. One list, plus a test
+// that no catalog abbr collides with a bespoke one.
 const nodeTypeMap: Record<string, string> = {
-  VPC: 'vpc',
-  SUB: 'subnet',
-  SG: 'sg',
-  EC2: 'ec2',
-  LAM: 'lambda',
-  S3: 's3',
-  DDB: 'dynamodb',
+  ...Object.fromEntries(BUILTINS.map((b) => [b.abbr, b.type])),
   ...catalogNodeTypeMap,
 };
 

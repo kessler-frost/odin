@@ -16,8 +16,7 @@
 // warns about. Read the real thing and the test breaks when reality moves.
 import { describe, expect, test } from 'bun:test';
 
-import { builtins } from '../components/Sidebar';
-import { CATALOG, catalogIamActions } from './catalog';
+import { BUILTINS, CATALOG, catalogIamActions } from './catalog';
 
 const TRANSLATE = new URL('../../../src/odin/spec/translate.py', import.meta.url).pathname;
 const MARKER = '(placeholder)';
@@ -75,37 +74,56 @@ describe('catalog ↔ translate.py', () => {
 });
 
 // The tests above cover CATALOG, which is only 20 of the 27 tiles the sidebar
-// renders: `Sidebar.tsx` builds `[...builtins, ...catalogItems]`, and those seven
-// bespoke builtins (VPC, Subnet, SG, EC2, Lambda, S3, DynamoDB) never pass
-// through catalog.ts. A uniqueness rule that skips a quarter of the tiles is a
-// guard that only half fires, so it is held over the union here.
+// renders: `Sidebar.tsx` builds `[...BUILTINS, ...catalogItems]`. A rule that
+// skips a quarter of the tiles is a guard that only half fires, so the invariants
+// are held over the union here -- which is the whole reason BUILTINS carries a
+// `type` and lives in catalog.ts instead of being a shape private to the sidebar.
 describe('the whole rendered sidebar', () => {
+  const TILES = [...BUILTINS, ...CATALOG];
   const dupes = (values: string[]) =>
     [...new Set(values.filter((v, i) => values.indexOf(v) !== i))].sort();
 
-  test('no builtin and catalog tile share a label', () => {
-    expect(dupes([...builtins, ...CATALOG].map((t) => t.label))).toEqual([]);
+  test('all 27 tiles are accounted for', () => {
+    // Guard the guard: were BUILTINS ever emptied, every assertion below would
+    // pass by checking the catalog alone -- the gap this block exists to close.
+    expect(BUILTINS.length).toBe(7);
+    expect(TILES.length).toBeGreaterThan(20);
   });
 
-  test('no catalog abbr shadows a builtin abbr in Canvas.tsx nodeTypeMap', async () => {
-    // The sharper half, and the reason this test reads Canvas.tsx instead of
-    // trusting Sidebar.tsx: `nodeTypeMap` spreads `...catalogNodeTypeMap` AFTER
-    // its seven literal builtin keys, so a catalog entry declaring abbr 'S3' or
-    // 'EC2' would silently OVERRIDE the builtin -- dragging the bespoke tile
-    // would create the catalog node type instead, with nothing on screen to say
-    // so. Nothing else in the codebase prevents that collision.
+  test('a tile is marked (placeholder) if and only if Apply skips its type', async () => {
+    const kinds = await modelledKinds();
+    const state = (t: { type: string; sublabel: string }) => ({
+      type: t.type,
+      marked: t.sublabel.includes(MARKER),
+      modelled: kinds.has(t.type),
+    });
+    expect(TILES.map(state).filter((t) => !t.modelled && !t.marked)).toEqual([]);
+    expect(TILES.map(state).filter((t) => t.modelled && t.marked)).toEqual([]);
+  });
+
+  test('no two tiles share a label, an abbr, or a type', () => {
+    expect(dupes(TILES.map((t) => t.label))).toEqual([]);
+    expect(dupes(TILES.map((t) => t.type))).toEqual([]);
+    // The abbr is the sharpest of the three. `Canvas.tsx`'s `nodeTypeMap` spreads
+    // `...catalogNodeTypeMap` AFTER the BUILTINS entries, so a catalog tile
+    // declaring abbr 'S3' or 'EC2' would silently OVERRIDE the bespoke one --
+    // dragging the bespoke tile would create the catalog node type instead, with
+    // nothing on screen to say so.
+    expect(dupes(TILES.map((t) => t.abbr))).toEqual([]);
+  });
+
+  test('nodeTypeMap keeps deriving its bespoke keys from BUILTINS', async () => {
+    // The collision test above is only meaningful while Canvas.tsx has ONE source
+    // for these keys. It used to hold a second hardcoded copy; if someone
+    // reintroduces literal abbr keys there, this suite would be policing a list
+    // the canvas no longer reads.
     const source = await Bun.file(
       new URL('../components/Canvas.tsx', import.meta.url).pathname,
     ).text();
     const block = source.split('const nodeTypeMap: Record<string, string> = {')[1];
     expect(block, 'nodeTypeMap was renamed or moved in Canvas.tsx').toBeDefined();
-    const literalAbbrs = [...block.split('}')[0].matchAll(/^\s*(\w+):\s*'[\w-]+',$/gm)]
-      .map((m) => m[1]);
-    // Guard the guard: a parse that matched nothing would pass vacuously.
-    expect(literalAbbrs.length).toBe(7);
-    // And the two hardcoded copies of the builtin set must agree, or this test
-    // would be policing a list the sidebar no longer renders.
-    expect(literalAbbrs.sort()).toEqual(builtins.map((b) => b.abbr).sort());
-    expect(CATALOG.map((s) => s.abbr).filter((a) => literalAbbrs.includes(a))).toEqual([]);
+    const body = block.split('};')[0];
+    expect(body).toContain('BUILTINS.map');
+    expect([...body.matchAll(/^\s*(\w+):\s*'[\w-]+',$/gm)].map((m) => m[1])).toEqual([]);
   });
 });
