@@ -756,6 +756,40 @@ def test_elasticache_creating_and_deleting_are_starting_with_no_facts_yet(tmp_pa
     result = project(stores, ENV)
     assert result["c1"] == ("elasticache", "starting", {}, None)  # nothing to advertise until it's up
     assert result["c2"][1] == "starting"  # a delete can fail: stays visible until the record is gone
+    # The half this test USED to leave unasserted, which is how the bug below
+    # survived it: the deleting cluster still had a port on its record.
+    assert result["c2"][2] == {}
+
+
+def test_a_deleting_cache_no_longer_advertises_a_live_redis_url(tmp_path):
+    """Field test 5's facts audit, hazard 3. `_cache_clusters` published
+    `cachectl.facts(record)` in EVERY phase, so a cluster mid-delete kept
+    handing out a `REDIS_URL` a consumer would dial -- the exact stale-green
+    lie `_db_instances`'s gate exists to prevent and `_ec2_instances` gates
+    for too. The record still carries the port (a delete can fail, and the
+    record outlives the container), so nothing else stops it."""
+    stores = SynthStores(tmp_path)
+    stores.cachectl.set(ENV, "cluster:cache", _cache_cluster("cache", "deleting", port=51234))
+
+    kind, phase, facts, verdict = project(stores, ENV)["cache"]
+
+    assert (kind, phase, verdict) == ("elasticache", "starting", None)
+    assert facts == {}
+    assert "51234" not in str(facts) and "redis://" not in str(facts)
+
+
+def test_every_fact_publishing_kind_gates_on_being_actually_up(tmp_path):
+    """The consistency this fix restores, asserted as one rule rather than
+    three separate tests: no kind that projects an address may project it
+    while the thing is not available. rds and ec2 already held; elasticache
+    was the outlier."""
+    stores = SynthStores(tmp_path)
+    stores.cachectl.set(ENV, "cluster:cache", _cache_cluster("cache", "deleting", port=51234))
+    stores.rdsctl.set(ENV, "db:appdb", _db_record("appdb", "deleting"))
+
+    result = project(stores, ENV)
+    assert result["cache"][2] == {}
+    assert result["appdb"][2] == {}
 
 
 def test_elasticache_create_failed_is_crashed_with_the_real_reason_as_verdict(tmp_path):
