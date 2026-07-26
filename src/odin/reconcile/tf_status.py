@@ -504,7 +504,22 @@ def _cache_clusters(stores: SynthStores, env: str) -> Projected:
     """W2.8. Publishes real FACTS the way `_db_instances` does: an `available`
     cluster's `REDIS_URL`/`REDIS_URL_VM` endpoints, so a consumer's
     `${{cache.REDIS_URL}}` ref resolves through the Fabric off World exactly
-    the way rds's `DATABASE_URL` does (`cachectl.facts`)."""
+    the way rds's `DATABASE_URL` does (`cachectl.facts`).
+
+    "The way `_db_instances` does" now includes the GATE, which is the whole
+    point of the pattern and was the one half missing (field test 5's facts
+    audit). This projected in EVERY phase, so a `deleting` cluster kept
+    advertising a live `REDIS_URL` -- precisely the stale-green lie
+    `_db_instances`'s docstring says its gate exists to prevent, and which
+    `_ec2_instances` gates for too. `cachectl.facts`'s own docstring already
+    said "the facts an AVAILABLE cluster publishes"; only the call site
+    disagreed.
+
+    Gated on the record STATUS rather than the derived phase, following rds
+    (they are equivalent today -- `available` is the only status
+    `_CACHE_PHASE` maps to `healthy` -- and the status form fails SAFE if that
+    ever stops being true: a new status publishes nothing until someone
+    decides it should)."""
     out: Projected = {}
     for record in cachectl.clusters(stores, env):
         tags = stores.tags.get(env, f"elasticache:{record['arn']}", {})
@@ -512,8 +527,9 @@ def _cache_clusters(stores: SynthStores, env: str) -> Projected:
         if not label:
             continue
         phase = _CACHE_PHASE.get(record["status"], "starting")
+        facts = cachectl.facts(record) if record["status"] == cachectl.STATUS_AVAILABLE else {}
         verdict = (record.get("status_reason") or None) if phase == "crashed" else None
-        out[label] = ("elasticache", phase, cachectl.facts(record), verdict)
+        out[label] = ("elasticache", phase, facts, verdict)
     return out
 
 
