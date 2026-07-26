@@ -496,10 +496,15 @@ def create_apply_router(
                     return JSONResponse(status_code=409, content={"error": str(exc)})
                 else:
                     body["tf"] = {"status": "ok" if result.ok else "failed", "exit_code": result.exit_code}
-                    # A negative exit code is a SIGNAL, not tofu's own verdict,
-                    # and on this path there is one thing that sends it:
-                    # `TfRunner._run`'s `killpg` when the destroy budget blows.
-                    tf_outcome = "ok" if result.ok else ("timed_out" if result.exit_code < 0 else "failed")
+                    # Field test 5 (MED): `timed_out` comes from the runner,
+                    # which is the only frame that knows -- it is the thing that
+                    # sent the signal. The old test, `result.exit_code < 0`,
+                    # rested on "only odin's own killpg produces a negative
+                    # code", which is false: ANY kill gives -9, so an external
+                    # `kill -9` 0.87 seconds into a destroy was reported as a
+                    # 300-second deadline expiry and sent the user to tune
+                    # ODIN_TOFU_DESTROY_TIMEOUT for something unrelated.
+                    tf_outcome = "ok" if result.ok else ("timed_out" if result.timed_out else "failed")
                     if not result.ok:
                         body["tf"]["tail"] = list(result.tail)
 

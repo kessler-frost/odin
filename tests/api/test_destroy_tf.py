@@ -137,9 +137,9 @@ def _write_state(tmp_path, env: str = "default") -> None:
     }))
 
 
-def _failing_destroy(exit_code: int, tail: tuple[str, ...]):
+def _failing_destroy(exit_code: int, tail: tuple[str, ...], timed_out: bool = False):
     async def _destroy(*args, **kwargs):
-        return TfResult(ok=False, exit_code=exit_code, tail=tail)
+        return TfResult(ok=False, exit_code=exit_code, tail=tail, timed_out=timed_out)
 
     return _destroy
 
@@ -151,7 +151,9 @@ def test_a_timed_out_destroy_is_not_reported_as_destroyed(tmp_path):
     exited 0 while everything was still standing."""
     app = _surviving_app(tmp_path)
     _write_state(tmp_path)
-    app.state.tf_runner.destroy = _failing_destroy(-9, ("tofu destroy timed out after 300s -- process killed",))
+    app.state.tf_runner.destroy = _failing_destroy(
+        -9, ("tofu destroy timed out after 300s -- process killed",), timed_out=True,
+    )
     with TestClient(app) as client:
         client.post("/apply", json=CANVAS)
         resp = client.post("/destroy")
@@ -162,6 +164,31 @@ def test_a_timed_out_destroy_is_not_reported_as_destroyed(tmp_path):
     # A deadline expiry is a distinct outcome from tofu erroring: nothing was diagnosed.
     assert "whole-call deadline" in body["error"]
     assert "ODIN_TOFU_DESTROY_TIMEOUT" in body["error"]
+
+
+def test_an_externally_killed_destroy_does_not_blame_the_deadline(tmp_path):
+    """Field test 5 (MED): the route used to read `result.exit_code < 0` as
+    "odin's own killpg fired", on the belief that nothing else produces a
+    negative code. Any kill gives -9 -- an external `kill -9` 0.87s into a
+    destroy was reported as a 300-SECOND deadline expiry, sending the operator
+    to tune `ODIN_TOFU_DESTROY_TIMEOUT` for something that had nothing to do
+    with it. `TfResult.timed_out` is the real signal, carried out of the one
+    frame that knows, and it is False here."""
+    app = _surviving_app(tmp_path)
+    _write_state(tmp_path)
+    # Exactly what an external SIGKILL looks like: -9, and the runner's own
+    # timeout branch never ran, so it appended nothing to the tail.
+    app.state.tf_runner.destroy = _failing_destroy(-9, ())
+    with TestClient(app) as client:
+        client.post("/apply", json=CANVAS)
+        resp = client.post("/destroy")
+
+    assert resp.status_code == 500, resp.text
+    body = resp.json()
+    assert body["status"] == "destroy_failed", body
+    assert "deadline" not in body["error"]
+    assert "ODIN_TOFU_DESTROY_TIMEOUT" not in body["error"]
+    assert "tofu exited -9" in body["error"]
 
 
 def test_a_failed_destroy_names_what_is_still_standing(tmp_path):
