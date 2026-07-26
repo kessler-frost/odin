@@ -376,9 +376,14 @@ def test_revoking_membership_drops_a_connection_that_is_already_open(
         )
         # A DROP is silence. A reset or a clean close would mean something else
         # ended the session (Postgres itself, or a restarted daemon), which is
-        # not the firewall decision this test exists to prove.
+        # not the firewall decision this test exists to prove -- and there IS a
+        # way to get one: Postgres' own `authentication_timeout` (60s) closes a
+        # connection that has not finished authenticating, which is why the
+        # holder keeps refreshing and reports `held_age_s`. An age near or over
+        # 60 here means the Apply outran that budget, not that the fix broke.
         assert result["verdict"] in ("TimeoutError", "timeout"), (
-            f"a revoked flow must be DROPPED (silence), not closed or reset: {result}"
+            f"a revoked flow must be DROPPED (silence), not closed or reset: {result} "
+            f"(a held_age_s near Postgres' 60s authentication_timeout would explain a reset instead)"
         )
 
         # The mechanism itself, in the database's own log: a reload whose rules
