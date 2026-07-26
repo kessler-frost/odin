@@ -482,17 +482,31 @@ prose explanation of a failure, and the evidence it reads is still there in
   `s3`, `sqs`, `sns`, `dynamodb`, `rds`, `vpc`, `subnet` only — and a
   live-imported RDS arrives with odin's default password, because no AWS API
   returns a master password.
-- **Some arguments are re-emitted with odin's own value whatever you wrote.** Five
-  warn when yours differs: an ALB's `internal` and `load_balancer_type`, a target
-  group's `protocol` and `target_type`, a listener's `protocol`. One changes what
-  you get and says nothing at all: an ElastiCache cluster is always
-  `engine = "redis"` with `num_cache_nodes = 1`, so importing a three-node
-  memcached cluster hands you back a single-node Redis in silence. A DynamoDB table
-  is always `PAY_PER_REQUEST` and a bucket always `force_destroy = true`; both warn,
-  but as "imported without unmodeled attribute(s)", which reads as a drop rather
-  than an override. Primary resources also gain an `odin:node` tag (companions such
-  as a key pair or a generated execution role do not), so a byte-identical round
-  trip is not a goal.
+- **Some arguments are re-emitted with odin's own value whatever you wrote**, and
+  each one warns on its own line — `imported with CHANGED argument(s) -- odin
+  substitutes its own value` — kept separate from the `imported without unmodeled
+  attribute(s)` line, which reports an argument that was *dropped*. The list: an
+  ALB's `internal`, `load_balancer_type` and any subnet past the first; a target
+  group's `protocol`, `target_type` and `name`; a listener's `protocol`; an
+  ElastiCache cluster's `engine` and `num_cache_nodes` (odin's cache is always
+  single-node Redis, so a three-node memcached cluster comes back as one Redis —
+  it now says so); a DynamoDB table's `billing_mode`; a bucket's `force_destroy`;
+  an RDS `skip_final_snapshot` and `allocated_storage`; a log group's
+  `retention_in_days`; a secret's `recovery_window_in_days`; a subscription's
+  `raw_message_delivery`; and **any resource name odin takes from the HCL block
+  label instead of the `name` you wrote** — which is what happens whenever the
+  real name is computed, so a project whose names come from variables gets
+  renamed on import and is told.
+- **What stays silent is the inverse: an argument you did not write.** AWS's
+  default is the opposite of odin's for `force_destroy`, `billing_mode` and
+  `skip_final_snapshot`, so omitting them changes meaning too — and odin invents a
+  value where the source had none (an RDS `password`/`username`/`db_name`, a VPC or
+  subnet CIDR, a cache `node_type`). Neither warns, because both would fire on
+  every ordinary import. An `aws_iam_role`'s `assume_role_policy` is reported only
+  as unmodeled, since odin's own output is a `jsonencode(...)` expression that
+  cannot be compared back. Primary resources also gain an `odin:node` tag
+  (companions such as a key pair or a generated execution role do not), so a
+  byte-identical round trip is not a goal.
 - **Lambda:** inline code only (paste it in the config panel, odin zips and ships
   it), one version (`$LATEST`). No S3-deployed packages, versions or aliases.
 - **ECS:** `network_configuration` (awsvpc/Fargate-style ENIs) is not modeled;
