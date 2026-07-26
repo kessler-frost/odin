@@ -26,12 +26,26 @@ from odin.compute.instances import (
     _Proc,
     _pick_shared_ip,
     instance_config_path,
+    membership_changed,
     vm_name,
 )
 from odin.compute.models import get_instance_type
 from odin.fabric.models import FirewallRule, FirewallRules
+from odin.fabric.nebula import FIREWALL_REVISION_KEY, LIGHTHOUSE_PORT
 
 NAME = vm_name("default", "i-0123456789abcdef0")
+
+
+@pytest.fixture(autouse=True)
+def pinned_lighthouse_port(monkeypatch):
+    """Port allocation PROBES the real machine (`fabric/nebula.py::_port_free`
+    binds a UDP socket), so a rendered `static_host_map` asserted against a
+    literal 4342 fails whenever any live env on this Mac happens to hold that
+    port -- a unit test failing on the state of somebody else's running
+    server. `ODIN_LIGHTHOUSE_PORT` is the seam that already exists for
+    exactly this ("honoured verbatim: no probing, no reallocation"), so
+    pinning it makes these assertions about the RENDERER again."""
+    monkeypatch.setenv("ODIN_LIGHTHOUSE_PORT", str(LIGHTHOUSE_PORT))
 
 
 class FakeRunner:
@@ -661,6 +675,55 @@ def test_a_reload_never_pokes_because_it_never_dropped_a_tunnel(tmp_path):
     )
     assert vm.refresh_nebula(NAME, widened) == "reloaded"
     assert not any(c[-3:] == ["sudo", "bash", "-s"] for c in runner.calls)
+
+
+def test_a_moved_roster_reaches_a_bystander_vm_as_a_reload(tmp_path):
+    """Field test 4, from the ADMITTING side. This VM's own groups and rules
+    are untouched -- somebody ELSE in the env lost a group. It still has to act,
+    because the flows it already permitted from that member are still open and
+    nebula only re-validates them when its OWN ruleset version moves.
+
+    A reload is the whole point: this fires for every member on every
+    membership change in the env, so a restart here would drop every tunnel in
+    the env every time anyone's groups moved."""
+    vm, runner, nebula = _booted_vm(tmp_path, firewall=_rules("5432"), groups=("sg-db",))
+
+    moved_roster = NebulaJoin(
+        root=nebula.root, env=nebula.env, host_id=nebula.host_id,
+        firewall=_rules("5432"), groups=("sg-db",), revision="roster-2",
+    )
+    assert vm.refresh_nebula(NAME, moved_roster) == "reloaded"
+    assert not any("restart" in c for c in runner.calls), "a bystander must not lose its tunnels"
+    assert not any("nebula-cert" in c for c in runner.calls), "its own membership did not change"
+    signal = next(c for c in runner.calls if "kill" in c)
+    assert signal == ["limactl", "shell", NAME, "--", "sudo", "systemctl", "kill", "-s", "HUP", "nebula"]
+
+    recorded = yaml.safe_load(instance_config_path(tmp_path, "myenv", "i-refresh").read_text())
+    assert recorded["firewall"][FIREWALL_REVISION_KEY] == "roster-2"
+    assert [r["port"] for r in recorded["firewall"]["inbound"]] == ["5432"], (
+        "the rules are untouched -- an equal-rules reload is exactly what bumps the ruleset version"
+    )
+    # ...and having taken it, the next Apply over the same roster is free again.
+    runner.calls.clear()
+    assert vm.refresh_nebula(NAME, moved_roster) == "unchanged"
+    assert runner.calls == []
+
+
+def test_membership_changed_is_the_cheap_predicate_the_caller_orders_by(tmp_path):
+    """`ensure_instance_mesh` re-certifies moved instances FIRST so an admitting
+    member never re-checks a flow against a certificate the peer is about to
+    replace. It has to be able to ask that question without a subprocess."""
+    vm, _runner, nebula = _booted_vm(tmp_path, firewall=_rules("22"), groups=("sg-web",))
+    assert membership_changed(nebula) is False
+    assert membership_changed(_moved(nebula)) is True
+    # A revision move alone is NOT a membership move -- the bystander reloads,
+    # it does not get re-signed, and it must not jump the queue.
+    bystander = NebulaJoin(
+        root=nebula.root, env=nebula.env, host_id=nebula.host_id,
+        firewall=_rules("22"), groups=("sg-web",), revision="roster-2",
+    )
+    assert membership_changed(bystander) is False
+    assert vm.refresh_nebula(NAME, bystander) == "reloaded"
 
 
 def test_a_failed_signal_is_reported_not_swallowed(tmp_path):

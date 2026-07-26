@@ -57,9 +57,11 @@ class FakePostgresRds:
         self.up: set[str] = set()
         self.overlay = overlay
         self.joined: list[tuple[str, object]] = []
+        self.revisions: list[str] = []
 
-    def join_mesh(self, db_id: str, firewall=None) -> str | None:
+    def join_mesh(self, db_id: str, firewall=None, revision: str = "") -> str | None:
         self.joined.append((db_id, firewall))
+        self.revisions.append(revision)
         return self.overlay
 
     def container_name(self, db_id: str) -> str:

@@ -69,12 +69,17 @@ class PostgresRds:
         legible next to the container it belongs to."""
         return self.container_name(db_id)
 
-    def join_mesh(self, db_id: str, firewall: FirewallRules | None = None) -> str | None:
+    def join_mesh(self, db_id: str, firewall: FirewallRules | None = None, revision: str = "") -> str | None:
         """Put this database on the env's overlay behind `firewall` (its drawn
         SG's compiled rules). No-op returning None when the env has no Nebula
-        network — i.e. no VPC on the canvas."""
+        network — i.e. no VPC on the canvas.
+
+        `revision` is the env's security-group membership digest (field test
+        4): a database is the ADMITTING member in the common case, so it is
+        the one that has to re-check the sessions it already granted when a
+        client loses the group that let it in. See `fabric/sidecar.py::ensure`."""
         return self._mesh.ensure(
-            self.container_name(db_id), self.mesh_member(db_id), firewall=firewall,
+            self.container_name(db_id), self.mesh_member(db_id), firewall=firewall, revision=revision,
         )
 
     def overlay_endpoint(self, db_id: str) -> tuple[str, int] | None:

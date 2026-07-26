@@ -53,6 +53,12 @@ forwards opaque encrypted UDP between two peers it already has live sessions
 with, never decrypting either side, so (empirically verified) it needs no
 tun device to do it — the lighthouse's existing `tun: disabled: true` is
 unaffected.
+
+R6 (field test 4) closes the last documented gap in the security-group story:
+a revoke refused NEW connections but left an ALREADY-OPEN flow alive, because
+nebula's firewall re-validates a conntrack entry only when its OWN ruleset
+version moves — never when a PEER's certificate changes. `FIREWALL_REVISION_KEY`
+is the lever, and the measurement behind it is in that constant's own comment.
 """
 from __future__ import annotations
 
@@ -146,6 +152,53 @@ DEFAULT_FIREWALL = FirewallRules(
     inbound=[FirewallRule(port="any", proto="any")],
     outbound=[FirewallRule(port="any", proto="any")],
 )
+
+# --- closing a revoke on flows that are ALREADY OPEN (field test 4) ----------
+#
+# v0.7.2 made a membership revoke real: odin re-signs the member's certificate
+# without the group and restarts its daemon, so NEW connections are refused
+# before Apply returns. Field test 4 then held a real TCP flow open to the
+# database ACROSS such a revoke and pushed a genuine Postgres startup packet
+# down it -- and the server ANSWERED. An already-open flow survived the revoke.
+#
+# That is nebula's documented design, not a bug in it: the firewall keeps a
+# conntrack entry per flow, and re-validates an entry only when its OWN ruleset
+# version has moved on ("keeping old conntrack entry, does match new ruleset" /
+# "dropping old conntrack entry, does not match new ruleset" -- both strings
+# are in the 1.10.3 binary odin ships). A PEER re-handshaking under a new
+# certificate does not move it, so the admitting member never re-checks the
+# flows it already admitted.
+#
+# So the lever is the ADMITTING side's own ruleset version, and nebula moves it
+# on config reload -- but only if the `firewall` section really changed:
+#
+#     func (f *Interface) reloadFirewall(c *config.C) {
+#         if c.HasChanged("firewall") == false {
+#             f.l.Debug("No firewall config change detected"); return }
+#         ... fw.rulesVersion = oldFw.rulesVersion + 1; fw.Conntrack = conntrack
+#
+# Measured against the shipped binary, four SIGHUPs at one running daemon:
+#   identical config             -> "No firewall config change detected"
+#   + firewall.odin_membership_revision
+#                                -> "New firewall has been installed"
+#                                   firewallHashes=SHA:10d2c73c... rulesVersion=1
+#                                   oldFirewallHashes=SHA:10d2c73c...  <- EQUAL
+#   identical again              -> "No firewall config change detected"
+#   revision changed again       -> installed again, hashes still equal
+#
+# The equal rule hashes are the whole point: the RULES are provably untouched,
+# and the ruleset VERSION still advanced -- exactly the "no-op but versioned"
+# reload this needs, with no invented rule that could accidentally permit
+# something. nebula ignores keys it does not know, so the value is inert to
+# every other part of its behaviour (verified: the daemon starts and reloads
+# with it present).
+#
+# What the value must BE is the caller's business: odin renders a digest of the
+# env's security-group MEMBERSHIP roster (`gateway/models/ec2compute.py::
+# membership_revision`), so the key changes when, and only when, some member's
+# certificate groups change -- an unchanged canvas keeps rendering the same
+# bytes and costs nothing.
+FIREWALL_REVISION_KEY = "odin_membership_revision"
 
 
 @dataclass
@@ -346,6 +399,7 @@ class NebulaManager:
         tun_disabled: bool = False,
         relay_enabled: bool = False,
         lighthouse_port: int | None = None,
+        firewall_revision: str | None = None,
     ) -> str:
         """`pki=None` (the default, unchanged): the VM-side fixed paths a
         node's own cloud-init writes its cert to (`/etc/nebula/...`). A REAL
@@ -382,8 +436,22 @@ class NebulaManager:
         `lighthouse_port` (field test 2 B8): the port THIS env's lighthouse
         owns -- what it binds when `is_lighthouse`, and what every member
         dials it on. `None` keeps the historical machine-global 4342, which is
-        what an `overlay.json` written before per-env ports existed means."""
+        what an `overlay.json` written before per-env ports existed means.
+
+        `firewall_revision` (field test 4): a value nebula itself ignores,
+        placed inside the `firewall` block so that CHANGING it -- and nothing
+        else -- makes a reload count. See `FIREWALL_REVISION_KEY` for the whole
+        mechanism and the measurement behind it. `None` omits the key
+        entirely, so every config rendered before this existed is byte-
+        identical to the one rendered now: an env that has never seen a
+        membership change pays nothing."""
         port = lighthouse_port or LIGHTHOUSE_PORT
+        firewall_block: dict = {
+            "inbound": [_rule_to_dict(r) for r in firewall.inbound],
+            "outbound": [_rule_to_dict(r) for r in firewall.outbound],
+        }
+        if firewall_revision:
+            firewall_block[FIREWALL_REVISION_KEY] = firewall_revision
         config: dict = {
             "pki": {
                 "ca": str(pki.ca_crt) if pki else "/etc/nebula/ca.crt",
@@ -395,10 +463,7 @@ class NebulaManager:
             # Lima steals the host's 4242 for a VM's own nebula listener), and
             # its own per ENV (B8).
             "listen": {"host": "0.0.0.0", "port": port if is_lighthouse else NEBULA_PORT},
-            "firewall": {
-                "inbound": [_rule_to_dict(r) for r in firewall.inbound],
-                "outbound": [_rule_to_dict(r) for r in firewall.outbound],
-            },
+            "firewall": firewall_block,
         }
         if tun_disabled:
             config["tun"] = {"disabled": True}
@@ -465,7 +530,24 @@ class NebulaManager:
 # overrides) -- the one file-system-visible proof that the daemon is up and has
 # configured its interface, readable with no tool at all inside either a Lima
 # VM or the busybox sidecar.
-NEBULA_TUN = "nebula1"
+# The tun device the daemon creates -- the one file-system-visible proof that
+# it is up and has configured its interface, readable with no tool at all
+# inside either a Lima VM or the busybox sidecar.
+#
+# A GLOB, not a name, and measured rather than assumed: this used to be the
+# literal `nebula1`, on the belief that it was "nebula's own default on Linux".
+# It is not. odin never sets `tun.dev`, and an unset `tun.dev` leaves the name
+# to the kernel, which hands out `tun0` -- confirmed on both kinds of member at
+# once (`ip -4 -o addr show` inside an EC2 VM and `ls /sys/class/net` inside a
+# backing's sidecar both report `tun0`, and nebula's own startup line says
+# `interface=tun0`). So the wait below never once short-circuited: every
+# re-handshake poke sat out its full timeout before firing.
+#
+# Both candidates are kept. `nebula1` is what nebula's example config sets, so
+# a member configured that way (or a future default) still matches, and an
+# unmatched glob stays literal in `sh`, which `[ -d ... ]` reads as false --
+# so the loop degrades to exactly the old behaviour rather than to a wrong one.
+NEBULA_TUN_GLOB = "/sys/class/net/nebula* /sys/class/net/tun*"
 # How long `rehandshake_script` waits for that device after a (re)start before
 # poking anyway: 1s ticks, POSIX `sleep` only (busybox's fractional sleep is a
 # compile-time option, and this script runs in alpine as well as Ubuntu).
@@ -498,11 +580,19 @@ def rehandshake_script(peers: Iterable[str]) -> str:
     HANDSHAKE happens below the firewall. We are buying tunnel state, not a
     reply. Self-bounding throughout (`-c 1 -W 1`, a capped wait loop, `exit 0`)
     so it can never hang an Apply, and it is only ever run on a real restart --
-    an unchanged member never pays a millisecond of it."""
+    an unchanged member never pays a millisecond of it.
+
+    The wait tests EVERY candidate, not just the first: an unmatched glob stays
+    literal in `sh`, so `nebula*` not matching would otherwise mask a `tun*`
+    that does (which is the case on every member odin actually runs -- see
+    `NEBULA_TUN_GLOB`). `break 2` leaves the `for` and the `while` together,
+    which is POSIX and works in both shells this runs in (bash inside an EC2
+    VM, busybox `sh` inside a backing's sidecar)."""
     pokes = "\n".join(f"ping -c 1 -W 1 {ip} >/dev/null 2>&1" for ip in peers)
     return (
         f"i=0; while [ $i -lt {_TUN_WAIT_TICKS} ]; do "
-        f"[ -d /sys/class/net/{NEBULA_TUN} ] && break; i=$((i+1)); sleep 1; done\n"
+        f"for d in {NEBULA_TUN_GLOB}; do [ -d \"$d\" ] && break 2; done; "
+        f"i=$((i+1)); sleep 1; done\n"
         f"{pokes}\nexit 0\n"
     )
 
@@ -515,6 +605,28 @@ def peer_overlay_ips(network: MeshNetwork, member: str) -> list[str]:
     hosts = network.subnets.get("hosts")
     assignments = hosts.assignments if hosts else {}
     return [ip for host, ip in assignments.items() if host != member]
+
+
+def firewall_only_change(before: str | None, after: str) -> bool:
+    """Is the ONLY difference between two rendered configs the `firewall`
+    block? That is the one section nebula genuinely reloads on SIGHUP, so it is
+    the one case where a running daemon can adopt the change without dropping
+    its tunnels. No previous config at all (an unreadable member) is not
+    evidence of anything, so it answers False -- restart, the safe side.
+
+    Shared by BOTH kinds of mesh member on purpose: `compute/instances.py`
+    (an EC2 VM, `systemctl kill -s HUP nebula`) and `fabric/sidecar.py` (a
+    backing container, `docker kill -s HUP`). They must agree about what a
+    reloadable change is, because `FIREWALL_REVISION_KEY` lives inside exactly
+    this block -- a member that answered False here would RESTART on every
+    membership change in its env and drop every tunnel it holds, which is the
+    heavy-handed outcome the revision exists to avoid."""
+    if before is None:
+        return False
+    old, new = yaml.safe_load(before) or {}, yaml.safe_load(after) or {}
+    old.pop("firewall", None)
+    new.pop("firewall", None)
+    return old == new
 
 
 def _rule_to_dict(rule: FirewallRule) -> dict:
