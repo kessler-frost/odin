@@ -155,16 +155,15 @@ Prefer an async driver where a production-grade one exists (`psycopg` v3's
 `aws/rds.py` use today). If something is genuinely unavoidable, leave the
 boundary VISIBLE and say why — an honest limit beats a hidden thread.
 
-**Which library: prefer `anyio`, so the choice stays open.** Not because trio
-beats asyncio — because anyio runs on BOTH (`anyio.get_all_backends()` →
-`('asyncio', 'trio')`), so anyio-shaped code is married to neither. It costs
-nothing here: Starlette already requires it (`anyio<5,>=3.6.2`, and 4.14.0 is
-in this venv today), so it is a transitive dependency odin already ships.
-Prefer its structured concurrency (`anyio.create_task_group`) over hand-rolled
-task bookkeeping. What this does NOT mean: rewriting the web stack to chase a
-backend. uvicorn/FastAPI are asyncio, anyio runs happily on asyncio, and that
-combination is exactly what "not limited to one library" buys. Judge async
-libraries on production quality and maintenance, not novelty.
+**Which library: core `asyncio`, and stay in it.** odin's own code imports
+`anyio` NOWHERE — it is purely transitive via Starlette — while `src/odin`
+already uses `asyncio.Lock`, `asyncio.create_subprocess_exec`,
+`asyncio.create_task` and friends throughout. Consistency is the whole point,
+so do not introduce a second async idiom; a transitive dependency is not a
+reason to start calling it directly. On Python 3.13 the stdlib covers what
+`anyio` is usually reached for: **`asyncio.TaskGroup`** for structured
+concurrency, `asyncio.create_subprocess_exec` for async subprocesses,
+`asyncio.timeout`, `asyncio.Lock`. That is also what uvicorn/FastAPI run on.
 
 odin's remaining threads as of v0.7.6, all scheduled to go in v0.7.7: the
 gateway's own uvicorn (`serve_in_thread`), the substrate boot threads
