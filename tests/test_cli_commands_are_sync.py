@@ -73,48 +73,53 @@ def test_typer_really_does_drop_async_commands():
     If a future typer starts supporting async commands, this fails and the
     guard above can be reconsidered — instead of the docstring quietly
     describing a version nobody runs any more.
+
+    Run in a SUBPROCESS on purpose. Dropping the coroutine is the behaviour
+    under test, so an in-process probe necessarily creates the exact orphan
+    that `conftest.py::_fail_on_unawaited_coroutines` exists to fail on. Two
+    in-process containment attempts were tried and MEASURED as not working —
+    the discarded coroutine survives an inner `catch_warnings` + `gc.collect()`
+    and is only finalized at interpreter exit, so the fixture caught it at
+    teardown anyway. Adding a marker-based opt-out would have worked and was
+    rejected: the moment that escape hatch exists, it gets used to silence real
+    forgotten awaits. A subprocess needs no exemption, and measures typer in a
+    clean interpreter besides.
     """
-    import gc
-    import warnings
+    import subprocess
+    import sys
+    import textwrap
 
-    import typer
-    from typer.testing import CliRunner
+    probe = textwrap.dedent(
+        """
+        import typer
+        from typer.testing import CliRunner
 
-    app = typer.Typer()
-    ran = {"sync": False, "async": False}
+        app = typer.Typer()
+        ran = {"sync": False, "async": False}
 
-    @app.command()
-    def syncish():
-        ran["sync"] = True
+        @app.command()
+        def syncish():
+            ran["sync"] = True
 
-    @app.command()
-    async def asyncish():
-        ran["async"] = True
+        @app.command()
+        async def asyncish():
+            ran["async"] = True
 
-    runner = CliRunner()
-    sync_result = runner.invoke(app, ["syncish"])
-
-    # Dropping the coroutine IS the behaviour under test, so this test creates
-    # exactly the orphan that `conftest.py::_fail_on_unawaited_coroutines`
-    # exists to fail on. It is contained here rather than excused: an inner
-    # `catch_warnings` receives the warning, and collecting inside that block
-    # means the fixture's outer recorder never sees it. No opt-out marker, so
-    # nothing else can reach for the same escape hatch.
-    with warnings.catch_warnings(record=True) as dropped:
-        warnings.simplefilter("always")
-        async_result = runner.invoke(app, ["asyncish"])
-        gc.collect()
-    assert any("never awaited" in str(w.message) for w in dropped), (
-        "expected typer to create and discard the coroutine; if no orphan "
-        "appeared, typer's handling has changed and this guard needs revisiting"
+        runner = CliRunner()
+        s = runner.invoke(app, ["syncish"])
+        a = runner.invoke(app, ["asyncish"])
+        print(f"sync={s.exit_code},{ran['sync']} async={a.exit_code},{ran['async']}")
+        """
     )
-
-    assert sync_result.exit_code == 0 and ran["sync"], "a sync command should run"
-    assert not ran["async"], (
-        "typer now runs async commands — this guard's premise has changed, "
-        "re-check whether CLI entry points still need to be synchronous"
+    done = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=False,
     )
-    assert async_result.exit_code == 0, (
-        "the danger is precisely that it exits 0; if typer now fails loudly, "
-        "this guard matters much less"
+    assert done.returncode == 0, f"probe itself failed:\n{done.stderr}"
+    out = done.stdout.strip()
+
+    assert "sync=0,True" in out, f"a sync command should run; probe said {out!r}"
+    assert "async=0,False" in out, (
+        "typer's handling of async commands has CHANGED — this guard's premise "
+        f"was `exit 0 with the body never run`, probe said {out!r}. Re-check "
+        "whether CLI entry points still need to be synchronous."
     )

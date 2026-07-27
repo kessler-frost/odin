@@ -58,15 +58,8 @@ BLOCKING = {
 # Delete an entry when you fix it; do NOT add one to make a new failure go away
 # without an owner and a reason.
 ALLOWED: dict[tuple[str, str, str], str] = {
-    ("compute/functions.py", "invoke", "httpx.post"):
-        "v0.7.7 stage C, owner dethread-gateway-src: becomes httpx.AsyncClient. "
-        "THE SEVERE ONE -- 30s timeout on the shared loop, and a re-entrant "
-        "invoke deadlocks because the loop that would serve the callback is "
-        "the one blocked inside the invoke.",
     ("compute/instances.py", "_discover_ip", "time.sleep"):
         "v0.7.7 stage C, owner dethread-control-src: becomes await asyncio.sleep.",
-    ("gateway/models/rdsctl.py", "_wait_available", "time.sleep"):
-        "v0.7.7 stage C, owner dethread-gateway-src: becomes await asyncio.sleep.",
     ("aws/rds.py", "set_password", "psycopg2.connect"):
         "v0.7.7 stage E: psycopg2 has no async API; the fix is the psycopg v3 "
         "AsyncConnection swap, which is a driver change and deliberately not "
