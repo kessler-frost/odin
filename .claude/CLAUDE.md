@@ -131,16 +131,26 @@ than claimed" — was the single most valuable output of the field tests.
    signalled nothing because the container's BusyBox lacks `pgrep -o`, and odin
    was right to keep reporting healthy).
 
-## Concurrency: asyncio, not threads (owner directive, 2026-07-27)
-**No `threading` and no `multiprocessing` unless genuinely unavoidable — use
-`asyncio`/`anyio`.** The reason is locking: threads force it, and on a single
+## Concurrency: async, not threads (owner directive, 2026-07-27)
+**No `threading` and no `multiprocessing` unless genuinely unavoidable.** The reason is locking: threads force it, and on a single
 event loop a synchronous read-modify-write is already atomic with respect to
 other tasks, because nothing preempts it without an `await`. So when threads
 go, DELETE the locks they existed for rather than porting `threading.Lock` to
 `asyncio.Lock` — check first whether the critical section contains an `await`;
 if it doesn't, it needs no lock. If a thread really is unavoidable (a blocking
 C call, a library with no async API), isolate it behind one
-`asyncio.to_thread` boundary and say in a comment why.
+`anyio.to_thread.run_sync` / `asyncio.to_thread` boundary and say why.
+
+**Which library: prefer `anyio`, so the choice stays open.** Not because trio
+beats asyncio — because anyio runs on BOTH (`anyio.get_all_backends()` →
+`('asyncio', 'trio')`), so anyio-shaped code is married to neither. It costs
+nothing here: Starlette already requires it (`anyio<5,>=3.6.2`, and 4.14.0 is
+in this venv today), so it is a transitive dependency odin already ships.
+Prefer its structured concurrency (`anyio.create_task_group`) over hand-rolled
+task bookkeeping. What this does NOT mean: rewriting the web stack to chase a
+backend. uvicorn/FastAPI are asyncio, anyio runs happily on asyncio, and that
+combination is exactly what "not limited to one library" buys. Judge async
+libraries on production quality and maintenance, not novelty.
 
 odin's remaining threads as of v0.7.6, all scheduled to go in v0.7.7: the
 gateway's own uvicorn (`serve_in_thread`), the substrate boot threads
