@@ -61,10 +61,10 @@ class FakeRedisCache:
     def delete(self, env: str, cluster_id: str) -> None:
         self.deleted.append((env, cluster_id))
 
-    async def host_port(self, env: str, cluster_id: str) -> int:
+    def host_port(self, env: str, cluster_id: str) -> int:
         return self.port
 
-    async def status(self, env: str, cluster_id: str) -> str:
+    def status(self, env: str, cluster_id: str) -> str:
         return "running"
 
 
@@ -159,10 +159,10 @@ def test_classify_falls_back_to_wildcard_never_none(elasticache, sink):
 # --- create ----------------------------------------------------------------
 
 
-async def test_create_returns_creating_immediately_then_goes_available(elasticache, sink, stores, cache):
+def test_create_returns_creating_immediately_then_goes_available(elasticache, sink, stores, cache):
     block = threading.Event()
     cache.block = block
-    response = await _create(elasticache, sink, stores)
+    response = _create(elasticache, sink, stores)
     cluster = _parse("CreateCacheCluster", response)["CacheCluster"]
     assert cluster["CacheClusterId"] == CLUSTER
     assert cluster["CacheClusterStatus"] == cachectl.STATUS_CREATING
@@ -174,34 +174,34 @@ async def test_create_returns_creating_immediately_then_goes_available(elasticac
     block.set()
     _settle(cache, stores)
     assert cache.ensured == [(ENV, CLUSTER)]
-    described = _parse("DescribeCacheClusters", await _describe(elasticache, sink, stores))
+    described = _parse("DescribeCacheClusters", _describe(elasticache, sink, stores))
     (live,) = described["CacheClusters"]
     assert live["CacheClusterStatus"] == cachectl.STATUS_AVAILABLE
     assert live["EngineVersion"] == "7.4.2"  # the REAL redis version, not a constant
 
 
-async def test_available_cluster_advertises_the_real_published_port(elasticache, sink, stores, cache):
-    await _create(elasticache, sink, stores)
+def test_available_cluster_advertises_the_real_published_port(elasticache, sink, stores, cache):
+    _create(elasticache, sink, stores)
     _settle(cache, stores)
-    (live,) = _parse("DescribeCacheClusters", await _describe(elasticache, sink, stores))["CacheClusters"]
+    (live,) = _parse("DescribeCacheClusters", _describe(elasticache, sink, stores))["CacheClusters"]
     (node,) = live["CacheNodes"]
     assert node["Endpoint"] == {"Address": CONTAINER_HOST, "Port": HOST_PORT}
     assert node["CacheNodeId"] == "0001"
 
 
-async def test_describe_without_show_cache_node_info_omits_the_nodes(elasticache, sink, stores, cache):
-    await _create(elasticache, sink, stores)
+def test_describe_without_show_cache_node_info_omits_the_nodes(elasticache, sink, stores, cache):
+    _create(elasticache, sink, stores)
     _settle(cache, stores)
     req = sink.call(lambda: elasticache.describe_cache_clusters(CacheClusterId=CLUSTER))
     (live,) = _parse("DescribeCacheClusters", _answer(stores, req))["CacheClusters"]
     assert live.get("CacheNodes", []) == []
 
 
-async def test_a_boot_failure_lands_create_failed_with_the_real_reason(elasticache, sink, stores, cache):
+def test_a_boot_failure_lands_create_failed_with_the_real_reason(elasticache, sink, stores, cache):
     cache.fail = True
-    await _create(elasticache, sink, stores)
+    _create(elasticache, sink, stores)
     _settle(cache, stores)
-    (live,) = _parse("DescribeCacheClusters", await _describe(elasticache, sink, stores))["CacheClusters"]
+    (live,) = _parse("DescribeCacheClusters", _describe(elasticache, sink, stores))["CacheClusters"]
     # NOT still "creating": the provider's waiter must fail fast, never hang.
     assert live["CacheClusterStatus"] == cachectl.STATUS_CREATE_FAILED
     record = stores.cachectl.get(ENV, f"cluster:{CLUSTER}")
@@ -212,10 +212,10 @@ async def test_a_boot_failure_lands_create_failed_with_the_real_reason(elasticac
     assert record["status_reason"] == "RuntimeError: redis never became ready"
 
 
-async def test_create_twice_is_already_exists(elasticache, sink, stores, cache):
-    await _create(elasticache, sink, stores)
+def test_create_twice_is_already_exists(elasticache, sink, stores, cache):
+    _create(elasticache, sink, stores)
     _settle(cache, stores)
-    response = await _create(elasticache, sink, stores)
+    response = _create(elasticache, sink, stores)
     parsed = _parse("CreateCacheCluster", response, error=True)
     assert parsed["Error"]["Code"] == "CacheClusterAlreadyExists"
 
@@ -239,10 +239,10 @@ def test_memcached_is_an_honest_invalid_parameter(elasticache, sink, stores, cac
     assert "Engine=redis" in parsed["Error"]["Message"]
 
 
-async def test_create_carries_security_group_ids_for_zero_drift(elasticache, sink, stores, cache):
-    await _create(elasticache, sink, stores, SecurityGroupIds=["sg-abc123"])
+def test_create_carries_security_group_ids_for_zero_drift(elasticache, sink, stores, cache):
+    _create(elasticache, sink, stores, SecurityGroupIds=["sg-abc123"])
     _settle(cache, stores)
-    (live,) = _parse("DescribeCacheClusters", await _describe(elasticache, sink, stores))["CacheClusters"]
+    (live,) = _parse("DescribeCacheClusters", _describe(elasticache, sink, stores))["CacheClusters"]
     assert [g["SecurityGroupId"] for g in live["SecurityGroups"]] == ["sg-abc123"]
 
 
@@ -258,8 +258,8 @@ def test_describe_unknown_cluster_is_not_found(elasticache, sink, stores, cache)
 # --- modify ----------------------------------------------------------------
 
 
-async def test_modify_applies_the_modelled_fields_in_place(elasticache, sink, stores, cache):
-    await _create(elasticache, sink, stores)
+def test_modify_applies_the_modelled_fields_in_place(elasticache, sink, stores, cache):
+    _create(elasticache, sink, stores)
     _settle(cache, stores)
     req = sink.call(lambda: elasticache.modify_cache_cluster(
         CacheClusterId=CLUSTER, ApplyImmediately=True, CacheNodeType="cache.t3.small",
@@ -271,8 +271,8 @@ async def test_modify_applies_the_modelled_fields_in_place(elasticache, sink, st
     assert cluster["CacheClusterStatus"] == cachectl.STATUS_AVAILABLE  # metadata-only: nothing to wait on
 
 
-async def test_modify_rejects_a_multi_node_resize(elasticache, sink, stores, cache):
-    await _create(elasticache, sink, stores)
+def test_modify_rejects_a_multi_node_resize(elasticache, sink, stores, cache):
+    _create(elasticache, sink, stores)
     _settle(cache, stores)
     req = sink.call(lambda: elasticache.modify_cache_cluster(
         CacheClusterId=CLUSTER, ApplyImmediately=True, NumCacheNodes=2,
@@ -290,8 +290,8 @@ def test_modify_unknown_cluster_is_not_found(elasticache, sink, stores, cache):
 # --- delete ----------------------------------------------------------------
 
 
-async def test_delete_removes_the_container_then_the_record(elasticache, sink, stores, cache):
-    await _create(elasticache, sink, stores)
+def test_delete_removes_the_container_then_the_record(elasticache, sink, stores, cache):
+    _create(elasticache, sink, stores)
     _settle(cache, stores)
     req = sink.call(lambda: elasticache.delete_cache_cluster(CacheClusterId=CLUSTER))
     cluster = _parse("DeleteCacheCluster", _answer(stores, req))["CacheCluster"]
@@ -303,7 +303,7 @@ async def test_delete_removes_the_container_then_the_record(elasticache, sink, s
     assert cache.deleted == [(ENV, CLUSTER)]
     assert stores.cachectl.items(ENV) == {}
     # The provider's delete waiter's target state: gone == NotFound.
-    parsed = _parse("DescribeCacheClusters", await _describe(elasticache, sink, stores, CacheClusterId=CLUSTER), error=True)
+    parsed = _parse("DescribeCacheClusters", _describe(elasticache, sink, stores, CacheClusterId=CLUSTER), error=True)
     assert parsed["Error"]["Code"] == "CacheClusterNotFound"
     assert stores.tags.get(ENV, f"elasticache:{cachectl.arn_for(CLUSTER)}") == {}
 
@@ -317,16 +317,16 @@ def test_delete_unknown_cluster_is_not_found(elasticache, sink, stores, cache):
 # --- tags (the zero-drift half) --------------------------------------------
 
 
-async def test_tags_seeded_on_create_are_readable_back(elasticache, sink, stores, cache):
-    await _create(elasticache, sink, stores, Tags=[{"Key": "odin:node", "Value": CLUSTER}, {"Key": "team", "Value": "web"}])
+def test_tags_seeded_on_create_are_readable_back(elasticache, sink, stores, cache):
+    _create(elasticache, sink, stores, Tags=[{"Key": "odin:node", "Value": CLUSTER}, {"Key": "team", "Value": "web"}])
     _settle(cache, stores)
     req = sink.call(lambda: elasticache.list_tags_for_resource(ResourceName=cachectl.arn_for(CLUSTER)))
     tags = _parse("ListTagsForResource", _answer(stores, req))["TagList"]
     assert {t["Key"]: t["Value"] for t in tags} == {"odin:node": CLUSTER, "team": "web"}
 
 
-async def test_add_and_remove_tags_round_trip(elasticache, sink, stores, cache):
-    await _create(elasticache, sink, stores, Tags=[{"Key": "keep", "Value": "1"}])
+def test_add_and_remove_tags_round_trip(elasticache, sink, stores, cache):
+    _create(elasticache, sink, stores, Tags=[{"Key": "keep", "Value": "1"}])
     _settle(cache, stores)
     arn = cachectl.arn_for(CLUSTER)
     add = sink.call(lambda: elasticache.add_tags_to_resource(ResourceName=arn, Tags=[{"Key": "extra", "Value": "2"}]))
@@ -346,11 +346,11 @@ def test_tag_calls_on_an_unknown_cluster_are_not_found(elasticache, sink, stores
 # --- facts / dispatch ------------------------------------------------------
 
 
-async def test_facts_publish_both_the_container_and_vm_reachable_forms(elasticache, sink, stores, cache):
-    await _create(elasticache, sink, stores)
+def test_facts_publish_both_the_container_and_vm_reachable_forms(elasticache, sink, stores, cache):
+    _create(elasticache, sink, stores)
     _settle(cache, stores)
     record = stores.cachectl.get(ENV, f"cluster:{CLUSTER}")
-    assert await cachectl.facts(record) == {
+    assert cachectl.facts(record) == {
         "REDIS_URL": f"redis://{CONTAINER_HOST}:{HOST_PORT}",
         "endpoint": f"{CONTAINER_HOST}:{HOST_PORT}",
         "REDIS_URL_VM": f"redis://{LIMA_HOST}:{HOST_PORT}",
@@ -359,8 +359,8 @@ async def test_facts_publish_both_the_container_and_vm_reachable_forms(elasticac
     }
 
 
-async def test_facts_are_empty_before_the_container_is_up(stores):
-    assert await cachectl.facts({"port": None, "address": None}) == {}
+def test_facts_are_empty_before_the_container_is_up(stores):
+    assert cachectl.facts({"port": None, "address": None}) == {}
 
 
 def test_an_unknown_action_is_an_invalid_action_envelope(stores, cache):
@@ -411,10 +411,10 @@ def test_a_request_that_named_no_cluster_says_so_instead_of_answering_about_noth
     assert stores.cachectl.items(ENV) == {}
 
 
-async def test_an_id_less_describe_is_still_a_legitimate_list(stores, sink, elasticache, cache):
+def test_an_id_less_describe_is_still_a_legitimate_list(stores, sink, elasticache, cache):
     """The gate must not turn the LIST call into an error -- `tofu refresh`
     drives exactly this."""
-    await _create(elasticache, sink, stores)
+    _create(elasticache, sink, stores)
     _settle(cache, stores)
-    listed = _parse("DescribeCacheClusters", await _describe(elasticache, sink, stores))
+    listed = _parse("DescribeCacheClusters", _describe(elasticache, sink, stores))
     assert [c["CacheClusterId"] for c in listed["CacheClusters"]] == [CLUSTER]

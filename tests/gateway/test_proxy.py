@@ -95,9 +95,9 @@ def stores(tmp_path: Path) -> SynthStores:
     return SynthStores(tmp_path)
 
 
-async def _issued_client(sink: CaptureSink, keystore: KeyStore, env: str, node_id: str, service: str, **extra):
+def _issued_client(sink: CaptureSink, keystore: KeyStore, env: str, node_id: str, service: str, **extra):
     access_key, secret_key = keystore.issue(env, node_id)
-    return await boto3.client(
+    return boto3.client(
         service, endpoint_url=sink.endpoint, region_name="us-east-1",
         aws_access_key_id=access_key, aws_secret_access_key=secret_key, **extra,
     )
@@ -121,7 +121,7 @@ async def _drive(app, req) -> httpx.Response:
 
 
 async def test_allowed_s3_get_object_forwards_and_resigns(sink, keystore, stores):
-    s3 = await _issued_client(sink, keystore, "default", "api", "s3", config=Config(signature_version="s3v4", s3={"addressing_style": "path"}))
+    s3 = _issued_client(sink, keystore, "default", "api", "s3", config=Config(signature_version="s3v4", s3={"addressing_style": "path"}))
     req = sink.call(lambda: s3.get_object(Bucket="uploads", Key="a.txt"))
 
     state = GatewayState()
@@ -140,7 +140,7 @@ async def test_allowed_s3_get_object_forwards_and_resigns(sink, keystore, stores
 
 
 async def test_allowed_s3_put_object_forwards_body_byte_identical(sink, keystore, stores):
-    s3 = await _issued_client(sink, keystore, "default", "api", "s3", config=Config(signature_version="s3v4", s3={"addressing_style": "path"}))
+    s3 = _issued_client(sink, keystore, "default", "api", "s3", config=Config(signature_version="s3v4", s3={"addressing_style": "path"}))
     req = sink.call(lambda: s3.put_object(Bucket="uploads", Key="a.txt", Body=b"payload-bytes-123"))
 
     state = GatewayState()
@@ -156,7 +156,7 @@ async def test_allowed_s3_put_object_forwards_body_byte_identical(sink, keystore
 
 
 async def test_s3_head_object_preserves_upstream_content_length(sink, keystore, stores):
-    s3 = await _issued_client(sink, keystore, "default", "api", "s3", config=Config(signature_version="s3v4", s3={"addressing_style": "path"}))
+    s3 = _issued_client(sink, keystore, "default", "api", "s3", config=Config(signature_version="s3v4", s3={"addressing_style": "path"}))
     req = sink.call(lambda: s3.head_object(Bucket="uploads", Key="a.txt"))
 
     state = GatewayState()
@@ -172,7 +172,7 @@ async def test_s3_head_object_preserves_upstream_content_length(sink, keystore, 
 
 
 async def test_allowed_sqs_send_message_forwards_creds_pass_through(sink, keystore, stores):
-    sqs = await _issued_client(sink, keystore, "default", "worker", "sqs")
+    sqs = _issued_client(sink, keystore, "default", "worker", "sqs")
     req = sink.call(lambda: sqs.send_message(QueueUrl=f"{sink.endpoint}/000000000000/jobs", MessageBody="hi"))
 
     state = GatewayState()
@@ -193,7 +193,7 @@ async def test_allowed_sqs_send_message_forwards_creds_pass_through(sink, keysto
 
 
 async def test_s3_denied_action_returns_bare_error_xml(sink, keystore, stores):
-    s3 = await _issued_client(sink, keystore, "default", "api", "s3", config=Config(signature_version="s3v4", s3={"addressing_style": "path"}))
+    s3 = _issued_client(sink, keystore, "default", "api", "s3", config=Config(signature_version="s3v4", s3={"addressing_style": "path"}))
     req = sink.call(lambda: s3.get_object(Bucket="uploads", Key="a.txt"))
 
     state = GatewayState()
@@ -211,7 +211,7 @@ async def test_s3_denied_action_returns_bare_error_xml(sink, keystore, stores):
 
 
 async def test_dynamodb_denied_action_returns_json_access_denied_exception(sink, keystore, stores):
-    dynamodb = await _issued_client(sink, keystore, "default", "worker", "dynamodb")
+    dynamodb = _issued_client(sink, keystore, "default", "worker", "dynamodb")
     req = sink.call(lambda: dynamodb.get_item(TableName="orders", Key={"id": {"S": "1"}}))
 
     state = GatewayState()
@@ -229,7 +229,7 @@ async def test_dynamodb_denied_action_returns_json_access_denied_exception(sink,
 
 
 async def test_sqs_denied_action_returns_json_access_denied_exception(sink, keystore, stores):
-    sqs = await _issued_client(sink, keystore, "default", "worker", "sqs")
+    sqs = _issued_client(sink, keystore, "default", "worker", "sqs")
     req = sink.call(lambda: sqs.send_message(QueueUrl=f"{sink.endpoint}/000000000000/jobs", MessageBody="hi"))
 
     state = GatewayState()
@@ -245,7 +245,7 @@ async def test_sqs_denied_action_returns_json_access_denied_exception(sink, keys
 
 
 async def test_sns_denied_action_returns_wrapped_error_response_xml(sink, keystore, stores):
-    sns = await _issued_client(sink, keystore, "default", "worker", "sns")
+    sns = _issued_client(sink, keystore, "default", "worker", "sns")
     req = sink.call(lambda: sns.publish(TopicArn="arn:aws:sns:us-east-1:000000000000:alerts", Message="hi"))
 
     state = GatewayState()
@@ -265,7 +265,7 @@ async def test_sqs_get_queue_url_now_classifies_but_still_denied_by_default(sink
     # evaluate() instead of an "unmappable-action" deny -- but no edge grants
     # workers this verb in v1, so it's STILL denied, just via ordinary
     # default-deny (see classify.py's module docstring).
-    sqs = await _issued_client(sink, keystore, "default", "worker", "sqs")
+    sqs = _issued_client(sink, keystore, "default", "worker", "sqs")
     req = sink.call(lambda: sqs.get_queue_url(QueueName="jobs"))
 
     state = GatewayState()
@@ -283,7 +283,7 @@ async def test_sqs_get_queue_url_now_classifies_but_still_denied_by_default(sink
 async def test_sns_create_topic_now_classifies_but_still_denied_by_default(sink, keystore, stores):
     # Same shift for CreateTopic (resolves via `Name`) -- still denied, now
     # for the ordinary reason.
-    sns = await _issued_client(sink, keystore, "default", "worker", "sns")
+    sns = _issued_client(sink, keystore, "default", "worker", "sns")
     req = sink.call(lambda: sns.create_topic(Name="alerts"))
 
     state = GatewayState()
@@ -301,7 +301,7 @@ async def test_sns_create_topic_now_classifies_but_still_denied_by_default(sink,
 async def test_unknown_access_key_denies_401_invalid_client_token_id(sink, keystore, stores, tmp_path):
     other = KeyStore(tmp_path / "other-keystore")  # a key this gateway's keystore never issued
     stray_key, stray_secret = other.issue("default", "ghost")
-    s3 = await boto3.client(
+    s3 = boto3.client(
         "s3", endpoint_url=sink.endpoint, region_name="us-east-1",
         aws_access_key_id=stray_key, aws_secret_access_key=stray_secret,
         config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
@@ -322,7 +322,7 @@ async def test_unknown_access_key_denies_401_invalid_client_token_id(sink, keyst
 
 
 async def test_bad_signature_denies_401_signature_does_not_match(sink, keystore, stores):
-    s3 = await _issued_client(sink, keystore, "default", "api", "s3", config=Config(signature_version="s3v4", s3={"addressing_style": "path"}))
+    s3 = _issued_client(sink, keystore, "default", "api", "s3", config=Config(signature_version="s3v4", s3={"addressing_style": "path"}))
     req = sink.call(lambda: s3.get_object(Bucket="uploads", Key="a.txt"))
     tampered_headers = dict(req.headers)
     tampered_headers["Authorization"] = tampered_headers["Authorization"][:-4] + "0000"  # corrupt the signature
@@ -349,7 +349,7 @@ async def test_bad_signature_denies_401_signature_does_not_match(sink, keystore,
 
 
 async def test_sqs_create_queue_rewrites_host_and_fixes_content_length(sink, keystore, stores):
-    sqs = await _issued_client(sink, keystore, "default", "worker", "sqs")
+    sqs = _issued_client(sink, keystore, "default", "worker", "sqs")
     req = sink.call(lambda: sqs.create_queue(QueueName="jobs"))
 
     state = GatewayState()
@@ -367,7 +367,7 @@ async def test_sqs_create_queue_rewrites_host_and_fixes_content_length(sink, key
 
 
 async def test_sqs_get_queue_attributes_never_reaches_backing(sink, keystore, stores):
-    sqs = await _issued_client(sink, keystore, "default", "worker", "sqs")
+    sqs = _issued_client(sink, keystore, "default", "worker", "sqs")
     req = sink.call(
         lambda: sqs.get_queue_attributes(QueueUrl=f"{sink.endpoint}/000000000000/jobs", AttributeNames=["All"])
     )
@@ -385,7 +385,7 @@ async def test_sqs_get_queue_attributes_never_reaches_backing(sink, keystore, st
 
 
 async def test_sts_get_caller_identity_answered_for_any_verified_principal(sink, keystore, stores):
-    sts = await _issued_client(sink, keystore, "default", "worker", "sts")
+    sts = _issued_client(sink, keystore, "default", "worker", "sts")
     req = sink.call(lambda: sts.get_caller_identity())
 
     state = GatewayState()
@@ -407,7 +407,7 @@ async def test_backing_unavailable_returns_503_and_is_never_an_access_denial(sin
     503/`ServiceUnavailable`) and polluted the exact `access_denied` audit stream
     a security review reads -- during a wedged destroy it filled with thousands
     of them. It now has its own seam."""
-    s3 = await _issued_client(sink, keystore, "default", "api", "s3", config=Config(signature_version="s3v4", s3={"addressing_style": "path"}))
+    s3 = _issued_client(sink, keystore, "default", "api", "s3", config=Config(signature_version="s3v4", s3={"addressing_style": "path"}))
     req = sink.call(lambda: s3.get_object(Bucket="uploads", Key="a.txt"))
 
     state = GatewayState()
@@ -430,7 +430,7 @@ async def test_backing_unavailable_returns_503_and_is_never_an_access_denial(sin
 # --- real sockets: prove boto3 actually raises ClientError -----------------
 
 
-async def test_real_boto3_client_raises_access_denied_client_error(tmp_path):
+def test_real_boto3_client_raises_access_denied_client_error(tmp_path):
     store = KeyStore(tmp_path)
     access_key, secret_key = store.issue("default", "worker")
     state = GatewayState()
@@ -442,7 +442,7 @@ async def test_real_boto3_client_raises_access_denied_client_error(tmp_path):
     app = create_gateway_app(state, store, SynthStores(tmp_path), on_deny)
     server, thread, port = serve_in_thread(app, port=0)
     try:
-        client = await boto3.client(
+        client = boto3.client(
             "s3", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
             aws_access_key_id=access_key, aws_secret_access_key=secret_key,
             config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
@@ -454,7 +454,7 @@ async def test_real_boto3_client_raises_access_denied_client_error(tmp_path):
         stop_in_thread(server, thread)
 
 
-async def test_real_boto3_client_raises_invalid_client_token_id_for_unknown_key(tmp_path):
+def test_real_boto3_client_raises_invalid_client_token_id_for_unknown_key(tmp_path):
     store = KeyStore(tmp_path)
     state = GatewayState()
     state.update("default", {}, {})
@@ -465,7 +465,7 @@ async def test_real_boto3_client_raises_invalid_client_token_id_for_unknown_key(
     app = create_gateway_app(state, store, SynthStores(tmp_path), on_deny)
     server, thread, port = serve_in_thread(app, port=0)
     try:
-        client = await boto3.client(
+        client = boto3.client(
             "s3", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
             aws_access_key_id="AKODINneverissued00000", aws_secret_access_key="not-a-real-secret",
             config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),

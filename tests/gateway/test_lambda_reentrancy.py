@@ -47,10 +47,10 @@ class _ReentrantSubstrate:
     def __init__(self, *_args: object, **_kwargs: object) -> None:
         pass
 
-    async def invoke(self, env: str, function_name: str, payload: bytes, timeout: float = 30.0):
+    def invoke(self, env: str, function_name: str, payload: bytes, timeout: float = 30.0):
         from odin.compute.functions import InvokeResult
 
-        sts = await boto3.client(
+        sts = boto3.client(
             "sts",
             endpoint_url=f"http://127.0.0.1:{type(self).gateway_port}",
             region_name="us-east-1",
@@ -100,14 +100,14 @@ def gateway(tmp_path: Path, monkeypatch):
     stop_in_thread(server, thread)
 
 
-async def test_invoke_does_not_freeze_the_loop_for_reentrant_calls(gateway):
+def test_invoke_does_not_freeze_the_loop_for_reentrant_calls(gateway):
     port, access_key, secret_key = gateway
-    lambda_client = await boto3.client(
+    lambda_client = boto3.client(
         "lambda", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
         aws_access_key_id=access_key, aws_secret_access_key=secret_key,
         config=Config(connect_timeout=10, read_timeout=10, retries={"max_attempts": 0}),
     )
-    response = await lambda_client.invoke(FunctionName=FUNCTION_NAME, Payload=b"{}")
+    response = lambda_client.invoke(FunctionName=FUNCTION_NAME, Payload=b"{}")
     payload = json.loads(response["Payload"].read())
     assert payload["reentrant_ok"] is True, (
         "the handler's re-entrant call back through the gateway was not served "

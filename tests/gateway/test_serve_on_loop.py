@@ -117,7 +117,7 @@ async def test_a_real_sigv4_call_is_served_on_the_callers_own_loop(tmp_path):
         )
         url = f"http://{HOST}:{port}/"
         async with httpx.AsyncClient() as client:
-            response = await client.post(url, headers=await _signed(access_key, secret_key, url), content=b"Action=GetCallerIdentity&Version=2011-06-15")
+            response = await client.post(url, headers=_signed(access_key, secret_key, url), content=b"Action=GetCallerIdentity&Version=2011-06-15")
 
     assert response.status_code == 200, response.text
     assert "GetCallerIdentityResponse" in response.text
@@ -140,8 +140,8 @@ async def test_the_loop_keeps_serving_while_a_gateway_request_is_in_flight(tmp_p
                     await asyncio.sleep(0.005)
                     ticks += 1
 
-            calls = [client.post(url, headers=await _signed(access_key, secret_key, url), content=body) for _ in range(10)]
-            responses, _ = await asyncio.gather(asyncio.gather(*calls), await tick())
+            calls = [client.post(url, headers=_signed(access_key, secret_key, url), content=body) for _ in range(10)]
+            responses, _ = await asyncio.gather(asyncio.gather(*calls), tick())
 
     assert [r.status_code for r in responses] == [200] * 10
     assert ticks == 20, "this task's own clock stopped while the gateway was serving"
@@ -162,13 +162,13 @@ async def test_serving_on_the_loop_does_not_take_the_process_signal_handlers(tmp
         return None
 
     original = signal.getsignal(signal.SIGINT)
-    await signal.signal(signal.SIGINT, sentinel)
+    signal.signal(signal.SIGINT, sentinel)
     try:
         app, _access_key, _secret_key = _gateway(tmp_path)
         async with serve_on_loop(app, host=HOST, port=0):
             during = signal.getsignal(signal.SIGINT)
     finally:
-        await signal.signal(signal.SIGINT, original)
+        signal.signal(signal.SIGINT, original)
 
     assert during is sentinel, (
         f"the gateway took the process's SIGINT handler while serving: {during!r}. "
@@ -284,7 +284,7 @@ async def test_an_explicitly_requested_port_is_the_port_that_is_served(tmp_path)
         assert port == wanted
         url = f"http://{HOST}:{port}/"
         async with httpx.AsyncClient() as client:
-            response = await client.post(url, headers=await _signed(access_key, secret_key, url), content=b"Action=GetCallerIdentity&Version=2011-06-15")
+            response = await client.post(url, headers=_signed(access_key, secret_key, url), content=b"Action=GetCallerIdentity&Version=2011-06-15")
     assert response.status_code == 200
 
 
@@ -355,7 +355,7 @@ async def test_a_server_that_never_starts_is_reported_and_not_waited_on_forever(
     """`_await_started`'s deadline names the port and the timeout instead of
     hanging. This is the backstop only; the two failures that really happen are
     covered below and neither of them waits it out."""
-    serving = asyncio.create_task(await _forever())
+    serving = asyncio.create_task(_forever())
     with pytest.raises(RuntimeError, match=r"gateway did not start on :4266 within 0\.05s"):
         await _await_started(_NeverStarts(), serving, 4266, timeout=0.05)
     serving.cancel()
@@ -371,7 +371,7 @@ async def test_a_listener_that_fails_surfaces_its_own_error_at_once(tmp_path):
     async def explodes() -> None:
         raise MemoryError("uvicorn could not come up")
 
-    serving = asyncio.create_task(await explodes())
+    serving = asyncio.create_task(explodes())
     started = time.monotonic()
     with pytest.raises(MemoryError, match="uvicorn could not come up"):
         await _await_started(_NeverStarts(), serving, 4266, timeout=1.5)
@@ -386,7 +386,7 @@ async def test_a_listener_that_returns_without_starting_is_not_waited_out():
     async def gives_up() -> None:
         return None
 
-    serving = asyncio.create_task(await gives_up())
+    serving = asyncio.create_task(gives_up())
     started = time.monotonic()
     with pytest.raises(RuntimeError, match=r"gateway did not start on :4266"):
         await _await_started(_NeverStarts(), serving, 4266, timeout=1.5)

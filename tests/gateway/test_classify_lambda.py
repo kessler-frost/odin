@@ -63,7 +63,7 @@ def test_get_function_code_signing_config(sink, lambda_):
     assert _classified(req) == ("lambda:GetFunctionCodeSigningConfig", "fn1")
 
 
-async def test_invoke_resolves_the_name_from_the_path_not_the_payload(sink, lambda_):
+def test_invoke_resolves_the_name_from_the_path_not_the_payload(sink, lambda_):
     req = sink.call(lambda: lambda_.invoke(FunctionName="fn1", Payload=b'{"key": "value"}'))
     assert _classified(req) == ("lambda:Invoke", "fn1")
 

@@ -108,16 +108,16 @@ def _gateway_port(client) -> int:
     return client.get("/health").json()["gateway"]["port"]
 
 
-async def _s3_client(port: int, access_key: str, secret_key: str):
-    return await boto3.client(
+def _s3_client(port: int, access_key: str, secret_key: str):
+    return boto3.client(
         "s3", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
         aws_access_key_id=access_key, aws_secret_access_key=secret_key,
         config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
     )
 
 
-async def _client(service: str, port: int, access_key: str, secret_key: str):
-    return await boto3.client(
+def _client(service: str, port: int, access_key: str, secret_key: str):
+    return boto3.client(
         service, endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
         aws_access_key_id=access_key, aws_secret_access_key=secret_key,
     )
@@ -135,14 +135,14 @@ def _run_aws_cli(port: int, access_key: str, secret_key: str, args: list[str]) -
 
 
 @pytest.fixture
-async def runtime():
+def runtime():
     rt = ColimaRuntime()
     yield rt
-    for name in await own_containers(rt, *OWN_ENVS):
-        await rt.stop(name)
+    for name in own_containers(rt, *OWN_ENVS):
+        rt.stop(name)
 
 
-async def test_edge_grants_and_absence_denies(tmp_path, runtime):
+def test_edge_grants_and_absence_denies(tmp_path, runtime):
     app = create_app(runtime=runtime, store=SpecStore(tmp_path))
     with TestClient(app) as client:
         client.post("/apply", json=CANVAS_S3_WITH_WORKER_EDGE)
@@ -150,12 +150,12 @@ async def test_edge_grants_and_absence_denies(tmp_path, runtime):
         port = _gateway_port(client)
 
         worker_key, worker_secret = app.state.gateway_keys.issue("default", "worker")
-        worker_s3 = await _s3_client(port, worker_key, worker_secret)
+        worker_s3 = _s3_client(port, worker_key, worker_secret)
         worker_s3.put_object(Bucket="uploads", Key="hello.txt", Body=b"payload-bytes")
         assert worker_s3.get_object(Bucket="uploads", Key="hello.txt")["Body"].read() == b"payload-bytes"
 
         stranger_key, stranger_secret = app.state.gateway_keys.issue("default", "stranger")
-        stranger_s3 = await _s3_client(port, stranger_key, stranger_secret)
+        stranger_s3 = _s3_client(port, stranger_key, stranger_secret)
         with pytest.raises(ClientError) as exc_info:
             stranger_s3.put_object(Bucket="uploads", Key="nope.txt", Body=b"x")
         assert exc_info.value.response["Error"]["Code"] == "AccessDenied"
@@ -167,11 +167,11 @@ async def test_edge_grants_and_absence_denies(tmp_path, runtime):
             for e in denied
         ), denied
 
-        await _destroy(client)
-    assert await own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"
+        _destroy(client)
+    assert own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"
 
 
-async def test_foreign_env_creds_denied(tmp_path, runtime):
+def test_foreign_env_creds_denied(tmp_path, runtime):
     app = create_app(runtime=runtime, store=SpecStore(tmp_path))
     with TestClient(app) as client:
         client.post("/apply", params={"env": "a"}, json=CANVAS_S3_WITH_WORKER_EDGE)
@@ -181,7 +181,7 @@ async def test_foreign_env_creds_denied(tmp_path, runtime):
         port = _gateway_port(client)
 
         worker_key, worker_secret = app.state.gateway_keys.issue("a", "worker")
-        s3 = await _s3_client(port, worker_key, worker_secret)
+        s3 = _s3_client(port, worker_key, worker_secret)
 
         # a's key against a's OWN bucket: scoping doesn't break legitimate access.
         s3.put_object(Bucket="uploads", Key="a-file.txt", Body=b"a-data")
@@ -194,12 +194,12 @@ async def test_foreign_env_creds_denied(tmp_path, runtime):
             s3.put_object(Bucket="secrets", Key="x.txt", Body=b"x")
         assert exc_info.value.response["Error"]["Code"] == "AccessDenied"
 
-        await _destroy(client, env="a")
-        await _destroy(client, env="b")
-    assert await own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"
+        _destroy(client, env="a")
+        _destroy(client, env="b")
+    assert own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"
 
 
-async def test_container_crosses_to_gateway(tmp_path, runtime):
+def test_container_crosses_to_gateway(tmp_path, runtime):
     app = create_app(runtime=runtime, store=SpecStore(tmp_path))
     with TestClient(app) as client:
         client.post("/apply", json=CANVAS_S3_WITH_WORKER_EDGE)
@@ -216,11 +216,11 @@ async def test_container_crosses_to_gateway(tmp_path, runtime):
         assert denied.returncode != 0
         assert "AccessDenied" in denied.stderr
 
-        await _destroy(client)
-    assert await own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"
+        _destroy(client)
+    assert own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"
 
 
-async def test_sqs_sns_dynamodb_through_gateway(tmp_path, runtime):
+def test_sqs_sns_dynamodb_through_gateway(tmp_path, runtime):
     app = create_app(runtime=runtime, store=SpecStore(tmp_path))
     with TestClient(app) as client:
         client.post("/apply", json=CANVAS_MULTI_SERVICE)
@@ -232,9 +232,9 @@ async def test_sqs_sns_dynamodb_through_gateway(tmp_path, runtime):
         topic_arn = world["alerts"]["facts"]["TOPIC_ARN"]
 
         worker_key, worker_secret = app.state.gateway_keys.issue("default", "worker")
-        sqs = await _client("sqs", port, worker_key, worker_secret)
-        sns = await _client("sns", port, worker_key, worker_secret)
-        ddb = await _client("dynamodb", port, worker_key, worker_secret)
+        sqs = _client("sqs", port, worker_key, worker_secret)
+        sns = _client("sns", port, worker_key, worker_secret)
+        ddb = _client("dynamodb", port, worker_key, worker_secret)
 
         # worker's edge grants only SendMessage+ReceiveMessage (no DeleteMessage
         # -- matches the brief's exact grant list), so messages are left in
@@ -252,9 +252,9 @@ async def test_sqs_sns_dynamodb_through_gateway(tmp_path, runtime):
         assert item["val"]["S"] == "hello"
 
         stranger_key, stranger_secret = app.state.gateway_keys.issue("default", "stranger")
-        sqs_stranger = await _client("sqs", port, stranger_key, stranger_secret)
-        sns_stranger = await _client("sns", port, stranger_key, stranger_secret)
-        ddb_stranger = await _client("dynamodb", port, stranger_key, stranger_secret)
+        sqs_stranger = _client("sqs", port, stranger_key, stranger_secret)
+        sns_stranger = _client("sns", port, stranger_key, stranger_secret)
+        ddb_stranger = _client("dynamodb", port, stranger_key, stranger_secret)
 
         with pytest.raises(ClientError) as sqs_exc:
             sqs_stranger.send_message(QueueUrl=queue_url, MessageBody="nope")
@@ -268,11 +268,11 @@ async def test_sqs_sns_dynamodb_through_gateway(tmp_path, runtime):
             ddb_stranger.get_item(TableName="sessions", Key={"id": {"S": "u1"}})
         assert ddb_exc.value.response["Error"]["Code"] == "AccessDeniedException"
 
-        await _destroy(client)
-    assert await own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"
+        _destroy(client)
+    assert own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"
 
 
-async def test_latency_overhead(tmp_path, runtime):
+def test_latency_overhead(tmp_path, runtime):
     app = create_app(runtime=runtime, store=SpecStore(tmp_path))
     with TestClient(app) as client:
         client.post("/apply", json=CANVAS_S3_WITH_WORKER_EDGE)
@@ -280,7 +280,7 @@ async def test_latency_overhead(tmp_path, runtime):
         port = _gateway_port(client)
 
         worker_key, worker_secret = app.state.gateway_keys.issue("default", "worker")
-        gateway_s3 = await _s3_client(port, worker_key, worker_secret)
+        gateway_s3 = _s3_client(port, worker_key, worker_secret)
         direct_s3 = BackingAws(runtime, "default").client("s3")  # host bypass, straight to RustFS (R5)
 
         def median_put_latency(s3_client) -> float:
@@ -307,5 +307,5 @@ async def test_latency_overhead(tmp_path, runtime):
             f"(direct={direct_median * 1000:.2f}ms, gateway={gateway_median * 1000:.2f}ms)"
         )
 
-        await _destroy(client)
-    assert await own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"
+        _destroy(client)
+    assert own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"

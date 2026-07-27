@@ -196,28 +196,28 @@ def test_delete_a_missing_parameter_is_parameter_not_found(stores, sink, ssm):
 # --- the metadata + tag reads the TF provider's refresh depends on ---------
 
 
-async def test_describe_parameters_carries_metadata_but_never_the_value(stores, sink, ssm):
+def test_describe_parameters_carries_metadata_but_never_the_value(stores, sink, ssm):
     """Real AWS's own boundary: DescribeParameters is where the provider reads
     description/tier/allowed_pattern/key_id from, and it carries NO value."""
     _put(stores, sink, ssm, Description="the api key", AllowedPattern="", Tier="Standard")
     filters = [{"Key": "Name", "Option": "Equals", "Values": [NAME]}]
-    parsed = _parse("DescribeParameters", await _describe(stores, sink, ssm, ParameterFilters=filters))
+    parsed = _parse("DescribeParameters", _describe(stores, sink, ssm, ParameterFilters=filters))
     metadata = parsed["Parameters"][0]
 
     assert metadata["Name"] == NAME
     assert metadata["Description"] == "the api key"
     assert metadata["Tier"] == "Standard"
     assert metadata["Version"] == 1
-    assert VALUE.encode() not in await _describe(stores, sink, ssm, ParameterFilters=filters).body
+    assert VALUE.encode() not in _describe(stores, sink, ssm, ParameterFilters=filters).body
 
 
-async def test_describe_parameters_name_filter_is_exact_and_canonical(stores, sink, ssm):
+def test_describe_parameters_name_filter_is_exact_and_canonical(stores, sink, ssm):
     _put(stores, sink, ssm, name="/odin/api-key", value="1")
     _put(stores, sink, ssm, name="/odin/api-key-2", value="2")
-    equals = _parse("DescribeParameters", await _describe(
+    equals = _parse("DescribeParameters", _describe(
         stores, sink, ssm, ParameterFilters=[{"Key": "Name", "Option": "Equals", "Values": ["/odin/api-key"]}],
     ))
-    begins = _parse("DescribeParameters", await _describe(
+    begins = _parse("DescribeParameters", _describe(
         stores, sink, ssm, ParameterFilters=[{"Key": "Name", "Option": "BeginsWith", "Values": ["/odin/api"]}],
     ))
 
@@ -225,9 +225,9 @@ async def test_describe_parameters_name_filter_is_exact_and_canonical(stores, si
     assert [p["Name"] for p in begins["Parameters"]] == ["/odin/api-key", "/odin/api-key-2"]
 
 
-async def test_describe_parameters_fails_closed_on_an_unmodeled_filter(stores, sink, ssm):
+def test_describe_parameters_fails_closed_on_an_unmodeled_filter(stores, sink, ssm):
     _put(stores, sink, ssm)
-    parsed = _parse("DescribeParameters", await _describe(
+    parsed = _parse("DescribeParameters", _describe(
         stores, sink, ssm, ParameterFilters=[{"Key": "Label", "Option": "Equals", "Values": ["prod"]}],
     ))
 
