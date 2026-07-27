@@ -267,7 +267,11 @@ future decision against these points instead of re-deriving them:
     is real — a `redis:7-alpine` container per cluster, its published port
     advertised as the cluster's node endpoint, zero-drift re-plan — but
     `num_cache_nodes` must be 1 and `engine` must be `redis`; anything else is
-    a real `InvalidParameterValue`, never a silent collapse to one node. No
+    a real `InvalidParameterValue`, never a silent collapse to one node. That
+    was only true of the APPLY path until v0.7.6 — `import-tf` reached the same
+    fixed values by rewriting them, so a three-node memcached cluster became
+    single-node redis without a word. It now warns per substituted argument,
+    which is what makes the sentence above true from both directions. No
     replication groups, no cluster mode, no memcached (which would need a
     different substrate and a `ConfigurationEndpoint` odin doesn't emit), no
     snapshots/parameter groups beyond the metadata the provider reads back.
