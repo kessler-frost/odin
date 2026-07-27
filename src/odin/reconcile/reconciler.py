@@ -248,7 +248,11 @@ class Reconciler:
     async def start(self) -> None:
         self._stop = False
         self._started_at = time.monotonic()
-        self._task = asyncio.create_task(await self._run())
+        # `create_task(self._run())`, NOT `create_task(await self._run())`:
+        # `_run` IS the control loop and only returns when `stop()` is asked
+        # for, so awaiting it here made `start()` never return -- the loop ran
+        # inline and every caller (the lifespan, `/apply`, the tests) hung.
+        self._task = asyncio.create_task(self._run())
 
     async def stop(self) -> None:
         """Ask the loop to finish its current tick and wait for it.
@@ -502,7 +506,9 @@ class Reconciler:
         stack = self._store.get_stack(self._env)
         await self._observe(stack)
         world = self._store.current_world(self._env)
-        for action in await plan(stack, world):
+        # `plan` is the PURE, synchronous core (reconcile/plan.py) -- no await.
+        # Awaiting it raised on every single tick, so nothing ever converged.
+        for action in plan(stack, world):
             await self._execute(action, stack)
         if self._aws is not None:  # stop backings no active kind needs anymore
             await self._aws.gc({r.kind for r in stack.resources})

@@ -1004,7 +1004,7 @@ def create_apply_router(
             # VM names reached the server log and the caller got the bare text
             # `Internal Server Error`. `_EXCEPTION_VERDICTS` is what actually
             # puts them in a 500 JSON body now.
-            reclaimed = await ec2compute.reclaim_env_instances(stores, env)
+            reclaimed = ec2compute.reclaim_env_instances(stores, env)
             if reclaimed:
                 body["reclaimed_vms"] = reclaimed
             # ...and the network records the same interruption left behind,
@@ -1013,7 +1013,7 @@ def create_apply_router(
             # because the lighthouse stop hangs off the VPC-delete path, a VPC
             # record that is never deleted is a lighthouse never stopped
             # (HIGH-A through HIGH-B's back door).
-            forgotten = await ec2net.purge_env(stores, env)
+            forgotten = ec2net.purge_env(stores, env)
             if forgotten:
                 body["reclaimed_network_records"] = forgotten
 
@@ -1842,7 +1842,7 @@ async def _reap_orphaned_ec2_vms(root: Path, envs: list[str], stores: SynthStore
         # Running and tofu's state empty -- is exactly the case it spares. The
         # second witness is tofu's own state; anything the store claims and
         # the state has forgotten is unreachable by terraform forever.
-        forgotten = await ec2compute.reclaim_tf_forgotten_vms(stores, envs)
+        forgotten = ec2compute.reclaim_tf_forgotten_vms(stores, envs)
         if forgotten:
             log.warning(
                 "startup reclaimed %d EC2 VM(s) tofu's state no longer knew about: %s", len(forgotten), forgotten,
@@ -2047,16 +2047,24 @@ def create_app(
             # v0.7.7: a TASK on THIS loop, not a second uvicorn on a second
             # thread -- odin ran two event loops in two threads until now. See
             # `gateway/app.py::serve_on_loop`.
-            async with await serve_on_loop(gateway_app, port=_resolved_gateway_port) as gateway_port_actual:
+            # NO `await` before `serve_on_loop(...)`: it is decorated
+            # `@contextlib.asynccontextmanager`, so calling it returns the
+            # context manager SYNCHRONOUSLY and `async with` does the awaiting.
+            # `async with await ...` raised TypeError inside the lifespan, i.e.
+            # no server started at all.
+            async with serve_on_loop(gateway_app, port=_resolved_gateway_port) as gateway_port_actual:
                 # ...and a watchdog that puts the lock FILE back if anything
                 # deletes it (field test 4 -- see `_keep_store_lock`). The lock
                 # itself survives the deletion; only the evidence odin can find
                 # by path does not.
-                lock_watch = asyncio.create_task(await _keep_store_lock(store_lock))
+                # `create_task(coro)`, never `create_task(await coro)`: these
+                # watchdogs run until cancelled, so awaiting one here would
+                # never return and the lifespan would never finish starting.
+                lock_watch = asyncio.create_task(_keep_store_lock(store_lock))
                 # ...and the same shape for the loops themselves: nothing used to
                 # notice a reconciler that had stopped ticking (see
                 # `_watch_reconcilers` and `Reconciler.health`).
-                loop_watch = asyncio.create_task(await _watch_reconcilers(reconcilers, ws_manager))
+                loop_watch = asyncio.create_task(_watch_reconcilers(reconcilers, ws_manager))
                 envs = _store.list_envs()
                 if _reap_ec2_vms:
                     await _reap_orphaned_ec2_vms(_store.root, envs, gateway_stores)
