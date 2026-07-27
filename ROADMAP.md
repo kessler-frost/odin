@@ -1162,34 +1162,41 @@ have meant retiring a claim rather than fixing a bug.
   why a hard `AttributeError` once surfaced as a decorative security group.
   Fix the collapse first; it may be what makes this test's real cause visible.
 
-- [ ] **The canvas badge does not go green live after an Apply.** Observed
-  repeatedly while recording the v0.7.7 GIFs: `/world` reports the resource
-  `healthy` and the WebSocket demonstrably delivers `world_delta` for it (I
-  connected a raw client and received two), yet the node's badge sits at
-  `DRAFT` until the page is reloaded — reload rehydrates correctly from
-  `/world`, so the seeding path works and the LIVE delta path does not.
-  NOT yet separated from its neighbour below, which was confounding every
-  measurement; re-measure now that the env bug is fixed before assuming this
-  one is real.
-  (A first theory — that the debounced canvas save raced the Apply — was
-  DISPROVEN: the debounce is 500ms, and the canvas was verified saved 3s
-  before Apply. Recorded so nobody re-derives it.)
+- [x] **A failed canvas READ silently destroyed the saved canvas** (fixed in
+  v0.7.7). Reported from a Tailscale-served odin -- "when I press refresh the
+  entire canvas gets nuked" -- and invisible on loopback, where the fetch does
+  not fail. `Canvas.tsx` loaded with
+  `.catch(() => ({nodes: [], edges: []}))`, so ANY failed read became an empty
+  canvas, `loaded` flipped true, and the debounced save wrote that emptiness
+  over `.odin/canvas.json`. Measured by rejecting a single GET: **2 nodes on
+  disk before, 0 after, unrecoverable.**
 
-## The intelligence layer (owner directive, 2026-07-27) — NEXT, after v0.7.7
+  Fix: `lib/canvasLoad.ts` -- `null` means COULD NOT READ; the loader returns
+  without arming the save, renders nothing, and shows a non-dismissible
+  banner saying the saved canvas is intact. Verified in a real browser with
+  the fault provably firing, on the freshly-built bundle: faulted load ->
+  banner + disk still 2; clean load -> 2 nodes, no banner; drop a node -> disk
+  3. Mutation-tested: restoring the old fallback fails 4 of the new tests.
 
-**The governing idea, in the owner's words: "canvas and navigating things
-around IS the language of odin, and not chatting with a bot to update things
-around."** A chat surface comes later and is a SEPARATE thing. What follows is
-about making spatial gestures carry real architectural meaning, because moving
-a box is the fastest way a person can say what they want.
+  Two theories I raised about a DIFFERENT symptom were both wrong, recorded
+  so nobody re-derives them:
+  * *"the debounced canvas save races Apply"* -- DISPROVEN. The debounce is
+    500ms; the canvas was verified saved 3s before the click.
+  * *"the badge never goes green live"* -- DISPROVEN. A WebSocket tap shows
+    `world_delta` (`starting` -> `healthy`) and the badge flipping with no
+    reload. I had been reading it 16-18s after Apply while the `tofu apply`
+    itself takes ~25s. **A real apply of one SQS queue is ~25s of tofu plus
+    ~5s to observation; measure past 30s or you will invent a bug.**
+  * and a third, about `/canvas` needing `?env=`: there is no per-env canvas.
+    `api/canvas.py` takes no env at all and `.odin/canvas.json` is a single
+    global file -- `GET /canvas?env=X` returns byte-identical bytes for every
+    X. One architecture, many envs (isolated AWS *state*) is the design.
 
-This extends a mechanism odin already has rather than inventing one:
-containment is already spatial (`ui/src/lib/containment.ts` stamps a node's
-`vpc`/`subnet` from which rectangle holds its centre, and `SgNode`/`Ec2Node`
-render it read-only). These items generalise that from "which network am I in"
-to "what does being inside this thing MEAN".
-
-Design: [docs/intelligence-layer.md](docs/intelligence-layer.md)
+- [ ] **Should the canvas be per-env?** Every other route (`/world`, `/apply`,
+  `/destroy`) takes `?env=` and defaults to `default`; `/canvas` alone is
+  global. Making it per-env-with-default would be consistent, but it changes
+  what an environment MEANS (today: the same architecture, isolated state),
+  so it is a design decision rather than a bug fix. Owner raised it 2026-07-27.
 
 - [ ] **Containment changes configuration, not just labels.** The owner's
   example: expand an EC2 box, drop an ECS box inside it, and that means **ECS

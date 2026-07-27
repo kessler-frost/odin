@@ -33,6 +33,7 @@ import { sizeOnLoad, sizeForSave } from '../lib/nodeSize';
 import { BUILTINS, CATALOG, catalogNodeTypeMap, catalogDefaultData, catalogDefaultStyle, catalogZIndex, catalogByType, COLORS } from '../lib/catalog';
 import { withContainment, isInsideContainer } from '../lib/containment';
 import { placeUnpositioned } from '../lib/placement';
+import { readCanvas } from '../lib/canvasLoad';
 import { computeTypes, defaultPermissions, detectDefaultEdgeType, edgeStyle, edgeTypes } from '../lib/iam';
 
 const nodeTypes: NodeTypes = {
@@ -189,6 +190,10 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
   // screen until dismissed: the fix for it was a toast that faded after 4.5s,
   // which is the same as saying nothing to anyone who looked a moment later.
   const [placed, setPlaced] = useState(0);
+  // The canvas could not be READ. Deliberately NOT dismissible: dismissing it
+  // would leave an empty canvas that looks like a real one, which is the exact
+  // confusion that made the data loss above so quiet.
+  const [loadFailed, setLoadFailed] = useState(false);
   const { screenToFlowPosition, fitView } = useReactFlow();
   const [shiftHeld, setShiftHeld] = useState(false);
 
@@ -220,7 +225,16 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
   // --- Load canvas from backend on mount (status is seeded separately, from /world) ---
   useEffect(() => {
     const load = async () => {
-      const canvasRes = await fetch(`${API}/canvas`).then(r => r.json()).catch(() => ({ nodes: [], edges: [] }));
+      // A FAILED read is not an empty canvas — see `lib/canvasLoad.ts` for the
+      // data loss that collapsing those two cases caused. `null` means COULD
+      // NOT READ, and the loader returns WITHOUT setting `loaded`: nothing
+      // renders, the debounced save below never arms, the file on disk is
+      // untouched, and the banner says so.
+      const canvasRes = await readCanvas(fetch, `${API}/canvas`);
+      if (!canvasRes) {
+        setLoadFailed(true);
+        return;
+      }
 
       // A canvas authored outside the UI (`odin canvas set`, an agent, the
       // README's own example) may carry no `position`. ReactFlow dereferences
@@ -814,6 +828,22 @@ const typeOrder = ['s3', 'sqs', 'dynamodb', 'rds', 'vpc', 'subnet', 'sg', 'ec2',
       {/* The canvas moved something the user didn't: say so, in the same pill
           bar RegionAsk uses (40px tall, 20px off the edge), and leave it up
           until it's dismissed. */}
+      {loadFailed && (
+        <div className="absolute top-0 left-0 right-0 z-30 flex items-center gap-2 px-3 py-2.5 bg-bg-secondary border-b border-neon-red shadow-lg">
+          <span className="font-mono text-[10px] leading-5 text-neon-red uppercase tracking-[1px] whitespace-nowrap">Not loaded</span>
+          <span className="flex-1 min-w-0 font-mono text-[11px] leading-5 text-text-secondary">
+            odin could not read the saved canvas. <span className="text-text-primary">Nothing has been overwritten</span> — your
+            saved canvas is intact on disk. Reload to try again; do not draw here until it loads.
+          </span>
+          <button
+            onClick={() => window.location.reload()}
+            title="Reload"
+            className="font-mono text-[10px] h-5 px-2.5 border border-border bg-bg-tertiary text-text-muted uppercase tracking-[1px] cursor-pointer transition-colors duration-200 hover:text-text-primary hover:border-border-bright"
+          >
+            Reload
+          </button>
+        </div>
+      )}
       {placed > 0 && (
         <div className="absolute top-0 left-0 right-0 z-30 flex items-center gap-2 px-3 py-2.5 bg-bg-secondary border-b border-border-bright shadow-lg">
           <span className="font-mono text-[10px] leading-5 text-neon-amber uppercase tracking-[1px] whitespace-nowrap">Placed</span>
