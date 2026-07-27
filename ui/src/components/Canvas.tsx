@@ -29,6 +29,7 @@ import S3Node from './nodes/S3Node';
 import DynamodbNode from './nodes/DynamodbNode';
 import ServiceNode from './nodes/ServiceNode';
 import RegionAsk from './RegionAsk';
+import { sizeOnLoad, sizeForSave } from '../lib/nodeSize';
 import { BUILTINS, CATALOG, catalogNodeTypeMap, catalogDefaultData, catalogDefaultStyle, catalogZIndex, catalogByType, COLORS } from '../lib/catalog';
 import { withContainment, isInsideContainer } from '../lib/containment';
 import { placeUnpositioned } from '../lib/placement';
@@ -195,7 +196,7 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
         position: (typeof n.position?.x === 'number' && typeof n.position?.y === 'number') ? n.position : undefined,
         zIndex: zIndexForType[n.type] ?? 2,
         data: { ...defaultDataForType[n.type], ...n.data },
-        style: { ...defaultStyleForType[n.type], ...n.size },
+        style: { ...defaultStyleForType[n.type], ...sizeOnLoad(defaultStyleForType, n.type, n.size) },
       }));
       const { nodes: rfNodes, placed: placedCount } = placeUnpositioned(fromDisk);
       setPlaced(placedCount);
@@ -341,10 +342,7 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
           id: n.id,
           type: n.type,
           position: n.position,
-          size: {
-            width: n.width ?? (n.style as any)?.width ?? (defaultStyleForType[n.type ?? ''] as any)?.width,
-            height: n.height ?? (n.style as any)?.height ?? n.measured?.height ?? (defaultStyleForType[n.type ?? ''] as any)?.height,
-          },
+          size: sizeForSave(defaultStyleForType, n),
           data: Object.fromEntries(
             Object.entries(n.data ?? {}).filter(([k]) => !['status', 'error'].includes(k))
           ),

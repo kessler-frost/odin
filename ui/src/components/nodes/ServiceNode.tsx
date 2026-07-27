@@ -1,5 +1,6 @@
 import { Handle, Position, type NodeProps, NodeResizer } from '@xyflow/react';
 import StatusBadge from './StatusBadge';
+import NodeMeta from './NodeMeta';
 import { catalogByType, COLORS } from '../../lib/catalog';
 
 // One component renders every catalog (Phase-5) leaf service; appearance comes
@@ -12,12 +13,21 @@ export default function ServiceNode({ type, data, selected }: NodeProps) {
   // Once it's running, the live endpoint is what the user actually wants.
   const endpoint = d.endpoint;
   const isUrl = endpoint?.startsWith('http');
+  const meta = endpoint ? (
+    isUrl ? (
+      <a href={endpoint} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()}
+         className="text-neon-green hover:underline" title={`Open ${endpoint}`}>{endpoint}</a>
+    ) : (
+      <span onClick={e => { e.stopPropagation(); navigator.clipboard?.writeText(endpoint); }}
+            className="text-neon-green cursor-copy" title={`Click to copy ${endpoint}`}>{endpoint}</span>
+    )
+  ) : detail;
   return (
-    <div className={`w-full h-full border ${c.border} bg-bg-secondary ${c.shadow}`}>
+    <div className={`w-full min-h-full border ${c.border} bg-bg-secondary ${c.shadow}`}>
       <NodeResizer
         isVisible={selected}
         minWidth={def.width}
-        minHeight={60}
+        minHeight={40}
         lineClassName={c.line}
         handleClassName={`${c.handle} !border-none !w-2 !h-2`}
       />
@@ -25,27 +35,12 @@ export default function ServiceNode({ type, data, selected }: NodeProps) {
       <Handle id="right" type="source" position={Position.Right} className={`${c.handle} !border-none !w-1.5 !h-1.5`} />
       <Handle id="top" type="source" position={Position.Top} className={`${c.handle} !border-none !w-1.5 !h-1.5`} />
       <Handle id="bottom" type="source" position={Position.Bottom} className={`${c.handle} !border-none !w-1.5 !h-1.5`} />
-      <div
-        className="flex items-center gap-2 px-3 h-10 border-b text-xs font-semibold overflow-hidden whitespace-nowrap"
-        style={{ borderColor: `rgba(${c.rgb},0.3)` }}
-      >
+      <div className="flex items-center gap-2 px-3 h-10 text-xs font-semibold overflow-hidden whitespace-nowrap">
         <span className={`${c.text} shrink-0`}>{def.abbr}</span>
         <span className="truncate">{d.label}</span>
         <StatusBadge status={d.status} error={d.error} />
       </div>
-      <div className="flex items-center px-3 h-5 font-mono text-[10px] truncate">
-        {endpoint ? (
-          isUrl ? (
-            <a href={endpoint} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()}
-               className="text-neon-green hover:underline truncate" title={`Open ${endpoint}`}>{endpoint}</a>
-          ) : (
-            <span onClick={e => { e.stopPropagation(); navigator.clipboard?.writeText(endpoint); }}
-                  className="text-neon-green truncate cursor-copy" title={`Click to copy ${endpoint}`}>{endpoint}</span>
-          )
-        ) : (
-          <span className="text-text-secondary truncate">{detail}</span>
-        )}
-      </div>
+      <NodeMeta rows={[meta]} rgb={c.rgb} />
     </div>
   );
 }
