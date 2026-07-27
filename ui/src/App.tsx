@@ -64,11 +64,16 @@ export default function App() {
     setEdgeUpdates({ edgeId, data });
   }, []);
 
+  // `?env=` is NOT optional here. Without it this read always returned the
+  // DEFAULT env's canvas while `handleApply` POSTed it to the SELECTED env --
+  // so applying in any non-default env applied the wrong desired state.
+  // Demonstrated with a fetch tap: `["/canvas", "/apply-full?env=gifclean"]`,
+  // and the default canvas's node duly appeared in gifclean's world.
   const readCanvas = useCallback(async () => {
-    const canvas = await fetch('/canvas').then(r => r.json()).catch(() => null);
+    const canvas = await fetch(`/canvas?env=${encodeURIComponent(env)}`).then(r => r.json()).catch(() => null);
     if (!canvas) pushToast('error', 'Could not read the canvas');
     return canvas;
-  }, [pushToast]);
+  }, [env, pushToast]);
 
   // Apply: send the canvas as desired state; the Reconciler runs it for real,
   // Terraform is generated + applied through the gateway, and live status

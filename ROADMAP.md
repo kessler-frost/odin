@@ -1162,20 +1162,18 @@ have meant retiring a claim rather than fixing a bug.
   why a hard `AttributeError` once surfaced as a decorative security group.
   Fix the collapse first; it may be what makes this test's real cause visible.
 
-- [ ] **Apply can send a STALE canvas — two pre-existing UI bugs, found while
-  recording the v0.7.7 GIFs.** Both verified as untouched by v0.7.7
-  (`ui/src/App.tsx` has no diff against v0.7.6), so they predate this release.
-  1. `handleApply` sends the SAVED canvas: `readCanvas()` does
-     `fetch('/canvas')`, and the canvas save is DEBOUNCED. Drop a node, click
-     Apply promptly, and the node is not in what gets applied — the badge
-     stays `draft` and nothing explains why. Reproduced repeatedly: an SNS
-     node dropped and applied never reached `/world` at all.
-     This is honesty rule 2 in the UI: Apply reports on something other than
-     what is on screen. Fix by sending the LIVE canvas (the component already
-     holds it in `nodesRef`/`edgesRef`) or by flushing the pending save first.
-  2. `readCanvas()` omits `?env=` entirely, so Apply always reads the DEFAULT
-     env's canvas while POSTing to the selected env. In any non-default env
-     that applies the wrong desired state.
+- [ ] **The canvas badge does not go green live after an Apply.** Observed
+  repeatedly while recording the v0.7.7 GIFs: `/world` reports the resource
+  `healthy` and the WebSocket demonstrably delivers `world_delta` for it (I
+  connected a raw client and received two), yet the node's badge sits at
+  `DRAFT` until the page is reloaded — reload rehydrates correctly from
+  `/world`, so the seeding path works and the LIVE delta path does not.
+  NOT yet separated from its neighbour below, which was confounding every
+  measurement; re-measure now that the env bug is fixed before assuming this
+  one is real.
+  (A first theory — that the debounced canvas save raced the Apply — was
+  DISPROVEN: the debounce is 500ms, and the canvas was verified saved 3s
+  before Apply. Recorded so nobody re-derives it.)
 
 ## The intelligence layer (owner directive, 2026-07-27) — NEXT, after v0.7.7
 
