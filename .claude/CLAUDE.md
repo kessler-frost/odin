@@ -262,10 +262,28 @@ Hard-won mechanics. Ignoring these has already destroyed work in this repo.
   (never `/tmp` — macOS TMPDIR isn't shared into Colima), and its own env-name
   prefix. Two agents defaulting to :4200/:4266 produced a bogus 401 and two
   phantom "bugs" that had to be retracted.
+- **Isolation is PER-PROCESS, not per-agent.** An agent with its own port, store
+  dir and env prefix then ran two of its own `pytest` processes through them at
+  once, and the collision produced a phantom "1-in-6 flaky test" that was
+  reported to the lead and later retracted. Seven clean runs were identical
+  (90/814/5); the two anomalous runs were both its own contamination. If you
+  start a second process, it needs its own everything too.
+- **A source mutation is a TREE-WIDE edit.** Mutation testing rewrites a file
+  that every concurrent reader of that worktree sees. The same incident had a
+  live `policy.py` mutation land in an unrelated full-suite run (three extra
+  failures, exactly the three that mutation breaks) and made a *different*
+  agent report an inexplicable `AssertionError` from a file rewritten
+  mid-import. So: mutate only in a private copy of the tree, or hold a hard
+  rule that nothing else runs during the window — and when a result surprises
+  you, suspect your own harness before the code.
 - **Cleanup must be scoped to the env names that agent created.** `docker ps -aq
   --filter label=odin=1 | xargs -r docker rm -f` is machine-wide and has already
   deleted another agent's containers mid-verification. Use
   `--filter name=<prefix>`.
+- **`git add -A <path>` is path-limited; `git commit` is NOT.** In a shared
+  worktree that combination swept 24 of another agent's staged files into an
+  unrelated commit. Commit with explicit pathspecs and read `git show --stat`
+  before trusting it.
 - **"I read it" needs a "when."** With many agents in flight, one read
   `catalog.ts` before a commit landed and another after, and they reported
   contradictory states — both honestly. Timestamp claims about the tree.
