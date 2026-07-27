@@ -267,12 +267,12 @@ class MeshSidecar:
         # The env's lighthouse may not be up yet: backings can be the FIRST
         # mesh members (no EC2 instance drawn at all). Idempotent -- a
         # lighthouse an instance already started is left alone.
-        self._lighthouse.ensure_started(self._root, self._env, underlay)
+        await self._lighthouse.ensure_started(self._root, self._env, underlay)
         manager = NebulaManager(self._nebula_dir(), runner=self._run)
         overlay = manager.load_overlay()
         if overlay is None:
             return None
-        cert_ip = manager.allocate_host_ip(member)  # sticky: same IP every join
+        cert_ip = await manager.allocate_host_ip(member)  # sticky: same IP every join
         # Signed ONCE per member, and RE-signed only when its membership really
         # changed (this runs on every ensure_backing / every reconciler tick
         # for a live rds -- a `nebula-cert` subprocess each time would be pure
