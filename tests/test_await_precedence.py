@@ -111,6 +111,63 @@ def test_the_allowlist_has_no_stale_entries():
     )
 
 
+# --- the sibling shape: `async with await <acm>` -----------------------------
+#
+# `@contextlib.asynccontextmanager` returns its context manager SYNCHRONOUSLY;
+# the `async with` does the awaiting. So `async with await serve_on_loop(...)`
+# raises `TypeError: object _AsyncGeneratorContextManager can't be used in
+# 'await' expression` -- and it did, inside `create_app`'s lifespan, meaning
+# the real server could not start at all.
+#
+# The inverse must stay SILENT: `async with reconciler.hold()` is correct and
+# extremely common. A checker that flags both is noise, and a static check that
+# cries wolf two times in three is one people learn to ignore -- which is worse
+# than not having it.
+ASYNC_WITH_ALLOWED: dict[str, str] = {
+    "server.py": "v0.7.7 stage C, owner dethread-control-src: `async with await "
+                 "serve_on_loop(...)` — delete the await, keep the async with.",
+}
+
+
+def _async_with_offenders() -> list[tuple[str, int]]:
+    found: list[tuple[str, int]] = []
+    for path in sorted(SRC.rglob("*.py")):
+        rel = path.relative_to(SRC).as_posix()
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.AsyncWith):
+                for item in node.items:
+                    if isinstance(item.context_expr, ast.Await):
+                        found.append((rel, node.lineno))
+    return found
+
+
+def test_async_with_does_not_await_its_context_manager():
+    unexpected = [(rel, line) for rel, line in _async_with_offenders() if rel not in ASYNC_WITH_ALLOWED]
+    assert not unexpected, (
+        "`async with await <acm>` — an @asynccontextmanager returns its manager "
+        "synchronously; the `async with` awaits it:\n"
+        + "\n".join(f"  {rel}:{line}" for rel, line in unexpected)
+    )
+
+
+def test_the_async_with_checker_stays_silent_on_the_correct_form():
+    """The false-positive direction, tested explicitly. `async with acm()` is
+    the overwhelmingly common CORRECT form; flagging it would make the whole
+    check noise."""
+    def flagged(src: str) -> bool:
+        return any(
+            isinstance(item.context_expr, ast.Await)
+            for node in ast.walk(ast.parse(src)) if isinstance(node, ast.AsyncWith)
+            for item in node.items
+        )
+
+    assert flagged("async def g():\n    async with await acm():\n        pass\n")
+    assert not flagged("async def g():\n    async with acm():\n        pass\n")
+    assert not flagged("async def g():\n    async with acm() as x, other() as y:\n        pass\n")
+    # a plain `with` on an awaited value is a different thing and not ours
+    assert not flagged("async def g():\n    with await thing():\n        pass\n")
+
+
 def test_the_checker_detects_the_wrong_form_and_accepts_the_right_one():
     """Mutation test for the checker itself: it must separate the two forms,
     not merely notice that an `await` and a `.` appear on the same line."""
