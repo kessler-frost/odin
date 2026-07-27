@@ -544,10 +544,14 @@ prose explanation of a failure, and the evidence it reads is still there in
   nothing, there are no snapshots, and a node's label must be a valid RDS
   identifier (lowercase, hyphen-separated).
 - **Nebula** is live single-host. VPC and SG config compiles to real Nebula
-  network and firewall primitives, the host runs a real and fully unprivileged
-  lighthouse per environment (no root, no sudo, no one-time setup), and every
-  VPC-joined EC2 VM runs a real `nebula` daemon carrying the compiled SG
-  firewall. Cross-Mac reachability lands with multi-Mac support.
+  network and firewall primitives, and every VPC-joined EC2 VM runs a real
+  `nebula` daemon carrying the compiled SG firewall. The per-environment
+  lighthouse is fully unprivileged when it runs (no root, no sudo, no one-time
+  setup) — and it runs **only once the first VM joins the mesh**, stopping when
+  the last one leaves. A canvas with a VPC but no EC2 instance gets its network,
+  its CA and its assigned lighthouse address, and `GET /mesh` says
+  `"lighthouse_running": false`, which is the honest answer: there is nothing to
+  coordinate yet. Cross-Mac reachability lands with multi-Mac support.
 - **Which endpoint fact your security groups actually govern.** A database
   publishes up to three. `DATABASE_URL` (for a container) and `DATABASE_URL_VM`
   (for an EC2 Lima VM) are the same raw published host port under two host
