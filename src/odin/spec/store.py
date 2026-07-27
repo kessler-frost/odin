@@ -31,6 +31,12 @@ def rev_of(stack: Stack) -> str:
 # two answers, and they are opposites -- see `StoreUnreadable`.
 CACHE = "cache"
 DESIRED = "desired"
+# The gateway's own two, so `_load` and `StoreUnreadable` serve every store odin
+# keeps rather than the spec store alone -- and so one handler in server.py
+# answers for all four. This module imports nothing from the gateway (only
+# `spec.models` and `util`), so the gateway reaching back here closes no cycle.
+CONTROL = "control"
+CREDENTIALS = "credentials"
 
 
 class StoreUnreadable(Exception):

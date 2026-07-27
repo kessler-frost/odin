@@ -20,6 +20,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from odin.spec.store import CONTROL, _load
 from odin.util import atomic_write_text
 
 # A mutator passed to `JsonStore.update` returns this to mean "leave the
@@ -96,10 +97,19 @@ class JsonStore:
             return self._locks.setdefault(env, threading.Lock())
 
     def _data(self, env: str) -> dict[str, Any]:
-        # Caller must already hold `_lock_for(env)`.
+        """Caller must already hold `_lock_for(env)`.
+
+        The read goes through `spec/store.py::_load` so a corrupt file NAMES
+        itself. It used to be a bare `json.loads`, and `JSONDecodeError` carries
+        no path: one truncated `gateway/<name>.json` made every store-backed kind
+        -- ecs, lambda, ec2, elasticache, logs -- raise out of here with nothing
+        saying which file, against a `GET /logs` docstring promising "never a
+        500". Role CONTROL, because deleting this one is NOT the fix: it is what
+        tofu's next refresh reads, so losing it orphans resources that really
+        exist."""
         if env not in self._loaded:
             path = self._path(env)
-            self._loaded[env] = json.loads(path.read_text()) if path.exists() else {}
+            self._loaded[env] = _load(path, CONTROL, json.loads) if path.exists() else {}
         return self._loaded[env]
 
     def _path(self, env: str) -> Path:

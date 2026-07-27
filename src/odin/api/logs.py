@@ -79,6 +79,7 @@ from odin.compute import instances as ec2_compute
 from odin.compute import tasks as ecs_compute
 from odin.gateway.models import cachectl, logsctl
 from odin.gateway.stores import SynthStores
+from odin.spec.store import StoreUnreadable
 from odin.runtime.colima import ColimaRuntime
 from odin.spec.store import SpecStore
 
@@ -388,8 +389,13 @@ def _unparseable(path: Path) -> bool:
 
 
 def _unreadable_state_error(root: Path, env: str, exc: Exception) -> str:
-    corrupt = _corrupt_state_files(root, env)
-    named = ", ".join(corrupt) if corrupt else f"somewhere under {root / env / 'gateway'}"
+    # `StoreUnreadable` NAMES its file (gateway/stores.py reads through
+    # `spec/store.py::_load` now), so the scan below is only needed for a raw
+    # `OSError`/`ValueError` from some other read -- which is why it stayed
+    # rather than being deleted outright.
+    named = str(getattr(exc, "path", "")) or (
+        ", ".join(_corrupt_state_files(root, env)) or f"somewhere under {root / env / 'gateway'}"
+    )
     # Accurate for BOTH paths this guard covers: a node read resolves a
     # container, a `?group=` read resolves a sink, and neither could happen.
     return (
@@ -411,8 +417,12 @@ def create_logs_router(store: SpecStore, stores: SynthStores, runtime) -> APIRou
         # THE one guard, at the boundary that owns the "every outcome is an
         # honest 200" contract. Probed: a truncated `.odin/<env>/gateway/
         # <name>.json` makes EVERY store-backed kind -- ecs, lambda, ec2,
-        # elasticache, logs, and `?group=` -- raise `JSONDecodeError` out of
-        # `gateway/stores.py::_data`, which reads its file unguarded. It must
+        # elasticache, logs, and `?group=` -- fail out of
+        # `gateway/stores.py::_data`. That read is no longer unguarded: it
+        # raises `StoreUnreadable`, which NAMES the file and carries the
+        # recovery for its role, and this clause catches that type as well as a
+        # raw OSError/ValueError from anything that does not go through
+        # `_load`. It must
         # not become a 500 (this route promises not to), and it must NOT
         # become an empty-but-successful log either: that is the false green
         # honesty rule 2 is about. It becomes the `error` field this route
@@ -422,7 +432,7 @@ def create_logs_router(store: SpecStore, stores: SynthStores, runtime) -> APIRou
             if group:  # an explicit group read wins over node resolution (module docstring)
                 return fetch_group_logs(stores, env, group, tail, node=node)
             return fetch_logs(store, stores, runtime, env, node, tail)
-        except (OSError, ValueError) as exc:
+        except (StoreUnreadable, OSError, ValueError) as exc:
             log.warning("could not read gateway state for env %s: %s", env, exc)
             return LogsResponse(env=env, node=node, error=_unreadable_state_error(stores.root, env, exc))
 

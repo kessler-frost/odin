@@ -30,6 +30,8 @@ tests/api/test_canvas_validation.py uses it).
 """
 from __future__ import annotations
 
+import json
+
 from pathlib import Path
 
 import pytest
@@ -39,9 +41,12 @@ from odin.agent.hcl import generate_tf
 from odin.agent.translate import TranslateResult
 from odin.aws.backings import BackingUnavailable
 from odin.gateway.models import ec2compute
+from odin.gateway.keys import KeyStore
+from odin.gateway.stores import SynthStores
 from odin.runtime.colima import ContainerFacts, HostFacts, RunHandle
 from odin.server import create_app
 from odin.spec.store import SpecStore, StoreUnreadable
+from odin.spec import store as store_mod
 from odin.spec.translate import canvas_to_stack
 
 S3_ONLY = {"nodes": [{"type": "s3", "data": {"label": "uploads"}}], "edges": []}
@@ -473,3 +478,62 @@ def test_an_exception_with_no_message_still_gives_a_reason(tmp_path, monkeypatch
         error = client.get("/world", params={"env": "applyfix"}).json()["error"]
     assert "TimeoutError: raised with no message" in error
     assert "TimeoutError: ." not in error
+
+
+# --- the three handovers: every store names itself, and a body-env route's
+# failure advises the env the caller actually named --------------------------
+
+
+def test_a_corrupt_gateway_store_names_itself_and_says_not_to_delete_it(tmp_path):
+    """`gateway/<name>.json` used to be read with a bare `json.loads`, and
+    `JSONDecodeError` carries no path — so one truncated file made every
+    store-backed kind raise with nothing saying WHICH file. Role CONTROL,
+    because deleting this one is not the fix: it is what tofu's next refresh
+    reads, so losing it orphans resources that really exist."""
+    store_dir = tmp_path / "gwenv" / "gateway"
+    store_dir.mkdir(parents=True)
+    (store_dir / "ecsctl.json").write_text('{"half": ')
+
+    with pytest.raises(StoreUnreadable) as caught:
+        SynthStores(tmp_path).ecsctl.get("gwenv", "task:x")
+
+    assert caught.value.role == store_mod.CONTROL
+    assert "ecsctl.json" in str(caught.value.path)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param({"db": "AKIAodin1234"}, id="a-string-where-the-pair-belongs"),
+        pytest.param(["a", "b"], id="a-list-instead-of-a-map"),
+        pytest.param({"db": ["AKIAxxxx", ""]}, id="an-empty-secret"),
+        pytest.param({"db": ["only-one"]}, id="a-one-element-pair"),
+    ],
+)
+def test_a_keyfile_odin_cannot_trust_is_refused_rather_than_half_read(tmp_path, payload):
+    """The sharpest of the three, because it forges a PRINCIPAL rather than
+    merely failing. `{"db": "AKIAodin1234"}` is valid JSON, and `pair[0],
+    pair[1]` then INDEXES THE STRING — odin registered access key 'A' with
+    secret 'K', so a one-character key authenticated as that node. Same shape
+    as the scrub set that redacted single letters, one consequence worse."""
+    (tmp_path / "e").mkdir()
+    (tmp_path / "e" / "keys.json").write_text(json.dumps(payload))
+
+    store = KeyStore(tmp_path)
+    with pytest.raises(StoreUnreadable) as caught:
+        store._ensure_loaded("e")
+
+    assert caught.value.role == store_mod.CREDENTIALS
+    assert store.lookup("A") is None, "a forged single-character principal survived"
+
+
+def test_a_good_keyfile_still_loads(tmp_path):
+    """The other direction: the guard must not refuse what `issue` really
+    writes, or every gateway call fails closed on a healthy env."""
+    (tmp_path / "e").mkdir()
+    written = KeyStore(tmp_path).issue("e", "api")
+
+    reread = KeyStore(tmp_path)
+    reread._ensure_loaded("e")
+
+    assert reread.lookup(written[0]) is not None

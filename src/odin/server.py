@@ -499,6 +499,20 @@ _STORE_RECOVERY = {
         "tick (measured: a 4-resource env came back complete, with identical facts, one tick "
         "later). `odin tf plan --env {env}` works right now and reads none of it"
     ),
+    store_mod.CONTROL: (
+        "that file is the gateway's record of the AWS resources odin CREATED for this env -- what "
+        "tofu's next refresh reads -- so do NOT delete it: odin would forget resources that really "
+        "exist and leave them orphaned. Restore it with `odin import <archive>` if you have an "
+        "`odin export` of this env; otherwise `odin destroy --env {env}` tears the env down through "
+        "the records that still parse, and a fresh Apply rebuilds it"
+    ),
+    store_mod.CREDENTIALS: (
+        "that file holds the gateway credentials odin issued to this env's workloads. A fresh Apply "
+        "mints new ones, but a container that is ALREADY running was launched with the old pair and "
+        "will fail auth (`InvalidClientTokenId`) until it is recreated -- so restore it with "
+        "`odin import <archive>` if you can, and otherwise expect to re-Apply and let the workloads "
+        "be replaced"
+    ),
     store_mod.DESIRED: (
         "that file IS this env's desired state -- the only record of what you asked for -- so do "
         "NOT delete it. Restore it with `odin import <archive>` if you have an `odin export` of "
@@ -587,7 +601,11 @@ def _failure_body(request: Request, exc: Exception) -> tuple[int, dict]:
     the handler of last resort; an exception raised INSIDE it would put the
     bare "Internal Server Error" straight back."""
     verdict = _EXCEPTION_VERDICTS.get(type(exc), _UNEXPECTED)
-    env = request.query_params.get("env") or ENV
+    # A route that takes env in its BODY records it on `request.state` (see
+    # `api/debug.py`), because this handler cannot await a request body -- it is
+    # the last resort, and an exception raised inside it puts the bare
+    # "Internal Server Error" straight back. Query param next, then the default.
+    env = getattr(request.state, "env", None) or request.query_params.get("env") or ENV
     # Field test 6, F4's sibling: `str(exc)` is empty for any exception built
     # with no args (`TimeoutError()`, `KeyError()`, and `TofuNotInstalled()`
     # right here in this tree), which rendered `-- TimeoutError: . odin has no

@@ -386,3 +386,29 @@ def test_build_context_is_usable_without_the_route(tmp_path):
     store.apply(Stack(env=ENV))
     context = build_context(store, SynthStores(tmp_path), LoggingRuntime(), ConnectionManager(tmp_path), ENV, ["db"])
     assert context["env"] == ENV and "db" in context["nodes"]
+
+
+def test_a_failure_here_advises_the_env_the_caller_actually_named(tmp_path):
+    """`/agent/debug` takes its env in the BODY, and `_failure_body` can only
+    read query params — so a failure on env 'staging' used to advise
+    `odin world --env default`, pointing the user at an env they never
+    mentioned. The handler of last resort cannot await a request body (it is
+    what runs when everything else has failed), so the route records the env it
+    resolved and the handler prefers that."""
+    store = SpecStore(tmp_path)
+    store.apply(Stack(env="staging", resources=(DB,)))
+
+    async def explode(*_args, **_kwargs):
+        raise RuntimeError("the model call fell over")
+
+    app = FastAPI()
+    app.add_exception_handler(Exception, _unhandled_failure)
+    app.include_router(create_debug_router(
+        store, SynthStores(tmp_path), LoggingRuntime(), ConnectionManager(tmp_path), diagnose=explode,
+    ))
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        body = client.post("/agent/debug", json={"env": "staging", "node_ids": ["db"]}).json()
+
+    assert "staging" in json.dumps(body), "the failure named an env the caller never asked about"
+    assert "--env default" not in json.dumps(body)

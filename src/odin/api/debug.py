@@ -44,7 +44,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from odin.agent import debugger
@@ -208,7 +208,14 @@ def create_debug_router(
     router = APIRouter()
 
     @router.post("/agent/debug")
-    async def debug_route(body: DebugRequest) -> DebugResponse:
+    async def debug_route(body: DebugRequest, request: Request) -> DebugResponse:
+        # This route takes its env in the BODY, and `server.py::_failure_body`
+        # can only see query params -- so a failure here used to advise
+        # `odin world --env default` for an env the caller never named. The
+        # handler of last resort must stay pure string building (it cannot
+        # await a body that may already be consumed), so the env is recorded
+        # here instead, the earliest point it is known.
+        request.state.env = body.env
         context = await asyncio.to_thread(
             build_context, store, stores, runtime, ws_manager, body.env, body.node_ids,
         )
