@@ -6,6 +6,7 @@ import Canvas from './components/Canvas';
 import ConfigPanel from './components/ConfigPanel';
 import BottomPanel from './components/BottomPanel';
 import CodePanel from './components/CodePanel';
+import { readCanvas as readCanvasPayload } from './lib/canvasLoad';
 
 export type BottomState = 'default' | 'collapsed' | 'half';
 
@@ -70,9 +71,19 @@ export default function App() {
   // env at all, and `GET /canvas?env=X` returns byte-identical bytes for
   // every X). Adding `?env=` here reads as a per-env canvas that does not
   // exist -- a claim the code cannot back.
+  //
+  // Shares `lib/canvasLoad.ts` with the canvas loader, and the sharing is the
+  // point: this call site had the same defect in a more destructive form. It
+  // was `fetch('/canvas').then(r => r.json())` with no status check, so a 500
+  // handed `handleApply` FastAPI's `{"detail": ...}` body — an object, so
+  // truthy — which `POST /apply-full` accepts as a canvas with ZERO nodes
+  // (`CanvasGraph.nodes` defaults to `[]`). Measured: HTTP 200,
+  // `{"status": "applied"}`, a real revision committed. Applying an empty
+  // desired state tears the environment down. A failed read must abort Apply,
+  // never apply emptiness.
   const readCanvas = useCallback(async () => {
-    const canvas = await fetch('/canvas').then(r => r.json()).catch(() => null);
-    if (!canvas) pushToast('error', 'Could not read the canvas');
+    const canvas = await readCanvasPayload(fetch, '/canvas');
+    if (!canvas) pushToast('error', 'Could not read the canvas — nothing was applied');
     return canvas;
   }, [pushToast]);
 

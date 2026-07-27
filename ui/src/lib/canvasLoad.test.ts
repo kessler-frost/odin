@@ -27,6 +27,17 @@ describe('readCanvas: a failed read is not an empty canvas', () => {
     expect(await readCanvas(ok('nope'), '/canvas')).toBeNull();
     expect(await readCanvas(ok(null), '/canvas')).toBeNull();
   });
+
+  it('is null for an error body that happens to be an object', async () => {
+    // The destructive one. `{"detail": ...}` is FastAPI's error shape; it
+    // passes a bare typeof-object check with `nodes` undefined, and
+    // `POST /apply-full` with that body returns HTTP 200 "applied" and
+    // commits a revision with ZERO nodes -- which reconciles the environment
+    // down to nothing. Measured against a live server.
+    expect(await readCanvas(ok({ detail: 'Internal Server Error' }), '/canvas')).toBeNull();
+    expect(await readCanvas(ok({ error: 'nope' }), '/canvas')).toBeNull();
+    expect(await readCanvas(ok({ nodes: 'not-an-array' }), '/canvas')).toBeNull();
+  });
 });
 
 describe('readCanvas: a successful read is returned intact', () => {
@@ -41,6 +52,7 @@ describe('readCanvas: a successful read is returned intact', () => {
   });
 
   it('a fresh odin that has never written the file still loads', async () => {
-    expect(await readCanvas(ok({}), '/canvas')).toEqual({});
+    // `api/canvas.py` answers `_EMPTY` in that case, so `nodes` is present.
+    expect(await readCanvas(ok({ nodes: [], edges: [] }), '/canvas')).toEqual({ nodes: [], edges: [] });
   });
 });

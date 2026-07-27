@@ -1192,6 +1192,20 @@ have meant retiring a claim rather than fixing a bug.
     global file -- `GET /canvas?env=X` returns byte-identical bytes for every
     X. One architecture, many envs (isolated AWS *state*) is the design.
 
+- [ ] **`/apply-full` treats a MALFORMED body as "destroy everything".**
+  `CanvasGraph.nodes` defaults to `[]`, so a body with no `nodes` key at all
+  validates as a canvas with zero nodes. Measured against a live server:
+  `POST /apply-full?env=X` with `{"detail": "Internal Server Error"}` returns
+  **HTTP 200 `{"status": "applied"}`** and commits a real revision -- and
+  reconciling an env to an empty desired state tears down every resource in
+  it. The v0.7.7 fix is client-side (`lib/canvasLoad.ts` refuses to hand such
+  a body to Apply), which closes the reported path but not the route itself.
+  The server distinction worth drawing: an EXPLICIT `"nodes": []` is a
+  legitimate "remove everything", while an ABSENT `nodes` key is a malformed
+  request and should be a 422. Deferred out of v0.7.7 because making the field
+  required changes validation for every canvas-taking route (`/apply`,
+  `/translate`, `/canvas`) and wants its own test pass.
+
 - [ ] **Should the canvas be per-env?** Every other route (`/world`, `/apply`,
   `/destroy`) takes `?env=` and defaults to `default`; `/canvas` alone is
   global. Making it per-env-with-default would be consistent, but it changes

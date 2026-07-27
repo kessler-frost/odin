@@ -41,11 +41,22 @@ export async function readCanvas(
 }
 
 /**
- * An array body (`[]`) or a string would both survive `r.json()` and then
- * read as a canvas with no nodes, which is the same silent-emptiness bug
- * wearing a different hat. `nodes`/`edges` may be absent — a brand-new odin
- * has never written the file, and `GET /canvas` answers `{}`-shaped default.
+ * `nodes` MUST be an array. That is not pedantry — it is what stops an error
+ * body from being applied as a canvas.
+ *
+ * `api/canvas.py` always answers with a `nodes` list (`_EMPTY = {"nodes": [],
+ * "edges": []}` when the file has never been written), so this rejects
+ * nothing the real server sends. What it does reject is FastAPI's own error
+ * shape, `{"detail": "Internal Server Error"}` — an object, so a laxer check
+ * passes it, with `nodes` simply undefined and read downstream as "no nodes".
+ *
+ * Measured against the live server, that is destructive rather than merely
+ * wrong: `POST /apply-full` with `{"detail": "Internal Server Error"}` returns
+ * `HTTP 200 {"status": "applied"}` and commits a real revision with ZERO
+ * nodes, because `CanvasGraph.nodes` defaults to `[]`. Reconciling an env to
+ * an empty desired state tears down every resource in it. So a 500 arriving
+ * where a canvas was expected could destroy an environment.
  */
 function isCanvasPayload(value: unknown): value is CanvasPayload {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
+  return typeof value === 'object' && value !== null && Array.isArray((value as CanvasPayload).nodes);
 }
