@@ -115,7 +115,7 @@ async def test_region_debug_sees_the_real_crash_and_the_agent_fingers_it(tmp_pat
         assert crashed["verdict"], "a crashed ecs node must carry a real verdict, not silence"
 
         # --- proof 1: the CONTEXT the agent is handed is real evidence -------
-        context = build_context(
+        context = await build_context(
             app.state.store, app.state.gateway_stores, app.state.runtime, app.state.ws_manager,
             ENV, [CRASHY, STEADY],
         )
