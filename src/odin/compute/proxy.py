@@ -54,6 +54,26 @@ The container's command is a two-line shell prologue -- delete the image's own
 NEVER serves the nginx welcome page in the window between `docker run` and the
 copy. `exec` also keeps nginx as PID 1, which is what makes `docker kill -s
 HUP` reach it.
+
+KNOWN LIMIT, MEASURED, NOT CLOSED: `ensure` reports the port DOCKER PUBLISHED,
+which is not the same claim as "nginx is serving on it". A recreate reads the
+port immediately after `docker cp`, and an nginx that then REJECTS the config
+exits a moment later -- so the load balancer goes `active` on a real host port
+that nothing is listening on. Timed against the real container on 2026-07-27:
+
+    +0.000s  ensure's own read -> host_port=34029
+    +0.179s  container stopped publishing (status=exited)
+
+i.e. the read wins the race by ~180ms, every time (6 of 6 converges in a
+separate run). `_require_published` does NOT catch this: the port it is handed
+is genuine at the instant it is read. Closing it needs a real readiness probe
+of the published port (the shape `compute/functions.py::FunctionRuntime.ensure`
+uses for RIE), which is a bigger change than this module's converge contract.
+The wire-reachable trigger found for it is a target id that is not a valid
+nginx server address -- `elbv2ctl._target_host` returns a non-`i-` id VERBATIM
+(its own docstring), so `aws_lb_target_group_attachment.target_id = "10.0.0.1
+bogus"` renders `server 10.0.0.1 bogus:8080;` and nginx answers
+`[emerg] invalid parameter`.
 """
 from __future__ import annotations
 
@@ -135,6 +155,27 @@ class ProxyListener:
     fail_timeout_seconds: int = 30
 
 
+class PortsUnpublished(RuntimeError):
+    """The proxy container ANSWERED about its published ports, and the answer is
+    that a listener port has none -- so this load balancer has no address to
+    hand anyone. Distinct from `runtime/colima.py`'s `PortUnreadable` ("could
+    not ask at all"), and the same idea one layer up.
+
+    Raised instead of returned because the ONLY use of `ensure`'s return value
+    is `elbv2ctl.converge_proxy` writing it onto the load-balancer record as
+    `endpoints`, which `endpoint_url` turns into `ALB_ENDPOINT` and
+    `gateway/wiring.py::producer_facts` INJECTS INTO A REAL CONSUMER CONTAINER.
+    A host port of 0 is not a port, it is "nothing is published": returning it
+    made the load balancer go `active` with `endpoints {"80": 0}` and handed a
+    workload `http://127.0.0.1:0`. Raising routes it to
+    `elbv2ctl._converge_safely`, which already does the honest thing: state
+    `failed` with this text as the load balancer's `State.Reason`. It leaves
+    the PREVIOUS converge's `endpoints` on the record (they are that converge's
+    result, and are worth keeping to look at), so what actually withholds the
+    fact is `elbv2ctl.endpoint_url` refusing to call a recorded port an address
+    unless the state is `active` -- see its docstring."""
+
+
 def _sanitize_upstream(name: str) -> str:
     """An nginx upstream identifier. Target-group names are `[A-Za-z0-9-]`, and
     `-` is legal in an nginx upstream name, so this only has to namespace it
@@ -185,7 +226,7 @@ class LoadBalancerProxy:
 
     def ensure(self, root: Path, env: str, lb_name: str, listeners: tuple[ProxyListener, ...]) -> dict[int, int]:
         """Converge the real proxy container onto `listeners` and return
-        `{listen_port: published host port}`.
+        `{listen_port: published host port}`, every one of them REAL.
 
         ONE deterministic rule, no hidden state: render the config, then
         - the container is running AND every wanted port is already published
@@ -195,28 +236,86 @@ class LoadBalancerProxy:
           itself changed, which is a published-port change Docker cannot apply
           to a live container).
         Idempotent: called after every elbv2 mutation that can change what the
-        proxy should serve, and a no-change call is one copy plus one signal."""
+        proxy should serve, and a no-change call is one copy plus one signal.
+
+        There is exactly ONE return, and it goes through `_require_published`.
+        That is the point rather than an implementation detail: the reload
+        branch used to carry its `all(published.values())` check inline while
+        the recreate branch had none, so a publish failure reached the record on
+        exactly one of the two paths. A single exit cannot be half-fixed."""
         name = container_name(env, lb_name)
         ports = tuple(listener.port for listener in listeners) or (IDLE_LISTEN_PORT,)
         host_conf = conf_path(root, env, lb_name)
         atomic_write_text(host_conf, render_conf(listeners))
-        published = {port: self._rt.host_port(name, port) for port in ports}
-        if self._rt.status(name) == "running" and all(published.values()):
+        published = self._live_ports(name, ports)
+        # `all({})` is True, hence the `published and`: an empty map means
+        # there was no running container to read ports off at all.
+        if published and all(published.values()):
             self._rt.copy_in(name, str(host_conf), CONF_PATH_IN_CONTAINER)
             self._rt.signal(name, RELOAD_SIGNAL)
-            return published
-        self._rt.stop(name)
-        self._rt.run_container(ContainerSpec(
-            name=name, image=IMAGE,
-            ports={port: 0 for port in ports},  # 0 => Docker picks a free host port
-            labels={"odin-env": env, "odin-alb": lb_name},
-            command=_ENTRY_COMMAND,
-            memory_mib=_MEMORY_MIB, cpus=_CPUS,
-        ))
-        # The container is up running `_ENTRY_COMMAND`'s wait loop; THIS copy is
-        # what lets nginx actually start (module docstring).
-        self._rt.copy_in(name, str(host_conf), CONF_PATH_IN_CONTAINER)
+        else:
+            self._rt.stop(name)
+            self._rt.run_container(ContainerSpec(
+                name=name, image=IMAGE,
+                ports={port: 0 for port in ports},  # 0 => Docker picks a free host port
+                labels={"odin-env": env, "odin-alb": lb_name},
+                command=_ENTRY_COMMAND,
+                memory_mib=_MEMORY_MIB, cpus=_CPUS,
+            ))
+            # The container is up running `_ENTRY_COMMAND`'s wait loop; THIS copy
+            # is what lets nginx actually start (module docstring).
+            self._rt.copy_in(name, str(host_conf), CONF_PATH_IN_CONTAINER)
+            published = {port: self._rt.host_port(name, port) for port in ports}
+        return self._require_published(name, published)
+
+    def _live_ports(self, name: str, ports: tuple[int, ...]) -> dict[int, int]:
+        """`{listen_port: host port}` as the RUNNING container really publishes
+        them -- a 0 for any it does not -- and `{}` when there is no running
+        container to ask.
+
+        The status check is what makes the port read LEGAL, not merely tidy.
+        `host_port` RAISES `PortUnreadable` on a container that does not exist
+        (that is how "I could not ask" stays distinguishable from "nothing is
+        published"), so reading the ports FIRST -- which is what this method
+        replaced -- made the very first `ensure` for a NEW load balancer raise
+        before it could ever create the container. Measured against real docker
+        on 2026-07-27, twice in a row on the same fresh name:
+
+            status before      : absent
+            ensure() #1 (fresh): PortUnreadable: docker cannot read
+                                 odin-alb-p1a-fresh-lb1's published ports:
+                                 error: no such object: odin-alb-p1a-fresh-lb1
+            status after #1    : absent
+
+        i.e. every `CreateLoadBalancer` ended in `state: failed` and no proxy
+        container was ever created. `PortUnreadable` (`runtime/colima.py`,
+        commit a67b218) landed AFTER this module (7005988) and nothing here
+        was adjusted for it."""
+        if self._rt.status(name) != "running":
+            return {}
         return {port: self._rt.host_port(name, port) for port in ports}
+
+    def _require_published(self, name: str, published: dict[int, int]) -> dict[int, int]:
+        """`published` unchanged, or `PortsUnpublished` naming the ports with no
+        host port, the container's real status, and its last log lines.
+
+        The log tail is there because it is the only thing that says WHY. The
+        real failure this closes is nginx refusing the rendered config and
+        exiting, and `docker logs` on the real exited container says exactly
+        that -- measured, not assumed:
+
+            nginx: [emerg] invalid parameter "bogus:8080" in
+            /etc/nginx/conf.d/odin.conf:2
+
+        which `_converge_safely` then stores as the load balancer's
+        `State.Reason` (honesty rule 2: name the real reason, not "failed")."""
+        dead = sorted(port for port, host_port in published.items() if not host_port)
+        if not dead:
+            return published
+        raise PortsUnpublished(
+            f"{name} published no host port for {dead} (container is "
+            f"{self._rt.status(name)}); last log lines: {self._rt.logs(name, 5).strip() or 'none'}"
+        )
 
     def status(self, env: str, lb_name: str) -> str:
         return self._rt.status(container_name(env, lb_name))

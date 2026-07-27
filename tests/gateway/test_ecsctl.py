@@ -11,6 +11,7 @@ only one that boots real Colima containers.
 """
 from __future__ import annotations
 
+import itertools
 import json
 import threading
 import time
@@ -290,6 +291,143 @@ def test_deregister_task_definition_marks_inactive_and_bare_family_skips_it(sink
     req = sink.call(lambda: ecs.describe_task_definition(taskDefinition="app"))
     described = _parse("DescribeTaskDefinition", _answer(stores, req, runtime))["taskDefinition"]
     assert described["revision"] == 1  # rev 2 is INACTIVE -- "latest ACTIVE" skips it
+
+
+def test_a_register_never_overwrites_a_live_revision_it_cannot_see_a_counter_for(sink, ecs, stores):
+    """The revision number comes off the `taskdef:` KEYS, never a separate
+    `taskdef-rev:` counter that could disagree with them.
+
+    Measured against the real handlers on the old code, after removing just
+    the counter key -- the state a user's own repair of `gateway/ecsctl.json`
+    leaves behind, and `stores.py::_data`'s docstring is what tells them to
+    repair it:
+
+        keys on disk          : ['taskdef:web:1']
+        _latest_active_taskdef: None
+        register #2 ->  .../task-definition/web:1
+        taskdef:web:1 now     : [alpine:3.21]   <- revision 1 OVERWRITTEN
+    """
+    runtime = FakeTaskRuntime()
+    first = _register_taskdef(stores, sink, ecs, runtime, containerDefinitions=[{"name": "one"}])
+    assert first["revision"] == 1
+    # Whatever bookkeeping key a previous odin left behind, gone.
+    stores.ecsctl.delete(ENV, "taskdef-rev:app")
+
+    assert ecsctl._latest_active_taskdef(stores, ENV, "app")["revision"] == 1
+    second = _register_taskdef(stores, sink, ecs, runtime, containerDefinitions=[{"name": "two"}])
+
+    assert second["revision"] == 2
+    assert ecsctl._taskdef(stores, ENV, "app", 1)["container_definitions"] == [{"name": "one"}]
+
+
+def test_a_stale_counter_left_by_an_older_odin_cannot_pull_a_revision_backwards(sink, ecs, stores):
+    # The other direction of the same shape: a counter that is present but
+    # LOWER than the real revisions. Nothing reads it any more, so it cannot
+    # steer a register onto a live key.
+    runtime = FakeTaskRuntime()
+    _register_taskdef(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+    stores.ecsctl.set(ENV, "taskdef-rev:app", 1)
+
+    assert _register_taskdef(stores, sink, ecs, runtime)["revision"] == 3
+
+
+def test_two_concurrent_registers_for_one_family_get_two_distinct_revisions(stores):
+    """No hand-edited store at all: choosing a revision and writing it used to
+    be `get()` + `set()`, two separate lock acquisitions, so two registers in
+    flight both saw the counter as 0, both claimed revision 1, and the loser's
+    task definition simply vanished under the winner's. Measured on the old
+    code:
+
+        revisions claimed : {'B': 1, 'A': 1}
+        taskdef:app:1     : [{'name': 'A'}]     <- B's registration is gone
+        taskdef:app:2     : None
+
+    The claim is now `stores.ecsctl.update`, which writes only while the key is
+    still free, plus a re-derive on loss.
+
+    The rendezvous is what makes this a real test rather than a hopeful one.
+    Simply starting two threads does not reproduce it -- each register is fast
+    enough that one finishes before the other begins, and a version of this
+    test without the barrier passed against a deliberately broken claim. So
+    both threads are held INSIDE the window, between reading the store and
+    writing to it, at the real seam `_taskdef_revisions` reads (`items`). The
+    `assert reached == 2` at the end is the fault injection proving it fired
+    (honesty rule 4: verify the harness before believing the result)."""
+    original_items = stores.ecsctl.items
+    barrier = threading.Barrier(2)
+    arrivals = itertools.count()
+    reached = 0
+
+    def items_then_wait(env: str) -> dict:
+        nonlocal reached
+        snapshot = original_items(env)
+        # Only the FIRST call from each thread rendezvous; the loser's retry
+        # must not block on an already-spent barrier.
+        if next(arrivals) < 2:
+            barrier.wait(timeout=5)
+            reached += 1
+        return snapshot
+
+    stores.ecsctl.items = items_then_wait
+    claimed: dict[str, int] = {}
+
+    def racer(tag: str) -> None:
+        payload = {"family": "app", "containerDefinitions": [{"name": tag}]}
+        response = ecsctl._register_task_definition(payload, ENV, stores, FakeTaskRuntime())
+        claimed[tag] = json.loads(response.body)["taskDefinition"]["revision"]
+
+    threads = [threading.Thread(target=racer, args=(tag,)) for tag in ("A", "B")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert reached == 2, "both registers must really have been held in the window"
+    assert sorted(claimed.values()) == [1, 2]
+    survivors = {
+        ecsctl._taskdef(stores, ENV, "app", revision)["container_definitions"][0]["name"]
+        for revision in (1, 2)
+    }
+    assert survivors == {"A", "B"}, "both registrations must survive"
+
+
+def test_register_task_definition_without_a_family_is_refused(sink, ecs, stores):
+    """botocore's own ecs model marks `family` required and a real boto3 client
+    refuses it client-side, so a request that arrives without one came from a
+    raw HTTP client. Accepting it minted `taskdef::1` under the ARN
+    `...task-definition/:1` -- a record keyed by nothing, which no later call
+    can name and therefore no later call can delete."""
+    response = ecsctl._register_task_definition({"containerDefinitions": []}, ENV, stores, FakeTaskRuntime())
+
+    assert response.status_code == 400
+    assert json.loads(response.body)["__type"] == "InvalidParameterException"
+    assert b"family" in response.body
+    assert stores.ecsctl.items(ENV) == {}
+
+
+def test_create_service_without_a_service_name_is_refused(sink, ecs, stores):
+    # Same shape, same reason: `serviceName` is required in botocore's model,
+    # and accepting an empty one keyed the record `service:default:`.
+    runtime = FakeTaskRuntime()
+    _create_cluster(stores, sink, ecs, runtime)
+    _register_taskdef(stores, sink, ecs, runtime)
+
+    response = ecsctl._create_service({"cluster": "odin", "taskDefinition": "app"}, ENV, stores, runtime)
+
+    assert response.status_code == 400
+    assert json.loads(response.body)["__type"] == "InvalidParameterException"
+    assert b"serviceName" in response.body
+    assert not [key for key in stores.ecsctl.items(ENV) if key.startswith("service:")]
+
+
+def test_a_not_found_message_names_the_empty_identifier_instead_of_trailing_off(stores):
+    # `f"Service not found: {name}"` rendered "Service not found: " -- a
+    # non-empty string that communicates nothing, so `errors.exc_text`'s
+    # empty-string guard could not help either.
+    assert b"Service not found: (none given)" in ecsctl._not_found_service("").body
+    assert b"Unable to describe task definition: (none given)" in ecsctl._not_found_taskdef("").body
+    assert b"Cluster not found: (none given)" in ecsctl._not_found_cluster("").body
 
 
 def test_describe_task_definition_unknown_is_client_exception(sink, ecs, stores):

@@ -19,7 +19,8 @@ import pytest
 from botocore.parsers import create_parser
 from starlette.responses import Response
 
-from odin.compute.proxy import ProxyListener
+from odin.compute.proxy import PortsUnpublished, ProxyListener
+from odin.gateway import wiring
 from odin.gateway.classify import classify
 from odin.gateway.models import elbv2ctl
 from odin.gateway.stores import SynthStores
@@ -454,6 +455,122 @@ def test_registering_into_an_unknown_target_group_is_a_real_not_found(stores, si
     req = sink.call(lambda: elbv2.register_targets(TargetGroupArn=bogus, Targets=[{"Id": "i-1"}]))
     parsed = _parse("RegisterTargets", _answer(stores, req, proxy), error=True)
     assert parsed["Error"]["Code"] == "TargetGroupNotFound"
+
+
+# --- upgrade safety: an OLDER record must not brick a read ------------------
+# `records.py::TargetGroup` types `health_check` as a bare mapping on purpose,
+# so a target group written before a member existed still LOADS. That makes the
+# reader the half that has to tolerate it -- and `_tg_xml` used to hard-index
+# all eight `_HEALTH_CHECK_DEFAULTS` keys, so such a record raised `KeyError` on
+# every DescribeTargetGroups, which is the read terraform does BEFORE it could
+# send anything that would repair the record.
+
+
+def _older_tg_record(stores, *, without: str) -> dict:
+    """A target group exactly as today's writer stores one, minus one
+    health-check member -- i.e. one written by an odin from before that member
+    was added."""
+    record = {
+        "name": TG, "tg_id": "def456", "arn": elbv2ctl.tg_arn(TG, "def456"),
+        "protocol": "HTTP", "protocol_version": "HTTP1", "port": 80, "vpc_id": "vpc-1",
+        "target_type": "ip", "ip_address_type": "ipv4",
+        "health_check": {k: v for k, v in elbv2ctl._HEALTH_CHECK_DEFAULTS.items() if k != without},
+        "matcher": {"HttpCode": "200", "GrpcCode": None},
+        "attributes": dict(elbv2ctl._TG_ATTRIBUTE_DEFAULTS),
+    }
+    stores.elbv2ctl.set(ENV, f"tg:{TG}", record)
+    return record
+
+
+def test_describe_target_groups_answers_for_a_record_missing_a_health_check_member(stores, sink, elbv2, proxy):
+    _older_tg_record(stores, without="HealthCheckEnabled")
+
+    req = sink.call(lambda: elbv2.describe_target_groups(Names=[TG]))
+    (described,) = _parse("DescribeTargetGroups", _answer(stores, req, proxy))["TargetGroups"]
+
+    # Real AWS's own default is filled in, NOT omitted: an omitted member reads
+    # as unset in the provider's schema and makes the next plan dirty (the same
+    # zero-drift rule `_LB_ATTRIBUTE_DEFAULTS` documents).
+    assert described["HealthCheckEnabled"] is True
+    assert described["HealthCheckPath"] == "/"
+
+
+def test_describe_target_health_answers_for_a_record_missing_the_health_check_path(stores, sink, elbv2, proxy):
+    # The sibling read: `_probe_target` hard-indexed `HealthCheckPath` the same
+    # way, so DescribeTargetHealth was the second permanent 500.
+    record = _older_tg_record(stores, without="HealthCheckPath")
+    stores.elbv2ctl.set(ENV, f"targets:{TG}", [{"id": "10.0.0.9", "port": 1}])
+
+    req = sink.call(lambda: elbv2.describe_target_health(TargetGroupArn=record["arn"]))
+    parsed = _parse("DescribeTargetHealth", _answer(stores, req, proxy))
+
+    (description,) = parsed["TargetHealthDescriptions"]
+    # Nothing is listening on that address, so the honest answer is unhealthy --
+    # the point is that it ANSWERS instead of raising.
+    assert description["TargetHealth"]["State"] == "unhealthy"
+
+
+def test_modify_target_group_heals_a_record_that_predates_a_member(stores, sink, elbv2, proxy):
+    _older_tg_record(stores, without="HealthCheckEnabled")
+
+    req = sink.call(lambda: elbv2.modify_target_group(
+        TargetGroupArn=elbv2ctl.tg_arn(TG, "def456"), HealthCheckPath="/ready",
+    ))
+    _parse("ModifyTargetGroup", _answer(stores, req, proxy))
+
+    # The next WRITE carries the full member set forward, so the gap does not
+    # travel with the record forever.
+    assert "HealthCheckEnabled" in stores.elbv2ctl.get(ENV, f"tg:{TG}")["health_check"]
+
+
+# --- a host port of 0 is not an endpoint ------------------------------------
+
+
+def test_endpoint_url_is_none_for_a_stored_host_port_of_zero(stores, sink, elbv2, proxy):
+    """A record written by odin <= v0.7.5, whose `host_port` ended
+    `return int(...) if out else 0` and turned any transient `docker` failure
+    into a port-shaped 0. Load-balancer records are only rewritten by a
+    converge, so the 0 persists -- and `gateway/wiring.py::producer_facts`
+    INJECTS the resulting `ALB_ENDPOINT` into a real consumer container.
+    Measured before this clause: `producer_facts()` answered
+    `{'web': {'ALB_ENDPOINT': 'http://127.0.0.1:0'}}`."""
+    _create_lb(stores, sink, elbv2, proxy)
+    record = stores.elbv2ctl.get(ENV, f"lb:{LB}")
+    stores.elbv2ctl.set(ENV, f"lb:{LB}", {**record, "state": "active", "endpoints": {"80": 0}})
+
+    stored = stores.elbv2ctl.get(ENV, f"lb:{LB}")
+    assert elbv2ctl.endpoint_url(stored) is None
+    assert wiring.producer_facts(stores, ENV) == {}
+
+
+def test_a_proxy_that_cannot_publish_leaves_the_load_balancer_failed_and_factless(stores, sink, elbv2, proxy):
+    """`compute/proxy.py::ensure` raises `PortsUnpublished` rather than
+    returning a 0, so `_converge_safely` records the honest outcome: state
+    `failed`, the real reason, and NO `ALB_ENDPOINT` for anything to consume.
+
+    The load balancer converged successfully first, which is the case worth
+    pinning: `_converge_safely` leaves the previous converge's `endpoints` on
+    the record, so before the state gate this failed load balancer went on
+    advertising the host port its now-dead container used to answer on."""
+    _create_lb(stores, sink, elbv2, proxy)
+    elbv2ctl.converge_proxy(stores, ENV, LB, proxy)
+    assert wiring.producer_facts(stores, ENV) != {}  # it really was published
+
+    class UnpublishableProxy(FakeProxy):
+        def ensure(self, root, env, lb_name, listeners):
+            raise PortsUnpublished(
+                'odin-alb-default-web published no host port for [80] (container is exited); '
+                'last log lines: nginx: [emerg] invalid parameter "bogus:8080"'
+            )
+
+    elbv2ctl._converge_safely(stores, ENV, LB, UnpublishableProxy())
+
+    record = stores.elbv2ctl.get(ENV, f"lb:{LB}")
+    assert record["state"] == "failed"
+    assert "invalid parameter" in record["state_reason"]
+    assert record["endpoints"] == {"80": 40080}  # the last converge's result, kept
+    assert elbv2ctl.endpoint_url(record) is None  # but no longer an address
+    assert wiring.producer_facts(stores, ENV) == {}
 
 
 # --- the no-backing contract ------------------------------------------------

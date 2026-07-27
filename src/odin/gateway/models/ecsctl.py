@@ -71,13 +71,17 @@ the honest fallback the brief allows: document it as a known re-register
 (research observed the same class of issue against MiniStack).
 
 Persistence: one `JsonStore` at `.odin/{env}/gateway/ecsctl.json`
-(`stores.ecsctl`), flat keys `"cluster:{name}"`, `"taskdef-rev:{family}"`
-(the per-family revision counter), `"taskdef:{family}:{revision}"`,
-`"service:{cluster}:{name}"`, `"task:{cluster}:{task_id}"` -- four disjoint
-prefixes (`"taskdef:"` never collides with `"taskdef-rev:"`, `"task:"` never
+(`stores.ecsctl`), flat keys `"cluster:{name}"`,
+`"taskdef:{family}:{revision}"`, `"service:{cluster}:{name}"`,
+`"task:{cluster}:{task_id}"` -- three disjoint prefixes (`"task:"` never
 matches `"taskdef..."` -- the 5th character disagrees) sharing one flat
 namespace, the exact convention ec2net/ec2compute already use for their own
-multi-kind stores. Service TAGS live in the shared `stores.tags` store
+multi-kind stores. There is NO per-family revision counter: the next revision
+is derived from the `"taskdef:"` keys themselves (`_taskdef_revisions`), because
+a `"taskdef-rev:{family}"` counter is a second copy of the truth that could go
+missing and let a register overwrite a live revision. Stores written by earlier
+odins still carry that key and `records.py` still validates it; nothing reads
+it. Service TAGS live in the shared `stores.tags` store
 (lambdactl's exact convention), keyed `"ecs:{serviceArn}"`, so a `tags`
 block on `aws_ecs_service` round-trips (DescribeServices echoes it;
 `TagResource`/`UntagResource`/`ListTagsForResource` are modeled) instead of
@@ -193,10 +197,6 @@ _Handler = Callable[[dict, str, SynthStores, TaskRuntime, KeyStore | None, int |
 
 def _cluster_key(name: str) -> str:
     return f"cluster:{name}"
-
-
-def _taskdef_counter_key(family: str) -> str:
-    return f"taskdef-rev:{family}"
 
 
 def _taskdef_key(family: str, revision: int) -> str:
@@ -316,9 +316,41 @@ def _tags_for(stores: SynthStores, env: str, arn: str) -> dict[str, str]:
     return stores.tags.get(env, f"ecs:{arn}", {})
 
 
+def _taskdef_revisions(stores: SynthStores, env: str, family: str) -> list[int]:
+    """Every revision `family` really has a stored task definition for,
+    ascending -- read off the `taskdef:{family}:{revision}` KEYS THEMSELVES.
+
+    It used to come from a separate `taskdef-rev:{family}` counter, and a
+    second copy of the truth is a copy that can disagree with it. `.get(...,
+    0)` on a missing counter made `_latest_active_taskdef` answer None for a
+    family that HAS live revisions, so the next RegisterTaskDefinition minted
+    revision 1 again and OVERWROTE the live one. Measured end to end against
+    the real handlers and a real on-disk store, after dropping just the counter
+    key -- the state a user's own repair of `gateway/ecsctl.json` leaves
+    behind, and `stores.py::_data` is what tells them to repair it:
+
+        keys on disk          : ['taskdef:web:1']
+        _latest_active_taskdef: None
+        register #2 ->  .../task-definition/web:1   [alpine:3.21]
+        taskdef:web:1 now     : [alpine:3.21]  <- revision 1 OVERWRITTEN
+
+    Depends on ONE invariant, which holds today and is worth stating because a
+    future change could break it silently: nothing ever DELETES a `taskdef:`
+    key. DeregisterTaskDefinition marks the record INACTIVE and keeps it (real
+    AWS never reuses a revision number either), and the only other removals in
+    this module are services, tasks and clusters. A delete added later would
+    have to leave a tombstone or revision numbers would start being reused.
+
+    The digit test on the suffix is what keeps families disjoint: for family
+    `a`, a key `taskdef:a:b:1` (family `a:b`) has the right prefix and a
+    non-numeric suffix, so it is skipped rather than miscounted."""
+    prefix = f"taskdef:{family}:"
+    suffixes = [key.removeprefix(prefix) for key in stores.ecsctl.items(env) if key.startswith(prefix)]
+    return sorted(int(suffix) for suffix in suffixes if suffix.isdigit())
+
+
 def _latest_active_taskdef(stores: SynthStores, env: str, family: str) -> dict | None:
-    latest = stores.ecsctl.get(env, _taskdef_counter_key(family), 0)
-    for revision in range(latest, 0, -1):
+    for revision in reversed(_taskdef_revisions(stores, env, family)):
         taskdef = _taskdef(stores, env, family, revision)
         if taskdef is not None and taskdef["status"] == "ACTIVE":
             return taskdef
@@ -341,16 +373,52 @@ def _json(payload: dict) -> Response:
     return Response(json.dumps(body), media_type="application/x-amz-json-1.0")
 
 
+# What a message says when the identifier it was about to interpolate is empty.
+# Not cosmetic: `f"Service not found: {name}"` rendered `"Service not found: "`,
+# a non-empty string that communicates nothing, so `errors.exc_text`'s
+# empty-string guard could not help either -- the caller is told a name is
+# wrong and never which, when the real answer is that no name was sent.
+_UNNAMED = "(none given)"
+
+
+def _missing_parameter(name: str) -> Response:
+    """A required identifier the request simply didn't carry.
+
+    Rejecting rather than accepting, decided by measurement rather than taste:
+    botocore's OWN ecs model marks `family` (RegisterTaskDefinition) and
+    `serviceName` (CreateService) `required`, and a real boto3 client refuses
+    them client-side before a byte goes out --
+
+        RegisterTaskDefinition required: ['family', 'containerDefinitions']
+        CreateService          required: ['serviceName']
+        register_task_definition -> ParamValidationError: Missing required
+                                    parameter in input: "family"
+
+    -- so a request that reaches odin without one came from a raw HTTP client,
+    never from terraform. Accepting it minted the record `taskdef::1` under the
+    ARN `...task-definition/:1`, and `service:default:` for a nameless service:
+    records keyed by nothing, which no later call can name and therefore no
+    later call can delete. `InvalidParameterException` is the code this module
+    already answers other parameter complaints with (`_create_service`'s
+    non-idempotent case); the wording is odin's own, not a claim about real
+    ECS's exact prose."""
+    return errors.synth_error(
+        "ecs", "InvalidParameterException", f"{name} is a required parameter and was not supplied", 400,
+    )
+
+
 def _not_found_cluster(name: str) -> Response:
-    return errors.synth_error("ecs", "ClusterNotFoundException", f"Cluster not found: {name}", 400)
+    return errors.synth_error("ecs", "ClusterNotFoundException", f"Cluster not found: {name or _UNNAMED}", 400)
 
 
 def _not_found_service(name: str) -> Response:
-    return errors.synth_error("ecs", "ServiceNotFoundException", f"Service not found: {name}", 400)
+    return errors.synth_error("ecs", "ServiceNotFoundException", f"Service not found: {name or _UNNAMED}", 400)
 
 
 def _not_found_taskdef(ref: str) -> Response:
-    return errors.synth_error("ecs", "ClientException", f"Unable to describe task definition: {ref}", 400)
+    return errors.synth_error(
+        "ecs", "ClientException", f"Unable to describe task definition: {ref or _UNNAMED}", 400,
+    )
 
 
 def _cluster_wire(stores: SynthStores, env: str, cluster: dict) -> dict:
@@ -1190,15 +1258,41 @@ def _delete_cluster(
 # --- TaskDefinition ----------------------------------------------------------
 
 
+def _claim_revision(stores: SynthStores, env: str, family: str, build: Callable[[int], dict]) -> dict:
+    """Store `build(revision)` under the first revision number that is FREE for
+    `family`, and return what was stored.
+
+    The claim is `stores.ecsctl.update`, whose read-modify-write is atomic under
+    the env lock, and the mutator writes ONLY when the key is still absent -- so
+    a register cannot overwrite a live revision for any reason, not just the
+    missing-counter one. `get()` + `set()`, what this replaced, is two separate
+    lock acquisitions and therefore a lost update; measured with two concurrent
+    registers for one family and NO hand-edited store at all:
+
+        revisions claimed  : {'B': 1, 'A': 1}
+        taskdef:web:1      : [{'name': 'A'}]     <- B's registration is gone
+        taskdef:web:2      : None
+
+    The loop is the retry that makes the atomic claim useful: losing the race
+    means re-deriving the next free number, which is now one higher."""
+    while True:
+        revision = (_taskdef_revisions(stores, env, family) or [0])[-1] + 1
+        claimed = stores.ecsctl.update(
+            env, _taskdef_key(family, revision),
+            lambda current, revision=revision: build(revision) if current is None else NO_CHANGE,
+        )
+        if claimed is not NO_CHANGE:
+            return claimed
+
+
 def _register_task_definition(
     payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
 ) -> Response:
     family = payload.get("family", "")
-    counter_key = _taskdef_counter_key(family)
-    revision = stores.ecsctl.get(env, counter_key, 0) + 1
-    stores.ecsctl.set(env, counter_key, revision)
-    taskdef = {
+    if not family:
+        return _missing_parameter("family")
+    taskdef = _claim_revision(stores, env, family, lambda revision: {
         "family": family,
         "revision": revision,
         "container_definitions": payload.get("containerDefinitions") or [],  # verbatim, see module docstring
@@ -1212,8 +1306,7 @@ def _register_task_definition(
         "status": "ACTIVE",
         "registered_at": time.time(),
         "deregistered_at": None,
-    }
-    stores.ecsctl.set(env, _taskdef_key(family, revision), taskdef)
+    })
     return _json({"taskDefinition": _taskdef_wire(taskdef), "tags": []})
 
 
@@ -1254,6 +1347,8 @@ def _create_service(
     if cluster is None:
         return _not_found_cluster(cluster_name)
     service_name = payload.get("serviceName", "")
+    if not service_name:
+        return _missing_parameter("serviceName")
     existing = _service(stores, env, cluster_name, service_name)
     if existing is not None and existing["status"] == "ACTIVE":
         return errors.synth_error(

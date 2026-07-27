@@ -13,11 +13,30 @@ the method names as `sequence()`, because the thing worth pinning about
 (copy + SIGHUP, nothing restarted) versus recreate (stop + run). A test that
 only looked at `runs`/`stopped` would pass on an implementation that also
 needlessly signalled, or that reloaded a container it had just recreated.
+
+`FakeRuntime.host_port` ANSWERS THE WAY REAL DOCKER DOES, and that is the
+load-bearing part of this file rather than a detail. It used to return 0 for
+any container it had no port for, including one that does not exist -- and
+because of that this suite passed while `ensure` was, on the real runtime,
+incapable of creating a load balancer at all. Probed against real docker
+28.4.0 on Colima (2026-07-27):
+
+    absent     ColimaRuntime.host_port -> raises PortUnreadable
+                 ("error: no such object: <name>")
+    exited     docker inspect ports {}  -> host_port 0
+    running    {"80/tcp":[{"HostPort":"34011"}]} -> host_port 34011
+
+so the fake raises for absent and answers 0 for anything not running. Honesty
+rule 1's "probe the real component and print what it returns" applies to a
+test double as much as to a guard: a double that is wrong about the upstream
+proves the parser and hides the integration.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+
+import pytest
 
 from odin.compute.proxy import (
     CONF_PATH_IN_CONTAINER,
@@ -25,6 +44,7 @@ from odin.compute.proxy import (
     IMAGE,
     RELOAD_SIGNAL,
     LoadBalancerProxy,
+    PortsUnpublished,
     ProxyListener,
     _ENTRY_COMMAND,
     conf_path,
@@ -32,7 +52,7 @@ from odin.compute.proxy import (
     render_conf,
     target_address,
 )
-from odin.runtime.colima import CONTAINER_HOST, ContainerSpec
+from odin.runtime.colima import CONTAINER_HOST, ContainerSpec, PortUnreadable
 
 ENV = "default"
 LB = "web"
@@ -56,6 +76,11 @@ class FakeRuntime:
     # What `run_container` publishes for each container port it is asked for,
     # standing in for Docker's own free-port pick when the spec says host 0.
     next_ports: dict[int, int] = field(default_factory=dict)
+    # `docker logs` output per container -- what a failed converge quotes.
+    logtails: dict[str, str] = field(default_factory=dict)
+    # The status `run_container` leaves behind, so a test can model a container
+    # the daemon started and whose process died before anything read its ports.
+    status_after_run: str = "running"
 
     def status(self, name: str) -> str:
         self.calls.append(("status", name))
@@ -63,7 +88,17 @@ class FakeRuntime:
 
     def host_port(self, name: str, container_port: int) -> int:
         self.calls.append(("host_port", name, container_port))
+        # See the module docstring: real docker raises for a container it has
+        # never heard of and answers 0 for one that is not running.
+        if self.statuses.get(name, "absent") == "absent":
+            raise PortUnreadable(f"docker cannot read {name}'s published ports: no such object: {name}")
+        if self.statuses[name] != "running":
+            return 0
         return self.ports.get((name, container_port), 0)
+
+    def logs(self, name: str, tail: int = 20) -> str:
+        self.calls.append(("logs", name, tail))
+        return self.logtails.get(name, "")
 
     def stop(self, name: str) -> None:
         self.calls.append(("stop", name))
@@ -74,7 +109,7 @@ class FakeRuntime:
     def run_container(self, spec: ContainerSpec) -> None:
         self.calls.append(("run_container", spec.name))
         self.runs.append(spec)
-        self.statuses[spec.name] = "running"
+        self.statuses[spec.name] = self.status_after_run
         for container_port in spec.ports:
             self.ports[(spec.name, container_port)] = self.next_ports.get(container_port, 0)
 
@@ -202,11 +237,17 @@ def test_ensure_first_create_runs_nginx_then_copies_the_config_in(tmp_path):
     assert host_conf.read_text() == render_conf(listeners)
 
     # Absent container => stop (idempotent pre-clean) then run, never a signal.
+    # `status` comes FIRST and no port is read before the container exists:
+    # `host_port` raises `PortUnreadable` on an absent container, so the old
+    # order (read the ports, then look at the status) made this very call --
+    # every first converge of every new load balancer -- raise before it could
+    # create anything. Measured against real docker before the fix:
+    # "ensure() #1 (fresh): PortUnreadable: docker cannot read
+    #  odin-alb-p1a-fresh-lb1's published ports: error: no such object".
     assert runtime.sequence() == [
-        "host_port", "host_port",  # nothing published yet -> both 0
-        "status",                  # "absent"
+        "status",                  # "absent" -> nothing to read a port off
         "stop", "run_container", "copy_in",
-        "host_port", "host_port",  # re-read AFTER the run: the real ports
+        "host_port", "host_port",  # read AFTER the run: the real ports
     ]
 
     (spec,) = runtime.runs
@@ -257,7 +298,7 @@ def test_ensure_reloads_with_a_hup_when_the_container_already_publishes_every_po
     # Zero downtime: the config is rewritten and copied in, then nginx re-reads
     # it on SIGHUP. Nothing is stopped or re-run, so no in-flight request is
     # dropped by a target change.
-    assert runtime.sequence() == ["host_port", "status", "copy_in", "signal"]
+    assert runtime.sequence() == ["status", "host_port", "copy_in", "signal"]
     assert runtime.runs == []
     assert ("signal", NAME, RELOAD_SIGNAL) in runtime.calls
     assert RELOAD_SIGNAL == "HUP"
@@ -281,8 +322,8 @@ def test_ensure_recreates_when_a_wanted_port_is_not_published_yet(tmp_path):
 
     assert published == {80: 32768, 443: 32769}
     assert runtime.sequence() == [
+        "status",                  # "running", so the ports are readable
         "host_port", "host_port",  # 80 -> 32768, 443 -> 0 (not published)
-        "status",                  # "running", but a port is missing
         "stop", "run_container", "copy_in",
         "host_port", "host_port",
     ]
@@ -292,7 +333,8 @@ def test_ensure_recreates_when_a_wanted_port_is_not_published_yet(tmp_path):
 
 def test_ensure_recreates_a_crashed_container_rather_than_signalling_it(tmp_path):
     # `docker kill -s HUP` on an exited container reloads nothing; the only way
-    # back to serving is a re-run.
+    # back to serving is a re-run. No port is read off the exited container --
+    # real docker answers `{}` for one, so the read could only ever say 0.
     runtime = FakeRuntime(
         statuses={NAME: "exited"}, ports={(NAME, 80): 32768}, next_ports={80: 32768},
     )
@@ -300,8 +342,78 @@ def test_ensure_recreates_a_crashed_container_rather_than_signalling_it(tmp_path
     LoadBalancerProxy(runtime).ensure(tmp_path, ENV, LB, (_listener(80),))
 
     assert runtime.sequence() == [
-        "host_port", "status", "stop", "run_container", "copy_in", "host_port",
+        "status", "stop", "run_container", "copy_in", "host_port",
     ]
+
+
+# --- ensure: a publish failure never becomes an endpoint --------------------
+# `ensure`'s return value is written straight onto the load-balancer record as
+# `endpoints`, which `elbv2ctl.endpoint_url` turns into `ALB_ENDPOINT` and
+# `gateway/wiring.py::producer_facts` INJECTS INTO A REAL CONSUMER CONTAINER.
+# A host port of 0 is "nothing is published", so returning one hands a workload
+# `http://127.0.0.1:0` behind a load balancer reporting `active`/healthy.
+
+
+def test_ensure_refuses_to_return_a_zero_port_from_the_recreate_path(tmp_path):
+    # The container the daemon started is gone by the time its ports are read --
+    # nginx rejecting the rendered config and exiting is the real way this
+    # happens, and real docker then reports the port map as `{}` (measured:
+    # "t=+0.2s status=exited host_port=0").
+    runtime = FakeRuntime(status_after_run="exited", logtails={
+        NAME: 'nginx: [emerg] invalid parameter "bogus:8080" in /etc/nginx/conf.d/odin.conf:2',
+    })
+
+    with pytest.raises(PortsUnpublished) as raised:
+        LoadBalancerProxy(runtime).ensure(tmp_path, ENV, LB, (_listener(80),))
+
+    # Honesty rule 2: the reason names the resource, its real state, and WHY --
+    # not just "failed". `elbv2ctl._converge_safely` stores this as the load
+    # balancer's `State.Reason`.
+    message = str(raised.value)
+    assert NAME in message
+    assert "[80]" in message
+    assert "container is exited" in message
+    assert "invalid parameter" in message
+
+
+def test_ensure_refuses_a_zero_port_even_when_only_one_listener_is_dead(tmp_path):
+    # All-or-nothing: a load balancer with a live :80 and a dead :443 has no
+    # honest `endpoints` map to publish, because a consumer that resolves the
+    # second one gets a dead address.
+    runtime = FakeRuntime(next_ports={80: 32768})  # 443 publishes nothing
+
+    with pytest.raises(PortsUnpublished) as raised:
+        LoadBalancerProxy(runtime).ensure(tmp_path, ENV, LB, (_listener(80), _listener(443)))
+
+    assert "[443]" in str(raised.value)
+
+
+def test_ensure_never_returns_a_zero_port_on_the_reload_path_either(tmp_path):
+    # The SHAPE, not the instance: the reload path carried this check inline
+    # (`all(published.values())`) while the recreate path had none. Both now
+    # return through the same gate, so a running container that has lost a
+    # published port is recreated -- and if THAT still publishes nothing, the
+    # answer is a refusal, never a 0.
+    runtime = FakeRuntime(statuses={NAME: "running"}, ports={(NAME, 80): 0})
+
+    with pytest.raises(PortsUnpublished):
+        LoadBalancerProxy(runtime).ensure(tmp_path, ENV, LB, (_listener(80),))
+
+    assert "run_container" in runtime.sequence()  # it did try a recreate first
+
+
+def test_ensure_creates_the_container_when_it_has_never_existed(tmp_path):
+    # The regression this ordering closes, stated on its own: `host_port` RAISES
+    # on an absent container (that is how "could not ask" stays distinct from
+    # "nothing published"), so reading ports before checking the status made
+    # every CreateLoadBalancer die with PortUnreadable and create nothing.
+    runtime = FakeRuntime(next_ports={IDLE_LISTEN_PORT: 32700})
+    assert runtime.statuses == {}  # nothing exists
+
+    published = LoadBalancerProxy(runtime).ensure(tmp_path, ENV, LB, ())
+
+    assert published == {IDLE_LISTEN_PORT: 32700}
+    assert [spec.name for spec in runtime.runs] == [NAME]
 
 
 # --- destroy / target_address ----------------------------------------------

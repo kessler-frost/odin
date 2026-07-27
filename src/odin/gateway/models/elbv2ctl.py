@@ -133,6 +133,14 @@ _DNS_NAME = "127.0.0.1"
 _PROBE_HOST = "127.0.0.1"
 _PROBE_TIMEOUT_SECONDS = 0.3
 
+# The three load-balancer states this model emits, spelled once. `records.py`'s
+# `_LB_STATE` is the same three values and must stay in step. `_LB_ACTIVE` is
+# what terraform's own waiter polls for, and what `endpoint_url` requires before
+# it will call a recorded host port an address.
+_LB_PROVISIONING = "provisioning"
+_LB_ACTIVE = "active"
+_LB_FAILED = "failed"
+
 _DEFAULT_TYPE = "application"
 _DEFAULT_SCHEME = "internet-facing"
 _DEFAULT_IP_ADDRESS_TYPE = "ipv4"
@@ -424,15 +432,42 @@ def _lb_xml(record: dict) -> str:
     )
 
 
+def _stored_health_check(record: dict) -> dict:
+    """A target group's health-check members with real AWS's own default filled
+    in for any member the STORED record doesn't carry.
+
+    An older record is not a corrupt one. `_tg_xml` used to hard-index all
+    eight `_HEALTH_CHECK_DEFAULTS` keys straight out of `record["health_check"]`,
+    so a target group written before a member was added raised `KeyError` on
+    EVERY DescribeTargetGroups -- measured on a record that validates and loads
+    perfectly well:
+
+        record LOADS through records.validate: True
+        DescribeTargetGroups      : RAISED KeyError: 'HealthCheckEnabled'
+        DescribeTargetGroups(name): RAISED KeyError: 'HealthCheckEnabled'
+
+    and DescribeTargetGroups is the read terraform does before it could send
+    anything that would repair the record, so the group is stuck. `records.py`
+    types `health_check` as a bare mapping deliberately, for exactly this: the
+    reader is the half that should tolerate, and this is the reader.
+
+    Filling the AWS DEFAULT rather than omitting the member is the same
+    zero-drift rule `_LB_ATTRIBUTE_DEFAULTS` documents -- an absent member reads
+    as unset in the provider's schema and makes the next plan dirty."""
+    stored = record.get("health_check") or {}
+    return {key: stored.get(key, default) for key, default in _HEALTH_CHECK_DEFAULTS.items()}
+
+
 def _tg_xml(record: dict, lb_arns: list[str]) -> str:
     matcher = record.get("matcher") or {}
+    health = _stored_health_check(record)
     return (
         _elem("TargetGroupArn", record["arn"])
         + _elem("TargetGroupName", record["name"])
         + _elem("Protocol", record.get("protocol"))
         + _elem("Port", record.get("port"))
         + _elem("VpcId", record.get("vpc_id"))
-        + "".join(_elem(key, record["health_check"][key]) for key in _HEALTH_CHECK_DEFAULTS)
+        + "".join(_elem(key, health[key]) for key in _HEALTH_CHECK_DEFAULTS)
         + (f"<Matcher>{_elem('HttpCode', matcher.get('HttpCode'))}{_elem('GrpcCode', matcher.get('GrpcCode'))}</Matcher>" if matcher else "")
         + _members("LoadBalancerArns", [escape(arn) for arn in lb_arns])
         + _elem("TargetType", record["target_type"])
@@ -566,7 +601,7 @@ def converge_proxy(stores: SynthStores, env: str, lb_name: str, proxy: LoadBalan
             if current is None:
                 return NO_CHANGE
             return {
-                **current, "state": "active", "state_reason": None,
+                **current, "state": _LB_ACTIVE, "state_reason": None,
                 "endpoints": {str(port): host_port for port, host_port in published.items()},
             }
 
@@ -585,7 +620,7 @@ def _converge_safely(stores: SynthStores, env: str, lb_name: str, proxy: LoadBal
         log.warning("load-balancer proxy failed for %s (env %s): %s", lb_name, env, exc)
         reason = exc_text(exc)
         stores.elbv2ctl.update(env, _lb_key(lb_name), lambda current: (
-            NO_CHANGE if current is None else {**current, "state": "failed", "state_reason": reason}
+            NO_CHANGE if current is None else {**current, "state": _LB_FAILED, "state_reason": reason}
         ))
 
 
@@ -666,10 +701,42 @@ def _deregister(stores: SynthStores, env: str, arn: str, targets: list[dict], pr
 def endpoint_url(record: dict) -> str | None:
     """`http://127.0.0.1:{port}` for the load balancer's FIRST listener -- the
     genuinely reachable address the DNSName can't carry (see `_DNS_NAME`).
-    None until the proxy is published."""
+    None until the proxy is published, AND None for a host port of 0, which is
+    not a port but "nothing is published".
+
+    That second clause is not defensive padding, it reads a signal that really
+    arrives: `compute/proxy.py::_require_published` now stops a 0 at the
+    writer, but every store written by odin <= v0.7.5 can already hold one on
+    disk, because `host_port` back then ended `return int(...) if out else 0`
+    and turned any transient `docker` failure into a port-shaped 0 (commit
+    a67b218's own account). A load-balancer record is only rewritten by a
+    converge, so such a record keeps its 0 indefinitely. Measured on a real
+    persisted record before this clause existed:
+
+        stored endpoints    : {'80': 0}
+        endpoint_url()      : http://127.0.0.1:0
+        producer_facts()    : {'web': {'ALB_ENDPOINT': 'http://127.0.0.1:0'}}
+
+    -- and `gateway/wiring.py` injects that `ALB_ENDPOINT` into a real consumer
+    container, which is the whole harm. `wiring.producer_facts` skips a
+    producer whose endpoint is None (it gates rds/elasticache/ec2 the same
+    way), so answering None here is what withholds it.
+
+    GATED ON `active` for the same reason, found by the test that pins the
+    clause above. `endpoints` is the RESULT of the last converge, and
+    `_converge_safely` records a failure by setting `state: failed` while
+    leaving `endpoints` exactly as the last SUCCESSFUL converge left them --
+    so a load balancer whose nginx container is gone kept advertising the host
+    port it used to answer on. `wiring.producer_facts` had no state gate for
+    `lb:` records (it has one for rds, elasticache and ec2), so that stale
+    address went on being injected into consumers. This is the one place all
+    three readers -- `producer_facts`, `reconcile/tf_status.py` and
+    `DescribeLoadBalancerAttributes`' `odin.endpoint.url` -- go through, so
+    gating here gates all of them."""
     endpoints = record.get("endpoints") or {}
     ports = sorted(int(port) for port in endpoints)
-    return f"http://{_DNS_NAME}:{endpoints[str(ports[0])]}" if ports else None
+    host_port = endpoints[str(ports[0])] if ports and record.get("state") == _LB_ACTIVE else 0
+    return f"http://{_DNS_NAME}:{host_port}" if host_port else None
 
 
 # --- Load balancer ---------------------------------------------------------
@@ -717,7 +784,7 @@ def _create_load_balancer(params: dict[str, str], env: str, stores: SynthStores,
         # Honest asynchrony (module docstring): the REAL nginx container comes
         # up on a daemon thread, and `active` is what the provider's own
         # waiter polls for.
-        "state": "provisioning",
+        "state": _LB_PROVISIONING,
         "state_reason": None,
         "attributes": dict(_LB_ATTRIBUTE_DEFAULTS),
         "endpoints": {},
@@ -888,7 +955,9 @@ def _modify_target_group(params: dict[str, str], env: str, stores: SynthStores, 
         return _not_found("TargetGroupNotFound", f"Target group '{name}' not found")
     matcher = dict(record.get("matcher") or {})
     matcher.update({key: params[f"Matcher.{key}"] for key in ("HttpCode", "GrpcCode") if params.get(f"Matcher.{key}")})
-    updated = {**record, "health_check": _health_check(params, record["health_check"]), "matcher": matcher}
+    # `_stored_health_check` as the base, so the next write HEALS a record that
+    # predates a member instead of carrying the gap forward forever.
+    updated = {**record, "health_check": _health_check(params, _stored_health_check(record)), "matcher": matcher}
     stores.elbv2ctl.set(env, _tg_key(name), updated)
     # A changed health-check interval changes the proxy's passive `fail_timeout`.
     _converge_target_group(stores, env, name, proxy, spawn=True)
@@ -1068,8 +1137,11 @@ def _probe_target(stores: SynthStores, env: str, tg: dict, target: dict) -> tupl
     non-matching status is `unhealthy` with the actual reason (the same
     "report what the substrate really did" rule ec2/lambda/ecs verdicts
     follow). One bounded request per target, only on this action."""
-    health = tg["health_check"]
-    if not health.get("HealthCheckEnabled", True):
+    # Through `_stored_health_check` for the same reason `_tg_xml` is: this read
+    # hard-indexed `HealthCheckPath` and so DescribeTargetHealth was the SIBLING
+    # 500 on an older record (measured: `RAISED KeyError: 'HealthCheckPath'`).
+    health = _stored_health_check(tg)
+    if not health["HealthCheckEnabled"]:
         return "unused", "Target.HealthCheckDisabled", "Health checks are disabled for this target group"
     host = _target_host(stores, env, target)
     probe_host = _PROBE_HOST if host == CONTAINER_HOST else host
