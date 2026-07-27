@@ -465,3 +465,47 @@ def test_a_well_formed_security_group_still_loads(tmp_path: Path):
     birth commit."""
     stores = seed(tmp_path, "ec2net", _sg_record(False))
     assert stores.ec2net.get(ENV, "sg:sg-1")["rules"]["r1"]["is_egress"] is False
+
+
+# --- closed status sets ------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("store", "record"),
+    [
+        ("ecsctl", {"task:c:t1": {"cluster_name": "c", "service_name": "web", "task_id": "t1",
+                                  "container_name": "x", "task_arn": "a",
+                                  "task_definition_arn": "d", "last_status": "Running",
+                                  "desired_status": "RUNNING", "host_ports": {}}}),
+        ("ecsctl", {"service:c:web": {"cluster": "c", "service_name": "web",
+                                      "status": "active", "desired_count": 1,
+                                      "task_definition_arn": "d"}}),
+    ],
+    ids=["task-last_status-wrong-case", "service-status-wrong-case"],
+)
+def test_a_status_outside_the_closed_set_is_refused(tmp_path: Path, store, record):
+    """An unknown status is not merely unrecognised — every reader compares
+    these by EXACT string, so the record becomes invisible in every direction at
+    once. A task whose `last_status` is `"Running"` rather than `"RUNNING"` is
+    never counted running (`== "RUNNING"`), never counted failed
+    (`== "STOPPED"`), skipped by the drift sweep (`!= "RUNNING"`) AND treated as
+    live by `api/logs.py` (`!= "STOPPED"`) — so the service sits at 0/N forever
+    while the apply reports success.
+
+    The sets were enumerated from the WRITERS, not from AWS's much larger
+    vocabularies, and the whole suite passing is the evidence they are
+    exhaustive: 2376 tests drive the real writers and none produced a value
+    outside them."""
+    assert unreadable(seed(tmp_path, store, record), store).role == CONTROL
+
+
+def test_the_statuses_the_writers_really_produce_still_load(tmp_path: Path):
+    """The other direction: closing a set must not refuse a state odin itself
+    writes, or the guard bricks a healthy env."""
+    for status in ("PROVISIONING", "RUNNING", "STOPPED"):
+        record = {"task:c:t1": {"cluster_name": "c", "service_name": "web", "task_id": "t1",
+                                "container_name": "x", "task_arn": "a",
+                                "task_definition_arn": "d", "last_status": status,
+                                "desired_status": "RUNNING", "host_ports": {}}}
+        stores = seed(tmp_path / status, "ecsctl", record)
+        assert stores.ecsctl.get(ENV, "task:c:t1")["last_status"] == status

@@ -522,8 +522,11 @@ def stop() -> None:
     # server still held the store lock. So wait for the signal every other
     # liveness question in odin uses (the kernel lock, plus the pid while the
     # pidfile is still there), never a sleep. The server's lifespan stops
-    # every reconciler and the gateway thread before releasing the lock, which
-    # is why the wait is generous.
+    # every reconciler and the gateway listener before releasing the lock,
+    # which is why the wait is generous. (v0.7.7: the gateway is a TASK on this
+    # app's own loop, not a thread -- `gateway/app.py::serve_on_loop` -- so
+    # what the lifespan waits on is that task ending, not a thread join. The
+    # wait itself is unchanged; only what it is waiting for was ever a thread.)
     remaining = await_server_exit(ODIN_DIR, SHUTDOWN_GRACE)
     if remaining is not None:
         # Still up, so say so and exit 1 -- the pidfile stays, because it is

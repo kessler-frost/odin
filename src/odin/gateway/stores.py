@@ -44,6 +44,17 @@ class JsonStore:
     thread's write, or hand back a dict that changes size mid-`json.dumps`.
     Different envs never contend (separate locks), matching the store's own
     per-env file isolation.
+
+    v0.7.7 DE-THREADING VERDICT (verified): this is the ONE lock in odin that
+    genuinely DELETES rather than becoming an `asyncio.Lock`, and it is the
+    concurrency directive's "file I/O stays SYNCHRONOUS" rule that makes it so.
+    Every critical section here is `_data()` (a sync `_load`) plus
+    `_persist_locked()` (a sync `atomic_write_text`); the conversion adds no
+    `await` to any of them, so once every contender shares one event loop
+    nothing can preempt a read-modify-write and the lock has nothing left to
+    guard. It comes out only AFTER its last contender does -- the `_spawn`ed
+    daemon threads in `gateway/models/*` and the `to_thread` workers in
+    `reconcile/reconciler.py` and `server.py`.
     """
 
     def __init__(self, root: Path, name: str) -> None:

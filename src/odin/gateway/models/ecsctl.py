@@ -1108,6 +1108,16 @@ def wait_for_steady_services(
 # calls interleaved with REAL `docker stop`/`docker rm` calls via `runtime`.
 # The two locks protect different things at different granularities and
 # both stay.
+#
+# v0.7.7 DE-THREADING VERDICT (verified): becomes an `asyncio.Lock`. The
+# sentence directly above is also the reason -- a section "interleaved with
+# REAL `docker stop`/`docker rm` calls" is a section the conversion fills with
+# `await`s, and a task can be preempted at every one of them. `JsonStore`'s
+# per-env lock is the opposite case and really does get deleted (see
+# `gateway/stores.py`), which is precisely because its sections stay
+# await-free; do not read that deletion as a precedent for this one.
+# `_service_locks_guard` below DOES delete -- it guards only an await-free
+# `setdefault` into the registry (see `fabric/nebula.py`'s note).
 _service_locks: "weakref.WeakKeyDictionary[SynthStores, dict[tuple[str, str, str], threading.Lock]]" = weakref.WeakKeyDictionary()
 _service_locks_guard = threading.Lock()
 

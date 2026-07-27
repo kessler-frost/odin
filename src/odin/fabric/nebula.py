@@ -243,6 +243,26 @@ def _default_runner(args: list[str]) -> _Proc:
 # both received the identical overlay IP and both handshook with the
 # lighthouse under it, and one instance's id was never in `overlay.json` at
 # all. Different envs never contend (separate locks, separate files).
+#
+# v0.7.7 DE-THREADING VERDICT (verified per call site, and they DIFFER --
+# which is why this lock survives as an `asyncio.Lock` rather than being
+# deleted). Two of the three critical sections are pure local work that the
+# conversion leaves without a single `await`: `allocate_host_ip` (line ~536)
+# is load_overlay -> mutate -> save_overlay, and `allocate_lighthouse_port`
+# (line ~303) is file reads plus non-blocking UDP `bind` probes. The THIRD,
+# `ensure_network` (line ~725), calls `manager.create_ca()` and
+# `manager.sign_cert()` inside the section -- two real `nebula-cert`
+# subprocesses, which the conversion turns into `await`s. One shared lock
+# object serves all three, and a section that awaits is preemptible, so the
+# duplicate-overlay-IP collision recorded above comes straight back if this is
+# deleted rather than converted.
+#
+# `_overlay_locks_guard` is the OPPOSITE case and does delete: it guards only
+# the lazy `setdefault` into the registry dict below, which contains no
+# `await` at all, and a coroutine runs to completion between awaits. The same
+# split applies to every `*_locks_guard` in odin (`gateway/stores.py`,
+# `gateway/models/elbv2ctl.py`, `gateway/models/ecsctl.py`) -- the registry
+# guard goes, the per-key lock is decided on its own critical section.
 _overlay_locks: dict[str, threading.Lock] = {}
 _overlay_locks_guard = threading.Lock()
 

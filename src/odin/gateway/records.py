@@ -93,9 +93,32 @@ WHAT IS DELIBERATELY NOT CHECKED, so the report is honest about its own gaps:
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
+
+
+# Closed status sets, enumerated from the WRITERS rather than from AWS's own
+# (much larger) vocabularies. The validation pass left these `str` deliberately,
+# because policing VALUES risks refusing a state a writer legitimately produces
+# -- so each set below was derived by grepping every assignment in the owning
+# model, and each is exhaustive as of this commit.
+#
+# Why they are worth closing: every reader compares these by EXACT string
+# (`== "RUNNING"`, `!= "STOPPED"`, `!= "ACTIVE"`), so an unknown value is not
+# merely unrecognised -- it is invisible in every direction at once. A task whose
+# `last_status` is a typo is never counted running, never counted failed, skipped
+# by the drift sweep (`!= "RUNNING"`) AND treated as live by `api/logs.py`
+# (`!= "STOPPED"`), so the service sits at 0/N forever while the apply reports
+# success.
+#
+# THE COUPLING IS DELIBERATE AND EXPLICIT: adding a state to a writer means
+# adding it here in the SAME commit. That is caught immediately -- the test suite
+# writes real records, so a new state fails loudly in development rather than
+# silently in production, which is the trade this makes.
+_TASK_STATUS = Literal["PROVISIONING", "RUNNING", "STOPPED"]
+_SERVICE_STATUS = Literal["ACTIVE", "INACTIVE"]   # DeleteService keeps the record, INACTIVE
+_LB_STATE = Literal["active", "provisioning", "failed"]
 
 
 class Record(BaseModel):
@@ -372,7 +395,7 @@ class EcsService(Record):
 
     service_name: str
     cluster_name: str
-    status: str
+    status: _SERVICE_STATUS
     desired_count: int
     task_definition_arn: str
     created_at: float
@@ -393,7 +416,7 @@ class EcsTask(Record):
     container_name: str
     task_arn: str
     task_definition_arn: str
-    last_status: str
+    last_status: _TASK_STATUS
     desired_status: str
     host_ports: dict[str, int]
     started_at: float | None = None
@@ -441,7 +464,7 @@ class LoadBalancer(Record):
 
     name: str
     arn: str
-    state: str
+    state: _LB_STATE
     lb_id: str
     scheme: str
     type: str

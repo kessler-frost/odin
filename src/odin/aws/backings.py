@@ -196,8 +196,23 @@ class BackingAws:
         # independently call it too (provision() -> ensure_backing()) --
         # without this, both threads can see "not running" and race
         # `docker run` with the same container name (a hard Conflict error).
-        # A threading.Lock, not asyncio.Lock: this runs under
-        # asyncio.to_thread on separate OS threads, not on the event loop.
+        # TODAY a threading.Lock rather than an asyncio.Lock, because today
+        # this runs under asyncio.to_thread on separate OS threads, not on the
+        # event loop. That is a statement about the current process model, not
+        # a preference -- see the verdict below for what it becomes.
+        #
+        # v0.7.7 DE-THREADING VERDICT (verified, not assumed): this lock does
+        # NOT disappear when the threads do -- it becomes an `asyncio.Lock`.
+        # The rule "if the critical section contains no `await`, delete the
+        # lock" is applied to the code AFTER the conversion, not before, and
+        # this critical section is three `docker` calls (`_rt.status`,
+        # `_stranded`, `_create_backing_container`) that the conversion turns
+        # into `await`s. Suspension points inside the section are exactly what
+        # lets two tasks interleave, so deleting it would restore the
+        # `docker run` name Conflict described above -- as a task race on one
+        # loop instead of a thread race. Its contender (`reconciler.py`'s
+        # `gather(to_thread(ensure_backing, k) ...)`) stays genuinely
+        # concurrent after conversion: `gather` of awaits, not of threads.
         self._ensure_lock = threading.Lock()
         # Per-tick docker-call cache. backing_ports() answers from a short-TTL
         # cache and gc() skips its whole stop-sweep when neither the active

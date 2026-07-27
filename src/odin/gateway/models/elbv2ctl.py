@@ -530,6 +530,17 @@ def _upstream_address(stores: SynthStores, env: str, target: dict) -> str:
 # loser force-removes the winner's fresh one). Keyed on the SynthStores
 # instance so independent stores (every test reuses env="default") never share
 # a lock.
+#
+# v0.7.7 DE-THREADING VERDICT (verified): becomes an `asyncio.Lock`; it is not
+# deleted. `converge_proxy`'s critical section calls `proxy.ensure(...)`, which
+# is real `docker` work (`compute/proxy.py` runs/removes an nginx container),
+# so the conversion puts `await`s inside the section and two tasks can
+# interleave there exactly as two threads can today -- the same "both decide to
+# recreate the SAME container, and the loser force-removes the winner's fresh
+# one" race this lock was written for. Same verdict, same reason, for
+# `ecsctl._lock_for_service`. `_proxy_locks_guard` below is the opposite case
+# and DOES delete -- it guards only an await-free `setdefault` into the
+# registry (see `fabric/nebula.py`'s note for the general split).
 _proxy_locks: "weakref.WeakKeyDictionary[SynthStores, dict[tuple[str, str], threading.Lock]]" = weakref.WeakKeyDictionary()
 _proxy_locks_guard = threading.Lock()
 

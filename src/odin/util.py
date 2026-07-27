@@ -130,7 +130,8 @@ STORE_LOCK_NAME = "lock"
 
 # How long `odin import` will wait for a server that is on its way out. A real
 # uvicorn with the reconciler in its lifespan takes well over 6 seconds to stop
-# (reconcilers drain, then the gateway thread joins), so the scripted
+# (reconcilers drain, then the gateway listener finishes -- a task on the same
+# loop since v0.7.7's `serve_on_loop`, a thread join before it), so the scripted
 # `odin stop; sleep 5; odin import` an operator writes during a restore would
 # otherwise hit a guard that "feels arbitrary". Waiting is honest: it is exactly
 # how long the store stays in use.

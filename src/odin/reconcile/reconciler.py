@@ -257,7 +257,8 @@ class Reconciler:
         and a landmine for a dead one: awaiting a CANCELLED task re-raises
         CancelledError, and awaiting a task that died on a BaseException
         re-raises that -- straight out of `create_app`'s lifespan `finally`,
-        which then never reaches `stop_in_thread(gateway_server, ...)` or
+        which then never reaches the gateway listener's own shutdown (v0.7.7:
+        leaving `serve_on_loop`; `stop_in_thread` before that) or
         `store_lock.release()`. So the one condition this change exists to
         surface also broke odin's SHUTDOWN, and silently: uvicorn reports
         "Application shutdown failed" and the gateway listener and the store

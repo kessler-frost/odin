@@ -140,6 +140,14 @@ def _default_max_concurrent_boots() -> int:
 # Process-wide: every `InstanceVm` -- including the fresh one each gateway
 # call constructs -- shares this ONE semaphore by default (`boot`/`start`
 # below fall back to it when no per-call override is given).
+#
+# v0.7.7 DE-THREADING VERDICT (verified): becomes an `asyncio.Semaphore`, and
+# unlike the five `Lock`s this one is not even arguable. It is not guarding a
+# data race, so the "does the critical section await?" test does not apply to
+# it at all -- it is a RESOURCE BOUND on how many `limactl create`/`start`
+# runs may be in flight against one Mac. That bound is still needed when the
+# boots are tasks rather than threads; N concurrent awaits stampede the host
+# exactly as N concurrent threads do.
 _BOOT_SEMAPHORE = threading.Semaphore(_default_max_concurrent_boots())
 
 
