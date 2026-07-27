@@ -24,6 +24,14 @@ dev = [
     "pytest-asyncio>=0.24",
     "ruff>=0.8",
     "respx>=0.21",  # BSD-3-Clause; httpx mocking for the CLI's unit tests
+    # MIT. The suite is ~2500 tests and the de-threading work made many of them
+    # actually RUN where they previously errored out in milliseconds, so serial
+    # wall-clock went past 15 minutes. MEASURED on tests/agent+api+aws:
+    # 238.08s serial -> 27.79s with `-n auto` (8.6x), with byte-identical
+    # results (42 failed / 595 passed / 37 errors both ways). Identical results
+    # are the precondition -- a parallel run that CHANGES outcomes is a broken
+    # suite, not a fast one.
+    "pytest-xdist>=3.6",
 ]
 
 [project.scripts]

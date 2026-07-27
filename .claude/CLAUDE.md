@@ -280,6 +280,23 @@ Hard-won mechanics. Ignoring these has already destroyed work in this repo.
   --filter label=odin=1 | xargs -r docker rm -f` is machine-wide and has already
   deleted another agent's containers mid-verification. Use
   `--filter name=<prefix>`.
+- **Ports and store dirs partition STATE; nothing partitions PROCESSES.** When
+  something you started hangs, cancel it by the handle you already have —
+  `TaskStop` for a harness background task, or `kill "$pid"` from
+  `cmd & pid=$!`. Reach for `pkill` only with no handle, and then scope it to
+  your own worktree path (`pkill -f "/worktrees/<my-agent-id>/"`). **Never
+  `pkill -f pytest`** or any pattern that can match another agent: it is the
+  process equivalent of the machine-wide docker sweep above.
+  Two agents did this independently within one hour — one `pkill -f "pytest
+  tests/gateway"`, one `pkill -9 -f pytest` — and each disclosed it to the
+  other unprompted. Both had correctly taken their own port, store dir and env
+  prefix, and both had used a properly scoped cancel earlier in the same
+  session. So this is REFLEX UNDER TIME PRESSURE, not ignorance of scoping,
+  which is why the cheap correct action has to be named first rather than the
+  rule merely saying "scope your pattern".
+  It also poisons diagnosis: a killed run looks exactly like a hang, and this
+  cost a false "the suite hangs at 12%" that was really someone else's `pkill`
+  landing on it.
 - **`git add -A <path>` is path-limited; `git commit` is NOT.** In a shared
   worktree that combination swept 24 of another agent's staged files into an
   unrelated commit. Commit with explicit pathspecs and read `git show --stat`
