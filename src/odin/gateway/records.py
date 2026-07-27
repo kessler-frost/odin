@@ -256,17 +256,48 @@ class Subnet(Record):
     availability_zone: str
 
 
+class SecurityGroupRule(Record):
+    """One rule body inside `sg:{id}`'s `rules` map.
+
+    `is_egress` is modelled -- and modelled STRICTLY -- because it is the only
+    thing separating "allow all OUTBOUND" (AWS's benign seeded default) from
+    "allow all INBOUND" (the widest firewall there is), and
+    `ec2net._compiled_firewall` selected on it with a TRUTHINESS test.
+
+    Measured, not reasoned about. The seeded default egress rule is
+    `ip_protocol "-1"`, `from_port`/`to_port` None, `cidr_ipv4 "0.0.0.0/0"`.
+    Compile that rule with `is_egress` as `0`, `""` or `None` -- all falsy, all
+    plausible in a hand-edited or round-tripped record -- and the firewall comes
+    out as
+
+        inbound=[{'port': 'any', 'proto': 'any', 'cidr': '0.0.0.0/0'}]
+
+    where the correct compilation is `inbound=[]`. The failure direction is
+    asymmetric, which is what makes it dangerous: the STRING `"false"` is
+    truthy, so it reads as egress and fails CLOSED, while `0`/`""`/`None` fail
+    OPEN. This is the one record field in odin where a wrong type is a security
+    hole rather than a wrong answer.
+
+    Upgrade-safe: `is_egress` has been a literal Python bool since this store's
+    birth commit (8353eb5) -- the four route handlers pass `is_egress=True` or
+    `False`, and no released odin ever wrote anything else."""
+
+    is_egress: bool
+    ip_protocol: str
+
+
 class SecurityGroup(Record):
     """`sg:{id}`. `rules` is a MAP of rule-id -> rule, and it is compiled into
     the Nebula firewall that really gates an rds container's overlay port --
     the one store value in odin that a network reachability decision is made
     from. A string here would be iterated as characters by the compiler, which
-    is why the container type is pinned even though the rule bodies are not."""
+    is why the container type is pinned -- and the rule BODIES are pinned too,
+    for the reason `SecurityGroupRule` documents."""
 
     group_id: str
     group_name: str
     vpc_id: str
-    rules: dict[str, Any]
+    rules: dict[str, SecurityGroupRule]
 
 
 # --- iam ---------------------------------------------------------------------

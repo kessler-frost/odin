@@ -431,3 +431,37 @@ def test_upgrade_an_integer_timestamp_is_accepted_where_a_float_is_declared(tmp_
 def test_upgrade_an_absent_store_file_is_still_an_empty_dict(tmp_path: Path):
     stores = SynthStores(tmp_path)
     assert stores.ecsctl.items(ENV) == {}
+
+
+
+# --- the one field where a wrong TYPE is a security hole ----------------------
+
+
+def _sg_record(is_egress):
+    return {"sg:sg-1": {"group_id": "sg-1", "group_name": "web", "vpc_id": "vpc-1",
+                        "rules": {"r1": {"is_egress": is_egress, "ip_protocol": "-1"}}}}
+
+
+@pytest.mark.parametrize("bad", [0, "", None, "false", 1], ids=repr)
+def test_a_security_group_rule_with_a_non_bool_direction_is_refused(tmp_path: Path, bad):
+    """`is_egress` decides whether a rule means "allow all OUTBOUND" (the seeded
+    AWS default) or "allow all INBOUND" (the widest firewall there is), and
+    `_compiled_firewall` used to select on it with a TRUTHINESS test.
+
+    Measured on the seeded egress rule — proto `-1`, no ports, `0.0.0.0/0` — a
+    falsy `is_egress` compiled to
+    `inbound=[{'port':'any','proto':'any','cidr':'0.0.0.0/0'}]` where correct is
+    `inbound=[]`. Asymmetric, which is what made it dangerous: the string
+    `"false"` is truthy so it failed CLOSED, while `0`/`""`/`None` failed OPEN.
+    So this is refused on read rather than tolerated."""
+    exc = unreadable(seed(tmp_path, "ec2net", _sg_record(bad)), "ec2net")
+    assert exc.role == CONTROL
+    assert exc.path.name == "ec2net.json"
+
+
+def test_a_well_formed_security_group_still_loads(tmp_path: Path):
+    """The guard must not refuse what the writers really produce — the four
+    route handlers pass a literal `True`/`False`, and have since this store's
+    birth commit."""
+    stores = seed(tmp_path, "ec2net", _sg_record(False))
+    assert stores.ec2net.get(ENV, "sg:sg-1")["rules"]["r1"]["is_egress"] is False

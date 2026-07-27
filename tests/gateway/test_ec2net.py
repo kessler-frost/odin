@@ -466,3 +466,47 @@ def test_unmodeled_ec2_action_gets_invalid_action_not_a_503(stores):
 def test_state_persists_at_the_ec2net_sidecar_path(sink, ec2, stores, tmp_path):
     _create_vpc(stores, sink, ec2)
     assert (tmp_path / ENV / "gateway" / "ec2net.json").exists()
+
+
+# --- the one record field where a wrong TYPE is a security hole --------------
+# `is_egress` is the whole difference between "allow all OUTBOUND" (the seeded
+# AWS default) and "allow all INBOUND". `_compiled_firewall` selected on it with
+# a truthiness test, so any falsy value flipped the seeded allow-all egress rule
+# into an allow-all ingress rule. Measured, then fixed in two places: the record
+# model rejects a non-bool on read, and the compiler selects with `is False` so
+# it fails CLOSED even if a rule reaches it unvalidated.
+
+_EGRESS_ALL = {
+    "is_egress": True, "ip_protocol": "-1", "from_port": None, "to_port": None,
+    "cidr_ipv4": "0.0.0.0/0", "cidr_ipv6": None, "referenced_group_id": None, "description": None,
+}
+
+
+def _firewall_for(is_egress_value):
+    from odin.gateway.models.ec2net import _compiled_firewall
+
+    rule = {**_EGRESS_ALL, "is_egress": is_egress_value}
+    return _compiled_firewall({"rules": {"r1": rule}})
+
+
+@pytest.mark.parametrize("falsy", [0, "", None], ids=["zero", "empty-string", "null"])
+def test_a_falsy_is_egress_can_no_longer_open_the_firewall_to_everything(falsy):
+    """The measured hole: the seeded egress rule is proto `-1`, no ports,
+    `0.0.0.0/0`, so reading its direction wrongly does not produce a slightly
+    wrong rule — it produces `port any, proto any, cidr 0.0.0.0/0` INBOUND, the
+    widest firewall there is, where correct is nothing at all.
+
+    Asymmetric before the fix, which is what made it dangerous: the string
+    `"false"` is truthy so it read as egress and failed CLOSED, while these
+    three are falsy and failed OPEN."""
+    assert _firewall_for(falsy)["inbound"] == [], "a malformed rule opened the firewall"
+
+
+def test_a_real_ingress_rule_still_compiles(  ):
+    """The other direction — the guard must not silence legitimate rules. A
+    genuine ingress rule carries a real `False`, and it must still produce its
+    inbound entry, or every drawn security group becomes decorative."""
+    assert _firewall_for(False)["inbound"] == [
+        {"port": "any", "proto": "any", "cidr": "0.0.0.0/0", "group": None}
+    ]
+    assert _firewall_for(True)["inbound"] == []

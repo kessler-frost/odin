@@ -606,7 +606,17 @@ def _compiled_firewall(sg: dict) -> dict:
     (V1b) -- `aggregate_permissions` already emits that function's exact
     input shape. Stored as a plain dump on the SG record so it dies with the
     group and `mesh_state` reads it without importing gateway code."""
-    ingress = [r for r in sg["rules"].values() if not r["is_egress"]]
+    # `is False`, not `not ...`: this one boolean is the whole difference
+    # between "allow all OUTBOUND" (the seeded AWS default) and "allow all
+    # INBOUND", and a truthiness test hands that decision to any falsy value.
+    # Measured on the seeded egress rule (proto "-1", no ports, 0.0.0.0/0):
+    # `is_egress` as 0, "" or None compiled to
+    # `inbound=[{'port':'any','proto':'any','cidr':'0.0.0.0/0'}]` where correct
+    # is `inbound=[]` -- and asymmetrically, the STRING "false" is truthy so it
+    # failed closed while those three failed OPEN. `records.py` now rejects a
+    # non-bool on read; this fails CLOSED even if a rule ever reaches here
+    # without passing through that validation.
+    ingress = [r for r in sg["rules"].values() if r["is_egress"] is False]
     return sg_rules_to_firewall(aggregate_permissions(ingress)).model_dump()
 
 
