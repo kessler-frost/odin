@@ -3,6 +3,7 @@ rewritten wholesale on every mutation; a crash or concurrent reader mid-write
 must never observe a truncated file."""
 from __future__ import annotations
 
+import asyncio
 import stat
 import threading
 import tomllib
@@ -170,6 +171,69 @@ def test_run_command_reports_a_missing_binary_as_127():
 def test_run_command_passes_through_a_real_command():
     result = util.run_command(["echo", "hello"])
     assert (result.returncode, result.stdout.strip()) == (0, "hello")
+
+
+# --- run_command_async: the same contract, without a thread ------------------
+# Shelling out is odin's dominant blocking work (one `docker inspect` measured
+# at 10.45 ms, vs 0.63-0.84 ms for a boto3 call to a local backing), and
+# `asyncio.create_subprocess_exec` is natively async -- so these convert rather
+# than getting wrapped in `to_thread`, which would just hide a thread pool.
+
+@pytest.mark.parametrize(
+    "args,stdin",
+    [
+        (["echo", "hello"], None),
+        (["sh", "-c", "echo out; echo err >&2; exit 3"], None),
+        (["cat"], "piped-stdin\n"),
+        (["odin-no-such-binary-exists", "--version"], None),
+    ],
+    ids=["success", "nonzero-with-both-streams", "stdin", "missing-binary"],
+)
+async def test_the_async_twin_answers_exactly_what_the_sync_one_does(args, stdin):
+    """The two share every caller, so any divergence is a bug in whichever the
+    caller did not expect. Asserted as full-object equality rather than field
+    by field, so a new field cannot quietly escape the comparison."""
+    assert await util.run_command_async(args, input=stdin) == util.run_command(args, input=stdin)
+
+
+async def test_a_missing_binary_is_still_a_result_and_not_a_raise():
+    """The contract `odin doctor` depends on: `create_subprocess_exec` raises
+    FileNotFoundError at creation for an absent binary just as `subprocess.run`
+    does, and the same guard has to turn it into rc 127."""
+    result = await util.run_command_async(["odin-no-such-binary-exists", "--version"])
+    assert result.returncode == util.COMMAND_NOT_FOUND
+    assert result.stdout == ""
+    assert "odin-no-such-binary-exists" in result.stderr
+    assert "command not found" in result.stderr
+
+
+async def test_undecodable_output_is_replaced_rather_than_raising():
+    """`text=True` decodes with the locale's codec, which can raise on a
+    container log full of odd bytes. Explicit utf-8 + errors="replace" means
+    the async seam mangles where the sync one could blow up."""
+    result = await util.run_command_async(["printf", r"\xff\xfe"])
+    assert result.returncode == 0
+    assert result.stdout  # replacement chars, not an exception
+
+
+async def test_it_does_not_block_the_event_loop():
+    """The whole point. While a 300ms subprocess runs, the loop must stay free
+    to run other tasks -- if this were a blocking call the ticker would be
+    starved and record far fewer ticks."""
+    ticks = 0
+
+    async def tick():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    ticker = asyncio.create_task(tick())
+    result = await util.run_command_async(["sh", "-c", "sleep 0.3; echo done"])
+    ticker.cancel()
+
+    assert result.stdout.strip() == "done"
+    assert ticks > 10, f"the loop only ran {ticks} ticks during a 300ms subprocess"
 
 
 def test_run_command_feeds_stdin():
