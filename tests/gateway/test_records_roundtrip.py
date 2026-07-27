@@ -49,30 +49,30 @@ def touch_everything(stores: SynthStores) -> dict[str, int]:
     return {name: len(getattr(stores, name).items(ENV)) for name in names}
 
 
-def json_call(module, action: str, payload: dict, stores: SynthStores, resource: str = ""):
-    response = module.pure_answer(action, resource, ENV, json.dumps(payload).encode(), stores, NOW)
+async def json_call(module, action: str, payload: dict, stores: SynthStores, resource: str = ""):
+    response = await module.pure_answer(action, resource, ENV, json.dumps(payload).encode(), stores, NOW)
     assert response.status_code == 200, response.body
     return response
 
 
-def query_call(module, action: str, params: dict, stores: SynthStores, resource: str = ""):
-    response = module.pure_answer(action, resource, ENV, urlencode(params).encode(), stores, NOW)
+async def query_call(module, action: str, params: dict, stores: SynthStores, resource: str = ""):
+    response = await module.pure_answer(action, resource, ENV, urlencode(params).encode(), stores, NOW)
     assert response.status_code == 200, response.body
     return response
 
 
-def test_logsctl_real_records_reload(tmp_path: Path):
+async def test_logsctl_real_records_reload(tmp_path: Path):
     """group + stream + the events ring buffer + a barrier, all written by the
     real CloudWatch Logs handlers."""
     stores = SynthStores(tmp_path)
     group, stream = "/odin/app", "s1"
-    json_call(logsctl, "logs:CreateLogGroup", {"logGroupName": group, "tags": {"odin:node": "app"}}, stores)
-    json_call(logsctl, "logs:CreateLogStream", {"logGroupName": group, "logStreamName": stream}, stores)
-    json_call(logsctl, "logs:PutLogEvents", {
+    await json_call(logsctl, "logs:CreateLogGroup", {"logGroupName": group, "tags": {"odin:node": "app"}}, stores)
+    await json_call(logsctl, "logs:CreateLogStream", {"logGroupName": group, "logStreamName": stream}, stores)
+    await json_call(logsctl, "logs:PutLogEvents", {
         "logGroupName": group, "logStreamName": stream,
         "logEvents": [{"timestamp": 1785130167000, "message": "hello"}],
     }, stores)
-    json_call(logsctl, "logs:PutRetentionPolicy", {"logGroupName": group, "retentionInDays": 7}, stores)
+    await json_call(logsctl, "logs:PutRetentionPolicy", {"logGroupName": group, "retentionInDays": 7}, stores)
     logsctl.reset_cursor(stores, ENV, group, stream)  # writes a real `barrier:` int
 
     fresh = reload(tmp_path)
@@ -93,9 +93,9 @@ def test_logsctl_substrate_shipping_reloads(tmp_path: Path):
     assert [e["message"] for e in fresh.logsctl.get(ENV, f"events:{group}")] == ["line one", "line two"]
 
 
-def test_ecr_real_record_reloads(tmp_path: Path):
+async def test_ecr_real_record_reloads(tmp_path: Path):
     stores = SynthStores(tmp_path)
-    json_call(ecr, "ecr:CreateRepository", {
+    await json_call(ecr, "ecr:CreateRepository", {
         "repositoryName": "app", "tags": [{"Key": "odin:node", "Value": "app"}],
     }, stores)
 
@@ -103,23 +103,23 @@ def test_ecr_real_record_reloads(tmp_path: Path):
     assert fresh.ecr.get(ENV, "repo:app")["repository_name"] == "app"
 
 
-def test_iamctl_real_records_reload(tmp_path: Path):
+async def test_iamctl_real_records_reload(tmp_path: Path):
     """A role, a managed policy, an instance profile, and the attachment that
     turns `attached_policy_arns` from `[]` into a real list."""
     stores = SynthStores(tmp_path)
-    query_call(iamctl, "iam:CreateRole", {
+    await query_call(iamctl, "iam:CreateRole", {
         "RoleName": "app", "AssumeRolePolicyDocument": '{"Version":"2012-10-17"}',
     }, stores)
-    query_call(iamctl, "iam:CreatePolicy", {
+    await query_call(iamctl, "iam:CreatePolicy", {
         "PolicyName": "readonly", "PolicyDocument": '{"Version":"2012-10-17"}',
     }, stores)
     arn = "arn:aws:iam::000000000000:policy/readonly"
-    query_call(iamctl, "iam:AttachRolePolicy", {"RoleName": "app", "PolicyArn": arn}, stores)
-    query_call(iamctl, "iam:PutRolePolicy", {
+    await query_call(iamctl, "iam:AttachRolePolicy", {"RoleName": "app", "PolicyArn": arn}, stores)
+    await query_call(iamctl, "iam:PutRolePolicy", {
         "RoleName": "app", "PolicyName": "inline", "PolicyDocument": '{"Version":"2012-10-17"}',
     }, stores)
-    query_call(iamctl, "iam:CreateInstanceProfile", {"InstanceProfileName": "app"}, stores)
-    query_call(iamctl, "iam:AddRoleToInstanceProfile", {
+    await query_call(iamctl, "iam:CreateInstanceProfile", {"InstanceProfileName": "app"}, stores)
+    await query_call(iamctl, "iam:AddRoleToInstanceProfile", {
         "InstanceProfileName": "app", "RoleName": "app",
     }, stores)
 
@@ -130,9 +130,9 @@ def test_iamctl_real_records_reload(tmp_path: Path):
     assert fresh.iamctl.get(ENV, "instance-profile:app")["roles"] == ["app"]
 
 
-def test_ssmctl_real_record_reloads(tmp_path: Path):
+async def test_ssmctl_real_record_reloads(tmp_path: Path):
     stores = SynthStores(tmp_path)
-    json_call(ssmctl, "ssm:PutParameter", {
+    await json_call(ssmctl, "ssm:PutParameter", {
         "Name": "/odin/db/url", "Value": "postgres://x", "Type": "String",
     }, stores)
 
@@ -140,11 +140,11 @@ def test_ssmctl_real_record_reloads(tmp_path: Path):
     assert fresh.ssmctl.get(ENV, "param:/odin/db/url")["version"] == 1
 
 
-def test_secretsctl_real_records_reload(tmp_path: Path):
+async def test_secretsctl_real_records_reload(tmp_path: Path):
     """The secret AND its version -- `version_stages` is the list whose
     membership test decides which cleartext GetSecretValue returns."""
     stores = SynthStores(tmp_path)
-    json_call(secretsctl, "secretsmanager:CreateSecret", {
+    await json_call(secretsctl, "secretsmanager:CreateSecret", {
         "Name": "db-password", "SecretString": "hunter2",
     }, stores)
 
@@ -153,17 +153,17 @@ def test_secretsctl_real_records_reload(tmp_path: Path):
     assert versions and "AWSCURRENT" in versions[0]["version_stages"]
 
 
-def test_ec2net_real_records_reload(tmp_path: Path):
+async def test_ec2net_real_records_reload(tmp_path: Path):
     """vpc + subnet + the DEFAULT security group the VPC mints, whose `rules`
     map is compiled into the Nebula firewall."""
     stores = SynthStores(tmp_path)
-    query_call(ec2net, "ec2:CreateVpc", {"CidrBlock": "10.0.0.0/16"}, stores)
+    await query_call(ec2net, "ec2:CreateVpc", {"CidrBlock": "10.0.0.0/16"}, stores)
     vpcs = [v for k, v in stores.ec2net.items(ENV).items() if k.startswith("vpc:")]
     assert vpcs
-    query_call(ec2net, "ec2:CreateSubnet", {
+    await query_call(ec2net, "ec2:CreateSubnet", {
         "VpcId": vpcs[0]["vpc_id"], "CidrBlock": "10.0.1.0/24",
     }, stores)
-    query_call(ec2net, "ec2:CreateSecurityGroup", {
+    await query_call(ec2net, "ec2:CreateSecurityGroup", {
         "VpcId": vpcs[0]["vpc_id"], "GroupName": "web", "GroupDescription": "web tier",
     }, stores)
 
@@ -216,17 +216,17 @@ def test_a_deleted_queues_grace_marker_reloads(tmp_path: Path):
     assert isinstance(reload(tmp_path).sqs_queues.get(ENV, "old-jobs")["deleted_at"], float)
 
 
-def test_an_env_written_by_many_models_reloads_whole(tmp_path: Path):
+async def test_an_env_written_by_many_models_reloads_whole(tmp_path: Path):
     """The integration the individual tests do not give: several stores
     populated in one env, then EVERY store in that env loaded. A model that is
     too strict for one writer fails here even if its own test forgot the
     field."""
     stores = SynthStores(tmp_path)
-    json_call(logsctl, "logs:CreateLogGroup", {"logGroupName": "/odin/app"}, stores)
-    json_call(ecr, "ecr:CreateRepository", {"repositoryName": "app"}, stores)
-    json_call(ssmctl, "ssm:PutParameter", {"Name": "/a", "Value": "b", "Type": "String"}, stores)
-    query_call(iamctl, "iam:CreateRole", {"RoleName": "app", "AssumeRolePolicyDocument": "{}"}, stores)
-    query_call(ec2net, "ec2:CreateVpc", {"CidrBlock": "10.0.0.0/16"}, stores)
+    await json_call(logsctl, "logs:CreateLogGroup", {"logGroupName": "/odin/app"}, stores)
+    await json_call(ecr, "ecr:CreateRepository", {"repositoryName": "app"}, stores)
+    await json_call(ssmctl, "ssm:PutParameter", {"Name": "/a", "Value": "b", "Type": "String"}, stores)
+    await query_call(iamctl, "iam:CreateRole", {"RoleName": "app", "AssumeRolePolicyDocument": "{}"}, stores)
+    await query_call(ec2net, "ec2:CreateVpc", {"CidrBlock": "10.0.0.0/16"}, stores)
 
     counts = touch_everything(reload(tmp_path))
     assert counts["logsctl"] and counts["ecr"] and counts["ssmctl"]
