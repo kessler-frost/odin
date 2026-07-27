@@ -85,6 +85,58 @@ def ping(port: int, timeout: float = 1.0) -> bool:
         return False  # not listening yet -- the readiness loop's normal case
 
 
+async def _reply_async(reader: asyncio.StreamReader) -> str | None:
+    """`_reply`'s async twin, deliberately line-for-line comparable with it so
+    the two cannot drift into disagreeing about the RESP2 wire."""
+    line = (await reader.readline()).rstrip(b"\r\n").decode()
+    if line[:1] != "$":
+        return line[1:]
+    length = int(line[1:])
+    if length < 0:
+        return None
+    return (await reader.readexactly(length + 2))[:length].decode()
+
+
+async def resp_call_async(
+    port: int, *args: str, host: str = "127.0.0.1", timeout: float = 2.0,
+) -> str | None:
+    """`resp_call` without blocking the event loop.
+
+    The sync twin uses `socket.create_connection`, which is fine from a thread
+    and NOT fine from a coroutine: it stalls the loop the gateway and the
+    reconciler share for the whole timeout. That was measured as a real ~1s
+    stall per poll while a Redis container boots -- and it is precisely the
+    blind spot `tests/test_no_blocking_in_coroutines.py` documents, since the
+    call written inside the `async def` was `ping(...)`, whose blocking lives
+    one level down where a static check cannot see it.
+
+    Both twins survive because `resp_call` still has genuinely synchronous
+    callers; they share `_reply`/`_reply_async`, which are kept side by side
+    for the same reason.
+    """
+    payload = f"*{len(args)}\r\n" + "".join(f"${len(a)}\r\n{a}\r\n" for a in args)
+    async with asyncio.timeout(timeout):
+        reader, writer = await asyncio.open_connection(host, port)
+        try:
+            writer.write(payload.encode())
+            await writer.drain()
+            return await _reply_async(reader)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+
+async def ping_async(port: int, timeout: float = 1.0) -> bool:
+    """`ping` for callers on the event loop. Same contract: nothing listening
+    yet is `False`, the readiness loop's ordinary case -- and a timeout counts
+    as "not yet" too, which `socket`'s own timeout raised as `OSError` but
+    `asyncio.timeout` raises as `TimeoutError`."""
+    try:
+        return await resp_call_async(port, "PING", timeout=timeout) == "PONG"
+    except (OSError, TimeoutError, asyncio.IncompleteReadError):
+        return False
+
+
 def engine_version(port: int) -> str:
     """The REAL Redis version the container is running (`INFO server`), so
     DescribeCacheClusters advertises the substrate's own version rather than a
@@ -131,7 +183,7 @@ class RedisCache:
         deadline = time.monotonic() + self._ready_timeout
         while time.monotonic() < deadline:
             port = await self._rt.host_port(name, REDIS_PORT)
-            if port and ping(port):
+            if port and await ping_async(port):
                 return port
             await asyncio.sleep(self._poll_interval)
         raise RuntimeError(f"{name} redis never became ready: {await self._not_ready_reason(name)}")

@@ -139,8 +139,9 @@ _DEFAULT_SWEEP_TICKS = 10
 # How long the rds half waits before re-asking "is it really down?" (see
 # `_sweep_databases`). Short enough that a genuinely dead database is still
 # reported on this same sweep, long enough to outlast a busy-daemon blip. Only
-# ever paid on the failure path, and the whole sweep already runs off the event
-# loop (`Reconciler._drift_verdicts` uses asyncio.to_thread).
+# ever paid on the failure path. (v0.7.7: the sweep used to run off the event
+# loop via asyncio.to_thread; it is now awaited on the loop itself, so this
+# delay yields rather than blocking.)
 _CONFIRM_DELAY = 1.0
 
 # What a failed probe that carries no error text says. `PgReady.error` is None

@@ -196,10 +196,14 @@ class BackingAws:
         # independently call it too (provision() -> ensure_backing()) --
         # without this, both threads can see "not running" and race
         # `docker run` with the same container name (a hard Conflict error).
-        # TODAY a threading.Lock rather than an asyncio.Lock, because today
-        # this runs under asyncio.to_thread on separate OS threads, not on the
-        # event loop. That is a statement about the current process model, not
-        # a preference -- see the verdict below for what it becomes.
+        # An asyncio.Lock, and it genuinely earns one: the critical section
+        # below holds THREE awaits (`_rt.status`, `_stranded`,
+        # `_create_backing_container`), and a suspension point is exactly what
+        # lets two tasks interleave into the same-name Conflict. Contrast the
+        # locks DELETED in ecsctl/elbv2ctl, whose sections had no await at all
+        # -- on one event loop nothing can preempt those, so they needed no
+        # lock. (v0.7.7: this was a threading.Lock while ensure_backing ran
+        # under asyncio.to_thread on separate OS threads.)
         #
         # v0.7.7 DE-THREADING VERDICT (verified, not assumed): this lock does
         # NOT disappear when the threads do -- it becomes an `asyncio.Lock`.
@@ -210,9 +214,10 @@ class BackingAws:
         # into `await`s. Suspension points inside the section are exactly what
         # lets two tasks interleave, so deleting it would restore the
         # `docker run` name Conflict described above -- as a task race on one
-        # loop instead of a thread race. Its contender (`reconciler.py`'s
-        # `gather(to_thread(ensure_backing, k) ...)`) stays genuinely
-        # concurrent after conversion: `gather` of awaits, not of threads.
+        # loop instead of a thread race. Its contender -- `reconciler.py`'s
+        # `gather(...)` over one ensure_backing per kind -- stays genuinely
+        # concurrent: a gather of awaits now, where it was a gather of
+        # `to_thread` calls before v0.7.7.
         self._ensure_lock = asyncio.Lock()
         # Per-tick docker-call cache. backing_ports() answers from a short-TTL
         # cache and gc() skips its whole stop-sweep when neither the active
@@ -311,8 +316,8 @@ class BackingAws:
         cname = self._cname(d)
         # Only the check+create is serialized -- the readiness wait below
         # runs OUTSIDE the lock so concurrent ensure_backing calls for
-        # DIFFERENT services (S5's ensure_backings runs one asyncio.to_thread
-        # per kind, in parallel) aren't forced sequential by a single
+        # DIFFERENT services (the reconciler gathers one task per kind, in
+        # parallel) aren't forced sequential by a single
         # per-instance lock.
         async with self._ensure_lock:
             if await self._rt.status(cname) != "running" or await self._stranded(d):
@@ -394,7 +399,7 @@ class BackingAws:
     async def _ensure_dynalite_image(self) -> None:
         """One-time (per machine) build of the baked dynalite image -- see
         the module-level comment by `_DYNALITE_IMAGE`. Runs inside
-        `ensure_backing`'s `_ensure_lock`, so two threads racing to boot
+        `ensure_backing`'s `_ensure_lock`, so two TASKS racing to boot
         dynalite for the first time never both `docker build` the same tag."""
         if not await self._rt.image_exists(_DYNALITE_IMAGE):
             await self._rt.build(_DYNALITE_IMAGE, _DYNALITE_DOCKERFILE)
