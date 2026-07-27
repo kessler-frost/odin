@@ -208,6 +208,22 @@ class _Proc:
     stderr: str = ""
 
 
+def _cert_failure(proc: _Proc) -> str:
+    """Why a `nebula-cert` call failed, using whatever it actually produced.
+
+    Field test 6, F4's class: both raise sites used `proc.stderr.strip()` alone,
+    so a `nebula-cert` that was signal-killed or wrote to stdout produced
+    `nebula-cert sign failed: ` -- and `RuntimeError` is unmapped in
+    `server.py::_EXCEPTION_VERDICTS`, so that empty tail reached the caller
+    verbatim. rc 127 (an absent binary) is the commonest case and the one with
+    the least stderr, which is why the exit code is named last rather than
+    dropped."""
+    return proc.stderr.strip() or proc.stdout.strip() or (
+        f"exit {proc.returncode} with no output"
+        + (" -- `nebula-cert` is not on PATH (`brew install nebula`)" if proc.returncode == 127 else "")
+    )
+
+
 def _default_runner(args: list[str]) -> _Proc:
     # `run_command`: `nebula`/`nebula-cert` are downloaded on demand, so an
     # absent binary is an ordinary state -- rc 127, not a traceback.
@@ -327,7 +343,7 @@ class NebulaManager:
             "-out-crt", str(self._ca_crt), "-out-key", str(self._ca_key),
         ])
         if proc.returncode != 0:
-            raise RuntimeError(f"nebula-cert ca failed: {proc.stderr.strip()}")
+            raise RuntimeError(f"nebula-cert ca failed: {_cert_failure(proc)}")
         return CaInfo(network=network, ca_crt=self._ca_crt, ca_key=self._ca_key)
 
     def sign_cert(self, hostname: str, ip: str, groups: list[str] | None = None) -> CertPaths:
@@ -344,7 +360,7 @@ class NebulaManager:
             cmd += ["-groups", ",".join(groups)]
         proc = self._run(cmd)
         if proc.returncode != 0:
-            raise RuntimeError(f"nebula-cert sign failed: {proc.stderr.strip()}")
+            raise RuntimeError(f"nebula-cert sign failed: {_cert_failure(proc)}")
         return CertPaths(crt=host_crt, key=host_key, ca_crt=self._ca_crt)
 
     def cert_paths(self, hostname: str) -> CertPaths:

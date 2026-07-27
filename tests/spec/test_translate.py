@@ -342,3 +342,24 @@ def test_an_unsupported_kind_still_translates_and_still_reports_as_skipped():
     assert canvas_problems(canvas) == []
     assert [r.id for r in canvas_to_stack(canvas).resources] == ["bucket"]
     assert skipped_node_types(canvas) == ["kinesis"]
+
+
+def test_a_null_type_is_reported_as_an_absence_not_as_the_object_None():
+    """Field test 6, F4's class. `get("type", "?")` defaults only on a MISSING
+    key, so `"type": null` put the Python object `None` into `skipped` -- and
+    therefore into `not_covered`, the one array the README tells CI to gate on,
+    where `cli/apply.py` prints it as `skipped: None`. Mixing `null` with a real
+    type also made `sorted` raise `TypeError`, i.e. a 500 instead of a list.
+
+    `/apply` and `/apply-full` reject a falsy type at the schema; `/tf/plan`
+    reads `.odin/canvas.json` from disk and that file is deliberately never
+    re-validated, which is how a hand-edited canvas gets here."""
+    canvas = {"nodes": [
+        {"id": "n1", "type": None, "data": {"label": "mystery"}},
+        {"id": "n2", "data": {"label": "no-type-key"}},
+        {"id": "k1", "type": "kinesis", "data": {"label": "stream"}},
+    ], "edges": []}
+    skipped = skipped_node_types(canvas)
+    assert skipped == ["?", "kinesis"]
+    assert None not in skipped
+    assert all(isinstance(t, str) for t in skipped)

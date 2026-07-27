@@ -1326,6 +1326,16 @@ async def test_a_loop_whose_every_tick_raises_stops_reading_as_converging(tmp_pa
         assert health.consecutive_failures >= 2
         assert "have all raised" in health.verdict
         assert "ValidationError" in health.verdict or "JSONDecodeError" in health.verdict
+        # Field test 6's advice sweep: the remedy follows the REASON. This
+        # verdict used to end "Restart odin (`odin stop && odin start`) to bring
+        # it back" -- which is right for a cancelled or dead task and wrong for
+        # this one: a fresh process re-reads the same corrupt file and raises on
+        # tick 1 forever (measured on a real server -- 20+ consecutive failures
+        # with the file unchanged, because every writer reads before it writes).
+        assert "odin stop && odin start" not in health.verdict
+        assert "a restart re-reads the same inputs and will raise again" in health.verdict
+        assert "world.json" in health.verdict, "the reason has to name the file to be actionable"
+        assert "odin events --env default" in health.verdict
     finally:
         recon._task.cancel()
         await asyncio.gather(recon._task, return_exceptions=True)

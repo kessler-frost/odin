@@ -13,11 +13,14 @@ import os
 
 import pytest
 
+from odin.aws.backings import PROVISIONED, BackingAws
 from odin.fabric.models import MeshNetwork, SubnetAllocation
+from odin.gateway.models import elbv2ctl
 from odin.gateway.stores import SynthStores
 from odin.gateway.wiring import UnresolvedRef, db_facts, ec2_facts, node_env, producer_facts
 from odin.reconcile import mesh_health, tf_status
 from odin.runtime.colima import CONTAINER_HOST
+from odin.spec.models import REFERENCEABLE_KINDS
 from odin.spec.store import SpecStore
 from odin.spec.translate import canvas_to_stack
 
@@ -94,12 +97,37 @@ def _seed_cache(stores: SynthStores, **overrides) -> None:
     stores.cachectl.set(ENV, f"cluster:{record['cache_cluster_id']}", record)
 
 
+_ALB_NODE = "web-lb"
+
+
+def _seed_alb(stores: SynthStores) -> None:
+    """An `active` elbv2ctl record with a published proxy port -- the same shape
+    `tests/reconcile/test_tf_status.py::_lb` builds, so the two projections of an
+    ALB's one fact are seeded identically."""
+    stores.elbv2ctl.set(ENV, f"lb:{_ALB_NODE}", {
+        "name": _ALB_NODE, "lb_id": "abc123", "arn": elbv2ctl.lb_arn(_ALB_NODE, "abc123"),
+        "scheme": "internal", "type": "application", "ip_address_type": "ipv4",
+        "vpc_id": "vpc-1", "subnets": ["subnet-1"], "security_groups": [],
+        "availability_zones": [], "created_time": "2026-07-25T00:00:00+00:00",
+        "state": "active", "state_reason": None, "attributes": {}, "endpoints": {"80": 41234},
+    })
+
+
 def _save_stack(tmp_path, nodes: list[dict]) -> None:
     SpecStore(tmp_path).apply(canvas_to_stack({"nodes": nodes, "edges": []}, env=ENV))
 
 
 def _ecs_node(env_map: dict) -> dict:
     return {"id": "n1", "type": "ecs", "data": {"label": "web", "image": "nginx:alpine", "env": env_map}}
+
+
+# The PRODUCER node as it exists on a real canvas. Field test 6 (F3): the
+# unresolved-ref reason is now derived from the target's KIND, so a test that
+# seeds only the consumer is testing the "odin cannot tell what this node is"
+# branch rather than the readiness branch it means to.
+_DB_NODE = {"id": "n2", "type": "rds", "data": {"label": "appdb"}}
+_VM_CANVAS_NODE = {"id": "n3", "type": "ec2", "data": {"label": _VM_NODE}}
+_QUEUE_NODE = {"id": "n4", "type": "sqs", "data": {"label": "jobs"}}
 
 
 # --- the duplication guard --------------------------------------------------
@@ -140,6 +168,60 @@ def test_the_injector_publishes_exactly_what_world_publishes_for_an_ec2(tmp_path
     projected = tf_status.project(stores, ENV).get(_VM_NODE)
     mesh_health.reset_cache()
     assert producer_facts(stores, ENV).get(_VM_NODE, {}) == (projected[2] if projected else {})
+
+
+# --- REFERENCEABLE_KINDS, held to both halves that read it -----------------
+#
+# Field test 6, F3. The list used to be prose inside one error string, and it
+# went wrong in the direction prose always goes: it said an sqs node "publishes
+# no facts" when what was true was "an sqs node is not a WIRING producer". These
+# two tests are what stop the tuple and the code drifting apart again -- one on
+# the gateway side (which builds the values) and one on the hcl side (which
+# refuses a ref before tofu runs).
+
+
+def test_every_referenceable_kind_really_publishes_and_no_other_kind_does(tmp_path):
+    """One live producer per `REFERENCEABLE_KINDS`, all four in the same env: the
+    tuple is exactly the set `producer_facts` can build for. A kind added to the
+    tuple without a builder, or a builder added without the tuple, fails here."""
+    stores = _stores(tmp_path)
+    _seed_db(stores)
+    _seed_cache(stores)
+    _seed_alb(stores)
+    _seed_ec2(stores, tmp_path)
+    facts = producer_facts(stores, ENV)
+    assert set(facts) == {"appdb", "cache", _ALB_NODE, _VM_NODE}
+    assert all(facts.values()), "a producer in the table must publish at least one fact"
+    # ...and every kind NOT in the tuple contributes nothing, which is the claim
+    # the error message now makes on the strength of this.
+    assert set(REFERENCEABLE_KINDS) == {"rds", "elasticache", "alb", "ec2"}
+
+
+class _PortOnlyRuntime:
+    """Just enough runtime for the REAL `BackingAws.facts` to run, so the facts
+    asserted below are the ones production publishes."""
+
+    def host_port(self, name, container_port):
+        return 51001
+
+
+def test_the_four_provisioned_kinds_publish_world_facts_and_are_still_not_producers(tmp_path):
+    """The exact pair of readings the field test took against a real server, as a
+    test: `aws/backings.py::facts` authors a real fact for each of s3/sqs/sns/
+    dynamodb -- which is why they show up in `odin world` -- and none of them is
+    a wiring producer. The error message may only say the second thing."""
+    assert set(PROVISIONED) == {"s3", "sqs", "sns", "dynamodb"}
+    assert not set(PROVISIONED) & set(REFERENCEABLE_KINDS)
+    aws = BackingAws(_PortOnlyRuntime(), env=ENV, root=tmp_path)
+    published = {kind: aws.facts(kind, "thing") for kind in PROVISIONED}
+    # Each one really does publish a named fact -- so "a kind that publishes no
+    # facts" is a false statement about every one of them.
+    assert {kind: sorted(facts) for kind, facts in published.items()} == {
+        "s3": ["BUCKET", "endpoint"],
+        "sqs": ["QUEUE_URL", "endpoint"],
+        "sns": ["TOPIC_ARN", "endpoint"],
+        "dynamodb": ["TABLE", "endpoint"],
+    }
 
 
 # --- producer_facts --------------------------------------------------------
@@ -244,13 +326,17 @@ def test_an_unhealthy_producer_fails_loudly_instead_of_injecting_an_empty_string
     honestly. An empty DATABASE_URL would let the app fail far from the cause."""
     stores = _stores(tmp_path)
     _seed_db(stores, status="creating")
-    _save_stack(tmp_path, [_ecs_node({"DATABASE_URL": "${{appdb.DATABASE_URL}}"})])
+    _save_stack(tmp_path, [_ecs_node({"DATABASE_URL": "${{appdb.DATABASE_URL}}"}), _DB_NODE])
     with pytest.raises(UnresolvedRef) as excinfo:
         node_env(stores, ENV, "web")
     message = str(excinfo.value)
     assert "DATABASE_URL" in message
     assert "appdb" in message
-    assert "not healthy yet" in message
+    # An rds IS a valid producer, so this is readiness -- and the message has to
+    # say that rather than the wiring-model reason (field test 6, F3).
+    assert "has not published its endpoint yet" in message
+    assert "IS a valid reference producer" in message
+    assert "publishes no facts" not in message
 
 
 def test_a_ref_to_a_nonexistent_node_fails_loudly(tmp_path):
@@ -301,10 +387,52 @@ def test_a_withheld_mesh_ip_fails_the_ref_instead_of_injecting_an_empty_string(t
 def test_a_ref_to_a_vm_that_is_not_up_yet_fails_honestly(tmp_path):
     stores = _stores(tmp_path)
     _seed_ec2(stores, tmp_path, state="pending")
-    _save_stack(tmp_path, [_ecs_node({"VM_HOST": "${{web1.PRIVATE_IP}}"})])
+    _save_stack(tmp_path, [_ecs_node({"VM_HOST": "${{web1.PRIVATE_IP}}"}), _VM_CANVAS_NODE])
     with pytest.raises(UnresolvedRef) as excinfo:
         node_env(stores, ENV, "web")
-    assert "not healthy yet" in str(excinfo.value)
+    assert "has not published its endpoint yet" in str(excinfo.value)
+
+
+def test_a_ref_to_a_kind_that_can_never_produce_says_so_and_does_not_deny_its_facts(tmp_path):
+    """Field test 6, F3's sub-finding. The message said an sqs node "publishes no
+    facts (only rds, elasticache, alb and ec2 do)" -- while `/world` was
+    publishing that same node's `QUEUE_URL`. Measured against a real server at
+    the same instant:
+
+        /world?env=srvfixf3  ->  sqs srvfix-queue healthy
+                                 {"QUEUE_URL": "http://host.docker.internal:4796/...", ...}
+        wiring.producer_facts(stores, "srvfixf3")  ->  {}
+
+    Both readings were right; the SENTENCE conflated observed facts with wiring
+    values. It must now name the real reason, name which kinds ARE referenceable,
+    and NOT deny the facts the user can see."""
+    stores = _stores(tmp_path)
+    _save_stack(tmp_path, [_ecs_node({"QUEUE_URL": "${{jobs.QUEUE_URL}}"}), _QUEUE_NODE])
+    with pytest.raises(UnresolvedRef) as excinfo:
+        node_env(stores, ENV, "web")
+    message = str(excinfo.value)
+    assert "'jobs' is a sqs node" in message
+    assert "no sqs node publishes an endpoint a reference can resolve" in message
+    assert "only rds, elasticache, alb and ec2 do" in message
+    # The claim the field test falsified must not come back in any form.
+    assert "publishes no facts" not in message
+    assert "not healthy yet" not in message
+    assert "has not published its endpoint yet" not in message
+    # ...and it says what DOES work instead.
+    assert "AWS_ENDPOINT_URL" in message
+
+
+def test_a_ref_whose_target_kind_is_unknown_says_that_rather_than_guessing(tmp_path):
+    """A resource no canvas node backs (an imported HCL project) has no kind in
+    either the staged wiring or the applied Stack. Reporting either of the other
+    two reasons would be a claim odin cannot make."""
+    stores = _stores(tmp_path)
+    _save_stack(tmp_path, [_ecs_node({"X": "${{ghost.ENDPOINT}}"})])
+    with pytest.raises(UnresolvedRef) as excinfo:
+        node_env(stores, ENV, "web")
+    message = str(excinfo.value)
+    assert "cannot tell what kind of node 'ghost' is" in message
+    assert "Nothing resolves from it either way" in message
 
 
 def test_a_lambda_node_resolves_the_same_way(tmp_path):

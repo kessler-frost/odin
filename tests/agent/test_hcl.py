@@ -22,8 +22,8 @@ from odin.agent.hcl import (
     unquote,
 )
 from odin.server import not_covered
-from odin.spec.models import Edge, FieldValue, ResourceDesired, Stack
-from odin.spec.translate import canvas_to_stack, skipped_node_types
+from odin.spec.models import REFERENCEABLE_KINDS, Edge, FieldValue, ResourceDesired, Stack
+from odin.spec.translate import MODELLED_NODE_TYPES, canvas_to_stack, skipped_node_types
 
 _FULL_CANVAS = {
     "nodes": [
@@ -873,6 +873,95 @@ def test_a_ref_to_a_node_that_is_not_on_the_canvas_is_reported_not_dropped():
     assert "depends_on" not in proj.files["main.tf"]
     (note,) = proj.wiring_errors
     assert "typo-db" in note and "DATABASE_URL" in note and "web" in note
+
+
+# --- field test 6 (F3): a ref against a kind that can never produce ---------
+#
+# The reported cost: following the README's generic `${{other.ATTR}}` syntax, a
+# lambda referencing an sqs queue reached tofu, created the function, launched
+# the container, and failed there with a message claiming the sqs node
+# "publishes no facts" -- ~2 minutes and a failed apply for a canvas that could
+# be refused deterministically before tofu started. The producer set
+# (`REFERENCEABLE_KINDS`) is static canvas data, so this check needs no I/O.
+
+
+def test_a_ref_to_a_kind_that_cannot_produce_is_refused_before_tofu_runs():
+    canvas = {
+        "nodes": [
+            {"id": "n1", "type": "lambda", "data": {
+                "label": "worker", "env": {"QUEUE_URL": "${{jobs.QUEUE_URL}}"}}},
+            {"id": "n2", "type": "sqs", "data": {"label": "jobs"}},
+        ],
+        "edges": [],
+    }
+    proj = generate_tf(canvas_to_stack(canvas))
+    # Both nodes are still BUILT and covered -- this is a wiring error, not a
+    # coverage gap (the field test 5 distinction, which holds here too).
+    assert 'resource "aws_lambda_function" "worker"' in proj.files["main.tf"]
+    assert 'resource "aws_sqs_queue" "jobs"' in proj.files["main.tf"]
+    assert proj.unsupported == []
+    (note,) = proj.wiring_errors
+    assert "worker (lambda)" in note and "QUEUE_URL" in note
+    assert "'jobs' (kind: sqs)" in note
+    assert "no sqs node publishes an endpoint a reference can resolve" in note
+    assert "Only rds, elasticache, alb and ec2 nodes do" in note
+    # It must not deny the facts the user can see in `odin world`...
+    assert "OBSERVED state, not wiring values" in note
+    assert "publishes no facts" not in note
+    # ...and must say what actually works instead.
+    assert "AWS_ENDPOINT_URL" in note
+
+
+def test_a_ref_to_a_real_producer_on_the_canvas_is_not_a_wiring_error():
+    """The guardrail: this refusal must not start rejecting the wiring that is
+    the whole point of the feature."""
+    canvas = {
+        "nodes": [
+            {"id": "n1", "type": "ecs", "data": {
+                "label": "web", "image": "nginx:alpine", "env": {"DATABASE_URL": "${{db.DATABASE_URL}}"}}},
+            {"id": "n2", "type": "rds", "data": {"label": "db"}},
+        ],
+        "edges": [],
+    }
+    proj = generate_tf(canvas_to_stack(canvas))
+    assert proj.wiring_errors == []
+    assert "depends_on = [aws_db_instance.db]" in proj.files["main.tf"]
+
+
+def test_every_kind_odin_models_is_either_referenceable_or_refused_by_name():
+    """The drift guard on the hcl side. `REFERENCEABLE_KINDS` is what
+    `gateway/wiring.py::producer_facts` can build; a kind that is NOT in it must
+    be refused with the wiring-model reason, never with a readiness reason and
+    never silently wired. Every modelled kind, so a new one cannot slip through
+    by being forgotten."""
+    referenceable, refused = set(), set()
+    for kind in sorted(MODELLED_NODE_TYPES - {"lambda"}):
+        canvas = {
+            "nodes": [
+                {"id": "n1", "type": "lambda", "data": {"label": "worker", "env": {"X": "${{p.ATTR}}"}}},
+                {"id": "n2", "type": kind, "data": _canvas_data_for(kind)},
+            ],
+            "edges": [],
+        }
+        notes = generate_tf(canvas_to_stack(canvas)).wiring_errors
+        # A kind whose own builder declines (a subnet with no VPC) is not in
+        # `refs` at all and reports the not-on-this-canvas reason -- that is a
+        # different question and is excluded rather than mis-counted.
+        if any("is not a resource on this canvas" in note for note in notes):
+            continue
+        (referenceable if not notes else refused).add(kind)
+    assert referenceable == set(REFERENCEABLE_KINDS) - {"lambda"}
+    assert refused and not refused & set(REFERENCEABLE_KINDS)
+
+
+def _canvas_data_for(kind: str) -> dict:
+    """The minimum a node of `kind` needs to be BUILT, so the loop above tests
+    the ref rule rather than a builder decline."""
+    return {
+        "label": "p",
+        "engine": "postgres", "runtime": "python3.12", "image": "nginx:alpine",
+        "partitionKey": "id", "cidr": "10.0.0.0/16", "vpc": "p", "subnet": "p",
+    }
 
 
 # --- field test 5: a wiring typo is not a coverage gap ----------------------

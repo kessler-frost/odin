@@ -251,13 +251,31 @@ canvas and vice versa.
 | `type` | yes | one of the kinds above; anything else is skipped, never applied |
 | `position` | yes | coordinates on odin's 20px grid. Only the UI reads it, and a node without one used to blank the canvas; `odin canvas set` now fills one in and says so on stderr |
 | `data.label` | yes | the canonical id: the name in `odin world`, in the Terraform, and in `${{...}}` references. Falls back to `id` |
-| `data.*` | no | config fields as the panel writes them (`cidr`, `engine`, `image`, `password`, …). A value like `${{other.ATTR}}` becomes a live reference resolved at reconcile time |
+| `data.*` | no | config fields as the panel writes them (`cidr`, `engine`, `image`, `password`, …). A value like `${{other.ATTR}}` becomes a live reference — see the note below for which kinds can be referenced |
 | `data.vpc` / `data.subnet` | no | containment, as the *label* of the containing node. The UI derives these from geometry; by hand, set them yourself |
 | `size` | no | width/height, for the container kinds (`vpc`, `subnet`) whose geometry is what nesting means |
 
 `edgeType` is `"iam"` (a grant, where `permissions` is exactly what the target
 workload's key may do) or `"network"` (reachability); permissions with no
 `edgeType` are treated as `iam`.
+
+**`${{producer.ATTR}}` works between specific kinds, not any two nodes.** Only
+four kinds publish an address a reference can resolve — **`rds`**
+(`DATABASE_URL`, `endpoint`, and the `_VM`/`_MESH` variants),
+**`elasticache`** (`REDIS_URL`, `endpoint`, `port`, `_VM`), **`alb`**
+(`ALB_ENDPOINT`) and **`ec2`** (`PRIVATE_IP`, `MESH_IP`) — and only **`ecs`** and
+**`lambda`** nodes consume refs, since a ref is delivered as an environment
+variable when the workload's container launches. That is also *when* it resolves:
+at launch, by the gateway, not when the canvas is applied.
+
+A ref to any other kind is **refused before tofu runs** (HTTP 409, naming the
+reference and the variable that would have gone unset) rather than failing
+mid-apply. The trap it saves you from: `s3`, `sqs`, `sns` and `dynamodb` *do*
+publish facts you can see in `odin world` — `BUCKET`, `QUEUE_URL`, `TOPIC_ARN`,
+`TABLE` — but those are **observed state, not wiring values**, so the syntax
+invites a reference that can never resolve. Reach those by name with the AWS SDK
+instead: odin already injects `AWS_ENDPOINT_URL` and the node's own credentials
+into the container.
 
 ## Contracts a script can rely on
 
@@ -284,6 +302,26 @@ A typo'd URL must not pass a CI drift gate as real drift. `odin stop` is the mir
 running is exit `0`, since that is the end state it was asked for, and it waits
 up to 20 seconds for the server to release the store lock before answering. Both
 of its non-zero cases mean odin is still up.
+
+**A failed destroy does not leave things half-gone — it leaves them coming back.**
+The env's desired state is deliberately kept, which is what makes a retry possible
+at all, so the reconciler re-creates any `s3`/`sqs`/`sns`/`dynamodb` resource the
+destroy already removed, within about one tick (measured: 0.74–0.76s at the default
+1s poll). So `still_standing` in the failure body is tofu's state plus real
+containers *at that moment*, not a list of what exists now — `odin world` answers
+that. To freeze an env while you diagnose, run `odin stop` first: nothing converges
+an env while odin is not running.
+
+Three things a JSON reader should know about failure bodies. `still_standing.tf_state`
+and `still_standing.containers` are `null` when odin **could not tell** (an
+unreadable state file, a docker daemon that would not answer) as opposed to `[]`
+for "nothing there" — `jq '.still_standing.containers | length'` breaks on null, and
+that distinction is the point, because an empty list used to be reported for both.
+`unhealthy_resources` now also appears when tofu itself failed, carrying odin's own
+recorded reason for a resource tofu could only describe as an unexpected state.
+And a store file odin cannot read is its own status, `store_unreadable`, with a
+`store: {path, role}` block naming the file and whether it is a rebuildable cache
+or your desired state.
 
 ### The one gate a CI pipeline needs
 

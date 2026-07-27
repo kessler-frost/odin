@@ -30,6 +30,8 @@ tests/api/test_canvas_validation.py uses it).
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -39,7 +41,7 @@ from odin.aws.backings import BackingUnavailable
 from odin.gateway.models import ec2compute
 from odin.runtime.colima import ContainerFacts, HostFacts, RunHandle
 from odin.server import create_app
-from odin.spec.store import SpecStore
+from odin.spec.store import SpecStore, StoreUnreadable
 from odin.spec.translate import canvas_to_stack
 
 S3_ONLY = {"nodes": [{"type": "s3", "data": {"label": "uploads"}}], "edges": []}
@@ -288,6 +290,15 @@ def test_destroy_reports_a_failed_vm_reclaim_with_the_vm_names_in_the_body(tmp_p
     assert "odin-ec2-applyfix-i-123" in body["error"]
     assert "still running" in body["error"]
     assert body["status"] != "destroyed"
+    # Field test 6, F2's sibling. This advice used to end "the env's desired
+    # state was left as it was, so the retry above picks up exactly here" -- and
+    # `_failure_body` is a single sentence with no "retry above" in it, so the
+    # phrase referred to nothing AND claimed a resumability that does not exist:
+    # the unchanged desired state is exactly why the loop re-creates what this
+    # request removed.
+    assert "picks up exactly here" not in body["error"]
+    assert "is re-created within about one tick" in body["error"]
+    assert "starts over rather than resuming" in body["error"]
 
 
 def test_apply_full_reports_a_mesh_refresh_failure_by_name(tmp_path, monkeypatch):
@@ -367,3 +378,98 @@ def test_the_env_in_the_verdict_is_the_one_the_request_named(tmp_path, monkeypat
     with TestClient(app, raise_server_exceptions=False) as client:
         default = client.post("/apply-full", json=S3_ONLY).json()
     assert default["env"] == "default"  # no ?env= -> odin's own default, never ""
+
+
+# --- field test 6 (F5): recovery advice that does not loop ------------------
+#
+# `world.json` overwritten with invalid UTF-8, measured on a real server:
+#
+#   GET /world?env=srvfixf3  ->  500, "UnicodeDecodeError: 'utf-8' codec can't
+#     decode byte 0xff in position 57 ... Check `odin world --env srvfixf3` and
+#     `odin tf plan --env srvfixf3` ... before re-applying"
+#
+# `odin world` reads that same file, fails identically, and recommends itself.
+# The exit codes were right and nothing false was claimed -- the advice was a
+# loop, and the message named no file at all, because `UnicodeDecodeError`
+# carries no path.
+
+
+def _corrupt_world(tmp_path, env: str = "applyfix") -> Path:
+    world = tmp_path / env / "world.json"
+    world.parent.mkdir(parents=True, exist_ok=True)
+    world.write_bytes(b'{"env": "' + env.encode() + b'", "resources": [\xff]}')
+    return world
+
+
+def test_a_corrupt_world_json_names_the_file_and_the_recovery_that_works(tmp_path):
+    world = _corrupt_world(tmp_path)
+    app = _app(tmp_path)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        resp = client.get("/world", params={"env": "applyfix"})
+    assert resp.status_code == 500
+    body = resp.json()
+    assert body["status"] == "store_unreadable"
+    # Structured, not scraped back out of the prose.
+    assert body["store"] == {"path": str(world), "role": "cache"}
+    error = body["error"]
+    assert str(world) in error
+    # THE fix for the loop: the message disowns its own `odin world` suggestion
+    # and names a command that survives a corrupt store.
+    assert "Do NOT run `odin world --env applyfix` on the strength of this message" in error
+    assert "`odin events --env applyfix`" in error
+    # ...and the recovery is the one that was measured to work.
+    assert f"`rm {world}`" in error
+    assert "rebuilds it from the real containers on its next tick" in error
+
+
+def test_a_corrupt_desired_state_is_never_told_to_delete_the_file(tmp_path):
+    """The opposite role, and the opposite recovery. Deleting a Stack revision
+    destroys the only record of what the user asked for, so the advice must not
+    reach for `rm` -- and `odin world` genuinely does still work here."""
+    store = SpecStore(tmp_path)
+    rev = store.apply(canvas_to_stack(S3_ONLY, env="applyfix"))
+    (tmp_path / "applyfix" / "stacks" / f"{rev}.json").write_text("{ not a stack")
+    app = _app(tmp_path)
+    # `/tf/plan` is one of the reads that goes through `get_stack`; `/world` does
+    # not, which is exactly the asymmetry the two roles exist to describe.
+    with TestClient(app, raise_server_exceptions=False) as client:
+        resp = client.post("/tf/plan", params={"env": "applyfix"})
+    assert resp.status_code == 500, resp.text
+    body = resp.json()
+    assert body["status"] == "store_unreadable"
+    assert body["store"]["role"] == "desired"
+    error = body["error"]
+    assert "do NOT delete it" in error
+    assert "`odin import <archive>`" in error
+    assert "rm " not in error
+
+
+def test_an_unmapped_store_role_states_that_rather_than_nothing(tmp_path, monkeypatch):
+    """The `_DESTROY_STATUS` shape, applied to the advice: a role nobody mapped
+    must not format an EMPTY instruction -- the one thing worse than no advice.
+    """
+    def boom(*a, **k):
+        raise StoreUnreadable(Path("/x/y.json"), "a-role-nobody-mapped", ValueError("bad"))
+
+    app = _app(tmp_path)
+    monkeypatch.setattr(type(app.state.store), "current_world", boom)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        resp = client.get("/world", params={"env": "applyfix"})
+    assert resp.status_code == 500
+    error = resp.json()["error"]
+    assert "odin has no specific recovery for that file" in error
+    assert not error.rstrip().endswith("To fix it:")
+
+
+def test_an_exception_with_no_message_still_gives_a_reason(tmp_path, monkeypatch):
+    """`f"{type(exc).__name__}: {exc}"` rendered a dangling colon for any
+    exception built with no args -- in the handler that catches EVERY route."""
+    monkeypatch.setattr(
+        "odin.server.stranded_in_tf_state",
+        lambda *a, **k: (_ for _ in ()).throw(TimeoutError()),
+    )
+    app = _app(tmp_path)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        error = client.get("/world", params={"env": "applyfix"}).json()["error"]
+    assert "TimeoutError: raised with no message" in error
+    assert "TimeoutError: ." not in error

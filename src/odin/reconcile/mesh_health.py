@@ -130,7 +130,12 @@ def _probe(
         return _verdict(root, env, address, sidecar_target, sidecar_port, rt, mesh, manager)
     except Exception as exc:  # noqa: BLE001 -- a verdict must never fail a tick
         log.warning("mesh health check failed for %s (env %r): %s", address, env, exc)
-        return MeshVerdict(ok=False, reason=f"the mesh health check itself failed: {exc}")
+        # Field test 6, F4's class: `{exc}` alone is empty for an exception built
+        # with no message, and this reason is interpolated straight into the
+        # resource's crashed verdict below -- so the ONE sentence explaining why
+        # the mesh was withheld would have ended in a colon.
+        detail = str(exc) or f"{type(exc).__name__}, raised with no message"
+        return MeshVerdict(ok=False, reason=f"the mesh health check itself failed: {detail}")
 
 
 def _verdict(

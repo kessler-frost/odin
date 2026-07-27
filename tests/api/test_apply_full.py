@@ -1061,8 +1061,25 @@ def test_apply_full_stays_applied_when_no_lambda_or_database_is_broken(tmp_path,
 
 def test_a_tofu_failure_is_not_also_charged_the_lambda_and_rds_waits(tmp_path, monkeypatch):
     """Same rule the ECS wait follows: a tofu failure has already failed the
-    apply honestly, and a second verification would only make it slower while
-    replacing the actual diagnosis with a downstream symptom."""
+    apply honestly, so it must not be charged the two slow WAITS on top.
+
+    Field test 6 (F4) split the wait from the read. The original form of this
+    test asserted `"unhealthy_resources" not in body`, which conflated them --
+    and that conflation is the bug: when tofu fails BECAUSE a database never
+    came up, odin's own records are the only place the real reason lives, and
+    tofu's own output is
+    `unexpected state 'failed', ... last error: %!s(<nil>)`. So the waits stay
+    skipped (asserted directly here, not inferred from the body) and the READ
+    happens."""
+    called: list[str] = []
+    monkeypatch.setattr(
+        "odin.server.lambdactl.wait_for_active_functions",
+        lambda *a, **k: called.append("lambda") or [],
+    )
+    monkeypatch.setattr(
+        "odin.server.rdsctl.wait_for_available_instances",
+        lambda *a, **k: called.append("rds") or [],
+    )
     _patch_dead_substrates(monkeypatch)
     _write_fake_tofu(tmp_path, _APPLY_FAILS)
     monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
@@ -1074,4 +1091,82 @@ def test_a_tofu_failure_is_not_also_charged_the_lambda_and_rds_waits(tmp_path, m
         resp = client.post("/apply-full", json=S3_SQS)
     body = resp.json()
     assert body["status"] == "applied_tf_failed", body
-    assert "unhealthy_resources" not in body
+    assert called == [], "a failed tofu apply must not be charged the readiness waits"
+
+
+def test_a_failed_tf_apply_names_the_reason_odin_already_holds(tmp_path, monkeypatch):
+    """Field test 6, F4. A fresh RDS apply against a Postgres that never accepts
+    connections failed with the AWS provider's own
+
+        Error: waiting for RDS DB Instance (srvfixdb) create: unexpected state
+        'failed', wanted target 'available, storage-optimization'.
+        last error: %!s(<nil>)
+
+    (captured verbatim from a real apply; the format string
+    `unexpected state '%s', wanted target '%s'. last error: %s` is in the
+    terraform-provider-aws v5.100.0 binary, so odin cannot change that sentence)
+    while odin's own record held `Postgres never became ready: ... timeout
+    expired` the whole time and printed none of it.
+
+    The apply's verdict must therefore carry odin's reason, in `note` -- which is
+    what `odin apply` echoes -- and structurally in `unhealthy_resources`.
+
+    The reason asserted below is the SEEDED one, and that is the point: it is
+    what the record said when tofu failed. `converge_db_instances` runs a few
+    lines later and overwrites it (here with `container did not start: docker run
+    failed: no space left on device`, from `_DeadPostgresRds`), which is why the
+    read has to happen inside the hold and why reading it after the fact finds
+    nothing -- on the real env this was measured against, the record had gone
+    back to `status=available, status_reason=None` by the time it was inspected.
+    """
+    _patch_dead_substrates(monkeypatch)
+    _write_fake_tofu(tmp_path, _APPLY_FAILS)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
+    _patch_translate(monkeypatch, TranslateResult(files=_skeleton_files(), refined=True))
+    app = _app(tmp_path)
+    _seed_failed_database(app)
+    with TestClient(app) as client:
+        resp = client.post("/apply-full", json=S3_SQS)
+    body = resp.json()
+    assert body["status"] == "applied_tf_failed", body
+    assert body["unhealthy_resources"] == [{
+        "kind": "rds", "node": "app-db", "observed": "failed",
+        "reason": "container removed outside odin",
+    }], body
+    # ...and legibly, in the one field the CLI echoes verbatim.
+    assert "desired state not committed" in body["note"]
+    assert "odin's own records say why" in body["note"]
+    assert "rds app-db is failed (container removed outside odin)" in body["note"]
+    # The record really was overwritten afterwards -- so this reason could only
+    # have come from the read inside the hold.
+    assert app.state.gateway_stores.rdsctl.get("default", "db:app-db")["status_reason"] != (
+        "container removed outside odin"
+    )
+
+
+def test_a_fault_with_no_recorded_reason_still_says_what_is_known(tmp_path, monkeypatch):
+    """`FunctionFault.reason`/`DatabaseFault.reason` are `str | None`, and the
+    old line simply dropped the parenthesis -- so "rds app-db is failed" was the
+    whole verdict, indistinguishable from a fault whose reason odin had and did
+    not print. A reason that genuinely is not there must SAY that."""
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: None)
+    _patch_translate(monkeypatch, TranslateResult(files={}, refined=False))
+    app = _app(tmp_path)
+    _seed_failed_database(app)
+    stores = app.state.gateway_stores
+    stores.rdsctl.set("default", "db:app-db", {
+        **stores.rdsctl.get("default", "db:app-db"), "status_reason": None,
+    })
+    # The converge pass would re-create it and author a reason; a substrate that
+    # raises nothing is not what this test is about, so keep the record as-is.
+    monkeypatch.setattr("odin.server.rdsctl.converge_db_instances", lambda *a, **k: [])
+    monkeypatch.setattr("odin.server.rdsctl.wait_for_available_instances", lambda *a, **k: [])
+    with TestClient(app) as client:
+        resp = client.post("/apply-full", json={"nodes": [], "edges": []})
+    body = resp.json()
+    assert body["status"] == "applied_resources_unhealthy", body
+    assert body["unhealthy_resources"] == [
+        {"kind": "rds", "node": "app-db", "observed": "failed", "reason": None},
+    ], body
+    assert "rds app-db is failed (no reason was recorded on the record" in body["note"]
+    assert "(None)" not in body["note"] and "()" not in body["note"]

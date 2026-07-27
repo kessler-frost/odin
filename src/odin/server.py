@@ -46,8 +46,9 @@ from odin.reconcile.tf_status import stranded_in_tf_state
 from odin.runtime.colima import ColimaRuntime
 from odin.simulate.runner import SimulateBusy, TfRunner, TofuNotInstalled
 from odin.simulate.workspace import tf_dir
+from odin.spec import store as store_mod
 from odin.spec.models import Stack, World
-from odin.spec.store import SpecStore
+from odin.spec.store import SpecStore, StoreUnreadable
 from odin.spec.translate import MODELLED_NODE_TYPES, canvas_to_stack, drawn_node_types, skipped_node_types
 from odin.util import STORE_LOCK_NAME, StoreLock, hold_store_lock, odin_version
 
@@ -184,10 +185,29 @@ def _managed_resources(root: Path, env: str) -> list[dict]:
 
 
 def _tf_state_addresses(root: Path, env: str) -> list[str]:
-    """Every managed resource tofu's own state still holds for `env` -- the
-    authoritative answer to "what is still standing" after a destroy that
-    didn't finish."""
+    """Every managed resource tofu's own state still holds for `env` -- TOFU'S
+    HALF of "what is still standing" after a destroy that didn't finish.
+
+    Not the whole answer, and this docstring used to claim it was ("the
+    authoritative answer"). tofu's state knows nothing about the s3/sqs/sns/
+    dynamodb resources the reconciler authors, so a resource a partial destroy
+    really deleted -- and the loop then re-created -- is in neither this list nor
+    the container list. Field test 6, F2: that omission is why the failure report
+    could under-describe an env. Always read with `_tf_state_readable`, which is
+    what separates "holds nothing" from "odin could not tell"."""
     return sorted(f"{r['type']}.{r['name']}" for r in _managed_resources(root, env))
+
+
+def _tf_state_readable(root: Path, env: str) -> bool:
+    """False only when `terraform.tfstate` is THERE and did not parse -- i.e.
+    when an empty `_tf_state_addresses` means "unknown", not "nothing".
+
+    tofu rewrites that file in place, so a run killed mid-write leaves exactly
+    this. `_tf_state` folds it into `{}` deliberately (a read must not 500), and
+    folding it into an empty ANSWER is what let a failed destroy report
+    `0 resource(s) []` and read like a success."""
+    state = tf_dir(root, env) / "terraform.tfstate"
+    return not (state.is_file() and state.read_text().strip() and not _tf_state(root, env))
 
 
 # The tag `agent/hcl.py::_tags_block` stamps on EVERY primary canvas-node-backed
@@ -318,7 +338,7 @@ def _uncovered_destroys(
 
 
 def _wiring_rejection(wiring_errors: list[str], env: str) -> JSONResponse:
-    """A canvas wiring reference that names a node which is not on the canvas.
+    """A canvas wiring reference that can never be given a value.
 
     NOT a coverage problem, and deliberately not reported as one (field test 5,
     F5-8: it used to ride in `unsupported`, so `not_covered` -- the one field a
@@ -327,14 +347,20 @@ def _wiring_rejection(wiring_errors: list[str], env: str) -> JSONResponse:
     variable, so `gateway/wiring.py::_resolve` raises `UnresolvedRef` for it at
     launch and the apply fails anyway. Refusing here reaches the same verdict
     before any container is created, naming the node and the ref instead of a
-    stopped task."""
+    stopped task.
+
+    THIS PREAMBLE SAYS NOTHING ABOUT THE CAUSE, on purpose. It used to assert
+    that the refs "name a node that is not on the canvas" -- true of the only
+    fault `_unwired_refs` could report when it was written, and a fresh lie the
+    moment field test 6 added the second one (a ref against a node that IS on the
+    canvas and is a kind nothing can reference). Each entry states its own
+    reason; the wrapper only counts them."""
     named = "; ".join(wiring_errors)
     return JSONResponse(status_code=409, content={
         "error": (
             f"refusing to apply: {len(wiring_errors)} canvas wiring reference(s) in env {env!r} "
-            f"name a node that is not on the canvas, so the workload(s) below could never be "
-            f"given those variables and would fail to start: {named}. Fix the reference(s) or "
-            f"add the missing node, then re-apply. Nothing was changed."
+            f"can never be given a value, so the workload(s) below would fail to start. Each one "
+            f"says why: {named}. Fix the reference(s) and re-apply. Nothing was changed."
         ),
         "wiring_errors": wiring_errors,
         "env": env,
@@ -360,7 +386,7 @@ def _uncovered_rejection(uncovered: list[dict], env: str) -> JSONResponse:
     })
 
 
-def _surviving_containers(runtime, env: str) -> list[str]:
+def _surviving_containers(runtime, env: str) -> list[str] | None:
     """Odin containers this env still has, by odin's own container naming --
     `odin-aws-{backing}-{env}` carries the env as a SUFFIX, `odin-rds-{env}-…`
     / `odin-ecs-{env}-…` / `odin-lambda-{env}-…` as an INFIX, both anchored on
@@ -370,12 +396,18 @@ def _surviving_containers(runtime, env: str) -> list[str]:
     Best-effort by design, and `reconcile/drift.py::_listing`'s exact
     reasoning: this runs only when a destroy has ALREADY failed, so a docker
     daemon that won't answer must degrade to "couldn't tell" rather than
-    replace a real failure report with a traceback."""
+    replace a real failure report with a traceback.
+
+    ...and "couldn't tell" is `None`, not `[]` (field test 6, F4's sibling).
+    Returning `[]` for a docker daemon that would not answer put the SAME text
+    in front of the user as a genuinely clean machine -- `0 container(s) []` --
+    with the real reason in the server log only, in the one report whose whole
+    job is naming what survived a failed teardown."""
     try:
         names = runtime.container_names()
     except Exception as exc:  # noqa: BLE001 -- any CLI/parse failure means "unknown"
         log.warning("could not list containers while reporting a failed destroy (%s)", exc)
-        return []
+        return None
     return sorted(name for name in names if name.endswith(f"-{env}") or f"-{env}-" in name)
 
 
@@ -422,13 +454,68 @@ _BACKING_ADVICE = (
     "the backing container named above is not serving this env. Re-run Apply "
     "(`odin apply --env {env}`): odin re-creates a missing or stopped backing on every "
     "apply. Nothing in this response is a claim about what was applied before it failed "
-    "-- check `odin world --env {env}` and `odin tf plan --env {env}` before retrying"
+    # Field test 6's advice sweep: `odin tf plan` used to be recommended here as
+    # a witness. Under THIS condition it is a trap -- `/tf/plan` deliberately
+    # does not ensure backings, so tofu's refresh reads go through the gateway to
+    # a backing that is not there, get a real ServiceUnavailable, and aws-sdk-go-v2
+    # retries each one ~25 times with silent backoff. That is the 8m26s
+    # "hang with no progress" `simulate/runner.py::_WEDGED_DESTROY_HINT`
+    # documents. `odin world` reads the store and answers instantly.
+    "-- check `odin world --env {env}` before retrying (not `odin tf plan`: with a backing "
+    "down, its refresh reads hang on the gateway's ServiceUnavailable retries for minutes)"
 )
 _UNEXPECTED_ADVICE = (
     "odin has no specific verdict for that failure, so this is reported as a plain "
     "FAILURE -- nothing here verified otherwise. The server log has the full traceback. "
     "Check `odin world --env {env}` and `odin tf plan --env {env}` for what env {env!r} "
     "actually holds before re-applying"
+)
+
+# --- a store file odin cannot read (field test 6, F5) ---
+#
+# The old behaviour: `world.json` overwritten with invalid UTF-8 fell through to
+# `_UNEXPECTED_ADVICE`, which sent the user to `odin world` -- the command that
+# reads that very file. Measured on a real server: `GET /world` answered 500
+# with `UnicodeDecodeError ... position 57` and told the user to run `odin
+# world`, which fails identically and recommends itself. A loop, and the message
+# named no file, because `UnicodeDecodeError` carries no path.
+#
+# `spec/store.py::StoreUnreadable` now raises from the read site with the path
+# and the file's ROLE, and the recovery is looked up from the role -- the
+# `_DESTROY_STATUS` shape, so a role nobody mapped states that instead of
+# formatting an empty instruction. Both recoveries below are measured or read
+# out of source, not guessed:
+#   * `rm world.json` -- on a 4-resource env, all four were back `healthy` with
+#     byte-identical facts ONE tick later, `consecutive_failures` 20 -> 0.
+#   * `odin events` survives, because `events.jsonl` is a separate append-only
+#     file (api/ws.py), and it holds the last World odin observed.
+#   * `odin tf plan` survives a corrupt `world.json` because it reads HEAD +
+#     `stacks/<rev>.json` + the tofu workspace and never calls `current_world`
+#     -- and for that same reason it is NOT offered for a corrupt DESIRED file.
+_STORE_RECOVERY = {
+    store_mod.CACHE: (
+        "that file is odin's OBSERVED-state cache, not your desired state -- delete it "
+        "(`rm {path}`) and this env's reconciler rebuilds it from the real containers on its next "
+        "tick (measured: a 4-resource env came back complete, with identical facts, one tick "
+        "later). `odin tf plan --env {env}` works right now and reads none of it"
+    ),
+    store_mod.DESIRED: (
+        "that file IS this env's desired state -- the only record of what you asked for -- so do "
+        "NOT delete it. Restore it with `odin import <archive>` if you have an `odin export` of "
+        "this env, or draw the canvas again and Apply to author a fresh revision. `odin world "
+        "--env {env}` still works, and reports what odin last OBSERVED"
+    ),
+}
+_STORE_RECOVERY_UNKNOWN = (
+    "odin has no specific recovery for that file, and does not invent one: the server log has "
+    "the traceback that names where it was read"
+)
+_STORE_ADVICE = (
+    "odin cannot read one of its own store files for env {env}. Do NOT run `odin world --env {env}` "
+    "on the strength of this message -- if that is the unreadable file, it fails the same way and "
+    "tells you the same thing. What survives any corrupt store file: `odin events --env {env}` "
+    "(a separate append-only log, holding the last state odin observed) and `odin status`. To fix "
+    "it: {recovery}"
 )
 # Deliberately NOT "this is an odin bug": the biggest population here is a
 # backing container that never became ready (`BackingAws._await_ready` raises a
@@ -449,10 +536,24 @@ _EXCEPTION_VERDICTS: dict[type[BaseException], _Verdict] = {
     # this map they raised into the bare-text 500 -- and `/destroy`'s comment
     # said `ReclaimFailed` produced "500 with the VM names" while the VM names
     # only ever reached the server log.
+    # Field test 6, F2's sibling -- and the worse copy of it. This used to read
+    # "the env's desired state was left as it was, so the retry above picks up
+    # exactly here", which is wrong twice: there is no "retry above" in a
+    # `_failure_body` sentence, and the unchanged desired state is exactly why
+    # the state does NOT stay put (`_RECREATED_BY_THE_LOOP`).
     ec2compute.ReclaimFailed: _Verdict(
         status="reclaim_failed", code=500,
-        advice="the env's desired state was left as it was, so the retry above picks up exactly here",
+        advice=(
+            "the rest of this request did not finish. The env's desired state was left as it was, "
+            "which means odin's reconciler goes on converging it: any s3/sqs/sns/dynamodb resource "
+            "this request already removed is re-created within about one tick. Fix the cause named "
+            "above and run the command again -- it starts over rather than resuming. `odin world "
+            "--env {env}` is what says which resources exist right now"
+        ),
     ),
+    # `role` decides the recovery, so the advice carries a `{recovery}` slot
+    # `_advice_fields` fills in -- see `_STORE_ADVICE`.
+    StoreUnreadable: _Verdict(status="store_unreadable", code=500, advice=_STORE_ADVICE),
     ec2compute.MeshRefreshFailed: _Verdict(
         status="mesh_refresh_failed", code=500,
         advice=(
@@ -464,6 +565,21 @@ _EXCEPTION_VERDICTS: dict[type[BaseException], _Verdict] = {
 _UNEXPECTED = _Verdict(status="server_error", code=500, advice=_UNEXPECTED_ADVICE)
 
 
+def _advice_fields(exc: Exception, env: str) -> dict[str, str]:
+    """The extra `{...}` slots one exception's advice needs, read off the
+    exception itself. Only `StoreUnreadable` has any today; `str.format` ignores
+    keys a template doesn't use, so every other verdict is unaffected. The
+    recovery comes through a map keyed on the file's ROLE, and an unmapped role
+    falls through to `_STORE_RECOVERY_UNKNOWN` rather than to an empty
+    instruction -- the one thing worse than no advice."""
+    path = getattr(exc, "path", "")
+    role = getattr(exc, "role", "")
+    return {
+        "path": str(path),
+        "recovery": _STORE_RECOVERY.get(role, _STORE_RECOVERY_UNKNOWN).format(path=path, env=env),
+    }
+
+
 def _failure_body(request: Request, exc: Exception) -> tuple[int, dict]:
     """The JSON verdict for an exception that reached the ASGI boundary.
 
@@ -472,12 +588,19 @@ def _failure_body(request: Request, exc: Exception) -> tuple[int, dict]:
     bare "Internal Server Error" straight back."""
     verdict = _EXCEPTION_VERDICTS.get(type(exc), _UNEXPECTED)
     env = request.query_params.get("env") or ENV
+    # Field test 6, F4's sibling: `str(exc)` is empty for any exception built
+    # with no args (`TimeoutError()`, `KeyError()`, and `TofuNotInstalled()`
+    # right here in this tree), which rendered `-- TimeoutError: . odin has no
+    # specific verdict...` -- a bare colon where the reason belongs, in the
+    # handler that catches EVERY route. Name the class as the reason when the
+    # class is all there is.
+    detail = str(exc) or f"raised with no message; {type(exc).__name__} is the whole of what odin knows"
     body = {
         "status": verdict.status,
         "env": env,
         "error": (
             f"{request.method} {request.url.path} did not complete for env {env!r} -- "
-            f"{type(exc).__name__}: {exc}. {verdict.advice.format(env=env)}"
+            f"{type(exc).__name__}: {detail}. {verdict.advice.format(env=env, **_advice_fields(exc, env))}"
         ),
     }
     # Structured, not scraped out of `error`: the container name and the state
@@ -485,6 +608,9 @@ def _failure_body(request: Request, exc: Exception) -> tuple[int, dict]:
     container = getattr(exc, "container", "")
     if container:
         body["backing"] = {"container": container, "observed": getattr(exc, "observed", "")}
+    store_path = getattr(exc, "path", "")
+    if store_path:
+        body["store"] = {"path": str(store_path), "role": getattr(exc, "role", "")}
     return verdict.code, body
 
 
@@ -530,6 +656,96 @@ _UNKNOWN_DESTROY_CAUSE = (
     "the destroy finished without reporting any outcome, which is an odin bug -- reported as a "
     "failure rather than assumed to have worked, because nothing here verified that it did"
 )
+
+# --- what a FAILED destroy really leaves behind (field test 6, F2) ---
+#
+# The behaviour is deliberate and does NOT change here: `store.apply(Stack(env=
+# env))` stays gated on `destroyed`, because committing an empty desired state
+# over a failed teardown BRICKED the env (field test 5 -- the note below says
+# how). What changes is the sentence, which used to end
+#
+#     "The env's desired state was left as it was, so re-running the destroy
+#      once the cause above is fixed picks up exactly here."
+#
+# telling the user progress was preserved while odin was reversing it. MEASURED
+# on a real server at the shipped cadence -- `poll_interval=1.0`,
+# ODIN_DRIFT_SWEEP_TICKS never set anywhere -- with the desired state still
+# asking for them, a queue and a bucket deleted out from under odin were both
+# back in the REAL backings (probed with boto3 directly, not via `/world`)
+# **0.76s** later. The path: `reconciler.tick()` below -> `_converge` ->
+# `_observe_provisioned` reads the missing resource as `crashed` ->
+# `plan()`'s pending/crashed branch emits `ProvisionResource` -> a real
+# `create_queue`/`create_bucket`. The background loop redoes it every second
+# regardless of the explicit tick.
+#
+# Two things the old sentence also got wrong by omission, both fixed below:
+# `still_standing` is tofu's own state plus real containers, so a resource the
+# destroy DID delete and the loop then re-created appears in NEITHER field; and
+# "re-running picks up exactly here" is not resumption -- the retry starts over.
+#
+# DERIVED, not asserted (the `_DESTROY_STATUS` rule one level up): the sentence
+# is built from the desired Stack that is still committed, so an env with no
+# PROVISIONED resource is not warned about a re-creation that cannot happen to
+# it, and a future PROVISIONED kind is covered without editing this text.
+_RECREATED_BY_THE_LOOP = (
+    "The env's desired state was deliberately left as it was -- that is what makes a retry "
+    "possible at all -- so this destroy did NOT preserve progress. odin's reconciler keeps "
+    "converging this env, and it RE-CREATES any of these that the destroy already removed, within "
+    "about one tick (~1s at the default poll interval; measured 0.76s): {recreated}. `still "
+    "standing` above is tofu's own state plus real containers -- it does NOT list a resource the "
+    "destroy deleted and the loop has since put back, so `odin world --env {env}` is what says "
+    "what exists now. What to do: fix the cause above and re-run `odin destroy --env {env}`; it "
+    "starts over rather than resuming, which is safe. To stop the re-creation while you diagnose, "
+    "run `odin stop` first -- nothing converges this env while odin is not running."
+)
+_NOTHING_RECREATED = (
+    "The env's desired state was deliberately left as it was -- that is what makes a retry "
+    "possible at all. This env's desired state holds no s3/sqs/sns/dynamodb resource, so odin's "
+    "reconciler is not re-creating anything behind you; but nothing was resumed either. Fix the "
+    "cause above and re-run `odin destroy --env {env}`, which starts over against whatever is "
+    "still there."
+)
+
+
+# `still standing` must never render a bare `[]`, and must never let "odin could
+# not tell" wear the same words as "there is nothing there" (field test 6, F4's
+# sibling). `None` from either witness is UNKNOWN; `[]` from both is a real
+# emptiness that still is not a success, and says so.
+_STANDING_UNKNOWN = "odin could not read {source}, so that half is UNKNOWN rather than zero"
+_TF_STATE_SOURCE = "tofu's own state file"
+_CONTAINER_SOURCE = "the machine's container list"
+_NOTHING_STANDING = (
+    "still standing: nothing odin can see -- tofu's state holds no resource for this env and no "
+    "container of odin's is left. That is not a success: the destroy did not complete (cause "
+    "above), so whatever it was in the middle of went unverified"
+)
+
+
+def _standing(source: str, names: list[str] | None, noun: str) -> str:
+    return (
+        _STANDING_UNKNOWN.format(source=source) if names is None
+        else f"{len(names)} {noun}(s) {names}"
+    )
+
+
+def _still_standing_text(tf_state: list[str] | None, containers: list[str] | None) -> str:
+    """Both witnesses in one clause. `== []` deliberately, not falsiness: `None`
+    is unknown and must not be folded into the nothing-standing sentence."""
+    if tf_state == [] and containers == []:
+        return _NOTHING_STANDING
+    return (
+        f"still standing: {_standing(_TF_STATE_SOURCE, tf_state, 'resource')} in tofu state, "
+        f"{_standing(_CONTAINER_SOURCE, containers, 'container')}"
+    )
+
+
+def _loop_leftover(stack: Stack, env: str) -> str:
+    """The closing sentence of a FAILED destroy: what the still-committed
+    desired state means for what happens NEXT. Selected by whether that Stack
+    holds anything the reconciler re-creates -- see `_RECREATED_BY_THE_LOOP`."""
+    recreated = sorted(f"{r.id} ({r.kind})" for r in stack.resources if r.kind in PROVISIONED)
+    template = _RECREATED_BY_THE_LOOP if recreated else _NOTHING_RECREATED
+    return template.format(recreated=", ".join(recreated), env=env)
 
 
 def _loop_health(reconcilers: dict[str, Reconciler], env: str) -> LoopHealth:
@@ -707,7 +923,15 @@ def create_apply_router(
                     # harmless and reported success over six live resources; a
                     # blanket failure would make an env tofu never touched
                     # un-destroyable without a tofu install it does not need.
-                    tf_outcome = "unavailable" if _tf_state_addresses(store.root, env) else "nothing_to_destroy"
+                    #
+                    # Field test 6, F4's sibling: the witness is only allowed to
+                    # score the SUCCESS side when it was actually readable. An
+                    # empty `_tf_state_addresses` used to be enough, and a state
+                    # file caught mid-rewrite folds to empty -- so "odin could
+                    # not tell" would have bought `nothing_to_destroy`, which is
+                    # a success. Unknown now goes the failure way.
+                    empty_state = _tf_state_readable(store.root, env) and not _tf_state_addresses(store.root, env)
+                    tf_outcome = "nothing_to_destroy" if empty_state else "unavailable"
                 except SimulateBusy as exc:  # a second call won the race after our guard passed
                     return JSONResponse(status_code=409, content={"error": str(exc)})
                 else:
@@ -778,20 +1002,18 @@ def create_apply_router(
         # and the real containers still on the machine. `error` is what makes
         # `odin destroy` exit nonzero: `cli/http.body_or_fail` keys on it, the
         # same convention every other honest failure in this file uses.
-        body["still_standing"] = {
-            "tf_state": _tf_state_addresses(store.root, env),
-            "containers": await asyncio.to_thread(_surviving_containers, runtime, env),
-        }
+        tf_state = _tf_state_addresses(store.root, env) if _tf_state_readable(store.root, env) else None
+        containers = await asyncio.to_thread(_surviving_containers, runtime, env)
+        body["still_standing"] = {"tf_state": tf_state, "containers": containers}
         cause = _DESTROY_CAUSE.get(tf_outcome, _UNKNOWN_DESTROY_CAUSE).format(
             exit_code=(body["tf"] or {}).get("exit_code"),
         )
         body["error"] = (
             f"destroy did not finish for env {env!r}: {cause}. "
-            f"still standing: {len(body['still_standing']['tf_state'])} resource(s) in tofu state "
-            f"{body['still_standing']['tf_state']}, "
-            f"{len(body['still_standing']['containers'])} container(s) {body['still_standing']['containers']}. "
-            f"The env's desired state was left as it was, so re-running the destroy once the cause "
-            f"above is fixed picks up exactly here."
+            f"{_still_standing_text(tf_state, containers)}. "
+            # The desired state that is STILL COMMITTED decides what happens
+            # next, so the sentence is derived from it -- see `_loop_leftover`.
+            f"{_loop_leftover(store.get_stack(env), env)}"
         )
         return JSONResponse(status_code=500, content=body)
 
@@ -1056,9 +1278,76 @@ def _unhealthy_wire(kind: str, node: str, observed: str, reason: str | None) -> 
     return {"kind": kind, "node": node, "observed": observed, "reason": reason}
 
 
+# A fault with no recorded reason still has to say something true. Field test 6,
+# F4's sibling: `reason` is `str | None` on both `FunctionFault` and
+# `DatabaseFault`, and the old line simply dropped the parenthesis -- so
+# "rds app-db is failed" was the whole verdict, indistinguishable from a fault
+# whose reason odin had and chose not to print.
+_NO_REASON_RECORDED = "no reason was recorded on the record; this is the observed status only"
+
+
 def _unhealthy_line(item: dict) -> str:
-    reason = f" ({item['reason']})" if item["reason"] else ""
-    return f"{item['kind']} {item['node']} is {item['observed']}{reason}"
+    # `.split()` collapses whitespace, and it earns its keep: the real reason
+    # measured for F4 is psycopg's own multi-line text ("server closed the
+    # connection unexpectedly\n\tThis probably means..."), and `note` is echoed
+    # as ONE line by `odin apply`. Verbatim it arrived as a paragraph wrapped
+    # into the middle of a sentence.
+    reason = " ".join((item["reason"] or _NO_REASON_RECORDED).split())
+    return f"{item['kind']} {item['node']} is {item['observed']} ({reason})"
+
+
+def _known_faults(stores: SynthStores, env: str) -> list[dict]:
+    """Every lambda/rds fault odin's OWN gateway records already hold for `env`.
+
+    Two callers now, and the second is field test 6's F4. The post-apply
+    verification block reads these only when everything else went clean
+    (`body["status"] == "applied"`), which is right for the WAITS it guards --
+    they are slow, and a tofu failure has already failed the apply. It was wrong
+    for the READ. When tofu failed *because* a database never came up, these
+    records are the only place the real reason exists, and skipping them left
+    the user reading the AWS provider's own
+
+        Error: waiting for RDS DB Instance (srvfixdb) create: unexpected state
+        'failed', wanted target 'available, storage-optimization'.
+        last error: %!s(<nil>)
+
+    -- reproduced verbatim on a real apply against a paused Postgres, at the
+    default 180s readiness budget. That `%!s(<nil>)` is Go's rendering of a nil
+    error and it belongs to the provider, not to odin: the format string
+    `unexpected state '%s', wanted target '%s'. last error: %s` is in the
+    `terraform-provider-aws` v5.100.0 binary, odin's own source has no "last
+    error" string anywhere, and the provider's RDS status refresher never
+    returns an error for it to carry. Odin cannot fix that sentence. What it can
+    do is print the reason it was holding the entire time --
+    `"Postgres never became ready: connection to server at ... timeout expired"`.
+
+    READ WHERE THE SIGNAL STILL EXISTS, which is the load-bearing part: the
+    caller below runs INSIDE the hold, straight after tofu returns and BEFORE
+    `converge_db_instances`, which re-creates every `failed` instance and clears
+    exactly this reason. Measured after the fact on the same env, the record had
+    already gone back to `status=available, status_reason=None` -- so reading it
+    any later would find nothing.
+
+    Pure store reads: no docker, no waits, nothing that can slow an
+    already-failed apply."""
+    return (
+        [_unhealthy_wire("lambda", f.node, f.state, f.reason) for f in lambdactl.function_faults(stores, env)]
+        + [_unhealthy_wire("rds", f.node, f.status, f.reason) for f in rdsctl.db_faults(stores, env)]
+    )
+
+
+_TF_FAILED_NOTE = "desired state not committed; fix and re-apply"
+
+
+def _tf_failed_note(faults: list[dict]) -> str:
+    """The tf-failed note, carrying odin's own diagnosis when it has one.
+
+    `odin apply` echoes `note` verbatim, so this is where a reason reaches a
+    human without reading JSON -- and where it goes so that tofu's tail (which
+    stays untouched: it is tofu's own output and odin does not rewrite it) is no
+    longer the only reason on offer."""
+    named = "; ".join(map(_unhealthy_line, faults))
+    return f"{_TF_FAILED_NOTE}. odin's own records say why: {named}" if named else _TF_FAILED_NOTE
 
 
 def create_apply_full_router(
@@ -1264,7 +1553,12 @@ def create_apply_full_router(
             if env_epoch.get(env, 0) != my_epoch:
                 return JSONResponse(status_code=409, content=_SUPERSEDED)
             if tf_failed:
-                body["note"] = "desired state not committed; fix and re-apply"
+                # HERE, not after the hold: `converge_db_instances` below
+                # re-creates every `failed` database and wipes the very
+                # `status_reason` this reads. See `_known_faults`.
+                faults = _known_faults(stores, env)
+                body["unhealthy_resources"] = faults
+                body["note"] = _tf_failed_note(faults)
             else:
                 body["rev"] = store.apply(stack)  # the desired state goes live before any tick can run
         # W2.2: an Apply is also the recovery for drift the reality sweep
@@ -1376,12 +1670,7 @@ def create_apply_full_router(
             # `/world` and this apply read one corrected record rather than two
             # checks that can disagree.
             await asyncio.to_thread(drift.sweep_compute, stores, env)
-            faulted_fns = lambdactl.function_faults(stores, env)
-            faulted_dbs = rdsctl.db_faults(stores, env)
-            unhealthy = (
-                [_unhealthy_wire("lambda", f.node, f.state, f.reason) for f in faulted_fns]
-                + [_unhealthy_wire("rds", f.node, f.status, f.reason) for f in faulted_dbs]
-            )
+            unhealthy = _known_faults(stores, env)
             if unhealthy:
                 body["status"] = "applied_resources_unhealthy"
                 body["unhealthy_resources"] = unhealthy

@@ -129,6 +129,19 @@ def _assert_string_facts(rid: str, facts: dict) -> None:
 STALL_GRACE = 30.0
 
 
+def _exc_text(exc: BaseException) -> str:
+    """`ClassName: message`, and something true when there IS no message.
+
+    Field test 6, F4's class: `f"{type(exc).__name__}: {exc}"` renders a
+    dangling colon for any exception constructed with no args -- and this text is
+    the `last_error` that `/world`, `/health`, `odin status` and
+    `server.py::_stale_resource` all quote, so an empty tail lands in the one
+    string that is supposed to explain a dead loop."""
+    return f"{type(exc).__name__}: {exc}" if str(exc) else (
+        f"{type(exc).__name__} (raised with no message, so the class is the whole of it)"
+    )
+
+
 class LoopHealth(BaseModel):
     """Whether an env's reconciler loop is actually converging, and if not,
     why not -- the read model behind `/world`'s `reconciler` block, `/health`,
@@ -305,7 +318,7 @@ class Reconciler:
 
     def _note_failure(self, exc: Exception) -> None:
         self._failures += 1
-        self._last_error = f"{type(exc).__name__}: {exc}"
+        self._last_error = _exc_text(exc)
         # The traceback stays at exception level (it is the diagnosis), and the
         # COUNT rides in the same line: "reconciler tick failed" once is a bad
         # tick, the same line 200 times is a loop that converges nothing, and
@@ -355,7 +368,7 @@ class Reconciler:
         if task.done():
             exc = task.exception()
             return (
-                f"its task DIED with {type(exc).__name__}: {exc}" if exc is not None
+                f"its task DIED with {_exc_text(exc)}" if exc is not None
                 else "its task exited on its own"
             )
         if age is not None and age > self._stall_after:
@@ -371,8 +384,34 @@ class Reconciler:
         return (
             f"odin's reconciler for env {self._env!r} is NOT converging: {reason}. Nothing is being "
             f"provisioned, garbage-collected, pruned or drift-checked for this env, and every phase "
-            f"in /world was last confirmed {stale}, not now. Restart odin "
-            f"(`odin stop && odin start`) to bring it back."
+            f"in /world was last confirmed {stale}, not now. {self._remedy()}"
+        )
+
+    def _remedy(self) -> str:
+        """What actually brings this loop back -- keyed on WHY it is down.
+
+        Field test 6's advice sweep. This used to be one hard-coded sentence,
+        "Restart odin (`odin stop && odin start`) to bring it back", appended to
+        all three of the deaths `LoopHealth` enumerates. It is right for two of
+        them (a cancelled task, a task that died) and wrong for the third: a tick
+        that RAISES every time is usually raising at something on disk, and a
+        fresh process re-reads the same disk and raises on tick 1 forever.
+        Measured: `world.json` overwritten with invalid UTF-8 kept this loop
+        failing every second, `consecutive_failures` past 20, with the file
+        unchanged -- every writer reads before it writes, so nothing heals it.
+        A restart there is busywork that hides the real fix.
+
+        So the remedy follows the reason. `_last_error` already carries the true
+        cause and is now allowed to BE the instruction."""
+        return (
+            # The error is already quoted in `reason` above; repeating it here
+            # doubled a paragraph-long verdict for no new information.
+            f"The loop is ALIVE and every tick is raising the error named above -- a restart "
+            f"re-reads the same inputs and will raise again, so fix THAT first; if it names a file "
+            f"under the store, that file is what to repair. `odin events --env {self._env}` still "
+            f"works and holds the last state odin observed."
+            if self._failures and self._task is not None and not self._task.done()
+            else "Restart odin (`odin stop && odin start`) to bring it back."
         )
 
     @asynccontextmanager
@@ -675,7 +714,12 @@ class Reconciler:
                 # Stay `starting`, carry the real reason, retry next tick.
                 # `_emit`'s dedupe makes a persistent failure exactly ONE
                 # delta, not one per tick.
-                await self._emit(res.id, res.kind, "starting", verdict=str(exc))
+                # `_exc_text`, not `str(exc)`: an exception built with no
+                # message would write an EMPTY verdict into World and the WS,
+                # which is a resource stuck `starting` with no stated reason
+                # (field test 6, F4's class). `_log_message` 40 lines above
+                # already guarded its own version of this; this one did not.
+                await self._emit(res.id, res.kind, "starting", verdict=_exc_text(exc))
             else:
                 await self._emit(res.id, res.kind, "healthy", facts=facts)
         if phase == "healthy" and not ok:
