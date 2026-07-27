@@ -11,10 +11,12 @@ import json
 import os
 from pathlib import Path
 
+from odin.aws.cache import container_name as cache_container_name
 from odin.aws.rds import container_name as db_container_name
 from odin.compute.functions import container_name as function_container_name
+from odin.compute.proxy import container_name as proxy_container_name
 from odin.fabric.models import MeshNetwork, SubnetAllocation
-from odin.gateway.models import elbv2ctl, rdsctl, secretsctl, ssmctl
+from odin.gateway.models import cachectl, elbv2ctl, lambdactl, rdsctl, secretsctl, ssmctl
 from odin.gateway.stores import SynthStores
 from odin.reconcile import mesh_health
 from odin.reconcile.tf_status import TF_OWNED_KINDS, project, stranded_in_tf_state
@@ -415,7 +417,10 @@ def test_lambda_pending_active_failed_map_to_starting_healthy_crashed(tmp_path):
     result = project(stores, ENV, containers=_fns_up("fn2"))
     assert result["fn1"] == ("lambda", "starting", {}, None)
     assert result["fn2"] == ("lambda", "healthy", {}, None)
-    assert result["fn3"] == ("lambda", "crashed", {}, None)
+    # `Failed` with no reason recorded: crashed, and the verdict says what odin
+    # DOES know rather than nothing at all -- see the no-reason tests below.
+    assert result["fn3"][:3] == ("lambda", "crashed", {})
+    assert "the container behind it is odin-lambda-default-fn3" in result["fn3"][3]
 
 
 def test_lambda_falls_back_to_function_name_without_a_tag(tmp_path):
@@ -1059,6 +1064,126 @@ def test_an_untagged_database_still_projects_under_its_identifier(tmp_path):
     assert project(stores, ENV, containers=_dbs_up("app-db"))["app-db"][0] == "rds"
 
 
+# --- a `crashed` resource whose record kept NO reason -------------------------
+#
+# The four crashed-phase sites here used to read `(record.get(...) or None)`,
+# turning an empty reason into no verdict: a node went red on the canvas with
+# nothing said, while its kind, identifier and container name were all known.
+# Verified against a real running server before the fix -- four `crashed`
+# resources, `"verdict": null` in `/world`, `odin world` printing phase and
+# nothing else.
+
+
+def _no_reason_verdict(result: dict, label: str) -> str:
+    kind, phase, facts, verdict = result[label]
+    assert phase == "crashed"
+    return verdict
+
+
+def test_a_crashed_resource_with_no_recorded_reason_still_names_what_is_known(tmp_path):
+    """All four kinds, each with a reason that is empty (`str(exc)` of an
+    exception built with no message -- the shape three of the four writers
+    really store) or absent (the `.get()` default). None of them may project a
+    bare `None`."""
+    stores = SynthStores(tmp_path)
+    stores.lambdactl.set(ENV, "fn:fn1", _lambda_fn("fn1", "Failed", state_reason=""))
+    stores.cachectl.set(ENV, "cluster:c1", _cache_cluster("c1", "create-failed", status_reason=""))
+    stores.elbv2ctl.set(ENV, "lb:web-lb", _lb("web-lb", state="failed", endpoints={}, reason=""))
+    _db(stores, "app-db", "app-db", status="failed")  # `status_reason` is None on the record
+
+    result = project(stores, ENV)
+
+    # Each verdict names the KIND, the IDENTIFIER and the CONTAINER -- the
+    # three things odin genuinely knows at this point.
+    for label, kind, identifier, container in [
+        ("fn1", "lambda", "fn1", function_container_name(ENV, "fn1")),
+        ("c1", "elasticache", "c1", cache_container_name(ENV, "c1")),
+        ("web-lb", "alb", "web-lb", proxy_container_name(ENV, "web-lb")),
+        ("app-db", "rds", "app-db", db_container_name(ENV, "app-db")),
+    ]:
+        verdict = _no_reason_verdict(result, label)
+        assert verdict, f"{label} projected crashed with NO verdict at all"
+        assert kind in verdict and repr(identifier) in verdict and container in verdict
+        assert "recorded with NO message" in verdict
+        # It reports the gap; it does not invent a cause, and it does not
+        # promise a recovery /apply-full does not perform for alb/elasticache.
+        assert "re-Apply to recreate" not in verdict
+
+
+def test_a_real_recorded_reason_is_never_replaced_by_the_fallback(tmp_path):
+    """The fallback is the LAST resort. A record that carries a real reason
+    projects that reason verbatim, byte for byte."""
+    stores = SynthStores(tmp_path)
+    stores.lambdactl.set(ENV, "fn:fn1", _lambda_fn("fn1", "Failed", "fn1 RIE never became ready"))
+    stores.cachectl.set(ENV, "cluster:c1", _cache_cluster("c1", "create-failed", status_reason="redis never became ready"))
+    stores.elbv2ctl.set(ENV, "lb:web-lb", _lb("web-lb", state="failed", endpoints={}, reason="docker run failed"))
+    _db(stores, "app-db", "app-db", status="failed", status_reason="Postgres never became ready: timeout")
+
+    result = project(stores, ENV)
+    assert result["fn1"][3] == "fn1 RIE never became ready"
+    assert result["c1"][3] == "redis never became ready"
+    assert result["web-lb"][3] == "docker run failed"
+    assert result["app-db"][3] == "Postgres never became ready: timeout"
+
+
+def test_the_real_writers_no_longer_leave_an_empty_reason(tmp_path):
+    """The other half of the same defence, and the one that moved.
+
+    When this was written, the three production failure paths stored
+    `str(exc)` verbatim, so a substrate raising `StopIteration` -- whose
+    `str()` really is `""`, as for a cancelled Future or a bare
+    `KeyError()`/`TimeoutError()` -- landed a record with an empty reason.
+    They are all guarded at the writer now (`gateway/errors.py::exc_text`),
+    which is where a reason should be rescued: the projection below can only
+    say what is KNOWN, while the writer still holds the exception.
+
+    So this drives the real writers and asserts the blank never gets in.
+    `_crash_verdict` stays as the backstop for a record that already has one --
+    written by an older odin, or by a future writer that forgets."""
+
+    class Boom:
+        def ensure(self, *args, **kwargs):
+            raise StopIteration
+
+    stores = SynthStores(tmp_path)
+    stores.cachectl.set(ENV, "cluster:c1", _cache_cluster("c1", "creating"))
+    cachectl._finish_create(stores, ENV, "c1", Boom())
+
+    stores.lambdactl.set(ENV, "fn:fn1", {**_lambda_fn("fn1", "Pending"), "environment": {}})
+    lambdactl._finish_deploy(
+        stores, ENV, "fn1", "python3.12", "app.handler", {}, tmp_path / "code", Boom(), None, None, 128,
+    )
+
+    stores.elbv2ctl.set(ENV, "lb:web-lb", _lb("web-lb", state="provisioning", endpoints={}))
+    elbv2ctl._converge_safely(stores, ENV, "web-lb", Boom())
+
+    recorded = (
+        stores.cachectl.get(ENV, "cluster:c1")["status_reason"],
+        stores.lambdactl.get(ENV, "fn:fn1")["state_reason"],
+        stores.elbv2ctl.get(ENV, "lb:web-lb")["state_reason"],
+    )
+    for reason in recorded:
+        assert reason, "a writer let a blank reason into the record"
+        assert "StopIteration" in reason, f"the class is all there is to say, and it must be said: {reason!r}"
+
+
+def test_a_record_that_already_holds_an_empty_reason_still_names_what_is_known(tmp_path):
+    """The projection-side backstop. A record written by an older odin (or by a
+    future writer that forgets) can carry `reason=""`, and `live_verdicts` does
+    NOT rescue it -- that only sweeps records claiming to be UP, so an already
+    failed one keeps the blank forever. Before `_crash_verdict`, `odin world`
+    printed rows reading `crashed` and nothing else."""
+    stores = SynthStores(tmp_path)
+    stores.cachectl.set(ENV, "cluster:c1", {**_cache_cluster("c1", "create-failed"), "status_reason": ""})
+    stores.lambdactl.set(ENV, "fn:fn1", {**_lambda_fn("fn1", "Failed"), "state_reason": ""})
+    stores.elbv2ctl.set(ENV, "lb:web-lb", {**_lb("web-lb", state="failed", endpoints={}), "state_reason": ""})
+
+    result = project(stores, ENV)
+
+    for label in ("c1", "fn1", "web-lb"):
+        assert _no_reason_verdict(result, label), f"{label} crashed with no explanation"
+
+
 # --- field test 3, P2-5: the resources a failed apply leaves ONLY in tofu's
 # state. `/world` showed 12 s3/sqs/sns/dynamodb nodes with NO BADGE AT ALL --
 # not pending, not crashed, absent -- while `tofu state` listed them and every
@@ -1100,7 +1225,30 @@ def test_a_bucket_tofu_created_is_visible_when_its_backing_never_started(tmp_pat
     assert "exists in the env's tofu state" in verdict          # WHY it is still listed
     assert "no s3 backing container is running" in verdict      # WHY it does not answer
     assert "ServiceUnavailable" in verdict                      # the error the user actually sees
-    assert "Apply to start it" in verdict                       # ...and the fix
+    assert "Apply again" in verdict                             # ...and the fix
+
+
+def test_the_stranded_verdict_warns_that_a_failed_apply_reprints_it(tmp_path):
+    """The advice used to be a bare "Apply to start it" for a state whose usual
+    cause is a FAILED apply -- so re-Applying, failing the same way and reading
+    the identical sentence was a loop with nothing in it to notice. Measured on
+    a real server: a successful apply clears it on the same tick, and the
+    moment the committed Stack stops naming the kind (what a failed apply
+    leaves, since `/apply-full` skips `store.apply` on `tf_failed`) the next
+    tick's gc stops the backing and this comes back within one poll.
+
+    `odin destroy` must NOT be offered here: under this exact condition
+    `/destroy`'s `ensure_backings(last_applied)` boots nothing (the last
+    applied Stack is the one without these resources), so the destroy 503-
+    retries into the documented wedge."""
+    _tf_state(tmp_path, ENV, _tf_resource("aws_s3_bucket", "bucket", "uploads"))
+    verdict = stranded_in_tf_state(tmp_path, ENV, World(env=ENV), reachable_kinds=set())[0].verdict
+
+    assert "SUCCEEDS" in verdict and "FAILS" in verdict     # the two outcomes differ, and it says so
+    assert "never commits the desired state" in verdict     # WHY a failed apply leaves this standing
+    assert "back within about one tick" in verdict          # ...and that the retry changes nothing
+    assert "fix the error your last apply printed" in verdict
+    assert "odin destroy" not in verdict                    # would wedge; never recommended here
 
 
 def test_a_resource_whose_backing_is_up_is_left_entirely_alone(tmp_path):

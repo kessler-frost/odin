@@ -3,6 +3,8 @@ estimated memory footprint against real host headroom, and free disk on the
 store volume, BEFORE Apply spawns anything."""
 from __future__ import annotations
 
+import pytest
+
 from odin.compute.instances import max_env_name_len
 from odin.reconcile import admission
 from odin.reconcile.admission import (
@@ -254,8 +256,21 @@ def test_an_explicit_budget_override_still_applies_even_with_unknown_host_memory
 
 
 def test_ok_result_still_carries_the_numbers_for_display():
-    result = AdmissionResult(ok=True, estimated_mib=256.0, budget_mib=7000.0, free_disk_gib=50.0, min_disk_gib=10.0)
+    result = AdmissionResult(estimated_mib=256.0, budget_mib=7000.0, free_disk_gib=50.0, min_disk_gib=10.0)
     assert result.reason == ""
+    assert result.ok is True
+
+
+def test_a_rejection_without_a_reason_is_not_expressible():
+    """`ok` is DERIVED from `reason` (see AdmissionResult), so the shape that
+    bit `/destroy` -- a verdict field defaulting into a lie -- cannot occur:
+    there is no `ok=` to set, and an AdmissionResult with nothing in it is an
+    admission, never a silent `{"error": ""}` rejection."""
+    assert "ok" not in AdmissionResult.__dataclass_fields__
+    with pytest.raises(TypeError):
+        AdmissionResult(ok=False)  # type: ignore[call-arg]
+    assert AdmissionResult().ok is True
+    assert AdmissionResult(reason="too big").ok is False
 
 
 def test_check_admission_reads_real_free_disk_on_the_given_path(tmp_path):

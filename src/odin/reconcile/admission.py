@@ -198,8 +198,25 @@ class AdmissionResult:
     """`estimated_mib` is always the canvas's TOTAL estimate across both pools.
     `budget_mib` is the budget of the pool the `reason` names on a rejection,
     and the container pool's budget when nothing was rejected -- the two
-    per-pool pairs below carry the full, unambiguous truth."""
-    ok: bool
+    per-pool pairs below carry the full, unambiguous truth.
+
+    THE REASON IS THE VERDICT -- there is no `ok` field to set, and that is the
+    whole point. It used to be `ok: bool` plus `reason: str = ""`, two fields
+    that could disagree: every branch below happens to set both today, but a
+    future `ok=False` that forgot the reason would answer `{"error": ""}` on
+    `/apply-full`'s 409, and `cli/http._renderable` rejects an empty error --
+    so the user would get raw JSON where the reason belongs. That is the exact
+    shape `/destroy`'s status bug took four rounds to kill, and what finally
+    worked there was to stop storing the verdict at all and DERIVE it (see the
+    honesty rules' rule 2). Same move here: a rejection IS a reason, `ok` is
+    read off it, and "reject without saying why" is no longer a state this type
+    can hold -- not caught by a check, not expressible.
+
+    The reverse mistake is closed too, and it is the one that would matter more:
+    `AdmissionResult()` cannot silently ADMIT a canvas some future branch meant
+    to reject, because there is nothing to write in that branch except the
+    reason. `check_admission` is total -- every path either returns a reason or
+    returns none -- so `ok` is never unset, only computed."""
     reason: str = ""
     estimated_mib: float = 0.0
     budget_mib: float = 0.0
@@ -209,6 +226,13 @@ class AdmissionResult:
     container_budget_mib: float = 0.0
     vm_mib: float = 0.0
     vm_budget_mib: float = 0.0
+
+    @property
+    def ok(self) -> bool:
+        """Admitted -- i.e. nothing found a reason to refuse. Derived, never
+        stored (see the class docstring); `server._admission_rejection` reads
+        it exactly as it did when it was a field."""
+        return not self.reason
 
 
 def _gib(mib: float) -> float:
@@ -340,8 +364,9 @@ def check_admission(
     each against its own pool's budget, then check free disk on the volume
     holding `disk_path` (the store root -- `.odin/`, images, containers all land
     there). Memory is checked first (typically the more informative rejection
-    reason for a local dev canvas); any failure is terminal -- `ok=False` with
-    `reason` naming the actual numbers, never a bare "rejected".
+    reason for a local dev canvas); any failure is terminal -- a `reason` naming
+    the actual numbers, never a bare "rejected" and never (see
+    `AdmissionResult`) a rejection with nothing in it.
 
     `host` carries the CONTAINER runtime's memory (`ensure_host()` ->
     `docker info` MemTotal). `host_mem_mib` is REAL machine memory for the
@@ -376,15 +401,16 @@ def check_admission(
     # an ec2 node.
     name_reason = env_name_rejection(stack)
     if name_reason is not None:
-        return AdmissionResult(ok=False, reason=name_reason, budget_mib=container_pool.budget_mib, **numbers)
+        return AdmissionResult(reason=name_reason, budget_mib=container_pool.budget_mib, **numbers)
 
     rejected = next((pool for pool in pools if pool.exceeded), None)
     if rejected is not None:
-        return AdmissionResult(ok=False, reason=rejected.reason, budget_mib=rejected.budget_mib, **numbers)
+        return AdmissionResult(reason=rejected.reason, budget_mib=rejected.budget_mib, **numbers)
     if free_disk_gib < min_disk_gib:
         reason = (
             f"only {free_disk_gib:.1f} GiB free disk (need >{min_disk_gib:.0f} GiB) -- "
             "free up space before applying"
         )
-        return AdmissionResult(ok=False, reason=reason, budget_mib=container_pool.budget_mib, **numbers)
-    return AdmissionResult(ok=True, budget_mib=container_pool.budget_mib, **numbers)
+        return AdmissionResult(reason=reason, budget_mib=container_pool.budget_mib, **numbers)
+    # No reason found -- and `AdmissionResult.ok` is that, nothing else.
+    return AdmissionResult(budget_mib=container_pool.budget_mib, **numbers)

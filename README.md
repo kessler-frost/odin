@@ -73,7 +73,7 @@ DynamoDB Apply doesn't wait on a one-time `npm install` inside a container.
 | [OpenTofu](https://opentofu.org/) | Apply runs `tofu` |
 | [Lima](https://lima-vm.io/) (`limactl`) | only for a canvas with an **EC2** node, since each one is a real Lima VM |
 | [bun](https://bun.sh/) | only to build the UI from a clone; the released package ships one prebuilt |
-| [nebula](https://github.com/slackhq/nebula) (`nebula` + `nebula-cert`, one `brew install nebula`) | only for the mesh: `nebula-cert` is needed by **any canvas with a VPC node** (CreateVpc signs that env's CA, and the apply fails without it), and `nebula` runs the lighthouse once the first EC2 VM joins |
+| [nebula](https://github.com/slackhq/nebula) (`nebula` + `nebula-cert`, one `brew install nebula`) | only for the mesh: `nebula-cert` is needed by **any canvas with a VPC node** (CreateVpc signs that env's CA, and the apply fails without it), and `nebula` runs the lighthouse once the first member joins the mesh — which can be a backing, not only an EC2 VM |
 
 ### Three install paths, one `odin` command
 
@@ -599,11 +599,12 @@ prose explanation of a failure, and the evidence it reads is still there in
   network and firewall primitives, and every VPC-joined EC2 VM runs a real
   `nebula` daemon carrying the compiled SG firewall. The per-environment
   lighthouse is fully unprivileged when it runs (no root, no sudo, no one-time
-  setup) — and it runs **only once the first VM joins the mesh**, stopping when
-  the last one leaves. A canvas with a VPC but no EC2 instance gets its network,
-  its CA and its assigned lighthouse address, and `GET /mesh` says
-  `"lighthouse_running": false`, which is the honest answer: there is nothing to
-  coordinate yet. Cross-Mac reachability lands with multi-Mac support.
+  setup) — and it runs **once the first member joins the mesh**, stopping when
+  the last one leaves. A member is not only an EC2 VM: a backing joins too, so a
+  VPC + RDS canvas with no EC2 node at all does run a lighthouse (measured). What
+  a VPC *alone* gets is the network, the CA and an assigned lighthouse address,
+  with `GET /mesh` reporting `"lighthouse_running": false` — the honest answer,
+  since there is nothing to coordinate yet. Cross-Mac reachability lands with multi-Mac support.
 - **Which endpoint fact your security groups actually govern.** A database
   publishes up to three. `DATABASE_URL` (for a container) and `DATABASE_URL_VM`
   (for an EC2 Lima VM) are the same raw published host port under two host

@@ -94,6 +94,7 @@ from odin.compute.models import INSTANCE_TYPES, get_instance_type
 from odin.fabric.models import FirewallRules
 from odin.fabric.nebula import LighthouseManager, union_firewalls
 from odin.gateway import errors
+from odin.gateway.errors import exc_text
 from odin.gateway.keys import KeyStore, workload_env
 from odin.gateway.models import ec2net
 from odin.gateway.stores import NO_CHANGE, SynthStores
@@ -146,26 +147,6 @@ _TERMINAL_STATES = frozenset({"shutting-down", "terminated"})
 _VM_NAME_PREFIX = "odin-ec2-"
 
 
-def _exc_text(exc: BaseException) -> str:
-    """`ClassName: message`, and something true when there IS no message.
-
-    Byte-identical to `reconcile/reconciler.py::_exc_text` (and to
-    `server.py::_failure_body`'s same treatment) -- ONE wording for "an
-    exception is the reason", asserted equal to the canonical one by
-    `tests/gateway/test_empty_reasons.py`. A copy rather than an import
-    because `reconcile.reconciler` -> `reconcile.drift` -> THIS MODULE is a
-    real import chain, so importing back would close a cycle.
-
-    This module's renderer is the worst of the three to feed a blank: a
-    `state_reason` dict is TRUTHY even when its message is empty, so
-    `_instance_xml` emits `<stateReason><code>Server.InternalError</code>
-    <message></message></stateReason>` -- an assertion that the instance
-    failed, with nothing whatsoever about why (measured). `str(exc)` is `''`
-    for any exception built with no args, a real interpreter-raised
-    `MemoryError` included (`args == ()`, measured)."""
-    return f"{type(exc).__name__}: {exc}" if str(exc) else (
-        f"{type(exc).__name__} (raised with no message, so the class is the whole of it)"
-    )
 
 
 def _stated(reason: str, fallback: str) -> str:
@@ -471,10 +452,10 @@ def _finish_boot(
     try:
         ip = vm.boot(name, vm_config, hostname=instance_id, ssh_pubkey=ssh_pubkey, user_data=user_data, nebula=nebula, env_vars=env_vars)
     except Exception as exc:
-        log.warning("boot failed for instance %s (%s): %s", instance_id, name, _exc_text(exc))
+        log.warning("boot failed for instance %s (%s): %s", instance_id, name, exc_text(exc))
         _update_instance(
             stores, env, instance_id, state_name="terminated",
-            state_reason={"code": "Server.InternalError", "message": _exc_text(exc)},
+            state_reason={"code": "Server.InternalError", "message": exc_text(exc)},
             terminated_at=time.monotonic(),
         )
         return
@@ -503,7 +484,7 @@ def _finish_terminate(stores: SynthStores, env: str, instance_id: str, name: str
         # destroyed before a retry ever lands).
         log.error(
             "VM delete failed for instance %s (%s), will retry on next describe: %s",
-            instance_id, name, _exc_text(exc),
+            instance_id, name, exc_text(exc),
         )
         _update_instance(
             stores, env, instance_id,
@@ -511,7 +492,7 @@ def _finish_terminate(stores: SynthStores, env: str, instance_id: str, name: str
                 "code": "Server.InternalError",
                 # Interpolating a bare `exc` here rendered `VM delete failed,
                 # retrying: ` -- a dangling colon where the cause belongs.
-                "message": f"VM delete failed, retrying: {_exc_text(exc)}",
+                "message": f"VM delete failed, retrying: {exc_text(exc)}",
             },
             delete_failed=True,
         )
@@ -574,8 +555,8 @@ def _finish_stop(stores: SynthStores, env: str, instance_id: str, name: str, vm:
     try:
         vm.stop(name)
     except Exception as exc:
-        log.warning("VM stop failed for instance %s (%s): %s", instance_id, name, _exc_text(exc))
-        reason = {"code": "Server.InternalError", "message": f"VM stop failed: {_exc_text(exc)}"}
+        log.warning("VM stop failed for instance %s (%s): %s", instance_id, name, exc_text(exc))
+        reason = {"code": "Server.InternalError", "message": f"VM stop failed: {exc_text(exc)}"}
     _update_instance(
         stores, env, instance_id, state_name="stopped",
         private_ip=None, public_ip=None, state_reason=reason,
@@ -586,10 +567,10 @@ def _finish_start(stores: SynthStores, env: str, instance_id: str, name: str, vm
     try:
         ip = vm.start(name)
     except Exception as exc:
-        log.warning("VM start failed for instance %s (%s): %s", instance_id, name, _exc_text(exc))
+        log.warning("VM start failed for instance %s (%s): %s", instance_id, name, exc_text(exc))
         _update_instance(
             stores, env, instance_id, state_name="stopped",
-            state_reason={"code": "Server.InternalError", "message": _exc_text(exc)},
+            state_reason={"code": "Server.InternalError", "message": exc_text(exc)},
         )
         return
     # Cleared on success -- see `_finish_boot` for the stale-reason this closes.
@@ -1190,8 +1171,8 @@ def reclaim_env_instances(stores: SynthStores, env: str, vm: InstanceVm | None =
             # `_exc_text`: `f"{name} ({exc})"` renders `odin-ec2-x ()` -- empty
             # parentheses -- for an exception with no message, inside the ONE
             # sentence that tells a user why their destroy did not destroy.
-            log.error("destroy could not reclaim VM %s (env %s): %s", name, env, _exc_text(exc))
-            failed.append(f"{name} ({_exc_text(exc)})")
+            log.error("destroy could not reclaim VM %s (env %s): %s", name, env, exc_text(exc))
+            failed.append(f"{name} ({exc_text(exc)})")
             continue
         stores.tags.set(env, f"ec2:{instance_id}", {})
         stores.ec2compute.delete(env, _key("instance", instance_id))

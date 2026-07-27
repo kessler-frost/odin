@@ -50,6 +50,7 @@ from httpx._transports.default import map_httpcore_exceptions
 from odin.compute.functions import InvokeResult
 from odin.gateway.models import ec2compute, ecsctl, lambdactl
 from odin.gateway.stores import SynthStores
+from odin.gateway.errors import exc_text
 from odin.reconcile.reconciler import _exc_text as canonical_exc_text
 from odin.simulate.workspace import tf_dir
 
@@ -77,15 +78,20 @@ _WITH_MESSAGE = [RuntimeError("boom"), ValueError("bad input"), KeyError("image"
 
 @pytest.mark.parametrize("exc", _NO_MESSAGE + _WITH_MESSAGE, ids=lambda e: type(e).__name__ + repr(str(e)))
 def test_every_model_words_an_exception_exactly_as_the_reconciler_does(exc):
-    """The three copies are a copy ON PURPOSE -- `reconcile.reconciler` ->
-    `reconcile.drift` -> these modules is a real import chain, so importing
-    the canonical `_exc_text` back would close a cycle (verified). This test
-    is what keeps three copies from becoming three dialects: it fails the
-    moment any of them drifts from the one in reconciler.py."""
-    canonical = canonical_exc_text(exc)
-    assert ecsctl._exc_text(exc) == canonical
-    assert lambdactl._exc_text(exc) == canonical
-    assert ec2compute._exc_text(exc) == canonical
+    """There is now exactly ONE implementation, and this is what holds it that
+    way. Five modules needed this wording; three kept private copies because
+    `reconcile.reconciler` -> `reconcile.drift` -> `gateway.models.*` is a real
+    import chain and importing back would close a cycle. `gateway/errors.py`
+    imports nothing from odin, so it is a leaf every one of them can reach --
+    which is why the copies are gone rather than merely kept in step.
+
+    Asserting identity, not equality: a re-spelled copy that happens to agree
+    today would pass an equality check and drift tomorrow."""
+    assert ecsctl.exc_text is exc_text
+    assert lambdactl.exc_text is exc_text
+    assert ec2compute.exc_text is exc_text
+    assert canonical_exc_text is exc_text
+    assert exc_text(exc) == canonical_exc_text(exc)
 
 
 @pytest.mark.parametrize("exc", _NO_MESSAGE, ids=lambda e: type(e).__name__)
@@ -94,7 +100,7 @@ def test_an_exception_with_no_message_still_names_its_class(exc):
     for each of these -- asserted here so the tests that follow are not
     resting on an assumption about their inputs."""
     assert str(exc) == "", "premise: these are the no-message cases"
-    text = ecsctl._exc_text(exc)
+    text = ecsctl.exc_text(exc)
     assert type(exc).__name__ in text
     assert text.strip(), "a reason may never be blank"
     assert not text.rstrip().endswith(":"), "and never a dangling colon"

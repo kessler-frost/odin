@@ -105,6 +105,7 @@ from starlette.responses import Response
 from odin.aws.backings import ACCOUNT, REGION
 from odin.compute.proxy import IDLE_LISTEN_PORT, LoadBalancerProxy, ProxyListener, _sanitize_upstream, target_address
 from odin.gateway import errors
+from odin.gateway.errors import exc_text
 from odin.gateway.stores import NO_CHANGE, SynthStores
 from odin.runtime.colima import CONTAINER_HOST
 
@@ -571,7 +572,7 @@ def _converge_safely(stores: SynthStores, env: str, lb_name: str, proxy: LoadBal
         converge_proxy(stores, env, lb_name, proxy)
     except Exception as exc:  # noqa: BLE001 -- deliberately broad, see docstring
         log.warning("load-balancer proxy failed for %s (env %s): %s", lb_name, env, exc)
-        reason = str(exc)
+        reason = exc_text(exc)
         stores.elbv2ctl.update(env, _lb_key(lb_name), lambda current: (
             NO_CHANGE if current is None else {**current, "state": "failed", "state_reason": reason}
         ))

@@ -1911,16 +1911,47 @@ def create_app(
         policy check has already passed), and mixing it into `access_denied`
         polluted the exact stream a security review reads for real denials --
         agent A watched thousands of them accumulate during a wedged destroy.
-        `recovery` names what actually fixes it, since a down backing always has
-        the same fix."""
+
+        `recovery` is now keyed on WHO made the call, because "run Apply" is
+        only advice for someone who is not already inside one. A tofu run holds
+        the OPERATOR key -- `/apply-full` and `/destroy` are its only issuers --
+        so an event carrying that principal is being emitted from inside an
+        apply or destroy that is 503-ing RIGHT NOW, and the old single sentence
+        told that user to start the command they were in the middle of.
+
+        The branch reads a signal that actually arrives, probed against the
+        real gateway before it was written rather than assumed: a genuinely
+        SigV4-signed `s3:ListBucket` made with the operator key, against an env
+        with no s3 backing registered, reached this callback with
+        `principal.node_id == "__operator__"` and put it on the wire as the
+        event's own `resource_id`. The retry count in the operator text is the
+        one botocore reported on that same call.
+
+        The FIRST clause is deliberately the same words `reconcile/tf_status.py
+        ::_STRANDED_VERDICT` uses -- one down backing, one vocabulary. Only the
+        advice diverges, and only because the two are sent at different
+        moments (that one is a `/world` overlay read after the fact)."""
+        env_name = principal.env if principal else "default"
+        node_id = principal.node_id if principal else None
+        recovery = (
+            f"no {service} backing container is running for this env, and this call came from the "
+            f"tofu run of an apply or destroy that is IN FLIGHT -- so it is already failing: "
+            f"aws-sdk-go-v2 retries each ServiceUnavailable with backoff (botocore gave up after 4 "
+            f"on the same call) before the operation errors. Starting another Apply on the strength "
+            f"of this event will not help; wait for the one in flight to return and fix the error "
+            f"IT reports."
+            if node_id == OPERATOR_NODE_ID else
+            f"no {service} backing container is running for this env -- run Apply (or "
+            f"`odin apply --env {env_name}`) to start it"
+        )
         await ws_manager.broadcast({
             "type": "backing_unavailable",
-            "env": principal.env if principal else "default",
-            "resource_id": principal.node_id if principal else None,
+            "env": env_name,
+            "resource_id": node_id,
             "action": action,
             "target": resource,
             "service": service,
-            "recovery": f"no {service} backing container is running for this env -- run Apply (or `odin apply --env {principal.env if principal else 'default'}`) to start it",
+            "recovery": recovery,
         })
 
     gateway_app = create_gateway_app(

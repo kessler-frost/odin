@@ -92,6 +92,7 @@ from starlette.responses import Response
 from odin.aws.backings import ACCOUNT, REGION
 from odin.compute.functions import DEFAULT_RUNTIME, READY_TIMEOUT, FunctionRuntime, container_name
 from odin.gateway import errors
+from odin.gateway.errors import exc_text
 from odin.gateway.keys import KeyStore, workload_env
 from odin.gateway.models import logsctl
 from odin.gateway.stores import NO_CHANGE, SynthStores
@@ -117,27 +118,6 @@ _Handler = Callable[
 ]
 
 
-def _exc_text(exc: BaseException) -> str:
-    """`ClassName: message`, and something true when there IS no message.
-
-    Byte-identical to `reconcile/reconciler.py::_exc_text` (and to
-    `server.py::_failure_body`'s same treatment) -- ONE wording for "an
-    exception is the reason", asserted equal to the canonical one by
-    `tests/gateway/test_empty_reasons.py`. A copy rather than an import
-    because `reconcile.reconciler` -> `reconcile.drift` -> THIS MODULE is a
-    real import chain, so importing back would close a cycle.
-
-    Load-bearing here in a way it is not in ecsctl: `_configuration_json`
-    renders `fn["state_reason"] or None` and `_json` drops every None, so an
-    EMPTY reason does not merely read badly -- `StateReason` disappears from
-    the wire entirely and GetFunction answers `State: Failed` with no reason
-    at all (measured). `str(exc)` is `''` for any exception built with no
-    args, and both a real interpreter `MemoryError` (`args == ()`) and
-    `httpx.PoolTimeout` (httpcore raises it bare, and httpx's own mapping
-    preserves the empty message) really do reach these clauses."""
-    return f"{type(exc).__name__}: {exc}" if str(exc) else (
-        f"{type(exc).__name__} (raised with no message, so the class is the whole of it)"
-    )
 
 
 def _stated(reason: str, fallback: str) -> str:
@@ -298,7 +278,7 @@ def _finish_deploy(
         # empty one from the wire outright -- GetFunction would answer
         # `State: Failed` with no StateReason at all, which is the one field
         # `reconcile/tf_status.py` renders as the node's World verdict.
-        reason = _exc_text(exc)
+        reason = exc_text(exc)
         log.warning("lambda container failed for function %s (env %s): %s", name, env, reason)
         _update_function(
             stores, env, name, state="Failed",
@@ -794,7 +774,7 @@ def _invoke(resource: str, env: str, body: bytes, stores: SynthStores, now: floa
         # the empty message, measured) -- with which botocore rendered exactly
         # `An error occurred (ServiceException) when calling the Invoke
         # operation: ` and stopped, a dangling colon where the cause belongs.
-        return errors.synth_error("lambda", "ServiceException", _exc_text(exc), 500)
+        return errors.synth_error("lambda", "ServiceException", exc_text(exc), 500)
     # Both outcomes ship: a handler that RAISED wrote its traceback to the
     # container's stderr, and that traceback is the whole reason CloudWatch
     # Logs exists.

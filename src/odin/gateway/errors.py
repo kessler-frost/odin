@@ -194,3 +194,24 @@ def synth_error(service: str, code: str, message: str, status: int) -> Response:
     if service == "lambda":
         return _lambda_response(code, message, status)
     return Response(_json_body_raw(service, code, message), status_code=status, media_type="application/x-amz-json-1.0")
+
+
+def exc_text(exc: BaseException) -> str:
+    """`ClassName: message`, and something true when there IS no message.
+
+    THE one wording for "an exception is the reason". It lives here because
+    this module is a leaf -- it imports nothing from odin -- so every writer
+    that records a failure can import it without closing the
+    `reconcile.reconciler` -> `reconcile.drift` -> `gateway.models.*` cycle
+    that made three of them keep private copies.
+
+    `str(exc)` is `''` for any exception constructed with no arguments, and
+    two really do reach these paths: an interpreter-raised `MemoryError`
+    (`args == ()`), and `httpx.PoolTimeout`, which httpcore raises bare and
+    httpx's own mapping preserves. A blank is not merely ugly -- lambdactl's
+    `_configuration_json` renders `state_reason or None` and `_json` drops
+    every None, so an empty reason made `StateReason` vanish from the wire and
+    GetFunction answered `State: Failed` with no reason at all."""
+    return f"{type(exc).__name__}: {exc}" if str(exc) else (
+        f"{type(exc).__name__} (raised with no message, so the class is the whole of it)"
+    )

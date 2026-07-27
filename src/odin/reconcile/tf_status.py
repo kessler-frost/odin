@@ -67,8 +67,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from odin.aws.cache import container_name as cache_container_name
 from odin.aws.rds import POSTGRES_PORT
 from odin.aws.rds import container_name as db_container_name
+from odin.compute.functions import container_name as function_container_name
+from odin.compute.proxy import container_name as proxy_container_name
 from odin.compute.tasks import TaskRuntime
 from odin.fabric.nebula import NebulaManager
 from odin.gateway.models import cachectl, ecsctl, elbv2ctl, logsctl, rdsctl, ssmctl
@@ -137,6 +140,49 @@ Projected = dict[str, tuple[str, str, dict, str | None]]
 
 def _label(tags: dict[str, str], natural: str | None) -> str | None:
     return tags.get("odin:node") or natural
+
+
+def _crash_verdict(reason: str | None, *, kind: str, identifier: str, status: str, container: str) -> str:
+    """The verdict a `crashed` projection carries: the recorded reason, or --
+    when the record kept none -- what odin DOES know, never nothing at all.
+
+    THE HOLE THIS CLOSES. Four sites here read `(record.get("<x>_reason") or
+    None)`, and that `or None` deliberately turned an empty reason into no
+    verdict: a node went RED on the canvas with no explanation, while its
+    kind, its identifier and its container name were all sitting right here.
+    Measured against a real server before this existed -- four `crashed`
+    resources, `"verdict": null` in `/world`, and `odin world` printing three
+    columns of phase with not one word of why.
+
+    IT IS REACHABLE, not theoretical. Three of the four writers store
+    `str(exc)` verbatim -- `cachectl._finish_create`,
+    `lambdactl._finish_deploy`, `elbv2ctl._converge_safely` -- and a real
+    `StopIteration`, a cancelled `Future`, a bare `KeyError()`/`TimeoutError()`
+    all stringify to `""` (probed, not assumed). Driving those three real
+    failure paths with such an exception put `reason=''` on all three records.
+    rds is the exception: both of ITS writers f-string-wrap the reason, so
+    today only the `.get()` default (a record with no such key) can reach the
+    fallback there -- it is included anyway, because the bug class here is a
+    field DEFAULTING into a lie, and the fix is the shape, not the instance.
+
+    Same rule the rest of the tree already keeps one layer down:
+    `drift.py::_NO_PROBE_ERROR`, `mesh_health.py`'s `"<Type>, raised with no
+    message"`, `server.py::_failure_body`'s `detail`. This is the projection's
+    own.
+
+    NO REMEDY IS PROMISED, deliberately: /apply-full converges lambda and rds
+    (`converge_functions` / `converge_db_instances`) but NOT elasticache and
+    NOT alb, so "re-Apply to recreate" would be false for half the kinds this
+    serves. The container name is the honest handle instead -- it is what the
+    user can read logs off, and what `odin logs --env <env> <label>` resolves
+    to for every kind here except alb.
+    """
+    return reason or (
+        f"odin's {kind} record for {identifier!r} is {status!r} and the failure was recorded with "
+        f"NO message, so this is the whole of what odin knows about it: the container behind it is "
+        f"{container}. Nothing here diagnosed the cause -- odin is reporting the gap rather than "
+        f"inventing a reason."
+    )
 
 
 def _vpc_subnet_sg(stores: SynthStores, env: str) -> Projected:
@@ -324,8 +370,11 @@ def _db_instances(stores: SynthStores, env: str) -> Projected:
             continue
         phase = _RDS_PHASE.get(record["status"], "starting")
         facts = _db_facts(record) if record["status"] == rdsctl.AVAILABLE else {}
-        verdict = (record.get("status_reason") or None) if phase == "crashed" else None
         container = db_container_name(env, identifier)
+        verdict = _crash_verdict(
+            record.get("status_reason"), kind="rds", identifier=identifier,
+            status=record["status"], container=container,
+        ) if phase == "crashed" else None
         out[label] = mesh_health.gate(
             ("rds", phase, facts, verdict), root=stores.root, env=env,
             member=container,  # PostgresRds.mesh_member == the container name
@@ -361,7 +410,10 @@ def _load_balancers(stores: SynthStores, env: str) -> Projected:
         phase = _ALB_PHASE.get(record["state"], "starting")
         endpoint = elbv2ctl.endpoint_url(record)
         facts = {"ALB_ENDPOINT": endpoint} if endpoint else {}
-        verdict = (record.get("state_reason") or None) if phase == "crashed" else None
+        verdict = _crash_verdict(
+            record.get("state_reason"), kind="alb", identifier=record["name"],
+            status=record["state"], container=proxy_container_name(env, record["name"]),
+        ) if phase == "crashed" else None
         out[label] = ("alb", phase, facts, verdict)
     return out
 
@@ -489,7 +541,10 @@ def _lambda_functions(stores: SynthStores, env: str) -> Projected:
         if label:
             phase = _LAMBDA_PHASE.get(record["state"], "starting")
             verdict = (
-                (record.get("state_reason") or None) if phase == "crashed"
+                _crash_verdict(
+                    record.get("state_reason"), kind="lambda", identifier=record["function_name"],
+                    status=record["state"], container=function_container_name(env, record["function_name"]),
+                ) if phase == "crashed"
                 else _invocation_verdict(record)
             )
             out[label] = ("lambda", phase, {}, verdict)
@@ -538,7 +593,10 @@ def _cache_clusters(stores: SynthStores, env: str) -> Projected:
             continue
         phase = _CACHE_PHASE.get(record["status"], "starting")
         facts = cachectl.facts(record) if record["status"] == cachectl.STATUS_AVAILABLE else {}
-        verdict = (record.get("status_reason") or None) if phase == "crashed" else None
+        verdict = _crash_verdict(
+            record.get("status_reason"), kind="elasticache", identifier=record["cache_cluster_id"],
+            status=record["status"], container=cache_container_name(env, record["cache_cluster_id"]),
+        ) if phase == "crashed" else None
         out[label] = ("elasticache", phase, facts, verdict)
     return out
 
@@ -680,12 +738,46 @@ _BACKED_TF_TYPES = {
     "aws_dynamodb_table": ("dynamodb", "name"),
 }
 
-# Deliberately the SAME words `server.on_backing_unavailable` puts on the
-# `backing_unavailable` event, and the same recovery: one down backing, one
-# vocabulary, whichever surface an operator happens to be looking at.
+# The DIAGNOSIS half is deliberately the same words `server.
+# on_backing_unavailable` puts on the `backing_unavailable` event: one down
+# backing, one vocabulary, whichever surface an operator is looking at. The
+# ADVICE half is not shared any more, because the two are sent at different
+# moments -- that event fires live, possibly from inside a tofu run that is
+# 503-ing right now; this is a read-model overlay on `GET /world`, after the
+# fact.
+#
+# WHY "Apply to start it" alone was not good enough, and what replaces it.
+# The state this reports is USUALLY REACHED BY A FAILED APPLY (see
+# `stranded_in_tf_state`), so the old sentence prescribed the very command
+# that had just failed, with nothing to tell the user their retry had changed
+# nothing. Both halves of the loop were measured against a real server on a
+# real env:
+#   * a SUCCESSFUL apply really does clear it -- `/apply` of a canvas with the
+#     s3 node booted the backing and the resource read `healthy` on the same
+#     tick, with the verdict gone (12 consecutive 1s samples).
+#   * the moment the committed Stack stops naming the kind -- which is exactly
+#     what a FAILED apply leaves, since `/apply-full` skips `store.apply(stack)`
+#     on `tf_failed` -- the next tick's `BackingAws.gc` stops the backing and
+#     this verdict is back. Measured at the first poll after the apply
+#     returned, and held for all 12 samples.
+# So a user who Applies, fails, and re-reads this has been told nothing new;
+# the sentence now says so, and names the apply's own error as the thing to
+# fix.
+#
+# `odin destroy` is deliberately NOT offered as the way out. Under exactly
+# this condition it wedges: `/destroy` calls `ensure_backings(last_applied)`,
+# the last applied Stack is the one WITHOUT these resources (that is why the
+# backing is down), so it boots nothing and every AWS call tofu's destroy
+# makes 503-retries with backoff -- `simulate/runner.py::_WEDGED_DESTROY_HINT`
+# and `server.py::_BACKING_ADVICE` document that same trap for `odin tf plan`.
 _STRANDED_VERDICT = (
     "this resource exists in the env's tofu state, but no {kind} backing container is running "
-    "for this env -- every AWS call to it answers ServiceUnavailable. Apply to start it."
+    "for this env -- every AWS call to it answers ServiceUnavailable. Apply again: an apply that "
+    "SUCCEEDS starts the backing and this clears on the same tick. An apply that FAILS does not, "
+    "and a failed apply is the usual way an env gets here -- it never commits the desired state, "
+    "so the next reconciler tick stops the backing again and this exact message is back within "
+    "about one tick (~1s at the default poll interval). If you are reading it a second time, "
+    "re-applying is not what changes it: fix the error your last apply printed."
 )
 
 

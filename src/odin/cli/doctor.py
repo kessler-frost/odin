@@ -101,7 +101,8 @@ _TOOLS: tuple[tuple[str, bool, str, str], ...] = (
     #     SERVER LOG, which is why doctor is the only place a user finds out
     #     before drawing anything.
     ("nebula", False, "brew install nebula",
-     "REQUIRED to run an env's Nebula lighthouse (started when the first EC2 VM joins); "
+     "REQUIRED to run an env's Nebula lighthouse (started by the first member to join -- an EC2 VM, "
+     "or a backing on a VPC canvas with no EC2 node at all); "
      "without it odin logs `nebula not found on PATH; lighthouse not started` to the "
      "server log and the mesh never forms"),
     ("nebula-cert", False, "brew install nebula",

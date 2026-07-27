@@ -100,6 +100,7 @@ from starlette.responses import Response
 from odin.aws.backings import ACCOUNT, REGION
 from odin.compute.tasks import TaskRuntime, container_name
 from odin.gateway import errors
+from odin.gateway.errors import exc_text
 from odin.gateway.keys import KeyStore, workload_env
 from odin.gateway.models import elbv2ctl, logsctl
 from odin.gateway.stores import NO_CHANGE, SynthStores
@@ -120,27 +121,6 @@ _DEFAULT_COMPATIBILITIES = ["EC2"]
 _ESSENTIAL_CONTAINER_EXITED = "Essential container in task exited"
 
 
-def _exc_text(exc: BaseException) -> str:
-    """`ClassName: message`, and something true when there IS no message.
-
-    Byte-identical to `reconcile/reconciler.py::_exc_text` (and to the same
-    treatment in `server.py::_failure_body`) -- ONE wording for "an exception
-    is the reason", asserted equal to the canonical one by
-    `tests/gateway/test_empty_reasons.py`. A copy rather than an import
-    because `reconcile.reconciler` -> `reconcile.drift` -> THIS MODULE is a
-    real import chain, so importing back would close a cycle. The single-home
-    fix is to lift it into a leaf module both trees already depend on
-    (`odin/util.py`, or `gateway/errors.py` which all three models import) and
-    have reconciler.py import it from there too.
-
-    Why it has to exist at the WRITER: `str(exc)` is `''` for any exception
-    built with no args, and a real interpreter-raised `MemoryError` has
-    `args == ()` (measured, not assumed). Every reader of `stopped_reason`
-    downstream -- `task_verdict`, `_rollout`, `_task_wire`, /world, the canvas
-    -- inherits that blank, and by then the real reason is gone."""
-    return f"{type(exc).__name__}: {exc}" if str(exc) else (
-        f"{type(exc).__name__} (raised with no message, so the class is the whole of it)"
-    )
 
 
 def _stated(reason: str, fallback: str) -> str:
@@ -773,7 +753,7 @@ def _launch_task(
         # Deliberately broad: this runs on a daemon thread with no caller to
         # propagate an exception to -- see ec2compute.py's `_finish_boot` for
         # the identical "silent hang is forbidden" reasoning.
-        log.warning("task container failed for %s/%s (env %s): %s", service_name, task_id, env, _exc_text(exc))
+        log.warning("task container failed for %s/%s (env %s): %s", service_name, task_id, env, exc_text(exc))
         # `_exc_text`, not `str(exc)`: this string IS the task's whole
         # explanation -- `task_verdict` renders it as the apply's failure line
         # and `reconcile/tf_status.py` as the node's World verdict -- and an
@@ -781,7 +761,7 @@ def _launch_task(
         # "task stopped", losing the one fact odin actually had.
         _update_task(
             stores, env, cluster_name, task_id,
-            last_status="STOPPED", stopped_at=time.time(), stopped_reason=_exc_text(exc),
+            last_status="STOPPED", stopped_at=time.time(), stopped_reason=exc_text(exc),
         )
         return
     _update_task(
@@ -807,7 +787,7 @@ def _stop_task(stores: SynthStores, env: str, task: dict, runtime: TaskRuntime) 
     try:
         runtime.stop(env, task["task_id"], task["container_name"])
     except Exception as exc:
-        log.warning("stopping task container %s (env %s) failed: %s", task["task_id"], env, _exc_text(exc))
+        log.warning("stopping task container %s (env %s) failed: %s", task["task_id"], env, exc_text(exc))
     stores.ecsctl.delete(env, _task_key(task["cluster_name"], task["task_id"]))
 
 

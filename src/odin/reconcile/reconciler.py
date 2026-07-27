@@ -59,6 +59,7 @@ from odin.reconcile.actions import NoOp, ProvisionResource, StopContainer
 from odin.reconcile.drift import DriftSweeper
 from odin.reconcile.plan import plan
 from odin.reconcile.tf_status import TF_OWNED_KINDS, project as project_tf_owned
+from odin.gateway.errors import exc_text
 from odin.spec.models import ResourceDesired, Stack, World, WorldDelta
 
 log = logging.getLogger("odin.reconcile")
@@ -129,17 +130,17 @@ def _assert_string_facts(rid: str, facts: dict) -> None:
 STALL_GRACE = 30.0
 
 
-def _exc_text(exc: BaseException) -> str:
-    """`ClassName: message`, and something true when there IS no message.
-
-    Field test 6, F4's class: `f"{type(exc).__name__}: {exc}"` renders a
-    dangling colon for any exception constructed with no args -- and this text is
-    the `last_error` that `/world`, `/health`, `odin status` and
-    `server.py::_stale_resource` all quote, so an empty tail lands in the one
-    string that is supposed to explain a dead loop."""
-    return f"{type(exc).__name__}: {exc}" if str(exc) else (
-        f"{type(exc).__name__} (raised with no message, so the class is the whole of it)"
-    )
+# `ClassName: message`, and something true when there IS no message. Imported
+# rather than re-spelled: five modules needed this wording and kept private
+# copies because `reconcile.reconciler` -> `reconcile.drift` ->
+# `gateway.models.*` is a real import chain. `gateway/errors.py` is a leaf (it
+# imports nothing from odin), so everyone can reach it without closing a cycle.
+# Field test 6, F4's class: the naive `f"{type(exc).__name__}: {exc}"` renders a
+# dangling colon for any exception built with no args -- and this text is the
+# `last_error` that `/world`, `/health`, `odin status` and
+# `server.py::_stale_resource` all quote, so an empty tail lands in the one
+# string that is supposed to explain a dead loop.
+_exc_text = exc_text
 
 
 class LoopHealth(BaseModel):
@@ -457,14 +458,32 @@ class Reconciler:
 
         The asymmetry is deliberate: TAKING the suspension needs the lock
         (nothing may act after the caller has started mutating), RELEASING it
-        does not. "Actions may resume" carries no ordering requirement --
-        resuming one tick later is harmless, and both routes kick an explicit
-        `tick()` straight after the hold anyway -- so the release is a bare
-        decrement with no await in it. That matters on the unwind path: a
-        `finally` that awaits a lock is one a cancelled request (a shutdown,
-        a connection dropped 40s into a tofu run) can stall in, and a
-        suspension that never lifts is an env whose reconciler silently stops
-        acting."""
+        does not. "Actions may resume" carries no ordering requirement -- there
+        is no state a later resume can corrupt, because the resume itself does
+        nothing; the next tick simply re-derives from the store -- so the
+        release is a bare decrement with no await in it. That matters on the
+        unwind path: a `finally` that awaits a lock is one a cancelled request
+        (a shutdown, a connection dropped 40s into a tofu run) can stall in, and
+        a suspension that never lifts is an env whose reconciler silently stops
+        acting.
+
+        WHAT THE ARGUMENT MAY NOT LEAN ON, though it used to: "both routes kick
+        an explicit `tick()` straight after the hold anyway". That holds only
+        for a request that REACHES the end of its route -- which does include
+        the failure paths (`/apply-full`'s trailing `tick()` runs on
+        `tf_failed`, `/destroy`'s runs on `destroy_failed`; both sit outside the
+        hold). It does NOT hold for a request that leaves from INSIDE the hold,
+        and three ways to do that exist today: the 409 `_SUPERSEDED` returns on
+        either epoch checkpoint, the 409 a `SimulateBusy` raises, and any
+        exception that unwinds to the ASGI handler (`BackingUnavailable`,
+        `ReclaimFailed`, `StoreUnreadable`, `MeshRefreshFailed`, or anything
+        unmapped -- `server.py::_EXCEPTION_VERDICTS`). On those the hold is
+        still released by this `finally`, but nothing prompts a pass: actions
+        resume when the background loop's own next iteration lands, at most one
+        `poll_interval` later (`_run`'s `await asyncio.sleep(self._poll)` --
+        1.0s in the real wiring). Bounded and harmless, which is the actual
+        claim; the trailing tick is a convenience on top of it, not the reason
+        the release is safe."""
         async with self._tick_lock:
             self._suspended += 1
         try:
