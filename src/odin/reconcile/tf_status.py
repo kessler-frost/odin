@@ -715,7 +715,7 @@ async def project(
     # exists to prevent, which a phase-only override would leave behind.
     out.update({
         label: (out[label][0], "crashed", {}, verdict)
-        for label, verdict in await live_verdicts(stores, env, containers).items()
+        for label, verdict in (await live_verdicts(stores, env, containers)).items()
         if label in out
     })
     return out

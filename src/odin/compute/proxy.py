@@ -314,7 +314,7 @@ class LoadBalancerProxy:
             return published
         raise PortsUnpublished(
             f"{name} published no host port for {dead} (container is "
-            f"{await self._rt.status(name)}); last log lines: {await self._rt.logs(name, 5).strip() or 'none'}"
+            f"{await self._rt.status(name)}); last log lines: {(await self._rt.logs(name, 5)).strip() or 'none'}"
         )
 
     async def status(self, env: str, lb_name: str) -> str:

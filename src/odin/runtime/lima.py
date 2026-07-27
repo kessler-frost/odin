@@ -72,7 +72,7 @@ class LimaRuntime(_ContainerRuntime):
         return ["limactl", "shell", self.VM, "sudo", "nerdctl", *args]
 
     async def ensure_host(self) -> HostFacts:
-        if self.VM not in await self._lima("list", "-q", check=False).split():
+        if self.VM not in (await self._lima("list", "-q", check=False)).split():
             cloud_init = generate_cloud_init(hostname=self.VM, install_nerdctl=True)
             yaml = generate_lima_yaml(
                 get_instance_type("t2.medium"), cloud_init_script=cloud_init,
@@ -94,7 +94,7 @@ class LimaRuntime(_ContainerRuntime):
     async def _wait_for_nerdctl(self, timeout: float = 360.0) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if "server version" in await self._cli("info", check=False).lower():
+            if "server version" in (await self._cli("info", check=False)).lower():
                 return
             await asyncio.sleep(5)
         raise RuntimeError(f"nerdctl not ready in {self.VM} within {timeout}s")

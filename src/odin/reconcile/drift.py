@@ -117,6 +117,7 @@ from __future__ import annotations
 import logging
 import asyncio
 import os
+from functools import partial
 from typing import NamedTuple
 
 from odin.aws.rds import container_name as db_container_name
@@ -522,7 +523,13 @@ class DriftSweeper:
         # At most ONE listing per substrate, and none at all when this env has
         # nothing of that shape to check (the common case: a canvas with no
         # ec2 node never shells out to limactl).
-        live_vms = _listing(lambda: frozenset(self._vms.list_names(check=True))) if vms else None
+        # `partial`, not a lambda: `list_names` is a coroutine function now and a
+        # lambda cannot hold an `await`. The frozenset moves AFTER the None check
+        # because None means "the listing failed" -- reading that as "empty" would
+        # flip a whole env to crashed over a transient limactl hiccup.
+        live_vms = await _listing(partial(self._vms.list_names, check=True)) if vms else None
+        if live_vms is not None:
+            live_vms = frozenset(live_vms)
         live_containers = await _listing(self._containers.container_names) if tasks else None
         for label, instance_id, name in vms:
             if live_vms is not None and name not in live_vms:
@@ -535,7 +542,7 @@ class DriftSweeper:
             if live_containers is not None and name not in live_containers:
                 # Same wording as ecsctl's own passive sweep, which races this
                 # one for the identical event -- see `container_gone_reason`.
-                mark_task_stopped(stores, env, cluster, task_id, container_gone_reason(name))
+                await mark_task_stopped(stores, env, cluster, task_id, container_gone_reason(name))
         await self._sweep_databases(stores, env, out)
         return out
 
@@ -587,7 +594,7 @@ class DriftSweeper:
             # beat and ask BOTH questions again, and only correct the record
             # when both still say down.
             await asyncio.sleep(_CONFIRM_DELAY)
-            if await self._probe_db(record).ok or await self._containers.status(name) == "running":
+            if (await self._probe_db(record)).ok or await self._containers.status(name) == "running":
                 log.info("drift sweep: %s answered on re-check; treating the first sample as a blip", name)
                 continue
             # Field test 2 LOW-17: say the same thing the ecs/lambda halves
