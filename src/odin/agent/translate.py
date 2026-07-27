@@ -197,6 +197,8 @@ async def _refine(skeleton: TfProject, stack: Stack, client_cls: type, timeout: 
         allowed_tools=["mcp__translate__emit_terraform"],
     )
     try:
+        # NO inner `await` -- see `agent/debugger.py`'s twin: awaiting first
+        # completes the SDK pass unbounded and leaves `wait_for` timing a value.
         await asyncio.wait_for(_run_agent(_prompt(skeleton, stack), options, client_cls), timeout=timeout)
     except Exception:
         log.exception("translate agent SDK pass failed for env %s", stack.env)
@@ -367,7 +369,7 @@ class TranslateCache:
         task = self._tasks.get(rev)
         return task is not None and not task.done()
 
-    def refine_in_background(self, rev: str, refine: Callable[[], Coroutine[Any, Any, TranslateResult]]) -> None:
+    async def refine_in_background(self, rev: str, refine: Callable[[], Coroutine[Any, Any, TranslateResult]]) -> None:
         """Start a background refine for `rev`. `refine` is a factory (the coro
         is built only when the task actually runs, so a task cancelled before it
         starts leaves no un-awaited coroutine). Idempotent per rev: a call while
@@ -381,7 +383,14 @@ class TranslateCache:
             if result.refined:
                 self._results[rev] = result
 
-        self._tasks[rev] = asyncio.create_task(_run())
+        # `create_task(_run())`, NEVER `create_task(await _run())` -- the latter
+        # runs the refine to completion inline (defeating the entire point of a
+        # background pass, and blocking the `/translate` response on an SDK
+        # call) and then hands `None` to `create_task`, which raises. The task
+        # object is retained in `self._tasks`, which is also what keeps a strong
+        # reference to it: asyncio holds only a weak one, so a task nobody
+        # stores can be garbage collected mid-flight.
+        self._tasks[rev] = asyncio.create_task(_run(), name=f"odin-refine-{rev}")
 
     async def _drain(self, rev: str) -> None:
         """Test seam: await the in-flight background refine for `rev` (there is
@@ -427,5 +436,9 @@ async def translate(
     cached = cache.get(rev)
     if cached is not None:
         return cached
-    cache.refine_in_background(rev, lambda: _refine_once(skeleton, stack, client_cls, timeout))
+    # The `lambda` is a coroutine FACTORY, not an awaited call: it builds the
+    # coroutine only when the task runs (see `refine_in_background`), so a
+    # cancelled task never leaves an un-awaited coroutine behind. `await` here
+    # only covers starting the task, which returns immediately.
+    await cache.refine_in_background(rev, lambda: _refine_once(skeleton, stack, client_cls, timeout))
     return _fallback_result(skeleton, [_BACKGROUND_NOTE])

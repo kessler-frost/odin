@@ -480,7 +480,13 @@ def test_real_boto3_client_raises_invalid_client_token_id_for_unknown_key(tmp_pa
 # --- server.py wiring: the gateway listener starts/stops with the app ------
 
 
-def test_create_app_boots_gateway_thread_and_health_still_works(tmp_path):
+def test_create_app_boots_the_gateway_listener_and_health_still_works(tmp_path):
+    """Renamed in v0.7.7 from `..._boots_gateway_thread_...`: there is no
+    gateway thread any more, the listener is an `asyncio` task on the control
+    app's own loop (`gateway/app.py::serve_on_loop`). Only the NAME changed --
+    every assertion below is the one it always made. That the listener really is
+    a task and not a thread is asserted separately, in
+    tests/gateway/test_serve_on_loop.py."""
     app = create_app(store=SpecStore(tmp_path), backings=False, gateway_port=0)
     with TestClient(app) as client:
         health = client.get("/health").json()

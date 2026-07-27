@@ -167,7 +167,7 @@ def test_wrong_answer_rds_null_endpoint_port_is_rejected(tmp_path: Path):
     assert "endpoint_port" in str(unreadable(stores, "rdsctl"))
 
 
-def test_wrong_answer_rds_false_green_is_gone_end_to_end(tmp_path: Path):
+async def test_wrong_answer_rds_false_green_is_gone_end_to_end(tmp_path: Path):
     """The projection itself, not just the store: `tf_status.project` used to
     answer `('rds', 'healthy', {}, None)` for this record. It must now refuse
     to answer at all rather than answer wrongly -- an unreadable store is a
@@ -178,9 +178,9 @@ def test_wrong_answer_rds_false_green_is_gone_end_to_end(tmp_path: Path):
         "master_username": "odin", "master_password": "pw", "db_name": "app",
     }})
     with pytest.raises(StoreUnreadable):
-        tf_status.project(stores, ENV)
+        await tf_status.project(stores, ENV)
     with pytest.raises(StoreUnreadable):
-        drift._db_records(stores, ENV)
+        drift._db_records(stores, ENV)  # still synchronous -- a plain store read
 
 
 def test_wrong_answer_load_balancer_security_groups_string(tmp_path: Path):

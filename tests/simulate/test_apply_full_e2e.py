@@ -46,11 +46,11 @@ _FIVE = ("uploads", "jobs", "alerts", "items", "db")
 
 
 @pytest.fixture
-def runtime():
+async def runtime():
     rt = ColimaRuntime()
     yield rt
-    for name in own_containers(rt, ENV):
-        rt.stop(name)
+    for name in await own_containers(rt, ENV):
+        await rt.stop(name)
 
 
 def _phases(client) -> dict:
@@ -67,7 +67,7 @@ def _wait(client, predicate, timeout=180.0, step=1.0):
     raise AssertionError(f"not met within {timeout}s (last={_phases(client)})")
 
 
-def test_apply_full_converges_reapplies_zero_drift_and_tears_down(tmp_path, runtime):
+async def test_apply_full_converges_reapplies_zero_drift_and_tears_down(tmp_path, runtime):
     assert shutil.which("tofu"), "OpenTofu must be on PATH for this integration test"
     app = create_app(runtime=runtime, store=SpecStore(tmp_path))
     with TestClient(app) as client:
@@ -76,17 +76,29 @@ def test_apply_full_converges_reapplies_zero_drift_and_tears_down(tmp_path, runt
         body = resp.json()
         assert body["status"] == "applied", body
         assert body["tf"] is not None and body["tf"]["status"] == "ok", body
-        assert body["unsupported"] == ["db (rds): Simulate v1 — stays on the reconciler path"], body
+        # W2.7 moved rds ONTO Terraform (`hcl.py`: "rds" -> "aws_db_instance"),
+        # so nothing is declined any more and `unsupported` is correctly empty.
+        # This assertion used to expect "db (rds): Simulate v1 — stays on the
+        # reconciler path", a string that no longer exists in src at all; it
+        # was stale from before W2.7 and had been masked because the test died
+        # earlier, on the goaws readiness bug fixed in v0.7.7.
+        #
+        # Kept as an assertion rather than deleted, and paired with the
+        # positive claim: `db` must be COVERED, not merely un-declined. It is
+        # in `_FIVE`, which the next line waits on reaching `healthy`, and its
+        # real Postgres is checked further down.
+        assert body["unsupported"] == [], body
+        assert body["skipped"] == [], body
 
         _wait(client, lambda p: all(p.get(n) == "healthy" for n in _FIVE))
 
         # The physical backing resources exist for real (not just the World
         # projection) -- checked directly against RustFS/goaws/dynalite.
         aws = BackingAws(runtime, ENV, gateway_port=client.get("/health").json()["gateway"]["port"])
-        assert aws.exists("s3", "uploads")
-        assert aws.exists("sqs", "jobs")
-        assert aws.exists("sns", "alerts")
-        assert aws.exists("dynamodb", "items")
+        assert await aws.exists("s3", "uploads")
+        assert await aws.exists("sqs", "jobs")
+        assert await aws.exists("sns", "alerts")
+        assert await aws.exists("dynamodb", "items")
 
         # Re-apply the identical canvas: zero drift, still healthy, tofu still ok.
         start = time.monotonic()
@@ -132,11 +144,11 @@ def test_apply_full_converges_reapplies_zero_drift_and_tears_down(tmp_path, runt
         assert world["resources"] == []
 
         # The physical resources are REALLY gone too, not just absent from World.
-        assert not aws.exists("s3", "uploads")
-        assert not aws.exists("sqs", "jobs")
-        assert not aws.exists("sns", "alerts")
-        assert not aws.exists("dynamodb", "items")
+        assert not await aws.exists("s3", "uploads")
+        assert not await aws.exists("sqs", "jobs")
+        assert not await aws.exists("sns", "alerts")
+        assert not await aws.exists("dynamodb", "items")
 
-        aws.gc(set())  # stop this env's backing containers -- nothing else owns them
+        await aws.gc(set())  # stop this env's backing containers -- nothing else owns them
 
-    assert own_containers(runtime, ENV) == [], "every container this test made is gone"
+    assert await own_containers(runtime, ENV) == [], "every container this test made is gone"

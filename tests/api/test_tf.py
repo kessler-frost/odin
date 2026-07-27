@@ -18,30 +18,30 @@ from odin.spec.translate import canvas_to_stack
 
 
 class FakeRuntime:
-    def run_container(self, spec):
+    async def run_container(self, spec):
         return RunHandle(id="x", name=spec.name)
 
-    def stop(self, name):
+    async def stop(self, name):
         pass
 
-    def facts(self, name, container_port=0):
+    async def facts(self, name, container_port=0):
         return ContainerFacts(phase="pending")
 
-    def stats(self, name):
+    async def stats(self, name):
         return {"cpu": 0.0, "ram": 0.0}
 
-    def ensure_host(self):
+    async def ensure_host(self):
         return HostFacts()
 
 
 class FakeRds:
-    def create_db(self, db_id, user, pw):
+    async def create_db(self, db_id, user, pw):
         pass
 
-    def delete_db(self, db_id):
+    async def delete_db(self, db_id):
         pass
 
-    def endpoint(self, db_id):
+    async def endpoint(self, db_id):
         return None
 
     def container_name(self, db_id):
@@ -109,7 +109,7 @@ def test_tf_destroy_409_when_a_run_is_already_in_flight(tmp_path):
 
 
 class _LowMemRuntime(FakeRuntime):
-    def ensure_host(self):
+    async def ensure_host(self):
         return HostFacts(total_mem_mib=1000.0)
 
 

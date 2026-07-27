@@ -24,22 +24,22 @@ class FakeAws:
         self.env = env
         self.provisioned = []
 
-    def provision(self, service, name, subscriptions=()):
+    async def provision(self, service, name, subscriptions=()):
         self.provisioned.append((service, name, subscriptions))
 
-    def exists(self, service, name):
+    async def exists(self, service, name):
         return True
 
-    def deprovision(self, service, name):
+    async def deprovision(self, service, name):
         pass
 
-    def facts(self, service, name):
+    async def facts(self, service, name):
         return {"BUCKET": name, "endpoint": "http://host.docker.internal:9000"}
 
-    def gc(self, active_kinds):
+    async def gc(self, active_kinds):
         pass
 
-    def backing_ports(self):
+    async def backing_ports(self):
         return {}
 
 

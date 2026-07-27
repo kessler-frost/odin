@@ -207,7 +207,7 @@ _HANDLERS: dict[str, _Handler] = {
 }
 
 
-def pure_answer(
+async def pure_answer(
     action: str, resource: str, env: str, body: bytes, stores: SynthStores, now: float,
     backing_port: int | None = None,
 ) -> Response | None:

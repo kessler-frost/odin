@@ -224,7 +224,7 @@ class LoadBalancerProxy:
     def __init__(self, runtime=None) -> None:
         self._rt = runtime or ColimaRuntime()
 
-    def ensure(self, root: Path, env: str, lb_name: str, listeners: tuple[ProxyListener, ...]) -> dict[int, int]:
+    async def ensure(self, root: Path, env: str, lb_name: str, listeners: tuple[ProxyListener, ...]) -> dict[int, int]:
         """Converge the real proxy container onto `listeners` and return
         `{listen_port: published host port}`, every one of them REAL.
 
@@ -247,15 +247,15 @@ class LoadBalancerProxy:
         ports = tuple(listener.port for listener in listeners) or (IDLE_LISTEN_PORT,)
         host_conf = conf_path(root, env, lb_name)
         atomic_write_text(host_conf, render_conf(listeners))
-        published = self._live_ports(name, ports)
+        published = await self._live_ports(name, ports)
         # `all({})` is True, hence the `published and`: an empty map means
         # there was no running container to read ports off at all.
         if published and all(published.values()):
-            self._rt.copy_in(name, str(host_conf), CONF_PATH_IN_CONTAINER)
-            self._rt.signal(name, RELOAD_SIGNAL)
+            await self._rt.copy_in(name, str(host_conf), CONF_PATH_IN_CONTAINER)
+            await self._rt.signal(name, RELOAD_SIGNAL)
         else:
-            self._rt.stop(name)
-            self._rt.run_container(ContainerSpec(
+            await self._rt.stop(name)
+            await self._rt.run_container(ContainerSpec(
                 name=name, image=IMAGE,
                 ports={port: 0 for port in ports},  # 0 => Docker picks a free host port
                 labels={"odin-env": env, "odin-alb": lb_name},
@@ -264,11 +264,11 @@ class LoadBalancerProxy:
             ))
             # The container is up running `_ENTRY_COMMAND`'s wait loop; THIS copy
             # is what lets nginx actually start (module docstring).
-            self._rt.copy_in(name, str(host_conf), CONF_PATH_IN_CONTAINER)
-            published = {port: self._rt.host_port(name, port) for port in ports}
-        return self._require_published(name, published)
+            await self._rt.copy_in(name, str(host_conf), CONF_PATH_IN_CONTAINER)
+            published = {port: await self._rt.host_port(name, port) for port in ports}
+        return await self._require_published(name, published)
 
-    def _live_ports(self, name: str, ports: tuple[int, ...]) -> dict[int, int]:
+    async def _live_ports(self, name: str, ports: tuple[int, ...]) -> dict[int, int]:
         """`{listen_port: host port}` as the RUNNING container really publishes
         them -- a 0 for any it does not -- and `{}` when there is no running
         container to ask.
@@ -291,11 +291,11 @@ class LoadBalancerProxy:
         container was ever created. `PortUnreadable` (`runtime/colima.py`,
         commit a67b218) landed AFTER this module (7005988) and nothing here
         was adjusted for it."""
-        if self._rt.status(name) != "running":
+        if await self._rt.status(name) != "running":
             return {}
-        return {port: self._rt.host_port(name, port) for port in ports}
+        return {port: await self._rt.host_port(name, port) for port in ports}
 
-    def _require_published(self, name: str, published: dict[int, int]) -> dict[int, int]:
+    async def _require_published(self, name: str, published: dict[int, int]) -> dict[int, int]:
         """`published` unchanged, or `PortsUnpublished` naming the ports with no
         host port, the container's real status, and its last log lines.
 
@@ -314,16 +314,16 @@ class LoadBalancerProxy:
             return published
         raise PortsUnpublished(
             f"{name} published no host port for {dead} (container is "
-            f"{self._rt.status(name)}); last log lines: {self._rt.logs(name, 5).strip() or 'none'}"
+            f"{await self._rt.status(name)}); last log lines: {(await self._rt.logs(name, 5)).strip() or 'none'}"
         )
 
-    def status(self, env: str, lb_name: str) -> str:
-        return self._rt.status(container_name(env, lb_name))
+    async def status(self, env: str, lb_name: str) -> str:
+        return await self._rt.status(container_name(env, lb_name))
 
-    def destroy(self, env: str, lb_name: str) -> None:
+    async def destroy(self, env: str, lb_name: str) -> None:
         """Force-remove the proxy container (idempotent on an absent name --
         `_ContainerRuntime.stop`'s contract)."""
-        self._rt.stop(container_name(env, lb_name))
+        await self._rt.stop(container_name(env, lb_name))
 
 
 def target_address(host_port: int, host: str = CONTAINER_HOST) -> str:

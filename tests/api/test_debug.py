@@ -32,19 +32,19 @@ class LoggingRuntime(FakeRuntime):
     makes -- so the route's log resolution is exercised for real, not stubbed
     out at the assembler's callable."""
 
-    def status(self, name):
+    async def status(self, name):
         return "exited"
 
-    def logs(self, name, tail=100):
+    async def logs(self, name, tail=100):
         return f"==> {name}\nFATAL: config missing\n"
 
-    def facts(self, name, container_port=0):
+    async def facts(self, name, container_port=0):
         return ContainerFacts(phase="crashed")
 
-    def exit_code(self, name):
+    async def exit_code(self, name):
         return 1
 
-    def ensure_host(self):
+    async def ensure_host(self):
         return HostFacts()
 
 
@@ -284,7 +284,7 @@ def test_a_secret_typed_on_the_canvas_never_reaches_the_agent(app_client, monkey
     assert seen[-1]["context"]["nodes"]["db"]["desired"]["fields"]["password"]["value"] == "[REDACTED]"
 
 
-def test_a_gateway_issued_credential_never_reaches_the_agent(tmp_path):
+async def test_a_gateway_issued_credential_never_reaches_the_agent(tmp_path):
     """Field test 2 finding #6, end to end through the route's own assembly: a
     REAL key pair minted by the REAL KeyStore, planted in the crash verdict the
     way a failed `docker run` used to put it there, must be redacted -- by name,
@@ -299,7 +299,7 @@ def test_a_gateway_issued_credential_never_reaches_the_agent(tmp_path):
         facts={"logtail": f"AWS_ACCESS_KEY_ID={access_key}"},
     ))
 
-    context = build_context(
+    context = await build_context(
         store, SynthStores(tmp_path), LoggingRuntime(), ConnectionManager(tmp_path), ENV, ["web-svc"],
     )
 
@@ -379,12 +379,14 @@ def test_a_well_formed_scrub_set_still_reaches_the_prompt(tmp_path):
     assert issued_credentials(tmp_path, ENV) == frozenset({access, secret})
 
 
-def test_build_context_is_usable_without_the_route(tmp_path):
+async def test_build_context_is_usable_without_the_route(tmp_path):
     """The seam the integration test leans on: the real assembled context, no
     HTTP and no SDK involved."""
     store = SpecStore(tmp_path)
     store.apply(Stack(env=ENV))
-    context = build_context(store, SynthStores(tmp_path), LoggingRuntime(), ConnectionManager(tmp_path), ENV, ["db"])
+    context = await build_context(
+        store, SynthStores(tmp_path), LoggingRuntime(), ConnectionManager(tmp_path), ENV, ["db"],
+    )
     assert context["env"] == ENV and "db" in context["nodes"]
 
 

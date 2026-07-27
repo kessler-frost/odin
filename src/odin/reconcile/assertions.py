@@ -21,6 +21,9 @@ forbidden to be", not a gateway wire concern.
 from __future__ import annotations
 
 import asyncio
+
+import asyncpg
+
 from dataclasses import dataclass
 
 
@@ -36,36 +39,63 @@ class PgReady:
     error: str | None = None
 
 
-def _pg_connect(host: str, port: int, user: str, password: str, db: str) -> bool:
-    import psycopg2
-
-    conn = psycopg2.connect(
-        host=host, port=port, user=user, password=password,
-        dbname=db, connect_timeout=3,
-    )
-    cur = conn.cursor()
-    cur.execute("SELECT 1")
-    ok = cur.fetchone()[0] == 1
-    conn.close()
-    return ok
+_CONNECT_TIMEOUT = 3.0
 
 
-def pg_ready_sync(host: str, port: int, user: str, password: str, db: str = "postgres") -> PgReady:
-    """The blocking form -- W2.7's callers are all already off the event loop:
-    `gateway/models/rdsctl.py`'s create waiter runs on its own daemon thread
-    (the same shape every other substrate-booting gateway model uses), and
-    `reconcile/drift.py`'s reality sweep runs inside `asyncio.to_thread`.
-    THIS is the assertion that gates an `aws_db_instance` reaching
-    `available`, so a Postgres that boots but never accepts connections fails
-    the apply instead of being reported up."""
-    try:
-        return PgReady(ok=_pg_connect(host, port, user, password, db))
-    except Exception as exc:
-        return PgReady(ok=False, error=str(exc))
+def _reason(host: str, port: int, exc: BaseException) -> str:
+    """The failure text, ALWAYS naming the address.
+
+    Load-bearing, and the reason this helper exists rather than `str(exc)`:
+    `server.py::_known_faults` quotes this sentence WITH the host and port as
+    the line that rescues an apply whose provider error reads
+    `last error: %!s(<nil>)`. psycopg2 happened to include the address in its
+    own message; asyncpg does not, and its connect timeout raises a bare
+    `TimeoutError` whose `str()` is EMPTY. So the shape is rebuilt here instead
+    of inherited from whatever the driver felt like saying.
+
+    `timeout expired` is likewise the exact wording `_known_faults` matches --
+    keep it verbatim.
+    """
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+        detail = "timeout expired"
+    else:
+        detail = str(exc).strip() or exc.__class__.__name__
+    return f'connection to server at "{host}", port {port} failed: {detail}'
 
 
 async def pg_ready(host: str, port: int, user: str, password: str, db: str = "postgres") -> PgReady:
-    return await asyncio.to_thread(pg_ready_sync, host, port, user, password, db)
+    """THE assertion that gates an `aws_db_instance` reaching `available`, so a
+    Postgres that boots but never accepts connections fails the apply instead
+    of being reported up.
+
+    asyncpg (Apache-2.0), not psycopg2 (LGPL): odin's licence rule is
+    permissive-only, and psycopg2 had quietly been the exception. It is also
+    the only Postgres driver here with a native async API, which matters more
+    than it sounds -- MEASURED against a real wedged Postgres (`docker pause`,
+    which is field test 6's F4, i.e. the documented failure mode rather than a
+    hypothetical one):
+
+        psycopg2   connect 3008.4 ms   heartbeat ticks:   1   worst gap 3011.5 ms
+        async      connect 3033.3 ms   heartbeat ticks: 264   worst gap   12.4 ms
+
+    A healthy or still-booting Postgres fast-fails in 0.42-5.8 ms and would
+    NOT have justified this on its own (~1.4% of the loop while booting).
+    A wedged one blocks 857 ms per second of wall clock -- 85.7% -- sustained
+    for up to `_CREATE_TIMEOUT` = 180 s, freezing the gateway and the
+    reconciler together. That is what decided it.
+    """
+    conn = None
+    try:
+        conn = await asyncpg.connect(
+            host=host, port=port, user=user, password=password,
+            database=db, timeout=_CONNECT_TIMEOUT,
+        )
+        return PgReady(ok=await conn.fetchval("SELECT 1") == 1)
+    except Exception as exc:
+        return PgReady(ok=False, error=_reason(host, port, exc))
+    finally:
+        if conn is not None:
+            await conn.close()
 
 
 @dataclass(frozen=True)
@@ -100,7 +130,7 @@ def mesh_probe_script(overlay_ip: str, port: int, timeout: float = 3.0) -> str:
     )
 
 
-def mesh_ready_sync(runtime, sidecar: str, overlay_ip: str, port: int, timeout: float = 3.0) -> MeshReady:
+async def mesh_ready_sync(runtime, sidecar: str, overlay_ip: str, port: int, timeout: float = 3.0) -> MeshReady:
     """Does the address odin PUBLISHES as the mesh endpoint actually answer,
     on the overlay, right now?
 
@@ -122,7 +152,7 @@ def mesh_ready_sync(runtime, sidecar: str, overlay_ip: str, port: int, timeout: 
     certificate satisfying this member's compiled SG firewall. Lighthouse
     liveness is checked separately (`reconcile/mesh_health.py`); the SG part is
     a policy decision, not a fault, so no probe should ever "fix" it."""
-    out = runtime.exec_sh(sidecar, mesh_probe_script(overlay_ip, port, timeout))
+    out = await runtime.exec_sh(sidecar, mesh_probe_script(overlay_ip, port, timeout))
     if MESH_PROBE_TOKEN in out:
         return MeshReady(ok=True)
     return MeshReady(ok=False, error=out.strip() or f"nothing answered at {overlay_ip}:{port} on the overlay")

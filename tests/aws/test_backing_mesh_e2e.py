@@ -24,7 +24,6 @@ mount. `mesh_root` cleans up after itself.
 """
 from __future__ import annotations
 
-import asyncio
 import secrets
 import shutil
 import subprocess
@@ -80,17 +79,17 @@ def lighthouse_cleanup():
         LighthouseManager().ensure_stopped(root, env)
 
 
-def _client(runtime: ColimaRuntime, mesh: MeshSidecar, name: str, group: str, containers: list[str]) -> None:
+async def _client(runtime: ColimaRuntime, mesh: MeshSidecar, name: str, group: str, containers: list[str]) -> None:
     """A mesh member that is just a psql client: the SAME postgres image (so
     `psql` is present) doing nothing, plus its own nebula sidecar whose cert
     carries `group`."""
-    runtime.stop(name)
-    runtime.run_container(ContainerSpec(
+    await runtime.stop(name)
+    await runtime.run_container(ContainerSpec(
         name=name, image=PG_IMAGE, command=("sleep", "infinity"), labels={"odin-env": ENV},
     ))
     containers.append(name)
     containers.append(mesh.sidecar_name(name))
-    assert mesh.ensure(name, name, groups=(group,)) is not None, f"{name} never joined the mesh"
+    assert await mesh.ensure(name, name, groups=(group,)) is not None, f"{name} never joined the mesh"
 
 
 def _psql(client: str, host: str) -> subprocess.CompletedProcess:
@@ -104,21 +103,21 @@ def _psql(client: str, host: str) -> subprocess.CompletedProcess:
     )
 
 
-def test_a_drawn_sg_gates_real_postgres_traffic_over_the_overlay(mesh_root, containers, lighthouse_cleanup):
+async def test_a_drawn_sg_gates_real_postgres_traffic_over_the_overlay(mesh_root, containers, lighthouse_cleanup):
     assert shutil.which("docker"), "docker (Colima) required"
     assert shutil.which("nebula") and shutil.which("nebula-cert"), "brew install nebula (MIT) required"
 
     runtime = ColimaRuntime()
     lighthouse_cleanup.append((mesh_root, ENV))
     # What CreateVpc does when a canvas draws a VPC: the env's CA + overlay.
-    ensure_network(mesh_root, ENV, underlay_ip())
+    await ensure_network(mesh_root, ENV, underlay_ip())
 
     rds = PostgresRds(runtime, ENV, root=mesh_root)
     containers.append(rds.container_name("db"))
     containers.append(f"{rds.container_name('db')}-mesh")
-    rds.create_db("db", "app", PASSWORD)
+    await rds.create_db("db", "app", PASSWORD)
 
-    db_ip = rds.join_mesh("db", DB_SG_FIREWALL)
+    db_ip = await rds.join_mesh("db", DB_SG_FIREWALL)
     assert db_ip, "the database never joined the env's mesh"
     assert rds.overlay_endpoint("db") == (db_ip, 5432)
     print(f"[W2.6-p2] postgres:16-alpine (unmodified) is on the mesh at {db_ip}, gated by db-sg")
@@ -126,18 +125,18 @@ def test_a_drawn_sg_gates_real_postgres_traffic_over_the_overlay(mesh_root, cont
     # The NON-NEGOTIABLE constraint: the published host port still works, so
     # the gateway's forwarding, the RDS model's own create-waiter probe, and
     # host-side clients are untouched by mesh membership.
-    host, port = rds.endpoint("db")
+    host, port = await rds.endpoint("db")
     ready = None
     for _ in range(60):
-        ready = asyncio.run(pg_ready(host, port, "app", PASSWORD))
+        ready = await pg_ready(host, port, "app", PASSWORD)
         if ready.ok:
             break
     assert ready.ok, f"the HOST path must keep working: {ready.error}"
     print(f"[W2.6-p2] host path still live at {host}:{port} (pg_ready ok)")
 
     mesh = MeshSidecar(runtime, ENV, mesh_root)
-    _client(runtime, mesh, f"odin-mesh-web-{ENV}", "sg-web", containers)
-    _client(runtime, mesh, f"odin-mesh-other-{ENV}", "sg-other", containers)
+    await _client(runtime, mesh, f"odin-mesh-web-{ENV}", "sg-web", containers)
+    await _client(runtime, mesh, f"odin-mesh-other-{ENV}", "sg-other", containers)
 
     # The allowed side polls: both sidecars must still handshake with the
     # lighthouse and set up a relayed tunnel after `ensure` returned.
@@ -156,5 +155,5 @@ def test_a_drawn_sg_gates_real_postgres_traffic_over_the_overlay(mesh_root, cont
     assert "overlay-ok" not in denied.stdout
 
     # Leaving the mesh is real too: the sidecar goes away with the database.
-    rds.delete_db("db")
-    assert runtime.status(f"{rds.container_name('db')}-mesh") == "absent"
+    await rds.delete_db("db")
+    assert await runtime.status(f"{rds.container_name('db')}-mesh") == "absent"

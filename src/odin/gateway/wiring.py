@@ -170,7 +170,7 @@ def _overlay_assignments(stores: SynthStores, env: str) -> dict[str, str]:
     return dict(hosts.assignments) if hosts else {}
 
 
-def _ec2_producers(stores: SynthStores, env: str) -> dict[str, dict[str, str]]:
+async def _ec2_producers(stores: SynthStores, env: str) -> dict[str, dict[str, str]]:
     """The RUNNING, canvas-labelled instances and the addresses each publishes.
 
     Every gate `tf_status._ec2_instances` applies before a fact reaches World
@@ -206,7 +206,7 @@ def _ec2_producers(stores: SynthStores, env: str) -> dict[str, dict[str, str]]:
     published: dict[str, dict[str, str]] = {}
     for label, record in instances:
         candidate = ec2_facts(record, overlay)
-        _kind, _phase, gated, _verdict = mesh_health.gate(
+        _kind, _phase, gated, _verdict = await mesh_health.gate(
             ("ec2", "healthy", candidate, None), root=stores.root, env=env,
             member=record["instance_id"], overlay_ip=candidate.get("MESH_IP"),
             mesh_keys=_EC2_MESH_KEYS,
@@ -215,7 +215,7 @@ def _ec2_producers(stores: SynthStores, env: str) -> dict[str, dict[str, str]]:
     return published
 
 
-def producer_facts(stores: SynthStores, env: str) -> dict[str, dict[str, str]]:
+async def producer_facts(stores: SynthStores, env: str) -> dict[str, dict[str, str]]:
     """`node label -> published WIRING facts`, for every kind that publishes
     any: `REFERENCEABLE_KINDS` (the same four `reconcile/tf_status.py` projects
     facts for).
@@ -250,7 +250,7 @@ def producer_facts(stores: SynthStores, env: str) -> dict[str, dict[str, str]]:
             continue
         tags = stores.tags.get(env, f"{elbv2ctl.SERVICE}:{record['arn']}", {})
         facts[_label(tags, record["name"])] = {"ALB_ENDPOINT": endpoint}
-    facts.update(_ec2_producers(stores, env))
+    facts.update(await _ec2_producers(stores, env))
     return facts
 
 
@@ -390,7 +390,7 @@ def _authored(stores: SynthStores, env: str, node_label: str) -> tuple[dict[str,
     return (dict(static.value) if static is not None and isinstance(static.value, dict) else {}), resource.refs
 
 
-def node_env(stores: SynthStores, env: str, node_label: str) -> dict[str, str]:
+async def node_env(stores: SynthStores, env: str, node_label: str) -> dict[str, str]:
     """The environment a workload node's REAL container should be launched with:
     its static `env` entries plus every `${{producer.ATTR}}` ref resolved to a
     live value.
@@ -413,7 +413,7 @@ def node_env(stores: SynthStores, env: str, node_label: str) -> dict[str, str]:
     resolved = dict(static)
     if not refs:
         return resolved
-    facts, kinds = producer_facts(stores, env), _kinds(stores, env)
+    facts, kinds = await producer_facts(stores, env), _kinds(stores, env)
     for ref in refs:
         resolved[ref.var] = _resolve(ref, facts, kinds)
     return resolved

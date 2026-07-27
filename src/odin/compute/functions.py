@@ -39,9 +39,10 @@ from __future__ import annotations
 import io
 import json
 import shutil
-import socket
+import asyncio
 import time
 import zipfile
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -162,7 +163,7 @@ class FunctionRuntime:
             archive.extractall(code_dir)
         return code_dir
 
-    def ensure(
+    async def ensure(
         self, env: str, function_name: str, runtime: str, handler: str,
         env_vars: dict[str, str], code_dir: Path, memory_mib: int | None = None,
     ) -> int:
@@ -179,9 +180,9 @@ class FunctionRuntime:
         runaway handler can't eat the host; `None` (a caller that predates
         this) leaves the container unbounded, same as before."""
         name = container_name(env, function_name)
-        self._rt.stop(name)  # clear any exited remnant (UpdateFunctionCode redeploy, or a stale prior run)
+        await self._rt.stop(name)  # clear any exited remnant (UpdateFunctionCode redeploy, or a stale prior run)
         image = RUNTIME_IMAGES.get(runtime, RUNTIME_IMAGES[DEFAULT_RUNTIME])
-        self._rt.run_container(ContainerSpec(
+        await self._rt.run_container(ContainerSpec(
             name=name, image=image, env=dict(env_vars),
             ports={_RIE_PORT: 0},
             labels={"odin-env": env, "odin-lambda-fn": function_name},
@@ -189,18 +190,18 @@ class FunctionRuntime:
             volumes={str(code_dir): "/var/task"},
             memory_mib=float(memory_mib) if memory_mib else None,
         ))
-        return self._await_ready(name)
+        return await self._await_ready(name)
 
-    def _await_ready(self, name: str) -> int:
+    async def _await_ready(self, name: str) -> int:
         deadline = time.monotonic() + self._ready_timeout
         while time.monotonic() < deadline:
-            port = self._rt.host_port(name, _RIE_PORT)
-            if port and _tcp_open(port):
+            port = await self._rt.host_port(name, _RIE_PORT)
+            if port and await _tcp_open(port):
                 return port
-            time.sleep(self._poll_interval)
-        raise RuntimeError(f"{name} RIE never became ready: {self._not_ready_reason(name)}")
+            await asyncio.sleep(self._poll_interval)
+        raise RuntimeError(f"{name} RIE never became ready: {await self._not_ready_reason(name)}")
 
-    def _not_ready_reason(self, name: str) -> str:
+    async def _not_ready_reason(self, name: str) -> str:
         """WHY the wait ended, in a form that is never empty.
 
         This message used to be `f"{name} RIE never became ready:\\n{logs}"`,
@@ -224,9 +225,9 @@ class FunctionRuntime:
         live container's `{{.State.ExitCode}}` is `0` (verified on the same
         probe), and "exit code 0" printed under a failure is the kind of true-
         looking detail that sends a reader down the wrong path."""
-        status = self._rt.status(name)
-        state = status if status == "running" else f"{status}, exit code {self._rt.exit_code(name)}"
-        logs = self._rt.logs(name)
+        status = await self._rt.status(name)
+        state = status if status == "running" else f"{status}, exit code {await self._rt.exit_code(name)}"
+        logs = await self._rt.logs(name)
         tail = f"Its logs:\n{logs}" if logs else (
             "It has logged nothing, so the container state above is the whole of it."
         )
@@ -235,36 +236,68 @@ class FunctionRuntime:
             f"within {self._ready_timeout:g}s. Container: {state}. {tail}"
         )
 
-    def invoke(self, env: str, function_name: str, payload: bytes, timeout: float = 30.0) -> InvokeResult:
+    async def invoke(self, env: str, function_name: str, payload: bytes, timeout: float = 30.0) -> InvokeResult:
         """The data plane: forward `payload` bytes straight to the
         function's own RIE container and hand back its response bytes
         verbatim, plus the FunctionError if the handler raised (see
         `_function_error` -- RIE sends no header, so it is read off the
         response) -- the gateway's Invoke handler is a pure pass-through of
-        both."""
-        port = self._rt.host_port(container_name(env, function_name), _RIE_PORT)
+        both.
+
+        `httpx.AsyncClient`, NOT `httpx.post`, and that is load-bearing rather
+        than stylistic (v0.7.7). This is the ONE odin call whose duration is
+        set by USER CODE: a handler may legitimately run the whole `timeout`
+        (30s default). `gateway/app.py` used to keep this on a thread for
+        exactly that reason, and the de-threading pass removed the thread --
+        so a blocking `httpx.post` here would now run on the shared control
+        loop and freeze the reconciler AND the gateway for the handler's whole
+        duration. Worse, it is RE-ENTRANT: a handler that calls back into the
+        gateway (the normal case -- that is what the injected credentials are
+        for) could not be served, because the loop that would serve it is the
+        one blocked inside this call, so the call could only ever end in a
+        timeout. An awaited `AsyncClient.post` yields to the loop for the whole
+        round trip, which is what makes both of those false. Timeout semantics
+        are unchanged: the per-request `timeout=` is the same value, applied
+        the same way (`AsyncClient()`'s own 5s default never applies, since
+        every request passes one explicitly)."""
+        port = await self._rt.host_port(container_name(env, function_name), _RIE_PORT)
         if not port:
             raise RuntimeError(f"{container_name(env, function_name)} is not running")
-        response = httpx.post(f"http://127.0.0.1:{port}{_INVOKE_PATH}", content=payload, timeout=timeout)
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"http://127.0.0.1:{port}{_INVOKE_PATH}", content=payload, timeout=timeout,
+            )
         return InvokeResult(payload=response.content, function_error=_function_error(response))
 
-    def delete(self, env: str, function_name: str) -> None:
-        self._rt.stop(container_name(env, function_name))
+    async def delete(self, env: str, function_name: str) -> None:
+        await self._rt.stop(container_name(env, function_name))
         shutil.rmtree(self.code_dir(env, function_name), ignore_errors=True)
 
-    def status(self, env: str, function_name: str) -> str:
-        return self._rt.status(container_name(env, function_name))
+    async def status(self, env: str, function_name: str) -> str:
+        return await self._rt.status(container_name(env, function_name))
 
-    def logs(self, env: str, function_name: str, tail: int = 20) -> str:
+    async def logs(self, env: str, function_name: str, tail: int = 20) -> str:
         """The RIE container's own log tail -- the function's stdout/stderr,
         which is what `gateway/models/lambdactl.py` ships into
         `/aws/lambda/{name}` after every Invoke. Never raises: the driver's
         `logs` is a `check=False` CLI call, so a container that's gone
         answers with "" (`_ContainerRuntime.logs`'s contract)."""
-        return self._rt.logs(container_name(env, function_name), tail)
+        return await self._rt.logs(container_name(env, function_name), tail)
 
 
-def _tcp_open(port: int) -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.settimeout(0.5)
-        return sock.connect_ex(("127.0.0.1", port)) == 0
+async def _tcp_open(port: int) -> bool:
+    """Does anything accept a TCP connection on this loopback port?
+
+    `asyncio.open_connection` rather than a blocking `socket.connect_ex`, for
+    the same reason `invoke` uses `AsyncClient`: `_await_ready` polls this for
+    up to `READY_TIMEOUT` (180s), and every blocking connect attempt in that
+    loop would be a stall on the shared control loop. The 0.5s budget is the
+    one the blocking version had (`sock.settimeout(0.5)`), now expressed as
+    `asyncio.timeout`; a refused connection still answers immediately, which
+    on loopback is the common case while RIE is still starting."""
+    with suppress(OSError, TimeoutError):
+        async with asyncio.timeout(0.5):
+            _reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.close()
+        return True
+    return False

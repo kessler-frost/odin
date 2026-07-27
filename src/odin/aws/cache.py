@@ -33,6 +33,7 @@ their own client).
 from __future__ import annotations
 
 import socket
+import asyncio
 import time
 
 from odin.runtime.colima import ColimaRuntime, ContainerSpec
@@ -84,6 +85,58 @@ def ping(port: int, timeout: float = 1.0) -> bool:
         return False  # not listening yet -- the readiness loop's normal case
 
 
+async def _reply_async(reader: asyncio.StreamReader) -> str | None:
+    """`_reply`'s async twin, deliberately line-for-line comparable with it so
+    the two cannot drift into disagreeing about the RESP2 wire."""
+    line = (await reader.readline()).rstrip(b"\r\n").decode()
+    if line[:1] != "$":
+        return line[1:]
+    length = int(line[1:])
+    if length < 0:
+        return None
+    return (await reader.readexactly(length + 2))[:length].decode()
+
+
+async def resp_call_async(
+    port: int, *args: str, host: str = "127.0.0.1", timeout: float = 2.0,
+) -> str | None:
+    """`resp_call` without blocking the event loop.
+
+    The sync twin uses `socket.create_connection`, which is fine from a thread
+    and NOT fine from a coroutine: it stalls the loop the gateway and the
+    reconciler share for the whole timeout. That was measured as a real ~1s
+    stall per poll while a Redis container boots -- and it is precisely the
+    blind spot `tests/test_no_blocking_in_coroutines.py` documents, since the
+    call written inside the `async def` was `ping(...)`, whose blocking lives
+    one level down where a static check cannot see it.
+
+    Both twins survive because `resp_call` still has genuinely synchronous
+    callers; they share `_reply`/`_reply_async`, which are kept side by side
+    for the same reason.
+    """
+    payload = f"*{len(args)}\r\n" + "".join(f"${len(a)}\r\n{a}\r\n" for a in args)
+    async with asyncio.timeout(timeout):
+        reader, writer = await asyncio.open_connection(host, port)
+        try:
+            writer.write(payload.encode())
+            await writer.drain()
+            return await _reply_async(reader)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+
+async def ping_async(port: int, timeout: float = 1.0) -> bool:
+    """`ping` for callers on the event loop. Same contract: nothing listening
+    yet is `False`, the readiness loop's ordinary case -- and a timeout counts
+    as "not yet" too, which `socket`'s own timeout raised as `OSError` but
+    `asyncio.timeout` raises as `TimeoutError`."""
+    try:
+        return await resp_call_async(port, "PING", timeout=timeout) == "PONG"
+    except (OSError, TimeoutError, asyncio.IncompleteReadError):
+        return False
+
+
 def engine_version(port: int) -> str:
     """The REAL Redis version the container is running (`INFO server`), so
     DescribeCacheClusters advertises the substrate's own version rather than a
@@ -111,37 +164,37 @@ class RedisCache:
         self._ready_timeout = ready_timeout
         self._poll_interval = poll_interval
 
-    def ensure(self, env: str, cluster_id: str, memory_mib: float = DEFAULT_MEMORY_MIB) -> int:
+    async def ensure(self, env: str, cluster_id: str, memory_mib: float = DEFAULT_MEMORY_MIB) -> int:
         """(Re)create the cluster's Redis container and block until it answers
         a real PING; returns the host port Docker published. Raises on a
         boot/readiness failure -- the caller (cachectl.py's background thread)
         turns that into a real, provider-visible failure state, never a silent
         hang (the same contract as `FunctionRuntime.ensure`)."""
         name = container_name(env, cluster_id)
-        self._rt.stop(name)  # clear any exited remnant (PostgresRds's own contract)
-        self._rt.run_container(ContainerSpec(
+        await self._rt.stop(name)  # clear any exited remnant (PostgresRds's own contract)
+        await self._rt.run_container(ContainerSpec(
             name=name, image=REDIS_IMAGE, ports={REDIS_PORT: 0},
             labels={"odin-env": env, "odin-cache-cluster": cluster_id},
             memory_mib=memory_mib,
         ))
-        return self._await_ready(name)
+        return await self._await_ready(name)
 
-    def _await_ready(self, name: str) -> int:
+    async def _await_ready(self, name: str) -> int:
         deadline = time.monotonic() + self._ready_timeout
         while time.monotonic() < deadline:
-            port = self._rt.host_port(name, REDIS_PORT)
-            if port and ping(port):
+            port = await self._rt.host_port(name, REDIS_PORT)
+            if port and await ping_async(port):
                 return port
-            time.sleep(self._poll_interval)
-        raise RuntimeError(f"{name} redis never became ready: {self._not_ready_reason(name)}")
+            await asyncio.sleep(self._poll_interval)
+        raise RuntimeError(f"{name} redis never became ready: {await self._not_ready_reason(name)}")
 
-    def _not_ready_reason(self, name: str) -> str:
+    async def _not_ready_reason(self, name: str) -> str:
         """WHY the wait ended, in a form that is never empty.
 
         A direct clone of the bug `FunctionRuntime._not_ready_reason` was
         written for, so it gets the same treatment -- and this module's own
         measurement is the stronger of the two. It used to be
-        `f"{name} redis never became ready:\\n{self._rt.logs(name)}"`, and
+        `f"{name} redis never became ready:\\n{await self._rt.logs(name)}"`, and
         `_ContainerRuntime.logs` answers `""` both for a container that wrote
         nothing and for one the runtime could not read. Driven to a REAL
         timeout against REAL containers (`ready_timeout=6s`, nothing on 6379):
@@ -168,13 +221,13 @@ class RedisCache:
         finding functions.py records: a live container's `{{.State.ExitCode}}`
         is `0` (row one and row three above), and "exit code 0" printed under
         a failure sends a reader down the wrong path."""
-        status = self._rt.status(name)
-        state = status if status == "running" else f"{status}, exit code {self._rt.exit_code(name)}"
-        port = self._rt.host_port(name, REDIS_PORT)
+        status = await self._rt.status(name)
+        state = status if status == "running" else f"{status}, exit code {await self._rt.exit_code(name)}"
+        port = await self._rt.host_port(name, REDIS_PORT)
         published = f"published on host port {port}, which never answered a Redis PING" if port else (
             f"docker never published its {REDIS_PORT}, so nothing could reach it"
         )
-        logs = self._rt.logs(name)
+        logs = await self._rt.logs(name)
         tail = f"Its logs:\n{logs}" if logs else (
             "It has logged nothing, so the container state above is the whole of it."
         )
@@ -183,11 +236,11 @@ class RedisCache:
             f"Container: {state}. {tail}"
         )
 
-    def host_port(self, env: str, cluster_id: str) -> int:
-        return self._rt.host_port(container_name(env, cluster_id), REDIS_PORT)
+    async def host_port(self, env: str, cluster_id: str) -> int:
+        return await self._rt.host_port(container_name(env, cluster_id), REDIS_PORT)
 
-    def status(self, env: str, cluster_id: str) -> str:
-        return self._rt.status(container_name(env, cluster_id))
+    async def status(self, env: str, cluster_id: str) -> str:
+        return await self._rt.status(container_name(env, cluster_id))
 
-    def delete(self, env: str, cluster_id: str) -> None:
-        self._rt.stop(container_name(env, cluster_id))
+    async def delete(self, env: str, cluster_id: str) -> None:
+        await self._rt.stop(container_name(env, cluster_id))

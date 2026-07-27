@@ -1,7 +1,7 @@
 """Which odin containers does THIS test own?
 
 Every integration test in this suite used to tear down with
-`runtime.list_odin()` -- i.e. EVERY container carrying the `odin=1` label on
+`await runtime.list_odin()` -- i.e. EVERY container carrying the `odin=1` label on
 the machine, regardless of which env, which test, or which PROCESS created
 it. That is not a coordination nicety:
 
@@ -37,13 +37,13 @@ smarter teardown filter.
 from __future__ import annotations
 
 
-def own_containers(runtime, *envs: str) -> list[str]:
+async def own_containers(runtime, *envs: str) -> list[str]:
     """Every odin container belonging to `envs`, by odin's own naming -- the
-    scoped replacement for `runtime.list_odin()` in an integration teardown.
+    scoped replacement for `await runtime.list_odin()` in an integration teardown.
 
     Pass every env the test applies to; the result is what that test is
     allowed to stop, and (once it has cleaned up) what must be empty."""
-    names = runtime.container_names()
+    names = await runtime.container_names()
     return sorted(
         name for name in names
         if any(name.endswith(f"-{env}") or f"-{env}-" in name for env in envs)

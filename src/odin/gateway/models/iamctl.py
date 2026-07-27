@@ -632,12 +632,18 @@ _HANDLERS: dict[str, _Handler] = {
 }
 
 
-def pure_answer(action: str, resource: str, env: str, body: bytes, stores: SynthStores, now: float) -> Response | None:
+async def pure_answer(action: str, resource: str, env: str, body: bytes, stores: SynthStores, now: float) -> Response | None:
     """The whole IAM answer -- same signature/contract as ec2net.pure_answer:
     IAM has no backing to fall through to, so an unmodeled action still gets
     a protocol-correct error rather than a 503 (real AWS's own
     `NoSuchEntity`-adjacent code doesn't fit an unknown ACTION, so this uses
     the same status IAM would for a malformed request)."""
+    # A coroutine with no `await` inside, deliberately (v0.7.7): this model's
+    # substrate is odin's own JSON sidecar, so nothing here blocks and nothing
+    # here needs to yield. It is `async def` only so `synth.pure_answer` has
+    # ONE contract to dispatch against -- `await <model>.pure_answer(...)` for
+    # every model, with no per-service branch that could return an un-awaited
+    # coroutine as if it were a Response.
     handler = _HANDLERS.get(action.removeprefix("iam:"))
     if handler is None:
         return errors.synth_error("iam", "InvalidAction", f"The action {action} is not valid.", 400)

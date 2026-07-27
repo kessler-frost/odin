@@ -400,7 +400,7 @@ _HANDLERS: dict[str, _Handler] = {
 }
 
 
-def pure_answer(action: str, resource: str, env: str, body: bytes, stores: SynthStores, now: float) -> Response:
+async def pure_answer(action: str, resource: str, env: str, body: bytes, stores: SynthStores, now: float) -> Response:
     """The whole SSM answer -- same no-backing contract as
     ec2net/iamctl/ecr/logsctl/secretsctl: an unmodeled action
     (LabelParameterVersion, GetParameterHistory, every non-parameter SSM API)

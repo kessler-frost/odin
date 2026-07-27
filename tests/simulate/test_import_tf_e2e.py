@@ -28,15 +28,15 @@ _ODIN_ENV_DIR = Path(".odin") / ENV
 
 
 @pytest.fixture
-def runtime():
+async def runtime():
     rt = ColimaRuntime()
     yield rt
-    for name in own_containers(rt, ENV):
-        rt.stop(name)
+    for name in await own_containers(rt, ENV):
+        await rt.stop(name)
     shutil.rmtree(_ODIN_ENV_DIR, ignore_errors=True)
 
 
-def test_live_import_of_an_out_of_band_bucket_returns_an_s3_node(tmp_path, runtime):
+async def test_live_import_of_an_out_of_band_bucket_returns_an_s3_node(tmp_path, runtime):
     assert shutil.which("tofu"), "OpenTofu must be on PATH for this integration test"
     store = SpecStore(tmp_path)
     app = create_app(runtime=runtime, store=store)
@@ -46,13 +46,17 @@ def test_live_import_of_an_out_of_band_bucket_returns_an_s3_node(tmp_path, runti
         # Simulate's own provisioning boundary (test_tf_runner_e2e.py's
         # pattern): no canvas /apply, no Reconciler for this env at all.
         aws = BackingAws(runtime, ENV, gateway_port=gateway_port)
-        aws.ensure_backing("s3")
-        app.state.gateway.update(ENV, {}, aws.backing_ports())
+        await aws.ensure_backing("s3")
+        app.state.gateway.update(ENV, {}, await aws.backing_ports())
 
         # "boto3 creates a bucket out-of-band" -- odin never authored this
         # bucket as a canvas node or a tofu resource.
-        aws.client("s3").create_bucket(Bucket="uploads")
-        assert aws.exists("s3", "uploads")
+        # `(await aws.client(...)).create_bucket(...)`: `BackingAws.client` is the
+        # coroutine, the boto3 client it hands back is NOT -- `await
+        # aws.client("s3").create_bucket(...)` reads `.create_bucket` off the
+        # COROUTINE and never makes a bucket.
+        (await aws.client("s3")).create_bucket(Bucket="uploads")
+        assert await aws.exists("s3", "uploads")
 
         access_key, secret_key = app.state.gateway_keys.issue(ENV, OPERATOR_NODE_ID)
         result = client.post("/import-tf", params={"env": ENV}, json={
@@ -65,6 +69,6 @@ def test_live_import_of_an_out_of_band_bucket_returns_an_s3_node(tmp_path, runti
         assert node["type"] == "s3"
         assert node["id"] == "uploads"
 
-        aws.gc(set())  # stop the backing container -- nothing else owns it for this env
+        await aws.gc(set())  # stop the backing container -- nothing else owns it for this env
 
-    assert own_containers(runtime, ENV) == [], "every container this test made is gone"
+    assert await own_containers(runtime, ENV) == [], "every container this test made is gone"

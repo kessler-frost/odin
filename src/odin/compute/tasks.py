@@ -63,7 +63,7 @@ class TaskRuntime:
     def __init__(self, runtime=None) -> None:
         self._rt = runtime or ColimaRuntime()
 
-    def run(
+    async def run(
         self, env: str, task_id: str, container_def: dict, extra_env: dict[str, str] | None = None,
         cpu: str | int | None = None, memory: str | int | None = None,
     ) -> TaskContainerHandle:
@@ -89,27 +89,27 @@ class TaskRuntime:
         if extra_env:
             env_vars.update(extra_env)
         ports = {pm["containerPort"]: pm.get("hostPort") or 0 for pm in container_def.get("portMappings") or []}
-        self._rt.run_container(ContainerSpec(
+        await self._rt.run_container(ContainerSpec(
             name=name, image=container_def["image"], env=env_vars, ports=ports,
             command=tuple(container_def.get("command") or []),
             labels={"odin-env": env, "odin-ecs-task": task_id},
             memory_mib=_memory_mib(memory), cpus=_cpus(cpu),
         ))
-        host_ports = {cport: self._rt.host_port(name, cport) for cport in ports}
+        host_ports = {cport: await self._rt.host_port(name, cport) for cport in ports}
         return TaskContainerHandle(name=name, host_ports=host_ports)
 
-    def status(self, env: str, task_id: str, container_def_name: str) -> str:
-        return self._rt.status(container_name(env, task_id, container_def_name))
+    async def status(self, env: str, task_id: str, container_def_name: str) -> str:
+        return await self._rt.status(container_name(env, task_id, container_def_name))
 
-    def exit_code(self, env: str, task_id: str, container_def_name: str) -> int:
-        return self._rt.exit_code(container_name(env, task_id, container_def_name))
+    async def exit_code(self, env: str, task_id: str, container_def_name: str) -> int:
+        return await self._rt.exit_code(container_name(env, task_id, container_def_name))
 
-    def logs(self, env: str, task_id: str, container_def_name: str, tail: int = 20) -> str:
+    async def logs(self, env: str, task_id: str, container_def_name: str, tail: int = 20) -> str:
         """The task container's own log tail -- what `gateway/models/
         ecsctl.py`'s sweep ships into `/ecs/{service}`. Never raises: the
         driver's `logs` is a `check=False` CLI call, so an already-removed
         container answers with "" (`_ContainerRuntime.logs`'s contract)."""
-        return self._rt.logs(container_name(env, task_id, container_def_name), tail)
+        return await self._rt.logs(container_name(env, task_id, container_def_name), tail)
 
-    def stop(self, env: str, task_id: str, container_def_name: str) -> None:
-        self._rt.stop(container_name(env, task_id, container_def_name))
+    async def stop(self, env: str, task_id: str, container_def_name: str) -> None:
+        await self._rt.stop(container_name(env, task_id, container_def_name))

@@ -1,6 +1,6 @@
 [project]
 name = "odin"
-version = "0.7.6"
+version = "0.7.7"
 description = "Odin: a local-first AWS-compatible cloud. Design AWS architectures on a drag-drop canvas; apply them for real onto local open-source substitutes (RustFS, goaws, dynalite, Postgres) on Colima/Lima."
 requires-python = ">=3.12"
 license = "Apache-2.0"
@@ -14,7 +14,15 @@ dependencies = [
     "httpx>=0.27",
     "claude-agent-sdk>=0.1.39",
     "typer>=0.15",
-    "psycopg2-binary>=2.9.12",
+    # asyncpg (Apache-2.0), not psycopg2 (LGPL-3.0) or psycopg3 (LGPL-3.0):
+    # odin ships permissive licences only, and psycopg2 had quietly been the
+    # exception. It is also the only Postgres driver here with a native async
+    # API. MEASURED against a real WEDGED Postgres (docker pause -- field
+    # test 6's F4): psycopg2 blocked the loop 3008ms for 1 heartbeat tick,
+    # async managed 264. A healthy DB fast-fails in 0.42-5.8ms and would not
+    # have justified the swap; a wedged one blocks 85.7% of wall clock for up
+    # to 180s, freezing gateway and reconciler together.
+    "asyncpg>=0.30",
     "python-hcl2>=8.1.2",
 ]
 
@@ -24,6 +32,14 @@ dev = [
     "pytest-asyncio>=0.24",
     "ruff>=0.8",
     "respx>=0.21",  # BSD-3-Clause; httpx mocking for the CLI's unit tests
+    # MIT. The suite is ~2500 tests and the de-threading work made many of them
+    # actually RUN where they previously errored out in milliseconds, so serial
+    # wall-clock went past 15 minutes. MEASURED on tests/agent+api+aws:
+    # 238.08s serial -> 27.79s with `-n auto` (8.6x), with byte-identical
+    # results (42 failed / 595 passed / 37 errors both ways). Identical results
+    # are the precondition -- a parallel run that CHANGES outcomes is a broken
+    # suite, not a fast one.
+    "pytest-xdist>=3.6",
 ]
 
 [project.scripts]

@@ -344,6 +344,10 @@ class TfRunner:
         budget = self._timeout if timeout is None else timeout
         timed_out = False
         try:
+            # NOT `wait_for(await _drain(), ...)`: the inner await runs `_drain`
+            # to completion FIRST, so the timeout this whole branch exists to
+            # enforce would never apply -- a tofu apply could hang forever while
+            # the code reads as if it were bounded.
             code = await asyncio.wait_for(_drain(), timeout=budget)
         except asyncio.TimeoutError:
             timed_out = True

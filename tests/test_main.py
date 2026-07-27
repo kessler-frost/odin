@@ -119,26 +119,41 @@ def test_dev_mode_backend_subprocess_gets_the_host_argv(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     calls = []
 
+    # The seam is `asyncio.create_subprocess_exec`, NOT `subprocess.Popen`.
+    # v0.7.7 moved dev mode's two children onto the loop, and this fake was
+    # still patching Popen -- so it intercepted nothing, the test launched a
+    # REAL uvicorn and a REAL vite, and `_relay` then waited forever on their
+    # stdout. It hung the whole suite (and left stray processes behind), which
+    # is why the fake now mirrors the real seam rather than the old one.
+    class FakeStream:
+        # `_relay` consumes it with `async for line in stream`, so the fake has
+        # to be an async ITERATOR, not just something with `readline`.
+        # Immediate StopAsyncIteration == the child closed its pipe.
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
     class FakeProc:
         pid = 1
-        stdout = []
+        returncode = 0
+        stdout = FakeStream()
 
-        def poll(self):
-            return 0
-
-        def wait(self):
+        async def wait(self):
             return 0
 
         def terminate(self):
             pass
 
-    def fake_popen(argv, **kwargs):
-        calls.append(argv)
+        def kill(self):
+            pass
+
+    async def fake_exec(*argv, **kwargs):
+        calls.append(list(argv))
         return FakeProc()
 
-    monkeypatch.setattr(main_mod.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(main_mod.signal, "signal", lambda *a, **kw: None)
-    monkeypatch.setattr(main_mod.signal, "pause", lambda: None)
+    monkeypatch.setattr(main_mod.asyncio, "create_subprocess_exec", fake_exec)
     # Dev mode's two prerequisites, stubbed rather than borrowed from whichever
     # machine runs the suite: this asserts an argv, and it used to pass or fail
     # on whether the developer happened to have bun on PATH and `bun install`
@@ -624,10 +639,17 @@ def test_dev_mode_without_bun_refuses_before_it_starts_anything(clone_without_bu
     assert not main_mod.PID_FILE.exists()
 
 
-def test_the_bun_fix_is_the_one_doctor_prints(clone_without_bun, capsys):
+async def test_the_bun_fix_is_the_one_doctor_prints(clone_without_bun, capsys):
     """One remedy, one spelling: `odin doctor`'s bun row and `odin start`'s
     refusal both come from `doctor.BUN_INSTALL`."""
-    row, = doctor_mod.run_checks(["bun"], lambda args, input=None: util.CommandResult(1, ""))
+    # v0.7.7: `run_checks` is a coroutine over an ASYNC runner seam (the Typer
+    # command itself stays sync and bridges with `asyncio.run`, because Typer
+    # silently drops an `async def` command). The fake runner has to be a
+    # coroutine function too, or `run_checks` awaits a plain CommandResult.
+    async def fake_run(args, input=None):
+        return util.CommandResult(1, "")
+
+    row, = await doctor_mod.run_checks(["bun"], fake_run)
     with pytest.raises(typer.Exit):
         main_mod._require_bun("build the UI")
     assert row.fix and row.fix in capsys.readouterr().err

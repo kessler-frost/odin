@@ -33,6 +33,7 @@ import { sizeOnLoad, sizeForSave } from '../lib/nodeSize';
 import { BUILTINS, CATALOG, catalogNodeTypeMap, catalogDefaultData, catalogDefaultStyle, catalogZIndex, catalogByType, COLORS } from '../lib/catalog';
 import { withContainment, isInsideContainer } from '../lib/containment';
 import { placeUnpositioned } from '../lib/placement';
+import { readCanvas } from '../lib/canvasLoad';
 import { computeTypes, defaultPermissions, detectDefaultEdgeType, edgeStyle, edgeTypes } from '../lib/iam';
 
 const nodeTypes: NodeTypes = {
@@ -105,14 +106,55 @@ function nextId(type: string) {
   return `${type}-${++idCounter}`;
 }
 
-// Nudge a drop/double-click spot so a new node never overlaps an existing one.
-// Step is >= the default node width (200px), kept on the 20px grid.
-const DECOLLIDE_STEP = 220;
-function deCollide(pos: { x: number; y: number }, nodes: Node[]) {
-  let { x, y } = pos;
-  const occupied = () => nodes.some(n => Math.abs(n.position.x - x) < DECOLLIDE_STEP && Math.abs(n.position.y - y) < DECOLLIDE_STEP);
-  for (let i = 0; i < 50 && occupied(); i++) { x += DECOLLIDE_STEP; y += DECOLLIDE_STEP; }
-  return { x, y };
+// Nudge a drop/double-click spot only when the new node would REALLY overlap
+// an existing one, and then only as far as it takes.
+//
+// This used to treat a 220x220 halo around every node as occupied and, on a
+// hit, jump +220 in BOTH axes -- up to 50 times. So a drop merely NEAR another
+// node was flung diagonally away, which reads as "it went somewhere else
+// entirely", and two nearby nodes compounded it. The halo was always wrong for
+// height (a node is 40-80px tall now that leaves are content-sized, so 220
+// reserved 3-5x its real size) and the diagonal step moved on an axis nothing
+// had collided on.
+//
+// Real rectangle overlap plus one grid cell of breathing room, then a ring
+// search outward on the 20px grid for the NEAREST free slot -- so a node that
+// fits where you dropped it stays exactly there, and one that does not moves
+// the minimum distance, usually a single cell.
+const GAP = 20;
+
+type Box = { x: number; y: number; w: number; h: number };
+
+function boxOf(n: Node): Box {
+  const style = (n.style ?? {}) as { width?: number; height?: number };
+  return {
+    x: n.position.x,
+    y: n.position.y,
+    w: n.width ?? style.width ?? 200,
+    // Leaves are content-sized, so `measured` is the only truth for them;
+    // fall back to the middle of the 40-80 range rather than the old 220.
+    h: n.height ?? n.measured?.height ?? style.height ?? 60,
+  };
+}
+
+function hits(a: Box, b: Box): boolean {
+  return a.x < b.x + b.w + GAP && a.x + a.w + GAP > b.x
+      && a.y < b.y + b.h + GAP && a.y + a.h + GAP > b.y;
+}
+
+function deCollide(pos: { x: number; y: number }, nodes: Node[], size = { w: 200, h: 60 }) {
+  const boxes = nodes.map(boxOf);
+  const free = (p: { x: number; y: number }) => !boxes.some(b => hits({ ...p, ...size }, b));
+  if (free(pos)) return pos;
+  for (let r = GAP; r <= 600; r += GAP) {
+    for (const cand of [
+      { x: pos.x + r, y: pos.y }, { x: pos.x, y: pos.y + r },
+      { x: pos.x - r, y: pos.y }, { x: pos.x, y: pos.y - r },
+      { x: pos.x + r, y: pos.y + r }, { x: pos.x - r, y: pos.y + r },
+      { x: pos.x + r, y: pos.y - r }, { x: pos.x - r, y: pos.y - r },
+    ]) if (free(cand)) return cand;
+  }
+  return pos;
 }
 
 // Read the live endpoint / DATABASE_URL off a World resource's facts — the
@@ -148,6 +190,10 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
   // screen until dismissed: the fix for it was a toast that faded after 4.5s,
   // which is the same as saying nothing to anyone who looked a moment later.
   const [placed, setPlaced] = useState(0);
+  // The canvas could not be READ. Deliberately NOT dismissible: dismissing it
+  // would leave an empty canvas that looks like a real one, which is the exact
+  // confusion that made the data loss above so quiet.
+  const [loadFailed, setLoadFailed] = useState(false);
   const { screenToFlowPosition, fitView } = useReactFlow();
   const [shiftHeld, setShiftHeld] = useState(false);
 
@@ -179,7 +225,16 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
   // --- Load canvas from backend on mount (status is seeded separately, from /world) ---
   useEffect(() => {
     const load = async () => {
-      const canvasRes = await fetch(`${API}/canvas`).then(r => r.json()).catch(() => ({ nodes: [], edges: [] }));
+      // A FAILED read is not an empty canvas — see `lib/canvasLoad.ts` for the
+      // data loss that collapsing those two cases caused. `null` means COULD
+      // NOT READ, and the loader returns WITHOUT setting `loaded`: nothing
+      // renders, the debounced save below never arms, the file on disk is
+      // untouched, and the banner says so.
+      const canvasRes = await readCanvas(fetch, `${API}/canvas`);
+      if (!canvasRes) {
+        setLoadFailed(true);
+        return;
+      }
 
       // A canvas authored outside the UI (`odin canvas set`, an agent, the
       // README's own example) may carry no `position`. ReactFlow dereferences
@@ -484,9 +539,9 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
       const type = nodeTypeMap[abbr];
       if (!type || !defaultDataForType[type]) return;
 
-      const position = screenToFlowPosition({ x: event.clientX, y: event.clientY });
-      position.x = Math.round(position.x / 20) * 20;
-      position.y = Math.round(position.y / 20) * 20;
+      const position = centredOn(
+        screenToFlowPosition({ x: event.clientX, y: event.clientY }), type,
+      );
       setNodes((nds) => {
         // Keep labels unique — the registry keys on `{type}_{label}`, so two
         // nodes of a type with the same default label would otherwise collide.
@@ -502,7 +557,7 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
             // A drop point already inside a VPC/Subnet is a deliberate nesting
             // gesture — deCollide's proximity shove would otherwise push the
             // new node outside the container it was just dropped into.
-            position: isInsideContainer(position, nds) ? position : deCollide(position, nds),
+            position: isInsideContainer(position, nds) ? position : deCollide(position, nds, sizeFor(type)),
             zIndex: zIndexForType[type] ?? 2,
             data: { ...defaultDataForType[type], label },
             style: { ...defaultStyleForType[type] },
@@ -514,15 +569,46 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
   );
 
   const dblClickTypeRef = useRef(0);
-  const typeOrder = ['s3', 'sqs', 'dynamodb', 'rds', 'vpc', 'subnet', 'sg', 'ec2', 'lambda'];
+  // A drop/click point is where the CURSOR is, and `screenToFlowPosition` returns
+// exactly that -- but ReactFlow reads `position` as the node's TOP-LEFT corner.
+// Using it raw put every new node down and to the RIGHT of the cursor by half
+// its own size, which reads as "it didn't land where I dropped it".
+// Centring is the right correction rather than preserving the grab offset,
+// because the thing being dragged is a small palette TILE, not the node, so an
+// offset inside the tile has no meaningful mapping onto a 200px node.
+// Heights are content-derived for leaf nodes now (40 + 20*rows), so the
+// declared height is used when there is one (vpc/subnet) and a 60px middle of
+// the leaf range otherwise -- half a row out is invisible, half a node is not.
+const CENTRED_FALLBACK = { width: 200, height: 60 };
+
+function sizeFor(type: string) {
+  const style = (defaultStyleForType[type] ?? {}) as { width?: number; height?: number };
+  return {
+    w: typeof style.width === 'number' ? style.width : CENTRED_FALLBACK.width,
+    h: typeof style.height === 'number' ? style.height : CENTRED_FALLBACK.height,
+  };
+}
+
+function centredOn(point: { x: number; y: number }, type: string) {
+  const style = (defaultStyleForType[type] ?? {}) as { width?: number; height?: number };
+  const width = typeof style.width === 'number' ? style.width : CENTRED_FALLBACK.width;
+  const height = typeof style.height === 'number' ? style.height : CENTRED_FALLBACK.height;
+  // Snap AFTER centring, so the node still lands on the 20px grid.
+  return {
+    x: Math.round((point.x - width / 2) / 20) * 20,
+    y: Math.round((point.y - height / 2) / 20) * 20,
+  };
+}
+
+const typeOrder = ['s3', 'sqs', 'dynamodb', 'rds', 'vpc', 'subnet', 'sg', 'ec2', 'lambda'];
 
   const onPaneDoubleClick = useCallback(
     (event: React.MouseEvent) => {
       const type = typeOrder[dblClickTypeRef.current % typeOrder.length];
       dblClickTypeRef.current++;
-      const position = screenToFlowPosition({ x: event.clientX, y: event.clientY });
-      position.x = Math.round(position.x / 20) * 20;
-      position.y = Math.round(position.y / 20) * 20;
+      const position = centredOn(
+        screenToFlowPosition({ x: event.clientX, y: event.clientY }), type,
+      );
       setNodes((nds) => {
         // Keep labels unique — the registry keys on `{type}_{label}`, so two
         // nodes of a type with the same default label would otherwise collide.
@@ -538,7 +624,7 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
             // A drop point already inside a VPC/Subnet is a deliberate nesting
             // gesture — deCollide's proximity shove would otherwise push the
             // new node outside the container it was just dropped into.
-            position: isInsideContainer(position, nds) ? position : deCollide(position, nds),
+            position: isInsideContainer(position, nds) ? position : deCollide(position, nds, sizeFor(type)),
             zIndex: zIndexForType[type] ?? 2,
             data: { ...defaultDataForType[type], label },
             style: { ...defaultStyleForType[type] },
@@ -742,6 +828,22 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
       {/* The canvas moved something the user didn't: say so, in the same pill
           bar RegionAsk uses (40px tall, 20px off the edge), and leave it up
           until it's dismissed. */}
+      {loadFailed && (
+        <div className="absolute top-0 left-0 right-0 z-30 flex items-center gap-2 px-3 py-2.5 bg-bg-secondary border-b border-neon-red shadow-lg">
+          <span className="font-mono text-[10px] leading-5 text-neon-red uppercase tracking-[1px] whitespace-nowrap">Not loaded</span>
+          <span className="flex-1 min-w-0 font-mono text-[11px] leading-5 text-text-secondary">
+            odin could not read the saved canvas. <span className="text-text-primary">Nothing has been overwritten</span> — your
+            saved canvas is intact on disk. Reload to try again; do not draw here until it loads.
+          </span>
+          <button
+            onClick={() => window.location.reload()}
+            title="Reload"
+            className="font-mono text-[10px] h-5 px-2.5 border border-border bg-bg-tertiary text-text-muted uppercase tracking-[1px] cursor-pointer transition-colors duration-200 hover:text-text-primary hover:border-border-bright"
+          >
+            Reload
+          </button>
+        </div>
+      )}
       {placed > 0 && (
         <div className="absolute top-0 left-0 right-0 z-30 flex items-center gap-2 px-3 py-2.5 bg-bg-secondary border-b border-border-bright shadow-lg">
           <span className="font-mono text-[10px] leading-5 text-neon-amber uppercase tracking-[1px] whitespace-nowrap">Placed</span>

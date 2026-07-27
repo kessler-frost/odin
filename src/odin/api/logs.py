@@ -201,7 +201,7 @@ def _tail_lines(text: str, budget: int) -> str:
     return "\n".join(text.splitlines()[-budget:])
 
 
-def _from_containers(
+async def _from_containers(
     env: str, node: str, kind: str, runtime, names: list[str], tail: int, absent_message: str | None = None,
 ) -> LogsResponse:
     """Read logs off every name in `names` -- an EXITED container's logs are
@@ -222,12 +222,12 @@ def _from_containers(
     budget = tail
     any_running = any_present = False
     for name in names:
-        status = runtime.status(name)
+        status = await runtime.status(name)
         if status == "absent":
             continue
         any_present = True
         any_running = any_running or status == "running"
-        text = _tail_lines(runtime.logs(name, budget), budget) if budget > 0 else ""
+        text = _tail_lines(await runtime.logs(name, budget), budget) if budget > 0 else ""
         budget -= len(text.splitlines())
         if text:
             blocks.append(f"==> {name} <==\n{text}" if len(names) > 1 else text)
@@ -283,7 +283,7 @@ def fetch_group_logs(
     )
 
 
-def fetch_logs(
+async def fetch_logs(
     store: SpecStore, stores: SynthStores, runtime, env: str, node: str, tail: int = DEFAULT_TAIL,
 ) -> LogsResponse:
     kind = _resource_kind(store, env, node)
@@ -292,11 +292,11 @@ def fetch_logs(
 
     if kind == "rds":
         name = PostgresRds(runtime, env).container_name(node)
-        return _from_containers(env, node, kind, runtime, [name], tail)
+        return await _from_containers(env, node, kind, runtime, [name], tail)
 
     if kind in PROVISIONED:
         name = BackingAws(runtime, env).container_name(kind)
-        return _from_containers(env, node, kind, runtime, [name], tail)
+        return await _from_containers(env, node, kind, runtime, [name], tail)
 
     if kind == "ec2":
         instance = _find_ec2_instance(stores, env, node)
@@ -311,9 +311,9 @@ def fetch_logs(
         # and the sentence contradicted itself. Both are worth showing (a
         # disagreement between them IS the diagnosis), neither may be printed
         # as if it were the other's answer.
-        state = vm.status(name)
+        state = await vm.status(name)
         running = state == "running"
-        lines = vm.logs(name, tail) if state != "absent" else ""
+        lines = await vm.logs(name, tail) if state != "absent" else ""
         message = None if running else (
             f"{name} is not running (VM state: {state}; odin's record says {instance['state_name']})"
         )
@@ -328,7 +328,7 @@ def fetch_logs(
             return LogsResponse(env=env, node=node, kind=kind, found=True, message=f"no Lambda function backs node {node!r} yet")
         name = lambda_compute.container_name(env, fn["function_name"])
         colima = ColimaRuntime()
-        return _from_containers(
+        return await _from_containers(
             env, node, kind, colima, [name], tail,
             absent_message=f"{name} is not running (function state: {fn['state']})",
         )
@@ -342,7 +342,7 @@ def fetch_logs(
             return LogsResponse(env=env, node=node, kind=kind, found=True, message="no tasks have run for this service yet")
         colima = ColimaRuntime()
         names = [ecs_compute.container_name(env, task_id, cdef_name) for task_id, cdef_name in containers]
-        return _from_containers(env, node, kind, colima, names, tail)
+        return await _from_containers(env, node, kind, colima, names, tail)
 
     if kind == "elasticache":
         cluster = _find_cache_cluster(stores, env, node)
@@ -351,7 +351,7 @@ def fetch_logs(
         name = cache_compute.container_name(env, cluster["cache_cluster_id"])
         # Always Colima, matching RedisCache's own default runtime (the same
         # reasoning the lambda/ecs branches above record).
-        return _from_containers(
+        return await _from_containers(
             env, node, kind, ColimaRuntime(), [name], tail,
             absent_message=f"{name} is not running (cluster status: {cluster['status']})",
         )
@@ -409,7 +409,7 @@ def create_logs_router(store: SpecStore, stores: SynthStores, runtime) -> APIRou
     router = APIRouter()
 
     @router.get("/logs")
-    def logs_route(
+    async def logs_route(
         env: str = "default", node: str = "", group: str = "", tail: int = DEFAULT_TAIL,
     ) -> LogsResponse:
         if not node and not group:
@@ -431,7 +431,7 @@ def create_logs_router(store: SpecStore, stores: SynthStores, runtime) -> APIRou
         try:
             if group:  # an explicit group read wins over node resolution (module docstring)
                 return fetch_group_logs(stores, env, group, tail, node=node)
-            return fetch_logs(store, stores, runtime, env, node, tail)
+            return await fetch_logs(store, stores, runtime, env, node, tail)
         except (StoreUnreadable, OSError, ValueError) as exc:
             log.warning("could not read gateway state for env %s: %s", env, exc)
             return LogsResponse(env=env, node=node, error=_unreadable_state_error(stores.root, env, exc))

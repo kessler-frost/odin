@@ -93,11 +93,11 @@ id, same address.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import tempfile
-import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -116,7 +116,7 @@ from odin.fabric.nebula import (
     rehandshake_script,
 )
 from odin.runtime.colima import _failure_reason
-from odin.util import atomic_write_text, run_command
+from odin.util import atomic_write_text, run_command_async
 
 log = logging.getLogger("odin.compute.instances")
 
@@ -149,7 +149,7 @@ def _default_max_concurrent_boots() -> int:
 # runs may be in flight against one Mac. That bound is still needed when the
 # boots are tasks rather than threads; N concurrent awaits stampede the host
 # exactly as N concurrent threads do.
-_BOOT_SEMAPHORE = threading.Semaphore(_default_max_concurrent_boots())
+_BOOT_SEMAPHORE = asyncio.Semaphore(_default_max_concurrent_boots())
 
 
 @dataclass
@@ -159,11 +159,14 @@ class _Proc:
     stderr: str = ""
 
 
-def _default_runner(args: list[str], input: str | None = None) -> _Proc:
-    # `run_command`: `limactl` is genuinely optional (doctor reports it as
-    # such), so "not installed" must surface as a nonzero result every caller
-    # already handles, never a FileNotFoundError.
-    proc = run_command(args, input=input)
+async def _default_runner(args: list[str], input: str | None = None) -> _Proc:
+    # `run_command_async`: `limactl` is genuinely optional (doctor reports it
+    # as such), so "not installed" must surface as a nonzero result every
+    # caller already handles, never a FileNotFoundError. Async because `_lima`
+    # awaits this seam (v0.7.7 de-threading) -- `limactl create`/`start` are
+    # the longest subprocesses odin runs, so blocking the loop on them is the
+    # single worst stall available.
+    proc = await run_command_async(args, input=input)
     return _Proc(proc.returncode, proc.stdout, proc.stderr)
 
 
@@ -371,7 +374,7 @@ class InstanceVm:
 
     def __init__(
         self, runner=None, poll_interval: float = 2.0, lighthouse: LighthouseManager | None = None,
-        boot_semaphore: threading.Semaphore | None = None,
+        boot_semaphore: asyncio.Semaphore | None = None,
     ) -> None:
         self._run = runner or _default_runner
         # A constructor knob (not a hardcoded sleep) purely for testability --
@@ -387,7 +390,7 @@ class InstanceVm:
         # bound without needing `ODIN_MAX_CONCURRENT_VM_BOOTS`/a real boot.
         self._boot_semaphore = boot_semaphore or _BOOT_SEMAPHORE
 
-    def _lima(self, *args: str, check: bool = True, input: str | None = None) -> _Proc:
+    async def _lima(self, *args: str, check: bool = True, input: str | None = None) -> _Proc:
         """One `limactl` run. A failure raises a reason that is never vacuous.
 
         The text was `f"limactl {' '.join(args)} failed: {proc.stderr.strip()}"`,
@@ -413,7 +416,7 @@ class InstanceVm:
         carries no secret. Every raising call site is `create`/`start`/`list`
         (VM name, `--timeout`, a YAML PATH); the cert key and the workload's
         env vars ride stdin and cloud-init files, never argv."""
-        proc = self._run(["limactl", *args], input=input)
+        proc = await self._run(["limactl", *args], input=input)
         if check and proc.returncode != 0:
             raise RuntimeError(
                 f"limactl {' '.join(args)} failed "
@@ -421,7 +424,7 @@ class InstanceVm:
             )
         return proc
 
-    def boot(
+    async def boot(
         self,
         name: str,
         vm_config: VmConfig,
@@ -439,7 +442,7 @@ class InstanceVm:
         StateReason, never a silent hang. `env_vars` (the workload's gateway
         identity, see `gateway/keys.py::workload_env`) is baked into the
         VM's cloud-init -- /etc/environment + ~/.aws/credentials."""
-        extra = _extra_provision_script(self._nebula_files(nebula), user_data)
+        extra = _extra_provision_script(await self._nebula_files(nebula), user_data)
         script = generate_cloud_init(
             hostname=hostname, ssh_pubkey=ssh_pubkey, extra_script=extra, env_vars=env_vars,
             install_nebula=nebula is not None,
@@ -451,21 +454,21 @@ class InstanceVm:
         try:
             # Owner directive B2: only `_boot_semaphore`'s own limit worth of
             # VMs are ever mid-create/start at once -- a caller beyond that
-            # blocks HERE (on this thread, one of ec2compute.py's own
-            # per-instance daemon threads -- never the event loop) until a
-            # slot frees. Released before `_discover_ip`'s poll loop and
-            # nebula activation, neither of which is the heavy part.
-            with self._boot_semaphore:
-                self._lima("create", "--tty=false", f"--name={name}", yaml_path)
-                self._lima("start", f"--timeout={int(timeout)}s", name)
+            # WAITS here (v0.7.7: an `asyncio.Semaphore`, so it yields the loop
+            # to every other task instead of parking a thread) until a slot
+            # frees. Released before `_discover_ip`'s poll loop and nebula
+            # activation, neither of which is the heavy part.
+            async with self._boot_semaphore:
+                await self._lima("create", "--tty=false", f"--name={name}", yaml_path)
+                await self._lima("start", f"--timeout={int(timeout)}s", name)
         finally:
             Path(yaml_path).unlink(missing_ok=True)
-        ip = self._discover_ip(name, timeout)
+        ip = await self._discover_ip(name, timeout)
         if nebula is not None:
-            self._activate_nebula(name, nebula, ip)
+            await self._activate_nebula(name, nebula, ip)
         return ip
 
-    def _nebula_files(self, nebula: NebulaJoin | None) -> dict[str, str] | None:
+    async def _nebula_files(self, nebula: NebulaJoin | None) -> dict[str, str] | None:
         """Cloud-init-time only: cert material, which doesn't depend on the
         underlay address -- `config.yml` is deliberately NOT here (see the
         module docstring's chicken/egg note); `_activate_nebula` writes it
@@ -490,13 +493,13 @@ class InstanceVm:
         manager = NebulaManager(Path(nebula.root) / nebula.env / "nebula", runner=self._run)
         existing = manager.load_overlay()
         underlay = (existing.lighthouse_underlay_ip if existing else None) or "127.0.0.1"
-        ensure_network(nebula.root, nebula.env, underlay, runner=self._run)
-        overlay_ip = manager.allocate_host_ip(nebula.host_id)
+        await ensure_network(nebula.root, nebula.env, underlay, runner=self._run)
+        overlay_ip = await manager.allocate_host_ip(nebula.host_id)
         # "ec2" plus this instance's own security-group ids (W2.6): nebula
         # matches a peer's `group:` firewall rule against THIS cert's groups,
         # so the sg ids have to be baked in at signing time -- they're what
         # another node's "allow 5432 from sg-web" rule tests against.
-        cert = manager.sign_cert(nebula.host_id, overlay_ip, groups=_cert_groups(nebula))
+        cert = await manager.sign_cert(nebula.host_id, overlay_ip, groups=_cert_groups(nebula))
         # What this VM is about to be born holding -- recorded HERE so the very
         # next Apply can tell an unchanged membership from a changed one
         # without a single subprocess (see `instance_membership_path`).
@@ -507,7 +510,7 @@ class InstanceVm:
             "host.key": cert.key.read_text(),
         }
 
-    def _discover_host_underlay(self, vm_ip: str) -> str | None:
+    async def _discover_host_underlay(self, vm_ip: str) -> str | None:
         """The host's own address on the VM's vzNAT /24 -- the address a
         nebula daemon INSIDE the VM can reach the host lighthouse at.
         Derived by correlating to the VM's OWN just-discovered IP (e.g.
@@ -519,7 +522,7 @@ class InstanceVm:
         real Lima vz VM and reading `ifconfig` on both sides; it only exists
         on the host while at least one vz VM is running, which is always
         true here (this VM is the one that just booted)."""
-        proc = self._run(["ifconfig"])
+        proc = await self._run(["ifconfig"])
         if proc.returncode != 0:
             return None
         prefix = f"{vm_ip.rsplit('.', 1)[0]}."
@@ -529,7 +532,7 @@ class InstanceVm:
                 return line.split()[1]
         return None
 
-    def _activate_nebula(self, name: str, nebula: NebulaJoin, vm_ip: str) -> None:
+    async def _activate_nebula(self, name: str, nebula: NebulaJoin, vm_ip: str) -> None:
         """Post-boot (the VM is up and vzNAT-networked, so the real underlay
         is now discoverable): write the FINAL nebula config -- the real
         underlay address and the VPC's compiled SG firewall -- and start the
@@ -542,15 +545,15 @@ class InstanceVm:
         instance in a failure path over something the AWS API contract
         doesn't even surface."""
         try:
-            underlay = self._discover_host_underlay(vm_ip)
+            underlay = await self._discover_host_underlay(vm_ip)
             if underlay is None:
                 log.warning("could not derive a host underlay address for %s; nebula not activated", name)
                 return
-            self._lighthouse.ensure_started(nebula.root, nebula.env, underlay)
-            network = ensure_network(nebula.root, nebula.env, underlay, runner=self._run)
+            await self._lighthouse.ensure_started(nebula.root, nebula.env, underlay)
+            network = await ensure_network(nebula.root, nebula.env, underlay, runner=self._run)
             config = self._render_config(nebula, network, underlay)
-            self._push_config(name, nebula, config)
-            self._lima("shell", name, "--", "sudo", "systemctl", "enable", "--now", "nebula", check=False)
+            await self._push_config(name, nebula, config)
+            await self._lima("shell", name, "--", "sudo", "systemctl", "enable", "--now", "nebula", check=False)
         except Exception as exc:  # noqa: BLE001 -- deliberately broad, see docstring
             log.warning("nebula activation failed for %s: %s", name, exc)
 
@@ -569,12 +572,12 @@ class InstanceVm:
             firewall_revision=nebula.revision,
         )
 
-    def _push_config(self, name: str, nebula: NebulaJoin, config: str) -> None:
+    async def _push_config(self, name: str, nebula: NebulaJoin, config: str) -> None:
         """Write the config INTO the VM and record what we put there."""
-        self._lima("shell", name, "--", "sudo", "tee", "/etc/nebula/config.yml", input=config, check=False)
+        await self._lima("shell", name, "--", "sudo", "tee", "/etc/nebula/config.yml", input=config, check=False)
         atomic_write_text(instance_config_path(nebula.root, nebula.env, nebula.host_id), config)
 
-    def _vm_config(self, name: str, nebula: NebulaJoin) -> str | None:
+    async def _vm_config(self, name: str, nebula: NebulaJoin) -> str | None:
         """What is ACTUALLY on the VM right now. Only read when odin has no
         record of its own (a VM booted before `refresh_nebula` existed, or one
         somebody edited by hand) -- one `limactl shell` per VM, once, instead
@@ -582,10 +585,10 @@ class InstanceVm:
         recorded = instance_config_path(nebula.root, nebula.env, nebula.host_id)
         if recorded.exists():
             return recorded.read_text()
-        proc = self._lima("shell", name, "--", "sudo", "cat", "/etc/nebula/config.yml", check=False)
+        proc = await self._lima("shell", name, "--", "sudo", "cat", "/etc/nebula/config.yml", check=False)
         return proc.stdout if proc.returncode == 0 and proc.stdout.strip() else None
 
-    def refresh_nebula(self, name: str, nebula: NebulaJoin) -> str:
+    async def refresh_nebula(self, name: str, nebula: NebulaJoin) -> str:
         """Bring a RUNNING VM's nebula config AND certificate up to date with
         the canvas, and make the running daemon actually adopt them. Returns
         what it did: `unchanged` / `reloaded` / `recertified` / `restarted` /
@@ -632,23 +635,23 @@ class InstanceVm:
         ec2compute.py::ensure_instance_mesh` refuses to let an Apply report
         success over it."""
         try:
-            return self._refresh(name, nebula)
+            return await self._refresh(name, nebula)
         except Exception as exc:  # noqa: BLE001 -- deliberately broad, see docstring
             log.warning("nebula refresh failed for %s: %s", name, exc)
             return "failed"
 
-    def _refresh(self, name: str, nebula: NebulaJoin) -> str:
+    async def _refresh(self, name: str, nebula: NebulaJoin) -> str:
         manager = NebulaManager(Path(nebula.root) / nebula.env / "nebula", runner=self._run)
         network = manager.load_overlay()
         underlay = network.lighthouse_underlay_ip if network else None
         if network is None or underlay is None:
             return "skipped"  # this env has no bootstrapped mesh to be out of date with
         config = self._render_config(nebula, network, underlay)
-        current = self._vm_config(name, nebula)
-        recertified = self._reissue_cert(name, nebula, manager)
+        current = await self._vm_config(name, nebula)
+        recertified = await self._reissue_cert(name, nebula, manager)
         if current == config and not recertified:
             return "unchanged"
-        self._push_config(name, nebula, config)
+        await self._push_config(name, nebula, config)
         action = (
             "recertified" if recertified
             else "reloaded" if firewall_only_change(current, config)
@@ -658,16 +661,16 @@ class InstanceVm:
             ["sudo", "systemctl", "kill", "-s", "HUP", "nebula"] if action == "reloaded"
             else ["sudo", "systemctl", "restart", "nebula"]
         )
-        proc = self._lima("shell", name, "--", *command, check=False)
+        proc = await self._lima("shell", name, "--", *command, check=False)
         if proc.returncode != 0:
             log.warning("nebula %s failed on %s: %s", action, name, proc.stderr.strip() or "no output")
             return "failed"
         _record_membership(nebula)
-        self._converge(name, nebula, network, action)
+        await self._converge(name, nebula, network, action)
         log.info("nebula config %s on %s (its security groups changed)", action, name)
         return action
 
-    def _reissue_cert(self, name: str, nebula: NebulaJoin, manager: NebulaManager) -> bool:
+    async def _reissue_cert(self, name: str, nebula: NebulaJoin, manager: NebulaManager) -> bool:
         """Has this instance's security-group MEMBERSHIP changed, and if so,
         give it a certificate that says so. Returns whether it re-issued.
 
@@ -687,9 +690,9 @@ class InstanceVm:
         desired = _cert_groups(nebula)
         if _recorded_membership(nebula) == desired:
             return False
-        cert = manager.reissue_cert(nebula.host_id, manager.allocate_host_ip(nebula.host_id), desired)
+        cert = await manager.reissue_cert(nebula.host_id, await manager.allocate_host_ip(nebula.host_id), desired)
         script = _write_files_script({"host.crt": cert.crt.read_text(), "host.key": cert.key.read_text()})
-        proc = self._lima("shell", name, "--", "sudo", "bash", "-s", input=script, check=False)
+        proc = await self._lima("shell", name, "--", "sudo", "bash", "-s", input=script, check=False)
         if proc.returncode != 0:
             # The same `_failure_reason` `_lima` raises, for the same measured
             # reason. This site had half the treatment already (`or 'no
@@ -704,7 +707,7 @@ class InstanceVm:
         log.info("re-issued %s's nebula certificate on %s with groups %s", nebula.host_id, name, desired)
         return True
 
-    def _converge(self, name: str, nebula: NebulaJoin, network, action: str) -> None:
+    async def _converge(self, name: str, nebula: NebulaJoin, network, action: str) -> None:
         """After a RESTART, make this VM re-establish its tunnels now instead
         of leaving peers to discover the change on their own schedule -- see
         `fabric/nebula.py::rehandshake_script` for the 10-60s window this
@@ -718,31 +721,34 @@ class InstanceVm:
         peers = peer_overlay_ips(network, nebula.host_id)
         if action == "reloaded" or not peers:
             return
-        self._lima("shell", name, "--", "sudo", "bash", "-s", input=rehandshake_script(peers), check=False)
+        await self._lima("shell", name, "--", "sudo", "bash", "-s", input=rehandshake_script(peers), check=False)
 
-    def _discover_ip(self, name: str, timeout: float) -> str:
+    async def _discover_ip(self, name: str, timeout: float) -> str:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            proc = self._lima("shell", name, "--", "hostname", "-I", check=False)
+            proc = await self._lima("shell", name, "--", "hostname", "-I", check=False)
             ip = _pick_shared_ip(proc.stdout) if proc.returncode == 0 else None
             if ip:
                 return ip
-            time.sleep(self._poll_interval)
+            # `await`, not `time.sleep`: this poll runs on the shared control
+            # loop, where a blocking sleep freezes the reconciler and the
+            # gateway together for the whole interval.
+            await asyncio.sleep(self._poll_interval)
         raise TimeoutError(f"{name} did not report a reachable IP within {timeout}s")
 
-    def stop(self, name: str) -> None:
-        self._lima("stop", name, check=False)
+    async def stop(self, name: str) -> None:
+        await self._lima("stop", name, check=False)
 
-    def start(self, name: str, timeout: float = BOOT_TIMEOUT) -> str:
-        with self._boot_semaphore:  # same bound as `boot` -- still a real VM start
-            self._lima("start", f"--timeout={int(timeout)}s", name)
-        return self._discover_ip(name, timeout)
+    async def start(self, name: str, timeout: float = BOOT_TIMEOUT) -> str:
+        async with self._boot_semaphore:  # same bound as `boot` -- still a real VM start
+            await self._lima("start", f"--timeout={int(timeout)}s", name)
+        return await self._discover_ip(name, timeout)
 
-    def delete(self, name: str) -> None:
-        self._lima("stop", "--force", name, check=False)
-        self._lima("delete", "--force", name, check=False)
+    async def delete(self, name: str) -> None:
+        await self._lima("stop", "--force", name, check=False)
+        await self._lima("delete", "--force", name, check=False)
 
-    def logs(self, name: str, tail: int = 20) -> str:
+    async def logs(self, name: str, tail: int = 20) -> str:
         """The VM's systemd journal tail -- the closest honest equivalent to
         a container's `docker logs` for a real Lima VM (there's no single
         process to attach to; journalctl aggregates every unit, including
@@ -751,17 +757,17 @@ class InstanceVm:
         itself missing) answers with a clear message instead of a stack
         trace, matching every other observability read in this app
         (`_ContainerRuntime.logs`'s own `check=False` contract)."""
-        proc = self._lima("shell", name, "--", "sudo", "journalctl", "-n", str(tail), "--no-pager", check=False)
+        proc = await self._lima("shell", name, "--", "sudo", "journalctl", "-n", str(tail), "--no-pager", check=False)
         if proc.returncode != 0:
             detail = proc.stderr.strip() or "no output"
             return f"[{name}: VM not reachable ({detail})]"
         return proc.stdout
 
-    def status(self, name: str) -> str:
+    async def status(self, name: str) -> str:
         """`limactl list --json` filtered by the EXACT name -- 'absent' if
         gone. `--json` emits one JSON object per line (JSON Lines), not a
         JSON array."""
-        out = self._lima("list", "--json", check=False).stdout
+        out = (await self._lima("list", "--json", check=False)).stdout
         for line in out.splitlines():
             if not line.strip():
                 continue
@@ -770,7 +776,7 @@ class InstanceVm:
                 return str(record.get("status", "Unknown")).lower()
         return "absent"
 
-    def list_names(self, check: bool = False) -> list[str]:
+    async def list_names(self, check: bool = False) -> list[str]:
         """Every VM name `limactl list --json` currently reports -- read-only
         (never touches a VM), the one non-exact-name limactl call this class
         makes. The startup reaper
@@ -782,7 +788,7 @@ class InstanceVm:
         of swallowing a `limactl` failure: that caller treats "absent from
         this listing" as "the VM was really deleted", so it must be able to
         tell a genuinely empty machine from a limactl that didn't answer."""
-        out = self._lima("list", "--json", check=check).stdout
+        out = (await self._lima("list", "--json", check=check)).stdout
         names = []
         for line in out.splitlines():
             if not line.strip():

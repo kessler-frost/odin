@@ -39,6 +39,7 @@ it -- see the module's report for the mutation runs.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -74,18 +75,22 @@ from .test_rdsctl import fast_probe  # noqa: F401  -- shrinks the create timeout
 ENV = "default"
 
 
-def _settle_rds(stores: SynthStores, identifier: str = _RDS_ID, timeout: float = 5.0) -> dict:
-    """Wait for `_finish_create`'s daemon thread to leave `creating`."""
+async def _settle_rds(stores: SynthStores, identifier: str = _RDS_ID, timeout: float = 5.0) -> dict:
+    """Wait for `_finish_create`'s background TASK to leave `creating`.
+
+    `await asyncio.sleep` rather than `time.sleep` is load-bearing since
+    v0.7.7: the writer is a task on THIS loop now, so a blocking poll would
+    never give it a chance to run and this would spin to its own deadline."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         record = rdsctl._record(stores, ENV, identifier)
         if record is not None and record["status"] != rdsctl.CREATING:
             return record
-        time.sleep(0.01)
-    raise AssertionError("the rds create thread never settled")
+        await asyncio.sleep(0.01)
+    raise AssertionError("the rds create task never settled")
 
 
-def _cache_create(stores: SynthStores, sink, elasticache, substrate) -> None:
+async def _cache_create(stores: SynthStores, sink, elasticache, substrate) -> None:
     """A real `available` cluster through the real CreateCacheCluster handler,
     with `substrate` injected the way `pure_answer` already allows -- so this
     module needs no fixture of its own (and cannot shadow test_cachectl's)."""
@@ -94,14 +99,14 @@ def _cache_create(stores: SynthStores, sink, elasticache, substrate) -> None:
     ))
     path, query = split_url(req.url)
     action, resource = classify("elasticache", req.method, path, query, req.headers, req.body)
-    cachectl.pure_answer(action, resource, ENV, req.body, stores, 0.0, cache=substrate)
+    await cachectl.pure_answer(action, resource, ENV, req.body, stores, 0.0, cache=substrate)
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
         record = stores.cachectl.get(ENV, f"cluster:{CACHE_CLUSTER}")
         if record is not None and record["status"] != cachectl.STATUS_CREATING:
             return
-        time.sleep(0.01)
-    raise AssertionError("the cache create thread never settled")
+        await asyncio.sleep(0.01)
+    raise AssertionError("the cache create task never settled")
 
 
 # --- ONE treatment, not a fourth spelling --------------------------------
@@ -154,28 +159,28 @@ class SilentlyFailingTaskRuntime(FakeTaskRuntime):
     """`run` raises with NO message -- the shape a real `MemoryError` (or any
     no-arg construction) takes when it reaches `_launch_task`'s broad catch."""
 
-    def run(self, env, task_id, container_def, extra_env=None, cpu=None, memory=None):
+    async def run(self, env, task_id, container_def, extra_env=None, cpu=None, memory=None):
         self.ran.append((env, task_id, container_def, extra_env, cpu, memory))
         raise RuntimeError()
 
 
-def _stopped_task(stores: SynthStores, timeout: float = 2.0) -> dict:
+async def _stopped_task(stores: SynthStores, timeout: float = 2.0) -> dict:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         stopped = [t for t in ecsctl._all_tasks(stores, ENV) if t["last_status"] == "STOPPED"]
         if stopped:
             return stopped[0]
-        time.sleep(0.02)
+        await asyncio.sleep(0.02)
     raise AssertionError("no task ever reached STOPPED")
 
 
-def test_a_task_that_dies_with_no_message_records_the_class_not_a_blank(sink, ecs, stores):
+async def test_a_task_that_dies_with_no_message_records_the_class_not_a_blank(sink, ecs, stores):
     runtime = SilentlyFailingTaskRuntime()
-    _create_cluster(stores, sink, ecs, runtime)
-    _register_taskdef(stores, sink, ecs, runtime)
-    _create_service(stores, sink, ecs, runtime, desiredCount=1)
+    await _create_cluster(stores, sink, ecs, runtime)
+    await _register_taskdef(stores, sink, ecs, runtime)
+    await _create_service(stores, sink, ecs, runtime, desiredCount=1)
 
-    task = _stopped_task(stores)
+    task = await _stopped_task(stores)
     assert task["stopped_reason"], "a STOPPED task with a blank reason is the bug"
     assert "RuntimeError" in task["stopped_reason"]
 
@@ -189,21 +194,21 @@ def test_a_task_that_dies_with_no_message_records_the_class_not_a_blank(sink, ec
     assert "RuntimeError" in reason, "the deployment must quote the task's real reason"
 
 
-def test_the_apply_shortfall_names_the_class_when_that_is_all_odin_has(sink, ecs, stores):
+async def test_the_apply_shortfall_names_the_class_when_that_is_all_odin_has(sink, ecs, stores):
     """`wait_for_steady_services` is what /apply-full turns into the apply's
     own failure line -- a blank there is a failed apply that says nothing."""
     runtime = SilentlyFailingTaskRuntime()
-    _create_cluster(stores, sink, ecs, runtime)
-    _register_taskdef(stores, sink, ecs, runtime)
-    _create_service(stores, sink, ecs, runtime, desiredCount=1)
-    _stopped_task(stores)
+    await _create_cluster(stores, sink, ecs, runtime)
+    await _register_taskdef(stores, sink, ecs, runtime)
+    await _create_service(stores, sink, ecs, runtime, desiredCount=1)
+    await _stopped_task(stores)
 
-    (short,) = ecsctl.wait_for_steady_services(stores, ENV, runtime)
+    (short,) = await ecsctl.wait_for_steady_services(stores, ENV, runtime)
     assert short.reason, "the apply's reason may not be blank"
     assert "RuntimeError" in short.reason
 
 
-def test_mark_task_stopped_refuses_a_reason_that_says_nothing(stores):
+async def test_mark_task_stopped_refuses_a_reason_that_says_nothing(stores):
     """The public seam `reconcile/drift.py` calls. A reason is the ONLY thing
     it adds to the record, so an empty one records a failure that explains
     itself with nothing."""
@@ -211,7 +216,7 @@ def test_mark_task_stopped_refuses_a_reason_that_says_nothing(stores):
         "cluster_name": "c", "task_id": "t1", "service_name": "s", "container_name": "app",
         "last_status": "RUNNING", "host_ports": {},
     })
-    ecsctl.mark_task_stopped(stores, ENV, "c", "t1", "   ")
+    await ecsctl.mark_task_stopped(stores, ENV, "c", "t1", "   ")
     task = stores.ecsctl.get(ENV, "task:c:t1")
     assert task["last_status"] == "STOPPED"
     assert task["stopped_reason"].strip(), task
@@ -224,19 +229,19 @@ def test_mark_task_stopped_refuses_a_reason_that_says_nothing(stores):
 class SilentlyFailingFunctionRuntime(FakeFunctionRuntime):
     """`ensure` raises with NO message."""
 
-    def ensure(self, env, name, runtime, handler, env_vars, code_dir, memory_mib=None):
+    async def ensure(self, env, name, runtime, handler, env_vars, code_dir, memory_mib=None):
         self.ensured.append((env, name, runtime, handler, dict(env_vars), code_dir, memory_mib))
         raise RuntimeError()
 
 
-def test_a_deploy_that_fails_with_no_message_keeps_statereason_on_the_wire(sink, lambda_, stores):
+async def test_a_deploy_that_fails_with_no_message_keeps_statereason_on_the_wire(sink, lambda_, stores):
     """The strongest of the three: `_configuration_json` renders
     `state_reason or None` and `_json` drops every None, so a blank reason did
     not merely READ badly -- `StateReason` disappeared from the response
     entirely and GetFunction answered `State: Failed` with no reason at all."""
     substrate = SilentlyFailingFunctionRuntime()
-    _create(stores, sink, lambda_, substrate)
-    failed = _wait_for_fn_state(stores, sink, lambda_, "fn1", "Failed", substrate)
+    await _create(stores, sink, lambda_, substrate)
+    failed = await _wait_for_fn_state(stores, sink, lambda_, "fn1", "Failed", substrate)
 
     assert "StateReason" in failed, "State: Failed with no StateReason is the bug"
     assert "RuntimeError" in failed["StateReason"]
@@ -253,22 +258,22 @@ class PoolTimeoutFunctionRuntime(FakeFunctionRuntime):
     real `map_httpcore_exceptions` rather than hand-built, so this is the
     upstream signal itself, not a stand-in for it."""
 
-    def invoke(self, env, name, payload, timeout: float = 30.0) -> InvokeResult:
+    async def invoke(self, env, name, payload, timeout: float = 30.0) -> InvokeResult:
         self.invoked.append((env, name, payload))
         with map_httpcore_exceptions():
             raise httpcore.PoolTimeout()
 
 
-def test_an_invoke_that_fails_with_no_message_still_names_what_went_wrong(sink, lambda_, stores):
+async def test_an_invoke_that_fails_with_no_message_still_names_what_went_wrong(sink, lambda_, stores):
     """`_invoke`'s reason has the narrowest escape hatch of all: it is the
     whole `Message` of the AWS error the SDK raises at the caller, recorded
     nowhere else."""
     substrate = PoolTimeoutFunctionRuntime()
-    _create(stores, sink, lambda_, substrate)
-    _wait_for_fn_state(stores, sink, lambda_, "fn1", "Active", substrate)
+    await _create(stores, sink, lambda_, substrate)
+    await _wait_for_fn_state(stores, sink, lambda_, "fn1", "Active", substrate)
 
     req = sink.call(lambda: lambda_.invoke(FunctionName="fn1", Payload=b"{}"))
-    response = _lambda_answer(stores, req, substrate)
+    response = await _lambda_answer(stores, req, substrate)
     parsed = _lambda_parse("Invoke", response, error=True)
 
     assert parsed["Error"]["Code"] == "ServiceException"
@@ -277,14 +282,14 @@ def test_an_invoke_that_fails_with_no_message_still_names_what_went_wrong(sink, 
     assert "PoolTimeout" in message
 
 
-def test_mark_function_failed_refuses_a_reason_that_says_nothing(sink, lambda_, stores):
+async def test_mark_function_failed_refuses_a_reason_that_says_nothing(sink, lambda_, stores):
     substrate = FakeFunctionRuntime()
-    _create(stores, sink, lambda_, substrate)
-    _wait_for_fn_state(stores, sink, lambda_, "fn1", "Active", substrate)
+    await _create(stores, sink, lambda_, substrate)
+    await _wait_for_fn_state(stores, sink, lambda_, "fn1", "Active", substrate)
 
     lambdactl.mark_function_failed(stores, ENV, "fn1", "")
     req = sink.call(lambda: lambda_.get_function_configuration(FunctionName="fn1"))
-    config = _lambda_parse("GetFunctionConfiguration", _lambda_answer(stores, req, substrate))
+    config = _lambda_parse("GetFunctionConfiguration", await _lambda_answer(stores, req, substrate))
 
     assert config["State"] == "Failed"
     assert "StateReason" in config, "a Failed function must always carry a reason"
@@ -294,120 +299,120 @@ def test_mark_function_failed_refuses_a_reason_that_says_nothing(sink, lambda_, 
 # --- ec2compute: stateReason, the delete retry, and destroy's verdict ------
 
 
-def _state_reason(sink, ec2, stores, vm, instance_id: str, want: str) -> dict:
-    return _wait_for_state(stores, sink, ec2, instance_id, want, vm)["StateReason"]
+async def _state_reason(sink, ec2, stores, vm, instance_id: str, want: str) -> dict:
+    return (await _wait_for_state(stores, sink, ec2, instance_id, want, vm))["StateReason"]
 
 
-def test_a_boot_that_fails_with_no_message_never_emits_an_empty_message_tag(sink, ec2, stores):
+async def test_a_boot_that_fails_with_no_message_never_emits_an_empty_message_tag(sink, ec2, stores):
     """A `state_reason` DICT is truthy even when its message is empty, so
     `_instance_xml` emitted `<message></message>` -- an instance asserting
     Server.InternalError and saying nothing about why."""
-    subnet_id = _subnet(stores, sink, ec2)
+    subnet_id = await _subnet(stores, sink, ec2)
     vm = FakeInstanceVm()
 
-    def silent_boot(name, vm_config, **kwargs):
+    async def silent_boot(name, vm_config, **kwargs):
         raise RuntimeError()
 
     vm.boot = silent_boot
-    result = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)
+    result = await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)
     instance_id = result["Instances"][0]["InstanceId"]
 
-    reason = _state_reason(sink, ec2, stores, vm, instance_id, "terminated")
+    reason = await _state_reason(sink, ec2, stores, vm, instance_id, "terminated")
     assert reason["Code"] == "Server.InternalError"
     assert reason["Message"].strip(), "<message></message> is the bug"
     assert "RuntimeError" in reason["Message"]
 
 
-def test_a_start_that_fails_with_no_message_records_the_class(sink, ec2, stores):
-    subnet_id = _subnet(stores, sink, ec2)
+async def test_a_start_that_fails_with_no_message_records_the_class(sink, ec2, stores):
+    subnet_id = await _subnet(stores, sink, ec2)
     vm = FakeInstanceVm()
-    result = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)
+    result = await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)
     instance_id = result["Instances"][0]["InstanceId"]
-    _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+    await _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
 
     req = sink.call(lambda: ec2.stop_instances(InstanceIds=[instance_id]))
-    _ec2_answer(stores, req, vm)
-    _wait_for_state(stores, sink, ec2, instance_id, "stopped", vm)
+    await _ec2_answer(stores, req, vm)
+    await _wait_for_state(stores, sink, ec2, instance_id, "stopped", vm)
 
-    def silent_start(name, timeout=300.0):
+    async def silent_start(name, timeout=300.0):
         raise RuntimeError()
 
     vm.start = silent_start
     req = sink.call(lambda: ec2.start_instances(InstanceIds=[instance_id]))
-    _ec2_answer(stores, req, vm)
+    await _ec2_answer(stores, req, vm)
 
-    reason = _state_reason(sink, ec2, stores, vm, instance_id, "stopped")
+    reason = await _state_reason(sink, ec2, stores, vm, instance_id, "stopped")
     assert reason["Message"].strip()
     assert "RuntimeError" in reason["Message"]
 
 
-def test_a_successful_start_clears_the_previous_failures_reason(sink, ec2, stores):
+async def test_a_successful_start_clears_the_previous_failures_reason(sink, ec2, stores):
     """A caveat outliving its fix, in the record: `_finish_terminate` cleared
     `state_reason` on success and the boot/start paths did not, so an instance
     that failed once kept answering DescribeInstances with that stale failure
     forever after it recovered."""
-    subnet_id = _subnet(stores, sink, ec2)
+    subnet_id = await _subnet(stores, sink, ec2)
     vm = FakeInstanceVm()
-    result = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)
+    result = await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)
     instance_id = result["Instances"][0]["InstanceId"]
-    _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+    await _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
 
     req = sink.call(lambda: ec2.stop_instances(InstanceIds=[instance_id]))
-    _ec2_answer(stores, req, vm)
-    _wait_for_state(stores, sink, ec2, instance_id, "stopped", vm)
+    await _ec2_answer(stores, req, vm)
+    await _wait_for_state(stores, sink, ec2, instance_id, "stopped", vm)
 
     working_start = vm.start
 
-    def failing_start(name, timeout=300.0):
+    async def failing_start(name, timeout=300.0):
         raise RuntimeError("start failed")
 
     vm.start = failing_start
     req = sink.call(lambda: ec2.start_instances(InstanceIds=[instance_id]))
-    _ec2_answer(stores, req, vm)
-    assert _state_reason(sink, ec2, stores, vm, instance_id, "stopped")["Message"]
+    await _ec2_answer(stores, req, vm)
+    assert (await _state_reason(sink, ec2, stores, vm, instance_id, "stopped"))["Message"]
 
     vm.start = working_start  # the retry works
     req = sink.call(lambda: ec2.start_instances(InstanceIds=[instance_id]))
-    _ec2_answer(stores, req, vm)
-    running = _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+    await _ec2_answer(stores, req, vm)
+    running = await _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
     assert "StateReason" not in running, f"a recovered instance still blames its old failure: {running}"
 
 
-def test_a_stop_that_fails_is_no_longer_silent(sink, ec2, stores):
+async def test_a_stop_that_fails_is_no_longer_silent(sink, ec2, stores):
     """`_finish_stop` recorded NOTHING for a failed stop while its sibling
     `_finish_start` recorded a reason for the identical failure -- so a stop
     that genuinely failed was indistinguishable from one that worked in every
     place a user can look."""
-    subnet_id = _subnet(stores, sink, ec2)
+    subnet_id = await _subnet(stores, sink, ec2)
     vm = FakeInstanceVm()
-    result = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)
+    result = await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)
     instance_id = result["Instances"][0]["InstanceId"]
-    _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+    await _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
 
-    def silent_stop(name):
+    async def silent_stop(name):
         raise RuntimeError()
 
     vm.stop = silent_stop
     req = sink.call(lambda: ec2.stop_instances(InstanceIds=[instance_id]))
-    _ec2_answer(stores, req, vm)
+    await _ec2_answer(stores, req, vm)
 
-    reason = _state_reason(sink, ec2, stores, vm, instance_id, "stopped")
+    reason = await _state_reason(sink, ec2, stores, vm, instance_id, "stopped")
     assert reason["Message"].strip(), "a failed stop that records nothing is the bug"
     assert "RuntimeError" in reason["Message"]
 
 
-def test_a_failed_delete_retry_message_has_no_dangling_colon(sink, ec2, stores):
-    subnet_id = _subnet(stores, sink, ec2)
+async def test_a_failed_delete_retry_message_has_no_dangling_colon(sink, ec2, stores):
+    subnet_id = await _subnet(stores, sink, ec2)
     vm = FakeInstanceVm()
-    result = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)
+    result = await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)
     instance_id = result["Instances"][0]["InstanceId"]
-    _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+    await _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
 
-    def silent_delete(name):
+    async def silent_delete(name):
         raise RuntimeError()
 
     vm.delete = silent_delete
-    ec2compute._finish_terminate(stores, ENV, instance_id, "odin-ec2-x", vm)
+    await ec2compute._finish_terminate(stores, ENV, instance_id, "odin-ec2-x", vm)
 
     record = ec2compute._instance(stores, ENV, instance_id)
     message = record["state_reason"]["message"]
@@ -415,22 +420,22 @@ def test_a_failed_delete_retry_message_has_no_dangling_colon(sink, ec2, stores):
     assert "RuntimeError" in message
 
 
-def test_destroys_verdict_never_reports_a_vm_with_empty_parentheses(sink, ec2, stores):
+async def test_destroys_verdict_never_reports_a_vm_with_empty_parentheses(sink, ec2, stores):
     """`ReclaimFailed` is the sentence that tells a user their destroy did not
     destroy. `f"{name} ({exc})"` rendered `odin-ec2-... ()` for an exception
     with no message."""
-    subnet_id = _subnet(stores, sink, ec2)
+    subnet_id = await _subnet(stores, sink, ec2)
     vm = FakeInstanceVm()
-    result = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)
+    result = await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)
     instance_id = result["Instances"][0]["InstanceId"]
-    _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+    await _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
 
-    def silent_delete(name):
+    async def silent_delete(name):
         raise RuntimeError()
 
     vm.delete = silent_delete
     with pytest.raises(ec2compute.ReclaimFailed) as raised:
-        ec2compute.reclaim_env_instances(stores, ENV, vm)
+        await ec2compute.reclaim_env_instances(stores, ENV, vm)
 
     text = str(raised.value)
     assert "()" not in text, f"an empty reason inside destroy's own verdict: {text}"
@@ -438,14 +443,14 @@ def test_destroys_verdict_never_reports_a_vm_with_empty_parentheses(sink, ec2, s
     assert instance_id in text
 
 
-def test_mark_instance_terminated_refuses_a_reason_that_says_nothing(sink, ec2, stores):
+async def test_mark_instance_terminated_refuses_a_reason_that_says_nothing(sink, ec2, stores):
     """A drifted record's whole purpose is to say WHY the node vanished --
     with a blank reason it projects `crashed` with nothing attached."""
-    subnet_id = _subnet(stores, sink, ec2)
+    subnet_id = await _subnet(stores, sink, ec2)
     vm = FakeInstanceVm()
-    result = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)
+    result = await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)
     instance_id = result["Instances"][0]["InstanceId"]
-    _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+    await _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
 
     ec2compute.mark_instance_terminated(stores, ENV, instance_id, "")
     record = ec2compute._instance(stores, ENV, instance_id)
@@ -492,7 +497,7 @@ def test_a_tfstate_that_is_not_a_state_object_never_accuses_every_vm(tmp_path, t
     assert ec2compute.tf_forgotten_instances(stores, "e1") == []
 
 
-def test_one_corrupt_tfstate_no_longer_silences_every_later_env(tmp_path):
+async def test_one_corrupt_tfstate_no_longer_silences_every_later_env(tmp_path):
     """The blast radius, and why the missing guard mattered beyond one env:
     `reclaim_tf_forgotten_vms` promises "Never raises" and
     `server.py::_reap_orphaned_ec2_vms` catches whatever escapes, so ONE
@@ -506,7 +511,7 @@ def test_one_corrupt_tfstate_no_longer_silences_every_later_env(tmp_path):
     _write_state(tmp_path, "healthy", json.dumps({"resources": []}))
 
     vm = FakeInstanceVm()
-    reclaimed = ec2compute.reclaim_tf_forgotten_vms(stores, ["broken", "healthy"], vm)
+    reclaimed = await ec2compute.reclaim_tf_forgotten_vms(stores, ["broken", "healthy"], vm)
 
     assert reclaimed == ["odin-ec2-healthy-i-bbb"], reclaimed
     assert "odin-ec2-broken-i-aaa" not in vm.deleted, "a corrupt state may not condemn a VM"
@@ -539,9 +544,9 @@ def test_a_state_tofu_really_wrote_still_names_what_it_forgot(tmp_path):
 # `_finish_delete`, twelve lines below, did not.
 
 
-def _rds_record(stores, sink, rds_client, substrate, identifier=_RDS_ID):
+async def _rds_record(stores, sink, rds_client, substrate, identifier=_RDS_ID):
     """A real `creating` record, minted by the real CreateDBInstance handler."""
-    _rds_create(sink, rds_client, stores, substrate, identifier=identifier)
+    await _rds_create(sink, rds_client, stores, substrate, identifier=identifier)
     return rdsctl._record(stores, ENV, identifier)
 
 
@@ -550,41 +555,41 @@ class _SilentCreate(FakePostgresRds):
     `MemoryError` looks like when it reaches `_finish_create`'s broad catch on a
     machine odin's own docs call short on headroom."""
 
-    def create_db(self, db_id, user, password, db_name="postgres"):
+    async def create_db(self, db_id, user, password, db_name="postgres"):
         raise RuntimeError()
 
 
 class _SilentDelete(FakePostgresRds):
-    def delete_db(self, db_id):
+    async def delete_db(self, db_id):
         raise RuntimeError()
 
 
 class _SilentPassword(FakePostgresRds):
-    def set_password(self, db_id, user, current, new):
+    async def set_password(self, db_id, user, current, new):
         raise RuntimeError()
 
 
-def test_an_rds_boot_that_fails_with_no_message_records_the_class(stores, sink, rds):
+async def test_an_rds_boot_that_fails_with_no_message_records_the_class(stores, sink, rds):
     """PERSISTED, and DescribeDBInstances hands it straight back: a `failed`
     status whose `StatusReason` is a dangling colon is a resource that says it
     broke and nothing about how."""
     substrate = _SilentCreate()
-    _rds_create(sink, rds, stores, substrate)
-    record = _settle_rds(stores)
+    await _rds_create(sink, rds, stores, substrate)
+    record = await _settle_rds(stores)
 
     assert record["status"] == rdsctl.FAILED
     assert record["status_reason"] == "container did not start: RuntimeError (raised with no message, so the class is the whole of it)"
     assert not record["status_reason"].rstrip().endswith(":")
 
 
-def test_an_rds_delete_that_fails_with_no_message_records_the_class(stores, sink, rds):
+async def test_an_rds_delete_that_fails_with_no_message_records_the_class(stores, sink, rds):
     """This branch exists to be honest with a polling caller -- the record STAYS
     `deleting` with the failure recorded -- so a blank reason defeats its whole
     purpose."""
     substrate = _SilentDelete()
-    _rds_create(sink, rds, stores, FakePostgresRds())
-    _settle_rds(stores)
-    rdsctl._finish_delete(stores, ENV, _RDS_ID, substrate)
+    await _rds_create(sink, rds, stores, FakePostgresRds())
+    await _settle_rds(stores)
+    await rdsctl._finish_delete(stores, ENV, _RDS_ID, substrate)
     record = rdsctl._record(stores, ENV, _RDS_ID)
 
     assert record is not None, "a failed delete must not remove the record"
@@ -592,12 +597,12 @@ def test_an_rds_delete_that_fails_with_no_message_records_the_class(stores, sink
     assert not record["status_reason"].rstrip().endswith(":")
 
 
-def test_an_rds_password_change_that_fails_with_no_message_still_names_something(stores, sink, rds):
+async def test_an_rds_password_change_that_fails_with_no_message_still_names_something(stores, sink, rds):
     """This one goes on the WIRE as the apply's own failure line, so a blank
     left tofu reporting an `InvalidDBInstanceState` with no state named."""
-    _rds_create(sink, rds, stores, FakePostgresRds())
-    _settle_rds(stores)
-    response = rdsctl.pure_answer(
+    await _rds_create(sink, rds, stores, FakePostgresRds())
+    await _settle_rds(stores)
+    response = await rdsctl.pure_answer(
         "rds:ModifyDBInstance", _RDS_ID, ENV,
         f"Action=ModifyDBInstance&DBInstanceIdentifier={_RDS_ID}&MasterUserPassword=brandnew123".encode(),
         stores, time.monotonic(), rds=_SilentPassword(),
@@ -612,25 +617,25 @@ def test_an_rds_password_change_that_fails_with_no_message_still_names_something
 class _SilentCacheDelete:
     """The `RedisCache` shape whose `delete` raises with no message."""
 
-    def ensure(self, env, cluster_id, memory_mib=None):
+    async def ensure(self, env, cluster_id, memory_mib=None):
         return 51234
 
-    def delete(self, env, cluster_id):
+    async def delete(self, env, cluster_id):
         raise RuntimeError()
 
-    def host_port(self, env, cluster_id):
+    async def host_port(self, env, cluster_id):
         return 51234
 
-    def status(self, env, cluster_id):
+    async def status(self, env, cluster_id):
         return "running"
 
 
-def test_a_cache_removal_that_fails_with_no_message_records_the_class(stores, sink, elasticache):
+async def test_a_cache_removal_that_fails_with_no_message_records_the_class(stores, sink, elasticache):
     """The sibling `_finish_create` in this SAME module already had `exc_text`
     and `_finish_delete` did not -- which is why the honesty rule says fix the
     SHAPE, then immediately hunt siblings."""
-    _cache_create(stores, sink, elasticache, FakeRedisCache())
-    cachectl._finish_delete(stores, ENV, CACHE_CLUSTER, "arn:aws:elasticache:x", _SilentCacheDelete())
+    await _cache_create(stores, sink, elasticache, FakeRedisCache())
+    await cachectl._finish_delete(stores, ENV, CACHE_CLUSTER, "arn:aws:elasticache:x", _SilentCacheDelete())
     record = stores.cachectl.get(ENV, f"cluster:{CACHE_CLUSTER}")
 
     assert record is not None, "a failed removal must not remove the record"
@@ -638,15 +643,15 @@ def test_a_cache_removal_that_fails_with_no_message_records_the_class(stores, si
     assert not record["status_reason"].rstrip().endswith(":")
 
 
-def test_both_writers_still_quote_a_real_message_when_there_is_one(stores, sink, rds):
+async def test_both_writers_still_quote_a_real_message_when_there_is_one(stores, sink, rds):
     """The common case must not regress: `exc_text` prefixes the class, it does
     not replace the message."""
     class _Loud(FakePostgresRds):
-        def create_db(self, db_id, user, password, db_name="postgres"):
+        async def create_db(self, db_id, user, password, db_name="postgres"):
             raise RuntimeError("docker: no space left on device")
 
-    _rds_create(sink, rds, stores, _Loud())
-    record = _settle_rds(stores)
+    await _rds_create(sink, rds, stores, _Loud())
+    record = await _settle_rds(stores)
     assert record["status_reason"] == (
         "container did not start: RuntimeError: docker: no space left on device"
     )

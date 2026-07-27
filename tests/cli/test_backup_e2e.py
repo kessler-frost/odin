@@ -30,6 +30,7 @@ Marked integration: needs Colima/Docker with the backing images pulled.
 """
 from __future__ import annotations
 
+import asyncio
 import shutil
 import tarfile
 import time
@@ -60,21 +61,21 @@ _BOTH = ("uploads", "jobs")
 OBJECT_KEY = "receipt.txt"
 
 
-def _own_containers(rt: ColimaRuntime) -> list[str]:
+async def _own_containers(rt: ColimaRuntime) -> list[str]:
     """Only the containers THIS test can have made -- it creates them in one
     env, and `aws.gc` already tears them down by env-scoped exact name, so
     the fixture needs no wider reach either. The naming rules (and why the
-    unscoped `rt.list_odin()` this replaced was dangerous) live in
+    unscoped `await rt.list_odin()` this replaced was dangerous) live in
     `tests/containers.py`, shared with every other integration file."""
-    return own_containers(rt, ENV)
+    return await own_containers(rt, ENV)
 
 
 @pytest.fixture
-def runtime():
+async def runtime():
     rt = ColimaRuntime()
     yield rt
-    for name in _own_containers(rt):
-        rt.stop(name)
+    for name in await _own_containers(rt):
+        await rt.stop(name)
 
 
 @pytest.fixture
@@ -104,11 +105,23 @@ def _wait(predicate, describe, timeout=180.0, step=1.0):
     raise AssertionError(f"never true within {timeout}s: {describe}")
 
 
+async def _wait_async(predicate, describe, timeout=180.0, step=1.0):
+    """`_wait` for a predicate that has to await (`aws.exists` is a coroutine
+    since v0.7.7). A separate helper because `await` is a syntax error inside a
+    `lambda`, so these call sites pass a coroutine FUNCTION instead."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if await predicate():
+            return
+        await asyncio.sleep(step)
+    raise AssertionError(f"never true within {timeout}s: {describe}")
+
+
 def _aws(client, runtime) -> BackingAws:
     return BackingAws(runtime, ENV, gateway_port=client.get("/health").json()["gateway"]["port"])
 
 
-def test_export_then_lose_odin_then_import_converges_again(runner, workdir, runtime):
+async def test_export_then_lose_odin_then_import_converges_again(runner, workdir, runtime):
     root = workdir / ".odin"
     store = SpecStore(root)
     archive = workdir / f"odin-{ENV}-export.tar.gz"
@@ -118,8 +131,8 @@ def test_export_then_lose_odin_then_import_converges_again(runner, workdir, runt
         assert client.post("/apply", params={"env": ENV}, json=CANVAS).status_code == 200
         aws = _aws(client, runtime)
         _wait(lambda: all(_phases(client).get(n) == "healthy" for n in _BOTH), "both healthy")
-        assert aws.exists("s3", "uploads") and aws.exists("sqs", "jobs")
-        s3 = aws.client("s3")
+        assert await aws.exists("s3", "uploads") and await aws.exists("sqs", "jobs")
+        s3 = await aws.client("s3")
         s3.put_object(Bucket="uploads", Key=OBJECT_KEY, Body=b"data-plane bytes")
         assert s3.get_object(Bucket="uploads", Key=OBJECT_KEY)["Body"].read() == b"data-plane bytes"
 
@@ -135,8 +148,8 @@ def test_export_then_lose_odin_then_import_converges_again(runner, workdir, runt
         # --- 3. tear the env down for real
         assert client.post("/destroy", params={"env": ENV}).status_code == 200
         _wait(lambda: not _phases(client), "world empty")
-        aws.gc(set())
-        assert not _own_containers(runtime), "backings gone before the store is wiped"
+        await aws.gc(set())
+        assert not await _own_containers(runtime), "backings gone before the store is wiped"
 
     # --- ...and lose .odin/bak entirely. odin now has no idea this env existed.
     shutil.rmtree(root / ENV)
@@ -154,10 +167,11 @@ def test_export_then_lose_odin_then_import_converges_again(runner, workdir, runt
     # real containers. Asserted on the physical backings, not on phases.
     with TestClient(create_app(runtime=runtime, store=store)) as client:
         aws = _aws(client, runtime)
-        _wait(
-            lambda: aws.exists("s3", "uploads") and aws.exists("sqs", "jobs"),
-            "both backing resources really re-created",
-        )
+
+        async def _both_exist() -> bool:
+            return await aws.exists("s3", "uploads") and await aws.exists("sqs", "jobs")
+
+        await _wait_async(_both_exist, "both backing resources really re-created")
         # ...and the World projection catches up to what's physically there.
         _wait(
             lambda: all(_phases(client).get(n) == "healthy" for n in _BOTH),
@@ -165,11 +179,13 @@ def test_export_then_lose_odin_then_import_converges_again(runner, workdir, runt
         )
 
         # The documented boundary: the bucket is back, its CONTENTS are not.
-        contents = aws.client("s3").list_objects_v2(Bucket="uploads")
+        # `client` is the coroutine; `list_objects_v2` on the boto3 client it
+        # returns is SYNC -- hence the parenthesised await.
+        contents = (await aws.client("s3")).list_objects_v2(Bucket="uploads")
         assert contents.get("KeyCount", 0) == 0, contents
 
         assert client.post("/destroy", params={"env": ENV}).status_code == 200
         _wait(lambda: not _phases(client), "world empty again")
-        aws.gc(set())
+        await aws.gc(set())
 
-    assert _own_containers(runtime) == [], "every container this test made is gone"
+    assert await _own_containers(runtime) == [], "every container this test made is gone"

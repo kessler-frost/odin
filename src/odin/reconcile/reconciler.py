@@ -248,6 +248,10 @@ class Reconciler:
     async def start(self) -> None:
         self._stop = False
         self._started_at = time.monotonic()
+        # `create_task(self._run())`, NOT `create_task(await self._run())`:
+        # `_run` IS the control loop and only returns when `stop()` is asked
+        # for, so awaiting it here made `start()` never return -- the loop ran
+        # inline and every caller (the lifespan, `/apply`, the tests) hung.
         self._task = asyncio.create_task(self._run())
 
     async def stop(self) -> None:
@@ -330,7 +334,7 @@ class Reconciler:
             "since)", self._env, self._failures,
         )
 
-    def health(self) -> LoopHealth:
+    async def health(self) -> LoopHealth:
         """Is this loop converging right now? Computed from the task's own
         state and the last completed tick -- no cached verdict, no watchdog to
         have run first, so every reader (`/world`, `/health`, `odin status`)
@@ -340,6 +344,7 @@ class Reconciler:
         return LoopHealth(
             env=self._env,
             ticking=reason is None,
+            # `_verdict` is a pure string builder (sync) -- no await.
             verdict=None if reason is None else self._verdict(reason, age),
             last_tick_seconds_ago=None if self._last_ok is None else round(time.monotonic() - self._last_ok, 2),
             last_tick_seconds=None if self._last_tick_seconds is None else round(self._last_tick_seconds, 3),
@@ -502,12 +507,14 @@ class Reconciler:
         stack = self._store.get_stack(self._env)
         await self._observe(stack)
         world = self._store.current_world(self._env)
+        # `plan` is the PURE, synchronous core (reconcile/plan.py) -- no await.
+        # Awaiting it raised on every single tick, so nothing ever converged.
         for action in plan(stack, world):
             await self._execute(action, stack)
         if self._aws is not None:  # stop backings no active kind needs anymore
-            await asyncio.to_thread(self._aws.gc, {r.kind for r in stack.resources})
+            await self._aws.gc({r.kind for r in stack.resources})
         if self._gateway is not None:  # policies/ports always track the applied Stack
-            ports = await asyncio.to_thread(self._aws.backing_ports) if self._aws is not None else {}
+            ports = await self._aws.backing_ports() if self._aws is not None else {}
             self._gateway.update(self._env, compile_policies(stack), ports)
         if self._stores is not None:  # fix-wave 2b finding #1: project tofu's own creations into World
             await self._project_tf_owned()
@@ -589,7 +596,7 @@ class Reconciler:
         `tests/reconcile/test_reconciler.py` tests named in that entry pin both
         halves."""
         drifted = await self._drift_verdicts(act)
-        projected = await asyncio.to_thread(project_tf_owned, self._stores, self._env)
+        projected = await project_tf_owned(self._stores, self._env)
         for label, (kind, phase, facts, verdict) in projected.items():
             phase, verdict = ("crashed", drifted[label]) if label in drifted else (phase, verdict)
             await self._emit(label, kind, phase, facts=facts, verdict=verdict)
@@ -603,7 +610,7 @@ class Reconciler:
     async def _drift_verdicts(self, sweep: bool = True) -> dict[str, str]:
         if self._drift is None:
             return {}
-        return await asyncio.to_thread(self._drift.verdicts, self._stores, self._env, sweep)
+        return await self._drift.verdicts(self._stores, self._env, sweep)
 
     async def ensure_backings(self, stack: Stack) -> None:
         """Boot (but don't create any resource on) the backing containers
@@ -627,9 +634,13 @@ class Reconciler:
         if self._aws is None:
             return
         kinds = {r.kind for r in stack.resources if r.kind in ENSURE_KINDS}
-        await asyncio.gather(*(asyncio.to_thread(self._aws.ensure_backing, k) for k in kinds))
+        # `gather(*(coro for ...))`, NOT `*(await coro for ...)`: an `await`
+        # inside a generator expression makes it an ASYNC generator, which `*`
+        # cannot unpack -- so `ensure_backing` never ran at all and every
+        # backing stayed unbooted. `gather` is what awaits these, concurrently.
+        await asyncio.gather(*(self._aws.ensure_backing(k) for k in kinds))
         if self._gateway is not None:
-            ports = await asyncio.to_thread(self._aws.backing_ports)
+            ports = await self._aws.backing_ports()
             self._gateway.update(self._env, compile_policies(stack), ports)
 
     # ---- helpers ----
@@ -719,10 +730,10 @@ class Reconciler:
         existing ARN; duplicate subscribes are swallowed), so re-provisioning
         just the missing queues is safe. Skipped when the topic doesn't
         currently exist (`not ok`): plan's pending/crashed path owns that."""
-        ok = await asyncio.to_thread(self._aws.exists, res.kind, res.id)
+        ok = await self._aws.exists(res.kind, res.id)
         if phase == "starting" and ok:
             try:
-                facts = await asyncio.to_thread(self._aws.facts, res.kind, res.id)
+                facts = await self._aws.facts(res.kind, res.id)
             except BackingUnavailable as exc:
                 # Honesty rule 1. `facts()` raises rather than inventing an
                 # endpoint when the backing's published port can't be read
@@ -743,7 +754,7 @@ class Reconciler:
             else:
                 await self._emit(res.id, res.kind, "healthy", facts=facts)
         if phase == "healthy" and not ok:
-            logtail = await asyncio.to_thread(self._backing_logtail, res.kind)
+            logtail = await self._backing_logtail(res.kind)
             await self._emit(
                 res.id, res.kind, "crashed",
                 facts=self._crash_facts(res.id, logtail),
@@ -751,10 +762,10 @@ class Reconciler:
             )
         if res.kind != "sns" or not ok:
             return
-        actual = await asyncio.to_thread(self._aws.subscriptions, res.id)
+        actual = await self._aws.subscriptions(res.id)
         missing = tuple(q for q in self._desired_subs(stack, res.id) if q not in actual)
         if missing:
-            await asyncio.to_thread(self._aws.provision, "sns", res.id, missing)
+            await self._aws.provision("sns", res.id, missing)
 
     def _crash_facts(self, rid: str, logtail: str) -> dict:
         """A crashed resource's facts: the identity it still HAS, plus the
@@ -784,13 +795,13 @@ class Reconciler:
         identity = _identity_facts(prior.facts) if prior is not None else {}
         return {**identity, **({"logtail": logtail} if logtail else {})}
 
-    def _backing_logtail(self, kind: str) -> str:
+    async def _backing_logtail(self, kind: str) -> str:
         """A short tail off the real backing container for a crash verdict --
         `container_name` is only on the real `BackingAws` (test doubles that
         don't implement it just skip the tail, never crash the observe pass
         over an optional diagnostic extra)."""
         container_name = getattr(self._aws, "container_name", None)
-        return self._rt.logs(container_name(kind)) if container_name is not None else ""
+        return await self._rt.logs(container_name(kind)) if container_name is not None else ""
 
     # ---- execute ----
     async def _execute(self, action, stack: Stack) -> None:
@@ -798,11 +809,11 @@ class Reconciler:
             # Only ever an AWS-shaped resource in a shared backing
             # (s3/sqs/sns/dynamodb) -- plan() emits nothing else (W2.7).
             subs = self._desired_subs(stack, action.id) if action.service == "sns" else ()
-            await asyncio.to_thread(self._aws.provision, action.service, action.id, subs)
+            await self._aws.provision(action.service, action.id, subs)
             await self._emit(action.id, action.service, "starting")
         elif isinstance(action, StopContainer):
             if action.kind in PROVISIONED:
-                await asyncio.to_thread(self._aws.deprovision, action.kind, action.id)
+                await self._aws.deprovision(action.kind, action.id)
             elif action.kind in TF_OWNED_KINDS and self._stores is not None:
                 # tofu (never this reconciler) owns create/destroy for a
                 # TF-managed kind, and `_project_tf_owned` -- which prunes any
@@ -822,7 +833,7 @@ class Reconciler:
                 # anything for `self._rt.stop` to do here either.
                 return
             else:
-                self._rt.stop(action.name)
+                await self._rt.stop(action.name)
             await self._prune(action.id)
         elif isinstance(action, NoOp):
             pass  # nothing left to gate on now that workload refs are gone

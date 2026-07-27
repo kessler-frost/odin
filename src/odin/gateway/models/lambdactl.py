@@ -8,7 +8,7 @@ substrate) -- adopted as a design, never as a dependency (NORTHSTAR
 directive 5). Unlike MiniStack's own instant-or-subprocess execution, this
 module's `State` is REAL: `Pending` until `compute/functions.py`'s
 `FunctionRuntime` reports the function's RIE container genuinely answers, a
-background thread away from the request path (the exact async-state-machine
+background TASK away from the request path (the exact async-state-machine
 shape `gateway/models/ec2compute.py`'s `RunInstances` uses for Lima boots).
 
 Like ec2net/iamctl/ecr, Lambda's CONTROL PLANE has no backing to forward to:
@@ -78,11 +78,11 @@ import base64
 import hashlib
 import json
 import logging
+import asyncio
 import os
-import threading
 import time
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple
@@ -94,7 +94,7 @@ from odin.compute.functions import DEFAULT_RUNTIME, READY_TIMEOUT, FunctionRunti
 from odin.gateway import errors
 from odin.gateway.errors import exc_text
 from odin.gateway.keys import KeyStore, workload_env
-from odin.gateway.models import logsctl
+from odin.gateway.models import background, join, logsctl
 from odin.gateway.stores import NO_CHANGE, SynthStores
 from odin.gateway.wiring import node_env
 from odin.runtime.colima import ColimaRuntime
@@ -112,9 +112,12 @@ _DEFAULT_MEMORY = 128
 # output for a call fits in one window.
 _LOG_TAIL_LINES = 200
 
+# EVERY handler is a coroutine function, including the ones that await
+# nothing (v0.7.7) -- see `rdsctl._Handler` for why one uniform contract, and
+# not a sniffed mix, is what keeps `pure_answer` honest.
 _Handler = Callable[
     [str, str, bytes, SynthStores, float, FunctionRuntime, dict[str, str], KeyStore | None, int | None],
-    Response,
+    Awaitable[Response],
 ]
 
 
@@ -224,13 +227,13 @@ def _get_function_response(fn: dict, stores: SynthStores, env: str) -> dict:
 
 # --- background completion: the async state machine (the "never block" /
 # "REAL readiness, not a timer" requirement -- every mutating handler below
-# returns a transitional status immediately, a daemon thread finishes the
+# returns a transitional status immediately, a background task finishes the
 # real container work; same shape as ec2compute.py's `_finish_boot`) -------
 
 
 def _update_function(stores: SynthStores, env: str, name: str, **fields: object) -> None:
     def mutate(fn: dict | None) -> dict | object:
-        if fn is None:  # deleted while the background thread was still running
+        if fn is None:  # deleted while the background task was still running
             return NO_CHANGE
         fn = dict(fn)
         fn.update(fields)
@@ -239,7 +242,7 @@ def _update_function(stores: SynthStores, env: str, name: str, **fields: object)
     stores.lambdactl.update(env, _key(name), mutate)
 
 
-def _finish_deploy(
+async def _finish_deploy(
     stores: SynthStores, env: str, name: str, runtime: str, handler: str,
     env_vars: dict[str, str], code_dir: Path, substrate: FunctionRuntime,
     keystore: KeyStore | None = None, gateway_port: int | None = None, memory_mib: int | None = None,
@@ -262,9 +265,9 @@ def _finish_deploy(
     # (logsctl.py's `ingest_tail`/`reset_cursor`). Already-stored events are
     # untouched: this resets the read position, not the log.
     logsctl.reset_cursor(stores, env, f"/aws/lambda/{name}", container_name(env, name))
-    # Deliberately broad: this runs on a daemon thread with no caller to
-    # propagate an exception to -- see ec2compute.py's `_finish_boot` for
-    # the identical "silent hang is forbidden" reasoning.
+    # Deliberately broad: this runs as an unattended background task with no
+    # caller to propagate an exception to -- see ec2compute.py's `_finish_boot`
+    # for the identical "silent hang is forbidden" reasoning.
     try:
         # CANVAS WIRING (field test 2, the product hole) -- inside this `try` on
         # purpose: an `UnresolvedRef` gets the SAME terminal shape a failed
@@ -274,10 +277,10 @@ def _finish_deploy(
         # the issued credentials: canvas wiring overrides a declared default,
         # odin's own four AWS_* vars override everything.
         if label:
-            container_env.update(node_env(stores, env, label))
+            container_env.update(await node_env(stores, env, label))
         if keystore is not None and gateway_port is not None and label:
             container_env.update(workload_env(keystore, env, label, gateway_port))
-        substrate.ensure(env, name, runtime, handler, container_env, code_dir, memory_mib=memory_mib)
+        await substrate.ensure(env, name, runtime, handler, container_env, code_dir, memory_mib=memory_mib)
     except Exception as exc:
         # `_exc_text`, not `str(exc)`: an exception built with no args would
         # make BOTH reason fields empty, and `_configuration_json` drops an
@@ -299,12 +302,6 @@ def _finish_deploy(
         last_update_status="Successful",
         last_update_status_reason=None, last_update_status_reason_code=None,
     )
-
-
-def _spawn(target: Callable[..., None], *args: object) -> threading.Thread:
-    thread = threading.Thread(target=target, args=args, daemon=True)
-    thread.start()
-    return thread
 
 
 # --- the reality sweep's seam + the Apply-driven recovery (W2.2's honesty
@@ -342,7 +339,7 @@ def mark_function_failed(stores: SynthStores, env: str, name: str, reason: str) 
 def converge_functions(
     stores: SynthStores, env: str, substrate: FunctionRuntime | None = None,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
-) -> list[threading.Thread]:
+) -> list[asyncio.Task]:
     """Re-create the REAL container of every `Failed` function -- the exact
     `_finish_deploy` pass CreateFunction/UpdateFunctionCode already spawn,
     driven by an APPLY (server.py's /apply-full) rather than by an AWS
@@ -364,9 +361,13 @@ def converge_functions(
     (e.g. the UpdateFunctionCode THIS apply just made, still booting) is
     skipped so two `ensure` calls can't fight over one container.
 
-    Returns the spawned threads so the caller can WAIT for the convergence it
+    Returns the started TASKS so the caller can WAIT for the convergence it
     just asked for (`wait_for_active_functions`) instead of guessing at it --
-    `ecsctl.converge_services`' contract, for the same reason."""
+    `ecsctl.converge_services`' contract, for the same reason.
+
+    Deliberately still a PLAIN `def` after v0.7.7's de-threading, for
+    `rdsctl.converge_db_instances`' reason: it starts work and awaits none of
+    it, and its only caller is already on the loop."""
     runtime = substrate or FunctionRuntime(ColimaRuntime(), stores.root)
     spawned = []
     for key, fn in stores.lambdactl.items(env).items():
@@ -382,10 +383,10 @@ def converge_functions(
             last_update_status_reason=None, last_update_status_reason_code=None,
         )
         log.info("converging lambda %s (env %s): re-creating its container", name, env)
-        spawned.append(_spawn(
-            _finish_deploy, stores, env, name, fn["runtime"], fn["handler"], fn["environment"],
+        spawned.append(background(_finish_deploy(
+            stores, env, name, fn["runtime"], fn["handler"], fn["environment"],
             runtime.code_dir(env, name), runtime, keystore, gateway_port, fn["memory_size"],
-        ))
+        )))
     return spawned
 
 
@@ -470,9 +471,9 @@ def function_faults(stores: SynthStores, env: str) -> list[FunctionFault]:
     return [fault for fn in _fn_records(stores, env) for fault in [_fault(fn)] if fault is not None]
 
 
-def wait_for_active_functions(
+async def wait_for_active_functions(
     stores: SynthStores, env: str,
-    converging: Iterable[threading.Thread] = (), timeout: float | None = None,
+    converging: Iterable[Awaitable[None]] = (), timeout: float | None = None,
 ) -> list[FunctionFault]:
     """Every function that is not `Active` once the Apply's convergence has had
     its bounded chance -- empty means every function in the env really does
@@ -480,8 +481,9 @@ def wait_for_active_functions(
     report success in.
 
     Bounded exactly the three ways `ecsctl.wait_for_steady_services` is:
-      1. it JOINS `converging` (the threads `converge_functions` just spawned),
-         so a slow first image pull is waited on rather than raced;
+      1. it AWAITS `converging` (the tasks `converge_functions` just started
+         -- a `Thread.join` before v0.7.7), so a slow first image pull is
+         waited on rather than raced;
       2. it returns the instant nothing is still coming up -- a `Failed`
          function with no deploy in flight cannot become Active without
          another Apply, so waiting out the budget would only make the failure
@@ -500,19 +502,21 @@ def wait_for_active_functions(
     exited or paused is established LIVE by the apply itself rather than
     inherited from the drift sweep's ~10-tick cadence."""
     deadline = time.monotonic() + (active_timeout() if timeout is None else timeout)
-    for thread in converging:
-        thread.join(max(0.0, deadline - time.monotonic()))
+    await join(converging, deadline - time.monotonic())
     while True:
         records = _fn_records(stores, env)
         if not any(map(_still_deploying, records)) or time.monotonic() >= deadline:
             return function_faults(stores, env)
-        time.sleep(_ACTIVE_POLL_SECONDS)
+        # `await`, never `time.sleep`: this runs on the shared control loop
+        # now, where a blocking sleep freezes the reconciler and the gateway
+        # with it -- and this poll can repeat for `active_timeout()` (210s).
+        await asyncio.sleep(_ACTIVE_POLL_SECONDS)
 
 
 # --- CreateFunction / GetFunction / DeleteFunction ------------------------
 
 
-def _create_function(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+async def _create_function(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     payload = _payload(body)
     name = payload.get("FunctionName") or resource
     # With neither a body `FunctionName` nor a URL resource this used to key the
@@ -577,43 +581,43 @@ def _create_function(resource: str, env: str, body: bytes, stores: SynthStores, 
     stores.tags.set(env, f"lambda:{fn['function_arn']}", dict(payload.get("Tags") or {}))
 
     code_dir = substrate.extract_code(env, name, zip_bytes)
-    # Render the `Pending` response BEFORE spawning the deploy thread: the
+    # Render the `Pending` response BEFORE starting the deploy: the
     # store hands back the SAME dict object it was given (JsonStore keeps
     # references, not copies -- see stores.py), so `fn` here and the record
     # `_finish_deploy` later mutates via `_update_function` are literally
     # the same object. `_json` calls `json.dumps` immediately, which is what
-    # actually captures the Pending snapshot -- rendering after `_spawn`
+    # actually captures the Pending snapshot -- rendering after the spawn
     # risked reading an already-`Active` function back on a fast (fake-
     # substrate) deploy, a real race (found via this module's own test
     # suite), not a test artifact. Same fix ec2compute.py's RunInstances
     # already documents for the identical shape.
     response = _json(201, _configuration_json(fn))
-    _spawn(
-        _finish_deploy, stores, env, name, runtime, handler, env_vars, code_dir, substrate,
+    background(_finish_deploy(
+        stores, env, name, runtime, handler, env_vars, code_dir, substrate,
         keystore, gateway_port, fn["memory_size"],
-    )
+    ))
     return response
 
 
-def _get_function(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+async def _get_function(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     fn = _function(stores, env, resource)
     if fn is None:
         return _not_found(resource)
     return _json(200, _get_function_response(fn, stores, env))
 
 
-def _get_function_configuration(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+async def _get_function_configuration(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     fn = _function(stores, env, resource)
     if fn is None:
         return _not_found(resource)
     return _json(200, _configuration_json(fn))
 
 
-def _delete_function(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+async def _delete_function(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     fn = _function(stores, env, resource)
     if fn is None:
         return _not_found(resource)
-    substrate.delete(env, resource)
+    await substrate.delete(env, resource)
     _zip_path(stores.root, env, resource).unlink(missing_ok=True)
     stores.lambdactl.delete(env, _key(resource))
     stores.tags.set(env, f"lambda:{fn['function_arn']}", {})
@@ -650,21 +654,24 @@ def _redeploy_response(
     stores: SynthStores, env: str, name: str, fn: dict, code_dir: Path, substrate: FunctionRuntime,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
 ) -> Response:
+    # Still a plain `def`: it awaits nothing, it only STARTS the deploy (see
+    # `gateway.models.background`). Its callers are coroutines because the
+    # dispatch table is uniform, not because this needs them to be.
     # `fn` is the fresh dict `JsonStore.update()` already returned (its own
     # private copy, not aliased with the store's internal object -- see
     # stores.py), so unlike CreateFunction's still-`set()`-aliased `fn`
-    # there's no shared-reference race to guard here; the render-before-spawn
+    # there's no shared-reference race to guard here; the render-before-start
     # ORDER is kept anyway, for the same "the response reflects the state at
     # the instant this call was made" reasoning.
     response = _json(200, _configuration_json(fn))
-    _spawn(
-        _finish_deploy, stores, env, name, fn["runtime"], fn["handler"], fn["environment"], code_dir, substrate,
+    background(_finish_deploy(
+        stores, env, name, fn["runtime"], fn["handler"], fn["environment"], code_dir, substrate,
         keystore, gateway_port, fn["memory_size"],
-    )
+    ))
     return response
 
 
-def _update_function_code(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+async def _update_function_code(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     fn = _function(stores, env, resource)
     if fn is None:
         return _not_found(resource)
@@ -689,7 +696,7 @@ def _update_function_code(resource: str, env: str, body: bytes, stores: SynthSto
     return _redeploy_response(stores, env, resource, fn, code_dir, substrate, keystore, gateway_port)
 
 
-def _update_function_configuration(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+async def _update_function_configuration(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     fn = _function(stores, env, resource)
     if fn is None:
         return _not_found(resource)
@@ -724,14 +731,14 @@ def _update_function_configuration(resource: str, env: str, body: bytes, stores:
 # --- ListVersionsByFunction / GetFunctionCodeSigningConfig ----------------
 
 
-def _list_versions_by_function(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+async def _list_versions_by_function(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     fn = _function(stores, env, resource)
     if fn is None:
         return _not_found(resource)
     return _json(200, {"Versions": [_configuration_json(fn)], "NextMarker": None})
 
 
-def _get_function_code_signing_config(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+async def _get_function_code_signing_config(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     fn = _function(stores, env, resource)
     if fn is None:
         return _not_found(resource)
@@ -745,7 +752,7 @@ def _get_function_code_signing_config(resource: str, env: str, body: bytes, stor
 # --- Invoke: the data plane ------------------------------------------------
 
 
-def _ship_logs(stores: SynthStores, env: str, name: str, substrate: FunctionRuntime) -> None:
+async def _ship_logs(stores: SynthStores, env: str, name: str, substrate: FunctionRuntime) -> None:
     """Ship the function's RIE container tail into `/aws/lambda/{name}` -- the
     exact group real Lambda writes to, so `odin logs --group /aws/lambda/foo`
     (and a canvas `aws_cloudwatch_log_group` drawn for that name, which
@@ -771,11 +778,11 @@ def _ship_logs(stores: SynthStores, env: str, name: str, substrate: FunctionRunt
     """
     logsctl.ingest_tail(
         stores, env, f"/aws/lambda/{name}", container_name(env, name),
-        substrate.logs(env, name, _LOG_TAIL_LINES),
+        await substrate.logs(env, name, _LOG_TAIL_LINES),
     )
 
 
-def _invoke(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+async def _invoke(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     fn = _function(stores, env, resource)
     if fn is None:
         return _not_found(resource)
@@ -785,7 +792,11 @@ def _invoke(resource: str, env: str, body: bytes, stores: SynthStores, now: floa
             f"Function '{resource}' is not ready to be invoked (state={fn['state']})", 502,
         )
     try:
-        result = substrate.invoke(env, resource, body)
+        # `FunctionRuntime.invoke` -- NOT a boto3 client's `invoke`, which is
+        # synchronous. This one is a coroutine, and the await is what lets the
+        # loop serve the handler's own re-entrant AWS calls while it runs (see
+        # `compute/functions.py::invoke`).
+        result = await substrate.invoke(env, resource, body)
     except Exception as exc:
         # The SIBLING of `_finish_deploy`'s reason, and the one with the
         # narrowest escape hatch: this string is the whole `Message` of the
@@ -799,7 +810,7 @@ def _invoke(resource: str, env: str, body: bytes, stores: SynthStores, now: floa
     # Both outcomes ship: a handler that RAISED wrote its traceback to the
     # container's stderr, and that traceback is the whole reason CloudWatch
     # Logs exists.
-    _ship_logs(stores, env, resource, substrate)
+    await _ship_logs(stores, env, resource, substrate)
     # ...and both outcomes are RECORDED, which is the honesty half (field test
     # 2 finding #4): a function failing every single invocation used to report
     # `healthy` and nothing else, because `FunctionError` went into the response
@@ -814,14 +825,14 @@ def _invoke(resource: str, env: str, body: bytes, stores: SynthStores, now: floa
 # --- Tags (per-function Tag/Untag/List, shared stores.tags) ---------------
 
 
-def _list_tags(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+async def _list_tags(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     fn = _function(stores, env, resource)
     if fn is None:
         return _not_found(resource)
     return _json(200, {"Tags": _tags_for(stores, env, fn["function_arn"])})
 
 
-def _tag_resource(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+async def _tag_resource(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     fn = _function(stores, env, resource)
     if fn is None:
         return _not_found(resource)
@@ -831,7 +842,7 @@ def _tag_resource(resource: str, env: str, body: bytes, stores: SynthStores, now
     return Response(status_code=204)
 
 
-def _untag_resource(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+async def _untag_resource(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     fn = _function(stores, env, resource)
     if fn is None:
         return _not_found(resource)
@@ -861,7 +872,7 @@ _HANDLERS: dict[str, _Handler] = {
 }
 
 
-def pure_answer(
+async def pure_answer(
     action: str, resource: str, env: str, body: bytes, stores: SynthStores, now: float,
     substrate: FunctionRuntime | None = None, query: dict[str, str] | None = None,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
@@ -877,4 +888,4 @@ def pure_answer(
     handler = _HANDLERS.get(op)
     if handler is None:
         return errors.synth_error("lambda", "InvalidAction", f"The action {op} is not valid.", 400)
-    return handler(resource, env, body, stores, now, substrate or FunctionRuntime(ColimaRuntime(), stores.root), query or {}, keystore, gateway_port)
+    return await handler(resource, env, body, stores, now, substrate or FunctionRuntime(ColimaRuntime(), stores.root), query or {}, keystore, gateway_port)

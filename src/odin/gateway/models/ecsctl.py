@@ -22,8 +22,8 @@ answer from REAL Colima containers (`compute/tasks.py::TaskRuntime`), never
 a stored fiction.
 
 GATEWAY-INTERNAL RECONCILE (the brief's own design note, not the main
-Reconciler loop): CreateService/UpdateService spawn a background thread
-(`_reconcile_service_tasks`, the exact `_spawn`-a-daemon-thread shape
+Reconciler loop): CreateService/UpdateService start a background task
+(`_reconcile_service_tasks`, the exact `background()`-a-task shape
 ec2compute/lambdactl already use) that converges the service's REAL task
 containers toward `desiredCount` -- launch when short, newest-task-first
 scale-down when over (the digest's own ordering), and replace any task
@@ -92,11 +92,11 @@ from __future__ import annotations
 import json
 import logging
 import os
-import threading
+import asyncio
 import time
 import uuid
 import weakref
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from typing import NamedTuple
 
 from starlette.responses import Response
@@ -106,7 +106,7 @@ from odin.compute.tasks import TaskRuntime, container_name
 from odin.gateway import errors
 from odin.gateway.errors import exc_text
 from odin.gateway.keys import KeyStore, workload_env
-from odin.gateway.models import elbv2ctl, logsctl
+from odin.gateway.models import background, elbv2ctl, join, logsctl
 from odin.gateway.stores import NO_CHANGE, SynthStores
 from odin.gateway.wiring import node_env
 from odin.runtime.colima import CONTAINER_HOST
@@ -189,7 +189,10 @@ _ROLLOUT_STABILIZE_SECONDS = 2.0
 # Trailing keystore/gateway_port are threaded to EVERY handler even where
 # unused (the same convention `runtime` itself follows): only the service
 # handlers act on them (workload-creds injection -- `workload_env`).
-_Handler = Callable[[dict, str, SynthStores, TaskRuntime, KeyStore | None, int | None], Response]
+# EVERY handler is a coroutine function, including the ones that await
+# nothing (v0.7.7) -- see `rdsctl._Handler` for why one uniform contract, and
+# not a table sniffed at the call site, is what keeps `pure_answer` honest.
+_Handler = Callable[[dict, str, SynthStores, TaskRuntime, KeyStore | None, int | None], Awaitable[Response]]
 
 
 # --- keys / arns -------------------------------------------------------
@@ -671,24 +674,24 @@ def _task_targets(
     ]
 
 
-def _register_task_targets(
+async def _register_task_targets(
     stores: SynthStores, env: str, cluster_name: str, service_name: str, host_ports: dict | None,
 ) -> None:
     for target_group_arn, host_port in _task_targets(stores, env, cluster_name, service_name, host_ports):
-        elbv2ctl.register_target(stores, env, target_group_arn, CONTAINER_HOST, host_port)
+        await elbv2ctl.register_target(stores, env, target_group_arn, CONTAINER_HOST, host_port)
 
 
-def _deregister_task_targets(stores: SynthStores, env: str, task: dict) -> None:
+async def _deregister_task_targets(stores: SynthStores, env: str, task: dict) -> None:
     targets = _task_targets(stores, env, task["cluster_name"], task["service_name"], task.get("host_ports"))
     for target_group_arn, host_port in targets:
-        elbv2ctl.deregister_target(stores, env, target_group_arn, CONTAINER_HOST, host_port)
+        await elbv2ctl.deregister_target(stores, env, target_group_arn, CONTAINER_HOST, host_port)
 
 
 # --- lazy sweep: real container status -> task lastStatus (research §2.6's
 # `_maybe_mark_stopped`, module docstring's "GATEWAY-INTERNAL RECONCILE") ---
 
 
-def _ship_task_logs(stores: SynthStores, env: str, task: dict, runtime: TaskRuntime) -> None:
+async def _ship_task_logs(stores: SynthStores, env: str, task: dict, runtime: TaskRuntime) -> None:
     """Ship one task container's log tail into `/ecs/{service}` -- the group
     an `awslogs` log-configuration would name in real ECS, so a crash's output
     survives the container that produced it.
@@ -711,19 +714,19 @@ def _ship_task_logs(stores: SynthStores, env: str, task: dict, runtime: TaskRunt
     logsctl.ingest_tail(
         stores, env, f"/ecs/{task['service_name']}",
         container_name(env, task["task_id"], task["container_name"]),
-        runtime.logs(env, task["task_id"], task["container_name"], _LOG_TAIL_LINES),
+        await runtime.logs(env, task["task_id"], task["container_name"], _LOG_TAIL_LINES),
     )
 
 
-def sweep_tasks(stores: SynthStores, env: str, runtime: TaskRuntime) -> None:
+async def sweep_tasks(stores: SynthStores, env: str, runtime: TaskRuntime) -> None:
     for task in _all_tasks(stores, env):
         # Before (and independent of) the RUNNING-only check below: a task
         # that already exited on its own still has its FINAL lines sitting in
         # a stopped container, and those lines ARE the crash diagnostic.
-        _ship_task_logs(stores, env, task, runtime)
+        await _ship_task_logs(stores, env, task, runtime)
         if task["last_status"] != "RUNNING":
             continue
-        status = runtime.status(env, task["task_id"], task["container_name"])
+        status = await runtime.status(env, task["task_id"], task["container_name"])
         if status not in ("exited", "dead", "removing", "absent"):
             continue
         # `absent` = the container is GONE, not merely stopped. Reaching it
@@ -737,7 +740,7 @@ def sweep_tasks(stores: SynthStores, env: str, runtime: TaskRuntime) -> None:
         # holds the env, and then runs only every 10 ticks. A gone container
         # never reported an exit code, so don't invent one.
         gone = status == "absent"
-        exit_code = None if gone else runtime.exit_code(env, task["task_id"], task["container_name"])
+        exit_code = None if gone else await runtime.exit_code(env, task["task_id"], task["container_name"])
         _update_task(
             stores, env, task["cluster_name"], task["task_id"],
             last_status="STOPPED", stopped_at=time.time(), exit_code=exit_code,
@@ -748,10 +751,10 @@ def sweep_tasks(stores: SynthStores, env: str, runtime: TaskRuntime) -> None:
         # upstream list too, or the proxy keeps a dead server in rotation. Runs
         # once, on the RUNNING->STOPPED transition (this loop only reaches here
         # for a task the store still calls RUNNING), never every sweep.
-        _deregister_task_targets(stores, env, task)
+        await _deregister_task_targets(stores, env, task)
 
 
-def mark_task_stopped(stores: SynthStores, env: str, cluster_name: str, task_id: str, reason: str) -> None:
+async def mark_task_stopped(stores: SynthStores, env: str, cluster_name: str, task_id: str, reason: str) -> None:
     """Public seam for W2.2's reality sweep (`reconcile/drift.py`): a task
     whose container was REMOVED outside odin, marked STOPPED with `reason`.
     Same terminal shape `sweep_tasks` gives a container that exited on its
@@ -767,7 +770,7 @@ def mark_task_stopped(stores: SynthStores, env: str, cluster_name: str, task_id:
     )
     task = stores.ecsctl.get(env, _task_key(cluster_name, task_id))
     if task is not None:  # W2.5: a vanished container leaves the LB's rotation too
-        _deregister_task_targets(stores, env, task)
+        await _deregister_task_targets(stores, env, task)
 
 
 # --- background completion: the reconcile-on-mutation shape (module
@@ -775,7 +778,7 @@ def mark_task_stopped(stores: SynthStores, env: str, cluster_name: str, task_id:
 # ec2compute/lambdactl already use for real, possibly-slow substrate work) --
 
 
-def _launch_task(
+async def _launch_task(
     stores: SynthStores, env: str, cluster_name: str, service_name: str, taskdef: dict, runtime: TaskRuntime,
     extra_env: dict[str, str] | None = None, node_label: str = "",
 ) -> None:
@@ -812,13 +815,13 @@ def _launch_task(
         # `docker run`: the task goes STOPPED with the real reason, which is
         # what makes a bad ref a `crashed` node with a naming verdict AND a
         # failed apply (the service never reaches steady state).
-        launch_env = {**node_env(stores, env, node_label), **(extra_env or {})} if node_label else extra_env
-        handle = runtime.run(
+        launch_env = {**await node_env(stores, env, node_label), **(extra_env or {})} if node_label else extra_env
+        handle = await runtime.run(
             env, task_id, container_def, extra_env=launch_env,
             cpu=taskdef.get("cpu"), memory=taskdef.get("memory"),
         )
     except Exception as exc:
-        # Deliberately broad: this runs on a daemon thread with no caller to
+        # Deliberately broad: this runs as a background task with no caller to
         # propagate an exception to -- see ec2compute.py's `_finish_boot` for
         # the identical "silent hang is forbidden" reasoning.
         log.warning("task container failed for %s/%s (env %s): %s", service_name, task_id, env, exc_text(exc))
@@ -840,10 +843,10 @@ def _launch_task(
     # groups -- which re-renders the load balancer's nginx config and reloads
     # it. Synchronous on purpose: this whole function already runs on a daemon
     # thread, and a task must be in rotation before anything reports it healthy.
-    _register_task_targets(stores, env, cluster_name, service_name, handle.host_ports)
+    await _register_task_targets(stores, env, cluster_name, service_name, handle.host_ports)
 
 
-def _stop_task(stores: SynthStores, env: str, task: dict, runtime: TaskRuntime) -> None:
+async def _stop_task(stores: SynthStores, env: str, task: dict, runtime: TaskRuntime) -> None:
     """A DELIBERATE stop (scale-down / stale-taskdef replacement / service
     delete) -- unlike `_sweep_tasks`'s lazy discovery of a spontaneous exit,
     this module already knows the outcome the moment it issues the stop, so
@@ -851,9 +854,9 @@ def _stop_task(stores: SynthStores, env: str, task: dict, runtime: TaskRuntime) 
     state nothing will ever sweep away."""
     # W2.5: out of the load balancer's rotation FIRST, so the proxy stops
     # sending it traffic before the container actually dies.
-    _deregister_task_targets(stores, env, task)
+    await _deregister_task_targets(stores, env, task)
     try:
-        runtime.stop(env, task["task_id"], task["container_name"])
+        await runtime.stop(env, task["task_id"], task["container_name"])
     except Exception as exc:
         log.warning("stopping task container %s (env %s) failed: %s", task["task_id"], env, exc_text(exc))
     stores.ecsctl.delete(env, _task_key(task["cluster_name"], task["task_id"]))
@@ -891,7 +894,7 @@ def _surge_budget(service: dict, live: int) -> int:
     return service["desired_count"] * percent // 100 - live
 
 
-def _stabilize(stores: SynthStores, env: str, runtime: TaskRuntime) -> None:
+async def _stabilize(stores: SynthStores, env: str, runtime: TaskRuntime) -> None:
     """Give the just-launched replacements a bounded window to prove they
     actually STAY up, then re-read every task's REAL container state, so a
     replacement that exited on its own inside the window is already STOPPED
@@ -902,15 +905,15 @@ def _stabilize(stores: SynthStores, env: str, runtime: TaskRuntime) -> None:
     `runningCount`, which is current-revision-only (`_on_current_revision`)
     and was already satisfied by the launches above, so a good update's apply
     time is unchanged -- the retirement finishes behind it on this same
-    daemon thread.
+    background task.
 
     LIMIT, recorded: a replacement that takes LONGER than this window to
     crash is still counted as serving and the previous revision is retired
     anyway. That is real ECS's own behavior for a service with no health
     check configured (a task counts as RUNNING the moment its container
     starts), and it is why this is a window rather than a promise."""
-    time.sleep(_ROLLOUT_STABILIZE_SECONDS)
-    sweep_tasks(stores, env, runtime)
+    await asyncio.sleep(_ROLLOUT_STABILIZE_SECONDS)
+    await sweep_tasks(stores, env, runtime)
 
 
 def _stale_tasks(stores: SynthStores, env: str, service: dict) -> list[dict]:
@@ -921,7 +924,7 @@ def _stale_tasks(stores: SynthStores, env: str, service: dict) -> list[dict]:
     ]
 
 
-def _retire_stale(stores: SynthStores, env: str, service: dict, runtime: TaskRuntime) -> None:
+async def _retire_stale(stores: SynthStores, env: str, service: dict, runtime: TaskRuntime) -> None:
     """Stop the previous revision's tasks -- but only down to the
     `minimumHealthyPercent` floor, and only counting replacements that are
     genuinely RUNNING.
@@ -947,7 +950,7 @@ def _retire_stale(stores: SynthStores, env: str, service: dict, runtime: TaskRun
     traded an outage for a false green, which is why the two ship together."""
     if not _stale_tasks(stores, env, service):
         return
-    _stabilize(stores, env, runtime)
+    await _stabilize(stores, env, runtime)
     # Re-derived AFTER the window: a stale task that died on its own during it
     # is already STOPPED, and neither counts as serving nor needs stopping.
     stale = _stale_tasks(stores, env, service)
@@ -958,14 +961,14 @@ def _retire_stale(stores: SynthStores, env: str, service: dict, runtime: TaskRun
     keep = max(_serving_floor(service) - len(serving), 0)
     # Oldest-first: the previous revision drains from its longest-lived task.
     for task in sorted(stale, key=lambda t: t["started_at"] or 0)[: max(len(stale) - keep, 0)]:
-        _stop_task(stores, env, task, runtime)
+        await _stop_task(stores, env, task, runtime)
 
 
-def _reconcile_service_tasks(
+async def _reconcile_service_tasks(
     stores: SynthStores, env: str, cluster_name: str, service_name: str, runtime: TaskRuntime,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
 ) -> None:
-    with _lock_for_service(stores, env, cluster_name, service_name):
+    async with _lock_for_service(stores, env, cluster_name, service_name):
         service = _service(stores, env, cluster_name, service_name)
         if service is None or service["status"] != "ACTIVE":  # deleted while this reconcile was queued/racing
             return
@@ -991,25 +994,19 @@ def _reconcile_service_tasks(
         # measured outage this ordering closes.
         if len(fresh) < desired:
             for _ in range(min(desired - len(fresh), max(_surge_budget(service, len(live)), 0))):
-                _launch_task(stores, env, cluster_name, service_name, taskdef, runtime, extra_env, node_label)
+                await _launch_task(stores, env, cluster_name, service_name, taskdef, runtime, extra_env, node_label)
         elif len(fresh) > desired:
             # Newest-task-first scale-down (the digest's own ordering).
             excess = sorted(fresh, key=lambda t: t["started_at"] or 0, reverse=True)[: len(fresh) - desired]
             for task in excess:
-                _stop_task(stores, env, task, runtime)
-        _retire_stale(stores, env, service, runtime)
+                await _stop_task(stores, env, task, runtime)
+        await _retire_stale(stores, env, service, runtime)
 
 
-def _spawn(target: Callable[..., None], *args: object) -> threading.Thread:
-    thread = threading.Thread(target=target, args=args, daemon=True)
-    thread.start()
-    return thread
-
-
-def converge_services(
+async def converge_services(
     stores: SynthStores, env: str, runtime: TaskRuntime,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
-) -> list[threading.Thread]:
+) -> list[asyncio.Task]:
     """Re-converge every ACTIVE service's REAL task containers toward
     `desiredCount` -- the exact `_reconcile_service_tasks` pass CreateService/
     UpdateService already spawn, driven by an APPLY (server.py's /apply-full)
@@ -1025,7 +1022,7 @@ def converge_services(
     convergence, not a timer" limit stays: no new scheduler loop). Idempotent
     -- a service already at desiredCount launches nothing.
 
-    Returns the spawned threads so the caller can WAIT for the convergence it
+    Returns the started TASKS so the caller can WAIT for the convergence it
     just asked for (`wait_for_steady_services`) instead of guessing at it.
 
     The leading `sweep_tasks` is load-bearing (field test 3): a container that
@@ -1034,12 +1031,12 @@ def converge_services(
     launched nothing -- the Apply-is-the-recovery promise silently did nothing
     for the most common failure there is. One sweep per Apply, the same
     idempotent pass every World projection already runs."""
-    sweep_tasks(stores, env, runtime)
+    await sweep_tasks(stores, env, runtime)
     return [
-        _spawn(
-            _reconcile_service_tasks, stores, env, service["cluster_name"],
+        background(_reconcile_service_tasks(
+            stores, env, service["cluster_name"],
             service["service_name"], runtime, keystore, gateway_port,
-        )
+        ))
         for service in _all_services(stores, env) if service["status"] == "ACTIVE"
     ]
 
@@ -1110,9 +1107,9 @@ def _shortfall(stores: SynthStores, env: str, service: dict) -> tuple[ServiceSho
     ), sum(1 for t in tasks if t["last_status"] not in ("RUNNING", "STOPPED"))
 
 
-def wait_for_steady_services(
+async def wait_for_steady_services(
     stores: SynthStores, env: str, runtime: TaskRuntime,
-    converging: Iterable[threading.Thread] = (), timeout: float | None = None,
+    converging: Iterable[Awaitable[None]] = (), timeout: float | None = None,
 ) -> list[ServiceShortfall]:
     """Every ACTIVE service still short of its desired task count once the
     Apply's convergence has had its bounded chance -- empty means the whole
@@ -1121,8 +1118,9 @@ def wait_for_steady_services(
 
     Bounded three ways, so this never becomes a hang and never fails a service
     that is legitimately still starting:
-      1. it JOINS `converging` (the threads `converge_services` just spawned),
-         so a slow first image pull is waited on rather than raced;
+      1. it AWAITS `converging` (the tasks `converge_services` just started --
+         a `Thread.join` before v0.7.7), so a slow first image pull is waited
+         on rather than raced;
       2. it returns the instant nothing is left PENDING -- a service short of
          desired with no task still coming up cannot converge without another
          Apply, so waiting out the budget would only make the failure slower;
@@ -1135,10 +1133,9 @@ def wait_for_steady_services(
     a task whose container already exited still reads RUNNING in the store, and
     counting that as healthy is precisely the lie this closes."""
     deadline = time.monotonic() + (steady_timeout() if timeout is None else timeout)
-    for thread in converging:
-        thread.join(max(0.0, deadline - time.monotonic()))
+    await join(converging, deadline - time.monotonic())
     while True:
-        sweep_tasks(stores, env, runtime)
+        await sweep_tasks(stores, env, runtime)
         short = [
             found for service in _all_services(stores, env) if service["status"] == "ACTIVE"
             for found in [_shortfall(stores, env, service)] if found is not None
@@ -1146,7 +1143,7 @@ def wait_for_steady_services(
         settled = all(pending == 0 for _, pending in short)
         if not short or settled or time.monotonic() >= deadline:
             return [shortfall for shortfall, _ in short]
-        time.sleep(_STEADY_POLL_SECONDS)
+        await asyncio.sleep(_STEADY_POLL_SECONDS)
 
 
 # Per-(SynthStores, env, cluster, service) lock, serializing
@@ -1186,21 +1183,23 @@ def wait_for_steady_services(
 # await-free; do not read that deletion as a precedent for this one.
 # `_service_locks_guard` below DOES delete -- it guards only an await-free
 # `setdefault` into the registry (see `fabric/nebula.py`'s note).
-_service_locks: "weakref.WeakKeyDictionary[SynthStores, dict[tuple[str, str, str], threading.Lock]]" = weakref.WeakKeyDictionary()
-_service_locks_guard = threading.Lock()
+_service_locks: "weakref.WeakKeyDictionary[SynthStores, dict[tuple[str, str, str], asyncio.Lock]]" = weakref.WeakKeyDictionary()
 
 
-def _lock_for_service(stores: SynthStores, env: str, cluster_name: str, service_name: str) -> threading.Lock:
+def _lock_for_service(stores: SynthStores, env: str, cluster_name: str, service_name: str) -> asyncio.Lock:
+    # `_service_locks_guard` is GONE, and its absence is the point: this body
+    # is two `setdefault` calls with no `await` between them, so on a single
+    # event loop nothing can preempt it and no lock can make it more atomic
+    # than it already is. See `elbv2ctl._lock_for_lb` for the same split.
     key = (env, cluster_name, service_name)
-    with _service_locks_guard:
-        per_store = _service_locks.setdefault(stores, {})
-        return per_store.setdefault(key, threading.Lock())
+    per_store = _service_locks.setdefault(stores, {})
+    return per_store.setdefault(key, asyncio.Lock())
 
 
 # --- Cluster ---------------------------------------------------------------
 
 
-def _create_cluster(
+async def _create_cluster(
     payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
 ) -> Response:
@@ -1217,7 +1216,7 @@ def _create_cluster(
     return _json({"cluster": _cluster_wire(stores, env, cluster)})
 
 
-def _describe_clusters(
+async def _describe_clusters(
     payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
 ) -> Response:
@@ -1237,7 +1236,7 @@ def _describe_clusters(
     return _json({"clusters": [_cluster_wire(stores, env, c) for c in selected], "failures": failures})
 
 
-def _delete_cluster(
+async def _delete_cluster(
     payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
 ) -> Response:
@@ -1285,7 +1284,7 @@ def _claim_revision(stores: SynthStores, env: str, family: str, build: Callable[
             return claimed
 
 
-def _register_task_definition(
+async def _register_task_definition(
     payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
 ) -> Response:
@@ -1310,7 +1309,7 @@ def _register_task_definition(
     return _json({"taskDefinition": _taskdef_wire(taskdef), "tags": []})
 
 
-def _describe_task_definition(
+async def _describe_task_definition(
     payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
 ) -> Response:
@@ -1321,7 +1320,7 @@ def _describe_task_definition(
     return _json({"taskDefinition": _taskdef_wire(taskdef), "tags": []})
 
 
-def _deregister_task_definition(
+async def _deregister_task_definition(
     payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
 ) -> Response:
@@ -1338,7 +1337,7 @@ def _deregister_task_definition(
 # --- Service -----------------------------------------------------------------
 
 
-def _create_service(
+async def _create_service(
     payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
 ) -> Response:
@@ -1396,15 +1395,15 @@ def _create_service(
     # thread -- the same ordering ec2compute/lambdactl document for their
     # own async creates -- carries no race here; it's kept for consistency.
     response = _json({"service": _service_wire(stores, env, service)})
-    _spawn(_reconcile_service_tasks, stores, env, cluster_name, service_name, runtime, keystore, gateway_port)
+    background(_reconcile_service_tasks(stores, env, cluster_name, service_name, runtime, keystore, gateway_port))
     return response
 
 
-def _describe_services(
+async def _describe_services(
     payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
 ) -> Response:
-    sweep_tasks(stores, env, runtime)
+    await sweep_tasks(stores, env, runtime)
     _sweep_inactive_services(stores, env)
     cluster_name = _strip_id(payload.get("cluster"))
     names = payload.get("services") or []
@@ -1419,7 +1418,7 @@ def _describe_services(
     return _json({"services": [_service_wire(stores, env, s) for s in selected], "failures": failures})
 
 
-def _update_service(
+async def _update_service(
     payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
 ) -> Response:
@@ -1441,11 +1440,11 @@ def _update_service(
     service.update(_deployment_config(payload, service))
     stores.ecsctl.set(env, _service_key(cluster_name, service_name), service)
     response = _json({"service": _service_wire(stores, env, service)})
-    _spawn(_reconcile_service_tasks, stores, env, cluster_name, service_name, runtime, keystore, gateway_port)
+    background(_reconcile_service_tasks(stores, env, cluster_name, service_name, runtime, keystore, gateway_port))
     return response
 
 
-def _delete_service(
+async def _delete_service(
     payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
 ) -> Response:
@@ -1464,9 +1463,9 @@ def _delete_service(
     # before this call, so without the lock its background reconcile thread
     # and this stop loop can race to `docker rm` the same container (see
     # `_lock_for_service`'s docstring -- V5d found this for real).
-    with _lock_for_service(stores, env, cluster_name, service_name):
+    async with _lock_for_service(stores, env, cluster_name, service_name):
         for task in _tasks_for_service(stores, env, cluster_name, service_name):
-            _stop_task(stores, env, task, runtime)
+            await _stop_task(stores, env, task, runtime)
         # The RECORD, unlike the containers, is NOT deleted outright -- see
         # `_INACTIVE_SERVICE_SWEEP_SECONDS`'s docstring: a real `tofu
         # destroy` hangs forever polling DescribeServices for a service
@@ -1482,11 +1481,11 @@ def _delete_service(
 # --- Tasks ---------------------------------------------------------------
 
 
-def _list_tasks(
+async def _list_tasks(
     payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
 ) -> Response:
-    sweep_tasks(stores, env, runtime)
+    await sweep_tasks(stores, env, runtime)
     cluster_name = _strip_id(payload.get("cluster"))
     tasks = _tasks_for_cluster(stores, env, cluster_name)
     service_name = payload.get("serviceName")
@@ -1500,11 +1499,11 @@ def _list_tasks(
     return _json({"taskArns": [t["task_arn"] for t in tasks], "nextToken": None})
 
 
-def _describe_tasks(
+async def _describe_tasks(
     payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
 ) -> Response:
-    sweep_tasks(stores, env, runtime)
+    await sweep_tasks(stores, env, runtime)
     cluster_name = _strip_id(payload.get("cluster"))
     by_arn = {t["task_arn"]: t for t in _tasks_for_cluster(stores, env, cluster_name)}
     selected, failures = [], []
@@ -1535,7 +1534,7 @@ def _tagged_service(stores: SynthStores, env: str, arn: str) -> dict | None:
     return None
 
 
-def _tag_resource(
+async def _tag_resource(
     payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
 ) -> Response:
@@ -1547,7 +1546,7 @@ def _tag_resource(
     return _json({})
 
 
-def _untag_resource(
+async def _untag_resource(
     payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
 ) -> Response:
@@ -1560,7 +1559,7 @@ def _untag_resource(
     return _json({})
 
 
-def _list_tags_for_resource(
+async def _list_tags_for_resource(
     payload: dict, env: str, stores: SynthStores, runtime: TaskRuntime,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
 ) -> Response:
@@ -1592,7 +1591,7 @@ _HANDLERS: dict[str, _Handler] = {
 }
 
 
-def pure_answer(
+async def pure_answer(
     action: str, resource: str, env: str, body: bytes, stores: SynthStores, now: float,
     runtime: TaskRuntime | None = None,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
@@ -1614,4 +1613,4 @@ def pure_answer(
         payload = json.loads(body) if body else {}
     except (json.JSONDecodeError, UnicodeDecodeError):
         payload = {}
-    return handler(payload, env, stores, runtime or TaskRuntime(), keystore, gateway_port)
+    return await handler(payload, env, stores, runtime or TaskRuntime(), keystore, gateway_port)

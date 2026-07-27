@@ -51,27 +51,27 @@ class FakeRuntime:
     exit_codes: dict[str, int] = field(default_factory=dict)
     log_text: str = ""
 
-    def run_container(self, spec: ContainerSpec):
+    async def run_container(self, spec: ContainerSpec):
         self.runs.append(spec)
         self.statuses[spec.name] = "running"
         if self.next_port:
             self.ports[spec.name] = self.next_port
 
-    def stop(self, name: str) -> None:
+    async def stop(self, name: str) -> None:
         self.stopped.append(name)
         self.statuses.pop(name, None)
         self.ports.pop(name, None)
 
-    def status(self, name: str) -> str:
+    async def status(self, name: str) -> str:
         return self.statuses.get(name, "absent")
 
-    def exit_code(self, name: str) -> int:
+    async def exit_code(self, name: str) -> int:
         return self.exit_codes.get(name, 0)
 
-    def host_port(self, name: str, container_port: int) -> int:
+    async def host_port(self, name: str, container_port: int) -> int:
         return self.ports.get(name, 0)
 
-    def logs(self, name: str, tail: int = 20) -> str:
+    async def logs(self, name: str, tail: int = 20) -> str:
         return self.log_text
 
 
@@ -92,6 +92,11 @@ class _FakeRedis:
         self._thread.start()
 
     def _serve(self) -> None:
+        # A REAL blocking accept loop on a REAL thread, deliberately: the code
+        # under test (`aws/cache.py::resp_call`/`ping`/`engine_version`) is
+        # synchronous socket work, so its counterparty has to block too. This
+        # is test scaffolding standing in for a Redis server, not odin runtime
+        # code -- the no-threads directive is about odin's own concurrency.
         while not self._stop:
             try:
                 conn, _ = self._sock.accept()
@@ -180,10 +185,10 @@ def test_engine_version_is_empty_when_unreachable(redis_server):
 # --- ensure / lifecycle ----------------------------------------------------
 
 
-def test_ensure_boots_redis_and_returns_the_published_port(redis_server):
+async def test_ensure_boots_redis_and_returns_the_published_port(redis_server):
     runtime = FakeRuntime(next_port=redis_server.port)
     cache = RedisCache(runtime=runtime, poll_interval=0.01)
-    assert cache.ensure(ENV, CLUSTER) == redis_server.port
+    assert await cache.ensure(ENV, CLUSTER) == redis_server.port
     (spec,) = runtime.runs
     assert spec.name == container_name(ENV, CLUSTER)
     assert spec.image == REDIS_IMAGE
@@ -192,18 +197,18 @@ def test_ensure_boots_redis_and_returns_the_published_port(redis_server):
     assert spec.memory_mib == DEFAULT_MEMORY_MIB  # owner directive B4: always capped
 
 
-def test_ensure_clears_an_exited_remnant_first(redis_server):
+async def test_ensure_clears_an_exited_remnant_first(redis_server):
     runtime = FakeRuntime(next_port=redis_server.port)
     runtime.statuses[container_name(ENV, CLUSTER)] = "exited"
-    RedisCache(runtime=runtime, poll_interval=0.01).ensure(ENV, CLUSTER)
+    await RedisCache(runtime=runtime, poll_interval=0.01).ensure(ENV, CLUSTER)
     assert runtime.stopped == [container_name(ENV, CLUSTER)]
 
 
-def test_ensure_raises_with_the_container_logs_when_redis_never_answers():
+async def test_ensure_raises_with_the_container_logs_when_redis_never_answers():
     runtime = FakeRuntime(next_port=1, log_text="LOG LINE")  # nothing listens on port 1
     cache = RedisCache(runtime=runtime, ready_timeout=0.05, poll_interval=0.01)
     with pytest.raises(RuntimeError, match="never became ready"):
-        cache.ensure(ENV, CLUSTER)
+        await cache.ensure(ENV, CLUSTER)
 
 
 # --- a readiness timeout that explained NOTHING -----------------------------
@@ -230,13 +235,13 @@ def test_ensure_raises_with_the_container_logs_when_redis_never_answers():
 # reason (no published port) sat unread in `host_port`.
 
 
-def test_a_readiness_timeout_on_a_live_silent_container_still_states_a_reason():
+async def test_a_readiness_timeout_on_a_live_silent_container_still_states_a_reason():
     """Row one, replayed: `status` running, no port, no logs. The old text was
     a colon and a blank line."""
     runtime = FakeRuntime()  # next_port 0 -> host_port stays 0, as docker really does
     cache = RedisCache(runtime=runtime, ready_timeout=0.05, poll_interval=0.01)
     with pytest.raises(RuntimeError) as raised:
-        cache.ensure(ENV, CLUSTER)
+        await cache.ensure(ENV, CLUSTER)
     message = str(raised.value)
     assert message == (
         f"{container_name(ENV, CLUSTER)} redis never became ready: docker never "
@@ -248,31 +253,31 @@ def test_a_readiness_timeout_on_a_live_silent_container_still_states_a_reason():
     assert "\n" not in message, "an empty log must not leave a blank line either"
 
 
-def test_a_readiness_timeout_on_an_exited_container_names_its_exit_code():
+async def test_a_readiness_timeout_on_an_exited_container_names_its_exit_code():
     """Row two, replayed -- the reading that mattered most and was discarded."""
     name = container_name(ENV, CLUSTER)
     runtime = FakeRuntime()
     cache = RedisCache(runtime=runtime, ready_timeout=0.05, poll_interval=0.01)
-    runtime.run_container(ContainerSpec(name=name, image=REDIS_IMAGE))
+    await runtime.run_container(ContainerSpec(name=name, image=REDIS_IMAGE))
     runtime.statuses[name] = "exited"
     runtime.exit_codes[name] = 5
     with pytest.raises(RuntimeError) as raised:
-        cache._await_ready(name)
+        await cache._await_ready(name)
     assert "Container: exited, exit code 5." in str(raised.value)
 
 
-def test_a_live_containers_exit_code_is_NOT_reported():
+async def test_a_live_containers_exit_code_is_NOT_reported():
     """`{{.State.ExitCode}}` is `0` for a RUNNING container (measured on rows
     one and three), and "exit code 0" printed under a failure is the kind of
     true-looking detail that sends a reader down the wrong path."""
     runtime = FakeRuntime()
     cache = RedisCache(runtime=runtime, ready_timeout=0.05, poll_interval=0.01)
     with pytest.raises(RuntimeError) as raised:
-        cache.ensure(ENV, CLUSTER)
+        await cache.ensure(ENV, CLUSTER)
     assert "exit code" not in str(raised.value)
 
 
-def test_a_readiness_timeout_discriminates_a_MUTE_port_from_an_absent_one():
+async def test_a_readiness_timeout_discriminates_a_MUTE_port_from_an_absent_one():
     """Row four: 6379 really IS published (a real `socat TCP-LISTEN:6379
     /dev/null` measured at host port 34045) and nothing behind it speaks RESP.
     That is a different fault from docker never publishing at all, and the old
@@ -280,13 +285,13 @@ def test_a_readiness_timeout_discriminates_a_MUTE_port_from_an_absent_one():
     runtime = FakeRuntime(next_port=1)  # published, and nothing listens on port 1
     cache = RedisCache(runtime=runtime, ready_timeout=0.05, poll_interval=0.01)
     with pytest.raises(RuntimeError) as raised:
-        cache.ensure(ENV, CLUSTER)
+        await cache.ensure(ENV, CLUSTER)
     message = str(raised.value)
     assert "published on host port 1, which never answered a Redis PING" in message
     assert "never published" not in message
 
 
-def test_the_log_tail_is_the_bonus_not_the_headline():
+async def test_the_log_tail_is_the_bonus_not_the_headline():
     """Row three: redis's own banner ends `Ready to accept connections tcp`, so
     the log alone reads as success. The reason has to lead with the reading that
     contradicts it."""
@@ -294,18 +299,18 @@ def test_the_log_tail_is_the_bonus_not_the_headline():
     runtime = FakeRuntime(log_text=banner)
     cache = RedisCache(runtime=runtime, ready_timeout=0.05, poll_interval=0.01)
     with pytest.raises(RuntimeError) as raised:
-        cache.ensure(ENV, CLUSTER)
+        await cache.ensure(ENV, CLUSTER)
     message = str(raised.value)
     assert message.index("never published") < message.index("Ready to accept")
     assert message.endswith(f"Its logs:\n{banner}")
 
 
-def test_status_host_port_and_delete_track_the_container(redis_server):
+async def test_status_host_port_and_delete_track_the_container(redis_server):
     runtime = FakeRuntime(next_port=redis_server.port)
     cache = RedisCache(runtime=runtime, poll_interval=0.01)
-    cache.ensure(ENV, CLUSTER)
-    assert cache.status(ENV, CLUSTER) == "running"
-    assert cache.host_port(ENV, CLUSTER) == redis_server.port
-    cache.delete(ENV, CLUSTER)
-    assert cache.status(ENV, CLUSTER) == "absent"
-    assert cache.host_port(ENV, CLUSTER) == 0
+    await cache.ensure(ENV, CLUSTER)
+    assert await cache.status(ENV, CLUSTER) == "running"
+    assert await cache.host_port(ENV, CLUSTER) == redis_server.port
+    await cache.delete(ENV, CLUSTER)
+    assert await cache.status(ENV, CLUSTER) == "absent"
+    assert await cache.host_port(ENV, CLUSTER) == 0
