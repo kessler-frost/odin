@@ -65,19 +65,23 @@ EVENTS = [
 LOGS = {"api": "starting\nFATAL: config missing\n", "db": "database system is ready to accept connections\n"}
 
 
-def _logs(node: str) -> str:
+async def _logs(node: str) -> str:
+    """`assemble_context` reads each node's tail with `await logs(node_id)`
+    (v0.7.7: the real resolver shells out, natively async), so this stand-in is
+    a coroutine function too -- a sync fake here would type-check the call site
+    but stop matching the seam it replaces."""
     return LOGS.get(node, "")
 
 
-def _context(node_ids=("db", "api", "ghost"), stack=STACK, world=WORLD, events=EVENTS, logs=_logs) -> dict:
-    return assemble_context(stack, world, events, logs, list(node_ids))
+async def _context(node_ids=("db", "api", "ghost"), stack=STACK, world=WORLD, events=EVENTS, logs=_logs) -> dict:
+    return await assemble_context(stack, world, events, logs, list(node_ids))
 
 
 # --- the assembler: shape ----------------------------------------------------
 
 
-def test_healthy_node_carries_desired_observed_events_and_logs():
-    node = _context()["nodes"]["db"]
+async def test_healthy_node_carries_desired_observed_events_and_logs():
+    node = (await _context())["nodes"]["db"]
     assert node["desired"]["kind"] == "rds"
     assert node["desired"]["fields"]["engine"] == {"value": "postgres", "provenance": "user"}
     assert node["observed"]["phase"] == "healthy"
@@ -86,8 +90,8 @@ def test_healthy_node_carries_desired_observed_events_and_logs():
     assert [e["type"] for e in node["events"]] == ["world_delta"]
 
 
-def test_crashed_node_carries_the_real_verdict_restarts_refs_and_crash_log():
-    node = _context()["nodes"]["api"]
+async def test_crashed_node_carries_the_real_verdict_restarts_refs_and_crash_log():
+    node = (await _context())["nodes"]["api"]
     assert node["observed"]["phase"] == "crashed"
     assert node["observed"]["verdict"] == "Essential container in task exited (exit 1)"
     assert node["observed"]["restarts"] == 3
@@ -95,17 +99,17 @@ def test_crashed_node_carries_the_real_verdict_restarts_refs_and_crash_log():
     assert "FATAL: config missing" in node["logs"]
 
 
-def test_selected_node_absent_from_the_stack_is_included_with_desired_none():
+async def test_selected_node_absent_from_the_stack_is_included_with_desired_none():
     # The canvas can select a stale tile whose node was already removed --
     # it still gets a record (with no desired config), never a KeyError.
-    node = _context()["nodes"]["ghost"]
+    node = (await _context())["nodes"]["ghost"]
     assert node["desired"] is None
     assert node["observed"] is None
     assert node["refs"] == [] and node["events"] == [] and node["logs"] == ""
 
 
-def test_env_wide_events_are_not_attributed_to_any_node():
-    context = _context()
+async def test_env_wide_events_are_not_attributed_to_any_node():
+    context = await _context()
     for node in context["nodes"].values():
         assert all(e["type"] != "tf" for e in node["events"])
 
@@ -124,38 +128,38 @@ def _tf_events(*, status: str = "failed", exit_code: int = 1, tail=("Error: crea
     ]
 
 
-def test_a_failed_tofu_apply_reaches_the_context_env_wide():
+async def test_a_failed_tofu_apply_reaches_the_context_env_wide():
     # THE most common "what's wrong here?": the user's apply just failed. That
     # evidence carries no resource_id, so before `recent_tf` it reached nothing.
-    context = _context(events=_tf_events())
+    context = await _context(events=_tf_events())
     assert "apply: Error: creating S3 Bucket: BucketAlreadyOwned" in context["recent_tf"]
     assert context["recent_tf"][-1] == "tofu apply failed (exit 1)"
 
 
-def test_the_tf_section_is_env_level_not_per_node():
-    context = _context(events=_tf_events())
+async def test_the_tf_section_is_env_level_not_per_node():
+    context = await _context(events=_tf_events())
     for node in context["nodes"].values():
         assert node["events"] == []
 
 
-def test_a_successful_apply_still_reports_its_verdict():
-    context = _context(events=_tf_events(status="ok", exit_code=0, tail=()))
+async def test_a_successful_apply_still_reports_its_verdict():
+    context = await _context(events=_tf_events(status="ok", exit_code=0, tail=()))
     assert context["recent_tf"][-1] == "tofu apply ok (exit 0)"
 
 
-def test_the_failure_tail_is_not_duplicated_by_the_stream_lines_it_repeats():
+async def test_the_failure_tail_is_not_duplicated_by_the_stream_lines_it_repeats():
     # `tail` IS the last lines of the same stdout already streamed as `line`
     # events, so re-adding them would spend the whole cap on a repeat.
-    lines = _context(events=_tf_events())["recent_tf"]
+    lines = (await _context(events=_tf_events()))["recent_tf"]
     assert lines.count("apply: Error: creating S3 Bucket: BucketAlreadyOwned") == 1
 
 
-def test_a_tail_entry_no_stream_line_carried_is_kept():
+async def test_a_tail_entry_no_stream_line_carried_is_kept():
     # The timeout path: `TfRunner._run` appends a synthetic sentence to the
     # tail that was never emitted as a line event, and it is the whole reason
     # for the failure.
     timed_out = "tofu apply timed out after 600s -- process killed"
-    context = _context(events=[
+    context = await _context(events=[
         {"type": "tf", "env": "dbg", "phase": "apply", "line": "aws_instance.web: Still creating... [9m50s elapsed]"},
         {"type": "tf", "env": "dbg", "phase": "apply", "status": "failed", "exit_code": -9, "tail": [timed_out]},
     ])
@@ -166,26 +170,26 @@ def test_a_tail_entry_no_stream_line_carried_is_kept():
     ]
 
 
-def test_the_tf_section_is_capped_at_the_last_twenty_lines():
+async def test_the_tf_section_is_capped_at_the_last_twenty_lines():
     events = [{"type": "tf", "env": "dbg", "phase": "apply", "line": f"tf-line-{i}"} for i in range(200)]
-    lines = _context(events=events)["recent_tf"]
+    lines = (await _context(events=events))["recent_tf"]
     assert len(lines) == debugger.MAX_TF_LINES
     assert lines[0] == "apply: tf-line-180" and lines[-1] == "apply: tf-line-199"
 
 
-def test_a_very_long_tf_line_is_clipped_like_every_other_string():
+async def test_a_very_long_tf_line_is_clipped_like_every_other_string():
     events = [{"type": "tf", "env": "dbg", "phase": "apply", "line": "z" * 9000}]
-    line = _context(events=events)["recent_tf"][0]
+    line = (await _context(events=events))["recent_tf"][0]
     assert len(line) < 9000 and line.endswith("(truncated)")
 
 
-def test_an_env_with_no_tofu_output_carries_an_empty_section():
-    assert _context(events=[])["recent_tf"] == []
+async def test_an_env_with_no_tofu_output_carries_an_empty_section():
+    assert (await _context(events=[]))["recent_tf"] == []
     # ...and an env whose only tf event is a clean apply says exactly that.
-    assert _context()["recent_tf"] == ["tofu apply ok (exit 0)"]
+    assert (await _context())["recent_tf"] == ["tofu apply ok (exit 0)"]
 
 
-def test_no_secret_survives_the_tf_section():
+async def test_no_secret_survives_the_tf_section():
     # `simulate/runner.py` already scrubs each line before it reaches
     # events.jsonl, but the assembler re-scrubs against the CURRENT Stack --
     # the two secret sets can differ (a Stack edited since the apply, a caller
@@ -195,14 +199,14 @@ def test_no_secret_survives_the_tf_section():
         {"type": "tf", "env": "dbg", "phase": "apply", "status": "failed", "exit_code": 1,
          "tail": [f"Error: invalid credentials for {PASSWORD}"]},
     ]
-    context = assemble_context(STACK, WORLD, events, _logs, ["db"])
+    context = await assemble_context(STACK, WORLD, events, _logs, ["db"])
     assert context["recent_tf"], "the section must exist for this test to mean anything"
     assert PASSWORD not in json.dumps(context)
     assert REDACTED in json.dumps(context["recent_tf"])
 
 
-def test_the_prompt_tells_the_agent_about_the_env_wide_tofu_evidence():
-    prompt = debugger._prompt(_context(events=_tf_events()), "what's wrong here?")
+async def test_the_prompt_tells_the_agent_about_the_env_wide_tofu_evidence():
+    prompt = debugger._prompt(await _context(events=_tf_events()), "what's wrong here?")
     assert "recent_tf" in prompt and "recent_tf" in debugger._SYSTEM
     assert "BucketAlreadyOwned" in prompt
 
@@ -210,7 +214,7 @@ def test_the_prompt_tells_the_agent_about_the_env_wide_tofu_evidence():
 # --- the assembler: drift (no key of its own, by design) ---------------------
 
 
-def test_a_drift_verdict_reaches_the_context_through_the_verdict_channel():
+async def test_a_drift_verdict_reaches_the_context_through_the_verdict_channel():
     """`reconcile/drift.py` landed after M8 and needs NO new key: the sweep's
     sentence is overlaid as the resource's `verdict` by
     `Reconciler._project_tf_owned` (and written into the store record, so
@@ -220,23 +224,23 @@ def test_a_drift_verdict_reaches_the_context_through_the_verdict_channel():
     world = World(env="dbg", resources=(
         ResourceObserved(id="web", kind="ec2", phase="crashed", verdict=reason),
     ))
-    node = assemble_context(Stack(env="dbg"), world, [], _logs, ["web"])["nodes"]["web"]
+    node = (await assemble_context(Stack(env="dbg"), world, [], _logs, ["web"]))["nodes"]["web"]
     assert node["observed"]["verdict"] == reason
     assert node["observed"]["phase"] == "crashed"
 
 
-def test_the_drift_crash_log_event_reaches_the_node_too():
+async def test_the_drift_crash_log_event_reaches_the_node_too():
     """The second copy, for free: `Reconciler._emit`'s crashed path broadcasts
     the verdict as a `type:"log"` event whose `source` is the node, which
     `_event_node` already attributes correctly."""
     reason = "container odin-lambda-dbg-fn removed outside odin — re-Apply to recreate"
     events = [{"type": "log", "env": "dbg", "source": "fn", "text": reason, "level": "error"}]
-    node = assemble_context(Stack(env="dbg"), World(env="dbg"), events, _logs, ["fn"])["nodes"]["fn"]
+    node = (await assemble_context(Stack(env="dbg"), World(env="dbg"), events, _logs, ["fn"]))["nodes"]["fn"]
     assert [e["text"] for e in node["events"]] == [reason]
 
 
-def test_the_env_is_carried_and_duplicate_ids_collapse():
-    context = _context(node_ids=("api", "api", "db"))
+async def test_the_env_is_carried_and_duplicate_ids_collapse():
+    context = await _context(node_ids=("api", "api", "db"))
     assert context["env"] == "dbg"
     assert list(context["nodes"]) == ["api", "db"]
 
@@ -244,17 +248,17 @@ def test_the_env_is_carried_and_duplicate_ids_collapse():
 # --- the assembler: secrecy --------------------------------------------------
 
 
-def test_env_var_values_are_reduced_to_key_names_only():
-    fields = _context()["nodes"]["api"]["desired"]["fields"]
+async def test_env_var_values_are_reduced_to_key_names_only():
+    fields = (await _context())["nodes"]["api"]["desired"]["fields"]
     assert fields["env"] == {"keys": ["DATABASE_URL", "LOG_LEVEL"], "provenance": "user"}
     assert "value" not in fields["env"]
 
 
-def test_a_sensitive_field_value_is_redacted():
-    assert _context()["nodes"]["db"]["desired"]["fields"]["password"]["value"] == REDACTED
+async def test_a_sensitive_field_value_is_redacted():
+    assert (await _context())["nodes"]["db"]["desired"]["fields"]["password"]["value"] == REDACTED
 
 
-def test_no_secret_value_survives_anywhere_in_the_assembled_context():
+async def test_no_secret_value_survives_anywhere_in_the_assembled_context():
     # The leak test for THIS path (the analogue of test_translate.py's own):
     # a real secret rides out on more than the desired field it was typed
     # into -- an rds node's observed `facts` carry the whole DATABASE_URL,
@@ -262,13 +266,17 @@ def test_no_secret_value_survives_anywhere_in_the_assembled_context():
     # stdout. Nothing that reaches the prompt may contain it.
     logs = {"api": f"connecting with PGPASSWORD={PASSWORD}\nFATAL: config missing\n"}
     events = [*EVENTS, {"type": "log", "env": "dbg", "source": "db", "text": f"password={PASSWORD}"}]
-    context = assemble_context(STACK, WORLD, events, lambda n: logs.get(n, ""), ["db", "api"])
+
+    async def read(node: str) -> str:
+        return logs.get(node, "")
+
+    context = await assemble_context(STACK, WORLD, events, read, ["db", "api"])
     assert PASSWORD not in json.dumps(context)
     assert REDACTED in json.dumps(context)
 
 
-def test_the_prompt_itself_carries_no_secret():
-    context = _context()
+async def test_the_prompt_itself_carries_no_secret():
+    context = await _context()
     prompt = debugger._prompt(context, "what's wrong here?")
     assert PASSWORD not in prompt
     assert "busybox:latest" in prompt  # non-sensitive evidence is still shown, unredacted
@@ -277,24 +285,24 @@ def test_the_prompt_itself_carries_no_secret():
 # --- field test 2 finding #8: ids odin has never heard of --------------------
 
 
-def test_an_id_with_no_record_anywhere_is_flagged_unknown():
-    context = _context(node_ids=("db", "d1"))
+async def test_an_id_with_no_record_anywhere_is_flagged_unknown():
+    context = await _context(node_ids=("db", "d1"))
     assert context["unknown_nodes"] == ["d1"]
     assert context["known_nodes"] == ["api", "db"]
 
 
-def test_an_observed_or_event_only_id_counts_as_known():
+async def test_an_observed_or_event_only_id_counts_as_known():
     # "Selected but not in the applied stack" is the deliberate desired-None
     # case, NOT an unknown id: World and the event log are records too.
     world = World(env="dbg", resources=(ResourceObserved(id="gone", kind="ecs", phase="crashed"),))
     events = [{"type": "access_denied", "env": "dbg", "resource_id": "principal"}]
-    context = assemble_context(Stack(env="dbg"), world, events, _logs, ["gone", "principal"])
+    context = await assemble_context(Stack(env="dbg"), world, events, _logs, ["gone", "principal"])
     assert context["unknown_nodes"] == []
     assert context["nodes"]["gone"]["desired"] is None
 
 
-def test_the_refusal_names_every_unknown_id_and_the_labels_that_do_exist():
-    context = _context(node_ids=("d1", "e1"))
+async def test_the_refusal_names_every_unknown_id_and_the_labels_that_do_exist():
+    context = await _context(node_ids=("d1", "e1"))
     answer = debugger.no_evidence_answer(context, ["d1", "e1"])
     assert answer["suspects"] == []
     assert "'d1'" in answer["answer"] and "'e1'" in answer["answer"]
@@ -302,20 +310,20 @@ def test_the_refusal_names_every_unknown_id_and_the_labels_that_do_exist():
     assert "api, db" in answer["answer"]
 
 
-def test_a_request_with_one_real_id_is_worth_a_model_call():
-    context = _context(node_ids=("db", "d1"))
+async def test_a_request_with_one_real_id_is_worth_a_model_call():
+    context = await _context(node_ids=("db", "d1"))
     assert debugger.no_evidence_answer(context, ["db", "d1"]) is None
 
 
-def test_an_empty_selection_is_an_env_wide_question_not_a_refusal():
+async def test_an_empty_selection_is_an_env_wide_question_not_a_refusal():
     # `node_ids: []` + a failed apply in `recent_tf` is a legitimate
     # "what's wrong with this environment?" -- there is nothing to refuse.
-    context = _context(node_ids=())
+    context = await _context(node_ids=())
     assert debugger.no_evidence_answer(context, []) is None
 
 
-def test_the_refusal_says_so_plainly_when_the_env_has_nothing_applied():
-    context = assemble_context(Stack(env="dbg"), World(env="dbg"), [], _logs, ["d1"])
+async def test_the_refusal_says_so_plainly_when_the_env_has_nothing_applied():
+    context = await assemble_context(Stack(env="dbg"), World(env="dbg"), [], _logs, ["d1"])
     answer = debugger.no_evidence_answer(context, ["d1"])
     assert "no applied nodes at all" in answer["answer"]
 
@@ -330,7 +338,7 @@ ISSUED_ACCESS = "AKODINFAKEFAKEFAKEFA"
 ISSUED_SECRET = "fake-issued-secret-000000000000000000000"
 
 
-def test_a_gateway_issued_credential_is_scrubbed_from_the_context():
+async def test_a_gateway_issued_credential_is_scrubbed_from_the_context():
     """`Stack.sensitive_values()` can NEVER contain a gateway-issued key: it is
     built from canvas-authored fields, and these are minted by
     `gateway/keys.py::KeyStore.issue`. Until now the only thing keeping a
@@ -344,8 +352,11 @@ def test_a_gateway_issued_credential_is_scrubbed_from_the_context():
             facts={"logtail": f"boot with AWS_ACCESS_KEY_ID={ISSUED_ACCESS}"},
         ),
     ))
-    context = assemble_context(
-        STACK, world, [], lambda _n: f"exported AWS_SECRET_ACCESS_KEY={ISSUED_SECRET}", ["api"],
+    async def read(_node: str) -> str:
+        return f"exported AWS_SECRET_ACCESS_KEY={ISSUED_SECRET}"
+
+    context = await assemble_context(
+        STACK, world, [], read, ["api"],
         extra_secrets=frozenset({ISSUED_ACCESS, ISSUED_SECRET}),
     )
     dumped = json.dumps(context)
@@ -354,7 +365,7 @@ def test_a_gateway_issued_credential_is_scrubbed_from_the_context():
     assert "docker run odin-ecs-dbg-web failed" in dumped  # the diagnostic survives
 
 
-def test_a_secret_is_scrubbed_before_the_clip_not_after():
+async def test_a_secret_is_scrubbed_before_the_clip_not_after():
     """Ordering matters: clipping FIRST can cut a secret in half, and the
     surviving prefix is no longer a substring `scrub` can match -- a partial
     credential is still a leak."""
@@ -362,7 +373,7 @@ def test_a_secret_is_scrubbed_before_the_clip_not_after():
     world = World(env="dbg", resources=(
         ResourceObserved(id="api", kind="ecs", phase="crashed", verdict=long_verdict),
     ))
-    context = assemble_context(
+    context = await assemble_context(
         STACK, world, [], _logs, ["api"], extra_secrets=frozenset({ISSUED_SECRET}),
     )
     assert ISSUED_SECRET[:10] not in json.dumps(context)
@@ -371,40 +382,45 @@ def test_a_secret_is_scrubbed_before_the_clip_not_after():
 # --- the assembler: caps ----------------------------------------------------
 
 
-def test_only_the_last_ten_events_per_node_are_kept():
+async def test_only_the_last_ten_events_per_node_are_kept():
     events = [{"type": "world_delta", "env": "dbg", "resource_id": "api", "seq": i} for i in range(25)]
-    node = assemble_context(STACK, WORLD, events, _logs, ["api"])["nodes"]["api"]
+    node = (await assemble_context(STACK, WORLD, events, _logs, ["api"]))["nodes"]["api"]
     assert len(node["events"]) == debugger.MAX_EVENTS
     assert [e["seq"] for e in node["events"]] == list(range(15, 25))  # the LAST ten
 
 
-def test_only_the_last_forty_log_lines_are_kept():
+async def test_only_the_last_forty_log_lines_are_kept():
     text = "\n".join(f"line-{i}" for i in range(500))
-    node = assemble_context(STACK, WORLD, [], lambda _n: text, ["api"])["nodes"]["api"]
+
+    async def read(_node: str) -> str:
+        return text
+
+    node = (await assemble_context(STACK, WORLD, [], read, ["api"]))["nodes"]["api"]
     lines = node["logs"].splitlines()
     assert len(lines) == debugger.MAX_LOG_LINES
     assert lines[0] == "line-460" and lines[-1] == "line-499"
 
 
-def test_a_long_field_value_is_clipped():
+async def test_a_long_field_value_is_clipped():
     stack = Stack(env="dbg", resources=(
         ResourceDesired(id="vm", kind="ec2", fields={"userData": FieldValue(value="x" * 5000)}),
     ))
-    value = assemble_context(stack, World(env="dbg"), [], _logs, ["vm"])["nodes"]["vm"]["desired"]["fields"]["userData"]["value"]
+    context = await assemble_context(stack, World(env="dbg"), [], _logs, ["vm"])
+    value = context["nodes"]["vm"]["desired"]["fields"]["userData"]["value"]
     assert len(value) < 5000 and value.endswith("(truncated)")
 
 
-def test_a_long_fact_value_is_clipped_too():
+async def test_a_long_fact_value_is_clipped_too():
     world = World(env="dbg", resources=(
         ResourceObserved(id="api", kind="ecs", phase="crashed", facts={"logtail": "y" * 9000}),
     ))
-    facts = assemble_context(STACK, world, [], _logs, ["api"])["nodes"]["api"]["observed"]["facts"]
+    facts = (await assemble_context(STACK, world, [], _logs, ["api"]))["nodes"]["api"]["observed"]["facts"]
     assert len(facts["logtail"]) < 9000 and facts["logtail"].endswith("(truncated)")
 
 
-def test_beyond_the_node_cap_extra_ids_are_named_not_silently_dropped():
+async def test_beyond_the_node_cap_extra_ids_are_named_not_silently_dropped():
     ids = [f"n{i}" for i in range(debugger.MAX_NODES + 3)]
-    context = assemble_context(Stack(env="dbg"), World(env="dbg"), [], _logs, ids)
+    context = await assemble_context(Stack(env="dbg"), World(env="dbg"), [], _logs, ids)
     assert len(context["nodes"]) == debugger.MAX_NODES
     assert context["omitted_nodes"] == ids[debugger.MAX_NODES:]
 
@@ -463,30 +479,30 @@ PAYLOAD = {
 
 
 async def test_the_reported_diagnosis_comes_back_verbatim():
-    result = await diagnose(_context(), "what's wrong here?", client_cls=_client_with(PAYLOAD), timeout=5)
+    result = await diagnose(await _context(), "what's wrong here?", client_cls=_client_with(PAYLOAD), timeout=5)
     assert result == PAYLOAD
 
 
 async def test_the_context_reaches_the_prompt():
     _PROMPTS.clear()
-    await diagnose(_context(), "why is api down?", client_cls=_client_with(PAYLOAD), timeout=5)
+    await diagnose(await _context(), "why is api down?", client_cls=_client_with(PAYLOAD), timeout=5)
     assert "why is api down?" in _PROMPTS[-1]
     assert "Essential container in task exited (exit 1)" in _PROMPTS[-1]
     assert "FATAL: config missing" in _PROMPTS[-1]
 
 
 async def test_an_sdk_error_falls_back_to_agent_unavailable():
-    result = await diagnose(_context(), "?", client_cls=_client_with(raises=RuntimeError("no CLI")), timeout=5)
+    result = await diagnose(await _context(), "?", client_cls=_client_with(raises=RuntimeError("no CLI")), timeout=5)
     assert result == {"answer": "agent unavailable", "suspects": []}
 
 
 async def test_a_timeout_falls_back_to_agent_unavailable():
-    result = await diagnose(_context(), "?", client_cls=_client_with(hang=True), timeout=0.05)
+    result = await diagnose(await _context(), "?", client_cls=_client_with(hang=True), timeout=0.05)
     assert result == {"answer": "agent unavailable", "suspects": []}
 
 
 async def test_a_run_that_never_calls_the_tool_falls_back():
-    result = await diagnose(_context(), "?", client_cls=_client_with(None), timeout=5)
+    result = await diagnose(await _context(), "?", client_cls=_client_with(None), timeout=5)
     assert result == {"answer": "agent unavailable", "suspects": []}
 
 
@@ -496,7 +512,7 @@ async def test_a_malformed_report_is_rejected_by_the_typed_membrane_itself():
     # the collector at all, so the run falls back honestly instead of
     # returning half-understood data.
     payload = {"answer": "unclear", "suspects": ["api", {"reason": "no id"}]}
-    result = await diagnose(_context(), "?", client_cls=_client_with(payload), timeout=5)
+    result = await diagnose(await _context(), "?", client_cls=_client_with(payload), timeout=5)
     assert result == {"answer": "agent unavailable", "suspects": []}
 
 
@@ -504,7 +520,7 @@ async def test_extra_keys_on_a_suspect_are_dropped_rather_than_breaking_the_resp
     # The membrane allows extra properties through; `normalize_suspects` is
     # what keeps `api/debug.py`'s `Suspect(**s)` from raising on them.
     payload = {"answer": "a", "suspects": [{"node_id": "api", "reason": "r", "confidence": "high"}]}
-    result = await diagnose(_context(), "?", client_cls=_client_with(payload), timeout=5)
+    result = await diagnose(await _context(), "?", client_cls=_client_with(payload), timeout=5)
     assert result == {"answer": "a", "suspects": [{"node_id": "api", "reason": "r"}]}
 
 
@@ -512,7 +528,7 @@ async def test_it_is_on_by_default_and_ODIN_DEBUG_AGENT_0_turns_it_off(monkeypat
     assert debugger.enabled() is True  # unlike translate's refine pass
     monkeypatch.setenv("ODIN_DEBUG_AGENT", "0")
     assert debugger.enabled() is False
-    result = await diagnose(_context(), "?", client_cls=_client_with(PAYLOAD), timeout=5)
+    result = await diagnose(await _context(), "?", client_cls=_client_with(PAYLOAD), timeout=5)
     assert result["suspects"] == [] and "off" in result["answer"]
 
 
