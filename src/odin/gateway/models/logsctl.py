@@ -219,9 +219,9 @@ def _drop_none(payload: dict) -> dict:
 
 
 def _create_log_group(payload: dict, env: str, stores: SynthStores, now: float) -> Response:
+    # No `if not name` guard: `_missing_identifier` (dispatch, below) rejects an
+    # empty `logGroupName` for EVERY op now, this one included.
     name = payload.get("logGroupName") or ""
-    if not name:
-        return _invalid("logGroupName is required")
     existing = _group(stores, env, name)
     if existing is not None and not existing.get("auto"):
         return _already_exists(f"The specified log group already exists: {name}")
@@ -630,6 +630,70 @@ def group_exists(stores: SynthStores, env: str, group: str) -> bool:
 
 
 # --- dispatch --------------------------------------------------------------
+#
+# Every handler above reads its identifiers as `payload.get(x) or ""`, and
+# exactly ONE of them (CreateLogGroup) used to check the result. That single
+# missing check was worth eleven vacuous answers, measured by calling the real
+# handlers with the member omitted:
+#
+#   DeleteLogGroup / PutRetentionPolicy / DeleteRetentionPolicy /
+#   CreateLogStream / PutLogEvents / GetLogEvents / FilterLogEvents /
+#   DescribeLogStreams / ListTagsForResource / TagResource / UntagResource
+#     -> 400 ResourceNotFoundException
+#        "The specified log group does not exist: "
+#
+# -- a sentence that ends in a dangling colon and tells a caller their group is
+# wrong when the truth is that they named no group at all. It is fixed HERE,
+# once, rather than in eleven handlers, because the defect is not in any of
+# them: it is that nothing stood between the wire and a handler that assumed an
+# identifier had arrived.
+#
+# WHICH members, measured rather than guessed -- these are exactly botocore's
+# OWN `required` lists for the `logs` model (printed from
+# `operation_model(op).input_shape.metadata["required"]`), except that the
+# group-reading ops also accept the alternates this module already honours
+# (`logGroupIdentifier`, and `resourceArn` for the tag ops). A real boto3
+# client refuses to send any of them:
+#
+#     logs.delete_log_group() -> ParamValidationError: Missing required
+#                                parameter in input: "logGroupName"
+#
+# ...so a request that arrives without one came from a raw HTTP client, never
+# from terraform -- the same finding, and the same conclusion, `ecsctl.py`'s
+# `_missing_parameter` records for `family`/`serviceName`.
+#
+# DescribeLogGroups is deliberately absent: it is a LIST, and a prefix-less
+# list is a legitimate call.
+_REQUIRED: dict[str, tuple[tuple[str, ...], ...]] = {
+    "CreateLogGroup": (("logGroupName",),),
+    "DeleteLogGroup": (("logGroupName",),),
+    "PutRetentionPolicy": (("logGroupName",),),
+    "DeleteRetentionPolicy": (("logGroupName",),),
+    "ListTagsForResource": (("resourceArn", "logGroupName"),),
+    "ListTagsLogGroup": (("resourceArn", "logGroupName"),),
+    "TagResource": (("resourceArn", "logGroupName"),),
+    "UntagResource": (("resourceArn", "logGroupName"),),
+    "CreateLogStream": (("logGroupName",), ("logStreamName",)),
+    "PutLogEvents": (("logGroupName",), ("logStreamName",)),
+    "GetLogEvents": (("logGroupName", "logGroupIdentifier"), ("logStreamName",)),
+    "FilterLogEvents": (("logGroupName", "logGroupIdentifier"),),
+    "DescribeLogStreams": (("logGroupName", "logGroupIdentifier"),),
+}
+
+
+def _missing_identifier(op: str, payload: dict) -> str | None:
+    """The first required identifier this request did not carry, or None.
+
+    An identifier counts as carried when ANY of its accepted members holds
+    something other than whitespace -- `("logGroupName", "logGroupIdentifier")`
+    is one identifier with two spellings, not two identifiers. The name
+    reported back is the FIRST spelling, which is the canonical one every
+    handler reaches for first."""
+    for members in _REQUIRED.get(op, ()):
+        if not any(str(payload.get(member) or "").strip() for member in members):
+            return members[0]
+    return None
+
 
 _Handler = Callable[[dict, str, SynthStores, float], Response]
 
@@ -663,4 +727,5 @@ def pure_answer(action: str, resource: str, env: str, body: bytes, stores: Synth
         payload = json.loads(body) if body else {}
     except (json.JSONDecodeError, UnicodeDecodeError):
         payload = {}
-    return handler(payload, env, stores, now)
+    missing = _missing_identifier(op, payload)
+    return _invalid(f"{missing} is required") if missing else handler(payload, env, stores, now)

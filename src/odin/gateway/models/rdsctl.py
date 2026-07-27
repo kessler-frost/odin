@@ -96,6 +96,7 @@ from odin.aws.rds import POSTGRES_MAJOR, PostgresRds
 from odin.fabric.models import FirewallRules
 from odin.fabric.nebula import union_firewalls
 from odin.gateway import errors
+from odin.gateway.errors import exc_text
 from odin.gateway.models import ec2net
 from odin.gateway.models.ec2compute import membership_revision
 from odin.gateway.stores import NO_CHANGE, SynthStores
@@ -505,8 +506,17 @@ def _finish_create(stores: SynthStores, env: str, identifier: str, user: str, pa
     try:
         rds.create_db(identifier, user, password, db_name)
     except Exception as exc:
-        log.warning("rds create failed for %s (env %s): %s", identifier, env, exc)
-        _update(stores, env, identifier, status=FAILED, status_reason=f"container did not start: {exc}")
+        # `exc_text`, not `str(exc)`: this string is PERSISTED as the
+        # instance's whole explanation and DescribeDBInstances hands it
+        # straight back, so a no-message exception (a real interpreter-raised
+        # `MemoryError` has `args == ()`) wrote `container did not start: `
+        # into the record -- a `failed` status whose reason is a dangling
+        # colon, with the real reason gone at the source. The same treatment
+        # ec2compute/lambdactl/ecsctl already had; imported from
+        # `gateway/errors.py` rather than re-spelled, and
+        # tests/gateway/test_empty_reasons.py pins the identity.
+        log.warning("rds create failed for %s (env %s): %s", identifier, env, exc_text(exc))
+        _update(stores, env, identifier, status=FAILED, status_reason=f"container did not start: {exc_text(exc)}")
         return
     port, error = _wait_available(rds, identifier, user, password, time.monotonic() + _CREATE_TIMEOUT)
     if error is not None:
@@ -534,8 +544,8 @@ def _finish_delete(stores: SynthStores, env: str, identifier: str, rds: Postgres
         # caller polling DescribeDBInstances is told the truth and the next
         # Apply's delete tries again -- never a record claiming the container
         # is gone when it might not be.
-        log.error("rds container delete failed for %s (env %s): %s", identifier, env, exc)
-        _update(stores, env, identifier, status_reason=f"container delete failed: {exc}")
+        log.error("rds container delete failed for %s (env %s): %s", identifier, env, exc_text(exc))
+        _update(stores, env, identifier, status_reason=f"container delete failed: {exc_text(exc)}")
         return
     stores.rdsctl.delete(env, _key(identifier))
     _set_tags(stores, env, identifier, {})
@@ -545,9 +555,10 @@ def _finish_delete(stores: SynthStores, env: str, identifier: str, rds: Postgres
 
 
 def _create_db_instance(params: dict[str, str], env: str, stores: SynthStores, now: float, rds: PostgresRds) -> Response:
+    # No `if not identifier` guard: `_missing_identifier` (dispatch, below)
+    # rejects an empty `DBInstanceIdentifier` for EVERY op now, this one
+    # included -- it was the only handler that ever checked.
     identifier = params.get("DBInstanceIdentifier", "")
-    if not identifier:
-        return errors.synth_error("rds", "InvalidParameterValue", "DBInstanceIdentifier is required", 400)
     if _record(stores, env, identifier) is not None:
         return errors.synth_error(
             "rds", "DBInstanceAlreadyExists", f"DB instance already exists: {identifier}", 400,
@@ -641,9 +652,12 @@ def _modify_db_instance(params: dict[str, str], env: str, stores: SynthStores, n
         try:
             rds.set_password(identifier, record["master_username"], record["master_password"], password)
         except Exception as exc:
+            # `exc_text` here too: this one goes on the WIRE as the apply's
+            # own failure line, so a blank left tofu reporting an
+            # `InvalidDBInstanceState` with no state named.
             return errors.synth_error(
                 "rds", "InvalidDBInstanceState",
-                f"could not change the master password on {identifier}: {exc}", 400,
+                f"could not change the master password on {identifier}: {exc_text(exc)}", 400,
             )
     changes: dict[str, object] = {"master_password": password or record["master_password"]}
     for param, field in (
@@ -908,6 +922,38 @@ _HANDLERS: dict[str, _Handler] = {
     "RemoveTagsFromResource": _remove_tags_from_resource,
 }
 
+# logsctl/secretsctl's defect, in this module. Only `CreateDBInstance` checked
+# the identifier it had just read, so a request that named NO instance was told
+# its instance was missing rather than that it named none. Measured against the
+# real handlers:
+#
+#   ModifyDBInstance / DeleteDBInstance / AddTagsToResource /
+#   ListTagsForResource / RemoveTagsFromResource
+#     -> 404 DBInstanceNotFound "DBInstance  not found."
+#
+# ...a sentence with a hole in it (note the double space) that reads as though
+# odin looked something up. The member lists are botocore's OWN `required`
+# metadata for the `rds` model, and a real boto3 client refuses to send a
+# request without them (`modify_db_instance()` -> `ParamValidationError:
+# Missing required parameter in input: "DBInstanceIdentifier"`), so only a raw
+# HTTP client gets here. `DescribeDBInstances` is deliberately absent: an
+# identifier-less describe is a legitimate LIST (botocore marks nothing
+# required on it either).
+_REQUIRED: dict[str, str] = {
+    "CreateDBInstance": "DBInstanceIdentifier",
+    "DeleteDBInstance": "DBInstanceIdentifier",
+    "ModifyDBInstance": "DBInstanceIdentifier",
+    "ListTagsForResource": "ResourceName",
+    "AddTagsToResource": "ResourceName",
+    "RemoveTagsFromResource": "ResourceName",
+}
+
+
+def _missing_identifier(op: str, params: dict[str, str]) -> str | None:
+    """The required identifier this request did not carry, or None."""
+    member = _REQUIRED.get(op, "")
+    return member if member and not params.get(member, "").strip() else None
+
 
 def pure_answer(
     action: str, resource: str, env: str, body: bytes, stores: SynthStores, now: float,
@@ -921,4 +967,8 @@ def pure_answer(
     handler = _HANDLERS.get(op)
     if handler is None:
         return errors.synth_error("rds", "InvalidAction", f"The action {op} is not valid.", 400)
-    return handler(_params(body), env, stores, now, _substrate(env, stores, rds))
+    params = _params(body)
+    missing = _missing_identifier(op, params)
+    if missing is not None:
+        return errors.synth_error("rds", "InvalidParameterValue", f"{missing} is required", 400)
+    return handler(params, env, stores, now, _substrate(env, stores, rds))

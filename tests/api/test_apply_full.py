@@ -856,9 +856,13 @@ def test_apply_full_fails_when_an_rds_this_apply_converged_never_came_back(tmp_p
         resp = client.post("/apply-full", json={"nodes": [], "edges": []})
     body = resp.json()
     assert body["status"] == "applied_resources_unhealthy", body
+    # `RuntimeError: ` is `errors.exc_text`, exactly as the lambda case above
+    # already reads: rdsctl's writer now shares that one wording instead of
+    # spelling `str(exc)` itself, so a no-message exception can no longer make
+    # this reason `container did not start: ` (see test_empty_reasons.py).
     assert body["unhealthy_resources"] == [{
         "kind": "rds", "node": "app-db", "observed": "failed",
-        "reason": "container did not start: docker run failed: no space left on device",
+        "reason": "container did not start: RuntimeError: docker run failed: no space left on device",
     }], body
     assert "rds app-db is failed" in body["note"]
     assert "no space left on device" in body["note"]

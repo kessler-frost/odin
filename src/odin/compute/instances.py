@@ -115,6 +115,7 @@ from odin.fabric.nebula import (
     peer_overlay_ips,
     rehandshake_script,
 )
+from odin.runtime.colima import _failure_reason
 from odin.util import atomic_write_text, run_command
 
 log = logging.getLogger("odin.compute.instances")
@@ -387,9 +388,37 @@ class InstanceVm:
         self._boot_semaphore = boot_semaphore or _BOOT_SEMAPHORE
 
     def _lima(self, *args: str, check: bool = True, input: str | None = None) -> _Proc:
+        """One `limactl` run. A failure raises a reason that is never vacuous.
+
+        The text was `f"limactl {' '.join(args)} failed: {proc.stderr.strip()}"`,
+        which renders `limactl shell odin-ec2-x -- ... failed: ` -- a sentence
+        whose reason slot is a dangling colon -- for the whole class of failure
+        this module actually produces. Probed against REAL limactl 2.1.3 and a
+        REAL Lima VM (created, driven, deleted), not reasoned about; every one
+        of these exits non-zero having written NOTHING to stderr:
+
+            shell <vm> -- sh -c 'exit 3'                 rc=3 err='' out=''
+            shell <vm> -- sh -c 'echo on-stdout; exit 7' rc=7 err='' out='on-stdout\\n'
+            shell <vm> -- sudo bash -s  <<< 'exit 9'     rc=9 err='' out=''
+            shell <vm> -- false                          rc=1 err='' out=''
+
+        `limactl shell` PROPAGATES the guest's exit code (3, 7, 9), so the one
+        fact that was there every time was the one being discarded -- and case
+        two shows the reason can be on STDOUT, which this seam kept only on
+        success. `_failure_reason` is `runtime/colima.py`'s, imported rather
+        than re-spelled: `docker` and `limactl` are the same problem, and
+        tests/compute/test_instances.py pins the identity.
+
+        Unlike colima's `_command_label`, the full argv IS named here: it
+        carries no secret. Every raising call site is `create`/`start`/`list`
+        (VM name, `--timeout`, a YAML PATH); the cert key and the workload's
+        env vars ride stdin and cloud-init files, never argv."""
         proc = self._run(["limactl", *args], input=input)
         if check and proc.returncode != 0:
-            raise RuntimeError(f"limactl {' '.join(args)} failed: {proc.stderr.strip()}")
+            raise RuntimeError(
+                f"limactl {' '.join(args)} failed "
+                f"(exit {proc.returncode}): {_failure_reason(proc)}"
+            )
         return proc
 
     def boot(
@@ -662,9 +691,15 @@ class InstanceVm:
         script = _write_files_script({"host.crt": cert.crt.read_text(), "host.key": cert.key.read_text()})
         proc = self._lima("shell", name, "--", "sudo", "bash", "-s", input=script, check=False)
         if proc.returncode != 0:
+            # The same `_failure_reason` `_lima` raises, for the same measured
+            # reason. This site had half the treatment already (`or 'no
+            # output'`, so it never trailed off) and it is the one that most
+            # needed the other half: it is a `sudo bash -s`, whose real failure
+            # is `rc=9, stderr='', stdout=''` -- "no output" threw away the 9,
+            # and threw away a script that explains itself on stdout.
             raise RuntimeError(
-                f"could not land {nebula.host_id}'s re-issued certificate (groups {desired}) on {name}: "
-                f"{proc.stderr.strip() or 'no output'}"
+                f"could not land {nebula.host_id}'s re-issued certificate (groups {desired}) "
+                f"on {name} (exit {proc.returncode}): {_failure_reason(proc)}"
             )
         log.info("re-issued %s's nebula certificate on %s with groups %s", nebula.host_id, name, desired)
         return True

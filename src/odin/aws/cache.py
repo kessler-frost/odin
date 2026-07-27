@@ -133,7 +133,55 @@ class RedisCache:
             if port and ping(port):
                 return port
             time.sleep(self._poll_interval)
-        raise RuntimeError(f"{name} redis never became ready:\n{self._rt.logs(name)}")
+        raise RuntimeError(f"{name} redis never became ready: {self._not_ready_reason(name)}")
+
+    def _not_ready_reason(self, name: str) -> str:
+        """WHY the wait ended, in a form that is never empty.
+
+        A direct clone of the bug `FunctionRuntime._not_ready_reason` was
+        written for, so it gets the same treatment -- and this module's own
+        measurement is the stronger of the two. It used to be
+        `f"{name} redis never became ready:\\n{self._rt.logs(name)}"`, and
+        `_ContainerRuntime.logs` answers `""` both for a container that wrote
+        nothing and for one the runtime could not read. Driven to a REAL
+        timeout against REAL containers (`ready_timeout=6s`, nothing on 6379):
+
+          container                     rendered                    status   exit  port  logs
+          alpine sleep 300              '... never became ready:\\n'  running  0     0     ''
+          alpine sh -c 'exit 5'         '... never became ready:\\n'  exited   5     0     ''
+          redis:7-alpine, unpublished   '... + the redis banner'     running  0     0     banner
+
+        Row two is the defect at its worst: the container had EXITED with code
+        5 and odin's whole explanation was a colon and a blank line. Row three
+        is why the log tail cannot be the headline -- that banner's last line
+        is `Ready to accept connections tcp`, a log that reads like SUCCESS
+        under a sentence saying the opposite, while the actual reason (no
+        published port) sat in `host_port`. `status`, `exit_code` and
+        `host_port` were all readable at that instant and all three were
+        discarded; the logs were never the only witness, just the only one
+        anybody asked.
+
+        `host_port` is named because it discriminates the two real failures
+        this substrate has -- docker never published the port at all, versus a
+        port that is published and never answers PING. The exit code is
+        reported only for a container that is NOT running, per the same
+        finding functions.py records: a live container's `{{.State.ExitCode}}`
+        is `0` (row one and row three above), and "exit code 0" printed under
+        a failure sends a reader down the wrong path."""
+        status = self._rt.status(name)
+        state = status if status == "running" else f"{status}, exit code {self._rt.exit_code(name)}"
+        port = self._rt.host_port(name, REDIS_PORT)
+        published = f"published on host port {port}, which never answered a Redis PING" if port else (
+            f"docker never published its {REDIS_PORT}, so nothing could reach it"
+        )
+        logs = self._rt.logs(name)
+        tail = f"Its logs:\n{logs}" if logs else (
+            "It has logged nothing, so the container state above is the whole of it."
+        )
+        return (
+            f"{published}, after {self._ready_timeout:g}s. "
+            f"Container: {state}. {tail}"
+        )
 
     def host_port(self, env: str, cluster_id: str) -> int:
         return self._rt.host_port(container_name(env, cluster_id), REDIS_PORT)

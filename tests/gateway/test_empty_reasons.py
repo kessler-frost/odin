@@ -48,12 +48,16 @@ import pytest
 from httpx._transports.default import map_httpcore_exceptions
 
 from odin.compute.functions import InvokeResult
-from odin.gateway.models import ec2compute, ecsctl, lambdactl
+from odin.gateway.classify import classify
+from odin.gateway.models import cachectl, ec2compute, ecsctl, lambdactl, rdsctl
 from odin.gateway.stores import SynthStores
 from odin.gateway.errors import exc_text
 from odin.reconcile.reconciler import _exc_text as canonical_exc_text
 from odin.simulate.workspace import tf_dir
 
+from .conftest import split_url
+from .test_cachectl import CLUSTER as CACHE_CLUSTER
+from .test_cachectl import FakeRedisCache
 from .test_ec2compute import FakeInstanceVm
 from .test_ec2compute import _answer as _ec2_answer
 from .test_ec2compute import _run_instance, _subnet, _wait_for_state
@@ -62,8 +66,42 @@ from .test_lambdactl import FakeFunctionRuntime, _create
 from .test_lambdactl import _answer as _lambda_answer
 from .test_lambdactl import _parse as _lambda_parse
 from .test_lambdactl import _wait_for_state as _wait_for_fn_state
+from .test_rdsctl import DB as _RDS_ID
+from .test_rdsctl import FakePostgresRds
+from .test_rdsctl import _create as _rds_create
+from .test_rdsctl import fast_probe  # noqa: F401  -- shrinks the create timeout
 
 ENV = "default"
+
+
+def _settle_rds(stores: SynthStores, identifier: str = _RDS_ID, timeout: float = 5.0) -> dict:
+    """Wait for `_finish_create`'s daemon thread to leave `creating`."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        record = rdsctl._record(stores, ENV, identifier)
+        if record is not None and record["status"] != rdsctl.CREATING:
+            return record
+        time.sleep(0.01)
+    raise AssertionError("the rds create thread never settled")
+
+
+def _cache_create(stores: SynthStores, sink, elasticache, substrate) -> None:
+    """A real `available` cluster through the real CreateCacheCluster handler,
+    with `substrate` injected the way `pure_answer` already allows -- so this
+    module needs no fixture of its own (and cannot shadow test_cachectl's)."""
+    req = sink.call(lambda: elasticache.create_cache_cluster(
+        CacheClusterId=CACHE_CLUSTER, Engine="redis", CacheNodeType="cache.t3.micro", NumCacheNodes=1,
+    ))
+    path, query = split_url(req.url)
+    action, resource = classify("elasticache", req.method, path, query, req.headers, req.body)
+    cachectl.pure_answer(action, resource, ENV, req.body, stores, 0.0, cache=substrate)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        record = stores.cachectl.get(ENV, f"cluster:{CACHE_CLUSTER}")
+        if record is not None and record["status"] != cachectl.STATUS_CREATING:
+            return
+        time.sleep(0.01)
+    raise AssertionError("the cache create thread never settled")
 
 
 # --- ONE treatment, not a fourth spelling --------------------------------
@@ -90,6 +128,9 @@ def test_every_model_words_an_exception_exactly_as_the_reconciler_does(exc):
     assert ecsctl.exc_text is exc_text
     assert lambdactl.exc_text is exc_text
     assert ec2compute.exc_text is exc_text
+    # …and the two that were still spelling it `str(exc)`.
+    assert rdsctl.exc_text is exc_text
+    assert cachectl.exc_text is exc_text
     assert canonical_exc_text is exc_text
     assert exc_text(exc) == canonical_exc_text(exc)
 
@@ -484,6 +525,131 @@ def test_a_state_tofu_really_wrote_still_names_what_it_forgot(tmp_path):
     ]}))
 
     assert ec2compute.tf_forgotten_instances(stores, "e1") == ["i-forgotten"]
+
+
+# --- rdsctl + cachectl: the two writers that never got the treatment ------
+#
+# The same defect, found in the same shape, two releases later. `rdsctl` and
+# `cachectl` each catch a deliberately broad `except Exception` on a daemon
+# thread and write the exception into the record as the resource's whole
+# explanation -- and they did it with `str(exc)`, so a no-message exception
+# persisted `container did not start: ` / `container removal failed: `. The
+# `cachectl` one is the sharpest illustration that a per-instance fix does not
+# generalise: that module's `_finish_create` ALREADY used `exc_text` while its
+# `_finish_delete`, twelve lines below, did not.
+
+
+def _rds_record(stores, sink, rds_client, substrate, identifier=_RDS_ID):
+    """A real `creating` record, minted by the real CreateDBInstance handler."""
+    _rds_create(sink, rds_client, stores, substrate, identifier=identifier)
+    return rdsctl._record(stores, ENV, identifier)
+
+
+class _SilentCreate(FakePostgresRds):
+    """`create_db` raises with NO message -- what a real interpreter-raised
+    `MemoryError` looks like when it reaches `_finish_create`'s broad catch on a
+    machine odin's own docs call short on headroom."""
+
+    def create_db(self, db_id, user, password, db_name="postgres"):
+        raise RuntimeError()
+
+
+class _SilentDelete(FakePostgresRds):
+    def delete_db(self, db_id):
+        raise RuntimeError()
+
+
+class _SilentPassword(FakePostgresRds):
+    def set_password(self, db_id, user, current, new):
+        raise RuntimeError()
+
+
+def test_an_rds_boot_that_fails_with_no_message_records_the_class(stores, sink, rds):
+    """PERSISTED, and DescribeDBInstances hands it straight back: a `failed`
+    status whose `StatusReason` is a dangling colon is a resource that says it
+    broke and nothing about how."""
+    substrate = _SilentCreate()
+    _rds_create(sink, rds, stores, substrate)
+    record = _settle_rds(stores)
+
+    assert record["status"] == rdsctl.FAILED
+    assert record["status_reason"] == "container did not start: RuntimeError (raised with no message, so the class is the whole of it)"
+    assert not record["status_reason"].rstrip().endswith(":")
+
+
+def test_an_rds_delete_that_fails_with_no_message_records_the_class(stores, sink, rds):
+    """This branch exists to be honest with a polling caller -- the record STAYS
+    `deleting` with the failure recorded -- so a blank reason defeats its whole
+    purpose."""
+    substrate = _SilentDelete()
+    _rds_create(sink, rds, stores, FakePostgresRds())
+    _settle_rds(stores)
+    rdsctl._finish_delete(stores, ENV, _RDS_ID, substrate)
+    record = rdsctl._record(stores, ENV, _RDS_ID)
+
+    assert record is not None, "a failed delete must not remove the record"
+    assert "RuntimeError" in record["status_reason"]
+    assert not record["status_reason"].rstrip().endswith(":")
+
+
+def test_an_rds_password_change_that_fails_with_no_message_still_names_something(stores, sink, rds):
+    """This one goes on the WIRE as the apply's own failure line, so a blank
+    left tofu reporting an `InvalidDBInstanceState` with no state named."""
+    _rds_create(sink, rds, stores, FakePostgresRds())
+    _settle_rds(stores)
+    response = rdsctl.pure_answer(
+        "rds:ModifyDBInstance", _RDS_ID, ENV,
+        f"Action=ModifyDBInstance&DBInstanceIdentifier={_RDS_ID}&MasterUserPassword=brandnew123".encode(),
+        stores, time.monotonic(), rds=_SilentPassword(),
+    )
+    body = response.body.decode()
+
+    assert response.status_code == 400
+    assert "RuntimeError" in body
+    assert f"could not change the master password on {_RDS_ID}: <" not in body
+
+
+class _SilentCacheDelete:
+    """The `RedisCache` shape whose `delete` raises with no message."""
+
+    def ensure(self, env, cluster_id, memory_mib=None):
+        return 51234
+
+    def delete(self, env, cluster_id):
+        raise RuntimeError()
+
+    def host_port(self, env, cluster_id):
+        return 51234
+
+    def status(self, env, cluster_id):
+        return "running"
+
+
+def test_a_cache_removal_that_fails_with_no_message_records_the_class(stores, sink, elasticache):
+    """The sibling `_finish_create` in this SAME module already had `exc_text`
+    and `_finish_delete` did not -- which is why the honesty rule says fix the
+    SHAPE, then immediately hunt siblings."""
+    _cache_create(stores, sink, elasticache, FakeRedisCache())
+    cachectl._finish_delete(stores, ENV, CACHE_CLUSTER, "arn:aws:elasticache:x", _SilentCacheDelete())
+    record = stores.cachectl.get(ENV, f"cluster:{CACHE_CLUSTER}")
+
+    assert record is not None, "a failed removal must not remove the record"
+    assert record["status_reason"] == "container removal failed: RuntimeError (raised with no message, so the class is the whole of it)"
+    assert not record["status_reason"].rstrip().endswith(":")
+
+
+def test_both_writers_still_quote_a_real_message_when_there_is_one(stores, sink, rds):
+    """The common case must not regress: `exc_text` prefixes the class, it does
+    not replace the message."""
+    class _Loud(FakePostgresRds):
+        def create_db(self, db_id, user, password, db_name="postgres"):
+            raise RuntimeError("docker: no space left on device")
+
+    _rds_create(sink, rds, stores, _Loud())
+    record = _settle_rds(stores)
+    assert record["status_reason"] == (
+        "container did not start: RuntimeError: docker: no space left on device"
+    )
 
 
 # --- the fixtures the imported helpers expect ----------------------------

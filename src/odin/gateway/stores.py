@@ -205,10 +205,16 @@ class SynthStores:
       above, keyed `"lambda:{functionArn}"`.
     - `ecsctl`: the ECS control-plane model's whole state
       (`gateway/models/ecsctl.py`, task V5a) -- flat keys
-      `"cluster:{name}"` / `"taskdef-rev:{family}"` (revision counter) /
-      `"taskdef:{family}:{revision}"` / `"service:{cluster}:{name}"` /
-      `"task:{cluster}:{task_id}"`, persisted at
-      `.odin/{env}/gateway/ecsctl.json`.
+      `"cluster:{name}"` / `"taskdef:{family}:{revision}"` /
+      `"service:{cluster}:{name}"` / `"task:{cluster}:{task_id}"`, persisted at
+      `.odin/{env}/gateway/ecsctl.json`. There is NO revision counter: the next
+      task-definition revision is derived from the `"taskdef:"` keys themselves
+      (`ecsctl._taskdef_revisions`), because a second copy of that truth could
+      go missing and let a register overwrite a live revision -- measured doing
+      exactly that. Stores written by earlier odins still carry the old
+      `"taskdef-rev:{family}"` counter and `records.py` still validates it so
+      such a file stays readable; nothing reads its value. Same shape as the
+      legacy `"cursor:"` key `logsctl` describes below.
     - `logsctl`: the CloudWatch Logs model's whole state
       (`gateway/models/logsctl.py`, task W2.1) -- flat keys `"group:{name}"` /
       `"stream:{group}:{stream}"` / `"events:{group}"` (the per-group ring

@@ -630,7 +630,13 @@ def test_wait_for_available_instances_reports_a_database_that_never_came_back(tm
 
 def test_wait_for_available_instances_names_the_docker_failure_when_that_is_the_reason(tmp_path, sink, rds):
     """The other real reason, and the higher-quality one: the container never
-    started at all, so the apply names the `docker` error itself."""
+    started at all, so the apply names the `docker` error itself.
+
+    The `RuntimeError: ` prefix is `errors.exc_text`, which this writer now
+    shares with ec2compute/lambdactl/ecsctl instead of spelling `str(exc)`
+    itself -- so a no-message exception can no longer persist `container did
+    not start: ` as an instance's whole explanation. See
+    tests/gateway/test_empty_reasons.py."""
     stores, fake = _stores(tmp_path), FakePostgresRds()
     _create(sink, rds, stores, fake)
     _await_status(sink, rds, stores, fake, "available")
@@ -641,7 +647,7 @@ def test_wait_for_available_instances_names_the_docker_failure_when_that_is_the_
     faults = rdsctl.wait_for_available_instances(stores, ENV, booting)
 
     assert faults == [rdsctl.DatabaseFault(
-        node=DB, status="failed", reason="container did not start: docker run failed",
+        node=DB, status="failed", reason="container did not start: RuntimeError: docker run failed",
     )], faults
 
 
@@ -690,3 +696,68 @@ def test_available_timeout_defaults_to_outlasting_the_boot_it_verifies(monkeypat
 
     monkeypatch.setenv("ODIN_RDS_AVAILABLE_TIMEOUT", "7")
     assert rdsctl.available_timeout() == 7.0
+
+
+# --- a request that named NO instance ---------------------------------------
+#
+# logsctl/secretsctl's defect in this module: only `CreateDBInstance` checked
+# the identifier it had just read. Measured against the real handlers with
+# `DBInstanceIdentifier` omitted, five ops answered
+#
+#   404 DBInstanceNotFound "DBInstance  not found."
+#
+# -- a sentence with a hole in it (note the double space) that reads as though
+# odin looked something up and came back empty-handed, when the truth is that
+# it was handed no name to look up. A real boto3 client refuses to send one
+# (`modify_db_instance()` -> `ParamValidationError: Missing required parameter
+# in input: "DBInstanceIdentifier"`), so this is the raw-client path -- the
+# same finding, and the same conclusion, ecsctl's `_missing_parameter` records.
+
+
+@pytest.mark.parametrize("op,body,expected", [
+    ("ModifyDBInstance", b"Action=ModifyDBInstance", "DBInstanceIdentifier"),
+    ("DeleteDBInstance", b"Action=DeleteDBInstance", "DBInstanceIdentifier"),
+    ("CreateDBInstance", b"Action=CreateDBInstance&Engine=postgres", "DBInstanceIdentifier"),
+    ("ModifyDBInstance", b"Action=ModifyDBInstance&DBInstanceIdentifier=", "DBInstanceIdentifier"),
+    ("ModifyDBInstance", b"Action=ModifyDBInstance&DBInstanceIdentifier=%20", "DBInstanceIdentifier"),
+    ("ListTagsForResource", b"Action=ListTagsForResource", "ResourceName"),
+    ("AddTagsToResource", b"Action=AddTagsToResource", "ResourceName"),
+    ("RemoveTagsFromResource", b"Action=RemoveTagsFromResource", "ResourceName"),
+])
+def test_a_request_that_named_no_db_instance_says_so_instead_of_blaming_the_name(
+    op, body, expected, tmp_path,
+):
+    stores = _stores(tmp_path)
+    response = rdsctl.pure_answer(f"rds:{op}", "", ENV, body, stores, 0.0, rds=FakePostgresRds())
+    text = response.body.decode()
+
+    assert response.status_code == 400, text
+    assert "<Code>InvalidParameterValue</Code>" in text
+    assert f"<Message>{expected} is required</Message>" in text
+    assert "DBInstance  not found" not in text, "a message with a hole in it is the bug"
+    assert stores.rdsctl.items(ENV) == {}
+
+
+def test_an_identifier_less_describe_is_still_a_legitimate_list(tmp_path, sink, rds):
+    """The gate must not turn the LIST call into an error -- terraform's own
+    refresh drives an unfiltered DescribeDBInstances (and botocore marks
+    nothing required on it)."""
+    stores, fake = _stores(tmp_path), FakePostgresRds()
+    _create(sink, rds, stores, fake)
+    _await_status(sink, rds, stores, fake, "available")
+    listed = _parse("DescribeDBInstances", _describe(sink, rds, stores, fake, identifier=None))
+    assert [i["DBInstanceIdentifier"] for i in listed["DBInstances"]] == [DB]
+
+
+def test_a_named_instance_that_is_missing_still_gets_the_real_not_found_code(tmp_path):
+    """`DBInstanceNotFound` is load-bearing twice over (the provider's Read
+    drops the resource from state on it, and its delete waiter treats it as
+    gone), so the gate must not swallow the genuine case."""
+    stores = _stores(tmp_path)
+    response = rdsctl.pure_answer(
+        "rds:DeleteDBInstance", "nope", ENV, b"Action=DeleteDBInstance&DBInstanceIdentifier=nope",
+        stores, 0.0, rds=FakePostgresRds(),
+    )
+    assert response.status_code == 404
+    assert "<Code>DBInstanceNotFound</Code>" in response.body.decode()
+    assert "DBInstance nope not found." in response.body.decode()

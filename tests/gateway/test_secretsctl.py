@@ -12,6 +12,7 @@ pipeline end to end.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import botocore.session
@@ -295,3 +296,76 @@ def test_the_value_never_leaves_except_through_get_secret_value(stores, sink, se
     assert VALUE.encode() not in described.body
     assert VALUE.encode() not in listed.body
     assert VALUE.encode() in _get_value(stores, sink, secretsmanager).body
+
+
+# --- a request that named NO secret (the nine vacuous answers) --------------
+#
+# logsctl's defect in this module's dialect: every handler reads
+# `_secret_name(payload.get("SecretId") or "")` and exactly ONE of them
+# (CreateSecret) used to check the result. MEASURED by calling the real handlers
+# with `SecretId` omitted, nine ops answered
+#
+#   400 ResourceNotFoundException "Secrets Manager can't find the specified secret: "
+#
+# -- which blames a name the caller never sent. Fixed ONCE, in `pure_answer`'s
+# `_missing_identifier` gate. The member lists are botocore's OWN `required`
+# metadata for the `secretsmanager` model, and a real boto3 client refuses to
+# send a request without them (`describe_secret()` -> `ParamValidationError:
+# Missing required parameter in input: "SecretId"`), so only a raw HTTP client
+# reaches here. ListSecrets is deliberately absent: a filter-less list is a
+# legitimate call.
+
+_NAMELESS = [
+    ("DescribeSecret", {}, "SecretId"),
+    ("UpdateSecret", {}, "SecretId"),
+    ("DeleteSecret", {}, "SecretId"),
+    ("TagResource", {"Tags": []}, "SecretId"),
+    ("UntagResource", {"TagKeys": []}, "SecretId"),
+    ("GetResourcePolicy", {}, "SecretId"),
+    ("GetSecretValue", {}, "SecretId"),
+    ("PutSecretValue", {"SecretString": "x"}, "SecretId"),
+    ("UpdateSecretVersionStage", {}, "SecretId"),
+    ("CreateSecret", {}, "Name"),
+    ("DescribeSecret", {"SecretId": ""}, "SecretId"),
+    ("DescribeSecret", {"SecretId": "   "}, "SecretId"),
+]
+
+
+@pytest.mark.parametrize("op,payload,expected", _NAMELESS, ids=lambda v: str(v)[:40])
+def test_a_request_that_named_no_secret_says_so_instead_of_blaming_the_name(op, payload, expected, stores):
+    response = synth.pure_answer(
+        f"secretsmanager:{op}", "*", ENV, json.dumps(payload).encode(), stores, 0.0,
+    )
+    body = json.loads(response.body)
+    assert response.status_code == 400
+    assert body["__type"] == "InvalidParameterException", body
+    assert body["message"] == f"{expected} is required"
+    assert not body["message"].rstrip().endswith(":")
+    assert "can't find" not in body["message"], "it must not blame a name that was never sent"
+
+
+def test_update_secret_version_stage_without_a_stage_no_longer_reports_a_false_success(stores, sink, secretsmanager):
+    """One shade worse than a vacuous error, and the reason `VersionStage` is on
+    the required list: an empty stage matched no version, so the call moved
+    NOTHING and answered 200 -- odin reporting a success it had not performed.
+    (botocore marks `VersionStage` required for this op; measured.)"""
+    _create(stores, sink, secretsmanager, SecretString="v1")
+    response = synth.pure_answer(
+        "secretsmanager:UpdateSecretVersionStage", "*", ENV,
+        json.dumps({"SecretId": NAME, "VersionStage": ""}).encode(), stores, 0.0,
+    )
+    assert response.status_code == 400, response.body
+    assert json.loads(response.body)["message"] == "VersionStage is required"
+
+
+def test_a_named_secret_still_gets_the_real_not_found_answer(stores):
+    """The gate must not swallow the genuine case: a caller who DID name a
+    secret that doesn't exist still gets `ResourceNotFoundException` naming it,
+    which is what terraform's read path drops the resource from state on."""
+    response = synth.pure_answer(
+        "secretsmanager:DescribeSecret", "*", ENV,
+        json.dumps({"SecretId": "no-such-secret"}).encode(), stores, 0.0,
+    )
+    body = json.loads(response.body)
+    assert body["__type"] == "ResourceNotFoundException"
+    assert "no-such-secret" in body["message"]

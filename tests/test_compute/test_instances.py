@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from odin.compute import instances
 from odin.compute.instances import (
     InstanceVm,
     NebulaJoin,
@@ -31,7 +32,9 @@ from odin.compute.instances import (
 )
 from odin.compute.models import get_instance_type
 from odin.fabric.models import FirewallRule, FirewallRules
-from odin.fabric.nebula import FIREWALL_REVISION_KEY, LIGHTHOUSE_PORT
+from odin.fabric.nebula import FIREWALL_REVISION_KEY, LIGHTHOUSE_PORT, NebulaManager
+from odin.runtime import lima
+from odin.runtime.colima import _failure_reason as canonical_failure_reason
 
 NAME = vm_name("default", "i-0123456789abcdef0")
 
@@ -817,3 +820,117 @@ def test_start_also_goes_through_the_boot_semaphore():
     released.set()
     t.join(timeout=2)
     assert sem.acquire(blocking=False) is True  # released once start() returns
+
+
+# --- a `limactl` failure that said NOTHING ----------------------------------
+#
+# `_lima` raised `f"limactl {' '.join(args)} failed: {proc.stderr.strip()}"`,
+# which renders `limactl shell <vm> -- ... failed: ` -- a sentence whose reason
+# slot is a dangling colon -- for the whole class of failure this module
+# actually produces. PROBED against REAL limactl 2.1.3 and a REAL Lima VM
+# (created, driven, deleted), never reasoned about; each of these exits
+# non-zero having written NOTHING to stderr:
+#
+#     shell <vm> -- sh -c 'exit 3'                       rc=3 err='' out=''
+#     shell <vm> -- sh -c 'echo on-stdout; exit 7'       rc=7 err='' out='on-stdout\n'
+#     shell <vm> -- sudo bash -s  <<< 'exit 9'           rc=9 err='' out=''
+#     shell <vm> -- sudo bash -s  <<< 'echo x; exit 4'   rc=4 err='' out='x\n'
+#     shell <vm> -- false                                rc=1 err='' out=''
+#
+# `limactl shell` PROPAGATES the guest's exit code (3, 7, 9, 4), so the one fact
+# present every time was the one being discarded -- and case two shows the
+# reason can be on STDOUT, which this seam kept only on success. The runners
+# below replay exactly those measured triples: the wording is what is under test
+# here, the integration was proved by running the real commands.
+
+
+def test_a_limactl_failure_with_no_output_at_all_still_states_a_reason():
+    def runner(args, input=None):
+        return _Proc(3, "", "")
+
+    with pytest.raises(RuntimeError) as raised:
+        InstanceVm(runner=runner).start(NAME)
+    message = str(raised.value)
+    assert message == (
+        f"limactl start --timeout=300s {NAME} failed (exit 3): it wrote nothing "
+        "to stderr or stdout, so the exit code is the whole of it"
+    )
+    assert not message.rstrip().endswith(":"), "nothing may trail off"
+
+
+def test_a_limactl_failure_that_explained_itself_on_stdout_is_not_reported_as_silent():
+    """Measured: `limactl shell <vm> -- sh -c 'echo on-stdout; exit 7'` is rc=7,
+    stderr EMPTY, reason on stdout. `_lima` kept stdout only on success."""
+    def runner(args, input=None):
+        return _Proc(7, "on-stdout\n", "")
+
+    with pytest.raises(RuntimeError) as raised:
+        InstanceVm(runner=runner).start(NAME)
+    assert str(raised.value) == (
+        f"limactl start --timeout=300s {NAME} failed (exit 7): "
+        "nothing on stderr; on stdout: on-stdout"
+    )
+
+
+def test_a_limactl_failure_with_real_stderr_still_leads_with_it():
+    """The common case must not regress: a real `limactl` diagnostic is still
+    the reason, now with the exit code in front of it."""
+    real = 'time="..." level=fatal msg="instance `x` does not exist"'
+
+    def runner(args, input=None):
+        return _Proc(1, "", real + "\n")
+
+    with pytest.raises(RuntimeError) as raised:
+        InstanceVm(runner=runner).start(NAME)
+    assert str(raised.value) == f"limactl start --timeout=300s {NAME} failed (exit 1): {real}"
+
+
+def test_the_two_limactl_seams_share_ONE_wording_with_docker():
+    """`compute/instances.py` and `runtime/lima.py` were an exact
+    `f"limactl … failed: {stderr.strip()}"` twin, and `runtime/colima.py` had
+    already fixed the same sentence for `docker`. Identity, not equality: a
+    re-spelled copy that agrees today would pass an equality check and drift
+    tomorrow."""
+    assert instances._failure_reason is canonical_failure_reason
+    assert lima._failure_reason is canonical_failure_reason
+
+    def runner(args, input=None):
+        return _Proc(9, "", "")
+
+    with pytest.raises(RuntimeError) as from_instances:
+        InstanceVm(runner=runner)._lima("shell", "vm", "--", "sudo", "bash", "-s", input="exit 9\n")
+    with pytest.raises(RuntimeError) as from_lima:
+        lima.LimaRuntime(runner=runner)._lima("shell", "vm", "--", "sudo", "bash", "-s", input="exit 9\n")
+    assert str(from_instances.value) == str(from_lima.value)
+    assert str(from_instances.value) == (
+        "limactl shell vm -- sudo bash -s failed (exit 9): it wrote nothing to "
+        "stderr or stdout, so the exit code is the whole of it"
+    )
+
+
+def test_a_cert_that_could_not_be_landed_names_the_exit_code_too(tmp_path):
+    """`_reissue_cert`'s message had HALF the treatment (`or 'no output'`, so it
+    never trailed off) and threw the exit code away -- on a `sudo bash -s`,
+    whose real failure IS a bare exit code. Driven end to end against a REAL
+    Lima VM holding a REAL nebula-cert-signed certificate, with `/etc/nebula`
+    made a FILE so the guest script really failed:
+
+        rc=1  stderr='mkdir: Already exists\\nbash: line 2: /etc/nebula/host.crt:
+              Not a directory\\n...'   -> the exit code was missing
+        rc=9  stderr='' stdout=''      -> BEFORE said only 'no output'
+
+    This replays the second, which is the one the old wording lost."""
+    vm, runner, nebula = _booted_vm(tmp_path, firewall=_rules("22"), groups=("sg-web",))
+    runner.responses["sudo bash -s"] = _Proc(9, "", "")
+    moved = NebulaJoin(
+        root=nebula.root, env=nebula.env, host_id=nebula.host_id,
+        firewall=_rules("22"), groups=("sg-admin",), revision="roster-2",
+    )
+    manager = NebulaManager(nebula.root / nebula.env / "nebula", runner=runner)
+    with pytest.raises(RuntimeError) as raised:
+        vm._reissue_cert(NAME, moved, manager)
+    message = str(raised.value)
+    assert "(exit 9)" in message, message
+    assert "it wrote nothing to stderr or stdout" in message
+    assert "no output" not in message
+    assert f"could not land {nebula.host_id}'s re-issued certificate" in message

@@ -2,6 +2,8 @@
 nerdctl-in-VM commands. Unit-level (injected subprocess), so deterministic."""
 from __future__ import annotations
 
+import pytest
+
 from odin.runtime.colima import ContainerSpec, _Proc
 from odin.runtime.driver import RuntimeDriver
 from odin.runtime.lima import LimaRuntime
@@ -122,3 +124,49 @@ def test_image_exists_false_on_dockers_empty_array_stdout():
     runner.responses["image inspect"] = _Proc(1, "[]")
     rt = LimaRuntime(runner=runner)
     assert rt.image_exists("odin-dynalite:1") is False
+
+
+# --- the OUTER seam's failure text ------------------------------------------
+#
+# `_lima` (limactl itself, as opposed to `_cli`'s nerdctl-in-the-VM) raised
+# `f"limactl … failed: {proc.stderr.strip()}"`, an exact twin of
+# `compute/instances.py::_lima`. Measured against REAL limactl 2.1.3 and a REAL
+# Lima VM, `limactl shell <vm> -- sh -c 'exit 3'` is rc=3 with BOTH streams
+# empty and `... 'echo on-stdout; exit 7'` puts the reason on STDOUT -- see
+# tests/test_compute/test_instances.py for the full probe. Fixed as a twin, from
+# ONE `_failure_reason`, so the two cannot drift apart again.
+
+
+def test_a_limactl_failure_with_no_output_names_the_exit_code():
+    runner = FakeRunner()
+    runner.responses["limactl create"] = _Proc(3, "", "")
+    with pytest.raises(RuntimeError) as raised:
+        LimaRuntime(runner=runner)._lima("create", "--tty=false", "--name=odin-host", "/tmp/x.yaml")
+    message = str(raised.value)
+    assert message == (
+        "limactl create --tty=false --name=odin-host /tmp/x.yaml failed (exit 3): "
+        "it wrote nothing to stderr or stdout, so the exit code is the whole of it"
+    )
+    assert not message.rstrip().endswith(":")
+
+
+def test_a_limactl_failure_that_spoke_on_stdout_is_not_reported_as_silent():
+    runner = FakeRunner()
+    runner.responses["limactl start"] = _Proc(7, "on-stdout\n", "")
+    with pytest.raises(RuntimeError) as raised:
+        LimaRuntime(runner=runner)._lima("start", "odin-host")
+    assert str(raised.value) == (
+        "limactl start odin-host failed (exit 7): nothing on stderr; on stdout: on-stdout"
+    )
+
+
+def test_ensure_host_surfaces_a_real_limactl_error_with_its_exit_code():
+    """The reachable path: `ensure_host` creates+starts the shared VM with
+    `check=True`, so this text is what a caller actually sees."""
+    runner = FakeRunner()
+    runner.responses["limactl start"] = _Proc(1, "", 'level=fatal msg="no such template"\n')
+    with pytest.raises(RuntimeError) as raised:
+        LimaRuntime(runner=runner).ensure_host()
+    assert str(raised.value) == (
+        'limactl start odin-host failed (exit 1): level=fatal msg="no such template"'
+    )

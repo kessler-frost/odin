@@ -304,8 +304,14 @@ def _finish_delete(stores: SynthStores, env: str, cluster_id: str, arn: str, cac
         # reason, so the provider's delete waiter keeps polling and eventually
         # times out loudly rather than odin claiming a clean delete over a
         # container that's still running.
-        log.error("cache container removal failed for %s: %s", cluster_id, exc)
-        _update(stores, env, cluster_id, status_reason=f"container removal failed: {exc}")
+        # `exc_text`, matching `_finish_create` twelve lines up: the SAME
+        # module already had the treatment on its create path and not on its
+        # delete path, so a no-message exception persisted `container removal
+        # failed: ` -- a record stuck in `deleting` whose reason is a dangling
+        # colon, which is exactly the polling caller this branch exists to be
+        # honest with.
+        log.error("cache container removal failed for %s: %s", cluster_id, exc_text(exc))
+        _update(stores, env, cluster_id, status_reason=f"container removal failed: {exc_text(exc)}")
         return
     stores.cachectl.delete(env, _key(cluster_id))
     _set_tags(stores, env, arn, {})
@@ -484,6 +490,41 @@ _HANDLERS: dict[str, _Handler] = {
     "RemoveTagsFromResource": _remove_tags_from_resource,
 }
 
+# logsctl/secretsctl/rdsctl's defect, in this module -- and here NO handler
+# checked, not even the create path. Measured against the real handlers with
+# the member omitted:
+#
+#   DeleteCacheCluster -> 404 CacheClusterNotFound "CacheCluster not found: "
+#   CreateCacheCluster -> 200, having MINTED `cluster:` -- a record keyed by
+#                         nothing, with `<CacheClusterId></CacheClusterId>` on
+#                         the wire, which no later call can name
+#
+# The second is worse than a message that says nothing: it is a success odin
+# did not achieve, and it is exactly the `taskdef::1` record
+# `ecsctl._missing_parameter` was written for. ModifyCacheCluster and the three
+# tag ops then answered 200 about that nameless record, which is how one
+# unchecked identifier becomes five wrong answers.
+#
+# The member lists are botocore's OWN `required` metadata for the
+# `elasticache` model, and a real boto3 client refuses to send a request
+# without them (`delete_cache_cluster()` -> `ParamValidationError: Missing
+# required parameter in input: "CacheClusterId"`). `DescribeCacheClusters` is
+# deliberately absent: an id-less describe is a legitimate LIST.
+_REQUIRED: dict[str, str] = {
+    "CreateCacheCluster": "CacheClusterId",
+    "DeleteCacheCluster": "CacheClusterId",
+    "ModifyCacheCluster": "CacheClusterId",
+    "ListTagsForResource": "ResourceName",
+    "AddTagsToResource": "ResourceName",
+    "RemoveTagsFromResource": "ResourceName",
+}
+
+
+def _missing_identifier(op: str, params: dict[str, str]) -> str | None:
+    """The required identifier this request did not carry, or None."""
+    member = _REQUIRED.get(op, "")
+    return member if member and not params.get(member, "").strip() else None
+
 
 def pure_answer(
     action: str, resource: str, env: str, body: bytes, stores: SynthStores, now: float,
@@ -498,7 +539,11 @@ def pure_answer(
     handler = _HANDLERS.get(op)
     if handler is None:
         return errors.synth_error("elasticache", "InvalidAction", f"The action {op} is not valid.", 400)
-    return handler(_params(body), env, stores, now, cache or RedisCache())
+    params = _params(body)
+    missing = _missing_identifier(op, params)
+    if missing is not None:
+        return _invalid_parameter(f"{missing} is required")
+    return handler(params, env, stores, now, cache or RedisCache())
 
 
 # --- facts for consumers ----------------------------------------------------

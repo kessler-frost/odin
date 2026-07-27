@@ -367,3 +367,54 @@ def test_an_unknown_action_is_an_invalid_action_envelope(stores, cache):
     response = cachectl.pure_answer("elasticache:RebootCacheCluster", CLUSTER, ENV, b"", stores, 0.0)
     assert response is not None and response.status_code == 400
     assert b"InvalidAction" in response.body
+
+
+# --- a request that named NO cluster ---------------------------------------
+#
+# The logsctl/secretsctl/rdsctl defect in this module, and here NOT ONE handler
+# checked -- not even the create path. Measured against the real handlers with
+# `CacheClusterId` omitted:
+#
+#   DeleteCacheCluster -> 404 CacheClusterNotFound "CacheCluster not found: "
+#   CreateCacheCluster -> 200, having MINTED the store key `cluster:` with
+#                         `<CacheClusterId></CacheClusterId>` on the wire
+#
+# The second is not a message defect at all, it is a success odin did not
+# achieve -- a record keyed by nothing that no later call can name (ecsctl's
+# `taskdef::1`, exactly). ModifyCacheCluster and the tag ops then answered 200
+# ABOUT that nameless record, so one unchecked identifier produced five wrong
+# answers. `DescribeCacheClusters` stays ungated: an id-less describe is a
+# legitimate list, which is also what botocore's model says.
+
+
+@pytest.mark.parametrize("op,body,expected", [
+    ("CreateCacheCluster", b"Action=CreateCacheCluster&Engine=redis", "CacheClusterId"),
+    ("DeleteCacheCluster", b"Action=DeleteCacheCluster", "CacheClusterId"),
+    ("ModifyCacheCluster", b"Action=ModifyCacheCluster", "CacheClusterId"),
+    ("CreateCacheCluster", b"Action=CreateCacheCluster&CacheClusterId=", "CacheClusterId"),
+    ("CreateCacheCluster", b"Action=CreateCacheCluster&CacheClusterId=%20%20", "CacheClusterId"),
+    ("ListTagsForResource", b"Action=ListTagsForResource", "ResourceName"),
+    ("AddTagsToResource", b"Action=AddTagsToResource", "ResourceName"),
+    ("RemoveTagsFromResource", b"Action=RemoveTagsFromResource", "ResourceName"),
+])
+def test_a_request_that_named_no_cluster_says_so_instead_of_answering_about_nothing(
+    op, body, expected, stores, cache,
+):
+    response = cachectl.pure_answer(f"elasticache:{op}", "", ENV, body, stores, 0.0)
+    text = response.body.decode()
+
+    assert response.status_code == 400, text
+    assert "<Code>InvalidParameterValue</Code>" in text
+    assert f"<Message>{expected} is required</Message>" in text
+    assert "not found: <" not in text, "it must not blame a name that was never sent"
+    # ...and nothing was minted under a nameless key.
+    assert stores.cachectl.items(ENV) == {}
+
+
+def test_an_id_less_describe_is_still_a_legitimate_list(stores, sink, elasticache, cache):
+    """The gate must not turn the LIST call into an error -- `tofu refresh`
+    drives exactly this."""
+    _create(elasticache, sink, stores)
+    _settle(cache, stores)
+    listed = _parse("DescribeCacheClusters", _describe(elasticache, sink, stores))
+    assert [c["CacheClusterId"] for c in listed["CacheClusters"]] == [CLUSTER]

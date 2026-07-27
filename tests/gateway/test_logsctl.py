@@ -474,6 +474,82 @@ def test_create_log_group_without_a_name_is_invalid_parameter(stores):
     assert b"InvalidParameterException" in response.body
 
 
+# --- a request that named NO group (the eleven vacuous answers) -------------
+#
+# Every handler reads `payload.get(x) or ""` and exactly ONE of them
+# (CreateLogGroup, above) used to check the result. MEASURED by calling the real
+# handlers with the member omitted, eleven ops answered
+#
+#   400 ResourceNotFoundException "The specified log group does not exist: "
+#
+# -- a sentence ending in a dangling colon that blames a group name the caller
+# never sent. It is fixed ONCE, in `pure_answer`'s `_missing_identifier` gate,
+# rather than in eleven handlers, so this parametrisation is the whole surface.
+#
+# Which members are required is not a guess: they are botocore's OWN `required`
+# lists for the `logs` model, and a real boto3 client refuses to send a request
+# without them (`logs.delete_log_group()` -> `ParamValidationError: Missing
+# required parameter in input: "logGroupName"`), so only a raw HTTP client
+# reaches here. `DescribeLogGroups` is deliberately absent: a prefix-less list
+# is a legitimate call.
+
+_NAMELESS = [
+    ("DeleteLogGroup", {}, "logGroupName"),
+    ("PutRetentionPolicy", {"retentionInDays": 7}, "logGroupName"),
+    ("DeleteRetentionPolicy", {}, "logGroupName"),
+    ("CreateLogStream", {"logStreamName": "s"}, "logGroupName"),
+    ("PutLogEvents", {"logStreamName": "s", "logEvents": []}, "logGroupName"),
+    ("GetLogEvents", {"logStreamName": "s"}, "logGroupName"),
+    ("FilterLogEvents", {}, "logGroupName"),
+    ("DescribeLogStreams", {}, "logGroupName"),
+    ("ListTagsForResource", {}, "resourceArn"),
+    ("ListTagsLogGroup", {}, "resourceArn"),
+    ("TagResource", {"tags": {"a": "b"}}, "resourceArn"),
+    ("UntagResource", {"tagKeys": ["a"]}, "resourceArn"),
+    ("CreateLogGroup", {}, "logGroupName"),
+    # present-but-blank is the same defect wearing a different hat
+    ("DeleteLogGroup", {"logGroupName": ""}, "logGroupName"),
+    ("DeleteLogGroup", {"logGroupName": "   "}, "logGroupName"),
+    ("GetLogEvents", {"logGroupIdentifier": "", "logStreamName": "s"}, "logGroupName"),
+    ("CreateLogStream", {"logGroupName": "g"}, "logStreamName"),
+    ("PutLogEvents", {"logGroupName": "g", "logEvents": []}, "logStreamName"),
+    ("GetLogEvents", {"logGroupName": "g"}, "logStreamName"),
+]
+
+
+@pytest.mark.parametrize("op,payload,expected", _NAMELESS, ids=lambda v: str(v)[:40])
+def test_a_request_that_named_no_log_group_says_so_instead_of_blaming_the_name(op, payload, expected, stores):
+    response = synth.pure_answer(f"logs:{op}", "*", ENV, json.dumps(payload).encode(), stores, 0.0)
+    body = json.loads(response.body)
+    assert response.status_code == 400
+    assert body["__type"] == "InvalidParameterException", body
+    assert body["message"] == f"{expected} is required"
+    assert not body["message"].rstrip().endswith(":"), "nothing may trail off"
+    assert "does not exist" not in body["message"], "it must not blame a name that was never sent"
+
+
+def test_the_group_identifier_alternates_are_ONE_identifier_not_two(stores, sink, logs):
+    """`logGroupName` and `logGroupIdentifier` are two spellings of the same
+    thing (this module's `_group_from_arn` already accepts either), so a request
+    carrying EITHER must pass the gate -- otherwise the fix would reject calls
+    that worked before."""
+    _create_group(stores, sink, logs)
+    logsctl.ingest(stores, ENV, GROUP, STREAM, ["hello"])
+    by_identifier = synth.pure_answer(
+        "logs:FilterLogEvents", "*", ENV,
+        json.dumps({"logGroupIdentifier": logsctl.group_arn(GROUP)}).encode(), stores, 0.0,
+    )
+    assert by_identifier.status_code == 200
+    assert json.loads(by_identifier.body)["events"][0]["message"] == "hello"
+
+
+def test_the_substrate_ingestion_api_is_NOT_behind_the_gate(stores):
+    """`ingest`/`ingest_tail`/`ensure_group` are odin's own callers, never the
+    wire -- they already carry real names and must stay branch-free."""
+    assert logsctl.ingest(stores, ENV, GROUP, STREAM, ["a", "b"]) == 2
+    assert len(logsctl.stored_events(stores, ENV, GROUP, 10)) == 2
+
+
 def test_state_persists_at_the_logsctl_sidecar_path(sink, logs, stores, tmp_path):
     _create_group(stores, sink, logs)
     assert (tmp_path / ENV / "gateway" / "logsctl.json").exists()

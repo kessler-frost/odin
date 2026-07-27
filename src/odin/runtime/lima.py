@@ -32,7 +32,7 @@ from pathlib import Path
 from odin.compute.cloud_init import generate_cloud_init
 from odin.compute.lima_yaml import generate_lima_yaml
 from odin.compute.models import get_instance_type
-from odin.runtime.colima import HostFacts, _ContainerRuntime
+from odin.runtime.colima import HostFacts, _ContainerRuntime, _failure_reason
 
 # The Mac host as seen from INSIDE a Lima VM (an EC2 node is a Lima VM): Lima
 # auto-provides this alias, the guest-side counterpart to Colima's
@@ -49,9 +49,21 @@ class LimaRuntime(_ContainerRuntime):
     CLI = "nerdctl"
 
     def _lima(self, *args: str, check: bool = True, input: str | None = None) -> str:
+        """The OUTER seam (`limactl` itself), as opposed to `_argv`/`_cli`'s
+        inner one (`nerdctl` inside the VM).
+
+        Word-for-word the same failure text `compute/instances.py::_lima`
+        raises, from the same `_failure_reason`: these two were an exact
+        `f"limactl … failed: {stderr.strip()}"` twin, so they are fixed as a
+        twin rather than one at a time. See that method for the real limactl
+        2.1.3 probe -- four real invocations that exit non-zero with an empty
+        stderr, one of them with its reason on stdout."""
         proc = self._run(["limactl", *args], input=input)
         if check and proc.returncode != 0:
-            raise RuntimeError(f"limactl {' '.join(args)} failed: {proc.stderr.strip()}")
+            raise RuntimeError(
+                f"limactl {' '.join(args)} failed "
+                f"(exit {proc.returncode}): {_failure_reason(proc)}"
+            )
         return proc.stdout.strip()
 
     def _argv(self, *args: str) -> list[str]:
