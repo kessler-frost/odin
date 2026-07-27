@@ -202,11 +202,46 @@ reason to start calling it directly. On Python 3.13 the stdlib covers what
 concurrency, `asyncio.create_subprocess_exec` for async subprocesses,
 `asyncio.timeout`, `asyncio.Lock`. That is also what uvicorn/FastAPI run on.
 
-odin's remaining threads as of v0.7.6, all scheduled to go in v0.7.7: the
-gateway's own uvicorn (`serve_in_thread`), the substrate boot threads
-(`ec2compute._finish_boot`, `lambdactl`'s deploy thread, `ecsctl._launch_task`,
-`cachectl._finish_create`), and the `threading.Lock` per env in
-`gateway/stores.py` that exists because of them.
+**Status (v0.7.7 in flight, branch `v077-dethread`).** `asyncio.to_thread` is
+GONE from odin's own code — 0 call sites, down from 28. The gateway models'
+boot threads are `asyncio` tasks now (`gateway/models/__init__.py::background`,
+which holds a strong reference in a module-level set with a done-callback
+discard — a bare `create_task` reference can be garbage-collected mid-flight
+where a daemon thread could not). The locks that guarded sections containing
+no `await` were DELETED rather than ported. Still standing: `__main__.py`'s two
+log relays, `compute/instances.py`'s boot semaphore, `fabric/nebula.py`'s
+locks, `gateway/stores.py`, and `gateway/app.py::serve_in_thread` (documented
+test-only; production uses `serve_on_loop`).
+
+**Four failure modes this conversion creates. All are silent, none is caught
+by an ordinary test, and each now has a mutation-tested ratchet under
+`tests/` — read them before converting anything.**
+1. **A coroutine that blocks.** `await f()` on a SYNC function raises, so that
+   mistake reports itself. The reverse does not: an `async def` whose body
+   still blocks awaits happily and stalls the reconciler and gateway together.
+   A blocking `httpx.post(timeout=30)` reached the shared loop this way and
+   could DEADLOCK a re-entrant lambda invoke — measured 25.11s and a
+   `TimeoutError`, against 0.10s once fixed.
+2. **`await f(...).attr` reads the attribute off the COROUTINE.** `await` binds
+   looser than attribute access, subscription and calls. Nine real instances.
+   Two sat in `except` blocks, so they returned a plausible-looking degraded
+   answer instead of raising.
+3. **`create_task(await f())` schedules nothing** — `f` runs inline, and if `f`
+   loops forever the caller never returns. `Reconciler.start()` did exactly
+   that. A HANG is indistinguishable from "still working".
+4. **A `threading.Lock` held across an `await` is a DEADLOCK, not a stall.**
+   Task B blocks the whole loop in `lock.acquire()`, so task A can never be
+   resumed to release it. Verified: a repro's own `asyncio.timeout(2)` never
+   fired, because nothing was left to service it. The lock did not change —
+   there is just one thread to block now.
+
+Two more, learned the hard way: **typer SILENTLY DROPS an `async def` command**
+(measured on 0.26.7 — exit 0, body never runs, no output), so CLI entry points
+stay sync and bridge with `asyncio.run`; and **an `asyncio.Task` has no head
+start**, where `Thread.start()` runs immediately — any test asserting on state
+right after a converge call was always racy and the thread was hiding it. Await
+the task; never add a sleep, which restores the coincidence rather than the
+guarantee.
 
 ## Working in parallel (subagents and teammates)
 Hard-won mechanics. Ignoring these has already destroyed work in this repo.
