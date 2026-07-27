@@ -24,7 +24,6 @@ mount. `mesh_root` cleans up after itself.
 """
 from __future__ import annotations
 
-import asyncio
 import secrets
 import shutil
 import subprocess
@@ -111,7 +110,7 @@ async def test_a_drawn_sg_gates_real_postgres_traffic_over_the_overlay(mesh_root
     runtime = ColimaRuntime()
     lighthouse_cleanup.append((mesh_root, ENV))
     # What CreateVpc does when a canvas draws a VPC: the env's CA + overlay.
-    ensure_network(mesh_root, ENV, underlay_ip())
+    await ensure_network(mesh_root, ENV, underlay_ip())
 
     rds = PostgresRds(runtime, ENV, root=mesh_root)
     containers.append(rds.container_name("db"))
@@ -129,7 +128,7 @@ async def test_a_drawn_sg_gates_real_postgres_traffic_over_the_overlay(mesh_root
     host, port = await rds.endpoint("db")
     ready = None
     for _ in range(60):
-        ready = asyncio.run(pg_ready(host, port, "app", PASSWORD))
+        ready = await pg_ready(host, port, "app", PASSWORD)
         if ready.ok:
             break
     assert ready.ok, f"the HOST path must keep working: {ready.error}"

@@ -120,12 +120,12 @@ async def test_sqs_roundtrip(tmp_path, runtime):
         _wait(client, lambda p: p.get("jobs") == "healthy")
         assert f"/{ACCOUNT}/jobs" in _world(client)["jobs"]["facts"]["QUEUE_URL"]
 
-        sqs = _aws_for(client, runtime).client("sqs")
+        sqs = await _aws_for(client, runtime).client("sqs")
         url = sqs.get_queue_url(QueueName="jobs")["QueueUrl"]
         sqs.send_message(QueueUrl=url, MessageBody="hello-roundtrip")
         assert _receive(sqs, url) == "hello-roundtrip"
 
-        await _destroy(client)
+        _destroy(client)
     assert await own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"
 
 
@@ -141,7 +141,7 @@ async def test_sns_to_sqs_delivery(tmp_path, runtime):
         assert f":{ACCOUNT}:" in topic_arn
 
         aws = _aws_for(client, runtime)
-        sns, sqs = await aws.client("sns"), aws.client("sqs")
+        sns, sqs = await aws.client("sns"), await aws.client("sqs")
         sns.publish(TopicArn=topic_arn, Message="ping")
         jobs_url = sqs.get_queue_url(QueueName="jobs")["QueueUrl"]
         assert _receive(sqs, jobs_url) == "ping"  # raw delivery: body verbatim
@@ -168,7 +168,7 @@ async def test_sns_to_sqs_delivery(tmp_path, runtime):
         assert _receive(sqs, jobs_url) == "fanout"
         assert _receive(sqs, jobs2_url) == "fanout"
 
-        await _destroy(client)
+        _destroy(client)
     assert await own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"
 
 
@@ -179,12 +179,12 @@ async def test_dynamodb_put_get(tmp_path, runtime):
         _wait(client, lambda p: p.get("sessions") == "healthy")  # npx cold start is slow
         assert _world(client)["sessions"]["facts"]["TABLE"] == "sessions"
 
-        ddb = _aws_for(client, runtime).client("dynamodb")
+        ddb = await _aws_for(client, runtime).client("dynamodb")
         ddb.put_item(TableName="sessions", Item={"id": {"S": "u1"}, "val": {"S": "hello"}})
         item = ddb.get_item(TableName="sessions", Key={"id": {"S": "u1"}})["Item"]
         assert item["val"]["S"] == "hello"
 
-        await _destroy(client)
+        _destroy(client)
     assert await own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"
 
 
@@ -200,18 +200,19 @@ async def test_env_isolation(tmp_path, runtime):
         assert await runtime.status("odin-aws-rustfs-a") == "running"
         assert await runtime.status("odin-aws-rustfs-b") == "running"
         for env in ("a", "b"):
-            buckets = _aws_for(client, runtime, env).client("s3").list_buckets()["Buckets"]
+            s3 = await _aws_for(client, runtime, env).client("s3")
+            buckets = s3.list_buckets()["Buckets"]
             assert "uploads" in [b["Name"] for b in buckets]
 
         # Destroying a gc's ONLY a's backing; b keeps serving.
-        await _destroy(client, env="a")
+        _destroy(client, env="a")
         assert await runtime.status("odin-aws-rustfs-a") == "absent"
         assert await runtime.status("odin-aws-rustfs-b") == "running"
         assert _phases(client, env="b").get("uploads") == "healthy"
-        buckets = BackingAws(runtime, "b").client("s3").list_buckets()["Buckets"]
+        buckets = (await BackingAws(runtime, "b").client("s3")).list_buckets()["Buckets"]
         assert "uploads" in [b["Name"] for b in buckets]
 
-        await _destroy(client, env="b")
+        _destroy(client, env="b")
     assert await own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"
 
 
@@ -232,8 +233,8 @@ async def test_backing_crash_recovers(tmp_path, runtime):
 
         # ...and come back: the reconciler re-provisions, rebooting RustFS.
         _wait(client, lambda p: p.get("uploads") == "healthy", timeout=90)
-        buckets = BackingAws(runtime, "default").client("s3").list_buckets()["Buckets"]
+        buckets = (await BackingAws(runtime, "default").client("s3")).list_buckets()["Buckets"]
         assert "uploads" in [b["Name"] for b in buckets]
 
-        await _destroy(client)
+        _destroy(client)
     assert await own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"

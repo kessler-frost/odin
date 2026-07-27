@@ -14,7 +14,7 @@ class FakeRunner:
         self.calls: list[list[str]] = []
         self.responses: dict[str, _Proc] = {}
 
-    def __call__(self, args, input=None):
+    async def __call__(self, args, input=None):
         self.calls.append(args)
         joined = " ".join(args)
         for key, resp in self.responses.items():
@@ -54,7 +54,7 @@ async def test_status_and_exit_code_inspect_in_vm():
     rt = LimaRuntime(runner=runner)
     assert await rt.status("job") == "exited"
     assert await rt.exit_code("job") == 0
-    assert await rt.facts("job").phase == "crashed"  # exited -> crashed phase
+    assert (await rt.facts("job")).phase == "crashed"  # exited -> crashed phase
 
 
 async def test_build_pipes_the_dockerfile_through_limactl_shell_into_nerdctl():
@@ -63,9 +63,9 @@ async def test_build_pipes_the_dockerfile_through_limactl_shell_into_nerdctl():
             super().__init__()
             self.inputs: list[str | None] = []
 
-        def __call__(self, args, input=None):
+        async def __call__(self, args, input=None):
             self.inputs.append(input)
-            return super().__call__(args, input=input)
+            return await super().__call__(args, input=input)
 
     runner = RecordingRunner()
     rt = LimaRuntime(runner=runner)
@@ -87,7 +87,7 @@ async def test_image_exists_inspects_through_the_vm():
     assert await rt.image_exists("odin-dynalite:1") is True
 
 
-def test_logs_runs_nerdctl_logs_tail_in_the_vm():
+async def test_logs_runs_nerdctl_logs_tail_in_the_vm():
     # LimaRuntime.logs is inherited from _ContainerRuntime unchanged -- this
     # locks its exact command shape now that observability code depends on it.
     # `--timestamps` is what lets the two streams be merged chronologically
@@ -95,14 +95,14 @@ def test_logs_runs_nerdctl_logs_tail_in_the_vm():
     runner = FakeRunner()
     runner.responses["nerdctl logs"] = _Proc(0, "line1\nline2\n")
     rt = LimaRuntime(runner=runner)
-    assert rt.logs("job", tail=5) == "line1\nline2"
+    assert await rt.logs("job", tail=5) == "line1\nline2"
     logs_call = next(c for c in runner.calls if "logs" in c)
     assert logs_call == [
         "limactl", "shell", "odin-host", "sudo", "nerdctl", "logs", "--timestamps", "--tail", "5", "job",
     ]
 
 
-def test_logs_in_the_vm_keeps_the_containers_stderr_half_too():
+async def test_logs_in_the_vm_keeps_the_containers_stderr_half_too():
     # The nerdctl side of field test 2's HIGH-3: an nginx/Postgres inside the
     # shared VM logs to stderr, and `limactl shell` hands that back on ITS
     # stderr.
@@ -112,7 +112,9 @@ def test_logs_in_the_vm_keeps_the_containers_stderr_half_too():
         "2026-07-25T14:00:01.000000000Z started\n",
         "2026-07-25T14:00:02.000000000Z crashed: bad config\n",
     )
-    assert LimaRuntime(runner=runner).logs("job").splitlines() == ["started", "crashed: bad config"]
+    assert (await LimaRuntime(runner=runner).logs("job")).splitlines() == [
+        "started", "crashed: bad config",
+    ]
 
 
 async def test_image_exists_false_on_dockers_empty_array_stdout():
@@ -137,11 +139,12 @@ async def test_image_exists_false_on_dockers_empty_array_stdout():
 # ONE `_failure_reason`, so the two cannot drift apart again.
 
 
-def test_a_limactl_failure_with_no_output_names_the_exit_code():
+async def test_a_limactl_failure_with_no_output_names_the_exit_code():
     runner = FakeRunner()
     runner.responses["limactl create"] = _Proc(3, "", "")
     with pytest.raises(RuntimeError) as raised:
-        LimaRuntime(runner=runner)._lima("create", "--tty=false", "--name=odin-host", "/tmp/x.yaml")
+        await LimaRuntime(runner=runner)._lima(
+            "create", "--tty=false", "--name=odin-host", "/tmp/x.yaml")
     message = str(raised.value)
     assert message == (
         "limactl create --tty=false --name=odin-host /tmp/x.yaml failed (exit 3): "
@@ -150,23 +153,23 @@ def test_a_limactl_failure_with_no_output_names_the_exit_code():
     assert not message.rstrip().endswith(":")
 
 
-def test_a_limactl_failure_that_spoke_on_stdout_is_not_reported_as_silent():
+async def test_a_limactl_failure_that_spoke_on_stdout_is_not_reported_as_silent():
     runner = FakeRunner()
     runner.responses["limactl start"] = _Proc(7, "on-stdout\n", "")
     with pytest.raises(RuntimeError) as raised:
-        LimaRuntime(runner=runner)._lima("start", "odin-host")
+        await LimaRuntime(runner=runner)._lima("start", "odin-host")
     assert str(raised.value) == (
         "limactl start odin-host failed (exit 7): nothing on stderr; on stdout: on-stdout"
     )
 
 
-def test_ensure_host_surfaces_a_real_limactl_error_with_its_exit_code():
+async def test_ensure_host_surfaces_a_real_limactl_error_with_its_exit_code():
     """The reachable path: `ensure_host` creates+starts the shared VM with
     `check=True`, so this text is what a caller actually sees."""
     runner = FakeRunner()
     runner.responses["limactl start"] = _Proc(1, "", 'level=fatal msg="no such template"\n')
     with pytest.raises(RuntimeError) as raised:
-        LimaRuntime(runner=runner).ensure_host()
+        await LimaRuntime(runner=runner).ensure_host()
     assert str(raised.value) == (
         'limactl start odin-host failed (exit 1): level=fatal msg="no such template"'
     )

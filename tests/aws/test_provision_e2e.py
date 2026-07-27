@@ -24,7 +24,7 @@ async def runtime():
         await rt.stop(name)
 
 
-def test_s3_node_provisions_bucket(tmp_path, runtime):
+async def test_s3_node_provisions_bucket(tmp_path, runtime):
     app = create_app(runtime=runtime, store=SpecStore(tmp_path))
     with TestClient(app) as client:
         client.post("/apply", json=CANVAS)
@@ -35,6 +35,6 @@ def test_s3_node_provisions_bucket(tmp_path, runtime):
                 break
             time.sleep(1)
         assert ph.get("uploads") == "healthy"
-        s3 = BackingAws(runtime, ENV).client("s3")
+        s3 = await BackingAws(runtime, ENV).client("s3")
         names = [b["Name"] for b in s3.list_buckets()["Buckets"]]
         assert "uploads" in names

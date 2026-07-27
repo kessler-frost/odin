@@ -44,7 +44,7 @@ class FakeRunner:
     def __init__(self):
         self.calls: list[list[str]] = []
 
-    def __call__(self, args, input=None):
+    async def __call__(self, args, input=None):
         self.calls.append(args)
         for flag in ("-out-crt", "-out-key"):
             if flag in args:
@@ -152,11 +152,11 @@ async def test_disabled_without_a_nebula_network(tmp_path):
     assert runtime.specs == [] and runtime.stopped == []
 
 
-def test_env_var_disables_even_with_a_network(tmp_path, monkeypatch):
-    ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
+async def test_env_var_disables_even_with_a_network(tmp_path, monkeypatch):
+    await ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
     monkeypatch.setenv("ODIN_BACKING_MESH", "0")
     runtime = FakeRuntime()
-    assert _sidecar(tmp_path, runtime).ensure(TARGET, MEMBER) is None
+    assert await _sidecar(tmp_path, runtime).ensure(TARGET, MEMBER) is None
     assert runtime.specs == []
 
 
@@ -164,7 +164,7 @@ def test_env_var_disables_even_with_a_network(tmp_path, monkeypatch):
 
 
 async def test_ensure_joins_the_backing_via_a_shared_network_namespace(tmp_path):
-    ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
+    await ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
     runtime, lighthouse = FakeRuntime(), FakeLighthouse()
     mesh = MeshSidecar(runtime, ENV, tmp_path, lighthouse=lighthouse, runner=FakeRunner())
 
@@ -187,7 +187,7 @@ async def test_ensure_joins_the_backing_via_a_shared_network_namespace(tmp_path)
 
 
 async def test_ensure_writes_cert_material_and_a_gated_config(tmp_path):
-    ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
+    await ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
     mesh = _sidecar(tmp_path)
     await mesh.ensure(TARGET, MEMBER, firewall=DB_FIREWALL)
 
@@ -207,7 +207,7 @@ async def test_ensure_writes_cert_material_and_a_gated_config(tmp_path):
 async def test_ensure_without_a_firewall_is_allow_all_not_deny_all(tmp_path):
     """A backing with no SG drawn must stay reachable on the overlay -- an
     empty inbound list would silently mean "deny everything"."""
-    ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
+    await ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
     mesh = _sidecar(tmp_path)
     await mesh.ensure(TARGET, MEMBER)
     config = yaml.safe_load((tmp_path / ENV / "nebula" / "members" / MEMBER / "config.yml").read_text())
@@ -215,7 +215,7 @@ async def test_ensure_without_a_firewall_is_allow_all_not_deny_all(tmp_path):
 
 
 async def test_overlay_ip_is_sticky_and_readable_without_side_effects(tmp_path):
-    ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
+    await ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
     mesh = _sidecar(tmp_path)
     first = await mesh.ensure(TARGET, MEMBER)
     assert mesh.overlay_ip(MEMBER) == first
@@ -227,7 +227,7 @@ async def test_overlay_ip_is_sticky_and_readable_without_side_effects(tmp_path):
 
 
 async def test_builds_the_nebula_image_once_when_missing(tmp_path):
-    ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
+    await ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
     runtime = FakeRuntime(images=())
     mesh = _sidecar(tmp_path, runtime)
     await mesh.ensure(TARGET, MEMBER)
@@ -239,7 +239,7 @@ async def test_builds_the_nebula_image_once_when_missing(tmp_path):
 
 
 async def test_unchanged_join_does_not_restart_the_sidecar(tmp_path):
-    ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
+    await ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
     runtime = FakeRuntime()
     mesh = _sidecar(tmp_path, runtime)
     await mesh.ensure(TARGET, MEMBER, firewall=DB_FIREWALL)
@@ -256,7 +256,7 @@ async def test_changed_firewall_reloads_the_sidecar_in_place(tmp_path):
     membership revision lives in this same block and moves far more often than
     a rule does, so a restart here would be a restart on every membership
     change anywhere in the env."""
-    ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
+    await ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
     runtime = FakeRuntime()
     mesh = _sidecar(tmp_path, runtime)
     await mesh.ensure(TARGET, MEMBER, firewall=DB_FIREWALL)
@@ -276,7 +276,7 @@ async def test_a_change_outside_the_firewall_still_replaces_the_daemon(tmp_path)
     NOT reload `static_host_map`/`lighthouse`/`relay`. A moved lighthouse port
     is exactly that case, and answering it with a reload would be a lie: the
     sidecar would go on dialing a port nobody is listening on."""
-    ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
+    await ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
     runtime = FakeRuntime()
     mesh = _sidecar(tmp_path, runtime)
     await mesh.ensure(TARGET, MEMBER, firewall=DB_FIREWALL)
@@ -300,7 +300,7 @@ async def test_the_membership_revision_rides_in_the_firewall_block_and_reloads(t
     All three properties in one test, because they are one contract: the value
     is rendered where nebula looks for firewall config, an unchanged one costs
     nothing, and a changed one is a SIGHUP rather than a restart."""
-    ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
+    await ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
     runtime = FakeRuntime()
     mesh = _sidecar(tmp_path, runtime)
     await mesh.ensure(TARGET, MEMBER, firewall=DB_FIREWALL, revision="rev-one")
@@ -325,7 +325,7 @@ async def test_no_revision_renders_no_key_at_all(tmp_path):
     """An env that has never seen a membership change must render exactly the
     bytes it rendered before this existed -- otherwise shipping the fix would
     itself churn every sidecar on the first Apply after an upgrade."""
-    ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
+    await ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
     mesh = _sidecar(tmp_path, FakeRuntime())
     await mesh.ensure(TARGET, MEMBER, firewall=DB_FIREWALL)
     config = yaml.safe_load((tmp_path / ENV / "nebula" / "members" / MEMBER / "config.yml").read_text())
@@ -339,7 +339,7 @@ async def test_a_replaced_target_container_gets_a_fresh_sidecar(tmp_path):
     is unreachable" forever. The config was byte-identical and the sidecar
     container was still `running`, so the old idempotence test short-circuited
     and no Apply could ever heal it."""
-    ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
+    await ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
     runtime = FakeRuntime()
     await runtime.start_target(TARGET)
     mesh = _sidecar(tmp_path, runtime)
@@ -360,7 +360,7 @@ async def test_an_unchanged_target_does_not_churn_the_sidecar(tmp_path):
     """The other half of the same fix -- one bug must not be traded for a
     restart-every-tick bug (`ensure_db_mesh` runs on every Apply, and the
     mesh health sweep re-checks this on its own cadence)."""
-    ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
+    await ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
     runtime = FakeRuntime()
     await runtime.start_target(TARGET)
     mesh = _sidecar(tmp_path, runtime)
@@ -374,7 +374,7 @@ async def test_attached_to_is_unknown_rather_than_false_when_the_target_is_gone(
     """A target the runtime can't report on (never started, docker hiccup) is
     NOT evidence of a replacement -- churning a sidecar on no evidence would
     be a self-inflicted restart loop."""
-    ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
+    await ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
     runtime = FakeRuntime()
     mesh = _sidecar(tmp_path, runtime)
     await mesh.ensure(TARGET, MEMBER, firewall=DB_FIREWALL)
@@ -384,7 +384,7 @@ async def test_attached_to_is_unknown_rather_than_false_when_the_target_is_gone(
 
 
 async def test_a_dead_sidecar_is_restarted_even_with_an_unchanged_config(tmp_path):
-    ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
+    await ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
     runtime = FakeRuntime()
     mesh = _sidecar(tmp_path, runtime)
     await mesh.ensure(TARGET, MEMBER, firewall=DB_FIREWALL)
@@ -397,7 +397,7 @@ async def test_certs_are_signed_once_per_member(tmp_path):
     """`ensure` runs on every ensure_backing and every reconciler tick -- a
     `nebula-cert` subprocess each time would be pure waste."""
     runner = FakeRunner()
-    ensure_network(tmp_path, ENV, "127.0.0.1", runner=runner)
+    await ensure_network(tmp_path, ENV, "127.0.0.1", runner=runner)
     mesh = _sidecar(tmp_path, runner=runner)
     await mesh.ensure(TARGET, MEMBER)
     await mesh.ensure(TARGET, MEMBER)
@@ -412,7 +412,7 @@ async def test_a_changed_membership_re_issues_the_cert_and_restarts_the_sidecar(
     VM's: re-sign, then restart, because a peer caches the identity of every
     tunnel it holds."""
     runner = FakeRunner()
-    ensure_network(tmp_path, ENV, "127.0.0.1", runner=runner)
+    await ensure_network(tmp_path, ENV, "127.0.0.1", runner=runner)
     runtime = FakeRuntime()
     await runtime.start_target(TARGET)
     mesh = _sidecar(tmp_path, runtime, runner=runner)
@@ -432,7 +432,7 @@ async def test_a_changed_membership_re_issues_the_cert_and_restarts_the_sidecar(
 
 async def test_an_unchanged_membership_does_not_re_issue_or_restart(tmp_path):
     runner = FakeRunner()
-    ensure_network(tmp_path, ENV, "127.0.0.1", runner=runner)
+    await ensure_network(tmp_path, ENV, "127.0.0.1", runner=runner)
     runtime = FakeRuntime()
     await runtime.start_target(TARGET)
     mesh = _sidecar(tmp_path, runtime, runner=runner)
@@ -449,7 +449,7 @@ async def test_a_restarted_sidecar_pokes_its_peers_to_re_handshake(tmp_path):
     overlay address did not answer because peers were still using the tunnel
     that had just died. The restarted member moves first."""
     runner = FakeRunner()
-    ensure_network(tmp_path, ENV, "127.0.0.1", runner=runner)
+    await ensure_network(tmp_path, ENV, "127.0.0.1", runner=runner)
     runtime = FakeRuntime()
     await runtime.start_target(TARGET)
     mesh = _sidecar(tmp_path, runtime, runner=runner)
@@ -473,29 +473,29 @@ async def test_a_restarted_sidecar_pokes_its_peers_to_re_handshake(tmp_path):
 
 async def test_a_lone_member_has_nobody_to_poke(tmp_path):
     runner = FakeRunner()
-    ensure_network(tmp_path, ENV, "127.0.0.1", runner=runner)
+    await ensure_network(tmp_path, ENV, "127.0.0.1", runner=runner)
     runtime = FakeRuntime()
     await runtime.start_target(TARGET)
-    _sidecar(tmp_path, runtime, runner=runner).ensure(TARGET, MEMBER, firewall=DB_FIREWALL)
+    await _sidecar(tmp_path, runtime, runner=runner).ensure(TARGET, MEMBER, firewall=DB_FIREWALL)
     assert runtime.probes == []
 
 
 # --- leaving + failure behavior ------------------------------------------------
 
 
-def test_stop_takes_the_backing_off_the_mesh(tmp_path):
+async def test_stop_takes_the_backing_off_the_mesh(tmp_path):
     runtime = FakeRuntime()
-    _sidecar(tmp_path, runtime).stop(TARGET)
+    await _sidecar(tmp_path, runtime).stop(TARGET)
     assert runtime.stopped == [f"{TARGET}-mesh"]
 
 
-def test_ensure_never_raises_when_the_runtime_explodes(tmp_path):
+async def test_ensure_never_raises_when_the_runtime_explodes(tmp_path):
     """Mesh wiring must never fail an otherwise-healthy backing -- the host
     path still works (same rule as `InstanceVm._activate_nebula`)."""
-    ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
+    await ensure_network(tmp_path, ENV, "127.0.0.1", runner=FakeRunner())
 
     class Exploding(FakeRuntime):
-        def run_container(self, spec):
+        async def run_container(self, spec):
             raise RuntimeError("no /dev/net/tun")
 
-    assert _sidecar(tmp_path, Exploding()).ensure(TARGET, MEMBER) is None
+    assert await _sidecar(tmp_path, Exploding()).ensure(TARGET, MEMBER) is None

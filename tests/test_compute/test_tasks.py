@@ -39,18 +39,18 @@ def _container_def() -> dict:
     }
 
 
-def test_run_without_extra_env_uses_the_taskdef_environment_alone():
+async def test_run_without_extra_env_uses_the_taskdef_environment_alone():
     runtime = FakeRuntime()
-    TaskRuntime(runtime).run(ENV, TASK_ID, _container_def())
+    await TaskRuntime(runtime).run(ENV, TASK_ID, _container_def())
     (spec,) = runtime.runs
     assert spec.name == container_name(ENV, TASK_ID, "app")
     assert spec.env == {"FOO": "bar", "AWS_ACCESS_KEY_ID": "user-set"}
 
 
-def test_run_layers_extra_env_on_top_and_odin_wins_name_collisions():
+async def test_run_layers_extra_env_on_top_and_odin_wins_name_collisions():
     runtime = FakeRuntime()
     container_def = _container_def()
-    TaskRuntime(runtime).run(ENV, TASK_ID, container_def, extra_env={
+    await TaskRuntime(runtime).run(ENV, TASK_ID, container_def, extra_env={
         "AWS_ACCESS_KEY_ID": "AKODINxxxxxxxxxxxxxx",
         "AWS_ENDPOINT_URL": "http://host.docker.internal:4266",
     })
@@ -68,20 +68,20 @@ def test_run_layers_extra_env_on_top_and_odin_wins_name_collisions():
 # --- owner directive B4: memory/cpu caps, from the taskdef when present -----
 
 
-def test_run_defaults_memory_and_cpu_when_the_taskdef_sets_neither():
+async def test_run_defaults_memory_and_cpu_when_the_taskdef_sets_neither():
     # v1's ECS canvas builder (agent/hcl.py) never emits cpu/memory on the
     # taskdef today -- this default is what actually caps every canvas-drawn
     # ECS node until it does.
     runtime = FakeRuntime()
-    TaskRuntime(runtime).run(ENV, TASK_ID, _container_def())
+    await TaskRuntime(runtime).run(ENV, TASK_ID, _container_def())
     (spec,) = runtime.runs
     assert spec.memory_mib == 512.0
     assert spec.cpus == 1.0
 
 
-def test_run_uses_the_taskdefs_own_cpu_and_memory_when_set():
+async def test_run_uses_the_taskdefs_own_cpu_and_memory_when_set():
     runtime = FakeRuntime()
-    TaskRuntime(runtime).run(ENV, TASK_ID, _container_def(), cpu="2048", memory="1024")
+    await TaskRuntime(runtime).run(ENV, TASK_ID, _container_def(), cpu="2048", memory="1024")
     (spec,) = runtime.runs
     assert spec.memory_mib == 1024.0
     assert spec.cpus == 2.0  # 2048 CPU units == 2 vCPUs

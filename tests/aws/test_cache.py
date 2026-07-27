@@ -91,10 +91,15 @@ class _FakeRedis:
         self._thread = threading.Thread(target=self._serve, daemon=True)
         self._thread.start()
 
-    async def _serve(self) -> None:
+    def _serve(self) -> None:
+        # A REAL blocking accept loop on a REAL thread, deliberately: the code
+        # under test (`aws/cache.py::resp_call`/`ping`/`engine_version`) is
+        # synchronous socket work, so its counterparty has to block too. This
+        # is test scaffolding standing in for a Redis server, not odin runtime
+        # code -- the no-threads directive is about odin's own concurrency.
         while not self._stop:
             try:
-                conn, _ = await self._sock.accept()
+                conn, _ = self._sock.accept()
             except OSError:
                 return
             threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
@@ -192,10 +197,10 @@ async def test_ensure_boots_redis_and_returns_the_published_port(redis_server):
     assert spec.memory_mib == DEFAULT_MEMORY_MIB  # owner directive B4: always capped
 
 
-def test_ensure_clears_an_exited_remnant_first(redis_server):
+async def test_ensure_clears_an_exited_remnant_first(redis_server):
     runtime = FakeRuntime(next_port=redis_server.port)
     runtime.statuses[container_name(ENV, CLUSTER)] = "exited"
-    RedisCache(runtime=runtime, poll_interval=0.01).ensure(ENV, CLUSTER)
+    await RedisCache(runtime=runtime, poll_interval=0.01).ensure(ENV, CLUSTER)
     assert runtime.stopped == [container_name(ENV, CLUSTER)]
 
 
@@ -306,6 +311,6 @@ async def test_status_host_port_and_delete_track_the_container(redis_server):
     await cache.ensure(ENV, CLUSTER)
     assert await cache.status(ENV, CLUSTER) == "running"
     assert await cache.host_port(ENV, CLUSTER) == redis_server.port
-    cache.delete(ENV, CLUSTER)
+    await cache.delete(ENV, CLUSTER)
     assert await cache.status(ENV, CLUSTER) == "absent"
     assert await cache.host_port(ENV, CLUSTER) == 0

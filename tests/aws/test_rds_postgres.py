@@ -1,6 +1,7 @@
 """PostgresRds: rds nodes as direct Postgres containers (no emulator)."""
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass, field
 
@@ -40,9 +41,9 @@ def test_container_name_is_env_scoped():
     assert rds.container_name("db") == "odin-rds-staging-db"
 
 
-def test_create_db_runs_postgres_with_creds_and_dynamic_port():
+async def test_create_db_runs_postgres_with_creds_and_dynamic_port():
     rt = FakeRuntime()
-    PostgresRds(rt, env="default").create_db("db", "app", "s3cret")
+    await PostgresRds(rt, env="default").create_db("db", "app", "s3cret")
     spec = rt.runs[0]
     assert spec.name == "odin-rds-default-db"
     assert spec.image.startswith("postgres:16")
@@ -103,7 +104,7 @@ async def test_create_db_boots_real_postgres_select_1():
                     return
                 except psycopg2.OperationalError as exc:
                     last = exc
-            time.sleep(2)
+            await asyncio.sleep(2)
         raise AssertionError(f"postgres never became ready: {last}")
     finally:
         await rds.delete_db("db")

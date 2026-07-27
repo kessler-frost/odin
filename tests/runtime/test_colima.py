@@ -4,6 +4,7 @@ Marked `integration`: needs a running Colima/Docker. Run with `-m integration`.
 """
 from __future__ import annotations
 
+import asyncio
 import time
 
 import pytest
@@ -32,7 +33,7 @@ async def _wait_running(rt: ColimaRuntime, name: str, timeout: float = 30.0) -> 
     while time.monotonic() < deadline:
         if await rt.status(name) == "running":
             return
-        time.sleep(0.5)
+        await asyncio.sleep(0.5)
     raise AssertionError(f"{name} not running within {timeout}s (status={await rt.status(name)})")
 
 
@@ -86,18 +87,18 @@ async def test_a_container_that_logs_only_to_stderr_still_yields_real_lines(post
     await _wait_running(postgres, PG)
     # A settled Postgres writes its server log (ready / checkpoint / errors) to
     # stderr; wait for it to get past initdb's stdout half.
-    time.sleep(12)
+    await asyncio.sleep(12)
 
     raw = await postgres._run(["docker", "logs", "--tail", "10", PG])
     assert raw.stderr.strip(), "the field premise: this container's log tail is on stderr"
 
-    ten = postgres.logs(PG, tail=10)
+    ten = await postgres.logs(PG, tail=10)
     assert ten.strip(), "odin must not report an empty log for a container that logs on stderr"
     assert len(ten.splitlines()) == 10, "--tail 10 must mean 10 real lines, not 10-minus-stderr"
 
     store = SpecStore(tmp_path)
     store.apply(Stack(env="logproof", resources=(ResourceDesired(id="appdb", kind="rds"),)))
-    result = fetch_logs(store, SynthStores(tmp_path), postgres, "logproof", "appdb", tail=10)
+    result = await fetch_logs(store, SynthStores(tmp_path), postgres, "logproof", "appdb", tail=10)
     assert result.found and result.running and result.sources == [PG]
     assert len(result.lines.splitlines()) == 10
     assert "database system is ready to accept connections" in result.lines

@@ -228,7 +228,7 @@ async def test_it_does_not_block_the_event_loop():
             await asyncio.sleep(0.01)
             ticks += 1
 
-    ticker = asyncio.create_task(await tick())
+    ticker = asyncio.create_task(tick())
     result = await util.run_command_async(["sh", "-c", "sleep 0.3; echo done"])
     ticker.cancel()
 
@@ -241,8 +241,8 @@ def test_run_command_feeds_stdin():
     assert (result.returncode, result.stdout) == (0, "piped")
 
 
-def test_colima_runtime_survives_a_missing_docker_cli(monkeypatch: pytest.MonkeyPatch):
+async def test_colima_runtime_survives_a_missing_docker_cli(monkeypatch: pytest.MonkeyPatch):
     """The seam fix, end to end: with nothing named `docker` on PATH,
     `ensure_host()` answers "I don't know" instead of raising."""
     monkeypatch.setenv("PATH", "/nonexistent")
-    assert ColimaRuntime().ensure_host().total_mem_mib == 0
+    assert (await ColimaRuntime().ensure_host()).total_mem_mib == 0

@@ -15,6 +15,7 @@ the parser again. These run against a real container inside a real VM.
 """
 from __future__ import annotations
 
+import asyncio
 import time
 
 import pytest
@@ -35,7 +36,7 @@ HOST_PORT = 18080
 async def _await_running(rt: LimaRuntime, name: str, timeout: float = 60.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline and await rt.status(name) != "running":
-        time.sleep(2)
+        await asyncio.sleep(2)
 
 
 @pytest.fixture(scope="module")
@@ -78,7 +79,7 @@ async def test_host_port_reads_a_real_published_port_through_nerdctl(lima):
     await _await_running(lima, PORT_NAME)
 
     assert await lima.host_port(PORT_NAME, INSIDE_PORT) == HOST_PORT
-    assert await lima.facts(PORT_NAME, container_port=INSIDE_PORT).host_port == HOST_PORT
+    assert (await lima.facts(PORT_NAME, container_port=INSIDE_PORT)).host_port == HOST_PORT
 
 
 async def test_host_port_is_zero_when_nerdctl_answers_and_nothing_is_published(lima):

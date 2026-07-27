@@ -220,14 +220,14 @@ def test_conf_path_lands_under_env_gateway_alb_lb():
 # --- ensure: first create ---------------------------------------------------
 
 
-def test_ensure_first_create_runs_nginx_then_copies_the_config_in(tmp_path):
+async def test_ensure_first_create_runs_nginx_then_copies_the_config_in(tmp_path):
     runtime = FakeRuntime(next_ports={80: 32768, 443: 32769})
     listeners = (
         _listener(80, upstream="odin_tg_a", targets=(TARGETS[0],)),
         _listener(443, upstream="odin_tg_b", targets=(TARGETS[1],)),
     )
 
-    published = LoadBalancerProxy(runtime).ensure(tmp_path, ENV, LB, listeners)
+    published = await LoadBalancerProxy(runtime).ensure(tmp_path, ENV, LB, listeners)
 
     # The returned map is what elbv2ctl records as the lb's endpoints: the
     # LISTEN port -> the host port Docker actually picked.
@@ -273,12 +273,12 @@ def test_ensure_first_create_runs_nginx_then_copies_the_config_in(tmp_path):
     assert copy == ("copy_in", NAME, str(host_conf), CONF_PATH_IN_CONTAINER)
 
 
-def test_ensure_with_no_listeners_still_publishes_the_idle_port(tmp_path):
+async def test_ensure_with_no_listeners_still_publishes_the_idle_port(tmp_path):
     # CreateLoadBalancer runs before CreateListener, so this is the state right
     # after a canvas-drawn ALB appears: one container, one 503 listener.
     runtime = FakeRuntime(next_ports={IDLE_LISTEN_PORT: 32700})
 
-    published = LoadBalancerProxy(runtime).ensure(tmp_path, ENV, LB, ())
+    published = await LoadBalancerProxy(runtime).ensure(tmp_path, ENV, LB, ())
 
     assert published == {IDLE_LISTEN_PORT: 32700}
     (spec,) = runtime.runs
@@ -288,11 +288,11 @@ def test_ensure_with_no_listeners_still_publishes_the_idle_port(tmp_path):
 # --- ensure: reload vs recreate --------------------------------------------
 
 
-def test_ensure_reloads_with_a_hup_when_the_container_already_publishes_every_port(tmp_path):
+async def test_ensure_reloads_with_a_hup_when_the_container_already_publishes_every_port(tmp_path):
     runtime = FakeRuntime(statuses={NAME: "running"}, ports={(NAME, 80): 32768})
     listeners = (_listener(80, targets=TARGETS),)
 
-    published = LoadBalancerProxy(runtime).ensure(tmp_path, ENV, LB, listeners)
+    published = await LoadBalancerProxy(runtime).ensure(tmp_path, ENV, LB, listeners)
 
     assert published == {80: 32768}
     # Zero downtime: the config is rewritten and copied in, then nginx re-reads
@@ -305,7 +305,7 @@ def test_ensure_reloads_with_a_hup_when_the_container_already_publishes_every_po
     assert conf_path(tmp_path, ENV, LB).read_text() == render_conf(listeners)
 
 
-def test_ensure_recreates_when_a_wanted_port_is_not_published_yet(tmp_path):
+async def test_ensure_recreates_when_a_wanted_port_is_not_published_yet(tmp_path):
     # The LISTENER SET changed (a second listener appeared): the container is
     # running and healthy, but Docker cannot add a published port to a live
     # container, so the only honest converge is remove-and-re-run.
@@ -318,7 +318,7 @@ def test_ensure_recreates_when_a_wanted_port_is_not_published_yet(tmp_path):
         _listener(443, upstream="odin_tg_b", targets=(TARGETS[1],)),
     )
 
-    published = LoadBalancerProxy(runtime).ensure(tmp_path, ENV, LB, listeners)
+    published = await LoadBalancerProxy(runtime).ensure(tmp_path, ENV, LB, listeners)
 
     assert published == {80: 32768, 443: 32769}
     assert runtime.sequence() == [
@@ -331,7 +331,7 @@ def test_ensure_recreates_when_a_wanted_port_is_not_published_yet(tmp_path):
     assert [spec.name for spec in runtime.runs] == [NAME]
 
 
-def test_ensure_recreates_a_crashed_container_rather_than_signalling_it(tmp_path):
+async def test_ensure_recreates_a_crashed_container_rather_than_signalling_it(tmp_path):
     # `docker kill -s HUP` on an exited container reloads nothing; the only way
     # back to serving is a re-run. No port is read off the exited container --
     # real docker answers `{}` for one, so the read could only ever say 0.
@@ -339,7 +339,7 @@ def test_ensure_recreates_a_crashed_container_rather_than_signalling_it(tmp_path
         statuses={NAME: "exited"}, ports={(NAME, 80): 32768}, next_ports={80: 32768},
     )
 
-    LoadBalancerProxy(runtime).ensure(tmp_path, ENV, LB, (_listener(80),))
+    await LoadBalancerProxy(runtime).ensure(tmp_path, ENV, LB, (_listener(80),))
 
     assert runtime.sequence() == [
         "status", "stop", "run_container", "copy_in", "host_port",
@@ -354,7 +354,7 @@ def test_ensure_recreates_a_crashed_container_rather_than_signalling_it(tmp_path
 # `http://127.0.0.1:0` behind a load balancer reporting `active`/healthy.
 
 
-def test_ensure_refuses_to_return_a_zero_port_from_the_recreate_path(tmp_path):
+async def test_ensure_refuses_to_return_a_zero_port_from_the_recreate_path(tmp_path):
     # The container the daemon started is gone by the time its ports are read --
     # nginx rejecting the rendered config and exiting is the real way this
     # happens, and real docker then reports the port map as `{}` (measured:
@@ -364,7 +364,7 @@ def test_ensure_refuses_to_return_a_zero_port_from_the_recreate_path(tmp_path):
     })
 
     with pytest.raises(PortsUnpublished) as raised:
-        LoadBalancerProxy(runtime).ensure(tmp_path, ENV, LB, (_listener(80),))
+        await LoadBalancerProxy(runtime).ensure(tmp_path, ENV, LB, (_listener(80),))
 
     # Honesty rule 2: the reason names the resource, its real state, and WHY --
     # not just "failed". `elbv2ctl._converge_safely` stores this as the load
@@ -376,19 +376,19 @@ def test_ensure_refuses_to_return_a_zero_port_from_the_recreate_path(tmp_path):
     assert "invalid parameter" in message
 
 
-def test_ensure_refuses_a_zero_port_even_when_only_one_listener_is_dead(tmp_path):
+async def test_ensure_refuses_a_zero_port_even_when_only_one_listener_is_dead(tmp_path):
     # All-or-nothing: a load balancer with a live :80 and a dead :443 has no
     # honest `endpoints` map to publish, because a consumer that resolves the
     # second one gets a dead address.
     runtime = FakeRuntime(next_ports={80: 32768})  # 443 publishes nothing
 
     with pytest.raises(PortsUnpublished) as raised:
-        LoadBalancerProxy(runtime).ensure(tmp_path, ENV, LB, (_listener(80), _listener(443)))
+        await LoadBalancerProxy(runtime).ensure(tmp_path, ENV, LB, (_listener(80), _listener(443)))
 
     assert "[443]" in str(raised.value)
 
 
-def test_ensure_never_returns_a_zero_port_on_the_reload_path_either(tmp_path):
+async def test_ensure_never_returns_a_zero_port_on_the_reload_path_either(tmp_path):
     # The SHAPE, not the instance: the reload path carried this check inline
     # (`all(published.values())`) while the recreate path had none. Both now
     # return through the same gate, so a running container that has lost a
@@ -397,12 +397,12 @@ def test_ensure_never_returns_a_zero_port_on_the_reload_path_either(tmp_path):
     runtime = FakeRuntime(statuses={NAME: "running"}, ports={(NAME, 80): 0})
 
     with pytest.raises(PortsUnpublished):
-        LoadBalancerProxy(runtime).ensure(tmp_path, ENV, LB, (_listener(80),))
+        await LoadBalancerProxy(runtime).ensure(tmp_path, ENV, LB, (_listener(80),))
 
     assert "run_container" in runtime.sequence()  # it did try a recreate first
 
 
-def test_ensure_creates_the_container_when_it_has_never_existed(tmp_path):
+async def test_ensure_creates_the_container_when_it_has_never_existed(tmp_path):
     # The regression this ordering closes, stated on its own: `host_port` RAISES
     # on an absent container (that is how "could not ask" stays distinct from
     # "nothing published"), so reading ports before checking the status made
@@ -410,7 +410,7 @@ def test_ensure_creates_the_container_when_it_has_never_existed(tmp_path):
     runtime = FakeRuntime(next_ports={IDLE_LISTEN_PORT: 32700})
     assert runtime.statuses == {}  # nothing exists
 
-    published = LoadBalancerProxy(runtime).ensure(tmp_path, ENV, LB, ())
+    published = await LoadBalancerProxy(runtime).ensure(tmp_path, ENV, LB, ())
 
     assert published == {IDLE_LISTEN_PORT: 32700}
     assert [spec.name for spec in runtime.runs] == [NAME]

@@ -360,18 +360,18 @@ _REAL_RIE_ERROR_BODY = json.dumps({
 }).encode()
 
 
-def test_a_raised_handler_is_a_function_error_even_with_no_header(tmp_path, rie_server):
+async def test_a_raised_handler_is_a_function_error_even_with_no_header(tmp_path, rie_server):
     rie_server.response = _REAL_RIE_ERROR_BODY
     rie_server.function_error = None  # real RIE sends no header -- this is the bug
     rie_server.status = 200
 
-    result = _invoker(tmp_path, rie_server).invoke(ENV, FN, b"{}")
+    result = await _invoker(tmp_path, rie_server).invoke(ENV, FN, b"{}")
 
     assert result.function_error == "Unhandled"
     assert result.payload == _REAL_RIE_ERROR_BODY  # the payload is relayed untouched
 
 
-def test_an_init_or_exit_failure_is_a_function_error_too(tmp_path, rie_server):
+async def test_an_init_or_exit_failure_is_a_function_error_too(tmp_path, rie_server):
     """RIE answers 502 for an import failure or a runtime exit; real Lambda
     reports those as a 200 + FunctionError, which is what odin returns."""
     rie_server.response = json.dumps(
@@ -379,26 +379,26 @@ def test_an_init_or_exit_failure_is_a_function_error_too(tmp_path, rie_server):
     ).encode()
     rie_server.status = 502
 
-    assert _invoker(tmp_path, rie_server).invoke(ENV, FN, b"{}").function_error == "Unhandled"
+    assert (await _invoker(tmp_path, rie_server).invoke(ENV, FN, b"{}")).function_error == "Unhandled"
 
 
-def test_a_successful_invocation_still_has_no_function_error(tmp_path, rie_server):
+async def test_a_successful_invocation_still_has_no_function_error(tmp_path, rie_server):
     rie_server.response = json.dumps({"statusCode": 200, "body": "ok"}).encode()
 
-    assert _invoker(tmp_path, rie_server).invoke(ENV, FN, b"{}").function_error is None
+    assert (await _invoker(tmp_path, rie_server).invoke(ENV, FN, b"{}")).function_error is None
 
 
-def test_a_non_json_response_body_is_not_mistaken_for_an_error(tmp_path, rie_server):
+async def test_a_non_json_response_body_is_not_mistaken_for_an_error(tmp_path, rie_server):
     rie_server.response = b"\x00\x01not json at all"
 
-    assert _invoker(tmp_path, rie_server).invoke(ENV, FN, b"{}").function_error is None
+    assert (await _invoker(tmp_path, rie_server).invoke(ENV, FN, b"{}")).function_error is None
 
 
-def test_a_handler_returning_only_one_error_key_is_not_an_error(tmp_path, rie_server):
+async def test_a_handler_returning_only_one_error_key_is_not_an_error(tmp_path, rie_server):
     """Both keys, or it's just a payload that happens to mention an error."""
     rie_server.response = json.dumps({"errorMessage": "handled internally, returned 200"}).encode()
 
-    assert _invoker(tmp_path, rie_server).invoke(ENV, FN, b"{}").function_error is None
+    assert (await _invoker(tmp_path, rie_server).invoke(ENV, FN, b"{}")).function_error is None
 
 
 async def test_invoke_raises_when_the_container_is_not_running(tmp_path):
@@ -410,13 +410,13 @@ async def test_invoke_raises_when_the_container_is_not_running(tmp_path):
 # --- delete / status --------------------------------------------------------
 
 
-def test_delete_stops_the_container_and_removes_the_code_dir(tmp_path):
+async def test_delete_stops_the_container_and_removes_the_code_dir(tmp_path):
     runtime = FakeRuntime()
     rt = FunctionRuntime(runtime, root=tmp_path)
     code_dir = rt.extract_code(ENV, FN, _zip_bytes({"a.py": "x"}))
     assert code_dir.exists()
 
-    rt.delete(ENV, FN)
+    await rt.delete(ENV, FN)
     assert runtime.stopped == [container_name(ENV, FN)]
     assert not code_dir.exists()
 

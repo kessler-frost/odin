@@ -76,30 +76,30 @@ class FakeAws:
         self.provisioned, self.gc_calls, self.ensured = [], [], []
         self.subs: dict[str, tuple[str, ...]] = {}  # pre-seedable, like the real backing's state
 
-    def ensure_backing(self, service):
+    async def ensure_backing(self, service):
         self.ensured.append(service)
 
-    def provision(self, service, name, subscriptions=()):
+    async def provision(self, service, name, subscriptions=()):
         self.provisioned.append((service, name, subscriptions))
         if service == "sns":  # a re-provision is observable as a subscription change
             self.subs[name] = self.subs.get(name, ()) + tuple(subscriptions)
 
-    def subscriptions(self, topic):
+    async def subscriptions(self, topic):
         return self.subs.get(topic, ())
 
-    def exists(self, service, name):
+    async def exists(self, service, name):
         return True
 
-    def deprovision(self, service, name):
+    async def deprovision(self, service, name):
         pass
 
     async def facts(self, service, name):
         return {"endpoint": "http://host.docker.internal:9000"}
 
-    def gc(self, active_kinds):
+    async def gc(self, active_kinds):
         self.gc_calls.append(active_kinds)
 
-    def backing_ports(self):
+    async def backing_ports(self):
         return {"s3": 9000}
 
     def container_name(self, service):
@@ -123,6 +123,17 @@ class FakeWS:
 
     async def broadcast(self, msg):
         self.sent.append(msg)
+
+
+async def _gone(service, name):
+    """`BackingAws.exists` after the backing lost the resource.
+
+    A module-level `async def` rather than the `lambda` this used to be:
+    `exists` is a coroutine method now, and `await` inside a lambda is a
+    SyntaxError -- so a lambda stand-in silently hands the reconciler a plain
+    `False` where it awaits, which is a TypeError at the call site rather than
+    the behaviour under test."""
+    return False
 
 
 async def test_provisioned_resource_reaches_healthy(tmp_path):
@@ -217,7 +228,7 @@ async def test_crash_pushes_a_type_log_message_matching_the_uis_bottompanel_shap
     await recon.tick()
     await recon.tick()  # healthy
 
-    aws.exists = lambda service, name: False  # the backing lost the resource
+    aws.exists = _gone  # the backing lost the resource
     await recon.tick()
 
     log_msgs = [m for m in ws.sent if m.get("type") == "log"]
@@ -258,7 +269,7 @@ async def test_provisioned_crash_carries_a_verdict_and_logtail(tmp_path):
     await recon.tick()  # observe exists() == True -> healthy
     assert store.current_world().get("uploads").phase == "healthy"
 
-    aws.exists = lambda service, name: False  # the backing lost the resource
+    aws.exists = _gone  # the backing lost the resource
     await recon.tick()
 
     crashed = next(m for m in sent if m.get("resource_id") == "uploads" and m.get("phase") == "crashed")
@@ -312,7 +323,7 @@ async def test_a_cancelled_hold_does_not_leave_the_reconciler_suspended(tmp_path
         async with recon.hold():
             await asyncio.sleep(30)  # the tofu run that never gets to finish
 
-    task = asyncio.create_task(await held())
+    task = asyncio.create_task(held())
     await asyncio.sleep(0.05)
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
@@ -618,20 +629,25 @@ class SlowAws(FakeAws):
     """provision takes real time (as a container boot does), widening the
     window in which a second tick can plan on the not-yet-updated world."""
 
-    def provision(self, service, name, subscriptions=()):
-        time.sleep(0.05)
-        super().provision(service, name, subscriptions)
+    async def provision(self, service, name, subscriptions=()):
+        # `await`, not `time.sleep`: a blocking sleep would pin the ONE event
+        # loop and the two ticks below could never overlap -- the test would
+        # pass without ever reproducing the race it exists for.
+        await asyncio.sleep(0.05)
+        await super().provision(service, name, subscriptions)
 
 
 async def test_concurrent_ticks_do_not_double_provision(tmp_path):
-    # /apply's synchronous tick overlaps the background loop's tick (tick
-    # yields at to_thread) — unserialized, both plan on the same pre-provision
-    # world and double-provision (live: two `docker run` on one backing name).
+    # /apply's tick overlaps the background loop's tick — unserialized, both
+    # plan on the same pre-provision world and double-provision (live: two
+    # `docker run` on one backing name). Two TASKS now rather than two threads;
+    # `SlowAws.provision`'s await is the suspension point that lets the second
+    # in, so the race is real and `_tick_lock` is what closes it.
     rt, aws = FakeRuntime(), SlowAws()
     store = SpecStore(tmp_path)
     store.apply(Stack(resources=(ResourceDesired(id="uploads", kind="s3"),)))
     recon = Reconciler(store, rt, aws=aws, poll_interval=0)
-    await asyncio.gather(await recon.tick(), recon.tick())
+    await asyncio.gather(recon.tick(), recon.tick())
     assert aws.provisioned == [("s3", "uploads", ())]
 
 
@@ -1105,7 +1121,10 @@ async def test_the_endpoint_is_published_once_the_port_becomes_readable_again(tm
     await recon.tick()
     await recon.tick()
 
-    aws.facts = lambda service, name: {"BUCKET": name, "endpoint": "http://host.docker.internal:51001"}
+    async def readable(service, name):
+        return {"BUCKET": name, "endpoint": "http://host.docker.internal:51001"}
+
+    aws.facts = readable
     await recon.tick()
 
     observed = store.current_world().get("uploads")
@@ -1170,8 +1189,8 @@ class _PortOnlyRuntime:
         return 51001
 
 
-def _real_backing_facts(tmp_path, service, name):
-    return BackingAws(_PortOnlyRuntime(), env="default", root=tmp_path).facts(service, name)
+async def _real_backing_facts(tmp_path, service, name):
+    return await BackingAws(_PortOnlyRuntime(), env="default", root=tmp_path).facts(service, name)
 
 
 async def test_a_crashed_resource_keeps_its_identity_and_gains_a_logtail(tmp_path):
@@ -1183,7 +1202,9 @@ async def test_a_crashed_resource_keeps_its_identity_and_gains_a_logtail(tmp_pat
     resource still IS that bucket."""
     rt, aws, ws = FakeRuntime(), FakeAws(), FakeWS()
     rt.set("odin-aws-s3-default", "running", logs="panic: disk full")
-    aws.facts = lambda service, name: _real_backing_facts(tmp_path, service, name)
+    async def facts(service, name):
+        return await _real_backing_facts(tmp_path, service, name)
+    aws.facts = facts
     store = SpecStore(tmp_path)
     store.apply(Stack(resources=(BUCKET,)))
 
@@ -1193,7 +1214,7 @@ async def test_a_crashed_resource_keeps_its_identity_and_gains_a_logtail(tmp_pat
     healthy = store.current_world().get("uploads").facts
     assert healthy["BUCKET"] == "uploads" and healthy["endpoint"].endswith(":51001")
 
-    aws.exists = lambda service, name: False   # the backing lost the resource
+    aws.exists = _gone   # the backing lost the resource
     await recon.tick()   # observe demotes to crashed, then plan re-provisions
 
     crashed = next(m for m in ws.sent if m.get("resource_id") == "uploads"
@@ -1211,7 +1232,7 @@ async def test_preserving_identity_across_a_crash_costs_no_extra_deltas(tmp_path
     once and then stays silent however many reads follow -- even as the log
     tail keeps changing under it."""
     r = Reconciler(store=SpecStore(tmp_path), runtime=FakeRuntime(), env="e")
-    facts = _real_backing_facts(tmp_path, "s3", "uploads")
+    facts = await _real_backing_facts(tmp_path, "s3", "uploads")
     await r._emit("uploads", "s3", "healthy", facts=facts)
     await r._emit("uploads", "s3", "crashed", verdict="gone",
                   facts=r._crash_facts("uploads", "panic: disk full"))
@@ -1231,7 +1252,9 @@ async def test_many_ticks_over_a_steady_healthy_env_emit_nothing(tmp_path):
     6-event minimum and 90s idle at zero new bytes -- none of these changes
     may cost that."""
     rt, aws = FakeRuntime(), FakeAws()
-    aws.facts = lambda service, name: _real_backing_facts(tmp_path, service, name)
+    async def facts(service, name):
+        return await _real_backing_facts(tmp_path, service, name)
+    aws.facts = facts
     store = SpecStore(tmp_path)
     store.apply(Stack(resources=(
         ResourceDesired(id="uploads", kind="s3"),
@@ -1261,7 +1284,7 @@ def _fresh(tmp_path, **kwargs) -> Reconciler:
 
 async def _await_a_tick(recon: Reconciler, timeout: float = 2.0) -> None:
     deadline = time.monotonic() + timeout
-    while recon.health().ticks == 0:
+    while (await recon.health()).ticks == 0:
         assert time.monotonic() < deadline, "the loop never completed a tick"
         await asyncio.sleep(0.01)
 
@@ -1271,7 +1294,7 @@ async def test_a_live_loop_reports_ticking_with_a_real_completed_tick_behind_it(
     await recon.start()
     try:
         await _await_a_tick(recon)
-        health = recon.health()
+        health = await recon.health()
         assert health.ticking is True
         assert health.verdict is None
         assert health.consecutive_failures == 0
@@ -1296,7 +1319,7 @@ async def test_a_cancelled_loop_is_reported_dead_instead_of_silently_stopping(tm
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
 
-    health = recon.health()
+    health = await recon.health()
     assert health.ticking is False
     assert "CANCELLED" in health.verdict
     assert "is NOT converging" in health.verdict
@@ -1315,12 +1338,12 @@ async def test_a_loop_whose_every_tick_raises_stops_reading_as_converging(tmp_pa
     await recon.start()
     try:
         deadline = time.monotonic() + 2.0
-        while recon.health().consecutive_failures < 2:
+        while (await recon.health()).consecutive_failures < 2:
             assert time.monotonic() < deadline, "the loop never recorded a failing tick"
             await asyncio.sleep(0.01)
         await asyncio.sleep(0.06)  # past `stall_after`, with the loop still alive
 
-        health = recon.health()
+        health = await recon.health()
         assert health.ticking is False
         assert health.ticks == 0
         assert health.consecutive_failures >= 2
@@ -1354,7 +1377,7 @@ async def test_a_hung_tick_is_reported_stalled_while_the_task_is_still_alive(tmp
     try:
         await asyncio.wait_for(entered.wait(), timeout=2.0)
         await asyncio.sleep(0.06)
-        health = recon.health()
+        health = await recon.health()
         assert health.ticking is False
         assert recon._task.done() is False  # alive, and still not converging
         assert "a tick is hung" in health.verdict
@@ -1373,7 +1396,7 @@ async def test_a_slow_but_completing_tick_is_not_called_stalled(tmp_path):
         await _await_a_tick(recon)
         for _ in range(5):
             await asyncio.sleep(0.05)
-            assert recon.health().ticking is True
+            assert (await recon.health()).ticking is True
     finally:
         await recon.stop()
 
@@ -1383,13 +1406,13 @@ async def test_a_stopped_loop_says_so_rather_than_claiming_to_tick(tmp_path):
     await recon.start()
     await _await_a_tick(recon)
     await recon.stop()
-    health = recon.health()
+    health = await recon.health()
     assert health.ticking is False
     assert "it has been stopped" in health.verdict
 
 
 async def test_a_never_started_loop_is_not_reported_as_ticking(tmp_path):
-    health = _fresh(tmp_path).health()
+    health = await _fresh(tmp_path).health()
     assert health.ticking is False
     assert "it was never started" in health.verdict
     assert health.last_tick_seconds_ago is None

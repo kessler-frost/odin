@@ -5,7 +5,7 @@ boto3. Real containers are exercised in the integration pass (Task 4).
 """
 from __future__ import annotations
 
-import threading
+import asyncio
 import time
 from dataclasses import dataclass, field
 
@@ -188,44 +188,42 @@ async def test_a_running_backing_that_publishes_its_port_is_still_adopted(rt, fa
     assert rt.stopped.count("odin-aws-goaws-default") == 1
 
 
-async def test_ensure_backing_is_thread_safe_against_concurrent_callers(rt, factory, tmp_path):
-    """S5 regression: /apply-full calls ensure_backing directly while the
-    SAME BackingAws instance's Reconciler background loop can independently
-    call it too (provision() -> ensure_backing()) on another OS thread
-    (both run under asyncio.to_thread). Without a lock around the
-    check-then-create, two threads can both observe "not running" and both
-    call docker run for the identical container name -- exactly the
-    Conflict error a real docker daemon raises. The fake mimics that: a
-    slight sleep before registering the container widens the race window
-    (like a real `docker run` taking real wall time), and a second create
-    for a name already running raises the same error shape Colima did."""
+async def test_ensure_backing_serializes_concurrent_callers(rt, factory, tmp_path):
+    """S5 regression, restated for v0.7.7's event loop: /apply-full calls
+    ensure_backing directly while the SAME BackingAws instance's Reconciler
+    background loop can independently call it too (provision() ->
+    ensure_backing()). Before de-threading those were two OS threads; now they
+    are two asyncio TASKS, and the hazard is identical because the critical
+    section (`status` -> `_stranded` -> `_create_backing_container`) is now
+    three `await`s -- every one of them a point where the loop can hand the
+    other task control. Without `_ensure_lock` both observe "not running" and
+    both call docker run for the identical container name, which is the
+    Conflict error a real docker daemon raises.
+
+    The fake mimics the daemon: an `await asyncio.sleep` before registering the
+    container widens the window a real `docker run` leaves open, and a second
+    create for a name already running raises the same error shape Colima did.
+    That sleep is what makes this a real test of the lock -- delete
+    `_ensure_lock` from `ensure_backing` and `len(runs)` becomes 2."""
 
     class RacyRuntime(FakeRuntime):
-        def run_container(self, spec):
+        async def run_container(self, spec):
             if spec.name in self.statuses:
                 raise RuntimeError(
                     f'docker run ... failed: Conflict. The container name '
                     f'"/{spec.name}" is already in use by container "deadbeef"'
                 )
-            time.sleep(0.05)  # widen the window a real `docker run` leaves open
-            super().run_container(spec)
+            await asyncio.sleep(0.05)  # widen the window a real `docker run` leaves open
+            await super().run_container(spec)
 
     racy_rt = RacyRuntime()
     aws = _aws(racy_rt, factory, tmp_path)
-    errors: list[Exception] = []
 
-    async def _call() -> None:
-        try:
-            await aws.ensure_backing("s3")
-        except Exception as exc:  # noqa: BLE001 — capturing across threads for the assertion
-            errors.append(exc)
+    outcomes = await asyncio.gather(
+        aws.ensure_backing("s3"), aws.ensure_backing("s3"), return_exceptions=True,
+    )
 
-    threads = [threading.Thread(target=_call) for _ in range(2)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=5)
-
+    errors = [o for o in outcomes if isinstance(o, BaseException)]
     assert errors == []  # the lock serializes the race away — no Conflict ever surfaces
     assert len(racy_rt.runs) == 1  # exactly one effective run
 
@@ -240,7 +238,7 @@ async def test_ensure_backing_heals_a_stale_already_in_use_conflict(rt, factory,
     cname = "odin-aws-rustfs-default"
 
     class ConflictingRuntime(FakeRuntime):
-        def run_container(self, spec):
+        async def run_container(self, spec):
             raise RuntimeError(
                 f'docker run ... failed: Conflict. The container name '
                 f'"/{spec.name}" is already in use by container "deadbeef"'
@@ -249,15 +247,19 @@ async def test_ensure_backing_heals_a_stale_already_in_use_conflict(rt, factory,
     conflict_rt = ConflictingRuntime()
     aws = _aws(conflict_rt, factory, tmp_path)
 
-    def _external_creator_wins() -> None:
-        time.sleep(0.1)  # simulate the other creator's docker run finishing shortly after
+    async def _external_creator_wins() -> None:
+        # The other creator is a different PROCESS in production; here it is a
+        # concurrent task, which is enough because `_create_backing_container`'s
+        # heal loop `await`s -- that suspension is exactly what lets this run.
+        await asyncio.sleep(0.1)
         conflict_rt.statuses[cname] = "running"
         conflict_rt.ports[cname] = 51000
         conflict_rt.published[cname] = {9000}  # ...publishing rustfs's real wire port
 
-    threading.Thread(target=_external_creator_wins).start()
+    creator = asyncio.create_task(_external_creator_wins())
 
     await aws.ensure_backing("s3")  # must not raise -- heals via the except branch
+    await creator
     assert conflict_rt.runs == []  # this instance never successfully created anything itself
 
 
@@ -294,13 +296,13 @@ async def test_goaws_config_uses_the_configured_gateway_port(rt, factory, tmp_pa
     assert rt.runs[0].ports == {5555: 0}
 
 
-def test_ensure_backing_timeout_raises_with_logs(rt, factory, tmp_path, monkeypatch):
+async def test_ensure_backing_timeout_raises_with_logs(rt, factory, tmp_path, monkeypatch):
     monkeypatch.setattr(backings, "READY_TIMEOUT", 0.0)
     with pytest.raises(RuntimeError, match="fake logs of odin-aws-dynalite-default"):
-        _aws(rt, factory, tmp_path).ensure_backing("dynamodb")
+        await _aws(rt, factory, tmp_path).ensure_backing("dynamodb")
 
 
-def test_a_backing_that_never_became_ready_says_WHY_not_only_that_it_did_not(rt, factory, tmp_path, monkeypatch):
+async def test_a_backing_that_never_became_ready_says_WHY_not_only_that_it_did_not(rt, factory, tmp_path, monkeypatch):
     """The S5 incident this module's own docstring cites, finally answered.
 
     The message was `f"{cname} never became ready:\\n{logs}"`, and `logs`
@@ -315,7 +317,7 @@ def test_a_backing_that_never_became_ready_says_WHY_not_only_that_it_did_not(rt,
     formatter, not the integration."""
     monkeypatch.setattr(backings, "READY_TIMEOUT", 0.0)
     with pytest.raises(RuntimeError) as exc:
-        _aws(rt, factory, tmp_path).ensure_backing("s3")
+        await _aws(rt, factory, tmp_path).ensure_backing("s3")
     msg = str(exc.value)
     assert not msg.endswith(":\n") and not msg.endswith(":")   # the defect itself
     assert "the s3 list_buckets probe never succeeded" in msg  # WHICH probe, not just "not ready"
@@ -392,27 +394,27 @@ async def test_the_registry_backing_names_its_own_wire_shape_not_a_boto3_probe(r
     assert "list_buckets" not in msg and "probe never succeeded" not in msg
 
 
-def test_ensure_backing_dynamodb_builds_the_baked_image_when_absent(rt, factory, tmp_path):
+async def test_ensure_backing_dynamodb_builds_the_baked_image_when_absent(rt, factory, tmp_path):
     """S5 e2e root cause #2: bare `node:alpine` + `npx -y dynalite` re-fetched
     from the npm registry on every boot, and a slow/flaky registry blew the
     readiness probe's budget ("never became ready", empty container logs).
     The baked image is built ONCE (network access accepted there) so every
     subsequent boot is instant and offline."""
-    _aws(rt, factory, tmp_path).ensure_backing("dynamodb")
+    await _aws(rt, factory, tmp_path).ensure_backing("dynamodb")
     assert rt.builds == [backings._DYNALITE_IMAGE]
     spec = rt.runs[0]
     assert spec.image == backings._DYNALITE_IMAGE
     assert spec.command == ("--port", "4567")  # no more npx -y dynalite
 
 
-def test_ensure_backing_dynamodb_skips_the_build_when_the_image_already_exists(rt, factory, tmp_path):
+async def test_ensure_backing_dynamodb_skips_the_build_when_the_image_already_exists(rt, factory, tmp_path):
     rt.images.add(backings._DYNALITE_IMAGE)
-    _aws(rt, factory, tmp_path).ensure_backing("dynamodb")
+    await _aws(rt, factory, tmp_path).ensure_backing("dynamodb")
     assert rt.builds == []
 
 
-def test_provision_dynamodb_creates_table_with_id_hash_key(rt, factory, tmp_path):
-    _aws(rt, factory, tmp_path).provision("dynamodb", "jobs")
+async def test_provision_dynamodb_creates_table_with_id_hash_key(rt, factory, tmp_path):
+    await _aws(rt, factory, tmp_path).provision("dynamodb", "jobs")
     assert ("dynamodb", "create_table", {
         "TableName": "jobs", "BillingMode": "PAY_PER_REQUEST",
         "AttributeDefinitions": [{"AttributeName": "id", "AttributeType": "S"}],
@@ -420,11 +422,11 @@ def test_provision_dynamodb_creates_table_with_id_hash_key(rt, factory, tmp_path
     }) in factory.calls
 
 
-def test_provision_sns_subscribes_queues_using_returned_arns(rt, factory, tmp_path):
+async def test_provision_sns_subscribes_queues_using_returned_arns(rt, factory, tmp_path):
     factory.responses[("sns", "create_topic")] = {"TopicArn": "arn:fake:alerts"}
     factory.responses[("sqs", "create_queue")] = {"QueueUrl": "http://q/jobs"}
     factory.responses[("sqs", "get_queue_attributes")] = {"Attributes": {"QueueArn": "arn:fake:jobs"}}
-    _aws(rt, factory, tmp_path).provision("sns", "alerts", subscriptions=("jobs",))
+    await _aws(rt, factory, tmp_path).provision("sns", "alerts", subscriptions=("jobs",))
 
     assert ("sqs", "create_queue", {"QueueName": "jobs"}) in factory.calls
     get_attrs = next(c for c in factory.calls if c[1] == "get_queue_attributes")
@@ -436,21 +438,21 @@ def test_provision_sns_subscribes_queues_using_returned_arns(rt, factory, tmp_pa
     }
 
 
-def test_provision_tolerates_already_exists_client_errors(rt, factory, tmp_path):
+async def test_provision_tolerates_already_exists_client_errors(rt, factory, tmp_path):
     factory.errors[("s3", "create_bucket")] = ClientError(
         {"Error": {"Code": "BucketAlreadyExists", "Message": "Exists"}}, "CreateBucket")
-    _aws(rt, factory, tmp_path).provision("s3", "uploads")  # must not raise
+    await _aws(rt, factory, tmp_path).provision("s3", "uploads")  # must not raise
 
 
-def test_provision_raises_on_other_client_errors(rt, factory, tmp_path):
+async def test_provision_raises_on_other_client_errors(rt, factory, tmp_path):
     factory.errors[("s3", "create_bucket")] = ClientError(
         {"Error": {"Code": "AccessDenied", "Message": "no"}}, "CreateBucket")
     with pytest.raises(ClientError):
-        _aws(rt, factory, tmp_path).provision("s3", "uploads")
+        await _aws(rt, factory, tmp_path).provision("s3", "uploads")
 
 
-def test_exists_false_when_backing_down_without_any_client_call(rt, factory, tmp_path):
-    assert _aws(rt, factory, tmp_path).exists("s3", "uploads") is False
+async def test_exists_false_when_backing_down_without_any_client_call(rt, factory, tmp_path):
+    assert await _aws(rt, factory, tmp_path).exists("s3", "uploads") is False
     assert factory.created == []
 
 
@@ -460,9 +462,9 @@ async def test_exists_true_when_backing_up_and_check_passes(rt, factory, tmp_pat
     aws = _aws(rt, factory, tmp_path)
     await aws.ensure_backing("s3")
     await aws.ensure_backing("sns")
-    assert aws.exists("s3", "uploads") is True
-    assert aws.exists("sns", "alerts") is True
-    assert aws.exists("sns", "other") is False
+    assert await aws.exists("s3", "uploads") is True
+    assert await aws.exists("sns", "alerts") is True
+    assert await aws.exists("sns", "other") is False
 
 
 async def test_exists_false_when_check_raises(rt, factory, tmp_path):
@@ -470,7 +472,7 @@ async def test_exists_false_when_check_raises(rt, factory, tmp_path):
         {"Error": {"Code": "ResourceNotFoundException", "Message": "no"}}, "DescribeTable")
     aws = _aws(rt, factory, tmp_path)
     await aws.ensure_backing("dynamodb")
-    assert aws.exists("dynamodb", "jobs") is False
+    assert await aws.exists("dynamodb", "jobs") is False
 
 
 async def test_deprovision_is_best_effort(rt, factory, tmp_path):
@@ -513,8 +515,8 @@ async def test_backing_ports_maps_service_to_running_backings_host_port(rt, fact
     }
 
 
-def test_backing_ports_empty_when_nothing_running(rt, factory, tmp_path):
-    assert _aws(rt, factory, tmp_path).backing_ports() == {}
+async def test_backing_ports_empty_when_nothing_running(rt, factory, tmp_path):
+    assert await _aws(rt, factory, tmp_path).backing_ports() == {}
 
 
 async def test_aws_env_yields_sqs_and_sns_from_one_goaws_plus_creds(rt, factory, tmp_path):
@@ -534,15 +536,15 @@ async def test_aws_env_yields_sqs_and_sns_from_one_goaws_plus_creds(rt, factory,
 # W2.6: each stopped backing takes its mesh SIDECAR with it (`<backing>-mesh`,
 # fabric/sidecar.py) -- it lives in that container's network namespace, so it
 # would die anyway; stopping it explicitly is what leaves nothing behind.
-def test_gc_stops_backings_whose_kinds_are_all_inactive(rt, factory, tmp_path):
-    _aws(rt, factory, tmp_path).gc({"s3"})
+async def test_gc_stops_backings_whose_kinds_are_all_inactive(rt, factory, tmp_path):
+    await _aws(rt, factory, tmp_path).gc({"s3"})
     assert set(rt.stopped) == {
         "odin-aws-goaws-default", "odin-aws-dynalite-default", "odin-aws-registry-default",
         "odin-aws-goaws-default-mesh", "odin-aws-dynalite-default-mesh", "odin-aws-registry-default-mesh"}
 
 
-def test_gc_with_no_active_kinds_stops_everything(rt, factory, tmp_path):
-    _aws(rt, factory, tmp_path).gc(set())
+async def test_gc_with_no_active_kinds_stops_everything(rt, factory, tmp_path):
+    await _aws(rt, factory, tmp_path).gc(set())
     assert set(rt.stopped) == {
         "odin-aws-rustfs-default",
         "odin-aws-goaws-default",
@@ -659,12 +661,12 @@ async def test_backing_ports_includes_ecr_when_running(rt, factory, tmp_path):
     assert await aws.backing_ports() == {"ecr": rt.ports["odin-aws-registry-default"]}
 
 
-def test_gc_keeps_registry_running_while_ecr_is_active(rt, factory, tmp_path):
+async def test_gc_keeps_registry_running_while_ecr_is_active(rt, factory, tmp_path):
     # No ensure_backing() first (unlike the running-container assertions
     # above): ensure_backing's OWN pre-create "clear any exited remnant"
     # stop() would otherwise pollute rt.stopped before gc() ever runs,
     # matching test_gc_stops_backings_whose_kinds_are_all_inactive's pattern.
-    _aws(rt, factory, tmp_path).gc({"ecr"})
+    await _aws(rt, factory, tmp_path).gc({"ecr"})
     assert "odin-aws-registry-default" not in rt.stopped
 
 
@@ -683,7 +685,7 @@ class BrokenDockerRunner:
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
 
-    def __call__(self, args, input=None):
+    async def __call__(self, args, input=None):
         self.calls.append(args)
         if "{{.State.Status}}" in args:
             return _Proc(0, "running")
@@ -707,21 +709,21 @@ async def test_facts_refuses_to_name_an_endpoint_it_could_not_read(tmp_path, fac
     assert ":0" not in str(raised.value)
 
 
-def test_client_still_fails_typed_when_the_port_read_itself_fails(tmp_path, factory):
+async def test_client_still_fails_typed_when_the_port_read_itself_fails(tmp_path, factory):
     # deprovision and friends swallow BackingUnavailable by name; a raw
     # PortUnreadable escaping here would turn a best-effort cleanup into a crash.
     with pytest.raises(backings.BackingUnavailable):
-        _broken_aws(tmp_path, factory).client("s3")
+        await _broken_aws(tmp_path, factory).client("s3")
 
 
-def test_the_gateway_routing_table_omits_a_backing_it_cannot_read(tmp_path, factory):
+async def test_the_gateway_routing_table_omits_a_backing_it_cannot_read(tmp_path, factory):
     # Absent means the gateway answers service-unavailable (true). A 0 entry
     # meant it forwarded to port 0 and blamed the backing.
-    assert _broken_aws(tmp_path, factory).backing_ports() == {}
+    assert await _broken_aws(tmp_path, factory).backing_ports() == {}
 
 
-def test_endpoint_vars_omit_a_backing_whose_port_cannot_be_read(tmp_path, factory):
-    env = _broken_aws(tmp_path, factory).aws_env()
+async def test_endpoint_vars_omit_a_backing_whose_port_cannot_be_read(tmp_path, factory):
+    env = await _broken_aws(tmp_path, factory).aws_env()
     assert not [k for k in env if k.startswith("AWS_ENDPOINT_URL_")]
     assert env["AWS_ACCESS_KEY_ID"] == ACCESS_KEY  # creds are still knowable
 
@@ -754,7 +756,7 @@ class _StateRunner:
     def __init__(self, state: str) -> None:
         self.state = state
 
-    def __call__(self, args, input=None):
+    async def __call__(self, args, input=None):
         if "{{.State.Status}}" in args:
             if self.state == "absent":
                 return _Proc(1, "", f"error: no such object: {args[-1]}")
@@ -776,7 +778,7 @@ def _aws_with_state(tmp_path, factory, state: str):
     ("running", "gateway_port mismatch"),
     ("dead", "odin has no reading for that container state"),
 ])
-def test_an_unavailable_backing_names_the_state_docker_really_reports(tmp_path, factory, state, expected):
+async def test_an_unavailable_backing_names_the_state_docker_really_reports(tmp_path, factory, state, expected):
     """The old message asserted "gateway_port mismatch ... ?" for all of these.
     It is only true for the RUNNING one -- a container that is running and still
     publishes nothing on the port this instance wants really is a mismatch --
@@ -784,22 +786,22 @@ def test_an_unavailable_backing_names_the_state_docker_really_reports(tmp_path, 
     `docker rm -f` produces. A state the map has no entry for says so rather
     than inheriting the running case's diagnosis."""
     with pytest.raises(backings.BackingUnavailable) as raised:
-        _aws_with_state(tmp_path, factory, state).client("s3")
+        await _aws_with_state(tmp_path, factory, state).client("s3")
     assert expected in str(raised.value)
 
 
-def test_an_unavailable_backing_carries_the_container_and_state_structurally(tmp_path, factory):
+async def test_an_unavailable_backing_carries_the_container_and_state_structurally(tmp_path, factory):
     """`server.py`'s failure verdict publishes `backing: {container, observed}`
     in its JSON body. Read off the exception, never scraped back out of its
     message."""
     with pytest.raises(backings.BackingUnavailable) as raised:
-        _aws_with_state(tmp_path, factory, "exited").client("s3")
+        await _aws_with_state(tmp_path, factory, "exited").client("s3")
     assert raised.value.container == "odin-aws-rustfs-applyfix"
     assert raised.value.observed == "exited"
     assert "odin-aws-rustfs-applyfix" in str(raised.value)
 
 
-def test_an_unreadable_port_does_not_go_on_to_ask_for_the_state(tmp_path, factory):
+async def test_an_unreadable_port_does_not_go_on_to_ask_for_the_state(tmp_path, factory):
     """The unreadable branch keeps its own reason and asks the runtime nothing
     else: the runtime has just failed to answer a question, so a second question
     proves nothing and its failure would replace a real reason with a worse
@@ -807,7 +809,7 @@ def test_an_unreadable_port_does_not_go_on_to_ask_for_the_state(tmp_path, factor
     `_published_port` that consulted it would append the mismatch diagnosis to a
     "Cannot connect to the Docker daemon" failure."""
     with pytest.raises(backings.BackingUnavailable) as raised:
-        _broken_aws(tmp_path, factory).client("s3")
+        await _broken_aws(tmp_path, factory).client("s3")
     assert "Cannot connect to the Docker daemon" in str(raised.value)
     assert "gateway_port mismatch" not in str(raised.value)
     assert raised.value.observed == "unreadable"
