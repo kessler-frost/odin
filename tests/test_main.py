@@ -181,7 +181,8 @@ NO_SERVER_URL = "http://127.0.0.1:9"
 
 def test_status_is_honest_about_a_server_odin_did_not_start(tmp_path, monkeypatch, capsys, store_lock):
     monkeypatch.chdir(tmp_path)
-    main_mod.status(url=NO_SERVER_URL)
+    with pytest.raises(typer.Exit):  # UNKNOWN loops -- see the exit-2 tests below
+        main_mod.status(url=NO_SERVER_URL)
     out = capsys.readouterr().out
     assert "Odin is running" in out and str(os.getpid()) in out
     assert "store lock" in out and "no pidfile" in out
@@ -219,8 +220,17 @@ def test_status_exits_nonzero_when_odin_is_not_running(tmp_path, monkeypatch, ca
     assert "Odin is not running" in capsys.readouterr().out
 
 
-def test_status_exits_zero_when_odin_is_running(tmp_path, monkeypatch, capsys, store_lock):
+def test_status_exits_zero_only_when_every_loop_is_confirmed_ticking(
+    tmp_path, monkeypatch, capsys, store_lock
+):
+    """0 is this command's documented "running, AND every env's reconciler is
+    ticking", so it takes a real `/health` answer to earn it -- see
+    `test_status_exits_two_when_convergence_is_unknown` for what the store lock
+    alone buys."""
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main_mod, "_reconciler_health", lambda url: [
+        LoopHealth(env="default", ticking=True, ticks=7).model_dump(),
+    ])
     main_mod.status(url=NO_SERVER_URL)  # no typer.Exit at all == exit 0
     assert "Odin is running" in capsys.readouterr().out
 
@@ -229,7 +239,8 @@ def test_status_reports_the_pidfile_path_as_managed(tmp_path, monkeypatch, capsy
     monkeypatch.chdir(tmp_path)
     main_mod.ODIN_DIR.mkdir()
     main_mod.PID_FILE.write_text(str(os.getpid()))
-    main_mod.status(url=NO_SERVER_URL)
+    with pytest.raises(typer.Exit):  # loops UNKNOWN at this URL
+        main_mod.status(url=NO_SERVER_URL)
     assert f"Odin is running (pid {os.getpid()}, pidfile)" in capsys.readouterr().out
 
 
@@ -242,10 +253,73 @@ def test_status_calls_reconciler_health_unknown_when_the_server_does_not_answer(
     localhost:4200, so a server on another port would otherwise fail a gate
     that has nothing wrong with it)."""
     monkeypatch.chdir(tmp_path)
-    main_mod.status(url=NO_SERVER_URL)  # exit 0
+    with pytest.raises(typer.Exit):
+        main_mod.status(url=NO_SERVER_URL)
     captured = capsys.readouterr()
     assert "Odin is running" in captured.out
     assert "UNKNOWN" in captured.err and "ODIN_URL" in captured.err
+
+
+def test_status_exits_two_when_convergence_is_unknown(tmp_path, monkeypatch, capsys, store_lock):
+    """Field test 6 F1. This branch used to exit 0 -- the code that says
+    "running, AND every env's reconciler is ticking" -- one line after printing
+    that the second half is UNKNOWN, so a monitoring script gating on `odin
+    status` read UNKNOWN as healthy. It is reachable by a plain `odin status`
+    whenever the server is on a non-default port, which this command's own
+    message anticipates.
+
+    2, not 1: odin has NOT observed a stopped loop, and reporting one it never
+    saw would be its own false claim. 2 is also what the README's contract
+    already assigns to an unreachable server, which is exactly what happened
+    here."""
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(typer.Exit) as exit_info:
+        main_mod.status(url=NO_SERVER_URL)
+    assert exit_info.value.exit_code == 2
+    captured = capsys.readouterr()
+    assert "Odin is running" in captured.out  # the half odin DID verify
+    assert "UNKNOWN" in captured.err
+
+
+def test_status_unknown_is_a_different_code_from_a_down_loop(tmp_path, monkeypatch, store_lock):
+    """The distinction the fix exists to make: "I could not tell" and "a loop is
+    down" are different answers and must not share a code. Mutation guard -- 2
+    collapsing back to 1 would make UNKNOWN indistinguishable from an observed
+    outage, and back to 0 would restore the finding."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main_mod, "_reconciler_health", lambda url: [
+        LoopHealth(env="default", ticking=False, verdict="its task was CANCELLED").model_dump(),
+    ])
+    with pytest.raises(typer.Exit) as down:
+        main_mod.status(url=NO_SERVER_URL)
+
+    monkeypatch.setattr(main_mod, "_reconciler_health", lambda url: "did not answer")
+    with pytest.raises(typer.Exit) as unknown:
+        main_mod.status(url=NO_SERVER_URL)
+
+    assert (down.value.exit_code, unknown.value.exit_code) == (1, 2)
+
+
+def test_status_names_a_malformed_url_rather_than_claiming_no_answer(
+    tmp_path, monkeypatch, capsys, store_lock
+):
+    """F9's `odin status` half. `httpx.InvalidURL` is not an `httpx.HTTPError`,
+    so a non-numeric port used to escape this command's own except clause as a
+    traceback; and a schemeless value is caught but "did not answer <url>/health"
+    is the wrong diagnosis, because odin never made a request at all."""
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(typer.Exit) as exit_info:
+        main_mod.status(url="localhost:4720")
+    assert exit_info.value.exit_code == 2
+    err = capsys.readouterr().err
+    assert "'localhost:4720' is not a usable odin URL" in err
+    assert "missing an 'http://' or 'https://' protocol" in err
+    assert "UNKNOWN" in err
+
+    with pytest.raises(typer.Exit) as bad_port:
+        main_mod.status(url="http://localhost:notaport")
+    assert bad_port.value.exit_code == 2
+    assert "Invalid port" in capsys.readouterr().err
 
 
 def test_status_exits_nonzero_and_names_the_env_when_a_reconciler_is_down(
@@ -291,10 +365,13 @@ def test_reconciler_health_reads_the_real_health_body(monkeypatch):
 def test_reconciler_health_is_unknown_rather_than_empty_when_the_field_is_missing():
     """An answer with no `reconcilers` key says nothing about the loops behind
     it -- reading that as "none are down" is exactly the inference this whole
-    change exists to remove."""
+    change exists to remove. Unknown is now the REASON rather than a bare None,
+    so the caller cannot guess at one (F9)."""
     with respx.mock:
         respx.get("http://odin.test/health").mock(return_value=httpx.Response(200, json={"ok": True}))
-        assert main_mod._reconciler_health("http://odin.test") is None
+        unknown = main_mod._reconciler_health("http://odin.test")
+    assert isinstance(unknown, str)
+    assert "no `reconcilers` field" in unknown
 
 
 def test_status_cleans_a_stale_pidfile_and_says_so(tmp_path, monkeypatch, capsys):

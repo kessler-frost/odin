@@ -56,7 +56,11 @@ directories, whose paths it prints. `--dry-run` shows what it would remove,
 
 ### What it needs
 
-`odin doctor` checks each of these and prints the fix for whatever is missing.
+`odin doctor` checks every one of these except the first — running it at all proves
+Python and `uv` work — and prints the fix for whatever is missing. A dependency
+needed only by one feature is reported as an optional `○` row that names the canvas
+or feature it is required for, and the summary line counts those rather than
+letting "All required checks passed" stand alone.
 `odin doctor --prebake` additionally builds the
 [dynalite](https://github.com/mhart/dynalite) image up front, so your first
 DynamoDB Apply doesn't wait on a one-time `npm install` inside a container.
@@ -69,6 +73,7 @@ DynamoDB Apply doesn't wait on a one-time `npm install` inside a container.
 | [OpenTofu](https://opentofu.org/) | Apply runs `tofu` |
 | [Lima](https://lima-vm.io/) (`limactl`) | only for a canvas with an **EC2** node, since each one is a real Lima VM |
 | [bun](https://bun.sh/) | only to build the UI from a clone; the released package ships one prebuilt |
+| [nebula](https://github.com/slackhq/nebula) (`nebula` + `nebula-cert`, one `brew install nebula`) | only for the mesh: `nebula-cert` is needed by **any canvas with a VPC node** (CreateVpc signs that env's CA, and the apply fails without it), and `nebula` runs the lighthouse once the first EC2 VM joins |
 
 ### Three install paths, one `odin` command
 
@@ -262,11 +267,20 @@ and there the code *is* the answer:
 
 | command | `0` | non-zero |
 | ------- | --- | -------- |
-| `odin status` | running, and every env's reconciler is ticking | `1` not running, **or** a reconciler has stopped converging |
-| `odin tf plan` | no changes | `2` changes, `1` error or refusal, `3` server unreachable |
+| `odin status` | running, and every env's reconciler is ticking | `1` not running, **or** a reconciler has stopped converging; `2` running, but whether its reconcilers are converging is **UNKNOWN** |
+| `odin tf plan` | no changes | `2` changes, `1` error or refusal, `3` server unreachable or an unusable `--url` |
+
+`status` exits `2` when it holds the store lock — so odin is definitely running —
+but the server did not answer `/health`, usually because it is on another port and
+no `--url` was passed. That is a third answer, not a failure: `0` claims both
+halves ("running **and** converging") and reporting `1` would invent a reconciler
+failure out of a URL guess. So `odin status && odin apply` still refuses to apply
+into an env nothing will converge, without ever crying wolf.
 
 `tf plan` answers `3` rather than `2` when it cannot reach the server, so a down
-odin can never be read as drift. `odin stop` is the mirror of `status`: nothing
+odin can never be read as drift — and for the same reason a `--url`/`ODIN_URL`
+odin cannot dial answers `3` there too, where every other command answers `2`.
+A typo'd URL must not pass a CI drift gate as real drift. `odin stop` is the mirror of `status`: nothing
 running is exit `0`, since that is the end state it was asked for, and it waits
 up to 20 seconds for the server to release the store lock before answering. Both
 of its non-zero cases mean odin is still up.

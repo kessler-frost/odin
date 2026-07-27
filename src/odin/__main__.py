@@ -543,18 +543,38 @@ def stop() -> None:
     typer.echo("Stopped.")
 
 
-def _reconciler_health(url: str) -> list[dict] | None:
-    """Every reconciler's own liveness answer from `GET /health`, or None if
+# The exit code for "odin is up, but its reconcilers could not be asked" -- see
+# `status`. Distinct from 0 (they ARE converging) and 1 (one is DOWN), and the
+# same 2 the README's contract already assigns to "a usage error or an
+# unreachable server": at this point the store lock proves odin is up, and the
+# server at `--url` is the thing that could not be reached.
+_STATUS_UNKNOWN_EXIT = 2
+
+
+def _reconciler_health(url: str) -> list[dict] | str:
+    """Every reconciler's own liveness answer from `GET /health`, or the reason
     this server could not be asked at `url`.
 
-    None is UNKNOWN and is reported as such -- never as healthy. An absent
-    `reconcilers` key is the same unknown: a body that predates the field
-    proves nothing about the loops behind it."""
+    A reason string is UNKNOWN and is reported as such -- never as healthy. An
+    absent `reconcilers` key is the same unknown: a body that predates the field
+    proves nothing about the loops behind it.
+
+    Returning the REASON rather than a bare None is what stops the caller
+    guessing at one: `http.URL_FAULTS` (a schemeless `ODIN_URL`, a non-numeric
+    port) means odin never made a request at all, so "did not answer" would be
+    the wrong sentence, and until field test 6 F9 `httpx.InvalidURL` -- which is
+    not an `httpx.HTTPError` -- was not caught here at all and came out as a
+    traceback."""
     try:
         body = httpx.get(f"{url.rstrip('/')}/health", timeout=5.0).json()
-    except (httpx.HTTPError, ValueError):
-        return None
-    return body.get("reconcilers") if isinstance(body.get("reconcilers"), list) else None
+    except http.URL_FAULTS as exc:
+        return http.url_fault_reason(url, exc)
+    except (httpx.HTTPError, ValueError) as exc:
+        return f"did not answer {url.rstrip('/')}/health ({type(exc).__name__})"
+    reconcilers = body.get("reconcilers")
+    return reconcilers if isinstance(reconcilers, list) else (
+        f"answered {url.rstrip('/')}/health with no `reconcilers` field"
+    )
 
 
 @app.command()
@@ -568,7 +588,7 @@ def status(
         "--url", envvar="ODIN_URL", help="Base URL of the running odin server.",
     )] = http.DEFAULT_URL,
 ) -> None:
-    """Is Odin up and reconciling? Exit 0 if it is, 1 if it is not.
+    """Is Odin up and reconciling? Exit 0 yes, 1 no, 2 could not tell.
 
     `status` is a question, so the exit code is the answer -- the shell
     convention every other predicate follows (`test`, `pgrep`, `systemctl
@@ -585,9 +605,25 @@ def status(
 
     The store lock is still the liveness evidence; the loops are asked over
     HTTP, so a server on another port needs `--url`/`ODIN_URL`. Not answering
-    there is reported as UNKNOWN and exits 0: the lock genuinely proves odin is
-    running, and inventing a failure from a URL guess would be the mirror of
-    the lie above.
+    there is reported as UNKNOWN -- and it exits **2**, its own code.
+
+    Field test 6 F1, and the reasoning is worth keeping because half of it was
+    already right. That branch used to exit **0**, on the argument that the lock
+    genuinely proves odin is running and that inventing a failure from a URL
+    guess would be the mirror of the lie above. The second half of that still
+    holds and 1 is still wrong here: odin has NOT observed a stopped loop, and
+    saying it did would be its own false report. What did not hold is the
+    conclusion, because 0 is not "I could not tell" -- it is this command's
+    documented "running, AND every env's reconciler is ticking", which is
+    precisely the half odin just said was UNKNOWN. A monitoring script gating
+    on `odin status` read that as healthy.
+
+    So UNKNOWN gets a code of its own rather than borrowing either answer, and
+    the reachable-by-default case it comes from -- the server on a non-default
+    port, which this command's own message anticipates -- now fails a gate
+    instead of passing one. `odin status && odin apply` stops at an env whose
+    convergence odin cannot vouch for, which is the same contract as the
+    reconciler-down branch below.
     """
     server = live_server(ODIN_DIR)
     if server is None:
@@ -595,13 +631,13 @@ def status(
         raise typer.Exit(1)
     typer.echo(f"Odin is running ({server.detail}).")
     loops = _reconciler_health(url)
-    if loops is None:
+    if isinstance(loops, str):
         typer.echo(
-            f"Odin holds this store, but did not answer {url.rstrip('/')}/health -- whether its "
-            f"reconcilers are converging is UNKNOWN (pass --url or ODIN_URL if it is on another port).",
+            f"Odin holds this store, but {loops} -- whether its reconcilers are converging is "
+            f"UNKNOWN (pass --url or ODIN_URL if it is on another port).",
             err=True,
         )
-        return
+        raise typer.Exit(_STATUS_UNKNOWN_EXIT)
     down = [loop for loop in loops if not loop.get("ticking")]
     for loop in down:
         typer.echo(f"RECONCILER DOWN: {loop.get('verdict')}", err=True)

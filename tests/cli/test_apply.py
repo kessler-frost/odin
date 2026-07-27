@@ -227,3 +227,95 @@ def test_destroy_server_down(runner):
     result = runner.invoke(app, ["destroy"])
     assert result.exit_code == 2
     assert "odin start" in result.stderr
+
+
+# --- field test 6 F7: `-o json` wrote ZERO BYTES on the failure path ---------
+#
+# `POST /destroy`'s 500 body, in the SHAPE server.py really builds it (the
+# `still_standing` block and the `error` sentence are assembled together on the
+# failure path there, and `error` is the field `body_or_fail` keys on) -- with
+# the tf tail carrying the real diagnosis the field test captured.
+DESTROY_FAILED_500 = {
+    "status": "destroy_failed",
+    "env": "f6dest",
+    "tf": {
+        "status": "failed", "exit_code": -9,
+        "tail": [
+            "the usual cause is that this env's AWS backing containers are not running, so "
+            "every AWS call gets a real ServiceUnavailable and the provider retries it ~25 "
+            "times with backoff",
+        ],
+    },
+    "still_standing": {
+        "tf_state": ["aws_s3_bucket.dbucket", "aws_sqs_queue.dqueue"],
+        "containers": ["odin-aws-rustfs-f6dest", "odin-aws-goaws-f6dest"],
+    },
+    "error": "destroy did not finish for env 'f6dest': tofu was killed at its whole-call "
+             "deadline. still standing: 2 resource(s) in tofu state, 2 container(s).",
+}
+
+
+@respx.mock
+def test_destroy_json_emits_the_failure_body_on_stdout(runner):
+    """The finding: `odin destroy -o json > dest.json` produced `0 dest.json`.
+    A script gating on the payload got an empty string, `jq .status` got a parse
+    error, and the best diagnosis odin produced -- which the server really does
+    put in this body -- reached nobody."""
+    respx.post(f"{BASE}/destroy", params={"env": "f6dest"}).mock(
+        return_value=httpx.Response(500, json=DESTROY_FAILED_500)
+    )
+
+    result = runner.invoke(app, ["destroy", "--env", "f6dest", "-o", "json"])
+
+    assert result.exit_code == 1, "a failed destroy is still a failure"
+    assert result.stdout != "", "the whole finding: zero bytes on stdout"
+    body = json.loads(result.stdout)
+    assert body == DESTROY_FAILED_500
+    # the three things a human or a script actually needs out of it
+    assert body["status"] == "destroy_failed"
+    assert body["still_standing"]["containers"] == ["odin-aws-rustfs-f6dest", "odin-aws-goaws-f6dest"]
+    assert "ServiceUnavailable" in body["tf"]["tail"][0]
+    # ...and the one-line verdict still goes to stderr, not into the JSON stream
+    assert "destroy did not finish" in result.stderr
+
+
+@respx.mock
+def test_destroy_text_mode_failure_is_unchanged(runner):
+    """The other half of the guard: text mode must NOT gain a JSON blob. The
+    payload on stdout is the answer to `-o json`; the verdict on stderr is the
+    answer to a human."""
+    respx.post(f"{BASE}/destroy").mock(return_value=httpx.Response(500, json=DESTROY_FAILED_500))
+    result = runner.invoke(app, ["destroy", "--env", "f6dest"])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "destroy did not finish" in result.stderr
+
+
+@respx.mock
+def test_apply_json_emits_an_error_body_on_stdout_too(runner):
+    """The SHAPE, not the instance: every command that renders a server payload
+    had this hole, so `body_or_fail` was fixed rather than `destroy`. `/apply-full`
+    answers 409 with `error` when a run is already in progress -- previously
+    zero bytes here as well."""
+    respx.get(f"{BASE}/canvas").mock(return_value=httpx.Response(200, json={"nodes": [], "edges": []}))
+    busy = {"error": "a tofu run is already in progress for env 'default'"}
+    respx.post(f"{BASE}/apply-full").mock(return_value=httpx.Response(409, json=busy))
+
+    result = runner.invoke(app, ["apply", "-o", "json"])
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout) == busy
+    assert "already in progress" in result.stderr
+
+
+@respx.mock
+def test_apply_json_emits_an_error_body_from_the_canvas_fetch_too(runner):
+    """...including the step BEFORE the apply. `odin apply` GETs `/canvas` first,
+    and a refusal there is just as invisible to `| jq` as one from the apply."""
+    refused = {"error": "no canvas has been saved yet", "fix": "draw one, or pass --file"}
+    respx.get(f"{BASE}/canvas").mock(return_value=httpx.Response(409, json=refused))
+
+    result = runner.invoke(app, ["apply", "-o", "json"])
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout) == refused

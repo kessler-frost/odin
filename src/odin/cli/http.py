@@ -59,6 +59,40 @@ def fail(message: str, code: int = 1) -> typer.Exit:
     return typer.Exit(code)
 
 
+# The exceptions httpx raises for a URL it cannot even ATTEMPT a connection
+# with -- both PROBED against the installed httpx rather than assumed, because
+# their class hierarchy is the whole trap here:
+#
+#   httpx.request("GET", "localhost:4200/world")
+#     -> UnsupportedProtocol("Request URL is missing an 'http://' or 'https://' protocol.")
+#   httpx.request("GET", "http://localhost:notaport/world")
+#     -> InvalidURL("Invalid port: 'notaport'")
+#
+# `UnsupportedProtocol` is a `TransportError`, so it slips past
+# `except (ConnectError, ConnectTimeout)` above; `InvalidURL` subclasses plain
+# `Exception` and is NOT an `httpx.HTTPError` at all, so it slips past
+# `except httpx.HTTPError` too -- which is how `odin status` kept its own hole
+# after `request()` was fixed. Field test 6 F9: `ODIN_URL=localhost:4520 odin
+# envs` printed a rich httpx traceback and exited 1. Re-measured here against a
+# live server before the fix: `ODIN_URL=localhost:4720 odin world` -> exit 1
+# with 176 lines on stderr (the report said ~90) and 0 bytes on stdout; `odin
+# status --url http://localhost:notaport` -> exit 1 with 140 lines, out of
+# `_reconciler_health`, a second site the field test never reached.
+URL_FAULTS = (httpx.UnsupportedProtocol, httpx.InvalidURL)
+
+
+def url_fault_reason(url: str, exc: Exception) -> str:
+    """Why `url` could not be used, in httpx's OWN words.
+
+    One spelling for every command that takes a `--url`/`ODIN_URL`: `request()`
+    below and `odin status`'s health probe both say this, so a user cannot be
+    told two different things about one malformed value. httpx's message is
+    quoted rather than re-derived -- it is the component that rejected the URL,
+    and re-implementing its parsing here is how a diagnosis drifts away from
+    the thing it diagnoses."""
+    return f"{url!r} is not a usable odin URL: {exc}"
+
+
 def request(
     method: str, url: str, path: str,
     params: dict | None = None, body: dict | None = None, unreachable_code: int = 2,
@@ -68,11 +102,22 @@ def request(
     `unreachable_code` overrides that 2 for the one command whose own exit
     codes need it: `odin tf plan` mirrors `tofu plan -detailed-exitcode`,
     where 2 already means "changes present" -- a down server must not be
-    able to masquerade as drift in a CI gate, so it exits 3 there."""
+    able to masquerade as drift in a CI gate, so it exits 3 there.
+
+    A URL httpx will not even dial (`URL_FAULTS`) takes the SAME exit as an
+    unreachable one, and for the same reason: the README's contract already
+    reads "2 a usage error or an unreachable server", and for `tf plan` a 2
+    would let a typo'd `ODIN_URL` masquerade as drift exactly the way a down
+    server would."""
     try:
         return httpx.request(
             method, f"{url.rstrip('/')}{path}", params=params, json=body, timeout=_TIMEOUT
         )
+    except URL_FAULTS as exc:
+        raise fail(
+            f"{url_fault_reason(url, exc)} Pass a full base URL like {DEFAULT_URL} "
+            "with --url or ODIN_URL.", unreachable_code
+        ) from None
     except (httpx.ConnectError, httpx.ConnectTimeout):
         raise fail(
             f"Could not reach odin server at {url} — is it running? Try `odin start`.", unreachable_code
@@ -157,17 +202,36 @@ def parsed_or_fail(response: httpx.Response) -> Any:
     raise fail(_refusal(response, body))
 
 
-def body_or_fail(response: httpx.Response) -> dict:
+def body_or_fail(response: httpx.Response, output: OutputFormat | None = None) -> dict:
     """`parsed_or_fail`, plus odin's own refusal convention: a truthy `error`
     (409 busy / superseded / tofu-not-installed / a failed `/destroy` /
     GET /logs's "no such node") goes to stderr with exit code 1. Checked by
     VALUE, not just key presence: a typed Pydantic response model (GET
     /logs's `LogsResponse`) always serializes an `error` key, `null` on the
     success path -- a presence-only check would wrongly treat every one of
-    those as a failure."""
+    those as a failure.
+
+    `output` is what the command was asked to PRINT, and passing it is what
+    keeps `-o json` machine-readable on the failure path (field test 6 F7).
+    `odin destroy -o json` on a failed destroy wrote ZERO BYTES to stdout: the
+    server's 500 body carries `still_standing.tf_state`,
+    `still_standing.containers` and a `tf.tail` with the correct diagnosis, and
+    all of it died here because this function only ever reached `fail`. So
+    `odin destroy -o json | jq .status` got a parse error and the best
+    diagnostic odin produced never reached anyone. The one-line `error` still
+    goes to stderr, and the exit code is still 1 -- a JSON body on stdout is
+    the ANSWER, never the verdict.
+
+    Deliberately narrower than "any error response": this runs only AFTER
+    `parsed_or_fail` has established the body is odin's OWN payload. FastAPI's
+    422 validation document still prints nothing to stdout, because a `| jq`
+    pipeline reading that as an apply result is the field-test-5 bug and
+    `parsed_or_fail` exists to stop it."""
     body = parsed_or_fail(response)
     if not body.get("error"):
         return body
+    if output is OutputFormat.json:
+        echo_json(body)
     raise fail(" — ".join(str(part) for part in (body["error"], body.get("fix")) if part))
 
 

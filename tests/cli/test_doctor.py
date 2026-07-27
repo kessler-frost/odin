@@ -34,6 +34,10 @@ ALL_OK = {
     "which limactl": FakeProc(0, "/opt/homebrew/bin/limactl\n"),
     "which bun": FakeProc(0, "/Users/me/.bun/bin/bun\n"),
     "which claude": FakeProc(0, "/opt/homebrew/bin/claude\n"),
+    # Real paths from this machine: `brew install nebula` ships both binaries,
+    # symlinked out of one Cellar/nebula/<version>/bin.
+    "which nebula": FakeProc(0, "/opt/homebrew/bin/nebula\n"),
+    "which nebula-cert": FakeProc(0, "/opt/homebrew/bin/nebula-cert\n"),
     "docker image inspect -f {{.Id}} " + DYNALITE_IMAGE: FakeProc(0, "sha256:abc\n"),
     # `ensure_host` -> the memory check's total (48 GiB in bytes, 8 CPUs)
     "docker info --format {{.MemTotal}} {{.NCPU}}": FakeProc(0, f"{48 * GIB} 8\n"),
@@ -160,6 +164,66 @@ def test_limactl_says_exactly_when_it_is_optional():
     limactl = by_name(run_checks(["limactl"], make_run({"which limactl": FakeProc(1)})))["limactl"]
     assert limactl.status == "skip"
     assert "REQUIRED for any canvas with an EC2 node" in limactl.detail
+
+
+# --- nebula: the dependency doctor never looked at (field test 6 F8) --------
+#
+# The absence was simulated with a PATH holding neither binary (nothing was
+# uninstalled) and the consequences below were PROBED against the real fabric
+# before being written down -- `ensure_network` really does raise
+# `RuntimeError: nebula-cert ca failed: nebula-cert: command not found`, and
+# `LighthouseManager.ensure_started` really does return False and log
+# "nebula not found on PATH; lighthouse not started".
+
+def test_nebula_binaries_are_checked_at_all():
+    """The finding itself: `odin doctor | grep -i nebula` printed NOTHING while
+    the mesh needs the binary, and doctor still said everything passed."""
+    results = by_name(run_checks(ALL_CHECKS, make_run(), disk_path=Path.cwd()))
+    assert "nebula" in results and "nebula-cert" in results
+
+
+def test_nebula_absent_is_a_skip_not_a_blocker():
+    """Optional, on `limactl`'s precedent: the mesh is one feature, and every
+    kind odin ships today works without it. A required-fail here would invent a
+    blocker on every machine that never draws a VPC."""
+    absent = {"which nebula": FakeProc(1), "which nebula-cert": FakeProc(1)}
+    results = run_checks(["nebula", "nebula-cert"], make_run(absent))
+    assert [(r.status, r.required) for r in results] == [("skip", False)] * 2
+    assert [r.fix for r in results] == ["brew install nebula"] * 2
+
+
+def test_nebula_rows_name_the_consequence_each_binary_has():
+    """"optional" on its own is what made `limactl` misleading. Each row carries
+    the failure the user would otherwise meet at apply time -- and they are
+    DIFFERENT failures, which is why this is two rows and not one."""
+    absent = {"which nebula": FakeProc(1), "which nebula-cert": FakeProc(1)}
+    results = by_name(run_checks(["nebula", "nebula-cert"], make_run(absent)))
+    assert "lighthouse" in results["nebula"].detail
+    assert "REQUIRED for any canvas with a VPC node" in results["nebula-cert"].detail
+    # the verbatim string the real fabric raises, so the row matches the error
+    assert "nebula-cert ca failed" in results["nebula-cert"].detail
+
+
+def test_the_summary_line_no_longer_reads_as_a_clean_bill_of_health(monkeypatch):
+    """F8's other half: "All required checks passed." was the LAST line while an
+    absent dependency sat above it. The sentence still holds (required checks
+    did pass) so it is unchanged -- but it no longer stands alone."""
+    patch_disk(monkeypatch)
+    absent = {"which nebula": FakeProc(1), "which nebula-cert": FakeProc(1)}
+    monkeypatch.setattr(doctor_mod, "_subprocess_run", make_run(absent))
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 0
+    assert "○ nebula " in result.output and "○ nebula-cert" in result.output
+    assert "fix: brew install nebula" in result.output
+    assert "All required checks passed." in result.output
+    assert "2 optional check(s) reported something (nebula, nebula-cert)" in result.output
+
+
+def test_the_summary_line_stays_bare_when_nothing_was_skipped(monkeypatch):
+    patch_disk(monkeypatch)
+    monkeypatch.setattr(doctor_mod, "_subprocess_run", make_run())
+    result = runner.invoke(app, ["doctor"])
+    assert result.output.rstrip().endswith("All required checks passed.")
 
 
 # --- dynalite prebake offer ------------------------------------------------

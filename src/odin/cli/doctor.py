@@ -78,6 +78,35 @@ _TOOLS: tuple[tuple[str, bool, str, str], ...] = (
      "needed only to build the UI from a clone -- the released package ships one prebuilt"),
     ("claude", False, "see https://docs.claude.com/claude-code",
      "needed only by \"what's wrong here?\" (POST /agent/debug); translation is deterministic"),
+    # Field test 6 F8: BOTH of these were undocumented AND unchecked, and doctor
+    # printed "All required checks passed." without ever looking at either --
+    # the same false-green shape as the hardcoded disk floor, one layer out.
+    #
+    # OPTIONAL, on `limactl`'s precedent and for the same reason: the mesh is
+    # ONE feature, and everything the product does today (rds, s3, sqs, sns,
+    # dynamodb, lambda, ecs, alb, elasticache, IAM, apply, destroy) runs without
+    # either binary. Failing doctor -- exit 1, "1 required check(s) failed" --
+    # on a machine that will never draw a VPC would invent a blocker, which is
+    # the mirror of the false green. What fixes the false green is the ROW: an
+    # absent binary is now printed, named, and given `brew install nebula`.
+    #
+    # Two rows, one formula, because they break at different moments with
+    # different consequences -- PROBED with a PATH holding neither (nothing was
+    # uninstalled), against the real fabric:
+    #   nebula-cert absent -> ensure_network() raises RuntimeError("nebula-cert
+    #     ca failed: nebula-cert: command not found"), so `CreateVpc` fails and
+    #     an apply of any canvas with a VPC node fails with it.
+    #   nebula absent      -> LighthouseManager.ensure_started() returns False
+    #     and logs "nebula not found on PATH; lighthouse not started" -- into the
+    #     SERVER LOG, which is why doctor is the only place a user finds out
+    #     before drawing anything.
+    ("nebula", False, "brew install nebula",
+     "REQUIRED to run an env's Nebula lighthouse (started when the first EC2 VM joins); "
+     "without it odin logs `nebula not found on PATH; lighthouse not started` to the "
+     "server log and the mesh never forms"),
+    ("nebula-cert", False, "brew install nebula",
+     "REQUIRED for any canvas with a VPC node -- CreateVpc signs that env's Nebula CA, and "
+     "without it the apply fails with `nebula-cert ca failed: nebula-cert: command not found`"),
 )
 
 ALL_CHECKS: tuple[str, ...] = (
@@ -232,4 +261,16 @@ def doctor(
     if blockers:
         typer.echo(f"\n{len(blockers)} required check(s) failed.")
         raise typer.Exit(1)
-    typer.echo("\nAll required checks passed.")
+    # The sentence, plus what it does NOT cover. Field test 6 F8 read "All
+    # required checks passed." as "this machine is ready" -- fair, since nothing
+    # else on the last line qualified it -- while an absent dependency sat in a
+    # ○ row above (or, then, in no row at all). The optional rows are the ones
+    # that decide whether a PARTICULAR canvas works, so the summary now counts
+    # them instead of leaving a reader to notice.
+    skipped = [r for r in results if r.status == "skip"]
+    typer.echo("\nAll required checks passed." + (
+        f" {len(skipped)} optional check(s) reported something "
+        f"({', '.join(r.name for r in skipped)}) -- read the ○ rows: each names the "
+        "canvas or feature it is required for."
+        if skipped else ""
+    ))
