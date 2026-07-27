@@ -183,15 +183,30 @@ async def test_wedged_apply_is_killed_at_the_timeout_and_reported_failed(tmp_pat
     _write_fake_tofu(tmp_path, _APPLY_WEDGED)
     monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
     ws = RecordingWs()
-    runner = TfRunner(tmp_path, ws=ws, timeout=0.3)
+    # 2s, not 0.3s: `apply()` runs `_init_then(...)`, so INIT gets this same
+    # budget first. At 0.3s a loaded machine timed out the (instant) fake init
+    # instead of the wedged apply -- and the test still passed its first three
+    # assertions, because an init timeout is also `ok is False` with "timed
+    # out" in the tail. It then died on `StopIteration` looking for an apply
+    # message that was never going to exist. Reproducible under `pytest -n
+    # auto`, invisible in isolation.
+    #
+    # The budget only has to be far above a shell script echoing one line
+    # while staying far below the 30s the wedged apply sleeps, so the timing
+    # this test is actually about is unchanged.
+    runner = TfRunner(tmp_path, ws=ws, timeout=2.0)
 
     start = time.monotonic()
     result = await runner.apply("default", _project(), 4266, "ak", "sk")
     elapsed = time.monotonic() - start
 
-    assert elapsed < 5, "the process should have been killed, not left to sleep out its 30s"
+    assert elapsed < 10, "the process should have been killed, not left to sleep out its 30s"
     assert result.ok is False
     assert any("timed out" in line for line in result.tail)
+    # Assert the phase EXPLICITLY. Without this the test can pass while
+    # measuring a timeout in a phase it never meant to exercise.
+    init_terminal = next(m for m in ws.messages if m.get("phase") == "init" and "status" in m)
+    assert init_terminal["status"] == "ok", "init must succeed; only the apply is meant to wedge"
     terminal = next(m for m in ws.messages if m.get("phase") == "apply" and "status" in m)
     assert terminal["status"] == "failed"
     assert any("timed out" in line for line in terminal["tail"])
