@@ -179,16 +179,16 @@ def store_lock(tmp_path):
 NO_SERVER_URL = "http://127.0.0.1:9"
 
 
-async def test_status_is_honest_about_a_server_odin_did_not_start(tmp_path, monkeypatch, capsys, store_lock):
+def test_status_is_honest_about_a_server_odin_did_not_start(tmp_path, monkeypatch, capsys, store_lock):
     monkeypatch.chdir(tmp_path)
     with pytest.raises(typer.Exit):  # UNKNOWN loops -- see the exit-2 tests below
-        await main_mod.status(url=NO_SERVER_URL)
+        main_mod.status(url=NO_SERVER_URL)
     out = capsys.readouterr().out
     assert "Odin is running" in out and str(os.getpid()) in out
     assert "store lock" in out and "no pidfile" in out
 
 
-async def test_status_says_nothing_is_running_for_a_process_that_only_looks_like_one(
+def test_status_says_nothing_is_running_for_a_process_that_only_looks_like_one(
     tmp_path, monkeypatch, capsys
 ):
     """Field test 3: with no server anywhere, `odin status` must say so --
@@ -202,25 +202,25 @@ async def test_status_says_nothing_is_running_for_a_process_that_only_looks_like
     )
     try:
         with pytest.raises(typer.Exit):
-            await main_mod.status()
+            main_mod.status()
         assert "Odin is not running" in capsys.readouterr().out
     finally:
         decoy.kill()
         decoy.wait()
 
 
-async def test_status_exits_nonzero_when_odin_is_not_running(tmp_path, monkeypatch, capsys):
+def test_status_exits_nonzero_when_odin_is_not_running(tmp_path, monkeypatch, capsys):
     """v0.7.3 printed "Odin is not running." and exited 0, so `odin status &&
     odin apply` applied against a server that wasn't there. The sentence and
     the code have to say the same thing."""
     monkeypatch.chdir(tmp_path)
     with pytest.raises(typer.Exit) as exit_info:
-        await main_mod.status()
+        main_mod.status()
     assert exit_info.value.exit_code == 1
     assert "Odin is not running" in capsys.readouterr().out
 
 
-async def test_status_exits_zero_only_when_every_loop_is_confirmed_ticking(
+def test_status_exits_zero_only_when_every_loop_is_confirmed_ticking(
     tmp_path, monkeypatch, capsys, store_lock
 ):
     """0 is this command's documented "running, AND every env's reconciler is
@@ -231,20 +231,20 @@ async def test_status_exits_zero_only_when_every_loop_is_confirmed_ticking(
     monkeypatch.setattr(main_mod, "_reconciler_health", lambda url: [
         LoopHealth(env="default", ticking=True, ticks=7).model_dump(),
     ])
-    await main_mod.status(url=NO_SERVER_URL)  # no typer.Exit at all == exit 0
+    main_mod.status(url=NO_SERVER_URL)  # no typer.Exit at all == exit 0
     assert "Odin is running" in capsys.readouterr().out
 
 
-async def test_status_reports_the_pidfile_path_as_managed(tmp_path, monkeypatch, capsys):
+def test_status_reports_the_pidfile_path_as_managed(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
     main_mod.ODIN_DIR.mkdir()
     main_mod.PID_FILE.write_text(str(os.getpid()))
     with pytest.raises(typer.Exit):  # loops UNKNOWN at this URL
-        await main_mod.status(url=NO_SERVER_URL)
+        main_mod.status(url=NO_SERVER_URL)
     assert f"Odin is running (pid {os.getpid()}, pidfile)" in capsys.readouterr().out
 
 
-async def test_status_calls_reconciler_health_unknown_when_the_server_does_not_answer(
+def test_status_calls_reconciler_health_unknown_when_the_server_does_not_answer(
     tmp_path, monkeypatch, capsys, store_lock
 ):
     """The store lock proves odin is UP; it proves nothing about the loops
@@ -254,13 +254,13 @@ async def test_status_calls_reconciler_health_unknown_when_the_server_does_not_a
     that has nothing wrong with it)."""
     monkeypatch.chdir(tmp_path)
     with pytest.raises(typer.Exit):
-        await main_mod.status(url=NO_SERVER_URL)
+        main_mod.status(url=NO_SERVER_URL)
     captured = capsys.readouterr()
     assert "Odin is running" in captured.out
     assert "UNKNOWN" in captured.err and "ODIN_URL" in captured.err
 
 
-async def test_status_exits_two_when_convergence_is_unknown(tmp_path, monkeypatch, capsys, store_lock):
+def test_status_exits_two_when_convergence_is_unknown(tmp_path, monkeypatch, capsys, store_lock):
     """Field test 6 F1. This branch used to exit 0 -- the code that says
     "running, AND every env's reconciler is ticking" -- one line after printing
     that the second half is UNKNOWN, so a monitoring script gating on `odin
@@ -274,14 +274,14 @@ async def test_status_exits_two_when_convergence_is_unknown(tmp_path, monkeypatc
     here."""
     monkeypatch.chdir(tmp_path)
     with pytest.raises(typer.Exit) as exit_info:
-        await main_mod.status(url=NO_SERVER_URL)
+        main_mod.status(url=NO_SERVER_URL)
     assert exit_info.value.exit_code == 2
     captured = capsys.readouterr()
     assert "Odin is running" in captured.out  # the half odin DID verify
     assert "UNKNOWN" in captured.err
 
 
-async def test_status_unknown_is_a_different_code_from_a_down_loop(tmp_path, monkeypatch, store_lock):
+def test_status_unknown_is_a_different_code_from_a_down_loop(tmp_path, monkeypatch, store_lock):
     """The distinction the fix exists to make: "I could not tell" and "a loop is
     down" are different answers and must not share a code. Mutation guard -- 2
     collapsing back to 1 would make UNKNOWN indistinguishable from an observed
@@ -291,16 +291,16 @@ async def test_status_unknown_is_a_different_code_from_a_down_loop(tmp_path, mon
         LoopHealth(env="default", ticking=False, verdict="its task was CANCELLED").model_dump(),
     ])
     with pytest.raises(typer.Exit) as down:
-        await main_mod.status(url=NO_SERVER_URL)
+        main_mod.status(url=NO_SERVER_URL)
 
     monkeypatch.setattr(main_mod, "_reconciler_health", lambda url: "did not answer")
     with pytest.raises(typer.Exit) as unknown:
-        await main_mod.status(url=NO_SERVER_URL)
+        main_mod.status(url=NO_SERVER_URL)
 
     assert (down.value.exit_code, unknown.value.exit_code) == (1, 2)
 
 
-async def test_status_names_a_malformed_url_rather_than_claiming_no_answer(
+def test_status_names_a_malformed_url_rather_than_claiming_no_answer(
     tmp_path, monkeypatch, capsys, store_lock
 ):
     """F9's `odin status` half. `httpx.InvalidURL` is not an `httpx.HTTPError`,
@@ -309,7 +309,7 @@ async def test_status_names_a_malformed_url_rather_than_claiming_no_answer(
     is the wrong diagnosis, because odin never made a request at all."""
     monkeypatch.chdir(tmp_path)
     with pytest.raises(typer.Exit) as exit_info:
-        await main_mod.status(url="localhost:4720")
+        main_mod.status(url="localhost:4720")
     assert exit_info.value.exit_code == 2
     err = capsys.readouterr().err
     assert "'localhost:4720' is not a usable odin URL" in err
@@ -317,12 +317,12 @@ async def test_status_names_a_malformed_url_rather_than_claiming_no_answer(
     assert "UNKNOWN" in err
 
     with pytest.raises(typer.Exit) as bad_port:
-        await main_mod.status(url="http://localhost:notaport")
+        main_mod.status(url="http://localhost:notaport")
     assert bad_port.value.exit_code == 2
     assert "Invalid port" in capsys.readouterr().err
 
 
-async def test_status_exits_nonzero_and_names_the_env_when_a_reconciler_is_down(
+def test_status_exits_nonzero_and_names_the_env_when_a_reconciler_is_down(
     tmp_path, monkeypatch, capsys, store_lock
 ):
     """A live server whose loop died is the same false green as a server that
@@ -334,18 +334,18 @@ async def test_status_exits_nonzero_and_names_the_env_when_a_reconciler_is_down(
         LoopHealth(env="default", ticking=False, verdict="... its task was CANCELLED ...").model_dump(),
     ])
     with pytest.raises(typer.Exit) as exit_info:
-        await main_mod.status(url=NO_SERVER_URL)
+        main_mod.status(url=NO_SERVER_URL)
     assert exit_info.value.exit_code == 1
     assert "RECONCILER DOWN" in capsys.readouterr().err
 
 
-async def test_status_reports_the_converging_reconcilers_by_name(tmp_path, monkeypatch, capsys, store_lock):
+def test_status_reports_the_converging_reconcilers_by_name(tmp_path, monkeypatch, capsys, store_lock):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(main_mod, "_reconciler_health", lambda url: [
         LoopHealth(env="default", ticking=True, ticks=40).model_dump(),
         LoopHealth(env="prod", ticking=True, ticks=12).model_dump(),
     ])
-    await main_mod.status(url=NO_SERVER_URL)  # exit 0
+    main_mod.status(url=NO_SERVER_URL)  # exit 0
     assert "2 reconciler(s) converging: default, prod" in capsys.readouterr().out
 
 
@@ -374,17 +374,17 @@ def test_reconciler_health_is_unknown_rather_than_empty_when_the_field_is_missin
     assert "no `reconcilers` field" in unknown
 
 
-async def test_status_cleans_a_stale_pidfile_and_says_so(tmp_path, monkeypatch, capsys):
+def test_status_cleans_a_stale_pidfile_and_says_so(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
     main_mod.ODIN_DIR.mkdir()
     main_mod.PID_FILE.write_text("999999")
     with pytest.raises(typer.Exit):
-        await main_mod.status()
+        main_mod.status()
     assert "not running (cleaned up a stale PID file)" in capsys.readouterr().out
     assert not main_mod.PID_FILE.exists()
 
 
-async def test_stop_signals_a_server_odin_did_not_start(tmp_path, monkeypatch, capsys):
+def test_stop_signals_a_server_odin_did_not_start(tmp_path, monkeypatch, capsys):
     """The SIGTERM lands, and the lock comes free the way a real server's
     does -- by the process the signal reached going away."""
     monkeypatch.chdir(tmp_path)
@@ -396,12 +396,12 @@ async def test_stop_signals_a_server_odin_did_not_start(tmp_path, monkeypatch, c
         lock.release()  # what a real server's death does to its store lock
 
     monkeypatch.setattr(main_mod.os, "kill", exits_on_sigterm)
-    await main_mod.stop()
+    main_mod.stop()
     assert killed == [(os.getpid(), main_mod.signal.SIGTERM)]
     assert "Stopped." in capsys.readouterr().out
 
 
-async def test_stop_says_stopped_only_once_the_store_is_really_free(tmp_path, monkeypatch, capsys):
+def test_stop_says_stopped_only_once_the_store_is_really_free(tmp_path, monkeypatch, capsys):
     """FIELD TEST 5. `odin stop` printed `Stopped.` and returned rc=0 in 0.17s
     while the server lived another 0.91s -- so `odin stop && odin clean --all`
     was REFUSED in two of three back-to-back trials, by the very guard that
@@ -423,7 +423,7 @@ async def test_stop_says_stopped_only_once_the_store_is_really_free(tmp_path, mo
 
     monkeypatch.setattr(main_mod.os, "kill", exits_slowly)
     started = time.monotonic()
-    await main_mod.stop()  # no typer.Exit == exit 0, and it is EARNED
+    main_mod.stop()  # no typer.Exit == exit 0, and it is EARNED
     returned_at = time.monotonic()
     assert "Stopped." in capsys.readouterr().out
     assert returned_at - started >= linger  # it waited
@@ -431,7 +431,7 @@ async def test_stop_says_stopped_only_once_the_store_is_really_free(tmp_path, mo
     assert util.live_server(main_mod.ODIN_DIR) is None  # and the store really is free
 
 
-async def test_stop_that_never_comes_down_says_so_and_exits_one(tmp_path, monkeypatch, capsys):
+def test_stop_that_never_comes_down_says_so_and_exits_one(tmp_path, monkeypatch, capsys):
     """The honest other half: a server that ignores SIGTERM. The contract is
     "0 once odin is down, 1 if it is still up", so a wait that runs out is a
     failure with the reason named -- and the pidfile SURVIVES it, because it
@@ -443,7 +443,7 @@ async def test_stop_that_never_comes_down_says_so_and_exits_one(tmp_path, monkey
     monkeypatch.setattr(main_mod.os, "kill", lambda pid, sig: None)  # SIGTERM ignored
     try:
         with pytest.raises(typer.Exit) as exit_info:
-            await main_mod.stop()
+            main_mod.stop()
     finally:
         lock.release()
     assert exit_info.value.exit_code == 1
@@ -462,7 +462,7 @@ def test_stop_waits_the_full_documented_grace(tmp_path, monkeypatch):
     assert util.SHUTDOWN_GRACE >= 10
 
 
-async def test_stop_never_signals_a_pid_it_cannot_vouch_for(tmp_path, monkeypatch, capsys):
+def test_stop_never_signals_a_pid_it_cannot_vouch_for(tmp_path, monkeypatch, capsys):
     """The lock is held (so a server IS up) but the pid stamp is unreadable --
     the one window where odin knows something is there and not what. It says
     that instead of signalling a guess: v0.7.1 guessed, and named a shell."""
@@ -474,7 +474,7 @@ async def test_stop_never_signals_a_pid_it_cannot_vouch_for(tmp_path, monkeypatc
     try:
         # ...and exits 1, because odin is still up and this command just said so.
         with pytest.raises(typer.Exit) as exit_info:
-            await main_mod.stop()
+            main_mod.stop()
     finally:
         lock.release()
     assert exit_info.value.exit_code == 1
@@ -482,11 +482,11 @@ async def test_stop_never_signals_a_pid_it_cannot_vouch_for(tmp_path, monkeypatc
     assert killed == [] and "cannot identify the process" in out and "lsof" in out
 
 
-async def test_stop_with_nothing_running_is_a_success(tmp_path, monkeypatch, capsys):
+def test_stop_with_nothing_running_is_a_success(tmp_path, monkeypatch, capsys):
     """The deliberate asymmetry with `odin status`: `stop` asks for an end
     state, and "odin is down" is exactly the end state it asked for."""
     monkeypatch.chdir(tmp_path)
-    await main_mod.stop()  # no typer.Exit == exit 0
+    main_mod.stop()  # no typer.Exit == exit 0
     assert "Odin is not running" in capsys.readouterr().out
 
 
