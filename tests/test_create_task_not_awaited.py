@@ -43,25 +43,7 @@ SCHEDULERS = {
 }
 
 # (module path, scheduler) -> owner + why it is still here. Delete when fixed.
-ALLOWED: dict[tuple[str, str], str] = {
-    ("reconcile/reconciler.py", "create_task"):
-        "v0.7.7 stage C, owner dethread-control-src. THE HANG: _run is an "
-        "infinite loop, so every `await recon.start()` never returns.",
-    ("server.py", "create_task"):
-        "v0.7.7 stage C, owner dethread-control-src (two sites: the store-lock "
-        "keeper and the reconciler watchdog, both infinite loops).",
-    ("agent/translate.py", "create_task"):
-        "v0.7.7 stage C, owner dethread-control-src.",
-    ("agent/translate.py", "wait_for"):
-        "v0.7.7 stage C, owner dethread-control-src. The inner await defeats "
-        "the timeout entirely -- all translate refinement is dead.",
-    ("agent/debugger.py", "wait_for"):
-        "v0.7.7 stage C, owner dethread-control-src. Same defeated timeout.",
-    ("reconcile/reconciler.py", "gather"):
-        "v0.7.7 stage C, owner dethread-control-src. `gather(*(await f(k) for "
-        "k in ks))` -- the await makes an ASYNC generator that `*` cannot "
-        "unpack at all, so ensure_backing never runs.",
-}
+ALLOWED: dict[tuple[str, str], str] = {}
 
 
 def _scheduler_name(call: ast.Call) -> str | None:

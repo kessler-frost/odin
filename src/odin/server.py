@@ -1004,7 +1004,7 @@ def create_apply_router(
             # VM names reached the server log and the caller got the bare text
             # `Internal Server Error`. `_EXCEPTION_VERDICTS` is what actually
             # puts them in a 500 JSON body now.
-            reclaimed = ec2compute.reclaim_env_instances(stores, env)
+            reclaimed = await ec2compute.reclaim_env_instances(stores, env)
             if reclaimed:
                 body["reclaimed_vms"] = reclaimed
             # ...and the network records the same interruption left behind,
@@ -1013,7 +1013,7 @@ def create_apply_router(
             # because the lighthouse stop hangs off the VPC-delete path, a VPC
             # record that is never deleted is a lighthouse never stopped
             # (HIGH-A through HIGH-B's back door).
-            forgotten = ec2net.purge_env(stores, env)
+            forgotten = await ec2net.purge_env(stores, env)
             if forgotten:
                 body["reclaimed_network_records"] = forgotten
 
@@ -1842,7 +1842,7 @@ async def _reap_orphaned_ec2_vms(root: Path, envs: list[str], stores: SynthStore
         # Running and tofu's state empty -- is exactly the case it spares. The
         # second witness is tofu's own state; anything the store claims and
         # the state has forgotten is unreachable by terraform forever.
-        forgotten = ec2compute.reclaim_tf_forgotten_vms(stores, envs)
+        forgotten = await ec2compute.reclaim_tf_forgotten_vms(stores, envs)
         if forgotten:
             log.warning(
                 "startup reclaimed %d EC2 VM(s) tofu's state no longer knew about: %s", len(forgotten), forgotten,

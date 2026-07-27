@@ -633,7 +633,11 @@ class Reconciler:
         if self._aws is None:
             return
         kinds = {r.kind for r in stack.resources if r.kind in ENSURE_KINDS}
-        await asyncio.gather(*(await self._aws.ensure_backing(k) for k in kinds))
+        # `gather(*(coro for ...))`, NOT `*(await coro for ...)`: an `await`
+        # inside a generator expression makes it an ASYNC generator, which `*`
+        # cannot unpack -- so `ensure_backing` never ran at all and every
+        # backing stayed unbooted. `gather` is what awaits these, concurrently.
+        await asyncio.gather(*(self._aws.ensure_backing(k) for k in kinds))
         if self._gateway is not None:
             ports = await self._aws.backing_ports()
             self._gateway.update(self._env, compile_policies(stack), ports)

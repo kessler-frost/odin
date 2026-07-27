@@ -39,14 +39,7 @@ SRC = Path(__file__).resolve().parents[1] / "src" / "odin"
 
 # (module path, line-anchoring coroutine name) -> owner + why it is still here.
 # Delete an entry when it is fixed.
-ALLOWED: dict[tuple[str, str], str] = {
-    ("api/debug.py", "fetch_logs"):
-        "v0.7.7 stage C, owner dethread-control-src",
-    ("compute/instances.py", "_lima"):
-        "v0.7.7 stage C, owner dethread-control-src (two sites)",
-    ("server.py", "health"):
-        "v0.7.7 stage C, owner dethread-control-src",
-}
+ALLOWED: dict[tuple[str, str], str] = {}
 
 
 def _coroutine_names() -> set[str]:

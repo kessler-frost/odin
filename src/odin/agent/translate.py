@@ -197,7 +197,9 @@ async def _refine(skeleton: TfProject, stack: Stack, client_cls: type, timeout: 
         allowed_tools=["mcp__translate__emit_terraform"],
     )
     try:
-        await asyncio.wait_for(await _run_agent(_prompt(skeleton, stack), options, client_cls), timeout=timeout)
+        # NO inner `await` -- see `agent/debugger.py`'s twin: awaiting first
+        # completes the SDK pass unbounded and leaves `wait_for` timing a value.
+        await asyncio.wait_for(_run_agent(_prompt(skeleton, stack), options, client_cls), timeout=timeout)
     except Exception:
         log.exception("translate agent SDK pass failed for env %s", stack.env)
         return None

@@ -492,8 +492,12 @@ async def diagnose(
         allowed_tools=["mcp__debugger__report_diagnosis"],
     )
     try:
+        # NO inner `await`: `wait_for` must receive the un-awaited coroutine so
+        # it can bound it. `wait_for(await f(), ...)` runs f to completion FIRST
+        # and only then applies a timeout to the finished result -- the bound
+        # never applies, which is precisely the hang this timeout exists to stop.
         await asyncio.wait_for(
-            await _run_agent(_prompt(context, question), options, client_cls),
+            _run_agent(_prompt(context, question), options, client_cls),
             timeout=timeout if timeout is not None else _default_timeout(),
         )
     except Exception:
