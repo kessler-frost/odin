@@ -1200,5 +1200,5 @@ What this means:
 
 ### Testing (superseded)
 - [x] pytest suite: 80 unit + 9 integration (real Colima/MiniStack/Lima/Claude, marker-gated)
-- [x] Browser e2e via playwright (skeleton + full-breadth scenarios)
+- [x] Browser e2e via the browser CLI (skeleton + full-breadth scenarios; playwright-cli retired 2026-07-27 in favour of agent-browser)
 - [ ] Broader end-to-end scenario coverage as milestones land
