@@ -63,6 +63,7 @@ _STATUS = {
     "SignatureDoesNotMatch": 401,
     "AccessDenied": 403,
     "ServiceUnavailable": 503,
+    "InternalFailure": 500,
 }
 
 
@@ -150,6 +151,24 @@ def service_unavailable(service: str) -> Response:
     "dead backing" failure mode: fail closed with a distinct error rather
     than hang or silently drop the request."""
     return _respond(service, "ServiceUnavailable", "The backing service is not currently available")
+
+
+def internal_failure(service: str, exc_name: str) -> Response:
+    """The handler of last resort: something raised that no path anticipated.
+
+    It exists because this app is what tofu's AWS provider and every workload
+    SDK talk to, and a bare-text 500 handed to botocore or aws-sdk-go-v2 is not
+    an error those clients can interpret -- they surface a parse failure, or
+    retry an unretryable fault, instead of reporting what went wrong. So even a
+    total surprise leaves here wearing the wire shape of the service that was
+    asked for.
+
+    Names the exception TYPE and nothing else. The full detail goes to the
+    server log, where the operator reads it; this response can reach an
+    unauthenticated caller (the gateway binds 0.0.0.0, and a request can fail
+    before SigV4 verification runs), so it must not carry paths or values. Real
+    AWS's own InternalFailure is opaque for the same reason."""
+    return _respond(service, "InternalFailure", f"odin's gateway failed to handle this request ({exc_name})")
 
 
 def synth_error(service: str, code: str, message: str, status: int) -> Response:
