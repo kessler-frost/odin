@@ -13,12 +13,12 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from odin.agent import debugger
-from odin.api.debug import build_context, create_debug_router, issued_credentials
+from odin.api.debug import ScrubSetUnreadable, build_context, create_debug_router, issued_credentials
 from odin.api.ws import ConnectionManager
 from odin.gateway.keys import KeyStore
 from odin.gateway.stores import SynthStores
 from odin.runtime.colima import ContainerFacts, HostFacts
-from odin.server import create_app
+from odin.server import _unhandled_failure, create_app
 from odin.spec.models import FieldValue, ResourceDesired, Stack, WorldDelta
 from odin.spec.store import SpecStore
 from tests.api.test_apply import FakeRds, FakeRuntime
@@ -310,6 +310,73 @@ def test_a_gateway_issued_credential_never_reaches_the_agent(tmp_path):
 
 def test_the_issued_credential_scrub_set_is_empty_for_an_env_that_issued_nothing(tmp_path):
     assert issued_credentials(SpecStore(tmp_path).root, ENV) == frozenset()
+
+
+# --- the scrub set is the ONE thing here that may not degrade quietly --------
+#
+# `issued_credentials`' docstring said it was "best-effort BY DESIGN"; the code
+# could raise five different ways, and in a sixth it returned a WRONG answer in
+# silence. Probed against the real file, all eight cases -- see that docstring.
+# An empty scrub set is the input that lets odin's own credentials into a model
+# prompt, so "there are none" and "I could not tell" must not be the same value.
+
+
+@pytest.mark.parametrize("label,content", [
+    ("truncated write", '{"db": ["AKIAodin1234", "supersecr'),
+    ("empty file", ""),
+    ("a list, not an object", "[]"),
+    ("a null value", '{"db": null}'),
+    # THE dangerous one. This raised nothing: the comprehension iterated the
+    # STRING, so the scrub set became {'A','K','I','4','o','d','i','n','1','2','3'}
+    # -- every one of those letters then redacted out of the whole prompt.
+    ("values are strings, not pairs", '{"db": "AKIAodin1234"}'),
+])
+def test_an_unreadable_scrub_set_is_never_silently_an_empty_one(tmp_path, label, content):
+    keys = tmp_path / ENV / "keys.json"
+    keys.parent.mkdir(parents=True, exist_ok=True)
+    keys.write_text(content)
+    with pytest.raises(ScrubSetUnreadable) as caught:
+        issued_credentials(tmp_path, ENV)
+    assert str(keys) in str(caught.value), f"{label}: the failure must name the file"
+
+
+def test_an_unreadable_scrub_set_stops_the_model_call_entirely(tmp_path):
+    """The point of failing at all: no prompt is built, so nothing can leak
+    into one. A route that answered 200 with a diagnosis here would have sent
+    real access/secret pairs to a model unscrubbed."""
+    store = SpecStore(tmp_path)
+    store.apply(Stack(env=ENV, resources=(DB,)))
+    keys = tmp_path / ENV / "keys.json"
+    keys.parent.mkdir(parents=True, exist_ok=True)
+    keys.write_text('{"db": "AKIAodin1234"}')
+
+    called: list[dict] = []
+
+    async def diagnose(context, question):
+        called.append(context)
+        return {"answer": "should never happen", "suspects": []}
+
+    app = FastAPI()
+    app.add_exception_handler(Exception, _unhandled_failure)
+    app.include_router(create_debug_router(
+        store, SynthStores(tmp_path), LoggingRuntime(), ConnectionManager(tmp_path), diagnose=diagnose,
+    ))
+    with TestClient(app, raise_server_exceptions=False) as client:
+        resp = client.post("/agent/debug", json={"env": ENV, "node_ids": ["db"]})
+
+    assert called == [], "the model must not be called with an unknown scrub set"
+    assert resp.status_code == 500, "documented: a file odin wrote and cannot parse is a named failure"
+    body = resp.json()
+    assert str(keys) in body["error"]
+    assert body["store"]["path"] == str(keys.absolute()), "the file rides structurally, not scraped from prose"
+
+
+def test_a_well_formed_scrub_set_still_reaches_the_prompt(tmp_path):
+    """The guard must not have broken the thing it protects: a real issued pair
+    is still collected and still scrubbed (field test 2 finding #6)."""
+    keystore = KeyStore(tmp_path)
+    access, secret = keystore.issue(ENV, "db")
+    assert issued_credentials(tmp_path, ENV) == frozenset({access, secret})
 
 
 def test_build_context_is_usable_without_the_route(tmp_path):

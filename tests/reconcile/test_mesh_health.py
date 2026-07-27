@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import pytest
 
+from odin.fabric.nebula import LighthouseAbsence
 from odin.reconcile import mesh_health
 from odin.reconcile.assertions import MESH_PROBE_TOKEN, mesh_probe_script, mesh_ready_sync
 
@@ -71,11 +72,35 @@ class FakeRuntime:
 
 
 class FakeLighthouse:
-    def __init__(self, running=True):
+    """Stands in for `LighthouseManager`, including the DIAGNOSIS half: a gate
+    that knows the lighthouse is down must also be able to say why, so
+    `why_not_running` is part of the contract this fake has to honour.
+
+    `absence` defaults to the real thing the REAL manager returns for the case
+    these tests reproduce -- the process ran and is gone -- so a test that does
+    not care still asserts against a shape production really produces."""
+
+    def __init__(self, running=True, absence=None):
         self.running = running
+        self.absence = absence or LighthouseAbsence(
+            reason="the 'prod' nebula lighthouse is not running: its process is gone",
+            fix="see /tmp/lighthouse.log for how it ended, then Apply again to restart it",
+        )
+        self.asked = 0
 
     def is_running(self, root, env):
         return self.running
+
+    def why_not_running(self, root, env):
+        self.asked += 1
+        return self.absence
+
+
+NO_NEBULA = LighthouseAbsence(
+    reason="the 'prod' nebula lighthouse is not running: the `nebula` binary is not on odin's PATH, "
+           "so it was never spawned",
+    fix="run `brew install nebula`, then Apply again (`odin doctor` shows this as its `nebula` row)",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -147,14 +172,76 @@ def test_a_dead_lighthouse_withholds_the_mesh_fact_and_ends_healthy(tmp_path):
     """Field test 2 B8: `nebula lighthouse exited immediately for env 'wa'` was
     a log line and nothing else -- /world kept publishing DATABASE_URL_MESH
     and every node stayed healthy."""
+    lighthouse = FakeLighthouse(running=False)
     kind, phase, facts, verdict = _gate(
-        _meshed_env(tmp_path), ("rds", "healthy", dict(MESH_FACTS), None),
-        lighthouse=FakeLighthouse(running=False),
+        _meshed_env(tmp_path), ("rds", "healthy", dict(MESH_FACTS), None), lighthouse=lighthouse,
     )
     assert phase == "crashed"
     assert "DATABASE_URL_MESH" not in facts and "endpoint_mesh" not in facts
     assert facts["DATABASE_URL"] == HOST_FACTS["DATABASE_URL"], "the host path is untouched"
-    assert "lighthouse is not running" in verdict and "lighthouse.log" in verdict
+    assert "lighthouse is not running" in verdict
+    # The CAUSE is asked of the component that refuses to start it, never
+    # guessed here -- and both halves of its answer reach the user.
+    assert lighthouse.asked == 1, "the gate must ask WHY, not just whether"
+    assert lighthouse.absence.reason in verdict
+    assert lighthouse.absence.fix in verdict
+
+
+def test_a_missing_nebula_binary_is_named_with_the_command_that_fixes_it(tmp_path):
+    """THE residual. In the two most likely dead-lighthouse cases the old
+    verdict sent the user to `{root}/{env}/nebula/lighthouse.log` -- a file
+    `_start_locked` returns BEFORE creating -- and then told them to re-Apply,
+    which re-enters the same `shutil.which` miss forever. Probed: three
+    consecutive `ensure_started` calls on a PATH without `nebula`, all False,
+    no log written, so the advice named a nonexistent file AND looped.
+
+    `tests/fabric/test_nebula.py::test_why_not_running_*` pins the other end of
+    this (that the REAL manager returns exactly this absence)."""
+    _, _, _, verdict = _gate(
+        _meshed_env(tmp_path), ("rds", "healthy", dict(MESH_FACTS), None),
+        lighthouse=FakeLighthouse(running=False, absence=NO_NEBULA),
+    )
+    assert "brew install nebula" in verdict, "the one command that actually fixes it"
+    assert "odin doctor" in verdict, "and where to confirm it before drawing anything"
+    assert "lighthouse.log" not in verdict, "that file has never been written in this case"
+    assert "re-Apply to re-join" not in verdict, "re-Applying re-enters the same PATH miss"
+
+
+def test_every_failure_verdict_names_a_reachable_fix(tmp_path):
+    """The SHAPE guard, not one instance of it (honesty rule 2): a future
+    branch that reports a fault without a remedy must be visible here rather
+    than inheriting whatever generic advice the wrapper last had. `gate` no
+    longer supplies one, so a forgotten `fix` prints NO advice -- honest, but
+    still a hole, and this is what finds it."""
+    root = _meshed_env(tmp_path)
+    faults = {
+        "dead lighthouse": {"lighthouse": FakeLighthouse(running=False)},
+        "stopped sidecar": {"runtime": FakeRuntime(sidecar_running=False)},
+        "replaced namespace": {"runtime": FakeRuntime(netns="container:" + "b" * 64)},
+        "unanswered overlay": {"runtime": FakeRuntime(probe_ok=False)},
+    }
+    for name, kwargs in faults.items():
+        mesh_health.reset_cache()
+        _, phase, _, verdict = _gate(root, ("rds", "healthy", dict(MESH_FACTS), None), **kwargs)
+        assert phase == "crashed", name
+        # Every remedy this module can offer, and nothing may fall through to none.
+        assert any(hint in verdict for hint in ("re-Apply", "brew install", "Apply again", "odin doctor")), \
+            f"{name}: a fault with no next move for the user: {verdict!r}"
+
+
+def test_a_check_that_explodes_does_not_tell_the_user_to_re_apply(tmp_path):
+    """A dead docker daemon is not repaired by an Apply -- and an Apply against
+    a runtime that cannot answer `status` will not fix the mesh either. This
+    branch is the one whose old inherited advice was actively wrong."""
+    class Exploding(FakeRuntime):
+        def status(self, name):
+            raise RuntimeError("docker daemon is not responding")
+
+    _, _, _, verdict = _gate(
+        _meshed_env(tmp_path), ("rds", "healthy", dict(MESH_FACTS), None), runtime=Exploding(),
+    )
+    assert "odin doctor" in verdict
+    assert "re-Apply" not in verdict, "there is nothing for an Apply to fix here"
 
 
 def test_a_sidecar_in_a_replaced_namespace_is_reported(tmp_path):

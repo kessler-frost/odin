@@ -606,6 +606,169 @@ def test_lighthouse_ensure_started_false_when_it_exits_immediately(tmp_path):
     assert not pidfile.exists()
 
 
+# --- why is it not running? the ACTIONABLE half of `is_running() is False` ---
+#
+# The residual these pin: `reconcile/mesh_health.py` told every user of a dead
+# lighthouse to read `{root}/{env}/nebula/lighthouse.log`, and in the two most
+# likely causes `_start_locked` returns BEFORE that file is opened -- so the
+# advice named a path that has never existed, while the string that really
+# fixes it (`brew install nebula`) went only to the server log.
+#
+# PROBED against the real fabric before these were written (real nebula-cert
+# 1.10.3, real `nebula` 1.10.3, nothing uninstalled -- `/opt/homebrew/bin` was
+# simply left off PATH):
+#   cert present + no `nebula` on PATH -> ensure_started False, NO log, and
+#     three further calls identically False (the "re-Apply" loop)
+#   cert absent  + `nebula` on PATH    -> ensure_started False, NO log
+#   nebula back on PATH                -> ensure_started True, log appears,
+#     is_running True  (so "brew install nebula, then Apply again" is verified,
+#     not assumed)
+#   after ensure_stopped / after a real spawn -> log EXISTS, so pointing at it
+#     there is correct and must survive
+
+
+def _empty_path(monkeypatch, tmp_path):
+    """A REAL PATH miss, not a patched `shutil.which`: an empty directory IS
+    the whole PATH, so `_resolve_bin` exercises the same lookup production
+    does (honesty rule 1 -- a fabricated upstream signal proves the parser,
+    not the integration). Nothing on the machine is touched."""
+    empty = tmp_path / "emptybin"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+
+
+def test_why_not_running_names_the_binary_not_a_log_that_was_never_written(tmp_path, monkeypatch):
+    runner = FakeRunner()
+    ensure_network(tmp_path, "prod", "1.2.3.4", runner=runner)  # cert IS present
+    _empty_path(monkeypatch, tmp_path)
+    calls: list[list[str]] = []
+    mgr = LighthouseManager(popen=_fake_popen(calls), runner=runner, nebula_bin=None)
+
+    assert mgr.ensure_started(tmp_path, "prod", "192.168.64.1") is False
+    assert calls == [], "nothing was spawned"
+    log_path = tmp_path / "prod" / "nebula" / "lighthouse.log"
+    assert not log_path.exists(), "the refusal happens BEFORE the log is opened"
+
+    absence = mgr.why_not_running(tmp_path, "prod")
+    assert "`nebula` binary is not on odin's PATH" in absence.reason
+    assert "brew install nebula" in absence.fix
+    assert "odin doctor" in absence.fix
+    assert "lighthouse.log" not in absence.sentence(), "never name a file that does not exist"
+
+
+def test_why_not_running_names_the_missing_certificate(tmp_path):
+    """No VPC ever applied for this env: `_start_locked` refuses here too, also
+    before any log is written."""
+    mgr = LighthouseManager(popen=_fake_popen([]), nebula_bin="nebula")
+    assert mgr.ensure_started(tmp_path, "prod", "192.168.64.1") is False
+    assert not (tmp_path / "prod" / "nebula" / "lighthouse.log").exists()
+
+    absence = mgr.why_not_running(tmp_path, "prod")
+    assert "no signed lighthouse certificate" in absence.reason
+    assert str(tmp_path / "prod" / "nebula" / "hosts" / "lighthouse.crt") in absence.reason
+    assert "draw a VPC node and Apply" in absence.fix
+    assert "lighthouse.log" not in absence.sentence()
+
+
+def test_why_not_running_points_at_the_log_once_the_process_really_ran(tmp_path):
+    """The half that was always RIGHT and must survive: a lighthouse that
+    actually started has a log, and its contents are the diagnosis. Probed
+    against the real binary -- the file is present after a real spawn, after
+    `ensure_stopped`, and after an immediate exit."""
+    runner = FakeRunner()
+    ensure_network(tmp_path, "prod", "1.2.3.4", runner=runner)
+    mgr = LighthouseManager(popen=_fake_popen([]), runner=runner, nebula_bin="nebula")
+    assert mgr.ensure_started(tmp_path, "prod", "192.168.64.1") is True
+    log_path = tmp_path / "prod" / "nebula" / "lighthouse.log"
+    assert log_path.exists(), "a spawn opens the log -- this is the case the old advice fit"
+    (tmp_path / "prod" / "nebula" / "lighthouse.pid").unlink()  # what ensure_stopped leaves
+
+    absence = mgr.why_not_running(tmp_path, "prod")
+    assert "its process is gone" in absence.reason
+    assert str(log_path) in absence.fix
+    assert "Apply again" in absence.fix
+
+
+def test_why_not_running_says_so_when_nothing_ever_started_it(tmp_path):
+    """Preconditions met, no log, no pid: nothing has joined this env's mesh
+    yet. The total-function fall-through -- it may not inherit another cause's
+    advice."""
+    runner = FakeRunner()
+    ensure_network(tmp_path, "prod", "1.2.3.4", runner=runner)
+    absence = LighthouseManager(runner=runner, nebula_bin="nebula").why_not_running(tmp_path, "prod")
+    assert "nothing has started it yet" in absence.reason
+    assert "Apply the canvas" in absence.fix
+
+
+def test_why_not_running_agrees_with_what_start_actually_refuses_on(tmp_path, monkeypatch):
+    """THE anti-drift property, and the reason `_blocker` exists at all: the
+    explanation a user reads must be the same check that stopped the start, not
+    a second copy of it that can rot. For every precondition state, `_blocker`
+    is non-None if and only if `ensure_started` refuses without spawning."""
+    runner = FakeRunner()
+    mgr = LighthouseManager(popen=_fake_popen([]), runner=runner, nebula_bin="nebula")
+
+    # 1. no cert -> blocked
+    assert mgr._blocker(tmp_path, "prod") is not None
+    assert mgr.ensure_started(tmp_path, "prod", "192.168.64.1") is False
+
+    # 2. cert, but no binary -> blocked
+    ensure_network(tmp_path, "prod", "1.2.3.4", runner=runner)
+    _empty_path(monkeypatch, tmp_path)
+    nobin = LighthouseManager(popen=_fake_popen([]), runner=runner, nebula_bin=None)
+    assert nobin._blocker(tmp_path, "prod") is not None
+    assert nobin.ensure_started(tmp_path, "prod", "192.168.64.1") is False
+
+    # 3. both present -> NOT blocked, and the start really proceeds
+    calls: list[list[str]] = []
+    ok = LighthouseManager(popen=_fake_popen(calls), runner=runner, nebula_bin="nebula")
+    assert ok._blocker(tmp_path, "prod") is None
+    assert ok.ensure_started(tmp_path, "prod", "192.168.64.1") is True
+    assert calls, "an unblocked start spawns"
+
+
+def test_every_absence_says_the_words_two_e2e_tests_read(tmp_path, monkeypatch):
+    """`tests/aws/test_mesh_health_e2e.py` and
+    `tests/simulate/test_mesh_recovery_e2e.py` both assert `"lighthouse is not
+    running" in verdict`, and both are `-m integration` -- deselected from the
+    unit run, so a reworded branch here would go green for a long time before
+    anything noticed. This is the cheap unit-speed proxy for that.
+
+    It is also the scannable prefix a user reads first, before the cause."""
+    runner = FakeRunner()
+    reasons = []
+
+    # 1. no cert
+    reasons.append(LighthouseManager(runner=runner, nebula_bin="nebula").why_not_running(tmp_path, "prod").reason)
+
+    # 2. cert, no binary
+    ensure_network(tmp_path, "prod", "1.2.3.4", runner=runner)
+    _empty_path(monkeypatch, tmp_path)
+    reasons.append(LighthouseManager(runner=runner, nebula_bin=None).why_not_running(tmp_path, "prod").reason)
+
+    # 3. never started (preconditions met, no log)
+    mgr = LighthouseManager(popen=_fake_popen([]), runner=runner, nebula_bin="nebula")
+    reasons.append(mgr.why_not_running(tmp_path, "prod").reason)
+
+    # 4. it ran and its process is gone
+    assert mgr.ensure_started(tmp_path, "prod", "192.168.64.1") is True
+    (tmp_path / "prod" / "nebula" / "lighthouse.pid").unlink()
+    reasons.append(mgr.why_not_running(tmp_path, "prod").reason)
+
+    assert len(reasons) == 4 and len(set(reasons)) == 4, "four DISTINCT causes, not one repeated"
+    for reason in reasons:
+        assert "lighthouse is not running" in reason, reason
+
+
+def test_why_not_running_writes_nothing(tmp_path):
+    """`is_running`'s own rule ("a GET must not mkdir") applies to the
+    diagnosis too -- a status projection calls this on a cadence."""
+    before = sorted(p.name for p in tmp_path.iterdir())
+    LighthouseManager(nebula_bin="nebula").why_not_running(tmp_path, "prod")
+    assert sorted(p.name for p in tmp_path.iterdir()) == before
+    assert not (tmp_path / "prod").exists(), "no env directory was created by a read"
+
+
 def test_lighthouse_ensure_stopped_sends_sigterm_to_the_exact_pid(tmp_path):
     """R4: no `sudo`, no ctl script -- we started this process ourselves, so
     a plain `os.kill(pid, SIGTERM)` is all it takes. Proven against a REAL

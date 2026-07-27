@@ -286,7 +286,9 @@ def test_run_instances_boot_failure_lands_terminated_with_state_reason(sink, ec2
     instance_id = result["Instances"][0]["InstanceId"]
 
     terminated = _wait_for_state(stores, sink, ec2, instance_id, "terminated", vm)
-    assert terminated["StateReason"]["Message"] == "boot failed"
+    # The class rides along with the message (`_exc_text`) -- so a boot failure
+    # whose exception carries NO message still names something real.
+    assert terminated["StateReason"]["Message"] == "RuntimeError: boot failed"
 
 
 def test_describe_instances_filters_by_state_and_vpc(sink, ec2, stores):

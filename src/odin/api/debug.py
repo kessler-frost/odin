@@ -4,10 +4,24 @@ canvas (W2.9 / M8).
 The route is a thin, honest wrapper around `agent/debugger.py`'s two halves:
 assemble the evidence for the selected node labels (pure, capped, redacted),
 then run ONE agent pass whose only effect channel is the typed
-`report_diagnosis` tool. Every outcome is a 200 -- an unknown node, an env
-with no World yet, a missing SDK, an agent timeout -- because the answer to
-"why is this broken" must never itself be a 500. When the agent can't run, the
-answer is literally `"agent unavailable"` (see `debugger.UNAVAILABLE`).
+`report_diagnosis` tool.
+
+EVERY FAILURE OF THE DIAGNOSIS IS A 200 -- an unknown node, an env with no
+World yet, a missing SDK, an agent timeout, a node whose logs cannot be read
+(`_logs_reader`) -- because the answer to "why is this broken" must never
+itself be a 500. When the agent can't run, the answer is literally
+`"agent unavailable"` (see `debugger.UNAVAILABLE`).
+
+A FILE ODIN WROTE AND CAN NO LONGER PARSE IS NOT ONE OF THOSE, and the
+docstring used to imply it was. Two reads here are load-bearing rather than
+best-effort, and both raise a NAMED failure that `server.py::_unhandled_failure`
+renders as JSON quoting the file:
+  - the Stack/World themselves (`spec/store.py::StoreUnreadable`) -- with no
+    evidence there is no diagnosis to give, only an invented one;
+  - the issued-credential scrub set (`ScrubSetUnreadable`, below) -- degrading
+    that one to "no secrets" is how odin's own keys reach a model prompt.
+Both mean the env is broken beneath this feature, so the honest answer names
+the file rather than shrugging inside a 200 that reads like a diagnosis.
 
 Logs come from the wave-1 `/logs` resolver (`api/logs.py::fetch_logs`), not a
 reimplementation: it already knows how to find an ec2 node's Lima VM journal,
@@ -26,13 +40,12 @@ send no `Origin`, so the guard never sees them.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from fastapi import APIRouter
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from odin.agent import debugger
 from odin.api.logs import fetch_logs
@@ -43,6 +56,42 @@ from odin.spec.store import SpecStore
 log = logging.getLogger("odin.debug")
 
 DEFAULT_QUESTION = "what's wrong here?"
+
+# `gateway/keys.py::KeyStore` persists exactly `{node_id: [access_key, secret_key]}`.
+# Validating the SHAPE, not just the JSON, is load-bearing: a file of
+# `{"db": "AKIA..."}` parses fine and then makes the scrub set below iterate a
+# STRING, producing the set of its single characters -- probed, and it really
+# returns `{'A','K','I','4','o','d','i','n','1','2','3'}`. That is worse than
+# any exception: every one of those letters would then be redacted out of the
+# whole prompt, mangling the evidence while looking like it worked.
+_ISSUED_KEYS = TypeAdapter(dict[str, list[str]])
+
+
+class ScrubSetUnreadable(RuntimeError):
+    """`keys.json` exists but odin cannot turn it into a scrub set.
+
+    Deliberately NOT swallowed (see `issued_credentials`): this set is the only
+    thing keeping odin's OWN issued credentials out of a model prompt, and an
+    empty set means "nothing was ever issued", never "I could not tell". A
+    corrupt file that degraded to `frozenset()` would silently re-open the leak
+    field test 2 finding #6 closed, and would do it at exactly the moment
+    something is already wrong with the env.
+
+    The same file is `KeyStore`'s own state (`gateway/keys.py::_ensure_loaded`
+    parses it unguarded too), so an env in this state has broken gateway auth
+    regardless -- naming the file loudly is the actionable answer, not a
+    graceful shrug."""
+
+    def __init__(self, path: Path, cause: Exception) -> None:
+        self.path = path.absolute()
+        super().__init__(
+            f"{self.path} holds odin's issued credentials for this env and could not be read as "
+            f"{{node: [access_key, secret_key]}} -- {type(cause).__name__}: {cause}. Refusing to "
+            f"build a diagnosis prompt without it, because those credentials could not then be "
+            # No trailing period: `server.py::_failure_body` appends its own
+            # sentence right after `str(exc)`, and one used to render as ".."
+            f"scrubbed out of it. Restore or delete that file (deleting it makes odin reissue)"
+        )
 
 
 class DebugRequest(BaseModel):
@@ -66,10 +115,21 @@ class DebugResponse(BaseModel):
 
 def _logs_reader(store: SpecStore, stores: SynthStores, runtime, env: str):
     """The `logs` callable `assemble_context` takes. `fetch_logs` is honest
-    rather than exceptional for every ABSENT case, so the guard here is only
-    for the genuinely broken host (no `docker`, no `limactl`): a diagnosis with
-    one node's logs missing is still worth having, and losing the whole answer
-    to it is not."""
+    rather than exceptional for every ABSENT case, so this guard exists for the
+    rest: a diagnosis with one node's logs missing is still worth having, and
+    losing the whole answer to it is not.
+
+    It used to say it was for "the genuinely broken host (no `docker`, no
+    `limactl`)", and that is the one thing it is NOT for -- probed, on a PATH
+    with no `docker` at all: `ColimaRuntime.status` returns `'absent'` and
+    `.logs` returns `''`, because every driver read is `check=False` and
+    `util.run_command` turns a missing binary into rc 127 rather than an
+    exception. Nothing raises. What DOES reach here is a corrupt
+    `.odin/<env>/gateway/<name>.json` (`JSONDecodeError` out of
+    `gateway/stores.py::_data`) -- and swallowing it is right HERE, unlike in
+    `GET /logs`: the diagnosis has the Stack, the World and the event log to
+    reason from, so one node's log tail going missing is a degraded answer
+    rather than no answer. It is logged with a traceback either way."""
 
     def read(node: str) -> str:
         try:
@@ -92,13 +152,32 @@ def issued_credentials(root: Path, env: str) -> frozenset[str]:
     route. Both halves go in: the access key identifies the principal and the
     secret authenticates it, and neither belongs in a prompt.
 
-    Read-only and best-effort BY DESIGN: an env that has issued nothing has no
-    file, and a diagnosis must never fail because a scrub set was empty --
-    `assemble_context` still scrubs the Stack's own secrets either way."""
+    Read-only, and best-effort about EXACTLY ONE thing: an env that has issued
+    nothing has no file at all, which is an ordinary state and answers with an
+    empty set. Everything else is a hard `ScrubSetUnreadable`, because "no
+    credentials exist" and "I could not read which credentials exist" must
+    never collapse into the same empty answer -- the second one silently
+    un-scrubs a prompt.
+
+    That distinction is the whole guard, so it is drawn on a real signal rather
+    than an assumed one. PROBED against this file, every case:
+        absent                          -> frozenset()          (the ONE best-effort case)
+        well-formed                     -> the pairs
+        truncated write                 -> was JSONDecodeError, now ScrubSetUnreadable
+        empty file                      -> was JSONDecodeError, now ScrubSetUnreadable
+        a list instead of an object     -> was AttributeError,  now ScrubSetUnreadable
+        a null value                    -> was TypeError,       now ScrubSetUnreadable
+        values are strings, not pairs   -> was a SET OF SINGLE CHARACTERS, now ScrubSetUnreadable
+        mode 000                        -> was PermissionError, now ScrubSetUnreadable
+    The second-to-last was the dangerous one: it raised nothing at all and
+    quietly produced a garbage scrub set (see `_ISSUED_KEYS`)."""
     path = root / env / "keys.json"
     if not path.exists():
         return frozenset()
-    pairs: dict[str, list[str]] = json.loads(path.read_text())
+    try:
+        pairs = _ISSUED_KEYS.validate_json(path.read_bytes())
+    except (OSError, ValidationError) as exc:
+        raise ScrubSetUnreadable(path, exc) from exc
     return frozenset(value for pair in pairs.values() for value in pair if value)
 
 

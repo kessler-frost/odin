@@ -592,9 +592,13 @@ def test_apply_full_fails_when_a_service_is_short_of_its_desired_count(tmp_path,
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "applied_services_unhealthy", body
+    # The exception's CLASS rides along with its message (`ecsctl._exc_text`),
+    # so a task killed by something that carries no message -- a real
+    # `MemoryError` has `args == ()` -- still names a real thing here instead
+    # of leaving the apply's own failure line blank.
     assert body["unhealthy"] == [{
         "node": "web", "running": 0, "desired": 3,
-        "reason": "pull access denied for nginx:this-tag-does-not-exist-9z9z",
+        "reason": "RuntimeError: pull access denied for nginx:this-tag-does-not-exist-9z9z",
     }], body
     assert "fix and re-apply" in body["note"]
 
@@ -827,9 +831,13 @@ def test_apply_full_fails_when_a_lambda_this_apply_converged_never_came_back(tmp
         resp = client.post("/apply-full", json={"nodes": [], "edges": []})
     body = resp.json()
     assert body["status"] == "applied_resources_unhealthy", body
+    # Class + message (`lambdactl._exc_text`): a deploy that fails with an
+    # exception carrying NO message would otherwise land here blank -- and
+    # `_configuration_json` drops an empty StateReason from the wire outright,
+    # so the apply would say `Failed` and nothing else.
     assert body["unhealthy_resources"] == [{
         "kind": "lambda", "node": "worker", "observed": "Failed",
-        "reason": "pull access denied for public.ecr.aws/lambda/python:3.12",
+        "reason": "RuntimeError: pull access denied for public.ecr.aws/lambda/python:3.12",
     }], body
     # The note is what `odin apply` echoes, so the resource and the real reason
     # have to be legible without reading the JSON.

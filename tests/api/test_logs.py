@@ -516,6 +516,72 @@ def test_logs_route_returns_200_never_500_for_an_unknown_node(tmp_path):
         assert resp.json()["error"]
 
 
+# --- env state odin wrote and can no longer parse ---------------------------
+#
+# The residual: `gateway/stores.py::_data` reads its file with a bare
+# `json.loads`, so a truncated `.odin/<env>/gateway/<name>.json` made EVERY
+# store-backed kind raise -- probed: ecs, lambda, ec2, elasticache, logs and
+# `?group=` all `JSONDecodeError`, against a docstring promising "never a 500".
+# The fix may not go the other way either: an empty `lines` with `found=True`
+# would read as "the container said nothing" when odin never found out which
+# container to ask.
+
+
+def _corrupt_gateway_state(tmp_path, name: str) -> object:
+    gateway = tmp_path / ENV / "gateway"
+    gateway.mkdir(parents=True, exist_ok=True)
+    path = gateway / f"{name}.json"
+    path.write_text('{"service:app": ')  # exactly what an interrupted write leaves
+    return path
+
+
+def _corruptible_app(tmp_path):
+    from tests.api.test_apply import FakeRds
+    from tests.api.test_apply import FakeRuntime as ServerFakeRuntime
+
+    store = SpecStore(tmp_path)
+    store.apply(Stack(env=ENV, resources=(ResourceDesired(id="app", kind="ecs"),)))
+    return create_app(runtime=ServerFakeRuntime(), store=store, rds=FakeRds(), backings=False)
+
+
+def test_a_corrupt_gateway_state_file_is_a_named_error_not_a_500(tmp_path):
+    path = _corrupt_gateway_state(tmp_path, "ecsctl")
+    with TestClient(_corruptible_app(tmp_path)) as client:
+        resp = client.get("/logs", params={"env": ENV, "node": "app"})
+    assert resp.status_code == 200, "this route's whole contract is that it does not 500"
+    body = resp.json()
+    assert str(path) in body["error"], "the raised JSONDecodeError carries no path -- the route must find it"
+    assert "JSONDecodeError" in body["error"]
+
+
+def test_a_corrupt_gateway_state_file_never_reads_as_an_empty_log(tmp_path):
+    """The false-green half (honesty rule 2). `found`/`lines` must not say the
+    backing was consulted and had nothing to say."""
+    _corrupt_gateway_state(tmp_path, "ecsctl")
+    with TestClient(_corruptible_app(tmp_path)) as client:
+        body = client.get("/logs", params={"env": ENV, "node": "app"}).json()
+    assert body["found"] is False
+    assert body["lines"] == "" and body["error"], "empty lines only ever alongside the error that explains them"
+
+
+def test_a_corrupt_gateway_state_file_is_reported_on_the_group_path_too(tmp_path):
+    """`?group=` bypasses node resolution but reads the same store."""
+    path = _corrupt_gateway_state(tmp_path, "logsctl")
+    with TestClient(_corruptible_app(tmp_path)) as client:
+        resp = client.get("/logs", params={"env": ENV, "group": "/ecs/app"})
+    assert resp.status_code == 200
+    assert str(path) in resp.json()["error"]
+
+
+def test_a_healthy_env_is_completely_unaffected_by_that_guard(tmp_path):
+    """The guard must not turn ordinary answers into errors -- an env with no
+    gateway state at all is the common case."""
+    with TestClient(_corruptible_app(tmp_path)) as client:
+        body = client.get("/logs", params={"env": ENV, "node": "app"}).json()
+    assert body["error"] is None
+    assert body["found"] is True and "no ECS service backs" in body["message"]
+
+
 def test_logs_route_with_neither_node_nor_group_is_an_honest_error(tmp_path):
     from tests.api.test_apply import FakeRds
     from tests.api.test_apply import FakeRuntime as ServerFakeRuntime

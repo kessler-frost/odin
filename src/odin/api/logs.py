@@ -8,10 +8,24 @@ Every outcome is an honest 200 -- an unknown node, a kind with no runnable
 backing (vpc/subnet/sg/iam_role/ecr are real API/network primitives, not a
 process), or a real backing that simply isn't running yet all answer with
 `found`/`running` + a `message`, never a 500 (the same "absent is not an
-exception" contract `aws/backings.py::BackingAws.exists` already keeps). An
-UNKNOWN node -- and a call naming NEITHER a node nor a group -- is the one
-genuine error (an `error` field, so `cli/http.py::body_or_fail` treats it as
-a hard failure the same way every other odin command already does).
+exception" contract `aws/backings.py::BackingAws.exists` already keeps).
+
+THREE things are a genuine error instead, and each fills the `error` field so
+`cli/http.py::body_or_fail` turns it into a real non-zero exit the way every
+other odin command does:
+  - an UNKNOWN node;
+  - a call naming NEITHER a node nor a group;
+  - env state odin itself wrote and can no longer parse (a corrupt
+    `.odin/<env>/gateway/<name>.json`). Probed: that makes every store-backed
+    kind raise out of `gateway/stores.py::_data`. It is reported rather than
+    swallowed BECAUSE the alternative is the worst answer available here -- an
+    empty `lines` with `found=True` reads as "this container said nothing",
+    when in truth odin never found out which container to ask. See
+    `logs_route`.
+A DEAD RUNTIME is deliberately not in that list: `ColimaRuntime.status`/`logs`
+and `InstanceVm.status`/`logs` are `check=False` throughout, so a machine with
+no `docker` on PATH answers `absent`/`""` rather than raising (probed) -- the
+node then reports `not running`, which is exactly true.
 
 Kind -> real backing:
 - rds: the instance's own Postgres container (aws/rds.py::PostgresRds) --
@@ -49,7 +63,10 @@ caller asked for a specific group) and `node` is echoed back unchanged.
 """
 from __future__ import annotations
 
+import json
+import logging
 from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import APIRouter
 from pydantic import BaseModel
@@ -64,6 +81,8 @@ from odin.gateway.models import cachectl, logsctl
 from odin.gateway.stores import SynthStores
 from odin.runtime.colima import ColimaRuntime
 from odin.spec.store import SpecStore
+
+log = logging.getLogger("odin.logs")
 
 DEFAULT_TAIL = 100
 NO_BACKING_KINDS = frozenset({"vpc", "subnet", "sg", "iam_role", "ecr"})
@@ -346,6 +365,40 @@ def fetch_logs(
     return LogsResponse(env=env, node=node, kind=kind, found=True, message=f"no logs available for kind {kind!r}")
 
 
+def _corrupt_state_files(root: Path, env: str) -> list[str]:
+    """Which of this env's gateway state files no longer parse as JSON.
+
+    Run ONLY after a read has already failed, so it costs a healthy request
+    nothing. It is what makes the error actionable: the raised
+    `JSONDecodeError` carries a line and column but NOT the path, and
+    `SynthStores` has ten of these files per env, so without this the user is
+    told a byte offset in a file odin declines to name."""
+    return sorted(
+        str(path) for path in sorted((root / env / "gateway").glob("*.json"))
+        if _unparseable(path)
+    )
+
+
+def _unparseable(path: Path) -> bool:
+    try:
+        json.loads(path.read_text())
+    except (OSError, ValueError):
+        return True
+    return False
+
+
+def _unreadable_state_error(root: Path, env: str, exc: Exception) -> str:
+    corrupt = _corrupt_state_files(root, env)
+    named = ", ".join(corrupt) if corrupt else f"somewhere under {root / env / 'gateway'}"
+    # Accurate for BOTH paths this guard covers: a node read resolves a
+    # container, a `?group=` read resolves a sink, and neither could happen.
+    return (
+        f"odin could not read the gateway state for env {env!r}, so this request could not be "
+        f"resolved: {named} -- {type(exc).__name__}: {exc}. Nothing was read, so an empty result "
+        f"here would have been a lie."
+    )
+
+
 def create_logs_router(store: SpecStore, stores: SynthStores, runtime) -> APIRouter:
     router = APIRouter()
 
@@ -355,8 +408,22 @@ def create_logs_router(store: SpecStore, stores: SynthStores, runtime) -> APIRou
     ) -> LogsResponse:
         if not node and not group:
             return LogsResponse(env=env, node=node, error="node or group is required")
-        if group:  # an explicit group read wins over node resolution (module docstring)
-            return fetch_group_logs(stores, env, group, tail, node=node)
-        return fetch_logs(store, stores, runtime, env, node, tail)
+        # THE one guard, at the boundary that owns the "every outcome is an
+        # honest 200" contract. Probed: a truncated `.odin/<env>/gateway/
+        # <name>.json` makes EVERY store-backed kind -- ecs, lambda, ec2,
+        # elasticache, logs, and `?group=` -- raise `JSONDecodeError` out of
+        # `gateway/stores.py::_data`, which reads its file unguarded. It must
+        # not become a 500 (this route promises not to), and it must NOT
+        # become an empty-but-successful log either: that is the false green
+        # honesty rule 2 is about. It becomes the `error` field this route
+        # already reserves for a genuine failure, which `cli/http.py::
+        # body_or_fail` turns into a real non-zero exit.
+        try:
+            if group:  # an explicit group read wins over node resolution (module docstring)
+                return fetch_group_logs(stores, env, group, tail, node=node)
+            return fetch_logs(store, stores, runtime, env, node, tail)
+        except (OSError, ValueError) as exc:
+            log.warning("could not read gateway state for env %s: %s", env, exc)
+            return LogsResponse(env=env, node=node, error=_unreadable_state_error(stores.root, env, exc))
 
     return router

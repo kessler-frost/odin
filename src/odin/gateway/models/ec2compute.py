@@ -80,6 +80,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl
@@ -143,6 +144,35 @@ _TERMINAL_STATES = frozenset({"shutting-down", "terminated"})
 # (`reap_orphaned_vms` below) only ever considers a VM shaped like this,
 # never anything else `limactl list` happens to report.
 _VM_NAME_PREFIX = "odin-ec2-"
+
+
+def _exc_text(exc: BaseException) -> str:
+    """`ClassName: message`, and something true when there IS no message.
+
+    Byte-identical to `reconcile/reconciler.py::_exc_text` (and to
+    `server.py::_failure_body`'s same treatment) -- ONE wording for "an
+    exception is the reason", asserted equal to the canonical one by
+    `tests/gateway/test_empty_reasons.py`. A copy rather than an import
+    because `reconcile.reconciler` -> `reconcile.drift` -> THIS MODULE is a
+    real import chain, so importing back would close a cycle.
+
+    This module's renderer is the worst of the three to feed a blank: a
+    `state_reason` dict is TRUTHY even when its message is empty, so
+    `_instance_xml` emits `<stateReason><code>Server.InternalError</code>
+    <message></message></stateReason>` -- an assertion that the instance
+    failed, with nothing whatsoever about why (measured). `str(exc)` is `''`
+    for any exception built with no args, a real interpreter-raised
+    `MemoryError` included (`args == ()`, measured)."""
+    return f"{type(exc).__name__}: {exc}" if str(exc) else (
+        f"{type(exc).__name__} (raised with no message, so the class is the whole of it)"
+    )
+
+
+def _stated(reason: str, fallback: str) -> str:
+    """A caller-supplied reason, or `fallback` when it says nothing -- see
+    `mark_instance_terminated`, whose `reason` is the ONLY thing separating a
+    drifted record from a silently-vanished one."""
+    return reason.strip() or fallback
 
 
 def _mint(prefix: str) -> str:
@@ -441,14 +471,20 @@ def _finish_boot(
     try:
         ip = vm.boot(name, vm_config, hostname=instance_id, ssh_pubkey=ssh_pubkey, user_data=user_data, nebula=nebula, env_vars=env_vars)
     except Exception as exc:
-        log.warning("boot failed for instance %s (%s): %s", instance_id, name, exc)
+        log.warning("boot failed for instance %s (%s): %s", instance_id, name, _exc_text(exc))
         _update_instance(
             stores, env, instance_id, state_name="terminated",
-            state_reason={"code": "Server.InternalError", "message": str(exc)},
+            state_reason={"code": "Server.InternalError", "message": _exc_text(exc)},
             terminated_at=time.monotonic(),
         )
         return
-    _update_instance(stores, env, instance_id, state_name="running", private_ip=ip, public_ip=ip)
+    # `state_reason=None` on success for the same reason `_finish_terminate`
+    # clears it: an instance that failed to start and is then started again
+    # would otherwise keep answering DescribeInstances with the OLD failure's
+    # stateReason forever -- a caveat outliving its own fix, in the record.
+    _update_instance(
+        stores, env, instance_id, state_name="running", private_ip=ip, public_ip=ip, state_reason=None,
+    )
 
 
 def _finish_terminate(stores: SynthStores, env: str, instance_id: str, name: str, vm: InstanceVm) -> None:
@@ -465,10 +501,18 @@ def _finish_terminate(stores: SynthStores, env: str, instance_id: str, name: str
         # reaper (`reap_orphaned_vms`) is the backstop for a VM that
         # outlives every record of it entirely (e.g. this env's store gets
         # destroyed before a retry ever lands).
-        log.error("VM delete failed for instance %s (%s), will retry on next describe: %s", instance_id, name, exc)
+        log.error(
+            "VM delete failed for instance %s (%s), will retry on next describe: %s",
+            instance_id, name, _exc_text(exc),
+        )
         _update_instance(
             stores, env, instance_id,
-            state_reason={"code": "Server.InternalError", "message": f"VM delete failed, retrying: {exc}"},
+            state_reason={
+                "code": "Server.InternalError",
+                # Interpolating a bare `exc` here rendered `VM delete failed,
+                # retrying: ` -- a dangling colon where the cause belongs.
+                "message": f"VM delete failed, retrying: {_exc_text(exc)}",
+            },
             delete_failed=True,
         )
         return
@@ -519,24 +563,39 @@ def _retry_failed_deletes(stores: SynthStores, env: str, vm: InstanceVm) -> None
 
 
 def _finish_stop(stores: SynthStores, env: str, instance_id: str, name: str, vm: InstanceVm) -> None:
+    """A failed stop still lands `stopped` -- the VM is not answering, which
+    for the caller is the same end state -- but it no longer lands there
+    SILENTLY. Its sibling `_finish_start` already recorded a `state_reason`
+    for the identical failure and this one recorded nothing at all, so a stop
+    that genuinely failed was indistinguishable from one that worked in every
+    place a user can look (DescribeInstances, /world, the canvas). Same
+    `_exc_text` treatment, so the two now say the same kind of thing."""
+    reason = None
     try:
         vm.stop(name)
     except Exception as exc:
-        log.warning("VM stop failed for instance %s (%s): %s", instance_id, name, exc)
-    _update_instance(stores, env, instance_id, state_name="stopped", private_ip=None, public_ip=None)
+        log.warning("VM stop failed for instance %s (%s): %s", instance_id, name, _exc_text(exc))
+        reason = {"code": "Server.InternalError", "message": f"VM stop failed: {_exc_text(exc)}"}
+    _update_instance(
+        stores, env, instance_id, state_name="stopped",
+        private_ip=None, public_ip=None, state_reason=reason,
+    )
 
 
 def _finish_start(stores: SynthStores, env: str, instance_id: str, name: str, vm: InstanceVm) -> None:
     try:
         ip = vm.start(name)
     except Exception as exc:
-        log.warning("VM start failed for instance %s (%s): %s", instance_id, name, exc)
+        log.warning("VM start failed for instance %s (%s): %s", instance_id, name, _exc_text(exc))
         _update_instance(
             stores, env, instance_id, state_name="stopped",
-            state_reason={"code": "Server.InternalError", "message": str(exc)},
+            state_reason={"code": "Server.InternalError", "message": _exc_text(exc)},
         )
         return
-    _update_instance(stores, env, instance_id, state_name="running", private_ip=ip, public_ip=ip)
+    # Cleared on success -- see `_finish_boot` for the stale-reason this closes.
+    _update_instance(
+        stores, env, instance_id, state_name="running", private_ip=ip, public_ip=ip, state_reason=None,
+    )
 
 
 def _spawn(target: Callable[..., None], *args: object) -> None:
@@ -580,7 +639,10 @@ def mark_instance_terminated(stores: SynthStores, env: str, instance_id: str, re
     the VM -- never an invented code."""
     _update_instance(
         stores, env, instance_id, state_name="terminated",
-        state_reason={"code": "Client.UserInitiatedShutdown", "message": reason},
+        state_reason={
+            "code": "Client.UserInitiatedShutdown",
+            "message": _stated(reason, "its VM was deleted outside odin — re-Apply to recreate"),
+        },
         terminated_at=time.monotonic(), drifted=True,
     )
 
@@ -1125,8 +1187,11 @@ def reclaim_env_instances(stores: SynthStores, env: str, vm: InstanceVm | None =
         try:
             machine.delete(name)
         except Exception as exc:  # noqa: BLE001 -- reported, never swallowed; see ReclaimFailed
-            log.error("destroy could not reclaim VM %s (env %s): %s", name, env, exc)
-            failed.append(f"{name} ({exc})")
+            # `_exc_text`: `f"{name} ({exc})"` renders `odin-ec2-x ()` -- empty
+            # parentheses -- for an exception with no message, inside the ONE
+            # sentence that tells a user why their destroy did not destroy.
+            log.error("destroy could not reclaim VM %s (env %s): %s", name, env, _exc_text(exc))
+            failed.append(f"{name} ({_exc_text(exc)})")
             continue
         stores.tags.set(env, f"ec2:{instance_id}", {})
         stores.ec2compute.delete(env, _key("instance", instance_id))
@@ -1154,14 +1219,44 @@ def tf_forgotten_instances(stores: SynthStores, env: str) -> list[str]:
     STRICTLY: a state file that is missing or unreadable is NO evidence (a
     fresh env, a workspace never materialized) and yields nothing; only a
     state tofu itself wrote, which parses, and which really does not name the
-    instance, counts."""
+    instance, counts.
+
+    That "which parses" clause described a guard that DID NOT EXIST: a
+    corrupt `terraform.tfstate` (a half-written file from a `kill -9` mid-
+    apply -- the very scenario this function was built for) made `json.loads`
+    raise `JSONDecodeError` straight out of here, measured. The blast radius
+    was not local: `reclaim_tf_forgotten_vms` promises "Never raises", and
+    `server.py::_reap_orphaned_ec2_vms` catches the escape and logs it -- so
+    ONE unparseable state file silently skipped the remaining envs' reclaim
+    AND the lighthouse reaper queued behind it, three startup safety nets
+    quietly off. Unparseable is now what the docstring always said it was:
+    no evidence, and never an accusation against a VM."""
     state = tf_dir(stores.root, env) / "terraform.tfstate"
     if not state.exists():
         return []
-    text = state.read_text().strip()
+    text = state.read_text(errors="replace").strip()
     if not text:
         return []  # pre-created 0600 but never written: tofu has said nothing yet
-    parsed = json.loads(text)
+    with suppress(json.JSONDecodeError):
+        return _instances_missing_from(stores, env, json.loads(text))
+    log.warning(
+        "env %r's terraform.tfstate does not parse -- treating it as no evidence about any instance "
+        "(a half-written state from an interrupted apply). Nothing is reclaimed from this env.", env,
+    )
+    return []
+
+
+def _instances_missing_from(stores: SynthStores, env: str, parsed: object) -> list[str]:
+    """The store's instance ids that `parsed` -- tofu's own state document --
+    does not name. Answers `[]` (no evidence, accuse nothing) unless `parsed`
+    is really a state OBJECT: valid JSON is not necessarily a tofu state, and
+    a truncated write can parse cleanly as `[]` or `null`, from which "no
+    resources are known" and "every VM in this env is forgotten" are the same
+    sentence. Deleting a whole env's VMs on that reading is precisely the
+    false witness the corrupt-file guard above refuses, so this refuses it
+    too."""
+    if not isinstance(parsed, dict):
+        return []
     known = {
         instance.get("attributes", {}).get("id")
         for resource in parsed.get("resources", []) if resource.get("type") == "aws_instance"
