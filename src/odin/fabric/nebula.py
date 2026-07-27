@@ -62,6 +62,7 @@ is the lever, and the measurement behind it is in that constant's own comment.
 """
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import json
 import logging
@@ -70,7 +71,6 @@ import shutil
 import signal
 import socket
 import subprocess
-import threading
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -92,7 +92,7 @@ from odin.fabric.models import (
     VpcNetwork,
 )
 from odin.spec.models import World
-from odin.util import atomic_write_text, private_mkdir, run_command
+from odin.util import atomic_write_text, private_mkdir, run_command_async
 
 log = logging.getLogger("odin.fabric.nebula")
 
@@ -224,14 +224,16 @@ def _cert_failure(proc: _Proc) -> str:
     )
 
 
-def _default_runner(args: list[str]) -> _Proc:
-    # `run_command`: `nebula`/`nebula-cert` are downloaded on demand, so an
-    # absent binary is an ordinary state -- rc 127, not a traceback.
-    proc = run_command(args)
+async def _default_runner(args: list[str]) -> _Proc:
+    # `run_command_async`: `nebula`/`nebula-cert` are downloaded on demand, so
+    # an absent binary is an ordinary state -- rc 127, not a traceback. Async
+    # because `create_ca`/`sign_cert` await this seam (v0.7.7 de-threading);
+    # the rc-127 contract is identical to the sync twin's, by construction.
+    proc = await run_command_async(args)
     return _Proc(proc.returncode, proc.stdout, proc.stderr)
 
 
-# One `threading.Lock` per env's nebula directory (mirrors `gateway/stores.py`
+# One `asyncio.Lock` per env's nebula directory (mirrors `gateway/stores.py`
 # ::JsonStore's own per-env lock) -- two VMs in the SAME env can boot
 # concurrently, and each independently reads-mutates-persists the ONE shared
 # `overlay.json` (bootstrap in `ensure_network`, sticky-IP allocation in
@@ -243,14 +245,39 @@ def _default_runner(args: list[str]) -> _Proc:
 # both received the identical overlay IP and both handshook with the
 # lighthouse under it, and one instance's id was never in `overlay.json` at
 # all. Different envs never contend (separate locks, separate files).
-_overlay_locks: dict[str, threading.Lock] = {}
-_overlay_locks_guard = threading.Lock()
+#
+# v0.7.7 DE-THREADING VERDICT (verified per call site, and they DIFFER --
+# which is why this lock survives as an `asyncio.Lock` rather than being
+# deleted). Two of the four critical sections are pure local work that the
+# conversion leaves without a single `await`: `allocate_host_ip` (line ~546)
+# is load_overlay -> mutate -> save_overlay, and `allocate_lighthouse_port`
+# (line ~314) is file reads plus non-blocking UDP `bind` probes. The other
+# two DO await inside the section: `ensure_network` (line ~733) calls
+# `manager.create_ca()` / `manager.sign_cert()` -- two real `nebula-cert`
+# subprocesses -- and `ensure_started` (line ~962) now awaits the
+# spawn-and-poll in `_start_locked`. One shared lock object serves all four,
+# and a section that awaits is preemptible, so the duplicate-overlay-IP
+# collision recorded above comes straight back if this is deleted rather than
+# converted. The two non-awaiting sections keep the lock only because they
+# share that object with the two that need it -- taking an uncontended
+# `asyncio.Lock` is a few hundred nanoseconds and costs nothing.
+#
+# `_overlay_locks_guard` is the OPPOSITE case and IS DELETED (v0.7.7): it
+# guarded only the lazy `setdefault` into the registry dict below, which
+# contains no `await` at all, and a coroutine runs to completion between
+# awaits -- so on one event loop the read-modify-write cannot be preempted and
+# needs no lock. The same split applies to every `*_locks_guard` in odin
+# (`gateway/stores.py`, `gateway/models/elbv2ctl.py`,
+# `gateway/models/ecsctl.py`) -- the registry guard goes, the per-key lock is
+# decided on its own critical section.
+_overlay_locks: dict[str, asyncio.Lock] = {}
 
 
-def _lock_for_dir(data_dir: Path) -> threading.Lock:
+def _lock_for_dir(data_dir: Path) -> asyncio.Lock:
+    # No guard around this `setdefault`: it is a synchronous read-modify-write
+    # with no `await`, so nothing on the loop can interleave with it.
     key = str(Path(data_dir).resolve())
-    with _overlay_locks_guard:
-        return _overlay_locks.setdefault(key, threading.Lock())
+    return _overlay_locks.setdefault(key, asyncio.Lock())
 
 
 def _pinned_port() -> int | None:
@@ -291,7 +318,7 @@ def _ports_taken_by_other_envs(root: Path, env: str) -> set[int]:
     }
 
 
-def allocate_lighthouse_port(root: Path, env: str) -> int:
+async def allocate_lighthouse_port(root: Path, env: str) -> int:
     """This env's own lighthouse port: the first candidate in
     `LIGHTHOUSE_PORTS` that no other env in the store has claimed and that a
     UDP socket can actually bind. Serialized on the STORE root (not the env
@@ -300,7 +327,7 @@ def allocate_lighthouse_port(root: Path, env: str) -> int:
     pin = _pinned_port()
     if pin is not None:
         return pin
-    with _lock_for_dir(root):
+    async with _lock_for_dir(root):
         taken = _ports_taken_by_other_envs(root, env)
         free = [port for port in LIGHTHOUSE_PORTS if port not in taken and _port_free(port)]
     if not free:
@@ -336,9 +363,9 @@ class NebulaManager:
         # Signed host keys land here; 0700 like everything else under `.odin`.
         return private_mkdir(self._dir / "hosts")
 
-    def create_ca(self, network: str) -> CaInfo:
+    async def create_ca(self, network: str) -> CaInfo:
         private_mkdir(self._dir)  # ca.key is written into it
-        proc = self._run([
+        proc = await self._run([
             "nebula-cert", "ca", "-name", network,
             "-out-crt", str(self._ca_crt), "-out-key", str(self._ca_key),
         ])
@@ -346,7 +373,7 @@ class NebulaManager:
             raise RuntimeError(f"nebula-cert ca failed: {_cert_failure(proc)}")
         return CaInfo(network=network, ca_crt=self._ca_crt, ca_key=self._ca_key)
 
-    def sign_cert(self, hostname: str, ip: str, groups: list[str] | None = None) -> CertPaths:
+    async def sign_cert(self, hostname: str, ip: str, groups: list[str] | None = None) -> CertPaths:
         """`ip` must be CIDR form (e.g. 10.42.1.7/24) — Nebula requires the mask."""
         host_crt = self._hosts_dir() / f"{hostname}.crt"
         host_key = self._hosts_dir() / f"{hostname}.key"
@@ -358,7 +385,7 @@ class NebulaManager:
         ]
         if groups:
             cmd += ["-groups", ",".join(groups)]
-        proc = self._run(cmd)
+        proc = await self._run(cmd)
         if proc.returncode != 0:
             raise RuntimeError(f"nebula-cert sign failed: {_cert_failure(proc)}")
         return CertPaths(crt=host_crt, key=host_key, ca_crt=self._ca_crt)
@@ -377,7 +404,7 @@ class NebulaManager:
         (self._hosts_dir() / f"{hostname}.crt").unlink(missing_ok=True)
         (self._hosts_dir() / f"{hostname}.key").unlink(missing_ok=True)
 
-    def reissue_cert(self, hostname: str, ip: str, groups: list[str]) -> CertPaths:
+    async def reissue_cert(self, hostname: str, ip: str, groups: list[str]) -> CertPaths:
         """Sign `hostname` a NEW certificate carrying `groups`, replacing
         whatever it holds now. `ip` is its EXISTING sticky overlay address, so
         nothing already published goes stale.
@@ -403,7 +430,7 @@ class NebulaManager:
         and every tunnel re-handshakes under the new identity (a SIGHUP is not
         enough -- see `compute/instances.py::InstanceVm._refresh`)."""
         self.revoke_cert(hostname)
-        return self.sign_cert(hostname, ip, groups=groups)
+        return await self.sign_cert(hostname, ip, groups=groups)
 
     def generate_config(
         self,
@@ -523,7 +550,7 @@ class NebulaManager:
             return None
         return MeshNetwork.model_validate_json(path.read_text())
 
-    def allocate_host_ip(self, host_id: str) -> str:
+    async def allocate_host_ip(self, host_id: str) -> str:
         """Atomic read-modify-write, under this directory's lock: allocates
         (or reuses) `host_id`'s sticky overlay IP and persists it
         immediately, in ONE locked critical section -- see `_lock_for_dir`'s
@@ -533,7 +560,7 @@ class NebulaManager:
         be bootstrapped (`ensure_network` called first, as every real caller
         already does) -- there's no sensible env name to default a fresh
         `MeshNetwork` to here."""
-        with _lock_for_dir(self._dir):
+        async with _lock_for_dir(self._dir):
             overlay = self.load_overlay()
             if overlay is None:
                 raise RuntimeError(f"no Nebula network bootstrapped at {self._dir} -- call ensure_network first")
@@ -710,7 +737,7 @@ def _nebula_dir(root: Path, env: str) -> Path:
     return Path(root) / env / "nebula"
 
 
-def ensure_network(root: Path, env: str, lighthouse_underlay: str, runner=None) -> MeshNetwork:
+async def ensure_network(root: Path, env: str, lighthouse_underlay: str, runner=None) -> MeshNetwork:
     """Lazily bootstrap an env's Nebula network: CA + lighthouse cert + overlay,
     persisted under `.odin/<env>/nebula/`. Idempotent (sticky overlay).
     Locked (see `_lock_for_dir`'s module-level docstring): two VMs booting
@@ -722,13 +749,13 @@ def ensure_network(root: Path, env: str, lighthouse_underlay: str, runner=None) 
     once, HERE, before any member config can embed it, and sticky from then
     on."""
     manager = NebulaManager(_nebula_dir(root, env), runner=runner)
-    with _lock_for_dir(manager._dir):
+    async with _lock_for_dir(manager._dir):
         overlay = manager.load_overlay() or MeshNetwork(network=env)
         overlay.lighthouse_underlay_ip = lighthouse_underlay
-        overlay.lighthouse_port = overlay.lighthouse_port or allocate_lighthouse_port(root, env)
+        overlay.lighthouse_port = overlay.lighthouse_port or await allocate_lighthouse_port(root, env)
         if not manager._ca_crt.exists():
-            manager.create_ca(env)
-            manager.sign_cert("lighthouse", f"{overlay.lighthouse_ip}/{overlay.mask}", groups=["lighthouse"])
+            await manager.create_ca(env)
+            await manager.sign_cert("lighthouse", f"{overlay.lighthouse_ip}/{overlay.mask}", groups=["lighthouse"])
         manager.save_overlay(overlay)
         return overlay
 
@@ -909,7 +936,7 @@ class LighthouseManager:
             return True
         return True
 
-    def _usable_port(self, root: Path, env: str, manager: NebulaManager, overlay: MeshNetwork | None) -> int:
+    async def _usable_port(self, root: Path, env: str, manager: NebulaManager, overlay: MeshNetwork | None) -> int:
         """This env's recorded port -- unless something else on the machine is
         holding it, in which case take a fresh one and RECORD it, so the
         members that regenerate their configs (every sidecar, on the next
@@ -924,7 +951,7 @@ class LighthouseManager:
         recorded = (overlay.lighthouse_port if overlay else None) or LIGHTHOUSE_PORT
         if _pinned_port() is not None or _port_free(recorded):
             return recorded
-        fresh = allocate_lighthouse_port(root, env)
+        fresh = await allocate_lighthouse_port(root, env)
         log.warning(
             "lighthouse port %s for env %r is already in use; moving this env to %s "
             "(mesh members pick it up on their next re-join)", recorded, env, fresh,
@@ -939,7 +966,7 @@ class LighthouseManager:
             manager.save_overlay(current)
         return fresh
 
-    def ensure_started(self, root: Path, env: str, underlay: str) -> bool:
+    async def ensure_started(self, root: Path, env: str, underlay: str) -> bool:
         """Idempotent no-op if already running. Never raises -- returns
         False when the network isn't bootstrapped yet, `nebula` isn't on
         PATH, or it exits immediately (bad cert/config); the caller logs and
@@ -947,19 +974,22 @@ class LighthouseManager:
         over mesh wiring.
 
         SERIALIZED PER ENV, and that is load-bearing: two VMs in one env boot
-        on their own threads (`compute/instances.py::_activate_nebula`) and a
-        backing can join at the same moment (`fabric/sidecar.py`), so without
-        this both can see `is_running()` False and spawn. That used to be
+        as concurrent tasks on the one event loop
+        (`compute/instances.py::_activate_nebula`) and a backing can join at
+        the same moment (`fabric/sidecar.py`), so without this both can see
+        `is_running()` False and spawn. The section really does need a lock
+        even on a single loop, because it awaits (the spawn-and-poll in
+        `_start_locked`) and is therefore preemptible. That used to be
         self-limiting -- the loser lost the bind on the one fixed port and
         exited -- but with a per-env port the loser would instead MOVE the env
         to a fresh port, spawn a second lighthouse, and overwrite the winner's
         pidfile, leaking the winner (found by a stray `nebula` process after a
         two-VM integration test). Inside the lock the loser simply sees a
         running lighthouse and returns True."""
-        with _lock_for_dir(_nebula_dir(root, env)):
-            return self._start_locked(root, env, underlay)
+        async with _lock_for_dir(_nebula_dir(root, env)):
+            return await self._start_locked(root, env, underlay)
 
-    def _start_locked(self, root: Path, env: str, underlay: str) -> bool:
+    async def _start_locked(self, root: Path, env: str, underlay: str) -> bool:
         if self.is_running(root, env):
             return True
         # `_blocker` IS the precondition check -- not a copy of one. Both refusals
@@ -976,7 +1006,7 @@ class LighthouseManager:
         nebula_bin = self._resolve_bin()
         overlay = manager.load_overlay()
         lighthouse_ip = overlay.lighthouse_ip if overlay else MeshNetwork(network=env).lighthouse_ip
-        port = self._usable_port(root, env, manager, overlay)
+        port = await self._usable_port(root, env, manager, overlay)
         config_text = manager.generate_config(
             lighthouse_ip=lighthouse_ip, lighthouse_underlay=underlay,
             firewall=DEFAULT_FIREWALL, is_lighthouse=True, pki=cert, tun_disabled=True, relay_enabled=True,
@@ -999,9 +1029,13 @@ class LighthouseManager:
         # We own this process directly (no sudo/exec chain to a separate
         # copy) -- `proc.pid` IS the real nebula pid. A short poll catches an
         # IMMEDIATE crash (bad cert/config, port in use) before we trust it.
+        # `await`, not `time.sleep`: this runs on the shared control loop (both
+        # callers -- `sidecar.py::_join` and `instances.py::_activate_nebula`
+        # -- are coroutines), so a blocking poll here froze the reconciler AND
+        # the gateway for the whole timeout.
         deadline = time.monotonic() + _LIGHTHOUSE_START_TIMEOUT
         while time.monotonic() < deadline and proc.poll() is None:
-            time.sleep(0.05)
+            await asyncio.sleep(0.05)
         if proc.poll() is not None:
             log.warning(
                 "nebula lighthouse exited immediately for env %r on UDP %s (exit %s); see %s -- "
@@ -1035,7 +1069,7 @@ class LighthouseManager:
         log.info("stopped nebula lighthouse for env %r", env)
 
 
-def orphaned_lighthouses(root: Path, runner=None) -> list[tuple[int, Path]]:
+async def orphaned_lighthouses(root: Path, runner=None) -> list[tuple[int, Path]]:
     """`(pid, config path)` for every live `nebula` lighthouse process THIS
     store started whose config file is GONE -- an env destroyed out from under
     a process that is still holding its UDP port.
@@ -1058,7 +1092,7 @@ def orphaned_lighthouses(root: Path, runner=None) -> list[tuple[int, Path]]:
     a recycled pid belonging to something else -- which is more than the
     pidfile path can say."""
     marker = f"{Path(root).resolve()}/"
-    proc = (runner or _default_runner)(["ps", "-Ao", "pid=,args="])
+    proc = await (runner or _default_runner)(["ps", "-Ao", "pid=,args="])
     found: list[tuple[int, Path]] = []
     for line in proc.stdout.splitlines():
         pid, _, args = line.strip().partition(" ")
@@ -1071,14 +1105,14 @@ def orphaned_lighthouses(root: Path, runner=None) -> list[tuple[int, Path]]:
     return found
 
 
-def reap_orphaned_lighthouses(root: Path, runner=None) -> list[int]:
+async def reap_orphaned_lighthouses(root: Path, runner=None) -> list[int]:
     """SIGTERM every `orphaned_lighthouses` process, returning the pids it
     reaped. Run at server startup (`odin.server`), the same one-shot
     crash-recovery cadence as `ec2compute.reap_orphaned_vms` -- and, like it,
     never able to touch anything it has not positively identified as odin's
     own leak."""
     reaped = []
-    for pid, config in orphaned_lighthouses(root, runner):
+    for pid, config in await orphaned_lighthouses(root, runner):
         log.warning("reaping orphaned nebula lighthouse pid %s (its config %s is gone)", pid, config)
         try:
             os.kill(pid, signal.SIGTERM)

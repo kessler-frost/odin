@@ -250,9 +250,9 @@ def _has_value(payload: dict) -> bool:
 
 
 def _create_secret(payload: dict, env: str, stores: SynthStores, now: float) -> Response:
+    # No `if not name` guard: `_missing_identifier` (dispatch, below) rejects an
+    # empty `Name` for EVERY op now, this one included.
     name = payload.get("Name") or ""
-    if not name:
-        return _invalid("Name is required")
     if _secret(stores, env, name) is not None:
         return _exists(f"The operation failed because the secret {name} already exists.")
     epoch = time.time()
@@ -447,6 +447,57 @@ def current_value(stores: SynthStores, env: str, name: str) -> str | None:
 
 
 # --- dispatch --------------------------------------------------------------
+#
+# logsctl's defect, in this module's own dialect, and found the same way: every
+# handler reads `_secret_name(payload.get("SecretId") or "")` and exactly ONE
+# of them (CreateSecret) used to check the result. Measured by calling the real
+# handlers with `SecretId` omitted, nine ops answered
+#
+#   400 ResourceNotFoundException
+#       "Secrets Manager can't find the specified secret: "
+#
+# -- which blames a name the caller never sent. Fixed HERE, once, for the same
+# reason it is fixed once in logsctl: no handler is wrong; nothing stood
+# between the wire and the assumption that an identifier had arrived.
+#
+# The member lists are exactly botocore's OWN `required` metadata for the
+# `secretsmanager` model, and a real boto3 client refuses to send a request
+# without them (`describe_secret()` -> `ParamValidationError: Missing required
+# parameter in input: "SecretId"`), so this path belongs to raw HTTP clients,
+# never to terraform.
+#
+# `VersionStage` is in here for a failure one shade worse than a vacuous
+# error: `UpdateSecretVersionStage` with an empty stage matched no version, so
+# it moved nothing and answered 200 -- odin reporting a success it had not
+# performed. ListSecrets is deliberately absent (a filter-less list is a
+# legitimate call), and `PutSecretValue`'s "SecretString or SecretBinary is
+# required" stays in the handler: that is a VALUE, not an identifier, and it
+# already says what is missing.
+#
+# `InvalidParameterException` is the code because it is the one this module
+# already chose for `CreateSecret`'s own missing `Name`. Real AWS's wire code
+# here cannot be observed -- botocore never lets the request leave -- so
+# agreeing with ourselves beats inventing a second answer.
+_REQUIRED: dict[str, tuple[str, ...]] = {
+    "CreateSecret": ("Name",),
+    "DescribeSecret": ("SecretId",),
+    "UpdateSecret": ("SecretId",),
+    "DeleteSecret": ("SecretId",),
+    "TagResource": ("SecretId",),
+    "UntagResource": ("SecretId",),
+    "GetResourcePolicy": ("SecretId",),
+    "GetSecretValue": ("SecretId",),
+    "PutSecretValue": ("SecretId",),
+    "UpdateSecretVersionStage": ("SecretId", "VersionStage"),
+}
+
+
+def _missing_identifier(op: str, payload: dict) -> str | None:
+    """The first required identifier this request did not carry, or None."""
+    return next(
+        (m for m in _REQUIRED.get(op, ()) if not str(payload.get(m) or "").strip()), None,
+    )
+
 
 _Handler = Callable[[dict, str, SynthStores, float], Response]
 
@@ -465,7 +516,7 @@ _HANDLERS: dict[str, _Handler] = {
 }
 
 
-def pure_answer(action: str, resource: str, env: str, body: bytes, stores: SynthStores, now: float) -> Response:
+async def pure_answer(action: str, resource: str, env: str, body: bytes, stores: SynthStores, now: float) -> Response:
     """The whole Secrets Manager answer -- same no-backing contract as
     ec2net/iamctl/ecr/logsctl: an unmodeled action (RotateSecret,
     RestoreSecret, ...) gets a protocol-correct error, never a 503 and never
@@ -478,4 +529,5 @@ def pure_answer(action: str, resource: str, env: str, body: bytes, stores: Synth
         payload = json.loads(body) if body else {}
     except (json.JSONDecodeError, UnicodeDecodeError):
         payload = {}
-    return handler(payload, env, stores, now)
+    missing = _missing_identifier(op, payload)
+    return _invalid(f"{missing} is required") if missing else handler(payload, env, stores, now)

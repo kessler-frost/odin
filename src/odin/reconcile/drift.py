@@ -115,8 +115,9 @@ empty plan forever.
 from __future__ import annotations
 
 import logging
+import asyncio
 import os
-import time
+from functools import partial
 from typing import NamedTuple
 
 from odin.aws.rds import container_name as db_container_name
@@ -128,7 +129,7 @@ from odin.gateway.models.ec2compute import mark_instance_terminated
 from odin.gateway.models.ecsctl import container_gone_reason, mark_task_stopped
 from odin.gateway.models.lambdactl import mark_function_failed
 from odin.gateway.stores import SynthStores
-from odin.reconcile.assertions import pg_ready_sync
+from odin.reconcile.assertions import pg_ready
 from odin.runtime.colima import ColimaRuntime
 
 log = logging.getLogger("odin.reconcile.drift")
@@ -138,8 +139,9 @@ _DEFAULT_SWEEP_TICKS = 10
 # How long the rds half waits before re-asking "is it really down?" (see
 # `_sweep_databases`). Short enough that a genuinely dead database is still
 # reported on this same sweep, long enough to outlast a busy-daemon blip. Only
-# ever paid on the failure path, and the whole sweep already runs off the event
-# loop (`Reconciler._drift_verdicts` uses asyncio.to_thread).
+# ever paid on the failure path. (v0.7.7: the sweep used to run off the event
+# loop via asyncio.to_thread; it is now awaited on the loop itself, so this
+# delay yields rather than blocking.)
 _CONFIRM_DELAY = 1.0
 
 # What a failed probe that carries no error text says. `PgReady.error` is None
@@ -241,14 +243,14 @@ def _db_records(stores: SynthStores, env: str) -> list[tuple[str, dict]]:
     return out
 
 
-def _listing(read):
+async def _listing(read):
     """One bulk listing, or None when the CLI call itself failed. LOAD-
     BEARING: an empty listing and a failed listing are NOT the same thing --
     reading "docker isn't answering" as "every container is gone" would flip
     a whole env to `crashed` over a transient hiccup. None means "unknown",
     and an unknown sweep reports no drift at all."""
     try:
-        return read()
+        return await read()
     except Exception as exc:  # noqa: BLE001 -- any CLI/parse failure means "unknown"
         log.warning("drift sweep listing failed (%s); reporting no drift this pass", exc)
         return None
@@ -321,7 +323,7 @@ def _not_serving(state: str | None) -> bool:
     return state is None or state in _NOT_SERVING
 
 
-def _live_states(runtime, names: list[str]) -> dict[str, str] | None:
+async def _live_states(runtime, names: list[str]) -> dict[str, str] | None:
     """`name -> the container's real state` for the containers asked about, or
     None when the runtime itself did not answer.
 
@@ -345,13 +347,17 @@ def _live_states(runtime, names: list[str]) -> dict[str, str] | None:
         asked ONLY for containers the listing just proved exist (so a healthy
         env pays one listing plus one inspect per lambda/rds node, and a
         removed container costs no inspect at all)."""
-    present = _listing(lambda: frozenset(runtime.container_names()))
+    # `_listing` takes the coroutine FUNCTION, not a lambda: an `await`
+    # inside a lambda is a syntax error, and the frozenset belongs after
+    # the None check anyway (None means "unknown", not "empty").
+    present = await _listing(runtime.container_names)
     if present is None:
         return None
-    return {name: runtime.status(name) for name in names if name in present}
+    present = frozenset(present)
+    return {name: await runtime.status(name) for name in names if name in present}
 
 
-def _dead_verdict(containers, name: str, state: str | None) -> str:
+async def _dead_verdict(containers, name: str, state: str | None) -> str:
     """WHY this container isn't serving, in the SAME sentences the cadence half
     has always used -- one down container, one vocabulary, whichever surface an
     operator is looking at. `state is None` is the container that no longer
@@ -365,7 +371,7 @@ def _dead_verdict(containers, name: str, state: str | None) -> str:
     template differs) is reported as no number at all rather than as "exit -1":
     field test 2 LOW-17's rule, that odin never invents a code nothing
     reported."""
-    code = containers.exit_code(name) if state == "exited" else -1
+    code = await containers.exit_code(name) if state == "exited" else -1
     detail = (
         "removed outside odin" if state is None
         else f"is not running (exit {code})" if code >= 0
@@ -387,7 +393,7 @@ class Dead(NamedTuple):
     verdict: str
 
 
-def _dead(stores: SynthStores, env: str, containers=None) -> list[Dead]:
+async def _dead(stores: SynthStores, env: str, containers=None) -> list[Dead]:
     """THE read, shared by both halves so they cannot disagree: `_live_states`
     against every record that CLAIMS to be up.
 
@@ -414,28 +420,28 @@ def _dead(stores: SynthStores, env: str, containers=None) -> list[Dead]:
         for label, record in databases
     ]
     runtime = containers or ColimaRuntime()
-    states = _live_states(runtime, [container for *_rest, container in claimed])
+    states = await _live_states(runtime, [container for *_rest, container in claimed])
     if states is None:  # the runtime didn't answer: unknown is not "gone"
         return []
     return [
-        Dead(label, identity, kind, _dead_verdict(runtime, container, states.get(container)))
+        Dead(label, identity, kind, await _dead_verdict(runtime, container, states.get(container)))
         for label, identity, kind, container in claimed
         if _not_serving(states.get(container))
     ]
 
 
-def live_verdicts(stores: SynthStores, env: str, containers=None) -> dict[str, str]:
+async def live_verdicts(stores: SynthStores, env: str, containers=None) -> dict[str, str]:
     """`label -> verdict` for every lambda/rds whose container is not running
     RIGHT NOW. READ-ONLY: not one record is touched (the module docstring says
     why the projection must not write). `tf_status.project()`'s caller."""
-    return {entry.label: entry.verdict for entry in _dead(stores, env, containers)}
+    return {entry.label: entry.verdict for entry in await _dead(stores, env, containers)}
 
 
 # label -> the model call that writes this kind's failure into its own record.
 _CORRECT = {"lambda": mark_function_failed, "rds": rdsctl.mark_instance_failed}
 
 
-def sweep_compute(stores: SynthStores, env: str, containers=None) -> dict[str, str]:
+async def sweep_compute(stores: SynthStores, env: str, containers=None) -> dict[str, str]:
     """`live_verdicts` PLUS the record correction -- the same verdict written
     into the record it just proved wrong, which is what makes "re-Apply to
     recreate" true (`converge_functions`/`converge_db_instances` only ever act
@@ -444,7 +450,7 @@ def sweep_compute(stores: SynthStores, env: str, containers=None) -> dict[str, s
     /apply-full and `DriftSweeper` are its only callers, and they are exactly
     the two places allowed to write: an apply REPORTING the death is what has to
     happen before anything recreates the resource."""
-    dead = _dead(stores, env, containers)
+    dead = await _dead(stores, env, containers)
     for entry in dead:
         _CORRECT[entry.kind](stores, env, entry.identity, entry.verdict)
     return {entry.label: entry.verdict for entry in dead}
@@ -468,11 +474,17 @@ class DriftSweeper:
         # W2.7: rds's reality check is a real Postgres connection, not a
         # listing (module docstring). Injectable for the same reason the two
         # above are -- a unit test proves the sweep with no database running.
-        self._probe = probe or pg_ready_sync
+        # `pg_ready`, the COROUTINE form -- `_probe_db` awaits this. It used to
+        # default to `pg_ready_sync`, a plain function returning a PgReady
+        # dataclass, so every rds half of every drift sweep raised
+        # `TypeError: object PgReady can't be used in 'await' expression`.
+        # Unnoticed because the only tests reaching the async form are
+        # integration-marked.
+        self._probe = probe or pg_ready
         self._ticks: dict[str, int] = {}
         self._cache: dict[str, dict[str, str]] = {}
 
-    def verdicts(self, stores: SynthStores, env: str, sweep: bool = True) -> dict[str, str]:
+    async def verdicts(self, stores: SynthStores, env: str, sweep: bool = True) -> dict[str, str]:
         """`label -> drift verdict` for every ec2/lambda/rds resource whose real
         VM/container is GONE, or whose database has stopped answering (ecs
         reports through its own task records instead -- see the module
@@ -504,22 +516,28 @@ class DriftSweeper:
         if sweep:
             self._ticks[env] = count + 1
             if count % _sweep_ticks() == 0:
-                self._cache[env] = self._sweep(stores, env)
+                self._cache[env] = await self._sweep(stores, env)
         return self._cache.get(env, {})
 
-    def _sweep(self, stores: SynthStores, env: str) -> dict[str, str]:
+    async def _sweep(self, stores: SynthStores, env: str) -> dict[str, str]:
         vms = _vm_records(stores, env)
         tasks = _task_records(stores, env)
         # The lambda + rds container check is the LIVE half above, called here
         # rather than reimplemented: one function, one set of sentences, one
         # correction -- so the cadence sweep, the projection and an apply can
         # never disagree about whether a container is up (field test 5).
-        out: dict[str, str] = dict(sweep_compute(stores, env, self._containers))
+        out: dict[str, str] = dict(await sweep_compute(stores, env, self._containers))
         # At most ONE listing per substrate, and none at all when this env has
         # nothing of that shape to check (the common case: a canvas with no
         # ec2 node never shells out to limactl).
-        live_vms = _listing(lambda: frozenset(self._vms.list_names(check=True))) if vms else None
-        live_containers = _listing(self._containers.container_names) if tasks else None
+        # `partial`, not a lambda: `list_names` is a coroutine function now and a
+        # lambda cannot hold an `await`. The frozenset moves AFTER the None check
+        # because None means "the listing failed" -- reading that as "empty" would
+        # flip a whole env to crashed over a transient limactl hiccup.
+        live_vms = await _listing(partial(self._vms.list_names, check=True)) if vms else None
+        if live_vms is not None:
+            live_vms = frozenset(live_vms)
+        live_containers = await _listing(self._containers.container_names) if tasks else None
         for label, instance_id, name in vms:
             if live_vms is not None and name not in live_vms:
                 out[label] = f"VM {name} deleted outside odin — re-Apply to recreate"
@@ -531,17 +549,17 @@ class DriftSweeper:
             if live_containers is not None and name not in live_containers:
                 # Same wording as ecsctl's own passive sweep, which races this
                 # one for the identical event -- see `container_gone_reason`.
-                mark_task_stopped(stores, env, cluster, task_id, container_gone_reason(name))
-        self._sweep_databases(stores, env, out)
+                await mark_task_stopped(stores, env, cluster, task_id, container_gone_reason(name))
+        await self._sweep_databases(stores, env, out)
         return out
 
-    def _probe_db(self, record: dict):
-        return self._probe(
+    async def _probe_db(self, record: dict):
+        return await self._probe(
             "127.0.0.1", record["endpoint_port"],
             record["master_username"], record["master_password"],
         )
 
-    def _sweep_databases(self, stores: SynthStores, env: str, out: dict[str, str]) -> None:
+    async def _sweep_databases(self, stores: SynthStores, env: str, out: dict[str, str]) -> None:
         """rds's REMAINING half: one real `pg_ready` per available instance, and
         a `status` call only when that fails.
 
@@ -559,12 +577,12 @@ class DriftSweeper:
             # carries no error, so the verdict asserted a failure its own
             # newest evidence had just disproved -- and rendered the reason as
             # the literal string "None".
-            probe = self._probe_db(record)
+            probe = await self._probe_db(record)
             if probe.ok:
                 continue
             identifier = record["db_instance_identifier"]
             name = db_container_name(env, identifier)
-            if self._containers.status(name) == "running":
+            if await self._containers.status(name) == "running":
                 # The container is up but Postgres isn't answering. Reported,
                 # NOT written into the record: this may be transient, and a
                 # corrected record would need a human Apply to undo.
@@ -582,8 +600,8 @@ class DriftSweeper:
             # exists to prevent, which this path has to honor too. So: sleep a
             # beat and ask BOTH questions again, and only correct the record
             # when both still say down.
-            time.sleep(_CONFIRM_DELAY)
-            if self._probe_db(record).ok or self._containers.status(name) == "running":
+            await asyncio.sleep(_CONFIRM_DELAY)
+            if (await self._probe_db(record)).ok or await self._containers.status(name) == "running":
                 log.info("drift sweep: %s answered on re-check; treating the first sample as a blip", name)
                 continue
             # Field test 2 LOW-17: say the same thing the ecs/lambda halves
@@ -591,7 +609,7 @@ class DriftSweeper:
             # code that was never reported -- `exit_code`'s negative sentinel
             # means "there was nothing to read", which for a container that no
             # longer exists is the truth, not "exit -1".
-            exit_code = self._containers.exit_code(name)
+            exit_code = await self._containers.exit_code(name)
             out[label] = (
                 container_gone_reason(name) if exit_code < 0
                 else f"container {name} is not running (exit {exit_code}) — re-Apply to recreate"

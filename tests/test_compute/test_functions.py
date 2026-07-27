@@ -45,26 +45,35 @@ class FakeRuntime:
     statuses: dict[str, str] = field(default_factory=dict)
     ports: dict[str, int] = field(default_factory=dict)
     next_port: int = 0
+    exit_codes: dict[str, int] = field(default_factory=dict)
+    # `None` keeps the old "always some text" behaviour; `""` is the state the
+    # readiness message used to render as a dangling colon, and it is a REAL
+    # one -- measured on a live `alpine sleep 300` container, `docker logs`
+    # answered `''` while `status` answered `running` (see `_not_ready_reason`).
+    log_text: str | None = None
 
-    def run_container(self, spec: ContainerSpec):
+    async def run_container(self, spec: ContainerSpec):
         self.runs.append(spec)
         self.statuses[spec.name] = "running"
         if self.next_port:
             self.ports[spec.name] = self.next_port
 
-    def stop(self, name: str) -> None:
+    async def stop(self, name: str) -> None:
         self.stopped.append(name)
         self.statuses.pop(name, None)
         self.ports.pop(name, None)
 
-    def status(self, name: str) -> str:
+    async def status(self, name: str) -> str:
         return self.statuses.get(name, "absent")
 
-    def host_port(self, name: str, container_port: int) -> int:
+    async def exit_code(self, name: str) -> int:
+        return self.exit_codes.get(name, 0)
+
+    async def host_port(self, name: str, container_port: int) -> int:
         return self.ports.get(name, 0)
 
-    def logs(self, name: str, tail: int = 20) -> str:
-        return f"fake logs of {name}"
+    async def logs(self, name: str, tail: int = 20) -> str:
+        return self.log_text if self.log_text is not None else f"fake logs of {name}"
 
 
 @pytest.fixture
@@ -121,7 +130,7 @@ def test_extract_code_wipes_stale_files_from_a_prior_deploy(tmp_path):
 # --- ensure() / readiness --------------------------------------------------
 
 
-def test_ensure_boots_from_the_right_image_with_code_mounted_and_handler_as_command(tmp_path, listener):
+async def test_ensure_boots_from_the_right_image_with_code_mounted_and_handler_as_command(tmp_path, listener):
     runtime = FakeRuntime()
     rt = FunctionRuntime(runtime, root=tmp_path)
 
@@ -129,7 +138,7 @@ def test_ensure_boots_from_the_right_image_with_code_mounted_and_handler_as_comm
     name = container_name(ENV, FN)
     runtime.next_port = listener
 
-    port = rt.ensure(ENV, FN, "python3.12", "lambda_function.lambda_handler", {"FOO": "bar"}, code_dir)
+    port = await rt.ensure(ENV, FN, "python3.12", "lambda_function.lambda_handler", {"FOO": "bar"}, code_dir)
     assert port == listener
 
     (spec,) = runtime.runs
@@ -141,55 +150,55 @@ def test_ensure_boots_from_the_right_image_with_code_mounted_and_handler_as_comm
     assert spec.labels == {"odin-env": ENV, "odin-lambda-fn": FN}
 
 
-def test_ensure_stops_any_existing_container_before_recreating(tmp_path, listener):
+async def test_ensure_stops_any_existing_container_before_recreating(tmp_path, listener):
     runtime = FakeRuntime()
     name = container_name(ENV, FN)
     runtime.statuses[name] = "exited"  # a stale remnant from a prior run
     rt = FunctionRuntime(runtime, root=tmp_path)
     runtime.next_port = listener
-    rt.ensure(ENV, FN, "python3.12", "h.h", {}, tmp_path)
+    await rt.ensure(ENV, FN, "python3.12", "h.h", {}, tmp_path)
     assert name in runtime.stopped
 
 
-def test_ensure_falls_back_to_the_default_image_for_an_unknown_runtime(tmp_path, listener):
+async def test_ensure_falls_back_to_the_default_image_for_an_unknown_runtime(tmp_path, listener):
     runtime = FakeRuntime()
     runtime.next_port = listener
     rt = FunctionRuntime(runtime, root=tmp_path)
-    rt.ensure(ENV, FN, "ruby3.4-does-not-exist", "h.h", {}, tmp_path)
+    await rt.ensure(ENV, FN, "ruby3.4-does-not-exist", "h.h", {}, tmp_path)
     assert runtime.runs[0].image == RUNTIME_IMAGES[DEFAULT_RUNTIME]
 
 
 # --- owner directive B4: the function's real MemorySize caps the container --
 
 
-def test_ensure_passes_memory_mib_through_to_the_container_spec(tmp_path, listener):
+async def test_ensure_passes_memory_mib_through_to_the_container_spec(tmp_path, listener):
     runtime = FakeRuntime()
     runtime.next_port = listener
     rt = FunctionRuntime(runtime, root=tmp_path)
-    rt.ensure(ENV, FN, "python3.12", "h.h", {}, tmp_path, memory_mib=256)
+    await rt.ensure(ENV, FN, "python3.12", "h.h", {}, tmp_path, memory_mib=256)
     assert runtime.runs[0].memory_mib == 256.0
 
 
-def test_ensure_leaves_memory_mib_unset_when_not_given(tmp_path, listener):
+async def test_ensure_leaves_memory_mib_unset_when_not_given(tmp_path, listener):
     # Back-compat: a caller that predates this (or genuinely has none) keeps
     # today's unbounded behavior rather than a silently invented default --
     # lambdactl.py always sets one in practice (memory_size defaults to 128).
     runtime = FakeRuntime()
     runtime.next_port = listener
     rt = FunctionRuntime(runtime, root=tmp_path)
-    rt.ensure(ENV, FN, "python3.12", "h.h", {}, tmp_path)
+    await rt.ensure(ENV, FN, "python3.12", "h.h", {}, tmp_path)
     assert runtime.runs[0].memory_mib is None
 
 
-def test_ensure_raises_when_the_port_never_opens(tmp_path):
+async def test_ensure_raises_when_the_port_never_opens(tmp_path):
     runtime = FakeRuntime()
     rt = FunctionRuntime(runtime, root=tmp_path, ready_timeout=0.2, poll_interval=0.05)
     # host_port stays 0 (never published) -- readiness must time out, not hang.
     with pytest.raises(RuntimeError, match="never became ready"):
-        rt.ensure(ENV, FN, "python3.12", "h.h", {}, tmp_path)
+        await rt.ensure(ENV, FN, "python3.12", "h.h", {}, tmp_path)
 
 
-def test_ensure_raises_when_the_port_is_published_but_nothing_listens(tmp_path):
+async def test_ensure_raises_when_the_port_is_published_but_nothing_listens(tmp_path):
     runtime = FakeRuntime()
     # A port docker CLAIMS is published, but nothing is actually accepting
     # connections on it yet -- readiness must still time out, not false-
@@ -200,7 +209,61 @@ def test_ensure_raises_when_the_port_is_published_but_nothing_listens(tmp_path):
     runtime.next_port = dead_port
     rt = FunctionRuntime(runtime, root=tmp_path, ready_timeout=0.2, poll_interval=0.05)
     with pytest.raises(RuntimeError, match="never became ready"):
-        rt.ensure(ENV, FN, "python3.12", "h.h", {}, tmp_path)
+        await rt.ensure(ENV, FN, "python3.12", "h.h", {}, tmp_path)
+
+
+# --- what the readiness failure SAYS (OPEN-BUGS #5) --------------------------
+
+
+async def test_a_readiness_failure_on_a_silent_container_still_states_a_reason(tmp_path):
+    """The bug: `f"{name} RIE never became ready:\\n{logs}"` with empty logs was
+    a dangling colon and a blank line. Measured on a REAL container (`docker run
+    -d alpine sleep 300`, nothing published, nothing logged) driving the REAL
+    `_await_ready` to a REAL timeout:
+
+        'odin-lambda-p1bprobe3-quiet RIE never became ready:\\n'
+
+    ...while `status` said `running`. The empty-logs half is replayed here; the
+    integration was proved against docker, not fabricated."""
+    runtime = FakeRuntime(log_text="")
+    rt = FunctionRuntime(runtime, root=tmp_path, ready_timeout=0.2, poll_interval=0.05)
+    with pytest.raises(RuntimeError) as raised:
+        await rt.ensure(ENV, FN, "python3.12", "h.h", {}, tmp_path)
+    message = str(raised.value)
+    assert message == (
+        f"odin-lambda-{ENV}-{FN} RIE never became ready: nothing accepted a TCP connection "
+        "on its published port 8080 within 0.2s. Container: running. "
+        "It has logged nothing, so the container state above is the whole of it."
+    )
+    # The properties, independent of the wording: nothing trails off, and the
+    # two readings that are ALWAYS available are both in it.
+    assert not message.rstrip().endswith(":")
+    assert "running" in message and "0.2s" in message
+
+
+async def test_a_readiness_failure_on_a_dead_container_reports_its_exit_code(tmp_path):
+    """The other branch, also measured for real (`sh -c 'echo bootstrap said
+    no; exit 5'` -> status `exited`, exit_code 5, logs `bootstrap said no`).
+    The exit code is reported ONLY here: a RUNNING container's is `0`, and
+    printing "exit code 0" under a failure sends the reader the wrong way."""
+    name = container_name(ENV, FN)
+    runtime = FakeRuntime(log_text="bootstrap said no", exit_codes={name: 5})
+    runtime.statuses[name] = "exited"
+    rt = FunctionRuntime(runtime, root=tmp_path, ready_timeout=0.2, poll_interval=0.05)
+    with pytest.raises(RuntimeError) as raised:
+        await rt._await_ready(name)
+    message = str(raised.value)
+    assert "Container: exited, exit code 5." in message
+    assert message.endswith("Its logs:\nbootstrap said no")
+
+
+async def test_a_running_container_is_never_reported_with_an_exit_code(tmp_path):
+    """`exit_code` on a live container is 0 -- the guard must not print it."""
+    runtime = FakeRuntime(log_text="")
+    rt = FunctionRuntime(runtime, root=tmp_path, ready_timeout=0.2, poll_interval=0.05)
+    with pytest.raises(RuntimeError) as raised:
+        await rt.ensure(ENV, FN, "python3.12", "h.h", {}, tmp_path)
+    assert "exit code" not in str(raised.value)
 
 
 # --- invoke() ----------------------------------------------------------------
@@ -246,20 +309,20 @@ def rie_server():
     thread.join(timeout=2)
 
 
-def test_invoke_posts_the_payload_to_the_invoke_path_and_returns_the_body(tmp_path, rie_server):
+async def test_invoke_posts_the_payload_to_the_invoke_path_and_returns_the_body(tmp_path, rie_server):
     runtime = FakeRuntime()
     name = container_name(ENV, FN)
     runtime.statuses[name] = "running"
     runtime.ports[name] = rie_server.server_address[1]
     rt = FunctionRuntime(runtime, root=tmp_path)
 
-    result = rt.invoke(ENV, FN, b'{"key": "value"}')
+    result = await rt.invoke(ENV, FN, b'{"key": "value"}')
     assert result.payload == b'{"ok": true}'
     assert result.function_error is None
     assert rie_server.received == [b'{"key": "value"}']
 
 
-def test_invoke_surfaces_the_function_error_header(tmp_path, rie_server):
+async def test_invoke_surfaces_the_function_error_header(tmp_path, rie_server):
     rie_server.response = json.dumps({"errorType": "ValueError", "errorMessage": "boom"}).encode()
     rie_server.function_error = "Unhandled"
     runtime = FakeRuntime()
@@ -267,7 +330,7 @@ def test_invoke_surfaces_the_function_error_header(tmp_path, rie_server):
     runtime.ports[name] = rie_server.server_address[1]
     rt = FunctionRuntime(runtime, root=tmp_path)
 
-    result = rt.invoke(ENV, FN, b"{}")
+    result = await rt.invoke(ENV, FN, b"{}")
     assert result.function_error == "Unhandled"
     assert json.loads(result.payload)["errorType"] == "ValueError"
 
@@ -297,18 +360,18 @@ _REAL_RIE_ERROR_BODY = json.dumps({
 }).encode()
 
 
-def test_a_raised_handler_is_a_function_error_even_with_no_header(tmp_path, rie_server):
+async def test_a_raised_handler_is_a_function_error_even_with_no_header(tmp_path, rie_server):
     rie_server.response = _REAL_RIE_ERROR_BODY
     rie_server.function_error = None  # real RIE sends no header -- this is the bug
     rie_server.status = 200
 
-    result = _invoker(tmp_path, rie_server).invoke(ENV, FN, b"{}")
+    result = await _invoker(tmp_path, rie_server).invoke(ENV, FN, b"{}")
 
     assert result.function_error == "Unhandled"
     assert result.payload == _REAL_RIE_ERROR_BODY  # the payload is relayed untouched
 
 
-def test_an_init_or_exit_failure_is_a_function_error_too(tmp_path, rie_server):
+async def test_an_init_or_exit_failure_is_a_function_error_too(tmp_path, rie_server):
     """RIE answers 502 for an import failure or a runtime exit; real Lambda
     reports those as a 200 + FunctionError, which is what odin returns."""
     rie_server.response = json.dumps(
@@ -316,52 +379,52 @@ def test_an_init_or_exit_failure_is_a_function_error_too(tmp_path, rie_server):
     ).encode()
     rie_server.status = 502
 
-    assert _invoker(tmp_path, rie_server).invoke(ENV, FN, b"{}").function_error == "Unhandled"
+    assert (await _invoker(tmp_path, rie_server).invoke(ENV, FN, b"{}")).function_error == "Unhandled"
 
 
-def test_a_successful_invocation_still_has_no_function_error(tmp_path, rie_server):
+async def test_a_successful_invocation_still_has_no_function_error(tmp_path, rie_server):
     rie_server.response = json.dumps({"statusCode": 200, "body": "ok"}).encode()
 
-    assert _invoker(tmp_path, rie_server).invoke(ENV, FN, b"{}").function_error is None
+    assert (await _invoker(tmp_path, rie_server).invoke(ENV, FN, b"{}")).function_error is None
 
 
-def test_a_non_json_response_body_is_not_mistaken_for_an_error(tmp_path, rie_server):
+async def test_a_non_json_response_body_is_not_mistaken_for_an_error(tmp_path, rie_server):
     rie_server.response = b"\x00\x01not json at all"
 
-    assert _invoker(tmp_path, rie_server).invoke(ENV, FN, b"{}").function_error is None
+    assert (await _invoker(tmp_path, rie_server).invoke(ENV, FN, b"{}")).function_error is None
 
 
-def test_a_handler_returning_only_one_error_key_is_not_an_error(tmp_path, rie_server):
+async def test_a_handler_returning_only_one_error_key_is_not_an_error(tmp_path, rie_server):
     """Both keys, or it's just a payload that happens to mention an error."""
     rie_server.response = json.dumps({"errorMessage": "handled internally, returned 200"}).encode()
 
-    assert _invoker(tmp_path, rie_server).invoke(ENV, FN, b"{}").function_error is None
+    assert (await _invoker(tmp_path, rie_server).invoke(ENV, FN, b"{}")).function_error is None
 
 
-def test_invoke_raises_when_the_container_is_not_running(tmp_path):
+async def test_invoke_raises_when_the_container_is_not_running(tmp_path):
     rt = FunctionRuntime(FakeRuntime(), root=tmp_path)
     with pytest.raises(RuntimeError, match="not running"):
-        rt.invoke(ENV, FN, b"{}")
+        await rt.invoke(ENV, FN, b"{}")
 
 
 # --- delete / status --------------------------------------------------------
 
 
-def test_delete_stops_the_container_and_removes_the_code_dir(tmp_path):
+async def test_delete_stops_the_container_and_removes_the_code_dir(tmp_path):
     runtime = FakeRuntime()
     rt = FunctionRuntime(runtime, root=tmp_path)
     code_dir = rt.extract_code(ENV, FN, _zip_bytes({"a.py": "x"}))
     assert code_dir.exists()
 
-    rt.delete(ENV, FN)
+    await rt.delete(ENV, FN)
     assert runtime.stopped == [container_name(ENV, FN)]
     assert not code_dir.exists()
 
 
-def test_status_delegates_to_the_runtime_driver(tmp_path):
+async def test_status_delegates_to_the_runtime_driver(tmp_path):
     runtime = FakeRuntime()
     name = container_name(ENV, FN)
     runtime.statuses[name] = "running"
     rt = FunctionRuntime(runtime, root=tmp_path)
-    assert rt.status(ENV, FN) == "running"
-    assert rt.status(ENV, "ghost") == "absent"
+    assert await rt.status(ENV, FN) == "running"
+    assert await rt.status(ENV, "ghost") == "absent"

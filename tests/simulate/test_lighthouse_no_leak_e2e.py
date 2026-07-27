@@ -121,7 +121,7 @@ def _port_free(port: int) -> bool:
     return True
 
 
-def test_apply_destroy_cycles_leak_no_lighthouse_and_hold_no_port(
+async def test_apply_destroy_cycles_leak_no_lighthouse_and_hold_no_port(
     mesh_root, lighthouse_cleanup, containers, monkeypatch,
 ):
     assert shutil.which("tofu"), "OpenTofu must be on PATH for this integration test"
@@ -162,7 +162,7 @@ def test_apply_destroy_cycles_leak_no_lighthouse_and_hold_no_port(
                   f"UDP {port} free: {_port_free(port)}")
             assert survivors == [], f"cycle {cycle} leaked a lighthouse: {survivors}"
             assert _port_free(port), f"cycle {cycle} left UDP {port} held"
-            assert orphaned_lighthouses(store.root) == []
+            assert await orphaned_lighthouses(store.root) == []
             assert not (store.root / ENV / "nebula" / LIGHTHOUSE_CONFIG).exists()
 
             teardown = client.post("/apply-full", params={"env": ENV}, json=EMPTY_CANVAS)

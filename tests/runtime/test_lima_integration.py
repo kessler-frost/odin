@@ -15,6 +15,7 @@ the parser again. These run against a real container inside a real VM.
 """
 from __future__ import annotations
 
+import asyncio
 import time
 
 import pytest
@@ -32,36 +33,36 @@ INSIDE_PORT = 80
 HOST_PORT = 18080
 
 
-def _await_running(rt: LimaRuntime, name: str, timeout: float = 60.0) -> None:
+async def _await_running(rt: LimaRuntime, name: str, timeout: float = 60.0) -> None:
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline and rt.status(name) != "running":
-        time.sleep(2)
+    while time.monotonic() < deadline and await rt.status(name) != "running":
+        await asyncio.sleep(2)
 
 
 @pytest.fixture(scope="module")
-def lima():
+async def lima():
     """ONE VM for the whole module (a boot is minutes), deleted by exact name
     afterwards — the repo rule is that no stray VM survives a test run."""
     rt = LimaRuntime()
-    rt.ensure_host()  # boots the VM + nerdctl (idempotent if it already exists)
+    await rt.ensure_host()  # boots the VM + nerdctl (idempotent if it already exists)
     yield rt
     for name in (NAME, PORT_NAME, NO_PORT_NAME):
-        rt.stop(name)
-    rt._lima("delete", "--force", rt.VM, check=False)  # reclaim the VM disk
+        await rt.stop(name)
+    await rt._lima("delete", "--force", rt.VM, check=False)  # reclaim the VM disk
 
 
-def test_runs_a_container_in_a_real_vm(lima):
-    handle = lima.run_container(ContainerSpec(name=NAME, image="busybox", command=("sleep", "60")))
+async def test_runs_a_container_in_a_real_vm(lima):
+    handle = await lima.run_container(ContainerSpec(name=NAME, image="busybox", command=("sleep", "60")))
     assert handle.id
 
-    _await_running(lima, NAME)
-    assert lima.status(NAME) == "running"  # container is live inside the VM
+    await _await_running(lima, NAME)
+    assert await lima.status(NAME) == "running"  # container is live inside the VM
 
-    lima.stop(NAME)
-    assert lima.status(NAME) == "absent"
+    await lima.stop(NAME)
+    assert await lima.status(NAME) == "absent"
 
 
-def test_host_port_reads_a_real_published_port_through_nerdctl(lima):
+async def test_host_port_reads_a_real_published_port_through_nerdctl(lima):
     """Probed on a real VM — `nerdctl inspect -f '{{json .NetworkSettings.Ports}}'`
     on a container published with `-p 18080:80`:
 
@@ -71,17 +72,17 @@ def test_host_port_reads_a_real_published_port_through_nerdctl(lima):
 
     Same SHAPE as docker's (docker adds a second `{"HostIp":"::"}` binding for
     the same port; `host_port` reads `[0]["HostPort"]`, so both agree)."""
-    lima.stop(PORT_NAME)
-    lima.run_container(ContainerSpec(
+    await lima.stop(PORT_NAME)
+    await lima.run_container(ContainerSpec(
         name=PORT_NAME, image="busybox", ports={INSIDE_PORT: HOST_PORT}, command=("sleep", "600"),
     ))
-    _await_running(lima, PORT_NAME)
+    await _await_running(lima, PORT_NAME)
 
-    assert lima.host_port(PORT_NAME, INSIDE_PORT) == HOST_PORT
-    assert lima.facts(PORT_NAME, container_port=INSIDE_PORT).host_port == HOST_PORT
+    assert await lima.host_port(PORT_NAME, INSIDE_PORT) == HOST_PORT
+    assert (await lima.facts(PORT_NAME, container_port=INSIDE_PORT)).host_port == HOST_PORT
 
 
-def test_host_port_is_zero_when_nerdctl_answers_and_nothing_is_published(lima):
+async def test_host_port_is_zero_when_nerdctl_answers_and_nothing_is_published(lima):
     """The middle state, and the whole point of the rewrite: the runtime DID
     answer, and the honest answer is "nothing published there". Probed:
 
@@ -95,14 +96,14 @@ def test_host_port_is_zero_when_nerdctl_answers_and_nothing_is_published(lima):
     nerdctl too: rc=1 here is indistinguishable from rc=1 for a container that
     does not exist (next test), so `<cli> port` could not tell them apart on
     EITHER runtime. The port map can: rc 0 means answered."""
-    lima.stop(NO_PORT_NAME)
-    lima.run_container(ContainerSpec(name=NO_PORT_NAME, image="busybox", command=("sleep", "600")))
-    _await_running(lima, NO_PORT_NAME)
+    await lima.stop(NO_PORT_NAME)
+    await lima.run_container(ContainerSpec(name=NO_PORT_NAME, image="busybox", command=("sleep", "600")))
+    await _await_running(lima, NO_PORT_NAME)
 
-    assert lima.host_port(NO_PORT_NAME, INSIDE_PORT) == 0  # answered: none
+    assert await lima.host_port(NO_PORT_NAME, INSIDE_PORT) == 0  # answered: none
 
 
-def test_host_port_raises_rather_than_returning_zero_for_a_container_nerdctl_cannot_find(lima):
+async def test_host_port_raises_rather_than_returning_zero_for_a_container_nerdctl_cannot_find(lima):
     """The state that used to corrupt a fact. Probed:
 
         $ nerdctl inspect -f '{{json .NetworkSettings.Ports}}' no-such-container-xyz
@@ -115,16 +116,16 @@ def test_host_port_raises_rather_than_returning_zero_for_a_container_nerdctl_can
     port and would be written into an `endpoint` fact forever, so this must
     raise."""
     with pytest.raises(PortUnreadable, match=ABSENT_NAME):
-        lima.host_port(ABSENT_NAME, INSIDE_PORT)
+        await lima.host_port(ABSENT_NAME, INSIDE_PORT)
 
 
-def test_facts_does_not_ask_an_absent_container_for_its_port(lima):
+async def test_facts_does_not_ask_an_absent_container_for_its_port(lima):
     """`facts()` (inherited from `_ContainerRuntime`) gates the port read on
     `status != "absent"`, and that gate is what keeps the raise above from
     reaching every caller that merely observes a not-yet-created container.
     Verified against the real nerdctl, not assumed: an absent container's
     `inspect {{.State.Status}}` is rc=1 + empty stdout, which `status()` turns
     into "absent"."""
-    assert lima.status(ABSENT_NAME) == "absent"
-    facts = lima.facts(ABSENT_NAME, container_port=INSIDE_PORT)
+    assert await lima.status(ABSENT_NAME) == "absent"
+    facts = await lima.facts(ABSENT_NAME, container_port=INSIDE_PORT)
     assert facts.phase == "pending" and facts.host_port == 0 and facts.logtail == ""

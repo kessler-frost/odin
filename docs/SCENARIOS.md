@@ -31,7 +31,7 @@ Driven through the real UI (`uvicorn odin.server:create_app --factory`) + Colima
 | W7 | Real Brain (`tests/agent/test_brain.py`) | claude-agent-sdk fills blank config on apply (AI-tagged, user wins) | ✅ green |
 | W8 | Memory-aware scheduling + LLM eviction (unit) | over-budget workloads queue; idle LLMs evicted for higher-priority work | ✅ green |
 
-Verified 2026-06-21 via playwright-cli (browser) + the integration test. Both
+Verified 2026-06-21 via a browser CLI + the integration test. Both
 nodes reach a green `HEALTHY` badge; the app's 200 depends on the resolved
 `DATABASE_URL`, so health proves the ref wiring end to end.
 
@@ -51,7 +51,7 @@ Actually running the architecture for real is **Simulate** (Lima VMs +
 containers); **Destroy** tears that down.
 
 How they're driven (for future sessions): the dev server runs (`uv run odin
-start --dev`), a Playwright browser drives `localhost:4200`. Nodes are dropped by
+start --dev`), a browser CLI drives `localhost:4200`. Nodes are dropped by
 dispatching an HTML5 `drop` with a `DataTransfer` carrying the sidebar abbr;
 edges are drawn by `page.mouse` dragging from a source node's handle to a
 target's; then the top-bar **Validate** button runs the agent. Note: a prompt

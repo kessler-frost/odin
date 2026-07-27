@@ -25,33 +25,35 @@ from odin.spec.translate import canvas_to_stack
 
 
 class FakeRuntime:
-    def run_container(self, spec):
+    async def run_container(self, spec):
         return RunHandle(id="x", name=spec.name)
 
-    def stop(self, name):
+    async def stop(self, name):
         pass
 
-    def facts(self, name, container_port=0):
+    async def facts(self, name, container_port=0):
         return ContainerFacts(phase="pending")
 
-    def stats(self, name):
+    async def stats(self, name):
         return {"cpu": 0.0, "ram": 0.0}
 
-    def ensure_host(self):
+    async def ensure_host(self):
         return HostFacts()
 
 
 class FakeRds:
+    # Async where the real `PostgresRds` is async; `container_name` is the one
+    # sync method on it (aws/rds.py) and stays sync here.
     def __init__(self):
         self.created = []
 
-    def create_db(self, db_id, user, pw):
+    async def create_db(self, db_id, user, pw):
         self.created.append(db_id)
 
-    def delete_db(self, db_id):
+    async def delete_db(self, db_id):
         pass
 
-    def endpoint(self, db_id):
+    async def endpoint(self, db_id):
         return None
 
     def container_name(self, db_id):
@@ -65,25 +67,25 @@ class FakeAws:
     def __init__(self):
         self.ensured = []
 
-    def ensure_backing(self, service):
+    async def ensure_backing(self, service):
         self.ensured.append(service)
 
-    def provision(self, service, name, subscriptions=()):
+    async def provision(self, service, name, subscriptions=()):
         pass
 
-    def exists(self, service, name):
+    async def exists(self, service, name):
         return True
 
-    def deprovision(self, service, name):
+    async def deprovision(self, service, name):
         pass
 
-    def facts(self, service, name):
+    async def facts(self, service, name):
         return {"endpoint": "http://host.docker.internal:9000"}
 
-    def gc(self, active_kinds):
+    async def gc(self, active_kinds):
         pass
 
-    def backing_ports(self):
+    async def backing_ports(self):
         return {}
 
 
@@ -129,7 +131,7 @@ def _patch_translate(monkeypatch, result: TranslateResult) -> list:
 
 
 class _LowMemRuntime(FakeRuntime):
-    def ensure_host(self):
+    async def ensure_host(self):
         return HostFacts(total_mem_mib=1000.0)  # far too small for 50 t3.medium EC2 nodes
 
 
@@ -312,11 +314,11 @@ def test_store_apply_is_deferred_until_after_ensure_backings_and_tofu(tmp_path, 
     orig_store_apply = app.state.store.apply
     orig_runner_apply = app.state.tf_runner.apply
 
-    def recording_ensure_backing(service):
+    async def recording_ensure_backing(service):  # the real one is a coroutine
         calls.append(f"ensure_backing:{service}")
-        return orig_ensure_backing(service)
+        return await orig_ensure_backing(service)
 
-    def recording_store_apply(stack):
+    def recording_store_apply(stack):  # SpecStore.apply stays sync (file I/O)
         calls.append("store.apply")
         return orig_store_apply(stack)
 
@@ -548,19 +550,19 @@ class _DeadTaskRuntime:
     """A TaskRuntime whose containers never come up -- `run` raises the way a
     real bad-image `docker run` does, and nothing is ever `running`."""
 
-    def run(self, env, task_id, container_def, extra_env=None, cpu=None, memory=None):
+    async def run(self, env, task_id, container_def, extra_env=None, cpu=None, memory=None):
         raise RuntimeError(f"pull access denied for {container_def['image']}")
 
-    def status(self, env, task_id, container_name):
+    async def status(self, env, task_id, container_name):
         return "absent"
 
-    def exit_code(self, env, task_id, container_name):
+    async def exit_code(self, env, task_id, container_name):
         return 0
 
-    def stop(self, env, task_id, container_name):
+    async def stop(self, env, task_id, container_name):
         pass
 
-    def logs(self, env, task_id, container_name, tail=20):
+    async def logs(self, env, task_id, container_name, tail=20):
         return ""
 
 
@@ -771,10 +773,10 @@ class _DeadFunctionRuntime:
     def __init__(self, *args, **kwargs):
         pass
 
-    def code_dir(self, env, function_name):
+    def code_dir(self, env, function_name):  # sync on the real FunctionRuntime too
         return Path("/nonexistent") / env / function_name
 
-    def ensure(self, *args, **kwargs):
+    async def ensure(self, *args, **kwargs):
         raise RuntimeError("pull access denied for public.ecr.aws/lambda/python:3.12")
 
 
@@ -785,7 +787,7 @@ class _DeadPostgresRds:
     def __init__(self, *args, **kwargs):
         pass
 
-    def create_db(self, db_id, user, password, db_name="postgres"):
+    async def create_db(self, db_id, user, password, db_name="postgres"):
         raise RuntimeError("docker run failed: no space left on device")
 
 
@@ -856,9 +858,13 @@ def test_apply_full_fails_when_an_rds_this_apply_converged_never_came_back(tmp_p
         resp = client.post("/apply-full", json={"nodes": [], "edges": []})
     body = resp.json()
     assert body["status"] == "applied_resources_unhealthy", body
+    # `RuntimeError: ` is `errors.exc_text`, exactly as the lambda case above
+    # already reads: rdsctl's writer now shares that one wording instead of
+    # spelling `str(exc)` itself, so a no-message exception can no longer make
+    # this reason `container did not start: ` (see test_empty_reasons.py).
     assert body["unhealthy_resources"] == [{
         "kind": "rds", "node": "app-db", "observed": "failed",
-        "reason": "container did not start: docker run failed: no space left on device",
+        "reason": "container did not start: RuntimeError: docker run failed: no space left on device",
     }], body
     assert "rds app-db is failed" in body["note"]
     assert "no space left on device" in body["note"]
@@ -902,13 +908,13 @@ class _FakeStates:
     def __init__(self, *_args, **_kwargs) -> None:
         pass
 
-    def container_names(self) -> list[str]:
+    async def container_names(self) -> list[str]:
         return list(type(self).running)
 
-    def status(self, name: str) -> str:
+    async def status(self, name: str) -> str:
         return "running" if name in type(self).running else "absent"
 
-    def exit_code(self, name: str) -> int:
+    async def exit_code(self, name: str) -> int:
         return -1
 
 
@@ -921,7 +927,7 @@ class _NoMeshPostgresRds(_DeadPostgresRds):
     it), any convergence attempt must fail fast and locally rather than reach
     for a real image -- so these tests pin the apply's ANSWER, never a race."""
 
-    def join_mesh(self, db_id, firewall=None, revision=""):
+    async def join_mesh(self, db_id, firewall=None, revision=""):
         return None
 
 
@@ -1080,14 +1086,23 @@ def test_a_tofu_failure_is_not_also_charged_the_lambda_and_rds_waits(tmp_path, m
     skipped (asserted directly here, not inferred from the body) and the READ
     happens."""
     called: list[str] = []
-    monkeypatch.setattr(
-        "odin.server.lambdactl.wait_for_active_functions",
-        lambda *a, **k: called.append("lambda") or [],
-    )
-    monkeypatch.setattr(
-        "odin.server.rdsctl.wait_for_available_instances",
-        lambda *a, **k: called.append("rds") or [],
-    )
+
+    # Coroutine functions, matching the real seams: both waits are `async def`
+    # and server.py hands them to `asyncio.gather`. Keeping them sync would
+    # still "pass" here only because the assertion below is that they are never
+    # reached -- and if that guard ever regressed, gather would blow up with an
+    # incidental `TypeError: unhashable type: 'list'` instead of this test's own
+    # message. Async stubs make the regression report the RIGHT reason.
+    async def _record_lambda_wait(*a, **k):
+        called.append("lambda")
+        return []
+
+    async def _record_rds_wait(*a, **k):
+        called.append("rds")
+        return []
+
+    monkeypatch.setattr("odin.server.lambdactl.wait_for_active_functions", _record_lambda_wait)
+    monkeypatch.setattr("odin.server.rdsctl.wait_for_available_instances", _record_rds_wait)
     _patch_dead_substrates(monkeypatch)
     _write_fake_tofu(tmp_path, _APPLY_FAILS)
     monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
@@ -1167,8 +1182,18 @@ def test_a_fault_with_no_recorded_reason_still_says_what_is_known(tmp_path, monk
     })
     # The converge pass would re-create it and author a reason; a substrate that
     # raises nothing is not what this test is about, so keep the record as-is.
+    # `converge_db_instances` is SYNC in src (rdsctl.py) and server.py calls it
+    # without `await`, so a plain lambda is the faithful stand-in. Its sibling
+    # is not: `wait_for_available_instances` is `async def` and server.py feeds
+    # it straight to `asyncio.gather`, which rejects a plain `[]` with
+    # `TypeError: unhashable type: 'list'` -- so that one has to be a coroutine
+    # function. Two stubs, two different shapes, because the seams differ.
     monkeypatch.setattr("odin.server.rdsctl.converge_db_instances", lambda *a, **k: [])
-    monkeypatch.setattr("odin.server.rdsctl.wait_for_available_instances", lambda *a, **k: [])
+
+    async def _no_rds_wait(*a, **k):
+        return []
+
+    monkeypatch.setattr("odin.server.rdsctl.wait_for_available_instances", _no_rds_wait)
     with TestClient(app) as client:
         resp = client.post("/apply-full", json={"nodes": [], "edges": []})
     body = resp.json()

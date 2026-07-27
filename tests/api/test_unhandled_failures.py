@@ -15,7 +15,7 @@ which names neither the container that went missing nor anything to do about it.
 These tests are about the SHAPE, which is why they do not stop at
 `/apply-full`. `BackingUnavailable` specifically also escapes `/apply` and
 `/destroy` -- both reach `ensure_backing` (`/apply` through its trailing
-`reconciler.tick()` -> plan -> provision, `/destroy` through its own
+`await reconciler.tick()` -> plan -> provision, `/destroy` through its own
 `ensure_backings`). `/tf/apply` cannot raise THAT one (it neither ensures
 backings nor ticks) but had the identical bare-text 500 for everything else it
 calls, so it is covered with an unmapped exception instead of a pretend one.
@@ -53,33 +53,33 @@ S3_ONLY = {"nodes": [{"type": "s3", "data": {"label": "uploads"}}], "edges": []}
 
 
 class FakeRuntime:
-    def run_container(self, spec):
+    async def run_container(self, spec):
         return RunHandle(id="x", name=spec.name)
 
-    def stop(self, name):
+    async def stop(self, name):
         pass
 
-    def facts(self, name, container_port=0):
+    async def facts(self, name, container_port=0):
         return ContainerFacts(phase="pending")
 
-    def stats(self, name):
+    async def stats(self, name):
         return {"cpu": 0.0, "ram": 0.0}
 
-    def ensure_host(self):
+    async def ensure_host(self):
         return HostFacts()
 
-    def container_names(self):
+    async def container_names(self):
         return []
 
 
 class FakeRds:
-    def create_db(self, db_id, user, pw):
+    async def create_db(self, db_id, user, pw):
         pass
 
-    def delete_db(self, db_id):
+    async def delete_db(self, db_id):
         pass
 
-    def endpoint(self, db_id):
+    async def endpoint(self, db_id):
         return None
 
     def container_name(self, db_id):
@@ -96,31 +96,31 @@ class FakeAws:
     def __init__(self, ensure_raises: Exception | None = None):
         self.ensure_raises = ensure_raises
 
-    def ensure_backing(self, service):
+    async def ensure_backing(self, service):
         if self.ensure_raises is not None:
             raise self.ensure_raises
 
-    def provision(self, service, name, subscriptions=()):
+    async def provision(self, service, name, subscriptions=()):
         # The real `BackingAws.provision` starts with `ensure_backing(service)`
         # and then dials `client(service)`, so BOTH of its first two steps go
         # through `_published_port`. Modelling that is what makes `/apply`'s
         # trailing tick a real second route for this exception, rather than a
         # route that only looks like one.
-        self.ensure_backing(service)
+        await self.ensure_backing(service)
 
-    def exists(self, service, name):
+    async def exists(self, service, name):
         return True
 
-    def deprovision(self, service, name):
+    async def deprovision(self, service, name):
         pass
 
-    def facts(self, service, name):
+    async def facts(self, service, name):
         return {"endpoint": "http://host.docker.internal:9000"}
 
-    def gc(self, active_kinds):
+    async def gc(self, active_kinds):
         pass
 
-    def backing_ports(self):
+    async def backing_ports(self):
         return {}
 
 
@@ -220,7 +220,7 @@ def test_the_verdict_names_the_recovery_that_actually_works(tmp_path, monkeypatc
 @pytest.mark.parametrize("path", ["/apply", "/apply-full"])
 def test_the_canvas_apply_routes_both_answer_json(tmp_path, monkeypatch, path):
     """`/apply` reaches `ensure_backing` through its own trailing
-    `reconciler.tick()` -> plan -> provision, so the identical exception comes
+    `await reconciler.tick()` -> plan -> provision, so the identical exception comes
     out of a route that never calls `ensure_backings` at all."""
     _patch_translate(monkeypatch)
     app = _app(tmp_path, aws=FakeAws(ensure_raises=_gone()))
@@ -449,6 +449,52 @@ def test_a_corrupt_desired_state_is_never_told_to_delete_the_file(tmp_path):
     assert "rm " not in error
 
 
+def test_the_control_recovery_never_recommends_the_command_that_just_failed(tmp_path):
+    """OPEN-BUGS #10, and the loop above reintroduced one role over.
+
+    The CONTROL advice used to end "...otherwise `odin destroy --env {env}`
+    tears the env down through the records that still parse". Measured on a real
+    server (:5250, a real `gateway/lambdactl.json` with one bad record):
+
+        POST /destroy?env=p1bctl  ->  500 {"status": "store_unreadable", ...}
+
+    ...with that sentence in its own body. `destroy` reads this store through
+    `reclaim_env_instances`, so it stops on it rather than tearing anything
+    down -- and `records.validate` refuses the WHOLE file for one bad record, so
+    there are no "records that still parse" either. The failing command was
+    recommending itself, which is exactly what
+    `test_a_corrupt_world_json_names_the_file_and_the_recovery_that_works`
+    exists to prevent for `odin world`."""
+    env = "ctlfix"
+    control = tmp_path / env / "gateway" / "lambdactl.json"
+    control.parent.mkdir(parents=True, exist_ok=True)
+    control.write_text('{"fn:one": "not-a-record"}')
+    app = _app(tmp_path)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        resp = client.post("/destroy", params={"env": env})
+    assert resp.status_code == 500, resp.text
+    body = resp.json()
+    assert body["status"] == "store_unreadable"
+    assert body["store"] == {"path": str(control), "role": "control"}
+    error = body["error"]
+    # The loop is gone. `odin destroy` is still NAMED -- a reader whose destroy
+    # just failed is owed the reason -- but only as something that fails too,
+    # never as the remedy, so the two mentions must stay adjacent.
+    assert f"including `odin destroy --env {env}`, which reads it too and stops on it" in error
+    assert f"otherwise `odin destroy --env {env}`" not in error
+    # ...and the claim that made it sound survivable is gone with it.
+    assert "records that still parse" not in error
+    # What replaced them is what was measured: all-or-nothing, and a repair that
+    # takes effect with no restart (verified live -- removing the named record
+    # made the identical POST answer 200 `destroyed`).
+    assert "do NOT delete it" in error
+    assert "a single bad record fails every gateway call for this env" in error
+    assert "no restart" in error
+    # ...and the error still names the offending record, which is what makes
+    # "repair it in place" actionable rather than a suggestion to guess.
+    assert "fn:one" in error
+
+
 def test_an_unmapped_store_role_states_that_rather_than_nothing(tmp_path, monkeypatch):
     """The `_DESTROY_STATUS` shape, applied to the advice: a role nobody mapped
     must not format an EMPTY instruction -- the one thing worse than no advice.
@@ -537,3 +583,36 @@ def test_a_good_keyfile_still_loads(tmp_path):
     reread._ensure_loaded("e")
 
     assert reread.lookup(written[0]) is not None
+
+
+def test_a_retry_after_an_unreadable_keyfile_does_not_destroy_the_credentials(tmp_path):
+    """The most natural response to a 500 is to try again — and that used to
+    wipe every credential odin had issued.
+
+    `_ensure_loaded` marked the env loaded BEFORE the read could raise, so the
+    second call returned early with `_by_env[env]` never set, and the next write
+    persisted a map containing only the new key. Measured: a file holding one
+    good pair and one malformed one came back holding only `__operator__`. Every
+    already-running workload that held one of the lost keys would then fail auth
+    with `InvalidClientTokenId` forever, with no record of the key it was using —
+    and the CREDENTIALS recovery advice ("restore it with `odin import`") pointed
+    at a file that had just been overwritten.
+
+    The guard is that a raise leaves the store untouched and stays consistent
+    across retries, which is what makes the advice actionable."""
+    (tmp_path / "e").mkdir()
+    keyfile = tmp_path / "e" / "keys.json"
+    original = json.dumps({"web": ["AKODINrealkey", "realsecret"], "bad": "not-a-pair"})
+    keyfile.write_text(original)
+
+    store = KeyStore(tmp_path)
+    for _ in range(3):
+        with pytest.raises(StoreUnreadable):
+            store._ensure_loaded("e")
+
+    assert keyfile.read_text() == original, "a retry rewrote the credential file"
+    # And issuing must not paper over it either: it loads first, so it fails the
+    # same way rather than persisting a map built from a load that never happened.
+    with pytest.raises(StoreUnreadable):
+        store.issue("e", "__operator__")
+    assert keyfile.read_text() == original

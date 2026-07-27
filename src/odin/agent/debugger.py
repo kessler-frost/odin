@@ -68,7 +68,7 @@ import asyncio
 import json
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any, TypedDict
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, SdkMcpTool, create_sdk_mcp_server, tool
@@ -319,11 +319,11 @@ def no_evidence_answer(context: dict[str, Any], node_ids: list[str]) -> dict[str
     }
 
 
-def assemble_context(
-    stack: Stack, world: World, events: list[dict], logs: Callable[[str], str], node_ids: list[str],
-    extra_secrets: frozenset[str] = frozenset(),
+async def assemble_context(
+    stack: Stack, world: World, events: list[dict], logs: Callable[[str], Awaitable[str]],
+    node_ids: list[str], extra_secrets: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
-    """The pure half. `logs(node_id) -> str` is the caller's resolver (in
+    """The pure half. `await logs(node_id) -> str` is the caller's resolver (in
     production `api/debug.py` wraps the wave-1 `/logs` per-kind resolution,
     which already knows how to find an ec2 VM's journal, an ecs service's task
     containers, a lambda's RIE container, or an rds/backing container).
@@ -357,8 +357,14 @@ def assemble_context(
     secrets = stack.sensitive_values() | extra_secrets
     unique = list(dict.fromkeys(node_ids))
     selected, omitted = unique[:MAX_NODES], unique[MAX_NODES:]
-    nodes = {
-        node_id: {
+    # An explicit loop rather than a dict comprehension: `await` inside a
+    # comprehension is a trap worth avoiding here -- in a generator-expression
+    # shape it silently produces an ASYNC generator that a plain `for` iterates
+    # as nothing at all, which would empty the model's evidence without error.
+    nodes: dict[str, Any] = {}
+    for node_id in selected:
+        tail = await logs(node_id)
+        nodes[node_id] = {
             **_sanitize({
                 "desired": _desired(stack, node_id),
                 "refs": _refs(stack, node_id),
@@ -367,10 +373,8 @@ def assemble_context(
             }, secrets),
             # Logs are line-capped rather than char-clipped (40 lines of real
             # stdout IS the evidence), so they're scrubbed on their own.
-            "logs": scrub(_log_tail(logs(node_id)), secrets),
+            "logs": scrub(_log_tail(tail), secrets),
         }
-        for node_id in selected
-    }
     known = known_node_ids(stack, world, events)
     return {
         "env": stack.env, "nodes": nodes, "omitted_nodes": omitted,
@@ -488,6 +492,10 @@ async def diagnose(
         allowed_tools=["mcp__debugger__report_diagnosis"],
     )
     try:
+        # NO inner `await`: `wait_for` must receive the un-awaited coroutine so
+        # it can bound it. `wait_for(await f(), ...)` runs f to completion FIRST
+        # and only then applies a timeout to the finished result -- the bound
+        # never applies, which is precisely the hang this timeout exists to stop.
         await asyncio.wait_for(
             _run_agent(_prompt(context, question), options, client_cls),
             timeout=timeout if timeout is not None else _default_timeout(),

@@ -169,3 +169,34 @@ def test_a_real_boto3_client_parses_a_real_gateway_failure(tmp_path):
     error = caught.value.response
     assert error["ResponseMetadata"]["HTTPStatusCode"] == 503
     assert error["Error"]["Code"] == "ServiceUnavailable"
+
+
+def test_an_sts_auth_failure_is_query_xml_so_botocore_can_parse_it(tmp_path):
+    """STS is a QUERY-protocol service, like sns/iam/rds — but it was missing
+    from `errors._QUERY_XML_SERVICES`, so odin answered an STS auth failure with
+    AWS-JSON. Reproduced with a real boto3 client against a real server: botocore
+    raised `ResponseParserError: ... invalid XML received` over a body of
+    `{"__type": "Invalid...`, instead of the `InvalidClientTokenId` the caller
+    can actually act on.
+
+    Reachable whenever a container holds credentials from a revoked env and calls
+    GetCallerIdentity — which is exactly when a clear auth error matters most.
+    Found by the gateway agent and confirmed on unmodified develop, so it
+    predates the loop migration."""
+    keystore = KeyStore(tmp_path / "keys")
+    stores = SynthStores(tmp_path / "synth")
+    app = create_gateway_app(GatewayState(), keystore, stores, _swallow)
+    server, thread, port = serve_in_thread(app, host="127.0.0.1", port=0)
+    try:
+        sts = boto3.client(
+            "sts", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+            aws_access_key_id="AKIAnotreal", aws_secret_access_key="nope",
+            config=Config(retries={"max_attempts": 1}),
+        )
+        with pytest.raises(ClientError) as caught:
+            sts.get_caller_identity()
+    finally:
+        stop_in_thread(server, thread)
+
+    assert caught.value.response["Error"]["Code"] == "InvalidClientTokenId"
+    assert caught.value.response["ResponseMetadata"]["HTTPStatusCode"] == 401

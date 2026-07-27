@@ -77,7 +77,7 @@ import json
 import logging
 import secrets
 import shutil
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from urllib.parse import parse_qsl
 from xml.sax.saxutils import escape
 
@@ -392,13 +392,13 @@ def _sg_rule_xml(rule_id: str, group_id: str, rule: dict) -> str:
 # --- VPC ----------------------------------------------------------------------
 
 
-def _create_vpc(params: dict[str, str], env: str, stores: SynthStores) -> Response:
+async def _create_vpc(params: dict[str, str], env: str, stores: SynthStores) -> Response:
     vpc_id = _mint("vpc")
     tags = _spec_tags(params)
     default_sg = _new_sg(stores, env, vpc_id, "default", "default VPC security group", is_default=True)
     # V1b: a VPC joins the env's Nebula network (1:1 for now -- see module
     # docstring). Real CA/cert artifacts, idempotent, no daemon started.
-    network = ensure_network(stores.root, env, "127.0.0.1")
+    network = await ensure_network(stores.root, env, "127.0.0.1")
     vpc = {
         "vpc_id": vpc_id,
         "cidr_block": params.get("CidrBlock", "10.0.0.0/16"),
@@ -416,7 +416,7 @@ def _create_vpc(params: dict[str, str], env: str, stores: SynthStores) -> Respon
     return _response("CreateVpc", f"<vpc>{_vpc_xml(vpc, tags)}</vpc>")
 
 
-def _describe_vpcs(params: dict[str, str], env: str, stores: SynthStores) -> Response:
+async def _describe_vpcs(params: dict[str, str], env: str, stores: SynthStores) -> Response:
     vpc_ids = _scalars(params, "VpcId")
     filters = _filters(params)
     vpcs = _records(stores, env, "vpc")
@@ -432,7 +432,7 @@ def _describe_vpcs(params: dict[str, str], env: str, stores: SynthStores) -> Res
     return _response("DescribeVpcs", f"<vpcSet>{items}</vpcSet>")
 
 
-def _describe_vpc_attribute(params: dict[str, str], env: str, stores: SynthStores) -> Response:
+async def _describe_vpc_attribute(params: dict[str, str], env: str, stores: SynthStores) -> Response:
     vpc_id = params.get("VpcId", "")
     if _get(stores, env, "vpc", vpc_id) is None:
         return _not_found("vpc", vpc_id)
@@ -444,7 +444,7 @@ def _describe_vpc_attribute(params: dict[str, str], env: str, stores: SynthStore
     )
 
 
-def purge_env(stores: SynthStores, env: str) -> list[str]:
+async def purge_env(stores: SynthStores, env: str) -> list[str]:
     """Forget every VPC / subnet / security-group record this env holds, and
     take its Nebula network down with them. Returns the keys it forgot.
 
@@ -473,7 +473,7 @@ def purge_env(stores: SynthStores, env: str) -> list[str]:
     return keys
 
 
-def _delete_vpc(params: dict[str, str], env: str, stores: SynthStores) -> Response:
+async def _delete_vpc(params: dict[str, str], env: str, stores: SynthStores) -> Response:
     vpc_id = params.get("VpcId", "")
     vpc = _get(stores, env, "vpc", vpc_id)
     if vpc is None:
@@ -510,7 +510,7 @@ def _delete_vpc(params: dict[str, str], env: str, stores: SynthStores) -> Respon
 # --- the VPC's auto-created sidecars (research finding #1) --------------------
 
 
-def _describe_network_acls(params: dict[str, str], env: str, stores: SynthStores) -> Response:
+async def _describe_network_acls(params: dict[str, str], env: str, stores: SynthStores) -> Response:
     filters = _filters(params)
     items = "".join(
         "<item>"
@@ -523,7 +523,7 @@ def _describe_network_acls(params: dict[str, str], env: str, stores: SynthStores
     return _response("DescribeNetworkAcls", f"<networkAclSet>{items}</networkAclSet>")
 
 
-def _describe_route_tables(params: dict[str, str], env: str, stores: SynthStores) -> Response:
+async def _describe_route_tables(params: dict[str, str], env: str, stores: SynthStores) -> Response:
     filters = _filters(params)
     items = "".join(
         "<item>"
@@ -546,7 +546,7 @@ def _describe_route_tables(params: dict[str, str], env: str, stores: SynthStores
     return _response("DescribeRouteTables", f"<routeTableSet>{items}</routeTableSet>")
 
 
-def _describe_network_interfaces(params: dict[str, str], env: str, stores: SynthStores) -> Response:
+async def _describe_network_interfaces(params: dict[str, str], env: str, stores: SynthStores) -> Response:
     """The provider's pre-delete ENI sweep. V1 has no EC2 instances (V3), so
     no ENIs ever exist -- always empty."""
     return _response("DescribeNetworkInterfaces", "<networkInterfaceSet/>")
@@ -555,7 +555,7 @@ def _describe_network_interfaces(params: dict[str, str], env: str, stores: Synth
 # --- Subnet -------------------------------------------------------------------
 
 
-def _create_subnet(params: dict[str, str], env: str, stores: SynthStores) -> Response:
+async def _create_subnet(params: dict[str, str], env: str, stores: SynthStores) -> Response:
     vpc_id = params.get("VpcId", "")
     if _get(stores, env, "vpc", vpc_id) is None:
         return _not_found("vpc", vpc_id)
@@ -571,7 +571,7 @@ def _create_subnet(params: dict[str, str], env: str, stores: SynthStores) -> Res
     return _response("CreateSubnet", f"<subnet>{_subnet_xml(subnet, tags)}</subnet>")
 
 
-def _describe_subnets(params: dict[str, str], env: str, stores: SynthStores) -> Response:
+async def _describe_subnets(params: dict[str, str], env: str, stores: SynthStores) -> Response:
     subnet_ids = _scalars(params, "SubnetId")
     filters = _filters(params)
     subnets = _records(stores, env, "subnet")
@@ -590,7 +590,7 @@ def _describe_subnets(params: dict[str, str], env: str, stores: SynthStores) -> 
     return _response("DescribeSubnets", f"<subnetSet>{items}</subnetSet>")
 
 
-def _delete_subnet(params: dict[str, str], env: str, stores: SynthStores) -> Response:
+async def _delete_subnet(params: dict[str, str], env: str, stores: SynthStores) -> Response:
     subnet_id = params.get("SubnetId", "")
     if _get(stores, env, "subnet", subnet_id) is None:
         return _not_found("subnet", subnet_id)
@@ -606,7 +606,17 @@ def _compiled_firewall(sg: dict) -> dict:
     (V1b) -- `aggregate_permissions` already emits that function's exact
     input shape. Stored as a plain dump on the SG record so it dies with the
     group and `mesh_state` reads it without importing gateway code."""
-    ingress = [r for r in sg["rules"].values() if not r["is_egress"]]
+    # `is False`, not `not ...`: this one boolean is the whole difference
+    # between "allow all OUTBOUND" (the seeded AWS default) and "allow all
+    # INBOUND", and a truthiness test hands that decision to any falsy value.
+    # Measured on the seeded egress rule (proto "-1", no ports, 0.0.0.0/0):
+    # `is_egress` as 0, "" or None compiled to
+    # `inbound=[{'port':'any','proto':'any','cidr':'0.0.0.0/0'}]` where correct
+    # is `inbound=[]` -- and asymmetrically, the STRING "false" is truthy so it
+    # failed closed while those three failed OPEN. `records.py` now rejects a
+    # non-bool on read; this fails CLOSED even if a rule ever reaches here
+    # without passing through that validation.
+    ingress = [r for r in sg["rules"].values() if r["is_egress"] is False]
     return sg_rules_to_firewall(aggregate_permissions(ingress)).model_dump()
 
 
@@ -645,7 +655,7 @@ def _new_sg(stores: SynthStores, env: str, vpc_id: str, name: str, description: 
     return sg
 
 
-def _create_security_group(params: dict[str, str], env: str, stores: SynthStores) -> Response:
+async def _create_security_group(params: dict[str, str], env: str, stores: SynthStores) -> Response:
     vpc_id = params.get("VpcId", "")
     if _get(stores, env, "vpc", vpc_id) is None:
         return _not_found("vpc", vpc_id)
@@ -663,7 +673,7 @@ def _create_security_group(params: dict[str, str], env: str, stores: SynthStores
     )
 
 
-def _describe_security_groups(params: dict[str, str], env: str, stores: SynthStores) -> Response:
+async def _describe_security_groups(params: dict[str, str], env: str, stores: SynthStores) -> Response:
     group_ids = _scalars(params, "GroupId")
     group_names = _scalars(params, "GroupName")
     filters = _filters(params)
@@ -683,7 +693,7 @@ def _describe_security_groups(params: dict[str, str], env: str, stores: SynthSto
     return _response("DescribeSecurityGroups", f"<securityGroupInfo>{items}</securityGroupInfo>")
 
 
-def _delete_security_group(params: dict[str, str], env: str, stores: SynthStores) -> Response:
+async def _delete_security_group(params: dict[str, str], env: str, stores: SynthStores) -> Response:
     group_id = params.get("GroupId", "")
     if _get(stores, env, "sg", group_id) is None:
         return _not_found("sg", group_id)
@@ -715,23 +725,23 @@ def _mutate_rules(params: dict[str, str], env: str, stores: SynthStores, is_egre
     return _response(action_name, f"<return>true</return>{rule_set}")
 
 
-def _authorize_ingress(params: dict[str, str], env: str, stores: SynthStores) -> Response:
+async def _authorize_ingress(params: dict[str, str], env: str, stores: SynthStores) -> Response:
     return _mutate_rules(params, env, stores, is_egress=False, action_name="AuthorizeSecurityGroupIngress")
 
 
-def _authorize_egress(params: dict[str, str], env: str, stores: SynthStores) -> Response:
+async def _authorize_egress(params: dict[str, str], env: str, stores: SynthStores) -> Response:
     return _mutate_rules(params, env, stores, is_egress=True, action_name="AuthorizeSecurityGroupEgress")
 
 
-def _revoke_ingress(params: dict[str, str], env: str, stores: SynthStores) -> Response:
+async def _revoke_ingress(params: dict[str, str], env: str, stores: SynthStores) -> Response:
     return _mutate_rules(params, env, stores, is_egress=False, action_name="RevokeSecurityGroupIngress")
 
 
-def _revoke_egress(params: dict[str, str], env: str, stores: SynthStores) -> Response:
+async def _revoke_egress(params: dict[str, str], env: str, stores: SynthStores) -> Response:
     return _mutate_rules(params, env, stores, is_egress=True, action_name="RevokeSecurityGroupEgress")
 
 
-def _describe_security_group_rules(params: dict[str, str], env: str, stores: SynthStores) -> Response:
+async def _describe_security_group_rules(params: dict[str, str], env: str, stores: SynthStores) -> Response:
     filters = _filters(params)
     rule_ids = _scalars(params, "SecurityGroupRuleId")
     items = "".join(
@@ -747,7 +757,7 @@ def _describe_security_group_rules(params: dict[str, str], env: str, stores: Syn
 # --- Tags (EC2's own wire shape -- distinct from sqs/sns/dynamodb's) ----------
 
 
-def _create_tags(params: dict[str, str], env: str, stores: SynthStores) -> Response:
+async def _create_tags(params: dict[str, str], env: str, stores: SynthStores) -> Response:
     new_tags = {t["Key"]: t.get("Value", "") for t in _indexed(params, "Tag")}
     for resource_id in _scalars(params, "ResourceId"):
         key = f"ec2:{resource_id}"
@@ -755,7 +765,7 @@ def _create_tags(params: dict[str, str], env: str, stores: SynthStores) -> Respo
     return _response("CreateTags", "<return>true</return>")
 
 
-def _delete_tags(params: dict[str, str], env: str, stores: SynthStores) -> Response:
+async def _delete_tags(params: dict[str, str], env: str, stores: SynthStores) -> Response:
     """Tag.N present: delete only matching keys (a Tag.N.Value further
     requires the value to match). No Tag.N at all: delete ALL tags."""
     tag_items = _indexed(params, "Tag")
@@ -770,7 +780,7 @@ def _delete_tags(params: dict[str, str], env: str, stores: SynthStores) -> Respo
     return _response("DeleteTags", "<return>true</return>")
 
 
-def _describe_tags(params: dict[str, str], env: str, stores: SynthStores) -> Response:
+async def _describe_tags(params: dict[str, str], env: str, stores: SynthStores) -> Response:
     filters = _filters(params)
     items = []
     for key, tags in stores.tags.items(env).items():
@@ -792,7 +802,9 @@ def _describe_tags(params: dict[str, str], env: str, stores: SynthStores) -> Res
 # --- dispatch -------------------------------------------------------------------
 
 
-_Handler = Callable[[dict[str, str], str, SynthStores], Response]
+# EVERY handler is a coroutine function, including the ones that await
+# nothing (v0.7.7) -- see `rdsctl._Handler` for why one uniform contract.
+_Handler = Callable[[dict[str, str], str, SynthStores], Awaitable[Response]]
 
 _HANDLERS: dict[str, _Handler] = {
     "CreateVpc": _create_vpc,
@@ -819,7 +831,7 @@ _HANDLERS: dict[str, _Handler] = {
 }
 
 
-def pure_answer(action: str, resource: str, env: str, body: bytes, stores: SynthStores, now: float) -> Response | None:
+async def pure_answer(action: str, resource: str, env: str, body: bytes, stores: SynthStores, now: float) -> Response | None:
     """The whole EC2 answer -- same signature as synth.pure_answer, which
     dispatches every `ec2:*` action here. Never returns None for an ec2
     action: EC2 has no backing to fall through to (an unknown action gets
@@ -829,4 +841,4 @@ def pure_answer(action: str, resource: str, env: str, body: bytes, stores: Synth
     handler = _HANDLERS.get(op)
     if handler is None:
         return errors.synth_error("ec2", "InvalidAction", f"The action {op} is not valid for this web service.", 400)
-    return handler(_params(body), env, stores)
+    return await handler(_params(body), env, stores)

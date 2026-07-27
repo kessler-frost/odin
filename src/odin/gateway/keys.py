@@ -10,6 +10,8 @@ running container's creds.
 """
 from __future__ import annotations
 
+import logging
+
 import json
 import secrets
 import string
@@ -20,8 +22,10 @@ from odin.aws.backings import REGION
 from odin.runtime.colima import CONTAINER_HOST
 from pydantic import TypeAdapter, constr
 
-from odin.spec.store import CREDENTIALS, _load
+from odin.spec.store import CREDENTIALS, StoreUnreadable, _load
 from odin.util import atomic_write_text
+
+log = logging.getLogger("odin.gateway.keys")
 
 _URLSAFE_ALPHABET = string.ascii_letters + string.digits + "-_"
 _ACCESS_KEY_PREFIX = "AKODIN"
@@ -102,12 +106,33 @@ class KeyStore:
         return self._root / env / "keys.json"
 
     def _ensure_loaded(self, env: str) -> None:
+        """Load this env's issued credentials, or raise and leave NOTHING marked.
+
+        The `_loaded_envs.add(env)` used to happen HERE, before the read below
+        could raise -- so a failed load was remembered as a successful one, and
+        that turned a 500 into silent data loss on the most natural response to
+        a 500: a retry. Measured, with a file holding one good pair and one bad:
+
+            call 1 -> StoreUnreadable (correct; the advice says do NOT delete it)
+            call 2 -> no error, `_by_env[env]` never set
+            any later issue() -> persists a map containing ONLY the new key
+
+        The real credentials were gone, and every already-running workload that
+        held one would fail auth with `InvalidClientTokenId` forever, with no
+        record of the key it had been using. It also made the CREDENTIALS
+        recovery text ("restore it with `odin import`") unbackable, because the
+        thing to restore had just been overwritten.
+
+        So the env is marked loaded only on a path that really loaded it: a
+        raise now leaves the store exactly as it was, and the next call retries
+        and fails the same way -- consistently, which is what lets the operator
+        act on the advice."""
         if env in self._loaded_envs:
             return
-        self._loaded_envs.add(env)
         path = self._path(env)
         if not path.exists():
             self._by_env.setdefault(env, {})
+            self._loaded_envs.add(env)
             return
         # VALIDATED, not just parsed, and this one is load-bearing for AUTH.
         # `{"db": "AKIAodin1234"}` -- a bare string where the pair belongs --
@@ -123,16 +148,38 @@ class KeyStore:
         self._by_env[env] = nodes
         for node_id, (access_key, _secret_key) in nodes.items():
             self._by_key[access_key] = Principal(env=env, node_id=node_id)
+        self._loaded_envs.add(env)  # ONLY here -- see the docstring above
 
     def _ensure_root_scanned(self) -> None:
+        """Opportunistic: load every env so a key can be resolved without
+        knowing which env issued it.
+
+        One env's unreadable keyfile must NOT break lookups for the others.
+        `_ensure_loaded` raises now (it stopped marking a failed load as
+        successful, which was destroying credentials on retry), and this walks
+        EVERY env -- so without the skip below, a corrupt `staging/keys.json`
+        would fail every request in `prod` too. That trade is deliberate and
+        goes the other way from a direct `_ensure_loaded(env)`, which still
+        raises: this path is a best-effort search across envs, so an env it
+        cannot read simply contributes no keys, and a key that lived there
+        comes back unresolved (a 401) rather than taking the whole gateway
+        down. The log line is the operator's only signal, so it names the
+        file."""
         if self._scanned_root:
             return
         self._scanned_root = True
         if not self._root.exists():
             return
         for env_dir in sorted(self._root.iterdir()):
-            if env_dir.is_dir():
+            if not env_dir.is_dir():
+                continue
+            try:
                 self._ensure_loaded(env_dir.name)
+            except StoreUnreadable as exc:
+                log.warning(
+                    "gateway keys: env %r contributes no credentials to this lookup -- %s",
+                    env_dir.name, exc,
+                )
 
     def _persist(self, env: str) -> None:
         # Access/secret key pairs: never briefly world-readable between

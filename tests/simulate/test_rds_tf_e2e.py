@@ -1,6 +1,6 @@
 """W2.7 -- the ONE integration test for RDS-on-Terraform: a real canvas with an
 `rds` node through a real `tofu apply`, into a real `postgres:16-alpine`
-container, with a real `psycopg2` connection made over the DATABASE_URL fact
+container, with a real `asyncpg` connection made over the DATABASE_URL fact
 odin published.
 
 What this proves that no unit test can:
@@ -37,7 +37,7 @@ import subprocess
 import time
 from pathlib import Path
 
-import psycopg2
+import asyncpg
 import pytest
 from fastapi.testclient import TestClient
 
@@ -129,7 +129,7 @@ def _observed(client, timeout: float, want_phase: str) -> dict | None:
     return last
 
 
-def _select_one(facts: dict) -> int:
+async def _select_one(facts: dict) -> int:
     """Connect with the credentials odin PUBLISHED and run a real query.
 
     The host in `DATABASE_URL` is `host.docker.internal` on purpose (that's what
@@ -137,15 +137,14 @@ def _select_one(facts: dict) -> int:
     host-side connection swaps in loopback and reuses the published port --
     proving the port and credentials in the fact are the real ones."""
     port = int(facts["endpoint"].rsplit(":", 1)[1])
-    conn = psycopg2.connect(
+    conn = await asyncpg.connect(
         host="127.0.0.1", port=port, user=USER, password=PASSWORD,
-        dbname=DB_NAME, connect_timeout=10,
+        database=DB_NAME, timeout=10,
     )
-    cur = conn.cursor()
-    cur.execute("SELECT 1")
-    value = cur.fetchone()[0]
-    conn.close()
-    return value
+    try:
+        return await conn.fetchval("SELECT 1")
+    finally:
+        await conn.close()
 
 
 @pytest.fixture
@@ -178,7 +177,7 @@ def skeleton_translate(monkeypatch):
     monkeypatch.setattr("odin.server.translate_mod.translate", fake_translate)
 
 
-def test_an_rds_node_is_a_real_tf_managed_postgres_that_survives_being_killed(
+async def test_an_rds_node_is_a_real_tf_managed_postgres_that_survives_being_killed(
     store_root, db_cleanup, skeleton_translate, monkeypatch,
 ):
     assert shutil.which("tofu"), "OpenTofu must be on PATH for this integration test"
@@ -230,7 +229,7 @@ def test_an_rds_node_is_a_real_tf_managed_postgres_that_survives_being_killed(
         assert facts["endpoint_vm"] == f"host.lima.internal:{port}"
         assert facts["DATABASE_URL"] == f"postgresql://{USER}:{PASSWORD}@host.docker.internal:{port}/{DB_NAME}"
         assert facts["DATABASE_URL_VM"] == f"postgresql://{USER}:{PASSWORD}@host.lima.internal:{port}/{DB_NAME}"
-        assert _select_one(facts) == 1
+        assert await _select_one(facts) == 1
         print(f"\n[W2.7] SELECT 1 over the published DATABASE_URL on :{port} (db {DB_NAME!r})")
 
         # (4) Scenario 2, preserved: kill the container out of band.
@@ -262,7 +261,7 @@ def test_an_rds_node_is_a_real_tf_managed_postgres_that_survives_being_killed(
         assert recovered is not None and recovered["phase"] == "healthy", f"never recovered: {recovered}"
         assert recovered["verdict"] is None
         assert _running(victim), "recovery means a really-running container, not a green badge"
-        assert _select_one(recovered["facts"]) == 1, "the recovered database must really answer"
+        assert await _select_one(recovered["facts"]) == 1, "the recovered database must really answer"
         print("[W2.7] killed -> crashed with a real verdict -> re-Apply -> SELECT 1 again")
 
         # Still zero drift after the recovery apply.

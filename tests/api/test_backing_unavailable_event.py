@@ -48,19 +48,19 @@ class NoBackings:
     routing table a gateway 503 is read off, empty. Everything else is a no-op
     so the reconciler's own tick converges normally around it."""
 
-    def ensure_backing(self, kind: str) -> None: ...
-    def gc(self, kinds: set) -> None: ...
-    def backing_ports(self) -> dict:
+    async def ensure_backing(self, kind: str) -> None: ...
+    async def gc(self, kinds: set) -> None: ...
+    async def backing_ports(self) -> dict:
         return {}
-    def exists(self, kind: str, rid: str) -> bool:
+    async def exists(self, kind: str, rid: str) -> bool:
         return True
-    def facts(self, kind: str, rid: str) -> dict:
+    async def facts(self, kind: str, rid: str) -> dict:
         return {}
-    def provision(self, kind: str, rid: str, *args) -> None: ...
-    def deprovision(self, kind: str, rid: str) -> None: ...
-    def subscriptions(self, rid: str) -> tuple:
+    async def provision(self, kind: str, rid: str, *args) -> None: ...
+    async def deprovision(self, kind: str, rid: str) -> None: ...
+    async def subscriptions(self, rid: str) -> tuple:
         return ()
-    def aws_env(self) -> dict:
+    async def aws_env(self) -> dict:
         return {}
 
 
@@ -84,9 +84,9 @@ def wired(tmp_path):
         yield client, tmp_path, creds
 
 
-def _call_s3(endpoint: str, creds: tuple[str, str]) -> str:
+async def _call_s3(endpoint: str, creds: tuple[str, str]) -> str:
     access_key, secret_key = creds
-    s3 = boto3.client(
+    s3 = boto3.client(  # boto3's own factory is SYNC (not BackingAws.client)
         "s3", endpoint_url=endpoint, region_name="us-east-1",
         aws_access_key_id=access_key, aws_secret_access_key=secret_key,
         config=Config(
@@ -112,14 +112,14 @@ def _recovery_for(root, node_id: str) -> str:
     return matching[-1]["recovery"]
 
 
-def test_a_tofu_run_is_not_told_to_run_the_command_it_is_inside(wired):
+async def test_a_tofu_run_is_not_told_to_run_the_command_it_is_inside(wired):
     """The OPERATOR principal is a tofu run -- `/apply-full` and `/destroy` are
     the only issuers of that key -- so this event is being emitted from inside
     an apply or destroy that is failing right now."""
     client, root, creds = wired
     endpoint = f"http://127.0.0.1:{client.get('/health').json()['gateway']['port']}"
 
-    assert _call_s3(endpoint, creds[OPERATOR_NODE_ID]) == "ServiceUnavailable"
+    assert await _call_s3(endpoint, creds[OPERATOR_NODE_ID]) == "ServiceUnavailable"
     recovery = _recovery_for(root, OPERATOR_NODE_ID)
 
     assert "no s3 backing container is running" in recovery   # the shared diagnosis half
@@ -131,14 +131,14 @@ def test_a_tofu_run_is_not_told_to_run_the_command_it_is_inside(wired):
     assert f"odin apply --env {ENV}" not in recovery
 
 
-def test_a_workload_principal_still_gets_the_apply_advice(wired):
+async def test_a_workload_principal_still_gets_the_apply_advice(wired):
     """The other half: a lambda/ecs container calling S3 is NOT inside an
     apply, so Apply really is what starts the backing for it. Same env, same
     gateway, same missing backing -- only the principal differs."""
     client, root, creds = wired
     endpoint = f"http://127.0.0.1:{client.get('/health').json()['gateway']['port']}"
 
-    assert _call_s3(endpoint, creds["worker"]) == "ServiceUnavailable"
+    assert await _call_s3(endpoint, creds["worker"]) == "ServiceUnavailable"
     recovery = _recovery_for(root, "worker")
 
     assert "no s3 backing container is running" in recovery

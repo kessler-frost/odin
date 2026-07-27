@@ -19,7 +19,7 @@ this layer would gate a raw `SET` -- that is a network-reachability question
 
 The state machine is real and asynchronous, the ec2compute/lambdactl shape:
 `CreateCacheCluster` mints the record as `creating` and returns immediately,
-spawning a daemon thread that boots the container and waits for a real Redis
+starting a background task that boots the container and waits for a real Redis
 PING -- terraform-provider-aws's own create waiter (pending `creating`, target
 `available`) absorbs that latency, so no timing hack is needed. A boot failure
 lands the cluster in `create-failed`, NEVER a silent hang: that status string
@@ -31,7 +31,7 @@ any status outside its pending list as an immediate hard error and prints it,
 so a failed boot fails `apply` fast and honestly; the real reason rides on the
 record for the World verdict (reconcile/tf_status.py).
 
-`DeleteCacheCluster` sets `deleting`, returns, and a daemon thread removes the
+`DeleteCacheCluster` sets `deleting`, returns, and a background task removes the
 real container and then the record itself -- the provider's delete waiter
 polls until DescribeCacheClusters answers `CacheClusterNotFound`, which is
 exactly what a removed record produces. No grace window needed (unlike SQS's
@@ -64,8 +64,7 @@ ec2net/iamctl/ecr use for their own resource families.
 from __future__ import annotations
 
 import logging
-import threading
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from urllib.parse import parse_qsl
 from xml.sax.saxutils import escape
@@ -77,6 +76,7 @@ from odin.aws.backings import ACCOUNT, REGION
 from odin.aws.cache import RedisCache
 from odin.gateway import errors
 from odin.gateway.errors import exc_text
+from odin.gateway.models import background
 from odin.gateway.stores import NO_CHANGE, SynthStores
 from odin.runtime.colima import CONTAINER_HOST
 from odin.runtime.lima import LIMA_HOST
@@ -275,17 +275,13 @@ def _update(stores: SynthStores, env: str, cluster_id: str, **fields: object) ->
 # --- background completion: the async state machine -------------------------
 
 
-def _spawn(target: Callable[..., None], *args: object) -> None:
-    threading.Thread(target=target, args=args, daemon=True).start()
-
-
-def _finish_create(stores: SynthStores, env: str, cluster_id: str, cache: RedisCache) -> None:
-    # Deliberately broad, for the ec2compute reason: this runs on a daemon
-    # thread with no caller to propagate to, and an uncaught exception here
-    # would strand the cluster `creating` forever -- the one failure mode the
-    # brief forbids. Any failure becomes a real, provider-visible status.
+async def _finish_create(stores: SynthStores, env: str, cluster_id: str, cache: RedisCache) -> None:
+    # Deliberately broad, for the ec2compute reason: this runs as an unattended
+    # background task with no caller to propagate to, and an uncaught exception
+    # here would strand the cluster `creating` forever -- the one failure mode
+    # the brief forbids. Any failure becomes a real, provider-visible status.
     try:
-        port = cache.ensure(env, cluster_id)
+        port = await cache.ensure(env, cluster_id)
     except Exception as exc:
         log.warning("cache cluster %s failed to boot: %s", cluster_id, exc)
         _update(stores, env, cluster_id, status=STATUS_CREATE_FAILED, status_reason=exc_text(exc))
@@ -296,16 +292,22 @@ def _finish_create(stores: SynthStores, env: str, cluster_id: str, cache: RedisC
     )
 
 
-def _finish_delete(stores: SynthStores, env: str, cluster_id: str, arn: str, cache: RedisCache) -> None:
+async def _finish_delete(stores: SynthStores, env: str, cluster_id: str, arn: str, cache: RedisCache) -> None:
     try:
-        cache.delete(env, cluster_id)
+        await cache.delete(env, cluster_id)
     except Exception as exc:
         # Container-removal honesty: the record stays `deleting` with the real
         # reason, so the provider's delete waiter keeps polling and eventually
         # times out loudly rather than odin claiming a clean delete over a
         # container that's still running.
-        log.error("cache container removal failed for %s: %s", cluster_id, exc)
-        _update(stores, env, cluster_id, status_reason=f"container removal failed: {exc}")
+        # `exc_text`, matching `_finish_create` twelve lines up: the SAME
+        # module already had the treatment on its create path and not on its
+        # delete path, so a no-message exception persisted `container removal
+        # failed: ` -- a record stuck in `deleting` whose reason is a dangling
+        # colon, which is exactly the polling caller this branch exists to be
+        # honest with.
+        log.error("cache container removal failed for %s: %s", cluster_id, exc_text(exc))
+        _update(stores, env, cluster_id, status_reason=f"container removal failed: {exc_text(exc)}")
         return
     stores.cachectl.delete(env, _key(cluster_id))
     _set_tags(stores, env, arn, {})
@@ -314,7 +316,7 @@ def _finish_delete(stores: SynthStores, env: str, cluster_id: str, arn: str, cac
 # --- handlers ---------------------------------------------------------------
 
 
-def _create_cache_cluster(params: dict[str, str], env: str, stores: SynthStores, now: float, cache: RedisCache) -> Response:
+async def _create_cache_cluster(params: dict[str, str], env: str, stores: SynthStores, now: float, cache: RedisCache) -> Response:
     cluster_id = params.get("CacheClusterId", "")
     if _cluster(stores, env, cluster_id) is not None:
         return errors.synth_error(
@@ -355,17 +357,17 @@ def _create_cache_cluster(params: dict[str, str], env: str, stores: SynthStores,
     stores.cachectl.set(env, _key(cluster_id), cluster)
     _set_tags(stores, env, cluster["arn"], _parse_tags(params))
 
-    # Render the `creating` response BEFORE spawning the boot thread: JsonStore
+    # Render the `creating` response BEFORE starting the boot: JsonStore
     # hands back the SAME dict object it was given, so `cluster` here and the
     # record `_finish_create` mutates are literally the same object -- render
-    # after `_spawn` and a fast boot can race into the response body
+    # after the spawn and a fast boot can race into the response body
     # (ec2compute.py hit exactly this).
     response = _response("CreateCacheCluster", f"<CacheCluster>{_cluster_xml(cluster, show_nodes=True)}</CacheCluster>")
-    _spawn(_finish_create, stores, env, cluster_id, cache)
+    background(_finish_create(stores, env, cluster_id, cache))
     return response
 
 
-def _describe_cache_clusters(params: dict[str, str], env: str, stores: SynthStores, now: float, cache: RedisCache) -> Response:
+async def _describe_cache_clusters(params: dict[str, str], env: str, stores: SynthStores, now: float, cache: RedisCache) -> Response:
     cluster_id = params.get("CacheClusterId")
     show_nodes = params.get("ShowCacheNodeInfo") == "true"
     records = clusters(stores, env)
@@ -379,7 +381,7 @@ def _describe_cache_clusters(params: dict[str, str], env: str, stores: SynthStor
     return _response("DescribeCacheClusters", f"<CacheClusters>{items}</CacheClusters>")
 
 
-def _delete_cache_cluster(params: dict[str, str], env: str, stores: SynthStores, now: float, cache: RedisCache) -> Response:
+async def _delete_cache_cluster(params: dict[str, str], env: str, stores: SynthStores, now: float, cache: RedisCache) -> Response:
     cluster_id = params.get("CacheClusterId", "")
     cluster = _cluster(stores, env, cluster_id)
     if cluster is None:
@@ -388,7 +390,7 @@ def _delete_cache_cluster(params: dict[str, str], env: str, stores: SynthStores,
     _update(stores, env, cluster_id, status=STATUS_DELETING)
     response = _response("DeleteCacheCluster", f"<CacheCluster>{_cluster_xml(cluster, show_nodes=True)}</CacheCluster>")
     if not already_deleting:  # idempotent: a retried delete never double-spawns
-        _spawn(_finish_delete, stores, env, cluster_id, cluster["arn"], cache)
+        background(_finish_delete(stores, env, cluster_id, cluster["arn"], cache))
     return response
 
 
@@ -404,7 +406,7 @@ _MODIFIABLE = {
 }
 
 
-def _modify_cache_cluster(params: dict[str, str], env: str, stores: SynthStores, now: float, cache: RedisCache) -> Response:
+async def _modify_cache_cluster(params: dict[str, str], env: str, stores: SynthStores, now: float, cache: RedisCache) -> Response:
     cluster_id = params.get("CacheClusterId", "")
     cluster = _cluster(stores, env, cluster_id)
     if cluster is None:
@@ -440,7 +442,7 @@ def _resource_cluster(stores: SynthStores, env: str, resource_name: str) -> dict
     return _cluster(stores, env, resource_name.rsplit(":", 1)[-1])
 
 
-def _list_tags_for_resource(params: dict[str, str], env: str, stores: SynthStores, now: float, cache: RedisCache) -> Response:
+async def _list_tags_for_resource(params: dict[str, str], env: str, stores: SynthStores, now: float, cache: RedisCache) -> Response:
     resource_name = params.get("ResourceName", "")
     cluster = _resource_cluster(stores, env, resource_name)
     if cluster is None:
@@ -448,7 +450,7 @@ def _list_tags_for_resource(params: dict[str, str], env: str, stores: SynthStore
     return _response("ListTagsForResource", _tags_xml(_tags_for(stores, env, cluster["arn"])))
 
 
-def _add_tags_to_resource(params: dict[str, str], env: str, stores: SynthStores, now: float, cache: RedisCache) -> Response:
+async def _add_tags_to_resource(params: dict[str, str], env: str, stores: SynthStores, now: float, cache: RedisCache) -> Response:
     resource_name = params.get("ResourceName", "")
     cluster = _resource_cluster(stores, env, resource_name)
     if cluster is None:
@@ -458,7 +460,7 @@ def _add_tags_to_resource(params: dict[str, str], env: str, stores: SynthStores,
     return _response("AddTagsToResource", _tags_xml(_tags_for(stores, env, arn)))
 
 
-def _remove_tags_from_resource(params: dict[str, str], env: str, stores: SynthStores, now: float, cache: RedisCache) -> Response:
+async def _remove_tags_from_resource(params: dict[str, str], env: str, stores: SynthStores, now: float, cache: RedisCache) -> Response:
     resource_name = params.get("ResourceName", "")
     cluster = _resource_cluster(stores, env, resource_name)
     if cluster is None:
@@ -472,7 +474,9 @@ def _remove_tags_from_resource(params: dict[str, str], env: str, stores: SynthSt
 # --- dispatch ---------------------------------------------------------------
 
 
-_Handler = Callable[[dict[str, str], str, SynthStores, float, RedisCache], Response]
+# EVERY handler is a coroutine function, including the ones that await
+# nothing (v0.7.7) -- see `rdsctl._Handler` for why one uniform contract.
+_Handler = Callable[[dict[str, str], str, SynthStores, float, RedisCache], Awaitable[Response]]
 
 _HANDLERS: dict[str, _Handler] = {
     "CreateCacheCluster": _create_cache_cluster,
@@ -484,8 +488,43 @@ _HANDLERS: dict[str, _Handler] = {
     "RemoveTagsFromResource": _remove_tags_from_resource,
 }
 
+# logsctl/secretsctl/rdsctl's defect, in this module -- and here NO handler
+# checked, not even the create path. Measured against the real handlers with
+# the member omitted:
+#
+#   DeleteCacheCluster -> 404 CacheClusterNotFound "CacheCluster not found: "
+#   CreateCacheCluster -> 200, having MINTED `cluster:` -- a record keyed by
+#                         nothing, with `<CacheClusterId></CacheClusterId>` on
+#                         the wire, which no later call can name
+#
+# The second is worse than a message that says nothing: it is a success odin
+# did not achieve, and it is exactly the `taskdef::1` record
+# `ecsctl._missing_parameter` was written for. ModifyCacheCluster and the three
+# tag ops then answered 200 about that nameless record, which is how one
+# unchecked identifier becomes five wrong answers.
+#
+# The member lists are botocore's OWN `required` metadata for the
+# `elasticache` model, and a real boto3 client refuses to send a request
+# without them (`delete_cache_cluster()` -> `ParamValidationError: Missing
+# required parameter in input: "CacheClusterId"`). `DescribeCacheClusters` is
+# deliberately absent: an id-less describe is a legitimate LIST.
+_REQUIRED: dict[str, str] = {
+    "CreateCacheCluster": "CacheClusterId",
+    "DeleteCacheCluster": "CacheClusterId",
+    "ModifyCacheCluster": "CacheClusterId",
+    "ListTagsForResource": "ResourceName",
+    "AddTagsToResource": "ResourceName",
+    "RemoveTagsFromResource": "ResourceName",
+}
 
-def pure_answer(
+
+def _missing_identifier(op: str, params: dict[str, str]) -> str | None:
+    """The required identifier this request did not carry, or None."""
+    member = _REQUIRED.get(op, "")
+    return member if member and not params.get(member, "").strip() else None
+
+
+async def pure_answer(
     action: str, resource: str, env: str, body: bytes, stores: SynthStores, now: float,
     cache: RedisCache | None = None,
 ) -> Response | None:
@@ -498,7 +537,11 @@ def pure_answer(
     handler = _HANDLERS.get(op)
     if handler is None:
         return errors.synth_error("elasticache", "InvalidAction", f"The action {op} is not valid.", 400)
-    return handler(_params(body), env, stores, now, cache or RedisCache())
+    params = _params(body)
+    missing = _missing_identifier(op, params)
+    if missing is not None:
+        return _invalid_parameter(f"{missing} is required")
+    return await handler(params, env, stores, now, cache or RedisCache())
 
 
 # --- facts for consumers ----------------------------------------------------

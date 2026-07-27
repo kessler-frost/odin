@@ -156,7 +156,7 @@ def test_ec2_facts_matches_the_world_projections_own_builder():
 
 
 @pytest.mark.parametrize("state", ["running", "pending", "stopped", "shutting-down", "terminated"])
-def test_the_injector_publishes_exactly_what_world_publishes_for_an_ec2(tmp_path, state):
+async def test_the_injector_publishes_exactly_what_world_publishes_for_an_ec2(tmp_path, state):
     """The whole-pipeline guard, and the actual contract of this feature: for
     any instance state, `${{web1.X}}` resolves to a value if and only if
     `/world` shows `X` on that node. Two independently-built projections of
@@ -165,9 +165,9 @@ def test_the_injector_publishes_exactly_what_world_publishes_for_an_ec2(tmp_path
     built in parallel."""
     stores = _stores(tmp_path)
     _seed_ec2(stores, tmp_path, state=state)
-    projected = tf_status.project(stores, ENV).get(_VM_NODE)
+    projected = (await tf_status.project(stores, ENV)).get(_VM_NODE)
     mesh_health.reset_cache()
-    assert producer_facts(stores, ENV).get(_VM_NODE, {}) == (projected[2] if projected else {})
+    assert (await producer_facts(stores, ENV)).get(_VM_NODE, {}) == (projected[2] if projected else {})
 
 
 # --- REFERENCEABLE_KINDS, held to both halves that read it -----------------
@@ -180,7 +180,7 @@ def test_the_injector_publishes_exactly_what_world_publishes_for_an_ec2(tmp_path
 # refuses a ref before tofu runs).
 
 
-def test_every_referenceable_kind_really_publishes_and_no_other_kind_does(tmp_path):
+async def test_every_referenceable_kind_really_publishes_and_no_other_kind_does(tmp_path):
     """One live producer per `REFERENCEABLE_KINDS`, all four in the same env: the
     tuple is exactly the set `producer_facts` can build for. A kind added to the
     tuple without a builder, or a builder added without the tuple, fails here."""
@@ -189,7 +189,7 @@ def test_every_referenceable_kind_really_publishes_and_no_other_kind_does(tmp_pa
     _seed_cache(stores)
     _seed_alb(stores)
     _seed_ec2(stores, tmp_path)
-    facts = producer_facts(stores, ENV)
+    facts = await producer_facts(stores, ENV)
     assert set(facts) == {"appdb", "cache", _ALB_NODE, _VM_NODE}
     assert all(facts.values()), "a producer in the table must publish at least one fact"
     # ...and every kind NOT in the tuple contributes nothing, which is the claim
@@ -201,11 +201,11 @@ class _PortOnlyRuntime:
     """Just enough runtime for the REAL `BackingAws.facts` to run, so the facts
     asserted below are the ones production publishes."""
 
-    def host_port(self, name, container_port):
+    async def host_port(self, name, container_port):
         return 51001
 
 
-def test_the_four_provisioned_kinds_publish_world_facts_and_are_still_not_producers(tmp_path):
+async def test_the_four_provisioned_kinds_publish_world_facts_and_are_still_not_producers(tmp_path):
     """The exact pair of readings the field test took against a real server, as a
     test: `aws/backings.py::facts` authors a real fact for each of s3/sqs/sns/
     dynamodb -- which is why they show up in `odin world` -- and none of them is
@@ -213,7 +213,12 @@ def test_the_four_provisioned_kinds_publish_world_facts_and_are_still_not_produc
     assert set(PROVISIONED) == {"s3", "sqs", "sns", "dynamodb"}
     assert not set(PROVISIONED) & set(REFERENCEABLE_KINDS)
     aws = BackingAws(_PortOnlyRuntime(), env=ENV, root=tmp_path)
-    published = {kind: aws.facts(kind, "thing") for kind in PROVISIONED}
+    # A plain loop, not `{k: await aws.facts(...) for k in ...}`: an `await`
+    # inside a comprehension is legal here but one character away from an ASYNC
+    # GENERATOR that a plain `for` silently cannot iterate.
+    published = {}
+    for kind in PROVISIONED:
+        published[kind] = await aws.facts(kind, "thing")
     # Each one really does publish a named fact -- so "a kind that publishes no
     # facts" is a false statement about every one of them.
     assert {kind: sorted(facts) for kind, facts in published.items()} == {
@@ -227,30 +232,30 @@ def test_the_four_provisioned_kinds_publish_world_facts_and_are_still_not_produc
 # --- producer_facts --------------------------------------------------------
 
 
-def test_producer_facts_publishes_rds_and_cache_endpoints_by_label(tmp_path):
+async def test_producer_facts_publishes_rds_and_cache_endpoints_by_label(tmp_path):
     stores = _stores(tmp_path)
     _seed_db(stores)
     _seed_cache(stores)
-    facts = producer_facts(stores, ENV)
+    facts = await producer_facts(stores, ENV)
     assert facts["appdb"]["DATABASE_URL"] == f"postgresql://app:s3cret@{CONTAINER_HOST}:33366/shop"
     assert facts["cache"]["REDIS_URL"] == f"redis://{CONTAINER_HOST}:33364"
 
 
-def test_producer_facts_prefers_the_odin_node_tag_over_the_native_name(tmp_path):
+async def test_producer_facts_prefers_the_odin_node_tag_over_the_native_name(tmp_path):
     """The canvas label is the identity every ref is written against, and
     `hcl.py::_tags_block` stamps it as `odin:node` -- the same bridge
     `workload_env` and the World projection use."""
     stores = _stores(tmp_path)
     _seed_db(stores)
     stores.tags.set(ENV, "rds:arn:aws:rds:us-east-1:000000000000:db:appdb", {"odin:node": "primary-db"})
-    facts = producer_facts(stores, ENV)
+    facts = await producer_facts(stores, ENV)
     assert "primary-db" in facts and "appdb" not in facts
 
 
-def test_producer_facts_withholds_a_database_that_is_not_available_yet(tmp_path):
+async def test_producer_facts_withholds_a_database_that_is_not_available_yet(tmp_path):
     stores = _stores(tmp_path)
     _seed_db(stores, status="creating")
-    assert producer_facts(stores, ENV) == {}
+    assert await producer_facts(stores, ENV) == {}
 
 
 # --- ec2 as a producer ------------------------------------------------------
@@ -261,43 +266,43 @@ def test_producer_facts_withholds_a_database_that_is_not_available_yet(tmp_path)
 # demonstrably existed. Only the NAMES had been coordinated.
 
 
-def test_a_running_ec2_publishes_its_private_and_overlay_addresses(tmp_path):
+async def test_a_running_ec2_publishes_its_private_and_overlay_addresses(tmp_path):
     stores = _stores(tmp_path)
     _seed_ec2(stores, tmp_path)
-    assert producer_facts(stores, ENV)[_VM_NODE] == {"PRIVATE_IP": _PRIVATE_IP, "MESH_IP": _OVERLAY_IP}
+    assert (await producer_facts(stores, ENV))[_VM_NODE] == {"PRIVATE_IP": _PRIVATE_IP, "MESH_IP": _OVERLAY_IP}
 
 
-def test_an_ec2_that_is_not_running_publishes_nothing(tmp_path):
+async def test_an_ec2_that_is_not_running_publishes_nothing(tmp_path):
     """The same gate every other producer gets: a VM that is still booting has
     no address to hand out, so a consumer must fail rather than receive one."""
     stores = _stores(tmp_path)
     _seed_ec2(stores, tmp_path, state="pending")
-    assert producer_facts(stores, ENV) == {}
+    assert await producer_facts(stores, ENV) == {}
 
 
-def test_an_untagged_ec2_is_not_a_producer(tmp_path):
+async def test_an_untagged_ec2_is_not_a_producer(tmp_path):
     """No `odin:node` tag means no canvas label, and a ref is written against
     the label -- there is nothing to publish it under (real EC2 has no native
     name field to fall back to either)."""
     stores = _stores(tmp_path)
     _seed_ec2(stores, tmp_path, label=None)
-    assert producer_facts(stores, ENV) == {}
+    assert await producer_facts(stores, ENV) == {}
 
 
-def test_a_dead_lighthouse_withholds_mesh_ip_but_not_private_ip(tmp_path):
+async def test_a_dead_lighthouse_withholds_mesh_ip_but_not_private_ip(tmp_path):
     """`reconcile/mesh_health.py`'s rule, applied verbatim to the injector: an
     overlay address no peer can find or relay to is not published at all. The
     host-reachable private address is untouched -- the VM really is still
     reachable that way."""
     stores = _stores(tmp_path)
     _seed_ec2(stores, tmp_path, lighthouse=False)
-    assert producer_facts(stores, ENV)[_VM_NODE] == {"PRIVATE_IP": _PRIVATE_IP}
+    assert (await producer_facts(stores, ENV))[_VM_NODE] == {"PRIVATE_IP": _PRIVATE_IP}
 
 
 # --- node_env --------------------------------------------------------------
 
 
-def test_node_env_resolves_refs_and_keeps_static_entries(tmp_path):
+async def test_node_env_resolves_refs_and_keeps_static_entries(tmp_path):
     stores = _stores(tmp_path)
     _seed_db(stores)
     _seed_cache(stores)
@@ -308,27 +313,27 @@ def test_node_env_resolves_refs_and_keeps_static_entries(tmp_path):
             "APP_TIER": "web",
         }),
     ])
-    assert node_env(stores, ENV, "web") == {
+    assert await node_env(stores, ENV, "web") == {
         "APP_TIER": "web",
         "DATABASE_URL": f"postgresql://app:s3cret@{CONTAINER_HOST}:33366/shop",
         "REDIS_URL": f"redis://{CONTAINER_HOST}:33364",
     }
 
 
-def test_node_env_is_empty_for_a_node_that_is_not_on_the_canvas(tmp_path):
+async def test_node_env_is_empty_for_a_node_that_is_not_on_the_canvas(tmp_path):
     stores = _stores(tmp_path)
     _save_stack(tmp_path, [_ecs_node({"A": "b"})])
-    assert node_env(stores, ENV, "not-a-node") == {}
+    assert await node_env(stores, ENV, "not-a-node") == {}
 
 
-def test_an_unhealthy_producer_fails_loudly_instead_of_injecting_an_empty_string(tmp_path):
+async def test_an_unhealthy_producer_fails_loudly_instead_of_injecting_an_empty_string(tmp_path):
     """The explicit requirement: a ref to a not-yet-healthy producer must fail
     honestly. An empty DATABASE_URL would let the app fail far from the cause."""
     stores = _stores(tmp_path)
     _seed_db(stores, status="creating")
     _save_stack(tmp_path, [_ecs_node({"DATABASE_URL": "${{appdb.DATABASE_URL}}"}), _DB_NODE])
     with pytest.raises(UnresolvedRef) as excinfo:
-        node_env(stores, ENV, "web")
+        await node_env(stores, ENV, "web")
     message = str(excinfo.value)
     assert "DATABASE_URL" in message
     assert "appdb" in message
@@ -339,33 +344,33 @@ def test_an_unhealthy_producer_fails_loudly_instead_of_injecting_an_empty_string
     assert "publishes no facts" not in message
 
 
-def test_a_ref_to_a_nonexistent_node_fails_loudly(tmp_path):
+async def test_a_ref_to_a_nonexistent_node_fails_loudly(tmp_path):
     stores = _stores(tmp_path)
     _save_stack(tmp_path, [_ecs_node({"DATABASE_URL": "${{typo.DATABASE_URL}}"})])
     with pytest.raises(UnresolvedRef) as excinfo:
-        node_env(stores, ENV, "web")
+        await node_env(stores, ENV, "web")
     assert "typo" in str(excinfo.value)
 
 
-def test_a_ref_to_an_attribute_the_producer_does_not_publish_names_what_it_does(tmp_path):
+async def test_a_ref_to_an_attribute_the_producer_does_not_publish_names_what_it_does(tmp_path):
     stores = _stores(tmp_path)
     _seed_db(stores)
     _save_stack(tmp_path, [_ecs_node({"X": "${{appdb.NOPE}}"})])
     with pytest.raises(UnresolvedRef) as excinfo:
-        node_env(stores, ENV, "web")
+        await node_env(stores, ENV, "web")
     message = str(excinfo.value)
     assert "'NOPE'" in message
     assert "DATABASE_URL" in message  # what it DOES publish, so the fix is obvious
 
 
-def test_a_workload_consumes_a_vms_addresses_through_its_env_map(tmp_path):
+async def test_a_workload_consumes_a_vms_addresses_through_its_env_map(tmp_path):
     stores = _stores(tmp_path)
     _seed_ec2(stores, tmp_path)
     _save_stack(tmp_path, [_ecs_node({"VM_HOST": "${{web1.PRIVATE_IP}}", "VM_MESH": "${{web1.MESH_IP}}"})])
-    assert node_env(stores, ENV, "web") == {"VM_HOST": _PRIVATE_IP, "VM_MESH": _OVERLAY_IP}
+    assert await node_env(stores, ENV, "web") == {"VM_HOST": _PRIVATE_IP, "VM_MESH": _OVERLAY_IP}
 
 
-def test_a_withheld_mesh_ip_fails_the_ref_instead_of_injecting_an_empty_string(tmp_path):
+async def test_a_withheld_mesh_ip_fails_the_ref_instead_of_injecting_an_empty_string(tmp_path):
     """The explicit requirement for this feature. `MESH_IP` is withheld when
     the env's lighthouse is down; the consumer must then fail exactly like any
     other unresolvable ref -- never an empty string, and never the stale
@@ -376,7 +381,7 @@ def test_a_withheld_mesh_ip_fails_the_ref_instead_of_injecting_an_empty_string(t
     _seed_ec2(stores, tmp_path, lighthouse=False)
     _save_stack(tmp_path, [_ecs_node({"VM_MESH": "${{web1.MESH_IP}}"})])
     with pytest.raises(UnresolvedRef) as excinfo:
-        node_env(stores, ENV, "web")
+        await node_env(stores, ENV, "web")
     message = str(excinfo.value)
     assert "VM_MESH" in message
     assert "'MESH_IP'" in message
@@ -384,16 +389,16 @@ def test_a_withheld_mesh_ip_fails_the_ref_instead_of_injecting_an_empty_string(t
     assert _OVERLAY_IP not in message  # and never the address it just refused to hand out
 
 
-def test_a_ref_to_a_vm_that_is_not_up_yet_fails_honestly(tmp_path):
+async def test_a_ref_to_a_vm_that_is_not_up_yet_fails_honestly(tmp_path):
     stores = _stores(tmp_path)
     _seed_ec2(stores, tmp_path, state="pending")
     _save_stack(tmp_path, [_ecs_node({"VM_HOST": "${{web1.PRIVATE_IP}}"}), _VM_CANVAS_NODE])
     with pytest.raises(UnresolvedRef) as excinfo:
-        node_env(stores, ENV, "web")
+        await node_env(stores, ENV, "web")
     assert "has not published its endpoint yet" in str(excinfo.value)
 
 
-def test_a_ref_to_a_kind_that_can_never_produce_says_so_and_does_not_deny_its_facts(tmp_path):
+async def test_a_ref_to_a_kind_that_can_never_produce_says_so_and_does_not_deny_its_facts(tmp_path):
     """Field test 6, F3's sub-finding. The message said an sqs node "publishes no
     facts (only rds, elasticache, alb and ec2 do)" -- while `/world` was
     publishing that same node's `QUEUE_URL`. Measured against a real server at
@@ -409,7 +414,7 @@ def test_a_ref_to_a_kind_that_can_never_produce_says_so_and_does_not_deny_its_fa
     stores = _stores(tmp_path)
     _save_stack(tmp_path, [_ecs_node({"QUEUE_URL": "${{jobs.QUEUE_URL}}"}), _QUEUE_NODE])
     with pytest.raises(UnresolvedRef) as excinfo:
-        node_env(stores, ENV, "web")
+        await node_env(stores, ENV, "web")
     message = str(excinfo.value)
     assert "'jobs' is a sqs node" in message
     assert "no sqs node publishes an endpoint a reference can resolve" in message
@@ -422,23 +427,23 @@ def test_a_ref_to_a_kind_that_can_never_produce_says_so_and_does_not_deny_its_fa
     assert "AWS_ENDPOINT_URL" in message
 
 
-def test_a_ref_whose_target_kind_is_unknown_says_that_rather_than_guessing(tmp_path):
+async def test_a_ref_whose_target_kind_is_unknown_says_that_rather_than_guessing(tmp_path):
     """A resource no canvas node backs (an imported HCL project) has no kind in
     either the staged wiring or the applied Stack. Reporting either of the other
     two reasons would be a claim odin cannot make."""
     stores = _stores(tmp_path)
     _save_stack(tmp_path, [_ecs_node({"X": "${{ghost.ENDPOINT}}"})])
     with pytest.raises(UnresolvedRef) as excinfo:
-        node_env(stores, ENV, "web")
+        await node_env(stores, ENV, "web")
     message = str(excinfo.value)
     assert "cannot tell what kind of node 'ghost' is" in message
     assert "Nothing resolves from it either way" in message
 
 
-def test_a_lambda_node_resolves_the_same_way(tmp_path):
+async def test_a_lambda_node_resolves_the_same_way(tmp_path):
     stores = _stores(tmp_path)
     _seed_db(stores)
     _save_stack(tmp_path, [
         {"id": "n1", "type": "lambda", "data": {"label": "notify", "env": {"DB": "${{appdb.endpoint}}"}}},
     ])
-    assert node_env(stores, ENV, "notify") == {"DB": f"{CONTAINER_HOST}:33366"}
+    assert await node_env(stores, ENV, "notify") == {"DB": f"{CONTAINER_HOST}:33366"}

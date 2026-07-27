@@ -39,13 +39,13 @@ Model decisions, each traced to the research:
   `LimaRuntime`'s own host VM uses, extended with t3.* rows) -- default
   `t3.micro` when the field is absent.
 - The state machine is real and asynchronous: RunInstances mints the record
-  as `pending` and returns immediately, spawning a background thread that
+  as `pending` and returns immediately, starting a background task that
   calls `InstanceVm.boot` -- the provider's own DescribeInstances waiter
   (research: "sleeps ~10s, then polls until running") is built for exactly
   this Lima-boot latency, no timing hack needed. A boot failure lands the
   instance in `terminated` with a `StateReason`, never a silent hang
   (`_finish_boot`'s `except` is the one deliberately broad catch in this
-  module -- required so an uncaught exception on a daemon thread can't strand
+  module -- required so an uncaught exception in a background task can't strand
   an instance `pending` forever). Stop/Start/Terminate follow the same
   immediate-transitional-state + background-completion shape.
 - Terminate keeps the record ~60s after `terminated` (MiniStack's lazy-sweep
@@ -69,6 +69,7 @@ Model decisions, each traced to the research:
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -77,9 +78,8 @@ import os
 import secrets
 import subprocess
 import tempfile
-import threading
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
@@ -96,7 +96,7 @@ from odin.fabric.nebula import LighthouseManager, union_firewalls
 from odin.gateway import errors
 from odin.gateway.errors import exc_text
 from odin.gateway.keys import KeyStore, workload_env
-from odin.gateway.models import ec2net
+from odin.gateway.models import background, ec2net
 from odin.gateway.stores import NO_CHANGE, SynthStores
 from odin.simulate.workspace import tf_dir
 
@@ -132,7 +132,7 @@ _INSTANCE_ATTRIBUTE_DEFAULTS = {
 _TERMINATED_SWEEP_SECONDS = 60.0
 
 # Release finding #3 -- the resurrection race: RunInstances spawns
-# `_finish_boot` on a daemon thread that can still be mid-flight when a
+# `_finish_boot` as a background task that can still be mid-flight when a
 # TerminateInstances call for the SAME instance wins the race and completes
 # first. Once an instance has entered one of these states, NO later
 # completion (a slow boot finishing as "running", a stale Stop/Start
@@ -252,6 +252,31 @@ def _tag_set_xml(tags: dict[str, str]) -> str:
 
 def _not_found_instance(instance_id: str) -> Response:
     return errors.synth_error("ec2", "InvalidInstanceID.NotFound", f"The instance ID '{instance_id}' does not exist", 400)
+
+
+def _missing_parameter(name: str) -> Response:
+    """EC2's own answer for a required parameter that isn't there -- the code
+    and the sentence real EC2 sends, so botocore/aws-sdk-go-v2 raise the
+    `ClientError` a caller can already branch on.
+
+    REFUSING is the decision, over recording the request and carrying the
+    defect forward, and the reason is that the two are not symmetric here.
+    Verified against botocore's own EC2 model (`ec2/2016-11-15/service-2.json`,
+    the model botocore validates real calls against):
+
+        ImportKeyPair            required = ['KeyName', 'PublicKeyMaterial']
+        DescribeInstanceAttribute required = ['InstanceId', 'Attribute']
+
+    -- real AWS refuses both, so refusing is also the higher-fidelity answer.
+    But the deciding argument is what ACCEPTING costs. A caller cannot act on a
+    record it never sees: the TF provider reads a 200 as "the key pair is
+    imported" and goes on to RunInstances, and the instance then boots for real
+    -- a live VM, the user's RAM and disk -- with an empty
+    `authorized_keys`. There is no later moment at which odin gets to mention
+    it, and no `ssh` failure that names this as the cause. A 400 arrives while
+    the caller is still in a position to do something about it, which is the
+    whole difference."""
+    return errors.synth_error("ec2", "MissingParameter", f"The request must contain the parameter {name}", 400)
 
 
 # --- security groups on the instance (field-test finding #2) ----------------
@@ -420,7 +445,7 @@ def _volume_xml(volume: dict) -> str:
 
 # --- background completion: the async state machine (the "never block"
 # requirement -- every handler below returns a transitional state
-# immediately, a daemon thread finishes the real work) -------------------
+# immediately, a background task finishes the real work) -----------------
 
 
 def _update_instance(stores: SynthStores, env: str, instance_id: str, **fields: object) -> None:
@@ -440,17 +465,17 @@ def _update_instance(stores: SynthStores, env: str, instance_id: str, **fields: 
     stores.ec2compute.update(env, _key("instance", instance_id), mutate)
 
 
-def _finish_boot(
+async def _finish_boot(
     stores: SynthStores, env: str, instance_id: str, name: str, vm_config, ssh_pubkey, user_data, nebula, vm: InstanceVm,
     env_vars: dict[str, str] | None = None,
 ) -> None:
-    # Deliberately broad: this runs on a daemon thread with no caller to
-    # propagate an exception to. Without this catch, a boot failure would
-    # kill the thread silently and strand the instance `pending` forever --
+    # Deliberately broad: this runs as an unattended background task with no
+    # caller to propagate an exception to. Without this catch, a boot failure
+    # would end the task silently and strand the instance `pending` forever --
     # exactly the "silent hang" the brief forbids. Any failure instead
     # becomes a real, provider-visible terminal state.
     try:
-        ip = vm.boot(name, vm_config, hostname=instance_id, ssh_pubkey=ssh_pubkey, user_data=user_data, nebula=nebula, env_vars=env_vars)
+        ip = await vm.boot(name, vm_config, hostname=instance_id, ssh_pubkey=ssh_pubkey, user_data=user_data, nebula=nebula, env_vars=env_vars)
     except Exception as exc:
         log.warning("boot failed for instance %s (%s): %s", instance_id, name, exc_text(exc))
         _update_instance(
@@ -468,9 +493,9 @@ def _finish_boot(
     )
 
 
-def _finish_terminate(stores: SynthStores, env: str, instance_id: str, name: str, vm: InstanceVm) -> None:
+async def _finish_terminate(stores: SynthStores, env: str, instance_id: str, name: str, vm: InstanceVm) -> None:
     try:
-        vm.delete(name)
+        await vm.delete(name)
     except Exception as exc:
         # VM delete honesty (release finding #4): a failed delete must NOT
         # be reported as a clean `terminated` -- a caller (tofu's own
@@ -540,10 +565,10 @@ def _retry_failed_deletes(stores: SynthStores, env: str, vm: InstanceVm) -> None
         claimed = stores.ec2compute.update(env, _key("instance", instance_id), _claim_delete_retry)
         if claimed is NO_CHANGE:
             continue
-        _spawn(_finish_terminate, stores, env, instance_id, vm_name(env, instance_id), vm)
+        background(_finish_terminate(stores, env, instance_id, vm_name(env, instance_id), vm))
 
 
-def _finish_stop(stores: SynthStores, env: str, instance_id: str, name: str, vm: InstanceVm) -> None:
+async def _finish_stop(stores: SynthStores, env: str, instance_id: str, name: str, vm: InstanceVm) -> None:
     """A failed stop still lands `stopped` -- the VM is not answering, which
     for the caller is the same end state -- but it no longer lands there
     SILENTLY. Its sibling `_finish_start` already recorded a `state_reason`
@@ -553,7 +578,7 @@ def _finish_stop(stores: SynthStores, env: str, instance_id: str, name: str, vm:
     `_exc_text` treatment, so the two now say the same kind of thing."""
     reason = None
     try:
-        vm.stop(name)
+        await vm.stop(name)
     except Exception as exc:
         log.warning("VM stop failed for instance %s (%s): %s", instance_id, name, exc_text(exc))
         reason = {"code": "Server.InternalError", "message": f"VM stop failed: {exc_text(exc)}"}
@@ -563,9 +588,9 @@ def _finish_stop(stores: SynthStores, env: str, instance_id: str, name: str, vm:
     )
 
 
-def _finish_start(stores: SynthStores, env: str, instance_id: str, name: str, vm: InstanceVm) -> None:
+async def _finish_start(stores: SynthStores, env: str, instance_id: str, name: str, vm: InstanceVm) -> None:
     try:
-        ip = vm.start(name)
+        ip = await vm.start(name)
     except Exception as exc:
         log.warning("VM start failed for instance %s (%s): %s", instance_id, name, exc_text(exc))
         _update_instance(
@@ -577,10 +602,6 @@ def _finish_start(stores: SynthStores, env: str, instance_id: str, name: str, vm
     _update_instance(
         stores, env, instance_id, state_name="running", private_ip=ip, public_ip=ip, state_reason=None,
     )
-
-
-def _spawn(target: Callable[..., None], *args: object) -> None:
-    threading.Thread(target=target, args=args, daemon=True).start()
 
 
 # --- Instances ------------------------------------------------------------
@@ -652,7 +673,7 @@ def _instance_firewall(stores: SynthStores, env: str, vpc: dict, security_group_
     return ec2net.compiled_firewall(stores, env, vpc["default_sg_id"])
 
 
-def _run_instances(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+async def _run_instances(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     subnet_id = params.get("SubnetId", "")
     subnet = stores.ec2net.get(env, f"subnet:{subnet_id}") if subnet_id else None
     if subnet_id and subnet is None:
@@ -703,11 +724,11 @@ def _run_instances(params: dict[str, str], env: str, stores: SynthStores, now: f
     tags = _spec_tags(params)
     stores.tags.set(env, f"ec2:{instance_id}", tags)
 
-    # Render the `pending` response BEFORE spawning the boot thread: the
+    # Render the `pending` response BEFORE starting the boot: the
     # store hands back the SAME dict object it was given (JsonStore keeps
     # references, not copies), so `instance` here and the record `_finish_boot`
     # later mutates via `_update_instance` are literally the same object --
-    # rendering after `_spawn` risked reading an already-`running` instance
+    # rendering after the spawn risked reading an already-`running` instance
     # back on a fast (fake-VM) boot, a real race, not a test artifact.
     response = _response("RunInstances", _reservation_inner_xml(stores, env, instance))
 
@@ -736,14 +757,14 @@ def _run_instances(params: dict[str, str], env: str, stores: SynthStores, now: f
     label = tags.get("odin:node")
     injectable = keystore is not None and gateway_port is not None and label
     env_vars = workload_env(keystore, env, label, gateway_port) if injectable else None
-    _spawn(_finish_boot, stores, env, instance_id, name, vm_config, ssh_pubkey, user_data, nebula, vm, env_vars)
+    background(_finish_boot(stores, env, instance_id, name, vm_config, ssh_pubkey, user_data, nebula, vm, env_vars))
 
     return response
 
 
-def _describe_instances(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+async def _describe_instances(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     _sweep_terminated(stores, env, now)
-    _retry_failed_deletes(stores, env, vm)
+    _retry_failed_deletes(stores, env, vm)  # starts tasks, awaits none -- see `background`
     instance_ids = _scalars(params, "InstanceId")
     filters = _filters(params)
     instances = _records(stores, env, "instance")
@@ -761,7 +782,7 @@ def _describe_instances(params: dict[str, str], env: str, stores: SynthStores, n
     return _response("DescribeInstances", _reservation_set_xml(stores, env, selected))
 
 
-def _terminate_instances(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+async def _terminate_instances(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     ids = _scalars(params, "InstanceId")
     changes = []
     for instance_id in ids:
@@ -773,13 +794,13 @@ def _terminate_instances(params: dict[str, str], env: str, stores: SynthStores, 
             changes.append((instance_id, previous, previous))
             continue
         _update_instance(stores, env, instance_id, state_name="shutting-down")
-        _spawn(_finish_terminate, stores, env, instance_id, vm_name(env, instance_id), vm)
+        background(_finish_terminate(stores, env, instance_id, vm_name(env, instance_id), vm))
         changes.append((instance_id, previous, "shutting-down"))
     items = "".join(_state_change_xml(i, p, c) for i, p, c in changes)
     return _response("TerminateInstances", f"<instancesSet>{items}</instancesSet>")
 
 
-def _stop_instances(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+async def _stop_instances(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     ids = _scalars(params, "InstanceId")
     changes = []
     for instance_id in ids:
@@ -788,13 +809,13 @@ def _stop_instances(params: dict[str, str], env: str, stores: SynthStores, now: 
             return _not_found_instance(instance_id)
         previous = instance["state_name"]
         _update_instance(stores, env, instance_id, state_name="stopping")
-        _spawn(_finish_stop, stores, env, instance_id, vm_name(env, instance_id), vm)
+        background(_finish_stop(stores, env, instance_id, vm_name(env, instance_id), vm))
         changes.append((instance_id, previous, "stopping"))
     items = "".join(_state_change_xml(i, p, c) for i, p, c in changes)
     return _response("StopInstances", f"<instancesSet>{items}</instancesSet>")
 
 
-def _start_instances(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+async def _start_instances(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     ids = _scalars(params, "InstanceId")
     changes = []
     for instance_id in ids:
@@ -803,7 +824,7 @@ def _start_instances(params: dict[str, str], env: str, stores: SynthStores, now:
             return _not_found_instance(instance_id)
         previous = instance["state_name"]
         _update_instance(stores, env, instance_id, state_name="pending")
-        _spawn(_finish_start, stores, env, instance_id, vm_name(env, instance_id), vm)
+        background(_finish_start(stores, env, instance_id, vm_name(env, instance_id), vm))
         changes.append((instance_id, previous, "pending"))
     items = "".join(_state_change_xml(i, p, c) for i, p, c in changes)
     return _response("StartInstances", f"<instancesSet>{items}</instancesSet>")
@@ -812,7 +833,7 @@ def _start_instances(params: dict[str, str], env: str, stores: SynthStores, now:
 # --- in-place attribute edits (field-test finding #2) ----------------------
 
 
-def _modify_instance_attribute(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+async def _modify_instance_attribute(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     """A real, tolerant success (was an InvalidAction 400 the provider merely
     tolerated). The provider calls this during destroy (DisableApiTermination
     =false) and CAN carry an in-place security-group change (`GroupId.N`); the
@@ -827,7 +848,7 @@ def _modify_instance_attribute(params: dict[str, str], env: str, stores: SynthSt
     return _response("ModifyInstanceAttribute", "<return>true</return>")
 
 
-def _modify_network_interface_attribute(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+async def _modify_network_interface_attribute(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     """The call terraform-provider-aws actually makes to change a VPC
     instance's `vpc_security_group_ids` (on the primary ENI). Maps the ENI id
     back to its instance and updates the stored set, so a canvas security-group
@@ -843,7 +864,7 @@ def _modify_network_interface_attribute(params: dict[str, str], env: str, stores
 # --- read-only hydration describes (research §2b) --------------------------
 
 
-def _describe_instance_types(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+async def _describe_instance_types(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     names = _scalars(params, "InstanceType") or list(INSTANCE_TYPES.keys())
     items = []
     for name in names:
@@ -859,12 +880,32 @@ def _describe_instance_types(params: dict[str, str], env: str, stores: SynthStor
     return _response("DescribeInstanceTypes", f"<instanceTypeSet>{''.join(items)}</instanceTypeSet>")
 
 
-def _describe_instance_attribute(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+async def _describe_instance_attribute(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     instance_id = params.get("InstanceId", "")
     instance = _instance(stores, env, instance_id)
     if instance is None:
         return _not_found_instance(instance_id)
     attribute = params.get("Attribute", "")
+    # No `Attribute` used to fall through to the tail of this function and build
+    # `<><value>false</value></>` -- not a wrong answer but an unparseable one,
+    # which every XML client answers with a parse error naming a column number
+    # rather than the missing parameter. `Attribute` is required in botocore's
+    # own EC2 model, so this is also what real EC2 sends.
+    #
+    # `isalnum` covers the same hole from the other side: the attribute name is
+    # interpolated as an ELEMENT NAME, where `escape()` is no help (escaping
+    # would emit the literal text, not a tag), so `Attribute=<foo` produced the
+    # identical unparseable document. All 16 values of the model's
+    # `InstanceAttributeName` enum are alphanumeric (checked against the model,
+    # not assumed), so no real attribute is refused by this -- including the 12
+    # this module does not model, which keep their permissive default answer.
+    if not attribute:
+        return _missing_parameter("Attribute")
+    if not attribute.isalnum():
+        return errors.synth_error(
+            "ec2", "InvalidParameterValue",
+            f"Invalid value '{attribute}' for Attribute: it is not the name of an instance attribute", 400,
+        )
     if attribute == "userData":
         value = instance.get("user_data_b64", "")
         # An empty `<value></value>` (rather than omitting `<value>`
@@ -882,7 +923,7 @@ def _describe_instance_attribute(params: dict[str, str], env: str, stores: Synth
     )
 
 
-def _describe_instance_credit_specifications(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+async def _describe_instance_credit_specifications(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     instance_ids = _scalars(params, "InstanceId")
     instances = _records(stores, env, "instance")
     selected = [i for i in instances if not instance_ids or i["instance_id"] in instance_ids]
@@ -892,7 +933,7 @@ def _describe_instance_credit_specifications(params: dict[str, str], env: str, s
     return _response("DescribeInstanceCreditSpecifications", f"<instanceCreditSpecificationSet>{items}</instanceCreditSpecificationSet>")
 
 
-def _describe_volumes(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+async def _describe_volumes(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     volume_ids = _scalars(params, "VolumeId")
     filters = _filters(params)
     volumes = [i["root_volume"] for i in _records(stores, env, "instance")]
@@ -908,15 +949,28 @@ def _describe_volumes(params: dict[str, str], env: str, stores: SynthStores, now
 # --- Key pairs --------------------------------------------------------------
 
 
-def _generate_keypair() -> tuple[str, str]:
+async def _generate_keypair() -> tuple[str, str]:
     """A REAL RSA keypair via `ssh-keygen` (no mock-only modes) -- the same
-    shelling-out style `fabric/nebula.py` uses for `nebula-cert`."""
+    shelling-out style `fabric/nebula.py` uses for `nebula-cert`.
+
+    `create_subprocess_exec`, not `subprocess.run` (v0.7.7): CreateKeyPair is
+    served on the shared control loop now, and `ssh-keygen -t rsa -b 2048`
+    measured 48.3ms on this machine -- 48ms in which neither the gateway nor
+    the reconciler could run. Same command, same `check=True` semantics
+    (a non-zero exit raises `CalledProcessError` carrying the real stderr, so
+    the failure text a caller sees is unchanged)."""
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "key"
-        subprocess.run(
-            ["ssh-keygen", "-t", "rsa", "-b", "2048", "-m", "PEM", "-N", "", "-f", str(path)],
-            check=True, capture_output=True, text=True,
+        argv = ["ssh-keygen", "-t", "rsa", "-b", "2048", "-m", "PEM", "-N", "", "-f", str(path)]
+        proc = await asyncio.create_subprocess_exec(
+            *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode:
+            raise subprocess.CalledProcessError(
+                proc.returncode, argv, output=stdout.decode(errors="replace"),
+                stderr=stderr.decode(errors="replace"),
+            )
         return path.with_suffix(".pub").read_text().strip(), path.read_text()
 
 
@@ -929,11 +983,21 @@ def _store_keypair(stores: SynthStores, env: str, params: dict[str, str], name: 
     return record
 
 
-def _import_key_pair(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+async def _import_key_pair(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     name = params.get("KeyName", "")
+    if not name:
+        return _missing_parameter("KeyName")
     if _keypair(stores, env, name) is not None:
         return errors.synth_error("ec2", "InvalidKeyPair.Duplicate", f"The keypair '{name}' already exists.", 400)
+    # The guard reads the DECODED key, not the presence of the parameter --
+    # `b64decode` ignores non-alphabet characters by default, so a
+    # `PublicKeyMaterial` that is present but junk decodes to `b""` and used to
+    # reach the store exactly like an absent one. Checking the parameter would
+    # be a guard on a signal that isn't the one that matters (honesty rule 1);
+    # the empty key is what an instance would have booted with.
     public_key = base64.b64decode(params.get("PublicKeyMaterial", "")).decode("utf-8", "replace").strip()
+    if not public_key:
+        return _missing_parameter("PublicKeyMaterial")
     record = _store_keypair(stores, env, params, name, public_key)
     tags = _res_tags(stores, env, record["key_pair_id"])
     inner = (
@@ -943,11 +1007,17 @@ def _import_key_pair(params: dict[str, str], env: str, stores: SynthStores, now:
     return _response("ImportKeyPair", inner)
 
 
-def _create_key_pair(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+async def _create_key_pair(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     name = params.get("KeyName", "")
+    # The sibling of ImportKeyPair's own guard, hunted rather than waited for
+    # (honesty rule 2: fix the shape). `CreateKeyPair` requires `KeyName` in the
+    # same botocore model, and without this it minted a real key pair under the
+    # empty-string name -- the `keypair:` record of OPEN-BUGS #7's family.
+    if not name:
+        return _missing_parameter("KeyName")
     if _keypair(stores, env, name) is not None:
         return errors.synth_error("ec2", "InvalidKeyPair.Duplicate", f"The keypair '{name}' already exists.", 400)
-    public_key, private_key = _generate_keypair()
+    public_key, private_key = await _generate_keypair()
     record = _store_keypair(stores, env, params, name, public_key)
     tags = _res_tags(stores, env, record["key_pair_id"])
     inner = (
@@ -957,7 +1027,7 @@ def _create_key_pair(params: dict[str, str], env: str, stores: SynthStores, now:
     return _response("CreateKeyPair", inner)
 
 
-def _describe_key_pairs(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+async def _describe_key_pairs(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     names = _scalars(params, "KeyName")
     keypairs = _records(stores, env, "keypair")
     missing = [n for n in names if n not in {k["key_name"] for k in keypairs}]
@@ -972,7 +1042,7 @@ def _describe_key_pairs(params: dict[str, str], env: str, stores: SynthStores, n
     return _response("DescribeKeyPairs", f"<keySet>{items}</keySet>")
 
 
-def _delete_key_pair(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+async def _delete_key_pair(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     # Idempotent-succeed even if the key is already gone -- real AWS's own
     # DeleteKeyPair semantics, and one fewer branch than a NotFound check.
     name = params.get("KeyName", "")
@@ -1057,7 +1127,7 @@ def membership_revision(stores: SynthStores, env: str) -> str:
     return hashlib.sha256(json.dumps(roster, sort_keys=True).encode()).hexdigest()[:16]
 
 
-def ensure_instance_mesh(stores: SynthStores, env: str, vm: InstanceVm | None = None) -> dict[str, str]:
+async def ensure_instance_mesh(stores: SynthStores, env: str, vm: InstanceVm | None = None) -> dict[str, str]:
     """Push each RUNNING instance's CURRENT compiled security groups into its
     already-booted VM -- `rdsctl.ensure_db_mesh`'s exact twin, for the exact
     same reason, and it is the half that was missing.
@@ -1109,7 +1179,7 @@ def ensure_instance_mesh(stores: SynthStores, env: str, vm: InstanceVm | None = 
         ))
     actions: dict[str, str] = {}
     for nebula in sorted(joins, key=lambda join: not membership_changed(join)):
-        actions[vm_name(env, nebula.host_id)] = machine.refresh_nebula(
+        actions[vm_name(env, nebula.host_id)] = await machine.refresh_nebula(
             vm_name(env, nebula.host_id), nebula,
         )
     _refuse_to_report_success(env, stores, actions)
@@ -1137,7 +1207,7 @@ class ReclaimFailed(RuntimeError):
     Running while destroy answered `destroyed / tf ok` in 1.7 seconds."""
 
 
-def reclaim_env_instances(stores: SynthStores, env: str, vm: InstanceVm | None = None) -> list[str]:
+async def reclaim_env_instances(stores: SynthStores, env: str, vm: InstanceVm | None = None) -> list[str]:
     """Delete every VM this env's gateway store still claims, and forget the
     records. Returns the VM names it reclaimed. RAISES `ReclaimFailed` if any
     VM could not be deleted -- teardown does not get to report success over a
@@ -1166,7 +1236,7 @@ def reclaim_env_instances(stores: SynthStores, env: str, vm: InstanceVm | None =
         instance_id = record["instance_id"]
         name = vm_name(env, instance_id)
         try:
-            machine.delete(name)
+            await machine.delete(name)
         except Exception as exc:  # noqa: BLE001 -- reported, never swallowed; see ReclaimFailed
             # `_exc_text`: `f"{name} ({exc})"` renders `odin-ec2-x ()` -- empty
             # parentheses -- for an exception with no message, inside the ONE
@@ -1246,7 +1316,7 @@ def _instances_missing_from(stores: SynthStores, env: str, parsed: object) -> li
     return [r["instance_id"] for r in _records(stores, env, "instance") if r["instance_id"] not in known]
 
 
-def reclaim_tf_forgotten_vms(stores: SynthStores, envs: list[str], vm: InstanceVm | None = None) -> list[str]:
+async def reclaim_tf_forgotten_vms(stores: SynthStores, envs: list[str], vm: InstanceVm | None = None) -> list[str]:
     """Startup half of the same fix: delete the VMs of instances tofu's state
     has forgotten, and forget their records, so `/world` and the store agree
     with reality again. Runs beside `reap_orphaned_vms` -- that one reclaims a
@@ -1265,14 +1335,14 @@ def reclaim_tf_forgotten_vms(stores: SynthStores, envs: list[str], vm: InstanceV
                 "reclaiming EC2 VM %r: env %r's gateway store claims it, but tofu's state does not -- "
                 "no terraform operation can ever reach it again (an interrupted apply)", name, env,
             )
-            machine.delete(name)
+            await machine.delete(name)
             stores.tags.set(env, f"ec2:{instance_id}", {})
             stores.ec2compute.delete(env, _key("instance", instance_id))
             reclaimed.append(name)
     return reclaimed
 
 
-def reap_orphaned_vms(root: Path, envs: list[str], vm: InstanceVm | None = None) -> list[str]:
+async def reap_orphaned_vms(root: Path, envs: list[str], vm: InstanceVm | None = None) -> list[str]:
     """A one-shot startup safety net for a VM that's on disk with NO
     matching store record anywhere -- e.g. a crash between `vm.delete`
     succeeding and the store update landing, or any other drift between
@@ -1302,10 +1372,10 @@ def reap_orphaned_vms(root: Path, envs: list[str], vm: InstanceVm | None = None)
         if key.startswith("instance:")
     }
     reaped = []
-    for name in vm.list_names():
+    for name in await vm.list_names():
         if name.startswith(_VM_NAME_PREFIX) and name not in expected:
             log.warning("startup reaper: deleting orphaned EC2 VM %r (no matching store record)", name)
-            vm.delete(name)
+            await vm.delete(name)
             reaped.append(name)
     return reaped
 
@@ -1313,7 +1383,12 @@ def reap_orphaned_vms(root: Path, envs: list[str], vm: InstanceVm | None = None)
 # --- dispatch ----------------------------------------------------------------
 
 
-_Handler = Callable[[dict[str, str], str, SynthStores, float, InstanceVm, KeyStore | None, int | None], Response]
+# EVERY handler is a coroutine function, including the ones that await
+# nothing (v0.7.7) -- see `rdsctl._Handler` for why one uniform contract.
+_Handler = Callable[
+    [dict[str, str], str, SynthStores, float, InstanceVm, KeyStore | None, int | None],
+    Awaitable[Response],
+]
 
 _HANDLERS: dict[str, _Handler] = {
     "RunInstances": _run_instances,
@@ -1334,7 +1409,7 @@ _HANDLERS: dict[str, _Handler] = {
 }
 
 
-def pure_answer(
+async def pure_answer(
     action: str, resource: str, env: str, body: bytes, stores: SynthStores, now: float,
     vm: InstanceVm | None = None, keystore: KeyStore | None = None, gateway_port: int | None = None,
 ) -> Response | None:
@@ -1350,5 +1425,5 @@ def pure_answer(
     op = action.removeprefix("ec2:")
     handler = _HANDLERS.get(op)
     if handler is None:
-        return ec2net.pure_answer(action, resource, env, body, stores, now)
-    return handler(_params(body), env, stores, now, vm or InstanceVm(), keystore, gateway_port)
+        return await ec2net.pure_answer(action, resource, env, body, stores, now)
+    return await handler(_params(body), env, stores, now, vm or InstanceVm(), keystore, gateway_port)

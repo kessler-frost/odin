@@ -22,8 +22,6 @@ build/
 node_modules/
 bun.lock
 .vite/
-.playwright-cli/
-.playwright/
 *.png
 !assets/*.png
 .odin-dev.log
@@ -41,3 +39,6 @@ docs/plans/
 # Built UI bundled into the wheel at release time (not committed)
 src/odin/_ui/
 .superpowers/
+
+.agents/
+skills-lock.json

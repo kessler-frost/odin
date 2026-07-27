@@ -17,9 +17,11 @@ from __future__ import annotations
 import json
 import threading
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from typing import Any
 
+from odin.gateway.records import validate
 from odin.spec.store import CONTROL, _load
 from odin.util import atomic_write_text
 
@@ -42,6 +44,17 @@ class JsonStore:
     thread's write, or hand back a dict that changes size mid-`json.dumps`.
     Different envs never contend (separate locks), matching the store's own
     per-env file isolation.
+
+    v0.7.7 DE-THREADING VERDICT (verified): this is the ONE lock in odin that
+    genuinely DELETES rather than becoming an `asyncio.Lock`, and it is the
+    concurrency directive's "file I/O stays SYNCHRONOUS" rule that makes it so.
+    Every critical section here is `_data()` (a sync `_load`) plus
+    `_persist_locked()` (a sync `atomic_write_text`); the conversion adds no
+    `await` to any of them, so once every contender shares one event loop
+    nothing can preempt a read-modify-write and the lock has nothing left to
+    guard. It comes out only AFTER its last contender does -- the `_spawn`ed
+    daemon threads in `gateway/models/*` and the `to_thread` workers in
+    `reconcile/reconciler.py` and `server.py`.
     """
 
     def __init__(self, root: Path, name: str) -> None:
@@ -106,10 +119,24 @@ class JsonStore:
         saying which file, against a `GET /logs` docstring promising "never a
         500". Role CONTROL, because deleting this one is NOT the fix: it is what
         tofu's next refresh reads, so losing it orphans resources that really
-        exist."""
+        exist.
+
+        VALIDATED, not merely parsed (`records.validate`) -- the same upgrade
+        `keys.py` got, for the same reason and by the same mechanism. A file
+        that decodes is not yet a file odin can trust: `json.loads` was happy
+        with a top-level LIST (the failure then surfaced as `ValueError:
+        dictionary update sequence element #0 has length 9; 2 is required` from
+        `items()`, and with a bare string as `AttributeError: 'str' object has
+        no attribute 'get'` from `get()` -- neither of them a `StoreUnreadable`,
+        so neither reached the CONTROL recovery advice this very docstring is
+        about), and it was equally happy with `"events:{group}": "boom"`, which
+        `logsctl._append_events` then splatted into single characters and wrote
+        BACK to disk behind a 200. Every shape `records.py` names is one a real
+        reader was measured mis-answering."""
         if env not in self._loaded:
             path = self._path(env)
-            self._loaded[env] = _load(path, CONTROL, json.loads) if path.exists() else {}
+            parse = partial(validate, self._name)
+            self._loaded[env] = _load(path, CONTROL, parse) if path.exists() else {}
         return self._loaded[env]
 
     def _path(self, env: str) -> Path:
@@ -178,10 +205,16 @@ class SynthStores:
       above, keyed `"lambda:{functionArn}"`.
     - `ecsctl`: the ECS control-plane model's whole state
       (`gateway/models/ecsctl.py`, task V5a) -- flat keys
-      `"cluster:{name}"` / `"taskdef-rev:{family}"` (revision counter) /
-      `"taskdef:{family}:{revision}"` / `"service:{cluster}:{name}"` /
-      `"task:{cluster}:{task_id}"`, persisted at
-      `.odin/{env}/gateway/ecsctl.json`.
+      `"cluster:{name}"` / `"taskdef:{family}:{revision}"` /
+      `"service:{cluster}:{name}"` / `"task:{cluster}:{task_id}"`, persisted at
+      `.odin/{env}/gateway/ecsctl.json`. There is NO revision counter: the next
+      task-definition revision is derived from the `"taskdef:"` keys themselves
+      (`ecsctl._taskdef_revisions`), because a second copy of that truth could
+      go missing and let a register overwrite a live revision -- measured doing
+      exactly that. Stores written by earlier odins still carry the old
+      `"taskdef-rev:{family}"` counter and `records.py` still validates it so
+      such a file stays readable; nothing reads its value. Same shape as the
+      legacy `"cursor:"` key `logsctl` describes below.
     - `logsctl`: the CloudWatch Logs model's whole state
       (`gateway/models/logsctl.py`, task W2.1) -- flat keys `"group:{name}"` /
       `"stream:{group}:{stream}"` / `"events:{group}"` (the per-group ring

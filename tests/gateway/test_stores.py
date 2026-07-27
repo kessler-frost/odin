@@ -6,6 +6,8 @@ import stat
 import threading
 from pathlib import Path
 
+from odin.gateway import records
+from odin.gateway.models import ecsctl
 from odin.gateway.stores import NO_CHANGE, JsonStore, SynthStores
 
 
@@ -174,3 +176,27 @@ def test_synth_stores_are_independently_namespaced(tmp_path: Path):
     assert stores.sqs_queues.get("default", "jobs") == {"attributes": {}, "deleted_at": None}
     assert (tmp_path / "default" / "gateway" / "tags.json").exists()
     assert (tmp_path / "default" / "gateway" / "sqs_queues.json").exists()
+
+
+def test_the_ecsctl_key_map_does_not_describe_a_counter_that_was_deleted():
+    """Honesty rule 3, applied to a docstring: this one is the only description
+    of `ecsctl.json`'s layout a reader repairing that file has, and it still
+    called `taskdef-rev:{family}` "(revision counter)" after the counter had
+    been REMOVED -- a second copy of the truth that could disagree with the
+    `taskdef:` keys, which it demonstrably did (see
+    `ecsctl._taskdef_revisions` and
+    tests/gateway/test_ecsctl.py::test_a_register_never_overwrites_a_live_
+    revision_it_cannot_see_a_counter_for).
+
+    Asserted against the SOURCE, not against prose: the doc may only claim the
+    key exists as legacy residue, and `records.py` must still validate it so a
+    store written by an older odin stays readable."""
+    doc = SynthStores.__doc__
+    ecs_entry = doc.split("- `ecsctl`:")[1].split("- `logsctl`:")[0]
+
+    assert "(revision counter)" not in ecs_entry, ecs_entry
+    assert "NO revision counter" in ecs_entry
+    assert "taskdef-rev" in ecs_entry, "the legacy key must still be described as legacy"
+    # ...and nothing in the live module reads it, which is what makes it legacy.
+    assert "taskdef-rev" not in ecsctl._taskdef_revisions.__code__.co_consts
+    assert "taskdef-rev:" in records.SCHEMAS["ecsctl"], "an old store must still validate"

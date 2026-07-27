@@ -1,12 +1,12 @@
 """Odin CLI — start and stop the server."""
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import signal
 import subprocess
 import sys
-import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -409,6 +409,84 @@ def start(
         )
 
 
+async def _relay(stream: asyncio.StreamReader, log) -> None:
+    """Pump one child's merged stdout+stderr to this terminal and to dev.log.
+
+    v0.7.7: an asyncio task, not a daemon thread. `create_subprocess_exec`
+    hands back a real `StreamReader`, so `async for line in stream` IS the
+    whole loop -- there was never any need for a thread here, only for a
+    non-blocking read. The loop ends by itself at EOF, i.e. when the child's
+    pipe closes, which is what makes `await`ing these at shutdown a drain
+    rather than a hang.
+    """
+    async for line in stream:
+        text = line.decode(errors="replace")
+        sys.stdout.write(text)
+        sys.stdout.flush()
+        log.write(text)
+        log.flush()
+
+
+async def _supervise_dev(port: int, host: str, log) -> None:
+    """Run Vite + the auto-reloading backend until either exits or we're
+    signalled, relaying both children's output the whole time."""
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+    backend = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "uvicorn", "odin.server:create_app",
+        "--factory", "--host", host, "--port", str(BACKEND_DEV_PORT),
+        "--reload", "--reload-dir", "src",
+        env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+    )
+    frontend = await asyncio.create_subprocess_exec(
+        "bun", "run", "dev", "--port", str(port),
+        cwd=str(UI_DIR), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+    )
+    procs = (backend, frontend)
+
+    # TASK LIFETIME. `asyncio` holds only a WEAK reference to a running task,
+    # so a bare `create_task(...)` whose result nobody keeps can be garbage
+    # collected mid-flight -- the one failure mode a daemon thread did not
+    # have. Both references are held in these locals, and this coroutine is
+    # awaited until shutdown, so its frame keeps them alive for exactly the
+    # window they must run in. They are awaited again at the bottom, which is
+    # also what drains the last lines out of a child that has already exited.
+    relays = [
+        asyncio.create_task(_relay(backend.stdout, log), name="odin-dev-relay-backend"),
+        asyncio.create_task(_relay(frontend.stdout, log), name="odin-dev-relay-frontend"),
+    ]
+    waits = [
+        asyncio.create_task(proc.wait(), name=f"odin-dev-wait-{n}")
+        for n, proc in (("backend", backend), ("frontend", frontend))
+    ]
+
+    # Signals go through the loop rather than `signal.signal` + `signal.pause`:
+    # a handler that only resolves a future can never race the loop's own
+    # bookkeeping, and it lets the wait below treat "a child died" and "the
+    # user hit ^C" as the same event.
+    loop = asyncio.get_running_loop()
+    stopping = loop.create_future()
+
+    def _request_stop() -> None:
+        if not stopping.done():
+            stopping.set_result(None)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, _request_stop)
+    try:
+        await asyncio.wait([*waits, stopping], return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.remove_signal_handler(sig)
+
+    for proc in procs:
+        if proc.returncode is None:
+            proc.terminate()
+    PID_FILE.unlink(missing_ok=True)
+    stopping.cancel()
+    for task in (*waits, *relays):
+        await task
+
+
 def _start_dev(port: int, host: str = DEFAULT_HOST) -> None:
     """Dev mode startup."""
     if _already_running():
@@ -438,47 +516,12 @@ def _start_dev(port: int, host: str = DEFAULT_HOST) -> None:
     PID_FILE.write_text(str(os.getpid()))
 
     log_path = ODIN_DIR / "dev.log"
-    log = log_path.open("w")
-
-    def _relay(stream: object) -> None:
-        for line in stream:
-            text = line.decode(errors="replace")
-            sys.stdout.write(text)
-            sys.stdout.flush()
-            log.write(text)
-            log.flush()
-
-    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
-    backend = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "odin.server:create_app",
-         "--factory", "--host", host, "--port", str(BACKEND_DEV_PORT),
-         "--reload", "--reload-dir", "src"],
-        env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-    )
-    frontend = subprocess.Popen(
-        ["bun", "run", "dev", "--port", str(port)],
-        cwd=str(UI_DIR), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-    )
-
-    threading.Thread(target=_relay, args=(backend.stdout,), daemon=True).start()
-    threading.Thread(target=_relay, args=(frontend.stdout,), daemon=True).start()
-
-    procs = [backend, frontend]
-
-    def _shutdown(*_: object) -> None:
-        for p in procs:
-            p.terminate()
-        PID_FILE.unlink(missing_ok=True)
-
-    signal.signal(signal.SIGINT, _shutdown)
-    signal.signal(signal.SIGTERM, _shutdown)
-
-    # Wait for either subprocess to exit (not os.wait() which catches any child)
-    while all(p.poll() is None for p in procs):
-        signal.pause()
-    _shutdown()
-    for p in procs:
-        p.wait()
+    # The command itself stays synchronous (Typer does not await coroutines --
+    # see `cli/doctor.py`'s module docstring for the measurement); `asyncio.run`
+    # here is the whole async boundary, and a CLI process owning its own loop is
+    # exactly where that call belongs.
+    with log_path.open("w") as log:
+        asyncio.run(_supervise_dev(port, host, log))
 
 
 def _clear_stale_pidfile() -> str:
@@ -522,8 +565,11 @@ def stop() -> None:
     # server still held the store lock. So wait for the signal every other
     # liveness question in odin uses (the kernel lock, plus the pid while the
     # pidfile is still there), never a sleep. The server's lifespan stops
-    # every reconciler and the gateway thread before releasing the lock, which
-    # is why the wait is generous.
+    # every reconciler and the gateway listener before releasing the lock,
+    # which is why the wait is generous. (v0.7.7: the gateway is a TASK on this
+    # app's own loop, not a thread -- `gateway/app.py::serve_on_loop` -- so
+    # what the lifespan waits on is that task ending, not a thread join. The
+    # wait itself is unchanged; only what it is waiting for was ever a thread.)
     remaining = await_server_exit(ODIN_DIR, SHUTDOWN_GRACE)
     if remaining is not None:
         # Still up, so say so and exit 1 -- the pidfile stays, because it is

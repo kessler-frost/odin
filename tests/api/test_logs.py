@@ -27,10 +27,10 @@ class FakeRuntime:
         self._status[name] = status
         self._logs[name] = logs
 
-    def status(self, name: str) -> str:
+    async def status(self, name: str) -> str:
         return self._status.get(name, "absent")
 
-    def logs(self, name: str, tail: int = 20) -> str:
+    async def logs(self, name: str, tail: int = 20) -> str:
         return self._logs.get(name, "")
 
 
@@ -43,10 +43,10 @@ def _store(tmp_path, resources=()):
 # --- unknown node: the one real error ---------------------------------------
 
 
-def test_unknown_node_is_an_honest_error_not_found(tmp_path):
+async def test_unknown_node_is_an_honest_error_not_found(tmp_path):
     store = _store(tmp_path)
     stores = SynthStores(tmp_path)
-    result = fetch_logs(store, stores, FakeRuntime(), ENV, "nope")
+    result = await fetch_logs(store, stores, FakeRuntime(), ENV, "nope")
     assert result.found is False
     assert "nope" in result.error
 
@@ -54,13 +54,13 @@ def test_unknown_node_is_an_honest_error_not_found(tmp_path):
 # --- rds -----------------------------------------------------------------
 
 
-def test_rds_logs_from_its_direct_postgres_container(tmp_path):
+async def test_rds_logs_from_its_direct_postgres_container(tmp_path):
     store = _store(tmp_path, (ResourceDesired(id="db", kind="rds"),))
     stores = SynthStores(tmp_path)
     rt = FakeRuntime()
     rt.set("odin-rds-default-db", "running", "PostgreSQL init complete")
 
-    result = fetch_logs(store, stores, rt, ENV, "db")
+    result = await fetch_logs(store, stores, rt, ENV, "db")
 
     assert result.found and result.running
     assert result.sources == ["odin-rds-default-db"]
@@ -68,10 +68,10 @@ def test_rds_logs_from_its_direct_postgres_container(tmp_path):
     assert result.message is None
 
 
-def test_rds_not_running_is_honest_not_a_500(tmp_path):
+async def test_rds_not_running_is_honest_not_a_500(tmp_path):
     store = _store(tmp_path, (ResourceDesired(id="db", kind="rds"),))
     stores = SynthStores(tmp_path)
-    result = fetch_logs(store, stores, FakeRuntime(), ENV, "db")  # container never booted
+    result = await fetch_logs(store, stores, FakeRuntime(), ENV, "db")  # container never booted
     assert result.found is True
     assert result.running is False
     assert "not running" in result.message
@@ -80,19 +80,19 @@ def test_rds_not_running_is_honest_not_a_500(tmp_path):
 # --- s3/sqs/sns/dynamodb: the shared per-env backing container -------------
 
 
-def test_provisioned_kind_reads_the_shared_backing_container(tmp_path):
+async def test_provisioned_kind_reads_the_shared_backing_container(tmp_path):
     store = _store(tmp_path, (ResourceDesired(id="uploads", kind="s3"),))
     stores = SynthStores(tmp_path)
     rt = FakeRuntime()
     rt.set("odin-aws-rustfs-default", "running", "listening on :9000")
 
-    result = fetch_logs(store, stores, rt, ENV, "uploads")
+    result = await fetch_logs(store, stores, rt, ENV, "uploads")
 
     assert result.sources == ["odin-aws-rustfs-default"]
     assert result.lines == "listening on :9000"
 
 
-def test_exited_container_still_returns_its_last_logs(tmp_path):
+async def test_exited_container_still_returns_its_last_logs(tmp_path):
     # A crash's whole diagnostic value is in the logs -- absent (never
     # existed) is the only status that skips reading them.
     store = _store(tmp_path, (ResourceDesired(id="db", kind="rds"),))
@@ -100,7 +100,7 @@ def test_exited_container_still_returns_its_last_logs(tmp_path):
     rt = FakeRuntime()
     rt.set("odin-rds-default-db", "exited", "FATAL: out of memory")
 
-    result = fetch_logs(store, stores, rt, ENV, "db")
+    result = await fetch_logs(store, stores, rt, ENV, "db")
 
     assert result.running is False
     assert result.lines == "FATAL: out of memory"
@@ -110,28 +110,28 @@ def test_exited_container_still_returns_its_last_logs(tmp_path):
 # --- ec2: resolves via the odin:node tag, reads the VM's journal -----------
 
 
-def test_ec2_resolves_instance_by_tag_and_reads_vm_logs(tmp_path, monkeypatch):
+async def test_ec2_resolves_instance_by_tag_and_reads_vm_logs(tmp_path, monkeypatch):
     store = _store(tmp_path, (ResourceDesired(id="server", kind="ec2"),))
     stores = SynthStores(tmp_path)
     stores.ec2compute.set(ENV, "instance:i-1", {"instance_id": "i-1", "state_name": "running"})
     stores.tags.set(ENV, "ec2:i-1", {"odin:node": "server"})
 
     class FakeVm:
-        def status(self, name):
+        async def status(self, name):
             return "running"
 
-        def logs(self, name, tail=20):
+        async def logs(self, name, tail=20):
             return f"journal for {name}"
 
     monkeypatch.setattr("odin.api.logs.ec2_compute.InstanceVm", FakeVm)
-    result = fetch_logs(store, stores, FakeRuntime(), ENV, "server")
+    result = await fetch_logs(store, stores, FakeRuntime(), ENV, "server")
 
     assert result.found and result.running
     assert result.sources == ["odin-ec2-default-i-1"]
     assert result.lines == "journal for odin-ec2-default-i-1"
 
 
-def test_a_deleted_vms_message_does_not_contradict_itself(tmp_path, monkeypatch):
+async def test_a_deleted_vms_message_does_not_contradict_itself(tmp_path, monkeypatch):
     """Field test 2 LOW-12: `odin-ec2-… is not running (state: running)` -- the
     real check found the VM gone, the parenthetical printed the stale model
     state. Each half must be attributed to whoever said it."""
@@ -141,14 +141,14 @@ def test_a_deleted_vms_message_does_not_contradict_itself(tmp_path, monkeypatch)
     stores.tags.set(ENV, "ec2:i-9", {"odin:node": "web2"})
 
     class DeletedVm:
-        def status(self, name):
+        async def status(self, name):
             return "absent"  # reality: `limactl list` doesn't have it
 
-        def logs(self, name, tail=20):
+        async def logs(self, name, tail=20):
             raise AssertionError("an absent VM's journal must not be read")
 
     monkeypatch.setattr("odin.api.logs.ec2_compute.InstanceVm", DeletedVm)
-    result = fetch_logs(store, stores, FakeRuntime(), ENV, "web2")
+    result = await fetch_logs(store, stores, FakeRuntime(), ENV, "web2")
 
     assert result.running is False and result.lines == ""
     assert result.message == (
@@ -156,10 +156,10 @@ def test_a_deleted_vms_message_does_not_contradict_itself(tmp_path, monkeypatch)
     )
 
 
-def test_ec2_no_instance_yet_is_honest_not_found(tmp_path):
+async def test_ec2_no_instance_yet_is_honest_not_found(tmp_path):
     store = _store(tmp_path, (ResourceDesired(id="server", kind="ec2"),))
     stores = SynthStores(tmp_path)
-    result = fetch_logs(store, stores, FakeRuntime(), ENV, "server")
+    result = await fetch_logs(store, stores, FakeRuntime(), ENV, "server")
     assert result.found is True
     assert "no EC2 instance" in result.message
 
@@ -167,7 +167,7 @@ def test_ec2_no_instance_yet_is_honest_not_found(tmp_path):
 # --- lambda: resolves via tag or FunctionName, always reads via Colima -----
 
 
-def test_lambda_resolves_by_function_name_and_reads_rie_container(tmp_path, monkeypatch):
+async def test_lambda_resolves_by_function_name_and_reads_rie_container(tmp_path, monkeypatch):
     store = _store(tmp_path, (ResourceDesired(id="fn1", kind="lambda"),))
     stores = SynthStores(tmp_path)
     stores.lambdactl.set(ENV, "fn:fn1", {
@@ -176,14 +176,14 @@ def test_lambda_resolves_by_function_name_and_reads_rie_container(tmp_path, monk
     })
 
     class FakeColima:
-        def status(self, name):
+        async def status(self, name):
             return "running"
 
-        def logs(self, name, tail=20):
+        async def logs(self, name, tail=20):
             return "RIE listening"
 
     monkeypatch.setattr("odin.api.logs.ColimaRuntime", FakeColima)
-    result = fetch_logs(store, stores, FakeRuntime(), ENV, "fn1")
+    result = await fetch_logs(store, stores, FakeRuntime(), ENV, "fn1")
 
     assert result.sources == ["odin-lambda-default-fn1"]
     assert result.lines == "RIE listening"
@@ -199,54 +199,54 @@ def _cache_record(cluster_id: str, status: str = "available") -> dict:
     }
 
 
-def test_elasticache_reads_its_redis_container_logs(tmp_path, monkeypatch):
+async def test_elasticache_reads_its_redis_container_logs(tmp_path, monkeypatch):
     store = _store(tmp_path, (ResourceDesired(id="cache", kind="elasticache"),))
     stores = SynthStores(tmp_path)
     stores.cachectl.set(ENV, "cluster:cache", _cache_record("cache"))
 
     class FakeColima:
-        def status(self, name):
+        async def status(self, name):
             return "running"
 
-        def logs(self, name, tail=20):
+        async def logs(self, name, tail=20):
             return "Ready to accept connections tcp"
 
     monkeypatch.setattr("odin.api.logs.ColimaRuntime", FakeColima)
-    result = fetch_logs(store, stores, FakeRuntime(), ENV, "cache")
+    result = await fetch_logs(store, stores, FakeRuntime(), ENV, "cache")
 
     assert result.sources == ["odin-cache-default-cache"]
     assert result.lines == "Ready to accept connections tcp"
     assert result.running is True
 
 
-def test_elasticache_with_no_cluster_yet_is_honest_not_a_500(tmp_path):
+async def test_elasticache_with_no_cluster_yet_is_honest_not_a_500(tmp_path):
     store = _store(tmp_path, (ResourceDesired(id="cache", kind="elasticache"),))
-    result = fetch_logs(store, SynthStores(tmp_path), FakeRuntime(), ENV, "cache")
+    result = await fetch_logs(store, SynthStores(tmp_path), FakeRuntime(), ENV, "cache")
     assert result.found is True and result.error is None
     assert "no cache cluster backs" in result.message
 
 
-def test_elasticache_absent_container_reports_the_cluster_status(tmp_path, monkeypatch):
+async def test_elasticache_absent_container_reports_the_cluster_status(tmp_path, monkeypatch):
     store = _store(tmp_path, (ResourceDesired(id="cache", kind="elasticache"),))
     stores = SynthStores(tmp_path)
     stores.cachectl.set(ENV, "cluster:cache", _cache_record("cache", status="creating"))
 
     class FakeColima:
-        def status(self, name):
+        async def status(self, name):
             return "absent"
 
-        def logs(self, name, tail=20):
+        async def logs(self, name, tail=20):
             return ""
 
     monkeypatch.setattr("odin.api.logs.ColimaRuntime", FakeColima)
-    result = fetch_logs(store, stores, FakeRuntime(), ENV, "cache")
+    result = await fetch_logs(store, stores, FakeRuntime(), ENV, "cache")
     assert "cluster status: creating" in result.message
 
 
 # --- ecs: every task container for the service ------------------------------
 
 
-def test_ecs_reads_logs_from_every_task_container(tmp_path, monkeypatch):
+async def test_ecs_reads_logs_from_every_task_container(tmp_path, monkeypatch):
     store = _store(tmp_path, (ResourceDesired(id="app", kind="ecs"),))
     stores = SynthStores(tmp_path)
     stores.ecsctl.set(ENV, "service:odin:app", {
@@ -262,14 +262,14 @@ def test_ecs_reads_logs_from_every_task_container(tmp_path, monkeypatch):
     })
 
     class FakeColima:
-        def status(self, name):
+        async def status(self, name):
             return "running" if "t1aaaaaa" in name else "exited"
 
-        def logs(self, name, tail=20):
+        async def logs(self, name, tail=20):
             return f"log:{name}"
 
     monkeypatch.setattr("odin.api.logs.ColimaRuntime", FakeColima)
-    result = fetch_logs(store, stores, FakeRuntime(), ENV, "app")
+    result = await fetch_logs(store, stores, FakeRuntime(), ENV, "app")
 
     assert result.running is True  # at least one task is up
     assert len(result.sources) == 2
@@ -307,16 +307,16 @@ class _CountingColima:
         self.log_calls: list[tuple[str, int]] = []
         self.lines_per_container = lines_per_container
 
-    def status(self, name):
+    async def status(self, name):
         self.status_calls.append(name)
         return "running" if "live" in name else "exited"
 
-    def logs(self, name, tail=20):
+    async def logs(self, name, tail=20):
         self.log_calls.append((name, tail))
         return "\n".join(f"{name} line {i}" for i in range(self.lines_per_container))
 
 
-def test_ecs_sources_are_bounded_by_the_live_tasks_not_every_task_that_ever_ran(tmp_path, monkeypatch):
+async def test_ecs_sources_are_bounded_by_the_live_tasks_not_every_task_that_ever_ran(tmp_path, monkeypatch):
     """Field test 3 (MED): 27 sources for 3 live tasks, one docker call each,
     growing without bound as deployments accumulate."""
     store = _store(tmp_path, (ResourceDesired(id="app", kind="ecs"),))
@@ -324,7 +324,7 @@ def test_ecs_sources_are_bounded_by_the_live_tasks_not_every_task_that_ever_ran(
     colima = _CountingColima()
     monkeypatch.setattr("odin.api.logs.ColimaRuntime", lambda: colima)
 
-    result = fetch_logs(store, stores, FakeRuntime(), ENV, "app")
+    result = await fetch_logs(store, stores, FakeRuntime(), ENV, "app")
 
     # 3 live + at most 3 recent dead -- bounded, and the dead ones are kept
     # because a crash-looping service has NO live task and its last lines are
@@ -337,20 +337,20 @@ def test_ecs_sources_are_bounded_by_the_live_tasks_not_every_task_that_ever_ran(
     ], "the three most recently stopped, newest first"
 
 
-def test_ecs_sources_are_only_the_recent_dead_ones_when_nothing_is_live(tmp_path, monkeypatch):
+async def test_ecs_sources_are_only_the_recent_dead_ones_when_nothing_is_live(tmp_path, monkeypatch):
     store = _store(tmp_path, (ResourceDesired(id="app", kind="ecs"),))
     stores = _ecs_stores(tmp_path, live=0, dead=9)
     colima = _CountingColima()
     monkeypatch.setattr("odin.api.logs.ColimaRuntime", lambda: colima)
 
-    result = fetch_logs(store, stores, FakeRuntime(), ENV, "app")
+    result = await fetch_logs(store, stores, FakeRuntime(), ENV, "app")
 
     assert len(result.sources) == 3, result.sources
     assert result.running is False
     assert result.lines, "a crash-looping service's last lines must still be readable"
 
 
-def test_tail_n_means_n_lines_of_output_for_a_multi_task_service(tmp_path, monkeypatch):
+async def test_tail_n_means_n_lines_of_output_for_a_multi_task_service(tmp_path, monkeypatch):
     """Field test 3 (MED): `--tail 1` returned 8 lines for a 3-task service.
     RDS honours --tail exactly; a multi-source node now does too -- N lines of
     CONTENT, newest source first, with the `==>` headers not counted."""
@@ -359,7 +359,7 @@ def test_tail_n_means_n_lines_of_output_for_a_multi_task_service(tmp_path, monke
     colima = _CountingColima(lines_per_container=5)
     monkeypatch.setattr("odin.api.logs.ColimaRuntime", lambda: colima)
 
-    result = fetch_logs(store, stores, FakeRuntime(), ENV, "app", tail=1)
+    result = await fetch_logs(store, stores, FakeRuntime(), ENV, "app", tail=1)
 
     content = [line for line in result.lines.splitlines() if not line.startswith("==> ")]
     assert len(content) == 1, result.lines
@@ -367,36 +367,36 @@ def test_tail_n_means_n_lines_of_output_for_a_multi_task_service(tmp_path, monke
     assert len(result.sources) == 3, "every live task is still reported as a source"
 
 
-def test_tail_budget_spreads_across_sources_when_one_cannot_fill_it(tmp_path, monkeypatch):
+async def test_tail_budget_spreads_across_sources_when_one_cannot_fill_it(tmp_path, monkeypatch):
     store = _store(tmp_path, (ResourceDesired(id="app", kind="ecs"),))
     stores = _ecs_stores(tmp_path, live=3, dead=0)
     colima = _CountingColima(lines_per_container=2)
     monkeypatch.setattr("odin.api.logs.ColimaRuntime", lambda: colima)
 
-    result = fetch_logs(store, stores, FakeRuntime(), ENV, "app", tail=5)
+    result = await fetch_logs(store, stores, FakeRuntime(), ENV, "app", tail=5)
 
     content = [line for line in result.lines.splitlines() if not line.startswith("==> ")]
     assert len(content) == 5, result.lines
     assert result.lines.count("==> ") == 3
 
 
-def test_a_single_source_node_still_honours_tail_exactly_and_has_no_header(tmp_path):
+async def test_a_single_source_node_still_honours_tail_exactly_and_has_no_header(tmp_path):
     """RDS parity -- the yardstick field test 3 measured against."""
     store = _store(tmp_path, (ResourceDesired(id="db", kind="rds"),))
     stores = SynthStores(tmp_path)
     rt = FakeRuntime()
     rt.set("odin-rds-default-db", "running", "one\ntwo\nthree")
 
-    result = fetch_logs(store, stores, rt, ENV, "db", tail=2)
+    result = await fetch_logs(store, stores, rt, ENV, "db", tail=2)
 
     assert result.lines == "two\nthree"
     assert "==>" not in result.lines
 
 
-def test_ecs_no_service_yet_is_honest_not_found(tmp_path):
+async def test_ecs_no_service_yet_is_honest_not_found(tmp_path):
     store = _store(tmp_path, (ResourceDesired(id="app", kind="ecs"),))
     stores = SynthStores(tmp_path)
-    result = fetch_logs(store, stores, FakeRuntime(), ENV, "app")
+    result = await fetch_logs(store, stores, FakeRuntime(), ENV, "app")
     assert result.found is True
     assert "no ECS service" in result.message
 
@@ -404,12 +404,12 @@ def test_ecs_no_service_yet_is_honest_not_found(tmp_path):
 # --- logs (W2.1): the node IS the sink -- its own group's stored events -----
 
 
-def test_logs_node_returns_its_own_groups_stored_events(tmp_path):
+async def test_logs_node_returns_its_own_groups_stored_events(tmp_path):
     store = _store(tmp_path, (ResourceDesired(id="/odin/app", kind="logs"),))
     stores = SynthStores(tmp_path)
     logsctl.ingest(stores, ENV, "/odin/app", "stream-a", ["first", "second"])
 
-    result = fetch_logs(store, stores, FakeRuntime(), ENV, "/odin/app")
+    result = await fetch_logs(store, stores, FakeRuntime(), ENV, "/odin/app")
 
     assert result.found and result.kind == "logs"
     assert result.running is True  # the group exists; a sink has no process to be up
@@ -422,11 +422,11 @@ def test_logs_node_returns_its_own_groups_stored_events(tmp_path):
     assert "[stream-a]" not in result.lines  # single stream: no stream prefix
 
 
-def test_logs_node_with_no_group_yet_is_honest_not_an_error(tmp_path):
+async def test_logs_node_with_no_group_yet_is_honest_not_an_error(tmp_path):
     store = _store(tmp_path, (ResourceDesired(id="/odin/app", kind="logs"),))
     stores = SynthStores(tmp_path)
 
-    result = fetch_logs(store, stores, FakeRuntime(), ENV, "/odin/app")
+    result = await fetch_logs(store, stores, FakeRuntime(), ENV, "/odin/app")
 
     assert result.found is True and result.error is None
     assert result.running is False
@@ -434,12 +434,12 @@ def test_logs_node_with_no_group_yet_is_honest_not_an_error(tmp_path):
     assert "no log group" in result.message
 
 
-def test_logs_node_whose_group_exists_but_is_empty_says_so(tmp_path):
+async def test_logs_node_whose_group_exists_but_is_empty_says_so(tmp_path):
     store = _store(tmp_path, (ResourceDesired(id="/odin/app", kind="logs"),))
     stores = SynthStores(tmp_path)
     logsctl.ensure_group(stores, ENV, "/odin/app")
 
-    result = fetch_logs(store, stores, FakeRuntime(), ENV, "/odin/app")
+    result = await fetch_logs(store, stores, FakeRuntime(), ENV, "/odin/app")
 
     assert result.running is True
     assert "no events yet" in result.message
@@ -492,12 +492,12 @@ def test_group_read_of_an_unknown_group_is_honest_not_an_error(tmp_path):
 # --- kinds with no runnable backing at all ----------------------------------
 
 
-def test_no_backing_kinds_answer_honestly(tmp_path):
+async def test_no_backing_kinds_answer_honestly(tmp_path):
     assert NO_BACKING_KINDS == {"vpc", "subnet", "sg", "iam_role", "ecr"}
     for kind in NO_BACKING_KINDS:
         store = _store(tmp_path, (ResourceDesired(id="thing", kind=kind),))
         stores = SynthStores(tmp_path)
-        result = fetch_logs(store, stores, FakeRuntime(), ENV, "thing")
+        result = await fetch_logs(store, stores, FakeRuntime(), ENV, "thing")
         assert result.found is True
         assert "no logs available" in result.message
 

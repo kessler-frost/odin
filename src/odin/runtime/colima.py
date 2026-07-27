@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from odin.spec.models import Phase
-from odin.util import run_command
+from odin.util import run_command_async
 
 LABEL = "odin"
 
@@ -202,12 +202,50 @@ class _Proc:
     stderr: str = ""
 
 
-def _default_runner(args: list[str], input: str | None = None) -> _Proc:
+# `exc_text`'s sibling, for the other half of "something failed and here is why":
+# a SUBPROCESS that failed. `exc_text` cannot serve this one -- it treats an
+# EMPTY `str(exc)`, and these strings were never empty, they were VACUOUS. The
+# text `f"{CLI} {label} failed: {proc.stderr.strip()}"` renders
+#
+#     docker run x failed:
+#
+# a sentence whose reason slot is a dangling colon. Probed against the REAL
+# docker on this machine (28.4.0 / Colima), not reasoned about -- three real
+# commands that exit non-zero having written nothing to stderr:
+#
+#     docker exec <c> sh -c 'exit 1'                rc=1  stderr=''  stdout=''
+#     docker exec <c> sh -c 'echo on-stdout; exit 7' rc=7 stderr=''  stdout='on-stdout\n'
+#     docker run --rm alpine sh -c 'exit 3'         rc=3  stderr=''  stdout=''
+#
+# All three rendered `docker exec failed: ` / `docker run failed: `. So the exit
+# code -- 1, 7, 3, the one fact that WAS there every time -- was dropped, and
+# case two shows the reason can be on STDOUT: `_cli` keeps only stdout on
+# success and only stderr on failure, so a command that explains itself on the
+# wrong stream explained itself to nobody.
+#
+# What this states instead: the exit code always (it exists by construction --
+# we are here BECAUSE it was non-zero), then stderr, then stdout if that is
+# where the process spoke, and otherwise the fact that it said nothing at all --
+# which is a real answer, not an absence. `_command_label` still supplies the
+# COMMAND, and still deliberately omits the argv (it carries workload secrets --
+# see that function).
+_NO_OUTPUT = "it wrote nothing to stderr or stdout, so the exit code is the whole of it"
+
+
+def _failure_reason(proc: _Proc) -> str:
+    """WHY a container-CLI command failed, in a form that is never empty."""
+    stdout = proc.stdout.strip()
+    return proc.stderr.strip() or (
+        f"nothing on stderr; on stdout: {stdout}" if stdout else _NO_OUTPUT
+    )
+
+
+async def _default_runner(args: list[str], input: str | None = None) -> _Proc:
     # `run_command`, so a machine with no `docker` CLI on PATH (Homebrew's
     # colima formula does NOT bring one) yields rc 127 -- which `_cli` turns
     # into "docker … failed: docker: command not found" -- instead of a bare
     # FileNotFoundError traceback out of whatever happened to call first.
-    proc = run_command(args, input=input)
+    proc = await run_command_async(args, input=input)
     return _Proc(proc.returncode, proc.stdout, proc.stderr)
 
 
@@ -230,31 +268,34 @@ class _ContainerRuntime:
         stderr really is the error channel)."""
         raise NotImplementedError
 
-    def _cli(self, *args: str, check: bool = True, input: str | None = None) -> str:
-        proc = self._run(self._argv(*args), input=input)
+    async def _cli(self, *args: str, check: bool = True, input: str | None = None) -> str:
+        proc = await self._run(self._argv(*args), input=input)
         if check and proc.returncode != 0:
-            raise RuntimeError(f"{self.CLI} {_command_label(args)} failed: {proc.stderr.strip()}")
+            raise RuntimeError(
+                f"{self.CLI} {_command_label(args)} failed "
+                f"(exit {proc.returncode}): {_failure_reason(proc)}"
+            )
         return proc.stdout.strip()
 
     def _run_flags(self) -> list[str]:
         return []
 
-    def image_exists(self, tag: str) -> bool:
+    async def image_exists(self, tag: str) -> bool:
         # Plain `image inspect` prints a truthy "[]" to stdout when the image
         # is MISSING (docker rc=1), which silently skipped the one-time build.
         # The Id template prints nothing on a missing image; "[]" is still
         # guarded because nerdctl's behavior differs across versions.
-        out = self._cli("image", "inspect", "-f", "{{.Id}}", tag, check=False)
+        out = await self._cli("image", "inspect", "-f", "{{.Id}}", tag, check=False)
         return out not in ("", "[]")
 
-    def build(self, tag: str, dockerfile: str) -> None:
+    async def build(self, tag: str, dockerfile: str) -> None:
         """Build `tag` from an inline Dockerfile (no build context — piped on
         stdin, `-`). Used to bake a one-time `npm install` into a local image
         (dynalite: see BackingAws) so container boot never re-fetches from a
         registry that might be slow or flaky that day."""
-        self._cli("build", "-t", tag, "-", input=dockerfile)
+        await self._cli("build", "-t", tag, "-", input=dockerfile)
 
-    def run_container(self, spec: ContainerSpec) -> RunHandle:
+    async def run_container(self, spec: ContainerSpec) -> RunHandle:
         # A namespace-sharing container takes no `_run_flags`: docker rejects
         # `--add-host` together with `--network container:` outright ("conflicting
         # options"), and it needs none -- it inherits the target's /etc/hosts-less
@@ -283,17 +324,17 @@ class _ContainerRuntime:
             args += ["--cpus", f"{spec.cpus:g}"]
         args.append(spec.image)
         args += list(spec.command)
-        return RunHandle(id=self._cli(*args), name=spec.name)
+        return RunHandle(id=await self._cli(*args), name=spec.name)
 
-    def status(self, name: str) -> str:
+    async def status(self, name: str) -> str:
         """Container state: running / exited / created / … / absent."""
-        return self._cli("inspect", "-f", "{{.State.Status}}", name, check=False) or "absent"
+        return await self._cli("inspect", "-f", "{{.State.Status}}", name, check=False) or "absent"
 
-    def exit_code(self, name: str) -> int:
-        out = self._cli("inspect", "-f", "{{.State.ExitCode}}", name, check=False)
+    async def exit_code(self, name: str) -> int:
+        out = await self._cli("inspect", "-f", "{{.State.ExitCode}}", name, check=False)
         return int(out) if out.lstrip("-").isdigit() else -1
 
-    def host_port(self, name: str, container_port: int) -> int:
+    async def host_port(self, name: str, container_port: int) -> int:
         """The host port `container_port` is published on -- 0 when the runtime
         ANSWERED and nothing is published there, `PortUnreadable` when it could
         not be asked at all (see that class for the corruption this closes).
@@ -352,17 +393,17 @@ class _ContainerRuntime:
 
         Pinned by `tests/runtime/test_lima_integration.py`, which runs all
         three states against a real VM rather than fabricating these strings."""
-        proc = self._run(self._argv("inspect", "-f", "{{json .NetworkSettings.Ports}}", name))
+        proc = await self._run(self._argv("inspect", "-f", "{{json .NetworkSettings.Ports}}", name))
         if proc.returncode != 0:
             raise PortUnreadable(
-                f"{self.CLI} cannot read {name}'s published ports: "
-                f"{proc.stderr.strip() or 'no output'}"
+                f"{self.CLI} cannot read {name}'s published ports "
+                f"(exit {proc.returncode}): {_failure_reason(proc)}"
             )
         bindings = json.loads(proc.stdout.strip() or "{}") or {}
         published = bindings.get(f"{container_port}/tcp") or []
         return int(published[0]["HostPort"]) if published else 0
 
-    def logs(self, name: str, tail: int = 20) -> str:
+    async def logs(self, name: str, tail: int = 20) -> str:
         """The container's last `tail` lines -- BOTH streams, merged, tailed
         after merging, so `--tail N` means N real lines (see
         `_merge_log_streams` for the bug this closes and the exact interleaving
@@ -372,12 +413,12 @@ class _ContainerRuntime:
         A failed read (a container that vanished between `status` and here) is
         "" exactly as before, rather than the CLI's own "No such container"
         text -- that would present a diagnostic as container output."""
-        proc = self._run(self._argv("logs", "--timestamps", "--tail", str(tail), name))
+        proc = await self._run(self._argv("logs", "--timestamps", "--tail", str(tail), name))
         return _merge_log_streams(proc.stdout, proc.stderr, tail) if proc.returncode == 0 else ""
 
-    def stats(self, name: str) -> dict[str, float]:
+    async def stats(self, name: str) -> dict[str, float]:
         """One-shot cpu% + memory (MiB) for a running container."""
-        out = self._cli(
+        out = await self._cli(
             "stats", "--no-stream", "--format", "{{.CPUPerc}} {{.MemUsage}}", name, check=False,
         )
         if not out:
@@ -385,22 +426,22 @@ class _ContainerRuntime:
         cpu_s, mem_s = out.split(" ", 1)
         return {"cpu": float(cpu_s.strip().rstrip("%") or 0), "ram": _to_mib(mem_s.split("/")[0].strip())}
 
-    def facts(self, name: str, container_port: int = 0) -> ContainerFacts:
+    async def facts(self, name: str, container_port: int = 0) -> ContainerFacts:
         # An ABSENT container has no port map to read, and `host_port` now says
         # so by raising -- so don't ask about one. Every other state (running,
         # created, exited, …) does have a map, so a raise from here is a real
         # runtime failure and belongs loud, not swallowed into a 0.
-        status = self.status(name)
-        stats = self.stats(name) if status == "running" else {"cpu": 0.0, "ram": 0.0}
+        status = await self.status(name)
+        stats = await self.stats(name) if status == "running" else {"cpu": 0.0, "ram": 0.0}
         readable = container_port and status != "absent"
         return ContainerFacts(
             phase=_STATUS_TO_PHASE.get(status, "pending"),
-            host_port=self.host_port(name, container_port) if readable else 0,
+            host_port=await self.host_port(name, container_port) if readable else 0,
             cpu=stats["cpu"], ram=stats["ram"],
-            logtail=self.logs(name, tail=5) if status != "absent" else "",
+            logtail=await self.logs(name, tail=5) if status != "absent" else "",
         )
 
-    def copy_in(self, name: str, host_path: str, container_path: str) -> None:
+    async def copy_in(self, name: str, host_path: str, container_path: str) -> None:
         """Copy a host file INTO a running container (`docker cp`).
 
         W2.5 uses this instead of a bind mount to deliver a load-balancer
@@ -411,26 +452,26 @@ class _ContainerRuntime:
         accepted-then-dropped every connection. `docker cp` streams through the
         daemon, so it works regardless of which host paths the runtime VM
         happens to share."""
-        self._cli("cp", host_path, f"{name}:{container_path}")
+        await self._cli("cp", host_path, f"{name}:{container_path}")
 
-    def container_id(self, name: str) -> str:
+    async def container_id(self, name: str) -> str:
         """This container's full id, or "" when it doesn't exist.
 
         The id is what makes "is my sidecar in the CURRENT target's network
         namespace?" answerable: a container that was killed and re-created
         keeps its NAME but never its id (fabric/sidecar.py's
         `attached_to`)."""
-        return self._cli("inspect", "-f", "{{.Id}}", name, check=False)
+        return await self._cli("inspect", "-f", "{{.Id}}", name, check=False)
 
-    def network_mode(self, name: str) -> str:
+    async def network_mode(self, name: str) -> str:
         """The container's own network mode -- for a namespace-sharing
         container (`--network container:<target>`) this is
         `container:<the target's id AS IT WAS AT CREATION>`, because the
         runtime resolves the name to an id right then. That stale id is
         exactly the signal that the target has since been replaced."""
-        return self._cli("inspect", "-f", "{{.HostConfig.NetworkMode}}", name, check=False)
+        return await self._cli("inspect", "-f", "{{.HostConfig.NetworkMode}}", name, check=False)
 
-    def exec_sh(self, name: str, script: str) -> str:
+    async def exec_sh(self, name: str, script: str) -> str:
         """Run `script` with `sh -c` INSIDE a running container's namespaces
         and return its stdout ("" if the container is gone, the exec fails, or
         the script printed nothing).
@@ -441,27 +482,27 @@ class _ContainerRuntime:
         (reconcile/assertions.py::mesh_ready_sync). Callers make the script
         self-bounding (busybox `nc -w`) and print a TOKEN on success rather
         than relying on an exit code, so this stays a plain stdout read."""
-        return self._cli("exec", name, "sh", "-c", script, check=False)
+        return await self._cli("exec", name, "sh", "-c", script, check=False)
 
-    def signal(self, name: str, sig: str) -> None:
+    async def signal(self, name: str, sig: str) -> None:
         """Send UNIX signal `sig` to the container's main process (`docker kill
         -s`). W2.5: how a load-balancer proxy container is told to re-read its
         rewritten config (nginx reloads on SIGHUP) WITHOUT `docker exec` and
         without recreating the container -- so an upstream change never drops
         an in-flight request. `check=False`: signalling an already-gone
         container is a no-op, exactly like `stop`."""
-        self._cli("kill", "-s", sig, name, check=False)
+        await self._cli("kill", "-s", sig, name, check=False)
 
-    def stop(self, name: str) -> None:
+    async def stop(self, name: str) -> None:
         # -v: drop the container's anonymous volumes with it (postgres creates
         # one per boot; without this a churn loop leaks gigabytes).
-        self._cli("rm", "-f", "-v", name, check=False)
+        await self._cli("rm", "-f", "-v", name, check=False)
 
-    def list_odin(self) -> list[str]:
-        out = self._cli("ps", "-aq", "--filter", f"label={LABEL}=1", check=False)
+    async def list_odin(self) -> list[str]:
+        out = await self._cli("ps", "-aq", "--filter", f"label={LABEL}=1", check=False)
         return [line for line in out.splitlines() if line]
 
-    def container_names(self) -> list[str]:
+    async def container_names(self) -> list[str]:
         """Every odin-labelled container's NAME -- running or exited, ONE
         `docker ps` call regardless of how many there are (W2.2's drift sweep
         compares whole synth stores against this single listing, never one
@@ -471,7 +512,7 @@ class _ContainerRuntime:
         is load-bearing (absent from it == the container was really removed),
         so a failed CLI call must raise rather than come back as an innocent
         empty list -- see `reconcile/drift.py::_listing`."""
-        out = self._cli("ps", "-a", "--format", "{{.Names}}", "--filter", f"label={LABEL}=1")
+        out = await self._cli("ps", "-a", "--format", "{{.Names}}", "--filter", f"label={LABEL}=1")
         return [line for line in out.splitlines() if line]
 
 
@@ -487,8 +528,8 @@ class ColimaRuntime(_ContainerRuntime):
         # Reach the host-side AWS embed + RDS from inside containers.
         return ["--add-host", "host.docker.internal:host-gateway"]
 
-    def ensure_host(self) -> HostFacts:
-        out = self._cli("info", "--format", "{{.MemTotal}} {{.NCPU}}", check=False)
+    async def ensure_host(self) -> HostFacts:
+        out = await self._cli("info", "--format", "{{.MemTotal}} {{.NCPU}}", check=False)
         if not out:
             return HostFacts()
         mem_bytes, ncpu = out.split()

@@ -27,6 +27,17 @@ what is next.
 
 ![Odin — a VPC/Subnet/EC2 stack, an SG, S3/SQS/SNS/DynamoDB/RDS, a Lambda, an ECS service, an IAM role and an ECR repo, drawn on the canvas with an IAM permission edge (EC2 → S3, GetObject/PutObject/ListBucket)](assets/odin-canvas.png)
 
+**Draw it, press Apply, watch it come up for real.** Three resources placed on the
+canvas, applied, and healthy — that is a real RustFS, a real goaws and a real
+dynalite behind those badges, not a mock:
+
+![Three resources drawn on odin's canvas, applied, and going healthy — S3, SQS and DynamoDB badges turning green](assets/odin-draw-apply.gif)
+
+**The `{ }` button shows the Terraform that canvas compiles to** — the same
+deterministic HCL Apply runs, not a preview of something else:
+
+![odin's code panel showing the Terraform generated from the canvas: aws_s3_bucket and aws_sqs_queue resources](assets/odin-code-panel.gif)
+
 ## Install
 
 macOS with [Homebrew](https://brew.sh). This installs colima, the docker CLI,

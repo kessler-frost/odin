@@ -16,20 +16,20 @@ class FakeRuntime:
     def __init__(self):
         self.runs = []
 
-    def run_container(self, spec):
+    async def run_container(self, spec):
         self.runs.append(spec.name)
         return RunHandle(id="x", name=spec.name)
 
-    def stop(self, name):
+    async def stop(self, name):
         pass
 
-    def facts(self, name, container_port=0):
+    async def facts(self, name, container_port=0):
         return ContainerFacts(phase="pending")
 
-    def stats(self, name):
+    async def stats(self, name):
         return {"cpu": 0.0, "ram": 0.0}
 
-    def ensure_host(self):
+    async def ensure_host(self):
         return HostFacts()
 
 
@@ -37,13 +37,13 @@ class FakeRds:
     def __init__(self):
         self.created = []
 
-    def create_db(self, db_id, user, pw):
+    async def create_db(self, db_id, user, pw):
         self.created.append(db_id)
 
-    def delete_db(self, db_id):
+    async def delete_db(self, db_id):
         pass
 
-    def endpoint(self, db_id):
+    async def endpoint(self, db_id):
         return None
 
     def container_name(self, db_id):
@@ -100,31 +100,31 @@ class RecordingAws:
     def __init__(self, log: list) -> None:
         self.log = log
 
-    def ensure_backing(self, kind: str) -> None:
+    async def ensure_backing(self, kind: str) -> None:
         self.log.append(("ensure", kind))
 
-    def gc(self, kinds: set) -> None:
+    async def gc(self, kinds: set) -> None:
         self.log.append(("gc", tuple(sorted(kinds))))
 
-    def backing_ports(self) -> dict:
+    async def backing_ports(self) -> dict:
         return {"s3": 9001}
 
-    def exists(self, kind: str, rid: str) -> bool:
+    async def exists(self, kind: str, rid: str) -> bool:
         return True
 
-    def facts(self, kind: str, rid: str) -> dict:
+    async def facts(self, kind: str, rid: str) -> dict:
         return {}
 
-    def provision(self, kind: str, rid: str, *args) -> None:
+    async def provision(self, kind: str, rid: str, *args) -> None:
         self.log.append(("provision", kind, rid))
 
-    def deprovision(self, kind: str, rid: str) -> None:
+    async def deprovision(self, kind: str, rid: str) -> None:
         self.log.append(("deprovision", kind, rid))
 
-    def subscriptions(self, rid: str) -> tuple:
+    async def subscriptions(self, rid: str) -> tuple:
         return ()
 
-    def aws_env(self) -> dict:
+    async def aws_env(self) -> dict:
         return {}
 
 

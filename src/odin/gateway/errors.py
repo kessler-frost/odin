@@ -6,7 +6,7 @@ service set spans four wire protocols:
 - s3:            REST-XML, a bare ``<Error>`` document.
 - sns/iam/rds/
   elasticache/
-  elbv2:          query-XML, wrapped in ``<ErrorResponse><Error>...`` --
+  elbv2/sts:      query-XML, wrapped in ``<ErrorResponse><Error>...`` --
                   all five are botocore's "query" protocol (verified against
                   each service's own model), whose error parser looks one
                   level deeper than S3's REST-XML. IAM, RDS (task W2.7),
@@ -56,7 +56,7 @@ _JSON_TYPE_PREFIX = {
 
 # Services whose errors ride botocore's "query" protocol envelope
 # (``<ErrorResponse><Error>...``) -- see the module docstring.
-_QUERY_XML_SERVICES = ("sns", "iam", "rds", "elasticache", "elasticloadbalancing")
+_QUERY_XML_SERVICES = ("sns", "iam", "rds", "elasticache", "elasticloadbalancing", "sts")
 
 _STATUS = {
     "InvalidClientTokenId": 401,

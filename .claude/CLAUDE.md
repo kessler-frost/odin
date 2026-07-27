@@ -131,32 +131,117 @@ than claimed" — was the single most valuable output of the field tests.
    signalled nothing because the container's BusyBox lacks `pgrep -o`, and odin
    was right to keep reporting healthy).
 
+## Browser automation: `agent-browser` (playwright-cli removed 2026-07-27)
+`agent-browser` (brew, Apache-2.0) is the only browser driver. `@playwright/cli`
+and its skill are gone; nothing in odin depended on them
+(`grep -in playwright ui/package.json pyproject.toml` → no match). Load usage at
+runtime with **`agent-browser skills get core --full`** — the skill in
+`~/.claude/skills/agent-browser/` is only a discovery stub, so instructions
+always match the installed CLI instead of going stale.
+
+**Two measured gotchas. Both are this repo's own "reports success it did not
+achieve" pattern, living inside the tool:**
+
+1. **Pointer-drawn UI (odin's IAM edges) is NOT reliably drivable — treat this as
+   OPEN.** Separate `mouse move`/`down`/`up` CLI calls draw no edge; that much I
+   reproduced. `agent-browser batch "mouse move …" "mouse down" … "mouse up"` was
+   reported to work by the evaluating agent, and **I could not reproduce it** over
+   several attempts. Instrumenting the page showed why the attempt fails but not
+   how to fix it: `pointerdown`/`mousedown` arrive with the target NOT a handle,
+   even though the preceding `mouse move` used the handle's measured centre, while
+   `pointerup` DOES land `@handle`. Handles are 6px wide. So: HTML5 drag-and-drop
+   (the sidebar → canvas path) is solid and verified; connection-dragging needs a
+   working recipe before anyone depends on it, and `eval`-dispatched synthetic
+   pointer events are the obvious fallback to try first.
+2. **`drag` has no target-position option** -- it always drops at the target's
+   CENTRE. For an exact coordinate use `eval` with a synthetic `DataTransfer`
+   (measured: places a node at the precise flow position). Use `drag` for the
+   visible gesture in a recording, `eval` when the position matters.
+
+Verified end-to-end against odin on 2026-07-27: drag places a real node
+(`data-id s3-101`, grid-snapped by `Canvas.tsx`'s onDrop); the full sequence
+fires (`dragstart` → `dragover` → `drop` → `dragend`) carrying
+`application/odin-resource`; clicking APPLY against a LIVE server committed a
+Stack revision and `/world` reported the resource `healthy`; and
+`record start/stop` writes WebM natively for the README GIFs (set the viewport
+AFTER `record start` -- recording opens a fresh context with its own viewport).
+For WebSocket taps use `--init-script`, which registers before the app's own
+connection; an `eval` after load always loses that race.
+
 ## Concurrency: async, not threads (owner directive, 2026-07-27)
 **No `threading` and no `multiprocessing` unless genuinely unavoidable.** The reason is locking: threads force it, and on a single
 event loop a synchronous read-modify-write is already atomic with respect to
 other tasks, because nothing preempts it without an `await`. So when threads
 go, DELETE the locks they existed for rather than porting `threading.Lock` to
 `asyncio.Lock` — check first whether the critical section contains an `await`;
-if it doesn't, it needs no lock. If a thread really is unavoidable (a blocking
-C call, a library with no async API), isolate it behind one
-`anyio.to_thread.run_sync` / `asyncio.to_thread` boundary and say why.
+if it doesn't, it needs no lock. **This includes `to_thread`** — `asyncio.to_thread` /
+`anyio.to_thread.run_sync` IS a thread pool, so it does not satisfy the rule,
+it hides it. Three facts make full elimination realistic here, all verified:
+- **Subprocess work is natively async.** `anyio.run_process` /
+  `anyio.open_process` / `asyncio.create_subprocess_exec` all exist. odin has
+  ~20 `subprocess.run` sites (docker, limactl, tofu, nebula-cert) and that is
+  the dominant blocking work — convert them, don't wrap them.
+- **File I/O should stay SYNCHRONOUS.** `anyio.AsyncFile.read` is literally
+  `await to_thread.run_sync(fp.read, ...)`, so "async file I/O" would
+  reintroduce threads invisibly. A page-cached few-KB store read is
+  sub-millisecond: inline is cheaper and simpler than a thread hop. Judge by
+  DURATION, not by whether it is "I/O".
+- **CPU-only work is not blocking I/O.** SigV4 signing needs neither.
+Prefer an async driver where a production-grade one exists (`psycopg` v3's
+`AsyncConnection` over psycopg2, which is what `assertions.py::pg_ready` and
+`aws/rds.py` use today). If something is genuinely unavoidable, leave the
+boundary VISIBLE and say why — an honest limit beats a hidden thread.
 
-**Which library: prefer `anyio`, so the choice stays open.** Not because trio
-beats asyncio — because anyio runs on BOTH (`anyio.get_all_backends()` →
-`('asyncio', 'trio')`), so anyio-shaped code is married to neither. It costs
-nothing here: Starlette already requires it (`anyio<5,>=3.6.2`, and 4.14.0 is
-in this venv today), so it is a transitive dependency odin already ships.
-Prefer its structured concurrency (`anyio.create_task_group`) over hand-rolled
-task bookkeeping. What this does NOT mean: rewriting the web stack to chase a
-backend. uvicorn/FastAPI are asyncio, anyio runs happily on asyncio, and that
-combination is exactly what "not limited to one library" buys. Judge async
-libraries on production quality and maintenance, not novelty.
+**Which library: core `asyncio`, and stay in it.** odin's own code imports
+`anyio` NOWHERE — it is purely transitive via Starlette — while `src/odin`
+already uses `asyncio.Lock`, `asyncio.create_subprocess_exec`,
+`asyncio.create_task` and friends throughout. Consistency is the whole point,
+so do not introduce a second async idiom; a transitive dependency is not a
+reason to start calling it directly. On Python 3.13 the stdlib covers what
+`anyio` is usually reached for: **`asyncio.TaskGroup`** for structured
+concurrency, `asyncio.create_subprocess_exec` for async subprocesses,
+`asyncio.timeout`, `asyncio.Lock`. That is also what uvicorn/FastAPI run on.
 
-odin's remaining threads as of v0.7.6, all scheduled to go in v0.7.7: the
-gateway's own uvicorn (`serve_in_thread`), the substrate boot threads
-(`ec2compute._finish_boot`, `lambdactl`'s deploy thread, `ecsctl._launch_task`,
-`cachectl._finish_create`), and the `threading.Lock` per env in
-`gateway/stores.py` that exists because of them.
+**Status (v0.7.7 in flight, branch `v077-dethread`).** `asyncio.to_thread` is
+GONE from odin's own code — 0 call sites, down from 28. The gateway models'
+boot threads are `asyncio` tasks now (`gateway/models/__init__.py::background`,
+which holds a strong reference in a module-level set with a done-callback
+discard — a bare `create_task` reference can be garbage-collected mid-flight
+where a daemon thread could not). The locks that guarded sections containing
+no `await` were DELETED rather than ported. Still standing: `__main__.py`'s two
+log relays, `compute/instances.py`'s boot semaphore, `fabric/nebula.py`'s
+locks, `gateway/stores.py`, and `gateway/app.py::serve_in_thread` (documented
+test-only; production uses `serve_on_loop`).
+
+**Four failure modes this conversion creates. All are silent, none is caught
+by an ordinary test, and each now has a mutation-tested ratchet under
+`tests/` — read them before converting anything.**
+1. **A coroutine that blocks.** `await f()` on a SYNC function raises, so that
+   mistake reports itself. The reverse does not: an `async def` whose body
+   still blocks awaits happily and stalls the reconciler and gateway together.
+   A blocking `httpx.post(timeout=30)` reached the shared loop this way and
+   could DEADLOCK a re-entrant lambda invoke — measured 25.11s and a
+   `TimeoutError`, against 0.10s once fixed.
+2. **`await f(...).attr` reads the attribute off the COROUTINE.** `await` binds
+   looser than attribute access, subscription and calls. Nine real instances.
+   Two sat in `except` blocks, so they returned a plausible-looking degraded
+   answer instead of raising.
+3. **`create_task(await f())` schedules nothing** — `f` runs inline, and if `f`
+   loops forever the caller never returns. `Reconciler.start()` did exactly
+   that. A HANG is indistinguishable from "still working".
+4. **A `threading.Lock` held across an `await` is a DEADLOCK, not a stall.**
+   Task B blocks the whole loop in `lock.acquire()`, so task A can never be
+   resumed to release it. Verified: a repro's own `asyncio.timeout(2)` never
+   fired, because nothing was left to service it. The lock did not change —
+   there is just one thread to block now.
+
+Two more, learned the hard way: **typer SILENTLY DROPS an `async def` command**
+(measured on 0.26.7 — exit 0, body never runs, no output), so CLI entry points
+stay sync and bridge with `asyncio.run`; and **an `asyncio.Task` has no head
+start**, where `Thread.start()` runs immediately — any test asserting on state
+right after a converge call was always racy and the thread was hiding it. Await
+the task; never add a sleep, which restores the coincidence rather than the
+guarantee.
 
 ## Working in parallel (subagents and teammates)
 Hard-won mechanics. Ignoring these has already destroyed work in this repo.
@@ -177,10 +262,64 @@ Hard-won mechanics. Ignoring these has already destroyed work in this repo.
   (never `/tmp` — macOS TMPDIR isn't shared into Colima), and its own env-name
   prefix. Two agents defaulting to :4200/:4266 produced a bogus 401 and two
   phantom "bugs" that had to be retracted.
+- **A FIXED port is the wrong isolation for a parallel run.** Assigning each
+  agent its own `ODIN_GATEWAY_PORT` partitions agents and then collides with
+  that agent's OWN xdist workers: measured, `ODIN_GATEWAY_PORT=5311` with
+  `-n auto` gave every worker but one `OSError: [Errno 48] Address already in
+  use` and made the run WORSE than leaving it unset (39 errors vs 34). The
+  tests already default to an ephemeral port (`0`), which is STRONGER
+  isolation than any fixed number -- nothing can collide with it. So: fixed
+  ports for a long-running server you must dial, ephemeral for test runs.
+  Same lesson as the one below, one level down.
+- **Isolation is PER-PROCESS, not per-agent.** An agent with its own port, store
+  dir and env prefix then ran two of its own `pytest` processes through them at
+  once, and the collision produced a phantom "1-in-6 flaky test" that was
+  reported to the lead and later retracted. Seven clean runs were identical
+  (90/814/5); the two anomalous runs were both its own contamination. If you
+  start a second process, it needs its own everything too.
+- **A source mutation is a TREE-WIDE edit.** Mutation testing rewrites a file
+  that every concurrent reader of that worktree sees. The same incident had a
+  live `policy.py` mutation land in an unrelated full-suite run (three extra
+  failures, exactly the three that mutation breaks) and made a *different*
+  agent report an inexplicable `AssertionError` from a file rewritten
+  mid-import. So: mutate only in a private copy of the tree, or hold a hard
+  rule that nothing else runs during the window — and when a result surprises
+  you, suspect your own harness before the code.
 - **Cleanup must be scoped to the env names that agent created.** `docker ps -aq
   --filter label=odin=1 | xargs -r docker rm -f` is machine-wide and has already
   deleted another agent's containers mid-verification. Use
   `--filter name=<prefix>`.
+- **Ports and store dirs partition STATE; nothing partitions PROCESSES.** When
+  something you started hangs, cancel it by the handle you already have —
+  `TaskStop` for a harness background task, or `kill "$pid"` from
+  `cmd & pid=$!`. Reach for `pkill` only with no handle, and then scope it to
+  your own worktree path (`pkill -f "/worktrees/<my-agent-id>/"`). **Never
+  `pkill -f pytest`** or any pattern that can match another agent: it is the
+  process equivalent of the machine-wide docker sweep above.
+  Two agents did this independently within one hour — one `pkill -f "pytest
+  tests/gateway"`, one `pkill -9 -f pytest` — and each disclosed it to the
+  other unprompted. Both had correctly taken their own port, store dir and env
+  prefix, and both had used a properly scoped cancel earlier in the same
+  session. So this is REFLEX UNDER TIME PRESSURE, not ignorance of scoping,
+  which is why the cheap correct action has to be named first rather than the
+  rule merely saying "scope your pattern".
+  It also poisons diagnosis: a killed run looks exactly like a hang, and this
+  cost a false "the suite hangs at 12%" that was really someone else's `pkill`
+  landing on it.
+- **`git add -A <path>` is path-limited; `git commit` is NOT.** In a shared
+  worktree that combination swept 24 of another agent's staged files into an
+  unrelated commit. Commit with explicit pathspecs and read `git show --stat`
+  before trusting it.
+- **A base check DECAYS — re-check it, don't establish it once.** An agent
+  correctly verified its worktree base at task start, worked for hours, and
+  reported a breakage list measured 8 commits behind the tip; every diagnosis
+  in it was right and every one was already fixed. Its own summary is the rule:
+  *"my error wasn't failing to know about staleness — it was that I did check,
+  got a clean answer, and never re-checked across a multi-hour session in a
+  worktree that had moved under me twice."* Re-run `git log --oneline -1`
+  against the main checkout immediately BEFORE reporting, not only before
+  starting. Being right about a cause while wrong about whether it is still
+  live costs a reviewer's attention as surely as being wrong.
 - **"I read it" needs a "when."** With many agents in flight, one read
   `catalog.ts` before a commit landed and another after, and they reported
   contradictory states — both honestly. Timestamp claims about the tree.
@@ -188,7 +327,7 @@ Hard-won mechanics. Ignoring these has already destroyed work in this repo.
 ## Cleanup / Disk (limited headroom — clean up after EVERY heavy step)
 - **Containers:** every test/run tears down its own; `docker ps -aq --filter label=odin=1 | xargs -r docker rm -f`. Tests use the `runtime` fixture's teardown.
 - **Lima VMs:** the LimaRuntime VM is `odin-host`; integration tests delete it after. Never leave stray VMs (`limactl list -q`); delete by exact name (the user's own VMs like `veronica` are off-limits).
-- **Misc:** prune `.odin/`, `.playwright-cli/*.yml`, `/tmp/*.png`, `__pycache__`, `.pytest_cache`, `.ruff_cache`.
+- **Misc:** prune `.odin/`, `/tmp/*.png`, `__pycache__`, `.pytest_cache`, `.ruff_cache`. (Browser work leaves no litter to prune: `agent-browser` keeps state in its own session store, unlike playwright-cli which dumped a YAML snapshot per command.)
 
 ## CLI / running
 - `uv run uvicorn odin.server:create_app --factory --host 127.0.0.1 --port 4200` (the real app: reconciler + AWS backings in lifespan).

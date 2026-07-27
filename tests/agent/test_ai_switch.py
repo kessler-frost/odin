@@ -140,6 +140,9 @@ async def test_the_debug_agent_answers_its_honest_unavailable_without_calling_an
     immediately rather than after the 90s timeout, because nothing is awaited."""
     monkeypatch.setenv("ODIN_AI", "0")
     answer = await asyncio.wait_for(
+        # the COROUTINE, not an awaited result -- awaiting it here would run
+        # `diagnose` to completion before `wait_for` ever saw it, making the
+        # 5s bound (this test's whole point) vacuous.
         debugger_mod.diagnose(CONTEXT, "what's wrong here?", client_cls=_NeverConstructed),
         timeout=5.0,
     )

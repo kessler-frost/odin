@@ -1129,6 +1129,120 @@ future decision against these points instead of re-deriving them:
   external/LAN-reachable underlay address plus multi-Mac membership and
   cross-machine placement are still open). Additive, no core change.
 
+## v0.7.8 — three PRE-EXISTING field failures, carried forward deliberately
+
+All three fail IDENTICALLY at v0.7.6 (verified by running them against the
+released tag, not asserted), so v0.7.7 regresses nothing. They are recorded
+here rather than hacked green, because making them pass in five minutes would
+have meant retiring a claim rather than fixing a bug.
+
+- [ ] **`test_a_noop_apply_cannot_report_success_*` (ecs + lambda) — a genuine
+  design conflict, and it needs a DECISION, not a patch.** The tests assert
+  that a no-op apply must not claim success while the service is at zero, and
+  they create that state with a broken `${{ghost.ENDPOINT}}` ref. odin's
+  wiring guard now refuses that apply upfront with a 409 — which is BETTER
+  behaviour, and it runs before apply, so "apply proceeds while a ref is
+  unresolvable" is unreachable BY DESIGN.
+  Three options, none free: (a) assert the refusal — honest, loses the
+  reconcile-path coverage; (b) find a failure mechanism the guard allows —
+  preserves the claim, but every candidate checked (bad image, etc.) breaks
+  the test's own "tofu had nothing to do" premise; (c) split into two tests.
+  The claim these encode is one of odin's honesty guarantees (field test 3:
+  `applied`/exit-0 at 0 of 3 tasks). Do not retire it quietly.
+
+- [ ] **`test_a_killed_database_gets_its_mesh_endpoint_back_after_one_apply`.**
+  A killed rds container does not come back after one apply — verdict
+  `container odin-rds-... is not running (exit 137) — re-Apply to recreate`.
+  Note the symptom DIFFERS between versions (v0.7.6: "never published a
+  verified overlay address"), so diagnose from the current failure rather than
+  assuming they are the same bug.
+  Adjacent and probably related: `fabric/sidecar.py::ensure()` collapses "the
+  join failed" into "there is no mesh here" — its broad `except` returns
+  `None`, the same value as the no-mesh case. That is honesty rule 2 and is
+  why a hard `AttributeError` once surfaced as a decorative security group.
+  Fix the collapse first; it may be what makes this test's real cause visible.
+
+- [x] **A failed canvas READ silently destroyed the saved canvas** (fixed in
+  v0.7.7). Reported from a Tailscale-served odin -- "when I press refresh the
+  entire canvas gets nuked" -- and invisible on loopback, where the fetch does
+  not fail. `Canvas.tsx` loaded with
+  `.catch(() => ({nodes: [], edges: []}))`, so ANY failed read became an empty
+  canvas, `loaded` flipped true, and the debounced save wrote that emptiness
+  over `.odin/canvas.json`. Measured by rejecting a single GET: **2 nodes on
+  disk before, 0 after, unrecoverable.**
+
+  Fix: `lib/canvasLoad.ts` -- `null` means COULD NOT READ; the loader returns
+  without arming the save, renders nothing, and shows a non-dismissible
+  banner saying the saved canvas is intact. Verified in a real browser with
+  the fault provably firing, on the freshly-built bundle: faulted load ->
+  banner + disk still 2; clean load -> 2 nodes, no banner; drop a node -> disk
+  3. Mutation-tested: restoring the old fallback fails 4 of the new tests.
+
+  Two theories I raised about a DIFFERENT symptom were both wrong, recorded
+  so nobody re-derives them:
+  * *"the debounced canvas save races Apply"* -- DISPROVEN. The debounce is
+    500ms; the canvas was verified saved 3s before the click.
+  * *"the badge never goes green live"* -- DISPROVEN. A WebSocket tap shows
+    `world_delta` (`starting` -> `healthy`) and the badge flipping with no
+    reload. I had been reading it 16-18s after Apply while the `tofu apply`
+    itself takes ~25s. **A real apply of one SQS queue is ~25s of tofu plus
+    ~5s to observation; measure past 30s or you will invent a bug.**
+  * and a third, about `/canvas` needing `?env=`: there is no per-env canvas.
+    `api/canvas.py` takes no env at all and `.odin/canvas.json` is a single
+    global file -- `GET /canvas?env=X` returns byte-identical bytes for every
+    X. One architecture, many envs (isolated AWS *state*) is the design.
+
+- [ ] **`/apply-full` treats a MALFORMED body as "destroy everything".**
+  `CanvasGraph.nodes` defaults to `[]`, so a body with no `nodes` key at all
+  validates as a canvas with zero nodes. Measured against a live server:
+  `POST /apply-full?env=X` with `{"detail": "Internal Server Error"}` returns
+  **HTTP 200 `{"status": "applied"}`** and commits a real revision -- and
+  reconciling an env to an empty desired state tears down every resource in
+  it. The v0.7.7 fix is client-side (`lib/canvasLoad.ts` refuses to hand such
+  a body to Apply), which closes the reported path but not the route itself.
+  The server distinction worth drawing: an EXPLICIT `"nodes": []` is a
+  legitimate "remove everything", while an ABSENT `nodes` key is a malformed
+  request and should be a 422. Deferred out of v0.7.7 because making the field
+  required changes validation for every canvas-taking route (`/apply`,
+  `/translate`, `/canvas`) and wants its own test pass.
+
+- [ ] **Should the canvas be per-env?** Every other route (`/world`, `/apply`,
+  `/destroy`) takes `?env=` and defaults to `default`; `/canvas` alone is
+  global. Making it per-env-with-default would be consistent, but it changes
+  what an environment MEANS (today: the same architecture, isolated state),
+  so it is a design decision rather than a bug fix. Owner raised it 2026-07-27.
+
+- [ ] **Containment changes configuration, not just labels.** The owner's
+  example: expand an EC2 box, drop an ECS box inside it, and that means **ECS
+  on the EC2 launch type rather than Fargate** — which is a real AWS
+  distinction (ECS tasks run either on EC2 container instances or on Fargate),
+  not a UI convenience. Dropping it back out means Fargate again.
+  **The invariant that makes this safe: identity is preserved.** The node's
+  name/label and anything the user typed stay exactly as they are; only the
+  fields that containment genuinely determines change. A gesture must never
+  silently rewrite something a person authored — that is the same honesty rule
+  the rest of odin follows, applied to the canvas.
+  Needs: a per-kind table of "what does containment in X imply", applied on the
+  containment-stamp path, plus a visible statement of what changed (odin says
+  what it did; it does not quietly do it).
+
+- [ ] **IAM edges across the whole catalog, not just S3.** Today the drawn-edge
+  → compiled-policy path is real and enforced, but the action vocabulary is
+  thin outside `s3:*`. Extend to sqs/sns/dynamodb/lambda/ecs/secrets/logs/ecr
+  and the rest, so drawing a lambda → dynamodb edge grants the right actions
+  the way a lambda → s3 edge already does. The compiler and the enforcement
+  point do not change; the vocabulary does.
+
+- [ ] **Placement that infers intent from geometry.** The general form of the
+  first item: what a person expresses by putting one thing inside, next to, or
+  overlapping another. Containment is the first and clearest case; adjacency
+  and grouping follow. Each inference must be reversible by the opposite
+  gesture and must never destroy authored values.
+
+- [ ] **Then, and separately: the chat/agent surface.** NORTHSTAR's canvas↔
+  Terraform translation agent. Explicitly NOT a replacement for the canvas
+  language — an addition to it.
+
 ## Deprecated 2026-07-22 (superseded by NORTHSTAR.md)
 
 Everything below this line described **odin**, a local-only "Railway,
@@ -1200,5 +1314,5 @@ What this means:
 
 ### Testing (superseded)
 - [x] pytest suite: 80 unit + 9 integration (real Colima/MiniStack/Lima/Claude, marker-gated)
-- [x] Browser e2e via playwright (skeleton + full-breadth scenarios)
+- [x] Browser e2e via the browser CLI (skeleton + full-breadth scenarios; playwright-cli retired 2026-07-27 in favour of agent-browser)
 - [ ] Broader end-to-end scenario coverage as milestones land

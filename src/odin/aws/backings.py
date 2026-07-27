@@ -20,7 +20,7 @@ boots/tears down the container the real image bytes live in.
 """
 from __future__ import annotations
 
-import threading
+import asyncio
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -196,9 +196,29 @@ class BackingAws:
         # independently call it too (provision() -> ensure_backing()) --
         # without this, both threads can see "not running" and race
         # `docker run` with the same container name (a hard Conflict error).
-        # A threading.Lock, not asyncio.Lock: this runs under
-        # asyncio.to_thread on separate OS threads, not on the event loop.
-        self._ensure_lock = threading.Lock()
+        # An asyncio.Lock, and it genuinely earns one: the critical section
+        # below holds THREE awaits (`_rt.status`, `_stranded`,
+        # `_create_backing_container`), and a suspension point is exactly what
+        # lets two tasks interleave into the same-name Conflict. Contrast the
+        # locks DELETED in ecsctl/elbv2ctl, whose sections had no await at all
+        # -- on one event loop nothing can preempt those, so they needed no
+        # lock. (v0.7.7: this was a threading.Lock while ensure_backing ran
+        # under asyncio.to_thread on separate OS threads.)
+        #
+        # v0.7.7 DE-THREADING VERDICT (verified, not assumed): this lock does
+        # NOT disappear when the threads do -- it becomes an `asyncio.Lock`.
+        # The rule "if the critical section contains no `await`, delete the
+        # lock" is applied to the code AFTER the conversion, not before, and
+        # this critical section is three `docker` calls (`_rt.status`,
+        # `_stranded`, `_create_backing_container`) that the conversion turns
+        # into `await`s. Suspension points inside the section are exactly what
+        # lets two tasks interleave, so deleting it would restore the
+        # `docker run` name Conflict described above -- as a task race on one
+        # loop instead of a thread race. Its contender -- `reconciler.py`'s
+        # `gather(...)` over one ensure_backing per kind -- stays genuinely
+        # concurrent: a gather of awaits now, where it was a gather of
+        # `to_thread` calls before v0.7.7.
+        self._ensure_lock = asyncio.Lock()
         # Per-tick docker-call cache. backing_ports() answers from a short-TTL
         # cache and gc() skips its whole stop-sweep when neither the active
         # kinds nor container state changed since the last sweep. Both are
@@ -234,7 +254,7 @@ class BackingAws:
         nothing is actually listening on)."""
         return self._gateway_port if d.name == "goaws" else d.port
 
-    def _published_port(self, d: BackingDef) -> int:
+    async def _published_port(self, d: BackingDef) -> int:
         """This backing's real published host port, or `BackingUnavailable`
         naming why there isn't one. The ONE place this class turns a port read
         into a number, so no caller can re-invent the hazard below.
@@ -263,14 +283,14 @@ class BackingAws:
         call, only ever on a path that is already failing."""
         cname, inside = self._cname(d), self._listen_port(d)
         try:
-            port = self._rt.host_port(cname, inside)
+            port = await self._rt.host_port(cname, inside)
         except PortUnreadable as exc:
             raise BackingUnavailable(
                 f"the {'/'.join(d.kinds)} backing container {cname} is unavailable: {exc}",
                 container=cname, observed="unreadable",
             ) from exc
         if not port:
-            observed = self._rt.status(cname)
+            observed = await self._rt.status(cname)
             raise BackingUnavailable(
                 f"the {'/'.join(d.kinds)} backing container {cname} is unavailable: it publishes "
                 f"no port {inside}, and the container runtime reports its state as {observed!r} "
@@ -279,7 +299,7 @@ class BackingAws:
             )
         return port
 
-    def _published_port_or_none(self, d: BackingDef) -> int | None:
+    async def _published_port_or_none(self, d: BackingDef) -> int | None:
         """`_published_port` for the callers that must OMIT rather than raise:
         the gateway routing table, the workload endpoint vars, and the two
         internal readiness/self-heal probes. `backing_ports`'s own contract
@@ -287,22 +307,22 @@ class BackingAws:
         table so the gateway 503s instead of forwarding somewhere wrong --
         absent is the honest answer for an unreadable one too. 0 never was."""
         try:
-            return self._published_port(d)
+            return await self._published_port(d)
         except BackingUnavailable:
             return None
 
-    def ensure_backing(self, service: str) -> None:
+    async def ensure_backing(self, service: str) -> None:
         d = self._backing_for(service)
         cname = self._cname(d)
         # Only the check+create is serialized -- the readiness wait below
         # runs OUTSIDE the lock so concurrent ensure_backing calls for
-        # DIFFERENT services (S5's ensure_backings runs one asyncio.to_thread
-        # per kind, in parallel) aren't forced sequential by a single
+        # DIFFERENT services (the reconciler gathers one task per kind, in
+        # parallel) aren't forced sequential by a single
         # per-instance lock.
-        with self._ensure_lock:
-            if self._rt.status(cname) != "running" or self._stranded(d):
-                self._create_backing_container(d, cname)
-        self._await_ready(cname, service)
+        async with self._ensure_lock:
+            if await self._rt.status(cname) != "running" or await self._stranded(d):
+                await self._create_backing_container(d, cname)
+        await self._await_ready(cname, service)
         # W2.6: the backing joins the env's Nebula overlay (a real cert + a
         # sticky overlay IP), so it is a mesh member a firewall can gate --
         # a no-op unless the canvas drew a VPC (fabric/sidecar.py::enabled).
@@ -313,9 +333,9 @@ class BackingAws:
         # their access control, which is the gateway's job), so they join
         # with nebula's allow-all default rather than a compiled SG; rds,
         # which IS VPC-resident, gets its drawn SG (aws/rds.py).
-        self._mesh.ensure(cname, cname)
+        await self._mesh.ensure(cname, cname)
 
-    def _stranded(self, d: BackingDef) -> bool:
+    async def _stranded(self, d: BackingDef) -> bool:
         """A container that's RUNNING but no longer publishes the inside-port
         this instance needs (W2.2). goaws is the real case: its listener port
         IS the gateway port (`_listen_port`), and that's baked into the
@@ -338,10 +358,10 @@ class BackingAws:
         for is recoverable, adopting one we can't reach is the stall this
         method exists to break. It only ever runs on a container `ensure_backing`
         has just seen `running`, under the same lock."""
-        return self._published_port_or_none(d) is None
+        return await self._published_port_or_none(d) is None
 
-    def _create_backing_container(self, d: BackingDef, cname: str) -> None:
-        self._rt.stop(cname)  # clear any exited remnant (same contract as PostgresRds)
+    async def _create_backing_container(self, d: BackingDef, cname: str) -> None:
+        await self._rt.stop(cname)  # clear any exited remnant (same contract as PostgresRds)
         volumes: dict[str, str] = {}
         if d.name == "goaws":
             # Config must live under the repo tree ($HOME is the only tree
@@ -350,9 +370,9 @@ class BackingAws:
             (conf_dir / "goaws.yaml").write_text(_goaws_config(self._gateway_port))
             volumes = {str(conf_dir): "/conf"}
         if d.name == "dynalite":
-            self._ensure_dynalite_image()
+            await self._ensure_dynalite_image()
         try:
-            self._rt.run_container(ContainerSpec(
+            await self._rt.run_container(ContainerSpec(
                 name=cname, image=d.image, env=d.env, ports={self._listen_port(d): 0},
                 labels={"odin-env": self._env}, command=d.command, volumes=volumes,
             ))
@@ -366,8 +386,8 @@ class BackingAws:
             # to report it running, then fall through to the readiness
             # probe like the happy path.
             deadline = time.monotonic() + READY_TIMEOUT
-            while time.monotonic() < deadline and self._rt.status(cname) != "running":
-                time.sleep(0.2)
+            while time.monotonic() < deadline and await self._rt.status(cname) != "running":
+                await asyncio.sleep(0.2)
         # A backing genuinely came up (booted here, or by the concurrent
         # creator the heal above waited on): the cached ports table is stale
         # and the next gc() must re-sweep even with unchanged active kinds
@@ -376,34 +396,78 @@ class BackingAws:
         self._ports_cache = None
         self._dirty = True
 
-    def _ensure_dynalite_image(self) -> None:
+    async def _ensure_dynalite_image(self) -> None:
         """One-time (per machine) build of the baked dynalite image -- see
         the module-level comment by `_DYNALITE_IMAGE`. Runs inside
-        `ensure_backing`'s `_ensure_lock`, so two threads racing to boot
+        `ensure_backing`'s `_ensure_lock`, so two TASKS racing to boot
         dynalite for the first time never both `docker build` the same tag."""
-        if not self._rt.image_exists(_DYNALITE_IMAGE):
-            self._rt.build(_DYNALITE_IMAGE, _DYNALITE_DOCKERFILE)
+        if not await self._rt.image_exists(_DYNALITE_IMAGE):
+            await self._rt.build(_DYNALITE_IMAGE, _DYNALITE_DOCKERFILE)
 
-    def ensure_dynalite_image(self) -> None:
+    async def ensure_dynalite_image(self) -> None:
         """Public seam for `odin doctor --prebake`: bake the dynalite image
         ahead of the first DynamoDB Apply. Idempotent; lock-free is fine here
         (a one-shot CLI, not the reconciler's concurrent ensure path)."""
-        self._ensure_dynalite_image()
+        await self._ensure_dynalite_image()
 
-    def _await_ready(self, cname: str, service: str) -> None:
+    async def _await_ready(self, cname: str, service: str) -> None:
         if service == "ecr":
-            self._await_registry_ready(cname)
+            await self._await_registry_ready(cname)
             return
         deadline = time.monotonic() + READY_TIMEOUT
         while time.monotonic() < deadline:
             try:
-                getattr(self.client(service), _PROBES[service])()
+                getattr(await self.client(service), _PROBES[service])()
                 return
             except (ClientError, BotoCoreError):
-                time.sleep(1)
-        raise RuntimeError(f"{cname} never became ready:\n{self._rt.logs(cname)}")
+                await asyncio.sleep(1)
+        reason = await self._not_ready_reason(
+            cname, self._backing_for(service), f"the {service} {_PROBES[service]} probe never succeeded",
+        )
+        raise RuntimeError(f"{cname} never became ready: {reason}")
 
-    def _await_registry_ready(self, cname: str) -> None:
+    async def _not_ready_reason(self, cname: str, d: BackingDef, probe: str) -> str:
+        """WHY the wait ended, in a form that is never empty.
+
+        The module docstring above already cites this exact failure as a real
+        incident (`"never became ready"`, empty container logs) -- the fix just
+        took longer to arrive than the diagnosis. It used to be
+        `f"{cname} never became ready:\\n{await self._rt.logs(cname)}"`, and
+        `logs` answers `""` both for a container that wrote nothing and for one
+        the runtime could not read. Measured against REAL containers, driven to
+        a real timeout with the canonical names so `client()` resolved a
+        published port:
+
+          backing                          rendered                    status   exit  port
+          odin-aws-rustfs-swpprobe    '... never became ready:\\n'  running  0     34071
+          odin-aws-registry-swpprobe  '... never became ready:\\n'  running  0     34072
+
+        A dangling colon and a blank line, with `status`, `exit_code` and
+        `host_port` all readable at that instant and all three discarded.
+
+        Same treatment as `CacheRuntime._not_ready_reason` and
+        `FunctionRuntime`'s before it, and for the same reasons: `host_port`
+        discriminates the two real failures (docker never published the port
+        at all, versus a port that is published and never answers), the log
+        tail is a trailing bonus rather than the headline (a backing's logs can
+        end on a line that reads like success while the actual reason sits in
+        the port), and the exit code is reported only for a container that is
+        NOT running -- a live container's `{{.State.ExitCode}}` is `0`, and
+        "exit code 0" printed under a failure sends a reader down the wrong
+        path."""
+        status = await self._rt.status(cname)
+        state = status if status == "running" else f"{status}, exit code {await self._rt.exit_code(cname)}"
+        port = await self._published_port_or_none(d)
+        published = f"published on host port {port}, but {probe}" if port else (
+            f"docker never published its {d.port}, so nothing could reach it"
+        )
+        logs = await self._rt.logs(cname)
+        tail = f"Its logs:\n{logs}" if logs else (
+            "It has logged nothing, so the container state above is the whole of it."
+        )
+        return f"{published}, after {READY_TIMEOUT:g}s. Container: {state}. {tail}"
+
+    async def _await_registry_ready(self, cname: str) -> None:
         """registry:2 speaks the Docker Registry v2 HTTP protocol, not any
         AWS wire shape -- `client()`'s boto3-ecr seam (every OTHER backing's
         readiness probe) can never reach it, since registry:2 doesn't
@@ -418,35 +482,48 @@ class BackingAws:
             return
         d = self._backing_for("ecr")
         deadline = time.monotonic() + READY_TIMEOUT
-        while time.monotonic() < deadline:
-            port = self._published_port_or_none(d)
-            try:
-                if port:
-                    httpx.get(f"http://127.0.0.1:{port}/v2/", timeout=2.0).raise_for_status()
-                    return
-            except httpx.HTTPError:
-                pass
-            time.sleep(0.5)
-        raise RuntimeError(f"{cname} never became ready:\n{self._rt.logs(cname)}")
+        # `httpx.AsyncClient`, not `httpx.get`: this coroutine runs on the
+        # control loop the gateway and reconciler share, and a BLOCKING call
+        # inside an `async def` awaits perfectly happily while stalling
+        # everything else for its whole timeout. That is invisible in a way a
+        # thread never was -- the same shape that let a lambda invoke freeze
+        # the loop for 30s once its `to_thread` was removed.
+        async with httpx.AsyncClient() as client:
+            while time.monotonic() < deadline:
+                port = await self._published_port_or_none(d)
+                try:
+                    if port:
+                        (await client.get(f"http://127.0.0.1:{port}/v2/", timeout=2.0)).raise_for_status()
+                        return
+                except httpx.HTTPError:
+                    pass
+                await asyncio.sleep(0.5)
+        raise RuntimeError(
+            f"{cname} never became ready: {await self._not_ready_reason(cname, d, 'GET /v2/ never returned 200')}"
+        )
 
-    def client(self, service: str):
+    async def client(self, service: str):
         """Host-side client against the backing's published port (tests/e2e).
 
         Fails loud (`BackingUnavailable`, typed so best-effort paths like
         `deprovision` can swallow it) rather than dialing a made-up port --
         `_published_port` owns that judgement and the reason text."""
         d = self._backing_for(service)
-        endpoint = f"http://127.0.0.1:{self._published_port(d)}"
+        endpoint = f"http://127.0.0.1:{await self._published_port(d)}"
         if self._client_factory:
             return self._client_factory(service, endpoint)
         config = Config(signature_version="s3v4", s3={"addressing_style": "path"}) \
             if service == "s3" else None
+        # boto3 is SYNCHRONOUS and stays that way: its calls against a local
+        # backing measured 0.63-0.84 ms, so a client built here costs less than
+        # a thread hop would. The automated await pass added an `await` to this
+        # line, which raises -- a client object is not awaitable.
         return boto3.client(service, endpoint_url=endpoint, aws_access_key_id=ACCESS_KEY,
                             aws_secret_access_key=SECRET_KEY, region_name=REGION, config=config)
 
-    def provision(self, service: str, name: str, subscriptions: tuple[str, ...] = ()) -> None:
-        self.ensure_backing(service)
-        client = self.client(service)
+    async def provision(self, service: str, name: str, subscriptions: tuple[str, ...] = ()) -> None:
+        await self.ensure_backing(service)
+        client = await self.client(service)
         try:
             if service == "s3":
                 client.create_bucket(Bucket=name)
@@ -460,7 +537,7 @@ class BackingAws:
                 )
             elif service == "sns":
                 topic_arn = client.create_topic(Name=name)["TopicArn"]  # RETURNED, not constructed
-                sqs = self.client("sqs")
+                sqs = await self.client("sqs")
                 for queue in subscriptions:
                     # idempotent — the sqs node's own provision may not have run yet
                     queue_url = sqs.create_queue(QueueName=queue)["QueueUrl"]
@@ -473,12 +550,12 @@ class BackingAws:
             if not any(w in str(exc) for w in ("Exist", "Conflict", "InUse")):
                 raise
 
-    def exists(self, service: str, name: str) -> bool:
+    async def exists(self, service: str, name: str) -> bool:
         d = self._backing_for(service)
         # Cheap liveness first: a dead backing must demote nodes without HTTP timeouts.
-        if self._rt.status(self._cname(d)) != "running":
+        if await self._rt.status(self._cname(d)) != "running":
             return False
-        client = self.client(service)
+        client = await self.client(service)
         try:
             if service == "s3":
                 client.head_bucket(Bucket=name)
@@ -493,7 +570,7 @@ class BackingAws:
         except (ClientError, BotoCoreError):  # BotoCoreError: backing just died mid-check
             return False
 
-    def subscriptions(self, topic: str) -> tuple[str, ...]:
+    async def subscriptions(self, topic: str) -> tuple[str, ...]:
         """Queue names currently subscribed to `topic` (the raw-delivery SQS
         subscriptions provision() creates), read back through
         ListSubscriptionsByTopic -- so the reconciler can diff desired vs
@@ -501,14 +578,14 @@ class BackingAws:
         is the queue ARN provision() subscribed with
         (arn:aws:sqs:region:account:name), so the queue name is the ARN's
         last colon-segment."""
-        sns = self.client("sns")
+        sns = await self.client("sns")
         topic_arn = f"arn:aws:sns:{REGION}:{ACCOUNT}:{topic}"
         subs = sns.list_subscriptions_by_topic(TopicArn=topic_arn)["Subscriptions"]
         return tuple(s["Endpoint"].rsplit(":", 1)[-1] for s in subs if s["Protocol"] == "sqs")
 
-    def deprovision(self, service: str, name: str) -> None:
+    async def deprovision(self, service: str, name: str) -> None:
         try:
-            client = self.client(service)
+            client = await self.client(service)
             if service == "s3":
                 client.delete_bucket(Bucket=name)
             elif service == "sqs":
@@ -520,7 +597,7 @@ class BackingAws:
         except (ClientError, BotoCoreError, BackingUnavailable):
             pass  # best-effort: the resource or its whole backing may already be gone
 
-    def facts(self, service: str, name: str) -> dict:
+    async def facts(self, service: str, name: str) -> dict:
         """This resource's World facts. Every value is a `str` -- see
         `Reconciler._assert_string_facts` for why that is load-bearing rather
         than stylistic (a fact that doesn't survive a JSON round-trip unchanged
@@ -533,7 +610,7 @@ class BackingAws:
         reconciler's caller keeps the resource `starting` and carries the
         reason (reconcile/reconciler.py::_observe_provisioned)."""
         d = self._backing_for(service)
-        endpoint = f"http://{CONTAINER_HOST}:{self._published_port(d)}"
+        endpoint = f"http://{CONTAINER_HOST}:{await self._published_port(d)}"
         # QUEUE_URL is constructed canonically, pointed at the gateway (not
         # goaws's own direct port) to match the Host/Port baked into
         # goaws.yaml -- the fact and what goaws itself now returns agree.
@@ -545,21 +622,24 @@ class BackingAws:
             "dynamodb": {"TABLE": name, "endpoint": endpoint},
         }[service]
 
-    def aws_env(self) -> dict[str, str]:
+    async def aws_env(self) -> dict[str, str]:
         """The creds + per-service endpoint vars a consumer needs. A backing
         whose port can't be read contributes NO endpoint var (rather than one
         pointing at `:0`): an absent override is a visible failure at the first
         call, a bogus one is a connection refused blamed on the service."""
         env = {"AWS_ACCESS_KEY_ID": ACCESS_KEY, "AWS_SECRET_ACCESS_KEY": SECRET_KEY,
                "AWS_DEFAULT_REGION": REGION}
-        running = (d for d in BACKINGS if self._rt.status(self._cname(d)) == "running")
-        for d in running:
-            port = self._published_port_or_none(d)
+        # A plain loop, not the generator this used to be: `await` inside a
+        # genexp makes it an ASYNC generator, which a `for` cannot iterate.
+        for d in BACKINGS:
+            if await self._rt.status(self._cname(d)) != "running":
+                continue
+            port = await self._published_port_or_none(d)
             for kind in d.kinds if port else ():  # goaws yields both _SQS and _SNS from one container
                 env[f"AWS_ENDPOINT_URL_{kind.upper()}"] = f"http://{CONTAINER_HOST}:{port}"
         return env
 
-    def backing_ports(self) -> dict[str, int]:
+    async def backing_ports(self) -> dict[str, int]:
         """service -> host port of its running backing; the routing table
         GatewayState.update forwards proxied requests against. A backing
         that isn't running (or never started) is simply absent -- the
@@ -572,23 +652,24 @@ class BackingAws:
         if self._ports_cache is not None and time.monotonic() - self._ports_cache_at < PORTS_CACHE_TTL:
             return self._ports_cache
         ports: dict[str, int] = {}
-        running = (d for d in BACKINGS if self._rt.status(self._cname(d)) == "running")
-        for d in running:
-            port = self._published_port_or_none(d)
+        for d in BACKINGS:
+            if await self._rt.status(self._cname(d)) != "running":
+                continue
+            port = await self._published_port_or_none(d)
             for kind in d.kinds if port else ():
                 ports[kind] = port
         self._ports_cache = ports
         self._ports_cache_at = time.monotonic()
         return ports
 
-    def gc(self, active_kinds: set[str]) -> None:
+    async def gc(self, active_kinds: set[str]) -> None:
         kinds = frozenset(active_kinds)
         if kinds == self._last_gc_kinds and not self._dirty:
             return  # same kinds, nothing started since the last sweep: zero docker calls
         for d in BACKINGS:
             if set(d.kinds).isdisjoint(active_kinds):
-                self._mesh.stop(self._cname(d))  # its mesh sidecar dies with it
-                self._rt.stop(self._cname(d))  # stop is idempotent on absent names
+                await self._mesh.stop(self._cname(d))  # its mesh sidecar dies with it
+                await self._rt.stop(self._cname(d))  # stop is idempotent on absent names
                 self._ports_cache = None       # a backing may have really stopped
         self._last_gc_kinds = kinds
         self._dirty = False
