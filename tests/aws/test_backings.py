@@ -624,3 +624,90 @@ def test_endpoint_vars_omit_a_backing_whose_port_cannot_be_read(tmp_path, factor
     env = _broken_aws(tmp_path, factory).aws_env()
     assert not [k for k in env if k.startswith("AWS_ENDPOINT_URL_")]
     assert env["AWS_ACCESS_KEY_ID"] == ACCESS_KEY  # creds are still knowable
+
+
+# --- field test 6: WHY a backing is unavailable, from the real docker --------
+#
+# `docker rm -f` racing /apply-full's ensure phase was reproduced for real, and
+# the exception it produced blamed a "gateway_port mismatch between this
+# BackingAws and the container's creator" for a container that had simply been
+# deleted. So the two answers real docker 28.4.0 gives were probed on this
+# machine before this was coded against (honesty rule 1), and these are the
+# transcripts:
+#
+#   $ docker run -d --name c -p 0:80 registry:2 && docker inspect -f '{{json .NetworkSettings.Ports}}' c
+#   {"80/tcp":[{"HostIp":"0.0.0.0","HostPort":"33947"},{"HostIp":"::","HostPort":"33947"}]}   rc=0
+#   $ docker create --name c … ; docker inspect …   ->  {}    rc=0   (State.Status "created")
+#   $ docker run -d … ; docker stop c ; docker inspect …  ->  {}    rc=0   (State.Status "exited")
+#   $ docker rm -f c ; docker inspect …  ->  (empty) "error: no such object: c"   rc=1
+#
+# i.e. an EMPTY port map means the container is not RUNNING; only rc=1 means the
+# runtime could not be asked. Both fixtures below reproduce those exact bytes
+# through the real ColimaRuntime, so the parse and the diagnosis are tested
+# against docker's real contract rather than a fabricated one.
+
+
+class _StateRunner:
+    """Real docker's answers for a container in a given `State.Status`, with the
+    empty port map that goes with every non-running state."""
+
+    def __init__(self, state: str) -> None:
+        self.state = state
+
+    def __call__(self, args, input=None):
+        if "{{.State.Status}}" in args:
+            if self.state == "absent":
+                return _Proc(1, "", f"error: no such object: {args[-1]}")
+            return _Proc(0, self.state)
+        if "{{json .NetworkSettings.Ports}}" in args:
+            return _Proc(0, "{}")
+        return _Proc(0, "")
+
+
+def _aws_with_state(tmp_path, factory, state: str):
+    return BackingAws(ColimaRuntime(runner=_StateRunner(state)), env="applyfix",
+                      root=tmp_path, client_factory=factory)
+
+
+@pytest.mark.parametrize(("state", "expected"), [
+    ("absent", "no container by that name exists"),
+    ("created", "the container was created but never started"),
+    ("exited", "the container exited"),
+    ("running", "gateway_port mismatch"),
+    ("dead", "odin has no reading for that container state"),
+])
+def test_an_unavailable_backing_names_the_state_docker_really_reports(tmp_path, factory, state, expected):
+    """The old message asserted "gateway_port mismatch ... ?" for all of these.
+    It is only true for the RUNNING one -- a container that is running and still
+    publishes nothing on the port this instance wants really is a mismatch --
+    and it is actively misleading for the deleted case, which is the one a real
+    `docker rm -f` produces. A state the map has no entry for says so rather
+    than inheriting the running case's diagnosis."""
+    with pytest.raises(backings.BackingUnavailable) as raised:
+        _aws_with_state(tmp_path, factory, state).client("s3")
+    assert expected in str(raised.value)
+
+
+def test_an_unavailable_backing_carries_the_container_and_state_structurally(tmp_path, factory):
+    """`server.py`'s failure verdict publishes `backing: {container, observed}`
+    in its JSON body. Read off the exception, never scraped back out of its
+    message."""
+    with pytest.raises(backings.BackingUnavailable) as raised:
+        _aws_with_state(tmp_path, factory, "exited").client("s3")
+    assert raised.value.container == "odin-aws-rustfs-applyfix"
+    assert raised.value.observed == "exited"
+    assert "odin-aws-rustfs-applyfix" in str(raised.value)
+
+
+def test_an_unreadable_port_does_not_go_on_to_ask_for_the_state(tmp_path, factory):
+    """The unreadable branch keeps its own reason and asks the runtime nothing
+    else: the runtime has just failed to answer a question, so a second question
+    proves nothing and its failure would replace a real reason with a worse
+    one. `BrokenDockerRunner` answers `running` for the status read, so a
+    `_published_port` that consulted it would append the mismatch diagnosis to a
+    "Cannot connect to the Docker daemon" failure."""
+    with pytest.raises(backings.BackingUnavailable) as raised:
+        _broken_aws(tmp_path, factory).client("s3")
+    assert "Cannot connect to the Docker daemon" in str(raised.value)
+    assert "gateway_port mismatch" not in str(raised.value)
+    assert raised.value.observed == "unreadable"

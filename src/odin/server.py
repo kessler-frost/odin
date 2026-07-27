@@ -29,7 +29,7 @@ from odin.api.canvas import CanvasGraph, create_canvas_router
 from odin.api.debug import create_debug_router
 from odin.api.logs import create_logs_router
 from odin.api.ws import ConnectionManager
-from odin.aws.backings import PROVISIONED, BackingAws
+from odin.aws.backings import PROVISIONED, BackingAws, BackingUnavailable
 from odin.compute.tasks import TaskRuntime
 from odin.fabric.localhost import LocalhostFabric
 from odin.fabric.nebula import mesh_state, reap_orphaned_lighthouses
@@ -70,7 +70,29 @@ _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
 def _is_loopback_origin(value: str) -> bool:
-    return urlparse(value).hostname in _LOOPBACK_HOSTS
+    """Whether `value` names a loopback host — i.e. whether this guard lets the
+    request through.
+
+    `urlparse` RAISES on a malformed authority, which was the cheapest 500 in
+    odin: no credentials, no body, one header. Probed against this Python rather
+    than assumed:
+
+        urlparse('http://[::1').hostname        -> ValueError: Invalid IPv6 URL
+        urlparse('http://a:b').hostname         -> 'a'
+        urlparse('garbage').hostname            -> None
+
+    It ran in a `BaseHTTPMiddleware` ahead of every route, so `curl -X POST -H
+    'Origin: http://[::1' …/apply-full` reached no route at all and still
+    answered `Internal Server Error`.
+
+    An origin odin cannot PARSE is not one it can prove is loopback, so this
+    answers False and the caller gets the same 403 every other cross-origin
+    request gets — fail closed, and never a server error for what is entirely a
+    malformed request."""
+    try:
+        return urlparse(value).hostname in _LOOPBACK_HOSTS
+    except ValueError:  # a malformed authority is not provably loopback
+        return False
 
 
 async def _csrf_guard(request: Request, call_next):
@@ -357,6 +379,121 @@ def _surviving_containers(runtime, env: str) -> list[str]:
     return sorted(name for name in names if name.endswith(f"-{env}") or f"-{env}-" in name)
 
 
+# --- the last line of defence: no odin route may answer with a non-JSON body ---
+#
+# Field test 6. Deleting a backing container while `/apply-full` was booting it
+# (reproduced for real: `docker rm -f odin-aws-rustfs-<env>` racing the ensure
+# phase) let `BackingUnavailable` out of the route unhandled, and Starlette
+# answered `HTTP 500` with the five plain-text words `Internal Server Error`.
+# The CLI's own honest fallback then printed
+#
+#     odin server returned HTTP 500 with a non-JSON body: Internal Server Error
+#
+# -- a traceback where a verdict belongs, naming neither the container that went
+# missing nor anything the user could act on.
+#
+# Fixed as a SHAPE, not as one `except` in one route, because it was never one
+# route: `reclaim_env_instances` (`ReclaimFailed`), `ensure_instance_mesh`
+# (`MeshRefreshFailed`) and the trailing `reconciler.tick()` of all three apply
+# routes could each do the same thing, and `/destroy`'s own comment already
+# CLAIMED `ReclaimFailed` produced "500 with the VM names" when the VM names only
+# ever reached the server log. This is `_DESTROY_STATUS`'s lesson applied one
+# level up: the verdict is DERIVED from the exception type through a map, and an
+# exception with no entry falls through to `_UNEXPECTED` -- which is a failure.
+# A new way for a route to blow up is therefore reported as a failure, in JSON,
+# naming the real exception, by default.
+#
+# What this deliberately does NOT do is say what was or was not committed. A
+# `BackingUnavailable` from the ensure phase happens before any store write; the
+# identical exception from the trailing `tick()` happens after it. Nothing here
+# can tell those apart, so it names the witnesses to consult instead of guessing
+# -- the same rule that makes `/destroy` report `still_standing` rather than a
+# reassurance.
+
+
+class _Verdict(BaseModel):
+    model_config = {"frozen": True}
+    status: str
+    code: int
+    advice: str
+
+
+_BACKING_ADVICE = (
+    "the backing container named above is not serving this env. Re-run Apply "
+    "(`odin apply --env {env}`): odin re-creates a missing or stopped backing on every "
+    "apply. Nothing in this response is a claim about what was applied before it failed "
+    "-- check `odin world --env {env}` and `odin tf plan --env {env}` before retrying"
+)
+_UNEXPECTED_ADVICE = (
+    "odin has no specific verdict for that failure, so this is reported as a plain "
+    "FAILURE -- nothing here verified otherwise. The server log has the full traceback. "
+    "Check `odin world --env {env}` and `odin tf plan --env {env}` for what env {env!r} "
+    "actually holds before re-applying"
+)
+# Deliberately NOT "this is an odin bug": the biggest population here is a
+# backing container that never became ready (`BackingAws._await_ready` raises a
+# plain RuntimeError carrying the container's own log tail), which is an
+# environment failure and not odin's fault. Claiming a cause odin has not
+# established is the exact habit these rules exist to break.
+
+# 503 for the backing case (a real service-unavailable condition, the same
+# vocabulary the gateway's own `backing_unavailable` event uses); 500 for the
+# two "odin tried and could not finish" reclaim/mesh failures and for anything
+# unmapped.
+_EXCEPTION_VERDICTS: dict[type[BaseException], _Verdict] = {
+    BackingUnavailable: _Verdict(status="backing_unavailable", code=503, advice=_BACKING_ADVICE),
+    # Both of these already name what is standing and what fixes it in their
+    # OWN message (`ec2compute.reclaim_env_instances` /
+    # `ensure_instance_mesh`), which is why the advice here adds the one thing
+    # they cannot know: that the request as a whole did not complete. Before
+    # this map they raised into the bare-text 500 -- and `/destroy`'s comment
+    # said `ReclaimFailed` produced "500 with the VM names" while the VM names
+    # only ever reached the server log.
+    ec2compute.ReclaimFailed: _Verdict(
+        status="reclaim_failed", code=500,
+        advice="the env's desired state was left as it was, so the retry above picks up exactly here",
+    ),
+    ec2compute.MeshRefreshFailed: _Verdict(
+        status="mesh_refresh_failed", code=500,
+        advice=(
+            "the firewall on the wire is NOT the one drawn on the canvas until this succeeds, and "
+            "the rest of this apply did not finish"
+        ),
+    ),
+}
+_UNEXPECTED = _Verdict(status="server_error", code=500, advice=_UNEXPECTED_ADVICE)
+
+
+def _failure_body(request: Request, exc: Exception) -> tuple[int, dict]:
+    """The JSON verdict for an exception that reached the ASGI boundary.
+
+    Pure string building on purpose -- no disk, no docker, no store. This is
+    the handler of last resort; an exception raised INSIDE it would put the
+    bare "Internal Server Error" straight back."""
+    verdict = _EXCEPTION_VERDICTS.get(type(exc), _UNEXPECTED)
+    env = request.query_params.get("env") or ENV
+    body = {
+        "status": verdict.status,
+        "env": env,
+        "error": (
+            f"{request.method} {request.url.path} did not complete for env {env!r} -- "
+            f"{type(exc).__name__}: {exc}. {verdict.advice.format(env=env)}"
+        ),
+    }
+    # Structured, not scraped out of `error`: the container name and the state
+    # odin really observed ride on the exception itself (aws/backings.py).
+    container = getattr(exc, "container", "")
+    if container:
+        body["backing"] = {"container": container, "observed": getattr(exc, "observed", "")}
+    return verdict.code, body
+
+
+async def _unhandled_failure(request: Request, exc: Exception) -> JSONResponse:
+    code, body = _failure_body(request, exc)
+    log.error("%s %s failed: %s", request.method, request.url.path, body["error"])
+    return JSONResponse(status_code=code, content=body)
+
+
 # --- `/destroy`: outcome -> status, the ONE place the status is decided ---
 #
 # Field test 5 (HIGH). The route no longer initialises `status` optimistically
@@ -594,7 +731,11 @@ def create_apply_router(
             # state is empty, so `tofu destroy` honestly destroys nothing and
             # reports success. Destroy is unambiguous about intent, so it
             # reclaims them directly; if it CANNOT, it refuses to say
-            # `destroyed` (`ReclaimFailed` -> 500 with the VM names).
+            # `destroyed` (`ReclaimFailed`). That claim was HALF true until
+            # field test 6: the exception escaped this route unhandled, so the
+            # VM names reached the server log and the caller got the bare text
+            # `Internal Server Error`. `_EXCEPTION_VERDICTS` is what actually
+            # puts them in a 500 JSON body now.
             reclaimed = await asyncio.to_thread(ec2compute.reclaim_env_instances, stores, env)
             if reclaimed:
                 body["reclaimed_vms"] = reclaimed
@@ -714,7 +855,18 @@ class ImportTfRequest(BaseModel):
 
 def _saved_canvas(path: Path) -> dict:
     """The canvas currently on disk (`GET /canvas`'s own source), or an empty
-    one. Never raises: a plan must not fail because nobody has drawn yet."""
+    one when nobody has drawn yet — a plan must not fail for that.
+
+    It does NOT swallow a canvas that is on disk and unparseable, and the
+    docstring used to claim "never raises" for both. `GET /canvas` returns this
+    file verbatim and never re-validates it (api/canvas.py), so a hand-edited or
+    truncated `.odin/canvas.json` is a supported state, and `json.loads` raises
+    on it. Left raising deliberately: `skipped`/`canvas_drift` describe THIS
+    file, and quietly reporting a corrupt canvas as an empty one would make
+    `/tf/plan` say the saved canvas differs from the applied Stack for a reason
+    that is not the real one. `_unhandled_failure` now turns it into a JSON
+    failure naming the parse error and the byte offset, which is the actionable
+    answer; before, it was a bare `Internal Server Error`."""
     return json.loads(path.read_text()) if path.is_file() else {}
 
 
@@ -1534,6 +1686,12 @@ def create_app(
             store_lock.release()
 
     app = FastAPI(title="odin", version=odin_version(), lifespan=lifespan)
+    # Registered on EVERY app this factory builds (there is only one place an
+    # app is built, which is what makes this reach every route including the
+    # ones added later) -- see `_unhandled_failure`. Starlette still re-raises
+    # after the response is sent, so uvicorn logs the full traceback exactly as
+    # it did before; the difference is only in what the CALLER receives.
+    app.add_exception_handler(Exception, _unhandled_failure)
     app.middleware("http")(_csrf_guard)
     # The saved canvas belongs to the STORE, not to the process's cwd: in
     # production `_store.root` IS `.odin`, so this is the same

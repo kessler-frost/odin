@@ -37,9 +37,22 @@ from odin.util import private_mkdir
 
 
 class BackingUnavailable(RuntimeError):
-    """A backing container isn't publishing the expected port (gone, or a
-    gateway_port mismatch with its creator). Loud by default; best-effort
-    paths (deprovision) catch it explicitly."""
+    """A backing container isn't publishing the expected port (gone, stopped,
+    or a gateway_port mismatch with its creator). Loud by default; best-effort
+    paths (deprovision) catch it explicitly.
+
+    Carries the CONTAINER NAME and the container state odin actually observed
+    as structured attributes, not only inside the message: `/apply-full`'s
+    failure verdict (server.py::_EXCEPTION_VERDICTS) names them in its JSON
+    body, and a field parsed back out of a message string is the regex trap
+    this repo's conventions forbid. Both default to "" so the one-argument
+    construction every existing caller/test uses still works.
+    """
+
+    def __init__(self, message: str, container: str = "", observed: str = "") -> None:
+        super().__init__(message)
+        self.container = container
+        self.observed = observed
 
 
 PROVISIONED = ("s3", "sqs", "sns", "dynamodb")
@@ -134,6 +147,36 @@ Local:
 _PROBES = {"s3": "list_buckets", "sqs": "list_queues",
            "sns": "list_topics", "dynamodb": "list_tables"}
 
+# What a container's OBSERVED STATE means when the runtime answered the
+# port-map read and the answer was "nothing published here". Probed against
+# the real docker (28.4.0) on this machine rather than assumed -- honesty
+# rule 1, and the assumption it corrects was live:
+#
+#   running, -p 0:80   {"80/tcp":[{"HostIp":"0.0.0.0","HostPort":"33947"}]} rc=0
+#   created            {}                                                  rc=0
+#   exited             {}                                                  rc=0
+#   force-removed      (empty)  error: no such object: <name>              rc=1
+#
+# So an EMPTY port map is not evidence of a port mismatch -- it is evidence
+# the container is not running. The old message asserted "gateway_port
+# mismatch ... ?" for all three, and a real `docker rm -f` mid-apply (the
+# reproduced /apply-full race) hit exactly this branch and was told to go
+# looking for a port mismatch that did not exist. Anything this map has no
+# entry for falls through to `_UNKNOWN_STATE` -- a state odin has no reading
+# for says so instead of inheriting the running case's diagnosis.
+_STATE_MEANING = {
+    "absent": "no container by that name exists (it was deleted, or was never created)",
+    "created": "the container was created but never started",
+    "exited": "the container exited",
+    "paused": "the container is paused",
+    "restarting": "the container is restarting",
+    "running": (
+        "the container IS running, so this is a gateway_port mismatch between this "
+        "BackingAws and whatever created the container"
+    ),
+}
+_UNKNOWN_STATE = "odin has no reading for that container state"
+
 
 class BackingAws:
     def __init__(self, runtime, env: str = "default", root: Path = Path(".odin"),
@@ -209,16 +252,30 @@ class BackingAws:
         exception saying why not -- "nothing published on that inside-port" (a
         goaws whose creator used a different gateway port, or no container at
         all) and "the runtime could not be asked" (`PortUnreadable`) are both
-        the second, carrying their own real reason. Never 0."""
+        the second, carrying their own real reason. Never 0.
+
+        Each branch says only what it KNOWS. The unreadable branch does not go
+        on to ask for the container's state: the runtime just failed to answer a
+        question, so a second question to the same runtime proves nothing and
+        its own failure would replace a real reason with a worse one. The
+        empty-map branch DOES ask, because there the runtime answered and the
+        state is the whole diagnosis (see `_STATE_MEANING`) -- one extra docker
+        call, only ever on a path that is already failing."""
         cname, inside = self._cname(d), self._listen_port(d)
         try:
             port = self._rt.host_port(cname, inside)
         except PortUnreadable as exc:
-            raise BackingUnavailable(str(exc)) from exc
-        if not port:
             raise BackingUnavailable(
-                f"{cname} publishes no port {inside} — "
-                f"gateway_port mismatch between this BackingAws and the container's creator?"
+                f"the {'/'.join(d.kinds)} backing container {cname} is unavailable: {exc}",
+                container=cname, observed="unreadable",
+            ) from exc
+        if not port:
+            observed = self._rt.status(cname)
+            raise BackingUnavailable(
+                f"the {'/'.join(d.kinds)} backing container {cname} is unavailable: it publishes "
+                f"no port {inside}, and the container runtime reports its state as {observed!r} "
+                f"-- {_STATE_MEANING.get(observed, _UNKNOWN_STATE)}",
+                container=cname, observed=observed,
             )
         return port
 
