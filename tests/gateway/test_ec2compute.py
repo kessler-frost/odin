@@ -12,8 +12,8 @@ V3d's integration test is the only one that boots anything real.
 """
 from __future__ import annotations
 
+import asyncio
 import json
-import threading
 import time
 from pathlib import Path
 
@@ -36,11 +36,39 @@ _SESSION = botocore.session.get_session()
 ENV = "default"
 
 
+async def _fired(event: asyncio.Event, timeout: float) -> bool:
+    """`threading.Event.wait(timeout)`'s exact semantics on an `asyncio.Event`
+    (v0.7.7): True if it was set inside the window, False if the window ran
+    out -- never an exception, because the gated fakes below rely on falling
+    through a lapsed wait exactly as the threading version did."""
+    try:
+        await asyncio.wait_for(event.wait(), timeout)
+    except TimeoutError:
+        return False
+    return True
+
+
+async def _wait_for_boot_call(vm, count: int = 1, timeout: float = 2.0) -> None:
+    """Wait for the background boot task to have really called `vm.boot`.
+
+    `background()` (gateway/models) hands the boot to an `asyncio.Task` that
+    cannot run until the awaiting test yields, where the daemon thread it
+    replaced could run the moment RunInstances returned. Every assertion below
+    that reads `vm.booted` without first waiting for a STATE used to observe
+    that thread by luck; this observes the task by construction, and fails
+    loudly (never vacuously) if the effect never lands."""
+    deadline = time.monotonic() + timeout
+    while len(vm.booted) < count:
+        assert time.monotonic() < deadline, f"the boot task never called vm.boot ({len(vm.booted)}/{count})"
+        await asyncio.sleep(0)
+
+
 class FakeInstanceVm:
-    """The InstanceVm shape (`boot`/`stop`/`start`/`delete`) with no
-    subprocess/VM involved -- deterministic and near-instant, so the
-    background-thread state transitions ec2compute.py spawns can be
-    observed with a short poll instead of a real boot's ~30-60s."""
+    """The InstanceVm shape (`boot`/`stop`/`start`/`delete`, every one of them
+    a coroutine like the real class) with no subprocess/VM involved --
+    deterministic and near-instant, so the background-task state transitions
+    ec2compute.py spawns can be observed with a short poll instead of a real
+    boot's ~30-60s."""
 
     def __init__(self, ip: str = "192.168.64.10", fail_boot: bool = False, fail_start: bool = False) -> None:
         self.ip = ip
@@ -51,22 +79,22 @@ class FakeInstanceVm:
         self.started: list[str] = []
         self.deleted: list[str] = []
 
-    def boot(self, name, vm_config, *, hostname, ssh_pubkey=None, user_data=None, nebula=None, timeout=300.0, env_vars=None):
+    async def boot(self, name, vm_config, *, hostname, ssh_pubkey=None, user_data=None, nebula=None, timeout=300.0, env_vars=None):
         self.booted.append((name, hostname, ssh_pubkey, user_data, nebula, env_vars))
         if self.fail_boot:
             raise RuntimeError("boot failed")
         return self.ip
 
-    def stop(self, name):
+    async def stop(self, name):
         self.stopped.append(name)
 
-    def start(self, name, timeout=300.0):
+    async def start(self, name, timeout=300.0):
         self.started.append(name)
         if self.fail_start:
             raise RuntimeError("start failed")
         return self.ip
 
-    def delete(self, name):
+    async def delete(self, name):
         self.deleted.append(name)
 
 
@@ -75,23 +103,29 @@ class GatedDeleteInstanceVm(FakeInstanceVm):
     lets a test deterministically observe the "delete failed, waiting for a
     retry" window instead of racing a near-instant fake delete against its
     own retry (release finding #4's honesty fix). The FIRST attempt raises
-    once released; every attempt after that succeeds once released."""
+    once released; every attempt after that succeeds once released.
+
+    The gates are `asyncio.Event`s now that the delete runs on a task rather
+    than a thread, and the window they hold open is the same one: the task
+    parks inside `vm.delete` until the test releases it, so `shutting-down +
+    a recorded reason` is a state the test genuinely observes rather than
+    races."""
 
     def __init__(self, ip: str = "192.168.64.10") -> None:
         super().__init__(ip=ip)
         self.delete_attempts = 0
-        self.first_delete_blocked = threading.Event()
-        self.release_first_delete = threading.Event()
-        self.release_retry = threading.Event()
+        self.first_delete_blocked = asyncio.Event()
+        self.release_first_delete = asyncio.Event()
+        self.release_retry = asyncio.Event()
 
-    def delete(self, name):
+    async def delete(self, name):
         self.delete_attempts += 1
         if self.delete_attempts == 1:
             self.first_delete_blocked.set()
-            self.release_first_delete.wait(timeout=5.0)
+            await _fired(self.release_first_delete, 5.0)
             self.deleted.append(name)
             raise RuntimeError("delete failed")
-        self.release_retry.wait(timeout=5.0)
+        await _fired(self.release_retry, 5.0)
         self.deleted.append(name)
 
 
@@ -102,13 +136,13 @@ class SlowBootInstanceVm(FakeInstanceVm):
 
     def __init__(self, ip: str = "192.168.64.10") -> None:
         super().__init__(ip=ip)
-        self.release = threading.Event()
-        self.boot_started = threading.Event()
+        self.release = asyncio.Event()
+        self.boot_started = asyncio.Event()
 
-    def boot(self, name, vm_config, *, hostname, ssh_pubkey=None, user_data=None, nebula=None, timeout=300.0, env_vars=None):
+    async def boot(self, name, vm_config, *, hostname, ssh_pubkey=None, user_data=None, nebula=None, timeout=300.0, env_vars=None):
         self.boot_started.set()
-        self.release.wait(timeout=5.0)
-        return super().boot(name, vm_config, hostname=hostname, ssh_pubkey=ssh_pubkey, user_data=user_data, nebula=nebula, timeout=timeout, env_vars=env_vars)
+        await _fired(self.release, 5.0)
+        return await super().boot(name, vm_config, hostname=hostname, ssh_pubkey=ssh_pubkey, user_data=user_data, nebula=nebula, timeout=timeout, env_vars=env_vars)
 
 
 def _parse(operation: str, response: Response, *, error: bool = False):
@@ -127,12 +161,12 @@ def stores(tmp_path: Path) -> SynthStores:
     return SynthStores(tmp_path)
 
 
-def _answer(stores, req, vm=None, keystore=None, gateway_port=None) -> Response:
+async def _answer(stores, req, vm=None, keystore=None, gateway_port=None) -> Response:
     path, query = split_url(req.url)
     classified = classify("ec2", req.method, path, query, req.headers, req.body)
     assert classified is not None, "an EC2 request must never be unmappable"
     action, resource = classified
-    response = ec2compute.pure_answer(
+    response = await ec2compute.pure_answer(
         action, resource, ENV, req.body, stores, time.monotonic(), vm,
         keystore=keystore, gateway_port=gateway_port,
     )
@@ -140,58 +174,58 @@ def _answer(stores, req, vm=None, keystore=None, gateway_port=None) -> Response:
     return response
 
 
-def _create_vpc(stores, sink, ec2) -> str:
+async def _create_vpc(stores, sink, ec2) -> str:
     req = sink.call(lambda: ec2.create_vpc(CidrBlock="10.0.0.0/16"))
-    return _parse("CreateVpc", _answer(stores, req))["Vpc"]["VpcId"]
+    return _parse("CreateVpc", await _answer(stores, req))["Vpc"]["VpcId"]
 
 
-def _create_subnet(stores, sink, ec2, vpc_id: str) -> str:
+async def _create_subnet(stores, sink, ec2, vpc_id: str) -> str:
     req = sink.call(lambda: ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.0.1.0/24"))
-    return _parse("CreateSubnet", _answer(stores, req))["Subnet"]["SubnetId"]
+    return _parse("CreateSubnet", await _answer(stores, req))["Subnet"]["SubnetId"]
 
 
-def _subnet(stores, sink, ec2) -> str:
-    return _create_subnet(stores, sink, ec2, _create_vpc(stores, sink, ec2))
+async def _subnet(stores, sink, ec2) -> str:
+    return await _create_subnet(stores, sink, ec2, await _create_vpc(stores, sink, ec2))
 
 
-def _create_sg(stores, sink, ec2, vpc_id: str, name: str = "web") -> str:
+async def _create_sg(stores, sink, ec2, vpc_id: str, name: str = "web") -> str:
     req = sink.call(lambda: ec2.create_security_group(GroupName=name, Description=name, VpcId=vpc_id))
-    return _parse("CreateSecurityGroup", _answer(stores, req))["GroupId"]
+    return _parse("CreateSecurityGroup", await _answer(stores, req))["GroupId"]
 
 
-def _run_instance(stores, sink, ec2, vm, *, keystore=None, gateway_port=None, **kwargs) -> dict:
+async def _run_instance(stores, sink, ec2, vm, *, keystore=None, gateway_port=None, **kwargs) -> dict:
     req = sink.call(lambda: ec2.run_instances(MinCount=1, MaxCount=1, **kwargs))
-    return _parse("RunInstances", _answer(stores, req, vm, keystore=keystore, gateway_port=gateway_port))
+    return _parse("RunInstances", await _answer(stores, req, vm, keystore=keystore, gateway_port=gateway_port))
 
 
-def _wait_for_state(stores, sink, ec2, instance_id: str, want: str, vm, timeout: float = 2.0) -> dict:
+async def _wait_for_state(stores, sink, ec2, instance_id: str, want: str, vm, timeout: float = 2.0) -> dict:
     deadline = time.monotonic() + timeout
     last = None
     while time.monotonic() < deadline:
         req = sink.call(lambda: ec2.describe_instances(InstanceIds=[instance_id]))
-        parsed = _parse("DescribeInstances", _answer(stores, req, vm))
+        parsed = _parse("DescribeInstances", await _answer(stores, req, vm))
         instance = parsed["Reservations"][0]["Instances"][0]
         last = instance["State"]["Name"]
         if last == want:
             return instance
-        time.sleep(0.02)
+        await asyncio.sleep(0.02)
     raise AssertionError(f"instance {instance_id} never reached {want!r} (last seen {last!r})")
 
 
 # --- RunInstances / DescribeInstances ----------------------------------------
 
 
-def test_run_instances_starts_pending_and_boots_to_running(sink, ec2, stores):
-    subnet_id = _subnet(stores, sink, ec2)
+async def test_run_instances_starts_pending_and_boots_to_running(sink, ec2, stores):
+    subnet_id = await _subnet(stores, sink, ec2)
     vm = FakeInstanceVm(ip="192.168.64.42")
-    result = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, ImageId="ami-test", InstanceType="t3.small")
+    result = await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, ImageId="ami-test", InstanceType="t3.small")
     instance = result["Instances"][0]
     assert instance["State"]["Name"] == "pending"
     assert instance["InstanceType"] == "t3.small"
     instance_id = instance["InstanceId"]
     assert instance_id.startswith("i-")
 
-    running = _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+    running = await _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
     assert running["PrivateIpAddress"] == "192.168.64.42"
     assert running["PublicIpAddress"] == "192.168.64.42"
     assert running["SubnetId"] == subnet_id
@@ -199,23 +233,23 @@ def test_run_instances_starts_pending_and_boots_to_running(sink, ec2, stores):
     assert vm.booted[0][0].startswith(f"odin-ec2-{ENV}-{instance_id}")
 
 
-def test_run_instances_reflects_security_groups_on_the_primary_eni(sink, ec2, stores):
+async def test_run_instances_reflects_security_groups_on_the_primary_eni(sink, ec2, stores):
     """Field-test finding #2: an instance launched with SecurityGroupIds must
     report them on a PRIMARY network interface so the TF provider reads
     `vpc_security_group_ids` with zero drift on re-apply. Before this the model
     ignored them -> the provider saw a changed group set with no primary NI to
     modify and errored 'does not contain a primary network interface'."""
-    vpc_id = _create_vpc(stores, sink, ec2)
-    subnet_id = _create_subnet(stores, sink, ec2, vpc_id)
-    sg_id = _create_sg(stores, sink, ec2, vpc_id, name="web-sg")
+    vpc_id = await _create_vpc(stores, sink, ec2)
+    subnet_id = await _create_subnet(stores, sink, ec2, vpc_id)
+    sg_id = await _create_sg(stores, sink, ec2, vpc_id, name="web-sg")
 
     vm = FakeInstanceVm()
-    result = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, SecurityGroupIds=[sg_id])
+    result = await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, SecurityGroupIds=[sg_id])
     instance_id = result["Instances"][0]["InstanceId"]
     assert stores.ec2compute.get(ENV, f"instance:{instance_id}")["security_group_ids"] == [sg_id]
 
     req = sink.call(lambda: ec2.describe_instances(InstanceIds=[instance_id]))
-    instance = _parse("DescribeInstances", _answer(stores, req, vm))["Reservations"][0]["Instances"][0]
+    instance = _parse("DescribeInstances", await _answer(stores, req, vm))["Reservations"][0]["Instances"][0]
     assert [g["GroupId"] for g in instance["SecurityGroups"]] == [sg_id]
     (eni,) = instance["NetworkInterfaces"]
     assert eni["Attachment"]["DeviceIndex"] == 0
@@ -223,82 +257,82 @@ def test_run_instances_reflects_security_groups_on_the_primary_eni(sink, ec2, st
     assert eni["Groups"][0]["GroupName"] == "web-sg"
 
 
-def test_run_instances_without_security_groups_has_no_primary_eni(sink, ec2, stores):
+async def test_run_instances_without_security_groups_has_no_primary_eni(sink, ec2, stores):
     """The no-SG path is byte-for-byte the pre-finding-#2 shape: no groupSet, no
     networkInterfaceSet -- the provider reads `vpc_security_group_ids` as an
     empty computed value (no drift), which is why the existing no-SG e2e stays
     zero-drift."""
-    subnet_id = _subnet(stores, sink, ec2)
+    subnet_id = await _subnet(stores, sink, ec2)
     vm = FakeInstanceVm()
-    instance_id = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)["Instances"][0]["InstanceId"]
+    instance_id = (await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id))["Instances"][0]["InstanceId"]
     req = sink.call(lambda: ec2.describe_instances(InstanceIds=[instance_id]))
-    instance = _parse("DescribeInstances", _answer(stores, req, vm))["Reservations"][0]["Instances"][0]
+    instance = _parse("DescribeInstances", await _answer(stores, req, vm))["Reservations"][0]["Instances"][0]
     assert instance.get("SecurityGroups", []) == []
     assert instance.get("NetworkInterfaces", []) == []
 
 
-def test_modify_instance_attribute_updates_the_security_group_set(sink, ec2, stores):
+async def test_modify_instance_attribute_updates_the_security_group_set(sink, ec2, stores):
     """The in-place security-group change path (finding #2): ModifyInstanceAttribute
     with a new GroupId set updates the stored membership so the next describe --
     and a re-apply -- reflect it."""
-    vpc_id = _create_vpc(stores, sink, ec2)
-    subnet_id = _create_subnet(stores, sink, ec2, vpc_id)
-    sg1 = _create_sg(stores, sink, ec2, vpc_id, name="sg-a")
-    sg2 = _create_sg(stores, sink, ec2, vpc_id, name="sg-b")
+    vpc_id = await _create_vpc(stores, sink, ec2)
+    subnet_id = await _create_subnet(stores, sink, ec2, vpc_id)
+    sg1 = await _create_sg(stores, sink, ec2, vpc_id, name="sg-a")
+    sg2 = await _create_sg(stores, sink, ec2, vpc_id, name="sg-b")
     vm = FakeInstanceVm()
-    instance_id = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, SecurityGroupIds=[sg1])["Instances"][0]["InstanceId"]
+    instance_id = (await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, SecurityGroupIds=[sg1]))["Instances"][0]["InstanceId"]
 
     req = sink.call(lambda: ec2.modify_instance_attribute(InstanceId=instance_id, Groups=[sg2]))
-    assert _answer(stores, req, vm).status_code == 200
+    assert (await _answer(stores, req, vm)).status_code == 200
     assert stores.ec2compute.get(ENV, f"instance:{instance_id}")["security_group_ids"] == [sg2]
 
 
-def test_run_instances_default_instance_type_and_ami(sink, ec2, stores):
-    subnet_id = _subnet(stores, sink, ec2)
+async def test_run_instances_default_instance_type_and_ami(sink, ec2, stores):
+    subnet_id = await _subnet(stores, sink, ec2)
     vm = FakeInstanceVm()
-    result = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)
+    result = await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)
     instance = result["Instances"][0]
     assert instance["InstanceType"] == "t3.micro"
     assert instance["ImageId"]
 
 
-def test_run_instances_unknown_subnet_is_not_found(sink, ec2, stores):
+async def test_run_instances_unknown_subnet_is_not_found(sink, ec2, stores):
     req = sink.call(lambda: ec2.run_instances(MinCount=1, MaxCount=1, SubnetId="subnet-00000000000000000"))
-    response = _answer(stores, req, FakeInstanceVm())
+    response = await _answer(stores, req, FakeInstanceVm())
     assert response.status_code == 400
     parsed = _parse("RunInstances", response, error=True)
     assert parsed["Error"]["Code"] == "InvalidSubnetID.NotFound"
 
 
-def test_run_instances_unknown_key_pair_is_not_found(sink, ec2, stores):
-    subnet_id = _subnet(stores, sink, ec2)
+async def test_run_instances_unknown_key_pair_is_not_found(sink, ec2, stores):
+    subnet_id = await _subnet(stores, sink, ec2)
     req = sink.call(lambda: ec2.run_instances(MinCount=1, MaxCount=1, SubnetId=subnet_id, KeyName="ghost"))
-    response = _answer(stores, req, FakeInstanceVm())
+    response = await _answer(stores, req, FakeInstanceVm())
     assert response.status_code == 400
     parsed = _parse("RunInstances", response, error=True)
     assert parsed["Error"]["Code"] == "InvalidKeyPair.NotFound"
 
 
-def test_run_instances_boot_failure_lands_terminated_with_state_reason(sink, ec2, stores):
-    subnet_id = _subnet(stores, sink, ec2)
+async def test_run_instances_boot_failure_lands_terminated_with_state_reason(sink, ec2, stores):
+    subnet_id = await _subnet(stores, sink, ec2)
     vm = FakeInstanceVm(fail_boot=True)
-    result = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)
+    result = await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)
     instance_id = result["Instances"][0]["InstanceId"]
 
-    terminated = _wait_for_state(stores, sink, ec2, instance_id, "terminated", vm)
+    terminated = await _wait_for_state(stores, sink, ec2, instance_id, "terminated", vm)
     # The class rides along with the message (`_exc_text`) -- so a boot failure
     # whose exception carries NO message still names something real.
     assert terminated["StateReason"]["Message"] == "RuntimeError: boot failed"
 
 
-def test_describe_instances_filters_by_state_and_vpc(sink, ec2, stores):
-    subnet_id = _subnet(stores, sink, ec2)
+async def test_describe_instances_filters_by_state_and_vpc(sink, ec2, stores):
+    subnet_id = await _subnet(stores, sink, ec2)
     vm = FakeInstanceVm()
-    a = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)["Instances"][0]
-    _wait_for_state(stores, sink, ec2, a["InstanceId"], "running", vm)
+    a = (await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id))["Instances"][0]
+    await _wait_for_state(stores, sink, ec2, a["InstanceId"], "running", vm)
 
     req = sink.call(lambda: ec2.describe_instances(Filters=[{"Name": "instance-state-name", "Values": ["running"]}]))
-    parsed = _parse("DescribeInstances", _answer(stores, req, vm))
+    parsed = _parse("DescribeInstances", await _answer(stores, req, vm))
     ids = {i["InstanceId"] for r in parsed["Reservations"] for i in r["Instances"]}
     assert a["InstanceId"] in ids
 
@@ -306,20 +340,20 @@ def test_describe_instances_filters_by_state_and_vpc(sink, ec2, stores):
 # --- workload identity injection (fix-wave 2b finding #2) ----------------------
 
 
-def test_run_instances_with_odin_node_tag_injects_workload_env(sink, ec2, stores, tmp_path):
+async def test_run_instances_with_odin_node_tag_injects_workload_env(sink, ec2, stores, tmp_path):
     """An instance tagged `odin:node=<label>` (agent/hcl.py stamps this on
     every canvas-node-backed resource) boots with the four AWS-SDK env vars
     from `workload_env` -- the keystore identity issued for that label --
     baked into its cloud-init, so the VM can call the gateway AS ITSELF."""
     keystore = KeyStore(tmp_path)
-    subnet_id = _subnet(stores, sink, ec2)
+    subnet_id = await _subnet(stores, sink, ec2)
     vm = FakeInstanceVm()
-    instance_id = _run_instance(
+    instance_id = (await _run_instance(
         stores, sink, ec2, vm, keystore=keystore, gateway_port=4266,
         SubnetId=subnet_id,
         TagSpecifications=[{"ResourceType": "instance", "Tags": [{"Key": "odin:node", "Value": "myserver"}]}],
-    )["Instances"][0]["InstanceId"]
-    _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+    ))["Instances"][0]["InstanceId"]
+    await _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
 
     env_vars = vm.booted[0][5]
     assert set(env_vars) == {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_ENDPOINT_URL", "AWS_DEFAULT_REGION"}
@@ -329,79 +363,79 @@ def test_run_instances_with_odin_node_tag_injects_workload_env(sink, ec2, stores
     assert env_vars["AWS_ENDPOINT_URL"].endswith(":4266")
 
 
-def test_run_instances_with_keystore_but_no_odin_node_tag_boots_without_env_vars(sink, ec2, stores, tmp_path):
+async def test_run_instances_with_keystore_but_no_odin_node_tag_boots_without_env_vars(sink, ec2, stores, tmp_path):
     keystore = KeyStore(tmp_path)
-    subnet_id = _subnet(stores, sink, ec2)
+    subnet_id = await _subnet(stores, sink, ec2)
     vm = FakeInstanceVm()
-    instance_id = _run_instance(
+    instance_id = (await _run_instance(
         stores, sink, ec2, vm, keystore=keystore, gateway_port=4266, SubnetId=subnet_id,
-    )["Instances"][0]["InstanceId"]
-    _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+    ))["Instances"][0]["InstanceId"]
+    await _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
     assert vm.booted[0][5] is None
 
 
-def test_run_instances_without_keystore_boots_without_env_vars(sink, ec2, stores):
+async def test_run_instances_without_keystore_boots_without_env_vars(sink, ec2, stores):
     """Regression: today's callers that pass no keystore/gateway_port get
     exactly the old behavior -- no env vars injected."""
-    subnet_id = _subnet(stores, sink, ec2)
+    subnet_id = await _subnet(stores, sink, ec2)
     vm = FakeInstanceVm()
-    instance_id = _run_instance(
+    instance_id = (await _run_instance(
         stores, sink, ec2, vm, SubnetId=subnet_id,
         TagSpecifications=[{"ResourceType": "instance", "Tags": [{"Key": "odin:node", "Value": "myserver"}]}],
-    )["Instances"][0]["InstanceId"]
-    _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+    ))["Instances"][0]["InstanceId"]
+    await _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
     assert vm.booted[0][5] is None
 
 
 # --- Stop / Start / Terminate -------------------------------------------------
 
 
-def test_stop_then_start_round_trips_through_the_vm(sink, ec2, stores):
-    subnet_id = _subnet(stores, sink, ec2)
+async def test_stop_then_start_round_trips_through_the_vm(sink, ec2, stores):
+    subnet_id = await _subnet(stores, sink, ec2)
     vm = FakeInstanceVm(ip="192.168.64.7")
-    instance_id = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)["Instances"][0]["InstanceId"]
-    _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+    instance_id = (await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id))["Instances"][0]["InstanceId"]
+    await _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
 
     stop_req = sink.call(lambda: ec2.stop_instances(InstanceIds=[instance_id]))
-    stop_parsed = _parse("StopInstances", _answer(stores, stop_req, vm))
+    stop_parsed = _parse("StopInstances", await _answer(stores, stop_req, vm))
     assert stop_parsed["StoppingInstances"][0]["CurrentState"]["Name"] == "stopping"
-    stopped = _wait_for_state(stores, sink, ec2, instance_id, "stopped", vm)
+    stopped = await _wait_for_state(stores, sink, ec2, instance_id, "stopped", vm)
     assert stopped.get("PrivateIpAddress") is None
     assert vm.stopped == [f"odin-ec2-{ENV}-{instance_id}"]
 
     start_req = sink.call(lambda: ec2.start_instances(InstanceIds=[instance_id]))
-    _answer(stores, start_req, vm)
-    running = _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+    await _answer(stores, start_req, vm)
+    running = await _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
     assert running["PrivateIpAddress"] == "192.168.64.7"
 
 
-def test_terminate_transitions_then_sweeps_after_grace_window(sink, ec2, stores):
-    subnet_id = _subnet(stores, sink, ec2)
+async def test_terminate_transitions_then_sweeps_after_grace_window(sink, ec2, stores):
+    subnet_id = await _subnet(stores, sink, ec2)
     vm = FakeInstanceVm()
-    instance_id = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)["Instances"][0]["InstanceId"]
-    _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+    instance_id = (await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id))["Instances"][0]["InstanceId"]
+    await _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
 
     term_req = sink.call(lambda: ec2.terminate_instances(InstanceIds=[instance_id]))
-    term_parsed = _parse("TerminateInstances", _answer(stores, term_req, vm))
+    term_parsed = _parse("TerminateInstances", await _answer(stores, term_req, vm))
     assert term_parsed["TerminatingInstances"][0]["CurrentState"]["Name"] == "shutting-down"
-    _wait_for_state(stores, sink, ec2, instance_id, "terminated", vm)
+    await _wait_for_state(stores, sink, ec2, instance_id, "terminated", vm)
     assert vm.deleted == [f"odin-ec2-{ENV}-{instance_id}"]
 
     # Still visible right after termination (the ~60s grace window)...
     req = sink.call(lambda: ec2.describe_instances(InstanceIds=[instance_id]))
-    _parse("DescribeInstances", _answer(stores, req, vm))
+    _parse("DescribeInstances", await _answer(stores, req, vm))
 
     # ...but a describe with `now` far past the window sweeps it, and a
     # by-id describe then reports NotFound like real AWS's post-terminate
     # delete-confirm.
     path, query = split_url(req.url)
     action, resource = classify("ec2", req.method, path, query, req.headers, req.body)
-    late = ec2compute.pure_answer(action, resource, ENV, req.body, stores, time.monotonic() + 120.0, vm)
+    late = await ec2compute.pure_answer(action, resource, ENV, req.body, stores, time.monotonic() + 120.0, vm)
     parsed = _parse("DescribeInstances", late, error=True)
     assert parsed["Error"]["Code"] == "InvalidInstanceID.NotFound"
 
 
-def test_mark_instance_terminated_is_what_tofu_reads_after_an_out_of_band_vm_delete(sink, ec2, stores):
+async def test_mark_instance_terminated_is_what_tofu_reads_after_an_out_of_band_vm_delete(sink, ec2, stores):
     """W2.2's honesty fix -- the reality sweep's seam (`reconcile/drift.py`):
     once odin has CONFIRMED the Lima VM is gone, DescribeInstances must answer
     `terminated` with a real StateReason, because that answer is the only thing
@@ -410,10 +444,10 @@ def test_mark_instance_terminated_is_what_tofu_reads_after_an_out_of_band_vm_del
     claiming `running` gives tofu an empty plan forever and the VM never comes
     back). The record is also reclaimed by the normal lazy sweep afterwards --
     no new lifecycle, just the existing terminal one."""
-    subnet_id = _subnet(stores, sink, ec2)
+    subnet_id = await _subnet(stores, sink, ec2)
     vm = FakeInstanceVm()
-    instance_id = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)["Instances"][0]["InstanceId"]
-    _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+    instance_id = (await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id))["Instances"][0]["InstanceId"]
+    await _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
 
     ec2compute.mark_instance_terminated(
         stores, ENV, instance_id,
@@ -421,7 +455,7 @@ def test_mark_instance_terminated_is_what_tofu_reads_after_an_out_of_band_vm_del
     )
 
     req = sink.call(lambda: ec2.describe_instances(InstanceIds=[instance_id]))
-    instance = _parse("DescribeInstances", _answer(stores, req, vm))["Reservations"][0]["Instances"][0]
+    instance = _parse("DescribeInstances", await _answer(stores, req, vm))["Reservations"][0]["Instances"][0]
     assert instance["State"]["Name"] == "terminated"
     assert instance["StateReason"]["Code"] == "Client.UserInitiatedShutdown"
     assert "deleted outside odin" in instance["StateReason"]["Message"]
@@ -431,23 +465,23 @@ def test_mark_instance_terminated_is_what_tofu_reads_after_an_out_of_band_vm_del
     # uses, never parked in the store forever.
     path, query = split_url(req.url)
     action, resource = classify("ec2", req.method, path, query, req.headers, req.body)
-    late = ec2compute.pure_answer(action, resource, ENV, req.body, stores, time.monotonic() + 120.0, vm)
+    late = await ec2compute.pure_answer(action, resource, ENV, req.body, stores, time.monotonic() + 120.0, vm)
     assert _parse("DescribeInstances", late, error=True)["Error"]["Code"] == "InvalidInstanceID.NotFound"
 
 
-def test_terminate_delete_failure_keeps_shutting_down_with_reason_and_retries(sink, ec2, stores):
+async def test_terminate_delete_failure_keeps_shutting_down_with_reason_and_retries(sink, ec2, stores):
     """Release finding #4 -- VM delete honesty: a failed `vm.delete` must
     NOT be reported as a clean `terminated`. The record stays
     `shutting-down` with the error recorded, and the NEXT Describe-driven
     pass retries the delete until it actually succeeds."""
-    subnet_id = _subnet(stores, sink, ec2)
+    subnet_id = await _subnet(stores, sink, ec2)
     vm = GatedDeleteInstanceVm()
-    instance_id = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)["Instances"][0]["InstanceId"]
-    _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+    instance_id = (await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id))["Instances"][0]["InstanceId"]
+    await _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
 
     term_req = sink.call(lambda: ec2.terminate_instances(InstanceIds=[instance_id]))
-    _answer(stores, term_req, vm)
-    assert vm.first_delete_blocked.wait(timeout=2.0)  # the first (failing) delete attempt is mid-flight
+    await _answer(stores, term_req, vm)
+    assert await _fired(vm.first_delete_blocked, 2.0)  # the first (failing) delete attempt is mid-flight
     vm.release_first_delete.set()
 
     # Poll until the failure has genuinely landed. Every poll ALSO drives
@@ -458,102 +492,104 @@ def test_terminate_delete_failure_keeps_shutting_down_with_reason_and_retries(si
     reasoned = None
     while time.monotonic() < deadline:
         req = sink.call(lambda: ec2.describe_instances(InstanceIds=[instance_id]))
-        parsed = _parse("DescribeInstances", _answer(stores, req, vm))
+        parsed = _parse("DescribeInstances", await _answer(stores, req, vm))
         instance = parsed["Reservations"][0]["Instances"][0]
         if instance["State"]["Name"] == "shutting-down" and instance.get("StateReason"):
             reasoned = instance
             break
-        time.sleep(0.02)
+        await asyncio.sleep(0.02)
     assert reasoned is not None, "the delete failure was never recorded"
     assert "delete failed" in reasoned["StateReason"]["Message"].lower()
 
     # Release the retry that the polling above already spawned -- it
     # succeeds, and the instance genuinely reaches terminated.
     vm.release_retry.set()
-    _wait_for_state(stores, sink, ec2, instance_id, "terminated", vm)
+    await _wait_for_state(stores, sink, ec2, instance_id, "terminated", vm)
     name = f"odin-ec2-{ENV}-{instance_id}"
     assert vm.deleted.count(name) == 2  # the original failed attempt + the successful retry
 
 
-def test_late_boot_completion_cannot_resurrect_a_terminated_instance(sink, ec2, stores):
+async def test_late_boot_completion_cannot_resurrect_a_terminated_instance(sink, ec2, stores):
     """Release finding #3 -- the resurrection race: RunInstances's background
     `_finish_boot` thread is still in flight when Terminate wins first. The
     instance must stay `terminated` forever; a stale boot completion landing
     afterward must never bounce it back to `running`."""
-    subnet_id = _subnet(stores, sink, ec2)
+    subnet_id = await _subnet(stores, sink, ec2)
     vm = SlowBootInstanceVm()
-    instance_id = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)["Instances"][0]["InstanceId"]
-    assert vm.boot_started.wait(timeout=2.0)  # the boot thread is genuinely mid-flight
+    instance_id = (await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id))["Instances"][0]["InstanceId"]
+    assert await _fired(vm.boot_started, 2.0)  # the boot task is genuinely mid-flight
 
     term_req = sink.call(lambda: ec2.terminate_instances(InstanceIds=[instance_id]))
-    _answer(stores, term_req, vm)
-    _wait_for_state(stores, sink, ec2, instance_id, "terminated", vm)
+    await _answer(stores, term_req, vm)
+    await _wait_for_state(stores, sink, ec2, instance_id, "terminated", vm)
 
     vm.release.set()  # let the stale boot finish AFTER the terminate already won
     deadline = time.monotonic() + 1.0
     while time.monotonic() < deadline:
         req = sink.call(lambda: ec2.describe_instances(InstanceIds=[instance_id]))
-        parsed = _parse("DescribeInstances", _answer(stores, req, vm))
+        parsed = _parse("DescribeInstances", await _answer(stores, req, vm))
         state = parsed["Reservations"][0]["Instances"][0]["State"]["Name"]
         assert state == "terminated", f"resurrected to {state!r}"
-        time.sleep(0.02)
+        await asyncio.sleep(0.02)
 
 
-def test_terminate_unknown_instance_is_not_found(sink, ec2, stores):
+async def test_terminate_unknown_instance_is_not_found(sink, ec2, stores):
     req = sink.call(lambda: ec2.terminate_instances(InstanceIds=["i-00000000000000000"]))
-    response = _answer(stores, req, FakeInstanceVm())
+    response = await _answer(stores, req, FakeInstanceVm())
     assert response.status_code == 400
 
 
 # --- R3/W2.6: the assigned-SG firewall + the lighthouse start/stop lifecycle ----
 
 
-def test_run_instances_threads_the_vpc_default_sg_firewall_into_nebula_join(sink, ec2, stores):
+async def test_run_instances_threads_the_vpc_default_sg_firewall_into_nebula_join(sink, ec2, stores):
     """An instance launched with NO SecurityGroupIds inherits its VPC's default
     SG, exactly like real AWS. An ingress rule authorized on that default SG
     must show up on the `NebulaJoin` `InstanceVm.boot` receives. (W2.6 made the
     ASSIGNED groups the primary source -- this is the fallback path for an
     instance that has none, which real AWS resolves the same way.)"""
-    subnet_id = _subnet(stores, sink, ec2)
+    subnet_id = await _subnet(stores, sink, ec2)
     vpc_id = stores.ec2net.get(ENV, f"subnet:{subnet_id}")["vpc_id"]
     default_sg_id = stores.ec2net.get(ENV, f"vpc:{vpc_id}")["default_sg_id"]
     req = sink.call(lambda: ec2.authorize_security_group_ingress(GroupId=default_sg_id, IpPermissions=[
         {"IpProtocol": "tcp", "FromPort": 8080, "ToPort": 8080, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
     ]))
-    assert _answer(stores, req).status_code == 200
+    assert (await _answer(stores, req)).status_code == 200
 
     vm = FakeInstanceVm()
-    _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)
+    await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)
+    await _wait_for_boot_call(vm)
     ((_name, _hostname, _ssh_pubkey, _user_data, nebula, _env_vars),) = vm.booted
     assert nebula is not None and nebula.firewall is not None
     assert FirewallRule(port="8080", proto="tcp", cidr="0.0.0.0/0") in nebula.firewall.inbound
 
 
-def _authorize(stores, sink, ec2, group_id: str, port: int) -> None:
+async def _authorize(stores, sink, ec2, group_id: str, port: int) -> None:
     req = sink.call(lambda: ec2.authorize_security_group_ingress(GroupId=group_id, IpPermissions=[
         {"IpProtocol": "tcp", "FromPort": port, "ToPort": port, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
     ]))
-    assert _answer(stores, req).status_code == 200
+    assert (await _answer(stores, req)).status_code == 200
 
 
-def test_run_instances_compiles_the_union_of_its_assigned_sgs_not_the_vpc_default(sink, ec2, stores):
+async def test_run_instances_compiles_the_union_of_its_assigned_sgs_not_the_vpc_default(sink, ec2, stores):
     """W2.6 piece 1: the VM's nebula firewall comes from the instance's OWN
     security groups (all of them -- AWS rules are permissive-only, so the
     effective set is their union), NOT from the VPC's default SG. Before this,
     a canvas that assigned `web-sg` to an instance got the default SG's rules
     baked into the VM regardless -- the drawn group was decorative on the
     wire."""
-    vpc_id = _create_vpc(stores, sink, ec2)
-    subnet_id = _create_subnet(stores, sink, ec2, vpc_id)
+    vpc_id = await _create_vpc(stores, sink, ec2)
+    subnet_id = await _create_subnet(stores, sink, ec2, vpc_id)
     default_sg_id = stores.ec2net.get(ENV, f"vpc:{vpc_id}")["default_sg_id"]
-    web_sg = _create_sg(stores, sink, ec2, vpc_id, name="web-sg")
-    ops_sg = _create_sg(stores, sink, ec2, vpc_id, name="ops-sg")
-    _authorize(stores, sink, ec2, default_sg_id, 7070)  # must NOT reach the VM
-    _authorize(stores, sink, ec2, web_sg, 8080)
-    _authorize(stores, sink, ec2, ops_sg, 9090)
+    web_sg = await _create_sg(stores, sink, ec2, vpc_id, name="web-sg")
+    ops_sg = await _create_sg(stores, sink, ec2, vpc_id, name="ops-sg")
+    await _authorize(stores, sink, ec2, default_sg_id, 7070)  # must NOT reach the VM
+    await _authorize(stores, sink, ec2, web_sg, 8080)
+    await _authorize(stores, sink, ec2, ops_sg, 9090)
 
     vm = FakeInstanceVm()
-    _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, SecurityGroupIds=[web_sg, ops_sg])
+    await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, SecurityGroupIds=[web_sg, ops_sg])
+    await _wait_for_boot_call(vm)
     ((_name, _hostname, _ssh_pubkey, _user_data, nebula, _env_vars),) = vm.booted
     assert nebula is not None and nebula.firewall is not None
     ports = {(r.port, r.proto) for r in nebula.firewall.inbound}
@@ -562,38 +598,41 @@ def test_run_instances_compiles_the_union_of_its_assigned_sgs_not_the_vpc_defaul
     assert ("7070", "tcp") not in ports, "the VPC default SG must NOT leak in once groups are assigned"
 
 
-def test_run_instances_stamps_assigned_sg_ids_as_nebula_cert_groups(sink, ec2, stores):
+async def test_run_instances_stamps_assigned_sg_ids_as_nebula_cert_groups(sink, ec2, stores):
     """The other half of SG-to-SG rules: nebula matches a peer's `group:` rule
     against that peer's CERTIFICATE groups, so an instance's sg ids have to
     ride into cert signing (`InstanceVm._nebula_files`)."""
-    vpc_id = _create_vpc(stores, sink, ec2)
-    subnet_id = _create_subnet(stores, sink, ec2, vpc_id)
-    web_sg = _create_sg(stores, sink, ec2, vpc_id, name="web-sg")
+    vpc_id = await _create_vpc(stores, sink, ec2)
+    subnet_id = await _create_subnet(stores, sink, ec2, vpc_id)
+    web_sg = await _create_sg(stores, sink, ec2, vpc_id, name="web-sg")
 
     vm = FakeInstanceVm()
-    _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, SecurityGroupIds=[web_sg])
+    await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, SecurityGroupIds=[web_sg])
+    await _wait_for_boot_call(vm)
     ((_name, _hostname, _ssh_pubkey, _user_data, nebula, _env_vars),) = vm.booted
     assert nebula.groups == (web_sg,)
 
 
-def test_run_instances_with_an_unknown_sg_falls_back_to_the_vpc_default(sink, ec2, stores):
+async def test_run_instances_with_an_unknown_sg_falls_back_to_the_vpc_default(sink, ec2, stores):
     """A SecurityGroupId with no record contributes no rules -- the instance
     falls back to its VPC default rather than silently booting with an empty
     (deny-everything) or invented firewall."""
-    vpc_id = _create_vpc(stores, sink, ec2)
-    subnet_id = _create_subnet(stores, sink, ec2, vpc_id)
+    vpc_id = await _create_vpc(stores, sink, ec2)
+    subnet_id = await _create_subnet(stores, sink, ec2, vpc_id)
     default_sg_id = stores.ec2net.get(ENV, f"vpc:{vpc_id}")["default_sg_id"]
-    _authorize(stores, sink, ec2, default_sg_id, 7070)
+    await _authorize(stores, sink, ec2, default_sg_id, 7070)
 
     vm = FakeInstanceVm()
-    _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, SecurityGroupIds=["sg-00000000000000000"])
+    await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, SecurityGroupIds=["sg-00000000000000000"])
+    await _wait_for_boot_call(vm)
     ((_name, _hostname, _ssh_pubkey, _user_data, nebula, _env_vars),) = vm.booted
     assert FirewallRule(port="7070", proto="tcp", cidr="0.0.0.0/0") in nebula.firewall.inbound
 
 
-def test_run_instances_without_a_subnet_gets_no_nebula_join(sink, ec2, stores):
+async def test_run_instances_without_a_subnet_gets_no_nebula_join(sink, ec2, stores):
     vm = FakeInstanceVm()
-    _run_instance(stores, sink, ec2, vm)  # no SubnetId at all
+    await _run_instance(stores, sink, ec2, vm)  # no SubnetId at all
+    await _wait_for_boot_call(vm)
     ((_name, _hostname, _ssh_pubkey, _user_data, nebula, _env_vars),) = vm.booted
     assert nebula is None
 
@@ -608,30 +647,30 @@ class RefreshingInstanceVm(FakeInstanceVm):
         super().__init__(ip=ip)
         self.refreshed: list[tuple] = []
 
-    def refresh_nebula(self, name, nebula):
+    async def refresh_nebula(self, name, nebula):
         self.refreshed.append((name, nebula))
         return "reloaded"
 
 
-def test_ensure_instance_mesh_pushes_the_current_rules_into_a_running_vm(sink, ec2, stores):
+async def test_ensure_instance_mesh_pushes_the_current_rules_into_a_running_vm(sink, ec2, stores):
     """Field test 2 HIGH-1: `web-sg` gains `tcp:8080` AFTER the VM is up.
     The gateway recorded it and a VM created later got it, but the running one
     never did -- one drawn group, two firewalls on the wire. An Apply must
     hand the running VM its CURRENT compiled union."""
-    vpc_id = _create_vpc(stores, sink, ec2)
-    subnet_id = _create_subnet(stores, sink, ec2, vpc_id)
-    web_sg = _create_sg(stores, sink, ec2, vpc_id, name="web-sg")
-    _authorize(stores, sink, ec2, web_sg, 22)
+    vpc_id = await _create_vpc(stores, sink, ec2)
+    subnet_id = await _create_subnet(stores, sink, ec2, vpc_id)
+    web_sg = await _create_sg(stores, sink, ec2, vpc_id, name="web-sg")
+    await _authorize(stores, sink, ec2, web_sg, 22)
 
     vm = RefreshingInstanceVm()
-    parsed = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, SecurityGroupIds=[web_sg])
+    parsed = await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, SecurityGroupIds=[web_sg])
     instance_id = parsed["Instances"][0]["InstanceId"]
-    _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+    await _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
     booted_ports = {(r.port, r.proto) for r in vm.booted[0][4].firewall.inbound}
     assert booted_ports == {("22", "tcp")}
 
-    _authorize(stores, sink, ec2, web_sg, 8080)  # the canvas edit
-    actions = ec2compute.ensure_instance_mesh(stores, ENV, vm)
+    await _authorize(stores, sink, ec2, web_sg, 8080)  # the canvas edit
+    actions = await ec2compute.ensure_instance_mesh(stores, ENV, vm)
 
     ((name, nebula),) = vm.refreshed
     assert name == f"odin-ec2-{ENV}-{instance_id}"
@@ -640,56 +679,56 @@ def test_ensure_instance_mesh_pushes_the_current_rules_into_a_running_vm(sink, e
     assert actions == {name: "reloaded"}
 
 
-def test_ensure_instance_mesh_refuses_to_report_success_when_a_vm_did_not_take_it(sink, ec2, stores):
+async def test_ensure_instance_mesh_refuses_to_report_success_when_a_vm_did_not_take_it(sink, ec2, stores):
     """Field test 3 HIGH-1's second half: `refresh_nebula` never raises (mesh
     wiring must not fail an instance boot), so a `failed` used to be a log line
     while the Apply returned `applied` and exit 0 -- with the VM still
     enforcing the groups it was born with. A security control that could not be
     applied must not be reported as applied, and the message must name the VM."""
-    vpc_id = _create_vpc(stores, sink, ec2)
-    subnet_id = _create_subnet(stores, sink, ec2, vpc_id)
-    web_sg = _create_sg(stores, sink, ec2, vpc_id, name="web-sg")
+    vpc_id = await _create_vpc(stores, sink, ec2)
+    subnet_id = await _create_subnet(stores, sink, ec2, vpc_id)
+    web_sg = await _create_sg(stores, sink, ec2, vpc_id, name="web-sg")
 
     class BrokenVm(RefreshingInstanceVm):
-        def refresh_nebula(self, name, nebula):
+        async def refresh_nebula(self, name, nebula):
             self.refreshed.append((name, nebula))
             return "failed"
 
     vm = BrokenVm()
-    parsed = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, SecurityGroupIds=[web_sg])
+    parsed = await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, SecurityGroupIds=[web_sg])
     instance_id = parsed["Instances"][0]["InstanceId"]
-    _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+    await _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
 
     with pytest.raises(ec2compute.MeshRefreshFailed) as raised:
-        ec2compute.ensure_instance_mesh(stores, ENV, vm)
+        await ec2compute.ensure_instance_mesh(stores, ENV, vm)
     message = str(raised.value)
     assert f"odin-ec2-{ENV}-{instance_id}" in message
     assert "REVOKED" in message and "Re-run Apply" in message
 
 
-def test_ensure_instance_mesh_skips_instances_with_no_running_vm_to_talk_to(sink, ec2, stores):
+async def test_ensure_instance_mesh_skips_instances_with_no_running_vm_to_talk_to(sink, ec2, stores):
     """A stopped instance has no daemon to signal, and an instance with no VPC
     was never on a mesh at all -- neither is a candidate."""
-    vpc_id = _create_vpc(stores, sink, ec2)
-    subnet_id = _create_subnet(stores, sink, ec2, vpc_id)
+    vpc_id = await _create_vpc(stores, sink, ec2)
+    subnet_id = await _create_subnet(stores, sink, ec2, vpc_id)
     vm = RefreshingInstanceVm()
-    parsed = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)
+    parsed = await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)
     instance_id = parsed["Instances"][0]["InstanceId"]
-    _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
-    _run_instance(stores, sink, ec2, vm)  # no subnet => no VPC => no mesh
+    await _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+    await _run_instance(stores, sink, ec2, vm)  # no subnet => no VPC => no mesh
 
     req = sink.call(lambda: ec2.stop_instances(InstanceIds=[instance_id]))
-    assert _answer(stores, req, vm).status_code == 200
-    _wait_for_state(stores, sink, ec2, instance_id, "stopped", vm)
+    assert (await _answer(stores, req, vm)).status_code == 200
+    await _wait_for_state(stores, sink, ec2, instance_id, "stopped", vm)
 
-    assert ec2compute.ensure_instance_mesh(stores, ENV, vm) == {}
+    assert await ec2compute.ensure_instance_mesh(stores, ENV, vm) == {}
     assert vm.refreshed == []
 
 
 # --- the membership revision: a revoke reaching flows already open ----------
 
 
-def test_membership_revision_moves_only_when_a_members_groups_move(sink, ec2, stores):
+async def test_membership_revision_moves_only_when_a_members_groups_move(sink, ec2, stores):
     """Field test 4's number, and its whole contract in one place.
 
     It has to change when someone's certificate groups change -- that is what
@@ -702,20 +741,20 @@ def test_membership_revision_moves_only_when_a_members_groups_move(sink, ec2, st
     Editing an SG's RULES deliberately does not move it. Rules travel in the
     config on their own and are re-validated by the same reload; membership
     cannot, because it lives in a certificate."""
-    vpc_id = _create_vpc(stores, sink, ec2)
-    subnet_id = _create_subnet(stores, sink, ec2, vpc_id)
-    web_sg = _create_sg(stores, sink, ec2, vpc_id, name="web-sg")
-    admin_sg = _create_sg(stores, sink, ec2, vpc_id, name="admin-sg")
+    vpc_id = await _create_vpc(stores, sink, ec2)
+    subnet_id = await _create_subnet(stores, sink, ec2, vpc_id)
+    web_sg = await _create_sg(stores, sink, ec2, vpc_id, name="web-sg")
+    admin_sg = await _create_sg(stores, sink, ec2, vpc_id, name="admin-sg")
 
     vm = RefreshingInstanceVm()
-    parsed = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, SecurityGroupIds=[web_sg])
+    parsed = await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, SecurityGroupIds=[web_sg])
     instance_id = parsed["Instances"][0]["InstanceId"]
-    _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+    await _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
 
     revision = ec2compute.membership_revision(stores, ENV)
     assert revision == ec2compute.membership_revision(stores, ENV), "a re-read must not move it"
 
-    _authorize(stores, sink, ec2, web_sg, 8080)
+    await _authorize(stores, sink, ec2, web_sg, 8080)
     assert ec2compute.membership_revision(stores, ENV) == revision, (
         "a RULE edit is not a membership change -- it must not churn every member in the env"
     )
@@ -725,28 +764,28 @@ def test_membership_revision_moves_only_when_a_members_groups_move(sink, ec2, st
     assert ec2compute.membership_revision(stores, ENV) != revision
 
 
-def test_ensure_instance_mesh_hands_every_vm_the_same_revision(sink, ec2, stores):
+async def test_ensure_instance_mesh_hands_every_vm_the_same_revision(sink, ec2, stores):
     """One env, one number: the admitting member's reload is only meaningful
     against the SAME roster the revoked member was re-signed from. Computing it
     per-VM inside the loop would make an Apply's outcome depend on which VM
     happened to be refreshed first."""
-    vpc_id = _create_vpc(stores, sink, ec2)
-    subnet_id = _create_subnet(stores, sink, ec2, vpc_id)
-    web_sg = _create_sg(stores, sink, ec2, vpc_id, name="web-sg")
+    vpc_id = await _create_vpc(stores, sink, ec2)
+    subnet_id = await _create_subnet(stores, sink, ec2, vpc_id)
+    web_sg = await _create_sg(stores, sink, ec2, vpc_id, name="web-sg")
 
     vm = RefreshingInstanceVm()
     for _ in range(2):
-        parsed = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, SecurityGroupIds=[web_sg])
-        _wait_for_state(stores, sink, ec2, parsed["Instances"][0]["InstanceId"], "running", vm)
+        parsed = await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, SecurityGroupIds=[web_sg])
+        await _wait_for_state(stores, sink, ec2, parsed["Instances"][0]["InstanceId"], "running", vm)
 
-    ec2compute.ensure_instance_mesh(stores, ENV, vm)
+    await ec2compute.ensure_instance_mesh(stores, ENV, vm)
     revisions = {nebula.revision for _name, nebula in vm.refreshed}
     assert len(vm.refreshed) == 2
     assert revisions == {ec2compute.membership_revision(stores, ENV)}
     assert "" not in revisions
 
 
-def test_ensure_instance_mesh_recertifies_a_moved_instance_before_the_others(sink, ec2, stores, tmp_path):
+async def test_ensure_instance_mesh_recertifies_a_moved_instance_before_the_others(sink, ec2, stores, tmp_path):
     """The ordering half of field test 4, and it is not cosmetic.
 
     An admitting member closes an already-open flow by re-checking it against
@@ -758,17 +797,17 @@ def test_ensure_instance_mesh_recertifies_a_moved_instance_before_the_others(sin
     already settled).
 
     `membership_changed` is the cheap local-file test that orders the loop."""
-    vpc_id = _create_vpc(stores, sink, ec2)
-    subnet_id = _create_subnet(stores, sink, ec2, vpc_id)
-    web_sg = _create_sg(stores, sink, ec2, vpc_id, name="web-sg")
-    admin_sg = _create_sg(stores, sink, ec2, vpc_id, name="admin-sg")
+    vpc_id = await _create_vpc(stores, sink, ec2)
+    subnet_id = await _create_subnet(stores, sink, ec2, vpc_id)
+    web_sg = await _create_sg(stores, sink, ec2, vpc_id, name="web-sg")
+    admin_sg = await _create_sg(stores, sink, ec2, vpc_id, name="admin-sg")
 
     vm = RefreshingInstanceVm()
     ids = []
     for _ in range(3):
-        parsed = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, SecurityGroupIds=[web_sg])
+        parsed = await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, SecurityGroupIds=[web_sg])
         ids.append(parsed["Instances"][0]["InstanceId"])
-        _wait_for_state(stores, sink, ec2, ids[-1], "running", vm)
+        await _wait_for_state(stores, sink, ec2, ids[-1], "running", vm)
     # Everyone is up to date on disk except the LAST one, which the canvas just
     # moved out of web-sg -- i.e. the one member whose cert has to be re-issued.
     for instance_id in ids:
@@ -778,13 +817,13 @@ def test_ensure_instance_mesh_recertifies_a_moved_instance_before_the_others(sin
     stores.ec2compute.get(ENV, f"instance:{moved}")["security_group_ids"] = [admin_sg]
 
     vm.refreshed.clear()
-    ec2compute.ensure_instance_mesh(stores, ENV, vm)
+    await ec2compute.ensure_instance_mesh(stores, ENV, vm)
     order = [nebula.host_id for _name, nebula in vm.refreshed]
     assert order[0] == moved, f"the re-certified instance must go first, got {order}"
     assert sorted(order) == sorted(ids)
 
 
-def test_terminate_last_vpc_instance_stops_the_lighthouse(sink, ec2, stores, monkeypatch):
+async def test_terminate_last_vpc_instance_stops_the_lighthouse(sink, ec2, stores, monkeypatch):
     stopped = []
 
     class FakeLighthouse:
@@ -792,18 +831,18 @@ def test_terminate_last_vpc_instance_stops_the_lighthouse(sink, ec2, stores, mon
             stopped.append((root, env))
 
     monkeypatch.setattr(ec2compute, "LighthouseManager", FakeLighthouse)
-    subnet_id = _subnet(stores, sink, ec2)
+    subnet_id = await _subnet(stores, sink, ec2)
     vm = FakeInstanceVm()
-    instance_id = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)["Instances"][0]["InstanceId"]
-    _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+    instance_id = (await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id))["Instances"][0]["InstanceId"]
+    await _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
 
     term_req = sink.call(lambda: ec2.terminate_instances(InstanceIds=[instance_id]))
-    _answer(stores, term_req, vm)
-    _wait_for_state(stores, sink, ec2, instance_id, "terminated", vm)
+    await _answer(stores, term_req, vm)
+    await _wait_for_state(stores, sink, ec2, instance_id, "terminated", vm)
     assert stopped == [(stores.root, ENV)]
 
 
-def test_terminate_does_not_stop_the_lighthouse_while_another_instance_remains(sink, ec2, stores, monkeypatch):
+async def test_terminate_does_not_stop_the_lighthouse_while_another_instance_remains(sink, ec2, stores, monkeypatch):
     stopped = []
 
     class FakeLighthouse:
@@ -811,29 +850,29 @@ def test_terminate_does_not_stop_the_lighthouse_while_another_instance_remains(s
             stopped.append((root, env))
 
     monkeypatch.setattr(ec2compute, "LighthouseManager", FakeLighthouse)
-    subnet_id = _subnet(stores, sink, ec2)
+    subnet_id = await _subnet(stores, sink, ec2)
     vm = FakeInstanceVm()
-    id1 = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)["Instances"][0]["InstanceId"]
-    id2 = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)["Instances"][0]["InstanceId"]
-    _wait_for_state(stores, sink, ec2, id1, "running", vm)
-    _wait_for_state(stores, sink, ec2, id2, "running", vm)
+    id1 = (await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id))["Instances"][0]["InstanceId"]
+    id2 = (await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id))["Instances"][0]["InstanceId"]
+    await _wait_for_state(stores, sink, ec2, id1, "running", vm)
+    await _wait_for_state(stores, sink, ec2, id2, "running", vm)
 
     term_req = sink.call(lambda: ec2.terminate_instances(InstanceIds=[id1]))
-    _answer(stores, term_req, vm)
-    _wait_for_state(stores, sink, ec2, id1, "terminated", vm)
+    await _answer(stores, term_req, vm)
+    await _wait_for_state(stores, sink, ec2, id1, "terminated", vm)
     assert stopped == []  # id2 (same env, same VPC) is still running
 
 
 # --- hydration describes -------------------------------------------------------
 
 
-def test_describe_volumes_returns_the_auto_root_volume(sink, ec2, stores):
-    subnet_id = _subnet(stores, sink, ec2)
+async def test_describe_volumes_returns_the_auto_root_volume(sink, ec2, stores):
+    subnet_id = await _subnet(stores, sink, ec2)
     vm = FakeInstanceVm()
-    instance_id = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, InstanceType="t3.medium")["Instances"][0]["InstanceId"]
+    instance_id = (await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, InstanceType="t3.medium"))["Instances"][0]["InstanceId"]
 
     req = sink.call(lambda: ec2.describe_volumes(Filters=[{"Name": "attachment.instance-id", "Values": [instance_id]}]))
-    parsed = _parse("DescribeVolumes", _answer(stores, req, vm))
+    parsed = _parse("DescribeVolumes", await _answer(stores, req, vm))
     (volume,) = parsed["Volumes"]
     assert volume["VolumeId"].startswith("vol-")
     assert volume["Size"] == 20  # t3.medium's VmConfig.disk == "20GiB"
@@ -841,44 +880,44 @@ def test_describe_volumes_returns_the_auto_root_volume(sink, ec2, stores):
     assert volume["Attachments"][0]["Device"] == "/dev/sda1"
 
 
-def test_describe_instance_types(sink, ec2, stores):
+async def test_describe_instance_types(sink, ec2, stores):
     req = sink.call(lambda: ec2.describe_instance_types(InstanceTypes=["t3.micro"]))
-    parsed = _parse("DescribeInstanceTypes", _answer(stores, req, FakeInstanceVm()))
+    parsed = _parse("DescribeInstanceTypes", await _answer(stores, req, FakeInstanceVm()))
     (info,) = parsed["InstanceTypes"]
     assert info["InstanceType"] == "t3.micro"
     assert info["VCpuInfo"]["DefaultVCpus"] == 1
     assert info["MemoryInfo"]["SizeInMiB"] == 1024
 
 
-def test_describe_instance_attribute_defaults(sink, ec2, stores):
-    subnet_id = _subnet(stores, sink, ec2)
+async def test_describe_instance_attribute_defaults(sink, ec2, stores):
+    subnet_id = await _subnet(stores, sink, ec2)
     vm = FakeInstanceVm()
-    instance_id = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)["Instances"][0]["InstanceId"]
+    instance_id = (await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id))["Instances"][0]["InstanceId"]
 
     req = sink.call(lambda: ec2.describe_instance_attribute(InstanceId=instance_id, Attribute="disableApiTermination"))
-    parsed = _parse("DescribeInstanceAttribute", _answer(stores, req, vm))
+    parsed = _parse("DescribeInstanceAttribute", await _answer(stores, req, vm))
     assert parsed["DisableApiTermination"] == {"Value": False}
 
 
-def test_modify_instance_attribute_returns_success(sink, ec2, stores):
+async def test_modify_instance_attribute_returns_success(sink, ec2, stores):
     # Finding #2: ModifyInstanceAttribute is now a real (tolerant) success, not
     # the old InvalidAction 400 -- the provider calls it during destroy
     # (DisableApiTermination=false) and on an in-place security-group change;
     # neither must 400 (the SG case is covered below).
-    subnet_id = _subnet(stores, sink, ec2)
+    subnet_id = await _subnet(stores, sink, ec2)
     vm = FakeInstanceVm()
-    instance_id = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)["Instances"][0]["InstanceId"]
+    instance_id = (await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id))["Instances"][0]["InstanceId"]
     req = sink.call(lambda: ec2.modify_instance_attribute(InstanceId=instance_id, DisableApiTermination={"Value": False}))
-    assert _answer(stores, req, vm).status_code == 200
+    assert (await _answer(stores, req, vm)).status_code == 200
 
 
 # --- Key pairs -----------------------------------------------------------------
 
 
-def test_import_key_pair_stores_pubkey_for_ssh_injection(sink, ec2, stores):
+async def test_import_key_pair_stores_pubkey_for_ssh_injection(sink, ec2, stores):
     pubkey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI test@host"
     req = sink.call(lambda: ec2.import_key_pair(KeyName="deploy", PublicKeyMaterial=pubkey.encode()))
-    parsed = _parse("ImportKeyPair", _answer(stores, req))
+    parsed = _parse("ImportKeyPair", await _answer(stores, req))
     assert parsed["KeyName"] == "deploy"
     assert parsed["KeyPairId"].startswith("key-")
 
@@ -896,122 +935,123 @@ def test_import_key_pair_stores_pubkey_for_ssh_injection(sink, ec2, stores):
 # reason the server may answer badly.
 
 
-def _raw(stores, action: str, params: dict[str, str], vm=None) -> Response:
+async def _raw(stores, action: str, params: dict[str, str], vm=None) -> Response:
     body = "&".join([f"Action={action}", "Version=2016-11-15", *(f"{k}={v}" for k, v in params.items())])
-    response = ec2compute.pure_answer(
+    response = await ec2compute.pure_answer(
         f"ec2:{action}", "", ENV, body.encode(), stores, time.monotonic(), vm or FakeInstanceVm(),
     )
     assert response is not None
     return response
 
 
-def test_import_key_pair_without_key_material_is_refused_not_silently_empty(stores):
+async def test_import_key_pair_without_key_material_is_refused_not_silently_empty(stores):
     """OPEN-BUGS #4: this stored an EMPTY public key and answered 200, and the
     instance then booted -- a real VM, real RAM and disk -- with nothing in
     `authorized_keys`. botocore's own EC2 model marks `PublicKeyMaterial`
     required, so real AWS refuses too."""
-    response = _raw(stores, "ImportKeyPair", {"KeyName": "deploy"})
+    response = await _raw(stores, "ImportKeyPair", {"KeyName": "deploy"})
     assert response.status_code == 400
     assert _parse("ImportKeyPair", response, error=True)["Error"]["Code"] == "MissingParameter"
     # ...and nothing was written: no empty-keyed record left behind.
     assert stores.ec2compute.get(ENV, "keypair:deploy") is None
 
 
-def test_import_key_pair_with_material_that_decodes_to_nothing_is_refused_too(stores):
+async def test_import_key_pair_with_material_that_decodes_to_nothing_is_refused_too(stores):
     """The guard reads the DECODED key, not the parameter's presence:
     `b64decode` skips non-alphabet characters, so junk decodes to `b""` and
     reached the store exactly like an absent parameter would."""
-    response = _raw(stores, "ImportKeyPair", {"KeyName": "deploy", "PublicKeyMaterial": "%20%20"})
+    response = await _raw(stores, "ImportKeyPair", {"KeyName": "deploy", "PublicKeyMaterial": "%20%20"})
     assert response.status_code == 400
     assert _parse("ImportKeyPair", response, error=True)["Error"]["Code"] == "MissingParameter"
     assert stores.ec2compute.get(ENV, "keypair:deploy") is None
 
 
-def test_a_key_pair_with_no_name_is_refused_by_both_import_and_create(stores):
+async def test_a_key_pair_with_no_name_is_refused_by_both_import_and_create(stores):
     """The empty-identifier sibling (OPEN-BUGS #7's family): both used to mint a
     real key pair under the empty-string name -- a `keypair:` record nothing can
     name, and so nothing can delete."""
     for action in ("ImportKeyPair", "CreateKeyPair"):
-        response = _raw(stores, action, {"PublicKeyMaterial": "c3NoLWVkMjU1MTkgQUFBQQ=="})
+        response = await _raw(stores, action, {"PublicKeyMaterial": "c3NoLWVkMjU1MTkgQUFBQQ=="})
         assert response.status_code == 400, action
         assert _parse(action, response, error=True)["Error"]["Code"] == "MissingParameter", action
     assert stores.ec2compute.get(ENV, "keypair:") is None
 
 
-def test_describe_instance_attribute_without_an_attribute_is_refused_not_malformed_xml(stores, sink, ec2):
+async def test_describe_instance_attribute_without_an_attribute_is_refused_not_malformed_xml(stores, sink, ec2):
     """OPEN-BUGS #8: this emitted `<><value>false</value></>` -- not a wrong
     answer but an UNPARSEABLE one, so every client reported a column number
     instead of the missing parameter. `Attribute` is required in botocore's own
     EC2 model."""
-    subnet_id = _subnet(stores, sink, ec2)
+    subnet_id = await _subnet(stores, sink, ec2)
     vm = FakeInstanceVm()
-    instance_id = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)["Instances"][0]["InstanceId"]
+    instance_id = (await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id))["Instances"][0]["InstanceId"]
 
-    response = _raw(stores, "DescribeInstanceAttribute", {"InstanceId": instance_id}, vm=vm)
+    response = await _raw(stores, "DescribeInstanceAttribute", {"InstanceId": instance_id}, vm=vm)
     assert response.status_code == 400
     assert b"<><value>" not in response.body
     assert _parse("DescribeInstanceAttribute", response, error=True)["Error"]["Code"] == "MissingParameter"
 
 
-def test_an_attribute_name_that_is_not_a_tag_name_cannot_break_the_document(stores, sink, ec2):
+async def test_an_attribute_name_that_is_not_a_tag_name_cannot_break_the_document(stores, sink, ec2):
     """The same hole from the other side: the attribute is interpolated as an
     ELEMENT NAME, where `escape()` cannot help -- escaping emits literal text,
     not a tag. All 16 values of the model's `InstanceAttributeName` enum are
     alphanumeric, so no real attribute is refused by this."""
-    subnet_id = _subnet(stores, sink, ec2)
+    subnet_id = await _subnet(stores, sink, ec2)
     vm = FakeInstanceVm()
-    instance_id = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)["Instances"][0]["InstanceId"]
+    instance_id = (await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id))["Instances"][0]["InstanceId"]
 
-    response = _raw(stores, "DescribeInstanceAttribute", {"InstanceId": instance_id, "Attribute": "a%3Eb"}, vm=vm)
+    response = await _raw(stores, "DescribeInstanceAttribute", {"InstanceId": instance_id, "Attribute": "a%3Eb"}, vm=vm)
     assert response.status_code == 400
     assert _parse("DescribeInstanceAttribute", response, error=True)["Error"]["Code"] == "InvalidParameterValue"
 
 
-def test_an_unmodelled_but_real_attribute_still_gets_its_permissive_answer(stores, sink, ec2):
+async def test_an_unmodelled_but_real_attribute_still_gets_its_permissive_answer(stores, sink, ec2):
     """The guard must not become a behaviour change for the 12 real attributes
     this module does not model -- `ebsOptimized` and friends keep answering."""
-    subnet_id = _subnet(stores, sink, ec2)
+    subnet_id = await _subnet(stores, sink, ec2)
     vm = FakeInstanceVm()
-    instance_id = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)["Instances"][0]["InstanceId"]
+    instance_id = (await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id))["Instances"][0]["InstanceId"]
 
-    response = _raw(stores, "DescribeInstanceAttribute", {"InstanceId": instance_id, "Attribute": "ebsOptimized"}, vm=vm)
+    response = await _raw(stores, "DescribeInstanceAttribute", {"InstanceId": instance_id, "Attribute": "ebsOptimized"}, vm=vm)
     assert response.status_code == 200
     assert _parse("DescribeInstanceAttribute", response)["EbsOptimized"] == {"Value": False}
 
 
-def test_run_instances_injects_the_imported_pubkey(sink, ec2, stores):
+async def test_run_instances_injects_the_imported_pubkey(sink, ec2, stores):
     pubkey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI test@host"
     req = sink.call(lambda: ec2.import_key_pair(KeyName="deploy", PublicKeyMaterial=pubkey.encode()))
-    _parse("ImportKeyPair", _answer(stores, req))
+    _parse("ImportKeyPair", await _answer(stores, req))
 
-    subnet_id = _subnet(stores, sink, ec2)
+    subnet_id = await _subnet(stores, sink, ec2)
     vm = FakeInstanceVm()
-    _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, KeyName="deploy")
+    await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, KeyName="deploy")
+    await _wait_for_boot_call(vm)
     assert vm.booted[0][2] == pubkey  # ssh_pubkey positional slot
 
 
-def test_describe_key_pairs_and_delete(sink, ec2, stores):
+async def test_describe_key_pairs_and_delete(sink, ec2, stores):
     pubkey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI test@host"
     req = sink.call(lambda: ec2.import_key_pair(KeyName="deploy", PublicKeyMaterial=pubkey.encode()))
-    _answer(stores, req)
+    await _answer(stores, req)
 
     describe_req = sink.call(lambda: ec2.describe_key_pairs(KeyNames=["deploy"]))
-    parsed = _parse("DescribeKeyPairs", _answer(stores, describe_req))
+    parsed = _parse("DescribeKeyPairs", await _answer(stores, describe_req))
     assert parsed["KeyPairs"][0]["KeyName"] == "deploy"
 
     delete_req = sink.call(lambda: ec2.delete_key_pair(KeyName="deploy"))
-    _parse("DeleteKeyPair", _answer(stores, delete_req))
+    _parse("DeleteKeyPair", await _answer(stores, delete_req))
     assert stores.ec2compute.get(ENV, "keypair:deploy") is None
 
     # deleting again is a tolerated no-op, matching real AWS
     delete_again = sink.call(lambda: ec2.delete_key_pair(KeyName="deploy"))
-    response = _answer(stores, delete_again)
+    response = await _answer(stores, delete_again)
     assert response.status_code == 200
 
 
-def test_create_key_pair_generates_a_real_rsa_keypair(sink, ec2, stores):
+async def test_create_key_pair_generates_a_real_rsa_keypair(sink, ec2, stores):
     req = sink.call(lambda: ec2.create_key_pair(KeyName="generated"))
-    parsed = _parse("CreateKeyPair", _answer(stores, req))
+    parsed = _parse("CreateKeyPair", await _answer(stores, req))
     assert parsed["KeyMaterial"].startswith("-----BEGIN")
     assert stores.ec2compute.get(ENV, "keypair:generated")["public_key"].startswith("ssh-rsa")
 
@@ -1019,20 +1059,20 @@ def test_create_key_pair_generates_a_real_rsa_keypair(sink, ec2, stores):
 # --- delegation to ec2net -------------------------------------------------------
 
 
-def test_ec2compute_delegates_vpc_calls_to_ec2net(sink, ec2, stores):
-    vpc_id = _create_vpc(stores, sink, ec2)
+async def test_ec2compute_delegates_vpc_calls_to_ec2net(sink, ec2, stores):
+    vpc_id = await _create_vpc(stores, sink, ec2)
     assert vpc_id.startswith("vpc-")
 
 
-def test_tags_flow_through_ec2net_and_report_the_right_resource_type(sink, ec2, stores):
-    subnet_id = _subnet(stores, sink, ec2)
+async def test_tags_flow_through_ec2net_and_report_the_right_resource_type(sink, ec2, stores):
+    subnet_id = await _subnet(stores, sink, ec2)
     vm = FakeInstanceVm()
-    instance_id = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, TagSpecifications=[
+    instance_id = (await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id, TagSpecifications=[
         {"ResourceType": "instance", "Tags": [{"Key": "Name", "Value": "web"}]},
-    ])["Instances"][0]["InstanceId"]
+    ]))["Instances"][0]["InstanceId"]
 
     req = sink.call(lambda: ec2.describe_tags(Filters=[{"Name": "resource-id", "Values": [instance_id]}]))
-    parsed = _parse("DescribeTags", _answer(stores, req, vm))
+    parsed = _parse("DescribeTags", await _answer(stores, req, vm))
     (tag,) = parsed["Tags"]
     assert tag == {"ResourceId": instance_id, "ResourceType": "instance", "Key": "Name", "Value": "web"}
 
@@ -1050,16 +1090,16 @@ class FakeReaperVm:
         self.deleted: list[str] = []
         self.listed = 0
 
-    def list_names(self) -> list[str]:
+    async def list_names(self) -> list[str]:
         self.listed += 1
         return list(self._names)
 
-    def delete(self, name: str) -> None:
+    async def delete(self, name: str) -> None:
         self.deleted.append(name)
         self._names.remove(name)
 
 
-def test_reap_orphaned_vms_deletes_only_unmatched_ec2_named_vms(tmp_path):
+async def test_reap_orphaned_vms_deletes_only_unmatched_ec2_named_vms(tmp_path):
     stores = SynthStores(tmp_path)
     stores.ec2compute.set("default", "instance:i-known", {"instance_id": "i-known", "state_name": "running"})
     vm = FakeReaperVm(names=[
@@ -1070,7 +1110,7 @@ def test_reap_orphaned_vms_deletes_only_unmatched_ec2_named_vms(tmp_path):
         "some-other-tool-vm",                 # another subsystem's VM -- never touched
     ])
 
-    reaped = ec2compute.reap_orphaned_vms(tmp_path, ["default", "staging"], vm=vm)
+    reaped = await ec2compute.reap_orphaned_vms(tmp_path, ["default", "staging"], vm=vm)
 
     assert sorted(reaped) == ["odin-ec2-default-i-orphaned", "odin-ec2-staging-i-elsewhere"]
     assert sorted(vm.deleted) == sorted(reaped)
@@ -1079,33 +1119,33 @@ def test_reap_orphaned_vms_deletes_only_unmatched_ec2_named_vms(tmp_path):
     assert "some-other-tool-vm" not in vm.deleted
 
 
-def test_reap_orphaned_vms_is_a_no_op_when_everything_matches(tmp_path):
+async def test_reap_orphaned_vms_is_a_no_op_when_everything_matches(tmp_path):
     stores = SynthStores(tmp_path)
     stores.ec2compute.set("default", "instance:i-known", {"instance_id": "i-known", "state_name": "running"})
     vm = FakeReaperVm(names=["odin-ec2-default-i-known"])
 
-    reaped = ec2compute.reap_orphaned_vms(tmp_path, ["default"], vm=vm)
+    reaped = await ec2compute.reap_orphaned_vms(tmp_path, ["default"], vm=vm)
 
     assert reaped == []
     assert vm.deleted == []
 
 
-def test_reap_orphaned_vms_with_no_vms_at_all_is_a_no_op(tmp_path):
+async def test_reap_orphaned_vms_with_no_vms_at_all_is_a_no_op(tmp_path):
     vm = FakeReaperVm(names=[])
-    assert ec2compute.reap_orphaned_vms(tmp_path, ["default"], vm=vm) == []
+    assert await ec2compute.reap_orphaned_vms(tmp_path, ["default"], vm=vm) == []
 
 
 # --- ODIN_REAP_EC2_VMS: the opt-out a second instance needs (v0.7.1) -------
 
 
 @pytest.mark.parametrize("value", ["0", "false", "no", "off", "OFF", " 0 "])
-def test_reap_orphaned_vms_is_off_when_odin_reap_ec2_vms_says_so(tmp_path, monkeypatch, value):
+async def test_reap_orphaned_vms_is_off_when_odin_reap_ec2_vms_says_so(tmp_path, monkeypatch, value):
     """A second odin on the same Mac must be able to leave the FIRST one's VMs
     alone: they are orphans by ITS store, which knows nothing about them."""
     monkeypatch.setenv("ODIN_REAP_EC2_VMS", value)
     vm = FakeReaperVm(names=["odin-ec2-default-i-someone-elses"])
 
-    assert ec2compute.reap_orphaned_vms(tmp_path, ["default"], vm=vm) == []
+    assert await ec2compute.reap_orphaned_vms(tmp_path, ["default"], vm=vm) == []
     assert vm.deleted == []
     # Not merely "deletes nothing" -- it must not even ENUMERATE, so the
     # opt-out holds on a machine where listing VMs is itself unwanted.
@@ -1113,16 +1153,16 @@ def test_reap_orphaned_vms_is_off_when_odin_reap_ec2_vms_says_so(tmp_path, monke
 
 
 @pytest.mark.parametrize("value", ["1", "true", "yes", "on", "", "anything-else"])
-def test_reap_orphaned_vms_stays_on_for_every_other_value(tmp_path, monkeypatch, value):
+async def test_reap_orphaned_vms_stays_on_for_every_other_value(tmp_path, monkeypatch, value):
     monkeypatch.setenv("ODIN_REAP_EC2_VMS", value)
     vm = FakeReaperVm(names=["odin-ec2-default-i-orphaned"])
-    assert ec2compute.reap_orphaned_vms(tmp_path, ["default"], vm=vm) == ["odin-ec2-default-i-orphaned"]
+    assert await ec2compute.reap_orphaned_vms(tmp_path, ["default"], vm=vm) == ["odin-ec2-default-i-orphaned"]
 
 
-def test_reap_orphaned_vms_is_on_when_the_variable_is_unset(tmp_path, monkeypatch):
+async def test_reap_orphaned_vms_is_on_when_the_variable_is_unset(tmp_path, monkeypatch):
     monkeypatch.delenv("ODIN_REAP_EC2_VMS", raising=False)
     vm = FakeReaperVm(names=["odin-ec2-default-i-orphaned"])
-    assert ec2compute.reap_orphaned_vms(tmp_path, ["default"], vm=vm) == ["odin-ec2-default-i-orphaned"]
+    assert await ec2compute.reap_orphaned_vms(tmp_path, ["default"], vm=vm) == ["odin-ec2-default-i-orphaned"]
 
 
 # --- reclaiming VMs an interrupted apply stranded (field test 3 HIGH-B) -----
@@ -1136,43 +1176,43 @@ def test_reap_orphaned_vms_is_on_when_the_variable_is_unset(tmp_path, monkeypatc
 # "expected" set from the very store that still claimed them.
 
 
-def _running_instance(sink, ec2, stores, vm) -> str:
-    vpc_id = _create_vpc(stores, sink, ec2)
-    subnet_id = _create_subnet(stores, sink, ec2, vpc_id)
-    parsed = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)
+async def _running_instance(sink, ec2, stores, vm) -> str:
+    vpc_id = await _create_vpc(stores, sink, ec2)
+    subnet_id = await _create_subnet(stores, sink, ec2, vpc_id)
+    parsed = await _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)
     instance_id = parsed["Instances"][0]["InstanceId"]
-    _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+    await _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
     return instance_id
 
 
-def test_destroy_reclaims_every_vm_the_store_still_claims(sink, ec2, stores):
+async def test_destroy_reclaims_every_vm_the_store_still_claims(sink, ec2, stores):
     """Destroy is unambiguous about intent, so it does not need tofu's state
     to know what to reclaim -- and the store must agree with reality after."""
     vm = FakeInstanceVm()
-    instance_id = _running_instance(sink, ec2, stores, vm)
+    instance_id = await _running_instance(sink, ec2, stores, vm)
 
-    reclaimed = ec2compute.reclaim_env_instances(stores, ENV, vm)
+    reclaimed = await ec2compute.reclaim_env_instances(stores, ENV, vm)
 
     assert reclaimed == [f"odin-ec2-{ENV}-{instance_id}"]
     assert vm.deleted == [f"odin-ec2-{ENV}-{instance_id}"]
     assert ec2compute._records(stores, ENV, "instance") == [], "/world must stop listing what is gone"
     # ...and it is idempotent: a second destroy has nothing left to do.
-    assert ec2compute.reclaim_env_instances(stores, ENV, vm) == []
+    assert await ec2compute.reclaim_env_instances(stores, ENV, vm) == []
 
 
-def test_destroy_refuses_to_report_success_over_a_vm_it_could_not_delete(sink, ec2, stores):
+async def test_destroy_refuses_to_report_success_over_a_vm_it_could_not_delete(sink, ec2, stores):
     """`destroyed / tf ok` while three real VMs keep running is the whole bug.
     If the VM cannot go, the record STAYS (so the next destroy tries again)
     and the caller is told, by name."""
     vm = FakeInstanceVm()
-    instance_id = _running_instance(sink, ec2, stores, vm)
+    instance_id = await _running_instance(sink, ec2, stores, vm)
 
-    def exploding_delete(name):
+    async def exploding_delete(name):
         raise RuntimeError("limactl: instance is busy")
 
     vm.delete = exploding_delete
     with pytest.raises(ec2compute.ReclaimFailed) as raised:
-        ec2compute.reclaim_env_instances(stores, ENV, vm)
+        await ec2compute.reclaim_env_instances(stores, ENV, vm)
 
     assert f"odin-ec2-{ENV}-{instance_id}" in str(raised.value)
     assert "limactl delete --force" in str(raised.value)
@@ -1187,38 +1227,38 @@ def _write_tf_state(root, env: str, instance_ids: list[str]) -> None:
     ]}))
 
 
-def test_an_instance_tofu_still_knows_about_is_never_forgotten(sink, ec2, stores):
+async def test_an_instance_tofu_still_knows_about_is_never_forgotten(sink, ec2, stores):
     vm = FakeInstanceVm()
-    instance_id = _running_instance(sink, ec2, stores, vm)
+    instance_id = await _running_instance(sink, ec2, stores, vm)
     _write_tf_state(stores.root, ENV, [instance_id])
     assert ec2compute.tf_forgotten_instances(stores, ENV) == []
 
 
-def test_an_instance_tofus_state_has_forgotten_is_unreachable_forever(sink, ec2, stores):
+async def test_an_instance_tofus_state_has_forgotten_is_unreachable_forever(sink, ec2, stores):
     """The crux: reality and the store disagree, and the store is the thing
     that is wrong. tofu's own state is the second witness -- an instance it
     does not name can never be reached by any terraform operation again."""
     vm = FakeInstanceVm()
-    instance_id = _running_instance(sink, ec2, stores, vm)
+    instance_id = await _running_instance(sink, ec2, stores, vm)
     _write_tf_state(stores.root, ENV, [])  # what `tofu destroy` writes after a crashed apply
 
     assert ec2compute.tf_forgotten_instances(stores, ENV) == [instance_id]
-    assert ec2compute.reclaim_tf_forgotten_vms(stores, [ENV], vm) == [f"odin-ec2-{ENV}-{instance_id}"]
+    assert await ec2compute.reclaim_tf_forgotten_vms(stores, [ENV], vm) == [f"odin-ec2-{ENV}-{instance_id}"]
     assert vm.deleted == [f"odin-ec2-{ENV}-{instance_id}"]
     assert ec2compute._records(stores, ENV, "instance") == []
 
 
-def test_no_readable_tofu_state_is_no_evidence_and_forgets_nothing(sink, ec2, stores):
+async def test_no_readable_tofu_state_is_no_evidence_and_forgets_nothing(sink, ec2, stores):
     """A state file that is missing (a fresh env) or empty (pre-created 0600
     but never written) must never be read as "tofu knows about nothing" --
     that would delete the VMs of an env that is perfectly healthy."""
     vm = FakeInstanceVm()
-    _running_instance(sink, ec2, stores, vm)
+    await _running_instance(sink, ec2, stores, vm)
     assert ec2compute.tf_forgotten_instances(stores, ENV) == []  # no file at all
 
     state = tf_dir(stores.root, ENV) / "terraform.tfstate"
     state.parent.mkdir(parents=True, exist_ok=True)
     state.write_text("")
     assert ec2compute.tf_forgotten_instances(stores, ENV) == []
-    assert ec2compute.reclaim_tf_forgotten_vms(stores, [ENV], vm) == []
+    assert await ec2compute.reclaim_tf_forgotten_vms(stores, [ENV], vm) == []
     assert vm.deleted == []
