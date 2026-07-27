@@ -477,15 +477,22 @@ class BackingAws:
             return
         d = self._backing_for("ecr")
         deadline = time.monotonic() + READY_TIMEOUT
-        while time.monotonic() < deadline:
-            port = await self._published_port_or_none(d)
-            try:
-                if port:
-                    httpx.get(f"http://127.0.0.1:{port}/v2/", timeout=2.0).raise_for_status()
-                    return
-            except httpx.HTTPError:
-                pass
-            await asyncio.sleep(0.5)
+        # `httpx.AsyncClient`, not `httpx.get`: this coroutine runs on the
+        # control loop the gateway and reconciler share, and a BLOCKING call
+        # inside an `async def` awaits perfectly happily while stalling
+        # everything else for its whole timeout. That is invisible in a way a
+        # thread never was -- the same shape that let a lambda invoke freeze
+        # the loop for 30s once its `to_thread` was removed.
+        async with httpx.AsyncClient() as client:
+            while time.monotonic() < deadline:
+                port = await self._published_port_or_none(d)
+                try:
+                    if port:
+                        (await client.get(f"http://127.0.0.1:{port}/v2/", timeout=2.0)).raise_for_status()
+                        return
+                except httpx.HTTPError:
+                    pass
+                await asyncio.sleep(0.5)
         raise RuntimeError(
             f"{cname} never became ready: {await self._not_ready_reason(cname, d, 'GET /v2/ never returned 200')}"
         )
