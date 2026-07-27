@@ -105,14 +105,55 @@ function nextId(type: string) {
   return `${type}-${++idCounter}`;
 }
 
-// Nudge a drop/double-click spot so a new node never overlaps an existing one.
-// Step is >= the default node width (200px), kept on the 20px grid.
-const DECOLLIDE_STEP = 220;
-function deCollide(pos: { x: number; y: number }, nodes: Node[]) {
-  let { x, y } = pos;
-  const occupied = () => nodes.some(n => Math.abs(n.position.x - x) < DECOLLIDE_STEP && Math.abs(n.position.y - y) < DECOLLIDE_STEP);
-  for (let i = 0; i < 50 && occupied(); i++) { x += DECOLLIDE_STEP; y += DECOLLIDE_STEP; }
-  return { x, y };
+// Nudge a drop/double-click spot only when the new node would REALLY overlap
+// an existing one, and then only as far as it takes.
+//
+// This used to treat a 220x220 halo around every node as occupied and, on a
+// hit, jump +220 in BOTH axes -- up to 50 times. So a drop merely NEAR another
+// node was flung diagonally away, which reads as "it went somewhere else
+// entirely", and two nearby nodes compounded it. The halo was always wrong for
+// height (a node is 40-80px tall now that leaves are content-sized, so 220
+// reserved 3-5x its real size) and the diagonal step moved on an axis nothing
+// had collided on.
+//
+// Real rectangle overlap plus one grid cell of breathing room, then a ring
+// search outward on the 20px grid for the NEAREST free slot -- so a node that
+// fits where you dropped it stays exactly there, and one that does not moves
+// the minimum distance, usually a single cell.
+const GAP = 20;
+
+type Box = { x: number; y: number; w: number; h: number };
+
+function boxOf(n: Node): Box {
+  const style = (n.style ?? {}) as { width?: number; height?: number };
+  return {
+    x: n.position.x,
+    y: n.position.y,
+    w: n.width ?? style.width ?? 200,
+    // Leaves are content-sized, so `measured` is the only truth for them;
+    // fall back to the middle of the 40-80 range rather than the old 220.
+    h: n.height ?? n.measured?.height ?? style.height ?? 60,
+  };
+}
+
+function hits(a: Box, b: Box): boolean {
+  return a.x < b.x + b.w + GAP && a.x + a.w + GAP > b.x
+      && a.y < b.y + b.h + GAP && a.y + a.h + GAP > b.y;
+}
+
+function deCollide(pos: { x: number; y: number }, nodes: Node[], size = { w: 200, h: 60 }) {
+  const boxes = nodes.map(boxOf);
+  const free = (p: { x: number; y: number }) => !boxes.some(b => hits({ ...p, ...size }, b));
+  if (free(pos)) return pos;
+  for (let r = GAP; r <= 600; r += GAP) {
+    for (const cand of [
+      { x: pos.x + r, y: pos.y }, { x: pos.x, y: pos.y + r },
+      { x: pos.x - r, y: pos.y }, { x: pos.x, y: pos.y - r },
+      { x: pos.x + r, y: pos.y + r }, { x: pos.x - r, y: pos.y + r },
+      { x: pos.x + r, y: pos.y - r }, { x: pos.x - r, y: pos.y - r },
+    ]) if (free(cand)) return cand;
+  }
+  return pos;
 }
 
 // Read the live endpoint / DATABASE_URL off a World resource's facts — the
@@ -502,7 +543,7 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
             // A drop point already inside a VPC/Subnet is a deliberate nesting
             // gesture — deCollide's proximity shove would otherwise push the
             // new node outside the container it was just dropped into.
-            position: isInsideContainer(position, nds) ? position : deCollide(position, nds),
+            position: isInsideContainer(position, nds) ? position : deCollide(position, nds, sizeFor(type)),
             zIndex: zIndexForType[type] ?? 2,
             data: { ...defaultDataForType[type], label },
             style: { ...defaultStyleForType[type] },
@@ -525,6 +566,14 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
 // declared height is used when there is one (vpc/subnet) and a 60px middle of
 // the leaf range otherwise -- half a row out is invisible, half a node is not.
 const CENTRED_FALLBACK = { width: 200, height: 60 };
+
+function sizeFor(type: string) {
+  const style = (defaultStyleForType[type] ?? {}) as { width?: number; height?: number };
+  return {
+    w: typeof style.width === 'number' ? style.width : CENTRED_FALLBACK.width,
+    h: typeof style.height === 'number' ? style.height : CENTRED_FALLBACK.height,
+  };
+}
 
 function centredOn(point: { x: number; y: number }, type: string) {
   const style = (defaultStyleForType[type] ?? {}) as { width?: number; height?: number };
@@ -561,7 +610,7 @@ const typeOrder = ['s3', 'sqs', 'dynamodb', 'rds', 'vpc', 'subnet', 'sg', 'ec2',
             // A drop point already inside a VPC/Subnet is a deliberate nesting
             // gesture — deCollide's proximity shove would otherwise push the
             // new node outside the container it was just dropped into.
-            position: isInsideContainer(position, nds) ? position : deCollide(position, nds),
+            position: isInsideContainer(position, nds) ? position : deCollide(position, nds, sizeFor(type)),
             zIndex: zIndexForType[type] ?? 2,
             data: { ...defaultDataForType[type], label },
             style: { ...defaultStyleForType[type] },
