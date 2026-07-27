@@ -131,6 +131,23 @@ than claimed" — was the single most valuable output of the field tests.
    signalled nothing because the container's BusyBox lacks `pgrep -o`, and odin
    was right to keep reporting healthy).
 
+## Concurrency: asyncio, not threads (owner directive, 2026-07-27)
+**No `threading` and no `multiprocessing` unless genuinely unavoidable — use
+`asyncio`/`anyio`.** The reason is locking: threads force it, and on a single
+event loop a synchronous read-modify-write is already atomic with respect to
+other tasks, because nothing preempts it without an `await`. So when threads
+go, DELETE the locks they existed for rather than porting `threading.Lock` to
+`asyncio.Lock` — check first whether the critical section contains an `await`;
+if it doesn't, it needs no lock. If a thread really is unavoidable (a blocking
+C call, a library with no async API), isolate it behind one
+`asyncio.to_thread` boundary and say in a comment why.
+
+odin's remaining threads as of v0.7.6, all scheduled to go in v0.7.7: the
+gateway's own uvicorn (`serve_in_thread`), the substrate boot threads
+(`ec2compute._finish_boot`, `lambdactl`'s deploy thread, `ecsctl._launch_task`,
+`cachectl._finish_create`), and the `threading.Lock` per env in
+`gateway/stores.py` that exists because of them.
+
 ## Working in parallel (subagents and teammates)
 Hard-won mechanics. Ignoring these has already destroyed work in this repo.
 - **An agent worktree is branched from whatever HEAD existed when it was
