@@ -352,7 +352,7 @@ _PURE_HANDLERS: dict[str, _PureHandler] = {
 }
 
 
-def pure_answer(
+async def pure_answer(
     action: str, resource: str, env: str, body: bytes, stores: SynthStores, now: float,
     backing_port: int | None = None, query: dict[str, str] | None = None,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
@@ -418,28 +418,40 @@ def pure_answer(
     actually-registered targets. Like ecs's TaskRuntime it needs no live fact
     threaded through here -- `gateway/models/elbv2ctl.py` defaults its own
     `LoadBalancerProxy`."""
+    # EVERY model's `pure_answer` is a coroutine, including the JSON-sidecar
+    # ones that await nothing, so every branch here is a plain `await` (v0.7.7).
+    # That uniformity is the guard: while some models were coroutines and some
+    # were not, a branch that forgot its `await` returned a COROUTINE OBJECT --
+    # which is truthy, so `app.py`'s `if pure is not None` accepted it and the
+    # gateway answered with a coroutine instead of a Response. Adding a model
+    # can no longer reintroduce that, because there is only one shape to copy.
     if action.startswith("ec2:"):
-        return ec2compute.pure_answer(action, resource, env, body, stores, now, keystore=keystore, gateway_port=gateway_port)
+        return await ec2compute.pure_answer(action, resource, env, body, stores, now, keystore=keystore, gateway_port=gateway_port)
     if action.startswith("iam:"):
-        return iamctl.pure_answer(action, resource, env, body, stores, now)
+        return await iamctl.pure_answer(action, resource, env, body, stores, now)
     if action.startswith("ecr:"):
-        return ecr.pure_answer(action, resource, env, body, stores, now, backing_port)
+        return await ecr.pure_answer(action, resource, env, body, stores, now, backing_port)
     if action.startswith("lambda:"):
-        return lambdactl.pure_answer(action, resource, env, body, stores, now, query=query, keystore=keystore, gateway_port=gateway_port)
+        return await lambdactl.pure_answer(action, resource, env, body, stores, now, query=query, keystore=keystore, gateway_port=gateway_port)
     if action.startswith("ecs:"):
-        return ecsctl.pure_answer(action, resource, env, body, stores, now, keystore=keystore, gateway_port=gateway_port)
+        return await ecsctl.pure_answer(action, resource, env, body, stores, now, keystore=keystore, gateway_port=gateway_port)
     if action.startswith("logs:"):
-        return logsctl.pure_answer(action, resource, env, body, stores, now)
+        return await logsctl.pure_answer(action, resource, env, body, stores, now)
     if action.startswith("secretsmanager:"):
-        return secretsctl.pure_answer(action, resource, env, body, stores, now)
+        return await secretsctl.pure_answer(action, resource, env, body, stores, now)
     if action.startswith("ssm:"):
-        return ssmctl.pure_answer(action, resource, env, body, stores, now)
+        return await ssmctl.pure_answer(action, resource, env, body, stores, now)
     if action.startswith("elasticache:"):
-        return cachectl.pure_answer(action, resource, env, body, stores, now)
+        return await cachectl.pure_answer(action, resource, env, body, stores, now)
     if action.startswith("rds:"):
-        return rdsctl.pure_answer(action, resource, env, body, stores, now, rds=rds)
+        return await rdsctl.pure_answer(action, resource, env, body, stores, now, rds=rds)
     if action.startswith("elasticloadbalancing:"):
-        return elbv2ctl.pure_answer(action, resource, env, body, stores, now)
+        return await elbv2ctl.pure_answer(action, resource, env, body, stores, now)
+    # `_PURE_HANDLERS` is the one table that stays SYNCHRONOUS: these are the
+    # gap-fill handlers for services that DO have a backing container, and
+    # every one of them is pure in-memory reshaping of the request body -- no
+    # substrate, nothing to await. They are called, not awaited, and their
+    # signature type says so.
     handler = _PURE_HANDLERS.get(action)
     return handler(resource, env, body, stores, now) if handler else None
 

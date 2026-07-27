@@ -78,12 +78,12 @@ DELIBERATE LIMITS, each honest rather than silently wrong:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import secrets
-import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from datetime import datetime, timezone
 from typing import NamedTuple
 from urllib.parse import parse_qsl
@@ -97,7 +97,7 @@ from odin.fabric.models import FirewallRules
 from odin.fabric.nebula import union_firewalls
 from odin.gateway import errors
 from odin.gateway.errors import exc_text
-from odin.gateway.models import ec2net
+from odin.gateway.models import background, ec2net, join
 from odin.gateway.models.ec2compute import membership_revision
 from odin.gateway.stores import NO_CHANGE, SynthStores
 from odin.reconcile.assertions import pg_ready_sync
@@ -381,7 +381,7 @@ def _instance_response(action: str, stores: SynthStores, env: str, record: dict)
 
 def _update(stores: SynthStores, env: str, identifier: str, **fields: object) -> None:
     """Field-wise update through the store's own mutate seam, so the create
-    waiter's background thread and a concurrent Describe/Delete can't clobber
+    waiter's background task and a concurrent Describe/Delete can't clobber
     each other's writes. A record that's already GONE (deleted while a boot
     was still in flight) is left gone -- never resurrected, the same guard
     `ec2compute._update_instance` keeps for its own terminal states."""
@@ -395,12 +395,6 @@ def _update(stores: SynthStores, env: str, identifier: str, **fields: object) ->
         return {**current, **fields}
 
     stores.rdsctl.update(env, _key(identifier), mutate)
-
-
-def _spawn(target: Callable[..., None], *args: object) -> threading.Thread:
-    thread = threading.Thread(target=target, args=args, daemon=True)
-    thread.start()
-    return thread
 
 
 def _substrate(env: str, stores: SynthStores, rds: PostgresRds | None) -> PostgresRds:
@@ -493,14 +487,18 @@ async def _wait_available(rds: PostgresRds, identifier: str, user: str, password
                 return endpoint[1], None
             if not probe.ok:
                 error = probe.error or "pg_ready failed"
-        time.sleep(_POLL_INTERVAL)
+        # `await`, not `time.sleep`: this waiter used to own a daemon thread and
+        # now runs as a task on the shared control loop, where a blocking sleep
+        # would freeze the reconciler AND the gateway for its full duration --
+        # and this one repeats for up to `_CREATE_TIMEOUT` (180s).
+        await asyncio.sleep(_POLL_INTERVAL)
     return 0, error
 
 
 async def _finish_create(stores: SynthStores, env: str, identifier: str, user: str, password: str, db_name: str, rds: PostgresRds) -> None:
     # Deliberately broad, for `ec2compute._finish_boot`'s exact reason: this
-    # runs on a daemon thread with no caller to propagate to, and an uncaught
-    # exception would strand the instance `creating` forever -- the provider's
+    # runs as an unattended background task with no caller to propagate to, and
+    # an uncaught exception would strand the instance `creating` forever -- the provider's
     # create waiter would then spin until ITS timeout with no explanation.
     # Any failure becomes a real, provider-visible `failed` status instead.
     try:
@@ -554,7 +552,7 @@ async def _finish_delete(stores: SynthStores, env: str, identifier: str, rds: Po
 # --- handlers --------------------------------------------------------------
 
 
-def _create_db_instance(params: dict[str, str], env: str, stores: SynthStores, now: float, rds: PostgresRds) -> Response:
+async def _create_db_instance(params: dict[str, str], env: str, stores: SynthStores, now: float, rds: PostgresRds) -> Response:
     # No `if not identifier` guard: `_missing_identifier` (dispatch, below)
     # rejects an empty `DBInstanceIdentifier` for EVERY op now, this one
     # included -- it was the only handler that ever checked.
@@ -598,16 +596,18 @@ def _create_db_instance(params: dict[str, str], env: str, stores: SynthStores, n
     }
     stores.rdsctl.set(env, _key(identifier), record)
     _set_tags(stores, env, identifier, _request_tags(params))
-    # Render the `creating` answer BEFORE spawning the boot (JsonStore hands
+    # Render the `creating` answer BEFORE starting the boot (JsonStore hands
     # back the same dict it was given, so a fast fake substrate could
     # otherwise flip it to `available` mid-render -- ec2compute's own
-    # documented race).
+    # documented race). Still true with a task rather than a thread: the
+    # coroutine does not begin running until this handler next awaits, but the
+    # ordering is kept because it is the ordering the invariant is stated in.
     response = _instance_response("CreateDBInstance", stores, env, record)
-    _spawn(_finish_create, stores, env, identifier, user, password, record["db_name"], rds)
+    background(_finish_create(stores, env, identifier, user, password, record["db_name"], rds))
     return response
 
 
-def _describe_db_instances(params: dict[str, str], env: str, stores: SynthStores, now: float, rds: PostgresRds) -> Response:
+async def _describe_db_instances(params: dict[str, str], env: str, stores: SynthStores, now: float, rds: PostgresRds) -> Response:
     identifier = params.get("DBInstanceIdentifier", "")
     if identifier:
         record = _record(stores, env, identifier)
@@ -623,7 +623,7 @@ def _describe_db_instances(params: dict[str, str], env: str, stores: SynthStores
     return _response("DescribeDBInstances", f"<DBInstances>{items}</DBInstances>")
 
 
-def _delete_db_instance(params: dict[str, str], env: str, stores: SynthStores, now: float, rds: PostgresRds) -> Response:
+async def _delete_db_instance(params: dict[str, str], env: str, stores: SynthStores, now: float, rds: PostgresRds) -> Response:
     identifier = params.get("DBInstanceIdentifier", "")
     record = _record(stores, env, identifier)
     if record is None:
@@ -635,7 +635,7 @@ def _delete_db_instance(params: dict[str, str], env: str, stores: SynthStores, n
     _update(stores, env, identifier, status=DELETING)
     deleting = {**record, "status": DELETING}
     response = _instance_response("DeleteDBInstance", stores, env, deleting)
-    _spawn(_finish_delete, stores, env, identifier, rds)
+    background(_finish_delete(stores, env, identifier, rds))
     return response
 
 
@@ -688,14 +688,14 @@ def _tagged(params: dict[str, str], env: str, stores: SynthStores) -> tuple[str,
     return identifier, _record(stores, env, identifier)
 
 
-def _list_tags_for_resource(params: dict[str, str], env: str, stores: SynthStores, now: float, rds: PostgresRds) -> Response:
+async def _list_tags_for_resource(params: dict[str, str], env: str, stores: SynthStores, now: float, rds: PostgresRds) -> Response:
     identifier, record = _tagged(params, env, stores)
     if record is None:
         return _not_found(identifier)
     return _response("ListTagsForResource", _tags_xml(_tags_for(stores, env, identifier)))
 
 
-def _add_tags_to_resource(params: dict[str, str], env: str, stores: SynthStores, now: float, rds: PostgresRds) -> Response:
+async def _add_tags_to_resource(params: dict[str, str], env: str, stores: SynthStores, now: float, rds: PostgresRds) -> Response:
     identifier, record = _tagged(params, env, stores)
     if record is None:
         return _not_found(identifier)
@@ -703,7 +703,7 @@ def _add_tags_to_resource(params: dict[str, str], env: str, stores: SynthStores,
     return _empty_response("AddTagsToResource")
 
 
-def _remove_tags_from_resource(params: dict[str, str], env: str, stores: SynthStores, now: float, rds: PostgresRds) -> Response:
+async def _remove_tags_from_resource(params: dict[str, str], env: str, stores: SynthStores, now: float, rds: PostgresRds) -> Response:
     identifier, record = _tagged(params, env, stores)
     if record is None:
         return _not_found(identifier)
@@ -735,7 +735,7 @@ def mark_instance_failed(stores: SynthStores, env: str, identifier: str, reason:
 
 def converge_db_instances(
     stores: SynthStores, env: str, substrate: PostgresRds | None = None,
-) -> list[threading.Thread]:
+) -> list[asyncio.Task]:
     """Re-create the REAL Postgres container of every `failed` instance -- the
     same `_finish_create` pass CreateDBInstance spawns, driven by an APPLY
     (server.py's /apply-full) rather than by an AWS mutation.
@@ -745,7 +745,7 @@ def converge_db_instances(
     failed storage without terraform's involvement either.
 
     Idempotent, and never two boots at once: the record is claimed back to
-    `creating` in the store BEFORE the thread is spawned, so a second Apply
+    `creating` in the store BEFORE the boot is started, so a second Apply
     arriving mid-boot sees `creating` and skips (`ec2compute._claim_delete_retry`'s
     claim-then-act shape). `available`/`creating`/`deleting` records are left
     completely alone.
@@ -753,9 +753,14 @@ def converge_db_instances(
     `substrate` is per-ENV, so it's built here rather than passed in from the
     request path: one `PostgresRds` covers every record in this env.
 
-    Returns the spawned threads so the caller can WAIT for the convergence it
+    Returns the started TASKS so the caller can WAIT for the convergence it
     just asked for (`wait_for_available_instances`) instead of guessing at it
-    -- `ecsctl.converge_services`' contract, for the same reason."""
+    -- `ecsctl.converge_services`' contract, for the same reason.
+
+    Deliberately still a PLAIN `def` after v0.7.7's de-threading: it starts
+    work and awaits none of it, and `server.py` calls it from an already-async
+    route, which is all `asyncio.create_task` needs. Making it a coroutine
+    would have bought nothing and changed a caller this module does not own."""
     rds = substrate or PostgresRds(ColimaRuntime(), env, root=stores.root)
     spawned = []
     for record in records(stores, env):
@@ -764,10 +769,10 @@ def converge_db_instances(
         identifier = record["db_instance_identifier"]
         _update(stores, env, identifier, status=CREATING, endpoint_port=0)
         log.info("converging rds %s (env %s): re-creating its container", identifier, env)
-        spawned.append(_spawn(
-            _finish_create, stores, env, identifier,
+        spawned.append(background(_finish_create(
+            stores, env, identifier,
             record["master_username"], record["master_password"], record["db_name"], rds,
-        ))
+        )))
     return spawned
 
 
@@ -844,16 +849,17 @@ def db_faults(stores: SynthStores, env: str) -> list[DatabaseFault]:
     return [fault for r in records(stores, env) for fault in [_db_fault(r)] if fault is not None]
 
 
-def wait_for_available_instances(
+async def wait_for_available_instances(
     stores: SynthStores, env: str,
-    converging: Iterable[threading.Thread] = (), timeout: float | None = None,
+    converging: Iterable[Awaitable[None]] = (), timeout: float | None = None,
 ) -> list[DatabaseFault]:
     """Every database instance left `failed` once the Apply's convergence has
     had its bounded chance -- empty means every database in the env really is
     reachable, which is the only state an Apply may report success in.
 
     Bounded exactly the three ways `ecsctl.wait_for_steady_services` is: it
-    JOINS `converging`, it returns the instant nothing is still `creating` (a
+    AWAITS `converging` (the tasks `converge_db_instances` just started -- a
+    `Thread.join` before v0.7.7), it returns the instant nothing is still `creating` (a
     `failed` instance with no boot in flight cannot recover without another
     Apply, and a healthy env returns after ONE store read), and it returns at
     `available_timeout()` regardless.
@@ -868,13 +874,12 @@ def wait_for_available_instances(
     apply that finds it rather than the one after the drift sweep's cadence
     notices (field test 5)."""
     deadline = time.monotonic() + (available_timeout() if timeout is None else timeout)
-    for thread in converging:
-        thread.join(max(0.0, deadline - time.monotonic()))
+    await join(converging, deadline - time.monotonic())
     while True:
         current = records(stores, env)
         if not any(r["status"] == CREATING for r in current) or time.monotonic() >= deadline:
             return db_faults(stores, env)
-        time.sleep(_AVAILABLE_POLL_SECONDS)
+        await asyncio.sleep(_AVAILABLE_POLL_SECONDS)
 
 
 async def ensure_db_mesh(
@@ -910,7 +915,13 @@ async def ensure_db_mesh(
 
 # --- dispatch --------------------------------------------------------------
 
-_Handler = Callable[[dict[str, str], str, SynthStores, float, PostgresRds], Response]
+# EVERY handler is a coroutine function, including the ones that await
+# nothing (v0.7.7). One uniform contract is what keeps `pure_answer` a single
+# `await handler(...)` -- the alternative, a table of mixed sync/async
+# callables sniffed at the call site, is exactly how a coroutine object gets
+# returned as a Response and passes `if pure is not None` because coroutines
+# are truthy.
+_Handler = Callable[[dict[str, str], str, SynthStores, float, PostgresRds], Awaitable[Response]]
 
 _HANDLERS: dict[str, _Handler] = {
     "CreateDBInstance": _create_db_instance,
@@ -955,7 +966,7 @@ def _missing_identifier(op: str, params: dict[str, str]) -> str | None:
     return member if member and not params.get(member, "").strip() else None
 
 
-def pure_answer(
+async def pure_answer(
     action: str, resource: str, env: str, body: bytes, stores: SynthStores, now: float,
     rds: PostgresRds | None = None,
 ) -> Response:
@@ -971,4 +982,4 @@ def pure_answer(
     missing = _missing_identifier(op, params)
     if missing is not None:
         return errors.synth_error("rds", "InvalidParameterValue", f"{missing} is required", 400)
-    return handler(params, env, stores, now, _substrate(env, stores, rds))
+    return await handler(params, env, stores, now, _substrate(env, stores, rds))

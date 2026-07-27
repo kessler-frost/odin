@@ -715,7 +715,7 @@ _HANDLERS: dict[str, _Handler] = {
 }
 
 
-def pure_answer(action: str, resource: str, env: str, body: bytes, stores: SynthStores, now: float) -> Response:
+async def pure_answer(action: str, resource: str, env: str, body: bytes, stores: SynthStores, now: float) -> Response:
     """The whole CloudWatch Logs answer -- same no-backing contract as
     ec2net/iamctl/ecr: an unmodeled action gets a protocol-correct error,
     never a 503 and never a silent forward."""

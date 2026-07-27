@@ -92,9 +92,9 @@ from __future__ import annotations
 
 import logging
 import secrets
-import threading
+import asyncio
 import weakref
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from urllib.parse import parse_qsl
 from xml.sax.saxutils import escape
@@ -106,6 +106,7 @@ from odin.aws.backings import ACCOUNT, REGION
 from odin.compute.proxy import IDLE_LISTEN_PORT, LoadBalancerProxy, ProxyListener, _sanitize_upstream, target_address
 from odin.gateway import errors
 from odin.gateway.errors import exc_text
+from odin.gateway.models import background
 from odin.gateway.stores import NO_CHANGE, SynthStores
 from odin.runtime.colima import CONTAINER_HOST
 
@@ -576,21 +577,25 @@ def _upstream_address(stores: SynthStores, env: str, target: dict) -> str:
 # `ecsctl._lock_for_service`. `_proxy_locks_guard` below is the opposite case
 # and DOES delete -- it guards only an await-free `setdefault` into the
 # registry (see `fabric/nebula.py`'s note for the general split).
-_proxy_locks: "weakref.WeakKeyDictionary[SynthStores, dict[tuple[str, str], threading.Lock]]" = weakref.WeakKeyDictionary()
-_proxy_locks_guard = threading.Lock()
+_proxy_locks: "weakref.WeakKeyDictionary[SynthStores, dict[tuple[str, str], asyncio.Lock]]" = weakref.WeakKeyDictionary()
 
 
-def _lock_for_lb(stores: SynthStores, env: str, lb_name: str) -> threading.Lock:
-    with _proxy_locks_guard:
-        return _proxy_locks.setdefault(stores, {}).setdefault((env, lb_name), threading.Lock())
+def _lock_for_lb(stores: SynthStores, env: str, lb_name: str) -> asyncio.Lock:
+    # `_proxy_locks_guard` is GONE, and its absence is the point: this body is
+    # two `setdefault` calls with no `await` between them, so on a single event
+    # loop nothing can preempt it and no lock can make it more atomic than it
+    # already is. Porting it to `asyncio.Lock` would have been ceremony -- and
+    # would have forced this function to become a coroutine, spreading the
+    # ceremony to every caller.
+    return _proxy_locks.setdefault(stores, {}).setdefault((env, lb_name), asyncio.Lock())
 
 
 async def converge_proxy(stores: SynthStores, env: str, lb_name: str, proxy: LoadBalancerProxy) -> None:
     """Bring the load balancer's REAL nginx container in line with the current
     listener/target state and record the published endpoint + `active` state on
-    the lb record. Synchronous and idempotent; every caller either already runs
-    off the event loop (ecsctl's task threads) or goes through `_spawn`."""
-    with _lock_for_lb(stores, env, lb_name):
+    the lb record. Idempotent; every caller either awaits it (ecsctl's task
+    reconcile) or starts it as a background task."""
+    async with _lock_for_lb(stores, env, lb_name):
         record = _lb(stores, env, lb_name)
         if record is None:  # deleted while this converge was queued
             return
@@ -609,11 +614,10 @@ async def converge_proxy(stores: SynthStores, env: str, lb_name: str, proxy: Loa
 
 
 async def _converge_safely(stores: SynthStores, env: str, lb_name: str, proxy: LoadBalancerProxy) -> None:
-    """`converge_proxy` on a daemon thread with no caller to raise to -- the
-    same "a silent hang is forbidden" contract ec2compute's `_finish_boot` and
-    ecsctl's `_launch_task` keep: a real `docker run` failure becomes the load
-    balancer's honest `failed` state plus a log line, never an exception nobody
-    ever sees."""
+    """`converge_proxy` with no caller to raise to -- the same "a silent hang is
+    forbidden" contract ec2compute's `_finish_boot` and ecsctl's `_launch_task`
+    keep: a real `docker run` failure becomes the load balancer's honest
+    `failed` state plus a log line, never an exception nobody ever sees."""
     try:
         await converge_proxy(stores, env, lb_name, proxy)
     except Exception as exc:  # noqa: BLE001 -- deliberately broad, see docstring
@@ -624,20 +628,21 @@ async def _converge_safely(stores: SynthStores, env: str, lb_name: str, proxy: L
         ))
 
 
-def _spawn(stores: SynthStores, env: str, lb_name: str, proxy: LoadBalancerProxy) -> None:
-    threading.Thread(target=_converge_safely, args=(stores, env, lb_name, proxy), daemon=True).start()
-
-
-def _converge_target_group(stores: SynthStores, env: str, tg_name: str, proxy: LoadBalancerProxy, spawn: bool) -> None:
+async def _converge_target_group(stores: SynthStores, env: str, tg_name: str, proxy: LoadBalancerProxy, spawn: bool) -> None:
     """Re-converge every load balancer whose listener forwards to `tg_name` --
     what a target change actually has to touch.
 
-    `spawn=False` (the ECS task-launch path, already on its own thread) still
-    goes through `_converge_safely`, NOT bare `converge_proxy`: a real `docker
-    cp`/`docker run` failure there would otherwise propagate into
-    `ecsctl._launch_task`'s caller and kill that daemon thread outright, leaving
-    a RUNNING task nothing ever registers. Same "a silent hang is forbidden"
-    contract, one function."""
+    `spawn=False` (the ECS task-launch path, which is itself already a
+    background task) AWAITS `_converge_safely`, and never bare `converge_proxy`:
+    a real `docker cp`/`docker run` failure there would otherwise propagate into
+    `ecsctl._launch_task`'s caller and end that task outright, leaving a RUNNING
+    task nothing ever registers. Same "a silent hang is forbidden" contract, one
+    function.
+
+    `spawn=True` (the wire path -- RegisterTargets/DeregisterTargets, whose
+    caller must not block on a `docker run`) starts each converge as a
+    background task instead. Same function either way; only the awaiting
+    differs."""
     tg = _tg(stores, env, tg_name)
     arn = (tg or {}).get("arn")
     lb_names = {
@@ -645,13 +650,17 @@ def _converge_target_group(stores: SynthStores, env: str, tg_name: str, proxy: L
         if any(a.get("TargetGroupArn") == arn for a in listener["default_actions"])
     }
     for lb_name in sorted(lb_names):
-        (_spawn if spawn else _converge_safely)(stores, env, lb_name, proxy)
+        converge = _converge_safely(stores, env, lb_name, proxy)
+        if spawn:
+            background(converge)
+        else:
+            await converge
 
 
 # --- the internal registration API the ECS substrate uses (never the wire) --
 
 
-def register_target(
+async def register_target(
     stores: SynthStores, env: str, target_group_arn: str, target_id: str, port: int,
     proxy: LoadBalancerProxy | None = None,
 ) -> None:
@@ -662,18 +671,18 @@ def register_target(
     guard `RegisterTargets` keeps: an unknown target group simply stores
     nothing (a service pointing at a deleted group has no proxy to reload
     either)."""
-    _register(stores, env, target_group_arn, [{"id": target_id, "port": port}], proxy or LoadBalancerProxy(), spawn=False)
+    await _register(stores, env, target_group_arn, [{"id": target_id, "port": port}], proxy or LoadBalancerProxy(), spawn=False)
 
 
-def deregister_target(
+async def deregister_target(
     stores: SynthStores, env: str, target_group_arn: str, target_id: str, port: int,
     proxy: LoadBalancerProxy | None = None,
 ) -> None:
     """The inverse of `register_target` -- called as ECS stops a task."""
-    _deregister(stores, env, target_group_arn, [{"id": target_id, "port": port}], proxy or LoadBalancerProxy(), spawn=False)
+    await _deregister(stores, env, target_group_arn, [{"id": target_id, "port": port}], proxy or LoadBalancerProxy(), spawn=False)
 
 
-def _register(stores: SynthStores, env: str, arn: str, targets: list[dict], proxy: LoadBalancerProxy, spawn: bool) -> None:
+async def _register(stores: SynthStores, env: str, arn: str, targets: list[dict], proxy: LoadBalancerProxy, spawn: bool) -> None:
     tg = _tg_by_arn(stores, env, arn)
     if tg is None:
         return
@@ -684,10 +693,10 @@ def _register(stores: SynthStores, env: str, arn: str, targets: list[dict], prox
         return [*kept, *targets]
 
     stores.elbv2ctl.update(env, _targets_key(tg["name"]), mutate)
-    _converge_target_group(stores, env, tg["name"], proxy, spawn)
+    await _converge_target_group(stores, env, tg["name"], proxy, spawn)
 
 
-def _deregister(stores: SynthStores, env: str, arn: str, targets: list[dict], proxy: LoadBalancerProxy, spawn: bool) -> None:
+async def _deregister(stores: SynthStores, env: str, arn: str, targets: list[dict], proxy: LoadBalancerProxy, spawn: bool) -> None:
     tg = _tg_by_arn(stores, env, arn)
     if tg is None:
         return
@@ -695,7 +704,7 @@ def _deregister(stores: SynthStores, env: str, arn: str, targets: list[dict], pr
     stores.elbv2ctl.update(env, _targets_key(tg["name"]), lambda current: [
         t for t in (current or []) if (t["id"], t.get("port")) not in doomed
     ])
-    _converge_target_group(stores, env, tg["name"], proxy, spawn)
+    await _converge_target_group(stores, env, tg["name"], proxy, spawn)
 
 
 def endpoint_url(record: dict) -> str | None:
@@ -750,7 +759,7 @@ def _availability_zones(stores: SynthStores, env: str, subnet_ids: list[str]) ->
     return zones
 
 
-def _create_load_balancer(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
+async def _create_load_balancer(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
     name = params.get("Name", "")
     if not name:
         return _validation_error("Name is required")
@@ -792,7 +801,7 @@ def _create_load_balancer(params: dict[str, str], env: str, stores: SynthStores,
     stores.elbv2ctl.set(env, _lb_key(name), record)
     _set_tags(stores, env, record["arn"], _tags(params))
     response = _response("CreateLoadBalancer", _members("LoadBalancers", [_lb_xml(record)]))
-    _spawn(stores, env, name, proxy)
+    background(_converge_safely(stores, env, name, proxy))
     return response
 
 
@@ -810,7 +819,7 @@ def _select_lbs(params: dict[str, str], env: str, stores: SynthStores) -> tuple[
     return selected, None
 
 
-def _describe_load_balancers(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
+async def _describe_load_balancers(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
     selected, missing = _select_lbs(params, env, stores)
     if missing is not None:
         return _not_found("LoadBalancerNotFound", f"Load balancer '{missing}' not found")
@@ -836,7 +845,7 @@ async def _delete_load_balancer(params: dict[str, str], env: str, stores: SynthS
     return _response("DeleteLoadBalancer", "")
 
 
-def _describe_load_balancer_attributes(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
+async def _describe_load_balancer_attributes(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
     name = name_from_arn(params.get("LoadBalancerArn", ""))
     record = _lb(stores, env, name)
     if record is None:
@@ -848,7 +857,7 @@ def _describe_load_balancer_attributes(params: dict[str, str], env: str, stores:
     return _response("DescribeLoadBalancerAttributes", _attributes_xml({**record["attributes"], **extra}))
 
 
-def _modify_load_balancer_attributes(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
+async def _modify_load_balancer_attributes(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
     name = name_from_arn(params.get("LoadBalancerArn", ""))
     record = _lb(stores, env, name)
     if record is None:
@@ -876,7 +885,7 @@ def _health_check(params: dict[str, str], current: dict | None = None) -> dict:
     return merged
 
 
-def _create_target_group(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
+async def _create_target_group(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
     name = params.get("Name", "")
     if not name:
         return _validation_error("Name is required")
@@ -918,7 +927,7 @@ def _lb_arns_for_tg(stores: SynthStores, env: str, tg_record: dict) -> list[str]
     )
 
 
-def _describe_target_groups(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
+async def _describe_target_groups(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
     arns = _scalars(params, "TargetGroupArns")
     names = _scalars(params, "Names") or [name_from_arn(arn) for arn in arns]
     lb_filter = params.get("LoadBalancerArn")
@@ -937,7 +946,7 @@ def _describe_target_groups(params: dict[str, str], env: str, stores: SynthStore
     return _response("DescribeTargetGroups", _members("TargetGroups", [_tg_xml(r, a) for r, a in groups]))
 
 
-def _delete_target_group(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
+async def _delete_target_group(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
     name = name_from_arn(params.get("TargetGroupArn", ""))
     record = _tg(stores, env, name)
     if record is None:
@@ -948,7 +957,7 @@ def _delete_target_group(params: dict[str, str], env: str, stores: SynthStores, 
     return _response("DeleteTargetGroup", "")
 
 
-def _modify_target_group(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
+async def _modify_target_group(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
     name = name_from_arn(params.get("TargetGroupArn", ""))
     record = _tg(stores, env, name)
     if record is None:
@@ -960,11 +969,11 @@ def _modify_target_group(params: dict[str, str], env: str, stores: SynthStores, 
     updated = {**record, "health_check": _health_check(params, _stored_health_check(record)), "matcher": matcher}
     stores.elbv2ctl.set(env, _tg_key(name), updated)
     # A changed health-check interval changes the proxy's passive `fail_timeout`.
-    _converge_target_group(stores, env, name, proxy, spawn=True)
+    await _converge_target_group(stores, env, name, proxy, spawn=True)
     return _response("ModifyTargetGroup", _members("TargetGroups", [_tg_xml(updated, _lb_arns_for_tg(stores, env, updated))]))
 
 
-def _describe_target_group_attributes(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
+async def _describe_target_group_attributes(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
     name = name_from_arn(params.get("TargetGroupArn", ""))
     record = _tg(stores, env, name)
     if record is None:
@@ -972,7 +981,7 @@ def _describe_target_group_attributes(params: dict[str, str], env: str, stores: 
     return _response("DescribeTargetGroupAttributes", _attributes_xml(record["attributes"]))
 
 
-def _modify_target_group_attributes(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
+async def _modify_target_group_attributes(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
     name = name_from_arn(params.get("TargetGroupArn", ""))
     record = _tg(stores, env, name)
     if record is None:
@@ -1000,7 +1009,7 @@ def _default_actions(params: dict[str, str]) -> list[dict]:
     return actions
 
 
-def _create_listener(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
+async def _create_listener(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
     lb_name = name_from_arn(params.get("LoadBalancerArn", ""))
     lb = _lb(stores, env, lb_name)
     if lb is None:
@@ -1028,11 +1037,11 @@ def _create_listener(params: dict[str, str], env: str, stores: SynthStores, prox
     response = _response("CreateListener", _members("Listeners", [_listener_xml(record)]))
     # A new listener changes the proxy's PUBLISHED PORT SET, which Docker can't
     # apply to a live container -- `LoadBalancerProxy.ensure` recreates it.
-    _spawn(stores, env, lb_name, proxy)
+    background(_converge_safely(stores, env, lb_name, proxy))
     return response
 
 
-def _describe_listeners(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
+async def _describe_listeners(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
     arns = _scalars(params, "ListenerArns")
     lb_arn_filter = params.get("LoadBalancerArn")
     if arns:
@@ -1050,7 +1059,7 @@ def _describe_listeners(params: dict[str, str], env: str, stores: SynthStores, p
     return _response("DescribeListeners", _members("Listeners", [_listener_xml(r) for r in selected]))
 
 
-def _modify_listener(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
+async def _modify_listener(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
     arn = params.get("ListenerArn", "")
     record = next((r for r in _all_listeners(stores, env) if r["arn"] == arn), None)
     if record is None:
@@ -1064,11 +1073,11 @@ def _modify_listener(params: dict[str, str], env: str, stores: SynthStores, prox
     }
     stores.elbv2ctl.set(env, _listener_key(record["listener_id"]), updated)
     response = _response("ModifyListener", _members("Listeners", [_listener_xml(updated)]))
-    _spawn(stores, env, record["lb_name"], proxy)
+    background(_converge_safely(stores, env, record["lb_name"], proxy))
     return response
 
 
-def _describe_listener_attributes(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
+async def _describe_listener_attributes(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
     """FOUND EMPIRICALLY, not from the resource's documented surface: the first
     real `tofu apply` through the real gateway failed at
     `aws_lb_listener` create with "reading ELBv2 Listener attributes:
@@ -1089,7 +1098,7 @@ def _describe_listener_attributes(params: dict[str, str], env: str, stores: Synt
     return _response("DescribeListenerAttributes", _attributes_xml(record.get("attributes") or {}))
 
 
-def _modify_listener_attributes(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
+async def _modify_listener_attributes(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
     arn = params.get("ListenerArn", "")
     record = next((r for r in _all_listeners(stores, env) if r["arn"] == arn), None)
     if record is None:
@@ -1099,7 +1108,7 @@ def _modify_listener_attributes(params: dict[str, str], env: str, stores: SynthS
     return _response("ModifyListenerAttributes", _attributes_xml(attributes))
 
 
-def _delete_listener(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
+async def _delete_listener(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
     arn = params.get("ListenerArn", "")
     record = next((r for r in _all_listeners(stores, env) if r["arn"] == arn), None)
     if record is None:
@@ -1107,30 +1116,30 @@ def _delete_listener(params: dict[str, str], env: str, stores: SynthStores, prox
     stores.elbv2ctl.delete(env, _listener_key(record["listener_id"]))
     _set_tags(stores, env, arn, {})
     response = _response("DeleteListener", "")
-    _spawn(stores, env, record["lb_name"], proxy)
+    background(_converge_safely(stores, env, record["lb_name"], proxy))
     return response
 
 
 # --- Targets ---------------------------------------------------------------
 
 
-def _register_targets(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
+async def _register_targets(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
     arn = params.get("TargetGroupArn", "")
     if _tg_by_arn(stores, env, arn) is None:
         return _not_found("TargetGroupNotFound", f"Target group '{name_from_arn(arn)}' not found")
-    _register(stores, env, arn, _targets(params), proxy, spawn=True)
+    await _register(stores, env, arn, _targets(params), proxy, spawn=True)
     return _response("RegisterTargets", "")
 
 
-def _deregister_targets(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
+async def _deregister_targets(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
     arn = params.get("TargetGroupArn", "")
     if _tg_by_arn(stores, env, arn) is None:
         return _not_found("TargetGroupNotFound", f"Target group '{name_from_arn(arn)}' not found")
-    _deregister(stores, env, arn, _targets(params), proxy, spawn=True)
+    await _deregister(stores, env, arn, _targets(params), proxy, spawn=True)
     return _response("DeregisterTargets", "")
 
 
-def _probe_target(stores: SynthStores, env: str, tg: dict, target: dict) -> tuple[str, str, str]:
+async def _probe_target(stores: SynthStores, env: str, tg: dict, target: dict) -> tuple[str, str, str]:
     """(State, Reason, Description) from a REAL HTTP GET against the target's
     real address on the target group's own health-check path, compared to its
     `Matcher.HttpCode`. Never invents `healthy`: a refused connection or a
@@ -1149,7 +1158,13 @@ def _probe_target(stores: SynthStores, env: str, tg: dict, target: dict) -> tupl
     url = f"http://{probe_host}:{port}{health['HealthCheckPath']}"
     expected = (tg.get("matcher") or {}).get("HttpCode") or "200"
     try:
-        status = httpx.get(url, timeout=_PROBE_TIMEOUT_SECONDS).status_code
+        # `AsyncClient`, not `httpx.get` (v0.7.7): DescribeTargetHealth probes
+        # EVERY registered target, and terraform POLLS this action -- a blocking
+        # request per target is `len(targets) * _PROBE_TIMEOUT_SECONDS` of dead
+        # control loop per call. Same timeout, same status code, same
+        # `httpx.HTTPError` surface, so the reasons below are unchanged.
+        async with httpx.AsyncClient() as client:
+            status = (await client.get(url, timeout=_PROBE_TIMEOUT_SECONDS)).status_code
     except httpx.HTTPError as exc:
         return "unhealthy", "Target.Timeout", f"{type(exc).__name__} connecting to {url}"
     if str(status) in {code.strip() for code in expected.split(",")}:
@@ -1157,7 +1172,7 @@ def _probe_target(stores: SynthStores, env: str, tg: dict, target: dict) -> tupl
     return "unhealthy", "Target.ResponseCodeMismatch", f"Health checks failed with these codes: [{status}]"
 
 
-def _describe_target_health(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
+async def _describe_target_health(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
     arn = params.get("TargetGroupArn", "")
     tg = _tg_by_arn(stores, env, arn)
     if tg is None:
@@ -1170,7 +1185,7 @@ def _describe_target_health(params: dict[str, str], env: str, stores: SynthStore
     ]
     descriptions = []
     for target in selected:
-        state, reason, description = _probe_target(stores, env, tg, target)
+        state, reason, description = await _probe_target(stores, env, tg, target)
         descriptions.append(
             f"<Target>{_elem('Id', target['id'])}{_elem('Port', target.get('port'))}</Target>"
             + _elem("HealthCheckPort", str(target.get("port") or tg.get("port") or IDLE_LISTEN_PORT))
@@ -1182,7 +1197,7 @@ def _describe_target_health(params: dict[str, str], env: str, stores: SynthStore
 # --- Tags (AddTags/RemoveTags/DescribeTags -- ResourceArns, never a typed id)
 
 
-def _add_tags(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
+async def _add_tags(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
     new_tags = _tags(params)
     for arn in _scalars(params, "ResourceArns"):
         if _resource_by_arn(stores, env, arn) is None:
@@ -1191,7 +1206,7 @@ def _add_tags(params: dict[str, str], env: str, stores: SynthStores, proxy: Load
     return _response("AddTags", "")
 
 
-def _remove_tags(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
+async def _remove_tags(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
     removed = set(_scalars(params, "TagKeys"))
     for arn in _scalars(params, "ResourceArns"):
         if _resource_by_arn(stores, env, arn) is None:
@@ -1200,7 +1215,7 @@ def _remove_tags(params: dict[str, str], env: str, stores: SynthStores, proxy: L
     return _response("RemoveTags", "")
 
 
-def _describe_tags(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
+async def _describe_tags(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
     descriptions = []
     for arn in _scalars(params, "ResourceArns"):
         if _resource_by_arn(stores, env, arn) is None:
@@ -1211,7 +1226,9 @@ def _describe_tags(params: dict[str, str], env: str, stores: SynthStores, proxy:
 
 # --- dispatch --------------------------------------------------------------
 
-_Handler = Callable[[dict[str, str], str, SynthStores, LoadBalancerProxy], Response]
+# EVERY handler is a coroutine function, including the ones that await
+# nothing (v0.7.7) -- see `rdsctl._Handler` for why one uniform contract.
+_Handler = Callable[[dict[str, str], str, SynthStores, LoadBalancerProxy], Awaitable[Response]]
 
 _HANDLERS: dict[str, _Handler] = {
     "CreateLoadBalancer": _create_load_balancer,
@@ -1240,7 +1257,7 @@ _HANDLERS: dict[str, _Handler] = {
 }
 
 
-def pure_answer(
+async def pure_answer(
     action: str, resource: str, env: str, body: bytes, stores: SynthStores, now: float,
     proxy: LoadBalancerProxy | None = None,
 ) -> Response:
@@ -1254,4 +1271,4 @@ def pure_answer(
     handler = _HANDLERS.get(op)
     if handler is None:
         return errors.synth_error(SERVICE, "InvalidAction", f"The action {op} is not valid.", 400)
-    return handler(_params(body), env, stores, proxy or LoadBalancerProxy())
+    return await handler(_params(body), env, stores, proxy or LoadBalancerProxy())

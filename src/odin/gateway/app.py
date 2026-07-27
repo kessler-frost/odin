@@ -223,46 +223,41 @@ def create_gateway_app(
         # threaded through as the same value the forward path below would
         # otherwise look up on its own.
         backing_port = state.backing_port(principal.env, service)
-        # `lambda:Invoke` runs the function's handler synchronously inside its
-        # REAL RIE container -- a blocking wait up to the function's timeout
-        # (compute/functions.py). Run ON the event loop it would freeze the
-        # whole gateway for the duration, so the handler's OWN re-entrant AWS
-        # calls back through here (a boto3 PutItem/PutObject during the
-        # invocation) could never be accepted -- they'd time out and the invoke
-        # would return empty (field-test finding #1). Hand JUST that action to a
-        # worker thread so the loop stays free to serve the re-entrant calls.
+        # ONE `await`, for every action -- no per-action branch (v0.7.7).
         #
-        # THE SENTENCE THAT USED TO FOLLOW WAS FALSE, and v0.7.7's de-threading
-        # is what made it matter. It read "every other synth answer is fast
-        # in-memory work"; a full trace of `synth.pure_answer`'s dispatch found
-        # roughly nine actions that shell out to `docker` or `nebula-cert` on
-        # this very line -- `ecs:DescribeServices`/`ListTasks`/`DescribeTasks`
-        # (a `docker logs` per task plus up to two `docker inspect` per running
-        # task, and terraform's steady-state waiter POLLS these),
-        # `ecs:DeleteService`, `lambda:DeleteFunction`,
-        # `elasticloadbalancing:DeleteLoadBalancer`/`DescribeTargetHealth` (a
-        # SYNC `httpx.get` per target, 0.3s timeout each), `ec2:CreateVpc` (two
-        # `nebula-cert` runs), `ec2:CreateKeyPair` (`ssh-keygen`), and
-        # `rds:ModifyDBInstance` (a psycopg2 connect, `connect_timeout=3`).
-        # Measured on this machine rather than guessed: `docker inspect` 11.0ms
-        # median, `docker logs --tail 20` 9.9ms, `docker run -d` 69.7ms,
-        # `docker rm -f -v` 78.6ms, `ssh-keygen -t rsa -b 2048` 48.3ms. Until
-        # those go async they block the CONTROL app's loop too, not just this
-        # one. They are deliberately NOT wrapped in a thread here -- a hidden
-        # thread is what v0.7.7 is removing -- and are recorded as the honest
-        # boundary for the gateway-models stage that follows.
+        # `lambda:Invoke` is why there used to be a branch, and it was the right
+        # instinct for the wrong reason. It runs the function's handler inside
+        # its REAL RIE container: a wait that is UNBOUNDED (a user handler, up
+        # to the function's 30s timeout) and RE-ENTRANT -- the handler's own
+        # boto3 calls come back through this very app during the invocation. So
+        # a BLOCKING wait here starves the loop that has to serve them, they
+        # time out, and the invoke returns empty (field-test finding #1). The
+        # old fix was a worker thread. The real fix, done now, is that the wait
+        # is not blocking any more: `compute/functions.py::invoke` uses
+        # `httpx.AsyncClient`, so awaiting it yields to the loop for the whole
+        # round trip and the re-entrant calls are served while it runs.
         #
-        # This one stays a thread for now because it is the only site whose
-        # blocking is UNBOUNDED (a user handler, up to 30s) AND re-entrant. Its
-        # real fix is `compute/functions.py` using `httpx.AsyncClient`, at which
-        # point this line becomes a plain `await` and the last `to_thread` in
-        # the request path goes with it. `tests/gateway/test_lambda_reentrancy.py`
-        # is what will keep that honest.
-        answer = lambda: synth.pure_answer(  # noqa: E731
+        # The other nine slow actions found by tracing this dispatch --
+        # `ecs:DescribeServices`/`ListTasks`/`DescribeTasks` (a `docker logs`
+        # per task plus up to two `docker inspect` per running task, and
+        # terraform's steady-state waiter POLLS these), `ecs:DeleteService`,
+        # `lambda:DeleteFunction`,
+        # `elasticloadbalancing:DeleteLoadBalancer`/`DescribeTargetHealth`,
+        # `ec2:CreateVpc` (two `nebula-cert` runs), `ec2:CreateKeyPair`
+        # (`ssh-keygen`) -- are async to the bottom now too, so none of them
+        # blocks this loop or the CONTROL app's. The measurements that made
+        # them worth chasing, on this machine: `docker inspect` 11.0ms median,
+        # `docker logs --tail 20` 9.9ms, `docker run -d` 69.7ms, `docker rm
+        # -f -v` 78.6ms, `ssh-keygen -t rsa -b 2048` 48.3ms.
+        #
+        # ONE known residual, named rather than hidden: `rds:ModifyDBInstance`
+        # reaches `aws/rds.py`'s psycopg2 connect (`connect_timeout=3`), and
+        # psycopg2 has no async form -- closing it needs psycopg v3's
+        # `AsyncConnection`, which is a dependency change outside this stage.
+        pure = await synth.pure_answer(
             action, resource, principal.env, body, stores, now, backing_port, query_params,
             keystore=keystore, gateway_port=gateway_port() if gateway_port else None, rds=rds,
         )
-        pure = await answer() if action == "lambda:Invoke" else answer()
         if pure is not None:
             return pure
 
