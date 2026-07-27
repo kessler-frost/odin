@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import psycopg2
+import asyncpg
 
 from odin.fabric.models import FirewallRules
 from odin.fabric.sidecar import MeshSidecar
@@ -133,13 +133,23 @@ class PostgresRds:
         endpoint = await self.endpoint(db_id)
         if endpoint is None:
             raise RuntimeError(f"{self.container_name(db_id)} publishes no port")
-        conn = psycopg2.connect(
+        conn = await asyncpg.connect(
             host=endpoint[0], port=endpoint[1], user=user,
-            password=current_password, dbname="postgres", connect_timeout=3,
+            password=current_password, database="postgres", timeout=3,
         )
-        conn.autocommit = True
-        # The role name is an IDENTIFIER (no parameter binding possible) --
-        # quoted the way Postgres itself demands; the password IS bound.
-        quoted = '"' + user.replace('"', '""') + '"'
-        conn.cursor().execute(f"ALTER USER {quoted} WITH PASSWORD %s", (new_password,))
-        conn.close()
+        try:
+            # ALTER USER takes NO bound parameters -- not the role (an
+            # identifier) and not the password (Postgres rejects a placeholder
+            # there outright: `syntax error at or near "$1"`). So the statement
+            # is built by POSTGRES ITSELF via `format('%I','%L')`, which quotes
+            # an identifier and a literal by its own rules. That retires the
+            # hand-rolled quote-doubling this used to do, and it is the whole
+            # reason the swap is not a rename: psycopg2 bound client-side and
+            # hid the restriction.
+            statement = await conn.fetchval(
+                "SELECT format('ALTER USER %I WITH PASSWORD %L', $1::text, $2::text)",
+                user, new_password,
+            )
+            await conn.execute(statement)
+        finally:
+            await conn.close()

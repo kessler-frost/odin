@@ -51,6 +51,8 @@ BLOCKING = {
     "requests.get", "requests.post", "requests.request",
     "socket.create_connection",
     "urllib.request.urlopen",
+    # psycopg2 is GONE (asyncpg, Apache-2.0, native async), but the name stays
+    # in the list: if anyone reintroduces it, this fires immediately.
     "psycopg2.connect",
 }
 
@@ -58,10 +60,6 @@ BLOCKING = {
 # Delete an entry when you fix it; do NOT add one to make a new failure go away
 # without an owner and a reason.
 ALLOWED: dict[tuple[str, str, str], str] = {
-    ("aws/rds.py", "set_password", "psycopg2.connect"):
-        "v0.7.7 stage E: psycopg2 has no async API; the fix is the psycopg v3 "
-        "AsyncConnection swap, which is a driver change and deliberately not "
-        "part of the de-threading pass. Boundary left visible on purpose.",
 }
 
 

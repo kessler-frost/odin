@@ -14,7 +14,15 @@ dependencies = [
     "httpx>=0.27",
     "claude-agent-sdk>=0.1.39",
     "typer>=0.15",
-    "psycopg2-binary>=2.9.12",
+    # asyncpg (Apache-2.0), not psycopg2 (LGPL-3.0) or psycopg3 (LGPL-3.0):
+    # odin ships permissive licences only, and psycopg2 had quietly been the
+    # exception. It is also the only Postgres driver here with a native async
+    # API. MEASURED against a real WEDGED Postgres (docker pause -- field
+    # test 6's F4): psycopg2 blocked the loop 3008ms for 1 heartbeat tick,
+    # async managed 264. A healthy DB fast-fails in 0.42-5.8ms and would not
+    # have justified the swap; a wedged one blocks 85.7% of wall clock for up
+    # to 180s, freezing gateway and reconciler together.
+    "asyncpg>=0.30",
     "python-hcl2>=8.1.2",
 ]
 

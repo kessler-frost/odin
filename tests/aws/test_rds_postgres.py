@@ -5,7 +5,7 @@ import asyncio
 import time
 from dataclasses import dataclass, field
 
-import psycopg2
+import asyncpg
 import pytest
 
 from odin.aws.rds import PostgresRds
@@ -92,17 +92,20 @@ async def test_create_db_boots_real_postgres_select_1():
             ep = await rds.endpoint("db")
             if ep is not None:
                 try:
-                    conn = psycopg2.connect(
+                    conn = await asyncpg.connect(
                         host=ep[0], port=ep[1], user="app",
-                        password="apppass123", dbname="postgres",
-                        connect_timeout=2,
+                        password="apppass123", database="postgres",
+                        timeout=2,
                     )
-                    with conn, conn.cursor() as cur:
-                        cur.execute("SELECT 1")
-                        assert cur.fetchone()[0] == 1
-                    conn.close()
+                    try:
+                        assert await conn.fetchval("SELECT 1") == 1
+                    finally:
+                        await conn.close()
                     return
-                except psycopg2.OperationalError as exc:
+                # asyncpg raises OSError/TimeoutError while the container is
+                # still coming up, where psycopg2 raised OperationalError --
+                # a not-yet-listening Postgres is this loop's normal case.
+                except (asyncpg.PostgresError, OSError, TimeoutError) as exc:
                     last = exc
             await asyncio.sleep(2)
         raise AssertionError(f"postgres never became ready: {last}")

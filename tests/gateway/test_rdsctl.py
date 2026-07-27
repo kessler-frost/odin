@@ -108,7 +108,7 @@ _READY: dict[str, bool] = {}
 _PROBES: dict[str, int] = {}
 
 
-def _fake_probe(host, port, user, password, db="postgres") -> PgReady:
+async def _fake_probe(host, port, user, password, db="postgres") -> PgReady:
     """`pg_ready_sync`'s answer, counted. `flap` makes the SECOND probe fail
     once -- the postgres init-then-restart shape `_wait_available`'s
     consecutive-success rule exists for.
@@ -132,7 +132,7 @@ def fast_probe(monkeypatch):
     instead of three minutes."""
     monkeypatch.setattr(rdsctl, "_POLL_INTERVAL", 0.01)
     monkeypatch.setattr(rdsctl, "_CREATE_TIMEOUT", 0.5)
-    monkeypatch.setattr(rdsctl, "pg_ready_sync", _fake_probe)
+    monkeypatch.setattr(rdsctl, "pg_ready", _fake_probe)
 
 
 @pytest.fixture(autouse=True)

@@ -20,6 +20,10 @@ forbidden to be", not a gateway wire concern.
 """
 from __future__ import annotations
 
+import asyncio
+
+import asyncpg
+
 from dataclasses import dataclass
 
 
@@ -35,47 +39,63 @@ class PgReady:
     error: str | None = None
 
 
-def _pg_connect(host: str, port: int, user: str, password: str, db: str) -> bool:
-    import psycopg2
-
-    conn = psycopg2.connect(
-        host=host, port=port, user=user, password=password,
-        dbname=db, connect_timeout=3,
-    )
-    cur = conn.cursor()
-    cur.execute("SELECT 1")
-    ok = cur.fetchone()[0] == 1
-    conn.close()
-    return ok
+_CONNECT_TIMEOUT = 3.0
 
 
-def pg_ready_sync(host: str, port: int, user: str, password: str, db: str = "postgres") -> PgReady:
-    """The blocking form. THIS is the assertion that gates an
-    `aws_db_instance` reaching `available`, so a Postgres that boots but never
-    accepts connections fails the apply instead of being reported up.
+def _reason(host: str, port: int, exc: BaseException) -> str:
+    """The failure text, ALWAYS naming the address.
 
-    KNOWN BLOCKING BOUNDARY (v0.7.7, left deliberately visible). psycopg2 has
-    no async API, so this call blocks whatever thread -- or, now, whatever
-    EVENT LOOP -- it runs on, for up to `connect_timeout=3` seconds. The
-    de-threading pass removed the threads that used to keep it off the loop
-    (`asyncio.to_thread` in the drift sweep, the rdsctl daemon thread), so
-    `pg_ready` below now blocks the shared control loop for real. The fix is
-    the psycopg v3 `AsyncConnection` swap, which is a separate, riskier stage;
-    naming the limit here beats hiding it behind a thread pool that the owner
-    directive rules out anyway."""
-    try:
-        return PgReady(ok=_pg_connect(host, port, user, password, db))
-    except Exception as exc:
-        return PgReady(ok=False, error=str(exc))
+    Load-bearing, and the reason this helper exists rather than `str(exc)`:
+    `server.py::_known_faults` quotes this sentence WITH the host and port as
+    the line that rescues an apply whose provider error reads
+    `last error: %!s(<nil>)`. psycopg2 happened to include the address in its
+    own message; asyncpg does not, and its connect timeout raises a bare
+    `TimeoutError` whose `str()` is EMPTY. So the shape is rebuilt here instead
+    of inherited from whatever the driver felt like saying.
+
+    `timeout expired` is likewise the exact wording `_known_faults` matches --
+    keep it verbatim.
+    """
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+        detail = "timeout expired"
+    else:
+        detail = str(exc).strip() or exc.__class__.__name__
+    return f'connection to server at "{host}", port {port} failed: {detail}'
 
 
 async def pg_ready(host: str, port: int, user: str, password: str, db: str = "postgres") -> PgReady:
-    """The coroutine form callers await. NOT `await pg_ready_sync(...)` --
-    that awaited a plain `PgReady` dataclass and raised
-    `TypeError: object PgReady can't be used in 'await' expression` on every
-    single call. See `pg_ready_sync` for the psycopg2 blocking boundary this
-    inherits."""
-    return pg_ready_sync(host, port, user, password, db)
+    """THE assertion that gates an `aws_db_instance` reaching `available`, so a
+    Postgres that boots but never accepts connections fails the apply instead
+    of being reported up.
+
+    asyncpg (Apache-2.0), not psycopg2 (LGPL): odin's licence rule is
+    permissive-only, and psycopg2 had quietly been the exception. It is also
+    the only Postgres driver here with a native async API, which matters more
+    than it sounds -- MEASURED against a real wedged Postgres (`docker pause`,
+    which is field test 6's F4, i.e. the documented failure mode rather than a
+    hypothetical one):
+
+        psycopg2   connect 3008.4 ms   heartbeat ticks:   1   worst gap 3011.5 ms
+        async      connect 3033.3 ms   heartbeat ticks: 264   worst gap   12.4 ms
+
+    A healthy or still-booting Postgres fast-fails in 0.42-5.8 ms and would
+    NOT have justified this on its own (~1.4% of the loop while booting).
+    A wedged one blocks 857 ms per second of wall clock -- 85.7% -- sustained
+    for up to `_CREATE_TIMEOUT` = 180 s, freezing the gateway and the
+    reconciler together. That is what decided it.
+    """
+    conn = None
+    try:
+        conn = await asyncpg.connect(
+            host=host, port=port, user=user, password=password,
+            database=db, timeout=_CONNECT_TIMEOUT,
+        )
+        return PgReady(ok=await conn.fetchval("SELECT 1") == 1)
+    except Exception as exc:
+        return PgReady(ok=False, error=_reason(host, port, exc))
+    finally:
+        if conn is not None:
+            await conn.close()
 
 
 @dataclass(frozen=True)

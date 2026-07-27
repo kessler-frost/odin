@@ -100,7 +100,7 @@ from odin.gateway.errors import exc_text
 from odin.gateway.models import background, ec2net, join
 from odin.gateway.models.ec2compute import membership_revision
 from odin.gateway.stores import NO_CHANGE, SynthStores
-from odin.reconcile.assertions import pg_ready_sync
+from odin.reconcile.assertions import pg_ready
 from odin.runtime.colima import CONTAINER_HOST, ColimaRuntime
 
 log = logging.getLogger("odin.gateway.rdsctl")
@@ -481,7 +481,7 @@ async def _wait_available(rds: PostgresRds, identifier: str, user: str, password
     while time.monotonic() < deadline:
         endpoint = await rds.endpoint(identifier)
         if endpoint is not None:
-            probe = pg_ready_sync(endpoint[0], endpoint[1], user, password)
+            probe = await pg_ready(endpoint[0], endpoint[1], user, password)
             streak = streak + 1 if probe.ok else 0
             if streak >= _CONSECUTIVE_PROBES:
                 return endpoint[1], None
