@@ -39,13 +39,13 @@ Model decisions, each traced to the research:
   `LimaRuntime`'s own host VM uses, extended with t3.* rows) -- default
   `t3.micro` when the field is absent.
 - The state machine is real and asynchronous: RunInstances mints the record
-  as `pending` and returns immediately, spawning a background thread that
+  as `pending` and returns immediately, starting a background task that
   calls `InstanceVm.boot` -- the provider's own DescribeInstances waiter
   (research: "sleeps ~10s, then polls until running") is built for exactly
   this Lima-boot latency, no timing hack needed. A boot failure lands the
   instance in `terminated` with a `StateReason`, never a silent hang
   (`_finish_boot`'s `except` is the one deliberately broad catch in this
-  module -- required so an uncaught exception on a daemon thread can't strand
+  module -- required so an uncaught exception in a background task can't strand
   an instance `pending` forever). Stop/Start/Terminate follow the same
   immediate-transitional-state + background-completion shape.
 - Terminate keeps the record ~60s after `terminated` (MiniStack's lazy-sweep
@@ -132,7 +132,7 @@ _INSTANCE_ATTRIBUTE_DEFAULTS = {
 _TERMINATED_SWEEP_SECONDS = 60.0
 
 # Release finding #3 -- the resurrection race: RunInstances spawns
-# `_finish_boot` on a daemon thread that can still be mid-flight when a
+# `_finish_boot` as a background task that can still be mid-flight when a
 # TerminateInstances call for the SAME instance wins the race and completes
 # first. Once an instance has entered one of these states, NO later
 # completion (a slow boot finishing as "running", a stale Stop/Start
@@ -445,7 +445,7 @@ def _volume_xml(volume: dict) -> str:
 
 # --- background completion: the async state machine (the "never block"
 # requirement -- every handler below returns a transitional state
-# immediately, a daemon thread finishes the real work) -------------------
+# immediately, a background task finishes the real work) -----------------
 
 
 def _update_instance(stores: SynthStores, env: str, instance_id: str, **fields: object) -> None:
@@ -724,7 +724,7 @@ async def _run_instances(params: dict[str, str], env: str, stores: SynthStores, 
     tags = _spec_tags(params)
     stores.tags.set(env, f"ec2:{instance_id}", tags)
 
-    # Render the `pending` response BEFORE spawning the boot thread: the
+    # Render the `pending` response BEFORE starting the boot: the
     # store hands back the SAME dict object it was given (JsonStore keeps
     # references, not copies), so `instance` here and the record `_finish_boot`
     # later mutates via `_update_instance` are literally the same object --

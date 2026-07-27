@@ -8,7 +8,7 @@ substrate) -- adopted as a design, never as a dependency (NORTHSTAR
 directive 5). Unlike MiniStack's own instant-or-subprocess execution, this
 module's `State` is REAL: `Pending` until `compute/functions.py`'s
 `FunctionRuntime` reports the function's RIE container genuinely answers, a
-background thread away from the request path (the exact async-state-machine
+background TASK away from the request path (the exact async-state-machine
 shape `gateway/models/ec2compute.py`'s `RunInstances` uses for Lima boots).
 
 Like ec2net/iamctl/ecr, Lambda's CONTROL PLANE has no backing to forward to:
@@ -227,13 +227,13 @@ def _get_function_response(fn: dict, stores: SynthStores, env: str) -> dict:
 
 # --- background completion: the async state machine (the "never block" /
 # "REAL readiness, not a timer" requirement -- every mutating handler below
-# returns a transitional status immediately, a daemon thread finishes the
+# returns a transitional status immediately, a background task finishes the
 # real container work; same shape as ec2compute.py's `_finish_boot`) -------
 
 
 def _update_function(stores: SynthStores, env: str, name: str, **fields: object) -> None:
     def mutate(fn: dict | None) -> dict | object:
-        if fn is None:  # deleted while the background thread was still running
+        if fn is None:  # deleted while the background task was still running
             return NO_CHANGE
         fn = dict(fn)
         fn.update(fields)
@@ -581,7 +581,7 @@ async def _create_function(resource: str, env: str, body: bytes, stores: SynthSt
     stores.tags.set(env, f"lambda:{fn['function_arn']}", dict(payload.get("Tags") or {}))
 
     code_dir = substrate.extract_code(env, name, zip_bytes)
-    # Render the `Pending` response BEFORE spawning the deploy thread: the
+    # Render the `Pending` response BEFORE starting the deploy: the
     # store hands back the SAME dict object it was given (JsonStore keeps
     # references, not copies -- see stores.py), so `fn` here and the record
     # `_finish_deploy` later mutates via `_update_function` are literally

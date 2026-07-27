@@ -22,8 +22,8 @@ answer from REAL Colima containers (`compute/tasks.py::TaskRuntime`), never
 a stored fiction.
 
 GATEWAY-INTERNAL RECONCILE (the brief's own design note, not the main
-Reconciler loop): CreateService/UpdateService spawn a background thread
-(`_reconcile_service_tasks`, the exact `_spawn`-a-daemon-thread shape
+Reconciler loop): CreateService/UpdateService start a background task
+(`_reconcile_service_tasks`, the exact `background()`-a-task shape
 ec2compute/lambdactl already use) that converges the service's REAL task
 containers toward `desiredCount` -- launch when short, newest-task-first
 scale-down when over (the digest's own ordering), and replace any task
@@ -821,7 +821,7 @@ async def _launch_task(
             cpu=taskdef.get("cpu"), memory=taskdef.get("memory"),
         )
     except Exception as exc:
-        # Deliberately broad: this runs on a daemon thread with no caller to
+        # Deliberately broad: this runs as a background task with no caller to
         # propagate an exception to -- see ec2compute.py's `_finish_boot` for
         # the identical "silent hang is forbidden" reasoning.
         log.warning("task container failed for %s/%s (env %s): %s", service_name, task_id, env, exc_text(exc))
@@ -905,7 +905,7 @@ async def _stabilize(stores: SynthStores, env: str, runtime: TaskRuntime) -> Non
     `runningCount`, which is current-revision-only (`_on_current_revision`)
     and was already satisfied by the launches above, so a good update's apply
     time is unchanged -- the retirement finishes behind it on this same
-    daemon thread.
+    background task.
 
     LIMIT, recorded: a replacement that takes LONGER than this window to
     crash is still counted as serving and the previous revision is retired

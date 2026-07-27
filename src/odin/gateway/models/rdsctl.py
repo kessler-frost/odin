@@ -13,7 +13,7 @@ reconciler's plan/execute loop to tofu's own CreateDBInstance call.
 Closest analogue: `ec2compute.py`. Both model a substrate that takes real
 wall-clock time to come up, and both do it the same way -- the create handler
 mints the record in a TRANSITIONAL state (`creating`, ec2's `pending`) and
-returns immediately, while a daemon thread finishes the real work. The
+returns immediately, while a background task finishes the real work. The
 provider's own create waiter (`DBInstanceAvailable`: poll DescribeDBInstances
 until `DBInstanceStatus == "available"`, botocore's own waiter model) is
 built for exactly this latency, so no timing hack is needed anywhere.

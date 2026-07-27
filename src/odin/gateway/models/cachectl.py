@@ -19,7 +19,7 @@ this layer would gate a raw `SET` -- that is a network-reachability question
 
 The state machine is real and asynchronous, the ec2compute/lambdactl shape:
 `CreateCacheCluster` mints the record as `creating` and returns immediately,
-spawning a daemon thread that boots the container and waits for a real Redis
+starting a background task that boots the container and waits for a real Redis
 PING -- terraform-provider-aws's own create waiter (pending `creating`, target
 `available`) absorbs that latency, so no timing hack is needed. A boot failure
 lands the cluster in `create-failed`, NEVER a silent hang: that status string
@@ -31,7 +31,7 @@ any status outside its pending list as an immediate hard error and prints it,
 so a failed boot fails `apply` fast and honestly; the real reason rides on the
 record for the World verdict (reconcile/tf_status.py).
 
-`DeleteCacheCluster` sets `deleting`, returns, and a daemon thread removes the
+`DeleteCacheCluster` sets `deleting`, returns, and a background task removes the
 real container and then the record itself -- the provider's delete waiter
 polls until DescribeCacheClusters answers `CacheClusterNotFound`, which is
 exactly what a removed record produces. No grace window needed (unlike SQS's

@@ -7,7 +7,7 @@ Like ec2net/iamctl/ecr/lambdactl/ecsctl/logsctl, elbv2 has NO backing container
 to forward to: this module is the whole answer for every
 `elasticloadbalancing:*` action. Unlike those, a load balancer's substrate is
 REAL and asynchronous like ec2compute's instances: `CreateLoadBalancer` returns
-`State.Code = "provisioning"` immediately and a daemon thread brings the proxy
+`State.Code = "provisioning"` immediately and a background task brings the proxy
 container up, after which `DescribeLoadBalancers` reports `"active"` -- the
 transition terraform-provider-aws's own `waitLoadBalancerActive` polls for, and
 an honest one (the state IS the real container's state, never a stored
@@ -650,11 +650,14 @@ async def _converge_target_group(stores: SynthStores, env: str, tg_name: str, pr
         if any(a.get("TargetGroupArn") == arn for a in listener["default_actions"])
     }
     for lb_name in sorted(lb_names):
-        converge = _converge_safely(stores, env, lb_name, proxy)
+        # Each call is written out at BOTH sites rather than bound to a local
+        # and used twice. Holding a coroutine object in a variable is the shape
+        # that lets a later edit drop the one thing that consumes it, and an
+        # unconsumed coroutine is silent -- it just never runs.
         if spawn:
-            background(converge)
-        else:
-            await converge
+            background(_converge_safely(stores, env, lb_name, proxy))
+            continue
+        await _converge_safely(stores, env, lb_name, proxy)
 
 
 # --- the internal registration API the ECS substrate uses (never the wire) --
@@ -791,7 +794,7 @@ async def _create_load_balancer(params: dict[str, str], env: str, stores: SynthS
         "availability_zones": zones,
         "created_time": datetime.now(UTC).isoformat(),
         # Honest asynchrony (module docstring): the REAL nginx container comes
-        # up on a daemon thread, and `active` is what the provider's own
+        # up as a background task, and `active` is what the provider's own
         # waiter polls for.
         "state": _LB_PROVISIONING,
         "state_reason": None,
