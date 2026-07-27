@@ -69,10 +69,52 @@ def dotted(node: ast.AST) -> str:
     return ".".join(reversed(bits))
 
 
+def _module_kinds(dotted: str) -> tuple[set[str], set[str]]:
+    """(sync defs, async defs) declared at the top level of an odin module."""
+    if not dotted.startswith("odin."):
+        return set(), set()
+    path = SRC.joinpath(*dotted.split(".")[1:]).with_suffix(".py")
+    if not path.exists():
+        path = SRC.joinpath(*dotted.split(".")[1:], "__init__.py")
+    if not path.exists():
+        return set(), set()
+    tree = ast.parse(path.read_text())
+    return (
+        {n.name for n in tree.body if isinstance(n, ast.FunctionDef)},
+        {n.name for n in tree.body if isinstance(n, ast.AsyncFunctionDef)},
+    )
+
+
+def _imported_kinds(tree: ast.Module) -> tuple[set[str], set[str]]:
+    """Names this module imported FROM odin, split by sync vs async."""
+    sync_names: set[str] = set()
+    async_names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom) or not node.module:
+            continue
+        mod_sync, mod_async = _module_kinds(node.module)
+        for alias in node.names:
+            local = alias.asname or alias.name
+            if alias.name in mod_sync:
+                sync_names.add(local)
+            elif alias.name in mod_async:
+                async_names.add(local)
+    return sync_names, async_names
+
+
 def _offenders_in(tree: ast.Module, rel: str) -> list[tuple[str, str, int, str]]:
     """(module, attribute, line, sync function it resolves to)."""
     sync_funcs = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
     async_funcs = {n.name for n in tree.body if isinstance(n, ast.AsyncFunctionDef)}
+    # ...and the IMPORTED ones. Without this the check only saw defaults defined
+    # in the same file, so `self._probe = probe or pg_ready_sync` was invisible
+    # -- `pg_ready_sync` is imported from reconcile.assertions. The checker
+    # exited 0 with a live TypeError in the same tree (the rds half of every
+    # drift sweep), which is the "guard that silently never fires" shape this
+    # repo keeps paying for. Found by a reviewer, not by the guard.
+    imported_sync, imported_async = _imported_kinds(tree)
+    sync_funcs |= imported_sync
+    async_funcs |= imported_async
 
     sync_attrs: dict[str, set[str]] = {}
     for node in ast.walk(tree):

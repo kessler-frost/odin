@@ -129,7 +129,7 @@ from odin.gateway.models.ec2compute import mark_instance_terminated
 from odin.gateway.models.ecsctl import container_gone_reason, mark_task_stopped
 from odin.gateway.models.lambdactl import mark_function_failed
 from odin.gateway.stores import SynthStores
-from odin.reconcile.assertions import pg_ready_sync
+from odin.reconcile.assertions import pg_ready
 from odin.runtime.colima import ColimaRuntime
 
 log = logging.getLogger("odin.reconcile.drift")
@@ -474,7 +474,13 @@ class DriftSweeper:
         # W2.7: rds's reality check is a real Postgres connection, not a
         # listing (module docstring). Injectable for the same reason the two
         # above are -- a unit test proves the sweep with no database running.
-        self._probe = probe or pg_ready_sync
+        # `pg_ready`, the COROUTINE form -- `_probe_db` awaits this. It used to
+        # default to `pg_ready_sync`, a plain function returning a PgReady
+        # dataclass, so every rds half of every drift sweep raised
+        # `TypeError: object PgReady can't be used in 'await' expression`.
+        # Unnoticed because the only tests reaching the async form are
+        # integration-marked.
+        self._probe = probe or pg_ready
         self._ticks: dict[str, int] = {}
         self._cache: dict[str, dict[str, str]] = {}
 
