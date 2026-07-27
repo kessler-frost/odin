@@ -137,9 +137,23 @@ event loop a synchronous read-modify-write is already atomic with respect to
 other tasks, because nothing preempts it without an `await`. So when threads
 go, DELETE the locks they existed for rather than porting `threading.Lock` to
 `asyncio.Lock` — check first whether the critical section contains an `await`;
-if it doesn't, it needs no lock. If a thread really is unavoidable (a blocking
-C call, a library with no async API), isolate it behind one
-`anyio.to_thread.run_sync` / `asyncio.to_thread` boundary and say why.
+if it doesn't, it needs no lock. **This includes `to_thread`** — `asyncio.to_thread` /
+`anyio.to_thread.run_sync` IS a thread pool, so it does not satisfy the rule,
+it hides it. Three facts make full elimination realistic here, all verified:
+- **Subprocess work is natively async.** `anyio.run_process` /
+  `anyio.open_process` / `asyncio.create_subprocess_exec` all exist. odin has
+  ~20 `subprocess.run` sites (docker, limactl, tofu, nebula-cert) and that is
+  the dominant blocking work — convert them, don't wrap them.
+- **File I/O should stay SYNCHRONOUS.** `anyio.AsyncFile.read` is literally
+  `await to_thread.run_sync(fp.read, ...)`, so "async file I/O" would
+  reintroduce threads invisibly. A page-cached few-KB store read is
+  sub-millisecond: inline is cheaper and simpler than a thread hop. Judge by
+  DURATION, not by whether it is "I/O".
+- **CPU-only work is not blocking I/O.** SigV4 signing needs neither.
+Prefer an async driver where a production-grade one exists (`psycopg` v3's
+`AsyncConnection` over psycopg2, which is what `assertions.py::pg_ready` and
+`aws/rds.py` use today). If something is genuinely unavoidable, leave the
+boundary VISIBLE and say why — an honest limit beats a hidden thread.
 
 **Which library: prefer `anyio`, so the choice stays open.** Not because trio
 beats asyncio — because anyio runs on BOTH (`anyio.get_all_backends()` →
