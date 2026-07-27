@@ -286,12 +286,20 @@ async def test_logs_never_raises_when_the_vm_is_unreachable():
 
 class FakeLighthouseManager:
     """R3: the injectable seam `InstanceVm._activate_nebula` calls -- no real
-    `sudo`/`nebula` involved, just records what it was asked to do."""
+    `sudo`/`nebula` involved, just records what it was asked to do.
+
+    `async def`, because the REAL seam is: `fabric/nebula.py::LighthouseManager.
+    ensure_started` is `async def` (it awaits `run_command_async` to spawn
+    `nebula`), and `instances.py::_activate_nebula` awaits it. A sync fake here
+    made `await` land on the returned `bool` -- `object bool can't be used in
+    'await' expression` -- which `_activate_nebula` catches as a best-effort
+    activation failure, so the boot still succeeded and every `refresh_nebula`
+    afterwards silently answered "restarted" instead of the real verdict."""
 
     def __init__(self) -> None:
         self.started: list[tuple] = []
 
-    def ensure_started(self, root, env, underlay):
+    async def ensure_started(self, root, env, underlay):
         self.started.append((root, env, underlay))
         return True
 
@@ -430,7 +438,7 @@ async def test_activate_nebula_is_best_effort_when_underlay_cannot_be_derived(tm
 
 async def test_activate_nebula_never_raises_even_if_lighthouse_manager_blows_up(tmp_path):
     class ExplodingLighthouse(FakeLighthouseManager):
-        def ensure_started(self, root, env, underlay):
+        async def ensure_started(self, root, env, underlay):
             raise RuntimeError("sudo not authorized")
 
     runner = FakeRunner()
@@ -768,14 +776,13 @@ async def test_boot_never_exceeds_the_semaphore_bound_under_real_concurrency():
     test would assert nothing at all. The `await asyncio.sleep(0.05)` inside the
     runner is what makes the race real: it is a suspension point in the middle
     of the guarded region, which is exactly where an unguarded second task gets
-    in. Measured with the guard removed: peak 3.
+    in.
 
-    BLOCKED ON src (reported, not fixed here): `compute/instances.py` still
-    holds `threading.Semaphore` with a plain `with` inside `async def boot`, so
-    this fails on `__enter__` until that becomes `asyncio.Semaphore` +
-    `async with` -- which `instances.py`'s own de-threading verdict comment
-    already commits to. A blocking `with` on one event loop would not merely be
-    slow, it would DEADLOCK the second task."""
+    src landed (`_BOOT_SEMAPHORE` is an `asyncio.Semaphore`, `boot()` holds it
+    with `async with`), so this test is green rather than blocked. Its bite was
+    re-measured, not assumed: deleting the `async with` from `boot()` and
+    re-running gives `assert 3 == 1` -- peak 3, the full stampede -- and
+    restoring it returns the file byte-identical to HEAD."""
     in_flight = 0
     peak = 0
 

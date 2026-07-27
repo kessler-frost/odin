@@ -1086,14 +1086,23 @@ def test_a_tofu_failure_is_not_also_charged_the_lambda_and_rds_waits(tmp_path, m
     skipped (asserted directly here, not inferred from the body) and the READ
     happens."""
     called: list[str] = []
-    monkeypatch.setattr(
-        "odin.server.lambdactl.wait_for_active_functions",
-        lambda *a, **k: called.append("lambda") or [],
-    )
-    monkeypatch.setattr(
-        "odin.server.rdsctl.wait_for_available_instances",
-        lambda *a, **k: called.append("rds") or [],
-    )
+
+    # Coroutine functions, matching the real seams: both waits are `async def`
+    # and server.py hands them to `asyncio.gather`. Keeping them sync would
+    # still "pass" here only because the assertion below is that they are never
+    # reached -- and if that guard ever regressed, gather would blow up with an
+    # incidental `TypeError: unhashable type: 'list'` instead of this test's own
+    # message. Async stubs make the regression report the RIGHT reason.
+    async def _record_lambda_wait(*a, **k):
+        called.append("lambda")
+        return []
+
+    async def _record_rds_wait(*a, **k):
+        called.append("rds")
+        return []
+
+    monkeypatch.setattr("odin.server.lambdactl.wait_for_active_functions", _record_lambda_wait)
+    monkeypatch.setattr("odin.server.rdsctl.wait_for_available_instances", _record_rds_wait)
     _patch_dead_substrates(monkeypatch)
     _write_fake_tofu(tmp_path, _APPLY_FAILS)
     monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
@@ -1173,8 +1182,18 @@ def test_a_fault_with_no_recorded_reason_still_says_what_is_known(tmp_path, monk
     })
     # The converge pass would re-create it and author a reason; a substrate that
     # raises nothing is not what this test is about, so keep the record as-is.
+    # `converge_db_instances` is SYNC in src (rdsctl.py) and server.py calls it
+    # without `await`, so a plain lambda is the faithful stand-in. Its sibling
+    # is not: `wait_for_available_instances` is `async def` and server.py feeds
+    # it straight to `asyncio.gather`, which rejects a plain `[]` with
+    # `TypeError: unhashable type: 'list'` -- so that one has to be a coroutine
+    # function. Two stubs, two different shapes, because the seams differ.
     monkeypatch.setattr("odin.server.rdsctl.converge_db_instances", lambda *a, **k: [])
-    monkeypatch.setattr("odin.server.rdsctl.wait_for_available_instances", lambda *a, **k: [])
+
+    async def _no_rds_wait(*a, **k):
+        return []
+
+    monkeypatch.setattr("odin.server.rdsctl.wait_for_available_instances", _no_rds_wait)
     with TestClient(app) as client:
         resp = client.post("/apply-full", json={"nodes": [], "edges": []})
     body = resp.json()
