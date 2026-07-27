@@ -76,6 +76,26 @@ That is genuine ECS-on-EC2 placement, not a relabel. It also makes Fargate a
 real distinction rather than a word, and it reuses `RuntimeDriver` rather than
 inventing a mechanism.
 
+**The user-facing sentence, in the owner's own framing, which is clearer than
+the mechanism:** *Fargate = odin picks where it runs. EC2 = you drew the box
+it runs in.* That happens to be exactly what the AWS distinction means — with
+Fargate you do not manage the capacity, with EC2 you do.
+
+**One naming trap, because `LimaRuntime` already exists and means something
+else.** There are THREE runtime bindings here and only two of them are this
+feature:
+
+| | driver | container lives |
+| --- | --- | --- |
+| Fargate (outside any box) | `ColimaRuntime` | host docker — no VM the user drew |
+| EC2 (inside a drawn box) | `LimaRuntime` bound to `odin-ec2-{env}-{id}` | inside THAT VM |
+| odin's existing "VM isolation" mode | `LimaRuntime` bound to `odin-host` | one SHARED VM, unrelated to ecs placement |
+
+Fargate is **not** Lima — `TaskRuntime.__init__` is `runtime or ColimaRuntime()`,
+so the default path is host docker. Lima is what makes the EC2 case real. The
+third row is why `LimaRuntime.VM` being a class constant is the unlocking
+change: the mechanism is right, it is just hardwired to the wrong VM.
+
 ### What it costs — stated up front
 
 1. **`LimaRuntime.VM` is a class constant** (`"odin-host"`, `lima.py:49`). It
