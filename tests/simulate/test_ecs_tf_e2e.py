@@ -161,7 +161,7 @@ def _wait_for_running_count(ecs_client, want: int, store_root: Path, ecs_cleanup
     raise AssertionError(f"service never reached runningCount={want} (last seen {last})")
 
 
-async def test_tf_apply_converges_real_containers_zero_drift_scale_destroy(tmp_path, ecs_cleanup):
+def test_tf_apply_converges_real_containers_zero_drift_scale_destroy(tmp_path, ecs_cleanup):
     assert shutil.which("tofu"), "OpenTofu must be on PATH for this integration test"
     assert shutil.which("docker"), "docker must be on PATH for this integration test"
     store = SpecStore(tmp_path)
@@ -182,7 +182,7 @@ async def test_tf_apply_converges_real_containers_zero_drift_scale_destroy(tmp_p
         _register_running_containers(store.root, ecs_cleanup)
         assert apply.returncode == 0, f"apply failed:\n{apply.stdout}\n{apply.stderr}"
 
-        ecs_client = await boto3.client(
+        ecs_client = boto3.client(
             "ecs", endpoint_url=f"http://127.0.0.1:{gateway_port}",
             aws_access_key_id=access_key, aws_secret_access_key=secret_key, region_name="us-east-1",
         )

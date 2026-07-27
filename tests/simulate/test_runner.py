@@ -153,12 +153,12 @@ async def test_status_reflects_last_result_and_running_flag(tmp_path, monkeypatc
     monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
     runner = TfRunner(tmp_path)
 
-    assert await runner.status("default")["running"] is False
-    assert await runner.status("default")["last"] is None
+    assert runner.status("default")["running"] is False
+    assert runner.status("default")["last"] is None
 
     await runner.apply("default", _project(), 4266, "ak", "sk")
 
-    status = await runner.status("default")
+    status = runner.status("default")
     assert status["running"] is False
     assert status["workspace_exists"] is True
     # tail is always carried on the result (status can show recent output
@@ -196,7 +196,7 @@ async def test_wedged_apply_is_killed_at_the_timeout_and_reported_failed(tmp_pat
     assert terminal["status"] == "failed"
     assert any("timed out" in line for line in terminal["tail"])
     # the lock is released -- a wedged, killed run must not wedge the env forever
-    assert await runner.status("default")["running"] is False
+    assert runner.status("default")["running"] is False
 
 
 # --- field test 2 finding B6: a wedged DESTROY is bounded, and says why ----
@@ -241,7 +241,7 @@ async def test_a_wedged_destroy_is_killed_and_names_the_likely_cause(tmp_path, m
     assert "timed out" in tail
     assert "backing" in tail, tail
     assert "odin apply" in tail, tail  # the documented recovery, named
-    assert await runner.status("default")["running"] is False
+    assert runner.status("default")["running"] is False
 
 
 async def test_the_destroy_budget_covers_init_too(tmp_path, monkeypatch):
@@ -490,10 +490,10 @@ async def test_plan_never_overwrites_the_last_apply_on_status(tmp_path, monkeypa
     runner = TfRunner(tmp_path)
 
     await runner.apply("default", _project(), 4266, "ak", "sk")
-    after_apply = await runner.status("default")["last"]
+    after_apply = runner.status("default")["last"]
     await runner.plan("default", _project(), 4266, "ak", "sk")
 
-    assert await runner.status("default")["last"] == after_apply
+    assert runner.status("default")["last"] == after_apply
 
 
 async def test_plan_secrets_are_scrubbed_from_its_output(tmp_path, monkeypatch):

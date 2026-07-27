@@ -109,7 +109,7 @@ def _await_active(client, name: str) -> None:
     raise AssertionError(f"{name} never reached Active within {_ACTIVE_TIMEOUT}s")
 
 
-async def test_a_raising_handler_reports_function_error_to_boto3(store_root, lambda_cleanup):
+def test_a_raising_handler_reports_function_error_to_boto3(store_root, lambda_cleanup):
     assert shutil.which("docker"), "docker must be on PATH for this integration test"
     lambda_cleanup.extend([container_name(ENV, RAISER), container_name(ENV, ECHO)])
 
@@ -118,7 +118,7 @@ async def test_a_raising_handler_reports_function_error_to_boto3(store_root, lam
     with TestClient(app) as http_client:
         gateway_port = http_client.get("/health").json()["gateway"]["port"]
         access_key, secret_key = app.state.gateway_keys.issue(ENV, OPERATOR_NODE_ID)
-        client = await boto3.client(
+        client = boto3.client(
             "lambda", endpoint_url=f"http://127.0.0.1:{gateway_port}",
             aws_access_key_id=access_key, aws_secret_access_key=secret_key, region_name="us-east-1",
         )
@@ -134,7 +134,7 @@ async def test_a_raising_handler_reports_function_error_to_boto3(store_root, lam
             assert ps.stdout.strip() == "public.ecr.aws/lambda/python:3.12", ps.stdout
 
         # THE assertion the finding is about: what an SDK client sees.
-        failed = await client.invoke(FunctionName=RAISER, Payload=b"{}")
+        failed = client.invoke(FunctionName=RAISER, Payload=b"{}")
         assert failed["StatusCode"] == 200  # real Lambda's own contract: 200 + FunctionError
         assert failed.get("FunctionError") == "Unhandled", failed
         payload = json.loads(failed["Payload"].read())
@@ -143,7 +143,7 @@ async def test_a_raising_handler_reports_function_error_to_boto3(store_root, lam
 
         # ...and a working function is still clean -- the detection must not
         # simply flag everything.
-        ok = await client.invoke(FunctionName=ECHO, Payload=json.dumps({"n": 1}).encode())
+        ok = client.invoke(FunctionName=ECHO, Payload=json.dumps({"n": 1}).encode())
         assert ok.get("FunctionError") is None, ok
         assert json.loads(ok["Payload"].read()) == {"n": 1}
 

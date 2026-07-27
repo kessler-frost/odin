@@ -27,7 +27,7 @@ CANVAS = {"nodes": [{"id": "n1", "type": "s3", "data": {"label": "artifacts"}}],
 EMPTY_CANVAS = {"nodes": [], "edges": []}
 
 
-async def test_non_empty_bucket_destroys_clean(tmp_path, monkeypatch):
+def test_non_empty_bucket_destroys_clean(tmp_path, monkeypatch):
     assert shutil.which("tofu"), "OpenTofu must be on PATH for this integration test"
 
     async def fake_translate(stack, **kwargs):
@@ -47,7 +47,7 @@ async def test_non_empty_bucket_destroys_clean(tmp_path, monkeypatch):
         # Put an object so the bucket is NON-empty at teardown.
         gateway_port = client.get("/health").json()["gateway"]["port"]
         access_key, secret_key = app.state.gateway_keys.issue(ENV, OPERATOR_NODE_ID)
-        s3 = await boto3.client(
+        s3 = boto3.client(
             "s3", endpoint_url=f"http://127.0.0.1:{gateway_port}",
             aws_access_key_id=access_key, aws_secret_access_key=secret_key, region_name="us-east-1",
             config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),

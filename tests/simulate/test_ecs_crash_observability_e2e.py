@@ -46,7 +46,7 @@ def _docker(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=30)
 
 
-async def test_crash_looping_ecs_task_is_visible_via_logs_and_a_real_verdict(tmp_path):
+def test_crash_looping_ecs_task_is_visible_via_logs_and_a_real_verdict(tmp_path):
     assert shutil.which("docker"), "docker must be on PATH for this integration test"
 
     store = SpecStore(tmp_path)
@@ -63,7 +63,7 @@ async def test_crash_looping_ecs_task_is_visible_via_logs_and_a_real_verdict(tmp
 
         gateway_port = httpx.get(f"{base}/health", timeout=10).json()["gateway"]["port"]
         access_key, secret_key = app.state.gateway_keys.issue(ENV, OPERATOR_NODE_ID)
-        ecs = await boto3.client(
+        ecs = boto3.client(
             "ecs", endpoint_url=f"http://127.0.0.1:{gateway_port}",
             aws_access_key_id=access_key, aws_secret_access_key=secret_key, region_name="us-east-1",
             config=Config(connect_timeout=10, read_timeout=15, retries={"max_attempts": 0}),
@@ -102,7 +102,7 @@ async def test_crash_looping_ecs_task_is_visible_via_logs_and_a_real_verdict(tmp
         # THE proof for findings #1/#2: real logs, over real HTTP, via the
         # actual CLI -- not a route unit test.
         runner = CliRunner()
-        result = await runner.invoke(cli_app, ["logs", NODE, "--env", ENV, "--url", base])
+        result = runner.invoke(cli_app, ["logs", NODE, "--env", ENV, "--url", base])
         assert result.exit_code == 0, result.output
         assert CRASH_MARKER in result.output, result.output
 

@@ -66,7 +66,7 @@ def _state_buckets(root: Path) -> list[str]:
     return sorted(r["name"] for r in parsed.get("resources", []) if r["type"] == "aws_s3_bucket")
 
 
-async def test_a_typoed_type_cannot_delete_a_live_bucket(store_root, monkeypatch):
+def test_a_typoed_type_cannot_delete_a_live_bucket(store_root, monkeypatch):
     assert shutil.which("tofu"), "OpenTofu must be on PATH for this integration test"
 
     async def fake_translate(stack, **kwargs):
@@ -86,7 +86,7 @@ async def test_a_typoed_type_cannot_delete_a_live_bucket(store_root, monkeypatch
 
         port = client.get("/health").json()["gateway"]["port"]
         access_key, secret_key = app.state.gateway_keys.issue(ENV, OPERATOR_NODE_ID)
-        s3 = await boto3.client(
+        s3 = boto3.client(
             "s3", endpoint_url=f"http://127.0.0.1:{port}",
             aws_access_key_id=access_key, aws_secret_access_key=secret_key, region_name="us-east-1",
             config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),

@@ -83,10 +83,10 @@ async def test_apply_full_converges_reapplies_zero_drift_and_tears_down(tmp_path
         # The physical backing resources exist for real (not just the World
         # projection) -- checked directly against RustFS/goaws/dynalite.
         aws = BackingAws(runtime, ENV, gateway_port=client.get("/health").json()["gateway"]["port"])
-        assert aws.exists("s3", "uploads")
-        assert aws.exists("sqs", "jobs")
-        assert aws.exists("sns", "alerts")
-        assert aws.exists("dynamodb", "items")
+        assert await aws.exists("s3", "uploads")
+        assert await aws.exists("sqs", "jobs")
+        assert await aws.exists("sns", "alerts")
+        assert await aws.exists("dynamodb", "items")
 
         # Re-apply the identical canvas: zero drift, still healthy, tofu still ok.
         start = time.monotonic()
@@ -132,10 +132,10 @@ async def test_apply_full_converges_reapplies_zero_drift_and_tears_down(tmp_path
         assert world["resources"] == []
 
         # The physical resources are REALLY gone too, not just absent from World.
-        assert not aws.exists("s3", "uploads")
-        assert not aws.exists("sqs", "jobs")
-        assert not aws.exists("sns", "alerts")
-        assert not aws.exists("dynamodb", "items")
+        assert not await aws.exists("s3", "uploads")
+        assert not await aws.exists("sqs", "jobs")
+        assert not await aws.exists("sns", "alerts")
+        assert not await aws.exists("dynamodb", "items")
 
         await aws.gc(set())  # stop this env's backing containers -- nothing else owns them
 

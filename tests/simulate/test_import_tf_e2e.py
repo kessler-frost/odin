@@ -51,8 +51,12 @@ async def test_live_import_of_an_out_of_band_bucket_returns_an_s3_node(tmp_path,
 
         # "boto3 creates a bucket out-of-band" -- odin never authored this
         # bucket as a canvas node or a tofu resource.
-        await aws.client("s3").create_bucket(Bucket="uploads")
-        assert aws.exists("s3", "uploads")
+        # `(await aws.client(...)).create_bucket(...)`: `BackingAws.client` is the
+        # coroutine, the boto3 client it hands back is NOT -- `await
+        # aws.client("s3").create_bucket(...)` reads `.create_bucket` off the
+        # COROUTINE and never makes a bucket.
+        (await aws.client("s3")).create_bucket(Bucket="uploads")
+        assert await aws.exists("s3", "uploads")
 
         access_key, secret_key = app.state.gateway_keys.issue(ENV, OPERATOR_NODE_ID)
         result = client.post("/import-tf", params={"env": ENV}, json={

@@ -43,7 +43,7 @@ def _docker(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=30)
 
 
-async def test_bad_ecs_image_fails_apply_fast_and_destroys_clean(tmp_path, monkeypatch):
+def test_bad_ecs_image_fails_apply_fast_and_destroys_clean(tmp_path, monkeypatch):
     assert shutil.which("tofu"), "OpenTofu must be on PATH for this integration test"
     assert shutil.which("docker"), "docker must be on PATH for this integration test"
 
@@ -75,7 +75,7 @@ async def test_bad_ecs_image_fails_apply_fast_and_destroys_clean(tmp_path, monke
         # old hardcoded COMPLETED.
         gateway_port = client.get("/health").json()["gateway"]["port"]
         access_key, secret_key = app.state.gateway_keys.issue(ENV, OPERATOR_NODE_ID)
-        ecs = await boto3.client(
+        ecs = boto3.client(
             "ecs", endpoint_url=f"http://127.0.0.1:{gateway_port}",
             aws_access_key_id=access_key, aws_secret_access_key=secret_key, region_name="us-east-1",
             config=Config(connect_timeout=10, read_timeout=10, retries={"max_attempts": 0}),

@@ -89,10 +89,10 @@ async def test_tf_apply_zero_drift_destroy(tmp_path, runtime):
         assert resp.status_code == 200, resp.json()
         assert resp.json()["status"] == "applied", resp.json()
 
-        assert aws.exists("s3", "uploads")
-        assert aws.exists("sqs", "jobs")
-        assert aws.exists("sns", "alerts")
-        assert aws.exists("dynamodb", "items")
+        assert await aws.exists("s3", "uploads")
+        assert await aws.exists("sqs", "jobs")
+        assert await aws.exists("sns", "alerts")
+        assert await aws.exists("dynamodb", "items")
 
         # zero drift: a plan against the just-applied state changes nothing
         # (the research bar -- "apply -> zero-drift plan -> destroy"). Through
@@ -112,17 +112,17 @@ async def test_tf_apply_zero_drift_destroy(tmp_path, runtime):
         assert drift_resp.json()["status"] == "changes", drift_resp.json()
         assert drift_resp.json()["exit_code"] == 2, drift_resp.json()
         # the plan itself created nothing -- it is a read
-        assert not aws.exists("s3", "reports")
+        assert not await aws.exists("s3", "reports")
 
         store.apply(stack)  # back to the applied canvas, so destroy tears down what exists
         destroy_resp = client.post("/tf/destroy", params={"env": ENV})
         assert destroy_resp.status_code == 200, destroy_resp.json()
         assert destroy_resp.json()["status"] == "destroyed"
 
-        assert not aws.exists("s3", "uploads")
-        assert not aws.exists("sqs", "jobs")
-        assert not aws.exists("sns", "alerts")
-        assert not aws.exists("dynamodb", "items")
+        assert not await aws.exists("s3", "uploads")
+        assert not await aws.exists("sqs", "jobs")
+        assert not await aws.exists("sns", "alerts")
+        assert not await aws.exists("dynamodb", "items")
 
         await aws.gc(set())  # stop the backing containers -- nothing else owns them for this env
 

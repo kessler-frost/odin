@@ -107,8 +107,8 @@ def _tf_env(gateway_port: int, access_key: str, secret_key: str) -> dict[str, st
     }
 
 
-async def _client(service: str, port: int, keys: tuple[str, str]):
-    return await boto3.client(
+def _client(service: str, port: int, keys: tuple[str, str]):
+    return boto3.client(
         service, endpoint_url=f"http://127.0.0.1:{port}",
         aws_access_key_id=keys[0], aws_secret_access_key=keys[1], region_name="us-east-1",
         config=Config(connect_timeout=45, read_timeout=45, retries={"max_attempts": 0}),
@@ -175,7 +175,7 @@ def _shipped(logs_client, stream: str, invoke, invokes: int, deadline_seconds: f
         invokes += 1
 
 
-async def test_lambda_ships_its_logs_to_a_real_log_group_iam_edge_gates_the_read(
+def test_lambda_ships_its_logs_to_a_real_log_group_iam_edge_gates_the_read(
     store_root, lambda_cleanup, skeleton_translate,
 ):
     assert shutil.which("tofu"), "OpenTofu must be on PATH for this integration test"
@@ -212,8 +212,8 @@ async def test_lambda_ships_its_logs_to_a_real_log_group_iam_edge_gates_the_read
         # its tail into the group.
         lambda_client = _client("lambda", gateway_port, operator)
 
-        async def invoke() -> None:
-            response = await lambda_client.invoke(FunctionName=FUNCTION, Payload=b"{}")
+        def invoke() -> None:
+            response = lambda_client.invoke(FunctionName=FUNCTION, Payload=b"{}")
             assert response.get("FunctionError") is None, response
             assert json.loads(response["Payload"].read()) == {"printed": True}
 
@@ -224,7 +224,7 @@ async def test_lambda_ships_its_logs_to_a_real_log_group_iam_edge_gates_the_read
         # its lines back is allowed only because the canvas edge grants it.
         own_keys = app.state.gateway_keys.issue(ENV, FUNCTION)
         assert own_keys != operator
-        workload_logs = await _client("logs", gateway_port, own_keys)
+        workload_logs = _client("logs", gateway_port, own_keys)
         streams = workload_logs.describe_log_streams(logGroupName=GROUP)["logStreams"]
         # One stream per real container, named after it (logsctl's documented
         # deviation from AWS's date/requestId naming).
@@ -244,7 +244,7 @@ async def test_lambda_ships_its_logs_to_a_real_log_group_iam_edge_gates_the_read
         # log group gets a REAL AccessDenied, not an empty answer.
         stranger = app.state.gateway_keys.issue(ENV, "stranger")
         with pytest.raises(ClientError) as denied:
-            await _client("logs", gateway_port, stranger).get_log_events(
+            _client("logs", gateway_port, stranger).get_log_events(
                 logGroupName=GROUP, logStreamName=streams[0]["logStreamName"],
             )
         assert denied.value.response["Error"]["Code"] == "AccessDeniedException", denied.value.response
