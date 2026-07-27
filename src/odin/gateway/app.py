@@ -38,11 +38,12 @@ answered directly or forwarded -- "synth never bypasses policy" (S1 brief).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import socket
 import threading
 import time
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
 from urllib.parse import parse_qsl
 
@@ -164,8 +165,8 @@ def create_gateway_app(
     echo) for the real one used in production. `gateway_port` is a zero-arg
     callable (never a plain int) for the SAME reason server.py's own
     `create_apply_router`/`create_tf_router` take one: this app is built
-    BEFORE uvicorn resolves its own actual bound port (server.py's
-    `serve_in_thread` -- port=0 resolves lazily), so the value can only be
+    BEFORE uvicorn resolves its own actual bound port (the lifespan's
+    `serve_on_loop` -- port=0 resolves lazily), so the value can only be
     read at request time. Fix-wave 2b finding #2: threaded down to
     ec2compute/ecsctl/lambdactl (via synth.pure_answer) so a workload
     substrate's injected AWS_ENDPOINT_URL points at THIS gateway's real
@@ -229,11 +230,34 @@ def create_gateway_app(
         # calls back through here (a boto3 PutItem/PutObject during the
         # invocation) could never be accepted -- they'd time out and the invoke
         # would return empty (field-test finding #1). Hand JUST that action to a
-        # worker thread so the loop stays free to serve the re-entrant calls;
-        # every other synth answer is fast in-memory work (the substrate-booting
-        # ones already return immediately, finishing on their own daemon
-        # thread), kept inline to avoid a needless thread hop on the hot forward
-        # path (the re-entrant PutItem/PutObject calls themselves).
+        # worker thread so the loop stays free to serve the re-entrant calls.
+        #
+        # THE SENTENCE THAT USED TO FOLLOW WAS FALSE, and v0.7.7's de-threading
+        # is what made it matter. It read "every other synth answer is fast
+        # in-memory work"; a full trace of `synth.pure_answer`'s dispatch found
+        # roughly nine actions that shell out to `docker` or `nebula-cert` on
+        # this very line -- `ecs:DescribeServices`/`ListTasks`/`DescribeTasks`
+        # (a `docker logs` per task plus up to two `docker inspect` per running
+        # task, and terraform's steady-state waiter POLLS these),
+        # `ecs:DeleteService`, `lambda:DeleteFunction`,
+        # `elasticloadbalancing:DeleteLoadBalancer`/`DescribeTargetHealth` (a
+        # SYNC `httpx.get` per target, 0.3s timeout each), `ec2:CreateVpc` (two
+        # `nebula-cert` runs), `ec2:CreateKeyPair` (`ssh-keygen`), and
+        # `rds:ModifyDBInstance` (a psycopg2 connect, `connect_timeout=3`).
+        # Measured on this machine rather than guessed: `docker inspect` 11.0ms
+        # median, `docker logs --tail 20` 9.9ms, `docker run -d` 69.7ms,
+        # `docker rm -f -v` 78.6ms, `ssh-keygen -t rsa -b 2048` 48.3ms. Until
+        # those go async they block the CONTROL app's loop too, not just this
+        # one. They are deliberately NOT wrapped in a thread here -- a hidden
+        # thread is what v0.7.7 is removing -- and are recorded as the honest
+        # boundary for the gateway-models stage that follows.
+        #
+        # This one stays a thread for now because it is the only site whose
+        # blocking is UNBOUNDED (a user handler, up to 30s) AND re-entrant. Its
+        # real fix is `compute/functions.py` using `httpx.AsyncClient`, at which
+        # point this line becomes a plain `await` and the last `to_thread` in
+        # the request path goes with it. `tests/gateway/test_lambda_reentrancy.py`
+        # is what will keep that honest.
         answer = lambda: synth.pure_answer(  # noqa: E731
             action, resource, principal.env, body, stores, now, backing_port, query_params,
             keystore=keystore, gateway_port=gateway_port() if gateway_port else None, rds=rds,
@@ -337,24 +361,194 @@ def _wait_until_serving(port: int, timeout: float = 15.0) -> None:
     raise RuntimeError(f"gateway did not start on :{port} within {timeout}s")
 
 
-def serve_in_thread(app: Starlette, host: str = "0.0.0.0", port: int = 0) -> tuple[uvicorn.Server, threading.Thread, int]:
-    """Run `app` on a background uvicorn thread -- the in-process
-    second-listener pattern (the deleted `aws/embed.py::start_ministack`'s
-    shape). `port=0` resolves a free port up front (same trick that
-    function used) so the actual bound port is known before uvicorn ever
-    starts, rather than needing to introspect it from another thread
-    afterward. Returns (server, thread, actual_port); stop via
-    `stop_in_thread`.
+# Security finding #1 NOTE, and it applies to BOTH entry points below:
+# `host="0.0.0.0"` is deliberate and NOT the same bug as the control app's old
+# default (see __main__.py) -- containers (a workload's AWS SDK, tofu's own
+# provider) reach this gateway via `host.docker.internal`, which resolves to the
+# HOST's real interface, not its loopback; a `127.0.0.1` bind would be
+# unreachable from inside a container. This is safe specifically because every
+# request here is SigV4-verified (`catch_all` -> `sigv4.verify`, this module's
+# own docstring) before anything is classified or forwarded -- unlike the
+# control app, which has no equivalent per-request check.
+_DEFAULT_HOST = "0.0.0.0"
 
-    Security finding #1 NOTE: `host="0.0.0.0"` here is deliberate and NOT
-    the same bug as the control app's old default (see __main__.py) --
-    containers (a workload's AWS SDK, tofu's own provider) reach this
-    gateway via `host.docker.internal`, which resolves to the HOST's real
-    interface, not its loopback; a `127.0.0.1` bind would be unreachable
-    from inside a container. This is safe specifically because every
-    request here is SigV4-verified (`catch_all` -> `sigv4.verify`, this
-    module's own docstring) before anything is classified or forwarded --
-    unlike the control app, which has no equivalent per-request check."""
+
+class _NoSignalServer(uvicorn.Server):
+    """A uvicorn server that never touches the process's signal handlers.
+
+    `uvicorn.Server.serve()` is exactly `capture_signals()` + `_serve()`, and
+    `capture_signals` is a no-op ONLY off the main thread -- which is why
+    `serve_in_thread` never had to think about it. Run as a TASK on the control
+    app's own loop, this server IS on the main thread, and it really does take
+    SIGINT away from the outer uvicorn for the whole serving window. Probed
+    against uvicorn 0.49.0 rather than assumed, printing the real
+    `signal.getsignal(SIGINT)` at each stage:
+
+        after installing OUTER (stand-in for the outer uvicorn's handler):
+            SIGINT handler = <function OUTER>
+        WHILE the nested server is serving via serve():
+            SIGINT handler = <bound method Server.handle_exit ...>   is it OUTER? False
+        WHILE the nested server is serving via _serve():
+            SIGINT handler = <function OUTER>                        is it OUTER? True
+
+    With the handler stolen, Ctrl-C would set the GATEWAY's `should_exit`, not
+    the control app's: the gateway would tear itself down first and the control
+    app would only follow once uvicorn's own end-of-`capture_signals` re-raise
+    reached it. That kills the gateway underneath an `/apply-full` that is
+    mid-`tofu apply` and still needs it to answer AWS calls. The background
+    thread never did that; neither does this.
+
+    Overriding the hook rather than calling `_serve` directly keeps the public
+    `serve()` as the entry point. The guard against a future uvicorn changing
+    this is a test that reads the REAL `signal.getsignal(SIGINT)` while a real
+    gateway is serving on the loop
+    (`tests/gateway/test_serve_on_loop.py::test_serving_on_the_loop_does_not_take_the_process_signal_handlers`),
+    not this docstring."""
+
+    @contextlib.contextmanager
+    def capture_signals(self) -> Iterator[None]:
+        yield
+
+
+async def _await_started(server: uvicorn.Server, serving: asyncio.Task, port: int, timeout: float = 15.0) -> None:
+    """Wait until uvicorn is really accepting connections on `port`, or say what
+    stopped it -- never sit out the timeout for a server that already gave up.
+
+    Reads `server.started`, which is a signal that arrives AND means what it is
+    read to mean -- probed, because `_bound_socket` binds without listening and
+    a bound-not-listening port refuses connections. Five real runs, each
+    printing whether a connect succeeded in the same breath as the flag
+    flipping:
+
+        bound-but-not-served connectable? False
+        started after 1 ticks of 10ms; connectable IMMEDIATELY? True
+
+    (`Server.startup` sets `started = True` only after `loop.create_server`
+    returns, and that is the call that puts the socket into listen state.)
+
+    `serving.done()` is watched alongside it because uvicorn has TWO ways to not
+    start, and only one of them is an exception. `Server._serve` reads
+
+        await self.startup(sockets=sockets)
+        if not self.should_exit: await self.main_loop()
+        if self.started: await self.shutdown(sockets=sockets)
+
+    -- so an ASGI app whose own lifespan fails makes `startup()` set
+    `should_exit` and RETURN, and `serve()` then completes normally with
+    `started` still False. Watching only for a raised exception would wait out
+    the whole 15s for that one. `await serving` re-raises the real failure when
+    there was one and falls through to the named RuntimeError when there was
+    not; the deadline stays as the backstop for a server that neither starts nor
+    finishes. The confusing 15s timeout `_bound_socket`'s docstring describes
+    was the thread version's only symptom for every one of these."""
+    deadline = time.monotonic() + timeout
+    while not server.started and not serving.done() and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    if serving.done():
+        await serving
+    if not server.started:
+        raise RuntimeError(f"gateway did not start on :{port} within {timeout}s")
+
+
+@contextlib.asynccontextmanager
+async def serve_on_loop(app: Starlette, host: str = _DEFAULT_HOST, port: int = 0) -> AsyncIterator[int]:
+    """Serve `app` on the CALLER'S event loop for the duration of the block,
+    yielding the actual bound port. The control app's lifespan is the one
+    production caller (`server.py`).
+
+    A task, not a thread: odin used to run two event loops in two threads (the
+    control app's and the gateway's), and one loop is what makes a synchronous
+    read-modify-write atomic without a lock at all -- nothing preempts it
+    without an `await`. `uvicorn.Server.serve` is a coroutine, so no rewrite is
+    involved; `_NoSignalServer` is the one thing that has to differ from the
+    threaded version, and says why.
+
+    A PLAIN TASK, and NOT `asyncio.TaskGroup`, which was written first and
+    measured wrong. CPython's TaskGroup treats the `async with` BODY's exception
+    as one more task failure -- `taskgroups.py::_aexit` appends it to
+    `self._errors` and raises `BaseExceptionGroup` -- so wrapping the control
+    app's lifespan in one changed what a failing lifespan raises. The real
+    failure from `tests/gateway/test_serve_on_loop.py`, before this was backed
+    out:
+
+        ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)
+          +---------------- 1 ----------------
+          | ZeroDivisionError: something in the lifespan body blew up
+
+    Every `except SomeError` around a lifespan stops matching when that happens.
+    A group is also the wrong SHAPE here: it exists to collect failures from
+    siblings, and this has exactly one child, whose lifetime is the block's. The
+    group's other habit costs too -- on the error path it ABORTS (cancels) its
+    children, so a lifespan that raised would kill the gateway mid-flight
+    instead of letting `should_exit` shut it down gracefully. The plain task
+    below is awaited on both paths, so both get the graceful stop.
+
+    What the block still guarantees without the group: the listener cannot
+    outlive it (the `finally` sets `should_exit` and then AWAITS the task, so
+    the port is gone before the caller continues), a `serve()` that fails
+    surfaces as itself instead of being swallowed by a dead thread
+    (`_await_started`), and shutdown is not a `join(timeout=5)` that can
+    silently give up. `should_exit` is noticed on uvicorn's own 0.1s `main_loop`
+    tick -- measured 0.192-0.194s from `should_exit` to the serve coroutine
+    returning, over five runs, with the port confirmed refusing connections
+    immediately after.
+
+    `asyncio`, not `anyio`, deliberately: odin's own source imports `anyio`
+    nowhere (it arrives only transitively, under Starlette) while `asyncio.Lock`
+    / `create_task` / `gather` / `wait_for` / `create_subprocess_exec` are
+    already the idiom throughout `src/odin`. One idiom beats two.
+
+    `port=0` still resolves through `_bound_socket`, which BINDS now and hands
+    the live socket to uvicorn, so the port cannot be stolen in between (see its
+    docstring -- that was a real bug). `contextlib.closing` is belt-and-braces
+    for the one path uvicorn does not cover: it closes the handed-over socket
+    itself in `shutdown()`, but `shutdown()` only runs `if self.started`, so a
+    server that never started would otherwise leak the listening socket. A
+    second `close()` on an already-closed socket is a no-op (probed: `fileno()`
+    is already -1)."""
+    sock = _bound_socket(host, port)
+    actual_port = sock.getsockname()[1]
+    server = _NoSignalServer(uvicorn.Config(app, host=host, port=actual_port, log_level="warning"))
+    with contextlib.closing(sock):
+        serving = asyncio.create_task(server.serve(sockets=[sock]), name="odin-gateway")
+        try:
+            await _await_started(server, serving, actual_port)
+            yield actual_port
+        finally:
+            server.should_exit = True
+            # `gather(..., return_exceptions=True)`, never a bare await, for the
+            # reason `Reconciler.stop()` documents at length: this runs in the
+            # control app's lifespan `finally`, and an await that re-raises
+            # there skips the rest of teardown -- odin has already shipped that
+            # bug once, and the thing skipped was the store lock. The outcome is
+            # REPORTED rather than dropped; a listener that died on its own is
+            # exactly what a user chasing "the gateway stopped answering" needs
+            # in the log.
+            outcome = (await asyncio.gather(serving, return_exceptions=True))[0]
+            if isinstance(outcome, BaseException):
+                log.error("gateway listener on :%d ended with %r", actual_port, outcome)
+
+
+def serve_in_thread(app: Starlette, host: str = _DEFAULT_HOST, port: int = 0) -> tuple[uvicorn.Server, threading.Thread, int]:
+    """TEST HELPER ONLY -- run `app` on a background uvicorn thread, for a
+    SYNCHRONOUS caller that needs a real listening port.
+
+    Production no longer uses this: the gateway runs on the control app's own
+    loop (`serve_on_loop`), and the odin server has no other listener. What
+    keeps it here is the class of test that cannot be written any other way --
+    `tests/gateway/test_unhandled.py::test_a_real_boto3_client_parses_a_real_gateway_failure`
+    drives a REAL boto3 client over a REAL socket to prove botocore parses
+    odin's error document, which `httpx.ASGITransport` provably cannot answer
+    (see that module's docstring), and pytest calls it from a plain `def`. Same
+    for the two ECS e2e tests and `test_debug_e2e`, which serve the CONTROL app
+    this way; the gateway then rides that thread's loop, exactly as it rides
+    uvicorn's in production.
+
+    `port=0` resolves a free port up front so the actual bound port is known
+    before uvicorn ever starts. Returns (server, thread, actual_port); stop via
+    `stop_in_thread`. Signals are not an issue here for the reason
+    `_NoSignalServer` documents: off the main thread, uvicorn's own
+    `capture_signals` is already a no-op."""
     sock = _bound_socket(host, port)
     actual_port = sock.getsockname()[1]
     config = uvicorn.Config(app, host=host, port=actual_port, log_level="warning")
@@ -366,5 +560,6 @@ def serve_in_thread(app: Starlette, host: str = "0.0.0.0", port: int = 0) -> tup
 
 
 def stop_in_thread(server: uvicorn.Server, thread: threading.Thread) -> None:
+    """The `serve_in_thread` counterpart -- test-only, same as its opener."""
     server.should_exit = True
     thread.join(timeout=5)

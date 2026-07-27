@@ -188,8 +188,9 @@ async def test_the_watchdog_survives_one_reconciler_raising(caplog):
 async def test_shutdown_completes_even_when_a_reconciler_task_is_already_dead(tmp_path):
     """The same dead loop also broke odin's SHUTDOWN. `Reconciler.stop()`
     awaited the task bare, so a cancelled one re-raised CancelledError out of
-    `create_app`'s lifespan `finally` -- before `stop_in_thread(gateway...)`
-    and `store_lock.release()`. Exiting the lifespan without raising IS the
+    `create_app`'s lifespan `finally` -- before the gateway listener was
+    stopped (v0.7.7: leaving `serve_on_loop`; `stop_in_thread` before that)
+    and before `store_lock.release()`. Exiting the lifespan without raising IS the
     assertion; the freed store lock is the consequence that used to be
     skipped."""
     app = create_app(

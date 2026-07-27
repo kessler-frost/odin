@@ -17,9 +17,11 @@ from __future__ import annotations
 import json
 import threading
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from typing import Any
 
+from odin.gateway.records import validate
 from odin.spec.store import CONTROL, _load
 from odin.util import atomic_write_text
 
@@ -106,10 +108,24 @@ class JsonStore:
         saying which file, against a `GET /logs` docstring promising "never a
         500". Role CONTROL, because deleting this one is NOT the fix: it is what
         tofu's next refresh reads, so losing it orphans resources that really
-        exist."""
+        exist.
+
+        VALIDATED, not merely parsed (`records.validate`) -- the same upgrade
+        `keys.py` got, for the same reason and by the same mechanism. A file
+        that decodes is not yet a file odin can trust: `json.loads` was happy
+        with a top-level LIST (the failure then surfaced as `ValueError:
+        dictionary update sequence element #0 has length 9; 2 is required` from
+        `items()`, and with a bare string as `AttributeError: 'str' object has
+        no attribute 'get'` from `get()` -- neither of them a `StoreUnreadable`,
+        so neither reached the CONTROL recovery advice this very docstring is
+        about), and it was equally happy with `"events:{group}": "boom"`, which
+        `logsctl._append_events` then splatted into single characters and wrote
+        BACK to disk behind a 200. Every shape `records.py` names is one a real
+        reader was measured mis-answering."""
         if env not in self._loaded:
             path = self._path(env)
-            self._loaded[env] = _load(path, CONTROL, json.loads) if path.exists() else {}
+            parse = partial(validate, self._name)
+            self._loaded[env] = _load(path, CONTROL, parse) if path.exists() else {}
         return self._loaded[env]
 
     def _path(self, env: str) -> Path:

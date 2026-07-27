@@ -35,7 +35,7 @@ from odin.fabric.localhost import LocalhostFabric
 from odin.fabric.nebula import mesh_state, reap_orphaned_lighthouses
 from odin.fabric.sidecar import MeshSidecar
 from odin.gateway import DEFAULT_GATEWAY_PORT, GATEWAY_PORT_ENV, wiring
-from odin.gateway.app import GatewayState, create_gateway_app, serve_in_thread, stop_in_thread
+from odin.gateway.app import GatewayState, create_gateway_app, serve_on_loop
 from odin.gateway.keys import OPERATOR_NODE_ID, KeyStore, Principal
 from odin.gateway.models import ec2compute, ec2net, ecsctl, lambdactl, rdsctl
 from odin.gateway.stores import SynthStores
@@ -1983,44 +1983,59 @@ def create_app(
         # `PostgresRds` from the request's own env.
         rds=rds,
     )
-    gateway_server = None
-    gateway_thread = None
-
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        nonlocal gateway_server, gateway_thread, gateway_port_actual
-        # The gateway listener starts FIRST: reconcilers (built below, for
-        # envs resumed on restart) need the ACTUAL resolved port to point
-        # BackingAws's goaws.yaml at.
-        gateway_server, gateway_thread, gateway_port_actual = serve_in_thread(gateway_app, port=_resolved_gateway_port)
+        nonlocal gateway_port_actual
         # The one piece of evidence that proves THIS store has a live server, to
         # anyone who asks the kernel rather than `ps`: `odin status`/`stop` and
         # `odin import`'s live-store refusal. Held for the whole run; released
-        # below AFTER the reconcilers stop, so the store is only advertised free
-        # once nothing is writing to it. (Never a reason to fail startup: an
+        # in the outer `finally` AFTER the reconcilers stop AND after the
+        # gateway stops, so the store is only advertised free once nothing is
+        # writing to it -- and the gateway writes to it (SynthStores) for as
+        # long as it is accepting. (Never a reason to fail startup: an
         # unlockable store answers "free", see util._flock.)
+        #
+        # v0.7.7 de-threading: this used to be claimed AFTER the gateway
+        # listener, and both were torn down in one `finally` in the order
+        # gateway-then-lock. `serve_on_loop` is a context manager, so the two
+        # can only nest, and nesting is LIFO -- claiming the lock FIRST is what
+        # makes the shutdown order come out unchanged. Nothing between them
+        # reads either, and a gateway bind that fails now simply releases it on
+        # the way out.
         store_lock = hold_store_lock(_store.root)
-        # ...and a watchdog that puts the lock FILE back if anything deletes it
-        # (field test 4 -- see `_keep_store_lock`). The lock itself survives the
-        # deletion; only the evidence odin can find by path does not.
-        lock_watch = asyncio.create_task(_keep_store_lock(store_lock))
-        # ...and the same shape for the loops themselves: nothing used to
-        # notice a reconciler that had stopped ticking (see
-        # `_watch_reconcilers` and `Reconciler.health`).
-        loop_watch = asyncio.create_task(_watch_reconcilers(reconcilers, ws_manager))
-        envs = _store.list_envs()
-        if _reap_ec2_vms:
-            await _reap_orphaned_ec2_vms(_store.root, envs, gateway_stores)
-        for env in envs:  # resume reconciling existing environments
-            await reconciler_for(env)
         try:
-            yield
+            # The gateway listener starts FIRST (of the things that matter to
+            # them): reconcilers (built below, for envs resumed on restart) need
+            # the ACTUAL resolved port to point BackingAws's goaws.yaml at.
+            #
+            # v0.7.7: a TASK on THIS loop, not a second uvicorn on a second
+            # thread -- odin ran two event loops in two threads until now. See
+            # `gateway/app.py::serve_on_loop`.
+            async with serve_on_loop(gateway_app, port=_resolved_gateway_port) as gateway_port_actual:
+                # ...and a watchdog that puts the lock FILE back if anything
+                # deletes it (field test 4 -- see `_keep_store_lock`). The lock
+                # itself survives the deletion; only the evidence odin can find
+                # by path does not.
+                lock_watch = asyncio.create_task(_keep_store_lock(store_lock))
+                # ...and the same shape for the loops themselves: nothing used to
+                # notice a reconciler that had stopped ticking (see
+                # `_watch_reconcilers` and `Reconciler.health`).
+                loop_watch = asyncio.create_task(_watch_reconcilers(reconcilers, ws_manager))
+                envs = _store.list_envs()
+                if _reap_ec2_vms:
+                    await _reap_orphaned_ec2_vms(_store.root, envs, gateway_stores)
+                for env in envs:  # resume reconciling existing environments
+                    await reconciler_for(env)
+                try:
+                    yield
+                finally:
+                    lock_watch.cancel()
+                    loop_watch.cancel()
+                    for reconciler in reconcilers.values():
+                        await reconciler.stop()
+                    # Leaving this block is what stops the gateway -- after the
+                    # reconcilers, exactly where `stop_in_thread` used to sit.
         finally:
-            lock_watch.cancel()
-            loop_watch.cancel()
-            for reconciler in reconcilers.values():
-                await reconciler.stop()
-            stop_in_thread(gateway_server, gateway_thread)
             store_lock.release()
 
     app = FastAPI(title="odin", version=odin_version(), lifespan=lifespan)

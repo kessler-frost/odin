@@ -979,7 +979,7 @@ def test_clean_all_names_the_envs_real_vms_too(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".odin" / "sneak").mkdir(parents=True)
     stores = SynthStores(tmp_path / ".odin")
-    stores.ec2compute.set("sneak", "instance:i-abc", {"instance_id": "i-abc"})
+    stores.ec2compute.set("sneak", "instance:i-abc", {"instance_id": "i-abc", "state_name": "running"})
     # A VM this store claims, one it does not, and the user's own machine.
     _fake_machine(monkeypatch, vms=["odin-ec2-sneak-i-abc", "odin-ec2-other-i-zzz", "veronica"])
 

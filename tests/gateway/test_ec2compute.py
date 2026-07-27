@@ -968,7 +968,7 @@ class FakeReaperVm:
 
 def test_reap_orphaned_vms_deletes_only_unmatched_ec2_named_vms(tmp_path):
     stores = SynthStores(tmp_path)
-    stores.ec2compute.set("default", "instance:i-known", {"instance_id": "i-known"})
+    stores.ec2compute.set("default", "instance:i-known", {"instance_id": "i-known", "state_name": "running"})
     vm = FakeReaperVm(names=[
         "odin-ec2-default-i-known",      # matches the store -- must survive
         "odin-ec2-default-i-orphaned",   # no matching record -- reaped
@@ -988,7 +988,7 @@ def test_reap_orphaned_vms_deletes_only_unmatched_ec2_named_vms(tmp_path):
 
 def test_reap_orphaned_vms_is_a_no_op_when_everything_matches(tmp_path):
     stores = SynthStores(tmp_path)
-    stores.ec2compute.set("default", "instance:i-known", {"instance_id": "i-known"})
+    stores.ec2compute.set("default", "instance:i-known", {"instance_id": "i-known", "state_name": "running"})
     vm = FakeReaperVm(names=["odin-ec2-default-i-known"])
 
     reaped = ec2compute.reap_orphaned_vms(tmp_path, ["default"], vm=vm)
