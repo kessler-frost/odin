@@ -49,18 +49,14 @@ from pathlib import Path
 SRC = Path(__file__).resolve().parents[1] / "src" / "odin"
 
 # (module path, awaited attribute) -> owner + why it is still here.
-ALLOWED: dict[tuple[str, str], str] = {
-    ("compute/instances.py", "self._run"):
-        "v0.7.7, owner dethread-compute-src. `_default_runner` (line 162) is a "
-        "plain def; awaited at lines 416 and 522. MEASURED: `await "
-        "InstanceVm()._lima('list','-q')` raises TypeError, and ec2compute "
-        "builds `vm or InstanceVm()` at five sites, so this is production.",
-    ("fabric/nebula.py", "self._run"):
-        "v0.7.7, owner dethread-fabric-src. `_default_runner` (line 227) is a "
-        "plain def; awaited at lines 361 and 381, yet called WITHOUT await at "
-        "line 1081 in the same file. MEASURED: `await NebulaManager(d)."
-        "create_ca(env)` raises TypeError.",
-}
+# Both original entries -- `compute/instances.py` and `fabric/nebula.py`, whose
+# `_default_runner` was a plain `def` awaited at its call sites -- are FIXED.
+# nebula's was 83 of the 90 failures then outstanding in tests/gateway; both
+# now run through `util.run_command_async`, which keeps `run_command`'s rc-127
+# contract for a binary that is not on PATH. Empty is the correct state, and
+# the stale-entry test below is what forced this cleanup rather than letting
+# the list rot into a description of bugs nobody has.
+ALLOWED: dict[tuple[str, str], str] = {}
 
 
 def dotted(node: ast.AST) -> str:
