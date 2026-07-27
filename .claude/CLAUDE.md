@@ -131,6 +131,39 @@ than claimed" — was the single most valuable output of the field tests.
    signalled nothing because the container's BusyBox lacks `pgrep -o`, and odin
    was right to keep reporting healthy).
 
+## Browser automation: `agent-browser` (playwright-cli removed 2026-07-27)
+`agent-browser` (brew, Apache-2.0) is the only browser driver. `@playwright/cli`
+and its skill are gone; nothing in odin depended on them
+(`grep -in playwright ui/package.json pyproject.toml` → no match). Load usage at
+runtime with **`agent-browser skills get core --full`** — the skill in
+`~/.claude/skills/agent-browser/` is only a discovery stub, so instructions
+always match the installed CLI instead of going stale.
+
+**Two measured gotchas. Both are this repo's own "reports success it did not
+achieve" pattern, living inside the tool:**
+
+1. **Mouse gestures MUST be batched.** Issued as separate CLI calls, `mouse move`
+   x5 after `mouse down` registers only ONE pointermove and fires `pointerup` at
+   the ORIGIN, not the target -- so odin's IAM permission edges (pointer-based, a
+   different code path from the sidebar's HTML5 drag-and-drop) never get drawn.
+   **Every swallowed call still prints `✓ Done` and exits 0.** Use
+   `agent-browser batch "mouse move …" "mouse down" … "mouse up"`, measured to
+   produce a real edge.
+2. **`drag` has no target-position option** -- it always drops at the target's
+   CENTRE. For an exact coordinate use `eval` with a synthetic `DataTransfer`
+   (measured: places a node at the precise flow position). Use `drag` for the
+   visible gesture in a recording, `eval` when the position matters.
+
+Verified end-to-end against odin on 2026-07-27: drag places a real node
+(`data-id s3-101`, grid-snapped by `Canvas.tsx`'s onDrop); the full sequence
+fires (`dragstart` → `dragover` → `drop` → `dragend`) carrying
+`application/odin-resource`; clicking APPLY against a LIVE server committed a
+Stack revision and `/world` reported the resource `healthy`; and
+`record start/stop` writes WebM natively for the README GIFs (set the viewport
+AFTER `record start` -- recording opens a fresh context with its own viewport).
+For WebSocket taps use `--init-script`, which registers before the app's own
+connection; an `eval` after load always loses that race.
+
 ## Concurrency: async, not threads (owner directive, 2026-07-27)
 **No `threading` and no `multiprocessing` unless genuinely unavoidable.** The reason is locking: threads force it, and on a single
 event loop a synchronous read-modify-write is already atomic with respect to
@@ -201,7 +234,7 @@ Hard-won mechanics. Ignoring these has already destroyed work in this repo.
 ## Cleanup / Disk (limited headroom — clean up after EVERY heavy step)
 - **Containers:** every test/run tears down its own; `docker ps -aq --filter label=odin=1 | xargs -r docker rm -f`. Tests use the `runtime` fixture's teardown.
 - **Lima VMs:** the LimaRuntime VM is `odin-host`; integration tests delete it after. Never leave stray VMs (`limactl list -q`); delete by exact name (the user's own VMs like `veronica` are off-limits).
-- **Misc:** prune `.odin/`, `.playwright-cli/*.yml`, `/tmp/*.png`, `__pycache__`, `.pytest_cache`, `.ruff_cache`.
+- **Misc:** prune `.odin/`, `/tmp/*.png`, `__pycache__`, `.pytest_cache`, `.ruff_cache`. (Browser work leaves no litter to prune: `agent-browser` keeps state in its own session store, unlike playwright-cli which dumped a YAML snapshot per command.)
 
 ## CLI / running
 - `uv run uvicorn odin.server:create_app --factory --host 127.0.0.1 --port 4200` (the real app: reconciler + AWS backings in lifespan).
