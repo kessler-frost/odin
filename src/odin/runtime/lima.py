@@ -25,6 +25,7 @@ container's stderr; they carry no `--timestamps` prefix, so
 """
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import time
 from pathlib import Path
@@ -48,7 +49,7 @@ class LimaRuntime(_ContainerRuntime):
     VM = "odin-host"
     CLI = "nerdctl"
 
-    def _lima(self, *args: str, check: bool = True, input: str | None = None) -> str:
+    async def _lima(self, *args: str, check: bool = True, input: str | None = None) -> str:
         """The OUTER seam (`limactl` itself), as opposed to `_argv`/`_cli`'s
         inner one (`nerdctl` inside the VM).
 
@@ -58,7 +59,7 @@ class LimaRuntime(_ContainerRuntime):
         twin rather than one at a time. See that method for the real limactl
         2.1.3 probe -- four real invocations that exit non-zero with an empty
         stderr, one of them with its reason on stdout."""
-        proc = self._run(["limactl", *args], input=input)
+        proc = await self._run(["limactl", *args], input=input)
         if check and proc.returncode != 0:
             raise RuntimeError(
                 f"limactl {' '.join(args)} failed "
@@ -70,8 +71,8 @@ class LimaRuntime(_ContainerRuntime):
         # the base seam: nerdctl inside the VM
         return ["limactl", "shell", self.VM, "sudo", "nerdctl", *args]
 
-    def ensure_host(self) -> HostFacts:
-        if self.VM not in self._lima("list", "-q", check=False).split():
+    async def ensure_host(self) -> HostFacts:
+        if self.VM not in await self._lima("list", "-q", check=False).split():
             cloud_init = generate_cloud_init(hostname=self.VM, install_nerdctl=True)
             yaml = generate_lima_yaml(
                 get_instance_type("t2.medium"), cloud_init_script=cloud_init,
@@ -80,20 +81,20 @@ class LimaRuntime(_ContainerRuntime):
             with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as handle:
                 handle.write(yaml)
                 yaml_path = handle.name
-            self._lima("create", "--tty=false", f"--name={self.VM}", yaml_path)
-            self._lima("start", self.VM)
+            await self._lima("create", "--tty=false", f"--name={self.VM}", yaml_path)
+            await self._lima("start", self.VM)
             Path(yaml_path).unlink(missing_ok=True)
-        self._wait_for_nerdctl()
-        out = self._cli("info", "--format", "{{.MemTotal}} {{.NCPU}}", check=False)
+        await self._wait_for_nerdctl()
+        out = await self._cli("info", "--format", "{{.MemTotal}} {{.NCPU}}", check=False)
         if not out:
             return HostFacts()
         mem_bytes, ncpu = out.split()
         return HostFacts(total_mem_mib=int(mem_bytes) / 1024 / 1024, cpu_count=int(ncpu))
 
-    def _wait_for_nerdctl(self, timeout: float = 360.0) -> None:
+    async def _wait_for_nerdctl(self, timeout: float = 360.0) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if "server version" in self._cli("info", check=False).lower():
+            if "server version" in await self._cli("info", check=False).lower():
                 return
-            time.sleep(5)
+            await asyncio.sleep(5)
         raise RuntimeError(f"nerdctl not ready in {self.VM} within {timeout}s")
