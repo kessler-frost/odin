@@ -110,6 +110,54 @@ recurring. Read them before writing a guard, a status, or a caveat.
 try to falsify it. That judgement — "here is where the original proof was weaker
 than claimed" — was the single most valuable output of the field tests.
 
+4. **Read the REAL exit code, and verify a change by CONTENT not by message.**
+   The rules above are about odin lying to a user; this one is about a tool lying
+   to *you*, and it cost more time in one session than any single bug.
+   `cmd | head; echo $?` gives you **head's** status, not `cmd`'s. Worst case
+   seen: `git apply -3 p 2>&1 | head -6; echo "APPLIED"` printed six "Applied
+   patch … cleanly" lines, so the merge looked done — but `git apply` is atomic,
+   a later file failed, it **rolled the whole patch back**, `head` ate the error,
+   and the unconditional `echo` manufactured the success. The full suite then
+   passed against pristine code. Caught only by grepping for the fix's own
+   identifier and getting zero hits. Two different agents hit this the same day
+   (the other: `git stash pop | tail -3` reported 0 while git had failed, leaving
+   the work stashed — nearly five false "fixes" reported).
+   So: **never pipe a command whose success you are about to rely on** — redirect
+   to a file, `echo $?` on its own line; **never write an unconditional
+   `echo "DONE"`** after a fallible command; and after any merge/patch/edit,
+   **grep for something the change introduces** before believing it landed.
+   Also verify your own *test harness* before blaming the code: a fault injection
+   that silently does nothing looks exactly like a bug (a `kill -STOP` that
+   signalled nothing because the container's BusyBox lacks `pgrep -o`, and odin
+   was right to keep reporting healthy).
+
+## Working in parallel (subagents and teammates)
+Hard-won mechanics. Ignoring these has already destroyed work in this repo.
+- **An agent worktree is branched from whatever HEAD existed when it was
+  created, which is often NOT current `develop`.** Two agents filed findings
+  against stale trees, and copying an agent's files wholesale into the main
+  checkout once silently **reverted 192 lines** of newer work. So: before
+  trusting anything from a worktree, `git diff <agent-base> HEAD -- <files>`; and
+  prefer `git apply -3` of the agent's own diff over any file copy. Agents:
+  compare your `git log --oneline -1` against the main checkout before concluding
+  a fix is missing.
+- **Never remove an agent's worktree until the whole run is over.** A "completed"
+  notification does not mean terminated — agents get resumed, and two that were
+  resumed after their worktrees were deleted lost their shells entirely, one
+  losing an uncommitted refactor it then reported as destroyed (it had actually
+  landed elsewhere; the false report was nearly acted on as a rebuild).
+- **Assign every agent its own server port, `ODIN_GATEWAY_PORT`, and store dir**
+  (never `/tmp` — macOS TMPDIR isn't shared into Colima), and its own env-name
+  prefix. Two agents defaulting to :4200/:4266 produced a bogus 401 and two
+  phantom "bugs" that had to be retracted.
+- **Cleanup must be scoped to the env names that agent created.** `docker ps -aq
+  --filter label=odin=1 | xargs -r docker rm -f` is machine-wide and has already
+  deleted another agent's containers mid-verification. Use
+  `--filter name=<prefix>`.
+- **"I read it" needs a "when."** With many agents in flight, one read
+  `catalog.ts` before a commit landed and another after, and they reported
+  contradictory states — both honestly. Timestamp claims about the tree.
+
 ## Cleanup / Disk (limited headroom — clean up after EVERY heavy step)
 - **Containers:** every test/run tears down its own; `docker ps -aq --filter label=odin=1 | xargs -r docker rm -f`. Tests use the `runtime` fixture's teardown.
 - **Lima VMs:** the LimaRuntime VM is `odin-host`; integration tests delete it after. Never leave stray VMs (`limactl list -q`); delete by exact name (the user's own VMs like `veronica` are off-limits).
