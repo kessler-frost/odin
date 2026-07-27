@@ -100,10 +100,10 @@ def test_sns_subscribe_verifies(sink, sns):
     assert sigv4.verify(req.method, req.url, req.headers, req.body, _secret_for) == ACCESS_KEY
 
 
-def test_unsigned_payload_verifies(sink):
+async def test_unsigned_payload_verifies(sink):
     # A REAL UNSIGNED-PAYLOAD capture, not a hand-edited header: botocore's
     # payload_signing_enabled=False config is what actually produces one.
-    client = _client(
+    client = await _client(
         sink, "s3", config=Config(signature_version="s3v4", s3={"addressing_style": "path", "payload_signing_enabled": False})
     )
     req = sink.call(lambda: client.put_object(Bucket="uploads", Key="a.txt", Body=b"payload-bytes"))

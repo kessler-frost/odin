@@ -355,7 +355,7 @@ async def _live_states(runtime, names: list[str]) -> dict[str, str] | None:
     return {name: await runtime.status(name) for name in names if name in present}
 
 
-def _dead_verdict(containers, name: str, state: str | None) -> str:
+async def _dead_verdict(containers, name: str, state: str | None) -> str:
     """WHY this container isn't serving, in the SAME sentences the cadence half
     has always used -- one down container, one vocabulary, whichever surface an
     operator is looking at. `state is None` is the container that no longer
@@ -369,7 +369,7 @@ def _dead_verdict(containers, name: str, state: str | None) -> str:
     template differs) is reported as no number at all rather than as "exit -1":
     field test 2 LOW-17's rule, that odin never invents a code nothing
     reported."""
-    code = containers.exit_code(name) if state == "exited" else -1
+    code = await containers.exit_code(name) if state == "exited" else -1
     detail = (
         "removed outside odin" if state is None
         else f"is not running (exit {code})" if code >= 0
@@ -391,7 +391,7 @@ class Dead(NamedTuple):
     verdict: str
 
 
-def _dead(stores: SynthStores, env: str, containers=None) -> list[Dead]:
+async def _dead(stores: SynthStores, env: str, containers=None) -> list[Dead]:
     """THE read, shared by both halves so they cannot disagree: `_live_states`
     against every record that CLAIMS to be up.
 
@@ -418,28 +418,28 @@ def _dead(stores: SynthStores, env: str, containers=None) -> list[Dead]:
         for label, record in databases
     ]
     runtime = containers or ColimaRuntime()
-    states = _live_states(runtime, [container for *_rest, container in claimed])
+    states = await _live_states(runtime, [container for *_rest, container in claimed])
     if states is None:  # the runtime didn't answer: unknown is not "gone"
         return []
     return [
-        Dead(label, identity, kind, _dead_verdict(runtime, container, states.get(container)))
+        Dead(label, identity, kind, await _dead_verdict(runtime, container, states.get(container)))
         for label, identity, kind, container in claimed
         if _not_serving(states.get(container))
     ]
 
 
-def live_verdicts(stores: SynthStores, env: str, containers=None) -> dict[str, str]:
+async def live_verdicts(stores: SynthStores, env: str, containers=None) -> dict[str, str]:
     """`label -> verdict` for every lambda/rds whose container is not running
     RIGHT NOW. READ-ONLY: not one record is touched (the module docstring says
     why the projection must not write). `tf_status.project()`'s caller."""
-    return {entry.label: entry.verdict for entry in _dead(stores, env, containers)}
+    return {entry.label: entry.verdict for entry in await _dead(stores, env, containers)}
 
 
 # label -> the model call that writes this kind's failure into its own record.
 _CORRECT = {"lambda": mark_function_failed, "rds": rdsctl.mark_instance_failed}
 
 
-def sweep_compute(stores: SynthStores, env: str, containers=None) -> dict[str, str]:
+async def sweep_compute(stores: SynthStores, env: str, containers=None) -> dict[str, str]:
     """`live_verdicts` PLUS the record correction -- the same verdict written
     into the record it just proved wrong, which is what makes "re-Apply to
     recreate" true (`converge_functions`/`converge_db_instances` only ever act
@@ -448,7 +448,7 @@ def sweep_compute(stores: SynthStores, env: str, containers=None) -> dict[str, s
     /apply-full and `DriftSweeper` are its only callers, and they are exactly
     the two places allowed to write: an apply REPORTING the death is what has to
     happen before anything recreates the resource."""
-    dead = _dead(stores, env, containers)
+    dead = await _dead(stores, env, containers)
     for entry in dead:
         _CORRECT[entry.kind](stores, env, entry.identity, entry.verdict)
     return {entry.label: entry.verdict for entry in dead}
@@ -518,7 +518,7 @@ class DriftSweeper:
         # rather than reimplemented: one function, one set of sentences, one
         # correction -- so the cadence sweep, the projection and an apply can
         # never disagree about whether a container is up (field test 5).
-        out: dict[str, str] = dict(sweep_compute(stores, env, self._containers))
+        out: dict[str, str] = dict(await sweep_compute(stores, env, self._containers))
         # At most ONE listing per substrate, and none at all when this env has
         # nothing of that shape to check (the common case: a canvas with no
         # ec2 node never shells out to limactl).
@@ -539,8 +539,8 @@ class DriftSweeper:
         await self._sweep_databases(stores, env, out)
         return out
 
-    def _probe_db(self, record: dict):
-        return self._probe(
+    async def _probe_db(self, record: dict):
+        return await self._probe(
             "127.0.0.1", record["endpoint_port"],
             record["master_username"], record["master_password"],
         )
@@ -563,7 +563,7 @@ class DriftSweeper:
             # carries no error, so the verdict asserted a failure its own
             # newest evidence had just disproved -- and rendered the reason as
             # the literal string "None".
-            probe = self._probe_db(record)
+            probe = await self._probe_db(record)
             if probe.ok:
                 continue
             identifier = record["db_instance_identifier"]
@@ -587,7 +587,7 @@ class DriftSweeper:
             # beat and ask BOTH questions again, and only correct the record
             # when both still say down.
             await asyncio.sleep(_CONFIRM_DELAY)
-            if self._probe_db(record).ok or await self._containers.status(name) == "running":
+            if await self._probe_db(record).ok or await self._containers.status(name) == "running":
                 log.info("drift sweep: %s answered on re-check; treating the first sample as a blip", name)
                 continue
             # Field test 2 LOW-17: say the same thing the ecs/lambda halves

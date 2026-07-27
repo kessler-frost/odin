@@ -776,7 +776,7 @@ def mark_task_stopped(stores: SynthStores, env: str, cluster_name: str, task_id:
 # ec2compute/lambdactl already use for real, possibly-slow substrate work) --
 
 
-def _launch_task(
+async def _launch_task(
     stores: SynthStores, env: str, cluster_name: str, service_name: str, taskdef: dict, runtime: TaskRuntime,
     extra_env: dict[str, str] | None = None, node_label: str = "",
 ) -> None:
@@ -813,7 +813,7 @@ def _launch_task(
         # `docker run`: the task goes STOPPED with the real reason, which is
         # what makes a bad ref a `crashed` node with a naming verdict AND a
         # failed apply (the service never reaches steady state).
-        launch_env = {**node_env(stores, env, node_label), **(extra_env or {})} if node_label else extra_env
+        launch_env = {**await node_env(stores, env, node_label), **(extra_env or {})} if node_label else extra_env
         handle = runtime.run(
             env, task_id, container_def, extra_env=launch_env,
             cpu=taskdef.get("cpu"), memory=taskdef.get("memory"),
@@ -992,7 +992,7 @@ async def _reconcile_service_tasks(
         # measured outage this ordering closes.
         if len(fresh) < desired:
             for _ in range(min(desired - len(fresh), max(_surge_budget(service, len(live)), 0))):
-                _launch_task(stores, env, cluster_name, service_name, taskdef, runtime, extra_env, node_label)
+                await _launch_task(stores, env, cluster_name, service_name, taskdef, runtime, extra_env, node_label)
         elif len(fresh) > desired:
             # Newest-task-first scale-down (the digest's own ordering).
             excess = sorted(fresh, key=lambda t: t["started_at"] or 0, reverse=True)[: len(fresh) - desired]

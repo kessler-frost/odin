@@ -18,19 +18,19 @@ from odin.spec.translate import canvas_to_stack
 
 
 class FakeRuntime:
-    def run_container(self, spec):
+    async def run_container(self, spec):
         return RunHandle(id="x", name=spec.name)
 
-    def stop(self, name):
+    async def stop(self, name):
         pass
 
-    def facts(self, name, container_port=0):
+    async def facts(self, name, container_port=0):
         return ContainerFacts(phase="pending")
 
-    def stats(self, name):
+    async def stats(self, name):
         return {"cpu": 0.0, "ram": 0.0}
 
-    def ensure_host(self):
+    async def ensure_host(self):
         return HostFacts()
 
 

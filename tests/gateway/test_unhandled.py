@@ -75,10 +75,10 @@ def _app(tmp_path: Path, backing, service: str = "s3"):
     return app, access_key, secret_key
 
 
-def _signed(access_key: str, secret_key: str, url: str, service: str = "s3"):
+async def _signed(access_key: str, secret_key: str, url: str, service: str = "s3"):
     """A real boto3-signed request, so the gateway identifies a real principal
     and a real service rather than being handed a hand-built header set."""
-    client = boto3.client(
+    client = await boto3.client(
         service, endpoint_url=url, region_name="us-east-1",
         aws_access_key_id=access_key, aws_secret_access_key=secret_key,
         config=Config(signature_version="s3v4", s3={"addressing_style": "path"},
@@ -125,7 +125,7 @@ def test_an_unexpected_exception_answers_internal_failure_without_leaking(tmp_pa
     assert "secret-bearing" not in response.text
 
 
-def test_the_failure_wears_the_wire_format_of_the_service_asked_for(tmp_path, sink):
+async def test_the_failure_wears_the_wire_format_of_the_service_asked_for(tmp_path, sink):
     """`request.state.service` is why this works: set at identification, the
     earliest point the service is known, so a handler covering paths that never
     reached their own error return still answers in the right dialect. DynamoDB
@@ -136,7 +136,7 @@ def test_the_failure_wears_the_wire_format_of_the_service_asked_for(tmp_path, si
     reached the forward, which would have tested the deny path instead of this
     handler."""
     app, access_key, secret_key = _app(tmp_path, DyingBacking(), service="dynamodb")
-    ddb = boto3.client(
+    ddb = await boto3.client(
         "dynamodb", endpoint_url=sink.endpoint, region_name="us-east-1",
         aws_access_key_id=access_key, aws_secret_access_key=secret_key,
     )
@@ -152,7 +152,7 @@ def test_the_failure_wears_the_wire_format_of_the_service_asked_for(tmp_path, si
     assert "ServiceUnavailable" in response.text
 
 
-def test_a_real_boto3_client_parses_a_real_gateway_failure(tmp_path):
+async def test_a_real_boto3_client_parses_a_real_gateway_failure(tmp_path):
     """The measurement the in-process cases cannot make (see module docstring):
     over a real socket, against real uvicorn, does botocore turn this into a
     ClientError it can reason about? Before the handler existed it received
@@ -160,7 +160,7 @@ def test_a_real_boto3_client_parses_a_real_gateway_failure(tmp_path):
     app, access_key, secret_key = _app(tmp_path, DyingBacking())
     server, thread, port = serve_in_thread(app, host="127.0.0.1", port=0)
     try:
-        s3 = _signed(access_key, secret_key, f"http://127.0.0.1:{port}")
+        s3 = await _signed(access_key, secret_key, f"http://127.0.0.1:{port}")
         with pytest.raises(ClientError) as caught:
             s3.get_object(Bucket="uploads", Key="a.txt")
     finally:
@@ -171,7 +171,7 @@ def test_a_real_boto3_client_parses_a_real_gateway_failure(tmp_path):
     assert error["Error"]["Code"] == "ServiceUnavailable"
 
 
-def test_an_sts_auth_failure_is_query_xml_so_botocore_can_parse_it(tmp_path):
+async def test_an_sts_auth_failure_is_query_xml_so_botocore_can_parse_it(tmp_path):
     """STS is a QUERY-protocol service, like sns/iam/rds — but it was missing
     from `errors._QUERY_XML_SERVICES`, so odin answered an STS auth failure with
     AWS-JSON. Reproduced with a real boto3 client against a real server: botocore
@@ -188,7 +188,7 @@ def test_an_sts_auth_failure_is_query_xml_so_botocore_can_parse_it(tmp_path):
     app = create_gateway_app(GatewayState(), keystore, stores, _swallow)
     server, thread, port = serve_in_thread(app, host="127.0.0.1", port=0)
     try:
-        sts = boto3.client(
+        sts = await boto3.client(
             "sts", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
             aws_access_key_id="AKIAnotreal", aws_secret_access_key="nope",
             config=Config(retries={"max_attempts": 1}),

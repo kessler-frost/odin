@@ -489,7 +489,7 @@ async def diagnose(
     )
     try:
         await asyncio.wait_for(
-            _run_agent(_prompt(context, question), options, client_cls),
+            await _run_agent(_prompt(context, question), options, client_cls),
             timeout=timeout if timeout is not None else _default_timeout(),
         )
     except Exception:

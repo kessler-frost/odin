@@ -502,7 +502,7 @@ class BackingAws:
             return self._client_factory(service, endpoint)
         config = Config(signature_version="s3v4", s3={"addressing_style": "path"}) \
             if service == "s3" else None
-        return boto3.client(service, endpoint_url=endpoint, aws_access_key_id=ACCESS_KEY,
+        return await boto3.client(service, endpoint_url=endpoint, aws_access_key_id=ACCESS_KEY,
                             aws_secret_access_key=SECRET_KEY, region_name=REGION, config=config)
 
     async def provision(self, service: str, name: str, subscriptions: tuple[str, ...] = ()) -> None:

@@ -440,7 +440,7 @@ def _db_firewall(stores: SynthStores, env: str, group_ids: list[str]) -> Firewal
     return union_firewalls(compiled) if compiled else None
 
 
-def _join_mesh(stores: SynthStores, env: str, identifier: str, rds: PostgresRds) -> None:
+async def _join_mesh(stores: SynthStores, env: str, identifier: str, rds: PostgresRds) -> None:
     """Put this instance's real Postgres container on the env's Nebula overlay
     behind its assigned SGs' compiled firewall, and record the overlay IP so
     `reconcile/tf_status.py::_db_facts` can publish `DATABASE_URL_MESH`.
@@ -464,10 +464,10 @@ def _join_mesh(stores: SynthStores, env: str, identifier: str, rds: PostgresRds)
     # `membership_revision` is what makes its reload count -- see
     # `fabric/nebula.py::FIREWALL_REVISION_KEY`.
     revision = membership_revision(stores, env)
-    _update(stores, env, identifier, overlay_ip=rds.join_mesh(identifier, firewall, revision))
+    _update(stores, env, identifier, overlay_ip=await rds.join_mesh(identifier, firewall, revision))
 
 
-def _wait_available(rds: PostgresRds, identifier: str, user: str, password: str, deadline: float) -> tuple[int, str | None]:
+async def _wait_available(rds: PostgresRds, identifier: str, user: str, password: str, deadline: float) -> tuple[int, str | None]:
     """Poll until the container publishes a host port AND `pg_ready_sync`
     succeeds TWICE IN A ROW against it. Returns `(port, error)` -- `error` is
     None on success, otherwise the LAST real failure text (never an invented
@@ -485,7 +485,7 @@ def _wait_available(rds: PostgresRds, identifier: str, user: str, password: str,
     error = "timed out waiting for a published port"
     streak = 0
     while time.monotonic() < deadline:
-        endpoint = rds.endpoint(identifier)
+        endpoint = await rds.endpoint(identifier)
         if endpoint is not None:
             probe = pg_ready_sync(endpoint[0], endpoint[1], user, password)
             streak = streak + 1 if probe.ok else 0
@@ -497,14 +497,14 @@ def _wait_available(rds: PostgresRds, identifier: str, user: str, password: str,
     return 0, error
 
 
-def _finish_create(stores: SynthStores, env: str, identifier: str, user: str, password: str, db_name: str, rds: PostgresRds) -> None:
+async def _finish_create(stores: SynthStores, env: str, identifier: str, user: str, password: str, db_name: str, rds: PostgresRds) -> None:
     # Deliberately broad, for `ec2compute._finish_boot`'s exact reason: this
     # runs on a daemon thread with no caller to propagate to, and an uncaught
     # exception would strand the instance `creating` forever -- the provider's
     # create waiter would then spin until ITS timeout with no explanation.
     # Any failure becomes a real, provider-visible `failed` status instead.
     try:
-        rds.create_db(identifier, user, password, db_name)
+        await rds.create_db(identifier, user, password, db_name)
     except Exception as exc:
         # `exc_text`, not `str(exc)`: this string is PERSISTED as the
         # instance's whole explanation and DescribeDBInstances hands it
@@ -518,7 +518,7 @@ def _finish_create(stores: SynthStores, env: str, identifier: str, user: str, pa
         log.warning("rds create failed for %s (env %s): %s", identifier, env, exc_text(exc))
         _update(stores, env, identifier, status=FAILED, status_reason=f"container did not start: {exc_text(exc)}")
         return
-    port, error = _wait_available(rds, identifier, user, password, time.monotonic() + _CREATE_TIMEOUT)
+    port, error = await _wait_available(rds, identifier, user, password, time.monotonic() + _CREATE_TIMEOUT)
     if error is not None:
         log.warning("rds %s (env %s) never became ready: %s", identifier, env, error)
         _update(stores, env, identifier, status=FAILED, status_reason=f"Postgres never became ready: {error}")
@@ -532,12 +532,12 @@ def _finish_create(stores: SynthStores, env: str, identifier: str, user: str, pa
     # never held behind mesh wiring (which, on a machine that hasn't built the
     # nebula sidecar image yet, does real work). The gated overlay address
     # follows a moment later as an extra fact.
-    _join_mesh(stores, env, identifier, rds)
+    await _join_mesh(stores, env, identifier, rds)
 
 
-def _finish_delete(stores: SynthStores, env: str, identifier: str, rds: PostgresRds) -> None:
+async def _finish_delete(stores: SynthStores, env: str, identifier: str, rds: PostgresRds) -> None:
     try:
-        rds.delete_db(identifier)
+        await rds.delete_db(identifier)
     except Exception as exc:
         # Honesty over a clean-looking teardown (ec2compute's own VM-delete
         # rule): the record STAYS `deleting` with the failure recorded, so a
@@ -639,7 +639,7 @@ def _delete_db_instance(params: dict[str, str], env: str, stores: SynthStores, n
     return response
 
 
-def _modify_db_instance(params: dict[str, str], env: str, stores: SynthStores, now: float, rds: PostgresRds) -> Response:
+async def _modify_db_instance(params: dict[str, str], env: str, stores: SynthStores, now: float, rds: PostgresRds) -> Response:
     identifier = params.get("DBInstanceIdentifier", "")
     record = _record(stores, env, identifier)
     if record is None:
@@ -650,7 +650,7 @@ def _modify_db_instance(params: dict[str, str], env: str, stores: SynthStores, n
         # embeds this password (module docstring). A failure is reported as a
         # real RDS error so the apply fails instead of drifting.
         try:
-            rds.set_password(identifier, record["master_username"], record["master_password"], password)
+            await rds.set_password(identifier, record["master_username"], record["master_password"], password)
         except Exception as exc:
             # `exc_text` here too: this one goes on the WIRE as the apply's
             # own failure line, so a blank left tofu reporting an
@@ -877,7 +877,7 @@ def wait_for_available_instances(
         time.sleep(_AVAILABLE_POLL_SECONDS)
 
 
-def ensure_db_mesh(
+async def ensure_db_mesh(
     stores: SynthStores, env: str, substrate: PostgresRds | None = None,
 ) -> None:
     """Re-ensure every `available` instance's Nebula mesh membership -- run on
@@ -905,7 +905,7 @@ def ensure_db_mesh(
     rds = substrate or PostgresRds(ColimaRuntime(), env, root=stores.root)
     for record in records(stores, env):
         if record["status"] == AVAILABLE:
-            _join_mesh(stores, env, record["db_instance_identifier"], rds)
+            await _join_mesh(stores, env, record["db_instance_identifier"], rds)
 
 
 # --- dispatch --------------------------------------------------------------

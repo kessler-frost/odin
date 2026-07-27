@@ -60,13 +60,13 @@ class FakeContainers:
         self.calls = 0
         self.status_calls: list[str] = []
 
-    def container_names(self) -> list[str]:
+    async def container_names(self) -> list[str]:
         self.calls += 1
         if self.error is not None:
             raise self.error
         return [*self.names, *self.exited, *self.paused]
 
-    def status(self, name: str) -> str:
+    async def status(self, name: str) -> str:
         self.status_calls.append(name)
         if name in self.names:
             return "running"
@@ -74,7 +74,7 @@ class FakeContainers:
             return "paused"
         return "exited" if name in self.exited else "absent"
 
-    def exit_code(self, name: str) -> int:
+    async def exit_code(self, name: str) -> int:
         return self.exited.get(name, -1)
 
 
@@ -130,12 +130,12 @@ def _ecs_task(stores: SynthStores, task_id: str, last_status: str = "RUNNING") -
 # --- ec2: the flagship case (a Lima VM deleted out of band) ----------------
 
 
-def test_deleted_vm_yields_a_crashed_verdict_naming_the_drift(tmp_path):
+async def test_deleted_vm_yields_a_crashed_verdict_naming_the_drift(tmp_path):
     stores = SynthStores(tmp_path)
     name = _ec2(stores, "web", "i-1")
     sweeper = _sweeper(vms=FakeVms(names=["veronica"]))  # the VM is simply gone
 
-    verdicts = sweeper.verdicts(stores, ENV)
+    verdicts = await sweeper.verdicts(stores, ENV)
 
     assert verdicts["web"] == f"VM {name} deleted outside odin — re-Apply to recreate"
 
@@ -348,17 +348,17 @@ def test_one_listing_per_substrate_regardless_of_resource_count(tmp_path):
     assert containers.status_calls == []
 
 
-def test_non_sweep_ticks_make_no_runtime_calls_and_keep_the_verdict(tmp_path, monkeypatch):
+async def test_non_sweep_ticks_make_no_runtime_calls_and_keep_the_verdict(tmp_path, monkeypatch):
     monkeypatch.setenv("ODIN_DRIFT_SWEEP_TICKS", "3")
     stores = SynthStores(tmp_path)
     _ec2(stores, "web", "i-1")
     vms = FakeVms(names=[])
     sweeper = _sweeper(vms=vms)
 
-    first = sweeper.verdicts(stores, ENV)  # tick 1: sweeps
+    first = await sweeper.verdicts(stores, ENV)  # tick 1: sweeps
     assert vms.calls == 1
-    assert sweeper.verdicts(stores, ENV) == first  # tick 2: cached
-    assert sweeper.verdicts(stores, ENV) == first  # tick 3: cached
+    assert await sweeper.verdicts(stores, ENV) == first  # tick 2: cached
+    assert await sweeper.verdicts(stores, ENV) == first  # tick 3: cached
     assert vms.calls == 1, "a non-sweep tick must not shell out at all"
 
     # Tick 4 sweeps again -- and finds nothing to report, because tick 1
@@ -368,12 +368,12 @@ def test_non_sweep_ticks_make_no_runtime_calls_and_keep_the_verdict(tmp_path, mo
     # (test_the_world_stops_claiming_healthy_for_a_deleted_vm), and that
     # handoff is exactly what a re-Apply needs to see -- and with no candidate
     # left, tick 4 doesn't even shell out.
-    assert sweeper.verdicts(stores, ENV) == {}
+    assert await sweeper.verdicts(stores, ENV) == {}
     assert vms.calls == 1
     assert project(stores, ENV)["web"][1] == "crashed"
 
 
-def test_a_recovered_resource_is_no_longer_reported(tmp_path, monkeypatch):
+async def test_a_recovered_resource_is_no_longer_reported(tmp_path, monkeypatch):
     """The recovery path for real: a re-Apply doesn't resurrect the drifted
     instance, it creates a NEW one (the provider dropped the terminated record
     from state), so the sweep goes quiet and the projection reads the live
@@ -383,15 +383,15 @@ def test_a_recovered_resource_is_no_longer_reported(tmp_path, monkeypatch):
     vms = FakeVms(names=[])
     sweeper = _sweeper(vms=vms)
     _ec2(stores, "web", "i-1")
-    assert "web" in sweeper.verdicts(stores, ENV)
+    assert "web" in await sweeper.verdicts(stores, ENV)
 
     vms.names = [_ec2(stores, "web", "i-2")]  # what a re-Apply actually does
-    sweeper.verdicts(stores, ENV)  # cached tick: still reported
-    assert sweeper.verdicts(stores, ENV) == {}  # next sweep: clean
+    await sweeper.verdicts(stores, ENV)  # cached tick: still reported
+    assert await sweeper.verdicts(stores, ENV) == {}  # next sweep: clean
     assert project(stores, ENV)["web"] == ("ec2", "healthy", {}, None)
 
 
-def test_per_env_cadence_and_cache_are_independent(tmp_path):
+async def test_per_env_cadence_and_cache_are_independent(tmp_path):
     stores = SynthStores(tmp_path)
     _ec2(stores, "web", "i-1")
     stores.ec2compute.set("other", "instance:i-2", {
@@ -400,8 +400,8 @@ def test_per_env_cadence_and_cache_are_independent(tmp_path):
     stores.tags.set("other", "ec2:i-2", {"odin:node": "web2"})
     sweeper = _sweeper(vms=FakeVms(names=[vm_name("other", "i-2")]))
 
-    assert "web" in sweeper.verdicts(stores, ENV)
-    assert sweeper.verdicts(stores, "other") == {}
+    assert "web" in await sweeper.verdicts(stores, ENV)
+    assert await sweeper.verdicts(stores, "other") == {}
 
 
 # --- a failed listing is NOT "everything is gone" ------------------------
@@ -431,7 +431,7 @@ def test_a_failed_container_listing_reports_no_drift_and_touches_no_record(tmp_p
     )
 
 
-def test_a_docker_failure_does_not_hide_real_vm_drift(tmp_path):
+async def test_a_docker_failure_does_not_hide_real_vm_drift(tmp_path):
     # The two listings are independent: one substrate being unreachable must
     # not suppress the other's honest report.
     stores = SynthStores(tmp_path)
@@ -441,7 +441,7 @@ def test_a_docker_failure_does_not_hide_real_vm_drift(tmp_path):
         vms=FakeVms(names=[]), containers=FakeContainers(error=RuntimeError("docker down")),
     )
 
-    verdicts = sweeper.verdicts(stores, ENV)
+    verdicts = await sweeper.verdicts(stores, ENV)
 
     assert verdicts == {"web": f"VM {name} deleted outside odin — re-Apply to recreate"}
 

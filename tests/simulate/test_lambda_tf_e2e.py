@@ -152,7 +152,7 @@ def store_root():
     shutil.rmtree(root, ignore_errors=True)
 
 
-def test_tf_apply_boots_a_real_rie_zero_drift_invoke_destroy(store_root, lambda_cleanup):
+async def test_tf_apply_boots_a_real_rie_zero_drift_invoke_destroy(store_root, lambda_cleanup):
     assert shutil.which("tofu"), "OpenTofu must be on PATH for this integration test"
     assert shutil.which("docker"), "docker must be on PATH for this integration test"
     lambda_cleanup.append(container_name(ENV, FUNCTION_NAME))
@@ -198,13 +198,13 @@ def test_tf_apply_boots_a_real_rie_zero_drift_invoke_destroy(store_root, lambda_
         # THE data-plane proof: a REAL Invoke through the gateway, operator
         # creds, a real boto3 lambda client -- the RIE container echoes the
         # payload straight back (ECHO_CODE == "return event").
-        lambda_client = boto3.client(
+        lambda_client = await boto3.client(
             "lambda", endpoint_url=f"http://127.0.0.1:{gateway_port}",
             aws_access_key_id=access_key, aws_secret_access_key=secret_key, region_name="us-east-1",
         )
         payload_in = {"key1": "value1", "nested": {"n": 42}}
         invoke_start = time.monotonic()
-        response = lambda_client.invoke(FunctionName=FUNCTION_NAME, Payload=json.dumps(payload_in).encode())
+        response = await lambda_client.invoke(FunctionName=FUNCTION_NAME, Payload=json.dumps(payload_in).encode())
         invoke_elapsed = time.monotonic() - invoke_start
         print(f"[V4d] first real Invoke round-trip took {invoke_elapsed * 1000:.0f}ms")
         assert response.get("FunctionError") is None, response
@@ -244,7 +244,7 @@ CANVAS_LAMBDA = {
 EMPTY_CANVAS = {"nodes": [], "edges": []}
 
 
-def test_apply_full_canvas_path_threads_binary_files_through_a_real_tofu_apply(store_root, lambda_cleanup, monkeypatch):
+async def test_apply_full_canvas_path_threads_binary_files_through_a_real_tofu_apply(store_root, lambda_cleanup, monkeypatch):
     """Release finding #1 (BLOCKER), proven against the REAL canvas path --
     unlike the flagship test above (hand-authored HCL), this one goes
     through canvas -> Stack -> generate_tf -> translate -> /apply-full's
@@ -281,12 +281,12 @@ def test_apply_full_canvas_path_threads_binary_files_through_a_real_tofu_apply(s
 
         gateway_port = client.get("/health").json()["gateway"]["port"]
         access_key, secret_key = app.state.gateway_keys.issue(CANVAS_ENV, OPERATOR_NODE_ID)
-        lambda_client = boto3.client(
+        lambda_client = await boto3.client(
             "lambda", endpoint_url=f"http://127.0.0.1:{gateway_port}",
             aws_access_key_id=access_key, aws_secret_access_key=secret_key, region_name="us-east-1",
         )
         payload_in = {"proof": "canvas-path"}
-        response = lambda_client.invoke(FunctionName=CANVAS_FUNCTION_NAME, Payload=json.dumps(payload_in).encode())
+        response = await lambda_client.invoke(FunctionName=CANVAS_FUNCTION_NAME, Payload=json.dumps(payload_in).encode())
         assert response.get("FunctionError") is None, response
         assert json.loads(response["Payload"].read()) == payload_in
 
@@ -323,9 +323,9 @@ CALLBACK_CODE = (
     "\n"
     "def lambda_handler(event, context):\n"
     "    endpoint = os.environ['AWS_ENDPOINT_URL']\n"
-    "    boto3.client('dynamodb', endpoint_url=endpoint).put_item(\n"
+    "    await boto3.client('dynamodb', endpoint_url=endpoint).put_item(\n"
     "        TableName='orders', Item={'id': {'S': 'order-1'}, 'via': {'S': 'callback'}})\n"
-    "    boto3.client('s3', endpoint_url=endpoint, config=Config(s3={'addressing_style': 'path'})).put_object(\n"
+    "    await boto3.client('s3', endpoint_url=endpoint, config=Config(s3={'addressing_style': 'path'})).put_object(\n"
     "        Bucket='artifacts', Key='receipt.txt', Body=b'paid')\n"
     "    return {'put_item': 'ok', 'put_object': 'ok'}\n"
 )
@@ -345,7 +345,7 @@ CALLBACK_CANVAS = {
 }
 
 
-def test_callback_lambda_reaches_other_services_during_invoke(store_root, lambda_cleanup, monkeypatch):
+async def test_callback_lambda_reaches_other_services_during_invoke(store_root, lambda_cleanup, monkeypatch):
     """The exact scenario the field test flagged: a Lambda whose handler does a
     real boto3 PutItem to a dynamodb node + PutObject to an s3 node DURING its
     invocation. Before the fix the synchronous invoke froze the gateway's event
@@ -376,13 +376,13 @@ def test_callback_lambda_reaches_other_services_during_invoke(store_root, lambda
 
         gateway_port = client.get("/health").json()["gateway"]["port"]
         operator_key, operator_secret = app.state.gateway_keys.issue(CALLBACK_ENV, OPERATOR_NODE_ID)
-        lambda_client = boto3.client(
+        lambda_client = await boto3.client(
             "lambda", endpoint_url=f"http://127.0.0.1:{gateway_port}",
             aws_access_key_id=operator_key, aws_secret_access_key=operator_secret, region_name="us-east-1",
             config=Config(connect_timeout=45, read_timeout=45, retries={"max_attempts": 0}),
         )
         invoke_start = time.monotonic()
-        response = lambda_client.invoke(FunctionName=CALLBACK_FUNCTION_NAME, Payload=b"{}")
+        response = await lambda_client.invoke(FunctionName=CALLBACK_FUNCTION_NAME, Payload=b"{}")
         invoke_elapsed = time.monotonic() - invoke_start
         print(f"\n[finding#1] re-entrant Invoke round-trip took {invoke_elapsed:.1f}s")
 
@@ -394,14 +394,14 @@ def test_callback_lambda_reaches_other_services_during_invoke(store_root, lambda
         assert invoke_elapsed < 20, f"invoke took {invoke_elapsed:.1f}s -- the re-entrancy deadlock is not fixed"
 
         # And the writes actually LANDED (operator creds, full-allow).
-        ddb = boto3.client(
+        ddb = await boto3.client(
             "dynamodb", endpoint_url=f"http://127.0.0.1:{gateway_port}",
             aws_access_key_id=operator_key, aws_secret_access_key=operator_secret, region_name="us-east-1",
         )
         item = ddb.get_item(TableName="orders", Key={"id": {"S": "order-1"}}).get("Item")
         assert item and item["via"]["S"] == "callback", item
 
-        s3 = boto3.client(
+        s3 = await boto3.client(
             "s3", endpoint_url=f"http://127.0.0.1:{gateway_port}",
             aws_access_key_id=operator_key, aws_secret_access_key=operator_secret, region_name="us-east-1",
             config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),

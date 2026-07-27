@@ -141,7 +141,7 @@ def test_a_postgres_lines_own_leading_date_is_never_mistaken_for_the_stamp():
     assert ColimaRuntime(runner=runner).logs("pg") == "2026-07-25 14:00:01.123 UTC [1] LOG:  ready"
 
 
-def test_a_failed_run_names_the_container_and_the_error_never_the_credentials():
+async def test_a_failed_run_names_the_container_and_the_error_never_the_credentials():
     """Field test 2 finding #6 (security): this exception text becomes an ECS
     task's `stopped_reason`, and from there the World verdict -> the WebSocket
     -> the durable `events.jsonl`. The old message was the whole argv, which
@@ -153,7 +153,7 @@ def test_a_failed_run_names_the_container_and_the_error_never_the_credentials():
 
     rt = ColimaRuntime(runner=runner)
     with pytest.raises(RuntimeError) as raised:
-        rt.run_container(ContainerSpec(
+        await rt.run_container(ContainerSpec(
             name="odin-ecs-wa-a53adf2b-web-svc", image="nginx:bogus-9z9z",
             env={"AWS_ACCESS_KEY_ID": "AKODINFAKEFAKEFAKEFA",
                  "AWS_SECRET_ACCESS_KEY": "fake-issued-secret-000000000000000000000",

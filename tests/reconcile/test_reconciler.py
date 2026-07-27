@@ -33,35 +33,35 @@ class FakeRuntime:
         self.runs, self.stopped, self.specs = [], [], {}
         self._status, self._port, self._exit, self._logs = {}, {}, {}, {}
 
-    def run_container(self, spec):
+    async def run_container(self, spec):
         self.runs.append(spec.name)
         self.specs[spec.name] = spec
         self._status[spec.name] = "running"
         self._port[spec.name] = 18080
         return RunHandle(id="fake-" + spec.name, name=spec.name)
 
-    def stop(self, name):
+    async def stop(self, name):
         self.stopped.append(name)
         self._status[name] = "absent"
 
-    def status(self, name):
+    async def status(self, name):
         return self._status.get(name, "absent")
 
-    def exit_code(self, name):
+    async def exit_code(self, name):
         return self._exit.get(name, 0)
 
-    def facts(self, name, container_port=0):
-        phase = _STATUS_TO_PHASE.get(self.status(name), "pending")
-        port = self._port.get(name, 0) if self.status(name) == "running" else 0
+    async def facts(self, name, container_port=0):
+        phase = _STATUS_TO_PHASE.get(await self.status(name), "pending")
+        port = self._port.get(name, 0) if await self.status(name) == "running" else 0
         return ContainerFacts(phase=phase, host_port=port, cpu=1.0, ram=10.0)
 
-    def stats(self, name):
+    async def stats(self, name):
         return {"cpu": 1.0, "ram": 10.0}
 
-    def logs(self, name, tail=20):
+    async def logs(self, name, tail=20):
         return self._logs.get(name, "")
 
-    def ensure_host(self):
+    async def ensure_host(self):
         return HostFacts(total_mem_mib=48000, cpu_count=8)
 
     def set(self, name, docker_status, exit_code=0, logs=""):
@@ -93,7 +93,7 @@ class FakeAws:
     def deprovision(self, service, name):
         pass
 
-    def facts(self, service, name):
+    async def facts(self, service, name):
         return {"endpoint": "http://host.docker.internal:9000"}
 
     def gc(self, active_kinds):
@@ -312,7 +312,7 @@ async def test_a_cancelled_hold_does_not_leave_the_reconciler_suspended(tmp_path
         async with recon.hold():
             await asyncio.sleep(30)  # the tofu run that never gets to finish
 
-    task = asyncio.create_task(held())
+    task = asyncio.create_task(await held())
     await asyncio.sleep(0.05)
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
@@ -428,13 +428,13 @@ class FakeTaskContainers:
     def __init__(self, statuses: dict[str, str]) -> None:
         self._statuses = statuses
 
-    def status(self, env, task_id, container_name):
+    async def status(self, env, task_id, container_name):
         return self._statuses.get(task_id, "running")
 
-    def exit_code(self, env, task_id, container_name):
+    async def exit_code(self, env, task_id, container_name):
         return 0
 
-    def logs(self, env, task_id, container_name, tail=20):
+    async def logs(self, env, task_id, container_name, tail=20):
         return ""
 
 
@@ -631,7 +631,7 @@ async def test_concurrent_ticks_do_not_double_provision(tmp_path):
     store = SpecStore(tmp_path)
     store.apply(Stack(resources=(ResourceDesired(id="uploads", kind="s3"),)))
     recon = Reconciler(store, rt, aws=aws, poll_interval=0)
-    await asyncio.gather(recon.tick(), recon.tick())
+    await asyncio.gather(await recon.tick(), recon.tick())
     assert aws.provisioned == [("s3", "uploads", ())]
 
 
@@ -1051,7 +1051,7 @@ async def test_a_changing_logtail_alone_does_not_re_emit(tmp_path):
 
 
 def _unreadable(reason: str = "docker cannot read odin-aws-rustfs-default's published ports: no daemon"):
-    def facts(service, name):
+    async def facts(service, name):
         raise BackingUnavailable(reason)
     return facts
 
@@ -1166,7 +1166,7 @@ class _PortOnlyRuntime:
     identity facts under test are the ones production publishes rather than a
     hand-written approximation of them."""
 
-    def host_port(self, name, container_port):
+    async def host_port(self, name, container_port):
         return 51001
 
 

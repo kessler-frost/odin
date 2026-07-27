@@ -163,7 +163,7 @@ def _captured(sink, client, call) -> tuple[str, str, bytes]:
     return action, resource, request.body
 
 
-def _create(sink, client, stores, rds, **kwargs) -> Response:
+async def _create(sink, client, stores, rds, **kwargs) -> Response:
     action, resource, body = _captured(sink, client, lambda c: c.create_db_instance(
         DBInstanceIdentifier=kwargs.pop("identifier", DB),
         DBInstanceClass=kwargs.pop("instance_class", "db.t3.micro"),
@@ -176,21 +176,21 @@ def _create(sink, client, stores, rds, **kwargs) -> Response:
         **kwargs,
     ))
     assert action == "rds:CreateDBInstance"
-    return _call(body, stores, rds, action, resource)
+    return await _call(body, stores, rds, action, resource)
 
 
-def _describe(sink, client, stores, rds, identifier: str | None = DB) -> Response:
+async def _describe(sink, client, stores, rds, identifier: str | None = DB) -> Response:
     action, resource, body = _captured(sink, client, lambda c: (
         c.describe_db_instances(DBInstanceIdentifier=identifier) if identifier
         else c.describe_db_instances()
     ))
-    return _call(body, stores, rds, action, resource)
+    return await _call(body, stores, rds, action, resource)
 
 
-def _await_status(sink, client, stores, rds, status: str, timeout: float = 5.0) -> dict:
+async def _await_status(sink, client, stores, rds, status: str, timeout: float = 5.0) -> dict:
     deadline = time.monotonic() + timeout
     while True:
-        parsed = _parse("DescribeDBInstances", _describe(sink, client, stores, rds))
+        parsed = _parse("DescribeDBInstances", await _describe(sink, client, stores, rds))
         instance = parsed["DBInstances"][0]
         if instance["DBInstanceStatus"] == status:
             return instance
@@ -201,9 +201,9 @@ def _await_status(sink, client, stores, rds, status: str, timeout: float = 5.0) 
 # --- create: the transitional answer + the real waiter ----------------------
 
 
-def test_create_returns_creating_immediately_and_boots_in_the_background(tmp_path, sink, rds):
+async def test_create_returns_creating_immediately_and_boots_in_the_background(tmp_path, sink, rds):
     stores, fake = _stores(tmp_path), FakePostgresRds()
-    parsed = _parse("CreateDBInstance", _create(sink, rds, stores, fake))
+    parsed = _parse("CreateDBInstance", await _create(sink, rds, stores, fake))
     instance = parsed["DBInstance"]
     # The create ANSWER is `creating` with no endpoint at all -- exactly what
     # the provider's own DBInstanceAvailable waiter is built to poll through.
@@ -215,26 +215,26 @@ def test_create_returns_creating_immediately_and_boots_in_the_background(tmp_pat
     assert instance["AllocatedStorage"] == 20
     assert instance["DBInstanceArn"] == f"arn:aws:rds:us-east-1:000000000000:db:{DB}"
 
-    available = _await_status(sink, rds, stores, fake, "available")
+    available = await _await_status(sink, rds, stores, fake, "available")
     assert available["Endpoint"] == {"Address": "host.docker.internal", "Port": 54321, "HostedZoneId": "Z2R2ITUGPM61AM"}
     assert available["DbInstancePort"] == 54321
     assert fake.created == [(DB, USER, PASSWORD, "postgres")]
 
 
-def test_available_is_gated_on_a_real_pg_ready_probe_not_on_docker_run(tmp_path, sink, rds):
+async def test_available_is_gated_on_a_real_pg_ready_probe_not_on_docker_run(tmp_path, sink, rds):
     """The health assertion moved, it wasn't dropped: a container that starts
     but never accepts connections is `failed` with the probe's OWN error, so
     the apply fails instead of reporting a database that doesn't work."""
     stores, fake = _stores(tmp_path), FakePostgresRds()
     _READY["ok"] = False
-    _create(sink, rds, stores, fake)
-    failed = _await_status(sink, rds, stores, fake, "failed")
+    await _create(sink, rds, stores, fake)
+    failed = await _await_status(sink, rds, stores, fake, "failed")
     assert failed["DBInstanceStatus"] == "failed"
     record = rdsctl.records(stores, ENV)[0]
     assert "connection refused" in record["status_reason"]
 
 
-def test_available_needs_two_consecutive_probes_so_a_restarting_postgres_isnt_ready(tmp_path, sink, rds):
+async def test_available_needs_two_consecutive_probes_so_a_restarting_postgres_isnt_ready(tmp_path, sink, rds):
     """The postgres image inits behind a TEMPORARY server, then shuts it down
     and starts the real one. A single lucky probe against that temp server would
     publish a DATABASE_URL that stops answering a moment later, so `available`
@@ -242,25 +242,25 @@ def test_available_needs_two_consecutive_probes_so_a_restarting_postgres_isnt_re
     stores, fake = _stores(tmp_path), FakePostgresRds()
     _READY["ok"] = True
     _READY["flap"] = True  # ok, then not ok, then ok forever (see the fixture)
-    _create(sink, rds, stores, fake)
-    available = _await_status(sink, rds, stores, fake, "available")
+    await _create(sink, rds, stores, fake)
+    available = await _await_status(sink, rds, stores, fake, "available")
     assert available["DBInstanceStatus"] == "available"
     # The flap means the FIRST success was discarded -- more than the two
     # minimum probes were needed to get a clean consecutive pair.
     assert _PROBES["n"] > rdsctl._CONSECUTIVE_PROBES
 
 
-def test_a_container_that_never_starts_lands_failed_with_the_real_reason(tmp_path, sink, rds):
+async def test_a_container_that_never_starts_lands_failed_with_the_real_reason(tmp_path, sink, rds):
     stores, fake = _stores(tmp_path), FakePostgresRds(fail_create=True)
-    _create(sink, rds, stores, fake)
-    _await_status(sink, rds, stores, fake, "failed")
+    await _create(sink, rds, stores, fake)
+    await _await_status(sink, rds, stores, fake, "failed")
     assert "docker run failed" in rdsctl.records(stores, ENV)[0]["status_reason"]
 
 
-def test_creating_the_same_identifier_twice_is_an_already_exists_error(tmp_path, sink, rds):
+async def test_creating_the_same_identifier_twice_is_an_already_exists_error(tmp_path, sink, rds):
     stores, fake = _stores(tmp_path), FakePostgresRds()
-    _create(sink, rds, stores, fake)
-    duplicate = _create(sink, rds, stores, fake)
+    await _create(sink, rds, stores, fake)
+    duplicate = await _create(sink, rds, stores, fake)
     assert duplicate.status_code == 400
     parsed = _parse("CreateDBInstance", duplicate, error=True)
     assert parsed["Error"]["Code"] == "DBInstanceAlreadyExists"
@@ -269,31 +269,31 @@ def test_creating_the_same_identifier_twice_is_an_already_exists_error(tmp_path,
 # --- describe --------------------------------------------------------------
 
 
-def test_describe_an_unknown_instance_is_db_instance_not_found(tmp_path, sink, rds):
+async def test_describe_an_unknown_instance_is_db_instance_not_found(tmp_path, sink, rds):
     """The exact wire code terraform-provider-aws's Read drops state on, and
     its delete waiter treats as "gone"."""
     stores, fake = _stores(tmp_path), FakePostgresRds()
-    response = _describe(sink, rds, stores, fake, identifier="nope")
+    response = await _describe(sink, rds, stores, fake, identifier="nope")
     assert response.status_code == 404
     assert _parse("DescribeDBInstances", response, error=True)["Error"]["Code"] == "DBInstanceNotFound"
 
 
-def test_describe_without_an_identifier_lists_every_instance(tmp_path, sink, rds):
+async def test_describe_without_an_identifier_lists_every_instance(tmp_path, sink, rds):
     stores, fake = _stores(tmp_path), FakePostgresRds()
-    _create(sink, rds, stores, fake)
-    _create(sink, rds, stores, fake, identifier="other", tags=[{"Key": "odin:node", "Value": "other"}])
-    parsed = _parse("DescribeDBInstances", _describe(sink, rds, stores, fake, identifier=None))
+    await _create(sink, rds, stores, fake)
+    await _create(sink, rds, stores, fake, identifier="other", tags=[{"Key": "odin:node", "Value": "other"}])
+    parsed = _parse("DescribeDBInstances", await _describe(sink, rds, stores, fake, identifier=None))
     assert [i["DBInstanceIdentifier"] for i in parsed["DBInstances"]] == [DB, "other"]
 
 
-def test_zero_drift_fields_carry_the_provider_defaults_that_would_otherwise_flap(tmp_path, sink, rds):
+async def test_zero_drift_fields_carry_the_provider_defaults_that_would_otherwise_flap(tmp_path, sink, rds):
     """Every `Optional`-without-`Computed` attribute in the provider's own
     aws_db_instance schema is emitted explicitly -- AutoMinorVersionUpgrade
     above all, whose provider DEFAULT is true (omitting it reads back false and
     drifts every plan)."""
     stores, fake = _stores(tmp_path), FakePostgresRds()
-    _create(sink, rds, stores, fake)
-    instance = _await_status(sink, rds, stores, fake, "available")
+    await _create(sink, rds, stores, fake)
+    instance = await _await_status(sink, rds, stores, fake, "available")
     assert instance["AutoMinorVersionUpgrade"] is True
     for field in (
         "MultiAZ", "PubliclyAccessible", "StorageEncrypted", "CopyTagsToSnapshot",
@@ -309,9 +309,9 @@ def test_zero_drift_fields_carry_the_provider_defaults_that_would_otherwise_flap
 # --- tags ------------------------------------------------------------------
 
 
-def test_create_tags_round_trip_through_list_tags_and_the_describe_taglist(tmp_path, sink, rds):
+async def test_create_tags_round_trip_through_list_tags_and_the_describe_taglist(tmp_path, sink, rds):
     stores, fake = _stores(tmp_path), FakePostgresRds()
-    _create(sink, rds, stores, fake, tags=[{"Key": "odin:node", "Value": DB}, {"Key": "team", "Value": "core"}])
+    await _create(sink, rds, stores, fake, tags=[{"Key": "odin:node", "Value": DB}, {"Key": "team", "Value": "core"}])
     action, resource, body = _captured(sink, rds, lambda c: c.list_tags_for_resource(
         ResourceName=rdsctl.db_arn(DB),
     ))
@@ -319,51 +319,51 @@ def test_create_tags_round_trip_through_list_tags_and_the_describe_taglist(tmp_p
     # The tag calls carry an ARN, reduced to the same bare identifier the
     # policy layer keys on.
     assert resource == DB
-    parsed = _parse("ListTagsForResource", _call(body, stores, fake, action, resource))
+    parsed = _parse("ListTagsForResource", await _call(body, stores, fake, action, resource))
     assert {t["Key"]: t["Value"] for t in parsed["TagList"]} == {"odin:node": DB, "team": "core"}
-    instance = _parse("DescribeDBInstances", _describe(sink, rds, stores, fake))["DBInstances"][0]
+    instance = _parse("DescribeDBInstances", await _describe(sink, rds, stores, fake))["DBInstances"][0]
     assert {t["Key"]: t["Value"] for t in instance["TagList"]} == {"odin:node": DB, "team": "core"}
 
 
-def test_add_and_remove_tags_mutate_the_shared_tag_store(tmp_path, sink, rds):
+async def test_add_and_remove_tags_mutate_the_shared_tag_store(tmp_path, sink, rds):
     stores, fake = _stores(tmp_path), FakePostgresRds()
-    _create(sink, rds, stores, fake)
+    await _create(sink, rds, stores, fake)
     action, resource, body = _captured(sink, rds, lambda c: c.add_tags_to_resource(
         ResourceName=rdsctl.db_arn(DB), Tags=[{"Key": "env", "Value": "dev"}],
     ))
     assert action == "rds:AddTagsToResource"
-    assert _call(body, stores, fake, action, resource).status_code == 200
+    assert await _call(body, stores, fake, action, resource).status_code == 200
     assert stores.tags.get(ENV, f"rds:{rdsctl.db_arn(DB)}") == {"odin:node": DB, "env": "dev"}
 
     action, resource, body = _captured(sink, rds, lambda c: c.remove_tags_from_resource(
         ResourceName=rdsctl.db_arn(DB), TagKeys=["env"],
     ))
     assert action == "rds:RemoveTagsFromResource"
-    assert _call(body, stores, fake, action, resource).status_code == 200
+    assert await _call(body, stores, fake, action, resource).status_code == 200
     assert stores.tags.get(ENV, f"rds:{rdsctl.db_arn(DB)}") == {"odin:node": DB}
 
 
-def test_tagging_an_unknown_instance_is_not_found(tmp_path, sink, rds):
+async def test_tagging_an_unknown_instance_is_not_found(tmp_path, sink, rds):
     stores, fake = _stores(tmp_path), FakePostgresRds()
     action, resource, body = _captured(sink, rds, lambda c: c.list_tags_for_resource(
         ResourceName=rdsctl.db_arn("ghost"),
     ))
-    response = _call(body, stores, fake, action, resource)
+    response = await _call(body, stores, fake, action, resource)
     assert _parse("ListTagsForResource", response, error=True)["Error"]["Code"] == "DBInstanceNotFound"
 
 
 # --- modify ----------------------------------------------------------------
 
 
-def test_modify_records_metadata_changes_and_echoes_them_back(tmp_path, sink, rds):
+async def test_modify_records_metadata_changes_and_echoes_them_back(tmp_path, sink, rds):
     stores, fake = _stores(tmp_path), FakePostgresRds()
-    _create(sink, rds, stores, fake)
-    _await_status(sink, rds, stores, fake, "available")
+    await _create(sink, rds, stores, fake)
+    await _await_status(sink, rds, stores, fake, "available")
     action, resource, body = _captured(sink, rds, lambda c: c.modify_db_instance(
         DBInstanceIdentifier=DB, AllocatedStorage=50, DBInstanceClass="db.t3.small", ApplyImmediately=True,
     ))
     assert action == "rds:ModifyDBInstance"
-    parsed = _parse("ModifyDBInstance", _call(body, stores, fake, action, resource))
+    parsed = _parse("ModifyDBInstance", await _call(body, stores, fake, action, resource))
     assert parsed["DBInstance"]["AllocatedStorage"] == 50
     assert parsed["DBInstance"]["DBInstanceClass"] == "db.t3.small"
     # Metadata only -- the container is untouched (a documented limit, not a
@@ -371,61 +371,61 @@ def test_modify_records_metadata_changes_and_echoes_them_back(tmp_path, sink, rd
     assert fake.created == [(DB, USER, PASSWORD, "postgres")]
 
 
-def test_modify_password_runs_a_real_alter_user(tmp_path, sink, rds):
+async def test_modify_password_runs_a_real_alter_user(tmp_path, sink, rds):
     """The DATABASE_URL fact embeds this password, so storing a new one without
     applying it would publish a credential that doesn't work."""
     stores, fake = _stores(tmp_path), FakePostgresRds()
-    _create(sink, rds, stores, fake)
-    _await_status(sink, rds, stores, fake, "available")
+    await _create(sink, rds, stores, fake)
+    await _await_status(sink, rds, stores, fake, "available")
     action, resource, body = _captured(sink, rds, lambda c: c.modify_db_instance(
         DBInstanceIdentifier=DB, MasterUserPassword="newpass456", ApplyImmediately=True,
     ))
-    assert _call(body, stores, fake, action, resource).status_code == 200
+    assert await _call(body, stores, fake, action, resource).status_code == 200
     assert fake.passwords == [(DB, "newpass456")]
     assert rdsctl.records(stores, ENV)[0]["master_password"] == "newpass456"
 
 
-def test_modify_password_failure_is_a_real_error_not_a_silent_drift(tmp_path, sink, rds):
+async def test_modify_password_failure_is_a_real_error_not_a_silent_drift(tmp_path, sink, rds):
     class RefusingRds(FakePostgresRds):
         def set_password(self, db_id, user, current, new):
             raise RuntimeError("connection refused")
 
     stores, fake = _stores(tmp_path), RefusingRds()
-    _create(sink, rds, stores, fake)
-    _await_status(sink, rds, stores, fake, "available")
+    await _create(sink, rds, stores, fake)
+    await _await_status(sink, rds, stores, fake, "available")
     action, resource, body = _captured(sink, rds, lambda c: c.modify_db_instance(
         DBInstanceIdentifier=DB, MasterUserPassword="newpass456", ApplyImmediately=True,
     ))
-    response = _call(body, stores, fake, action, resource)
+    response = await _call(body, stores, fake, action, resource)
     assert _parse("ModifyDBInstance", response, error=True)["Error"]["Code"] == "InvalidDBInstanceState"
     assert rdsctl.records(stores, ENV)[0]["master_password"] == PASSWORD
 
 
-def test_modify_an_unknown_instance_is_not_found(tmp_path, sink, rds):
+async def test_modify_an_unknown_instance_is_not_found(tmp_path, sink, rds):
     stores, fake = _stores(tmp_path), FakePostgresRds()
     action, resource, body = _captured(sink, rds, lambda c: c.modify_db_instance(
         DBInstanceIdentifier="ghost", AllocatedStorage=50,
     ))
-    response = _call(body, stores, fake, action, resource)
+    response = await _call(body, stores, fake, action, resource)
     assert _parse("ModifyDBInstance", response, error=True)["Error"]["Code"] == "DBInstanceNotFound"
 
 
 # --- delete ----------------------------------------------------------------
 
 
-def _delete(sink, client, stores, rds, identifier: str = DB) -> Response:
+async def _delete(sink, client, stores, rds, identifier: str = DB) -> Response:
     action, resource, body = _captured(sink, client, lambda c: c.delete_db_instance(
         DBInstanceIdentifier=identifier, SkipFinalSnapshot=True,
     ))
     assert action == "rds:DeleteDBInstance"
-    return _call(body, stores, rds, action, resource)
+    return await _call(body, stores, rds, action, resource)
 
 
-def test_delete_reports_deleting_then_the_record_disappears(tmp_path, sink, rds):
+async def test_delete_reports_deleting_then_the_record_disappears(tmp_path, sink, rds):
     stores, fake = _stores(tmp_path), FakePostgresRds()
-    _create(sink, rds, stores, fake)
-    _await_status(sink, rds, stores, fake, "available")
-    parsed = _parse("DeleteDBInstance", _delete(sink, rds, stores, fake))
+    await _create(sink, rds, stores, fake)
+    await _await_status(sink, rds, stores, fake, "available")
+    parsed = _parse("DeleteDBInstance", await _delete(sink, rds, stores, fake))
     assert parsed["DBInstance"]["DBInstanceStatus"] == "deleting"
     deadline = time.monotonic() + 5.0
     while rdsctl.records(stores, ENV):
@@ -433,14 +433,14 @@ def test_delete_reports_deleting_then_the_record_disappears(tmp_path, sink, rds)
         time.sleep(0.02)
     assert fake.deleted == [DB]
     # The delete waiter's success condition: the instance is genuinely gone.
-    assert _describe(sink, rds, stores, fake).status_code == 404
+    assert await _describe(sink, rds, stores, fake).status_code == 404
     assert stores.tags.get(ENV, f"rds:{rdsctl.db_arn(DB)}") == {}
 
 
-def test_a_failed_container_delete_keeps_the_record_deleting_rather_than_lying(tmp_path, sink, rds):
+async def test_a_failed_container_delete_keeps_the_record_deleting_rather_than_lying(tmp_path, sink, rds):
     stores, fake = _stores(tmp_path), FailingDelete()
-    _create(sink, rds, stores, FakePostgresRds())
-    _delete(sink, rds, stores, fake)
+    await _create(sink, rds, stores, FakePostgresRds())
+    await _delete(sink, rds, stores, fake)
     deadline = time.monotonic() + 5.0
     while True:
         record = rdsctl.records(stores, ENV)[0]
@@ -452,40 +452,40 @@ def test_a_failed_container_delete_keeps_the_record_deleting_rather_than_lying(t
     assert "docker rm failed" in record["status_reason"]
 
 
-def test_deleting_an_unknown_instance_is_not_found(tmp_path, sink, rds):
+async def test_deleting_an_unknown_instance_is_not_found(tmp_path, sink, rds):
     stores, fake = _stores(tmp_path), FakePostgresRds()
-    response = _delete(sink, rds, stores, fake, identifier="ghost")
+    response = await _delete(sink, rds, stores, fake, identifier="ghost")
     assert _parse("DeleteDBInstance", response, error=True)["Error"]["Code"] == "DBInstanceNotFound"
 
 
 # --- drift + converge ------------------------------------------------------
 
 
-def test_mark_instance_failed_then_converge_recreates_the_container(tmp_path, sink, rds):
+async def test_mark_instance_failed_then_converge_recreates_the_container(tmp_path, sink, rds):
     """The crash-recovery contract W2.2's `converge_*` pattern established, for
     rds: the reality sweep marks the record `failed` (honest, and what the
     canvas shows), and an Apply's converge is what actually brings the real
     Postgres back -- tofu's own plan is empty, since the config never changed."""
     stores, fake = _stores(tmp_path), FakePostgresRds()
-    _create(sink, rds, stores, fake)
-    _await_status(sink, rds, stores, fake, "available")
+    await _create(sink, rds, stores, fake)
+    await _await_status(sink, rds, stores, fake, "available")
 
     fake.up.discard(DB)  # the container is gone (docker kill / rm)
     rdsctl.mark_instance_failed(stores, ENV, DB, "container removed outside odin")
-    failed = _parse("DescribeDBInstances", _describe(sink, rds, stores, fake))["DBInstances"][0]
+    failed = _parse("DescribeDBInstances", await _describe(sink, rds, stores, fake))["DBInstances"][0]
     assert failed["DBInstanceStatus"] == "failed"
 
     rdsctl.converge_db_instances(stores, ENV, substrate=fake)
-    recovered = _await_status(sink, rds, stores, fake, "available")
+    recovered = await _await_status(sink, rds, stores, fake, "available")
     assert recovered["Endpoint"]["Port"] == 54321
     assert fake.created == [(DB, USER, PASSWORD, "postgres"), (DB, USER, PASSWORD, "postgres")]
     assert rdsctl.records(stores, ENV)[0]["status_reason"] is None
 
 
-def test_converge_leaves_available_and_creating_instances_alone(tmp_path, sink, rds):
+async def test_converge_leaves_available_and_creating_instances_alone(tmp_path, sink, rds):
     stores, fake = _stores(tmp_path), FakePostgresRds()
-    _create(sink, rds, stores, fake)
-    _await_status(sink, rds, stores, fake, "available")
+    await _create(sink, rds, stores, fake)
+    await _await_status(sink, rds, stores, fake, "available")
     rdsctl.converge_db_instances(stores, ENV, substrate=fake)
     rdsctl.converge_db_instances(stores, ENV, substrate=fake)
     assert fake.created == [(DB, USER, PASSWORD, "postgres")]
@@ -511,21 +511,21 @@ def _seed_sg(stores: SynthStores, group_id: str, port: int, source: dict) -> Non
     })
 
 
-def test_create_records_and_echoes_its_assigned_security_groups(tmp_path, sink, rds):
+async def test_create_records_and_echoes_its_assigned_security_groups(tmp_path, sink, rds):
     """ZERO-DRIFT: the provider reads `vpc_security_group_ids` back out of
     DescribeDBInstances' `VpcSecurityGroups`, so groups that went in have to
     come back out -- otherwise an `aws_db_instance` with an SG plans a change
     on every single apply."""
     stores, fake = _stores(tmp_path), FakePostgresRds()
-    _create(sink, rds, stores, fake, VpcSecurityGroupIds=["sg-db", "sg-ops"])
-    instance = _await_status(sink, rds, stores, fake, "available")
+    await _create(sink, rds, stores, fake, VpcSecurityGroupIds=["sg-db", "sg-ops"])
+    instance = await _await_status(sink, rds, stores, fake, "available")
     assert instance["VpcSecurityGroups"] == [
         {"VpcSecurityGroupId": "sg-db", "Status": "active"},
         {"VpcSecurityGroupId": "sg-ops", "Status": "active"},
     ]
 
 
-def test_the_database_joins_the_mesh_behind_its_assigned_sgs_compiled_firewall(tmp_path, sink, rds):
+async def test_the_database_joins_the_mesh_behind_its_assigned_sgs_compiled_firewall(tmp_path, sink, rds):
     """The W2.6 payoff, for a TF-owned database: the SGs a canvas drew for it
     compile into the firewall its overlay membership is gated by -- the UNION
     of every assigned group, byte-identical to what an EC2 VM in those same
@@ -533,8 +533,8 @@ def test_the_database_joins_the_mesh_behind_its_assigned_sgs_compiled_firewall(t
     stores, fake = _stores(tmp_path), FakePostgresRds()
     _seed_sg(stores, "sg-db", 5432, {"UserIdGroupPairs": [{"GroupId": "sg-web"}]})
     _seed_sg(stores, "sg-ops", 22, {"IpRanges": [{"CidrIp": "10.0.0.0/8"}]})
-    _create(sink, rds, stores, fake, VpcSecurityGroupIds=["sg-db", "sg-ops"])
-    _await_status(sink, rds, stores, fake, "available")
+    await _create(sink, rds, stores, fake, VpcSecurityGroupIds=["sg-db", "sg-ops"])
+    await _await_status(sink, rds, stores, fake, "available")
 
     (db_id, firewall) = fake.joined[-1]
     assert db_id == DB
@@ -543,33 +543,33 @@ def test_the_database_joins_the_mesh_behind_its_assigned_sgs_compiled_firewall(t
     assert FirewallRule(port="22", proto="tcp", cidr="10.0.0.0/8") in firewall.inbound
 
 
-def test_a_database_with_no_security_groups_joins_the_mesh_ungated(tmp_path, sink, rds):
+async def test_a_database_with_no_security_groups_joins_the_mesh_ungated(tmp_path, sink, rds):
     """No SG assigned -> `None` -> the sidecar's allow-all default. Joining the
     mesh must never silently become "deny everything" just because nothing was
     drawn -- that would break a canvas that worked yesterday."""
     stores, fake = _stores(tmp_path), FakePostgresRds()
-    _create(sink, rds, stores, fake)
-    _await_status(sink, rds, stores, fake, "available")
+    await _create(sink, rds, stores, fake)
+    await _await_status(sink, rds, stores, fake, "available")
     assert fake.joined == [(DB, None)]
 
 
-def test_the_gated_overlay_address_lands_on_the_record(tmp_path, sink, rds):
+async def test_the_gated_overlay_address_lands_on_the_record(tmp_path, sink, rds):
     """`overlay_ip` on the record is what `tf_status._db_facts` publishes
     `DATABASE_URL_MESH` from -- and it stays None for an env with no Nebula
     network (no VPC drawn), which is what keeps the mesh facts absent rather
     than empty."""
     stores, joined = _stores(tmp_path), FakePostgresRds(overlay="10.42.1.4")
-    _create(sink, rds, stores, joined)
-    _await_status(sink, rds, stores, joined, "available")
+    await _create(sink, rds, stores, joined)
+    await _await_status(sink, rds, stores, joined, "available")
     assert rdsctl.records(stores, ENV)[0]["overlay_ip"] == "10.42.1.4"
 
     meshless_stores, meshless = _stores(tmp_path / "no-mesh"), FakePostgresRds()
-    _create(sink, rds, meshless_stores, meshless)
-    _await_status(sink, rds, meshless_stores, meshless, "available")
+    await _create(sink, rds, meshless_stores, meshless)
+    await _await_status(sink, rds, meshless_stores, meshless, "available")
     assert rdsctl.records(meshless_stores, ENV)[0]["overlay_ip"] is None
 
 
-def test_ensure_db_mesh_repushes_an_edited_sgs_rules_and_ignores_failed_instances(tmp_path, sink, rds):
+async def test_ensure_db_mesh_repushes_an_edited_sgs_rules_and_ignores_failed_instances(tmp_path, sink, rds):
     """An SG edit reaches the gateway only through an Apply (security groups are
     TF-owned) and nebula reads its firewall only at startup, so an Apply is
     when the recompiled rules must be pushed -- `ensure_db_mesh`. A `failed`
@@ -577,8 +577,8 @@ def test_ensure_db_mesh_repushes_an_edited_sgs_rules_and_ignores_failed_instance
     joins on its own."""
     stores, fake = _stores(tmp_path), FakePostgresRds()
     _seed_sg(stores, "sg-db", 5432, {"UserIdGroupPairs": [{"GroupId": "sg-web"}]})
-    _create(sink, rds, stores, fake, VpcSecurityGroupIds=["sg-db"])
-    _await_status(sink, rds, stores, fake, "available")
+    await _create(sink, rds, stores, fake, VpcSecurityGroupIds=["sg-db"])
+    await _await_status(sink, rds, stores, fake, "available")
 
     _seed_sg(stores, "sg-db", 5432, {"UserIdGroupPairs": [{"GroupId": "sg-batch"}]})  # the canvas edited it
     rdsctl.ensure_db_mesh(stores, ENV, substrate=fake)
@@ -606,15 +606,15 @@ def test_an_unmodeled_action_is_a_protocol_correct_invalid_action(tmp_path):
 # --- the post-apply verification (`ecsctl.wait_for_steady_services`' twin) ---
 
 
-def test_wait_for_available_instances_reports_a_database_that_never_came_back(tmp_path, sink, rds):
+async def test_wait_for_available_instances_reports_a_database_that_never_came_back(tmp_path, sink, rds):
     """THE hole this closes: `converge_db_instances` starts a re-create and
     returns, so /apply-full scored `applied` the instant the thread was spawned
     even when Postgres never accepted a connection. The wait JOINS that thread
     and reports what really happened -- naming the instance and the LAST REAL
     probe failure, never an invented one."""
     stores, fake = _stores(tmp_path), FakePostgresRds()
-    _create(sink, rds, stores, fake)
-    _await_status(sink, rds, stores, fake, "available")
+    await _create(sink, rds, stores, fake)
+    await _await_status(sink, rds, stores, fake, "available")
     fake.up.discard(DB)
     rdsctl.mark_instance_failed(stores, ENV, DB, "container removed outside odin")
     _READY["ok"] = False  # ...and this time Postgres never answers
@@ -628,7 +628,7 @@ def test_wait_for_available_instances_reports_a_database_that_never_came_back(tm
     )], faults
 
 
-def test_wait_for_available_instances_names_the_docker_failure_when_that_is_the_reason(tmp_path, sink, rds):
+async def test_wait_for_available_instances_names_the_docker_failure_when_that_is_the_reason(tmp_path, sink, rds):
     """The other real reason, and the higher-quality one: the container never
     started at all, so the apply names the `docker` error itself.
 
@@ -638,8 +638,8 @@ def test_wait_for_available_instances_names_the_docker_failure_when_that_is_the_
     not start: ` as an instance's whole explanation. See
     tests/gateway/test_empty_reasons.py."""
     stores, fake = _stores(tmp_path), FakePostgresRds()
-    _create(sink, rds, stores, fake)
-    _await_status(sink, rds, stores, fake, "available")
+    await _create(sink, rds, stores, fake)
+    await _await_status(sink, rds, stores, fake, "available")
     rdsctl.mark_instance_failed(stores, ENV, DB, "container removed outside odin")
     fake.fail_create = True
 
@@ -651,12 +651,12 @@ def test_wait_for_available_instances_names_the_docker_failure_when_that_is_the_
     )], faults
 
 
-def test_wait_for_available_instances_is_one_store_read_when_everything_is_available(tmp_path, sink, rds):
+async def test_wait_for_available_instances_is_one_store_read_when_everything_is_available(tmp_path, sink, rds):
     """The happy path may not slow down: nothing is `creating`, so the wait
     returns on its first pass without sleeping or polling once."""
     stores, fake = _stores(tmp_path), FakePostgresRds()
-    _create(sink, rds, stores, fake)
-    _await_status(sink, rds, stores, fake, "available")
+    await _create(sink, rds, stores, fake)
+    await _await_status(sink, rds, stores, fake, "available")
 
     started = time.monotonic()
     faults = rdsctl.wait_for_available_instances(stores, ENV, [])
@@ -666,13 +666,13 @@ def test_wait_for_available_instances_is_one_store_read_when_everything_is_avail
     assert elapsed < 0.1, f"a healthy env cost {elapsed:.3f}s -- it must cost one store read"
 
 
-def test_wait_for_available_instances_waits_for_a_database_that_is_still_creating(tmp_path, sink, rds):
+async def test_wait_for_available_instances_waits_for_a_database_that_is_still_creating(tmp_path, sink, rds):
     """The trap the ECS version avoids, for rds: a database that is merely
     STILL BOOTING must never fail an apply -- a FRESH one legitimately takes
     time. The wait blocks on `creating` rather than judging it at that
     instant."""
     stores, fake = _stores(tmp_path), SlowStart()
-    _create(sink, rds, stores, fake)
+    await _create(sink, rds, stores, fake)
     # The create thread is genuinely in flight: `_wait_available` polls until
     # the substrate says the container publishes a port.
     assert rdsctl.records(stores, ENV)[0]["status"] == "creating"
@@ -738,14 +738,14 @@ def test_a_request_that_named_no_db_instance_says_so_instead_of_blaming_the_name
     assert stores.rdsctl.items(ENV) == {}
 
 
-def test_an_identifier_less_describe_is_still_a_legitimate_list(tmp_path, sink, rds):
+async def test_an_identifier_less_describe_is_still_a_legitimate_list(tmp_path, sink, rds):
     """The gate must not turn the LIST call into an error -- terraform's own
     refresh drives an unfiltered DescribeDBInstances (and botocore marks
     nothing required on it)."""
     stores, fake = _stores(tmp_path), FakePostgresRds()
-    _create(sink, rds, stores, fake)
-    _await_status(sink, rds, stores, fake, "available")
-    listed = _parse("DescribeDBInstances", _describe(sink, rds, stores, fake, identifier=None))
+    await _create(sink, rds, stores, fake)
+    await _await_status(sink, rds, stores, fake, "available")
+    listed = _parse("DescribeDBInstances", await _describe(sink, rds, stores, fake, identifier=None))
     assert [i["DBInstanceIdentifier"] for i in listed["DBInstances"]] == [DB]
 
 

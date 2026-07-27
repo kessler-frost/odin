@@ -150,7 +150,7 @@ async def _admission_rejection(runtime, store: SpecStore, stack: Stack) -> JSONR
     `limactl` calls. Returns None when admitted, else the 409 JSONResponse
     the caller should return VERBATIM (named numbers, never a bare
     "rejected")."""
-    host = await asyncio.to_thread(runtime.ensure_host)
+    host = await runtime.ensure_host()
     result = admission.check_admission(stack, host, store.root)
     if result.ok:
         return None
@@ -386,7 +386,7 @@ def _uncovered_rejection(uncovered: list[dict], env: str) -> JSONResponse:
     })
 
 
-def _surviving_containers(runtime, env: str) -> list[str] | None:
+async def _surviving_containers(runtime, env: str) -> list[str] | None:
     """Odin containers this env still has, by odin's own container naming --
     `odin-aws-{backing}-{env}` carries the env as a SUFFIX, `odin-rds-{env}-…`
     / `odin-ecs-{env}-…` / `odin-lambda-{env}-…` as an INFIX, both anchored on
@@ -404,7 +404,7 @@ def _surviving_containers(runtime, env: str) -> list[str] | None:
     with the real reason in the server log only, in the one report whose whole
     job is naming what survived a failed teardown."""
     try:
-        names = runtime.container_names()
+        names = await runtime.container_names()
     except Exception as exc:  # noqa: BLE001 -- any CLI/parse failure means "unknown"
         log.warning("could not list containers while reporting a failed destroy (%s)", exc)
         return None
@@ -792,7 +792,7 @@ def _loop_leftover(stack: Stack, env: str) -> str:
     return template.format(recreated=", ".join(recreated), env=env)
 
 
-def _loop_health(reconcilers: dict[str, Reconciler], env: str) -> LoopHealth:
+async def _loop_health(reconcilers: dict[str, Reconciler], env: str) -> LoopHealth:
     """This env's reconciler health, WITHOUT creating one.
 
     `reconciler_for` starts a real loop as a side effect, which a read must
@@ -807,7 +807,7 @@ def _loop_health(reconcilers: dict[str, Reconciler], env: str) -> LoopHealth:
             verdict=f"no reconciler is running for env {env!r} -- nothing is converging it. If "
                     f"something has been applied to this env, restart odin (`odin stop && odin start`).",
         )
-    return reconciler.health()
+    return await reconciler.health()
 
 
 def _stale_resource(resource: dict, health: LoopHealth) -> dict:
@@ -1004,7 +1004,7 @@ def create_apply_router(
             # VM names reached the server log and the caller got the bare text
             # `Internal Server Error`. `_EXCEPTION_VERDICTS` is what actually
             # puts them in a 500 JSON body now.
-            reclaimed = await asyncio.to_thread(ec2compute.reclaim_env_instances, stores, env)
+            reclaimed = await ec2compute.reclaim_env_instances(stores, env)
             if reclaimed:
                 body["reclaimed_vms"] = reclaimed
             # ...and the network records the same interruption left behind,
@@ -1013,7 +1013,7 @@ def create_apply_router(
             # because the lighthouse stop hangs off the VPC-delete path, a VPC
             # record that is never deleted is a lighthouse never stopped
             # (HIGH-A through HIGH-B's back door).
-            forgotten = await asyncio.to_thread(ec2net.purge_env, stores, env)
+            forgotten = await ec2net.purge_env(stores, env)
             if forgotten:
                 body["reclaimed_network_records"] = forgotten
 
@@ -1047,7 +1047,7 @@ def create_apply_router(
         # `odin destroy` exit nonzero: `cli/http.body_or_fail` keys on it, the
         # same convention every other honest failure in this file uses.
         tf_state = _tf_state_addresses(store.root, env) if _tf_state_readable(store.root, env) else None
-        containers = await asyncio.to_thread(_surviving_containers, runtime, env)
+        containers = await _surviving_containers(runtime, env)
         body["still_standing"] = {"tf_state": tf_state, "containers": containers}
         cause = _DESTROY_CAUSE.get(tf_outcome, _UNKNOWN_DESTROY_CAUSE).format(
             exit_code=(body["tf"] or {}).get("exit_code"),
@@ -1062,7 +1062,7 @@ def create_apply_router(
         return JSONResponse(status_code=500, content=body)
 
     @router.get("/world")
-    def world(env: str = ENV) -> dict:
+    async def world(env: str = ENV) -> dict:
         """The env's observed World, plus the resources tofu really created
         that odin can currently see nowhere else (field test 3, P2-5: after a
         failed apply the s3/sqs/sns/dynamodb nodes had NO BADGE AT ALL while
@@ -1085,7 +1085,7 @@ def create_apply_router(
         observed = store.current_world(env)
         reachable = {kind for kind in PROVISIONED if gateway.backing_port(env, kind) is not None}
         stranded = stranded_in_tf_state(store.root, env, observed, reachable)
-        health = _loop_health(reconcilers, env)
+        health = await _loop_health(reconcilers, env)
         body = World(env=observed.env, resources=(*observed.resources, *stranded)).model_dump()
         resources = body["resources"] if health.ticking else [
             _stale_resource(resource, health) for resource in body["resources"]
@@ -1616,7 +1616,7 @@ def create_apply_full_router(
         # A bare `TaskRuntime()` (not this app's `runtime`) deliberately: it
         # must be the SAME substrate that launched these containers, and
         # ecsctl's own `runtime or TaskRuntime()` default is what did.
-        converging = ecsctl.converge_services(stores, env, TaskRuntime(), keystore, gateway_port())
+        converging = await ecsctl.converge_services(stores, env, TaskRuntime(), keystore, gateway_port())
         # The same recovery for lambda, and for the same reason: a function's
         # RIE container is its EXECUTION ENVIRONMENT, not a TF resource -- an
         # `aws_lambda_function`'s config doesn't change when its container is
@@ -1650,14 +1650,14 @@ def create_apply_full_router(
         # restarts its daemon and pokes it into re-handshaking with every peer,
         # all synchronously, so by the time it returns the database is looking
         # at the new identity.
-        await asyncio.to_thread(ec2compute.ensure_instance_mesh, stores, env)
+        await ec2compute.ensure_instance_mesh(stores, env)
         # ...then push each live database's SG-compiled firewall into its mesh
         # sidecar. An apply is exactly the right cadence -- security groups are
         # TF-owned, so an edited `db-sg` only reaches the gateway here. Also
         # heals a sidecar that was killed under a still-running database, and
         # carries the membership revision that closes the flows above. See
         # rdsctl.ensure_db_mesh.
-        rdsctl.ensure_db_mesh(stores, env)
+        await rdsctl.ensure_db_mesh(stores, env)
         # Field test 3 (HIGH): an Apply may not report success while a service
         # is short of its desired task count. tofu's own `wait_for_steady_state`
         # only runs when tofu UPDATES the service, so every apply tofu sees as a
@@ -1671,9 +1671,7 @@ def create_apply_full_router(
         # would only make an already-honest failure slower. Off the event loop:
         # `wait_for_steady_services` joins real threads and sleeps.
         if body["status"] == "applied":
-            shortfalls = await asyncio.to_thread(
-                ecsctl.wait_for_steady_services, stores, env, TaskRuntime(), converging,
-            )
+            shortfalls = await ecsctl.wait_for_steady_services(stores, env, TaskRuntime(), converging)
             if shortfalls:
                 body["status"] = "applied_services_unhealthy"
                 body["unhealthy"] = [s._asdict() for s in shortfalls]
@@ -1693,8 +1691,8 @@ def create_apply_full_router(
         # reason: a tofu failure has already failed this apply honestly.
         if body["status"] == "applied":
             await asyncio.gather(
-                asyncio.to_thread(lambdactl.wait_for_active_functions, stores, env, deploying),
-                asyncio.to_thread(rdsctl.wait_for_available_instances, stores, env, booting),
+                lambdactl.wait_for_active_functions(stores, env, deploying),
+                rdsctl.wait_for_available_instances(stores, env, booting),
             )
             # ...and THEN ask reality, once, before believing any of it (field
             # test 5). The two waits above settle the convergence and answer
@@ -1713,7 +1711,7 @@ def create_apply_full_router(
             # finished. `tf_status.project()` calls the SAME function, so
             # `/world` and this apply read one corrected record rather than two
             # checks that can disagree.
-            await asyncio.to_thread(drift.sweep_compute, stores, env)
+            await drift.sweep_compute(stores, env)
             unhealthy = _known_faults(stores, env)
             if unhealthy:
                 body["status"] = "applied_resources_unhealthy"
@@ -1809,7 +1807,7 @@ async def _watch_reconcilers(
         await asyncio.sleep(interval)
         for env, reconciler in list(reconcilers.items()):
             try:
-                health = reconciler.health()
+                health = await reconciler.health()
                 if health.ticking:
                     if env in down:
                         down.discard(env)
@@ -1836,7 +1834,7 @@ async def _reap_orphaned_ec2_vms(root: Path, envs: list[str], stores: SynthStore
     the event loop thread (`limactl list`/`delete` are blocking subprocess
     calls that can take real wall-clock time for however many VMs exist)."""
     try:
-        reaped = await asyncio.to_thread(ec2compute.reap_orphaned_vms, root, envs)
+        reaped = await ec2compute.reap_orphaned_vms(root, envs)
         if reaped:
             log.warning("startup reaper deleted %d orphaned EC2 VM(s): %s", len(reaped), reaped)
         # Field test 3 HIGH-B: the reaper above builds its "expected" set from
@@ -1844,7 +1842,7 @@ async def _reap_orphaned_ec2_vms(root: Path, envs: list[str], stores: SynthStore
         # Running and tofu's state empty -- is exactly the case it spares. The
         # second witness is tofu's own state; anything the store claims and
         # the state has forgotten is unreachable by terraform forever.
-        forgotten = await asyncio.to_thread(ec2compute.reclaim_tf_forgotten_vms, stores, envs)
+        forgotten = await ec2compute.reclaim_tf_forgotten_vms(stores, envs)
         if forgotten:
             log.warning(
                 "startup reclaimed %d EC2 VM(s) tofu's state no longer knew about: %s", len(forgotten), forgotten,
@@ -1852,7 +1850,7 @@ async def _reap_orphaned_ec2_vms(root: Path, envs: list[str], stores: SynthStore
         # Field test 3 HIGH-A: and the lighthouse PROCESSES of envs that were
         # destroyed before teardown learned to stop them -- each one still
         # holding a port out of the 4342-4441 pool.
-        lighthouses = await asyncio.to_thread(reap_orphaned_lighthouses, root)
+        lighthouses = await reap_orphaned_lighthouses(root)
         if lighthouses:
             log.warning("startup reaper stopped %d orphaned nebula lighthouse(s): %s", len(lighthouses), lighthouses)
     except Exception:
@@ -2049,16 +2047,16 @@ def create_app(
             # v0.7.7: a TASK on THIS loop, not a second uvicorn on a second
             # thread -- odin ran two event loops in two threads until now. See
             # `gateway/app.py::serve_on_loop`.
-            async with serve_on_loop(gateway_app, port=_resolved_gateway_port) as gateway_port_actual:
+            async with await serve_on_loop(gateway_app, port=_resolved_gateway_port) as gateway_port_actual:
                 # ...and a watchdog that puts the lock FILE back if anything
                 # deletes it (field test 4 -- see `_keep_store_lock`). The lock
                 # itself survives the deletion; only the evidence odin can find
                 # by path does not.
-                lock_watch = asyncio.create_task(_keep_store_lock(store_lock))
+                lock_watch = asyncio.create_task(await _keep_store_lock(store_lock))
                 # ...and the same shape for the loops themselves: nothing used to
                 # notice a reconciler that had stopped ticking (see
                 # `_watch_reconcilers` and `Reconciler.health`).
-                loop_watch = asyncio.create_task(_watch_reconcilers(reconcilers, ws_manager))
+                loop_watch = asyncio.create_task(await _watch_reconcilers(reconcilers, ws_manager))
                 envs = _store.list_envs()
                 if _reap_ec2_vms:
                     await _reap_orphaned_ec2_vms(_store.root, envs, gateway_stores)
@@ -2129,7 +2127,7 @@ def create_app(
         return ws_manager.get_events(env)
 
     @app.get("/health")
-    def health():
+    async def health():
         """Still 200, and `ok` still means "this HTTP server answered" -- that
         is what `odin start`'s readiness wait and the UI's Backend LED ask, and
         a server whose reconciler died is still serving. The reconciler answer
@@ -2138,7 +2136,7 @@ def create_app(
         return {
             "ok": True,
             "gateway": {"port": gateway_port_actual},
-            "reconcilers": [reconciler.health().model_dump() for reconciler in reconcilers.values()],
+            "reconcilers": [await reconciler.health().model_dump() for reconciler in reconcilers.values()],
         }
 
     app.state.store = _store

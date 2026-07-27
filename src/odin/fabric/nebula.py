@@ -356,9 +356,9 @@ class NebulaManager:
         # Signed host keys land here; 0700 like everything else under `.odin`.
         return private_mkdir(self._dir / "hosts")
 
-    def create_ca(self, network: str) -> CaInfo:
+    async def create_ca(self, network: str) -> CaInfo:
         private_mkdir(self._dir)  # ca.key is written into it
-        proc = self._run([
+        proc = await self._run([
             "nebula-cert", "ca", "-name", network,
             "-out-crt", str(self._ca_crt), "-out-key", str(self._ca_key),
         ])
@@ -366,7 +366,7 @@ class NebulaManager:
             raise RuntimeError(f"nebula-cert ca failed: {_cert_failure(proc)}")
         return CaInfo(network=network, ca_crt=self._ca_crt, ca_key=self._ca_key)
 
-    def sign_cert(self, hostname: str, ip: str, groups: list[str] | None = None) -> CertPaths:
+    async def sign_cert(self, hostname: str, ip: str, groups: list[str] | None = None) -> CertPaths:
         """`ip` must be CIDR form (e.g. 10.42.1.7/24) — Nebula requires the mask."""
         host_crt = self._hosts_dir() / f"{hostname}.crt"
         host_key = self._hosts_dir() / f"{hostname}.key"
@@ -378,7 +378,7 @@ class NebulaManager:
         ]
         if groups:
             cmd += ["-groups", ",".join(groups)]
-        proc = self._run(cmd)
+        proc = await self._run(cmd)
         if proc.returncode != 0:
             raise RuntimeError(f"nebula-cert sign failed: {_cert_failure(proc)}")
         return CertPaths(crt=host_crt, key=host_key, ca_crt=self._ca_crt)
@@ -397,7 +397,7 @@ class NebulaManager:
         (self._hosts_dir() / f"{hostname}.crt").unlink(missing_ok=True)
         (self._hosts_dir() / f"{hostname}.key").unlink(missing_ok=True)
 
-    def reissue_cert(self, hostname: str, ip: str, groups: list[str]) -> CertPaths:
+    async def reissue_cert(self, hostname: str, ip: str, groups: list[str]) -> CertPaths:
         """Sign `hostname` a NEW certificate carrying `groups`, replacing
         whatever it holds now. `ip` is its EXISTING sticky overlay address, so
         nothing already published goes stale.
@@ -423,7 +423,7 @@ class NebulaManager:
         and every tunnel re-handshakes under the new identity (a SIGHUP is not
         enough -- see `compute/instances.py::InstanceVm._refresh`)."""
         self.revoke_cert(hostname)
-        return self.sign_cert(hostname, ip, groups=groups)
+        return await self.sign_cert(hostname, ip, groups=groups)
 
     def generate_config(
         self,
@@ -730,7 +730,7 @@ def _nebula_dir(root: Path, env: str) -> Path:
     return Path(root) / env / "nebula"
 
 
-def ensure_network(root: Path, env: str, lighthouse_underlay: str, runner=None) -> MeshNetwork:
+async def ensure_network(root: Path, env: str, lighthouse_underlay: str, runner=None) -> MeshNetwork:
     """Lazily bootstrap an env's Nebula network: CA + lighthouse cert + overlay,
     persisted under `.odin/<env>/nebula/`. Idempotent (sticky overlay).
     Locked (see `_lock_for_dir`'s module-level docstring): two VMs booting
@@ -747,8 +747,8 @@ def ensure_network(root: Path, env: str, lighthouse_underlay: str, runner=None) 
         overlay.lighthouse_underlay_ip = lighthouse_underlay
         overlay.lighthouse_port = overlay.lighthouse_port or allocate_lighthouse_port(root, env)
         if not manager._ca_crt.exists():
-            manager.create_ca(env)
-            manager.sign_cert("lighthouse", f"{overlay.lighthouse_ip}/{overlay.mask}", groups=["lighthouse"])
+            await manager.create_ca(env)
+            await manager.sign_cert("lighthouse", f"{overlay.lighthouse_ip}/{overlay.mask}", groups=["lighthouse"])
         manager.save_overlay(overlay)
         return overlay
 

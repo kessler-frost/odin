@@ -344,7 +344,7 @@ class TfRunner:
         budget = self._timeout if timeout is None else timeout
         timed_out = False
         try:
-            code = await asyncio.wait_for(_drain(), timeout=budget)
+            code = await asyncio.wait_for(await _drain(), timeout=budget)
         except asyncio.TimeoutError:
             timed_out = True
             with contextlib.suppress(ProcessLookupError):

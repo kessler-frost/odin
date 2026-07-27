@@ -227,13 +227,13 @@ def run_checks(which: Iterable[str], run: Runner, disk_path: Path | None = None)
 _ICONS = {"ok": "✓", "fail": "✗", "skip": "○"}
 
 
-def _prebake() -> None:
+async def _prebake() -> None:
     if not _which(_subprocess_run, "docker"):
         typer.echo("docker not found on PATH — there is nothing to build the image with.")
         typer.echo("fix: brew install docker")
         raise typer.Exit(1)
     runtime = ColimaRuntime()
-    present = runtime.image_exists(DYNALITE_IMAGE)
+    present = await runtime.image_exists(DYNALITE_IMAGE)
     state = "present" if present else "absent — building now (one-time npm install)"
     typer.echo(f"before: {DYNALITE_IMAGE} {state}")
     BackingAws(runtime).ensure_dynalite_image()
@@ -241,7 +241,7 @@ def _prebake() -> None:
 
 
 @app.command()
-def doctor(
+async def doctor(
     prebake: bool = typer.Option(
         False, "--prebake",
         help=f"Build the {DYNALITE_IMAGE} image now (a one-time npm install inside a "
@@ -251,7 +251,7 @@ def doctor(
 ) -> None:
     """Preflight: verify this machine has everything Odin needs to run."""
     if prebake:
-        _prebake()
+        await _prebake()
         return
     results = run_checks(ALL_CHECKS, _subprocess_run)
     for result in results:

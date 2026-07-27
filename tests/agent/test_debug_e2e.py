@@ -83,7 +83,7 @@ def _await_phase(base: str, node: str, phase: str, seconds: int = 120) -> dict |
     return observed
 
 
-def test_region_debug_sees_the_real_crash_and_the_agent_fingers_it(tmp_path):
+async def test_region_debug_sees_the_real_crash_and_the_agent_fingers_it(tmp_path):
     assert shutil.which("docker"), "docker must be on PATH for this integration test"
 
     store = SpecStore(tmp_path)
@@ -101,7 +101,7 @@ def test_region_debug_sees_the_real_crash_and_the_agent_fingers_it(tmp_path):
 
         gateway_port = httpx.get(f"{base}/health", timeout=10).json()["gateway"]["port"]
         access_key, secret_key = app.state.gateway_keys.issue(ENV, OPERATOR_NODE_ID)
-        ecs = boto3.client(
+        ecs = await boto3.client(
             "ecs", endpoint_url=f"http://127.0.0.1:{gateway_port}",
             aws_access_key_id=access_key, aws_secret_access_key=secret_key, region_name="us-east-1",
             config=Config(connect_timeout=10, read_timeout=15, retries={"max_attempts": 0}),

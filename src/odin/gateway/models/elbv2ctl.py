@@ -585,7 +585,7 @@ def _lock_for_lb(stores: SynthStores, env: str, lb_name: str) -> threading.Lock:
         return _proxy_locks.setdefault(stores, {}).setdefault((env, lb_name), threading.Lock())
 
 
-def converge_proxy(stores: SynthStores, env: str, lb_name: str, proxy: LoadBalancerProxy) -> None:
+async def converge_proxy(stores: SynthStores, env: str, lb_name: str, proxy: LoadBalancerProxy) -> None:
     """Bring the load balancer's REAL nginx container in line with the current
     listener/target state and record the published endpoint + `active` state on
     the lb record. Synchronous and idempotent; every caller either already runs
@@ -595,7 +595,7 @@ def converge_proxy(stores: SynthStores, env: str, lb_name: str, proxy: LoadBalan
         if record is None:  # deleted while this converge was queued
             return
         listeners = _proxy_listeners(stores, env, lb_name)
-        published = proxy.ensure(stores.root, env, lb_name, listeners)
+        published = await proxy.ensure(stores.root, env, lb_name, listeners)
 
         def mutate(current: dict | None) -> dict | object:
             if current is None:
@@ -608,14 +608,14 @@ def converge_proxy(stores: SynthStores, env: str, lb_name: str, proxy: LoadBalan
         stores.elbv2ctl.update(env, _lb_key(lb_name), mutate)
 
 
-def _converge_safely(stores: SynthStores, env: str, lb_name: str, proxy: LoadBalancerProxy) -> None:
+async def _converge_safely(stores: SynthStores, env: str, lb_name: str, proxy: LoadBalancerProxy) -> None:
     """`converge_proxy` on a daemon thread with no caller to raise to -- the
     same "a silent hang is forbidden" contract ec2compute's `_finish_boot` and
     ecsctl's `_launch_task` keep: a real `docker run` failure becomes the load
     balancer's honest `failed` state plus a log line, never an exception nobody
     ever sees."""
     try:
-        converge_proxy(stores, env, lb_name, proxy)
+        await converge_proxy(stores, env, lb_name, proxy)
     except Exception as exc:  # noqa: BLE001 -- deliberately broad, see docstring
         log.warning("load-balancer proxy failed for %s (env %s): %s", lb_name, env, exc)
         reason = exc_text(exc)
@@ -817,7 +817,7 @@ def _describe_load_balancers(params: dict[str, str], env: str, stores: SynthStor
     return _response("DescribeLoadBalancers", _members("LoadBalancers", [_lb_xml(r) for r in selected]))
 
 
-def _delete_load_balancer(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
+async def _delete_load_balancer(params: dict[str, str], env: str, stores: SynthStores, proxy: LoadBalancerProxy) -> Response:
     name = name_from_arn(params.get("LoadBalancerArn", ""))
     record = _lb(stores, env, name)
     if record is None:
@@ -832,7 +832,7 @@ def _delete_load_balancer(params: dict[str, str], env: str, stores: SynthStores,
     # so the provider's post-delete read lands in the ordinary unknown-name
     # path (LoadBalancerNotFound), which is what its delete waiter treats as
     # "gone" -- ec2net.py's verified no-grace-window precedent.
-    proxy.destroy(env, name)
+    await proxy.destroy(env, name)
     return _response("DeleteLoadBalancer", "")
 
 

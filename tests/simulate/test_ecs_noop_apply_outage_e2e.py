@@ -90,10 +90,10 @@ def ecs_cleanup():
         _docker("rm", "-f", "-v", container_id)
 
 
-def _ecs_client(client, app):
+async def _ecs_client(client, app):
     gateway_port = client.get("/health").json()["gateway"]["port"]
     access_key, secret_key = app.state.gateway_keys.issue(ENV, OPERATOR_NODE_ID)
-    return boto3.client(
+    return await boto3.client(
         "ecs", endpoint_url=f"http://127.0.0.1:{gateway_port}",
         aws_access_key_id=access_key, aws_secret_access_key=secret_key, region_name="us-east-1",
         config=Config(connect_timeout=10, read_timeout=20, retries={"max_attempts": 0}),
@@ -107,7 +107,7 @@ def _apply(client, canvas: dict) -> tuple[dict, float]:
     return resp.json(), time.monotonic() - started
 
 
-def test_a_noop_apply_cannot_report_success_while_the_service_is_at_zero(tmp_path, monkeypatch, ecs_cleanup):
+async def test_a_noop_apply_cannot_report_success_while_the_service_is_at_zero(tmp_path, monkeypatch, ecs_cleanup):
     assert shutil.which("tofu"), "OpenTofu must be on PATH for this integration test"
     assert shutil.which("docker"), "docker must be on PATH for this integration test"
 
@@ -128,7 +128,7 @@ def test_a_noop_apply_cannot_report_success_while_the_service_is_at_zero(tmp_pat
         assert body["tf"]["status"] == "ok", body
         assert "unhealthy" not in body, body
 
-        ecs = _ecs_client(client, app)
+        ecs = await _ecs_client(client, app)
         healthy = ecs.describe_services(cluster="odin", services=[NODE])["services"][0]
         assert healthy["runningCount"] == COUNT, healthy
         assert len(_task_containers()) == COUNT

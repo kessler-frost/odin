@@ -239,7 +239,7 @@ def _update_function(stores: SynthStores, env: str, name: str, **fields: object)
     stores.lambdactl.update(env, _key(name), mutate)
 
 
-def _finish_deploy(
+async def _finish_deploy(
     stores: SynthStores, env: str, name: str, runtime: str, handler: str,
     env_vars: dict[str, str], code_dir: Path, substrate: FunctionRuntime,
     keystore: KeyStore | None = None, gateway_port: int | None = None, memory_mib: int | None = None,
@@ -274,10 +274,10 @@ def _finish_deploy(
         # the issued credentials: canvas wiring overrides a declared default,
         # odin's own four AWS_* vars override everything.
         if label:
-            container_env.update(node_env(stores, env, label))
+            container_env.update(await node_env(stores, env, label))
         if keystore is not None and gateway_port is not None and label:
             container_env.update(workload_env(keystore, env, label, gateway_port))
-        substrate.ensure(env, name, runtime, handler, container_env, code_dir, memory_mib=memory_mib)
+        await substrate.ensure(env, name, runtime, handler, container_env, code_dir, memory_mib=memory_mib)
     except Exception as exc:
         # `_exc_text`, not `str(exc)`: an exception built with no args would
         # make BOTH reason fields empty, and `_configuration_json` drops an

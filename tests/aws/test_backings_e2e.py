@@ -94,11 +94,11 @@ def _destroy(client, env="default"):
 
 
 @pytest.fixture
-def runtime():
+async def runtime():
     rt = ColimaRuntime()
     yield rt
-    for name in own_containers(rt, *OWN_ENVS):
-        rt.stop(name)
+    for name in await own_containers(rt, *OWN_ENVS):
+        await rt.stop(name)
 
 
 
@@ -113,7 +113,7 @@ def _aws_for(client, runtime, env="default"):
     port = client.get("/health").json()["gateway"]["port"]
     return BackingAws(runtime, env, gateway_port=port)
 
-def test_sqs_roundtrip(tmp_path, runtime):
+async def test_sqs_roundtrip(tmp_path, runtime):
     app = create_app(runtime=runtime, store=SpecStore(tmp_path))
     with TestClient(app) as client:
         client.post("/apply", json=CANVAS_SQS)
@@ -125,11 +125,11 @@ def test_sqs_roundtrip(tmp_path, runtime):
         sqs.send_message(QueueUrl=url, MessageBody="hello-roundtrip")
         assert _receive(sqs, url) == "hello-roundtrip"
 
-        _destroy(client)
-    assert own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"
+        await _destroy(client)
+    assert await own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"
 
 
-def test_sns_to_sqs_delivery(tmp_path, runtime):
+async def test_sns_to_sqs_delivery(tmp_path, runtime):
     app = create_app(runtime=runtime, store=SpecStore(tmp_path))
     with TestClient(app) as client:
         client.post("/apply", json=CANVAS_SNS)
@@ -141,7 +141,7 @@ def test_sns_to_sqs_delivery(tmp_path, runtime):
         assert f":{ACCOUNT}:" in topic_arn
 
         aws = _aws_for(client, runtime)
-        sns, sqs = aws.client("sns"), aws.client("sqs")
+        sns, sqs = await aws.client("sns"), aws.client("sqs")
         sns.publish(TopicArn=topic_arn, Message="ping")
         jobs_url = sqs.get_queue_url(QueueName="jobs")["QueueUrl"]
         assert _receive(sqs, jobs_url) == "ping"  # raw delivery: body verbatim
@@ -168,11 +168,11 @@ def test_sns_to_sqs_delivery(tmp_path, runtime):
         assert _receive(sqs, jobs_url) == "fanout"
         assert _receive(sqs, jobs2_url) == "fanout"
 
-        _destroy(client)
-    assert own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"
+        await _destroy(client)
+    assert await own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"
 
 
-def test_dynamodb_put_get(tmp_path, runtime):
+async def test_dynamodb_put_get(tmp_path, runtime):
     app = create_app(runtime=runtime, store=SpecStore(tmp_path))
     with TestClient(app) as client:
         client.post("/apply", json=CANVAS_DDB)
@@ -184,11 +184,11 @@ def test_dynamodb_put_get(tmp_path, runtime):
         item = ddb.get_item(TableName="sessions", Key={"id": {"S": "u1"}})["Item"]
         assert item["val"]["S"] == "hello"
 
-        _destroy(client)
-    assert own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"
+        await _destroy(client)
+    assert await own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"
 
 
-def test_env_isolation(tmp_path, runtime):
+async def test_env_isolation(tmp_path, runtime):
     app = create_app(runtime=runtime, store=SpecStore(tmp_path))
     with TestClient(app) as client:
         client.post("/apply", params={"env": "a"}, json=CANVAS_S3)
@@ -197,31 +197,31 @@ def test_env_isolation(tmp_path, runtime):
         _wait(client, lambda p: p.get("uploads") == "healthy", env="b")
 
         # One backing container per env, same node label in both.
-        assert runtime.status("odin-aws-rustfs-a") == "running"
-        assert runtime.status("odin-aws-rustfs-b") == "running"
+        assert await runtime.status("odin-aws-rustfs-a") == "running"
+        assert await runtime.status("odin-aws-rustfs-b") == "running"
         for env in ("a", "b"):
             buckets = _aws_for(client, runtime, env).client("s3").list_buckets()["Buckets"]
             assert "uploads" in [b["Name"] for b in buckets]
 
         # Destroying a gc's ONLY a's backing; b keeps serving.
-        _destroy(client, env="a")
-        assert runtime.status("odin-aws-rustfs-a") == "absent"
-        assert runtime.status("odin-aws-rustfs-b") == "running"
+        await _destroy(client, env="a")
+        assert await runtime.status("odin-aws-rustfs-a") == "absent"
+        assert await runtime.status("odin-aws-rustfs-b") == "running"
         assert _phases(client, env="b").get("uploads") == "healthy"
         buckets = BackingAws(runtime, "b").client("s3").list_buckets()["Buckets"]
         assert "uploads" in [b["Name"] for b in buckets]
 
-        _destroy(client, env="b")
-    assert own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"
+        await _destroy(client, env="b")
+    assert await own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"
 
 
-def test_backing_crash_recovers(tmp_path, runtime):
+async def test_backing_crash_recovers(tmp_path, runtime):
     app = create_app(runtime=runtime, store=SpecStore(tmp_path))
     with TestClient(app) as client:
         client.post("/apply", json=CANVAS_S3)
         _wait(client, lambda p: p.get("uploads") == "healthy")
 
-        runtime.stop("odin-aws-rustfs-default")  # kill the backing out from under it
+        await runtime.stop("odin-aws-rustfs-default")  # kill the backing out from under it
 
         # The node must leave healthy within ~10s (exists() sees the dead
         # backing) — poll fast: the crashed→starting window is about one tick.
@@ -235,5 +235,5 @@ def test_backing_crash_recovers(tmp_path, runtime):
         buckets = BackingAws(runtime, "default").client("s3").list_buckets()["Buckets"]
         assert "uploads" in [b["Name"] for b in buckets]
 
-        _destroy(client)
-    assert own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"
+        await _destroy(client)
+    assert await own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"

@@ -392,13 +392,13 @@ def _sg_rule_xml(rule_id: str, group_id: str, rule: dict) -> str:
 # --- VPC ----------------------------------------------------------------------
 
 
-def _create_vpc(params: dict[str, str], env: str, stores: SynthStores) -> Response:
+async def _create_vpc(params: dict[str, str], env: str, stores: SynthStores) -> Response:
     vpc_id = _mint("vpc")
     tags = _spec_tags(params)
     default_sg = _new_sg(stores, env, vpc_id, "default", "default VPC security group", is_default=True)
     # V1b: a VPC joins the env's Nebula network (1:1 for now -- see module
     # docstring). Real CA/cert artifacts, idempotent, no daemon started.
-    network = ensure_network(stores.root, env, "127.0.0.1")
+    network = await ensure_network(stores.root, env, "127.0.0.1")
     vpc = {
         "vpc_id": vpc_id,
         "cidr_block": params.get("CidrBlock", "10.0.0.0/16"),

@@ -465,7 +465,7 @@ def _update_instance(stores: SynthStores, env: str, instance_id: str, **fields: 
     stores.ec2compute.update(env, _key("instance", instance_id), mutate)
 
 
-def _finish_boot(
+async def _finish_boot(
     stores: SynthStores, env: str, instance_id: str, name: str, vm_config, ssh_pubkey, user_data, nebula, vm: InstanceVm,
     env_vars: dict[str, str] | None = None,
 ) -> None:
@@ -475,7 +475,7 @@ def _finish_boot(
     # exactly the "silent hang" the brief forbids. Any failure instead
     # becomes a real, provider-visible terminal state.
     try:
-        ip = vm.boot(name, vm_config, hostname=instance_id, ssh_pubkey=ssh_pubkey, user_data=user_data, nebula=nebula, env_vars=env_vars)
+        ip = await vm.boot(name, vm_config, hostname=instance_id, ssh_pubkey=ssh_pubkey, user_data=user_data, nebula=nebula, env_vars=env_vars)
     except Exception as exc:
         log.warning("boot failed for instance %s (%s): %s", instance_id, name, exc_text(exc))
         _update_instance(
@@ -1118,7 +1118,7 @@ def membership_revision(stores: SynthStores, env: str) -> str:
     return hashlib.sha256(json.dumps(roster, sort_keys=True).encode()).hexdigest()[:16]
 
 
-def ensure_instance_mesh(stores: SynthStores, env: str, vm: InstanceVm | None = None) -> dict[str, str]:
+async def ensure_instance_mesh(stores: SynthStores, env: str, vm: InstanceVm | None = None) -> dict[str, str]:
     """Push each RUNNING instance's CURRENT compiled security groups into its
     already-booted VM -- `rdsctl.ensure_db_mesh`'s exact twin, for the exact
     same reason, and it is the half that was missing.
@@ -1170,7 +1170,7 @@ def ensure_instance_mesh(stores: SynthStores, env: str, vm: InstanceVm | None = 
         ))
     actions: dict[str, str] = {}
     for nebula in sorted(joins, key=lambda join: not membership_changed(join)):
-        actions[vm_name(env, nebula.host_id)] = machine.refresh_nebula(
+        actions[vm_name(env, nebula.host_id)] = await machine.refresh_nebula(
             vm_name(env, nebula.host_id), nebula,
         )
     _refuse_to_report_success(env, stores, actions)
@@ -1333,7 +1333,7 @@ def reclaim_tf_forgotten_vms(stores: SynthStores, envs: list[str], vm: InstanceV
     return reclaimed
 
 
-def reap_orphaned_vms(root: Path, envs: list[str], vm: InstanceVm | None = None) -> list[str]:
+async def reap_orphaned_vms(root: Path, envs: list[str], vm: InstanceVm | None = None) -> list[str]:
     """A one-shot startup safety net for a VM that's on disk with NO
     matching store record anywhere -- e.g. a crash between `vm.delete`
     succeeding and the store update landing, or any other drift between
@@ -1363,7 +1363,7 @@ def reap_orphaned_vms(root: Path, envs: list[str], vm: InstanceVm | None = None)
         if key.startswith("instance:")
     }
     reaped = []
-    for name in vm.list_names():
+    for name in await vm.list_names():
         if name.startswith(_VM_NAME_PREFIX) and name not in expected:
             log.warning("startup reaper: deleting orphaned EC2 VM %r (no matching store record)", name)
             vm.delete(name)

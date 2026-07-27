@@ -125,7 +125,7 @@ def _await_status(root: Path, want: str, timeout: float) -> dict:
         time.sleep(0.5)
 
 
-def test_a_noop_apply_cannot_report_success_on_a_database_that_never_answers(
+async def test_a_noop_apply_cannot_report_success_on_a_database_that_never_answers(
     store_root, db_cleanup, monkeypatch,
 ):
     assert shutil.which("tofu"), "OpenTofu must be on PATH for this integration test"
@@ -179,7 +179,7 @@ def test_a_noop_apply_cannot_report_success_on_a_database_that_never_answers(
         # so the converge finds it "up" and only `_wait_available`'s REAL
         # `pg_ready` connection can tell the difference.
         _docker("rm", "-f", "-v", victim)
-        _await_status(store_root, "failed", DRIFT_WINDOW)
+        await _await_status(store_root, "failed", DRIFT_WINDOW)
         squat = _docker(
             "run", "-d", "--name", victim, "--label", "odin=1",
             "-p", "0:5432", SQUATTER_IMAGE,

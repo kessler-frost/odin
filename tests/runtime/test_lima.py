@@ -29,12 +29,12 @@ def test_conforms_to_runtime_driver_protocol():
         assert callable(getattr(rt, method))
 
 
-def test_run_container_goes_through_nerdctl_in_the_vm():
+async def test_run_container_goes_through_nerdctl_in_the_vm():
     runner = FakeRunner()
     runner.responses["nerdctl run"] = _Proc(0, "abc123")
     rt = LimaRuntime(runner=runner)
 
-    handle = rt.run_container(ContainerSpec(
+    handle = await rt.run_container(ContainerSpec(
         name="job", image="busybox", env={"K": "v"}, ports={8000: 18080},
         command=("true",), volumes={"/host/conf": "/conf"}))
     assert handle.id == "abc123" and handle.name == "job"
@@ -47,17 +47,17 @@ def test_run_container_goes_through_nerdctl_in_the_vm():
     assert "18080:8000" in run_call and run_call[-1] == "true"
 
 
-def test_status_and_exit_code_inspect_in_vm():
+async def test_status_and_exit_code_inspect_in_vm():
     runner = FakeRunner()
     runner.responses["State.Status"] = _Proc(0, "exited")
     runner.responses["State.ExitCode"] = _Proc(0, "0")
     rt = LimaRuntime(runner=runner)
-    assert rt.status("job") == "exited"
-    assert rt.exit_code("job") == 0
-    assert rt.facts("job").phase == "crashed"  # exited -> crashed phase
+    assert await rt.status("job") == "exited"
+    assert await rt.exit_code("job") == 0
+    assert await rt.facts("job").phase == "crashed"  # exited -> crashed phase
 
 
-def test_build_pipes_the_dockerfile_through_limactl_shell_into_nerdctl():
+async def test_build_pipes_the_dockerfile_through_limactl_shell_into_nerdctl():
     class RecordingRunner(FakeRunner):
         def __init__(self):
             super().__init__()
@@ -70,7 +70,7 @@ def test_build_pipes_the_dockerfile_through_limactl_shell_into_nerdctl():
     runner = RecordingRunner()
     rt = LimaRuntime(runner=runner)
 
-    rt.build("odin-dynalite:1", "FROM node:20-alpine\n")
+    await rt.build("odin-dynalite:1", "FROM node:20-alpine\n")
 
     build_call = next(c for c in runner.calls if "build" in c)
     assert build_call == [
@@ -80,11 +80,11 @@ def test_build_pipes_the_dockerfile_through_limactl_shell_into_nerdctl():
     assert runner.inputs == ["FROM node:20-alpine\n"]
 
 
-def test_image_exists_inspects_through_the_vm():
+async def test_image_exists_inspects_through_the_vm():
     runner = FakeRunner()
     runner.responses["image inspect"] = _Proc(0, "sha256:abc")
     rt = LimaRuntime(runner=runner)
-    assert rt.image_exists("odin-dynalite:1") is True
+    assert await rt.image_exists("odin-dynalite:1") is True
 
 
 def test_logs_runs_nerdctl_logs_tail_in_the_vm():
@@ -115,7 +115,7 @@ def test_logs_in_the_vm_keeps_the_containers_stderr_half_too():
     assert LimaRuntime(runner=runner).logs("job").splitlines() == ["started", "crashed: bad config"]
 
 
-def test_image_exists_false_on_dockers_empty_array_stdout():
+async def test_image_exists_false_on_dockers_empty_array_stdout():
     # REAL docker/nerdctl prints literal "[]" to stdout (rc=1) for a missing
     # image — a truthy string. This exact behavior skipped the dynalite image
     # build in S5's e2e (bool("[]") is True), so the inspect MUST use a
@@ -123,7 +123,7 @@ def test_image_exists_false_on_dockers_empty_array_stdout():
     runner = FakeRunner()
     runner.responses["image inspect"] = _Proc(1, "[]")
     rt = LimaRuntime(runner=runner)
-    assert rt.image_exists("odin-dynalite:1") is False
+    assert await rt.image_exists("odin-dynalite:1") is False
 
 
 # --- the OUTER seam's failure text ------------------------------------------

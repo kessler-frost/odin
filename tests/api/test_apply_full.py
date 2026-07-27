@@ -25,19 +25,19 @@ from odin.spec.translate import canvas_to_stack
 
 
 class FakeRuntime:
-    def run_container(self, spec):
+    async def run_container(self, spec):
         return RunHandle(id="x", name=spec.name)
 
-    def stop(self, name):
+    async def stop(self, name):
         pass
 
-    def facts(self, name, container_port=0):
+    async def facts(self, name, container_port=0):
         return ContainerFacts(phase="pending")
 
-    def stats(self, name):
+    async def stats(self, name):
         return {"cpu": 0.0, "ram": 0.0}
 
-    def ensure_host(self):
+    async def ensure_host(self):
         return HostFacts()
 
 
@@ -77,7 +77,7 @@ class FakeAws:
     def deprovision(self, service, name):
         pass
 
-    def facts(self, service, name):
+    async def facts(self, service, name):
         return {"endpoint": "http://host.docker.internal:9000"}
 
     def gc(self, active_kinds):
@@ -129,7 +129,7 @@ def _patch_translate(monkeypatch, result: TranslateResult) -> list:
 
 
 class _LowMemRuntime(FakeRuntime):
-    def ensure_host(self):
+    async def ensure_host(self):
         return HostFacts(total_mem_mib=1000.0)  # far too small for 50 t3.medium EC2 nodes
 
 
@@ -288,7 +288,7 @@ def test_success_path_runs_tofu_and_reports_ok(tmp_path, monkeypatch):
     assert body["skipped"] == []
 
 
-def test_store_apply_is_deferred_until_after_ensure_backings_and_tofu(tmp_path, monkeypatch):
+async def test_store_apply_is_deferred_until_after_ensure_backings_and_tofu(tmp_path, monkeypatch):
     """Root cause of the S5 e2e failure: reconciler_for() starts a background
     loop (Reconciler._run, poll_interval=1.0) that ticks INDEPENDENTLY of this
     request. That loop's only signal that there's new work is store.apply()
@@ -479,7 +479,7 @@ def test_non_empty_apply_full_does_not_bump_the_epoch(tmp_path, monkeypatch):
     assert after == before
 
 
-def test_stale_request_is_superseded_before_tofu_ever_starts(tmp_path, monkeypatch):
+async def test_stale_request_is_superseded_before_tofu_ever_starts(tmp_path, monkeypatch):
     """An epoch bump that lands before this request reaches tofu (e.g. a
     concurrent /destroy that raced ahead) must abort BEFORE tofu ever runs --
     the first of the finding's two checkpoints."""
@@ -508,7 +508,7 @@ def test_stale_request_is_superseded_before_tofu_ever_starts(tmp_path, monkeypat
     assert app.state.store.head("default") is None
 
 
-def test_stale_request_is_superseded_right_before_the_final_commit(tmp_path, monkeypatch):
+async def test_stale_request_is_superseded_right_before_the_final_commit(tmp_path, monkeypatch):
     """The second checkpoint: the epoch can also change WHILE tofu itself is
     running (a slow apply racing a fast concurrent /destroy). Even though
     tofu succeeded, the stale request must not go on to commit."""
@@ -551,16 +551,16 @@ class _DeadTaskRuntime:
     def run(self, env, task_id, container_def, extra_env=None, cpu=None, memory=None):
         raise RuntimeError(f"pull access denied for {container_def['image']}")
 
-    def status(self, env, task_id, container_name):
+    async def status(self, env, task_id, container_name):
         return "absent"
 
-    def exit_code(self, env, task_id, container_name):
+    async def exit_code(self, env, task_id, container_name):
         return 0
 
-    def stop(self, env, task_id, container_name):
+    async def stop(self, env, task_id, container_name):
         pass
 
-    def logs(self, env, task_id, container_name, tail=20):
+    async def logs(self, env, task_id, container_name, tail=20):
         return ""
 
 
@@ -642,7 +642,7 @@ _LB = {
 }
 
 
-def test_world_keeps_being_projected_while_an_apply_full_is_in_flight(tmp_path, monkeypatch):
+async def test_world_keeps_being_projected_while_an_apply_full_is_in_flight(tmp_path, monkeypatch):
     """FIELD TEST 3's measurement, at the endpoint that produced it.
 
     `/apply-full` holds the reconciler across ensure + tofu + commit, and
@@ -906,13 +906,13 @@ class _FakeStates:
     def __init__(self, *_args, **_kwargs) -> None:
         pass
 
-    def container_names(self) -> list[str]:
+    async def container_names(self) -> list[str]:
         return list(type(self).running)
 
-    def status(self, name: str) -> str:
+    async def status(self, name: str) -> str:
         return "running" if name in type(self).running else "absent"
 
-    def exit_code(self, name: str) -> int:
+    async def exit_code(self, name: str) -> int:
         return -1
 
 

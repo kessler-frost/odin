@@ -140,7 +140,7 @@ async def test_the_debug_agent_answers_its_honest_unavailable_without_calling_an
     immediately rather than after the 90s timeout, because nothing is awaited."""
     monkeypatch.setenv("ODIN_AI", "0")
     answer = await asyncio.wait_for(
-        debugger_mod.diagnose(CONTEXT, "what's wrong here?", client_cls=_NeverConstructed),
+        await debugger_mod.diagnose(CONTEXT, "what's wrong here?", client_cls=_NeverConstructed),
         timeout=5.0,
     )
     assert "ODIN_AI" in answer["answer"]

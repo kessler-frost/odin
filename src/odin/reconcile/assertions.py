@@ -20,7 +20,6 @@ forbidden to be", not a gateway wire concern.
 """
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 
 
@@ -65,7 +64,7 @@ def pg_ready_sync(host: str, port: int, user: str, password: str, db: str = "pos
 
 
 async def pg_ready(host: str, port: int, user: str, password: str, db: str = "postgres") -> PgReady:
-    return await asyncio.to_thread(pg_ready_sync, host, port, user, password, db)
+    return await pg_ready_sync(host, port, user, password, db)
 
 
 @dataclass(frozen=True)
@@ -100,7 +99,7 @@ def mesh_probe_script(overlay_ip: str, port: int, timeout: float = 3.0) -> str:
     )
 
 
-def mesh_ready_sync(runtime, sidecar: str, overlay_ip: str, port: int, timeout: float = 3.0) -> MeshReady:
+async def mesh_ready_sync(runtime, sidecar: str, overlay_ip: str, port: int, timeout: float = 3.0) -> MeshReady:
     """Does the address odin PUBLISHES as the mesh endpoint actually answer,
     on the overlay, right now?
 
@@ -122,7 +121,7 @@ def mesh_ready_sync(runtime, sidecar: str, overlay_ip: str, port: int, timeout: 
     certificate satisfying this member's compiled SG firewall. Lighthouse
     liveness is checked separately (`reconcile/mesh_health.py`); the SG part is
     a policy decision, not a fault, so no probe should ever "fix" it."""
-    out = runtime.exec_sh(sidecar, mesh_probe_script(overlay_ip, port, timeout))
+    out = await runtime.exec_sh(sidecar, mesh_probe_script(overlay_ip, port, timeout))
     if MESH_PROBE_TOKEN in out:
         return MeshReady(ok=True)
     return MeshReady(ok=False, error=out.strip() or f"nothing answered at {overlay_ip}:{port} on the overlay")

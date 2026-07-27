@@ -82,11 +82,11 @@ class FakeRuntime:
     # the daemon started and whose process died before anything read its ports.
     status_after_run: str = "running"
 
-    def status(self, name: str) -> str:
+    async def status(self, name: str) -> str:
         self.calls.append(("status", name))
         return self.statuses.get(name, "absent")
 
-    def host_port(self, name: str, container_port: int) -> int:
+    async def host_port(self, name: str, container_port: int) -> int:
         self.calls.append(("host_port", name, container_port))
         # See the module docstring: real docker raises for a container it has
         # never heard of and answers 0 for one that is not running.
@@ -96,27 +96,27 @@ class FakeRuntime:
             return 0
         return self.ports.get((name, container_port), 0)
 
-    def logs(self, name: str, tail: int = 20) -> str:
+    async def logs(self, name: str, tail: int = 20) -> str:
         self.calls.append(("logs", name, tail))
         return self.logtails.get(name, "")
 
-    def stop(self, name: str) -> None:
+    async def stop(self, name: str) -> None:
         self.calls.append(("stop", name))
         self.statuses.pop(name, None)
         for key in [key for key in self.ports if key[0] == name]:
             del self.ports[key]
 
-    def run_container(self, spec: ContainerSpec) -> None:
+    async def run_container(self, spec: ContainerSpec) -> None:
         self.calls.append(("run_container", spec.name))
         self.runs.append(spec)
         self.statuses[spec.name] = self.status_after_run
         for container_port in spec.ports:
             self.ports[(spec.name, container_port)] = self.next_ports.get(container_port, 0)
 
-    def copy_in(self, name: str, host_path: str, container_path: str) -> None:
+    async def copy_in(self, name: str, host_path: str, container_path: str) -> None:
         self.calls.append(("copy_in", name, host_path, container_path))
 
-    def signal(self, name: str, sig: str) -> None:
+    async def signal(self, name: str, sig: str) -> None:
         self.calls.append(("signal", name, sig))
 
     def sequence(self) -> list[str]:
@@ -419,12 +419,12 @@ def test_ensure_creates_the_container_when_it_has_never_existed(tmp_path):
 # --- destroy / target_address ----------------------------------------------
 
 
-def test_destroy_force_removes_by_exact_container_name_and_is_idempotent():
+async def test_destroy_force_removes_by_exact_container_name_and_is_idempotent():
     runtime = FakeRuntime()
     proxy = LoadBalancerProxy(runtime)
 
-    proxy.destroy(ENV, LB)
-    proxy.destroy(ENV, LB)  # absent now -- `stop`'s contract is a no-op, no raise
+    await proxy.destroy(ENV, LB)
+    await proxy.destroy(ENV, LB)  # absent now -- `stop`'s contract is a no-op, no raise
 
     assert runtime.calls == [("stop", NAME), ("stop", NAME)]
 

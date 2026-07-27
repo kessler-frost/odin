@@ -15,7 +15,7 @@ which names neither the container that went missing nor anything to do about it.
 These tests are about the SHAPE, which is why they do not stop at
 `/apply-full`. `BackingUnavailable` specifically also escapes `/apply` and
 `/destroy` -- both reach `ensure_backing` (`/apply` through its trailing
-`reconciler.tick()` -> plan -> provision, `/destroy` through its own
+`await reconciler.tick()` -> plan -> provision, `/destroy` through its own
 `ensure_backings`). `/tf/apply` cannot raise THAT one (it neither ensures
 backings nor ticks) but had the identical bare-text 500 for everything else it
 calls, so it is covered with an unmapped exception instead of a pretend one.
@@ -53,22 +53,22 @@ S3_ONLY = {"nodes": [{"type": "s3", "data": {"label": "uploads"}}], "edges": []}
 
 
 class FakeRuntime:
-    def run_container(self, spec):
+    async def run_container(self, spec):
         return RunHandle(id="x", name=spec.name)
 
-    def stop(self, name):
+    async def stop(self, name):
         pass
 
-    def facts(self, name, container_port=0):
+    async def facts(self, name, container_port=0):
         return ContainerFacts(phase="pending")
 
-    def stats(self, name):
+    async def stats(self, name):
         return {"cpu": 0.0, "ram": 0.0}
 
-    def ensure_host(self):
+    async def ensure_host(self):
         return HostFacts()
 
-    def container_names(self):
+    async def container_names(self):
         return []
 
 
@@ -100,13 +100,13 @@ class FakeAws:
         if self.ensure_raises is not None:
             raise self.ensure_raises
 
-    def provision(self, service, name, subscriptions=()):
+    async def provision(self, service, name, subscriptions=()):
         # The real `BackingAws.provision` starts with `ensure_backing(service)`
         # and then dials `client(service)`, so BOTH of its first two steps go
         # through `_published_port`. Modelling that is what makes `/apply`'s
         # trailing tick a real second route for this exception, rather than a
         # route that only looks like one.
-        self.ensure_backing(service)
+        await self.ensure_backing(service)
 
     def exists(self, service, name):
         return True
@@ -114,7 +114,7 @@ class FakeAws:
     def deprovision(self, service, name):
         pass
 
-    def facts(self, service, name):
+    async def facts(self, service, name):
         return {"endpoint": "http://host.docker.internal:9000"}
 
     def gc(self, active_kinds):
@@ -218,9 +218,9 @@ def test_the_verdict_names_the_recovery_that_actually_works(tmp_path, monkeypatc
 
 
 @pytest.mark.parametrize("path", ["/apply", "/apply-full"])
-def test_the_canvas_apply_routes_both_answer_json(tmp_path, monkeypatch, path):
+async def test_the_canvas_apply_routes_both_answer_json(tmp_path, monkeypatch, path):
     """`/apply` reaches `ensure_backing` through its own trailing
-    `reconciler.tick()` -> plan -> provision, so the identical exception comes
+    `await reconciler.tick()` -> plan -> provision, so the identical exception comes
     out of a route that never calls `ensure_backings` at all."""
     _patch_translate(monkeypatch)
     app = _app(tmp_path, aws=FakeAws(ensure_raises=_gone()))

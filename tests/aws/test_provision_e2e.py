@@ -17,11 +17,11 @@ CANVAS = {"nodes": [{"type": "s3", "data": {"label": "uploads"}}], "edges": []}
 
 
 @pytest.fixture
-def runtime():
+async def runtime():
     rt = ColimaRuntime()
     yield rt
-    for name in own_containers(rt, ENV):
-        rt.stop(name)
+    for name in await own_containers(rt, ENV):
+        await rt.stop(name)
 
 
 def test_s3_node_provisions_bucket(tmp_path, runtime):

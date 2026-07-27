@@ -92,17 +92,17 @@ def ecs_cleanup():
         _docker("rm", "-f", "-v", container_id)
 
 
-def _ecs_client(client, app):
+async def _ecs_client(client, app):
     gateway_port = client.get("/health").json()["gateway"]["port"]
     access_key, secret_key = app.state.gateway_keys.issue(ENV, OPERATOR_NODE_ID)
-    return boto3.client(
+    return await boto3.client(
         "ecs", endpoint_url=f"http://127.0.0.1:{gateway_port}",
         aws_access_key_id=access_key, aws_secret_access_key=secret_key, region_name="us-east-1",
         config=Config(connect_timeout=10, read_timeout=20, retries={"max_attempts": 0}),
     )
 
 
-def test_a_bad_image_update_fails_apply_and_names_the_image(tmp_path, monkeypatch, ecs_cleanup):
+async def test_a_bad_image_update_fails_apply_and_names_the_image(tmp_path, monkeypatch, ecs_cleanup):
     assert shutil.which("tofu"), "OpenTofu must be on PATH for this integration test"
     assert shutil.which("docker"), "docker must be on PATH for this integration test"
 
@@ -122,7 +122,7 @@ def test_a_bad_image_update_fails_apply_and_names_the_image(tmp_path, monkeypatc
         assert first.json()["status"] == "applied", first.json()
         assert first.json()["tf"]["status"] == "ok", first.json()
 
-        ecs = _ecs_client(client, app)
+        ecs = await _ecs_client(client, app)
         healthy = ecs.describe_services(cluster="odin", services=[NODE])["services"][0]
         assert healthy["runningCount"] == int(COUNT), healthy
         assert healthy["deployments"][0]["rolloutState"] == "COMPLETED", healthy

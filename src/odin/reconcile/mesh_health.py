@@ -128,7 +128,7 @@ def reset_cache() -> None:
     _cache.clear()
 
 
-def check(
+async def check(
     root: Path, env: str, member: str, address: str,
     *, sidecar_target: str | None = None, sidecar_port: int | None = None,
     runtime=None, lighthouse: LighthouseManager | None = None, now: float | None = None,
@@ -141,12 +141,12 @@ def check(
     cached = _cache.get(key)
     if cached is not None and stamp < cached[0]:
         return cached[1]
-    verdict = _probe(root, env, address, sidecar_target, sidecar_port, runtime, lighthouse)
+    verdict = await _probe(root, env, address, sidecar_target, sidecar_port, runtime, lighthouse)
     _cache[key] = (stamp + (_ok_seconds() if verdict.ok else _fail_seconds()), verdict)
     return verdict
 
 
-def _probe(
+async def _probe(
     root: Path, env: str, address: str, sidecar_target: str | None, sidecar_port: int | None,
     runtime, lighthouse: LighthouseManager | None,
 ) -> MeshVerdict:
@@ -154,7 +154,7 @@ def _probe(
     manager = lighthouse or LighthouseManager()
     mesh = MeshSidecar(rt, env, root, lighthouse=manager)
     try:
-        return _verdict(root, env, address, sidecar_target, sidecar_port, rt, mesh, manager)
+        return await _verdict(root, env, address, sidecar_target, sidecar_port, rt, mesh, manager)
     except Exception as exc:  # noqa: BLE001 -- a verdict must never fail a tick
         log.warning("mesh health check failed for %s (env %r): %s", address, env, exc)
         # Field test 6, F4's class: `{exc}` alone is empty for an exception built
@@ -171,7 +171,7 @@ def _probe(
         )
 
 
-def _verdict(
+async def _verdict(
     root: Path, env: str, address: str, sidecar_target: str | None, sidecar_port: int | None,
     runtime, mesh: MeshSidecar, lighthouse: LighthouseManager,
 ) -> MeshVerdict:
@@ -207,21 +207,21 @@ def _verdict(
         return MeshVerdict(ok=True)
     target, port = sidecar_target, sidecar_port
     sidecar = mesh.sidecar_name(target)
-    if not mesh.running(target):
+    if not await mesh.running(target):
         return MeshVerdict(
             ok=False, reason=f"the mesh sidecar {sidecar} is not running", fix=RE_APPLY,
         )
-    if mesh.attached_to(target) is False:
+    if await mesh.attached_to(target) is False:
         return MeshVerdict(
             ok=False,
             reason=f"the mesh sidecar {sidecar} is in a REPLACED container's network namespace",
             fix=RE_APPLY,
         )
-    ready = mesh_ready_sync(runtime, sidecar, address.rsplit(":", 1)[0], port)
+    ready = await mesh_ready_sync(runtime, sidecar, address.rsplit(":", 1)[0], port)
     return MeshVerdict(ok=ready.ok, reason=ready.error, fix=None if ready.ok else RE_APPLY)
 
 
-def gate(
+async def gate(
     entry: Entry, *, root: Path, env: str, member: str, overlay_ip: str | None,
     mesh_keys: tuple[str, ...], sidecar_target: str | None = None, sidecar_port: int | None = None,
     runtime=None, lighthouse: LighthouseManager | None = None, now: float | None = None,
@@ -241,7 +241,7 @@ def gate(
     if not overlay_ip or not any(key in facts for key in mesh_keys):
         return entry
     address = f"{overlay_ip}:{sidecar_port}" if sidecar_port else overlay_ip
-    result = check(
+    result = await check(
         root, env, member, address, sidecar_target=sidecar_target, sidecar_port=sidecar_port,
         runtime=runtime, lighthouse=lighthouse, now=now,
     )

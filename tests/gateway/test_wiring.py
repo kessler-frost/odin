@@ -201,11 +201,11 @@ class _PortOnlyRuntime:
     """Just enough runtime for the REAL `BackingAws.facts` to run, so the facts
     asserted below are the ones production publishes."""
 
-    def host_port(self, name, container_port):
+    async def host_port(self, name, container_port):
         return 51001
 
 
-def test_the_four_provisioned_kinds_publish_world_facts_and_are_still_not_producers(tmp_path):
+async def test_the_four_provisioned_kinds_publish_world_facts_and_are_still_not_producers(tmp_path):
     """The exact pair of readings the field test took against a real server, as a
     test: `aws/backings.py::facts` authors a real fact for each of s3/sqs/sns/
     dynamodb -- which is why they show up in `odin world` -- and none of them is
@@ -213,7 +213,7 @@ def test_the_four_provisioned_kinds_publish_world_facts_and_are_still_not_produc
     assert set(PROVISIONED) == {"s3", "sqs", "sns", "dynamodb"}
     assert not set(PROVISIONED) & set(REFERENCEABLE_KINDS)
     aws = BackingAws(_PortOnlyRuntime(), env=ENV, root=tmp_path)
-    published = {kind: aws.facts(kind, "thing") for kind in PROVISIONED}
+    published = {kind: await aws.facts(kind, "thing") for kind in PROVISIONED}
     # Each one really does publish a named fact -- so "a kind that publishes no
     # facts" is a false statement about every one of them.
     assert {kind: sorted(facts) for kind, facts in published.items()} == {

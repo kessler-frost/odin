@@ -57,15 +57,15 @@ EDITED_CANVAS = {
 
 
 @pytest.fixture
-def runtime():
+async def runtime():
     rt = ColimaRuntime()
     yield rt
-    for name in own_containers(rt, ENV):
-        rt.stop(name)
+    for name in await own_containers(rt, ENV):
+        await rt.stop(name)
     shutil.rmtree(_ODIN_ENV_DIR, ignore_errors=True)
 
 
-def test_tf_apply_zero_drift_destroy(tmp_path, runtime):
+async def test_tf_apply_zero_drift_destroy(tmp_path, runtime):
     assert shutil.which("tofu"), "OpenTofu must be on PATH for this integration test"
     store = SpecStore(tmp_path)
     app = create_app(runtime=runtime, store=store)
@@ -77,8 +77,8 @@ def test_tf_apply_zero_drift_destroy(tmp_path, runtime):
         # Reconciler for this env at all.
         aws = BackingAws(runtime, ENV, gateway_port=gateway_port)
         for service in ("s3", "sqs", "sns", "dynamodb"):
-            aws.ensure_backing(service)
-        app.state.gateway.update(ENV, {}, aws.backing_ports())
+            await aws.ensure_backing(service)
+        app.state.gateway.update(ENV, {}, await aws.backing_ports())
 
         stack = canvas_to_stack(CANVAS, env=ENV)
         store.apply(stack)  # sets this env's HEAD Stack -- /tf/apply's generate_tf input
@@ -124,7 +124,7 @@ def test_tf_apply_zero_drift_destroy(tmp_path, runtime):
         assert not aws.exists("sns", "alerts")
         assert not aws.exists("dynamodb", "items")
 
-        aws.gc(set())  # stop the backing containers -- nothing else owns them for this env
+        await aws.gc(set())  # stop the backing containers -- nothing else owns them for this env
 
-    assert own_containers(runtime, ENV) == [], "every container this test made is gone"
+    assert await own_containers(runtime, ENV) == [], "every container this test made is gone"
     print(f"\ntofu apply wall time: {wall_apply:.2f}s")

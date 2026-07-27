@@ -197,7 +197,7 @@ async def _refine(skeleton: TfProject, stack: Stack, client_cls: type, timeout: 
         allowed_tools=["mcp__translate__emit_terraform"],
     )
     try:
-        await asyncio.wait_for(_run_agent(_prompt(skeleton, stack), options, client_cls), timeout=timeout)
+        await asyncio.wait_for(await _run_agent(_prompt(skeleton, stack), options, client_cls), timeout=timeout)
     except Exception:
         log.exception("translate agent SDK pass failed for env %s", stack.env)
         return None
@@ -367,7 +367,7 @@ class TranslateCache:
         task = self._tasks.get(rev)
         return task is not None and not task.done()
 
-    def refine_in_background(self, rev: str, refine: Callable[[], Coroutine[Any, Any, TranslateResult]]) -> None:
+    async def refine_in_background(self, rev: str, refine: Callable[[], Coroutine[Any, Any, TranslateResult]]) -> None:
         """Start a background refine for `rev`. `refine` is a factory (the coro
         is built only when the task actually runs, so a task cancelled before it
         starts leaves no un-awaited coroutine). Idempotent per rev: a call while
@@ -381,7 +381,7 @@ class TranslateCache:
             if result.refined:
                 self._results[rev] = result
 
-        self._tasks[rev] = asyncio.create_task(_run())
+        self._tasks[rev] = asyncio.create_task(await _run())
 
     async def _drain(self, rev: str) -> None:
         """Test seam: await the in-flight background refine for `rev` (there is

@@ -189,7 +189,7 @@ def test_a_task_that_dies_with_no_message_records_the_class_not_a_blank(sink, ec
     assert "RuntimeError" in reason, "the deployment must quote the task's real reason"
 
 
-def test_the_apply_shortfall_names_the_class_when_that_is_all_odin_has(sink, ecs, stores):
+async def test_the_apply_shortfall_names_the_class_when_that_is_all_odin_has(sink, ecs, stores):
     """`wait_for_steady_services` is what /apply-full turns into the apply's
     own failure line -- a blank there is a failed apply that says nothing."""
     runtime = SilentlyFailingTaskRuntime()
@@ -198,7 +198,7 @@ def test_the_apply_shortfall_names_the_class_when_that_is_all_odin_has(sink, ecs
     _create_service(stores, sink, ecs, runtime, desiredCount=1)
     _stopped_task(stores)
 
-    (short,) = ecsctl.wait_for_steady_services(stores, ENV, runtime)
+    (short,) = await ecsctl.wait_for_steady_services(stores, ENV, runtime)
     assert short.reason, "the apply's reason may not be blank"
     assert "RuntimeError" in short.reason
 
@@ -259,7 +259,7 @@ class PoolTimeoutFunctionRuntime(FakeFunctionRuntime):
             raise httpcore.PoolTimeout()
 
 
-def test_an_invoke_that_fails_with_no_message_still_names_what_went_wrong(sink, lambda_, stores):
+async def test_an_invoke_that_fails_with_no_message_still_names_what_went_wrong(sink, lambda_, stores):
     """`_invoke`'s reason has the narrowest escape hatch of all: it is the
     whole `Message` of the AWS error the SDK raises at the caller, recorded
     nowhere else."""
@@ -618,10 +618,10 @@ class _SilentCacheDelete:
     def delete(self, env, cluster_id):
         raise RuntimeError()
 
-    def host_port(self, env, cluster_id):
+    async def host_port(self, env, cluster_id):
         return 51234
 
-    def status(self, env, cluster_id):
+    async def status(self, env, cluster_id):
         return "running"
 
 

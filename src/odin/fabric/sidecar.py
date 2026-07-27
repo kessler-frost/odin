@@ -286,7 +286,7 @@ class MeshSidecar:
             _recorded_groups(directory) != desired or not manager.cert_paths(member).crt.exists()
         )
         cert = (
-            manager.reissue_cert(member, cert_ip, desired) if recertified
+            await manager.reissue_cert(member, cert_ip, desired) if recertified
             else manager.cert_paths(member)
         )
         config = manager.generate_config(

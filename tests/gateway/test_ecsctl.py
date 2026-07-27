@@ -1139,7 +1139,7 @@ def test_mark_task_stopped_records_the_drift_reason_with_no_invented_exit_code(s
     assert _describe_service(stores, sink, ecs, runtime)["runningCount"] == 0
 
 
-def test_converge_services_relaunches_a_task_whose_container_is_gone(sink, ecs, stores):
+async def test_converge_services_relaunches_a_task_whose_container_is_gone(sink, ecs, stores):
     runtime = FakeTaskRuntime()
     _create_cluster(stores, sink, ecs, runtime)
     _register_taskdef(stores, sink, ecs, runtime)
@@ -1148,27 +1148,27 @@ def test_converge_services_relaunches_a_task_whose_container_is_gone(sink, ecs, 
     _, task_id, _, _, _, _ = runtime.ran[0]
     ecsctl.mark_task_stopped(stores, ENV, "odin", task_id, "removed outside odin")
 
-    ecsctl.converge_services(stores, ENV, runtime)  # what an Apply now does
+    await ecsctl.converge_services(stores, ENV, runtime)  # what an Apply now does
 
     _wait_for_running_count(stores, sink, ecs, runtime, 1)
     assert len(runtime.ran) == 2, "the missing task must be relaunched, not left short"
 
 
-def test_converge_services_is_a_no_op_at_desired_count(sink, ecs, stores):
+async def test_converge_services_is_a_no_op_at_desired_count(sink, ecs, stores):
     runtime = FakeTaskRuntime()
     _create_cluster(stores, sink, ecs, runtime)
     _register_taskdef(stores, sink, ecs, runtime)
     _create_service(stores, sink, ecs, runtime, desiredCount=2)
     _wait_for_running_count(stores, sink, ecs, runtime, 2)
 
-    ecsctl.converge_services(stores, ENV, runtime)
+    await ecsctl.converge_services(stores, ENV, runtime)
     _wait_for_running_count(stores, sink, ecs, runtime, 2)
 
     assert len(runtime.ran) == 2  # idempotent: every Apply must not stack up containers
     assert runtime.stopped == []
 
 
-def test_converge_services_leaves_a_deleted_service_alone(sink, ecs, stores):
+async def test_converge_services_leaves_a_deleted_service_alone(sink, ecs, stores):
     runtime = FakeTaskRuntime()
     _create_cluster(stores, sink, ecs, runtime)
     _register_taskdef(stores, sink, ecs, runtime)
@@ -1178,13 +1178,13 @@ def test_converge_services_leaves_a_deleted_service_alone(sink, ecs, stores):
     _parse("DeleteService", _answer(stores, delete_req, runtime))
     launched = len(runtime.ran)
 
-    ecsctl.converge_services(stores, ENV, runtime)  # an empty-canvas Apply's teardown
+    await ecsctl.converge_services(stores, ENV, runtime)  # an empty-canvas Apply's teardown
 
     time.sleep(0.1)
     assert len(runtime.ran) == launched, "an INACTIVE service must never be re-launched"
 
 
-def test_converge_services_relaunches_a_task_whose_container_exited(sink, ecs, stores):
+async def test_converge_services_relaunches_a_task_whose_container_exited(sink, ecs, stores):
     """Field test 3 (HIGH): the Apply's own convergence pass must SEE reality
     before it decides there is nothing to do -- a container that exited on its
     own still reads RUNNING in the store until something sweeps it, so without
@@ -1198,7 +1198,7 @@ def test_converge_services_relaunches_a_task_whose_container_exited(sink, ecs, s
     _, task_id, _, _, _, _ = runtime.ran[0]
     runtime.mark_exited(ENV, task_id, "app", exit_code=137)  # crashed on its own
 
-    ecsctl.converge_services(stores, ENV, runtime)
+    await ecsctl.converge_services(stores, ENV, runtime)
 
     _wait_for_running_count(stores, sink, ecs, runtime, 1)
     assert len(runtime.ran) == 2, "the exited task must be swept STOPPED, then relaunched"
@@ -1207,7 +1207,7 @@ def test_converge_services_relaunches_a_task_whose_container_exited(sink, ecs, s
 # --- Field test 3 (HIGH): a no-op Apply must not report success at zero tasks ---
 
 
-def test_wait_for_steady_services_is_silent_at_desired_count(sink, ecs, stores):
+async def test_wait_for_steady_services_is_silent_at_desired_count(sink, ecs, stores):
     runtime = FakeTaskRuntime()
     _create_cluster(stores, sink, ecs, runtime)
     _register_taskdef(stores, sink, ecs, runtime)
@@ -1215,11 +1215,11 @@ def test_wait_for_steady_services_is_silent_at_desired_count(sink, ecs, stores):
     _wait_for_running_count(stores, sink, ecs, runtime, 2)
 
     started = time.monotonic()
-    assert ecsctl.wait_for_steady_services(stores, ENV, runtime) == []
+    assert await ecsctl.wait_for_steady_services(stores, ENV, runtime) == []
     assert time.monotonic() - started < 1.0, "a healthy service must not cost the apply a wait"
 
 
-def test_wait_for_steady_services_names_the_service_the_counts_and_the_reason(sink, ecs, stores):
+async def test_wait_for_steady_services_names_the_service_the_counts_and_the_reason(sink, ecs, stores):
     """THE field-test-3 bug: an Apply tofu sees as a no-op, on a service that
     is already short of desired. The shortfall must name the node, what it
     observed (running vs desired) and the real underlying reason."""
@@ -1230,7 +1230,7 @@ def test_wait_for_steady_services_names_the_service_the_counts_and_the_reason(si
     _wait_for_running_count(stores, sink, ecs, runtime, 0)
 
     started = time.monotonic()
-    (short,) = ecsctl.wait_for_steady_services(stores, ENV, runtime)
+    (short,) = await ecsctl.wait_for_steady_services(stores, ENV, runtime)
     elapsed = time.monotonic() - started
 
     assert short.node == "app"
@@ -1239,7 +1239,7 @@ def test_wait_for_steady_services_names_the_service_the_counts_and_the_reason(si
     assert elapsed < 10, f"nothing is pending -- this must fail fast, took {elapsed:.1f}s"
 
 
-def test_wait_for_steady_services_waits_out_a_slow_start(sink, ecs, stores):
+async def test_wait_for_steady_services_waits_out_a_slow_start(sink, ecs, stores):
     """A task legitimately takes seconds to come up: the wait must join the
     convergence it is verifying instead of failing a service that is still
     launching."""
@@ -1250,11 +1250,11 @@ def test_wait_for_steady_services_waits_out_a_slow_start(sink, ecs, stores):
     _create_service(stores, sink, ecs, runtime, desiredCount=1)
     threading.Timer(0.3, block.set).start()
 
-    converging = ecsctl.converge_services(stores, ENV, runtime)
-    assert ecsctl.wait_for_steady_services(stores, ENV, runtime, converging) == []
+    converging = await ecsctl.converge_services(stores, ENV, runtime)
+    assert await ecsctl.wait_for_steady_services(stores, ENV, runtime, converging) == []
 
 
-def test_wait_for_steady_services_is_bounded(sink, ecs, stores, monkeypatch):
+async def test_wait_for_steady_services_is_bounded(sink, ecs, stores, monkeypatch):
     """A service that never converges fails the apply inside the budget rather
     than hanging it -- `ODIN_ECS_STEADY_TIMEOUT` is the knob."""
     monkeypatch.setenv("ODIN_ECS_STEADY_TIMEOUT", "0.5")
@@ -1268,13 +1268,13 @@ def test_wait_for_steady_services_is_bounded(sink, ecs, stores, monkeypatch):
     stores.ecsctl.set(ENV, task_key, {**stores.ecsctl.get(ENV, task_key), "last_status": "PROVISIONING"})
 
     started = time.monotonic()
-    (short,) = ecsctl.wait_for_steady_services(stores, ENV, runtime)
+    (short,) = await ecsctl.wait_for_steady_services(stores, ENV, runtime)
     assert time.monotonic() - started < 5.0
     assert (short.running, short.desired) == (0, 1)
     assert short.reason is None, "nothing has failed yet -- inventing a reason would be a lie"
 
 
-def test_wait_for_steady_services_ignores_a_deleted_service(sink, ecs, stores):
+async def test_wait_for_steady_services_ignores_a_deleted_service(sink, ecs, stores):
     runtime = FakeTaskRuntime()
     _create_cluster(stores, sink, ecs, runtime)
     _register_taskdef(stores, sink, ecs, runtime)
@@ -1283,7 +1283,7 @@ def test_wait_for_steady_services_ignores_a_deleted_service(sink, ecs, stores):
     delete_req = sink.call(lambda: ecs.delete_service(cluster="odin", service="app", force=True))
     _parse("DeleteService", _answer(stores, delete_req, runtime))
 
-    assert ecsctl.wait_for_steady_services(stores, ENV, runtime) == []
+    assert await ecsctl.wait_for_steady_services(stores, ENV, runtime) == []
 
 
 # --- W2.1 piece 3: the sweep ships each task's tail into /ecs/{service} ---------
@@ -1453,7 +1453,7 @@ def test_drift_marking_a_task_stopped_also_deregisters_it(sink, ecs, stores, tar
     assert target_calls["deregister"] == [(ENV, _TG_ARN, CONTAINER_HOST, 10_001)]
 
 
-def test_sweep_marks_a_task_whose_container_vanished(sink, ecs, stores):
+async def test_sweep_marks_a_task_whose_container_vanished(sink, ecs, stores):
     """Field test 4: one of three serving containers was `docker rm -f`'d 20s
     into a 63s apply and `/world` still said 3 for 57s. The drift sweep is the
     only other thing that notices a vanished container, and during an apply it
@@ -1466,7 +1466,7 @@ def test_sweep_marks_a_task_whose_container_vanished(sink, ecs, stores):
     _, task_id, _, _, _, _ = runtime.ran[0]
 
     runtime.vanish(ENV, task_id, "app")  # gone, not exited
-    ecsctl.sweep_tasks(stores, ENV, runtime)
+    await ecsctl.sweep_tasks(stores, ENV, runtime)
 
     task = stores.ecsctl.get(ENV, f"task:odin:{task_id}")
     assert task["last_status"] == "STOPPED"

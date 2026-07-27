@@ -120,14 +120,14 @@ def test_destroy_reports_tofu_failure_and_keeps_the_desired_state_for_a_retry(tm
 class _BlindRuntime(FakeRuntime):
     """A machine odin cannot ask: `docker` will not answer at all."""
 
-    def container_names(self):
+    async def container_names(self):
         raise RuntimeError("Cannot connect to the Docker daemon")
 
 
 class _CleanRuntime(FakeRuntime):
     """A machine that really has no container left for this env."""
 
-    def container_names(self):
+    async def container_names(self):
         return []
 
 
@@ -249,7 +249,7 @@ class _SurvivingRuntime(FakeRuntime):
     this env and one for a DIFFERENT env, so the residue report is proven to be
     env-scoped rather than a blanket listing."""
 
-    def container_names(self):
+    async def container_names(self):
         return ["odin-rds-default-db", "odin-aws-s3-default", "odin-rds-other-db"]
 
 
@@ -427,7 +427,7 @@ def test_tofu_unavailable_over_a_live_state_is_a_failed_destroy(tmp_path):
     assert body["still_standing"]["tf_state"] == ["aws_db_instance.app_db", "aws_s3_bucket.uploads"]
 
 
-def test_tofu_unavailable_does_not_brick_the_env(tmp_path):
+async def test_tofu_unavailable_does_not_brick_the_env(tmp_path):
     """The second half of the same bug: the route committed an empty Stack on
     its way out even though nothing was destroyed, so the NEXT destroy's
     `ensure_backings(last_applied)` got an empty Stack, started no backing

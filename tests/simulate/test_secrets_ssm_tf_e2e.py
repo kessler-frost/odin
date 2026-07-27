@@ -79,10 +79,10 @@ CODE = (
     "\n"
     "def lambda_handler(event, context):\n"
     "    endpoint = os.environ['AWS_ENDPOINT_URL']\n"
-    f"    value = boto3.client('secretsmanager', endpoint_url=endpoint).get_secret_value(SecretId={SECRET!r})['SecretString']\n"
+    f"    value = await boto3.client('secretsmanager', endpoint_url=endpoint).get_secret_value(SecretId={SECRET!r})['SecretString']\n"
     "    out = {'digest': hashlib.sha256(value.encode()).hexdigest(), 'length': len(value)}\n"
     "    try:\n"
-    f"        boto3.client('ssm', endpoint_url=endpoint).get_parameter(Name={PARAM!r}, WithDecryption=True)\n"
+    f"        await boto3.client('ssm', endpoint_url=endpoint).get_parameter(Name={PARAM!r}, WithDecryption=True)\n"
     "        out['ssm'] = 'ALLOWED'\n"
     "    except ClientError as exc:\n"
     "        out['ssm'] = exc.response['Error']['Code']\n"
@@ -135,8 +135,8 @@ def _tf_env(gateway_port: int, access_key: str, secret_key: str) -> dict[str, st
     }
 
 
-def _client(service: str, port: int, keys: tuple[str, str]):
-    return boto3.client(
+async def _client(service: str, port: int, keys: tuple[str, str]):
+    return await boto3.client(
         service, endpoint_url=f"http://127.0.0.1:{port}",
         aws_access_key_id=keys[0], aws_secret_access_key=keys[1], region_name="us-east-1",
         config=Config(connect_timeout=45, read_timeout=45, retries={"max_attempts": 0}),
@@ -179,7 +179,7 @@ def skeleton_translate(monkeypatch):
     monkeypatch.setattr("odin.server.translate_mod.translate", fake_translate)
 
 
-def test_an_iam_edge_is_what_lets_a_lambda_read_a_secret(store_root, lambda_cleanup, skeleton_translate):
+async def test_an_iam_edge_is_what_lets_a_lambda_read_a_secret(store_root, lambda_cleanup, skeleton_translate):
     assert shutil.which("tofu"), "OpenTofu must be on PATH for this integration test"
     assert shutil.which("docker"), "docker must be on PATH for this integration test"
     lambda_cleanup.append(container_name(ENV, FUNCTION))
@@ -229,7 +229,7 @@ def test_an_iam_edge_is_what_lets_a_lambda_read_a_secret(store_root, lambda_clea
         # (issue() is stable, so these are literally the container's keys).
         own_keys = app.state.gateway_keys.issue(ENV, FUNCTION)
         assert own_keys != operator
-        got = _client("secretsmanager", gateway_port, own_keys).get_secret_value(SecretId=SECRET)
+        got = await _client("secretsmanager", gateway_port, own_keys).get_secret_value(SecretId=SECRET)
         assert got["SecretString"] == SECRET_VALUE
         assert _denied_code(
             lambda: _client("ssm", gateway_port, own_keys).get_parameter(Name=PARAM)

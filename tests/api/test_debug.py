@@ -388,7 +388,7 @@ def test_build_context_is_usable_without_the_route(tmp_path):
     assert context["env"] == ENV and "db" in context["nodes"]
 
 
-def test_a_failure_here_advises_the_env_the_caller_actually_named(tmp_path):
+async def test_a_failure_here_advises_the_env_the_caller_actually_named(tmp_path):
     """`/agent/debug` takes its env in the BODY, and `_failure_body` can only
     read query params — so a failure on env 'staging' used to advise
     `odin world --env default`, pointing the user at an env they never

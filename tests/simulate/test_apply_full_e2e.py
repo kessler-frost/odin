@@ -46,11 +46,11 @@ _FIVE = ("uploads", "jobs", "alerts", "items", "db")
 
 
 @pytest.fixture
-def runtime():
+async def runtime():
     rt = ColimaRuntime()
     yield rt
-    for name in own_containers(rt, ENV):
-        rt.stop(name)
+    for name in await own_containers(rt, ENV):
+        await rt.stop(name)
 
 
 def _phases(client) -> dict:
@@ -67,7 +67,7 @@ def _wait(client, predicate, timeout=180.0, step=1.0):
     raise AssertionError(f"not met within {timeout}s (last={_phases(client)})")
 
 
-def test_apply_full_converges_reapplies_zero_drift_and_tears_down(tmp_path, runtime):
+async def test_apply_full_converges_reapplies_zero_drift_and_tears_down(tmp_path, runtime):
     assert shutil.which("tofu"), "OpenTofu must be on PATH for this integration test"
     app = create_app(runtime=runtime, store=SpecStore(tmp_path))
     with TestClient(app) as client:
@@ -137,6 +137,6 @@ def test_apply_full_converges_reapplies_zero_drift_and_tears_down(tmp_path, runt
         assert not aws.exists("sns", "alerts")
         assert not aws.exists("dynamodb", "items")
 
-        aws.gc(set())  # stop this env's backing containers -- nothing else owns them
+        await aws.gc(set())  # stop this env's backing containers -- nothing else owns them
 
-    assert own_containers(runtime, ENV) == [], "every container this test made is gone"
+    assert await own_containers(runtime, ENV) == [], "every container this test made is gone"

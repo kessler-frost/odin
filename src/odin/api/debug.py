@@ -39,7 +39,6 @@ send no `Origin`, so the guard never sees them.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -131,9 +130,9 @@ def _logs_reader(store: SpecStore, stores: SynthStores, runtime, env: str):
     reason from, so one node's log tail going missing is a degraded answer
     rather than no answer. It is logged with a traceback either way."""
 
-    def read(node: str) -> str:
+    async def read(node: str) -> str:
         try:
-            return fetch_logs(store, stores, runtime, env, node, tail=debugger.MAX_LOG_LINES).lines
+            return await fetch_logs(store, stores, runtime, env, node, tail=debugger.MAX_LOG_LINES).lines
         except Exception:
             log.exception("could not read logs for node %s in env %s (continuing without them)", node, env)
             return ""
@@ -216,9 +215,7 @@ def create_debug_router(
         # await a body that may already be consumed), so the env is recorded
         # here instead, the earliest point it is known.
         request.state.env = body.env
-        context = await asyncio.to_thread(
-            build_context, store, stores, runtime, ws_manager, body.env, body.node_ids,
-        )
+        context = await build_context(store, stores, runtime, ws_manager, body.env, body.node_ids)
         # Every selected id unknown to odin => an honest answer naming them,
         # and NO model call: there is no evidence, so the only thing a run
         # could produce is confident noise (field test 2 finding #8).

@@ -41,13 +41,13 @@ class FakeContainers:
     def __init__(self, *running: str) -> None:
         self.running = list(running)
 
-    def container_names(self) -> list[str]:
+    async def container_names(self) -> list[str]:
         return list(self.running)
 
-    def status(self, name: str) -> str:
+    async def status(self, name: str) -> str:
         return "running" if name in self.running else "absent"
 
-    def exit_code(self, name: str) -> int:
+    async def exit_code(self, name: str) -> int:
         return -1
 
 
@@ -495,13 +495,13 @@ class FakeTaskRuntime:
         self._exit_codes = exit_codes or {}
         self._logs = logs or {}
 
-    def status(self, env, task_id, container_name):
+    async def status(self, env, task_id, container_name):
         return self._statuses.get(task_id, "running")
 
-    def exit_code(self, env, task_id, container_name):
+    async def exit_code(self, env, task_id, container_name):
         return self._exit_codes.get(task_id, 0)
 
-    def logs(self, env, task_id, container_name, tail=20):
+    async def logs(self, env, task_id, container_name, tail=20):
         # W2.1: the sweep now also ships each task container's tail into
         # `/ecs/{service}` (ecsctl.py's `_ship_task_logs`), so this seam has to
         # answer for a log read too. "" (nothing seeded) is a real container's
@@ -799,9 +799,9 @@ def test_elasticache_creating_and_deleting_are_starting_with_no_facts_yet(tmp_pa
     assert result["c2"][2] == {}
 
 
-def test_a_deleting_cache_no_longer_advertises_a_live_redis_url(tmp_path):
+async def test_a_deleting_cache_no_longer_advertises_a_live_redis_url(tmp_path):
     """Field test 5's facts audit, hazard 3. `_cache_clusters` published
-    `cachectl.facts(record)` in EVERY phase, so a cluster mid-delete kept
+    `await cachectl.facts(record)` in EVERY phase, so a cluster mid-delete kept
     handing out a `REDIS_URL` a consumer would dial -- the exact stale-green
     lie `_db_instances`'s gate exists to prevent and `_ec2_instances` gates
     for too. The record still carries the port (a delete can fail, and the

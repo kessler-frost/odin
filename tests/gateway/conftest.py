@@ -25,8 +25,8 @@ def sink() -> Iterator[CaptureSink]:
     capture.close()
 
 
-def _client(sink: CaptureSink, service: str, **extra: object):
-    return boto3.client(
+async def _client(sink: CaptureSink, service: str, **extra: object):
+    return await boto3.client(
         service,
         endpoint_url=sink.endpoint,
         region_name="us-east-1",
@@ -37,43 +37,43 @@ def _client(sink: CaptureSink, service: str, **extra: object):
 
 
 @pytest.fixture
-def s3(sink: CaptureSink):
-    return _client(sink, "s3", config=Config(signature_version="s3v4", s3={"addressing_style": "path"}))
+async def s3(sink: CaptureSink):
+    return await _client(sink, "s3", config=Config(signature_version="s3v4", s3={"addressing_style": "path"}))
 
 
 @pytest.fixture
-def dynamodb(sink: CaptureSink):
-    return _client(sink, "dynamodb")
+async def dynamodb(sink: CaptureSink):
+    return await _client(sink, "dynamodb")
 
 
 @pytest.fixture
-def sqs(sink: CaptureSink):
-    return _client(sink, "sqs")
+async def sqs(sink: CaptureSink):
+    return await _client(sink, "sqs")
 
 
 @pytest.fixture
-def sns(sink: CaptureSink):
-    return _client(sink, "sns")
+async def sns(sink: CaptureSink):
+    return await _client(sink, "sns")
 
 
 @pytest.fixture
-def sts(sink: CaptureSink):
-    return _client(sink, "sts")
+async def sts(sink: CaptureSink):
+    return await _client(sink, "sts")
 
 
 @pytest.fixture
-def ec2(sink: CaptureSink):
-    return _client(sink, "ec2")
+async def ec2(sink: CaptureSink):
+    return await _client(sink, "ec2")
 
 
 @pytest.fixture
-def iam(sink: CaptureSink):
-    return _client(sink, "iam")
+async def iam(sink: CaptureSink):
+    return await _client(sink, "iam")
 
 
 @pytest.fixture
-def ecr(sink: CaptureSink):
-    return _client(sink, "ecr")
+async def ecr(sink: CaptureSink):
+    return await _client(sink, "ecr")
 
 
 @pytest.fixture
@@ -84,40 +84,40 @@ def lambda_(sink: CaptureSink):
 
 
 @pytest.fixture
-def ecs(sink: CaptureSink):
-    return _client(sink, "ecs")
+async def ecs(sink: CaptureSink):
+    return await _client(sink, "ecs")
 
 
 @pytest.fixture
-def logs(sink: CaptureSink):
-    return _client(sink, "logs")
+async def logs(sink: CaptureSink):
+    return await _client(sink, "logs")
 
 
 @pytest.fixture
-def secretsmanager(sink: CaptureSink):
-    return _client(sink, "secretsmanager")
+async def secretsmanager(sink: CaptureSink):
+    return await _client(sink, "secretsmanager")
 
 
 @pytest.fixture
-def ssm(sink: CaptureSink):
-    return _client(sink, "ssm")
+async def ssm(sink: CaptureSink):
+    return await _client(sink, "ssm")
 
 
 @pytest.fixture
-def elasticache(sink: CaptureSink):
-    return _client(sink, "elasticache")
+async def elasticache(sink: CaptureSink):
+    return await _client(sink, "elasticache")
 
 
 @pytest.fixture
-def rds(sink: CaptureSink):
-    return _client(sink, "rds")
+async def rds(sink: CaptureSink):
+    return await _client(sink, "rds")
 
 
 @pytest.fixture
-def elbv2(sink: CaptureSink):
+async def elbv2(sink: CaptureSink):
     # botocore names the service model `elbv2`; its SigV4 credential scope (and
     # so `classify()`'s `service`) is `elasticloadbalancing`.
-    return _client(sink, "elbv2")
+    return await _client(sink, "elbv2")
 
 
 def split_url(url: str) -> tuple[str, dict[str, str]]:

@@ -16,20 +16,20 @@ class FakeRuntime:
     def __init__(self):
         self.runs = []
 
-    def run_container(self, spec):
+    async def run_container(self, spec):
         self.runs.append(spec.name)
         return RunHandle(id="x", name=spec.name)
 
-    def stop(self, name):
+    async def stop(self, name):
         pass
 
-    def facts(self, name, container_port=0):
+    async def facts(self, name, container_port=0):
         return ContainerFacts(phase="pending")
 
-    def stats(self, name):
+    async def stats(self, name):
         return {"cpu": 0.0, "ram": 0.0}
 
-    def ensure_host(self):
+    async def ensure_host(self):
         return HostFacts()
 
 
@@ -112,7 +112,7 @@ class RecordingAws:
     def exists(self, kind: str, rid: str) -> bool:
         return True
 
-    def facts(self, kind: str, rid: str) -> dict:
+    async def facts(self, kind: str, rid: str) -> dict:
         return {}
 
     def provision(self, kind: str, rid: str, *args) -> None:
@@ -131,7 +131,7 @@ class RecordingAws:
 S3_CANVAS = {"nodes": [{"type": "s3", "data": {"label": "uploads"}}], "edges": []}
 
 
-def test_destroy_boots_the_backings_before_tofu_then_gcs_them_after(tmp_path, monkeypatch):
+async def test_destroy_boots_the_backings_before_tofu_then_gcs_them_after(tmp_path, monkeypatch):
     """Field test 2, finding B6: `odin destroy` on a restored env ran 8m26s with
     no progress. `/destroy` never booted the backings, so the gateway 503'd every
     AWS call the destroy made and aws-sdk-go retried each ~25x with backoff --

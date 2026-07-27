@@ -348,7 +348,7 @@ def _db_facts(record: dict) -> dict:
     }
 
 
-def _db_instances(stores: SynthStores, env: str) -> Projected:
+async def _db_instances(stores: SynthStores, env: str) -> Projected:
     """W2.7: rds joins the projection instead of being provisioned+observed by
     the reconciler. Facts are published ONLY for an `available` instance -- a
     `failed` one has no working endpoint, and advertising the last known
@@ -375,7 +375,7 @@ def _db_instances(stores: SynthStores, env: str) -> Projected:
             record.get("status_reason"), kind="rds", identifier=identifier,
             status=record["status"], container=container,
         ) if phase == "crashed" else None
-        out[label] = mesh_health.gate(
+        out[label] = await mesh_health.gate(
             ("rds", phase, facts, verdict), root=stores.root, env=env,
             member=container,  # PostgresRds.mesh_member == the container name
             overlay_ip=record.get("overlay_ip"), mesh_keys=_DB_MESH_KEYS,
@@ -460,7 +460,7 @@ def _overlay_assignments(stores: SynthStores, env: str) -> dict[str, str]:
     return dict(hosts.assignments) if hosts else {}
 
 
-def _ec2_instances(stores: SynthStores, env: str) -> Projected:
+async def _ec2_instances(stores: SynthStores, env: str) -> Projected:
     out: Projected = {}
     overlay = _overlay_assignments(stores, env)
     instances = [r for k, r in stores.ec2compute.items(env).items() if k.startswith("instance:")]
@@ -497,7 +497,7 @@ def _ec2_instances(stores: SynthStores, env: str) -> Projected:
         phase = _EC2_PHASE.get(record["state_name"], "starting")
         verdict = _ec2_verdict(record) if phase == "crashed" else None
         facts = _ec2_facts(record, overlay) if phase == "healthy" else {}
-        out[label] = mesh_health.gate(
+        out[label] = await mesh_health.gate(
             ("ec2", phase, facts, verdict), root=stores.root, env=env,
             member=record["instance_id"],  # the nebula host_id `InstanceVm` signs (compute/instances.py)
             overlay_ip=facts.get("MESH_IP"), mesh_keys=_EC2_MESH_KEYS,
@@ -622,14 +622,14 @@ def _serving_previous_verdict(stores: SynthStores, env: str, service: dict, prev
     return f"{previous} {plural} serving the previous revision; deployment{target} failed: {task_verdict(failed)}"
 
 
-def _ecs_services(stores: SynthStores, env: str, runtime: TaskRuntime | None = None) -> Projected:
+async def _ecs_services(stores: SynthStores, env: str, runtime: TaskRuntime | None = None) -> Projected:
     out: Projected = {}
     # Keep task state honest against real containers BEFORE reading it below
     # -- without this, a task whose container already exited on its own
     # keeps reading "RUNNING" from the store until some unrelated Describe*
     # call happens to sweep it, and a crash-looping service shows "starting"
     # forever (the exact bug this fix closes).
-    sweep_tasks(stores, env, runtime or TaskRuntime())
+    await sweep_tasks(stores, env, runtime or TaskRuntime())
     for key, record in stores.ecsctl.items(env).items():
         # An INACTIVE service is mid-delete (ecsctl.py's own grace-window
         # sweep, `_INACTIVE_SERVICE_SWEEP_SECONDS`) -- World must drop it
@@ -673,7 +673,7 @@ def _ecs_services(stores: SynthStores, env: str, runtime: TaskRuntime | None = N
     return out
 
 
-def project(
+async def project(
     stores: SynthStores, env: str, ecs_runtime: TaskRuntime | None = None, containers=None,
 ) -> Projected:
     """`label -> (kind, phase, facts, verdict)` for every currently-existing
@@ -703,11 +703,11 @@ def project(
     out.update(_log_groups(stores, env))
     out.update(_secrets(stores, env))
     out.update(_ssm_parameters(stores, env))
-    out.update(_db_instances(stores, env))
+    out.update(await _db_instances(stores, env))
     out.update(_load_balancers(stores, env))
-    out.update(_ec2_instances(stores, env))
+    out.update(await _ec2_instances(stores, env))
     out.update(_lambda_functions(stores, env))
-    out.update(_ecs_services(stores, env, ecs_runtime))
+    out.update(await _ecs_services(stores, env, ecs_runtime))
     out.update(_cache_clusters(stores, env))
     # The live container check, applied over whatever the records claimed. Facts
     # go with it: a database that isn't running must stop advertising a
@@ -715,7 +715,7 @@ def project(
     # exists to prevent, which a phase-only override would leave behind.
     out.update({
         label: (out[label][0], "crashed", {}, verdict)
-        for label, verdict in live_verdicts(stores, env, containers).items()
+        for label, verdict in await live_verdicts(stores, env, containers).items()
         if label in out
     })
     return out

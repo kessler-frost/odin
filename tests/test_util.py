@@ -228,7 +228,7 @@ async def test_it_does_not_block_the_event_loop():
             await asyncio.sleep(0.01)
             ticks += 1
 
-    ticker = asyncio.create_task(tick())
+    ticker = asyncio.create_task(await tick())
     result = await util.run_command_async(["sh", "-c", "sleep 0.3; echo done"])
     ticker.cancel()
 

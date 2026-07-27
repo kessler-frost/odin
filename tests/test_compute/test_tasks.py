@@ -21,10 +21,10 @@ TASK_ID = "0123456789abcdef0123456789abcdef"
 class FakeRuntime:
     runs: list[ContainerSpec] = field(default_factory=list)
 
-    def run_container(self, spec: ContainerSpec) -> None:
+    async def run_container(self, spec: ContainerSpec) -> None:
         self.runs.append(spec)
 
-    def host_port(self, name: str, container_port: int) -> int:
+    async def host_port(self, name: str, container_port: int) -> int:
         return 10_080
 
 

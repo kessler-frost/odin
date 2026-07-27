@@ -279,13 +279,13 @@ def _spawn(target: Callable[..., None], *args: object) -> None:
     threading.Thread(target=target, args=args, daemon=True).start()
 
 
-def _finish_create(stores: SynthStores, env: str, cluster_id: str, cache: RedisCache) -> None:
+async def _finish_create(stores: SynthStores, env: str, cluster_id: str, cache: RedisCache) -> None:
     # Deliberately broad, for the ec2compute reason: this runs on a daemon
     # thread with no caller to propagate to, and an uncaught exception here
     # would strand the cluster `creating` forever -- the one failure mode the
     # brief forbids. Any failure becomes a real, provider-visible status.
     try:
-        port = cache.ensure(env, cluster_id)
+        port = await cache.ensure(env, cluster_id)
     except Exception as exc:
         log.warning("cache cluster %s failed to boot: %s", cluster_id, exc)
         _update(stores, env, cluster_id, status=STATUS_CREATE_FAILED, status_reason=exc_text(exc))

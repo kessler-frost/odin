@@ -411,7 +411,7 @@ def test_update_function_configuration_changes_fields_without_touching_code(sink
 # --- Invoke: the data plane ----------------------------------------------------
 
 
-def test_invoke_forwards_the_payload_to_the_substrate(sink, lambda_, stores):
+async def test_invoke_forwards_the_payload_to_the_substrate(sink, lambda_, stores):
     substrate = FakeFunctionRuntime(invoke_response=b'{"echo": true}')
     _create(stores, sink, lambda_, substrate)
     _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
@@ -423,7 +423,7 @@ def test_invoke_forwards_the_payload_to_the_substrate(sink, lambda_, stores):
     assert substrate.invoked == [(ENV, "fn1", b'{"key": "value"}')]
 
 
-def test_invoke_surfaces_function_error_header(sink, lambda_, stores):
+async def test_invoke_surfaces_function_error_header(sink, lambda_, stores):
     substrate = FakeFunctionRuntime(invoke_response=b'{"errorType": "ValueError"}', invoke_error="Unhandled")
     _create(stores, sink, lambda_, substrate)
     _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
@@ -476,7 +476,7 @@ def test_a_recovering_invocation_clears_the_recorded_failure(sink, lambda_, stor
     assert stores.lambdactl.get(ENV, "fn:fn1")["last_invocation_error"] is None
 
 
-def test_invoke_before_active_is_not_ready(sink, lambda_, stores):
+async def test_invoke_before_active_is_not_ready(sink, lambda_, stores):
     substrate = FakeFunctionRuntime(block=threading.Event())  # never released -- stays Pending
     _create(stores, sink, lambda_, substrate)
     req = sink.call(lambda: lambda_.invoke(FunctionName="fn1", Payload=b"{}"))
@@ -487,7 +487,7 @@ def test_invoke_before_active_is_not_ready(sink, lambda_, stores):
     assert substrate.invoked == []
 
 
-def test_invoke_unknown_function_is_not_found(sink, lambda_, stores):
+async def test_invoke_unknown_function_is_not_found(sink, lambda_, stores):
     req = sink.call(lambda: lambda_.invoke(FunctionName="ghost", Payload=b"{}"))
     response = _answer(stores, req, FakeFunctionRuntime())
     assert response.status_code == 404
@@ -500,7 +500,7 @@ _FN_LOG_GROUP = "/aws/lambda/fn1"
 _FN_LOG_STREAM = "odin-lambda-default-fn1"  # compute/functions.py::container_name
 
 
-def _invoke_once(stores, sink, lambda_, substrate) -> Response:
+async def _invoke_once(stores, sink, lambda_, substrate) -> Response:
     req = sink.call(lambda: lambda_.invoke(FunctionName="fn1", Payload=b"{}"))
     return _answer(stores, req, substrate)
 
@@ -647,9 +647,9 @@ def test_untag_resource_removes_the_key(sink, lambda_, stores):
 _AWS_INJECTED_KEYS = {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_ENDPOINT_URL", "AWS_DEFAULT_REGION"}
 
 
-def test_create_with_odin_node_tag_injects_gateway_creds_into_the_container(sink, lambda_, stores, keystore):
+async def test_create_with_odin_node_tag_injects_gateway_creds_into_the_container(sink, lambda_, stores, keystore):
     substrate = FakeFunctionRuntime()
-    _create(
+    await _create(
         stores, sink, lambda_, substrate, keystore=keystore, gateway_port=_GATEWAY_PORT,
         Tags={"odin:node": "myfn"}, Environment={"Variables": {"FOO": "bar"}},
     )
@@ -663,9 +663,9 @@ def test_create_with_odin_node_tag_injects_gateway_creds_into_the_container(sink
     assert env_vars == {"FOO": "bar", **expected}
 
 
-def test_injected_creds_never_leak_into_the_configuration_response(sink, lambda_, stores, keystore):
+async def test_injected_creds_never_leak_into_the_configuration_response(sink, lambda_, stores, keystore):
     substrate = FakeFunctionRuntime()
-    _create(
+    await _create(
         stores, sink, lambda_, substrate, keystore=keystore, gateway_port=_GATEWAY_PORT,
         Tags={"odin:node": "myfn"}, Environment={"Variables": {"FOO": "bar"}},
     )
@@ -676,9 +676,9 @@ def test_injected_creds_never_leak_into_the_configuration_response(sink, lambda_
     assert not _AWS_INJECTED_KEYS & set(active["Environment"]["Variables"])
 
 
-def test_update_configuration_redeploy_reinjects_creds_from_persisted_tags(sink, lambda_, stores, keystore):
+async def test_update_configuration_redeploy_reinjects_creds_from_persisted_tags(sink, lambda_, stores, keystore):
     substrate = FakeFunctionRuntime()
-    _create(
+    await _create(
         stores, sink, lambda_, substrate, keystore=keystore, gateway_port=_GATEWAY_PORT,
         Tags={"odin:node": "myfn"},
     )
@@ -697,9 +697,9 @@ def test_update_configuration_redeploy_reinjects_creds_from_persisted_tags(sink,
     assert env_vars == workload_env(keystore, ENV, "myfn", _GATEWAY_PORT)
 
 
-def test_create_without_keystore_behaves_exactly_as_before(sink, lambda_, stores):
+async def test_create_without_keystore_behaves_exactly_as_before(sink, lambda_, stores):
     substrate = FakeFunctionRuntime()
-    _create(
+    await _create(
         stores, sink, lambda_, substrate,
         Tags={"odin:node": "myfn"}, Environment={"Variables": {"FOO": "bar"}},
     )
@@ -717,7 +717,7 @@ def test_create_without_odin_node_tag_deploys_with_no_injected_vars(sink, lambda
 # --- Canvas WIRING: the node's own `env` map reaches the real container --------
 
 
-def test_the_nodes_env_refs_are_resolved_into_the_container(sink, lambda_, stores, keystore, tmp_path):
+async def test_the_nodes_env_refs_are_resolved_into_the_container(sink, lambda_, stores, keystore, tmp_path):
     """Field test 2, "the product hole": a lambda node's `env` refs never
     reached the RIE container. They now ride the same launch-time seam the
     issued credentials do -- so a resolved DATABASE_URL (which carries the DB
@@ -736,7 +736,7 @@ def test_the_nodes_env_refs_are_resolved_into_the_container(sink, lambda_, store
         "edges": [],
     }, env=ENV))
     substrate = FakeFunctionRuntime()
-    _create(
+    await _create(
         stores, sink, lambda_, substrate, keystore=keystore, gateway_port=_GATEWAY_PORT,
         Tags={"odin:node": "myfn"}, Environment={"Variables": {"FOO": "bar"}},
     )
@@ -750,7 +750,7 @@ def test_the_nodes_env_refs_are_resolved_into_the_container(sink, lambda_, store
     assert active["Environment"]["Variables"] == {"FOO": "bar"}
 
 
-def test_an_unresolvable_ref_lands_the_function_failed_with_a_naming_reason(sink, lambda_, stores, keystore, tmp_path):
+async def test_an_unresolvable_ref_lands_the_function_failed_with_a_naming_reason(sink, lambda_, stores, keystore, tmp_path):
     stores.rdsctl.set(ENV, "db:appdb", {
         "db_instance_identifier": "appdb", "master_username": "app", "master_password": "s3cret",
         "db_name": "shop", "status": "creating", "endpoint_port": 0,
@@ -764,7 +764,7 @@ def test_an_unresolvable_ref_lands_the_function_failed_with_a_naming_reason(sink
         "edges": [],
     }, env=ENV))
     substrate = FakeFunctionRuntime()
-    _create(
+    await _create(
         stores, sink, lambda_, substrate, keystore=keystore, gateway_port=_GATEWAY_PORT,
         Tags={"odin:node": "myfn"},
     )
@@ -778,7 +778,7 @@ def test_an_unresolvable_ref_lands_the_function_failed_with_a_naming_reason(sink
 # recovery that makes "re-Apply to recreate" true for lambda ------------------
 
 
-def test_mark_function_failed_is_what_a_caller_reads_after_the_container_vanishes(sink, lambda_, stores):
+async def test_mark_function_failed_is_what_a_caller_reads_after_the_container_vanishes(sink, lambda_, stores):
     """The sweep's seam: a function whose RIE container was removed outside
     odin reads `Failed` with the drift reason (so /world says crashed and says
     why), and Invoke refuses instead of dialing a container that isn't there.

@@ -262,7 +262,7 @@ def create_gateway_app(
             action, resource, principal.env, body, stores, now, backing_port, query_params,
             keystore=keystore, gateway_port=gateway_port() if gateway_port else None, rds=rds,
         )
-        pure = await asyncio.to_thread(answer) if action == "lambda:Invoke" else answer()
+        pure = await answer() if action == "lambda:Invoke" else answer()
         if pure is not None:
             return pure
 
