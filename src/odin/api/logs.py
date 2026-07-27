@@ -201,7 +201,7 @@ def _tail_lines(text: str, budget: int) -> str:
     return "\n".join(text.splitlines()[-budget:])
 
 
-def _from_containers(
+async def _from_containers(
     env: str, node: str, kind: str, runtime, names: list[str], tail: int, absent_message: str | None = None,
 ) -> LogsResponse:
     """Read logs off every name in `names` -- an EXITED container's logs are
@@ -222,12 +222,12 @@ def _from_containers(
     budget = tail
     any_running = any_present = False
     for name in names:
-        status = runtime.status(name)
+        status = await runtime.status(name)
         if status == "absent":
             continue
         any_present = True
         any_running = any_running or status == "running"
-        text = _tail_lines(runtime.logs(name, budget), budget) if budget > 0 else ""
+        text = _tail_lines(await runtime.logs(name, budget), budget) if budget > 0 else ""
         budget -= len(text.splitlines())
         if text:
             blocks.append(f"==> {name} <==\n{text}" if len(names) > 1 else text)

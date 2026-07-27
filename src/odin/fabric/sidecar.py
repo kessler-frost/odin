@@ -184,10 +184,10 @@ class MeshSidecar:
         hosts = overlay.subnets.get("hosts") if overlay else None
         return hosts.assignments.get(member) if hosts else None
 
-    def running(self, target: str) -> bool:
-        return self._rt.status(self.sidecar_name(target)) == "running"
+    async def running(self, target: str) -> bool:
+        return await self._rt.status(self.sidecar_name(target)) == "running"
 
-    def attached_to(self, target: str) -> bool | None:
+    async def attached_to(self, target: str) -> bool | None:
         """Is the sidecar in the CURRENT `target`'s network namespace?
 
         True/False, or None for "no evidence either way" (the runtime can't
@@ -203,13 +203,13 @@ class MeshSidecar:
         every handshake, while the config file is byte-identical and the
         sidecar container is still `running` -- so "unchanged + running" said
         "nothing to do" forever and no Apply could heal it."""
-        target_id = self._rt.container_id(target)
+        target_id = await self._rt.container_id(target)
         if not target_id:
             return None
-        return _shares_namespace(self._rt.network_mode(self.sidecar_name(target)), target_id)
+        return _shares_namespace(await self._rt.network_mode(self.sidecar_name(target)), target_id)
 
     # ---- join / leave ----
-    def ensure(
+    async def ensure(
         self, target: str, member: str, *,
         groups: tuple[str, ...] = (), firewall: FirewallRules | None = None,
         revision: str = "",
@@ -254,12 +254,12 @@ class MeshSidecar:
         if not self.enabled():
             return None
         try:
-            return self._join(target, member, groups, firewall or DEFAULT_FIREWALL, revision)
+            return await self._join(target, member, groups, firewall or DEFAULT_FIREWALL, revision)
         except Exception as exc:  # noqa: BLE001 -- deliberately broad, see docstring
             log.warning("mesh join failed for %s (env %r): %s", target, self._env, exc)
             return None
 
-    def _join(
+    async def _join(
         self, target: str, member: str, groups: tuple[str, ...],
         firewall: FirewallRules, revision: str = "",
     ) -> str | None:
@@ -313,17 +313,17 @@ class MeshSidecar:
         # `attached_to(...) is not False`: a definite NO (the target was
         # replaced) is the one case that must re-join; None (no evidence) keeps
         # the no-churn contract -- see `attached_to`.
-        healthy = self.running(target) and self.attached_to(target) is not False
+        healthy = await self.running(target) and await self.attached_to(target) is not False
         if not recertified and healthy:
             if previous == config:
                 return cert_ip.split("/")[0]
             if firewall_only_change(previous, config):
-                self._reload(target)
+                await self._reload(target)
                 return cert_ip.split("/")[0]
-        self._start(target, directory, peer_overlay_ips(overlay, member))
+        await self._start(target, directory, peer_overlay_ips(overlay, member))
         return cert_ip.split("/")[0]
 
-    def _reload(self, target: str) -> None:
+    async def _reload(self, target: str) -> None:
         """Adopt a FIREWALL-only config change without dropping a single
         tunnel -- the sidecar's half of what `compute/instances.py::_refresh`
         already does for a VM (`systemctl kill -s HUP nebula`), and now for the
@@ -346,15 +346,15 @@ class MeshSidecar:
         `docker kill -s HUP` reaches nebula directly: the image's ENTRYPOINT is
         exec-form, so nebula IS pid 1 in the sidecar, and its config lives on a
         bind mount that already holds the bytes just written."""
-        self._rt.signal(self.sidecar_name(target), "HUP")
+        await self._rt.signal(self.sidecar_name(target), "HUP")
         log.info("reloaded %s's mesh firewall in place (env %r)", target, self._env)
 
-    def _start(self, target: str, config_dir: Path, peers: Iterable[str] = ()) -> None:
+    async def _start(self, target: str, config_dir: Path, peers: Iterable[str] = ()) -> None:
         name = self.sidecar_name(target)
-        self._rt.stop(name)  # clear a remnant / an old config's daemon
-        if not self._rt.image_exists(NEBULA_IMAGE):
-            self._rt.build(NEBULA_IMAGE, NEBULA_DOCKERFILE)
-        self._rt.run_container(ContainerSpec(
+        await self._rt.stop(name)  # clear a remnant / an old config's daemon
+        if not await self._rt.image_exists(NEBULA_IMAGE):
+            await self._rt.build(NEBULA_IMAGE, NEBULA_DOCKERFILE)
+        await self._rt.run_container(ContainerSpec(
             name=name, image=NEBULA_IMAGE, labels={"odin-env": self._env},
             # The whole mechanism: the sidecar has NO network of its own -- it
             # lives in `target`'s namespace, so the tun it creates is the
@@ -365,9 +365,9 @@ class MeshSidecar:
             volumes={str(config_dir.resolve()): "/etc/nebula"},
         ))
         log.info("joined %s to the %r mesh (sidecar %s)", target, self._env, name)
-        self._converge(name, peers)
+        await self._converge(name, peers)
 
-    def _converge(self, sidecar: str, peers: Iterable[str]) -> None:
+    async def _converge(self, sidecar: str, peers: Iterable[str]) -> None:
         """Re-establish this member's tunnels NOW, from inside its own network
         namespace, instead of leaving every peer to time its stale tunnel out
         on nebula's own (deliberately unhurried) schedule.
@@ -382,9 +382,9 @@ class MeshSidecar:
         (re)start -- an unchanged member never reaches `_start` at all."""
         ips = list(peers)
         if ips:
-            self._rt.exec_sh(sidecar, rehandshake_script(ips))
+            await self._rt.exec_sh(sidecar, rehandshake_script(ips))
 
-    def stop(self, target: str) -> None:
+    async def stop(self, target: str) -> None:
         """Take `target` off the mesh. Idempotent, and safe to call for a
         container that never joined (`stop` on an absent name is a no-op)."""
-        self._rt.stop(self.sidecar_name(target))
+        await self._rt.stop(self.sidecar_name(target))

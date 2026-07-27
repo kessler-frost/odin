@@ -40,6 +40,7 @@ import io
 import json
 import shutil
 import socket
+import asyncio
 import time
 import zipfile
 from dataclasses import dataclass
@@ -162,7 +163,7 @@ class FunctionRuntime:
             archive.extractall(code_dir)
         return code_dir
 
-    def ensure(
+    async def ensure(
         self, env: str, function_name: str, runtime: str, handler: str,
         env_vars: dict[str, str], code_dir: Path, memory_mib: int | None = None,
     ) -> int:
@@ -179,9 +180,9 @@ class FunctionRuntime:
         runaway handler can't eat the host; `None` (a caller that predates
         this) leaves the container unbounded, same as before."""
         name = container_name(env, function_name)
-        self._rt.stop(name)  # clear any exited remnant (UpdateFunctionCode redeploy, or a stale prior run)
+        await self._rt.stop(name)  # clear any exited remnant (UpdateFunctionCode redeploy, or a stale prior run)
         image = RUNTIME_IMAGES.get(runtime, RUNTIME_IMAGES[DEFAULT_RUNTIME])
-        self._rt.run_container(ContainerSpec(
+        await self._rt.run_container(ContainerSpec(
             name=name, image=image, env=dict(env_vars),
             ports={_RIE_PORT: 0},
             labels={"odin-env": env, "odin-lambda-fn": function_name},
@@ -189,18 +190,18 @@ class FunctionRuntime:
             volumes={str(code_dir): "/var/task"},
             memory_mib=float(memory_mib) if memory_mib else None,
         ))
-        return self._await_ready(name)
+        return await self._await_ready(name)
 
-    def _await_ready(self, name: str) -> int:
+    async def _await_ready(self, name: str) -> int:
         deadline = time.monotonic() + self._ready_timeout
         while time.monotonic() < deadline:
-            port = self._rt.host_port(name, _RIE_PORT)
+            port = await self._rt.host_port(name, _RIE_PORT)
             if port and _tcp_open(port):
                 return port
-            time.sleep(self._poll_interval)
-        raise RuntimeError(f"{name} RIE never became ready: {self._not_ready_reason(name)}")
+            await asyncio.sleep(self._poll_interval)
+        raise RuntimeError(f"{name} RIE never became ready: {await self._not_ready_reason(name)}")
 
-    def _not_ready_reason(self, name: str) -> str:
+    async def _not_ready_reason(self, name: str) -> str:
         """WHY the wait ended, in a form that is never empty.
 
         This message used to be `f"{name} RIE never became ready:\\n{logs}"`,
@@ -224,9 +225,9 @@ class FunctionRuntime:
         live container's `{{.State.ExitCode}}` is `0` (verified on the same
         probe), and "exit code 0" printed under a failure is the kind of true-
         looking detail that sends a reader down the wrong path."""
-        status = self._rt.status(name)
-        state = status if status == "running" else f"{status}, exit code {self._rt.exit_code(name)}"
-        logs = self._rt.logs(name)
+        status = await self._rt.status(name)
+        state = status if status == "running" else f"{status}, exit code {await self._rt.exit_code(name)}"
+        logs = await self._rt.logs(name)
         tail = f"Its logs:\n{logs}" if logs else (
             "It has logged nothing, so the container state above is the whole of it."
         )
@@ -235,33 +236,33 @@ class FunctionRuntime:
             f"within {self._ready_timeout:g}s. Container: {state}. {tail}"
         )
 
-    def invoke(self, env: str, function_name: str, payload: bytes, timeout: float = 30.0) -> InvokeResult:
+    async def invoke(self, env: str, function_name: str, payload: bytes, timeout: float = 30.0) -> InvokeResult:
         """The data plane: forward `payload` bytes straight to the
         function's own RIE container and hand back its response bytes
         verbatim, plus the FunctionError if the handler raised (see
         `_function_error` -- RIE sends no header, so it is read off the
         response) -- the gateway's Invoke handler is a pure pass-through of
         both."""
-        port = self._rt.host_port(container_name(env, function_name), _RIE_PORT)
+        port = await self._rt.host_port(container_name(env, function_name), _RIE_PORT)
         if not port:
             raise RuntimeError(f"{container_name(env, function_name)} is not running")
         response = httpx.post(f"http://127.0.0.1:{port}{_INVOKE_PATH}", content=payload, timeout=timeout)
         return InvokeResult(payload=response.content, function_error=_function_error(response))
 
-    def delete(self, env: str, function_name: str) -> None:
-        self._rt.stop(container_name(env, function_name))
+    async def delete(self, env: str, function_name: str) -> None:
+        await self._rt.stop(container_name(env, function_name))
         shutil.rmtree(self.code_dir(env, function_name), ignore_errors=True)
 
-    def status(self, env: str, function_name: str) -> str:
-        return self._rt.status(container_name(env, function_name))
+    async def status(self, env: str, function_name: str) -> str:
+        return await self._rt.status(container_name(env, function_name))
 
-    def logs(self, env: str, function_name: str, tail: int = 20) -> str:
+    async def logs(self, env: str, function_name: str, tail: int = 20) -> str:
         """The RIE container's own log tail -- the function's stdout/stderr,
         which is what `gateway/models/lambdactl.py` ships into
         `/aws/lambda/{name}` after every Invoke. Never raises: the driver's
         `logs` is a `check=False` CLI call, so a container that's gone
         answers with "" (`_ContainerRuntime.logs`'s contract)."""
-        return self._rt.logs(container_name(env, function_name), tail)
+        return await self._rt.logs(container_name(env, function_name), tail)
 
 
 def _tcp_open(port: int) -> bool:

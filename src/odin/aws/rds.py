@@ -69,7 +69,7 @@ class PostgresRds:
         legible next to the container it belongs to."""
         return self.container_name(db_id)
 
-    def join_mesh(self, db_id: str, firewall: FirewallRules | None = None, revision: str = "") -> str | None:
+    async def join_mesh(self, db_id: str, firewall: FirewallRules | None = None, revision: str = "") -> str | None:
         """Put this database on the env's overlay behind `firewall` (its drawn
         SG's compiled rules). No-op returning None when the env has no Nebula
         network — i.e. no VPC on the canvas.
@@ -78,7 +78,7 @@ class PostgresRds:
         4): a database is the ADMITTING member in the common case, so it is
         the one that has to re-check the sessions it already granted when a
         client loses the group that let it in. See `fabric/sidecar.py::ensure`."""
-        return self._mesh.ensure(
+        return await self._mesh.ensure(
             self.container_name(db_id), self.mesh_member(db_id), firewall=firewall, revision=revision,
         )
 
@@ -88,7 +88,7 @@ class PostgresRds:
         ip = self._mesh.overlay_ip(self.mesh_member(db_id))
         return (ip, POSTGRES_PORT) if ip else None
 
-    def create_db(self, db_id: str, user: str, password: str, db_name: str = "postgres") -> None:
+    async def create_db(self, db_id: str, user: str, password: str, db_name: str = "postgres") -> None:
         """`db_name` is REAL (W2.7): it becomes `POSTGRES_DB`, so the database
         an `aws_db_instance`'s `db_name` names actually exists and the
         DATABASE_URL fact can point at it. Defaults to `postgres` -- the
@@ -96,15 +96,15 @@ class PostgresRds:
         no `dbName` field gets byte-identical behavior and a byte-identical
         DATABASE_URL."""
         name = self.container_name(db_id)
-        if self._rt.status(name) == "running":
+        if await self._rt.status(name) == "running":
             return  # idempotent: already up
         # A same-name remnant (an exited container after a `docker kill`, or a
         # `created`-but-never-started one) makes the bare `docker run` below
         # fail outright, so clear it unconditionally -- this is also exactly
         # what makes `rdsctl.converge_db_instances` able to recover a killed
         # container without a separate teardown step.
-        self._rt.stop(name)
-        self._rt.run_container(ContainerSpec(
+        await self._rt.stop(name)
+        await self._rt.run_container(ContainerSpec(
             name=name,
             image=POSTGRES_IMAGE,
             env={"POSTGRES_USER": user, "POSTGRES_PASSWORD": password, "POSTGRES_DB": db_name},
@@ -112,25 +112,25 @@ class PostgresRds:
             labels={"odin-env": self._env},
         ))
 
-    def delete_db(self, db_id: str) -> None:
+    async def delete_db(self, db_id: str) -> None:
         # The mesh sidecar lives in this container's network namespace, so it
         # dies with it either way -- stopping it explicitly keeps `docker ps`
         # honest and makes the "no leftover containers" rule hold.
-        self._mesh.stop(self.container_name(db_id))
-        self._rt.stop(self.container_name(db_id))
+        await self._mesh.stop(self.container_name(db_id))
+        await self._rt.stop(self.container_name(db_id))
 
-    def endpoint(self, db_id: str) -> tuple[str, int] | None:
-        port = self._rt.host_port(self.container_name(db_id), 5432)
+    async def endpoint(self, db_id: str) -> tuple[str, int] | None:
+        port = await self._rt.host_port(self.container_name(db_id), 5432)
         return ("127.0.0.1", port) if port else None
 
-    def set_password(self, db_id: str, user: str, current_password: str, new_password: str) -> None:
+    async def set_password(self, db_id: str, user: str, current_password: str, new_password: str) -> None:
         """A REAL `ALTER USER ... WITH PASSWORD` against the running Postgres
         -- what `ModifyDBInstance`'s `MasterUserPassword` has to mean if the
         DATABASE_URL fact odin publishes is to stay true (no mock-only modes).
         Raises if the DB can't be reached or the statement fails, so the
         caller can report a real RDS error instead of storing a password the
         container doesn't actually have."""
-        endpoint = self.endpoint(db_id)
+        endpoint = await self.endpoint(db_id)
         if endpoint is None:
             raise RuntimeError(f"{self.container_name(db_id)} publishes no port")
         conn = psycopg2.connect(
