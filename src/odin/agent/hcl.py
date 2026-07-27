@@ -175,8 +175,36 @@ def values_preserved(skeleton_attrs: dict, agent_attrs: dict) -> bool:
 
 
 def _field(res: ResourceDesired, key: str, default: str) -> str:
+    """The ONE accessor every builder reads a config field through, and the one
+    place its `-> str` is made true.
+
+    A `FieldValue.value` is `Any` on purpose: the canvas is an open document and
+    `spec/translate.py`'s boundary check is deliberately permissive about
+    `data.*` (only `label` and `env` are type-checked, because only their shapes
+    are structural). But ten call sites here then do `.strip()` on the result,
+    so a canvas carrying `"allocatedStorage": 20` -- a bare JSON number, which is
+    what a hand-written canvas or an importer naturally writes where the config
+    panel would have written "20" -- crashed the apply with `'int' object has no
+    attribute 'strip'`. That is a 500 for what is at worst a client's harmless
+    type choice, and at best exactly what they meant.
+
+    So a scalar is coerced to the text it obviously denotes rather than refused:
+    the alternative, type-checking every consumed field at the boundary, would
+    reject `20` for `20` and buy nothing. A container (dict/list) is NOT
+    coerced -- `str({...})` would emit Python repr into HCL, which is a silent
+    wrong answer, and the honest response is the default. Non-scalars reaching
+    here at all means a builder is reading a key whose shape it never modelled;
+    `_ref_fault` and the boundary check cover the structural cases."""
     fv = res.fields.get(key)
-    return fv.value if fv is not None else default
+    if fv is None or isinstance(fv.value, (dict, list)) or fv.value is None:
+        return default
+    return fv.value if isinstance(fv.value, str) else _scalar_text(fv.value)
+
+
+def _scalar_text(value: object) -> str:
+    """`20` -> "20", `True` -> "true" (HCL's spelling, not Python's `True`),
+    `20.0` -> "20.0". Booleans are checked first because `bool` IS an `int`."""
+    return str(value).lower() if isinstance(value, bool) else str(value)
 
 
 def _block(resource_type: str, name: str, attrs: dict[str, str], nested: str = "") -> str:

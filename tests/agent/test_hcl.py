@@ -1734,3 +1734,46 @@ def test_no_decline_message_asks_a_cli_user_to_perform_a_ui_gesture(message):
     to make one sends them looking in the wrong place."""
     for gesture in ("drag it into", "rename the node", "needs a Value", "set Type to"):
         assert gesture not in message, f"{gesture!r} in {message!r}"
+
+
+# --- field test 6 follow-up: a JSON number where the panel writes a string ---
+# `FieldValue.value` is `Any` on purpose (the canvas is an open document, and
+# translate.py's boundary check only type-checks `label`/`env`, whose shapes are
+# structural). But every builder here reads config through `_field` and ten call
+# sites then `.strip()` it, so `"allocatedStorage": 20` -- what a hand-written
+# canvas or an importer naturally writes -- crashed the apply with `'int' object
+# has no attribute 'strip'`: a 500 for what is at worst a harmless type choice.
+
+
+def _rds_hcl(storage: object) -> str:
+    canvas = {"nodes": [{"id": "n", "type": "rds", "position": {"x": 0, "y": 0},
+                         "data": {"label": "db", "engine": "postgres",
+                                  "allocatedStorage": storage}}], "edges": []}
+    return generate_tf(canvas_to_stack(canvas, env="p")).files["main.tf"]
+
+
+def test_a_json_number_field_renders_exactly_like_its_string_form():
+    """The whole point: `20` is what the user meant, so it must not be a 500 AND
+    must not be a different answer than `"20"`."""
+    assert _rds_hcl(20) == _rds_hcl("20")
+    assert "allocated_storage   = 20" in _rds_hcl(20)
+
+
+def test_a_boolean_field_gets_hcls_spelling_not_pythons():
+    """`bool` IS an `int` in Python, so it has to be checked first -- and `True`
+    is not valid HCL."""
+    assert hcl._scalar_text(True) == "true"
+    assert hcl._scalar_text(False) == "false"
+    canvas = {"nodes": [{"id": "b", "type": "s3", "position": {"x": 0, "y": 0},
+                         "data": {"label": "buck", "forceDestroy": True}}], "edges": []}
+    assert "True" not in generate_tf(canvas_to_stack(canvas, env="p")).files["main.tf"]
+
+
+def test_a_container_valued_field_falls_back_rather_than_emitting_python_repr():
+    """A dict/list is deliberately NOT coerced: `str({...})` would put Python
+    repr into HCL, which is a silent wrong answer rather than a loud one. The
+    default is the honest response -- a builder reading a key whose shape it never
+    modelled has nothing true to emit."""
+    emitted = _rds_hcl({"oops": 1})
+    assert "oops" not in emitted
+    assert f"allocated_storage   = {hcl._DEFAULT_ALLOCATED_STORAGE}" in emitted
