@@ -107,7 +107,7 @@ def vm_cleanup():
         subprocess.run(["limactl", "delete", "--force", name], capture_output=True, timeout=30)
 
 
-def test_tf_apply_boots_a_real_vm_zero_drift_destroy(tmp_path, vm_cleanup):
+async def test_tf_apply_boots_a_real_vm_zero_drift_destroy(tmp_path, vm_cleanup):
     assert shutil.which("tofu"), "OpenTofu must be on PATH for this integration test"
     assert shutil.which("limactl"), "limactl must be on PATH for this integration test"
     store = SpecStore(tmp_path)
@@ -200,4 +200,4 @@ def test_tf_apply_boots_a_real_vm_zero_drift_destroy(tmp_path, vm_cleanup):
         # tagged `terminated` record would project as ("ec2", "crashed").
         stores = SynthStores(store.root)
         stores.tags.set(ENV, f"ec2:{instance_id}", {"odin:node": "server"})
-        assert "server" not in project_tf_owned(stores, ENV)
+        assert "server" not in await project_tf_owned(stores, ENV)

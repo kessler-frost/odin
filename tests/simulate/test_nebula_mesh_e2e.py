@@ -203,7 +203,7 @@ def _process_owner(pid: int) -> str:
     return probe.stdout.strip()
 
 
-async def test_real_overlay_ping_and_sg_rule_filters_a_real_connection(tmp_path, vm_cleanup, lighthouse_cleanup):
+def test_real_overlay_ping_and_sg_rule_filters_a_real_connection(tmp_path, vm_cleanup, lighthouse_cleanup):
     assert shutil.which("tofu"), "OpenTofu must be on PATH for this integration test"
     assert shutil.which("limactl"), "limactl must be on PATH for this integration test"
     assert shutil.which("nebula") and shutil.which("nebula-cert"), "brew install nebula (MIT) required"
@@ -227,7 +227,7 @@ async def test_real_overlay_ping_and_sg_rule_filters_a_real_connection(tmp_path,
         net_apply = _tofu(["apply", "-auto-approve"], workspace, env_vars, timeout=120)
         assert net_apply.returncode == 0, f"network apply failed:\n{net_apply.stdout}\n{net_apply.stderr}"
 
-        ec2_client = await boto3.client(
+        ec2_client = boto3.client(
             "ec2", endpoint_url=f"http://127.0.0.1:{gateway_port}",
             aws_access_key_id=access_key, aws_secret_access_key=secret_key, region_name="us-east-1",
         )
