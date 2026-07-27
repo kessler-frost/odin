@@ -262,6 +262,15 @@ Hard-won mechanics. Ignoring these has already destroyed work in this repo.
   (never `/tmp` — macOS TMPDIR isn't shared into Colima), and its own env-name
   prefix. Two agents defaulting to :4200/:4266 produced a bogus 401 and two
   phantom "bugs" that had to be retracted.
+- **A FIXED port is the wrong isolation for a parallel run.** Assigning each
+  agent its own `ODIN_GATEWAY_PORT` partitions agents and then collides with
+  that agent's OWN xdist workers: measured, `ODIN_GATEWAY_PORT=5311` with
+  `-n auto` gave every worker but one `OSError: [Errno 48] Address already in
+  use` and made the run WORSE than leaving it unset (39 errors vs 34). The
+  tests already default to an ephemeral port (`0`), which is STRONGER
+  isolation than any fixed number -- nothing can collide with it. So: fixed
+  ports for a long-running server you must dial, ephemeral for test runs.
+  Same lesson as the one below, one level down.
 - **Isolation is PER-PROCESS, not per-agent.** An agent with its own port, store
   dir and env prefix then ran two of its own `pytest` processes through them at
   once, and the collision produced a phantom "1-in-6 flaky test" that was

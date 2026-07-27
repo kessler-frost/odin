@@ -144,10 +144,12 @@ def _bump_epoch(env_epoch: dict[str, int], env: str) -> int:
 async def _admission_rejection(runtime, store: SpecStore, stack: Stack) -> JSONResponse | None:
     """Owner directive B1: the pre-apply admission check, shared by
     `/apply-full` and `/tf/apply` -- both must reject BEFORE touching any
-    container/VM, never after. `ensure_host()` shells to `docker info`
-    (blocking); `asyncio.to_thread` keeps that off the event loop, same
-    precaution `_reap_orphaned_ec2_vms` already takes for its own blocking
-    `limactl` calls. Returns None when admitted, else the 409 JSONResponse
+    container/VM, never after. `ensure_host()` shells to `docker info`, which
+    is a SUBPROCESS and therefore natively async (`run_command_async`): it is
+    awaited, and nothing is hidden behind a thread. (v0.7.7: this used to say
+    `asyncio.to_thread` kept it off the loop; there are zero `to_thread` call
+    sites left in src, so that sentence described a mechanism that no longer
+    exists.) Returns None when admitted, else the 409 JSONResponse
     the caller should return VERBATIM (named numbers, never a bare
     "rejected")."""
     host = await runtime.ensure_host()
