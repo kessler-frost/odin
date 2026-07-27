@@ -31,6 +31,11 @@ class FakeRuntime:
     # so the caching tests assert against their lengths
     status_calls: list[str] = field(default_factory=list)
     port_calls: list[str] = field(default_factory=list)
+    # a real `docker inspect -f {{.State.ExitCode}}` answers 0 for a LIVE
+    # container, which is why `_not_ready_reason` only prints it when the
+    # container has actually stopped
+    exit_codes: dict[str, int] = field(default_factory=dict)
+    log_text: dict[str, str] = field(default_factory=dict)
 
     def run_container(self, spec: ContainerSpec):
         self.runs.append(spec)
@@ -58,8 +63,11 @@ class FakeRuntime:
             return 0
         return self.ports.get(name, 0)
 
+    def exit_code(self, name: str) -> int:
+        return self.exit_codes.get(name, 0)
+
     def logs(self, name: str, tail: int = 20) -> str:
-        return f"fake logs of {name}"
+        return self.log_text.get(name, f"fake logs of {name}")
 
     def image_exists(self, tag: str) -> bool:
         return tag in self.images
@@ -290,6 +298,98 @@ def test_ensure_backing_timeout_raises_with_logs(rt, factory, tmp_path, monkeypa
     monkeypatch.setattr(backings, "READY_TIMEOUT", 0.0)
     with pytest.raises(RuntimeError, match="fake logs of odin-aws-dynalite-default"):
         _aws(rt, factory, tmp_path).ensure_backing("dynamodb")
+
+
+def test_a_backing_that_never_became_ready_says_WHY_not_only_that_it_did_not(rt, factory, tmp_path, monkeypatch):
+    """The S5 incident this module's own docstring cites, finally answered.
+
+    The message was `f"{cname} never became ready:\\n{logs}"`, and `logs`
+    answers `""` both for a container that wrote nothing and for one the
+    runtime could not read -- so the entire explanation was a dangling colon
+    and a blank line. Measured against real RustFS and real registry
+    containers driven to a real timeout, with `status`, `exit_code` and
+    `host_port` all readable at that instant and all three discarded.
+
+    These tests pin the RENDERING; the real-container measurement is recorded
+    in `_not_ready_reason`'s docstring, because a fabricated signal proves the
+    formatter, not the integration."""
+    monkeypatch.setattr(backings, "READY_TIMEOUT", 0.0)
+    with pytest.raises(RuntimeError) as exc:
+        _aws(rt, factory, tmp_path).ensure_backing("s3")
+    msg = str(exc.value)
+    assert not msg.endswith(":\n") and not msg.endswith(":")   # the defect itself
+    assert "the s3 list_buckets probe never succeeded" in msg  # WHICH probe, not just "not ready"
+    assert "published on host port 51001" in msg              # the discriminator that was unread
+    assert "after 0s" in msg
+    assert "Container: running" in msg
+    assert "exit code" not in msg                             # a LIVE container's exit code is 0
+
+
+def test_a_stopped_backing_names_its_exit_code_and_a_live_one_never_does(rt, factory, tmp_path):
+    aws = _aws(rt, factory, tmp_path)
+    d = aws._backing_for("s3")
+    cname = aws._cname(d)
+    rt.statuses[cname] = "running"
+    rt.published[cname] = {d.port}
+    rt.ports[cname] = 34071
+
+    live = aws._not_ready_reason(cname, d, "the probe never succeeded")
+    assert "Container: running." in live
+    # "exit code 0" under a failure sends a reader down the wrong path
+    assert "exit code" not in live
+
+    rt.statuses[cname] = "exited"
+    rt.exit_codes[cname] = 5
+    assert "Container: exited, exit code 5." in aws._not_ready_reason(cname, d, "the probe never succeeded")
+
+
+def test_an_unpublished_port_is_a_different_reason_from_a_mute_one(rt, factory, tmp_path):
+    """The discrimination the old message could not make at all: docker never
+    published the port, versus a port that is published and never answers."""
+    aws = _aws(rt, factory, tmp_path)
+    d = aws._backing_for("s3")
+    cname = aws._cname(d)
+    rt.statuses[cname] = "running"
+
+    assert f"docker never published its {d.port}" in aws._not_ready_reason(cname, d, "the probe never succeeded")
+
+
+def test_a_silent_backing_says_the_container_state_is_the_whole_of_it(rt, factory, tmp_path):
+    """`logs == ""` was the entire old message; now it is the one case that
+    says so out loud, and a talkative container keeps its tail as a BONUS
+    rather than the headline (a backing can log a line that reads like success
+    while the real reason sits in the port)."""
+    aws = _aws(rt, factory, tmp_path)
+    d = aws._backing_for("s3")
+    cname = aws._cname(d)
+
+    rt.log_text[cname] = ""
+    assert "It has logged nothing, so the container state above is the whole of it." in \
+        aws._not_ready_reason(cname, d, "the probe never succeeded")
+
+    rt.log_text.pop(cname)
+    assert f"Its logs:\nfake logs of {cname}" in aws._not_ready_reason(cname, d, "the probe never succeeded")
+
+
+def test_the_registry_backing_names_its_own_wire_shape_not_a_boto3_probe(rt, tmp_path, monkeypatch):
+    """ecr is the one backing whose probe is NOT a boto3 call -- registry:2
+    speaks the Docker Registry v2 protocol and understands neither SigV4 nor
+    the ECR JSON shape -- so its reason must name `GET /v2/`. Built without a
+    client_factory on purpose: that seam is exactly what makes the other
+    probes skip real I/O."""
+    monkeypatch.setattr(backings, "READY_TIMEOUT", 0.0)
+    aws = BackingAws(rt, env="default", root=tmp_path)
+    d = aws._backing_for("ecr")
+    cname = aws._cname(d)
+    rt.statuses[cname] = "running"
+    rt.published[cname] = {d.port}
+    rt.ports[cname] = 34072
+
+    with pytest.raises(RuntimeError) as exc:
+        aws._await_registry_ready(cname)
+    msg = str(exc.value)
+    assert "GET /v2/ never returned 200" in msg
+    assert "list_buckets" not in msg and "probe never succeeded" not in msg
 
 
 def test_ensure_backing_dynamodb_builds_the_baked_image_when_absent(rt, factory, tmp_path):

@@ -416,7 +416,51 @@ class BackingAws:
                 return
             except (ClientError, BotoCoreError):
                 time.sleep(1)
-        raise RuntimeError(f"{cname} never became ready:\n{self._rt.logs(cname)}")
+        reason = self._not_ready_reason(
+            cname, self._backing_for(service), f"the {service} {_PROBES[service]} probe never succeeded",
+        )
+        raise RuntimeError(f"{cname} never became ready: {reason}")
+
+    def _not_ready_reason(self, cname: str, d: BackingDef, probe: str) -> str:
+        """WHY the wait ended, in a form that is never empty.
+
+        The module docstring above already cites this exact failure as a real
+        incident (`"never became ready"`, empty container logs) -- the fix just
+        took longer to arrive than the diagnosis. It used to be
+        `f"{cname} never became ready:\\n{self._rt.logs(cname)}"`, and
+        `logs` answers `""` both for a container that wrote nothing and for one
+        the runtime could not read. Measured against REAL containers, driven to
+        a real timeout with the canonical names so `client()` resolved a
+        published port:
+
+          backing                          rendered                    status   exit  port
+          odin-aws-rustfs-swpprobe    '... never became ready:\\n'  running  0     34071
+          odin-aws-registry-swpprobe  '... never became ready:\\n'  running  0     34072
+
+        A dangling colon and a blank line, with `status`, `exit_code` and
+        `host_port` all readable at that instant and all three discarded.
+
+        Same treatment as `CacheRuntime._not_ready_reason` and
+        `FunctionRuntime`'s before it, and for the same reasons: `host_port`
+        discriminates the two real failures (docker never published the port
+        at all, versus a port that is published and never answers), the log
+        tail is a trailing bonus rather than the headline (a backing's logs can
+        end on a line that reads like success while the actual reason sits in
+        the port), and the exit code is reported only for a container that is
+        NOT running -- a live container's `{{.State.ExitCode}}` is `0`, and
+        "exit code 0" printed under a failure sends a reader down the wrong
+        path."""
+        status = self._rt.status(cname)
+        state = status if status == "running" else f"{status}, exit code {self._rt.exit_code(cname)}"
+        port = self._published_port_or_none(d)
+        published = f"published on host port {port}, but {probe}" if port else (
+            f"docker never published its {d.port}, so nothing could reach it"
+        )
+        logs = self._rt.logs(cname)
+        tail = f"Its logs:\n{logs}" if logs else (
+            "It has logged nothing, so the container state above is the whole of it."
+        )
+        return f"{published}, after {READY_TIMEOUT:g}s. Container: {state}. {tail}"
 
     def _await_registry_ready(self, cname: str) -> None:
         """registry:2 speaks the Docker Registry v2 HTTP protocol, not any
@@ -442,7 +486,9 @@ class BackingAws:
             except httpx.HTTPError:
                 pass
             time.sleep(0.5)
-        raise RuntimeError(f"{cname} never became ready:\n{self._rt.logs(cname)}")
+        raise RuntimeError(
+            f"{cname} never became ready: {self._not_ready_reason(cname, d, 'GET /v2/ never returned 200')}"
+        )
 
     def client(self, service: str):
         """Host-side client against the backing's published port (tests/e2e).
