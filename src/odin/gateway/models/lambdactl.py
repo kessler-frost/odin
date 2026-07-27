@@ -164,8 +164,14 @@ def _json(status: int, payload: dict) -> Response:
 
 
 def _not_found(name: str) -> Response:
-    arn = f"arn:aws:lambda:{REGION}:{ACCOUNT}:function:{name}"
-    return errors.synth_error("lambda", "ResourceNotFoundException", f"Function not found: {arn}", 404)
+    """The reader-side half of the empty-identifier family. Fifteen call sites
+    pass the URL `resource` straight in, and a request that named no function
+    made this render `Function not found: arn:aws:lambda:...:function:` -- the
+    sentence trailing off inside the ARN, which reads as an odin bug rather
+    than as the malformed request it is. The ARN is only worth printing when
+    there is a name to put in it."""
+    subject = f"arn:aws:lambda:{REGION}:{ACCOUNT}:function:{name}" if name else "this request named no function"
+    return errors.synth_error("lambda", "ResourceNotFoundException", f"Function not found: {subject}", 404)
 
 
 def _conflict(message: str) -> Response:
@@ -509,6 +515,21 @@ def wait_for_active_functions(
 def _create_function(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     payload = _payload(body)
     name = payload.get("FunctionName") or resource
+    # With neither a body `FunctionName` nor a URL resource this used to key the
+    # record `fn:` and mint the ARN `...:function:` -- a real function record,
+    # deployed for real, that no later call can name and therefore no later call
+    # can get, update or delete. REFUSING rather than recording, for the reason
+    # `_create_function`'s own `Code.ZipFile` guard two lines down already
+    # applies: the caller is still able to act on a 400, and cannot act on a
+    # resource it has no way to refer to.
+    #
+    # `InvalidParameterValueException` because it is Lambda's OWN documented
+    # CreateFunction error for exactly this (verified in botocore's lambda
+    # model: it is in `CreateFunction`'s `errors` list, 400/senderFault, and
+    # `FunctionName` carries `min: 1` there), and because it is already this
+    # module's refusal for the other unusable-request cases.
+    if not name:
+        return _invalid_parameter("FunctionName is required, and this request carried neither one nor a function in the URL")
     if _function(stores, env, name) is not None:
         return _conflict(f"Function already exists: {name}")
     zip_b64 = (payload.get("Code") or {}).get("ZipFile")

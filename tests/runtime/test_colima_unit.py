@@ -165,7 +165,7 @@ def test_a_failed_run_names_the_container_and_the_error_never_the_credentials():
     assert "fake-db-password" not in message
     # …and it still says which container died and why, up front.
     assert message == (
-        "docker run odin-ecs-wa-a53adf2b-web-svc failed: "
+        "docker run odin-ecs-wa-a53adf2b-web-svc failed (exit 1): "
         "Unable to find image 'nginx:bogus-9z9z' locally"
     )
 
@@ -174,8 +174,65 @@ def test_a_failed_command_with_no_named_container_still_names_the_subcommand():
     def runner(args, input=None):
         return _Proc(1, "", "no such directory")
 
-    with pytest.raises(RuntimeError, match=r"^docker cp failed: no such directory$"):
+    with pytest.raises(RuntimeError, match=r"^docker cp failed \(exit 1\): no such directory$"):
         ColimaRuntime(runner=runner).copy_in("job", "/host/odin.conf", "/etc/nginx/odin.conf")
+
+
+# --- a failed command that said NOTHING (OPEN-BUGS #5) ----------------------
+#
+# These three pin the shape probed against the REAL docker 28.4.0 on Colima,
+# whose output is recorded in `_failure_reason`'s own comment: `docker exec <c>
+# sh -c 'exit 1'` is rc=1 with BOTH streams empty, `... 'echo on-stdout; exit
+# 7'` is rc=7 with the reason on STDOUT, and `docker run --rm alpine sh -c 'exit
+# 3'` is rc=3 with both empty. The runners below replay exactly those three
+# triples -- the parser is what is under test here; the integration was proved
+# by running the real commands.
+
+
+def test_a_failure_with_no_output_at_all_still_states_a_reason():
+    """The bug: `f"{CLI} {label} failed: {stderr.strip()}"` rendered `docker run
+    x failed: ` -- a sentence whose reason is a dangling colon. The exit code
+    was there the whole time (it is why we are raising) and was dropped."""
+    def runner(args, input=None):
+        return _Proc(3, "", "")
+
+    with pytest.raises(RuntimeError) as raised:
+        ColimaRuntime(runner=runner).run_container(ContainerSpec(name="x", image="alpine:latest"))
+    message = str(raised.value)
+    assert message == (
+        "docker run x failed (exit 3): it wrote nothing to stderr or stdout, "
+        "so the exit code is the whole of it"
+    )
+    # The property that matters more than the exact wording: nothing trails off.
+    assert not message.rstrip().endswith(":")
+
+
+def test_a_failure_that_explained_itself_on_stdout_is_not_reported_as_silent():
+    """Real case, measured: `docker exec <c> sh -c 'echo on-stdout; exit 7'` is
+    rc=7, stderr empty, reason on stdout. `_cli` keeps only stdout on success
+    and only stderr on failure, so this reason reached nobody."""
+    def runner(args, input=None):
+        return _Proc(7, "on-stdout\n", "")
+
+    with pytest.raises(RuntimeError) as raised:
+        ColimaRuntime(runner=runner).copy_in("job", "/host/f", "/etc/f")
+    assert str(raised.value) == "docker cp failed (exit 7): nothing on stderr; on stdout: on-stdout"
+
+
+def test_an_unreadable_port_map_names_the_exit_code_and_the_silence_too():
+    """`host_port`'s PortUnreadable carried the same defect in a milder form --
+    it had `or 'no output'`, but threw the exit code away. One wording now."""
+    def runner(args, input=None):
+        return _Proc(125, "", "")
+
+    with pytest.raises(PortUnreadable) as raised:
+        ColimaRuntime(runner=runner).host_port("gone", 8080)
+    message = str(raised.value)
+    assert message == (
+        "docker cannot read gone's published ports (exit 125): it wrote nothing "
+        "to stderr or stdout, so the exit code is the whole of it"
+    )
+    assert not message.rstrip().endswith(":")
 
 
 def test_a_failed_log_read_is_empty_not_the_clis_own_error_text():

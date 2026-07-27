@@ -886,6 +886,99 @@ def test_import_key_pair_stores_pubkey_for_ssh_injection(sink, ec2, stores):
     assert keypair["public_key"] == pubkey
 
 
+# --- malformed requests (OPEN-BUGS #4 and #8) --------------------------------
+#
+# These go through `pure_answer` with a hand-built form body rather than the
+# `ec2` fixture, ON PURPOSE: botocore refuses to SEND a request missing a
+# required member, so a boto3-signed capture cannot express the case at all.
+# The gateway is a real HTTP server that anything can post to -- curl, a Go SDK
+# with a bug, a hand-rolled client -- so "botocore wouldn't do that" is not a
+# reason the server may answer badly.
+
+
+def _raw(stores, action: str, params: dict[str, str], vm=None) -> Response:
+    body = "&".join([f"Action={action}", "Version=2016-11-15", *(f"{k}={v}" for k, v in params.items())])
+    response = ec2compute.pure_answer(
+        f"ec2:{action}", "", ENV, body.encode(), stores, time.monotonic(), vm or FakeInstanceVm(),
+    )
+    assert response is not None
+    return response
+
+
+def test_import_key_pair_without_key_material_is_refused_not_silently_empty(stores):
+    """OPEN-BUGS #4: this stored an EMPTY public key and answered 200, and the
+    instance then booted -- a real VM, real RAM and disk -- with nothing in
+    `authorized_keys`. botocore's own EC2 model marks `PublicKeyMaterial`
+    required, so real AWS refuses too."""
+    response = _raw(stores, "ImportKeyPair", {"KeyName": "deploy"})
+    assert response.status_code == 400
+    assert _parse("ImportKeyPair", response, error=True)["Error"]["Code"] == "MissingParameter"
+    # ...and nothing was written: no empty-keyed record left behind.
+    assert stores.ec2compute.get(ENV, "keypair:deploy") is None
+
+
+def test_import_key_pair_with_material_that_decodes_to_nothing_is_refused_too(stores):
+    """The guard reads the DECODED key, not the parameter's presence:
+    `b64decode` skips non-alphabet characters, so junk decodes to `b""` and
+    reached the store exactly like an absent parameter would."""
+    response = _raw(stores, "ImportKeyPair", {"KeyName": "deploy", "PublicKeyMaterial": "%20%20"})
+    assert response.status_code == 400
+    assert _parse("ImportKeyPair", response, error=True)["Error"]["Code"] == "MissingParameter"
+    assert stores.ec2compute.get(ENV, "keypair:deploy") is None
+
+
+def test_a_key_pair_with_no_name_is_refused_by_both_import_and_create(stores):
+    """The empty-identifier sibling (OPEN-BUGS #7's family): both used to mint a
+    real key pair under the empty-string name -- a `keypair:` record nothing can
+    name, and so nothing can delete."""
+    for action in ("ImportKeyPair", "CreateKeyPair"):
+        response = _raw(stores, action, {"PublicKeyMaterial": "c3NoLWVkMjU1MTkgQUFBQQ=="})
+        assert response.status_code == 400, action
+        assert _parse(action, response, error=True)["Error"]["Code"] == "MissingParameter", action
+    assert stores.ec2compute.get(ENV, "keypair:") is None
+
+
+def test_describe_instance_attribute_without_an_attribute_is_refused_not_malformed_xml(stores, sink, ec2):
+    """OPEN-BUGS #8: this emitted `<><value>false</value></>` -- not a wrong
+    answer but an UNPARSEABLE one, so every client reported a column number
+    instead of the missing parameter. `Attribute` is required in botocore's own
+    EC2 model."""
+    subnet_id = _subnet(stores, sink, ec2)
+    vm = FakeInstanceVm()
+    instance_id = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)["Instances"][0]["InstanceId"]
+
+    response = _raw(stores, "DescribeInstanceAttribute", {"InstanceId": instance_id}, vm=vm)
+    assert response.status_code == 400
+    assert b"<><value>" not in response.body
+    assert _parse("DescribeInstanceAttribute", response, error=True)["Error"]["Code"] == "MissingParameter"
+
+
+def test_an_attribute_name_that_is_not_a_tag_name_cannot_break_the_document(stores, sink, ec2):
+    """The same hole from the other side: the attribute is interpolated as an
+    ELEMENT NAME, where `escape()` cannot help -- escaping emits literal text,
+    not a tag. All 16 values of the model's `InstanceAttributeName` enum are
+    alphanumeric, so no real attribute is refused by this."""
+    subnet_id = _subnet(stores, sink, ec2)
+    vm = FakeInstanceVm()
+    instance_id = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)["Instances"][0]["InstanceId"]
+
+    response = _raw(stores, "DescribeInstanceAttribute", {"InstanceId": instance_id, "Attribute": "a%3Eb"}, vm=vm)
+    assert response.status_code == 400
+    assert _parse("DescribeInstanceAttribute", response, error=True)["Error"]["Code"] == "InvalidParameterValue"
+
+
+def test_an_unmodelled_but_real_attribute_still_gets_its_permissive_answer(stores, sink, ec2):
+    """The guard must not become a behaviour change for the 12 real attributes
+    this module does not model -- `ebsOptimized` and friends keep answering."""
+    subnet_id = _subnet(stores, sink, ec2)
+    vm = FakeInstanceVm()
+    instance_id = _run_instance(stores, sink, ec2, vm, SubnetId=subnet_id)["Instances"][0]["InstanceId"]
+
+    response = _raw(stores, "DescribeInstanceAttribute", {"InstanceId": instance_id, "Attribute": "ebsOptimized"}, vm=vm)
+    assert response.status_code == 200
+    assert _parse("DescribeInstanceAttribute", response)["EbsOptimized"] == {"Value": False}
+
+
 def test_run_instances_injects_the_imported_pubkey(sink, ec2, stores):
     pubkey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI test@host"
     req = sink.call(lambda: ec2.import_key_pair(KeyName="deploy", PublicKeyMaterial=pubkey.encode()))

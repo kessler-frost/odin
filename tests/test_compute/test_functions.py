@@ -45,6 +45,12 @@ class FakeRuntime:
     statuses: dict[str, str] = field(default_factory=dict)
     ports: dict[str, int] = field(default_factory=dict)
     next_port: int = 0
+    exit_codes: dict[str, int] = field(default_factory=dict)
+    # `None` keeps the old "always some text" behaviour; `""` is the state the
+    # readiness message used to render as a dangling colon, and it is a REAL
+    # one -- measured on a live `alpine sleep 300` container, `docker logs`
+    # answered `''` while `status` answered `running` (see `_not_ready_reason`).
+    log_text: str | None = None
 
     def run_container(self, spec: ContainerSpec):
         self.runs.append(spec)
@@ -60,11 +66,14 @@ class FakeRuntime:
     def status(self, name: str) -> str:
         return self.statuses.get(name, "absent")
 
+    def exit_code(self, name: str) -> int:
+        return self.exit_codes.get(name, 0)
+
     def host_port(self, name: str, container_port: int) -> int:
         return self.ports.get(name, 0)
 
     def logs(self, name: str, tail: int = 20) -> str:
-        return f"fake logs of {name}"
+        return self.log_text if self.log_text is not None else f"fake logs of {name}"
 
 
 @pytest.fixture
@@ -201,6 +210,60 @@ def test_ensure_raises_when_the_port_is_published_but_nothing_listens(tmp_path):
     rt = FunctionRuntime(runtime, root=tmp_path, ready_timeout=0.2, poll_interval=0.05)
     with pytest.raises(RuntimeError, match="never became ready"):
         rt.ensure(ENV, FN, "python3.12", "h.h", {}, tmp_path)
+
+
+# --- what the readiness failure SAYS (OPEN-BUGS #5) --------------------------
+
+
+def test_a_readiness_failure_on_a_silent_container_still_states_a_reason(tmp_path):
+    """The bug: `f"{name} RIE never became ready:\\n{logs}"` with empty logs was
+    a dangling colon and a blank line. Measured on a REAL container (`docker run
+    -d alpine sleep 300`, nothing published, nothing logged) driving the REAL
+    `_await_ready` to a REAL timeout:
+
+        'odin-lambda-p1bprobe3-quiet RIE never became ready:\\n'
+
+    ...while `status` said `running`. The empty-logs half is replayed here; the
+    integration was proved against docker, not fabricated."""
+    runtime = FakeRuntime(log_text="")
+    rt = FunctionRuntime(runtime, root=tmp_path, ready_timeout=0.2, poll_interval=0.05)
+    with pytest.raises(RuntimeError) as raised:
+        rt.ensure(ENV, FN, "python3.12", "h.h", {}, tmp_path)
+    message = str(raised.value)
+    assert message == (
+        f"odin-lambda-{ENV}-{FN} RIE never became ready: nothing accepted a TCP connection "
+        "on its published port 8080 within 0.2s. Container: running. "
+        "It has logged nothing, so the container state above is the whole of it."
+    )
+    # The properties, independent of the wording: nothing trails off, and the
+    # two readings that are ALWAYS available are both in it.
+    assert not message.rstrip().endswith(":")
+    assert "running" in message and "0.2s" in message
+
+
+def test_a_readiness_failure_on_a_dead_container_reports_its_exit_code(tmp_path):
+    """The other branch, also measured for real (`sh -c 'echo bootstrap said
+    no; exit 5'` -> status `exited`, exit_code 5, logs `bootstrap said no`).
+    The exit code is reported ONLY here: a RUNNING container's is `0`, and
+    printing "exit code 0" under a failure sends the reader the wrong way."""
+    name = container_name(ENV, FN)
+    runtime = FakeRuntime(log_text="bootstrap said no", exit_codes={name: 5})
+    runtime.statuses[name] = "exited"
+    rt = FunctionRuntime(runtime, root=tmp_path, ready_timeout=0.2, poll_interval=0.05)
+    with pytest.raises(RuntimeError) as raised:
+        rt._await_ready(name)
+    message = str(raised.value)
+    assert "Container: exited, exit code 5." in message
+    assert message.endswith("Its logs:\nbootstrap said no")
+
+
+def test_a_running_container_is_never_reported_with_an_exit_code(tmp_path):
+    """`exit_code` on a live container is 0 -- the guard must not print it."""
+    runtime = FakeRuntime(log_text="")
+    rt = FunctionRuntime(runtime, root=tmp_path, ready_timeout=0.2, poll_interval=0.05)
+    with pytest.raises(RuntimeError) as raised:
+        rt.ensure(ENV, FN, "python3.12", "h.h", {}, tmp_path)
+    assert "exit code" not in str(raised.value)
 
 
 # --- invoke() ----------------------------------------------------------------

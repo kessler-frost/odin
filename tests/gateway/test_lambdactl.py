@@ -226,6 +226,59 @@ def test_create_function_without_zipfile_is_invalid_parameter(sink, lambda_, sto
     assert parsed["Error"]["Code"] == "InvalidParameterValueException"
 
 
+# --- malformed requests (OPEN-BUGS #7, the lambda half) ----------------------
+#
+# Called through `pure_answer` with a hand-built body rather than the `lambda_`
+# fixture, ON PURPOSE: `FunctionName` carries `min: 1` in botocore's own model,
+# so boto3 refuses to SEND this and the case cannot be expressed as a signed
+# capture. The gateway is a real HTTP server anything can post to.
+
+
+def _raw_create(stores, payload: dict, resource: str = "") -> Response:
+    response = lambdactl.pure_answer(
+        "lambda:CreateFunction", resource, ENV, json.dumps(payload).encode(),
+        stores, time.monotonic(), FakeFunctionRuntime(), {},
+    )
+    assert response is not None
+    return response
+
+
+def test_create_function_with_no_name_anywhere_is_refused_not_keyed_empty(stores):
+    """OPEN-BUGS #7: with neither a body `FunctionName` nor a URL resource this
+    minted the record `fn:` and the ARN `...:function:` -- a function deployed
+    for real that no later call can name, and therefore no later call can get,
+    update or delete."""
+    response = _raw_create(stores, {"Role": _ROLE_ARN, "Code": {"ZipFile": base64.b64encode(_ZIP_BYTES).decode()}})
+    assert response.status_code == 400
+    assert _parse("CreateFunction", response, error=True)["Error"]["Code"] == "InvalidParameterValueException"
+    # ...and no empty-keyed record was left behind.
+    assert stores.lambdactl.get(ENV, "fn:") is None
+    assert stores.lambdactl.items(ENV) == {}
+
+
+def test_create_function_still_falls_back_to_the_url_resource_for_its_name(stores):
+    """The guard refuses only when BOTH are absent -- the URL-resource fallback
+    is a real path and must keep working."""
+    response = _raw_create(
+        stores, {"Role": _ROLE_ARN, "Code": {"ZipFile": base64.b64encode(_ZIP_BYTES).decode()}}, resource="from-url",
+    )
+    assert response.status_code == 201
+    assert stores.lambdactl.get(ENV, "fn:from-url") is not None
+
+
+def test_a_not_found_for_a_request_that_named_no_function_does_not_trail_off(stores):
+    """The reader-side half: fifteen call sites pass the URL `resource`
+    straight into `_not_found`, and an empty one made the sentence trail off
+    INSIDE the ARN -- `Function not found: arn:aws:lambda:...:function:`."""
+    response = lambdactl.pure_answer(
+        "lambda:GetFunction", "", ENV, b"", stores, time.monotonic(), FakeFunctionRuntime(), {},
+    )
+    assert response.status_code == 404
+    message = _parse("GetFunction", response, error=True)["Error"]["Message"]
+    assert message == "Function not found: this request named no function"
+    assert not message.rstrip().endswith(":")
+
+
 def test_create_function_deploy_failure_lands_failed_with_reason(sink, lambda_, stores):
     substrate = FakeFunctionRuntime(fail_ensure=True)
     _create(stores, sink, lambda_, substrate)

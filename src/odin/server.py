@@ -499,12 +499,38 @@ _STORE_RECOVERY = {
         "tick (measured: a 4-resource env came back complete, with identical facts, one tick "
         "later). `odin tf plan --env {env}` works right now and reads none of it"
     ),
+    # Honesty rule 3, and the sharpest form of it yet: this text used to end
+    # "...otherwise `odin destroy --env {env}` tears the env down through the
+    # records that still parse, and a fresh Apply rebuilds it". Every clause of
+    # that was wrong, and MEASURED wrong on a real server (:5250, a real
+    # `gateway/lambdactl.json` holding one bad record):
+    #
+    #   POST /destroy?env=p1bctl  ->  500  {"status": "store_unreadable", ...}
+    #
+    # There is no "records that still parse" any more -- `_load` runs
+    # `records.validate` over the WHOLE file, so one bad record refuses all of
+    # it (and a decode error always did). And `destroy` does not survive that:
+    # `reclaim_env_instances` reads this very store, so the route raises before
+    # it tears anything down. Worst of all, the advice was printed BY the
+    # failing destroy, so `odin destroy` answered its own failure by
+    # recommending `odin destroy` -- the exact self-referential loop the
+    # comment above this dict says it fixed for `odin world`, reintroduced one
+    # role over.
+    #
+    # What replaces it is verified the same way: repairing the one named record
+    # and re-running the same POST answered 200, with no restart -- the store
+    # does not cache a failed load (`JsonStore._data` assigns only on success).
     store_mod.CONTROL: (
         "that file is the gateway's record of the AWS resources odin CREATED for this env -- what "
         "tofu's next refresh reads -- so do NOT delete it: odin would forget resources that really "
-        "exist and leave them orphaned. Restore it with `odin import <archive>` if you have an "
-        "`odin export` of this env; otherwise `odin destroy --env {env}` tears the env down through "
-        "the records that still parse, and a fresh Apply rebuilds it"
+        "exist and leave them orphaned. It is also all-or-nothing: odin validates the whole file on "
+        "each read, so a single bad record fails every gateway call for this env -- including "
+        "`odin destroy --env {env}`, which reads it too and stops on it rather than tearing "
+        "anything down. Restore it with `odin import <archive>` if you have an `odin export` of "
+        "this env. Otherwise repair it in place: it is plain JSON, the error above names the one "
+        "record that was rejected and what was wrong with it, and odin re-reads the file on the "
+        "next call -- no restart. Deleting just that entry works too, at the price of orphaning "
+        "whatever it described"
     ),
     store_mod.CREDENTIALS: (
         "that file holds the gateway credentials odin issued to this env's workloads. A fresh Apply "

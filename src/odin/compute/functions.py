@@ -198,7 +198,42 @@ class FunctionRuntime:
             if port and _tcp_open(port):
                 return port
             time.sleep(self._poll_interval)
-        raise RuntimeError(f"{name} RIE never became ready:\n{self._rt.logs(name)}")
+        raise RuntimeError(f"{name} RIE never became ready: {self._not_ready_reason(name)}")
+
+    def _not_ready_reason(self, name: str) -> str:
+        """WHY the wait ended, in a form that is never empty.
+
+        This message used to be `f"{name} RIE never became ready:\\n{logs}"`,
+        and `_ContainerRuntime.logs` answers `""` both for a container that
+        wrote nothing and for one the runtime could not read -- so the whole
+        explanation was a dangling colon and a blank line. Measured against a
+        REAL container (`docker run -d --name <fn> alpine sleep 300`, nothing
+        published on 8080, nothing logged), driving this real method to a real
+        timeout, it rendered exactly:
+
+            'odin-lambda-p1bprobe3-quiet RIE never became ready:\\n'
+
+        ...while `status` said `running` and `host_port` said `0` at that same
+        instant. Both were free to read and both were thrown away, which is the
+        actual defect: the logs were never the only witness, just the only one
+        anybody asked. So the reason now leads with the two readings that are
+        ALWAYS available -- how long odin waited, and what the container was
+        doing when it gave up -- and treats the log tail as the bonus it is.
+
+        The exit code is reported only for a container that is NOT running: a
+        live container's `{{.State.ExitCode}}` is `0` (verified on the same
+        probe), and "exit code 0" printed under a failure is the kind of true-
+        looking detail that sends a reader down the wrong path."""
+        status = self._rt.status(name)
+        state = status if status == "running" else f"{status}, exit code {self._rt.exit_code(name)}"
+        logs = self._rt.logs(name)
+        tail = f"Its logs:\n{logs}" if logs else (
+            "It has logged nothing, so the container state above is the whole of it."
+        )
+        return (
+            f"nothing accepted a TCP connection on its published port {_RIE_PORT} "
+            f"within {self._ready_timeout:g}s. Container: {state}. {tail}"
+        )
 
     def invoke(self, env: str, function_name: str, payload: bytes, timeout: float = 30.0) -> InvokeResult:
         """The data plane: forward `payload` bytes straight to the

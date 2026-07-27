@@ -449,6 +449,52 @@ def test_a_corrupt_desired_state_is_never_told_to_delete_the_file(tmp_path):
     assert "rm " not in error
 
 
+def test_the_control_recovery_never_recommends_the_command_that_just_failed(tmp_path):
+    """OPEN-BUGS #10, and the loop above reintroduced one role over.
+
+    The CONTROL advice used to end "...otherwise `odin destroy --env {env}`
+    tears the env down through the records that still parse". Measured on a real
+    server (:5250, a real `gateway/lambdactl.json` with one bad record):
+
+        POST /destroy?env=p1bctl  ->  500 {"status": "store_unreadable", ...}
+
+    ...with that sentence in its own body. `destroy` reads this store through
+    `reclaim_env_instances`, so it stops on it rather than tearing anything
+    down -- and `records.validate` refuses the WHOLE file for one bad record, so
+    there are no "records that still parse" either. The failing command was
+    recommending itself, which is exactly what
+    `test_a_corrupt_world_json_names_the_file_and_the_recovery_that_works`
+    exists to prevent for `odin world`."""
+    env = "ctlfix"
+    control = tmp_path / env / "gateway" / "lambdactl.json"
+    control.parent.mkdir(parents=True, exist_ok=True)
+    control.write_text('{"fn:one": "not-a-record"}')
+    app = _app(tmp_path)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        resp = client.post("/destroy", params={"env": env})
+    assert resp.status_code == 500, resp.text
+    body = resp.json()
+    assert body["status"] == "store_unreadable"
+    assert body["store"] == {"path": str(control), "role": "control"}
+    error = body["error"]
+    # The loop is gone. `odin destroy` is still NAMED -- a reader whose destroy
+    # just failed is owed the reason -- but only as something that fails too,
+    # never as the remedy, so the two mentions must stay adjacent.
+    assert f"including `odin destroy --env {env}`, which reads it too and stops on it" in error
+    assert f"otherwise `odin destroy --env {env}`" not in error
+    # ...and the claim that made it sound survivable is gone with it.
+    assert "records that still parse" not in error
+    # What replaced them is what was measured: all-or-nothing, and a repair that
+    # takes effect with no restart (verified live -- removing the named record
+    # made the identical POST answer 200 `destroyed`).
+    assert "do NOT delete it" in error
+    assert "a single bad record fails every gateway call for this env" in error
+    assert "no restart" in error
+    # ...and the error still names the offending record, which is what makes
+    # "repair it in place" actionable rather than a suggestion to guess.
+    assert "fn:one" in error
+
+
 def test_an_unmapped_store_role_states_that_rather_than_nothing(tmp_path, monkeypatch):
     """The `_DESTROY_STATUS` shape, applied to the advice: a role nobody mapped
     must not format an EMPTY instruction -- the one thing worse than no advice.
@@ -537,3 +583,36 @@ def test_a_good_keyfile_still_loads(tmp_path):
     reread._ensure_loaded("e")
 
     assert reread.lookup(written[0]) is not None
+
+
+def test_a_retry_after_an_unreadable_keyfile_does_not_destroy_the_credentials(tmp_path):
+    """The most natural response to a 500 is to try again — and that used to
+    wipe every credential odin had issued.
+
+    `_ensure_loaded` marked the env loaded BEFORE the read could raise, so the
+    second call returned early with `_by_env[env]` never set, and the next write
+    persisted a map containing only the new key. Measured: a file holding one
+    good pair and one malformed one came back holding only `__operator__`. Every
+    already-running workload that held one of the lost keys would then fail auth
+    with `InvalidClientTokenId` forever, with no record of the key it was using —
+    and the CREDENTIALS recovery advice ("restore it with `odin import`") pointed
+    at a file that had just been overwritten.
+
+    The guard is that a raise leaves the store untouched and stays consistent
+    across retries, which is what makes the advice actionable."""
+    (tmp_path / "e").mkdir()
+    keyfile = tmp_path / "e" / "keys.json"
+    original = json.dumps({"web": ["AKODINrealkey", "realsecret"], "bad": "not-a-pair"})
+    keyfile.write_text(original)
+
+    store = KeyStore(tmp_path)
+    for _ in range(3):
+        with pytest.raises(StoreUnreadable):
+            store._ensure_loaded("e")
+
+    assert keyfile.read_text() == original, "a retry rewrote the credential file"
+    # And issuing must not paper over it either: it loads first, so it fails the
+    # same way rather than persisting a map built from a load that never happened.
+    with pytest.raises(StoreUnreadable):
+        store.issue("e", "__operator__")
+    assert keyfile.read_text() == original

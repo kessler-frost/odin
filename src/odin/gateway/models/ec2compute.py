@@ -254,6 +254,31 @@ def _not_found_instance(instance_id: str) -> Response:
     return errors.synth_error("ec2", "InvalidInstanceID.NotFound", f"The instance ID '{instance_id}' does not exist", 400)
 
 
+def _missing_parameter(name: str) -> Response:
+    """EC2's own answer for a required parameter that isn't there -- the code
+    and the sentence real EC2 sends, so botocore/aws-sdk-go-v2 raise the
+    `ClientError` a caller can already branch on.
+
+    REFUSING is the decision, over recording the request and carrying the
+    defect forward, and the reason is that the two are not symmetric here.
+    Verified against botocore's own EC2 model (`ec2/2016-11-15/service-2.json`,
+    the model botocore validates real calls against):
+
+        ImportKeyPair            required = ['KeyName', 'PublicKeyMaterial']
+        DescribeInstanceAttribute required = ['InstanceId', 'Attribute']
+
+    -- real AWS refuses both, so refusing is also the higher-fidelity answer.
+    But the deciding argument is what ACCEPTING costs. A caller cannot act on a
+    record it never sees: the TF provider reads a 200 as "the key pair is
+    imported" and goes on to RunInstances, and the instance then boots for real
+    -- a live VM, the user's RAM and disk -- with an empty
+    `authorized_keys`. There is no later moment at which odin gets to mention
+    it, and no `ssh` failure that names this as the cause. A 400 arrives while
+    the caller is still in a position to do something about it, which is the
+    whole difference."""
+    return errors.synth_error("ec2", "MissingParameter", f"The request must contain the parameter {name}", 400)
+
+
 # --- security groups on the instance (field-test finding #2) ----------------
 
 
@@ -865,6 +890,26 @@ def _describe_instance_attribute(params: dict[str, str], env: str, stores: Synth
     if instance is None:
         return _not_found_instance(instance_id)
     attribute = params.get("Attribute", "")
+    # No `Attribute` used to fall through to the tail of this function and build
+    # `<><value>false</value></>` -- not a wrong answer but an unparseable one,
+    # which every XML client answers with a parse error naming a column number
+    # rather than the missing parameter. `Attribute` is required in botocore's
+    # own EC2 model, so this is also what real EC2 sends.
+    #
+    # `isalnum` covers the same hole from the other side: the attribute name is
+    # interpolated as an ELEMENT NAME, where `escape()` is no help (escaping
+    # would emit the literal text, not a tag), so `Attribute=<foo` produced the
+    # identical unparseable document. All 16 values of the model's
+    # `InstanceAttributeName` enum are alphanumeric (checked against the model,
+    # not assumed), so no real attribute is refused by this -- including the 12
+    # this module does not model, which keep their permissive default answer.
+    if not attribute:
+        return _missing_parameter("Attribute")
+    if not attribute.isalnum():
+        return errors.synth_error(
+            "ec2", "InvalidParameterValue",
+            f"Invalid value '{attribute}' for Attribute: it is not the name of an instance attribute", 400,
+        )
     if attribute == "userData":
         value = instance.get("user_data_b64", "")
         # An empty `<value></value>` (rather than omitting `<value>`
@@ -931,9 +976,19 @@ def _store_keypair(stores: SynthStores, env: str, params: dict[str, str], name: 
 
 def _import_key_pair(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     name = params.get("KeyName", "")
+    if not name:
+        return _missing_parameter("KeyName")
     if _keypair(stores, env, name) is not None:
         return errors.synth_error("ec2", "InvalidKeyPair.Duplicate", f"The keypair '{name}' already exists.", 400)
+    # The guard reads the DECODED key, not the presence of the parameter --
+    # `b64decode` ignores non-alphabet characters by default, so a
+    # `PublicKeyMaterial` that is present but junk decodes to `b""` and used to
+    # reach the store exactly like an absent one. Checking the parameter would
+    # be a guard on a signal that isn't the one that matters (honesty rule 1);
+    # the empty key is what an instance would have booted with.
     public_key = base64.b64decode(params.get("PublicKeyMaterial", "")).decode("utf-8", "replace").strip()
+    if not public_key:
+        return _missing_parameter("PublicKeyMaterial")
     record = _store_keypair(stores, env, params, name, public_key)
     tags = _res_tags(stores, env, record["key_pair_id"])
     inner = (
@@ -945,6 +1000,12 @@ def _import_key_pair(params: dict[str, str], env: str, stores: SynthStores, now:
 
 def _create_key_pair(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     name = params.get("KeyName", "")
+    # The sibling of ImportKeyPair's own guard, hunted rather than waited for
+    # (honesty rule 2: fix the shape). `CreateKeyPair` requires `KeyName` in the
+    # same botocore model, and without this it minted a real key pair under the
+    # empty-string name -- the `keypair:` record of OPEN-BUGS #7's family.
+    if not name:
+        return _missing_parameter("KeyName")
     if _keypair(stores, env, name) is not None:
         return errors.synth_error("ec2", "InvalidKeyPair.Duplicate", f"The keypair '{name}' already exists.", 400)
     public_key, private_key = _generate_keypair()

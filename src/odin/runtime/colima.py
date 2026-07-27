@@ -202,6 +202,44 @@ class _Proc:
     stderr: str = ""
 
 
+# `exc_text`'s sibling, for the other half of "something failed and here is why":
+# a SUBPROCESS that failed. `exc_text` cannot serve this one -- it treats an
+# EMPTY `str(exc)`, and these strings were never empty, they were VACUOUS. The
+# text `f"{CLI} {label} failed: {proc.stderr.strip()}"` renders
+#
+#     docker run x failed:
+#
+# a sentence whose reason slot is a dangling colon. Probed against the REAL
+# docker on this machine (28.4.0 / Colima), not reasoned about -- three real
+# commands that exit non-zero having written nothing to stderr:
+#
+#     docker exec <c> sh -c 'exit 1'                rc=1  stderr=''  stdout=''
+#     docker exec <c> sh -c 'echo on-stdout; exit 7' rc=7 stderr=''  stdout='on-stdout\n'
+#     docker run --rm alpine sh -c 'exit 3'         rc=3  stderr=''  stdout=''
+#
+# All three rendered `docker exec failed: ` / `docker run failed: `. So the exit
+# code -- 1, 7, 3, the one fact that WAS there every time -- was dropped, and
+# case two shows the reason can be on STDOUT: `_cli` keeps only stdout on
+# success and only stderr on failure, so a command that explains itself on the
+# wrong stream explained itself to nobody.
+#
+# What this states instead: the exit code always (it exists by construction --
+# we are here BECAUSE it was non-zero), then stderr, then stdout if that is
+# where the process spoke, and otherwise the fact that it said nothing at all --
+# which is a real answer, not an absence. `_command_label` still supplies the
+# COMMAND, and still deliberately omits the argv (it carries workload secrets --
+# see that function).
+_NO_OUTPUT = "it wrote nothing to stderr or stdout, so the exit code is the whole of it"
+
+
+def _failure_reason(proc: _Proc) -> str:
+    """WHY a container-CLI command failed, in a form that is never empty."""
+    stdout = proc.stdout.strip()
+    return proc.stderr.strip() or (
+        f"nothing on stderr; on stdout: {stdout}" if stdout else _NO_OUTPUT
+    )
+
+
 def _default_runner(args: list[str], input: str | None = None) -> _Proc:
     # `run_command`, so a machine with no `docker` CLI on PATH (Homebrew's
     # colima formula does NOT bring one) yields rc 127 -- which `_cli` turns
@@ -233,7 +271,10 @@ class _ContainerRuntime:
     def _cli(self, *args: str, check: bool = True, input: str | None = None) -> str:
         proc = self._run(self._argv(*args), input=input)
         if check and proc.returncode != 0:
-            raise RuntimeError(f"{self.CLI} {_command_label(args)} failed: {proc.stderr.strip()}")
+            raise RuntimeError(
+                f"{self.CLI} {_command_label(args)} failed "
+                f"(exit {proc.returncode}): {_failure_reason(proc)}"
+            )
         return proc.stdout.strip()
 
     def _run_flags(self) -> list[str]:
@@ -355,8 +396,8 @@ class _ContainerRuntime:
         proc = self._run(self._argv("inspect", "-f", "{{json .NetworkSettings.Ports}}", name))
         if proc.returncode != 0:
             raise PortUnreadable(
-                f"{self.CLI} cannot read {name}'s published ports: "
-                f"{proc.stderr.strip() or 'no output'}"
+                f"{self.CLI} cannot read {name}'s published ports "
+                f"(exit {proc.returncode}): {_failure_reason(proc)}"
             )
         bindings = json.loads(proc.stdout.strip() or "{}") or {}
         published = bindings.get(f"{container_port}/tcp") or []
