@@ -319,3 +319,44 @@ def test_apply_json_emits_an_error_body_from_the_canvas_fetch_too(runner):
 
     assert result.exit_code == 1
     assert json.loads(result.stdout) == refused
+
+
+@respx.mock
+def test_apply_shows_the_recorded_reason_when_tofu_could_only_say_unexpected_state(runner):
+    """Field test 6 F4's other half. tofu describes a failed RDS as an unexpected
+    state (`last error: %!s(<nil>)` — the provider's own output, not odin's), while
+    odin's records hold the real reason. The server publishes it in
+    `unhealthy_resources`; text mode rendered nothing at all, so the reason reached
+    JSON readers only — and a CI log is text."""
+    body = {
+        "status": "applied_tf_failed", "env": "default", "rev": "abc123",
+        "unhealthy_resources": [{
+            "kind": "rds", "node": "app-db", "observed": "failed",
+            "reason": "Postgres never became ready: connection refused",
+        }],
+    }
+    respx.post(f"{BASE}/apply-full").mock(return_value=httpx.Response(200, json=body))
+    respx.get(f"{BASE}/canvas").mock(return_value=httpx.Response(200, json={"nodes": [], "edges": []}))
+
+    result = runner.invoke(app, ["apply"])
+
+    assert "unhealthy: rds app-db is failed" in result.stdout
+    assert "Postgres never became ready: connection refused" in result.stdout
+
+
+@respx.mock
+def test_apply_says_so_when_a_resource_carries_no_recorded_reason(runner):
+    """A verdict must never render as an empty tail. `reason` is `str | None`, and
+    dropping it silently made "unhealthy: rds app-db is failed" the whole answer
+    with no hint that the reason was missing rather than empty."""
+    body = {
+        "status": "applied_tf_failed", "env": "default", "rev": "abc123",
+        "unhealthy_resources": [{"kind": "rds", "node": "app-db", "observed": "failed", "reason": None}],
+    }
+    respx.post(f"{BASE}/apply-full").mock(return_value=httpx.Response(200, json=body))
+    respx.get(f"{BASE}/canvas").mock(return_value=httpx.Response(200, json={"nodes": [], "edges": []}))
+
+    result = runner.invoke(app, ["apply"])
+
+    assert "no reason recorded" in result.stdout
+    assert "None" not in result.stdout

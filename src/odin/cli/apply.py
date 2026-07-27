@@ -49,6 +49,20 @@ def _echo_unhealthy(item: dict) -> None:
     typer.echo(f"unhealthy: {item['node']} — {item['running']}/{item['desired']} tasks running{reason}")
 
 
+def _echo_unhealthy_resource(item: dict) -> None:
+    """`unhealthy_resources` is a different shape from `unhealthy` above (which is
+    ECS-only: running/desired tasks), so it needs its own line rather than being
+    squeezed into that one.
+
+    It exists because tofu can only describe a failed RDS or Lambda as an
+    unexpected state -- famously as `last error: %!s(<nil>)`, which is the
+    provider's own output and not something odin can rewrite. odin's records DO
+    hold the real reason, and this is the surface a CI log actually shows: text
+    mode rendered nothing at all here, so the reason reached JSON readers only."""
+    reason = f" — {item['reason']}" if item.get("reason") else " (no reason recorded; observed status only)"
+    typer.echo(f"unhealthy: {item.get('kind', '?')} {item['node']} is {item['observed']}{reason}")
+
+
 def _render_apply(body: dict) -> None:
     typer.echo(f"status: {body['status']}  env: {body['env']}  rev: {body.get('rev') or '-'}")
     for key in ("skipped", "unsupported"):
@@ -59,6 +73,8 @@ def _render_apply(body: dict) -> None:
         _echo_tf(body["tf"])
     for item in body.get("unhealthy") or []:
         _echo_unhealthy(item)
+    for item in body.get("unhealthy_resources") or []:
+        _echo_unhealthy_resource(item)
     if body.get("note"):
         typer.echo(f"note: {body['note']}")
 
