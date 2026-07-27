@@ -484,9 +484,9 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
       const type = nodeTypeMap[abbr];
       if (!type || !defaultDataForType[type]) return;
 
-      const position = screenToFlowPosition({ x: event.clientX, y: event.clientY });
-      position.x = Math.round(position.x / 20) * 20;
-      position.y = Math.round(position.y / 20) * 20;
+      const position = centredOn(
+        screenToFlowPosition({ x: event.clientX, y: event.clientY }), type,
+      );
       setNodes((nds) => {
         // Keep labels unique — the registry keys on `{type}_{label}`, so two
         // nodes of a type with the same default label would otherwise collide.
@@ -514,15 +514,38 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
   );
 
   const dblClickTypeRef = useRef(0);
-  const typeOrder = ['s3', 'sqs', 'dynamodb', 'rds', 'vpc', 'subnet', 'sg', 'ec2', 'lambda'];
+  // A drop/click point is where the CURSOR is, and `screenToFlowPosition` returns
+// exactly that -- but ReactFlow reads `position` as the node's TOP-LEFT corner.
+// Using it raw put every new node down and to the RIGHT of the cursor by half
+// its own size, which reads as "it didn't land where I dropped it".
+// Centring is the right correction rather than preserving the grab offset,
+// because the thing being dragged is a small palette TILE, not the node, so an
+// offset inside the tile has no meaningful mapping onto a 200px node.
+// Heights are content-derived for leaf nodes now (40 + 20*rows), so the
+// declared height is used when there is one (vpc/subnet) and a 60px middle of
+// the leaf range otherwise -- half a row out is invisible, half a node is not.
+const CENTRED_FALLBACK = { width: 200, height: 60 };
+
+function centredOn(point: { x: number; y: number }, type: string) {
+  const style = (defaultStyleForType[type] ?? {}) as { width?: number; height?: number };
+  const width = typeof style.width === 'number' ? style.width : CENTRED_FALLBACK.width;
+  const height = typeof style.height === 'number' ? style.height : CENTRED_FALLBACK.height;
+  // Snap AFTER centring, so the node still lands on the 20px grid.
+  return {
+    x: Math.round((point.x - width / 2) / 20) * 20,
+    y: Math.round((point.y - height / 2) / 20) * 20,
+  };
+}
+
+const typeOrder = ['s3', 'sqs', 'dynamodb', 'rds', 'vpc', 'subnet', 'sg', 'ec2', 'lambda'];
 
   const onPaneDoubleClick = useCallback(
     (event: React.MouseEvent) => {
       const type = typeOrder[dblClickTypeRef.current % typeOrder.length];
       dblClickTypeRef.current++;
-      const position = screenToFlowPosition({ x: event.clientX, y: event.clientY });
-      position.x = Math.round(position.x / 20) * 20;
-      position.y = Math.round(position.y / 20) * 20;
+      const position = centredOn(
+        screenToFlowPosition({ x: event.clientX, y: event.clientY }), type,
+      );
       setNodes((nds) => {
         // Keep labels unique — the registry keys on `{type}_{label}`, so two
         // nodes of a type with the same default label would otherwise collide.
