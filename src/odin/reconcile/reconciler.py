@@ -344,7 +344,8 @@ class Reconciler:
         return LoopHealth(
             env=self._env,
             ticking=reason is None,
-            verdict=None if reason is None else await self._verdict(reason, age),
+            # `_verdict` is a pure string builder (sync) -- no await.
+            verdict=None if reason is None else self._verdict(reason, age),
             last_tick_seconds_ago=None if self._last_ok is None else round(time.monotonic() - self._last_ok, 2),
             last_tick_seconds=None if self._last_tick_seconds is None else round(self._last_tick_seconds, 3),
             ticks=self._ticks,

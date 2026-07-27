@@ -116,10 +116,7 @@ def test_the_allowlist_has_no_stale_entries():
 # extremely common. A checker that flags both is noise, and a static check that
 # cries wolf two times in three is one people learn to ignore -- which is worse
 # than not having it.
-ASYNC_WITH_ALLOWED: dict[str, str] = {
-    "server.py": "v0.7.7 stage C, owner dethread-control-src: `async with await "
-                 "serve_on_loop(...)` — delete the await, keep the async with.",
-}
+ASYNC_WITH_ALLOWED: dict[str, str] = {}
 
 
 def _async_with_offenders() -> list[tuple[str, int]]:

@@ -58,8 +58,6 @@ BLOCKING = {
 # Delete an entry when you fix it; do NOT add one to make a new failure go away
 # without an owner and a reason.
 ALLOWED: dict[tuple[str, str, str], str] = {
-    ("compute/instances.py", "_discover_ip", "time.sleep"):
-        "v0.7.7 stage C, owner dethread-control-src: becomes await asyncio.sleep.",
     ("aws/rds.py", "set_password", "psycopg2.connect"):
         "v0.7.7 stage E: psycopg2 has no async API; the fix is the psycopg v3 "
         "AsyncConnection swap, which is a driver change and deliberately not "
@@ -164,20 +162,7 @@ def test_the_allowlist_has_no_stale_entries():
 # is a net, not a proof -- an oddly-named lock slips through.
 LOCKISH = ("lock", "guard", "mutex", "semaphore")
 
-THREAD_LOCK_ALLOWED: dict[tuple[str, int], str] = {
-    ("fabric/nebula.py", 745): "v0.7.7 stage D, owner dethread-control-src: "
-                               "`_lock_for_dir` is a threading.Lock held across "
-                               "awaits at 750-751. DEADLOCK, not a stall.",
-    ("compute/instances.py", 458): "v0.7.7 stage D, owner dethread-control-src. "
-                                   "THE WORST INSTANCE: a threading.Semaphore "
-                                   "held across `await self._lima(create/start)` "
-                                   "-- a VM boot, MINUTES long. The semaphore "
-                                   "exists to bound concurrent boots, so it is "
-                                   "contended BY DESIGN; the second task blocks "
-                                   "the whole loop for the length of a VM boot.",
-    ("compute/instances.py", 737): "v0.7.7 stage D, owner dethread-control-src: "
-                                   "the same semaphore across `_lima start`.",
-}
+THREAD_LOCK_ALLOWED: dict[tuple[str, int], str] = {}
 
 
 def _thread_locks_across_awaits() -> list[tuple[str, int, str]]:
