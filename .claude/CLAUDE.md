@@ -310,6 +310,16 @@ Hard-won mechanics. Ignoring these has already destroyed work in this repo.
   worktree that combination swept 24 of another agent's staged files into an
   unrelated commit. Commit with explicit pathspecs and read `git show --stat`
   before trusting it.
+- **A base check DECAYS — re-check it, don't establish it once.** An agent
+  correctly verified its worktree base at task start, worked for hours, and
+  reported a breakage list measured 8 commits behind the tip; every diagnosis
+  in it was right and every one was already fixed. Its own summary is the rule:
+  *"my error wasn't failing to know about staleness — it was that I did check,
+  got a clean answer, and never re-checked across a multi-hour session in a
+  worktree that had moved under me twice."* Re-run `git log --oneline -1`
+  against the main checkout immediately BEFORE reporting, not only before
+  starting. Being right about a cause while wrong about whether it is still
+  live costs a reviewer's attention as surely as being wrong.
 - **"I read it" needs a "when."** With many agents in flight, one read
   `catalog.ts` before a commit landed and another after, and they reported
   contradictory states — both honestly. Timestamp claims about the tree.
