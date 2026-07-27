@@ -122,8 +122,9 @@ def _logs_reader(store: SpecStore, stores: SynthStores, runtime, env: str):
     `limactl`)", and that is the one thing it is NOT for -- probed, on a PATH
     with no `docker` at all: `ColimaRuntime.status` returns `'absent'` and
     `.logs` returns `''`, because every driver read is `check=False` and
-    `util.run_command` turns a missing binary into rc 127 rather than an
-    exception. Nothing raises. What DOES reach here is a corrupt
+    `util.run_command_async` turns a missing binary into rc 127 rather than an
+    exception (v0.7.7 renamed the seam; the contract is unchanged and pinned in
+    `tests/test_util.py`). Nothing raises. What DOES reach here is a corrupt
     `.odin/<env>/gateway/<name>.json` (`JSONDecodeError` out of
     `gateway/stores.py::_data`) -- and swallowing it is right HERE, unlike in
     `GET /logs`: the diagnosis has the Stack, the World and the event log to
@@ -132,7 +133,9 @@ def _logs_reader(store: SpecStore, stores: SynthStores, runtime, env: str):
 
     async def read(node: str) -> str:
         try:
-            return await fetch_logs(store, stores, runtime, env, node, tail=debugger.MAX_LOG_LINES).lines
+            # Parenthesised: `await f(...).lines` binds as `await (f(...).lines)`,
+            # which reads `.lines` off the COROUTINE and raises AttributeError.
+            return (await fetch_logs(store, stores, runtime, env, node, tail=debugger.MAX_LOG_LINES)).lines
         except Exception:
             log.exception("could not read logs for node %s in env %s (continuing without them)", node, env)
             return ""
@@ -180,18 +183,19 @@ def issued_credentials(root: Path, env: str) -> frozenset[str]:
     return frozenset(value for pair in pairs.values() for value in pair if value)
 
 
-def build_context(
+async def build_context(
     store: SpecStore, stores: SynthStores, runtime, ws_manager: ConnectionManager, env: str, node_ids: list[str],
 ) -> dict:
     """Everything the model gets, assembled from real state: the desired Stack,
     the observed World, the env's durable event log, and each node's real log
-    tail. Blocking (the log reads shell out), so the route runs it off the
-    event loop. Exposed as its own function because it's also the part an
-    integration test can assert on WITHOUT needing the SDK at all."""
+    tail. The log reads shell out, which v0.7.7 made natively async (they were
+    pushed off the loop with a thread before), so this is a coroutine and the
+    route simply awaits it. Exposed as its own function because it's also the
+    part an integration test can assert on WITHOUT needing the SDK at all."""
     stack = store.get_stack(env)
     world = store.current_world(env)
     events = ws_manager.get_events(env)
-    return debugger.assemble_context(
+    return await debugger.assemble_context(
         stack, world, events, _logs_reader(store, stores, runtime, env), node_ids,
         extra_secrets=issued_credentials(store.root, env),
     )

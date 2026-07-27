@@ -311,9 +311,9 @@ async def fetch_logs(
         # and the sentence contradicted itself. Both are worth showing (a
         # disagreement between them IS the diagnosis), neither may be printed
         # as if it were the other's answer.
-        state = vm.status(name)
+        state = await vm.status(name)
         running = state == "running"
-        lines = vm.logs(name, tail) if state != "absent" else ""
+        lines = await vm.logs(name, tail) if state != "absent" else ""
         message = None if running else (
             f"{name} is not running (VM state: {state}; odin's record says {instance['state_name']})"
         )

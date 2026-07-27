@@ -50,13 +50,19 @@ def _pg_connect(host: str, port: int, user: str, password: str, db: str) -> bool
 
 
 def pg_ready_sync(host: str, port: int, user: str, password: str, db: str = "postgres") -> PgReady:
-    """The blocking form -- W2.7's callers are all already off the event loop:
-    `gateway/models/rdsctl.py`'s create waiter runs on its own daemon thread
-    (the same shape every other substrate-booting gateway model uses), and
-    `reconcile/drift.py`'s reality sweep runs inside `asyncio.to_thread`.
-    THIS is the assertion that gates an `aws_db_instance` reaching
-    `available`, so a Postgres that boots but never accepts connections fails
-    the apply instead of being reported up."""
+    """The blocking form. THIS is the assertion that gates an
+    `aws_db_instance` reaching `available`, so a Postgres that boots but never
+    accepts connections fails the apply instead of being reported up.
+
+    KNOWN BLOCKING BOUNDARY (v0.7.7, left deliberately visible). psycopg2 has
+    no async API, so this call blocks whatever thread -- or, now, whatever
+    EVENT LOOP -- it runs on, for up to `connect_timeout=3` seconds. The
+    de-threading pass removed the threads that used to keep it off the loop
+    (`asyncio.to_thread` in the drift sweep, the rdsctl daemon thread), so
+    `pg_ready` below now blocks the shared control loop for real. The fix is
+    the psycopg v3 `AsyncConnection` swap, which is a separate, riskier stage;
+    naming the limit here beats hiding it behind a thread pool that the owner
+    directive rules out anyway."""
     try:
         return PgReady(ok=_pg_connect(host, port, user, password, db))
     except Exception as exc:
@@ -64,7 +70,12 @@ def pg_ready_sync(host: str, port: int, user: str, password: str, db: str = "pos
 
 
 async def pg_ready(host: str, port: int, user: str, password: str, db: str = "postgres") -> PgReady:
-    return await pg_ready_sync(host, port, user, password, db)
+    """The coroutine form callers await. NOT `await pg_ready_sync(...)` --
+    that awaited a plain `PgReady` dataclass and raised
+    `TypeError: object PgReady can't be used in 'await' expression` on every
+    single call. See `pg_ready_sync` for the psycopg2 blocking boundary this
+    inherits."""
+    return pg_ready_sync(host, port, user, password, db)
 
 
 @dataclass(frozen=True)

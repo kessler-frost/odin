@@ -2136,7 +2136,11 @@ def create_app(
         return {
             "ok": True,
             "gateway": {"port": gateway_port_actual},
-            "reconcilers": [await reconciler.health().model_dump() for reconciler in reconcilers.values()],
+            # Parenthesised: `await r.health().model_dump()` binds as
+            # `await (r.health().model_dump())`, i.e. `.model_dump()` on the
+            # COROUTINE -- an AttributeError on every /health call, which is
+            # the endpoint `odin start`'s readiness wait polls.
+            "reconcilers": [(await reconciler.health()).model_dump() for reconciler in reconcilers.values()],
         }
 
     app.state.store = _store

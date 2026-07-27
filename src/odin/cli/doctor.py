@@ -7,10 +7,35 @@ subprocess-runner callable (fakeable in tests — the same runner seam
 `ColimaRuntime` already exposes) and returns typed `CheckResult`s. The Typer
 command renders them (✓/✗/○) and exits 1 only when a REQUIRED check fails;
 optional tooling never blocks.
+
+v0.7.7 — WHY THIS FILE HAS AN `asyncio.run` BRIDGE AND NOT AN ASYNC COMMAND.
+`odin doctor` is a synchronous CLI command and stays one. The de-threading
+pass made the container-runtime driver fully async, and doctor reaches it
+through `ColimaRuntime(runner=…)` for two of its checks (`memory` calls
+`ensure_host`, `dynalite-image` calls `image_exists`), so `run_checks` had to
+become a coroutine to keep using that ONE runner seam — the property this
+module's whole fake-ability rests on. The alternative, re-implementing
+`docker info` / `docker image inspect` locally to stay sync, would have
+duplicated the driver and let doctor drift from what an Apply really does,
+which is the exact defect LOW-14/LOW-15 already recorded here.
+
+So the async stops at the command boundary: `doctor()` is a plain `def` that
+calls `asyncio.run(...)`. That is legitimate and thread-free — a CLI process
+owns its loop, and there is no outer loop to nest inside.
+
+MEASURED, not assumed: the previous stage left this as `async def doctor(...)`,
+and **Typer 0.26.7 does not await async commands**. Probed with
+`CliRunner().invoke` on a minimal async command: exit_code 0, empty stdout,
+body never executed, `RuntimeWarning: coroutine 'hello' was never awaited`.
+`odin doctor` was therefore exiting 0 while running ZERO checks and printing
+nothing — a false green in the one tool whose entire job is to report that a
+prerequisite is missing. Do not turn these back into `async def` commands
+without re-probing that.
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+import asyncio
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -24,7 +49,7 @@ from odin.cli.app import app
 from odin.reconcile.admission import check_admission, default_min_disk_gib
 from odin.runtime.colima import ColimaRuntime
 from odin.spec.models import Stack
-from odin.util import run_command
+from odin.util import run_command_async
 
 # Both live-resource checks are READ-ONLY over `reconcile/admission.py` -- the
 # module that can actually hard-fail an Apply -- rather than second guesses at
@@ -41,9 +66,11 @@ class Proc(Protocol):
     stderr: str
 
 
-# run(args, input=None) -> Proc — the exact seam ColimaRuntime(runner=…) takes,
-# so ONE fake covers both the `which`/`colima status` calls and docker lookups.
-Runner = Callable[..., Proc]
+# run(args, input=None) -> awaitable Proc — the exact seam
+# ColimaRuntime(runner=…) takes, so ONE fake covers both the `which`/`colima
+# status` calls and the docker lookups the driver makes. Async since v0.7.7,
+# because that seam is (see the module docstring).
+Runner = Callable[..., Awaitable[Proc]]
 
 
 @dataclass(frozen=True)
@@ -115,31 +142,37 @@ ALL_CHECKS: tuple[str, ...] = (
 )
 
 
-def _subprocess_run(args: list[str], input: str | None = None) -> Proc:
-    """The runner every check goes through -- `util.run_command`, so a tool
-    that isn't installed comes back as rc 127 rather than raising. A doctor
-    that can crash on a missing binary is a doctor that reports nothing on the
-    machines that need it most (BLOCK-2: no `docker` -> traceback, zero rows)."""
-    return run_command(args, input=input)
+async def _subprocess_run(args: list[str], input: str | None = None) -> Proc:
+    """The runner every check goes through -- `util.run_command_async`, so a
+    tool that isn't installed comes back as rc 127 rather than raising. A
+    doctor that can crash on a missing binary is a doctor that reports nothing
+    on the machines that need it most (BLOCK-2: no `docker` -> traceback, zero
+    rows).
+
+    The rc-127 contract is IDENTICAL to the sync `run_command`'s and is pinned
+    for both twins in `tests/test_util.py` -- `create_subprocess_exec` raises
+    `FileNotFoundError` at creation for an absent binary exactly as
+    `subprocess.run` does, and the same guard turns it into a result."""
+    return await run_command_async(args, input=input)
 
 
-def _which(run: Runner, tool: str) -> str:
-    proc = run(["which", tool])
+async def _which(run: Runner, tool: str) -> str:
+    proc = await run(["which", tool])
     return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
-def _check_tool(run: Runner, name: str, required: bool, fix: str, when_optional: str) -> CheckResult:
-    path = _which(run, name)
+async def _check_tool(run: Runner, name: str, required: bool, fix: str, when_optional: str) -> CheckResult:
+    path = await _which(run, name)
     status = "ok" if path else ("fail" if required else "skip")
     absent = "not found on PATH" + (f" -- {when_optional}" if when_optional else "")
     return CheckResult(name, status, required, path or absent, "" if path else fix)
 
 
-def _check_colima(run: Runner) -> CheckResult:
-    path = _which(run, "colima")
+async def _check_colima(run: Runner) -> CheckResult:
+    path = await _which(run, "colima")
     if not path:
         return CheckResult("colima", "fail", True, "not found on PATH", "brew install colima")
-    proc = run(["colima", "status"])
+    proc = await run(["colima", "status"])
     if proc.returncode != 0:
         # Colima's OWN last line, when it said anything. "dependency check
         # failed for VM: lima not found" is a different problem from "not
@@ -152,7 +185,9 @@ def _check_colima(run: Runner) -> CheckResult:
     return CheckResult("colima", "ok", True, f"{path} — running")
 
 
-def _check_disk(root: Path) -> CheckResult:
+async def _check_disk(root: Path) -> CheckResult:
+    # Async only so the dispatch table in `run_checks` is uniform -- there is
+    # no I/O to await here; `disk_usage` is a single `statvfs`.
     free_gib = disk_usage(root).free / 2**30
     floor = default_min_disk_gib()  # the SAME number admission rejects an Apply on
     ok = free_gib > floor
@@ -164,7 +199,7 @@ def _check_disk(root: Path) -> CheckResult:
     )
 
 
-def _check_memory(run: Runner, root: Path) -> CheckResult:
+async def _check_memory(run: Runner, root: Path) -> CheckResult:
     """The admission budget, straight from `check_admission` itself (an empty
     Stack, so this is a pure read): the number an Apply is rejected against.
 
@@ -174,14 +209,14 @@ def _check_memory(run: Runner, root: Path) -> CheckResult:
     # BLOCK-2: no docker CLI = nothing to ask, and `colima start` is the wrong
     # remedy for it. Named as its own answer rather than collapsed into the
     # daemon-is-silent one, which sends the user off to start a running Colima.
-    if not _which(run, "docker"):
+    if not await _which(run, "docker"):
         return CheckResult(
             "memory", "skip", False,
             "unknown -- there is no `docker` CLI on PATH to ask for a memory total, so "
             "Apply's memory admission check is skipped entirely (see the docker row)",
             "brew install docker",
         )
-    host = ColimaRuntime(runner=run).ensure_host()
+    host = await ColimaRuntime(runner=run).ensure_host()
     budget_mib = check_admission(Stack(), host, root).budget_mib
     known = budget_mib > 0
     detail = (
@@ -196,10 +231,12 @@ def _check_memory(run: Runner, root: Path) -> CheckResult:
                        "" if known else "colima start")
 
 
-def _check_dynalite_image(run: Runner) -> CheckResult:
+async def _check_dynalite_image(run: Runner) -> CheckResult:
     # Guard on the docker CLI first: without it there's no daemon to ask, and
     # the note below (skip + the prebake offer) is still the right answer.
-    present = bool(_which(run, "docker")) and ColimaRuntime(runner=run).image_exists(DYNALITE_IMAGE)
+    # Two statements rather than one `and` chain: `await` short-circuits fine,
+    # but keeping the driver call on its own line makes the guard readable.
+    present = bool(await _which(run, "docker")) and await ColimaRuntime(runner=run).image_exists(DYNALITE_IMAGE)
     detail = f"{DYNALITE_IMAGE} " + (
         "present" if present
         else "absent — first Apply with DynamoDB will build it (one-time npm install)"
@@ -208,12 +245,18 @@ def _check_dynalite_image(run: Runner) -> CheckResult:
                        "" if present else "odin doctor --prebake")
 
 
-def run_checks(which: Iterable[str], run: Runner, disk_path: Path | None = None) -> list[CheckResult]:
+async def run_checks(which: Iterable[str], run: Runner, disk_path: Path | None = None) -> list[CheckResult]:
     """Run the named checks through `run` (the subprocess seam); results come
     back in the order asked. `disk_path` defaults to the current directory —
-    the volume Odin's images, containers, and `.odin/` state land on."""
+    the volume Odin's images, containers, and `.odin/` state land on.
+
+    Sequential on purpose. These are cheap `which` calls and two docker reads,
+    and running them in order keeps the rendered table deterministic; there is
+    nothing here worth a `TaskGroup`."""
     root = disk_path or Path.cwd()
-    checks: dict[str, Callable[[], CheckResult]] = {
+    # `partial`, never `lambda`: a `lambda` cannot contain `await`, and these
+    # entries are coroutine FUNCTIONS that the loop below calls and awaits.
+    checks: dict[str, Callable[[], Awaitable[CheckResult]]] = {
         "colima": partial(_check_colima, run),
         "disk": partial(_check_disk, root),
         "memory": partial(_check_memory, run, root),
@@ -221,14 +264,17 @@ def run_checks(which: Iterable[str], run: Runner, disk_path: Path | None = None)
     }
     checks.update({name: partial(_check_tool, run, name, required, fix, when_optional)
                    for name, required, fix, when_optional in _TOOLS})
-    return [checks[name]() for name in which]
+    results: list[CheckResult] = []
+    for name in which:
+        results.append(await checks[name]())
+    return results
 
 
 _ICONS = {"ok": "✓", "fail": "✗", "skip": "○"}
 
 
 async def _prebake() -> None:
-    if not _which(_subprocess_run, "docker"):
+    if not await _which(_subprocess_run, "docker"):
         typer.echo("docker not found on PATH — there is nothing to build the image with.")
         typer.echo("fix: brew install docker")
         raise typer.Exit(1)
@@ -236,12 +282,12 @@ async def _prebake() -> None:
     present = await runtime.image_exists(DYNALITE_IMAGE)
     state = "present" if present else "absent — building now (one-time npm install)"
     typer.echo(f"before: {DYNALITE_IMAGE} {state}")
-    BackingAws(runtime).ensure_dynalite_image()
+    await BackingAws(runtime).ensure_dynalite_image()
     typer.echo(f"after:  {DYNALITE_IMAGE} present ({'already there' if present else 'just built'})")
 
 
 @app.command()
-async def doctor(
+def doctor(
     prebake: bool = typer.Option(
         False, "--prebake",
         help=f"Build the {DYNALITE_IMAGE} image now (a one-time npm install inside a "
@@ -250,10 +296,13 @@ async def doctor(
     ),
 ) -> None:
     """Preflight: verify this machine has everything Odin needs to run."""
+    # The whole async boundary of this command, in two calls. See the module
+    # docstring: Typer does NOT await an `async def` command, so the bridge has
+    # to be here, inside a sync command body.
     if prebake:
-        await _prebake()
+        asyncio.run(_prebake())
         return
-    results = run_checks(ALL_CHECKS, _subprocess_run)
+    results = asyncio.run(run_checks(ALL_CHECKS, _subprocess_run))
     for result in results:
         typer.echo(f" {_ICONS[result.status]} {result.name:<15} {result.detail}")
         if result.fix:

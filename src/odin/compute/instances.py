@@ -93,11 +93,11 @@ id, same address.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import tempfile
-import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -116,7 +116,7 @@ from odin.fabric.nebula import (
     rehandshake_script,
 )
 from odin.runtime.colima import _failure_reason
-from odin.util import atomic_write_text, run_command
+from odin.util import atomic_write_text, run_command_async
 
 log = logging.getLogger("odin.compute.instances")
 
@@ -149,7 +149,7 @@ def _default_max_concurrent_boots() -> int:
 # runs may be in flight against one Mac. That bound is still needed when the
 # boots are tasks rather than threads; N concurrent awaits stampede the host
 # exactly as N concurrent threads do.
-_BOOT_SEMAPHORE = threading.Semaphore(_default_max_concurrent_boots())
+_BOOT_SEMAPHORE = asyncio.Semaphore(_default_max_concurrent_boots())
 
 
 @dataclass
@@ -159,11 +159,14 @@ class _Proc:
     stderr: str = ""
 
 
-def _default_runner(args: list[str], input: str | None = None) -> _Proc:
-    # `run_command`: `limactl` is genuinely optional (doctor reports it as
-    # such), so "not installed" must surface as a nonzero result every caller
-    # already handles, never a FileNotFoundError.
-    proc = run_command(args, input=input)
+async def _default_runner(args: list[str], input: str | None = None) -> _Proc:
+    # `run_command_async`: `limactl` is genuinely optional (doctor reports it
+    # as such), so "not installed" must surface as a nonzero result every
+    # caller already handles, never a FileNotFoundError. Async because `_lima`
+    # awaits this seam (v0.7.7 de-threading) -- `limactl create`/`start` are
+    # the longest subprocesses odin runs, so blocking the loop on them is the
+    # single worst stall available.
+    proc = await run_command_async(args, input=input)
     return _Proc(proc.returncode, proc.stdout, proc.stderr)
 
 
@@ -371,7 +374,7 @@ class InstanceVm:
 
     def __init__(
         self, runner=None, poll_interval: float = 2.0, lighthouse: LighthouseManager | None = None,
-        boot_semaphore: threading.Semaphore | None = None,
+        boot_semaphore: asyncio.Semaphore | None = None,
     ) -> None:
         self._run = runner or _default_runner
         # A constructor knob (not a hardcoded sleep) purely for testability --
@@ -451,11 +454,11 @@ class InstanceVm:
         try:
             # Owner directive B2: only `_boot_semaphore`'s own limit worth of
             # VMs are ever mid-create/start at once -- a caller beyond that
-            # blocks HERE (on this thread, one of ec2compute.py's own
-            # per-instance daemon threads -- never the event loop) until a
-            # slot frees. Released before `_discover_ip`'s poll loop and
-            # nebula activation, neither of which is the heavy part.
-            with self._boot_semaphore:
+            # WAITS here (v0.7.7: an `asyncio.Semaphore`, so it yields the loop
+            # to every other task instead of parking a thread) until a slot
+            # frees. Released before `_discover_ip`'s poll loop and nebula
+            # activation, neither of which is the heavy part.
+            async with self._boot_semaphore:
                 await self._lima("create", "--tty=false", f"--name={name}", yaml_path)
                 await self._lima("start", f"--timeout={int(timeout)}s", name)
         finally:
@@ -491,7 +494,7 @@ class InstanceVm:
         existing = manager.load_overlay()
         underlay = (existing.lighthouse_underlay_ip if existing else None) or "127.0.0.1"
         await ensure_network(nebula.root, nebula.env, underlay, runner=self._run)
-        overlay_ip = manager.allocate_host_ip(nebula.host_id)
+        overlay_ip = await manager.allocate_host_ip(nebula.host_id)
         # "ec2" plus this instance's own security-group ids (W2.6): nebula
         # matches a peer's `group:` firewall rule against THIS cert's groups,
         # so the sg ids have to be baked in at signing time -- they're what
@@ -546,7 +549,7 @@ class InstanceVm:
             if underlay is None:
                 log.warning("could not derive a host underlay address for %s; nebula not activated", name)
                 return
-            self._lighthouse.ensure_started(nebula.root, nebula.env, underlay)
+            await self._lighthouse.ensure_started(nebula.root, nebula.env, underlay)
             network = await ensure_network(nebula.root, nebula.env, underlay, runner=self._run)
             config = self._render_config(nebula, network, underlay)
             await self._push_config(name, nebula, config)
@@ -687,7 +690,7 @@ class InstanceVm:
         desired = _cert_groups(nebula)
         if _recorded_membership(nebula) == desired:
             return False
-        cert = await manager.reissue_cert(nebula.host_id, manager.allocate_host_ip(nebula.host_id), desired)
+        cert = await manager.reissue_cert(nebula.host_id, await manager.allocate_host_ip(nebula.host_id), desired)
         script = _write_files_script({"host.crt": cert.crt.read_text(), "host.key": cert.key.read_text()})
         proc = await self._lima("shell", name, "--", "sudo", "bash", "-s", input=script, check=False)
         if proc.returncode != 0:
@@ -727,14 +730,17 @@ class InstanceVm:
             ip = _pick_shared_ip(proc.stdout) if proc.returncode == 0 else None
             if ip:
                 return ip
-            time.sleep(self._poll_interval)
+            # `await`, not `time.sleep`: this poll runs on the shared control
+            # loop, where a blocking sleep freezes the reconciler and the
+            # gateway together for the whole interval.
+            await asyncio.sleep(self._poll_interval)
         raise TimeoutError(f"{name} did not report a reachable IP within {timeout}s")
 
     async def stop(self, name: str) -> None:
         await self._lima("stop", name, check=False)
 
     async def start(self, name: str, timeout: float = BOOT_TIMEOUT) -> str:
-        with self._boot_semaphore:  # same bound as `boot` -- still a real VM start
+        async with self._boot_semaphore:  # same bound as `boot` -- still a real VM start
             await self._lima("start", f"--timeout={int(timeout)}s", name)
         return await self._discover_ip(name, timeout)
 
@@ -761,7 +767,7 @@ class InstanceVm:
         """`limactl list --json` filtered by the EXACT name -- 'absent' if
         gone. `--json` emits one JSON object per line (JSON Lines), not a
         JSON array."""
-        out = await self._lima("list", "--json", check=False).stdout
+        out = (await self._lima("list", "--json", check=False)).stdout
         for line in out.splitlines():
             if not line.strip():
                 continue
@@ -782,7 +788,7 @@ class InstanceVm:
         of swallowing a `limactl` failure: that caller treats "absent from
         this listing" as "the VM was really deleted", so it must be able to
         tell a genuinely empty machine from a limactl that didn't answer."""
-        out = await self._lima("list", "--json", check=check).stdout
+        out = (await self._lima("list", "--json", check=check)).stdout
         names = []
         for line in out.splitlines():
             if not line.strip():

@@ -381,7 +381,14 @@ class TranslateCache:
             if result.refined:
                 self._results[rev] = result
 
-        self._tasks[rev] = asyncio.create_task(await _run())
+        # `create_task(_run())`, NEVER `create_task(await _run())` -- the latter
+        # runs the refine to completion inline (defeating the entire point of a
+        # background pass, and blocking the `/translate` response on an SDK
+        # call) and then hands `None` to `create_task`, which raises. The task
+        # object is retained in `self._tasks`, which is also what keeps a strong
+        # reference to it: asyncio holds only a weak one, so a task nobody
+        # stores can be garbage collected mid-flight.
+        self._tasks[rev] = asyncio.create_task(_run(), name=f"odin-refine-{rev}")
 
     async def _drain(self, rev: str) -> None:
         """Test seam: await the in-flight background refine for `rev` (there is
@@ -427,5 +434,9 @@ async def translate(
     cached = cache.get(rev)
     if cached is not None:
         return cached
-    cache.refine_in_background(rev, lambda: _refine_once(skeleton, stack, client_cls, timeout))
+    # The `lambda` is a coroutine FACTORY, not an awaited call: it builds the
+    # coroutine only when the task runs (see `refine_in_background`), so a
+    # cancelled task never leaves an un-awaited coroutine behind. `await` here
+    # only covers starting the task, which returns immediately.
+    await cache.refine_in_background(rev, lambda: _refine_once(skeleton, stack, client_cls, timeout))
     return _fallback_result(skeleton, [_BACKGROUND_NOTE])

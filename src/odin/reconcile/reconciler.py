@@ -784,13 +784,13 @@ class Reconciler:
         identity = _identity_facts(prior.facts) if prior is not None else {}
         return {**identity, **({"logtail": logtail} if logtail else {})}
 
-    def _backing_logtail(self, kind: str) -> str:
+    async def _backing_logtail(self, kind: str) -> str:
         """A short tail off the real backing container for a crash verdict --
         `container_name` is only on the real `BackingAws` (test doubles that
         don't implement it just skip the tail, never crash the observe pass
         over an optional diagnostic extra)."""
         container_name = getattr(self._aws, "container_name", None)
-        return self._rt.logs(container_name(kind)) if container_name is not None else ""
+        return await self._rt.logs(container_name(kind)) if container_name is not None else ""
 
     # ---- execute ----
     async def _execute(self, action, stack: Stack) -> None:
@@ -822,7 +822,7 @@ class Reconciler:
                 # anything for `self._rt.stop` to do here either.
                 return
             else:
-                self._rt.stop(action.name)
+                await self._rt.stop(action.name)
             await self._prune(action.id)
         elif isinstance(action, NoOp):
             pass  # nothing left to gate on now that workload refs are gone
