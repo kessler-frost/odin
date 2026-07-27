@@ -142,13 +142,17 @@ always match the installed CLI instead of going stale.
 **Two measured gotchas. Both are this repo's own "reports success it did not
 achieve" pattern, living inside the tool:**
 
-1. **Mouse gestures MUST be batched.** Issued as separate CLI calls, `mouse move`
-   x5 after `mouse down` registers only ONE pointermove and fires `pointerup` at
-   the ORIGIN, not the target -- so odin's IAM permission edges (pointer-based, a
-   different code path from the sidebar's HTML5 drag-and-drop) never get drawn.
-   **Every swallowed call still prints `✓ Done` and exits 0.** Use
-   `agent-browser batch "mouse move …" "mouse down" … "mouse up"`, measured to
-   produce a real edge.
+1. **Pointer-drawn UI (odin's IAM edges) is NOT reliably drivable — treat this as
+   OPEN.** Separate `mouse move`/`down`/`up` CLI calls draw no edge; that much I
+   reproduced. `agent-browser batch "mouse move …" "mouse down" … "mouse up"` was
+   reported to work by the evaluating agent, and **I could not reproduce it** over
+   several attempts. Instrumenting the page showed why the attempt fails but not
+   how to fix it: `pointerdown`/`mousedown` arrive with the target NOT a handle,
+   even though the preceding `mouse move` used the handle's measured centre, while
+   `pointerup` DOES land `@handle`. Handles are 6px wide. So: HTML5 drag-and-drop
+   (the sidebar → canvas path) is solid and verified; connection-dragging needs a
+   working recipe before anyone depends on it, and `eval`-dispatched synthetic
+   pointer events are the obvious fallback to try first.
 2. **`drag` has no target-position option** -- it always drops at the target's
    CENTRE. For an exact coordinate use `eval` with a synthetic `DataTransfer`
    (measured: places a node at the precise flow position). Use `drag` for the
