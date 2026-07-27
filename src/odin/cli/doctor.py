@@ -283,6 +283,20 @@ async def _prebake() -> None:
     state = "present" if present else "absent — building now (one-time npm install)"
     typer.echo(f"before: {DYNALITE_IMAGE} {state}")
     await BackingAws(runtime).ensure_dynalite_image()
+    # ASK THE DAEMON AGAIN rather than asserting the happy path. This line used
+    # to print "present (just built)" unconditionally, directly under a call
+    # that was not even awaited -- so `odin doctor --prebake` built nothing and
+    # reported success, the same shape as `doctor` itself silently running zero
+    # checks. The status is now the OUTCOME of a real second read, and a build
+    # that did not land exits non-zero saying what is actually there.
+    landed = await runtime.image_exists(DYNALITE_IMAGE)
+    if not landed:
+        typer.echo(
+            f"after:  {DYNALITE_IMAGE} STILL ABSENT — the build reported no error but the "
+            "image is not in the daemon. Run `docker images` and check the daemon's disk.",
+            err=True,
+        )
+        raise typer.Exit(1)
     typer.echo(f"after:  {DYNALITE_IMAGE} present ({'already there' if present else 'just built'})")
 
 
