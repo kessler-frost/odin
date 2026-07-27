@@ -392,6 +392,23 @@ export const catalogByType: Record<string, ServiceDef> = Object.fromEntries(
 
 export const catalogTypes = CATALOG.map((s) => s.type);
 
+/**
+ * A kind with no real substitute behind it. The `(placeholder)` marker in the
+ * sublabel is the single source of truth (see the note at the top of this
+ * file): it is what makes Apply skip the kind, and `catalog.test.ts` enforces
+ * that any kind absent from translate.py carries it.
+ *
+ * These are hidden from the SIDEBAR palette (owner call, 2026-07-27) and come
+ * back one at a time as each gains a substitute -- removing the marker
+ * restores the tile in the same edit, with no second list to update.
+ * `CATALOG` itself keeps every entry so an already-saved canvas containing one
+ * still renders properly.
+ */
+export const isPlaceholder = (sublabel: string) => sublabel.includes('(placeholder)');
+
+/** What the palette offers: everything with a real substitute behind it. */
+export const PALETTE: ServiceDef[] = CATALOG.filter((s) => !isPlaceholder(s.sublabel));
+
 // --- derived maps merged into the existing Canvas/ConfigPanel/Sidebar/IAM ---
 
 export const catalogNodeTypeMap: Record<string, string> = Object.fromEntries(

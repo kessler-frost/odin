@@ -1206,6 +1206,30 @@ have meant retiring a claim rather than fixing a bug.
   required changes validation for every canvas-taking route (`/apply`,
   `/translate`, `/canvas`) and wants its own test pass.
 
+- [ ] **Bring the placeholder kinds back, one at a time.** The palette hides
+  every `(placeholder)` tile as of v0.7.8 (owner call, 2026-07-27): 27 tiles
+  became 18. A placeholder dragged onto the canvas draws like a real resource
+  and is then silently skipped by Apply, so the canvas showed four resources
+  while Terraform built three -- and it cost real time here, where a demo
+  recording dropped an EBS Volume by accident and the apply reported
+  "Resources: 2 added" for three tiles with no visible complaint.
+
+  Currently hidden, each needing a real substitute before its tile returns:
+  **EFS, EBS, Kinesis, KMS, Route 53, API Gateway, EventBridge, Elastic IP,
+  Internet Gateway**. The gate is one edit: delete `(placeholder)` from the
+  sublabel once the kind is genuinely backed, and `Sidebar`'s `PALETTE` picks
+  it up automatically -- `catalog.test.ts` enforces that a kind absent from
+  translate.py still carries the marker, so the two cannot drift.
+
+- [ ] **The canvas is GLOBAL and last-writer-wins across tabs.** Two pages
+  open, and whichever re-renders last silently overwrites the other -- there
+  is no revision check on `POST /canvas`. This is not theoretical: it
+  destroyed the canvas repeatedly while recording the release GIFs, once
+  replacing three applied resources with a single node from a stale tab, and
+  it is the same root as the v0.7.7 data-loss fix (a canvas write that nobody
+  asked for). Wants an If-Match/revision guard, or at least a warning when the
+  stored canvas changed underneath the page.
+
 - [ ] **Should the canvas be per-env?** Every other route (`/world`, `/apply`,
   `/destroy`) takes `?env=` and defaults to `default`; `/canvas` alone is
   global. Making it per-env-with-default would be consistent, but it changes
