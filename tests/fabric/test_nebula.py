@@ -4,10 +4,10 @@ Cert ops use an injected fake runner, so no nebula-cert binary is required.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
-import threading
 
 import pytest
 import yaml
@@ -388,44 +388,50 @@ async def test_allocate_host_ip_persists_immediately(tmp_path):
     runner = FakeRunner()
     await ensure_network(tmp_path, "prod", "192.168.1.10", runner=runner)
     mgr = NebulaManager(tmp_path / "prod" / "nebula", runner=runner)
-    ip = mgr.allocate_host_ip("i-aaa")  # CIDR form, e.g. "10.42.1.1/16" -- what nebula-cert sign needs
+    ip = await mgr.allocate_host_ip("i-aaa")  # CIDR form, e.g. "10.42.1.1/16" -- what nebula-cert sign needs
     reloaded = NebulaManager(tmp_path / "prod" / "nebula").load_overlay()
     assert reloaded.subnets["hosts"].assignments["i-aaa"] == ip.split("/")[0]  # assignments store the bare IP
 
 
-def test_allocate_host_ip_raises_if_network_never_bootstrapped(tmp_path):
+async def test_allocate_host_ip_raises_if_network_never_bootstrapped(tmp_path):
     mgr = NebulaManager(tmp_path / "prod" / "nebula")
     with pytest.raises(RuntimeError, match="ensure_network"):
-        mgr.allocate_host_ip("i-aaa")
+        await mgr.allocate_host_ip("i-aaa")
 
 
 async def test_allocate_host_ip_is_atomic_under_concurrent_boots(tmp_path):
     """The exact race the two-VM proof test hit for real: two instances
     booting concurrently in the SAME env must not collide on the same IP or
     silently drop one another's allocation -- see `_lock_for_dir`'s
-    module-level docstring in fabric/nebula.py."""
+    module-level docstring in fabric/nebula.py.
+
+    v0.7.7: concurrent TASKS, not threads -- these are the two VMs booting as
+    concurrent coroutines on the one control loop, which is what production
+    now actually does (`compute/instances.py::_activate_nebula`). Every
+    assertion below is unchanged and keeps its exact force: no allocation
+    lost, no two hosts on one address, and disk agreeing with what the callers
+    were handed.
+
+    HONEST LIMIT, stated rather than implied (`_lock_for_dir`'s own v0.7.7
+    verdict says the same thing from the other side): `allocate_host_ip`'s
+    critical section is load_overlay -> mutate -> save_overlay with no `await`
+    in it, so on ONE event loop nothing can preempt it and this test can no
+    longer fail by deleting the lock -- under threads it could. What it still
+    proves for real is the bug it was written for (an allocation that lives
+    only in memory: drop `save_overlay` and the disk assertion fails), that
+    `MeshNetwork.allocate_host` hands out distinct addresses, and that a
+    future `await` slipped into that section would reintroduce the race. The
+    lock's teeth are tested where the section really does await --
+    `test_two_concurrent_boots_in_one_env_start_exactly_one_lighthouse`."""
     runner = FakeRunner()
     await ensure_network(tmp_path, "prod", "192.168.1.10", runner=runner)
     host_ids = [f"i-{n:03d}" for n in range(20)]
-    results: dict[str, str] = {}
-    errors: list[Exception] = []
-    results_lock = threading.Lock()
 
-    def worker(host_id: str) -> None:
-        try:
-            ip = NebulaManager(tmp_path / "prod" / "nebula").allocate_host_ip(host_id)
-            with results_lock:
-                results[host_id] = ip
-        except Exception as exc:  # pragma: no cover -- surfaced via `errors`
-            errors.append(exc)
+    async def worker(host_id: str) -> tuple[str, str]:
+        return host_id, await NebulaManager(tmp_path / "prod" / "nebula").allocate_host_ip(host_id)
 
-    threads = [threading.Thread(target=worker, args=(host_id,)) for host_id in host_ids]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=10)
+    results = dict(await asyncio.gather(*(worker(host_id) for host_id in host_ids)))
 
-    assert not errors
     assert set(results) == set(host_ids)                # nobody's allocation was lost
     assert len(set(results.values())) == len(host_ids)  # nobody collided on the same IP (CIDR form)
 
@@ -545,7 +551,7 @@ async def test_lighthouse_ensure_started_spawns_nebula_directly_no_sudo(tmp_path
     pidfile = tmp_path / "prod" / "nebula" / "lighthouse.pid"
     mgr = LighthouseManager(popen=_fake_popen(calls), runner=runner, nebula_bin="nebula")
 
-    started = mgr.ensure_started(tmp_path, "prod", "192.168.64.1")
+    started = await mgr.ensure_started(tmp_path, "prod", "192.168.64.1")
     assert started is True
     config_path = tmp_path / "prod" / "nebula" / "lighthouse-config.yml"
     assert calls == [["nebula", "-config", str(config_path)]]
@@ -557,23 +563,23 @@ async def test_lighthouse_ensure_started_spawns_nebula_directly_no_sudo(tmp_path
     assert config["pki"]["cert"] == str(tmp_path / "prod" / "nebula" / "hosts" / "lighthouse.crt")
 
 
-def test_lighthouse_ensure_started_is_idempotent_when_already_running(tmp_path):
+async def test_lighthouse_ensure_started_is_idempotent_when_already_running(tmp_path):
     pidfile = tmp_path / "prod" / "nebula" / "lighthouse.pid"
     pidfile.parent.mkdir(parents=True)
     pidfile.write_text(str(os.getpid()))
     calls: list[list[str]] = []
     mgr = LighthouseManager(popen=_fake_popen(calls), nebula_bin="nebula")
-    assert mgr.ensure_started(tmp_path, "prod", "192.168.64.1") is True
+    assert await mgr.ensure_started(tmp_path, "prod", "192.168.64.1") is True
     assert calls == []  # never spawned a second one
 
 
-def test_lighthouse_ensure_started_false_when_network_not_bootstrapped_yet(tmp_path):
+async def test_lighthouse_ensure_started_false_when_network_not_bootstrapped_yet(tmp_path):
     """No VPC ever created for this env -> no lighthouse cert -> best-effort
     False, no spawn attempt (matches `_activate_nebula`'s own "log and move
     on" rule -- never a crash over an unmet precondition)."""
     calls: list[list[str]] = []
     mgr = LighthouseManager(popen=_fake_popen(calls), nebula_bin="nebula")
-    assert mgr.ensure_started(tmp_path, "prod", "192.168.64.1") is False
+    assert await mgr.ensure_started(tmp_path, "prod", "192.168.64.1") is False
     assert calls == []
 
 
@@ -586,7 +592,7 @@ async def test_lighthouse_ensure_started_false_when_nebula_not_on_path(tmp_path,
     mgr = LighthouseManager(popen=_fake_popen(calls), runner=runner, nebula_bin=None)
 
     monkeypatch.setattr(nebula_module.shutil, "which", lambda name: None)
-    started = mgr.ensure_started(tmp_path, "prod", "192.168.64.1")
+    started = await mgr.ensure_started(tmp_path, "prod", "192.168.64.1")
     assert started is False
     assert calls == []
 
@@ -601,7 +607,7 @@ async def test_lighthouse_ensure_started_false_when_it_exits_immediately(tmp_pat
     pidfile = tmp_path / "prod" / "nebula" / "lighthouse.pid"
     mgr = LighthouseManager(popen=_fake_popen(calls, exits_immediately=True), runner=runner, nebula_bin="nebula")
 
-    started = mgr.ensure_started(tmp_path, "prod", "192.168.64.1")
+    started = await mgr.ensure_started(tmp_path, "prod", "192.168.64.1")
     assert started is False
     assert not pidfile.exists()
 
@@ -644,7 +650,7 @@ async def test_why_not_running_names_the_binary_not_a_log_that_was_never_written
     calls: list[list[str]] = []
     mgr = LighthouseManager(popen=_fake_popen(calls), runner=runner, nebula_bin=None)
 
-    assert mgr.ensure_started(tmp_path, "prod", "192.168.64.1") is False
+    assert await mgr.ensure_started(tmp_path, "prod", "192.168.64.1") is False
     assert calls == [], "nothing was spawned"
     log_path = tmp_path / "prod" / "nebula" / "lighthouse.log"
     assert not log_path.exists(), "the refusal happens BEFORE the log is opened"
@@ -656,11 +662,11 @@ async def test_why_not_running_names_the_binary_not_a_log_that_was_never_written
     assert "lighthouse.log" not in absence.sentence(), "never name a file that does not exist"
 
 
-def test_why_not_running_names_the_missing_certificate(tmp_path):
+async def test_why_not_running_names_the_missing_certificate(tmp_path):
     """No VPC ever applied for this env: `_start_locked` refuses here too, also
     before any log is written."""
     mgr = LighthouseManager(popen=_fake_popen([]), nebula_bin="nebula")
-    assert mgr.ensure_started(tmp_path, "prod", "192.168.64.1") is False
+    assert await mgr.ensure_started(tmp_path, "prod", "192.168.64.1") is False
     assert not (tmp_path / "prod" / "nebula" / "lighthouse.log").exists()
 
     absence = mgr.why_not_running(tmp_path, "prod")
@@ -678,7 +684,7 @@ async def test_why_not_running_points_at_the_log_once_the_process_really_ran(tmp
     runner = FakeRunner()
     await ensure_network(tmp_path, "prod", "1.2.3.4", runner=runner)
     mgr = LighthouseManager(popen=_fake_popen([]), runner=runner, nebula_bin="nebula")
-    assert mgr.ensure_started(tmp_path, "prod", "192.168.64.1") is True
+    assert await mgr.ensure_started(tmp_path, "prod", "192.168.64.1") is True
     log_path = tmp_path / "prod" / "nebula" / "lighthouse.log"
     assert log_path.exists(), "a spawn opens the log -- this is the case the old advice fit"
     (tmp_path / "prod" / "nebula" / "lighthouse.pid").unlink()  # what ensure_stopped leaves
@@ -710,20 +716,20 @@ async def test_why_not_running_agrees_with_what_start_actually_refuses_on(tmp_pa
 
     # 1. no cert -> blocked
     assert mgr._blocker(tmp_path, "prod") is not None
-    assert mgr.ensure_started(tmp_path, "prod", "192.168.64.1") is False
+    assert await mgr.ensure_started(tmp_path, "prod", "192.168.64.1") is False
 
     # 2. cert, but no binary -> blocked
     await ensure_network(tmp_path, "prod", "1.2.3.4", runner=runner)
     _empty_path(monkeypatch, tmp_path)
     nobin = LighthouseManager(popen=_fake_popen([]), runner=runner, nebula_bin=None)
     assert nobin._blocker(tmp_path, "prod") is not None
-    assert nobin.ensure_started(tmp_path, "prod", "192.168.64.1") is False
+    assert await nobin.ensure_started(tmp_path, "prod", "192.168.64.1") is False
 
     # 3. both present -> NOT blocked, and the start really proceeds
     calls: list[list[str]] = []
     ok = LighthouseManager(popen=_fake_popen(calls), runner=runner, nebula_bin="nebula")
     assert ok._blocker(tmp_path, "prod") is None
-    assert ok.ensure_started(tmp_path, "prod", "192.168.64.1") is True
+    assert await ok.ensure_started(tmp_path, "prod", "192.168.64.1") is True
     assert calls, "an unblocked start spawns"
 
 
@@ -751,7 +757,7 @@ async def test_every_absence_says_the_words_two_e2e_tests_read(tmp_path, monkeyp
     reasons.append(mgr.why_not_running(tmp_path, "prod").reason)
 
     # 4. it ran and its process is gone
-    assert mgr.ensure_started(tmp_path, "prod", "192.168.64.1") is True
+    assert await mgr.ensure_started(tmp_path, "prod", "192.168.64.1") is True
     (tmp_path / "prod" / "nebula" / "lighthouse.pid").unlink()
     reasons.append(mgr.why_not_running(tmp_path, "prod").reason)
 
@@ -899,7 +905,7 @@ async def test_a_lighthouse_whose_recorded_port_got_taken_moves_and_records_the_
     calls: list[list[str]] = []
     mgr = LighthouseManager(popen=_fake_popen(calls), runner=runner, nebula_bin="nebula")
 
-    assert mgr.ensure_started(tmp_path, "prod", "192.168.64.1") is True
+    assert await mgr.ensure_started(tmp_path, "prod", "192.168.64.1") is True
     config = yaml.safe_load((tmp_path / "prod" / "nebula" / "lighthouse-config.yml").read_text())
     moved = nebula_module.LIGHTHOUSE_PORT + 1
     assert config["listen"]["port"] == moved
@@ -908,28 +914,31 @@ async def test_a_lighthouse_whose_recorded_port_got_taken_moves_and_records_the_
 
 
 async def test_two_concurrent_boots_in_one_env_start_exactly_one_lighthouse(tmp_path, free_ports):
-    """Two VMs in one env boot on their own threads, and a backing can join at
-    the same moment -- so `ensure_started` must be serialized per env. With a
-    per-env port an unserialized loser would MOVE the env to a fresh port,
-    spawn a SECOND lighthouse and overwrite the winner's pidfile, leaking the
-    winner (caught in the field as a stray `nebula` process after a two-VM
-    integration test)."""
+    """Two VMs in one env boot as concurrent TASKS on the one control loop,
+    and a backing can join at the same moment -- so `ensure_started` must be
+    serialized per env. With a per-env port an unserialized loser would MOVE
+    the env to a fresh port, spawn a SECOND lighthouse and overwrite the
+    winner's pidfile, leaking the winner (caught in the field as a stray
+    `nebula` process after a two-VM integration test).
+
+    v0.7.7: tasks replace the threads, and this is where the per-env
+    `asyncio.Lock` keeps its real teeth -- unlike `allocate_host_ip`, THIS
+    critical section genuinely awaits (`_usable_port`, then the
+    spawn-and-poll's `asyncio.sleep`), so it is preemptible and the loser can
+    still overtake the winner. Mutation-verified: drop the `async with
+    _lock_for_dir(...)` from `ensure_started` and the loser sees `is_running`
+    False during the winner's poll loop -- before its pidfile is written --
+    and `len(calls)` becomes 2."""
     runner = FakeRunner()
     await ensure_network(tmp_path, "prod", "1.2.3.4", runner=runner)
     calls: list[list[str]] = []
     # A pid that is genuinely alive, so the second caller's own `is_running`
     # sees what it would see in production: the winner's live process.
     mgr = LighthouseManager(popen=_fake_popen(calls, pid=os.getpid()), runner=runner, nebula_bin="nebula")
-    results: list[bool] = []
 
-    def boot():
-        results.append(mgr.ensure_started(tmp_path, "prod", "192.168.64.1"))
-
-    threads = [threading.Thread(target=boot) for _ in range(2)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=30)
+    results = list(await asyncio.gather(*(
+        mgr.ensure_started(tmp_path, "prod", "192.168.64.1") for _ in range(2)
+    )))
 
     assert results == [True, True]
     assert len(calls) == 1, f"exactly one nebula process, got {calls}"
@@ -954,12 +963,19 @@ async def test_mesh_state_reports_which_port_this_env_owns(tmp_path, free_ports)
 
 class FakePs:
     """A `ps -Ao pid=,args=` stand-in. Everything else the module might run
-    answers empty, so a test only has to describe the process table."""
+    answers empty, so a test only has to describe the process table.
+
+    A COROUTINE function, because the seam it stands in for is one:
+    `_default_runner` is `async def` over `run_command_async` (v0.7.7), and
+    `orphaned_lighthouses` awaits `(runner or _default_runner)(...)`. A sync
+    fake here would still "work" -- awaiting a `_Proc` raises, so it would
+    fail loudly -- but the shape has to match the real seam, not merely fail
+    in a recognisable way."""
 
     def __init__(self, lines: list[str]) -> None:
         self.lines = lines
 
-    def __call__(self, args):
+    async def __call__(self, args):
         from odin.fabric.nebula import _Proc
         return _Proc(0, "\n".join(self.lines) if args[:2] == ["ps", "-Ao"] else "")
 
@@ -968,29 +984,29 @@ def _lighthouse_line(pid: int, config, binary: str = "/opt/homebrew/bin/nebula")
     return f"{pid} {binary} -config {config}"
 
 
-def test_orphaned_lighthouses_finds_a_process_whose_env_was_destroyed(tmp_path):
+async def test_orphaned_lighthouses_finds_a_process_whose_env_was_destroyed(tmp_path):
     gone = tmp_path / "prod" / "nebula" / nebula_module.LIGHTHOUSE_CONFIG  # never created: the env was destroyed
     ps = FakePs([_lighthouse_line(4242, gone)])
-    assert nebula_module.orphaned_lighthouses(tmp_path, runner=ps) == [(4242, gone)]
+    assert await nebula_module.orphaned_lighthouses(tmp_path, runner=ps) == [(4242, gone)]
 
 
-def test_a_live_envs_lighthouse_is_never_an_orphan(tmp_path):
+async def test_a_live_envs_lighthouse_is_never_an_orphan(tmp_path):
     """The one thing this must never do: kill the lighthouse of an env that
     is still up. Its config file existing IS the evidence it is still wanted."""
     live = tmp_path / "prod" / "nebula" / nebula_module.LIGHTHOUSE_CONFIG
     live.parent.mkdir(parents=True)
     live.write_text("pki: {}\n")
-    assert nebula_module.orphaned_lighthouses(tmp_path, runner=FakePs([_lighthouse_line(4242, live)])) == []
+    assert await nebula_module.orphaned_lighthouses(tmp_path, runner=FakePs([_lighthouse_line(4242, live)])) == []
 
 
-def test_another_stores_lighthouse_is_never_an_orphan(tmp_path):
+async def test_another_stores_lighthouse_is_never_an_orphan(tmp_path):
     """A second odin on this Mac (its own `.odin`) owns its own processes --
     and its deleted config is none of our business."""
     other = tmp_path.parent / "somebody-elses" / "prod" / "nebula" / nebula_module.LIGHTHOUSE_CONFIG
-    assert nebula_module.orphaned_lighthouses(tmp_path, runner=FakePs([_lighthouse_line(999, other)])) == []
+    assert await nebula_module.orphaned_lighthouses(tmp_path, runner=FakePs([_lighthouse_line(999, other)])) == []
 
 
-def test_a_non_nebula_process_is_never_an_orphan(tmp_path):
+async def test_a_non_nebula_process_is_never_an_orphan(tmp_path):
     """`-config <a deleted path>` is an ordinary thing for a program to carry."""
     gone = tmp_path / "prod" / "nebula" / nebula_module.LIGHTHOUSE_CONFIG
     lines = [
@@ -998,10 +1014,10 @@ def test_a_non_nebula_process_is_never_an_orphan(tmp_path):
         f"2 /opt/homebrew/bin/nebula -config {tmp_path / 'prod' / 'nebula' / 'config.yml'}",  # a MEMBER's config
         "3 /opt/homebrew/bin/nebula",  # no -config at all
     ]
-    assert nebula_module.orphaned_lighthouses(tmp_path, runner=FakePs(lines)) == []
+    assert await nebula_module.orphaned_lighthouses(tmp_path, runner=FakePs(lines)) == []
 
 
-def test_reap_orphaned_lighthouses_signals_exactly_the_orphans(tmp_path, monkeypatch):
+async def test_reap_orphaned_lighthouses_signals_exactly_the_orphans(tmp_path, monkeypatch):
     gone = tmp_path / "gone" / "nebula" / nebula_module.LIGHTHOUSE_CONFIG
     live = tmp_path / "live" / "nebula" / nebula_module.LIGHTHOUSE_CONFIG
     live.parent.mkdir(parents=True)
@@ -1010,15 +1026,15 @@ def test_reap_orphaned_lighthouses_signals_exactly_the_orphans(tmp_path, monkeyp
     monkeypatch.setattr(nebula_module.os, "kill", lambda pid, sig: signalled.append((pid, sig)))
 
     ps = FakePs([_lighthouse_line(11, gone), _lighthouse_line(22, live)])
-    assert nebula_module.reap_orphaned_lighthouses(tmp_path, runner=ps) == [11]
+    assert await nebula_module.reap_orphaned_lighthouses(tmp_path, runner=ps) == [11]
     assert signalled == [(11, nebula_module.signal.SIGTERM)]
 
 
-def test_reaping_a_pid_that_already_died_is_not_an_error(tmp_path, monkeypatch):
+async def test_reaping_a_pid_that_already_died_is_not_an_error(tmp_path, monkeypatch):
     gone = tmp_path / "gone" / "nebula" / nebula_module.LIGHTHOUSE_CONFIG
 
     def exploding_kill(pid, sig):
         raise ProcessLookupError(pid)
 
     monkeypatch.setattr(nebula_module.os, "kill", exploding_kill)
-    assert nebula_module.reap_orphaned_lighthouses(tmp_path, runner=FakePs([_lighthouse_line(11, gone)])) == []
+    assert await nebula_module.reap_orphaned_lighthouses(tmp_path, runner=FakePs([_lighthouse_line(11, gone)])) == []

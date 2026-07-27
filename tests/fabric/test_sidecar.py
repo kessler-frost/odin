@@ -117,10 +117,17 @@ class FakeRuntime:
 
 
 class FakeLighthouse:
+    """A COROUTINE function, because the seam it replaces is one:
+    `LighthouseManager.ensure_started` is `async def` (v0.7.7 -- it awaits
+    `_lock_for_dir`, `_usable_port` and the spawn-and-poll). Keeping this fake
+    SYNC is the trap that matters here, not a harmless mismatch: it would make
+    `MeshSidecar._join`'s un-awaited call look correct and this file go green
+    while production never starts a lighthouse at all."""
+
     def __init__(self):
         self.started: list[tuple] = []
 
-    def ensure_started(self, root, env, underlay):
+    async def ensure_started(self, root, env, underlay):
         self.started.append((root, env, underlay))
         return True
 
@@ -453,7 +460,7 @@ async def test_a_restarted_sidecar_pokes_its_peers_to_re_handshake(tmp_path):
     runtime = FakeRuntime()
     await runtime.start_target(TARGET)
     mesh = _sidecar(tmp_path, runtime, runner=runner)
-    NebulaManager(tmp_path / ENV / "nebula", runner=runner).allocate_host_ip("i-web")
+    await NebulaManager(tmp_path / ENV / "nebula", runner=runner).allocate_host_ip("i-web")
 
     await mesh.ensure(TARGET, MEMBER, firewall=DB_FIREWALL)
 
