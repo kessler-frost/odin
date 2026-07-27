@@ -184,6 +184,25 @@ def test_tf_plan_prints_the_servers_note_when_the_two_halves_describe_different_
 
 
 @respx.mock
+def test_tf_plan_json_carries_canvas_drift_for_a_ci_gate(runner):
+    """The README tells CI to gate on `.canvas_drift`, so that field has to
+    survive `-o json` -- exactly as `.not_covered` does above.
+
+    It is the ONLY machine-readable signal for an unapplied canvas edit: the
+    exit code cannot carry it, because `tf plan` plans the LAST-APPLIED Stack
+    and an unapplied edit is legitimately `no_changes`. A gate written against
+    the exit code alone passes green over an entire un-applied canvas -- which
+    is what the README used to describe, wrongly, as exit 2."""
+    drifted = {**PLAN_NO_CHANGES, "canvas_drift": True, "note": "the saved canvas is not what env 'default' last applied"}
+    respx.post(f"{BASE}/tf/plan").mock(return_value=httpx.Response(200, json=drifted))
+
+    result = runner.invoke(app, ["tf", "plan", "-o", "json"])
+
+    assert result.exit_code == 0, "an unapplied edit is not an error -- the field is the gate"
+    assert json.loads(result.stdout)["canvas_drift"] is True
+
+
+@respx.mock
 def test_tf_plan_never_calls_the_canvas_route(runner):
     """One source of truth: v0.7.3 fetched `/canvas` here and derived `skipped`
     client-side, so `curl /tf/plan` got neither field and the CLI's own answer

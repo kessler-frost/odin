@@ -316,8 +316,9 @@ from AWS. Every workspace now carries a `README.md` saying so.
 credentials as Apply, and it changes nothing. Two things its exit code cannot
 carry. First, **it plans the last-applied Stack, not the saved canvas** — an edit
 you have not applied is not drift, so `tf plan` reports `no changes` with four new
-resources sitting in `canvas.json`. It notes on stderr when the two differ, and
-only Apply closes the gap. Second, `no_changes` means "no drift in what odin can
+resources sitting in `canvas.json`. It notes on stderr when the two differ and sets
+**`.canvas_drift`** in `-o json` — that field, not the exit code, is what a CI check
+should gate on, and only Apply closes the gap. Second, `no_changes` means "no drift in what odin can
 generate": a node odin has no Terraform for was never in the plan, and the command
 names those on their own line (`-o json` puts them in `.not_covered`).
 
