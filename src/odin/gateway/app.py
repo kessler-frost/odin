@@ -41,6 +41,7 @@ import asyncio
 import socket
 import threading
 import time
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from urllib.parse import parse_qsl
@@ -60,6 +61,8 @@ from odin.gateway import errors, sigv4, synth
 from odin.gateway.keys import OPERATOR_NODE_ID, KeyStore, Principal
 from odin.gateway.policy import Statement, evaluate
 from odin.gateway.stores import SynthStores
+
+log = logging.getLogger("odin.gateway")
 
 # Stripped before ANY forward -- hop-by-hop / connection-specific, never
 # meaningful to replay to the backing (httpx recomputes content-length and
@@ -180,6 +183,10 @@ def create_gateway_app(
 
         identified = sigv4.identify(headers)
         access_key, service = (identified[0], identified[2]) if identified else (None, "s3")
+        # So `_unhandled_failure` can answer in THIS service's wire format. Set
+        # here, the earliest point it is known, because the handler's whole job
+        # is to cover paths that never reached their own error return.
+        request.state.service = service
 
         principal = keystore.lookup(access_key) if access_key else None
         if principal is None:
@@ -264,16 +271,59 @@ def create_gateway_app(
         return Response(content=response_body, status_code=upstream.status_code, headers=response_headers)
 
     methods = ["GET", "PUT", "POST", "DELETE", "HEAD"]
-    return Starlette(routes=[
-        Route("/", catch_all, methods=methods),
-        Route("/{path:path}", catch_all, methods=methods),
-    ])
+    return Starlette(
+        routes=[
+            Route("/", catch_all, methods=methods),
+            Route("/{path:path}", catch_all, methods=methods),
+        ],
+        exception_handlers={Exception: _unhandled_failure},
+    )
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+async def _unhandled_failure(request: Request, exc: Exception) -> Response:
+    """Anything `catch_all` did not anticipate, answered in the asked-for
+    service's own wire format instead of as a bare-text 500.
+
+    Probed before it was written: a backing that dies between the port read and
+    the forward makes httpx raise inside `catch_all`, and the exception went
+    straight out of the ASGI app -- so what botocore actually received was
+    uvicorn's plain `Internal Server Error`, with no AWS error document in it at
+    all. That is the same race `BackingUnavailable` covers on the control app,
+    seen from the other side.
+
+    A transport failure IS the "backing isn't there" case this module already
+    has a word for, so it reuses `ServiceUnavailable` (503) -- which SDKs treat
+    as retryable, correctly, since the next Apply re-creates the backing.
+    Everything else is a genuine surprise and gets a 500 `InternalFailure`.
+
+    Deliberately built from nothing but the exception and `request.state`: a
+    handler of last resort that touches disk, docker or the stores can raise on
+    its own, and then the bare 500 is back. The detail is logged rather than
+    returned, for the reason `errors.internal_failure` documents."""
+    service = getattr(request.state, "service", "s3")
+    log.error("gateway: unhandled %s serving %s %s", type(exc).__name__, request.method, request.url.path, exc_info=exc)
+    if isinstance(exc, httpx.HTTPError):
+        return errors.service_unavailable(service)
+    return errors.internal_failure(service, type(exc).__name__)
+
+
+def _bound_socket(host: str, port: int) -> socket.socket:
+    """Bind NOW and hand the live socket to uvicorn, so the port cannot be
+    stolen between choosing it and serving on it.
+
+    `port=0` used to be resolved by binding a throwaway socket, reading its
+    number, and CLOSING it -- uvicorn then bound the same number a moment
+    later. Anything else on the machine could take it in that window, and
+    under parallel runs something did (intermittent EADDRINUSE, and the
+    symptom was a confusing 15s `_wait_until_serving` timeout rather than a
+    bind error). Holding the socket removes the window entirely.
+
+    An explicitly requested port still fails loudly here: a caller who asked
+    for 4266 must not silently be given something else."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((host, port))
+    return sock
 
 
 def _wait_until_serving(port: int, timeout: float = 15.0) -> None:
@@ -305,10 +355,11 @@ def serve_in_thread(app: Starlette, host: str = "0.0.0.0", port: int = 0) -> tup
     request here is SigV4-verified (`catch_all` -> `sigv4.verify`, this
     module's own docstring) before anything is classified or forwarded --
     unlike the control app, which has no equivalent per-request check."""
-    actual_port = port or _free_port()
+    sock = _bound_socket(host, port)
+    actual_port = sock.getsockname()[1]
     config = uvicorn.Config(app, host=host, port=actual_port, log_level="warning")
     server = uvicorn.Server(config)
-    thread = threading.Thread(target=server.run, name="odin-gateway", daemon=True)
+    thread = threading.Thread(target=lambda: server.run(sockets=[sock]), name="odin-gateway", daemon=True)
     thread.start()
     _wait_until_serving(actual_port)
     return server, thread, actual_port

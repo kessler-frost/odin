@@ -110,6 +110,81 @@ recurring. Read them before writing a guard, a status, or a caveat.
 try to falsify it. That judgement — "here is where the original proof was weaker
 than claimed" — was the single most valuable output of the field tests.
 
+4. **Read the REAL exit code, and verify a change by CONTENT not by message.**
+   The rules above are about odin lying to a user; this one is about a tool lying
+   to *you*, and it cost more time in one session than any single bug.
+   `cmd | head; echo $?` gives you **head's** status, not `cmd`'s. Worst case
+   seen: `git apply -3 p 2>&1 | head -6; echo "APPLIED"` printed six "Applied
+   patch … cleanly" lines, so the merge looked done — but `git apply` is atomic,
+   a later file failed, it **rolled the whole patch back**, `head` ate the error,
+   and the unconditional `echo` manufactured the success. The full suite then
+   passed against pristine code. Caught only by grepping for the fix's own
+   identifier and getting zero hits. Two different agents hit this the same day
+   (the other: `git stash pop | tail -3` reported 0 while git had failed, leaving
+   the work stashed — nearly five false "fixes" reported).
+   So: **never pipe a command whose success you are about to rely on** — redirect
+   to a file, `echo $?` on its own line; **never write an unconditional
+   `echo "DONE"`** after a fallible command; and after any merge/patch/edit,
+   **grep for something the change introduces** before believing it landed.
+   Also verify your own *test harness* before blaming the code: a fault injection
+   that silently does nothing looks exactly like a bug (a `kill -STOP` that
+   signalled nothing because the container's BusyBox lacks `pgrep -o`, and odin
+   was right to keep reporting healthy).
+
+## Concurrency: async, not threads (owner directive, 2026-07-27)
+**No `threading` and no `multiprocessing` unless genuinely unavoidable.** The reason is locking: threads force it, and on a single
+event loop a synchronous read-modify-write is already atomic with respect to
+other tasks, because nothing preempts it without an `await`. So when threads
+go, DELETE the locks they existed for rather than porting `threading.Lock` to
+`asyncio.Lock` — check first whether the critical section contains an `await`;
+if it doesn't, it needs no lock. If a thread really is unavoidable (a blocking
+C call, a library with no async API), isolate it behind one
+`anyio.to_thread.run_sync` / `asyncio.to_thread` boundary and say why.
+
+**Which library: prefer `anyio`, so the choice stays open.** Not because trio
+beats asyncio — because anyio runs on BOTH (`anyio.get_all_backends()` →
+`('asyncio', 'trio')`), so anyio-shaped code is married to neither. It costs
+nothing here: Starlette already requires it (`anyio<5,>=3.6.2`, and 4.14.0 is
+in this venv today), so it is a transitive dependency odin already ships.
+Prefer its structured concurrency (`anyio.create_task_group`) over hand-rolled
+task bookkeeping. What this does NOT mean: rewriting the web stack to chase a
+backend. uvicorn/FastAPI are asyncio, anyio runs happily on asyncio, and that
+combination is exactly what "not limited to one library" buys. Judge async
+libraries on production quality and maintenance, not novelty.
+
+odin's remaining threads as of v0.7.6, all scheduled to go in v0.7.7: the
+gateway's own uvicorn (`serve_in_thread`), the substrate boot threads
+(`ec2compute._finish_boot`, `lambdactl`'s deploy thread, `ecsctl._launch_task`,
+`cachectl._finish_create`), and the `threading.Lock` per env in
+`gateway/stores.py` that exists because of them.
+
+## Working in parallel (subagents and teammates)
+Hard-won mechanics. Ignoring these has already destroyed work in this repo.
+- **An agent worktree is branched from whatever HEAD existed when it was
+  created, which is often NOT current `develop`.** Two agents filed findings
+  against stale trees, and copying an agent's files wholesale into the main
+  checkout once silently **reverted 192 lines** of newer work. So: before
+  trusting anything from a worktree, `git diff <agent-base> HEAD -- <files>`; and
+  prefer `git apply -3` of the agent's own diff over any file copy. Agents:
+  compare your `git log --oneline -1` against the main checkout before concluding
+  a fix is missing.
+- **Never remove an agent's worktree until the whole run is over.** A "completed"
+  notification does not mean terminated — agents get resumed, and two that were
+  resumed after their worktrees were deleted lost their shells entirely, one
+  losing an uncommitted refactor it then reported as destroyed (it had actually
+  landed elsewhere; the false report was nearly acted on as a rebuild).
+- **Assign every agent its own server port, `ODIN_GATEWAY_PORT`, and store dir**
+  (never `/tmp` — macOS TMPDIR isn't shared into Colima), and its own env-name
+  prefix. Two agents defaulting to :4200/:4266 produced a bogus 401 and two
+  phantom "bugs" that had to be retracted.
+- **Cleanup must be scoped to the env names that agent created.** `docker ps -aq
+  --filter label=odin=1 | xargs -r docker rm -f` is machine-wide and has already
+  deleted another agent's containers mid-verification. Use
+  `--filter name=<prefix>`.
+- **"I read it" needs a "when."** With many agents in flight, one read
+  `catalog.ts` before a commit landed and another after, and they reported
+  contradictory states — both honestly. Timestamp claims about the tree.
+
 ## Cleanup / Disk (limited headroom — clean up after EVERY heavy step)
 - **Containers:** every test/run tears down its own; `docker ps -aq --filter label=odin=1 | xargs -r docker rm -f`. Tests use the `runtime` fixture's teardown.
 - **Lima VMs:** the LimaRuntime VM is `odin-host`; integration tests delete it after. Never leave stray VMs (`limactl list -q`); delete by exact name (the user's own VMs like `veronica` are off-limits).

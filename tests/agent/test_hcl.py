@@ -22,8 +22,8 @@ from odin.agent.hcl import (
     unquote,
 )
 from odin.server import not_covered
-from odin.spec.models import Edge, FieldValue, ResourceDesired, Stack
-from odin.spec.translate import canvas_to_stack, skipped_node_types
+from odin.spec.models import REFERENCEABLE_KINDS, Edge, FieldValue, ResourceDesired, Stack
+from odin.spec.translate import MODELLED_NODE_TYPES, canvas_to_stack, skipped_node_types
 
 _FULL_CANVAS = {
     "nodes": [
@@ -875,6 +875,95 @@ def test_a_ref_to_a_node_that_is_not_on_the_canvas_is_reported_not_dropped():
     assert "typo-db" in note and "DATABASE_URL" in note and "web" in note
 
 
+# --- field test 6 (F3): a ref against a kind that can never produce ---------
+#
+# The reported cost: following the README's generic `${{other.ATTR}}` syntax, a
+# lambda referencing an sqs queue reached tofu, created the function, launched
+# the container, and failed there with a message claiming the sqs node
+# "publishes no facts" -- ~2 minutes and a failed apply for a canvas that could
+# be refused deterministically before tofu started. The producer set
+# (`REFERENCEABLE_KINDS`) is static canvas data, so this check needs no I/O.
+
+
+def test_a_ref_to_a_kind_that_cannot_produce_is_refused_before_tofu_runs():
+    canvas = {
+        "nodes": [
+            {"id": "n1", "type": "lambda", "data": {
+                "label": "worker", "env": {"QUEUE_URL": "${{jobs.QUEUE_URL}}"}}},
+            {"id": "n2", "type": "sqs", "data": {"label": "jobs"}},
+        ],
+        "edges": [],
+    }
+    proj = generate_tf(canvas_to_stack(canvas))
+    # Both nodes are still BUILT and covered -- this is a wiring error, not a
+    # coverage gap (the field test 5 distinction, which holds here too).
+    assert 'resource "aws_lambda_function" "worker"' in proj.files["main.tf"]
+    assert 'resource "aws_sqs_queue" "jobs"' in proj.files["main.tf"]
+    assert proj.unsupported == []
+    (note,) = proj.wiring_errors
+    assert "worker (lambda)" in note and "QUEUE_URL" in note
+    assert "'jobs' (kind: sqs)" in note
+    assert "no sqs node publishes an endpoint a reference can resolve" in note
+    assert "Only rds, elasticache, alb and ec2 nodes do" in note
+    # It must not deny the facts the user can see in `odin world`...
+    assert "OBSERVED state, not wiring values" in note
+    assert "publishes no facts" not in note
+    # ...and must say what actually works instead.
+    assert "AWS_ENDPOINT_URL" in note
+
+
+def test_a_ref_to_a_real_producer_on_the_canvas_is_not_a_wiring_error():
+    """The guardrail: this refusal must not start rejecting the wiring that is
+    the whole point of the feature."""
+    canvas = {
+        "nodes": [
+            {"id": "n1", "type": "ecs", "data": {
+                "label": "web", "image": "nginx:alpine", "env": {"DATABASE_URL": "${{db.DATABASE_URL}}"}}},
+            {"id": "n2", "type": "rds", "data": {"label": "db"}},
+        ],
+        "edges": [],
+    }
+    proj = generate_tf(canvas_to_stack(canvas))
+    assert proj.wiring_errors == []
+    assert "depends_on = [aws_db_instance.db]" in proj.files["main.tf"]
+
+
+def test_every_kind_odin_models_is_either_referenceable_or_refused_by_name():
+    """The drift guard on the hcl side. `REFERENCEABLE_KINDS` is what
+    `gateway/wiring.py::producer_facts` can build; a kind that is NOT in it must
+    be refused with the wiring-model reason, never with a readiness reason and
+    never silently wired. Every modelled kind, so a new one cannot slip through
+    by being forgotten."""
+    referenceable, refused = set(), set()
+    for kind in sorted(MODELLED_NODE_TYPES - {"lambda"}):
+        canvas = {
+            "nodes": [
+                {"id": "n1", "type": "lambda", "data": {"label": "worker", "env": {"X": "${{p.ATTR}}"}}},
+                {"id": "n2", "type": kind, "data": _canvas_data_for(kind)},
+            ],
+            "edges": [],
+        }
+        notes = generate_tf(canvas_to_stack(canvas)).wiring_errors
+        # A kind whose own builder declines (a subnet with no VPC) is not in
+        # `refs` at all and reports the not-on-this-canvas reason -- that is a
+        # different question and is excluded rather than mis-counted.
+        if any("is not a resource on this canvas" in note for note in notes):
+            continue
+        (referenceable if not notes else refused).add(kind)
+    assert referenceable == set(REFERENCEABLE_KINDS) - {"lambda"}
+    assert refused and not refused & set(REFERENCEABLE_KINDS)
+
+
+def _canvas_data_for(kind: str) -> dict:
+    """The minimum a node of `kind` needs to be BUILT, so the loop above tests
+    the ref rule rather than a builder decline."""
+    return {
+        "label": "p",
+        "engine": "postgres", "runtime": "python3.12", "image": "nginx:alpine",
+        "partitionKey": "id", "cidr": "10.0.0.0/16", "vpc": "p", "subnet": "p",
+    }
+
+
 # --- field test 5: a wiring typo is not a coverage gap ----------------------
 # An apply with a bad ref put `worker (lambda): env ref ${{ghost.ENDPOINT}}
 # names 'ghost'...` into BOTH `unsupported` and `not_covered` -- for a lambda
@@ -1645,3 +1734,46 @@ def test_no_decline_message_asks_a_cli_user_to_perform_a_ui_gesture(message):
     to make one sends them looking in the wrong place."""
     for gesture in ("drag it into", "rename the node", "needs a Value", "set Type to"):
         assert gesture not in message, f"{gesture!r} in {message!r}"
+
+
+# --- field test 6 follow-up: a JSON number where the panel writes a string ---
+# `FieldValue.value` is `Any` on purpose (the canvas is an open document, and
+# translate.py's boundary check only type-checks `label`/`env`, whose shapes are
+# structural). But every builder here reads config through `_field` and ten call
+# sites then `.strip()` it, so `"allocatedStorage": 20` -- what a hand-written
+# canvas or an importer naturally writes -- crashed the apply with `'int' object
+# has no attribute 'strip'`: a 500 for what is at worst a harmless type choice.
+
+
+def _rds_hcl(storage: object) -> str:
+    canvas = {"nodes": [{"id": "n", "type": "rds", "position": {"x": 0, "y": 0},
+                         "data": {"label": "db", "engine": "postgres",
+                                  "allocatedStorage": storage}}], "edges": []}
+    return generate_tf(canvas_to_stack(canvas, env="p")).files["main.tf"]
+
+
+def test_a_json_number_field_renders_exactly_like_its_string_form():
+    """The whole point: `20` is what the user meant, so it must not be a 500 AND
+    must not be a different answer than `"20"`."""
+    assert _rds_hcl(20) == _rds_hcl("20")
+    assert "allocated_storage   = 20" in _rds_hcl(20)
+
+
+def test_a_boolean_field_gets_hcls_spelling_not_pythons():
+    """`bool` IS an `int` in Python, so it has to be checked first -- and `True`
+    is not valid HCL."""
+    assert hcl._scalar_text(True) == "true"
+    assert hcl._scalar_text(False) == "false"
+    canvas = {"nodes": [{"id": "b", "type": "s3", "position": {"x": 0, "y": 0},
+                         "data": {"label": "buck", "forceDestroy": True}}], "edges": []}
+    assert "True" not in generate_tf(canvas_to_stack(canvas, env="p")).files["main.tf"]
+
+
+def test_a_container_valued_field_falls_back_rather_than_emitting_python_repr():
+    """A dict/list is deliberately NOT coerced: `str({...})` would put Python
+    repr into HCL, which is a silent wrong answer rather than a loud one. The
+    default is the honest response -- a builder reading a key whose shape it never
+    modelled has nothing true to emit."""
+    emitted = _rds_hcl({"oops": 1})
+    assert "oops" not in emitted
+    assert f"allocated_storage   = {hcl._DEFAULT_ALLOCATED_STORAGE}" in emitted

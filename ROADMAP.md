@@ -60,7 +60,12 @@ future decision against these points instead of re-deriving them:
   redacted before the prompt; an unavailable SDK answers `agent unavailable`
   rather than failing. Limits: evidence is capped at 40 log lines and 10 events
   per node and 20 nodes, so a cause that scrolled out of that window won't be
-  in the answer. Still roadmap, not shipped: HCL for kinds with no builder,
+  in the answer. **`ODIN_AI=0` turns BOTH of these off at once** (`agent/ai.py`)
+  — one switch for every model call in the process, checked at the SDK boundary
+  as well as at each feature's own flag, and an unrecognised value disables
+  them too rather than silently allowing a call. Everything else stays: the
+  canvas↔Terraform translation is a deterministic compiler and is completely
+  unaffected. Still roadmap, not shipped: HCL for kinds with no builder,
   least-privilege policy synthesis, import of unmodeled resource types.
 
 ## Roadmap (northstar-derived sequence)
@@ -262,7 +267,11 @@ future decision against these points instead of re-deriving them:
     is real — a `redis:7-alpine` container per cluster, its published port
     advertised as the cluster's node endpoint, zero-drift re-plan — but
     `num_cache_nodes` must be 1 and `engine` must be `redis`; anything else is
-    a real `InvalidParameterValue`, never a silent collapse to one node. No
+    a real `InvalidParameterValue`, never a silent collapse to one node. That
+    was only true of the APPLY path until v0.7.6 — `import-tf` reached the same
+    fixed values by rewriting them, so a three-node memcached cluster became
+    single-node redis without a word. It now warns per substituted argument,
+    which is what makes the sentence above true from both directions. No
     replication groups, no cluster mode, no memcached (which would need a
     different substrate and a `ConfigurationEndpoint` odin doesn't emit), no
     snapshots/parameter groups beyond the metadata the provider reads back.

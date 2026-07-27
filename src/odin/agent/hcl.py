@@ -20,7 +20,7 @@ import zipfile
 import hcl2
 from pydantic import BaseModel
 
-from odin.spec.models import ResourceDesired, Stack
+from odin.spec.models import REFERENCEABLE_KINDS, Ref, ResourceDesired, Stack
 
 _REGION = "us-east-1"
 _SANITIZE = re.compile(r"[^a-z0-9_]")
@@ -175,8 +175,36 @@ def values_preserved(skeleton_attrs: dict, agent_attrs: dict) -> bool:
 
 
 def _field(res: ResourceDesired, key: str, default: str) -> str:
+    """The ONE accessor every builder reads a config field through, and the one
+    place its `-> str` is made true.
+
+    A `FieldValue.value` is `Any` on purpose: the canvas is an open document and
+    `spec/translate.py`'s boundary check is deliberately permissive about
+    `data.*` (only `label` and `env` are type-checked, because only their shapes
+    are structural). But ten call sites here then do `.strip()` on the result,
+    so a canvas carrying `"allocatedStorage": 20` -- a bare JSON number, which is
+    what a hand-written canvas or an importer naturally writes where the config
+    panel would have written "20" -- crashed the apply with `'int' object has no
+    attribute 'strip'`. That is a 500 for what is at worst a client's harmless
+    type choice, and at best exactly what they meant.
+
+    So a scalar is coerced to the text it obviously denotes rather than refused:
+    the alternative, type-checking every consumed field at the boundary, would
+    reject `20` for `20` and buy nothing. A container (dict/list) is NOT
+    coerced -- `str({...})` would emit Python repr into HCL, which is a silent
+    wrong answer, and the honest response is the default. Non-scalars reaching
+    here at all means a builder is reading a key whose shape it never modelled;
+    `_ref_fault` and the boundary check cover the structural cases."""
     fv = res.fields.get(key)
-    return fv.value if fv is not None else default
+    if fv is None or isinstance(fv.value, (dict, list)) or fv.value is None:
+        return default
+    return fv.value if isinstance(fv.value, str) else _scalar_text(fv.value)
+
+
+def _scalar_text(value: object) -> str:
+    """`20` -> "20", `True` -> "true" (HCL's spelling, not Python's `True`),
+    `20.0` -> "20.0". Booleans are checked first because `bool` IS an `int`."""
+    return str(value).lower() if isinstance(value, bool) else str(value)
 
 
 def _block(resource_type: str, name: str, attrs: dict[str, str], nested: str = "") -> str:
@@ -287,12 +315,26 @@ def _depends_on_block(res: ResourceDesired, refs: Refs) -> str:
     return f"  depends_on = [{', '.join(addresses)}]" if addresses else ""
 
 
-def _unwired_refs(res: ResourceDesired, refs: Refs) -> list[str]:
-    """Human reasons for every ref this canvas CANNOT wire -- a ref naming a
-    node that isn't on the canvas (a typo, or a node since deleted). Reported
-    rather than dropped (northstar directive 5): the apply response carries
-    these, so `${{typo.DATABASE_URL}}` is visible at build time instead of only
-    as a crashed container later.
+def _ref_fault(res: ResourceDesired, ref: Ref, refs: Refs) -> str | None:
+    """Why this `${{...}}` ref can NEVER be given a value, or None if it can.
+
+    Two distinct faults, and the second one is field test 6's F3 sub-finding.
+    Keyed off what the target actually IS rather than assembled per-branch, so a
+    new unreferenceable kind gets the right sentence by default:
+
+      NOT ON THE CANVAS -- a typo, or a node since deleted. `_ref_dependencies`
+      silently omits it from `depends_on`, so without this it fails much later.
+
+      ON THE CANVAS BUT NOT A REFERENCE PRODUCER -- `${{queue.QUEUE_URL}}`
+      against an sqs node. Only `REFERENCEABLE_KINDS` publish wiring values
+      (`gateway/wiring.py::producer_facts`), and the reason a user needs is NOT
+      "that node publishes no facts": `odin world` shows an sqs node's
+      `QUEUE_URL` the whole time (measured -- see `REFERENCEABLE_KINDS`). It
+      publishes an OBSERVED fact, which is a different system from wiring, and
+      the message says which kinds the wiring one covers plus the thing that
+      actually works for these four kinds (`AWS_ENDPOINT_URL` + the resource
+      name, both of which the workload already has -- `gateway/keys.py::
+      workload_env`).
 
     WHERE THIS GOES, and why it is not `unsupported` (field test 5). These land
     in `TfProject.wiring_errors`, never in `unsupported`, because they are a
@@ -304,19 +346,44 @@ def _unwired_refs(res: ResourceDesired, refs: Refs) -> list[str]:
     support their node.
 
     IT IS THE SAME ERROR THE GATEWAY ALREADY FAILS ON, CAUGHT EARLIER -- not a
-    third story. A ref naming a node that isn't on the canvas also publishes no
-    facts at launch, so `gateway/wiring.py::_resolve` raises `UnresolvedRef`
-    for it regardless, which `ecsctl`/`lambdactl` turn into a task STOPPED /
-    `State: Failed` with that reason, a `crashed` node, and a FAILED apply.
-    This check reaches the identical verdict from static canvas data, before
-    any container is launched. So a `wiring_errors` entry is never merely
-    advisory: it names a workload that WILL fail."""
-    return [
-        f"{res.id} ({res.kind}): env ref {'${{' + f'{ref.target_id}.{ref.target_attr}' + '}}'} "
-        f"names {ref.target_id!r}, which is not a resource on this canvas — the variable "
-        f"{ref.var} will NOT be set and the workload will fail to start"
-        for ref in res.refs if _TF_TYPES.get(refs.get(ref.target_id, ("", ""))[0]) is None
-    ]
+    third story. Neither fault can resolve at launch either, so
+    `gateway/wiring.py::_resolve` raises `UnresolvedRef` for both regardless,
+    which `ecsctl`/`lambdactl` turn into a task STOPPED / `State: Failed` with
+    that reason, a `crashed` node, and a FAILED apply. This check reaches the
+    identical verdict from static canvas data, before any container is
+    launched. So a `wiring_errors` entry is never merely advisory: it names a
+    workload that WILL fail."""
+    kind = refs.get(ref.target_id, ("", ""))[0]
+    target = "${{" + f"{ref.target_id}.{ref.target_attr}" + "}}"
+    absent = (
+        f"names {ref.target_id!r}, which is not a resource on this canvas"
+        if _TF_TYPES.get(kind) is None else ""
+    )
+    unreferenceable = (
+        f"names {ref.target_id!r} (kind: {kind}) — and no {kind} node publishes an endpoint a "
+        f"reference can resolve. Only {_join_kinds(REFERENCEABLE_KINDS)} nodes do (`odin world` "
+        f"may well show {ref.target_id!r} with facts of its own — those are OBSERVED state, not "
+        f"wiring values). To reach a {kind} resource from this workload, use its name "
+        f"({ref.target_id!r}) with the AWS SDK: odin already injects AWS_ENDPOINT_URL and this "
+        f"node's own credentials into the container"
+        if not absent and kind not in REFERENCEABLE_KINDS else ""
+    )
+    reason = absent or unreferenceable
+    return (
+        f"{res.id} ({res.kind}): env ref {target} {reason} — the variable {ref.var} will NOT "
+        f"be set and the workload will fail to start"
+    ) if reason else None
+
+
+def _join_kinds(kinds: tuple[str, ...]) -> str:
+    return f"{', '.join(kinds[:-1])} and {kinds[-1]}"
+
+
+def _unwired_refs(res: ResourceDesired, refs: Refs) -> list[str]:
+    """Human reasons for every ref this canvas CANNOT wire -- see `_ref_fault`
+    for the two faults and why they are `wiring_errors` rather than
+    `unsupported`."""
+    return [fault for ref in res.refs for fault in [_ref_fault(res, ref, refs)] if fault]
 
 
 def _vpc_ref(res: ResourceDesired, refs: Refs) -> str | None:

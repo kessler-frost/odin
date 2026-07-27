@@ -76,6 +76,7 @@ from odin.aws import cache as cache_mod
 from odin.aws.backings import ACCOUNT, REGION
 from odin.aws.cache import RedisCache
 from odin.gateway import errors
+from odin.gateway.errors import exc_text
 from odin.gateway.stores import NO_CHANGE, SynthStores
 from odin.runtime.colima import CONTAINER_HOST
 from odin.runtime.lima import LIMA_HOST
@@ -287,7 +288,7 @@ def _finish_create(stores: SynthStores, env: str, cluster_id: str, cache: RedisC
         port = cache.ensure(env, cluster_id)
     except Exception as exc:
         log.warning("cache cluster %s failed to boot: %s", cluster_id, exc)
-        _update(stores, env, cluster_id, status=STATUS_CREATE_FAILED, status_reason=str(exc))
+        _update(stores, env, cluster_id, status=STATUS_CREATE_FAILED, status_reason=exc_text(exc))
         return
     _update(
         stores, env, cluster_id, status=STATUS_AVAILABLE, status_reason=None,

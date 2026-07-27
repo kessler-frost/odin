@@ -26,6 +26,7 @@ from odin.server import create_app
 from odin.simulate.runner import SimulateBusy, TfResult, TofuNotInstalled
 from odin.spec.store import SpecStore
 from tests.api.test_apply import CANVAS, FakeRds, FakeRuntime
+from tests.api.test_apply_full import FakeAws
 
 
 def _app(tmp_path):
@@ -104,7 +105,140 @@ def test_destroy_reports_tofu_failure_and_keeps_the_desired_state_for_a_retry(tm
     body = resp.json()
     assert body["tf"] == {"status": "failed", "exit_code": 1, "tail": ["boom"]}
     assert app.state.store.get_stack("default").resources != ()
-    assert "re-running the destroy" in body["error"]
+    assert "re-run `odin destroy --env default`" in body["error"]
+
+
+# --- field test 6 (F2): the failed-destroy NARRATIVE ---
+#
+# The behaviour above is right and stays. What was wrong is what the user was
+# told about it: "The env's desired state was left as it was, so re-running the
+# destroy once the cause above is fixed picks up exactly here" -- while the
+# reconciler was re-creating the s3/sqs/sns/dynamodb resources the destroy had
+# already removed. Measured at the shipped cadence against a real server: a
+# deleted queue and bucket were both back in the REAL backings 0.76s later.
+
+class _BlindRuntime(FakeRuntime):
+    """A machine odin cannot ask: `docker` will not answer at all."""
+
+    def container_names(self):
+        raise RuntimeError("Cannot connect to the Docker daemon")
+
+
+class _CleanRuntime(FakeRuntime):
+    """A machine that really has no container left for this env."""
+
+    def container_names(self):
+        return []
+
+
+_PROVISIONED_CANVAS = {
+    "nodes": [
+        {"type": "sqs", "data": {"label": "jobs"}},
+        {"type": "s3", "data": {"label": "uploads"}},
+        {"type": "rds", "data": {"label": "db"}},
+    ],
+    "edges": [],
+}
+
+
+def test_a_failed_destroy_says_the_reconciler_will_re_create_what_it_removed(tmp_path):
+    """The sentence must name the re-creation, the resources it applies to, the
+    window, and what to do -- and must NOT claim the retry resumes."""
+    app = create_app(
+        runtime=_SurvivingRuntime(), store=SpecStore(tmp_path), rds=FakeRds(), aws=FakeAws(),
+    )
+    _write_state(tmp_path)
+    app.state.tf_runner.destroy = _failing_destroy(1, ("Error: deleting S3 Bucket",))
+    with TestClient(app) as client:
+        client.post("/apply", json=_PROVISIONED_CANVAS)
+        resp = client.post("/destroy")
+
+    assert resp.status_code == 500, resp.text
+    error = resp.json()["error"]
+    assert "did NOT preserve progress" in error
+    assert "RE-CREATES" in error
+    # Only the PROVISIONED kinds, derived from the still-committed Stack -- the
+    # rds node is TF-owned and the loop does not re-create it.
+    assert "jobs (sqs)" in error and "uploads (s3)" in error
+    assert "db (rds)" not in error
+    assert "about one tick" in error
+    # What to do, and the honest characterisation of a retry.
+    assert "starts over rather than resuming" in error
+    assert "`odin stop`" in error
+    # ...and the claim the field test caught is gone for good.
+    assert "picks up exactly here" not in error
+    # `still standing` no longer over-claims either.
+    assert "does NOT list a resource the destroy deleted and the loop has since put back" in error
+
+
+def test_an_env_with_nothing_the_loop_re_creates_is_not_warned_about_it(tmp_path):
+    """Derived, not asserted: the warning is built from the desired Stack, so an
+    env whose desired state holds no s3/sqs/sns/dynamodb resource is not told
+    about a re-creation that cannot happen to it. (`CANVAS` is rds-only.)"""
+    app = _surviving_app(tmp_path)
+    _write_state(tmp_path)
+    app.state.tf_runner.destroy = _failing_destroy(1, ("boom",))
+    with TestClient(app) as client:
+        client.post("/apply", json=CANVAS)
+        error = client.post("/destroy").json()["error"]
+    assert "RE-CREATES" not in error
+    assert "holds no s3/sqs/sns/dynamodb resource" in error
+    assert "nothing was resumed either" in error
+
+
+def test_a_failed_destroy_with_nothing_visible_does_not_read_as_a_success(tmp_path):
+    """`still standing: 0 resource(s) [], 0 container(s) []` contradicted the
+    verdict it was attached to -- a bare `[]` twice, on a report whose whole job
+    is naming what survived. Reachable for real: a timed-out destroy on a machine
+    the containers have already left."""
+    app = create_app(
+        runtime=_CleanRuntime(), store=SpecStore(tmp_path), rds=FakeRds(), backings=False,
+    )
+    _make_workspace(tmp_path)  # a workspace with no state file -> no addresses
+    app.state.tf_runner.destroy = _failing_destroy(-9, ("killed",), timed_out=True)
+    with TestClient(app) as client:
+        client.post("/apply", json=CANVAS)
+        error = client.post("/destroy").json()["error"]
+    assert "still standing: nothing odin can see" in error
+    assert "That is not a success" in error
+    assert "[]" not in error
+
+
+def test_a_destroy_that_cannot_list_containers_says_unknown_not_zero(tmp_path):
+    """`_surviving_containers` returned `[]` both for a clean machine and for a
+    docker daemon that would not answer, with the real reason in the server log
+    only -- so "couldn't tell" wore the words of "there is nothing there"."""
+    app = create_app(
+        runtime=_BlindRuntime(), store=SpecStore(tmp_path), rds=FakeRds(), backings=False,
+    )
+    _write_state(tmp_path)
+    app.state.tf_runner.destroy = _failing_destroy(1, ("boom",))
+    with TestClient(app) as client:
+        client.post("/apply", json=CANVAS)
+        body = client.post("/destroy").json()
+    assert body["still_standing"]["containers"] is None
+    assert "could not read the machine's container list" in body["error"]
+    assert "UNKNOWN rather than zero" in body["error"]
+
+
+def test_nothing_visible_and_nothing_knowable_are_not_the_same_sentence(tmp_path):
+    """The sharp edge of the same distinction, and the one a falsiness test cannot
+    see: tofu's state holds nothing AND docker will not answer. `None` must not be
+    folded into the nothing-standing sentence, because "odin can see nothing" is
+    then a claim odin has no basis for."""
+    app = create_app(
+        runtime=_BlindRuntime(), store=SpecStore(tmp_path), rds=FakeRds(), backings=False,
+    )
+    _make_workspace(tmp_path)  # workspace, no state file -> tf_state == []
+    app.state.tf_runner.destroy = _failing_destroy(-9, ("killed",), timed_out=True)
+    with TestClient(app) as client:
+        client.post("/apply", json=CANVAS)
+        body = client.post("/destroy").json()
+    assert body["still_standing"] == {"tf_state": [], "containers": None}
+    error = body["error"]
+    assert "still standing: nothing odin can see" not in error
+    assert "0 resource(s) [] in tofu state" in error
+    assert "could not read the machine's container list" in error
 
 
 # --- field test 4 (HIGH): a destroy that did not destroy may not say it did --

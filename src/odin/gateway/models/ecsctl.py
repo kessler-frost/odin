@@ -100,6 +100,7 @@ from starlette.responses import Response
 from odin.aws.backings import ACCOUNT, REGION
 from odin.compute.tasks import TaskRuntime, container_name
 from odin.gateway import errors
+from odin.gateway.errors import exc_text
 from odin.gateway.keys import KeyStore, workload_env
 from odin.gateway.models import elbv2ctl, logsctl
 from odin.gateway.stores import NO_CHANGE, SynthStores
@@ -118,10 +119,34 @@ _DEFAULT_COMPATIBILITIES = ["EC2"]
 # delete), which never goes through the lazy sweep at all (this module
 # already knows the outcome the moment it issues the stop).
 _ESSENTIAL_CONTAINER_EXITED = "Essential container in task exited"
-# A container that no longer exists at all -- removed out of band rather than
-# exited on its own. Worth its own reason: "exited" invites a hunt for a crash
-# that never happened.
-_CONTAINER_GONE = "Task container removed outside odin"
+
+
+
+
+def _stated(reason: str, fallback: str) -> str:
+    """A caller-supplied reason, or `fallback` when it says nothing.
+
+    The public `mark_*` seams below take a sentence from `reconcile/drift.py`.
+    Today drift always passes a real one, but a reason is the ONLY thing these
+    seams add to the record, so an empty string would record a failure that
+    explains itself with nothing -- guarded here, at the writer, rather than in
+    each of the readers that would have to guess."""
+    return reason.strip() or fallback
+
+
+def container_gone_reason(container_name: str) -> str:
+    """The ONE wording for "this task's container no longer exists".
+
+    Two paths reach that conclusion and RACE to record it: this module's
+    passive `sweep_tasks` (which sees `absent` on a status read) and
+    `reconcile/drift.py`'s reality sweep. They used to write different strings
+    for the identical event, so whichever won decided what the user saw -- and
+    a test asserting one of them flaked intermittently. Both now call this.
+
+    It says its own reason rather than "exited", because "exited" invites a
+    hunt for a crash that never happened, and it names the remedy because the
+    user's next question is always what to do about it."""
+    return f"container {container_name} removed outside odin — re-Apply to recreate"
 
 # How many trailing lines of a task container's output ONE sweep reads
 # (`docker logs --tail N`) -- see `_ship_task_logs`: bounded so a chatty
@@ -648,7 +673,8 @@ def sweep_tasks(stores: SynthStores, env: str, runtime: TaskRuntime) -> None:
         _update_task(
             stores, env, task["cluster_name"], task["task_id"],
             last_status="STOPPED", stopped_at=time.time(), exit_code=exit_code,
-            stopped_reason=_CONTAINER_GONE if gone else _ESSENTIAL_CONTAINER_EXITED,
+            stopped_reason=(container_gone_reason(task["container_name"]) if gone
+                            else _ESSENTIAL_CONTAINER_EXITED),
         )
         # W2.5: a task that died on its own must leave its load balancer's
         # upstream list too, or the proxy keeps a dead server in rotation. Runs
@@ -668,7 +694,8 @@ def mark_task_stopped(stores: SynthStores, env: str, cluster_name: str, task_id:
     is gone would have it wait forever for a task nothing will replace."""
     _update_task(
         stores, env, cluster_name, task_id,
-        last_status="STOPPED", stopped_at=time.time(), stopped_reason=reason,
+        last_status="STOPPED", stopped_at=time.time(),
+        stopped_reason=_stated(reason, "stopped for a reason odin was not given"),
     )
     task = stores.ecsctl.get(env, _task_key(cluster_name, task_id))
     if task is not None:  # W2.5: a vanished container leaves the LB's rotation too
@@ -726,10 +753,15 @@ def _launch_task(
         # Deliberately broad: this runs on a daemon thread with no caller to
         # propagate an exception to -- see ec2compute.py's `_finish_boot` for
         # the identical "silent hang is forbidden" reasoning.
-        log.warning("task container failed for %s/%s (env %s): %s", service_name, task_id, env, exc)
+        log.warning("task container failed for %s/%s (env %s): %s", service_name, task_id, env, exc_text(exc))
+        # `_exc_text`, not `str(exc)`: this string IS the task's whole
+        # explanation -- `task_verdict` renders it as the apply's failure line
+        # and `reconcile/tf_status.py` as the node's World verdict -- and an
+        # exception built with no args would make both of them fall back to
+        # "task stopped", losing the one fact odin actually had.
         _update_task(
             stores, env, cluster_name, task_id,
-            last_status="STOPPED", stopped_at=time.time(), stopped_reason=str(exc),
+            last_status="STOPPED", stopped_at=time.time(), stopped_reason=exc_text(exc),
         )
         return
     _update_task(
@@ -755,7 +787,7 @@ def _stop_task(stores: SynthStores, env: str, task: dict, runtime: TaskRuntime) 
     try:
         runtime.stop(env, task["task_id"], task["container_name"])
     except Exception as exc:
-        log.warning("stopping task container %s (env %s) failed: %s", task["task_id"], env, exc)
+        log.warning("stopping task container %s (env %s) failed: %s", task["task_id"], env, exc_text(exc))
     stores.ecsctl.delete(env, _task_key(task["cluster_name"], task["task_id"]))
 
 

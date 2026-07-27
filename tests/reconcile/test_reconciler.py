@@ -1247,3 +1247,149 @@ async def test_many_ticks_over_a_steady_healthy_env_emit_nothing(tmp_path):
     for _ in range(45):  # 45 ticks ~= 90s at the real 2s poll interval
         await recon.tick()
     assert emitted == []
+
+
+# --- loop liveness: a reconciler that stopped converging must not look
+# --- healthy (the CancelledError-is-a-BaseException hole) -------------------
+
+
+def _fresh(tmp_path, **kwargs) -> Reconciler:
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(BUCKET,)))
+    return Reconciler(store, FakeRuntime(), aws=FakeAws(), **kwargs)
+
+
+async def _await_a_tick(recon: Reconciler, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while recon.health().ticks == 0:
+        assert time.monotonic() < deadline, "the loop never completed a tick"
+        await asyncio.sleep(0.01)
+
+
+async def test_a_live_loop_reports_ticking_with_a_real_completed_tick_behind_it(tmp_path):
+    recon = _fresh(tmp_path, poll_interval=0.01)
+    await recon.start()
+    try:
+        await _await_a_tick(recon)
+        health = recon.health()
+        assert health.ticking is True
+        assert health.verdict is None
+        assert health.consecutive_failures == 0
+        assert health.last_error is None
+        assert health.last_tick_seconds is not None  # a measured duration, not a guess
+        assert health.last_tick_seconds_ago is not None
+    finally:
+        await recon.stop()
+
+
+async def test_a_cancelled_loop_is_reported_dead_instead_of_silently_stopping(tmp_path):
+    """THE bug this landed for. `asyncio.CancelledError` inherits from
+    BaseException, so it walked straight through `_run`'s `except Exception`
+    and out of the coroutine with no log line, and nothing ever inspected the
+    task afterwards -- `/world` kept serving its last snapshot and `odin
+    status` said "running" while nothing converged. A REAL cancel of the REAL
+    task is the signal here; nothing is fabricated."""
+    recon = _fresh(tmp_path, poll_interval=0.01)
+    await recon.start()
+    await _await_a_tick(recon)
+    task = recon._task
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    health = recon.health()
+    assert health.ticking is False
+    assert "CANCELLED" in health.verdict
+    assert "is NOT converging" in health.verdict
+    assert "odin stop && odin start" in health.verdict  # the remedy, named
+    assert health.ticks >= 1  # it did work before it died -- say so, don't erase it
+
+
+async def test_a_loop_whose_every_tick_raises_stops_reading_as_converging(tmp_path):
+    """The narrower live-but-useless case: a tick that fails every time was
+    logged and swallowed forever, which looked identical to a healthy loop.
+    The failure here is REAL -- a corrupt `world.json`, which is what a
+    truncated write or a hand-edit leaves behind -- so `current_world()`
+    genuinely raises on every pass."""
+    recon = _fresh(tmp_path, poll_interval=0.01, stall_after=0.05)
+    (tmp_path / "default" / "world.json").write_text("{not json")
+    await recon.start()
+    try:
+        deadline = time.monotonic() + 2.0
+        while recon.health().consecutive_failures < 2:
+            assert time.monotonic() < deadline, "the loop never recorded a failing tick"
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.06)  # past `stall_after`, with the loop still alive
+
+        health = recon.health()
+        assert health.ticking is False
+        assert health.ticks == 0
+        assert health.consecutive_failures >= 2
+        assert "have all raised" in health.verdict
+        assert "ValidationError" in health.verdict or "JSONDecodeError" in health.verdict
+        # Field test 6's advice sweep: the remedy follows the REASON. This
+        # verdict used to end "Restart odin (`odin stop && odin start`) to bring
+        # it back" -- which is right for a cancelled or dead task and wrong for
+        # this one: a fresh process re-reads the same corrupt file and raises on
+        # tick 1 forever (measured on a real server -- 20+ consecutive failures
+        # with the file unchanged, because every writer reads before it writes).
+        assert "odin stop && odin start" not in health.verdict
+        assert "a restart re-reads the same inputs and will raise again" in health.verdict
+        assert "world.json" in health.verdict, "the reason has to name the file to be actionable"
+        assert "odin events --env default" in health.verdict
+    finally:
+        recon._task.cancel()
+        await asyncio.gather(recon._task, return_exceptions=True)
+
+
+async def test_a_hung_tick_is_reported_stalled_while_the_task_is_still_alive(tmp_path):
+    recon = _fresh(tmp_path, poll_interval=0.01, stall_after=0.05)
+    entered = asyncio.Event()
+
+    async def _never_returns(_stack):
+        entered.set()
+        await asyncio.Event().wait()
+
+    recon._observe = _never_returns
+    await recon.start()
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2.0)
+        await asyncio.sleep(0.06)
+        health = recon.health()
+        assert health.ticking is False
+        assert recon._task.done() is False  # alive, and still not converging
+        assert "a tick is hung" in health.verdict
+    finally:
+        recon._task.cancel()
+        await asyncio.gather(recon._task, return_exceptions=True)
+
+
+async def test_a_slow_but_completing_tick_is_not_called_stalled(tmp_path):
+    """The false-positive direction: `stall_after` must measure COMPLETED
+    ticks, not tick duration -- a loop doing slow real work (a live drift
+    sweep shelling out to limactl/docker) is converging."""
+    recon = _fresh(tmp_path, poll_interval=0.01, stall_after=0.5)
+    await recon.start()
+    try:
+        await _await_a_tick(recon)
+        for _ in range(5):
+            await asyncio.sleep(0.05)
+            assert recon.health().ticking is True
+    finally:
+        await recon.stop()
+
+
+async def test_a_stopped_loop_says_so_rather_than_claiming_to_tick(tmp_path):
+    recon = _fresh(tmp_path, poll_interval=0.01)
+    await recon.start()
+    await _await_a_tick(recon)
+    await recon.stop()
+    health = recon.health()
+    assert health.ticking is False
+    assert "it has been stopped" in health.verdict
+
+
+async def test_a_never_started_loop_is_not_reported_as_ticking(tmp_path):
+    health = _fresh(tmp_path).health()
+    assert health.ticking is False
+    assert "it was never started" in health.verdict
+    assert health.last_tick_seconds_ago is None

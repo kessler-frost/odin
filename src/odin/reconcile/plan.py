@@ -40,7 +40,22 @@ def plan(stack: Stack, world: World) -> list[Action]:
             continue
 
         if res.kind in PROVISIONED:
-            # AWS-shaped resource in a shared backing: create once, then it just exists.
+            # An AWS-shaped resource inside a shared backing (bucket / queue /
+            # topic / table). NOT "create once and then it just exists", which
+            # is what this used to say and what the very next line contradicts:
+            # `crashed` is in the tuple deliberately, so anything that removes
+            # the real resource while the canvas still asks for it is
+            # RE-CREATED, not merely reported.
+            #
+            # That is the loop's contract and also its sharpest edge, because a
+            # FAILED destroy leaves the desired state committed on purpose (it
+            # is what makes a retry possible), so a resource that destroy did
+            # delete comes straight back. Measured on a real server: a bucket
+            # deleted directly out of the running RustFS backing -- probing the
+            # backing itself, never odin -- was back in 0.73s, one tick at the
+            # production 1s poll. `server.py::_RECREATED_BY_THE_LOOP` is the
+            # sentence that tells the user so, and `odin stop` is what actually
+            # stops it. Nothing here can.
             if phase in ("pending", "crashed"):
                 actions.append(ProvisionResource(id=res.id, service=res.kind))
             else:

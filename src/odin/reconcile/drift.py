@@ -125,7 +125,7 @@ from odin.compute.instances import InstanceVm, vm_name
 from odin.compute.tasks import container_name as task_container_name
 from odin.gateway.models import rdsctl
 from odin.gateway.models.ec2compute import mark_instance_terminated
-from odin.gateway.models.ecsctl import mark_task_stopped
+from odin.gateway.models.ecsctl import container_gone_reason, mark_task_stopped
 from odin.gateway.models.lambdactl import mark_function_failed
 from odin.gateway.stores import SynthStores
 from odin.reconcile.assertions import pg_ready_sync
@@ -141,6 +141,17 @@ _DEFAULT_SWEEP_TICKS = 10
 # ever paid on the failure path, and the whole sweep already runs off the event
 # loop (`Reconciler._drift_verdicts` uses asyncio.to_thread).
 _CONFIRM_DELAY = 1.0
+
+# What a failed probe that carries no error text says. `PgReady.error` is None
+# on the `ok=False`-without-an-exception path (`_pg_connect` returning False),
+# and interpolating that None put the literal word "None" where a user expects
+# a reason. A verdict has to name something true even when the driver says
+# nothing -- rule 2: the failure names what is actually known.
+_NO_PROBE_ERROR = "the connection completed but the readiness query did not return"
+
+
+def _probe_reason(probe) -> str:
+    return probe.error or _NO_PROBE_ERROR
 
 
 def _sweep_ticks() -> int:
@@ -518,10 +529,9 @@ class DriftSweeper:
                 mark_instance_terminated(stores, env, instance_id, out[label])
         for cluster, task_id, name in tasks:
             if live_containers is not None and name not in live_containers:
-                mark_task_stopped(
-                    stores, env, cluster, task_id,
-                    f"container {name} removed outside odin — re-Apply to recreate",
-                )
+                # Same wording as ecsctl's own passive sweep, which races this
+                # one for the identical event -- see `container_gone_reason`.
+                mark_task_stopped(stores, env, cluster, task_id, container_gone_reason(name))
         self._sweep_databases(stores, env, out)
         return out
 
@@ -543,7 +553,14 @@ class DriftSweeper:
         rather than need a human Apply), so it remains a verdict on this
         cadence, not an apply-failing fault -- see ROADMAP's limits."""
         for label, record in _db_records(stores, env):
-            if self._probe_db(record).ok:
+            # ONE probe, and the verdict quotes THAT probe. Re-probing to fetch
+            # the error text let the reported reason come from a different
+            # sample than the one that failed: a second probe that SUCCEEDED
+            # carries no error, so the verdict asserted a failure its own
+            # newest evidence had just disproved -- and rendered the reason as
+            # the literal string "None".
+            probe = self._probe_db(record)
+            if probe.ok:
                 continue
             identifier = record["db_instance_identifier"]
             name = db_container_name(env, identifier)
@@ -551,7 +568,7 @@ class DriftSweeper:
                 # The container is up but Postgres isn't answering. Reported,
                 # NOT written into the record: this may be transient, and a
                 # corrected record would need a human Apply to undo.
-                out[label] = f"Postgres on {name} is not accepting connections: {self._probe_db(record).error}"
+                out[label] = f"Postgres on {name} is not accepting connections: {_probe_reason(probe)}"
                 continue
             # CONFIRM BEFORE CORRECTING (found running the real thing): a
             # single failed sample is not proof. Under real load -- a `tofu
@@ -576,7 +593,7 @@ class DriftSweeper:
             # longer exists is the truth, not "exit -1".
             exit_code = self._containers.exit_code(name)
             out[label] = (
-                f"container {name} removed outside odin — re-Apply to recreate" if exit_code < 0
+                container_gone_reason(name) if exit_code < 0
                 else f"container {name} is not running (exit {exit_code}) — re-Apply to recreate"
             )
             # A confirmed death: the same sentence goes into the RECORD, so the

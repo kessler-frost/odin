@@ -32,6 +32,7 @@ import asyncio
 import os
 import shutil
 import tempfile
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -106,22 +107,36 @@ _TF_TYPE = {kind: rtype for rtype, kind in _KIND.items() if kind not in _NO_LIVE
 # (`__is_block__` is python-hcl2's internal block marker, never a real arg).
 _IGNORED_ATTRS = {"__is_block__"}
 _CARRIED_ATTRS = {
-    "s3": {"bucket", "tags"},
+    # `force_destroy` is carried in the sense that odin always re-emits it --
+    # as `true`, unconditionally (hcl.py's `_s3`). A source `force_destroy =
+    # false` is therefore a CHANGED argument (`_FIXED_VALUES`), not a dropped
+    # one: v0.7.5 reported it as "unmodeled", which reads as "odin ignored it"
+    # when odin actually flips a bucket the user protected into one `tofu
+    # destroy` will empty.
+    "s3": {"bucket", "force_destroy", "tags"},
     "sqs": {"name"},
     "sns": {"name"},
-    "dynamodb": {"name", "hash_key", "range_key", "attribute"},
+    # `billing_mode` likewise: odin always emits PAY_PER_REQUEST, so a
+    # PROVISIONED table with read/write capacity is a changed argument.
+    "dynamodb": {"name", "billing_mode", "hash_key", "range_key", "attribute"},
     "iam_role": {"name"},  # assume_role_policy/inline policies are NOT carried -> warned
     "logs": {"name", "retention_in_days", "tags"},
     # W2.4: `recovery_window_in_days` is carried in the sense that odin always
-    # emits its own value (0 -- see hcl.py's `_secret`), so a differing imported
-    # one is deliberately NOT surfaced as a dropped attribute the user must act
-    # on. The VALUE isn't here at all: it lives on the companion
+    # emits its own value (0 -- see hcl.py's `_secret`). Until v0.7.6 that was
+    # where the sentence stopped, and a source `recovery_window_in_days = 30`
+    # became 0 in silence -- a 30-day undelete window turned into immediate,
+    # irreversible deletion. It is a `_FIXED_VALUES` entry now, so odin's own
+    # 0 still round-trips quietly while a DIFFERING one is reported.
+    # The VALUE isn't here at all: it lives on the companion
     # aws_secretsmanager_secret_version resource, assembled separately below.
     "secret": {"name", "description", "recovery_window_in_days", "tags"},
     "ssm": {"name", "type", "value", "description", "tags"},
-    # engine/num_cache_nodes are carried because hcl.py always re-emits them
-    # (redis, 1) -- so a round-trip reproduces the resource without warning
-    # about arguments odin does model, just doesn't need on the node.
+    # engine/num_cache_nodes are carried because hcl.py always re-emits them --
+    # as `redis` and `1`, unconditionally. THIS COMMENT USED TO STOP THERE, and
+    # that was the bug: neither value reaches the canvas node at all, so a
+    # 3-node memcached cluster came back as a single-node redis one with no
+    # warning of any kind (a different datastore, a different wire protocol,
+    # a third of the nodes). Both are `_FIXED_VALUES` entries now.
     "elasticache": {"cluster_id", "engine", "node_type", "num_cache_nodes", "tags"},
     # `password` IS carried (unlike every other secret odin touches): dropping
     # it would make a round-trip through generate_tf silently substitute the
@@ -146,27 +161,70 @@ _CARRIED_ATTRS = {
 # reproduces (hcl.py's alb companion pass emits exactly these). Until v0.7.1
 # nothing computed dropped attributes for a companion at all, so a target
 # group's `matcher`, `stickiness`, `deregistration_delay` -- and every
-# health_check member except `path` -- vanished without a word.
+# health_check member except `path` -- vanished without a word. v0.7.6 adds the
+# OTHER TWO companion types, which still had no honesty pass of any kind: an
+# sns subscription's `filter_policy` (a routing rule -- without it the queue
+# starts receiving every message on the topic) and `raw_message_delivery =
+# false` (odin always emits true, which changes the envelope every consumer
+# parses), plus a secret version's `version_stages`.
 _CARRIED_COMPANION_ATTRS = {
     "aws_lb_target_group": {"name", "port", "protocol", "vpc_id", "target_type", "health_check"},
     "aws_lb_listener": {"load_balancer_arn", "port", "protocol", "default_action"},
+    "aws_sns_topic_subscription": {"topic_arn", "protocol", "endpoint", "raw_message_delivery"},
+    "aws_secretsmanager_secret_version": {"secret_id", "secret_string"},
 }
 _CARRIED_HEALTH_CHECK_ATTRS = {"path"}
 # (owner, attribute) -> the value odin ALWAYS emits, lowercased. An imported
 # value that differs is reported by name: the argument survives, its MEANING
 # does not. Owner is the canvas kind for a primary resource, the aws_* type for
 # a companion.
+#
+# EVERY ENTRY HERE IS A SUBSTITUTION ODIN MAKES BECAUSE THE LOCAL SUBSTRATE
+# CANNOT DO THE OTHER THING (a real redis container is not memcached; odin's
+# DeleteSecret has no recovery window; there is no snapshot surface to take a
+# final snapshot into). The substitution is a legitimate limit -- the SILENCE
+# was the bug, and this table is the whole cure: an entry is compared against
+# the source's own value, so odin's own generated HCL round-trips without a
+# word while anything else is named on the import itself.
 _FIXED_VALUES = {
+    ("s3", "force_destroy"): "true",
+    ("dynamodb", "billing_mode"): "pay_per_request",
+    ("secret", "recovery_window_in_days"): "0",
+    ("elasticache", "engine"): "redis",
+    ("elasticache", "num_cache_nodes"): "1",
+    ("rds", "skip_final_snapshot"): "true",
     ("alb", "internal"): "true",
     ("alb", "load_balancer_type"): "application",
     ("aws_lb_target_group", "protocol"): "http",
     ("aws_lb_target_group", "target_type"): "instance",
     ("aws_lb_listener", "protocol"): "http",
+    ("aws_sns_topic_subscription", "protocol"): "sqs",
+    ("aws_sns_topic_subscription", "raw_message_delivery"): "true",
+}
+# The default odin's `_node_data` falls back to when a NUMERIC argument's source
+# value isn't a literal number odin can read (`allocated_storage = var.size`,
+# `retention_in_days = local.days`) -> {kind: {attribute: what that costs the
+# user}}. A quoted `"500"` IS readable (see `_int_text`); a computed one is not,
+# and substituting odin's default for it in silence is the elasticache bug in
+# another costume -- a 500 GiB database imported as 20 GiB, a 30-day log
+# retention imported as never-expire.
+_RDS_DEFAULT_STORAGE = "20"  # hcl.py::_DEFAULT_ALLOCATED_STORAGE
+_UNREADABLE_NUMBERS = {
+    "logs": {
+        "retention_in_days": "the canvas gets no retention at all -- AWS's never-expire default",
+    },
+    "rds": {
+        "allocated_storage": f"the canvas gets odin's default {_RDS_DEFAULT_STORAGE} GiB",
+    },
 }
 # The kinds whose user `tags` map survives the round trip as node data (hcl.py's
 # `_tags_block` merges a node's own `tags` field back in for EVERY primary
 # builder, so this is purely about which imports bother to read them).
-_TAGGED_KINDS = {"s3", "logs", "secret", "ssm", "rds", "alb", "vpc", "subnet"}
+# `elasticache` was missing here while `tags` sat in its `_CARRIED_ATTRS` set,
+# which is the worst possible combination: the tags were dropped AND the drop
+# was suppressed. Reading them is the fix -- hcl.py already re-emits whatever a
+# node carries -- not a warning about losing them.
+_TAGGED_KINDS = {"s3", "logs", "secret", "ssm", "rds", "alb", "vpc", "subnet", "elasticache"}
 _CONTAINER_KINDS = ("vpc", "subnet")
 
 # Canvas geometry for the layout pass. These ARE the UI's own container sizes
@@ -216,18 +274,27 @@ class LiveResource:
     id: str
 
 
-def _label(rtype: str, rname: str, attrs: dict) -> str:
-    name_attr = _NAME_ATTR.get(rtype)
-    value = attrs.get(name_attr) if name_attr else None
+def _plain_literal(value: object) -> str | None:
+    """`value` as a plain string literal, or None when it is anything computed.
+
+    Only a plain literal (no leftover `${...}`, whether it was a bare reference
+    or a literal with an embedded interpolation) is a value odin can carry onto
+    the canvas."""
     unquoted = hcl.unquote(value) if isinstance(value, str) else None
-    # Only a plain literal (no leftover `${...}`, whether it was a bare
-    # reference or a literal with an embedded interpolation) is trustworthy
-    # as a human label; anything computed falls back to odin's own management
-    # tag (which IS the canvas label, so odin's generated HCL round-trips even
-    # for the name-less kinds), then to the resource's own HCL name.
-    if isinstance(unquoted, str) and "${" not in unquoted:
-        return unquoted
-    return _tags(attrs, odin_tag=True).get("odin:node") or rname
+    return unquoted if isinstance(unquoted, str) and "${" not in unquoted else None
+
+
+def _label(rtype: str, rname: str, attrs: dict) -> str:
+    """The canvas label -- which for every named kind IS the name odin will
+    create the resource under, so a fallback here RENAMES a real resource
+    (reported by `_renamed_by_import`, never silent).
+
+    A computed name falls back to odin's own management tag (which IS the canvas
+    label, so odin's generated HCL round-trips even for the name-less kinds),
+    then to the resource's own HCL name."""
+    name_attr = _NAME_ATTR.get(rtype)
+    literal = _plain_literal(attrs.get(name_attr)) if name_attr else None
+    return literal or _tags(attrs, odin_tag=True).get("odin:node") or rname
 
 
 def _ref_target(value: object) -> str | None:
@@ -307,22 +374,108 @@ def _literal(value: object) -> str:
     return str(unquoted).lower()
 
 
-def _unsurvived_attrs(owner: str, attrs: dict, carried: set[str]) -> list[str]:
-    """Every argument on this resource that a round trip through `generate_tf`
-    would NOT reproduce -- reported by name, never dropped in silence (the
+def _int_text(value: object) -> str | None:
+    """An HCL integer argument as digits, or None when the source value isn't a
+    literal number at all. python-hcl2 parses `20` as a real int and a quoted
+    `"20"` as a 4-character string (both are valid HCL for a number argument and
+    both must survive), while `var.size` arrives as the string `${var.size}`,
+    which nothing can turn into a number here -- and `isinstance(True, int)` is
+    True in Python, so a bool has to be excluded explicitly."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value)
+    unquoted = hcl.unquote(value)
+    return unquoted if isinstance(unquoted, str) and unquoted.isdigit() else None
+
+
+def _derived_changes(triples: Iterable[tuple[str, object, str]]) -> dict[str, str]:
+    """{attribute: why} for each `(attribute, source value, what odin emits)`
+    whose source value disagrees with what odin emits -- the `_FIXED_VALUES`
+    check for the values odin COMPUTES per resource instead of hardcoding: a
+    node's own name, a target group's `<alb label>-tg`."""
+    return {
+        attr: f"odin always emits {expected}"
+        for attr, value, expected in triples
+        if value is not None and _literal(value) != _literal(expected)
+    }
+
+
+def _renamed_by_import(rtype: str, attrs: dict, label: str) -> dict[str, str]:
+    """The name argument odin could not read (`name = "${var.env}-jobs"`).
+
+    The canvas label falls back to the HCL resource name, and `generate_tf` then
+    emits THAT as the real bucket/queue/table/cluster name -- so importing a
+    project whose names are built from variables silently renames every resource
+    in it. Compared against the label rather than tested for `${`, so a name odin
+    CAN read (the round-trip case) never fires."""
+    return _derived_changes((attr, attrs.get(attr), label) for attr in (_NAME_ATTR.get(rtype),) if attr)
+
+
+def _unreadable_numbers(kind: str, attrs: dict) -> dict[str, str]:
+    """The numeric arguments whose source value odin cannot read as a number, so
+    `_node_data`'s own default lands on the canvas instead (`_UNREADABLE_NUMBERS`)."""
+    return {
+        attr: f"not a literal number, so {cost}"
+        for attr, cost in _UNREADABLE_NUMBERS.get(kind, {}).items()
+        if attr in attrs and _int_text(attrs[attr]) is None
+    }
+
+
+def _uncarried_attribute_blocks(attrs: dict, data: dict) -> list[str]:
+    """A dynamodb `attribute {}` block for something that is neither the hash nor
+    the range key. `generate_tf` emits an attribute block for exactly those two,
+    so a secondary index's key attribute does not survive -- the index itself is
+    already reported as an unmodeled argument, its attribute was not."""
+    keys = {data.get("hashKey"), data.get("rangeKey")}
+    return [f"attribute.{name}" for name in _attribute_types(attrs) if name not in keys]
+
+
+def _attribute_notes(
+    owner: str, attrs: dict, carried: set[str],
+    also_dropped: Iterable[str], also_changed: dict[str, str],
+) -> tuple[list[str], list[str]]:
+    """`(dropped, changed)` -- the two ways an argument fails to survive a round
+    trip through `generate_tf`, reported by name, never dropped in silence (the
     v0.5.4 attribute-honesty rule, which is meant to have no exceptions).
 
-    Two ways an argument fails to survive: odin doesn't model it at all, or
-    odin always emits its own value for it and the source's value differs. The
-    second kind is the sneakier one -- the argument is still THERE in the
-    regenerated HCL, saying something else."""
-    dropped = [k for k in attrs if k not in carried and k not in _IGNORED_ATTRS]
-    overridden = [
-        f"{key}={_literal(attrs[key])} (odin always emits {want})"
+    Either odin doesn't model the argument at all (`dropped`), or odin emits its
+    own value for it and the source's value differs (`changed`). The second kind
+    is the sneakier one -- the argument is still THERE in the regenerated HCL,
+    saying something else -- and it is returned SEPARATELY because through
+    v0.7.5 both shared one line reading "imported without unmodeled
+    attribute(s)", which says odin IGNORED the argument when odin in fact
+    changed the resource. `also_changed` carries the cases a static table can't
+    express: a value odin computes per resource, and a number odin can't read.
+    """
+    dropped = sorted({k for k in attrs if k not in carried and k not in _IGNORED_ATTRS} | set(also_dropped))
+    fixed = {
+        key: f"odin always emits {want}"
         for (fixed_owner, key), want in _FIXED_VALUES.items()
         if fixed_owner == owner and key in attrs and _literal(attrs[key]) != want
+    }
+    changed = sorted(
+        f"{key}={_literal(attrs[key])} ({why})"
+        for key, why in {**fixed, **also_changed}.items() if key in attrs
+    )
+    return dropped, changed
+
+
+def _attribute_warnings(subject: str, what: str, dropped: list[str], changed: list[str]) -> list[str]:
+    """The per-resource honesty lines a caller surfaces (`cli/translate.py`
+    prints each as `warning: ...` on stderr, and they ride in the JSON body's
+    `warnings` array for programmatic callers).
+
+    Two lines, not one, and the second one says CHANGED: an argument odin
+    substitutes its own value for is not a missing argument, and a user reading
+    "imported without unmodeled attribute(s): engine=memcached" would reasonably
+    conclude their cluster was imported unchanged minus a detail."""
+    return [
+        *([f"{subject}: imported without unmodeled {what}attribute(s): {', '.join(dropped)}"]
+          if dropped else []),
+        *([f"{subject}: imported with CHANGED {what}argument(s) -- odin substitutes its own "
+           f"value: {', '.join(changed)}"] if changed else []),
     ]
-    return sorted(dropped + overridden)
 
 
 def _dropped_health_check_attrs(tg_attrs: dict) -> list[str]:
@@ -351,11 +504,14 @@ def _node_data(kind: str, label: str, attrs: dict) -> dict:
             if range_key in types:
                 data["rangeKeyType"] = types[range_key]
     if kind == "logs":
-        # python-hcl2 parses an unquoted `retention_in_days = 14` as a real int
-        # (verified empirically) -- the canvas field is text, so stringify it.
-        retention = attrs.get("retention_in_days")
-        if isinstance(retention, int):
-            data["retentionInDays"] = str(retention)
+        # `_int_text` because a quoted `retention_in_days = "30"` is valid HCL for
+        # a number argument and used to fall straight through an `isinstance(int)`
+        # test into "no retention" -- i.e. never expire, for a group the user
+        # asked to expire. A genuinely computed value still can't be carried, and
+        # `_unreadable_numbers` reports THAT rather than substituting in silence.
+        retention = _int_text(attrs.get("retention_in_days"))
+        if retention is not None:
+            data["retentionInDays"] = retention
     if kind == "ssm":
         # W2.4: the parameter's VALUE comes across as canvas data -- the same
         # trust model as any other import (SECURITY.md: treat an imported .tf
@@ -370,10 +526,10 @@ def _node_data(kind: str, label: str, attrs: dict) -> dict:
         if isinstance(description, str):
             data["description"] = description
     if kind == "rds":
-        # python-hcl2 parses an unquoted `allocated_storage = 20` as a real int
-        # (the same thing logs' retention does); the canvas fields are text.
-        storage = attrs.get("allocated_storage")
-        data["allocatedStorage"] = str(storage) if isinstance(storage, int) else "20"
+        # Same reading as logs' retention above, and the same reason: a quoted
+        # `allocated_storage = "500"` silently became odin's default 20 GiB.
+        storage = _int_text(attrs.get("allocated_storage"))
+        data["allocatedStorage"] = storage or _RDS_DEFAULT_STORAGE
         for attr, field in (("engine", "engine"), ("instance_class", "instanceClass"),
                             ("db_name", "dbName"), ("username", "username"), ("password", "password")):
             value = hcl.unquote(attrs.get(attr))
@@ -430,8 +586,9 @@ def _stamp_containment(
     for label, node in node_by_label.items():
         if node["type"] != "alb":
             continue
+        wanted = attrs_by_label[label].get("subnets") or []
         subnet = next(
-            (found for value in (attrs_by_label[label].get("subnets") or [])
+            (found for value in wanted
              if (found := _referenced_label(value, "aws_subnet", by_hcl_name))),
             None,
         )
@@ -442,6 +599,16 @@ def _stamp_containment(
             "aws_subnet inside an imported aws_vpc, so Apply will skip it (\"not contained inside "
             "a Subnet on the canvas\") until you draw a VPC + Subnet and drop it inside"
         ]
+        # A canvas node sits in exactly ONE Subnet box, so only the first
+        # resolvable subnet becomes containment. Real load balancers are
+        # multi-AZ by requirement (the API rejects a single subnet for an ALB),
+        # so this is the common case, not the exotic one -- and it changed the
+        # regenerated `subnets` list in silence through v0.7.5.
+        warnings += [
+            f"{label} (alb): imported into ONE subnet ({subnet}) of the {len(wanted)} its `subnets` "
+            "names -- a canvas node lives inside a single Subnet box, so the rest are dropped and "
+            "the regenerated aws_lb spans one subnet"
+        ] if subnet and vpc and len(wanted) > 1 else []
     return warnings
 
 
@@ -541,9 +708,12 @@ def parse_hcl(files: dict[str, str]) -> ImportResult:
         nodes.append(node)
         node_by_label[label] = node
         attrs_by_label[label] = attrs
-        dropped = _unsurvived_attrs(kind, attrs, _CARRIED_ATTRS.get(kind, set()))
-        if dropped:
-            warnings.append(f"{label} ({kind}): imported without unmodeled attribute(s): {', '.join(dropped)}")
+        dropped, changed = _attribute_notes(
+            kind, attrs, _CARRIED_ATTRS.get(kind, set()),
+            _uncarried_attribute_blocks(attrs, node["data"]),
+            {**_renamed_by_import(rtype, attrs, label), **_unreadable_numbers(kind, attrs)},
+        )
+        warnings += _attribute_warnings(f"{label} ({kind})", "", dropped, changed)
         index += 1
 
     # W2.4: a companion `aws_secretsmanager_secret_version` carries the VALUE,
@@ -561,6 +731,11 @@ def parse_hcl(files: dict[str, str]) -> ImportResult:
         # `secret_string = jsonencode(...)` or a var reference) can't be carried.
         if node is not None and isinstance(value, str) and "${" not in value:
             node["data"]["secretString"] = value
+            version_type = "aws_secretsmanager_secret_version"
+            dropped, changed = _attribute_notes(
+                version_type, attrs, _CARRIED_COMPANION_ATTRS[version_type], (), {},
+            )
+            warnings += _attribute_warnings(f"{label} (secret)", f"{version_type} ", dropped, changed)
             continue
         unsupported.append(Unsupported(
             type="aws_secretsmanager_secret_version", name=rname,
@@ -602,16 +777,21 @@ def parse_hcl(files: dict[str, str]) -> ImportResult:
         # primary resource's: v0.7.0 folded them on and said nothing about what
         # it left behind (a target group's `matcher = "200-299"`, every
         # health_check member but `path`).
+        label = node["data"]["label"]
         for companion_type, companion_attrs in (
             ("aws_lb_listener", attrs), ("aws_lb_target_group", tg_attrs),
         ):
-            lost = _unsurvived_attrs(
-                companion_type, companion_attrs, _CARRIED_COMPANION_ATTRS[companion_type]
-            ) + (_dropped_health_check_attrs(companion_attrs) if companion_type.endswith("group") else [])
-            warnings += [
-                f"{node['data']['label']} (alb): imported without unmodeled "
-                f"{companion_type} attribute(s): {', '.join(sorted(lost))}"
-            ] if lost else []
+            dropped, changed = _attribute_notes(
+                companion_type, companion_attrs, _CARRIED_COMPANION_ATTRS[companion_type],
+                # A listener carries no health_check block and no `name`, so both
+                # of these are no-ops for it -- no per-type branch needed.
+                _dropped_health_check_attrs(companion_attrs),
+                # hcl.py names the target group `<the alb node's label>-tg`, so a
+                # target group the user named anything else is renamed by the
+                # round trip (silent through v0.7.5).
+                _derived_changes([("name", companion_attrs.get("name"), f"{label}-tg")]),
+            )
+            warnings += _attribute_warnings(f"{label} (alb)", f"{companion_type} ", dropped, changed)
     for rtype, rname, attrs in alb_companions:
         if rtype == "aws_lb_target_group" and f"aws_lb_target_group.{rname}" not in claimed_target_groups:
             unsupported.append(Unsupported(
@@ -630,6 +810,18 @@ def parse_hcl(files: dict[str, str]) -> ImportResult:
         queue_label = by_hcl_name.get(f"aws_sqs_queue.{queue_target}") if queue_target else None
         if topic_label and queue_label:
             edges.append({"source": topic_label, "target": queue_label})
+            # The subscription becomes an EDGE, and an edge carries no arguments
+            # -- so everything the source put ON the subscription has to be
+            # accounted for here or it vanishes. `filter_policy` is the one that
+            # matters most: drop it and the queue starts receiving every message
+            # published to the topic, which no warning ever mentioned.
+            sub_type = "aws_sns_topic_subscription"
+            dropped, changed = _attribute_notes(
+                sub_type, attrs, _CARRIED_COMPANION_ATTRS[sub_type], (), {},
+            )
+            warnings += _attribute_warnings(
+                f"{topic_label} -> {queue_label} (sns subscription)", "", dropped, changed,
+            )
         else:
             unsupported.append(Unsupported(
                 type="aws_sns_topic_subscription", name=rname,

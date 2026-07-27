@@ -63,6 +63,7 @@ _STATUS = {
     "SignatureDoesNotMatch": 401,
     "AccessDenied": 403,
     "ServiceUnavailable": 503,
+    "InternalFailure": 500,
 }
 
 
@@ -152,6 +153,24 @@ def service_unavailable(service: str) -> Response:
     return _respond(service, "ServiceUnavailable", "The backing service is not currently available")
 
 
+def internal_failure(service: str, exc_name: str) -> Response:
+    """The handler of last resort: something raised that no path anticipated.
+
+    It exists because this app is what tofu's AWS provider and every workload
+    SDK talk to, and a bare-text 500 handed to botocore or aws-sdk-go-v2 is not
+    an error those clients can interpret -- they surface a parse failure, or
+    retry an unretryable fault, instead of reporting what went wrong. So even a
+    total surprise leaves here wearing the wire shape of the service that was
+    asked for.
+
+    Names the exception TYPE and nothing else. The full detail goes to the
+    server log, where the operator reads it; this response can reach an
+    unauthenticated caller (the gateway binds 0.0.0.0, and a request can fail
+    before SigV4 verification runs), so it must not carry paths or values. Real
+    AWS's own InternalFailure is opaque for the same reason."""
+    return _respond(service, "InternalFailure", f"odin's gateway failed to handle this request ({exc_name})")
+
+
 def synth_error(service: str, code: str, message: str, status: int) -> Response:
     """A synth-authored error (gateway.synth) with an explicit status and
     the EXACT wire code -- unlike `access_denied`/`auth_error`'s fixed
@@ -175,3 +194,24 @@ def synth_error(service: str, code: str, message: str, status: int) -> Response:
     if service == "lambda":
         return _lambda_response(code, message, status)
     return Response(_json_body_raw(service, code, message), status_code=status, media_type="application/x-amz-json-1.0")
+
+
+def exc_text(exc: BaseException) -> str:
+    """`ClassName: message`, and something true when there IS no message.
+
+    THE one wording for "an exception is the reason". It lives here because
+    this module is a leaf -- it imports nothing from odin -- so every writer
+    that records a failure can import it without closing the
+    `reconcile.reconciler` -> `reconcile.drift` -> `gateway.models.*` cycle
+    that made three of them keep private copies.
+
+    `str(exc)` is `''` for any exception constructed with no arguments, and
+    two really do reach these paths: an interpreter-raised `MemoryError`
+    (`args == ()`), and `httpx.PoolTimeout`, which httpcore raises bare and
+    httpx's own mapping preserves. A blank is not merely ugly -- lambdactl's
+    `_configuration_json` renders `state_reason or None` and `_json` drops
+    every None, so an empty reason made `StateReason` vanish from the wire and
+    GetFunction answered `State: Failed` with no reason at all."""
+    return f"{type(exc).__name__}: {exc}" if str(exc) else (
+        f"{type(exc).__name__} (raised with no message, so the class is the whole of it)"
+    )

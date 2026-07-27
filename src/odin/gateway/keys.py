@@ -18,6 +18,9 @@ from pathlib import Path
 
 from odin.aws.backings import REGION
 from odin.runtime.colima import CONTAINER_HOST
+from pydantic import TypeAdapter, constr
+
+from odin.spec.store import CREDENTIALS, _load
 from odin.util import atomic_write_text
 
 _URLSAFE_ALPHABET = string.ascii_letters + string.digits + "-_"
@@ -42,6 +45,10 @@ class Principal:
 
     env: str
     node_id: str
+
+
+# access key + secret, exactly two, both non-empty -- the shape `issue` writes.
+_KEYFILE = TypeAdapter(dict[str, tuple[constr(min_length=1), constr(min_length=1)]])
 
 
 class KeyStore:
@@ -102,7 +109,16 @@ class KeyStore:
         if not path.exists():
             self._by_env.setdefault(env, {})
             return
-        raw: dict[str, list[str]] = json.loads(path.read_text())
+        # VALIDATED, not just parsed, and this one is load-bearing for AUTH.
+        # `{"db": "AKIAodin1234"}` -- a bare string where the pair belongs --
+        # parses as JSON, and `pair[0], pair[1]` then INDEXES THE STRING: odin
+        # registered access key 'A' with secret 'K', so a one-character key
+        # would have authenticated as that node. The same shape that made the
+        # debug route's scrub set redact single letters, except here it forges a
+        # principal. `_load` turns every bad shape into one StoreUnreadable that
+        # names the file; role CREDENTIALS carries the recovery, which is not
+        # "delete it" -- a container already running holds the old pair.
+        raw = _load(path, CREDENTIALS, _KEYFILE.validate_json)
         nodes = {node_id: (pair[0], pair[1]) for node_id, pair in raw.items()}
         self._by_env[env] = nodes
         for node_id, (access_key, _secret_key) in nodes.items():

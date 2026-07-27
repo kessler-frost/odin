@@ -7,6 +7,17 @@
 //
 // Class strings are written out in full (not constructed) so Tailwind's scanner
 // keeps them.
+//
+// PLACEHOLDERS -- the one invariant this file owes the user. A tile whose `type`
+// is not in spec/translate.py's `_KIND` can never become a Stack resource: Apply
+// reports it under `skipped_node_types` and touches nothing. Drawn beside a real
+// one it is indistinguishable, so every such entry MUST say `(placeholder)` at
+// the end of its `sublabel` and MUST NOT declare `iamActions` (see the kms note
+// below for why the permissions are the sharper half of the lie). The rule reads
+// both ways: `(placeholder)` in a sublabel means Apply skips it, and nothing
+// else does. When a placeholder becomes real, the marker comes off in the same
+// commit that adds it to `_KIND`.
+// Today: kinesis, kms, route53, apigateway, efs, events, ebs, eip, igw.
 
 // `multiline`/`placeholder` mirror ConfigPanel's own FieldDef (catalogFields
 // spreads straight into it), so a catalog entry can declare a textarea field
@@ -52,6 +63,45 @@ export type ServiceDef = {
   iamActions?: string[];                // if this is an IAM target
 };
 
+// The seven BESPOKE resources: real, modelled services that render through their
+// own node components instead of the generic ServiceNode, which is why they are
+// not CATALOG entries. They live here anyway for two reasons.
+//
+// One: the sidebar renders `[...BUILTINS, ...CATALOG]`, so the honesty invariant
+// this file owes the user -- a tile either models a real service or says
+// `(placeholder)` -- has to hold over all 27 tiles, not the 20 in CATALOG. That
+// needs a `type` to check against translate.py's `_KIND`, which the sidebar's own
+// tile shape never carried.
+//
+// Two: Sidebar.tsx and Canvas.tsx each used to keep their own hardcoded copy of
+// this list, and Canvas's copy is the load-bearing one -- its `nodeTypeMap`
+// spreads the catalog AFTER these keys, so a catalog entry declaring abbr 'S3'
+// would silently override the bespoke tile and drop the wrong node type. Two
+// copies of a list where one silently wins is a bug waiting for its second
+// author; both now derive from here.
+//
+// `iconClass` is spelled out in full rather than built from COLORS for the same
+// reason every other class string in this file is: Tailwind's scanner only sees
+// literal text.
+export type BuiltinDef = {
+  type: string;         // node type (matches backend node_type)
+  abbr: string;         // sidebar drag key
+  label: string;
+  sublabel: string;
+  category: string;
+  iconClass: string;
+};
+
+export const BUILTINS: BuiltinDef[] = [
+  { type: 'vpc', abbr: 'VPC', label: 'VPC', sublabel: 'Virtual Private Cloud', category: 'Networking', iconClass: 'text-neon-purple border-neon-purple' },
+  { type: 'subnet', abbr: 'SUB', label: 'Subnet', sublabel: 'Network partition', category: 'Networking', iconClass: 'text-neon-blue border-neon-blue' },
+  { type: 'sg', abbr: 'SG', label: 'Security Group', sublabel: 'Firewall rules', category: 'Networking', iconClass: 'text-neon-red border-neon-red' },
+  { type: 'ec2', abbr: 'EC2', label: 'EC2 Instance', sublabel: 'Real Lima VM', category: 'Compute', iconClass: 'text-neon-orange border-neon-orange' },
+  { type: 'lambda', abbr: 'LAM', label: 'Lambda Function', sublabel: 'Real RIE container', category: 'Compute', iconClass: 'text-neon-yellow border-neon-yellow' },
+  { type: 's3', abbr: 'S3', label: 'S3 Bucket', sublabel: 'Object storage', category: 'Storage', iconClass: 'text-neon-green border-neon-green' },
+  { type: 'dynamodb', abbr: 'DDB', label: 'DynamoDB', sublabel: 'NoSQL table', category: 'Database', iconClass: 'text-neon-cyan border-neon-cyan' },
+];
+
 export const CATALOG: ServiceDef[] = [
   {
     type: 'sqs', abbr: 'SQS', label: 'SQS Queue', sublabel: 'Message queue',
@@ -73,12 +123,19 @@ export const CATALOG: ServiceDef[] = [
     defaultData: { label: 'new-topic', arn: '' },
     iamActions: ['sns:Publish', 'sns:Subscribe', 'sns:*'],
   },
+  // kinesis: an UNBACKED placeholder (see PLACEHOLDERS at the top). It used to
+  // declare `iamActions` for kinesis:PutRecord/GetRecords/* -- the only skipped
+  // tile that did -- which let a user draw an IAM edge to a node Apply never
+  // creates and tick permissions against a namespace the gateway does not
+  // classify at all (there is no kinesis handler in gateway/models/). Removed for
+  // exactly the reason kms has never had any: a permission odin can neither
+  // enforce nor reach is a promise the engine cannot keep, and offering it is
+  // worse than offering nothing. They come back with a real Kinesis model.
   {
-    type: 'kinesis', abbr: 'KIN', label: 'Kinesis Stream', sublabel: 'Data stream',
+    type: 'kinesis', abbr: 'KIN', label: 'Kinesis Stream', sublabel: 'Data stream (placeholder)',
     category: 'Integration', color: 'fuchsia', width: 200,
     fields: [{ key: 'label', label: 'Name', editable: true }, { key: 'arn', label: 'ARN' }],
     defaultData: { label: 'new-stream', arn: '' },
-    iamActions: ['kinesis:PutRecord', 'kinesis:GetRecords', 'kinesis:*'],
   },
   {
     // W2.7: a real `aws_db_instance` (a real Postgres container behind it), so
@@ -152,9 +209,9 @@ export const CATALOG: ServiceDef[] = [
       'secretsmanager:PutSecretValue', 'secretsmanager:*',
     ],
   },
-  // kms: an UNBACKED placeholder (like 'iamrole' below) -- odin has no KMS
-  // substitute and the gateway classifies no `kms:*` action, so it is not in
-  // translate.py's _KIND and Apply skips it (see skipped_node_types).
+  // kms: an UNBACKED placeholder -- odin has no KMS substitute and the gateway
+  // classifies no `kms:*` action, so it is not in translate.py's _KIND and Apply
+  // skips it (see skipped_node_types).
   // Deliberately NO `iamActions`: advertising kms:Encrypt/Decrypt let a user
   // draw an IAM edge and tick permissions that could never be enforced or
   // even reached -- a promise the engine cannot keep. They come back with a
@@ -165,17 +222,20 @@ export const CATALOG: ServiceDef[] = [
     fields: [{ key: 'label', label: 'Description', editable: true }, { key: 'arn', label: 'Key ARN' }],
     defaultData: { label: 'new-key', arn: '' },
   },
-  {
-    type: 'iamrole', abbr: 'IAM', label: 'IAM Role', sublabel: 'Identity role',
-    category: 'Security', color: 'amber', width: 200,
-    fields: [{ key: 'label', label: 'Name', editable: true }, { key: 'arn', label: 'ARN' }],
-    defaultData: { label: 'new-role', arn: '' },
-  },
-  // iam_role/ecr (V2c) are the REAL, gateway-modeled services (NORTHSTAR
-  // directive 5) — distinct from the 'iamrole' placeholder above, which
-  // stays an unwired future-coverage entry (not in translate.py's _KIND, so
-  // Apply silently skips it; see skipped_node_types). Both render via the
-  // generic ServiceNode, no bespoke component.
+  // iam_role/ecr (V2c) are REAL, gateway-modeled services (NORTHSTAR directive
+  // 5). Both render via the generic ServiceNode, no bespoke component.
+  //
+  // There used to be a SECOND tile here, `type: 'iamrole'` (abbr IAM, sublabel
+  // "Identity role"), also labelled "IAM Role", also amber, also in Security --
+  // an unwired placeholder absent from translate.py's _KIND. Two tiles with the
+  // same label in the same group, one of which silently does nothing on Apply,
+  // is a coin flip the sidebar gave the user no way to win: sublabels are the
+  // only thing that differed. Deleted rather than marked `(placeholder)`, because
+  // unlike kms/route53/efs it duplicated a service odin ALREADY models -- the
+  // "future coverage" it stood in for is `iam_role`, and it is right here. A
+  // stale saved canvas still holding `type: 'iamrole'` degrades honestly: ReactFlow
+  // falls back to its default node (error003) and Apply reports the type under
+  // skipped/not_covered, the same path a typo'd type takes.
   {
     type: 'iam_role', abbr: 'ROLE', label: 'IAM Role', sublabel: 'Terraform-managed role',
     category: 'Security', color: 'amber', width: 220,
@@ -192,19 +252,19 @@ export const CATALOG: ServiceDef[] = [
     defaultData: { label: 'new-repo' },
   },
   {
-    type: 'route53', abbr: 'DNS', label: 'Route 53 Zone', sublabel: 'Hosted zone',
+    type: 'route53', abbr: 'DNS', label: 'Route 53 Zone', sublabel: 'Hosted zone (placeholder)',
     category: 'Networking', color: 'indigo', width: 200,
     fields: [{ key: 'label', label: 'Domain', editable: true }, { key: 'zoneId', label: 'Zone ID' }],
     defaultData: { label: 'example.com', zoneId: '' },
   },
   {
-    type: 'apigateway', abbr: 'API', label: 'API Gateway', sublabel: 'REST API',
+    type: 'apigateway', abbr: 'API', label: 'API Gateway', sublabel: 'REST API (placeholder)',
     category: 'Networking', color: 'fuchsia', width: 200,
     fields: [{ key: 'label', label: 'Name', editable: true }, { key: 'apiId', label: 'API ID' }],
     defaultData: { label: 'new-api', apiId: '' },
   },
   {
-    type: 'efs', abbr: 'EFS', label: 'EFS', sublabel: 'Elastic file system',
+    type: 'efs', abbr: 'EFS', label: 'EFS', sublabel: 'Elastic file system (placeholder)',
     category: 'Storage', color: 'sky', width: 200,
     fields: [{ key: 'label', label: 'Name', editable: true }, { key: 'fsId', label: 'File System ID' }],
     defaultData: { label: 'new-fs', fsId: '' },
@@ -266,7 +326,7 @@ export const CATALOG: ServiceDef[] = [
     ],
   },
   {
-    type: 'events', abbr: 'EVT', label: 'EventBridge', sublabel: 'Event rule',
+    type: 'events', abbr: 'EVT', label: 'EventBridge', sublabel: 'Event rule (placeholder)',
     category: 'Integration', color: 'sky', width: 200,
     fields: [
       { key: 'label', label: 'Name', editable: true },
@@ -276,7 +336,7 @@ export const CATALOG: ServiceDef[] = [
     primary: { key: 'schedule', label: 'Schedule' },
   },
   {
-    type: 'ebs', abbr: 'EBS', label: 'EBS Volume', sublabel: 'Block storage',
+    type: 'ebs', abbr: 'EBS', label: 'EBS Volume', sublabel: 'Block storage (placeholder)',
     category: 'Storage', color: 'lime', width: 200,
     fields: [
       { key: 'label', label: 'Name', editable: true },
@@ -287,13 +347,13 @@ export const CATALOG: ServiceDef[] = [
     primary: { key: 'size', label: 'GiB' },
   },
   {
-    type: 'eip', abbr: 'EIP', label: 'Elastic IP', sublabel: 'Static IP',
+    type: 'eip', abbr: 'EIP', label: 'Elastic IP', sublabel: 'Static IP (placeholder)',
     category: 'Networking', color: 'teal', width: 200,
     fields: [{ key: 'label', label: 'Name', editable: true }, { key: 'publicIp', label: 'Public IP' }],
     defaultData: { label: 'new-eip', publicIp: '' },
   },
   {
-    type: 'igw', abbr: 'IGW', label: 'Internet Gateway', sublabel: 'VPC internet access',
+    type: 'igw', abbr: 'IGW', label: 'Internet Gateway', sublabel: 'VPC internet access (placeholder)',
     category: 'Networking', color: 'sky', width: 200,
     fields: [{ key: 'label', label: 'Name', editable: true }, { key: 'igwId', label: 'Gateway ID' }],
     defaultData: { label: 'new-igw', igwId: '' },

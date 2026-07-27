@@ -180,7 +180,62 @@ def test_tf_plan_prints_the_servers_note_when_the_two_halves_describe_different_
     result = runner.invoke(app, ["tf", "plan"])
     assert result.exit_code == 0
     assert "not covered by this plan: kinesis" in result.stdout
-    assert "note: the saved canvas is not what env 'default' last applied" in result.stdout
+    assert "note: the saved canvas is not what env 'default' last applied" in result.stderr
+
+
+@respx.mock
+def test_tf_plans_drift_note_is_on_stderr_like_its_sibling(runner):
+    """Field test 6 F6: the README says this note is on stderr and it was on
+    stdout, so `odin tf plan > report.txt` mixed an advisory into the plan report
+    a human reads. `odin canvas set`'s identical note really is on stderr, which
+    is what made this one look like an unverified copy of a working pattern.
+
+    The `not covered by this plan:` line is NOT an advisory -- it is part of the
+    answer (the README: "the command names those on their own line") -- so it
+    stays on stdout, and that split is what this pins."""
+    drifted = {
+        **PLAN_NO_CHANGES, "skipped": ["kinesis"], "not_covered": ["kinesis"],
+        "canvas_drift": True, "note": "the saved canvas is not what env 'default' last applied",
+    }
+    respx.post(f"{BASE}/tf/plan").mock(return_value=httpx.Response(200, json=drifted))
+
+    result = runner.invoke(app, ["tf", "plan"])
+
+    assert "note:" in result.stderr
+    assert "note:" not in result.stdout
+    assert "not covered by this plan: kinesis" in result.stdout
+
+
+@respx.mock
+def test_tf_plan_json_mode_still_emits_only_json_on_stdout(runner):
+    """The note moving must not leak into `-o json`'s stdout, which has to stay
+    parseable by `jq` -- `emit` prints raw JSON and nothing else."""
+    drifted = {**PLAN_NO_CHANGES, "canvas_drift": True, "note": "the saved canvas is not what env 'default' last applied"}
+    respx.post(f"{BASE}/tf/plan").mock(return_value=httpx.Response(200, json=drifted))
+
+    result = runner.invoke(app, ["tf", "plan", "-o", "json"])
+
+    assert json.loads(result.stdout) == drifted
+    assert result.stderr == ""
+
+
+@respx.mock
+def test_tf_plan_json_carries_canvas_drift_for_a_ci_gate(runner):
+    """The README tells CI to gate on `.canvas_drift`, so that field has to
+    survive `-o json` -- exactly as `.not_covered` does above.
+
+    It is the ONLY machine-readable signal for an unapplied canvas edit: the
+    exit code cannot carry it, because `tf plan` plans the LAST-APPLIED Stack
+    and an unapplied edit is legitimately `no_changes`. A gate written against
+    the exit code alone passes green over an entire un-applied canvas -- which
+    is what the README used to describe, wrongly, as exit 2."""
+    drifted = {**PLAN_NO_CHANGES, "canvas_drift": True, "note": "the saved canvas is not what env 'default' last applied"}
+    respx.post(f"{BASE}/tf/plan").mock(return_value=httpx.Response(200, json=drifted))
+
+    result = runner.invoke(app, ["tf", "plan", "-o", "json"])
+
+    assert result.exit_code == 0, "an unapplied edit is not an error -- the field is the gate"
+    assert json.loads(result.stdout)["canvas_drift"] is True
 
 
 @respx.mock

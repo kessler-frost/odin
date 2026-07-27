@@ -13,12 +13,12 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from odin.agent import debugger
-from odin.api.debug import build_context, create_debug_router, issued_credentials
+from odin.api.debug import ScrubSetUnreadable, build_context, create_debug_router, issued_credentials
 from odin.api.ws import ConnectionManager
 from odin.gateway.keys import KeyStore
 from odin.gateway.stores import SynthStores
 from odin.runtime.colima import ContainerFacts, HostFacts
-from odin.server import create_app
+from odin.server import _unhandled_failure, create_app
 from odin.spec.models import FieldValue, ResourceDesired, Stack, WorldDelta
 from odin.spec.store import SpecStore
 from tests.api.test_apply import FakeRds, FakeRuntime
@@ -247,6 +247,19 @@ def test_the_route_is_wired_into_the_real_app_and_never_500s_when_the_agent_is_o
     assert body["env"] == ENV and body["suspects"] == [] and "off" in body["answer"]
 
 
+def test_odin_ai_0_answers_honestly_through_the_real_route_without_a_model_call(app_client, monkeypatch):
+    """The one switch for every model call, at the route. Same real
+    `debugger.diagnose`, same honest 200 -- the answer just names `ODIN_AI`,
+    the switch that actually stopped it, rather than this feature's own flag."""
+    monkeypatch.setenv("ODIN_AI", "0")
+    monkeypatch.setenv("ODIN_DEBUG_AGENT", "1")  # the feature is opted IN and still makes no call
+    app_client.post("/apply", params={"env": ENV}, json=CANVAS)
+    resp = app_client.post("/agent/debug", json={"env": ENV, "node_ids": ["db"]})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["suspects"] == [] and "ODIN_AI" in body["answer"]
+
+
 def test_a_cross_origin_post_is_rejected_like_every_other_state_changing_route(app_client):
     # Deliberate (see api/debug.py's own note): the route mutates nothing, but
     # it spends a model call and hands back the env's config/logs/verdicts, so
@@ -299,6 +312,73 @@ def test_the_issued_credential_scrub_set_is_empty_for_an_env_that_issued_nothing
     assert issued_credentials(SpecStore(tmp_path).root, ENV) == frozenset()
 
 
+# --- the scrub set is the ONE thing here that may not degrade quietly --------
+#
+# `issued_credentials`' docstring said it was "best-effort BY DESIGN"; the code
+# could raise five different ways, and in a sixth it returned a WRONG answer in
+# silence. Probed against the real file, all eight cases -- see that docstring.
+# An empty scrub set is the input that lets odin's own credentials into a model
+# prompt, so "there are none" and "I could not tell" must not be the same value.
+
+
+@pytest.mark.parametrize("label,content", [
+    ("truncated write", '{"db": ["AKIAodin1234", "supersecr'),
+    ("empty file", ""),
+    ("a list, not an object", "[]"),
+    ("a null value", '{"db": null}'),
+    # THE dangerous one. This raised nothing: the comprehension iterated the
+    # STRING, so the scrub set became {'A','K','I','4','o','d','i','n','1','2','3'}
+    # -- every one of those letters then redacted out of the whole prompt.
+    ("values are strings, not pairs", '{"db": "AKIAodin1234"}'),
+])
+def test_an_unreadable_scrub_set_is_never_silently_an_empty_one(tmp_path, label, content):
+    keys = tmp_path / ENV / "keys.json"
+    keys.parent.mkdir(parents=True, exist_ok=True)
+    keys.write_text(content)
+    with pytest.raises(ScrubSetUnreadable) as caught:
+        issued_credentials(tmp_path, ENV)
+    assert str(keys) in str(caught.value), f"{label}: the failure must name the file"
+
+
+def test_an_unreadable_scrub_set_stops_the_model_call_entirely(tmp_path):
+    """The point of failing at all: no prompt is built, so nothing can leak
+    into one. A route that answered 200 with a diagnosis here would have sent
+    real access/secret pairs to a model unscrubbed."""
+    store = SpecStore(tmp_path)
+    store.apply(Stack(env=ENV, resources=(DB,)))
+    keys = tmp_path / ENV / "keys.json"
+    keys.parent.mkdir(parents=True, exist_ok=True)
+    keys.write_text('{"db": "AKIAodin1234"}')
+
+    called: list[dict] = []
+
+    async def diagnose(context, question):
+        called.append(context)
+        return {"answer": "should never happen", "suspects": []}
+
+    app = FastAPI()
+    app.add_exception_handler(Exception, _unhandled_failure)
+    app.include_router(create_debug_router(
+        store, SynthStores(tmp_path), LoggingRuntime(), ConnectionManager(tmp_path), diagnose=diagnose,
+    ))
+    with TestClient(app, raise_server_exceptions=False) as client:
+        resp = client.post("/agent/debug", json={"env": ENV, "node_ids": ["db"]})
+
+    assert called == [], "the model must not be called with an unknown scrub set"
+    assert resp.status_code == 500, "documented: a file odin wrote and cannot parse is a named failure"
+    body = resp.json()
+    assert str(keys) in body["error"]
+    assert body["store"]["path"] == str(keys.absolute()), "the file rides structurally, not scraped from prose"
+
+
+def test_a_well_formed_scrub_set_still_reaches_the_prompt(tmp_path):
+    """The guard must not have broken the thing it protects: a real issued pair
+    is still collected and still scrubbed (field test 2 finding #6)."""
+    keystore = KeyStore(tmp_path)
+    access, secret = keystore.issue(ENV, "db")
+    assert issued_credentials(tmp_path, ENV) == frozenset({access, secret})
+
+
 def test_build_context_is_usable_without_the_route(tmp_path):
     """The seam the integration test leans on: the real assembled context, no
     HTTP and no SDK involved."""
@@ -306,3 +386,29 @@ def test_build_context_is_usable_without_the_route(tmp_path):
     store.apply(Stack(env=ENV))
     context = build_context(store, SynthStores(tmp_path), LoggingRuntime(), ConnectionManager(tmp_path), ENV, ["db"])
     assert context["env"] == ENV and "db" in context["nodes"]
+
+
+def test_a_failure_here_advises_the_env_the_caller_actually_named(tmp_path):
+    """`/agent/debug` takes its env in the BODY, and `_failure_body` can only
+    read query params — so a failure on env 'staging' used to advise
+    `odin world --env default`, pointing the user at an env they never
+    mentioned. The handler of last resort cannot await a request body (it is
+    what runs when everything else has failed), so the route records the env it
+    resolved and the handler prefers that."""
+    store = SpecStore(tmp_path)
+    store.apply(Stack(env="staging", resources=(DB,)))
+
+    async def explode(*_args, **_kwargs):
+        raise RuntimeError("the model call fell over")
+
+    app = FastAPI()
+    app.add_exception_handler(Exception, _unhandled_failure)
+    app.include_router(create_debug_router(
+        store, SynthStores(tmp_path), LoggingRuntime(), ConnectionManager(tmp_path), diagnose=explode,
+    ))
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        body = client.post("/agent/debug", json={"env": "staging", "node_ids": ["db"]}).json()
+
+    assert "staging" in json.dumps(body), "the failure named an env the caller never asked about"
+    assert "--env default" not in json.dumps(body)

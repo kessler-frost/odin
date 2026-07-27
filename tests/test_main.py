@@ -4,18 +4,22 @@ everywhere `odin start` can launch uvicorn, and warn loudly the moment a
 caller opts into anything wider."""
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
 import threading
 import time
 
+import httpx
 import pytest
+import respx
 import typer
 
 from odin import __main__ as main_mod, util
 from odin.cli import doctor as doctor_mod
 from odin.gateway.stores import SynthStores
+from odin.reconcile.reconciler import LoopHealth
 
 
 def test_default_host_constant_is_loopback():
@@ -135,6 +139,12 @@ def test_dev_mode_backend_subprocess_gets_the_host_argv(tmp_path, monkeypatch):
     monkeypatch.setattr(main_mod.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(main_mod.signal, "signal", lambda *a, **kw: None)
     monkeypatch.setattr(main_mod.signal, "pause", lambda: None)
+    # Dev mode's two prerequisites, stubbed rather than borrowed from whichever
+    # machine runs the suite: this asserts an argv, and it used to pass or fail
+    # on whether the developer happened to have bun on PATH and `bun install`
+    # already run in ui/.
+    monkeypatch.setattr(main_mod.shutil, "which", lambda tool: "/usr/local/bin/bun")
+    monkeypatch.setattr(main_mod, "_require_ui_deps", lambda purpose: None)
 
     main_mod._start_dev(port=4200, host="203.0.113.9")
 
@@ -162,9 +172,17 @@ def store_lock(tmp_path):
     lock.release()
 
 
+# A port nothing serves (RFC 863 discard, unused on macOS). `odin status` asks
+# a live server about its reconcilers over HTTP, and these tests are about the
+# STORE-LOCK half -- pointing them at a URL that cannot answer keeps them from
+# depending on whatever happens to be listening on 4200.
+NO_SERVER_URL = "http://127.0.0.1:9"
+
+
 def test_status_is_honest_about_a_server_odin_did_not_start(tmp_path, monkeypatch, capsys, store_lock):
     monkeypatch.chdir(tmp_path)
-    main_mod.status()
+    with pytest.raises(typer.Exit):  # UNKNOWN loops -- see the exit-2 tests below
+        main_mod.status(url=NO_SERVER_URL)
     out = capsys.readouterr().out
     assert "Odin is running" in out and str(os.getpid()) in out
     assert "store lock" in out and "no pidfile" in out
@@ -202,9 +220,18 @@ def test_status_exits_nonzero_when_odin_is_not_running(tmp_path, monkeypatch, ca
     assert "Odin is not running" in capsys.readouterr().out
 
 
-def test_status_exits_zero_when_odin_is_running(tmp_path, monkeypatch, capsys, store_lock):
+def test_status_exits_zero_only_when_every_loop_is_confirmed_ticking(
+    tmp_path, monkeypatch, capsys, store_lock
+):
+    """0 is this command's documented "running, AND every env's reconciler is
+    ticking", so it takes a real `/health` answer to earn it -- see
+    `test_status_exits_two_when_convergence_is_unknown` for what the store lock
+    alone buys."""
     monkeypatch.chdir(tmp_path)
-    main_mod.status()  # no typer.Exit at all == exit 0
+    monkeypatch.setattr(main_mod, "_reconciler_health", lambda url: [
+        LoopHealth(env="default", ticking=True, ticks=7).model_dump(),
+    ])
+    main_mod.status(url=NO_SERVER_URL)  # no typer.Exit at all == exit 0
     assert "Odin is running" in capsys.readouterr().out
 
 
@@ -212,8 +239,139 @@ def test_status_reports_the_pidfile_path_as_managed(tmp_path, monkeypatch, capsy
     monkeypatch.chdir(tmp_path)
     main_mod.ODIN_DIR.mkdir()
     main_mod.PID_FILE.write_text(str(os.getpid()))
-    main_mod.status()
+    with pytest.raises(typer.Exit):  # loops UNKNOWN at this URL
+        main_mod.status(url=NO_SERVER_URL)
     assert f"Odin is running (pid {os.getpid()}, pidfile)" in capsys.readouterr().out
+
+
+def test_status_calls_reconciler_health_unknown_when_the_server_does_not_answer(
+    tmp_path, monkeypatch, capsys, store_lock
+):
+    """The store lock proves odin is UP; it proves nothing about the loops
+    inside it. Not being able to ask must read as UNKNOWN -- never as healthy,
+    and never as a failure invented from a URL guess (the default is
+    localhost:4200, so a server on another port would otherwise fail a gate
+    that has nothing wrong with it)."""
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(typer.Exit):
+        main_mod.status(url=NO_SERVER_URL)
+    captured = capsys.readouterr()
+    assert "Odin is running" in captured.out
+    assert "UNKNOWN" in captured.err and "ODIN_URL" in captured.err
+
+
+def test_status_exits_two_when_convergence_is_unknown(tmp_path, monkeypatch, capsys, store_lock):
+    """Field test 6 F1. This branch used to exit 0 -- the code that says
+    "running, AND every env's reconciler is ticking" -- one line after printing
+    that the second half is UNKNOWN, so a monitoring script gating on `odin
+    status` read UNKNOWN as healthy. It is reachable by a plain `odin status`
+    whenever the server is on a non-default port, which this command's own
+    message anticipates.
+
+    2, not 1: odin has NOT observed a stopped loop, and reporting one it never
+    saw would be its own false claim. 2 is also what the README's contract
+    already assigns to an unreachable server, which is exactly what happened
+    here."""
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(typer.Exit) as exit_info:
+        main_mod.status(url=NO_SERVER_URL)
+    assert exit_info.value.exit_code == 2
+    captured = capsys.readouterr()
+    assert "Odin is running" in captured.out  # the half odin DID verify
+    assert "UNKNOWN" in captured.err
+
+
+def test_status_unknown_is_a_different_code_from_a_down_loop(tmp_path, monkeypatch, store_lock):
+    """The distinction the fix exists to make: "I could not tell" and "a loop is
+    down" are different answers and must not share a code. Mutation guard -- 2
+    collapsing back to 1 would make UNKNOWN indistinguishable from an observed
+    outage, and back to 0 would restore the finding."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main_mod, "_reconciler_health", lambda url: [
+        LoopHealth(env="default", ticking=False, verdict="its task was CANCELLED").model_dump(),
+    ])
+    with pytest.raises(typer.Exit) as down:
+        main_mod.status(url=NO_SERVER_URL)
+
+    monkeypatch.setattr(main_mod, "_reconciler_health", lambda url: "did not answer")
+    with pytest.raises(typer.Exit) as unknown:
+        main_mod.status(url=NO_SERVER_URL)
+
+    assert (down.value.exit_code, unknown.value.exit_code) == (1, 2)
+
+
+def test_status_names_a_malformed_url_rather_than_claiming_no_answer(
+    tmp_path, monkeypatch, capsys, store_lock
+):
+    """F9's `odin status` half. `httpx.InvalidURL` is not an `httpx.HTTPError`,
+    so a non-numeric port used to escape this command's own except clause as a
+    traceback; and a schemeless value is caught but "did not answer <url>/health"
+    is the wrong diagnosis, because odin never made a request at all."""
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(typer.Exit) as exit_info:
+        main_mod.status(url="localhost:4720")
+    assert exit_info.value.exit_code == 2
+    err = capsys.readouterr().err
+    assert "'localhost:4720' is not a usable odin URL" in err
+    assert "missing an 'http://' or 'https://' protocol" in err
+    assert "UNKNOWN" in err
+
+    with pytest.raises(typer.Exit) as bad_port:
+        main_mod.status(url="http://localhost:notaport")
+    assert bad_port.value.exit_code == 2
+    assert "Invalid port" in capsys.readouterr().err
+
+
+def test_status_exits_nonzero_and_names_the_env_when_a_reconciler_is_down(
+    tmp_path, monkeypatch, capsys, store_lock
+):
+    """A live server whose loop died is the same false green as a server that
+    isn't there: `odin status && odin apply` must not apply into an env nothing
+    converges."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main_mod, "_reconciler_health", lambda url: [
+        LoopHealth(env="prod", ticking=True, ticks=40).model_dump(),
+        LoopHealth(env="default", ticking=False, verdict="... its task was CANCELLED ...").model_dump(),
+    ])
+    with pytest.raises(typer.Exit) as exit_info:
+        main_mod.status(url=NO_SERVER_URL)
+    assert exit_info.value.exit_code == 1
+    assert "RECONCILER DOWN" in capsys.readouterr().err
+
+
+def test_status_reports_the_converging_reconcilers_by_name(tmp_path, monkeypatch, capsys, store_lock):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main_mod, "_reconciler_health", lambda url: [
+        LoopHealth(env="default", ticking=True, ticks=40).model_dump(),
+        LoopHealth(env="prod", ticking=True, ticks=12).model_dump(),
+    ])
+    main_mod.status(url=NO_SERVER_URL)  # exit 0
+    assert "2 reconciler(s) converging: default, prod" in capsys.readouterr().out
+
+
+def test_reconciler_health_reads_the_real_health_body(monkeypatch):
+    """The parse, against the shape `GET /health` really serves (built here by
+    the same `LoopHealth` the route serializes). The whole round trip -- real
+    server, real route, real `odin status` binary -- is proven in the e2e."""
+    body = {
+        "ok": True, "gateway": {"port": 4599},
+        "reconcilers": [LoopHealth(env="default", ticking=True, ticks=3).model_dump()],
+    }
+    with respx.mock:
+        respx.get("http://odin.test/health").mock(return_value=httpx.Response(200, json=body))
+        assert main_mod._reconciler_health("http://odin.test/") == body["reconcilers"]
+
+
+def test_reconciler_health_is_unknown_rather_than_empty_when_the_field_is_missing():
+    """An answer with no `reconcilers` key says nothing about the loops behind
+    it -- reading that as "none are down" is exactly the inference this whole
+    change exists to remove. Unknown is now the REASON rather than a bare None,
+    so the caller cannot guess at one (F9)."""
+    with respx.mock:
+        respx.get("http://odin.test/health").mock(return_value=httpx.Response(200, json={"ok": True}))
+        unknown = main_mod._reconciler_health("http://odin.test")
+    assert isinstance(unknown, str)
+    assert "no `reconcilers` field" in unknown
 
 
 def test_status_cleans_a_stale_pidfile_and_says_so(tmp_path, monkeypatch, capsys):
@@ -475,14 +633,24 @@ def test_the_bun_fix_is_the_one_doctor_prints(clone_without_bun, capsys):
     assert row.fix and row.fix in capsys.readouterr().err
 
 
-def test_a_failed_ui_build_is_reported_not_raised(tmp_path, monkeypatch, capsys):
-    """bun IS installed and its build fails -- a different problem, a different
-    sentence, and still no traceback."""
+@pytest.fixture
+def clone_with_bun_and_deps(tmp_path, monkeypatch):
+    """A clone with bun on PATH AND `ui/node_modules` installed -- i.e. past
+    both preconditions, so `_build_ui` really reaches the build."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(main_mod, "BUNDLED_UI", tmp_path / "_ui")
     monkeypatch.setattr(main_mod, "UI_DIR", tmp_path / "ui")
     monkeypatch.setattr(main_mod.shutil, "which", lambda tool: "/usr/local/bin/bun")
-    monkeypatch.setattr(main_mod, "_run_in_ui", lambda args: 1)
+    vite = tmp_path / "ui" / "node_modules" / ".bin" / "vite"
+    vite.parent.mkdir(parents=True)
+    vite.touch()
+    return tmp_path
+
+
+def test_a_failed_ui_build_is_reported_not_raised(clone_with_bun_and_deps, monkeypatch, capsys):
+    """bun IS installed and its build fails -- a different problem, a different
+    sentence, and still no traceback."""
+    monkeypatch.setattr(main_mod, "_run_in_ui", lambda args: main_mod.UiRun(True, 1))
 
     with pytest.raises(typer.Exit) as exc:
         main_mod._build_ui()
@@ -490,18 +658,15 @@ def test_a_failed_ui_build_is_reported_not_raised(tmp_path, monkeypatch, capsys)
     assert exc.value.exit_code == 1
     err = capsys.readouterr().err
     assert "`bun run build` failed (exit 1)" in err
-    assert "bun install" in err
+    assert "read bun's output above" in err
 
 
-def test_a_bun_that_cannot_be_executed_is_reported_not_raised(tmp_path, monkeypatch, capsys):
+def test_a_bun_that_cannot_be_executed_is_reported_not_raised(
+    clone_with_bun_and_deps, monkeypatch, capsys
+):
     """The backstop: PATH says yes, exec says no (a dangling shim, a wrong-arch
-    binary). `_run_in_ui` translates it to 127 the way `util.run_command`
-    does for every other tool, so nothing here can raise."""
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(main_mod, "BUNDLED_UI", tmp_path / "_ui")
-    monkeypatch.setattr(main_mod, "UI_DIR", tmp_path / "ui")
-    monkeypatch.setattr(main_mod.shutil, "which", lambda tool: "/usr/local/bin/bun")
-
+    binary). The OSError is caught, so nothing here can raise -- and this is the
+    ONE input that may produce the "could not be run" sentence."""
     def exec_fails(args, **kwargs):
         raise OSError(8, "Exec format error")
 
@@ -512,6 +677,113 @@ def test_a_bun_that_cannot_be_executed_is_reported_not_raised(tmp_path, monkeypa
 
     assert exc.value.exit_code == 1
     assert "could not be run" in capsys.readouterr().err
+
+
+# --- the `vite: command not found` misdiagnosis ------------------------------
+# Reproduced on a fresh clone (no `ui/node_modules`), bun 1.2.15 on PATH and
+# perfectly runnable:
+#     $ bun run build
+#     $ vite build
+#     /bin/bash: vite: command not found
+#     error: script "build" exited with code 127
+# `odin start` answered "Cannot build the UI: `bun` is on PATH but could not be
+# run." and prescribed `curl -fsSL https://bun.sh/install | bash` -- advice that
+# fixes nothing, because bun was never the problem. The missing step was
+# `cd ui && bun install`, and odin never said the word.
+
+
+@pytest.fixture
+def clone_without_ui_deps(clone_without_bun, monkeypatch):
+    """The bug's own machine: a clone with bun installed and runnable, and
+    `ui/node_modules` never installed.
+
+    Built on `clone_without_bun`, so its "must not shell out" guard still
+    stands -- which doubles as the proof that this diagnosis is a FILESYSTEM
+    observation and not a reading of an exit code. odin has to know before it
+    runs anything.
+    """
+    monkeypatch.setattr(main_mod.shutil, "which", lambda tool: "/usr/local/bin/bun")
+    return clone_without_bun
+
+
+def test_a_clone_that_never_ran_bun_install_is_told_to_bun_install(
+    clone_without_ui_deps, capsys
+):
+    """The bug's own case, end to end. bun on PATH, `ui/node_modules` absent."""
+    with pytest.raises(typer.Exit) as exc:
+        main_mod._build_ui()
+
+    assert exc.value.exit_code == 1
+    err = capsys.readouterr().err
+    assert f"fix: {main_mod.UI_DEPS_INSTALL}" in err     # the command that works
+    assert "cd ui && bun install" in err
+    assert "dependencies are not installed" in err
+    # ...and NOT one word of the advice that sent the user in a circle:
+    assert doctor_mod.BUN_INSTALL not in err
+    assert "bun.sh/install" not in err
+    assert "could not be run" not in err
+
+
+def test_a_child_exit_127_is_never_reported_as_a_bun_that_cannot_run(
+    clone_with_bun_and_deps, monkeypatch, capsys
+):
+    """The SHAPE fix, independent of the precondition above: 127 out of a bun
+    that launched fine means the SCRIPT's tool was missing, never that bun was.
+    Both used to arrive as the integer 127; only `UiRun.launched` can tell them
+    apart, and it is what the message is keyed on now."""
+    monkeypatch.setattr(main_mod, "_run_in_ui", lambda args: main_mod.UiRun(True, 127))
+
+    with pytest.raises(typer.Exit) as exc:
+        main_mod._build_ui()
+
+    assert exc.value.exit_code == 1
+    err = capsys.readouterr().err
+    assert "`bun run build` failed (exit 127)" in err
+    assert "could not be run" not in err
+    assert doctor_mod.BUN_INSTALL not in err
+
+
+def test_run_in_ui_reports_a_real_exit_127_as_launched(clone_with_bun_and_deps):
+    """`_run_in_ui` against a REAL process that really exits 127 -- the number
+    bun really returns for `vite: command not found`. `launched` must be True:
+    the discriminator has to survive the actual value, not just a fabricated
+    `UiRun`."""
+    run = main_mod._run_in_ui([sys.executable, "-c", "raise SystemExit(127)"])
+    assert (run.launched, run.code) == (True, 127)
+
+
+def test_run_in_ui_reports_an_unexecutable_binary_as_not_launched(clone_with_bun_and_deps):
+    """The other side, also against the real OS: a path that cannot be exec'd."""
+    missing = clone_with_bun_and_deps / "no-such-bun"
+    run = main_mod._run_in_ui([str(missing)])
+    assert run.launched is False
+
+
+def test_the_deps_probe_names_the_binary_ui_package_json_actually_runs():
+    """Rule 1, applied to the guard's premise. `_require_ui_deps` looks for
+    `node_modules/.bin/vite` because that is what `ui/package.json`'s own
+    scripts invoke -- read from the real manifest, so swapping the UI's build
+    tool breaks this test instead of silently making the check meaningless."""
+    manifest = json.loads((main_mod.UI_DIR / "package.json").read_text())
+    tools = {script.split()[0] for script in manifest["scripts"].values()}
+
+    assert tools == {"vite"}, "the deps probe is pinned to vite; scripts changed"
+    assert main_mod._vite_bin().parts[-3:] == ("node_modules", ".bin", "vite")
+
+
+def test_dev_mode_without_ui_deps_refuses_before_it_starts_anything(
+    clone_without_ui_deps, capsys
+):
+    """The sibling. `bun run dev` fails identically on a fresh clone (`vite
+    --port "4311"` -> `vite: command not found`, exit 127), and dev mode never
+    looked -- so odin wrote the pidfile, launched the backend, and left Vite
+    dead in a relayed log line."""
+    with pytest.raises(typer.Exit) as exc:
+        main_mod._start_dev(port=4200, host="127.0.0.1")
+
+    assert exc.value.exit_code == 1
+    assert "cd ui && bun install" in capsys.readouterr().err
+    assert not main_mod.PID_FILE.exists()
 
 
 def test_a_bundled_ui_needs_no_bun_at_all(tmp_path, monkeypatch, capsys):

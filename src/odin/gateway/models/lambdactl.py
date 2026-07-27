@@ -92,6 +92,7 @@ from starlette.responses import Response
 from odin.aws.backings import ACCOUNT, REGION
 from odin.compute.functions import DEFAULT_RUNTIME, READY_TIMEOUT, FunctionRuntime, container_name
 from odin.gateway import errors
+from odin.gateway.errors import exc_text
 from odin.gateway.keys import KeyStore, workload_env
 from odin.gateway.models import logsctl
 from odin.gateway.stores import NO_CHANGE, SynthStores
@@ -115,6 +116,15 @@ _Handler = Callable[
     [str, str, bytes, SynthStores, float, FunctionRuntime, dict[str, str], KeyStore | None, int | None],
     Response,
 ]
+
+
+
+
+def _stated(reason: str, fallback: str) -> str:
+    """A caller-supplied reason, or `fallback` when it says nothing -- see
+    `mark_function_failed`, whose `reason` is the ONLY thing it adds to the
+    record."""
+    return reason.strip() or fallback
 
 
 def _key(name: str) -> str:
@@ -263,12 +273,18 @@ def _finish_deploy(
             container_env.update(workload_env(keystore, env, label, gateway_port))
         substrate.ensure(env, name, runtime, handler, container_env, code_dir, memory_mib=memory_mib)
     except Exception as exc:
-        log.warning("lambda container failed for function %s (env %s): %s", name, env, exc)
+        # `_exc_text`, not `str(exc)`: an exception built with no args would
+        # make BOTH reason fields empty, and `_configuration_json` drops an
+        # empty one from the wire outright -- GetFunction would answer
+        # `State: Failed` with no StateReason at all, which is the one field
+        # `reconcile/tf_status.py` renders as the node's World verdict.
+        reason = exc_text(exc)
+        log.warning("lambda container failed for function %s (env %s): %s", name, env, reason)
         _update_function(
             stores, env, name, state="Failed",
-            state_reason=str(exc), state_reason_code="InternalError",
+            state_reason=reason, state_reason_code="InternalError",
             last_update_status="Failed",
-            last_update_status_reason=str(exc), last_update_status_reason_code="InternalError",
+            last_update_status_reason=reason, last_update_status_reason_code="InternalError",
         )
         return
     _update_function(
@@ -312,7 +328,8 @@ def mark_function_failed(stores: SynthStores, env: str, name: str, reason: str) 
     below is what makes the "re-Apply to recreate" verdict true."""
     _update_function(
         stores, env, name, state="Failed",
-        state_reason=reason, state_reason_code="InternalError",
+        state_reason=_stated(reason, "its execution environment is gone; odin was given no further reason"),
+        state_reason_code="InternalError",
     )
 
 
@@ -749,7 +766,15 @@ def _invoke(resource: str, env: str, body: bytes, stores: SynthStores, now: floa
     try:
         result = substrate.invoke(env, resource, body)
     except Exception as exc:
-        return errors.synth_error("lambda", "ServiceException", str(exc), 500)
+        # The SIBLING of `_finish_deploy`'s reason, and the one with the
+        # narrowest escape hatch: this string is the whole `Message` of the
+        # AWS error the caller's SDK raises, with nothing else recorded
+        # anywhere. `substrate.invoke` is a real `httpx.post`, and httpcore
+        # raises `PoolTimeout()` with no args (httpx's own mapping preserves
+        # the empty message, measured) -- with which botocore rendered exactly
+        # `An error occurred (ServiceException) when calling the Invoke
+        # operation: ` and stopped, a dangling colon where the cause belongs.
+        return errors.synth_error("lambda", "ServiceException", exc_text(exc), 500)
     # Both outcomes ship: a handler that RAISED wrote its traceback to the
     # container's stderr, and that traceback is the whole reason CloudWatch
     # Logs exists.

@@ -239,8 +239,18 @@ def _edge(e: dict, labels: dict[str, str]) -> Edge:
 
 def skipped_node_types(canvas: dict) -> list[str]:
     """Distinct canvas node types that aren't runnable workloads/resources, so
-    Apply/Preview can tell the user instead of silently dropping them."""
-    types = [n.get("type", "?") for n in (canvas.get("nodes") or []) if n.get("type") not in _KIND]
+    Apply/Preview can tell the user instead of silently dropping them.
+
+    `or "?"`, not `get("type", "?")` (field test 6, F4's class): a node whose
+    `type` is literally `null` used to put the Python object `None` in this list,
+    which `cli/apply.py` prints as `skipped: None` and which lands in
+    `not_covered` -- the ONE array the README tells CI to gate on. A `null` and a
+    missing key are the same absence and now read the same. It also stops a
+    canvas mixing `null` with real types from raising `TypeError` inside
+    `sorted`. `/apply` and `/apply-full` reject a falsy type at the schema, but
+    `/tf/plan` reads `.odin/canvas.json` from disk, which is deliberately never
+    re-validated."""
+    types = [n.get("type") or "?" for n in (canvas.get("nodes") or []) if n.get("type") not in _KIND]
     return sorted(set(types))
 
 

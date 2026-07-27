@@ -205,7 +205,11 @@ def test_a_boot_failure_lands_create_failed_with_the_real_reason(elasticache, si
     # NOT still "creating": the provider's waiter must fail fast, never hang.
     assert live["CacheClusterStatus"] == cachectl.STATUS_CREATE_FAILED
     record = stores.cachectl.get(ENV, f"cluster:{CLUSTER}")
-    assert record["status_reason"] == "redis never became ready"
+    # Carries the exception CLASS as well as its message, the one wording every
+    # writer now shares (`gateway/errors.py::exc_text`) — a `TimeoutError:
+    # connection refused` and an `OSError: connection refused` are different
+    # diagnoses, and the class is the only thing that says which.
+    assert record["status_reason"] == "RuntimeError: redis never became ready"
 
 
 def test_create_twice_is_already_exists(elasticache, sink, stores, cache):

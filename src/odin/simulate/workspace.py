@@ -15,13 +15,17 @@ never baked into either file, so the workspace itself stays inspectable and
 main.tf stays byte-identical to what a plain `generate_tf` call produces.
 
 State stays local under the same directory (`.terraform/`,
-`terraform.tfstate`) and is never touched by `materialize()` -- only
-`main.tf`/`override.tf` are (re)written on every call, so re-materializing
-for a new apply never disturbs an existing state file or downloaded
-provider plugin.
+`terraform.tfstate`) and is never touched by `materialize()` -- only the
+odin-owned files are, so re-materializing for a new apply never disturbs an
+existing state file or downloaded provider plugin.
+
+"Regenerated on every apply" means the odin-owned file SET, not just the
+bytes of the files that happen to be in the new project (field test 6). See
+`_prune_stale`.
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from odin.agent.hcl import TfProject
@@ -32,6 +36,8 @@ from odin.util import (
     ensure_private_file,
     private_mkdir,
 )
+
+log = logging.getLogger("odin")
 
 # tofu's own state files. Neither is ever written by odin -- they are
 # pre-CREATED 0600 (see `ensure_private_file`) so tofu's in-place rewrite
@@ -83,8 +89,20 @@ Let odin run it instead; the endpoint cannot be gotten wrong that way:
     odin tf destroy --env {env}    # tofu's own teardown
 
 `main.tf`, `override.tf`, and this file are regenerated from the canvas on
-every apply and every plan -- edits here are overwritten, not applied.
+every apply and every plan -- edits here are overwritten, not applied. A `.tf`
+or `.zip` file odin did not just write is DELETED for the same reason: tofu
+loads every `*.tf` in a directory, so a leftover one would be applied.
 """
+
+
+# The suffixes odin itself writes into this directory: `project.files` (`.tf`)
+# and `project.binary_files` (a lambda's `.zip`). Anything with one of these
+# suffixes that THIS materialize did not write is stale by definition and is
+# deleted -- see `_prune_stale`. Deliberately a suffix allow-list rather than
+# "everything that isn't state": tofu's own artifacts must survive, and they
+# do, because none of them ends in `.tf` or `.zip` (`terraform.tfstate`,
+# `terraform.tfstate.backup`, `.terraform.lock.hcl`, `tfplan`, `.terraform/`).
+_ODIN_OWNED_SUFFIXES = (".tf", ".zip")
 
 
 def _override_tf() -> str:
@@ -114,8 +132,57 @@ def materialize(root: Path, env: str, project: TfProject) -> Path:
         atomic_write_bytes(workspace / name, content, mode=SECRET_FILE_MODE)
     atomic_write_text(workspace / "override.tf", OVERRIDE_TF, mode=SECRET_FILE_MODE)
     atomic_write_text(workspace / _README_NAME, _README.format(env=env), mode=SECRET_FILE_MODE)
+    _prune_stale(workspace, {*project.files, *project.binary_files, "override.tf"})
     _lock_down(workspace)
     return workspace
+
+
+def _prune_stale(workspace: Path, written: set[str]) -> list[str]:
+    """Delete every odin-owned file this materialize did NOT write, so the
+    workspace is the project rather than the union of every project ever
+    applied here. Returns the names removed (for the log line and the tests).
+
+    Field test 6 reported a lambda's `other.zip` surviving the failed apply
+    that would have created lambda `other`, against a workspace documented as
+    regenerated every apply. A stale ZIP turns out to be litter and nothing
+    worse -- `hcl.generate_tf` writes `<hcl_name>.zip` for every lambda in the
+    Stack and derives the `filename`/`filebase64sha256()` in the HCL block from
+    the SAME name table, so a zip the current main.tf references is always one
+    this same call just rewrote; a zip it doesn't reference is unreachable.
+
+    The same staleness in a `.tf` file is NOT litter, and that is why this
+    prunes by suffix rather than fixing the zip: tofu is pointed at a
+    DIRECTORY and loads every `*.tf` in it. Measured on the real tofu, one
+    stale file in an otherwise one-resource workspace:
+
+        with leftover.tf     Plan: 2 to add, 0 to change, 0 to destroy
+        without it           Plan: 1 to add, 0 to change, 0 to destroy
+
+    -- a resource created for a node that is not on the canvas. It is reachable
+    without anyone hand-editing anything: the agent refine pass emits a FILE
+    SET (`translate.EmitTerraformInput.files` is a list of paths), the
+    guardrail only requires the resource set to be unchanged, so one apply can
+    legitimately write `main.tf` + `lambda.tf` and the next -- refine off,
+    refine timing out, or the guardrail rejecting and falling back to the
+    single-file skeleton -- writes only `main.tf` and used to leave `lambda.tf`
+    behind to be applied forever.
+
+    `README.md` is deliberately absent from `written` and survives anyway: its
+    suffix is not an odin-owned one, so it is never a prune candidate in the
+    first place (same as every tofu artifact).
+    """
+    stale = sorted(
+        path for path in workspace.iterdir()
+        if path.is_file() and path.suffix in _ODIN_OWNED_SUFFIXES and path.name not in written
+    )
+    for path in stale:
+        path.unlink()
+    if stale:
+        log.warning(
+            "removed %d stale file(s) from %s that this apply no longer generates: %s",
+            len(stale), workspace, [path.name for path in stale],
+        )
+    return [path.name for path in stale]
 
 
 def _lock_down(workspace: Path) -> None:

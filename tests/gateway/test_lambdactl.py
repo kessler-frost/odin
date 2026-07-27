@@ -834,8 +834,11 @@ def test_wait_for_active_functions_reports_a_function_whose_redeploy_failed(sink
     deploying = lambdactl.converge_functions(stores, ENV, substrate)
     faults = lambdactl.wait_for_active_functions(stores, ENV, deploying)
 
+    # `_exc_text`: the class rides with the message, so a redeploy that fails
+    # with an exception carrying none still names something real here rather
+    # than reporting a fault with a blank reason.
     assert faults == [lambdactl.FunctionFault(
-        node="fn1", state="Failed", reason="RIE never became ready",
+        node="fn1", state="Failed", reason="RuntimeError: RIE never became ready",
     )], faults
 
 

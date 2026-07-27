@@ -1,12 +1,16 @@
 """`odin world` / `odin envs` / `odin events` against a respx-mocked server."""
 from __future__ import annotations
 
+import inspect
 import json
 
 import httpx
 import respx
 
+from odin.cli import observe
 from odin.cli.app import app
+from odin.reconcile.reconciler import LoopHealth
+from odin.spec.store import SpecStore
 from tests.cli.conftest import BASE
 
 WORLD = {
@@ -97,25 +101,66 @@ def test_envs_text_and_json(runner):
     assert json.loads(as_json.stdout) == {"envs": ["default", "prod"]}
 
 
+def test_a_never_used_store_really_lists_default(tmp_path):
+    """The fact `odin envs --help` is allowed to state, measured at the source.
+
+    `GET /envs` is `{"envs": store.list_envs()}` verbatim, and `list_envs`
+    floors at `["default"]` -- so a store that has never been touched lists
+    ONE env, not none. Confirmed against the real route on a never-used store
+    dir: `curl /envs` -> `{"envs":["default"]}`, `odin envs` -> `default`,
+    exit 0.
+    """
+    assert SpecStore(tmp_path / "never-used").list_envs() == ["default"]
+
+
+def test_a_store_with_a_real_env_stops_listing_default(tmp_path):
+    """The help's second sentence, and the reason it is not "always lists
+    `default`": the floor is a FALLBACK, not an addition. Once one env has a
+    HEAD, the list is exactly the envs that have one."""
+    root = tmp_path / "store"
+    (root / "clifix1").mkdir(parents=True)
+    (root / "clifix1" / "HEAD").write_text("deadbeef")
+    assert SpecStore(root).list_envs() == ["clifix1"]
+
+
+def test_envs_help_states_what_the_store_actually_does(tmp_path):
+    """The bug: the help said "a fresh odin lists none — not an error, and exit
+    0 either way", and a fresh odin lists `default`. Pinned to the real store
+    in the same test, so the sentence cannot drift from the code again -- edit
+    either side alone and this fails.
+    """
+    help_text = " ".join(inspect.getdoc(observe.envs).split())
+    fresh, = SpecStore(tmp_path / "never-used").list_envs()
+
+    assert f"A never-used odin lists `{fresh}`" in help_text
+    assert "lists none" not in help_text
+    # ...and the OTHER two claims the old sentence made and could not back:
+    # `default` is not conjured by an apply, and `envs` exits 2 (not 0) when
+    # the server is unreachable -- see `test_envs_server_down`.
+    assert "comes into existence when a canvas is applied" not in help_text
+    assert "exit 0 either way" not in help_text
+
+
 @respx.mock
-def test_envs_with_none_yet_explains_itself_without_polluting_stdout(runner):
-    """Fresh-user friction: with nothing applied, `odin envs` printed one
-    blank line and exited 0 -- indistinguishable from a broken command. The
-    answer now goes to stderr, and stdout stays strictly one-env-per-line so
-    `odin envs | while read e` gets zero iterations, not one empty one."""
+def test_envs_invents_no_explanation_for_a_list_it_did_not_get(runner):
+    """The removed dead branch. It printed "no environments yet — an env exists
+    once something has been applied to it" on `envs == []`, which is (a) a
+    state odin's own `/envs` cannot answer with and (b) false about `default`.
+    An answer odin did not receive is not an answer it should narrate."""
     respx.get(f"{BASE}/envs").mock(return_value=httpx.Response(200, json={"envs": []}))
     result = runner.invoke(app, ["envs"])
     assert result.exit_code == 0
     assert result.stdout == ""
-    assert "no environments yet" in result.stderr and "'default'" in result.stderr
+    assert "no environments yet" not in result.stderr
+    assert "applied" not in result.stderr
 
 
 @respx.mock
-def test_envs_json_stays_pure_json_when_empty(runner):
-    respx.get(f"{BASE}/envs").mock(return_value=httpx.Response(200, json={"envs": []}))
+def test_envs_json_stays_pure_json(runner):
+    respx.get(f"{BASE}/envs").mock(return_value=httpx.Response(200, json={"envs": ["default"]}))
     result = runner.invoke(app, ["envs", "-o", "json"])
     assert result.exit_code == 0
-    assert json.loads(result.stdout) == {"envs": []}
+    assert json.loads(result.stdout) == {"envs": ["default"]}
 
 
 @respx.mock
@@ -267,3 +312,53 @@ def test_logs_server_down(runner):
     result = runner.invoke(app, ["logs", "db"])
     assert result.exit_code == 2
     assert "Could not reach odin server" in result.stderr
+
+
+# --- a dead reconciler has to reach the terminal too ------------------------
+
+# The block `/world` really publishes -- built by the same `LoopHealth` the
+# route serializes, so this cannot drift into a hand-typed shape the server
+# never sends. (The real string comes from a real dead loop in
+# tests/api/test_reconciler_liveness.py and in the e2e proof.)
+DEAD_LOOP = LoopHealth(
+    env="prod", ticking=False, ticks=12, last_tick_seconds_ago=94.0,
+    verdict="odin's reconciler for env 'prod' is NOT converging: its task was CANCELLED. ...",
+).model_dump()
+
+
+@respx.mock
+def test_world_text_says_when_the_reconciler_is_not_converging(runner):
+    """Without this the table is a frozen snapshot printed as if it were live."""
+    respx.get(f"{BASE}/world", params={"env": "prod"}).mock(
+        return_value=httpx.Response(200, json={**WORLD, "reconciler": DEAD_LOOP})
+    )
+    result = runner.invoke(app, ["world", "--env", "prod"])
+    assert result.exit_code == 0
+    assert "RECONCILER DOWN" in result.stderr
+    assert "is NOT converging" in result.stderr
+    assert len(result.stdout.splitlines()) == 2  # the table itself is unchanged
+
+
+@respx.mock
+def test_world_says_the_reconciler_is_down_even_when_the_world_is_empty(runner):
+    """"world is empty" from a loop that never ticked is the same lie as a
+    stale table, so the warning sits ABOVE the empty-world return."""
+    respx.get(f"{BASE}/world", params={"env": "prod"}).mock(
+        return_value=httpx.Response(200, json={"env": "prod", "resources": [], "reconciler": DEAD_LOOP})
+    )
+    result = runner.invoke(app, ["world", "--env", "prod"])
+    assert result.exit_code == 0
+    assert "RECONCILER DOWN" in result.stderr
+    assert "world is empty" in result.stdout
+
+
+@respx.mock
+def test_world_is_silent_about_a_converging_reconciler(runner):
+    respx.get(f"{BASE}/world", params={"env": "prod"}).mock(
+        return_value=httpx.Response(200, json={
+            **WORLD, "reconciler": LoopHealth(env="prod", ticking=True, ticks=99).model_dump(),
+        })
+    )
+    result = runner.invoke(app, ["world", "--env", "prod"])
+    assert result.exit_code == 0
+    assert "RECONCILER" not in result.stderr

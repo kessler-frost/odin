@@ -13,7 +13,8 @@ from odin.compute.tasks import container_name as task_container_name
 from odin.gateway.models import rdsctl
 from odin.gateway.stores import SynthStores
 from odin.reconcile.assertions import PgReady
-from odin.reconcile.drift import DriftSweeper, sweep_compute
+from odin.gateway.models.ecsctl import container_gone_reason
+from odin.reconcile.drift import _NO_PROBE_ERROR, DriftSweeper, sweep_compute
 from odin.reconcile.tf_status import project
 
 ENV = "default"
@@ -286,7 +287,11 @@ def test_removed_task_container_marks_the_task_stopped_with_a_drift_reason(tmp_p
     assert verdicts == {}  # ecs reports through its own record, not the overlay
     task = stores.ecsctl.get(ENV, "task:odin:t1")
     assert task["last_status"] == "STOPPED"
-    assert task["stopped_reason"] == f"container {container} removed outside odin — re-Apply to recreate"
+    # Pinned to the SHARED wording, not a hand-copied string: ecsctl's passive
+    # sweep races this path for the identical event, and when the two wrote
+    # different sentences whichever won decided what the user saw -- which made
+    # this very assertion flake under load. One source of truth for both.
+    assert task["stopped_reason"] == container_gone_reason(container)
     assert task["exit_code"] is None  # a container that's GONE never reported one
 
 
@@ -556,6 +561,57 @@ def test_a_wedged_but_running_container_is_reported_without_corrupting_the_recor
     assert verdicts["app-db"] == f"Postgres on {name} is not accepting connections: too many clients"
     record = stores.rdsctl.get(ENV, "db:app-db")
     assert (record["status"], record["status_reason"]) == ("available", None)
+
+
+def test_the_verdict_quotes_the_probe_that_failed_and_spends_only_one(tmp_path):
+    """The reported reason must come from the SAMPLE THAT FAILED, not from a
+    fresh probe taken to fetch the text.
+
+    The wedged path used to probe twice -- once to test, once to interpolate
+    `.error` -- so a second probe that SUCCEEDED made odin assert a failure its
+    own newest evidence had just disproved, and rendered the reason as the
+    literal string "None". `calls` pins the single-probe property, so
+    reintroducing the second probe fails here rather than silently."""
+    stores = SynthStores(tmp_path)
+    name = _db(stores, "app-db", "app-db")
+
+    class FlipsToHealthy:
+        """Fails once, then answers fine -- exactly the transient blip the
+        second probe used to land in."""
+
+        def __init__(self) -> None:
+            self.calls: list[tuple] = []
+
+        def __call__(self, host, port, user, password, db="postgres") -> PgReady:
+            self.calls.append((host, port, user, password))
+            if len(self.calls) == 1:
+                return PgReady(ok=False, error="server closed the connection unexpectedly")
+            return PgReady(ok=True)
+
+    probe = FlipsToHealthy()
+    verdicts = _sweeper(containers=FakeContainers(names=[name]), probe=probe).verdicts(stores, ENV)
+
+    assert verdicts["app-db"] == (
+        f"Postgres on {name} is not accepting connections: server closed the connection unexpectedly"
+    )
+    assert len(probe.calls) == 1
+
+
+def test_a_probe_that_fails_without_an_error_still_names_a_reason(tmp_path):
+    """`PgReady.error` is None whenever `_pg_connect` returns False instead of
+    raising, and interpolating that None printed the word "None" at the user.
+    A verdict has to name something true even when the driver says nothing."""
+    stores = SynthStores(tmp_path)
+    name = _db(stores, "app-db", "app-db")
+
+    class Silent:
+        def __call__(self, host, port, user, password, db="postgres") -> PgReady:
+            return PgReady(ok=False)
+
+    verdict = _sweeper(containers=FakeContainers(names=[name]), probe=Silent()).verdicts(stores, ENV)["app-db"]
+
+    assert "None" not in verdict
+    assert verdict == f"Postgres on {name} is not accepting connections: {_NO_PROBE_ERROR}"
 
 
 def test_a_creating_deleting_or_failed_database_is_never_probed(tmp_path):

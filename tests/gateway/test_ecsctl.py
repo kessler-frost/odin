@@ -1333,5 +1333,8 @@ def test_sweep_marks_a_task_whose_container_vanished(sink, ecs, stores):
     task = stores.ecsctl.get(ENV, f"task:odin:{task_id}")
     assert task["last_status"] == "STOPPED"
     assert task["exit_code"] is None, "a container that no longer exists never reported one"
-    assert "removed outside odin" in task["stopped_reason"]
+    # The SHARED wording -- reconcile/drift.py's reality sweep races this
+    # passive path for the identical event, and they must not disagree about
+    # what the user is told (a test asserting one of two sentences flaked).
+    assert task["stopped_reason"] == ecsctl.container_gone_reason(task["container_name"])
     assert _describe_service(stores, sink, ecs, runtime)["runningCount"] == 0

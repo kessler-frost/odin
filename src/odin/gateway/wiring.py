@@ -56,9 +56,15 @@ with the reason; a Lambda `State: Failed` with it), so it surfaces as a
 `crashed` node with a verdict naming the ref -- and, because a short service
 never reaches steady state, as a FAILED apply.
 
-WHICH KINDS PRODUCE: rds, elasticache, alb and ec2 -- the same four
-`reconcile/tf_status.py` projects facts for, held to the same gates (see
-`producer_facts`). ec2 arrived a beat late and is worth recording as a lesson:
+WHICH KINDS PRODUCE: `spec/models.py::REFERENCEABLE_KINDS` -- rds, elasticache,
+alb and ec2, the same four `reconcile/tf_status.py` projects facts for, held to
+the same gates (see `producer_facts`). That tuple lives in `spec/models.py`
+rather than here because `agent/hcl.py` needs the identical list to refuse an
+unreferenceable ref BEFORE tofu runs, and field test 6 found the cost of having
+it as prose in one error string instead: the string told users an sqs node
+"publishes no facts" while `/world` was publishing its QUEUE_URL.
+
+ec2 arrived a beat late and is worth recording as a lesson:
 the mesh work published `PRIVATE_IP`/`MESH_IP` into World while this injector
 was being built in parallel, the two halves coordinated only on the NAMES, and
 the result was a fact that visibly existed in `/world` and could not be
@@ -79,7 +85,7 @@ from odin.gateway.stores import SynthStores
 from odin.reconcile import mesh_health
 from odin.runtime.colima import CONTAINER_HOST
 from odin.runtime.lima import LIMA_HOST
-from odin.spec.models import Ref, Stack
+from odin.spec.models import REFERENCEABLE_KINDS, Ref, Stack
 from odin.spec.store import SpecStore
 from odin.util import atomic_write_text
 
@@ -210,9 +216,15 @@ def _ec2_producers(stores: SynthStores, env: str) -> dict[str, dict[str, str]]:
 
 
 def producer_facts(stores: SynthStores, env: str) -> dict[str, dict[str, str]]:
-    """`node label -> published facts`, for every kind that publishes any: rds,
-    elasticache, alb and ec2 (the same four `reconcile/tf_status.py` projects
-    facts for -- every other kind projects `{}`).
+    """`node label -> published WIRING facts`, for every kind that publishes
+    any: `REFERENCEABLE_KINDS` (the same four `reconcile/tf_status.py` projects
+    facts for).
+
+    "every other kind publishes nothing" is only true OF THIS TABLE, and saying
+    it without that qualifier is what field test 6 caught: s3/sqs/sns/dynamodb
+    publish real OBSERVED facts into World through `aws/backings.py::facts`, and
+    those show up in `odin world`. They are not wiring values and nothing here
+    builds them -- see `spec/models.py::REFERENCEABLE_KINDS`.
 
     GATED ON REALLY BEING UP, per kind: an rds record with no `endpoint_port`
     or a status other than `available`, a cache cluster that isn't
@@ -242,13 +254,64 @@ def producer_facts(stores: SynthStores, env: str) -> dict[str, dict[str, str]]:
     return facts
 
 
-def _resolve(ref: Ref, facts: dict[str, dict[str, str]]) -> str:
+# The three reasons a ref can find no producer, each in the words that are TRUE
+# of it. Selected by `_unresolvable_reason` through a map on the target's kind,
+# so an unmapped kind falls through to "not a producer" -- the safe default,
+# since `REFERENCEABLE_KINDS` is the whole of what `producer_facts` builds.
+_NOT_UP_YET = (
+    "{target!r} is a {kind} node that has not published its endpoint yet. A {kind} IS a valid "
+    "reference producer, so this is readiness, not wiring: odin withholds a {kind}'s facts until "
+    "it is really up (see `producer_facts`). Check `odin world` for the phase {target!r} is in"
+)
+_NOT_A_PRODUCER = (
+    "{target!r} is a {kind} node, and no {kind} node publishes an endpoint a reference can "
+    "resolve -- only {producers} do. This is NOT a claim that {target!r} has "
+    "no facts: `odin world` shows a {kind} node's own facts (an sqs node's QUEUE_URL, an s3 "
+    "node's BUCKET) and those are OBSERVED state, which is a different thing from a wiring "
+    "value. Reach a {kind} from this workload by name ({target!r}) through the AWS SDK -- "
+    "AWS_ENDPOINT_URL and this node's own credentials are already in its environment"
+)
+_KIND_UNKNOWN = (
+    "odin cannot tell what kind of node {target!r} is in this env: it is in neither the staged "
+    "wiring nor the applied desired state, so it is either a resource no canvas node backs or a "
+    "node that has since been removed. Nothing resolves from it either way"
+)
+
+
+# Derived from the tuple, never spelled out again: the whole point of moving
+# the list into `spec/models.py` was that a kind added there reaches every
+# sentence that names the set (field test 6, F3).
+_PRODUCERS = f"{', '.join(REFERENCEABLE_KINDS[:-1])} and {REFERENCEABLE_KINDS[-1]}"
+
+
+def _unresolvable_reason(ref: Ref, kind: str | None) -> str:
+    reasons = {None: _KIND_UNKNOWN, **dict.fromkeys(REFERENCEABLE_KINDS, _NOT_UP_YET)}
+    return reasons.get(kind, _NOT_A_PRODUCER).format(
+        target=ref.target_id, kind=kind, producers=_PRODUCERS,
+    )
+
+
+def _resolve(ref: Ref, facts: dict[str, dict[str, str]], kinds: dict[str, str]) -> str:
+    """One ref's real value, or `UnresolvedRef` naming the REAL reason.
+
+    Field test 6, F3's sub-finding: this used to answer "publishes no facts
+    (only rds, elasticache, alb and ec2 do)" for every miss, which is a
+    provably false statement about an sqs node -- `/world` publishes its
+    `QUEUE_URL` at the same instant (measured; see `spec/models.py::
+    REFERENCEABLE_KINDS`). Two misses with two different causes had one
+    sentence, and it named the wrong one for the commoner of the two.
+
+    So the reason is DERIVED from the target's KIND, which `kinds` carries in
+    from the staged wiring, and each cause gets the words that are true of it:
+    a referenceable kind that has not published yet is a TIMING answer; a kind
+    that can never publish is a WIRING-MODEL answer. A target whose kind is
+    unknown here (an env staged by an older build, a resource no canvas node
+    backs) says exactly that instead of guessing either one."""
     producer = facts.get(ref.target_id)
     if not producer:
         raise UnresolvedRef(
-            f"{ref.var} references {_ref_text(ref)}, but {ref.target_id!r} publishes no endpoint "
-            "in this env yet -- it is either not healthy yet or a kind that publishes no facts "
-            "(only rds, elasticache, alb and ec2 do)"
+            f"{ref.var} references {_ref_text(ref)}, but "
+            f"{_unresolvable_reason(ref, kinds.get(ref.target_id))}"
         )
     value = producer.get(ref.target_attr)
     if value is None:
@@ -282,12 +345,33 @@ def stage(stores: SynthStores, env: str, stack: Stack) -> None:
     never lingers."""
     staged = {
         res.id: {
+            # Field test 6, F3: the KIND rides along so `_resolve` can name the
+            # real reason a ref did not resolve. It has to come from here rather
+            # than from the store for the same reason the refs do -- during the
+            # apply that creates both nodes, `get_stack(env)` is still the
+            # previous (on a first apply, empty) Stack.
+            "kind": res.kind,
             "env": res.fields["env"].value if "env" in res.fields else {},
             "refs": [{"var": r.var, "target_id": r.target_id, "target_attr": r.target_attr} for r in res.refs],
         }
         for res in stack.resources
     }
     atomic_write_text(_staged_path(stores, env), json.dumps(staged, indent=2), mode=0o600)
+
+
+def _kinds(stores: SynthStores, env: str) -> dict[str, str]:
+    """`node label -> canvas kind` for this env: the staged wiring over the
+    applied Stack.
+
+    Both sources, staged winning, because each covers the other's blind spot --
+    the staged file is the only one that knows about a node created by the apply
+    currently in flight, and the Stack is the only one that knows anything at
+    all about an env staged by a build that wrote no `kind`. A label in neither
+    is reported as unknown (`_KIND_UNKNOWN`) rather than guessed at."""
+    stack = {r.id: r.kind for r in SpecStore(stores.root).get_stack(env).resources}
+    path = _staged_path(stores, env)
+    staged = json.loads(path.read_text()) if path.exists() else {}
+    return {**stack, **{node: entry["kind"] for node, entry in staged.items() if entry.get("kind")}}
 
 
 def _authored(stores: SynthStores, env: str, node_label: str) -> tuple[dict[str, str], tuple[Ref, ...]]:
@@ -329,7 +413,7 @@ def node_env(stores: SynthStores, env: str, node_label: str) -> dict[str, str]:
     resolved = dict(static)
     if not refs:
         return resolved
-    facts = producer_facts(stores, env)
+    facts, kinds = producer_facts(stores, env), _kinds(stores, env)
     for ref in refs:
-        resolved[ref.var] = _resolve(ref, facts)
+        resolved[ref.var] = _resolve(ref, facts, kinds)
     return resolved

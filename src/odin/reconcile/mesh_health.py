@@ -20,7 +20,9 @@ we publish?" -- and its answer is allowed to take a resource out of
      before any of this when no `*_MESH` fact is published)
   2. is the env's lighthouse process alive?  (a pidfile + signal-0 check, no
      subprocess -- discovery AND relay ride it, so a member is unreachable
-     from any peer without it: fabric/nebula.py's R5 note)
+     from any peer without it: fabric/nebula.py's R5 note. When it is not,
+     `LighthouseManager.why_not_running` supplies WHICH of the four causes it
+     is and the remedy for that one)
   3. is the sidecar running, and in the CURRENT target's namespace?
      (`MeshSidecar.attached_to` -- HIGH-2's exact failure)
   4. does the overlay address answer?  (`assertions.mesh_ready_sync`, one
@@ -32,6 +34,15 @@ effective, since `MeshSidecar` re-joins a replaced target), and a projection
 that restarted daemons behind the user's back would fight it. What this does
 instead is refuse to keep publishing an address that doesn't answer, and say
 why.
+
+...and REPORTING means naming a remedy that is actually reachable. Every
+failure verdict carries its own `fix` (`MeshVerdict.fix`), because "re-Apply"
+is the right answer for exactly three of the five faults here and a LOOP for
+the fourth: an Apply with no `nebula` on PATH re-enters the same
+`shutil.which` miss forever, so telling the user to re-Apply sent them round a
+circle while the sentence that ends it (`brew install nebula`) went only to
+the server log. `odin doctor` prints a `nebula` row for the same condition,
+which is why the fix points there too.
 
 WHAT THIS STILL CANNOT SEE, and where that is handled instead. Check 4 stands
 in the member's OWN namespace, so by construction it cannot observe a PEER
@@ -78,6 +89,12 @@ Entry = tuple[str, str, dict, str | None]
 _OK_SECONDS = 30.0
 _FAIL_SECONDS = 5.0
 
+# The remedy for every fault an Apply genuinely repairs: `rdsctl.ensure_db_mesh`
+# re-creates a stopped sidecar and re-joins a replaced target (this module's
+# "REPORT, DON'T HEAL" note). Deliberately NOT the answer for a dead lighthouse,
+# whose two most likely causes an Apply cannot touch.
+RE_APPLY = "re-Apply to re-join the overlay"
+
 _cache: dict[tuple[str, str, str], tuple[float, "MeshVerdict"]] = {}
 
 
@@ -85,6 +102,16 @@ _cache: dict[tuple[str, str, str], tuple[float, "MeshVerdict"]] = {}
 class MeshVerdict:
     ok: bool
     reason: str | None = None
+    # The user's next move, chosen BY THE BRANCH that found the fault -- not a
+    # remedy the wrapper assumes. `gate` used to append a flat "re-Apply to
+    # re-join" to every failure, which is right for a stranded sidecar and a
+    # LOOP for a missing `nebula` binary: re-Applying re-enters the same
+    # `shutil.which` miss forever (probed -- three consecutive `ensure_started`
+    # calls, all False, no log written). `None` prints no advice at all, which
+    # is the honest fall-through: a branch that forgets says nothing rather
+    # than sending the user round a circle (`test_every_failure_verdict_names_a_fix`
+    # is what keeps that theoretical).
+    fix: str | None = None
 
 
 def _ok_seconds() -> float:
@@ -130,7 +157,18 @@ def _probe(
         return _verdict(root, env, address, sidecar_target, sidecar_port, rt, mesh, manager)
     except Exception as exc:  # noqa: BLE001 -- a verdict must never fail a tick
         log.warning("mesh health check failed for %s (env %r): %s", address, env, exc)
-        return MeshVerdict(ok=False, reason=f"the mesh health check itself failed: {exc}")
+        # Field test 6, F4's class: `{exc}` alone is empty for an exception built
+        # with no message, and this reason is interpolated straight into the
+        # resource's crashed verdict below -- so the ONE sentence explaining why
+        # the mesh was withheld would have ended in a colon.
+        detail = str(exc) or f"{type(exc).__name__}, raised with no message"
+        return MeshVerdict(
+            ok=False, reason=f"the mesh health check itself failed: {detail}",
+            # NOT "re-Apply": this is odin's own probe failing (a dead docker
+            # daemon reaches here), and an Apply against a runtime that cannot
+            # answer `status` will not fix a thing.
+            fix="run `odin doctor` -- odin could not complete the check, so the mesh itself is unproven either way",
+        )
 
 
 def _verdict(
@@ -148,22 +186,39 @@ def _verdict(
         # to verify (and nothing published one).
         return MeshVerdict(ok=True)
     if not lighthouse.is_running(root, env):
-        return MeshVerdict(ok=False, reason=(
-            f"the {env!r} nebula lighthouse is not running, so no peer can find or relay to "
-            f"{address} (see {Path(root) / env / 'nebula' / 'lighthouse.log'})"
-        ))
+        # WHY it is not running, from the component that refuses to start it --
+        # `LighthouseManager._blocker` is literally the check `_start_locked`
+        # returns on, so this cannot drift from the real cause. This used to
+        # send every reader to `{root}/{env}/nebula/lighthouse.log`, and in the
+        # two most likely cases (`nebula` absent from PATH, cert never signed)
+        # `_start_locked` returns BEFORE opening that file, so it has never
+        # existed -- probed both ways; see `LighthouseAbsence`. Only the
+        # `why_not_running` branch that has evidence the process really ran
+        # names the log now.
+        absence = lighthouse.why_not_running(root, env)
+        return MeshVerdict(
+            # `gate` already says WHICH address is unreachable, so this adds only
+            # the mechanism (why a member that is itself perfectly up still
+            # cannot be reached) -- not a third restatement of "unreachable".
+            ok=False, reason=f"{absence.reason}; discovery and relay both ride the lighthouse",
+            fix=absence.fix,
+        )
     if sidecar_target is None or sidecar_port is None:
         return MeshVerdict(ok=True)
     target, port = sidecar_target, sidecar_port
     sidecar = mesh.sidecar_name(target)
     if not mesh.running(target):
-        return MeshVerdict(ok=False, reason=f"the mesh sidecar {sidecar} is not running")
+        return MeshVerdict(
+            ok=False, reason=f"the mesh sidecar {sidecar} is not running", fix=RE_APPLY,
+        )
     if mesh.attached_to(target) is False:
-        return MeshVerdict(ok=False, reason=(
-            f"the mesh sidecar {sidecar} is in a REPLACED container's network namespace"
-        ))
+        return MeshVerdict(
+            ok=False,
+            reason=f"the mesh sidecar {sidecar} is in a REPLACED container's network namespace",
+            fix=RE_APPLY,
+        )
     ready = mesh_ready_sync(runtime, sidecar, address.rsplit(":", 1)[0], port)
-    return MeshVerdict(ok=ready.ok, reason=ready.error)
+    return MeshVerdict(ok=ready.ok, reason=ready.error, fix=None if ready.ok else RE_APPLY)
 
 
 def gate(
@@ -193,8 +248,12 @@ def gate(
     if result.ok:
         return entry
     withheld = {key: value for key, value in facts.items() if key not in mesh_keys}
+    # The remedy comes from the verdict, never from here. This line used to end
+    # in a flat "re-Apply to re-join" for EVERY cause, which for a missing
+    # `nebula` binary is a loop the user cannot leave by following it.
+    advice = f"; {result.fix}" if result.fix else ""
     reason = (
         f"the published mesh address {address} is unreachable: {result.reason} "
-        f"-- the SG-gated overlay path is down (any published host port is unaffected); re-Apply to re-join"
+        f"-- the SG-gated overlay path is down (any published host port is unaffected){advice}"
     )
     return (kind, "crashed" if phase == "healthy" else phase, withheld, verdict or reason)

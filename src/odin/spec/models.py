@@ -81,6 +81,35 @@ class Ref(BaseModel):
     target_attr: str  # the attribute to read, e.g. "DATABASE_URL"
 
 
+# THE canvas kinds a `${{producer.ATTR}}` reference can resolve against. ONE
+# definition, imported by both halves that need it: `gateway/wiring.py::
+# producer_facts`, which builds the values at launch time, and
+# `agent/hcl.py::_unwired_refs`, which refuses a ref against anything else
+# BEFORE tofu runs.
+#
+# Field test 6, F3's sub-finding. The list used to exist only as prose inside
+# one `wiring.py` error string, which told the user an sqs node "publishes no
+# facts" -- measured against a REAL running server at the same instant:
+#
+#   /world?env=srvfixf3   sqs srvfix-queue healthy
+#                         {"QUEUE_URL": "http://host.docker.internal:4796/…",
+#                          "endpoint": "http://host.docker.internal:33983"}
+#   wiring.producer_facts(stores, "srvfixf3")  ->  {}
+#
+# Both readings are correct; the SENTENCE conflated two different fact systems.
+# `aws/backings.py::facts` authors OBSERVED facts for s3/sqs/sns/dynamodb --
+# `BUCKET`, `QUEUE_URL`, `TOPIC_ARN`, `TABLE` -- and they really are in
+# `odin world`. `producer_facts` builds WIRING values out of the gateway's synth
+# records, and only these four kinds have one. A node can therefore publish a
+# fact you can see and still not be referenceable, which is the thing to say.
+#
+# (`fabric/localhost.py::resolve` DOES resolve refs out of World facts and would
+# make the four PROVISIONED kinds referenceable -- but the reconciler only
+# stores its `_fabric` and never calls it, so it is not a live path and must not
+# be counted as one here.)
+REFERENCEABLE_KINDS = ("rds", "elasticache", "alb", "ec2")
+
+
 class Edge(BaseModel):
     model_config = {"frozen": True}
     src: str

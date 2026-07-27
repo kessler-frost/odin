@@ -27,7 +27,7 @@ def _render_tf_status(body: dict) -> None:
 @tf_app.command("status")
 def tf_status(env: str = http.ENV, url: str = http.URL, output: OutputFormat = http.OUTPUT) -> None:
     """The env's tofu state: running?, workspace on disk?, last run's outcome."""
-    body = http.body_or_fail(http.request("GET", url, "/tf/status", params={"env": env}))
+    body = http.body_or_fail(http.request("GET", url, "/tf/status", params={"env": env}), output)
     http.emit(body, output, _render_tf_status)
 
 
@@ -55,8 +55,18 @@ def _render_tf_plan(body: dict) -> None:
     # ...and when the saved canvas is no longer what this env applied, the two
     # halves above describe two DIFFERENT things. Never silently: the server
     # detected it, and the operator reading this output is told which is which.
+    #
+    # On STDERR, unlike the plan report above it. This note is an advisory about
+    # a discrepancy, not part of the answer -- the README says so ("It notes on
+    # stderr when the two differ"), `odin canvas set`'s identical note really is
+    # on stderr, and so is every other advisory the CLI prints (`odin
+    # translate`'s `unsupported:`/`warning:`, `odin world`'s `RECONCILER DOWN`).
+    # Field test 6 F6 found this ONE line on stdout, where `odin tf plan >
+    # report.txt` mixes it into the report a human is meant to read. NOT the
+    # `not covered by this plan:` line above: that one is part of the answer
+    # ("the command names those on their own line") and stays on stdout.
     if body.get("note"):
-        typer.echo(f"note: {body['note']}")
+        typer.echo(f"note: {body['note']}", err=True)
 
 
 @tf_app.command("plan")
@@ -69,11 +79,17 @@ def tf_plan(env: str = http.ENV, url: str = http.URL, output: OutputFormat = htt
     hand talks to REAL AWS. This command cannot. It changes nothing.
 
     Exit codes mirror `tofu plan -detailed-exitcode`: 0 no changes, 2 changes
-    present, 1 a real error or a refusal, 3 the odin server is unreachable.
+    present, 1 a real error or a refusal, 3 the odin server could not be
+    reached — which includes a `--url`/`ODIN_URL` odin cannot dial at all (a
+    missing `http://`, a non-numeric port). 2 is reserved for drift here, so
+    neither a down server nor a typo'd URL is allowed to look like it.
+
+    The canvas-drift note goes to STDERR; `-o json` carries it as
+    `.canvas_drift`, which is what a CI check should gate on.
     """
     body = http.body_or_fail(http.request(
         "POST", url, "/tf/plan", params={"env": env}, unreachable_code=_PLAN_UNREACHABLE_EXIT,
-    ))
+    ), output)
     http.emit(body, output, _render_tf_plan)
     raise typer.Exit(_PLAN_EXIT[body["status"]])
 
@@ -87,7 +103,7 @@ def _render_tf_destroy(body: dict) -> None:
 @tf_app.command("destroy")
 def tf_destroy(env: str = http.ENV, url: str = http.URL, output: OutputFormat = http.OUTPUT) -> None:
     """Run `tofu destroy` for the env's workspace (tofu's half only — see `odin destroy`)."""
-    body = http.body_or_fail(http.request("POST", url, "/tf/destroy", params={"env": env}))
+    body = http.body_or_fail(http.request("POST", url, "/tf/destroy", params={"env": env}), output)
     http.emit(body, output, _render_tf_destroy)
     if body["status"] == "failed":
         raise typer.Exit(1)

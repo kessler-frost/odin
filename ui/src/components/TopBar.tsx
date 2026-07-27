@@ -28,6 +28,12 @@ interface TopBarProps {
 export default function TopBar({ wsConnected, env, onEnvChange, onApply, onViewCode, codeOpen }: TopBarProps) {
   const [busy, setBusy] = useState<Busy>(null);
   const [backendUp, setBackendUp] = useState(false);
+  // Reconcilers that have stopped converging (GET /health's `reconcilers`).
+  // A dead loop leaves every badge on the canvas frozen at its last reading
+  // while the Backend LED stays green -- which is exactly what made it
+  // invisible -- so it gets its own chip, off the live 5s /health poll rather
+  // than the /world read the canvas only makes on mount.
+  const [deadLoops, setDeadLoops] = useState<{ env: string; verdict: string }[]>([]);
   const [envs, setEnvs] = useState<string[]>([]);
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -39,6 +45,10 @@ export default function TopBar({ wsConnected, env, onEnvChange, onApply, onViewC
       const res = await fetch(`${API}/health`).then(r => r.json()).catch(() => null);
       if (!mountedRef.current) return;
       setBackendUp(!!res);
+      const loops: { env: string; ticking: boolean; verdict: string | null }[] = res?.reconcilers ?? [];
+      setDeadLoops(
+        loops.filter(l => !l.ticking).map(l => ({ env: l.env, verdict: l.verdict ?? 'not converging' })),
+      );
     };
     poll();
     const interval = setInterval(poll, 5000);
@@ -107,6 +117,15 @@ export default function TopBar({ wsConnected, env, onEnvChange, onApply, onViewC
           <Led state={wsLed} />
           WebSocket
         </div>
+        {deadLoops.length > 0 && (
+          <div
+            title={deadLoops.map(l => l.verdict).join('\n\n')}
+            className="flex items-center gap-1.5 h-5 px-2 border border-neon-red bg-[rgba(255,51,85,0.08)] text-neon-red uppercase tracking-[1px] text-[10px] leading-5"
+          >
+            <Led state="red" />
+            Reconciler down: {deadLoops.map(l => l.env).join(', ')}
+          </div>
+        )}
       </div>
       <div className="flex-1"></div>
       <input

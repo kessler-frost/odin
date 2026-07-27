@@ -208,6 +208,22 @@ class _Proc:
     stderr: str = ""
 
 
+def _cert_failure(proc: _Proc) -> str:
+    """Why a `nebula-cert` call failed, using whatever it actually produced.
+
+    Field test 6, F4's class: both raise sites used `proc.stderr.strip()` alone,
+    so a `nebula-cert` that was signal-killed or wrote to stdout produced
+    `nebula-cert sign failed: ` -- and `RuntimeError` is unmapped in
+    `server.py::_EXCEPTION_VERDICTS`, so that empty tail reached the caller
+    verbatim. rc 127 (an absent binary) is the commonest case and the one with
+    the least stderr, which is why the exit code is named last rather than
+    dropped."""
+    return proc.stderr.strip() or proc.stdout.strip() or (
+        f"exit {proc.returncode} with no output"
+        + (" -- `nebula-cert` is not on PATH (`brew install nebula`)" if proc.returncode == 127 else "")
+    )
+
+
 def _default_runner(args: list[str]) -> _Proc:
     # `run_command`: `nebula`/`nebula-cert` are downloaded on demand, so an
     # absent binary is an ordinary state -- rc 127, not a traceback.
@@ -327,7 +343,7 @@ class NebulaManager:
             "-out-crt", str(self._ca_crt), "-out-key", str(self._ca_key),
         ])
         if proc.returncode != 0:
-            raise RuntimeError(f"nebula-cert ca failed: {proc.stderr.strip()}")
+            raise RuntimeError(f"nebula-cert ca failed: {_cert_failure(proc)}")
         return CaInfo(network=network, ca_crt=self._ca_crt, ca_key=self._ca_key)
 
     def sign_cert(self, hostname: str, ip: str, groups: list[str] | None = None) -> CertPaths:
@@ -344,7 +360,7 @@ class NebulaManager:
             cmd += ["-groups", ",".join(groups)]
         proc = self._run(cmd)
         if proc.returncode != 0:
-            raise RuntimeError(f"nebula-cert sign failed: {proc.stderr.strip()}")
+            raise RuntimeError(f"nebula-cert sign failed: {_cert_failure(proc)}")
         return CertPaths(crt=host_crt, key=host_key, ca_crt=self._ca_crt)
 
     def cert_paths(self, hostname: str) -> CertPaths:
@@ -717,6 +733,31 @@ def ensure_network(root: Path, env: str, lighthouse_underlay: str, runner=None) 
         return overlay
 
 
+@dataclass(frozen=True)
+class LighthouseAbsence:
+    """Why an env's lighthouse is not running, and what actually fixes it.
+
+    Exists because the two most likely answers are NOT "read the log". Probed
+    against the real fabric with a PATH holding no `nebula` (nothing was
+    uninstalled -- `/opt/homebrew/bin` was simply left off PATH):
+    `_start_locked` returns False in both precondition cases BEFORE it opens
+    `lighthouse.log`, so that file has never been created -- yet the only
+    advice `reconcile/mesh_health.py` gave was to go read it, and the string
+    that really fixes it (`brew install nebula`) went to the SERVER log, where
+    no user looks. `re-Apply to re-join` then re-entered the same
+    `shutil.which` miss forever, so the advice was also a loop.
+
+    `reason` names what is wrong; `fix` names the user's next move. Kept apart
+    so a caller can render them into its own sentence rather than parsing one.
+    """
+
+    reason: str
+    fix: str
+
+    def sentence(self) -> str:
+        return f"{self.reason} -- {self.fix}"
+
+
 class LighthouseManager:
     """R3 (single-host mesh activation): supervises ONE real `nebula`
     lighthouse PROCESS per env on the HOST -- the piece `ensure_network`'s
@@ -778,6 +819,75 @@ class LighthouseManager:
 
     def _log_path(self, root: Path, env: str) -> Path:
         return _nebula_dir(root, env) / "lighthouse.log"
+
+    def _resolve_bin(self) -> str | None:
+        """The `nebula` binary this manager would spawn, or None. ONE
+        expression, so `_blocker`'s "it isn't there" and `_start_locked`'s
+        "here it is" can never disagree about the same PATH."""
+        return self._nebula_bin or shutil.which("nebula")
+
+    def _blocker(self, root: Path, env: str) -> LighthouseAbsence | None:
+        """The preconditions a lighthouse cannot start without -- evaluated
+        read-only (a path `exists()` and a PATH scan; no mkdir, no spawn).
+
+        THE single implementation, consumed both by `_start_locked` (which
+        refuses) and by `why_not_running` (which explains), so the explanation
+        a user reads is literally the check that stopped the start rather than
+        a re-derivation of it that can drift away from it."""
+        cert = NebulaManager(_nebula_dir(root, env), runner=self._run).cert_paths("lighthouse")
+        if not cert.crt.exists():
+            return LighthouseAbsence(
+                reason=(
+                    f"the {env!r} nebula lighthouse is not running: this env has no signed "
+                    f"lighthouse certificate ({cert.crt} does not exist)"
+                ),
+                fix=(
+                    "draw a VPC node and Apply (that is what signs this env's Nebula CA and "
+                    "lighthouse cert); if an earlier Apply failed on `nebula-cert`, `odin doctor`'s "
+                    "`nebula-cert` row says why"
+                ),
+            )
+        if self._resolve_bin() is None:
+            return LighthouseAbsence(
+                reason=(
+                    f"the {env!r} nebula lighthouse is not running: the `nebula` binary is not on "
+                    f"odin's PATH, so it was never spawned"
+                ),
+                # VERIFIED, not assumed: with `nebula` hidden `ensure_started`
+                # returns False and writes no log; put back on PATH the very
+                # next `ensure_started` returns True, the log appears, and
+                # `is_running` goes True (probe 2, steps 1-2).
+                fix="run `brew install nebula`, then Apply again (`odin doctor` shows this as its `nebula` row)",
+            )
+        return None
+
+    def why_not_running(self, root: Path, env: str) -> LighthouseAbsence:
+        """The actionable half of `is_running() is False`: which of the four
+        real causes it is, and what the user does about it. Read-only, on
+        `is_running`'s own terms -- a status projection must not mkdir or spawn.
+
+        Total by construction: the two preconditions come from `_blocker`, and
+        what remains splits on whether the process ever produced OUTPUT. That
+        distinction is the point -- `lighthouse.log` exists if and only if
+        `_start_locked` got as far as spawning, so this is the only caller that
+        may name it (probed: present after a real start, after `ensure_stopped`,
+        and after an immediate exit; absent in both `_blocker` cases)."""
+        blocker = self._blocker(root, env)
+        if blocker is not None:
+            return blocker
+        log_path = self._log_path(root, env)
+        if log_path.exists():
+            return LighthouseAbsence(
+                reason=f"the {env!r} nebula lighthouse is not running: its process is gone",
+                fix=f"see {log_path} for how it ended, then Apply again to restart it",
+            )
+        return LighthouseAbsence(
+            reason=(
+                f"the {env!r} nebula lighthouse is not running: nothing has started it yet "
+                f"(no {log_path.name} was ever written)"
+            ),
+            fix="Apply the canvas -- a backing or EC2 node joining this env's mesh starts it",
+        )
 
     def is_running(self, root: Path, env: str) -> bool:
         """Read-only: no filesystem write (mirrors `mesh_state`'s own "a GET
@@ -852,15 +962,18 @@ class LighthouseManager:
     def _start_locked(self, root: Path, env: str, underlay: str) -> bool:
         if self.is_running(root, env):
             return True
+        # `_blocker` IS the precondition check -- not a copy of one. Both refusals
+        # return before `lighthouse.log` is opened below, which is exactly why
+        # `why_not_running` must be the thing a user-facing verdict asks (a
+        # verdict that said "see lighthouse.log" here named a file that has
+        # never existed).
+        blocker = self._blocker(root, env)
+        if blocker is not None:
+            log.warning("lighthouse not started for env %r: %s", env, blocker.sentence())
+            return False
         manager = NebulaManager(_nebula_dir(root, env), runner=self._run)
         cert = manager.cert_paths("lighthouse")
-        if not cert.crt.exists():
-            log.warning("no lighthouse cert for env %r yet (no VPC created?); lighthouse not started", env)
-            return False
-        nebula_bin = self._nebula_bin or shutil.which("nebula")
-        if nebula_bin is None:
-            log.warning("nebula not found on PATH; lighthouse not started for env %r (brew install nebula)", env)
-            return False
+        nebula_bin = self._resolve_bin()
         overlay = manager.load_overlay()
         lighthouse_ip = overlay.lighthouse_ip if overlay else MeshNetwork(network=env).lighthouse_ip
         port = self._usable_port(root, env, manager, overlay)
