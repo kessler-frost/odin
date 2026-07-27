@@ -1129,6 +1129,54 @@ future decision against these points instead of re-deriving them:
   external/LAN-reachable underlay address plus multi-Mac membership and
   cross-machine placement are still open). Additive, no core change.
 
+## v0.7.8 — three PRE-EXISTING field failures, carried forward deliberately
+
+All three fail IDENTICALLY at v0.7.6 (verified by running them against the
+released tag, not asserted), so v0.7.7 regresses nothing. They are recorded
+here rather than hacked green, because making them pass in five minutes would
+have meant retiring a claim rather than fixing a bug.
+
+- [ ] **`test_a_noop_apply_cannot_report_success_*` (ecs + lambda) — a genuine
+  design conflict, and it needs a DECISION, not a patch.** The tests assert
+  that a no-op apply must not claim success while the service is at zero, and
+  they create that state with a broken `${{ghost.ENDPOINT}}` ref. odin's
+  wiring guard now refuses that apply upfront with a 409 — which is BETTER
+  behaviour, and it runs before apply, so "apply proceeds while a ref is
+  unresolvable" is unreachable BY DESIGN.
+  Three options, none free: (a) assert the refusal — honest, loses the
+  reconcile-path coverage; (b) find a failure mechanism the guard allows —
+  preserves the claim, but every candidate checked (bad image, etc.) breaks
+  the test's own "tofu had nothing to do" premise; (c) split into two tests.
+  The claim these encode is one of odin's honesty guarantees (field test 3:
+  `applied`/exit-0 at 0 of 3 tasks). Do not retire it quietly.
+
+- [ ] **`test_a_killed_database_gets_its_mesh_endpoint_back_after_one_apply`.**
+  A killed rds container does not come back after one apply — verdict
+  `container odin-rds-... is not running (exit 137) — re-Apply to recreate`.
+  Note the symptom DIFFERS between versions (v0.7.6: "never published a
+  verified overlay address"), so diagnose from the current failure rather than
+  assuming they are the same bug.
+  Adjacent and probably related: `fabric/sidecar.py::ensure()` collapses "the
+  join failed" into "there is no mesh here" — its broad `except` returns
+  `None`, the same value as the no-mesh case. That is honesty rule 2 and is
+  why a hard `AttributeError` once surfaced as a decorative security group.
+  Fix the collapse first; it may be what makes this test's real cause visible.
+
+- [ ] **Apply can send a STALE canvas — two pre-existing UI bugs, found while
+  recording the v0.7.7 GIFs.** Both verified as untouched by v0.7.7
+  (`ui/src/App.tsx` has no diff against v0.7.6), so they predate this release.
+  1. `handleApply` sends the SAVED canvas: `readCanvas()` does
+     `fetch('/canvas')`, and the canvas save is DEBOUNCED. Drop a node, click
+     Apply promptly, and the node is not in what gets applied — the badge
+     stays `draft` and nothing explains why. Reproduced repeatedly: an SNS
+     node dropped and applied never reached `/world` at all.
+     This is honesty rule 2 in the UI: Apply reports on something other than
+     what is on screen. Fix by sending the LIVE canvas (the component already
+     holds it in `nodesRef`/`edgesRef`) or by flushing the pending save first.
+  2. `readCanvas()` omits `?env=` entirely, so Apply always reads the DEFAULT
+     env's canvas while POSTing to the selected env. In any non-default env
+     that applies the wrong desired state.
+
 ## The intelligence layer (owner directive, 2026-07-27) — NEXT, after v0.7.7
 
 **The governing idea, in the owner's words: "canvas and navigating things
