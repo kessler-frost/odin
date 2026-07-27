@@ -32,19 +32,19 @@ class LoggingRuntime(FakeRuntime):
     makes -- so the route's log resolution is exercised for real, not stubbed
     out at the assembler's callable."""
 
-    def status(self, name):
+    async def status(self, name):
         return "exited"
 
-    def logs(self, name, tail=100):
+    async def logs(self, name, tail=100):
         return f"==> {name}\nFATAL: config missing\n"
 
-    def facts(self, name, container_port=0):
+    async def facts(self, name, container_port=0):
         return ContainerFacts(phase="crashed")
 
-    def exit_code(self, name):
+    async def exit_code(self, name):
         return 1
 
-    def ensure_host(self):
+    async def ensure_host(self):
         return HostFacts()
 
 
@@ -388,7 +388,7 @@ def test_build_context_is_usable_without_the_route(tmp_path):
     assert context["env"] == ENV and "db" in context["nodes"]
 
 
-async def test_a_failure_here_advises_the_env_the_caller_actually_named(tmp_path):
+def test_a_failure_here_advises_the_env_the_caller_actually_named(tmp_path):
     """`/agent/debug` takes its env in the BODY, and `_failure_body` can only
     read query params — so a failure on env 'staging' used to advise
     `odin world --env default`, pointing the user at an env they never

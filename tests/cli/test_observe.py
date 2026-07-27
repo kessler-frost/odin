@@ -27,21 +27,21 @@ EVENTS = [
 
 
 @respx.mock
-async def test_world_json(runner):
+def test_world_json(runner):
     respx.get(f"{BASE}/world", params={"env": "prod"}).mock(
         return_value=httpx.Response(200, json=WORLD)
     )
-    result = await runner.invoke(app, ["world", "--env", "prod", "-o", "json"])
+    result = runner.invoke(app, ["world", "--env", "prod", "-o", "json"])
     assert result.exit_code == 0
     assert json.loads(result.stdout) == WORLD
 
 
 @respx.mock
-async def test_world_text_renders_phase_table(runner):
+def test_world_text_renders_phase_table(runner):
     respx.get(f"{BASE}/world", params={"env": "prod"}).mock(
         return_value=httpx.Response(200, json=WORLD)
     )
-    result = await runner.invoke(app, ["world", "--env", "prod"])
+    result = runner.invoke(app, ["world", "--env", "prod"])
     assert result.exit_code == 0
     lines = result.stdout.splitlines()
     assert len(lines) == 2
@@ -50,7 +50,7 @@ async def test_world_text_renders_phase_table(runner):
 
 
 @respx.mock
-async def test_world_text_renders_a_drift_verdict(runner):
+def test_world_text_renders_a_drift_verdict(runner):
     """W2.2: the reality sweep's verdict is the whole point of `odin world`
     for a drifted resource -- "crashed" alone doesn't tell anyone their VM was
     deleted out of band, or that re-Apply is the fix. It rides
@@ -64,7 +64,7 @@ async def test_world_text_renders_a_drift_verdict(runner):
              "verdict": verdict, "restarts": 0},
         ],
     }))
-    result = await runner.invoke(app, ["world", "--env", "prod"])
+    result = runner.invoke(app, ["world", "--env", "prod"])
     assert result.exit_code == 0
     (line,) = result.stdout.splitlines()
     assert "server" in line and "ec2" in line and "crashed" in line
@@ -72,32 +72,32 @@ async def test_world_text_renders_a_drift_verdict(runner):
 
 
 @respx.mock
-async def test_world_text_empty(runner):
+def test_world_text_empty(runner):
     respx.get(f"{BASE}/world", params={"env": "default"}).mock(
         return_value=httpx.Response(200, json={"env": "default", "resources": []})
     )
-    result = await runner.invoke(app, ["world"])
+    result = runner.invoke(app, ["world"])
     assert result.exit_code == 0
     assert "world is empty" in result.stdout
 
 
 @respx.mock
-async def test_world_server_down(runner):
+def test_world_server_down(runner):
     respx.get(f"{BASE}/world").mock(side_effect=httpx.ConnectError("refused"))
-    result = await runner.invoke(app, ["world"])
+    result = runner.invoke(app, ["world"])
     assert result.exit_code == 2
     assert "Could not reach odin server" in result.stderr
 
 
 @respx.mock
-async def test_envs_text_and_json(runner):
+def test_envs_text_and_json(runner):
     respx.get(f"{BASE}/envs").mock(
         return_value=httpx.Response(200, json={"envs": ["default", "prod"]})
     )
-    text = await runner.invoke(app, ["envs"])
+    text = runner.invoke(app, ["envs"])
     assert text.exit_code == 0
     assert text.stdout.splitlines() == ["default", "prod"]
-    as_json = await runner.invoke(app, ["envs", "-o", "json"])
+    as_json = runner.invoke(app, ["envs", "-o", "json"])
     assert json.loads(as_json.stdout) == {"envs": ["default", "prod"]}
 
 
@@ -142,13 +142,13 @@ def test_envs_help_states_what_the_store_actually_does(tmp_path):
 
 
 @respx.mock
-async def test_envs_invents_no_explanation_for_a_list_it_did_not_get(runner):
+def test_envs_invents_no_explanation_for_a_list_it_did_not_get(runner):
     """The removed dead branch. It printed "no environments yet — an env exists
     once something has been applied to it" on `envs == []`, which is (a) a
     state odin's own `/envs` cannot answer with and (b) false about `default`.
     An answer odin did not receive is not an answer it should narrate."""
     respx.get(f"{BASE}/envs").mock(return_value=httpx.Response(200, json={"envs": []}))
-    result = await runner.invoke(app, ["envs"])
+    result = runner.invoke(app, ["envs"])
     assert result.exit_code == 0
     assert result.stdout == ""
     assert "no environments yet" not in result.stderr
@@ -156,27 +156,27 @@ async def test_envs_invents_no_explanation_for_a_list_it_did_not_get(runner):
 
 
 @respx.mock
-async def test_envs_json_stays_pure_json(runner):
+def test_envs_json_stays_pure_json(runner):
     respx.get(f"{BASE}/envs").mock(return_value=httpx.Response(200, json={"envs": ["default"]}))
-    result = await runner.invoke(app, ["envs", "-o", "json"])
+    result = runner.invoke(app, ["envs", "-o", "json"])
     assert result.exit_code == 0
     assert json.loads(result.stdout) == {"envs": ["default"]}
 
 
 @respx.mock
-async def test_envs_server_down(runner):
+def test_envs_server_down(runner):
     respx.get(f"{BASE}/envs").mock(side_effect=httpx.ConnectError("refused"))
-    result = await runner.invoke(app, ["envs"])
+    result = runner.invoke(app, ["envs"])
     assert result.exit_code == 2
     assert "odin start" in result.stderr
 
 
 @respx.mock
-async def test_events_text_one_line_per_event(runner):
+def test_events_text_one_line_per_event(runner):
     respx.get(f"{BASE}/events", params={"env": "default"}).mock(
         return_value=httpx.Response(200, json=EVENTS)
     )
-    result = await runner.invoke(app, ["events"])
+    result = runner.invoke(app, ["events"])
     assert result.exit_code == 0
     lines = result.stdout.splitlines()
     assert len(lines) == 2
@@ -184,19 +184,19 @@ async def test_events_text_one_line_per_event(runner):
 
 
 @respx.mock
-async def test_events_json_mode(runner):
+def test_events_json_mode(runner):
     respx.get(f"{BASE}/events", params={"env": "prod"}).mock(
         return_value=httpx.Response(200, json=EVENTS)
     )
-    result = await runner.invoke(app, ["events", "--env", "prod", "-o", "json"])
+    result = runner.invoke(app, ["events", "--env", "prod", "-o", "json"])
     assert result.exit_code == 0
     assert json.loads(result.stdout) == EVENTS
 
 
 @respx.mock
-async def test_events_server_down(runner):
+def test_events_server_down(runner):
     respx.get(f"{BASE}/events").mock(side_effect=httpx.ConnectTimeout("slow"))
-    result = await runner.invoke(app, ["events"])
+    result = runner.invoke(app, ["events"])
     assert result.exit_code == 2
     assert "Could not reach odin server" in result.stderr
 
@@ -205,20 +205,20 @@ async def test_events_server_down(runner):
 
 
 @respx.mock
-async def test_logs_prints_lines_and_exits_zero(runner):
+def test_logs_prints_lines_and_exits_zero(runner):
     respx.get(f"{BASE}/logs", params={"env": "default", "node": "db", "tail": "100"}).mock(
         return_value=httpx.Response(200, json={
             "env": "default", "node": "db", "kind": "rds", "found": True, "running": True,
             "sources": ["odin-rds-default-db"], "lines": "PostgreSQL init complete", "message": None,
         })
     )
-    result = await runner.invoke(app, ["logs", "db"])
+    result = runner.invoke(app, ["logs", "db"])
     assert result.exit_code == 0
     assert "PostgreSQL init complete" in result.stdout
 
 
 @respx.mock
-async def test_logs_json_mode(runner):
+def test_logs_json_mode(runner):
     body = {
         "env": "default", "node": "db", "kind": "rds", "found": True, "running": True,
         "sources": ["odin-rds-default-db"], "lines": "hello", "message": None,
@@ -226,49 +226,49 @@ async def test_logs_json_mode(runner):
     respx.get(f"{BASE}/logs", params={"env": "default", "node": "db", "tail": "100"}).mock(
         return_value=httpx.Response(200, json=body)
     )
-    result = await runner.invoke(app, ["logs", "db", "-o", "json"])
+    result = runner.invoke(app, ["logs", "db", "-o", "json"])
     assert result.exit_code == 0
     assert json.loads(result.stdout) == body
 
 
 @respx.mock
-async def test_logs_not_running_prints_the_honest_message_and_still_exits_zero(runner):
+def test_logs_not_running_prints_the_honest_message_and_still_exits_zero(runner):
     respx.get(f"{BASE}/logs", params={"env": "default", "node": "db", "tail": "100"}).mock(
         return_value=httpx.Response(200, json={
             "env": "default", "node": "db", "kind": "rds", "found": True, "running": False,
             "sources": ["odin-rds-default-db"], "lines": "", "message": "odin-rds-default-db is not running",
         })
     )
-    result = await runner.invoke(app, ["logs", "db"])
+    result = runner.invoke(app, ["logs", "db"])
     assert result.exit_code == 0
     assert "not running" in result.stdout
 
 
 @respx.mock
-async def test_logs_unknown_node_exits_one(runner):
+def test_logs_unknown_node_exits_one(runner):
     respx.get(f"{BASE}/logs", params={"env": "default", "node": "ghost", "tail": "100"}).mock(
         return_value=httpx.Response(200, json={"env": "default", "node": "ghost", "error": "no such node 'ghost'"})
     )
-    result = await runner.invoke(app, ["logs", "ghost"])
+    result = runner.invoke(app, ["logs", "ghost"])
     assert result.exit_code == 1
     assert "no such node" in result.stderr
 
 
 @respx.mock
-async def test_logs_custom_env_and_tail(runner):
+def test_logs_custom_env_and_tail(runner):
     respx.get(f"{BASE}/logs", params={"env": "prod", "node": "app", "tail": "50"}).mock(
         return_value=httpx.Response(200, json={
             "env": "prod", "node": "app", "kind": "ecs", "found": True, "running": True,
             "sources": ["odin-ecs-prod-abc"], "lines": "starting up", "message": None,
         })
     )
-    result = await runner.invoke(app, ["logs", "app", "--env", "prod", "--tail", "50"])
+    result = runner.invoke(app, ["logs", "app", "--env", "prod", "--tail", "50"])
     assert result.exit_code == 0
     assert "starting up" in result.stdout
 
 
 @respx.mock
-async def test_logs_group_reads_a_log_group_with_no_node_argument(runner):
+def test_logs_group_reads_a_log_group_with_no_node_argument(runner):
     respx.get(f"{BASE}/logs", params={"env": "default", "group": "/aws/lambda/fn1", "tail": "100"}).mock(
         return_value=httpx.Response(200, json={
             "env": "default", "node": "", "kind": None, "found": True, "running": True,
@@ -276,40 +276,40 @@ async def test_logs_group_reads_a_log_group_with_no_node_argument(runner):
             "lines": "2026-07-24T00:00:00.000+00:00 hello from the handler", "message": None,
         })
     )
-    result = await runner.invoke(app, ["logs", "--group", "/aws/lambda/fn1"])
+    result = runner.invoke(app, ["logs", "--group", "/aws/lambda/fn1"])
     assert result.exit_code == 0
     assert "hello from the handler" in result.stdout
 
 
 @respx.mock
-async def test_logs_node_and_group_together_pass_both_through(runner):
+def test_logs_node_and_group_together_pass_both_through(runner):
     respx.get(f"{BASE}/logs", params={"env": "prod", "node": "app", "group": "/ecs/app", "tail": "20"}).mock(
         return_value=httpx.Response(200, json={
             "env": "prod", "node": "app", "kind": None, "found": True, "running": True,
             "sources": ["odin-ecs-prod-abc12345-app"], "lines": "task one up", "message": None,
         })
     )
-    result = await runner.invoke(app, ["logs", "app", "--group", "/ecs/app", "--env", "prod", "--tail", "20"])
+    result = runner.invoke(app, ["logs", "app", "--group", "/ecs/app", "--env", "prod", "--tail", "20"])
     assert result.exit_code == 0
     assert "task one up" in result.stdout
 
 
 @respx.mock
-async def test_logs_with_neither_node_nor_group_exits_one(runner):
+def test_logs_with_neither_node_nor_group_exits_one(runner):
     respx.get(f"{BASE}/logs", params={"env": "default", "tail": "100"}).mock(
         return_value=httpx.Response(200, json={
             "env": "default", "node": "", "error": "node or group is required",
         })
     )
-    result = await runner.invoke(app, ["logs"])
+    result = runner.invoke(app, ["logs"])
     assert result.exit_code == 1
     assert "node or group is required" in result.stderr
 
 
 @respx.mock
-async def test_logs_server_down(runner):
+def test_logs_server_down(runner):
     respx.get(f"{BASE}/logs").mock(side_effect=httpx.ConnectError("refused"))
-    result = await runner.invoke(app, ["logs", "db"])
+    result = runner.invoke(app, ["logs", "db"])
     assert result.exit_code == 2
     assert "Could not reach odin server" in result.stderr
 
@@ -327,12 +327,12 @@ DEAD_LOOP = LoopHealth(
 
 
 @respx.mock
-async def test_world_text_says_when_the_reconciler_is_not_converging(runner):
+def test_world_text_says_when_the_reconciler_is_not_converging(runner):
     """Without this the table is a frozen snapshot printed as if it were live."""
     respx.get(f"{BASE}/world", params={"env": "prod"}).mock(
         return_value=httpx.Response(200, json={**WORLD, "reconciler": DEAD_LOOP})
     )
-    result = await runner.invoke(app, ["world", "--env", "prod"])
+    result = runner.invoke(app, ["world", "--env", "prod"])
     assert result.exit_code == 0
     assert "RECONCILER DOWN" in result.stderr
     assert "is NOT converging" in result.stderr
@@ -340,25 +340,25 @@ async def test_world_text_says_when_the_reconciler_is_not_converging(runner):
 
 
 @respx.mock
-async def test_world_says_the_reconciler_is_down_even_when_the_world_is_empty(runner):
+def test_world_says_the_reconciler_is_down_even_when_the_world_is_empty(runner):
     """"world is empty" from a loop that never ticked is the same lie as a
     stale table, so the warning sits ABOVE the empty-world return."""
     respx.get(f"{BASE}/world", params={"env": "prod"}).mock(
         return_value=httpx.Response(200, json={"env": "prod", "resources": [], "reconciler": DEAD_LOOP})
     )
-    result = await runner.invoke(app, ["world", "--env", "prod"])
+    result = runner.invoke(app, ["world", "--env", "prod"])
     assert result.exit_code == 0
     assert "RECONCILER DOWN" in result.stderr
     assert "world is empty" in result.stdout
 
 
 @respx.mock
-async def test_world_is_silent_about_a_converging_reconciler(runner):
+def test_world_is_silent_about_a_converging_reconciler(runner):
     respx.get(f"{BASE}/world", params={"env": "prod"}).mock(
         return_value=httpx.Response(200, json={
             **WORLD, "reconciler": LoopHealth(env="prod", ticking=True, ticks=99).model_dump(),
         })
     )
-    result = await runner.invoke(app, ["world", "--env", "prod"])
+    result = runner.invoke(app, ["world", "--env", "prod"])
     assert result.exit_code == 0
     assert "RECONCILER" not in result.stderr

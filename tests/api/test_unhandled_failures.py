@@ -73,13 +73,13 @@ class FakeRuntime:
 
 
 class FakeRds:
-    def create_db(self, db_id, user, pw):
+    async def create_db(self, db_id, user, pw):
         pass
 
-    def delete_db(self, db_id):
+    async def delete_db(self, db_id):
         pass
 
-    def endpoint(self, db_id):
+    async def endpoint(self, db_id):
         return None
 
     def container_name(self, db_id):
@@ -96,7 +96,7 @@ class FakeAws:
     def __init__(self, ensure_raises: Exception | None = None):
         self.ensure_raises = ensure_raises
 
-    def ensure_backing(self, service):
+    async def ensure_backing(self, service):
         if self.ensure_raises is not None:
             raise self.ensure_raises
 
@@ -108,19 +108,19 @@ class FakeAws:
         # route that only looks like one.
         await self.ensure_backing(service)
 
-    def exists(self, service, name):
+    async def exists(self, service, name):
         return True
 
-    def deprovision(self, service, name):
+    async def deprovision(self, service, name):
         pass
 
     async def facts(self, service, name):
         return {"endpoint": "http://host.docker.internal:9000"}
 
-    def gc(self, active_kinds):
+    async def gc(self, active_kinds):
         pass
 
-    def backing_ports(self):
+    async def backing_ports(self):
         return {}
 
 
@@ -218,7 +218,7 @@ def test_the_verdict_names_the_recovery_that_actually_works(tmp_path, monkeypatc
 
 
 @pytest.mark.parametrize("path", ["/apply", "/apply-full"])
-async def test_the_canvas_apply_routes_both_answer_json(tmp_path, monkeypatch, path):
+def test_the_canvas_apply_routes_both_answer_json(tmp_path, monkeypatch, path):
     """`/apply` reaches `ensure_backing` through its own trailing
     `await reconciler.tick()` -> plan -> provision, so the identical exception comes
     out of a route that never calls `ensure_backings` at all."""

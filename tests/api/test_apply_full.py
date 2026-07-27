@@ -42,16 +42,18 @@ class FakeRuntime:
 
 
 class FakeRds:
+    # Async where the real `PostgresRds` is async; `container_name` is the one
+    # sync method on it (aws/rds.py) and stays sync here.
     def __init__(self):
         self.created = []
 
-    def create_db(self, db_id, user, pw):
+    async def create_db(self, db_id, user, pw):
         self.created.append(db_id)
 
-    def delete_db(self, db_id):
+    async def delete_db(self, db_id):
         pass
 
-    def endpoint(self, db_id):
+    async def endpoint(self, db_id):
         return None
 
     def container_name(self, db_id):
@@ -65,25 +67,25 @@ class FakeAws:
     def __init__(self):
         self.ensured = []
 
-    def ensure_backing(self, service):
+    async def ensure_backing(self, service):
         self.ensured.append(service)
 
-    def provision(self, service, name, subscriptions=()):
+    async def provision(self, service, name, subscriptions=()):
         pass
 
-    def exists(self, service, name):
+    async def exists(self, service, name):
         return True
 
-    def deprovision(self, service, name):
+    async def deprovision(self, service, name):
         pass
 
     async def facts(self, service, name):
         return {"endpoint": "http://host.docker.internal:9000"}
 
-    def gc(self, active_kinds):
+    async def gc(self, active_kinds):
         pass
 
-    def backing_ports(self):
+    async def backing_ports(self):
         return {}
 
 
@@ -288,7 +290,7 @@ def test_success_path_runs_tofu_and_reports_ok(tmp_path, monkeypatch):
     assert body["skipped"] == []
 
 
-async def test_store_apply_is_deferred_until_after_ensure_backings_and_tofu(tmp_path, monkeypatch):
+def test_store_apply_is_deferred_until_after_ensure_backings_and_tofu(tmp_path, monkeypatch):
     """Root cause of the S5 e2e failure: reconciler_for() starts a background
     loop (Reconciler._run, poll_interval=1.0) that ticks INDEPENDENTLY of this
     request. That loop's only signal that there's new work is store.apply()
@@ -312,11 +314,11 @@ async def test_store_apply_is_deferred_until_after_ensure_backings_and_tofu(tmp_
     orig_store_apply = app.state.store.apply
     orig_runner_apply = app.state.tf_runner.apply
 
-    def recording_ensure_backing(service):
+    async def recording_ensure_backing(service):  # the real one is a coroutine
         calls.append(f"ensure_backing:{service}")
-        return orig_ensure_backing(service)
+        return await orig_ensure_backing(service)
 
-    def recording_store_apply(stack):
+    def recording_store_apply(stack):  # SpecStore.apply stays sync (file I/O)
         calls.append("store.apply")
         return orig_store_apply(stack)
 
@@ -479,7 +481,7 @@ def test_non_empty_apply_full_does_not_bump_the_epoch(tmp_path, monkeypatch):
     assert after == before
 
 
-async def test_stale_request_is_superseded_before_tofu_ever_starts(tmp_path, monkeypatch):
+def test_stale_request_is_superseded_before_tofu_ever_starts(tmp_path, monkeypatch):
     """An epoch bump that lands before this request reaches tofu (e.g. a
     concurrent /destroy that raced ahead) must abort BEFORE tofu ever runs --
     the first of the finding's two checkpoints."""
@@ -508,7 +510,7 @@ async def test_stale_request_is_superseded_before_tofu_ever_starts(tmp_path, mon
     assert app.state.store.head("default") is None
 
 
-async def test_stale_request_is_superseded_right_before_the_final_commit(tmp_path, monkeypatch):
+def test_stale_request_is_superseded_right_before_the_final_commit(tmp_path, monkeypatch):
     """The second checkpoint: the epoch can also change WHILE tofu itself is
     running (a slow apply racing a fast concurrent /destroy). Even though
     tofu succeeded, the stale request must not go on to commit."""
@@ -548,7 +550,7 @@ class _DeadTaskRuntime:
     """A TaskRuntime whose containers never come up -- `run` raises the way a
     real bad-image `docker run` does, and nothing is ever `running`."""
 
-    def run(self, env, task_id, container_def, extra_env=None, cpu=None, memory=None):
+    async def run(self, env, task_id, container_def, extra_env=None, cpu=None, memory=None):
         raise RuntimeError(f"pull access denied for {container_def['image']}")
 
     async def status(self, env, task_id, container_name):
@@ -642,7 +644,7 @@ _LB = {
 }
 
 
-async def test_world_keeps_being_projected_while_an_apply_full_is_in_flight(tmp_path, monkeypatch):
+def test_world_keeps_being_projected_while_an_apply_full_is_in_flight(tmp_path, monkeypatch):
     """FIELD TEST 3's measurement, at the endpoint that produced it.
 
     `/apply-full` holds the reconciler across ensure + tofu + commit, and
@@ -771,10 +773,10 @@ class _DeadFunctionRuntime:
     def __init__(self, *args, **kwargs):
         pass
 
-    def code_dir(self, env, function_name):
+    def code_dir(self, env, function_name):  # sync on the real FunctionRuntime too
         return Path("/nonexistent") / env / function_name
 
-    def ensure(self, *args, **kwargs):
+    async def ensure(self, *args, **kwargs):
         raise RuntimeError("pull access denied for public.ecr.aws/lambda/python:3.12")
 
 
@@ -785,7 +787,7 @@ class _DeadPostgresRds:
     def __init__(self, *args, **kwargs):
         pass
 
-    def create_db(self, db_id, user, password, db_name="postgres"):
+    async def create_db(self, db_id, user, password, db_name="postgres"):
         raise RuntimeError("docker run failed: no space left on device")
 
 
@@ -925,7 +927,7 @@ class _NoMeshPostgresRds(_DeadPostgresRds):
     it), any convergence attempt must fail fast and locally rather than reach
     for a real image -- so these tests pin the apply's ANSWER, never a race."""
 
-    def join_mesh(self, db_id, firewall=None, revision=""):
+    async def join_mesh(self, db_id, firewall=None, revision=""):
         return None
 
 

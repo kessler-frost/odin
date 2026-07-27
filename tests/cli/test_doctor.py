@@ -204,14 +204,14 @@ def test_nebula_rows_name_the_consequence_each_binary_has():
     assert "nebula-cert ca failed" in results["nebula-cert"].detail
 
 
-async def test_the_summary_line_no_longer_reads_as_a_clean_bill_of_health(monkeypatch):
+def test_the_summary_line_no_longer_reads_as_a_clean_bill_of_health(monkeypatch):
     """F8's other half: "All required checks passed." was the LAST line while an
     absent dependency sat above it. The sentence still holds (required checks
     did pass) so it is unchanged -- but it no longer stands alone."""
     patch_disk(monkeypatch)
     absent = {"which nebula": FakeProc(1), "which nebula-cert": FakeProc(1)}
     monkeypatch.setattr(doctor_mod, "_subprocess_run", make_run(absent))
-    result = await runner.invoke(app, ["doctor"])
+    result = runner.invoke(app, ["doctor"])
     assert result.exit_code == 0
     assert "○ nebula " in result.output and "○ nebula-cert" in result.output
     assert "fix: brew install nebula" in result.output
@@ -219,10 +219,10 @@ async def test_the_summary_line_no_longer_reads_as_a_clean_bill_of_health(monkey
     assert "2 optional check(s) reported something (nebula, nebula-cert)" in result.output
 
 
-async def test_the_summary_line_stays_bare_when_nothing_was_skipped(monkeypatch):
+def test_the_summary_line_stays_bare_when_nothing_was_skipped(monkeypatch):
     patch_disk(monkeypatch)
     monkeypatch.setattr(doctor_mod, "_subprocess_run", make_run())
-    result = await runner.invoke(app, ["doctor"])
+    result = runner.invoke(app, ["doctor"])
     assert result.output.rstrip().endswith("All required checks passed.")
 
 
@@ -249,26 +249,26 @@ def test_dynalite_note_survives_missing_docker():
 
 # --- the CLI command -------------------------------------------------------
 
-async def test_cli_exit_zero_with_optional_missing(monkeypatch):
+def test_cli_exit_zero_with_optional_missing(monkeypatch):
     patch_disk(monkeypatch)
     monkeypatch.setattr(doctor_mod, "_subprocess_run", make_run({"which limactl": FakeProc(1)}))
-    result = await runner.invoke(app, ["doctor"])
+    result = runner.invoke(app, ["doctor"])
     assert result.exit_code == 0
     assert "○ limactl" in result.output
     assert "brew install lima" in result.output
     assert "All required checks passed." in result.output
 
 
-async def test_cli_exit_one_on_required_failure(monkeypatch):
+def test_cli_exit_one_on_required_failure(monkeypatch):
     patch_disk(monkeypatch)
     monkeypatch.setattr(doctor_mod, "_subprocess_run", make_run({"which tofu": FakeProc(1)}))
-    result = await runner.invoke(app, ["doctor"])
+    result = runner.invoke(app, ["doctor"])
     assert result.exit_code == 1
     assert "✗ tofu" in result.output
     assert "fix: brew install opentofu" in result.output
 
 
-async def test_docker_absent_prints_every_row_and_exits_one(monkeypatch):
+def test_docker_absent_prints_every_row_and_exits_one(monkeypatch):
     """Fresh-user BLOCK-2: `brew install colima` brings only `lima`, so a Mac
     that ran the install one-liner has no `docker` -- and doctor died there with
     a FileNotFoundError traceback out of `_check_memory`, printing ZERO rows.
@@ -276,7 +276,7 @@ async def test_docker_absent_prints_every_row_and_exits_one(monkeypatch):
     remedy that actually installs it."""
     patch_disk(monkeypatch)
     monkeypatch.setattr(doctor_mod, "_subprocess_run", make_run({"which docker": FakeProc(1)}))
-    result = await runner.invoke(app, ["doctor"])
+    result = runner.invoke(app, ["doctor"])
     assert result.exit_code == 1
     assert result.exception is None or isinstance(result.exception, SystemExit)
     for name in ALL_CHECKS:  # the FULL table, not a stack trace
@@ -305,18 +305,18 @@ def test_colima_failure_carries_colimas_own_words(monkeypatch):
     assert "lima not found" in colima.detail
 
 
-async def test_prebake_without_docker_refuses_instead_of_crashing(monkeypatch):
+def test_prebake_without_docker_refuses_instead_of_crashing(monkeypatch):
     monkeypatch.setattr(doctor_mod, "_subprocess_run", make_run({"which docker": FakeProc(1)}))
-    result = await runner.invoke(app, ["doctor", "--prebake"])
+    result = runner.invoke(app, ["doctor", "--prebake"])
     assert result.exit_code == 1
     assert "docker not found on PATH" in result.output
     assert "brew install docker" in result.output
 
 
-async def test_cli_all_ok(monkeypatch):
+def test_cli_all_ok(monkeypatch):
     patch_disk(monkeypatch)
     monkeypatch.setattr(doctor_mod, "_subprocess_run", make_run())
-    result = await runner.invoke(app, ["doctor"])
+    result = runner.invoke(app, ["doctor"])
     assert result.exit_code == 0
     assert result.output.count("✓") == len(ALL_CHECKS)
 
@@ -327,7 +327,9 @@ class FakeRuntime:
     def __init__(self, images: set[str]):
         self.images = images
 
-    def image_exists(self, tag: str) -> bool:
+    # async, like the real `ColimaRuntime.image_exists` it stands in for --
+    # a sync fake here would let `_prebake`'s `await` fail on a plain bool.
+    async def image_exists(self, tag: str) -> bool:
         return tag in self.images
 
 
@@ -337,7 +339,8 @@ class FakeBacking:
     def __init__(self, runtime):
         self.runtime = runtime
 
-    def ensure_dynalite_image(self) -> None:
+    # async, like the real `BackingAws.ensure_dynalite_image`.
+    async def ensure_dynalite_image(self) -> None:
         FakeBacking.ensured.append(DYNALITE_IMAGE)
         self.runtime.images.add(DYNALITE_IMAGE)
 
@@ -348,18 +351,18 @@ def patch_prebake(monkeypatch, images: set[str]) -> None:
     monkeypatch.setattr(doctor_mod, "BackingAws", FakeBacking)
 
 
-async def test_prebake_builds_absent_image(monkeypatch):
+def test_prebake_builds_absent_image(monkeypatch):
     patch_prebake(monkeypatch, images=set())
-    result = await runner.invoke(app, ["doctor", "--prebake"])
+    result = runner.invoke(app, ["doctor", "--prebake"])
     assert result.exit_code == 0
     assert FakeBacking.ensured == [DYNALITE_IMAGE]
     assert f"before: {DYNALITE_IMAGE} absent" in result.output
     assert "just built" in result.output
 
 
-async def test_prebake_with_image_already_present(monkeypatch):
+def test_prebake_with_image_already_present(monkeypatch):
     patch_prebake(monkeypatch, images={DYNALITE_IMAGE})
-    result = await runner.invoke(app, ["doctor", "--prebake"])
+    result = runner.invoke(app, ["doctor", "--prebake"])
     assert result.exit_code == 0
     assert FakeBacking.ensured == [DYNALITE_IMAGE]  # idempotent call-through, still invoked
     assert f"before: {DYNALITE_IMAGE} present" in result.output

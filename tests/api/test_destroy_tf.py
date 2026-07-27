@@ -427,7 +427,7 @@ def test_tofu_unavailable_over_a_live_state_is_a_failed_destroy(tmp_path):
     assert body["still_standing"]["tf_state"] == ["aws_db_instance.app_db", "aws_s3_bucket.uploads"]
 
 
-async def test_tofu_unavailable_does_not_brick_the_env(tmp_path):
+def test_tofu_unavailable_does_not_brick_the_env(tmp_path):
     """The second half of the same bug: the route committed an empty Stack on
     its way out even though nothing was destroyed, so the NEXT destroy's
     `ensure_backings(last_applied)` got an empty Stack, started no backing

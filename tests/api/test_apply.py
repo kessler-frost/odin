@@ -37,13 +37,13 @@ class FakeRds:
     def __init__(self):
         self.created = []
 
-    def create_db(self, db_id, user, pw):
+    async def create_db(self, db_id, user, pw):
         self.created.append(db_id)
 
-    def delete_db(self, db_id):
+    async def delete_db(self, db_id):
         pass
 
-    def endpoint(self, db_id):
+    async def endpoint(self, db_id):
         return None
 
     def container_name(self, db_id):
@@ -100,38 +100,38 @@ class RecordingAws:
     def __init__(self, log: list) -> None:
         self.log = log
 
-    def ensure_backing(self, kind: str) -> None:
+    async def ensure_backing(self, kind: str) -> None:
         self.log.append(("ensure", kind))
 
-    def gc(self, kinds: set) -> None:
+    async def gc(self, kinds: set) -> None:
         self.log.append(("gc", tuple(sorted(kinds))))
 
-    def backing_ports(self) -> dict:
+    async def backing_ports(self) -> dict:
         return {"s3": 9001}
 
-    def exists(self, kind: str, rid: str) -> bool:
+    async def exists(self, kind: str, rid: str) -> bool:
         return True
 
     async def facts(self, kind: str, rid: str) -> dict:
         return {}
 
-    def provision(self, kind: str, rid: str, *args) -> None:
+    async def provision(self, kind: str, rid: str, *args) -> None:
         self.log.append(("provision", kind, rid))
 
-    def deprovision(self, kind: str, rid: str) -> None:
+    async def deprovision(self, kind: str, rid: str) -> None:
         self.log.append(("deprovision", kind, rid))
 
-    def subscriptions(self, rid: str) -> tuple:
+    async def subscriptions(self, rid: str) -> tuple:
         return ()
 
-    def aws_env(self) -> dict:
+    async def aws_env(self) -> dict:
         return {}
 
 
 S3_CANVAS = {"nodes": [{"type": "s3", "data": {"label": "uploads"}}], "edges": []}
 
 
-async def test_destroy_boots_the_backings_before_tofu_then_gcs_them_after(tmp_path, monkeypatch):
+def test_destroy_boots_the_backings_before_tofu_then_gcs_them_after(tmp_path, monkeypatch):
     """Field test 2, finding B6: `odin destroy` on a restored env ran 8m26s with
     no progress. `/destroy` never booted the backings, so the gateway 503'd every
     AWS call the destroy made and aws-sdk-go retried each ~25x with backoff --

@@ -48,19 +48,19 @@ class NoBackings:
     routing table a gateway 503 is read off, empty. Everything else is a no-op
     so the reconciler's own tick converges normally around it."""
 
-    def ensure_backing(self, kind: str) -> None: ...
-    def gc(self, kinds: set) -> None: ...
-    def backing_ports(self) -> dict:
+    async def ensure_backing(self, kind: str) -> None: ...
+    async def gc(self, kinds: set) -> None: ...
+    async def backing_ports(self) -> dict:
         return {}
-    def exists(self, kind: str, rid: str) -> bool:
+    async def exists(self, kind: str, rid: str) -> bool:
         return True
-    def facts(self, kind: str, rid: str) -> dict:
+    async def facts(self, kind: str, rid: str) -> dict:
         return {}
-    def provision(self, kind: str, rid: str, *args) -> None: ...
-    def deprovision(self, kind: str, rid: str) -> None: ...
-    def subscriptions(self, rid: str) -> tuple:
+    async def provision(self, kind: str, rid: str, *args) -> None: ...
+    async def deprovision(self, kind: str, rid: str) -> None: ...
+    async def subscriptions(self, rid: str) -> tuple:
         return ()
-    def aws_env(self) -> dict:
+    async def aws_env(self) -> dict:
         return {}
 
 
@@ -86,7 +86,7 @@ def wired(tmp_path):
 
 async def _call_s3(endpoint: str, creds: tuple[str, str]) -> str:
     access_key, secret_key = creds
-    s3 = await boto3.client(
+    s3 = boto3.client(  # boto3's own factory is SYNC (not BackingAws.client)
         "s3", endpoint_url=endpoint, region_name="us-east-1",
         aws_access_key_id=access_key, aws_secret_access_key=secret_key,
         config=Config(

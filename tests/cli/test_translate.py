@@ -23,7 +23,7 @@ GRAPH = {"nodes": [{"id": "uploads", "type": "s3"}], "edges": []}
 
 
 @respx.mock
-async def test_translate_default_posts_the_saved_canvas(runner):
+def test_translate_default_posts_the_saved_canvas(runner):
     """Field-test 2 findings B4/MEDIUM-10: with no `--file` this used to POST
     an empty body, which made the server translate the env's STORED STACK --
     empty until something has been applied -- so `odin canvas set x.json &&
@@ -34,7 +34,7 @@ async def test_translate_default_posts_the_saved_canvas(runner):
     route = respx.post(f"{BASE}/translate", params={"env": "default"}).mock(
         return_value=httpx.Response(200, json=TRANSLATED)
     )
-    result = await runner.invoke(app, ["translate"])
+    result = runner.invoke(app, ["translate"])
     assert result.exit_code == 0
     assert canvas.called
     assert json.loads(route.calls.last.request.content) == GRAPH
@@ -43,19 +43,19 @@ async def test_translate_default_posts_the_saved_canvas(runner):
 
 
 @respx.mock
-async def test_translate_with_file_posts_that_canvas(runner, tmp_path):
+def test_translate_with_file_posts_that_canvas(runner, tmp_path):
     canvas_file = tmp_path / "canvas.json"
     canvas_file.write_text(json.dumps(GRAPH))
     route = respx.post(f"{BASE}/translate", params={"env": "prod"}).mock(
         return_value=httpx.Response(200, json=TRANSLATED)
     )
-    result = await runner.invoke(app, ["translate", "--env", "prod", "--file", str(canvas_file)])
+    result = runner.invoke(app, ["translate", "--env", "prod", "--file", str(canvas_file)])
     assert result.exit_code == 0
     assert json.loads(route.calls.last.request.content) == GRAPH
 
 
 @respx.mock
-async def test_translate_notes_an_empty_saved_canvas_on_stderr(runner):
+def test_translate_notes_an_empty_saved_canvas_on_stderr(runner):
     """The other half of B4/U5: nothing is drawn, so there IS no Terraform --
     exit 0 (same as `apply`'s legitimate empty-canvas teardown), but never
     silently, so `odin translate > main.tf` in CI can't look like a success
@@ -64,36 +64,36 @@ async def test_translate_notes_an_empty_saved_canvas_on_stderr(runner):
     respx.post(f"{BASE}/translate").mock(return_value=httpx.Response(
         200, json={**TRANSLATED, "unsupported": []},
     ))
-    result = await runner.invoke(app, ["translate"])
+    result = runner.invoke(app, ["translate"])
     assert result.exit_code == 0
     assert "saved canvas is empty" in result.stderr
     assert "--file" in result.stderr
 
 
 @respx.mock
-async def test_translate_json_mode_prints_full_result(runner):
+def test_translate_json_mode_prints_full_result(runner):
     respx.get(f"{BASE}/canvas").mock(return_value=httpx.Response(200, json=GRAPH))
     respx.post(f"{BASE}/translate").mock(return_value=httpx.Response(200, json=TRANSLATED))
-    result = await runner.invoke(app, ["translate", "-o", "json"])
+    result = runner.invoke(app, ["translate", "-o", "json"])
     assert result.exit_code == 0
     assert json.loads(result.stdout) == TRANSLATED
     assert result.stderr == ""
 
 
 @respx.mock
-async def test_translate_server_down(runner):
+def test_translate_server_down(runner):
     respx.get(f"{BASE}/canvas").mock(side_effect=httpx.ConnectError("refused"))
-    result = await runner.invoke(app, ["translate"])
+    result = runner.invoke(app, ["translate"])
     assert result.exit_code == 2
     assert "Could not reach odin server" in result.stderr
 
 
 @respx.mock
-async def test_import_tf_hcl_mode_stdout_is_canvas_shaped(runner, tmp_path):
+def test_import_tf_hcl_mode_stdout_is_canvas_shaped(runner, tmp_path):
     tf_file = tmp_path / "main.tf"
     tf_file.write_text(MAIN_TF)
     route = respx.post(f"{BASE}/import-tf").mock(return_value=httpx.Response(200, json=IMPORTED))
-    result = await runner.invoke(app, ["import-tf", str(tf_file)])
+    result = runner.invoke(app, ["import-tf", str(tf_file)])
     assert result.exit_code == 0
     assert json.loads(route.calls.last.request.content) == {"source": "hcl", "hcl": MAIN_TF}
     # stdout is EXACTLY {"nodes":..., "edges":...} — pipeable into `odin canvas set -`
@@ -102,21 +102,21 @@ async def test_import_tf_hcl_mode_stdout_is_canvas_shaped(runner, tmp_path):
 
 
 @respx.mock
-async def test_import_tf_json_mode_same_stdout(runner, tmp_path):
+def test_import_tf_json_mode_same_stdout(runner, tmp_path):
     tf_file = tmp_path / "main.tf"
     tf_file.write_text(MAIN_TF)
     respx.post(f"{BASE}/import-tf").mock(return_value=httpx.Response(200, json=IMPORTED))
-    result = await runner.invoke(app, ["import-tf", str(tf_file), "-o", "json"])
+    result = runner.invoke(app, ["import-tf", str(tf_file), "-o", "json"])
     assert result.exit_code == 0
     assert json.loads(result.stdout) == {"nodes": IMPORTED["nodes"], "edges": []}
 
 
 @respx.mock
-async def test_import_tf_live_mode(runner):
+def test_import_tf_live_mode(runner):
     route = respx.post(f"{BASE}/import-tf", params={"env": "prod"}).mock(
         return_value=httpx.Response(200, json={**IMPORTED, "unsupported": []})
     )
-    result = await runner.invoke(
+    result = runner.invoke(
         app, ["import-tf", "--live", "s3=uploads", "--live", "sqs=orders", "--env", "prod"]
     )
     assert result.exit_code == 0
@@ -127,14 +127,14 @@ async def test_import_tf_live_mode(runner):
     assert result.stderr == ""
 
 
-async def test_import_tf_live_malformed_spec(runner):
-    result = await runner.invoke(app, ["import-tf", "--live", "s3uploads"])
+def test_import_tf_live_malformed_spec(runner):
+    result = runner.invoke(app, ["import-tf", "--live", "s3uploads"])
     assert result.exit_code == 2
     assert "type=id" in result.stderr
 
 
-async def test_import_tf_requires_file_or_live(runner):
-    result = await runner.invoke(app, ["import-tf"])
+def test_import_tf_requires_file_or_live(runner):
+    result = runner.invoke(app, ["import-tf"])
     assert result.exit_code == 2
     assert "needs a <file.tf>" in result.stderr
 
@@ -143,7 +143,7 @@ async def test_import_tf_requires_file_or_live(runner):
 
 
 @respx.mock
-async def test_import_tf_accepts_a_directory_and_sends_every_tf_as_one_canvas(runner, tmp_path):
+def test_import_tf_accepts_a_directory_and_sends_every_tf_as_one_canvas(runner, tmp_path):
     project = tmp_path / "tfproj"
     project.mkdir()
     (project / "network.tf").write_text('resource "aws_vpc" "net" {}\n')
@@ -151,7 +151,7 @@ async def test_import_tf_accepts_a_directory_and_sends_every_tf_as_one_canvas(ru
     (project / "README.md").write_text("not terraform\n")
     route = respx.post(f"{BASE}/import-tf").mock(return_value=httpx.Response(200, json=IMPORTED))
 
-    result = await runner.invoke(app, ["import-tf", str(project)])
+    result = runner.invoke(app, ["import-tf", str(project)])
 
     assert result.exit_code == 0
     sent = json.loads(route.calls.last.request.content)
@@ -163,22 +163,22 @@ async def test_import_tf_accepts_a_directory_and_sends_every_tf_as_one_canvas(ru
     assert json.loads(result.stdout) == {"nodes": IMPORTED["nodes"], "edges": []}
 
 
-async def test_import_tf_of_a_directory_with_no_tf_files_says_so(runner, tmp_path):
+def test_import_tf_of_a_directory_with_no_tf_files_says_so(runner, tmp_path):
     empty = tmp_path / "empty"
     empty.mkdir()
-    result = await runner.invoke(app, ["import-tf", str(empty)])
+    result = runner.invoke(app, ["import-tf", str(empty)])
     assert result.exit_code == 2
     assert "no *.tf files in" in result.stderr and "Traceback" not in result.stderr
 
 
-async def test_import_tf_of_a_missing_path_says_so_instead_of_tracebacking(runner, tmp_path):
-    result = await runner.invoke(app, ["import-tf", str(tmp_path / "nope.tf")])
+def test_import_tf_of_a_missing_path_says_so_instead_of_tracebacking(runner, tmp_path):
+    result = runner.invoke(app, ["import-tf", str(tmp_path / "nope.tf")])
     assert result.exit_code == 2
     assert "no such file or directory" in result.stderr and "Traceback" not in result.stderr
 
 
 @respx.mock
-async def test_import_tf_malformed_hcl_exits_nonzero(runner, tmp_path):
+def test_import_tf_malformed_hcl_exits_nonzero(runner, tmp_path):
     # Finding #7: a genuine parse failure is a hard error a CI exit-code check
     # catches -- not a silent exit 0 with an empty canvas.
     tf_file = tmp_path / "bad.tf"
@@ -187,14 +187,14 @@ async def test_import_tf_malformed_hcl_exits_nonzero(runner, tmp_path):
         "nodes": [], "edges": [], "unsupported": [], "warnings": [],
         "parse_error": "HCL failed to parse: something",
     }))
-    result = await runner.invoke(app, ["import-tf", str(tf_file)])
+    result = runner.invoke(app, ["import-tf", str(tf_file)])
     assert result.exit_code != 0
     assert "failed to parse" in result.stderr
     assert result.stdout == ""  # never a canvas on a parse failure
 
 
 @respx.mock
-async def test_import_tf_only_unsupported_stays_exit_zero(runner, tmp_path):
+def test_import_tf_only_unsupported_stays_exit_zero(runner, tmp_path):
     # The other side of finding #7: a WELL-FORMED file with only unsupported
     # resources is a success (exit 0), just with an unsupported list on stderr.
     tf_file = tmp_path / "unsupported.tf"
@@ -204,17 +204,17 @@ async def test_import_tf_only_unsupported_stays_exit_zero(runner, tmp_path):
         "unsupported": [{"type": "aws_cloudwatch_log_group", "name": "logs", "reason": "not supported"}],
         "warnings": [], "parse_error": None,
     }))
-    result = await runner.invoke(app, ["import-tf", str(tf_file)])
+    result = runner.invoke(app, ["import-tf", str(tf_file)])
     assert result.exit_code == 0
     assert json.loads(result.stdout) == {"nodes": [], "edges": []}
     assert "aws_cloudwatch_log_group" in result.stderr
 
 
 @respx.mock
-async def test_import_tf_server_down(runner, tmp_path):
+def test_import_tf_server_down(runner, tmp_path):
     tf_file = tmp_path / "main.tf"
     tf_file.write_text(MAIN_TF)
     respx.post(f"{BASE}/import-tf").mock(side_effect=httpx.ConnectError("refused"))
-    result = await runner.invoke(app, ["import-tf", str(tf_file)])
+    result = runner.invoke(app, ["import-tf", str(tf_file)])
     assert result.exit_code == 2
     assert "odin start" in result.stderr

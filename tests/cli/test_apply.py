@@ -43,12 +43,12 @@ SERVICES_UNHEALTHY = {
 
 
 @respx.mock
-async def test_apply_fetches_saved_canvas_when_no_file(runner):
+def test_apply_fetches_saved_canvas_when_no_file(runner):
     respx.get(f"{BASE}/canvas").mock(return_value=httpx.Response(200, json=GRAPH))
     route = respx.post(f"{BASE}/apply-full", params={"env": "default"}).mock(
         return_value=httpx.Response(200, json=APPLIED)
     )
-    result = await runner.invoke(app, ["apply"])
+    result = runner.invoke(app, ["apply"])
     assert result.exit_code == 0
     assert json.loads(route.calls.last.request.content) == GRAPH
     assert "status: applied" in result.stdout
@@ -57,31 +57,31 @@ async def test_apply_fetches_saved_canvas_when_no_file(runner):
 
 
 @respx.mock
-async def test_apply_with_file_posts_that_canvas(runner, tmp_path):
+def test_apply_with_file_posts_that_canvas(runner, tmp_path):
     canvas_file = tmp_path / "canvas.json"
     canvas_file.write_text(json.dumps(GRAPH))
     route = respx.post(f"{BASE}/apply-full", params={"env": "prod"}).mock(
         return_value=httpx.Response(200, json={**APPLIED, "env": "prod"})
     )
-    result = await runner.invoke(app, ["apply", "--env", "prod", "--file", str(canvas_file)])
+    result = runner.invoke(app, ["apply", "--env", "prod", "--file", str(canvas_file)])
     assert result.exit_code == 0
     assert json.loads(route.calls.last.request.content) == GRAPH
 
 
 @respx.mock
-async def test_apply_json_mode_prints_full_body(runner):
+def test_apply_json_mode_prints_full_body(runner):
     respx.get(f"{BASE}/canvas").mock(return_value=httpx.Response(200, json=GRAPH))
     respx.post(f"{BASE}/apply-full").mock(return_value=httpx.Response(200, json=APPLIED))
-    result = await runner.invoke(app, ["apply", "-o", "json"])
+    result = runner.invoke(app, ["apply", "-o", "json"])
     assert result.exit_code == 0
     assert json.loads(result.stdout) == APPLIED
 
 
 @respx.mock
-async def test_apply_tf_failed_streams_tail_and_exits_nonzero(runner):
+def test_apply_tf_failed_streams_tail_and_exits_nonzero(runner):
     respx.get(f"{BASE}/canvas").mock(return_value=httpx.Response(200, json=GRAPH))
     respx.post(f"{BASE}/apply-full").mock(return_value=httpx.Response(200, json=TF_FAILED))
-    result = await runner.invoke(app, ["apply"])
+    result = runner.invoke(app, ["apply"])
     assert result.exit_code == 1
     assert "status: applied_tf_failed" in result.stdout
     assert "skipped: note" in result.stdout
@@ -91,22 +91,22 @@ async def test_apply_tf_failed_streams_tail_and_exits_nonzero(runner):
 
 
 @respx.mock
-async def test_apply_tf_failed_json_mode_still_exits_nonzero(runner):
+def test_apply_tf_failed_json_mode_still_exits_nonzero(runner):
     respx.get(f"{BASE}/canvas").mock(return_value=httpx.Response(200, json=GRAPH))
     respx.post(f"{BASE}/apply-full").mock(return_value=httpx.Response(200, json=TF_FAILED))
-    result = await runner.invoke(app, ["apply", "-o", "json"])
+    result = runner.invoke(app, ["apply", "-o", "json"])
     assert result.exit_code == 1
     assert json.loads(result.stdout) == TF_FAILED
 
 
 @respx.mock
-async def test_apply_names_the_short_service_and_exits_nonzero(runner):
+def test_apply_names_the_short_service_and_exits_nonzero(runner):
     """`tf: ok` must not be enough to exit 0: the output has to name WHICH
     service, WHAT it observed (running vs desired) and the real reason -- which
     field test 3 could only find in /world and events, never in apply itself."""
     respx.get(f"{BASE}/canvas").mock(return_value=httpx.Response(200, json=GRAPH))
     respx.post(f"{BASE}/apply-full").mock(return_value=httpx.Response(200, json=SERVICES_UNHEALTHY))
-    result = await runner.invoke(app, ["apply"])
+    result = runner.invoke(app, ["apply"])
     assert result.exit_code == 1
     assert "status: applied_services_unhealthy" in result.stdout
     assert "tf: ok" in result.stdout
@@ -115,16 +115,16 @@ async def test_apply_names_the_short_service_and_exits_nonzero(runner):
 
 
 @respx.mock
-async def test_apply_unhealthy_json_mode_still_exits_nonzero(runner):
+def test_apply_unhealthy_json_mode_still_exits_nonzero(runner):
     respx.get(f"{BASE}/canvas").mock(return_value=httpx.Response(200, json=GRAPH))
     respx.post(f"{BASE}/apply-full").mock(return_value=httpx.Response(200, json=SERVICES_UNHEALTHY))
-    result = await runner.invoke(app, ["apply", "-o", "json"])
+    result = runner.invoke(app, ["apply", "-o", "json"])
     assert result.exit_code == 1
     assert json.loads(result.stdout) == SERVICES_UNHEALTHY
 
 
 @respx.mock
-async def test_the_documented_ci_gate_reads_the_servers_own_field(runner):
+def test_the_documented_ci_gate_reads_the_servers_own_field(runner):
     """MISLEAD-1: the README told CI to gate on `.unsupported`, but a node
     whose KIND odin doesn't model lands in `.skipped` -- so
     `jq -e '.unsupported | length == 0'` was TRUE, exit 0, while two drawn
@@ -138,14 +138,14 @@ async def test_the_documented_ci_gate_reads_the_servers_own_field(runner):
     }
     respx.get(f"{BASE}/canvas").mock(return_value=httpx.Response(200, json=GRAPH))
     respx.post(f"{BASE}/apply-full").mock(return_value=httpx.Response(200, json=dropped))
-    body = json.loads(await runner.invoke(app, ["apply", "-o", "json"]).stdout)
+    body = json.loads(runner.invoke(app, ["apply", "-o", "json"]).stdout)
     assert body["unsupported"] == []                       # the old gate: still empty
     assert body["not_covered"] == ["kinesis", "notarealservice"]   # the gate that works
     assert len(body["not_covered"]) != 0
 
 
 @respx.mock
-async def test_the_cli_never_invents_a_not_covered_of_its_own(runner):
+def test_the_cli_never_invents_a_not_covered_of_its_own(runner):
     """The regression that would re-open the `curl` hole: if this command
     recomputed the union, a server that got it wrong (or an older one that
     published nothing) would be silently papered over here and the API's own
@@ -157,74 +157,74 @@ async def test_the_cli_never_invents_a_not_covered_of_its_own(runner):
     }
     respx.get(f"{BASE}/canvas").mock(return_value=httpx.Response(200, json=GRAPH))
     respx.post(f"{BASE}/apply-full").mock(return_value=httpx.Response(200, json=contradictory))
-    body = json.loads(await runner.invoke(app, ["apply", "-o", "json"]).stdout)
+    body = json.loads(runner.invoke(app, ["apply", "-o", "json"]).stdout)
     assert body["skipped"] == ["kinesis"]
     assert body["unsupported"] == ["db1 (rds): mysql not supported"]
     assert body["not_covered"] == ["only what the server said"]
 
 
 @respx.mock
-async def test_apply_busy_409_exits_nonzero(runner):
+def test_apply_busy_409_exits_nonzero(runner):
     respx.get(f"{BASE}/canvas").mock(return_value=httpx.Response(200, json=GRAPH))
     respx.post(f"{BASE}/apply-full").mock(
         return_value=httpx.Response(
             409, json={"error": "a tofu run is already in progress for env 'default'"}
         )
     )
-    result = await runner.invoke(app, ["apply"])
+    result = runner.invoke(app, ["apply"])
     assert result.exit_code == 1
     assert "already in progress" in result.stderr
     assert result.stdout == ""
 
 
 @respx.mock
-async def test_apply_server_down(runner):
+def test_apply_server_down(runner):
     respx.get(f"{BASE}/canvas").mock(side_effect=httpx.ConnectError("refused"))
-    result = await runner.invoke(app, ["apply"])
+    result = runner.invoke(app, ["apply"])
     assert result.exit_code == 2
     assert "Could not reach odin server" in result.stderr
 
 
 @respx.mock
-async def test_destroy_text(runner):
+def test_destroy_text(runner):
     respx.post(f"{BASE}/destroy", params={"env": "default"}).mock(
         return_value=httpx.Response(
             200, json={"status": "destroyed", "env": "default", "tf": {"status": "ok", "exit_code": 0}}
         )
     )
-    result = await runner.invoke(app, ["destroy"])
+    result = runner.invoke(app, ["destroy"])
     assert result.exit_code == 0
     assert "status: destroyed" in result.stdout
     assert "tf: ok" in result.stdout
 
 
 @respx.mock
-async def test_destroy_json_without_tf_half(runner):
+def test_destroy_json_without_tf_half(runner):
     body = {"status": "destroyed", "env": "prod", "tf": None}
     respx.post(f"{BASE}/destroy", params={"env": "prod"}).mock(
         return_value=httpx.Response(200, json=body)
     )
-    result = await runner.invoke(app, ["destroy", "--env", "prod", "-o", "json"])
+    result = runner.invoke(app, ["destroy", "--env", "prod", "-o", "json"])
     assert result.exit_code == 0
     assert json.loads(result.stdout) == body
 
 
 @respx.mock
-async def test_destroy_busy_409_exits_nonzero(runner):
+def test_destroy_busy_409_exits_nonzero(runner):
     respx.post(f"{BASE}/destroy").mock(
         return_value=httpx.Response(
             409, json={"error": "a tofu run is already in progress for env 'default'"}
         )
     )
-    result = await runner.invoke(app, ["destroy"])
+    result = runner.invoke(app, ["destroy"])
     assert result.exit_code == 1
     assert "already in progress" in result.stderr
 
 
 @respx.mock
-async def test_destroy_server_down(runner):
+def test_destroy_server_down(runner):
     respx.post(f"{BASE}/destroy").mock(side_effect=httpx.ConnectError("refused"))
-    result = await runner.invoke(app, ["destroy"])
+    result = runner.invoke(app, ["destroy"])
     assert result.exit_code == 2
     assert "odin start" in result.stderr
 
@@ -256,7 +256,7 @@ DESTROY_FAILED_500 = {
 
 
 @respx.mock
-async def test_destroy_json_emits_the_failure_body_on_stdout(runner):
+def test_destroy_json_emits_the_failure_body_on_stdout(runner):
     """The finding: `odin destroy -o json > dest.json` produced `0 dest.json`.
     A script gating on the payload got an empty string, `jq .status` got a parse
     error, and the best diagnosis odin produced -- which the server really does
@@ -265,7 +265,7 @@ async def test_destroy_json_emits_the_failure_body_on_stdout(runner):
         return_value=httpx.Response(500, json=DESTROY_FAILED_500)
     )
 
-    result = await runner.invoke(app, ["destroy", "--env", "f6dest", "-o", "json"])
+    result = runner.invoke(app, ["destroy", "--env", "f6dest", "-o", "json"])
 
     assert result.exit_code == 1, "a failed destroy is still a failure"
     assert result.stdout != "", "the whole finding: zero bytes on stdout"
@@ -280,19 +280,19 @@ async def test_destroy_json_emits_the_failure_body_on_stdout(runner):
 
 
 @respx.mock
-async def test_destroy_text_mode_failure_is_unchanged(runner):
+def test_destroy_text_mode_failure_is_unchanged(runner):
     """The other half of the guard: text mode must NOT gain a JSON blob. The
     payload on stdout is the answer to `-o json`; the verdict on stderr is the
     answer to a human."""
     respx.post(f"{BASE}/destroy").mock(return_value=httpx.Response(500, json=DESTROY_FAILED_500))
-    result = await runner.invoke(app, ["destroy", "--env", "f6dest"])
+    result = runner.invoke(app, ["destroy", "--env", "f6dest"])
     assert result.exit_code == 1
     assert result.stdout == ""
     assert "destroy did not finish" in result.stderr
 
 
 @respx.mock
-async def test_apply_json_emits_an_error_body_on_stdout_too(runner):
+def test_apply_json_emits_an_error_body_on_stdout_too(runner):
     """The SHAPE, not the instance: every command that renders a server payload
     had this hole, so `body_or_fail` was fixed rather than `destroy`. `/apply-full`
     answers 409 with `error` when a run is already in progress -- previously
@@ -301,7 +301,7 @@ async def test_apply_json_emits_an_error_body_on_stdout_too(runner):
     busy = {"error": "a tofu run is already in progress for env 'default'"}
     respx.post(f"{BASE}/apply-full").mock(return_value=httpx.Response(409, json=busy))
 
-    result = await runner.invoke(app, ["apply", "-o", "json"])
+    result = runner.invoke(app, ["apply", "-o", "json"])
 
     assert result.exit_code == 1
     assert json.loads(result.stdout) == busy
@@ -309,20 +309,20 @@ async def test_apply_json_emits_an_error_body_on_stdout_too(runner):
 
 
 @respx.mock
-async def test_apply_json_emits_an_error_body_from_the_canvas_fetch_too(runner):
+def test_apply_json_emits_an_error_body_from_the_canvas_fetch_too(runner):
     """...including the step BEFORE the apply. `odin apply` GETs `/canvas` first,
     and a refusal there is just as invisible to `| jq` as one from the apply."""
     refused = {"error": "no canvas has been saved yet", "fix": "draw one, or pass --file"}
     respx.get(f"{BASE}/canvas").mock(return_value=httpx.Response(409, json=refused))
 
-    result = await runner.invoke(app, ["apply", "-o", "json"])
+    result = runner.invoke(app, ["apply", "-o", "json"])
 
     assert result.exit_code == 1
     assert json.loads(result.stdout) == refused
 
 
 @respx.mock
-async def test_apply_shows_the_recorded_reason_when_tofu_could_only_say_unexpected_state(runner):
+def test_apply_shows_the_recorded_reason_when_tofu_could_only_say_unexpected_state(runner):
     """Field test 6 F4's other half. tofu describes a failed RDS as an unexpected
     state (`last error: %!s(<nil>)` — the provider's own output, not odin's), while
     odin's records hold the real reason. The server publishes it in
@@ -338,14 +338,14 @@ async def test_apply_shows_the_recorded_reason_when_tofu_could_only_say_unexpect
     respx.post(f"{BASE}/apply-full").mock(return_value=httpx.Response(200, json=body))
     respx.get(f"{BASE}/canvas").mock(return_value=httpx.Response(200, json={"nodes": [], "edges": []}))
 
-    result = await runner.invoke(app, ["apply"])
+    result = runner.invoke(app, ["apply"])
 
     assert "unhealthy: rds app-db is failed" in result.stdout
     assert "Postgres never became ready: connection refused" in result.stdout
 
 
 @respx.mock
-async def test_apply_says_so_when_a_resource_carries_no_recorded_reason(runner):
+def test_apply_says_so_when_a_resource_carries_no_recorded_reason(runner):
     """A verdict must never render as an empty tail. `reason` is `str | None`, and
     dropping it silently made "unhealthy: rds app-db is failed" the whole answer
     with no hint that the reason was missing rather than empty."""
@@ -356,7 +356,7 @@ async def test_apply_says_so_when_a_resource_carries_no_recorded_reason(runner):
     respx.post(f"{BASE}/apply-full").mock(return_value=httpx.Response(200, json=body))
     respx.get(f"{BASE}/canvas").mock(return_value=httpx.Response(200, json={"nodes": [], "edges": []}))
 
-    result = await runner.invoke(app, ["apply"])
+    result = runner.invoke(app, ["apply"])
 
     assert "no reason recorded" in result.stdout
     assert "None" not in result.stdout

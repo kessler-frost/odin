@@ -30,6 +30,7 @@ Marked integration: needs Colima/Docker with the backing images pulled.
 """
 from __future__ import annotations
 
+import asyncio
 import shutil
 import tarfile
 import time
@@ -104,6 +105,18 @@ def _wait(predicate, describe, timeout=180.0, step=1.0):
     raise AssertionError(f"never true within {timeout}s: {describe}")
 
 
+async def _wait_async(predicate, describe, timeout=180.0, step=1.0):
+    """`_wait` for a predicate that has to await (`aws.exists` is a coroutine
+    since v0.7.7). A separate helper because `await` is a syntax error inside a
+    `lambda`, so these call sites pass a coroutine FUNCTION instead."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if await predicate():
+            return
+        await asyncio.sleep(step)
+    raise AssertionError(f"never true within {timeout}s: {describe}")
+
+
 def _aws(client, runtime) -> BackingAws:
     return BackingAws(runtime, ENV, gateway_port=client.get("/health").json()["gateway"]["port"])
 
@@ -118,13 +131,13 @@ async def test_export_then_lose_odin_then_import_converges_again(runner, workdir
         assert client.post("/apply", params={"env": ENV}, json=CANVAS).status_code == 200
         aws = _aws(client, runtime)
         _wait(lambda: all(_phases(client).get(n) == "healthy" for n in _BOTH), "both healthy")
-        assert aws.exists("s3", "uploads") and aws.exists("sqs", "jobs")
+        assert await aws.exists("s3", "uploads") and await aws.exists("sqs", "jobs")
         s3 = await aws.client("s3")
         s3.put_object(Bucket="uploads", Key=OBJECT_KEY, Body=b"data-plane bytes")
         assert s3.get_object(Bucket="uploads", Key=OBJECT_KEY)["Body"].read() == b"data-plane bytes"
 
         # --- 2. export: offline, straight off the filesystem, server up or down
-        export = await runner.invoke(cli, ["export", "--env", ENV])
+        export = runner.invoke(cli, ["export", "--env", ENV])
         assert export.exit_code == 0, export.output
         with tarfile.open(archive, "r:gz") as tar:
             names = set(tar.getnames())
@@ -143,7 +156,7 @@ async def test_export_then_lose_odin_then_import_converges_again(runner, workdir
     assert ENV not in store.list_envs()
 
     # --- 4. restore, server down, from the archive alone
-    restore = await runner.invoke(cli, ["import", str(archive)])
+    restore = runner.invoke(cli, ["import", str(archive)])
     assert restore.exit_code == 0, restore.output
     assert store.list_envs() == [ENV]
     assert {r.id for r in store.get_stack(ENV).resources} == set(_BOTH)
@@ -154,10 +167,11 @@ async def test_export_then_lose_odin_then_import_converges_again(runner, workdir
     # real containers. Asserted on the physical backings, not on phases.
     with TestClient(create_app(runtime=runtime, store=store)) as client:
         aws = _aws(client, runtime)
-        _wait(
-            lambda: aws.exists("s3", "uploads") and aws.exists("sqs", "jobs"),
-            "both backing resources really re-created",
-        )
+
+        async def _both_exist() -> bool:
+            return await aws.exists("s3", "uploads") and await aws.exists("sqs", "jobs")
+
+        await _wait_async(_both_exist, "both backing resources really re-created")
         # ...and the World projection catches up to what's physically there.
         _wait(
             lambda: all(_phases(client).get(n) == "healthy" for n in _BOTH),
@@ -165,7 +179,9 @@ async def test_export_then_lose_odin_then_import_converges_again(runner, workdir
         )
 
         # The documented boundary: the bucket is back, its CONTENTS are not.
-        contents = await aws.client("s3").list_objects_v2(Bucket="uploads")
+        # `client` is the coroutine; `list_objects_v2` on the boto3 client it
+        # returns is SYNC -- hence the parenthesised await.
+        contents = (await aws.client("s3")).list_objects_v2(Bucket="uploads")
         assert contents.get("KeyCount", 0) == 0, contents
 
         assert client.post("/destroy", params={"env": ENV}).status_code == 200

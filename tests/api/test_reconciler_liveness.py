@@ -149,7 +149,7 @@ class _StubLoop:
     def __init__(self) -> None:
         self.state = LoopHealth(env="default", ticking=False, verdict="down for a reason")
 
-    def health(self) -> LoopHealth:
+    async def health(self) -> LoopHealth:
         return self.state
 
 
@@ -168,7 +168,7 @@ async def test_the_watchdog_announces_the_recovery_too(caplog):
 
 async def test_the_watchdog_survives_one_reconciler_raising(caplog):
     class _Broken:
-        def health(self):
+        async def health(self):
             raise RuntimeError("boom")
 
     ws = _RecordingWs()

@@ -32,13 +32,13 @@ class FakeRuntime:
 
 
 class FakeRds:
-    def create_db(self, db_id, user, pw):
+    async def create_db(self, db_id, user, pw):
         pass
 
-    def delete_db(self, db_id):
+    async def delete_db(self, db_id):
         pass
 
-    def endpoint(self, db_id):
+    async def endpoint(self, db_id):
         return None
 
     def container_name(self, db_id):
