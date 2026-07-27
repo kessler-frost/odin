@@ -1143,6 +1143,8 @@ containment is already spatial (`ui/src/lib/containment.ts` stamps a node's
 render it read-only). These items generalise that from "which network am I in"
 to "what does being inside this thing MEAN".
 
+Design: [docs/intelligence-layer.md](docs/intelligence-layer.md)
+
 - [ ] **Containment changes configuration, not just labels.** The owner's
   example: expand an EC2 box, drop an ECS box inside it, and that means **ECS
   on the EC2 launch type rather than Fargate** — which is a real AWS
