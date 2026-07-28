@@ -688,7 +688,17 @@ async def test_wait_for_available_instances_is_one_store_read_when_everything_is
     elapsed = time.monotonic() - started
 
     assert faults == []
-    assert elapsed < 0.1, f"a healthy env cost {elapsed:.3f}s -- it must cost one store read"
+    # Against the REAL poll interval, not an arbitrary tighter number: the claim
+    # is "returned without sleeping once", and sleeping once costs exactly this.
+    # The previous bound was a flat 0.1s -- 5x tighter than the behaviour it
+    # guards, so on a contended CI runner it measured the runner rather than
+    # odin. That is the shape that broke `test_a_slow_refine_never_blocks...` on
+    # v0.8.2 (1.86s and 2.33s against a 1.0s bound, with the thing it was
+    # checking for provably not happening), so it is fixed here too rather than
+    # left as the next instance of it.
+    assert elapsed < rdsctl._AVAILABLE_POLL_SECONDS, (
+        f"a healthy env cost {elapsed:.3f}s -- it must cost one store read, not a poll"
+    )
 
 
 async def test_wait_for_available_instances_waits_for_a_database_that_is_still_creating(tmp_path, sink, rds):
