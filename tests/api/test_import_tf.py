@@ -65,12 +65,15 @@ def test_import_tf_hcl_source_parses_for_real(tmp_path):
 
 def test_import_tf_hcl_source_lists_unsupported_types(tmp_path):
     app = _app(tmp_path)
-    body = {"source": "hcl", "hcl": 'resource "aws_lambda_function" "fn" {\n  function_name = "fn"\n}\n'}
+    # `aws_route53_zone`, not `aws_lambda_function`: lambda became importable in
+    # v0.8.4, so using it here would have turned this route's unsupported-listing
+    # assertion into a test that nothing is ever listed.
+    body = {"source": "hcl", "hcl": 'resource "aws_route53_zone" "dns" {\n  name = "example.com"\n}\n'}
     with TestClient(app) as client:
         resp = client.post("/import-tf", params={"env": "default"}, json=body)
     assert resp.status_code == 200
     unsupported = resp.json()["unsupported"]
-    assert unsupported == [{"type": "aws_lambda_function", "name": "fn", "reason": unsupported[0]["reason"]}]
+    assert unsupported == [{"type": "aws_route53_zone", "name": "dns", "reason": unsupported[0]["reason"]}]
     assert "not supported" in unsupported[0]["reason"]
 
 

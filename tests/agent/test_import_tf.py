@@ -47,8 +47,12 @@ resource "aws_dynamodb_table" "items" {
   }
 }
 
-resource "aws_lambda_function" "fn" {
-  function_name = "fn"
+# v0.8.4: this was `aws_lambda_function`, which is now IMPORTED. These tests are
+# about the unsupported-listing invariant, not about lambda, so they need a type
+# odin genuinely has no model for -- otherwise closing an import gap silently
+# turns "unsupported types are listed" into an assertion about nothing.
+resource "aws_route53_zone" "dns" {
+  name = "example.com"
 }
 '''
 
@@ -67,8 +71,8 @@ def test_full_project_parses_into_nodes_edges_and_unsupported():
     assert result.edges == [{"source": "alerts", "target": "jobs"}]
 
     assert len(result.unsupported) == 1
-    assert result.unsupported[0].type == "aws_lambda_function"
-    assert result.unsupported[0].name == "fn"
+    assert result.unsupported[0].type == "aws_route53_zone"
+    assert result.unsupported[0].name == "dns"
 
 
 def test_grid_positions_are_on_the_20px_grid_in_220px_steps():
@@ -81,12 +85,12 @@ def test_grid_positions_are_on_the_20px_grid_in_220px_steps():
 
 
 def test_unsupported_type_never_dropped_even_when_alone():
-    result = parse_hcl_text('resource "aws_lambda_function" "fn" {\n  function_name = "fn"\n}\n')
+    result = parse_hcl_text('resource "aws_route53_zone" "dns" {\n  name = "example.com"\n}\n')
     assert result.nodes == []
     assert result.edges == []
     assert len(result.unsupported) == 1
-    assert result.unsupported[0].type == "aws_lambda_function"
-    assert result.unsupported[0].name == "fn"
+    assert result.unsupported[0].type == "aws_route53_zone"
+    assert result.unsupported[0].name == "dns"
     assert "not supported" in result.unsupported[0].reason
 
 
@@ -116,7 +120,7 @@ def test_malformed_hcl_sets_parse_error_not_unsupported():
 
 
 def test_valid_file_with_only_unsupported_resources_has_no_parse_error():
-    result = parse_hcl_text('resource "aws_lambda_function" "fn" {\n  function_name = "fn"\n}\n')
+    result = parse_hcl_text('resource "aws_route53_zone" "dns" {\n  name = "example.com"\n}\n')
     assert result.parse_error is None
     assert len(result.unsupported) == 1
 

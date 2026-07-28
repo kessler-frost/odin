@@ -47,38 +47,53 @@ def _round_trip():
     return parse_hcl_text(tf)
 
 
-def test_what_cannot_be_imported_is_listed_rather_than_dropped():
-    """Northstar directive 5. Silence here would mean a user re-imports their
-    own generated project and loses half of it without being told."""
+def test_odins_own_project_now_round_trips_with_nothing_unsupported():
+    """v0.8.4 finished the import direction: every kind odin GENERATES it also
+    reads back, so its own `main.tf` no longer loses anything.
+
+    This replaced "aws_lambda_function must be listed unsupported", which had
+    walked down from five kinds to one over four commits and was about to become
+    unfalsifiable. The invariant it protected did not go away -- it moved to the
+    test below, where it belongs, because the durable claim is about resources
+    odin does not MODEL, not ones it merely could not read.
+    """
     result = _round_trip()
-    listed = {entry.type for entry in result.unsupported}
-    # `aws_security_group` left this list in v0.8.4 by BECOMING importable --
-    # which is what this file is for: the ratchet failed, and the README was
-    # corrected in the same change rather than drifting.
-    for kind in ("aws_lambda_function",):
-        assert kind in listed, f"{kind} vanished silently; listed={sorted(listed)}"
-    for entry in result.unsupported:
-        assert entry.reason, f"{entry.type} was listed with no reason"
+    assert result.unsupported == [], [e.type for e in result.unsupported]
+    assert {n["type"] for n in result.nodes} >= {
+        "vpc", "subnet", "sg", "ec2", "ecs", "s3", "lambda",
+    }
 
 
-def test_what_can_be_imported_actually_comes_back():
-    result = _round_trip()
-    assert {n["type"] for n in result.nodes} >= {"vpc", "subnet", "s3"}
+def test_a_resource_odin_does_not_model_at_all_is_listed_with_a_reason():
+    """Northstar directive 5, the half that stays true forever: silence would mean
+    importing a real project and losing part of it without being told. Checked
+    against a resource odin has no model for, so full generate-side coverage can
+    never make it vacuous."""
+    result = parse_hcl_text('resource "aws_route53_zone" "main" {\n  name = "example.com"\n}\n')
+    (entry,) = result.unsupported
+    assert entry.type == "aws_route53_zone"
+    assert entry.reason, "listed with no reason"
+    assert result.nodes == []
 
 
-def test_the_readme_does_not_claim_import_covers_everything():
-    """The doc-drift half. `import_tf` gaining `aws_instance` support should
-    make this fail, so the README is updated in the same change."""
+def test_the_readme_describes_the_coverage_import_actually_has():
+    """The doc-drift half, in the direction that actually rots: every kind this
+    bullet names as a gap must still BE one.
+
+    Five were named when this file was written. All five became importable in
+    v0.8.4, and every commit that closed one had to come back and correct the
+    bullet -- which is the entire point of pinning prose to behaviour. The bullet
+    must also still separate COVERAGE from FIDELITY: equal kind coverage does not
+    make a round trip lossless, and what it does cost is named in Known limits.
+    """
     claim = re.search(r"- \*\*Translation\*\*.*?(?=\n- \*\*)", README, re.S)
     assert claim, "the Translation bullet moved -- re-point this test"
     text = claim.group(0)
-    assert "do not cover the same ground" in text, (
-        "the README summarises translation without saying the import direction "
-        "covers less -- determinism and completeness are different claims"
-    )
-    for kind in ("aws_lambda_function",):
-        assert kind in text, f"the README does not name {kind} as un-importable"
-    # And the inverse, which is the half that actually rots: a kind that BECAME
-    # importable must stop being advertised as a gap.
-    for kind in ("aws_security_group", "aws_ecr_repository", "aws_instance", "aws_ecs_service"):
+    for kind in ("aws_security_group", "aws_ecr_repository", "aws_instance",
+                 "aws_ecs_service", "aws_lambda_function"):
         assert kind not in text, f"the README still calls {kind} un-importable, but import_tf reads it"
+    assert "not lossless" in text, (
+        "the README claims equal coverage without separating it from FIDELITY -- "
+        "an ECS service's wiring, a security group's egress, and a function's code "
+        "read from HCL text alone all still cost something"
+    )

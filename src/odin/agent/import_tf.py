@@ -29,10 +29,12 @@ Two modes (research-verified, docs/superpowers/research/research-tofu-provider.m
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import shutil
 import tempfile
+import zipfile
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -84,6 +86,11 @@ _KIND = {
     # definition + the shared cluster), so only the SERVICE becomes a node --
     # the other two fold on, the same shape as the alb trio.
     "aws_ecs_service": "ecs",
+    # v0.8.4, the last kind. A function's CONFIG is all in the HCL; its CODE is
+    # in a zip beside `main.tf`, so `parse_hcl_dir` recovers it and
+    # `parse_hcl_text` cannot -- see `_stamp_lambda`, which says so rather than
+    # letting odin's default payload pass for the user's own function.
+    "aws_lambda_function": "lambda",
 }
 # Neither of these becomes a node. The task definition folds onto its service
 # (image/port/memory/cpu live there, not on the service); the cluster is a
@@ -108,6 +115,7 @@ _NAME_ATTR = {
     "aws_lb": "name",
     "aws_security_group": "name", "aws_ecr_repository": "name",
     "aws_ecs_service": "name",
+    "aws_lambda_function": "function_name",
 }
 # canvas kind -> aws_* type, for mode (b) (the inverse of `_KIND`). iam_role,
 # logs, secret and ssm have no backing to enumerate live resources from (all
@@ -134,7 +142,12 @@ _NAME_ATTR = {
 # `i-...` InstanceId, minted at RunInstances and absent from any canvas.
 # `ecs` is out for the alb reason rather than the id reason: one canvas node is
 # three tf resources, so there is no single live resource to import it from.
-_NO_LIVE_IMPORT = {"iam_role", "logs", "secret", "ssm", "elasticache", "alb", "sg", "ecr", "ec2", "ecs"}
+# `lambda` is out of the live path because its CODE is not recoverable from any
+# AWS API odin implements -- a live import would produce a function whose body is
+# odin's default payload, which is the substitution this whole module refuses.
+_NO_LIVE_IMPORT = {
+    "iam_role", "logs", "secret", "ssm", "elasticache", "alb", "sg", "ecr", "ec2", "ecs", "lambda",
+}
 _TF_TYPE = {kind: rtype for rtype, kind in _KIND.items() if kind not in _NO_LIVE_IMPORT}
 
 # The HCL arguments each kind CARRIES into the canvas -- so a round-trip through
@@ -216,6 +229,13 @@ _CARRIED_ATTRS = {
         "deployment_maximum_percent", "timeouts", "placement_constraints",
         "depends_on", "load_balancer", "tags",
     },
+    # `filename`/`source_code_hash` are carried in the sense that odin re-derives
+    # both from the code it materializes itself; `role` is either a reference to a
+    # drawn iam_role node or odin's own auto-generated one (`_stamp_lambda`).
+    "lambda": {
+        "function_name", "role", "handler", "runtime", "filename",
+        "source_code_hash", "depends_on", "tags",
+    },
 }
 # The companion resources' equivalent: which of THEIR arguments a round trip
 # reproduces (hcl.py's alb companion pass emits exactly these). Until v0.7.1
@@ -294,7 +314,7 @@ _UNREADABLE_NUMBERS = {
 # node carries -- not a warning about losing them.
 # Every builder in hcl.py appends `_tags_block(res)`, so user tags round-trip
 # for every kind -- these are the ones whose tags are read BACK into `data.tags`.
-_TAGGED_KINDS = {"s3", "logs", "secret", "ssm", "rds", "alb", "vpc", "subnet", "elasticache", "sg", "ecr", "ec2", "ecs"}
+_TAGGED_KINDS = {"s3", "logs", "secret", "ssm", "rds", "alb", "vpc", "subnet", "elasticache", "sg", "ecr", "ec2", "ecs", "lambda"}
 _CONTAINER_KINDS = ("vpc", "subnet")
 
 # Canvas geometry for the layout pass. These ARE the UI's own container sizes
@@ -617,6 +637,11 @@ def _node_data(kind: str, label: str, attrs: dict) -> dict:
         node_type = hcl.unquote(attrs.get("node_type"))
         if isinstance(node_type, str):
             data["nodeType"] = node_type
+    if kind == "lambda":
+        for attr, field in (("runtime", "runtime"), ("handler", "handler")):
+            value = hcl.unquote(attrs.get(attr))
+            if isinstance(value, str):
+                data[field] = value
     if kind == "ecs":
         count = _int_text(attrs.get("desired_count"))
         if count is not None:
@@ -750,6 +775,82 @@ def _container_definition(taskdef: dict) -> dict:
     except json.JSONDecodeError:
         return {}
     return parsed[0] if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict) else {}
+
+
+def _lambda_code(archives: dict[str, bytes], filename: str) -> str | None:
+    """The function body out of its deployment zip, or None.
+
+    odin materializes a single-entry zip beside `main.tf` and references it by
+    filename (`hcl.py::_lambda`), so the code is recoverable in DIRECTORY mode and
+    simply absent in text mode. `_stamp_lambda` reports the difference rather than
+    letting odin's `_DEFAULT_LAMBDA_CODE` pass for the user's own function.
+    """
+    raw = archives.get(filename)
+    if raw is None:
+        return None
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            names = archive.namelist()
+            return archive.read(names[0]).decode() if names else None
+    except (zipfile.BadZipFile, UnicodeDecodeError, KeyError):
+        return None
+
+
+def _stamp_lambda(
+    node_by_label: dict[str, dict], attrs_by_label: dict[str, dict], by_hcl_name: dict[str, str],
+    role_names: dict[str, str], archives: dict[str, bytes],
+) -> tuple[list[str], set[str]]:
+    """Resolve each function's role and code. Returns (warnings, labels to DROP).
+
+    ## The phantom role, which was a defect before lambda import existed
+
+    A lambda drawn with no `role` gets an AUTO-GENERATED `aws_iam_role`
+    (`hcl.py` pass 3, `name = "<function>-role"`). Because `_KIND` maps
+    `aws_iam_role` to a real canvas kind, importing odin's own generated project
+    produced an `iam_role` NODE THE USER NEVER DREW -- measured before this
+    function existed: a one-lambda canvas round-tripped into a canvas containing
+    one `iam_role` called `thumbnailer-role` and no function at all. So the role
+    is dropped here when it is odin's own, and the node's `role` field is left
+    empty, which is exactly what the canvas said in the first place.
+
+    Detecting it reconstructs hcl.py's `<function>-role` NAMING CONVENTION, and
+    that is a compromise worth naming: the generated HCL carries no marker
+    distinguishing an auto-role from a drawn one (both get the same
+    `assume_role_policy` -- `_iam_role` and the auto pass emit the identical
+    default Lambda trust policy), so the name is the only signal available. A
+    user who draws a role and happens to call it `<function>-role` gets it folded
+    in; the effect is that their `role` field comes back empty and odin
+    regenerates the same role, so the Terraform is unchanged.
+    """
+    warnings: list[str] = []
+    drop: set[str] = set()
+    for label, node in node_by_label.items():
+        if node["type"] != "lambda":
+            continue
+        attrs = attrs_by_label[label]
+
+        role_label = _referenced_label(attrs.get("role"), "aws_iam_role", by_hcl_name)
+        auto = role_label is not None and role_names.get(role_label) == f"{label}-role"
+        if role_label and not auto:
+            node["data"]["role"] = role_label
+        if auto:
+            drop.add(role_label)
+        warnings += [] if role_label or attrs.get("role") is None else [
+            f"{label} (lambda): its `role` names no imported aws_iam_role, so odin will "
+            "auto-generate an execution role for it on the next Apply"
+        ]
+
+        filename = hcl.unquote(attrs.get("filename"))
+        code = _lambda_code(archives, filename) if isinstance(filename, str) else None
+        if code is not None:
+            node["data"]["code"] = code
+        warnings += [] if code is not None else [
+            f"{label} (lambda): its CODE could not be imported -- a function's body lives in "
+            f"{filename or 'a zip'} beside main.tf, not in the HCL. Reading a directory "
+            "(`odin translate import <dir>`) recovers it; from HCL text alone the node comes back "
+            "with odin's DEFAULT placeholder payload, which is NOT your function."
+        ]
+    return warnings, drop
 
 
 def _stamp_ecs_taskdef(
@@ -1047,7 +1148,7 @@ def _layout(nodes: list[dict]) -> None:
                _MIN_SUBNET_SIZE if node["type"] == "subnet" else None)
 
 
-def parse_hcl(files: dict[str, str]) -> ImportResult:
+def parse_hcl(files: dict[str, str], archives: dict[str, bytes] | None = None) -> ImportResult:
     """Mode (a) core: `files` maps filename -> HCL text (a single-string
     caller passes `{"main.tf": text}`)."""
     try:
@@ -1202,6 +1303,29 @@ def parse_hcl(files: dict[str, str]) -> ImportResult:
     warnings += _stamp_sg_rules(node_by_label, attrs_by_label, by_hcl_name)
     warnings += _stamp_ec2_wiring(node_by_label, attrs_by_label, by_hcl_name, key_pairs)
     warnings += _stamp_ecs_taskdef(node_by_label, attrs_by_label, by_hcl_name, taskdefs)
+    role_names = {
+        label: str(hcl.unquote(attrs_by_label[label].get("name")) or "")
+        for label, node in node_by_label.items() if node["type"] == "iam_role"
+    }
+    lambda_warnings, folded_roles = _stamp_lambda(
+        node_by_label, attrs_by_label, by_hcl_name, role_names, archives or {},
+    )
+    warnings += lambda_warnings
+    # A folded auto-role must leave BOTH lists: the node list the canvas is built
+    # from, and `node_by_label`, which later passes read.
+    nodes = [node for node in nodes if node["id"] not in folded_roles]
+    for label in folded_roles:
+        node_by_label.pop(label, None)
+    # ...and its WARNINGS go with it. The per-resource honesty pass ran while the
+    # role was still a node, so a folded auto-role left behind
+    # "thumbnailer-role (iam_role): imported without unmodeled attribute(s):
+    # assume_role_policy" -- about a node that no longer exists, on every single
+    # lambda import. Warning noise is not harmless here: this module's whole value
+    # is that its warnings are worth reading.
+    warnings = [
+        warning for warning in warnings
+        if not any(warning.startswith(f"{label} (iam_role)") for label in folded_roles)
+    ]
     _layout(nodes)
 
     edges: list[dict] = []
@@ -1233,13 +1357,19 @@ def parse_hcl(files: dict[str, str]) -> ImportResult:
     return ImportResult(nodes=nodes, edges=edges, unsupported=unsupported, warnings=warnings)
 
 
-def parse_hcl_text(text: str) -> ImportResult:
-    return parse_hcl({"main.tf": text})
+def parse_hcl_text(text: str, archives: dict[str, bytes] | None = None) -> ImportResult:
+    return parse_hcl({"main.tf": text}, archives)
 
 
 def parse_hcl_dir(directory: Path) -> ImportResult:
+    """Directory mode reads the ZIPS as well as the `.tf` files -- a lambda's body
+    lives in one, so text mode can only ever report it missing (`_stamp_lambda`).
+    Synchronous on purpose: `.read_bytes()` on a page-cached few-KB archive is
+    sub-millisecond, and an async file API in Python is a thread pool in a costume
+    (the concurrency note in .claude/CLAUDE.md)."""
     files = {p.name: p.read_text() for p in sorted(directory.glob("*.tf"))}
-    return parse_hcl(files)
+    archives = {p.name: p.read_bytes() for p in sorted(directory.glob("*.zip"))}
+    return parse_hcl(files, archives)
 
 
 def _import_id(resource: LiveResource, gateway_port: int) -> str:
