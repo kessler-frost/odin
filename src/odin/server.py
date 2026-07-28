@@ -13,6 +13,7 @@ import base64
 import json
 import logging
 import os
+import shutil
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -822,6 +823,105 @@ def _loop_leftover(stack: Stack, env: str) -> str:
     return template.format(recreated=", ".join(recreated), env=env)
 
 
+# --- `/envs/rm`: outcome -> status, the ONE place the status is decided ---
+#
+# The same shape as `_DESTROY_STATUS` above, adopted from the START rather than
+# after three releases of exit-0-over-a-standing-env. `_remove_env` below
+# performs the removal and reports an OUTCOME; it never names a status, and its
+# signature makes forgetting to report one impossible (the outcome IS the first
+# half of what it returns). The status is looked up here, once. An outcome this
+# map has no entry for -- including a typo -- lands on `_REMOVE_FAILED`, so a
+# new way for a removal not to happen fails loudly by default and can only be
+# scored as success by being added here on purpose.
+_REMOVE_FAILED = "remove_failed"
+_REMOVE_STATUS = {
+    "removed": "removed",                     # teardown ok, loop ended, no container, state gone
+    "never_existed": "not_found",             # nothing was removed AND nothing was created
+    "unsafe_env_name": "remove_refused",      # `env` does not name a child of the store root
+    "busy": "remove_refused",                 # a tofu run holds this env
+    "destroy_failed": "remove_failed_teardown",
+    "loop_still_running": "remove_failed_loop_running",
+    "containers_standing": "remove_failed_containers_standing",
+    "containers_unknown": "remove_unverified",
+    "state_survived": "remove_failed_state_survives",
+}
+# The two statuses that mean the end state HOLDS. Everything else -- including
+# the fallback -- gets an `error`, which is what makes `odin env rm` exit
+# nonzero (`cli/http.body_or_fail` keys on it).
+_REMOVE_OK = {"removed", "not_found"}
+_REMOVE_HTTP = {"removed": 200, "never_existed": 200, "unsafe_env_name": 400, "busy": 409}
+
+# What each failing outcome REALLY was, and what is still standing because of
+# it. Every one of them leaves `.odin/<env>/` INTACT on purpose: a removal that
+# could not finish must stay retryable, and deleting the desired state over a
+# half-finished teardown is the same mistake `/destroy` makes a point of not
+# making (see `_RECREATED_BY_THE_LOOP`).
+_REMOVE_CAUSE = {
+    "unsafe_env_name": (
+        "{env!r} does not name an environment directly under odin's store, so it is not an "
+        "environment odin can remove -- nothing was read, written or deleted"
+    ),
+    "busy": (
+        "a tofu run is in progress for this env, so the teardown was not even attempted -- nothing "
+        "was removed. Wait for it (`odin tf status --env {env}`) and re-run"
+    ),
+    "destroy_failed": (
+        "the teardown failed, so nothing was forgotten -- the env, its state directory, its "
+        "credentials and its reconciler are all exactly as they were. The `teardown` field carries "
+        "the full report, including what tofu left standing; fix that cause and re-run"
+    ),
+    "loop_still_running": (
+        "odin asked this env's reconciler to stop and its loop task had NOT finished when asked -- "
+        "so nothing was deleted. Removing the state under a live loop would let it re-create "
+        "`world.json` and real containers inside the directory being deleted. The env is still "
+        "registered and still converging; restart odin (`odin stop && odin start`) and re-run"
+    ),
+    "containers_standing": (
+        "the teardown reported success but odin can still see container(s) of this env's on the "
+        "machine, so its state was NOT deleted -- removing it would leave them with nothing left "
+        "that names them. Remove them (`docker rm -f ...`) and re-run"
+    ),
+    "containers_unknown": (
+        "odin could not list this machine's containers, so it cannot say this env left none behind "
+        "-- and it will not call a removal complete on a half it could not read. NOTHING was "
+        "deleted; the env is exactly as it was. Fix the container runtime (`odin doctor`) and "
+        "re-run"
+    ),
+    "state_survived": (
+        "`{state_dir}` still exists after odin deleted it, so this env's desired state, credentials "
+        "and gateway records are still on disk. Its reconciler HAS been stopped and it is no longer "
+        "registered, so nothing is converging it -- check the directory's permissions and remove it "
+        "by hand, or restart odin to pick it back up"
+    ),
+}
+_UNKNOWN_REMOVE_CAUSE = (
+    "the removal finished without reporting any outcome, which is an odin bug -- reported as a "
+    "failure rather than assumed to have worked, because nothing here verified that it did"
+)
+
+
+def _env_dir(root: Path, env: str) -> Path | None:
+    """`env`'s own directory under `root`, or None if `env` does not name one.
+
+    `/envs/rm` ends in `shutil.rmtree`, and every other route in this file
+    interpolates `env` straight into a path. A resolution check rather than a
+    name pattern, because it answers the question that actually matters -- is
+    this a CHILD of the store root -- and answers it for the cases a charset
+    rule gets wrong in both directions:
+
+        _env_dir(root, "..")        -> None   (root's parent)
+        _env_dir(root, "a/b")       -> None   (a grandchild)
+        _env_dir(root, "")          -> None   (the root itself)
+        _env_dir(root, "/etc")      -> None   (absolute: `root / "/etc"` IS "/etc")
+        _env_dir(root, "my env")    -> the directory  (legal today; a pattern would refuse it)
+
+    A symlinked `<root>/<env>` resolves to its target, whose parent is not the
+    root, so it is refused rather than followed out of the store."""
+    parent = root.resolve()
+    target = (root / env).resolve()
+    return target if target.parent == parent and target != parent else None
+
+
 async def _loop_health(reconcilers: dict[str, Reconciler], env: str) -> LoopHealth:
     """This env's reconciler health, WITHOUT creating one.
 
@@ -865,8 +965,13 @@ def _stale_resource(resource: dict, health: LoopHealth) -> dict:
 def create_apply_router(
     store: SpecStore, reconciler_for, keystore: KeyStore, runner: TfRunner, gateway_port, env_epoch: dict[str, int],
     stores: SynthStores, gateway: GatewayState, runtime, reconcilers: dict[str, Reconciler],
+    chat_sessions: dict[str, list[tuple[str, str]]] | None = None,
 ) -> APIRouter:
     router = APIRouter()
+    # `/envs/rm` forgets these too -- see `_remove_env`. Defaulted so every
+    # existing caller (the api tests build this router directly) keeps working;
+    # `create_app` passes the real ones the chat route and the stream use.
+    _chat_sessions = {} if chat_sessions is None else chat_sessions
 
     @router.post("/apply")
     async def apply(graph: CanvasGraph, env: str = ENV, allow_destroying_uncovered: bool = False) -> JSONResponse:
@@ -896,8 +1001,13 @@ def create_apply_router(
             "skipped": skipped, "not_covered": not_covered(skipped, []),
         })
 
-    @router.post("/destroy")
-    async def destroy(env: str = ENV) -> JSONResponse:
+    async def _destroy(env: str) -> JSONResponse:
+        """The whole teardown, as one callable. `/destroy` IS this, and so is
+        the first half of `/envs/rm` -- which is why it is a function rather
+        than a route body copied into a second route. A removal that tore an
+        env down its own way would be a second teardown to keep honest, and the
+        four rounds of `_DESTROY_STATUS` above are the argument against having
+        two of them."""
         # Release finding #5: `/destroy` used to only ever prune the
         # reconciler half, leaving anything tofu created (vpc/subnet/sg have
         # NO reconciler-driven teardown path at all -- see
@@ -1091,6 +1201,135 @@ def create_apply_router(
         )
         return JSONResponse(status_code=500, content=body)
 
+    @router.post("/destroy")
+    async def destroy(env: str = ENV) -> JSONResponse:
+        return await _destroy(env)
+
+    async def _remove_env(env: str) -> tuple[str, dict]:
+        """Remove `env` entirely, and report the OUTCOME -- never a status.
+
+        Deliberately has no way to say "it worked": it returns an outcome
+        string, `create_apply_router`'s caller looks that up in
+        `_REMOVE_STATUS`, and anything unmapped is a failure. A branch added
+        here that returns the wrong word therefore fails loudly instead of
+        inheriting a success (`/destroy`'s hard-won shape, one level up).
+
+        ORDER is the whole design, and every step is a gate on the next:
+
+          1. teardown (`_destroy`) -- while the loop is still ALIVE, because
+             its trailing `tick()` is what gc's the backing containers.
+          2. STOP the loop, and verify with `Reconciler.loop_finished()` that
+             the task really ended. A live loop re-creates `world.json` and
+             real containers inside a directory being deleted.
+          3. ask the machine what containers survived, the same witness
+             `/destroy`'s failure report uses.
+          4. only THEN forget the in-memory per-env state and `rmtree` the
+             directory.
+
+        Anything that goes wrong before step 4 leaves `.odin/<env>/` untouched,
+        so the removal is retryable and no half-removed env can exist.
+
+        `still_standing` from step 3 errs toward refusing: `_surviving_containers`
+        matches on odin's container NAMING, so an env whose name is a `-`-suffix
+        of this one's (`a` inside `b-a`) reads as this env's container and
+        refuses the removal (MEASURED, and recorded in `docs/limits.md`).
+        Refusing a legitimate removal is recoverable; deleting the last record
+        of a running container is not.
+
+        What is deliberately NOT forgotten: `TranslateCache`. It is keyed by a
+        Stack's content hash, and a Stack carries its own `env`, so a removed
+        env's entries are unreachable unless the identical env and canvas come
+        back -- in which case the cached translation is the right answer, not a
+        stale one."""
+        target = _env_dir(store.root, env)
+        if target is None:
+            return "unsafe_env_name", {}
+        # Nothing to remove AND nothing to create -- the same rule `/destroy`
+        # follows for an env that never existed. `reconcilers` is asked too, so
+        # an env whose directory was deleted by hand still gets its loop
+        # stopped rather than left ticking over nothing.
+        if not target.exists() and env not in reconcilers:
+            return "never_existed", {}
+
+        teardown = await _destroy(env)
+        detail: dict = {"teardown": json.loads(teardown.body)}
+        if teardown.status_code == 409:
+            return "busy", detail
+        if teardown.status_code != 200:
+            return "destroy_failed", detail
+
+        reconciler = reconcilers.get(env)
+        if reconciler is not None:
+            await reconciler.stop()
+            if not reconciler.loop_finished():
+                return "loop_still_running", detail
+
+        containers = await _surviving_containers(runtime, env)
+        if containers is None:
+            return "containers_unknown", detail
+        if containers:
+            return "containers_standing", {**detail, "still_standing": {"containers": containers}}
+
+        # ...and from here to the `rmtree` there is deliberately NO `await`.
+        # On one event loop that makes forgetting the caches and deleting the
+        # directory a single uninterruptible step, so no request can land in
+        # the middle and re-persist a file (`JsonStore._persist_locked` and
+        # `KeyStore._persist` both write on every mutation) into a directory
+        # that is on its way out.
+        reconcilers.pop(env, None)
+        detail["forgotten"] = {
+            "reconciler": reconciler is not None,
+            # Normally `[]`, and that is the CORRECT reading rather than a
+            # miss: the teardown above ends in `keystore.revoke_env(env)`, so
+            # by here there is usually nothing left to drop. `forget_env` is
+            # still the right call and not `revoke_env` -- revoke PERSISTS an
+            # empty `keys.json`, which would re-create a file one line before
+            # the directory holding it is deleted. A non-empty list here means
+            # a credential was issued between the teardown and this line.
+            "keys": keystore.forget_env(env),
+            "gateway_stores": stores.forget_env(env),
+            "gateway_policy": gateway.forget_env(env),
+            "tf_runs": runner.forget_env(env),
+            "apply_epoch": env_epoch.pop(env, None) is not None,
+            "chat_turns": len(_chat_sessions.pop(env, [])),
+        }
+        detail["state_dir"] = str(target)
+        shutil.rmtree(target, ignore_errors=True)
+        if target.exists():
+            return "state_survived", detail
+        return "removed", detail
+
+    @router.post("/envs/rm")
+    async def env_rm(env: str = ENV) -> JSONResponse:
+        """Tear an env down AND forget it: no directory, no credentials, no
+        gateway records, no reconciler, and gone from `GET /envs`.
+
+        `odin destroy --env X` deliberately keeps the env -- its desired state
+        is what makes a retry possible, and its loop is what converges the next
+        apply. That is right for a teardown and wrong for a decommission, which
+        is what this is: seven envs accumulated in one field-test session, each
+        with a reconciler ticking forever over nothing.
+
+        The status is DERIVED, once, from `_REMOVE_STATUS` -- see `_remove_env`.
+        """
+        outcome, detail = await _remove_env(env)
+        status = _REMOVE_STATUS.get(outcome, _REMOVE_FAILED)
+        body = {"status": status, "env": env, **detail}
+        if status in _REMOVE_OK:
+            # The SERVER log, deliberately, and not `ws.broadcast`. The durable
+            # event log is PER ENV (`<root>/<env>/events.jsonl`) and
+            # `secure_append_line` mkdirs its parent, so broadcasting a
+            # removal would re-create the very directory this route just
+            # deleted -- an env that came back from the dead one line after it
+            # went away. The UI re-reads `GET /envs` on its own poll instead.
+            log.warning("removed env %r: %s", env, detail.get("forgotten"))
+            return JSONResponse(status_code=_REMOVE_HTTP.get(outcome, 200), content=body)
+        cause = _REMOVE_CAUSE.get(outcome, _UNKNOWN_REMOVE_CAUSE).format(
+            env=env, state_dir=detail.get("state_dir", store.root / env),
+        )
+        body["error"] = f"env {env!r} was NOT removed: {cause}."
+        return JSONResponse(status_code=_REMOVE_HTTP.get(outcome, 500), content=body)
+
     @router.get("/world")
     async def world(env: str = ENV) -> dict:
         """The env's observed World, plus the resources tofu really created
@@ -1195,6 +1434,7 @@ def create_tf_router(
     translate_cache: translate_mod.TranslateCache, runtime, stores: SynthStores,
     canvas_for: Callable[[str], Path] = lambda env: ODIN_DIR / env / CANVAS_NAME,
     ws=None,
+    chat_sessions: dict[str, list[tuple[str, str]]] | None = None,
 ) -> APIRouter:
     """`/tf/*` -- Simulate's own apply/destroy/status, independent of the
     canvas `/apply`/`/destroy` above (S2 CONTRACT ADDENDUM: routes named
@@ -1205,8 +1445,11 @@ def create_tf_router(
     router = APIRouter()
     # Per-env, per-process. Not persisted on purpose: a conversation is a
     # working context, not a record, and one that outlived a restart would be a
-    # surprise nobody asked for.
-    chat_sessions: dict[str, list[tuple[str, str]]] = {}
+    # surprise nobody asked for. OWNED BY `create_app` now rather than by this
+    # closure, so `/envs/rm` can forget a removed env's conversation too --
+    # otherwise an env of the same name, recreated in the same process, would
+    # resume a conversation about an architecture that no longer exists.
+    _chat_sessions: dict[str, list[tuple[str, str]]] = {} if chat_sessions is None else chat_sessions
 
     async def save_canvas_now(env: str, canvas: dict) -> dict[str, str]:
         """Save an agent-authored canvas through the SAME writer the UI's own
@@ -1389,7 +1632,7 @@ def create_tf_router(
         # tries. Everything downstream is written against {nodes, edges}.
         saved = _saved_canvas(canvas_for(env))
         canvas = {"nodes": saved.get("nodes") or [], "edges": saved.get("edges") or []}
-        session = chat_sessions.setdefault(env, [])
+        session = _chat_sessions.setdefault(env, [])
         proposal = await chat.propose(canvas, body.message, history=list(session))
         # The turn is remembered whatever happened, INCLUDING a refusal: "no, do
         # it the other way" is the most common second message, and it is
@@ -1434,7 +1677,7 @@ def create_tf_router(
         work you may have built on since would be a far worse surprise than a
         stale conversation.
         """
-        turns = len(chat_sessions.pop(env, []))
+        turns = len(_chat_sessions.pop(env, []))
         return {"status": "cleared", "env": env, "turns_forgotten": turns}
 
     @router.post("/import-tf")
@@ -2226,6 +2469,11 @@ def create_app(
     # refine tasks, so no request ever blocks on the (slow) claude-agent-sdk
     # pass; a later same-revision call serves the refined output once ready.
     translate_cache = translate_mod.TranslateCache()
+    # The chat agent's per-env conversation, owned HERE because two routers
+    # need it: `/chat` reads and appends, `/envs/rm` forgets it along with
+    # everything else that env owns. In memory, per process (see
+    # `_CHAT_HISTORY_TURNS`).
+    chat_sessions: dict[str, list[tuple[str, str]]] = {}
 
     # One reconciler per environment, created lazily. Each gets its own
     # env-scoped backing containers, so AWS state stays isolated. (The rds
@@ -2432,13 +2680,13 @@ def create_app(
     app.include_router(
         create_apply_router(
             _store, reconciler_for, gateway_keystore, tf_runner, lambda: gateway_port_actual, env_epoch,
-            gateway_stores, gateway_state, _runtime, reconcilers,
+            gateway_stores, gateway_state, _runtime, reconcilers, chat_sessions,
         )
     )
     app.include_router(
         create_tf_router(
             _store, tf_runner, gateway_keystore, lambda: gateway_port_actual,
-            translate_cache, _runtime, gateway_stores, canvas_for, ws_manager,
+            translate_cache, _runtime, gateway_stores, canvas_for, ws_manager, chat_sessions,
         )
     )
     app.include_router(

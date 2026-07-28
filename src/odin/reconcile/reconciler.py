@@ -222,6 +222,12 @@ class Reconciler:
         # real, runtime-backed wiring always passes one.
         self._drift = drift
         self._task: asyncio.Task | None = None
+        # The task `stop()` last waited on, kept AFTER `_task` is cleared --
+        # the evidence `loop_finished()` reads. See its docstring: without it,
+        # the only thing left to ask after a stop is "does anything still point
+        # at the task", and an asyncio.Task that nothing points at goes on
+        # running exactly as it did before.
+        self._finished_task: asyncio.Task | None = None
         self._stop = False
         self._stall_after = poll_interval + STALL_GRACE if stall_after is None else stall_after
         # The liveness bookkeeping `health()` reads. Written ONLY by `_run`
@@ -274,7 +280,32 @@ class Reconciler:
         self._stop = True
         if self._task is not None:
             await asyncio.gather(self._task, return_exceptions=True)
+            self._finished_task = self._task
             self._task = None
+
+    def loop_finished(self) -> bool:
+        """Has this env's loop REALLY ended? Read off the task object itself.
+
+        `/envs/rm` cannot delete an env's state while something is still
+        converging it -- the loop would re-create `world.json` (and, through
+        `plan()`, real containers) under the directory being removed. So the
+        removal has to verify the stop rather than assume it, and the only
+        honest witness is the task's own `done()`.
+
+        Which is why `stop()` keeps `_finished_task`. `self._task = None` is
+        NOT evidence of anything: an `asyncio.Task` nobody references keeps
+        running (that is the whole reason `create_task` results are held in a
+        strong ref elsewhere in odin), so a check that read `_task is None`
+        would pass for a loop that never stopped -- exactly the shape of guard
+        the honesty rules exist to stop.
+
+        `True` when no task was ever created, because then there is genuinely
+        nothing converging this env. `reconciler_for()` awaits `start()` before
+        handing one out, so that state does not arise from the server's own
+        wiring; a hand-built Reconciler that was never started is the case it
+        covers, and it answers the question asked, not a proxy for it."""
+        task = self._task if self._task is not None else self._finished_task
+        return task is None or task.done()
 
     async def _run(self) -> None:
         """The loop, plus the bookkeeping that makes its own death visible.

@@ -109,7 +109,8 @@ ALB becomes a load balancer plus a target group plus a listener, and a Lambda
 drawn without a role gets one generated for it.
 
 Environments are independent. `--env staging` and `--env prod` keep separate
-canvases, containers and state.
+canvases, containers and state. `odin envs` lists them, and `odin env rm <name>`
+decommissions one — teardown, then the environment itself.
 
 ## Apply
 
@@ -121,8 +122,18 @@ output names which one and why.
 ```bash
 odin apply --env prod
 odin world --env prod          # one line per resource, with its live facts
-odin destroy --env prod
+odin destroy --env prod        # tear the resources down, keep the environment
+odin env rm prod               # ...and remove the environment itself
 ```
+
+`odin destroy` and `odin env rm` are different verbs. Destroy keeps the
+environment on purpose: its desired state is what makes a retry possible and its
+reconciler is what converges the next apply. `env rm` is the decommission — the
+same teardown, then the `.odin/prod/` directory, the gateway credentials it
+issued, its synthesized control-plane records, its reconciler, and its entry in
+`odin envs`. It is not undoable (`odin export --env prod` first if you might want
+it back), and it exits non-zero, having deleted nothing, if the environment is
+not actually gone.
 
 If a container is killed or removed out of band, the next apply rebuilds it and
 tells you what that cost:

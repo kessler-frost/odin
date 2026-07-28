@@ -138,6 +138,18 @@ class GatewayState:
         env_state = self._envs.get(env)
         return env_state.backing_ports.get(service) if env_state else None
 
+    def forget_env(self, env: str) -> bool:
+        """Drop this env's compiled policy and routing table. Returns whether
+        there was one.
+
+        `/envs/rm`'s half of the symmetry: every other per-env thing odin holds
+        lives in a file under `.odin/<env>/` and goes away with the directory,
+        but this one is IN MEMORY for the life of the process. Left behind, a
+        later env of the same name would answer AWS calls out of the removed
+        env's routing table until its first reconciler tick rebuilt it -- a
+        stale `backing_port` pointing at a container that no longer exists."""
+        return self._envs.pop(env, None) is not None
+
 
 def _strip(headers: dict[str, str], drop: set[str]) -> dict[str, str]:
     return {k: v for k, v in headers.items() if k.lower() not in drop}

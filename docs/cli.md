@@ -21,6 +21,38 @@ env's own canvas, and `odin canvas get --env staging` prints the same document
 the browser shows you there. `odin envs` lists the envs that have had something
 applied, and answers `default` on a store where nothing ever has.
 
+**`odin env rm <name>` removes one.** `odin destroy --env X` is a *teardown*: it
+deletes the resources and deliberately keeps the environment, because its desired
+state is what makes a retry possible and its reconciler is what converges the next
+apply. `odin env rm` is the *decommission*: the same teardown, and then the
+environment — `.odin/<name>/` (canvas, every Stack revision, `world.json`, the
+event log, the tofu workspace, the gateway sidecars, `keys.json`), the credentials
+that keystore issued, the in-memory gateway routing table and synth records, the
+reconciler, and its entry in `odin envs`. Not undoable: `odin export --env <name>`
+first if you might want it back.
+
+It reports whether the environment is **gone**, not whether it tried, and no
+failure deletes anything — `.odin/<name>/` is still there afterwards in every
+row below, so a retry starts clean rather than half-done. (In the one case where
+the *delete itself* fails, the reconciler has already been stopped and the env
+de-registered; the table says which.)
+
+| status | exit | what it means |
+| ------ | ---- | ------------- |
+| `removed` | 0 | teardown succeeded, the loop's task really ended, no container of this env's is left, and the directory is gone |
+| `not_found` | 0 | the env never existed — nothing was removed, and nothing was created |
+| `remove_refused` | 1 | a tofu run holds this env, or the name does not resolve to a directory under the store. Nothing was read, written or deleted |
+| `remove_failed_teardown` | 1 | the teardown failed; `teardown` carries its whole report, tofu tail included |
+| `remove_failed_loop_running` | 1 | the reconciler was asked to stop and its task had not finished. Deleting the state under a live loop would let it re-create `world.json` and real containers inside the directory being deleted |
+| `remove_failed_containers_standing` | 1 | the teardown reported success and a container of this env's is still up; `still_standing.containers` names them |
+| `remove_unverified` | 1 | odin could not list the machine's containers, so it cannot say this env left none behind — and will not call a removal complete on a half it could not read |
+| `remove_failed_state_survives` | 1 | the directory still exists after odin deleted it (the one case where the loop *has* been stopped and the env *is* de-registered) |
+| `remove_failed` | 1 | a removal that reported no outcome at all: an odin bug, reported as a failure rather than assumed to have worked |
+
+The last row is the shape rather than a case: the status is looked up from a map
+of outcomes, so a branch added later that forgets to report one fails loudly
+instead of inheriting a success.
+
 **`odin start`** backgrounds the server but does not return until it answers `GET
 /health`, so `odin start && odin apply` works on the first try. If the server dies
 on the way up or does not answer within two minutes, it says which, prints the tail

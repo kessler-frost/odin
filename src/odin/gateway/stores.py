@@ -118,6 +118,19 @@ class JsonStore:
             self._persist_locked(env)
             return new_value
 
+    def forget_env(self, env: str) -> bool:
+        """Drop this env's cached contents (and its lock) without writing.
+        Returns whether anything was cached.
+
+        `/envs/rm` deletes `.odin/<env>/gateway/<name>.json` outright, and this
+        is what stops the deletion being invisible: `_data` caches the parsed
+        dict in `_loaded` FOREVER (there is no invalidation anywhere else in
+        this class), so a later env of the same name would be served the removed
+        env's records out of memory and, on its first `set`, persist them back
+        to a file that had been deleted."""
+        self._locks.pop(env, None)
+        return self._loaded.pop(env, None) is not None
+
     def _lock_for(self, env: str) -> threading.Lock:
         with self._locks_guard:
             return self._locks.setdefault(env, threading.Lock())
@@ -299,3 +312,17 @@ class SynthStores:
         self.cachectl = JsonStore(root, "cachectl")
         self.rdsctl = JsonStore(root, "rdsctl")
         self.elbv2ctl = JsonStore(root, "elbv2ctl")
+
+    def forget_env(self, env: str) -> list[str]:
+        """Drop every store's cached copy of `env`. Returns the store names that
+        held one.
+
+        DERIVED from the attributes, never a hand-written list: this class has
+        grown from four stores to sixteen, one service at a time, and a
+        removal that named them individually would silently miss the
+        seventeenth. `vars(self)` also skips `root`, which is a Path, not a
+        store."""
+        return sorted(
+            name for name, store in vars(self).items()
+            if isinstance(store, JsonStore) and store.forget_env(env)
+        )
