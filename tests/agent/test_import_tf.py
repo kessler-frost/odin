@@ -1111,6 +1111,12 @@ _EVERY_KIND_CANVAS = {
         {"id": "n8", "type": "rds", "data": {"label": "app-db"}},
         {"id": "n9", "type": "sns", "data": {"label": "alerts"}},
         {"id": "n10", "type": "sqs", "data": {"label": "jobs"}},
+        # v0.8.4: `ecs` was missing from a canvas named EVERY_KIND, so the four
+        # `_FIXED_VALUES` claims about an `aws_ecs_service` had nothing to be
+        # checked against -- the test below said so the moment they were added,
+        # which is exactly what it is for.
+        {"id": "n11", "type": "ecs", "data": {"label": "api", "image": "nginx:alpine",
+                                              "count": "2", "port": "8080"}},
     ],
     "edges": [{"id": "e1", "source": "n9", "target": "n10"}],
 }

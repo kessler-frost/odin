@@ -29,6 +29,7 @@ Two modes (research-verified, docs/superpowers/research/research-tofu-provider.m
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import tempfile
@@ -79,7 +80,16 @@ _KIND = {
     # back to. Its optional SSH key lives on a companion `aws_key_pair`, folded
     # back on below rather than becoming a node of its own.
     "aws_instance": "ec2",
+    # v0.8.4: one canvas `ecs` node is THREE tf resources (service + task
+    # definition + the shared cluster), so only the SERVICE becomes a node --
+    # the other two fold on, the same shape as the alb trio.
+    "aws_ecs_service": "ecs",
 }
+# Neither of these becomes a node. The task definition folds onto its service
+# (image/port/memory/cpu live there, not on the service); the cluster is a
+# singleton odin always emits exactly one of, named "odin", so importing it would
+# invent a node the canvas has no kind for.
+_ECS_COMPANION_TYPES = ("aws_ecs_task_definition", "aws_ecs_cluster")
 # W2.5: the two OTHER types an `alb` canvas node expands to. Neither becomes a
 # node of its own -- they fold ONTO the alb node the same way
 # aws_secretsmanager_secret_version folds onto its secret, which is what makes
@@ -97,6 +107,7 @@ _NAME_ATTR = {
     "aws_db_instance": "identifier",
     "aws_lb": "name",
     "aws_security_group": "name", "aws_ecr_repository": "name",
+    "aws_ecs_service": "name",
 }
 # canvas kind -> aws_* type, for mode (b) (the inverse of `_KIND`). iam_role,
 # logs, secret and ssm have no backing to enumerate live resources from (all
@@ -121,7 +132,9 @@ _NAME_ATTR = {
 # how a live import would generate a bogus import block and fail at apply.
 # `ec2` is out for the same reason as `sg`: an instance's live import id is its
 # `i-...` InstanceId, minted at RunInstances and absent from any canvas.
-_NO_LIVE_IMPORT = {"iam_role", "logs", "secret", "ssm", "elasticache", "alb", "sg", "ecr", "ec2"}
+# `ecs` is out for the alb reason rather than the id reason: one canvas node is
+# three tf resources, so there is no single live resource to import it from.
+_NO_LIVE_IMPORT = {"iam_role", "logs", "secret", "ssm", "elasticache", "alb", "sg", "ecr", "ec2", "ecs"}
 _TF_TYPE = {kind: rtype for rtype, kind in _KIND.items() if kind not in _NO_LIVE_IMPORT}
 
 # The HCL arguments each kind CARRIES into the canvas -- so a round-trip through
@@ -193,6 +206,16 @@ _CARRIED_ATTRS = {
     # aws_key_pair whose `public_key` is the real value.
     "ec2": {"ami", "instance_type", "subnet_id", "vpc_security_group_ids",
             "key_name", "user_data", "tags"},
+    # `depends_on` is carried in the sense that odin RE-DERIVES it from the
+    # node's own `${{...}}` refs, so it is never a dropped argument -- but see
+    # `_stamp_ecs_taskdef`: the refs themselves are not in the HCL at all and
+    # cannot come back, which is reported rather than left to be discovered.
+    "ecs": {
+        "name", "cluster", "task_definition", "desired_count", "launch_type",
+        "wait_for_steady_state", "deployment_minimum_healthy_percent",
+        "deployment_maximum_percent", "timeouts", "placement_constraints",
+        "depends_on", "load_balancer", "tags",
+    },
 }
 # The companion resources' equivalent: which of THEIR arguments a round trip
 # reproduces (hcl.py's alb companion pass emits exactly these). Until v0.7.1
@@ -237,6 +260,14 @@ _FIXED_VALUES = {
     ("aws_lb_listener", "protocol"): "http",
     ("aws_sns_topic_subscription", "protocol"): "sqs",
     ("aws_sns_topic_subscription", "raw_message_delivery"): "true",
+    # odin emits all four of these unconditionally (`hcl.py::_ecs`), and the
+    # rolling-update pair is load-bearing: `_ECS_MIN_HEALTHY_PERCENT = 100` is
+    # what keeps the previous revision serving while a new one comes up, so a
+    # source that lowered it comes back with different rollout behaviour.
+    ("ecs", "launch_type"): "ec2",
+    ("ecs", "wait_for_steady_state"): "true",
+    ("ecs", "deployment_minimum_healthy_percent"): "100",
+    ("ecs", "deployment_maximum_percent"): "200",
 }
 # The default odin's `_node_data` falls back to when a NUMERIC argument's source
 # value isn't a literal number odin can read (`allocated_storage = var.size`,
@@ -263,7 +294,7 @@ _UNREADABLE_NUMBERS = {
 # node carries -- not a warning about losing them.
 # Every builder in hcl.py appends `_tags_block(res)`, so user tags round-trip
 # for every kind -- these are the ones whose tags are read BACK into `data.tags`.
-_TAGGED_KINDS = {"s3", "logs", "secret", "ssm", "rds", "alb", "vpc", "subnet", "elasticache", "sg", "ecr", "ec2"}
+_TAGGED_KINDS = {"s3", "logs", "secret", "ssm", "rds", "alb", "vpc", "subnet", "elasticache", "sg", "ecr", "ec2", "ecs"}
 _CONTAINER_KINDS = ("vpc", "subnet")
 
 # Canvas geometry for the layout pass. These ARE the UI's own container sizes
@@ -586,6 +617,10 @@ def _node_data(kind: str, label: str, attrs: dict) -> dict:
         node_type = hcl.unquote(attrs.get("node_type"))
         if isinstance(node_type, str):
             data["nodeType"] = node_type
+    if kind == "ecs":
+        count = _int_text(attrs.get("desired_count"))
+        if count is not None:
+            data["count"] = count
     if kind == "ec2":
         # `userData` is carried verbatim, and that is a deliberate trust
         # decision, not an oversight: it is a shell script odin will run on a
@@ -678,6 +713,120 @@ def _ingress_rule_line(block: dict, by_hcl_name: dict[str, str]) -> str | None:
         None,
     )
     return f"{protocol}:{from_port}:{source}" if source else None
+
+
+_ODIN_PLACEMENT_PREFIX = "attribute:odin.instance == "
+
+
+def _placement_host(attrs: dict) -> str | None:
+    """The EC2 node a service's tasks were pinned to, out of its real
+    `placement_constraints { type = "memberOf" }`.
+
+    This is the owner's "an ecs box inside an ec2 box means ecs ON ec2" gesture
+    as it survives Terraform, so losing it on import would silently move a
+    workload back onto the shared host -- a different machine, with different
+    memory, reported as a clean import.
+    """
+    for block in attrs.get("placement_constraints") or []:
+        expression = hcl.unquote(block.get("expression"))
+        if isinstance(expression, str) and expression.startswith(_ODIN_PLACEMENT_PREFIX):
+            return expression[len(_ODIN_PLACEMENT_PREFIX):].strip() or None
+    return None
+
+
+def _container_definition(taskdef: dict) -> dict:
+    """The single container out of a task definition's `container_definitions`.
+
+    It is a JSON STRING literal in the HCL, so this needs `unquote` to be a REAL
+    inverse of `quote` -- which it only became in this same release. With the old
+    quote-stripping version the escaped inner quotes survived and `json.loads`
+    could not read it at all.
+    """
+    raw = hcl.unquote(taskdef.get("container_definitions"))
+    if not isinstance(raw, str):
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return parsed[0] if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict) else {}
+
+
+def _stamp_ecs_taskdef(
+    node_by_label: dict[str, dict], attrs_by_label: dict[str, dict], by_hcl_name: dict[str, str],
+    taskdefs: dict[str, dict],
+) -> list[str]:
+    """Fold each service's task definition back onto its node, and say what a
+    round trip cannot bring with it.
+
+    `image`, `port`, `memory` and `cpu` are all on the TASK DEFINITION, not the
+    service, so without this the node comes back with a default image and no
+    resources -- an nginx placeholder where the user's own container was.
+
+    THE WIRING IS THE HONEST GAP, and it is not this importer's doing: a
+    workload's `${{db.DATABASE_URL}}` refs are deliberately NEVER interpolated
+    into the HCL (`hcl.py`'s `_WIRED_KINDS` note -- a resolved DATABASE_URL
+    carries the database password, so writing it into the generated config would
+    put a credential in `terraform.tfstate` in plaintext AND drift on every
+    plan). Only `depends_on` survives, which names WHICH producers the service
+    consumed but not which variable or attribute. So the ordering round-trips and
+    the values cannot, and an imported service will start with no configuration
+    it did not have on the canvas. `depends_on` is used to name the producers in
+    the warning, which is the most an import can honestly offer here.
+    """
+    warnings: list[str] = []
+    for label, node in node_by_label.items():
+        if node["type"] != "ecs":
+            continue
+        attrs = attrs_by_label[label]
+
+        target = _ref_target(attrs.get("task_definition"))
+        taskdef = taskdefs.get(target or "", {})
+        if not taskdef:
+            warnings.append(
+                f"{label} (ecs): its `task_definition` names no imported aws_ecs_task_definition, so "
+                "the service comes back with odin's DEFAULT image and no port -- not the container "
+                "it was running"
+            )
+        container = _container_definition(taskdef)
+        image = container.get("image")
+        if isinstance(image, str):
+            node["data"]["image"] = image
+        ports = container.get("portMappings") or []
+        port = ports[0].get("containerPort") if ports and isinstance(ports[0], dict) else None
+        if port is not None:
+            node["data"]["port"] = str(port)
+        for attr, field in (("memory", "memory"), ("cpu", "cpu")):
+            value = _int_text(taskdef.get(attr))
+            if value is not None:
+                node["data"][field] = value
+
+        host = _placement_host(attrs)
+        if host:
+            node["data"]["host"] = host
+
+        # A `depends_on` entry parses as `'${aws_db_instance.app_db}'` -- an
+        # interpolation wrapper around the `<type>.<name>` key `by_hcl_name` is
+        # keyed by, and with NO attribute suffix, unlike every other reference in
+        # this file. So neither `_ref_target` (which pulls the NAME out of
+        # `${aws_x.y.arn}`) nor the raw string resolves it: the first draft used
+        # each in turn and the warning named "resources this file does not
+        # define" for a database sitting right there in the same file. Printed the
+        # real parsed value rather than reasoning about it a third time.
+        producers = [
+            found for value in (attrs.get("depends_on") or [])
+            if (found := by_hcl_name.get(str(value).strip().removeprefix("${").removesuffix("}")))
+        ]
+        warnings += [] if not attrs.get("depends_on") else [
+            f"{label} (ecs): its canvas wiring cannot be imported -- a `${{{{producer.ATTR}}}}` env "
+            "reference is deliberately never written into the generated Terraform (it would put a "
+            "resolved password into tfstate). NEITHER the values NOR the ordering survive: odin "
+            "re-derives `depends_on` FROM those refs, so a re-generated project has no ordering "
+            f"either. This service depended on "
+            f"{', '.join(producers) or 'resources this file does not define'}; re-add the env "
+            "references it consumed."
+        ]
+    return warnings
 
 
 def _stamp_ec2_wiring(
@@ -916,6 +1065,7 @@ def parse_hcl(files: dict[str, str]) -> ImportResult:
     secret_versions: list[tuple[str, dict]] = []
     alb_companions: list[tuple[str, str, dict]] = []
     key_pairs: dict[str, dict] = {}
+    taskdefs: dict[str, dict] = {}
     node_by_label: dict[str, dict] = {}
     attrs_by_label: dict[str, dict] = {}
     index = 0
@@ -929,6 +1079,12 @@ def parse_hcl(files: dict[str, str]) -> ImportResult:
             continue
         if rtype in _ALB_COMPANION_TYPES:
             alb_companions.append((rtype, rname, attrs))
+            continue
+        if rtype in _ECS_COMPANION_TYPES:
+            # The task definition folds onto its service; the cluster is a
+            # singleton odin always emits and the canvas has no kind for.
+            if rtype == "aws_ecs_task_definition":
+                taskdefs[rname] = attrs
             continue
         if rtype == "aws_key_pair":
             # A COMPANION, like a secret version: it folds onto the instance that
@@ -1045,6 +1201,7 @@ def parse_hcl(files: dict[str, str]) -> ImportResult:
     warnings += _stamp_containment(node_by_label, attrs_by_label, by_hcl_name)
     warnings += _stamp_sg_rules(node_by_label, attrs_by_label, by_hcl_name)
     warnings += _stamp_ec2_wiring(node_by_label, attrs_by_label, by_hcl_name, key_pairs)
+    warnings += _stamp_ecs_taskdef(node_by_label, attrs_by_label, by_hcl_name, taskdefs)
     _layout(nodes)
 
     edges: list[dict] = []
