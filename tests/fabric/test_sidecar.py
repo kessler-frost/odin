@@ -506,3 +506,65 @@ async def test_ensure_never_raises_when_the_runtime_explodes(tmp_path):
             raise RuntimeError("no /dev/net/tun")
 
     assert await _sidecar(tmp_path, Exploding()).ensure(TARGET, MEMBER) is None
+
+
+# --- "the join failed" must be distinguishable from "there is no mesh" -------
+#
+# `ensure()` returns None for three different truths, and collapsing them is
+# honesty rule 2: a hard AttributeError in the join once surfaced to the user
+# as a decorative security group -- the mesh was never joined, the firewall
+# gated nothing, and every layer above reported success. `ensure()` still must
+# not raise, so the reason is RECORDED rather than thrown.
+
+async def test_no_mesh_drawn_is_not_recorded_as_a_failure(tmp_path):
+    sidecar = MeshSidecar(FakeRuntime(), "e", tmp_path)
+    assert sidecar.enabled() is False
+    assert await sidecar.ensure("c", "m") is None
+    assert sidecar.last_failure is None, "an absent mesh is an absence, not a failure"
+
+
+async def test_a_blown_up_join_records_why(tmp_path, monkeypatch):
+    sidecar = MeshSidecar(FakeRuntime(), "e", tmp_path)
+    monkeypatch.setattr(type(sidecar), "enabled", lambda self: True)
+
+    async def boom(*a, **k):
+        raise AttributeError("'coroutine' object has no attribute 'strip'")
+
+    monkeypatch.setattr(type(sidecar), "_join", boom)
+    assert await sidecar.ensure("c", "m") is None
+    assert sidecar.last_failure is not None, "a failed join must be reportable, not silent"
+    assert "AttributeError" in sidecar.last_failure
+    assert "strip" in sidecar.last_failure
+
+
+async def test_an_uninitialised_overlay_says_so(tmp_path, monkeypatch):
+    """The third case: enabled, no exception, but no overlay recorded yet."""
+    sidecar = MeshSidecar(FakeRuntime(), "e", tmp_path)
+    monkeypatch.setattr(type(sidecar), "enabled", lambda self: True)
+
+    async def no_overlay(*a, **k):
+        return None
+
+    monkeypatch.setattr(type(sidecar), "_join", no_overlay)
+    assert await sidecar.ensure("c", "m") is None
+    assert sidecar.last_failure is not None
+    assert "overlay" in sidecar.last_failure
+
+
+async def test_a_successful_join_clears_a_previous_failure(tmp_path, monkeypatch):
+    sidecar = MeshSidecar(FakeRuntime(), "e", tmp_path)
+    monkeypatch.setattr(type(sidecar), "enabled", lambda self: True)
+
+    async def boom(*a, **k):
+        raise RuntimeError("nope")
+
+    monkeypatch.setattr(type(sidecar), "_join", boom)
+    await sidecar.ensure("c", "m")
+    assert sidecar.last_failure is not None
+
+    async def joined(*a, **k):
+        return "10.42.0.7"
+
+    monkeypatch.setattr(type(sidecar), "_join", joined)
+    assert await sidecar.ensure("c", "m") == "10.42.0.7"
+    assert sidecar.last_failure is None, "a stale failure outliving its fix is a caveat that lies"
