@@ -1255,6 +1255,29 @@ index-to-index deletion on this file.
   save-side fix may carry a baked height, which now renders instead of being
   re-derived -- visible, and one drag from fixed.
 
+- [~] **Placement's four costs: two closed, two open.** `docs/intelligence-layer.md`
+  named them when placement was designed, and shipping it did not address them.
+
+  * **Ordering — CLOSED.** Nothing sequenced an ecs node behind its ec2 node,
+    and a container cannot launch into a VM that is not up. A placed service now
+    emits `depends_on = [aws_instance.<host>]`, so tofu owns the ordering and it
+    is visible in `plan` rather than being an invisible sleep in the gateway.
+    Combines correctly with ref-derived dependencies.
+  * **Failure meaning — CLOSED.** "the VM is not up" and "the task failed" read
+    identically before: both surfaced as a raw `limactl shell ... failed`. They
+    need OPPOSITE responses from a person -- bring the instance back, versus fix
+    the workload -- so a placed task's failure now names the instance and says
+    the workload can only run once it is up, while keeping the underlying cause.
+    An unplaced task's message is byte-for-byte unchanged.
+  * **Capacity — OPEN.** A VM has finite memory and several tasks placed in one
+    instance can exhaust it. Real ECS answers this with capacity providers. The
+    parked app layer (`app-layer-parked`) had a memory-aware scheduler that is
+    the nearest prior art and is worth reading before inventing another.
+  * **Naming — OPEN (documentation, not code).** `LimaRuntime` now means two
+    things depending on its `vm`: odin's shared VM-isolation mode, and a
+    specific EC2 instance. Distinguished by the name today; worth a clearer
+    split if a third meaning appears.
+
 - [ ] **Placement that infers intent from geometry.** The general form of the
   first item: what a person expresses by putting one thing inside, next to, or
   overlapping another. Containment is the first and clearest case; adjacency

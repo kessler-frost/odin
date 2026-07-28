@@ -60,8 +60,14 @@ class TaskRuntime:
     same seam FunctionRuntime/InstanceVm use, so a test can inject a fake
     runtime with no real Docker involved)."""
 
-    def __init__(self, runtime=None) -> None:
+    def __init__(self, runtime=None, placed_on: str = "") -> None:
         self._rt = runtime or ColimaRuntime()
+        # The EC2 instance this runtime was bound to, if any. Used ONLY to
+        # phrase failures -- see `run`. `docs/intelligence-layer.md` named this
+        # as one of placement's four costs: "the VM is not up" and "the task
+        # failed" must not collapse into one status, because they need opposite
+        # responses from a person.
+        self._placed_on = placed_on
 
     async def run(
         self, env: str, task_id: str, container_def: dict, extra_env: dict[str, str] | None = None,
@@ -89,12 +95,30 @@ class TaskRuntime:
         if extra_env:
             env_vars.update(extra_env)
         ports = {pm["containerPort"]: pm.get("hostPort") or 0 for pm in container_def.get("portMappings") or []}
-        await self._rt.run_container(ContainerSpec(
+        spec = ContainerSpec(
             name=name, image=container_def["image"], env=env_vars, ports=ports,
             command=tuple(container_def.get("command") or []),
             labels={"odin-env": env, "odin-ecs-task": task_id},
             memory_mib=_memory_mib(memory), cpus=_cpus(cpu),
-        ))
+        )
+        if not self._placed_on:
+            await self._rt.run_container(spec)
+        else:
+            # A PLACED task runs inside its instance's VM, so a failure here has
+            # two very different causes and they must not read alike: the
+            # workload is broken (bad image, bad command), or the instance it
+            # was drawn inside is not up. The second is not a task failure at
+            # all -- the user's fix is to bring the instance back, not to touch
+            # the workload -- so it says which instance, in the message that
+            # becomes the task's terminal STOPPED reason.
+            try:
+                await self._rt.run_container(spec)
+            except Exception as exc:  # noqa: BLE001 -- re-raised, only re-phrased
+                raise RuntimeError(
+                    f"could not start this task on the {self._placed_on!r} instance: {exc}. "
+                    f"The workload is drawn inside that instance, so it can only run once the "
+                    f"instance is up -- check it before changing the task."
+                ) from exc
         host_ports = {cport: await self._rt.host_port(name, cport) for cport in ports}
         return TaskContainerHandle(name=name, host_ports=host_ports)
 

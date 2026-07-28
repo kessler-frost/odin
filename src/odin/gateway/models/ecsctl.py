@@ -1060,7 +1060,7 @@ def runtime_for_service(service: dict, default: TaskRuntime) -> TaskRuntime:
     host = placement_host(service)
     if not host:
         return default
-    return TaskRuntime(runtime=LimaRuntime(vm=vm_name(service.get("env", ""), host)))
+    return TaskRuntime(runtime=LimaRuntime(vm=vm_name(service.get("env", ""), host)), placed_on=host)
 
 
 async def converge_services(
