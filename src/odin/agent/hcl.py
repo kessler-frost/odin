@@ -1371,8 +1371,26 @@ def generate_tf(stack: Stack) -> TfProject:
             continue
         container_json = quote(json.dumps(_ecs_container_definitions(res)))
         nested = f"  container_definitions = {container_json}"
+        # `cpu`/`memory` only when the canvas actually says so. odin ENFORCES
+        # memory -- `compute/tasks.py::_memory_mib` turns the taskdef's value
+        # into the container's hard cap -- and until now nothing emitted it, so
+        # every task ran at the 512 MiB fallback and a container needing more
+        # was OOM-killed with no field to say otherwise. The gateway already
+        # carried both (`ecsctl` stores them from RegisterTaskDefinition and
+        # passes them to `run_task`); this was the missing first link.
+        #
+        # ABSENT rather than an explicit 512 when unset: writing the default
+        # into the HCL would freeze it into every canvas ever applied, so
+        # changing the default later would silently not reach them.
+        # `_memory_mib(None)` supplies it at the point that enforces it.
+        sized = {
+            key: quote(value)
+            for key in ("cpu", "memory")
+            if (value := _field(res, key, "").strip())
+        }
         attrs = {
             "family": quote(res.id),
+            **sized,
             "requires_compatibilities": '["EC2"]',
             "network_mode": quote("bridge"),
         }

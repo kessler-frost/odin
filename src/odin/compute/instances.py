@@ -122,6 +122,31 @@ log = logging.getLogger("odin.compute.instances")
 
 _SLIRP_PREFIX = "192.168.5."  # Lima's built-in user-mode network -- never host-reachable
 BOOT_TIMEOUT = 300.0
+_BOOT_TIMEOUT_ENV = "ODIN_BOOT_TIMEOUT"
+
+
+def boot_timeout() -> float:
+    """How long a VM may take to report a running guest, in seconds.
+
+    300s is generous for a healthy boot -- the nebula mesh e2e boots two VMs
+    and finishes ENTIRELY in 74.6s on an idle machine. It is not generous on a
+    busy one. Measured at the tail of a 57-minute integration suite (dozens of
+    VMs and containers created and destroyed before it), a VM reached
+    `[VZ] - vm state change: running` in one second and then never signalled a
+    running guest: `limactl start --timeout=300s` gave up at exactly 300s, the
+    instance went `terminated`, and the whole apply failed with it.
+
+    So the ceiling is real work-in-progress, not a bug -- but a hard constant
+    left a user on a loaded Mac with no recourse at all, which is the part
+    worth fixing. Read per call (never at import) so it can be raised for one
+    slow run without a restart, matching `rdsctl.available_timeout()` and
+    `simulate/runner.py`'s own timeout knob.
+
+    The default deliberately does NOT move. Raising it for everyone would make
+    a genuinely hung boot take longer to report, and a slow boot and a dead one
+    look identical until the clock runs out.
+    """
+    return float(os.environ.get(_BOOT_TIMEOUT_ENV, BOOT_TIMEOUT))
 
 
 def _default_max_concurrent_boots() -> int:
@@ -433,7 +458,7 @@ class InstanceVm:
         ssh_pubkey: str | None = None,
         user_data: str | None = None,
         nebula: NebulaJoin | None = None,
-        timeout: float = BOOT_TIMEOUT,
+        timeout: float | None = None,
         env_vars: dict[str, str] | None = None,
     ) -> str:
         """Create + start a fresh VM, wait for its vzNAT IP, return it.
@@ -442,6 +467,7 @@ class InstanceVm:
         StateReason, never a silent hang. `env_vars` (the workload's gateway
         identity, see `gateway/keys.py::workload_env`) is baked into the
         VM's cloud-init -- /etc/environment + ~/.aws/credentials."""
+        timeout = timeout or boot_timeout()
         extra = _extra_provision_script(await self._nebula_files(nebula), user_data)
         script = generate_cloud_init(
             hostname=hostname, ssh_pubkey=ssh_pubkey, extra_script=extra, env_vars=env_vars,
@@ -734,12 +760,19 @@ class InstanceVm:
             # loop, where a blocking sleep freezes the reconciler and the
             # gateway together for the whole interval.
             await asyncio.sleep(self._poll_interval)
-        raise TimeoutError(f"{name} did not report a reachable IP within {timeout}s")
+        # Name the knob IN the failure: this message is the only place a user
+        # meets the ceiling, and a timeout they cannot find the dial for reads
+        # as odin being broken rather than busy.
+        raise TimeoutError(
+            f"{name} did not report a reachable IP within {timeout}s "
+            f"(raise {_BOOT_TIMEOUT_ENV} if this Mac is just slow or loaded)"
+        )
 
     async def stop(self, name: str) -> None:
         await self._lima("stop", name, check=False)
 
-    async def start(self, name: str, timeout: float = BOOT_TIMEOUT) -> str:
+    async def start(self, name: str, timeout: float | None = None) -> str:
+        timeout = timeout or boot_timeout()
         async with self._boot_semaphore:  # same bound as `boot` -- still a real VM start
             await self._lima("start", f"--timeout={int(timeout)}s", name)
         return await self._discover_ip(name, timeout)

@@ -1229,3 +1229,42 @@ def test_a_fault_with_no_recorded_reason_still_says_what_is_known(tmp_path, monk
     ], body
     assert "rds app-db is failed (no reason was recorded on the record" in body["note"]
     assert "(None)" not in body["note"] and "()" not in body["note"]
+
+
+def test_a_recovery_is_disclosed_even_when_an_unrelated_service_fails(tmp_path, monkeypatch):
+    """The disclosure must not be suppressed by someone else's bad news.
+
+    `recovered_resources` first lived inside the `status == "applied"` block, so
+    an ECS shortfall -- which sets `applied_services_unhealthy` earlier and skips
+    everything after it -- silently swallowed the fact that odin had just emptied
+    a database. That is the worst possible moment to drop it: the user is already
+    reading a failure and would have no reason to suspect their data was gone
+    too.
+
+    Note this apply's rds recovery also FAILS (`_DeadPostgresRds`), and the
+    disclosure still fires -- correctly. `create_db` clears the same-name
+    remnant before booting a replacement, so the old data is gone the moment the
+    re-create starts, whether or not the new container ever comes up. The cost
+    does not depend on the outcome; only the health does, and that is reported
+    separately.
+    """
+    monkeypatch.setattr("odin.server.TaskRuntime", _DeadTaskRuntime)
+    monkeypatch.setenv("ODIN_ECS_STEADY_TIMEOUT", "5")
+    _patch_dead_substrates(monkeypatch)
+    _patch_translate(monkeypatch, TranslateResult(files={}, refined=False))
+    app = _app(tmp_path)
+    _seed_broken_service(app)
+    _seed_failed_database(app)
+    with TestClient(app) as client:
+        resp = client.post("/apply-full", json={"nodes": [], "edges": []})
+
+    body = resp.json()
+    assert body["status"] == "applied_services_unhealthy", body
+    assert body["recovered_resources"] == [{
+        "kind": "rds", "node": "app-db", "reason": "container removed outside odin",
+    }], body
+    # BOTH facts reach the one line `odin apply` prints, and the pre-existing
+    # failure keeps its place at the front rather than being overwritten.
+    assert "fix and re-apply" in body["note"], body["note"]
+    assert "app-db was re-created" in body["note"], body["note"]
+    assert "data did not survive" in body["note"], body["note"]

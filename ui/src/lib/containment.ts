@@ -1,9 +1,18 @@
 // Spatial containment — the owner-mandated rule (NORTHSTAR ledger 2026-07-23):
 // "a node drawn inside a VPC/Subnet box BELONGS to it; geometry compiles to
-// infrastructure." Two deliberately different rules (task-v1 brief):
-//   - leaf-in-container: the leaf's CENTER point inside the container's rect;
-//   - subnet-in-vpc: the subnet's FULL rect inside the vpc's rect (a subnet
-//     hanging off the edge of a VPC is not in it).
+// infrastructure."
+//
+// ONE rule for everything: the inner node's FULL rect inside the outer node's
+// rect, compared with `<=`. A box hanging off an edge — by one pixel or by
+// half — is OUTSIDE. That covers leaf-in-container, subnet-in-vpc and
+// ecs-in-ec2 alike; where two containers both qualify, the SMALLEST wins, so
+// nested boxes resolve to the deepest one.
+//
+// (The original task-v1 brief gave leaves a looser CENTER-point rule. It was
+// replaced by the owner's decision on 2026-07-28 — the long comment above the
+// leaf loop below has the reasoning, and this header described the discarded
+// rule for a while after the code stopped implementing it.)
+//
 // Node positions are absolute canvas coordinates — the canvas never uses
 // ReactFlow parent-child nesting (containment is spatial + z-index).
 

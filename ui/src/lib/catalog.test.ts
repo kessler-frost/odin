@@ -16,7 +16,7 @@
 // warns about. Read the real thing and the test breaks when reality moves.
 import { describe, expect, test } from 'bun:test';
 
-import { BUILTINS, CATALOG, PALETTE, catalogByType, catalogIamActions, isPlaceholder } from './catalog';
+import { BUILTINS, CATALOG, PALETTE, catalogByType, catalogFields, catalogIamActions, isPlaceholder } from './catalog';
 
 const TRANSLATE = new URL('../../../src/odin/spec/translate.py', import.meta.url).pathname;
 const MARKER = '(placeholder)';
@@ -176,5 +176,30 @@ describe('every kind a canvas can name has somewhere to render', () => {
     const known = new Set([...CATALOG.map((s) => s.type), ...BUILTINS.map((b) => b.type)]);
     expect(known.has('iam_role')).toBe(true);
     expect(known.has('role')).toBe(false);
+  });
+});
+
+
+// A containment stamp is authored by DRAGGING, and odin acts on it: an ecs
+// node's `host` becomes a real `placement_constraints { memberOf }` and decides
+// which Lima VM the task runs in. The gesture is only honest if the answer is
+// legible -- the containment rule is strict full-rect, so "I dragged it in" and
+// "it went in" are genuinely different states a user must be able to tell apart.
+describe('containment stamps are shown, and never editable', () => {
+  test('the ECS tile surfaces the instance it was drawn into', () => {
+    const host = catalogFields['ecs'].find((f) => f.key === 'host');
+    expect(host).toBeDefined();
+    expect(host!.label).toContain('placement');
+  });
+
+  test('no containment stamp is editable anywhere in the catalog', () => {
+    // Typing one would be a second source of truth that the next drag silently
+    // overwrites -- `withContainment` re-derives these keys from geometry on
+    // every change and would discard whatever was typed, with no warning.
+    const stamps = new Set(['vpc', 'subnet', 'host']);
+    const editable = Object.entries(catalogFields).flatMap(([type, fields]) =>
+      fields.filter((f) => stamps.has(f.key) && f.editable).map((f) => `${type}.${f.key}`),
+    );
+    expect(editable).toEqual([]);
   });
 });

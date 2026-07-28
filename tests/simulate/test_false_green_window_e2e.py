@@ -22,15 +22,38 @@ container dies is the one under test -- the field's exact loop:
 
   1. a healthy resource                    -> applied, exit 0, and PROMPT
   2. kill/remove/pause the container, then
-     apply IMMEDIATELY                     -> FAILS, naming the resource, and
-                                              `/world` is not green for it
-  3. apply again                           -> applied, exit 0, container back
+     apply IMMEDIATELY                     -> that SAME apply re-creates it, SAYS
+                                              what it re-created and what that
+                                              cost, and ends green FOR REAL
 
-Step 3 is as load-bearing as step 2: the fix must not trade a false green for a
-stuck red, and "re-Apply to recreate" has to be true. Note the ORDER -- odin
-reports the death before it recreates anything, because recreating an rds
-container destroys its data and no operator should learn about that from a green
-apply (see reconcile/drift.py's "WHY THE PROJECTION MAY NOT WRITE").
+## THE CONTRACT CHANGED IN v0.8.2, AND THIS FILE NOW ASSERTS THE OPPOSITE
+
+Until v0.8.2 step 2 read "-> FAILS, naming the resource" and a third step applied
+again to recover. That was deliberate and its reason was good: an rds container
+keeps its data on its own writable layer (`PostgresRds.create_db` mounts no
+volume), so re-creating one returns an EMPTY database, and this file's own words
+were that "no operator should learn about that from a green apply".
+
+What the ordering actually produced in the field was worse. The sweep that MARKS
+a container dead ran only after the converges that CLEAR the mark, so the apply
+which discovered a death never repaired it: `/world` said `crashed — re-Apply to
+recreate`, and the re-Apply the user was told to run converged nothing at all.
+Measured end to end, 302.8s of applies against a killed database that never came
+back. odin told the user to do the exact thing they had just done -- the same
+false-report shape one level up.
+
+So the sweep moved BEFORE the converges (recovery in one apply, 302.8s -> 5.9s)
+and the data-loss promise is kept a better way: the apply NAMES what it
+re-created and what that cost (`recovered_resources` + `note`, built by
+`server.py::_recovering_resources`). Green now means the end state holds AND the
+operator was told what happened on the way, instead of green meaning silence.
+
+The false-green guard did NOT move: an apply must still refuse to report success
+when a resource is down and cannot be brought back. Step 2's assertions below
+pin that here -- they require the container to be genuinely running, the record
+`available`/`Active` and `/world` healthy in the SAME apply, so a recovery that
+only claims to have happened fails them. `tests/api/test_apply_full.py` covers
+the unrecoverable case directly, against a substrate that never comes up.
 
 Step 1 also covers "a still-starting resource must not fail an apply": the fresh
 apply that opens each test is exactly that case -- the record is `creating` /
@@ -183,24 +206,32 @@ def test_a_lambda_whose_container_was_removed_fails_the_very_next_apply(
         body, elapsed = _apply(client, LAMBDA_ENV, LAMBDA_CANVAS)
         print(f"[FT5-lambda] FIRST apply after the removal took {elapsed:.1f}s -> {body['status']}")
         assert body["tf"] == {"status": "ok", "exit_code": 0}, body  # tofu had nothing to do
-        assert body["status"] == "applied_resources_unhealthy", body
-        (fault,) = body["unhealthy_resources"]
-        assert (fault["kind"], fault["node"], fault["observed"]) == ("lambda", FN, "Failed"), fault
-        assert "removed outside odin" in fault["reason"], fault
-        assert FN in body["note"], body["note"]
-        # ...and `/world` is not green for it either, in the same breath.
-        observed = _world(client, LAMBDA_ENV, FN)
-        assert observed.get("phase") == "crashed", observed
-        assert "removed outside odin" in (observed.get("verdict") or ""), observed
-
-        # --- 3. ...and the next apply really does recreate it ---------------
-        body, elapsed = _apply(client, LAMBDA_ENV, LAMBDA_CANVAS)
-        print(f"[FT5-lambda] recovery apply took {elapsed:.1f}s -> {body['status']}")
         assert body["status"] == "applied", body
         assert "unhealthy_resources" not in body, body
-        assert _state(rie) == "running", "the recovery apply must actually bring the container back"
+
+        # It SAYS so. A recovery the user is not told about is the v0.8.2
+        # replacement for the old fail-first step, and the whole reason this
+        # apply is allowed to be green.
+        (recovered,) = body["recovered_resources"]
+        assert (recovered["kind"], recovered["node"]) == ("lambda", FN), recovered
+        assert "removed outside odin" in recovered["reason"], recovered
+        assert FN in body["note"] and "re-created" in body["note"], body["note"]
+
+        # ...and it REALLY happened, in this apply, not in a later sweep. These
+        # three are what stop the report above from being a nicer-sounding
+        # false green than the one this file was written for.
+        assert _state(rie) == "running", "the apply claimed a recovery it did not perform"
         assert _record(store_root, LAMBDA_ENV, "lambdactl", f"fn:{FN}")["state"] == "Active"
         assert _world(client, LAMBDA_ENV, FN).get("phase") == "healthy"
+
+        # --- 3. and the apply AFTER a recovery is a clean no-op -------------
+        # The news must not stick around: a second apply has nothing to
+        # re-create, so it must be green AND silent about recoveries.
+        body, elapsed = _apply(client, LAMBDA_ENV, LAMBDA_CANVAS)
+        print(f"[FT5-lambda] apply after the recovery took {elapsed:.1f}s -> {body['status']}")
+        assert body["status"] == "applied", body
+        assert "recovered_resources" not in body, body
+        assert _state(rie) == "running"
 
         _apply(client, LAMBDA_ENV, EMPTY_CANVAS)  # teardown through the product's own path
 
@@ -247,43 +278,48 @@ def test_a_killed_or_paused_database_fails_the_very_next_apply(
         body, elapsed = _apply(client, RDS_ENV, RDS_CANVAS)
         print(f"[FT5-rds] FIRST apply after the kill took {elapsed:.1f}s -> {body['status']}")
         assert body["tf"] == {"status": "ok", "exit_code": 0}, body
-        assert body["status"] == "applied_resources_unhealthy", body
-        (fault,) = body["unhealthy_resources"]
-        assert (fault["kind"], fault["node"], fault["observed"]) == ("rds", DB, "failed"), fault
-        assert "is not running (exit 137)" in fault["reason"], fault
-        assert DB in body["note"], body["note"]
-        observed = _world(client, RDS_ENV, DB)
-        assert observed.get("phase") == "crashed", observed
-        # A dead database must also stop advertising a DATABASE_URL nothing can
-        # connect to -- the stale fact the Fabric would hand a consumer.
-        assert not observed.get("facts"), observed
-
-        # --- 3. the next apply recreates it ---------------------------------
-        body, elapsed = _apply(client, RDS_ENV, RDS_CANVAS)
-        print(f"[FT5-rds] recovery apply took {elapsed:.1f}s -> {body['status']}")
         assert body["status"] == "applied", body
-        assert _state(db) == "running"
-        assert _record(store_root, RDS_ENV, "rdsctl", f"db:{DB}")["status"] == "available"
-        assert _world(client, RDS_ENV, DB).get("phase") == "healthy"
+        assert "unhealthy_resources" not in body, body
 
-        # --- 4. `docker pause`: present, listed, and serving nothing ---------
+        # THE DATA-LOSS DISCLOSURE. This is the assertion that lets the apply
+        # above be green at all: re-creating this container returned an EMPTY
+        # database, and an operator who reads only `note` still learns that.
+        (recovered,) = body["recovered_resources"]
+        assert (recovered["kind"], recovered["node"]) == ("rds", DB), recovered
+        assert "is not running (exit 137)" in recovered["reason"], recovered
+        assert DB in body["note"] and "re-created" in body["note"], body["note"]
+        assert "data did not survive" in body["note"], body["note"]
+
+        # ...and the recovery is real, in this same apply.
+        assert _state(db) == "running", "the apply claimed a recovery it did not perform"
+        assert _record(store_root, RDS_ENV, "rdsctl", f"db:{DB}")["status"] == "available"
+        observed = _world(client, RDS_ENV, DB)
+        assert observed.get("phase") == "healthy", observed
+        # A recovered database advertises a DATABASE_URL again -- and it must be
+        # one that WORKS, not the stale fact the Fabric held while it was dead.
+        assert observed.get("facts"), observed
+
+        # --- 3. `docker pause`: present, listed, and serving nothing ---------
         _docker("pause", db)
         assert _state(db) == "paused"
 
         body, elapsed = _apply(client, RDS_ENV, RDS_CANVAS)
         print(f"[FT5-rds] FIRST apply after the pause took {elapsed:.1f}s -> {body['status']}")
-        assert body["status"] == "applied_resources_unhealthy", body
-        (fault,) = body["unhealthy_resources"]
-        assert (fault["kind"], fault["node"], fault["observed"]) == ("rds", DB, "failed"), fault
-        assert "is paused" in fault["reason"], fault
-        assert _world(client, RDS_ENV, DB).get("phase") == "crashed"
-
-        # ...and it recovers from a pause too (`create_db` clears a same-name
-        # remnant whatever state it is in).
-        body, elapsed = _apply(client, RDS_ENV, RDS_CANVAS)
-        print(f"[FT5-rds] recovery apply after the pause took {elapsed:.1f}s -> {body['status']}")
         assert body["status"] == "applied", body
+        (recovered,) = body["recovered_resources"]
+        assert (recovered["kind"], recovered["node"]) == ("rds", DB), recovered
+        assert "is paused" in recovered["reason"], recovered
+        assert "data did not survive" in body["note"], body["note"]
+        # `create_db` clears a same-name remnant whatever state it is in, so a
+        # paused container recovers exactly like a killed one.
         assert _state(db) == "running"
+        assert _world(client, RDS_ENV, DB).get("phase") == "healthy"
+
+        # --- 4. and the apply after a recovery is a clean, silent no-op ------
+        body, elapsed = _apply(client, RDS_ENV, RDS_CANVAS)
+        print(f"[FT5-rds] apply after the recovery took {elapsed:.1f}s -> {body['status']}")
+        assert body["status"] == "applied", body
+        assert "recovered_resources" not in body, body
 
         _apply(client, RDS_ENV, EMPTY_CANVAS)  # teardown through the product's own path
 

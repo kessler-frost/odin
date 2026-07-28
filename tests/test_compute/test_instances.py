@@ -953,3 +953,74 @@ async def test_a_cert_that_could_not_be_landed_names_the_exit_code_too(tmp_path)
     assert "it wrote nothing to stderr or stdout" in message
     assert "no output" not in message
     assert f"could not land {nebula.host_id}'s re-issued certificate" in message
+
+
+# --- ODIN_BOOT_TIMEOUT ---------------------------------------------------------
+#
+# A knob nobody can verify reaches `limactl` is this repo's honesty rule 1 in its
+# purest form: a setting that reads fine, applies cleanly, and does nothing. The
+# failure it exists for was measured -- at the tail of a 57-minute integration
+# suite a VM reached `[VZ] - vm state change: running` in one second and never
+# signalled a running guest, and `--timeout=300s` gave up at exactly 300s and
+# terminated the instance. Alone on the same machine the whole test took 74.6s.
+
+
+async def test_boot_timeout_defaults_to_300s(monkeypatch):
+    """The default must NOT move: a longer default makes a genuinely hung boot
+    take longer to report, and a slow boot and a dead one are indistinguishable
+    until the clock runs out."""
+    monkeypatch.delenv("ODIN_BOOT_TIMEOUT", raising=False)
+    assert instances.boot_timeout() == 300.0
+
+
+async def test_the_env_override_reaches_the_real_limactl_argument(monkeypatch):
+    """Not `boot_timeout() == 900` -- that only proves the getter parses. This
+    asserts the number arrives on the command line odin actually runs."""
+    monkeypatch.setenv("ODIN_BOOT_TIMEOUT", "900")
+    runner = FakeRunner()
+    runner.responses["hostname -I"] = _Proc(0, "192.168.64.20")
+    vm = InstanceVm(runner=runner)
+
+    await vm.boot(NAME, get_instance_type("t3.micro"), hostname="i-0123456789abcdef0")
+
+    start_call = next(c for c in runner.calls if "start" in c)
+    assert start_call == ["limactl", "start", "--timeout=900s", NAME]
+
+
+async def test_the_override_reaches_start_too(monkeypatch):
+    """`start()` restarts an existing VM (a stopped instance being brought back),
+    a separate call site that had its own hardcoded default."""
+    monkeypatch.setenv("ODIN_BOOT_TIMEOUT", "600")
+    runner = FakeRunner()
+    runner.responses["hostname -I"] = _Proc(0, "192.168.64.20")
+    vm = InstanceVm(runner=runner, poll_interval=0.01)
+
+    await vm.start(NAME)
+
+    start_call = next(c for c in runner.calls if "start" in c)
+    assert start_call == ["limactl", "start", "--timeout=600s", NAME]
+
+
+async def test_the_value_is_read_per_call_not_at_import(monkeypatch):
+    """Read at import, the knob would need a restart to take effect -- which is
+    exactly what a user reaching for it does not have. This module was imported
+    long before `monkeypatch.setenv` ran, so a passing assertion here IS the
+    proof."""
+    monkeypatch.setenv("ODIN_BOOT_TIMEOUT", "450")
+    assert instances.boot_timeout() == 450.0
+    monkeypatch.setenv("ODIN_BOOT_TIMEOUT", "500")
+    assert instances.boot_timeout() == 500.0
+
+
+async def test_an_explicit_argument_still_wins(monkeypatch):
+    """`ec2compute` passes a timeout at one site; the env must not silently
+    override a caller that asked for a specific bound."""
+    monkeypatch.setenv("ODIN_BOOT_TIMEOUT", "900")
+    runner = FakeRunner()
+    runner.responses["hostname -I"] = _Proc(0, "192.168.64.20")
+    vm = InstanceVm(runner=runner, poll_interval=0.01)
+
+    await vm.start(NAME, timeout=30)
+
+    start_call = next(c for c in runner.calls if "start" in c)
+    assert start_call == ["limactl", "start", "--timeout=30s", NAME]

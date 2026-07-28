@@ -18,7 +18,7 @@ function node(
 }
 
 describe('computeContainment', () => {
-  test('leaf center inside a subnet inside a vpc stamps both levels', () => {
+  test('a leaf fully inside a subnet inside a vpc stamps both levels', () => {
     const nodes = [
       node('net', 'vpc', 0, 0, 560, 380),
       node('web', 'subnet', 20, 60, 520, 280),
@@ -71,7 +71,7 @@ describe('computeContainment', () => {
     expect(c['web-sg']).toEqual({ vpc: 'net', subnet: 'web' });
   });
 
-  test('an ec2 node is a leaf like sg -- stamped by center point (V3c)', () => {
+  test('an ec2 node is a leaf like sg -- same full-rect rule (V3c)', () => {
     const nodes = [
       node('net', 'vpc', 0, 0, 560, 380),
       node('web', 'subnet', 20, 60, 520, 280),

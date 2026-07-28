@@ -1297,6 +1297,34 @@ index-to-index deletion on this file.
   and grouping follow. Each inference must be reversible by the opposite
   gesture and must never destroy authored values.
 
+  **INSIDE is done and legible (v0.8.2).** One rule covers every case — the
+  inner node's full rect within the outer's, compared `<=`, deepest container
+  wins — and it compiles: a subnet's `vpc_id`, an SG's `vpc_id`, an EC2's
+  `subnet_id`, and an ECS service's real `placement_constraints { memberOf }`.
+  Reversibility is not an aspiration: `withContainment` drops the three derived
+  keys and re-adds only what geometry still supports, so dragging back out
+  clears the claim, and every other field passes through untouched
+  (`containment.test.ts` pins both directions). v0.8.2 closed the last gap in
+  it — `host` was the one stamp odin ACTED on and never showed, so a box
+  dragged a few pixels short of "fully inside" looked identical to one that
+  landed. It is now a read-only field on the ECS tile, and a test asserts no
+  containment stamp anywhere is editable (typing one would be a second source
+  of truth the next drag silently discards).
+
+  **NEXT TO and OVERLAPPING are deliberately NOT built**, on the same grounds
+  the edge-type selector is not: there is nothing yet for them to mean.
+  Overlapping is already answered — partial containment is OUTSIDE, decided by
+  the owner on 2026-07-28 — and adjacency has no unambiguous reading in odin's
+  model today, because every peer relationship it might stand for (IAM grant,
+  network reach, SG membership) is already carried by an EDGE, which says which
+  one it is. Inventing a meaning for "near" would also break this item's own
+  rule in the worst way: it would make MOVING a node change infrastructure,
+  with no gesture that reads as the opposite of "near".
+
+  The trigger for building it: a gesture users actually perform whose intent is
+  unambiguous and which no edge already expresses. That is a real observation
+  about how people draw, not something to reason out in advance.
+
 - [ ] **Then, and separately: the chat/agent surface.** NORTHSTAR's canvas↔
   Terraform translation agent. Explicitly NOT a replacement for the canvas
   language — an addition to it.

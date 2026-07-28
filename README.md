@@ -543,7 +543,13 @@ prose explanation of a failure, and the evidence it reads is still there in
   forwards to a real backing or answers from its own per-service model store. EC2,
   VPC, SG, IAM, ECR, Lambda and ECS have no open-source AWS API to borrow, so odin
   owns the model and binds it to a real substrate.
-- **Translation** (`src/odin/agent/`) is deterministic in both directions.
+- **Translation** (`src/odin/agent/`) is deterministic in both directions, and
+  the two directions do not cover the same ground. Canvas → Terraform covers
+  every kind odin builds. Terraform → canvas covers 17 resource types today —
+  not `aws_instance`, `aws_ecs_service`/`_task_definition`/`_cluster`,
+  `aws_security_group`, `aws_lambda_function` or `aws_ecr_repository`, which
+  come back as LISTED unsupported entries rather than being silently dropped, so
+  an import tells you exactly what it could not take.
   **Runtime:** real containers via Colima (default) or inside a Lima VM
   (`src/odin/runtime/`), and a real Lima VM per EC2 node (`src/odin/compute/`).
 - **Control loop:** a Spec Store (Stack = desired, World = observed) with a pure,
@@ -615,6 +621,21 @@ prose explanation of a failure, and the evidence it reads is still there in
   and that holds on an import round trip even if your `.tf` said otherwise. It
   keeps `tofu apply` and Apply delivering identically, but it changes what a
   consumer reads.
+- **An RDS container holds its data on its own writable layer** — no volume — so
+  anything that replaces the container returns an **empty** database. That
+  includes odin's own repair: if the container is killed or removed out of band,
+  the next Apply re-creates it, and the database comes back blank. The Apply says
+  so rather than reporting a bare green — `recovered_resources`, and a `note`
+  naming the resource and that *its data did not survive* — but it does not ask
+  first, so treat a dead RDS container as a lost one.
+- **An EC2 VM gets 300s to boot** (`limactl start --timeout`), and that ceiling is
+  real: the two-VM mesh e2e finishes in 74.6s on an idle Mac, but at the tail of a
+  57-minute test run a VM reached the hypervisor's `running` state in one second
+  and never signalled a running guest before the clock ran out — the instance goes
+  `terminated` and the Apply fails with it. Raise `ODIN_BOOT_TIMEOUT` (seconds) on
+  a slow or loaded machine. The default deliberately stays put: a longer one makes
+  a genuinely hung boot take longer to report, and the two look identical until
+  the timeout fires.
 - **RDS** is Terraform-managed (`aws_db_instance` → a real Postgres container)
   and Postgres-only: MySQL or MariaDB is declined with the reason.
   `allocated_storage` and `instance_class` round-trip faithfully but resize

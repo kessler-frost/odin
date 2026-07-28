@@ -188,14 +188,22 @@ function PermissionCheckbox({ action, checked, onChange }: { action: string; che
   );
 }
 
-function EdgeConfigView({ edge, onEdgeUpdate, onCollapse }: { edge: Edge; onEdgeUpdate?: (edgeId: string, data: Record<string, unknown>) => void; onCollapse?: () => void }) {
+function EdgeConfigView({ edge, nodes, onEdgeUpdate, onCollapse }: { edge: Edge; nodes: Node[]; onEdgeUpdate?: (edgeId: string, data: Record<string, unknown>) => void; onCollapse?: () => void }) {
   const panelBase = "bg-bg-secondary border-l border-border-bright p-0 overflow-y-auto h-full";
   const currentType = (edge.data?.edgeType as string) ?? 'network';
   const typeDef = edgeTypes[currentType] ?? edgeTypes.network;
   const isIam = currentType === 'iam';
 
-  const sourceType = edge.source.split('-')[0];
-  const targetType = edge.target.split('-')[0];
+  // The REAL node types, looked up by id. This used to be
+  // `edge.source.split('-')[0]`, which only works while every node id happens to
+  // be `<type>-<n>` -- true of nodes the sidebar creates and false of every
+  // hand-authored canvas, where ids like `web` or `e1` yielded a type of `web`
+  // or `e1` and the panel then offered the wrong edge types and no permissions
+  // at all. A canvas written by hand or by an agent is a first-class input
+  // (`odin canvas set`), so the panel reads what the node actually is.
+  const typeOf = (id: string) => nodes.find((n) => n.id === id)?.type ?? '';
+  const sourceType = typeOf(edge.source);
+  const targetType = typeOf(edge.target);
   const permissions: string[] = (edge.data?.permissions as string[]) ?? [];
 
   // Available edge types for this node pair
@@ -423,7 +431,7 @@ export default function ConfigPanel({ nodes, selectedEdge, allLabels, onNodeUpda
   if (!node || !config || !fields) {
     // Edge config view: show when no node selected but an edge is selected
     if (selectedEdge) {
-      return <EdgeConfigView edge={selectedEdge} onEdgeUpdate={onEdgeUpdate} onCollapse={onCollapse} />;
+      return <EdgeConfigView edge={selectedEdge} nodes={nodes} onEdgeUpdate={onEdgeUpdate} onCollapse={onCollapse} />;
     }
 
     return (
