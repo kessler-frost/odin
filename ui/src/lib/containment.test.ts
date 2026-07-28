@@ -161,3 +161,80 @@ describe('a leaf must be COMPLETELY inside to count as contained', () => {
     expect(result.sg1).toEqual({});
   });
 });
+
+describe('an ecs node drawn inside an ec2 box means ECS-on-that-instance', () => {
+  // Owner's ask: "when I expand the ec2 box and put an ecs box inside it, that
+  // means I want ecs on ec2 ... and the configuration and stuff updates
+  // accordingly if needed but things like name and stuff remains as is."
+  //
+  // In odin this is PLACEMENT, not a launch-type label: an EC2 node is a real
+  // Lima VM and `LimaRuntime` can run containers inside a named one, so the
+  // task can genuinely run in that instance. odin already emits
+  // `launch_type = "EC2"` unconditionally and has no Fargate substrate, so
+  // flipping a label would claim a distinction it cannot back.
+  const instance = () => node('ec2-1', 'ec2', 0, 0, 600, 400, { label: 'api-server' });
+
+  test('fully inside stamps the host instance', () => {
+    const result = computeContainment([instance(), node('ecs-1', 'ecs', 100, 100, 200, 80, { label: 'web' })]);
+    expect(result['ecs-1']).toEqual({ host: 'api-server' });
+  });
+
+  test('partially inside is NOT placed — same strict rule as everything else', () => {
+    // Chosen so the two candidate rules DISAGREE: the box spans 500..700 across
+    // an instance ending at 600, so its centre (600) is still inside while the
+    // box plainly is not. A first version used x=550, whose centre (650) is
+    // outside under either rule -- it passed against centre-point containment
+    // too, and so proved nothing.
+    const result = computeContainment([instance(), node('ecs-1', 'ecs', 500, 100, 200, 80, { label: 'web' })]);
+    expect(result['ecs-1']).toEqual({});
+  });
+
+  test('a workload outside every instance keeps no host', () => {
+    const result = computeContainment([instance(), node('ecs-1', 'ecs', 900, 100, 200, 80, { label: 'web' })]);
+    expect(result['ecs-1']).toEqual({});
+  });
+
+  test('the deepest instance wins when boxes nest', () => {
+    const outer = node('ec2-1', 'ec2', 0, 0, 800, 600, { label: 'big' });
+    const inner = node('ec2-2', 'ec2', 100, 100, 400, 300, { label: 'small' });
+    const result = computeContainment([outer, inner, node('ecs-1', 'ecs', 150, 150, 200, 80, { label: 'web' })]);
+    expect(result['ecs-1']).toEqual({ host: 'small' });
+  });
+
+  test('only ecs is placed this way — an s3 bucket inside an instance is not', () => {
+    const result = computeContainment([instance(), node('s3-1', 's3', 100, 100, 200, 80, { label: 'uploads' })]);
+    expect(result['s3-1'].host).toBeUndefined();
+  });
+});
+
+describe('withContainment never rewrites what the user authored', () => {
+  // The owner's invariant for the whole intelligence layer, and the line
+  // between a language and a trap.
+  const nodes = () => [
+    node('ec2-1', 'ec2', 0, 0, 600, 400, { label: 'api-server' }),
+    node('ecs-1', 'ecs', 100, 100, 200, 80, {
+      label: 'web', image: 'myapp:v2', count: '3', port: '8080',
+    }),
+  ];
+
+  test('placement is stamped and every authored field survives', () => {
+    const [, ecs] = withContainment(nodes());
+    expect(ecs.data).toMatchObject({
+      label: 'web', image: 'myapp:v2', count: '3', port: '8080', host: 'api-server',
+    });
+  });
+
+  test('dragging back OUT clears the placement rather than leaving a stale claim', () => {
+    const placed = withContainment(nodes());
+    const moved = placed.map((n) => (n.id === 'ecs-1' ? { ...n, position: { x: 900, y: 900 } } : n));
+    const [, ecs] = withContainment(moved);
+    expect(ecs.data.host).toBeUndefined();
+    // ...and the authored values are still untouched by the round trip.
+    expect(ecs.data).toMatchObject({ label: 'web', image: 'myapp:v2', count: '3', port: '8080' });
+  });
+
+  test('a node whose containment did not change is returned identically', () => {
+    const once = withContainment(nodes());
+    expect(withContainment(once)).toBe(once);
+  });
+});

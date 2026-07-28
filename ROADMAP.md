@@ -1171,7 +1171,43 @@ while replacing a neighbouring entry, and they were only noticed when the owner
 asked whether they had been forgotten. Recovered from 8a0c89e. Do not use
 index-to-index deletion on this file.
 
-- [ ] **Containment changes configuration, not just labels.** The owner's
+- [x] **Containment changes configuration, not just labels — DONE.** Drawing an
+  ecs box inside an ec2 box now places that workload's tasks INSIDE that
+  instance, end to end:
+
+      canvas gesture   ->  `host` stamped by lib/containment.ts (strict full-rect)
+      spec             ->  carried into the ecs resource's fields
+      terraform        ->  placement_constraints { type = "memberOf",
+                             expression = "attribute:odin.instance == api-server" }
+      gateway          ->  ecsctl reads AWS's own placementConstraints shape
+      runtime          ->  TaskRuntime(LimaRuntime(vm="odin-ec2-prod-api-server"))
+
+  **It is PLACEMENT, not a launch-type label.** The owner's example said "ecs on
+  ec2 instead of fargate", and the honest finding is that odin already emits
+  `launch_type = "EC2"` unconditionally and has NO Fargate substrate -- so
+  flipping that label would have claimed a distinction odin cannot back. Where
+  the task actually runs is the real difference, and an EC2 node is a real Lima
+  VM, so it can be made true.
+
+  Three things it needed:
+  * `LimaRuntime.VM` was a class constant, pointing every caller at the shared
+    `odin-host`. Now per-instance -- the change the design doc predicted would
+    be the unlocking one.
+  * an expanded EC2 box did not SURVIVE a reload (a leaf's stored height is
+    dropped and re-derived from content), so the instance snapped back and the
+    workload fell outside it. `EXPANDABLE_KINDS` keeps a height the user chose
+    without giving every instance a default one.
+  * the node SAYS what happened -- it reads `on api-server`. An inference the
+    user cannot see is a trap, not a language.
+
+  The owner's invariant holds and is tested: name, image, count and port all
+  survive being placed, and dragging back out clears the placement rather than
+  leaving a stale claim.
+
+  Verified live: expanded instance at 248..448, workload at 318..400 inside it,
+  node reads `ECS | web | DRAFT | tasks: 2 | on api-server`, `host` persisted.
+
+- [ ] **~~Containment changes configuration~~ (superseded above).** The owner's
   example: expand an EC2 box, drop an ECS box inside it, and that means **ECS
   on the EC2 launch type rather than Fargate** — which is a real AWS
   distinction (ECS tasks run either on EC2 container instances or on Fargate),

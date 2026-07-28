@@ -40,7 +40,22 @@ export default function ServiceNode({ type, data, selected }: NodeProps) {
         <span className="truncate">{d.label}</span>
         <StatusBadge status={d.status} error={d.error} />
       </div>
-      <NodeMeta rows={[meta]} rgb={c.rgb} />
+      <NodeMeta
+        rows={[
+          meta,
+          // odin SAYS what a gesture did rather than doing it quietly. Drawing
+          // an ecs box inside an ec2 box places its tasks in that instance's own
+          // VM (`lib/containment.ts` stamps `host`), and this is where the canvas
+          // admits it -- an inference the user cannot see is a trap, not a
+          // language.
+          d.host ? (
+            <span className={`${c.text}/70`} title={`tasks run on the ${String(d.host)} instance`}>
+              on {String(d.host)}
+            </span>
+          ) : null,
+        ]}
+        rgb={c.rgb}
+      />
     </div>
   );
 }
