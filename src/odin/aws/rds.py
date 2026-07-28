@@ -3,10 +3,18 @@
 W2.7: this is now the SUBSTRATE of the gateway's RDS model
 (`gateway/models/rdsctl.py`), not the reconciler's own provisioner -- the
 `aws_db_instance` resource `tofu apply` creates is fulfilled by these exact
-calls. Nothing about the container itself changed: the name is still
-`odin-rds-{env}-{db_id}` (load-bearing for cleanup, labels and every test
-that greps for it), the image is still `postgres:16-alpine`, and the host
-port is still ephemeral (`ports={5432: 0}`).
+calls. The name is still `odin-rds-{env}-{db_id}` (load-bearing for cleanup,
+labels and every test that greps for it), the image is still
+`postgres:16-alpine`, and the host port is still ephemeral (`ports={5432: 0}`).
+
+ONE thing about the container did change, in v0.8.14: its PGDATA is a NAMED
+volume (`volume_name`) instead of the image's anonymous one, so replacing the
+container no longer replaces the database. Odin's own repair
+(`rdsctl.converge_db_instances` -> `create_db`) is what made that urgent -- it
+destroys and re-creates the container to fix a crash, and until the volume was
+named that handed the user back an EMPTY database with a green apply. The
+volume is created with the container and removed with `delete_db`, never in
+between.
 """
 from __future__ import annotations
 
@@ -27,6 +35,20 @@ POSTGRES_MAJOR = POSTGRES_IMAGE.split(":")[1].split("-")[0]
 # overlay peer dials, because the mesh sidecar shares this container's network
 # namespace (the host-published port is a separate, ephemeral one).
 POSTGRES_PORT = 5432
+# WHERE the database's bytes live, and therefore what has to sit on a named
+# volume for a container replacement to be non-destructive. Probed off the real
+# image rather than remembered:
+#
+#     $ docker image inspect postgres:16-alpine \
+#         -f '{{json .Config.Volumes}} {{range .Config.Env}}{{.}} {{end}}'
+#     {"/var/lib/postgresql/data":{}} ... PGDATA=/var/lib/postgresql/data ...
+#
+# Note what that first field says: the image ALREADY declares this path a
+# volume, so every rds container odin has ever run had one. It was just an
+# ANONYMOUS volume, which `RuntimeDriver.stop` (`docker rm -f -v`) deletes with
+# the container -- which is exactly why odin's own repair used to hand back an
+# empty database.
+PGDATA = "/var/lib/postgresql/data"
 
 
 def container_name(env: str, db_id: str) -> str:
@@ -37,6 +59,18 @@ def container_name(env: str, db_id: str) -> str:
     `compute/tasks.py::container_name` and `compute/functions.py`'s do for
     their kinds."""
     return f"odin-rds-{env}-{db_id}"
+
+
+def volume_name(env: str, db_id: str) -> str:
+    """The named volume holding THIS database's data, derived from the
+    container name so the pair is legible in `docker volume ls` next to
+    `docker ps` -- `odin-rds-{env}-{db_id}-data`.
+
+    A module function for `container_name`'s reason: callers that hold no
+    `PostgresRds` need it too (`server.py`'s recovery disclosure asks the
+    runtime whether this exact volume is still there before it tells a user
+    their data survived)."""
+    return f"{container_name(env, db_id)}-data"
 
 
 class PostgresRds:
@@ -62,6 +96,9 @@ class PostgresRds:
 
     def container_name(self, db_id: str) -> str:
         return container_name(self._env, db_id)
+
+    def volume_name(self, db_id: str) -> str:
+        return volume_name(self._env, db_id)
 
     def mesh_member(self, db_id: str) -> str:
         """This database's mesh identity == its container name: unique per
@@ -104,12 +141,25 @@ class PostgresRds:
         # what makes `rdsctl.converge_db_instances` able to recover a killed
         # container without a separate teardown step.
         await self._rt.stop(name)
+        # ...and THIS is what makes that recovery non-destructive. The volume
+        # is created before the container and outlives it, so the re-created
+        # container mounts the SAME PGDATA the dead one was using and the
+        # database comes back with its rows. Measured on a real container:
+        # 2 rows written, `docker rm -f -v`, fresh container on this volume,
+        # 2 rows read back. It is also why `POSTGRES_USER`/`POSTGRES_DB` below
+        # are honoured on the FIRST boot only -- the entrypoint skips initdb
+        # when PGDATA is already populated, which is correct: after a
+        # `ModifyDBInstance` password change the volume's own credentials are
+        # the current ones, and `set_password` put them there with a real
+        # `ALTER USER`.
+        await self._rt.create_volume(self.volume_name(db_id))
         await self._rt.run_container(ContainerSpec(
             name=name,
             image=POSTGRES_IMAGE,
             env={"POSTGRES_USER": user, "POSTGRES_PASSWORD": password, "POSTGRES_DB": db_name},
             ports={5432: 0},
             labels={"odin-env": self._env},
+            volumes={self.volume_name(db_id): PGDATA},
         ))
 
     async def delete_db(self, db_id: str) -> None:
@@ -118,6 +168,18 @@ class PostgresRds:
         # honest and makes the "no leftover containers" rule hold.
         await self._mesh.stop(self.container_name(db_id))
         await self._rt.stop(self.container_name(db_id))
+        # The volume goes LAST, and that ordering is load-bearing rather than
+        # tidy: docker refuses to remove a volume a container still references
+        # (probed -- `rc 1: remove <vol>: volume is in use - [<container id>]`),
+        # so removing it first would fail every delete. A DELETE is the one
+        # moment the data is genuinely meant to go: surviving a container
+        # replacement is the point, surviving the resource that owns it would
+        # be a data leak and a disk leak both, on a machine with little
+        # headroom. `remove_volume` raises rather than shrugging, so a volume
+        # that could not be removed fails the delete instead of being reported
+        # as a clean teardown (honesty rule 2) -- `_finish_delete` keeps the
+        # record in `deleting` with the reason, and the next Apply retries.
+        await self._rt.remove_volume(self.volume_name(db_id))
 
     async def endpoint(self, db_id: str) -> tuple[str, int] | None:
         port = await self._rt.host_port(self.container_name(db_id), 5432)

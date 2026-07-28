@@ -88,13 +88,31 @@ They are listed because finding one by surprise is worse than reading it here.
   and that holds on an import round trip even if your `.tf` said otherwise. It
   keeps `tofu apply` and Apply delivering identically, but it changes what a
   consumer reads.
-- **An RDS container holds its data on its own writable layer** — no volume — so
-  anything that replaces the container returns an **empty** database. That
-  includes odin's own repair: if the container is killed or removed out of band,
-  the next Apply re-creates it, and the database comes back blank. The Apply says
-  so rather than reporting a bare green — `recovered_resources`, and a `note`
-  naming the resource and that *its data did not survive* — but it does not ask
-  first, so treat a dead RDS container as a lost one.
+- **An RDS instance's data is a Docker volume and nothing else — there are no
+  snapshots and no backups.** This entry used to say the opposite of its first
+  half: the container held its data on the image's *anonymous* volume, which
+  `docker rm -f -v` deleted with it, so odin's own repair handed back an empty
+  database. Since v0.8.14 each instance gets a **named** volume
+  (`odin-rds-<env>-<node>-data`) that outlives its container, and a repair is
+  non-destructive — measured end to end in `tests/simulate/test_rds_tf_e2e.py`:
+  rows `[42, 43]` written over the published `DATABASE_URL`, `docker kill`, one
+  Apply, the same `[42, 43]` read back. The Apply still discloses the repair
+  (`recovered_resources`, and a `note` naming the resource), and it checks that
+  volume before claiming *its data survived* — remove the volume by hand and the
+  same Apply says *its data did not survive* instead.
+  What remains, and what the fix traded for:
+  - `odin destroy` deletes the volume with the instance, by design, and there is
+    no snapshot to restore from. `odin export` carries control-plane state, not
+    container volumes, so a restored env's database comes back empty.
+  - A repair now REUSES the old data directory, so a genuinely corrupt one is no
+    longer papered over by a fresh container: Postgres refuses to start, the
+    record goes `failed` with the real reason and the Apply reports
+    `applied_resources_unhealthy`. That is the honest outcome, but it does mean
+    `docker volume rm odin-rds-<env>-<node>-data` is the manual step for "give me
+    a blank database back".
+  - Nothing sweeps volumes on a schedule, so a `.odin` store deleted while
+    containers are still up orphans them. `docker volume ls --filter
+    label=odin=1` lists every volume odin made.
 - **An EC2 VM gets 300s to boot** (`limactl start --timeout`), and that ceiling is
   real: the two-VM mesh e2e finishes in 74.6s on an idle Mac, but at the tail of a
   57-minute test run a VM reached the hypervisor's `running` state in one second

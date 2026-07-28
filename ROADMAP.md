@@ -1458,10 +1458,27 @@ index-to-index deletion on this file.
      import without loss, and the gateway now authorizes from THAT — see the
      enforcement-source entry below. What remains is portability, tracked in
      `docs/limits.md`: the `Resource` is odin's node label rather than an ARN.
-  2. **An RDS container keeps no volume**, so odin's own repair returns an empty
-     database. A named volume per instance would survive a container replacement
-     and make the recovery non-destructive, which changes the disclosure in
-     `server.py::_RECOVERY_COST` from a warning into a footnote.
+  2. ~~**An RDS container keeps no volume**, so odin's own repair returns an
+     empty database.~~ CLOSED in v0.8.14. Each instance now has a named volume
+     (`aws/rds.py::volume_name` → `odin-rds-<env>-<node>-data`) mounted at
+     `PGDATA`, created before its container and removed with `delete_db`, so the
+     repair is non-destructive. Measured through the product's own path in
+     `tests/simulate/test_rds_tf_e2e.py`: rows `[42, 43]` written over the
+     published `DATABASE_URL`, `docker kill`, one Apply → the same `[42, 43]`
+     read back; and `docker volume ls` is empty for the env after teardown.
+
+     Two things worth carrying forward. First, the fix was only half a fix
+     without the lifecycle: `docker rm -f -v` deliberately does NOT remove a
+     named volume (probed, and that is exactly what makes the repair work), so
+     every teardown path and every test fixture had to learn to remove it or a
+     Postgres volume would leak on each run. Second, `_RECOVERY_COST` did become
+     a footnote — but a *measured* one. It is keyed `(kind, data_kept)` and
+     `_recovering_resources` reads the real `docker volume ls` in the one
+     instant between the sweep that marks the death and the converge that
+     repairs it, so an instance whose volume was also destroyed still gets the
+     old warning. A static "your data is safe" would have been a guard reading
+     no signal — honesty rule 1, in the direction that reassures rather than
+     alarms. Mutation-tested both ways.
   3. **An ECS service's canvas wiring cannot be imported** — env refs are never
      written into the HCL (a resolved DATABASE_URL carries a password), and
      `depends_on` is re-derived from those refs, so neither survives. Wants a

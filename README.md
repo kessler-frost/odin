@@ -129,9 +129,13 @@ tells you what that cost:
 
 ```
 note: desired state applied; rds app-db was re-created because container
-odin-rds-prod-app-db is not running (exit 137) (its data did not survive —
-the container is new and empty)
+odin-rds-prod-app-db is not running (exit 137) (its data survived — the
+container is new, the volume holding the database is not)
 ```
+
+Each RDS instance keeps its data on a named Docker volume, so a repair replaces
+the container and not the database. Odin checks that volume before it says so,
+and says the opposite when it is gone.
 
 ## Edges are IAM
 
@@ -318,8 +322,9 @@ The ones most likely to matter:
 - **An emitted IAM policy names resources by label, not ARN.** It round-trips
   through odin perfectly; taken to Amazon each policy needs its `Resource`
   rewritten as an ARN.
-- **An RDS container keeps no volume**, so anything that replaces it comes back
-  empty. Odin's own repair says so in the apply output.
+- **An RDS instance has no snapshots and no backups.** Its data survives a
+  container replacement (a named volume), and `odin destroy` deletes it along
+  with the volume — there is nothing to restore from afterwards.
 - **Import is narrower in `--live` mode**, and a live-imported RDS arrives with
   odin's default password, because no AWS API returns one.
 - **Lambda is inline code only**, one version, with no S3-deployed packages.

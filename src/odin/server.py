@@ -34,6 +34,7 @@ from odin.api.debug import create_debug_router
 from odin.api.logs import create_logs_router
 from odin.api.events import SSE_HEADERS, ConnectionManager, event_stream
 from odin.aws.backings import PROVISIONED, BackingAws, BackingUnavailable
+from odin.aws.rds import volume_name as rds_volume_name
 from odin.compute.tasks import TaskRuntime
 from odin.fabric.localhost import LocalhostFabric
 from odin.fabric.nebula import mesh_state, reap_orphaned_lighthouses
@@ -1487,14 +1488,31 @@ def _unhealthy_line(item: dict) -> str:
     return f"{item['kind']} {item['node']} is {item['observed']} ({reason})"
 
 
-# What a recovery COST, per kind. An rds container holds its data on the
-# container's own writable layer -- `aws/rds.py::PostgresRds.create_db` mounts
-# no volume -- so re-creating it returns an EMPTY database. That is the single
-# most important thing an apply can tell someone, and until v0.8.2 it told them
-# nothing at all.
+# What a recovery COST, keyed by (kind, did its data survive?).
+#
+# This used to be a one-line WARNING with no second case, because there was no
+# second case to have: an rds container kept its data on the image's anonymous
+# volume, `RuntimeDriver.stop` (`docker rm -f -v`) deleted it with the
+# container, and re-creating one therefore returned an EMPTY database. v0.8.14
+# gave each instance a NAMED volume (`aws/rds.py::volume_name`) that outlives
+# its container, so the ordinary repair is non-destructive and the sentence is a
+# footnote.
+#
+# It is a footnote that is CHECKED, not assumed. `_recovering_resources` asks
+# the runtime whether that volume is really still there at the one moment the
+# answer matters -- after the sweep marked the database dead and before the
+# converge re-creates it -- so if someone removed the volume too (or an older
+# instance predates the volume entirely), the apply goes back to saying the
+# data is gone. Asserting the good case would be exactly the guard-that-reads-
+# no-signal shape honesty rule 1 is about.
+#
+# `None` is lambda's data_kept: a rebuilt RIE container has no data to keep,
+# and a `(kind, data_kept)` combination this map does not know falls through to
+# a neutral truth rather than inheriting either claim.
 _RECOVERY_COST = {
-    "rds": "its data did not survive — the container is new and empty",
-    "lambda": "its execution environment was rebuilt from the deployed code",
+    ("rds", True): "its data survived — the container is new, the volume holding the database is not",
+    ("rds", False): "its data did not survive — its volume was gone too, so the database is new and empty",
+    ("lambda", None): "its execution environment was rebuilt from the deployed code",
 }
 
 
@@ -1509,13 +1527,11 @@ _ADVICE_SUFFIX = " — re-Apply to recreate"
 
 def _recovered_line(item: dict) -> str:
     cause = (item["reason"] or "").removesuffix(_ADVICE_SUFFIX).rstrip(" —-")
-    return (
-        f"{item['kind']} {item['node']} was re-created because {cause}"
-        f" ({_RECOVERY_COST.get(item['kind'], 'it was rebuilt')})"
-    )
+    cost = _RECOVERY_COST.get((item["kind"], item.get("data_kept")), "it was rebuilt")
+    return f"{item['kind']} {item['node']} was re-created because {cause} ({cost})"
 
 
-def _recovering_resources(stores: SynthStores, env: str) -> list[dict]:
+async def _recovering_resources(stores: SynthStores, env: str, runtime) -> list[dict]:
     """The lambda/rds resources this apply is ABOUT to re-create, named.
 
     ## Why an apply that fixes itself still has to say so
@@ -1525,8 +1541,8 @@ def _recovering_resources(stores: SynthStores, env: str) -> list[dict]:
     `crashed — re-Apply to recreate`, and the re-Apply the user was told to run
     converged nothing. Sweeping FIRST closed that (recovery now takes one apply,
     measured 302.8s -> 5.9s), but it opened a quieter dishonesty in its place:
-    the apply silently destroyed and rebuilt a container, and for rds that means
-    it silently destroyed a database. A green `applied` is a true statement
+    the apply silently destroyed and rebuilt a container, and for rds that meant
+    it silently destroyed a DATABASE. A green `applied` is a true statement
     about the END STATE and a misleading one about what happened on the way --
     exactly the shape honesty rule 2 is about.
 
@@ -1535,6 +1551,14 @@ def _recovering_resources(stores: SynthStores, env: str) -> list[dict]:
     that data loss visible; its own words were "no operator should learn about
     that from a green apply". This is how the recover-in-one behaviour keeps
     that promise instead of trading it away.
+
+    v0.8.14 removed the data loss itself (`aws/rds.py::volume_name` -- a named
+    volume per instance, so the replacement container remounts the same
+    database), which is a reason to keep this function, not to delete it: an
+    apply still rebuilds a container nobody asked it to touch, and the operator
+    still has to be told which one and why. What changed is the SENTENCE, and
+    `data_kept` below is why it can now be a footnote without becoming a
+    reassurance nobody checked.
 
     Read BETWEEN the sweep and the converges, which is the only moment the mark
     exists: the sweep sets `failed`/`Failed`, and each converge clears it to
@@ -1546,11 +1570,32 @@ def _recovering_resources(stores: SynthStores, env: str) -> list[dict]:
     `ecsctl.converge_services` reconciles ACTIVE services toward a desired count
     rather than resurrecting a failed record, so it has no equivalent moment to
     report and is not claimed here.
+
+    ## `data_kept`: the one fact here that is measured, not derived
+
+    Since v0.8.14 an rds container's PGDATA is a NAMED volume that survives the
+    container, so the ordinary repair keeps the data -- and `_RECOVERY_COST`
+    could just say so. It doesn't, because a user can `docker volume rm` too,
+    and an instance created before v0.8.14 has no named volume at all; in both
+    cases the re-create really does hand back an empty database and the apply
+    would be reassuring them about data it was in the middle of losing.
+
+    So the volume listing is READ, once, from the same runtime that is about to
+    do the re-creating -- and read HERE, in the same instant the failure marks
+    exist, because `create_db` starts mounting (and thereby creating) the volume
+    moments later, at which point the question is unanswerable. One `docker
+    volume ls` for the whole env, and only when there is a failed database to
+    report: an env with none pays nothing, exactly like `drift`'s own listing.
     """
+    failed = [r for r in rdsctl.records(stores, env) if r["status"] == rdsctl.FAILED]
+    volumes = frozenset(await runtime.volume_names()) if failed else frozenset()
     databases = [
-        {"kind": "rds", "node": r["db_instance_identifier"], "reason": r.get("status_reason") or "it was not running"}
-        for r in rdsctl.records(stores, env)
-        if r["status"] == rdsctl.FAILED
+        {
+            "kind": "rds", "node": r["db_instance_identifier"],
+            "reason": r.get("status_reason") or "it was not running",
+            "data_kept": rds_volume_name(env, r["db_instance_identifier"]) in volumes,
+        }
+        for r in failed
     ]
     functions = [
         {"kind": "lambda", "node": fn["function_name"], "reason": fn.get("state_reason") or "it was not running"}
@@ -1868,7 +1913,7 @@ def create_apply_full_router(
         await drift.sweep_compute(stores, env)
         # Read WHO is broken between the sweep that marks it and the converges
         # that clear the mark -- this is the only instant both are true.
-        recovering = _recovering_resources(stores, env)
+        recovering = await _recovering_resources(stores, env, runtime)
         converging = await ecsctl.converge_services(stores, env, TaskRuntime(), keystore, gateway_port())
         # The same recovery for lambda, and for the same reason: a function's
         # RIE container is its EXECUTION ENVIRONMENT, not a TF resource -- an
@@ -1987,13 +2032,19 @@ def create_apply_full_router(
         # unmentioned precisely when something else was already going wrong,
         # which is when a user can least afford a missing fact.
         #
-        # It is also the more honest shape. The cost does not depend on the
-        # OUTCOME: `create_db` clears the same-name remnant before it boots a
-        # replacement, so the old data is gone the moment the re-create starts,
-        # whether or not the new container ever comes up. Reporting it only on
-        # success would have hidden it in exactly the failure case where it
-        # matters most. Whether the result is HEALTHY is a separate question,
-        # answered separately by `unhealthy_resources`.
+        # It is also the more honest shape. What was re-created does not depend
+        # on the OUTCOME: `create_db` clears the same-name remnant before it
+        # boots a replacement, so the container is gone the moment the
+        # re-create starts, whether or not the new one ever comes up. Reporting
+        # it only on success would have hidden it in exactly the failure case
+        # where it matters most. Whether the result is HEALTHY is a separate
+        # question, answered separately by `unhealthy_resources`.
+        #
+        # `data_kept` was read BEFORE any of that (see `_recovering_resources`),
+        # which is what keeps this true now that an rds recovery is normally
+        # non-destructive: the volume question is answered while the answer
+        # still exists, not inferred afterwards from a container that has since
+        # been replaced.
         #
         # APPENDS to any existing note rather than replacing it: the note may
         # already carry a tofu failure or an unhealthy resource, and those are
