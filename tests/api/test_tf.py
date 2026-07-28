@@ -244,11 +244,18 @@ TYPO_CANVAS = {
 def _plan_app(tmp_path, result: TfResult, canvas: dict | None = None):
     """An app whose /tf/plan returns `result`, with `canvas` already saved --
     at the STORE's own canvas path, so this reads the test's canvas and never
-    the checkout's real `.odin/canvas.json`."""
+    the checkout's real one.
+
+    The canvas is PER-ENV now (`.odin/<env>/canvas.json`), which is also what
+    makes `canvas_drift` meaningful: /tf/plan compares this env's canvas against
+    this env's stack, where it used to compare one global file against every
+    env's stack."""
     app = create_app(runtime=FakeRuntime(), store=SpecStore(tmp_path), rds=FakeRds(), backings=False)
     app.state.tf_runner.plan = _plan_returning(result)
     if canvas is not None:
-        (tmp_path / "canvas.json").write_text(json.dumps(canvas))
+        target = tmp_path / "default" / "canvas.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(canvas))
     return app
 
 

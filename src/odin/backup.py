@@ -55,6 +55,7 @@ from odin.util import (
     SHUTDOWN_GRACE,
     LiveServer,
     atomic_write_bytes,
+    atomic_write_text,
     await_server_exit,
     live_server,
     odin_version,
@@ -108,9 +109,20 @@ def default_archive_name(env: str) -> str:
 
 
 def _exportable_files(env_dir: Path) -> list[Path]:
+    """The env's files, EXCLUDING its canvas.
+
+    The canvas moved into the env dir when it became per-env, which would have
+    swept it into this walk -- and an env dir is replaced wholesale on import,
+    so that would make `--with-canvas` meaningless: restoring an env's state
+    would always clobber whatever the user currently has drawn. It is archived
+    as its own top-level entry instead (`_add_canvas`), which keeps the flag's
+    promise AND keeps new archives byte-compatible in layout with old ones.
+    """
     files = (
         p for p in env_dir.rglob("*")
-        if p.is_file() and EXCLUDED_DIRS.isdisjoint(p.relative_to(env_dir).parts)
+        if p.is_file()
+        and EXCLUDED_DIRS.isdisjoint(p.relative_to(env_dir).parts)
+        and p.relative_to(env_dir).parts != (CANVAS_NAME,)
     )
     return sorted(files)
 
@@ -134,13 +146,17 @@ def export_env(root: Path, env: str, dest: Path) -> ExportResult:
         odin_version=odin_version(), env=env,
         created_at=datetime.now(UTC).isoformat(), format=FORMAT,
     )
-    canvas = root / CANVAS_NAME
+    canvas = env_dir / CANVAS_NAME
     dest.parent.mkdir(parents=True, exist_ok=True)
     with _private_archive(dest) as tar:
         _add_bytes(tar, MANIFEST_NAME, manifest.model_dump_json(indent=2).encode())
         for path in _exportable_files(env_dir):
             tar.add(path, arcname=f"{ENV_PREFIX}/{path.relative_to(env_dir).as_posix()}",
                     filter=_owner_only)
+        # This env's OWN canvas, at the same top-level archive path the global
+        # one used -- so an exported env finally carries the canvas that
+        # PRODUCED it, while `--with-canvas` keeps meaning "replace what I have
+        # drawn" rather than being implied by every restore.
         _add_canvas(tar, canvas)
     return ExportResult(
         archive=str(dest), env=env, size=dest.stat().st_size,
@@ -274,8 +290,21 @@ def _destination(
     if path.parts[:1] == (ENV_PREFIX,) and len(path.parts) > 1:
         return target.joinpath(*path.parts[1:])
     if with_canvas and path.parts == (CANVAS_NAME,):
-        return root / CANVAS_NAME
+        # A LEGACY archive: back when the canvas was one global file it was
+        # stored at the archive root. It now belongs to the env being restored
+        # (`.odin/<env>/canvas.json`), which is where anything reads it -- so
+        # restoring it to the old global path would put it somewhere nothing
+        # looks. New archives carry it inside the env payload instead, and hit
+        # the ENV_PREFIX branch above.
+        return target / CANVAS_NAME
     return None
+
+
+def _current_canvas(target: Path) -> str | None:
+    """The env's canvas as it stands, or None if it has none. Read BEFORE the
+    env dir is replaced so a restore can put it back (see `import_archive`)."""
+    path = target / CANVAS_NAME
+    return path.read_text() if path.is_file() else None
 
 
 def import_archive(
@@ -304,17 +333,26 @@ def import_archive(
             if member.isfile()
             and (dest := _destination(path, root, target, with_canvas)) is not None
         ]
+        # The canvas is per-env, so it lives INSIDE the dir about to be
+        # replaced -- which would make `--with-canvas` unkeepable: every
+        # restore would clobber whatever the user currently has drawn, flag or
+        # no flag. So without the flag its current canvas is carried across the
+        # replacement. With the flag, the archive's canvas is written and this
+        # keeps nothing.
+        keep_canvas = None if with_canvas else _current_canvas(target)
         # Replace, don't merge: a restore of a --force'd env must not leave
         # stale files from the env it overwrote. Only reached once every
         # member has passed _checked_relative above.
         shutil.rmtree(target, ignore_errors=True)
         for member, dest in restore:
             _write(tar, member, dest)
+        if keep_canvas is not None:
+            atomic_write_text(target / CANVAS_NAME, keep_canvas, mode=0o600)
     return ImportResult(
         archive=str(archive), env=target_env, source_env=manifest.env,
         odin_version=manifest.odin_version, created_at=manifest.created_at,
         files=len(restore),
-        canvas_restored=any(dest == root / CANVAS_NAME for _, dest in restore),
+        canvas_restored=any(dest.name == CANVAS_NAME for _, dest in restore),
     )
 
 

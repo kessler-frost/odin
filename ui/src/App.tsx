@@ -44,7 +44,7 @@ export default function App() {
   const statusUpdateFnRef = useRef<((name: string, status: string, error?: string, facts?: Record<string, unknown>) => void) | null>(null);
   // Another client saved the canvas. The canvas is global, so every tab must
   // converge on it rather than sit on a stale copy and later overwrite it.
-  const canvasUpdatedFnRef = useRef<((rev: string) => void) | null>(null);
+  const canvasUpdatedFnRef = useRef<((rev: string, env: string) => void) | null>(null);
   const [configUpdate, setConfigUpdate] = useState<{ nodeId: string; data: Record<string, any> } | null>(null);
   const [nodeLabels, setNodeLabels] = useState<{ id: string; label?: string }[]>([]);
 
@@ -85,10 +85,12 @@ export default function App() {
   // desired state tears the environment down. A failed read must abort Apply,
   // never apply emptiness.
   const readCanvas = useCallback(async () => {
-    const canvas = await readCanvasPayload(fetch, '/canvas');
+    // `?env=` IS required now: the canvas is per-env, so Apply must send the
+    // canvas of the environment the user is looking at.
+    const canvas = await readCanvasPayload(fetch, `/canvas?env=${encodeURIComponent(env)}`);
     if (!canvas) pushToast('error', 'Could not read the canvas — nothing was applied');
     return canvas;
-  }, [pushToast]);
+  }, [env, pushToast]);
 
   // Apply: send the canvas as desired state; the Reconciler runs it for real,
   // Terraform is generated + applied through the gateway, and live status
@@ -128,8 +130,8 @@ export default function App() {
     statusUpdateFnRef.current?.(name, status, error, facts);
   }, []);
 
-  const handleCanvasUpdated = useCallback((rev: string) => {
-    canvasUpdatedFnRef.current?.(rev);
+  const handleCanvasUpdated = useCallback((rev: string, updatedEnv: string) => {
+    canvasUpdatedFnRef.current?.(rev, updatedEnv);
   }, []);
 
   const handleConfigUpdate = useCallback((nodeId: string, data: Record<string, any>) => {

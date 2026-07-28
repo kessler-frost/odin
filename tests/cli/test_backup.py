@@ -47,7 +47,7 @@ def _seed(root: Path, env: str = ENV) -> Path:
     (tf / "terraform.tfstate").write_text('{"version": 4}')
     (tf / ".terraform" / "providers" / "huge.bin").write_bytes(b"x" * 4096)
     (tf / ".terraform.lock.hcl").write_text("# lock\n")
-    (root / CANVAS_NAME).write_text('{"nodes": [{"id": "n1"}], "edges": []}')
+    (root / env / CANVAS_NAME).write_text('{"nodes": [{"id": "n1"}], "edges": []}')
     return env_dir
 
 
@@ -169,7 +169,11 @@ def test_round_trip_restores_every_file_byte_for_byte_and_keeps_0600(runner, tmp
 
     # the "I lost .odin/" disaster, exactly
     shutil.rmtree(env_dir)
-    result = runner.invoke(app, ["import", f"odin-{ENV}-export.tar.gz"])
+    # `--with-canvas` because the canvas is per-env now and its restore stays
+    # OPT-IN: an env dir is replaced wholesale, so restoring state without the
+    # flag deliberately leaves whatever the user currently has drawn in place.
+    # This test is about the "I lost .odin/" disaster, where you do want it all.
+    result = runner.invoke(app, ["import", f"odin-{ENV}-export.tar.gz", "--with-canvas"])
     assert result.exit_code == 0, result.output
     assert "Restored env 'bak'" in result.stdout
     assert "odin start" in result.stdout  # the next steps
@@ -188,17 +192,22 @@ def test_import_leaves_the_canvas_alone_unless_asked(runner, tmp_path, monkeypat
     root = tmp_path / ".odin"
     _seed(root)
     assert runner.invoke(app, ["export", "--env", ENV]).exit_code == 0
-    (root / CANVAS_NAME).write_text('{"nodes": [{"id": "mine"}], "edges": []}')
+    # The archive was written while the canvas was still global (`_seed` puts it
+    # at the archive root), so this also covers reading a LEGACY archive. It now
+    # restores into the ENV being restored, because that is where anything reads
+    # it -- the old global path is no longer consulted by anything.
+    mine = root / ENV / CANVAS_NAME
+    mine.write_text('{"nodes": [{"id": "mine"}], "edges": []}')
 
     plain = runner.invoke(app, ["import", f"odin-{ENV}-export.tar.gz", "--force"])
     assert plain.exit_code == 0, plain.output
     assert "Canvas left alone" in plain.stdout
-    assert "mine" in (root / CANVAS_NAME).read_text()  # NOT clobbered
+    assert "mine" in mine.read_text()  # NOT clobbered
 
     withc = runner.invoke(app, ["import", f"odin-{ENV}-export.tar.gz", "--force", "--with-canvas"])
     assert withc.exit_code == 0, withc.output
     assert "Canvas restored" in withc.stdout
-    assert "n1" in (root / CANVAS_NAME).read_text()
+    assert "n1" in mine.read_text()
 
 
 def test_import_env_override_rewrites_the_env_dir_name(runner, tmp_path, monkeypatch):

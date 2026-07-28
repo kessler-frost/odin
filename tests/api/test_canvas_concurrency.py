@@ -75,7 +75,7 @@ def test_a_current_writer_is_accepted(tmp_path):
         current = client.get("/canvas").headers["ETag"]
         ok = client.post("/canvas", json=ONE, headers={"If-Match": current})
         assert ok.status_code == 200
-        assert ok.json()["rev"] == canvas_revision(SpecStore(tmp_path).root / "canvas.json")
+        assert ok.json()["rev"] == canvas_revision(SpecStore(tmp_path).root / "default" / "canvas.json")
 
 
 def test_omitting_the_precondition_still_saves(tmp_path):
@@ -108,10 +108,10 @@ def test_a_save_broadcasts_so_other_tabs_can_converge(tmp_path):
     """
     from odin.api.canvas import create_canvas_router
 
-    canvas = tmp_path / "canvas.json"
+    canvas = tmp_path / "default" / "canvas.json"
     ws = RecordingWs()
     app = FastAPI()
-    app.include_router(create_canvas_router(canvas, ws=ws))
+    app.include_router(create_canvas_router(lambda env: tmp_path / env / "canvas.json", ws=ws))
     with TestClient(app) as client:
         client.post("/canvas", json=ONE)
         updates = [m for m in ws.messages if m.get("type") == "canvas_updated"]

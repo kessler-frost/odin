@@ -143,7 +143,7 @@ const statusConfig: Record<WsStatus, { color: string; label: string; pulse: bool
 interface BottomPanelProps {
   bottomState: string;
   activeEnv?: string;
-  onCanvasUpdated?: (rev: string) => void;
+  onCanvasUpdated?: (rev: string, env: string) => void;
   selectedNode?: string;
   onCycleBottom: () => void;
   onWsStatusChange?: (connected: boolean) => void;
@@ -222,7 +222,7 @@ export default function BottomPanel({ bottomState, activeEnv, selectedNode, onCy
     // The canvas is GLOBAL and shared by every tab, so this one is NOT
     // filtered by env -- unlike world_delta below, which is per-environment.
     if (type === 'canvas_updated') {
-      onCanvasUpdatedRef.current?.(msg.rev as string);
+      onCanvasUpdatedRef.current?.(msg.rev as string, (msg.env as string) ?? 'default');
     }
     if (type === 'world_delta') {
       const env = (msg.env as string | undefined) ?? 'default';

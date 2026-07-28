@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,7 @@ from pydantic import BaseModel, model_validator
 from odin.spec.translate import canvas_problems
 from odin.util import atomic_write_text
 
+ENV = "default"  # the same default every other env-taking route uses
 _EMPTY: dict[str, list] = {"nodes": [], "edges": []}
 
 
@@ -77,14 +79,26 @@ def canvas_revision(canvas_path: Path) -> str:
     return hashlib.sha256(raw).hexdigest()[:16]
 
 
-def create_canvas_router(canvas_path: Path, ws=None) -> APIRouter:
-    """`ws` is the `ConnectionManager`, optional so every existing caller (and
-    every test) keeps working. When present, a successful save is broadcast so
-    OTHER TABS CONVERGE instead of silently overwriting each other."""
+def create_canvas_router(canvas_for: Callable[[str], Path], ws=None) -> APIRouter:
+    """The canvas is PER-ENVIRONMENT (owner decision, 2026-07-27).
+
+    It used to be one global `.odin/canvas.json` shared by every env, and
+    `?env=` was ignored here while every other route (`/world`, `/apply`,
+    `/destroy`) honoured it and defaulted to `default`. That made `/canvas` the
+    only route where the parameter was a lie, and it meant switching
+    environments could not change what you were looking at -- so two envs could
+    never hold different architectures, only the same one applied twice.
+
+    `canvas_for(env) -> Path` resolves the env's own file, so this router never
+    needs to know the store layout. `ws` is the `ConnectionManager`, optional
+    so every existing caller (and every test) keeps working; a successful save
+    is broadcast WITH its env, so a tab converges only on changes to the
+    environment it is actually showing.
+    """
     router = APIRouter()
 
     @router.get("/canvas")
-    def get_canvas(response: Response) -> dict[str, Any]:
+    def get_canvas(response: Response, env: str = ENV) -> dict[str, Any]:
         """The stored canvas VERBATIM, never re-validated: whatever is on disk
         is what `odin canvas get` must hand back, or a canvas hand-edited into
         an unusable shape would be unreachable by the one command that could
@@ -93,11 +107,15 @@ def create_canvas_router(canvas_path: Path, ws=None) -> APIRouter:
         The revision rides in the `ETag` HEADER, deliberately not in the body:
         the body must stay byte-for-byte what is on disk.
         """
+        canvas_path = canvas_for(env)
         response.headers["ETag"] = canvas_revision(canvas_path)
         return json.loads(canvas_path.read_text()) if canvas_path.exists() else dict(_EMPTY)
 
     @router.post("/canvas")
-    async def save_canvas(graph: CanvasGraph, response: Response, if_match: str | None = Header(None)) -> dict[str, str]:
+    async def save_canvas(
+        graph: CanvasGraph, response: Response, env: str = ENV,
+        if_match: str | None = Header(None),
+    ) -> dict[str, str]:
         """Save, and tell everyone else.
 
         The canvas is GLOBAL by design -- one architecture, many environments --
@@ -119,6 +137,7 @@ def create_canvas_router(canvas_path: Path, ws=None) -> APIRouter:
           sit on a stale copy until their next render overwrites this one. This
           is what makes "the same canvas everywhere" true rather than aspirational.
         """
+        canvas_path = canvas_for(env)
         if if_match is not None and if_match != canvas_revision(canvas_path):
             raise HTTPException(
                 status_code=409,
@@ -138,7 +157,9 @@ def create_canvas_router(canvas_path: Path, ws=None) -> APIRouter:
             # Carries the new revision so a tab that just saved can recognise
             # its OWN echo and skip reloading -- otherwise every save round-trips
             # into a reload, and a reload mid-edit is its own kind of data loss.
-            await ws.broadcast({"type": "canvas_updated", "rev": revision})
+            # Carries the ENV as well as the revision: a tab showing a
+            # different environment must not reload someone else's canvas.
+            await ws.broadcast({"type": "canvas_updated", "env": env, "rev": revision})
         return {"status": "saved", "rev": revision}
 
     return router

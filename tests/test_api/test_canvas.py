@@ -10,13 +10,17 @@ from odin.api.canvas import create_canvas_router
 
 @pytest.fixture
 def canvas_path(tmp_path):
-    return tmp_path / "canvas.json"
+    # The canvas is PER-ENV now, so these single-canvas tests address the
+    # default env's file -- the one a request with no `?env=` resolves to.
+    path = tmp_path / "default" / "canvas.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 @pytest.fixture
-def client(canvas_path):
+def client(tmp_path, canvas_path):
     app = FastAPI()
-    app.include_router(create_canvas_router(canvas_path))
+    app.include_router(create_canvas_router(lambda env: tmp_path / env / "canvas.json"))
     return TestClient(app)
 
 
@@ -40,9 +44,9 @@ def test_post_and_get_canvas(client):
 
 def test_post_canvas_creates_missing_parent_dir(tmp_path):
     # A fresh start (no .odin yet): saving the canvas must create the dir, not 500.
-    path = tmp_path / "fresh" / "canvas.json"
+    path = tmp_path / "fresh" / "default" / "canvas.json"
     app = FastAPI()
-    app.include_router(create_canvas_router(path))
+    app.include_router(create_canvas_router(lambda env: tmp_path / "fresh" / env / "canvas.json"))
     with TestClient(app) as fresh_client:
         resp = fresh_client.post("/canvas", json={"nodes": [{"id": "a", "type": "service",
                                   "position": {"x": 0, "y": 0}, "data": {}}], "edges": []})

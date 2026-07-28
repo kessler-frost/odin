@@ -1129,6 +1129,39 @@ future decision against these points instead of re-deriving them:
   external/LAN-reachable underlay address plus multi-Mac membership and
   cross-machine placement are still open). Additive, no core change.
 
+## v0.7.9 — the canvas is per-environment
+
+- [x] **The canvas is PER-ENV** (owner decision, 2026-07-27). `/canvas` was the
+  only env-taking route where `?env=` was IGNORED: one global
+  `.odin/canvas.json` shared by every environment, so two envs could never hold
+  different architectures, only the same one applied twice. It lives at
+  `.odin/<env>/canvas.json` now and defaults to `default` like every other
+  route. Verified live: `staging` and `prod` held different canvases, and
+  switching the env field in the UI loaded that env's own canvas
+  (`canvas?env=staging` on the wire).
+
+  Three things this dragged in, each worth knowing:
+  * **Migration.** Moving the read without moving the file would make a user's
+    architecture appear to VANISH -- the same silently-empty-canvas failure
+    v0.7.7 was spent on. The old global file seeds `default` and every existing
+    env (all of them were showing it), then is RENAMED to
+    `canvas.json.pre-per-env` rather than deleted: recoverable if the guess was
+    wrong, and the rename makes the migration idempotent with no marker file.
+  * **`/tf/plan`'s drift check was quietly wrong**, and is now right. It
+    compared the one global canvas against a PER-ENV stack, so `canvas_drift`
+    meant nothing for any env but the default.
+  * **Backup.** The canvas would have been swept into the env-dir walk, and an
+    env dir is replaced wholesale on import -- which would have made
+    `--with-canvas` unkeepable, since every restore would clobber whatever the
+    user had drawn. It is archived as its own entry, and an import WITHOUT the
+    flag now carries the env's current canvas across the replacement.
+
+  The CLI's `odin canvas get/set` take `--env`. Their module docstring used to
+  say "no `env` parameter on purpose ... no fake `--env` here" -- true of the
+  file it was written for, a lie the moment the canvas moved. The correction is
+  left in place as a note, because a caveat outliving its subject is the doc
+  failure this repo keeps auditing for.
+
 ## v0.7.8 — three PRE-EXISTING field failures, carried forward deliberately
 
 All three fail IDENTICALLY at v0.7.6 (verified by running them against the

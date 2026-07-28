@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import os
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
@@ -50,7 +51,7 @@ from odin.spec import store as store_mod
 from odin.spec.models import Stack, World
 from odin.spec.store import SpecStore, StoreUnreadable
 from odin.spec.translate import MODELLED_NODE_TYPES, canvas_to_stack, drawn_node_types, skipped_node_types
-from odin.util import STORE_LOCK_NAME, StoreLock, hold_store_lock, odin_version
+from odin.util import STORE_LOCK_NAME, StoreLock, atomic_write_text, hold_store_lock, odin_version
 
 ODIN_DIR = Path(".odin")
 CANVAS_NAME = "canvas.json"
@@ -1141,7 +1142,7 @@ def _saved_canvas(path: Path) -> dict:
 def create_tf_router(
     store: SpecStore, runner: TfRunner, keystore: KeyStore, gateway_port,
     translate_cache: translate_mod.TranslateCache, runtime, stores: SynthStores,
-    canvas_path: Path = CANVAS_PATH,
+    canvas_for: Callable[[str], Path] = lambda env: ODIN_DIR / env / CANVAS_NAME,
 ) -> APIRouter:
     """`/tf/*` -- Simulate's own apply/destroy/status, independent of the
     canvas `/apply`/`/destroy` above (S2 CONTRACT ADDENDUM: routes named
@@ -1231,7 +1232,10 @@ def create_tf_router(
         say so, in the payload and in the CLI's own output, whenever they
         differ."""
         stack = store.get_stack(env)
-        canvas = _saved_canvas(canvas_path)
+        # This env's OWN canvas. It used to read one global file and compare it
+        # against a per-env stack, so `canvas_drift` was meaningless for every
+        # env but the default.
+        canvas = _saved_canvas(canvas_for(env))
         skipped = skipped_node_types(canvas)
         canvas_drift = canvas_to_stack(canvas, env=env) != stack
         project = generate_tf(stack)
@@ -1879,6 +1883,46 @@ async def _reap_orphaned_ec2_vms(root: Path, envs: list[str], stores: SynthStore
         log.exception("startup EC2 VM reaper failed (continuing without it)")
 
 
+_LEGACY_CANVAS_SUFFIX = ".pre-per-env"
+
+
+def _migrate_global_canvas(root: Path) -> list[str]:
+    """Seed every existing env's canvas from the old GLOBAL one, once.
+
+    Before this release the canvas lived at `.odin/canvas.json` and was shared
+    by every environment. Moving it to `.odin/<env>/canvas.json` without a
+    migration would make a user's architecture appear to VANISH on upgrade --
+    the file is still on disk, but nothing reads it any more, which is exactly
+    the "silently empty canvas" failure v0.7.7 was spent fixing.
+
+    So: copy it into `default` and into every env directory that already
+    exists and has no canvas of its own. Every env was showing that same canvas
+    before, so this preserves what each of them showed. Then RENAME the global
+    file rather than deleting it -- if this migration ever guesses wrong, the
+    original is still there under `canvas.json.pre-per-env`, and a rename also
+    makes the migration idempotent without needing a marker file.
+
+    An env whose canvas already exists is never touched.
+    """
+    legacy = root / CANVAS_NAME
+    if not legacy.exists():
+        return []
+    payload = legacy.read_text()
+    envs = {ENV, *(child.name for child in root.iterdir() if child.is_dir())}
+    seeded: list[str] = []
+    for env in sorted(envs):
+        target = root / env / CANVAS_NAME
+        if target.exists():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(target, payload, mode=0o600)
+        seeded.append(env)
+    legacy.rename(legacy.with_suffix(legacy.suffix + _LEGACY_CANVAS_SUFFIX))
+    if seeded:
+        log.info("canvas is per-env now: seeded %s from the previous global canvas", ", ".join(seeded))
+    return seeded
+
+
 def create_app(
     runtime=None,
     store: SpecStore | None = None,
@@ -2118,8 +2162,14 @@ def create_app(
     # `root / CANVAS_NAME` -- but a caller that brought its own store (every
     # test) now reads and writes its OWN canvas instead of the real one under
     # the checkout. The module constant stays as the documented location.
-    canvas_path = _store.root / CANVAS_NAME
-    app.include_router(create_canvas_router(canvas_path, ws=ws_manager))
+    # PER-ENV canvas (owner decision, 2026-07-27): `.odin/<env>/canvas.json`,
+    # alongside that env's stacks/world/events, instead of one global file that
+    # made `?env=` a no-op on this one route.
+    def canvas_for(env: str) -> Path:
+        return _store.root / env / CANVAS_NAME
+
+    _migrate_global_canvas(_store.root)
+    app.include_router(create_canvas_router(canvas_for, ws=ws_manager))
     app.include_router(
         create_apply_router(
             _store, reconciler_for, gateway_keystore, tf_runner, lambda: gateway_port_actual, env_epoch,
@@ -2129,7 +2179,7 @@ def create_app(
     app.include_router(
         create_tf_router(
             _store, tf_runner, gateway_keystore, lambda: gateway_port_actual,
-            translate_cache, _runtime, gateway_stores, canvas_path,
+            translate_cache, _runtime, gateway_stores, canvas_for,
         )
     )
     app.include_router(
