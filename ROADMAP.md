@@ -1121,7 +1121,15 @@ future decision against these points instead of re-deriving them:
     nothing about memory, so the ceiling is not discoverable before an Apply
     hits it, and it hardcodes its own disk floor rather than honouring
     `ODIN_MIN_DISK_GIB`.
-- [ ] **M7 (multi-Mac) — the fleet.** The single-host half is DONE (see
+- [ ] **M7 (multi-Mac) — the fleet. DEFERRED: do not build unless the owner
+  explicitly asks for it** (owner call, 2026-07-28). It is the one item that
+  cannot be honestly finished on this machine: a genuine cross-machine handshake
+  needs a SECOND Mac, so anything built here could only be unit-tested and would
+  ship claiming a capability nobody had verified. That is the exact shape the
+  honesty rules exist to prevent, so it waits for a real two-machine setup
+  rather than being simulated into looking done.
+
+  The single-host half is DONE (see
   above: a real lighthouse + real per-VM daemons + a real ping/SG-filter
   proof, all on one Mac). What remains is genuinely cross-machine: a second
   Mac's host joining the SAME env's mesh (today's lighthouse only binds
