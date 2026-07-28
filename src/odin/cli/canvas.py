@@ -1,8 +1,12 @@
 """`odin canvas` — read/write the saved canvas.
 
-The server's `/canvas` routes have NO `env` parameter on purpose: there is
-one global canvas file (`.odin/canvas.json`) that every env's apply reads.
-These commands honestly mirror that — no fake `--env` here.
+The canvas is PER-ENVIRONMENT (`.odin/<env>/canvas.json`), so both commands
+take `--env` and default to `default`, exactly like `odin apply`/`destroy`.
+
+This file used to say the opposite -- "no `env` parameter on purpose ... no
+fake `--env` here" -- which was true of the one global canvas it was written
+for and became a lie the moment the canvas moved. Left as a note because a
+caveat outliving its subject is the doc failure this repo keeps auditing for.
 
 The canvas JSON shape is documented in the README ("The canvas JSON schema").
 The one field a hand-authored canvas keeps forgetting is `position`, because
@@ -55,19 +59,22 @@ def _render_canvas(body: dict) -> None:
 
 
 @canvas_app.command("get")
-def canvas_get(url: str = http.URL, output: OutputFormat = http.JSON_OUTPUT) -> None:
-    """Print the saved canvas ({"nodes": [...], "edges": [...]}) as JSON."""
-    body = http.body_or_fail(http.request("GET", url, "/canvas"))
+def canvas_get(
+    env: str = http.ENV, url: str = http.URL, output: OutputFormat = http.JSON_OUTPUT,
+) -> None:
+    """Print this env's saved canvas ({"nodes": [...], "edges": [...]}) as JSON."""
+    body = http.body_or_fail(http.request("GET", url, "/canvas", params={"env": env}))
     http.emit(body, output, _render_canvas)
 
 
 @canvas_app.command("set")
 def canvas_set(
     file: str = typer.Argument(..., help="Canvas JSON file, or - to read stdin."),
+    env: str = http.ENV,
     url: str = http.URL,
     output: OutputFormat = http.OUTPUT,
 ) -> None:
-    """Save a canvas JSON ({"nodes": [...], "edges": [...]}) as THE canvas."""
+    """Save a canvas JSON ({"nodes": [...], "edges": [...]}) as THIS ENV's canvas."""
     graph = http.parse_json_arg(http.read_text_arg(file), file)
     # Field test 4, P4-5: this used to store anything that was valid JSON, so a
     # canvas that could never be applied sat on disk until the next translate
@@ -87,5 +94,5 @@ def canvas_set(
             f"no \"position\" on {len(placed)} node(s) — placed on the grid: {', '.join(placed)}",
             err=True,
         )
-    body = http.body_or_fail(http.request("POST", url, "/canvas", body=graph))
+    body = http.body_or_fail(http.request("POST", url, "/canvas", body=graph, params={"env": env}))
     http.emit(body, output, lambda b: typer.echo(f"canvas {b['status']}"))

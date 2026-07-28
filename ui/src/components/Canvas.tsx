@@ -34,6 +34,12 @@ import { BUILTINS, CATALOG, catalogNodeTypeMap, catalogDefaultData, catalogDefau
 import { withContainment, isInsideContainer } from '../lib/containment';
 import { placeUnpositioned } from '../lib/placement';
 import { readCanvasWithRevision } from '../lib/canvasLoad';
+
+// The canvas is PER-ENV (`.odin/<env>/canvas.json`). One helper so none of the
+// three call sites can forget the parameter -- omitting it silently reads or
+// writes the DEFAULT env's canvas, which is the class of bug that cost a
+// canvas earlier in this release.
+const canvasUrl = (env: string | undefined) => `${API}/canvas?env=${encodeURIComponent(env || 'default')}`;
 import { computeTypes, defaultPermissions, detectDefaultEdgeType, edgeStyle, edgeTypes } from '../lib/iam';
 
 const nodeTypes: NodeTypes = {
@@ -180,7 +186,7 @@ interface CanvasProps {
   configUpdate?: { nodeId: string; data: Record<string, any> } | null;
   onCanvasSave?: (graph: { nodes: any[]; edges: any[] }) => void;
   onResetDrafts?: React.MutableRefObject<(() => void) | null>;
-  onCanvasUpdated?: React.MutableRefObject<((rev: string) => void) | null>;
+  onCanvasUpdated?: React.MutableRefObject<((rev: string, env: string) => void) | null>;
 }
 
 function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, nodeUpdates, edgeUpdates, onStatusUpdate, configUpdate, onCanvasSave, onResetDrafts, onCanvasUpdated }: CanvasProps) {
@@ -237,7 +243,7 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
       // NOT READ, and the loader returns WITHOUT setting `loaded`: nothing
       // renders, the debounced save below never arms, the file on disk is
       // untouched, and the banner says so.
-      const read = await readCanvasWithRevision(fetch, `${API}/canvas`);
+      const read = await readCanvasWithRevision(fetch, canvasUrl(env));
       if (!read) {
         setLoadFailed(true);
         return;
@@ -294,7 +300,11 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
       setLoaded(true);
     };
     load();
-  }, [setNodes, setEdges]);
+    // `env` is a dependency: the canvas is per-env now, so switching
+    // environments must LOAD that env's canvas. Without it the previous env's
+    // nodes stay on screen and the debounced save then writes them into the
+    // env the user just switched to.
+  }, [env, setNodes, setEdges]);
 
   // --- Rehydrate node badges from the observed World, on mount and on env change ---
   // (a live world_delta over the WebSocket always arrives after this and wins).
@@ -429,7 +439,7 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
       // node from a tab left open in another window.
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
       if (revisionRef.current) headers['If-Match'] = revisionRef.current;
-      fetch(`${API}/canvas`, { method: 'POST', headers, body: JSON.stringify(canvasData) })
+      fetch(canvasUrl(env), { method: 'POST', headers, body: JSON.stringify(canvasData) })
         .then(r => {
           if (r.status === 409) { setConflict(true); return; }
           // Track the revision WE just wrote, so this page recognises its own
@@ -450,12 +460,14 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
   // remaining races refuse rather than clobber.
   useEffect(() => {
     if (!onCanvasUpdated) return;
-    onCanvasUpdated.current = (rev: string) => {
+    onCanvasUpdated.current = (rev: string, updatedEnv: string) => {
+      // A tab showing `prod` must not reload because `staging` was saved.
+      if ((updatedEnv || 'default') !== (env || 'default')) return;
       // Our OWN save echoes back. Reloading on it would throw away whatever
       // the user typed in the 500ms since, which is the same data loss wearing
       // a friendlier hat.
       if (!rev || rev === revisionRef.current) return;
-      readCanvasWithRevision(fetch, `${API}/canvas`).then(read => {
+      readCanvasWithRevision(fetch, canvasUrl(env)).then(read => {
         if (!read) return;
         revisionRef.current = read.rev;
         setConflict(false);
@@ -472,7 +484,7 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
       });
     };
     return () => { onCanvasUpdated.current = null; };
-  }, [onCanvasUpdated, setNodes]);
+  }, [env, onCanvasUpdated, setNodes]);
 
   // --- Register status update callback (called directly, avoids React batching loss) ---
   useEffect(() => {
