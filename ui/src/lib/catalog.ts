@@ -287,6 +287,15 @@ export const CATALOG: ServiceDef[] = [
       { key: 'image', label: 'Image', editable: true },
       { key: 'count', label: 'Task Count', editable: true },
       { key: 'port', label: 'Container Port', editable: true },
+      // Memory is a HARD cap odin enforces (`compute/tasks.py::_memory_mib`
+      // sets the container's limit), and it was unauthorable until v0.8.2 --
+      // every task ran at the 512 MiB fallback, so a container needing more was
+      // OOM-killed with no field to say otherwise. It is also the number
+      // `spec/capacity.py` refuses an over-subscribed instance with, so leaving
+      // it blank and leaving it at 512 have to mean the same thing.
+      { key: 'memory', label: 'Task Memory (MiB)', editable: true, placeholder: '512' },
+      // cpu is a SHARE, not a cap -- same plumbing, no admission guard needed.
+      { key: 'cpu', label: 'Task CPU (units, 1024 = 1 vCPU)', editable: true, placeholder: '256' },
       // Read-only, exactly like sg/ec2's `vpc`/`subnet` stamps: authored by
       // DRAGGING this box inside an EC2 box (lib/containment.ts), never typed.
       //
