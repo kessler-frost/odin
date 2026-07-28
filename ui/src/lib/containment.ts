@@ -56,16 +56,27 @@ export function computeContainment(nodes: Node[]): Record<string, Containment> {
     result[s.id] = { ...(vpc ? { vpc: labelOf(vpc) } : {}) };
   }
 
-  // Leaf nodes (sg + any future leaf): CENTER-point containment. A leaf in a
-  // subnet inherits the subnet's vpc; a leaf in a vpc but no subnet takes the
-  // direct vpc hit.
+  // Leaf nodes (sg + any future leaf): FULL-RECT containment, same as
+  // subnet-in-vpc above (owner decision, 2026-07-28).
+  //
+  // This used to be CENTRE-point: a node counted as inside a VPC once its
+  // middle crossed the boundary, so a box half-hanging out of a container was
+  // silently claimed by it. Containment is not decoration here -- it is where
+  // an SG's `vpc_id` comes from, a required and immutable field on a real
+  // `aws_security_group` -- so "roughly inside" meant infrastructure decided by
+  // a few pixels of overlap, with no way for the user to tell which side of the
+  // line they were on.
+  //
+  // A partially-overlapping box is now OUTSIDE. That is the answer that can be
+  // made unambiguous: fully-inside is a property the user can see and aim for,
+  // whereas "more than half" is not. Being wrong in the direction of "not
+  // contained" is also the recoverable one -- odin reports an SG with no VPC
+  // rather than quietly attaching it to the wrong one.
   for (const n of nodes) {
     if (n.type === 'vpc' || n.type === 'subnet') continue;
     const r = rectOf(n);
-    const cx = r.x + r.w / 2;
-    const cy = r.y + r.h / 2;
-    const subnet = smallest(subnets.filter((s) => containsPoint(rectOf(s), cx, cy)));
-    const direct = smallest(vpcs.filter((v) => containsPoint(rectOf(v), cx, cy)));
+    const subnet = smallest(subnets.filter((s) => containsRect(rectOf(s), r)));
+    const direct = smallest(vpcs.filter((v) => containsRect(rectOf(v), r)));
     const vpc = (subnet ? vpcOfSubnet[subnet.id] : undefined) ?? direct;
     result[n.id] = {
       ...(vpc ? { vpc: labelOf(vpc) } : {}),

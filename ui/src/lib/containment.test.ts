@@ -113,3 +113,51 @@ describe('withContainment', () => {
     expect(withContainment(nodes)).toBe(nodes);
   });
 });
+
+describe('a leaf must be COMPLETELY inside to count as contained', () => {
+  // Owner decision, 2026-07-28. This was centre-point containment: a box whose
+  // middle had crossed the boundary was claimed by the container even while it
+  // visibly hung out of it. Containment supplies an SG's `vpc_id` -- required
+  // and immutable on a real `aws_security_group` -- so that meant a few pixels
+  // of overlap silently decided infrastructure.
+  const vpc = () => node('v1', 'vpc', 0, 0, 400, 400, { label: 'main-vpc' });
+
+  test('fully inside is contained', () => {
+    const result = computeContainment([vpc(), node('sg1', 'sg', 100, 100, 100, 100, { label: 'web-sg' })]);
+    expect(result.sg1).toEqual({ vpc: 'main-vpc' });
+  });
+
+  test('an exact fit counts — the rule is <=, not <', () => {
+    const result = computeContainment([vpc(), node('sg1', 'sg', 0, 0, 400, 400, { label: 'web-sg' })]);
+    expect(result.sg1).toEqual({ vpc: 'main-vpc' });
+  });
+
+  test('hanging out by ONE pixel is outside, on every side', () => {
+    // The case that used to be "inside": centre still within, edge not.
+    for (const [x, y, w, h] of [
+      [-1, 100, 100, 100],   // past the left
+      [100, -1, 100, 100],   // past the top
+      [301, 100, 100, 100],  // past the right
+      [100, 301, 100, 100],  // past the bottom
+    ]) {
+      const result = computeContainment([vpc(), node('sg1', 'sg', x, y, w, h, { label: 'web-sg' })]);
+      expect(result.sg1).toEqual({});
+    }
+  });
+
+  test('a box larger than its would-be container is never contained', () => {
+    const result = computeContainment([vpc(), node('sg1', 'sg', -50, -50, 500, 500, { label: 'web-sg' })]);
+    expect(result.sg1).toEqual({});
+  });
+
+  test('half-overlapping reports NO vpc rather than guessing one', () => {
+    // Being wrong toward "not contained" is the recoverable direction: odin
+    // reports an SG with no VPC instead of quietly attaching it to the wrong one.
+    const result = computeContainment([
+      vpc(),
+      node('v2', 'vpc', 400, 0, 400, 400, { label: 'other-vpc' }),
+      node('sg1', 'sg', 350, 100, 100, 100, { label: 'straddler' }),
+    ]);
+    expect(result.sg1).toEqual({});
+  });
+});

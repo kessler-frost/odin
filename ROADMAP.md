@@ -1131,6 +1131,40 @@ future decision against these points instead of re-deriving them:
 
 ## Next — known, measured, not yet fixed
 
+- [ ] **The edge-type selector, when there is anything to select.** Owner design
+  call (2026-07-28): what an edge MEANS depends on the components it connects,
+  and where a pair could legitimately mean more than one thing odin should ASK
+  rather than pick. `detectEdgeTypes` already returns an ARRAY, so the model
+  anticipates this; `edgeDataForConnection` takes `[0]` and says nothing.
+
+  Measured before building anything: across the whole catalog, **729 ordered
+  pairs, ZERO ambiguous** -- only two edge types exist (`iam`, `network`) and no
+  pair maps to both. A selector today would never open, so it is not built.
+  `iam.test.ts` carries the trigger instead: the moment a pair becomes genuinely
+  ambiguous the test FAILS, naming the pair, which is when the selector becomes
+  real work rather than speculation. Mutation-tested by making one pair
+  ambiguous.
+
+  When it is built: store the chosen type ON the edge (`data.edgeType` already
+  is the store) rather than re-inferring, so a user's choice survives a node
+  being moved or retyped.
+
+- [x] **Containment is strict (owner decision, 2026-07-28).** A leaf counted as
+  inside a container once its CENTRE crossed the boundary, so a box visibly
+  hanging out was silently claimed. That decides an SG's `vpc_id` -- required and
+  immutable on a real `aws_security_group` -- so a few pixels of overlap decided
+  infrastructure. A partially-overlapping box is OUTSIDE now: fully-inside is a
+  property the user can see and aim for, and erring toward "not contained" is the
+  recoverable direction (odin reports an SG with no VPC rather than attaching it
+  to the wrong one). Subnet-in-VPC already worked this way; leaves now match.
+  Five new cases, mutation-tested.
+
+  Still open, and the more interesting half: SG **membership** -- which instances
+  an SG gates -- is a relationship, not ownership, and is still implied by
+  geometry. That one wants to be an edge.
+
+
+
 - [x] **An edge with no handles routes backwards, putting its label on the
   source node.** I first blamed live convergence and was wrong twice -- neither
   deferring the edge commit by a frame nor preserving node identity across the
