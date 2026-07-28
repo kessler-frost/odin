@@ -545,11 +545,11 @@ prose explanation of a failure, and the evidence it reads is still there in
   owns the model and binds it to a real substrate.
 - **Translation** (`src/odin/agent/`) is deterministic in both directions, and
   the two directions do not cover the same ground. Canvas → Terraform covers
-  every kind odin builds. Terraform → canvas covers 17 resource types today —
-  not `aws_instance`, `aws_ecs_service`/`_task_definition`/`_cluster`,
-  `aws_security_group`, `aws_lambda_function` or `aws_ecr_repository`, which
-  come back as LISTED unsupported entries rather than being silently dropped, so
-  an import tells you exactly what it could not take.
+  every kind odin builds. Terraform → canvas covers 19 resource types today —
+  not `aws_instance`, `aws_ecs_service`/`_task_definition`/`_cluster` or
+  `aws_lambda_function`, which come back as LISTED unsupported entries rather
+  than being silently dropped, so an import tells you exactly what it could not
+  take.
   **Runtime:** real containers via Colima (default) or inside a Lima VM
   (`src/odin/runtime/`), and a real Lima VM per EC2 node (`src/odin/compute/`).
 - **Control loop:** a Spec Store (Stack = desired, World = observed) with a pure,
@@ -560,12 +560,20 @@ prose explanation of a failure, and the evidence it reads is still there in
 ## Known limits
 
 - **Import is narrower than generation.** Odin generates 18 kinds and reads back
-  13: `aws_lambda_function`, `aws_instance`, `aws_security_group`,
-  `aws_ecs_service` and `aws_ecr_repository` come back as unsupported, so feeding
-  odin its own `main.tf` does not return every node. `--live` is narrower still —
+  15: `aws_lambda_function`, `aws_instance` and `aws_ecs_service` come back as
+  unsupported, so feeding odin its own `main.tf` does not return every node.
+  `--live` is narrower still —
   `s3`, `sqs`, `sns`, `dynamodb`, `rds`, `vpc`, `subnet` only — and a
   live-imported RDS arrives with odin's default password, because no AWS API
   returns a master password.
+- **An imported security group's OUTBOUND rules do not survive.** odin re-emits
+  its own wide-open egress (everything to `0.0.0.0/0`) for every group and has no
+  canvas field for outbound rules, so a source that restricted egress comes back
+  unrestricted. The import says so on its own line rather than leaving you to
+  find it. Inbound rules do round-trip, including the identity form
+  (`security_groups = [...]` → the referenced group's label), except that odin's
+  rule is a single port: an ingress block with a port RANGE is reported and left
+  out, so the regenerated group allows *less* than the source.
 - **Some arguments are re-emitted with odin's own value whatever you wrote**, and
   each one warns on its own line — `imported with CHANGED argument(s) -- odin
   substitutes its own value` — kept separate from the `imported without unmodeled

@@ -66,6 +66,14 @@ _KIND = {
     # `subnets` references.
     "aws_vpc": "vpc",
     "aws_subnet": "subnet",
+    # v0.8.4: the two that made a NETWORK canvas un-round-trippable. An
+    # `aws_security_group` is where the interesting half lives -- its rules are
+    # what the Nebula firewall actually compiles from, so losing them on import
+    # loses the security posture, not a label. `aws_ecr_repository` is here
+    # because it is a one-argument resource that was being reported unsupported
+    # for no reason other than nobody having written the line.
+    "aws_security_group": "sg",
+    "aws_ecr_repository": "ecr",
 }
 # W2.5: the two OTHER types an `alb` canvas node expands to. Neither becomes a
 # node of its own -- they fold ONTO the alb node the same way
@@ -83,6 +91,7 @@ _NAME_ATTR = {
     "aws_elasticache_cluster": "cluster_id",
     "aws_db_instance": "identifier",
     "aws_lb": "name",
+    "aws_security_group": "name", "aws_ecr_repository": "name",
 }
 # canvas kind -> aws_* type, for mode (b) (the inverse of `_KIND`). iam_role,
 # logs, secret and ssm have no backing to enumerate live resources from (all
@@ -98,7 +107,14 @@ _NAME_ATTR = {
 # password rather than the original one. `alb` (W2.5) stays out of the live path
 # too -- one canvas node is three aws_* resources, so there is no single live
 # resource to import it from (mode (a), reading an existing HCL project, works).
-_NO_LIVE_IMPORT = {"iam_role", "logs", "secret", "ssm", "elasticache", "alb"}
+# `sg` and `ecr` (v0.8.4) stay OUT of the live path deliberately, and for
+# different reasons. A security group's live import id is its `sg-...` GroupId,
+# which is minted by the gateway and appears nowhere on a canvas, so there is no
+# id to resolve from outside an Apply. ECR has no `_import_id` shape either --
+# its repositories exist as gateway-model records. Mode (a), reading an existing
+# HCL project, works for both; claiming mode (b) without an id that resolves is
+# how a live import would generate a bogus import block and fail at apply.
+_NO_LIVE_IMPORT = {"iam_role", "logs", "secret", "ssm", "elasticache", "alb", "sg", "ecr"}
 _TF_TYPE = {kind: rtype for rtype, kind in _KIND.items() if kind not in _NO_LIVE_IMPORT}
 
 # The HCL arguments each kind CARRIES into the canvas -- so a round-trip through
@@ -156,6 +172,15 @@ _CARRIED_ATTRS = {
     "alb": {"name", "internal", "load_balancer_type", "subnets", "tags"},
     "vpc": {"cidr_block", "tags"},
     "subnet": {"cidr_block", "vpc_id", "tags"},
+    # v0.8.4. `ingress` IS carried -- into the node's `ingressRules` text, one
+    # `protocol:port:source` line per block, which is what `hcl.py::_sg` reads
+    # back. `egress` is carried in the weaker sense the others in this map use:
+    # odin always re-emits its own wide-open default (`_DEFAULT_EGRESS`), so a
+    # source egress that DIFFERS is a changed argument, not a dropped one, and
+    # says so via `_FIXED_VALUES` below. `vpc_id` is CONTAINMENT, stamped by
+    # `_stamp_containment` exactly as a subnet's is.
+    "sg": {"name", "vpc_id", "ingress", "egress", "tags"},
+    "ecr": {"name", "tags"},
 }
 # The companion resources' equivalent: which of THEIR arguments a round trip
 # reproduces (hcl.py's alb companion pass emits exactly these). Until v0.7.1
@@ -224,7 +249,9 @@ _UNREADABLE_NUMBERS = {
 # which is the worst possible combination: the tags were dropped AND the drop
 # was suppressed. Reading them is the fix -- hcl.py already re-emits whatever a
 # node carries -- not a warning about losing them.
-_TAGGED_KINDS = {"s3", "logs", "secret", "ssm", "rds", "alb", "vpc", "subnet", "elasticache"}
+# Every builder in hcl.py appends `_tags_block(res)`, so user tags round-trip
+# for every kind -- these are the ones whose tags are read BACK into `data.tags`.
+_TAGGED_KINDS = {"s3", "logs", "secret", "ssm", "rds", "alb", "vpc", "subnet", "elasticache", "sg", "ecr"}
 _CONTAINER_KINDS = ("vpc", "subnet")
 
 # Canvas geometry for the layout pass. These ARE the UI's own container sizes
@@ -557,6 +584,114 @@ def _referenced_label(value: object, rtype: str, by_hcl_name: dict[str, str]) ->
     return by_hcl_name.get(f"{rtype}.{target}") if target else None
 
 
+# hcl.py::_DEFAULT_EGRESS, as the parsed block it becomes. odin re-emits exactly
+# this for every security group and offers no way to author anything else, so an
+# imported group whose egress DIFFERS is a changed argument -- and in the one
+# direction that matters: a source that restricted outbound traffic comes back
+# wide open. That is a real posture change, and v0.8.4 is the first release in
+# which it could happen at all, so it is reported from the start rather than
+# discovered later.
+_ODIN_EGRESS = {"from_port": 0, "to_port": 0, "protocol": "-1", "cidr_blocks": ["0.0.0.0/0"]}
+
+
+def _same_literal(value: object, want: object) -> bool:
+    """`_literal` equality that also works for a LIST argument.
+
+    `_literal` only unquotes a `str`, so a list falls through to `str(...)` and
+    `['"0.0.0.0/0"']` (what python-hcl2 hands back -- quotes retained on the
+    MEMBERS) never equals `['0.0.0.0/0']`. Measured: that mismatch made odin's
+    own generated egress report itself as a changed argument, i.e. a warning on
+    every single security-group import, which is exactly how a real warning gets
+    trained out of people.
+    """
+    if isinstance(want, list):
+        return isinstance(value, list) and [_literal(v) for v in value] == [_literal(w) for w in want]
+    return _literal(value) == _literal(want)
+
+
+def _egress_changes(kind: str, attrs: dict) -> dict[str, str]:
+    """`{"egress": why}` when a security group's outbound rules are not the wide
+    -open default odin always emits. Empty for every other kind, and for a group
+    that already matches -- which is every group odin generated itself, so its
+    own round trip stays quiet."""
+    if kind != "sg":
+        return {}
+    blocks = attrs.get("egress") or []
+    same = len(blocks) == 1 and all(
+        _same_literal(blocks[0].get(key), want) for key, want in _ODIN_EGRESS.items()
+    )
+    return {} if same else {
+        "egress": "odin always emits its own wide-open egress (0-65535 to 0.0.0.0/0) and has no "
+                  "field for outbound rules, so a restricted one comes back UNRESTRICTED"
+    }
+
+
+def _ingress_rule_line(block: dict, by_hcl_name: dict[str, str]) -> str | None:
+    """One `protocol:port:source` line from an `ingress {}` block, or None when
+    the block cannot be expressed as one.
+
+    The exact inverse of `hcl.py::_ingress_source`: `cidr_blocks` is a literal
+    CIDR, and `security_groups` is another SG NODE'S LABEL -- the
+    identity-based "only the web tier may reach me" rule, which is the form the
+    Nebula firewall compiles to a `group:` rule. Reading it back as the referenced
+    group's label (not its `sg-` id) is what lets the rule survive a round trip
+    at all, since the canvas has no ids in it.
+
+    A port RANGE cannot be expressed: odin's field is one port, and `_sg` emits
+    `from_port == to_port`. Returning None sends it to the dropped list rather
+    than silently narrowing a range to its lower bound.
+    """
+    from_port, to_port = _int_text(block.get("from_port")), _int_text(block.get("to_port"))
+    protocol = hcl.unquote(block.get("protocol"))
+    if from_port is None or from_port != to_port or not isinstance(protocol, str):
+        return None
+    cidrs = block.get("cidr_blocks") or []
+    groups = block.get("security_groups") or []
+    source = next(
+        (text for value in cidrs if isinstance(text := hcl.unquote(value), str) and "/" in text),
+        None,
+    ) or next(
+        (label for value in groups
+         if (label := _referenced_label(value, "aws_security_group", by_hcl_name))),
+        None,
+    )
+    return f"{protocol}:{from_port}:{source}" if source else None
+
+
+def _stamp_sg_rules(
+    node_by_label: dict[str, dict], attrs_by_label: dict[str, dict], by_hcl_name: dict[str, str]
+) -> list[str]:
+    """Rebuild each security group's `ingressRules` text from its own blocks.
+
+    A POST-pass, like `_stamp_containment`, and for the same reason: a rule may
+    reference a group defined LATER in the file, which is not yet in
+    `by_hcl_name` while the nodes are still being built.
+
+    An unexpressible block is named rather than dropped in silence. Losing an
+    ingress rule quietly is the worst import defect available here -- the
+    regenerated group would be MORE restrictive than the source (traffic that
+    used to be allowed stops), and nothing on the canvas would show the rule had
+    ever existed.
+    """
+    warnings: list[str] = []
+    for label, node in node_by_label.items():
+        if node["type"] != "sg":
+            continue
+        blocks = attrs_by_label[label].get("ingress") or []
+        lines = [_ingress_rule_line(block, by_hcl_name) for block in blocks]
+        kept = [line for line in lines if line]
+        if kept:
+            node["data"]["ingressRules"] = "\n".join(kept)
+        lost = len(lines) - len(kept)
+        warnings += [] if not lost else [
+            f"{label} (sg): {lost} of {len(lines)} ingress rule(s) could not be imported -- odin's "
+            "rule is one `protocol:port:source` with a single port and a CIDR or an imported "
+            "security group, so a port RANGE or a source odin cannot resolve is left out. The "
+            "regenerated group allows LESS than the source did."
+        ]
+    return warnings
+
+
 def _stamp_containment(
     node_by_label: dict[str, dict], attrs_by_label: dict[str, dict], by_hcl_name: dict[str, str]
 ) -> list[str]:
@@ -575,6 +710,18 @@ def _stamp_containment(
     at import (field test U2).
     """
     warnings: list[str] = []
+    # v0.8.4: an sg's `vpc_id` is containment too, and EXACTLY as load-bearing --
+    # `hcl.py::_sg` refuses to build a group that is not inside a VPC, so an
+    # imported group without this stamp is a node Apply will skip.
+    for label, node in node_by_label.items():
+        if node["type"] != "sg":
+            continue
+        vpc = _referenced_label(attrs_by_label[label].get("vpc_id"), "aws_vpc", by_hcl_name)
+        node["data"].update({"vpc": vpc} if vpc else {})
+        warnings += [] if vpc else [
+            f"{label} (sg): imported without containment -- its `vpc_id` names no imported "
+            "aws_vpc, so Apply will skip it until you draw a VPC on the canvas and drop it inside"
+        ]
     subnets = [(label, node) for label, node in node_by_label.items() if node["type"] == "subnet"]
     for label, node in subnets:
         vpc = _referenced_label(attrs_by_label[label].get("vpc_id"), "aws_vpc", by_hcl_name)
@@ -711,7 +858,8 @@ def parse_hcl(files: dict[str, str]) -> ImportResult:
         dropped, changed = _attribute_notes(
             kind, attrs, _CARRIED_ATTRS.get(kind, set()),
             _uncarried_attribute_blocks(attrs, node["data"]),
-            {**_renamed_by_import(rtype, attrs, label), **_unreadable_numbers(kind, attrs)},
+            {**_renamed_by_import(rtype, attrs, label), **_unreadable_numbers(kind, attrs),
+             **_egress_changes(kind, attrs)},
         )
         warnings += _attribute_warnings(f"{label} ({kind})", "", dropped, changed)
         index += 1
@@ -800,6 +948,7 @@ def parse_hcl(files: dict[str, str]) -> ImportResult:
             ))
 
     warnings += _stamp_containment(node_by_label, attrs_by_label, by_hcl_name)
+    warnings += _stamp_sg_rules(node_by_label, attrs_by_label, by_hcl_name)
     _layout(nodes)
 
     edges: list[dict] = []
