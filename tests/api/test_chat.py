@@ -77,9 +77,21 @@ def test_the_route_hands_the_saved_canvas_to_the_agent(tmp_path, monkeypatch):
     assert [n["data"]["label"] for n in seen_canvas["nodes"]] == ["uploads"]
 
 
-def test_the_route_does_NOT_save_anything(tmp_path, monkeypatch):
-    """THE property. The proposal names a canvas with a second node; the file on
-    disk must still hold one."""
+def test_the_route_SAVES_the_edit(tmp_path, monkeypatch):
+    """Owner decision, 2026-07-28: the agent edits the canvas directly.
+
+    This test asserted the opposite until then -- "the route applies nothing" --
+    and it was the right contract for a surface whose review step was a
+    confirmation. It is not, now: the CANVAS is the review surface. The change
+    appears where you are already looking, the UI's undo stack picks it up
+    (Canvas.tsx records history from a `[nodes, edges]` effect, so the
+    WebSocket-driven `setNodes` lands on it exactly like a drag), and Cmd-Z
+    reverses it.
+
+    What the route still must NOT do is provision: see
+    `test_the_route_never_triggers_an_apply` below. That is the line that
+    matters -- an agent may rearrange the drawing, never build from it.
+    """
     proposed = {
         "nodes": [
             *CANVAS["nodes"],
@@ -91,10 +103,49 @@ def test_the_route_does_NOT_save_anything(tmp_path, monkeypatch):
     with TestClient(app) as client:
         _save_canvas(client, CANVAS)
         resp = client.post("/chat", params={"env": "default"}, json={"message": "add a queue"})
-        assert len(resp.json()["canvas"]["nodes"]) == 2
+        body = resp.json()
         on_disk = client.get("/canvas", params={"env": "default"}).json()
 
-    assert [n["data"]["label"] for n in on_disk["nodes"]] == ["uploads"], "the route applied the proposal"
+    assert body["status"] == "saved" and body["rev"]
+    assert sorted(n["data"]["label"] for n in on_disk["nodes"]) == ["jobs", "uploads"]
+
+
+def test_dry_run_still_writes_nothing(tmp_path, monkeypatch):
+    """`odin chat --dry-run` keeps the look-first behaviour for anyone who wants
+    it, and it must genuinely not touch the file."""
+    proposed = {
+        "nodes": [
+            *CANVAS["nodes"],
+            {"id": "sqs-1", "type": "sqs", "position": {"x": 220, "y": 0}, "data": {"label": "jobs"}},
+        ],
+        "edges": [],
+    }
+    app, _fake = _app(tmp_path, monkeypatch, Proposal(reply="ok", changes=["add"], canvas=proposed))
+    with TestClient(app) as client:
+        _save_canvas(client, CANVAS)
+        body = client.post("/chat", params={"env": "default"},
+                           json={"message": "add a queue", "dry_run": True}).json()
+        on_disk = client.get("/canvas", params={"env": "default"}).json()
+
+    assert len(body["canvas"]["nodes"]) == 2, "the preview should still describe the change"
+    assert "status" not in body, "a dry run must not report a save"
+    assert [n["data"]["label"] for n in on_disk["nodes"]] == ["uploads"]
+
+
+def test_a_proposal_with_no_changes_writes_nothing(tmp_path, monkeypatch):
+    """A question ("what is on this canvas?") must not rewrite the file with an
+    identical copy -- that would bump the revision and make every other tab
+    reload for nothing."""
+    app, _fake = _app(tmp_path, monkeypatch, Proposal(reply="You have one bucket.", canvas=CANVAS))
+    with TestClient(app) as client:
+        _save_canvas(client, CANVAS)
+        before = client.get("/canvas", params={"env": "default"}).headers.get("etag")
+        body = client.post("/chat", params={"env": "default"}, json={"message": "what is here?"}).json()
+        after = client.get("/canvas", params={"env": "default"}).headers.get("etag")
+
+    assert body["reply"] == "You have one bucket."
+    assert "status" not in body
+    assert before == after, "an answer with no edits must not touch the canvas revision"
 
 
 def test_an_unavailable_agent_is_a_200_with_a_note(tmp_path, monkeypatch):
@@ -176,3 +227,128 @@ def test_the_proposed_canvas_is_valid_input_to_the_canvas_route(tmp_path, monkey
 
     assert sorted(n["data"]["label"] for n in on_disk["nodes"]) == ["jobs", "uploads"]
     assert json.dumps(on_disk)  # round-trips as JSON, i.e. nothing exotic leaked in
+
+
+# --- the line the agent may not cross -----------------------------------------
+
+
+def test_the_route_never_triggers_an_apply(tmp_path, monkeypatch):
+    """The agent edits the DRAWING; only the user builds from it.
+
+    Owner: "only the user should press the apply button". So `/chat` may write
+    the canvas and must never reach `/apply-full` — a canvas edit is reversible
+    with Cmd-Z, whereas an apply creates real containers and, for rds, can
+    destroy real data.
+    """
+    applied: list[str] = []
+
+    async def boom(*args, **kwargs):
+        applied.append("apply")
+        raise AssertionError("chat must never provision")
+
+    monkeypatch.setattr("odin.simulate.runner.TfRunner.apply", boom, raising=False)
+    proposed = {
+        "nodes": [
+            *CANVAS["nodes"],
+            {"id": "sqs-1", "type": "sqs", "position": {"x": 220, "y": 0}, "data": {"label": "jobs"}},
+        ],
+        "edges": [],
+    }
+    app, _fake = _app(tmp_path, monkeypatch, Proposal(reply="ok", changes=["add"], canvas=proposed))
+    with TestClient(app) as client:
+        _save_canvas(client, CANVAS)
+        assert client.post("/chat", params={"env": "default"},
+                           json={"message": "add a queue"}).status_code == 200
+
+    assert applied == []
+
+
+# --- the session --------------------------------------------------------------
+
+
+def test_the_conversation_is_remembered_across_turns(tmp_path, monkeypatch):
+    """"no, make it two" is the most common second message, and it is meaningless
+    without the first."""
+    seen: list[list] = []
+
+    async def fake_propose(canvas, message, **kwargs):
+        seen.append(list(kwargs.get("history") or []))
+        return Proposal(reply=f"did {message}", canvas=canvas)
+
+    monkeypatch.setattr("odin.agent.chat.propose", fake_propose)
+    app = create_app(runtime=FakeRuntime(), store=SpecStore(tmp_path), backings=False)
+    with TestClient(app) as client:
+        _save_canvas(client, CANVAS)
+        client.post("/chat", params={"env": "default"}, json={"message": "add a queue"})
+        client.post("/chat", params={"env": "default"}, json={"message": "make it two"})
+
+    assert seen[0] == [], "the first turn has no history"
+    assert seen[1] == [("add a queue", "did add a queue")], "the second turn must see the first"
+
+
+def test_each_env_has_its_own_conversation(tmp_path, monkeypatch):
+    """Envs are isolated everywhere else in odin; a conversation about staging
+    must not leak into prod's context."""
+    seen: dict[str, list] = {}
+
+    async def fake_propose(canvas, message, **kwargs):
+        seen[message] = list(kwargs.get("history") or [])
+        return Proposal(reply="ok", canvas=canvas)
+
+    monkeypatch.setattr("odin.agent.chat.propose", fake_propose)
+    app = create_app(runtime=FakeRuntime(), store=SpecStore(tmp_path), backings=False)
+    with TestClient(app) as client:
+        _save_canvas(client, CANVAS)
+        client.post("/chat", params={"env": "default"}, json={"message": "first in default"})
+        client.post("/chat", params={"env": "staging"}, json={"message": "first in staging"})
+
+    assert seen["first in staging"] == [], "staging must not inherit default's conversation"
+
+
+def test_clear_forgets_the_conversation_and_leaves_the_canvas_alone(tmp_path, monkeypatch):
+    """Clear resets the AGENT, not your work. Rolling the canvas back would throw
+    away edits made by hand since, which is a far worse surprise than a stale
+    conversation."""
+    seen: list[list] = []
+
+    async def fake_propose(canvas, message, **kwargs):
+        seen.append(list(kwargs.get("history") or []))
+        return Proposal(reply="ok", canvas=canvas)
+
+    monkeypatch.setattr("odin.agent.chat.propose", fake_propose)
+    app = create_app(runtime=FakeRuntime(), store=SpecStore(tmp_path), backings=False)
+    with TestClient(app) as client:
+        _save_canvas(client, CANVAS)
+        client.post("/chat", params={"env": "default"}, json={"message": "first"})
+        cleared = client.post("/chat/clear", params={"env": "default"}).json()
+        client.post("/chat", params={"env": "default"}, json={"message": "second"})
+        on_disk = client.get("/canvas", params={"env": "default"}).json()
+
+    assert cleared == {"status": "cleared", "env": "default", "turns_forgotten": 1}
+    assert seen[-1] == [], "the turn after a clear must start fresh"
+    assert [n["data"]["label"] for n in on_disk["nodes"]] == ["uploads"], "clear touched the canvas"
+
+
+def test_clearing_one_env_does_not_clear_another(tmp_path, monkeypatch):
+    seen: dict[str, list] = {}
+
+    async def fake_propose(canvas, message, **kwargs):
+        seen[message] = list(kwargs.get("history") or [])
+        return Proposal(reply="ok", canvas=canvas)
+
+    monkeypatch.setattr("odin.agent.chat.propose", fake_propose)
+    app = create_app(runtime=FakeRuntime(), store=SpecStore(tmp_path), backings=False)
+    with TestClient(app) as client:
+        _save_canvas(client, CANVAS)
+        client.post("/chat", params={"env": "default"}, json={"message": "keep me"})
+        client.post("/chat/clear", params={"env": "staging"})
+        client.post("/chat", params={"env": "default"}, json={"message": "still there?"})
+
+    assert seen["still there?"] == [("keep me", "ok")]
+
+
+def test_clearing_an_env_that_never_chatted_is_a_clean_no_op(tmp_path, monkeypatch):
+    app, _fake = _app(tmp_path, monkeypatch, Proposal(canvas=CANVAS))
+    with TestClient(app) as client:
+        body = client.post("/chat/clear", params={"env": "never-used"}).json()
+    assert body == {"status": "cleared", "env": "never-used", "turns_forgotten": 0}

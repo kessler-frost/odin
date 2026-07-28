@@ -392,11 +392,26 @@ def canvas_summary(canvas: dict) -> list[dict[str, Any]]:
     ]
 
 
-def _prompt(canvas: dict, message: str) -> str:
+def _prompt(canvas: dict, message: str, history: list[tuple[str, str]] = ()) -> str:
+    """The one prompt, with the conversation so far in front of it.
+
+    History is (user, reply) pairs, replayed as text rather than resumed through
+    an SDK session id. Deliberate: odin already re-sends the CANVAS every turn
+    (it is the ground truth and the user may have changed it by hand between
+    turns), so the only thing a resumed session would add is the model's own
+    prior wording -- and replaying it here keeps the whole input visible,
+    testable, and clearable by dropping a list. An SDK-side session would put
+    the conversation somewhere odin cannot inspect or reset.
+    """
+    past = "".join(
+        f"\nEarlier — you: {said}\nEarlier — your answer: {answered}\n"
+        for said, answered in history
+    )
     return (
         f"The canvas right now (field VALUES are withheld; you get field names only):\n"
         f"{json.dumps(canvas_summary(canvas), indent=2)}\n\n"
-        f"Kinds odin can build: {', '.join(sorted(_KIND))}\n\n"
+        f"Kinds odin can build: {', '.join(sorted(_KIND))}\n"
+        f"{past}\n"
         f"The user says: {message}\n\n"
         "Call propose_edits once."
     )
@@ -489,6 +504,7 @@ def _parse_op(raw: dict) -> tuple[Op | None, str | None]:
 
 async def propose(
     canvas: dict, message: str, client_cls: type[Any] | None = None, timeout: float | None = None,
+    history: list[tuple[str, str]] = (),
 ) -> Proposal:
     """Ask the agent what to do, then decide what odin will actually do.
 
@@ -511,7 +527,7 @@ async def propose(
     )
     try:
         await asyncio.wait_for(
-            _run_agent(_prompt(canvas, message), options, client_cls or ClaudeSDKClient),
+            _run_agent(_prompt(canvas, message, history), options, client_cls or ClaudeSDKClient),
             timeout=timeout if timeout is not None else default_timeout(),
         )
     except Exception:

@@ -83,6 +83,23 @@ export default function TopBar({ wsConnected, env, onEnvChange, onApply, onViewC
     return () => window.removeEventListener('keydown', h);
   });
 
+  // The agent's conversation lives in the SERVER's memory, per env, and is
+  // cleared by a restart or by this. Tucked in the overflow menu on purpose
+  // (owner: "I don't want to see it unless I actually want to go there") --
+  // it is a rare, deliberate act, not a control to keep in view.
+  const [cleared, setCleared] = useState<number | null>(null);
+  const clearChat = async () => {
+    setMenuOpen(false);
+    const body = await fetch(`${API}/chat/clear?env=${encodeURIComponent(env || 'default')}`, {
+      method: 'POST',
+    }).then(r => r.json()).catch(() => null);
+    if (!body) return;
+    // Say what happened. A menu item that silently does nothing visible is
+    // indistinguishable from one that failed.
+    setCleared(body.turns_forgotten ?? 0);
+    setTimeout(() => setCleared(null), 4000);
+  };
+
   const exportCanvas = async () => {
     setMenuOpen(false);
     const canvas = await fetch(`${API}/canvas`).then(r => r.json()).catch(() => null);
@@ -171,6 +188,18 @@ export default function TopBar({ wsConnected, env, onEnvChange, onApply, onViewC
             >
               Export Canvas
             </button>
+            <button
+              onClick={clearChat}
+              title="Forget the agent's conversation for this environment. Your canvas is untouched."
+              className="w-full text-left font-mono text-xs py-2 px-4 text-text-secondary hover:bg-bg-tertiary hover:text-neon-purple transition-colors uppercase tracking-[1px]"
+            >
+              Clear Agent Session
+            </button>
+          </div>
+        )}
+        {cleared !== null && (
+          <div className="absolute right-0 top-full mt-1 bg-bg-secondary border border-neon-purple z-50 py-2 px-4 whitespace-nowrap font-mono text-xs text-neon-purple uppercase tracking-[1px]">
+            forgot {cleared} turn{cleared === 1 ? '' : 's'} — canvas untouched
           </div>
         )}
       </div>
