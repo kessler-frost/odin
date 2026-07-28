@@ -1255,7 +1255,7 @@ index-to-index deletion on this file.
   save-side fix may carry a baked height, which now renders instead of being
   re-derived -- visible, and one drag from fixed.
 
-- [~] **Placement's four costs: two closed, two open.** `docs/intelligence-layer.md`
+- [x] **Placement's four costs: all four closed.** `docs/intelligence-layer.md`
   named them when placement was designed, and shipping it did not address them.
 
   * **Ordering — CLOSED.** Nothing sequenced an ecs node behind its ec2 node,
@@ -1282,10 +1282,14 @@ index-to-index deletion on this file.
     reserves 256 MiB for guest kernel/containerd overhead and says so in the
     message rather than hiding the fudge inside the comparison. A canvas that
     places nothing pays nothing.
-  * **Naming — OPEN (documentation, not code).** `LimaRuntime` now means two
-    things depending on its `vm`: odin's shared VM-isolation mode, and a
-    specific EC2 instance. Distinguished by the name today; worth a clearer
-    split if a third meaning appears.
+  * **Naming — CLOSED as documentation, which is what it was.** `LimaRuntime`
+    means two things depending on its `vm`: odin's shared VM-isolation runtime
+    mode (`odin-host`) and one specific EC2 instance
+    (`odin-ec2-<env>-<label>`). Its class docstring now states both, side by
+    side, with the two constructor calls that produce them -- and
+    `DEFAULT_VM` is named for the shared one so the default cannot be mistaken
+    for "no VM". A type-level split would buy nothing today: the behaviour is
+    identical and only the target differs. Revisit if a third meaning appears.
 
 - [ ] **Placement that infers intent from geometry.** The general form of the
   first item: what a person expresses by putting one thing inside, next to, or
