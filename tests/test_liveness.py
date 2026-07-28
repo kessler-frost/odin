@@ -111,8 +111,20 @@ def test_a_process_that_merely_mentions_the_server_is_not_one(tmp_path: Path):
         cwd=tmp_path,
     )
     try:
-        listed = subprocess.run(["ps", "-xo", "pid=,command="], capture_output=True, text=True).stdout
-        assert "odin.server:create_app" in listed, "the decoy must really be visible to a ps scan"
+        # POLL for the decoy instead of scanning once. `Popen` returns before
+        # the child has finished `exec`, so a single immediate `ps` can run
+        # while the process still carries the parent's argv -- which is exactly
+        # what happened on CI (green locally, red on a loaded runner, for 87
+        # consecutive runs). Waiting for the precondition is the fix; asserting
+        # it once and hoping is what made this look like a code failure.
+        deadline = time.monotonic() + 10
+        listed = ""
+        while time.monotonic() < deadline:
+            listed = subprocess.run(["ps", "-xo", "pid=,command="], capture_output=True, text=True).stdout
+            if UVICORN in listed:
+                break
+            time.sleep(0.1)
+        assert UVICORN in listed, "the decoy must really be visible to a ps scan"
         assert util.live_server(root) is None
     finally:
         wrapper.kill()
