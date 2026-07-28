@@ -169,6 +169,35 @@ function endpointFromFacts(facts?: Record<string, unknown>): string {
   return (facts?.endpoint as string) || (facts?.DATABASE_URL as string) || '';
 }
 
+// ReactFlow edges from a stored canvas.
+//
+// Shared by the initial load AND the `canvas_updated` convergence handler
+// deliberately. The handler originally rebuilt only NODES, so a canvas change
+// that added an IAM edge converged its nodes and silently dropped the edge --
+// measured with `odin canvas set` adding an EC2 -> S3 edge, which an open tab
+// showed as 2 nodes and 0 edges indefinitely. Two code paths reading one shape
+// drift; one function cannot.
+function edgesFromCanvas(canvas: { edges?: unknown[] }): Edge[] {
+  return (canvas.edges ?? []).map((e: any) => {
+    const eType = e.data?.edgeType ?? 'network';
+    const typeDef = edgeTypes[eType] ?? edgeTypes.network;
+    const permissions = e.data?.permissions ?? [];
+    const hasLabel = eType === 'iam' && permissions.length > 0;
+    return {
+      id: e.id,
+      source: e.source,
+      target: e.target,
+      sourceHandle: e.sourceHandle ?? null,
+      targetHandle: e.targetHandle ?? null,
+      data: e.data ?? {},
+      style: edgeStyle(eType),
+      label: hasLabel ? permissions.map((p: string) => p.split(':')[1]).join(', ') : undefined,
+      labelStyle: hasLabel ? { fill: typeDef.color, fontSize: 10, fontFamily: 'monospace' } : undefined,
+      labelBgStyle: hasLabel ? { fill: '#0a0a10', stroke: typeDef.color, strokeWidth: 0.5 } : undefined,
+    };
+  });
+}
+
 type HistoryEntry = { nodes: Node[]; edges: Edge[] };
 
 // A node as it comes off `/canvas`: everything a ReactFlow node needs EXCEPT a
@@ -273,24 +302,7 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
       const { nodes: rfNodes, placed: placedCount } = placeUnpositioned(fromDisk);
       setPlaced(placedCount);
 
-      const rfEdges: Edge[] = (canvasRes.edges ?? []).map((e: any) => {
-        const eType = e.data?.edgeType ?? 'network';
-        const typeDef = edgeTypes[eType] ?? edgeTypes.network;
-        const permissions = e.data?.permissions ?? [];
-        const hasLabel = eType === 'iam' && permissions.length > 0;
-        return {
-          id: e.id,
-          source: e.source,
-          target: e.target,
-          sourceHandle: e.sourceHandle ?? null,
-          targetHandle: e.targetHandle ?? null,
-          data: e.data ?? {},
-          style: edgeStyle(eType),
-          label: hasLabel ? permissions.map((p: string) => p.split(':')[1]).join(', ') : undefined,
-          labelStyle: hasLabel ? { fill: typeDef.color, fontSize: 10, fontFamily: 'monospace' } : undefined,
-          labelBgStyle: hasLabel ? { fill: '#0a0a10', stroke: typeDef.color, strokeWidth: 0.5 } : undefined,
-        };
-      });
+      const rfEdges = edgesFromCanvas(canvasRes);
 
       setNodes(rfNodes);
       setEdges(rfEdges);
@@ -481,6 +493,9 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
         }));
         const { nodes: rfNodes } = placeUnpositioned(fromDisk);
         setNodes(rfNodes);
+        // Edges too -- see `edgesFromCanvas`. Omitting this made a CLI-added
+        // IAM edge invisible in an already-open tab.
+        setEdges(edgesFromCanvas(read.canvas));
       });
     };
     return () => { onCanvasUpdated.current = null; };

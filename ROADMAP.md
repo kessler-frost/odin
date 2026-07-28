@@ -1129,6 +1129,29 @@ future decision against these points instead of re-deriving them:
   external/LAN-reachable underlay address plus multi-Mac membership and
   cross-machine placement are still open). Additive, no core change.
 
+## Next — known, measured, not yet fixed
+
+- [ ] **An edge LABEL is mispositioned when a canvas converges live.** Found
+  while recording the IAM clip. `odin canvas set` adds an EC2 -> S3 IAM edge, an
+  already-open tab converges it (correct: 1 edge, permissions in the DOM), but
+  the label renders at **x=503** -- on top of the source node -- instead of at
+  the edge midpoint (~x=850). ReactFlow places labels from measured node
+  dimensions, and the convergence handler sets nodes and edges in the same
+  commit, so the label is positioned before the new nodes have been measured.
+  A reload fixes it, and the INITIAL load path is unaffected (the README hero
+  screenshot shows a correctly-labelled edge).
+  Likely fix: set edges in a later frame than nodes on the convergence path
+  only, or force a ReactFlow re-measure after the node commit. Verify by
+  reading the label's bounding box, not by eyeballing the GIF -- the DOM check
+  passes either way, which is exactly how this nearly shipped.
+
+- [ ] **agent-browser cannot draw a connection on the canvas.** Unchanged and
+  still open. Handles are 6px and `pointerdown` arrives with a NON-handle target
+  even when the mouse is at the handle's measured centre (`pointerup` does land
+  on it). The IAM clip is therefore CLI-driven, which turned out better -- it
+  demonstrates the edge AND live convergence -- but a mouse-drawn edge remains
+  unrecordable, so the drag-to-connect path has no automated coverage at all.
+
 ## v0.7.9 — the canvas is per-environment
 
 - [x] **The canvas is PER-ENV** (owner decision, 2026-07-27). `/canvas` was the

@@ -345,6 +345,69 @@ clip_code_panel() {
   say "odin-code-panel.gif: $(du -h "$OUT/odin-code-panel.gif" | cut -f1), $got frames"
 }
 
+
+# --- clip 3: an IAM permission edge, drawn by the CLI, appearing LIVE --------
+#
+# Driven by `odin canvas set` rather than by the mouse, for two reasons.
+#
+# The honest one: agent-browser cannot reliably draw a connection on this
+# canvas. The handles are 6px, and instrumenting the page showed `pointerdown`
+# arriving with a NON-handle target even when the mouse had been moved to the
+# handle's measured centre (`pointerup` does land on it). That is recorded in
+# .claude/CLAUDE.md as an open limitation, not something this script can fix.
+#
+# The better one: this clip now shows TWO real features at once. The edge is
+# authored through odin's own CLI, and it appears in the already-open browser
+# with no reload -- which is the per-env `canvas_updated` convergence working.
+# A mouse-drawn edge would have demonstrated only the first.
+clip_iam_edge() {
+  say "clip 3/3: IAM edge via the CLI, converging live"
+  local before="$WORK/iam-before.json" after="$WORK/iam-after.json"
+  cat > "$before" <<'JSON'
+{"nodes":[
+  {"id":"ec2-1","type":"ec2","position":{"x":260,"y":180},"data":{"label":"api-server","instance_type":"t3.micro"}},
+  {"id":"s3-1","type":"s3","position":{"x":760,"y":180},"data":{"label":"uploads"}}
+],"edges":[]}
+JSON
+  cat > "$after" <<'JSON'
+{"nodes":[
+  {"id":"ec2-1","type":"ec2","position":{"x":260,"y":180},"data":{"label":"api-server","instance_type":"t3.micro"}},
+  {"id":"s3-1","type":"s3","position":{"x":760,"y":180},"data":{"label":"uploads"}}
+],"edges":[
+  {"id":"iam-1","source":"ec2-1","target":"s3-1","data":{"edgeType":"iam","permissions":["s3:GetObject","s3:PutObject","s3:ListBucket"]}}
+]}
+JSON
+  curl -sf -X POST "$BASE/canvas?env=default" -H 'Content-Type: application/json' --data-binary "@$before" >/dev/null
+
+  agent-browser close --all >/dev/null 2>&1 || true
+  sleep 2
+  agent-browser set viewport "$VIEW_W" "$VIEW_H" "$VIEW_DPR" >/dev/null 2>&1
+  agent-browser open "$BASE/?cb=$RANDOM$RANDOM" >/dev/null 2>&1
+  sleep 6
+  [ "$(ab_eval "(()=>document.querySelectorAll('.react-flow__edge').length)()" | tr -d '"')" = "0" ] \
+    || { say "ABORT: the canvas already has an edge -- the clip must show it APPEAR"; return 1; }
+
+  rm -rf "$WORK/iam"; mkdir -p "$WORK/iam"
+  local i=0
+  # A few frames of the edgeless canvas first, so the edge visibly ARRIVES.
+  for i in 0 1 2 3 4 5; do
+    agent-browser screenshot "$WORK/iam/$(printf '%03d' "$i").png" >/dev/null 2>&1
+  done
+  curl -sf -X POST "$BASE/canvas?env=default" -H 'Content-Type: application/json' --data-binary "@$after" >/dev/null
+  for i in $(seq 6 27); do
+    agent-browser screenshot "$WORK/iam/$(printf '%03d' "$i").png" >/dev/null 2>&1
+  done
+
+  local edges
+  edges="$(ab_eval "(()=>document.querySelectorAll('.react-flow__edge').length)()" | tr -d '"')"
+  [ "${edges:-0}" -ge 1 ] || { say "ABORT: the edge never converged into the open tab"; return 1; }
+  ab_eval "(()=>/GetObject/.test(document.body.innerText))()" | grep -q true \
+    || { say "ABORT: the edge has no permission label -- the clip would show a bare line"; return 1; }
+
+  gifski --quiet --fps 6 --width "$GIF_W" -o "$OUT/odin-iam-edge.gif" "$WORK"/iam/*.png || return 1
+  say "odin-iam-edge.gif: $(du -h "$OUT/odin-iam-edge.gif" | cut -f1), $(ls "$WORK/iam" | wc -l | tr -d ' ') frames"
+}
+
 require
 mkdir -p "$OUT"
 
@@ -364,7 +427,10 @@ agent-browser close --all >/dev/null 2>&1 || true
 # on to, it does not survive a second recording in the same process.
 case "${ODIN_GIF_ONLY:-all}" in
   draw) clip_draw_apply ;;
-  code) clip_code_panel ;;
+  code) clip_code_panel && ODIN_GIF_ONLY=iam exec "$0" "$BASE" "$OUT" ;;
+  iam)  clip_iam_edge ;;
   *)    clip_draw_apply && ODIN_GIF_ONLY=code exec "$0" "$BASE" "$OUT" ;;
+  # (the code clip re-execs into the iam clip; see the note above about each
+  #  recording needing its own process)
 esac
 say "done"
