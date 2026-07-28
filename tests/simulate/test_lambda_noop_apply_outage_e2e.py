@@ -204,3 +204,30 @@ def test_a_noop_apply_cannot_report_success_on_a_function_that_never_came_back(
 
     leftover = _docker("ps", "-aq", "--filter", f"name={container_name(ENV, NODE)}")
     assert leftover.stdout.strip() == "", f"the RIE container survived: {leftover.stdout}"
+
+
+def test_a_broken_ref_is_refused_upfront_instead_of_applied(store_root, monkeypatch, lambda_cleanup):
+    """Half of the split (owner decision, 2026-07-27); see the ECS twin.
+
+    odin's wiring guard now refuses an apply carrying an unresolvable
+    `${{ghost.ENDPOINT}}` ref BEFORE it runs. That is strictly better than
+    applying it and discovering the damage later -- and it is what makes the
+    no-op test above unreachable by its original route, since that route WAS
+    the broken ref. Asserted here as the guarantee it now is.
+    """
+    assert shutil.which("tofu"), "OpenTofu must be on PATH for this integration test"
+
+    async def fake_translate(stack, **kwargs):
+        skeleton = hcl.generate_tf(stack)
+        return translate_mod.TranslateResult(
+            files=skeleton.files, unsupported=skeleton.unsupported, binary_files=skeleton.binary_files,
+        )
+    monkeypatch.setattr("odin.server.translate_mod.translate", fake_translate)
+
+    with TestClient(create_app(store=SpecStore(store_root))) as client:
+        resp = client.post("/apply-full", params={"env": ENV}, json=_canvas({"NEED": BROKEN_REF}))
+        assert resp.status_code == 409, f"an unresolvable ref must be refused, got {resp.status_code}: {resp.text}"
+        assert "ghost" in resp.text, resp.text
+        # Refused BEFORE anything ran: no container was built.
+        ps = _docker("ps", "-aq", "--filter", f"name={container_name(ENV, NODE)}")
+        assert ps.stdout.strip() == "", f"a refused apply must not have created a container: {ps.stdout}"

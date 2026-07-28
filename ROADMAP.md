@@ -1154,9 +1154,29 @@ have meant retiring a claim rather than fixing a bug.
   an `IndexError` that says nothing. Poll the task containers instead.
 
   Both ECS tests pass against real containers and real tofu (93s).
-  **`tests/simulate/test_lambda_noop_apply_outage_e2e.py` needs the same
-  treatment** — the same 409 collides with it, and the lambda equivalent of
-  "a route the guard permits" has not been established yet.
+
+  **LAMBDA: the refusal half is done and passing; the no-op half is still
+  open, and its route is genuinely harder.** ECS's route works because the
+  IMAGE is a real `aws_ecs_task_definition` attribute, so switching it is a
+  tofu update AND leaves a container that cannot start. Lambda has no such
+  field. Three candidates were checked and all are dead ends — recorded so
+  nobody re-derives them:
+  * **a bad `runtime`** — `functions.py::RUNTIME_IMAGES.get(runtime,
+    RUNTIME_IMAGES[DEFAULT_RUNTIME])` FALLS BACK to the default image, so an
+    unknown runtime silently boots a working container.
+  * **memory** — `memory_size` is neither settable from the canvas (no catalog
+    field) nor emitted by `agent/hcl.py`, so it defaults and cannot be used to
+    make `docker run` refuse.
+  * **broken `code`** — readiness is a TCP check on the RIE port
+    (`functions.py::_await_ready`), which a syntactically broken handler still
+    satisfies; the error only appears on invoke.
+
+  Suggested next step, since the claim is about odin's REPORTING rather than
+  about docker: reach the state with an INJECTED `FunctionRuntime` whose
+  redeploy raises, then assert `applied_resources_unhealthy` on the unchanged
+  canvas. Narrower than the current e2e and honest about it — it tests the
+  verdict path, not the substrate — but it keeps the guarantee under test
+  instead of retiring it.
 
 - [ ] **`test_a_killed_database_gets_its_mesh_endpoint_back_after_one_apply`.**
   A killed rds container does not come back after one apply — verdict
