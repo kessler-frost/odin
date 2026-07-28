@@ -91,9 +91,25 @@ def unquote(value: object) -> str | None:
     parsed string (verified empirically — `bucket = "x"` parses to the
     3-character string '"x"', not 'x'). Anything else (an interpolation like
     `${aws_sns_topic.t.arn}`, a bare number/bool, a nested block) is left
-    alone — only a plain quoted-literal string gets unwrapped."""
+    alone — only a plain quoted-literal string gets unwrapped.
+
+    `json.loads` rather than a slice, because `quote` is `json.dumps` and stripping
+    the quotes is only HALF its inverse: it leaves the ESCAPES in place. Found
+    importing an ec2 node's `userData` — a shell script came back with a literal
+    two-character `\\n` instead of a newline, so it would have run as one line on
+    a real VM, and re-emitting doubled the escape (`\\\\n`) so the round trip was
+    not even stable. Any field that can hold a newline or a quote had the same
+    defect: an ssm parameter's value, a secret's value, an iam policy.
+
+    The slice stays as the fallback for a quoted string that is not valid JSON —
+    an HCL expression like `"a" + "b"`, or a Windows path with an invalid escape.
+    Those keep exactly their previous behaviour rather than raising."""
     if isinstance(value, str) and value.startswith('"') and value.endswith('"'):
-        return value[1:-1]
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            return value[1:-1]
+        return decoded if isinstance(decoded, str) else value[1:-1]
     return value if isinstance(value, str) else None
 
 

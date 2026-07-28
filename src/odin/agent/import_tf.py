@@ -29,9 +29,12 @@ Two modes (research-verified, docs/superpowers/research/research-tofu-provider.m
 from __future__ import annotations
 
 import asyncio
+import io
+import json
 import os
 import shutil
 import tempfile
+import zipfile
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,7 +69,34 @@ _KIND = {
     # `subnets` references.
     "aws_vpc": "vpc",
     "aws_subnet": "subnet",
+    # v0.8.4: the two that made a NETWORK canvas un-round-trippable. An
+    # `aws_security_group` is where the interesting half lives -- its rules are
+    # what the Nebula firewall actually compiles from, so losing them on import
+    # loses the security posture, not a label. `aws_ecr_repository` is here
+    # because it is a one-argument resource that was being reported unsupported
+    # for no reason other than nobody having written the line.
+    "aws_security_group": "sg",
+    "aws_ecr_repository": "ecr",
+    # v0.8.4: an `aws_instance` is a real Lima VM to odin, and it has NO `name`
+    # argument -- its label comes from the `odin:node` tag `_label` already falls
+    # back to. Its optional SSH key lives on a companion `aws_key_pair`, folded
+    # back on below rather than becoming a node of its own.
+    "aws_instance": "ec2",
+    # v0.8.4: one canvas `ecs` node is THREE tf resources (service + task
+    # definition + the shared cluster), so only the SERVICE becomes a node --
+    # the other two fold on, the same shape as the alb trio.
+    "aws_ecs_service": "ecs",
+    # v0.8.4, the last kind. A function's CONFIG is all in the HCL; its CODE is
+    # in a zip beside `main.tf`, so `parse_hcl_dir` recovers it and
+    # `parse_hcl_text` cannot -- see `_stamp_lambda`, which says so rather than
+    # letting odin's default payload pass for the user's own function.
+    "aws_lambda_function": "lambda",
 }
+# Neither of these becomes a node. The task definition folds onto its service
+# (image/port/memory/cpu live there, not on the service); the cluster is a
+# singleton odin always emits exactly one of, named "odin", so importing it would
+# invent a node the canvas has no kind for.
+_ECS_COMPANION_TYPES = ("aws_ecs_task_definition", "aws_ecs_cluster")
 # W2.5: the two OTHER types an `alb` canvas node expands to. Neither becomes a
 # node of its own -- they fold ONTO the alb node the same way
 # aws_secretsmanager_secret_version folds onto its secret, which is what makes
@@ -83,6 +113,9 @@ _NAME_ATTR = {
     "aws_elasticache_cluster": "cluster_id",
     "aws_db_instance": "identifier",
     "aws_lb": "name",
+    "aws_security_group": "name", "aws_ecr_repository": "name",
+    "aws_ecs_service": "name",
+    "aws_lambda_function": "function_name",
 }
 # canvas kind -> aws_* type, for mode (b) (the inverse of `_KIND`). iam_role,
 # logs, secret and ssm have no backing to enumerate live resources from (all
@@ -98,7 +131,23 @@ _NAME_ATTR = {
 # password rather than the original one. `alb` (W2.5) stays out of the live path
 # too -- one canvas node is three aws_* resources, so there is no single live
 # resource to import it from (mode (a), reading an existing HCL project, works).
-_NO_LIVE_IMPORT = {"iam_role", "logs", "secret", "ssm", "elasticache", "alb"}
+# `sg` and `ecr` (v0.8.4) stay OUT of the live path deliberately, and for
+# different reasons. A security group's live import id is its `sg-...` GroupId,
+# which is minted by the gateway and appears nowhere on a canvas, so there is no
+# id to resolve from outside an Apply. ECR has no `_import_id` shape either --
+# its repositories exist as gateway-model records. Mode (a), reading an existing
+# HCL project, works for both; claiming mode (b) without an id that resolves is
+# how a live import would generate a bogus import block and fail at apply.
+# `ec2` is out for the same reason as `sg`: an instance's live import id is its
+# `i-...` InstanceId, minted at RunInstances and absent from any canvas.
+# `ecs` is out for the alb reason rather than the id reason: one canvas node is
+# three tf resources, so there is no single live resource to import it from.
+# `lambda` is out of the live path because its CODE is not recoverable from any
+# AWS API odin implements -- a live import would produce a function whose body is
+# odin's default payload, which is the substitution this whole module refuses.
+_NO_LIVE_IMPORT = {
+    "iam_role", "logs", "secret", "ssm", "elasticache", "alb", "sg", "ecr", "ec2", "ecs", "lambda",
+}
 _TF_TYPE = {kind: rtype for rtype, kind in _KIND.items() if kind not in _NO_LIVE_IMPORT}
 
 # The HCL arguments each kind CARRIES into the canvas -- so a round-trip through
@@ -156,6 +205,37 @@ _CARRIED_ATTRS = {
     "alb": {"name", "internal", "load_balancer_type", "subnets", "tags"},
     "vpc": {"cidr_block", "tags"},
     "subnet": {"cidr_block", "vpc_id", "tags"},
+    # v0.8.4. `ingress` IS carried -- into the node's `ingressRules` text, one
+    # `protocol:port:source` line per block, which is what `hcl.py::_sg` reads
+    # back. `egress` is carried in the weaker sense the others in this map use:
+    # odin always re-emits its own wide-open default (`_DEFAULT_EGRESS`), so a
+    # source egress that DIFFERS is a changed argument, not a dropped one, and
+    # says so via `_FIXED_VALUES` below. `vpc_id` is CONTAINMENT, stamped by
+    # `_stamp_containment` exactly as a subnet's is.
+    "sg": {"name", "vpc_id", "ingress", "egress", "tags"},
+    "ecr": {"name", "tags"},
+    # `subnet_id` is containment; `vpc_security_group_ids` becomes the node's
+    # `securityGroups` label list; `key_name` is a reference to the companion
+    # aws_key_pair whose `public_key` is the real value.
+    "ec2": {"ami", "instance_type", "subnet_id", "vpc_security_group_ids",
+            "key_name", "user_data", "tags"},
+    # `depends_on` is carried in the sense that odin RE-DERIVES it from the
+    # node's own `${{...}}` refs, so it is never a dropped argument -- but see
+    # `_stamp_ecs_taskdef`: the refs themselves are not in the HCL at all and
+    # cannot come back, which is reported rather than left to be discovered.
+    "ecs": {
+        "name", "cluster", "task_definition", "desired_count", "launch_type",
+        "wait_for_steady_state", "deployment_minimum_healthy_percent",
+        "deployment_maximum_percent", "timeouts", "placement_constraints",
+        "depends_on", "load_balancer", "tags",
+    },
+    # `filename`/`source_code_hash` are carried in the sense that odin re-derives
+    # both from the code it materializes itself; `role` is either a reference to a
+    # drawn iam_role node or odin's own auto-generated one (`_stamp_lambda`).
+    "lambda": {
+        "function_name", "role", "handler", "runtime", "filename",
+        "source_code_hash", "depends_on", "tags",
+    },
 }
 # The companion resources' equivalent: which of THEIR arguments a round trip
 # reproduces (hcl.py's alb companion pass emits exactly these). Until v0.7.1
@@ -200,6 +280,14 @@ _FIXED_VALUES = {
     ("aws_lb_listener", "protocol"): "http",
     ("aws_sns_topic_subscription", "protocol"): "sqs",
     ("aws_sns_topic_subscription", "raw_message_delivery"): "true",
+    # odin emits all four of these unconditionally (`hcl.py::_ecs`), and the
+    # rolling-update pair is load-bearing: `_ECS_MIN_HEALTHY_PERCENT = 100` is
+    # what keeps the previous revision serving while a new one comes up, so a
+    # source that lowered it comes back with different rollout behaviour.
+    ("ecs", "launch_type"): "ec2",
+    ("ecs", "wait_for_steady_state"): "true",
+    ("ecs", "deployment_minimum_healthy_percent"): "100",
+    ("ecs", "deployment_maximum_percent"): "200",
 }
 # The default odin's `_node_data` falls back to when a NUMERIC argument's source
 # value isn't a literal number odin can read (`allocated_storage = var.size`,
@@ -224,7 +312,9 @@ _UNREADABLE_NUMBERS = {
 # which is the worst possible combination: the tags were dropped AND the drop
 # was suppressed. Reading them is the fix -- hcl.py already re-emits whatever a
 # node carries -- not a warning about losing them.
-_TAGGED_KINDS = {"s3", "logs", "secret", "ssm", "rds", "alb", "vpc", "subnet", "elasticache"}
+# Every builder in hcl.py appends `_tags_block(res)`, so user tags round-trip
+# for every kind -- these are the ones whose tags are read BACK into `data.tags`.
+_TAGGED_KINDS = {"s3", "logs", "secret", "ssm", "rds", "alb", "vpc", "subnet", "elasticache", "sg", "ecr", "ec2", "ecs", "lambda"}
 _CONTAINER_KINDS = ("vpc", "subnet")
 
 # Canvas geometry for the layout pass. These ARE the UI's own container sizes
@@ -547,6 +637,25 @@ def _node_data(kind: str, label: str, attrs: dict) -> dict:
         node_type = hcl.unquote(attrs.get("node_type"))
         if isinstance(node_type, str):
             data["nodeType"] = node_type
+    if kind == "lambda":
+        for attr, field in (("runtime", "runtime"), ("handler", "handler")):
+            value = hcl.unquote(attrs.get(attr))
+            if isinstance(value, str):
+                data[field] = value
+    if kind == "ecs":
+        count = _int_text(attrs.get("desired_count"))
+        if count is not None:
+            data["count"] = count
+    if kind == "ec2":
+        # `userData` is carried verbatim, and that is a deliberate trust
+        # decision, not an oversight: it is a shell script odin will run on a
+        # real VM. SECURITY.md's rule for the whole import path applies -- treat
+        # an imported .tf like a shell script, because for this field it IS one.
+        for attr, field in (("ami", "ami"), ("instance_type", "instanceType"),
+                            ("user_data", "userData")):
+            value = hcl.unquote(attrs.get(attr))
+            if isinstance(value, str):
+                data[field] = value
     return data
 
 
@@ -555,6 +664,380 @@ def _referenced_label(value: object, rtype: str, by_hcl_name: dict[str, str]) ->
     at (`vpc_id = aws_vpc.net.id` -> the vpc node's label), or None."""
     target = _ref_target(value)
     return by_hcl_name.get(f"{rtype}.{target}") if target else None
+
+
+# hcl.py::_DEFAULT_EGRESS, as the parsed block it becomes. odin re-emits exactly
+# this for every security group and offers no way to author anything else, so an
+# imported group whose egress DIFFERS is a changed argument -- and in the one
+# direction that matters: a source that restricted outbound traffic comes back
+# wide open. That is a real posture change, and v0.8.4 is the first release in
+# which it could happen at all, so it is reported from the start rather than
+# discovered later.
+_ODIN_EGRESS = {"from_port": 0, "to_port": 0, "protocol": "-1", "cidr_blocks": ["0.0.0.0/0"]}
+
+
+def _same_literal(value: object, want: object) -> bool:
+    """`_literal` equality that also works for a LIST argument.
+
+    `_literal` only unquotes a `str`, so a list falls through to `str(...)` and
+    `['"0.0.0.0/0"']` (what python-hcl2 hands back -- quotes retained on the
+    MEMBERS) never equals `['0.0.0.0/0']`. Measured: that mismatch made odin's
+    own generated egress report itself as a changed argument, i.e. a warning on
+    every single security-group import, which is exactly how a real warning gets
+    trained out of people.
+    """
+    if isinstance(want, list):
+        return isinstance(value, list) and [_literal(v) for v in value] == [_literal(w) for w in want]
+    return _literal(value) == _literal(want)
+
+
+def _egress_changes(kind: str, attrs: dict) -> dict[str, str]:
+    """`{"egress": why}` when a security group's outbound rules are not the wide
+    -open default odin always emits. Empty for every other kind, and for a group
+    that already matches -- which is every group odin generated itself, so its
+    own round trip stays quiet."""
+    if kind != "sg":
+        return {}
+    blocks = attrs.get("egress") or []
+    same = len(blocks) == 1 and all(
+        _same_literal(blocks[0].get(key), want) for key, want in _ODIN_EGRESS.items()
+    )
+    return {} if same else {
+        "egress": "odin always emits its own wide-open egress (0-65535 to 0.0.0.0/0) and has no "
+                  "field for outbound rules, so a restricted one comes back UNRESTRICTED"
+    }
+
+
+def _ingress_rule_line(block: dict, by_hcl_name: dict[str, str]) -> str | None:
+    """One `protocol:port:source` line from an `ingress {}` block, or None when
+    the block cannot be expressed as one.
+
+    The exact inverse of `hcl.py::_ingress_source`: `cidr_blocks` is a literal
+    CIDR, and `security_groups` is another SG NODE'S LABEL -- the
+    identity-based "only the web tier may reach me" rule, which is the form the
+    Nebula firewall compiles to a `group:` rule. Reading it back as the referenced
+    group's label (not its `sg-` id) is what lets the rule survive a round trip
+    at all, since the canvas has no ids in it.
+
+    A port RANGE cannot be expressed: odin's field is one port, and `_sg` emits
+    `from_port == to_port`. Returning None sends it to the dropped list rather
+    than silently narrowing a range to its lower bound.
+    """
+    from_port, to_port = _int_text(block.get("from_port")), _int_text(block.get("to_port"))
+    protocol = hcl.unquote(block.get("protocol"))
+    if from_port is None or from_port != to_port or not isinstance(protocol, str):
+        return None
+    cidrs = block.get("cidr_blocks") or []
+    groups = block.get("security_groups") or []
+    source = next(
+        (text for value in cidrs if isinstance(text := hcl.unquote(value), str) and "/" in text),
+        None,
+    ) or next(
+        (label for value in groups
+         if (label := _referenced_label(value, "aws_security_group", by_hcl_name))),
+        None,
+    )
+    return f"{protocol}:{from_port}:{source}" if source else None
+
+
+_ODIN_PLACEMENT_PREFIX = "attribute:odin.instance == "
+
+
+def _placement_host(attrs: dict) -> str | None:
+    """The EC2 node a service's tasks were pinned to, out of its real
+    `placement_constraints { type = "memberOf" }`.
+
+    This is the owner's "an ecs box inside an ec2 box means ecs ON ec2" gesture
+    as it survives Terraform, so losing it on import would silently move a
+    workload back onto the shared host -- a different machine, with different
+    memory, reported as a clean import.
+    """
+    for block in attrs.get("placement_constraints") or []:
+        expression = hcl.unquote(block.get("expression"))
+        if isinstance(expression, str) and expression.startswith(_ODIN_PLACEMENT_PREFIX):
+            return expression[len(_ODIN_PLACEMENT_PREFIX):].strip() or None
+    return None
+
+
+def _container_definition(taskdef: dict) -> dict:
+    """The single container out of a task definition's `container_definitions`.
+
+    It is a JSON STRING literal in the HCL, so this needs `unquote` to be a REAL
+    inverse of `quote` -- which it only became in this same release. With the old
+    quote-stripping version the escaped inner quotes survived and `json.loads`
+    could not read it at all.
+    """
+    raw = hcl.unquote(taskdef.get("container_definitions"))
+    if not isinstance(raw, str):
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return parsed[0] if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict) else {}
+
+
+def _lambda_code(archives: dict[str, bytes], filename: str) -> str | None:
+    """The function body out of its deployment zip, or None.
+
+    odin materializes a single-entry zip beside `main.tf` and references it by
+    filename (`hcl.py::_lambda`), so the code is recoverable in DIRECTORY mode and
+    simply absent in text mode. `_stamp_lambda` reports the difference rather than
+    letting odin's `_DEFAULT_LAMBDA_CODE` pass for the user's own function.
+    """
+    raw = archives.get(filename)
+    if raw is None:
+        return None
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            names = archive.namelist()
+            return archive.read(names[0]).decode() if names else None
+    except (zipfile.BadZipFile, UnicodeDecodeError, KeyError):
+        return None
+
+
+def _stamp_lambda(
+    node_by_label: dict[str, dict], attrs_by_label: dict[str, dict], by_hcl_name: dict[str, str],
+    role_names: dict[str, str], archives: dict[str, bytes],
+) -> tuple[list[str], set[str]]:
+    """Resolve each function's role and code. Returns (warnings, labels to DROP).
+
+    ## The phantom role, which was a defect before lambda import existed
+
+    A lambda drawn with no `role` gets an AUTO-GENERATED `aws_iam_role`
+    (`hcl.py` pass 3, `name = "<function>-role"`). Because `_KIND` maps
+    `aws_iam_role` to a real canvas kind, importing odin's own generated project
+    produced an `iam_role` NODE THE USER NEVER DREW -- measured before this
+    function existed: a one-lambda canvas round-tripped into a canvas containing
+    one `iam_role` called `thumbnailer-role` and no function at all. So the role
+    is dropped here when it is odin's own, and the node's `role` field is left
+    empty, which is exactly what the canvas said in the first place.
+
+    Detecting it reconstructs hcl.py's `<function>-role` NAMING CONVENTION, and
+    that is a compromise worth naming: the generated HCL carries no marker
+    distinguishing an auto-role from a drawn one (both get the same
+    `assume_role_policy` -- `_iam_role` and the auto pass emit the identical
+    default Lambda trust policy), so the name is the only signal available. A
+    user who draws a role and happens to call it `<function>-role` gets it folded
+    in; the effect is that their `role` field comes back empty and odin
+    regenerates the same role, so the Terraform is unchanged.
+    """
+    warnings: list[str] = []
+    drop: set[str] = set()
+    for label, node in node_by_label.items():
+        if node["type"] != "lambda":
+            continue
+        attrs = attrs_by_label[label]
+
+        role_label = _referenced_label(attrs.get("role"), "aws_iam_role", by_hcl_name)
+        auto = role_label is not None and role_names.get(role_label) == f"{label}-role"
+        if role_label and not auto:
+            node["data"]["role"] = role_label
+        if auto:
+            drop.add(role_label)
+        warnings += [] if role_label or attrs.get("role") is None else [
+            f"{label} (lambda): its `role` names no imported aws_iam_role, so odin will "
+            "auto-generate an execution role for it on the next Apply"
+        ]
+
+        filename = hcl.unquote(attrs.get("filename"))
+        code = _lambda_code(archives, filename) if isinstance(filename, str) else None
+        if code is not None:
+            node["data"]["code"] = code
+        warnings += [] if code is not None else [
+            f"{label} (lambda): its CODE could not be imported -- a function's body lives in "
+            f"{filename or 'a zip'} beside main.tf, not in the HCL. Reading a directory "
+            "(`odin translate import <dir>`) recovers it; from HCL text alone the node comes back "
+            "with odin's DEFAULT placeholder payload, which is NOT your function."
+        ]
+    return warnings, drop
+
+
+def _stamp_ecs_taskdef(
+    node_by_label: dict[str, dict], attrs_by_label: dict[str, dict], by_hcl_name: dict[str, str],
+    taskdefs: dict[str, dict],
+) -> list[str]:
+    """Fold each service's task definition back onto its node, and say what a
+    round trip cannot bring with it.
+
+    `image`, `port`, `memory` and `cpu` are all on the TASK DEFINITION, not the
+    service, so without this the node comes back with a default image and no
+    resources -- an nginx placeholder where the user's own container was.
+
+    THE WIRING IS THE HONEST GAP, and it is not this importer's doing: a
+    workload's `${{db.DATABASE_URL}}` refs are deliberately NEVER interpolated
+    into the HCL (`hcl.py`'s `_WIRED_KINDS` note -- a resolved DATABASE_URL
+    carries the database password, so writing it into the generated config would
+    put a credential in `terraform.tfstate` in plaintext AND drift on every
+    plan). Only `depends_on` survives, which names WHICH producers the service
+    consumed but not which variable or attribute. So the ordering round-trips and
+    the values cannot, and an imported service will start with no configuration
+    it did not have on the canvas. `depends_on` is used to name the producers in
+    the warning, which is the most an import can honestly offer here.
+    """
+    warnings: list[str] = []
+    for label, node in node_by_label.items():
+        if node["type"] != "ecs":
+            continue
+        attrs = attrs_by_label[label]
+
+        target = _ref_target(attrs.get("task_definition"))
+        taskdef = taskdefs.get(target or "", {})
+        if not taskdef:
+            warnings.append(
+                f"{label} (ecs): its `task_definition` names no imported aws_ecs_task_definition, so "
+                "the service comes back with odin's DEFAULT image and no port -- not the container "
+                "it was running"
+            )
+        container = _container_definition(taskdef)
+        image = container.get("image")
+        if isinstance(image, str):
+            node["data"]["image"] = image
+        ports = container.get("portMappings") or []
+        port = ports[0].get("containerPort") if ports and isinstance(ports[0], dict) else None
+        if port is not None:
+            node["data"]["port"] = str(port)
+        for attr, field in (("memory", "memory"), ("cpu", "cpu")):
+            value = _int_text(taskdef.get(attr))
+            if value is not None:
+                node["data"][field] = value
+
+        host = _placement_host(attrs)
+        if host:
+            node["data"]["host"] = host
+
+        # A `depends_on` entry parses as `'${aws_db_instance.app_db}'` -- an
+        # interpolation wrapper around the `<type>.<name>` key `by_hcl_name` is
+        # keyed by, and with NO attribute suffix, unlike every other reference in
+        # this file. So neither `_ref_target` (which pulls the NAME out of
+        # `${aws_x.y.arn}`) nor the raw string resolves it: the first draft used
+        # each in turn and the warning named "resources this file does not
+        # define" for a database sitting right there in the same file. Printed the
+        # real parsed value rather than reasoning about it a third time.
+        producers = [
+            found for value in (attrs.get("depends_on") or [])
+            if (found := by_hcl_name.get(str(value).strip().removeprefix("${").removesuffix("}")))
+            and found != host  # see below
+        ]
+        # Only warn about producers that are NOT the placement host. `depends_on`
+        # has TWO sources in hcl.py -- the node's env refs AND
+        # `_placement_dependency` (the instance a placed service must not start
+        # before) -- and a service placed inside an ec2 box with no env refs at
+        # all has a `depends_on` naming only that instance. Measured end to end
+        # through the real CLI: such a service was told to "re-add the env
+        # references it consumed" when it had never had any. A warning that fires
+        # on a correct import is worse than no warning, because it is the reason
+        # people stop reading them.
+        warnings += [] if not producers else [
+            f"{label} (ecs): its canvas wiring cannot be imported -- a `${{{{producer.ATTR}}}}` env "
+            "reference is deliberately never written into the generated Terraform (it would put a "
+            "resolved password into tfstate). NEITHER the values NOR the ordering survive: odin "
+            "re-derives `depends_on` FROM those refs, so a re-generated project has no ordering "
+            f"either. This service depended on "
+            f"{', '.join(producers) or 'resources this file does not define'}; re-add the env "
+            "references it consumed."
+        ]
+    return warnings
+
+
+def _stamp_ec2_wiring(
+    node_by_label: dict[str, dict], attrs_by_label: dict[str, dict], by_hcl_name: dict[str, str],
+    key_pairs: dict[str, dict],
+) -> list[str]:
+    """Rebuild an instance's containment, security groups and SSH key.
+
+    Three references, each of which decides whether the node can be applied at
+    all or what it is protected by, so each has its own warning rather than one
+    vague line:
+
+    * `subnet_id` -> the `subnet`/`vpc` stamps. `hcl.py::_ec2` REFUSES to build
+      an instance that is not inside a subnet, so a missing stamp is a node Apply
+      silently skips.
+    * `vpc_security_group_ids` -> the `securityGroups` field, one LABEL per line
+      (`_security_group_refs` reads exactly that). An id odin cannot resolve to
+      an imported group is dropped and counted -- the regenerated instance is
+      then in FEWER groups than the source, which for an inbound-deny default
+      means less reachable, not more exposed, but is still a posture change.
+    * `key_name` -> the companion `aws_key_pair`'s `public_key`, followed by
+      REFERENCE rather than by reconstructing the `<name>_key` naming convention:
+      the convention is hcl.py's private business, and a hand-authored project
+      names its key pairs however it likes.
+
+    A post-pass for `_stamp_sg_rules`' reason -- a group or key pair may be
+    defined after the instance that points at it.
+    """
+    warnings: list[str] = []
+    for label, node in node_by_label.items():
+        if node["type"] != "ec2":
+            continue
+        attrs = attrs_by_label[label]
+
+        subnet = _referenced_label(attrs.get("subnet_id"), "aws_subnet", by_hcl_name)
+        vpc = node_by_label[subnet]["data"].get("vpc") if subnet in node_by_label else None
+        node["data"].update({"subnet": subnet, "vpc": vpc} if subnet and vpc else {})
+        warnings += [] if subnet and vpc else [
+            f"{label} (ec2): imported without containment -- its `subnet_id` names no imported "
+            "aws_subnet inside an imported aws_vpc, so Apply will skip it (\"not contained inside "
+            "a Subnet on the canvas\") until you draw a VPC + Subnet and drop it inside"
+        ]
+
+        wanted = attrs.get("vpc_security_group_ids") or []
+        groups = [
+            found for value in wanted
+            if (found := _referenced_label(value, "aws_security_group", by_hcl_name))
+        ]
+        if groups:
+            node["data"]["securityGroups"] = "\n".join(groups)
+        lost = len(wanted) - len(groups)
+        warnings += [] if not lost else [
+            f"{label} (ec2): {lost} of {len(wanted)} security group(s) could not be imported -- "
+            "the id names no imported aws_security_group, so the regenerated instance is in FEWER "
+            "groups than the source and the rules those groups carried do not apply to it"
+        ]
+
+        target = _ref_target(attrs.get("key_name"))
+        public_key = hcl.unquote((key_pairs.get(target) or {}).get("public_key")) if target else None
+        if isinstance(public_key, str):
+            node["data"]["key"] = public_key
+        warnings += [] if target is None or isinstance(public_key, str) else [
+            f"{label} (ec2): its `key_name` names no imported aws_key_pair, so the instance comes "
+            "back with NO SSH key and you will not be able to log in to it"
+        ]
+    return warnings
+
+
+def _stamp_sg_rules(
+    node_by_label: dict[str, dict], attrs_by_label: dict[str, dict], by_hcl_name: dict[str, str]
+) -> list[str]:
+    """Rebuild each security group's `ingressRules` text from its own blocks.
+
+    A POST-pass, like `_stamp_containment`, and for the same reason: a rule may
+    reference a group defined LATER in the file, which is not yet in
+    `by_hcl_name` while the nodes are still being built.
+
+    An unexpressible block is named rather than dropped in silence. Losing an
+    ingress rule quietly is the worst import defect available here -- the
+    regenerated group would be MORE restrictive than the source (traffic that
+    used to be allowed stops), and nothing on the canvas would show the rule had
+    ever existed.
+    """
+    warnings: list[str] = []
+    for label, node in node_by_label.items():
+        if node["type"] != "sg":
+            continue
+        blocks = attrs_by_label[label].get("ingress") or []
+        lines = [_ingress_rule_line(block, by_hcl_name) for block in blocks]
+        kept = [line for line in lines if line]
+        if kept:
+            node["data"]["ingressRules"] = "\n".join(kept)
+        lost = len(lines) - len(kept)
+        warnings += [] if not lost else [
+            f"{label} (sg): {lost} of {len(lines)} ingress rule(s) could not be imported -- odin's "
+            "rule is one `protocol:port:source` with a single port and a CIDR or an imported "
+            "security group, so a port RANGE or a source odin cannot resolve is left out. The "
+            "regenerated group allows LESS than the source did."
+        ]
+    return warnings
 
 
 def _stamp_containment(
@@ -575,6 +1058,18 @@ def _stamp_containment(
     at import (field test U2).
     """
     warnings: list[str] = []
+    # v0.8.4: an sg's `vpc_id` is containment too, and EXACTLY as load-bearing --
+    # `hcl.py::_sg` refuses to build a group that is not inside a VPC, so an
+    # imported group without this stamp is a node Apply will skip.
+    for label, node in node_by_label.items():
+        if node["type"] != "sg":
+            continue
+        vpc = _referenced_label(attrs_by_label[label].get("vpc_id"), "aws_vpc", by_hcl_name)
+        node["data"].update({"vpc": vpc} if vpc else {})
+        warnings += [] if vpc else [
+            f"{label} (sg): imported without containment -- its `vpc_id` names no imported "
+            "aws_vpc, so Apply will skip it until you draw a VPC on the canvas and drop it inside"
+        ]
     subnets = [(label, node) for label, node in node_by_label.items() if node["type"] == "subnet"]
     for label, node in subnets:
         vpc = _referenced_label(attrs_by_label[label].get("vpc_id"), "aws_vpc", by_hcl_name)
@@ -663,7 +1158,7 @@ def _layout(nodes: list[dict]) -> None:
                _MIN_SUBNET_SIZE if node["type"] == "subnet" else None)
 
 
-def parse_hcl(files: dict[str, str]) -> ImportResult:
+def parse_hcl(files: dict[str, str], archives: dict[str, bytes] | None = None) -> ImportResult:
     """Mode (a) core: `files` maps filename -> HCL text (a single-string
     caller passes `{"main.tf": text}`)."""
     try:
@@ -680,6 +1175,8 @@ def parse_hcl(files: dict[str, str]) -> ImportResult:
     subscriptions: list[tuple[str, dict]] = []
     secret_versions: list[tuple[str, dict]] = []
     alb_companions: list[tuple[str, str, dict]] = []
+    key_pairs: dict[str, dict] = {}
+    taskdefs: dict[str, dict] = {}
     node_by_label: dict[str, dict] = {}
     attrs_by_label: dict[str, dict] = {}
     index = 0
@@ -693,6 +1190,18 @@ def parse_hcl(files: dict[str, str]) -> ImportResult:
             continue
         if rtype in _ALB_COMPANION_TYPES:
             alb_companions.append((rtype, rname, attrs))
+            continue
+        if rtype in _ECS_COMPANION_TYPES:
+            # The task definition folds onto its service; the cluster is a
+            # singleton odin always emits and the canvas has no kind for.
+            if rtype == "aws_ecs_task_definition":
+                taskdefs[rname] = attrs
+            continue
+        if rtype == "aws_key_pair":
+            # A COMPANION, like a secret version: it folds onto the instance that
+            # references it and never becomes a node. Keyed by HCL resource name
+            # because that is what the instance's `key_name` interpolation names.
+            key_pairs[rname] = attrs
             continue
         kind = _KIND.get(rtype)
         if kind is None:
@@ -711,7 +1220,8 @@ def parse_hcl(files: dict[str, str]) -> ImportResult:
         dropped, changed = _attribute_notes(
             kind, attrs, _CARRIED_ATTRS.get(kind, set()),
             _uncarried_attribute_blocks(attrs, node["data"]),
-            {**_renamed_by_import(rtype, attrs, label), **_unreadable_numbers(kind, attrs)},
+            {**_renamed_by_import(rtype, attrs, label), **_unreadable_numbers(kind, attrs),
+             **_egress_changes(kind, attrs)},
         )
         warnings += _attribute_warnings(f"{label} ({kind})", "", dropped, changed)
         index += 1
@@ -800,6 +1310,32 @@ def parse_hcl(files: dict[str, str]) -> ImportResult:
             ))
 
     warnings += _stamp_containment(node_by_label, attrs_by_label, by_hcl_name)
+    warnings += _stamp_sg_rules(node_by_label, attrs_by_label, by_hcl_name)
+    warnings += _stamp_ec2_wiring(node_by_label, attrs_by_label, by_hcl_name, key_pairs)
+    warnings += _stamp_ecs_taskdef(node_by_label, attrs_by_label, by_hcl_name, taskdefs)
+    role_names = {
+        label: str(hcl.unquote(attrs_by_label[label].get("name")) or "")
+        for label, node in node_by_label.items() if node["type"] == "iam_role"
+    }
+    lambda_warnings, folded_roles = _stamp_lambda(
+        node_by_label, attrs_by_label, by_hcl_name, role_names, archives or {},
+    )
+    warnings += lambda_warnings
+    # A folded auto-role must leave BOTH lists: the node list the canvas is built
+    # from, and `node_by_label`, which later passes read.
+    nodes = [node for node in nodes if node["id"] not in folded_roles]
+    for label in folded_roles:
+        node_by_label.pop(label, None)
+    # ...and its WARNINGS go with it. The per-resource honesty pass ran while the
+    # role was still a node, so a folded auto-role left behind
+    # "thumbnailer-role (iam_role): imported without unmodeled attribute(s):
+    # assume_role_policy" -- about a node that no longer exists, on every single
+    # lambda import. Warning noise is not harmless here: this module's whole value
+    # is that its warnings are worth reading.
+    warnings = [
+        warning for warning in warnings
+        if not any(warning.startswith(f"{label} (iam_role)") for label in folded_roles)
+    ]
     _layout(nodes)
 
     edges: list[dict] = []
@@ -831,13 +1367,19 @@ def parse_hcl(files: dict[str, str]) -> ImportResult:
     return ImportResult(nodes=nodes, edges=edges, unsupported=unsupported, warnings=warnings)
 
 
-def parse_hcl_text(text: str) -> ImportResult:
-    return parse_hcl({"main.tf": text})
+def parse_hcl_text(text: str, archives: dict[str, bytes] | None = None) -> ImportResult:
+    return parse_hcl({"main.tf": text}, archives)
 
 
 def parse_hcl_dir(directory: Path) -> ImportResult:
+    """Directory mode reads the ZIPS as well as the `.tf` files -- a lambda's body
+    lives in one, so text mode can only ever report it missing (`_stamp_lambda`).
+    Synchronous on purpose: `.read_bytes()` on a page-cached few-KB archive is
+    sub-millisecond, and an async file API in Python is a thread pool in a costume
+    (the concurrency note in .claude/CLAUDE.md)."""
     files = {p.name: p.read_text() for p in sorted(directory.glob("*.tf"))}
-    return parse_hcl(files)
+    archives = {p.name: p.read_bytes() for p in sorted(directory.glob("*.zip"))}
+    return parse_hcl(files, archives)
 
 
 def _import_id(resource: LiveResource, gateway_port: int) -> str:

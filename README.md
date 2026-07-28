@@ -543,13 +543,13 @@ prose explanation of a failure, and the evidence it reads is still there in
   forwards to a real backing or answers from its own per-service model store. EC2,
   VPC, SG, IAM, ECR, Lambda and ECS have no open-source AWS API to borrow, so odin
   owns the model and binds it to a real substrate.
-- **Translation** (`src/odin/agent/`) is deterministic in both directions, and
-  the two directions do not cover the same ground. Canvas → Terraform covers
-  every kind odin builds. Terraform → canvas covers 17 resource types today —
-  not `aws_instance`, `aws_ecs_service`/`_task_definition`/`_cluster`,
-  `aws_security_group`, `aws_lambda_function` or `aws_ecr_repository`, which
-  come back as LISTED unsupported entries rather than being silently dropped, so
-  an import tells you exactly what it could not take.
+- **Translation** (`src/odin/agent/`) is deterministic in both directions and, as
+  of v0.8.4, covers the same KINDS in both: canvas → Terraform builds 18, and
+  Terraform → canvas reads all 18 back across 24 resource types, so odin's own
+  `main.tf` round-trips with nothing unsupported. Anything odin does not model at
+  all is a LISTED unsupported entry rather than a silent omission, so an import
+  tells you exactly what it could not take. Equal coverage is **not lossless**
+  though — three things a round trip still costs are in Known limits.
   **Runtime:** real containers via Colima (default) or inside a Lima VM
   (`src/odin/runtime/`), and a real Lima VM per EC2 node (`src/odin/compute/`).
 - **Control loop:** a Spec Store (Stack = desired, World = observed) with a pure,
@@ -559,13 +559,29 @@ prose explanation of a failure, and the evidence it reads is still there in
 
 ## Known limits
 
-- **Import is narrower than generation.** Odin generates 18 kinds and reads back
-  13: `aws_lambda_function`, `aws_instance`, `aws_security_group`,
-  `aws_ecs_service` and `aws_ecr_repository` come back as unsupported, so feeding
-  odin its own `main.tf` does not return every node. `--live` is narrower still —
+- **A Lambda's CODE needs the whole directory, not just the HCL.** A function's
+  body lives in a zip beside `main.tf`, so `odin translate import <dir>` recovers
+  it and reading HCL text alone cannot — in that case the node comes back with
+  odin's default placeholder payload, and the import says so rather than letting
+  it pass for your function. `--live` is narrower than either —
   `s3`, `sqs`, `sns`, `dynamodb`, `rds`, `vpc`, `subnet` only — and a
   live-imported RDS arrives with odin's default password, because no AWS API
   returns a master password.
+- **An imported ECS service loses its canvas wiring entirely** — both the
+  `${{producer.ATTR}}` env references and the ordering they produced. The
+  references are deliberately never written into the generated Terraform (a
+  resolved `DATABASE_URL` carries the database password, so it would land in
+  `terraform.tfstate` in plaintext), and odin re-derives `depends_on` *from* those
+  references, so nothing is left to rebuild either from. The import names the
+  producers the service depended on and tells you to re-add the references.
+- **An imported security group's OUTBOUND rules do not survive.** odin re-emits
+  its own wide-open egress (everything to `0.0.0.0/0`) for every group and has no
+  canvas field for outbound rules, so a source that restricted egress comes back
+  unrestricted. The import says so on its own line rather than leaving you to
+  find it. Inbound rules do round-trip, including the identity form
+  (`security_groups = [...]` → the referenced group's label), except that odin's
+  rule is a single port: an ingress block with a port RANGE is reported and left
+  out, so the regenerated group allows *less* than the source.
 - **Some arguments are re-emitted with odin's own value whatever you wrote**, and
   each one warns on its own line — `imported with CHANGED argument(s) -- odin
   substitutes its own value` — kept separate from the `imported without unmodeled
