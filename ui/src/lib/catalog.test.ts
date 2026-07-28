@@ -151,3 +151,30 @@ describe('the palette hides placeholder kinds', () => {
     expect(isPlaceholder('Block storage')).toBe(false);
   });
 });
+
+describe('every kind a canvas can name has somewhere to render', () => {
+  // The gap this closes: ReactFlow falls back to its `default` node for a type
+  // it has no component for, and that default is a blank white rectangle. A
+  // canvas saying `"type": "role"` (the kind is `iam_role`) drew an unlabelled
+  // white box while regenerating the README hero -- indistinguishable from odin
+  // mis-rendering a resource it DOES know, and I took it for one.
+  //
+  // `Canvas.tsx` now registers `default: UnknownNode`, which names the kind. A
+  // component test would need DOM infrastructure this repo does not have, so
+  // what is pinned here is the INVARIANT that makes the fallback necessary and
+  // sufficient: every real kind has its own entry, so anything reaching the
+  // fallback is genuinely unrecognised rather than merely unregistered.
+  test('every catalog + builtin type is a known kind', () => {
+    const known = new Set([...CATALOG.map((s) => s.type), ...BUILTINS.map((b) => b.type)]);
+    expect(known.size).toBe(CATALOG.length + BUILTINS.length);
+    for (const type of known) expect(type).toMatch(/^[a-z0-9_]+$/);
+  });
+
+  test('the near-miss that caused this is still a near-miss', () => {
+    // `role` vs `iam_role` — if a future rename made `role` real, the hero
+    // canvas that exposed the bug would stop exercising it and this test says so.
+    const known = new Set([...CATALOG.map((s) => s.type), ...BUILTINS.map((b) => b.type)]);
+    expect(known.has('iam_role')).toBe(true);
+    expect(known.has('role')).toBe(false);
+  });
+});

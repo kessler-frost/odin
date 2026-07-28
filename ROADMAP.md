@@ -1208,6 +1208,36 @@ future decision against these points instead of re-deriving them:
   translation agent next -- and drawing one wrong in silence is the shape the
   honesty rules exist for.
 
+- [x] **An unknown node `type` announces itself instead of drawing a blank box.**
+  ReactFlow falls back to its `default` node for a type it has no component for,
+  and that default is an unlabelled white rectangle -- indistinguishable from
+  odin mis-rendering a resource it DOES know. Found while regenerating the README
+  hero: a canvas saying `"type": "role"` (the kind is `iam_role`) drew a white
+  box, and I took it for an odin bug before finding the typo was mine.
+
+  `UnknownNode` is the registered fallback and names the offending kind --
+  verified live: `? | api-role | unknown kind: role`. Drawn rather than refused,
+  because an unknown kind is applied-and-skipped BY DESIGN; the canvas is valid,
+  it just cannot be built, and what was missing was any way to SEE that.
+
+- [ ] **SG membership should be an edge** (owner design call; scoped, not
+  started). Which instances a security group gates is a RELATIONSHIP, not
+  ownership -- unlike `vpc_id`, which containment correctly supplies. Today it is
+  an EC2 node's `securityGroups` TEXT FIELD, one SG label per line
+  (`agent/hcl.py::_security_group_refs`), so the canvas cannot show it at all.
+
+  Shape, from reading the current path: a new edge kind between an sg node and a
+  compute node, merged by `spec/translate.py` into the target's
+  `securityGroups`. `hcl.py` needs no change -- it already reads that field, so
+  the edge becomes another way to AUTHOR what it consumes rather than a second
+  source of truth. The field must keep working (a hand-authored canvas uses it),
+  so the merge -- and its precedence when both are present -- is the part that
+  wants tests written first.
+
+  Note this may be what finally makes the edge-type selector real: an sg->compute
+  pair could plausibly read as either membership or a network edge, and the
+  ambiguity ratchet above will say so the moment it does.
+
 - [~] **agent-browser cannot draw a connection; its RESULT is now covered.**
   The gesture is still not automatable: handles are 6px and `pointerdown`
   arrives with a non-handle target even at the handle's measured centre
