@@ -38,6 +38,11 @@ jobs:
             "https://github.com/slackhq/nebula/releases/download/v${VERSION}/nebula-linux-amd64.tar.gz"
           sudo tar -xzf /tmp/nebula.tar.gz -C /usr/local/bin nebula nebula-cert
           nebula-cert -version
+      - name: Install OpenTofu
+        if: matrix.python-version == '3.12'
+        uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_wrapper: false
       - name: Lint
         run: uv run ruff check .
       # `-n auto`: measured 8.6x locally, and CI was taking ~11 minutes serially.
@@ -45,11 +50,6 @@ jobs:
       # by comparing full pass/fail counts both ways before adopting.
       - name: Test
         run: uv run pytest -q -n auto
-      - name: Install OpenTofu
-        if: matrix.python-version == '3.12'
-        uses: opentofu/setup-opentofu@v2
-        with:
-          tofu_wrapper: false
       - name: Test (Moto + tofu)
         if: matrix.python-version == '3.12'
         run: uv run pytest -m tofu -q

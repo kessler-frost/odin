@@ -11,7 +11,9 @@ protocol handshake all the same (test_functions.py's own precedent).
 """
 from __future__ import annotations
 
+import contextlib
 import socket
+import time
 import threading
 from dataclasses import dataclass, field
 
@@ -132,8 +134,26 @@ class _FakeRedis:
         return b"-ERR unknown command\r\n"
 
     def close(self) -> None:
+        """Close, and do not return until the port really refuses.
+
+        `socket.close()` returns immediately; the listen backlog can still
+        complete connections a moment longer, so `ping()` kept answering True
+        right after close on CI (green locally, red on a loaded runner).
+        `shutdown` retires the listener first, then this waits for the
+        observable state the tests assert on -- the same "wait for the
+        precondition instead of assuming it" fix the liveness decoy needed.
+        """
         self._stop = True
+        with contextlib.suppress(OSError):
+            self._sock.shutdown(socket.SHUT_RDWR)
         self._sock.close()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with socket.socket() as probe:
+                probe.settimeout(0.2)
+                if probe.connect_ex(("127.0.0.1", self.port)) != 0:
+                    return
+            time.sleep(0.05)
 
 
 @pytest.fixture
