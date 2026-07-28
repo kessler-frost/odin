@@ -34,13 +34,14 @@ import { BUILTINS, CATALOG, catalogNodeTypeMap, catalogDefaultData, catalogDefau
 import { withContainment, isInsideContainer } from '../lib/containment';
 import { placeUnpositioned } from '../lib/placement';
 import { readCanvasWithRevision } from '../lib/canvasLoad';
+import { centreOf, resolveHandles } from '../lib/edgeHandles';
 
 // The canvas is PER-ENV (`.odin/<env>/canvas.json`). One helper so none of the
 // three call sites can forget the parameter -- omitting it silently reads or
 // writes the DEFAULT env's canvas, which is the class of bug that cost a
 // canvas earlier in this release.
 const canvasUrl = (env: string | undefined) => `${API}/canvas?env=${encodeURIComponent(env || 'default')}`;
-import { computeTypes, defaultPermissions, detectDefaultEdgeType, edgeStyle, edgeTypes } from '../lib/iam';
+import { edgeDataForConnection, edgeStyle, edgeTypes } from '../lib/iam';
 
 const nodeTypes: NodeTypes = {
   vpc: VpcNode,
@@ -177,8 +178,16 @@ function endpointFromFacts(facts?: Record<string, unknown>): string {
 // measured with `odin canvas set` adding an EC2 -> S3 edge, which an open tab
 // showed as 2 nodes and 0 edges indefinitely. Two code paths reading one shape
 // drift; one function cannot.
-function edgesFromCanvas(canvas: { edges?: unknown[] }): Edge[] {
+function edgesFromCanvas(canvas: { edges?: unknown[]; nodes?: unknown[] }): Edge[] {
+  // Centres by id, so an edge that omits its handles can be given the sides the
+  // two nodes actually face each other on -- see `lib/edgeHandles.ts` for the
+  // measured bug (a hand-authored EC2 -> S3 edge routed backwards and put its
+  // permission label inside the source node).
+  const centres = new Map<string, { x: number; y: number }>(
+    (canvas.nodes ?? []).map((n: any) => [n.id, centreOf(n)]),
+  );
   return (canvas.edges ?? []).map((e: any) => {
+    const handles = resolveHandles(e, centres.get(e.source) ?? null, centres.get(e.target) ?? null);
     const eType = e.data?.edgeType ?? 'network';
     const typeDef = edgeTypes[eType] ?? edgeTypes.network;
     const permissions = e.data?.permissions ?? [];
@@ -187,8 +196,8 @@ function edgesFromCanvas(canvas: { edges?: unknown[] }): Edge[] {
       id: e.id,
       source: e.source,
       target: e.target,
-      sourceHandle: e.sourceHandle ?? null,
-      targetHandle: e.targetHandle ?? null,
+      sourceHandle: handles.sourceHandle,
+      targetHandle: handles.targetHandle,
       data: e.data ?? {},
       style: edgeStyle(eType),
       label: hasLabel ? permissions.map((p: string) => p.split(':')[1]).join(', ') : undefined,
@@ -581,14 +590,12 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
       const targetNode = nodesRef.current.find(n => n.id === connection.target);
       const sourceType = sourceNode?.type ?? '';
       const targetType = targetNode?.type ?? '';
-      const detectedType = detectDefaultEdgeType(sourceType, targetType);
+      // What this edge MEANS now lives in `lib/iam.ts::edgeDataForConnection`,
+      // where a test can reach it: the drag gesture itself is not automatable
+      // (6px handles), so its result is the only part that can be covered.
+      const { edgeType: detectedType, permissions: perms } = edgeDataForConnection(sourceType, targetType);
       const typeDef = edgeTypes[detectedType] ?? edgeTypes.network;
       const isIam = detectedType === 'iam';
-      // For IAM, pick the non-compute end (the resource being accessed) for defaults
-      const iamResourceType = isIam
-        ? (!computeTypes.has(sourceType) ? sourceType : !computeTypes.has(targetType) ? targetType : '')
-        : '';
-      const perms = isIam ? [...(defaultPermissions[iamResourceType] ?? [])] : [];
       const hasLabel = isIam && perms.length > 0;
 
       setEdges((eds) =>

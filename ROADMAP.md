@@ -1152,12 +1152,29 @@ future decision against these points instead of re-deriving them:
   asserts the label's GEOMETRY rather than its text, because a DOM check for the
   text passed the whole time this was broken.
 
-- [ ] **agent-browser cannot draw a connection on the canvas.** Unchanged and
-  still open. Handles are 6px and `pointerdown` arrives with a NON-handle target
-  even when the mouse is at the handle's measured centre (`pointerup` does land
-  on it). The IAM clip is therefore CLI-driven, which turned out better -- it
-  demonstrates the edge AND live convergence -- but a mouse-drawn edge remains
-  unrecordable, so the drag-to-connect path has no automated coverage at all.
+- [x] **odin now CHOOSES sensible handles when a canvas omits them.**
+  `lib/edgeHandles.ts` infers the sides two nodes face each other on, from their
+  centres, and explicit handles always win. Verified live on the exact canvas
+  that used to break: the permission label moved from x=601 (inside a source
+  node spanning 500..700) to **x=850**, the true midpoint. This matters because
+  a hand-authored canvas is a first-class input -- `odin canvas set` today, the
+  translation agent next -- and drawing one wrong in silence is the shape the
+  honesty rules exist for.
+
+- [~] **agent-browser cannot draw a connection; its RESULT is now covered.**
+  The gesture is still not automatable: handles are 6px and `pointerdown`
+  arrives with a non-handle target even at the handle's measured centre
+  (`pointerup` does land on it). That stays open, and there is no automated
+  coverage of the drag itself.
+
+  What was ALSO uncovered, and no longer is: what a drawn edge MEANS.
+  `lib/iam.ts` had no test file at all, so nothing checked that an IAM edge
+  takes its permissions from the NON-COMPUTE end -- that `ec2 -> s3` and
+  `s3 -> ec2` grant the same S3 permissions, because the user drew the same
+  intent either way. `edgeDataForConnection` is extracted from
+  `Canvas.tsx::onConnect` and tested (6 cases, mutation-tested: pinning the
+  resource end to the target fails it). The gesture remains the gap; the
+  decision behind it does not.
 
 ## v0.7.9 — the canvas is per-environment
 
