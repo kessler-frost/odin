@@ -6,7 +6,8 @@ One catch-all Starlette route per SigV4-signed request: identify the
 caller and target service from the credential scope (works even before/if
 verification fails, so an auth-failure response can still be
 protocol-shaped) -> verify the signature -> map the request to an
-(action, resource) pair -> check the caller's edge-compiled policy ->
+(action, resource) pair -> check the policy compiled from the APPLIED
+IAM (`policy.compile_policies_from_iam`) ->
 forward to the env's backing container. S3 (RustFS) enforces SigV4, so its
 forward is re-signed with the backing's own credentials; sqs/sns/dynamodb
 (goaws/dynalite) ignore auth entirely, so their forward passes the
@@ -110,7 +111,7 @@ _OPERATOR_STATEMENTS: list[Statement] = [Statement(actions=("*",), resources=("*
 
 
 class GatewayState:
-    """Per-env edge-compiled policies + backing routing table.
+    """Per-env policies (compiled from the applied IAM) + backing routing table.
 
     `update()` replaces an env's entry wholesale (never patched
     incrementally) so a stale edge can never survive a reconcile pass --

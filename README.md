@@ -288,7 +288,7 @@ node red without anyone pressing anything.
                   v
 <----------------------------------->
 |                                   |
-|    does a drawn edge grant it?    |---------------+
+|   does the APPLIED IAM allow it?  |---------------+
 |                                   |               |
 <----------------------------------->              no
                   |                                 |

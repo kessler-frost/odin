@@ -700,6 +700,16 @@ async def _run_instances(params: dict[str, str], env: str, stores: SynthStores, 
 
     instance = {
         "instance_id": instance_id,
+        # v0.8.12: which instance profile this VM launched with, so the gateway
+        # can resolve instance -> profile -> role -> policy when it authorizes a
+        # call from it. The AWS provider sends the profile NAME (or its ARN) on
+        # RunInstances; without recording it, an ec2 workload's grants could only
+        # be matched by a naming convention.
+        "iam_instance_profile": (
+            params.get("IamInstanceProfile.Name")
+            or params.get("IamInstanceProfile.Arn", "").rpartition("/")[2]
+            or None
+        ),
         "image_id": params.get("ImageId") or _DEFAULT_AMI,
         "instance_type": instance_type,
         "key_name": key_name,

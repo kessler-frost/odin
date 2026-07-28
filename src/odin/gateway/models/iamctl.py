@@ -6,16 +6,20 @@ MiniStack's own IAM taxonomy (§2.6: "pure CRUD, no evaluation" -- role =
 versioned documents; instance-profile = named role container) -- adopted as
 a design, never as a dependency (NORTHSTAR directive 5).
 
-IMPORTANT BOUNDARY (northstar directive 4 + the V2 brief's explicit
-addendum): this module is a DOCUMENT STORE for Terraform compatibility --
-roles/policies TF creates for Lambda and friends. It does NOT feed the
-gateway's edge-based enforcement engine (`gateway/policy.py`). odin's canvas
-edges remain the SOLE authorization source for `evaluate()`; a TF-created
-role's attached/inline policies are modeled state that `evaluate()` never
-reads, and nothing here ever compiles into a `Statement`. Where a TF-created
-role's policy would conflict with an edge-compiled statement, nothing
-changes -- `evaluate()` only ever sees edge-compiled statements, never this
-store.
+THIS STORE IS THE AUTHORIZATION SOURCE (changed in v0.8.12). It used to be a
+document store for Terraform compatibility only, while `evaluate()` read a
+policy map compiled straight from the canvas edges -- which meant a permission
+drawn on the canvas took effect without an apply, and the Terraform odin
+generated described an IAM posture the gateway was not using.
+
+Now a drawn permission is compiled into a real `aws_iam_role_policy` by
+`agent/hcl.py`, applied by tofu through the gateway like any other resource,
+and landed HERE. `gateway/policy.py::compile_policies_from_iam` reads these
+records back -- each workload's role via its own service record (a lambda's
+`role`, a task definition's `task_role_arn`, an instance's
+`iam_instance_profile`), then that role's inline and attached documents -- and
+hands the result to `evaluate()`. So a permission takes effect when it is
+applied, not when it is drawn, and an unapplied edge grants nothing.
 
 Like ec2net.py, IAM has NO backing container: this module is the WHOLE
 answer for every `iam:*` action the gateway classifies. IAM shares EC2's

@@ -1,6 +1,6 @@
 graph TD
   Call["boto3 call from your workload"] --> Sig["verify SigV4 signature"]
   Sig --> Class["classify: s3:GetObject on uploads"]
-  Class --> Check{"does a drawn edge grant it?"}
+  Class --> Check{"does the APPLIED IAM allow it?"}
   Check -->|yes| Do["run it against the substitute"]
   Check -->|no| Deny["403 AccessDenied"]
