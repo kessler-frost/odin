@@ -42,6 +42,7 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from odin.agent import hcl
+from odin.agent.hcl import sanitize_name as sanitize
 from odin.aws.backings import ACCOUNT, REGION
 from odin.simulate import workspace as workspace_mod
 from odin.simulate.runner import PLUGIN_CACHE_DIR
@@ -97,6 +98,13 @@ _KIND = {
 # singleton odin always emits exactly one of, named "odin", so importing it would
 # invent a node the canvas has no kind for.
 _ECS_COMPANION_TYPES = ("aws_ecs_task_definition", "aws_ecs_cluster")
+
+# v0.8.11: a drawn IAM edge is emitted as an `aws_iam_role_policy` on the
+# workload's role, so importing one reconstructs the EDGE rather than becoming a
+# node. Before this, generate -> import dropped every permission and reported
+# nothing, which is the round-trip loss the emission was added to fix; importing
+# the policy back is the other half of that fix.
+_IAM_POLICY_TYPE = "aws_iam_role_policy"
 # W2.5: the two OTHER types an `alb` canvas node expands to. Neither becomes a
 # node of its own -- they fold ONTO the alb node the same way
 # aws_secretsmanager_secret_version folds onto its secret, which is what makes
@@ -796,6 +804,56 @@ def _lambda_code(archives: dict[str, bytes], filename: str) -> str | None:
         return None
 
 
+def _edges_from_role_policies(
+    policies: list[dict], node_by_label: dict[str, dict], attrs_by_label: dict[str, dict],
+) -> list[dict]:
+    """Turn each `aws_iam_role_policy` back into the canvas edges that produced it.
+
+    The policy names a ROLE; the canvas edge starts at the WORKLOAD that role
+    belongs to, so the two are matched by walking the workloads and asking which
+    role each one carries. That is the same direction `hcl.py` writes it in, and
+    it avoids depending on the `<node>-role` naming convention for anything the
+    file already states outright.
+
+    A statement whose Resource names no node on this canvas is skipped: an edge
+    to a resource that does not exist would draw into nowhere and be dropped by
+    `canvas_to_stack` anyway.
+    """
+    role_to_workload: dict[str, str] = {}
+    for label, node in node_by_label.items():
+        attrs = attrs_by_label.get(label) or {}
+        target = _ref_target(attrs.get("role")) or _ref_target(attrs.get("task_role_arn"))
+        if target:
+            role_to_workload[target] = label
+        # An auto-role is named for its workload and referenced by nothing else,
+        # which is the only handle an ec2/ecs node gives us.
+        role_to_workload.setdefault(f"{sanitize(label)}_role", label)
+
+    out: list[dict] = []
+    for policy in policies:
+        source = role_to_workload.get(_ref_target(policy.get("role")) or "")
+        document = hcl.unquote(policy.get("policy"))
+        if source is None or not isinstance(document, str):
+            continue
+        try:
+            parsed = json.loads(document)
+        except json.JSONDecodeError:
+            continue
+        for statement in parsed.get("Statement") or []:
+            target = statement.get("Resource")
+            actions = statement.get("Action") or []
+            if target not in node_by_label or not actions:
+                continue
+            # Endpoints are LABELS, matching the subscription edges above --
+            # `canvas_to_stack` resolves an id through `labels` and falls back to
+            # the raw value, so a label works and reads better in a saved canvas.
+            out.append({
+                "source": source, "target": target,
+                "data": {"edgeType": "iam", "permissions": list(actions)},
+            })
+    return out
+
+
 def _stamp_lambda(
     node_by_label: dict[str, dict], attrs_by_label: dict[str, dict], by_hcl_name: dict[str, str],
     role_names: dict[str, str], archives: dict[str, bytes],
@@ -1177,6 +1235,7 @@ def parse_hcl(files: dict[str, str], archives: dict[str, bytes] | None = None) -
     alb_companions: list[tuple[str, str, dict]] = []
     key_pairs: dict[str, dict] = {}
     taskdefs: dict[str, dict] = {}
+    role_policies: list[dict] = []
     node_by_label: dict[str, dict] = {}
     attrs_by_label: dict[str, dict] = {}
     index = 0
@@ -1190,6 +1249,9 @@ def parse_hcl(files: dict[str, str], archives: dict[str, bytes] | None = None) -
             continue
         if rtype in _ALB_COMPANION_TYPES:
             alb_companions.append((rtype, rname, attrs))
+            continue
+        if rtype == _IAM_POLICY_TYPE:
+            role_policies.append(attrs)
             continue
         if rtype in _ECS_COMPANION_TYPES:
             # The task definition folds onto its service; the cluster is a
@@ -1321,6 +1383,21 @@ def parse_hcl(files: dict[str, str], archives: dict[str, bytes] | None = None) -
         node_by_label, attrs_by_label, by_hcl_name, role_names, archives or {},
     )
     warnings += lambda_warnings
+    # The ec2/ecs auto-role gets the same treatment a lambda's does, for the same
+    # reason and by the same signal (`<workload>-role`). Without it, generate ->
+    # import -> generate produced a SECOND role: the emitted `web_role` came back
+    # as an `iam_role` NODE, and re-generating added a fresh auto-role beside it
+    # (`web_role_2`). Caught by the round-trip assertion, which is the only thing
+    # that would have.
+    workload_labels = {
+        label for label, node in node_by_label.items() if node["type"] in ("ec2", "ecs")
+    }
+    auto = {
+        label for label, node in node_by_label.items()
+        if node["type"] == "iam_role" and label.endswith("-role")
+        and label[: -len("-role")] in workload_labels
+    }
+    folded_roles |= auto
     # A folded auto-role must leave BOTH lists: the node list the canvas is built
     # from, and `node_by_label`, which later passes read.
     nodes = [node for node in nodes if node["id"] not in folded_roles]
@@ -1363,6 +1440,8 @@ def parse_hcl(files: dict[str, str], archives: dict[str, bytes] | None = None) -
                 type="aws_sns_topic_subscription", name=rname,
                 reason="subscription references a resource outside the supported set -- edge dropped",
             ))
+
+    edges += _edges_from_role_policies(role_policies, node_by_label, attrs_by_label)
 
     return ImportResult(nodes=nodes, edges=edges, unsupported=unsupported, warnings=warnings)
 

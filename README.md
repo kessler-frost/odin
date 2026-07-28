@@ -143,10 +143,11 @@ The edge type comes from what you connected: `lambda → dynamodb` is an IAM gra
 with sensible defaults, `sg → ec2` is group membership, `ec2 → subnet` is
 containment. Across the whole catalog no pair is ambiguous, so odin never guesses.
 
-One thing worth knowing before you take the HCL elsewhere: **a drawn permission is
-enforced by odin's gateway and does not appear in the generated Terraform.**
-`odin translate` says so on stderr, and [docs/limits.md](docs/limits.md) explains
-what it means.
+A drawn permission is emitted as a real `aws_iam_role_policy` on the workload's
+role, so it survives into the Terraform and back out of it. One caveat if you take
+the HCL to Amazon: the policy's `Resource` is odin's node label, which is what the
+gateway matches on, where AWS expects an ARN. `odin translate` says so per policy
+on stderr.
 
 ## Driving it from a terminal
 
@@ -314,8 +315,9 @@ claim in this README is verified.
 
 The ones most likely to matter:
 
-- **A drawn IAM edge is not in the generated Terraform.** The gateway enforces it;
-  `main.tf` taken to Amazon grants nothing.
+- **An emitted IAM policy names resources by label, not ARN.** It round-trips
+  through odin perfectly; taken to Amazon each policy needs its `Resource`
+  rewritten as an ARN.
 - **An RDS container keeps no volume**, so anything that replaces it comes back
   empty. Odin's own repair says so in the apply output.
 - **Import is narrower in `--live` mode**, and a live-imported RDS arrives with
