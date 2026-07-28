@@ -98,3 +98,37 @@ describe('round trip', () => {
     expect(size).toEqual({ width: 800, height: 640 });
   });
 });
+
+describe('an EC2 box the user expanded keeps its height', () => {
+  // The owner's gesture only works if the expansion SURVIVES: "when I expand the
+  // ec2 box and put an ecs box inside it". Before this, a leaf's stored height
+  // was dropped on load and re-derived from content, so an instance expanded to
+  // hold a workload snapped back on reload and the workload fell outside it --
+  // silently un-placing it.
+  const defaults = { vpc: { width: 400, height: 300 }, ec2: { width: 200 }, s3: { width: 200 } };
+
+  test('a height the user chose is kept', () => {
+    expect(sizeOnLoad(defaults, 'ec2', { width: 480, height: 200 })).toEqual({ width: 480, height: 200 });
+  });
+
+  test('an un-expanded instance stays adaptive', () => {
+    // No default height, so nothing is invented: the node is as tall as its
+    // content until someone drags it bigger.
+    expect(sizeOnLoad(defaults, 'ec2', { width: 200 }).height).toBeUndefined();
+    expect(sizeOnLoad(defaults, 'ec2', undefined).height).toBeUndefined();
+  });
+
+  test('other leaves still drop a stored height', () => {
+    // The frozen-boxes bug this rule exists for: a height baked from a
+    // measurement must never come back.
+    expect(sizeOnLoad(defaults, 's3', { width: 200, height: 81 }).height).toBeUndefined();
+  });
+
+  test('a real container is unaffected', () => {
+    expect(sizeOnLoad(defaults, 'vpc', { width: 900, height: 500 })).toEqual({ width: 900, height: 500 });
+  });
+
+  test('a zero height is not treated as a choice', () => {
+    expect(sizeOnLoad(defaults, 'ec2', { width: 200, height: 0 }).height).toBeUndefined();
+  });
+});

@@ -102,6 +102,8 @@ from typing import NamedTuple
 from starlette.responses import Response
 
 from odin.aws.backings import ACCOUNT, REGION
+from odin.compute.instances import vm_name
+from odin.runtime.lima import LimaRuntime
 from odin.compute.tasks import TaskRuntime, container_name
 from odin.gateway import errors
 from odin.gateway.errors import exc_text
@@ -112,6 +114,38 @@ from odin.gateway.wiring import node_env
 from odin.runtime.colima import CONTAINER_HOST
 
 log = logging.getLogger("odin.gateway.ecsctl")
+
+# --- placement: which EC2 instance a service's tasks belong on ---------------
+
+# odin's own instance attribute, matching what `agent/hcl.py::_ecs` emits for a
+# service drawn INSIDE an ec2 node. Real clusters pin tasks with custom instance
+# attributes exactly like this, so the constraint round-trips through the
+# provider as an `aws_ecs_service` field rather than as an odin-only extension.
+_PLACEMENT_ATTRIBUTE = "attribute:odin.instance =="
+
+
+def placement_host(payload_or_record: dict) -> str:
+    """The instance label a service's tasks are pinned to, or `""`.
+
+    Reads AWS's own `placementConstraints` shape, so it works on the
+    CreateService payload the Terraform provider sends AND on the stored record.
+    Anything it does not recognise -- a different constraint type, an expression
+    odin did not write -- returns `""` rather than a guess: an unplaced service
+    runs on the shared host, which is the pre-existing behaviour and the safe
+    one.
+    """
+    stored = payload_or_record.get("placement_host")
+    if isinstance(stored, str) and stored:
+        return stored
+    for constraint in payload_or_record.get("placementConstraints") or ():
+        if not isinstance(constraint, dict) or constraint.get("type") != "memberOf":
+            continue
+        expression = str(constraint.get("expression") or "")
+        if expression.startswith(_PLACEMENT_ATTRIBUTE):
+            return expression[len(_PLACEMENT_ATTRIBUTE):].strip()
+    return ""
+
+
 
 _DEFAULT_LAUNCH_TYPE = "EC2"
 _DEFAULT_NETWORK_MODE = "bridge"
@@ -1003,6 +1037,32 @@ async def _reconcile_service_tasks(
         await _retire_stale(stores, env, service, runtime)
 
 
+
+def runtime_for_service(service: dict, default: TaskRuntime) -> TaskRuntime:
+    """The runtime a service's tasks launch on.
+
+    An UNPLACED service keeps `default` -- the shared host runtime every service
+    used before placement existed, so nothing changes for a canvas that draws no
+    workload inside an instance.
+
+    A PLACED one gets a `TaskRuntime` bound to that EC2 node's own Lima VM
+    (`odin-ec2-<env>-<label>`), which is what makes the owner's gesture real
+    rather than cosmetic: the container genuinely runs inside the instance it
+    was drawn in. This is only possible because `LimaRuntime`'s VM became
+    per-instance -- it was a class constant pointing every caller at the shared
+    `odin-host`.
+
+    Placement is deliberately NOT expressed as a Fargate/EC2 launch-type switch:
+    odin emits `launch_type = "EC2"` unconditionally and has no Fargate
+    substrate, so that label could only lie. Where the task RUNS is the real
+    difference.
+    """
+    host = placement_host(service)
+    if not host:
+        return default
+    return TaskRuntime(runtime=LimaRuntime(vm=vm_name(service.get("env", ""), host)))
+
+
 async def converge_services(
     stores: SynthStores, env: str, runtime: TaskRuntime,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
@@ -1035,7 +1095,11 @@ async def converge_services(
     return [
         background(_reconcile_service_tasks(
             stores, env, service["cluster_name"],
-            service["service_name"], runtime, keystore, gateway_port,
+            service["service_name"],
+            # PER SERVICE: a workload drawn inside an ec2 node runs in that
+            # instance's VM, not on the shared host.
+            runtime_for_service({**service, "env": env}, runtime),
+            keystore, gateway_port,
         ))
         for service in _all_services(stores, env) if service["status"] == "ACTIVE"
     ]
@@ -1377,6 +1441,9 @@ async def _create_service(
         "task_definition_arn": _taskdef_arn(taskdef["family"], taskdef["revision"]),
         "desired_count": int(payload.get("desiredCount") or 0),
         "launch_type": payload.get("launchType") or _DEFAULT_LAUNCH_TYPE,
+        # Persisted so convergence can place tasks without re-reading the
+        # request that created the service.
+        "placement_host": placement_host(payload),
         "created_at": time.time(),
         "status": "ACTIVE",
         "deleted_at": None,

@@ -768,6 +768,31 @@ def _ecs(res: ResourceDesired, refs: Refs) -> Built:
         f'    delete = {quote(_ECS_CONVERGE_TIMEOUT)}\n'
         "  }"
     ]
+    # PLACEMENT: this service was drawn INSIDE an ec2 node, so its tasks belong
+    # on that instance rather than on the shared host (the owner's
+    # "ecs inside the ec2 box means ecs ON ec2" gesture, stamped as `host` by
+    # `ui/src/lib/containment.ts`).
+    #
+    # Expressed as a real `placement_constraints { type = "memberOf" }`, which is
+    # how AWS itself pins a task to instances, rather than as an odin-only field:
+    # it shows up in `tofu plan`, it round-trips through the provider, and the
+    # gateway reads it back out of CreateService. The attribute name is odin's
+    # own (`odin.instance`), the way a real cluster uses custom instance
+    # attributes.
+    #
+    # NOT a launch-type switch: odin already emits `launch_type = "EC2"`
+    # unconditionally and has no Fargate substrate at all, so flipping that
+    # label would claim a distinction odin cannot back. Placement is the part
+    # that is real -- an EC2 node IS a Lima VM and the task can genuinely run
+    # inside it.
+    host = _field(res, "host", "").strip()
+    if host:
+        blocks.append(
+            "  placement_constraints {\n"
+            f'    type       = {quote("memberOf")}\n'
+            f'    expression = {quote(f"attribute:odin.instance == {host}")}\n'
+            "  }"
+        )
     # Canvas wiring: order every `${{producer.ATTR}}` target ahead of this
     # service, so its tasks never launch before the endpoint they consume
     # exists. The VALUES arrive at container launch, not through the HCL --

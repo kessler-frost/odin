@@ -228,13 +228,12 @@ odin apply
 ```
 
 **Environments.** Every command that touches one takes `--env`, defaulting to
-`default`, which is also the env the browser opens on. To work elsewhere, pass
-`--env staging` *and* type `staging` into the top-bar selector. Getting those two
-out of step is the most convincing way to make odin look broken: apply from the
-CLI to one env, watch the canvas on another, and every node reads `DRAFT` with
-nothing running while the resources are healthy where you applied them. `odin
-envs` lists the envs that have had something applied, and answers `default` on a
-store where nothing ever has.
+`default`, which is also the env the browser opens on. An environment owns its
+canvas as well as its state (`.odin/<env>/canvas.json`), so two envs can hold
+genuinely different architectures — switching the top-bar selector loads that
+env's own canvas, and `odin canvas get --env staging` prints the same document
+the browser shows you there. `odin envs` lists the envs that have had something
+applied, and answers `default` on a store where nothing ever has.
 
 **`odin start`** backgrounds the server but does not return until it answers `GET
 /health`, so `odin start && odin apply` works on the first try. If the server dies
@@ -246,9 +245,17 @@ frontend, since the backend always binds `:4201` in that mode.
 
 ### The canvas JSON schema
 
-`.odin/canvas.json` is a plain `{"nodes": [...], "edges": [...]}` document, the
-same file the UI reads and writes, so anything you author by hand shows up on the
-canvas and vice versa.
+`.odin/<env>/canvas.json` is a plain `{"nodes": [...], "edges": [...]}` document,
+the same file the UI reads and writes for that environment, so anything you
+author by hand shows up on the canvas and vice versa.
+
+Two fields are worth knowing about when you write one by hand, because odin has
+to guess without them and a guess renders wrong rather than loudly:
+`sourceHandle`/`targetHandle` on an edge (odin infers the sides the two nodes
+face each other on, which is right for a straight run and arbitrary for a
+deliberate layout), and a node's `type`, which must be a kind odin knows —
+an unrecognised one draws as `unknown kind: <what you wrote>` rather than
+silently rendering as something else.
 
 ```json
 {
@@ -386,7 +393,7 @@ from AWS. Every workspace now carries a `README.md` saying so.
 credentials as Apply, and it changes nothing. Two things its exit code cannot
 carry. First, **it plans the last-applied Stack, not the saved canvas** — an edit
 you have not applied is not drift, so `tf plan` reports `no changes` with four new
-resources sitting in `canvas.json`. It notes on stderr when the two differ and sets
+resources sitting in that env's `canvas.json`. It notes on stderr when the two differ and sets
 **`.canvas_drift`** in `-o json` — that field, not the exit code, is what a CI check
 should gate on, and only Apply closes the gap. Second, `no_changes` means "no drift in what odin can
 generate": a node odin has no Terraform for was never in the plan, and the command
@@ -442,10 +449,10 @@ converges reality to it.
 
 Both operations are destructive, so `import` refuses to overwrite an existing env
 directory without `--force`, refuses to run while odin is up, and rejects any
-archive containing an absolute path, a `..` traversal, or a link member. The
-shared `.odin/canvas.json` rides along but is restored only under
-`--with-canvas`, because a restore should never silently replace the canvas you
-are drawing on.
+archive containing an absolute path, a `..` traversal, or a link member. The env's own
+`canvas.json` rides along but is restored only under `--with-canvas`, because a
+restore should never silently replace the canvas you are drawing on — without
+the flag the canvas you currently have is carried across the restore intact.
 
 **How odin knows a server is up**, since a wrong answer here is expensive in both
 directions: a running control app writes a pidfile and holds an exclusive lock on

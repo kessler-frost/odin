@@ -250,6 +250,11 @@ export const CATALOG: ServiceDef[] = [
     category: 'Storage', color: 'sky', width: 200,
     fields: [{ key: 'label', label: 'Name', editable: true }],
     defaultData: { label: 'new-repo' },
+    // The image-PULL path a workload needs. `gateway/classify.py::_classify_ecr`
+    // builds its action as `ecr:<op>` straight from `x-amz-target`, so these are
+    // the op names a real SDK sends -- which is what makes the grant bite rather
+    // than decorate (`tests/gateway/test_iam_vocabulary_is_enforceable.py`).
+    iamActions: ['ecr:GetAuthorizationToken', 'ecr:BatchGetImage', 'ecr:GetDownloadUrlForLayer', 'ecr:BatchCheckLayerAvailability', 'ecr:*'],
   },
   {
     type: 'route53', abbr: 'DNS', label: 'Route 53 Zone', sublabel: 'Hosted zone (placeholder)',
@@ -285,6 +290,10 @@ export const CATALOG: ServiceDef[] = [
     ],
     defaultData: { label: 'new-service', image: 'nginx:alpine', count: '1', port: '80' },
     primary: { key: 'count', label: 'tasks' },
+    // ECS is a workload AND an IAM target: one service legitimately controls
+    // another's tasks. `gateway/classify.py::_classify_ecs` builds its action as
+    // `ecs:<op>` from `x-amz-target`, so these are real SDK op names.
+    iamActions: ['ecs:RunTask', 'ecs:StopTask', 'ecs:DescribeTasks', 'ecs:ListTasks', 'ecs:*'],
   },
   // W2.4: real SSM Parameter Store -- the node's Name IS the parameter name,
   // slashes and all (the gateway classifies every ssm:* call by that bare

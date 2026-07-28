@@ -46,8 +46,32 @@ LIMA_HOST = "host.lima.internal"
 
 
 class LimaRuntime(_ContainerRuntime):
-    VM = "odin-host"
+    """Containers inside a Lima VM, via `nerdctl`.
+
+    `vm` is PER-INSTANCE (owner's intelligence-layer ask, 2026-07-28). It used to
+    be a class constant, which meant every LimaRuntime everywhere pointed at the
+    one shared `odin-host` VM -- fine for odin's "VM isolation" runtime mode, and
+    the single thing standing between odin and real ECS-on-EC2 placement: an
+    ECS task drawn inside an EC2 box should run inside THAT instance's VM
+    (`odin-ec2-<env>-<id>`), which is a different VM per node.
+
+    The default is unchanged, so every existing caller and every test keeps the
+    old behaviour: `LimaRuntime()` is still the shared host VM. Only a caller
+    that names a VM gets a different one.
+
+    Note the two meanings do not collide by accident -- they are distinguished by
+    the NAME, and `DEFAULT_VM` is the shared-isolation one:
+
+        LimaRuntime()                              -> odin-host, the shared VM
+        LimaRuntime(vm="odin-ec2-prod-api-server") -> that instance's own VM
+    """
+
+    DEFAULT_VM = "odin-host"
     CLI = "nerdctl"
+
+    def __init__(self, *args, vm: str | None = None, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.VM = vm or self.DEFAULT_VM
 
     async def _lima(self, *args: str, check: bool = True, input: str | None = None) -> str:
         """The OUTER seam (`limactl` itself), as opposed to `_argv`/`_cli`'s

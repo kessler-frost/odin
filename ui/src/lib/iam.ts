@@ -3,11 +3,24 @@ import { catalogIamActions } from './catalog';
 export const iamActionsForTarget: Record<string, string[]> = {
   s3: ['s3:GetObject', 's3:PutObject', 's3:DeleteObject', 's3:ListBucket', 's3:GetBucketLocation', 's3:*'],
   dynamodb: ['dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:Query', 'dynamodb:Scan', 'dynamodb:DeleteItem', 'dynamodb:*'],
+  // lambda is a BUILTIN, so its actions live here rather than in the catalog.
+  // NOTE the op name: odin's gateway classifies an invoke as `lambda:Invoke`
+  // (`classify.py::_LAMBDA_ROUTES`), NOT AWS's `lambda:InvokeFunction`. Granting
+  // the AWS spelling is DECORATIVE -- measured against the real evaluator:
+  //   evaluate([lambda:InvokeFunction], action=lambda:Invoke) -> False
+  //   evaluate([lambda:Invoke],         action=lambda:Invoke) -> True
+  // `tests/gateway/test_iam_vocabulary_is_enforceable.py` pins every entry in
+  // this file against what the classifier can actually emit, so a permission
+  // that cannot bite can no longer be offered in the UI.
+  lambda: ['lambda:Invoke', 'lambda:GetFunction', 'lambda:GetFunctionConfiguration', 'lambda:*'],
   ...catalogIamActions,
 };
 
 export const defaultPermissions: Record<string, string[]> = {
   s3: ['s3:GetObject', 's3:PutObject'],
+  lambda: ['lambda:Invoke'],
+  ecr: ['ecr:GetAuthorizationToken', 'ecr:BatchGetImage'],
+  ecs: ['ecs:RunTask', 'ecs:DescribeTasks'],
   dynamodb: ['dynamodb:GetItem', 'dynamodb:PutItem'],
   sqs: ['sqs:SendMessage', 'sqs:ReceiveMessage'],
   sns: ['sns:Publish'],

@@ -1121,13 +1121,148 @@ future decision against these points instead of re-deriving them:
     nothing about memory, so the ceiling is not discoverable before an Apply
     hits it, and it hardcodes its own disk floor rather than honouring
     `ODIN_MIN_DISK_GIB`.
-- [ ] **M7 (multi-Mac) — the fleet.** The single-host half is DONE (see
+- [ ] **M7 (multi-Mac) — the fleet. DEFERRED: do not build unless the owner
+  explicitly asks for it** (owner call, 2026-07-28). It is the one item that
+  cannot be honestly finished on this machine: a genuine cross-machine handshake
+  needs a SECOND Mac, so anything built here could only be unit-tested and would
+  ship claiming a capability nobody had verified. That is the exact shape the
+  honesty rules exist to prevent, so it waits for a real two-machine setup
+  rather than being simulated into looking done.
+
+  The single-host half is DONE (see
   above: a real lighthouse + real per-VM daemons + a real ping/SG-filter
   proof, all on one Mac). What remains is genuinely cross-machine: a second
   Mac's host joining the SAME env's mesh (today's lighthouse only binds
   `0.0.0.0:4242` locally reachable via this Mac's own vzNAT bridge — a real
   external/LAN-reachable underlay address plus multi-Mac membership and
   cross-machine placement are still open). Additive, no core change.
+
+## The intelligence layer — the canvas IS the language
+
+**Owner's framing, in their words, and the reason this section exists:**
+
+> *"canvas and navigating things around IS the language of odin and not chatting
+> with a bot to update things around - that we'll add later too but this is a
+> separate thing."*
+
+> *"More intelligent placement like when I expand the ec2 box and put an ecs box
+> inside it, that means I want ecs on ec2 - which is a valid thing instead of
+> fargate right? and the configuration and stuff updates accordingly if needed
+> but things like name and stuff remains as is."*
+
+> *"if that kind of stuff can be done without intelligence then that's great too
+> but I believe the intelligence layer would be needed anyways cuz of the intent
+> detection and acting on user's events since canvas IS the language."*
+
+So the ordering principle for everything below: **do it deterministically where
+a gesture has exactly one honest meaning, and reach for the intelligence layer
+where the job is INTENT DETECTION — reading what a person meant by an action on
+the canvas and acting on it.** Containment implying a launch type is the
+deterministic end (one gesture, one meaning, a lookup table). Inferring intent
+from adjacency, grouping, or a sequence of edits is the other end, and that is
+what the intelligence layer is actually for.
+
+Neither end is a chat box. The chat/agent surface is listed last on purpose: it
+is an ADDITION to the canvas language, never a replacement for it, and building
+it first would answer a question nobody asked.
+
+These four were LOST once already: a range-based edit to this file deleted them
+while replacing a neighbouring entry, and they were only noticed when the owner
+asked whether they had been forgotten. Recovered from 8a0c89e. Do not use
+index-to-index deletion on this file.
+
+- [x] **Containment changes configuration, not just labels — DONE.** Drawing an
+  ecs box inside an ec2 box now places that workload's tasks INSIDE that
+  instance, end to end:
+
+      canvas gesture   ->  `host` stamped by lib/containment.ts (strict full-rect)
+      spec             ->  carried into the ecs resource's fields
+      terraform        ->  placement_constraints { type = "memberOf",
+                             expression = "attribute:odin.instance == api-server" }
+      gateway          ->  ecsctl reads AWS's own placementConstraints shape
+      runtime          ->  TaskRuntime(LimaRuntime(vm="odin-ec2-prod-api-server"))
+
+  **It is PLACEMENT, not a launch-type label.** The owner's example said "ecs on
+  ec2 instead of fargate", and the honest finding is that odin already emits
+  `launch_type = "EC2"` unconditionally and has NO Fargate substrate -- so
+  flipping that label would have claimed a distinction odin cannot back. Where
+  the task actually runs is the real difference, and an EC2 node is a real Lima
+  VM, so it can be made true.
+
+  Three things it needed:
+  * `LimaRuntime.VM` was a class constant, pointing every caller at the shared
+    `odin-host`. Now per-instance -- the change the design doc predicted would
+    be the unlocking one.
+  * an expanded EC2 box did not SURVIVE a reload (a leaf's stored height is
+    dropped and re-derived from content), so the instance snapped back and the
+    workload fell outside it. `EXPANDABLE_KINDS` keeps a height the user chose
+    without giving every instance a default one.
+  * the node SAYS what happened -- it reads `on api-server`. An inference the
+    user cannot see is a trap, not a language.
+
+  The owner's invariant holds and is tested: name, image, count and port all
+  survive being placed, and dragging back out clears the placement rather than
+  leaving a stale claim.
+
+  Verified live: expanded instance at 248..448, workload at 318..400 inside it,
+  node reads `ECS | web | DRAFT | tasks: 2 | on api-server`, `host` persisted.
+
+- [ ] **~~Containment changes configuration~~ (superseded above).** The owner's
+  example: expand an EC2 box, drop an ECS box inside it, and that means **ECS
+  on the EC2 launch type rather than Fargate** — which is a real AWS
+  distinction (ECS tasks run either on EC2 container instances or on Fargate),
+  not a UI convenience. Dropping it back out means Fargate again.
+  **The invariant that makes this safe: identity is preserved.** The node's
+  name/label and anything the user typed stay exactly as they are; only the
+  fields that containment genuinely determines change. A gesture must never
+  silently rewrite something a person authored — that is the same honesty rule
+  the rest of odin follows, applied to the canvas.
+  Needs: a per-kind table of "what does containment in X imply", applied on the
+  containment-stamp path, plus a visible statement of what changed (odin says
+  what it did; it does not quietly do it).
+
+- [x] **IAM edges across the whole catalog.** Turned out broader than this entry
+  claimed -- s3, dynamodb, sqs, sns, rds, logs, secret, ssm and elasticache all
+  had real vocabularies already. What was genuinely missing was **lambda, ecr and
+  ecs**, now added: a workload can be granted `lambda:Invoke`, the ECR image-pull
+  actions, and ECS task control.
+
+  The find that mattered more than the vocabulary: **AWS's spelling is not
+  necessarily odin's.** The gateway classifies an invoke as `lambda:Invoke`
+  (`classify.py::_LAMBDA_ROUTES`), not AWS's `lambda:InvokeFunction`. Measured
+  against the real evaluator:
+
+      evaluate([lambda:InvokeFunction], action=lambda:Invoke) -> False
+      evaluate([lambda:Invoke],         action=lambda:Invoke) -> True
+
+  So offering the AWS name would have produced an edge that draws, applies,
+  reports success and grants NOTHING -- a decorative permission, across a
+  TS/Python boundary where nothing type-checks either side.
+
+  `tests/gateway/test_iam_vocabulary_is_enforceable.py` now pins every action the
+  UI can put on an edge against what the classifier can actually emit (60 cases).
+  Mutation-tested both ways: planting `lambda:InvokeFunction` fails it, and so
+  does inventing a service the gateway never dispatches on. Two false positives
+  in the checker itself were fixed first -- it read only one of the two dispatch
+  spellings (reporting sqs as unclassified) and matched `nginx:alpine` out of a
+  node's defaultData as though it were a grant.
+
+- [ ] **~~IAM edges across the whole catalog~~ (superseded above).** Today the drawn-edge
+  → compiled-policy path is real and enforced, but the action vocabulary is
+  thin outside `s3:*`. Extend to sqs/sns/dynamodb/lambda/ecs/secrets/logs/ecr
+  and the rest, so drawing a lambda → dynamodb edge grants the right actions
+  the way a lambda → s3 edge already does. The compiler and the enforcement
+  point do not change; the vocabulary does.
+
+- [ ] **Placement that infers intent from geometry.** The general form of the
+  first item: what a person expresses by putting one thing inside, next to, or
+  overlapping another. Containment is the first and clearest case; adjacency
+  and grouping follow. Each inference must be reversible by the opposite
+  gesture and must never destroy authored values.
+
+- [ ] **Then, and separately: the chat/agent surface.** NORTHSTAR's canvas↔
+  Terraform translation agent. Explicitly NOT a replacement for the canvas
+  language — an addition to it.
 
 ## Next — known, measured, not yet fixed
 
