@@ -107,7 +107,7 @@ class Ref(BaseModel):
 # make the four PROVISIONED kinds referenceable -- but the reconciler only
 # stores its `_fabric` and never calls it, so it is not a live path and must not
 # be counted as one here.)
-REFERENCEABLE_KINDS = ("rds", "elasticache", "alb", "ec2")
+REFERENCEABLE_KINDS = ("rds", "elasticache", "alb", "ec2", "ecr")
 
 
 class Edge(BaseModel):

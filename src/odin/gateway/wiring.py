@@ -250,6 +250,16 @@ async def producer_facts(stores: SynthStores, env: str) -> dict[str, dict[str, s
             continue
         tags = stores.tags.get(env, f"{elbv2ctl.SERVICE}:{record['arn']}", {})
         facts[_label(tags, record["name"])] = {"ALB_ENDPOINT": endpoint}
+    for key, record in stores.ecr.items(env).items():
+        if not key.startswith("repo:"):
+            continue
+        # Unlike the four above there is no readiness gate, and deliberately: a
+        # repository is addressable the moment it exists. The others withhold
+        # facts until they are really up because a half-built address is worse
+        # than none -- an ECR uri has nothing to be half-built about, it is the
+        # registry's own published port and the repo name.
+        tags = stores.tags.get(env, f"ecr:{record['repository_arn']}", {})
+        facts[_label(tags, record["repository_name"])] = {"REPOSITORY_URI": record["repository_uri"]}
     facts.update(await _ec2_producers(stores, env))
     return facts
 
@@ -295,7 +305,7 @@ def _resolve(ref: Ref, facts: dict[str, dict[str, str]], kinds: dict[str, str]) 
     """One ref's real value, or `UnresolvedRef` naming the REAL reason.
 
     Field test 6, F3's sub-finding: this used to answer "publishes no facts
-    (only rds, elasticache, alb and ec2 do)" for every miss, which is a
+    (only rds, elasticache, alb, ec2 and ecr do)" for every miss, which is a
     provably false statement about an sqs node -- `/world` publishes its
     `QUEUE_URL` at the same instant (measured; see `spec/models.py::
     REFERENCEABLE_KINDS`). Two misses with two different causes had one

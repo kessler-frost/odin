@@ -100,6 +100,19 @@ def _seed_cache(stores: SynthStores, **overrides) -> None:
 _ALB_NODE = "web-lb"
 
 
+_ECR_NODE = "app-image"
+
+
+def _seed_ecr(stores: SynthStores) -> None:
+    """A repository record as `ecr.py` really writes it. No readiness gate here,
+    unlike the other four: a repository is addressable the moment it exists."""
+    stores.ecr.set(ENV, f"repo:{_ECR_NODE}", {
+        "repository_name": _ECR_NODE,
+        "repository_arn": f"arn:aws:ecr:us-east-1:000000000000:repository/{_ECR_NODE}",
+        "repository_uri": f"127.0.0.1:53219/{_ECR_NODE}",
+    })
+
+
 def _seed_alb(stores: SynthStores) -> None:
     """An `active` elbv2ctl record with a published proxy port -- the same shape
     `tests/reconcile/test_tf_status.py::_lb` builds, so the two projections of an
@@ -189,12 +202,13 @@ async def test_every_referenceable_kind_really_publishes_and_no_other_kind_does(
     _seed_cache(stores)
     _seed_alb(stores)
     _seed_ec2(stores, tmp_path)
+    _seed_ecr(stores)
     facts = await producer_facts(stores, ENV)
-    assert set(facts) == {"appdb", "cache", _ALB_NODE, _VM_NODE}
+    assert set(facts) == {"appdb", "cache", _ALB_NODE, _VM_NODE, _ECR_NODE}
     assert all(facts.values()), "a producer in the table must publish at least one fact"
     # ...and every kind NOT in the tuple contributes nothing, which is the claim
     # the error message now makes on the strength of this.
-    assert set(REFERENCEABLE_KINDS) == {"rds", "elasticache", "alb", "ec2"}
+    assert set(REFERENCEABLE_KINDS) == {"rds", "elasticache", "alb", "ec2", "ecr"}
 
 
 class _PortOnlyRuntime:
@@ -400,7 +414,7 @@ async def test_a_ref_to_a_vm_that_is_not_up_yet_fails_honestly(tmp_path):
 
 async def test_a_ref_to_a_kind_that_can_never_produce_says_so_and_does_not_deny_its_facts(tmp_path):
     """Field test 6, F3's sub-finding. The message said an sqs node "publishes no
-    facts (only rds, elasticache, alb and ec2 do)" -- while `/world` was
+    facts (only rds, elasticache, alb, ec2 and ecr do)" -- while `/world` was
     publishing that same node's `QUEUE_URL`. Measured against a real server at
     the same instant:
 
@@ -418,7 +432,7 @@ async def test_a_ref_to_a_kind_that_can_never_produce_says_so_and_does_not_deny_
     message = str(excinfo.value)
     assert "'jobs' is a sqs node" in message
     assert "no sqs node publishes an endpoint a reference can resolve" in message
-    assert "only rds, elasticache, alb and ec2 do" in message
+    assert "only rds, elasticache, alb, ec2 and ecr do" in message
     # The claim the field test falsified must not come back in any form.
     assert "publishes no facts" not in message
     assert "not healthy yet" not in message
