@@ -9,6 +9,13 @@ case-sensitive on both sides (odin controls both the compiler's casing and
 the classifier's), explicit-deny-wins, default-deny. The compiler itself
 never emits Deny in v1 -- Deny support is kept in the evaluator for future
 edge-level deny authoring and is exercised by tests.
+
+A statement's `Resource` may be an ARN or a bare node label, and both match
+(see `arn_label`): the applied Terraform names a real ARN so the file is
+portable to Amazon, while `classify.py` reports the bare label for every
+request. Matching only one of the two would deny permissions that were drawn,
+applied and are sitting in `iamctl` -- which is why the ARN emitter and this
+reducer are pinned against each other by `tests/agent/test_hcl_iam_arns.py`.
 """
 from __future__ import annotations
 
@@ -41,6 +48,83 @@ def _matches_any(specs: tuple[str, ...], value: str) -> bool:
     return any(_pattern(spec).fullmatch(value) for spec in specs)
 
 
+# --- resources: an ARN and a bare label name the same thing --------------------
+#
+# `classify.py` reports odin's node LABEL for every request -- `uploads`, not
+# `arn:aws:s3:::uploads` -- and that is deliberate (its module docstring's
+# CONTRACT ADDENDUM). A statement's `Resource`, though, can arrive in either
+# form, and BOTH have to match or a real permission is silently denied:
+#
+#   * `agent/hcl.py::_ARN_FORMS` emits a real ARN since v0.8.14, so a canvas
+#     applied through the gateway now grants `arn:aws:s3:::uploads`;
+#   * `compile_policies` (the edge compiler, still used when a Reconciler has no
+#     gateway stores) emits the bare label;
+#   * a hand-written `aws_iam_role_policy` in an IMPORTED project -- the case
+#     v0.8.12 exists to honour -- carries whatever its author wrote, which is an
+#     ARN if they were writing for real AWS.
+#
+# So an ARN spec contributes a SECOND pattern: the label its resource part
+# names. Reduction is keyed on the ARN's OWN service field and only applied when
+# the request's action is for that same service, which is what stops
+# `arn:aws:s3:::*` from reducing to a `*` that would match every resource of
+# every service. An ARN for a service not modeled here reduces to nothing and
+# is matched literally -- it can only ever have been meant for real AWS.
+_ARN = re.compile(r"^arn:[^:]*:(?P<service>[^:]*):[^:]*:[^:]*:(?P<resource>.+)$")
+
+# The RESOURCE part of each modeled service's ARN -> the LABEL `classify.py`
+# reports for that resource. Every entry is the exact inverse of the
+# corresponding `agent/hcl.py::_ARN_FORMS` shape, and
+# `tests/agent/test_hcl_iam_arns.py` walks the two tables against each other so
+# neither can gain a shape the other cannot read.
+_ARN_RESOURCE_LABEL: dict[str, re.Pattern[str]] = {
+    # bucket, bucket/key, bucket/* -- the bucket is the label either way
+    "s3": re.compile(r"(?P<label>[^/]+)(?:/.*)?"),
+    "sqs": re.compile(r"(?P<label>[^:]+)"),
+    # a subscription ARN is `<topic>:<subscription-id>`, like _sns_resource reads
+    "sns": re.compile(r"(?P<label>[^:]+)(?::.+)?"),
+    "dynamodb": re.compile(r"table/(?P<label>[^/]+)(?:/.*)?"),
+    "lambda": re.compile(r"function:(?P<label>[^:]+)(?::.+)?"),
+    "rds": re.compile(r"db:(?P<label>.+)"),
+    "elasticache": re.compile(r"cluster:(?P<label>.+)"),
+    "secretsmanager": re.compile(r"secret:(?P<label>.+)"),
+    "ecr": re.compile(r"repository/(?P<label>.+)"),
+    # cluster/<name>, service/<cluster>/<name>, task-definition/<family:rev>
+    "ecs": re.compile(r"[a-z-]+/(?:[^/]+/)?(?P<label>[^/]+)"),
+    # a group name contains `/` and the ARN can carry a `:*` or `:log-stream:`
+    # suffix -- the same two forms `classify._bare_log_group` trims
+    "logs": re.compile(r"log-group:(?P<label>.+?)(?::\*)?(?::log-stream:.*)?"),
+    # `parameter/db` -> `db`; the leading slash of a HIERARCHICAL name is part of
+    # it, exactly as `classify._ssm_canonical` / `ssmctl.canonical_name` decide
+    "ssm": re.compile(r"parameter/(?P<label>.+)"),
+}
+# The one service whose label is not simply the captured group: SSM restores the
+# leading slash of a hierarchical name (`/odin/db`) and drops it from a
+# root-level one (`db`).
+_SSM_HIERARCHICAL = "/{label}"
+
+
+def arn_label(spec: str, action: str) -> str | None:
+    """The node label an ARN `Resource` names, or None when `spec` is not an ARN
+    for the service this request's `action` belongs to."""
+    arn = _ARN.match(spec)
+    if arn is None or arn["service"] != action.partition(":")[0]:
+        return None
+    pattern = _ARN_RESOURCE_LABEL.get(arn["service"])
+    match = pattern.fullmatch(arn["resource"]) if pattern is not None else None
+    if match is None:
+        return None
+    label = match["label"]
+    return _SSM_HIERARCHICAL.format(label=label) if arn["service"] == "ssm" and "/" in label else label
+
+
+def _resource_specs(specs: tuple[str, ...], action: str) -> tuple[str, ...]:
+    """Every form of a statement's resources the classifier could be reporting:
+    the specs themselves, plus the bare label of each that is an ARN."""
+    return specs + tuple(
+        label for spec in specs for label in (arn_label(spec, action),) if label is not None
+    )
+
+
 def compile_policies(stack: Stack) -> dict[str, list[Statement]]:
     """Compile each workload's `kind == "iam"` edges into Allow statements."""
     policies: dict[str, list[Statement]] = {}
@@ -56,7 +140,8 @@ def evaluate(statements: list[Statement], action: str, resource: str) -> bool:
     """default-deny; an explicit Deny beats any Allow regardless of order."""
     allowed = False
     for statement in statements:
-        if not (_matches_any(statement.actions, action) and _matches_any(statement.resources, resource)):
+        resources = _resource_specs(statement.resources, action)
+        if not (_matches_any(statement.actions, action) and _matches_any(resources, resource)):
             continue
         if statement.effect == "Deny":
             return False
