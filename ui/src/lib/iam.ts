@@ -99,3 +99,27 @@ export function edgeStyle(edgeTypeId: string): React.CSSProperties {
     ...(def.dashed ? { strokeDasharray: '6 3' } : {}),
   };
 }
+
+/**
+ * What a DRAWN edge means: its type, and for IAM the permissions it starts with.
+ *
+ * Extracted from `Canvas.tsx::onConnect` so it can be tested. The gesture that
+ * produces it -- dragging between two 6px handles -- is not automatable here
+ * (see .claude/CLAUDE.md: `pointerdown` arrives with a non-handle target even at
+ * the handle's measured centre), so the drag itself has no coverage. Its RESULT
+ * is pure logic, and this is that logic, where a test can reach it.
+ *
+ * The IAM rule worth pinning: permissions come from the NON-COMPUTE end, the
+ * resource being accessed. `ec2 -> s3` and `s3 -> ec2` must therefore produce
+ * the same S3 permissions, because the user drew the same intent either way.
+ */
+export function edgeDataForConnection(
+  sourceType: string, targetType: string,
+): { edgeType: string; permissions: string[] } {
+  const edgeType = detectDefaultEdgeType(sourceType, targetType);
+  if (edgeType !== 'iam') return { edgeType, permissions: [] };
+  const resourceType = !computeTypes.has(sourceType)
+    ? sourceType
+    : !computeTypes.has(targetType) ? targetType : '';
+  return { edgeType, permissions: [...(defaultPermissions[resourceType] ?? [])] };
+}
