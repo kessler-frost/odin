@@ -22,10 +22,26 @@ part):
   reload, because a leaf's stored height was dropped on load. The gesture was
   unusable until that was fixed — and fixing it revealed the same bug for every
   other kind, which the owner then caught and which is now general.
-- Its four stated costs (ordering, capacity, failure meaning, naming) all
-  remain real and unaddressed. Placement chooses a VM; nothing yet sequences an
-  ecs node behind its ec2 node, bounds how many tasks one instance may hold, or
-  separates "the VM is not up" from "the task failed".
+- Its four stated costs were all real, and all four are now CLOSED (v0.8.1).
+  This bullet said they "remain real and unaddressed" for a while after they
+  stopped being either, which is the stale-caveat failure this repo keeps
+  finding in its own docs — so, with the code that answers each:
+  - *the unlocking change* — `LimaRuntime(vm=...)` per instance, no longer a
+    class constant.
+  - *ordering* — `hcl.py::_placement_dependency` emits
+    `depends_on = [aws_instance.<host>]`, so tofu (which already owns ordering
+    here) will not schedule a task before its instance exists. A real
+    dependency, not a wait loop.
+  - *capacity* — `spec/capacity.py::overcommitted` refuses the apply BEFORE
+    anything is built, naming the instance, what was asked of it and what it
+    has. Arithmetic, not a scheduler: one sum per instance, and a canvas that
+    fits pays nothing. v0.8.2 finished it by making the number it reasons about
+    authorable at all (`memory` on the ecs node reached neither the HCL nor the
+    UI before, so every task was the 512 MiB default).
+  - *failure meaning* — `compute/tasks.py::TaskRuntime(placed_on=...)` phrases a
+    placed task's failure against the instance it was placed in, so "the VM is
+    not up" and "the task failed" stay distinguishable. They need opposite
+    responses from a person.
 
 > "canvas and navigating things around IS the language of odin, and not
 > chatting with a bot to update things around" — the owner.
