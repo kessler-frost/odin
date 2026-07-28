@@ -35,11 +35,13 @@ kind whose calls can never be matched.
 """
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
 import pytest
 
+from odin.gateway.classify import classify
 from odin.gateway.policy import Statement, evaluate
 
 REPO = Path(__file__).resolve().parents[2]
@@ -132,3 +134,48 @@ def test_a_wildcard_grant_covers_its_service():
         service = action.split(":", 1)[0]
         statements = [Statement(actions=(f"{service}:*",), resources=("thing",))]
         assert evaluate(statements, action, "thing") is True, action
+
+
+# --- EventBridge, checked FORWARDS as well as backwards -----------------------
+#
+# Every test above starts from the UI and asks whether the gateway can keep up.
+# That direction cannot protect a service the UI has not reached yet: an
+# `events` edge is being drawn in the canvas in parallel with the classifier
+# landing here, and until both are in the tree `_ui_actions()` yields no
+# `events:*` at all, so every parametrized test above would pass vacuously
+# while the grant was inert.
+#
+# So this pair checks the OTHER direction for the newest service: given the
+# actions an `events` edge will offer, can the classifier emit them, and does
+# an edge granting one really allow the matching call? Written against the real
+# `classify`/`evaluate`, not against a list of strings -- a string list would
+# agree with itself.
+
+# What an `events` iam edge is for, and the only actions worth offering: the
+# rule's own read/describe surface plus `PutEvents`, which is the one a
+# workload actually calls. Kept small deliberately -- the create verbs belong to
+# the operator (tofu), never to a workload edge.
+EVENTS_EDGE_ACTIONS = ("events:PutEvents", "events:DescribeRule", "events:ListTargetsByRule", "events:*")
+
+
+def test_the_gateway_classifies_eventbridge_at_all():
+    assert "events" in CLASSIFIED_SERVICES, (
+        "`classify.py` no longer dispatches on `events`, so every `events:*` grant is decorative "
+        "and an `aws_cloudwatch_event_rule` in generated Terraform fails `tofu apply` with "
+        "AccessDenied/unmappable-action"
+    )
+
+
+@pytest.mark.parametrize("action", EVENTS_EDGE_ACTIONS)
+def test_an_events_grant_allows_the_call_the_classifier_really_emits(action: str):
+    """The falsification: build the statement an edge compiles to, then feed
+    `evaluate` the exact `(action, resource)` pair `classify` produces for a
+    real EventBridge request -- so a rename on either side fails here."""
+    body = json.dumps({"Entries": [{"Source": "odin", "DetailType": "t", "Detail": "{}"}]}).encode()
+    emitted = classify(
+        "events", "POST", "/", {}, {"X-Amz-Target": "AWSEvents.PutEvents"}, body,
+    )
+    assert emitted == ("events:PutEvents", "default"), "classify no longer names the bus PutEvents targets"
+    statements = [Statement(actions=(action,), resources=("default",))]
+    expected = action in ("events:PutEvents", "events:*")
+    assert evaluate(statements, *emitted) is expected, action

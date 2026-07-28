@@ -103,6 +103,24 @@ They are listed because finding one by surprise is worse than reading it here.
   a slow or loaded machine. The default deliberately stays put: a longer one makes
   a genuinely hung boot take longer to report, and the two look identical until
   the timeout fires.
+- **EventBridge is a control plane with no delivery.** `aws_cloudwatch_event_rule`,
+  `aws_cloudwatch_event_target` and `aws_cloudwatch_event_bus` apply, refresh,
+  tag and destroy for real, and the records survive a restart — so a rule you draw
+  is really there. **Nothing runs its targets.** `PutEvents` therefore does not
+  answer `FailedEntryCount: 0` the way real EventBridge does; it fails with a
+  message naming the missing half, because an accepted event that is never
+  delivered is a worse answer than a refused one. Invoke the target directly
+  (`lambda:Invoke` for a lambda target) until the dispatcher lands — the design
+  for it is `docs/event-dispatch-design.md`. Also unmodelled: event-pattern
+  matching, archives and replays, API destinations and connections, partner event
+  sources, `PutPermission`, and rule/target pagination (every list returns one
+  page and `Limit` truncates).
+- **S3 bucket notifications do not work at all, and the failure is loud in one
+  place and silent in another.** `aws_s3_bucket_notification` is forwarded to
+  RustFS, which **rejects every notification ARN form with `InvalidArgument` and
+  stores the configuration anyway** (measured against `rustfs/rustfs:latest`). So
+  `tofu apply` fails, the next `plan` reads the config back through GET and
+  reports no drift, and nothing ever fires. Do not draw an S3 trigger yet.
 - **RDS** is Terraform-managed (`aws_db_instance` → a Postgres container)
   and Postgres-only: MySQL or MariaDB is declined with the reason.
   `allocated_storage` and `instance_class` round-trip faithfully but resize
