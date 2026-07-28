@@ -1137,6 +1137,48 @@ future decision against these points instead of re-deriving them:
   external/LAN-reachable underlay address plus multi-Mac membership and
   cross-machine placement are still open). Additive, no core change.
 
+## The intelligence layer — the canvas IS the language
+
+Owner's framing, and the reason this section exists: *"canvas and navigating
+things around IS the language of odin, not chatting with a bot to update things
+around — that we'll add later too, but this is a separate thing."*
+
+These four were LOST once already: a range-based edit to this file deleted them
+while replacing a neighbouring entry, and they were only noticed when the owner
+asked whether they had been forgotten. Recovered from 8a0c89e. Do not use
+index-to-index deletion on this file.
+
+- [ ] **Containment changes configuration, not just labels.** The owner's
+  example: expand an EC2 box, drop an ECS box inside it, and that means **ECS
+  on the EC2 launch type rather than Fargate** — which is a real AWS
+  distinction (ECS tasks run either on EC2 container instances or on Fargate),
+  not a UI convenience. Dropping it back out means Fargate again.
+  **The invariant that makes this safe: identity is preserved.** The node's
+  name/label and anything the user typed stay exactly as they are; only the
+  fields that containment genuinely determines change. A gesture must never
+  silently rewrite something a person authored — that is the same honesty rule
+  the rest of odin follows, applied to the canvas.
+  Needs: a per-kind table of "what does containment in X imply", applied on the
+  containment-stamp path, plus a visible statement of what changed (odin says
+  what it did; it does not quietly do it).
+
+- [ ] **IAM edges across the whole catalog, not just S3.** Today the drawn-edge
+  → compiled-policy path is real and enforced, but the action vocabulary is
+  thin outside `s3:*`. Extend to sqs/sns/dynamodb/lambda/ecs/secrets/logs/ecr
+  and the rest, so drawing a lambda → dynamodb edge grants the right actions
+  the way a lambda → s3 edge already does. The compiler and the enforcement
+  point do not change; the vocabulary does.
+
+- [ ] **Placement that infers intent from geometry.** The general form of the
+  first item: what a person expresses by putting one thing inside, next to, or
+  overlapping another. Containment is the first and clearest case; adjacency
+  and grouping follow. Each inference must be reversible by the opposite
+  gesture and must never destroy authored values.
+
+- [ ] **Then, and separately: the chat/agent surface.** NORTHSTAR's canvas↔
+  Terraform translation agent. Explicitly NOT a replacement for the canvas
+  language — an addition to it.
+
 ## Next — known, measured, not yet fixed
 
 - [ ] **The edge-type selector, when there is anything to select.** Owner design
