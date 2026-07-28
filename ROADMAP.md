@@ -1331,6 +1331,43 @@ index-to-index deletion on this file.
 
 ## Next — known, measured, not yet fixed
 
+- [x] **The import direction is complete (v0.8.4).** NORTHSTAR says the
+  translation runs BOTH ways; it generated 18 kinds and read back 13, so feeding
+  odin its own `main.tf` lost a third of it. All 18 now round-trip, across 24
+  resource types, and odin's own project imports with nothing unsupported.
+
+  What each of the five added kinds actually cost, because none was just a line
+  in a table:
+  - **sg** — the rules are what the Nebula firewall compiles from, so losing them
+    loses the security posture. Both directions of difference are reported: an
+    `ingress` block that cannot be one `protocol:port:source` line (a port RANGE)
+    is named with a count because the group then allows LESS, and `egress` cannot
+    survive at all (odin re-emits its own wide-open default and has no outbound
+    field) so a restricted source comes back UNRESTRICTED.
+  - **ec2** — three references that each decide something different: containment
+    (unappliable without it), security groups (less protected), and the companion
+    key pair (unreachable). One warning each, not one vague line.
+  - **ecs** — one node, three resources. The task definition folds on; placement
+    survives. Its canvas WIRING cannot: env refs are deliberately never written
+    into the HCL, and since odin re-derives `depends_on` from those refs, neither
+    the values nor the ordering come back.
+  - **lambda** — config from the HCL, body from the zip beside it. It also
+    exposed a defect older than the feature: a lambda's AUTO-GENERATED role
+    imported as a node the user never drew, so a one-lambda canvas round-tripped
+    into one `iam_role` and no function.
+  - **ecr** — one argument, unsupported only because nobody had written the line.
+
+  Two things worth keeping from how it went. **`unquote` was half an inverse** —
+  `quote` is `json.dumps` but unquote only stripped the quotes, so an imported
+  shell script came back with a literal `\n` and would have run as one line on a
+  real VM; that was never ec2-specific (ssm values, secrets, iam policies all had
+  it). And **the last two defects were only visible end to end**: the CLI sent
+  `.tf` text without the zip, so the code recovery worked in unit tests and
+  nowhere else, and a correct import warned about env references that never
+  existed. Both were found by running the real `odin import-tf` against a real
+  server after the unit tests were green.
+
+
 - [ ] **The edge-type selector, when there is anything to select.** Owner design
   call (2026-07-28): what an edge MEANS depends on the components it connects,
   and where a pair could legitimately mean more than one thing odin should ASK
