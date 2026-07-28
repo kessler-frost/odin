@@ -476,9 +476,40 @@ The archive holds the env's credentials in cleartext. It is written `0600` with
 every member stored `0600`, so a restore can only tighten a store's modes.
 Copying it elsewhere will not preserve that, so treat it like a private key.
 
-## AI: one feature, one switch
+## AI: two features, one switch
 
-Exactly one feature asks a model anything, and it is not the translation.
+Two features ask a model anything, and neither of them is the translation.
+
+**`odin chat` — plain English to a canvas edit you review first.** The canvas is
+odin's language; this is an addition to it, not a replacement, so it never edits
+anything by itself:
+
+```
+$ odin chat "give the thumbnailer lambda read access to the uploads bucket"
+Granted thumbnailer read access to the uploads bucket.
+  - draw a iam edge from 'thumbnailer' to 'uploads' granting s3:GetObject, s3:ListBucket
+
+nothing was changed — re-run with --apply to save this
+```
+
+- **Two calls, never one.** The default prints what *would* change and writes
+  nothing; `--apply` saves it through the same `POST /canvas` the UI's own save
+  uses. There is no privileged path for an agent-authored canvas.
+- **It proposes operations, not a rewritten canvas**, so every change is one
+  reviewable sentence and anything you did not ask for is impossible by
+  construction — there is no operation that says "and also touch this".
+- **The costly changes say so.** A rename is not a label edit: for most kinds the
+  label *is* the real resource name, so the plan reads `applying this DESTROYS and
+  recreates it`.
+- **It cannot set what odin derives.** `vpc`/`subnet`/`host` come from where you
+  draw a box and `status` from the live world, so a value there would be discarded
+  by your next drag — those are refused, by name.
+- **It is told field NAMES, never values.** A canvas holds real secrets (an RDS
+  password, a secret's value, an SSM parameter), so they are never assembled into
+  the prompt. The cost is that it cannot tell you a password; that is the trade.
+- Anything odin declines is printed on stderr, naming the operation and why —
+  that line is the difference between "it did what I asked" and "it did some of
+  it". `ODIN_CHAT_TIMEOUT` (default 60s) bounds the call.
 
 **"What's wrong here?"** Select nodes (click, or Cmd-drag a region) and a bar
 appears with the button and a free-form question box. Odin gathers each node's
@@ -506,11 +537,12 @@ expects was never supplied"*. The compiler builds; the agent explains.
   tofu output, so a failure whose cause scrolled past that window will not be in
   the answer. The Logs tab has the full tail.
 
-**`ODIN_AI=0` turns off every model call odin can make.** There are two call
-sites: this feature (`ODIN_DEBUG_AGENT`, on by default) and the optional
-Terraform *refine* pass (`ODIN_TRANSLATE_REFINE`, off by default). With
-`ODIN_AI=0` neither builds a client or spawns anything, and the debug route
-answers with its normal 200 naming the switch:
+**`ODIN_AI=0` turns off every model call odin can make.** There are three call
+sites: this feature (`ODIN_DEBUG_AGENT`, on by default), `odin chat`, and the
+optional Terraform *refine* pass (`ODIN_TRANSLATE_REFINE`, off by default). With
+`ODIN_AI=0` none of them builds a client or spawns anything, and each answers
+with its normal 200 naming the switch — `odin chat` prints
+`note: agent unavailable: ODIN_AI=0 …` and changes nothing. The debug route:
 
 ```
 the failure-explanation agent did not run: ODIN_AI=0 — every model call is
