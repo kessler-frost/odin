@@ -1052,16 +1052,25 @@ def test_start_bounds_uvicorns_graceful_shutdown(monkeypatch, tmp_path):
     alive after four minutes, gateway port held so nothing could restart. Ctrl-C
     hung the same way. With the flag it stops in ~11s.
     """
+    # `_build_ui` stubbed like every other start test here: `start` shells out to
+    # `bun run build` first, and CI has no bun -- the first version of this test
+    # skipped that and failed on all three Python versions with a bare `Exit: 1`,
+    # having never reached uvicorn at all.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main_mod, "_build_ui", lambda: None)
     seen: dict = {}
 
-    def fake_run(app, **kwargs):
+    def fake_uvicorn_run(app_path, factory, host, port, **kwargs):
         seen.update(kwargs)
 
-    monkeypatch.setattr("uvicorn.run", fake_run)
-    monkeypatch.setattr("odin.__main__.ODIN_DIR", tmp_path)
-    monkeypatch.setattr("odin.__main__.PID_FILE", tmp_path / "server.pid")
-    from odin.__main__ import GRACEFUL_SHUTDOWN_SECONDS, start
+    monkeypatch.setitem(
+        sys.modules, "uvicorn",
+        type("FakeUvicorn", (), {"run": staticmethod(fake_uvicorn_run)}),
+    )
 
-    start(host="127.0.0.1", port=4200, foreground=True, dev=False)
-    assert seen.get("timeout_graceful_shutdown") == GRACEFUL_SHUTDOWN_SECONDS
-    assert 0 < GRACEFUL_SHUTDOWN_SECONDS <= 30, "a long grace is indistinguishable from the hang"
+    main_mod.start(host="127.0.0.1", port=4200, foreground=True, dev=False)
+
+    assert seen.get("timeout_graceful_shutdown") == main_mod.GRACEFUL_SHUTDOWN_SECONDS
+    assert 0 < main_mod.GRACEFUL_SHUTDOWN_SECONDS <= 30, (
+        "a grace period this long is indistinguishable from the hang it fixes"
+    )
