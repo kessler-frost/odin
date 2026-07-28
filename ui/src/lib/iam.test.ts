@@ -8,7 +8,14 @@
  * in its entirety -- `lib/iam.ts` had no test file at all.
  */
 import { describe, expect, it } from 'bun:test';
-import { computeTypes, defaultPermissions, edgeDataForConnection } from './iam';
+import {
+  computeTypes,
+  defaultPermissions,
+  detectEdgeTypes,
+  edgeDataForConnection,
+  edgeTypes,
+  sgMemberTypes,
+} from './iam';
 
 describe('edgeDataForConnection', () => {
   it('a compute -> data-resource edge is an IAM edge with that resource\'s permissions', () => {
@@ -52,5 +59,37 @@ describe('edgeDataForConnection', () => {
     expect(typeof edgeType).toBe('string');
     expect(edgeType.length).toBeGreaterThan(0);
     expect(Array.isArray(permissions)).toBe(true);
+  });
+});
+
+describe('security-group membership edges', () => {
+  // Which instances a group gates is a RELATIONSHIP; an SG's own `vpc_id` is
+  // ownership and comes from containment. Before this, membership could only be
+  // typed into an ec2/rds `securityGroups` field, so the canvas could not show it.
+  it('an sg drawn against ec2 or rds means membership, not network', () => {
+    for (const member of sgMemberTypes) {
+      expect(detectEdgeTypes('sg', member)).toEqual(['sg']);
+      expect(edgeDataForConnection('sg', member).edgeType).toBe('sg');
+    }
+  });
+
+  it('reads the same either way round', () => {
+    expect(edgeDataForConnection('sg', 'ec2')).toEqual(edgeDataForConnection('ec2', 'sg'));
+  });
+
+  it('carries no permissions — membership is not a grant', () => {
+    // Permissions on a membership edge would imply odin enforces something it
+    // does not; the SG's own rules are what gate traffic.
+    expect(edgeDataForConnection('sg', 'ec2').permissions).toEqual([]);
+  });
+
+  it('is limited to the kinds whose HCL actually reads securityGroups', () => {
+    // s3 has no such field, so an sg edge to it must not claim to configure one.
+    expect(detectEdgeTypes('sg', 's3')).not.toEqual(['sg']);
+  });
+
+  it('has a definition, so it renders as itself rather than a fallback line', () => {
+    expect(edgeTypes.sg).toBeDefined();
+    expect(edgeTypes.sg.label).toBe('Security Group');
   });
 });
