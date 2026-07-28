@@ -101,7 +101,7 @@ and there the code *is* the answer:
 
 `status` exits `2` when it holds the store lock — so odin is definitely running —
 but the server did not answer `/health`, usually because it is on another port and
-no `--url` was passed. That is a third answer, not a failure: `0` claims both
+no `--url` was passed. That is a third answer: `0` claims both
 halves ("running **and** converging") and reporting `1` would invent a reconciler
 failure out of a URL guess. So `odin status && odin apply` still refuses to apply
 into an env nothing will converge, without ever crying wolf.

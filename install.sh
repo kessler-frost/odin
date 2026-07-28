@@ -15,7 +15,7 @@
 # *development* install throws away the link to someone's checkout, so this
 # script REFUSES unless you pass --force:
 #
-#   curl -fsSL …/scripts/install.sh | sh -s -- --force
+#   curl -fsSL …/install.sh | sh -s -- --force
 set -eu
 
 FORCE=0
@@ -50,7 +50,7 @@ if [ "$FORCE" -eq 0 ] && [ -f "$receipt" ] && grep -q 'editable' "$receipt"; the
   echo "Pick one:"
   echo "  * keep developing        — you already have odin; nothing to do here."
   echo "  * really replace it      — re-run with --force:"
-  echo "        curl -fsSL https://raw.githubusercontent.com/kessler-frost/odin/main/scripts/install.sh | sh -s -- --force"
+  echo "        curl -fsSL https://raw.githubusercontent.com/kessler-frost/odin/main/install.sh | sh -s -- --force"
   echo "  * go back to dev later   — cd ${checkout:-<your clone>} && uv tool install --editable '.[dev]'"
   exit 1
 fi

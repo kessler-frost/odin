@@ -1065,7 +1065,7 @@ future decision against these points instead of re-deriving them:
     cleartext. Written `0600`, every member stored `0600`, and a restore masks
     off group/other bits so it can only ever tighten a store's modes.
 - [x] **Packaging (pragmatic scope).** DONE 2026-07-24 (v0.5.0):
-  `scripts/install.sh` (one command: brew tools + colima up + odin + doctor)
+  `install.sh` (one command: brew tools + colima up + odin + doctor)
   and `odin doctor` (toolchain checks with exact fixes, disk headroom,
   `--prebake` for the dynalite image). Full binary vendoring into one
   distributable.
@@ -1371,6 +1371,36 @@ index-to-index deletion on this file.
     one observed field alias is accepted.
 
 ## Next — known, measured, not yet fixed
+
+- [ ] **Close the Known limits, one at a time.** `docs/limits.md` is the list, and
+  each entry there is a promise odin does not keep yet. Owner ask, 2026-07-28:
+  treat it as a work queue, not a disclaimer. In rough order of what a user hits
+  first:
+
+  1. **A drawn IAM edge is not in the generated Terraform.** The gateway enforces
+     it, so odin is correct; the FILE is incomplete. `main.tf` taken to Amazon
+     grants nothing, and a canvas round-tripped through Terraform loses every
+     permission. Emitting `aws_iam_role_policy` per drawn edge would close it and
+     make the round trip lossless — the one design question is what to attach a
+     policy to for a workload that has no role drawn.
+  2. **An RDS container keeps no volume**, so odin's own repair returns an empty
+     database. A named volume per instance would survive a container replacement
+     and make the recovery non-destructive, which changes the disclosure in
+     `server.py::_RECOVERY_COST` from a warning into a footnote.
+  3. **An ECS service's canvas wiring cannot be imported** — env refs are never
+     written into the HCL (a resolved DATABASE_URL carries a password), and
+     `depends_on` is re-derived from those refs, so neither survives. Wants a
+     non-secret representation of a ref that Terraform can carry.
+  4. **sqs/sns tags are dropped on import** (`_CARRIED_ATTRS` lists only `name`
+     while `hcl.py` emits tags for every kind). Small and mechanical.
+  5. **Envs are never removable.** `odin destroy --env X` tears the resources
+     down and leaves the env registered with a reconciler ticking forever; seven
+     accumulated during one field-test session. Wants `odin env rm` or a
+     `--forget` flag, plus whatever the UI env list should do with it.
+  6. **Lambda is inline code only**, one version, no S3-deployed packages.
+  7. **Nebula is single-host** — this is M7, and it stays deferred until the
+     owner asks, because it cannot be honestly finished on one machine.
+
 
 - [x] **The import direction is complete (v0.8.4).** NORTHSTAR says the
   translation runs BOTH ways; it generated 18 kinds and read back 13, so feeding

@@ -1,0 +1,5 @@
+graph TD
+  C["Canvas"] -->|compile| T["Terraform"]
+  T -->|tofu apply| G["odin gateway"]
+  G -->|provision| R["Postgres, RustFS, goaws, Lima VMs"]
+  R -->|observe| C
