@@ -1325,9 +1325,36 @@ index-to-index deletion on this file.
   unambiguous and which no edge already expresses. That is a real observation
   about how people draw, not something to reason out in advance.
 
-- [ ] **Then, and separately: the chat/agent surface.** NORTHSTAR's canvas↔
-  Terraform translation agent. Explicitly NOT a replacement for the canvas
-  language — an addition to it.
+- [x] **The chat/agent surface — BUILT (v0.8.5), as an addition.** `odin chat
+  "..."` proposes a canvas edit; `--apply` saves it. Explicitly NOT a replacement
+  for the canvas language, and the shape follows from that: two calls, never one,
+  and `--apply` goes through the same `POST /canvas` the UI's own save uses, so
+  there is no privileged path for an agent-authored canvas.
+
+  **It proposes OPERATIONS, not a rewritten canvas.** Canvas-in-canvas-out is
+  unauditable — a dropped node, a rewritten password and a rename all arrive as
+  the same opaque blob, and diffing cannot recover intent. An op list can be
+  validated one at a time against the real catalog, shown as a sentence per
+  change, and makes an unrequested edit impossible by construction: there is no
+  op that says "and also touch this". The owner's *"things like name and stuff
+  remains as is"* is enforced literally — `set_field` may not write `label`, and
+  renaming is its own op whose description says it DESTROYS and recreates.
+
+  **Three defects found only by running the real thing**, each invisible to the
+  unit tests that were already green:
+  - the SDK returned `ops` as a JSON **string**, not a list. The reader iterated
+    it character by character, found no dicts, and reported "the agent proposed
+    nothing" — while the agent had proposed exactly the right edge. Honesty rule
+    1 in a new costume: a reader wired to a shape the signal does not arrive in.
+  - an empty tool call printed a blank line and exited 0, which is
+    indistinguishable from success; and a `reply` claiming "Added a read-access
+    edge" could stand alone with zero ops behind it. odin now always states
+    whether anything would change, so prose cannot imply an action it did not
+    take.
+  - "odin does not model that operation" was reported for an op odin models
+    perfectly whose ARGUMENTS were wrong (`node` where the schema says `label`),
+    hiding the only actionable detail. The two failures are now distinct, and the
+    one observed field alias is accepted.
 
 ## Next — known, measured, not yet fixed
 

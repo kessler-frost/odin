@@ -10,6 +10,7 @@ from odin.cli import (  # noqa: F401  (registration side effects)
     apply,
     backup,
     canvas,
+    chat,
     keys,
     observe,
     tf,

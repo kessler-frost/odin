@@ -50,11 +50,19 @@ can be tested without a model.
 """
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
+import os
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, SdkMcpTool, create_sdk_mcp_server, tool
+from pydantic import BaseModel, Field, ValidationError
 
+from odin.agent import ai
 from odin.spec.translate import _KIND
+
+log = logging.getLogger("odin.chat")
 
 # The fields a `set_field` op may write, per kind, taken from the CATALOG the UI
 # offers rather than restated here -- a second list would drift the first time
@@ -276,3 +284,263 @@ def apply_ops(canvas: dict, ops: list[Op]) -> tuple[dict, list[str], list[Refusa
             ]
         changes.append(describe(op))
     return result, changes, refused
+
+
+# --- the SDK half -------------------------------------------------------------
+#
+# Everything above is pure and decides what is ALLOWED. This half decides what is
+# ASKED FOR, and it is the only part a model touches. Same split, same reasons and
+# the same shape as `agent/translate.py`'s refine pass and `agent/debugger.py`'s
+# diagnosis: one typed MCP tool as the sole effect channel, `ai.refuse_if_off()`
+# before any client exists, and a bounded `wait_for` around the un-awaited
+# coroutine (awaiting first would complete the pass unbounded and leave the
+# timeout measuring a finished value -- the exact hang the bound exists to stop).
+
+
+class ProposeEditsInput(BaseModel):
+    """The ONE thing the agent may hand back. Deliberately NOT a canvas.
+
+    `reply` is what the user reads; `ops` is what odin might do. Both are
+    required, because an edit with no explanation is unreviewable and an
+    explanation with no ops is a chatbot.
+    """
+    reply: str = Field(description="A short plain-English answer to the user, in the second person.")
+    ops: list[dict] = Field(
+        default_factory=list,
+        description=(
+            "The canvas edits you propose, in order. Each is an object with an `op` key: "
+            "add_node{kind,label,fields}, set_field{label,field,value}, "
+            "rename_node{label,new_label}, delete_node{label}, "
+            "add_edge{source,target,edge_type,actions}, delete_edge{source,target}. "
+            "Empty when the user asked a question rather than for a change."
+        ),
+    )
+
+
+_MODEL = "claude-sonnet-5"
+_TIMEOUT_ENV = "ODIN_CHAT_TIMEOUT"
+_DEFAULT_TIMEOUT = 60.0
+
+_SYSTEM = (
+    "You edit an odin canvas: a diagram of AWS-shaped infrastructure that odin builds for real. "
+    "You never apply anything -- you PROPOSE edits a human reviews first.\n\n"
+    "Rules, in order of importance:\n"
+    "1. Change only what was asked for. Never 'tidy up' a field nobody mentioned.\n"
+    "2. Never rename a node unless renaming is the request. A node's label IS the real "
+    "resource name, so a rename destroys and recreates it.\n"
+    "3. Never set vpc/subnet/host/status: odin derives those from where boxes are DRAWN and "
+    "from the live world, and your value would be discarded.\n"
+    "4. If the request is ambiguous, propose nothing and ask for the missing detail in `reply`.\n"
+    "5. If the request is a question about the canvas, answer it in `reply` with no ops.\n\n"
+    "When the user asks for a CHANGE you must put it in `ops` -- describing it in `reply` "
+    "changes nothing, and odin will report that nothing happened. Worked example:\n"
+    "  user: give the worker lambda read access to the uploads bucket\n"
+    "  ops:  [{\"op\": \"add_edge\", \"source\": \"worker\", \"target\": \"uploads\", "
+    "\"edge_type\": \"iam\", \"actions\": [\"s3:GetObject\", \"s3:ListBucket\"]}]\n"
+    "  reply: Granted worker read access to uploads.\n\n"
+    "Always call propose_edits exactly once."
+)
+
+
+def default_timeout() -> float:
+    """Read per call so it can be raised for one slow request without a restart
+    (`rdsctl.available_timeout`'s shape)."""
+    return float(os.environ.get(_TIMEOUT_ENV, _DEFAULT_TIMEOUT))
+
+
+def disabled_reason() -> str | None:
+    """Why chat is unavailable, in the user's words, or None. Mirrors
+    `debugger.disabled_reason` -- the panel/CLI says `agent unavailable` and the
+    REASON rather than failing with a stack trace."""
+    return ai.off_reason()
+
+
+def make_propose_tool(collector: list[dict]) -> SdkMcpTool:
+    @tool("propose_edits", "Propose canvas edits for the user to review, plus a short reply.", ProposeEditsInput)
+    async def propose_edits(args: ProposeEditsInput) -> dict:
+        collector.append(dict(args))
+        return {"content": [{"type": "text", "text": "recorded"}]}
+
+    return propose_edits
+
+
+def canvas_summary(canvas: dict) -> list[dict[str, Any]]:
+    """What the model is allowed to SEE. One entry per node: kind, label, the
+    fields it carries and its edges.
+
+    VALUES ARE NOT INCLUDED. Only field NAMES, because a canvas holds real
+    secrets -- an rds node's `password`, a secret's `secretString`, an ssm
+    parameter's value -- and `debugger.assemble_context` already learned that
+    the cheapest way not to leak one is never to assemble it. The cost is that
+    the agent cannot answer "what is the password"; that is the correct trade,
+    and it can still change a field it cannot read.
+    """
+    by_id = {n.get("id", ""): n.get("data", {}).get("label", "") for n in canvas.get("nodes") or []}
+    edges = [
+        {"from": by_id.get(e.get("source", ""), ""), "to": by_id.get(e.get("target", ""), ""),
+         "type": (e.get("data") or {}).get("edgeType", "iam")}
+        for e in canvas.get("edges") or []
+    ]
+    return [
+        {
+            "kind": node.get("type", ""),
+            "label": node.get("data", {}).get("label", node.get("id", "")),
+            "fields_set": sorted(k for k in (node.get("data") or {}) if k != "label"),
+            "edges": [e for e in edges if e["from"] == node.get("data", {}).get("label")],
+        }
+        for node in canvas.get("nodes") or []
+    ]
+
+
+def _prompt(canvas: dict, message: str) -> str:
+    return (
+        f"The canvas right now (field VALUES are withheld; you get field names only):\n"
+        f"{json.dumps(canvas_summary(canvas), indent=2)}\n\n"
+        f"Kinds odin can build: {', '.join(sorted(_KIND))}\n\n"
+        f"The user says: {message}\n\n"
+        "Call propose_edits once."
+    )
+
+
+async def _run_agent(prompt: str, options: ClaudeAgentOptions, client_cls: type) -> None:
+    async with client_cls(options=options) as client:
+        await client.query(prompt)
+        async for _ in client.receive_response():
+            pass
+
+
+def _raw_ops(value: Any) -> tuple[list[Any], str | None]:
+    """The op list out of the tool payload, whatever shape it arrived in.
+
+    MEASURED against the real agent, and the reason this function exists: the
+    SDK handed `ops` back as a JSON **string** --
+
+        "ops": "[{\"op\": \"add_edge\", \"source\": \"thumbnailer\", ...}]"
+
+    -- not as a list. The first version did `for raw in payload.get("ops") or []`
+    and iterated that string CHARACTER BY CHARACTER, found no dicts, and reported
+    "the agent proposed nothing". The agent had proposed exactly the right edge.
+    Nothing failed, nothing logged; the request simply evaporated, which is this
+    repo's honesty rule 1 in a new costume -- a reader wired to a shape the
+    signal does not arrive in.
+
+    So both shapes are accepted. A string that is not JSON, or JSON that is not a
+    list, is REPORTED rather than silently treated as empty: "no ops" and "your
+    ops could not be read" must never look the same to a user.
+    """
+    if isinstance(value, list):
+        return value, None
+    if isinstance(value, str) and value.strip():
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            return [], "the agent's edit list was not readable JSON, so nothing was changed."
+        if isinstance(decoded, list):
+            return decoded, None
+        return [], "the agent's edit list was not a list, so nothing was changed."
+    return [], None
+
+
+# The same concept under a different word. MEASURED, not anticipated: asked to
+# rename a bucket, the real agent sent
+# `{"op": "rename_node", "node": "uploads", "new_label": "archives"}` -- the right
+# operation, with `node` where the schema says `label`. Only variants actually
+# observed go in here; guessing at more would be a treadmill, and the specific
+# error message below is the durable half of the fix.
+_FIELD_ALIASES = {"node": "label", "name": "label"}
+
+
+def _normalise(raw: dict) -> dict:
+    return {_FIELD_ALIASES.get(key, key): value for key, value in raw.items()}
+
+
+def _parse_op(raw: dict) -> tuple[Op | None, str | None]:
+    """(typed op, why not) for one raw op dict. Never raises.
+
+    The two failure modes are DIFFERENT and were reported identically at first:
+    an op odin has no concept of, and an op odin models perfectly whose arguments
+    were wrong. "odin does not model that operation" was flatly untrue for the
+    second, and it hid the one detail that makes the failure actionable -- which
+    field was missing. A single malformed op still costs only itself
+    (`apply_ops`' partial-failure rule).
+    """
+    kinds: dict[str, type[BaseModel]] = {
+        "add_node": AddNode, "set_field": SetField, "rename_node": RenameNode,
+        "delete_node": DeleteNode, "add_edge": AddEdge, "delete_edge": DeleteEdge,
+    }
+    name = str(raw.get("op", ""))
+    model = kinds.get(name)
+    if model is None:
+        return None, (
+            f"odin has no {name or 'unnamed'!r} operation -- it models "
+            f"{', '.join(sorted(kinds))}. Nothing was changed by it."
+        )
+    try:
+        return model.model_validate(_normalise(raw)), None  # type: ignore[return-value]
+    except ValidationError as invalid:
+        missing = ", ".join(
+            str(error["loc"][0]) for error in invalid.errors() if error.get("loc")
+        )
+        return None, (
+            f"the {name!r} operation arrived without {missing or 'the fields it needs'}, "
+            "so odin could not carry it out."
+        )
+
+
+async def propose(
+    canvas: dict, message: str, client_cls: type[Any] | None = None, timeout: float | None = None,
+) -> Proposal:
+    """Ask the agent what to do, then decide what odin will actually do.
+
+    Returns a Proposal and applies NOTHING -- the canvas in it is a preview the
+    caller may choose to save. Every failure mode (AI off, SDK error, timeout,
+    no tool call) lands on the SAME shape: the canvas unchanged, no changes, and
+    a `note` saying why, so a caller never has to distinguish "nothing to do"
+    from "it broke" by inspecting an exception.
+    """
+    off = disabled_reason()
+    if off is not None:
+        return Proposal(canvas=canvas, note=f"agent unavailable: {off}")
+
+    collected: list[dict] = []
+    os.environ.pop("CLAUDECODE", None)  # nested-Claude-Code confusion, as in translate.py
+    server = create_sdk_mcp_server(name="chat", tools=[make_propose_tool(collected)])
+    options = ClaudeAgentOptions(
+        system_prompt=_SYSTEM, model=_MODEL,
+        mcp_servers={"chat": server}, allowed_tools=["mcp__chat__propose_edits"],
+    )
+    try:
+        await asyncio.wait_for(
+            _run_agent(_prompt(canvas, message), options, client_cls or ClaudeSDKClient),
+            timeout=timeout if timeout is not None else default_timeout(),
+        )
+    except Exception:
+        log.exception("chat agent SDK pass failed")
+        return Proposal(canvas=canvas, note="the agent could not be reached — nothing was changed")
+
+    if not collected:
+        return Proposal(canvas=canvas, note="the agent proposed nothing — nothing was changed")
+
+    payload = collected[-1]
+    raw_ops, ops_error = _raw_ops(payload.get("ops"))
+    parsed = [(raw, *_parse_op(raw)) for raw in raw_ops if isinstance(raw, dict)]
+    unparsed = [Refusal(op=raw, reason=why or "odin could not read that operation.")
+                for raw, op, why in parsed if op is None]
+    if ops_error is not None:
+        unparsed.append(Refusal(op={}, reason=ops_error))
+    ops = [op for _raw, op, _why in parsed if op is not None]
+
+    updated, changes, refused = apply_ops(canvas, ops)
+    reply = str(payload.get("reply", ""))
+    # An answer with no changes AND no refusals AND no words is not an answer.
+    # Measured against the real agent: one run called the tool with an empty
+    # reply and no ops, and odin reported literally nothing -- the CLI printed
+    # a blank line and exited 0, which is indistinguishable from success. The
+    # note is what stops silence from reading as "done".
+    note = "" if (changes or refused or reply.strip()) else (
+        "the agent answered with nothing at all — nothing was changed"
+    )
+    return Proposal(
+        reply=reply, changes=changes, refused=[*unparsed, *refused],
+        canvas=updated, note=note,
+    )

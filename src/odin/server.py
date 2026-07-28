@@ -24,6 +24,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from odin.agent import chat
 from odin.agent import import_tf as import_tf_mod
 from odin.agent import translate as translate_mod
 from odin.agent.hcl import TfProject, generate_tf, parse_tf, resource_set, unquote
@@ -1141,6 +1142,10 @@ _TOFU_NOT_INSTALLED = {"error": "tofu not installed", "fix": "brew install opent
 _PLAN_STATUS = {0: "no_changes", 2: "changes"}
 
 
+class ChatRequest(BaseModel):
+    message: str
+
+
 class ImportTfRequest(BaseModel):
     source: Literal["hcl", "live"]
     hcl: str = ""
@@ -1330,6 +1335,31 @@ def create_tf_router(
         # Release finding #1: strip the (non-JSON-serializable) lambda zip bytes
         # -- the code panel needs only the .tf text + notes/unsupported/refined.
         return result.for_display()
+
+    @router.post("/chat")
+    async def chat_route(body: ChatRequest, env: str = ENV) -> dict:
+        """Plain English -> a PROPOSED canvas edit. Applies nothing.
+
+        The proposal's `canvas` is a preview: saving it is a separate call the
+        human makes (`odin chat --apply`, or the panel's Apply button), which is
+        the whole shape of this surface — the owner's rule is that the canvas is
+        the language and chat is an addition to it, so an agent that edited the
+        canvas someone was looking at would be taking the language away.
+
+        Every failure lands on the same body (`note` set, `canvas` unchanged),
+        so a client never distinguishes "nothing to do" from "it broke" by
+        catching an exception.
+        """
+        # Normalised to the canvas SHAPE rather than passed through: an env
+        # nobody has drawn in yet reads back as `{}` (`_saved_canvas`), and
+        # "add a bucket" before drawing anything is the first thing a person
+        # tries. Everything downstream -- the summary, `apply_ops`, and the
+        # `--apply` POST -- is written against {nodes, edges}, so the one place
+        # that knows the file may be absent is the right place to say so.
+        saved = _saved_canvas(canvas_for(env))
+        canvas = {"nodes": saved.get("nodes") or [], "edges": saved.get("edges") or []}
+        proposal = await chat.propose(canvas, body.message)
+        return proposal.model_dump()
 
     @router.post("/import-tf")
     async def import_tf_route(body: ImportTfRequest, env: str = ENV) -> dict:
