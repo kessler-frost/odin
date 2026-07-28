@@ -1178,17 +1178,34 @@ have meant retiring a claim rather than fixing a bug.
   verdict path, not the substrate — but it keeps the guarantee under test
   instead of retiring it.
 
-- [ ] **`test_a_killed_database_gets_its_mesh_endpoint_back_after_one_apply`.**
-  A killed rds container does not come back after one apply — verdict
-  `container odin-rds-... is not running (exit 137) — re-Apply to recreate`.
-  Note the symptom DIFFERS between versions (v0.7.6: "never published a
-  verified overlay address"), so diagnose from the current failure rather than
-  assuming they are the same bug.
-  Adjacent and probably related: `fabric/sidecar.py::ensure()` collapses "the
-  join failed" into "there is no mesh here" — its broad `except` returns
-  `None`, the same value as the no-mesh case. That is honesty rule 2 and is
-  why a hard `AttributeError` once surfaced as a decorative security group.
-  Fix the collapse first; it may be what makes this test's real cause visible.
+- [ ] **`test_a_killed_database_gets_its_mesh_endpoint_back_after_one_apply` —
+  DIAGNOSED, not yet fixed.** Re-run 2026-07-27 against v0.7.8 (399s, real
+  containers). One Apply after the container is killed leaves:
+
+      phase:    crashed
+      verdict:  container odin-rds-<env>-db is not running (exit 137)
+                — re-Apply to recreate
+      restarts: 1
+
+  So this is NOT primarily a mesh bug: the database itself never comes back,
+  and the mesh endpoint is missing only because there is nothing to attach it
+  to. The verdict is the tell — it instructs the user to do the exact thing
+  the command they just ran was supposed to do, which is this repo's own
+  false-status shape (honesty rule 2) rather than a mesh-fabric problem.
+
+  What is already ruled out: `aws/rds.py::ensure` DOES clear an exited remnant
+  before recreating (`self._rt.stop(name)`, rds.py:106), so the recreate would
+  work IF it were called. The next step is therefore `reconcile/plan.py` —
+  establish whether a CRASHED rds (a container that exists but exited 137)
+  produces a recreate Action at all, or whether plan() treats "the container
+  record exists" as "the resource exists" and emits nothing. Read the actual
+  Action list for that state before changing anything; the exit-137 case is
+  distinct from a container that is simply absent.
+
+  Also fixed on the way here, and worth re-checking against this: the sidecar
+  used to collapse "the join failed" into "there is no mesh here" (both
+  `None`). It now records `last_failure`, so if the mesh IS implicated once the
+  database comes back, there is finally a signal to read.
 
 - [x] **A failed canvas READ silently destroyed the saved canvas** (fixed in
   v0.7.7). Reported from a Tailscale-served odin -- "when I press refresh the
