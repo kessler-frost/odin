@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 
@@ -117,7 +118,17 @@ def _import_payload(file: Path | None, live: list[str]) -> dict:
         raise http.fail("import-tf needs a <file.tf> or directory, or at least one --live type=id", 2)
     if not file.exists():
         raise http.fail(f"no such file or directory: {file}", 2)
-    return {"source": "hcl", "hcl": _project_hcl(file) if file.is_dir() else file.read_text()}
+    if not file.is_dir():
+        return {"source": "hcl", "hcl": file.read_text()}
+    # A DIRECTORY carries its zips too: a lambda's body is in one, and this
+    # payload is the only way it can reach the parser (the server does the
+    # parsing, so reading the zip client-side and dropping it here would leave
+    # the recovery working in unit tests and nowhere else).
+    archives = {
+        path.name: base64.b64encode(path.read_bytes()).decode()
+        for path in sorted(file.glob("*.zip"))
+    }
+    return {"source": "hcl", "hcl": _project_hcl(file), "archives": archives}
 
 
 @app.command("import-tf")

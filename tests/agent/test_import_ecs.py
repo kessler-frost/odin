@@ -190,3 +190,19 @@ resource "aws_ecs_service" "api" {
     result = parse_hcl_text(tf)
     (warning,) = [w for w in result.warnings if "task_definition" in w]
     assert "DEFAULT image" in warning, warning
+
+
+def test_a_service_placed_in_an_instance_with_no_env_refs_does_NOT_warn():
+    """Found end to end, through the real CLI, after the unit tests were green.
+
+    `depends_on` has TWO sources in hcl.py -- the node's env refs and
+    `_placement_dependency` (the instance a placed service must not start before)
+    -- and the first draft of the wiring warning could not tell them apart. A
+    service drawn inside an ec2 box with no env refs at all was told to "re-add
+    the env references it consumed", about references it had never had. A warning
+    that fires on a correct import is worse than none: it is exactly how people
+    learn to skip them.
+    """
+    result, _tf = _round_trip(PLACED)
+    assert _node(result, "api")["data"]["host"] == "api-server"
+    assert result.warnings == [], result.warnings

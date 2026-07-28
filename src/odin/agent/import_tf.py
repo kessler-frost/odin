@@ -917,8 +917,18 @@ def _stamp_ecs_taskdef(
         producers = [
             found for value in (attrs.get("depends_on") or [])
             if (found := by_hcl_name.get(str(value).strip().removeprefix("${").removesuffix("}")))
+            and found != host  # see below
         ]
-        warnings += [] if not attrs.get("depends_on") else [
+        # Only warn about producers that are NOT the placement host. `depends_on`
+        # has TWO sources in hcl.py -- the node's env refs AND
+        # `_placement_dependency` (the instance a placed service must not start
+        # before) -- and a service placed inside an ec2 box with no env refs at
+        # all has a `depends_on` naming only that instance. Measured end to end
+        # through the real CLI: such a service was told to "re-add the env
+        # references it consumed" when it had never had any. A warning that fires
+        # on a correct import is worse than no warning, because it is the reason
+        # people stop reading them.
+        warnings += [] if not producers else [
             f"{label} (ecs): its canvas wiring cannot be imported -- a `${{{{producer.ATTR}}}}` env "
             "reference is deliberately never written into the generated Terraform (it would put a "
             "resolved password into tfstate). NEITHER the values NOR the ordering survive: odin "

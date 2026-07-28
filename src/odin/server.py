@@ -9,6 +9,7 @@ WebSocket.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -1144,6 +1145,13 @@ class ImportTfRequest(BaseModel):
     source: Literal["hcl", "live"]
     hcl: str = ""
     resources: list[dict] = []  # [{"type": "s3", "id": "uploads"}, ...] -- see import_tf.LiveResource
+    # v0.8.4: `{filename: base64(zip)}`. A lambda's CODE lives in a zip beside
+    # `main.tf`, never in the HCL, and this route is how `odin import-tf` reaches
+    # the parser -- so without carrying the archives the directory-mode recovery
+    # in `parse_hcl_dir` could not reach the product at all, only its own unit
+    # tests. Base64 because the body is JSON. Optional, so an older client and a
+    # single-file import both keep working exactly as before.
+    archives: dict[str, str] = {}
 
 
 def _saved_canvas(path: Path) -> dict:
@@ -1330,7 +1338,10 @@ def create_tf_router(
         against the env's real backings through the gateway (operator creds,
         same as /tf/apply)."""
         if body.source == "hcl":
-            result = import_tf_mod.parse_hcl_text(body.hcl)
+            archives = {
+                name: base64.b64decode(blob) for name, blob in body.archives.items()
+            }
+            result = import_tf_mod.parse_hcl_text(body.hcl, archives)
         else:
             resources = [import_tf_mod.LiveResource(type=r["type"], id=r["id"]) for r in body.resources]
             access_key, secret_key = _issue_operator(env)
