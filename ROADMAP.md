@@ -1129,6 +1129,36 @@ future decision against these points instead of re-deriving them:
   external/LAN-reachable underlay address plus multi-Mac membership and
   cross-machine placement are still open). Additive, no core change.
 
+## Next — known, measured, not yet fixed
+
+- [x] **An edge with no handles routes backwards, putting its label on the
+  source node.** I first blamed live convergence and was wrong twice -- neither
+  deferring the edge commit by a frame nor preserving node identity across the
+  merge changed anything, and a FULL RELOAD reproduced it identically, which is
+  what finally ruled convergence out. Both speculative fixes were reverted.
+
+  The real cause: an edge that omits `sourceHandle`/`targetHandle` is routed
+  from an arbitrary default handle, so the path curves backwards (a bezier
+  control point LEFT of the source) and the label lands at the source node's
+  centre -- measured x=601 for a node spanning 500..700, where the midpoint is
+  850. The UI's drawn edges always set handles, so only hand- or CLI-authored
+  canvases hit it. Naming `"sourceHandle": "right", "targetHandle": "left"` puts
+  the label at exactly 850.
+
+  Worth doing, not done: odin could CHOOSE sensible handles when a canvas omits
+  them, since a hand-authored or agent-authored canvas is a first-class input
+  (`odin canvas set`, the translation agent) and silently drawing it wrong is
+  the shape of bug this repo keeps auditing for. `scripts/record-gifs.sh` now
+  asserts the label's GEOMETRY rather than its text, because a DOM check for the
+  text passed the whole time this was broken.
+
+- [ ] **agent-browser cannot draw a connection on the canvas.** Unchanged and
+  still open. Handles are 6px and `pointerdown` arrives with a NON-handle target
+  even when the mouse is at the handle's measured centre (`pointerup` does land
+  on it). The IAM clip is therefore CLI-driven, which turned out better -- it
+  demonstrates the edge AND live convergence -- but a mouse-drawn edge remains
+  unrecordable, so the drag-to-connect path has no automated coverage at all.
+
 ## v0.7.9 — the canvas is per-environment
 
 - [x] **The canvas is PER-ENV** (owner decision, 2026-07-27). `/canvas` was the
