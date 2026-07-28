@@ -56,8 +56,20 @@ export default function TopBar({ streamConnected, env, onEnvChange, onApply, onV
   }, []);
 
   // Discover existing environments so the env field can autocomplete them.
+  //
+  // Polled, not just loaded once: an environment can now be REMOVED
+  // (`odin env rm`, POST /envs/rm), and until it was polled the datalist went
+  // on offering an env that no longer existed until the field happened to be
+  // focused. `/envs` is a directory listing -- the cheapest read odin has --
+  // and the removal is deliberately NOT broadcast on the event stream: that
+  // log is per-env and its writer mkdirs its parent, so announcing a removal
+  // would re-create the directory that was just deleted (see server.py).
   const loadEnvs = () => fetch(`${API}/envs`).then(r => r.json()).then(d => setEnvs(d.envs ?? [])).catch(() => {});
-  useEffect(() => { loadEnvs(); }, []);
+  useEffect(() => {
+    loadEnvs();
+    const interval = setInterval(loadEnvs, 5000);
+    return () => clearInterval(interval);
+  }, []);
 
   useEffect(() => {
     if (!menuOpen) return;

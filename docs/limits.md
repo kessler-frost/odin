@@ -88,6 +88,17 @@ They are listed because finding one by surprise is worse than reading it here.
   and that holds on an import round trip even if your `.tf` said otherwise. It
   keeps `tofu apply` and Apply delivering identically, but it changes what a
   consumer reads.
+- **`odin env rm` refuses when another environment's name ends with this one's.**
+  Its last check before deleting anything is "does this machine still have a
+  container of this env's", and it answers that from odin's container *naming*
+  (`odin-aws-rustfs-<env>`, `odin-rds-<env>-…`) rather than a label, so a
+  `-`-suffix collision reads across. Measured: with `a` and `b-a` both live,
+  removing `a` sees `odin-aws-rustfs-b-a` and stops, having deleted nothing —
+  `odin env rm b-a` first, or rename. It errs this way on purpose: refusing a
+  legitimate removal is recoverable, and deleting the last record of a running
+  container is not. Nothing else about the two environments is affected; the
+  matching rule is the same one a failed `odin destroy` uses to report what
+  survived.
 - **An RDS container holds its data on its own writable layer** — no volume — so
   anything that replaces the container returns an **empty** database. That
   includes odin's own repair: if the container is killed or removed out of band,

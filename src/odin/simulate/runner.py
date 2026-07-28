@@ -264,6 +264,22 @@ class TfRunner:
         self._last[env] = result
         return result
 
+    def forget_env(self, env: str) -> bool:
+        """Drop this env's lock and last-run record. Returns whether a run was
+        remembered.
+
+        `/envs/rm`'s half of the symmetry -- `.odin/<env>/tf/` goes with the
+        directory, but `status()` answers out of `_last`, so without this a
+        freshly-recreated env of the same name would report the REMOVED env's
+        last apply as its own. Refuses while that env's lock is held, because
+        dropping a held lock lets a second tofu run start beside the one that
+        holds it; `/envs/rm` checks the same `status()['running']` before it
+        gets here, so this is the second line of the same guard."""
+        if self._lock(env).locked():
+            return False
+        self._locks.pop(env, None)
+        return self._last.pop(env, None) is not None
+
     def _apply_args(self) -> tuple[str, ...]:
         return (*_TOFU_APPLY_ARGS, f"-parallelism={self._parallelism}")
 

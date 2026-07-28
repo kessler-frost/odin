@@ -1468,10 +1468,22 @@ index-to-index deletion on this file.
      non-secret representation of a ref that Terraform can carry.
   4. **sqs/sns tags are dropped on import** (`_CARRIED_ATTRS` lists only `name`
      while `hcl.py` emits tags for every kind). Small and mechanical.
-  5. **Envs are never removable.** `odin destroy --env X` tears the resources
-     down and leaves the env registered with a reconciler ticking forever; seven
-     accumulated during one field-test session. Wants `odin env rm` or a
-     `--forget` flag, plus whatever the UI env list should do with it.
+  5. ~~**Envs are never removable.**~~ CLOSED. `odin env rm <name>` (POST
+     `/envs/rm`) is the decommission verb `odin destroy` deliberately is not: the
+     same teardown, then the env's `.odin/<name>/` directory, its issued gateway
+     credentials, its cached synth records and routing table, its reconciler —
+     stopped, and *verified* stopped off the loop task's own `done()`, because
+     `_task = None` proves only that nothing points at it — and its entry in
+     `odin envs`. The status is derived from an outcome map (`_REMOVE_STATUS`)
+     from the start rather than after four rounds of it, so a branch that
+     reports no outcome fails loudly; every failure leaves the directory intact,
+     so a retry is clean. Measured against a real server: a real
+     `odin-aws-rustfs-envrm-c1` container and a `healthy` world, then removed —
+     container gone, directory gone, delisted, the loop off `/health`, and
+     nothing re-created over the following 8s while a second env kept ticking.
+     Residual in `docs/limits.md`: the container check matches on naming, so an
+     env whose name is a `-`-suffix of another's refuses (measured, and it
+     refuses rather than over-deletes).
   6. **Lambda is inline code only**, one version, no S3-deployed packages.
   7. **Nebula is single-host** — this is M7, and it stays deferred until the
      owner asks, because it cannot be honestly finished on one machine.
