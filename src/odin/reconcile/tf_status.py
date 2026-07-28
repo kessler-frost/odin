@@ -212,14 +212,29 @@ def _iam_roles(stores: SynthStores, env: str) -> Projected:
 
 
 def _ecr_repos(stores: SynthStores, env: str) -> Projected:
+    """A repository, and the address a workload must name to run its image.
+
+    THE THIRD KIND THAT PROJECTS FACTS (`rds` and `alb` are the others, for the
+    same reason): the whole point of an ECR node is that something pulls from
+    it, and `repositoryUri` carries a port odin publishes dynamically, so it
+    cannot be reconstructed by anyone reading the canvas.
+
+    It projected `{}` until v0.8.14, which made the address undiscoverable from
+    the product entirely -- not in `/world`, not in `odin world`, not reachable
+    by a `${{repo.REPOSITORY_URI}}` reference. A user was expected to type an
+    image address the UI never showed them. Nothing here is secret: it is a
+    loopback host:port, unlike `_secrets`/`_ssm_parameters`, which project no
+    facts at all.
+    """
     out: Projected = {}
     for key, record in stores.ecr.items(env).items():
         if not key.startswith("repo:"):
             continue
         tags = stores.tags.get(env, f"ecr:{record['repository_arn']}", {})
         label = _label(tags, record["repository_name"])
+        uri = record.get("repository_uri")
         if label:
-            out[label] = ("ecr", "healthy", {}, None)
+            out[label] = ("ecr", "healthy", {"REPOSITORY_URI": uri} if uri else {}, None)
     return out
 
 

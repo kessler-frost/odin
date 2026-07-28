@@ -25,7 +25,7 @@ from urllib.parse import urlencode
 import pytest
 
 from odin.gateway import synth
-from odin.gateway.models import ec2net, ecr, iamctl, logsctl, secretsctl, ssmctl
+from odin.gateway.models import ec2net, ecr, eventsctl, iamctl, logsctl, secretsctl, ssmctl
 from odin.gateway.stores import SynthStores
 
 ENV = "v77a-rt"
@@ -44,7 +44,7 @@ def touch_everything(stores: SynthStores) -> dict[str, int]:
     names = [
         "tags", "sqs_queues", "sns_topics", "sns_subscriptions", "ec2net", "iamctl",
         "ecr", "ec2compute", "lambdactl", "ecsctl", "logsctl", "secretsctl",
-        "ssmctl", "cachectl", "rdsctl", "elbv2ctl",
+        "ssmctl", "cachectl", "rdsctl", "elbv2ctl", "eventsctl",
     ]
     return {name: len(getattr(stores, name).items(ENV)) for name in names}
 
@@ -151,6 +151,26 @@ async def test_secretsctl_real_records_reload(tmp_path: Path):
     fresh = reload(tmp_path)
     versions = [v for k, v in fresh.secretsctl.items(ENV).items() if k.startswith("version:")]
     assert versions and "AWSCURRENT" in versions[0]["version_stages"]
+
+
+async def test_eventsctl_real_records_reload(tmp_path: Path):
+    """A custom bus, a rule on it, and the target LIST -- the shape that made
+    `events:` splat into characters one store over."""
+    stores = SynthStores(tmp_path)
+    await json_call(eventsctl, "events:CreateEventBus", {"Name": "orders"}, stores)
+    await json_call(eventsctl, "events:PutRule", {
+        "Name": "nightly", "EventBusName": "orders", "ScheduleExpression": "rate(1 day)",
+        "Tags": [{"Key": "odin:node", "Value": "nightly"}],
+    }, stores)
+    await json_call(eventsctl, "events:PutTargets", {
+        "Name": "nightly", "Rule": "nightly", "EventBusName": "orders",
+        "Targets": [{"Id": "t1", "Arn": "arn:aws:lambda:us-east-1:000000000000:function:f"}],
+    }, stores)
+
+    fresh = reload(tmp_path)
+    assert fresh.eventsctl.get(ENV, "rule:orders:nightly")["event_bus_name"] == "orders"
+    assert [t["Id"] for t in fresh.eventsctl.get(ENV, "targets:orders:nightly")] == ["t1"]
+    assert fresh.tags.get(ENV, f"events:{eventsctl.rule_arn('orders', 'nightly')}") == {"odin:node": "nightly"}
 
 
 async def test_ec2net_real_records_reload(tmp_path: Path):

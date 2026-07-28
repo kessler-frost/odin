@@ -36,6 +36,7 @@ import shutil
 import tempfile
 import zipfile
 from collections.abc import Iterable
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -953,23 +954,77 @@ def _container_definition(taskdef: dict) -> dict:
     return parsed[0] if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict) else {}
 
 
-def _lambda_code(archives: dict[str, bytes], filename: str) -> str | None:
-    """The function body out of its deployment zip, or None.
+def _member_text(archive: zipfile.ZipFile, name: str) -> str | None:
+    """One zip member as text, or None when it isn't text at all (a vendored
+    `.so`, a compiled asset) -- the canvas carries a package as TEXT, so that
+    distinction has to survive up to the warning that reports it."""
+    with suppress(UnicodeDecodeError):
+        return archive.read(name).decode()
+    return None
 
-    odin materializes a single-entry zip beside `main.tf` and references it by
-    filename (`hcl.py::_lambda`), so the code is recoverable in DIRECTORY mode and
-    simply absent in text mode. `_stamp_lambda` reports the difference rather than
+
+def _lambda_members(archives: dict[str, bytes], filename: str) -> tuple[dict[str, str], list[str]] | None:
+    """`({member name: text}, [members that are not text])` out of a function's
+    deployment zip, or None when there is no such archive to read.
+
+    odin materializes the zip beside `main.tf` and references it by filename
+    (`hcl.py::_lambda`), so the code is recoverable in DIRECTORY mode and simply
+    absent in text mode. `_stamp_lambda` reports the difference rather than
     letting odin's `_DEFAULT_LAMBDA_CODE` pass for the user's own function.
+
+    EVERY member, not `namelist()[0]`. Until v0.8.14 a package was one file by
+    construction, so reading the first entry was the same thing as reading the
+    function -- once `sourceDir` can package a whole tree it stops being: the
+    first entry in a multi-file archive is whichever name sorted first, which
+    for a function whose handler is in `lambda_function.py` beside a `helpers.py`
+    is `helpers.py`. That would have put a helper module on the canvas as the
+    function's whole body, silently, and re-applied it as the function.
     """
     raw = archives.get(filename)
     if raw is None:
         return None
-    try:
+    with suppress(zipfile.BadZipFile):
         with zipfile.ZipFile(io.BytesIO(raw)) as archive:
-            names = archive.namelist()
-            return archive.read(names[0]).decode() if names else None
-    except (zipfile.BadZipFile, UnicodeDecodeError, KeyError):
-        return None
+            decoded = {
+                name: _member_text(archive, name)
+                for name in sorted(archive.namelist()) if not name.endswith("/")
+            }
+        return (
+            {name: text for name, text in decoded.items() if text is not None},
+            [name for name, text in decoded.items() if text is None],
+        )
+    return None
+
+
+def _carry_lambda_code(node: dict, label: str, filename: str, recovered) -> list[str]:
+    """Put the recovered package on the node, and warn about whatever of it
+    could not come along. Three outcomes, deliberately separate:
+
+    * ONE text member and nothing else -- the v1 shape. It lands in `code`, the
+      field the config panel's textarea edits, exactly as before.
+    * MORE than one -- it lands in `files`, the inline `{path: text}` map
+      `hcl.py::_lambda_package` re-packages verbatim, so the archive this import
+      read and the archive the next Apply writes are byte-identical.
+    * NOTHING readable -- the node keeps odin's default placeholder body, and
+      that is stated rather than left to be discovered.
+    """
+    members, binary = recovered or ({}, [])
+    if len(members) == 1 and not binary:
+        node["data"]["code"] = next(iter(members.values()))
+        return []
+    if members:
+        node["data"]["files"] = members
+        return [] if not binary else [
+            f"{label} (lambda): {len(binary)} file(s) in {filename} are not text and are NOT on the "
+            f"canvas ({', '.join(binary[:4])}) -- a canvas carries a package as text, so a function "
+            "with a compiled dependency needs its `sourceDir` set to the real directory instead"
+        ]
+    return [
+        f"{label} (lambda): its CODE could not be imported -- a function's body lives in "
+        f"{filename or 'a zip'} beside main.tf, not in the HCL. Reading a directory "
+        "(`odin translate import <dir>`) recovers it; from HCL text alone the node comes back "
+        "with odin's DEFAULT placeholder payload, which is NOT your function."
+    ]
 
 
 def _statement_resources(statement: dict) -> list[str]:
@@ -1128,15 +1183,8 @@ def _stamp_lambda(
         ]
 
         filename = hcl.unquote(attrs.get("filename"))
-        code = _lambda_code(archives, filename) if isinstance(filename, str) else None
-        if code is not None:
-            node["data"]["code"] = code
-        warnings += [] if code is not None else [
-            f"{label} (lambda): its CODE could not be imported -- a function's body lives in "
-            f"{filename or 'a zip'} beside main.tf, not in the HCL. Reading a directory "
-            "(`odin translate import <dir>`) recovers it; from HCL text alone the node comes back "
-            "with odin's DEFAULT placeholder payload, which is NOT your function."
-        ]
+        recovered = _lambda_members(archives, filename) if isinstance(filename, str) else None
+        warnings += _carry_lambda_code(node, label, filename, recovered)
     return warnings, drop
 
 

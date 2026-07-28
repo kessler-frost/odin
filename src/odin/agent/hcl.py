@@ -16,6 +16,7 @@ import io
 import json
 import re
 import zipfile
+from pathlib import Path, PurePosixPath
 
 import hcl2
 from pydantic import BaseModel
@@ -23,6 +24,13 @@ from pydantic import BaseModel
 from odin.spec.models import REFERENCEABLE_KINDS, Ref, ResourceDesired, Stack
 
 _REGION = "us-east-1"
+# The account every ARN odin emits is scoped to. Duplicated from
+# `aws/backings.py` rather than imported, the same way `_REGION` and `_SSM_TYPES`
+# are: the deterministic translator does not depend on the gateway. Prose
+# lock-step is what goes stale here, so
+# `tests/agent/test_hcl_iam_arns.py::test_the_arn_constants_match_the_gateways`
+# fails the build if the two ever disagree.
+_ACCOUNT = "000000000000"
 _SANITIZE = re.compile(r"[^a-z0-9_]")
 
 # kind -> human reason it can't be simulated yet. Anything not in the map (and
@@ -248,8 +256,56 @@ def _block(resource_type: str, name: str, attrs: dict[str, str], nested: str = "
     return f'resource "{resource_type}" "{name}" {{\n{body}\n}}'
 
 
+# v0.8.14: the CANVAS WIRING, carried in the file at last -- the tag key prefix
+# under which a node's `${{producer.ATTR}}` references travel.
+#
+# THE POINT IS THAT A REFERENCE IS NOT A SECRET; ONLY ITS RESOLVED VALUE IS.
+# `${{db.DATABASE_URL}}` names a producer and an attribute. The string it
+# resolves to at container launch (`gateway/wiring.py`) carries the database
+# password, which is why it is deliberately never interpolated into the HCL --
+# it would land in `terraform.tfstate` in plaintext and drift on every plan.
+# The reference ITSELF carries no value at all, so writing it down costs
+# nothing and buys back the two things the old silence threw away: an import
+# can rebuild the wiring, and the `depends_on` odin re-derives FROM those
+# refs comes back with it.
+#
+# WHY THE TAG VALUE CANNOT LEAK A RESOLVED SECRET, precisely:
+#   * it is built from `Ref.target_id` and `Ref.target_attr` and nothing else --
+#     two structural fields `spec/translate.py::parse_ref` fills from the regex
+#     groups of the canvas text, never from a value;
+#   * `generate_tf` never calls the resolver. `gateway/wiring.py` runs at
+#     container launch, long after this file is written, so no resolved value
+#     exists here to leak;
+#   * a node's STATIC env entries (`API_TOKEN = "tok-live-..."`, a literal a
+#     user may well have typed a secret into) are NOT emitted at all. Only
+#     refs are. `tests/agent/test_hcl_wiring_tags.py` pins that with a canvas
+#     carrying both, and is the mutation target for this whole mechanism.
+#
+# WHY `odin:ref:` AND NOT `odin:env:`: a `Ref` reaches the Stack from a node's
+# `env` map OR from a top-level `${{...}}` field, and `_resource` merges the two
+# without recording which. "env" would be a claim the Stack cannot back.
+#
+# WHY NOT THE LITERAL `${{...}}` TEXT: measured against OpenTofu 1.12.3 --
+# `value = "${{db.DATABASE_URL}}"` is a PARSE error ("Missing key/value
+# separator"), which fails the whole project, not just that resource. The
+# escaped `"$${{...}}"` does parse, but `$`/`{`/`}` are outside AWS's documented
+# tag-value character set (letters, digits, spaces and `_ . : / = + - @`), so it
+# would fail on the real Amazon this file is meant to be portable to. The
+# unwrapped `producer.attr` form has neither problem and needs no unescaping.
+_REF_TAG = "odin:ref:"
+
+
+def _ref_tags(res: ResourceDesired) -> dict[str, str]:
+    """`{"odin:ref:<VAR>": "<producer>.<attr>"}` for every `${{...}}` this node
+    carries, ordered by VAR so generate -> import -> generate is byte-stable."""
+    return {
+        f"{_REF_TAG}{ref.var}": f"{ref.target_id}.{ref.target_attr}"
+        for ref in sorted(res.refs, key=lambda ref: ref.var)
+    }
+
+
 def _tags_block(res: ResourceDesired) -> str:
-    """`tags = { <user tags...>, "odin:node" = <label> }` -- stamped on every
+    """`tags = { <user tags...>, <ref tags...>, "odin:node" = <label> }` -- stamped on every
     PRIMARY canvas-node-backed resource (never a companion resource -- a key
     pair, an sns->sqs subscription, an inline role policy, a lambda's
     auto-generated execution role, the one shared ecs cluster, or an ecs
@@ -264,7 +320,11 @@ def _tags_block(res: ResourceDesired) -> str:
     keystore identity to inject from this same tag) -- see
     reconcile/tf_status.py and gateway/keys.py::workload_env."""
     user = res.fields.get("tags")
-    tags = {**(user.value if user is not None and isinstance(user.value, dict) else {}), "odin:node": res.id}
+    tags = {
+        **(user.value if user is not None and isinstance(user.value, dict) else {}),
+        **_ref_tags(res),
+        "odin:node": res.id,
+    }
     width = max(len(quote(k)) for k in tags)
     lines = "\n".join(f"    {quote(k).ljust(width)} = {quote(v)}" for k, v in tags.items())
     return f"  tags = {{\n{lines}\n  }}"
@@ -300,14 +360,18 @@ _NOT_IN_VPC = (
 # egress rule, but the TF provider REMOVES it when the config omits an egress
 # block — emitting it explicitly keeps apply -> plan zero-drift against the
 # gateway's pre-seeded default egress (research §2a / MiniStack digest).
-_DEFAULT_EGRESS = (
-    "  egress {\n"
-    "    from_port   = 0\n"
-    "    to_port     = 0\n"
-    '    protocol    = "-1"\n'
-    '    cidr_blocks = ["0.0.0.0/0"]\n'
-    "  }"
-)
+#
+# v0.8.14: this is now the default for an sg node with an EMPTY `egressRules`
+# field, not the only thing odin can emit. A node that authors outbound rules
+# gets those instead, and nothing appends this (`_sg`) — otherwise a restricted
+# egress would sit next to an allow-all one and mean nothing.
+#
+# BUILT BY THE SAME BUILDER an authored rule goes through, so the canvas line
+# `-1:0:0.0.0.0/0` produces BYTES IDENTICAL to this default. That is what lets
+# an import canonicalize a wide-open egress either way — as an empty field or
+# as that one line — and regenerate the same file. Two hand-kept copies would
+# have made "identical" a hope; one builder makes it arithmetic.
+_DEFAULT_EGRESS_RULE = ("-1", "0", "0.0.0.0/0")
 
 
 # CANVAS WIRING ordering (field test 2, the product hole). A workload node's
@@ -489,18 +553,79 @@ def _subnet_ref(res: ResourceDesired, refs: Refs) -> str | None:
     return f"aws_subnet.{name}.id" if kind == "subnet" else None
 
 
-def _ingress_rules(res: ResourceDesired) -> list[tuple[str, str, str]] | None:
-    """Parse the SG node's `ingressRules` field: one rule per line, formatted
-    `protocol:port:source` (e.g. `tcp:443:0.0.0.0/0`). Returns (protocol, port,
-    source) triples, or None when any non-empty line doesn't fit the format."""
-    lines = [line.strip() for line in _field(res, "ingressRules", "").splitlines()]
-    parsed = [tuple(line.split(":")) for line in lines if line]
+# The SG node's TWO rule fields, and the word each one's messages use for the
+# far end of a rule. ONE parser and ONE block builder serve both directions --
+# `ingress {}` and `egress {}` take the identical arguments in the AWS provider,
+# so a second copy would only be a second place to drift.
+_SG_RULE_FIELDS: tuple[tuple[str, str, str], ...] = (
+    ("ingress", "ingressRules", "source"),
+    ("egress", "egressRules", "destination"),
+)
+
+
+def _sg_rules(res: ResourceDesired, field: str) -> list[tuple[str, str, str]] | None:
+    """Parse one of the SG node's rule fields (`ingressRules`/`egressRules`):
+    one rule per line, formatted `protocol:port:peer` (e.g. `tcp:443:0.0.0.0/0`).
+    Returns (protocol, port, peer) triples, or None when any non-empty line
+    doesn't fit the format.
+
+    `split(":", 2)` and NOT a bare `split(":")`: AN IPv6 CIDR CONTAINS COLONS.
+    Found from the import side by the agent building the inverse of this
+    grammar, and it is the worse half of the pair -- a bare split turned
+    `tcp:443:2001:db8::/32` into five fields, failed the arity check, and
+    declined the WHOLE security group, taking every other (perfectly readable)
+    rule on it with it. The peer is the last field by definition, so bounding
+    the split is both the fix and what makes a `":".join(...)` writer a true
+    inverse. The protocol and port cannot contain a colon, so nothing else
+    changes; a line with a fourth field now resolves a peer that no group
+    matches and is declined by `_sg_peer` with the reason for THAT, rather
+    than on arity.
+    """
+    lines = [line.strip() for line in _field(res, field, "").splitlines()]
+    parsed = [tuple(line.split(":", 2)) for line in lines if line]
     ok = all(len(p) == 3 and p[1].isdigit() for p in parsed)
     return parsed if ok else None
 
 
-def _ingress_source(source: str, res: ResourceDesired, refs: Refs) -> str | None:
-    """The `source` third of an ingress rule, as an HCL argument line.
+# IPv6, DECLINED WITH THE REAL REASON rather than made authorable.
+#
+# `fabric/nebula.py::sg_rules_to_firewall` reads `IpRanges` and
+# `UserIdGroupPairs` and nothing else, so an `Ipv6Ranges` entry compiles to ZERO
+# nebula rules. Emitting `ipv6_cidr_blocks` would therefore hand a user a
+# firewall rule that is carried in Terraform, stored by the gateway, visible in
+# `tofu plan` -- and enforced by nothing. That is a decorative permission, the
+# same class of bug `tests/gateway/test_iam_vocabulary_is_enforceable.py` exists
+# to prevent, so the ergonomic hole stays open and the message tells the truth
+# about why. Making it real is a nebula change (teach the compiler IPv6), not a
+# grammar one; `docs/limits.md` records it as such.
+_NO_IPV6 = (
+    "odin's security groups are IPv4 only, because the mesh firewall that enforces them "
+    "(fabric/nebula.py) compiles IPv4 ranges and group identities and nothing else — an IPv6 rule "
+    "would be carried by Terraform and enforced by nothing. Use an IPv4 CIDR, or another Security "
+    "Group node's label to gate by identity"
+)
+
+
+def _is_ipv6_cidr(peer: str) -> bool:
+    """An IPv6 CIDR is the one peer form that is neither an IPv4 CIDR nor a
+    label: it carries BOTH a `/` and a `:`, and no canvas label can (a label
+    with a colon in it would already be unresolvable as a group)."""
+    return "/" in peer and ":" in peer
+
+
+def _sg_peer(peer: str, res: ResourceDesired, refs: Refs) -> tuple[str, str] | None:
+    """The third field of a rule (an ingress SOURCE or an egress DESTINATION),
+    as an (argument name, HCL value) pair.
+
+    The NAME is returned rather than a finished line because it decides the
+    block's `=` alignment: `security_groups` is 15 characters against
+    `cidr_blocks`' 11, and this module promises fmt-canonical output. Measured
+    on the pre-v0.8.14 emitter, which pasted a finished line in and padded every
+    other key to 11 regardless: `tofu fmt -check -diff` (OpenTofu 1.12.3)
+    reported a real diff on any group with an identity-form ingress rule --
+    exit 3, three lines re-padded per block. The docstring's "so `tofu fmt
+    -check` accepts it unmodified" was simply not true for that shape, and no
+    test covered it because every fmt test used a CIDR.
 
     A CIDR (anything with a `/`) stays `cidr_blocks`. ANYTHING ELSE is read as
     another SG NODE's canvas label and becomes `security_groups` -- the
@@ -511,12 +636,51 @@ def _ingress_source(source: str, res: ResourceDesired, refs: Refs) -> str | None
     address -- and overlay addresses are not VPC addresses, so a VPC-CIDR rule
     could never gate mesh traffic anyway). None = unresolvable, which
     `_sg` turns into a human reason."""
-    if "/" in source:
-        return f"    cidr_blocks = [{quote(source)}]"
-    if source == res.id:
+    if "/" in peer:
+        return ("cidr_blocks", f"[{quote(peer)}]")
+    if peer == res.id:
         return None  # a self-reference needs TF's `self = true`; not modeled yet
-    kind, name = refs.get(source, ("", ""))
-    return f"    security_groups = [aws_security_group.{name}.id]" if kind == "sg" else None
+    kind, name = refs.get(peer, ("", ""))
+    return ("security_groups", f"[aws_security_group.{name}.id]") if kind == "sg" else None
+
+
+def _sg_rule_blocks(res: ResourceDesired, refs: Refs, block: str, field: str, word: str) -> list[str] | str:
+    """Every `ingress {}` / `egress {}` block one rule field produces, or -- the
+    `_alb_ports` idiom -- the human reason a line can't be built."""
+    rules = _sg_rules(res, field)
+    if rules is None:
+        return (f'{field}: expected one "protocol:port:{word}" rule per line, '
+                "e.g. tcp:443:0.0.0.0/0")
+    ipv6 = [peer for _protocol, _port, peer in rules if _is_ipv6_cidr(peer)]
+    if ipv6:
+        return f"{field}: {word} {ipv6[0]!r} is an IPv6 CIDR — {_NO_IPV6}"
+    peers = [_sg_peer(peer, res, refs) for _protocol, _port, peer in rules]
+    if None in peers:
+        bad = [r[2] for r, p in zip(rules, peers, strict=True) if p is None]
+        return (
+            f"{field}: {word} {bad[0]!r} is neither a CIDR (like 10.0.0.0/16) "
+            "nor the label of another Security Group node on this canvas"
+        )
+    return [
+        _sg_rule_block(block, protocol, port, *peer)
+        for (protocol, port, _peer), peer in zip(rules, peers, strict=True)
+    ]
+
+
+def _default_egress_block() -> str:
+    """AWS's own allow-all egress, through the authored-rule builder — see
+    `_DEFAULT_EGRESS_RULE`."""
+    protocol, port, destination = _DEFAULT_EGRESS_RULE
+    return _sg_rule_block("egress", protocol, port, "cidr_blocks", f"[{quote(destination)}]")
+
+
+def _sg_rule_block(block: str, protocol: str, port: str, peer_key: str, peer_value: str) -> str:
+    """One `ingress {}` / `egress {}` block, `=` aligned to its own widest key
+    exactly the way `tofu fmt` aligns it (see `_sg_peer`)."""
+    args = {"from_port": port, "to_port": port, "protocol": quote(protocol), peer_key: peer_value}
+    width = max(len(key) for key in args)
+    body = "\n".join(f"    {key.ljust(width)} = {value}" for key, value in args.items())
+    return f"  {block} {{\n{body}\n  }}"
 
 
 def _s3(res: ResourceDesired, refs: Refs) -> Built:
@@ -604,29 +768,21 @@ def _sg(res: ResourceDesired, refs: Refs) -> Built:
     vpc_id = _vpc_ref(res, refs)
     if vpc_id is None:
         return _NOT_IN_VPC
-    rules = _ingress_rules(res)
-    if rules is None:
-        return ('ingressRules: expected one "protocol:port:source" rule per line, '
-                "e.g. tcp:443:0.0.0.0/0")
-    sources = [_ingress_source(source, res, refs) for _protocol, _port, source in rules]
-    if None in sources:
-        bad = [r[2] for r, s in zip(rules, sources, strict=True) if s is None]
-        return (
-            f"ingressRules: source {bad[0]!r} is neither a CIDR (like 10.0.0.0/16) "
-            "nor the label of another Security Group node on this canvas"
-        )
-    ingress = [
-        (
-            "  ingress {\n"
-            f"    from_port   = {port}\n"
-            f"    to_port     = {port}\n"
-            f"    protocol    = {quote(protocol)}\n"
-            f"{source}\n"
-            "  }"
-        )
-        for (protocol, port, _source), source in zip(rules, sources, strict=True)
-    ]
-    return {"name": quote(res.id), "vpc_id": vpc_id}, "\n\n".join([*ingress, _DEFAULT_EGRESS])
+    built = [_sg_rule_blocks(res, refs, block, field, word) for block, field, word in _SG_RULE_FIELDS]
+    declined = [reason for reason in built if isinstance(reason, str)]
+    if declined:
+        return declined[0]
+    ingress, egress = built
+    # v0.8.14: `egressRules` authors real outbound rules. The wide-open default
+    # is emitted ONLY when the field is empty -- which is every canvas drawn
+    # before the field existed, so their generated file is byte-identical to
+    # what it was. The default is not a decoration either way: every
+    # aws_security_group starts with AWS's seeded allow-all egress and the TF
+    # provider REVOKES it when the config omits an egress block, so the empty
+    # field has to keep saying "allow everything out" explicitly.
+    return {"name": quote(res.id), "vpc_id": vpc_id}, "\n\n".join(
+        [*ingress, *(egress or [_default_egress_block()])],
+    )
 
 
 # V3c: EC2 instances (real Lima VMs, gateway/models/ec2compute.py). Matches
@@ -730,27 +886,185 @@ _BAD_ROLE_REF = "role names something that isn't an IAM Role on the canvas"
 # pins every host-dependent field instead: the ZIP epoch (the earliest
 # timestamp the DOS format can express -- what reproducible-build tooling
 # uses), 0644 permissions, and the unix create_system, so nothing about WHEN or
-# WHERE the translate ran leaks into the archive. Member ORDER is stable too:
-# v1 taskdefs/packages are single-entry, and the one entry's name is derived
-# from `_lambda_entry` rather than a directory walk.
+# WHERE the translate ran leaks into the archive.
+#
+# v0.8.14 makes the archive MULTI-MEMBER (a function may be a whole directory),
+# which puts a second host-dependent input in reach: member ORDER. A directory
+# walk's order is the filesystem's, so the members are written in sorted name
+# order here and nowhere else -- `sorted()` is the whole of that guarantee, and
+# `tests/agent/test_lambda_package.py` zips the same tree twice and compares
+# bytes rather than trusting this comment.
 _ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
 _ZIP_FILE_MODE = 0o100644  # regular file, rw-r--r--
 _ZIP_UNIX = 3  # ZipInfo.create_system
 
 
-def _deterministic_zip(entry_filename: str, code: str) -> bytes:
-    info = zipfile.ZipInfo(entry_filename, date_time=_ZIP_EPOCH)
-    info.compress_type = zipfile.ZIP_DEFLATED
-    info.external_attr = _ZIP_FILE_MODE << 16
-    info.create_system = _ZIP_UNIX
+def _deterministic_zip(members: dict[str, bytes]) -> bytes:
+    """`{member name: bytes}` -> a byte-deterministic zip. Same members, same
+    bytes, on any host at any time -- see the note above for why every field
+    is pinned and why the members are sorted."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as archive:
-        archive.writestr(info, code)
+        for name in sorted(members):
+            info = zipfile.ZipInfo(name, date_time=_ZIP_EPOCH)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = _ZIP_FILE_MODE << 16
+            info.create_system = _ZIP_UNIX
+            archive.writestr(info, members[name])
     return buf.getvalue()
 
 
 def _lambda_entry(runtime: str) -> tuple[str, str]:
     return _LAMBDA_RUNTIME_ENTRY.get(runtime, _LAMBDA_RUNTIME_ENTRY[_DEFAULT_LAMBDA_RUNTIME])
+
+
+# --- v0.8.14: a Lambda may be a whole DIRECTORY, not one pasted file --------
+#
+# THREE sources, ONE archive builder, and a precedence that is stated rather
+# than inferred (`_lambda_package` is the only reader of any of them):
+#
+#   1. `sourceDir` -- a path to a directory ON THE MACHINE RUNNING ODIN. Its
+#      whole tree is packaged, so a function can import its own modules. It is
+#      also the DEPENDENCY story, and the only one odin offers: whatever you
+#      have installed INTO that directory ships with it, because odin never
+#      runs a package manager of its own and never fetches anything at apply
+#      time (docs/limits.md says so in those words).
+#   2. `files` -- an inline `{relative path: text}` map. Nothing authors this
+#      by hand; `agent/import_tf.py` writes it when it recovers a MULTI-FILE
+#      deployment zip, so a package that came from Terraform goes back to
+#      Terraform byte-identically instead of collapsing to whichever member
+#      happened to sort first.
+#   3. `code` -- the single pasted file (the v1 shape), written under the
+#      runtime's own entry filename. Unchanged, and still the default.
+#
+# The path is read by the SERVER at translate time, which is the honest place
+# for it: `odin apply` posts the canvas and the server builds the zip, so the
+# package cannot go missing between the two the way it does when a `.tf` file
+# is handed over without the archive beside it (docs/limits.md, "a Lambda's
+# CODE needs the whole directory").
+
+# Names never packaged, and the reason is determinism, not tidiness: CPython
+# writes `__pycache__/*.pyc` into a source directory the moment anything
+# imports from it, and a `.pyc` embeds the source's mtime and size -- so a tree
+# that had merely been imported once produced different archive bytes, a
+# different `source_code_hash`, and the exact `Plan: 1 to change` churn the
+# pinned ZipInfo above exists to prevent. `.venv` is excluded because a
+# virtualenv is host-specific by construction (absolute paths in its scripts,
+# a symlinked interpreter) and is never what belongs in a package; vendored
+# dependencies go directly in the directory (`pip install -t .`), and
+# `node_modules` is deliberately NOT excluded because that is exactly where a
+# Node function's vendored dependencies live.
+_ZIP_SKIP_DIRS = frozenset({
+    "__pycache__", ".git", ".venv", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+})
+_ZIP_SKIP_SUFFIXES = (".pyc", ".pyo")
+_ZIP_SKIP_NAMES = frozenset({".DS_Store"})
+
+# AWS's own quota for an UNZIPPED deployment package (250 MB). Checked from
+# `stat` while walking, before a single byte is read, so pointing `sourceDir`
+# at a home directory by accident is a fast refusal naming the measured size
+# rather than an out-of-memory translate.
+_MAX_PACKAGE_BYTES = 250 * 1024 * 1024
+
+# The file extensions a HANDLER MODULE may have, keyed by the runtime's own
+# entry filename suffix (from `_LAMBDA_RUNTIME_ENTRY`, so this cannot drift
+# away from the runtime table).
+_MODULE_SUFFIXES = {".py": (".py",), ".js": (".js", ".mjs", ".cjs")}
+
+
+def _package_paths(root: Path) -> list[Path]:
+    """Every file in `root`'s tree that a deployment package carries, sorted.
+
+    Symlinks are skipped rather than followed: a link out of the tree would put
+    a file the user never put in their source directory into the archive, and
+    the RIE container mounts the EXTRACTED directory, where a link to a host
+    path resolves to nothing anyway."""
+    return sorted(
+        path for path in root.rglob("*")
+        if path.is_file() and not path.is_symlink()
+        and not (_ZIP_SKIP_DIRS & set(path.relative_to(root).parts))
+        and path.suffix not in _ZIP_SKIP_SUFFIXES and path.name not in _ZIP_SKIP_NAMES
+    )
+
+
+def _dir_members(root: Path) -> dict[str, bytes] | str:
+    if not root.is_dir():
+        return (
+            f"sourceDir {str(root)!r} is not a directory on the machine running odin -- "
+            "the server reads it at translate time, so it must be a real path THERE"
+        )
+    paths = _package_paths(root)
+    if not paths:
+        return f"sourceDir {str(root)!r} holds no files to package"
+    total = sum(path.stat().st_size for path in paths)
+    if total > _MAX_PACKAGE_BYTES:
+        return (
+            f"sourceDir {str(root)!r} is {total / 1048576:.1f} MiB unzipped, over the "
+            f"{_MAX_PACKAGE_BYTES // 1048576} MiB AWS allows an unzipped deployment package"
+        )
+    return {path.relative_to(root).as_posix(): path.read_bytes() for path in paths}
+
+
+def _safe_member(name: object) -> bool:
+    """A `files` key that names a file INSIDE the package and nowhere else.
+    `..` and a leading `/` both escape the extraction directory
+    (`compute/functions.py::extract_code` calls `ZipFile.extractall`), and a
+    backslash is a Windows separator zipfile would keep as part of the name."""
+    parts = PurePosixPath(name).parts if isinstance(name, str) else ()
+    return bool(name) and bool(parts) and ".." not in parts and "\\" not in str(name) and not str(name).startswith("/")
+
+
+def _inline_members(mapping: dict) -> dict[str, bytes] | str:
+    rejected = sorted(
+        str(key) for key, value in mapping.items()
+        if not _safe_member(key) or not isinstance(value, str)
+    )
+    if rejected:
+        return (
+            "files must map a RELATIVE path to that file's text; odin cannot package "
+            f"{', '.join(repr(name) for name in rejected)}"
+        )
+    return {key: value.encode() for key, value in mapping.items()}
+
+
+def _handler_checked(members: dict[str, bytes], handler: str, entry_filename: str) -> dict[str, bytes] | str:
+    """The package, or the reason its own handler cannot possibly load.
+
+    A multi-file package is the first shape where the entry file can simply be
+    ABSENT -- the single-textarea path writes it by construction. Absent, the
+    function still deploys, its RIE container still answers a TCP connect
+    (`compute/functions.py` documents why readiness is a socket probe and not a
+    warm-up invoke), and the failure surfaces only when somebody invokes it and
+    gets `Runtime.ImportModuleError`. Reading the archive's own member list is
+    a real signal available right here, at translate time, so odin declines the
+    node and names the missing file instead of shipping that.
+    """
+    module = handler.rsplit(".", 1)[0]
+    suffixes = _MODULE_SUFFIXES[PurePosixPath(entry_filename).suffix]
+    if any(f"{module}{suffix}" in members for suffix in suffixes):
+        return members
+    listed = ", ".join(sorted(members)[:6])
+    return (
+        f"handler {handler!r} needs {module}{suffixes[0]} in the deployment package, and the "
+        f"{len(members)} file(s) packaged do not include it: {listed}"
+    )
+
+
+def _lambda_package(res: ResourceDesired) -> dict[str, bytes] | str:
+    """This function's zip members, or the human reason odin cannot build them
+    -- routed into `unsupported` exactly like any other builder refusal. See
+    the block comment above for the three sources and their precedence."""
+    runtime = _field(res, "runtime", _DEFAULT_LAMBDA_RUNTIME)
+    entry_filename, default_handler = _lambda_entry(runtime)
+    source_dir = _field(res, "sourceDir", "").strip()
+    declared = res.fields.get("files")
+    inline = declared.value if declared is not None and isinstance(declared.value, dict) else {}
+    if not source_dir and not inline:
+        return {entry_filename: (_field(res, "code", "") or _DEFAULT_LAMBDA_CODE).encode()}
+    members = _dir_members(Path(source_dir).expanduser()) if source_dir else _inline_members(inline)
+    if isinstance(members, str):
+        return members
+    return _handler_checked(members, _field(res, "handler", default_handler), entry_filename)
 
 
 # Workloads an IAM edge may start from (`ui/src/lib/iam.ts::computeTypes`). A
@@ -782,19 +1096,75 @@ def _granted_ids(stack: Stack) -> set[str]:
     return {edge.src for edge in stack.edges if edge.kind == "iam"}
 
 
-def _policy_document(edges) -> str:
-    """The IAM policy JSON for one workload's grants.
+# v0.8.14: the REAL ARN a drawn permission's `Resource` names, per target kind.
+#
+# Until now the `Resource` was odin's node LABEL, because that is what
+# `gateway/classify.py` reports for a request and therefore what the evaluator
+# matched. It enforced correctly inside odin and granted NOTHING on real AWS,
+# which is the same "portable file that isn't" shape `not_in_terraform` exists
+# to name.
+#
+# THE OTHER HALF OF THIS CHANGE LIVES IN `gateway/policy.py`. Emitting ARNs and
+# changing nothing else would have silently broken every permission in the
+# product: the gateway authorizes from the APPLIED IAM (v0.8.12) and asks
+# `evaluate` to match these strings against a bare label. `policy.py::_arn_label`
+# reduces an ARN back to the label the classifier reports, and
+# `tests/agent/test_hcl_iam_arns.py` pins THIS table against THAT reducer for
+# every kind, so a shape added here without a reducer there fails the build
+# rather than silently denying a granted call.
+#
+# Each string is what the gateway's own model builds for that resource
+# (`gateway/models/*ctl.py`), so the ARN in `main.tf` is the ARN the local
+# substrate reports back. Two kinds need TWO forms: an s3 grant is worthless
+# without the object-level `bucket/*` (real IAM scopes GetObject to it and
+# ListBucket to the bucket itself), and a log group's stream-level actions are
+# scoped to `log-group:<name>:*`.
+_ARN_FORMS: dict[str, tuple[str, ...]] = {
+    "s3": ("arn:aws:s3:::{label}", "arn:aws:s3:::{label}/*"),
+    "sqs": ("arn:aws:sqs:{region}:{account}:{label}",),
+    "sns": ("arn:aws:sns:{region}:{account}:{label}",),
+    "dynamodb": ("arn:aws:dynamodb:{region}:{account}:table/{label}",),
+    "lambda": ("arn:aws:lambda:{region}:{account}:function:{label}",),
+    "rds": ("arn:aws:rds:{region}:{account}:db:{label}",),
+    "elasticache": ("arn:aws:elasticache:{region}:{account}:cluster:{label}",),
+    "secret": ("arn:aws:secretsmanager:{region}:{account}:secret:{label}",),
+    "ssm": ("arn:aws:ssm:{region}:{account}:parameter/{stripped}",),
+    "logs": (
+        "arn:aws:logs:{region}:{account}:log-group:{label}",
+        "arn:aws:logs:{region}:{account}:log-group:{label}:*",
+    ),
+    "ecr": ("arn:aws:ecr:{region}:{account}:repository/{label}",),
+    "ecs": ("arn:aws:ecs:{region}:{account}:service/{cluster}/{label}",),
+}
 
-    Resources are odin's own node LABELS rather than ARNs, which is what the
-    gateway's classifier reports and therefore what its evaluator matches
-    (`gateway/classify.py`). A canvas taken to Amazon needs real ARNs, and
-    `not_in_terraform` said so before this existed; that gap narrows to the
-    resource FORMAT now rather than the policy being absent entirely.
+
+def _resource_arns(label: str, kind: str) -> tuple[str, ...]:
+    """The real ARN(s) naming one grant target, or the bare LABEL when odin has
+    no ARN shape for it.
+
+    The fallback is not a formality: an edge can point at a node that is not on
+    this canvas at all, and inventing `arn:aws::::<typo>` for it would be worse
+    than saying what was drawn. `_not_in_terraform` reports every case that
+    takes it, so the file never claims portability it does not have.
     """
+    forms = _ARN_FORMS.get(kind)
+    return tuple(
+        form.format(label=label, region=_REGION, account=_ACCOUNT,
+                    stripped=label.lstrip("/"), cluster=_ECS_CLUSTER_NAME)
+        for form in forms
+    ) if forms else (label,)
+
+
+def _policy_document(edges, kind_by_id: dict[str, str]) -> str:
+    """The IAM policy JSON for one workload's grants."""
     return json.dumps({
         "Version": "2012-10-17",
         "Statement": [
-            {"Effect": "Allow", "Action": list(edge.perms), "Resource": edge.dst}
+            {
+                "Effect": "Allow",
+                "Action": list(edge.perms),
+                "Resource": list(_resource_arns(edge.dst, kind_by_id.get(edge.dst, ""))),
+            }
             for edge in edges if edge.perms
         ],
     })
@@ -854,6 +1224,11 @@ def _lambda(res: ResourceDesired, refs: Refs) -> Built:
 # (unlike `_ec2`'s hard subnet requirement) -- odin has no ENI/awsvpc model
 # to stand behind that block anyway.
 _ECS_CLUSTER_KEY = "__ecs_cluster__"
+# The one shared cluster's AWS NAME. Named rather than repeated as a literal
+# because `_ARN_FORMS` has to build `service/<cluster>/<label>` out of the same
+# value -- an ecs grant's ARN would name a cluster that does not exist if the
+# two ever disagreed.
+_ECS_CLUSTER_NAME = "odin"
 _DEFAULT_ECS_IMAGE = "nginx:alpine"
 _DEFAULT_ECS_COUNT = "1"
 _DEFAULT_ECS_PORT = "80"
@@ -1267,38 +1642,59 @@ _BUILDERS = {
 _ALB_TARGET_KINDS = ("ecs",)
 
 
-def _not_in_terraform(stack: Stack, emitted: set[str]) -> list[str]:
+def _not_in_terraform(stack: Stack, emitted: set[str], kind_by_id: dict[str, str]) -> list[str]:
     """What the generated Terraform carries differently from odin itself.
 
-    Until v0.8.11 a drawn permission reached the file not at all, and this said
-    so in the bluntest terms ("this file grants it nothing"). It is emitted now,
-    as a real `aws_iam_role_policy` on the workload's role, so the remaining
-    difference is narrower and worth stating precisely: the `Resource` in that
-    policy is odin's node LABEL, because that is what `gateway/classify.py`
-    reports and therefore what odin matches against. Amazon expects an ARN.
+    Two entries are gone from this list and it is worth saying which, because a
+    caveat that outlives its fix is a bug in this repo. Until v0.8.11 a drawn
+    permission reached the file not at all ("this file grants it nothing"); until
+    v0.8.14 it reached the file naming odin's node LABEL, which enforced inside
+    odin and granted nothing on Amazon. Both are closed: the policy is a real
+    `aws_iam_role_policy` and its `Resource` is a real ARN (`_ARN_FORMS`).
+
+    What is LEFT is only what is still true. A grant drawn FROM a kind that
+    cannot hold a role emits nothing at all, and since v0.8.12 the gateway
+    authorizes from the applied IAM, so a grant that is not in the file is a
+    grant that does not exist. A grant drawn TO something odin has no ARN shape
+    for — in practice a `dst` that is not a resource on this canvas — keeps the
+    bare label, and says so.
 
     `emitted` is the set of nodes that really got a policy, and it is passed in
     rather than re-derived, for the reason pass 2 gives about its own companion
     blocks: re-deriving a condition instead of reading what actually happened is
-    how the two drift. Only lambda/ec2/ecs can hold a role, so a grant drawn
-    FROM any other kind emits nothing at all — and since v0.8.12 the gateway
-    authorizes from the applied IAM, a grant that is not in the file is a grant
-    that does not exist. Claiming "the policy is emitted" for one of those would
-    be the decorative-grant bug again, one layer further down.
+    how the two drift.
     """
     return [
-        f"{edge.src} -> {edge.dst}: the policy is emitted, but its Resource is the node label "
-        f"{edge.dst!r} — Amazon expects an ARN there"
-        if edge.src in emitted else
-        f"{edge.src} -> {edge.dst}: NO policy is emitted and nothing enforces this — "
-        f"{edge.src!r} is not a kind that can hold an IAM role (only lambda, ec2 and ecs can), "
-        f"so this permission has no effect after an apply"
+        message
         for edge in stack.edges if edge.kind == "iam" and edge.perms
+        for message in [_grant_gap(edge, emitted, kind_by_id.get(edge.dst, ""))] if message
     ]
+
+
+def _grant_gap(edge, emitted: set[str], dst_kind: str) -> str | None:
+    """How this drawn permission differs from what the file carries, or None
+    when the file carries it fully."""
+    if edge.src not in emitted:
+        return (
+            f"{edge.src} -> {edge.dst}: NO policy is emitted and nothing enforces this — "
+            f"{edge.src!r} is not a kind that can hold an IAM role (only lambda, ec2 and ecs can), "
+            f"so this permission has no effect after an apply"
+        )
+    if dst_kind not in _ARN_FORMS:
+        return (
+            f"{edge.src} -> {edge.dst}: the policy is emitted, but its Resource is the node label "
+            f"{edge.dst!r} rather than an ARN — odin has no ARN shape for "
+            f"{f'a {dst_kind} target' if dst_kind else f'{edge.dst!r}, which is not a resource on this canvas'}"
+        )
+    return None
 
 
 def generate_tf(stack: Stack) -> TfProject:
     by_id = {r.id: r for r in stack.resources}
+    # An IAM edge's target kind, which is what decides the ARN its `Resource`
+    # names. Built from the canvas rather than from `refs`, so a `dst` that no
+    # builder ever reached still resolves to a kind and is reported honestly.
+    kind_by_id = {r.id: r.kind for r in stack.resources}
     ordered = sorted(stack.resources, key=lambda r: (r.kind, r.id))
     used_names: dict[str, set[str]] = {}
     hcl_name_by_id: dict[str, str] = {}
@@ -1353,7 +1749,9 @@ def generate_tf(stack: Stack) -> TfProject:
         # name -- every later ecs node's `_ecs` builder (pass 2) just reads
         # it back, same reservation technique as the lambda auto-role above.
         if res.kind == "ecs" and _ECS_CLUSTER_KEY not in refs:
-            cluster_name = unique_name(sanitize_name("odin"), used_names.setdefault("aws_ecs_cluster", set()))
+            cluster_name = unique_name(
+                sanitize_name(_ECS_CLUSTER_NAME), used_names.setdefault("aws_ecs_cluster", set()),
+            )
             refs[_ECS_CLUSTER_KEY] = ("ecs_cluster", cluster_name)
 
     # Pass 1.5 (W2.5) — resolve ALB TARGET EDGES, which pass 1 can't do (it
@@ -1397,6 +1795,29 @@ def generate_tf(stack: Stack) -> TfProject:
                 used_names.setdefault("aws_iam_role_policy", set()),
             ))
 
+    # Pass 1.7 (v0.8.14) — resolve every lambda's DEPLOYMENT PACKAGE once,
+    # before pass 2, because the answer is needed in two places: pass 2 must
+    # DECLINE a function whose package odin cannot build (a `sourceDir` that
+    # isn't a directory, a handler whose module the tree doesn't contain), and
+    # the zip pass at the bottom needs the bytes. Resolving here rather than
+    # inside `_lambda` keeps it to ONE directory walk, and — the part that
+    # actually matters — keeps a declined function from emitting an
+    # `aws_lambda_function` whose `filename` / `filebase64sha256()` name a zip
+    # that was never written. That is not a bad node, it is a `tofu plan` that
+    # fails for the WHOLE project, so every other resource on the canvas stops
+    # applying too (the same failure the `built_ids` note below describes for
+    # the alb companions).
+    lambda_packages: dict[str, dict[str, bytes]] = {}
+    lambda_declined: dict[str, str] = {}
+    for res in ordered:
+        if res.kind != "lambda" or res.id not in hcl_name_by_id:
+            continue
+        package = _lambda_package(res)
+        if isinstance(package, str):
+            lambda_declined[res.id] = package
+            continue
+        lambda_packages[res.id] = package
+
     # Pass 2 — build blocks with the name table complete. A builder may still
     # opt out for THIS resource (returns the reason string) — e.g. a subnet
     # not drawn inside any VPC — which lands in `unsupported`, never dropped.
@@ -1418,7 +1839,7 @@ def generate_tf(stack: Stack) -> TfProject:
     for res in ordered:
         if res.kind not in _BUILDERS:
             continue
-        built = _BUILDERS[res.kind](res, refs)
+        built = lambda_declined.get(res.id) or _BUILDERS[res.kind](res, refs)
         if isinstance(built, str):
             unsupported.append(f"{res.id} ({res.kind}): {built}")
             continue
@@ -1536,7 +1957,7 @@ def generate_tf(stack: Stack) -> TfProject:
         attrs = {
             "name": quote(f"{res.id}-grants"),
             "role": f"aws_iam_role.{role_name}.name",
-            "policy": quote(_policy_document(grants)),
+            "policy": quote(_policy_document(grants, kind_by_id)),
         }
         blocks.append((("iam_role_policy", f"__grants__{res.id}"), _block("aws_iam_role_policy", name, attrs)))
         granted_with_a_policy.add(res.id)
@@ -1608,7 +2029,7 @@ def generate_tf(stack: Stack) -> TfProject:
     # with no ecs nodes at all).
     if _ECS_CLUSTER_KEY in refs:
         _, cluster_name = refs[_ECS_CLUSTER_KEY]
-        block = _block("aws_ecs_cluster", cluster_name, {"name": quote("odin")})
+        block = _block("aws_ecs_cluster", cluster_name, {"name": quote(_ECS_CLUSTER_NAME)})
         blocks.append((("aws_ecs_cluster", "__cluster__"), block))
 
     # V5c: each ecs node's companion `aws_ecs_task_definition` -- named
@@ -1710,25 +2131,28 @@ def generate_tf(stack: Stack) -> TfProject:
     blocks.sort(key=lambda b: b[0])
     main_tf = "\n\n".join([HEADER, provider_block(), *(text for _, text in blocks)]) + "\n"
 
-    # V4c: materialize each lambda's pasted code into the zip its own HCL
-    # block references by filename -- odin owns this pre-tofu, not a
+    # V4c: materialize each lambda's code into the zip its own HCL block
+    # references by filename -- odin owns this pre-tofu, not a
     # `data archive_file` round-trip (module docstring). The entry filename
     # MUST match `_lambda_entry`'s choice for the SAME runtime, or the
     # deployed zip and the `handler` string would disagree. BYTE-DETERMINISTIC
-    # (`_deterministic_zip`): identical code must produce an identical archive,
-    # or `source_code_hash` churns on every translate.
+    # (`_deterministic_zip`): identical members must produce an identical
+    # archive, or `source_code_hash` churns on every translate.
+    #
+    # Gated on `built_ids` (v0.8.14): a function pass 2 declined has no
+    # `aws_lambda_function` block, so a zip written for it would be a file
+    # nothing references -- `simulate/workspace.py::_prune_stale` would delete
+    # it on the next materialize anyway, and writing it in the first place
+    # invites the reader to think the block exists.
     binary_files: dict[str, bytes] = {}
     for res in ordered:
         name = hcl_name_by_id.get(res.id)
-        if res.kind != "lambda" or name is None:
+        if res.kind != "lambda" or name is None or res.id not in built_ids:
             continue
-        runtime = _field(res, "runtime", _DEFAULT_LAMBDA_RUNTIME)
-        entry_filename, _ = _lambda_entry(runtime)
-        code = _field(res, "code", "") or _DEFAULT_LAMBDA_CODE
-        binary_files[f"{name}.zip"] = _deterministic_zip(entry_filename, code)
+        binary_files[f"{name}.zip"] = _deterministic_zip(lambda_packages[res.id])
 
     return TfProject(
         files={"main.tf": main_tf}, unsupported=unsupported,
         wiring_errors=wiring_errors, binary_files=binary_files,
-        not_in_terraform=_not_in_terraform(stack, granted_with_a_policy),
+        not_in_terraform=_not_in_terraform(stack, granted_with_a_policy, kind_by_id),
     )

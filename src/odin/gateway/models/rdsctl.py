@@ -542,8 +542,13 @@ async def _finish_delete(stores: SynthStores, env: str, identifier: str, rds: Po
         # caller polling DescribeDBInstances is told the truth and the next
         # Apply's delete tries again -- never a record claiming the container
         # is gone when it might not be.
-        log.error("rds container delete failed for %s (env %s): %s", identifier, env, exc_text(exc))
-        _update(stores, env, identifier, status_reason=f"container delete failed: {exc_text(exc)}")
+        # "container or volume", not "container": `delete_db` removes BOTH now
+        # (the data volume that makes a repair non-destructive has to go when
+        # the instance itself goes, or it is a disk leak), and either half can
+        # be what failed. Naming only the container would send someone hunting
+        # for a container that is already gone.
+        log.error("rds delete failed for %s (env %s): %s", identifier, env, exc_text(exc))
+        _update(stores, env, identifier, status_reason=f"container or volume delete failed: {exc_text(exc)}")
         return
     stores.rdsctl.delete(env, _key(identifier))
     _set_tags(stores, env, identifier, {})

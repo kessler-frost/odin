@@ -116,11 +116,13 @@ To regenerate this diagram after editing `docs/diagrams/*.mmd`:
   covers the same NODE KINDS in both: canvas → Terraform builds 18, and
   Terraform → canvas reads all 18 back across 24 resource types. Anything odin
   does not model is a LISTED unsupported entry rather than a silent omission.
-  Equal node coverage is **not lossless**, and the sharpest gap is edges:
-  **a drawn IAM permission never reaches the Terraform at all.** It is enforced —
-  by odin's gateway, from the canvas — but `odin translate` says so on stderr
-  rather than letting you discover it, because that file handed to real AWS
-  grants nothing. See Known limits.
+  Equal node coverage is **not lossless**, and what it costs is listed rather
+  than discovered: a security group's port RANGES and IPv6 rules, a Lambda's body
+  when only the HCL text is read, and — until the reader learns them — the
+  `odin:ref:` tags and `egress` blocks the generator now writes. A drawn IAM
+  permission is no longer among them: since v0.8.11 it is a real
+  `aws_iam_role_policy`, and since v0.8.14 its `Resource` is a real ARN, so the
+  generated file grants on Amazon what it grants here. See Known limits.
   **Runtime:** containers via Colima (default) or inside a Lima VM
   (`src/odin/runtime/`), and a Lima VM per EC2 node (`src/odin/compute/`).
 - **Control loop:** a Spec Store (Stack = desired, World = observed) with a pure,

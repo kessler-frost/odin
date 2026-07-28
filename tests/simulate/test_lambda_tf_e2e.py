@@ -39,12 +39,17 @@ import io
 import json
 import os
 import shutil
+import socket
 import subprocess
+import sys
 import time
 import zipfile
+from contextlib import suppress
 from pathlib import Path
 
+import attr
 import boto3
+import httpx
 import pytest
 from botocore.config import Config
 from fastapi.testclient import TestClient
@@ -418,5 +423,335 @@ def test_callback_lambda_reaches_other_services_during_invoke(store_root, lambda
 
     ps_after = _docker(
         "ps", "-a", "--filter", f"name={container_name(CALLBACK_ENV, CALLBACK_FUNCTION_NAME)}", "--format", "{{.Names}}",
+    )
+    assert ps_after.stdout.strip() == "", f"lambda container survived teardown: {ps_after.stdout}"
+
+
+# --- v0.8.14: a function that is a whole DIRECTORY -- its own modules, and a
+# vendored dependency, both really executing inside a real RIE container. ------
+
+PKG_ENV = "lampkg-multifile-e2e"
+PKG_FUNCTION = "lampkg-thumbnailer"
+
+# The tree a user owns. Three things the single-textarea shape could not
+# express: a package the handler imports (`thumbs`), a nested module inside it,
+# and a DEPENDENCY vendored into the source directory the way `pip install -t .`
+# leaves one -- odin's whole dependency story, and the only one it offers (it
+# never fetches anything at apply time; docs/limits.md says so).
+VENDORED = "attr"  # the `attrs` distribution's import package -- see `_write_tree`
+PACKAGE_TREE = {
+    "lambda_function.py": (
+        "import os\n"
+        f"import {VENDORED}\n"
+        "from thumbs.resize import describe\n"
+        "\n"
+        "def lambda_handler(event, context):\n"
+        f"    Point = {VENDORED}.make_class('Point', ['x', 'y'])\n"
+        "    return {\n"
+        "        'described': describe(event['name']),\n"
+        f"        'vendored_ran': {VENDORED}.asdict(Point(1, 2)),\n"
+        f"        'vendored_version': {VENDORED}.__version__,\n"
+        f"        'vendored_from': {VENDORED}.__file__,\n"
+        "        'task_files': sorted(os.listdir('/var/task')),\n"
+        "    }\n"
+    ),
+    "thumbs/__init__.py": "",
+    "thumbs/resize.py": "def describe(name):\n    return name.upper() + '-128x128'\n",
+}
+
+
+def _write_tree(root: Path, files: dict[str, str]) -> Path:
+    """The source directory `sourceDir` points at, INCLUDING a real vendored
+    dependency.
+
+    `attrs` is a genuine third-party pure-Python distribution (a package with
+    submodules, type stubs, `__pycache__` and all), copied in exactly where
+    `pip install -t <dir> attrs` would put it -- copied rather than downloaded,
+    because odin's whole dependency claim is that nothing is fetched at apply
+    time. A handmade stub package would have proved the import machinery and
+    nothing about a real distribution's layout.
+
+    WHY `attrs` AND NOT SOMETHING FROM boto3's OWN DEPENDENCY TREE. The first
+    version of this used `jmespath` and the proof was worthless: deleting the
+    vendored copy from the archive entirely still returned the right answer,
+    because `public.ecr.aws/lambda/python:3.12` bundles boto3 -- and therefore
+    jmespath -- in `/var/runtime`. Measured by mutation, not reasoned about.
+    `attrs` is in no AWS runtime, and the handler additionally reports
+    `__file__` so the assertion can prove the module that ran came out of
+    `/var/task` rather than out of the image.
+
+    `tmp_path` is fine HERE, and that is not a contradiction of this module's
+    LOAD-BEARING DISCOVERY: nothing bind-mounts this tree. The SERVER reads it
+    at translate time and puts its bytes in the zip; what Colima mounts is the
+    extracted `.odin/<env>/gateway/lambda/<fn>-code/` directory, which the
+    `store_root` fixture already keeps under the repo checkout.
+    """
+    for name, text in files.items():
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    site_packages = Path(attr.__file__).parent.parent
+    shutil.copytree(site_packages / VENDORED, root / VENDORED, dirs_exist_ok=True)
+    # ...and its `.dist-info`, because that is what `pip install -t` leaves and
+    # because `attr.__version__` reads it through `importlib.metadata` -- found
+    # by the container raising `PackageNotFoundError` when only the import
+    # package was copied. Vendoring the code without the metadata is a real
+    # mistake a user can make, so the test makes the faithful copy instead.
+    dist_info = next(site_packages.glob(f"{VENDORED}s-*.dist-info"))
+    shutil.copytree(dist_info, root / dist_info.name, dirs_exist_ok=True)
+    return root
+
+
+def _assert_ran_the_package(payload: dict) -> None:
+    """Every claim the multi-file feature makes, read off one real invocation."""
+    assert payload["described"] == "HERO-128x128", payload  # the node's own module ran
+    assert payload["vendored_ran"] == {"x": 1, "y": 2}, payload  # the vendored dep really executed
+    assert payload["vendored_version"] == attr.__version__, payload  # ...and its metadata shipped too
+    # ...and it was the VENDORED copy, not one the base image happened to ship.
+    assert payload["vendored_from"].startswith("/var/task/"), payload
+    assert {"lambda_function.py", "thumbs", VENDORED} <= set(payload["task_files"]), payload
+
+
+def _archive_names(root: Path, env: str) -> list[str]:
+    """Every member name of the deployment zip odin actually shipped, read back
+    off the one the GATEWAY stored -- so what is checked is the archive that
+    reached the substrate, not the generator's own output."""
+    with zipfile.ZipFile(root / env / "gateway" / "lambda" / f"{PKG_FUNCTION}.zip") as archive:
+        return archive.namelist()
+
+
+def _package_canvas(source_dir: Path, function_name: str = PKG_FUNCTION) -> dict:
+    return {
+        "nodes": [{"id": "fn", "type": "lambda", "data": {
+            "label": function_name, "runtime": "python3.12", "sourceDir": str(source_dir),
+        }}],
+        "edges": [],
+    }
+
+
+def test_a_multi_file_source_directory_really_runs_in_the_rie_container(store_root, lambda_cleanup, tmp_path):
+    """The whole v0.8.14 claim, end to end and through the product's own path:
+    canvas -> Stack -> generate_tf (which WALKS the directory) -> a real
+    `tofu apply` -> a real RIE container -> a real Invoke whose answer could
+    only have been produced by code in THREE different files of that tree.
+
+    Plus the determinism claim, measured rather than asserted about: `/tf/plan`
+    re-runs `generate_tf` from scratch, so it re-walks the directory and rebuilds
+    the archive. `no_changes` means the second archive hashed identically to the
+    one in tofu's state -- if member order or a timestamp leaked in, this is
+    `changes` and every Apply would redeploy the function.
+    """
+    assert shutil.which("tofu"), "OpenTofu must be on PATH for this integration test"
+    assert shutil.which("docker"), "docker must be on PATH for this integration test"
+    lambda_cleanup.append(container_name(PKG_ENV, PKG_FUNCTION))
+    source_dir = _write_tree(tmp_path / "thumbnailer", PACKAGE_TREE)
+
+    store = SpecStore(store_root)
+    app = create_app(store=store)
+    with TestClient(app) as client:
+        resp = client.post("/apply-full", json=_package_canvas(source_dir), params={"env": PKG_ENV})
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["tf"] == {"status": "ok", "exit_code": 0}, body["tf"]
+        assert body["status"] == "applied", body
+
+        state = _lambdactl_state(store.root, PKG_ENV)
+        (fn,) = [v for k, v in state.items() if k.startswith("fn:")]
+        assert fn["state"] == "Active", fn
+
+        # THE data-plane proof: every one of the three files ran.
+        gateway_port = client.get("/health").json()["gateway"]["port"]
+        access_key, secret_key = app.state.gateway_keys.issue(PKG_ENV, OPERATOR_NODE_ID)
+        lambda_client = boto3.client(
+            "lambda", endpoint_url=f"http://127.0.0.1:{gateway_port}",
+            aws_access_key_id=access_key, aws_secret_access_key=secret_key, region_name="us-east-1",
+        )
+        response = lambda_client.invoke(
+            FunctionName=PKG_FUNCTION, Payload=json.dumps({"name": "hero"}).encode(),
+        )
+        assert response.get("FunctionError") is None, response
+        payload_out = json.loads(response["Payload"].read())
+        print(f"\n[v0.8.14] multi-file invoke answered: {payload_out}")
+        _assert_ran_the_package(payload_out)
+
+        # The archive the GATEWAY stored, read back: the real vendored
+        # distribution shipped, and no bytecode did.
+        #
+        # The `.pyc` half of that is deliberately NOT the proof of the exclusion
+        # rules, and saying so is the point: `__pycache__` is caught twice over
+        # (once as a skipped directory, once by the `.pyc` suffix), so deleting
+        # EITHER rule leaves this assertion green -- measured, by doing exactly
+        # that against this test. Each rule is killed individually by
+        # `tests/agent/test_lambda_package.py`, using the inputs that
+        # distinguish them. What this line is worth end-to-end is the other
+        # direction: an exclusion that grew too greedy and swallowed a vendored
+        # dependency would fail it.
+        shipped = set(_archive_names(store.root, PKG_ENV))
+        assert {f"{VENDORED}/__init__.py", f"{VENDORED}/_make.py"} <= shipped, sorted(shipped)
+        assert not [name for name in shipped if name.endswith(".pyc")], sorted(shipped)
+
+        # ZERO DRIFT: a second translate of an unchanged directory must produce
+        # a byte-identical archive, or `source_code_hash` churns forever.
+        plan = client.post("/tf/plan", params={"env": PKG_ENV})
+        assert plan.status_code == 200, plan.text
+        assert plan.json()["status"] == "no_changes", plan.json()
+
+        resp = client.post("/apply-full", json=EMPTY_CANVAS, params={"env": PKG_ENV})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["tf"] == {"status": "ok", "exit_code": 0}
+
+    ps_after = _docker(
+        "ps", "-a", "--filter", f"name={container_name(PKG_ENV, PKG_FUNCTION)}", "--format", "{{.Names}}",
+    )
+    assert ps_after.stdout.strip() == "", f"lambda container survived teardown: {ps_after.stdout}"
+
+
+def test_a_source_directory_missing_its_handler_module_fails_the_apply(store_root, lambda_cleanup, tmp_path):
+    """The guard, exercised where it matters. A package with no
+    `lambda_function.py` deploys perfectly happily -- RIE answers a TCP connect
+    whether or not the module exists -- and only fails when somebody invokes it.
+    So the apply must REFUSE, name the missing file, and leave no container."""
+    assert shutil.which("tofu"), "OpenTofu must be on PATH for this integration test"
+    env = f"{PKG_ENV}-nohandler"
+    lambda_cleanup.append(container_name(env, PKG_FUNCTION))
+    source_dir = _write_tree(tmp_path / "broken", {"thumbs/resize.py": "def describe(n):\n    return n\n"})
+
+    app = create_app(store=SpecStore(store_root))
+    with TestClient(app) as client:
+        resp = client.post("/apply-full", json=_package_canvas(source_dir), params={"env": env})
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        (reason,) = [u for u in body["not_covered"] if "handler" in u]
+        assert "needs lambda_function.py" in reason, reason
+        assert _lambdactl_state(SpecStore(store_root).root, env) == {}, "a declined function was deployed anyway"
+
+    ps_after = _docker("ps", "-a", "--filter", f"name={container_name(env, PKG_FUNCTION)}", "--format", "{{.Names}}")
+    assert ps_after.stdout.strip() == "", ps_after.stdout
+
+
+# --- the REAL `odin` CLI, against a REAL server -----------------------------
+#
+# Verify through the product's own path. The last two import defects in this
+# area were invisible to unit tests for one reason: the CLI never sent what the
+# tests sent. `sourceDir` is deliberately shaped so it cannot repeat that -- the
+# CLI posts the canvas and the SERVER builds the archive, so there is no zip to
+# leave behind on the client -- and this test is what makes that a measurement
+# rather than an argument. A real uvicorn process, the real `odin apply` binary
+# in its own process, and a real invoke of what it built.
+
+CLI_ENV = "lampkg-cli-e2e"
+CLI_FUNCTION = "lampkg-cli-thumbnailer"
+
+
+def _free_port() -> int:
+    """A port nothing is on right now. NOT a fixed number: several agents and
+    several xdist workers share this machine, and a fixed port is the one
+    isolation that reliably collides (.claude/CLAUDE.md)."""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+@pytest.fixture
+def live_server():
+    """A REAL uvicorn process serving the REAL app, rooted in its own directory
+    under the repo checkout (`ODIN_DIR` is `.odin` relative to the process's
+    CWD, and Colima only mounts $HOME -- this module's own LOAD-BEARING
+    DISCOVERY). Yields (root, base_url, env vars for the CLI)."""
+    root = Path(__file__).resolve().parents[2] / ".odin-lampkg-cli"
+    shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True)
+    port = _free_port()
+    # ODIN_GATEWAY_PORT=0 -> an ephemeral gateway port. Without it a real server
+    # takes the default one, which is exactly how two agents produced a bogus
+    # 401 and two phantom bugs.
+    env_vars = {**os.environ, "ODIN_GATEWAY_PORT": "0", "ODIN_URL": f"http://127.0.0.1:{port}"}
+    server = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "odin.server:create_app", "--factory",
+         "--host", "127.0.0.1", "--port", str(port), "--timeout-graceful-shutdown", "5"],
+        cwd=root, env=env_vars, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        health = _get(f"http://127.0.0.1:{port}/health")
+        if health is not None:
+            break
+        assert server.poll() is None, f"the server exited before serving:\n{server.communicate()[0]}"
+        time.sleep(0.25)
+    else:
+        server.kill()
+        raise AssertionError(f"uvicorn never served on {port}:\n{server.communicate()[0]}")
+    yield root, f"http://127.0.0.1:{port}", env_vars
+    server.terminate()
+    server.wait(timeout=30)
+    shutil.rmtree(root, ignore_errors=True)
+
+
+def _get(url: str) -> dict | None:
+    with suppress(httpx.HTTPError):
+        response = httpx.get(url, timeout=2.0)
+        return response.json() if response.status_code == 200 else None
+    return None
+
+
+def _odin(root: Path, env_vars: dict[str, str], *args: str, timeout: float = 420) -> subprocess.CompletedProcess:
+    """The REAL CLI, in its own process -- `python -m odin` is the same entry
+    point the `odin` console script calls (`odin.__main__:main`)."""
+    return subprocess.run(
+        [sys.executable, "-m", "odin", *args],
+        cwd=root, env=env_vars, capture_output=True, text=True, timeout=timeout,
+    )
+
+
+def test_the_real_odin_cli_applies_a_multi_file_function(live_server, lambda_cleanup, tmp_path):
+    assert shutil.which("tofu"), "OpenTofu must be on PATH for this integration test"
+    assert shutil.which("docker"), "docker must be on PATH for this integration test"
+    root, base_url, env_vars = live_server
+    lambda_cleanup.append(container_name(CLI_ENV, CLI_FUNCTION))
+    source_dir = _write_tree(tmp_path / "cli-thumbnailer", PACKAGE_TREE)
+    canvas_file = tmp_path / "canvas.json"
+    canvas_file.write_text(json.dumps(_package_canvas(source_dir, CLI_FUNCTION)))
+
+    applied = _odin(root, env_vars, "apply", "--file", str(canvas_file), "--env", CLI_ENV)
+    assert applied.returncode == 0, f"odin apply failed ({applied.returncode}):\n{applied.stdout}\n{applied.stderr}"
+    assert "tf: ok" in applied.stdout, applied.stdout
+
+    # The CLI's own view of the world agrees the function is up...
+    world = _odin(root, env_vars, "world", "--env", CLI_ENV, "-o", "json")
+    assert world.returncode == 0, world.stderr
+    phases = {r["id"]: r["phase"] for r in json.loads(world.stdout)["resources"]}
+    assert phases.get(CLI_FUNCTION) == "healthy", phases
+
+    # ...and the RIE container it built really runs all three files. Credentials
+    # come from the CLI too (`odin keys issue`, the documented escape hatch),
+    # so nothing in this test reaches past the product's own surface except the
+    # AWS SDK call any user would make.
+    gateway_port = _get(f"{base_url}/health")["gateway"]["port"]
+    keys = _odin(root, env_vars, "keys", "issue", OPERATOR_NODE_ID, "--env", CLI_ENV, "-o", "json")
+    assert keys.returncode == 0, keys.stderr
+    creds = json.loads(keys.stdout)
+    lambda_client = boto3.client(
+        "lambda", endpoint_url=f"http://127.0.0.1:{gateway_port}",
+        aws_access_key_id=creds["access_key"], aws_secret_access_key=creds["secret_key"],
+        region_name="us-east-1",
+    )
+    response = lambda_client.invoke(FunctionName=CLI_FUNCTION, Payload=json.dumps({"name": "hero"}).encode())
+    assert response.get("FunctionError") is None, response
+    payload_out = json.loads(response["Payload"].read())
+    print(f"\n[v0.8.14] real-CLI multi-file invoke answered: {payload_out}")
+    _assert_ran_the_package(payload_out)
+
+    # `odin tf plan` is the drift check a CI job runs, and its exit code IS the
+    # determinism claim: 0 no changes, 2 changes present. A churning archive
+    # would make this 2 on every run.
+    plan = _odin(root, env_vars, "tf", "plan", "--env", CLI_ENV)
+    assert plan.returncode == 0, f"odin tf plan reported drift ({plan.returncode}):\n{plan.stdout}\n{plan.stderr}"
+
+    empty = tmp_path / "empty.json"
+    empty.write_text(json.dumps(EMPTY_CANVAS))
+    torn_down = _odin(root, env_vars, "apply", "--file", str(empty), "--env", CLI_ENV)
+    assert torn_down.returncode == 0, f"{torn_down.stdout}\n{torn_down.stderr}"
+    ps_after = _docker(
+        "ps", "-a", "--filter", f"name={container_name(CLI_ENV, CLI_FUNCTION)}", "--format", "{{.Names}}",
     )
     assert ps_after.stdout.strip() == "", f"lambda container survived teardown: {ps_after.stdout}"

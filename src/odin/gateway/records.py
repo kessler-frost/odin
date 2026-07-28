@@ -521,6 +521,55 @@ class Target(Record):
 TARGETS = strict(list[Target])
 
 
+# --- eventbridge -------------------------------------------------------------
+
+
+class EventRule(Record):
+    """`rule:{bus}:{name}` (gateway/models/eventsctl.py).
+
+    `event_bus_name` is the one worth pinning beyond the obvious: it is half of
+    the key every target lookup is built from (`targets:{bus}:{rule}`), so a
+    non-string there sends `ListTargetsByRule` to a key that exists for no rule
+    and the answer is an empty target list behind a 200 -- a rule that reads as
+    having no targets rather than as broken. `state` is what a dispatcher must
+    read to honour a DISABLED rule, and `arn` is what the tag ops resolve a
+    `ResourceARN` against (`_by_arn`), so a wrong type there loses a rule's tags
+    without failing."""
+
+    name: str
+    arn: str
+    event_bus_name: str
+    state: str
+
+
+class EventTarget(Record):
+    """One entry inside `targets:{bus}:{rule}` -- stored VERBATIM as terraform
+    sent it, so the members are the wire's own capitalized names.
+
+    `Id` alone is modelled, and that is deliberate rather than lazy: it is the
+    only member any reader indexes (`_put_targets`' upsert-by-id, `_remove_targets`'
+    filter, `_delete_rule`'s "targets remain" guard all do `t["Id"]`). `Arn` is
+    REQUIRED by botocore and will be load-bearing the moment a dispatcher reads
+    it, but nothing indexes it today, and requiring a field no released writer
+    guarantees is how this module bricks an env instead of protecting one
+    (module docstring, rule 1)."""
+
+    Id: str
+
+
+# `targets:{bus}:{rule}` -- a LIST of targets, the events store's own instance
+# of the shape that made `events:` splat into characters in logsctl.
+EVENT_TARGETS = strict(list[EventTarget])
+
+
+class EventBus(Record):
+    """`bus:{name}`. The DEFAULT bus is never stored (eventsctl's `_bus`
+    synthesizes it), so every record under this prefix is a real custom bus."""
+
+    name: str
+    arn: str
+
+
 # --- elasticache -------------------------------------------------------------
 
 
@@ -631,6 +680,11 @@ SCHEMAS: dict[str, dict[str, TypeAdapter]] = {
         "tg:": strict(TargetGroup),
         "listener:": strict(Listener),
         "targets:": TARGETS,
+    },
+    "eventsctl": {
+        "rule:": strict(EventRule),
+        "targets:": EVENT_TARGETS,
+        "bus:": strict(EventBus),
     },
     "cachectl": {"cluster:": strict(CacheCluster)},
     "secretsctl": {"secret:": strict(Secret), "version:": strict(SecretVersion)},

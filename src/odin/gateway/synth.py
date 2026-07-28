@@ -65,6 +65,7 @@ from odin.gateway.models import (
     ecr,
     ecsctl,
     elbv2ctl,
+    eventsctl,
     iamctl,
     lambdactl,
     logsctl,
@@ -417,7 +418,13 @@ async def pure_answer(
     balancer (`compute/proxy.py`), whose upstreams are the target group's
     actually-registered targets. Like ecs's TaskRuntime it needs no live fact
     threaded through here -- `gateway/models/elbv2ctl.py` defaults its own
-    `LoadBalancerProxy`."""
+    `LoadBalancerProxy`.
+    `events:*` (EventBridge) is all-synth on the JSON-sidecar substrate too,
+    and it is the one family whose CONTROL plane is real while its DATA plane
+    deliberately is not: rules and targets are stored and round-trip for tofu,
+    and `PutEvents` returns an error naming the missing dispatcher rather than
+    an accepted-and-never-delivered `FailedEntryCount: 0` (gateway/models/
+    eventsctl.py)."""
     # EVERY model's `pure_answer` is a coroutine, including the JSON-sidecar
     # ones that await nothing, so every branch here is a plain `await` (v0.7.7).
     # That uniformity is the guard: while some models were coroutines and some
@@ -447,6 +454,8 @@ async def pure_answer(
         return await rdsctl.pure_answer(action, resource, env, body, stores, now, rds=rds)
     if action.startswith("elasticloadbalancing:"):
         return await elbv2ctl.pure_answer(action, resource, env, body, stores, now)
+    if action.startswith("events:"):
+        return await eventsctl.pure_answer(action, resource, env, body, stores, now)
     # `_PURE_HANDLERS` is the one table that stays SYNCHRONOUS: these are the
     # gap-fill handlers for services that DO have a backing container, and
     # every one of them is pure in-memory reshaping of the request body -- no

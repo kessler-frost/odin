@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 
 from odin.agent.hcl import generate_tf
 from odin.agent.translate import TranslateResult
+from odin.aws.rds import volume_name as rds_volume_name
 from odin.runtime.colima import ContainerFacts, HostFacts, RunHandle
 from odin.server import _TOFU_NOT_INSTALLED, create_app
 from odin.simulate.runner import SimulateBusy, TfResult
@@ -25,6 +26,15 @@ from odin.spec.translate import canvas_to_stack
 
 
 class FakeRuntime:
+    def __init__(self):
+        # Real volume bookkeeping, not a stub returning []: the apply's recovery
+        # disclosure asks this runtime whether a database's data volume is still
+        # there before it tells anyone their data survived, so a fake that always
+        # answered "no volumes" would make every rds recovery in this file report
+        # a data loss that never happened -- and a fake that always answered "yes"
+        # would prove nothing at all.
+        self.volumes: set[str] = set()
+
     async def run_container(self, spec):
         return RunHandle(id="x", name=spec.name)
 
@@ -39,6 +49,15 @@ class FakeRuntime:
 
     async def ensure_host(self):
         return HostFacts()
+
+    async def create_volume(self, name):
+        self.volumes.add(name)
+
+    async def remove_volume(self, name):
+        self.volumes.discard(name)
+
+    async def volume_names(self):
+        return sorted(self.volumes)
 
 
 class FakeRds:
@@ -804,7 +823,12 @@ def _seed_failed_function(app, env: str = "default") -> None:
     })
 
 
-def _seed_failed_database(app, env: str = "default") -> None:
+def _seed_failed_database(app, env: str = "default", volume: bool = True) -> None:
+    """A database whose container died. `volume=True` is the real-world case:
+    only the CONTAINER is gone, and the named data volume `create_db` made is
+    still sitting there -- which is what makes odin's repair non-destructive.
+    `volume=False` is the case where someone removed that too (or the instance
+    predates v0.8.14), and the repair really does return an empty database."""
     app.state.gateway_stores.rdsctl.set(env, "db:app-db", {
         "db_instance_identifier": "app-db", "status": "failed",
         "status_reason": "container removed outside odin",
@@ -812,6 +836,7 @@ def _seed_failed_database(app, env: str = "default") -> None:
         "vpc_security_group_ids": [], "overlay_ip": None, "endpoint_address": "127.0.0.1",
         "endpoint_port": 0, "engine": "postgres",
     })
+    app.state.runtime.volumes.update({rds_volume_name(env, "app-db")} if volume else set())
 
 
 def _patch_dead_substrates(monkeypatch) -> None:
@@ -1243,10 +1268,10 @@ def test_a_recovery_is_disclosed_even_when_an_unrelated_service_fails(tmp_path, 
 
     Note this apply's rds recovery also FAILS (`_DeadPostgresRds`), and the
     disclosure still fires -- correctly. `create_db` clears the same-name
-    remnant before booting a replacement, so the old data is gone the moment the
-    re-create starts, whether or not the new container ever comes up. The cost
-    does not depend on the outcome; only the health does, and that is reported
-    separately.
+    remnant before booting a replacement, so the container is gone the moment
+    the re-create starts, whether or not the new one ever comes up. WHAT was
+    re-created does not depend on the outcome; only the health does, and that is
+    reported separately.
     """
     monkeypatch.setattr("odin.server.TaskRuntime", _DeadTaskRuntime)
     monkeypatch.setenv("ODIN_ECS_STEADY_TIMEOUT", "5")
@@ -1262,9 +1287,47 @@ def test_a_recovery_is_disclosed_even_when_an_unrelated_service_fails(tmp_path, 
     assert body["status"] == "applied_services_unhealthy", body
     assert body["recovered_resources"] == [{
         "kind": "rds", "node": "app-db", "reason": "container removed outside odin",
+        # ...and the data volume was still there when the apply looked, so the
+        # re-create is non-destructive. Read from the runtime, not assumed --
+        # `_seed_failed_database` puts the volume where `create_db` would have.
+        "data_kept": True,
     }], body
     # BOTH facts reach the one line `odin apply` prints, and the pre-existing
     # failure keeps its place at the front rather than being overwritten.
     assert "fix and re-apply" in body["note"], body["note"]
     assert "app-db was re-created" in body["note"], body["note"]
+    assert "its data survived" in body["note"], body["note"]
+    assert "data did not survive" not in body["note"], body["note"]
+
+
+def test_a_recovery_whose_volume_is_also_gone_still_reports_the_data_loss(tmp_path, monkeypatch):
+    """The disclosure has to be able to say the BAD thing, or it is a
+    reassurance rather than a report.
+
+    A named volume makes the ordinary repair non-destructive; it does not make
+    the repair non-destructive under every condition. Remove the volume as well
+    as the container -- by hand, or because the instance was created before
+    v0.8.14 ever named one -- and the re-create really does hand back an empty
+    database. odin cannot tell those apart by reasoning, only by LOOKING, which
+    is what `_recovering_resources` does: one `docker volume ls`, read in the
+    instant between the sweep that marks the death and the converge that repairs
+    it.
+
+    Mutation-tested: hard-code `data_kept` either way in `server.py` and this
+    test or its sibling above fails.
+    """
+    _patch_dead_substrates(monkeypatch)
+    monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: None)
+    _patch_translate(monkeypatch, TranslateResult(files={}, refined=False))
+    app = _app(tmp_path)
+    _seed_failed_database(app, volume=False)
+    with TestClient(app) as client:
+        resp = client.post("/apply-full", json={"nodes": [], "edges": []})
+
+    body = resp.json()
+    assert body["recovered_resources"] == [{
+        "kind": "rds", "node": "app-db", "reason": "container removed outside odin",
+        "data_kept": False,
+    }], body
     assert "data did not survive" in body["note"], body["note"]
+    assert "its volume was gone too" in body["note"], body["note"]

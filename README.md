@@ -109,7 +109,8 @@ ALB becomes a load balancer plus a target group plus a listener, and a Lambda
 drawn without a role gets one generated for it.
 
 Environments are independent. `--env staging` and `--env prod` keep separate
-canvases, containers and state.
+canvases, containers and state. `odin envs` lists them, and `odin env rm <name>`
+decommissions one — teardown, then the environment itself.
 
 ## Apply
 
@@ -121,17 +122,31 @@ output names which one and why.
 ```bash
 odin apply --env prod
 odin world --env prod          # one line per resource, with its live facts
-odin destroy --env prod
+odin destroy --env prod        # tear the resources down, keep the environment
+odin env rm prod               # ...and remove the environment itself
 ```
+
+`odin destroy` and `odin env rm` are different verbs. Destroy keeps the
+environment on purpose: its desired state is what makes a retry possible and its
+reconciler is what converges the next apply. `env rm` is the decommission — the
+same teardown, then the `.odin/prod/` directory, the gateway credentials it
+issued, its synthesized control-plane records, its reconciler, and its entry in
+`odin envs`. It is not undoable (`odin export --env prod` first if you might want
+it back), and it exits non-zero, having deleted nothing, if the environment is
+not actually gone.
 
 If a container is killed or removed out of band, the next apply rebuilds it and
 tells you what that cost:
 
 ```
 note: desired state applied; rds app-db was re-created because container
-odin-rds-prod-app-db is not running (exit 137) (its data did not survive —
-the container is new and empty)
+odin-rds-prod-app-db is not running (exit 137) (its data survived — the
+container is new, the volume holding the database is not)
 ```
+
+Each RDS instance keeps its data on a named Docker volume, so a repair replaces
+the container and not the database. Odin checks that volume before it says so,
+and says the opposite when it is gone.
 
 ## Edges are IAM
 
@@ -144,10 +159,11 @@ with sensible defaults, `sg → ec2` is group membership, `ec2 → subnet` is
 containment. Across the whole catalog no pair is ambiguous, so odin never guesses.
 
 A drawn permission is emitted as a real `aws_iam_role_policy` on the workload's
-role, so it survives into the Terraform and back out of it. One caveat if you take
-the HCL to Amazon: the policy's `Resource` is odin's node label, which is what the
-gateway matches on, where AWS expects an ARN. `odin translate` says so per policy
-on stderr.
+role, naming a real ARN — `arn:aws:s3:::uploads` and `arn:aws:s3:::uploads/*` for
+a bucket grant — so the file means the same thing on Amazon as it does here. The
+gateway matches either form: it reports odin's node label for a request and
+reduces the ARN back to it, which is what keeps a permission enforced locally and
+portable at the same time.
 
 ## Driving it from a terminal
 
@@ -318,11 +334,15 @@ The ones most likely to matter:
 - **An emitted IAM policy names resources by label, not ARN.** It round-trips
   through odin perfectly; taken to Amazon each policy needs its `Resource`
   rewritten as an ARN.
-- **An RDS container keeps no volume**, so anything that replaces it comes back
-  empty. Odin's own repair says so in the apply output.
+- **An RDS instance has no snapshots and no backups.** Its data survives a
+  container replacement (a named volume), and `odin destroy` deletes it along
+  with the volume — there is nothing to restore from afterwards.
 - **Import is narrower in `--live` mode**, and a live-imported RDS arrives with
   odin's default password, because no AWS API returns one.
-- **Lambda is inline code only**, one version, with no S3-deployed packages.
+- **Lambda dependencies are vendored only.** A function can be a whole directory
+  (`sourceDir`), so it can import its own modules and carry whatever you have
+  installed into that directory — but odin never runs a package manager and
+  fetches nothing at apply time. One version, no S3-deployed packages.
 - **Nebula is single-host.** The mesh, firewall and per-VM daemons work; a second
   machine joining the same environment is still to come.
 

@@ -102,6 +102,26 @@ class KeyStore:
         self._loaded_envs.discard(env)
         self._persist(env)
 
+    def forget_env(self, env: str) -> list[str]:
+        """Drop this env's credentials from MEMORY without writing anything.
+        Returns the access keys forgotten.
+
+        `revoke_env` is the /destroy verb: it persists an empty `keys.json`,
+        because the env lives on and its file has to say "no keys". This is the
+        `/envs/rm` verb, and the difference is the write -- `keys.json` is about
+        to be deleted along with the rest of `.odin/<env>/`, so re-creating it
+        one line before `rmtree` would be a setup that outlived its teardown.
+        (Measured: `revoke_env` on a never-issued env MINTS the file.)
+
+        `_scanned_root` is deliberately NOT reset. It only gates the
+        opportunistic walk in `_ensure_root_scanned`, and this env's entries are
+        gone from `_by_key` here, so a lookup for one of them correctly misses."""
+        nodes = self._by_env.pop(env, {})
+        for access_key, _secret_key in nodes.values():
+            self._by_key.pop(access_key, None)
+        self._loaded_envs.discard(env)
+        return sorted(access_key for access_key, _secret in nodes.values())
+
     def _path(self, env: str) -> Path:
         return self._root / env / "keys.json"
 

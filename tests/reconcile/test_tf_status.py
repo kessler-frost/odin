@@ -133,6 +133,57 @@ async def test_ecr_healthy_and_falls_back_to_repository_name(tmp_path):
     assert (await project(stores, ENV))["app-image"] == ("ecr", "healthy", {}, None)
 
 
+async def test_ecr_publishes_the_address_a_workload_has_to_name(tmp_path):
+    """v0.8.14. The repository's whole purpose is that something pulls from it,
+    and `repository_uri` carries a port odin publishes DYNAMICALLY -- so nobody
+    reading the canvas can reconstruct it.
+
+    It projected `{}`, which put the address nowhere in the product: not in
+    `/world`, not in `odin world`, not in the UI, and unreachable by a
+    reference. The `image` field on an ecs node is a free-text box, so a user
+    was being asked to type an address odin knew and never showed them.
+    """
+    stores = SynthStores(tmp_path)
+    stores.ecr.set(ENV, "repo:app-image", {
+        "repository_name": "app-image",
+        "repository_arn": "arn:aws:ecr:us-east-1:000000000000:repository/app-image",
+        "repository_uri": "127.0.0.1:53219/app-image",
+    })
+
+    kind, phase, facts, verdict = (await project(stores, ENV))["app-image"]
+
+    assert (kind, phase, verdict) == ("ecr", "healthy", None)
+    assert facts == {"REPOSITORY_URI": "127.0.0.1:53219/app-image"}, (
+        "the pull address must reach World, or it exists only inside the gateway"
+    )
+
+
+async def test_an_ecr_reference_can_actually_resolve(tmp_path):
+    """The fact is only half of it: `${{repo.REPOSITORY_URI}}` also has to be
+    ALLOWED. `REFERENCEABLE_KINDS` is what `hcl.py` checks before deciding a
+    reference can never resolve, and `ecr` was absent -- so the reference was
+    refused statically even once the fact existed. Both halves or neither.
+    """
+    from odin.fabric.localhost import LocalhostFabric
+    from odin.spec.models import REFERENCEABLE_KINDS, Ref, ResourceObserved, World
+
+    assert "ecr" in REFERENCEABLE_KINDS
+
+    stores = SynthStores(tmp_path)
+    stores.ecr.set(ENV, "repo:app-image", {
+        "repository_name": "app-image",
+        "repository_arn": "arn:aws:ecr:us-east-1:000000000000:repository/app-image",
+        "repository_uri": "127.0.0.1:53219/app-image",
+    })
+    kind, phase, facts, _ = (await project(stores, ENV))["app-image"]
+    world = World(resources=(ResourceObserved(
+        id="app-image", kind=kind, phase=phase, facts=facts),))
+
+    resolved = LocalhostFabric().resolve(Ref(var="IMAGE", target_id="app-image", target_attr="REPOSITORY_URI"), world)
+
+    assert resolved == "127.0.0.1:53219/app-image"
+
+
 # --- logs (W2.1): healthy on existence, tag-then-group-name label -- except an
 # `auto` group, which the SUBSTRATE created and the canvas never drew. --------
 

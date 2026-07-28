@@ -108,8 +108,11 @@ future decision against these points instead of re-deriving them:
 
   **v1 limits, recorded rather than hidden** (northstar directive 5's honesty
   rule):
-  - Lambda: inline code only, `$LATEST` only — no S3-deployed packages,
-    versions, or aliases.
+  - Lambda: `$LATEST` only — no S3-deployed packages, versions, or aliases.
+    Code may be a single pasted file OR a whole directory (`sourceDir`, v0.8.14)
+    whose tree is packaged as-is; dependencies are whatever you vendored into
+    that directory, because odin runs no package manager and fetches nothing at
+    apply time (docs/limits.md).
   - ECS: no `network_configuration` (awsvpc/Fargate-style ENIs — odin's tasks
     are `launch_type = "EC2"` / `network_mode = "bridge"`, which need none);
     a task that dies between API calls isn't auto-replaced until the next
@@ -1456,39 +1459,89 @@ index-to-index deletion on this file.
      granted something gets the same auto-role a lambda always had, reached
      through an `aws_iam_instance_profile` for ec2), it round-trips through
      import without loss, and the gateway now authorizes from THAT — see the
-     enforcement-source entry below. What remains is portability, tracked in
-     `docs/limits.md`: the `Resource` is odin's node label rather than an ARN.
-  2. **An RDS container keeps no volume**, so odin's own repair returns an empty
-     database. A named volume per instance would survive a container replacement
-     and make the recovery non-destructive, which changes the disclosure in
-     `server.py::_RECOVERY_COST` from a warning into a footnote.
-  3. ~~**An ECS service's canvas wiring cannot be imported.**~~ CLOSED in
-     v0.8.14. The non-secret representation this asked for is a tag:
-     `"odin:ref:DATABASE_URL" = "db.DATABASE_URL"` names the variable and the
-     producer and carries no resolved value, so it can be written into the HCL
-     without putting a password in `terraform.tfstate`. The import reads it back
-     into the node's `env`, for **ecs and lambda** both. The ordering came back
-     with it at no extra cost: `depends_on` is `sorted(set(...))` over the ref
-     TARGETS, so it is a function of which refs exist, not of their order —
-     verified by generating, importing and generating again and diffing the
-     `depends_on` lines. The literal `${{...}}` text was NOT an option and that
-     was measured, not assumed: OpenTofu rejects it as a parse error, and the
-     escaped form uses characters outside AWS's tag-value set. A project odin did
-     not generate still cannot have its wiring rebuilt, and the import says so.
+     enforcement-source entry below. **Portability closed in v0.8.14**: the
+     `Resource` is a real ARN, and `gateway/policy.py::arn_label` reduces it back
+     to the node label the classifier reports, so the same policy is enforced
+     locally and valid on Amazon. Emitting ARNs without that reducer would have
+     silently denied every permission in the product, which is why the two
+     tables are pinned against each other by `tests/agent/test_hcl_iam_arns.py`.
+  2. ~~**An RDS container keeps no volume**, so odin's own repair returns an
+     empty database.~~ CLOSED in v0.8.14. Each instance now has a named volume
+     (`aws/rds.py::volume_name` → `odin-rds-<env>-<node>-data`) mounted at
+     `PGDATA`, created before its container and removed with `delete_db`, so the
+     repair is non-destructive. Measured through the product's own path in
+     `tests/simulate/test_rds_tf_e2e.py`: rows `[42, 43]` written over the
+     published `DATABASE_URL`, `docker kill`, one Apply → the same `[42, 43]`
+     read back; and `docker volume ls` is empty for the env after teardown.
+
+     Two things worth carrying forward. First, the fix was only half a fix
+     without the lifecycle: `docker rm -f -v` deliberately does NOT remove a
+     named volume (probed, and that is exactly what makes the repair work), so
+     every teardown path and every test fixture had to learn to remove it or a
+     Postgres volume would leak on each run. Second, `_RECOVERY_COST` did become
+     a footnote — but a *measured* one. It is keyed `(kind, data_kept)` and
+     `_recovering_resources` reads the real `docker volume ls` in the one
+     instant between the sweep that marks the death and the converge that
+     repairs it, so an instance whose volume was also destroyed still gets the
+     old warning. A static "your data is safe" would have been a guard reading
+     no signal — honesty rule 1, in the direction that reassures rather than
+     alarms. Mutation-tested both ways.
+  3. ~~**An ECS service's canvas wiring cannot be imported.**~~ The GENERATE
+     half is CLOSED in v0.8.14: a ref travels as an `odin:ref:<VAR>` tag whose
+     value is `<producer>.<attr>` — the non-secret representation this entry
+     asked for. A reference names a producer and an attribute; only the string
+     it RESOLVES to at launch carries the password, and that is built by
+     `gateway/wiring.py` long after the file is written, so it cannot appear.
+     Static env entries are still never emitted, for the same reason (a user may
+     have typed a credential into one).
+
+     The READ half is CLOSED too, in the same release: the importer puts those
+     tags back into a node's `env`, for **ecs and lambda** both. The ordering did
+     come back for free, and the reason is worth keeping — `depends_on` is
+     `sorted(set(...))` over the ref TARGETS, so it is a function of *which* refs
+     exist and not of their order, which means recovering the refs recovers it
+     with no ordering logic in the importer at all. Verified by generating,
+     importing and generating again and diffing the `depends_on` lines, and then
+     through the real `odin import-tf` against a running server. The literal
+     `${{...}}` text was never an option and that was MEASURED rather than
+     assumed: OpenTofu rejects it as a parse error, which fails the whole
+     project, and the escaped form uses characters outside AWS's tag-value set.
+     A project odin did not generate has no such tags and its wiring still cannot
+     be rebuilt; the import says so, and says it only in that case.
   4. ~~**sqs/sns tags are dropped on import.**~~ CLOSED in v0.8.14 — and it was
      **four** kinds, not two: `dynamodb` and `iam_role` had the identical defect
-     and were not in the report. It was also two bugs, since `hcl.py` stamps an
-     `odin:node` tag on every primary: those four kinds *also* printed
-     `imported without unmodeled attribute(s): tags` on every import of odin's
-     own output, about a tag odin itself had just written. Fixed as a shape
-     rather than four instances — `tags` is unioned in centrally instead of
-     listed per kind, the second list that could disagree with the first is
-     deleted, and a test parametrized over `_KIND` covers a kind added later.
-  5. **Envs are never removable.** `odin destroy --env X` tears the resources
-     down and leaves the env registered with a reconciler ticking forever; seven
-     accumulated during one field-test session. Wants `odin env rm` or a
-     `--forget` flag, plus whatever the UI env list should do with it.
-  6. **Lambda is inline code only**, one version, no S3-deployed packages.
+     and were not in the report, which is why the fix went in as a shape rather
+     than as the two instances named. It was also two bugs wearing one coat,
+     since `hcl.py` stamps an `odin:node` tag on every primary: those four kinds
+     *also* printed `imported without unmodeled attribute(s): tags` on every
+     import of odin's own output, about a tag odin itself had just written.
+     `tags` is unioned in centrally now instead of listed per kind, the second
+     list that could disagree with the first (`_TAGGED_KINDS`) is deleted, the
+     whole `odin:` tag namespace is reserved rather than the one key, and a test
+     parametrized over `_KIND` covers a kind added later.
+  5. ~~**Envs are never removable.**~~ CLOSED. `odin env rm <name>` (POST
+     `/envs/rm`) is the decommission verb `odin destroy` deliberately is not: the
+     same teardown, then the env's `.odin/<name>/` directory, its issued gateway
+     credentials, its cached synth records and routing table, its reconciler —
+     stopped, and *verified* stopped off the loop task's own `done()`, because
+     `_task = None` proves only that nothing points at it — and its entry in
+     `odin envs`. The status is derived from an outcome map (`_REMOVE_STATUS`)
+     from the start rather than after four rounds of it, so a branch that
+     reports no outcome fails loudly; every failure leaves the directory intact,
+     so a retry is clean. Measured against a real server: a real
+     `odin-aws-rustfs-envrm-c1` container and a `healthy` world, then removed —
+     container gone, directory gone, delisted, the loop off `/health`, and
+     nothing re-created over the following 8s while a second env kept ticking.
+     Residual in `docs/limits.md`: the container check matches on naming, so an
+     env whose name is a `-`-suffix of another's refuses (measured, and it
+     refuses rather than over-deletes).
+  6. **Lambda has one version and no S3-deployed packages.** Multi-file/
+     directory packaging landed in v0.8.14 (`sourceDir`), so this is now only
+     `$LATEST`-with-no-aliases plus the missing `s3_bucket`/`s3_key` deploy
+     path. The S3 half is the cheapest of what is left — odin has a real S3
+     substitute to test it against — and it wants an `aws_s3_object` upload in
+     the generated project plus `S3Bucket`/`S3Key` in the gateway's
+     CreateFunction, which today refuses them by name.
   7. **Nebula is single-host** — this is M7, and it stays deferred until the
      owner asks, because it cannot be honestly finished on one machine.
 
@@ -1503,13 +1556,15 @@ index-to-index deletion on this file.
   - **sg** — the rules are what the Nebula firewall compiles from, so losing them
     loses the security posture. Both directions of difference are reported: an
     `ingress` block that cannot be one `protocol:port:source` line (a port RANGE)
-    is named with a count because the group then allows LESS, and `egress` could
-    not survive at all — odin re-emitted its own wide-open default and had no
-    outbound field, so a restricted source came back UNRESTRICTED.
-    *(v0.8.14 closed the egress half: there is an `egressRules` field now and the
-    rules round-trip. The loss that remains is narrower and points the other way
-    — a rule odin cannot express empties the field, and an empty field is what
-    selects the wide-open default. See `docs/limits.md`.)*
+    is named with a count because the group then allows LESS, and `egress` cannot
+    survive at all (odin re-emits its own wide-open default and has no outbound
+    field) so a restricted source comes back UNRESTRICTED.
+    **The outbound half of that was closed in v0.8.14**: the sg node has an
+    `egressRules` field in the same line format, real `egress` blocks are
+    emitted from it, and the wide-open default now applies only when the field
+    is empty — which keeps every pre-existing canvas byte-identical. Nebula
+    still compiles INGRESS only (`outbound: any`), so an egress rule is portable
+    configuration rather than a control; `docs/limits.md` says so.
   - **ec2** — three references that each decide something different: containment
     (unappliable without it), security groups (less protected), and the companion
     key pair (unreachable). One warning each, not one vague line.
@@ -1543,17 +1598,67 @@ index-to-index deletion on this file.
   rather than pick. `detectEdgeTypes` already returns an ARRAY, so the model
   anticipates this; `edgeDataForConnection` takes `[0]` and says nothing.
 
-  Measured before building anything: across the whole catalog, **729 ordered
-  pairs, ZERO ambiguous** -- only two edge types exist (`iam`, `network`) and no
-  pair maps to both. A selector today would never open, so it is not built.
-  `iam.test.ts` carries the trigger instead: the moment a pair becomes genuinely
-  ambiguous the test FAILS, naming the pair, which is when the selector becomes
-  real work rather than speculation. Mutation-tested by making one pair
-  ambiguous.
+  Re-measured 2026-07-28 after the edge registry grew from two types to six
+  (`iam`, `sg`, `role`, `target`, `subscription`, `unmodelled`): **729 ordered
+  pairs, ZERO ambiguous**, so a selector still would never open and is still not
+  built. The `<select>` in `ConfigPanel.tsx` has therefore never once rendered.
+
+  The trigger is `ui/src/lib/edge-ambiguity.test.ts`, NOT `iam.test.ts` as this
+  entry claimed for a month while no such test existed anywhere -- the guard was
+  described, reviewed, believed and never written, which is honesty rule 1 living
+  in the roadmap itself. It iterates every ordered pair over the real kind list
+  and fails naming any pair that means more than one thing. Mutation-tested by
+  giving `iam_role` an `iamActions` list, which makes `iam_role ↔ lambda` mean
+  both `iam` and `role`: the test fails and prints both orderings by name.
+  The registration helper appends rather than assigns for exactly this reason --
+  an `=` would let a second meaning silently replace the first, and the pair
+  would keep looking unambiguous.
 
   When it is built: store the chosen type ON the edge (`data.edgeType` already
   is the store) rather than re-inferring, so a user's choice survives a node
   being moved or retyped.
+
+- [x] **Every drawn edge now has a consumer, or says it has none (2026-07-28).**
+  Four defects, all the same shape -- odin showing the user one thing and doing
+  another.
+  **(1) The `iam_role → workload` edge was INERT.** `iam_role` declares no
+  `iamActions` (correctly -- a role is not an IAM data-plane target), so the pair
+  was never registered, fell through to the catch-all, and was read by NOTHING:
+  drawing `admin-role → my-lambda` while the lambda's `role` field said
+  `other-role` gave a dead line, `other-role` in the generated file, and
+  `other-role` enforced by the gateway. There is a `role` edge type now, folded
+  into the `role` FIELD `agent/hcl.py::_lambda` already reads, so it took effect
+  with no builder change at all. Lambda only -- ec2/ecs reach a role through an
+  auto-role plus an instance profile / `task_role_arn` and read no such field, so
+  those pairs stay `unmodelled` rather than authoring a field nothing consumes
+  (docs/limits.md names what honouring them needs).
+  **(2) compute→compute IAM edges granted nothing.** `edgeDataForConnection`
+  picked "whichever end is not compute" as the resource, which has no answer when
+  both are -- and `ecs → lambda` (invoke) and `ec2 → ecs` (RunTask) are both
+  explicitly in the catalog. The user got a cyan edge with nothing ticked and an
+  `aws_iam_role` with no policy on it. The rule is now "which end is an IAM
+  target", which also gets `ecs → ec2` right where a plain target-end tie-break
+  would not.
+  **(3) `edge.kind` was unvalidated where it is authored.** `odin chat` took a
+  free string, so an invented kind round-tripped through a revision looking real.
+  Validated against `spec/translate.py::EDGE_KINDS` now. This is the SMALLER
+  half and must not be read as more: `hcl.py`'s subscription and ALB passes match
+  on NODE kinds and never read `edge.kind`, so a valid `iam` edge between sns and
+  sqs still builds a real subscription.
+  **(4) `network` meant "no model" 340 times out of 341.** Renamed to
+  `unmodelled` ("Not modelled"), with `target` (`alb↔ecs`) and `subscription`
+  (`sns↔sqs`) lifted out as their own named types. Both are **presentational** by
+  design and no builder may gate on them: every saved canvas types those edges
+  `network`, so requiring the new name without a migration in the same commit
+  would drop the subscription from the generated HCL and `tofu` would DESTROY the
+  live subscription on the next apply -- silently, because `_desired_subs` only
+  ever ADDS. `network` stays a valid stored kind and a defined type.
+  **Plus a fifth, found while measuring:** an sns/sqs edge drawn BACKWARDS was a
+  silent no-op -- both consumers key on the drawn direction, so `sqs → sns` gave
+  a green Apply, no subscription, and no `unsupported`/`wiring_errors` entry, with
+  no test in either direction. `spec/translate.py` now orients the edge
+  topic→queue, which fixes `hcl.py` and `reconciler.py::_desired_subs` at once
+  without either file changing. Every guard mutation-tested.
 
 - [x] **Containment is strict (owner decision, 2026-07-28).** A leaf counted as
   inside a container once its CENTRE crossed the boundary, so a box visibly

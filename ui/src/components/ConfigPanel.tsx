@@ -1,8 +1,12 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import type { Node, Edge } from '@xyflow/react';
 import StatusBadge, { phaseTextColor } from './nodes/StatusBadge';
-import { iamActionsForTarget, edgeTypes, detectEdgeTypes } from '../lib/iam';
+import { iamActionsForTarget, edgeTypes, detectEdgeTypes, UNMODELLED } from '../lib/iam';
 import { catalogTypeConfig, catalogFields } from '../lib/catalog';
+
+// The pre-rename catch-all. Kept as a named constant rather than a bare string
+// so the one place that has to know about the old canvases says why.
+const LEGACY_CATCH_ALL = 'network';
 
 interface ConfigPanelProps {
   nodes: Node[];
@@ -54,6 +58,15 @@ const fieldsForType: Record<string, FieldDef[]> = {
       key: 'ingressRules', label: 'Ingress Rules (protocol:port:cidr-or-SG-name, one per line)',
       editable: true, multiline: true, placeholder: 'tcp:443:0.0.0.0/0\ntcp:5432:web-sg',
     },
+    {
+      // Outbound. EMPTY MEANS WIDE OPEN -- odin emits AWS's own allow-all
+      // egress when nothing is authored here, which is what every group did
+      // before this field existed and what real AWS seeds a new group with.
+      // The placeholder shows that default spelled out, so the first thing a
+      // reader learns is what they are replacing (agent/hcl.py::_sg).
+      key: 'egressRules', label: 'Egress Rules (protocol:port:cidr-or-SG-name, one per line — empty = allow all)',
+      editable: true, multiline: true, placeholder: '-1:0:0.0.0.0/0\ntcp:443:10.0.0.0/16',
+    },
     { key: 'vpc', label: 'VPC (containment)' },
     { key: 'subnet', label: 'Subnet (containment)' },
     { key: 'groupId', label: 'Group ID' },
@@ -80,6 +93,16 @@ const fieldsForType: Record<string, FieldDef[]> = {
     {
       key: 'code', label: 'Code', editable: true, multiline: true,
       placeholder: 'def lambda_handler(event, context):\n    return event',
+    },
+    // A function that is more than one file. The path is read BY THE SERVER at
+    // translate time (it builds the zip; the browser never touches the tree),
+    // so it must be a real directory on the machine running odin. Set, it wins
+    // over Code entirely -- agent/hcl.py::_lambda_package documents the whole
+    // precedence, and it is also the only place dependencies can come from:
+    // whatever you install INTO that directory ships with it.
+    {
+      key: 'sourceDir', label: 'Source Directory (optional — packages the whole tree, overrides Code)',
+      editable: true, placeholder: '/Users/you/functions/thumbnailer',
     },
     { key: 'role', label: 'IAM Role (optional -- blank auto-generates one)', editable: true, placeholder: 'an IAM Role node\'s name' },
     { key: 'status', label: 'Status' },
@@ -190,9 +213,6 @@ function PermissionCheckbox({ action, checked, onChange }: { action: string; che
 
 function EdgeConfigView({ edge, nodes, onEdgeUpdate, onCollapse }: { edge: Edge; nodes: Node[]; onEdgeUpdate?: (edgeId: string, data: Record<string, unknown>) => void; onCollapse?: () => void }) {
   const panelBase = "bg-bg-secondary border-l border-border-bright p-0 overflow-y-auto h-full";
-  const currentType = (edge.data?.edgeType as string) ?? 'network';
-  const typeDef = edgeTypes[currentType] ?? edgeTypes.network;
-  const isIam = currentType === 'iam';
 
   // The REAL node types, looked up by id. This used to be
   // `edge.source.split('-')[0]`, which only works while every node id happens to
@@ -209,6 +229,23 @@ function EdgeConfigView({ edge, nodes, onEdgeUpdate, onCollapse }: { edge: Edge;
   // Available edge types for this node pair
   const availableTypes = detectEdgeTypes(sourceType, targetType);
   const iamAvailable = availableTypes.includes('iam');
+
+  // What this edge IS. A canvas saved before an edge type was named carries the
+  // old catch-all `network`, and `network` decides nothing: `agent/hcl.py`'s ALB
+  // and subscription passes key on the two NODE kinds and never read the edge's
+  // kind at all. So an alb->ecs edge stored as `network` really does compile to
+  // a `load_balancer` block, and labelling that panel "Network" would name the
+  // edge by the one word in it that has no consequence.
+  //
+  // Every OTHER stored kind is shown exactly as authored. An `iam` edge compiles
+  // to a real policy whichever pair it sits on (`gateway/policy.py` reads the
+  // kind, not the kinds of its endpoints), so overriding that one to match the
+  // registry would HIDE a live grant -- a worse lie than a stale word.
+  const storedType = edge.data?.edgeType as string | undefined;
+  const currentType = !storedType || storedType === LEGACY_CATCH_ALL
+    ? availableTypes[0] : storedType;
+  const typeDef = edgeTypes[currentType] ?? edgeTypes[UNMODELLED];
+  const isIam = currentType === 'iam';
 
   // Build per-resource permission groups (only for types that have IAM actions)
   const permissionGroups: { resourceType: string; label: string; neonColor: string; actions: string[] }[] = [];
