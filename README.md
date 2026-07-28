@@ -480,21 +480,29 @@ Copying it elsewhere will not preserve that, so treat it like a private key.
 
 Two features ask a model anything, and neither of them is the translation.
 
-**`odin chat` — plain English to a canvas edit you review first.** The canvas is
-odin's language; this is an addition to it, not a replacement, so it never edits
-anything by itself:
+**`odin chat` — plain English, and the canvas changes.** The canvas is odin's
+language; this is an addition to it, not a replacement:
 
 ```
 $ odin chat "give the thumbnailer lambda read access to the uploads bucket"
 Granted thumbnailer read access to the uploads bucket.
   - draw a iam edge from 'thumbnailer' to 'uploads' granting s3:GetObject, s3:ListBucket
-
-nothing was changed — re-run with --apply to save this
+canvas saved (4d18a5091659) — Cmd-Z in the UI undoes it
 ```
 
-- **Two calls, never one.** The default prints what *would* change and writes
-  nothing; `--apply` saves it through the same `POST /canvas` the UI's own save
-  uses. There is no privileged path for an agent-authored canvas.
+- **The canvas is the review surface.** The edit appears in your open tab over
+  the event stream, lands on the browser's own undo stack, and **Cmd-Z reverses
+  it** — measured, not assumed. Confirming a diff in a terminal, while the thing
+  it describes is on screen behind it, is the worse review. `--dry-run` still
+  shows the plan without touching anything.
+- **It never applies.** Editing the drawing is reversible; building from it
+  creates real containers and, for rds, can destroy real data. That button stays
+  yours. The save goes through the same `POST /canvas` the UI uses, so there is
+  no privileged path for an agent-authored canvas.
+- **It remembers the conversation** — "actually make it read-write" works — per
+  environment, in the server's memory. A restart clears it, as does
+  `odin chat --clear` or *Clear Agent Session* in the `···` menu. Clearing never
+  touches your canvas.
 - **It proposes operations, not a rewritten canvas**, so every change is one
   reviewable sentence and anything you did not ask for is impossible by
   construction — there is no operation that says "and also touch this".
@@ -569,7 +577,7 @@ prose explanation of a failure, and the evidence it reads is still there in
 ## How it's built
 
 - **UI:** React 19 + ReactFlow + Tailwind v4, served by Vite (`ui/`, `bun`).
-  **Backend:** Python 3.12+ (`uv`), FastAPI + WebSocket, Pydantic.
+  **Backend:** Python 3.12+ (`uv`), FastAPI + Server-Sent Events, Pydantic.
 - **The gateway** (`src/odin/gateway/`) verifies SigV4, classifies each call into
   (service, action, resource), evaluates it against the edges you drew, then
   forwards to a real backing or answers from its own per-service model store. EC2,

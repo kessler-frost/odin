@@ -93,7 +93,7 @@ def _assert_string_facts(rid: str, facts: dict) -> None:
     43%-of-all-events flap v0.7.1 already killed once, and it would arrive
     with a credential in tow -- `DATABASE_URL` embeds the RDS password
     (SECURITY.md), so each spurious delta writes another cleartext copy into
-    `world.json`, `events.jsonl` and the WebSocket broadcast.
+    `world.json`, `events.jsonl` and the event-stream broadcast.
 
     `str` is the one JSON type with no such gap, and every fact odin publishes
     today is one -- `cachectl.facts` spells `str(port)` out precisely for this.
@@ -827,7 +827,7 @@ class Reconciler:
                 # projected every tick, and in no canvas -- so plan() called it
                 # "observed but not desired" and pruned it, the projection
                 # re-added it, and the pair flapped `draft`/`healthy` forever:
-                # ~1.8 events/second into the WebSocket and the append-only
+                # ~1.8 events/second into the event stream and the append-only
                 # events.jsonl, burying real crash events. `action.name` is a
                 # label rather than a container name anyway, so there was never
                 # anything for `self._rt.stop` to do here either.

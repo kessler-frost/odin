@@ -38,7 +38,7 @@ const spinnerWords = [
   'Boogieing', 'Discombobulating',
 ];
 
-function parseWebSocketMessage(msg: Record<string, unknown>): LogLine[] {
+function parseStreamMessage(msg: Record<string, unknown>): LogLine[] {
   const time = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
   const type = msg.type as string | undefined;
 
@@ -86,55 +86,47 @@ function parseWebSocketMessage(msg: Record<string, unknown>): LogLine[] {
   return [];
 }
 
-type WsStatus = 'connected' | 'reconnecting' | 'disconnected';
+type StreamStatus = 'connected' | 'reconnecting' | 'disconnected';
 
-function useWebSocket(onMessage: (msg: Record<string, unknown>) => void) {
-  const [status, setStatus] = useState<WsStatus>('disconnected');
-  const delayRef = useRef(1000);
-  const wsRef = useRef<WebSocket | null>(null);
+function useEventStream(onMessage: (msg: Record<string, unknown>) => void) {
+  const [status, setStatus] = useState<StreamStatus>('disconnected');
+  const sourceRef = useRef<EventSource | null>(null);
   const mountedRef = useRef(true);
   const onMessageRef = useRef(onMessage);
   onMessageRef.current = onMessage;
 
-  const connect = useCallback(() => {
-    if (!mountedRef.current) return;
-    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const ws = new WebSocket(`${protocol}//${location.host}/ws`);
-    wsRef.current = ws;
-
-    ws.onopen = () => {
-      if (!mountedRef.current) return;
-      setStatus('connected');
-      delayRef.current = 1000;
-    };
-
-    ws.onmessage = (event) => {
-      const msg = JSON.parse(event.data);
-      onMessageRef.current(msg);
-    };
-
-    ws.onclose = () => {
-      if (!mountedRef.current) return;
-      setStatus('reconnecting');
-      const delay = delayRef.current;
-      delayRef.current = Math.min(delay * 2, 30000);
-      setTimeout(connect, delay);
-    };
-  }, []);
-
+  // v0.8.7: SSE, not a WebSocket. odin's stream was always one-way -- this file
+  // never called `.send()` and the server discarded everything it received --
+  // so the duplex half bought nothing and cost exactly what is deleted below:
+  // a hand-rolled reconnect with its own backoff. `EventSource` retries on its
+  // own, and `/events` (fetched on env change) backfills whatever a gap missed.
   useEffect(() => {
     mountedRef.current = true;
-    connect();
+    const source = new EventSource('/stream');
+    sourceRef.current = source;
+
+    source.onopen = () => { if (mountedRef.current) setStatus('connected'); };
+    source.onmessage = (event) => {
+      // A heartbeat is an SSE COMMENT (`: ping`), which EventSource never
+      // surfaces as a message -- so anything arriving here is a real event and
+      // parsing it unconditionally is safe.
+      onMessageRef.current(JSON.parse(event.data));
+    };
+    // EventSource reconnects itself; this only reflects that in the LED. It
+    // fires on every retry, so it must not schedule anything of its own -- two
+    // reconnect loops racing is the bug this migration removes.
+    source.onerror = () => { if (mountedRef.current) setStatus('reconnecting'); };
+
     return () => {
       mountedRef.current = false;
-      wsRef.current?.close();
+      source.close();
     };
-  }, [connect]);
+  }, []);
 
   return status;
 }
 
-const statusConfig: Record<WsStatus, { color: string; label: string; pulse: boolean }> = {
+const statusConfig: Record<StreamStatus, { color: string; label: string; pulse: boolean }> = {
   connected: { color: 'bg-neon-green shadow-[0_0_6px_rgba(0,255,136,0.5)]', label: 'Connected', pulse: false },
   reconnecting: { color: 'bg-neon-yellow shadow-[0_0_6px_rgba(255,221,0,0.5)]', label: 'Reconnecting...', pulse: true },
   disconnected: { color: 'bg-neon-red shadow-[0_0_6px_rgba(255,51,85,0.5)]', label: 'Disconnected', pulse: false },
@@ -146,7 +138,7 @@ interface BottomPanelProps {
   onCanvasUpdated?: (rev: string, env: string) => void;
   selectedNode?: string;
   onCycleBottom: () => void;
-  onWsStatusChange?: (connected: boolean) => void;
+  onStreamStatusChange?: (connected: boolean) => void;
   onResourceStatus?: (name: string, status: string, error?: string, facts?: Record<string, unknown>) => void;
   onConfigUpdate?: (nodeId: string, data: Record<string, any>) => void;
   clearSignal?: number;
@@ -168,7 +160,7 @@ async function fetchNodeLogs(env: string, node: string): Promise<LogLine[]> {
   return lines.map(l => ({ time, source: node, msg: l, msgClass: body.running ? '' : 'warn' }));
 }
 
-export default function BottomPanel({ bottomState, activeEnv, selectedNode, onCycleBottom, onWsStatusChange, onResourceStatus, onConfigUpdate, onCanvasUpdated, clearSignal }: BottomPanelProps) {
+export default function BottomPanel({ bottomState, activeEnv, selectedNode, onCycleBottom, onStreamStatusChange, onResourceStatus, onConfigUpdate, onCanvasUpdated, clearSignal }: BottomPanelProps) {
   const [activeTab, setActiveTab] = useState("Agent");
   const [logs, setLogs] = useState<LogLine[]>([]);
   const [fetchingLogs, setFetchingLogs] = useState(false);
@@ -188,7 +180,7 @@ export default function BottomPanel({ bottomState, activeEnv, selectedNode, onCy
     fetch(`/events?env=${encodeURIComponent(activeEnv ?? 'default')}`)
       .then(r => r.json())
       .then((events: Record<string, unknown>[]) => {
-        const lines = events.flatMap(parseWebSocketMessage);
+        const lines = events.flatMap(parseStreamMessage);
         setLogs(lines.reverse());
       })
       .catch(() => {});
@@ -236,7 +228,7 @@ export default function BottomPanel({ bottomState, activeEnv, selectedNode, onCy
     // A crash-tail push (type:"log") carries an env too -- other envs'
     // failures shouldn't spam a console the user isn't looking at.
     if (type === 'log' && (msg.env as string | undefined ?? 'default') !== (activeEnvRef.current ?? 'default')) return;
-    const logLines = parseWebSocketMessage(msg);
+    const logLines = parseStreamMessage(msg);
     if (logLines.length) setLogs(prev => [...logLines, ...prev]);
   }, []);
 
@@ -248,11 +240,11 @@ export default function BottomPanel({ bottomState, activeEnv, selectedNode, onCy
     return () => clearInterval(interval);
   }, [agentActive]);
 
-  const wsStatus = useWebSocket(handleMessage);
+  const wsStatus = useEventStream(handleMessage);
 
   useEffect(() => {
-    onWsStatusChange?.(wsStatus === 'connected');
-  }, [wsStatus, onWsStatusChange]);
+    onStreamStatusChange?.(wsStatus === 'connected');
+  }, [wsStatus, onStreamStatusChange]);
   const sc = statusConfig[wsStatus];
 
   const filteredLogs = useMemo(() => logs.filter(tabFilter[activeTab]), [logs, activeTab]);

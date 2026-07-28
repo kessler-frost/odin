@@ -185,7 +185,7 @@ def _command_label(args: tuple[str, ...]) -> str:
     rds `POSTGRES_PASSWORD`, a resolved `DATABASE_URL` -- and this message does
     not stay local: `gateway/models/ecsctl.py` records `str(exc)` as the task's
     `stopped_reason`, `tf_status.py` projects that as the World verdict, and the
-    reconciler broadcasts it on the WebSocket and appends it to
+    reconciler broadcasts it on the event stream and appends it to
     `.odin/{env}/events.jsonl` (field test 2 finding #6 -- a real workload
     secret key was found in four durable log entries). The argv was also what
     pushed the real docker error past the 200-char clip in

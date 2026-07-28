@@ -48,7 +48,7 @@ from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from odin.agent import debugger
 from odin.api.logs import fetch_logs
-from odin.api.ws import ConnectionManager
+from odin.api.events import ConnectionManager
 from odin.gateway.stores import SynthStores
 from odin.spec.store import SpecStore
 

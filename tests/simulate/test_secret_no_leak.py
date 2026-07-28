@@ -16,6 +16,8 @@ generated `main.tf`, because tofu has to send the value to create the resource
 """
 from __future__ import annotations
 
+import asyncio
+
 import stat
 from pathlib import Path
 
@@ -23,7 +25,7 @@ import pytest
 
 from odin.agent import hcl
 from odin.agent.translate import _prompt
-from odin.api.ws import ConnectionManager
+from odin.api.events import ConnectionManager
 from odin.simulate.runner import TfRunner
 from odin.spec.models import REDACTED
 from odin.spec.translate import canvas_to_stack
@@ -62,15 +64,28 @@ def _write_fake_tofu(path: Path) -> Path:
     return tofu
 
 
-class RecordingConnection:
-    """A WebSocket stand-in that records exactly what a live viewer would
-    receive -- the frames, not just the durable log."""
+class RecordingViewer:
+    """A live SSE subscriber, recording exactly what would go out on the wire --
+    the frames, not just the durable log.
 
-    def __init__(self) -> None:
-        self.frames: list[dict] = []
+    v0.8.7: this was a WebSocket stand-in with a `send_json` method, added
+    straight to the manager's connection set. The stream is SSE now, so a
+    subscriber IS a queue; this wraps one so the assertions below read the same.
+    Added directly to `_subscribers` rather than through `subscribe()`, which is
+    an async context manager built for a real request lifecycle."""
 
-    async def send_json(self, message: dict) -> None:
-        self.frames.append(message)
+    def __init__(self, manager) -> None:
+        self.queue: asyncio.Queue = asyncio.Queue(maxsize=4096)
+        manager._subscribers.add(self.queue)
+
+    @property
+    def frames(self) -> list[dict]:
+        out: list[dict] = []
+        while not self.queue.empty():
+            message = self.queue.get_nowait()
+            if message is not None:
+                out.append(message)
+        return out
 
 
 @pytest.fixture
@@ -80,12 +95,11 @@ def wired(tmp_path, monkeypatch):
     _write_fake_tofu(tmp_path)
     monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
     ws = ConnectionManager(tmp_path)
-    viewer = RecordingConnection()
-    ws._connections.add(viewer)  # bypasses accept(); there's no real socket here
+    viewer = RecordingViewer(ws)
     return ws, viewer, tmp_path
 
 
-async def test_a_secret_value_reaches_neither_a_ws_frame_nor_events_jsonl(wired):
+async def test_a_secret_value_reaches_neither_a_stream_frame_nor_events_jsonl(wired):
     ws, viewer, root = wired
     stack = canvas_to_stack(CANVAS, env=ENV)
     project = hcl.generate_tf(stack)

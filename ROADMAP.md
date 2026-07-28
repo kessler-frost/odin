@@ -1325,11 +1325,25 @@ index-to-index deletion on this file.
   unambiguous and which no edge already expresses. That is a real observation
   about how people draw, not something to reason out in advance.
 
-- [x] **The chat/agent surface — BUILT (v0.8.5), as an addition.** `odin chat
-  "..."` proposes a canvas edit; `--apply` saves it. Explicitly NOT a replacement
-  for the canvas language, and the shape follows from that: two calls, never one,
-  and `--apply` goes through the same `POST /canvas` the UI's own save uses, so
-  there is no privileged path for an agent-authored canvas.
+- [x] **The chat/agent surface — BUILT (v0.8.5), direct-editing since v0.8.6.**
+  `odin chat "..."` changes the canvas; `--dry-run` previews.
+
+  **Owner correction, 2026-07-28:** v0.8.5 returned a proposal to confirm, and
+  the owner's call was that the CANVAS is the review surface — the edit should
+  appear where you are already looking, and undo is what takes it back. That
+  turned out to need no new mechanism at all: `Canvas.tsx` records history from
+  a `[nodes, edges]` effect, not from the drag handlers, so a WebSocket-driven
+  `setNodes` already lands on the undo stack exactly like a drag. VERIFIED in a
+  real browser — the edge appears in an open tab (0 -> 1) and Cmd-Z reverses it
+  (1 -> 0). I had presented this as a design tradeoff; it was not one.
+
+  It still never APPLIES: editing the drawing is reversible, building from it is
+  not. The save goes through the same `POST /canvas` the UI uses, so there is no
+  privileged path for an agent-authored canvas. The conversation is remembered
+  per env in server memory, bounded at 12 turns, cleared by a restart,
+  `--clear`, or *Clear Agent Session* in the `···` menu — never touching the
+  canvas, because reverting work you may have built on since is a far worse
+  surprise than a stale conversation.
 
   **It proposes OPERATIONS, not a rewritten canvas.** Canvas-in-canvas-out is
   unauditable — a dropped node, a rewritten password and a rename all arrive as

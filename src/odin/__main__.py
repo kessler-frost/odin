@@ -63,6 +63,22 @@ _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 # reported, never assumed (see `_await_serving`).
 READY_TIMEOUT = 120.0
 _READY_POLL = 0.1
+# How long uvicorn may wait for in-flight requests before cancelling them.
+#
+# NOT a tuning knob -- odin does not shut down without it. An SSE response is an
+# in-flight request that by design never finishes (`api/events.py::event_stream`
+# loops emitting heartbeats), and uvicorn's graceful shutdown waits for in-flight
+# requests BEFORE it runs lifespan shutdown -- so the app's own
+# `ConnectionManager.close_all` never gets reached. MEASURED with one browser tab
+# open: the server ignored two SIGTERMs, was still alive after four minutes, and
+# held its gateway port so nothing could restart. With this set it stops in ~11s
+# (the wait, then teardown). Ctrl-C had the same hang.
+#
+# `close_all` is kept as well: it ends the streams cleanly on the paths that DO
+# reach lifespan shutdown, rather than leaving them to be cancelled.
+GRACEFUL_SHUTDOWN_SECONDS = 5
+
+
 # Enough of the log to show the error uvicorn died on (a port already in use,
 # an import error) without pasting a whole startup transcript into the terminal.
 _LOG_TAIL_LINES = 12
@@ -383,7 +399,10 @@ def start(
         # because uvicorn.run reuses this process -- the pidfile is exact.)
         private_mkdir(ODIN_DIR)
         PID_FILE.write_text(str(os.getpid()))
-        uvicorn.run("odin.server:create_app", factory=True, host=host, port=port)
+        uvicorn.run(
+            "odin.server:create_app", factory=True, host=host, port=port,
+            timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SECONDS,
+        )
         PID_FILE.unlink(missing_ok=True)
     else:
         private_mkdir(ODIN_DIR)
@@ -391,7 +410,8 @@ def start(
         log = log_path.open("w")
         proc = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "odin.server:create_app",
-             "--factory", "--host", host, "--port", str(port)],
+             "--factory", "--host", host, "--port", str(port),
+             "--timeout-graceful-shutdown", str(GRACEFUL_SHUTDOWN_SECONDS)],
             stdout=log, stderr=log, start_new_session=True,
         )
         PID_FILE.write_text(str(proc.pid))

@@ -4,7 +4,7 @@ The canvas authors a desired-state Stack; a continuous Reconciler drives reality
 (per-env backing containers for the AWS-shaped resources, via Colima) and
 projects what `tofu apply` created through the gateway (every TF-owned kind,
 `rds` among them since W2.7); the World projects back to the canvas over
-WebSocket.
+a Server-Sent Events stream.
 """
 from __future__ import annotations
 
@@ -19,19 +19,20 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import APIRouter, FastAPI, Request
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from odin.agent import chat
+from odin.api.canvas import write_canvas
 from odin.agent import import_tf as import_tf_mod
 from odin.agent import translate as translate_mod
 from odin.agent.hcl import TfProject, generate_tf, parse_tf, resource_set, unquote
 from odin.api.canvas import CanvasGraph, create_canvas_router
 from odin.api.debug import create_debug_router
 from odin.api.logs import create_logs_router
-from odin.api.ws import ConnectionManager
+from odin.api.events import SSE_HEADERS, ConnectionManager, event_stream
 from odin.aws.backings import PROVISIONED, BackingAws, BackingUnavailable
 from odin.compute.tasks import TaskRuntime
 from odin.fabric.localhost import LocalhostFabric
@@ -1144,6 +1145,7 @@ _PLAN_STATUS = {0: "no_changes", 2: "changes"}
 
 class ChatRequest(BaseModel):
     message: str
+    dry_run: bool = False
 
 
 class ImportTfRequest(BaseModel):
@@ -1176,10 +1178,19 @@ def _saved_canvas(path: Path) -> dict:
     return json.loads(path.read_text()) if path.is_file() else {}
 
 
+# How many (message, reply) turns the chat agent remembers per env. In MEMORY,
+# so a server restart clears it -- which is one of the two resets the owner asked
+# for; `POST /chat/clear` is the other. Bounded because a conversation is
+# replayed into every prompt: unbounded history would grow the prompt without
+# limit and quietly start costing more than the canvas it is editing.
+_CHAT_HISTORY_TURNS = 12
+
+
 def create_tf_router(
     store: SpecStore, runner: TfRunner, keystore: KeyStore, gateway_port,
     translate_cache: translate_mod.TranslateCache, runtime, stores: SynthStores,
     canvas_for: Callable[[str], Path] = lambda env: ODIN_DIR / env / CANVAS_NAME,
+    ws=None,
 ) -> APIRouter:
     """`/tf/*` -- Simulate's own apply/destroy/status, independent of the
     canvas `/apply`/`/destroy` above (S2 CONTRACT ADDENDUM: routes named
@@ -1188,6 +1199,16 @@ def create_tf_router(
     the real port is only known once the gateway's uvicorn listener starts
     in `create_app`'s `lifespan`, resolved AFTER this router is built."""
     router = APIRouter()
+    # Per-env, per-process. Not persisted on purpose: a conversation is a
+    # working context, not a record, and one that outlived a restart would be a
+    # surprise nobody asked for.
+    chat_sessions: dict[str, list[tuple[str, str]]] = {}
+
+    async def save_canvas_now(env: str, canvas: dict) -> dict[str, str]:
+        """Save an agent-authored canvas through the SAME writer the UI's own
+        save uses, so it gets identical validation, the same 0600 mode, and the
+        same `canvas_updated` broadcast that makes an open tab redraw."""
+        return await write_canvas(canvas_for(env), CanvasGraph.model_validate(canvas), env, ws)
 
     def _issue_operator(env: str) -> tuple[str, str]:
         return keystore.issue(env, OPERATOR_NODE_ID)
@@ -1338,28 +1359,57 @@ def create_tf_router(
 
     @router.post("/chat")
     async def chat_route(body: ChatRequest, env: str = ENV) -> dict:
-        """Plain English -> a PROPOSED canvas edit. Applies nothing.
+        """Plain English -> the canvas is CHANGED, live, and you review it there.
 
-        The proposal's `canvas` is a preview: saving it is a separate call the
-        human makes (`odin chat --apply`, or the panel's Apply button), which is
-        the whole shape of this surface — the owner's rule is that the canvas is
-        the language and chat is an addition to it, so an agent that edited the
-        canvas someone was looking at would be taking the language away.
+        Owner decision, 2026-07-28: the agent edits the canvas directly rather
+        than handing back a proposal to confirm. The canvas is the review
+        surface -- the change appears where you are already looking, the UI's
+        own undo stack picks it up (Canvas.tsx records history from a `[nodes,
+        edges]` effect, so a stream-driven `setNodes` lands on it exactly
+        like a drag), and Cmd-Z reverses it.
 
-        Every failure lands on the same body (`note` set, `canvas` unchanged),
-        so a client never distinguishes "nothing to do" from "it broke" by
-        catching an exception.
+        What it still does NOT do is APPLY: nothing here provisions anything.
+        `/apply-full` remains the user's own button, which is the line that
+        matters -- an agent may rearrange the drawing, never build from it.
+
+        `dry_run` keeps the old preview behaviour for a caller that wants to
+        look first (`odin chat --dry-run`).
+
+        Every failure lands on the same body (`note` set, canvas untouched), so
+        a client never distinguishes "nothing to do" from "it broke" by catching
+        an exception.
         """
         # Normalised to the canvas SHAPE rather than passed through: an env
         # nobody has drawn in yet reads back as `{}` (`_saved_canvas`), and
         # "add a bucket" before drawing anything is the first thing a person
-        # tries. Everything downstream -- the summary, `apply_ops`, and the
-        # `--apply` POST -- is written against {nodes, edges}, so the one place
-        # that knows the file may be absent is the right place to say so.
+        # tries. Everything downstream is written against {nodes, edges}.
         saved = _saved_canvas(canvas_for(env))
         canvas = {"nodes": saved.get("nodes") or [], "edges": saved.get("edges") or []}
-        proposal = await chat.propose(canvas, body.message)
-        return proposal.model_dump()
+        session = chat_sessions.setdefault(env, [])
+        proposal = await chat.propose(canvas, body.message, history=list(session))
+        # The turn is remembered whatever happened, INCLUDING a refusal: "no, do
+        # it the other way" is the most common second message, and it is
+        # meaningless without the first.
+        session.append((body.message, proposal.reply))
+        del session[:-_CHAT_HISTORY_TURNS]
+
+        if body.dry_run or not proposal.changes:
+            return proposal.model_dump()
+        return {**proposal.model_dump(), **await save_canvas_now(env, proposal.canvas)}
+
+    @router.post("/chat/clear")
+    async def chat_clear_route(env: str = ENV) -> dict:
+        """Forget the conversation. The CANVAS is untouched.
+
+        The session is in memory, so a server restart clears it too -- this is
+        the deliberate version of that, for starting a fresh line of thought
+        without one. It deliberately does NOT roll the canvas back: the agent's
+        edits are yours now, they are on the undo stack, and silently reverting
+        work you may have built on since would be a far worse surprise than a
+        stale conversation.
+        """
+        turns = len(chat_sessions.pop(env, []))
+        return {"status": "cleared", "env": env, "turns_forgotten": turns}
 
     @router.post("/import-tf")
     async def import_tf_route(body: ImportTfRequest, env: str = ENV) -> dict:
@@ -2306,6 +2356,12 @@ def create_app(
                 try:
                     yield
                 finally:
+                    # FIRST: end every open SSE stream. uvicorn's graceful
+                    # shutdown waits for in-flight requests, and a live stream
+                    # never finishes on its own -- measured, the server survived
+                    # two SIGTERMs and held its gateway port for minutes with one
+                    # tab open. See `ConnectionManager.close_all`.
+                    ws_manager.close_all()
                     lock_watch.cancel()
                     loop_watch.cancel()
                     for reconciler in reconcilers.values():
@@ -2346,7 +2402,7 @@ def create_app(
     app.include_router(
         create_tf_router(
             _store, tf_runner, gateway_keystore, lambda: gateway_port_actual,
-            translate_cache, _runtime, gateway_stores, canvas_for,
+            translate_cache, _runtime, gateway_stores, canvas_for, ws_manager,
         )
     )
     app.include_router(
@@ -2360,14 +2416,19 @@ def create_app(
     # logs route does, plus the ws_manager's durable per-env event log.
     app.include_router(create_debug_router(_store, gateway_stores, _runtime, ws_manager))
 
-    @app.websocket("/ws")
-    async def websocket_endpoint(websocket: WebSocket):
-        await ws_manager.connect(websocket)
-        try:
-            while True:
-                await websocket.receive_text()
-        except WebSocketDisconnect:
-            ws_manager.disconnect(websocket)
+    @app.get("/stream")
+    async def stream_endpoint() -> StreamingResponse:
+        """The live event stream (SSE). Replaced `/ws` in v0.8.7.
+
+        The socket it replaces was strictly server->client -- the UI never sent
+        anything and this handler discarded everything it received -- so the
+        duplex half was pure cost, most visibly a hand-rolled reconnect in the
+        browser. `EventSource` reconnects itself, and on reconnect the UI
+        backfills from `/events` below, so a gap self-heals.
+        """
+        return StreamingResponse(
+            event_stream(ws_manager), media_type="text/event-stream", headers=SSE_HEADERS,
+        )
 
     @app.get("/events")
     def get_events(env: str = ENV):

@@ -150,16 +150,27 @@ def create_canvas_router(canvas_for: Callable[[str], Path], ws=None) -> APIRoute
         # in this file in cleartext by design (the reconciler reads it back
         # verbatim) -- 0600 is the only thing stopping another local account
         # from reading it.
-        atomic_write_text(canvas_path, graph.model_dump_json(indent=2), mode=0o600)
-        revision = canvas_revision(canvas_path)
-        response.headers["ETag"] = revision
-        if ws is not None:
-            # Carries the new revision so a tab that just saved can recognise
-            # its OWN echo and skip reloading -- otherwise every save round-trips
-            # into a reload, and a reload mid-edit is its own kind of data loss.
-            # Carries the ENV as well as the revision: a tab showing a
-            # different environment must not reload someone else's canvas.
-            await ws.broadcast({"type": "canvas_updated", "env": env, "rev": revision})
-        return {"status": "saved", "rev": revision}
+        result = await write_canvas(canvas_path, graph, env, ws)
+        response.headers["ETag"] = result["rev"]
+        return result
 
     return router
+
+
+async def write_canvas(canvas_path: Path, graph: CanvasGraph, env: str, ws=None) -> dict[str, str]:
+    """Write a canvas and tell every open tab. The ONE place a canvas is saved.
+
+    Extracted so `POST /chat` can save through it too (v0.8.6: the agent edits
+    the canvas directly, so the change has to reach the open UI the same way a
+    save from another tab does). Duplicating it there would have meant two
+    copies of three invariants that are easy to get subtly wrong and silent when
+    they are: the 0600 mode (a canvas holds an rds `password` in cleartext), the
+    content-addressed revision, and the broadcast that carries BOTH the revision
+    (so a tab skips its own echo) and the env (so a tab showing `prod` does not
+    reload because `staging` changed).
+    """
+    atomic_write_text(canvas_path, graph.model_dump_json(indent=2), mode=0o600)
+    revision = canvas_revision(canvas_path)
+    if ws is not None:
+        await ws.broadcast({"type": "canvas_updated", "env": env, "rev": revision})
+    return {"status": "saved", "rev": revision}
