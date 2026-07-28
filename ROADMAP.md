@@ -1359,9 +1359,16 @@ index-to-index deletion on this file.
   to the wrong one). Subnet-in-VPC already worked this way; leaves now match.
   Five new cases, mutation-tested.
 
-  Still open, and the more interesting half: SG **membership** -- which instances
-  an SG gates -- is a relationship, not ownership, and is still implied by
-  geometry. That one wants to be an edge.
+  The more interesting half -- SG **membership**, which instances an SG gates --
+  said "still open ... wants to be an edge" here for a while after it had BECOME
+  one (v0.7.13). It is built: `translate.py::SG_MEMBERSHIP` folds an `sg` edge
+  into the same `securityGroups` field the text box already feeds, ADDING to it
+  rather than replacing, so `hcl.py` is untouched and a hand-authored canvas
+  keeps working. Membership is a many-to-many fact between peers, which geometry
+  cannot express and an edge can. Eleven cases in
+  `tests/spec/test_sg_membership_edges.py`, including that direction does not
+  matter and that an `sg` edge to a kind with no such field is ignored rather
+  than inventing a setting nothing reads.
 
 
 
