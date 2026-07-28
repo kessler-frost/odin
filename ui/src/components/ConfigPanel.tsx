@@ -54,6 +54,15 @@ const fieldsForType: Record<string, FieldDef[]> = {
       key: 'ingressRules', label: 'Ingress Rules (protocol:port:cidr-or-SG-name, one per line)',
       editable: true, multiline: true, placeholder: 'tcp:443:0.0.0.0/0\ntcp:5432:web-sg',
     },
+    {
+      // Outbound. EMPTY MEANS WIDE OPEN -- odin emits AWS's own allow-all
+      // egress when nothing is authored here, which is what every group did
+      // before this field existed and what real AWS seeds a new group with.
+      // The placeholder shows that default spelled out, so the first thing a
+      // reader learns is what they are replacing (agent/hcl.py::_sg).
+      key: 'egressRules', label: 'Egress Rules (protocol:port:cidr-or-SG-name, one per line — empty = allow all)',
+      editable: true, multiline: true, placeholder: '-1:0:0.0.0.0/0\ntcp:443:10.0.0.0/16',
+    },
     { key: 'vpc', label: 'VPC (containment)' },
     { key: 'subnet', label: 'Subnet (containment)' },
     { key: 'groupId', label: 'Group ID' },

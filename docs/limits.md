@@ -12,27 +12,45 @@ They are listed because finding one by surprise is worse than reading it here.
   `s3`, `sqs`, `sns`, `dynamodb`, `rds`, `vpc`, `subnet` only — and a
   live-imported RDS arrives with odin's default password, because no AWS API
   returns a master password.
-- **An emitted IAM policy names resources by label, not ARN.** Since v0.8.11 a
-  drawn permission becomes a real `aws_iam_role_policy` on the workload's role,
-  and it round-trips through Terraform and back without loss. What it is not yet
-  is portable: the `Resource` is odin's node label, because that is what
-  `gateway/classify.py` reports and therefore what the evaluator matches. Taken
-  to Amazon, each policy needs its `Resource` rewritten as an ARN.
-- **An imported ECS service loses its canvas wiring entirely** — both the
-  `${{producer.ATTR}}` env references and the ordering they produced. The
-  references are deliberately never written into the generated Terraform (a
-  resolved `DATABASE_URL` carries the database password, so it would land in
-  `terraform.tfstate` in plaintext), and odin re-derives `depends_on` *from* those
-  references, so nothing is left to rebuild either from. The import names the
-  producers the service depended on and tells you to re-add the references.
-- **An imported security group's OUTBOUND rules do not survive.** odin re-emits
-  its own wide-open egress (everything to `0.0.0.0/0`) for every group and has no
-  canvas field for outbound rules, so a source that restricted egress comes back
-  unrestricted. The import says so on its own line rather than leaving you to
-  find it. Inbound rules do round-trip, including the identity form
-  (`security_groups = [...]` → the referenced group's label), except that odin's
-  rule is a single port: an ingress block with a port RANGE is reported and left
-  out, so the regenerated group allows *less* than the source.
+- **A security group's OUTBOUND rules are authored but not ENFORCED.** Since
+  v0.8.14 the sg node has an `egressRules` field, in the same
+  `protocol:port:destination` form as `ingressRules`, and it emits real `egress`
+  blocks that reach the gateway — so a restricted egress survives generation and
+  `tofu plan`. What still does not gate it is the mesh: `fabric/nebula.py::
+  _compiled_firewall` compiles the group's INGRESS rules only, and every Nebula
+  config odin writes carries `outbound: any`. Treat an egress rule as portable
+  configuration, not as a control. An empty field still emits AWS's own
+  allow-all egress, which is what every canvas drawn before the field existed
+  gets and why their generated file is byte-identical to what it was.
+- **A security group is IPv4 only.** An IPv6 CIDR in either rule field is
+  declined with that reason, and the reason is real rather than a parser
+  limitation: `sg_rules_to_firewall` compiles `IpRanges` and `UserIdGroupPairs`
+  and nothing else, so an IPv6 rule would be carried by Terraform, stored by the
+  gateway, visible in `tofu plan`, and enforced by nothing. Making it real is a
+  Nebula change, not a canvas one. One bad line still declines the whole group,
+  deliberately: silently dropping one rule from a firewall is worse than
+  refusing the group.
+- **A security group's rules are a single port each.** `tcp:443:0.0.0.0/0`, not
+  a range — so an imported ingress block with a port RANGE is reported and left
+  out, and the regenerated group allows *less* than the source.
+- **A workload's `${{producer.ATTR}}` references are carried as TAGS, and the
+  resolved values still are not.** The distinction the design rests on: a
+  reference names a producer and an attribute, while the string it resolves to
+  at container launch carries the database password. Since v0.8.14 each
+  reference travels as an `odin:ref:<VAR>` tag on the workload's own resource
+  (value `<producer>.<attr>`), so the generated Terraform states the wiring and
+  the `depends_on` odin re-derives from it. The values never appear — nor do a
+  node's STATIC env entries, which a user may well have typed a credential into,
+  so an `API_TOKEN = "..."` you set on the canvas is not in `main.tf` and is not
+  in `terraform.tfstate`. It arrives at launch, from `gateway/wiring.py`, and
+  nowhere else.
+- **Whether an IMPORT recovers either of the two above is the import direction's
+  half, and at the time of writing it does not.** The generator states them; the
+  HCL reader has not been taught to read `odin:ref:` tags back into a node's
+  `env`, nor `egress` blocks back into `egressRules`. Until it is, a round trip
+  through `odin translate import` still drops both — for a different reason than
+  before (the file now carries them), which is the only part this entry is
+  claiming.
 - **Some arguments are re-emitted with odin's own value whatever you wrote**, and
   each one warns on its own line — `imported with CHANGED argument(s) -- odin
   substitutes its own value` — kept separate from the `imported without unmodeled
