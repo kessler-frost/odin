@@ -114,7 +114,12 @@ class Edge(BaseModel):
     model_config = {"frozen": True}
     src: str
     dst: str
-    kind: str = "ref"            # "ref" | "iam" | "network"
+    # A free string on purpose, so a canvas saved before a kind existed still
+    # parses. `spec/translate.py::EDGE_KINDS` is the registry; `ui/src/lib/iam.ts`
+    # is its UI half. "network" is retained as a legacy value: every saved
+    # canvas carries it, and the builders key on NODE KINDS rather than this
+    # field, so gating on it without a migration would tear down live resources.
+    kind: str = "ref"            # ref | iam | sg | role | target | subscription | unmodelled | network
     perms: tuple[str, ...] = ()
 
 
