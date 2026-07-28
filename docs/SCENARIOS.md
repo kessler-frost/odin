@@ -63,6 +63,15 @@ session keeps its original system prompt).
 All 15 pass: every node reaches `validated` through the live agent, built via the
 real UI (run 2026-06-21).
 
+> **What a tick means here, because the table reads as capability at a glance:**
+> the agent emitted the expected resources and `tofu plan` passed against an
+> ephemeral Moto server. **No apply, and no odin implementation.** So "S10 —
+> Internet Gateway, Elastic IP, Route 53 ✅ 9/9" records that plausible HCL was
+> generated and validated, NOT that odin ever ran an internet gateway, allocated
+> an address, or resolved a name. It never has: those three kinds are unbacked
+> placeholders today, and are filtered out of the sidebar palette. This is the
+> only place in the repo that could be read as saying otherwise.
+
 | # | Scenario | Services exercised | Result |
 |---|----------|--------------------|--------|
 | S1 | Serverless REST API | API Gateway, Lambda, DynamoDB, CloudWatch Logs, IAM | ✅ 4/4 (agent also created the Lambda IAM role) |
