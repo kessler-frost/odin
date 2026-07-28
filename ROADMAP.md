@@ -1269,10 +1269,19 @@ index-to-index deletion on this file.
     the workload -- so a placed task's failure now names the instance and says
     the workload can only run once it is up, while keeping the underlying cause.
     An unplaced task's message is byte-for-byte unchanged.
-  * **Capacity — OPEN.** A VM has finite memory and several tasks placed in one
-    instance can exhaust it. Real ECS answers this with capacity providers. The
-    parked app layer (`app-layer-parked`) had a memory-aware scheduler that is
-    the nearest prior art and is worth reading before inventing another.
+  * **Capacity — CLOSED.** An EC2 node is a real Lima VM sized by its instance
+    type (t3.micro -> 1GiB) and a placed task gets a real memory cap (512 MiB by
+    default), so "three services of two tasks each inside a t3.micro" is
+    arithmetic odin cannot honour. `spec/capacity.py` sums the demand per
+    instance and /apply-full refuses with a 409 BEFORE anything is built --
+    beside the wiring guard, naming the instance, what was asked, what it has,
+    and what to do about it. The alternative was never "it works": it was
+    OOM-killed containers minutes later, reported as task failures that say
+    nothing about the instance being too small.
+    Deliberately NOT a scheduler -- one sum per instance, checked once. It
+    reserves 256 MiB for guest kernel/containerd overhead and says so in the
+    message rather than hiding the fudge inside the comparison. A canvas that
+    places nothing pays nothing.
   * **Naming — OPEN (documentation, not code).** `LimaRuntime` now means two
     things depending on its `vm`: odin's shared VM-isolation mode, and a
     specific EC2 instance. Distinguished by the name today; worth a clearer

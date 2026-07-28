@@ -49,6 +49,7 @@ from odin.simulate.runner import SimulateBusy, TfRunner, TofuNotInstalled
 from odin.simulate.workspace import tf_dir
 from odin.spec import store as store_mod
 from odin.spec.models import Stack, World
+from odin.spec.capacity import overcommitted
 from odin.spec.store import SpecStore, StoreUnreadable
 from odin.spec.translate import MODELLED_NODE_TYPES, canvas_to_stack, drawn_node_types, skipped_node_types
 from odin.util import STORE_LOCK_NAME, StoreLock, atomic_write_text, hold_store_lock, odin_version
@@ -338,6 +339,29 @@ def _uncovered_destroys(
         for node, requested_as in sorted(requested.items())
         if node in existing and node not in covered
     ]
+
+
+
+def _capacity_rejection(problems: list[str], env: str) -> JSONResponse:
+    """Refuse an apply that asks an instance to hold more than it has.
+
+    Same shape as `_wiring_rejection`: a 409 before anything is built, naming
+    what is wrong and what to do. The alternative is not "it works" -- it is
+    containers OOM-killed inside a VM some minutes later, reported as task
+    failures that say nothing about the instance being too small.
+    """
+    named = "; ".join(problems)
+    return JSONResponse(
+        {
+            "status": "refused",
+            "note": (
+                f"refusing to apply: {len(problems)} instance(s) in env {env!r} are asked to hold "
+                f"more than they have -- {named}"
+            ),
+            "capacity_problems": problems,
+        },
+        status_code=409,
+    )
 
 
 def _wiring_rejection(wiring_errors: list[str], env: str) -> JSONResponse:
@@ -1459,6 +1483,16 @@ def create_apply_full_router(
         # refusal so both land before anything is touched.
         if skeleton.wiring_errors:
             return _wiring_rejection(skeleton.wiring_errors, env)
+
+        # CAPACITY: an EC2 node is a real Lima VM with a real memory size, and a
+        # placed ECS task gets a real memory cap. "three services of two tasks
+        # each, drawn inside a t3.micro" is arithmetic odin cannot honour, so it
+        # is refused here -- beside the wiring guard, before any container or VM
+        # exists -- rather than discovered as OOM-killed containers minutes
+        # later. Silent for every canvas that places nothing.
+        capacity_problems = overcommitted(stack)
+        if capacity_problems:
+            return _capacity_rejection(capacity_problems, env)
 
         # Owner directive B1: reject BEFORE ensure_backings/translate/tofu
         # ever touch a container or VM, not after 20 of them have already
