@@ -225,14 +225,20 @@ def _resource(node: dict) -> ResourceDesired | None:
 
 def _edge(e: dict, labels: dict[str, str]) -> Edge:
     # The UI stores access metadata under `data` (Canvas.tsx): `permissions` +
-    # `edgeType` ("iam" | "network"). Thread both through so the Brain's IAM
-    # review sees real grants. (Data-flow ${{node.attr}} refs are NOT edges —
+    # `edgeType`, one of `EDGE_KINDS` above. Thread both through so the Brain's
+    # IAM review sees real grants. (Data-flow ${{node.attr}} refs are NOT edges —
     # they're lifted into ResourceDesired.refs above.)
     # Edge endpoints are ReactFlow node IDs but Stack resources are keyed by
     # LABEL — translate through `labels` (fall back for edges naming labels).
+    #
+    # An edge with no `edgeType` at all (a hand-authored canvas) falls to
+    # `UNMODELLED`, matching what the UI now stores for the same pair. The kind
+    # written here is NOT read back by any builder -- `agent/hcl.py`'s ALB and
+    # subscription passes key on the two NODE kinds -- so changing the word
+    # cannot change what gets built, only what the canvas says it is.
     data = e.get("data") or {}
     perms = tuple(data.get("permissions") or ())
-    kind = data.get("edgeType") or ("iam" if perms else "network")
+    kind = data.get("edgeType") or ("iam" if perms else UNMODELLED)
     src, dst = e.get("source", ""), e.get("target", "")
     return Edge(src=labels.get(src, src), dst=labels.get(dst, dst), kind=kind, perms=perms)
 
@@ -281,6 +287,23 @@ def drawn_node_types(canvas: dict) -> dict[str, str]:
 
 
 
+# --- edge kinds --------------------------------------------------------------
+#
+# `Edge.kind` is a free `str` (spec/models.py), which is what lets every canvas
+# ever saved keep parsing -- including the ones carrying the pre-rename catch-all
+# `"network"`. The cost of a free string is that a typo round-trips through the
+# store and through Apply looking real, so the set below is the ONE place Python
+# knows which kinds exist, and `agent/chat.py` validates against it.
+#
+# Being in this set does NOT mean a builder gates on it. Two consumers -- the
+# subscription pass in `agent/hcl.py` and `reconcile/reconciler.py::
+# _desired_subs` -- key on the two NODE kinds and never read `edge.kind`, and
+# they must keep doing so: every saved canvas types an sns->sqs edge `network`,
+# so requiring `kind == "subscription"` without a migration in the same commit
+# would drop the subscription from the generated HCL for all of them and `tofu`
+# would DESTROY the live subscription on the next apply. The reconciler would
+# not catch it either -- `_desired_subs` only ever ADDS a missing subscription.
+
 # The edge kind that means "this security group gates this resource".
 #
 # Membership is a RELATIONSHIP, not ownership: containment already supplies an
@@ -289,6 +312,29 @@ def drawn_node_types(canvas: dict) -> dict[str, str]:
 # cannot express it. Before this it could only be typed into an ec2/rds node's
 # `securityGroups` text field, so the canvas could not show it at all.
 SG_MEMBERSHIP = "sg"
+
+# "This workload assumes this role" -- folded into the `role` FIELD below.
+ROLE_ASSUMPTION = "role"
+
+# "This load balancer fronts that service" and "this topic fans out to that
+# queue". Both are PRESENTATIONAL today (see the note above): they name what the
+# user drew, and the passes that build them read the node kinds instead.
+ALB_TARGET = "target"
+SNS_SUBSCRIPTION = "subscription"
+
+# The catch-all: odin has no model for this pair of kinds, so the edge is stored
+# and nothing reads it. Measured before the rename, `"network"` was the answer
+# for 341 of the 378 unordered kind pairs and meant exactly this for 340 of them.
+UNMODELLED = "unmodelled"
+
+# The pre-rename catch-all. Every canvas saved before `UNMODELLED` existed
+# carries it, and `Edge.kind`'s own default is `"ref"`, so both stay valid.
+LEGACY_UNMODELLED = "network"
+
+EDGE_KINDS = frozenset({
+    "iam", SG_MEMBERSHIP, ROLE_ASSUMPTION, ALB_TARGET, SNS_SUBSCRIPTION,
+    UNMODELLED, LEGACY_UNMODELLED, "ref",
+})
 
 # Kinds whose HCL reads `securityGroups` (`agent/hcl.py::_security_group_refs`,
 # used by `_ec2` and `_rds`). An SG edge to anything else is left alone rather
@@ -343,9 +389,122 @@ def _merge_sg_edges(
     return tuple(merged)
 
 
+# Kinds whose HCL reads a `role` field (`agent/hcl.py::_lambda`). ec2 and ecs
+# reach a role through an auto-generated role plus an instance profile /
+# `task_role_arn` and read no `role` field at all, so a role edge drawn to them
+# is deliberately NOT registered on the canvas (`ui/src/lib/iam.ts`) and never
+# authored here -- the same rule `_SG_MEMBERS` holds. Writing a field nothing
+# reads is the drawn-line-that-does-nothing bug this whole edge type exists to
+# fix. See docs/limits.md for what it would take to honour those two.
+_ROLE_HOLDERS = frozenset({"lambda"})
+
+
+def _merge_role_edges(
+    resources: tuple[ResourceDesired, ...], edges: tuple[Edge, ...],
+) -> tuple[ResourceDesired, ...]:
+    """Fold role edges into each holder's `role` field.
+
+    Before this, `iam_role` was not registered as an edge target at all (it
+    declares no `iamActions`, correctly -- a role is not an IAM data-plane
+    target), so an `iam_role -> lambda` edge fell through to the catch-all,
+    was stored in the Stack, survived every revision, and was read by NOTHING.
+    Draw `admin-role -> my-lambda` while the lambda's `role` field says
+    `other-role` and you got a dead edge, `other-role` in the generated file,
+    and `other-role`'s statements enforced by the gateway: the canvas saying one
+    thing and the gateway doing another, silently and permanently.
+
+    Folding into the field the builder ALREADY reads is what makes the edge take
+    effect with no change to `agent/hcl.py` at all -- `_lambda` still reads one
+    `role` field and cannot tell how a name got there. Same technique as
+    `_merge_sg_edges`, and direction is not significant for the same reason.
+
+    A HAND-TYPED value wins. `odin canvas set`, the README's JSON schema and the
+    translation agent all write the field directly, and an edge must not
+    silently overwrite something a user typed -- unlike `securityGroups`, a role
+    is single-valued, so "add to it" is not available as an answer here.
+
+    Two DIFFERENT roles edged to one lambda is a contradiction the canvas can
+    express and odin cannot resolve; the lowest name wins, deterministically, so
+    the generated file never depends on edge ordering. That is better than the
+    old behaviour (both edges did nothing) and still not right -- it is recorded
+    as an open limit in docs/limits.md rather than presented as a decision.
+    """
+    by_id = {r.id: r for r in resources}
+    edged: dict[str, list[str]] = {}
+    for edge in edges:
+        if edge.kind != ROLE_ASSUMPTION:
+            continue
+        for role, holder in ((edge.src, edge.dst), (edge.dst, edge.src)):
+            role_res, holder_res = by_id.get(role), by_id.get(holder)
+            if role_res is None or holder_res is None:
+                continue
+            if role_res.kind == "iam_role" and holder_res.kind in _ROLE_HOLDERS:
+                edged.setdefault(holder, []).append(role)
+
+    if not edged:
+        return resources
+    merged = []
+    for res in resources:
+        roles = edged.get(res.id)
+        typed = str(res.fields.get("role", FieldValue(value="")).value).strip()
+        if not roles or typed:
+            merged.append(res)
+            continue
+        fields = {**res.fields, "role": FieldValue(value=sorted(roles)[0], provenance="user")}
+        merged.append(res.model_copy(update={"fields": fields}))
+    return tuple(merged)
+
+
+def _orient_subscription_edges(
+    resources: tuple[ResourceDesired, ...], edges: tuple[Edge, ...],
+) -> tuple[Edge, ...]:
+    """Point every sns/sqs edge topic -> queue, whichever way it was drawn.
+
+    A subscription has exactly one possible direction: a topic fans out to a
+    queue, never the reverse. Both consumers nevertheless key on the DRAWN
+    direction -- `agent/hcl.py`'s subscription pass reads `edge.src` as the
+    topic, and `reconcile/reconciler.py::_desired_subs` filters on
+    `e.src == sns_id` -- so drawing the edge queue -> topic gave a grey line, a
+    green Apply, no subscription, and no entry in `unsupported` or
+    `wiring_errors`. A silent no-op, with no test in either direction. Three
+    hundred lines earlier hcl.py's ALB pass already accepts both orderings
+    "since which end the user started from carries no meaning"; the same
+    reasoning had never been applied here.
+
+    Normalising in the SPEC rather than teaching either consumer to look at
+    `edge.kind` is the deliberate choice. Every canvas saved before edge types
+    were named carries `kind="network"` on this edge and works anyway, precisely
+    because both consumers ignore the kind; a builder that started requiring
+    `kind == "subscription"` would drop the subscription from the generated HCL
+    for all of them, and `tofu` would DESTROY the live subscription on the next
+    apply while the reconciler stayed quiet (`_desired_subs` only ever ADDS).
+    Flipping src/dst leaves that path exactly as it is and fixes both consumers
+    at once.
+
+    `iam` edges are left alone: `hcl.py::_granted_ids` and
+    `gateway/policy.py::compile_policies` both read `edge.src` as the PRINCIPAL,
+    so flipping one would move a grant to a different node.
+    """
+    by_id = {r.id: r for r in resources}
+    reversed_ids = {
+        (edge.src, edge.dst) for edge in edges
+        if edge.kind != "iam"
+        and getattr(by_id.get(edge.src), "kind", None) == "sqs"
+        and getattr(by_id.get(edge.dst), "kind", None) == "sns"
+    }
+    return tuple(
+        edge.model_copy(update={"src": edge.dst, "dst": edge.src})
+        if (edge.src, edge.dst) in reversed_ids else edge
+        for edge in edges
+    )
+
+
 def canvas_to_stack(canvas: dict, env: str = "default") -> Stack:
     nodes = canvas.get("nodes") or []
     labels = {n["id"]: _node_id(n) for n in nodes if n.get("id")}
     resources = tuple(r for n in nodes if (r := _resource(n)) is not None)
-    edges = tuple(_edge(e, labels) for e in (canvas.get("edges") or []))
-    return Stack(env=env, resources=_merge_sg_edges(resources, edges), edges=edges)
+    edges = _orient_subscription_edges(
+        resources, tuple(_edge(e, labels) for e in (canvas.get("edges") or [])),
+    )
+    resources = _merge_role_edges(_merge_sg_edges(resources, edges), edges)
+    return Stack(env=env, resources=resources, edges=edges)

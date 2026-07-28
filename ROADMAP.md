@@ -1532,17 +1532,67 @@ index-to-index deletion on this file.
   rather than pick. `detectEdgeTypes` already returns an ARRAY, so the model
   anticipates this; `edgeDataForConnection` takes `[0]` and says nothing.
 
-  Measured before building anything: across the whole catalog, **729 ordered
-  pairs, ZERO ambiguous** -- only two edge types exist (`iam`, `network`) and no
-  pair maps to both. A selector today would never open, so it is not built.
-  `iam.test.ts` carries the trigger instead: the moment a pair becomes genuinely
-  ambiguous the test FAILS, naming the pair, which is when the selector becomes
-  real work rather than speculation. Mutation-tested by making one pair
-  ambiguous.
+  Re-measured 2026-07-28 after the edge registry grew from two types to six
+  (`iam`, `sg`, `role`, `target`, `subscription`, `unmodelled`): **729 ordered
+  pairs, ZERO ambiguous**, so a selector still would never open and is still not
+  built. The `<select>` in `ConfigPanel.tsx` has therefore never once rendered.
+
+  The trigger is `ui/src/lib/edge-ambiguity.test.ts`, NOT `iam.test.ts` as this
+  entry claimed for a month while no such test existed anywhere -- the guard was
+  described, reviewed, believed and never written, which is honesty rule 1 living
+  in the roadmap itself. It iterates every ordered pair over the real kind list
+  and fails naming any pair that means more than one thing. Mutation-tested by
+  giving `iam_role` an `iamActions` list, which makes `iam_role ↔ lambda` mean
+  both `iam` and `role`: the test fails and prints both orderings by name.
+  The registration helper appends rather than assigns for exactly this reason --
+  an `=` would let a second meaning silently replace the first, and the pair
+  would keep looking unambiguous.
 
   When it is built: store the chosen type ON the edge (`data.edgeType` already
   is the store) rather than re-inferring, so a user's choice survives a node
   being moved or retyped.
+
+- [x] **Every drawn edge now has a consumer, or says it has none (2026-07-28).**
+  Four defects, all the same shape -- odin showing the user one thing and doing
+  another.
+  **(1) The `iam_role → workload` edge was INERT.** `iam_role` declares no
+  `iamActions` (correctly -- a role is not an IAM data-plane target), so the pair
+  was never registered, fell through to the catch-all, and was read by NOTHING:
+  drawing `admin-role → my-lambda` while the lambda's `role` field said
+  `other-role` gave a dead line, `other-role` in the generated file, and
+  `other-role` enforced by the gateway. There is a `role` edge type now, folded
+  into the `role` FIELD `agent/hcl.py::_lambda` already reads, so it took effect
+  with no builder change at all. Lambda only -- ec2/ecs reach a role through an
+  auto-role plus an instance profile / `task_role_arn` and read no such field, so
+  those pairs stay `unmodelled` rather than authoring a field nothing consumes
+  (docs/limits.md names what honouring them needs).
+  **(2) compute→compute IAM edges granted nothing.** `edgeDataForConnection`
+  picked "whichever end is not compute" as the resource, which has no answer when
+  both are -- and `ecs → lambda` (invoke) and `ec2 → ecs` (RunTask) are both
+  explicitly in the catalog. The user got a cyan edge with nothing ticked and an
+  `aws_iam_role` with no policy on it. The rule is now "which end is an IAM
+  target", which also gets `ecs → ec2` right where a plain target-end tie-break
+  would not.
+  **(3) `edge.kind` was unvalidated where it is authored.** `odin chat` took a
+  free string, so an invented kind round-tripped through a revision looking real.
+  Validated against `spec/translate.py::EDGE_KINDS` now. This is the SMALLER
+  half and must not be read as more: `hcl.py`'s subscription and ALB passes match
+  on NODE kinds and never read `edge.kind`, so a valid `iam` edge between sns and
+  sqs still builds a real subscription.
+  **(4) `network` meant "no model" 340 times out of 341.** Renamed to
+  `unmodelled` ("Not modelled"), with `target` (`alb↔ecs`) and `subscription`
+  (`sns↔sqs`) lifted out as their own named types. Both are **presentational** by
+  design and no builder may gate on them: every saved canvas types those edges
+  `network`, so requiring the new name without a migration in the same commit
+  would drop the subscription from the generated HCL and `tofu` would DESTROY the
+  live subscription on the next apply -- silently, because `_desired_subs` only
+  ever ADDS. `network` stays a valid stored kind and a defined type.
+  **Plus a fifth, found while measuring:** an sns/sqs edge drawn BACKWARDS was a
+  silent no-op -- both consumers key on the drawn direction, so `sqs → sns` gave
+  a green Apply, no subscription, and no `unsupported`/`wiring_errors` entry, with
+  no test in either direction. `spec/translate.py` now orients the edge
+  topic→queue, which fixes `hcl.py` and `reconciler.py::_desired_subs` at once
+  without either file changing. Every guard mutation-tested.
 
 - [x] **Containment is strict (owner decision, 2026-07-28).** A leaf counted as
   inside a container once its CENTRE crossed the boundary, so a box visibly
