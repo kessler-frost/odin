@@ -1839,16 +1839,6 @@ def create_apply_full_router(
             # checks that can disagree.
             await drift.sweep_compute(stores, env)
             unhealthy = _known_faults(stores, env)
-            if recovering and not unhealthy:
-                # It WORKED -- and that is exactly why it has to be said out
-                # loud. See `_recovering_resources`: this apply destroyed and
-                # rebuilt a container the user never asked it to touch, and for
-                # rds the data did not come with it.
-                body["recovered_resources"] = recovering
-                body["note"] = (
-                    "desired state applied; "
-                    + "; ".join(map(_recovered_line, recovering))
-                )
             if unhealthy:
                 body["status"] = "applied_resources_unhealthy"
                 body["unhealthy_resources"] = unhealthy
@@ -1860,6 +1850,32 @@ def create_apply_full_router(
                     + "; ".join(map(_unhealthy_line, unhealthy))
                     + " — fix and re-apply"
                 )
+        # The recovery disclosure, on EVERY exit path rather than only the green
+        # one -- see `_recovering_resources` for what it is and why it exists.
+        #
+        # Placed out here deliberately. It first lived inside the
+        # `status == "applied"` block, which meant an unrelated ECS shortfall
+        # (`applied_services_unhealthy`, set earlier and skipping everything
+        # after it) SUPPRESSED it -- so a database odin had just emptied went
+        # unmentioned precisely when something else was already going wrong,
+        # which is when a user can least afford a missing fact.
+        #
+        # It is also the more honest shape. The cost does not depend on the
+        # OUTCOME: `create_db` clears the same-name remnant before it boots a
+        # replacement, so the old data is gone the moment the re-create starts,
+        # whether or not the new container ever comes up. Reporting it only on
+        # success would have hidden it in exactly the failure case where it
+        # matters most. Whether the result is HEALTHY is a separate question,
+        # answered separately by `unhealthy_resources`.
+        #
+        # APPENDS to any existing note rather than replacing it: the note may
+        # already carry a tofu failure or an unhealthy resource, and those are
+        # not this fact's to overwrite.
+        if recovering:
+            body["recovered_resources"] = recovering
+            recovered = "; ".join(map(_recovered_line, recovering))
+            prior = body.get("note")
+            body["note"] = f"{prior} Also: {recovered}" if prior else f"desired state applied; {recovered}"
         await reconciler.tick()  # kick an immediate pass; the loop continues it
         return JSONResponse(status_code=200, content=body)
 

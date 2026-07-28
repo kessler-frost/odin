@@ -392,18 +392,50 @@ async def test_happy_path_refinement_is_kept():
 
 @pytest.mark.integration
 @pytest.mark.skipif(_NO_TOFU, reason="tofu not on PATH")
-async def test_real_sdk_refines_a_three_node_canvas():
+async def test_real_sdk_translates_a_three_node_canvas():
+    """The real Claude Code CLI subprocess, end to end.
+
+    ## What this may and may not assert
+
+    It used to assert `refined is True`, and that failed in a full integration
+    run against a perfectly healthy odin: the agent RAN, looked at a skeleton
+    for three independent resources, and proposed no change --
+    `agent proposed no refinement -- using the deterministic skeleton`. Nothing
+    was broken. The test was asserting a MODEL'S CHOICE, which is not odin's to
+    promise: refinement is an optional decoration over a deterministic
+    translation (`ODIN_TRANSLATE_REFINE`, off by default), so "the agent had
+    nothing to add" is a correct outcome, not a failure.
+
+    What odin DOES owe, and what is asserted instead:
+
+      * the SDK is genuinely reachable and the pass really ran -- an
+        `AiDisabled` fallback (no `claude` CLI, not signed in) still FAILS
+        here, because a test that passes without ever reaching the agent would
+        prove nothing at all;
+      * whatever comes back is USABLE -- non-empty files;
+      * the guardrail's invariant holds against the real agent: arguments and
+        comments may change, the resource SET may not;
+      * the outcome is one odin recognises. An unrecognised note fails, so a
+        new fallback path cannot quietly start being the answer here.
+    """
     stack = Stack(resources=(
         ResourceDesired(id="uploads", kind="s3"),
         ResourceDesired(id="jobs", kind="sqs"),
         ResourceDesired(id="items", kind="dynamodb"),
     ))
     result = await translate(stack)
-    assert result.refined is True
-    assert result.files  # the agent-refined (guardrail-passed) files, not empty
-    # The guardrail's own invariant, re-asserted here against the real agent:
-    # arguments/comments may change, the resource SET may not.
+
+    assert result.files, result
     assert hcl.resource_set(result.files) == hcl.resource_set(generate_tf(stack).files)
+
+    note = " ".join(result.notes)
+    assert "no AI refine pass" not in note, (
+        f"the agent was never reached, so this test proved nothing: {note!r}. "
+        "The `claude` CLI must be on PATH and signed in for this integration test."
+    )
+    # `refined` True means it proposed something the guardrail accepted; the two
+    # notes are the other outcomes odin models. Anything else is new.
+    assert result.refined or "proposed no refinement" in note or "refinement rejected" in note, result
 
 
 # --- release finding #5: the SDK timeout default + the unchanged-canvas cache
