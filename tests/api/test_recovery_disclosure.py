@@ -31,7 +31,9 @@ rule 1 in miniature -- a guard wired to a signal that never arrives.
 """
 from __future__ import annotations
 
-from odin.gateway.models import rdsctl
+from pathlib import Path
+
+from odin.gateway.models import lambdactl, rdsctl
 from odin.gateway.stores import SynthStores
 from odin.server import _recovered_line, _recovering_resources
 
@@ -50,9 +52,16 @@ def _failed_fn(
     stores: SynthStores, name: str = "worker", reason: str | None = "its container was removed outside odin",
     last_update: str = "Successful",
 ) -> None:
+    # The FULL record shape `converge_functions` reads, not the subset
+    # `_recovering_resources` needs -- the drift ratchet below runs the real
+    # converge against these, and a thin seed would only prove the getter.
     stores.lambdactl.set(ENV, f"fn:{name}", {
         "function_name": name, "state": "Failed", "state_reason": reason,
         "state_reason_code": "InternalError", "last_update_status": last_update,
+        "last_update_status_reason": None, "last_update_status_reason_code": None,
+        "runtime": "python3.12", "handler": "lambda_function.lambda_handler",
+        "environment": {}, "memory_size": 128,
+        "function_arn": f"arn:aws:lambda:us-east-1:000000000000:function:{name}",
     })
 
 
@@ -140,3 +149,67 @@ def test_the_lambda_line_does_not_claim_data_loss(tmp_path):
     line = _recovered_line({"kind": "lambda", "node": "worker", "reason": "it was not running"})
     assert "worker" in line and "re-created" in line
     assert "data did not survive" not in line
+
+
+# --- the drift ratchet ---------------------------------------------------------
+#
+# `_recovering_resources` PREDICTS what the converges are about to do, by reading
+# the same records against the same criteria. Two independent copies of one rule
+# is how a report starts lying quietly: loosen `converge_functions`' skip and the
+# apply would announce recoveries it never performed; tighten it and a real one
+# would go unannounced -- and in BOTH directions every existing test still passes,
+# because each half is individually correct.
+#
+# So these tie the two together BEHAVIOURALLY: the same store, the real converge,
+# and the claim checked against what it actually spawned. Same shape as
+# `capacity.py`'s `DEFAULT_TASK_MEMORY_MIB` mirror.
+
+
+class _NeverRuns:
+    """A substrate whose containers are never actually built -- these assert WHICH
+    records a converge claims, not that a container comes up."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def code_dir(self, env, function_name):
+        return Path("/nonexistent") / env / function_name
+
+    async def ensure(self, *args, **kwargs):
+        raise RuntimeError("not a real substrate")
+
+
+async def test_the_lambda_claim_matches_what_converge_functions_really_spawns(tmp_path):
+    stores = SynthStores(tmp_path)
+    _failed_fn(stores, "worker")
+    _failed_fn(stores, "mid-redeploy", last_update="InProgress")  # converge skips this one
+    stores.lambdactl.set(ENV, "fn:healthy", {"function_name": "healthy", "state": "Active"})
+
+    claimed = {i["node"] for i in _recovering_resources(stores, ENV) if i["kind"] == "lambda"}
+    spawned = lambdactl.converge_functions(stores, ENV, substrate=_NeverRuns())
+    for task in spawned:  # they raise by design; don't leave them unretrieved
+        task.cancel()
+
+    assert claimed == {"worker"}
+    assert len(spawned) == len(claimed), (
+        f"the apply claimed {claimed} but converge_functions spawned {len(spawned)} redeploys — "
+        "the report and the repair have drifted apart"
+    )
+
+
+async def test_the_rds_claim_matches_what_converge_db_instances_really_spawns(tmp_path):
+    stores = SynthStores(tmp_path)
+    _failed_db(stores, "app-db")
+    stores.rdsctl.set(ENV, "db:healthy-db", {
+        "db_instance_identifier": "healthy-db", "status": rdsctl.AVAILABLE,
+    })
+
+    claimed = {i["node"] for i in _recovering_resources(stores, ENV) if i["kind"] == "rds"}
+    spawned = rdsctl.converge_db_instances(stores, ENV, substrate=_NeverRuns())
+    for task in spawned:
+        task.cancel()
+
+    assert claimed == {"app-db"}
+    assert len(spawned) == len(claimed), (
+        f"the apply claimed {claimed} but converge_db_instances spawned {len(spawned)} re-creates"
+    )
