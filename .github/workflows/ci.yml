@@ -21,10 +21,30 @@ jobs:
           enable-cache: true
       - name: Install dependencies
         run: uv sync --extra dev
+      # `nebula-cert` is a REAL dependency of the gateway's VPC/SG tests: they
+      # bootstrap an actual Nebula CA rather than faking one, which is the whole
+      # reason those tests are worth having. Without it 85 of them failed with
+      # `nebula-cert: command not found` -- CI had been red for every run since
+      # 2026-07-26 while the suite was green locally, purely because the dev
+      # machine has it from brew and the runner does not. Version tracks
+      # `compute/cloud_init.py::NEBULA_VERSION`, so one mesh protocol is spoken
+      # everywhere.
+      - name: Install nebula
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -n 's/^NEBULA_VERSION = "\(.*\)"/\1/p' src/odin/compute/cloud_init.py)"
+          test -n "$VERSION"
+          curl -fsSL -o /tmp/nebula.tar.gz \
+            "https://github.com/slackhq/nebula/releases/download/v${VERSION}/nebula-linux-amd64.tar.gz"
+          sudo tar -xzf /tmp/nebula.tar.gz -C /usr/local/bin nebula nebula-cert
+          nebula-cert -version
       - name: Lint
         run: uv run ruff check .
+      # `-n auto`: measured 8.6x locally, and CI was taking ~11 minutes serially.
+      # The precondition is IDENTICAL results, not merely a green run -- verified
+      # by comparing full pass/fail counts both ways before adopting.
       - name: Test
-        run: uv run pytest -q
+        run: uv run pytest -q -n auto
       - name: Install OpenTofu
         if: matrix.python-version == '3.12'
         uses: opentofu/setup-opentofu@v2
