@@ -17,7 +17,13 @@ from odin.agent.hcl import generate_tf
 from odin.agent.import_tf import parse_hcl_text
 from odin.spec.translate import canvas_to_stack
 
-README = (Path(__file__).resolve().parents[2] / "README.md").read_text()
+_ROOT = Path(__file__).resolve().parents[2]
+README = (_ROOT / "README.md").read_text()
+# The translation-coverage claim moved out of the README in v0.8.10, when the
+# front page was cut from 803 lines to ~250 and the deep material went to docs/.
+# This test follows the CLAIM, not the file it used to live in -- pinning prose
+# to behaviour only works if it keeps pointing at the prose.
+INTERNALS = (_ROOT / "docs" / "internals.md").read_text()
 
 CANVAS = {
     "nodes": [
@@ -94,8 +100,8 @@ def test_the_readme_describes_the_coverage_import_actually_has():
     must also still separate COVERAGE from FIDELITY: equal kind coverage does not
     make a round trip lossless, and what it does cost is named in Known limits.
     """
-    claim = re.search(r"- \*\*Translation\*\*.*?(?=\n- \*\*)", README, re.S)
-    assert claim, "the Translation bullet moved -- re-point this test"
+    claim = re.search(r"- \*\*Translation\*\*.*?(?=\n- \*\*)", INTERNALS, re.S)
+    assert claim, "the Translation bullet moved again -- re-point this test at it"
     text = claim.group(0)
     for kind in ("aws_security_group", "aws_ecr_repository", "aws_instance",
                  "aws_ecs_service", "aws_lambda_function"):
@@ -134,3 +140,17 @@ def test_a_drawn_GRANT_does_not_reach_the_terraform_and_says_so():
 
     # ...and the round trip really does drop it, which is what the warning is for.
     assert parse_hcl_text(project.files["main.tf"]).edges == []
+
+
+def test_the_README_still_warns_that_a_drawn_GRANT_is_not_in_the_terraform():
+    """The front page carries the ONE consequence a reader has to know before
+    taking `main.tf` anywhere: their permissions are not in it.
+
+    Kept on the README rather than only in docs/limits.md because it is the
+    difference between "this file describes my architecture" and "this file
+    describes my architecture minus its security posture", and someone piping
+    `odin translate` into a repo will not have read the limits page first.
+    """
+    assert "not\nwritten into the generated Terraform" in README or \
+           "not written into the generated Terraform" in README.replace("\n", " "), README[:0]
+    assert "docs/limits.md" in README, "and it should point at the full explanation"
