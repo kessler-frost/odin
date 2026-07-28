@@ -151,6 +151,10 @@ def test_the_README_still_warns_that_a_drawn_GRANT_is_not_in_the_terraform():
     describes my architecture minus its security posture", and someone piping
     `odin translate` into a repo will not have read the limits page first.
     """
-    assert "not\nwritten into the generated Terraform" in README or \
-           "not written into the generated Terraform" in README.replace("\n", " "), README[:0]
+    # Asserted by MEANING, not by an exact phrase: the first version of this test
+    # pinned one wording and broke the moment the README was reworded, which
+    # teaches the next person to loosen the test instead of checking the claim.
+    prose = " ".join(README.split())
+    assert "enforced by odin's gateway" in prose
+    assert "generated Terraform" in prose
     assert "docs/limits.md" in README, "and it should point at the full explanation"

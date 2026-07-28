@@ -106,13 +106,13 @@ They are listed because finding one by surprise is worse than reading it here.
   a slow or loaded machine. The default deliberately stays put: a longer one makes
   a genuinely hung boot take longer to report, and the two look identical until
   the timeout fires.
-- **RDS** is Terraform-managed (`aws_db_instance` → a real Postgres container)
+- **RDS** is Terraform-managed (`aws_db_instance` → a Postgres container)
   and Postgres-only: MySQL or MariaDB is declined with the reason.
   `allocated_storage` and `instance_class` round-trip faithfully but resize
   nothing, there are no snapshots, and a node's label must be a valid RDS
   identifier (lowercase, hyphen-separated).
-- **Nebula** is live single-host. VPC and SG config compiles to real Nebula
-  network and firewall primitives, and every VPC-joined EC2 VM runs a real
+- **Nebula** is live single-host. VPC and SG config compiles to Nebula
+  network and firewall primitives, and every VPC-joined EC2 VM runs a
   `nebula` daemon carrying the compiled SG firewall. The per-environment
   lighthouse is fully unprivileged when it runs (no root, no sudo, no one-time
   setup) — and it runs **once the first member joins the mesh**, stopping when
