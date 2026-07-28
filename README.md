@@ -543,7 +543,13 @@ prose explanation of a failure, and the evidence it reads is still there in
   forwards to a real backing or answers from its own per-service model store. EC2,
   VPC, SG, IAM, ECR, Lambda and ECS have no open-source AWS API to borrow, so odin
   owns the model and binds it to a real substrate.
-- **Translation** (`src/odin/agent/`) is deterministic in both directions.
+- **Translation** (`src/odin/agent/`) is deterministic in both directions, and
+  the two directions do not cover the same ground. Canvas → Terraform covers
+  every kind odin builds. Terraform → canvas covers 17 resource types today —
+  not `aws_instance`, `aws_ecs_service`/`_task_definition`/`_cluster`,
+  `aws_security_group`, `aws_lambda_function` or `aws_ecr_repository`, which
+  come back as LISTED unsupported entries rather than being silently dropped, so
+  an import tells you exactly what it could not take.
   **Runtime:** real containers via Colima (default) or inside a Lima VM
   (`src/odin/runtime/`), and a real Lima VM per EC2 node (`src/odin/compute/`).
 - **Control loop:** a Spec Store (Stack = desired, World = observed) with a pure,
