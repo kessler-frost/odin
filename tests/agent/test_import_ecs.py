@@ -148,15 +148,119 @@ WIRED = {
 }
 
 
-def test_the_env_wiring_is_reported_as_unrecoverable_naming_the_producer():
-    """It is NOT in the HCL by design (a resolved DATABASE_URL carries the
-    password), so an import cannot bring it back. Saying nothing would hand
-    someone a service that starts with no configuration it used to have."""
-    result, tf = _round_trip(WIRED)
-    assert "DATABASE_URL" not in tf, "a resolved credential must never reach the generated HCL"
+# A project odin did NOT write: it has ordering and no `odin:ref:` tags, which
+# is the only shape whose wiring genuinely cannot be rebuilt. The two tests below
+# used to generate their fixture, which meant that the day the emitter started
+# tagging refs they would have been measuring the recoverable case while claiming
+# the unrecoverable one -- passing, and testing something else.
+WIRED_HCL = '''
+resource "aws_db_instance" "app_db" {
+  identifier = "app-db"
+  engine     = "postgres"
+}
+
+resource "aws_ecs_cluster" "odin" {
+  name = "odin"
+}
+
+resource "aws_ecs_task_definition" "api_taskdef" {
+  family                = "api"
+  container_definitions = "[{\\"name\\": \\"api\\", \\"image\\": \\"nginx:alpine\\"}]"
+}
+
+resource "aws_ecs_service" "api" {
+  name            = "api"
+  cluster         = aws_ecs_cluster.odin.id
+  task_definition = aws_ecs_task_definition.api_taskdef.arn
+
+  depends_on = [aws_db_instance.app_db]
+}
+'''
+
+
+def test_no_resolved_credential_reaches_the_generated_hcl():
+    """This test used to assert `"DATABASE_URL" not in tf`, and it was renamed
+    from `..._is_reported_as_unrecoverable_...` because BOTH halves of the old
+    name became untrue: the wiring is recoverable now, and the check it made was
+    not the check it meant.
+
+    Greping for the variable NAME was always a proxy. Once a ref travels as
+    `"odin:ref:DATABASE_URL" = "app-db.DATABASE_URL"`, the proxy fires on a tag
+    KEY that carries no secret at all, while the property actually worth
+    defending -- no resolved VALUE in the file -- would still hold. Measured: the
+    only occurrence of the password is `aws_db_instance.password`, the master
+    password Terraform must send in order to create the database, and there is no
+    `postgresql://` string anywhere.
+
+    So it asserts the real thing in three parts: the credential is absent
+    everywhere but the one block that legitimately needs it, the resolved URL
+    SCHEME is absent entirely, and -- positively, so the test cannot pass by the
+    file simply not having wiring in it -- the reference form is present.
+
+    Mutation-tested by making `_ref_tags` emit a resolved `postgresql://...`
+    value instead of `<producer>.<attr>`: this test fails, the old
+    name-substring assertion did not.
+    """
+    canvas = {
+        "nodes": [
+            {"id": "d1", "type": "rds", "position": {"x": 0, "y": 0},
+             "data": {"label": "app-db", "password": "canvas-password-fixture"}},
+            {"id": "c1", "type": "ecs", "position": {"x": 0, "y": 0},
+             "data": {"label": "api", "image": "nginx:alpine", "count": "1", "port": "80",
+                      "env": {"DATABASE_URL": "${{app-db.DATABASE_URL}}",
+                              "API_TOKEN": "canvas-token-fixture"}}},
+        ],
+        "edges": [],
+    }
+    tf = generate_tf(canvas_to_stack(canvas)).files["main.tf"]
+
+    # 1. The credential appears ONLY in the aws_db_instance block.
+    blocks = [b for b in tf.split("\nresource ") if "canvas-password-fixture" in b]
+    assert len(blocks) == 1, blocks
+    assert blocks[0].startswith('"aws_db_instance"'), blocks[0][:60]
+
+    # 2. No RESOLVED endpoint, in any form. This is the string a ref becomes at
+    #    launch, and the one that carries the password into tfstate if emitted.
+    assert "postgresql://" not in tf
+    # 3. ...nor a static env value, which a user may well have typed a secret into.
+    assert "canvas-token-fixture" not in tf
+
+    # 4. Positively: the REFERENCE is carried, so this cannot pass vacuously on a
+    #    file that simply has no wiring.
+    assert '"odin:ref:DATABASE_URL" = "app-db.DATABASE_URL"' in tf
+
+
+def test_a_file_without_ref_tags_reports_the_wiring_as_unrecoverable():
+    """The case the old test's name described, on a fixture that genuinely has
+    it: a hand-authored project with ordering and no `odin:ref:` tags."""
+    result = parse_hcl_text(WIRED_HCL)
     (warning,) = [w for w in result.warnings if "wiring" in w]
     assert "app-db" in warning, warning
     assert "re-add the env references" in warning, warning
+
+
+def test_the_env_wiring_round_trips_from_odins_own_output():
+    """The READ half, against the REAL emitter now that it is on develop: the
+    refs come back and the ordering comes back with them."""
+    canvas = {
+        "nodes": [
+            {"id": "d1", "type": "rds", "position": {"x": 0, "y": 0}, "data": {"label": "app-db"}},
+            {"id": "c1", "type": "ecs", "position": {"x": 0, "y": 0},
+             "data": {"label": "api", "image": "nginx:alpine", "count": "1", "port": "80",
+                      "env": {"DATABASE_URL": "${{app-db.DATABASE_URL}}"}}},
+        ],
+        "edges": [],
+    }
+    first = generate_tf(canvas_to_stack(canvas)).files["main.tf"]
+    imported = parse_hcl_text(first)
+    api = next(n for n in imported.nodes if n["type"] == "ecs")
+    assert api["data"]["env"] == {"DATABASE_URL": "${{app-db.DATABASE_URL}}"}
+    assert [w for w in imported.warnings if "wiring" in w] == []
+
+    second = generate_tf(
+        canvas_to_stack({"nodes": imported.nodes, "edges": imported.edges})
+    ).files["main.tf"]
+    assert second == first, "generate -> import -> generate must be byte-stable"
 
 
 def test_not_even_the_ordering_survives_and_the_warning_says_so():
@@ -169,13 +273,21 @@ def test_not_even_the_ordering_survives_and_the_warning_says_so():
     "only the ORDERING survives" was wrong in the direction that matters: it
     would have reassured someone that tofu still sequenced their database ahead
     of the service consuming it.
+
+    v0.8.14 narrows WHEN this holds without changing that it holds: the refs are
+    recoverable now, from the `odin:ref:<VAR>` tags `hcl.py` emits, so a file
+    that HAS them round-trips its ordering (see
+    `tests/agent/test_import_wiring.py`). `WIRED_HCL` deliberately has none -- a
+    hand-authored project, or one from an older odin -- and for it the reasoning
+    above is unchanged and the warning must still say so.
     """
-    result, _tf = _round_trip(WIRED)
+    result = parse_hcl_text(WIRED_HCL)
     regenerated = generate_tf(canvas_to_stack(
         {"nodes": result.nodes, "edges": result.edges})).files["main.tf"]
     assert "depends_on" not in regenerated
     (warning,) = [w for w in result.warnings if "wiring" in w]
-    assert "NEITHER the values NOR the ordering" in warning, warning
+    assert "odin re-derives that FROM the references" in warning, warning
+    assert "loses the ordering too" in warning, warning
 
 
 def test_a_service_whose_task_definition_is_missing_says_so():

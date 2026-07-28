@@ -48,13 +48,19 @@ They are listed because finding one by surprise is worse than reading it here.
   so an `API_TOKEN = "..."` you set on the canvas is not in `main.tf` and is not
   in `terraform.tfstate`. It arrives at launch, from `gateway/wiring.py`, and
   nowhere else.
-- **Whether an IMPORT recovers either of the two above is the import direction's
-  half, and at the time of writing it does not.** The generator states them; the
-  HCL reader has not been taught to read `odin:ref:` tags back into a node's
-  `env`, nor `egress` blocks back into `egressRules`. Until it is, a round trip
-  through `odin translate import` still drops both — for a different reason than
-  before (the file now carries them), which is the only part this entry is
-  claiming.
+- **The IMPORT direction reads both of those back**, so the round trip closes:
+  `odin translate import` turns `odin:ref:` tags into the node's `env` (for ecs
+  and lambda) and `egress` blocks into `egressRules`, and a re-generated project
+  carries the same wiring and the same `depends_on`. Two residues, both narrower
+  than what they replace. **A project odin did not generate has no `odin:ref:`
+  tags**, and for it nothing has changed: only the ordering is in the file, odin
+  re-derives `depends_on` *from* the references it cannot recover, so neither
+  survives — the import names the producers and says to re-add the references.
+  And **a rule odin cannot express empties the field**, which for egress is the
+  dangerous direction: an empty `egressRules` is exactly what selects the
+  allow-all default, so a group whose only outbound rule is a port range or an
+  IPv6 CIDR does not come back with no egress, it comes back with all of it. The
+  import says which of the two happened rather than leaving you to find it.
 - **Some arguments are re-emitted with odin's own value whatever you wrote**, and
   each one warns on its own line — `imported with CHANGED argument(s) -- odin
   substitutes its own value` — kept separate from the `imported without unmodeled

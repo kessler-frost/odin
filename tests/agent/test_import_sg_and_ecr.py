@@ -137,15 +137,23 @@ resource "aws_security_group" "locked" {
 """
 
 
-def test_a_restricted_egress_is_reported_because_it_comes_back_WIDE_OPEN():
-    """The dangerous direction. odin has no outbound field, so this group's
-    egress cannot survive -- and an import that took it silently would hand
-    someone a group that permits everything outbound while looking imported
-    cleanly."""
+def test_a_restricted_egress_is_now_CARRIED_rather_than_reported_as_lost():
+    """v0.8.14 closed this. Until then odin had no canvas field for outbound
+    rules, so the best this import could do was warn that a restricted group came
+    back UNRESTRICTED -- which is what this test used to assert.
+
+    `hcl-generate` added an `egressRules` field and real `egress` emission, so the
+    rules survive and the warning would now be a caveat outliving its fix
+    (honesty rule 3). The direction of the assertion flips: the rule must be on
+    the node, and nothing may claim it was lost. See
+    `tests/agent/test_import_wiring.py` for the round trip and for the case that
+    still IS lossy (a rule odin cannot express, which empties the field and
+    therefore does come back wide open)."""
     result = parse_hcl_text(_RESTRICTED_EGRESS)
-    assert _node(result, "locked-sg")["data"]["ingressRules"] == "tcp:443:0.0.0.0/0"
-    (warning,) = [w for w in result.warnings if "egress" in w]
-    assert "UNRESTRICTED" in warning, warning
+    data = _node(result, "locked-sg")["data"]
+    assert data["ingressRules"] == "tcp:443:0.0.0.0/0"
+    assert data["egressRules"] == "tcp:443:10.0.0.0/16"
+    assert [w for w in result.warnings if "egress" in w] == []
 
 
 _PORT_RANGE = """

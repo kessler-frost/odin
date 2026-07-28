@@ -1493,12 +1493,32 @@ index-to-index deletion on this file.
      it RESOLVES to at launch carries the password, and that is built by
      `gateway/wiring.py` long after the file is written, so it cannot appear.
      Static env entries are still never emitted, for the same reason (a user may
-     have typed a credential into one). What remains is the READ half: teaching
-     the HCL importer to put those tags back into a node's `env`, which also
-     restores the ordering for free, since `depends_on` is re-derived from the
-     refs.
-  4. **sqs/sns tags are dropped on import** (`_CARRIED_ATTRS` lists only `name`
-     while `hcl.py` emits tags for every kind). Small and mechanical.
+     have typed a credential into one).
+
+     The READ half is CLOSED too, in the same release: the importer puts those
+     tags back into a node's `env`, for **ecs and lambda** both. The ordering did
+     come back for free, and the reason is worth keeping — `depends_on` is
+     `sorted(set(...))` over the ref TARGETS, so it is a function of *which* refs
+     exist and not of their order, which means recovering the refs recovers it
+     with no ordering logic in the importer at all. Verified by generating,
+     importing and generating again and diffing the `depends_on` lines, and then
+     through the real `odin import-tf` against a running server. The literal
+     `${{...}}` text was never an option and that was MEASURED rather than
+     assumed: OpenTofu rejects it as a parse error, which fails the whole
+     project, and the escaped form uses characters outside AWS's tag-value set.
+     A project odin did not generate has no such tags and its wiring still cannot
+     be rebuilt; the import says so, and says it only in that case.
+  4. ~~**sqs/sns tags are dropped on import.**~~ CLOSED in v0.8.14 — and it was
+     **four** kinds, not two: `dynamodb` and `iam_role` had the identical defect
+     and were not in the report, which is why the fix went in as a shape rather
+     than as the two instances named. It was also two bugs wearing one coat,
+     since `hcl.py` stamps an `odin:node` tag on every primary: those four kinds
+     *also* printed `imported without unmodeled attribute(s): tags` on every
+     import of odin's own output, about a tag odin itself had just written.
+     `tags` is unioned in centrally now instead of listed per kind, the second
+     list that could disagree with the first (`_TAGGED_KINDS`) is deleted, the
+     whole `odin:` tag namespace is reserved rather than the one key, and a test
+     parametrized over `_KIND` covers a kind added later.
   5. ~~**Envs are never removable.**~~ CLOSED. `odin env rm <name>` (POST
      `/envs/rm`) is the decommission verb `odin destroy` deliberately is not: the
      same teardown, then the env's `.odin/<name>/` directory, its issued gateway
@@ -1549,9 +1569,12 @@ index-to-index deletion on this file.
     (unappliable without it), security groups (less protected), and the companion
     key pair (unreachable). One warning each, not one vague line.
   - **ecs** — one node, three resources. The task definition folds on; placement
-    survives. Its canvas WIRING cannot: env refs are deliberately never written
-    into the HCL, and since odin re-derives `depends_on` from those refs, neither
-    the values nor the ordering come back.
+    survives. Its canvas WIRING could not: env refs were deliberately never
+    written into the HCL, and since odin re-derives `depends_on` from those refs,
+    neither the values nor the ordering came back.
+    *(v0.8.14 closed this too, with an `odin:ref:<VAR>` tag carrying the
+    reference rather than its resolved value. The reasoning above still holds for
+    a file odin did not generate, which has no such tags.)*
   - **lambda** — config from the HCL, body from the zip beside it. It also
     exposed a defect older than the feature: a lambda's AUTO-GENERATED role
     imported as a node the user never drew, so a one-lambda canvas round-tripped
