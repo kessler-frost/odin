@@ -1216,8 +1216,9 @@ released tag, not asserted), so v0.7.7 regresses nothing. They are recorded
 here rather than hacked green, because making them pass in five minutes would
 have meant retiring a claim rather than fixing a bug.
 
-- [~] **`test_a_noop_apply_cannot_report_success_*` — SPLIT (owner decision,
-  2026-07-27). ECS is done; LAMBDA still to mirror.** The wiring guard now
+- [x] **`test_a_noop_apply_cannot_report_success_*` — SPLIT (owner decision,
+  2026-07-27). ECS split; LAMBDA resolved differently, see below.** The wiring
+  guard now
   refuses an apply carrying an unresolvable `${{ghost.ENDPOINT}}` ref with a
   409, which made these tests' route to a zero-task service unreachable by
   design. Resolved by splitting rather than retiring: one test asserts the
