@@ -1618,6 +1618,26 @@ def create_apply_full_router(
         # A bare `TaskRuntime()` (not this app's `runtime`) deliberately: it
         # must be the SAME substrate that launched these containers, and
         # ecsctl's own `runtime or TaskRuntime()` default is what did.
+        # Correct the records BEFORE converging anything.
+        #
+        # `converge_services`/`converge_functions`/`converge_db_instances` only
+        # ever act on a record already marked failed, and the only things that
+        # write that mark are this sweep and `DriftSweeper`'s cadence. The sweep
+        # below used to run ONLY after the converges, so an Apply converged
+        # whatever the PREVIOUS sweep had marked and recovery needed a SECOND
+        # Apply. Measured end to end on a killed database: `/world` showed
+        # `crashed` with `container ... is not running (exit 137) — re-Apply to
+        # recreate`, the Apply that followed logged no convergence at all, and
+        # the database never came back. The status told the user to do the
+        # exact thing they had just done.
+        #
+        # Safe here precisely because `_db_records`/`_function_records` only
+        # sweep what CLAIMS to be up (`available`/`Active` with a real
+        # endpoint): a resource this apply is still creating is `creating` and
+        # is skipped, which is the concern the post-apply sweep's own comment
+        # raises. That later sweep stays exactly where it is -- it verifies
+        # what this one enabled.
+        await drift.sweep_compute(stores, env)
         converging = await ecsctl.converge_services(stores, env, TaskRuntime(), keystore, gateway_port())
         # The same recovery for lambda, and for the same reason: a function's
         # RIE container is its EXECUTION ENVIRONMENT, not a TF resource -- an
@@ -2099,7 +2119,7 @@ def create_app(
     # test) now reads and writes its OWN canvas instead of the real one under
     # the checkout. The module constant stays as the documented location.
     canvas_path = _store.root / CANVAS_NAME
-    app.include_router(create_canvas_router(canvas_path))
+    app.include_router(create_canvas_router(canvas_path, ws=ws_manager))
     app.include_router(
         create_apply_router(
             _store, reconciler_for, gateway_keystore, tf_runner, lambda: gateway_port_actual, env_epoch,

@@ -158,6 +158,10 @@ class MeshSidecar:
         # The `nebula-cert` subprocess seam (same convention as
         # `NebulaManager`/`InstanceVm`): None means the real CLI.
         self._run = runner
+        # Why the last `ensure()` returned None, when the answer was not
+        # "there is no mesh here". `None` means the last call had nothing to
+        # report -- it either joined, or the env simply has no mesh drawn.
+        self.last_failure: str | None = None
 
     # ---- paths / naming ----
     def _nebula_dir(self) -> Path:
@@ -252,12 +256,31 @@ class MeshSidecar:
         Never raises -- like `InstanceVm._activate_nebula`, mesh wiring must
         not fail an otherwise-healthy backing (the host path still works)."""
         if not self.enabled():
+            self.last_failure = None  # no mesh drawn: not a failure, an absence
             return None
         try:
-            return await self._join(target, member, groups, firewall or DEFAULT_FIREWALL, revision)
+            overlay_ip = await self._join(target, member, groups, firewall or DEFAULT_FIREWALL, revision)
         except Exception as exc:  # noqa: BLE001 -- deliberately broad, see docstring
+            # `None` alone cannot say WHICH of three things happened -- no mesh
+            # drawn, joined-but-no-overlay-yet, or the join genuinely blew up --
+            # and collapsing them is honesty rule 2 in miniature. A hard
+            # `AttributeError` in here once surfaced to the user as a
+            # decorative security group: the mesh was never joined, the
+            # firewall gated nothing, and every layer above reported success.
+            #
+            # The contract still holds (mesh wiring must not fail an
+            # otherwise-healthy backing, and the host path still works), so
+            # this records the reason rather than raising it. `last_failure` is
+            # what lets a caller say "the mesh join failed BECAUSE ..." instead
+            # of silently treating it as "there is no mesh here".
+            self.last_failure = f"{type(exc).__name__}: {exc}"
             log.warning("mesh join failed for %s (env %r): %s", target, self._env, exc)
             return None
+        self.last_failure = (
+            None if overlay_ip is not None
+            else "the env's overlay is not initialised yet (no lighthouse address recorded)"
+        )
+        return overlay_ip
 
     async def _join(
         self, target: str, member: str, groups: tuple[str, ...],

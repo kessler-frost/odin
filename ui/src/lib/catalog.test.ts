@@ -16,7 +16,7 @@
 // warns about. Read the real thing and the test breaks when reality moves.
 import { describe, expect, test } from 'bun:test';
 
-import { BUILTINS, CATALOG, catalogIamActions } from './catalog';
+import { BUILTINS, CATALOG, PALETTE, catalogByType, catalogIamActions, isPlaceholder } from './catalog';
 
 const TRANSLATE = new URL('../../../src/odin/spec/translate.py', import.meta.url).pathname;
 const MARKER = '(placeholder)';
@@ -128,5 +128,26 @@ describe('the whole rendered sidebar', () => {
     const body = block.split('};')[0];
     expect(body).toContain('BUILTINS.map');
     expect([...body.matchAll(/^\s*(\w+):\s*'[\w-]+',$/gm)].map((m) => m[1])).toEqual([]);
+  });
+});
+
+describe('the palette hides placeholder kinds', () => {
+  test('offers no tile that Apply would silently skip', () => {
+    const offered = PALETTE.filter((s) => isPlaceholder(s.sublabel));
+    expect(offered).toEqual([]);
+  });
+
+  test('still keeps every kind in CATALOG, so a saved canvas renders', () => {
+    // Palette-only hiding. A canvas authored earlier (or by `odin canvas set`)
+    // may contain a placeholder node; it must not become an unknown type.
+    const hidden = CATALOG.filter((s) => isPlaceholder(s.sublabel));
+    expect(hidden.length).toBeGreaterThan(0);
+    for (const s of hidden) expect(catalogByType[s.type]).toBeDefined();
+  });
+
+  test('a kind stops being hidden the moment its marker comes off', () => {
+    // The marker is the single source of truth -- no second list to update.
+    expect(isPlaceholder('Block storage (placeholder)')).toBe(true);
+    expect(isPlaceholder('Block storage')).toBe(false);
   });
 });

@@ -1136,183 +1136,38 @@ released tag, not asserted), so v0.7.7 regresses nothing. They are recorded
 here rather than hacked green, because making them pass in five minutes would
 have meant retiring a claim rather than fixing a bug.
 
-- [ ] **`test_a_noop_apply_cannot_report_success_*` (ecs + lambda) — a genuine
-  design conflict, and it needs a DECISION, not a patch.** The tests assert
-  that a no-op apply must not claim success while the service is at zero, and
-  they create that state with a broken `${{ghost.ENDPOINT}}` ref. odin's
-  wiring guard now refuses that apply upfront with a 409 — which is BETTER
-  behaviour, and it runs before apply, so "apply proceeds while a ref is
-  unresolvable" is unreachable BY DESIGN.
-  Three options, none free: (a) assert the refusal — honest, loses the
-  reconcile-path coverage; (b) find a failure mechanism the guard allows —
-  preserves the claim, but every candidate checked (bad image, etc.) breaks
-  the test's own "tofu had nothing to do" premise; (c) split into two tests.
-  The claim these encode is one of odin's honesty guarantees (field test 3:
-  `applied`/exit-0 at 0 of 3 tasks). Do not retire it quietly.
+- [~] **`test_a_noop_apply_cannot_report_success_*` — SPLIT (owner decision,
+  2026-07-27). ECS is done; LAMBDA still to mirror.** The wiring guard now
+  refuses an apply carrying an unresolvable `${{ghost.ENDPOINT}}` ref with a
+  409, which made these tests' route to a zero-task service unreachable by
+  design. Resolved by splitting rather than retiring: one test asserts the
+  refusal (and that nothing was built), the other keeps the honesty claim via a
+  route the guard permits.
 
-- [ ] **`test_a_killed_database_gets_its_mesh_endpoint_back_after_one_apply`.**
-  A killed rds container does not come back after one apply — verdict
-  `container odin-rds-... is not running (exit 137) — re-Apply to recreate`.
-  Note the symptom DIFFERS between versions (v0.7.6: "never published a
-  verified overlay address"), so diagnose from the current failure rather than
-  assuming they are the same bug.
-  Adjacent and probably related: `fabric/sidecar.py::ensure()` collapses "the
-  join failed" into "there is no mesh here" — its broad `except` returns
-  `None`, the same value as the no-mesh case. That is honesty rule 2 and is
-  why a hard `AttributeError` once surfaced as a decorative security group.
-  Fix the collapse first; it may be what makes this test's real cause visible.
+  For the ECS one that route is: apply a bad image (a real update, so tofu
+  does work), kill the tasks OUT OF BAND as the field did, then re-apply the
+  UNCHANGED canvas — a genuine empty plan with the service at 0 of 3. Two
+  premises failed on the way and are worth not re-deriving: a bad image ALONE
+  never reaches zero, because ECS keeps healthy old-revision tasks when the new
+  ones cannot start (measured: 3 still up); and reading `DescribeServices`
+  straight after the recovery apply races the service's re-registration, giving
+  an `IndexError` that says nothing. Poll the task containers instead.
 
-- [x] **A failed canvas READ silently destroyed the saved canvas** (fixed in
-  v0.7.7). Reported from a Tailscale-served odin -- "when I press refresh the
-  entire canvas gets nuked" -- and invisible on loopback, where the fetch does
-  not fail. `Canvas.tsx` loaded with
-  `.catch(() => ({nodes: [], edges: []}))`, so ANY failed read became an empty
-  canvas, `loaded` flipped true, and the debounced save wrote that emptiness
-  over `.odin/canvas.json`. Measured by rejecting a single GET: **2 nodes on
-  disk before, 0 after, unrecoverable.**
+  Both ECS tests pass against real containers and real tofu (93s).
 
-  Fix: `lib/canvasLoad.ts` -- `null` means COULD NOT READ; the loader returns
-  without arming the save, renders nothing, and shows a non-dismissible
-  banner saying the saved canvas is intact. Verified in a real browser with
-  the fault provably firing, on the freshly-built bundle: faulted load ->
-  banner + disk still 2; clean load -> 2 nodes, no banner; drop a node -> disk
-  3. Mutation-tested: restoring the old fallback fails 4 of the new tests.
+  **LAMBDA: resolved differently, and deliberately.** The refusal half is done
+  and passing. The e2e no-op half was RETIRED rather than faked, because lambda
+  has no route to it through real containers -- measured dead ends: a bad
+  `runtime` falls back to the DEFAULT image (`RUNTIME_IMAGES.get(runtime,
+  RUNTIME_IMAGES[DEFAULT_RUNTIME])`) and boots a working container;
+  `memory_size` is neither canvas-settable nor emitted by `agent/hcl.py`; and
+  readiness is a TCP check on the RIE port, which a broken handler satisfies.
 
-  Two theories I raised about a DIFFERENT symptom were both wrong, recorded
-  so nobody re-derives them:
-  * *"the debounced canvas save races Apply"* -- DISPROVEN. The debounce is
-    500ms; the canvas was verified saved 3s before the click.
-  * *"the badge never goes green live"* -- DISPROVEN. A WebSocket tap shows
-    `world_delta` (`starting` -> `healthy`) and the badge flipping with no
-    reload. I had been reading it 16-18s after Apply while the `tofu apply`
-    itself takes ~25s. **A real apply of one SQS queue is ~25s of tofu plus
-    ~5s to observation; measure past 30s or you will invent a bug.**
-  * and a third, about `/canvas` needing `?env=`: there is no per-env canvas.
-    `api/canvas.py` takes no env at all and `.odin/canvas.json` is a single
-    global file -- `GET /canvas?env=X` returns byte-identical bytes for every
-    X. One architecture, many envs (isolated AWS *state*) is the design.
-
-- [ ] **`/apply-full` treats a MALFORMED body as "destroy everything".**
-  `CanvasGraph.nodes` defaults to `[]`, so a body with no `nodes` key at all
-  validates as a canvas with zero nodes. Measured against a live server:
-  `POST /apply-full?env=X` with `{"detail": "Internal Server Error"}` returns
-  **HTTP 200 `{"status": "applied"}`** and commits a real revision -- and
-  reconciling an env to an empty desired state tears down every resource in
-  it. The v0.7.7 fix is client-side (`lib/canvasLoad.ts` refuses to hand such
-  a body to Apply), which closes the reported path but not the route itself.
-  The server distinction worth drawing: an EXPLICIT `"nodes": []` is a
-  legitimate "remove everything", while an ABSENT `nodes` key is a malformed
-  request and should be a 422. Deferred out of v0.7.7 because making the field
-  required changes validation for every canvas-taking route (`/apply`,
-  `/translate`, `/canvas`) and wants its own test pass.
-
-- [ ] **Should the canvas be per-env?** Every other route (`/world`, `/apply`,
-  `/destroy`) takes `?env=` and defaults to `default`; `/canvas` alone is
-  global. Making it per-env-with-default would be consistent, but it changes
-  what an environment MEANS (today: the same architecture, isolated state),
-  so it is a design decision rather than a bug fix. Owner raised it 2026-07-27.
-
-- [ ] **Containment changes configuration, not just labels.** The owner's
-  example: expand an EC2 box, drop an ECS box inside it, and that means **ECS
-  on the EC2 launch type rather than Fargate** — which is a real AWS
-  distinction (ECS tasks run either on EC2 container instances or on Fargate),
-  not a UI convenience. Dropping it back out means Fargate again.
-  **The invariant that makes this safe: identity is preserved.** The node's
-  name/label and anything the user typed stay exactly as they are; only the
-  fields that containment genuinely determines change. A gesture must never
-  silently rewrite something a person authored — that is the same honesty rule
-  the rest of odin follows, applied to the canvas.
-  Needs: a per-kind table of "what does containment in X imply", applied on the
-  containment-stamp path, plus a visible statement of what changed (odin says
-  what it did; it does not quietly do it).
-
-- [ ] **IAM edges across the whole catalog, not just S3.** Today the drawn-edge
-  → compiled-policy path is real and enforced, but the action vocabulary is
-  thin outside `s3:*`. Extend to sqs/sns/dynamodb/lambda/ecs/secrets/logs/ecr
-  and the rest, so drawing a lambda → dynamodb edge grants the right actions
-  the way a lambda → s3 edge already does. The compiler and the enforcement
-  point do not change; the vocabulary does.
-
-- [ ] **Placement that infers intent from geometry.** The general form of the
-  first item: what a person expresses by putting one thing inside, next to, or
-  overlapping another. Containment is the first and clearest case; adjacency
-  and grouping follow. Each inference must be reversible by the opposite
-  gesture and must never destroy authored values.
-
-- [ ] **Then, and separately: the chat/agent surface.** NORTHSTAR's canvas↔
-  Terraform translation agent. Explicitly NOT a replacement for the canvas
-  language — an addition to it.
-
-## Deprecated 2026-07-22 (superseded by NORTHSTAR.md)
-
-Everything below this line described **odin**, a local-only "Railway,
-but with a brain" app orchestrator — the product identity before the owner's
-2026-07-22 pivot to an AWS-compatible core. The app-workload
-layer it describes (service/dep/batch/llm node kinds, the memory-aware
-scheduler, the per-kind probe registry, the claude-agent-sdk config-completion
-brain) has been ripped from live code and parked at git tag
-`app-layer-parked` — it may return as a layer on top of the AWS core later.
-Kept below for history, not as current direction.
-
-### Direction (2026-06-23): local-only pivot (superseded)
-
-**odin is going local-only.** We're dropping the ambition to maintain AWS /
-cloud resources. The actual use cases are personal + friends/family, the local
-machine is plenty, and the intelligence runs locally too — so there's no reason
-to cater to cloud/AWS users.
-
-What this means:
-- **Drop the AWS-emulation story.** MiniStack (the embedded AWS control plane),
-  the Pulumi-for-AWS infra layer we were mid-designing, the real-AWS↔local
-  switching, and the whole infra-vs-app layering question — none of it.
-  odin is not an AWS tool. (MiniStack was also just friction.)
-- **Everything is a local container / process.** A "database" is just a Postgres
-  container (a `dep` node); a cache is a Redis container; a queue is a real
-  local broker (NATS/Redis) — run + supervised by the reconciler directly, with
-  no AWS abstraction in front of them.
-- **odin = a local-first, AI-operated orchestrator** for your Mac (Railway/
-  Compose, but with a brain, fully local). Workloads: app services,
-  dependencies, batch jobs, local LLMs. Intelligence: local (omlx / local models).
-- **The palette** eventually sheds the AWS nodes (VPC/EC2/S3/SQS/RDS/…) and keeps
-  the local primitives (app, dependency, job, LLM, + local volumes / networks).
-
-> The earlier history (Moto/OpenTofu validate, the old Lima+Nebula
-> per-EC2 "Simulate" overlay) was **retired and deleted** — 21 source modules +
-> 30 test files removed. Do not resurrect Terraform/Moto/HCL or that old
-> per-VM Nebula overlay. NOTE: this is distinct from the **self-hosted Nebula
-> mesh fabric** (`fabric/nebula.py`) — a host-level mesh that IS the chosen
-> multi-Mac direction. Different thing; don't re-strip it.
-
-### Done (superseded)
-
-#### Walking skeleton (S0–S3)
-- [x] Spec Store spine — Stack (desired) + World (observed) + append-only, content-addressed, per-env revisions
-- [x] Pure `plan(Stack, World) → [Action]` (total + idempotent) + the Reconciler loop (observe → plan → execute, supervision, ref-gating)
-- [x] MiniStack embedded in-process as the AWS control plane; its container spawn rewired to odin's runtime (one spawn authority, no double-spawn)
-- [x] `ColimaRuntime` behind a `RuntimeDriver` protocol; localhost fabric resolving `${{node.VAR}}` from World facts
-- [x] api + RDS→real-Postgres slice, proven end-to-end (headless + browser)
-
-#### Milestones
-- [x] **M1 — Brain:** `claude_complete` fills blank config (AI-tagged, user values win, best-effort); IAM review
-- [x] **M1-UX — staged changeset:** `POST /preview` returns the AI's proposed diff before Apply; Preview button; `POST /review-iam`
-- [x] **M2 — workloads:** all 4 kinds — service (HTTP-supervised), dep (any container, e.g. Redis), batch (run-to-completion), llm — plus AWS usable *by* app containers (injected endpoint/creds)
-- [x] **M3 — Scheduler:** memory-aware admission (queue over budget) + idle-LLM eviction for higher-priority work
-- [x] **M4 — Assertion Engine:** per-kind health probe registry (http / tcp / `/v1/models` / pg / exit-code), injectable
-- [x] **M5 — UI parity:** catalog codegen from MiniStack's service registry (47 generated AWS nodes)
-- [x] **M6 — environments:** independent per-env reconcilers, each scoped to a distinct MiniStack account (isolated AWS state); `/envs`; UI env switcher
-- [x] **M7 (single-host) — Lima runtime:** `LimaRuntime`, a second `RuntimeDriver` impl running workloads inside a Lima VM (VM isolation); unit + real-VM integration
-- [x] AWS resource provisioning from canvas nodes (S3/SQS/SNS/DynamoDB created in the embed on Apply)
-- [x] **Nebula mesh fabric foundation** (`fabric/nebula.py`) — recovered cert/lighthouse/config primitives (one network per env, sticky overlay IPs) + `NebulaFabric` (a verified drop-in for the `resolve` seam) + a `mesh_state` read model and `GET /mesh?env=` for a future mesh UI. The cross-Mac *activation* (host overlay IP → World facts, World replication, placement) is M7 below.
-
-### Roadmap (superseded)
-
-- [x] **M8 — Region-select debugging ("what's wrong here?")** — SHIPPED 2026-07-25 as W2.9 (`agent/debugger.py`, `POST /agent/debug`, `ui/src/components/RegionAsk.tsx`); the "fix this part" half of the original wording deliberately did NOT ship — the agent explains, it never edits. Original entry: drag a selection rectangle over a canvas region → context menu ("Debug this" / "What's wrong here?" / "Fix this part" / free-form ask) → a region-scoped agent auto-gathers the enclosed nodes + edges and, for each, its World state (phase/facts/verdict/restarts) + recent events/logs + relevant Stack fields, then investigates or fixes from there. Reuses the existing Cmd+drag selection; new parts are the menu + a context-assembler that turns a selection into the agent prompt. **Point at a region instead of describing it — far less back-and-forth.**
-- [ ] **M7 (multi-Mac) — the fleet:** a **self-hosted Nebula mesh** fabric (you own the lighthouse — runs in your private network, programmable, a control-plane/UI can be built on top; chosen over Tailscale, whose SaaS coordination would limit that) + multi-Mac membership (memberlist/raft) + apple-container runtime. The Nebula fabric foundation (cert/lighthouse/config primitives + the `NebulaFabric` resolve seam) is reinstated under `fabric/nebula.py`; cross-Mac placement is the deferred part. Additive, no core change.
-- [ ] **Brain Toolbelt MCP:** make the Brain a candidate-only producer behind a typed `place` + `propose_changeset` + `review_iam` MCP membrane (stricter than today's best-effort completion).
-- [ ] **MiniStack real-container backings** for the remaining stateful AWS services (ElastiCache→Redis, etc.) so apps use them for real, not just the API.
-- [ ] **Packaging:** bundle the external tools (colima, lima, uv, …) into one distributable.
-
-### Testing (superseded)
-- [x] pytest suite: 80 unit + 9 integration (real Colima/MiniStack/Lima/Claude, marker-gated)
-- [x] Browser e2e via the browser CLI (skeleton + full-breadth scenarios; playwright-cli retired 2026-07-27 in favour of agent-browser)
-- [ ] Broader end-to-end scenario coverage as milestones land
+  The CLAIM is not retired -- it is covered by `tests/api/test_apply_full.py::
+  test_apply_full_fails_on_a_function_whose_container_is_gone_though_the_record_says_active`,
+  which seeds an `Active` record, removes the container, injects a
+  `FunctionRuntime` whose boot raises, and asserts
+  `applied_resources_unhealthy`. Its "tofu had nothing to do" premise is
+  STRONGER than the e2e's empty plan: tofu is not installed at all there. What
+  is lost is only the real-container substrate, which the ECS e2e covers for
+  the same shape.

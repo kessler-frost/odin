@@ -143,6 +143,7 @@ const statusConfig: Record<WsStatus, { color: string; label: string; pulse: bool
 interface BottomPanelProps {
   bottomState: string;
   activeEnv?: string;
+  onCanvasUpdated?: (rev: string) => void;
   selectedNode?: string;
   onCycleBottom: () => void;
   onWsStatusChange?: (connected: boolean) => void;
@@ -167,7 +168,7 @@ async function fetchNodeLogs(env: string, node: string): Promise<LogLine[]> {
   return lines.map(l => ({ time, source: node, msg: l, msgClass: body.running ? '' : 'warn' }));
 }
 
-export default function BottomPanel({ bottomState, activeEnv, selectedNode, onCycleBottom, onWsStatusChange, onResourceStatus, onConfigUpdate, clearSignal }: BottomPanelProps) {
+export default function BottomPanel({ bottomState, activeEnv, selectedNode, onCycleBottom, onWsStatusChange, onResourceStatus, onConfigUpdate, onCanvasUpdated, clearSignal }: BottomPanelProps) {
   const [activeTab, setActiveTab] = useState("Agent");
   const [logs, setLogs] = useState<LogLine[]>([]);
   const [fetchingLogs, setFetchingLogs] = useState(false);
@@ -203,6 +204,8 @@ export default function BottomPanel({ bottomState, activeEnv, selectedNode, onCy
   activeEnvRef.current = activeEnv;
   const onConfigUpdateRef = useRef(onConfigUpdate);
   onConfigUpdateRef.current = onConfigUpdate;
+  const onCanvasUpdatedRef = useRef(onCanvasUpdated);
+  onCanvasUpdatedRef.current = onCanvasUpdated;
 
   const handleMessage = useCallback((msg: Record<string, unknown>) => {
     const type = msg.type as string | undefined;
@@ -215,6 +218,11 @@ export default function BottomPanel({ bottomState, activeEnv, selectedNode, onCy
       const name = msg.name as string;
       const status = type.replace('resource_', '');
       onResourceStatusRef.current?.(name, status, msg.error as string | undefined);
+    }
+    // The canvas is GLOBAL and shared by every tab, so this one is NOT
+    // filtered by env -- unlike world_delta below, which is per-environment.
+    if (type === 'canvas_updated') {
+      onCanvasUpdatedRef.current?.(msg.rev as string);
     }
     if (type === 'world_delta') {
       const env = (msg.env as string | undefined) ?? 'default';

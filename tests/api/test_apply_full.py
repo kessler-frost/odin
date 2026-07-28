@@ -977,9 +977,20 @@ def test_apply_full_fails_on_a_function_whose_container_is_gone_though_the_recor
         resp = client.post("/apply-full", json={"nodes": [], "edges": []})
     body = resp.json()
     assert body["status"] == "applied_resources_unhealthy", body
+    # The reason now names WHY THIS APPLY'S RECREATE FAILED, not
+    # "re-Apply to recreate". /apply-full sweeps BEFORE it converges (see
+    # `tests/gateway/test_apply_recovers_in_one_apply.py`), so a gone
+    # container is marked failed and re-created by the SAME apply. It used
+    # to be marked only afterwards, which meant the apply converged nothing
+    # and told the user to run the command they had just run -- measured on
+    # a real killed database, 300s later still crashed.
+    #
+    # These fakes deliberately cannot start a container, so what surfaces
+    # here is the substrate's own refusal. That is the honest answer for a
+    # recreate that was ATTEMPTED and failed.
     assert body["unhealthy_resources"] == [{
         "kind": "lambda", "node": "worker", "observed": "Failed",
-        "reason": "container odin-lambda-default-worker removed outside odin — re-Apply to recreate",
+        "reason": "RuntimeError: pull access denied for public.ecr.aws/lambda/python:3.12",
     }], body
     assert "lambda worker is Failed" in body["note"]
 
@@ -997,15 +1008,30 @@ def test_apply_full_fails_on_a_database_whose_container_is_gone_though_the_recor
         world = client.get("/world").json()
     body = resp.json()
     assert body["status"] == "applied_resources_unhealthy", body
+    # The reason now names WHY THIS APPLY'S RECREATE FAILED, not
+    # "re-Apply to recreate". /apply-full sweeps BEFORE it converges (see
+    # `tests/gateway/test_apply_recovers_in_one_apply.py`), so a gone
+    # container is marked failed and re-created by the SAME apply. It used
+    # to be marked only afterwards, which meant the apply converged nothing
+    # and told the user to run the command they had just run -- measured on
+    # a real killed database, 300s later still crashed.
+    #
+    # These fakes deliberately cannot start a container, so what surfaces
+    # here is the substrate's own refusal. That is the honest answer for a
+    # recreate that was ATTEMPTED and failed.
     assert body["unhealthy_resources"] == [{
         "kind": "rds", "node": "app-db", "observed": "failed",
-        "reason": "container odin-rds-default-app-db removed outside odin — re-Apply to recreate",
+        "reason": "container did not start: RuntimeError: docker run failed: no space left on device",
     }], body
     # ...and `/world` is not green for it either, off the same live read -- the
     # projection and the apply cannot disagree about liveness by construction.
     (observed,) = [r for r in world["resources"] if r["id"] == "app-db"]
     assert observed["phase"] == "crashed", world
-    assert "removed outside odin" in observed["verdict"], world
+    # Same reason as the apply body above: the recreate was attempted and the
+    # fake substrate refused it. `/world` and the apply read ONE corrected
+    # record, so they still cannot disagree -- which is the property this line
+    # exists to defend.
+    assert "did not start" in observed["verdict"], world
 
 
 def test_apply_full_stays_applied_when_the_containers_really_are_there(tmp_path, monkeypatch):

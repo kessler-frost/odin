@@ -33,7 +33,7 @@ import { sizeOnLoad, sizeForSave } from '../lib/nodeSize';
 import { BUILTINS, CATALOG, catalogNodeTypeMap, catalogDefaultData, catalogDefaultStyle, catalogZIndex, catalogByType, COLORS } from '../lib/catalog';
 import { withContainment, isInsideContainer } from '../lib/containment';
 import { placeUnpositioned } from '../lib/placement';
-import { readCanvas } from '../lib/canvasLoad';
+import { readCanvasWithRevision } from '../lib/canvasLoad';
 import { computeTypes, defaultPermissions, detectDefaultEdgeType, edgeStyle, edgeTypes } from '../lib/iam';
 
 const nodeTypes: NodeTypes = {
@@ -180,9 +180,10 @@ interface CanvasProps {
   configUpdate?: { nodeId: string; data: Record<string, any> } | null;
   onCanvasSave?: (graph: { nodes: any[]; edges: any[] }) => void;
   onResetDrafts?: React.MutableRefObject<(() => void) | null>;
+  onCanvasUpdated?: React.MutableRefObject<((rev: string) => void) | null>;
 }
 
-function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, nodeUpdates, edgeUpdates, onStatusUpdate, configUpdate, onCanvasSave, onResetDrafts }: CanvasProps) {
+function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, nodeUpdates, edgeUpdates, onStatusUpdate, configUpdate, onCanvasSave, onResetDrafts, onCanvasUpdated }: CanvasProps) {
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   const [loaded, setLoaded] = useState(false);
@@ -194,6 +195,12 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
   // would leave an empty canvas that looks like a real one, which is the exact
   // confusion that made the data loss above so quiet.
   const [loadFailed, setLoadFailed] = useState(false);
+  // Another tab saved a newer canvas than this page is editing. Not
+  // dismissible: the page is now knowingly stale, and quietly continuing is
+  // how the overwrite used to happen.
+  const [conflict, setConflict] = useState(false);
+  // The revision this page's canvas was loaded (or last saved) at.
+  const revisionRef = useRef<string | null>(null);
   const { screenToFlowPosition, fitView } = useReactFlow();
   const [shiftHeld, setShiftHeld] = useState(false);
 
@@ -230,11 +237,15 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
       // NOT READ, and the loader returns WITHOUT setting `loaded`: nothing
       // renders, the debounced save below never arms, the file on disk is
       // untouched, and the banner says so.
-      const canvasRes = await readCanvas(fetch, `${API}/canvas`);
-      if (!canvasRes) {
+      const read = await readCanvasWithRevision(fetch, `${API}/canvas`);
+      if (!read) {
         setLoadFailed(true);
         return;
       }
+      const canvasRes = read.canvas;
+      // Remember WHICH canvas this page is editing, so the save below can say
+      // so and be refused rather than clobber a newer one.
+      revisionRef.current = read.rev;
 
       // A canvas authored outside the UI (`odin canvas set`, an agent, the
       // README's own example) may carry no `position`. ReactFlow dereferences
@@ -411,14 +422,57 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
           data: e.data ?? {},
         })),
       };
-      fetch(`${API}/canvas`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(canvasData),
-      }).catch(() => {});
+      // `If-Match` carries the revision this page loaded. The canvas is
+      // global and every tab holds its own copy plus this debounced save, so
+      // without the precondition the last tab to re-render silently overwrites
+      // the others -- measured replacing three applied resources with a single
+      // node from a tab left open in another window.
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (revisionRef.current) headers['If-Match'] = revisionRef.current;
+      fetch(`${API}/canvas`, { method: 'POST', headers, body: JSON.stringify(canvasData) })
+        .then(r => {
+          if (r.status === 409) { setConflict(true); return; }
+          // Track the revision WE just wrote, so this page recognises its own
+          // broadcast echo and does not reload itself mid-edit.
+          if (r.ok) revisionRef.current = r.headers.get('ETag') ?? revisionRef.current;
+        })
+        .catch(() => {});
       onCanvasSaveRef.current?.(canvasData);
     }, 500);
   }, [nodes, edges, loaded]);
+
+  // --- Another client saved the canvas: converge instead of drifting ---
+  //
+  // The canvas is GLOBAL by design -- one architecture, many environments --
+  // so two tabs should show the same thing. They did not: each held its own
+  // copy and the last to re-render overwrote the rest, silently. This is the
+  // half that makes them agree; `If-Match` above is the half that makes the
+  // remaining races refuse rather than clobber.
+  useEffect(() => {
+    if (!onCanvasUpdated) return;
+    onCanvasUpdated.current = (rev: string) => {
+      // Our OWN save echoes back. Reloading on it would throw away whatever
+      // the user typed in the 500ms since, which is the same data loss wearing
+      // a friendlier hat.
+      if (!rev || rev === revisionRef.current) return;
+      readCanvasWithRevision(fetch, `${API}/canvas`).then(read => {
+        if (!read) return;
+        revisionRef.current = read.rev;
+        setConflict(false);
+        const fromDisk: LoadedNode[] = (read.canvas.nodes ?? []).map((n: any) => ({
+          id: n.id,
+          type: n.type,
+          position: (typeof n.position?.x === 'number' && typeof n.position?.y === 'number') ? n.position : undefined,
+          zIndex: zIndexForType[n.type] ?? 2,
+          data: { ...defaultDataForType[n.type], ...n.data },
+          style: { ...defaultStyleForType[n.type], ...sizeOnLoad(defaultStyleForType, n.type, n.size) },
+        }));
+        const { nodes: rfNodes } = placeUnpositioned(fromDisk);
+        setNodes(rfNodes);
+      });
+    };
+    return () => { onCanvasUpdated.current = null; };
+  }, [onCanvasUpdated, setNodes]);
 
   // --- Register status update callback (called directly, avoids React batching loss) ---
   useEffect(() => {
@@ -844,6 +898,22 @@ const typeOrder = ['s3', 'sqs', 'dynamodb', 'rds', 'vpc', 'subnet', 'sg', 'ec2',
           </button>
         </div>
       )}
+      {conflict && (
+        <div className="absolute top-0 left-0 right-0 z-30 flex items-center gap-2 px-3 py-2.5 bg-bg-secondary border-b border-neon-amber shadow-lg">
+          <span className="font-mono text-[10px] leading-5 text-neon-amber uppercase tracking-[1px] whitespace-nowrap">Stale</span>
+          <span className="flex-1 min-w-0 font-mono text-[11px] leading-5 text-text-secondary">
+            Another tab saved a newer canvas, so this page's changes were <span className="text-text-primary">not saved</span> —
+            nothing was overwritten. Reload to continue from the current canvas.
+          </span>
+          <button
+            onClick={() => window.location.reload()}
+            title="Reload"
+            className="font-mono text-[10px] h-5 px-2.5 border border-border bg-bg-tertiary text-text-muted uppercase tracking-[1px] cursor-pointer transition-colors duration-200 hover:text-text-primary hover:border-border-bright"
+          >
+            Reload
+          </button>
+        </div>
+      )}
       {placed > 0 && (
         <div className="absolute top-0 left-0 right-0 z-30 flex items-center gap-2 px-3 py-2.5 bg-bg-secondary border-b border-border-bright shadow-lg">
           <span className="font-mono text-[10px] leading-5 text-neon-amber uppercase tracking-[1px] whitespace-nowrap">Placed</span>
@@ -866,10 +936,10 @@ const typeOrder = ['s3', 'sqs', 'dynamodb', 'rds', 'vpc', 'subnet', 'sg', 'ec2',
   );
 }
 
-export default function Canvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, nodeUpdates, edgeUpdates, onStatusUpdate, configUpdate, onCanvasSave, onResetDrafts }: CanvasProps) {
+export default function Canvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, nodeUpdates, edgeUpdates, onStatusUpdate, configUpdate, onCanvasSave, onResetDrafts, onCanvasUpdated }: CanvasProps) {
   return (
     <ReactFlowProvider>
-      <InnerCanvas env={env} onNodeSelect={onNodeSelect} onEdgeSelect={onEdgeSelect} onNodeLabelsChange={onNodeLabelsChange} nodeUpdates={nodeUpdates} edgeUpdates={edgeUpdates} onStatusUpdate={onStatusUpdate} configUpdate={configUpdate} onCanvasSave={onCanvasSave} onResetDrafts={onResetDrafts} />
+      <InnerCanvas env={env} onNodeSelect={onNodeSelect} onEdgeSelect={onEdgeSelect} onNodeLabelsChange={onNodeLabelsChange} nodeUpdates={nodeUpdates} edgeUpdates={edgeUpdates} onStatusUpdate={onStatusUpdate} configUpdate={configUpdate} onCanvasSave={onCanvasSave} onResetDrafts={onResetDrafts} onCanvasUpdated={onCanvasUpdated} />
     </ReactFlowProvider>
   );
 }

@@ -114,11 +114,46 @@ def _await_state(root: Path, want: str, timeout: float = 60.0) -> dict:
         time.sleep(0.5)
 
 
-def test_a_noop_apply_cannot_report_success_on_a_function_that_never_came_back(
-    store_root, monkeypatch, lambda_cleanup,
-):
+# --- the no-op claim: where it lives now, and why not here ------------------
+#
+# The e2e version of that test USED TO stand here, and it reached its zero-state
+# with a broken `${{ghost.ENDPOINT}}` ref in the node's `env` map -- chosen
+# because that map is injected at container launch and is NOT part of the
+# `aws_lambda_function` resource, making every apply a guaranteed empty plan.
+#
+# odin now REFUSES that apply with a 409 (asserted below), so the route is gone
+# by design. Unlike ECS, lambda has no substitute route through real
+# containers, and all three candidates were measured to be dead ends:
+#
+#   bad runtime   `functions.py` does RUNTIME_IMAGES.get(runtime,
+#                 RUNTIME_IMAGES[DEFAULT_RUNTIME]) -- an unknown runtime falls
+#                 back to the DEFAULT image and boots a WORKING container
+#   memory        `memory_size` is neither settable from the canvas nor emitted
+#                 by `agent/hcl.py`, so it cannot make `docker run` refuse
+#   broken code   readiness is a TCP check on the RIE port
+#                 (`functions.py::_await_ready`), which a broken handler still
+#                 satisfies -- the error only appears on invoke
+#
+# The CLAIM is not retired, it moved to where it can be made honestly:
+# `tests/api/test_apply_full.py::
+#  test_apply_full_fails_on_a_function_whose_container_is_gone_though_the_record_says_active`
+# seeds an `Active` record, removes the container, injects a FunctionRuntime
+# whose boot raises, and asserts `applied_resources_unhealthy`. Its "tofu had
+# nothing to do" premise is STRONGER than this file's empty plan: tofu is not
+# installed at all in that test, so no plan runs. What is lost is only the real
+# -container substrate, which the ECS e2e still covers for the same shape.
+
+
+def test_a_broken_ref_is_refused_upfront_instead_of_applied(store_root, monkeypatch, lambda_cleanup):
+    """Half of the split (owner decision, 2026-07-27); see the ECS twin.
+
+    odin's wiring guard now refuses an apply carrying an unresolvable
+    `${{ghost.ENDPOINT}}` ref BEFORE it runs. That is strictly better than
+    applying it and discovering the damage later -- and it is what makes the
+    no-op test above unreachable by its original route, since that route WAS
+    the broken ref. Asserted here as the guarantee it now is.
+    """
     assert shutil.which("tofu"), "OpenTofu must be on PATH for this integration test"
-    assert shutil.which("docker"), "docker must be on PATH for this integration test"
 
     async def fake_translate(stack, **kwargs):
         skeleton = hcl.generate_tf(stack)
@@ -126,81 +161,11 @@ def test_a_noop_apply_cannot_report_success_on_a_function_that_never_came_back(
             files=skeleton.files, unsupported=skeleton.unsupported, binary_files=skeleton.binary_files,
         )
     monkeypatch.setattr("odin.server.translate_mod.translate", fake_translate)
-    # The reality sweep on EVERY tick, so step 3's removed container is noticed
-    # in seconds rather than on the production ~10-tick cadence. It is the same
-    # sweep either way -- only its period changes.
-    #
-    # LEGITIMATE HERE, and field test 5 is why that needs saying (honesty rule
-    # 1b). What this test measures is an apply whose CONVERGENCE cannot succeed
-    # -- the redeploy dies on an unresolvable `${{ghost.ENDPOINT}}` -- and a
-    # `Failed` record is that scenario's PRECONDITION, not its guard. Shortening
-    # the cadence only reaches the precondition sooner. The residual this file
-    # used to step around (is the apply honest BEFORE any sweep has run?) is
-    # measured at the full default cadence in test_false_green_window_e2e.py.
-    monkeypatch.setenv("ODIN_DRIFT_SWEEP_TICKS", "1")
 
-    store = SpecStore(store_root)
-    app = create_app(store=store)
-    with TestClient(app) as client:
-        # --- 1. a genuinely healthy function --------------------------------
-        body, elapsed = _apply(client, _canvas())
-        print(f"\n[FT3-lambda] fresh apply took {elapsed:.1f}s")
-        assert body["status"] == "applied", body
-        assert body["tf"]["status"] == "ok", body
-        assert "unhealthy_resources" not in body, body
-        assert _fn_record(store_root)["state"] == "Active"
-        assert container_name(ENV, NODE) in _docker("ps", "--format", "{{.Names}}").stdout
-
-        # --- 2. add the broken ref: a no-op apply on a HEALTHY function -----
-        # The `env` map is not in the `aws_lambda_function` resource, so tofu's
-        # plan is empty and the running container is untouched. Must stay green,
-        # and must stay FAST -- the verification may not tax the happy path.
-        body, elapsed = _apply(client, _canvas({"NEED": BROKEN_REF}))
-        print(f"[FT3-lambda] no-op apply on a healthy function took {elapsed:.1f}s")
-        assert body["tf"] == {"status": "ok", "exit_code": 0}, body
-        assert body["status"] == "applied", body
-        assert "unhealthy_resources" not in body, body
-        assert elapsed < 90, f"a healthy no-op apply must stay prompt, took {elapsed:.1f}s"
-
-        # --- 3. the sandbox is removed, then THE BUG ------------------------
-        # `docker rm -f` is what a container destroyed out of band looks like to
-        # the reality sweep, which marks the function Failed. Every redeploy now
-        # dies on the unresolvable ref, so the function cannot converge -- while
-        # tofu still has nothing whatsoever to do.
-        _docker("rm", "-f", "-v", container_name(ENV, NODE))
-        _await_state(store_root, "Failed")
-
-        body, elapsed = _apply(client, _canvas({"NEED": BROKEN_REF}))
-        print(f"[FT3-lambda] no-op apply on a BROKEN function took {elapsed:.1f}s -> {body['status']}")
-        # tofu genuinely had nothing to do -- exactly why it could never have
-        # caught this, and why odin has to.
-        assert body["tf"] == {"status": "ok", "exit_code": 0}, body
-        # THE regression: this used to be `applied`, exit 0, on a dead function.
-        assert body["status"] == "applied_resources_unhealthy", body
-        (fault,) = body["unhealthy_resources"]
-        assert fault["kind"] == "lambda", fault
-        assert fault["node"] == NODE, fault
-        assert fault["observed"] == "Failed", fault
-        # ...and it names the real underlying reason, in the APPLY's own output.
-        assert "ghost" in (fault["reason"] or ""), fault
-        assert "ghost" in body["note"] and NODE in body["note"], body["note"]
-        assert elapsed < 180, f"the failure must be bounded, took {elapsed:.1f}s"
-
-        # --- 4. drop the ref: the Apply is the recovery, and it is quick -----
-        body, elapsed = _apply(client, _canvas())
-        print(f"[FT3-lambda] recovery apply took {elapsed:.1f}s")
-        assert body["status"] == "applied", body
-        assert body["tf"] == {"status": "ok", "exit_code": 0}, body
-        assert "unhealthy_resources" not in body, body
-        assert elapsed < 180, f"recovery must not crawl, took {elapsed:.1f}s"
-        assert _fn_record(store_root)["state"] == "Active"
-        assert container_name(ENV, NODE) in _docker("ps", "--format", "{{.Names}}").stdout
-
-        # --- 5. teardown still completes promptly ---------------------------
-        body, elapsed = _apply(client, EMPTY_CANVAS)
-        print(f"[FT3-lambda] teardown apply took {elapsed:.1f}s")
-        assert body["tf"] == {"status": "ok", "exit_code": 0}, body
-        assert body["status"] == "applied", body
-
-    leftover = _docker("ps", "-aq", "--filter", f"name={container_name(ENV, NODE)}")
-    assert leftover.stdout.strip() == "", f"the RIE container survived: {leftover.stdout}"
+    with TestClient(create_app(store=SpecStore(store_root))) as client:
+        resp = client.post("/apply-full", params={"env": ENV}, json=_canvas({"NEED": BROKEN_REF}))
+        assert resp.status_code == 409, f"an unresolvable ref must be refused, got {resp.status_code}: {resp.text}"
+        assert "ghost" in resp.text, resp.text
+        # Refused BEFORE anything ran: no container was built.
+        ps = _docker("ps", "-aq", "--filter", f"name={container_name(ENV, NODE)}")
+        assert ps.stdout.strip() == "", f"a refused apply must not have created a container: {ps.stdout}"

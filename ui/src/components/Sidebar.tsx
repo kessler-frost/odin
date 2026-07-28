@@ -1,4 +1,4 @@
-import { BUILTINS, CATALOG, COLORS } from '../lib/catalog';
+import { BUILTINS, COLORS, PALETTE } from '../lib/catalog';
 
 type Item = { abbr: string; label: string; sublabel: string; category: string; iconClass: string };
 
@@ -6,7 +6,12 @@ type Item = { abbr: string; label: string; sublabel: string; category: string; i
 // derives its `nodeTypeMap` from the same one). Catalog services are appended.
 const builtins: Item[] = BUILTINS;
 
-const catalogItems: Item[] = CATALOG.map((s) => ({
+// `PALETTE` is `CATALOG` minus the `(placeholder)` kinds -- tiles that drag
+// onto the canvas, draw like a real resource, and are then silently skipped by
+// Apply. Hidden until each has a real substitute (owner call, 2026-07-27; see
+// ROADMAP). Palette-only: `CATALOG` still holds them so an already-saved
+// canvas containing one keeps rendering properly.
+const catalogItems: Item[] = PALETTE.map((s) => ({
   abbr: s.abbr,
   label: s.label,
   sublabel: s.sublabel,

@@ -28,15 +28,16 @@ what is next.
 ![Odin — a VPC/Subnet/EC2 stack, an SG, S3/SQS/SNS/DynamoDB/RDS, a Lambda, an ECS service, an IAM role and an ECR repo, drawn on the canvas with an IAM permission edge (EC2 → S3, GetObject/PutObject/ListBucket)](assets/odin-canvas.png)
 
 **Draw it, press Apply, watch it come up for real.** Three resources placed on the
-canvas, applied, and healthy — that is a real RustFS, a real goaws and a real
-dynalite behind those badges, not a mock:
+canvas, applied, and healthy — a real RustFS bucket, a real dynalite table and a
+real Postgres container behind those badges, not a mock. The clip runs at
+roughly 4x: the apply it records took 103 seconds:
 
-![Three resources drawn on odin's canvas, applied, and going healthy — S3, SQS and DynamoDB badges turning green](assets/odin-draw-apply.gif)
+![Three resources drawn on odin's canvas, applied, and going healthy — S3, DynamoDB and RDS badges turning green, with the database's live host:port shown on the node](assets/odin-draw-apply.gif)
 
 **The `{ }` button shows the Terraform that canvas compiles to** — the same
 deterministic HCL Apply runs, not a preview of something else:
 
-![odin's code panel showing the Terraform generated from the canvas: aws_s3_bucket and aws_sqs_queue resources](assets/odin-code-panel.gif)
+![odin's code panel scrolling through the Terraform generated from the canvas: aws_dynamodb_table, aws_db_instance and aws_s3_bucket resources](assets/odin-code-panel.gif)
 
 ## Install
 

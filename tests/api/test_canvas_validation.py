@@ -75,3 +75,38 @@ def test_a_node_with_no_position_is_repaired_not_refused(tmp_path):
     graph = {"nodes": [{"id": "x1", "type": "rds", "data": {"label": "db"}}], "edges": []}
     with TestClient(_app(tmp_path), raise_server_exceptions=False) as client:
         assert client.post("/apply", json=graph).json()["status"] == "applied"
+
+
+# --- an ABSENT `nodes` key is malformed; an EXPLICIT empty one is an order ---
+#
+# These two must never collapse into each other, because the difference is
+# destructive. Measured against a live server before `nodes` became required:
+#
+#     POST /apply-full?env=X  {"detail": "Internal Server Error"}
+#     -> HTTP 200 {"status": "applied"}, a real revision committed
+#
+# FastAPI's own error shape validated as a canvas of zero nodes, so a 500 from
+# anywhere upstream became "tear down every resource in that environment".
+
+def test_a_body_with_no_nodes_key_is_refused_on_every_canvas_route(tmp_path):
+    with TestClient(_app(tmp_path), raise_server_exceptions=False) as client:
+        for path in ("/canvas", "/apply", "/apply-full", "/translate"):
+            for body in ({"detail": "Internal Server Error"}, {"error": "nope"}, {"edges": []}, {}):
+                response = client.post(path, json=body)
+                assert response.status_code == 422, (path, body, response.status_code, response.text)
+
+
+def test_an_explicitly_empty_canvas_is_still_accepted_and_still_applies(tmp_path):
+    # "Remove everything" is a real instruction and must keep working -- this
+    # is the case the guard above must NOT catch.
+    with TestClient(_app(tmp_path), raise_server_exceptions=False) as client:
+        assert client.post("/canvas", json={"nodes": [], "edges": []}).status_code == 200
+        assert client.post("/apply", json={"nodes": [], "edges": []}).json()["status"] == "applied"
+
+
+def test_edges_stay_optional(tmp_path):
+    # A canvas with nodes and no edges is ordinary, and nothing destructive
+    # follows from assuming none -- so `edges` keeps its default.
+    graph = {"nodes": [{"id": "s1", "type": "s3", "position": {"x": 0, "y": 0}, "data": {"label": "b"}}]}
+    with TestClient(_app(tmp_path), raise_server_exceptions=False) as client:
+        assert client.post("/canvas", json=graph).status_code == 200

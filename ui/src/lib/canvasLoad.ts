@@ -41,6 +41,31 @@ export async function readCanvas(
 }
 
 /**
+ * The same read, plus the revision the server served it at (the `ETag`).
+ *
+ * That revision is what makes a save safe: sent back as `If-Match`, it tells
+ * the server WHICH canvas this edit was based on, and a save built on a stale
+ * one is refused with a 409 instead of overwriting a newer canvas. The canvas
+ * is global and shared by every tab, so without it the last tab to re-render
+ * silently wins — measured destroying three applied resources during the
+ * v0.7.7 GIF recording.
+ *
+ * `rev` is null when the server did not send one (an older odin, or a proxy
+ * that strips the header). Callers then save unconditionally, exactly as
+ * before — degraded, not broken.
+ */
+export async function readCanvasWithRevision(
+  fetchImpl: typeof fetch,
+  url: string,
+): Promise<{ canvas: CanvasPayload; rev: string | null } | null> {
+  const response = await fetchImpl(url).catch(() => null);
+  if (!response || !response.ok) return null;
+  const payload = await response.json().catch(() => null);
+  if (!isCanvasPayload(payload)) return null;
+  return { canvas: payload, rev: response.headers.get('ETag') };
+}
+
+/**
  * `nodes` MUST be an array. That is not pedantry — it is what stops an error
  * body from being applied as a canvas.
  *
