@@ -19,6 +19,14 @@ The translation is deterministic. The same canvas always produces byte-identical
 HCL, Terraform reads back into canvas nodes the same way every time, and no model
 call sits anywhere in that path.
 
+## Contents
+
+[Install](#install) · [What you can do](#what-you-can-do) · [Apply](#apply) ·
+[Edges are IAM](#edges-are-iam) · [Terminal](#driving-it-from-a-terminal) ·
+[AI](#ai-two-features-one-switch) · [How it works](#how-it-works) ·
+[Known limits](#known-limits) · [Security](#security) ·
+[Contributing](#contributing) · [Where it's going](#where-its-going)
+
 ![Odin — a VPC/Subnet/EC2 stack, an SG, S3/SQS/SNS/DynamoDB/RDS, a Lambda, an ECS service, an IAM role and an ECR repo, drawn on the canvas with an IAM permission edge (EC2 → S3, GetObject/PutObject/ListBucket)](assets/odin-canvas.png)
 
 **Draw it, press Apply, watch it come up.** Three resources placed on the canvas,
@@ -99,13 +107,6 @@ which compiles to `vpc_id` and `subnet_id`, and an ECS box drawn inside an EC2 b
 runs its tasks in that VM. One node can expand to several Terraform resources: an
 ALB becomes a load balancer plus a target group plus a listener, and a Lambda
 drawn without a role gets one generated for it.
-
-Nine more tiles are drawable but unbuilt: `kinesis`, `kms`, `route53`,
-`apigateway`, `efs`, `events`, `ebs`, `eip`, `igw`. Each is labelled
-**`(placeholder)`**, and that marker is exact in both directions. A marked tile is
-reported under `skipped` and never touched, and an unmarked tile is a service odin
-models end to end. A test reads the modelled-kinds list out of `translate.py`
-itself, so the label stays honest.
 
 Environments are independent. `--env staging` and `--env prod` keep separate
 canvases, containers and state.
@@ -189,9 +190,16 @@ Odin gathers each node's config, observed phase, crash verdict, recent events an
 a tail of its logs, then answers in plain English with per-node suspects. It reads
 state and returns prose, and it can change nothing.
 
-`ODIN_AI=0` turns off every model call odin can make. Both features then say so
-and carry on: the debug panel answers with the reason, and `odin chat` reports
-`agent unavailable` and changes nothing.
+**Both are off until you turn them on.** The top bar carries an `AI OFF` switch,
+and odin makes no model call of any kind while it reads that way. Flip it and
+both features come alive; flip it back and they say so and carry on, with the
+debug panel answering with the reason and `odin chat` reporting
+`agent unavailable` while changing nothing.
+
+Setting `ODIN_AI` in the environment overrides the switch in both directions,
+which is what a CI job or a headless run wants. The switch renders disabled and
+names the variable when that happens, so it never looks like a control that does
+nothing.
 
 ## How it works
 

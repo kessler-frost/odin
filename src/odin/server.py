@@ -24,7 +24,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from odin.agent import chat
+from odin.agent import ai, chat
 from odin.api.canvas import write_canvas
 from odin.agent import import_tf as import_tf_mod
 from odin.agent import translate as translate_mod
@@ -1143,6 +1143,10 @@ _TOFU_NOT_INSTALLED = {"error": "tofu not installed", "fix": "brew install opent
 _PLAN_STATUS = {0: "no_changes", 2: "changes"}
 
 
+class AiRequest(BaseModel):
+    enabled: bool
+
+
 class ChatRequest(BaseModel):
     message: str
     dry_run: bool = False
@@ -1396,6 +1400,28 @@ def create_tf_router(
         if body.dry_run or not proposal.changes:
             return proposal.model_dump()
         return {**proposal.model_dump(), **await save_canvas_now(env, proposal.canvas)}
+
+    @router.get("/ai")
+    async def ai_state() -> dict:
+        """Whether model calls are allowed, and who decided.
+
+        `source` matters to the UI: when `ODIN_AI` is set the switch cannot
+        override it, so the control renders disabled with the reason rather than
+        pretending to work.
+        """
+        forced = os.environ.get(ai.ENV_VAR, "").strip()
+        return {
+            "enabled": ai.off_reason() is None,
+            "source": "env" if forced else "switch",
+            "reason": ai.off_reason(),
+        }
+
+    @router.post("/ai")
+    async def set_ai_state(body: AiRequest) -> dict:
+        """Turn model calls on or off from the UI. Ignored while `ODIN_AI` is
+        set, which is reported rather than silently obeyed."""
+        ai.set_runtime_enabled(body.enabled)
+        return await ai_state()
 
     @router.post("/chat/clear")
     async def chat_clear_route(env: str = ENV) -> dict:

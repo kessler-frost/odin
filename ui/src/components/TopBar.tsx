@@ -83,6 +83,25 @@ export default function TopBar({ streamConnected, env, onEnvChange, onApply, onV
     return () => window.removeEventListener('keydown', h);
   });
 
+  // Model calls are OFF until someone turns them on here (owner decision,
+  // 2026-07-28). `source: "env"` means ODIN_AI is set, which the switch cannot
+  // override -- it renders disabled with the reason instead of pretending to.
+  const [ai, setAi] = useState<{ enabled: boolean; source: string; reason: string | null } | null>(null);
+  useEffect(() => {
+    let alive = true;
+    fetch(`${API}/ai`).then(r => r.json()).then(b => { if (alive) setAi(b); }).catch(() => {});
+    return () => { alive = false; };
+  }, []);
+  const toggleAi = async () => {
+    if (!ai || ai.source === 'env') return;
+    const next = await fetch(`${API}/ai`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: !ai.enabled }),
+    }).then(r => r.json()).catch(() => null);
+    if (next) setAi(next);
+  };
+
   // The agent's conversation lives in the SERVER's memory, per env, and is
   // cleared by a restart or by this. Tucked in the overflow menu on purpose
   // (owner: "I don't want to see it unless I actually want to go there") --
@@ -172,6 +191,22 @@ export default function TopBar({ streamConnected, env, onEnvChange, onApply, onV
         className={`font-mono text-xs py-1.5 px-3 border bg-bg-tertiary transition-all duration-200 ${codeOpen ? 'border-neon-purple text-neon-purple bg-[rgba(170,85,255,0.1)]' : 'border-border-bright text-text-muted hover:bg-bg-hover hover:text-text-primary'} ${!backendUp ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer'}`}
       >
         {'{ }'}
+      </button>
+      <button
+        onClick={toggleAi}
+        disabled={!ai || ai.source === 'env'}
+        title={ai?.source === 'env'
+          ? `ODIN_AI is set in the environment — ${ai.reason ?? 'it decides, not this switch'}`
+          : ai?.enabled
+            ? 'Model calls are ON. Click to turn them off.'
+            : 'Model calls are OFF. Click to allow them.'}
+        className={`font-mono text-xs py-1.5 px-3 border transition-all duration-200 ${
+          ai?.enabled
+            ? 'border-neon-purple text-neon-purple bg-[rgba(170,85,255,0.1)]'
+            : 'border-border-bright text-text-muted bg-bg-tertiary'
+        } ${!ai || ai.source === 'env' ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer hover:bg-bg-hover'}`}
+      >
+        AI {ai?.enabled ? 'ON' : 'OFF'}
       </button>
       <div className="relative" ref={menuRef}>
         <button
