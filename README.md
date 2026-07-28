@@ -338,7 +338,10 @@ The ones most likely to matter:
   with the volume — there is nothing to restore from afterwards.
 - **Import is narrower in `--live` mode**, and a live-imported RDS arrives with
   odin's default password, because no AWS API returns one.
-- **Lambda is inline code only**, one version, with no S3-deployed packages.
+- **Lambda dependencies are vendored only.** A function can be a whole directory
+  (`sourceDir`), so it can import its own modules and carry whatever you have
+  installed into that directory — but odin never runs a package manager and
+  fetches nothing at apply time. One version, no S3-deployed packages.
 - **Nebula is single-host.** The mesh, firewall and per-VM daemons work; a second
   machine joining the same environment is still to come.
 
