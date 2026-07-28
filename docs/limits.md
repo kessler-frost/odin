@@ -18,21 +18,42 @@ They are listed because finding one by surprise is worse than reading it here.
   is portable: the `Resource` is odin's node label, because that is what
   `gateway/classify.py` reports and therefore what the evaluator matches. Taken
   to Amazon, each policy needs its `Resource` rewritten as an ARN.
-- **An imported ECS service loses its canvas wiring entirely** — both the
-  `${{producer.ATTR}}` env references and the ordering they produced. The
-  references are deliberately never written into the generated Terraform (a
-  resolved `DATABASE_URL` carries the database password, so it would land in
-  `terraform.tfstate` in plaintext), and odin re-derives `depends_on` *from* those
-  references, so nothing is left to rebuild either from. The import names the
-  producers the service depended on and tells you to re-add the references.
-- **An imported security group's OUTBOUND rules do not survive.** odin re-emits
-  its own wide-open egress (everything to `0.0.0.0/0`) for every group and has no
-  canvas field for outbound rules, so a source that restricted egress comes back
-  unrestricted. The import says so on its own line rather than leaving you to
-  find it. Inbound rules do round-trip, including the identity form
-  (`security_groups = [...]` → the referenced group's label), except that odin's
-  rule is a single port: an ingress block with a port RANGE is reported and left
-  out, so the regenerated group allows *less* than the source.
+- **An imported workload's canvas wiring survives, but only from a file odin
+  generated.** A `${{producer.ATTR}}` env reference is still never written into
+  the Terraform as a *resolved* value (a resolved `DATABASE_URL` carries the
+  database password, so it would land in `terraform.tfstate` in plaintext).
+  What odin emits instead is the reference itself, as a tag —
+  `"odin:ref:DATABASE_URL" = "db.DATABASE_URL"` — which names the variable and
+  the producer and carries no secret. The import reads those back into the node's
+  `env`, so both the references and the ordering return: odin re-derives
+  `depends_on` *from* the references, so recovering them recovers the ordering
+  for free (verified by generating, importing, and generating again — the second
+  file's `depends_on` is identical to the first's). This covers **ecs and
+  lambda**, the two kinds that carry wiring. A project odin did *not* generate
+  has no such tags, and for it the old limit stands unchanged: only `depends_on`
+  is left, odin cannot rebuild the references from it, and the import names the
+  producers and tells you to re-add them.
+- **An imported security group's OUTBOUND rules survive**, in the same
+  `protocol:port:destination` form as inbound, including the identity form
+  (`security_groups = [...]` → the referenced group's label). Two things to know.
+  **odin's rule is a single port**, so an `egress` (or `ingress`) block with a
+  port RANGE is reported and left out — and for egress the direction of that loss
+  is the dangerous one: an *empty* rules field is exactly what makes odin emit its
+  wide-open default, so a group whose only outbound rule odin cannot express does
+  not come back with no egress, it comes back with all of it. The import says
+  which of the two happened in as many words. **Outbound is carried, not
+  enforced**: odin's SG→Nebula firewall compiler reads inbound rules only, so an
+  egress rule reaches the gateway's security-group record and `tofu plan` and
+  restricts nothing on the mesh.
+- **An IPv6 CIDR cannot be written as a security-group rule.** odin's rule format
+  is `protocol:port:source` and an IPv6 address contains colons, so the source
+  cannot be told from the port. The rule is reported and left out rather than
+  imported as text odin can write and cannot read back — which is what used to
+  happen: the group imported clean, and *regenerating* it then dropped the entire
+  `aws_security_group`, taking every other rule in it along. Making IPv6
+  authorable needs more than a format change: the Nebula firewall compiler reads
+  `IpRanges` and `UserIdGroupPairs` only, so an IPv6 rule would be carried,
+  stored, visible in `tofu plan` and enforced by nothing.
 - **Some arguments are re-emitted with odin's own value whatever you wrote**, and
   each one warns on its own line — `imported with CHANGED argument(s) -- odin
   substitutes its own value` — kept separate from the `imported without unmodeled

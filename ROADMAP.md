@@ -1462,12 +1462,28 @@ index-to-index deletion on this file.
      database. A named volume per instance would survive a container replacement
      and make the recovery non-destructive, which changes the disclosure in
      `server.py::_RECOVERY_COST` from a warning into a footnote.
-  3. **An ECS service's canvas wiring cannot be imported** — env refs are never
-     written into the HCL (a resolved DATABASE_URL carries a password), and
-     `depends_on` is re-derived from those refs, so neither survives. Wants a
-     non-secret representation of a ref that Terraform can carry.
-  4. **sqs/sns tags are dropped on import** (`_CARRIED_ATTRS` lists only `name`
-     while `hcl.py` emits tags for every kind). Small and mechanical.
+  3. ~~**An ECS service's canvas wiring cannot be imported.**~~ CLOSED in
+     v0.8.14. The non-secret representation this asked for is a tag:
+     `"odin:ref:DATABASE_URL" = "db.DATABASE_URL"` names the variable and the
+     producer and carries no resolved value, so it can be written into the HCL
+     without putting a password in `terraform.tfstate`. The import reads it back
+     into the node's `env`, for **ecs and lambda** both. The ordering came back
+     with it at no extra cost: `depends_on` is `sorted(set(...))` over the ref
+     TARGETS, so it is a function of which refs exist, not of their order —
+     verified by generating, importing and generating again and diffing the
+     `depends_on` lines. The literal `${{...}}` text was NOT an option and that
+     was measured, not assumed: OpenTofu rejects it as a parse error, and the
+     escaped form uses characters outside AWS's tag-value set. A project odin did
+     not generate still cannot have its wiring rebuilt, and the import says so.
+  4. ~~**sqs/sns tags are dropped on import.**~~ CLOSED in v0.8.14 — and it was
+     **four** kinds, not two: `dynamodb` and `iam_role` had the identical defect
+     and were not in the report. It was also two bugs, since `hcl.py` stamps an
+     `odin:node` tag on every primary: those four kinds *also* printed
+     `imported without unmodeled attribute(s): tags` on every import of odin's
+     own output, about a tag odin itself had just written. Fixed as a shape
+     rather than four instances — `tags` is unioned in centrally instead of
+     listed per kind, the second list that could disagree with the first is
+     deleted, and a test parametrized over `_KIND` covers a kind added later.
   5. **Envs are never removable.** `odin destroy --env X` tears the resources
      down and leaves the env registered with a reconciler ticking forever; seven
      accumulated during one field-test session. Wants `odin env rm` or a
@@ -1487,16 +1503,23 @@ index-to-index deletion on this file.
   - **sg** — the rules are what the Nebula firewall compiles from, so losing them
     loses the security posture. Both directions of difference are reported: an
     `ingress` block that cannot be one `protocol:port:source` line (a port RANGE)
-    is named with a count because the group then allows LESS, and `egress` cannot
-    survive at all (odin re-emits its own wide-open default and has no outbound
-    field) so a restricted source comes back UNRESTRICTED.
+    is named with a count because the group then allows LESS, and `egress` could
+    not survive at all — odin re-emitted its own wide-open default and had no
+    outbound field, so a restricted source came back UNRESTRICTED.
+    *(v0.8.14 closed the egress half: there is an `egressRules` field now and the
+    rules round-trip. The loss that remains is narrower and points the other way
+    — a rule odin cannot express empties the field, and an empty field is what
+    selects the wide-open default. See `docs/limits.md`.)*
   - **ec2** — three references that each decide something different: containment
     (unappliable without it), security groups (less protected), and the companion
     key pair (unreachable). One warning each, not one vague line.
   - **ecs** — one node, three resources. The task definition folds on; placement
-    survives. Its canvas WIRING cannot: env refs are deliberately never written
-    into the HCL, and since odin re-derives `depends_on` from those refs, neither
-    the values nor the ordering come back.
+    survives. Its canvas WIRING could not: env refs were deliberately never
+    written into the HCL, and since odin re-derives `depends_on` from those refs,
+    neither the values nor the ordering came back.
+    *(v0.8.14 closed this too, with an `odin:ref:<VAR>` tag carrying the
+    reference rather than its resolved value. The reasoning above still holds for
+    a file odin did not generate, which has no such tags.)*
   - **lambda** — config from the HCL, body from the zip beside it. It also
     exposed a defect older than the feature: a lambda's AUTO-GENERATED role
     imported as a node the user never drew, so a one-lambda canvas round-tripped
