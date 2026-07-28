@@ -1207,20 +1207,6 @@ index-to-index deletion on this file.
   Verified live: expanded instance at 248..448, workload at 318..400 inside it,
   node reads `ECS | web | DRAFT | tasks: 2 | on api-server`, `host` persisted.
 
-- [ ] **~~Containment changes configuration~~ (superseded above).** The owner's
-  example: expand an EC2 box, drop an ECS box inside it, and that means **ECS
-  on the EC2 launch type rather than Fargate** — which is a real AWS
-  distinction (ECS tasks run either on EC2 container instances or on Fargate),
-  not a UI convenience. Dropping it back out means Fargate again.
-  **The invariant that makes this safe: identity is preserved.** The node's
-  name/label and anything the user typed stay exactly as they are; only the
-  fields that containment genuinely determines change. A gesture must never
-  silently rewrite something a person authored — that is the same honesty rule
-  the rest of odin follows, applied to the canvas.
-  Needs: a per-kind table of "what does containment in X imply", applied on the
-  containment-stamp path, plus a visible statement of what changed (odin says
-  what it did; it does not quietly do it).
-
 - [x] **IAM edges across the whole catalog.** Turned out broader than this entry
   claimed -- s3, dynamodb, sqs, sns, rds, logs, secret, ssm and elasticache all
   had real vocabularies already. What was genuinely missing was **lambda, ecr and
@@ -1247,12 +1233,63 @@ index-to-index deletion on this file.
   spellings (reporting sqs as unclassified) and matched `nginx:alpine` out of a
   node's defaultData as though it were a grant.
 
-- [ ] **~~IAM edges across the whole catalog~~ (superseded above).** Today the drawn-edge
-  → compiled-policy path is real and enforced, but the action vocabulary is
-  thin outside `s3:*`. Extend to sqs/sns/dynamodb/lambda/ecs/secrets/logs/ecr
-  and the rest, so drawing a lambda → dynamodb edge grants the right actions
-  the way a lambda → s3 edge already does. The compiler and the enforcement
-  point do not change; the vocabulary does.
+- [x] **Every box persists its size, not just containers** (owner question,
+  2026-07-28: *"it's not just ec2's box right? All the boxes and their exact
+  positions and Heights and weights should be persisted if it exists right?"*).
+  Correct, and it was not the case. Positions and widths always persisted;
+  HEIGHTS were dropped on load for every kind except containers, so resizing an
+  S3 or Lambda box silently snapped back.
+
+  The rule outlived its reason. Heights were dropped because an older build
+  baked `measured.height` into the saved canvas and froze every box at its
+  first-render size; `sizeForSave` stopped writing measurements, which fixed
+  that at the source. After that, dropping heights on load could only discard
+  DELIBERATE resizes -- and it had just been caught doing exactly that to an
+  expanded EC2 box, taking a workload's placement with it.
+
+  Now every kind keeps a stored size. The frozen-boxes guarantee is enforced
+  entirely on the save side and tested there: no matter how often a node is
+  measured and re-saved, a height nobody chose is never written. Verified live
+  across three kinds at once (260x140, 300x160, 240x120 all preserved through a
+  reload). One caveat stated rather than guarded: a canvas written before the
+  save-side fix may carry a baked height, which now renders instead of being
+  re-derived -- visible, and one drag from fixed.
+
+- [x] **Placement's four costs: all four closed.** `docs/intelligence-layer.md`
+  named them when placement was designed, and shipping it did not address them.
+
+  * **Ordering — CLOSED.** Nothing sequenced an ecs node behind its ec2 node,
+    and a container cannot launch into a VM that is not up. A placed service now
+    emits `depends_on = [aws_instance.<host>]`, so tofu owns the ordering and it
+    is visible in `plan` rather than being an invisible sleep in the gateway.
+    Combines correctly with ref-derived dependencies.
+  * **Failure meaning — CLOSED.** "the VM is not up" and "the task failed" read
+    identically before: both surfaced as a raw `limactl shell ... failed`. They
+    need OPPOSITE responses from a person -- bring the instance back, versus fix
+    the workload -- so a placed task's failure now names the instance and says
+    the workload can only run once it is up, while keeping the underlying cause.
+    An unplaced task's message is byte-for-byte unchanged.
+  * **Capacity — CLOSED.** An EC2 node is a real Lima VM sized by its instance
+    type (t3.micro -> 1GiB) and a placed task gets a real memory cap (512 MiB by
+    default), so "three services of two tasks each inside a t3.micro" is
+    arithmetic odin cannot honour. `spec/capacity.py` sums the demand per
+    instance and /apply-full refuses with a 409 BEFORE anything is built --
+    beside the wiring guard, naming the instance, what was asked, what it has,
+    and what to do about it. The alternative was never "it works": it was
+    OOM-killed containers minutes later, reported as task failures that say
+    nothing about the instance being too small.
+    Deliberately NOT a scheduler -- one sum per instance, checked once. It
+    reserves 256 MiB for guest kernel/containerd overhead and says so in the
+    message rather than hiding the fudge inside the comparison. A canvas that
+    places nothing pays nothing.
+  * **Naming — CLOSED as documentation, which is what it was.** `LimaRuntime`
+    means two things depending on its `vm`: odin's shared VM-isolation runtime
+    mode (`odin-host`) and one specific EC2 instance
+    (`odin-ec2-<env>-<label>`). Its class docstring now states both, side by
+    side, with the two constructor calls that produce them -- and
+    `DEFAULT_VM` is named for the shared one so the default cannot be mistaken
+    for "no VM". A type-level split would buy nothing today: the behaviour is
+    identical and only the target differs. Revisit if a third meaning appears.
 
 - [ ] **Placement that infers intent from geometry.** The general form of the
   first item: what a person expresses by putting one thing inside, next to, or

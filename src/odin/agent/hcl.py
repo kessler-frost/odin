@@ -310,9 +310,33 @@ def _ref_dependencies(res: ResourceDesired, refs: Refs) -> list[str]:
     return addresses
 
 
-def _depends_on_block(res: ResourceDesired, refs: Refs) -> str:
-    addresses = _ref_dependencies(res, refs)
-    return f"  depends_on = [{', '.join(addresses)}]" if addresses else ""
+def _depends_on_block(res: ResourceDesired, refs: Refs, extra: list[str] | None = None) -> str:
+    addresses = _ref_dependencies(res, refs) + list(extra or [])
+    # de-duplicated and ordered, so a host that is ALSO a ref target appears once
+    return f"  depends_on = [{', '.join(sorted(set(addresses)))}]" if addresses else ""
+
+
+def _placement_dependency(res: ResourceDesired, refs: Refs) -> list[str]:
+    """The EC2 instance a placed workload must not start before.
+
+    One of the four costs `docs/intelligence-layer.md` named when placement was
+    designed: the instance's VM has to exist before a task can be scheduled into
+    it, and nothing sequenced an ecs node behind its ec2 node.
+
+    `depends_on` is the honest fix rather than a wait loop: tofu already owns
+    ordering here, the dependency is real (the container literally cannot launch
+    into a VM that is not up), and it shows up in `tofu plan` rather than being
+    an invisible sleep somewhere in the gateway.
+
+    Silent when the host does not resolve to an ec2 node on this canvas -- an
+    unresolvable placement is reported by `_ecs` itself, and inventing a
+    dependency on nothing would only produce a worse error later.
+    """
+    host = _field(res, "host", "").strip()
+    if not host:
+        return []
+    kind, name = refs.get(host, ("", ""))
+    return [f"aws_instance.{name}"] if kind == "ec2" else []
 
 
 def _ref_fault(res: ResourceDesired, ref: Ref, refs: Refs) -> str | None:
@@ -797,7 +821,7 @@ def _ecs(res: ResourceDesired, refs: Refs) -> Built:
     # service, so its tasks never launch before the endpoint they consume
     # exists. The VALUES arrive at container launch, not through the HCL --
     # `_WIRED_KINDS` above.
-    depends_on = _depends_on_block(res, refs)
+    depends_on = _depends_on_block(res, refs, _placement_dependency(res, refs))
     if depends_on:
         blocks.append(depends_on)
     # W2.5: an `alb` node edged to this service fronts it -- which in real AWS

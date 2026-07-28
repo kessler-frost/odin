@@ -1,6 +1,31 @@
 # The intelligence layer — canvas gestures as the language
 
-**Status:** design, not built. Owner directive 2026-07-27, after v0.7.7.
+**Status:** the FIRST GESTURE IS BUILT and shipped in v0.8.0 — an ecs box drawn
+inside an ec2 box places that workload's tasks in that instance's VM, end to
+end. The rest of this document is still design. Owner directive 2026-07-27,
+after v0.7.7; first gesture landed 2026-07-28.
+
+**What changed against this document's own predictions, now that it has been
+built** (kept here rather than rewritten away, because the misses are the useful
+part):
+
+- The unlocking change it named — `LimaRuntime.VM` being a class constant — was
+  exactly right, and became `LimaRuntime(vm=...)` per instance.
+- It framed the gesture as **Fargate → EC2 launch type**. That turned out to be
+  wrong in a way worth recording: odin already emits `launch_type = "EC2"`
+  unconditionally and has NO Fargate substrate, so flipping the label would have
+  claimed a distinction odin cannot back. What shipped is PLACEMENT — where the
+  container actually runs — expressed as a real
+  `placement_constraints { memberOf }` so it survives `tofu plan` and the
+  provider round trip.
+- It missed a prerequisite entirely: an expanded EC2 box did not SURVIVE a
+  reload, because a leaf's stored height was dropped on load. The gesture was
+  unusable until that was fixed — and fixing it revealed the same bug for every
+  other kind, which the owner then caught and which is now general.
+- Its four stated costs (ordering, capacity, failure meaning, naming) all
+  remain real and unaddressed. Placement chooses a VM; nothing yet sequences an
+  ecs node behind its ec2 node, bounds how many tasks one instance may hold, or
+  separates "the VM is not up" from "the task failed".
 
 > "canvas and navigating things around IS the language of odin, and not
 > chatting with a bot to update things around" — the owner.
