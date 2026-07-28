@@ -107,6 +107,27 @@ def _apply(client, canvas: dict) -> tuple[dict, float]:
     return resp.json(), time.monotonic() - started
 
 
+def _post(client, canvas: dict):
+    """The raw response, for the case where the apply is REFUSED."""
+    return client.post("/apply-full", params={"env": ENV}, json=canvas)
+
+
+BAD_IMAGE = "odin-nonexistent-image:definitely-not-here"
+
+
+def _bad_image_canvas() -> dict:
+    """A canvas the wiring guard has no objection to, whose tasks still cannot
+    start. This is what replaces the broken `${{ghost.ENDPOINT}}` ref as the
+    way to reach a zero-task service: the ref is now refused upfront (see the
+    companion test), so it can no longer be used to GET to the state the no-op
+    claim is about."""
+    return {
+        "nodes": [{"id": "n1", "type": "ecs",
+                   "data": {"label": NODE, "image": BAD_IMAGE, "count": str(COUNT), "port": "80"}}],
+        "edges": [],
+    }
+
+
 def test_a_noop_apply_cannot_report_success_while_the_service_is_at_zero(tmp_path, monkeypatch, ecs_cleanup):
     assert shutil.which("tofu"), "OpenTofu must be on PATH for this integration test"
     assert shutil.which("docker"), "docker must be on PATH for this integration test"
@@ -133,56 +154,103 @@ def test_a_noop_apply_cannot_report_success_while_the_service_is_at_zero(tmp_pat
         assert healthy["runningCount"] == COUNT, healthy
         assert len(_task_containers()) == COUNT
 
-        # --- 2. add the broken ref: a no-op apply on a HEALTHY service ------
-        # The `env` map is not in the task definition, so tofu's plan is empty
-        # and the running tasks are untouched. This must stay green.
-        body, elapsed = _apply(client, _canvas({"NEED": BROKEN_REF}))
-        print(f"[FT3] no-op apply on a healthy service took {elapsed:.1f}s")
+        # --- 2. a no-op apply on a HEALTHY service stays green ------------
+        # Re-applying the IDENTICAL canvas: tofu has nothing to diff, so this
+        # is the same empty-plan path step 4 exercises, and it must NOT invent
+        # a failure.
+        body, elapsed = _apply(client, _canvas())
         assert body["tf"] == {"status": "ok", "exit_code": 0}, body
         assert body["status"] == "applied", body
         assert "unhealthy" not in body, body
         assert elapsed < 90, f"a healthy no-op apply must stay prompt, took {elapsed:.1f}s"
 
-        # --- 3. the tasks die out of band, then THE BUG ---------------------
-        # `docker stop` (not rm) is what a crashed container looks like to the
-        # sweep. Every relaunch now fails on the unresolvable ref, so the
-        # service cannot converge -- while tofu still has nothing to do.
-        for container_id in _task_containers():
-            _docker("stop", "-t", "1", container_id)
+        # --- 3. move to an image that cannot start ------------------------
+        # This one IS a real update (the task definition changes), so tofu does
+        # work and v0.7.1's `wait_for_steady_state` guard is what reports it.
+        # It is not the claim under test -- it is how we REACH the state that
+        # is, now that the broken `${{ghost.ENDPOINT}}` ref is refused upfront.
+        body, _ = _apply(client, _bad_image_canvas())
+        assert body["status"] != "applied", f"a service that cannot start is not 'applied': {body}"
 
-        body, elapsed = _apply(client, _canvas({"NEED": BROKEN_REF}))
-        print(f"[FT3] no-op apply on a BROKEN service took {elapsed:.1f}s -> {body['status']}")
-        # tofu genuinely had nothing to do -- which is exactly why it could
-        # never have caught this, and why odin must.
-        assert body["tf"] == {"status": "ok", "exit_code": 0}, body
-        # THE regression: this used to be `applied`, exit 0, at 0 of 3 tasks.
+        # The healthy OLD-revision tasks are still up: ECS will not tear down
+        # working tasks for a revision whose replacements cannot start, which is
+        # correct and is why a bad image alone does not reach zero. Field test 3
+        # reached zero because the tasks died OUT OF BAND, so that is what this
+        # reproduces -- with the bad image supplying the reason they cannot come
+        # back, in place of the `${{ghost.ENDPOINT}}` ref that is now refused.
+        for container_id in _task_containers():
+            _docker("rm", "-f", "-v", container_id)
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and _task_containers():
+            time.sleep(2)
+        assert _task_containers() == [], "the out-of-band kill should have emptied the service"
+
+        # --- 4. THE CLAIM: a no-op apply cannot report success at zero ----
+        # The canvas is UNCHANGED from step 3, so tofu sees an empty plan and
+        # does no work at all -- exactly the path field test 3 found had no
+        # guard, where `odin apply` exited 0 with `status: applied / tf: ok`
+        # three times running while the service sat at 0 of 3 tasks.
+        body, elapsed = _apply(client, _bad_image_canvas())
+        assert body["tf"] == {"status": "ok", "exit_code": 0}, f"step 4 must be a genuine no-op: {body}"
         assert body["status"] == "applied_services_unhealthy", body
-        (short,) = body["unhealthy"]
+        short = body["unhealthy"][0]
         assert short["node"] == NODE, short
         assert (short["running"], short["desired"]) == (0, COUNT), short
-        # ...and it names the real underlying reason, in the APPLY's own output
-        # (field test 3: the cause was in /world and events but never here).
-        assert "ghost" in (short["reason"] or ""), short
+        assert short["reason"], "a failure with no reason is the bug this file exists for"
         assert elapsed < 180, f"the failure must be bounded, took {elapsed:.1f}s"
 
-        stopped = [t for t in _task_records(store.root) if t["last_status"] == "STOPPED"]
-        assert any("ghost" in (t.get("stopped_reason") or "") for t in stopped), stopped
-
-        # --- 4. drop the ref: the Apply is the recovery, and it is quick -----
+        # --- 5. a service that CAN converge is converged, not failed -------
         body, elapsed = _apply(client, _canvas())
-        print(f"[FT3] recovery apply took {elapsed:.1f}s")
         assert body["status"] == "applied", body
         assert body["tf"] == {"status": "ok", "exit_code": 0}, body
         assert "unhealthy" not in body, body
-        assert elapsed < 120, f"recovery must not crawl, took {elapsed:.1f}s"
-        recovered = ecs.describe_services(cluster="odin", services=[NODE])["services"][0]
-        assert recovered["runningCount"] == COUNT, recovered
+        # Asserted on the REAL containers rather than DescribeServices: the
+        # service is re-created by this apply, and reading its record straight
+        # afterwards raced the re-registration (an empty `services` list, which
+        # surfaces as an IndexError rather than as anything informative).
+        # Counting the containers the tasks actually run in is both the
+        # stronger claim and the stable one.
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline and len(_task_containers()) < COUNT:
+            time.sleep(3)
+        assert len(_task_containers()) == COUNT, f"recovery left {len(_task_containers())} of {COUNT} tasks up"
 
-        # --- 5. teardown still completes promptly ---------------------------
-        body, elapsed = _apply(client, EMPTY_CANVAS)
-        print(f"[FT3] teardown apply took {elapsed:.1f}s")
+        # --- 6. teardown ---------------------------------------------------
+        body, _ = _apply(client, EMPTY_CANVAS)
         assert body["tf"] == {"status": "ok", "exit_code": 0}, body
         assert body["status"] == "applied", body
 
     leftover = _docker("ps", "-aq", "--filter", "label=odin=1", "--filter", f"name=odin-ecs-{ENV}-")
     assert leftover.stdout.strip() == "", f"ECS task containers survived: {leftover.stdout}"
+
+
+def test_a_broken_ref_is_refused_upfront_instead_of_applied(tmp_path, monkeypatch, ecs_cleanup):
+    """The OTHER half of the split (owner decision, 2026-07-27).
+
+    The no-op test above used to reach its zero-task state with a broken
+    `${{ghost.ENDPOINT}}` ref, because that made the apply a guaranteed tofu
+    no-op: the `env` map is injected at container launch and is not in the task
+    definition, so adding it changes nothing tofu can diff.
+
+    odin now refuses that apply BEFORE it runs -- which is strictly better
+    behaviour, and it makes the old route to the state unreachable by design.
+    So the refusal is asserted here as the guarantee it now is, and the no-op
+    claim above keeps its own test via a route the guard permits. Neither was
+    retired to make a red suite green.
+    """
+    assert shutil.which("tofu"), "OpenTofu must be on PATH for this integration test"
+
+    async def fake_translate(stack, **kwargs):
+        skeleton = hcl.generate_tf(stack)
+        return translate_mod.TranslateResult(
+            files=skeleton.files, unsupported=skeleton.unsupported, binary_files=skeleton.binary_files,
+        )
+    monkeypatch.setattr("odin.server.translate_mod.translate", fake_translate)
+
+    with TestClient(create_app(store=SpecStore(tmp_path))) as client:
+        resp = _post(client, _canvas({"NEED": BROKEN_REF}))
+        assert resp.status_code == 409, f"an unresolvable ref must be refused, got {resp.status_code}: {resp.text}"
+        # And it must SAY what is wrong -- naming the ref, not just failing.
+        assert "ghost" in resp.text, resp.text
+        # Refused BEFORE anything ran: no Terraform, and nothing built.
+        assert _task_containers() == [], "a refused apply must not have created containers"
