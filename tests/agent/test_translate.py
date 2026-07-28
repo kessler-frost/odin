@@ -508,18 +508,30 @@ async def test_a_slow_refine_never_blocks_the_request_when_a_cache_is_given(monk
     # deterministic skeleton IMMEDIATELY and refine on a background task -- it
     # must NOT wait out the (here, deliberately slow) SDK pass on the request's
     # critical path, the ~45s block the release sweep flagged on every Apply.
+    # The sleep is deliberately far longer than anything this test waits for, so
+    # "returned before the refine finished" is unambiguous rather than a race.
+    # It was 5s against an `elapsed < 1.0` bound, and that 1s absolute threshold
+    # is what broke CI on v0.8.2: a contended runner measured 1.86s (py3.13) and
+    # 2.33s (py3.14) while the 5s refine was plainly still running -- the request
+    # had NOT waited for it, and the test failed anyway. A wall-clock bound tight
+    # enough to be meaningful about scheduling is also tight enough to measure
+    # the runner's load instead of odin's behaviour.
     class _Slow(_FakeClient):
         async def query(self, prompt: str, session_id: str = "default") -> None:
-            await asyncio.sleep(5)
+            await asyncio.sleep(30)
 
     cache = translate_mod.TranslateCache()
     rev = rev_of(_S3_STACK)
     start = time.perf_counter()
-    result = await translate(_S3_STACK, client_cls=_Slow, cache=cache, timeout=5)
+    result = await translate(_S3_STACK, client_cls=_Slow, cache=cache, timeout=30)
     elapsed = time.perf_counter() - start
 
     assert result.refined is False
-    assert elapsed < 1.0, f"request blocked {elapsed:.2f}s on the refine instead of returning immediately"
+    # The real proof is timing-FREE and comes below: the background task is still
+    # pending, which cannot be true if `translate` had awaited it. This bound only
+    # has to be loose enough to survive a busy runner and tight enough that
+    # actually waiting out the 30s refine fails -- a 6x margin either way.
+    assert elapsed < 5.0, f"request blocked {elapsed:.2f}s on the refine instead of returning immediately"
     # the background refine really was kicked (and is still running)
     assert cache._refining(rev)
     cache._tasks[rev].cancel()
