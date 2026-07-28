@@ -28,10 +28,24 @@ FILE = typer.Option(
 )
 
 
-def _graph(url: str, file: Path | None, output: OutputFormat) -> dict:
+def _graph(url: str, env: str, file: Path | None, output: OutputFormat) -> dict:
+    """The canvas this apply will build, from THIS env.
+
+    The `env` argument was missing until v0.8.9, and the canvas has been
+    per-environment since v0.7.9 -- so `odin apply --env prod` fetched
+    DEFAULT's canvas and applied it to prod. Found by field test: an env whose
+    canvas held s3+sqs+rds came up with the default env's lambda instead, and
+    its own two resources never existed.
+
+    Worse than showing the wrong thing, because apply RECONCILES: any resource
+    the target env legitimately had and the default canvas does not name is
+    torn down. `/canvas` has honoured `?env=` since v0.7.9; this call site was
+    simply never updated, which is the same drift the canvas router's own
+    docstring describes for the route itself.
+    """
     if file is not None:
         return http.parse_json_arg(file.read_text(), str(file))
-    return http.body_or_fail(http.request("GET", url, "/canvas"), output)
+    return http.body_or_fail(http.request("GET", url, "/canvas", params={"env": env}), output)
 
 
 def _echo_tf(tf: dict) -> None:
@@ -87,7 +101,7 @@ def apply(
     output: OutputFormat = http.OUTPUT,
 ) -> None:
     """Apply a canvas to an env: reconcile backings + tofu apply (the UI's Apply button)."""
-    graph = _graph(url, file, output)
+    graph = _graph(url, env, file, output)
     # `not_covered` -- the one field a CI gate should read -- comes from the
     # SERVER (v0.7.4). v0.7.3 computed it here, which left the same trap open
     # for `curl /apply-full`: an agent or a CI job without the odin CLI got the
