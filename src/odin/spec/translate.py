@@ -280,9 +280,72 @@ def drawn_node_types(canvas: dict) -> dict[str, str]:
     }
 
 
+
+# The edge kind that means "this security group gates this resource".
+#
+# Membership is a RELATIONSHIP, not ownership: containment already supplies an
+# SG's own `vpc_id` (it belongs to exactly one VPC, immutably), but WHICH
+# instances a group gates is a many-to-many fact between peers, and geometry
+# cannot express it. Before this it could only be typed into an ec2/rds node's
+# `securityGroups` text field, so the canvas could not show it at all.
+SG_MEMBERSHIP = "sg"
+
+# Kinds whose HCL reads `securityGroups` (`agent/hcl.py::_security_group_refs`,
+# used by `_ec2` and `_rds`). An SG edge to anything else is left alone rather
+# than invented into a field nothing consumes.
+_SG_MEMBERS = frozenset({"ec2", "rds"})
+
+
+def _merge_sg_edges(
+    resources: tuple[ResourceDesired, ...], edges: tuple[Edge, ...],
+) -> tuple[ResourceDesired, ...]:
+    """Fold SG-membership edges into each member's `securityGroups` field.
+
+    The field is NOT replaced. A hand-authored canvas (`odin canvas set`, the
+    README's own JSON schema, the translation agent next) writes it directly and
+    must keep working, so an edge ADDS to whatever is typed there -- the edge is
+    another way to author the same fact, not a second source of truth competing
+    with it. `agent/hcl.py` therefore needs no change at all: it still reads one
+    field, and cannot tell how a line got there.
+
+    Order is preserved and duplicates are dropped, so drawing an edge that
+    duplicates a typed line is a no-op rather than a doubled `security_groups`
+    entry -- which real AWS rejects.
+
+    Direction is not significant. An edge drawn sg->instance and one drawn
+    instance->sg express the same intent, exactly as an IAM edge does
+    (`edgeDataForConnection` in the UI takes the same view), so both are read
+    the same way rather than one silently doing nothing.
+    """
+    by_id = {r.id: r for r in resources}
+    extra: dict[str, list[str]] = {}
+    for edge in edges:
+        if edge.kind != SG_MEMBERSHIP:
+            continue
+        for group, member in ((edge.src, edge.dst), (edge.dst, edge.src)):
+            if (by_id.get(group) or None) is None or (by_id.get(member) or None) is None:
+                continue
+            if by_id[group].kind == "sg" and by_id[member].kind in _SG_MEMBERS:
+                extra.setdefault(member, []).append(group)
+
+    if not extra:
+        return resources
+    merged = []
+    for res in resources:
+        groups = extra.get(res.id)
+        if not groups:
+            merged.append(res)
+            continue
+        typed = [ln.strip() for ln in str(res.fields.get("securityGroups", FieldValue(value="")).value).splitlines() if ln.strip()]
+        combined = list(dict.fromkeys([*typed, *groups]))
+        fields = {**res.fields, "securityGroups": FieldValue(value="\n".join(combined), provenance="user")}
+        merged.append(res.model_copy(update={"fields": fields}))
+    return tuple(merged)
+
+
 def canvas_to_stack(canvas: dict, env: str = "default") -> Stack:
     nodes = canvas.get("nodes") or []
     labels = {n["id"]: _node_id(n) for n in nodes if n.get("id")}
     resources = tuple(r for n in nodes if (r := _resource(n)) is not None)
     edges = tuple(_edge(e, labels) for e in (canvas.get("edges") or []))
-    return Stack(env=env, resources=resources, edges=edges)
+    return Stack(env=env, resources=_merge_sg_edges(resources, edges), edges=edges)

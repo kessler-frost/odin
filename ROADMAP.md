@@ -1131,19 +1131,6 @@ future decision against these points instead of re-deriving them:
 
 ## Next — known, measured, not yet fixed
 
-- [ ] **An unknown node `type` renders as a blank white box, silently.** Found
-  while regenerating the README hero: the canvas said `"type": "role"` where the
-  catalog kind is `iam_role`, and odin drew an unlabelled white rectangle with no
-  hint that the type was unrecognised. It looks like a rendering bug in odin
-  rather than a typo in the canvas -- I assumed it was one for a minute myself.
-
-  Same family as the missing-handles bug, and the same fix direction: a canvas
-  is a first-class hand-authored input (`odin canvas set`, the translation agent
-  next), so an unrecognised kind should SAY so on the node -- and `POST /canvas`
-  could name it the way `canvas_problems` already names a malformed label,
-  without refusing the canvas (an unknown kind is applied-and-skipped by design,
-  not invalid).
-
 - [ ] **The edge-type selector, when there is anything to select.** Owner design
   call (2026-07-28): what an edge MEANS depends on the components it connects,
   and where a pair could legitimately mean more than one thing odin should ASK
@@ -1220,23 +1207,28 @@ future decision against these points instead of re-deriving them:
   because an unknown kind is applied-and-skipped BY DESIGN; the canvas is valid,
   it just cannot be built, and what was missing was any way to SEE that.
 
-- [ ] **SG membership should be an edge** (owner design call; scoped, not
-  started). Which instances a security group gates is a RELATIONSHIP, not
-  ownership -- unlike `vpc_id`, which containment correctly supplies. Today it is
-  an EC2 node's `securityGroups` TEXT FIELD, one SG label per line
-  (`agent/hcl.py::_security_group_refs`), so the canvas cannot show it at all.
+- [x] **SG membership is an edge.** Which instances a security group gates is a
+  RELATIONSHIP, not ownership -- containment correctly supplies an SG's own
+  `vpc_id` (one VPC, immutable), but membership is many-to-many between peers and
+  geometry cannot express it. It could previously only be TYPED into an ec2/rds
+  `securityGroups` field, so the canvas could not show it at all.
 
-  Shape, from reading the current path: a new edge kind between an sg node and a
-  compute node, merged by `spec/translate.py` into the target's
-  `securityGroups`. `hcl.py` needs no change -- it already reads that field, so
-  the edge becomes another way to AUTHOR what it consumes rather than a second
-  source of truth. The field must keep working (a hand-authored canvas uses it),
-  so the merge -- and its precedence when both are present -- is the part that
-  wants tests written first.
+  The design that keeps it safe: the edge ADDS to that field rather than
+  replacing it, so `agent/hcl.py` is untouched -- it still reads one field
+  (`_security_group_refs`) and cannot tell how a line got there. A hand-authored
+  canvas keeps working unchanged, duplicates collapse (real AWS rejects a doubled
+  entry), and direction is not significant, exactly as for an IAM edge.
 
-  Note this may be what finally makes the edge-type selector real: an sg->compute
-  pair could plausibly read as either membership or a network edge, and the
-  ambiguity ratchet above will say so the moment it does.
+  Scoped to `ec2`/`rds`, the kinds whose HCL actually reads the field, so the
+  edge cannot author something nothing consumes. Verified end to end: an edge
+  drawn with NO field typed anywhere produced
+  `vpc_security_group_ids = [aws_security_group.api_sg.id]` in real Terraform,
+  and renders solid red against IAM's cyan dashed. 11 translate tests + 5 UI
+  tests.
+
+  It did NOT turn out ambiguous -- a "network" line between a group and an
+  instance would describe nothing -- so the ambiguity ratchet stays green and no
+  selector is needed here.
 
 - [~] **agent-browser cannot draw a connection; its RESULT is now covered.**
   The gesture is still not automatable: handles are 6px and `pointerdown`

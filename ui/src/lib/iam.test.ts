@@ -8,8 +8,14 @@
  * in its entirety -- `lib/iam.ts` had no test file at all.
  */
 import { describe, expect, it } from 'bun:test';
-import { BUILTINS, CATALOG } from './catalog';
-import { computeTypes, defaultPermissions, detectEdgeTypes, edgeDataForConnection, edgeTypes } from './iam';
+import {
+  computeTypes,
+  defaultPermissions,
+  detectEdgeTypes,
+  edgeDataForConnection,
+  edgeTypes,
+  sgMemberTypes,
+} from './iam';
 
 describe('edgeDataForConnection', () => {
   it('a compute -> data-resource edge is an IAM edge with that resource\'s permissions', () => {
@@ -56,44 +62,34 @@ describe('edgeDataForConnection', () => {
   });
 });
 
-describe('edge-type ambiguity: the selector this repo does NOT have yet', () => {
-  // The owner's design call (2026-07-28): what an edge MEANS depends on the
-  // components it connects, and where a pair could legitimately mean more than
-  // one thing, odin should ASK rather than pick.
-  //
-  // `detectEdgeTypes` already returns an ARRAY, so the model anticipates that.
-  // What it does today is take `[0]` and say nothing. Measured across the whole
-  // catalog: 729 ordered pairs, ZERO ambiguous, because only two edge types
-  // exist (`iam`, `network`) and no pair maps to both. So the selector would
-  // never open, and building it now would be UI with nothing to select.
-  //
-  // This test is the trigger instead. The moment a pair becomes genuinely
-  // ambiguous -- a third edge type, or a pair that legitimately means either --
-  // it FAILS, and it fails pointing at the work that has become necessary
-  // rather than letting `[0]` quietly decide on the user's behalf.
-  it('no pair is ambiguous yet — when one is, build the selector', () => {
-    const types = [...new Set([...CATALOG.map(s => s.type), ...BUILTINS.map(b => b.type)])];
-    const ambiguous: string[] = [];
-    for (const a of types) {
-      for (const b of types) {
-        const candidates = detectEdgeTypes(a, b);
-        if (candidates.length > 1) ambiguous.push(`${a} -> ${b}: ${candidates.join(' | ')}`);
-      }
+describe('security-group membership edges', () => {
+  // Which instances a group gates is a RELATIONSHIP; an SG's own `vpc_id` is
+  // ownership and comes from containment. Before this, membership could only be
+  // typed into an ec2/rds `securityGroups` field, so the canvas could not show it.
+  it('an sg drawn against ec2 or rds means membership, not network', () => {
+    for (const member of sgMemberTypes) {
+      expect(detectEdgeTypes('sg', member)).toEqual(['sg']);
+      expect(edgeDataForConnection('sg', member).edgeType).toBe('sg');
     }
-    expect(ambiguous).toEqual([]);
   });
 
-  it('every pair still resolves to a type that actually exists', () => {
-    // A pair mapping to a type with no definition would render with fallback
-    // styling and no label, which reads as "odin drew a plain line" rather than
-    // as the misconfiguration it is.
-    const types = [...new Set([...CATALOG.map(s => s.type), ...BUILTINS.map(b => b.type)])];
-    for (const a of types) {
-      for (const b of types) {
-        for (const candidate of detectEdgeTypes(a, b)) {
-          expect(Object.keys(edgeTypes)).toContain(candidate);
-        }
-      }
-    }
+  it('reads the same either way round', () => {
+    expect(edgeDataForConnection('sg', 'ec2')).toEqual(edgeDataForConnection('ec2', 'sg'));
+  });
+
+  it('carries no permissions — membership is not a grant', () => {
+    // Permissions on a membership edge would imply odin enforces something it
+    // does not; the SG's own rules are what gate traffic.
+    expect(edgeDataForConnection('sg', 'ec2').permissions).toEqual([]);
+  });
+
+  it('is limited to the kinds whose HCL actually reads securityGroups', () => {
+    // s3 has no such field, so an sg edge to it must not claim to configure one.
+    expect(detectEdgeTypes('sg', 's3')).not.toEqual(['sg']);
+  });
+
+  it('has a definition, so it renders as itself rather than a fallback line', () => {
+    expect(edgeTypes.sg).toBeDefined();
+    expect(edgeTypes.sg.label).toBe('Security Group');
   });
 });

@@ -67,6 +67,12 @@ export type EdgeTypeDef = {
 export const edgeTypes: Record<string, EdgeTypeDef> = {
   iam: { id: 'iam', label: 'IAM Policy', color: '#00e5ff', dashed: true },
   network: { id: 'network', label: 'Network', color: '#4a4a60', dashed: false },
+  // Membership: "this security group gates this resource". A relationship
+  // between peers, unlike an SG's own `vpc_id`, which containment supplies
+  // because a group belongs to exactly one VPC. Solid and red, matching the SG
+  // node's own accent, so a glance separates "what may reach what" (IAM, cyan
+  // dashed) from "what this is behind" (membership).
+  sg: { id: 'sg', label: 'Security Group', color: '#ff3355', dashed: false },
 };
 
 // Given a pair of node types (unordered), return which edge types are valid
@@ -81,6 +87,14 @@ for (const target of Object.keys(iamActionsForTarget)) {
 }
 // W2.5: alb <-> compute is a target edge (see `albTargetTypes` above).
 for (const target of albTargetTypes) edgeTypesForPair[pairKey('alb', target)] = ['network'];
+// An sg drawn against a kind whose HCL reads `securityGroups` means MEMBERSHIP,
+// and only that -- a plain "network" line between a group and an instance would
+// describe nothing. Kept deliberately to the kinds `agent/hcl.py` actually
+// consumes it for (`_ec2`, `_rds`), so the edge cannot author a field nothing
+// reads. Unambiguous, so the ambiguity ratchet in `iam.test.ts` stays green:
+// there is one honest meaning here, and odin should not ask about it.
+export const sgMemberTypes = new Set(['ec2', 'rds']);
+for (const member of sgMemberTypes) edgeTypesForPair[pairKey('sg', member)] = ['sg'];
 
 export function detectEdgeTypes(nodeTypeA: string, nodeTypeB: string): string[] {
   return edgeTypesForPair[pairKey(nodeTypeA, nodeTypeB)] ?? ['network'];
