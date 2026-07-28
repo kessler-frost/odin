@@ -545,11 +545,10 @@ prose explanation of a failure, and the evidence it reads is still there in
   owns the model and binds it to a real substrate.
 - **Translation** (`src/odin/agent/`) is deterministic in both directions, and
   the two directions do not cover the same ground. Canvas → Terraform covers
-  every kind odin builds. Terraform → canvas covers 19 resource types today —
-  not `aws_instance`, `aws_ecs_service`/`_task_definition`/`_cluster` or
-  `aws_lambda_function`, which come back as LISTED unsupported entries rather
-  than being silently dropped, so an import tells you exactly what it could not
-  take.
+  every kind odin builds. Terraform → canvas covers 21 resource types today —
+  not `aws_ecs_service`/`_task_definition`/`_cluster` or `aws_lambda_function`,
+  which come back as LISTED unsupported entries rather than being silently
+  dropped, so an import tells you exactly what it could not take.
   **Runtime:** real containers via Colima (default) or inside a Lima VM
   (`src/odin/runtime/`), and a real Lima VM per EC2 node (`src/odin/compute/`).
 - **Control loop:** a Spec Store (Stack = desired, World = observed) with a pure,
@@ -560,8 +559,8 @@ prose explanation of a failure, and the evidence it reads is still there in
 ## Known limits
 
 - **Import is narrower than generation.** Odin generates 18 kinds and reads back
-  15: `aws_lambda_function`, `aws_instance` and `aws_ecs_service` come back as
-  unsupported, so feeding odin its own `main.tf` does not return every node.
+  16: `aws_lambda_function` and `aws_ecs_service` come back as unsupported, so
+  feeding odin its own `main.tf` does not return every node.
   `--live` is narrower still —
   `s3`, `sqs`, `sns`, `dynamodb`, `rds`, `vpc`, `subnet` only — and a
   live-imported RDS arrives with odin's default password, because no AWS API

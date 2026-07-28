@@ -49,7 +49,7 @@ def test_what_cannot_be_imported_is_listed_rather_than_dropped():
     # `aws_security_group` left this list in v0.8.4 by BECOMING importable --
     # which is what this file is for: the ratchet failed, and the README was
     # corrected in the same change rather than drifting.
-    for kind in ("aws_instance", "aws_ecs_service"):
+    for kind in ("aws_ecs_service",):
         assert kind in listed, f"{kind} vanished silently; listed={sorted(listed)}"
     for entry in result.unsupported:
         assert entry.reason, f"{entry.type} was listed with no reason"
@@ -70,9 +70,9 @@ def test_the_readme_does_not_claim_import_covers_everything():
         "the README summarises translation without saying the import direction "
         "covers less -- determinism and completeness are different claims"
     )
-    for kind in ("aws_instance", "aws_ecs_service"):
+    for kind in ("aws_ecs_service",):
         assert kind in text, f"the README does not name {kind} as un-importable"
     # And the inverse, which is the half that actually rots: a kind that BECAME
     # importable must stop being advertised as a gap.
-    for kind in ("aws_security_group", "aws_ecr_repository"):
+    for kind in ("aws_security_group", "aws_ecr_repository", "aws_instance"):
         assert kind not in text, f"the README still calls {kind} un-importable, but import_tf reads it"

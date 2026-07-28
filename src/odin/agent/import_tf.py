@@ -74,6 +74,11 @@ _KIND = {
     # for no reason other than nobody having written the line.
     "aws_security_group": "sg",
     "aws_ecr_repository": "ecr",
+    # v0.8.4: an `aws_instance` is a real Lima VM to odin, and it has NO `name`
+    # argument -- its label comes from the `odin:node` tag `_label` already falls
+    # back to. Its optional SSH key lives on a companion `aws_key_pair`, folded
+    # back on below rather than becoming a node of its own.
+    "aws_instance": "ec2",
 }
 # W2.5: the two OTHER types an `alb` canvas node expands to. Neither becomes a
 # node of its own -- they fold ONTO the alb node the same way
@@ -114,7 +119,9 @@ _NAME_ATTR = {
 # its repositories exist as gateway-model records. Mode (a), reading an existing
 # HCL project, works for both; claiming mode (b) without an id that resolves is
 # how a live import would generate a bogus import block and fail at apply.
-_NO_LIVE_IMPORT = {"iam_role", "logs", "secret", "ssm", "elasticache", "alb", "sg", "ecr"}
+# `ec2` is out for the same reason as `sg`: an instance's live import id is its
+# `i-...` InstanceId, minted at RunInstances and absent from any canvas.
+_NO_LIVE_IMPORT = {"iam_role", "logs", "secret", "ssm", "elasticache", "alb", "sg", "ecr", "ec2"}
 _TF_TYPE = {kind: rtype for rtype, kind in _KIND.items() if kind not in _NO_LIVE_IMPORT}
 
 # The HCL arguments each kind CARRIES into the canvas -- so a round-trip through
@@ -181,6 +188,11 @@ _CARRIED_ATTRS = {
     # `_stamp_containment` exactly as a subnet's is.
     "sg": {"name", "vpc_id", "ingress", "egress", "tags"},
     "ecr": {"name", "tags"},
+    # `subnet_id` is containment; `vpc_security_group_ids` becomes the node's
+    # `securityGroups` label list; `key_name` is a reference to the companion
+    # aws_key_pair whose `public_key` is the real value.
+    "ec2": {"ami", "instance_type", "subnet_id", "vpc_security_group_ids",
+            "key_name", "user_data", "tags"},
 }
 # The companion resources' equivalent: which of THEIR arguments a round trip
 # reproduces (hcl.py's alb companion pass emits exactly these). Until v0.7.1
@@ -251,7 +263,7 @@ _UNREADABLE_NUMBERS = {
 # node carries -- not a warning about losing them.
 # Every builder in hcl.py appends `_tags_block(res)`, so user tags round-trip
 # for every kind -- these are the ones whose tags are read BACK into `data.tags`.
-_TAGGED_KINDS = {"s3", "logs", "secret", "ssm", "rds", "alb", "vpc", "subnet", "elasticache", "sg", "ecr"}
+_TAGGED_KINDS = {"s3", "logs", "secret", "ssm", "rds", "alb", "vpc", "subnet", "elasticache", "sg", "ecr", "ec2"}
 _CONTAINER_KINDS = ("vpc", "subnet")
 
 # Canvas geometry for the layout pass. These ARE the UI's own container sizes
@@ -574,6 +586,16 @@ def _node_data(kind: str, label: str, attrs: dict) -> dict:
         node_type = hcl.unquote(attrs.get("node_type"))
         if isinstance(node_type, str):
             data["nodeType"] = node_type
+    if kind == "ec2":
+        # `userData` is carried verbatim, and that is a deliberate trust
+        # decision, not an oversight: it is a shell script odin will run on a
+        # real VM. SECURITY.md's rule for the whole import path applies -- treat
+        # an imported .tf like a shell script, because for this field it IS one.
+        for attr, field in (("ami", "ami"), ("instance_type", "instanceType"),
+                            ("user_data", "userData")):
+            value = hcl.unquote(attrs.get(attr))
+            if isinstance(value, str):
+                data[field] = value
     return data
 
 
@@ -656,6 +678,72 @@ def _ingress_rule_line(block: dict, by_hcl_name: dict[str, str]) -> str | None:
         None,
     )
     return f"{protocol}:{from_port}:{source}" if source else None
+
+
+def _stamp_ec2_wiring(
+    node_by_label: dict[str, dict], attrs_by_label: dict[str, dict], by_hcl_name: dict[str, str],
+    key_pairs: dict[str, dict],
+) -> list[str]:
+    """Rebuild an instance's containment, security groups and SSH key.
+
+    Three references, each of which decides whether the node can be applied at
+    all or what it is protected by, so each has its own warning rather than one
+    vague line:
+
+    * `subnet_id` -> the `subnet`/`vpc` stamps. `hcl.py::_ec2` REFUSES to build
+      an instance that is not inside a subnet, so a missing stamp is a node Apply
+      silently skips.
+    * `vpc_security_group_ids` -> the `securityGroups` field, one LABEL per line
+      (`_security_group_refs` reads exactly that). An id odin cannot resolve to
+      an imported group is dropped and counted -- the regenerated instance is
+      then in FEWER groups than the source, which for an inbound-deny default
+      means less reachable, not more exposed, but is still a posture change.
+    * `key_name` -> the companion `aws_key_pair`'s `public_key`, followed by
+      REFERENCE rather than by reconstructing the `<name>_key` naming convention:
+      the convention is hcl.py's private business, and a hand-authored project
+      names its key pairs however it likes.
+
+    A post-pass for `_stamp_sg_rules`' reason -- a group or key pair may be
+    defined after the instance that points at it.
+    """
+    warnings: list[str] = []
+    for label, node in node_by_label.items():
+        if node["type"] != "ec2":
+            continue
+        attrs = attrs_by_label[label]
+
+        subnet = _referenced_label(attrs.get("subnet_id"), "aws_subnet", by_hcl_name)
+        vpc = node_by_label[subnet]["data"].get("vpc") if subnet in node_by_label else None
+        node["data"].update({"subnet": subnet, "vpc": vpc} if subnet and vpc else {})
+        warnings += [] if subnet and vpc else [
+            f"{label} (ec2): imported without containment -- its `subnet_id` names no imported "
+            "aws_subnet inside an imported aws_vpc, so Apply will skip it (\"not contained inside "
+            "a Subnet on the canvas\") until you draw a VPC + Subnet and drop it inside"
+        ]
+
+        wanted = attrs.get("vpc_security_group_ids") or []
+        groups = [
+            found for value in wanted
+            if (found := _referenced_label(value, "aws_security_group", by_hcl_name))
+        ]
+        if groups:
+            node["data"]["securityGroups"] = "\n".join(groups)
+        lost = len(wanted) - len(groups)
+        warnings += [] if not lost else [
+            f"{label} (ec2): {lost} of {len(wanted)} security group(s) could not be imported -- "
+            "the id names no imported aws_security_group, so the regenerated instance is in FEWER "
+            "groups than the source and the rules those groups carried do not apply to it"
+        ]
+
+        target = _ref_target(attrs.get("key_name"))
+        public_key = hcl.unquote((key_pairs.get(target) or {}).get("public_key")) if target else None
+        if isinstance(public_key, str):
+            node["data"]["key"] = public_key
+        warnings += [] if target is None or isinstance(public_key, str) else [
+            f"{label} (ec2): its `key_name` names no imported aws_key_pair, so the instance comes "
+            "back with NO SSH key and you will not be able to log in to it"
+        ]
+    return warnings
 
 
 def _stamp_sg_rules(
@@ -827,6 +915,7 @@ def parse_hcl(files: dict[str, str]) -> ImportResult:
     subscriptions: list[tuple[str, dict]] = []
     secret_versions: list[tuple[str, dict]] = []
     alb_companions: list[tuple[str, str, dict]] = []
+    key_pairs: dict[str, dict] = {}
     node_by_label: dict[str, dict] = {}
     attrs_by_label: dict[str, dict] = {}
     index = 0
@@ -840,6 +929,12 @@ def parse_hcl(files: dict[str, str]) -> ImportResult:
             continue
         if rtype in _ALB_COMPANION_TYPES:
             alb_companions.append((rtype, rname, attrs))
+            continue
+        if rtype == "aws_key_pair":
+            # A COMPANION, like a secret version: it folds onto the instance that
+            # references it and never becomes a node. Keyed by HCL resource name
+            # because that is what the instance's `key_name` interpolation names.
+            key_pairs[rname] = attrs
             continue
         kind = _KIND.get(rtype)
         if kind is None:
@@ -949,6 +1044,7 @@ def parse_hcl(files: dict[str, str]) -> ImportResult:
 
     warnings += _stamp_containment(node_by_label, attrs_by_label, by_hcl_name)
     warnings += _stamp_sg_rules(node_by_label, attrs_by_label, by_hcl_name)
+    warnings += _stamp_ec2_wiring(node_by_label, attrs_by_label, by_hcl_name, key_pairs)
     _layout(nodes)
 
     edges: list[dict] = []
