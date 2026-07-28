@@ -140,6 +140,40 @@ the same reason: a load balancer is not an IAM data-plane target on odin's
 canvas (see `_elbv2_resource`'s own docstring), so tofu is the only principal
 that ever gets here.
 
+EVENTBRIDGE (`events`) SHARES ECR's JSON-target WIRE (`X-Amz-Target:
+AWSEvents.*`, protocol `json`, jsonVersion 1.1 -- read off botocore's OWN
+`events` service model, along with `endpointPrefix: events`, which is the
+SigV4 credential-scope name this module dispatches on) and logs/secrets/ssm's
+WORKLOAD-FACING resource convention: the resource is the bare RULE NAME, which
+for an `events` canvas node IS its label, so an iam edge drawn to that node
+gates the call through the ordinary `evaluate(statements, action, resource)`
+path with no events-specific plumbing.
+
+Its extraction is where the DynamoDB-Streams trap lives, and it is worth
+naming precisely because a repeat is invisible: `_target_resource` reads
+`ResourceArn`, and EventBridge's tag API spells it **`ResourceARN`** (capital
+ARN -- verified against botocore's own `TagResource`/`UntagResource`/
+`ListTagsForResource` input shapes, whose `required` lists say `ResourceARN`).
+Read the DynamoDB spelling here and every tag call resolves to `"*"`, which
+the OPERATOR's wildcard still allows -- so nothing breaks until someone draws
+an iam edge, and then `events:TagResource` on rule `nightly` denies with
+`resource '*'`, indistinguishable from a policy denial. Three key families
+carry a rule identifier and each op uses exactly one: `Name` (Put/Delete/
+Describe/Enable/DisableRule, and the event-BUS ops, where the resource is the
+bus), `Rule` (Put/RemoveTargets, ListTargetsByRule) and `ResourceARN` (the
+three tag ops). `_events_resource` reads all three, in that order -- they never
+co-occur -- falling back to `NamePrefix` for a bare `ListRules` and then to
+`"*"`, never None, so `tofu` is never denied via `unmappable-action`.
+
+`PutEvents` is the ONE op whose identifier is not a top-level member at all:
+real IAM authorizes it against the EVENT BUS, and the bus name rides INSIDE
+the entries list (`Entries[].EventBusName`, defaulting to `default`). A flat
+key scan finds nothing there and returns `"*"` -- and PutEvents is the one
+`events` action a WORKLOAD makes, so that miss would be the silent deny in the
+exact place it costs most. `_events_bus` reads it, with the same bounded gap
+`_ssm_resource` records for a batch `GetParameters`: a multi-bus PutEvents is
+authorized against the FIRST entry's bus.
+
 S3 BUCKET-CONFIG READS (S2, discovered running real tofu through the real
 gateway): the TF AWS provider's `aws_s3_bucket` refresh probes bucket-config
 subresources -- `?policy`, `?tagging`, `?acl`, `?cors`, `?versioning`, etc.
@@ -290,6 +324,8 @@ def classify(
         return _classify_rds(body)
     if service == "elasticloadbalancing":
         return _classify_elbv2(body)
+    if service == "events":
+        return _classify_events(lower_headers, body)
     return None
 
 
@@ -666,6 +702,75 @@ def _classify_elbv2(body: bytes) -> tuple[str, str] | None:
     if not action_name:
         return None
     return f"elasticloadbalancing:{action_name}", _elbv2_resource(params)
+
+
+# EventBridge's default event bus -- the one every rule lands on when a caller
+# names none, and what an entry-less `PutEvents` is authorized against. Kept in
+# lock-step with `gateway/models/eventsctl.py::DEFAULT_BUS`.
+EVENTS_DEFAULT_BUS = "default"
+
+# The rule/bus identifier members, MOST SPECIFIC FIRST. No two of these ever
+# co-occur on one request (verified against botocore's `events` input shapes),
+# so the order is documentation rather than tie-breaking:
+#   Rule        -- PutTargets / RemoveTargets / ListTargetsByRule
+#   Name        -- Put/Delete/Describe/Enable/DisableRule, and Create/Delete/
+#                  DescribeEventBus (where the resource IS the bus)
+#   ResourceARN -- TagResource / UntagResource / ListTagsForResource. CAPITAL
+#                  ARN: this is the spelling that makes the difference between
+#                  a real name and a silent `"*"` (module docstring).
+#   NamePrefix  -- the LIST ops' only identifier, the same last-resort
+#                  `_logs_resource` gives `logGroupNamePrefix`.
+_EVENTS_ID_MEMBERS = ("Rule", "Name", "ResourceARN", "NamePrefix")
+
+
+def _events_bare_name(value: str) -> str:
+    """The bare RULE or EVENT BUS name -- kept in lock-step with
+    `gateway/models/eventsctl.py::bare_name`.
+
+    `arn:aws:events:…:rule/nightly` -> `nightly`; a custom-bus rule ARN
+    (`…:rule/{bus}/{rule}`) and a bus ARN (`…:event-bus/{bus}`) reduce the same
+    way, because in all three the name is the last `/`-segment. A value that
+    isn't an ARN comes back UNCHANGED, which is safe rather than lucky:
+    EventBridge rule and bus names are `[\\.\\-_A-Za-z0-9]+` (no slash), so a
+    bare name has no `/`-segment to lose -- and `EventBusName` really is
+    documented as "the name OR ARN of the event bus", so both forms arrive."""
+    return value.rsplit("/", 1)[-1] if value.startswith("arn:") else value
+
+
+def _events_bus(payload: dict) -> str:
+    """`PutEvents`' resource: the EVENT BUS its first entry names.
+
+    Not a top-level member -- `Entries[].EventBusName` -- which is the whole
+    reason this has its own function instead of another `_EVENTS_ID_MEMBERS`
+    entry (module docstring). An entry that names no bus, or a request with no
+    usable entries at all, is the DEFAULT bus, matching EventBridge itself."""
+    entries = payload.get("Entries")
+    first = entries[0] if isinstance(entries, list) and entries and isinstance(entries[0], dict) else {}
+    name = first.get("EventBusName")
+    return _events_bare_name(name) if isinstance(name, str) and name else EVENTS_DEFAULT_BUS
+
+
+def _events_resource(op: str, payload: dict) -> str:
+    """The bare rule name (or bus name, for the bus/PutEvents ops), in the
+    never-None style every service since `_logs_resource` uses: a real value
+    when the request carries one, `"*"` otherwise."""
+    if op == "PutEvents":
+        return _events_bus(payload)
+    value = _first_str(payload, *_EVENTS_ID_MEMBERS)
+    return _events_bare_name(value) if value else "*"
+
+
+def _classify_events(lower_headers: dict[str, str], body: bytes) -> tuple[str, str] | None:
+    """EventBridge: ECR's JSON-target wire shape, `X-Amz-Target: AWSEvents.*`."""
+    target = lower_headers.get("x-amz-target")
+    if target is None or "." not in target:
+        return None
+    op = target.rsplit(".", 1)[1]
+    try:
+        payload = json.loads(body) if body else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return f"events:{op}", _events_resource(op, payload)
 
 
 def _classify_ecs(lower_headers: dict[str, str], body: bytes) -> tuple[str, str] | None:

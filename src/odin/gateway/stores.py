@@ -292,6 +292,18 @@ class SynthStores:
       RemoveTags/DescribeTags all take `ResourceArns`, never a typed id). The
       REAL substrate this state describes is an nginx container per load
       balancer (`compute/proxy.py`), never anything in this file.
+    - `eventsctl`: the EventBridge model's whole state
+      (`gateway/models/eventsctl.py`) -- flat keys `"rule:{bus}:{name}"` /
+      `"targets:{bus}:{rule}"` (a LIST of the target dicts terraform sent,
+      stored verbatim) / `"bus:{name}"`, persisted at
+      `.odin/{env}/gateway/eventsctl.json`. Rule and event-bus tags live in the
+      shared `tags` store above, keyed `"events:{arn}"` (EventBridge's tag API
+      is ARN-only: Tag/Untag/ListTagsForResource all take `ResourceARN`, never
+      a typed id). The DEFAULT event bus has NO `bus:` record on purpose -- it
+      always exists, so storing one would only create a way for it to be
+      missing (`eventsctl._bus`). There is no substrate behind any of this yet:
+      the rules and targets are real and durable, and nothing DELIVERS an
+      event to them -- see that module's PutEvents note.
     """
 
     def __init__(self, root: Path) -> None:
@@ -312,16 +324,21 @@ class SynthStores:
         self.cachectl = JsonStore(root, "cachectl")
         self.rdsctl = JsonStore(root, "rdsctl")
         self.elbv2ctl = JsonStore(root, "elbv2ctl")
+        self.eventsctl = JsonStore(root, "eventsctl")
 
     def forget_env(self, env: str) -> list[str]:
         """Drop every store's cached copy of `env`. Returns the store names that
         held one.
 
         DERIVED from the attributes, never a hand-written list: this class has
-        grown from four stores to sixteen, one service at a time, and a
+        grown from four stores to seventeen, one service at a time, and a
         removal that named them individually would silently miss the
-        seventeenth. `vars(self)` also skips `root`, which is a Path, not a
-        store."""
+        eighteenth. `vars(self)` also skips `root`, which is a Path, not a
+        store.
+
+        That is not hypothetical. This method and `eventsctl` arrived in the
+        same merge, from two agents that never saw each other's work, and the
+        derived form covered the new store with no edit at all."""
         return sorted(
             name for name, store in vars(self).items()
             if isinstance(store, JsonStore) and store.forget_env(env)
