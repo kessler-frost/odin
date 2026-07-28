@@ -1459,8 +1459,12 @@ index-to-index deletion on this file.
      granted something gets the same auto-role a lambda always had, reached
      through an `aws_iam_instance_profile` for ec2), it round-trips through
      import without loss, and the gateway now authorizes from THAT — see the
-     enforcement-source entry below. What remains is portability, tracked in
-     `docs/limits.md`: the `Resource` is odin's node label rather than an ARN.
+     enforcement-source entry below. **Portability closed in v0.8.14**: the
+     `Resource` is a real ARN, and `gateway/policy.py::arn_label` reduces it back
+     to the node label the classifier reports, so the same policy is enforced
+     locally and valid on Amazon. Emitting ARNs without that reducer would have
+     silently denied every permission in the product, which is why the two
+     tables are pinned against each other by `tests/agent/test_hcl_iam_arns.py`.
   2. ~~**An RDS container keeps no volume**, so odin's own repair returns an
      empty database.~~ CLOSED in v0.8.14. Each instance now has a named volume
      (`aws/rds.py::volume_name` → `odin-rds-<env>-<node>-data`) mounted at
@@ -1482,10 +1486,17 @@ index-to-index deletion on this file.
      old warning. A static "your data is safe" would have been a guard reading
      no signal — honesty rule 1, in the direction that reassures rather than
      alarms. Mutation-tested both ways.
-  3. **An ECS service's canvas wiring cannot be imported** — env refs are never
-     written into the HCL (a resolved DATABASE_URL carries a password), and
-     `depends_on` is re-derived from those refs, so neither survives. Wants a
-     non-secret representation of a ref that Terraform can carry.
+  3. ~~**An ECS service's canvas wiring cannot be imported.**~~ The GENERATE
+     half is CLOSED in v0.8.14: a ref travels as an `odin:ref:<VAR>` tag whose
+     value is `<producer>.<attr>` — the non-secret representation this entry
+     asked for. A reference names a producer and an attribute; only the string
+     it RESOLVES to at launch carries the password, and that is built by
+     `gateway/wiring.py` long after the file is written, so it cannot appear.
+     Static env entries are still never emitted, for the same reason (a user may
+     have typed a credential into one). What remains is the READ half: teaching
+     the HCL importer to put those tags back into a node's `env`, which also
+     restores the ordering for free, since `depends_on` is re-derived from the
+     refs.
   4. **sqs/sns tags are dropped on import** (`_CARRIED_ATTRS` lists only `name`
      while `hcl.py` emits tags for every kind). Small and mechanical.
   5. ~~**Envs are never removable.**~~ CLOSED. `odin env rm <name>` (POST
@@ -1528,6 +1539,12 @@ index-to-index deletion on this file.
     is named with a count because the group then allows LESS, and `egress` cannot
     survive at all (odin re-emits its own wide-open default and has no outbound
     field) so a restricted source comes back UNRESTRICTED.
+    **The outbound half of that was closed in v0.8.14**: the sg node has an
+    `egressRules` field in the same line format, real `egress` blocks are
+    emitted from it, and the wide-open default now applies only when the field
+    is empty — which keeps every pre-existing canvas byte-identical. Nebula
+    still compiles INGRESS only (`outbound: any`), so an egress rule is portable
+    configuration rather than a control; `docs/limits.md` says so.
   - **ec2** — three references that each decide something different: containment
     (unappliable without it), security groups (less protected), and the companion
     key pair (unreachable). One warning each, not one vague line.

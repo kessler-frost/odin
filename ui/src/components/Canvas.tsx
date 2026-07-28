@@ -79,7 +79,7 @@ const DEFAULT_LAMBDA_CODE = 'def lambda_handler(event, context):\n    return eve
 const defaultDataForType: Record<string, Record<string, string>> = {
   vpc: { label: 'new-vpc', resourceId: '', cidr: '10.0.0.0/16', status: 'draft' },
   subnet: { label: 'new-subnet', resourceId: '', cidr: '10.0.1.0/24', status: 'draft' },
-  sg: { label: 'new-sg', groupId: '', vpcId: '', ingressRules: '', status: 'draft' },
+  sg: { label: 'new-sg', groupId: '', vpcId: '', ingressRules: '', egressRules: '', status: 'draft' },
   ec2: { label: 'new-instance', instanceType: 't3.micro', ami: '', key: '', userData: '', securityGroups: '', status: 'draft' },
   lambda: { label: 'new-function', runtime: 'python3.12', handler: 'lambda_function.lambda_handler', code: DEFAULT_LAMBDA_CODE, role: '', status: 'draft' },
   s3: { label: 'new-bucket', arn: '', status: 'draft' },

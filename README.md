@@ -159,10 +159,11 @@ with sensible defaults, `sg → ec2` is group membership, `ec2 → subnet` is
 containment. Across the whole catalog no pair is ambiguous, so odin never guesses.
 
 A drawn permission is emitted as a real `aws_iam_role_policy` on the workload's
-role, so it survives into the Terraform and back out of it. One caveat if you take
-the HCL to Amazon: the policy's `Resource` is odin's node label, which is what the
-gateway matches on, where AWS expects an ARN. `odin translate` says so per policy
-on stderr.
+role, naming a real ARN — `arn:aws:s3:::uploads` and `arn:aws:s3:::uploads/*` for
+a bucket grant — so the file means the same thing on Amazon as it does here. The
+gateway matches either form: it reports odin's node label for a request and
+reduces the ARN back to it, which is what keeps a permission enforced locally and
+portable at the same time.
 
 ## Driving it from a terminal
 
