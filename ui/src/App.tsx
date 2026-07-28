@@ -39,7 +39,7 @@ export default function App() {
   const [configOpen, setConfigOpen] = useState(true);
   const [codeOpen, setCodeOpen] = useState(false);
   const [bottomState, setBottomState] = useState<BottomState>('default');
-  const [wsConnected, setWsConnected] = useState(false);
+  const [streamConnected, setStreamConnected] = useState(false);
   const [env, setEnv] = useState(() => localStorage.getItem('odin-active-env') || 'default');
   const statusUpdateFnRef = useRef<((name: string, status: string, error?: string, facts?: Record<string, unknown>) => void) | null>(null);
   // Another client saved the canvas. The canvas is global, so every tab must
@@ -94,7 +94,7 @@ export default function App() {
 
   // Apply: send the canvas as desired state; the Reconciler runs it for real,
   // Terraform is generated + applied through the gateway, and live status
-  // (world_delta + tf lines) streams back over the WebSocket.
+  // (world_delta + tf lines) streams back over the event stream.
   const handleApply = useCallback(async () => {
     const canvas = await readCanvas();
     if (!canvas) return;
@@ -158,7 +158,7 @@ export default function App() {
       }}
     >
       {/* Row 1: TopBar */}
-      <div className="col-span-full"><TopBar wsConnected={wsConnected} env={env} onEnvChange={setEnv} onApply={handleApply} onViewCode={() => setCodeOpen(o => !o)} codeOpen={codeOpen} /></div>
+      <div className="col-span-full"><TopBar streamConnected={streamConnected} env={env} onEnvChange={setEnv} onApply={handleApply} onViewCode={() => setCodeOpen(o => !o)} codeOpen={codeOpen} /></div>
 
       {/* Row 2: Sidebar + Canvas + Config */}
       <div className="overflow-hidden">
@@ -216,7 +216,7 @@ export default function App() {
         <BottomPanel
           bottomState={bottomState} activeEnv={env}
           selectedNode={selectedNodes.length === 1 ? ((selectedNodes[0].data?.label as string) || selectedNodes[0].id) : undefined}
-          onCycleBottom={cycleBottom} onWsStatusChange={setWsConnected} onResourceStatus={handleResourceStatus} onConfigUpdate={handleConfigUpdate}
+          onCycleBottom={cycleBottom} onStreamStatusChange={setStreamConnected} onResourceStatus={handleResourceStatus} onConfigUpdate={handleConfigUpdate}
           onCanvasUpdated={handleCanvasUpdated}
         />
       </div>

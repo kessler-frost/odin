@@ -47,7 +47,7 @@ def test_start_foreground_passes_host_through_to_uvicorn(tmp_path, monkeypatch):
     monkeypatch.setattr(main_mod, "_build_ui", lambda: None)
     captured = {}
 
-    def fake_uvicorn_run(app_path, factory, host, port):
+    def fake_uvicorn_run(app_path, factory, host, port, **kwargs):
         captured["host"] = host
         captured["port"] = port
 
@@ -1030,7 +1030,7 @@ def test_start_foreground_writes_and_removes_the_pidfile(tmp_path, monkeypatch):
     monkeypatch.setattr(main_mod, "_build_ui", lambda: None)
     seen = {}
 
-    def fake_uvicorn_run(app_path, factory, host, port):
+    def fake_uvicorn_run(app_path, factory, host, port, **kwargs):
         seen["pid_while_running"] = main_mod.PID_FILE.read_text().strip()
 
     monkeypatch.setitem(
@@ -1040,3 +1040,28 @@ def test_start_foreground_writes_and_removes_the_pidfile(tmp_path, monkeypatch):
     main_mod.start(port=4200, foreground=True, dev=False, host="127.0.0.1")
     assert seen["pid_while_running"] == str(os.getpid())
     assert not main_mod.PID_FILE.exists()
+
+
+def test_start_bounds_uvicorns_graceful_shutdown(monkeypatch, tmp_path):
+    """Without this odin does not shut down at all.
+
+    An SSE response is an in-flight request that never finishes by design
+    (`api/events.py::event_stream`), and uvicorn waits for in-flight requests
+    BEFORE running lifespan shutdown -- so the app's own `close_all` is never
+    reached. MEASURED with one browser tab open: two ignored SIGTERMs, still
+    alive after four minutes, gateway port held so nothing could restart. Ctrl-C
+    hung the same way. With the flag it stops in ~11s.
+    """
+    seen: dict = {}
+
+    def fake_run(app, **kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr("uvicorn.run", fake_run)
+    monkeypatch.setattr("odin.__main__.ODIN_DIR", tmp_path)
+    monkeypatch.setattr("odin.__main__.PID_FILE", tmp_path / "server.pid")
+    from odin.__main__ import GRACEFUL_SHUTDOWN_SECONDS, start
+
+    start(host="127.0.0.1", port=4200, foreground=True, dev=False)
+    assert seen.get("timeout_graceful_shutdown") == GRACEFUL_SHUTDOWN_SECONDS
+    assert 0 < GRACEFUL_SHUTDOWN_SECONDS <= 30, "a long grace is indistinguishable from the hang"

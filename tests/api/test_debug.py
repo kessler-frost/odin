@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 
 from odin.agent import debugger
 from odin.api.debug import ScrubSetUnreadable, build_context, create_debug_router, issued_credentials
-from odin.api.ws import ConnectionManager
+from odin.api.events import ConnectionManager
 from odin.gateway.keys import KeyStore
 from odin.gateway.stores import SynthStores
 from odin.runtime.colima import ContainerFacts, HostFacts

@@ -250,7 +250,7 @@ def _log_groups(stores: SynthStores, env: str) -> Projected:
 def _secrets(stores: SynthStores, env: str) -> Projected:
     """W2.4: a `secret` node exists once tofu's CreateSecret landed. NO FACTS
     ARE PROJECTED -- deliberately: `facts` ride the WorldDelta onto the
-    WebSocket and into `.odin/{env}/world.json`, and a secret's value must
+    event stream and into `.odin/{env}/world.json`, and a secret's value must
     never travel either. Existence + phase is the whole honest projection; the
     value leaves only through a `GetSecretValue` an IAM edge allowed."""
     out: Projected = {}
@@ -394,7 +394,7 @@ def _load_balancers(stores: SynthStores, env: str) -> Projected:
     `_db_facts`): a load balancer's whole point is an
     address, and `DNSName` can't carry the dynamic host port odin publishes the
     proxy on (elbv2ctl.py's `_DNS_NAME` note). So the genuinely reachable
-    `http://127.0.0.1:{port}` rides out as a fact -- onto the WebSocket, into
+    `http://127.0.0.1:{port}` rides out as a fact -- onto the event stream, into
     `.odin/{env}/world.json`, and resolvable by another node's
     `${{lb.ALB_ENDPOINT}}` reference through the fabric. Nothing secret is in
     it (contrast `_secrets`/`_ssm_parameters`, which project no facts at all).
@@ -517,7 +517,7 @@ def _invocation_verdict(record: dict) -> str | None:
     invocations failed (`lambdactl._invoke` records the FunctionError the RIE
     reported) and said nothing. So the invocation outcome rides out as the
     verdict, which is exactly the channel a phase-less truth belongs in: it
-    reaches the WebSocket, `world.json`, `events.jsonl` and M8's evidence
+    reaches the event stream, `world.json`, `events.jsonl` and M8's evidence
     bundle, and `Reconciler._emit` already suppresses everything but a CHANGE,
     so a function failing in a loop costs one delta, not one per invocation.
 
@@ -837,7 +837,7 @@ def stranded_in_tf_state(
     read-model overlay on `GET /world`, computed per request. That is what
     keeps it away from the draft-flap v0.7.1 killed -- plan() would call any
     such entry "observed but no longer desired" on the very next tick and
-    prune it straight back out, one WebSocket event per tick, forever.
+    prune it straight back out, one stream event per tick, forever.
     """
     out: list[ResourceObserved] = []
     for resource in _tf_state(root, env).get("resources", []):

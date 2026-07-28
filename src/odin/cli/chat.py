@@ -10,7 +10,7 @@ ADDITION to the canvas, and the shape follows directly:
   odin chat --clear                                         -> forget the conversation
 
 **The canvas is the review surface** (owner decision, 2026-07-28). The edit
-lands where you are already looking: the open UI redraws over its WebSocket, the
+lands where you are already looking: the open UI redraws over its event stream, the
 change goes onto the browser's own undo stack, and Cmd-Z reverses it. Asking a
 person to confirm a diff in a terminal, when the thing the diff describes is on
 screen behind it, is the worse review.

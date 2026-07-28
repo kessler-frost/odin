@@ -4,7 +4,7 @@ The canvas authors a desired-state Stack; a continuous Reconciler drives reality
 (per-env backing containers for the AWS-shaped resources, via Colima) and
 projects what `tofu apply` created through the gateway (every TF-owned kind,
 `rds` among them since W2.7); the World projects back to the canvas over
-WebSocket.
+a Server-Sent Events stream.
 """
 from __future__ import annotations
 
@@ -19,8 +19,8 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import APIRouter, FastAPI, Request
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -32,7 +32,7 @@ from odin.agent.hcl import TfProject, generate_tf, parse_tf, resource_set, unquo
 from odin.api.canvas import CanvasGraph, create_canvas_router
 from odin.api.debug import create_debug_router
 from odin.api.logs import create_logs_router
-from odin.api.ws import ConnectionManager
+from odin.api.events import SSE_HEADERS, ConnectionManager, event_stream
 from odin.aws.backings import PROVISIONED, BackingAws, BackingUnavailable
 from odin.compute.tasks import TaskRuntime
 from odin.fabric.localhost import LocalhostFabric
@@ -1365,7 +1365,7 @@ def create_tf_router(
         than handing back a proposal to confirm. The canvas is the review
         surface -- the change appears where you are already looking, the UI's
         own undo stack picks it up (Canvas.tsx records history from a `[nodes,
-        edges]` effect, so a WebSocket-driven `setNodes` lands on it exactly
+        edges]` effect, so a stream-driven `setNodes` lands on it exactly
         like a drag), and Cmd-Z reverses it.
 
         What it still does NOT do is APPLY: nothing here provisions anything.
@@ -2356,6 +2356,12 @@ def create_app(
                 try:
                     yield
                 finally:
+                    # FIRST: end every open SSE stream. uvicorn's graceful
+                    # shutdown waits for in-flight requests, and a live stream
+                    # never finishes on its own -- measured, the server survived
+                    # two SIGTERMs and held its gateway port for minutes with one
+                    # tab open. See `ConnectionManager.close_all`.
+                    ws_manager.close_all()
                     lock_watch.cancel()
                     loop_watch.cancel()
                     for reconciler in reconcilers.values():
@@ -2410,14 +2416,19 @@ def create_app(
     # logs route does, plus the ws_manager's durable per-env event log.
     app.include_router(create_debug_router(_store, gateway_stores, _runtime, ws_manager))
 
-    @app.websocket("/ws")
-    async def websocket_endpoint(websocket: WebSocket):
-        await ws_manager.connect(websocket)
-        try:
-            while True:
-                await websocket.receive_text()
-        except WebSocketDisconnect:
-            ws_manager.disconnect(websocket)
+    @app.get("/stream")
+    async def stream_endpoint() -> StreamingResponse:
+        """The live event stream (SSE). Replaced `/ws` in v0.8.7.
+
+        The socket it replaces was strictly server->client -- the UI never sent
+        anything and this handler discarded everything it received -- so the
+        duplex half was pure cost, most visibly a hand-rolled reconnect in the
+        browser. `EventSource` reconnects itself, and on reconnect the UI
+        backfills from `/events` below, so a gap self-heals.
+        """
+        return StreamingResponse(
+            event_stream(ws_manager), media_type="text/event-stream", headers=SSE_HEADERS,
+        )
 
     @app.get("/events")
     def get_events(env: str = ENV):

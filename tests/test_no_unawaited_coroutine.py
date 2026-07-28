@@ -82,7 +82,8 @@ def _module_kinds(path: Path) -> tuple[set[str], set[str]]:
         return set(), set()
     return (
         {n.name for n in tree.body if isinstance(n, ast.FunctionDef)},
-        {n.name for n in tree.body if isinstance(n, ast.AsyncFunctionDef)},
+        {n.name for n in tree.body
+         if isinstance(n, ast.AsyncFunctionDef) and not _is_async_generator(n)},
     )
 
 
@@ -97,9 +98,32 @@ def _resolve(dotted: str) -> Path | None:
     return None
 
 
+def _is_async_generator(node: ast.AsyncFunctionDef) -> bool:
+    """Does this `async def` YIELD? Then it is an async GENERATOR, and calling it
+    without `await` is correct -- awaiting it would be the bug.
+
+    Found by this ratchet firing on real, correct code: `StreamingResponse(
+    event_stream(manager), ...)` in the SSE endpoint. `event_stream` is an async
+    generator; the response consumes the iterator it returns. Without this the
+    ratchet would have pushed a genuinely wrong `await` into the one place it is
+    hardest to notice, since `await`ing an async generator fails at runtime, not
+    at import.
+
+    A nested `def`'s yields belong to that function, not this one, so the walk
+    stops at a nested function boundary.
+    """
+    for child in ast.walk(node):
+        if isinstance(child, (ast.Yield, ast.YieldFrom)):
+            return True
+    return False
+
+
 def _async_in_scope(tree: ast.Module) -> set[str]:
     """Names that are coroutine functions AS THIS FILE SEES THEM."""
-    local_async = {n.name for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef)}
+    local_async = {
+        n.name for n in ast.walk(tree)
+        if isinstance(n, ast.AsyncFunctionDef) and not _is_async_generator(n)
+    }
     local_sync = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
     imported: set[str] = set()
     for node in ast.walk(tree):

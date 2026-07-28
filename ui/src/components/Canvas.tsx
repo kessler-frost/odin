@@ -336,7 +336,7 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
   }, [env, setNodes, setEdges]);
 
   // --- Rehydrate node badges from the observed World, on mount and on env change ---
-  // (a live world_delta over the WebSocket always arrives after this and wins).
+  // (a live world_delta over the event stream always arrives after this and wins).
   const worldForEnv = useCallback((envName: string) => {
     fetch(`${API}/world?env=${encodeURIComponent(envName)}`)
       .then(r => r.json())
@@ -546,7 +546,7 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
     onNodeLabelsChange?.(nodes.map(n => ({ id: n.id, label: (n.data as Record<string, string>)?.label })));
   }, [nodes, onNodeLabelsChange]);
 
-  // --- Apply config updates from agent (via WebSocket → BottomPanel → App.tsx) ---
+  // --- Apply config updates from agent (via the event stream → BottomPanel → App.tsx) ---
   useEffect(() => {
     if (!configUpdate) return;
     setNodes(nds => nds.map(n => {

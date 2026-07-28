@@ -491,7 +491,7 @@ canvas saved (4d18a5091659) — Cmd-Z in the UI undoes it
 ```
 
 - **The canvas is the review surface.** The edit appears in your open tab over
-  the WebSocket, lands on the browser's own undo stack, and **Cmd-Z reverses
+  the event stream, lands on the browser's own undo stack, and **Cmd-Z reverses
   it** — measured, not assumed. Confirming a diff in a terminal, while the thing
   it describes is on screen behind it, is the worse review. `--dry-run` still
   shows the plan without touching anything.
@@ -577,7 +577,7 @@ prose explanation of a failure, and the evidence it reads is still there in
 ## How it's built
 
 - **UI:** React 19 + ReactFlow + Tailwind v4, served by Vite (`ui/`, `bun`).
-  **Backend:** Python 3.12+ (`uv`), FastAPI + WebSocket, Pydantic.
+  **Backend:** Python 3.12+ (`uv`), FastAPI + Server-Sent Events, Pydantic.
 - **The gateway** (`src/odin/gateway/`) verifies SigV4, classifies each call into
   (service, action, resource), evaluates it against the edges you drew, then
   forwards to a real backing or answers from its own per-service model store. EC2,

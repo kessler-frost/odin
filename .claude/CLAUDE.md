@@ -25,7 +25,7 @@ that either; `tofu apply` returns as the **Simulate** button per NORTHSTAR.md,
 not as the old validate-only flow.
 
 ## Tech Stack
-- **Backend:** Python 3.12+ (uv), FastAPI + WebSocket, Pydantic.
+- **Backend:** Python 3.12+ (uv), FastAPI + SSE, Pydantic.
 - **AWS substitutes:** real per-env backing containers — RustFS (S3), goaws (SQS+SNS, one container serves both), dynalite (DynamoDB) — plus a real Postgres container per RDS node. Run through the same `RuntimeDriver` as everything else, no emulator holding fake state.
 - **Runtime:** `ColimaRuntime` (containers directly on Colima — the default) and `LimaRuntime` (containers inside a Lima VM, VM isolation), both behind the `RuntimeDriver` protocol.
 - **Translation agent:** parked for now (see above). `claude-agent-sdk` is still a dependency; it's being repurposed toward canvas↔Terraform translation next, not config-completion.
@@ -348,12 +348,12 @@ Hard-won mechanics. Ignoring these has already destroyed work in this repo.
 - **Misc:** prune `.odin/`, `/tmp/*.png`, `__pycache__`, `.pytest_cache`, `.ruff_cache`. (Browser work leaves no litter to prune: `agent-browser` keeps state in its own session store, unlike playwright-cli which dumped a YAML snapshot per command.)
 
 ## CLI / running
-- `uv run uvicorn odin.server:create_app --factory --host 127.0.0.1 --port 4200` (the real app: reconciler + AWS backings in lifespan).
+- `uv run uvicorn odin.server:create_app --factory --host 127.0.0.1 --port 4200 --timeout-graceful-shutdown 5` (the flag is REQUIRED: an open SSE stream otherwise blocks uvicorn's graceful shutdown forever — measured, two ignored SIGTERMs) (the real app: reconciler + AWS backings in lifespan).
 - `odin start` / `odin start --dev` (Vite :4200 + uvicorn :4201). Tests: `uv run pytest` (unit), `uv run pytest -m integration` (real Colima backings — slow).
 
 ## Status / lifecycle
 - Canonical resource id = the node **label**. World phases: `pending` / `starting` / `healthy` / `crashed` are what's actually emitted today (rds + the PROVISIONED AWS kinds). `blocked` / `queued` / `running` / `done` / `evicted` / `error` remain in the `Phase` type for the parked workload layer and future gateway/Simulate error states — don't be surprised they're unreachable right now.
-- Status is a one-way projection: drivers + assertions author facts → Reconciler emits `WorldDelta` → `ConnectionManager.broadcast` (WS) + append-only `.odin/<env>/world.json` + `events.jsonl`. The UI is a pure projection; `StatusBadge` maps phases to colors; deltas carry `env` (UI filters by the active env).
+- Status is a one-way projection: drivers + assertions author facts → Reconciler emits `WorldDelta` → `ConnectionManager.broadcast` (SSE) + append-only `.odin/<env>/world.json` + `events.jsonl`. The UI is a pure projection; `StatusBadge` maps phases to colors; deltas carry `env` (UI filters by the active env).
 
 ## Environments
 Multiple named envs reconciled independently (`/apply?env=`, `/world?env=`, `/destroy?env=`, `/envs`); each env gets its own `BackingAws` + `PostgresRds` (containers named `odin-aws-<backing>-<env>` / `odin-rds-<env>-<id>`) → isolated AWS-shaped state per env. UI has an env field in the TopBar.

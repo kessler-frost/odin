@@ -17,7 +17,7 @@ function Led({ state }: { state: LedState }) {
 type Busy = null | 'apply';
 
 interface TopBarProps {
-  wsConnected?: boolean;
+  streamConnected?: boolean;
   env?: string;
   onEnvChange?: (env: string) => void;
   onApply?: () => Promise<void>;
@@ -25,7 +25,7 @@ interface TopBarProps {
   codeOpen?: boolean;
 }
 
-export default function TopBar({ wsConnected, env, onEnvChange, onApply, onViewCode, codeOpen }: TopBarProps) {
+export default function TopBar({ streamConnected, env, onEnvChange, onApply, onViewCode, codeOpen }: TopBarProps) {
   const [busy, setBusy] = useState<Busy>(null);
   const [backendUp, setBackendUp] = useState(false);
   // Reconcilers that have stopped converging (GET /health's `reconcilers`).
@@ -114,7 +114,7 @@ export default function TopBar({ wsConnected, env, onEnvChange, onApply, onViewC
   };
 
   const backendLed: LedState = backendUp ? 'green' : 'red';
-  const wsLed: LedState = wsConnected ? 'green' : backendUp ? 'yellow' : 'red';
+  const streamLed: LedState = streamConnected ? 'green' : backendUp ? 'yellow' : 'red';
 
   const disabled = !!busy || !backendUp;
   const dim = disabled ? 'opacity-40 cursor-not-allowed' : '';
@@ -130,9 +130,9 @@ export default function TopBar({ wsConnected, env, onEnvChange, onApply, onViewC
           <Led state={backendLed} />
           Backend
         </div>
-        <div className="flex items-center gap-1.5 text-text-secondary" title={wsConnected ? 'Live status connected' : 'WebSocket reconnecting'}>
-          <Led state={wsLed} />
-          WebSocket
+        <div className="flex items-center gap-1.5 text-text-secondary" title={streamConnected ? 'Live status connected' : 'Live status reconnecting'}>
+          <Led state={streamLed} />
+          LIVE
         </div>
         {deadLoops.length > 0 && (
           <div

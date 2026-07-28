@@ -29,7 +29,7 @@ import tarfile
 from pathlib import Path
 
 from odin.agent.hcl import TfProject
-from odin.api.ws import ConnectionManager
+from odin.api.events import ConnectionManager
 from odin.backup import export_env
 from odin.gateway.keys import KeyStore
 from odin.simulate import workspace
