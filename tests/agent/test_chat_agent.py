@@ -292,7 +292,7 @@ async def test_ops_sent_as_a_JSON_STRING_are_read(monkeypatch):
         "draw a iam edge from 'thumbnailer' to 'uploads' granting s3:GetObject",
     ]
     (edge,) = result.canvas["edges"]
-    assert edge["data"]["actions"] == ["s3:GetObject"]
+    assert edge["data"]["permissions"] == ["s3:GetObject"], "the key the Stack reads"
 
 
 async def test_ops_as_a_string_that_is_not_JSON_is_reported_not_swallowed():

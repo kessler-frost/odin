@@ -41,9 +41,14 @@ def _render_translate(body: dict) -> None:
     unsupported = body.get("unsupported") or []
     if unsupported:
         typer.echo(f"unsupported: {', '.join(str(u) for u in unsupported)}", err=True)
+    # On stderr, beside `unsupported`, and worded so it cannot be mistaken for
+    # one: odin DOES enforce these. What it cannot do is put them in this file,
+    # so a `translate > main.tf` taken to real AWS grants nothing (field test 7).
+    for gap in body.get("not_in_terraform") or []:
+        typer.echo(f"not in this file: {gap}", err=True)
 
 
-def _graph(url: str, file: Path | None) -> dict:
+def _graph(url: str, env: str, file: Path | None) -> dict:
     """Findings B4 / MEDIUM-10: with no `--file`, translate the canvas SAVED ON
     THE SERVER -- `odin apply`'s own default (`cli/apply.py::_graph`), and what
     README ("print the Terraform your canvas becomes") and this command's own
@@ -54,7 +59,10 @@ def _graph(url: str, file: Path | None) -> dict:
     previews the canvas, not the last-applied stack; so does this now."""
     if file is not None:
         return http.parse_json_arg(file.read_text(), str(file))
-    return http.body_or_fail(http.request("GET", url, "/canvas"))
+    # Per-env since v0.7.9. Without `env` this previewed the DEFAULT env's canvas
+    # whatever `--env` said -- the same omission `cli/apply.py::_graph` had, and
+    # there it was building infrastructure rather than printing it.
+    return http.body_or_fail(http.request("GET", url, "/canvas", params={"env": env}))
 
 
 @app.command()
@@ -69,7 +77,7 @@ def translate(
     With no --file this translates the canvas saved on the server -- the same
     default `odin apply` uses.
     """
-    graph = _graph(url, file)
+    graph = _graph(url, env, file)
     body = http.body_or_fail(
         http.request("POST", url, "/translate", params={"env": env}, body=graph)
     )

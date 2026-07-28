@@ -273,9 +273,31 @@ def apply_ops(canvas: dict, ops: list[Op]) -> tuple[dict, list[str], list[Refusa
             ]
         elif isinstance(op, AddEdge):
             source, target = by_label[op.source].get("id"), by_label[op.target].get("id")
+            # `permissions`, NOT `actions`. `spec/translate.py::_edge` reads
+            # `data["permissions"]`, and the UI's own `edgeDataForConnection`
+            # writes that key -- an edge stored under any other name compiles to
+            # `perms=()`, i.e. a grant that allows NOTHING.
+            #
+            # Shipped that way in v0.8.5 and caught by field test 7 against a
+            # live env: `odin chat "give resizer read access to uploads"` drew
+            # the edge, applied clean, reported "Granted resizer read access
+            # (s3:GetObject, s3:ListBucket)" -- and the gateway compiled
+            # `Statement(actions=(), resources=('uploads',))`. A DECORATIVE
+            # permission, the exact class `tests/gateway/
+            # test_iam_vocabulary_is_enforceable.py` exists to prevent.
+            #
+            # The tests missed it for the reason that keeps recurring here: they
+            # asserted on the canvas key this code writes, so both ends agreed
+            # with each other and neither was checked against the thing between
+            # them. `test_chat_grants_are_enforceable.py` asserts the COMPILED
+            # POLICY instead.
+            #
+            # The agent-facing schema keeps saying `actions`: that is the word an
+            # LLM produces for IAM and the word AWS uses. The mapping lives here,
+            # in one line, rather than in the model's head.
             data: dict[str, Any] = {"edgeType": op.edge_type}
             if op.actions:
-                data["actions"] = op.actions
+                data["permissions"] = op.actions
             result["edges"].append({"id": f"{source}-{target}", "source": source, "target": target, "data": data})
         elif isinstance(op, DeleteEdge):
             result["edges"] = [

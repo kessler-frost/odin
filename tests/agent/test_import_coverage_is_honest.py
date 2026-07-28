@@ -17,7 +17,13 @@ from odin.agent.hcl import generate_tf
 from odin.agent.import_tf import parse_hcl_text
 from odin.spec.translate import canvas_to_stack
 
-README = (Path(__file__).resolve().parents[2] / "README.md").read_text()
+_ROOT = Path(__file__).resolve().parents[2]
+README = (_ROOT / "README.md").read_text()
+# The translation-coverage claim moved out of the README in v0.8.10, when the
+# front page was cut from 803 lines to ~250 and the deep material went to docs/.
+# This test follows the CLAIM, not the file it used to live in -- pinning prose
+# to behaviour only works if it keeps pointing at the prose.
+INTERNALS = (_ROOT / "docs" / "internals.md").read_text()
 
 CANVAS = {
     "nodes": [
@@ -38,7 +44,15 @@ CANVAS = {
         {"id": "f1", "type": "lambda", "position": {"x": 0, "y": 0},
          "data": {"label": "thumbnailer", "code": "def lambda_handler(event, context):\n    return event\n"}},
     ],
-    "edges": [],
+    # An IAM edge, deliberately. Until field test 7 this fixture had NO edges,
+    # which made the round-trip claim below vacuous on exactly the thing it
+    # mattered most for: a drawn grant never reaches the Terraform at all
+    # (`hcl.TfProject.not_in_terraform`), so "odin's own project round-trips
+    # with nothing unsupported" was true only for canvases that granted nothing.
+    "edges": [
+        {"id": "e1", "source": "c1", "target": "b1",
+         "data": {"edgeType": "iam", "permissions": ["s3:GetObject"]}},
+    ],
 }
 
 
@@ -86,8 +100,8 @@ def test_the_readme_describes_the_coverage_import_actually_has():
     must also still separate COVERAGE from FIDELITY: equal kind coverage does not
     make a round trip lossless, and what it does cost is named in Known limits.
     """
-    claim = re.search(r"- \*\*Translation\*\*.*?(?=\n- \*\*)", README, re.S)
-    assert claim, "the Translation bullet moved -- re-point this test"
+    claim = re.search(r"- \*\*Translation\*\*.*?(?=\n- \*\*)", INTERNALS, re.S)
+    assert claim, "the Translation bullet moved again -- re-point this test at it"
     text = claim.group(0)
     for kind in ("aws_security_group", "aws_ecr_repository", "aws_instance",
                  "aws_ecs_service", "aws_lambda_function"):
@@ -97,3 +111,46 @@ def test_the_readme_describes_the_coverage_import_actually_has():
         "an ECS service's wiring, a security group's egress, and a function's code "
         "read from HCL text alone all still cost something"
     )
+
+
+def test_a_drawn_GRANT_does_not_reach_the_terraform_and_says_so():
+    """The round trip is complete for NODES and lossy for EDGES, and the honest
+    version of that sentence is the point of this test.
+
+    A drawn IAM edge is enforced -- `gateway/policy.py::compile_policies` builds
+    it from the Stack and the gateway denies anything without a matching grant --
+    but enforcement happens in odin's gateway, not through Terraform, so nothing
+    about it is written into `main.tf`. Measured in field test 7: a canvas
+    granting a lambda `s3:GetObject` produced five resources and ZERO mentions of
+    the permission, and importing that file back returned the nodes with no edges
+    and no warning of any kind.
+
+    So the loss is REPORTED at the point it happens (translate), because import
+    cannot warn about something that was never in the file it reads.
+    """
+    project = generate_tf(canvas_to_stack(CANVAS))
+    assert "s3:GetObject" not in project.files["main.tf"], (
+        "if odin starts emitting real IAM policy for drawn edges, this test should "
+        "fail and the whole not_in_terraform story should be deleted, not updated"
+    )
+    (gap,) = project.not_in_terraform
+    assert "web -> uploads" in gap
+    assert "s3:GetObject" in gap
+    assert "grants it nothing" in gap
+
+    # ...and the round trip really does drop it, which is what the warning is for.
+    assert parse_hcl_text(project.files["main.tf"]).edges == []
+
+
+def test_the_README_still_warns_that_a_drawn_GRANT_is_not_in_the_terraform():
+    """The front page carries the ONE consequence a reader has to know before
+    taking `main.tf` anywhere: their permissions are not in it.
+
+    Kept on the README rather than only in docs/limits.md because it is the
+    difference between "this file describes my architecture" and "this file
+    describes my architecture minus its security posture", and someone piping
+    `odin translate` into a repo will not have read the limits page first.
+    """
+    assert "not\nwritten into the generated Terraform" in README or \
+           "not written into the generated Terraform" in README.replace("\n", " "), README[:0]
+    assert "docs/limits.md" in README, "and it should point at the full explanation"

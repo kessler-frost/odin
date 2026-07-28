@@ -77,6 +77,22 @@ class TfProject(BaseModel):
     # `materialize()`/`resource_set()` both assume text there) -- a zip gets
     # its OWN dict rather than smuggled through as a decode-on-write string.
     binary_files: dict[str, bytes] = {}
+    # A THIRD question, and the comments above already argue why it needs its own
+    # field: not "can odin build this?" (`unsupported`) and not "did you wire it
+    # correctly?" (`wiring_errors`), but "does the generated Terraform CARRY it?"
+    #
+    # A drawn IAM edge is enforced for real -- `gateway/policy.py::compile_policies`
+    # builds it from `stack.edges` and the gateway denies a request with no
+    # matching grant -- but that happens in odin's gateway, not through Terraform,
+    # so nothing about it reaches `main.tf`. Found by field test 7: a canvas
+    # granting a lambda `s3:GetObject` on a bucket produced five resources and
+    # ZERO mentions of the permission, and importing that file back returned the
+    # nodes with no edges and no warning at all.
+    #
+    # It matters twice: `odin translate > main.tf` handed to real AWS gives that
+    # lambda no permissions, and a canvas round-tripped through Terraform loses
+    # its entire security posture in silence.
+    not_in_terraform: list[str] = []
 
 
 def quote(value: object) -> str:
@@ -1166,6 +1182,21 @@ _BUILDERS = {
 _ALB_TARGET_KINDS = ("ecs",)
 
 
+def _not_in_terraform(stack: Stack) -> list[str]:
+    """What this canvas does that the generated Terraform will not carry.
+
+    Only drawn IAM edges today. They ARE enforced -- by odin's gateway, from the
+    Stack -- so this is not a coverage gap in odin, it is a gap in the FILE, and
+    the difference is the whole reason it gets said out loud rather than filed
+    under `unsupported`.
+    """
+    return [
+        f"{edge.src} -> {edge.dst} ({', '.join(edge.perms) or 'no actions'}): enforced by odin's "
+        "gateway, but NOT written into the Terraform -- this file grants it nothing"
+        for edge in stack.edges if edge.kind == "iam"
+    ]
+
+
 def generate_tf(stack: Stack) -> TfProject:
     by_id = {r.id: r for r in stack.resources}
     ordered = sorted(stack.resources, key=lambda r: (r.kind, r.id))
@@ -1483,4 +1514,5 @@ def generate_tf(stack: Stack) -> TfProject:
     return TfProject(
         files={"main.tf": main_tf}, unsupported=unsupported,
         wiring_errors=wiring_errors, binary_files=binary_files,
+        not_in_terraform=_not_in_terraform(stack),
     )
