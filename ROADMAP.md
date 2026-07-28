@@ -1192,19 +1192,42 @@ have meant retiring a claim rather than fixing a bug.
     global file -- `GET /canvas?env=X` returns byte-identical bytes for every
     X. One architecture, many envs (isolated AWS *state*) is the design.
 
-- [ ] **`/apply-full` treats a MALFORMED body as "destroy everything".**
-  `CanvasGraph.nodes` defaults to `[]`, so a body with no `nodes` key at all
-  validates as a canvas with zero nodes. Measured against a live server:
-  `POST /apply-full?env=X` with `{"detail": "Internal Server Error"}` returns
-  **HTTP 200 `{"status": "applied"}`** and commits a real revision -- and
-  reconciling an env to an empty desired state tears down every resource in
-  it. The v0.7.7 fix is client-side (`lib/canvasLoad.ts` refuses to hand such
-  a body to Apply), which closes the reported path but not the route itself.
-  The server distinction worth drawing: an EXPLICIT `"nodes": []` is a
-  legitimate "remove everything", while an ABSENT `nodes` key is a malformed
-  request and should be a 422. Deferred out of v0.7.7 because making the field
-  required changes validation for every canvas-taking route (`/apply`,
-  `/translate`, `/canvas`) and wants its own test pass.
+- [x] **`/apply-full` treated a MALFORMED body as "destroy everything"**
+  (fixed in v0.7.8). `CanvasGraph.nodes` defaulted to `[]`, so a body with no
+  `nodes` key validated as a canvas with zero nodes. Measured against a live
+  server: `POST /apply-full?env=X` with `{"detail": "Internal Server Error"}`
+  returned **HTTP 200 `{"status": "applied"}`** and committed a real revision
+  -- reconciling that env down to nothing. `nodes` is now REQUIRED and an
+  absent key is a 422 on every canvas-taking route; an EXPLICIT `"nodes": []`
+  stays legitimate, because "remove everything" is a real instruction.
+  Verified live after the fix: the same body now 422s, `{"nodes":[],"edges":[]}`
+  still applies. Mutation-tested.
+
+- [x] **The canvas was GLOBAL and last-writer-wins across tabs** (fixed in
+  v0.7.8). Keeping it global is the DESIGN and stays -- one architecture, many
+  environments, every tab showing the same thing. The bug was that tabs
+  DIVERGED: each held its own copy plus a debounced save, so whichever
+  re-rendered last silently overwrote the rest. It destroyed the canvas
+  repeatedly during the v0.7.7 GIF recording, once replacing three applied
+  resources with a single node from a tab left open in another window.
+
+  Two mechanisms, because they cover different failures:
+  * **`canvas_updated` broadcast** — a save is announced on the existing
+    WebSocket and other tabs reload, so they CONVERGE. Verified live: a tab
+    picked up another client's save in under 2s with no reload. The message
+    carries the new revision so the tab that saved ignores its own echo rather
+    than reloading mid-edit.
+  * **`If-Match` precondition** — `GET /canvas` returns the revision as an
+    `ETag` (header, not body, so `odin canvas get` is unchanged) and a save
+    that quotes a stale one gets a 409. Verified live: the stale write was
+    refused and the canvas was left untouched. OPTIONAL, so `odin canvas set`,
+    curl and every pre-existing client keep working; the UI sends it.
+
+  Both mutation-tested, including the server-side wiring. One note for future
+  tests here: the first version of the broadcast test used a live websocket and
+  `receive_json()`, which could not FAIL when the broadcast was removed -- only
+  hang, for ten minutes, leaving the mutated source in the tree. It drives a
+  recording fake now.
 
 - [ ] **Bring the placeholder kinds back, one at a time.** The palette hides
   every `(placeholder)` tile as of v0.7.8 (owner call, 2026-07-27): 27 tiles

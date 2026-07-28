@@ -2099,7 +2099,7 @@ def create_app(
     # test) now reads and writes its OWN canvas instead of the real one under
     # the checkout. The module constant stays as the documented location.
     canvas_path = _store.root / CANVAS_NAME
-    app.include_router(create_canvas_router(canvas_path))
+    app.include_router(create_canvas_router(canvas_path, ws=ws_manager))
     app.include_router(
         create_apply_router(
             _store, reconciler_for, gateway_keystore, tf_runner, lambda: gateway_port_actual, env_epoch,

@@ -42,6 +42,9 @@ export default function App() {
   const [wsConnected, setWsConnected] = useState(false);
   const [env, setEnv] = useState(() => localStorage.getItem('odin-active-env') || 'default');
   const statusUpdateFnRef = useRef<((name: string, status: string, error?: string, facts?: Record<string, unknown>) => void) | null>(null);
+  // Another client saved the canvas. The canvas is global, so every tab must
+  // converge on it rather than sit on a stale copy and later overwrite it.
+  const canvasUpdatedFnRef = useRef<((rev: string) => void) | null>(null);
   const [configUpdate, setConfigUpdate] = useState<{ nodeId: string; data: Record<string, any> } | null>(null);
   const [nodeLabels, setNodeLabels] = useState<{ id: string; label?: string }[]>([]);
 
@@ -125,6 +128,10 @@ export default function App() {
     statusUpdateFnRef.current?.(name, status, error, facts);
   }, []);
 
+  const handleCanvasUpdated = useCallback((rev: string) => {
+    canvasUpdatedFnRef.current?.(rev);
+  }, []);
+
   const handleConfigUpdate = useCallback((nodeId: string, data: Record<string, any>) => {
     setConfigUpdate({ nodeId, data });
   }, []);
@@ -156,7 +163,7 @@ export default function App() {
         <Sidebar onCollapse={() => setSidebarOpen(false)} />
       </div>
       <div className="relative overflow-hidden">
-        <Canvas env={env} onNodeSelect={setSelectedNodes} onEdgeSelect={setSelectedEdges} onNodeLabelsChange={setNodeLabels} nodeUpdates={nodeUpdates} edgeUpdates={edgeUpdates} onStatusUpdate={statusUpdateFnRef} configUpdate={configUpdate} />
+        <Canvas env={env} onNodeSelect={setSelectedNodes} onEdgeSelect={setSelectedEdges} onNodeLabelsChange={setNodeLabels} nodeUpdates={nodeUpdates} edgeUpdates={edgeUpdates} onStatusUpdate={statusUpdateFnRef} configUpdate={configUpdate} onCanvasUpdated={canvasUpdatedFnRef} />
         {!sidebarOpen && (
           <button
             onClick={() => setSidebarOpen(true)}
@@ -208,6 +215,7 @@ export default function App() {
           bottomState={bottomState} activeEnv={env}
           selectedNode={selectedNodes.length === 1 ? ((selectedNodes[0].data?.label as string) || selectedNodes[0].id) : undefined}
           onCycleBottom={cycleBottom} onWsStatusChange={setWsConnected} onResourceStatus={handleResourceStatus} onConfigUpdate={handleConfigUpdate}
+          onCanvasUpdated={handleCanvasUpdated}
         />
       </div>
 

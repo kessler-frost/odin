@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { readCanvas } from './canvasLoad';
+import { readCanvas, readCanvasWithRevision } from './canvasLoad';
 
 const ok = (body: unknown): typeof fetch =>
   (async () => new Response(JSON.stringify(body), { status: 200 })) as unknown as typeof fetch;
@@ -54,5 +54,37 @@ describe('readCanvas: a successful read is returned intact', () => {
   it('a fresh odin that has never written the file still loads', async () => {
     // `api/canvas.py` answers `_EMPTY` in that case, so `nodes` is present.
     expect(await readCanvas(ok({ nodes: [], edges: [] }), '/canvas')).toEqual({ nodes: [], edges: [] });
+  });
+});
+
+describe('readCanvasWithRevision: the revision that makes a save safe', () => {
+  const withEtag = (body: unknown, etag?: string): typeof fetch =>
+    (async () => new Response(JSON.stringify(body), {
+      status: 200,
+      headers: etag ? { ETag: etag } : {},
+    })) as unknown as typeof fetch;
+
+  it('returns the canvas and its ETag', async () => {
+    const got = await readCanvasWithRevision(withEtag({ nodes: [], edges: [] }, 'abc123'), '/canvas');
+    expect(got).toEqual({ canvas: { nodes: [], edges: [] }, rev: 'abc123' });
+  });
+
+  it('rev is null when the server sends no ETag — degraded, not broken', async () => {
+    // An older odin, or a proxy that strips the header. The caller then saves
+    // unconditionally, exactly as it did before the precondition existed.
+    const got = await readCanvasWithRevision(withEtag({ nodes: [] }), '/canvas');
+    expect(got?.rev).toBeNull();
+    expect(got?.canvas).toEqual({ nodes: [] });
+  });
+
+  it('still refuses everything readCanvas refuses', async () => {
+    // The whole point of the v0.7.7 guard must survive the new entry point:
+    // a failure must not arrive as an empty canvas that then gets saved.
+    const rejects = (async () => { throw new TypeError('Failed to fetch'); }) as unknown as typeof fetch;
+    const five00 = (async () => new Response('down', { status: 500 })) as unknown as typeof fetch;
+    expect(await readCanvasWithRevision(rejects, '/canvas')).toBeNull();
+    expect(await readCanvasWithRevision(five00, '/canvas')).toBeNull();
+    expect(await readCanvasWithRevision(withEtag({ detail: 'Internal Server Error' }), '/canvas')).toBeNull();
+    expect(await readCanvasWithRevision(withEtag([]), '/canvas')).toBeNull();
   });
 });
