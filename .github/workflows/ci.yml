@@ -38,8 +38,14 @@ jobs:
             "https://github.com/slackhq/nebula/releases/download/v${VERSION}/nebula-linux-amd64.tar.gz"
           sudo tar -xzf /tmp/nebula.tar.gz -C /usr/local/bin nebula nebula-cert
           nebula-cert -version
+      # No `if:` here, deliberately. The gate belongs on the tofu-MARKED suite
+      # below, not on the binary: the main suite has a test that asserts a
+      # refinement was validated, and without tofu on PATH it fails with
+      # "tofu not on PATH -- cannot validate refinement" on every matrix entry
+      # that skipped the install. Gating the install left 3.12 green and 3.14
+      # red for the same code, which reads as a version incompatibility and is
+      # not one.
       - name: Install OpenTofu
-        if: matrix.python-version == '3.12'
         uses: opentofu/setup-opentofu@v2
         with:
           tofu_wrapper: false
