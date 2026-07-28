@@ -208,10 +208,28 @@ boot threads are `asyncio` tasks now (`gateway/models/__init__.py::background`,
 which holds a strong reference in a module-level set with a done-callback
 discard — a bare `create_task` reference can be garbage-collected mid-flight
 where a daemon thread could not). The locks that guarded sections containing
-no `await` were DELETED rather than ported. Still standing: `__main__.py`'s two
-log relays, `compute/instances.py`'s boot semaphore, `fabric/nebula.py`'s
-locks, `gateway/stores.py`, and `gateway/app.py::serve_in_thread` (documented
-test-only; production uses `serve_on_loop`).
+no `await` were DELETED rather than ported.
+
+**Still standing, re-measured 2026-07-27 — exactly TWO modules, not five.**
+This list previously named `__main__.py`'s log relays, `compute/instances.py`'s
+boot semaphore and `fabric/nebula.py`'s locks; all three had already been
+converted, so the inventory described a state that no longer existed. It is now
+pinned by `tests/test_thread_inventory.py` rather than by this paragraph,
+because prose about thread inventories has gone stale here twice and prose
+cannot fail a build:
+- `gateway/app.py::serve_in_thread` / `stop_in_thread` — TEST-ONLY, and
+  genuinely unavoidable: two SYNC integration tests must dial a real bound port
+  while doing blocking boto3/docker work inline, so serving on the caller's loop
+  would deadlock against the loop those calls block. Production uses
+  `serve_on_loop`.
+- `gateway/stores.py` — `JsonStore`'s per-env locks, whose ONLY remaining
+  contender is that helper. Every critical section there is synchronous (the
+  file has no `async def` and no `await`), so on one event loop they guard
+  nothing: **delete them in the same change that deletes `serve_in_thread`, and
+  not before.** Removing them while it exists reintroduces a real interleaved
+  read/write in those two tests that no unit test catches.
+
+`asyncio.to_thread` is at ZERO call sites and a ratchet keeps it there.
 
 **Four failure modes this conversion creates. All are silent, none is caught
 by an ordinary test, and each now has a mutation-tested ratchet under
