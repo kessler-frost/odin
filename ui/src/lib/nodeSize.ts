@@ -30,37 +30,33 @@ export const isContainerKind = (
   type: string,
 ): boolean => 'height' in (defaults[type] ?? {});
 
-/**
- * Kinds that are LEAVES by default but can be expanded to hold other nodes.
- *
- * `ec2` is one because of the owner's gesture: *"when I expand the ec2 box and
- * put an ecs box inside it, that means I want ecs on ec2"*. That only works if
- * the expansion SURVIVES — and it did not: a leaf's stored height is dropped on
- * load and re-derived from content, so an instance expanded to hold a workload
- * snapped back on the next reload and the workload fell outside it.
- *
- * Deliberately not solved by giving `ec2` a default height, which would make
- * every instance tall whether or not anyone expanded one and undo the adaptive
- * sizing that keeps an un-expanded node exactly as big as its content. The rule
- * is narrower: no default height, but a height the user CHOSE is kept.
- *
- * `sizeForSave` only ever writes a height the resizer set or a declared
- * default — never `measured.height`, which is what once froze every box — so a
- * stored height here is always a real choice.
- */
-export const EXPANDABLE_KINDS = new Set(['ec2']);
 
-// Loading: a container keeps its stored size; a leaf drops any stored height,
-// including one an older build baked in, and re-derives it from its content.
+
+// Loading: EVERY node keeps a stored size, whatever its kind.
+//
+// A stored height is always a deliberate choice, because `sizeForSave` below
+// only ever writes one the RESIZER set or a kind's declared default -- never
+// `measured.height`, which is what once froze every box at its first-render
+// size. Dropping heights on load was the belt-and-braces half of that fix, and
+// it outlived its cause: it meant resizing an S3 or Lambda box silently snapped
+// back on the next load, and (until this was noticed) that an EC2 box expanded
+// to hold a workload lost the expansion, taking the workload's placement with
+// it.
+//
+// Positions and widths already persisted for everything; heights are simply
+// the third dimension of the same fact, and there is no kind for which "the
+// user dragged this bigger" should be discarded.
+//
+// The one caveat, stated rather than guarded: a canvas written by a build from
+// BEFORE the save-side fix may contain a height baked from a measurement. Such
+// a node now renders at that height instead of re-deriving it. That is visible
+// and one drag away from fixed, which is a better trade than silently
+// discarding every deliberate resize to protect against an old file.
 export const sizeOnLoad = (
-  defaults: Record<string, CSSProperties>,
-  type: string,
+  _defaults: Record<string, CSSProperties>,
+  _type: string,
   size: NodeSize | undefined,
-): NodeSize => (
-  isContainerKind(defaults, type) || (EXPANDABLE_KINDS.has(type) && size?.height)
-    ? { ...size }
-    : { ...size, height: undefined }
-);
+): NodeSize => ({ ...size });
 
 // Saving: store only a height the user actually CHOSE (the resizer sets
 // `node.height`) or a container's declared default. Deliberately never

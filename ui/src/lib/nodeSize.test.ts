@@ -38,10 +38,16 @@ describe('sizeOnLoad', () => {
   // The regression itself: 62px is what ReactFlow measured for a lambda before
   // its handler line existed, and older builds wrote it to disk. Reapplying it
   // is what clipped the handler.
-  test('a leaf drops a height an older build baked in', () => {
+  test('a stored height is KEPT, for a leaf as much as a container', () => {
+    // This used to assert the opposite, and the opposite outlived its reason.
+    // Heights were dropped on load because an older build baked
+    // `measured.height` into the saved canvas and froze every box. `sizeForSave`
+    // stopped writing measurements, which fixed it at the source -- after which
+    // dropping heights on load only discarded DELIBERATE resizes. Positions and
+    // widths always persisted; a height is the same fact.
     expect(sizeOnLoad(DEFAULTS, 'lambda', { width: 220, height: 62 })).toEqual({
       width: 220,
-      height: undefined,
+      height: 62,
     });
   });
 
@@ -80,10 +86,15 @@ describe('round trip', () => {
   // The invariant that keeps boxes content-sized: save then load must not
   // reintroduce a height for a leaf nobody resized, however many times the
   // canvas is saved and reloaded.
-  test('a never-resized leaf never acquires a height', () => {
-    let size = sizeOnLoad(DEFAULTS, 'lambda', { width: 220, height: 62 });
+  test('a never-resized leaf never acquires a height from being MEASURED', () => {
+    // The frozen-boxes guarantee, now enforced entirely on the save side: no
+    // matter how many times a node is measured and re-saved, a height nobody
+    // chose is never written. `measured: { height: 80 }` is deliberately fed in
+    // on every pass -- that is exactly the value the old bug persisted.
+    let size = sizeOnLoad(DEFAULTS, 'lambda', { width: 220 });
     for (let i = 0; i < 3; i++) {
       const saved = sizeForSave(DEFAULTS, { type: 'lambda', style: size, measured: { height: 80 } });
+      expect(saved.height).toBeUndefined();
       size = sizeOnLoad(DEFAULTS, 'lambda', saved);
       expect(size.height).toBeUndefined();
     }
@@ -118,17 +129,18 @@ describe('an EC2 box the user expanded keeps its height', () => {
     expect(sizeOnLoad(defaults, 'ec2', undefined).height).toBeUndefined();
   });
 
-  test('other leaves still drop a stored height', () => {
-    // The frozen-boxes bug this rule exists for: a height baked from a
-    // measurement must never come back.
-    expect(sizeOnLoad(defaults, 's3', { width: 200, height: 81 }).height).toBeUndefined();
+  test('every other kind keeps a chosen height too', () => {
+    // Generalised after the owner asked why this was ec2-only: nothing about an
+    // S3 or Lambda box makes a deliberate resize less real.
+    expect(sizeOnLoad(defaults, 's3', { width: 200, height: 140 }).height).toBe(140);
   });
 
   test('a real container is unaffected', () => {
     expect(sizeOnLoad(defaults, 'vpc', { width: 900, height: 500 })).toEqual({ width: 900, height: 500 });
   });
 
-  test('a zero height is not treated as a choice', () => {
-    expect(sizeOnLoad(defaults, 'ec2', { width: 200, height: 0 }).height).toBeUndefined();
+  test('an absent height stays absent — nothing is invented', () => {
+    expect(sizeOnLoad(defaults, 'ec2', { width: 200 }).height).toBeUndefined();
+    expect(sizeOnLoad(defaults, 'ec2', undefined).height).toBeUndefined();
   });
 });

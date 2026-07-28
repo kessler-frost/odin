@@ -1254,6 +1254,28 @@ index-to-index deletion on this file.
   the way a lambda → s3 edge already does. The compiler and the enforcement
   point do not change; the vocabulary does.
 
+- [x] **Every box persists its size, not just containers** (owner question,
+  2026-07-28: *"it's not just ec2's box right? All the boxes and their exact
+  positions and Heights and weights should be persisted if it exists right?"*).
+  Correct, and it was not the case. Positions and widths always persisted;
+  HEIGHTS were dropped on load for every kind except containers, so resizing an
+  S3 or Lambda box silently snapped back.
+
+  The rule outlived its reason. Heights were dropped because an older build
+  baked `measured.height` into the saved canvas and froze every box at its
+  first-render size; `sizeForSave` stopped writing measurements, which fixed
+  that at the source. After that, dropping heights on load could only discard
+  DELIBERATE resizes -- and it had just been caught doing exactly that to an
+  expanded EC2 box, taking a workload's placement with it.
+
+  Now every kind keeps a stored size. The frozen-boxes guarantee is enforced
+  entirely on the save side and tested there: no matter how often a node is
+  measured and re-saved, a height nobody chose is never written. Verified live
+  across three kinds at once (260x140, 300x160, 240x120 all preserved through a
+  reload). One caveat stated rather than guarded: a canvas written before the
+  save-side fix may carry a baked height, which now renders instead of being
+  re-derived -- visible, and one drag from fixed.
+
 - [ ] **Placement that infers intent from geometry.** The general form of the
   first item: what a person expresses by putting one thing inside, next to, or
   overlapping another. Containment is the first and clearest case; adjacency
