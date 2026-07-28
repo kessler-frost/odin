@@ -1136,19 +1136,27 @@ released tag, not asserted), so v0.7.7 regresses nothing. They are recorded
 here rather than hacked green, because making them pass in five minutes would
 have meant retiring a claim rather than fixing a bug.
 
-- [ ] **`test_a_noop_apply_cannot_report_success_*` (ecs + lambda) — a genuine
-  design conflict, and it needs a DECISION, not a patch.** The tests assert
-  that a no-op apply must not claim success while the service is at zero, and
-  they create that state with a broken `${{ghost.ENDPOINT}}` ref. odin's
-  wiring guard now refuses that apply upfront with a 409 — which is BETTER
-  behaviour, and it runs before apply, so "apply proceeds while a ref is
-  unresolvable" is unreachable BY DESIGN.
-  Three options, none free: (a) assert the refusal — honest, loses the
-  reconcile-path coverage; (b) find a failure mechanism the guard allows —
-  preserves the claim, but every candidate checked (bad image, etc.) breaks
-  the test's own "tofu had nothing to do" premise; (c) split into two tests.
-  The claim these encode is one of odin's honesty guarantees (field test 3:
-  `applied`/exit-0 at 0 of 3 tasks). Do not retire it quietly.
+- [~] **`test_a_noop_apply_cannot_report_success_*` — SPLIT (owner decision,
+  2026-07-27). ECS is done; LAMBDA still to mirror.** The wiring guard now
+  refuses an apply carrying an unresolvable `${{ghost.ENDPOINT}}` ref with a
+  409, which made these tests' route to a zero-task service unreachable by
+  design. Resolved by splitting rather than retiring: one test asserts the
+  refusal (and that nothing was built), the other keeps the honesty claim via a
+  route the guard permits.
+
+  For the ECS one that route is: apply a bad image (a real update, so tofu
+  does work), kill the tasks OUT OF BAND as the field did, then re-apply the
+  UNCHANGED canvas — a genuine empty plan with the service at 0 of 3. Two
+  premises failed on the way and are worth not re-deriving: a bad image ALONE
+  never reaches zero, because ECS keeps healthy old-revision tasks when the new
+  ones cannot start (measured: 3 still up); and reading `DescribeServices`
+  straight after the recovery apply races the service's re-registration, giving
+  an `IndexError` that says nothing. Poll the task containers instead.
+
+  Both ECS tests pass against real containers and real tofu (93s).
+  **`tests/simulate/test_lambda_noop_apply_outage_e2e.py` needs the same
+  treatment** — the same 409 collides with it, and the lambda equivalent of
+  "a route the guard permits" has not been established yet.
 
 - [ ] **`test_a_killed_database_gets_its_mesh_endpoint_back_after_one_apply`.**
   A killed rds container does not come back after one apply — verdict
