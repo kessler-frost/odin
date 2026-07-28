@@ -19,7 +19,7 @@ just sqs/sns.
 Three call shapes, dispatched by `app.py`:
   - `get_caller_identity` -- STS, handled OUTSIDE classify()/evaluate()
     entirely (verify() is the only gate: GetCallerIdentity isn't scoped to
-    any canvas resource, so there's no edge-compiled statement that could
+    any canvas resource, so there's no applied statement that could
     ever grant/deny it -- matching real AWS, where it needs no IAM policy).
   - `pure_answer` -- PURE_ACTIONS never reach a backing (goaws/dynalite lack
     or mishandle them entirely): tag CRUD, SNS Get/SetTopicAttributes, SQS

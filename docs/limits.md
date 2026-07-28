@@ -17,12 +17,7 @@ They are listed because finding one by surprise is worse than reading it here.
   and it round-trips through Terraform and back without loss. What it is not yet
   is portable: the `Resource` is odin's node label, because that is what
   `gateway/classify.py` reports and therefore what the evaluator matches. Taken
-  to Amazon, each policy needs its `Resource` rewritten as an ARN. Two consequences worth knowing: `odin translate > main.tf` taken to
-  real AWS gives that workload no permissions, and a canvas round-tripped through
-  Terraform comes back with no edges. `odin translate` prints
-  `not in this file: <src> -> <dst> …` on stderr for each one, and the round-trip
-  loss is reported there because an import cannot warn about something that was
-  never in the file it read.
+  to Amazon, each policy needs its `Resource` rewritten as an ARN.
 - **An imported ECS service loses its canvas wiring entirely** — both the
   `${{producer.ATTR}}` env references and the ordering they produced. The
   references are deliberately never written into the generated Terraform (a

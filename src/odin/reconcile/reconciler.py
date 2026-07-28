@@ -53,7 +53,7 @@ from pydantic import BaseModel
 
 from odin.aws.backings import BackingUnavailable, ENSURE_KINDS, PROVISIONED
 from odin.fabric.localhost import LocalhostFabric
-from odin.gateway.policy import compile_policies
+from odin.gateway.policy import compile_policies, compile_policies_from_iam
 from odin.gateway.stores import SynthStores
 from odin.reconcile.actions import NoOp, ProvisionResource, StopContainer
 from odin.reconcile.drift import DriftSweeper
@@ -513,9 +513,9 @@ class Reconciler:
             await self._execute(action, stack)
         if self._aws is not None:  # stop backings no active kind needs anymore
             await self._aws.gc({r.kind for r in stack.resources})
-        if self._gateway is not None:  # policies/ports always track the applied Stack
+        if self._gateway is not None:  # policies/ports always track the APPLIED state
             ports = await self._aws.backing_ports() if self._aws is not None else {}
-            self._gateway.update(self._env, compile_policies(stack), ports)
+            self._gateway.update(self._env, self._policies(stack), ports)
         if self._stores is not None:  # fix-wave 2b finding #1: project tofu's own creations into World
             await self._project_tf_owned()
 
@@ -641,7 +641,32 @@ class Reconciler:
         await asyncio.gather(*(self._aws.ensure_backing(k) for k in kinds))
         if self._gateway is not None:
             ports = await self._aws.backing_ports()
-            self._gateway.update(self._env, compile_policies(stack), ports)
+            self._gateway.update(self._env, self._policies(stack), ports)
+
+    def _policies(self, stack: Stack) -> dict[str, list]:
+        """What the gateway will authorize, compiled from the APPLIED IAM.
+
+        Owner decision, 2026-07-28: a permission takes effect when it is applied,
+        and the applied Terraform is what says so. `hcl.py` emits each drawn edge
+        as a real `aws_iam_role_policy` attached to the workload's role, tofu
+        creates it through the gateway, and this reads it back out.
+
+        The user-visible behaviour is UNCHANGED, which is worth being exact
+        about: policies were already compiled from `store.get_stack(env)` — the
+        APPLIED Stack — so an edge drawn and left unapplied never granted
+        anything. Measured before the switch: canvas with 1 edge, applied stack
+        with 0, `evaluate` False. What changes is WHERE the answer comes from,
+        and that is what makes `iamctl` load-bearing instead of a store nothing
+        read.
+
+        Falls back to the Stack's edges when there are no gateway stores at all
+        (unit tests that build a Reconciler without them). A missing store is not
+        an empty policy set: silently authorizing nothing would look exactly like
+        a canvas with no grants.
+        """
+        if self._stores is None:
+            return compile_policies(stack)
+        return compile_policies_from_iam(self._stores, self._env)
 
     # ---- helpers ----
     def _kind_of(self, stack: Stack, rid: str) -> str | None:

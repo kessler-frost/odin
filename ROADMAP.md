@@ -72,7 +72,7 @@ future decision against these points instead of re-deriving them:
 
 - [x] **Gateway + IAM enforcement.** DONE 2026-07-22 (G1–G5 + synthesized
   control-plane): SigV4 verification (incl. S3 body-hash cross-check) →
-  (service, action, resource) classification → edge-compiled policy
+  (service, action, resource) classification → applied-IAM policy
   evaluation → forward to substitutes (re-signed for RustFS), with
   protocol-correct AccessDenied per service, STS identity, tag/attribute
   stores, and ~2ms added latency. Proven by real-container acceptance tests
@@ -1372,17 +1372,67 @@ index-to-index deletion on this file.
 
 ## Next — known, measured, not yet fixed
 
+- [x] **The gateway authorizes from the APPLIED IAM, not from the canvas.**
+  DONE v0.8.12, owner ask 2026-07-28: *"I want the permission to take effect
+  only after an apply. Decorative shit shouldn't be there."*
+
+  Before this, `evaluate()` read a policy map compiled straight from the canvas
+  edges. Two things were wrong with that. A permission took effect the moment it
+  was drawn and committed, with no apply — so the Terraform odin generated
+  described an IAM posture the gateway was not using, which is the same shape as
+  every other bug in the honesty section: a claim nothing verified. And the
+  chat agent's own grant op wrote `data["actions"]` where the translator reads
+  `data["permissions"]`, so an agent-drawn grant rendered on the canvas and
+  granted nothing at all — decorative in the literal sense.
+
+  Now: `agent/hcl.py` emits the policy, tofu applies it through the gateway,
+  `iamctl` stores it, and `policy.compile_policies_from_iam` reads it back —
+  each workload's role found in its OWN service record (a lambda's `role`, a
+  task definition's `task_role_arn`, an instance's `iam_instance_profile`
+  resolved through the profile that owns it) rather than by a naming
+  convention. Each granted workload also `depends_on` its policy, because tofu
+  is free to order two resources that merely share a role either way, and a
+  container that starts first would be denied a permission that WAS applied —
+  a race indistinguishable from a wrong grant.
+
+- [ ] **Cleanup, redundancy removal and code hygiene — AFTER the owner's manual
+  pass.** Owner ask, 2026-07-28: schedule proper maintenance work, but only once
+  every feature has been tried by hand. The gate is deliberate: a hygiene sweep
+  that lands before the features are exercised removes things nobody has yet
+  discovered they need, and it makes any bug the manual pass finds ambiguous —
+  pre-existing, or introduced by the sweep? So this stays blocked until the
+  owner says the manual pass is done.
+
+  What it covers when unblocked:
+  - **Dead and duplicated code.** The parked app-layer left seams behind, the
+    de-threading run rewrote ~28 call sites, and several passes in `hcl.py` grew
+    by accretion. Find what nothing calls and what two modules both do.
+  - **The docs-vs-source audit as a routine, not an incident.** Honesty rule 3
+    exists because caveats outlive their fixes; this release closed four stale
+    claims about edge-compiled enforcement that were true when written. Worth a
+    check that can fail a build rather than a habit.
+  - **Test-suite hygiene.** 2808 tests, some overlapping; and a ratchet is only
+    worth its runtime if breaking the thing it guards still fails it. Re-run the
+    mutation checks the honesty rules ask for and delete the ones that no longer
+    bite.
+  - **`try`/`except` and branch density**, per the owner's standing rule — the
+    reconciler and the gateway builders are where multiple paths accumulated.
+  - **Dependency and disk review.** Trim what is no longer imported; confirm
+    every licence is still permissive.
+
 - [ ] **Close the Known limits, one at a time.** `docs/limits.md` is the list, and
   each entry there is a promise odin does not keep yet. Owner ask, 2026-07-28:
   treat it as a work queue, not a disclaimer. In rough order of what a user hits
   first:
 
-  1. **A drawn IAM edge is not in the generated Terraform.** The gateway enforces
-     it, so odin is correct; the FILE is incomplete. `main.tf` taken to Amazon
-     grants nothing, and a canvas round-tripped through Terraform loses every
-     permission. Emitting `aws_iam_role_policy` per drawn edge would close it and
-     make the round trip lossless — the one design question is what to attach a
-     policy to for a workload that has no role drawn.
+  1. ~~**A drawn IAM edge is not in the generated Terraform.**~~ CLOSED in
+     v0.8.11/v0.8.12. A drawn permission is emitted as a real
+     `aws_iam_role_policy` on the workload's role (an ec2/ecs node that is
+     granted something gets the same auto-role a lambda always had, reached
+     through an `aws_iam_instance_profile` for ec2), it round-trips through
+     import without loss, and the gateway now authorizes from THAT — see the
+     enforcement-source entry below. What remains is portability, tracked in
+     `docs/limits.md`: the `Resource` is odin's node label rather than an ARN.
   2. **An RDS container keeps no volume**, so odin's own repair returns an empty
      database. A named volume per instance would survive a container replacement
      and make the recovery non-destructive, which changes the disclosure in

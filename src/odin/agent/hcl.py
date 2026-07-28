@@ -348,6 +348,38 @@ def _depends_on_block(res: ResourceDesired, refs: Refs, extra: list[str] | None 
     return f"  depends_on = [{', '.join(sorted(set(addresses)))}]" if addresses else ""
 
 
+def _grant_role_ref(res: ResourceDesired, stack: Stack, refs: Refs) -> tuple[str, str] | None:
+    """The role a workload's drawn permissions hang on, or None if it has none.
+
+    A policy needs a role, so this is the single gate on whether a granted
+    workload gets an `aws_iam_role_policy` at all. Both the pass that reserves
+    the policy's name and the pass that emits it call this, so the two cannot
+    disagree -- a name reserved but never emitted is a `depends_on` pointing at
+    nothing, which fails `tofu plan` for every resource on the canvas.
+    """
+    if not [e for e in stack.edges if e.kind == "iam" and e.src == res.id and e.perms]:
+        return None
+    role_ref = refs.get(_workload_role_key(res.id)) or refs.get(_lambda_role_key(res.id))
+    if role_ref is not None:
+        return role_ref
+    # A lambda with a DRAWN role hangs its policy on that role instead.
+    drawn = _field(res, "role", "").strip()
+    role_ref = refs.get(drawn) if drawn else None
+    return role_ref if role_ref is not None and role_ref[0] == "iam_role" else None
+
+
+def _grant_dependency(res: ResourceDesired, refs: Refs) -> list[str]:
+    """The policy this workload must not start before.
+
+    tofu is free to order two resources that merely share a role either way, so
+    without this a container could come up, call S3 and be denied a permission
+    that was drawn and applied. That failure would look exactly like a wrong
+    grant, which is the most expensive kind of bug to chase.
+    """
+    grants = refs.get(_grants_key(res.id))
+    return [f"aws_iam_role_policy.{grants[1]}"] if grants else []
+
+
 def _placement_dependency(res: ResourceDesired, refs: Refs) -> list[str]:
     """The EC2 instance a placed workload must not start before.
 
@@ -656,6 +688,12 @@ def _ec2(res: ResourceDesired, refs: Refs) -> Built:
         # already assigned in pass 1, so `refs[res.id]` is available here.
         _, own_name = refs[res.id]
         nested.append(f"  key_name = aws_key_pair.{own_name}_key.key_name")
+    profile = refs.get(_instance_profile_key(res.id))
+    if profile is not None:
+        nested.append(f"  iam_instance_profile = aws_iam_instance_profile.{profile[1]}.name")
+    grant_dep = _depends_on_block(res, refs, _grant_dependency(res, refs))
+    if grant_dep:
+        nested.append(grant_dep)
     user_data = _field(res, "userData", "")
     if user_data:
         nested.append(f"  user_data = {quote(user_data)}")
@@ -721,6 +759,17 @@ def _lambda_entry(runtime: str) -> tuple[str, str]:
 _GRANTABLE_KINDS = ("ec2", "ecs")
 
 
+def _grants_key(node_id: str) -> str:
+    """`refs` key for the `aws_iam_role_policy` carrying this workload's grants.
+    Reserved in pass 1 so the workload can `depends_on` it in pass 2."""
+    return f"__grants__{node_id}"
+
+
+def _instance_profile_key(node_id: str) -> str:
+    """`refs` key for the instance profile that carries an ec2 node's role."""
+    return f"__instance_profile__{node_id}"
+
+
 def _workload_role_key(node_id: str) -> str:
     """`refs` key for the auto-role an ec2/ecs node gets when something is
     granted to it. Same reservation shape as `_lambda_role_key`."""
@@ -783,7 +832,7 @@ def _lambda(res: ResourceDesired, refs: Refs) -> Built:
     }
     # No `environment` block: the node's env map is injected at container launch
     # (`gateway/wiring.py`); this only orders the producers ahead of it.
-    return attrs, _depends_on_block(res, refs)
+    return attrs, _depends_on_block(res, refs, _grant_dependency(res, refs))
 
 
 # V5c: ECS services (real per-task Colima containers, gateway/models/
@@ -889,7 +938,7 @@ def _ecs(res: ResourceDesired, refs: Refs) -> Built:
     # service, so its tasks never launch before the endpoint they consume
     # exists. The VALUES arrive at container launch, not through the HCL --
     # `_WIRED_KINDS` above.
-    depends_on = _depends_on_block(res, refs, _placement_dependency(res, refs))
+    depends_on = _depends_on_block(res, refs, _placement_dependency(res, refs) + _grant_dependency(res, refs))
     if depends_on:
         blocks.append(depends_on)
     # W2.5: an `alb` node edged to this service fronts it -- which in real AWS
@@ -1283,6 +1332,14 @@ def generate_tf(stack: Stack) -> TfProject:
                 sanitize_name(f"{res.id}_role"), used_names.setdefault("aws_iam_role", set()),
             )
             refs[_workload_role_key(res.id)] = ("iam_role", role_name)
+            # An ec2 instance reaches a role through an instance profile, and
+            # `_ec2` runs in pass 2 -- so the profile's name is reserved here,
+            # exactly like the role, or the builder has nothing to reference.
+            if res.kind == "ec2":
+                refs[_instance_profile_key(res.id)] = ("iam_instance_profile", unique_name(
+                    sanitize_name(f"{res.id}_profile"),
+                    used_names.setdefault("aws_iam_instance_profile", set()),
+                ))
         # V5c: the FIRST ecs node seen reserves the one shared cluster's HCL
         # name -- every later ecs node's `_ecs` builder (pass 2) just reads
         # it back, same reservation technique as the lambda auto-role above.
@@ -1313,6 +1370,23 @@ def generate_tf(stack: Stack) -> TfProject:
                     f"{'/'.join(_ALB_TARGET_KINDS)} nodes can be load-balancer targets in Simulate v1"
                 )
             break  # one edge is one (alb, target) pair, whichever way it was drawn
+
+    # Pass 1.6 — reserve each granted workload's policy name, so pass 2 can
+    # point that workload's `depends_on` at it. This runs as its own pass, after
+    # every resource name exists, because the gate is `_grant_role_ref`: a
+    # policy needs a role to hang on, and a lambda's DRAWN role is an ordinary
+    # resource that pass 1 may not have reached yet when the lambda is visited.
+    #
+    # The gate is shared with the emission loop below for the reason pass 2's
+    # comment gives: a reservation the emission loop then declines to fill
+    # leaves a `depends_on` pointing at a block that does not exist, and an
+    # unresolvable reference fails `tofu plan` for the WHOLE project.
+    for res in ordered:
+        if _grant_role_ref(res, stack, refs) is not None:
+            refs[_grants_key(res.id)] = ("iam_role_policy", unique_name(
+                sanitize_name(f"{res.id}_grants"),
+                used_names.setdefault("aws_iam_role_policy", set()),
+            ))
 
     # Pass 2 — build blocks with the name table complete. A builder may still
     # opt out for THIS resource (returns the reason string) — e.g. a subnet
@@ -1443,23 +1517,44 @@ def generate_tf(stack: Stack) -> TfProject:
     for res in ordered:
         if res.id not in granted_ids:
             continue
+        role_ref = _grant_role_ref(res, stack, refs)
+        if role_ref is None:
+            continue
         grants = [e for e in stack.edges if e.kind == "iam" and e.src == res.id and e.perms]
-        role_ref = refs.get(_workload_role_key(res.id)) or refs.get(_lambda_role_key(res.id))
-        if not grants or role_ref is None:
-            # A lambda with a DRAWN role hangs its policy on that role instead.
-            drawn = _field(res, "role", "").strip()
-            role_ref = refs.get(drawn) if drawn else None
-            if not grants or role_ref is None or role_ref[0] != "iam_role":
-                continue
         _, role_name = role_ref
-        own = hcl_name_by_id.get(res.id) or sanitize_name(res.id)
-        name = unique_name(sanitize_name(f"{own}_grants"), used_names.setdefault("aws_iam_role_policy", set()))
+        name = refs[_grants_key(res.id)][1]
         attrs = {
             "name": quote(f"{res.id}-grants"),
             "role": f"aws_iam_role.{role_name}.name",
             "policy": quote(_policy_document(grants)),
         }
         blocks.append((("iam_role_policy", f"__grants__{res.id}"), _block("aws_iam_role_policy", name, attrs)))
+        # The workload must not start before the policy that authorizes it. tofu
+        # is free to order two resources that merely share a role either way, so
+        # without this a container could come up, call S3 and get AccessDenied
+        # for a permission that was drawn and applied -- a race that would look
+        # exactly like a wrong grant. `_grant_dependency` feeds this into the
+        # workload's own `depends_on`.
+
+
+    # An ec2 node reaches its role through an INSTANCE PROFILE, which is how AWS
+    # models it and what `iamctl` already implements (CreateInstanceProfile,
+    # AddRoleToInstanceProfile). Emitted only for an instance that was granted
+    # something, so an ungranted canvas is byte-identical to before.
+    for res in ordered:
+        role_ref = refs.get(_workload_role_key(res.id))
+        if res.kind != "ec2" or role_ref is None:
+            continue
+        profile_ref = refs.get(_instance_profile_key(res.id))
+        if profile_ref is None:
+            continue
+        blocks.append((
+            ("aws_iam_instance_profile", res.id),
+            _block("aws_iam_instance_profile", profile_ref[1], {
+                "name": quote(f"{res.id}-profile"),
+                "role": f"aws_iam_role.{role_ref[1]}.name",
+            }),
+        ))
 
     # ...and the auto-role itself for an ec2/ecs node that was granted something.
     # A lambda's auto-role is emitted by its own pass below; this is the same
@@ -1538,9 +1633,16 @@ def generate_tf(stack: Stack) -> TfProject:
             for key in ("cpu", "memory")
             if (value := _field(res, key, "").strip())
         }
+        # `task_role_arn` when something was granted to this service: the policy
+        # has to be reachable FROM the workload, or the gateway can only guess
+        # which node a role belongs to by its name. With this the link is stated
+        # in the file, which is what lets enforcement read the applied IaC.
+        role_ref = refs.get(_workload_role_key(res.id))
+        attached = {"task_role_arn": f"aws_iam_role.{role_ref[1]}.arn"} if role_ref else {}
         attrs = {
             "family": quote(res.id),
             **sized,
+            **attached,
             "requires_compatibilities": '["EC2"]',
             "network_mode": quote("bridge"),
         }

@@ -25,6 +25,7 @@ from botocore.exceptions import ClientError
 from fastapi.testclient import TestClient
 
 from odin.gateway.keys import OPERATOR_NODE_ID, KeyStore
+from odin.gateway.policy import compile_policies_from_iam
 from odin.server import create_app
 from odin.spec.store import SpecStore
 from tests.api.test_apply import FakeRds, FakeRuntime
@@ -81,6 +82,40 @@ def wired(tmp_path):
         # the gateway's policy) while the routing table stays empty -- exactly
         # the condition the gateway answers ServiceUnavailable for.
         assert client.post("/apply", params={"env": ENV}, json=CANVAS).status_code == 200
+        # v0.8.12: the gateway authorizes from the APPLIED IAM, so the fixture has
+        # to contain what a real apply produces. `/apply` commits the Stack
+        # without running tofu, so nothing here creates the role or its policy --
+        # under the old edge-compiled enforcement the canvas alone was enough,
+        # and this test went from ServiceUnavailable to AccessDenied when that
+        # changed. Seeded rather than reworded, because the case under test is
+        # what a GRANTED principal sees when the backing is down.
+        stores = client.app.state.gateway_stores
+        stores.iamctl.set(ENV, "role:worker-role", {
+            "role_name": "worker-role", "role_id": "AROATEST", "path": "/",
+            "assume_role_policy_document": "{}", "description": "",
+            "inline_policies": {"worker-grants": json.dumps({
+                "Version": "2012-10-17",
+                "Statement": [{"Effect": "Allow", "Action": ["s3:GetObject"], "Resource": "uploads"}],
+            })},
+            "attached_policy_arns": [],
+        })
+        stores.lambdactl.set(ENV, "fn:worker", {
+            "function_name": "worker", "state": "Active",
+            "role": "arn:aws:iam::000000000000:role/worker-role",
+        })
+        # The gateway is handed its policy map at reconcile time, and the seeding
+        # above lands after that, so it has to be recompiled here or the gateway
+        # is still holding the empty map it was given during `/apply`.
+        gateway = client.app.state.gateway
+        existing = gateway._envs.get(ENV)
+        gateway.update(
+            ENV,
+            compile_policies_from_iam(stores, ENV),
+            # Carried over rather than passed as `{}`: the empty routing table is
+            # the very thing this test asserts on, so writing it here would be
+            # the test manufacturing its own answer.
+            existing.backing_ports if existing else {},
+        )
         yield client, tmp_path, creds
 
 
