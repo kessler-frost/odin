@@ -122,10 +122,16 @@ def test_a_drawn_GRANT_is_emitted_as_real_terraform_and_survives_a_round_trip():
     rather than patched to survive. It did fail, and that is what happened — the
     claim "the permission is absent" is gone.
 
-    What replaced it is a smaller, different claim, which is why
-    `not_in_terraform` still exists: the policy IS emitted, and its `Resource` is
-    odin's node LABEL because that is what the gateway matches on, where Amazon
-    expects an ARN. Complete for odin, one edit per policy for AWS.
+    That instruction applied a second time, and is being honoured the same way
+    rather than patched around. v0.8.11's replacement claim was "the policy IS
+    emitted, but its `Resource` is odin's node LABEL where Amazon expects an
+    ARN"; the ARN work closes that too, so the pinned `(gap,)` assertion is
+    DELETED rather than rewritten to match whichever form it currently takes.
+
+    What is asserted instead is the invariant that must hold in every version:
+    `not_in_terraform` may note a portability difference, but it may never again
+    say the permission is ABSENT. The behaviour worth pinning is the round trip
+    below, which is the part that was actually lost.
     """
     project = generate_tf(canvas_to_stack(CANVAS))
     main_tf = project.files["main.tf"]
@@ -133,10 +139,9 @@ def test_a_drawn_GRANT_is_emitted_as_real_terraform_and_survives_a_round_trip():
     assert "aws_iam_role_policy" in main_tf, "the grant must be real Terraform now"
     assert "s3:GetObject" in main_tf, "and carry the action that was drawn"
 
-    # The remaining difference, stated exactly.
-    (gap,) = project.not_in_terraform
-    assert "the policy is emitted" in gap
-    assert "ARN" in gap
+    assert not any("NO policy is emitted" in gap for gap in project.not_in_terraform), (
+        project.not_in_terraform
+    )
 
     # And the round trip keeps it, which is the part that used to be lost.
     imported = parse_hcl_text(main_tf)

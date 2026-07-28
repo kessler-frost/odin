@@ -148,12 +148,46 @@ WIRED = {
 }
 
 
+# A project odin did NOT write: it has ordering and no `odin:ref:` tags, which
+# is the only shape whose wiring genuinely cannot be rebuilt. The two tests below
+# used to generate their fixture, which meant that the day the emitter started
+# tagging refs they would have been measuring the recoverable case while claiming
+# the unrecoverable one -- passing, and testing something else.
+WIRED_HCL = '''
+resource "aws_db_instance" "app_db" {
+  identifier = "app-db"
+  engine     = "postgres"
+}
+
+resource "aws_ecs_cluster" "odin" {
+  name = "odin"
+}
+
+resource "aws_ecs_task_definition" "api_taskdef" {
+  family                = "api"
+  container_definitions = "[{\\"name\\": \\"api\\", \\"image\\": \\"nginx:alpine\\"}]"
+}
+
+resource "aws_ecs_service" "api" {
+  name            = "api"
+  cluster         = aws_ecs_cluster.odin.id
+  task_definition = aws_ecs_task_definition.api_taskdef.arn
+
+  depends_on = [aws_db_instance.app_db]
+}
+'''
+
+
 def test_the_env_wiring_is_reported_as_unrecoverable_naming_the_producer():
-    """It is NOT in the HCL by design (a resolved DATABASE_URL carries the
-    password), so an import cannot bring it back. Saying nothing would hand
-    someone a service that starts with no configuration it used to have."""
-    result, tf = _round_trip(WIRED)
-    assert "DATABASE_URL" not in tf, "a resolved credential must never reach the generated HCL"
+    """A resolved DATABASE_URL carries the password, so it is never written into
+    the HCL and a file that lacks the reference tags cannot get the wiring back.
+    Saying nothing would hand someone a service that starts with no configuration
+    it used to have.
+
+    What odin DOES write is the reference without its value -- see
+    `tests/agent/test_import_wiring.py`, which asserts that round trip and that
+    no resolved secret reaches the file."""
+    result = parse_hcl_text(WIRED_HCL)
     (warning,) = [w for w in result.warnings if "wiring" in w]
     assert "app-db" in warning, warning
     assert "re-add the env references" in warning, warning
@@ -173,11 +207,11 @@ def test_not_even_the_ordering_survives_and_the_warning_says_so():
     v0.8.14 narrows WHEN this holds without changing that it holds: the refs are
     recoverable now, from the `odin:ref:<VAR>` tags `hcl.py` emits, so a file
     that HAS them round-trips its ordering (see
-    `tests/agent/test_import_wiring.py`). This fixture predates them -- a
+    `tests/agent/test_import_wiring.py`). `WIRED_HCL` deliberately has none -- a
     hand-authored project, or one from an older odin -- and for it the reasoning
     above is unchanged and the warning must still say so.
     """
-    result, _tf = _round_trip(WIRED)
+    result = parse_hcl_text(WIRED_HCL)
     regenerated = generate_tf(canvas_to_stack(
         {"nodes": result.nodes, "edges": result.edges})).files["main.tf"]
     assert "depends_on" not in regenerated
