@@ -23,7 +23,7 @@ from odin.aws.backings import BackingAws
 from odin.runtime.colima import ColimaRuntime
 from odin.server import create_app
 from odin.spec.store import SpecStore
-from tests.containers import own_containers
+from tests.containers import own_containers, own_volumes
 
 pytestmark = pytest.mark.integration
 
@@ -51,6 +51,11 @@ async def runtime():
     yield rt
     for name in await own_containers(rt, ENV):
         await rt.stop(name)
+    # `stop` is `docker rm -f -v`, which leaves NAMED volumes standing on
+    # purpose (that is what makes an rds repair non-destructive), so this
+    # canvas's rds data volume needs removing in its own right.
+    for volume in await own_volumes(rt, ENV):
+        await rt.remove_volume(volume)
 
 
 def _phases(client) -> dict:
@@ -152,3 +157,7 @@ async def test_apply_full_converges_reapplies_zero_drift_and_tears_down(tmp_path
         await aws.gc(set())  # stop this env's backing containers -- nothing else owns them
 
     assert await own_containers(runtime, ENV) == [], "every container this test made is gone"
+    # ...and every VOLUME, which is a separate question: the empty-canvas
+    # teardown above is what has to remove the rds data volume, and a leaked one
+    # would be invisible to the container listing.
+    assert await own_volumes(runtime, ENV) == [], "the rds data volume survived teardown"

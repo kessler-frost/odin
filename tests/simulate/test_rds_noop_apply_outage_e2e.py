@@ -92,11 +92,17 @@ def _db_record(root: Path) -> dict:
 @pytest.fixture
 def db_cleanup():
     """Container hygiene ABSOLUTE, by EXACT name -- both the real database
-    container and the stand-in that takes its name, whatever the outcome."""
+    container and the stand-in that takes its name, whatever the outcome.
+
+    The data VOLUME needs its own removal: `rm -f -v` drops a container's
+    anonymous volumes and deliberately leaves NAMED ones (that is what makes
+    odin's rds repair non-destructive), so removing only the container would
+    leak a Postgres volume on every failed run."""
     names: list[str] = []
     yield names
     for name in names:
         _docker("rm", "-f", "-v", name)
+        _docker("volume", "rm", "-f", f"{name}-data")
 
 
 @pytest.fixture
@@ -220,3 +226,7 @@ def test_a_noop_apply_cannot_report_success_on_a_database_that_never_answers(
 
     leftover = _docker("ps", "-aq", "--filter", f"name={victim}")
     assert leftover.stdout.strip() == "", f"the database container survived: {leftover.stdout}"
+    # ...and so does its data volume: a teardown that leaves one behind is a
+    # data leak and a disk leak, and nothing else in odin would ever reclaim it.
+    vols = _docker("volume", "ls", "--filter", f"name={victim}", "--format", "{{.Name}}")
+    assert vols.stdout.strip() == "", f"the database's data volume survived: {vols.stdout}"

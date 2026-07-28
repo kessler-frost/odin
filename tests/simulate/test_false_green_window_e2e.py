@@ -30,9 +30,16 @@ container dies is the one under test -- the field's exact loop:
 
 Until v0.8.2 step 2 read "-> FAILS, naming the resource" and a third step applied
 again to recover. That was deliberate and its reason was good: an rds container
-keeps its data on its own writable layer (`PostgresRds.create_db` mounts no
-volume), so re-creating one returns an EMPTY database, and this file's own words
-were that "no operator should learn about that from a green apply".
+kept its data on the image's anonymous volume, which `docker rm -f -v` deleted
+with it, so re-creating one returned an EMPTY database, and this file's own
+words were that "no operator should learn about that from a green apply".
+
+(v0.8.14 removed that data loss outright -- each instance now has a NAMED data
+volume that outlives its container -- so the disclosure this file checks says
+"its data survived" rather than "its data did not survive". The disclosure is
+still mandatory, and it is still checked here, because a container the user did
+not touch is still being replaced. `tests/aws/test_rds_postgres.py` is where
+real rows are written, killed and read back; this file's job is the WINDOW.)
 
 What the ordering actually produced in the field was worse. The sweep that MARKS
 a container dead ran only after the converges that CLEAR the mark, so the apply
@@ -143,6 +150,12 @@ def containers():
     yield names
     for name in names:
         _docker("rm", "-f", "-v", name)
+        # ...and, for an rds container, its NAMED data volume: `rm -f -v`
+        # deliberately leaves those standing (that is what makes odin's repair
+        # non-destructive), so removing only the container leaks a Postgres
+        # volume on every run that fails before its real teardown. A no-op --
+        # exit 0 -- for every other kind, which has no such volume.
+        _docker("volume", "rm", "-f", f"{name}-data")
 
 
 @pytest.fixture
@@ -281,14 +294,18 @@ def test_a_killed_or_paused_database_fails_the_very_next_apply(
         assert body["status"] == "applied", body
         assert "unhealthy_resources" not in body, body
 
-        # THE DATA-LOSS DISCLOSURE. This is the assertion that lets the apply
-        # above be green at all: re-creating this container returned an EMPTY
-        # database, and an operator who reads only `note` still learns that.
+        # THE RECOVERY DISCLOSURE. This is the assertion that lets the apply
+        # above be green at all: a container the user did not touch was
+        # destroyed and rebuilt, and an operator who reads only `note` still
+        # learns that -- plus what it cost, which since v0.8.14 is nothing,
+        # because the named data volume outlived the container. `data_kept` is
+        # READ from the real docker volume listing here, not assumed.
         (recovered,) = body["recovered_resources"]
         assert (recovered["kind"], recovered["node"]) == ("rds", DB), recovered
         assert "is not running (exit 137)" in recovered["reason"], recovered
+        assert recovered["data_kept"] is True, recovered
         assert DB in body["note"] and "re-created" in body["note"], body["note"]
-        assert "data did not survive" in body["note"], body["note"]
+        assert "its data survived" in body["note"], body["note"]
 
         # ...and the recovery is real, in this same apply.
         assert _state(db) == "running", "the apply claimed a recovery it did not perform"
@@ -309,7 +326,7 @@ def test_a_killed_or_paused_database_fails_the_very_next_apply(
         (recovered,) = body["recovered_resources"]
         assert (recovered["kind"], recovered["node"]) == ("rds", DB), recovered
         assert "is paused" in recovered["reason"], recovered
-        assert "data did not survive" in body["note"], body["note"]
+        assert "its data survived" in body["note"], body["note"]
         # `create_db` clears a same-name remnant whatever state it is in, so a
         # paused container recovers exactly like a killed one.
         assert _state(db) == "running"
