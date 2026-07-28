@@ -16,6 +16,7 @@ import io
 import json
 import re
 import zipfile
+from pathlib import Path, PurePosixPath
 
 import hcl2
 from pydantic import BaseModel
@@ -730,27 +731,185 @@ _BAD_ROLE_REF = "role names something that isn't an IAM Role on the canvas"
 # pins every host-dependent field instead: the ZIP epoch (the earliest
 # timestamp the DOS format can express -- what reproducible-build tooling
 # uses), 0644 permissions, and the unix create_system, so nothing about WHEN or
-# WHERE the translate ran leaks into the archive. Member ORDER is stable too:
-# v1 taskdefs/packages are single-entry, and the one entry's name is derived
-# from `_lambda_entry` rather than a directory walk.
+# WHERE the translate ran leaks into the archive.
+#
+# v0.8.14 makes the archive MULTI-MEMBER (a function may be a whole directory),
+# which puts a second host-dependent input in reach: member ORDER. A directory
+# walk's order is the filesystem's, so the members are written in sorted name
+# order here and nowhere else -- `sorted()` is the whole of that guarantee, and
+# `tests/agent/test_lambda_package.py` zips the same tree twice and compares
+# bytes rather than trusting this comment.
 _ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
 _ZIP_FILE_MODE = 0o100644  # regular file, rw-r--r--
 _ZIP_UNIX = 3  # ZipInfo.create_system
 
 
-def _deterministic_zip(entry_filename: str, code: str) -> bytes:
-    info = zipfile.ZipInfo(entry_filename, date_time=_ZIP_EPOCH)
-    info.compress_type = zipfile.ZIP_DEFLATED
-    info.external_attr = _ZIP_FILE_MODE << 16
-    info.create_system = _ZIP_UNIX
+def _deterministic_zip(members: dict[str, bytes]) -> bytes:
+    """`{member name: bytes}` -> a byte-deterministic zip. Same members, same
+    bytes, on any host at any time -- see the note above for why every field
+    is pinned and why the members are sorted."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as archive:
-        archive.writestr(info, code)
+        for name in sorted(members):
+            info = zipfile.ZipInfo(name, date_time=_ZIP_EPOCH)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = _ZIP_FILE_MODE << 16
+            info.create_system = _ZIP_UNIX
+            archive.writestr(info, members[name])
     return buf.getvalue()
 
 
 def _lambda_entry(runtime: str) -> tuple[str, str]:
     return _LAMBDA_RUNTIME_ENTRY.get(runtime, _LAMBDA_RUNTIME_ENTRY[_DEFAULT_LAMBDA_RUNTIME])
+
+
+# --- v0.8.14: a Lambda may be a whole DIRECTORY, not one pasted file --------
+#
+# THREE sources, ONE archive builder, and a precedence that is stated rather
+# than inferred (`_lambda_package` is the only reader of any of them):
+#
+#   1. `sourceDir` -- a path to a directory ON THE MACHINE RUNNING ODIN. Its
+#      whole tree is packaged, so a function can import its own modules. It is
+#      also the DEPENDENCY story, and the only one odin offers: whatever you
+#      have installed INTO that directory ships with it, because odin never
+#      runs a package manager of its own and never fetches anything at apply
+#      time (docs/limits.md says so in those words).
+#   2. `files` -- an inline `{relative path: text}` map. Nothing authors this
+#      by hand; `agent/import_tf.py` writes it when it recovers a MULTI-FILE
+#      deployment zip, so a package that came from Terraform goes back to
+#      Terraform byte-identically instead of collapsing to whichever member
+#      happened to sort first.
+#   3. `code` -- the single pasted file (the v1 shape), written under the
+#      runtime's own entry filename. Unchanged, and still the default.
+#
+# The path is read by the SERVER at translate time, which is the honest place
+# for it: `odin apply` posts the canvas and the server builds the zip, so the
+# package cannot go missing between the two the way it does when a `.tf` file
+# is handed over without the archive beside it (docs/limits.md, "a Lambda's
+# CODE needs the whole directory").
+
+# Names never packaged, and the reason is determinism, not tidiness: CPython
+# writes `__pycache__/*.pyc` into a source directory the moment anything
+# imports from it, and a `.pyc` embeds the source's mtime and size -- so a tree
+# that had merely been imported once produced different archive bytes, a
+# different `source_code_hash`, and the exact `Plan: 1 to change` churn the
+# pinned ZipInfo above exists to prevent. `.venv` is excluded because a
+# virtualenv is host-specific by construction (absolute paths in its scripts,
+# a symlinked interpreter) and is never what belongs in a package; vendored
+# dependencies go directly in the directory (`pip install -t .`), and
+# `node_modules` is deliberately NOT excluded because that is exactly where a
+# Node function's vendored dependencies live.
+_ZIP_SKIP_DIRS = frozenset({
+    "__pycache__", ".git", ".venv", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+})
+_ZIP_SKIP_SUFFIXES = (".pyc", ".pyo")
+_ZIP_SKIP_NAMES = frozenset({".DS_Store"})
+
+# AWS's own quota for an UNZIPPED deployment package (250 MB). Checked from
+# `stat` while walking, before a single byte is read, so pointing `sourceDir`
+# at a home directory by accident is a fast refusal naming the measured size
+# rather than an out-of-memory translate.
+_MAX_PACKAGE_BYTES = 250 * 1024 * 1024
+
+# The file extensions a HANDLER MODULE may have, keyed by the runtime's own
+# entry filename suffix (from `_LAMBDA_RUNTIME_ENTRY`, so this cannot drift
+# away from the runtime table).
+_MODULE_SUFFIXES = {".py": (".py",), ".js": (".js", ".mjs", ".cjs")}
+
+
+def _package_paths(root: Path) -> list[Path]:
+    """Every file in `root`'s tree that a deployment package carries, sorted.
+
+    Symlinks are skipped rather than followed: a link out of the tree would put
+    a file the user never put in their source directory into the archive, and
+    the RIE container mounts the EXTRACTED directory, where a link to a host
+    path resolves to nothing anyway."""
+    return sorted(
+        path for path in root.rglob("*")
+        if path.is_file() and not path.is_symlink()
+        and not (_ZIP_SKIP_DIRS & set(path.relative_to(root).parts))
+        and path.suffix not in _ZIP_SKIP_SUFFIXES and path.name not in _ZIP_SKIP_NAMES
+    )
+
+
+def _dir_members(root: Path) -> dict[str, bytes] | str:
+    if not root.is_dir():
+        return (
+            f"sourceDir {str(root)!r} is not a directory on the machine running odin -- "
+            "the server reads it at translate time, so it must be a real path THERE"
+        )
+    paths = _package_paths(root)
+    if not paths:
+        return f"sourceDir {str(root)!r} holds no files to package"
+    total = sum(path.stat().st_size for path in paths)
+    if total > _MAX_PACKAGE_BYTES:
+        return (
+            f"sourceDir {str(root)!r} is {total / 1048576:.1f} MiB unzipped, over the "
+            f"{_MAX_PACKAGE_BYTES // 1048576} MiB AWS allows an unzipped deployment package"
+        )
+    return {path.relative_to(root).as_posix(): path.read_bytes() for path in paths}
+
+
+def _safe_member(name: object) -> bool:
+    """A `files` key that names a file INSIDE the package and nowhere else.
+    `..` and a leading `/` both escape the extraction directory
+    (`compute/functions.py::extract_code` calls `ZipFile.extractall`), and a
+    backslash is a Windows separator zipfile would keep as part of the name."""
+    parts = PurePosixPath(name).parts if isinstance(name, str) else ()
+    return bool(name) and bool(parts) and ".." not in parts and "\\" not in str(name) and not str(name).startswith("/")
+
+
+def _inline_members(mapping: dict) -> dict[str, bytes] | str:
+    rejected = sorted(
+        str(key) for key, value in mapping.items()
+        if not _safe_member(key) or not isinstance(value, str)
+    )
+    if rejected:
+        return (
+            "files must map a RELATIVE path to that file's text; odin cannot package "
+            f"{', '.join(repr(name) for name in rejected)}"
+        )
+    return {key: value.encode() for key, value in mapping.items()}
+
+
+def _handler_checked(members: dict[str, bytes], handler: str, entry_filename: str) -> dict[str, bytes] | str:
+    """The package, or the reason its own handler cannot possibly load.
+
+    A multi-file package is the first shape where the entry file can simply be
+    ABSENT -- the single-textarea path writes it by construction. Absent, the
+    function still deploys, its RIE container still answers a TCP connect
+    (`compute/functions.py` documents why readiness is a socket probe and not a
+    warm-up invoke), and the failure surfaces only when somebody invokes it and
+    gets `Runtime.ImportModuleError`. Reading the archive's own member list is
+    a real signal available right here, at translate time, so odin declines the
+    node and names the missing file instead of shipping that.
+    """
+    module = handler.rsplit(".", 1)[0]
+    suffixes = _MODULE_SUFFIXES[PurePosixPath(entry_filename).suffix]
+    if any(f"{module}{suffix}" in members for suffix in suffixes):
+        return members
+    listed = ", ".join(sorted(members)[:6])
+    return (
+        f"handler {handler!r} needs {module}{suffixes[0]} in the deployment package, and the "
+        f"{len(members)} file(s) packaged do not include it: {listed}"
+    )
+
+
+def _lambda_package(res: ResourceDesired) -> dict[str, bytes] | str:
+    """This function's zip members, or the human reason odin cannot build them
+    -- routed into `unsupported` exactly like any other builder refusal. See
+    the block comment above for the three sources and their precedence."""
+    runtime = _field(res, "runtime", _DEFAULT_LAMBDA_RUNTIME)
+    entry_filename, default_handler = _lambda_entry(runtime)
+    source_dir = _field(res, "sourceDir", "").strip()
+    declared = res.fields.get("files")
+    inline = declared.value if declared is not None and isinstance(declared.value, dict) else {}
+    if not source_dir and not inline:
+        return {entry_filename: (_field(res, "code", "") or _DEFAULT_LAMBDA_CODE).encode()}
+    members = _dir_members(Path(source_dir).expanduser()) if source_dir else _inline_members(inline)
+    if isinstance(members, str):
+        return members
+    return _handler_checked(members, _field(res, "handler", default_handler), entry_filename)
 
 
 # Workloads an IAM edge may start from (`ui/src/lib/iam.ts::computeTypes`). A
@@ -1397,6 +1556,29 @@ def generate_tf(stack: Stack) -> TfProject:
                 used_names.setdefault("aws_iam_role_policy", set()),
             ))
 
+    # Pass 1.7 (v0.8.14) — resolve every lambda's DEPLOYMENT PACKAGE once,
+    # before pass 2, because the answer is needed in two places: pass 2 must
+    # DECLINE a function whose package odin cannot build (a `sourceDir` that
+    # isn't a directory, a handler whose module the tree doesn't contain), and
+    # the zip pass at the bottom needs the bytes. Resolving here rather than
+    # inside `_lambda` keeps it to ONE directory walk, and — the part that
+    # actually matters — keeps a declined function from emitting an
+    # `aws_lambda_function` whose `filename` / `filebase64sha256()` name a zip
+    # that was never written. That is not a bad node, it is a `tofu plan` that
+    # fails for the WHOLE project, so every other resource on the canvas stops
+    # applying too (the same failure the `built_ids` note below describes for
+    # the alb companions).
+    lambda_packages: dict[str, dict[str, bytes]] = {}
+    lambda_declined: dict[str, str] = {}
+    for res in ordered:
+        if res.kind != "lambda" or res.id not in hcl_name_by_id:
+            continue
+        package = _lambda_package(res)
+        if isinstance(package, str):
+            lambda_declined[res.id] = package
+            continue
+        lambda_packages[res.id] = package
+
     # Pass 2 — build blocks with the name table complete. A builder may still
     # opt out for THIS resource (returns the reason string) — e.g. a subnet
     # not drawn inside any VPC — which lands in `unsupported`, never dropped.
@@ -1418,7 +1600,7 @@ def generate_tf(stack: Stack) -> TfProject:
     for res in ordered:
         if res.kind not in _BUILDERS:
             continue
-        built = _BUILDERS[res.kind](res, refs)
+        built = lambda_declined.get(res.id) or _BUILDERS[res.kind](res, refs)
         if isinstance(built, str):
             unsupported.append(f"{res.id} ({res.kind}): {built}")
             continue
@@ -1710,22 +1892,25 @@ def generate_tf(stack: Stack) -> TfProject:
     blocks.sort(key=lambda b: b[0])
     main_tf = "\n\n".join([HEADER, provider_block(), *(text for _, text in blocks)]) + "\n"
 
-    # V4c: materialize each lambda's pasted code into the zip its own HCL
-    # block references by filename -- odin owns this pre-tofu, not a
+    # V4c: materialize each lambda's code into the zip its own HCL block
+    # references by filename -- odin owns this pre-tofu, not a
     # `data archive_file` round-trip (module docstring). The entry filename
     # MUST match `_lambda_entry`'s choice for the SAME runtime, or the
     # deployed zip and the `handler` string would disagree. BYTE-DETERMINISTIC
-    # (`_deterministic_zip`): identical code must produce an identical archive,
-    # or `source_code_hash` churns on every translate.
+    # (`_deterministic_zip`): identical members must produce an identical
+    # archive, or `source_code_hash` churns on every translate.
+    #
+    # Gated on `built_ids` (v0.8.14): a function pass 2 declined has no
+    # `aws_lambda_function` block, so a zip written for it would be a file
+    # nothing references -- `simulate/workspace.py::_prune_stale` would delete
+    # it on the next materialize anyway, and writing it in the first place
+    # invites the reader to think the block exists.
     binary_files: dict[str, bytes] = {}
     for res in ordered:
         name = hcl_name_by_id.get(res.id)
-        if res.kind != "lambda" or name is None:
+        if res.kind != "lambda" or name is None or res.id not in built_ids:
             continue
-        runtime = _field(res, "runtime", _DEFAULT_LAMBDA_RUNTIME)
-        entry_filename, _ = _lambda_entry(runtime)
-        code = _field(res, "code", "") or _DEFAULT_LAMBDA_CODE
-        binary_files[f"{name}.zip"] = _deterministic_zip(entry_filename, code)
+        binary_files[f"{name}.zip"] = _deterministic_zip(lambda_packages[res.id])
 
     return TfProject(
         files={"main.tf": main_tf}, unsupported=unsupported,

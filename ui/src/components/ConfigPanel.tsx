@@ -81,6 +81,16 @@ const fieldsForType: Record<string, FieldDef[]> = {
       key: 'code', label: 'Code', editable: true, multiline: true,
       placeholder: 'def lambda_handler(event, context):\n    return event',
     },
+    // A function that is more than one file. The path is read BY THE SERVER at
+    // translate time (it builds the zip; the browser never touches the tree),
+    // so it must be a real directory on the machine running odin. Set, it wins
+    // over Code entirely -- agent/hcl.py::_lambda_package documents the whole
+    // precedence, and it is also the only place dependencies can come from:
+    // whatever you install INTO that directory ships with it.
+    {
+      key: 'sourceDir', label: 'Source Directory (optional — packages the whole tree, overrides Code)',
+      editable: true, placeholder: '/Users/you/functions/thumbnailer',
+    },
     { key: 'role', label: 'IAM Role (optional -- blank auto-generates one)', editable: true, placeholder: 'an IAM Role node\'s name' },
     { key: 'status', label: 'Status' },
     { key: 'error', label: 'Error' },
