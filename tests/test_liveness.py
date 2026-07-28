@@ -125,7 +125,13 @@ def test_a_process_that_merely_mentions_the_server_is_not_one(tmp_path: Path):
         deadline = time.monotonic() + 10
         listed = ""
         while time.monotonic() < deadline:
-            listed = subprocess.run(["ps", "-xo", "pid=,command="], capture_output=True, text=True).stdout
+            # `-ww`: without it `ps` truncates each line to the terminal
+            # width, and in a non-tty CI runner that clipped the decoy's argv
+            # before the marker at its end -- so the scan found nothing and the
+            # test failed for a reason that had nothing to do with liveness.
+            listed = subprocess.run(
+                ["ps", "-xww", "-o", "pid=,command="], capture_output=True, text=True,
+            ).stdout
             if MARKER in listed:
                 break
             time.sleep(0.1)
