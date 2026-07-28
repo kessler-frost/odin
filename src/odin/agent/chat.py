@@ -60,7 +60,7 @@ from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, SdkMcpTool, cr
 from pydantic import BaseModel, Field, ValidationError
 
 from odin.agent import ai
-from odin.spec.translate import _KIND
+from odin.spec.translate import _KIND, EDGE_KINDS
 
 log = logging.getLogger("odin.chat")
 
@@ -105,7 +105,16 @@ class AddEdge(BaseModel):
     op: Literal["add_edge"] = "add_edge"
     source: str = Field(description="Source node label.")
     target: str = Field(description="Target node label.")
-    edge_type: str = Field(default="iam", description="iam, network or sg.")
+    edge_type: str = Field(
+        default="iam",
+        description=(
+            "What the edge MEANS: 'iam' (a permission grant), 'sg' (this security group "
+            "gates this resource), 'role' (this lambda assumes this IAM role), "
+            "'subscription' (this SNS topic fans out to this SQS queue), 'target' (this "
+            "load balancer fronts this ECS service), or 'unmodelled' when none of those "
+            "fit -- odin then stores the line and acts on nothing."
+        ),
+    )
     actions: list[str] = Field(default_factory=list, description="For an iam edge: the permissions granted.")
 
 
@@ -178,6 +187,23 @@ def validate(op: Op, canvas: dict) -> str | None:
         missing = [label for label in (op.source, op.target) if label not in known]
         if missing:
             return f"no node called {' or '.join(repr(m) for m in missing)} on this canvas."
+        # `edge_type` was an unvalidated free string, and `Edge.kind` is a free
+        # `str` all the way down to the store, so an invented kind ('access',
+        # 'connects', 'permission') round-tripped through a revision and through
+        # Apply looking exactly like a real edge -- and did nothing, for ever.
+        # The same shape as the invented FIELD this module already refuses, one
+        # level up: the canvas is permissive by design, so the gate has to be
+        # here rather than in the schema underneath.
+        #
+        # NOTE what this does NOT close, because it must not be read as having
+        # closed it: `agent/hcl.py`'s subscription and ALB passes match on the
+        # two NODE kinds and never read the kind at all, so a perfectly valid
+        # 'iam' edge between an sns node and an sqs node still emits a real
+        # `aws_sns_topic_subscription`. Kind-blindness is the primary defect and
+        # it survives this fix entirely.
+        if op.edge_type not in EDGE_KINDS:
+            return (f"odin has no {op.edge_type!r} edge -- it models "
+                    f"{', '.join(sorted(EDGE_KINDS))}. Nothing was drawn.")
         return None
     if isinstance(op, DeleteEdge):
         missing = [label for label in (op.source, op.target) if label not in known]

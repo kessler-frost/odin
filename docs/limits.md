@@ -83,6 +83,39 @@ They are listed because finding one by surprise is worse than reading it here.
   backings and the prune, and reads a cached drift result instead of sweeping. ECS
   stays genuinely live because its task sweep runs on every one of those ticks;
   EC2, Lambda and RDS drift can be up to one sweep cadence stale for the duration.
+- **A drawn edge means something to odin only for six kind pairs out of 378.**
+  Since v0.8.14 every ordered pair of node kinds resolves to exactly one edge
+  type, and the honest majority answer is `unmodelled` — 338 of the 378 unordered
+  pairs, drawn as a grey line labelled *Not modelled*, stored in the Stack and
+  read by nothing. It was called `network` until now, which was a claim about
+  layer 3 that odin never checked. The pairs that do mean something: `iam`
+  (35 pairs, a real policy), `sg` (2, security-group membership), `role`
+  (`iam_role ↔ lambda`), `target` (`alb ↔ ecs`) and `subscription`
+  (`sns ↔ sqs`). Drawing anything else is decoration, and now says so.
+- **A `role` edge works for lambda only.** `iam_role → lambda` folds into the
+  lambda's `role` field, which is what `agent/hcl.py` already reads, so the edge
+  really does decide the execution role in the generated Terraform. **ec2 and ecs
+  reach a role differently** — an auto-generated role plus an instance profile /
+  `task_role_arn`, with no `role` field anywhere — so odin does *not* offer a
+  role edge to them: `iam_role ↔ ec2` and `iam_role ↔ ecs` stay `unmodelled`, and
+  the label on the canvas is the report. Honouring them needs `hcl.py` to accept
+  a drawn role in place of the auto-role for those two kinds; until it does,
+  set the role on the node, not on a line.
+  Two *different* role edges drawn to one lambda is a contradiction odin cannot
+  resolve: the alphabetically lowest role name wins, deterministically, so the
+  generated file never depends on edge ordering. Nothing reports the conflict.
+- **`edge.kind` decides nothing in any builder.** The subscription and ALB passes
+  in `agent/hcl.py`, and `reconcile/reconciler.py::_desired_subs`, all match on
+  the two NODE kinds and never read the edge's kind — so an `iam`-typed line
+  between an SNS node and an SQS node still emits a real
+  `aws_sns_topic_subscription`. `odin chat` now refuses an edge kind odin does
+  not model, but that closes the smaller half: kind-blindness survives it.
+  This is deliberate, not an oversight. Every canvas saved before edge types were
+  named carries `network` on those edges; a builder that started *requiring* the
+  new name without a migration in the same commit would drop the subscription
+  from the generated HCL for all of them, and `tofu` would **destroy the live
+  subscription** on the next apply — with the reconciler silent, because
+  `_desired_subs` only ever adds a missing subscription and never unsubscribes.
 - **SNS→SQS subscriptions** are all generated with `raw_message_delivery = true`,
   so the queue gets the published body verbatim rather than SNS's JSON envelope,
   and that holds on an import round trip even if your `.tf` said otherwise. It

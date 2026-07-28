@@ -1,8 +1,12 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import type { Node, Edge } from '@xyflow/react';
 import StatusBadge, { phaseTextColor } from './nodes/StatusBadge';
-import { iamActionsForTarget, edgeTypes, detectEdgeTypes } from '../lib/iam';
+import { iamActionsForTarget, edgeTypes, detectEdgeTypes, UNMODELLED } from '../lib/iam';
 import { catalogTypeConfig, catalogFields } from '../lib/catalog';
+
+// The pre-rename catch-all. Kept as a named constant rather than a bare string
+// so the one place that has to know about the old canvases says why.
+const LEGACY_CATCH_ALL = 'network';
 
 interface ConfigPanelProps {
   nodes: Node[];
@@ -190,9 +194,6 @@ function PermissionCheckbox({ action, checked, onChange }: { action: string; che
 
 function EdgeConfigView({ edge, nodes, onEdgeUpdate, onCollapse }: { edge: Edge; nodes: Node[]; onEdgeUpdate?: (edgeId: string, data: Record<string, unknown>) => void; onCollapse?: () => void }) {
   const panelBase = "bg-bg-secondary border-l border-border-bright p-0 overflow-y-auto h-full";
-  const currentType = (edge.data?.edgeType as string) ?? 'network';
-  const typeDef = edgeTypes[currentType] ?? edgeTypes.network;
-  const isIam = currentType === 'iam';
 
   // The REAL node types, looked up by id. This used to be
   // `edge.source.split('-')[0]`, which only works while every node id happens to
@@ -209,6 +210,23 @@ function EdgeConfigView({ edge, nodes, onEdgeUpdate, onCollapse }: { edge: Edge;
   // Available edge types for this node pair
   const availableTypes = detectEdgeTypes(sourceType, targetType);
   const iamAvailable = availableTypes.includes('iam');
+
+  // What this edge IS. A canvas saved before an edge type was named carries the
+  // old catch-all `network`, and `network` decides nothing: `agent/hcl.py`'s ALB
+  // and subscription passes key on the two NODE kinds and never read the edge's
+  // kind at all. So an alb->ecs edge stored as `network` really does compile to
+  // a `load_balancer` block, and labelling that panel "Network" would name the
+  // edge by the one word in it that has no consequence.
+  //
+  // Every OTHER stored kind is shown exactly as authored. An `iam` edge compiles
+  // to a real policy whichever pair it sits on (`gateway/policy.py` reads the
+  // kind, not the kinds of its endpoints), so overriding that one to match the
+  // registry would HIDE a live grant -- a worse lie than a stale word.
+  const storedType = edge.data?.edgeType as string | undefined;
+  const currentType = !storedType || storedType === LEGACY_CATCH_ALL
+    ? availableTypes[0] : storedType;
+  const typeDef = edgeTypes[currentType] ?? edgeTypes[UNMODELLED];
+  const isIam = currentType === 'iam';
 
   // Build per-resource permission groups (only for types that have IAM actions)
   const permissionGroups: { resourceType: string; label: string; neonColor: string; actions: string[] }[] = [];

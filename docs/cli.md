@@ -66,9 +66,30 @@ silently rendering as something else.
 | `data.vpc` / `data.subnet` | no | containment, as the *label* of the containing node. The UI derives these from geometry; by hand, set them yourself |
 | `size` | no | width/height, for the container kinds (`vpc`, `subnet`) whose geometry is what nesting means |
 
-`edgeType` is `"iam"` (a grant, where `permissions` is exactly what the target
-workload's key may do) or `"network"` (reachability); permissions with no
-`edgeType` are treated as `iam`.
+`edgeType` says what the line MEANS. Six values, and only the first four change
+anything odin builds:
+
+| `edgeType` | between | what it does |
+| ---------- | ------- | ------------ |
+| `iam` | a compute kind and an IAM target | a real grant — `permissions` is exactly what the workload's key may do |
+| `sg` | `sg` and `ec2`/`rds` | membership: adds the group to that node's `securityGroups` |
+| `role` | `iam_role` and `lambda` | sets the lambda's execution role (a role typed into the node wins) |
+| `subscription` | `sns` and `sqs` | the topic fans out to the queue |
+| `target` | `alb` and `ecs` | the load balancer fronts that service |
+| `unmodelled` | anything else | odin has no model for the pair: stored, drawn grey, acts on nothing |
+
+Permissions with no `edgeType` are treated as `iam`; an edge with neither is
+`unmodelled`. `"network"` is the old name for `unmodelled` and still parses, so
+a canvas saved before v0.8.14 loads unchanged.
+
+Two things worth knowing, because they are not what the table implies.
+**`subscription` and `target` are descriptive only** — the generator matches on
+the two node KINDS, not on `edgeType`, so *any* edge between an `sns` and an
+`sqs` node creates a real subscription (the same for `alb`↔`ecs`). And
+**direction does not matter anywhere**: `sqs → sns` is read as the subscription
+it obviously is, exactly as `sg → ec2` and `ec2 → sg` are the same membership.
+The one exception is `iam`, where the arrow is the grant: it runs from the
+workload to the thing it may use.
 
 **`${{producer.ATTR}}` works between specific kinds, not any two nodes.** Only
 four kinds publish an address a reference can resolve — **`rds`**

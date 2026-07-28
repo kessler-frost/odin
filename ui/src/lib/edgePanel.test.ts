@@ -13,7 +13,7 @@
  * parsing ids. The lookup itself is now `nodes.find(n => n.id === id)?.type`.
  */
 import { describe, expect, it } from 'bun:test';
-import { detectEdgeTypes, iamActionsForTarget } from './iam';
+import { UNMODELLED, detectEdgeTypes, iamActionsForTarget } from './iam';
 
 // The same two-step the panel does: id -> type -> what that pair means.
 const typeOf = (nodes: { id: string; type: string }[], id: string) =>
@@ -54,8 +54,11 @@ describe('edge decisions survive hand-authored node ids', () => {
 
   it('an edge naming a node that is not on the canvas yields no type', () => {
     expect(typeOf(handAuthored, 'ghost')).toBe('');
-    // ...and that resolves to the safe default rather than throwing.
-    expect(detectEdgeTypes('', '')).toEqual(['network']);
+    // ...and that resolves to the safe default rather than throwing. The
+    // default is named `unmodelled` rather than `network` since v0.8.14: it
+    // covers 338 of the 378 kind pairs and means "odin has no model for this",
+    // which is precisely the answer for a pair with a ghost end.
+    expect(detectEdgeTypes('', '')).toEqual([UNMODELLED]);
   });
 
   it('sidebar-created ids keep working — the old shape is still valid', () => {
