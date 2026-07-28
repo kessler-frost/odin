@@ -28,6 +28,7 @@ import LambdaNode from './nodes/LambdaNode';
 import S3Node from './nodes/S3Node';
 import DynamodbNode from './nodes/DynamodbNode';
 import ServiceNode from './nodes/ServiceNode';
+import UnknownNode from './nodes/UnknownNode';
 import RegionAsk from './RegionAsk';
 import { sizeOnLoad, sizeForSave } from '../lib/nodeSize';
 import { BUILTINS, CATALOG, catalogNodeTypeMap, catalogDefaultData, catalogDefaultStyle, catalogZIndex, catalogByType, COLORS } from '../lib/catalog';
@@ -53,6 +54,11 @@ const nodeTypes: NodeTypes = {
   dynamodb: DynamodbNode,
   // Every catalog service renders with the generic ServiceNode.
   ...Object.fromEntries(CATALOG.map((s) => [s.type, ServiceNode])),
+  // ReactFlow falls back to `default` for a type it has no component for, and
+  // its default node is a blank white rectangle -- indistinguishable from odin
+  // mis-rendering a resource it DOES know. A hand-authored canvas with a typo'd
+  // kind now says so on the node instead. See `UnknownNode`.
+  default: UnknownNode,
 };
 
 // abbr -> node type, for both halves of the sidebar. The bespoke keys come from
@@ -305,7 +311,9 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
         type: n.type,
         position: (typeof n.position?.x === 'number' && typeof n.position?.y === 'number') ? n.position : undefined,
         zIndex: zIndexForType[n.type] ?? 2,
-        data: { ...defaultDataForType[n.type], ...n.data },
+        // `__type` is the kind as WRITTEN, so an unrecognised one can be named
+        // back to the author instead of being silently normalised away.
+        data: { ...defaultDataForType[n.type], ...n.data, __type: n.type },
         style: { ...defaultStyleForType[n.type], ...sizeOnLoad(defaultStyleForType, n.type, n.size) },
       }));
       const { nodes: rfNodes, placed: placedCount } = placeUnpositioned(fromDisk);
@@ -497,7 +505,9 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
           type: n.type,
           position: (typeof n.position?.x === 'number' && typeof n.position?.y === 'number') ? n.position : undefined,
           zIndex: zIndexForType[n.type] ?? 2,
-          data: { ...defaultDataForType[n.type], ...n.data },
+          // `__type` is the kind as WRITTEN, so an unrecognised one can be named
+        // back to the author instead of being silently normalised away.
+        data: { ...defaultDataForType[n.type], ...n.data, __type: n.type },
           style: { ...defaultStyleForType[n.type], ...sizeOnLoad(defaultStyleForType, n.type, n.size) },
         }));
         const { nodes: rfNodes } = placeUnpositioned(fromDisk);
