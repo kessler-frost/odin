@@ -1185,7 +1185,33 @@ index-to-index deletion on this file.
   containment-stamp path, plus a visible statement of what changed (odin says
   what it did; it does not quietly do it).
 
-- [ ] **IAM edges across the whole catalog, not just S3.** Today the drawn-edge
+- [x] **IAM edges across the whole catalog.** Turned out broader than this entry
+  claimed -- s3, dynamodb, sqs, sns, rds, logs, secret, ssm and elasticache all
+  had real vocabularies already. What was genuinely missing was **lambda, ecr and
+  ecs**, now added: a workload can be granted `lambda:Invoke`, the ECR image-pull
+  actions, and ECS task control.
+
+  The find that mattered more than the vocabulary: **AWS's spelling is not
+  necessarily odin's.** The gateway classifies an invoke as `lambda:Invoke`
+  (`classify.py::_LAMBDA_ROUTES`), not AWS's `lambda:InvokeFunction`. Measured
+  against the real evaluator:
+
+      evaluate([lambda:InvokeFunction], action=lambda:Invoke) -> False
+      evaluate([lambda:Invoke],         action=lambda:Invoke) -> True
+
+  So offering the AWS name would have produced an edge that draws, applies,
+  reports success and grants NOTHING -- a decorative permission, across a
+  TS/Python boundary where nothing type-checks either side.
+
+  `tests/gateway/test_iam_vocabulary_is_enforceable.py` now pins every action the
+  UI can put on an edge against what the classifier can actually emit (60 cases).
+  Mutation-tested both ways: planting `lambda:InvokeFunction` fails it, and so
+  does inventing a service the gateway never dispatches on. Two false positives
+  in the checker itself were fixed first -- it read only one of the two dispatch
+  spellings (reporting sqs as unclassified) and matched `nginx:alpine` out of a
+  node's defaultData as though it were a grant.
+
+- [ ] **~~IAM edges across the whole catalog~~ (superseded above).** Today the drawn-edge
   → compiled-policy path is real and enforced, but the action vocabulary is
   thin outside `s3:*`. Extend to sqs/sns/dynamodb/lambda/ecs/secrets/logs/ecr
   and the rest, so drawing a lambda → dynamodb edge grants the right actions
