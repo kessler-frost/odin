@@ -1207,20 +1207,6 @@ index-to-index deletion on this file.
   Verified live: expanded instance at 248..448, workload at 318..400 inside it,
   node reads `ECS | web | DRAFT | tasks: 2 | on api-server`, `host` persisted.
 
-- [ ] **~~Containment changes configuration~~ (superseded above).** The owner's
-  example: expand an EC2 box, drop an ECS box inside it, and that means **ECS
-  on the EC2 launch type rather than Fargate** — which is a real AWS
-  distinction (ECS tasks run either on EC2 container instances or on Fargate),
-  not a UI convenience. Dropping it back out means Fargate again.
-  **The invariant that makes this safe: identity is preserved.** The node's
-  name/label and anything the user typed stay exactly as they are; only the
-  fields that containment genuinely determines change. A gesture must never
-  silently rewrite something a person authored — that is the same honesty rule
-  the rest of odin follows, applied to the canvas.
-  Needs: a per-kind table of "what does containment in X imply", applied on the
-  containment-stamp path, plus a visible statement of what changed (odin says
-  what it did; it does not quietly do it).
-
 - [x] **IAM edges across the whole catalog.** Turned out broader than this entry
   claimed -- s3, dynamodb, sqs, sns, rds, logs, secret, ssm and elasticache all
   had real vocabularies already. What was genuinely missing was **lambda, ecr and
@@ -1246,13 +1232,6 @@ index-to-index deletion on this file.
   in the checker itself were fixed first -- it read only one of the two dispatch
   spellings (reporting sqs as unclassified) and matched `nginx:alpine` out of a
   node's defaultData as though it were a grant.
-
-- [ ] **~~IAM edges across the whole catalog~~ (superseded above).** Today the drawn-edge
-  → compiled-policy path is real and enforced, but the action vocabulary is
-  thin outside `s3:*`. Extend to sqs/sns/dynamodb/lambda/ecs/secrets/logs/ecr
-  and the rest, so drawing a lambda → dynamodb edge grants the right actions
-  the way a lambda → s3 edge already does. The compiler and the enforcement
-  point do not change; the vocabulary does.
 
 - [x] **Every box persists its size, not just containers** (owner question,
   2026-07-28: *"it's not just ec2's box right? All the boxes and their exact
