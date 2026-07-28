@@ -1139,9 +1139,32 @@ future decision against these points instead of re-deriving them:
 
 ## The intelligence layer — the canvas IS the language
 
-Owner's framing, and the reason this section exists: *"canvas and navigating
-things around IS the language of odin, not chatting with a bot to update things
-around — that we'll add later too, but this is a separate thing."*
+**Owner's framing, in their words, and the reason this section exists:**
+
+> *"canvas and navigating things around IS the language of odin and not chatting
+> with a bot to update things around - that we'll add later too but this is a
+> separate thing."*
+
+> *"More intelligent placement like when I expand the ec2 box and put an ecs box
+> inside it, that means I want ecs on ec2 - which is a valid thing instead of
+> fargate right? and the configuration and stuff updates accordingly if needed
+> but things like name and stuff remains as is."*
+
+> *"if that kind of stuff can be done without intelligence then that's great too
+> but I believe the intelligence layer would be needed anyways cuz of the intent
+> detection and acting on user's events since canvas IS the language."*
+
+So the ordering principle for everything below: **do it deterministically where
+a gesture has exactly one honest meaning, and reach for the intelligence layer
+where the job is INTENT DETECTION — reading what a person meant by an action on
+the canvas and acting on it.** Containment implying a launch type is the
+deterministic end (one gesture, one meaning, a lookup table). Inferring intent
+from adjacency, grouping, or a sequence of edits is the other end, and that is
+what the intelligence layer is actually for.
+
+Neither end is a chat box. The chat/agent surface is listed last on purpose: it
+is an ADDITION to the canvas language, never a replacement for it, and building
+it first would answer a question nobody asked.
 
 These four were LOST once already: a range-based edit to this file deleted them
 while replacing a neighbouring entry, and they were only noticed when the owner
