@@ -34,6 +34,12 @@ roughly 4x: the apply it records took 103 seconds:
 
 ![Three resources drawn on odin's canvas, applied, and going healthy — S3, DynamoDB and RDS badges turning green, with the database's live host:port shown on the node](assets/odin-draw-apply.gif)
 
+**IAM permissions are edges you draw** — and the canvas updates live when
+anything changes it, including the CLI. This clip authors the edge with
+`odin canvas set` and the already-open browser converges it with no reload:
+
+![An IAM permission edge appearing on odin's canvas, from an EC2 instance to an S3 bucket, labelled GetObject, PutObject, ListBucket](assets/odin-iam-edge.gif)
+
 **The `{ }` button shows the Terraform that canvas compiles to** — the same
 deterministic HCL Apply runs, not a preview of something else:
 

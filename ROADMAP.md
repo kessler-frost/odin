@@ -1131,19 +1131,26 @@ future decision against these points instead of re-deriving them:
 
 ## Next — known, measured, not yet fixed
 
-- [ ] **An edge LABEL is mispositioned when a canvas converges live.** Found
-  while recording the IAM clip. `odin canvas set` adds an EC2 -> S3 IAM edge, an
-  already-open tab converges it (correct: 1 edge, permissions in the DOM), but
-  the label renders at **x=503** -- on top of the source node -- instead of at
-  the edge midpoint (~x=850). ReactFlow places labels from measured node
-  dimensions, and the convergence handler sets nodes and edges in the same
-  commit, so the label is positioned before the new nodes have been measured.
-  A reload fixes it, and the INITIAL load path is unaffected (the README hero
-  screenshot shows a correctly-labelled edge).
-  Likely fix: set edges in a later frame than nodes on the convergence path
-  only, or force a ReactFlow re-measure after the node commit. Verify by
-  reading the label's bounding box, not by eyeballing the GIF -- the DOM check
-  passes either way, which is exactly how this nearly shipped.
+- [x] **An edge with no handles routes backwards, putting its label on the
+  source node.** I first blamed live convergence and was wrong twice -- neither
+  deferring the edge commit by a frame nor preserving node identity across the
+  merge changed anything, and a FULL RELOAD reproduced it identically, which is
+  what finally ruled convergence out. Both speculative fixes were reverted.
+
+  The real cause: an edge that omits `sourceHandle`/`targetHandle` is routed
+  from an arbitrary default handle, so the path curves backwards (a bezier
+  control point LEFT of the source) and the label lands at the source node's
+  centre -- measured x=601 for a node spanning 500..700, where the midpoint is
+  850. The UI's drawn edges always set handles, so only hand- or CLI-authored
+  canvases hit it. Naming `"sourceHandle": "right", "targetHandle": "left"` puts
+  the label at exactly 850.
+
+  Worth doing, not done: odin could CHOOSE sensible handles when a canvas omits
+  them, since a hand-authored or agent-authored canvas is a first-class input
+  (`odin canvas set`, the translation agent) and silently drawing it wrong is
+  the shape of bug this repo keeps auditing for. `scripts/record-gifs.sh` now
+  asserts the label's GEOMETRY rather than its text, because a DOM check for the
+  text passed the whole time this was broken.
 
 - [ ] **agent-browser cannot draw a connection on the canvas.** Unchanged and
   still open. Handles are 6px and `pointerdown` arrives with a NON-handle target

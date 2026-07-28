@@ -374,7 +374,8 @@ JSON
   {"id":"ec2-1","type":"ec2","position":{"x":260,"y":180},"data":{"label":"api-server","instance_type":"t3.micro"}},
   {"id":"s3-1","type":"s3","position":{"x":760,"y":180},"data":{"label":"uploads"}}
 ],"edges":[
-  {"id":"iam-1","source":"ec2-1","target":"s3-1","data":{"edgeType":"iam","permissions":["s3:GetObject","s3:PutObject","s3:ListBucket"]}}
+  {"id":"iam-1","source":"ec2-1","target":"s3-1","sourceHandle":"right","targetHandle":"left",
+   "data":{"edgeType":"iam","permissions":["s3:GetObject","s3:PutObject","s3:ListBucket"]}}
 ]}
 JSON
   curl -sf -X POST "$BASE/canvas?env=default" -H 'Content-Type: application/json' --data-binary "@$before" >/dev/null
