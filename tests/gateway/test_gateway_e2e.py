@@ -2,10 +2,12 @@
 denials (task-g5-brief.md; PRD docs/superpowers/specs/2026-07-22-gateway-prd.md
 §6). The app-workload layer is parked (NORTHSTAR.md, tag app-layer-parked),
 so principals are exercised directly: `app.state.gateway_keys.issue(env,
-node_id)` mints creds for a workload identity, and iam edges are authored
-against a phantom (unknown-kind) canvas node standing in for that workload
--- edges-as-grants outlive workload kinds (translate.py, see
-tests/spec/test_translate.py's survival test for the unit-level proof).
+node_id)` mints creds for an identity, and the calls are made with those.
+
+Since v0.8.12 the gateway authorizes from the APPLIED IAM rather than from
+canvas edges, which changed what this file can prove on its own -- see the
+long note above the fixtures for what moved, where it moved to, and the two
+alternatives that were tried and rejected for making the tests lie.
 
 Every test boots a real `create_app()` (real ColimaRuntime, real
 BackingAws-provisioned RustFS/goaws/dynalite, real gateway listener on
@@ -17,6 +19,7 @@ with the backing + aws-cli images pulled.
 """
 from __future__ import annotations
 
+import os
 import statistics
 import subprocess
 import time
@@ -28,12 +31,18 @@ from botocore.exceptions import ClientError
 from fastapi.testclient import TestClient
 
 from odin.aws.backings import BackingAws
+from odin.gateway.keys import OPERATOR_NODE_ID
 from odin.runtime.colima import ColimaRuntime
 from odin.server import create_app
 from odin.spec.store import SpecStore
 from tests.containers import own_containers
 
 pytestmark = pytest.mark.integration
+
+# See `_apply_the_grant`: the seeded workload record has no container behind it,
+# and the drift sweeper would correctly mark it Failed. Nothing in this file
+# tests drift.
+os.environ["ODIN_DRIFT_SWEEP_TICKS"] = "1000000"
 
 # Every env this file applies to -- and therefore everything its teardown is
 # allowed to stop. `default` is the implicit env of most slices; `a` and `b`
@@ -134,22 +143,61 @@ def _run_aws_cli(port: int, access_key: str, secret_key: str, args: list[str]) -
     )
 
 
+# --- what this file proves after v0.8.12 -------------------------------------
+#
+# It used to prove "a drawn edge grants": the worker principal was a PHANTOM
+# canvas node, `/apply` committed the Stack, and the gateway compiled its policy
+# map straight from the edges. The gateway authorizes from the APPLIED IAM now,
+# so an edge grants nothing until a real apply creates a role and a policy — and
+# a phantom node cannot be applied at all, because only lambda/ec2/ecs can hold
+# an IAM role.
+#
+# Two ways to keep the allowed-half here were tried and rejected, both for the
+# same reason — they would have made the test lie about the product:
+#   - seeding the gateway's own stores: the reconciler projects TF-owned status
+#     out of them, so a seeded role and function appeared in `/world` as real
+#     resources (`worker-role healthy`, `worker crashed`), and `destroy` could
+#     never empty the environment.
+#   - making the worker a real lambda and calling `/apply-full`: lambda zips
+#     materialize under the store root, and this file's store is pytest's
+#     `tmp_path`, which on macOS is not under `$HOME` (the same discovery
+#     tests/simulate/test_lambda_tf_e2e.py documents at the top).
+#
+# So the allowed half moved rather than being faked, and it is proven HARDER
+# where it landed: tests/simulate/test_lambda_tf_e2e.py applies a granted lambda
+# with real tofu, boots a real RIE container, and has the handler call S3 and
+# DynamoDB back through this gateway with its own injected credentials. That is
+# mutation-tested — emptying `compile_policies_from_iam` fails it.
+#
+# What stays here is everything this file can still prove end to end with real
+# containers and real SigV4: the OPERATOR principal (full-allow by construction,
+# and the identity tofu itself uses) exercises the allowed path, an ungranted
+# principal is denied, credentials do not cross environments, a real container
+# reaches the gateway from outside, and the overhead is bounded.
+
+
 @pytest.fixture
 async def runtime():
     rt = ColimaRuntime()
     yield rt
     for name in await own_containers(rt, *OWN_ENVS):
-        rt.stop(name)
+        # `stop` became a coroutine in the v0.7.7 de-threading pass and this call
+        # was never awaited, so this teardown has cleaned up NOTHING since —
+        # silently, because an un-awaited coroutine only warns. Found by running
+        # the full integration suite for v0.8.12, which left two backing
+        # containers standing. Failure mode #1 from CLAUDE.md, in the fixture
+        # that exists to prevent exactly this.
+        await rt.stop(name)
 
 
-async def test_edge_grants_and_absence_denies(tmp_path, runtime):
+async def test_an_ungranted_principal_is_denied_while_a_legitimate_one_is_not(tmp_path, runtime):
     app = create_app(runtime=runtime, store=SpecStore(tmp_path))
     with TestClient(app) as client:
         client.post("/apply", json=CANVAS_S3_WITH_WORKER_EDGE)
         _wait(client, lambda p: p.get("uploads") == "healthy")
         port = _gateway_port(client)
 
-        worker_key, worker_secret = app.state.gateway_keys.issue("default", "worker")
+        worker_key, worker_secret = app.state.gateway_keys.issue("default", OPERATOR_NODE_ID)
         worker_s3 = _s3_client(port, worker_key, worker_secret)
         worker_s3.put_object(Bucket="uploads", Key="hello.txt", Body=b"payload-bytes")
         assert worker_s3.get_object(Bucket="uploads", Key="hello.txt")["Body"].read() == b"payload-bytes"
@@ -180,18 +228,28 @@ async def test_foreign_env_creds_denied(tmp_path, runtime):
         _wait(client, lambda p: p.get("uploads") == "healthy" and p.get("secrets") == "healthy", env="b")
         port = _gateway_port(client)
 
-        worker_key, worker_secret = app.state.gateway_keys.issue("a", "worker")
-        s3 = _s3_client(port, worker_key, worker_secret)
+        # The two halves need two principals, and the reason is the point of the
+        # test. The operator is full-allow BY CONSTRUCTION, so it proves the
+        # legitimate half but cannot prove the denial: measured, it passes the
+        # policy check and gets `NoSuchBucket` from env a's own backing, which
+        # shows routing is scoped and says nothing about authorization. An
+        # ordinary principal is the one whose denial comes from the POLICY.
+        operator_key, operator_secret = app.state.gateway_keys.issue("a", OPERATOR_NODE_ID)
+        operator_s3 = _s3_client(port, operator_key, operator_secret)
 
         # a's key against a's OWN bucket: scoping doesn't break legitimate access.
-        s3.put_object(Bucket="uploads", Key="a-file.txt", Body=b"a-data")
-        assert s3.get_object(Bucket="uploads", Key="a-file.txt")["Body"].read() == b"a-data"
+        operator_s3.put_object(Bucket="uploads", Key="a-file.txt", Body=b"a-data")
+        assert operator_s3.get_object(Bucket="uploads", Key="a-file.txt")["Body"].read() == b"a-data"
 
-        # the SAME key against a resource that exists only in env b: denied.
-        # a's compiled policy has no statement for "secrets" at all -- there is
-        # no path from a's principal into b's world (statements_for is env-keyed).
+        # An env-a principal against a resource that exists only in env b:
+        # denied by the policy. a's compiled map has no statement for "secrets"
+        # at all -- there is no path from a's principal into b's world
+        # (`statements_for` is env-keyed), and since v0.8.12 that map is built
+        # from a's applied IAM, which never mentions another environment.
+        stranger_key, stranger_secret = app.state.gateway_keys.issue("a", "stranger")
+        stranger_s3 = _s3_client(port, stranger_key, stranger_secret)
         with pytest.raises(ClientError) as exc_info:
-            s3.put_object(Bucket="secrets", Key="x.txt", Body=b"x")
+            stranger_s3.put_object(Bucket="secrets", Key="x.txt", Body=b"x")
         assert exc_info.value.response["Error"]["Code"] == "AccessDenied"
 
         _destroy(client, env="a")
@@ -206,7 +264,7 @@ async def test_container_crosses_to_gateway(tmp_path, runtime):
         _wait(client, lambda p: p.get("uploads") == "healthy")
         port = _gateway_port(client)
 
-        worker_key, worker_secret = app.state.gateway_keys.issue("default", "worker")
+        worker_key, worker_secret = app.state.gateway_keys.issue("default", OPERATOR_NODE_ID)
         stranger_key, stranger_secret = app.state.gateway_keys.issue("default", "stranger")
 
         allowed = _run_aws_cli(port, worker_key, worker_secret, ["s3", "ls", "s3://uploads"])
@@ -231,7 +289,7 @@ async def test_sqs_sns_dynamodb_through_gateway(tmp_path, runtime):
         queue_url = world["jobs"]["facts"]["QUEUE_URL"]  # already gateway-shaped (BackingAws.facts)
         topic_arn = world["alerts"]["facts"]["TOPIC_ARN"]
 
-        worker_key, worker_secret = app.state.gateway_keys.issue("default", "worker")
+        worker_key, worker_secret = app.state.gateway_keys.issue("default", OPERATOR_NODE_ID)
         sqs = _client("sqs", port, worker_key, worker_secret)
         sns = _client("sns", port, worker_key, worker_secret)
         ddb = _client("dynamodb", port, worker_key, worker_secret)
@@ -279,7 +337,7 @@ async def test_latency_overhead(tmp_path, runtime):
         _wait(client, lambda p: p.get("uploads") == "healthy")
         port = _gateway_port(client)
 
-        worker_key, worker_secret = app.state.gateway_keys.issue("default", "worker")
+        worker_key, worker_secret = app.state.gateway_keys.issue("default", OPERATOR_NODE_ID)
         gateway_s3 = _s3_client(port, worker_key, worker_secret)
         direct_s3 = await BackingAws(runtime, "default").client("s3")  # host bypass, straight to RustFS (R5)
 

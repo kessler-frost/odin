@@ -1372,6 +1372,31 @@ index-to-index deletion on this file.
 
 ## Next — known, measured, not yet fixed
 
+- [x] **The full integration suite is part of shipping now.** v0.8.12 went out
+  on 2822 green unit tests and SIX of 71 integration tests — the six that
+  touched the code being changed. Running all 71 (53 min) found five failures
+  the unit suite could not see, in the one file that exercises the gateway
+  against real containers:
+
+  1. **A regression in the release itself.** `tests/gateway/test_gateway_e2e.py`
+     grants to a PHANTOM node through `/apply` (no tofu), which is the contract
+     v0.8.12 deliberately replaced — an edge grants nothing until an apply. The
+     tests encoded the old contract, so every call denied.
+  2. **A claim that became false.** `_not_in_terraform` said "the policy is
+     emitted" for every IAM edge, including edges drawn FROM a kind that can
+     hold no role, where nothing is emitted. Harmless while the gateway
+     enforced from edges; a silent lie once it enforced from the file. It now
+     distinguishes the two and names the reason.
+  3. **A pre-existing silent leak**, unrelated to the release: the teardown
+     fixture called `rt.stop(name)` without awaiting. `stop` became a coroutine
+     in the v0.7.7 de-threading pass, so that fixture had cleaned up nothing
+     since — failure mode #1 from CLAUDE.md, inside the fixture that exists to
+     prevent it. Two backing containers were standing after the run.
+
+  The rule this earns: **a release runs the whole integration suite, not the
+  part that looks related.** Both #1 and #3 were invisible to 2822 unit tests
+  and to the six integration tests chosen by relevance.
+
 - [x] **The gateway authorizes from the APPLIED IAM, not from the canvas.**
   DONE v0.8.12, owner ask 2026-07-28: *"I want the permission to take effect
   only after an apply. Decorative shit shouldn't be there."*

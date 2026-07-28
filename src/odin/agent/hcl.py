@@ -1267,7 +1267,7 @@ _BUILDERS = {
 _ALB_TARGET_KINDS = ("ecs",)
 
 
-def _not_in_terraform(stack: Stack) -> list[str]:
+def _not_in_terraform(stack: Stack, emitted: set[str]) -> list[str]:
     """What the generated Terraform carries differently from odin itself.
 
     Until v0.8.11 a drawn permission reached the file not at all, and this said
@@ -1277,13 +1277,22 @@ def _not_in_terraform(stack: Stack) -> list[str]:
     policy is odin's node LABEL, because that is what `gateway/classify.py`
     reports and therefore what odin matches against. Amazon expects an ARN.
 
-    So the file is complete for odin and needs one edit per policy for AWS. That
-    is a smaller and more honest claim than the one it replaces, and it stays out
-    of `unsupported` for the same reason as before: odin builds this fine.
+    `emitted` is the set of nodes that really got a policy, and it is passed in
+    rather than re-derived, for the reason pass 2 gives about its own companion
+    blocks: re-deriving a condition instead of reading what actually happened is
+    how the two drift. Only lambda/ec2/ecs can hold a role, so a grant drawn
+    FROM any other kind emits nothing at all — and since v0.8.12 the gateway
+    authorizes from the applied IAM, a grant that is not in the file is a grant
+    that does not exist. Claiming "the policy is emitted" for one of those would
+    be the decorative-grant bug again, one layer further down.
     """
     return [
         f"{edge.src} -> {edge.dst}: the policy is emitted, but its Resource is the node label "
         f"{edge.dst!r} — Amazon expects an ARN there"
+        if edge.src in emitted else
+        f"{edge.src} -> {edge.dst}: NO policy is emitted and nothing enforces this — "
+        f"{edge.src!r} is not a kind that can hold an IAM role (only lambda, ec2 and ecs can), "
+        f"so this permission has no effect after an apply"
         for edge in stack.edges if edge.kind == "iam" and edge.perms
     ]
 
@@ -1514,6 +1523,7 @@ def generate_tf(stack: Stack) -> TfProject:
     # workload was granted. The role it hangs on is the one pass 1 reserved: a
     # lambda's own (drawn or auto-generated), or the auto-role an ec2/ecs node
     # gets the moment something is granted to it.
+    granted_with_a_policy: set[str] = set()
     for res in ordered:
         if res.id not in granted_ids:
             continue
@@ -1529,6 +1539,7 @@ def generate_tf(stack: Stack) -> TfProject:
             "policy": quote(_policy_document(grants)),
         }
         blocks.append((("iam_role_policy", f"__grants__{res.id}"), _block("aws_iam_role_policy", name, attrs)))
+        granted_with_a_policy.add(res.id)
         # The workload must not start before the policy that authorizes it. tofu
         # is free to order two resources that merely share a role either way, so
         # without this a container could come up, call S3 and get AccessDenied
@@ -1719,5 +1730,5 @@ def generate_tf(stack: Stack) -> TfProject:
     return TfProject(
         files={"main.tf": main_tf}, unsupported=unsupported,
         wiring_errors=wiring_errors, binary_files=binary_files,
-        not_in_terraform=_not_in_terraform(stack),
+        not_in_terraform=_not_in_terraform(stack, granted_with_a_policy),
     )
