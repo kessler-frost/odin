@@ -1131,6 +1131,19 @@ future decision against these points instead of re-deriving them:
 
 ## Next — known, measured, not yet fixed
 
+- [ ] **An unknown node `type` renders as a blank white box, silently.** Found
+  while regenerating the README hero: the canvas said `"type": "role"` where the
+  catalog kind is `iam_role`, and odin drew an unlabelled white rectangle with no
+  hint that the type was unrecognised. It looks like a rendering bug in odin
+  rather than a typo in the canvas -- I assumed it was one for a minute myself.
+
+  Same family as the missing-handles bug, and the same fix direction: a canvas
+  is a first-class hand-authored input (`odin canvas set`, the translation agent
+  next), so an unrecognised kind should SAY so on the node -- and `POST /canvas`
+  could name it the way `canvas_problems` already names a malformed label,
+  without refusing the canvas (an unknown kind is applied-and-skipped by design,
+  not invalid).
+
 - [ ] **The edge-type selector, when there is anything to select.** Owner design
   call (2026-07-28): what an edge MEANS depends on the components it connects,
   and where a pair could legitimately mean more than one thing odin should ASK
