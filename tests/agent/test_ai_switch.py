@@ -44,15 +44,66 @@ def _clean_env(monkeypatch):
 # --- the value table -------------------------------------------------------
 
 
-@pytest.mark.parametrize("value", ["1", "true", "True", "yes", "on", "", "  "])
-def test_model_calls_are_allowed_when_the_switch_is_on_or_unset(monkeypatch, value):
+@pytest.mark.parametrize("value", ["1", "true", "True", "yes", "on"])
+def test_an_explicit_on_allows_model_calls(monkeypatch, value):
+    """`""` and `"  "` left this list when the default flipped to off: an unset
+    (or blank) variable now defers to the UI switch, which the test below covers.
+    An explicit truthy value still forces model calls on regardless."""
     monkeypatch.setenv("ODIN_AI", value)
     assert ai.off_reason() is None, value
 
 
-def test_unset_means_allowed(monkeypatch):
+def test_unset_means_OFF_until_the_switch_is_turned_on(monkeypatch, tmp_path):
+    """Owner decision, 2026-07-28: odin ships with model calls off.
+
+    This asserted the opposite until then. A tool that phones a model the first
+    time you press a button, without being asked, is not a default anyone chose
+    -- so an unset `ODIN_AI` now defers to the UI switch, which starts off.
+    """
     monkeypatch.delenv("ODIN_AI", raising=False)
+    monkeypatch.setattr(ai, "STATE_FILE", tmp_path / "ai.json")
+
+    reason = ai.off_reason()
+    assert reason is not None
+    assert "switch is off" in reason
+    assert "ODIN_AI=1" in reason, "and it should name the way to override it without the UI"
+
+    ai.set_runtime_enabled(True)
     assert ai.off_reason() is None
+
+    ai.set_runtime_enabled(False)
+    assert ai.off_reason() is not None
+
+
+def test_an_explicitly_set_env_var_beats_the_switch(monkeypatch, tmp_path):
+    """`ODIN_AI` is the ops override a CI job and `ODIN_AI=0 odin apply` rely on.
+    A preference file that could silently overrule it would make the flag a
+    suggestion."""
+    monkeypatch.setattr(ai, "STATE_FILE", tmp_path / "ai.json")
+    ai.set_runtime_enabled(True)
+    monkeypatch.setenv("ODIN_AI", "0")
+    assert ai.off_reason() is not None, "ODIN_AI=0 must win over a switch that is on"
+
+    ai.set_runtime_enabled(False)
+    monkeypatch.setenv("ODIN_AI", "1")
+    assert ai.off_reason() is None, "ODIN_AI=1 must win over a switch that is off"
+
+
+def test_the_switch_survives_a_restart(monkeypatch, tmp_path):
+    """Held on disk, because a preference that reset every time the server
+    restarted would be a nag -- odin restarts often during development."""
+    monkeypatch.delenv("ODIN_AI", raising=False)
+    monkeypatch.setattr(ai, "STATE_FILE", tmp_path / "ai.json")
+    ai.set_runtime_enabled(True)
+    assert ai.runtime_enabled() is True  # a fresh read of the file, no cache
+
+
+def test_an_unreadable_state_file_reads_as_OFF(monkeypatch, tmp_path):
+    """Fail closed. A corrupt preference must not enable model calls."""
+    state = tmp_path / "ai.json"
+    state.write_text("{not json")
+    monkeypatch.setattr(ai, "STATE_FILE", state)
+    assert ai.runtime_enabled() is False
 
 
 @pytest.mark.parametrize("value", ["0", "false", "False", "no", "off", "OFF"])
@@ -90,6 +141,10 @@ def test_refuse_if_off_is_a_no_op_when_the_switch_is_on(monkeypatch):
 
 
 def test_it_overrides_the_refine_opt_in(monkeypatch):
+    # The baseline is explicit since the default flipped to off: the point here
+    # is that ODIN_AI=0 beats a feature's OWN opt-in, which needs the feature to
+    # be genuinely on first.
+    monkeypatch.setenv("ODIN_AI", "1")
     monkeypatch.setenv("ODIN_TRANSLATE_REFINE", "1")
     assert translate_mod.refine_enabled() is True
     monkeypatch.setenv("ODIN_AI", "0")
@@ -97,7 +152,8 @@ def test_it_overrides_the_refine_opt_in(monkeypatch):
 
 
 def test_it_overrides_the_debug_agents_on_by_default(monkeypatch):
-    assert debugger_mod.enabled() is True  # M8 is ON by default
+    monkeypatch.setenv("ODIN_AI", "1")
+    assert debugger_mod.enabled() is True  # M8 is ON once model calls are allowed
     monkeypatch.setenv("ODIN_AI", "0")
     assert debugger_mod.enabled() is False
 

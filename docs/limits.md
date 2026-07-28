@@ -12,10 +12,12 @@ They are listed because finding one by surprise is worse than reading it here.
   `s3`, `sqs`, `sns`, `dynamodb`, `rds`, `vpc`, `subnet` only — and a
   live-imported RDS arrives with odin's default password, because no AWS API
   returns a master password.
-- **A drawn IAM edge is not in the generated Terraform.** Permissions you draw
-  are enforced by odin's gateway, which compiles them from the canvas and denies
-  any call without a matching grant — but nothing about them is written into
-  `main.tf`. Two consequences worth knowing: `odin translate > main.tf` taken to
+- **An emitted IAM policy names resources by label, not ARN.** Since v0.8.11 a
+  drawn permission becomes a real `aws_iam_role_policy` on the workload's role,
+  and it round-trips through Terraform and back without loss. What it is not yet
+  is portable: the `Resource` is odin's node label, because that is what
+  `gateway/classify.py` reports and therefore what the evaluator matches. Taken
+  to Amazon, each policy needs its `Resource` rewritten as an ARN. Two consequences worth knowing: `odin translate > main.tf` taken to
   real AWS gives that workload no permissions, and a canvas round-tripped through
   Terraform comes back with no edges. `odin translate` prints
   `not in this file: <src> -> <dst> …` on stderr for each one, and the round-trip

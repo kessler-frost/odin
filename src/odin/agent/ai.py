@@ -39,8 +39,12 @@ with no restart.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
+from pathlib import Path
+
+from odin.util import atomic_write_text
 
 log = logging.getLogger("odin.agent")
 
@@ -49,18 +53,59 @@ _ON = ("1", "true", "yes", "on")
 _OFF = ("0", "false", "no", "off")
 
 
+# Where the UI switch's answer lives. The env var stays the authoritative ops
+# override; this is the product-facing preference underneath it.
+STATE_FILE = Path(".odin") / "ai.json"
+
+
+def runtime_enabled() -> bool:
+    """Has someone turned the AI on in the UI? OFF until they do.
+
+    Owner decision, 2026-07-28: odin ships with model calls OFF and a switch in
+    the top bar. A tool that phones a model the first time you press a button,
+    without being asked, is not a default anyone chose.
+
+    Persisted rather than held in memory: a preference that reset on every
+    server restart would be a nag, and odin restarts often during development.
+    """
+    try:
+        return bool(json.loads(STATE_FILE.read_text()).get("enabled", False))
+    except (OSError, ValueError):
+        return False
+
+
+def set_runtime_enabled(enabled: bool) -> bool:
+    """Turn model calls on or off, and return what it now is."""
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(STATE_FILE, json.dumps({"enabled": bool(enabled)}), mode=0o600)
+    return bool(enabled)
+
+
 def off_reason() -> str | None:
     """Why no model call may happen, or None if they are allowed.
 
     A sentence, not a bool, because every degradation path has to be able to
     SAY why -- `POST /agent/debug`'s answer, `/translate`'s notes and the log
-    line all quote this."""
+    line all quote this.
+
+    Precedence: an explicitly SET `ODIN_AI` wins, because it is the ops switch a
+    CI job or a `ODIN_AI=0 odin apply` relies on and it must not be silently
+    overridden by a preference file. With it unset, the UI switch decides, and
+    its default is off.
+    """
     raw = os.environ.get(ENV_VAR, "").strip()
     value = raw.lower()
     if value in _OFF:
         return f"{ENV_VAR}={raw} — every model call is disabled (unset it, or set {ENV_VAR}=1, to allow them)"
-    if value == "" or value in _ON:
+    if value in _ON:
         return None
+    if value == "":
+        if runtime_enabled():
+            return None
+        return (
+            "the AI switch is off — turn it on in the top bar, or set "
+            f"{ENV_VAR}=1 to allow model calls without it"
+        )
     log.warning(
         "%s=%r is not a value I recognise, so odin is making NO model calls at all. Use %s=0 "
         "(or false/no/off) to disable them deliberately, or %s=1 to allow them.",

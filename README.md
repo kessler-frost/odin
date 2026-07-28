@@ -19,6 +19,14 @@ The translation is deterministic. The same canvas always produces byte-identical
 HCL, Terraform reads back into canvas nodes the same way every time, and no model
 call sits anywhere in that path.
 
+## Contents
+
+[Install](#install) · [What you can do](#what-you-can-do) · [Apply](#apply) ·
+[Edges are IAM](#edges-are-iam) · [Terminal](#driving-it-from-a-terminal) ·
+[AI](#ai-two-features-one-switch) · [How it works](#how-it-works) ·
+[Known limits](#known-limits) · [Security](#security) ·
+[Contributing](#contributing) · [Where it's going](#where-its-going)
+
 ![Odin — a VPC/Subnet/EC2 stack, an SG, S3/SQS/SNS/DynamoDB/RDS, a Lambda, an ECS service, an IAM role and an ECR repo, drawn on the canvas with an IAM permission edge (EC2 → S3, GetObject/PutObject/ListBucket)](assets/odin-canvas.png)
 
 **Draw it, press Apply, watch it come up.** Three resources placed on the canvas,
@@ -100,13 +108,6 @@ runs its tasks in that VM. One node can expand to several Terraform resources: a
 ALB becomes a load balancer plus a target group plus a listener, and a Lambda
 drawn without a role gets one generated for it.
 
-Nine more tiles are drawable but unbuilt: `kinesis`, `kms`, `route53`,
-`apigateway`, `efs`, `events`, `ebs`, `eip`, `igw`. Each is labelled
-**`(placeholder)`**, and that marker is exact in both directions. A marked tile is
-reported under `skipped` and never touched, and an unmarked tile is a service odin
-models end to end. A test reads the modelled-kinds list out of `translate.py`
-itself, so the label stays honest.
-
 Environments are independent. `--env staging` and `--env prod` keep separate
 canvases, containers and state.
 
@@ -142,10 +143,11 @@ The edge type comes from what you connected: `lambda → dynamodb` is an IAM gra
 with sensible defaults, `sg → ec2` is group membership, `ec2 → subnet` is
 containment. Across the whole catalog no pair is ambiguous, so odin never guesses.
 
-One thing worth knowing before you take the HCL elsewhere: **a drawn permission is
-enforced by odin's gateway and does not appear in the generated Terraform.**
-`odin translate` says so on stderr, and [docs/limits.md](docs/limits.md) explains
-what it means.
+A drawn permission is emitted as a real `aws_iam_role_policy` on the workload's
+role, so it survives into the Terraform and back out of it. One caveat if you take
+the HCL to Amazon: the policy's `Resource` is odin's node label, which is what the
+gateway matches on, where AWS expects an ARN. `odin translate` says so per policy
+on stderr.
 
 ## Driving it from a terminal
 
@@ -189,9 +191,16 @@ Odin gathers each node's config, observed phase, crash verdict, recent events an
 a tail of its logs, then answers in plain English with per-node suspects. It reads
 state and returns prose, and it can change nothing.
 
-`ODIN_AI=0` turns off every model call odin can make. Both features then say so
-and carry on: the debug panel answers with the reason, and `odin chat` reports
-`agent unavailable` and changes nothing.
+**Both are off until you turn them on.** The top bar carries an `AI OFF` switch,
+and odin makes no model call of any kind while it reads that way. Flip it and
+both features come alive; flip it back and they say so and carry on, with the
+debug panel answering with the reason and `odin chat` reporting
+`agent unavailable` while changing nothing.
+
+Setting `ODIN_AI` in the environment overrides the switch in both directions,
+which is what a CI job or a headless run wants. The switch renders disabled and
+names the variable when that happens, so it never looks like a control that does
+nothing.
 
 ## How it works
 
@@ -306,8 +315,9 @@ claim in this README is verified.
 
 The ones most likely to matter:
 
-- **A drawn IAM edge is not in the generated Terraform.** The gateway enforces it;
-  `main.tf` taken to Amazon grants nothing.
+- **An emitted IAM policy names resources by label, not ARN.** It round-trips
+  through odin perfectly; taken to Amazon each policy needs its `Resource`
+  rewritten as an ARN.
 - **An RDS container keeps no volume**, so anything that replaces it comes back
   empty. Odin's own repair says so in the apply output.
 - **Import is narrower in `--live` mode**, and a live-imported RDS arrives with

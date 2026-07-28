@@ -715,6 +715,42 @@ def _lambda_entry(runtime: str) -> tuple[str, str]:
     return _LAMBDA_RUNTIME_ENTRY.get(runtime, _LAMBDA_RUNTIME_ENTRY[_DEFAULT_LAMBDA_RUNTIME])
 
 
+# Workloads an IAM edge may start from (`ui/src/lib/iam.ts::computeTypes`). A
+# lambda is excluded because it already has a role on every path, drawn or
+# auto-generated.
+_GRANTABLE_KINDS = ("ec2", "ecs")
+
+
+def _workload_role_key(node_id: str) -> str:
+    """`refs` key for the auto-role an ec2/ecs node gets when something is
+    granted to it. Same reservation shape as `_lambda_role_key`."""
+    return f"__workload_role__{node_id}"
+
+
+def _granted_ids(stack: Stack) -> set[str]:
+    """Every node an `iam` edge points AWAY from -- i.e. every workload that
+    needs a role to carry the policy the edge compiles to."""
+    return {edge.src for edge in stack.edges if edge.kind == "iam"}
+
+
+def _policy_document(edges) -> str:
+    """The IAM policy JSON for one workload's grants.
+
+    Resources are odin's own node LABELS rather than ARNs, which is what the
+    gateway's classifier reports and therefore what its evaluator matches
+    (`gateway/classify.py`). A canvas taken to Amazon needs real ARNs, and
+    `not_in_terraform` said so before this existed; that gap narrows to the
+    resource FORMAT now rather than the policy being absent entirely.
+    """
+    return json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [
+            {"Effect": "Allow", "Action": list(edge.perms), "Resource": edge.dst}
+            for edge in edges if edge.perms
+        ],
+    })
+
+
 def _lambda_role_key(lambda_id: str) -> str:
     """A synthetic `refs` key (never a real canvas id -- see the module's
     Refs type) for a lambda's AUTO-GENERATED execution role, reserved in
@@ -1183,17 +1219,23 @@ _ALB_TARGET_KINDS = ("ecs",)
 
 
 def _not_in_terraform(stack: Stack) -> list[str]:
-    """What this canvas does that the generated Terraform will not carry.
+    """What the generated Terraform carries differently from odin itself.
 
-    Only drawn IAM edges today. They ARE enforced -- by odin's gateway, from the
-    Stack -- so this is not a coverage gap in odin, it is a gap in the FILE, and
-    the difference is the whole reason it gets said out loud rather than filed
-    under `unsupported`.
+    Until v0.8.11 a drawn permission reached the file not at all, and this said
+    so in the bluntest terms ("this file grants it nothing"). It is emitted now,
+    as a real `aws_iam_role_policy` on the workload's role, so the remaining
+    difference is narrower and worth stating precisely: the `Resource` in that
+    policy is odin's node LABEL, because that is what `gateway/classify.py`
+    reports and therefore what odin matches against. Amazon expects an ARN.
+
+    So the file is complete for odin and needs one edit per policy for AWS. That
+    is a smaller and more honest claim than the one it replaces, and it stays out
+    of `unsupported` for the same reason as before: odin builds this fine.
     """
     return [
-        f"{edge.src} -> {edge.dst} ({', '.join(edge.perms) or 'no actions'}): enforced by odin's "
-        "gateway, but NOT written into the Terraform -- this file grants it nothing"
-        for edge in stack.edges if edge.kind == "iam"
+        f"{edge.src} -> {edge.dst}: the policy is emitted, but its Resource is the node label "
+        f"{edge.dst!r} — Amazon expects an ARN there"
+        for edge in stack.edges if edge.kind == "iam" and edge.perms
     ]
 
 
@@ -1206,6 +1248,9 @@ def generate_tf(stack: Stack) -> TfProject:
     blocks: list[tuple[tuple[str, str], str]] = []
     unsupported: list[str] = []
     wiring_errors: list[str] = []
+    # Which workloads a drawn permission points away from -- read once, because
+    # pass 1 reserves a role for each of them and the policy pass below emits it.
+    granted_ids = _granted_ids(stack)
 
     # Pass 1 — assign every buildable resource its HCL name BEFORE any builder
     # runs. "subnet" sorts before "vpc", yet aws_subnet.vpc_id must reference
@@ -1222,11 +1267,22 @@ def generate_tf(stack: Stack) -> TfProject:
         # auto-role's HCL name reserved HERE (same reasoning as the vpc-
         # before-subnet ordering this pass already exists for) so `_lambda`'s
         # builder, which runs in pass 2, can already reference it.
+        # v0.8.11 generalises this from lambda to every workload an IAM edge can
+        # start from. A drawn permission is emitted as a real
+        # `aws_iam_role_policy`, and a policy needs a role to hang on -- so an
+        # ec2 or ecs node that is granted something gets the same auto-role a
+        # lambda has always had. A node nobody granted anything keeps emitting
+        # exactly what it did before.
         if res.kind == "lambda" and not _field(res, "role", "").strip():
             role_name = unique_name(
                 sanitize_name(f"{res.id}_role"), used_names.setdefault("aws_iam_role", set()),
             )
             refs[_lambda_role_key(res.id)] = ("iam_role", role_name)
+        elif res.kind in _GRANTABLE_KINDS and res.id in granted_ids:
+            role_name = unique_name(
+                sanitize_name(f"{res.id}_role"), used_names.setdefault("aws_iam_role", set()),
+            )
+            refs[_workload_role_key(res.id)] = ("iam_role", role_name)
         # V5c: the FIRST ecs node seen reserves the one shared cluster's HCL
         # name -- every later ecs node's `_ecs` builder (pass 2) just reads
         # it back, same reservation technique as the lambda auto-role above.
@@ -1371,6 +1427,53 @@ def generate_tf(stack: Stack) -> TfProject:
         nested = f"  assume_role_policy = {_LAMBDA_TRUST_POLICY}"
         block = _block("aws_iam_role", role_name, {"name": quote(f"{res.id}-role")}, nested)
         blocks.append((("aws_iam_role", res.id), block))
+
+    # v0.8.11: every drawn IAM edge becomes REAL Terraform.
+    #
+    # Until now a permission you drew existed only in odin's Stack: the gateway
+    # compiled it and enforced it, and `main.tf` contained nothing about it. That
+    # made the generated project incomplete (taken to Amazon it granted nothing)
+    # and made a canvas round trip through Terraform lose the whole security
+    # posture in silence.
+    #
+    # One `aws_iam_role_policy` per granted workload, carrying every action that
+    # workload was granted. The role it hangs on is the one pass 1 reserved: a
+    # lambda's own (drawn or auto-generated), or the auto-role an ec2/ecs node
+    # gets the moment something is granted to it.
+    for res in ordered:
+        if res.id not in granted_ids:
+            continue
+        grants = [e for e in stack.edges if e.kind == "iam" and e.src == res.id and e.perms]
+        role_ref = refs.get(_workload_role_key(res.id)) or refs.get(_lambda_role_key(res.id))
+        if not grants or role_ref is None:
+            # A lambda with a DRAWN role hangs its policy on that role instead.
+            drawn = _field(res, "role", "").strip()
+            role_ref = refs.get(drawn) if drawn else None
+            if not grants or role_ref is None or role_ref[0] != "iam_role":
+                continue
+        _, role_name = role_ref
+        own = hcl_name_by_id.get(res.id) or sanitize_name(res.id)
+        name = unique_name(sanitize_name(f"{own}_grants"), used_names.setdefault("aws_iam_role_policy", set()))
+        attrs = {
+            "name": quote(f"{res.id}-grants"),
+            "role": f"aws_iam_role.{role_name}.name",
+            "policy": quote(_policy_document(grants)),
+        }
+        blocks.append((("iam_role_policy", f"__grants__{res.id}"), _block("aws_iam_role_policy", name, attrs)))
+
+    # ...and the auto-role itself for an ec2/ecs node that was granted something.
+    # A lambda's auto-role is emitted by its own pass below; this is the same
+    # block for the two kinds that never had one.
+    for res in ordered:
+        role_ref = refs.get(_workload_role_key(res.id))
+        if role_ref is None:
+            continue
+        _, role_name = role_ref
+        nested = f"  assume_role_policy = {_LAMBDA_TRUST_POLICY}"
+        blocks.append((
+            ("aws_iam_role", f"__workload__{res.id}"),
+            _block("aws_iam_role", role_name, {"name": quote(f"{res.id}-role")}, nested),
+        ))
 
     # W2.4: a secret node's VALUE becomes a companion
     # `aws_secretsmanager_secret_version` -- the same one-canvas-node-to-two-

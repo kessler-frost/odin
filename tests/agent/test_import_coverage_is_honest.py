@@ -113,48 +113,37 @@ def test_the_readme_describes_the_coverage_import_actually_has():
     )
 
 
-def test_a_drawn_GRANT_does_not_reach_the_terraform_and_says_so():
-    """The round trip is complete for NODES and lossy for EDGES, and the honest
-    version of that sentence is the point of this test.
+def test_a_drawn_GRANT_is_emitted_as_real_terraform_and_survives_a_round_trip():
+    """v0.8.11 replaced the story this test used to tell.
 
-    A drawn IAM edge is enforced -- `gateway/policy.py::compile_policies` builds
-    it from the Stack and the gateway denies anything without a matching grant --
-    but enforcement happens in odin's gateway, not through Terraform, so nothing
-    about it is written into `main.tf`. Measured in field test 7: a canvas
-    granting a lambda `s3:GetObject` produced five resources and ZERO mentions of
-    the permission, and importing that file back returned the nodes with no edges
-    and no warning of any kind.
+    It read "a drawn grant does not reach the terraform and says so", and it
+    carried an instruction: if odin ever started emitting real IAM policy, the
+    test should fail and the whole `not_in_terraform` story should be deleted
+    rather than patched to survive. It did fail, and that is what happened — the
+    claim "the permission is absent" is gone.
 
-    So the loss is REPORTED at the point it happens (translate), because import
-    cannot warn about something that was never in the file it reads.
+    What replaced it is a smaller, different claim, which is why
+    `not_in_terraform` still exists: the policy IS emitted, and its `Resource` is
+    odin's node LABEL because that is what the gateway matches on, where Amazon
+    expects an ARN. Complete for odin, one edit per policy for AWS.
     """
     project = generate_tf(canvas_to_stack(CANVAS))
-    assert "s3:GetObject" not in project.files["main.tf"], (
-        "if odin starts emitting real IAM policy for drawn edges, this test should "
-        "fail and the whole not_in_terraform story should be deleted, not updated"
-    )
+    main_tf = project.files["main.tf"]
+
+    assert "aws_iam_role_policy" in main_tf, "the grant must be real Terraform now"
+    assert "s3:GetObject" in main_tf, "and carry the action that was drawn"
+
+    # The remaining difference, stated exactly.
     (gap,) = project.not_in_terraform
-    assert "web -> uploads" in gap
-    assert "s3:GetObject" in gap
-    assert "grants it nothing" in gap
+    assert "the policy is emitted" in gap
+    assert "ARN" in gap
 
-    # ...and the round trip really does drop it, which is what the warning is for.
-    assert parse_hcl_text(project.files["main.tf"]).edges == []
+    # And the round trip keeps it, which is the part that used to be lost.
+    imported = parse_hcl_text(main_tf)
+    assert imported.unsupported == [], [e.type for e in imported.unsupported]
+    (edge,) = [e for e in imported.edges if (e.get("data") or {}).get("edgeType") == "iam"]
+    assert edge["source"] == "web" and edge["target"] == "uploads"
+    assert edge["data"]["permissions"] == ["s3:GetObject"]
 
-
-def test_the_README_still_warns_that_a_drawn_GRANT_is_not_in_the_terraform():
-    """The front page carries the ONE consequence a reader has to know before
-    taking `main.tf` anywhere: their permissions are not in it.
-
-    Kept on the README rather than only in docs/limits.md because it is the
-    difference between "this file describes my architecture" and "this file
-    describes my architecture minus its security posture", and someone piping
-    `odin translate` into a repo will not have read the limits page first.
-    """
-    # Asserted by MEANING, not by an exact phrase: the first version of this test
-    # pinned one wording and broke the moment the README was reworded, which
-    # teaches the next person to loosen the test instead of checking the claim.
-    prose = " ".join(README.split())
-    assert "enforced by odin's gateway" in prose
-    assert "generated Terraform" in prose
-    assert "docs/limits.md" in README, "and it should point at the full explanation"
+    again = generate_tf(canvas_to_stack({"nodes": imported.nodes, "edges": imported.edges}))
+    assert again.files["main.tf"] == main_tf, "generate -> import -> generate must be stable"

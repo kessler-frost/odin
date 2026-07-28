@@ -12,6 +12,20 @@ import os
 # value (CI, a developer testing the real port) untouched.
 os.environ.setdefault("ODIN_GATEWAY_PORT", "0")
 
+# v0.8.11 flipped the PRODUCT default for model calls to OFF, behind a switch in
+# the top bar: a tool that phones a model the first time you press a button,
+# without being asked, is not a default anyone chose (`agent/ai.py`).
+#
+# The suite was written when an unset `ODIN_AI` meant "allowed", and dozens of
+# tests exercise agent paths on that assumption. Their intent has not changed --
+# they are about what the agent DOES once it may run -- so the assumption is made
+# explicit here in one place instead of being re-stated in every file.
+#
+# `setdefault`, so `ODIN_AI=0 uv run pytest` still turns everything off, and any
+# test that monkeypatches the variable (including the ones that assert the new
+# off-by-default behaviour) overrides this for its own duration.
+os.environ.setdefault("ODIN_AI", "1")
+
 
 # --- a forgotten `await` must FAIL, not pass vacuously ----------------------
 #
