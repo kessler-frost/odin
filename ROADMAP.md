@@ -108,8 +108,11 @@ future decision against these points instead of re-deriving them:
 
   **v1 limits, recorded rather than hidden** (northstar directive 5's honesty
   rule):
-  - Lambda: inline code only, `$LATEST` only — no S3-deployed packages,
-    versions, or aliases.
+  - Lambda: `$LATEST` only — no S3-deployed packages, versions, or aliases.
+    Code may be a single pasted file OR a whole directory (`sourceDir`, v0.8.14)
+    whose tree is packaged as-is; dependencies are whatever you vendored into
+    that directory, because odin runs no package manager and fetches nothing at
+    apply time (docs/limits.md).
   - ECS: no `network_configuration` (awsvpc/Fargate-style ENIs — odin's tasks
     are `launch_type = "EC2"` / `network_mode = "bridge"`, which need none);
     a task that dies between API calls isn't auto-replaced until the next
@@ -1472,7 +1475,13 @@ index-to-index deletion on this file.
      down and leaves the env registered with a reconciler ticking forever; seven
      accumulated during one field-test session. Wants `odin env rm` or a
      `--forget` flag, plus whatever the UI env list should do with it.
-  6. **Lambda is inline code only**, one version, no S3-deployed packages.
+  6. **Lambda has one version and no S3-deployed packages.** Multi-file/
+     directory packaging landed in v0.8.14 (`sourceDir`), so this is now only
+     `$LATEST`-with-no-aliases plus the missing `s3_bucket`/`s3_key` deploy
+     path. The S3 half is the cheapest of what is left — odin has a real S3
+     substitute to test it against — and it wants an `aws_s3_object` upload in
+     the generated project plus `S3Bucket`/`S3Key` in the gateway's
+     CreateFunction, which today refuses them by name.
   7. **Nebula is single-host** — this is M7, and it stays deferred until the
      owner asks, because it cannot be honestly finished on one machine.
 

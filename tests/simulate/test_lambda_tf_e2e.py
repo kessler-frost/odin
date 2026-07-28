@@ -47,6 +47,7 @@ import zipfile
 from contextlib import suppress
 from pathlib import Path
 
+import attr
 import boto3
 import httpx
 import pytest
@@ -437,29 +438,47 @@ PKG_FUNCTION = "lampkg-thumbnailer"
 # and a DEPENDENCY vendored into the source directory the way `pip install -t .`
 # leaves one -- odin's whole dependency story, and the only one it offers (it
 # never fetches anything at apply time; docs/limits.md says so).
+VENDORED = "attr"  # the `attrs` distribution's import package -- see `_write_tree`
 PACKAGE_TREE = {
     "lambda_function.py": (
         "import os\n"
+        f"import {VENDORED}\n"
         "from thumbs.resize import describe\n"
-        "from vendored_pkg import STAMP\n"
         "\n"
         "def lambda_handler(event, context):\n"
+        f"    Point = {VENDORED}.make_class('Point', ['x', 'y'])\n"
         "    return {\n"
         "        'described': describe(event['name']),\n"
-        "        'stamp': STAMP,\n"
+        f"        'vendored_ran': {VENDORED}.asdict(Point(1, 2)),\n"
+        f"        'vendored_version': {VENDORED}.__version__,\n"
+        f"        'vendored_from': {VENDORED}.__file__,\n"
         "        'task_files': sorted(os.listdir('/var/task')),\n"
         "    }\n"
     ),
     "thumbs/__init__.py": "",
     "thumbs/resize.py": "def describe(name):\n    return name.upper() + '-128x128'\n",
-    "vendored_pkg/__init__.py": "from vendored_pkg.const import STAMP\n",
-    "vendored_pkg/const.py": "STAMP = 'vendored-1.2.3'\n",
 }
-PACKAGE_ANSWER = {"described": "HERO-128x128", "stamp": "vendored-1.2.3"}
 
 
 def _write_tree(root: Path, files: dict[str, str]) -> Path:
-    """The source directory `sourceDir` points at.
+    """The source directory `sourceDir` points at, INCLUDING a real vendored
+    dependency.
+
+    `attrs` is a genuine third-party pure-Python distribution (a package with
+    submodules, type stubs, `__pycache__` and all), copied in exactly where
+    `pip install -t <dir> attrs` would put it -- copied rather than downloaded,
+    because odin's whole dependency claim is that nothing is fetched at apply
+    time. A handmade stub package would have proved the import machinery and
+    nothing about a real distribution's layout.
+
+    WHY `attrs` AND NOT SOMETHING FROM boto3's OWN DEPENDENCY TREE. The first
+    version of this used `jmespath` and the proof was worthless: deleting the
+    vendored copy from the archive entirely still returned the right answer,
+    because `public.ecr.aws/lambda/python:3.12` bundles boto3 -- and therefore
+    jmespath -- in `/var/runtime`. Measured by mutation, not reasoned about.
+    `attrs` is in no AWS runtime, and the handler additionally reports
+    `__file__` so the assertion can prove the module that ran came out of
+    `/var/task` rather than out of the image.
 
     `tmp_path` is fine HERE, and that is not a contradiction of this module's
     LOAD-BEARING DISCOVERY: nothing bind-mounts this tree. The SERVER reads it
@@ -471,7 +490,34 @@ def _write_tree(root: Path, files: dict[str, str]) -> Path:
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
+    site_packages = Path(attr.__file__).parent.parent
+    shutil.copytree(site_packages / VENDORED, root / VENDORED, dirs_exist_ok=True)
+    # ...and its `.dist-info`, because that is what `pip install -t` leaves and
+    # because `attr.__version__` reads it through `importlib.metadata` -- found
+    # by the container raising `PackageNotFoundError` when only the import
+    # package was copied. Vendoring the code without the metadata is a real
+    # mistake a user can make, so the test makes the faithful copy instead.
+    dist_info = next(site_packages.glob(f"{VENDORED}s-*.dist-info"))
+    shutil.copytree(dist_info, root / dist_info.name, dirs_exist_ok=True)
     return root
+
+
+def _assert_ran_the_package(payload: dict) -> None:
+    """Every claim the multi-file feature makes, read off one real invocation."""
+    assert payload["described"] == "HERO-128x128", payload  # the node's own module ran
+    assert payload["vendored_ran"] == {"x": 1, "y": 2}, payload  # the vendored dep really executed
+    assert payload["vendored_version"] == attr.__version__, payload  # ...and its metadata shipped too
+    # ...and it was the VENDORED copy, not one the base image happened to ship.
+    assert payload["vendored_from"].startswith("/var/task/"), payload
+    assert {"lambda_function.py", "thumbs", VENDORED} <= set(payload["task_files"]), payload
+
+
+def _archive_names(root: Path, env: str) -> list[str]:
+    """Every member name of the deployment zip odin actually shipped, read back
+    off the one the GATEWAY stored -- so what is checked is the archive that
+    reached the substrate, not the generator's own output."""
+    with zipfile.ZipFile(root / env / "gateway" / "lambda" / f"{PKG_FUNCTION}.zip") as archive:
+        return archive.namelist()
 
 
 def _package_canvas(source_dir: Path, function_name: str = PKG_FUNCTION) -> dict:
@@ -526,11 +572,23 @@ def test_a_multi_file_source_directory_really_runs_in_the_rie_container(store_ro
         assert response.get("FunctionError") is None, response
         payload_out = json.loads(response["Payload"].read())
         print(f"\n[v0.8.14] multi-file invoke answered: {payload_out}")
-        assert {k: payload_out[k] for k in PACKAGE_ANSWER} == PACKAGE_ANSWER, payload_out
-        # ...and the container's /var/task really holds the whole tree, not one
-        # file (`__pycache__` is written by the import that just ran, so this is
-        # a superset check rather than an equality one).
-        assert {"lambda_function.py", "thumbs", "vendored_pkg"} <= set(payload_out["task_files"]), payload_out
+        _assert_ran_the_package(payload_out)
+
+        # The archive the GATEWAY stored, read back: the real vendored
+        # distribution shipped, and no bytecode did.
+        #
+        # The `.pyc` half of that is deliberately NOT the proof of the exclusion
+        # rules, and saying so is the point: `__pycache__` is caught twice over
+        # (once as a skipped directory, once by the `.pyc` suffix), so deleting
+        # EITHER rule leaves this assertion green -- measured, by doing exactly
+        # that against this test. Each rule is killed individually by
+        # `tests/agent/test_lambda_package.py`, using the inputs that
+        # distinguish them. What this line is worth end-to-end is the other
+        # direction: an exclusion that grew too greedy and swallowed a vendored
+        # dependency would fail it.
+        shipped = set(_archive_names(store.root, PKG_ENV))
+        assert {f"{VENDORED}/__init__.py", f"{VENDORED}/_make.py"} <= shipped, sorted(shipped)
+        assert not [name for name in shipped if name.endswith(".pyc")], sorted(shipped)
 
         # ZERO DRIFT: a second translate of an unchanged directory must produce
         # a byte-identical archive, or `source_code_hash` churns forever.
@@ -681,7 +739,7 @@ def test_the_real_odin_cli_applies_a_multi_file_function(live_server, lambda_cle
     assert response.get("FunctionError") is None, response
     payload_out = json.loads(response["Payload"].read())
     print(f"\n[v0.8.14] real-CLI multi-file invoke answered: {payload_out}")
-    assert {k: payload_out[k] for k in PACKAGE_ANSWER} == PACKAGE_ANSWER, payload_out
+    _assert_ran_the_package(payload_out)
 
     # `odin tf plan` is the drift check a CI job runs, and its exit code IS the
     # determinism claim: 0 no changes, 2 changes present. A churning archive

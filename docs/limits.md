@@ -8,7 +8,11 @@ They are listed because finding one by surprise is worse than reading it here.
   body lives in a zip beside `main.tf`, so `odin translate import <dir>` recovers
   it and reading HCL text alone cannot — in that case the node comes back with
   odin's default placeholder payload, and the import says so rather than letting
-  it pass for your function. `--live` is narrower than either —
+  it pass for your function. A multi-file package comes back as the node's
+  `files` map (every member, so re-applying it regenerates a byte-identical
+  archive); a member that is not text — a vendored `.so`, a compiled asset —
+  cannot live on a canvas, so it is named on its own line and left behind.
+  `--live` is narrower than either —
   `s3`, `sqs`, `sns`, `dynamodb`, `rds`, `vpc`, `subnet` only — and a
   live-imported RDS arrives with odin's default password, because no AWS API
   returns a master password.
@@ -58,8 +62,33 @@ They are listed because finding one by surprise is worse than reading it here.
   cannot be compared back. Primary resources also gain an `odin:node` tag
   (companions such as a key pair or a generated execution role do not), so a
   byte-identical round trip is not a goal.
-- **Lambda:** inline code only (paste it in the config panel, odin zips and ships
-  it), one version (`$LATEST`). No S3-deployed packages, versions or aliases.
+- **Lambda dependencies are VENDORED ONLY — odin never runs a package manager.**
+  Since v0.8.14 a function can be a whole directory: set `sourceDir` on the node
+  to a path on the machine running odin and the entire tree is packaged, so a
+  handler can import its own modules. That is also the only way to get a
+  dependency in: install it INTO that directory yourself
+  (`pip install -t <dir> requests`, `npm install --prefix <dir>`), and it ships
+  with the tree. Nothing is fetched at apply time, there is no `requirements.txt`
+  / `package.json` step, and no build container — an apply is offline by
+  construction and stays that way. Two consequences worth knowing before you hit
+  them: a dependency with a COMPILED extension has to be built for the container,
+  not for your Mac (the runtime is `public.ecr.aws/lambda/*`, so linux/x86_64 —
+  `pip install --platform manylinux2014_x86_64 --only-binary=:all: -t <dir>`),
+  and `__pycache__` / `*.pyc` / `.venv` are excluded from the archive on purpose,
+  because a `.pyc` embeds its source's mtime and would change the package's hash
+  on every translate. `sourceDir` overrides the Code textarea entirely.
+- **Lambda has one version and no S3-deployed packages.** `$LATEST` only — no
+  versions, no aliases, and no `s3_bucket`/`s3_key` on `aws_lambda_function`
+  (the gateway's CreateFunction accepts an inline `Code.ZipFile` and refuses
+  `S3Bucket`/`S3Key` by name rather than silently ignoring it).
+- **odin declines a Lambda whose package does not contain its handler's module.**
+  A package missing `lambda_function.py` deploys perfectly happily — the RIE
+  container answers a TCP connect whether or not the module exists — and fails
+  only when somebody invokes it. So the apply refuses at translate time and names
+  the file it wanted. The cost is a false refusal for anyone whose handler
+  resolves some way odin cannot see; the field it checks is the node's own
+  `handler`, so renaming that is the way out. The package is also capped at
+  AWS's own 250 MB unzipped quota, measured before anything is read.
 - **ECS:** `network_configuration` (awsvpc/Fargate-style ENIs) is not modeled;
   tasks run `launch_type = "EC2"` with `network_mode = "bridge"`, which needs
   none. A task that dies **is** noticed — the task sweep runs every reconciler

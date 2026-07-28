@@ -115,10 +115,30 @@ def test_member_order_is_sorted_not_filesystem_order(tmp_path):
     assert _project(sourceDir=str(forward)).binary_files == _project(sourceDir=str(backward)).binary_files
 
 
-def test_pycache_never_reaches_the_archive(tmp_path):
-    """A `.pyc` embeds the source's mtime, so a tree that had merely been
-    imported once would produce different bytes on every translate."""
-    root = _tree(tmp_path / "src", {**PACKAGE, "__pycache__/helpers.cpython-313.pyc": "not really bytecode"})
+def test_a_pyc_never_reaches_the_archive(tmp_path):
+    """A `.pyc` embeds the source's mtime and size, so a tree that had merely
+    been imported once would produce different bytes on every translate -- and
+    CPython writes one into any source directory it imports from. This is the
+    SUFFIX half of that exclusion (a stray `.pyc` beside the source, which is
+    where a copied tree or an old build leaves them)."""
+    root = _tree(tmp_path / "src", {**PACKAGE, "helpers.pyc": "not really bytecode"})
+    clean = _tree(tmp_path / "clean", PACKAGE)
+    assert set(_members(_project(sourceDir=str(root)))) == set(PACKAGE)
+    assert _project(sourceDir=str(root)).binary_files == _project(sourceDir=str(clean)).binary_files
+
+
+def test_a_skipped_directory_is_skipped_WHATEVER_it_holds(tmp_path):
+    """The DIRECTORY half, and it needs a member the suffix rule would not have
+    caught anyway -- the first version of this test put a `.pyc` inside
+    `__pycache__` and so proved only the suffix rule twice (it survived deleting
+    the entire skip-directory set). `__pycache__` and `.venv` both routinely hold
+    plain `.py` files, which is exactly what must not ship: a virtualenv is
+    host-specific by construction and its size dwarfs the function."""
+    root = _tree(tmp_path / "src", {
+        **PACKAGE,
+        "__pycache__/leftover.py": "print('stale')\n",
+        ".venv/lib/python3.13/site-packages/wrong.py": "HOST_SPECIFIC = True\n",
+    })
     clean = _tree(tmp_path / "clean", PACKAGE)
     assert set(_members(_project(sourceDir=str(root)))) == set(PACKAGE)
     assert _project(sourceDir=str(root)).binary_files == _project(sourceDir=str(clean)).binary_files
