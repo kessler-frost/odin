@@ -24,9 +24,9 @@ from urllib.parse import urlencode
 
 import pytest
 
-from odin.gateway import synth
+from odin.gateway import records, synth
 from odin.gateway.models import ec2net, ecr, eventsctl, iamctl, logsctl, secretsctl, ssmctl
-from odin.gateway.stores import SynthStores
+from odin.gateway.stores import JsonStore, SynthStores
 
 ENV = "v77a-rt"
 NOW = 1785130167.0
@@ -38,15 +38,40 @@ def reload(root: Path) -> SynthStores:
     return SynthStores(root)
 
 
+def store_names(stores: SynthStores) -> list[str]:
+    """Every `JsonStore` on `SynthStores`, DERIVED rather than listed.
+
+    This used to be a hand-written list of 17 names, and the store count has
+    grown one service at a time from four -- so an 18th store was invisible to
+    both readers below until someone remembered to type it in. Same reasoning
+    `SynthStores.forget_env` already writes down for deriving from `vars`."""
+    return sorted(name for name, store in vars(stores).items() if isinstance(store, JsonStore))
+
+
 def touch_everything(stores: SynthStores) -> dict[str, int]:
     """Force a load of every store and report how many records each holds, so
     a test that seeded nothing cannot pass by validating nothing."""
-    names = [
-        "tags", "sqs_queues", "sns_topics", "sns_subscriptions", "ec2net", "iamctl",
-        "ecr", "ec2compute", "lambdactl", "ecsctl", "logsctl", "secretsctl",
-        "ssmctl", "cachectl", "rdsctl", "elbv2ctl", "eventsctl",
-    ]
-    return {name: len(getattr(stores, name).items(ENV)) for name in names}
+    return {name: len(getattr(stores, name).items(ENV)) for name in store_names(stores)}
+
+
+def test_every_store_has_a_records_schema(tmp_path: Path):
+    """The ratchet that was missing: a new `JsonStore` with no `SCHEMAS` entry
+    loads WITHOUT validation and says nothing about it (`_adapter_for` returns
+    None for an unknown store name and every record is skipped).
+
+    That is a guard silently not firing -- honesty rule 1 -- and it is exactly
+    how the file-shape bugs `records.py`'s docstring lists got in. Nothing
+    enforced the pairing before: `touch_everything`'s list happened to match
+    `SCHEMAS` at 17 entries each, by hand, twice."""
+    missing = sorted(set(store_names(SynthStores(tmp_path))) - set(records.SCHEMAS))
+    assert not missing, f"these stores load unvalidated -- add a records.SCHEMAS entry: {missing}"
+
+
+def test_records_schemas_name_no_store_that_does_not_exist(tmp_path: Path):
+    """The other direction: a `SCHEMAS` key that matches no store validates
+    nothing at all, so a typo there is a schema that silently never runs."""
+    unknown = sorted(set(records.SCHEMAS) - set(store_names(SynthStores(tmp_path))))
+    assert not unknown, f"these SCHEMAS entries match no JsonStore: {unknown}"
 
 
 async def json_call(module, action: str, payload: dict, stores: SynthStores, resource: str = ""):
