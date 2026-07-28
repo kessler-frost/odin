@@ -41,6 +41,11 @@ def _render_translate(body: dict) -> None:
     unsupported = body.get("unsupported") or []
     if unsupported:
         typer.echo(f"unsupported: {', '.join(str(u) for u in unsupported)}", err=True)
+    # On stderr, beside `unsupported`, and worded so it cannot be mistaken for
+    # one: odin DOES enforce these. What it cannot do is put them in this file,
+    # so a `translate > main.tf` taken to real AWS grants nothing (field test 7).
+    for gap in body.get("not_in_terraform") or []:
+        typer.echo(f"not in this file: {gap}", err=True)
 
 
 def _graph(url: str, env: str, file: Path | None) -> dict:

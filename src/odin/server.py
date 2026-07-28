@@ -1472,9 +1472,19 @@ _RECOVERY_COST = {
 }
 
 
+# The drift sweep ends its verdicts with a call to action -- "container X is not
+# running (exit 137) — re-Apply to recreate" -- which is right where a user reads
+# it (`/world`, a crashed node) and WRONG quoted into a recovery line, where the
+# apply has already done the thing it asks for. Field test 7 caught it reading
+# "was re-created because ... — re-Apply to recreate", which invites someone to
+# repeat an action that just happened. Only the CAUSE belongs here.
+_ADVICE_SUFFIX = " — re-Apply to recreate"
+
+
 def _recovered_line(item: dict) -> str:
+    cause = (item["reason"] or "").removesuffix(_ADVICE_SUFFIX).rstrip(" —-")
     return (
-        f"{item['kind']} {item['node']} was re-created because {item['reason']}"
+        f"{item['kind']} {item['node']} was re-created because {cause}"
         f" ({_RECOVERY_COST.get(item['kind'], 'it was rebuilt')})"
     )
 

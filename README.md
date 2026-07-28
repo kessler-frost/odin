@@ -583,13 +583,15 @@ prose explanation of a failure, and the evidence it reads is still there in
   forwards to a real backing or answers from its own per-service model store. EC2,
   VPC, SG, IAM, ECR, Lambda and ECS have no open-source AWS API to borrow, so odin
   owns the model and binds it to a real substrate.
-- **Translation** (`src/odin/agent/`) is deterministic in both directions and, as
-  of v0.8.4, covers the same KINDS in both: canvas → Terraform builds 18, and
-  Terraform → canvas reads all 18 back across 24 resource types, so odin's own
-  `main.tf` round-trips with nothing unsupported. Anything odin does not model at
-  all is a LISTED unsupported entry rather than a silent omission, so an import
-  tells you exactly what it could not take. Equal coverage is **not lossless**
-  though — three things a round trip still costs are in Known limits.
+- **Translation** (`src/odin/agent/`) is deterministic in both directions and
+  covers the same NODE KINDS in both: canvas → Terraform builds 18, and
+  Terraform → canvas reads all 18 back across 24 resource types. Anything odin
+  does not model is a LISTED unsupported entry rather than a silent omission.
+  Equal node coverage is **not lossless**, and the sharpest gap is edges:
+  **a drawn IAM permission never reaches the Terraform at all.** It is enforced —
+  by odin's gateway, from the canvas — but `odin translate` says so on stderr
+  rather than letting you discover it, because that file handed to real AWS
+  grants nothing. See Known limits.
   **Runtime:** real containers via Colima (default) or inside a Lima VM
   (`src/odin/runtime/`), and a real Lima VM per EC2 node (`src/odin/compute/`).
 - **Control loop:** a Spec Store (Stack = desired, World = observed) with a pure,
@@ -607,6 +609,15 @@ prose explanation of a failure, and the evidence it reads is still there in
   `s3`, `sqs`, `sns`, `dynamodb`, `rds`, `vpc`, `subnet` only — and a
   live-imported RDS arrives with odin's default password, because no AWS API
   returns a master password.
+- **A drawn IAM edge is not in the generated Terraform.** Permissions you draw
+  are enforced by odin's gateway, which compiles them from the canvas and denies
+  any call without a matching grant — but nothing about them is written into
+  `main.tf`. Two consequences worth knowing: `odin translate > main.tf` taken to
+  real AWS gives that workload no permissions, and a canvas round-tripped through
+  Terraform comes back with no edges. `odin translate` prints
+  `not in this file: <src> -> <dst> …` on stderr for each one, and the round-trip
+  loss is reported there because an import cannot warn about something that was
+  never in the file it read.
 - **An imported ECS service loses its canvas wiring entirely** — both the
   `${{producer.ATTR}}` env references and the ordering they produced. The
   references are deliberately never written into the generated Terraform (a

@@ -135,13 +135,22 @@ def test_deleting_a_node_takes_its_edges_with_it():
     assert "destroys the real resource" in changes[0]
 
 
-def test_an_iam_edge_carries_its_actions():
+def test_an_iam_edge_carries_its_permissions_under_the_key_the_STACK_reads():
+    """`permissions`, not `actions`.
+
+    This test asserted `actions` until field test 7, which is why it passed while
+    the feature granted nothing: `spec/translate.py::_edge` reads
+    `data["permissions"]`, so an edge under any other key compiles to `perms=()`.
+    Both ends agreed with each other and neither was checked against the thing
+    between them. `test_chat_grants_are_enforceable.py` now asserts the compiled
+    policy, which is the assertion that cannot be fooled this way.
+    """
     canvas, changes, refused = apply_ops(CANVAS, [
         AddEdge(source="thumbnailer", target="uploads", actions=["s3:GetObject", "s3:PutObject"]),
     ])
     assert refused == []
     (edge,) = canvas["edges"]
-    assert edge["data"] == {"edgeType": "iam", "actions": ["s3:GetObject", "s3:PutObject"]}
+    assert edge["data"] == {"edgeType": "iam", "permissions": ["s3:GetObject", "s3:PutObject"]}
     assert "granting s3:GetObject, s3:PutObject" in changes[0]
 
 

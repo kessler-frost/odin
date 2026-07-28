@@ -86,7 +86,7 @@ def test_translate_route_uses_the_env_stack_and_returns_the_result_verbatim(tmp_
     # Release finding #1: binary_files (raw zip bytes) is NEVER in the response.
     assert resp.json() == {
         "files": {"main.tf": "fake"}, "notes": ["hi"], "unsupported": [],
-        "wiring_errors": [], "refined": True,
+        "wiring_errors": [], "not_in_terraform": [], "refined": True,
     }
     assert "binary_files" not in resp.json()
     assert seen_stacks == [stack]

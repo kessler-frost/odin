@@ -366,7 +366,8 @@ def test_for_display_drops_binary_files_and_is_json_serializable():
     # see -- it just must never be mistaken for the coverage list beside it.
     assert display == {
         "files": {"main.tf": "resource {}"}, "notes": ["n"], "unsupported": ["rds"],
-        "wiring_errors": ["web (ecs): env ref ${{ghost.URL}} names 'ghost'"], "refined": True,
+        "wiring_errors": ["web (ecs): env ref ${{ghost.URL}} names 'ghost'"],
+        "not_in_terraform": [], "refined": True,
     }
     json.dumps(display)  # must not raise -- the whole point of the fix
     assert result.binary_files  # the object still carries the bytes /apply-full needs

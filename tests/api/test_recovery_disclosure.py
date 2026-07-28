@@ -213,3 +213,27 @@ async def test_the_rds_claim_matches_what_converge_db_instances_really_spawns(tm
     assert len(spawned) == len(claimed), (
         f"the apply claimed {claimed} but converge_db_instances spawned {len(spawned)} re-creates"
     )
+
+
+def test_the_recovery_line_drops_the_sweeps_call_to_action(tmp_path):
+    """Field test 7. The drift sweep ends a verdict with "— re-Apply to
+    recreate", which is right on a crashed node in `/world` and WRONG quoted into
+    a recovery line: the apply has already done it. Measured in the field:
+
+        rds app-db was re-created because container odin-rds-ft-app-db is not
+        running (exit 137) — re-Apply to recreate (its data did not survive ...)
+
+    telling someone to repeat the action they just watched happen.
+    """
+    line = _recovered_line({
+        "kind": "rds", "node": "app-db",
+        "reason": "container odin-rds-ft-app-db is not running (exit 137) — re-Apply to recreate",
+    })
+    assert "is not running (exit 137)" in line, "the CAUSE must survive"
+    assert "re-Apply" not in line, "the advice must not"
+    assert "data did not survive" in line
+
+
+def test_a_reason_without_the_suffix_is_untouched(tmp_path):
+    line = _recovered_line({"kind": "lambda", "node": "worker", "reason": "its container was removed"})
+    assert "because its container was removed (" in line
