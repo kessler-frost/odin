@@ -1370,6 +1370,69 @@ def _unhealthy_line(item: dict) -> str:
     return f"{item['kind']} {item['node']} is {item['observed']} ({reason})"
 
 
+# What a recovery COST, per kind. An rds container holds its data on the
+# container's own writable layer -- `aws/rds.py::PostgresRds.create_db` mounts
+# no volume -- so re-creating it returns an EMPTY database. That is the single
+# most important thing an apply can tell someone, and until v0.8.2 it told them
+# nothing at all.
+_RECOVERY_COST = {
+    "rds": "its data did not survive — the container is new and empty",
+    "lambda": "its execution environment was rebuilt from the deployed code",
+}
+
+
+def _recovered_line(item: dict) -> str:
+    return (
+        f"{item['kind']} {item['node']} was re-created because {item['reason']}"
+        f" ({_RECOVERY_COST.get(item['kind'], 'it was rebuilt')})"
+    )
+
+
+def _recovering_resources(stores: SynthStores, env: str) -> list[dict]:
+    """The lambda/rds resources this apply is ABOUT to re-create, named.
+
+    ## Why an apply that fixes itself still has to say so
+
+    Before v0.8.2 the drift sweep ran only AFTER the converges, so the apply
+    that discovered a dead container never repaired it: `/world` said
+    `crashed — re-Apply to recreate`, and the re-Apply the user was told to run
+    converged nothing. Sweeping FIRST closed that (recovery now takes one apply,
+    measured 302.8s -> 5.9s), but it opened a quieter dishonesty in its place:
+    the apply silently destroyed and rebuilt a container, and for rds that means
+    it silently destroyed a database. A green `applied` is a true statement
+    about the END STATE and a misleading one about what happened on the way --
+    exactly the shape honesty rule 2 is about.
+
+    `tests/simulate/test_false_green_window_e2e.py` originally asserted the
+    opposite contract (fail first, recover on a second apply) precisely to keep
+    that data loss visible; its own words were "no operator should learn about
+    that from a green apply". This is how the recover-in-one behaviour keeps
+    that promise instead of trading it away.
+
+    Read BETWEEN the sweep and the converges, which is the only moment the mark
+    exists: the sweep sets `failed`/`Failed`, and each converge clears it to
+    `creating`/`InProgress` as the first thing it does. Reading later would
+    report nothing; reading earlier would report the last apply's news.
+
+    Scoped to rds and lambda deliberately. Those two are re-created WHOLESALE by
+    an apply because their execution container is not a terraform resource.
+    `ecsctl.converge_services` reconciles ACTIVE services toward a desired count
+    rather than resurrecting a failed record, so it has no equivalent moment to
+    report and is not claimed here.
+    """
+    databases = [
+        {"kind": "rds", "node": r["db_instance_identifier"], "reason": r.get("status_reason") or "it was not running"}
+        for r in rdsctl.records(stores, env)
+        if r["status"] == rdsctl.FAILED
+    ]
+    functions = [
+        {"kind": "lambda", "node": fn["function_name"], "reason": fn.get("state_reason") or "it was not running"}
+        for key, fn in stores.lambdactl.items(env).items()
+        if key.startswith("fn:") and fn["state"] == "Failed" and fn["last_update_status"] != "InProgress"
+    ]
+    return databases + functions
+
+
 def _known_faults(stores: SynthStores, env: str) -> list[dict]:
     """Every lambda/rds fault odin's OWN gateway records already hold for `env`.
 
@@ -1676,6 +1739,9 @@ def create_apply_full_router(
         # raises. That later sweep stays exactly where it is -- it verifies
         # what this one enabled.
         await drift.sweep_compute(stores, env)
+        # Read WHO is broken between the sweep that marks it and the converges
+        # that clear the mark -- this is the only instant both are true.
+        recovering = _recovering_resources(stores, env)
         converging = await ecsctl.converge_services(stores, env, TaskRuntime(), keystore, gateway_port())
         # The same recovery for lambda, and for the same reason: a function's
         # RIE container is its EXECUTION ENVIRONMENT, not a TF resource -- an
@@ -1773,6 +1839,16 @@ def create_apply_full_router(
             # checks that can disagree.
             await drift.sweep_compute(stores, env)
             unhealthy = _known_faults(stores, env)
+            if recovering and not unhealthy:
+                # It WORKED -- and that is exactly why it has to be said out
+                # loud. See `_recovering_resources`: this apply destroyed and
+                # rebuilt a container the user never asked it to touch, and for
+                # rds the data did not come with it.
+                body["recovered_resources"] = recovering
+                body["note"] = (
+                    "desired state applied; "
+                    + "; ".join(map(_recovered_line, recovering))
+                )
             if unhealthy:
                 body["status"] = "applied_resources_unhealthy"
                 body["unhealthy_resources"] = unhealthy
