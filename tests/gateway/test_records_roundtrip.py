@@ -229,21 +229,21 @@ def _synth_env(root: Path) -> SynthStores:
         "sqs:CreateQueue", "jobs", ENV,
         json.dumps({"Attributes": {"VisibilityTimeout": "30"}, "tags": {"odin:node": "jobs"}}).encode(),
         json.dumps({"QueueUrl": "http://127.0.0.1:4100/queue/jobs"}).encode(),
-        stores, "127.0.0.1:5186", NOW,
+        stores, "127.0.0.1:5186", NOW, "", {},
     )
     synth.postprocess(
-        "sqs:DeleteQueue", "old-jobs", ENV, b"{}", b"{}", stores, "127.0.0.1:5186", NOW,
+        "sqs:DeleteQueue", "old-jobs", ENV, b"{}", b"{}", stores, "127.0.0.1:5186", NOW, "", {},
     )
     synth.postprocess(
         "sns:CreateTopic", "events", ENV,
         b"Attributes.entry.1.key=DisplayName&Attributes.entry.1.value=events"
         b"&Tags.member.1.Key=odin%3Anode&Tags.member.1.Value=events",
-        b"<CreateTopicResponse/>", stores, "127.0.0.1:5186", NOW,
+        b"<CreateTopicResponse/>", stores, "127.0.0.1:5186", NOW, "", {},
     )
     synth.postprocess(
         "sns:Unsubscribe", "events", ENV,
         b"SubscriptionArn=arn%3Aaws%3Asns%3Aus-east-1%3A000000000000%3Aevents%3Asub",
-        b"<UnsubscribeResponse/>", stores, "127.0.0.1:5186", NOW,
+        b"<UnsubscribeResponse/>", stores, "127.0.0.1:5186", NOW, "", {},
     )
     return stores
 

@@ -70,6 +70,7 @@ from odin.gateway.models import (
     lambdactl,
     logsctl,
     rdsctl,
+    s3notify,
     secretsctl,
     ssmctl,
 )
@@ -350,6 +351,13 @@ _PURE_HANDLERS: dict[str, _PureHandler] = {
     "dynamodb:ListTagsOfResource": _ddb_list_tags,
     "dynamodb:TagResource": _ddb_tag_resource,
     "dynamodb:UntagResource": _ddb_untag_resource,
+    # The two S3 actions that must NEVER be forwarded: RustFS rejects every
+    # PutBucketNotificationConfiguration ARN form with `InvalidArgument` and
+    # persists the configuration anyway, so a forward makes `apply` fail,
+    # `plan` read clean and nothing fire -- three answers that cannot all be
+    # true (gateway/models/s3notify.py's docstring has the measured probe).
+    "s3:PutBucketNotification": s3notify.put_notification,
+    "s3:GetBucketNotification": s3notify.get_notification,
 }
 
 
@@ -424,7 +432,16 @@ async def pure_answer(
     deliberately is not: rules and targets are stored and round-trip for tofu,
     and `PutEvents` returns an error naming the missing dispatcher rather than
     an accepted-and-never-delivered `FailedEntryCount: 0` (gateway/models/
-    eventsctl.py)."""
+    eventsctl.py).
+    `s3:PutBucketNotification`/`s3:GetBucketNotification` are the ONE pair of
+    S3 actions that are synth-owned (`gateway/models/s3notify.py`, in
+    `_PURE_HANDLERS` below): S3 otherwise forwards wholesale to RustFS, but
+    RustFS was measured rejecting every notification ARN form with
+    `InvalidArgument` while persisting the configuration anyway -- so a forward
+    makes `tofu apply` FAIL, the next `plan` read CLEAN, and nothing ever FIRE.
+    Being pure is what makes those three answers one answer. The module refuses
+    an SQS/SNS target outright rather than storing a trigger odin cannot
+    deliver."""
     # EVERY model's `pure_answer` is a coroutine, including the JSON-sidecar
     # ones that await nothing, so every branch here is a plain `await` (v0.7.7).
     # That uniformity is the guard: while some models were coroutines and some
@@ -468,7 +485,7 @@ async def pure_answer(
 # --- postprocess: forwarded for real, then observed/reshaped ----------------
 
 
-def _sqs_create_queue(resource: str, env: str, request_body: bytes, response_body: bytes, stores: SynthStores, gateway_host: str, now: float) -> bytes:
+def _sqs_create_queue(resource: str, env: str, request_body: bytes, response_body: bytes, stores: SynthStores, gateway_host: str, now: float, path: str, query: dict[str, str]) -> bytes:
     request = json.loads(request_body or b"{}")
     payload = json.loads(response_body)
     payload["QueueUrl"] = _rewrite_host(payload.get("QueueUrl", ""), gateway_host)
@@ -479,21 +496,21 @@ def _sqs_create_queue(resource: str, env: str, request_body: bytes, response_bod
     return json.dumps(payload).encode()
 
 
-def _sqs_delete_queue(resource: str, env: str, request_body: bytes, response_body: bytes, stores: SynthStores, gateway_host: str, now: float) -> bytes:
+def _sqs_delete_queue(resource: str, env: str, request_body: bytes, response_body: bytes, stores: SynthStores, gateway_host: str, now: float, path: str, query: dict[str, str]) -> bytes:
     state = stores.sqs_queues.get(env, resource, {"attributes": {}, "deleted_at": None})
     state["deleted_at"] = now
     stores.sqs_queues.set(env, resource, state)
     return response_body
 
 
-def _sns_create_topic(resource: str, env: str, request_body: bytes, response_body: bytes, stores: SynthStores, gateway_host: str, now: float) -> bytes:
+def _sns_create_topic(resource: str, env: str, request_body: bytes, response_body: bytes, stores: SynthStores, gateway_host: str, now: float, path: str, query: dict[str, str]) -> bytes:
     params = dict(parse_qsl(request_body.decode("utf-8")))
     stores.sns_topics.set(env, resource, _parse_map(params, "Attributes"))
     stores.tags.set(env, _tags_key("sns", resource), _tags_from_structs(_parse_struct_list(params, "Tags")))
     return response_body
 
 
-def _sns_fix_subscription_attributes(resource: str, env: str, request_body: bytes, response_body: bytes, stores: SynthStores, gateway_host: str, now: float) -> bytes:
+def _sns_fix_subscription_attributes(resource: str, env: str, request_body: bytes, response_body: bytes, stores: SynthStores, gateway_host: str, now: float, path: str, query: dict[str, str]) -> bytes:
     """goaws's LIVE GetSubscriptionAttributes answer includes an entry like
     `FilterPolicy = "null"` (the literal 4-char string) for every optional
     attribute nobody set -- verified against goaws's own wire response.
@@ -507,7 +524,7 @@ def _sns_fix_subscription_attributes(resource: str, env: str, request_body: byte
     return re.sub(rb"<entry><key>[^<]+</key><value>null</value></entry>", b"", response_body)
 
 
-def _sns_unsubscribe(resource: str, env: str, request_body: bytes, response_body: bytes, stores: SynthStores, gateway_host: str, now: float) -> bytes:
+def _sns_unsubscribe(resource: str, env: str, request_body: bytes, response_body: bytes, stores: SynthStores, gateway_host: str, now: float, path: str, query: dict[str, str]) -> bytes:
     params = dict(parse_qsl(request_body.decode("utf-8")))
     subscription_arn = params.get("SubscriptionArn", "")
     if subscription_arn:
@@ -515,13 +532,13 @@ def _sns_unsubscribe(resource: str, env: str, request_body: bytes, response_body
     return response_body
 
 
-def _ddb_create_table(resource: str, env: str, request_body: bytes, response_body: bytes, stores: SynthStores, gateway_host: str, now: float) -> bytes:
+def _ddb_create_table(resource: str, env: str, request_body: bytes, response_body: bytes, stores: SynthStores, gateway_host: str, now: float, path: str, query: dict[str, str]) -> bytes:
     request = json.loads(request_body or b"{}")
     stores.tags.set(env, _tags_key("dynamodb", resource), _tags_from_structs(request.get("Tags", [])))
     return response_body
 
 
-_PostprocessHandler = Callable[[str, str, bytes, bytes, SynthStores, str, float], bytes]
+_PostprocessHandler = Callable[[str, str, bytes, bytes, SynthStores, str, float, str, dict[str, str]], bytes]
 
 _POSTPROCESS_HANDLERS: dict[str, _PostprocessHandler] = {
     "sqs:CreateQueue": _sqs_create_queue,
@@ -530,6 +547,13 @@ _POSTPROCESS_HANDLERS: dict[str, _PostprocessHandler] = {
     "sns:Unsubscribe": _sns_unsubscribe,
     "sns:GetSubscriptionAttributes": _sns_fix_subscription_attributes,
     "dynamodb:CreateTable": _ddb_create_table,
+    # S3 bucket notifications: every successful object write is matched against
+    # the bucket's stored configurations and ENQUEUED for the tick-driven
+    # dispatcher (gateway/models/s3notify.py). Deliberately not an invoke --
+    # this function is synchronous and cannot await, and a real S3 notification
+    # is asynchronous anyway.
+    "s3:PutObject": s3notify.enqueue_put_object,
+    "s3:DeleteObject": s3notify.enqueue_delete_object,
 }
 
 
@@ -539,12 +563,22 @@ def is_postprocess_action(action: str) -> bool:
 
 def postprocess(
     action: str, resource: str, env: str, request_body: bytes, response_body: bytes,
-    stores: SynthStores, gateway_host: str, now: float,
+    stores: SynthStores, gateway_host: str, now: float, path: str, query: dict[str, str],
 ) -> bytes:
     """The (possibly rewritten) response body for a POSTPROCESS action --
     called only after a successful (<300) forward. `gateway_host` is the
     caller's own arrival `Host` header, so a rewritten QueueUrl re-dials
     through whichever path (container docker-host-gateway alias, or a
     host-side tofu process on 127.0.0.1) reached the gateway in the first
-    place, matching research's "rewrite to the gateway's own host:port"."""
-    return _POSTPROCESS_HANDLERS[action](resource, env, request_body, response_body, stores, gateway_host, now)
+    place, matching research's "rewrite to the gateway's own host:port".
+
+    `path` and `query` are the request's RAW target and its already-parsed
+    query dict, and they are here even though `resource` exists because
+    `classify` REDUCES an S3 request to its BUCKET -- the object key survives
+    only in the path, and the four distinct wire shapes that all classify to
+    `s3:PutObject` (a plain write, CreateMultipartUpload, UploadPart,
+    CompleteMultipartUpload) are told apart only by the query. Without them the
+    S3-notification hook would enqueue an empty key and fire once per uploaded
+    PART; see `s3notify._writes`, which is where that is worked out. Do not
+    tidy them away because the other five handlers ignore them."""
+    return _POSTPROCESS_HANDLERS[action](resource, env, request_body, response_body, stores, gateway_host, now, path, query)
