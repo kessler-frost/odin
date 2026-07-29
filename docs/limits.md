@@ -136,16 +136,21 @@ They are listed because finding one by surprise is worse than reading it here.
   backings and the prune, and reads a cached drift result instead of sweeping. ECS
   stays genuinely live because its task sweep runs on every one of those ticks;
   EC2, Lambda and RDS drift can be up to one sweep cadence stale for the duration.
-- **A drawn edge carries a modelled TYPE for only 40 of the 378 kind pairs.**
+- **A drawn edge carries a modelled TYPE for only 41 of the 378 kind pairs.**
   Since v0.8.14 every ordered pair of node kinds resolves to exactly one edge
-  type, and the honest majority answer is `unmodelled` — 338 of the 378 unordered
+  type, and the honest majority answer is `unmodelled` — 337 of the 378 unordered
   pairs, drawn as a grey line labelled *Not modelled*, stored in the Stack and
-  read by nothing. It was called `network` until now, which was a claim about
+  read by nothing. It was called `network` until then, which was a claim about
   layer 3 that odin never checked. The pairs that do mean something: `iam`
   (35 pairs, a real policy), `sg` (2, security-group membership), `role`
-  (`iam_role ↔ lambda`), `target` (`alb ↔ ecs`, and `alb ↔ ec2` since v0.8.15)
-  and `subscription`
-  (`sns ↔ sqs`). Drawing anything else is decoration, and now says so.
+  (`iam_role ↔ lambda`), `target` (2 — `alb ↔ ecs`, and `alb ↔ ec2` since
+  v0.8.15) and `subscription` (`sns ↔ sqs`). Drawing anything else is
+  decoration, and now says so.
+  These counts are not prose: `ui/src/lib/edge-types.test.ts` recomputes them
+  from the real registry and fails if this paragraph disagrees. They went stale
+  within a day of being written — `alb ↔ ec2` moved one pair out of `unmodelled`
+  and the numbers here still read 40/338 — which is the whole argument for
+  measuring them from a test rather than trusting a careful writer.
 - **An edge's TYPE is not always the whole of what it does.** Three pairs
   carry a second meaning on top of the grant, added in v0.8.15 because a
   permission whose subject is not wired is the same decoration under a
@@ -213,20 +218,25 @@ They are listed because finding one by surprise is worse than reading it here.
   `unsupported` — the function is built and applied perfectly well): odin's
   Lambda substrate packages the node's code as a zip and runs it in an AWS RIE
   container, so `package_type = "Image"` is not modelled at all.
-- **The ECR image-layer grants are PORTABLE, not enforced — and odin no longer
-  ticks them for you.** `ecr:BatchGetImage`, `GetDownloadUrlForLayer` and
-  `BatchCheckLayerAvailability` gate nothing locally, for two independent
-  reasons: `gateway/models/ecr.py::_HANDLERS` has no entry for any of them (an
-  arriving request gets `InvalidAction` 400), *and* the image bytes never arrive
-  at all — ECR's data plane is a real `registry:2` container a docker client
-  dials directly, and the gateway does not proxy the registry v2 protocol.
-  `defaultPermissions.ecr` is therefore `['ecr:GetAuthorizationToken']` alone,
-  that being the one ECR action odin can answer and so actually gate. The three
-  layer verbs stay *tickable*, because the generated Terraform is meant to be
-  portable and on real AWS they are exactly right — they are simply not a local
-  control. `tests/gateway/test_ecr_vocabulary_has_handlers.py` pins it in both
-  directions, so implementing one of them fails the build until the catalog
-  stops calling it decorative.
+- **Three of the five tickable ECR permissions gate nothing locally.**
+  `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer` and
+  `ecr:BatchCheckLayerAvailability` are offered on an ECR edge and enforced by
+  nothing, for two *independent* reasons. `gateway/models/ecr.py::_HANDLERS` has
+  no entry for any of them, so a request naming one gets `InvalidAction` 400 —
+  being *classifiable* is not being *answerable*, and `_classify_ecr` will
+  happily emit `ecr:BatchGetImage` from `x-amz-target`, which is what made this
+  look enforced for so long. And the image bytes never reach the gateway at all:
+  odin does not proxy the registry's v2 protocol, so a real `docker pull` dials
+  the `registry:2` container's published port directly and no IAM decision is
+  ever taken over it. Only **`ecr:GetAuthorizationToken`** (the docker-login
+  step) genuinely bites, and it is the only one odin ticks for you.
+  The other three stay tickable on purpose — a drawn permission becomes a real
+  `aws_iam_role_policy`, and taken to Amazon those are exactly the verbs a pull
+  needs — so treat them as portable configuration, not as a local control. The
+  split is pinned both ways by
+  `tests/gateway/test_ecr_vocabulary_has_handlers.py`: a newly offered op with no
+  handler fails, and so does one of these three *gaining* a handler, so this
+  paragraph cannot quietly outlive its own fix.
 - **An `alb ↔ ec2` edge registers a real target.** Since v0.8.15 the builder's
   `_ALB_TARGET_KINDS` is `("ecs", "ec2")` and the edge emits an
   `aws_lb_target_group_attachment` naming `aws_instance.<n>.id` — the form
