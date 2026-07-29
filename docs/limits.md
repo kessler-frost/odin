@@ -143,20 +143,17 @@ They are listed because finding one by surprise is worse than reading it here.
   read by nothing. It was called `network` until now, which was a claim about
   layer 3 that odin never checked. The pairs that do mean something: `iam`
   (35 pairs, a real policy), `sg` (2, security-group membership), `role`
-  (`iam_role ↔ lambda`), `target` (`alb ↔ ecs`, and since v0.8.15 `alb ↔ ec2`
-  too) and `subscription` (`sns ↔ sqs`). Drawing anything else is decoration,
-  and now says so.
-  Three of those pairs carry a SECOND meaning on top of the grant, added in
-  v0.8.15 because a permission whose subject is not wired is the same
-  decoration under a colour: `logs ↔ lambda|ecs` decides which group the
-  workload's output lands in, and `ecr ↔ ecs` decides the service's image. Both
-  are described in their own entries below. The edge *type* is unchanged for
-  all three — they stay `iam` — because the passes that read them key on the
-  two NODE kinds.
-  **Stale until `ui/src/lib/iam.ts` catches up:** `albTargetTypes` there is
-  still `new Set(['ecs'])`, so the UI labels an `alb ↔ ec2` line *Not modelled*
-  while tofu registers a real target for it. Presentational only — the
-  generated Terraform is correct either way — but the label is wrong today.
+  (`iam_role ↔ lambda`), `target` (`alb ↔ ecs`) and `subscription`
+  (`sns ↔ sqs`). Drawing anything else is decoration, and now says so.
+- **An edge's TYPE is not always the whole of what it does.** Three pairs
+  carry a second meaning on top of the grant, added in v0.8.15 because a
+  permission whose subject is not wired is the same decoration under a
+  different colour: `logs ↔ lambda|ecs` decides which group the workload's
+  output lands in, `ecr ↔ ecs` decides the service's image, and `alb ↔ ec2`
+  registers a real load-balancer target. Their type is unchanged — the first
+  two stay `iam` — because the passes that read them key on the two NODE
+  kinds and never on `edge.kind`. Each is documented in its own entry below;
+  none of them is inferable from the label the canvas draws.
 - **A Log Group drawn as a workload's sink is created under the WORKLOAD's
   name, not the node's label.** odin's two log shippers write to a name derived
   from the workload and read no destination from anywhere:
@@ -209,6 +206,15 @@ They are listed because finding one by surprise is worse than reading it here.
   the registry v2 protocol at all (`gateway/models/ecr.py`'s own docstring). So
   an ECR permission edge is enforced by nothing. Open; it is a catalog change
   in `ui/src/lib/iam.ts`, not a translator one.
+- **An `alb ↔ ec2` edge registers a real target, and the UI has not caught up.**
+  Since v0.8.15 the builder's `_ALB_TARGET_KINDS` is `("ecs", "ec2")` and the
+  edge emits an `aws_lb_target_group_attachment` naming `aws_instance.<n>.id` —
+  the form `elbv2ctl._target_host` resolves through the EC2-compute store to the
+  VM's real address. **`ui/src/lib/iam.ts::albTargetTypes` is still
+  `new Set(['ecs'])`**, so the canvas labels that line *Not modelled* while tofu
+  registers a live target for it. Presentational only — the generated Terraform
+  is correct either way — but the two disagree on `develop` today, and the fix
+  is that one-line set.
 - **A lambda cannot be a load-balancer target.** `alb ↔ lambda` is declined with
   the reason rather than silently ignored: odin's load-balancer substrate is a
   real nginx container whose upstreams are `host:port` (`compute/proxy.py`), and
