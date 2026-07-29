@@ -157,38 +157,46 @@ describe('who the principal is, when a producer is also an IAM target', () => {
   });
 });
 
-describe('the two decorative defaults this replaces', () => {
-  it('rds no longer defaults to a grant the gateway cannot evaluate', () => {
+describe('the two decorative DEFAULTS this replaces', () => {
+  // The distinction that took two agents disagreeing to get right. `edge-registry`
+  // drew it for ecr; this file had deleted the actions outright, which was worse.
+  //
+  // TICKABLE and DEFAULT are different promises. A drawn permission becomes a real
+  // `aws_iam_role_policy`, and the generated Terraform is meant to be portable --
+  // taken to Amazon, `rds-db:connect` is exactly what IAM DB auth needs. A
+  // DEFAULT is what odin ticks FOR you, and ticking something odin cannot enforce
+  // is odin claiming a protection it has not got. So the fix is to un-tick, not
+  // to delete.
+  it('rds no longer DEFAULTS to a grant the gateway cannot evaluate', () => {
     // `classify.py` emits `rds:<Action>` and nothing else, so no request can
     // ever carry `rds-db:connect` to `evaluate`.
     expect(defaultPermissions.rds).toEqual(['rds:DescribeDBInstances']);
-    expect(iamActionsForTarget.rds).not.toContain('rds-db:connect');
-    expect(defaultPermissions.rds.every((a) => a.startsWith('rds:'))).toBe(true);
+    expect(defaultPermissions.rds).not.toContain('rds-db:connect');
   });
 
-  it('no offered action anywhere uses the rds-db service prefix', () => {
-    // The generalisation: `rds-db:` is a whole namespace odin cannot classify,
-    // so any action in it is decorative wherever it appears. Pinned across the
-    // WHOLE vocabulary rather than the one entry that had it, which is the
-    // "fix the SHAPE not the instance" rule.
-    const offered = Object.values(iamActionsForTarget).flat();
-    expect(offered.filter((a) => a.startsWith('rds-db:'))).toEqual([]);
+  it('...but keeps it TICKABLE, because the generated file has to be portable', () => {
+    // Deleting it would make odin's Terraform unable to express a thing real AWS
+    // does. The honest position is to offer it and not pre-tick it.
+    expect(iamActionsForTarget.rds).toContain('rds-db:connect');
   });
 
-  it('ecr offers only ops the gateway has a handler for', () => {
-    // `gateway/models/ecr.py::_HANDLERS` answers seven ops. The three that were
-    // removed -- BatchGetImage, GetDownloadUrlForLayer, BatchCheckLayerAvailability
-    // -- are the DATA plane, which `docker push`/`pull` reaches on the
-    // registry:2 container's own published port, never through the gateway.
-    const handled = new Set([
-      'CreateRepository', 'DescribeRepositories', 'DeleteRepository',
-      'ListTagsForResource', 'TagResource', 'UntagResource', 'GetAuthorizationToken',
-    ]);
-    const offeredOps = iamActionsForTarget.ecr
-      .map((a) => a.split(':')[1])
-      .filter((op) => op !== '*');
-    expect(offeredOps.filter((op) => !handled.has(op))).toEqual([]);
+  it('nothing odin ticks FOR you is in a prefix the classifier cannot emit', () => {
+    // The generalisation, and the shape rather than the instance: a DEFAULT must
+    // always be enforceable, whatever service it belongs to. `rds-db:` is the
+    // only unclassifiable prefix in the vocabulary today, and this catches the
+    // next one too.
+    const defaulted = Object.values(defaultPermissions).flat();
+    expect(defaulted.filter((a) => a.startsWith('rds-db:'))).toEqual([]);
+  });
+
+  it('ecr defaults to the one op the gateway has a handler for', () => {
+    // `gateway/models/ecr.py::_HANDLERS` answers seven ops, and the three
+    // image-layer verbs are in none of them -- they are the DATA plane, which
+    // `docker push`/`pull` reaches on the registry:2 container's own published
+    // port, never through the gateway. They stay offered and stay un-ticked;
+    // `tests/gateway/test_ecr_vocabulary_has_handlers.py` is the Python half.
     expect(defaultPermissions.ecr).toEqual(['ecr:GetAuthorizationToken']);
+    expect(iamActionsForTarget.ecr).toContain('ecr:BatchGetImage');
   });
 });
 

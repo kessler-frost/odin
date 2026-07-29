@@ -136,15 +136,24 @@ They are listed because finding one by surprise is worse than reading it here.
   backings and the prune, and reads a cached drift result instead of sweeping. ECS
   stays genuinely live because its task sweep runs on every one of those ticks;
   EC2, Lambda and RDS drift can be up to one sweep cadence stale for the duration.
-- **A drawn edge means something to odin for 40 of the 378 kind pairs.**
-  The honest majority answer is `unmodelled` — 338 of the 378 unordered pairs,
+- **A drawn edge carries a modelled TYPE for only 41 of the 378 kind pairs.**
+  The honest majority answer is `unmodelled` — 337 of the 378 unordered pairs,
   drawn as a grey line labelled *Not modelled*, stored in the Stack and read by
   nothing. It was called `network` until v0.8.14, which was a claim about layer 3
-  that odin never checked. Measured over the real 27 canvas kinds, the pairs that
-  do mean something: `iam` alone (31 pairs, a real policy), `connection` **and**
-  `iam` together (4), `sg` (2, security-group membership), `role`
-  (`iam_role ↔ lambda`), `target` (`alb ↔ ecs`) and `subscription`
-  (`sns ↔ sqs`). Drawing anything else is decoration, and now says so.
+  that odin never checked. Re-measured 2026-07-29 over the real 27 canvas kinds,
+  the pairs that do mean something: `iam` alone (31, a real policy), `connection`
+  **and** `iam` together (4), `sg` (2, security-group membership), `target`
+  (2 — `alb ↔ ecs`, and since v0.8.15 `alb ↔ ec2`), `role` (`iam_role ↔ lambda`)
+  and `subscription` (`sns ↔ sqs`). Drawing anything else is decoration, and now
+  says so.
+  Three more pairs carry a SECOND meaning on top of the grant, added in
+  v0.8.15 because a permission whose subject is not wired is the same
+  decoration under a colour: `logs ↔ lambda|ecs` decides which group the
+  workload's output lands in, and `ecr ↔ ecs` decides the service's image. Both
+  are described in their own entries below. The edge *type* is unchanged for
+  all three — they stay `iam` — because the passes that read them key on the
+  two NODE kinds. `connection` is the one that does get its own type, because
+  unlike those it is a meaning a user has to CHOOSE (see the next entry).
 - **Four kind pairs mean two things at once, and odin asks.** `rds` and
   `elasticache` against `ecs` and `lambda` — 8 ordered pairs — are simultaneously
   a `connection` (the workload's environment is wired to the endpoint) and an
@@ -219,19 +228,23 @@ They are listed because finding one by surprise is worse than reading it here.
   `docker push`/`pull` dials on its own published port, which never passes
   through odin's gateway at all, and that registry runs auth-less by design. So
   an IAM edge to an `ecr` node cannot stop anyone pulling the image.
-  Until v0.8.15 the tile offered `ecr:BatchGetImage`,
-  `ecr:GetDownloadUrlForLayer` and `ecr:BatchCheckLayerAvailability` — three of
-  its five actions, none of which has a handler in
-  `gateway/models/ecr.py::_HANDLERS` and none of which any request could reach.
-  They were removed on the rule kms and kinesis are already held to: a
-  permission odin can neither enforce nor reach is a promise the engine cannot
-  keep, and offering it is worse than offering nothing.
-- **There is no IAM database authentication, so `rds-db:connect` is gone.**
+  `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer` and
+  `ecr:BatchCheckLayerAvailability` have no handler in
+  `gateway/models/ecr.py::_HANDLERS` and no request could reach them anyway. They
+  are still TICKABLE, because the generated Terraform is meant to be portable and
+  on real AWS these are exactly the verbs a pull needs — but they stopped being
+  PRE-TICKED in v0.8.15, since a default is what odin ticks for you and must not
+  assert a protection odin has not got. The distinction is kept honest by
+  `tests/gateway/test_ecr_vocabulary_has_handlers.py`, which fails both if an
+  offered op has no handler and no `PORTABLE_ONLY` declaration, and if a
+  `PORTABLE_ONLY` op ever gains one.
+- **There is no IAM database authentication, so `rds-db:connect` gates nothing.**
   `gateway/classify.py` builds every rds action as `rds:<Action>` out of the
   query protocol's `Action` param, so the `rds-db:` prefix is unreachable and a
   policy granting it could never match. Nothing in odin consults IAM when a
   workload opens a Postgres connection — the container takes the password out of
-  `DATABASE_URL`. The action was the DEFAULT a drawn `rds` edge ticked until
+  `DATABASE_URL`. It stays TICKABLE for the same portability reason ECR's layer
+  verbs do, and it stopped being the DEFAULT a drawn `rds` edge ticks in
   v0.8.15; the default is now `rds:DescribeDBInstances`, which is classified and
   enforced, and what a user drawing that line usually wants is the `connection`
   edge above.

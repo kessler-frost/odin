@@ -19,36 +19,34 @@ export const iamActionsForTarget: Record<string, string[]> = {
 export const defaultPermissions: Record<string, string[]> = {
   s3: ['s3:GetObject', 's3:PutObject'],
   lambda: ['lambda:Invoke'],
-  // v0.8.15: was ['ecr:GetAuthorizationToken', 'ecr:BatchGetImage']. Only the
-  // first of those can ever be evaluated. `gateway/models/ecr.py::_HANDLERS`
-  // answers seven ops -- Create/Describe/DeleteRepository, the three tag ops,
-  // and GetAuthorizationToken -- and `BatchGetImage` is not among them, because
-  // ECR's DATA plane is a real `registry:2` container that `docker push`/`pull`
-  // dials on its own published port, never through odin's gateway (that module's
-  // docstring: "the gateway does NOT proxy the registry's v2 HTTP protocol").
-  // So a BatchGetImage grant cannot bite -- not because the string is wrong, but
-  // because no request carrying it ever reaches the evaluator.
-  //
-  // The catalog's `iamActions` list kept three such ops for the same reason and
-  // is trimmed in the same change; see the note there. Login IS gateway-served,
-  // so the one action left is the one that does something.
+  // `ecr:BatchGetImage` was ticked here by default and gates NOTHING locally.
+  // Two independent reasons, both measured: `gateway/models/ecr.py::_HANDLERS`
+  // has no `BatchGetImage` entry (the gateway answers `InvalidAction` 400), and
+  // the image bytes never reach the gateway in the first place -- ecr.py's own
+  // docstring: "The gateway does NOT proxy the registry's v2 HTTP protocol in
+  // this slice", a real `docker pull` dials the `registry:2` container's port
+  // directly. `GetAuthorizationToken` (the docker-login step) is the one ECR
+  // action odin can actually answer and therefore actually gate, so it is the
+  // only one odin ticks FOR you. The rest stay TICKABLE in the catalog because
+  // the generated Terraform is meant to be portable -- see the note there.
   ecr: ['ecr:GetAuthorizationToken'],
   ecs: ['ecs:RunTask', 'ecs:DescribeTasks'],
   dynamodb: ['dynamodb:GetItem', 'dynamodb:PutItem'],
   sqs: ['sqs:SendMessage', 'sqs:ReceiveMessage'],
   sns: ['sns:Publish'],
-  // v0.8.15: was ['rds-db:connect'], which the gateway can never evaluate.
-  // `classify.py::_classify_rds` builds `rds:<Action>` from the query
-  // protocol's `Action` param, so the only strings it can ever emit are
-  // `rds:*` -- `rds-db:` is a different service prefix entirely and no request
-  // is classified into it. The action names IAM database authentication, a
-  // thing odin does not implement: the Postgres container takes the password
-  // in `DATABASE_URL` and nothing consults IAM.
+  // `rds-db:connect` was ticked here by default and is the SAME defect as ecr's,
+  // one step worse: `classify.py` builds every rds action as `rds:<Action>` out
+  // of the query protocol's `Action` param, so `rds-db:` is a prefix the
+  // classifier cannot even EMIT, let alone answer. odin implements no IAM
+  // database authentication -- the Postgres container takes its password out of
+  // `DATABASE_URL` and consults nobody.
   //
-  // What a user drawing rds -> workload actually wants is now its own edge type
-  // (`connection`, below), which authors that `DATABASE_URL`. The IAM meaning
-  // survives for the workloads that really do call the RDS control plane, with
-  // the one default that is genuinely classified and enforced.
+  // Same split as ecr's, for the same reason: it stays TICKABLE in the catalog
+  // because the generated Terraform is meant to be portable, and stops being
+  // pre-ticked because a default is what odin ticks FOR you. What is left is the
+  // one rds action that really is classified and really is enforced -- and what
+  // a user drawing rds -> workload usually wants is the `connection` edge below,
+  // which authors that `DATABASE_URL`.
   rds: ['rds:DescribeDBInstances'],
   // W2.1: what a workload actually needs to WRITE to a log group it's edged
   // to. The read verbs (GetLogEvents/FilterLogEvents/DescribeLogStreams) are
@@ -86,7 +84,11 @@ export const defaultPermissions: Record<string, string[]> = {
 // `iamActionsForTarget` above is what stops the IAM loop from claiming the pair
 // first. Pass 1.5 reads the two NODE kinds and not `edge.kind`, so the type is
 // presentational and naming it changed nothing about what gets built.
-export const albTargetTypes = new Set(['ecs']);
+// ec2 joined in v0.8.15, the same change that taught `hcl.py` to emit an
+// `aws_lb_target_group_attachment` for an instance. The two lists are pinned
+// against each other by tests/spec/test_edge_registry_matches_builders.py --
+// which is what caught this line being one merge behind, naming the side.
+export const albTargetTypes = new Set(['ecs', 'ec2']);
 
 // Compute kinds act as IAM principals; permission edges run compute → resource.
 // The app-workload kinds (service/dep/batch/llm) are parked (see NORTHSTAR.md,

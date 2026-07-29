@@ -167,21 +167,26 @@ export const CATALOG: ServiceDef[] = [
       password: 'apppass123', securityGroups: '', arn: '',
     },
     primary: { key: 'engine', label: 'Engine' },
-    // v0.8.15: `rds-db:connect` was the FIRST entry here and the default a drawn
-    // edge ticked, and the gateway can never evaluate it. `classify.py` builds
-    // `rds:<Action>` from the query protocol's `Action` param, so every string it
-    // can emit starts `rds:`; `rds-db:` is a different service prefix and no
-    // request is classified into it. classify.py's own prose asserted the
-    // opposite ("compiles to a statement the gateway enforces") and is corrected
-    // in the same change. IAM database authentication is not a thing odin
-    // implements at all -- the Postgres container takes the password out of
-    // DATABASE_URL and consults nothing.
+    // `rds-db:connect` is TICKABLE and is no longer the DEFAULT, which is the
+    // same split the ecr block below draws and for the same two reasons.
     //
-    // Connecting to a database is now its own edge type (`connection` in
-    // ui/src/lib/iam.ts), which authors that DATABASE_URL instead of granting a
-    // permission nobody checks. What stays here is the rds CONTROL plane, which
-    // really is classified and really is enforced.
-    iamActions: ['rds:DescribeDBInstances', 'rds:*'],
+    // It cannot bite locally, and unlike ecr's layer verbs it cannot even be
+    // CLASSIFIED: `classify.py` builds every rds action as `rds:<Action>` out of
+    // the query protocol's `Action` param, so every string it can emit starts
+    // `rds:` and `rds-db:` is a different service prefix entirely. odin
+    // implements no IAM database authentication at all -- the Postgres container
+    // takes its password out of `DATABASE_URL` and consults nobody. classify.py's
+    // own prose asserted the opposite ("compiles to a statement the gateway
+    // enforces") and is corrected in the same change.
+    //
+    // It stays here because the generated Terraform is meant to be portable, and
+    // taken to Amazon this is exactly the action IAM DB auth needs. It stops
+    // being PRE-TICKED (`iam.ts::defaultPermissions` now offers
+    // `rds:DescribeDBInstances`) because ticking something FOR the user that odin
+    // cannot enforce is odin claiming a protection it has not got -- and what the
+    // user drawing rds -> workload usually wants is the `connection` edge, which
+    // authors that `DATABASE_URL` instead of granting a permission nobody checks.
+    iamActions: ['rds-db:connect', 'rds:DescribeDBInstances', 'rds:*'],
   },
   // elasticache (W2.8) is a REAL, gateway-modeled service (NORTHSTAR directive
   // 5): the drawn node IS one `aws_elasticache_cluster`, backed by a real
@@ -264,31 +269,34 @@ export const CATALOG: ServiceDef[] = [
     category: 'Storage', color: 'sky', width: 200,
     fields: [{ key: 'label', label: 'Name', editable: true }],
     defaultData: { label: 'new-repo' },
-    // v0.8.15: this list used to be
-    //   ['ecr:GetAuthorizationToken', 'ecr:BatchGetImage',
-    //    'ecr:GetDownloadUrlForLayer', 'ecr:BatchCheckLayerAvailability', 'ecr:*']
-    // above a comment claiming those op names are "what makes the grant bite
-    // rather than decorate". THREE OF THE FIVE could never bite, and the comment
-    // was the reason nobody checked: `gateway/models/ecr.py::_HANDLERS` answers
-    // seven ops -- CreateRepository, DescribeRepositories, DeleteRepository,
-    // ListTagsForResource, TagResource, UntagResource, GetAuthorizationToken --
-    // and the three image-layer ops are in none of them. They are the DATA
-    // plane, and ecr.py's own docstring says the gateway does not proxy it: "a
-    // real `docker push`/`pull` dials the registry's published port directly".
-    // No request carrying `ecr:BatchGetImage` ever reaches `evaluate`.
+    // ONLY `ecr:GetAuthorizationToken` bites locally. The comment here used to
+    // say the opposite -- that `_classify_ecr` building `ecr:<op>` from
+    // `x-amz-target` "is what makes the grant bite rather than decorate" -- and
+    // that was wrong twice over, in the direction this repo's honesty rules
+    // exist for:
     //
-    // The vocabulary test could not catch it either, and that is worth writing
-    // down: ECR is a TARGET-derived service, so it only checks the `ecr:` prefix
-    // against `classify.py`'s dispatch -- correctly, since any op a real SDK
-    // sends is emittable. Whether a HANDLER exists is a second question, and the
-    // answer for the pull path is "no handler, and no request either".
+    //   * `gateway/models/ecr.py::_HANDLERS` has SEVEN entries, and the three
+    //     layer verbs below are not among them: the gateway answers
+    //     `InvalidAction` 400. Classifiable is not the same as answerable.
+    //   * The image bytes never reach the gateway at all. ecr.py's docstring:
+    //     "The gateway does NOT proxy the registry's v2 HTTP protocol in this
+    //     slice" -- a real `docker pull` dials the `registry:2` container's
+    //     published port directly, `repositoryUri` merely making it findable.
+    //     Nothing in `src/odin` ever sends any of the three (grep: zero hits).
     //
-    // What is left is what the gateway really serves and a workload really
-    // calls: log in, and look the repository up. Same rule kms and kinesis are
-    // held to -- a permission odin can neither enforce nor reach is a promise
-    // the engine cannot keep, and offering it is worse than offering nothing.
-    // See docs/limits.md for the pull path's actual gate (there is none).
-    iamActions: ['ecr:GetAuthorizationToken', 'ecr:DescribeRepositories', 'ecr:*'],
+    // It cited `test_iam_vocabulary_is_enforceable.py` as proof, and that test
+    // never checked it: its own docstring says only the SERVICE prefix can be
+    // checked for target-derived services like ecr. So the claim was reviewed,
+    // believed, and pinned by nothing -- honesty rule 1 exactly.
+    // `tests/gateway/test_ecr_vocabulary_has_handlers.py` pins it properly now.
+    //
+    // The three stay TICKABLE rather than deleted because a drawn permission
+    // becomes a real `aws_iam_role_policy` in the generated Terraform, and that
+    // file is meant to be portable: taken to Amazon these are exactly the verbs
+    // an image pull needs. They are not pre-ticked (`iam.ts::defaultPermissions`
+    // offers only `GetAuthorizationToken`), because ticking something FOR the
+    // user that odin cannot enforce is odin claiming a protection it has not got.
+    iamActions: ['ecr:GetAuthorizationToken', 'ecr:BatchGetImage', 'ecr:GetDownloadUrlForLayer', 'ecr:BatchCheckLayerAvailability', 'ecr:*'],
   },
   {
     type: 'route53', abbr: 'DNS', label: 'Route 53 Zone', sublabel: 'Hosted zone (placeholder)',

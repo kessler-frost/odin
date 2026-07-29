@@ -64,24 +64,28 @@ CLASSIFIED_SERVICES = set(re.findall(r'service == "([a-z0-9-]+)"', CLASSIFY)) | 
 # The ops `_LAMBDA_ROUTES` can return, i.e. the only valid `lambda:*` actions.
 LAMBDA_OPS = set(re.findall(r'\),\s*"([A-Za-z]+)"\),', CLASSIFY))
 
-# EMPTY since v0.8.15, and that is the strongest form of this file's claim:
-# every action the UI offers is one the classifier can emit, with no exceptions
-# list.
+# `rds-db:connect` is TICKABLE and cannot be classified, which is the one
+# combination this file has to be told about.
 #
-# It held exactly one entry, `rds-db:connect`, excused as "not an API call at
-# all -- it names the data-plane connection, which the mesh firewall gates".
-# The first half was true and the second was a guess: nothing in odin consults
-# IAM when a workload opens a Postgres connection, the mesh firewall is compiled
-# from SECURITY GROUPS and has never read an IAM statement, and there is no IAM
-# database authentication here at all. So the entry excused a permission that
-# was decorative, in a file whose entire purpose is to make decorative
-# permissions impossible.
+# The REASON was rewritten in v0.8.15 because the old one was a guess. It read:
+# "it names the data-plane connection, which the mesh firewall gates". The first
+# half is true; the second is false and was never checked. Nothing in odin
+# consults IAM when a workload opens a Postgres connection, and the mesh firewall
+# is compiled from SECURITY GROUPS (`fabric/nebula.py::_compiled_firewall`) --
+# it has never read an IAM statement. There is no IAM database authentication
+# here at all. So a file whose whole purpose is to make decorative permissions
+# impossible carried an excuse for one, on a claim about a component it never
+# probed.
 #
-# The mechanism stays rather than the whitelist being deleted, so re-adding a
-# non-API action is a deliberate act with a name on it. What a user drawing
-# rds -> workload wants is the `connection` edge (`ui/src/lib/iam.ts`), which
-# authors `DATABASE_URL` instead of granting something nobody checks.
-NOT_API_ACTIONS: set[str] = set()
+# What keeps it offered is the same rule `ecr`'s three layer verbs are kept
+# under (`tests/gateway/test_ecr_vocabulary_has_handlers.py`, and the catalog's
+# own note): a drawn permission becomes a real `aws_iam_role_policy`, and that
+# file is meant to be portable -- taken to Amazon, this is exactly the action IAM
+# DB auth needs. What changed is that it is no longer a DEFAULT: odin does not
+# tick it FOR you, because a default asserts a protection odin has not got. The
+# `connection` edge (`ui/src/lib/iam.ts`) is what a user drawing rds -> workload
+# usually wants, and it authors `DATABASE_URL` rather than granting anything.
+NOT_API_ACTIONS = {"rds-db:connect"}
 
 
 def _ui_actions() -> set[str]:

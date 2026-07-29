@@ -113,6 +113,15 @@ future decision against these points instead of re-deriving them:
     whose tree is packaged as-is; dependencies are whatever you vendored into
     that directory, because odin runs no package manager and fetches nothing at
     apply time (docs/limits.md).
+  - ECR: an `ecr ↔ ecs` edge sets the service's image as of v0.8.15 (a real
+    `${aws_ecr_repository.<n>.repository_url}:latest` interpolation, since the
+    registry's port is minted per env and can't be typed in advance); a
+    hand-typed `image` still wins. `ecr ↔ lambda` sets nothing and says so —
+    odin's Lambda substrate is a zip in an RIE container, not a container
+    image. And the ECR *permissions* the catalog offers
+    (`ecr:GetAuthorizationToken`, `ecr:BatchGetImage`) are enforced by nothing:
+    neither has a gateway handler, and image-layer traffic dials the
+    `registry:2` container directly without passing through the gateway at all.
   - ECS: no `network_configuration` (awsvpc/Fargate-style ENIs — odin's tasks
     are `launch_type = "EC2"` / `network_mode = "bridge"`, which need none);
     a task that dies between API calls isn't auto-replaced until the next
@@ -786,6 +795,17 @@ future decision against these points instead of re-deriving them:
   read the line it printed; a principal with no edge gets a real
   AccessDenied).
 
+  **v0.8.15 — the drawn group is now the one that receives.** Those two
+  destinations are derived from the workload and read from nowhere, so a Log
+  Group tile drawn to a lambda used to produce TWO groups: the drawn one, which
+  the policy granted `logs:PutLogEvents` on, and `/aws/lambda/{fn}`, which got
+  every line. The drawn one stayed empty forever unless its label happened to
+  coincide. An `aws_cloudwatch_log_group` whose node is edged to a lambda/ecs
+  node is now created under that workload's destination name, and the policy's
+  `Resource` follows it — `docs/limits.md` records the two costs (a workload
+  that hardcodes the *label* in its own PutLogEvents call, and an import that
+  re-labels the node).
+
   **v1 limits, recorded rather than hidden:**
   - Storage is a per-env JSON sidecar (`.odin/{env}/gateway/logsctl.json`),
     dev-scale by design: each group keeps at most 10 000 events in a ring
@@ -913,14 +933,22 @@ future decision against these points instead of re-deriving them:
   - `application` type only. A `network` LB (NLB) reports itself unsupported
     on Apply instead of quietly becoming an ALB; `internal = true` always
     (odin has no internet gateway to be internet-facing through).
-  - Targets: an `ecs` node is the only canvas kind that can be a target in v1
-    (an alb→`ec2` edge is reported as unsupported). The model's
-    `RegisterTargets` itself is generic — an `i-…` id resolves through the
-    EC2-compute store to the VM's real address — so `aws_lb_target_group_
-    attachment` is a small follow-up, not a redesign. A task target is
-    `(host.docker.internal, its real published host port)`: the honest local
-    analogue of an `ip` target for a bridge-mode container, not a fiction
-    about instance ids.
+  - Targets: `ecs` and — since v0.8.15 — `ec2`. An alb→`ec2` edge emits a real
+    `aws_lb_target_group_attachment` naming `aws_instance.<n>.id`, which is the
+    form the model's generic `RegisterTargets` resolves through the EC2-compute
+    store to the VM's real address. That resolution had never actually run:
+    `_instance_address` read `private_ip_address`/`public_ip_address`, keys
+    `ec2compute` has never written (its record carries `private_ip`/
+    `public_ip`), and the one test covering it fabricated a record with the key
+    the reader wanted. Nothing on the canvas could produce an `i-…` target, so
+    it was never caught in the field either. Both are fixed; the test now boots
+    an instance through ec2compute's own RunInstances.
+    A task target is `(host.docker.internal, its real published host port)`:
+    the honest local analogue of an `ip` target for a bridge-mode container,
+    not a fiction about instance ids.
+    A `lambda` target is still REFUSED, with the reason: nginx dials host:port
+    upstreams, and a lambda needs HTTP translated into the RIE's invoke
+    envelope — the same shim `apigateway → lambda` needs, built once there.
   - Cross-zone/AZ behaviour, access logs, WAF, deletion protection and every
     other load-balancer attribute are STORED AND ECHOED for zero-drift
     fidelity and do nothing. AWS's own "an ALB needs ≥2 subnets in different
@@ -1218,26 +1246,35 @@ index-to-index deletion on this file.
 
   **CORRECTED 2026-07-29, and the correction is the same bug this entry is
   about.** It said "the ECR image-pull actions", and said rds "had a real
-  vocabulary already". Four of the offered actions could never bite:
+  vocabulary already". Four offered actions could never bite locally:
   `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer` and
   `ecr:BatchCheckLayerAvailability` have no handler in
   `gateway/models/ecr.py::_HANDLERS` and describe a DATA plane that `docker
   push`/`pull` reaches on the `registry:2` container's own published port,
   bypassing the gateway entirely; and `rds-db:connect` -- the FIRST action the
-  rds tile offered and the one a drawn edge ticked by default -- names IAM
-  database authentication, which odin does not implement, in a service prefix
-  `classify.py` can never emit. All four are removed.
+  rds tile offered -- names IAM database authentication, which odin does not
+  implement, in a service prefix `classify.py` can never emit.
+
+  The fix is the DEFAULT/TICKABLE split, and getting there took two agents
+  disagreeing. `edge-registry` drew it for ecr and `connection-edge` had deleted
+  the actions outright; the split is better, and the reason is portability: a
+  drawn permission becomes a real `aws_iam_role_policy`, and taken to Amazon
+  these are exactly the verbs an image pull and IAM DB auth need. So they stay
+  TICKABLE and stop being PRE-TICKED, because a default is what odin ticks FOR
+  you and must not assert a protection odin has not got. `rds`'s default is now
+  `rds:DescribeDBInstances`; `ecr`'s is `GetAuthorizationToken`.
 
   Why the ratchet below did not catch them, which is worth more than the fix:
   ECR is a TARGET-derived service, so the test can only check the SERVICE
   prefix -- correctly, since any op a real SDK sends is emittable -- and
-  "is there a handler" is a second question it never asked. `rds-db:connect` was
-  on an explicit `NOT_API_ACTIONS` whitelist, excused as naming a data-plane
-  connection "which the mesh firewall gates"; the first half was true and the
-  second was a guess, since that firewall is compiled from security groups and
-  has never read an IAM statement. **The whitelist is now empty**, which is the
-  strongest form of this file's claim: every action the UI offers is one the
-  classifier can emit, with no exceptions.
+  "is there a handler" is a second question it never asked;
+  `tests/gateway/test_ecr_vocabulary_has_handlers.py` asks it now, both ways.
+  `rds-db:connect` was on an explicit `NOT_API_ACTIONS` whitelist, excused as
+  naming a data-plane connection "which the mesh firewall gates". The first half
+  was true and **the second was a guess**: that firewall is compiled from
+  SECURITY GROUPS and has never read an IAM statement. The entry stays -- its
+  portability reason is real -- but with the reason it actually has, in a file
+  whose whole purpose is making decorative permissions impossible.
 
   The find that mattered more than the vocabulary: **AWS's spelling is not
   necessarily odin's.** The gateway classifies an invoke as `lambda:Invoke`
