@@ -136,16 +136,21 @@ They are listed because finding one by surprise is worse than reading it here.
   backings and the prune, and reads a cached drift result instead of sweeping. ECS
   stays genuinely live because its task sweep runs on every one of those ticks;
   EC2, Lambda and RDS drift can be up to one sweep cadence stale for the duration.
-- **A drawn edge carries a modelled TYPE for only 40 of the 378 kind pairs.**
+- **A drawn edge carries a modelled TYPE for only 41 of the 378 kind pairs.**
   Since v0.8.14 every ordered pair of node kinds resolves to exactly one edge
-  type, and the honest majority answer is `unmodelled` — 338 of the 378 unordered
+  type, and the honest majority answer is `unmodelled` — 337 of the 378 unordered
   pairs, drawn as a grey line labelled *Not modelled*, stored in the Stack and
-  read by nothing. It was called `network` until now, which was a claim about
+  read by nothing. It was called `network` until then, which was a claim about
   layer 3 that odin never checked. The pairs that do mean something: `iam`
   (35 pairs, a real policy), `sg` (2, security-group membership), `role`
-  (`iam_role ↔ lambda`), `target` (`alb ↔ ecs`, and since v0.8.15 `alb ↔ ec2`
-  too) and `subscription` (`sns ↔ sqs`). Drawing anything else is decoration,
-  and now says so.
+  (`iam_role ↔ lambda`), `target` (2 — `alb ↔ ecs`, and since v0.8.15
+  `alb ↔ ec2`) and `subscription` (`sns ↔ sqs`). Drawing anything else is
+  decoration, and now says so.
+  These five counts are not prose: `ui/src/lib/edge-types.test.ts` recomputes
+  them from the real registry and fails if this paragraph disagrees. They went
+  stale within a day of being written — `alb ↔ ec2` moved one pair out of
+  `unmodelled` and the numbers here still read 40/338 — which is the whole
+  argument for measuring them from a test rather than trusting a careful writer.
   Three of those pairs carry a SECOND meaning on top of the grant, added in
   v0.8.15 because a permission whose subject is not wired is the same
   decoration under a colour: `logs ↔ lambda|ecs` decides which group the
@@ -177,6 +182,25 @@ They are listed because finding one by surprise is worse than reading it here.
   from the generated HCL for all of them, and `tofu` would **destroy the live
   subscription** on the next apply — with the reconciler silent, because
   `_desired_subs` only ever adds a missing subscription and never unsubscribes.
+- **Three of the five tickable ECR permissions gate nothing locally.**
+  `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer` and
+  `ecr:BatchCheckLayerAvailability` are offered on an ECR edge and enforced by
+  nothing, for two *independent* reasons. `gateway/models/ecr.py::_HANDLERS` has
+  no entry for any of them, so a request naming one gets `InvalidAction` 400 —
+  being *classifiable* is not being *answerable*, and `_classify_ecr` will
+  happily emit `ecr:BatchGetImage` from `x-amz-target`, which is what made this
+  look enforced for so long. And the image bytes never reach the gateway at all:
+  odin does not proxy the registry's v2 protocol, so a real `docker pull` dials
+  the `registry:2` container's published port directly and no IAM decision is
+  ever taken over it. Only **`ecr:GetAuthorizationToken`** (the docker-login
+  step) genuinely bites, and it is the only one odin ticks for you.
+  The other three stay tickable on purpose — a drawn permission becomes a real
+  `aws_iam_role_policy`, and taken to Amazon those are exactly the verbs a pull
+  needs — so treat them as portable configuration, not as a local control. The
+  split is pinned both ways by
+  `tests/gateway/test_ecr_vocabulary_has_handlers.py`: a newly offered op with no
+  handler fails, and so does one of these three *gaining* a handler, so this
+  paragraph cannot quietly outlive its own fix.
 - **SNS→SQS subscriptions** are all generated with `raw_message_delivery = true`,
   so the queue gets the published body verbatim rather than SNS's JSON envelope,
   and that holds on an import round trip even if your `.tf` said otherwise. It
