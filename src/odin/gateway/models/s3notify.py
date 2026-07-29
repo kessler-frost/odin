@@ -299,7 +299,31 @@ def _deleted_keys(response_body: bytes) -> list[str]:
     The request lists what was ASKED for; DeleteObjects reports per-object
     success and failure separately, and enqueuing off the request would fire
     `ObjectRemoved` for objects that are still there -- reporting a delete odin
-    did not achieve."""
+    did not achieve.
+
+    MEASURED against `rustfs/rustfs:latest` (scoped throwaway container, since
+    removed), deleting one key that existed and one that never did:
+
+        HTTP 200
+        <?xml version="1.0" encoding="UTF-8"?><DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+        <Deleted><Key>incoming/a.jpg</Key></Deleted>
+        <Deleted><Key>does/not/exist.jpg</Key></Deleted></DeleteResult>
+
+    -- so the element shape is exactly what this parses, and there were ZERO
+    `<Error>` entries. That second fact is the LIMIT recorded in
+    `docs/limits.md`: DeleteObjects is idempotent, so S3 reports a key that
+    never existed as `<Deleted>`, and odin therefore enqueues a removal
+    notification real AWS would not send (real AWS fires nothing -- nothing was
+    removed). The response carries no signal that distinguishes the two cases,
+    and `postprocess` runs AFTER the forward, so odin cannot tell from here.
+    The single-object `DELETE /{b}/{k}` has the identical divergence for the
+    identical reason: S3 answers 204 whether or not the key was there.
+
+    The `<Error>` skip below is still correct and still load-bearing -- a
+    GENUINE per-object failure (AccessDenied, an object-lock retention) does
+    come back as `<Error><Key>` and must not fire. RustFS was simply not
+    provoked into emitting one, which is why the test for that branch says out
+    loud that its body comes from the S3 API reference rather than a probe."""
     root = ElementTree.fromstring(response_body)
     return [
         (key.text or "")
@@ -337,7 +361,16 @@ def _writes(action: str, path: str, query: dict[str, str], request_body: bytes, 
     For that one shape S3's ETag is defined as the MD5 of the body odin just
     forwarded, so it is COMPUTED here rather than observed, and left empty for
     every shape where that identity does not hold. Deletes carry neither in a
-    real S3 event either."""
+    real S3 event either.
+
+    ONE KNOWN OVER-FIRE, measured and documented in `docs/limits.md` rather
+    than hidden: BOTH delete shapes enqueue a removal for a key that never
+    existed. S3 is idempotent about deletes -- a single-object DELETE answers
+    204 and DeleteObjects reports `<Deleted>`, in both cases whether or not the
+    key was there (probed against RustFS; see `_deleted_keys`) -- so the
+    response carries nothing that would let odin tell the difference, and
+    `postprocess` runs after the forward, when the answer is unrecoverable
+    either way. Real AWS fires no event there."""
     if action == "s3:DeleteObject":
         keys = _deleted_keys(response_body) if "delete" in query else [_object_key(path)]
         return [(key, OBJECT_REMOVED_DELETE, 0, "") for key in keys if key]

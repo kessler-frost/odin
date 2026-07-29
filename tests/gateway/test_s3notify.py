@@ -48,6 +48,20 @@ OTHER_LAMBDA_ARN = "arn:aws:lambda:us-east-1:000000000000:function:archiver"
 QUEUE_ARN = "arn:aws:sqs:us-east-1:000000000000:jobs"
 TOPIC_ARN = "arn:aws:sns:us-east-1:000000000000:fanout"
 
+# The REAL `DeleteObjects` answer, captured from a scoped throwaway
+# `rustfs/rustfs:latest` (since removed) while deleting one key that existed
+# and one that never did. Two facts, and the second is the interesting one:
+# the element shape is exactly `<DeleteResult><Deleted><Key>`, and a key that
+# NEVER EXISTED comes back as `<Deleted>` with no `<Error>` at all -- correct
+# S3 idempotency, and the source of the documented over-fire below.
+MEASURED_DELETE_RESULT = (
+    b'<?xml version="1.0" encoding="UTF-8"?>'
+    b'<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+    b"<Deleted><Key>incoming/a.jpg</Key></Deleted>"
+    b"<Deleted><Key>does/not/exist.jpg</Key></Deleted>"
+    b"</DeleteResult>"
+)
+
 LAMBDA_CONFIG = {
     "LambdaFunctionConfigurations": [{
         "Id": "on-upload",
@@ -541,29 +555,77 @@ async def test_completing_a_multipart_upload_enqueues_the_multipart_event(stores
     assert records[0]["key"] == "big.bin"
 
 
-async def test_a_multi_object_delete_enqueues_per_key_actually_deleted(stores, sink, s3):
+async def test_a_multi_object_delete_enqueues_per_key_the_backing_reported_deleted(stores, sink, s3):
     """`POST /{b}?delete` carries NO key in the path -- the keys are in the
-    body, and which ones SUCCEEDED is only in the response. Reading the request
-    instead would announce deletes odin did not achieve."""
+    body, and which ones SUCCEEDED is only in the response.
+
+    The response here is `MEASURED_DELETE_RESULT`, captured from a real
+    `rustfs/rustfs:latest`, so the parse is proven against the bytes odin will
+    actually receive rather than against a reading of the S3 reference. It also
+    carries the divergence the probe found, asserted below."""
     await _configure(stores, sink, s3, {"LambdaFunctionConfigurations": [
         {"Id": "removed", "LambdaFunctionArn": LAMBDA_ARN, "Events": ["s3:ObjectRemoved:*"]},
     ]})
     captured = sink.call(lambda: s3.delete_objects(
-        Bucket=BUCKET, Delete={"Objects": [{"Key": "a.txt"}, {"Key": "b.txt"}, {"Key": "locked.txt"}]},
+        Bucket=BUCKET, Delete={"Objects": [{"Key": "incoming/a.jpg"}, {"Key": "does/not/exist.jpg"}]},
     ))
     assert _classified(captured)[0] == "s3:DeleteObject", "the premise of this test"
-    rustfs_answer = (
+
+    _post(stores, captured, MEASURED_DELETE_RESULT)
+
+    assert [record["key"] for record in _pending(stores)] == ["does/not/exist.jpg", "incoming/a.jpg"]
+
+
+async def test_deleting_a_key_that_never_existed_over_fires_a_removal(stores, sink, s3):
+    """A DOCUMENTED DIVERGENCE FROM REAL AWS, pinned so it cannot drift into
+    being an unnoticed one. `docs/limits.md` carries it in these words.
+
+    The probe deleted `incoming/a.jpg` (which existed) and
+    `does/not/exist.jpg` (which never did). RustFS reported BOTH as `<Deleted>`
+    with zero `<Error>` entries -- correct S3 behaviour, since DeleteObjects is
+    idempotent. Real AWS fires no `s3:ObjectRemoved` for the second, because
+    nothing was removed; odin fires one, because the response carries no signal
+    that separates the two and `postprocess` runs after the forward. Over-firing
+    is milder than never firing, but it is still odin reporting something that
+    did not happen, so it is written down rather than left silent."""
+    await _configure(stores, sink, s3, {"LambdaFunctionConfigurations": [
+        {"Id": "removed", "LambdaFunctionArn": LAMBDA_ARN, "Events": ["s3:ObjectRemoved:*"]},
+    ]})
+    captured = sink.call(lambda: s3.delete_objects(
+        Bucket=BUCKET, Delete={"Objects": [{"Key": "incoming/a.jpg"}, {"Key": "does/not/exist.jpg"}]},
+    ))
+
+    _post(stores, captured, MEASURED_DELETE_RESULT)
+
+    fired = [record["key"] for record in _pending(stores)]
+    assert "does/not/exist.jpg" in fired, "the documented over-fire; real AWS sends nothing here"
+
+
+async def test_a_key_the_backing_reported_as_FAILED_does_not_enqueue(stores, sink, s3):
+    """The `<Error>` skip in `_deleted_keys`, and the one body in this file odin
+    has NOT measured: the RustFS probe produced zero `<Error>` entries, so this
+    shape comes from the S3 API reference, not from the wire. Said out loud
+    because a test that fabricates an upstream signal proves the parser, not the
+    integration -- but the branch is real (a genuine AccessDenied or object-lock
+    retention does come back this way) and deleting it would make a FAILED
+    delete announce an object that is still standing."""
+    await _configure(stores, sink, s3, {"LambdaFunctionConfigurations": [
+        {"Id": "removed", "LambdaFunctionArn": LAMBDA_ARN, "Events": ["s3:ObjectRemoved:*"]},
+    ]})
+    captured = sink.call(lambda: s3.delete_objects(
+        Bucket=BUCKET, Delete={"Objects": [{"Key": "a.txt"}, {"Key": "locked.txt"}]},
+    ))
+    spec_shaped_answer = (
         b'<?xml version="1.0" encoding="UTF-8"?>'
         b'<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
         b"<Deleted><Key>a.txt</Key></Deleted>"
-        b"<Deleted><Key>b.txt</Key></Deleted>"
         b"<Error><Key>locked.txt</Key><Code>AccessDenied</Code></Error>"
         b"</DeleteResult>"
     )
 
-    _post(stores, captured, rustfs_answer)
+    _post(stores, captured, spec_shaped_answer)
 
-    assert [record["key"] for record in _pending(stores)] == ["a.txt", "b.txt"], "the failed key must not fire"
+    assert [record["key"] for record in _pending(stores)] == ["a.txt"], "the failed key must not fire"
 
 
 # --- through the REAL gateway app --------------------------------------------
