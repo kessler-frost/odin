@@ -655,7 +655,19 @@ class PendingNotification(Record):
     dispatcher, so this record is the whole handoff between the two. Every
     field is read on the delivery side: `target_arn` picks the function,
     `bucket`/`key`/`event_name`/`size`/`etag` build the S3 event AWS's own
-    handlers expect, and `at` orders the drain."""
+    handlers expect, and `at` orders the drain.
+
+    `at` is WALL-CLOCK (`time.time()`), never `time.monotonic()`, and that is
+    load-bearing rather than stylistic: this record is PERSISTED to
+    `.odin/{env}/gateway/dispatch.json`, and monotonic's epoch is arbitrary and
+    resets with the process -- so a record written before a restart and one
+    written after would be ordered against incomparable clocks and the drain's
+    ascending sort would silently invert.
+
+    `attempts` is how many times delivery has been TRIED and failed. The
+    producer never writes it; `reconcile/dispatch.py` increments it and drops
+    the record once it reaches its bound, which is what stops a broken function
+    from being invoked forever by a notification nobody can deliver."""
 
     bucket: str
     key: str
@@ -664,6 +676,7 @@ class PendingNotification(Record):
     at: float
     size: int = 0
     etag: str = ""
+    attempts: int = 0
 
 
 class BucketNotification(Record):

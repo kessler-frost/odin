@@ -23,6 +23,7 @@ import pytest
 from odin.compute.functions import InvokeResult
 from odin.gateway.models import eventsctl
 from odin.gateway.stores import SynthStores
+from odin.reconcile import dispatch
 from odin.reconcile.dispatch import Dispatcher
 
 ENV = "evdisp-unit"
@@ -350,17 +351,93 @@ async def test_pending_notifications_are_delivered_oldest_first(stores):
     assert keys == ["pending:a", "pending:b", "pending:c"]
 
 
-async def test_a_pending_notification_for_a_dead_function_is_consumed_with_a_verdict(stores):
-    """No visibility timeout exists here, so keeping the record would retry
-    forever on every tick. The verdict is what survives."""
-    seed_function(stores, state="Failed")
-    stores.dispatch.set(ENV, "pending:abc", {
-        "bucket": "uploads", "key": "k", "event_name": "s3:ObjectCreated:Put",
-        "target_arn": FUNCTION_ARN, "at": 1.0,
+def seed_pending(stores: SynthStores, store_key: str = "pending:abc", **overrides) -> None:
+    """`store_key` names the STORE key; the record's own `key` (the S3 object
+    key) is an override, since a `pending:` record has a field called `key` too
+    and the two collide in a kwargs signature."""
+    stores.dispatch.set(ENV, store_key, {
+        "bucket": "uploads", "key": "a/b.png", "event_name": "s3:ObjectCreated:Put",
+        "target_arn": FUNCTION_ARN, "at": 1.0, "size": 0, "etag": "", "attempts": 0,
+        **overrides,
     })
+
+
+async def test_a_failed_delivery_KEEPS_the_record_for_the_next_tick(stores):
+    """THE at-least-once half, and the first version of this code got it wrong
+    -- it deleted unconditionally, BEFORE the invoke. A notification for a
+    function that happened to be mid-redeploy vanished with nothing anywhere
+    recording that it was owed, which is the quietest possible way to lose
+    work."""
+    seed_function(stores, state="Failed")
+    seed_pending(stores)
     verdicts = await Dispatcher(FakeFunctions(), MovableClock()).verdicts(stores, ENV)
+
     assert "could not run" in verdicts[FUNCTION]
-    assert stores.dispatch.get(ENV, "pending:abc") is None
+    kept = stores.dispatch.get(ENV, "pending:abc")
+    assert kept is not None, "an undelivered notification must survive for the next pass"
+    assert kept["attempts"] == 1
+
+
+async def test_a_retried_notification_is_delivered_once_the_function_recovers(stores):
+    """The point of keeping it: the retry has to actually work."""
+    seed_function(stores, state="Failed")
+    seed_pending(stores)
+    functions, clock = FakeFunctions(), MovableClock()
+    dispatcher = Dispatcher(functions, clock)
+
+    await dispatcher.verdicts(stores, ENV)
+    assert functions.payloads == []
+
+    stores.lambdactl.update(ENV, f"fn:{FUNCTION}", lambda fn: {**fn, "state": "Active"})
+    assert await dispatcher.verdicts(stores, ENV) == {}
+    assert len(functions.payloads) == 1
+    assert stores.dispatch.get(ENV, "pending:abc") is None, "a delivered notification is consumed"
+
+
+async def test_delivery_is_given_up_on_LOUDLY_rather_than_retried_forever(stores):
+    """The opposite bug, and the worse one because it LOOKS like work: an
+    unbounded retry invokes a broken function once per tick, for every stuck
+    notification, forever -- a busy machine reporting nothing wrong.
+
+    There is no visibility timeout here to space retries out (that is SQS's own,
+    which is why the mapping drain needs no counter). So the record counts its
+    attempts and is dropped with a verdict that NAMES the loss -- real AWS's
+    max-receive-count into a DLQ, with an honest report standing in for the DLQ
+    odin does not have."""
+    seed_function(stores, state="Failed")
+    seed_pending(stores)
+    dispatcher = Dispatcher(FakeFunctions(), MovableClock())
+
+    for _ in range(dispatch._MAX_DELIVERY_ATTEMPTS - 1):
+        verdicts = await dispatcher.verdicts(stores, ENV)
+        assert stores.dispatch.get(ENV, "pending:abc") is not None
+        assert "GIVING UP" not in verdicts[FUNCTION]
+
+    final = await dispatcher.verdicts(stores, ENV)
+    assert stores.dispatch.get(ENV, "pending:abc") is None, "it must not be retried forever"
+    assert "GIVING UP" in final[FUNCTION]
+    assert "uploads/a/b.png" in final[FUNCTION], "the verdict must name what was dropped"
+
+
+async def test_one_pass_drains_a_bounded_number_of_notifications(stores):
+    """`aws s3 cp --recursive` over a few thousand objects enqueues a few
+    thousand records in one burst. Draining them all inside one tick would stall
+    the reconciler for every other resource -- the same shape as a blocking call
+    on the shared loop. The remainder is not lost: these are durable records and
+    the next pass is one tick away."""
+    seed_function(stores)
+    for i in range(dispatch._MAX_PENDING_PER_PASS * 3):
+        seed_pending(stores, store_key=f"pending:{i:03d}", at=float(i), key=f"obj-{i:03d}")
+    functions = FakeFunctions()
+
+    await Dispatcher(functions, MovableClock()).verdicts(stores, ENV)
+    assert len(functions.payloads) == dispatch._MAX_PENDING_PER_PASS
+    remaining = [k for k in stores.dispatch.items(ENV) if k.startswith("pending:")]
+    assert len(remaining) == dispatch._MAX_PENDING_PER_PASS * 2, "the rest wait, they are not dropped"
+
+    # ...and the OLDEST were the ones taken, so nothing starves at the back.
+    delivered = [json.loads(p)["Records"][0]["s3"]["object"]["key"] for p in functions.payloads]
+    assert delivered == [f"obj-{i:03d}" for i in range(dispatch._MAX_PENDING_PER_PASS)]
 
 
 # --- SQS event source mappings ----------------------------------------------

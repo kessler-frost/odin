@@ -98,6 +98,16 @@ _SQS_TIMEOUT = 5.0
 # throughput at a 1s cadence and none of the risk.
 _WAIT_TIME_SECONDS = 0
 
+# How many pending S3 notifications one pass may deliver, and how many times one
+# of them may fail before it is dropped with a verdict. Both are bounds on the
+# same hazard from opposite sides -- an unbounded BATCH stalls the tick, an
+# unbounded RETRY invokes a broken function forever -- and `_dispatch_pending`'s
+# docstring argues each. 10 matches the SQS batch size for no deeper reason than
+# that one tick should move a comparable amount of work whichever source it came
+# from.
+_MAX_PENDING_PER_PASS = 10
+_MAX_DELIVERY_ATTEMPTS = 5
+
 
 def _dispatch_ticks() -> int:
     """Ticks between passes. Read fresh (not cached) so the override is real,
@@ -446,23 +456,63 @@ def _s3_event(pending: dict) -> bytes:
 
 
 async def _dispatch_pending(stores: SynthStores, env: str, substrate=None) -> list[Delivery]:
-    """Every pending S3 notification, oldest first.
+    """Pending S3 notifications, oldest first, at most `_MAX_PENDING_PER_PASS`
+    of them, each retried at most `_MAX_DELIVERY_ATTEMPTS` times.
 
-    The record is deleted whether or not the invoke succeeded, and that is a
-    deliberate difference from the SQS drain: there is no visibility timeout
-    here and no redrive, so keeping it would retry forever on every tick
-    against a function that is down. Real S3 notifications retry and then give
-    up too. The verdict is what survives."""
+    THE THREE PROPERTIES, because every one of them has a silent failure mode
+    and the first version of this function got two of them wrong.
+
+    1. **A DELIVERED record is deleted; a FAILED one is not.** The first version
+       deleted unconditionally, before the invoke -- so a notification for a
+       function that happened to be redeploying vanished with nothing anywhere
+       recording that it was owed. Deleting only on success is what makes this
+       at-least-once, which is what S3 notifications are.
+
+    2. **...but not forever.** Keeping a failed record with no bound is the
+       opposite bug and it is worse, because it LOOKS like work: a function that
+       is down would be invoked once per tick, for every stuck notification,
+       until someone noticed a busy machine reporting nothing wrong. There is no
+       visibility timeout here to space the retries out (that is SQS's, and it
+       is why the mapping drain needs no counter of its own). So the record
+       carries `attempts`, and on the `_MAX_DELIVERY_ATTEMPTS`-th failure it is
+       dropped with a verdict that NAMES the loss -- real AWS's max-receive-count
+       into a dead-letter queue, with an honest report standing in for the DLQ
+       odin does not have.
+
+    3. **The pass is BOUNDED.** `aws s3 cp --recursive` over a few thousand
+       objects enqueues a few thousand records in one burst, and draining them
+       all inside one tick would stall the reconciler for everything else. The
+       remainder is not lost -- these are durable records, and the next pass is
+       one tick away. What that costs, stated rather than implied: at the
+       production 1s poll the drain rate is ~`_MAX_PENDING_PER_PASS` per second,
+       and a SLOW handler makes the pass itself exceed one tick, in which case
+       ticks queue behind `Reconciler._tick_lock` rather than overlapping -- the
+       reconciler falls behind, it does not double-run."""
     pending = sorted(
         ((key, record) for key, record in stores.dispatch.items(env).items() if key.startswith("pending:")),
         key=lambda item: item[1]["at"],
-    )
+    )[:_MAX_PENDING_PER_PASS]
     out: list[Delivery] = []
     for key, record in pending:
-        stores.dispatch.delete(env, key)
         function_name = record["target_arn"].rsplit(":", 1)[-1]
         trigger = f"the {record['bucket']!r} notification for {record['key']!r}"
-        out.append(await _deliver(stores, env, function_name, _s3_event(record), trigger, substrate))
+        delivery = await _deliver(stores, env, function_name, _s3_event(record), trigger, substrate)
+        if delivery.fired:
+            stores.dispatch.delete(env, key)
+            continue
+        attempts = record.get("attempts", 0) + 1
+        if attempts < _MAX_DELIVERY_ATTEMPTS:
+            stores.dispatch.set(env, key, {**record, "attempts": attempts})
+            out.append(delivery)
+            continue
+        # Given up on. The verdict says so IN the sentence, because "could not
+        # run" and "will never run" are different things to a reader and only
+        # one of them is worth acting on.
+        stores.dispatch.delete(env, key)
+        out.append(delivery._replace(detail=(
+            f"{delivery.detail} — GIVING UP after {attempts} attempts; "
+            f"the {record['bucket']}/{record['key']} notification was dropped and will not be retried"
+        )))
     return out
 
 

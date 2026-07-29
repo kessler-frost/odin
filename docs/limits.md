@@ -344,6 +344,38 @@ They are listed because finding one by surprise is worse than reading it here.
   honoured. Only **SQS** sources are accepted — a Kinesis, DynamoDB-Streams, MSK
   or self-managed-Kafka `event_source_arn` is refused at create time rather than
   stored as a poller that could never run.
+- **An S3 notification is retried five times, then dropped with a verdict.**
+  A write that matches a bucket notification is enqueued and delivered on the
+  next tick. If the function cannot run, the record is **kept** and retried on
+  each following tick — at-least-once, which is what S3 notifications are — but
+  only up to **5 attempts**, after which it is dropped and the node's verdict
+  says `GIVING UP after 5 attempts` and names the object. That bound exists
+  because there is no visibility timeout here to space retries out (that is
+  SQS's, which is why the queue drain needs no counter): an unbounded retry
+  would invoke a broken function once per tick forever, which looks like a busy
+  machine rather than a fault. It stands in for the dead-letter queue odin does
+  not have — the notification really is lost, and the verdict is the only record
+  of it.
+- **One tick delivers at most 10 pending notifications.** `aws s3 cp
+  --recursive` over a few thousand objects enqueues a few thousand records in
+  one burst; the drain is bounded so one upload cannot stall the reconciler for
+  every other resource. Nothing is lost — the records are durable and the next
+  pass is one tick away, so the steady drain rate is ~10/second at the
+  production poll. A **slow handler** makes the pass itself exceed one tick, in
+  which case ticks queue behind the reconciler's own lock rather than
+  overlapping: odin falls behind, it does not double-run.
+- **Only writes that go THROUGH the gateway fire a notification.** Delivery is
+  synthesized from the gateway's own view of an object write, not forwarded from
+  RustFS (which cannot hold the configuration at all). In practice that is every
+  workload write, since `AWS_ENDPOINT_URL` is what they all get — but a write
+  made directly against the RustFS container's published port fires nothing.
+- **The ETag in a delivered event is computed, and it was checked.** odin never
+  observes RustFS's response headers on the notification path, so a single-part
+  PUT's ETag is computed as `md5(body)` — S3's own definition. Measured against
+  the real thing: RustFS reported `7e7a063e…` and `md5(body)` gave
+  `7e7a063e…`, identical. A multipart completion and every delete carry an
+  empty ETag and size `0`, because neither is knowable there; treat `""` as
+  "not reported", not as an error.
 - **SQS long-polling through the gateway fails when the queue is empty.**
   Pre-existing and unrelated to triggers, but measured while building them: the
   gateway's forward client is a plain `httpx.AsyncClient()` whose default read
