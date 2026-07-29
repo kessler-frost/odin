@@ -1,11 +1,20 @@
-# The event dispatcher — design note for the half that is not built
+# The event dispatcher — design note
 
-odin can now *record* that "when X happens, run Y": EventBridge rules and
-targets are a real, durable control plane (`gateway/models/eventsctl.py`), and
+> **BUILT in v0.8.15. `src/odin/reconcile/dispatch.py` is the truth; this file is
+> the reasoning that produced it, kept because the *why* did not ship with the
+> code.** Read below as the argument, not as a description of current behaviour —
+> and where the two disagree, the code is right and this is stale. Three claims
+> here were already falsified during implementation and are corrected in place:
+> `synth.postprocess` cannot see the object key (it now takes `path` and
+> `query`), four wire shapes classify as `s3:PutObject` rather than one, and a
+> multi-object delete carries no key in its path at all.
+
+odin *records* that "when X happens, run Y": EventBridge rules and targets are a
+real, durable control plane (`gateway/models/eventsctl.py`), and
 `gateway/classify.py` classifies `events:*` so a rule survives a real `tofu
-apply`. Nothing yet **reads** that record and runs Y.
+apply`. When this was written, nothing **read** that record and ran Y.
 
-That gap is deliberate and it is visible on the wire: `events:PutEvents`
+That gap WAS deliberate and visible on the wire — and `events:PutEvents`
 answers a named `InternalException` rather than the `{"FailedEntryCount": 0}`
 real EventBridge sends, because an accepted-and-never-delivered event is
 exactly the "reports success it did not achieve" shape this repo's honesty
