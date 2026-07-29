@@ -815,6 +815,19 @@ _LAMBDA_ROUTES: tuple[tuple[str, re.Pattern[str], str], ...] = (
     ("GET", re.compile(r"^/2017-03-31/tags/(?P<arn>.+)$"), "ListTags"),
     ("POST", re.compile(r"^/2017-03-31/tags/(?P<arn>.+)$"), "TagResource"),
     ("DELETE", re.compile(r"^/2017-03-31/tags/(?P<arn>.+)$"), "UntagResource"),
+    # Event source mappings -- `aws_lambda_event_source_mapping`, the SQS ->
+    # Lambda trigger. Method+path taken from botocore's OWN lambda model
+    # (printed, not remembered). The `{uuid}` group is named `mapping` rather
+    # than `name` on purpose: `name` would make the loop below hand the UUID to
+    # `lambdactl` as a FUNCTION name, and every one of these would 404 against
+    # a function that does not exist. Ordered before nothing and after
+    # everything: `/2015-03-31/event-source-mappings` cannot collide with
+    # `/2015-03-31/functions/...`, the segment after the version differs.
+    ("POST", re.compile(r"^/2015-03-31/event-source-mappings$"), "CreateEventSourceMapping"),
+    ("GET", re.compile(r"^/2015-03-31/event-source-mappings$"), "ListEventSourceMappings"),
+    ("GET", re.compile(r"^/2015-03-31/event-source-mappings/(?P<mapping>[^/]+)$"), "GetEventSourceMapping"),
+    ("PUT", re.compile(r"^/2015-03-31/event-source-mappings/(?P<mapping>[^/]+)$"), "UpdateEventSourceMapping"),
+    ("DELETE", re.compile(r"^/2015-03-31/event-source-mappings/(?P<mapping>[^/]+)$"), "DeleteEventSourceMapping"),
 )
 
 
@@ -830,14 +843,30 @@ def _classify_lambda(method: str, path: str, body: bytes) -> tuple[str, str] | N
             return f"lambda:{op}", unquote(groups["name"])
         if "arn" in groups:
             return f"lambda:{op}", unquote(groups["arn"]).rsplit(":", 1)[-1]
-        # CreateFunction: the path carries no name -- read it from the body,
-        # same technique _classify_ecr uses for repositoryName.
+        if "mapping" in groups:
+            # An event source mapping's identity is its UUID, and it is NOT a
+            # function name: the mapping outlives no function and a policy
+            # written against a function name must not accidentally match one.
+            # A workload principal therefore denies these by ordinary
+            # default-deny (no iam edge grants a mapping UUID), which is right
+            # -- creating triggers is an operator action.
+            return f"lambda:{op}", unquote(groups["mapping"])
+        # CreateFunction / CreateEventSourceMapping: the path carries no name
+        # -- read it from the body, same technique _classify_ecr uses for
+        # repositoryName. `FunctionName` is documented as the name, the partial
+        # ARN or the full ARN, and terraform sends the full ARN for a mapping
+        # (`aws_lambda_function.x.arn`), so it reduces to the bare name here --
+        # otherwise the same function is one resource under CreateFunction and
+        # a different one under CreateEventSourceMapping, and no policy could
+        # be written to cover both.
         try:
             payload = json.loads(body) if body else {}
         except (json.JSONDecodeError, UnicodeDecodeError):
             payload = {}
         name = payload.get("FunctionName")
-        return f"lambda:{op}", name if isinstance(name, str) and name else "*"
+        if not isinstance(name, str) or not name:
+            return f"lambda:{op}", "*"
+        return f"lambda:{op}", name.rsplit(":", 1)[-1] if name.startswith("arn:") else name
     return None
 
 

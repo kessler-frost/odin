@@ -301,9 +301,26 @@ class SynthStores:
       is ARN-only: Tag/Untag/ListTagsForResource all take `ResourceARN`, never
       a typed id). The DEFAULT event bus has NO `bus:` record on purpose -- it
       always exists, so storing one would only create a way for it to be
-      missing (`eventsctl._bus`). There is no substrate behind any of this yet:
-      the rules and targets are real and durable, and nothing DELIVERS an
-      event to them -- see that module's PutEvents note.
+      missing (`eventsctl._bus`). A rule's targets are DELIVERED by
+      `reconcile/dispatch.py`, whose own bookkeeping lives in `dispatch` below
+      rather than in here: this store is EventBridge's control plane, and
+      "when did this rule last fire" is not a fact EventBridge's API has.
+    - `dispatch`: the event dispatcher's own bookkeeping
+      (`reconcile/dispatch.py`) -- flat keys `"fired:{bus}:{rule}"` (a
+      scheduled rule's clock anchor) and `"pending:{id}"` (an S3 object write
+      that matched a bucket notification and is waiting for the next pass),
+      persisted at `.odin/{env}/gateway/dispatch.json`. Deliberately NOT folded
+      into `eventsctl`/`s3notify`: those two are CONTROL planes that tofu reads
+      back, and mixing a mutable per-tick cursor into a record terraform diffs
+      is how a refresh starts reporting drift on odin's own bookkeeping.
+    - `s3notify`: the S3 bucket-notification configuration
+      (`gateway/models/s3notify.py`) -- flat keys `"notify:{bucket}"`,
+      persisted at `.odin/{env}/gateway/s3notify.json`. This is odin's OWN
+      state rather than a forward, and the reason is measured: RustFS rejects
+      every `PutBucketNotificationConfiguration` ARN form with
+      `InvalidArgument` and stores the configuration anyway, so forwarding gave
+      a failed `apply`, a clean `plan` and a trigger that never fired -- three
+      answers that cannot all be true (docs/limits.md).
     """
 
     def __init__(self, root: Path) -> None:
@@ -325,6 +342,8 @@ class SynthStores:
         self.rdsctl = JsonStore(root, "rdsctl")
         self.elbv2ctl = JsonStore(root, "elbv2ctl")
         self.eventsctl = JsonStore(root, "eventsctl")
+        self.dispatch = JsonStore(root, "dispatch")
+        self.s3notify = JsonStore(root, "s3notify")
 
     def forget_env(self, env: str) -> list[str]:
         """Drop every store's cached copy of `env`. Returns the store names that

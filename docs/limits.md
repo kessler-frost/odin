@@ -410,24 +410,116 @@ They are listed because finding one by surprise is worse than reading it here.
   a slow or loaded machine. The default deliberately stays put: a longer one makes
   a genuinely hung boot take longer to report, and the two look identical until
   the timeout fires.
-- **EventBridge is a control plane with no delivery.** `aws_cloudwatch_event_rule`,
-  `aws_cloudwatch_event_target` and `aws_cloudwatch_event_bus` apply, refresh,
-  tag and destroy for real, and the records survive a restart — so a rule you draw
-  is really there. **Nothing runs its targets.** `PutEvents` therefore does not
-  answer `FailedEntryCount: 0` the way real EventBridge does; it fails with a
-  message naming the missing half, because an accepted event that is never
-  delivered is a worse answer than a refused one. Invoke the target directly
-  (`lambda:Invoke` for a lambda target) until the dispatcher lands — the design
-  for it is `docs/event-dispatch-design.md`. Also unmodelled: event-pattern
-  matching, archives and replays, API destinations and connections, partner event
-  sources, `PutPermission`, and rule/target pagination (every list returns one
-  page and `Limit` truncates).
+- **EventBridge fires SCHEDULES only, and refuses everything else at the door.**
+  A rule with a `rate(N minutes|hours|days)` expression and a **Lambda** target
+  really runs — `reconcile/dispatch.py` checks every rule on the reconciler
+  tick. Everything else this API can express is **refused rather than stored**,
+  because a rule that applies, plans clean and never fires is worse than an
+  error: `PutRule` declines an `EventPattern` (odin has no event bus, so nothing
+  could ever match one) and any non-`rate` schedule including **`cron(...)`**
+  (odin has no cron evaluator; firing at a time nobody asked for is worse than
+  not firing), and `PutTargets` declines a non-Lambda target ARN — SQS, SNS, ECS
+  and Step Functions targets are not delivered. A batch containing one
+  undeliverable target fails whole rather than partially, so an apply cannot
+  succeed with a target silently missing.
+  `PutEvents` is still refused for a narrower reason that survived the
+  dispatcher landing: its entries are routed to rules by event PATTERN, and
+  there is no pattern matcher, so there is no rule an event could reach.
+  Also unmodelled: archives and replays, API destinations and connections,
+  partner event sources, `PutPermission`, and rule/target pagination.
+- **How late a trigger can be: at most one poll interval.** Measured on this
+  machine at the production wiring (`poll_interval=1.0s`, `ODIN_DISPATCH_TICKS`
+  unset), 20 runs at randomised phase: **min 0.02s, median 0.54s, max 0.94s**
+  between a rule becoming due and its target being invoked. The dispatcher runs
+  on **every** tick, not on the drift sweep's 10-tick cadence, because a late
+  sweep is a late report while a late dispatcher is a broken trigger. A rule's
+  own minimum period is one minute (AWS's), so the shortest end-to-end wait
+  after `PutTargets` is ~60s — measured at 60.5s against a real RIE container.
+  Nothing in the test suite may shorten the cadence; a repo-wide ratchet
+  (`tests/reconcile/test_dispatch_cadence.py`) fails the build if any file
+  assigns `ODIN_DISPATCH_TICKS`.
+- **Triggers do not fire during an apply.** Dispatch is suspended for the whole
+  of `/apply-full`, exactly as the drift sweep is, and for a sharper reason: a
+  Lambda redeploy removes the old RIE container before starting the new one, so
+  invoking mid-`UpdateFunctionCode` would report a function unreachable that is
+  merely being rebuilt. A rule that came due during the apply fires on the first
+  tick after it, rather than losing its turn.
+- **`sqs → lambda` works; the mapping is a real poller.**
+  `aws_lambda_event_source_mapping` applies for real (the five
+  `/2015-03-31/event-source-mappings` routes are modelled) and odin drains the
+  queue on each tick, invoking the function with the same `Records` envelope
+  real Lambda sends. Messages are deleted **only** when the invoke actually ran,
+  so a function that is down leaves them for the queue's own visibility timeout
+  to redeliver — SQS's redrive, unchanged. A handler that RAISES still counts as
+  delivered (the failure is recorded as the node's verdict), because
+  redelivering it forever would turn one bad message into an infinite invoke
+  loop. There is no DLQ, no `maximum_retry_attempts`, no batching window, and no
+  partial-batch response: `FunctionResponseTypes` round-trips but is not
+  honoured. Only **SQS** sources are accepted — a Kinesis, DynamoDB-Streams, MSK
+  or self-managed-Kafka `event_source_arn` is refused at create time rather than
+  stored as a poller that could never run.
+- **An S3 notification is retried five times, then dropped with a verdict.**
+  A write that matches a bucket notification is enqueued and delivered on the
+  next tick. If the function cannot run, the record is **kept** and retried on
+  each following tick — at-least-once, which is what S3 notifications are — but
+  only up to **5 attempts**, after which it is dropped and the node's verdict
+  says `GIVING UP after 5 attempts` and names the object. That bound exists
+  because there is no visibility timeout here to space retries out (that is
+  SQS's, which is why the queue drain needs no counter): an unbounded retry
+  would invoke a broken function once per tick forever, which looks like a busy
+  machine rather than a fault. It stands in for the dead-letter queue odin does
+  not have — the notification really is lost, and the verdict is the only record
+  of it.
+- **One tick delivers at most 10 pending notifications.** `aws s3 cp
+  --recursive` over a few thousand objects enqueues a few thousand records in
+  one burst; the drain is bounded so one upload cannot stall the reconciler for
+  every other resource. Nothing is lost — the records are durable and the next
+  pass is one tick away, so the steady drain rate is ~10/second at the
+  production poll. A **slow handler** makes the pass itself exceed one tick, in
+  which case ticks queue behind the reconciler's own lock rather than
+  overlapping: odin falls behind, it does not double-run.
+- **Only writes that go THROUGH the gateway fire a notification.** Delivery is
+  synthesized from the gateway's own view of an object write, not forwarded from
+  RustFS (which cannot hold the configuration at all). In practice that is every
+  workload write, since `AWS_ENDPOINT_URL` is what they all get — but a write
+  made directly against the RustFS container's published port fires nothing.
+- **The ETag in a delivered event is computed, and it was checked.** odin never
+  observes RustFS's response headers on the notification path, so a single-part
+  PUT's ETag is computed as `md5(body)` — S3's own definition. Measured against
+  the real thing: RustFS reported `7e7a063e…` and `md5(body)` gave
+  `7e7a063e…`, identical. A multipart completion and every delete carry an
+  empty ETag and size `0`, because neither is knowable there; treat `""` as
+  "not reported", not as an error.
+- **SQS long-polling through the gateway fails when the queue is empty.**
+  Pre-existing and unrelated to triggers, but measured while building them: the
+  gateway's forward client is a plain `httpx.AsyncClient()` whose default read
+  timeout is 5s, so a `ReceiveMessage` with `WaitTimeSeconds >= 5` against an
+  empty queue exceeds it, and the gateway answers **503 ServiceUnavailable**
+  (a `ReadTimeout` is an `httpx.HTTPError`, which the gateway maps to
+  "the backing isn't there"). Short-poll, or keep `WaitTimeSeconds` under 5.
+  odin's own dispatcher short-polls (`WaitTimeSeconds=0`) and is unaffected.
 - **S3 bucket notifications do not work at all, and the failure is loud in one
   place and silent in another.** `aws_s3_bucket_notification` is forwarded to
   RustFS, which **rejects every notification ARN form with `InvalidArgument` and
   stores the configuration anyway** (measured against `rustfs/rustfs:latest`). So
   `tofu apply` fails, the next `plan` reads the config back through GET and
   reports no drift, and nothing ever fires. Do not draw an S3 trigger yet.
+- **An S3 removal notification OVER-FIRES for a key that never existed.**
+  Applies once bucket notifications land (`gateway/models/s3notify.py` +
+  the dispatcher). S3 deletes are idempotent: deleting a key that was never
+  there SUCCEEDS. Measured against `rustfs/rustfs:latest` — deleting one real
+  key and one that never existed returned HTTP 200 and reported **both** as
+  `<Deleted>`, with zero `<Error>` entries; the single-object `DELETE` answers
+  204 the same way regardless. So the response carries no signal that separates
+  "removed something" from "removed nothing", and odin's hook runs after the
+  forward, when the answer is already unrecoverable. odin therefore enqueues an
+  `s3:ObjectRemoved:Delete` notification in both cases; **real AWS sends nothing
+  when nothing was removed.** A handler that assumes the object existed (and,
+  say, deletes a matching database row) will run for a key that never did.
+  Over-firing is the milder direction — a trigger that never fires is worse —
+  but it is a real divergence, so it is written here rather than discovered.
+  Genuine per-object FAILURES are handled correctly: a key S3 reports under
+  `<Error>` (AccessDenied, an object-lock retention) fires nothing.
 - **RDS** is Terraform-managed (`aws_db_instance` → a Postgres container)
   and Postgres-only: MySQL or MariaDB is declined with the reason.
   `allocated_storage` and `instance_class` round-trip faithfully but resize

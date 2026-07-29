@@ -13,17 +13,19 @@ Its substrate is the per-env JSON sidecar `.odin/{env}/gateway/eventsctl.json`,
 which is what makes rules and targets survive a reload -- the whole reason a
 `plan` after an `apply` is clean.
 
-**THE DELIVERY HALF IS NOT BUILT, AND THIS MODULE SAYS SO ON THE WIRE.**
-odin can now record that "rule R fires target T"; nothing yet READS that record
-and invokes T. So `PutEvents` -- the one `events` action a workload makes --
-does NOT answer `{"FailedEntryCount": 0}`, because an accepted-and-never-
-delivered event is precisely the "reports success it did not achieve" shape
-this repo's honesty rules exist for. It answers a protocol-correct
-`InternalException` naming the missing half instead (`_put_events`), so a
-caller finds out at the call site rather than by waiting for a lambda that will
-never run. Every control-plane op below is real; that one is honest about
-being absent. See the DISPATCHER section of ROADMAP/the design note for where
-the delivery half lands and what it must call.
+**THE DELIVERY HALF IS BUILT FOR SCHEDULES ONLY, AND THIS MODULE REFUSES
+EVERYTHING ELSE ON THE WIRE.** `reconcile/dispatch.py` reads the rules below on
+the reconciler tick and really does invoke their targets -- for a rule with a
+`rate(...)` schedule and a Lambda target. That is one shape out of many this API
+can express, so the other shapes are REFUSED here rather than stored:
+an `EventPattern` and a non-`rate` schedule at `PutRule`, a non-Lambda target at
+`PutTargets` (see "what odin can actually fire" below).
+
+`PutEvents` is still refused, and for a reason that survived the dispatcher
+landing rather than one that was forgotten: a `PutEvents` entry is routed to
+rules by EVENT PATTERN, and odin has no pattern matcher -- so there is no rule
+it could ever be delivered to. `{"FailedEntryCount": 0}` would be true of the
+bytes and false about the only thing anyone calls PutEvents for.
 
 WHAT IS MODELED, and why each one is load-bearing rather than an extra --
 these are exactly the calls terraform-provider-aws drives for the three
@@ -62,6 +64,7 @@ never a 503 and never a silent forward.
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections.abc import Callable
 
@@ -267,15 +270,122 @@ def _bus_json(record: dict) -> dict:
     })
 
 
+# --- what odin can actually fire, and the refusals that keep that honest -----
+#
+# `reconcile/dispatch.py` is the delivery half, and it can do exactly two
+# things: run a SCHEDULE off odin's own clock, and invoke a LAMBDA. Everything
+# a rule can otherwise express -- an event pattern, a cron expression, an SQS
+# or SNS or ECS or Step Functions target -- would be stored here, would
+# round-trip through `tofu plan` cleanly, and would never fire once.
+#
+# That is the shape the owner rejected by name: a trigger that RENDERS and
+# never FIRES. So each of them is refused at the earliest door, in the same
+# voice `_put_events` uses -- at `PutRule` for the schedule/pattern, at
+# `PutTargets` for the sink. A caller finds out at the call site, where the
+# error is attached to the line of HCL that caused it, instead of by waiting
+# for a lambda that will never run.
+#
+# THE PARSER LIVES HERE, NOT IN THE DISPATCHER, and the direction is
+# load-bearing: `reconcile/dispatch.py` imports this module (the arrow
+# `reconcile -> gateway.models` already exists via `drift.py`; the reverse
+# cycles). Which means what `PutRule` ACCEPTS and what the dispatcher can FIRE
+# are the same function. Two parsers would eventually disagree, and a rule
+# accepted by one and unfireable by the other is the render-and-never-fire bug
+# reintroduced by symmetry failure rather than by intent.
+
+# `rate(N unit)` -- AWS's own units, and its own rule that the value is a
+# positive integer. `cron(...)` is real EventBridge syntax that odin has no
+# evaluator for; see `_SCHEDULE_UNSUPPORTED`.
+_RATE = re.compile(r"^rate\(\s*(\d+)\s+(minute|minutes|hour|hours|day|days)\s*\)$")
+_RATE_UNIT_SECONDS = {"minute": 60, "hour": 3600, "day": 86400}
+
+EVENT_PATTERN_UNROUTABLE = (
+    "odin has no event bus carrying service events -- `PutEvents` is refused for the same reason -- "
+    "so a rule selected by an EventPattern could never match anything and would never fire. Nothing "
+    "would tell you: the rule would apply, `tofu plan` would be clean, and the target would sit "
+    "there forever. Use a ScheduleExpression, or invoke the target directly (lambda:Invoke). Event "
+    "pattern matching is not built -- see docs/limits.md."
+)
+
+_SCHEDULE_UNSUPPORTED = (
+    "odin fires a scheduled rule off its own reconciler tick and understands `rate(N minutes|hours|"
+    "days)` only; {expression!r} is not that. A cron expression is real EventBridge syntax, and odin "
+    "has no cron evaluator -- accepting one would mean firing at a time nobody asked for, or not at "
+    "all, with no way to tell which. See docs/limits.md."
+)
+
+_NO_SCHEDULE = (
+    "a rule needs a ScheduleExpression: it is the only thing odin can fire on. A rule with neither a "
+    "schedule nor a pattern is inert in real EventBridge too, and here it would also be invisible."
+)
+
+# The one sink `reconcile/dispatch.py` has. Kept as a prefix test rather than a
+# full ARN parse for `_by_arn`'s reason: what matters is which SERVICE would
+# have to run the target, and that is the third ARN field.
+_LAMBDA_ARN_PREFIX = "arn:aws:lambda:"
+
+TARGET_UNDELIVERABLE = (
+    "odin delivers an EventBridge target by invoking a Lambda function, and that is the only sink it "
+    "has. Target {id!r} points at {arn!r}, which odin cannot run -- storing it would give you a rule "
+    "that applies, plans clean and never fires. SQS, SNS, ECS, Step Functions and API-destination "
+    "targets are not built; see docs/limits.md."
+)
+
+
+def schedule_seconds(expression: str) -> int | None:
+    """`rate(N unit)` in SECONDS, or None when odin cannot fire this schedule.
+
+    THE single reader of a `ScheduleExpression` in odin: `_put_rule` refuses
+    what this returns None for, and `reconcile/dispatch.py` fires on what it
+    returns a number for, so "accepted" and "fireable" cannot drift apart.
+
+    `rate(0 ...)` is None rather than 0 -- a zero period would make the rule due
+    on literally every tick, which is not what any caller means and is not legal
+    in real EventBridge either (its minimum is one minute)."""
+    match = _RATE.match(expression.strip())
+    if match is None:
+        return None
+    value, unit = int(match.group(1)), match.group(2)
+    return value * _RATE_UNIT_SECONDS[unit.rstrip("s")] if value > 0 else None
+
+
+def is_lambda_target(target: dict) -> bool:
+    """Can `reconcile/dispatch.py` actually run this target? The ONE place that
+    is decided, shared by `_put_targets`' refusal and the dispatcher's own
+    read -- so a target that got stored is a target that gets invoked."""
+    return str(target.get("Arn") or "").startswith(_LAMBDA_ARN_PREFIX)
+
+
+def target_function(target: dict) -> str:
+    """The bare function NAME a lambda target names. For odin that is also the
+    canvas label (`hcl.py::_lambda` emits `function_name = <label>`), which is
+    what makes a dispatch verdict land on a node `/world` actually shows."""
+    return str(target["Arn"]).rsplit(":", 1)[-1]
+
+
 # --- rules -------------------------------------------------------------------
 
 
 def _put_rule(payload: dict, env: str, stores: SynthStores, now: float) -> Response:
     """Create OR update -- one call for both, which is what the provider drives
-    for a create and for every in-place change."""
+    for a create and for every in-place change.
+
+    Since the dispatcher landed this also REFUSES the two rule shapes odin
+    cannot fire (see the block above): an `EventPattern`, and any
+    `ScheduleExpression` that is not a `rate(...)`. Both used to be stored
+    happily, which is why this is a behaviour change rather than a new guard --
+    the old behaviour was an apply that succeeded and a trigger that never
+    ran."""
     bus, name = _bus_of(payload), payload["Name"]
     if _bus(stores, env, bus) is None:
         return _not_found(f"Event bus {bus} does not exist.")
+    if payload.get("EventPattern"):
+        return _invalid(EVENT_PATTERN_UNROUTABLE)
+    expression = str(payload.get("ScheduleExpression") or "")
+    if not expression:
+        return _invalid(_NO_SCHEDULE)
+    if schedule_seconds(expression) is None:
+        return _invalid(_SCHEDULE_UNSUPPORTED.format(expression=expression))
     existing = _rule(stores, env, bus, name)
     record = {
         "name": name,
@@ -355,11 +465,25 @@ def _disable_rule(payload: dict, env: str, stores: SynthStores, now: float) -> R
 def _put_targets(payload: dict, env: str, stores: SynthStores, now: float) -> Response:
     """Upsert by target `Id`, exactly like real PutTargets -- re-sending an
     existing id REPLACES that target rather than duplicating it, which is what
-    makes a re-apply of an unchanged `aws_cloudwatch_event_target` a no-op."""
+    makes a re-apply of an unchanged `aws_cloudwatch_event_target` a no-op.
+
+    A target odin cannot invoke is REFUSED here rather than stored (see the
+    "what odin can actually fire" block above). Real EventBridge accepts any
+    target ARN, so this is a deliberate divergence: real EventBridge would
+    actually deliver to that queue, and odin would not.
+
+    The refusal is WHOLE-BATCH, deliberately: `FailedEntryCount`/`FailedEntries`
+    is real PutTargets' partial-success shape, and answering with it would let
+    a `tofu apply` succeed while one target silently went missing. One rejected
+    target fails the call, the same way `sg_rules_to_firewall` refuses a whole
+    group rather than dropping one rule from a firewall."""
     bus, rule = _bus_of(payload), payload["Rule"]
     if _rule(stores, env, bus, rule) is None:
         return _not_found(f"Rule {rule} does not exist on EventBus {bus}.")
     incoming = [t for t in (payload.get("Targets") or []) if isinstance(t, dict) and t.get("Id")]
+    undeliverable = next((t for t in incoming if not is_lambda_target(t)), None)
+    if undeliverable is not None:
+        return _invalid(TARGET_UNDELIVERABLE.format(id=undeliverable["Id"], arn=undeliverable.get("Arn") or ""))
     replaced = {t["Id"] for t in incoming}
     kept = [t for t in _targets(stores, env, bus, rule) if t["Id"] not in replaced]
     stores.eventsctl.set(env, _targets_key(bus, rule), [*kept, *incoming])
@@ -477,10 +601,11 @@ def _untag_resource(payload: dict, env: str, stores: SynthStores, now: float) ->
 # --- the data plane, which is honest about not existing yet ------------------
 
 PUT_EVENTS_UNBUILT = (
-    "odin's gateway records EventBridge rules and targets but does not deliver events yet: "
-    "nothing reads a rule's targets and invokes them, so accepting this PutEvents would report "
-    "a delivery that never happens. The rule/target control plane is real; the dispatcher is not "
-    "built. Invoke the target directly (for a lambda target, lambda:Invoke) until it is."
+    "odin delivers SCHEDULED EventBridge rules (reconcile/dispatch.py invokes their Lambda targets "
+    "on the reconciler tick), but a PutEvents entry is routed to rules by EVENT PATTERN, and odin "
+    "has no pattern matcher -- so there is no rule this event could ever reach. Accepting it would "
+    "report a delivery that never happens. Invoke the target directly (for a lambda target, "
+    "lambda:Invoke), or give the rule a rate(...) schedule."
 )
 
 
@@ -491,8 +616,14 @@ def _put_events(payload: dict, env: str, stores: SynthStores, now: float) -> Res
     would be true of the bytes -- odin could store these entries and report
     zero failures without lying about a single field. It would still be the
     wrong answer, because the only reason anyone calls PutEvents is to make a
-    target run, and no target runs. `FailedEntryCount: 0` is read as "it will
-    fire". So this fails, loudly, naming the missing half."""
+    target run, and nothing routes an event to a target: `PutRule` refuses the
+    `EventPattern` that would have selected one.
+
+    STILL REFUSED AFTER THE DISPATCHER LANDED, which is the part worth
+    checking rather than assuming. The dispatcher fires SCHEDULES -- a clock,
+    not a bus. Delivering a PutEvents entry needs the pattern matcher that does
+    not exist, so this refusal is the same refusal `_put_rule` makes, one API
+    call further along."""
     return errors.synth_error(SERVICE, "InternalException", PUT_EVENTS_UNBUILT, 500)
 
 
