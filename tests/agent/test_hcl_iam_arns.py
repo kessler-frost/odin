@@ -114,11 +114,21 @@ TARGETS: dict[str, dict] = {
         "request": ("ssm", "POST", "/", {}, {"X-Amz-Target": "AmazonSSM.GetParameter"},
                     b'{"Name": "/odin/db"}'),
     },
+    # THE ONE ROW WHOSE RESOURCE IS NOT ITS LABEL, and deliberately so. Every
+    # canvas here draws the grant from the lambda `caller` (`_CALLER` below), so
+    # this log group IS that function's sink -- and since v0.8.15 a sink is
+    # created under the name the substrate really ships to
+    # (`/aws/lambda/caller`), not under the node's label, or the drawn group
+    # collects nothing (`agent/hcl.py::_LOG_DESTINATIONS`). The grant has to
+    # follow the group to the name `classify.py` will report for a real
+    # PutLogEvents, which is exactly what this row pins: the label is left
+    # deliberately UNLIKE the destination so a rename that silently stopped
+    # happening would fail here.
     "logs": {
         "node": {"label": "/aws/ecs/api"},
-        "action": "logs:PutLogEvents", "resource": "/aws/ecs/api",
+        "action": "logs:PutLogEvents", "resource": "/aws/lambda/caller",
         "request": ("logs", "POST", "/", {}, {"X-Amz-Target": "Logs_20140328.PutLogEvents"},
-                    b'{"logGroupName": "/aws/ecs/api"}'),
+                    b'{"logGroupName": "/aws/lambda/caller"}'),
     },
     "ecr": {
         "node": {"label": "images"},

@@ -46,8 +46,11 @@ Kind -> real backing:
   that had EVER run. Also always on Colima, matching TaskRuntime's own default.
 - elasticache: the cluster's own `redis:7-alpine` container (aws/cache.py).
 - logs: no container of its own -- an `aws_cloudwatch_log_group` node IS the
-  SINK, so this reads the events stored under the group whose name is the
-  node's label (`gateway/models/logsctl.py::stored_events`).
+  SINK, so this reads the events stored under the group that node backs
+  (`gateway/models/logsctl.py::stored_events`), found through its `odin:node`
+  tag. That group is named after the node UNLESS the node is drawn as a
+  workload's sink, in which case it carries the name that workload's substrate
+  really ships to -- see `_find_log_group`.
 - vpc/subnet/sg/iam_role/ecr: no runnable backing at all.
 
 `tail` is a budget for the WHOLE response, never per container: a node with
@@ -152,6 +155,32 @@ def _find_ecs_service(stores: SynthStores, env: str, node: str) -> dict | None:
         if label == node:
             return record
     return None
+
+
+def _find_log_group(stores: SynthStores, env: str, node: str) -> str:
+    """The AWS group name backing a `logs` canvas node.
+
+    It used to be the node label itself, on the rule that "a log group's
+    identity IS its name, and odin's canonical resource id is the node label".
+    v0.8.15 breaks that rule on purpose for ONE case: a log group drawn as a
+    workload's sink is created under the name that workload's substrate really
+    ships to (`/aws/lambda/{fn}`, `/ecs/{svc}` -- `agent/hcl.py::
+    _LOG_DESTINATIONS`), because otherwise the drawn group stays empty forever
+    while a second, undrawn one collects every line.
+
+    So the group is found the way every OTHER kind in this module is found:
+    through the `odin:node` tag odin's own generated HCL stamps on it. The
+    label is still the fallback, so an env whose groups carry no tag -- one the
+    substrate auto-created, one applied by an older build -- reads exactly as
+    it did before.
+    """
+    for key, record in stores.logsctl.items(env).items():
+        if not key.startswith("group:"):
+            continue
+        name = record["log_group_name"]
+        if _tagged_label(stores, env, f"logs:{logsctl.group_arn(name)}") == node:
+            return name
+    return node
 
 
 def _find_cache_cluster(stores: SynthStores, env: str, node: str) -> dict | None:
@@ -357,11 +386,10 @@ async def fetch_logs(
         )
 
     if kind == "logs":
-        # A log group's identity IS its name, and odin's canonical resource id
-        # is the node label -- so the group this node backs is the one named
-        # after it, no tag lookup needed (unlike ec2/lambda/ecs above, whose
-        # real ids are server-minted).
-        return fetch_group_logs(stores, env, node, tail, node=node, kind=kind)
+        # Resolved through the `odin:node` tag, exactly like ec2/lambda/ecs
+        # above -- see `_find_log_group` for why the name is no longer always
+        # the label.
+        return fetch_group_logs(stores, env, _find_log_group(stores, env, node), tail, node=node, kind=kind)
 
     return LogsResponse(env=env, node=node, kind=kind, found=True, message=f"no logs available for kind {kind!r}")
 
