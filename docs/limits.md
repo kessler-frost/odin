@@ -200,22 +200,36 @@ They are listed because finding one by surprise is worse than reading it here.
   `unsupported` — the function is built and applied perfectly well): odin's
   Lambda substrate packages the node's code as a zip and runs it in an AWS RIE
   container, so `package_type = "Image"` is not modelled at all.
-- **`ecr:GetAuthorizationToken` / `ecr:BatchGetImage` are grants that can never
-  bite.** Neither has a gateway handler, and image-layer traffic never reaches
-  the gateway in the first place: ECR's data plane is a real `registry:2`
-  container that a docker client dials directly, and the gateway does not proxy
-  the registry v2 protocol at all (`gateway/models/ecr.py`'s own docstring). So
-  an ECR permission edge is enforced by nothing. Open; it is a catalog change
-  in `ui/src/lib/iam.ts`, not a translator one.
-- **An `alb ↔ ec2` edge registers a real target, and the UI has not caught up.**
-  Since v0.8.15 the builder's `_ALB_TARGET_KINDS` is `("ecs", "ec2")` and the
-  edge emits an `aws_lb_target_group_attachment` naming `aws_instance.<n>.id` —
-  the form `elbv2ctl._target_host` resolves through the EC2-compute store to the
-  VM's real address. **`ui/src/lib/iam.ts::albTargetTypes` is still
-  `new Set(['ecs'])`**, so the canvas labels that line *Not modelled* while tofu
-  registers a live target for it. Presentational only — the generated Terraform
-  is correct either way — but the two disagree on `develop` today, and the fix
-  is that one-line set.
+- **The ECR image-layer grants are PORTABLE, not enforced — and odin no longer
+  ticks them for you.** `ecr:BatchGetImage`, `GetDownloadUrlForLayer` and
+  `BatchCheckLayerAvailability` gate nothing locally, for two independent
+  reasons: `gateway/models/ecr.py::_HANDLERS` has no entry for any of them (an
+  arriving request gets `InvalidAction` 400), *and* the image bytes never arrive
+  at all — ECR's data plane is a real `registry:2` container a docker client
+  dials directly, and the gateway does not proxy the registry v2 protocol.
+  `defaultPermissions.ecr` is therefore `['ecr:GetAuthorizationToken']` alone,
+  that being the one ECR action odin can answer and so actually gate. The three
+  layer verbs stay *tickable*, because the generated Terraform is meant to be
+  portable and on real AWS they are exactly right — they are simply not a local
+  control. `tests/gateway/test_ecr_vocabulary_has_handlers.py` pins it in both
+  directions, so implementing one of them fails the build until the catalog
+  stops calling it decorative.
+- **An `alb ↔ ec2` edge registers a real target.** Since v0.8.15
+  `_ALB_TARGET_KINDS` is `("ecs", "ec2")` and the edge emits an
+  `aws_lb_target_group_attachment` naming `aws_instance.<n>.id` — the form
+  `elbv2ctl._target_host` resolves through the EC2-compute store to the VM's
+  real address. That resolution had never once run: it read
+  `private_ip_address`/`public_ip_address`, keys `ec2compute` has never written
+  (its record carries `private_ip`/`public_ip`), so it returned `None` for every
+  real instance and the proxy was handed the bare `i-…` id, which nginx cannot
+  dial. The one test covering it had fabricated a record with the key the reader
+  wanted — honesty rule 1, inside a test. Both halves are fixed, and the test
+  now boots an instance through `ec2compute`'s own RunInstances.
+  The UI disagreed for exactly one commit (`albTargetTypes` was still
+  `new Set(['ecs'])`, so the canvas labelled the line *Not modelled* while tofu
+  registered a live target). Closed, and now held closed from both sides by
+  `tests/spec/test_edge_registry_matches_builders.py`, which compares the
+  TypeScript set against the Python tuple and names whichever side is behind.
 - **A lambda cannot be a load-balancer target.** `alb ↔ lambda` is declined with
   the reason rather than silently ignored: odin's load-balancer substrate is a
   real nginx container whose upstreams are `host:port` (`compute/proxy.py`), and
