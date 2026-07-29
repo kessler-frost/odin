@@ -187,6 +187,15 @@ def synth_error(service: str, code: str, message: str, status: int) -> Response:
     own source), not botocore's shape name. EC2's per-kind NotFound codes
     (`InvalidVpcID.NotFound` & co., gateway/models/ec2net.py) ride this same
     exact-wire-code path in the EC2 error envelope."""
+    # s3 first, and it was MISSING here while `_respond` above has had it all
+    # along -- so a synth-authored S3 error fell through to the AWS-JSON body at
+    # the bottom, which botocore parses with RestXMLParser and cannot read. The
+    # caller sees a parse failure instead of the error odin wrote. Found by an
+    # agent building S3 notifications, who was about to hand-build REST-XML
+    # locally rather than touch this file; one shared builder is the point of
+    # this module.
+    if service == "s3":
+        return Response(_s3_xml(code, message), status_code=status, media_type="application/xml")
     if service in _QUERY_XML_SERVICES:
         return Response(_sns_xml(code, message), status_code=status, media_type="text/xml")
     if service == "ec2":
