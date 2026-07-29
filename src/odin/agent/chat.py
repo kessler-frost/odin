@@ -108,11 +108,17 @@ class AddEdge(BaseModel):
     edge_type: str = Field(
         default="iam",
         description=(
-            "What the edge MEANS: 'iam' (a permission grant), 'sg' (this security group "
+            "What the edge MEANS: 'iam' (a permission grant), 'connection' (wire the "
+            "workload's environment to the producer's endpoint -- rds gives it "
+            "DATABASE_URL, elasticache gives it REDIS_URL; producer must be rds or "
+            "elasticache and consumer must be ecs or lambda), 'sg' (this security group "
             "gates this resource), 'role' (this lambda assumes this IAM role), "
             "'subscription' (this SNS topic fans out to this SQS queue), 'target' (this "
             "load balancer fronts this ECS service), or 'unmodelled' when none of those "
-            "fit -- odin then stores the line and acts on nothing."
+            "fit -- odin then stores the line and acts on nothing. "
+            "EXACTLY ONE of these, never a combination: the canvas panel lets a person "
+            "tick both 'connection' and 'iam' on one rds/ecs line, but an op naming two "
+            "is refused. Pick the meaning the user asked for."
         ),
     )
     actions: list[str] = Field(default_factory=list, description="For an iam edge: the permissions granted.")

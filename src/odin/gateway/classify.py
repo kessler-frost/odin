@@ -125,8 +125,19 @@ RDS (task W2.7) is the QUERY protocol (form-encoded `Action=`, like sns/ec2/
 iam -- not a JSON target header), and its resource is workload-facing like
 logs': an `rds` canvas node's label IS its `DBInstanceIdentifier`
 (agent/hcl.py's `_rds` builder emits `identifier = <label>`), so an
-`rds-db:connect` edge drawn to that node compiles to a statement the gateway
-enforces with no rds-specific code in the policy layer.
+`rds:DescribeDBInstances` edge drawn to that node compiles to a statement the
+gateway enforces with no rds-specific code in the policy layer.
+
+NOTE WHAT THAT DOES NOT COVER, because this paragraph asserted the opposite
+until v0.8.15 and was believed for it: it named `rds-db:connect` as the example
+action. Every string this function can produce for rds is built as
+`f"rds:{action}"` from the `Action` form param, so `rds-db:` -- a DIFFERENT
+service prefix -- is unreachable, and a policy granting it could never match
+anything. odin does not implement IAM database authentication at all; the
+Postgres container takes its password out of `DATABASE_URL` and consults
+nobody. The action has been removed from the canvas's vocabulary
+(`ui/src/lib/catalog.ts`), and what a user drawing rds -> workload actually
+wants is the `connection` edge, which authors that `DATABASE_URL`.
 
 ELBV2 (task W2.5) IS THE QUERY PROTOCOL, like sns/ec2/iam -- the operation
 rides in the `Action` form param, not an `X-Amz-Target` header (verified
@@ -529,7 +540,7 @@ def _bare_log_group(value: str) -> str:
 def _rds_resource(params: dict[str, str]) -> str:
     """The bare DB-instance IDENTIFIER -- which for an `rds` canvas node IS
     its label (agent/hcl.py's `_rds` builder emits `identifier = <label>`), so
-    an `rds-db:connect` / `rds:DescribeDBInstances` edge drawn to that node
+    an `rds:DescribeDBInstances` edge drawn to that node
     gates through the ordinary `evaluate(statements, action, resource)` path
     with no rds-specific plumbing (the same identity rule s3's bucket, sqs's
     queue name and a log group's name already carry). The tag calls carry a
