@@ -196,6 +196,19 @@ They are listed because finding one by surprise is worse than reading it here.
   control yet, so it is reachable only from hand-authored JSON, `odin canvas
   set` and `import-tf`. Two repositories drawn to one service is declined
   rather than guessed.
+  **You must `docker push` before you apply the service**, and that ordering is
+  the real constraint rather than a test artefact: odin never builds or pushes
+  anything, so an apply that creates the repository and the service together
+  asks ECS to run a tag that does not exist yet, and the service fails its
+  converge timeout. Apply the repository, push, then apply the service.
+  MEASURED end to end on 2026-07-29 (`tests/simulate/test_ecr_image_edge_e2e.py`),
+  because one link in that chain had never been exercised: `ecr.py`'s docstring
+  only ever claimed `127.0.0.1:{port}/{name}` works for a HOST-side `docker`
+  CLI, and nothing had asked the *daemon inside Colima* to pull from it. It
+  does — tofu resolved the attribute before RegisterTaskDefinition (`ecsctl`
+  stored `127.0.0.1:32824/edgebld-app:latest`, not a literal `${...}`), and the
+  task container came up running exactly that image after the local tag had
+  been deleted, so the pull genuinely went to the registry.
   For a lambda the edge authors nothing and says so in `wiring_errors` (never
   `unsupported` — the function is built and applied perfectly well): odin's
   Lambda substrate packages the node's code as a zip and runs it in an AWS RIE
@@ -214,22 +227,32 @@ They are listed because finding one by surprise is worse than reading it here.
   control. `tests/gateway/test_ecr_vocabulary_has_handlers.py` pins it in both
   directions, so implementing one of them fails the build until the catalog
   stops calling it decorative.
-- **An `alb ↔ ec2` edge registers a real target.** Since v0.8.15
+- **An `alb ↔ ec2` edge registers a real target.** Since v0.8.15 the builder's
   `_ALB_TARGET_KINDS` is `("ecs", "ec2")` and the edge emits an
   `aws_lb_target_group_attachment` naming `aws_instance.<n>.id` — the form
   `elbv2ctl._target_host` resolves through the EC2-compute store to the VM's
-  real address. That resolution had never once run: it read
-  `private_ip_address`/`public_ip_address`, keys `ec2compute` has never written
-  (its record carries `private_ip`/`public_ip`), so it returned `None` for every
-  real instance and the proxy was handed the bare `i-…` id, which nginx cannot
-  dial. The one test covering it had fabricated a record with the key the reader
-  wanted — honesty rule 1, inside a test. Both halves are fixed, and the test
-  now boots an instance through `ec2compute`'s own RunInstances.
-  The UI disagreed for exactly one commit (`albTargetTypes` was still
-  `new Set(['ecs'])`, so the canvas labelled the line *Not modelled* while tofu
-  registered a live target). Closed, and now held closed from both sides by
-  `tests/spec/test_edge_registry_matches_builders.py`, which compares the
-  TypeScript set against the Python tuple and names whichever side is behind.
+  real address. The canvas half (`ui/src/lib/iam.ts::albTargetTypes`) and the
+  builder half briefly disagreed, which would have labelled a live target
+  *Not modelled*; they are now kept in step by
+  `tests/spec/test_edge_registry_matches_builders.py`, which compares the two
+  lists across the language boundary and fails naming whichever side is behind.
+  **That resolution had never once run**, and the sentence above was true only
+  of the docstring until v0.8.15: `_instance_address` read
+  `private_ip_address`/`public_ip_address`, two keys `gateway/models/
+  ec2compute.py` has never written (its record carries `private_ip`/
+  `public_ip`). It returned `None` for every real instance, so the proxy was
+  handed the bare `i-…` id — and its one test had fabricated a record with the
+  key the reader wanted, which is honesty rule 1 living inside a test. Nothing
+  on the canvas could produce an `i-…` target either, so the field never
+  contradicted it. It is recorded here rather than quietly fixed because the
+  same docstring is what a reader (and one of this repo's own briefs) already
+  trusted once. MEASURED end to end on 2026-07-29,
+  `tests/simulate/test_alb_ec2_target_e2e.py`: a real Lima VM at
+  `192.168.64.2`, a real nginx proxy, `GET` the load balancer's published port
+  → **200** with the VM's own bytes. Re-injecting the old keys fails that test
+  on the rendered nginx config, which reads
+  `server i-994e52be19f90b93a:80 max_fails=1 fail_timeout=30s;` — an upstream
+  nginx cannot resolve.
 - **A lambda cannot be a load-balancer target.** `alb ↔ lambda` is declined with
   the reason rather than silently ignored: odin's load-balancer substrate is a
   real nginx container whose upstreams are `host:port` (`compute/proxy.py`), and

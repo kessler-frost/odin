@@ -116,7 +116,15 @@ future decision against these points instead of re-deriving them:
   - ECR: an `ecr ↔ ecs` edge sets the service's image as of v0.8.15 (a real
     `${aws_ecr_repository.<n>.repository_url}:latest` interpolation, since the
     registry's port is minted per env and can't be typed in advance); a
-    hand-typed `image` still wins. `ecr ↔ lambda` sets nothing and says so —
+    hand-typed `image` still wins. Proven end to end 2026-07-29
+    (`tests/simulate/test_ecr_image_edge_e2e.py`): a real `docker push` to the
+    published `repositoryUri`, the local tag then DELETED, and the ECS task
+    still comes up running that image — so the pull really reached the
+    `registry:2` container, which answers the one link `ecr.py`'s docstring had
+    never claimed (it only ever said the address works for a host-side CLI, not
+    for the daemon inside Colima). Push BEFORE applying the service: odin
+    builds and pushes nothing, so a combined apply asks ECS for a tag that does
+    not exist yet. `ecr ↔ lambda` sets nothing and says so —
     odin's Lambda substrate is a zip in an RIE container, not a container
     image. And the ECR *permissions* the catalog offers
     (`ecr:GetAuthorizationToken`, `ecr:BatchGetImage`) are enforced by nothing:
@@ -943,6 +951,15 @@ future decision against these points instead of re-deriving them:
     the reader wanted. Nothing on the canvas could produce an `i-…` target, so
     it was never caught in the field either. Both are fixed; the test now boots
     an instance through ec2compute's own RunInstances.
+    PROVEN END TO END 2026-07-29 (`tests/simulate/test_alb_ec2_target_e2e.py`),
+    which this path had never been: a real `tofu apply` boots a real Lima VM
+    (192.168.64.2), a real nginx container fronts it, and a GET on the load
+    balancer's published port returns 200 with the VM's own bytes — apply
+    including the VM boot, 66s. Re-injecting the old keys fails it on the
+    rendered nginx config (`server i-994e52be19f90b93a:80`), so the test reads
+    the real defect and not a fabricated one. It also settles a question
+    nothing had asked: a container on Colima CAN reach a Lima VM's vzNAT
+    address.
     A task target is `(host.docker.internal, its real published host port)`:
     the honest local analogue of an `ip` target for a bridge-mode container,
     not a fiction about instance ids.
