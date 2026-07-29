@@ -143,21 +143,103 @@ They are listed because finding one by surprise is worse than reading it here.
   read by nothing. It was called `network` until then, which was a claim about
   layer 3 that odin never checked. The pairs that do mean something: `iam`
   (35 pairs, a real policy), `sg` (2, security-group membership), `role`
-  (`iam_role ↔ lambda`), `target` (2 — `alb ↔ ecs`, and since v0.8.15
-  `alb ↔ ec2`) and `subscription` (`sns ↔ sqs`). Drawing anything else is
+  (`iam_role ↔ lambda`), `target` (2 — `alb ↔ ecs`, and `alb ↔ ec2` since
+  v0.8.15) and `subscription` (`sns ↔ sqs`). Drawing anything else is
   decoration, and now says so.
-  These five counts are not prose: `ui/src/lib/edge-types.test.ts` recomputes
-  them from the real registry and fails if this paragraph disagrees. They went
-  stale within a day of being written — `alb ↔ ec2` moved one pair out of
-  `unmodelled` and the numbers here still read 40/338 — which is the whole
-  argument for measuring them from a test rather than trusting a careful writer.
-  Three of those pairs carry a SECOND meaning on top of the grant, added in
-  v0.8.15 because a permission whose subject is not wired is the same
-  decoration under a colour: `logs ↔ lambda|ecs` decides which group the
-  workload's output lands in, and `ecr ↔ ecs` decides the service's image. Both
-  are described in their own entries below. The edge *type* is unchanged for
-  all three — they stay `iam` — because the passes that read them key on the
-  two NODE kinds.
+  These counts are not prose: `ui/src/lib/edge-types.test.ts` recomputes them
+  from the real registry and fails if this paragraph disagrees. They went stale
+  within a day of being written — `alb ↔ ec2` moved one pair out of `unmodelled`
+  and the numbers here still read 40/338 — which is the whole argument for
+  measuring them from a test rather than trusting a careful writer.
+- **An edge's TYPE is not always the whole of what it does.** Three pairs
+  carry a second meaning on top of the grant, added in v0.8.15 because a
+  permission whose subject is not wired is the same decoration under a
+  different colour: `logs ↔ lambda|ecs` decides which group the workload's
+  output lands in, `ecr ↔ ecs` decides the service's image, and `alb ↔ ec2`
+  registers a real load-balancer target. Their type is unchanged — the first
+  two stay `iam` — because the passes that read them key on the two NODE
+  kinds and never on `edge.kind`. Each is documented in its own entry below;
+  none of them is inferable from the label the canvas draws.
+- **A Log Group drawn as a workload's sink is created under the WORKLOAD's
+  name, not the node's label.** odin's two log shippers write to a name derived
+  from the workload and read no destination from anywhere:
+  `lambdactl._ship_logs` → `/aws/lambda/{function}`, `ecsctl._ship_task_logs` →
+  `/ecs/{service}`. Before v0.8.15, drawing a Log Group tile (default label
+  `/odin/logs`) to a lambda `myfn` therefore produced **two** groups — the drawn
+  one, which the policy granted `logs:PutLogEvents` on, and `/aws/lambda/myfn`,
+  which collected every line. The drawn one stayed empty forever, and the only
+  canvas that appeared to work was one whose label happened to coincide.
+  It is fixed in the direction that needed no new signal: the emitted
+  `aws_cloudwatch_log_group` takes the name the substrate already writes to, so
+  the node you drew backs the group that receives. **Two costs, both real:**
+  (a) code inside the workload that calls `PutLogEvents` on the *label*
+  (`/odin/logs`) will now be denied and find no such group — the grant follows
+  the group, deliberately, since granting on a name nothing creates is the same
+  decorative-permission bug; use the destination name, which `odin logs --node
+  <label>` and `/world` still resolve for you through the `odin:node` tag.
+  (b) `odin import-tf` reads a group's label from its `name` argument
+  (`agent/import_tf.py::_label` prefers the literal over the tag), so importing
+  the generated file back labels the node `/aws/lambda/myfn`. The file then
+  regenerates byte-identically and the edge and policy stay self-consistent —
+  it is a visible label change, not a broken round trip.
+  Drawing ONE Log Group as the sink for two workloads is declined
+  (`unsupported`, naming both destinations): a group has one name and the two
+  substrates write to two. An `ec2 ↔ logs` edge is untouched — nothing ships a
+  VM's output into CloudWatch Logs, so that edge is a grant for the code inside
+  the VM to call `PutLogEvents` itself, which works exactly as drawn.
+- **An `ecr ↔ ecs` edge sets the service's image; an `ecr ↔ lambda` edge sets
+  nothing.** Until v0.8.15 `_ecs_container_definitions` read the node's
+  hand-typed `image` field and consulted no edge at all, so drawing a
+  repository to a service granted `ecr:BatchGetImage` and left the service
+  running whatever was typed (in practice `nginx:alpine`). The edge now emits
+  `image = "${aws_ecr_repository.<n>.repository_url}:latest"` — a real
+  Terraform interpolation, so tofu resolves it at apply time to the address
+  `gateway/models/ecr.py` actually publishes (`127.0.0.1:{port}/{name}`, whose
+  port is minted per env and cannot be typed in advance), and
+  `compute/tasks.py` hands that straight to `docker run`. A **hand-typed
+  `image` always wins**; an `imageTag` field overrides `latest` but has no UI
+  control yet, so it is reachable only from hand-authored JSON, `odin canvas
+  set` and `import-tf`. Two repositories drawn to one service is declined
+  rather than guessed.
+  For a lambda the edge authors nothing and says so in `wiring_errors` (never
+  `unsupported` — the function is built and applied perfectly well): odin's
+  Lambda substrate packages the node's code as a zip and runs it in an AWS RIE
+  container, so `package_type = "Image"` is not modelled at all.
+- **Three of the five tickable ECR permissions gate nothing locally.**
+  `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer` and
+  `ecr:BatchCheckLayerAvailability` are offered on an ECR edge and enforced by
+  nothing, for two *independent* reasons. `gateway/models/ecr.py::_HANDLERS` has
+  no entry for any of them, so a request naming one gets `InvalidAction` 400 —
+  being *classifiable* is not being *answerable*, and `_classify_ecr` will
+  happily emit `ecr:BatchGetImage` from `x-amz-target`, which is what made this
+  look enforced for so long. And the image bytes never reach the gateway at all:
+  odin does not proxy the registry's v2 protocol, so a real `docker pull` dials
+  the `registry:2` container's published port directly and no IAM decision is
+  ever taken over it. Only **`ecr:GetAuthorizationToken`** (the docker-login
+  step) genuinely bites, and it is the only one odin ticks for you.
+  The other three stay tickable on purpose — a drawn permission becomes a real
+  `aws_iam_role_policy`, and taken to Amazon those are exactly the verbs a pull
+  needs — so treat them as portable configuration, not as a local control. The
+  split is pinned both ways by
+  `tests/gateway/test_ecr_vocabulary_has_handlers.py`: a newly offered op with no
+  handler fails, and so does one of these three *gaining* a handler, so this
+  paragraph cannot quietly outlive its own fix.
+- **An `alb ↔ ec2` edge registers a real target.** Since v0.8.15 the builder's
+  `_ALB_TARGET_KINDS` is `("ecs", "ec2")` and the edge emits an
+  `aws_lb_target_group_attachment` naming `aws_instance.<n>.id` — the form
+  `elbv2ctl._target_host` resolves through the EC2-compute store to the VM's
+  real address. The canvas half (`ui/src/lib/iam.ts::albTargetTypes`) and the
+  builder half briefly disagreed, which would have labelled a live target
+  *Not modelled*; they are now kept in step by
+  `tests/spec/test_edge_registry_matches_builders.py`, which compares the two
+  lists across the language boundary and fails naming whichever side is behind.
+- **A lambda cannot be a load-balancer target.** `alb ↔ lambda` is declined with
+  the reason rather than silently ignored: odin's load-balancer substrate is a
+  real nginx container whose upstreams are `host:port` (`compute/proxy.py`), and
+  a lambda target needs an HTTP request translated into the RIE's invoke
+  envelope and the response translated back. That is the identical shim an
+  `apigateway → lambda` route needs, so it is deliberately built once, there,
+  rather than twice.
 - **A `role` edge works for lambda only.** `iam_role → lambda` folds into the
   lambda's `role` field, which is what `agent/hcl.py` already reads, so the edge
   really does decide the execution role in the generated Terraform. **ec2 and ecs
@@ -182,25 +264,6 @@ They are listed because finding one by surprise is worse than reading it here.
   from the generated HCL for all of them, and `tofu` would **destroy the live
   subscription** on the next apply — with the reconciler silent, because
   `_desired_subs` only ever adds a missing subscription and never unsubscribes.
-- **Three of the five tickable ECR permissions gate nothing locally.**
-  `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer` and
-  `ecr:BatchCheckLayerAvailability` are offered on an ECR edge and enforced by
-  nothing, for two *independent* reasons. `gateway/models/ecr.py::_HANDLERS` has
-  no entry for any of them, so a request naming one gets `InvalidAction` 400 —
-  being *classifiable* is not being *answerable*, and `_classify_ecr` will
-  happily emit `ecr:BatchGetImage` from `x-amz-target`, which is what made this
-  look enforced for so long. And the image bytes never reach the gateway at all:
-  odin does not proxy the registry's v2 protocol, so a real `docker pull` dials
-  the `registry:2` container's published port directly and no IAM decision is
-  ever taken over it. Only **`ecr:GetAuthorizationToken`** (the docker-login
-  step) genuinely bites, and it is the only one odin ticks for you.
-  The other three stay tickable on purpose — a drawn permission becomes a real
-  `aws_iam_role_policy`, and taken to Amazon those are exactly the verbs a pull
-  needs — so treat them as portable configuration, not as a local control. The
-  split is pinned both ways by
-  `tests/gateway/test_ecr_vocabulary_has_handlers.py`: a newly offered op with no
-  handler fails, and so does one of these three *gaining* a handler, so this
-  paragraph cannot quietly outlive its own fix.
 - **SNS→SQS subscriptions** are all generated with `raw_message_delivery = true`,
   so the queue gets the published body verbatim rather than SNS's JSON envelope,
   and that holds on an import round trip even if your `.tf` said otherwise. It
