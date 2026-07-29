@@ -46,6 +46,7 @@ from odin.gateway.keys import OPERATOR_NODE_ID, KeyStore, Principal
 from odin.gateway.models import ec2compute, ec2net, ecsctl, lambdactl, rdsctl
 from odin.gateway.stores import SynthStores
 from odin.reconcile import admission, drift
+from odin.reconcile.dispatch import Dispatcher
 from odin.reconcile.drift import DriftSweeper
 from odin.reconcile.reconciler import LoopHealth, Reconciler
 from odin.reconcile.tf_status import stranded_in_tf_state
@@ -2557,6 +2558,13 @@ def create_app(
             # and its hand-seeded synth records must not be measured against
             # this machine's actual VMs/containers.
             drift=DriftSweeper() if backings else None,
+            # The event dispatcher really INVOKES lambdas (a real RIE
+            # container) and really dials this env's goaws backing, so it is
+            # gated on the same `backings` flag every other real-runtime
+            # dependency is: an app built with `backings=False` is the
+            # fake-substrate one, and its hand-seeded records must not drive
+            # actual container work on this machine.
+            dispatcher=Dispatcher() if backings else None,
         )
 
     async def reconciler_for(env: str) -> Reconciler:

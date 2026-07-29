@@ -1375,6 +1375,35 @@ index-to-index deletion on this file.
 
 ## Next — known, measured, not yet fixed
 
+- [x] **Event delivery: triggers that actually fire.** odin could record "when X
+  happens, run Y" and nothing read the record. `reconcile/dispatch.py` is the
+  other half — one dispatcher, three sources (a scheduled EventBridge rule, an
+  SQS event source mapping, an S3 bucket notification), one sink (a Lambda
+  invoke through `lambdactl.invoke`, so the durable `last_invocation_error`
+  verdict `/world` projects can never be bypassed).
+
+  **Cadence 1 tick, not the drift sweep's 10**, because a late sweep is a late
+  report and a late dispatcher is a broken trigger. Measured at the production
+  wiring, 20 runs: 0.02–0.94s from due to invoked. A repo-wide ratchet fails the
+  build if any file assigns `ODIN_DISPATCH_TICKS`, so no test can fabricate the
+  promptness the way the two drift e2e tests did (rule 1b).
+
+  **What it refuses, loudly, rather than storing:** an `EventPattern` rule (no
+  bus exists, so nothing could match it), a `cron(...)` schedule (no evaluator —
+  firing at the wrong time silently is worse than refusing), a non-Lambda
+  EventBridge target, and a non-SQS event source. Each of those previously
+  applied clean, planned clean, and would never have fired once. `PutEvents`
+  stays refused for a narrower reason that survived the dispatcher: its entries
+  route by pattern, and there is no matcher.
+
+  **What the integration tests found that the unit tests could not**, both fixed:
+  a verdict for a label the World projection does not carry was **silently
+  dropped** by the reconciler (a rule may target a function that does not exist;
+  the unit test asserted on the dispatcher's return value and passed the whole
+  time), and resolving the SQS backing port eagerly every tick put a `docker`
+  shell-out storm on the loop — enough, measured, to destabilise the goaws
+  backing until the lookup was made lazy. 15/15 mutations caught.
+
 - [x] **The full integration suite is part of shipping now.** v0.8.12 went out
   on 2822 green unit tests and SIX of 71 integration tests — the six that
   touched the code being changed. Running all 71 (53 min) found five failures
