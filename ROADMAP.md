@@ -1213,8 +1213,31 @@ index-to-index deletion on this file.
 - [x] **IAM edges across the whole catalog.** Turned out broader than this entry
   claimed -- s3, dynamodb, sqs, sns, rds, logs, secret, ssm and elasticache all
   had real vocabularies already. What was genuinely missing was **lambda, ecr and
-  ecs**, now added: a workload can be granted `lambda:Invoke`, the ECR image-pull
-  actions, and ECS task control.
+  ecs**, now added: a workload can be granted `lambda:Invoke`, ECR login and
+  repository reads, and ECS task control.
+
+  **CORRECTED 2026-07-29, and the correction is the same bug this entry is
+  about.** It said "the ECR image-pull actions", and said rds "had a real
+  vocabulary already". Four of the offered actions could never bite:
+  `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer` and
+  `ecr:BatchCheckLayerAvailability` have no handler in
+  `gateway/models/ecr.py::_HANDLERS` and describe a DATA plane that `docker
+  push`/`pull` reaches on the `registry:2` container's own published port,
+  bypassing the gateway entirely; and `rds-db:connect` -- the FIRST action the
+  rds tile offered and the one a drawn edge ticked by default -- names IAM
+  database authentication, which odin does not implement, in a service prefix
+  `classify.py` can never emit. All four are removed.
+
+  Why the ratchet below did not catch them, which is worth more than the fix:
+  ECR is a TARGET-derived service, so the test can only check the SERVICE
+  prefix -- correctly, since any op a real SDK sends is emittable -- and
+  "is there a handler" is a second question it never asked. `rds-db:connect` was
+  on an explicit `NOT_API_ACTIONS` whitelist, excused as naming a data-plane
+  connection "which the mesh firewall gates"; the first half was true and the
+  second was a guess, since that firewall is compiled from security groups and
+  has never read an IAM statement. **The whitelist is now empty**, which is the
+  strongest form of this file's claim: every action the UI offers is one the
+  classifier can emit, with no exceptions.
 
   The find that mattered more than the vocabulary: **AWS's spelling is not
   necessarily odin's.** The gateway classifies an invoke as `lambda:Invoke`
@@ -1229,7 +1252,9 @@ index-to-index deletion on this file.
   TS/Python boundary where nothing type-checks either side.
 
   `tests/gateway/test_iam_vocabulary_is_enforceable.py` now pins every action the
-  UI can put on an edge against what the classifier can actually emit (60 cases).
+  UI can put on an edge against what the classifier can actually emit (66 cases
+  as of 2026-07-29, measured; it was 60 before EventBridge was added forwards and
+  the four decorative actions were removed).
   Mutation-tested both ways: planting `lambda:InvokeFunction` fails it, and so
   does inventing a service the gateway never dispatches on. Two false positives
   in the checker itself were fixed first -- it read only one of the two dispatch
@@ -1314,8 +1339,10 @@ index-to-index deletion on this file.
   containment stamp anywhere is editable (typing one would be a second source
   of truth the next drag silently discards).
 
-  **NEXT TO and OVERLAPPING are deliberately NOT built**, on the same grounds
-  the edge-type selector is not: there is nothing yet for them to mean.
+  **NEXT TO and OVERLAPPING are deliberately NOT built**, on the grounds that
+  kept the edge-type selector unbuilt until 2026-07-29: there is nothing yet for
+  them to mean. (The selector's grounds expired when a pair acquired a second
+  honest meaning and the ambiguity ratchet fired. Adjacency has acquired none.)
   Overlapping is already answered — partial containment is OUTSIDE, decided by
   the owner on 2026-07-28 — and adjacency has no unambiguous reading in odin's
   model today, because every peer relationship it might stand for (IAM grant,
@@ -1592,31 +1619,59 @@ index-to-index deletion on this file.
   server after the unit tests were green.
 
 
-- [ ] **The edge-type selector, when there is anything to select.** Owner design
-  call (2026-07-28): what an edge MEANS depends on the components it connects,
-  and where a pair could legitimately mean more than one thing odin should ASK
-  rather than pick. `detectEdgeTypes` already returns an ARRAY, so the model
-  anticipates this; `edgeDataForConnection` takes `[0]` and says nothing.
+- [x] **The edge-type selector — built 2026-07-29, because the ratchet FIRED.**
+  Owner design call (2026-07-28): what an edge MEANS depends on the components
+  it connects, and where a pair could legitimately mean more than one thing odin
+  should ASK rather than pick. This entry sat unbuilt because, measured, nothing
+  was ambiguous: 729 ordered pairs, ZERO. The `<select>` in `ConfigPanel.tsx`
+  had therefore **never once rendered** in production — written, reviewed,
+  shipped, never executed.
 
-  Re-measured 2026-07-28 after the edge registry grew from two types to six
-  (`iam`, `sg`, `role`, `target`, `subscription`, `unmodelled`): **729 ordered
-  pairs, ZERO ambiguous**, so a selector still would never open and is still not
-  built. The `<select>` in `ConfigPanel.tsx` has therefore never once rendered.
+  What made it real was the **connection edge**. `rds → ecs` is the most-drawn
+  line in any architecture diagram and odin did nothing with it: it produced a
+  cyan IAM edge defaulting to `rds-db:connect`, an action `gateway/classify.py`
+  can never emit. Giving that pair its honest second meaning made `rds` and
+  `elasticache` against `ecs` and `lambda` ambiguous — and
+  `ui/src/lib/edge-ambiguity.test.ts` failed on the next run, printing all eight
+  ordered pairs by name. That is the trigger working exactly as designed, one
+  day after it was written.
 
-  The trigger is `ui/src/lib/edge-ambiguity.test.ts`, NOT `iam.test.ts` as this
-  entry claimed for a month while no such test existed anywhere -- the guard was
-  described, reviewed, believed and never written, which is honesty rule 1 living
-  in the roadmap itself. It iterates every ordered pair over the real kind list
-  and fails naming any pair that means more than one thing. Mutation-tested by
-  giving `iam_role` an `iamActions` list, which makes `iam_role ↔ lambda` mean
-  both `iam` and `role`: the test fails and prints both orderings by name.
-  The registration helper appends rather than assigns for exactly this reason --
-  an `=` would let a second meaning silently replace the first, and the pair
-  would keep looking unambiguous.
+  **It is multi-select, not exclusive**, because in AWS the meanings co-occur —
+  a workload wired to a database may also call its control plane, exactly as an
+  event source mapping needs the role to hold `sqs:ReceiveMessage`. Ticking a
+  meaning auto-ticks the permissions that meaning requires (an `iam` edge with
+  nothing ticked reserves a role and emits a policy-less `aws_iam_role`), and
+  the last remaining meaning cannot be unticked, since an edge with no meaning
+  reloads as `unmodelled` and silently loses the choice.
 
-  When it is built: store the chosen type ON the edge (`data.edgeType` already
-  is the store) rather than re-inferring, so a user's choice survives a node
-  being moved or retyped.
+  The choice is stored ON the edge as the ROADMAP asked (`data.edgeType`), now
+  as a `+`-joined set in registry order: `"connection+iam"`. A single meaning has
+  no separator and serialises to the bytes it always did, so nothing needed
+  migrating; `spec/translate.py::_edges` splits the set into one `Edge` per
+  meaning, which is what lets `gateway/policy.py::compile_policies` and
+  `agent/hcl.py::_granted_ids` keep gating on `kind == "iam"` unchanged. Handing
+  them the joined string would have compiled NO policy — permissions ticked in
+  the panel and none granted.
+
+  The ratchet now asserts an **enumerated allowlist** rather than zero, so it
+  keeps both properties: a ninth ambiguous pair fails and names itself, and a
+  listed pair that silently STOPS being ambiguous fails too (the picker would
+  simply vanish for it). Mutation-tested in both directions on 2026-07-29 —
+  shrinking the allowlist failed naming the four dropped pairs; registering
+  `sns ↔ lambda` as a second meaning failed naming both its orderings.
+
+  The panel's logic lives in `ui/src/lib/iam.ts` (`selectedEdgeTypes`,
+  `edgeTypeChoices`, `toggleEdgeType`) rather than in the TSX, because this repo
+  has no React test runner and logic left in the component would have no
+  coverage — which is precisely how a `<select>` shipped unexecuted.
+
+  Two defects the picker's own tests then found, both pre-existing:
+  `edgeDataForConnection` asked the DESTINATION end for the resource type, so
+  `rds → ecs` offered to grant the DATABASE permission to run ECS tasks, and the
+  two orderings of one pair disagreed — breaking that function's own documented
+  property. The principal is now the compute end wherever exactly one end is
+  compute, and the arrow decides only when both are, which is the one case where
+  it is the only thing that can.
 
 - [x] **Every drawn edge now has a consumer, or says it has none (2026-07-28).**
   Four defects, all the same shape -- odin showing the user one thing and doing
@@ -1745,8 +1800,10 @@ index-to-index deletion on this file.
   tests.
 
   It did NOT turn out ambiguous -- a "network" line between a group and an
-  instance would describe nothing -- so the ambiguity ratchet stays green and no
-  selector is needed here.
+  instance would describe nothing -- so this pair needs no selector. (Green now
+  means "matches the eight allowlisted pairs", not "zero": the connection edge
+  made `rds`/`elasticache` against `ecs`/`lambda` genuinely ambiguous on
+  2026-07-29 and the picker was built. `sg ↔ ec2` is still not among them.)
 
 - [~] **agent-browser cannot draw a connection; its RESULT is now covered.**
   The gesture is still not automatable: handles are 6px and `pointerdown`

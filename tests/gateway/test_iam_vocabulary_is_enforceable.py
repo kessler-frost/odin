@@ -64,11 +64,24 @@ CLASSIFIED_SERVICES = set(re.findall(r'service == "([a-z0-9-]+)"', CLASSIFY)) | 
 # The ops `_LAMBDA_ROUTES` can return, i.e. the only valid `lambda:*` actions.
 LAMBDA_OPS = set(re.findall(r'\),\s*"([A-Za-z]+)"\),', CLASSIFY))
 
-# `rds-db:connect` is the IAM-auth action for connecting to a database. It is
-# not produced by `classify.py` because it is not an API call at all -- it names
-# the data-plane connection, which the mesh firewall gates. Kept because AWS
-# spells it exactly this way and the canvas should too.
-NOT_API_ACTIONS = {"rds-db:connect"}
+# EMPTY since v0.8.15, and that is the strongest form of this file's claim:
+# every action the UI offers is one the classifier can emit, with no exceptions
+# list.
+#
+# It held exactly one entry, `rds-db:connect`, excused as "not an API call at
+# all -- it names the data-plane connection, which the mesh firewall gates".
+# The first half was true and the second was a guess: nothing in odin consults
+# IAM when a workload opens a Postgres connection, the mesh firewall is compiled
+# from SECURITY GROUPS and has never read an IAM statement, and there is no IAM
+# database authentication here at all. So the entry excused a permission that
+# was decorative, in a file whose entire purpose is to make decorative
+# permissions impossible.
+#
+# The mechanism stays rather than the whitelist being deleted, so re-adding a
+# non-API action is a deliberate act with a name on it. What a user drawing
+# rds -> workload wants is the `connection` edge (`ui/src/lib/iam.ts`), which
+# authors `DATABASE_URL` instead of granting something nobody checks.
+NOT_API_ACTIONS: set[str] = set()
 
 
 def _ui_actions() -> set[str]:
@@ -129,8 +142,16 @@ def test_the_aws_spelling_of_invoke_really_would_not_work():
 
 
 def test_a_wildcard_grant_covers_its_service():
-    """`<service>:*` is offered for every target, so it has to actually work."""
-    for action in ("lambda:Invoke", "ecr:BatchGetImage", "ecs:RunTask", "s3:GetObject"):
+    """`<service>:*` is offered for every target, so it has to actually work.
+
+    The ECR exemplar was `ecr:BatchGetImage` until v0.8.15, which is a fair
+    illustration of the gap this file does NOT close: `ecr` is a TARGET-derived
+    service, so the parametrized checks above only verify the SERVICE prefix,
+    and BatchGetImage passed them while `gateway/models/ecr.py::_HANDLERS` had
+    no handler for it and `docker pull` never reached the gateway anyway. It has
+    been removed from the catalog; the exemplar is now an op the model really
+    answers."""
+    for action in ("lambda:Invoke", "ecr:DescribeRepositories", "ecs:RunTask", "s3:GetObject"):
         service = action.split(":", 1)[0]
         statements = [Statement(actions=(f"{service}:*",), resources=("thing",))]
         assert evaluate(statements, action, "thing") is True, action

@@ -167,7 +167,21 @@ export const CATALOG: ServiceDef[] = [
       password: 'apppass123', securityGroups: '', arn: '',
     },
     primary: { key: 'engine', label: 'Engine' },
-    iamActions: ['rds-db:connect', 'rds:DescribeDBInstances', 'rds:*'],
+    // v0.8.15: `rds-db:connect` was the FIRST entry here and the default a drawn
+    // edge ticked, and the gateway can never evaluate it. `classify.py` builds
+    // `rds:<Action>` from the query protocol's `Action` param, so every string it
+    // can emit starts `rds:`; `rds-db:` is a different service prefix and no
+    // request is classified into it. classify.py's own prose asserted the
+    // opposite ("compiles to a statement the gateway enforces") and is corrected
+    // in the same change. IAM database authentication is not a thing odin
+    // implements at all -- the Postgres container takes the password out of
+    // DATABASE_URL and consults nothing.
+    //
+    // Connecting to a database is now its own edge type (`connection` in
+    // ui/src/lib/iam.ts), which authors that DATABASE_URL instead of granting a
+    // permission nobody checks. What stays here is the rds CONTROL plane, which
+    // really is classified and really is enforced.
+    iamActions: ['rds:DescribeDBInstances', 'rds:*'],
   },
   // elasticache (W2.8) is a REAL, gateway-modeled service (NORTHSTAR directive
   // 5): the drawn node IS one `aws_elasticache_cluster`, backed by a real
@@ -250,11 +264,31 @@ export const CATALOG: ServiceDef[] = [
     category: 'Storage', color: 'sky', width: 200,
     fields: [{ key: 'label', label: 'Name', editable: true }],
     defaultData: { label: 'new-repo' },
-    // The image-PULL path a workload needs. `gateway/classify.py::_classify_ecr`
-    // builds its action as `ecr:<op>` straight from `x-amz-target`, so these are
-    // the op names a real SDK sends -- which is what makes the grant bite rather
-    // than decorate (`tests/gateway/test_iam_vocabulary_is_enforceable.py`).
-    iamActions: ['ecr:GetAuthorizationToken', 'ecr:BatchGetImage', 'ecr:GetDownloadUrlForLayer', 'ecr:BatchCheckLayerAvailability', 'ecr:*'],
+    // v0.8.15: this list used to be
+    //   ['ecr:GetAuthorizationToken', 'ecr:BatchGetImage',
+    //    'ecr:GetDownloadUrlForLayer', 'ecr:BatchCheckLayerAvailability', 'ecr:*']
+    // above a comment claiming those op names are "what makes the grant bite
+    // rather than decorate". THREE OF THE FIVE could never bite, and the comment
+    // was the reason nobody checked: `gateway/models/ecr.py::_HANDLERS` answers
+    // seven ops -- CreateRepository, DescribeRepositories, DeleteRepository,
+    // ListTagsForResource, TagResource, UntagResource, GetAuthorizationToken --
+    // and the three image-layer ops are in none of them. They are the DATA
+    // plane, and ecr.py's own docstring says the gateway does not proxy it: "a
+    // real `docker push`/`pull` dials the registry's published port directly".
+    // No request carrying `ecr:BatchGetImage` ever reaches `evaluate`.
+    //
+    // The vocabulary test could not catch it either, and that is worth writing
+    // down: ECR is a TARGET-derived service, so it only checks the `ecr:` prefix
+    // against `classify.py`'s dispatch -- correctly, since any op a real SDK
+    // sends is emittable. Whether a HANDLER exists is a second question, and the
+    // answer for the pull path is "no handler, and no request either".
+    //
+    // What is left is what the gateway really serves and a workload really
+    // calls: log in, and look the repository up. Same rule kms and kinesis are
+    // held to -- a permission odin can neither enforce nor reach is a promise
+    // the engine cannot keep, and offering it is worse than offering nothing.
+    // See docs/limits.md for the pull path's actual gate (there is none).
+    iamActions: ['ecr:GetAuthorizationToken', 'ecr:DescribeRepositories', 'ecr:*'],
   },
   {
     type: 'route53', abbr: 'DNS', label: 'Route 53 Zone', sublabel: 'Hosted zone (placeholder)',

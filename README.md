@@ -156,7 +156,15 @@ no matching grant gets `AccessDenied`.
 
 The edge type comes from what you connected: `lambda → dynamodb` is an IAM grant
 with sensible defaults, `sg → ec2` is group membership, `ec2 → subnet` is
-containment. Across the whole catalog no pair is ambiguous, so odin never guesses.
+containment.
+
+Eight of the lines you can draw mean two things at once: `rds` or `elasticache`
+against `ecs` or `lambda`, in either direction. The workload needs the producer's
+address, and it may also need a grant on it — in AWS both readings are true at the
+same time. Odin does not choose between them for you: the picker lists both and
+you tick the ones you mean, so one line can carry both. Ticking the connection on
+`rds → ecs` writes `DATABASE_URL` into the service's environment, resolved to the
+real endpoint when the container starts.
 
 A drawn permission is emitted as a real `aws_iam_role_policy` on the workload's
 role, naming a real ARN — `arn:aws:s3:::uploads` and `arn:aws:s3:::uploads/*` for

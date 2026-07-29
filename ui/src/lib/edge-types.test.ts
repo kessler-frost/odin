@@ -1,6 +1,8 @@
 /**
- * The four things a drawn edge is now allowed to MEAN, and the one thing it is
- * allowed to mean nothing by.
+ * The things a drawn edge is allowed to MEAN, and the one thing it is allowed to
+ * mean nothing by. Four when this file was written; `connection` was the fifth
+ * (v0.8.15) and lives in `connection-edge.test.ts`, along with the multi-select
+ * picker its arrival made real.
  *
  * Each block below pins a measured defect rather than a design. Before this
  * file: `iam_role -> lambda` was inert, `ecs -> lambda` granted nothing while
