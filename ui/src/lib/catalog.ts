@@ -250,10 +250,33 @@ export const CATALOG: ServiceDef[] = [
     category: 'Storage', color: 'sky', width: 200,
     fields: [{ key: 'label', label: 'Name', editable: true }],
     defaultData: { label: 'new-repo' },
-    // The image-PULL path a workload needs. `gateway/classify.py::_classify_ecr`
-    // builds its action as `ecr:<op>` straight from `x-amz-target`, so these are
-    // the op names a real SDK sends -- which is what makes the grant bite rather
-    // than decorate (`tests/gateway/test_iam_vocabulary_is_enforceable.py`).
+    // ONLY `ecr:GetAuthorizationToken` bites locally. The comment here used to
+    // say the opposite -- that `_classify_ecr` building `ecr:<op>` from
+    // `x-amz-target` "is what makes the grant bite rather than decorate" -- and
+    // that was wrong twice over, in the direction this repo's honesty rules
+    // exist for:
+    //
+    //   * `gateway/models/ecr.py::_HANDLERS` has SEVEN entries, and the three
+    //     layer verbs below are not among them: the gateway answers
+    //     `InvalidAction` 400. Classifiable is not the same as answerable.
+    //   * The image bytes never reach the gateway at all. ecr.py's docstring:
+    //     "The gateway does NOT proxy the registry's v2 HTTP protocol in this
+    //     slice" -- a real `docker pull` dials the `registry:2` container's
+    //     published port directly, `repositoryUri` merely making it findable.
+    //     Nothing in `src/odin` ever sends any of the three (grep: zero hits).
+    //
+    // It cited `test_iam_vocabulary_is_enforceable.py` as proof, and that test
+    // never checked it: its own docstring says only the SERVICE prefix can be
+    // checked for target-derived services like ecr. So the claim was reviewed,
+    // believed, and pinned by nothing -- honesty rule 1 exactly.
+    // `tests/gateway/test_ecr_vocabulary_has_handlers.py` pins it properly now.
+    //
+    // The three stay TICKABLE rather than deleted because a drawn permission
+    // becomes a real `aws_iam_role_policy` in the generated Terraform, and that
+    // file is meant to be portable: taken to Amazon these are exactly the verbs
+    // an image pull needs. They are not pre-ticked (`iam.ts::defaultPermissions`
+    // offers only `GetAuthorizationToken`), because ticking something FOR the
+    // user that odin cannot enforce is odin claiming a protection it has not got.
     iamActions: ['ecr:GetAuthorizationToken', 'ecr:BatchGetImage', 'ecr:GetDownloadUrlForLayer', 'ecr:BatchCheckLayerAvailability', 'ecr:*'],
   },
   {

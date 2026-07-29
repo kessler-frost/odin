@@ -19,7 +19,17 @@ export const iamActionsForTarget: Record<string, string[]> = {
 export const defaultPermissions: Record<string, string[]> = {
   s3: ['s3:GetObject', 's3:PutObject'],
   lambda: ['lambda:Invoke'],
-  ecr: ['ecr:GetAuthorizationToken', 'ecr:BatchGetImage'],
+  // `ecr:BatchGetImage` was ticked here by default and gates NOTHING locally.
+  // Two independent reasons, both measured: `gateway/models/ecr.py::_HANDLERS`
+  // has no `BatchGetImage` entry (the gateway answers `InvalidAction` 400), and
+  // the image bytes never reach the gateway in the first place -- ecr.py's own
+  // docstring: "The gateway does NOT proxy the registry's v2 HTTP protocol in
+  // this slice", a real `docker pull` dials the `registry:2` container's port
+  // directly. `GetAuthorizationToken` (the docker-login step) is the one ECR
+  // action odin can actually answer and therefore actually gate, so it is the
+  // only one odin ticks FOR you. The rest stay TICKABLE in the catalog because
+  // the generated Terraform is meant to be portable -- see the note there.
+  ecr: ['ecr:GetAuthorizationToken'],
   ecs: ['ecs:RunTask', 'ecs:DescribeTasks'],
   dynamodb: ['dynamodb:GetItem', 'dynamodb:PutItem'],
   sqs: ['sqs:SendMessage', 'sqs:ReceiveMessage'],
@@ -61,7 +71,11 @@ export const defaultPermissions: Record<string, string[]> = {
 // `iamActionsForTarget` above is what stops the IAM loop from claiming the pair
 // first. Pass 1.5 reads the two NODE kinds and not `edge.kind`, so the type is
 // presentational and naming it changed nothing about what gets built.
-export const albTargetTypes = new Set(['ecs']);
+// ec2 joined in v0.8.15, the same change that taught `hcl.py` to emit an
+// `aws_lb_target_group_attachment` for an instance. The two lists are pinned
+// against each other by tests/spec/test_edge_registry_matches_builders.py --
+// which is what caught this line being one merge behind, naming the side.
+export const albTargetTypes = new Set(['ecs', 'ec2']);
 
 // Compute kinds act as IAM principals; permission edges run compute → resource.
 // The app-workload kinds (service/dep/batch/llm) are parked (see NORTHSTAR.md,

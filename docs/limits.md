@@ -136,7 +136,7 @@ They are listed because finding one by surprise is worse than reading it here.
   backings and the prune, and reads a cached drift result instead of sweeping. ECS
   stays genuinely live because its task sweep runs on every one of those ticks;
   EC2, Lambda and RDS drift can be up to one sweep cadence stale for the duration.
-- **A drawn edge means something to odin only for six kind pairs out of 378.**
+- **A drawn edge carries a modelled TYPE for only 40 of the 378 kind pairs.**
   Since v0.8.14 every ordered pair of node kinds resolves to exactly one edge
   type, and the honest majority answer is `unmodelled` — 338 of the 378 unordered
   pairs, drawn as a grey line labelled *Not modelled*, stored in the Stack and
@@ -153,69 +153,6 @@ They are listed because finding one by surprise is worse than reading it here.
   are described in their own entries below. The edge *type* is unchanged for
   all three — they stay `iam` — because the passes that read them key on the
   two NODE kinds.
-  **Stale until `ui/src/lib/iam.ts` catches up:** `albTargetTypes` there is
-  still `new Set(['ecs'])`, so the UI labels an `alb ↔ ec2` line *Not modelled*
-  while tofu registers a real target for it. Presentational only — the
-  generated Terraform is correct either way — but the label is wrong today.
-- **A Log Group drawn as a workload's sink is created under the WORKLOAD's
-  name, not the node's label.** odin's two log shippers write to a name derived
-  from the workload and read no destination from anywhere:
-  `lambdactl._ship_logs` → `/aws/lambda/{function}`, `ecsctl._ship_task_logs` →
-  `/ecs/{service}`. Before v0.8.15, drawing a Log Group tile (default label
-  `/odin/logs`) to a lambda `myfn` therefore produced **two** groups — the drawn
-  one, which the policy granted `logs:PutLogEvents` on, and `/aws/lambda/myfn`,
-  which collected every line. The drawn one stayed empty forever, and the only
-  canvas that appeared to work was one whose label happened to coincide.
-  It is fixed in the direction that needed no new signal: the emitted
-  `aws_cloudwatch_log_group` takes the name the substrate already writes to, so
-  the node you drew backs the group that receives. **Two costs, both real:**
-  (a) code inside the workload that calls `PutLogEvents` on the *label*
-  (`/odin/logs`) will now be denied and find no such group — the grant follows
-  the group, deliberately, since granting on a name nothing creates is the same
-  decorative-permission bug; use the destination name, which `odin logs --node
-  <label>` and `/world` still resolve for you through the `odin:node` tag.
-  (b) `odin import-tf` reads a group's label from its `name` argument
-  (`agent/import_tf.py::_label` prefers the literal over the tag), so importing
-  the generated file back labels the node `/aws/lambda/myfn`. The file then
-  regenerates byte-identically and the edge and policy stay self-consistent —
-  it is a visible label change, not a broken round trip.
-  Drawing ONE Log Group as the sink for two workloads is declined
-  (`unsupported`, naming both destinations): a group has one name and the two
-  substrates write to two. An `ec2 ↔ logs` edge is untouched — nothing ships a
-  VM's output into CloudWatch Logs, so that edge is a grant for the code inside
-  the VM to call `PutLogEvents` itself, which works exactly as drawn.
-- **An `ecr ↔ ecs` edge sets the service's image; an `ecr ↔ lambda` edge sets
-  nothing.** Until v0.8.15 `_ecs_container_definitions` read the node's
-  hand-typed `image` field and consulted no edge at all, so drawing a
-  repository to a service granted `ecr:BatchGetImage` and left the service
-  running whatever was typed (in practice `nginx:alpine`). The edge now emits
-  `image = "${aws_ecr_repository.<n>.repository_url}:latest"` — a real
-  Terraform interpolation, so tofu resolves it at apply time to the address
-  `gateway/models/ecr.py` actually publishes (`127.0.0.1:{port}/{name}`, whose
-  port is minted per env and cannot be typed in advance), and
-  `compute/tasks.py` hands that straight to `docker run`. A **hand-typed
-  `image` always wins**; an `imageTag` field overrides `latest` but has no UI
-  control yet, so it is reachable only from hand-authored JSON, `odin canvas
-  set` and `import-tf`. Two repositories drawn to one service is declined
-  rather than guessed.
-  For a lambda the edge authors nothing and says so in `wiring_errors` (never
-  `unsupported` — the function is built and applied perfectly well): odin's
-  Lambda substrate packages the node's code as a zip and runs it in an AWS RIE
-  container, so `package_type = "Image"` is not modelled at all.
-- **`ecr:GetAuthorizationToken` / `ecr:BatchGetImage` are grants that can never
-  bite.** Neither has a gateway handler, and image-layer traffic never reaches
-  the gateway in the first place: ECR's data plane is a real `registry:2`
-  container that a docker client dials directly, and the gateway does not proxy
-  the registry v2 protocol at all (`gateway/models/ecr.py`'s own docstring). So
-  an ECR permission edge is enforced by nothing. Open; it is a catalog change
-  in `ui/src/lib/iam.ts`, not a translator one.
-- **A lambda cannot be a load-balancer target.** `alb ↔ lambda` is declined with
-  the reason rather than silently ignored: odin's load-balancer substrate is a
-  real nginx container whose upstreams are `host:port` (`compute/proxy.py`), and
-  a lambda target needs an HTTP request translated into the RIE's invoke
-  envelope and the response translated back. That is the identical shim an
-  `apigateway → lambda` route needs, so it is deliberately built once, there,
-  rather than twice.
 - **A `role` edge works for lambda only.** `iam_role → lambda` folds into the
   lambda's `role` field, which is what `agent/hcl.py` already reads, so the edge
   really does decide the execution role in the generated Terraform. **ec2 and ecs
