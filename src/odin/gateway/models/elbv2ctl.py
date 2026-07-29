@@ -536,8 +536,22 @@ def _proxy_listeners(stores: SynthStores, env: str, lb_name: str) -> tuple[Proxy
 
 
 def _instance_address(stores: SynthStores, env: str, instance_id: str) -> str | None:
-    record = stores.ec2compute.get(env, f"instance:{instance_id}")
-    return (record or {}).get("private_ip_address") or (record or {}).get("public_ip_address")
+    """The VM's real address out of the ec2-compute record.
+
+    THE KEYS ARE `private_ip` / `public_ip`, and this read had them wrong until
+    v0.8.15: it asked for `private_ip_address`/`public_ip_address`, which
+    `gateway/models/ec2compute.py` has never written -- its record is seeded
+    `{"private_ip": None, "public_ip": None}` and `_finish_boot` fills those
+    two names. So this resolved to None for every real instance and
+    `_target_host` fell back to the bare `i-...` id, which nginx can never
+    dial. The one test covering it FABRICATED the upstream record with the key
+    this function wanted, which is why it passed for as long as it did -- rule
+    1's "a unit test that fabricates the upstream signal proves the parser, not
+    the integration", exactly. `tests/gateway/test_elbv2ctl.py` now builds the
+    record through ec2compute's own RunInstances instead.
+    """
+    record = stores.ec2compute.get(env, f"instance:{instance_id}") or {}
+    return record.get("private_ip") or record.get("public_ip")
 
 
 def _target_host(stores: SynthStores, env: str, target: dict) -> str:

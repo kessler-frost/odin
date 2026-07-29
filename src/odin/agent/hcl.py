@@ -392,6 +392,52 @@ _DEFAULT_EGRESS_RULE = ("-1", "0", "0.0.0.0/0")
 _WIRED_KINDS = ("ecs", "lambda")
 
 
+# ---------------------------------------------------------------------------
+# EDGE-AUTHORED FIELDS (v0.8.15) -- an edge that grants a permission must also
+# WIRE the thing the permission is for, or it is a decorative line.
+#
+# Three passes below read canvas edges to author a value a builder would
+# otherwise take from a hand-typed field (or from nothing at all): a log
+# group's NAME, an ecs service's IMAGE, and an alb's ec2 TARGETS.
+#
+# THEY MATCH ON NODE KINDS AND NEVER ON `edge.kind`, and that is not a
+# stylistic choice. Every canvas saved before the edge-type registry existed
+# carries `kind: "network"` on every edge (`spec/translate.py::
+# LEGACY_UNMODELLED`), so a builder that required a new type name would drop
+# the resource from the generated HCL for those canvases -- and `tofu destroy`
+# the live one on the next Apply. A reconciler test stays green straight
+# through that, because `_desired_subs` only ever ADDS. The sns->sqs
+# subscription pass and the alb target pass already work this way; these
+# follow them.
+#
+# DIRECTION IS NOT SIGNIFICANT either, for the reason `spec/translate.py::
+# _merge_sg_edges` gives: which end the user started the drag from carries no
+# meaning, so both orders are read the same way rather than one silently doing
+# nothing.
+def _kind_pair_edges(
+    stack: Stack, by_id: dict[str, ResourceDesired], left: tuple[str, ...], right: tuple[str, ...],
+) -> dict[str, list[str]]:
+    """`{left-node id: [right-node ids]}` for every edge joining a node whose
+    kind is in `left` to one whose kind is in `right`, in EITHER drawn
+    direction, sorted and de-duplicated so the generated file never depends on
+    edge ordering."""
+    out: dict[str, list[str]] = {}
+    for edge in sorted(stack.edges, key=lambda e: (e.src, e.dst)):
+        matched = [
+            (a, b) for a, b in ((edge.src, edge.dst), (edge.dst, edge.src))
+            if (by_id.get(a) or _NO_RES).kind in left and (by_id.get(b) or _NO_RES).kind in right
+        ]
+        for a, b in matched[:1]:
+            out.setdefault(a, [])
+            out[a] += [b] if b not in out[a] else []
+    return out
+
+
+# A stand-in for "no such node", so `_kind_pair_edges` reads one attribute
+# instead of branching on None twice per direction. Its kind matches nothing.
+_NO_RES = ResourceDesired(id="", kind="")
+
+
 def _ref_dependencies(res: ResourceDesired, refs: Refs) -> list[str]:
     """`[<tf type>.<hcl name>, ...]` for every DISTINCT node this resource's
     `${{...}}` refs point at, sorted for determinism. A ref whose target isn't a
@@ -1155,15 +1201,26 @@ def _resource_arns(label: str, kind: str) -> tuple[str, ...]:
     ) if forms else (label,)
 
 
-def _policy_document(edges, kind_by_id: dict[str, str]) -> str:
-    """The IAM policy JSON for one workload's grants."""
+def _policy_document(edges, kind_by_id: dict[str, str], aws_names: dict[str, str]) -> str:
+    """The IAM policy JSON for one workload's grants.
+
+    `aws_names` maps a node id to the AWS name it is actually created under
+    WHERE THAT DIFFERS FROM ITS LABEL -- today only a log group that some
+    workload's substrate ships into (`_log_group_name`). It has to be applied
+    here, not just in the builder: the gateway authorizes from the applied IAM
+    and `classify.py` reports the group name a request NAMES, so a grant whose
+    Resource kept the old label would deny the very PutLogEvents the edge was
+    drawn to allow.
+    """
     return json.dumps({
         "Version": "2012-10-17",
         "Statement": [
             {
                 "Effect": "Allow",
                 "Action": list(edge.perms),
-                "Resource": list(_resource_arns(edge.dst, kind_by_id.get(edge.dst, ""))),
+                "Resource": list(_resource_arns(
+                    aws_names.get(edge.dst, edge.dst), kind_by_id.get(edge.dst, ""),
+                )),
             }
             for edge in edges if edge.perms
         ],
@@ -1434,12 +1491,89 @@ def _elasticache(res: ResourceDesired, refs: Refs) -> Built:
     }, ""
 
 
-def _ecs_container_definitions(res: ResourceDesired) -> list[dict]:
+# v0.8.15: AN ECR EDGE AUTHORS THE IMAGE.
+#
+# `_ecs_container_definitions` read the node's hand-typed `image` field and
+# NOTHING ELSE -- no edge was consulted anywhere -- so drawing an ecr node to a
+# service granted `ecr:BatchGetImage` and left the service running whatever was
+# typed (in practice the `nginx:alpine` default). The permission was the whole
+# of the edge.
+#
+# The image is emitted as a real TERRAFORM INTERPOLATION of the repository's own
+# attribute, not as an odin-only field and not as a `${{...}}` canvas ref:
+#   * tofu resolves it at apply time, so the taskdef `ecsctl` stores carries the
+#     REAL address (`127.0.0.1:{port}/{name}` -- `gateway/models/ecr.py`, whose
+#     port is minted per env and cannot be typed by a user in advance), which is
+#     what `compute/tasks.py` hands to `docker run`. The consumer therefore
+#     already exists and needed no change;
+#   * it is portable: applied against Amazon it names that account's real
+#     repository URL;
+#   * it creates the implicit dependency for free -- tofu orders the task
+#     definition after the repository without any `depends_on`.
+# A `${{repo.REPOSITORY_URI}}` ref would NOT have worked: `gateway/wiring.py`
+# resolves refs into a container's ENVIRONMENT, and `compute/tasks.py` passes
+# `container_def["image"]` to the driver verbatim, so the placeholder would
+# have reached `docker run` unresolved.
+#
+# NOT TOUCHED, and deliberately: the ECR permission defaults themselves.
+# `ecr:BatchGetImage` has no gateway handler and image-layer traffic never
+# reaches the gateway (the registry is a real `registry:2` container a docker
+# client dials directly -- `gateway/models/ecr.py`'s own docstring), so that
+# grant can never bite. That is a real defect and it is a catalog change; it is
+# reported rather than fixed here.
+_DEFAULT_IMAGE_TAG = "latest"
+
+
+def _ecr_image_key(node_id: str) -> str:
+    """A synthetic `refs` key carrying the HCL name of the ecr repository a
+    workload is edged to -- reserved by the image pass, read by `_ecs_image`."""
+    return f"__ecr_image__{node_id}"
+
+
+def _two_images(repos: list[str]) -> str:
+    return (
+        f"drawn to more than one ECR repository ({', '.join(repr(r) for r in repos)}) and odin "
+        "cannot choose which one holds this service's image — draw one, or type the image address "
+        "into the node's `image` field, which always wins over an edge"
+    )
+
+
+def _ecr_lambda_note(lambda_id: str, repos: list[str]) -> str:
+    """NOT `unsupported`, which feeds a coverage gate: the lambda IS built and
+    IS applied, so claiming odin cannot support it would be false. What is
+    missing is a MEANING for the edge, which is exactly what `wiring_errors`
+    is for (see `TfProject.wiring_errors`)."""
+    return (
+        f"{lambda_id} (lambda): the edge to {', '.join(repr(r) for r in repos)} (ecr) does NOT set "
+        "this function's image — odin's Lambda substrate packages the node's code as a zip and runs "
+        "it in an AWS RIE container (`compute/functions.py`), so container-image packaging "
+        "(`package_type = \"Image\"`) is not modelled at all. Put the code in `code`/`sourceDir`; "
+        "the repository is unused by this function"
+    )
+
+
+def _ecs_image(res: ResourceDesired, refs: Refs) -> str:
+    """A HAND-TYPED `image` always wins -- `odin canvas set`, the README's JSON
+    schema, `import-tf` and the translation agent all write the field directly,
+    and an edge must never silently overwrite something a user typed. Unlike
+    `securityGroups`, an image is single-valued, so `_merge_sg_edges`' "add to
+    it" is not available as an answer here; this is `_merge_role_edges`' rule."""
+    typed = _field(res, "image", "").strip()
+    if typed:
+        return typed
+    repo_name = refs.get(_ecr_image_key(res.id), ("", ""))[1]
+    if not repo_name:
+        return _DEFAULT_ECS_IMAGE
+    tag = _field(res, "imageTag", "").strip() or _DEFAULT_IMAGE_TAG
+    return f"${{aws_ecr_repository.{repo_name}.repository_url}}:{tag}"
+
+
+def _ecs_container_definitions(res: ResourceDesired, refs: Refs) -> list[dict]:
     port = _field(res, "port", _DEFAULT_ECS_PORT)
     port_int = int(port) if port.isdigit() else int(_DEFAULT_ECS_PORT)
     return [{
         "name": res.id,
-        "image": _field(res, "image", _DEFAULT_ECS_IMAGE),
+        "image": _ecs_image(res, refs),
         "essential": True,
         "portMappings": [{"containerPort": port_int, "hostPort": 0, "protocol": "tcp"}],
     }]
@@ -1453,6 +1587,71 @@ def _ecs_container_definitions(res: ResourceDesired) -> list[dict]:
 # rule s3's bucket / sqs's queue name already carry).
 _BAD_LOGS_RETENTION = "retentionInDays must be a whole number of days (e.g. 14)"
 
+# v0.8.15: THE DRAWN GROUP IS THE ONE THAT RECEIVES.
+#
+# The two substrates that ship logs write to a name derived from the WORKLOAD's
+# own id and read no destination from anywhere: `lambdactl._ship_logs` ->
+# `/aws/lambda/{function}`, `ecsctl._ship_task_logs` -> `/ecs/{service}`. So
+# drawing a log-group tile (default label `/odin/logs`) to a lambda `myfn` and
+# applying created TWO groups -- the drawn one, which the policy granted
+# `logs:PutLogEvents` on, and `/aws/lambda/myfn`, which got every line. The
+# drawn one stayed empty forever, and the only canvas that appeared to work was
+# one whose label happened to coincide.
+#
+# The fix runs in the direction that needs no new signal at all: the emitted
+# group takes the name the substrate ALREADY writes to, so the canvas node
+# backs the group that receives. Nothing had to learn to read a destination.
+# (`aws_cloudwatch_log_group` would carry `logging_config`/`logConfiguration`
+# in the other direction, but nothing in odin consumes either -- verified by
+# grep, zero hits outside prose -- so emitting them would only move the
+# decorative line from the canvas into the file.)
+#
+# WHAT THIS COSTS, stated because it breaks an invariant three other modules
+# were written against ("a log group's identity IS its name, and odin's
+# canonical resource id is the node label"):
+#   * `reconcile/tf_status.py::_log_groups` already resolves through the
+#     `odin:node` tag (`_label(tags, name)`), so /world keeps reporting the
+#     node under its own label -- no change needed there, verified;
+#   * `api/logs.py`'s `kind == "logs"` branch assumed name == label and is
+#     changed in the same commit to resolve through that same tag;
+#   * `agent/import_tf.py::_label` prefers the `name` literal, so importing
+#     the generated file back gives the node the DESTINATION as its label.
+#     The file then regenerates byte-identically (label == destination is the
+#     coincidence case), and the drawn edge plus the policy ARN stay
+#     self-consistent -- it is a visible label change, not a broken round
+#     trip. `docs/limits.md` records it.
+# An `ec2` node is deliberately NOT in this table: nothing ships a VM's output
+# into CloudWatch Logs, so an ec2 -> logs edge is a grant for the code INSIDE
+# the VM to call PutLogEvents itself, which works exactly as drawn today.
+_LOG_DESTINATIONS = {"lambda": "/aws/lambda/{label}", "ecs": "/ecs/{label}"}
+_LOG_SHIPPING_KINDS = tuple(sorted(_LOG_DESTINATIONS))
+
+
+def _log_destination(workload: ResourceDesired) -> str:
+    return _LOG_DESTINATIONS[workload.kind].format(label=workload.id)
+
+
+def _log_sink_key(node_id: str) -> str:
+    """A synthetic `refs` key (never a real canvas id) carrying the AWS NAME a
+    logs node must take because it is some workload's sink. Reserved by the
+    log-sink pass, read by `_logs` -- the `_alb_target_key` technique."""
+    return f"__log_sink__{node_id}"
+
+
+def _two_log_destinations(node_id: str, destinations: list[str]) -> str:
+    return (
+        f"drawn as the log sink for more than one workload, and odin's substrates ship to a group "
+        f"named after the workload ({', '.join(destinations)}) — one group cannot be both. Draw one "
+        f"Log Group node per workload (this one is {node_id!r})"
+    )
+
+
+def _log_group_name(res: ResourceDesired, refs: Refs) -> str:
+    """The AWS name this group is created under: the workload's real
+    destination when this node is a sink, else the node's own label (which is
+    every canvas that draws no such edge -- byte-identical to before)."""
+    return refs.get(_log_sink_key(res.id), ("", res.id))[1]
+
 
 def _logs(res: ResourceDesired, refs: Refs) -> Built:
     # No retention field = no `retention_in_days` argument at all, which is
@@ -1461,7 +1660,7 @@ def _logs(res: ResourceDesired, refs: Refs) -> Built:
     retention = _field(res, "retentionInDays", "").strip()
     if retention and not retention.isdigit():
         return _BAD_LOGS_RETENTION
-    attrs = {"name": quote(res.id)}
+    attrs = {"name": quote(_log_group_name(res, refs))}
     if retention:
         attrs["retention_in_days"] = retention
     return attrs, ""
@@ -1634,12 +1833,35 @@ _BUILDERS = {
     "alb": _alb,
 }
 
-# W2.5: which canvas kinds can actually BE an ALB target in v1. An ECS service
-# registers its own tasks (real ECS's scheduler behaviour, modeled in
-# gateway/models/ecsctl.py); an ec2 instance would need an
-# `aws_lb_target_group_attachment` and is recorded as an unbuilt limit instead
-# of silently doing nothing with the edge the user drew.
-_ALB_TARGET_KINDS = ("ecs",)
+# W2.5: which canvas kinds can actually BE an ALB target. An ECS service
+# registers its OWN tasks (real ECS's scheduler behaviour, modeled in
+# gateway/models/ecsctl.py), so it needs a `load_balancer` block on the service
+# and no attachment at all; an ec2 instance is registered by tofu, through an
+# `aws_lb_target_group_attachment` companion (v0.8.15 -- see the companion pass
+# in generate_tf, and `_ALB_NO_LAMBDA` for the one target that is still
+# declined).
+_ALB_TARGET_KINDS = ("ecs", "ec2")
+
+# DECLINED WITH THE REAL REASON, and it is a design decision rather than an
+# unbuilt corner. odin's load-balancer substrate is a real nginx container
+# (`compute/proxy.py`) whose upstreams are `host:port`; a lambda target needs an
+# HTTP request TRANSLATED into the RIE's invoke envelope and the response
+# translated back. That is the identical shim an `apigateway -> lambda` route
+# needs, and building it twice is how odin ends up with two unrelated
+# implementations of one thing -- so it is built once, there, and this says so.
+_ALB_NO_LAMBDA = (
+    "a lambda target needs an HTTP request translated into the RIE's invoke envelope, and odin's "
+    "load-balancer substrate is an nginx reverse proxy that dials host:port upstreams. That "
+    "translation is the same shim an apigateway → lambda route needs and is deliberately built "
+    "once, there, rather than twice"
+)
+
+
+def _alb_target_unsupported(alb_id: str, target_id: str, kind: str) -> str:
+    reason = _ALB_NO_LAMBDA if kind == "lambda" else (
+        f"only {'/'.join(_ALB_TARGET_KINDS)} nodes can be load-balancer targets in Simulate v1"
+    )
+    return f"{alb_id} (alb): target edge to {target_id} ({kind}) — {reason}"
 
 
 def _not_in_terraform(stack: Stack, emitted: set[str], kind_by_id: dict[str, str]) -> list[str]:
@@ -1754,28 +1976,69 @@ def generate_tf(stack: Stack) -> TfProject:
             )
             refs[_ECS_CLUSTER_KEY] = ("ecs_cluster", cluster_name)
 
+    # Pass 1.4 (v0.8.15) — LOG SINK edges. A logs node edged to a workload takes
+    # the AWS name that workload's substrate actually ships to, so the drawn
+    # group is the one that receives (see `_LOG_DESTINATIONS`). `edge_declined`
+    # is the `lambda_declined` shape: a reason pass 2 substitutes for the
+    # builder, so nothing here has to reach into a builder's return value.
+    #
+    # `aws_names` is the same answer for the IAM half -- `_policy_document`
+    # needs it or a granted PutLogEvents into the real group is denied.
+    edge_declined: dict[str, str] = {}
+    aws_names: dict[str, str] = {}
+    for logs_id, workload_ids in _kind_pair_edges(stack, by_id, ("logs",), _LOG_SHIPPING_KINDS).items():
+        if logs_id not in hcl_name_by_id:
+            continue
+        destinations = sorted({_log_destination(by_id[node_id]) for node_id in workload_ids})
+        if len(destinations) > 1:
+            edge_declined[logs_id] = _two_log_destinations(logs_id, destinations)
+            continue
+        refs[_log_sink_key(logs_id)] = ("log_group_name", destinations[0])
+        aws_names[logs_id] = destinations[0]
+
+    # Pass 1.45 (v0.8.15) — ECR IMAGE edges. An ecr node edged to an ecs service
+    # authors that service's container image (`_ecs_image`); edged to a lambda
+    # it authors nothing, and says so through `wiring_errors` rather than
+    # `unsupported` -- the function itself is built and applied perfectly well.
+    for workload_id, repo_ids in _kind_pair_edges(stack, by_id, _WIRED_KINDS, ("ecr",)).items():
+        repos = sorted(repo_id for repo_id in repo_ids if repo_id in hcl_name_by_id)
+        if workload_id not in hcl_name_by_id or not repos:
+            continue
+        if by_id[workload_id].kind == "lambda":
+            wiring_errors.append(_ecr_lambda_note(workload_id, repos))
+            continue
+        if len(repos) > 1:
+            edge_declined[workload_id] = _two_images(repos)
+            continue
+        refs[_ecr_image_key(workload_id)] = ("ecr_repository", hcl_name_by_id[repos[0]])
+
     # Pass 1.5 (W2.5) — resolve ALB TARGET EDGES, which pass 1 can't do (it
     # walks resources, and an edge's other end may not be named yet) and pass 2
-    # can't either (a builder only sees `(res, refs)`, never the edge list). A
-    # NETWORK edge between an `alb` node and a compute node means "this load
-    # balancer fronts that compute": accepted in EITHER drawn direction, since
-    # which end the user started from carries no meaning. The result is a
-    # synthetic `refs` entry per target, which `_ecs` reads to emit its
-    # `load_balancer` block. `alb` deliberately isn't an IAM target on the
-    # canvas (see ui/src/lib/iam.ts), so an alb<->compute edge is unambiguously
-    # this and nothing else.
+    # can't either (a builder only sees `(res, refs)`, never the edge list). An
+    # edge between an `alb` node and a compute node means "this load balancer
+    # fronts that compute": accepted in EITHER drawn direction, since which end
+    # the user started from carries no meaning. `alb` deliberately isn't an IAM
+    # target on the canvas (see ui/src/lib/iam.ts), so an alb<->compute edge is
+    # unambiguously this and nothing else.
+    #
+    # The two supported targets need OPPOSITE machinery, which is why one is a
+    # synthetic `refs` entry and the other a list read by the companion pass:
+    # an ECS service registers its own tasks, so it emits a `load_balancer`
+    # block naming the target group (`_ecs`); an EC2 instance is registered by
+    # tofu, through an `aws_lb_target_group_attachment` naming the instance id.
+    alb_instance_targets: dict[str, list[str]] = {}
     for edge in sorted(stack.edges, key=lambda e: (e.src, e.dst)):
         for alb_id, target_id in ((edge.src, edge.dst), (edge.dst, edge.src)):
             alb_res, target_res = by_id.get(alb_id), by_id.get(target_id)
             if alb_res is None or target_res is None or alb_res.kind != "alb" or alb_id not in hcl_name_by_id:
                 continue
-            if target_res.kind in _ALB_TARGET_KINDS:
+            if target_res.kind == "ec2":
+                targets = alb_instance_targets.setdefault(alb_id, [])
+                targets += [target_id] if target_id not in targets else []
+            elif target_res.kind in _ALB_TARGET_KINDS:
                 refs[_alb_target_key(target_id)] = ("alb_target_group", f"{hcl_name_by_id[alb_id]}_tg")
             else:
-                unsupported.append(
-                    f"{alb_id} (alb): target edge to {target_id} ({target_res.kind}) — only "
-                    f"{'/'.join(_ALB_TARGET_KINDS)} nodes can be load-balancer targets in Simulate v1"
-                )
+                unsupported.append(_alb_target_unsupported(alb_id, target_id, target_res.kind))
             break  # one edge is one (alb, target) pair, whichever way it was drawn
 
     # Pass 1.6 — reserve each granted workload's policy name, so pass 2 can
@@ -1839,7 +2102,7 @@ def generate_tf(stack: Stack) -> TfProject:
     for res in ordered:
         if res.kind not in _BUILDERS:
             continue
-        built = lambda_declined.get(res.id) or _BUILDERS[res.kind](res, refs)
+        built = lambda_declined.get(res.id) or edge_declined.get(res.id) or _BUILDERS[res.kind](res, refs)
         if isinstance(built, str):
             unsupported.append(f"{res.id} ({res.kind}): {built}")
             continue
@@ -1957,7 +2220,7 @@ def generate_tf(stack: Stack) -> TfProject:
         attrs = {
             "name": quote(f"{res.id}-grants"),
             "role": f"aws_iam_role.{role_name}.name",
-            "policy": quote(_policy_document(grants, kind_by_id)),
+            "policy": quote(_policy_document(grants, kind_by_id, aws_names)),
         }
         blocks.append((("iam_role_policy", f"__grants__{res.id}"), _block("aws_iam_role_policy", name, attrs)))
         granted_with_a_policy.add(res.id)
@@ -2046,7 +2309,7 @@ def generate_tf(stack: Stack) -> TfProject:
         own_name = hcl_name_by_id.get(res.id)
         if own_name is None:
             continue
-        container_json = quote(json.dumps(_ecs_container_definitions(res)))
+        container_json = quote(json.dumps(_ecs_container_definitions(res, refs)))
         nested = f"  container_definitions = {container_json}"
         # `cpu`/`memory` only when the canvas actually says so. odin ENFORCES
         # memory -- `compute/tasks.py::_memory_mib` turns the taskdef's value
@@ -2127,6 +2390,34 @@ def generate_tf(stack: Stack) -> TfProject:
             "  }",
         )
         blocks.append((("aws_lb_listener", res.id), listener))
+        # v0.8.15: each EC2 instance this load balancer fronts, registered by
+        # tofu. The gateway half was already there and unreachable: elbv2ctl's
+        # `_target_host` resolves an `i-...` target Id through
+        # `stores.ec2compute` to the VM's real address, and nothing on the
+        # canvas could ever produce such a target because `_ALB_TARGET_KINDS`
+        # excluded ec2.
+        #
+        # `target_id` is the INSTANCE ID (`aws_instance.<n>.id`), which is what
+        # makes `_target_host`'s branch fire; the port is the target group's own
+        # (`_alb_ports`), so the instance is dialled where the group listens.
+        # `built_ids` gates it for the reason pass 2 records -- an attachment
+        # referencing an `aws_instance` that pass 2 declined is an unresolvable
+        # reference, which fails `tofu plan` for the WHOLE project. That
+        # instance's own decline (a node outside any Subnet, say) already names
+        # the cause in `unsupported`, so nothing is lost silently here.
+        for target_id in sorted(alb_instance_targets.get(res.id, [])):
+            if target_id not in built_ids:
+                continue
+            instance_name = hcl_name_by_id[target_id]
+            attachment = _block(
+                "aws_lb_target_group_attachment", f"{own_name}_{instance_name}_attach",
+                {
+                    "target_group_arn": f"aws_lb_target_group.{own_name}_tg.arn",
+                    "target_id": f"aws_instance.{instance_name}.id",
+                    "port": target_port,
+                },
+            )
+            blocks.append((("aws_lb_target_group_attachment", f"{res.id}.{target_id}"), attachment))
 
     blocks.sort(key=lambda b: b[0])
     main_tf = "\n\n".join([HEADER, provider_block(), *(text for _, text in blocks)]) + "\n"
