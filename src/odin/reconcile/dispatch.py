@@ -490,7 +490,14 @@ def _s3_event(pending: dict) -> bytes:
 
 async def _dispatch_pending(stores: SynthStores, env: str, substrate=None) -> list[Delivery]:
     """Pending S3 notifications, oldest first, at most `_MAX_PENDING_PER_PASS`
-    of them, each retried at most `_MAX_DELIVERY_ATTEMPTS` times.
+    ATTEMPTS per pass, each record retried at most `_MAX_DELIVERY_ATTEMPTS`
+    times.
+
+    "attempts per pass" rather than "records per pass" is load-bearing, and is
+    why the sort below is not sliced: a record skipped because its function is
+    mid-redeploy is not an attempt and must not consume a slot. Slicing first
+    would let a few such records hold the ten oldest places and starve every
+    healthy function behind them until the redeploy finished (`_mid_redeploy`).
 
     THE THREE PROPERTIES, because every one of them has a silent failure mode
     and the first version of this function got two of them wrong.
