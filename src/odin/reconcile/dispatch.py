@@ -96,6 +96,25 @@ _SQS_TIMEOUT = 5.0
 # blocks onto the shared loop and stall the gateway and the reconciler
 # together. `httpx.AsyncClient` plus a short poll every tick is the same
 # throughput at a 1s cadence and none of the risk.
+#
+# DO NOT "OPTIMISE" THIS INTO A LONG POLL now that the gateway supports one.
+# Long polling THROUGH the gateway used to be broken outright (a wait of 5s or
+# more came back as a 503 `ServiceUnavailable`, measured), and
+# `gateway/app.py::_long_poll` fixed it -- at which point the obvious next thought
+# is that this poller should use it. It should not, for reasons that fix does not
+# touch:
+#   - this is a RECONCILER TICK, not a request. One pass drains every mapping and
+#     every pending S3 notification in turn, so a 20s park here is 20s that the
+#     drift sweep, the scheduled rules and every other mapping also spend
+#     waiting. A bounded pass is the whole design (see `_MAX_PENDING_PER_PASS`).
+#   - it would also have to outlast `_SQS_TIMEOUT` below, which is sized for a
+#     LOCAL round trip and is what turns a genuinely wedged goaws into a
+#     `source_unavailable` verdict rather than a hang.
+#   - and none of the gateway's work applies anyway: `_sqs_call` dials goaws's own
+#     published port DIRECTLY (see `_queue_url`), so this path never sees the
+#     derived read timeout at all.
+# `tests/gateway/test_sqs_long_poll.py::test_the_event_dispatcher_still_short_polls`
+# is the part of this comment that can fail a build.
 _WAIT_TIME_SECONDS = 0
 
 # How many pending S3 notifications one pass may deliver, and how many times one

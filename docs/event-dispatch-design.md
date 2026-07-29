@@ -108,6 +108,17 @@ The details that are not free:
   still blocks — and it would stall the gateway *and* the reconciler together.
   Use `httpx.AsyncClient`. Short-poll every tick is the same throughput at a 1s
   cadence and none of the risk.
+  **Still true now that the GATEWAY long-polls correctly** (`gateway/app.py::_long_poll`
+  derives the forward read timeout from the caller's own `WaitTimeSeconds`; it
+  used to answer 503 for any wait ≥ 5s). That fix changes nothing here, and the
+  reason is not the client: this is a reconciler **tick**, so a 20s park is 20s
+  the drift sweep, the scheduled rules and every other mapping also spend
+  waiting, and it would have to outlast `_SQS_TIMEOUT` — which is what turns a
+  wedged goaws into a `source_unavailable` verdict instead of a hang. The
+  receive here also dials goaws directly, so it never sees the gateway's derived
+  timeout at all.
+  `tests/gateway/test_sqs_long_poll.py::test_the_event_dispatcher_still_short_polls`
+  is the build-failing version of this paragraph.
 - **Read/delete go DIRECT to the backing port; the invoke goes THROUGH
   `lambdactl`.** The asymmetry is deliberate and worth stating because it looks
   inconsistent. The receive/delete is odin's own bookkeeping, not a workload's
