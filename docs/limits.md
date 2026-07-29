@@ -83,15 +83,19 @@ They are listed because finding one by surprise is worse than reading it here.
   backings and the prune, and reads a cached drift result instead of sweeping. ECS
   stays genuinely live because its task sweep runs on every one of those ticks;
   EC2, Lambda and RDS drift can be up to one sweep cadence stale for the duration.
-- **A drawn edge means something to odin only for six kind pairs out of 378.**
+- **A drawn edge carries a modelled TYPE for only 40 of the 378 kind pairs.**
   Since v0.8.14 every ordered pair of node kinds resolves to exactly one edge
   type, and the honest majority answer is `unmodelled` — 338 of the 378 unordered
   pairs, drawn as a grey line labelled *Not modelled*, stored in the Stack and
-  read by nothing. It was called `network` until now, which was a claim about
-  layer 3 that odin never checked. The pairs that do mean something: `iam`
-  (35 pairs, a real policy), `sg` (2, security-group membership), `role`
-  (`iam_role ↔ lambda`), `target` (`alb ↔ ecs`) and `subscription`
-  (`sns ↔ sqs`). Drawing anything else is decoration, and now says so.
+  read by nothing. It was called `network` until then, which was a claim about
+  layer 3 that odin never checked. The typed remainder: `iam` (35 pairs, a real
+  policy), `sg` (2, security-group membership), `role` (`iam_role ↔ lambda`),
+  `target` (`alb ↔ ecs`) and `subscription` (`sns ↔ sqs`). Drawing anything
+  outside those is decoration, and now says so.
+  The type is what the canvas *shows*; it is not always the whole of what an
+  edge *does*, and the two are worth reading separately — some pairs drive
+  wiring in the generated Terraform beyond the type's own meaning, and those are
+  documented per pair rather than inferable from the label.
 - **A `role` edge works for lambda only.** `iam_role → lambda` folds into the
   lambda's `role` field, which is what `agent/hcl.py` already reads, so the edge
   really does decide the execution role in the generated Terraform. **ec2 and ecs

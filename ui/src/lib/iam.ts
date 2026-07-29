@@ -19,7 +19,17 @@ export const iamActionsForTarget: Record<string, string[]> = {
 export const defaultPermissions: Record<string, string[]> = {
   s3: ['s3:GetObject', 's3:PutObject'],
   lambda: ['lambda:Invoke'],
-  ecr: ['ecr:GetAuthorizationToken', 'ecr:BatchGetImage'],
+  // `ecr:BatchGetImage` was ticked here by default and gates NOTHING locally.
+  // Two independent reasons, both measured: `gateway/models/ecr.py::_HANDLERS`
+  // has no `BatchGetImage` entry (the gateway answers `InvalidAction` 400), and
+  // the image bytes never reach the gateway in the first place -- ecr.py's own
+  // docstring: "The gateway does NOT proxy the registry's v2 HTTP protocol in
+  // this slice", a real `docker pull` dials the `registry:2` container's port
+  // directly. `GetAuthorizationToken` (the docker-login step) is the one ECR
+  // action odin can actually answer and therefore actually gate, so it is the
+  // only one odin ticks FOR you. The rest stay TICKABLE in the catalog because
+  // the generated Terraform is meant to be portable -- see the note there.
+  ecr: ['ecr:GetAuthorizationToken'],
   ecs: ['ecs:RunTask', 'ecs:DescribeTasks'],
   dynamodb: ['dynamodb:GetItem', 'dynamodb:PutItem'],
   sqs: ['sqs:SendMessage', 'sqs:ReceiveMessage'],
