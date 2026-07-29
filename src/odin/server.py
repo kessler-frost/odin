@@ -57,7 +57,13 @@ from odin.spec import store as store_mod
 from odin.spec.models import Stack, World
 from odin.spec.capacity import overcommitted
 from odin.spec.store import SpecStore, StoreUnreadable
-from odin.spec.translate import MODELLED_NODE_TYPES, canvas_to_stack, drawn_node_types, skipped_node_types
+from odin.spec.translate import (
+    MODELLED_NODE_TYPES,
+    canvas_to_stack,
+    connection_conflicts,
+    drawn_node_types,
+    skipped_node_types,
+)
 from odin.util import STORE_LOCK_NAME, StoreLock, atomic_write_text, hold_store_lock, odin_version
 
 ODIN_DIR = Path(".odin")
@@ -1960,8 +1966,17 @@ def create_apply_full_router(
         # verdict before any container exists, and -- the actual bug -- keeps it
         # out of `not_covered`, which is a COVERAGE field. Beside the uncovered
         # refusal so both land before anything is touched.
-        if skeleton.wiring_errors:
-            return _wiring_rejection(skeleton.wiring_errors, env)
+        # v0.8.15 adds the SECOND source of a wiring fault, and it is the same
+        # kind of thing: a connection edge asking to set a variable the consumer
+        # already sets to something else. `_ref_fault` cannot see it -- by the
+        # time hcl.py runs, the translator has already decided the typed value
+        # wins, so the Stack it reads is internally consistent and the drawn line
+        # has silently become a no-op. Reported here, from the canvas the two
+        # were drawn on, so the user is told which line odin ignored instead of
+        # finding out never.
+        wiring_errors = [*skeleton.wiring_errors, *connection_conflicts(stack)]
+        if wiring_errors:
+            return _wiring_rejection(wiring_errors, env)
 
         # CAPACITY: an EC2 node is a real Lima VM with a real memory size, and a
         # placed ECS task gets a real memory cap. "three services of two tasks

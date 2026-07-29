@@ -1,14 +1,18 @@
 /**
- * The four things a drawn edge is now allowed to MEAN, and the one thing it is
- * allowed to mean nothing by.
+ * The things a drawn edge is allowed to MEAN, and the one thing it is allowed to
+ * mean nothing by. Four when this file was written; `connection` was the fifth
+ * (v0.8.15) and lives in `connection-edge.test.ts`, along with the multi-select
+ * picker its arrival made real.
  *
  * Each block below pins a measured defect rather than a design. Before this
  * file: `iam_role -> lambda` was inert, `ecs -> lambda` granted nothing while
  * emitting an empty role, and 341 of 378 unordered pairs answered "Network" --
  * a positive claim about layer 3 that odin never checks.
  */
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'bun:test';
 
+import { catalogTypes } from './catalog';
 import {
   UNMODELLED,
   computeTypes,
@@ -175,5 +179,52 @@ describe('the renamed catch-all', () => {
 
   it('styles an unknown kind as unmodelled rather than crashing', () => {
     expect(edgeStyle('a-kind-nobody-registered').stroke).toBe(edgeTypes[UNMODELLED].color);
+  });
+});
+
+describe('the counts in docs/limits.md are measured, not written', () => {
+  // They went stale within ONE DAY of being written: `alb <-> ec2` became a
+  // target, which moved a pair out of `unmodelled`, and the paragraph went on
+  // saying 40/338. Nobody was careless -- the number simply lives in a file that
+  // no build reads, which is the definition of prose that cannot fail. So the
+  // paragraph is recomputed here from the real registry instead.
+  //
+  // Same reasoning `.claude/CLAUDE.md` gives for pinning the thread inventory in
+  // `tests/test_thread_inventory.py`: "prose about inventories has gone stale
+  // here twice and prose cannot fail a build".
+  const BESPOKE_KINDS = ['vpc', 'subnet', 'sg', 'ec2', 'lambda', 's3', 'dynamodb'];
+  const ALL_KINDS = [...new Set([...BESPOKE_KINDS, ...catalogTypes])].sort();
+
+  const counts = () => {
+    const unordered = new Set<string>();
+    for (const a of ALL_KINDS) for (const b of ALL_KINDS) unordered.add([a, b].sort().join('~'));
+    const byType: Record<string, number> = {};
+    for (const key of unordered) {
+      const [a, b] = key.split('~');
+      const type = detectEdgeTypes(a, b)[0];
+      byType[type] = (byType[type] ?? 0) + 1;
+    }
+    return { total: unordered.size, byType };
+  };
+
+  const LIMITS = readFileSync(new URL('../../../docs/limits.md', import.meta.url), 'utf8');
+
+  it('reads the real limits.md', () => {
+    // Guards the guard: a bad path would make every assertion below vacuous.
+    expect(LIMITS).toContain('A drawn edge carries a modelled TYPE');
+  });
+
+  it('states the right number of typed and unmodelled pairs', () => {
+    const { total, byType } = counts();
+    const unmodelled = byType[UNMODELLED] ?? 0;
+    expect(LIMITS).toContain(`modelled TYPE for only ${total - unmodelled} of the ${total} kind pairs`);
+    expect(LIMITS).toContain(`\`unmodelled\` — ${unmodelled} of the ${total} unordered`);
+  });
+
+  it('states the right per-type counts for the two it enumerates', () => {
+    const { byType } = counts();
+    expect(LIMITS).toContain(`\`iam\`\n  (${byType.iam} pairs, a real policy)`);
+    expect(LIMITS).toContain(`\`sg\` (${byType.sg}, security-group membership)`);
+    expect(LIMITS).toContain(`\`target\` (${byType.target} —`);
   });
 });

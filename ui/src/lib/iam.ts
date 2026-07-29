@@ -34,7 +34,20 @@ export const defaultPermissions: Record<string, string[]> = {
   dynamodb: ['dynamodb:GetItem', 'dynamodb:PutItem'],
   sqs: ['sqs:SendMessage', 'sqs:ReceiveMessage'],
   sns: ['sns:Publish'],
-  rds: ['rds-db:connect'],
+  // `rds-db:connect` was ticked here by default and is the SAME defect as ecr's,
+  // one step worse: `classify.py` builds every rds action as `rds:<Action>` out
+  // of the query protocol's `Action` param, so `rds-db:` is a prefix the
+  // classifier cannot even EMIT, let alone answer. odin implements no IAM
+  // database authentication -- the Postgres container takes its password out of
+  // `DATABASE_URL` and consults nobody.
+  //
+  // Same split as ecr's, for the same reason: it stays TICKABLE in the catalog
+  // because the generated Terraform is meant to be portable, and stops being
+  // pre-ticked because a default is what odin ticks FOR you. What is left is the
+  // one rds action that really is classified and really is enforced -- and what
+  // a user drawing rds -> workload usually wants is the `connection` edge below,
+  // which authors that `DATABASE_URL`.
+  rds: ['rds:DescribeDBInstances'],
   // W2.1: what a workload actually needs to WRITE to a log group it's edged
   // to. The read verbs (GetLogEvents/FilterLogEvents/DescribeLogStreams) are
   // in the catalog's `iamActions` list to tick, but aren't defaults — a
@@ -140,6 +153,13 @@ export const edgeTypes: Record<string, EdgeTypeDef> = {
   // "This topic fans out to that queue" -- it emits a real
   // `aws_sns_topic_subscription`. Rose, matching the SNS node's accent.
   subscription: { id: 'subscription', label: 'Subscription', color: '#fb7185', dashed: false },
+  // "This workload's environment is wired to that endpoint": the edge AUTHORS
+  // the `${{producer.ATTR}}` ref a user would otherwise have to type by hand
+  // (`spec/translate.py::_merge_connection_edges` -> `ResourceDesired.refs` ->
+  // `gateway/wiring.py::node_env`, which injects it into the real container at
+  // launch). Emerald and solid: solid because it is a wire that carries a value,
+  // and a colour of its own because it is neither a grant nor a firewall.
+  connection: { id: 'connection', label: 'Connection', color: '#34d399', dashed: false },
 };
 
 // Given a pair of node types (unordered), return which edge types are valid
@@ -161,6 +181,52 @@ const register = (a: string, b: string, edgeTypeId: string) => {
   const already = edgeTypesForPair[key] ?? [];
   edgeTypesForPair[key] = already.includes(edgeTypeId) ? already : [...already, edgeTypeId];
 };
+
+// --- the connection edge ------------------------------------------------------
+//
+// The most-drawn line in any architecture diagram -- `rds -> ecs`, `cache ->
+// lambda` -- and until v0.8.15 the only one odin did nothing with. It produced a
+// cyan IAM edge whose default grant was `rds-db:connect`, an action the gateway
+// can never emit (see `defaultPermissions.rds`), or for elasticache a
+// Describe-only control-plane grant that cannot gate a Redis GET/SET at all.
+//
+// "Connection" turned out to be THREE mechanisms, and only one of them was
+// missing. Reachability is the `sg` edge and is real. Permission is the `iam`
+// edge and is real where the data plane is AWS-signed. The ADDRESS -- typing
+// `${{db.DATABASE_URL}}` into a consumer's env field by hand -- was real too,
+// and no gesture authored it. So this edge's one job is authoring that ref from
+// the drag: no new substrate, no new gateway model, no new Terraform resource
+// type. `spec/translate.py::_merge_connection_edges` folds it into `refs`, the
+// same way `_merge_sg_edges` and `_merge_role_edges` fold theirs into a field a
+// builder already reads, which is why neither needed a builder change.
+//
+// PRODUCERS are the kinds that publish a wiring fact worth naming
+// (`spec/models.py::REFERENCEABLE_KINDS`), paired with the var a user would have
+// typed. alb/ec2/ecr are referenceable too and deliberately absent: an
+// ALB_ENDPOINT or a REPOSITORY_URI has no single obvious variable name, and
+// guessing one is how you author a field the app does not read.
+export const connectionRefs: Record<string, { var: string; attr: string }> = {
+  rds: { var: 'DATABASE_URL', attr: 'DATABASE_URL' },
+  elasticache: { var: 'REDIS_URL', attr: 'REDIS_URL' },
+};
+
+// CONSUMERS are exactly the kinds whose real container is launched with the
+// node's `env` map, and that is a MEASURED list, not the obvious one:
+// `gateway/wiring.py::node_env` has two callers, `ecsctl.py` and `lambdactl.py`.
+// `ec2compute.py` imports only `workload_env` (the issued gateway credentials)
+// and never `node_env`, so a ref authored onto an ec2 node reaches nothing at
+// all -- the drawn-line-that-does-nothing bug this edge exists to fix, which is
+// why `rds -> ec2` stays IAM-only and says so in docs/limits.md. Same rule
+// `roleHolderTypes` and `sgMemberTypes` already hold.
+export const connectionConsumerTypes = new Set(['ecs', 'lambda']);
+
+// Registered BEFORE the IAM loop, so `connection` is `detectEdgeTypes`'s first
+// entry and therefore what a fresh drag defaults to. These eight ordered pairs
+// are odin's first genuinely ambiguous ones: in AWS both readings are
+// simultaneously true, and `edge-ambiguity.test.ts` names them.
+for (const producer of Object.keys(connectionRefs)) {
+  for (const consumer of connectionConsumerTypes) register(producer, consumer, 'connection');
+}
 
 // Workload → any IAM target (s3/dynamodb + every catalog entry with
 // iamActions) is an IAM permission edge; everything else falls through to
@@ -238,8 +304,62 @@ export function detectDefaultEdgeType(nodeTypeA: string, nodeTypeB: string): str
   return types[0] ?? UNMODELLED;
 }
 
+// --- more than one meaning on one line ----------------------------------------
+//
+// A pair CAN mean two things at once, and in AWS the two usually arrive
+// together: an event source mapping does not work unless the role also holds
+// `sqs:ReceiveMessage`, and a workload wired to a database may also call its
+// control plane. So the picker is multi-select, and `data.edgeType` -- which
+// ROADMAP fixes as the store, so a choice survives a node being moved or
+// retyped -- has to hold a SET.
+//
+// It stays a single string, `+`-joined in registry order. Three reasons that
+// beat adding a second field:
+//   * ONE meaning serialises to exactly the bytes it does today (`"iam"`), so
+//     every canvas ever saved, `spec/translate.py::_EDGE_DATA_SHAPE`'s
+//     `edgeType: str`, and `agent/chat.py`'s `EDGE_KINDS` check are all
+//     untouched. There is no migration, because there is nothing to migrate.
+//   * A second field (`edgeTypes: string[]`) beside `edgeType` would be two
+//     sources of truth for one fact, which is the bug class this whole edge
+//     registry exists to remove.
+//   * `spec/translate.py::_edge` splits it into ONE `Edge` per meaning, so every
+//     Python consumer keeps matching a single kind (`compile_policies` and
+//     `hcl.py::_granted_ids` both gate on `kind == "iam"`) and none of them
+//     needed to change. Collapsing two meanings into one string there would
+//     have silently dropped the grant.
+export const EDGE_TYPE_SEPARATOR = '+';
+
+export function parseEdgeTypes(stored: string | undefined | null): string[] {
+  return [...new Set((stored ?? '').split(EDGE_TYPE_SEPARATOR).map(s => s.trim()).filter(Boolean))];
+}
+
+/** Canonical order is the REGISTRY's, never the click order: two users who tick
+ * the same boxes must produce the same string, or the canvas diffs for nothing. */
+export function serializeEdgeTypes(types: string[], available: string[]): string {
+  const chosen = new Set(types);
+  const ordered = [...available.filter(t => chosen.has(t)), ...types.filter(t => !available.includes(t))];
+  return [...new Set(ordered)].join(EDGE_TYPE_SEPARATOR);
+}
+
+/** The type a joined value RENDERS as: its first meaning. Styling one line two
+ * colours is not available, so the primary wins and the panel lists the rest. */
+export function primaryEdgeType(stored: string | undefined | null): string {
+  return parseEdgeTypes(stored)[0] ?? UNMODELLED;
+}
+
+/** Does a stored value carry this meaning AT ALL -- primary or not?
+ *
+ * Every `=== 'iam'` on a stored value in `Canvas.tsx` had to become this: an edge
+ * stored as `connection+iam` grants exactly as much as one stored `iam`, and
+ * comparing the whole string would have hidden the permission label on the line
+ * while `gateway/policy.py` went on enforcing it. That is the shape of bug this
+ * repo names "the screen saying one thing and the engine doing another". */
+export function includesEdgeType(stored: string | undefined | null, edgeType: string): boolean {
+  return parseEdgeTypes(stored).includes(edgeType);
+}
+
 export function edgeStyle(edgeTypeId: string): React.CSSProperties {
-  const def = edgeTypes[edgeTypeId] ?? edgeTypes[UNMODELLED];
+  const def = edgeTypes[primaryEdgeType(edgeTypeId)] ?? edgeTypes[UNMODELLED];
   return {
     stroke: def.color,
     strokeWidth: 1.5,
@@ -264,7 +384,21 @@ export function edgeDataForConnection(
   sourceType: string, targetType: string,
 ): { edgeType: string; permissions: string[] } {
   const edgeType = detectDefaultEdgeType(sourceType, targetType);
-  if (edgeType !== 'iam') return { edgeType, permissions: [] };
+  return { edgeType, permissions: defaultPermissionsFor(edgeType, sourceType, targetType) };
+}
+
+/**
+ * The permissions a MEANING requires, for this pair. Empty for every meaning but
+ * `iam`: a connection edge grants nothing, because connecting to a Postgres
+ * container with a password consults no IAM at all, and odin does not implement
+ * the one AWS action that would (`rds-db:connect` -- see `defaultPermissions`).
+ * Ticking the IAM box beside it is what a workload calling the RDS control plane
+ * does, and that is a separate, real choice.
+ */
+export function defaultPermissionsFor(
+  edgeType: string, sourceType: string, targetType: string,
+): string[] {
+  if (edgeType !== 'iam') return [];
   // Which end is the RESOURCE being accessed: the end that IS an IAM target.
   //
   // This used to ask "which end is not compute", which has no answer when BOTH
@@ -281,7 +415,102 @@ export function edgeDataForConnection(
   // granted actions on, so direction must NOT decide there. When both ends are
   // genuinely IAM targets -- `ecs <-> lambda` -- the arrow is the only thing
   // that says who calls whom, so the destination end wins.
-  const resourceType = iamTargetTypes.has(targetType) ? targetType
-    : iamTargetTypes.has(sourceType) ? sourceType : '';
-  return { edgeType, permissions: [...(defaultPermissions[resourceType] ?? [])] };
+  //
+  // v0.8.15 REFINEMENT, found by a test rather than by reading. The rule above
+  // asks the destination end first, and `rds` is now paired with `ecs` -- both
+  // of which are IAM targets -- so `rds -> ecs` answered `ecs:RunTask`,
+  // GRANTING THE DATABASE PERMISSION TO RUN ECS TASKS. It also broke this
+  // function's own documented property, that the two orderings of one pair
+  // produce the same permissions "because the user drew the same intent either
+  // way": `rds -> ecs` and `ecs -> rds` disagreed.
+  //
+  // The PRINCIPAL is what was actually missing. Only a compute kind can hold a
+  // role (`agent/hcl.py::_GRANTABLE_KINDS` plus lambda), so where exactly one
+  // end is compute, THAT end is the principal and the other is the resource,
+  // whichever way the line was drawn. The arrow only decides when both ends are
+  // compute, which is the one case where it is the only thing that can.
+  const principalType = computeTypes.has(sourceType) === computeTypes.has(targetType)
+    ? sourceType                                   // both compute, or neither: the arrow says
+    : computeTypes.has(sourceType) ? sourceType : targetType;
+  const otherType = principalType === sourceType ? targetType : sourceType;
+  // The resource is the far end when it is something you can be granted actions
+  // on, else the principal end (`ecs -> ec2`: ec2 is no target, ecs is).
+  const resourceType = iamTargetTypes.has(otherType) ? otherType
+    : iamTargetTypes.has(principalType) ? principalType : '';
+  return [...(defaultPermissions[resourceType] ?? [])];
+}
+
+// --- what the picker in `ConfigPanel.tsx` decides -----------------------------
+//
+// Extracted here for the same reason `edgeDataForConnection` was: the panel is
+// TSX and this repo has no React test runner, so logic left inside the component
+// has no coverage at all. That mattered more than usual for this one -- the
+// `<select>` it replaces was gated on `availableTypes.length > 1` and, since
+// every pair meant exactly one thing until v0.8.15, had NEVER ONCE RENDERED. It
+// was unproven code that looked like working code.
+
+/**
+ * Which meanings an edge currently claims, as the panel should show them.
+ *
+ * A STORED value is honoured verbatim, and it is worth saying why it is not
+ * filtered against `available`: an `iam` edge compiles to a real policy whichever
+ * pair it sits on, because `gateway/policy.py` reads the edge's kind and not the
+ * kinds of its endpoints. Dropping a stored meaning the registry no longer
+ * suggests for that pair would therefore HIDE A LIVE GRANT -- the panel would
+ * show no permissions while the gateway went on enforcing them. `ConfigPanel`
+ * handles the one value that IS overridden (`network`, the pre-rename catch-all,
+ * which decides nothing anywhere) before calling this.
+ *
+ * Nothing stored falls back to the pair's default meaning, which is what a fresh
+ * drag would have written.
+ */
+export function selectedEdgeTypes(
+  stored: string | undefined | null, available: string[],
+): string[] {
+  const parsed = parseEdgeTypes(stored);
+  return parsed.length > 0 ? parsed : available.slice(0, 1);
+}
+
+/** Every box the picker shows: what this pair can mean, plus anything the edge
+ * already claims that it no longer suggests -- so a stored meaning is always
+ * visible and always removable, never a silent extra. */
+export function edgeTypeChoices(
+  stored: string | undefined | null, available: string[],
+): string[] {
+  return [...new Set([...available, ...selectedEdgeTypes(stored, available)])];
+}
+
+/**
+ * The edge data after ticking or unticking one meaning.
+ *
+ * NEVER EMPTY: unticking the last remaining meaning is a no-op, because an edge
+ * with no meaning is a line whose stored kind nothing can read -- it would come
+ * back as `unmodelled` on the next load and quietly lose whatever the user had
+ * chosen. The panel disables that box rather than letting the click look like it
+ * did something.
+ *
+ * Permissions FOLLOW the meaning, which is the whole reason the picker is
+ * multi-select: ticking `iam` seeds the defaults for the resource end (a grant
+ * with nothing ticked reserves a role and emits a policy-less `aws_iam_role`),
+ * and unticking it clears them, because `permissions` on a non-`iam` edge is
+ * read by nothing on the Python side.
+ */
+export function toggleEdgeType(
+  stored: string | undefined | null, available: string[],
+  edgeType: string, on: boolean, sourceType: string, targetType: string,
+  permissions: string[] = [],
+): { edgeType: string; permissions: string[] } {
+  const current = selectedEdgeTypes(stored, available);
+  const next = on
+    ? [...current, edgeType]
+    : current.filter(t => t !== edgeType);
+  const kept = next.length > 0 ? next : current;
+  const iamOn = kept.includes('iam');
+  const wasIam = current.includes('iam');
+  return {
+    edgeType: serializeEdgeTypes(kept, available),
+    permissions: iamOn
+      ? (wasIam ? permissions : defaultPermissionsFor('iam', sourceType, targetType))
+      : [],
+  };
 }

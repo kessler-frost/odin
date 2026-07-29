@@ -136,16 +136,66 @@ They are listed because finding one by surprise is worse than reading it here.
   backings and the prune, and reads a cached drift result instead of sweeping. ECS
   stays genuinely live because its task sweep runs on every one of those ticks;
   EC2, Lambda and RDS drift can be up to one sweep cadence stale for the duration.
-- **A drawn edge carries a modelled TYPE for only 40 of the 378 kind pairs.**
-  Since v0.8.14 every ordered pair of node kinds resolves to exactly one edge
-  type, and the honest majority answer is `unmodelled` — 338 of the 378 unordered
-  pairs, drawn as a grey line labelled *Not modelled*, stored in the Stack and
-  read by nothing. It was called `network` until now, which was a claim about
-  layer 3 that odin never checked. The pairs that do mean something: `iam`
-  (35 pairs, a real policy), `sg` (2, security-group membership), `role`
-  (`iam_role ↔ lambda`), `target` (`alb ↔ ecs`, and `alb ↔ ec2` since v0.8.15)
-  and `subscription`
-  (`sns ↔ sqs`). Drawing anything else is decoration, and now says so.
+- **A drawn edge carries a modelled TYPE for only 41 of the 378 kind pairs.**
+  The honest majority answer is `unmodelled` — 337 of the 378 unordered pairs,
+  drawn as a grey line labelled *Not modelled*, stored in the Stack and read by
+  nothing. It was called `network` until v0.8.14, which was a claim about layer 3
+  that odin never checked. Re-measured 2026-07-29 over the real 27 canvas kinds,
+  the pairs that do mean something: `iam`
+  (31 pairs, a real policy), `connection` **and** `iam` together (4),
+  `sg` (2, security-group membership), `target` (2 — `alb ↔ ecs`, and since
+  v0.8.15 `alb ↔ ec2`), `role` (`iam_role ↔ lambda`) and `subscription`
+  (`sns ↔ sqs`). Drawing anything else is decoration, and now
+  says so.
+  Three more pairs carry a SECOND meaning on top of the grant, added in
+  v0.8.15 because a permission whose subject is not wired is the same
+  decoration under a colour: `logs ↔ lambda|ecs` decides which group the
+  workload's output lands in, and `ecr ↔ ecs` decides the service's image. Both
+  are described in their own entries below. The edge *type* is unchanged for
+  all three — they stay `iam` — because the passes that read them key on the
+  two NODE kinds. `connection` is the one that does get its own type, because
+  unlike those it is a meaning a user has to CHOOSE (see the next entry).
+- **Four kind pairs mean two things at once, and odin asks.** `rds` and
+  `elasticache` against `ecs` and `lambda` — 8 ordered pairs — are simultaneously
+  a `connection` (the workload's environment is wired to the endpoint) and an
+  `iam` grant (the workload calls the service's control plane), because in AWS
+  both readings are true at the same time. These are the only ambiguous pairs
+  odin has, the config panel offers a **multi-select** on them rather than
+  picking silently, and `ui/src/lib/edge-ambiguity.test.ts` fails by name if a
+  ninth appears. `data.edgeType` then stores a `+`-joined set
+  (`"connection+iam"`), which `spec/translate.py::_edges` splits into one `Edge`
+  per meaning; a single meaning has no separator and is stored exactly as it
+  always was, which is why no saved canvas needed migrating.
+- **A `connection` edge works for ecs and lambda only, and for rds and
+  elasticache only.** It authors the ref a user would otherwise type by hand —
+  `DATABASE_URL=${{db.DATABASE_URL}}`, `REDIS_URL=${{cache.REDIS_URL}}` — into the
+  consumer node, where `gateway/wiring.py::node_env` resolves it and injects it
+  into the real container at launch. **ec2 is deliberately excluded**: `node_env`
+  has exactly two callers, `gateway/models/ecsctl.py` and
+  `gateway/models/lambdactl.py`, and `gateway/models/ec2compute.py` never calls
+  it, so a ref authored onto an ec2 node would reach nothing at all. `alb` and
+  `ecr` publish wiring facts too (`ALB_ENDPOINT`, `REPOSITORY_URI`) and are
+  excluded for the other reason: neither has one obvious variable name, and
+  guessing one authors a field the app does not read. Those pairs stay
+  IAM-only or `unmodelled`, the same rule the role edge above holds.
+  A **hand-typed value wins**: `odin canvas set`, the README's JSON schema and
+  the translation agent all write `env` directly, and an edge must not become a
+  second source of truth beside a field. Where the two genuinely disagree —
+  including two databases edged to one service, both wanting `DATABASE_URL` —
+  the merge keeps the typed value deterministically and the disagreement is
+  reported in `wiring_errors`, which **refuses the apply**: odin cannot tell
+  which one you meant, so it changes nothing and names both.
+  It only takes effect on an edge you drew or ticked as a `connection`. Every
+  canvas saved before v0.8.15 types this pair `iam` and is completely unaffected
+  — no new variable, no new `depends_on`, no conflict.
+  The address it hands out is the plain published-port one; see *Which endpoint
+  fact your security groups actually govern* below for why `DATABASE_URL_MESH`
+  is the gated form and is still not what the edge writes.
+  These counts are not prose: `ui/src/lib/edge-types.test.ts` recomputes them
+  from the real registry and fails if this paragraph disagrees. They went stale
+  within a day of being written — `alb ↔ ec2` moved one pair out of `unmodelled`
+  and the numbers here still read 40/338 — which is the whole argument for
+  measuring them from a test rather than trusting a careful writer.
 - **An edge's TYPE is not always the whole of what it does.** Three pairs
   carry a second meaning on top of the grant, added in v0.8.15 because a
   permission whose subject is not wired is the same decoration under a
@@ -155,6 +205,9 @@ They are listed because finding one by surprise is worse than reading it here.
   two stay `iam` — because the passes that read them key on the two NODE
   kinds and never on `edge.kind`. Each is documented in its own entry below;
   none of them is inferable from the label the canvas draws.
+  `connection` is the counter-example, and the contrast is the point: it is the
+  one second meaning a user has to CHOOSE, so it gets its own type, its own
+  colour and a `+`-joined `edgeType` — see the two entries above.
 - **A Log Group drawn as a workload's sink is created under the WORKLOAD's
   name, not the node's label.** odin's two log shippers write to a name derived
   from the workload and read no destination from anywhere:
@@ -196,26 +249,70 @@ They are listed because finding one by surprise is worse than reading it here.
   control yet, so it is reachable only from hand-authored JSON, `odin canvas
   set` and `import-tf`. Two repositories drawn to one service is declined
   rather than guessed.
+  **You must `docker push` before you apply the service**, and that ordering is
+  the real constraint rather than a test artefact: odin never builds or pushes
+  anything, so an apply that creates the repository and the service together
+  asks ECS to run a tag that does not exist yet, and the service fails its
+  converge timeout. Apply the repository, push, then apply the service.
+  MEASURED end to end on 2026-07-29 (`tests/simulate/test_ecr_image_edge_e2e.py`),
+  because one link in that chain had never been exercised: `ecr.py`'s docstring
+  only ever claimed `127.0.0.1:{port}/{name}` works for a HOST-side `docker`
+  CLI, and nothing had asked the *daemon inside Colima* to pull from it. It
+  does — tofu resolved the attribute before RegisterTaskDefinition (`ecsctl`
+  stored `127.0.0.1:32824/edgebld-app:latest`, not a literal `${...}`), and the
+  task container came up running exactly that image after the local tag had
+  been deleted, so the pull genuinely went to the registry.
   For a lambda the edge authors nothing and says so in `wiring_errors` (never
   `unsupported` — the function is built and applied perfectly well): odin's
   Lambda substrate packages the node's code as a zip and runs it in an AWS RIE
   container, so `package_type = "Image"` is not modelled at all.
-- **`ecr:GetAuthorizationToken` / `ecr:BatchGetImage` are grants that can never
-  bite.** Neither has a gateway handler, and image-layer traffic never reaches
-  the gateway in the first place: ECR's data plane is a real `registry:2`
-  container that a docker client dials directly, and the gateway does not proxy
-  the registry v2 protocol at all (`gateway/models/ecr.py`'s own docstring). So
-  an ECR permission edge is enforced by nothing. Open; it is a catalog change
-  in `ui/src/lib/iam.ts`, not a translator one.
-- **An `alb ↔ ec2` edge registers a real target, and the UI has not caught up.**
-  Since v0.8.15 the builder's `_ALB_TARGET_KINDS` is `("ecs", "ec2")` and the
-  edge emits an `aws_lb_target_group_attachment` naming `aws_instance.<n>.id` —
-  the form `elbv2ctl._target_host` resolves through the EC2-compute store to the
-  VM's real address. **`ui/src/lib/iam.ts::albTargetTypes` is still
-  `new Set(['ecs'])`**, so the canvas labels that line *Not modelled* while tofu
-  registers a live target for it. Presentational only — the generated Terraform
-  is correct either way — but the two disagree on `develop` today, and the fix
-  is that one-line set.
+- **An ECR grant covers the CONTROL plane only — nothing gates a `docker pull`.**
+  This entry said "`ecr:GetAuthorizationToken` / `ecr:BatchGetImage` are grants
+  that can never bite. Neither has a gateway handler", and was **half wrong in
+  the direction that undersells odin**: `GetAuthorizationToken` IS one of
+  `gateway/models/ecr.py::_HANDLERS`' seven entries, so the docker-login step
+  really is classified and really is enforced. It also called the fix Open after
+  it had landed.
+  What is true is the image bytes: the data plane is a real `registry:2`
+  container that a docker client dials on its own published port, the gateway
+  does not proxy the registry v2 protocol at all (`ecr.py`'s own docstring), and
+  that registry runs auth-less by design — so no IAM edge can stop anyone pulling
+  the image. `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer` and
+  `ecr:BatchCheckLayerAvailability` have no handler and no request could reach
+  them anyway.
+  They are still TICKABLE, because the generated Terraform is meant to be
+  portable and on real AWS these are exactly the verbs a pull needs — but they
+  stopped being PRE-TICKED in v0.8.15, since a default is what odin ticks for you
+  and must not assert a protection odin has not got. The distinction is kept
+  honest by `tests/gateway/test_ecr_vocabulary_has_handlers.py`, which fails both
+  if an offered op has no handler and no `PORTABLE_ONLY` declaration, and if a
+  `PORTABLE_ONLY` op ever gains one.
+- **An `alb ↔ ec2` edge registers a real target.** Since v0.8.15 the builder's
+  `_ALB_TARGET_KINDS` is `("ecs", "ec2")` and the edge emits an
+  `aws_lb_target_group_attachment` naming `aws_instance.<n>.id` — the form
+  `elbv2ctl._target_host` resolves through the EC2-compute store to the VM's
+  real address. The canvas half (`ui/src/lib/iam.ts::albTargetTypes`) and the
+  builder half briefly disagreed, which would have labelled a live target
+  *Not modelled*; they are now kept in step by
+  `tests/spec/test_edge_registry_matches_builders.py`, which compares the two
+  lists across the language boundary and fails naming whichever side is behind.
+  **That resolution had never once run**, and the sentence above was true only
+  of the docstring until v0.8.15: `_instance_address` read
+  `private_ip_address`/`public_ip_address`, two keys `gateway/models/
+  ec2compute.py` has never written (its record carries `private_ip`/
+  `public_ip`). It returned `None` for every real instance, so the proxy was
+  handed the bare `i-…` id — and its one test had fabricated a record with the
+  key the reader wanted, which is honesty rule 1 living inside a test. Nothing
+  on the canvas could produce an `i-…` target either, so the field never
+  contradicted it. It is recorded here rather than quietly fixed because the
+  same docstring is what a reader (and one of this repo's own briefs) already
+  trusted once. MEASURED end to end on 2026-07-29,
+  `tests/simulate/test_alb_ec2_target_e2e.py`: a real Lima VM at
+  `192.168.64.2`, a real nginx proxy, `GET` the load balancer's published port
+  → **200** with the VM's own bytes. Re-injecting the old keys fails that test
+  on the rendered nginx config, which reads
+  `server i-994e52be19f90b93a:80 max_fails=1 fail_timeout=30s;` — an upstream
+  nginx cannot resolve.
 - **A lambda cannot be a load-balancer target.** `alb ↔ lambda` is declined with
   the reason rather than silently ignored: odin's load-balancer substrate is a
   real nginx container whose upstreams are `host:port` (`compute/proxy.py`), and
@@ -235,7 +332,7 @@ They are listed because finding one by surprise is worse than reading it here.
   Two *different* role edges drawn to one lambda is a contradiction odin cannot
   resolve: the alphabetically lowest role name wins, deterministically, so the
   generated file never depends on edge ordering. Nothing reports the conflict.
-- **`edge.kind` decides nothing in any builder.** The subscription and ALB passes
+- **`edge.kind` decides nothing in any BUILDER.** The subscription and ALB passes
   in `agent/hcl.py`, and `reconcile/reconciler.py::_desired_subs`, all match on
   the two NODE kinds and never read the edge's kind — so an `iam`-typed line
   between an SNS node and an SQS node still emits a real
@@ -247,6 +344,23 @@ They are listed because finding one by surprise is worse than reading it here.
   from the generated HCL for all of them, and `tofu` would **destroy the live
   subscription** on the next apply — with the reconciler silent, because
   `_desired_subs` only ever adds a missing subscription and never unsubscribes.
+  Three edge kinds ARE gated on the kind, and all three are gated in
+  `spec/translate.py` rather than in a builder: `sg`, `role` and `connection`
+  each fold into a field or a ref the builder already reads, so the builder
+  still cannot tell how the value got there. That is the safe direction of the
+  same rule. A gate that can **remove** something already being built is the
+  hazard; a new meaning gated on a new kind only withholds a new feature from an
+  old canvas, which destroys nothing and is what upgrading should mean.
+- **There is no IAM database authentication, so `rds-db:connect` gates nothing.**
+  `gateway/classify.py` builds every rds action as `rds:<Action>` out of the
+  query protocol's `Action` param, so the `rds-db:` prefix is unreachable and a
+  policy granting it could never match. Nothing in odin consults IAM when a
+  workload opens a Postgres connection — the container takes the password out of
+  `DATABASE_URL`. It stays TICKABLE for the same portability reason ECR's layer
+  verbs do, and it stopped being the DEFAULT a drawn `rds` edge ticks in
+  v0.8.15; the default is now `rds:DescribeDBInstances`, which is classified and
+  enforced, and what a user drawing that line usually wants is the `connection`
+  edge above.
 - **SNS→SQS subscriptions** are all generated with `raw_message_delivery = true`,
   so the queue gets the published body verbatim rather than SNS's JSON envelope,
   and that holds on an import round trip even if your `.tf` said otherwise. It
