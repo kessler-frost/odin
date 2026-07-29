@@ -15,9 +15,18 @@ destroys and re-creates the container to fix a crash, and until the volume was
 named that handed the user back an EMPTY database with a green apply. The
 volume is created with the container and removed with `delete_db`, never in
 between.
+
+v0.8.15 closes what that left open: a named volume is exactly a volume `docker rm
+-f -v` does NOT remove, and until now NOTHING removed one outside `delete_db`.
+Four orphans from two environments that no longer existed in any form -- no
+containers, no `.odin/<env>/`, absent from `GET /envs` -- were measured on the
+development machine, and a Postgres data directory is not small. `reclaim_env_volumes`
+below is the reclaim, and `ENV_LABEL` is the only thing it keys on.
 """
 from __future__ import annotations
 
+import logging
+from dataclasses import dataclass
 from pathlib import Path
 
 import asyncpg
@@ -25,6 +34,8 @@ import asyncpg
 from odin.fabric.models import FirewallRules
 from odin.fabric.sidecar import MeshSidecar
 from odin.runtime.colima import ContainerSpec
+
+log = logging.getLogger("odin.rds")
 
 POSTGRES_IMAGE = "postgres:16-alpine"
 # The engine version odin's substrate really is -- derived from the image tag
@@ -71,6 +82,110 @@ def volume_name(env: str, db_id: str) -> str:
     runtime whether this exact volume is still there before it tells a user
     their data survived)."""
     return f"{container_name(env, db_id)}-data"
+
+
+# --- reclaiming the disk a dead environment left behind -------------------
+#
+# The shape is `BackingAws.gc`'s, deliberately: an idempotent, ENV-SCOPED sweep
+# that removes what the env no longer needs and is safe to run when there is
+# nothing to do. Two things are different, and both are because the stakes are.
+#
+# 1. `gc` is driven by which KINDS are still active, so it stops a backing the
+#    moment the last bucket leaves the canvas. A volume sweep may NOT work that
+#    way. A database whose node was just dragged off the canvas mid-edit still
+#    holds the user's rows, and reclaiming on "absent from the desired Stack"
+#    would vaporise them. So the ONLY thing that removes a live env's volume
+#    stays `delete_db` -- a real DELETE, through a real apply. This sweep never
+#    looks inside a live env at all.
+# 2. `gc` runs on every reconciler tick. This does not, and cannot: a reconciler
+#    is per-env, docker volumes are per-MACHINE, and "no environment claims this
+#    volume" is a question no per-env loop can answer -- a second odin with its
+#    own store root (every parallel agent worktree on this machine has one) owns
+#    envs the first one has never heard of. A tick that swept on that reasoning
+#    would delete the other one's databases. So the reclaim is only ever driven
+#    by an env NAME somebody supplied: `odin env rm <env>`.
+
+
+# The two fixed ends of `volume_name(env, db_id)`. Pinned against the builder
+# itself by `tests/aws/test_volume_reclaim.py` rather than trusted to stay in
+# step, because everything below reads them and nothing else would notice.
+VOLUME_PREFIX = "odin-rds-"
+VOLUME_SUFFIX = "-data"
+
+
+def volume_env_candidates(volume: str) -> tuple[str, ...]:
+    """Every environment name that COULD have produced `volume`, shortest first
+    -- or `()` if it is not shaped like an rds data volume at all.
+
+    A GUESS, and plural on purpose. `odin-rds-conn2-app-db-data` is env `conn2`
+    database `app-db` and env `conn2-app` database `db`, and the string does not
+    say which; both halves may contain `-`. Nothing that DELETES may use this
+    (see `runtime/colima.py::ENV_LABEL`) -- it exists so `GET /volumes` can offer
+    a starting point for a volume whose `odin.env` label is missing, and label the
+    offer a guess."""
+    if not (volume.startswith(VOLUME_PREFIX) and volume.endswith(VOLUME_SUFFIX)):
+        return ()
+    parts = volume[len(VOLUME_PREFIX):-len(VOLUME_SUFFIX)].split("-")
+    # `1..len-1`: a name has to leave at least one segment for the db_id, so a
+    # bare `odin-rds-db-data` yields nothing rather than the env `db`.
+    return tuple("-".join(parts[:k]) for k in range(1, len(parts)))
+
+
+@dataclass(frozen=True)
+class VolumeReclaim:
+    """What ONE env-scoped sweep really did -- never what it attempted.
+
+    Three fields because there are three genuinely different answers, and
+    collapsing any two of them is this repo's most-repeated bug: `reclaimed`
+    empty with `standing` empty and `unknown` empty means there was nothing to
+    reclaim, which is a success; `unknown` means odin could not even ask, which
+    is not."""
+
+    reclaimed: tuple[str, ...] = ()
+    standing: tuple[dict, ...] = ()
+    unknown: str = ""
+
+    @property
+    def failed(self) -> bool:
+        return bool(self.standing or self.unknown)
+
+
+async def reclaim_env_volumes(runtime, env: str) -> VolumeReclaim:
+    """Remove every named volume LABELLED as `env`'s, and report each one that
+    would not go.
+
+    Scoped by `ENV_LABEL` and nothing else, so it cannot reach another
+    environment's data however similar the names are -- which a name-shaped
+    filter cannot promise (`volume_env_candidates`).
+
+    Both `except` blocks here are load-bearing rather than defensive:
+
+    * The listing one. "Odin could not ask docker" and "there are no volumes"
+      arrive as the same empty list otherwise, and the caller turns the second
+      into a completed removal -- the exact substitution field test 6 found in
+      `_surviving_containers`, whose `None`-not-`[]` reasoning this copies.
+    * The per-volume one. `remove_volume` raises on a volume that is still
+      attached (probed: `rc 1: remove <vol>: volume is in use - [<container
+      id>]`), and that refusal is docker REFUSING TO DESTROY DATA -- the guard
+      working, not an error to route around. Catching per volume means one
+      refusal cannot hide the others, and the reason is carried out by name
+      instead of being logged and dropped: a reclaim that silently skips
+      everything looks identical to one that had nothing to do."""
+    try:
+        names = await runtime.volume_names(env=env)
+    except Exception as exc:  # noqa: BLE001 -- any CLI/parse failure means "unknown"
+        log.warning("could not list env %r's volumes to reclaim them (%s)", env, exc)
+        return VolumeReclaim(unknown=str(exc))
+    reclaimed: list[str] = []
+    standing: list[dict] = []
+    for name in sorted(names):
+        try:
+            await runtime.remove_volume(name)
+        except Exception as exc:  # noqa: BLE001 -- docker's refusal IS the answer
+            standing.append({"volume": name, "reason": str(exc)})
+        else:
+            reclaimed.append(name)
+    return VolumeReclaim(tuple(reclaimed), tuple(standing))
 
 
 class PostgresRds:
@@ -152,7 +267,7 @@ class PostgresRds:
         # `ModifyDBInstance` password change the volume's own credentials are
         # the current ones, and `set_password` put them there with a real
         # `ALTER USER`.
-        await self._rt.create_volume(self.volume_name(db_id))
+        await self._rt.create_volume(self.volume_name(db_id), self._env)
         await self._rt.run_container(ContainerSpec(
             name=name,
             image=POSTGRES_IMAGE,
