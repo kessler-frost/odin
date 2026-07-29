@@ -165,6 +165,39 @@ def _verdict(outcome: str, trigger: str, detail: str) -> str:
     return _VERDICT[outcome](trigger, detail)
 
 
+def _mid_redeploy(stores: SynthStores, env: str, function_name: str) -> bool:
+    """Is this function being replaced right now?
+
+    `lambdactl`'s deploy path removes the old container BEFORE starting the new
+    one, so there is a real window where an invoke cannot succeed and NOTHING is
+    wrong. `drift.py` exempts that window and this file honoured nothing.
+
+    IN FLIGHT, not merely not-running: `last_update_status == "InProgress"` or
+    `state == "Pending"`. The first draft read `state != "Active"`, which also
+    swallows `Failed` -- and a Failed function is genuinely broken, so its
+    notifications must burn attempts and eventually be given up on rather than
+    retried forever against a function that will never answer. The existing
+    `test_a_failed_delivery_KEEPS_the_record_for_the_next_tick` caught that
+    overreach immediately, which is the argument for narrow predicates over
+    convenient ones.
+
+    What that cost, before the fix: a redeploy burned one delivery attempt per
+    tick, so a redeploy slower than `_MAX_DELIVERY_ATTEMPTS` ticks dropped every
+    notification enqueued during it AND reported `GIVING UP after 5 attempts` --
+    a lost event with a false verdict layered on top, which is both halves of
+    this repo's worst bug class in one place.
+
+    The caller must SKIP without counting the attempt and without consuming a
+    batch slot. "Don't count the failure" alone is not enough and is worse than
+    it looks: the drain is oldest-first, so records for a redeploying function
+    would sit at the head forever and starve every healthy function behind them
+    for the whole redeploy."""
+    record = stores.lambdactl.get(env, f"fn:{function_name}")
+    if record is None:
+        return False
+    return record.get("last_update_status") == "InProgress" or record.get("state") == "Pending"
+
+
 async def _deliver(
     stores: SynthStores, env: str, function_name: str, payload: bytes, trigger: str,
     substrate=None,
@@ -488,13 +521,23 @@ async def _dispatch_pending(stores: SynthStores, env: str, substrate=None) -> li
        and a SLOW handler makes the pass itself exceed one tick, in which case
        ticks queue behind `Reconciler._tick_lock` rather than overlapping -- the
        reconciler falls behind, it does not double-run."""
+    # NOT sliced here: the batch bounds ATTEMPTS, and a record skipped for a
+    # redeploying function is not an attempt. Slicing first would let a handful
+    # of such records hold the ten oldest slots and starve everything behind
+    # them until the redeploy finished.
     pending = sorted(
         ((key, record) for key, record in stores.dispatch.items(env).items() if key.startswith("pending:")),
         key=lambda item: item[1]["at"],
-    )[:_MAX_PENDING_PER_PASS]
+    )
     out: list[Delivery] = []
+    attempted = 0
     for key, record in pending:
+        if attempted >= _MAX_PENDING_PER_PASS:
+            break
         function_name = record["target_arn"].rsplit(":", 1)[-1]
+        if _mid_redeploy(stores, env, function_name):
+            continue
+        attempted += 1
         trigger = f"the {record['bucket']!r} notification for {record['key']!r}"
         delivery = await _deliver(stores, env, function_name, _s3_event(record), trigger, substrate)
         if delivery.fired:

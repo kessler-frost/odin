@@ -498,15 +498,21 @@ They are listed because finding one by surprise is worse than reading it here.
   (a `ReadTimeout` is an `httpx.HTTPError`, which the gateway maps to
   "the backing isn't there"). Short-poll, or keep `WaitTimeSeconds` under 5.
   odin's own dispatcher short-polls (`WaitTimeSeconds=0`) and is unaffected.
-- **S3 bucket notifications do not work at all, and the failure is loud in one
-  place and silent in another.** `aws_s3_bucket_notification` is forwarded to
+- **S3 bucket notifications fire only for a LAMBDA target, and only for writes
+  through the gateway.** They work as of v0.8.15, and the way they got there is
+  the reason for the shape: `aws_s3_bucket_notification` used to be forwarded to
   RustFS, which **rejects every notification ARN form with `InvalidArgument` and
-  stores the configuration anyway** (measured against `rustfs/rustfs:latest`). So
-  `tofu apply` fails, the next `plan` reads the config back through GET and
-  reports no drift, and nothing ever fires. Do not draw an S3 trigger yet.
+  stores the configuration anyway** (measured against `rustfs/rustfs:latest`) —
+  so an apply failed, the next `plan` read the config back through GET and
+  reported no drift, and nothing ever fired. Pass-through was therefore
+  impossible, and odin answers `PutBucketNotificationConfiguration` itself; the
+  request never reaches RustFS. Delivery is synthesized from traffic the gateway
+  already sees, so a write sent straight at a backing container's published port
+  fires nothing — in practice every workload gets `AWS_ENDPOINT_URL`, so every
+  workload write goes through. A queue or topic target is refused at PUT with
+  `InvalidArgument` rather than stored, because nothing would drain it.
 - **An S3 removal notification OVER-FIRES for a key that never existed.**
-  Applies once bucket notifications land (`gateway/models/s3notify.py` +
-  the dispatcher). S3 deletes are idempotent: deleting a key that was never
+  S3 deletes are idempotent: deleting a key that was never
   there SUCCEEDS. Measured against `rustfs/rustfs:latest` — deleting one real
   key and one that never existed returned HTTP 200 and reported **both** as
   `<Deleted>`, with zero `<Error>` entries; the single-object `DELETE` answers

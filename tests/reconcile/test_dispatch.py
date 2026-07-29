@@ -522,3 +522,71 @@ async def test_a_source_that_raises_is_logged_and_the_others_still_deliver(store
     assert verdicts == {}
     assert len(functions.payloads) == 1, "the healthy source still delivered"
     assert "dispatch pass failed for scheduled rules" in caplog.text
+
+
+# --- the mid-redeploy exemption --------------------------------------------
+#
+# Found by `s3notify` reviewing this file's source rather than agreeing from a
+# summary, and verified before fixing: `drift.py` exempts a redeploying function
+# on BOTH signals (`state != "Active"`, `last_update_status == "InProgress"`) and
+# `dispatch.py` honoured neither. `lambdactl`'s deploy path removes the old
+# container before starting the new one, so that window is real and nothing is
+# wrong during it.
+
+
+async def test_a_redeploying_function_does_not_burn_delivery_attempts(stores):
+    """The bug, in the direction that loses data. A redeploy slower than
+    `_MAX_DELIVERY_ATTEMPTS` ticks used to drop every notification enqueued
+    during it AND report `GIVING UP after 5 attempts` — a lost event with a
+    false verdict on top."""
+    seed_function(stores, state="Active")
+    stores.lambdactl.set(ENV, f"fn:{FUNCTION}", {
+        **stores.lambdactl.get(ENV, f"fn:{FUNCTION}"), "last_update_status": "InProgress",
+    })
+    stores.dispatch.set(ENV, "pending:abc", {
+        "bucket": "uploads", "key": "a/b.png", "event_name": "s3:ObjectCreated:Put",
+        "target_arn": FUNCTION_ARN, "at": 1.0, "size": 42, "etag": "e1",
+    })
+    functions = FakeFunctions()
+
+    for _ in range(8):  # comfortably past the give-up bound
+        await Dispatcher(functions, MovableClock()).verdicts(stores, ENV)
+
+    record = stores.dispatch.get(ENV, "pending:abc")
+    assert record is not None, "the notification was dropped while its function was redeploying"
+    assert record.get("attempts", 0) == 0, f"a redeploy burned attempts: {record}"
+    assert functions.payloads == [], "nothing should have been invoked mid-redeploy"
+
+
+async def test_a_redeploying_function_does_not_starve_the_healthy_ones(stores):
+    """The interaction, which is why 'do not count the failure' alone is wrong.
+    The drain is oldest-first, so records for a redeploying function would hold
+    the head of the queue and block everything behind them for the whole
+    redeploy. They must not consume a batch slot either."""
+    seed_function(stores, state="Active")
+    stores.lambdactl.set(ENV, f"fn:{FUNCTION}", {
+        **stores.lambdactl.get(ENV, f"fn:{FUNCTION}"), "last_update_status": "InProgress",
+    })
+    other, other_arn = "healthy-fn", "arn:aws:lambda:us-east-1:000000000000:function:healthy-fn"
+    stores.lambdactl.set(ENV, f"fn:{other}", {
+        "function_name": other, "function_arn": other_arn, "state": "Active",
+        "last_update_status": "Successful", "last_invocation_error": None,
+    })
+    # 12 older records for the redeploying function -- more than the batch of 10.
+    for i in range(12):
+        stores.dispatch.set(ENV, f"pending:old{i:02d}", {
+            "bucket": "uploads", "key": f"old{i}.png", "event_name": "s3:ObjectCreated:Put",
+            "target_arn": FUNCTION_ARN, "at": float(i), "size": 1, "etag": "e",
+        })
+    stores.dispatch.set(ENV, "pending:new", {
+        "bucket": "uploads", "key": "new.png", "event_name": "s3:ObjectCreated:Put",
+        "target_arn": other_arn, "at": 99.0, "size": 1, "etag": "e",
+    })
+    functions = FakeFunctions()
+
+    await Dispatcher(functions, MovableClock()).verdicts(stores, ENV)
+
+    assert stores.dispatch.get(ENV, "pending:new") is None, (
+        "the healthy function's notification was starved behind 12 older records "
+        "for a function that is merely redeploying"
+    )
