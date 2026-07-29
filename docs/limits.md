@@ -190,6 +190,102 @@ They are listed because finding one by surprise is worse than reading it here.
   The address it hands out is the plain published-port one; see *Which endpoint
   fact your security groups actually govern* below for why `DATABASE_URL_MESH`
   is the gated form and is still not what the edge writes.
+- **An edge's TYPE is not always the whole of what it does.** Three pairs
+  carry a second meaning on top of the grant, added in v0.8.15 because a
+  permission whose subject is not wired is the same decoration under a
+  different colour: `logs ↔ lambda|ecs` decides which group the workload's
+  output lands in, `ecr ↔ ecs` decides the service's image, and `alb ↔ ec2`
+  registers a real load-balancer target. Their type is unchanged — the first
+  two stay `iam` — because the passes that read them key on the two NODE
+  kinds and never on `edge.kind`. Each is documented in its own entry below;
+  none of them is inferable from the label the canvas draws.
+  `connection` is the counter-example, and the contrast is the point: it is the
+  one second meaning a user has to CHOOSE, so it gets its own type, its own
+  colour and a `+`-joined `edgeType` — see the two entries above.
+- **A Log Group drawn as a workload's sink is created under the WORKLOAD's
+  name, not the node's label.** odin's two log shippers write to a name derived
+  from the workload and read no destination from anywhere:
+  `lambdactl._ship_logs` → `/aws/lambda/{function}`, `ecsctl._ship_task_logs` →
+  `/ecs/{service}`. Before v0.8.15, drawing a Log Group tile (default label
+  `/odin/logs`) to a lambda `myfn` therefore produced **two** groups — the drawn
+  one, which the policy granted `logs:PutLogEvents` on, and `/aws/lambda/myfn`,
+  which collected every line. The drawn one stayed empty forever, and the only
+  canvas that appeared to work was one whose label happened to coincide.
+  It is fixed in the direction that needed no new signal: the emitted
+  `aws_cloudwatch_log_group` takes the name the substrate already writes to, so
+  the node you drew backs the group that receives. **Two costs, both real:**
+  (a) code inside the workload that calls `PutLogEvents` on the *label*
+  (`/odin/logs`) will now be denied and find no such group — the grant follows
+  the group, deliberately, since granting on a name nothing creates is the same
+  decorative-permission bug; use the destination name, which `odin logs --node
+  <label>` and `/world` still resolve for you through the `odin:node` tag.
+  (b) `odin import-tf` reads a group's label from its `name` argument
+  (`agent/import_tf.py::_label` prefers the literal over the tag), so importing
+  the generated file back labels the node `/aws/lambda/myfn`. The file then
+  regenerates byte-identically and the edge and policy stay self-consistent —
+  it is a visible label change, not a broken round trip.
+  Drawing ONE Log Group as the sink for two workloads is declined
+  (`unsupported`, naming both destinations): a group has one name and the two
+  substrates write to two. An `ec2 ↔ logs` edge is untouched — nothing ships a
+  VM's output into CloudWatch Logs, so that edge is a grant for the code inside
+  the VM to call `PutLogEvents` itself, which works exactly as drawn.
+- **An `ecr ↔ ecs` edge sets the service's image; an `ecr ↔ lambda` edge sets
+  nothing.** Until v0.8.15 `_ecs_container_definitions` read the node's
+  hand-typed `image` field and consulted no edge at all, so drawing a
+  repository to a service granted `ecr:BatchGetImage` and left the service
+  running whatever was typed (in practice `nginx:alpine`). The edge now emits
+  `image = "${aws_ecr_repository.<n>.repository_url}:latest"` — a real
+  Terraform interpolation, so tofu resolves it at apply time to the address
+  `gateway/models/ecr.py` actually publishes (`127.0.0.1:{port}/{name}`, whose
+  port is minted per env and cannot be typed in advance), and
+  `compute/tasks.py` hands that straight to `docker run`. A **hand-typed
+  `image` always wins**; an `imageTag` field overrides `latest` but has no UI
+  control yet, so it is reachable only from hand-authored JSON, `odin canvas
+  set` and `import-tf`. Two repositories drawn to one service is declined
+  rather than guessed.
+  For a lambda the edge authors nothing and says so in `wiring_errors` (never
+  `unsupported` — the function is built and applied perfectly well): odin's
+  Lambda substrate packages the node's code as a zip and runs it in an AWS RIE
+  container, so `package_type = "Image"` is not modelled at all.
+- **An ECR grant covers the CONTROL plane only — nothing gates a `docker pull`.**
+  This entry said "`ecr:GetAuthorizationToken` / `ecr:BatchGetImage` are grants
+  that can never bite. Neither has a gateway handler", and was **half wrong in
+  the direction that undersells odin**: `GetAuthorizationToken` IS one of
+  `gateway/models/ecr.py::_HANDLERS`' seven entries, so the docker-login step
+  really is classified and really is enforced. It also called the fix Open after
+  it had landed.
+  What is true is the image bytes: the data plane is a real `registry:2`
+  container that a docker client dials on its own published port, the gateway
+  does not proxy the registry v2 protocol at all (`ecr.py`'s own docstring), and
+  that registry runs auth-less by design — so no IAM edge can stop anyone pulling
+  the image. `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer` and
+  `ecr:BatchCheckLayerAvailability` have no handler and no request could reach
+  them anyway.
+  They are still TICKABLE, because the generated Terraform is meant to be
+  portable and on real AWS these are exactly the verbs a pull needs — but they
+  stopped being PRE-TICKED in v0.8.15, since a default is what odin ticks for you
+  and must not assert a protection odin has not got. The distinction is kept
+  honest by `tests/gateway/test_ecr_vocabulary_has_handlers.py`, which fails both
+  if an offered op has no handler and no `PORTABLE_ONLY` declaration, and if a
+  `PORTABLE_ONLY` op ever gains one.
+- **An `alb ↔ ec2` edge registers a real target.** Since v0.8.15 the builder's
+  `_ALB_TARGET_KINDS` is `("ecs", "ec2")` and the edge emits an
+  `aws_lb_target_group_attachment` naming `aws_instance.<n>.id` — the form
+  `elbv2ctl._target_host` resolves through the EC2-compute store to the VM's real
+  address.
+  This entry used to end "**`albTargetTypes` is still `new Set(['ecs'])`**, so
+  the canvas labels that line *Not modelled* while tofu registers a live target".
+  That was true for the hours the two halves were landing in separate worktrees
+  and is not true now: both sides read `('ecs', 'ec2')`, and
+  `tests/spec/test_edge_registry_matches_builders.py` fails naming whichever side
+  falls behind, so the window cannot reopen silently.
+- **A lambda cannot be a load-balancer target.** `alb ↔ lambda` is declined with
+  the reason rather than silently ignored: odin's load-balancer substrate is a
+  real nginx container whose upstreams are `host:port` (`compute/proxy.py`), and
+  a lambda target needs an HTTP request translated into the RIE's invoke
+  envelope and the response translated back. That is the identical shim an
+  `apigateway → lambda` route needs, so it is deliberately built once, there,
+  rather than twice.
 - **A `role` edge works for lambda only.** `iam_role → lambda` folds into the
   lambda's `role` field, which is what `agent/hcl.py` already reads, so the edge
   really does decide the execution role in the generated Terraform. **ec2 and ecs
@@ -221,23 +317,6 @@ They are listed because finding one by surprise is worse than reading it here.
   same rule. A gate that can **remove** something already being built is the
   hazard; a new meaning gated on a new kind only withholds a new feature from an
   old canvas, which destroys nothing and is what upgrading should mean.
-- **An ECR grant covers the CONTROL plane only — nothing gates a `docker pull`.**
-  The repository's metadata calls (`GetAuthorizationToken`,
-  `DescribeRepositories`) really are classified and really are enforced. The
-  image bytes are not: the data plane is a real `registry:2` container that
-  `docker push`/`pull` dials on its own published port, which never passes
-  through odin's gateway at all, and that registry runs auth-less by design. So
-  an IAM edge to an `ecr` node cannot stop anyone pulling the image.
-  `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer` and
-  `ecr:BatchCheckLayerAvailability` have no handler in
-  `gateway/models/ecr.py::_HANDLERS` and no request could reach them anyway. They
-  are still TICKABLE, because the generated Terraform is meant to be portable and
-  on real AWS these are exactly the verbs a pull needs — but they stopped being
-  PRE-TICKED in v0.8.15, since a default is what odin ticks for you and must not
-  assert a protection odin has not got. The distinction is kept honest by
-  `tests/gateway/test_ecr_vocabulary_has_handlers.py`, which fails both if an
-  offered op has no handler and no `PORTABLE_ONLY` declaration, and if a
-  `PORTABLE_ONLY` op ever gains one.
 - **There is no IAM database authentication, so `rds-db:connect` gates nothing.**
   `gateway/classify.py` builds every rds action as `rds:<Action>` out of the
   query protocol's `Action` param, so the `rds-db:` prefix is unreachable and a
