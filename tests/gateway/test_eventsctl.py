@@ -33,7 +33,14 @@ RULE_ARN = f"arn:aws:events:us-east-1:000000000000:rule/{RULE}"
 BUS_RULE_ARN = f"arn:aws:events:us-east-1:000000000000:rule/{BUS}/{RULE}"
 BUS_ARN = f"arn:aws:events:us-east-1:000000000000:event-bus/{BUS}"
 TARGET = {"Id": "thumbnailer", "Arn": "arn:aws:lambda:us-east-1:000000000000:function:thumbnailer"}
-OTHER_TARGET = {"Id": "archiver", "Arn": "arn:aws:sqs:us-east-1:000000000000:archive"}
+# Both targets are LAMBDA targets now. `OTHER_TARGET` used to be an SQS queue,
+# and it stopped being one on the day delivery landed: a lambda invoke is the
+# only sink `reconcile/dispatch.py` has, so `PutTargets` refuses anything else
+# rather than storing a target that would render and never fire. The refusal
+# has its own test below; these fixtures exercise the paths that still work.
+OTHER_TARGET = {"Id": "archiver", "Arn": "arn:aws:lambda:us-east-1:000000000000:function:archiver"}
+UNDELIVERABLE_TARGET = {"Id": "archiver", "Arn": "arn:aws:sqs:us-east-1:000000000000:archive"}
+SCHEDULE = "rate(1 day)"
 
 
 def _parse(operation: str, response: Response, *, error: bool = False):
@@ -67,6 +74,10 @@ async def _call(stores, sink, fn) -> Response:
 
 
 async def _put_rule(stores, sink, events, name=RULE, **kwargs) -> Response:
+    """A rule needs a `ScheduleExpression` odin can fire since delivery landed
+    (`eventsctl._put_rule` refuses one it cannot), so every caller that does not
+    care which schedule gets a real one rather than none."""
+    kwargs.setdefault("ScheduleExpression", SCHEDULE)
     return await _call(stores, sink, lambda: events.put_rule(Name=name, **kwargs))
 
 
@@ -102,16 +113,22 @@ async def test_an_unset_optional_member_is_omitted_not_null(stores, sink, events
     A parsed-response assertion therefore could not tell `_drop_none` working
     from `_drop_none` deleted -- it did not (mutation M12 survived it). What
     differs is the BYTES, which is what this now reads, and the claim it makes
-    is only what it can back: odin's wire matches real EventBridge's shape."""
-    await _put_rule(stores, sink, events, EventPattern='{"source":["odin"]}')
+    is only what it can back: odin's wire matches real EventBridge's shape.
+
+    The unset members probed used to be `ScheduleExpression`/`RoleArn` on an
+    EventPattern rule; a pattern rule is refused now, so it is the other way
+    round -- a scheduled rule whose `EventPattern`, `RoleArn` and `Description`
+    were never sent. Same three-of-six coverage, opposite half."""
+    await _put_rule(stores, sink, events, ScheduleExpression=SCHEDULE)
     response = await _call(stores, sink, lambda: events.describe_rule(Name=RULE))
     body = json.loads(response.body)
-    assert "ScheduleExpression" not in body
+    assert "EventPattern" not in body
     assert "RoleArn" not in body
-    assert body["EventPattern"] == '{"source":["odin"]}'
+    assert "Description" not in body
+    assert body["ScheduleExpression"] == SCHEDULE
     # ...and the parsed view still carries what WAS set.
     described = _parse("DescribeRule", response)
-    assert described["EventPattern"] == '{"source":["odin"]}'
+    assert described["ScheduleExpression"] == SCHEDULE
 
 
 async def test_put_rule_is_an_upsert_the_provider_can_use_for_updates(stores, sink, events):
@@ -407,14 +424,21 @@ async def test_the_internal_reads_reach_rules_and_their_targets(stores, sink, ev
 
 async def test_put_events_refuses_rather_than_accepting_an_undeliverable_event(stores, sink, events):
     """The honesty rule, enforced. `{"FailedEntryCount": 0}` would be true of
-    every field and false about the only thing the caller wants to know."""
+    every field and false about the only thing the caller wants to know.
+
+    STILL REFUSED after the dispatcher landed, and the reason changed rather
+    than expired: delivery exists now, but it fires SCHEDULES off a clock, and a
+    PutEvents entry reaches a rule only through an EVENT PATTERN, which
+    `_put_rule` refuses because odin cannot match one. So there is no rule this
+    event could ever be routed to -- a stricter statement than the old "nothing
+    delivers anything", and the one this asserts."""
     await _put_rule(stores, sink, events)
     await _call(stores, sink, lambda: events.put_targets(Rule=RULE, Targets=[TARGET]))
     response = await _call(stores, sink, lambda: events.put_events(
         Entries=[{"Source": "odin.test", "DetailType": "t", "Detail": "{}"}]))
     parsed = _parse("PutEvents", response, error=True)
     assert parsed["Error"]["Code"] == "InternalException"
-    assert "does not deliver events yet" in parsed["Error"]["Message"]
+    assert "no pattern matcher" in parsed["Error"]["Message"]
     assert "FailedEntryCount" not in parsed
 
 
