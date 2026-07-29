@@ -167,6 +167,25 @@ export const CATALOG: ServiceDef[] = [
       password: 'apppass123', securityGroups: '', arn: '',
     },
     primary: { key: 'engine', label: 'Engine' },
+    // `rds-db:connect` is TICKABLE and is no longer the DEFAULT, which is the
+    // same split the ecr block below draws and for the same two reasons.
+    //
+    // It cannot bite locally, and unlike ecr's layer verbs it cannot even be
+    // CLASSIFIED: `classify.py` builds every rds action as `rds:<Action>` out of
+    // the query protocol's `Action` param, so every string it can emit starts
+    // `rds:` and `rds-db:` is a different service prefix entirely. odin
+    // implements no IAM database authentication at all -- the Postgres container
+    // takes its password out of `DATABASE_URL` and consults nobody. classify.py's
+    // own prose asserted the opposite ("compiles to a statement the gateway
+    // enforces") and is corrected in the same change.
+    //
+    // It stays here because the generated Terraform is meant to be portable, and
+    // taken to Amazon this is exactly the action IAM DB auth needs. It stops
+    // being PRE-TICKED (`iam.ts::defaultPermissions` now offers
+    // `rds:DescribeDBInstances`) because ticking something FOR the user that odin
+    // cannot enforce is odin claiming a protection it has not got -- and what the
+    // user drawing rds -> workload usually wants is the `connection` edge, which
+    // authors that `DATABASE_URL` instead of granting a permission nobody checks.
     iamActions: ['rds-db:connect', 'rds:DescribeDBInstances', 'rds:*'],
   },
   // elasticache (W2.8) is a REAL, gateway-modeled service (NORTHSTAR directive

@@ -169,6 +169,19 @@ Neither the compiler nor the enforcement point changes — only the table that
 maps (source kind, target kind) to a default action set, plus the per-edge
 permission editing the UI already has.
 
+**`ecr` extends only halfway, and the half that does not is the interesting
+one.** Its CONTROL plane is gateway-served, so a grant on it compiles and is
+enforced like any other: `gateway/models/ecr.py::_HANDLERS` answers
+`CreateRepository`, `DescribeRepositories`, `DeleteRepository`, the three tag
+ops and `GetAuthorizationToken`. Its DATA plane cannot be granted at all.
+`ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer` and
+`ecr:BatchCheckLayerAvailability` are the actions an image push or pull needs,
+and a real `docker push`/`pull` dials the `registry:2` container's published
+port directly — the gateway does not proxy the registry's v2 HTTP protocol, so
+no request carrying those actions ever reaches the evaluator. All three were
+offered in the UI and have been removed; a data-plane action earns its way back
+only when the request it authorises arrives at the gateway.
+
 Test shape that matters: a drawn edge must produce a grant that is **actually
 enforced** (a real call succeeds, and the same call from an env without the
 edge is denied). That is how the s3 path was proven; the rest should not be

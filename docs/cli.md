@@ -98,12 +98,13 @@ silently rendering as something else.
 | `data.vpc` / `data.subnet` | no | containment, as the *label* of the containing node. The UI derives these from geometry; by hand, set them yourself |
 | `size` | no | width/height, for the container kinds (`vpc`, `subnet`) whose geometry is what nesting means |
 
-`edgeType` says what the line MEANS. Six values, and only the first four change
+`edgeType` says what the line MEANS. Seven values, and only the first four change
 anything odin builds:
 
 | `edgeType` | between | what it does |
 | ---------- | ------- | ------------ |
 | `iam` | a compute kind and an IAM target | a real grant — `permissions` is exactly what the workload's key may do |
+| `connection` | `rds`/`elasticache` and `ecs`/`lambda` | writes `DATABASE_URL=${{producer.DATABASE_URL}}` (or `REDIS_URL`) into the consumer, as if you had typed it |
 | `sg` | `sg` and `ec2`/`rds` | membership: adds the group to that node's `securityGroups` |
 | `role` | `iam_role` and `lambda` | sets the lambda's execution role (a role typed into the node wins) |
 | `subscription` | `sns` and `sqs` | the topic fans out to the queue |
@@ -114,12 +115,33 @@ Permissions with no `edgeType` are treated as `iam`; an edge with neither is
 `unmodelled`. `"network"` is the old name for `unmodelled` and still parses, so
 a canvas saved before v0.8.14 loads unchanged.
 
+**One line can mean two things.** `rds`/`elasticache` against `ecs`/`lambda` is
+both a connection and a grant — in AWS both are true at once — and those four
+pairs are the only ambiguous ones odin has. The config panel offers a
+multi-select there instead of picking for you, and `edgeType` then holds a
+`+`-joined set: `"connection+iam"`. Written by hand, the two orders are
+equivalent but only the registry order round-trips without a diff, so prefer
+`"connection+iam"`. A single meaning has no separator and is exactly the value
+it always was.
+
+A `connection` edge writes the ref only if the consumer does not already set
+that variable: **what you typed wins.** If the two disagree — a hand-written
+`DATABASE_URL`, or two databases both edged to one service — the apply is
+**refused** with both values named, because odin cannot tell which you meant.
+Typing the same ref the edge would have written is agreement, not a conflict.
+`ec2` is not a consumer: it never receives the `env` map (see the reference note
+below), so a connection edge to it would author nothing and is not offered.
+
 Two things worth knowing, because they are not what the table implies.
 **`subscription` and `target` are descriptive only** — the generator matches on
 the two node KINDS, not on `edgeType`, so *any* edge between an `sns` and an
-`sqs` node creates a real subscription (the same for `alb`↔`ecs`). And
-**direction does not matter anywhere**: `sqs → sns` is read as the subscription
-it obviously is, exactly as `sg → ec2` and `ec2 → sg` are the same membership.
+`sqs` node creates a real subscription (the same for `alb`↔`ecs`). `sg`, `role`
+and `connection` are the opposite: each is read from `edgeType`, so an
+`iam`-typed line between an `rds` and an `ecs` node writes no `DATABASE_URL`.
+That is what keeps every canvas saved before v0.8.15 behaving exactly as it did.
+And **direction does not matter anywhere**: `sqs → sns` is read as the
+subscription it obviously is, exactly as `sg → ec2` and `ec2 → sg` are the same
+membership, and `rds → ecs` and `ecs → rds` wire the same variable.
 The one exception is `iam`, where the arrow is the grant: it runs from the
 workload to the thing it may use.
 
