@@ -22,7 +22,7 @@ call sits anywhere in that path.
 ## Contents
 
 [Install](#install) · [What you can do](#what-you-can-do) · [Apply](#apply) ·
-[Edges are IAM](#edges-are-iam) · [Terminal](#driving-it-from-a-terminal) ·
+[What an edge means](#what-an-edge-means) · [Terminal](#driving-it-from-a-terminal) ·
 [AI](#ai-two-features-one-switch) · [How it works](#how-it-works) ·
 [Known limits](#known-limits) · [Security](#security) ·
 [Contributing](#contributing) · [Where it's going](#where-its-going)
@@ -101,6 +101,7 @@ Drag any of these onto the canvas, wire them up, and press Apply:
 | **EC2** | A Lima VM, joined to the environment's Nebula mesh |
 | **VPC / Subnet / SG** | Nebula networks and compiled firewall rules |
 | **IAM role, ECR, Secrets, SSM, CloudWatch Logs, ALB** | Gateway-backed AWS APIs |
+| **Event triggers** | A schedule, a queue, or a bucket write really invokes a Lambda |
 
 Geometry carries meaning. A node drawn inside a VPC or Subnet box belongs to it,
 which compiles to `vpc_id` and `subnet_id`, and an ECS box drawn inside an EC2 box
@@ -148,9 +149,9 @@ Each RDS instance keeps its data on a named Docker volume, so a repair replaces
 the container and not the database. Odin checks that volume before it says so,
 and says the opposite when it is gone.
 
-## Edges are IAM
+## What an edge means
 
-An edge from a workload to a resource is a permission. Draw one, pick the actions,
+An edge from a workload to a resource is usually a permission. Draw one, pick the actions,
 and the gateway compiles them into policy it checks on every request. A call with
 no matching grant gets `AccessDenied`.
 
@@ -165,6 +166,13 @@ same time. Odin does not choose between them for you: the picker lists both and
 you tick the ones you mean, so one line can carry both. Ticking the connection on
 `rds → ecs` writes `DATABASE_URL` into the service's environment, resolved to the
 real endpoint when the container starts.
+
+Two more lines decide something besides access. A Log Group drawn to a workload
+becomes the group its output really lands in, rather than a second empty group
+beside the one the runtime writes to. An ECR repository drawn to an ECS service
+becomes that service's image, resolved to the registry address odin published. In
+both cases the permission alone used to be the whole of it, which meant the line
+looked like it wired the thing it granted access to and did not.
 
 A drawn permission is emitted as a real `aws_iam_role_policy` on the workload's
 role, naming a real ARN — `arn:aws:s3:::uploads` and `arn:aws:s3:::uploads/*` for
