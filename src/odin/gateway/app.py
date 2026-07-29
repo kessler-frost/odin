@@ -296,7 +296,7 @@ def create_gateway_app(
         response_body = upstream.content
         response_headers = _strip(dict(upstream.headers), _RESPONSE_HOP_BY_HOP)
         if upstream.status_code < 300 and synth.is_postprocess_action(action):
-            rewritten = synth.postprocess(action, resource, principal.env, body, response_body, stores, headers.get("host", ""), now)
+            rewritten = synth.postprocess(action, resource, principal.env, body, response_body, stores, headers.get("host", ""), now, path, query_params)
             if rewritten != response_body:
                 response_headers["content-length"] = str(len(rewritten))
             response_body = rewritten

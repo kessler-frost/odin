@@ -358,6 +358,22 @@ They are listed because finding one by surprise is worse than reading it here.
   stores the configuration anyway** (measured against `rustfs/rustfs:latest`). So
   `tofu apply` fails, the next `plan` reads the config back through GET and
   reports no drift, and nothing ever fires. Do not draw an S3 trigger yet.
+- **An S3 removal notification OVER-FIRES for a key that never existed.**
+  Applies once bucket notifications land (`gateway/models/s3notify.py` +
+  the dispatcher). S3 deletes are idempotent: deleting a key that was never
+  there SUCCEEDS. Measured against `rustfs/rustfs:latest` — deleting one real
+  key and one that never existed returned HTTP 200 and reported **both** as
+  `<Deleted>`, with zero `<Error>` entries; the single-object `DELETE` answers
+  204 the same way regardless. So the response carries no signal that separates
+  "removed something" from "removed nothing", and odin's hook runs after the
+  forward, when the answer is already unrecoverable. odin therefore enqueues an
+  `s3:ObjectRemoved:Delete` notification in both cases; **real AWS sends nothing
+  when nothing was removed.** A handler that assumes the object existed (and,
+  say, deletes a matching database row) will run for a key that never did.
+  Over-firing is the milder direction — a trigger that never fires is worse —
+  but it is a real divergence, so it is written here rather than discovered.
+  Genuine per-object FAILURES are handled correctly: a key S3 reports under
+  `<Error>` (AccessDenied, an object-lock retention) fires nothing.
 - **RDS** is Terraform-managed (`aws_db_instance` → a Postgres container)
   and Postgres-only: MySQL or MariaDB is declined with the reason.
   `allocated_storage` and `instance_class` round-trip faithfully but resize
