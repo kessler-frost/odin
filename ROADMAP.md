@@ -1540,6 +1540,56 @@ machine-wide-sweep rule already in CLAUDE.md. A test-owned env is invisible to
 every check a human would think to run; the only safe rule is to touch nothing
 while a suite is running.
 
+## v0.8.16 — the gate stops lying, and two leaks that made it lie
+
+**SQS long polling works.** `WaitTimeSeconds >= 5` used to exceed the forward
+client's 5s read timeout, so an empty queue answered `ServiceUnavailable` — for
+the recommended way to consume a queue, and indistinguishable from the backing
+being down while `/world` said healthy. Measured cost was 10s, not 5, because
+botocore retries a 503. The timeout is DERIVED (`client read + this request's
+wait`), not raised: a blanket 30s would make every other forwarded call wait 30s
+before failing. A wait above AWS's 20s maximum is refused with
+`InvalidParameterValue` rather than clamped, because answering sooner than asked
+is indistinguishable from an empty queue. The trap worth recording:
+`httpx.ASGITransport` enforces NO timeouts, so the natural test would have
+passed against the broken code — it needed a real socket.
+
+**Orphaned volumes are reclaimable.** Named volumes survive `docker rm -f -v` by
+design — that is what makes RDS repair non-destructive — and nothing reclaimed
+them. Scoped by a new `odin.env` LABEL, never by name: `odin-rds-conn2-app-db-data`
+is ambiguous between env `conn2`/db `app-db` and env `conn2-app`/db `db`, so a
+name filter over-reaches by construction. Deliberately NO reconciler-tick sweep:
+a reconciler is per-env while volumes are per-machine, so "no env claims this" is
+unanswerable from inside one, and every agent worktree is a second odin whose
+databases such a sweep would delete.
+
+**Two flakes fixed by changing the signal, not the timeout.** `test_rds_tf_e2e`
+paired a CADENCE-FREE fact (`/world` reading `crashed`) with a CADENCED one (the
+record, written by the background sweeper) and gave the second zero retries. It
+now asserts on the recovery apply's own `recovered_resources` — synchronous, in
+the response body — and `ODIN_DRIFT_SWEEP_TICKS=1` is GONE, so it runs at the
+production cadence. Falsified rather than assumed: with the sweep pinned so it can
+never run, the test still passes. `test_debug_e2e` was not cadence at all — the
+model called a node "the working control… not implicated" in prose and listed it
+in `suspects` anyway. The CONTRACT was the defect (`_SYSTEM`'s only rule was
+provenance, which permits naming every evidence node); it is implicated-only in
+all three channels the model reads now. The test hard-asserts recall and PRINTS
+precision, because which nodes a model names is not schema-guaranteed.
+
+**A "unit" test that booted four real containers and kept them.** Not
+integration-marked, built with `FakeRuntime`/`FakeRds`/`FakeAws`, and the fakes
+are bypassed: `/apply-full` runs real tofu and the gateway's models default to
+`ColimaRuntime`. The asymmetry makes a leak certain rather than likely —
+**creation is real, teardown is fake** — so `/destroy` destroyed a fake while the
+real Postgres stood. Fixed twice: the first fix reclaimed containers and leaked a
+data directory per node instead.
+
+**The gate, stated honestly.** 84/84, rc=0, but as THREE serial invocations
+(27+28+29) whose partition was verified by `diff` before running — a single
+84-test invocation cannot complete in this harness, which kills at ~61 minutes
+against a ~65-minute suite. Measured twice. Three green runs are not one green
+run and are not described as such.
+
 ## Next — known, measured, not yet fixed
 
 - [ ] **A fake runtime does not isolate `/apply-full`, so a "unit" test boots real
