@@ -35,11 +35,19 @@ justification. Every other synth-owned action (sqs/sns/dynamodb tag CRUD,
 SNS topic attributes, delete-confirmation shims) DOES go through the normal
 classify -> evaluate gate; synth only decides whether an ALLOWED request is
 answered directly or forwarded -- "synth never bypasses policy" (S1 brief).
+
+The forward's READ TIMEOUT is per-request, not fixed, for exactly one reason:
+`sqs:ReceiveMessage` carries a wait the BACKING performs (`WaitTimeSeconds`,
+long polling -- the RECOMMENDED way to consume a queue), so it is the one
+forwarded parameter that can legitimately outlast a proxy's own patience. See
+`SQS_MAX_WAIT_TIME_SECONDS` below for what that used to cost and what odin now
+does with a wait above AWS's maximum.
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import socket
 import threading
 import time
@@ -155,6 +163,118 @@ def _strip(headers: dict[str, str], drop: set[str]) -> dict[str, str]:
     return {k: v for k, v in headers.items() if k.lower() not in drop}
 
 
+# --- SQS long polling -------------------------------------------------------
+#
+# MEASURED BEFORE THIS EXISTED -- a real boto3 sqs consumer -> a real gateway
+# listener -> a real socket that answers only once the poll has elapsed, which is
+# what goaws really does on an empty queue (`loops := waitTimeSeconds * 10`, one
+# 100ms timer per loop, `app/gosqs/receive_message.go` at the `v0.5.4` tag
+# `aws/backings.py` pins):
+#
+#   WaitTimeSeconds=2    OK in 2.02s,  Messages=[]
+#   WaitTimeSeconds=5    ClientError in 10.17s  ServiceUnavailableException  503
+#   WaitTimeSeconds=10   ClientError in 10.90s  ServiceUnavailableException  503
+#   WaitTimeSeconds=20   ClientError in 10.46s  ServiceUnavailableException  503
+#
+# 5s was the cliff because `httpx.AsyncClient()` defaults to 5s on EVERY phase,
+# and a `ReadTimeout` is an `httpx.HTTPError`, which `_unhandled_failure` maps to
+# "the backing isn't there". So a consumer doing the recommended thing was told
+# its queue was down while `/world` reported the same queue healthy -- and it
+# cost 10s rather than 5s, because botocore RETRIES a 503.
+#
+# AWS's own maximum for `WaitTimeSeconds`, and so also the longest odin will hold
+# a forwarded connection open for one receive.
+SQS_MAX_WAIT_TIME_SECONDS = 20
+_RECEIVE_MESSAGE = "sqs:ReceiveMessage"
+# goaws's own name for the queue attribute it falls back to (read from
+# `app/gosqs/queue_attributes.go`: `setQueueAttributesV1` stores it straight off
+# CreateQueue's Attributes, `if attr.ReceiveMessageWaitTimeSeconds > 0`, with no
+# range check anywhere).
+_QUEUE_WAIT_ATTRIBUTE = "ReceiveMessageWaitTimeSeconds"
+# Worded the way a parameter-range rejection is worded, and it is the CODE
+# (`InvalidParameterValue`) that a caller keys on -- botocore derives it from the
+# part of `__type` after the `#` (errors.py's module docstring).
+_WAIT_OUT_OF_RANGE = (
+    "Value {value} for parameter WaitTimeSeconds is invalid. "
+    f"Reason: Must be >= 0 and <= {SQS_MAX_WAIT_TIME_SECONDS}, if provided."
+)
+
+
+def _whole_seconds(value: object) -> int:
+    """`value` as whole seconds, or 0 for anything that is not an integer.
+
+    Both forms have to read the same: `WaitTimeSeconds` arrives as a JSON NUMBER
+    in the request body, while queue attributes are string-valued
+    (`{"ReceiveMessageWaitTimeSeconds": "20"}` is what `synth._sqs_create_queue`
+    stores, because that is what SQS's own attribute map is). Anything else -- a
+    float, a bool, a word -- is 0, which forwards the request unchanged and
+    leaves the rest of the parameter validation to the backing that owns it."""
+    text = str(value)
+    return int(text) if text.lstrip("-").isdigit() else 0
+
+
+def _long_poll(action: str, resource: str, env: str, body: bytes, stores: SynthStores) -> tuple[int, int]:
+    """(what the caller asked for, how long the backing will really hold this
+    request open) -- `(0, 0)` for anything that is not an SQS receive.
+
+    TWO numbers, because they answer different questions and only the first is
+    the caller's fault. A `WaitTimeSeconds` outside 0..20 is a bad PARAMETER and
+    is refused as one; the wait to ACCOMMODATE is whatever goaws will actually
+    do, and those diverge -- goaws falls back to the QUEUE's own
+    `ReceiveMessageWaitTimeSeconds` when the request's is 0:
+
+        waitTimeSeconds := requestBody.WaitTimeSeconds
+        if waitTimeSeconds == 0 {
+            waitTimeSeconds = models.SyncQueues.Queues[queueName].ReceiveMessageWaitTimeSeconds
+        }
+
+    (`app/gosqs/receive_message.go`, pinned v0.5.4.) So a request naming no wait
+    at all can still be a 20-second poll, and deriving the timeout from the
+    request ALONE would have left this same 503 alive through a second door.
+    odin knows that attribute because `CreateQueue` is forwarded and its
+    Attributes are stored (`synth._sqs_create_queue`) -- which
+    `tests/gateway/test_sqs_long_poll.py` proves by creating the queue THROUGH
+    the app rather than by writing the store by hand.
+
+    The `min` bounds odin, it is not fidelity: goaws stores an out-of-range
+    attribute without complaint, and odin will not hold a connection longer than
+    AWS's own maximum over a value the caller never sent."""
+    if action != _RECEIVE_MESSAGE:
+        return 0, 0
+    # Unguarded on purpose: to have been classified `sqs:ReceiveMessage` at all,
+    # this body already parsed as a JSON OBJECT with a queue in it --
+    # `classify._classify_target` answers None otherwise, and an unclassifiable
+    # request never reaches the forward.
+    requested = _whole_seconds(json.loads(body or b"{}").get("WaitTimeSeconds", 0))
+    attributes = stores.sqs_queues.get(env, resource, {}).get("attributes", {})
+    configured = _whole_seconds(attributes.get(_QUEUE_WAIT_ATTRIBUTE, 0))
+    return requested, min(requested or configured, SQS_MAX_WAIT_TIME_SECONDS)
+
+
+def _forward_timeout(client: httpx.AsyncClient, long_poll_wait: int) -> httpx.Timeout:
+    """The forward client's own timeout with READ extended by the backing's own
+    long poll -- derived per request, never a blanket larger number.
+
+    Only `read` moves. `connect`/`write`/`pool` describe reaching a container on
+    loopback and are not made slower by a wait that happens after the request is
+    on the wire; raising all four would trade one wrong answer for a slower one
+    on every OTHER forwarded call, which is the same "fix the shape" trap in
+    reverse. The client's existing read timeout becomes the MARGIN on top of the
+    poll (5s in production, since the forward client is a plain
+    `httpx.AsyncClient()`), so there is no second constant to keep in step.
+
+    Built component-by-component because `httpx.Timeout(other, read=...)` is NOT
+    a way to do this: httpx ASSERTS the other three are unset when the first
+    argument is a `Timeout`, so that spelling raises a bare `AssertionError`
+    (probed against the installed httpx 0.28.1, which is also where the
+    `Timeout(timeout=5.0)` default above comes from). A client with `read=None`
+    has no read timeout to extend and already accommodates any poll -- coercing
+    that to a number would take a deliberately unbounded client and bound it."""
+    base = client.timeout
+    read = base.read + long_poll_wait if base.read is not None else None
+    return httpx.Timeout(connect=base.connect, read=read, write=base.write, pool=base.pool)
+
+
 def _raw_target(request: Request) -> tuple[str, str]:
     """(raw percent-encoded path, raw query string) exactly as sent on the
     wire. SigV4 verification and the forward URL must use these, not
@@ -229,6 +349,22 @@ def create_gateway_app(
             await on_deny(principal, action, resource, "denied")
             return errors.access_denied(service, action, resource)
 
+        # AFTER the policy gate, never before: an unauthorized caller learns it is
+        # unauthorized, not that its parameter was out of range.
+        requested_wait, long_poll_wait = _long_poll(action, resource, principal.env, body, stores)
+        if not 0 <= requested_wait <= SQS_MAX_WAIT_TIME_SECONDS:
+            # REFUSED, not clamped. Silently shortening the wait would make odin
+            # answer "no messages" earlier than the caller asked, which is
+            # indistinguishable from an empty queue -- a wrong answer wearing a
+            # correct one's clothes. Real SQS rejects the parameter; goaws v0.5.4
+            # does NOT (it multiplies whatever it is handed by ten 100ms loops, so
+            # `WaitTimeSeconds=3600` really would poll for an hour), so odin has to
+            # be the one that does -- which also bounds how long one caller can
+            # hold a forwarded connection open.
+            return errors.synth_error(
+                "sqs", "InvalidParameterValue", _WAIT_OUT_OF_RANGE.format(value=requested_wait), 400,
+            )
+
         now = time.monotonic()
         # Computed once, ahead of pure_answer: ecr's control-plane model
         # (all-synth, like ec2/iam) still needs the registry:2 backing's
@@ -292,7 +428,14 @@ def create_gateway_app(
                 request.method, backing_url, _strip(forward_headers, _SIGNING_HEADERS), body,
                 BACKING_ACCESS_KEY, BACKING_SECRET_KEY, "s3", BACKING_REGION,
             )
-        upstream = await client.request(request.method, backing_url, headers=forward_headers, content=body)
+        # `timeout=` per request, and an `await` throughout: a long poll holds a
+        # CONNECTION for up to 20s but never the loop, so everything else this
+        # gateway and the control app serve keeps being served while it waits
+        # (asserted by `test_a_long_poll_does_not_block_the_event_loop`).
+        upstream = await client.request(
+            request.method, backing_url, headers=forward_headers, content=body,
+            timeout=_forward_timeout(client, long_poll_wait),
+        )
         response_body = upstream.content
         response_headers = _strip(dict(upstream.headers), _RESPONSE_HOP_BY_HOP)
         if upstream.status_code < 300 and synth.is_postprocess_action(action):

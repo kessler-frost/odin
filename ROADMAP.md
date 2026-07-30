@@ -1682,6 +1682,24 @@ while a suite is running.
      old warning. A static "your data is safe" would have been a guard reading
      no signal — honesty rule 1, in the direction that reassures rather than
      alarms. Mutation-tested both ways.
+
+     **And the first of those two came back in v0.8.15, which is the part worth
+     carrying forward hardest.** "Every teardown path had to learn to remove it"
+     was true of `delete_db` and false of `odin env rm`: four orphaned volumes
+     from two environments that no longer existed in any form — no containers, no
+     `.odin/<env>/`, absent from `GET /envs` — were found on the development
+     machine by hand, with `docker volume ls` the only thing that could see them.
+     A fix whose whole point is that state OUTLIVES its container leaves a
+     reclaim question behind by construction, and that question was answered for
+     one caller instead of as a lifecycle. The closure (`aws/rds.py::
+     reclaim_env_volumes`, `GET /volumes`, `odin volumes`) also had to add a
+     `odin.env` LABEL, because the volume's own name cannot be used to scope a
+     deletion: `odin-rds-conn2-app-db-data` is env `conn2` database `app-db` and
+     env `conn2-app` database `db`, so a name filter over-reaches by
+     construction. Deliberately NOT on the reconciler tick — a reconciler is
+     per-env and docker volumes are per-machine, so "no env claims this" is a
+     question no per-env loop can answer without deleting another odin's
+     databases. See `docs/limits.md` for the two residuals.
   3. ~~**An ECS service's canvas wiring cannot be imported.**~~ The GENERATE
      half is CLOSED in v0.8.14: a ref travels as an `odin:ref:<VAR>` tag whose
      value is `<producer>.<attr>` — the non-secret representation this entry

@@ -35,6 +35,7 @@ from odin.api.debug import create_debug_router
 from odin.api.logs import create_logs_router
 from odin.api.events import SSE_HEADERS, ConnectionManager, event_stream
 from odin.aws.backings import PROVISIONED, BackingAws, BackingUnavailable
+from odin.aws.rds import reclaim_env_volumes, volume_env_candidates
 from odin.aws.rds import volume_name as rds_volume_name
 from odin.compute.tasks import TaskRuntime
 from odin.fabric.localhost import LocalhostFabric
@@ -851,6 +852,8 @@ _REMOVE_STATUS = {
     "loop_still_running": "remove_failed_loop_running",
     "containers_standing": "remove_failed_containers_standing",
     "containers_unknown": "remove_unverified",
+    "volumes_standing": "remove_failed_volumes_standing",
+    "volumes_unknown": "remove_unverified",
     "state_survived": "remove_failed_state_survives",
 }
 # The two statuses that mean the end state HOLDS. Everything else -- including
@@ -894,6 +897,20 @@ _REMOVE_CAUSE = {
         "-- and it will not call a removal complete on a half it could not read. NOTHING was "
         "deleted; the env is exactly as it was. Fix the container runtime (`odin doctor`) and "
         "re-run"
+    ),
+    "volumes_standing": (
+        "the teardown finished but odin could not reclaim the Docker volume(s) holding this env's "
+        "database files, so its state was NOT deleted -- removing it would leave those volumes with "
+        "nothing left that names them, which is exactly the disk leak this step exists to close. "
+        "`still_standing.volumes` names each one and carries docker's own reason; `volume is in use` "
+        "means a container of this env's is still attached (`docker rm -f <container>`), and then "
+        "re-run"
+    ),
+    "volumes_unknown": (
+        "odin could not list this env's Docker volumes, so it cannot say the disk its databases were "
+        "holding has been reclaimed -- and it will not call a removal complete on a half it could not "
+        "read. NOTHING was deleted; the env is exactly as it was. Fix the container runtime "
+        "(`odin doctor`) and re-run"
     ),
     "state_survived": (
         "`{state_dir}` still exists after odin deleted it, so this env's desired state, credentials "
@@ -1213,6 +1230,44 @@ def create_apply_router(
     async def destroy(env: str = ENV) -> JSONResponse:
         return await _destroy(env)
 
+    async def _reclaim_only(env: str) -> tuple[str, dict]:
+        """`env` has no state directory and no reconciler -- and may still be
+        holding DISK. Reclaim it, and report the OUTCOME (`_remove_env`'s
+        contract, one level down: never a status, never "it worked").
+
+        This branch used to be a flat `never_existed`, and it is what let the
+        reported bug happen at all: two environments were removed, their
+        directories deleted, and four named volumes stayed on the machine with
+        nothing left anywhere that named them. `never_existed` is now the answer
+        only when the DISK agrees, which is a signal that actually arrives
+        (honesty rule 1) rather than an inference from a missing directory.
+
+        The container witness runs FIRST, and it is not a formality. `env` here
+        is a name a human typed, not one odin read out of its own store, and
+        docker volumes are per-MACHINE while a store root is not: on a machine
+        running a second odin (every parallel agent worktree has its own
+        `.odin/`), `env` may be that one's LIVE environment. A live env with a
+        database has a container -- running or exited, `container_names` lists
+        both -- so this refuses instead of deleting its data. Docker's own
+        in-use refusal inside `reclaim_env_volumes` is the second line behind
+        it, and `docs/limits.md` records what neither one covers."""
+        containers = await _surviving_containers(runtime, env)
+        if containers is None:
+            return "containers_unknown", {}
+        if containers:
+            return "containers_standing", {"still_standing": {"containers": containers}}
+        volumes = await reclaim_env_volumes(runtime, env)
+        detail: dict = {"reclaimed": {"volumes": list(volumes.reclaimed)}}
+        if volumes.unknown:
+            return "volumes_unknown", detail
+        if volumes.standing:
+            return "volumes_standing", {**detail, "still_standing": {"volumes": list(volumes.standing)}}
+        # Reclaiming something means the env DID exist, so "removed" is the true
+        # word and `not_found` would be the false one -- odin just deleted state
+        # a user cannot get back, and reporting that as "there was nothing here"
+        # is the same class of lie as an exit 0 over a standing env.
+        return ("removed" if volumes.reclaimed else "never_existed"), detail
+
     async def _remove_env(env: str) -> tuple[str, dict]:
         """Remove `env` entirely, and report the OUTCOME -- never a status.
 
@@ -1231,10 +1286,19 @@ def create_apply_router(
              real containers inside a directory being deleted.
           3. ask the machine what containers survived, the same witness
              `/destroy`'s failure report uses.
-          4. only THEN forget the in-memory per-env state and `rmtree` the
+          4. reclaim this env's named Docker volumes -- AFTER 3, because docker
+             refuses to remove a volume a container still references and that
+             refusal is the guard, not an error to route around. Normally there
+             is nothing here: `delete_db` removed each volume with its instance
+             during step 1. It is the BACKSTOP for every way that does not
+             happen -- an instance tofu's state never knew about, a partial
+             delete, a container swept out from under odin by a `docker rm`
+             -- and it is what stops `odin env rm` leaving a Postgres data
+             directory on a disk-tight machine with nothing left that names it.
+          5. only THEN forget the in-memory per-env state and `rmtree` the
              directory.
 
-        Anything that goes wrong before step 4 leaves `.odin/<env>/` untouched,
+        Anything that goes wrong before step 5 leaves `.odin/<env>/` untouched,
         so the removal is retryable and no half-removed env can exist.
 
         `still_standing` from step 3 errs toward refusing: `_surviving_containers`
@@ -1252,12 +1316,13 @@ def create_apply_router(
         target = _env_dir(store.root, env)
         if target is None:
             return "unsafe_env_name", {}
-        # Nothing to remove AND nothing to create -- the same rule `/destroy`
-        # follows for an env that never existed. `reconcilers` is asked too, so
-        # an env whose directory was deleted by hand still gets its loop
-        # stopped rather than left ticking over nothing.
+        # No directory and no loop is NOT yet "nothing to remove": a named volume
+        # outlives its container by design, so an env can be gone from every
+        # place odin looks and still be holding gigabytes. All four orphans
+        # measured on the development machine had exactly this shape, which is
+        # why this branch now asks the disk before it answers.
         if not target.exists() and env not in reconcilers:
-            return "never_existed", {}
+            return await _reclaim_only(env)
 
         teardown = await _destroy(env)
         detail: dict = {"teardown": json.loads(teardown.body)}
@@ -1277,6 +1342,13 @@ def create_apply_router(
             return "containers_unknown", detail
         if containers:
             return "containers_standing", {**detail, "still_standing": {"containers": containers}}
+
+        volumes = await reclaim_env_volumes(runtime, env)
+        detail["reclaimed"] = {"volumes": list(volumes.reclaimed)}
+        if volumes.unknown:
+            return "volumes_unknown", detail
+        if volumes.standing:
+            return "volumes_standing", {**detail, "still_standing": {"volumes": list(volumes.standing)}}
 
         # ...and from here to the `rmtree` there is deliberately NO `await`.
         # On one event loop that makes forgetting the caches and deleting the
@@ -1378,6 +1450,104 @@ def create_apply_router(
     @router.get("/envs")
     def envs() -> dict:
         return {"envs": store.list_envs()}
+
+    async def _labelled_env(volume: str) -> str | None:
+        """Which environment's `odin.env` label `volume` really carries, for a
+        volume no LIVE env claimed -- or None if it carries none at all.
+
+        The distinction decides which command a user is told to run, so it is
+        MEASURED rather than parsed. `volume_env_candidates` produces the env
+        names the volume's own name could encode -- a genuine ambiguity, since
+        both halves may contain `-` -- and each candidate is then put to docker
+        as a label filter. A candidate the filter agrees with is the label's real
+        value; none agreeing means there is no label, which is what a volume
+        created before v0.8.15 looks like and the one case `odin env rm` cannot
+        reach.
+
+        Costs nothing on a healthy machine: only volumes no live env claimed get
+        here, and there are normally none."""
+        for candidate in volume_env_candidates(volume):
+            if volume in await runtime.volume_names(env=candidate):
+                return candidate
+        return None
+
+    async def _volume_rows(live: list[str]) -> list[dict]:
+        """One row per odin-labelled volume on this machine: its name, the env
+        whose label it carries, and whether that env is live HERE.
+
+        Every docker read the listing needs is in this function, so the route's
+        one `except` covers all of them -- a daemon that answers the full listing
+        and then stops answering must still report "odin could not tell" rather
+        than a half-built table."""
+        everything = sorted(set(await runtime.volume_names()))
+        owned = {env: set(await runtime.volume_names(env=env)) for env in live}
+        rows = []
+        for name in everything:
+            env = next((e for e in live if name in owned[e]), None) or await _labelled_env(name)
+            rows.append({
+                "name": name, "env": env, "live": env in live,
+                **({} if env in live else {
+                    # The one command that really reclaims THIS volume, which is
+                    # not the same command in both cases -- and getting that
+                    # wrong would send a user to `odin env rm`, have it answer
+                    # `not_found` because there is no label to match, and leave
+                    # the volume exactly where it was.
+                    "reclaim": f"odin env rm {env}" if env else f"docker volume rm {name}",
+                }),
+            })
+        return rows
+
+    @router.get("/volumes")
+    async def volumes() -> dict:
+        """Every named Docker volume odin made, and which environment owns it.
+
+        The disk report that had no home. A named rds volume outlives its
+        container on purpose (`aws/rds.py`), so the only thing that ever found a
+        stranded one was a hand-run `docker volume ls` -- and a reclaim that
+        reports nothing is indistinguishable from a machine with nothing to
+        reclaim, which is this repo's most-repeated bug wearing a new hat. This
+        route is the counter: it NAMES what is holding disk, including every
+        volume odin will not remove for you and why.
+
+        `env` per volume is MEASURED, not parsed. A volume's name cannot say
+        which env it belongs to (`volume_env_candidates` explains why), so
+        attribution is done by asking docker to filter on the `odin.env` label
+        that `create_volume` set -- one narrowed listing per environment odin
+        knows, intersected with the full one, and `_labelled_env` for whatever is
+        left over. `env: null` therefore means the volume carries NO `odin.env`
+        label: created before v0.8.15, or auto-created by a bare `-v name:/path`.
+        Those are the only volumes `odin env rm` cannot reach, and the only ones
+        a user has to remove by hand.
+
+        Read-only, and it never proposes a machine-wide sweep. `reclaim` appears
+        only on rows that are NOT live -- `odin env rm <env>` for an attributed
+        one (scoped to that single label), `docker volume rm` for one odin cannot
+        attribute. A live env's row carries no command at all: the volume holds a
+        database somebody is using, and the only thing that may remove it is a
+        real DELETE through a real apply.
+
+        THE CAVEAT this cannot get rid of: `live` is judged against THIS server's
+        store root. Two odin servers on one machine share docker's volumes but
+        not their `.odin/`, so the other one's live environments appear here as
+        not-live. That is why nothing on this route deletes anything.
+        """
+        live = sorted(set(store.list_envs()) | set(reconcilers))
+        try:
+            rows = await _volume_rows(live)
+        except Exception as exc:  # noqa: BLE001 -- "odin could not ask" is an answer, not a 500
+            # `_surviving_containers`' rule: unknown must not wear the words of
+            # "there is nothing there". An empty `volumes` list with no reason
+            # would read as a clean machine -- the one reading this route exists
+            # to make impossible. `null`, and the reason, instead of `[]`.
+            log.warning("could not list odin's docker volumes (%s)", exc)
+            return {"envs": live, "volumes": None, "orphans": None, "error": (
+                f"odin could not list this machine's Docker volumes, so it cannot say what disk it "
+                f"is holding: {exc}. Fix the container runtime (`odin doctor`) and re-run."
+            )}
+        return {
+            "envs": live, "volumes": rows,
+            "orphans": [row["name"] for row in rows if not row["live"]],
+        }
 
     return router
 

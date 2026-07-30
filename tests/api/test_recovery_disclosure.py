@@ -69,7 +69,10 @@ class FakeRuntime:
     def __init__(self, *names: str):
         self.volumes = set(names)
 
-    async def volume_names(self) -> list[str]:
+    async def volume_names(self, env: str | None = None) -> list[str]:
+        # `env` is accepted and ignored ON PURPOSE, and only safely so: nothing
+        # in this file removes anything. `_recovered_resources` asks for the FULL
+        # listing (`env=None`) and looks one exact name up in it.
         return sorted(self.volumes)
 
 

@@ -31,6 +31,7 @@ from odin.server import _REMOVE_FAILED, _REMOVE_OK, _REMOVE_STATUS, create_app
 from odin.simulate.runner import TfResult
 from odin.spec.store import SpecStore
 from tests.api.test_apply import CANVAS, FakeRds, FakeRuntime
+from tests.volumes import IN_USE
 
 S3_CANVAS = {"nodes": [{"type": "s3", "data": {"label": "uploads"}}], "edges": []}
 
@@ -41,7 +42,11 @@ KEEP = "envrm-keep"
 class CleanRuntime(FakeRuntime):
     """A machine that really has no container left for any env — `container_names`
     is what `/envs/rm`'s third guard reads, and `FakeRuntime` does not have it
-    (which is itself a case: see `test_a_machine_odin_cannot_ask_...`)."""
+    (which is itself a case: see `test_a_machine_odin_cannot_ask_...`).
+
+    Its volume half comes from `FakeRuntime`/`tests.volumes.FakeVolumes`, which
+    models docker's `odin.env` label filter for real — a fake that ignored the
+    filter would let a reclaim that swept the whole machine pass."""
 
     async def container_names(self):
         return []
@@ -424,3 +429,237 @@ def test_rds_canvas_env_removes_too(tmp_path):
         _seed(client, app, DROP, canvas=CANVAS)
         assert client.post(f"/envs/rm?env={DROP}").json()["status"] == "removed"
         assert not (tmp_path / DROP).exists()
+
+
+# --- the DISK a removed env leaves behind ---------------------------------
+#
+# An rds instance's PGDATA is a NAMED docker volume since v0.8.14, precisely so
+# that replacing the container does not replace the database. The consequence
+# nobody closed: `docker rm -f -v` never takes one, and nothing else did either.
+# Four orphans from two long-dead environments were measured on the development
+# machine. `/envs/rm` is where that closes, and every test below is about the
+# reclaim being SCOPED and HONEST rather than merely happening.
+
+
+def test_removing_an_env_reclaims_its_data_volumes_and_names_them(tmp_path):
+    runtime = CleanRuntime()
+    runtime.seed_volume(f"odin-rds-{DROP}-app-db-data", DROP)
+    runtime.seed_volume(f"odin-rds-{DROP}-other-db-data", DROP)
+    app = _app(tmp_path, runtime=runtime)
+    with TestClient(app) as client:
+        _seed(client, app, DROP, canvas=CANVAS)
+        body = client.post(f"/envs/rm?env={DROP}").json()
+
+    assert body["status"] == "removed", body
+    # NAMED, not counted: nothing else on the machine would ever say the disk
+    # went back, and a reclaim that reports nothing is indistinguishable from one
+    # that had nothing to do.
+    assert body["reclaimed"]["volumes"] == [
+        f"odin-rds-{DROP}-app-db-data", f"odin-rds-{DROP}-other-db-data",
+    ]
+    assert runtime.volumes == set()
+
+
+def test_removing_one_env_leaves_another_envs_database_on_the_disk(tmp_path):
+    """The blast radius. `env rm` is scoped to the `odin.env` LABEL, so the
+    surviving env's data volume is still there afterwards.
+
+    Mutation-test: make `volume_names(env=...)` in `tests/volumes.py` ignore its
+    argument (docker's filter dropped) and this fails."""
+    runtime = CleanRuntime()
+    runtime.seed_volume(f"odin-rds-{DROP}-db-data", DROP)
+    runtime.seed_volume(f"odin-rds-{KEEP}-db-data", KEEP)
+    app = _app(tmp_path, runtime=runtime)
+    with TestClient(app) as client:
+        _seed(client, app, DROP, canvas=CANVAS)
+        _seed(client, app, KEEP, canvas=CANVAS)
+        assert client.post(f"/envs/rm?env={DROP}").json()["status"] == "removed"
+
+    assert runtime.volumes == {f"odin-rds-{KEEP}-db-data"}
+
+
+def test_an_env_whose_name_prefixes_this_one_keeps_its_database(tmp_path):
+    """The collision a name-shaped filter cannot survive, at the route level.
+    `envrm-drop` and `envrm-drop-two` share every character of the shorter one's
+    prefix, so `--filter name=odin-rds-envrm-drop-` deletes both."""
+    other = f"{DROP}-two"
+    runtime = CleanRuntime()
+    runtime.seed_volume(f"odin-rds-{DROP}-db-data", DROP)
+    runtime.seed_volume(f"odin-rds-{other}-db-data", other)
+    app = _app(tmp_path, runtime=runtime)
+    with TestClient(app) as client:
+        _seed(client, app, DROP, canvas=CANVAS)
+        _seed(client, app, other, canvas=CANVAS)
+        # The container witness matches on NAMING and would read `other`'s
+        # container as this env's, so there must be none for either.
+        assert client.post(f"/envs/rm?env={DROP}").json()["status"] == "removed"
+
+    assert runtime.volumes == {f"odin-rds-{other}-db-data"}
+
+
+def test_a_volume_that_will_not_go_blocks_the_removal_and_is_named(tmp_path):
+    """The guard, FIRING. Docker refuses to remove a volume a container still
+    references, and deleting `.odin/<env>/` over that refusal would leave a
+    Postgres data directory with nothing left on the machine that names it —
+    exactly the leak this step exists to close.
+
+    Mutation-test: drop the `if volumes.standing` branch in `_remove_env` and
+    this fails."""
+    runtime = CleanRuntime()
+    runtime.seed_volume(f"odin-rds-{DROP}-db-data", DROP)
+    runtime.refuse_volume(f"odin-rds-{DROP}-db-data")
+    app = _app(tmp_path, runtime=runtime)
+    with TestClient(app) as client:
+        _seed(client, app, DROP, canvas=CANVAS)
+        resp = client.post(f"/envs/rm?env={DROP}")
+
+    assert resp.status_code == 500, resp.text
+    body = resp.json()
+    assert body["status"] == "remove_failed_volumes_standing"
+    assert body["still_standing"]["volumes"] == [{
+        "volume": f"odin-rds-{DROP}-db-data",
+        "reason": IN_USE.format(name=f"odin-rds-{DROP}-db-data"),
+    }]
+    # Docker's OWN sentence reaches the user (asserted verbatim above), and the
+    # error text points AT it and says what to do about it.
+    assert "still_standing.volumes` names each one" in body["error"]
+    assert "volume is in use" in body["error"]
+    assert "docker rm -f <container>" in body["error"]
+    # ...and NOTHING was deleted, so a retry after removing the container is clean.
+    assert (tmp_path / DROP / "HEAD").exists()
+    assert DROP in client.get("/envs").json()["envs"]
+    assert runtime.volumes == {f"odin-rds-{DROP}-db-data"}
+
+
+def test_a_machine_odin_cannot_ask_about_volumes_blocks_the_removal(tmp_path):
+    """"odin could not tell" must not wear the words of "there was nothing
+    there" (field test 6's F4, applied to the volume half). Unknown goes the
+    failure way and deletes nothing."""
+    class VolumeBlindRuntime(CleanRuntime):
+        async def volume_names(self, env=None):
+            raise RuntimeError("Cannot connect to the Docker daemon")
+
+    app = _app(tmp_path, runtime=VolumeBlindRuntime())
+    with TestClient(app) as client:
+        _seed(client, app, DROP, canvas=CANVAS)
+        resp = client.post(f"/envs/rm?env={DROP}")
+
+    assert resp.status_code == 500, resp.text
+    body = resp.json()
+    assert body["status"] == "remove_unverified"
+    assert "could not list this env's Docker volumes" in body["error"]
+    assert "NOTHING was deleted" in body["error"]
+    assert (tmp_path / DROP / "HEAD").exists()
+
+
+# --- the reported bug: an env that is gone everywhere but the disk --------
+
+
+def test_an_env_with_no_directory_still_has_its_volumes_reclaimed(tmp_path):
+    """THE reported bug. All four measured orphans had exactly this shape: no
+    container, no `.odin/<env>/`, absent from `GET /envs` — and gigabytes on the
+    disk. This branch used to return a flat `never_existed` and reclaim nothing,
+    which is how they accumulated with no way to find them but `docker volume ls`.
+
+    Mutation-test: restore `return "never_existed", {}` and this fails."""
+    runtime = CleanRuntime()
+    runtime.seed_volume("odin-rds-envrm-orphan-app-db-data", "envrm-orphan")
+    app = _app(tmp_path, runtime=runtime)
+    with TestClient(app) as client:
+        assert "envrm-orphan" not in client.get("/envs").json()["envs"]
+        resp = client.post("/envs/rm?env=envrm-orphan")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # "removed", not "not_found": odin just deleted state a user cannot get back,
+    # and calling that "there was nothing here" is the same class of lie as an
+    # exit 0 over a standing env.
+    assert body["status"] == "removed"
+    assert body["reclaimed"]["volumes"] == ["odin-rds-envrm-orphan-app-db-data"]
+    assert runtime.volumes == set()
+    # ...and it minted no state directory on the way (field test 5, LOW).
+    assert not (tmp_path / "envrm-orphan").exists()
+
+
+def test_an_env_with_neither_a_directory_nor_a_volume_is_still_not_found(tmp_path):
+    """The other side of the same branch: `odin env rm typo` must still say
+    nothing was there. `removed` is reserved for a removal that really removed
+    something."""
+    app = _app(tmp_path)
+    with TestClient(app) as client:
+        resp = client.post("/envs/rm?env=envrm-typo2")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "not_found"
+    assert resp.json()["reclaimed"]["volumes"] == []
+    assert "error" not in resp.json()
+
+
+def test_a_directoryless_env_with_a_live_container_refuses_before_touching_disk(tmp_path):
+    """`env` here is a name a HUMAN typed, not one odin read out of its own
+    store — and docker volumes are per-machine while a store root is not. On a
+    machine running a second odin (every parallel agent worktree has its own
+    `.odin/`), that name may be the other one's LIVE environment, whose database
+    has a container. So the container witness runs first and refuses.
+
+    Mutation-test: delete the `_surviving_containers` check from `_reclaim_only`
+    and this fails."""
+    class OtherOdinsEnvRuntime(CleanRuntime):
+        async def container_names(self):
+            return ["odin-rds-envrm-elsewhere-app-db"]
+
+    runtime = OtherOdinsEnvRuntime()
+    runtime.seed_volume("odin-rds-envrm-elsewhere-app-db-data", "envrm-elsewhere")
+    app = _app(tmp_path, runtime=runtime)
+    with TestClient(app) as client:
+        resp = client.post("/envs/rm?env=envrm-elsewhere")
+
+    assert resp.status_code == 500, resp.text
+    assert resp.json()["status"] == "remove_failed_containers_standing"
+    assert runtime.volumes == {"odin-rds-envrm-elsewhere-app-db-data"}, (
+        "another odin's live database must survive a name collision"
+    )
+
+
+def test_a_directoryless_env_odin_cannot_ask_about_is_unverified_not_not_found(tmp_path):
+    """Found by MUTATION TESTING, and it is the more dangerous half of the pair.
+
+    `_reclaim_only` has its own `volumes_unknown` branch, and the test for the
+    other one (`test_a_machine_odin_cannot_ask_about_volumes_blocks_the_removal`)
+    could not reach it — that env has a directory, so it goes through
+    `_remove_env`. With this branch broken, an env whose disk odin could not read
+    answers `not_found` and **exits 0**: "there was nothing here" over volumes
+    that may well still be holding gigabytes. That is the exact shape of the
+    exit-0-over-a-standing-env bug this repo fixed three times.
+
+    Mutation-test: replace `_reclaim_only`'s `if volumes.unknown: return
+    "volumes_unknown", detail` with `pass` and this fails."""
+    class VolumeBlindRuntime(CleanRuntime):
+        async def volume_names(self, env=None):
+            raise RuntimeError("Cannot connect to the Docker daemon")
+
+    app = _app(tmp_path, runtime=VolumeBlindRuntime())
+    with TestClient(app) as client:
+        resp = client.post("/envs/rm?env=envrm-unreadable")
+
+    assert resp.status_code == 500, resp.text
+    body = resp.json()
+    assert body["status"] == "remove_unverified"
+    assert body["status"] not in _REMOVE_OK
+    assert "could not list this env's Docker volumes" in body["error"]
+    assert not (tmp_path / "envrm-unreadable").exists()
+
+
+def test_a_directoryless_env_whose_volume_will_not_go_is_named_not_ignored(tmp_path):
+    runtime = CleanRuntime()
+    runtime.seed_volume("odin-rds-envrm-stuck-db-data", "envrm-stuck")
+    runtime.refuse_volume("odin-rds-envrm-stuck-db-data")
+    app = _app(tmp_path, runtime=runtime)
+    with TestClient(app) as client:
+        resp = client.post("/envs/rm?env=envrm-stuck")
+
+    assert resp.status_code == 500, resp.text
+    body = resp.json()
+    assert body["status"] == "remove_failed_volumes_standing"
+    assert body["still_standing"]["volumes"][0]["volume"] == "odin-rds-envrm-stuck-db-data"
+    assert runtime.volumes == {"odin-rds-envrm-stuck-db-data"}
