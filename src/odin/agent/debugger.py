@@ -69,7 +69,7 @@ import json
 import logging
 import os
 from collections.abc import Awaitable, Callable
-from typing import Any, TypedDict
+from typing import Annotated, Any, TypedDict
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, SdkMcpTool, create_sdk_mcp_server, tool
 
@@ -387,14 +387,32 @@ async def assemble_context(
 # --- 2. the diagnosis (one agent run, one typed effect channel) ---------------
 
 
+# The `suspects` contract, in the SCHEMA -- `Annotated[..., "text"]` becomes a
+# JSON-Schema `description` on the field itself, so it travels with the thing the
+# model is filling in rather than sitting only in a system prompt above it.
+#
+# VERIFIED against the installed SDK rather than assumed, because the first
+# version of this comment asserted the OPPOSITE and was wrong:
+# `claude_agent_sdk._typeddict_to_json_schema` calls
+# `_get_type_hints(..., include_extras=True)` and `_python_type_to_json_schema`
+# has an explicit `if origin is Annotated:` branch that copies the first `str` in
+# the metadata to `schema["description"]`. Printed, for `SuspectInput.node_id`:
+#     {"type": "string", "description": "The canvas node label ..."}
+# The bare TypedDict this replaced rendered `{"type": "string"}` with no
+# description at all, which is what made the constraint unreachable from here.
 class SuspectInput(TypedDict):
-    node_id: str
-    reason: str
+    node_id: Annotated[str, "The canvas node label of a node you are IMPLICATING as a cause."]
+    reason: Annotated[str, "The evidence implicating this node -- quote the exit code, verdict or log line."]
 
 
 class ReportDiagnosisInput(TypedDict):
-    answer: str
-    suspects: list[SuspectInput]
+    answer: Annotated[str, "The plain-English diagnosis. Put controls and comparisons HERE, not in suspects."]
+    suspects: Annotated[
+        list[SuspectInput],
+        "ONLY the nodes implicated as a cause of the failure. A node included as a healthy "
+        "control or a point of comparison must NOT appear here -- mention it in `answer` "
+        "instead. Empty is correct when the evidence implicates nothing.",
+    ]
 
 
 _SYSTEM = (
@@ -413,17 +431,59 @@ _SYSTEM = (
     "evidence -- quote the exit code, the verdict, or the log line that shows it. "
     "If the evidence does not explain the failure, say so plainly instead of "
     "guessing. Secrets and env-var values are redacted by design; never ask for them "
-    "and never treat their absence as the problem. Name as suspects only nodes that "
-    "appear in the evidence. Call report_diagnosis exactly once."
+    "and never treat their absence as the problem. "
+    # `suspects` means IMPLICATED, and this sentence is the whole reason it says so.
+    # The rule here used to be provenance-only -- "name as suspects only nodes that
+    # appear in the evidence" -- which permits naming EVERY node in the evidence,
+    # and a real run took it that way: the answer said `steady` was "included only
+    # as the working control/comparison, not implicated in the failure" and then
+    # listed `steady` in `suspects` anyway. The model was obeying the instruction
+    # exactly; the instruction was the defect. A caller cannot tell a control from
+    # a culprit in a flat list, so the field has to mean one thing.
+    "`suspects` is the nodes you are IMPLICATING as a cause of this failure, and "
+    "nothing else. Only nodes that appear in the evidence may be named, and a node "
+    "you are including as a healthy control or a point of comparison must NOT be "
+    "listed there -- say that in `answer` instead. If the evidence implicates no "
+    "node, report an empty list and say why in `answer`. "
+    "Call report_diagnosis exactly once."
+)
+
+
+# The tool's own description, which reaches the model as part of the tool
+# definition rather than the system prompt. It repeats the `suspects` contract
+# deliberately -- the field descriptions on `ReportDiagnosisInput` say it a third
+# time, in the schema itself. See `make_report_tool` for why all three.
+_TOOL_DESCRIPTION = (
+    "Report the plain-English diagnosis, plus `suspects`: ONLY the nodes implicated "
+    "as a cause of the failure. Never list a healthy control or comparison node."
 )
 
 
 def make_report_tool(collector: list[dict]) -> SdkMcpTool:
     """The ONE typed tool the agent may call -- the only effect channel out of
     the run, exactly as `translate.make_emit_tool` is for the refine pass.
-    `collector` accumulates each call's raw args."""
+    `collector` accumulates each call's raw args.
 
-    @tool("report_diagnosis", "Report the plain-English diagnosis and the per-node suspects.", ReportDiagnosisInput)
+    THE `suspects` CONTRACT IS SAID THREE TIMES, and each place is a different
+    channel the model reads: `_SYSTEM` (the system prompt), this description (the
+    tool), and the field descriptions on `ReportDiagnosisInput` (the schema). The
+    schema one is the closest to the field being filled in, so it is the one that
+    should survive a long prompt.
+
+    A NOTE ON HOW THAT WAS ESTABLISHED, because it is the whole of honesty rule 1
+    in miniature. The first version of this docstring claimed the opposite -- that
+    a field description could never reach the model, since
+    `_typeddict_to_json_schema` "emits types alone" -- and reasoned that the
+    constraint therefore had to live in prose. That was FALSE, and reading two
+    more functions down disproved it: `_python_type_to_json_schema` has an
+    explicit `if origin is Annotated:` branch that copies the first `str` in the
+    metadata into `schema["description"]`, and `_get_type_hints` is called with
+    `include_extras=True` precisely so it survives. The claim had already been
+    written into a docstring, a test and a commit message before it was checked
+    against the real renderer. Print the schema (see the comment on
+    `SuspectInput`); do not reason about it."""
+
+    @tool("report_diagnosis", _TOOL_DESCRIPTION, ReportDiagnosisInput)
     async def report_diagnosis(args: ReportDiagnosisInput) -> dict:
         collector.append(dict(args))
         return {"content": [{"type": "text", "text": "recorded"}]}

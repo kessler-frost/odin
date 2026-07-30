@@ -29,6 +29,46 @@ What this proves that no unit test can:
      leftover volume. A volume that outlives `destroy` is a data leak and a disk
      leak both, so the fix for (4b) is only half a fix without it.
 
+THE CADENCE -- why this file sets NO drift knob (and used to). It set
+`ODIN_DRIFT_SWEEP_TICKS=1`, which .claude/CLAUDE.md honesty rule 1b names as a
+test fabricating a guard's promptness. That was load-bearing for exactly one
+assertion -- that `rdsctl.json` reads `failed` -- and that assertion was FLAKY
+for a precise reason: the two facts it paired come from different code paths
+with different cadences.
+
+  * `/world` reading `crashed` is CADENCE-FREE. `tf_status.project()` applies
+    `drift.live_verdicts` on every projection, so the phase and the verdict flip
+    on the next reconciler tick whatever the sweep is doing.
+  * the RECORD being corrected to `failed` was, here, the BACKGROUND sweep's
+    write. `Reconciler._project_tf_owned` runs the sweep and the projection in
+    one tick but as TWO INDEPENDENT `_dead` calls, each taking its own
+    `docker ps`/`inspect` sample -- and `drift.py` deliberately makes the
+    correcting one skip a pass rather than act on an ambiguous reading
+    (`_listing`'s "unknown is not gone", and `_not_serving` refusing to treat
+    `inspect`'s `absent` as a death).
+
+So the OBSERVED failure was `/world` already saying `crashed` while the record
+still said `available`, and the test read the record with no retry at all. Which
+of the two samples disagreed is NOT claimed here, because it was not caught in
+the act: the kill landing between the sweep's read and the projection's read, and
+the sweep hitting an ambiguous reading and skipping, both produce exactly this
+and are both narrow enough to explain why it is rare. Naming one would be a
+guess dressed as a diagnosis. The ROOT SHAPE is what the fix acts on and is not
+in doubt -- two independent samples per tick, and an assertion that read the
+product of only one of them without waiting for it.
+
+The fix is not a longer wait; it is to stop asking a background loop at all. The
+record correction that odin's CONTRACT depends on is the one /apply-full makes
+for itself (`server.py` calls `drift.sweep_compute` BEFORE
+`rdsctl.converge_db_instances`, which is what made recovery take one apply
+instead of two), and that write is witnessed synchronously in the apply's own
+response by `recovered_resources` -- `_recovering_resources` filters on
+`status == rdsctl.FAILED` and is called in the single instant the mark exists.
+So the record assertion moved onto that signal, the knob went away, and this
+test now runs at the cadence the user gets. It also got STRONGER: it pins the
+record's reason to the verdict `/world` showed, the one-wording invariant
+`ecsctl.container_gone_reason` exists for.
+
 Shape/hygiene modeled on tests/simulate/test_logs_tf_e2e.py, including its
 LOAD-BEARING store-root discovery (Colima only mounts `$HOME`, so the SpecStore
 must live under the repo checkout, never pytest's `tmp_path`) and its absolute
@@ -73,8 +113,13 @@ INSTANCE_CLASS = "db.t3.micro"
 # the apply is considered broken (rdsctl's own `_CREATE_TIMEOUT` is 180s; tofu's
 # create waiter sits on top of it).
 BOOT_WINDOW = 240.0
-# The reality sweep runs every tick here (ODIN_DRIFT_SWEEP_TICKS=1, ~1s), so a
-# killed container should surface well inside this.
+# How long `/world` gets to report a killed database. This is ONE reconciler
+# tick's worth of work, not a sweep cadence: `tf_status.project()` applies
+# `live_verdicts` on every projection, so the phase flips on the next tick
+# whatever the drift sweep is doing. The test PRINTS the time it really took, so
+# the number is measured on every run rather than asserted here. The generous
+# bound is for a stalled reconciler, which is the only way this can genuinely
+# fail -- it is not absorbing a cadence.
 DRIFT_WINDOW = 45.0
 
 CANVAS = {
@@ -169,7 +214,17 @@ async def _write_rows(facts: dict) -> list[int]:
 
 
 async def _read_rows(facts: dict) -> list[int]:
-    return sorted(r["id"] for r in await _query(facts, "SELECT id FROM orders"))
+    """The rows, or `[]` when the TABLE ITSELF is gone.
+
+    The `to_regclass` probe first, and it is not decoration: FOUND BY
+    MUTATION-TESTING the non-destructive claim below. With the repair broken so
+    the replacement container mounts no data volume, `SELECT id FROM orders`
+    raises `asyncpg.exceptions.UndefinedTableError` at plan time -- so the test
+    failed with a driver traceback and the carefully-worded "odin's own repair
+    emptied the database" message it exists to print never appeared. An emptied
+    database is exactly the failure this assertion is for; it should read as one."""
+    (present,) = await _query(facts, "SELECT to_regclass('orders') IS NOT NULL AS ok")
+    return sorted(r["id"] for r in await _query(facts, "SELECT id FROM orders")) if present["ok"] else []
 
 
 @pytest.fixture
@@ -221,9 +276,10 @@ async def test_an_rds_node_is_a_real_tf_managed_postgres_that_survives_being_kil
     cleanup_names, cleanup_volumes = db_cleanup
     cleanup_names.append(victim)
     cleanup_volumes.append(data_volume)
-    # Sweep every tick (~1s) so the drift half isn't 10 ticks of waiting; the
-    # default cadence itself is covered by tests/reconcile/test_drift.py.
-    monkeypatch.setenv("ODIN_DRIFT_SWEEP_TICKS", "1")
+    # NO CADENCE KNOB -- see "THE CADENCE" in the module docstring. This used to
+    # set `ODIN_DRIFT_SWEEP_TICKS=1`; every signal it waits on below is
+    # cadence-free, so the default (10 ticks) is what runs here.
+    monkeypatch.delenv("ODIN_DRIFT_SWEEP_TICKS", raising=False)
 
     store = SpecStore(store_root)
     app = create_app(store=store)
@@ -283,6 +339,7 @@ async def test_an_rds_node_is_a_real_tf_managed_postgres_that_survives_being_kil
         assert _docker("kill", victim).returncode == 0
         assert not _running(victim), "the premise: the database is really down"
 
+        killed_at = time.monotonic()
         drifted = _observed(client, DRIFT_WINDOW, "crashed")
         assert drifted is not None and drifted["phase"] == "crashed", (
             f"a killed database must not keep reading healthy (last seen: {drifted})"
@@ -294,11 +351,12 @@ async def test_an_rds_node_is_a_real_tf_managed_postgres_that_survives_being_kil
         assert "exit 137" in drifted["verdict"], drifted["verdict"]
         # And no stale DATABASE_URL left advertising a database that's gone.
         assert drifted["facts"] == {}, drifted["facts"]
-        # The RECORD is corrected too, which is what survives a restart.
-        assert _rdsctl_state(store.root, ENV)[f"db:{NODE}"]["status"] == "failed"
+        print(f"[W2.7] killed -> /world crashed in {time.monotonic() - killed_at:.2f}s")
 
-        # ...and the SAME Apply button brings it back. tofu's own plan here is
-        # empty (an aws_db_instance's config never changed), so this recovery is
+        # ...and the SAME Apply button brings it back -- with NOTHING having
+        # waited for the background sweep first, which is the whole point of the
+        # cadence note in this module's docstring. tofu's own plan here is empty
+        # (an aws_db_instance's config never changed), so this recovery is
         # `converge_db_instances` -- the lambda/ecs pattern, for rds.
         reapply = client.post("/apply-full", json=CANVAS, params={"env": ENV})
         assert reapply.status_code == 200, reapply.text
@@ -306,9 +364,26 @@ async def test_an_rds_node_is_a_real_tf_managed_postgres_that_survives_being_kil
 
         # ...and the apply DISCLOSES the repair, with what it cost -- read from
         # the real volume listing, not asserted (`server.py::_RECOVERY_COST`).
+        #
+        # This is ALSO the proof that the RECORD was corrected to `failed`, and
+        # it is why the test no longer reads `rdsctl.json` for that itself.
+        # `_recovering_resources` filters on `status == rdsctl.FAILED` and
+        # server.py calls it in the one instant the mark exists -- after
+        # `drift.sweep_compute`, before `converge_db_instances` clears it back to
+        # `creating`. So a non-empty entry here cannot be produced without a
+        # record that really said `failed`, and it arrives IN THIS RESPONSE
+        # rather than whenever a background loop got round to it.
         recovery_body = reapply.json()
         (disclosed,) = recovery_body["recovered_resources"]
         assert (disclosed["kind"], disclosed["node"]) == ("rds", NODE), disclosed
+        # ...carrying the SAME sentence the canvas showed. Both come from
+        # `drift.py::_dead_verdict`, and that one-wording rule is exactly what
+        # `ecsctl.container_gone_reason` was extracted for after two paths
+        # writing different strings for one event made a test flake.
+        assert disclosed["reason"] == drifted["verdict"], (
+            f"the record's reason and the canvas verdict must be one sentence: "
+            f"{disclosed['reason']!r} vs {drifted['verdict']!r}"
+        )
         assert disclosed["data_kept"] is True, disclosed
         assert "its data survived" in recovery_body["note"], recovery_body["note"]
 

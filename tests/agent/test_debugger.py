@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 
+from claude_agent_sdk import _typeddict_to_json_schema
 from mcp import types as mcp_types
 
 from odin.agent import debugger
@@ -330,6 +331,43 @@ async def test_the_refusal_says_so_plainly_when_the_env_has_nothing_applied():
 
 def test_the_prompt_tells_the_agent_to_call_out_unknown_ids():
     assert "unknown_nodes" in debugger._SYSTEM
+
+
+def test_the_suspects_contract_is_implicated_only_in_EVERY_channel_the_model_reads():
+    """`suspects` means IMPLICATED, and this pins the specification that says so.
+
+    Why a text assertion earns its place here. The rule used to be
+    provenance-only ("name as suspects only nodes that appear in the evidence"),
+    which permits naming every node in the evidence -- and a real
+    `tests/agent/test_debug_e2e.py` run took it that way: the answer said the
+    healthy node was "included only as the working control/comparison, not
+    implicated in the failure" and `suspects` listed it anyway. That is a
+    SPECIFICATION defect (the model obeyed the instruction it was given), and the
+    e2e cannot pin the fix, because whether a given model call includes the
+    control is model variance -- MEASURED 0/24 against the real captured context
+    with the OLD wording and 0/24 with this one, so no sample size available here
+    can tell a fixed prompt from an unfixed one in either direction.
+    What CAN be pinned deterministically is that the instruction still exists in
+    every channel the model reads it through: the system prompt, the tool
+    description, and -- the one that travels with the field itself -- the RENDERED
+    JSON SCHEMA. That last assertion goes through the SDK's own converter rather
+    than reading `__annotations__`, because the question is not "did someone write
+    an Annotated" but "does it come out the other end". An earlier version of this
+    file asserted the schema could not carry a description at all; it was wrong,
+    and only running the converter showed that."""
+    for text in (debugger._SYSTEM, debugger._TOOL_DESCRIPTION):
+        assert "implicat" in text.lower(), text
+        assert "control" in text.lower() and "comparison" in text.lower(), text
+    # ...and the tool really is described with it, rather than the constraint
+    # sitting in an unused constant.
+    assert debugger.make_report_tool([]).description == debugger._TOOL_DESCRIPTION
+    # ...and the SCHEMA the model receives says it too. `_typeddict_to_json_schema`
+    # is the SDK's own function, so this fails if a future SDK stops honouring
+    # `Annotated` -- which is exactly the silent regression worth catching.
+    schema = _typeddict_to_json_schema(debugger.ReportDiagnosisInput)
+    described = schema["properties"]["suspects"]["description"].lower()
+    assert "implicated" in described, schema
+    assert "control" in described and "comparison" in described, schema
 
 
 # --- field test 2 finding #6: credentials odin ISSUED, not ones it was given --
