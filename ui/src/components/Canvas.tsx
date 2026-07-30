@@ -42,7 +42,12 @@ import { centreOf, resolveHandles } from '../lib/edgeHandles';
 // writes the DEFAULT env's canvas, which is the class of bug that cost a
 // canvas earlier in this release.
 const canvasUrl = (env: string | undefined) => `${API}/canvas?env=${encodeURIComponent(env || 'default')}`;
-import { edgeDataForConnection, edgeStyle, edgeTypes } from '../lib/iam';
+// `primaryEdgeType`/`includesEdgeType` rather than a bare lookup or `=== 'iam'`:
+// since v0.8.15 `data.edgeType` may carry a `+`-joined SET of meanings for a
+// genuinely ambiguous pair (rds/ecs, elasticache/lambda). A direct
+// `edgeTypes['connection+iam']` misses and falls to grey; a `=== 'iam'` says the
+// edge grants nothing while the gateway is enforcing its policy.
+import { edgeDataForConnection, edgeStyle, edgeTypes, includesEdgeType, primaryEdgeType } from '../lib/iam';
 
 const nodeTypes: NodeTypes = {
   vpc: VpcNode,
@@ -79,7 +84,7 @@ const DEFAULT_LAMBDA_CODE = 'def lambda_handler(event, context):\n    return eve
 const defaultDataForType: Record<string, Record<string, string>> = {
   vpc: { label: 'new-vpc', resourceId: '', cidr: '10.0.0.0/16', status: 'draft' },
   subnet: { label: 'new-subnet', resourceId: '', cidr: '10.0.1.0/24', status: 'draft' },
-  sg: { label: 'new-sg', groupId: '', vpcId: '', ingressRules: '', status: 'draft' },
+  sg: { label: 'new-sg', groupId: '', vpcId: '', ingressRules: '', egressRules: '', status: 'draft' },
   ec2: { label: 'new-instance', instanceType: 't3.micro', ami: '', key: '', userData: '', securityGroups: '', status: 'draft' },
   lambda: { label: 'new-function', runtime: 'python3.12', handler: 'lambda_function.lambda_handler', code: DEFAULT_LAMBDA_CODE, role: '', status: 'draft' },
   s3: { label: 'new-bucket', arn: '', status: 'draft' },
@@ -195,9 +200,9 @@ function edgesFromCanvas(canvas: { edges?: unknown[]; nodes?: unknown[] }): Edge
   return (canvas.edges ?? []).map((e: any) => {
     const handles = resolveHandles(e, centres.get(e.source) ?? null, centres.get(e.target) ?? null);
     const eType = e.data?.edgeType ?? 'network';
-    const typeDef = edgeTypes[eType] ?? edgeTypes.network;
+    const typeDef = edgeTypes[primaryEdgeType(eType)] ?? edgeTypes.network;
     const permissions = e.data?.permissions ?? [];
-    const hasLabel = eType === 'iam' && permissions.length > 0;
+    const hasLabel = includesEdgeType(eType, 'iam') && permissions.length > 0;
     return {
       id: e.id,
       source: e.source,
@@ -577,9 +582,9 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
       if (e.id !== edgeId) return e;
       const newData = { ...e.data, ...data };
       const eType = (newData.edgeType as string) ?? 'network';
-      const typeDef = edgeTypes[eType] ?? edgeTypes.network;
+      const typeDef = edgeTypes[primaryEdgeType(eType)] ?? edgeTypes.network;
       const permissions = (newData.permissions as string[]) ?? [];
-      const hasLabel = eType === 'iam' && permissions.length > 0;
+      const hasLabel = includesEdgeType(eType, 'iam') && permissions.length > 0;
       updatedEdge = {
         ...e,
         data: newData,
@@ -604,8 +609,8 @@ function InnerCanvas({ env, onNodeSelect, onEdgeSelect, onNodeLabelsChange, node
       // where a test can reach it: the drag gesture itself is not automatable
       // (6px handles), so its result is the only part that can be covered.
       const { edgeType: detectedType, permissions: perms } = edgeDataForConnection(sourceType, targetType);
-      const typeDef = edgeTypes[detectedType] ?? edgeTypes.network;
-      const isIam = detectedType === 'iam';
+      const typeDef = edgeTypes[primaryEdgeType(detectedType)] ?? edgeTypes.network;
+      const isIam = includesEdgeType(detectedType, 'iam');
       const hasLabel = isIam && perms.length > 0;
 
       setEdges((eds) =>

@@ -1,8 +1,15 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import type { Node, Edge } from '@xyflow/react';
 import StatusBadge, { phaseTextColor } from './nodes/StatusBadge';
-import { iamActionsForTarget, edgeTypes, detectEdgeTypes } from '../lib/iam';
+import {
+  iamActionsForTarget, edgeTypes, detectEdgeTypes, UNMODELLED,
+  edgeTypeChoices, primaryEdgeType, selectedEdgeTypes, toggleEdgeType,
+} from '../lib/iam';
 import { catalogTypeConfig, catalogFields } from '../lib/catalog';
+
+// The pre-rename catch-all. Kept as a named constant rather than a bare string
+// so the one place that has to know about the old canvases says why.
+const LEGACY_CATCH_ALL = 'network';
 
 interface ConfigPanelProps {
   nodes: Node[];
@@ -54,6 +61,15 @@ const fieldsForType: Record<string, FieldDef[]> = {
       key: 'ingressRules', label: 'Ingress Rules (protocol:port:cidr-or-SG-name, one per line)',
       editable: true, multiline: true, placeholder: 'tcp:443:0.0.0.0/0\ntcp:5432:web-sg',
     },
+    {
+      // Outbound. EMPTY MEANS WIDE OPEN -- odin emits AWS's own allow-all
+      // egress when nothing is authored here, which is what every group did
+      // before this field existed and what real AWS seeds a new group with.
+      // The placeholder shows that default spelled out, so the first thing a
+      // reader learns is what they are replacing (agent/hcl.py::_sg).
+      key: 'egressRules', label: 'Egress Rules (protocol:port:cidr-or-SG-name, one per line — empty = allow all)',
+      editable: true, multiline: true, placeholder: '-1:0:0.0.0.0/0\ntcp:443:10.0.0.0/16',
+    },
     { key: 'vpc', label: 'VPC (containment)' },
     { key: 'subnet', label: 'Subnet (containment)' },
     { key: 'groupId', label: 'Group ID' },
@@ -80,6 +96,16 @@ const fieldsForType: Record<string, FieldDef[]> = {
     {
       key: 'code', label: 'Code', editable: true, multiline: true,
       placeholder: 'def lambda_handler(event, context):\n    return event',
+    },
+    // A function that is more than one file. The path is read BY THE SERVER at
+    // translate time (it builds the zip; the browser never touches the tree),
+    // so it must be a real directory on the machine running odin. Set, it wins
+    // over Code entirely -- agent/hcl.py::_lambda_package documents the whole
+    // precedence, and it is also the only place dependencies can come from:
+    // whatever you install INTO that directory ships with it.
+    {
+      key: 'sourceDir', label: 'Source Directory (optional — packages the whole tree, overrides Code)',
+      editable: true, placeholder: '/Users/you/functions/thumbnailer',
     },
     { key: 'role', label: 'IAM Role (optional -- blank auto-generates one)', editable: true, placeholder: 'an IAM Role node\'s name' },
     { key: 'status', label: 'Status' },
@@ -190,9 +216,6 @@ function PermissionCheckbox({ action, checked, onChange }: { action: string; che
 
 function EdgeConfigView({ edge, nodes, onEdgeUpdate, onCollapse }: { edge: Edge; nodes: Node[]; onEdgeUpdate?: (edgeId: string, data: Record<string, unknown>) => void; onCollapse?: () => void }) {
   const panelBase = "bg-bg-secondary border-l border-border-bright p-0 overflow-y-auto h-full";
-  const currentType = (edge.data?.edgeType as string) ?? 'network';
-  const typeDef = edgeTypes[currentType] ?? edgeTypes.network;
-  const isIam = currentType === 'iam';
 
   // The REAL node types, looked up by id. This used to be
   // `edge.source.split('-')[0]`, which only works while every node id happens to
@@ -209,6 +232,30 @@ function EdgeConfigView({ edge, nodes, onEdgeUpdate, onCollapse }: { edge: Edge;
   // Available edge types for this node pair
   const availableTypes = detectEdgeTypes(sourceType, targetType);
   const iamAvailable = availableTypes.includes('iam');
+
+  // What this edge IS. A canvas saved before an edge type was named carries the
+  // old catch-all `network`, and `network` decides nothing: `agent/hcl.py`'s ALB
+  // and subscription passes key on the two NODE kinds and never read the edge's
+  // kind at all. So an alb->ecs edge stored as `network` really does compile to
+  // a `load_balancer` block, and labelling that panel "Network" would name the
+  // edge by the one word in it that has no consequence.
+  //
+  // Every OTHER stored kind is shown exactly as authored. An `iam` edge compiles
+  // to a real policy whichever pair it sits on (`gateway/policy.py` reads the
+  // kind, not the kinds of its endpoints), so overriding that one to match the
+  // registry would HIDE a live grant -- a worse lie than a stale word.
+  //
+  // A pair CAN now mean more than one thing at once (rds/ecs, elasticache/lambda
+  // -- see `iam.ts`'s connection edge), so `edgeType` may hold a `+`-joined SET
+  // and the picker below is multi-select. `selectedEdgeTypes` drops any stored
+  // meaning this pair does not really have, which is how a retyped node stops
+  // showing a tick the user never made.
+  const storedType = edge.data?.edgeType as string | undefined;
+  const stored = !storedType || storedType === LEGACY_CATCH_ALL ? availableTypes[0] : storedType;
+  const currentTypes = selectedEdgeTypes(stored, availableTypes);
+  const choices = edgeTypeChoices(stored, availableTypes);
+  const typeDef = edgeTypes[primaryEdgeType(currentTypes[0])] ?? edgeTypes[UNMODELLED];
+  const isIam = currentTypes.includes('iam');
 
   // Build per-resource permission groups (only for types that have IAM actions)
   const permissionGroups: { resourceType: string; label: string; neonColor: string; actions: string[] }[] = [];
@@ -230,14 +277,30 @@ function EdgeConfigView({ edge, nodes, onEdgeUpdate, onCollapse }: { edge: Edge;
     const newPermissions = checked
       ? [...permissions, action]
       : permissions.filter(p => p !== action);
-    onEdgeUpdate?.(edge.id, { permissions: newPermissions, edgeType: 'iam' });
+    // Ticking a permission ADDS the `iam` meaning rather than replacing whatever
+    // the edge already means. Writing a flat `edgeType: 'iam'` here (what this
+    // did before there was anything else to mean) would silently drop the
+    // `connection` half of an rds->ecs edge -- the workload would keep its grant
+    // and lose its DATABASE_URL, with the panel showing no sign of it.
+    onEdgeUpdate?.(edge.id, {
+      ...toggleEdgeType(stored, availableTypes, 'iam', true, sourceType, targetType, newPermissions),
+      permissions: newPermissions,
+    });
   };
 
-  const changeEdgeType = (newType: string) => {
-    const base: Record<string, unknown> = { edgeType: newType };
-    if (newType !== 'iam') base.permissions = [];
-    onEdgeUpdate?.(edge.id, base);
-  };
+  // MULTI-SELECT, not exclusive, because in AWS the meanings co-occur: a
+  // workload wired to a database may also call its control plane, exactly as an
+  // event source mapping needs the role to hold `sqs:ReceiveMessage`. The whole
+  // decision lives in `lib/iam.ts::toggleEdgeType` -- including "the last
+  // remaining meaning cannot be unticked" and "permissions follow the meaning"
+  // -- because this file is TSX and the repo has no React test runner, so logic
+  // left here would have no coverage at all. That is not hypothetical: the
+  // `<select>` this replaces was gated on `availableTypes.length > 1` and had
+  // never once rendered, since every pair meant exactly one thing until v0.8.15.
+  const changeEdgeType = (edgeType: string, on: boolean) =>
+    onEdgeUpdate?.(edge.id, toggleEdgeType(
+      stored, availableTypes, edgeType, on, sourceType, targetType, permissions,
+    ));
 
   return (
     <div className={panelBase}>
@@ -249,25 +312,48 @@ function EdgeConfigView({ edge, nodes, onEdgeUpdate, onCollapse }: { edge: Edge;
         >
           {typeDef.label}
         </span>
-        <span className="font-semibold text-sm truncate text-text-primary">{isIam ? 'Permission' : 'Connection'}</span>
+        {/* Every meaning the edge carries, not just the primary one the badge is
+            coloured for -- an rds->ecs edge that is BOTH must not read as one. */}
+        <span className="font-semibold text-sm truncate text-text-primary">
+          {currentTypes.map(t => edgeTypes[t]?.label ?? t).join(' + ')}
+        </span>
       </div>
 
-      {/* Connection type selector — only show if multiple types available */}
-      {availableTypes.length > 1 && (
+      {/* What this line MEANS. Only shown where there is a genuine choice —
+          `rds ↔ {ecs,lambda}` and `elasticache ↔ {ecs,lambda}` are the only
+          pairs today, and `edge-ambiguity.test.ts` fails by name the moment
+          another one appears, so this cannot start hiding a real decision. */}
+      {choices.length > 1 && (
         <div className="px-4 py-3 border-b border-border">
           <div className="font-mono text-[10px] text-text-muted uppercase tracking-[2px] mb-2.5">
-            Type
+            Means
           </div>
-          <select
-            value={currentType}
-            onChange={(e) => changeEdgeType(e.target.value)}
-            className="w-full py-1.5 px-2.5 bg-bg-primary border border-border text-text-primary font-mono text-xs outline-none transition-colors duration-200 focus:border-neon-blue focus:ring-1 focus:ring-neon-blue/30 appearance-none cursor-pointer"
-          >
-            {availableTypes.map(t => {
+          <div className="space-y-0.5">
+            {choices.map(t => {
               const def = edgeTypes[t];
-              return <option key={t} value={t}>{def?.label ?? t}</option>;
+              const on = currentTypes.includes(t);
+              // The last remaining meaning is locked: an edge with no meaning
+              // reloads as `unmodelled` and silently loses what was chosen.
+              const locked = on && currentTypes.length === 1;
+              return (
+                <label
+                  key={t}
+                  title={locked ? 'an edge must mean at least one thing' : undefined}
+                  className={`flex items-center gap-2 py-0.5 font-mono text-xs ${locked ? 'cursor-not-allowed opacity-60' : 'cursor-pointer hover:text-text-primary'}`}
+                  style={{ color: on ? (def?.color ?? undefined) : undefined }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={on}
+                    disabled={locked}
+                    onChange={(e) => changeEdgeType(t, e.target.checked)}
+                    style={{ accentColor: def?.color }}
+                  />
+                  {def?.label ?? t}
+                </label>
+              );
             })}
-          </select>
+          </div>
         </div>
       )}
 

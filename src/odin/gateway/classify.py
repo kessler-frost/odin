@@ -125,8 +125,19 @@ RDS (task W2.7) is the QUERY protocol (form-encoded `Action=`, like sns/ec2/
 iam -- not a JSON target header), and its resource is workload-facing like
 logs': an `rds` canvas node's label IS its `DBInstanceIdentifier`
 (agent/hcl.py's `_rds` builder emits `identifier = <label>`), so an
-`rds-db:connect` edge drawn to that node compiles to a statement the gateway
-enforces with no rds-specific code in the policy layer.
+`rds:DescribeDBInstances` edge drawn to that node compiles to a statement the
+gateway enforces with no rds-specific code in the policy layer.
+
+NOTE WHAT THAT DOES NOT COVER, because this paragraph asserted the opposite
+until v0.8.15 and was believed for it: it named `rds-db:connect` as the example
+action. Every string this function can produce for rds is built as
+`f"rds:{action}"` from the `Action` form param, so `rds-db:` -- a DIFFERENT
+service prefix -- is unreachable, and a policy granting it could never match
+anything. odin does not implement IAM database authentication at all; the
+Postgres container takes its password out of `DATABASE_URL` and consults
+nobody. The action has been removed from the canvas's vocabulary
+(`ui/src/lib/catalog.ts`), and what a user drawing rds -> workload actually
+wants is the `connection` edge, which authors that `DATABASE_URL`.
 
 ELBV2 (task W2.5) IS THE QUERY PROTOCOL, like sns/ec2/iam -- the operation
 rides in the `Action` form param, not an `X-Amz-Target` header (verified
@@ -139,6 +150,40 @@ same OPERATOR-only "never return None" reasoning ec2/iam/ecr/ecs use, and for
 the same reason: a load balancer is not an IAM data-plane target on odin's
 canvas (see `_elbv2_resource`'s own docstring), so tofu is the only principal
 that ever gets here.
+
+EVENTBRIDGE (`events`) SHARES ECR's JSON-target WIRE (`X-Amz-Target:
+AWSEvents.*`, protocol `json`, jsonVersion 1.1 -- read off botocore's OWN
+`events` service model, along with `endpointPrefix: events`, which is the
+SigV4 credential-scope name this module dispatches on) and logs/secrets/ssm's
+WORKLOAD-FACING resource convention: the resource is the bare RULE NAME, which
+for an `events` canvas node IS its label, so an iam edge drawn to that node
+gates the call through the ordinary `evaluate(statements, action, resource)`
+path with no events-specific plumbing.
+
+Its extraction is where the DynamoDB-Streams trap lives, and it is worth
+naming precisely because a repeat is invisible: `_target_resource` reads
+`ResourceArn`, and EventBridge's tag API spells it **`ResourceARN`** (capital
+ARN -- verified against botocore's own `TagResource`/`UntagResource`/
+`ListTagsForResource` input shapes, whose `required` lists say `ResourceARN`).
+Read the DynamoDB spelling here and every tag call resolves to `"*"`, which
+the OPERATOR's wildcard still allows -- so nothing breaks until someone draws
+an iam edge, and then `events:TagResource` on rule `nightly` denies with
+`resource '*'`, indistinguishable from a policy denial. Three key families
+carry a rule identifier and each op uses exactly one: `Name` (Put/Delete/
+Describe/Enable/DisableRule, and the event-BUS ops, where the resource is the
+bus), `Rule` (Put/RemoveTargets, ListTargetsByRule) and `ResourceARN` (the
+three tag ops). `_events_resource` reads all three, in that order -- they never
+co-occur -- falling back to `NamePrefix` for a bare `ListRules` and then to
+`"*"`, never None, so `tofu` is never denied via `unmappable-action`.
+
+`PutEvents` is the ONE op whose identifier is not a top-level member at all:
+real IAM authorizes it against the EVENT BUS, and the bus name rides INSIDE
+the entries list (`Entries[].EventBusName`, defaulting to `default`). A flat
+key scan finds nothing there and returns `"*"` -- and PutEvents is the one
+`events` action a WORKLOAD makes, so that miss would be the silent deny in the
+exact place it costs most. `_events_bus` reads it, with the same bounded gap
+`_ssm_resource` records for a batch `GetParameters`: a multi-bus PutEvents is
+authorized against the FIRST entry's bus.
 
 S3 BUCKET-CONFIG READS (S2, discovered running real tofu through the real
 gateway): the TF AWS provider's `aws_s3_bucket` refresh probes bucket-config
@@ -290,6 +335,8 @@ def classify(
         return _classify_rds(body)
     if service == "elasticloadbalancing":
         return _classify_elbv2(body)
+    if service == "events":
+        return _classify_events(lower_headers, body)
     return None
 
 
@@ -493,7 +540,7 @@ def _bare_log_group(value: str) -> str:
 def _rds_resource(params: dict[str, str]) -> str:
     """The bare DB-instance IDENTIFIER -- which for an `rds` canvas node IS
     its label (agent/hcl.py's `_rds` builder emits `identifier = <label>`), so
-    an `rds-db:connect` / `rds:DescribeDBInstances` edge drawn to that node
+    an `rds:DescribeDBInstances` edge drawn to that node
     gates through the ordinary `evaluate(statements, action, resource)` path
     with no rds-specific plumbing (the same identity rule s3's bucket, sqs's
     queue name and a log group's name already carry). The tag calls carry a
@@ -668,6 +715,75 @@ def _classify_elbv2(body: bytes) -> tuple[str, str] | None:
     return f"elasticloadbalancing:{action_name}", _elbv2_resource(params)
 
 
+# EventBridge's default event bus -- the one every rule lands on when a caller
+# names none, and what an entry-less `PutEvents` is authorized against. Kept in
+# lock-step with `gateway/models/eventsctl.py::DEFAULT_BUS`.
+EVENTS_DEFAULT_BUS = "default"
+
+# The rule/bus identifier members, MOST SPECIFIC FIRST. No two of these ever
+# co-occur on one request (verified against botocore's `events` input shapes),
+# so the order is documentation rather than tie-breaking:
+#   Rule        -- PutTargets / RemoveTargets / ListTargetsByRule
+#   Name        -- Put/Delete/Describe/Enable/DisableRule, and Create/Delete/
+#                  DescribeEventBus (where the resource IS the bus)
+#   ResourceARN -- TagResource / UntagResource / ListTagsForResource. CAPITAL
+#                  ARN: this is the spelling that makes the difference between
+#                  a real name and a silent `"*"` (module docstring).
+#   NamePrefix  -- the LIST ops' only identifier, the same last-resort
+#                  `_logs_resource` gives `logGroupNamePrefix`.
+_EVENTS_ID_MEMBERS = ("Rule", "Name", "ResourceARN", "NamePrefix")
+
+
+def _events_bare_name(value: str) -> str:
+    """The bare RULE or EVENT BUS name -- kept in lock-step with
+    `gateway/models/eventsctl.py::bare_name`.
+
+    `arn:aws:events:…:rule/nightly` -> `nightly`; a custom-bus rule ARN
+    (`…:rule/{bus}/{rule}`) and a bus ARN (`…:event-bus/{bus}`) reduce the same
+    way, because in all three the name is the last `/`-segment. A value that
+    isn't an ARN comes back UNCHANGED, which is safe rather than lucky:
+    EventBridge rule and bus names are `[\\.\\-_A-Za-z0-9]+` (no slash), so a
+    bare name has no `/`-segment to lose -- and `EventBusName` really is
+    documented as "the name OR ARN of the event bus", so both forms arrive."""
+    return value.rsplit("/", 1)[-1] if value.startswith("arn:") else value
+
+
+def _events_bus(payload: dict) -> str:
+    """`PutEvents`' resource: the EVENT BUS its first entry names.
+
+    Not a top-level member -- `Entries[].EventBusName` -- which is the whole
+    reason this has its own function instead of another `_EVENTS_ID_MEMBERS`
+    entry (module docstring). An entry that names no bus, or a request with no
+    usable entries at all, is the DEFAULT bus, matching EventBridge itself."""
+    entries = payload.get("Entries")
+    first = entries[0] if isinstance(entries, list) and entries and isinstance(entries[0], dict) else {}
+    name = first.get("EventBusName")
+    return _events_bare_name(name) if isinstance(name, str) and name else EVENTS_DEFAULT_BUS
+
+
+def _events_resource(op: str, payload: dict) -> str:
+    """The bare rule name (or bus name, for the bus/PutEvents ops), in the
+    never-None style every service since `_logs_resource` uses: a real value
+    when the request carries one, `"*"` otherwise."""
+    if op == "PutEvents":
+        return _events_bus(payload)
+    value = _first_str(payload, *_EVENTS_ID_MEMBERS)
+    return _events_bare_name(value) if value else "*"
+
+
+def _classify_events(lower_headers: dict[str, str], body: bytes) -> tuple[str, str] | None:
+    """EventBridge: ECR's JSON-target wire shape, `X-Amz-Target: AWSEvents.*`."""
+    target = lower_headers.get("x-amz-target")
+    if target is None or "." not in target:
+        return None
+    op = target.rsplit(".", 1)[1]
+    try:
+        payload = json.loads(body) if body else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return f"events:{op}", _events_resource(op, payload)
+
+
 def _classify_ecs(lower_headers: dict[str, str], body: bytes) -> tuple[str, str] | None:
     target = lower_headers.get("x-amz-target")
     if target is None or "." not in target:
@@ -699,6 +815,19 @@ _LAMBDA_ROUTES: tuple[tuple[str, re.Pattern[str], str], ...] = (
     ("GET", re.compile(r"^/2017-03-31/tags/(?P<arn>.+)$"), "ListTags"),
     ("POST", re.compile(r"^/2017-03-31/tags/(?P<arn>.+)$"), "TagResource"),
     ("DELETE", re.compile(r"^/2017-03-31/tags/(?P<arn>.+)$"), "UntagResource"),
+    # Event source mappings -- `aws_lambda_event_source_mapping`, the SQS ->
+    # Lambda trigger. Method+path taken from botocore's OWN lambda model
+    # (printed, not remembered). The `{uuid}` group is named `mapping` rather
+    # than `name` on purpose: `name` would make the loop below hand the UUID to
+    # `lambdactl` as a FUNCTION name, and every one of these would 404 against
+    # a function that does not exist. Ordered before nothing and after
+    # everything: `/2015-03-31/event-source-mappings` cannot collide with
+    # `/2015-03-31/functions/...`, the segment after the version differs.
+    ("POST", re.compile(r"^/2015-03-31/event-source-mappings$"), "CreateEventSourceMapping"),
+    ("GET", re.compile(r"^/2015-03-31/event-source-mappings$"), "ListEventSourceMappings"),
+    ("GET", re.compile(r"^/2015-03-31/event-source-mappings/(?P<mapping>[^/]+)$"), "GetEventSourceMapping"),
+    ("PUT", re.compile(r"^/2015-03-31/event-source-mappings/(?P<mapping>[^/]+)$"), "UpdateEventSourceMapping"),
+    ("DELETE", re.compile(r"^/2015-03-31/event-source-mappings/(?P<mapping>[^/]+)$"), "DeleteEventSourceMapping"),
 )
 
 
@@ -714,14 +843,30 @@ def _classify_lambda(method: str, path: str, body: bytes) -> tuple[str, str] | N
             return f"lambda:{op}", unquote(groups["name"])
         if "arn" in groups:
             return f"lambda:{op}", unquote(groups["arn"]).rsplit(":", 1)[-1]
-        # CreateFunction: the path carries no name -- read it from the body,
-        # same technique _classify_ecr uses for repositoryName.
+        if "mapping" in groups:
+            # An event source mapping's identity is its UUID, and it is NOT a
+            # function name: the mapping outlives no function and a policy
+            # written against a function name must not accidentally match one.
+            # A workload principal therefore denies these by ordinary
+            # default-deny (no iam edge grants a mapping UUID), which is right
+            # -- creating triggers is an operator action.
+            return f"lambda:{op}", unquote(groups["mapping"])
+        # CreateFunction / CreateEventSourceMapping: the path carries no name
+        # -- read it from the body, same technique _classify_ecr uses for
+        # repositoryName. `FunctionName` is documented as the name, the partial
+        # ARN or the full ARN, and terraform sends the full ARN for a mapping
+        # (`aws_lambda_function.x.arn`), so it reduces to the bare name here --
+        # otherwise the same function is one resource under CreateFunction and
+        # a different one under CreateEventSourceMapping, and no policy could
+        # be written to cover both.
         try:
             payload = json.loads(body) if body else {}
         except (json.JSONDecodeError, UnicodeDecodeError):
             payload = {}
         name = payload.get("FunctionName")
-        return f"lambda:{op}", name if isinstance(name, str) and name else "*"
+        if not isinstance(name, str) or not name:
+            return f"lambda:{op}", "*"
+        return f"lambda:{op}", name.rsplit(":", 1)[-1] if name.startswith("arn:") else name
     return None
 
 

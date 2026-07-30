@@ -28,6 +28,10 @@ from odin.gateway.stores import SynthStores
 from odin.runtime.colima import CONTAINER_HOST
 
 from .conftest import split_url
+# The ec2-compute harness, reused rather than re-faked: `_instance_address`
+# reads a record `ec2compute` writes, so the only honest way to test it is to
+# let `ec2compute` write one (see `test_an_ec2_target_resolves_to_the_vms_real_address`).
+from .test_ec2compute import FakeInstanceVm, _run_instance, _subnet, _wait_for_state
 
 _SESSION = botocore.session.get_session()
 ENV = "default"
@@ -437,11 +441,30 @@ async def test_registering_the_same_target_twice_is_idempotent(stores, sink, elb
     assert stores.elbv2ctl.get(ENV, f"targets:{TG}") == [{"id": CONTAINER_HOST, "port": 32768}]
 
 
-async def test_an_ec2_target_resolves_to_the_vms_real_address(stores, sink, elbv2, proxy):
+async def test_an_ec2_target_resolves_to_the_vms_real_address(stores, sink, elbv2, ec2, proxy):
+    """THE INSTANCE RECORD IS BUILT BY ec2compute ITSELF, through a real
+    RunInstances and a real boot, and that is the whole point of the test.
+
+    Its predecessor wrote the record by hand as
+    `{"instance_id": ..., "private_ip_address": "192.168.5.7"}` -- a key
+    `ec2compute` has never written; its record carries `private_ip`/`public_ip`.
+    So `_instance_address` returned None for every REAL instance and the proxy
+    was handed the bare `i-...` id as an upstream, which nginx can never dial,
+    while this test passed for as long as it existed. Rule 1, exactly: a test
+    that fabricates the upstream signal proves the parser, not the integration.
+    Nothing on the canvas could produce an `i-...` target until v0.8.15 added
+    the `aws_lb_target_group_attachment`, which is why it was never caught in
+    the field either.
+    """
     _lb, tg, _listener = await _trio(stores, sink, elbv2, proxy)
-    stores.ec2compute.set(ENV, "instance:i-0abc", {"instance_id": "i-0abc", "private_ip_address": "192.168.5.7"})
-    await elbv2ctl.register_target(stores, ENV, tg["TargetGroupArn"], "i-0abc", 8080, proxy=proxy)
-    assert proxy.last_listeners[0].targets == ("192.168.5.7:8080",)
+    subnet_id = await _subnet(stores, sink, ec2)
+    vm = FakeInstanceVm(ip="192.168.64.42")
+    run = await _run_instance(stores, sink, ec2, vm, ImageId="ami-1", InstanceType="t3.micro", SubnetId=subnet_id)
+    instance_id = run["Instances"][0]["InstanceId"]
+    await _wait_for_state(stores, sink, ec2, instance_id, "running", vm)
+
+    await elbv2ctl.register_target(stores, ENV, tg["TargetGroupArn"], instance_id, 8080, proxy=proxy)
+    assert proxy.last_listeners[0].targets == ("192.168.64.42:8080",)
 
 
 async def test_describe_target_health_probes_for_real_and_never_invents_healthy(stores, sink, elbv2, proxy):

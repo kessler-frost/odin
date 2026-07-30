@@ -904,7 +904,7 @@ def test_a_ref_to_a_kind_that_cannot_produce_is_refused_before_tofu_runs():
     assert "worker (lambda)" in note and "QUEUE_URL" in note
     assert "'jobs' (kind: sqs)" in note
     assert "no sqs node publishes an endpoint a reference can resolve" in note
-    assert "Only rds, elasticache, alb and ec2 nodes do" in note
+    assert "Only rds, elasticache, alb, ec2 and ecr nodes do" in note
     # It must not deny the facts the user can see in `odin world`...
     assert "OBSERVED state, not wiring values" in note
     assert "publishes no facts" not in note
@@ -1112,7 +1112,7 @@ def test_ecs_container_definitions_never_carry_a_command():
     stack = Stack(resources=(
         ResourceDesired(id="app", kind="ecs", fields=_fields(image="nginx:alpine", command="rm -rf /")),
     ))
-    definitions = _ecs_container_definitions(stack.resources[0])
+    definitions = _ecs_container_definitions(stack.resources[0], {})
     assert [sorted(d) for d in definitions] == [["essential", "image", "name", "portMappings"]]
     assert "command" not in generate_tf(stack).files["main.tf"]
 
@@ -1651,11 +1651,12 @@ def test_an_ecs_service_with_no_alb_edge_gets_no_load_balancer_block():
     assert "aws_lb_target_group" not in main_tf
 
 
-def test_an_alb_target_edge_to_an_ec2_node_lands_in_unsupported_exactly_once():
-    # An ec2 target would need an `aws_lb_target_group_attachment` -- recorded
-    # as an unbuilt limit instead of silently doing nothing with the edge the
-    # user drew. Pass 1.5 tries BOTH edge directions, so the reason must not be
-    # recorded twice for one edge.
+def test_an_alb_target_edge_to_an_ec2_node_attaches_the_instance_exactly_once():
+    # v0.8.15: an ec2 target is REGISTERED, by an
+    # `aws_lb_target_group_attachment` naming the instance id -- which is the
+    # form `elbv2ctl._target_host` resolves through `stores.ec2compute`. It used
+    # to land in `unsupported` instead. Pass 1.5 tries BOTH edge directions, so
+    # the attachment must not be emitted twice for one edge.
     stack = Stack(
         resources=(
             ResourceDesired(id="net", kind="vpc"),
@@ -1666,10 +1667,16 @@ def test_an_alb_target_edge_to_an_ec2_node_lands_in_unsupported_exactly_once():
         edges=(Edge(src="front", dst="server", kind="network"),),
     )
     proj = generate_tf(stack)
-    assert proj.unsupported == [
-        "front (alb): target edge to server (ec2) — only ecs nodes can be load-balancer targets in Simulate v1"
-    ]
-    assert "load_balancer {" not in proj.files["main.tf"]
+    assert proj.unsupported == []
+    main_tf = proj.files["main.tf"]
+    assert main_tf.count('resource "aws_lb_target_group_attachment"') == 1
+    attrs = resource_attrs(proj.files)[("aws_lb_target_group_attachment", "front_server_attach")]
+    assert attrs["target_group_arn"] == "${aws_lb_target_group.front_tg.arn}"
+    assert attrs["target_id"] == "${aws_instance.server.id}"
+    assert str(attrs["port"]) == "80"
+    # An ECS service registers its own tasks and gets a `load_balancer` block;
+    # an instance gets an attachment and no such block.
+    assert "load_balancer {" not in main_tf
 
 
 def test_tofu_fmt_accepts_alb_output(tmp_path):

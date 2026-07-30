@@ -1,5 +1,5 @@
-"""`tests/containers.py::own_containers` -- the scoped teardown filter every
-integration file now uses instead of `await runtime.list_odin()`.
+"""`tests/containers.py::own_containers` / `own_volumes` -- the scoped teardown
+filters every integration file now uses instead of `await runtime.list_odin()`.
 
 Unit-tested (not integration) precisely because the thing it must never do is
 too expensive to discover for real: a filter that is too WIDE stops a
@@ -10,7 +10,7 @@ encodes are odin's own (`aws/backings.py`, `aws/rds.py`, `aws/cache.py`,
 """
 from __future__ import annotations
 
-from tests.containers import own_containers
+from tests.containers import own_containers, own_volumes
 
 
 class FakeRuntime:
@@ -68,3 +68,46 @@ async def test_a_single_letter_env_does_not_match_a_longer_one_starting_with_it(
 
 async def test_an_empty_machine_is_empty():
     assert await own_containers(FakeRuntime(), "bak") == []
+
+
+# --- own_volumes: the same filter, on the other listing -----------------------
+#
+# `RuntimeDriver.stop` is `docker rm -f -v`, which drops a container's ANONYMOUS
+# volumes and deliberately leaves NAMED ones -- that is exactly what makes an rds
+# repair non-destructive (`aws/rds.py`). So "every container this test made is
+# gone" stopped implying "nothing this test made is on the disk", and a teardown
+# that only listed containers would leave a Postgres data volume behind on every
+# run. Same scoping rules, same blast radius if they are wrong.
+
+
+class FakeVolumeRuntime(FakeRuntime):
+    def __init__(self, *names: str) -> None:
+        super().__init__()
+        self._volumes = list(names)
+
+    async def volume_names(self) -> list[str]:
+        return list(self._volumes)
+
+
+_VOLUMES = FakeVolumeRuntime(
+    "odin-rds-bak-appdb-data",    # the caller's own
+    "odin-rds-bak2-appdb-data",   # a longer env sharing the prefix
+    "odin-rds-prod-appdb-data",   # somebody else's env
+)
+
+
+async def test_own_volumes_finds_this_envs_data_volume():
+    assert await own_volumes(_VOLUMES, "bak") == ["odin-rds-bak-appdb-data"]
+
+
+async def test_own_volumes_leaves_another_envs_data_alone():
+    """A volume is a DATABASE. Sweeping one that belongs to another env (or to
+    the user's own running stack) destroys data that nothing can restore --
+    there are no snapshots. The `-` anchor matters more here than anywhere."""
+    mine = await own_volumes(_VOLUMES, "bak")
+    assert "odin-rds-bak2-appdb-data" not in mine
+    assert "odin-rds-prod-appdb-data" not in mine
+
+
+async def test_own_volumes_on_a_machine_with_none():
+    assert await own_volumes(FakeVolumeRuntime(), "bak") == []

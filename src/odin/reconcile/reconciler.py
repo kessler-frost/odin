@@ -56,6 +56,7 @@ from odin.fabric.localhost import LocalhostFabric
 from odin.gateway.policy import compile_policies, compile_policies_from_iam
 from odin.gateway.stores import SynthStores
 from odin.reconcile.actions import NoOp, ProvisionResource, StopContainer
+from odin.reconcile.dispatch import Dispatcher
 from odin.reconcile.drift import DriftSweeper
 from odin.reconcile.plan import plan
 from odin.reconcile.tf_status import TF_OWNED_KINDS, project as project_tf_owned
@@ -199,6 +200,7 @@ class Reconciler:
         poll_interval: float = 2.0,
         stores: SynthStores | None = None,
         drift: DriftSweeper | None = None,
+        dispatcher: Dispatcher | None = None,
         stall_after: float | None = None,
     ) -> None:
         self._store = store
@@ -221,7 +223,22 @@ class Reconciler:
         # real `limactl list`/`docker ps` leaves it out), and create_app's
         # real, runtime-backed wiring always passes one.
         self._drift = drift
+        # The event dispatcher (reconcile/dispatch.py) -- the same optional-seam
+        # shape as `drift`. None means "no triggers fire", which is what every
+        # unit test that hand-seeds records and does not want a real invoke
+        # leaves it as; create_app's real wiring always passes one.
+        #
+        # Its cadence is 1 tick, NOT the drift sweep's 10, and the difference is
+        # the point: a sweep being late is a late report, a dispatcher being
+        # late is a broken trigger.
+        self._dispatcher = dispatcher
         self._task: asyncio.Task | None = None
+        # The task `stop()` last waited on, kept AFTER `_task` is cleared --
+        # the evidence `loop_finished()` reads. See its docstring: without it,
+        # the only thing left to ask after a stop is "does anything still point
+        # at the task", and an asyncio.Task that nothing points at goes on
+        # running exactly as it did before.
+        self._finished_task: asyncio.Task | None = None
         self._stop = False
         self._stall_after = poll_interval + STALL_GRACE if stall_after is None else stall_after
         # The liveness bookkeeping `health()` reads. Written ONLY by `_run`
@@ -274,7 +291,32 @@ class Reconciler:
         self._stop = True
         if self._task is not None:
             await asyncio.gather(self._task, return_exceptions=True)
+            self._finished_task = self._task
             self._task = None
+
+    def loop_finished(self) -> bool:
+        """Has this env's loop REALLY ended? Read off the task object itself.
+
+        `/envs/rm` cannot delete an env's state while something is still
+        converging it -- the loop would re-create `world.json` (and, through
+        `plan()`, real containers) under the directory being removed. So the
+        removal has to verify the stop rather than assume it, and the only
+        honest witness is the task's own `done()`.
+
+        Which is why `stop()` keeps `_finished_task`. `self._task = None` is
+        NOT evidence of anything: an `asyncio.Task` nobody references keeps
+        running (that is the whole reason `create_task` results are held in a
+        strong ref elsewhere in odin), so a check that read `_task is None`
+        would pass for a loop that never stopped -- exactly the shape of guard
+        the honesty rules exist to stop.
+
+        `True` when no task was ever created, because then there is genuinely
+        nothing converging this env. `reconciler_for()` awaits `start()` before
+        handing one out, so that state does not arise from the server's own
+        wiring; a hand-built Reconciler that was never started is the case it
+        covers, and it answers the question asked, not a proxy for it."""
+        task = self._task if self._task is not None else self._finished_task
+        return task is None or task.done()
 
     async def _run(self) -> None:
         """The loop, plus the bookkeeping that makes its own death visible.
@@ -596,10 +638,26 @@ class Reconciler:
         `tests/reconcile/test_reconciler.py` tests named in that entry pin both
         halves."""
         drifted = await self._drift_verdicts(act)
+        # The dispatcher runs BEFORE the projection for the drift sweep's own
+        # reason: a trigger that could not run this tick should surface on THIS
+        # tick's projection rather than the next one. It is suspended during an
+        # apply (`act=False`) for a sharper reason than the sweep's, though --
+        # `lambdactl`'s deploy path removes the old RIE container before
+        # starting the new one, so invoking mid-`UpdateFunctionCode` would
+        # report a function unreachable that is merely being redeployed.
+        dispatched = await self._dispatch_verdicts(act)
         projected = await project_tf_owned(self._stores, self._env)
         for label, (kind, phase, facts, verdict) in projected.items():
             phase, verdict = ("crashed", drifted[label]) if label in drifted else (phase, verdict)
+            # A dispatch verdict never changes the PHASE, deliberately -- the
+            # same call `_invocation_verdict` makes. The function is deployed
+            # and serving; what failed is a trigger that tried to reach it, and
+            # calling that `crashed` would make an unrelated Apply look failed.
+            # A drift verdict outranks it: "the container is gone" explains the
+            # trigger failure rather than competing with it.
+            verdict = dispatched.get(label, verdict) if label not in drifted else verdict
             await self._emit(label, kind, phase, facts=facts, verdict=verdict)
+        await self._report_unprojected(dispatched, projected)
         if not act:
             return
         world = self._store.current_world(self._env)
@@ -607,10 +665,63 @@ class Reconciler:
             if observed.kind in TF_OWNED_KINDS and observed.id not in projected:
                 await self._prune(observed.id)
 
+    async def _report_unprojected(self, dispatched: dict[str, str], projected: dict) -> None:
+        """Say the verdicts the loop above could not attach to anything.
+
+        FOUND BY THE e2e, and it is worth writing down why no unit test caught
+        it. A rule can target a Lambda that does not exist -- real EventBridge
+        does not validate target existence, and neither does `PutTargets`,
+        because refusing would break a legitimate terraform ordering. A function
+        with no record is not in `projected`, so the loop above simply never
+        visits its label and the verdict the dispatcher had just computed was
+        DROPPED. `tests/reconcile/test_dispatch.py` asserted on the
+        dispatcher's own return value and passed the whole time; the integration
+        test waited 150s for a report that was never coming.
+
+        That is honesty rule 1 in reverse -- a guard whose output nobody
+        receives -- and the fix is the SHAPE, not the instance: anything the
+        dispatcher computed and the projection cannot carry goes out as a
+        `type:"log"` error line, which `ConnectionManager.broadcast` persists to
+        `events.jsonl`. A future source that invents a new kind of label is
+        covered by construction rather than by remembering this case.
+
+        NOT deduplicated, deliberately: unlike `_emit`'s unchanged-status skip,
+        each of these is a distinct delivery that was attempted and failed, and
+        collapsing them would report one failure for a trigger that has now
+        missed sixty."""
+        if self._ws is None:
+            return
+        for label, verdict in dispatched.items():
+            if label not in projected:
+                await self._ws.broadcast(
+                    {"type": "log", "env": self._env, "text": verdict, "source": label, "level": "error"},
+                )
+
     async def _drift_verdicts(self, sweep: bool = True) -> dict[str, str]:
         if self._drift is None:
             return {}
         return await self._drift.verdicts(self._stores, self._env, sweep)
+
+    async def _dispatch_verdicts(self, dispatch: bool = True) -> dict[str, str]:
+        """`label -> verdict` for every trigger that could not run, having fired
+        the ones that could.
+
+        The SQS port is passed as a CALLABLE, not a number, and that is the fix
+        for a real regression this introduced: `backing_ports()` shells out to
+        `docker` once per backing on a cache miss, so resolving it eagerly here
+        made every tick pay for it at a 1-tick cadence even in an env with no
+        event source mapping at all. Measured, that load was enough for the
+        goaws backing to restart mid-test and the gateway to answer
+        `ServiceUnavailable`. The dispatcher asks the cheap store question
+        first and only calls this when it has something to drain."""
+        if self._dispatcher is None:
+            return {}
+
+        async def sqs_port() -> int | None:
+            ports = await self._aws.backing_ports() if self._aws is not None else {}
+            return ports.get("sqs")
+
+        return await self._dispatcher.verdicts(self._stores, self._env, sqs_port, dispatch)
 
     async def ensure_backings(self, stack: Stack) -> None:
         """Boot (but don't create any resource on) the backing containers

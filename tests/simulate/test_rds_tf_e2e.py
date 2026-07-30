@@ -18,7 +18,16 @@ What this proves that no unit test can:
      container -> the reality sweep reports `crashed` with a verdict naming the
      container and its real exit code -> the SAME Apply button brings a working
      database back (`rdsctl.converge_db_instances`).
-  5. Empty canvas + Apply destroys it for real -- no leftover container.
+  4b. ...and that recovery is NON-DESTRUCTIVE (v0.8.14). Real rows are written
+     over the published DATABASE_URL before the kill and read back after the
+     recovery apply. Until each instance got a named data volume this was the
+     single worst thing odin did quietly: the repair replaced the container, the
+     database came back EMPTY, and the apply reported a green `applied` with a
+     one-line warning. The warning is now a footnote, and this is what pays for
+     it.
+  5. Empty canvas + Apply destroys it for real -- no leftover container, AND no
+     leftover volume. A volume that outlives `destroy` is a data leak and a disk
+     leak both, so the fix for (4b) is only half a fix without it.
 
 Shape/hygiene modeled on tests/simulate/test_logs_tf_e2e.py, including its
 LOAD-BEARING store-root discovery (Colima only mounts `$HOME`, so the SpecStore
@@ -43,7 +52,7 @@ from fastapi.testclient import TestClient
 
 from odin.agent import hcl
 from odin.agent import translate as translate_mod
-from odin.aws.rds import container_name
+from odin.aws.rds import container_name, volume_name
 from odin.gateway.keys import OPERATOR_NODE_ID
 from odin.server import create_app
 from odin.simulate import workspace as workspace_mod
@@ -129,8 +138,8 @@ def _observed(client, timeout: float, want_phase: str) -> dict | None:
     return last
 
 
-async def _select_one(facts: dict) -> int:
-    """Connect with the credentials odin PUBLISHED and run a real query.
+async def _query(facts: dict, sql: str):
+    """Connect with the credentials odin PUBLISHED and run a real statement.
 
     The host in `DATABASE_URL` is `host.docker.internal` on purpose (that's what
     a container consumer needs, and the port is the same either way), so this
@@ -142,20 +151,45 @@ async def _select_one(facts: dict) -> int:
         database=DB_NAME, timeout=10,
     )
     try:
-        return await conn.fetchval("SELECT 1")
+        return await conn.fetch(sql)
     finally:
         await conn.close()
+
+
+async def _select_one(facts: dict) -> int:
+    return (await _query(facts, "SELECT 1 AS one"))[0]["one"]
+
+
+async def _write_rows(facts: dict) -> list[int]:
+    """Real rows, through the fact odin published -- the thing a recovery must
+    not destroy."""
+    await _query(facts, "CREATE TABLE IF NOT EXISTS orders (id int)")
+    await _query(facts, "INSERT INTO orders VALUES (42), (43)")
+    return await _read_rows(facts)
+
+
+async def _read_rows(facts: dict) -> list[int]:
+    return sorted(r["id"] for r in await _query(facts, "SELECT id FROM orders"))
 
 
 @pytest.fixture
 def db_cleanup():
     """Container hygiene ABSOLUTE: force-removed by EXACT name on teardown
     regardless of outcome -- the guarantee `tofu destroy` alone can't give if
-    the test fails before it runs."""
+    the test fails before it runs.
+
+    The VOLUME is force-removed the same way, and it needs its own line: `rm -f
+    -v` drops a container's anonymous volumes and deliberately leaves NAMED ones
+    (that is what makes odin's rds repair non-destructive), so a test that only
+    removed the container would leak a Postgres data volume on every failed
+    run."""
     names: list[str] = []
-    yield names
+    volumes: list[str] = []
+    yield names, volumes
     for name in names:
         _docker("rm", "-f", "-v", name)
+    for volume in volumes:
+        _docker("volume", "rm", "-f", volume)
 
 
 @pytest.fixture
@@ -183,7 +217,10 @@ async def test_an_rds_node_is_a_real_tf_managed_postgres_that_survives_being_kil
     assert shutil.which("tofu"), "OpenTofu must be on PATH for this integration test"
     assert shutil.which("docker"), "docker must be on PATH for this integration test"
     victim = container_name(ENV, NODE)
-    db_cleanup.append(victim)
+    data_volume = volume_name(ENV, NODE)
+    cleanup_names, cleanup_volumes = db_cleanup
+    cleanup_names.append(victim)
+    cleanup_volumes.append(data_volume)
     # Sweep every tick (~1s) so the drift half isn't 10 ticks of waiting; the
     # default cadence itself is covered by tests/reconcile/test_drift.py.
     monkeypatch.setenv("ODIN_DRIFT_SWEEP_TICKS", "1")
@@ -232,6 +269,16 @@ async def test_an_rds_node_is_a_real_tf_managed_postgres_that_survives_being_kil
         assert await _select_one(facts) == 1
         print(f"\n[W2.7] SELECT 1 over the published DATABASE_URL on :{port} (db {DB_NAME!r})")
 
+        # (3b) REAL ROWS, written through that same published fact. Everything
+        # below is about whether odin's own repair gives them back.
+        before = await _write_rows(facts)
+        assert before == [42, 43]
+        volumes = _docker("volume", "ls", "--format", "{{.Name}}").stdout.split()
+        assert data_volume in volumes, (
+            f"the database's data must be on a NAMED volume ({data_volume}), or the repair "
+            f"below cannot be non-destructive. Volumes present: {volumes}"
+        )
+
         # (4) Scenario 2, preserved: kill the container out of band.
         assert _docker("kill", victim).returncode == 0
         assert not _running(victim), "the premise: the database is really down"
@@ -257,12 +304,31 @@ async def test_an_rds_node_is_a_real_tf_managed_postgres_that_survives_being_kil
         assert reapply.status_code == 200, reapply.text
         assert reapply.json()["tf"] == {"status": "ok", "exit_code": 0}, reapply.json()
 
+        # ...and the apply DISCLOSES the repair, with what it cost -- read from
+        # the real volume listing, not asserted (`server.py::_RECOVERY_COST`).
+        recovery_body = reapply.json()
+        (disclosed,) = recovery_body["recovered_resources"]
+        assert (disclosed["kind"], disclosed["node"]) == ("rds", NODE), disclosed
+        assert disclosed["data_kept"] is True, disclosed
+        assert "its data survived" in recovery_body["note"], recovery_body["note"]
+
         recovered = _observed(client, BOOT_WINDOW, "healthy")
         assert recovered is not None and recovered["phase"] == "healthy", f"never recovered: {recovered}"
         assert recovered["verdict"] is None
         assert _running(victim), "recovery means a really-running container, not a green badge"
         assert await _select_one(recovered["facts"]) == 1, "the recovered database must really answer"
-        print("[W2.7] killed -> crashed with a real verdict -> re-Apply -> SELECT 1 again")
+
+        # (4b) THE PROOF the disclosure above is now allowed to be a footnote:
+        # the rows written before the kill are still there. The container is a
+        # NEW one -- `create_db` removed the old one before running it -- so
+        # this is the volume, not a survivor.
+        after = await _read_rows(recovered["facts"])
+        assert after == before, (
+            f"odin's own repair emptied the database: {before} before the kill, {after} after "
+            f"the recovery apply. The named data volume ({data_volume}) did not survive the "
+            f"container replacement."
+        )
+        print(f"[W2.7] killed -> crashed -> re-Apply -> rows {before} -> {after} (non-destructive)")
 
         # Still zero drift after the recovery apply.
         plan = _tofu(["plan", "-detailed-exitcode"], workspace, _tf_env(gateway_port, *operator))
@@ -278,3 +344,9 @@ async def test_an_rds_node_is_a_real_tf_managed_postgres_that_survives_being_kil
     assert ps_after.stdout.strip() == "", f"the Postgres container survived teardown: {ps_after.stdout}"
     leftover = _docker("ps", "-aq", "--filter", "label=odin=1", "--filter", f"name={ENV}")
     assert leftover.stdout.strip() == ""
+    # (5, the other half) The DATA VOLUME goes with the instance. Surviving a
+    # container replacement is the point; surviving `destroy` would be a data
+    # leak and, on a machine with little disk headroom, a growing one -- every
+    # Postgres volume is tens of MiB and nothing else would ever reclaim it.
+    vols_after = _docker("volume", "ls", "--filter", f"name={ENV}", "--format", "{{.Name}}")
+    assert vols_after.stdout.strip() == "", f"a data volume survived teardown: {vols_after.stdout}"

@@ -362,4 +362,10 @@ Multiple named envs reconciled independently (`/apply?env=`, `/world?env=`, `/de
 - **Grid alignment:** 20px grid; node sections are multiples of 20px (header=40, single-line meta=20, two-line=40, button row=40). Snap to 20px; node positions/sizes multiples of 20.
 - **High-contrast dark theme:** near-black backgrounds (#050508, #0a0a10), bright borders, neon per-type accents. Solid borders. Catalog nodes render via the generic `ServiceNode`; bespoke nodes (s3/dynamodb) have their own components in `ui/src/components/nodes/`.
 - **Catalog:** `ui/src/lib/catalog.ts` — hand-curated AWS-shaped nodes (sqs/sns/rds live today; the rest are future-coverage placeholders per NORTHSTAR.md directive 5).
-- **Z-index:** all catalog/bespoke nodes at 2; `elevateNodesOnSelect={false}`. Reference edges auto-drawn from `${{node.VAR}}` fields.
+- **Z-index:** all catalog/bespoke nodes at 2; `elevateNodesOnSelect={false}`.
+- **Edges are drawn by the user, never by odin.** `Canvas.tsx` produces edges in
+  exactly two places: `edgesFromCanvas` (replaying what was saved) and `onConnect`
+  (a drag). This line used to claim "reference edges auto-drawn from `${{node.VAR}}`
+  fields" — that describes a June design that did not survive, and nothing has
+  ever done it. Two separate agents built reasoning on the claim before checking
+  it, which is what makes a false line here expensive rather than merely untidy.

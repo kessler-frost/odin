@@ -445,6 +445,42 @@ async def test_logs_node_whose_group_exists_but_is_empty_says_so(tmp_path):
     assert "no events yet" in result.message
 
 
+async def test_a_sink_node_reads_the_group_it_was_renamed_to(tmp_path):
+    """v0.8.15: a Log Group drawn as a workload's sink is CREATED under the
+    name that workload's substrate really ships to (`/aws/lambda/myfn`), not
+    under the node's label -- `agent/hcl.py::_LOG_DESTINATIONS`.
+
+    THE RENAME WOULD STRAND THE NODE without this: `odin logs --node
+    /odin/logs` read the group NAMED `/odin/logs`, which after the rename does
+    not exist, so the drawn node would answer "no log group" while collecting
+    every line under another name. Resolution goes through the `odin:node` tag
+    odin's own generated HCL stamps, exactly like ec2/lambda/ecs already do.
+    """
+    store = _store(tmp_path, (ResourceDesired(id="/odin/logs", kind="logs"),))
+    stores = SynthStores(tmp_path)
+    logsctl.ingest(stores, ENV, "/aws/lambda/myfn", "odin-lambda-default-myfn", ["hello"])
+    stores.tags.set(ENV, f"logs:{logsctl.group_arn('/aws/lambda/myfn')}", {"odin:node": "/odin/logs"})
+
+    result = await fetch_logs(store, stores, FakeRuntime(), ENV, "/odin/logs")
+
+    assert result.found and result.running is True
+    assert result.sources == ["odin-lambda-default-myfn"]
+    assert result.lines.endswith(" hello")
+
+
+async def test_an_untagged_group_still_reads_by_label(tmp_path):
+    """The fallback that keeps every pre-v0.8.15 env working: a group the
+    substrate auto-created, or one applied by an older build, carries no
+    `odin:node` tag and is still found by its name."""
+    store = _store(tmp_path, (ResourceDesired(id="/odin/app", kind="logs"),))
+    stores = SynthStores(tmp_path)
+    logsctl.ingest(stores, ENV, "/odin/app", "stream-a", ["first"])
+
+    result = await fetch_logs(store, stores, FakeRuntime(), ENV, "/odin/app")
+
+    assert result.sources == ["stream-a"]
+
+
 # --- ?group=: any group, including the substrate-created ones ---------------
 
 

@@ -7,6 +7,7 @@ export type SgNodeData = {
   groupId: string;
   vpcId: string;
   ingressRules: string;
+  egressRules: string; // empty = odin emits AWS's own allow-all egress
   status: string;
   vpc?: string;    // containment-stamped: the VPC whose rect holds this node's center
   subnet?: string; // containment-stamped: the deepest subnet holding this node's center

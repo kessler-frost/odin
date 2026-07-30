@@ -118,6 +118,19 @@ class JsonStore:
             self._persist_locked(env)
             return new_value
 
+    def forget_env(self, env: str) -> bool:
+        """Drop this env's cached contents (and its lock) without writing.
+        Returns whether anything was cached.
+
+        `/envs/rm` deletes `.odin/<env>/gateway/<name>.json` outright, and this
+        is what stops the deletion being invisible: `_data` caches the parsed
+        dict in `_loaded` FOREVER (there is no invalidation anywhere else in
+        this class), so a later env of the same name would be served the removed
+        env's records out of memory and, on its first `set`, persist them back
+        to a file that had been deleted."""
+        self._locks.pop(env, None)
+        return self._loaded.pop(env, None) is not None
+
     def _lock_for(self, env: str) -> threading.Lock:
         with self._locks_guard:
             return self._locks.setdefault(env, threading.Lock())
@@ -279,6 +292,35 @@ class SynthStores:
       RemoveTags/DescribeTags all take `ResourceArns`, never a typed id). The
       REAL substrate this state describes is an nginx container per load
       balancer (`compute/proxy.py`), never anything in this file.
+    - `eventsctl`: the EventBridge model's whole state
+      (`gateway/models/eventsctl.py`) -- flat keys `"rule:{bus}:{name}"` /
+      `"targets:{bus}:{rule}"` (a LIST of the target dicts terraform sent,
+      stored verbatim) / `"bus:{name}"`, persisted at
+      `.odin/{env}/gateway/eventsctl.json`. Rule and event-bus tags live in the
+      shared `tags` store above, keyed `"events:{arn}"` (EventBridge's tag API
+      is ARN-only: Tag/Untag/ListTagsForResource all take `ResourceARN`, never
+      a typed id). The DEFAULT event bus has NO `bus:` record on purpose -- it
+      always exists, so storing one would only create a way for it to be
+      missing (`eventsctl._bus`). A rule's targets are DELIVERED by
+      `reconcile/dispatch.py`, whose own bookkeeping lives in `dispatch` below
+      rather than in here: this store is EventBridge's control plane, and
+      "when did this rule last fire" is not a fact EventBridge's API has.
+    - `dispatch`: the event dispatcher's own bookkeeping
+      (`reconcile/dispatch.py`) -- flat keys `"fired:{bus}:{rule}"` (a
+      scheduled rule's clock anchor) and `"pending:{id}"` (an S3 object write
+      that matched a bucket notification and is waiting for the next pass),
+      persisted at `.odin/{env}/gateway/dispatch.json`. Deliberately NOT folded
+      into `eventsctl`/`s3notify`: those two are CONTROL planes that tofu reads
+      back, and mixing a mutable per-tick cursor into a record terraform diffs
+      is how a refresh starts reporting drift on odin's own bookkeeping.
+    - `s3notify`: the S3 bucket-notification configuration
+      (`gateway/models/s3notify.py`) -- flat keys `"notify:{bucket}"`,
+      persisted at `.odin/{env}/gateway/s3notify.json`. This is odin's OWN
+      state rather than a forward, and the reason is measured: RustFS rejects
+      every `PutBucketNotificationConfiguration` ARN form with
+      `InvalidArgument` and stores the configuration anyway, so forwarding gave
+      a failed `apply`, a clean `plan` and a trigger that never fired -- three
+      answers that cannot all be true (docs/limits.md).
     """
 
     def __init__(self, root: Path) -> None:
@@ -299,3 +341,24 @@ class SynthStores:
         self.cachectl = JsonStore(root, "cachectl")
         self.rdsctl = JsonStore(root, "rdsctl")
         self.elbv2ctl = JsonStore(root, "elbv2ctl")
+        self.eventsctl = JsonStore(root, "eventsctl")
+        self.dispatch = JsonStore(root, "dispatch")
+        self.s3notify = JsonStore(root, "s3notify")
+
+    def forget_env(self, env: str) -> list[str]:
+        """Drop every store's cached copy of `env`. Returns the store names that
+        held one.
+
+        DERIVED from the attributes, never a hand-written list: this class has
+        grown from four stores to seventeen, one service at a time, and a
+        removal that named them individually would silently miss the
+        eighteenth. `vars(self)` also skips `root`, which is a Path, not a
+        store.
+
+        That is not hypothetical. This method and `eventsctl` arrived in the
+        same merge, from two agents that never saw each other's work, and the
+        derived form covered the new store with no edit at all."""
+        return sorted(
+            name for name, store in vars(self).items()
+            if isinstance(store, JsonStore) and store.forget_env(env)
+        )

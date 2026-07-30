@@ -49,7 +49,13 @@ class ContainerSpec:
     ports: dict[int, int] = field(default_factory=dict)  # container_port -> host_port
     labels: dict[str, str] = field(default_factory=dict)
     command: tuple[str, ...] = ()
-    volumes: dict[str, str] = field(default_factory=dict)  # host_path -> container_path
+    # source -> container_path, where a source is EITHER a host path (the
+    # nebula config dir, a Lambda's code dir) or the NAME of a named volume
+    # (`aws/rds.py`'s per-database data volume). `docker`/`nerdctl` decide
+    # between the two by the same rule: a source containing a `/` is a bind
+    # mount, anything else is a volume. That distinction is what makes an rds
+    # container replaceable without losing its data -- see `stop` below.
+    volumes: dict[str, str] = field(default_factory=dict)
     # Owner directive B4: a runaway container (a bad ECS image, a Lambda
     # handler gone wild) can't eat the host -- None emits no docker flag at
     # all (unbounded, today's behavior); the binding layer that owns each
@@ -494,9 +500,70 @@ class _ContainerRuntime:
         await self._cli("kill", "-s", sig, name, check=False)
 
     async def stop(self, name: str) -> None:
-        # -v: drop the container's anonymous volumes with it (postgres creates
-        # one per boot; without this a churn loop leaks gigabytes).
+        # -v: drop the container's ANONYMOUS volumes with it (an image with a
+        # bare `VOLUME` line creates one per boot; without this a churn loop
+        # leaks gigabytes). A NAMED volume is deliberately untouched by it --
+        # probed on this machine's docker rather than assumed, because odin's
+        # non-destructive rds repair rests on it:
+        #
+        #     $ docker rm -f -v rdsvol-probe-pg          # rc 0
+        #     $ docker volume ls --filter name=rdsvol-probe-data --format '{{.Name}}'
+        #     rdsvol-probe-data
+        #
+        # -- and the 2 rows written before the removal were still there after a
+        # fresh container was started on that same volume. `remove_volume` is
+        # the only thing that deletes one.
         await self._cli("rm", "-f", "-v", name, check=False)
+
+    # --- named volumes: the state that has to OUTLIVE its container ---------
+    #
+    # Everything else odin runs is disposable: kill the container, run a new
+    # one, nothing is lost. A database is not, and that made odin's own repair
+    # destructive -- `postgres:16-alpine` declares `/var/lib/postgresql/data`
+    # as a VOLUME, so every rds container already had one, just an ANONYMOUS
+    # one that `stop`'s `-v` deleted along with it. Naming it is the whole fix.
+
+    async def create_volume(self, name: str) -> None:
+        """Ensure a named volume exists, LABELLED as odin's.
+
+        Idempotent by the CLI's own contract (probed: a second
+        `docker volume create` on the same name exits 0 and changes nothing),
+        so this needs no exists-check and no branch.
+
+        The explicit create earns its one extra call by the label: `-v
+        name:/path` auto-creates an UNLABELLED volume, which is indistinguishable
+        from one the user made by hand -- and an odin volume nobody can attribute
+        to odin is one nobody can ever safely reclaim on a disk-tight machine.
+        `volume_names` is what that buys."""
+        await self._cli(
+            "volume", "create", "--label", f"{LABEL}=1", "--label", f"{LABEL}.name={name}", name,
+        )
+
+    async def remove_volume(self, name: str) -> None:
+        """Delete a named volume. Absent is success; STILL IN USE is not.
+
+        `check=True` on purpose, unlike `stop`. Both cases were probed on the
+        real docker here rather than reasoned about:
+
+            docker volume rm -f <never-existed>   rc 0  (prints the name)
+            docker volume rm -f <in-use>          rc 1  "volume is in use - [<id>]"
+
+        so `-f` already absorbs the idempotent case, and the only way this
+        fails is a volume that is genuinely still attached -- i.e. the caller
+        removed the container after the volume, or not at all. That is a real
+        disk leak and a real teardown failure, and swallowing it would leave
+        `odin destroy` reporting a success it did not achieve."""
+        await self._cli("volume", "rm", "-f", name)
+
+    async def volume_names(self) -> list[str]:
+        """Every odin-labelled volume's NAME, in one call -- `container_names`'
+        twin, and `check=True` for the same reason: an empty answer here means
+        "the volume is really gone", so a CLI hiccup must raise rather than
+        arrive as an innocent empty list. `server.py`'s recovery disclosure
+        reads it to say whether a database's data really survived, instead of
+        asserting that it must have."""
+        out = await self._cli("volume", "ls", "--format", "{{.Name}}", "--filter", f"label={LABEL}=1")
+        return [line for line in out.splitlines() if line]
 
     async def list_odin(self) -> list[str]:
         out = await self._cli("ps", "-aq", "--filter", f"label={LABEL}=1", check=False)

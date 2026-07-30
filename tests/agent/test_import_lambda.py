@@ -30,6 +30,9 @@ the Terraform is unchanged either way.
 """
 from __future__ import annotations
 
+import io
+import zipfile
+
 from odin.agent.hcl import generate_tf
 from odin.agent.import_tf import parse_hcl, parse_hcl_dir, parse_hcl_text
 from odin.spec.translate import canvas_to_stack
@@ -177,3 +180,70 @@ def test_a_corrupt_zip_is_reported_rather_than_crashing_the_import():
     result = parse_hcl(project.files, {"thumbnailer.zip": b"not a zip at all"})
     assert "code" not in _node(result, "thumbnailer")["data"]
     assert any("CODE" in w for w in result.warnings), result.warnings
+
+
+# --- v0.8.14: a MULTI-FILE package, which is where `namelist()[0]` broke -----
+
+HELPERS = "def shout(name):\n    return {'said': name.upper()}\n"
+BODY = "from helpers import shout\n\ndef lambda_handler(event, context):\n    return shout(event['name'])\n"
+MULTI = {"lambda_function.py": BODY, "helpers.py": HELPERS, "vendor/dep.py": "VERSION = '1.0'\n"}
+
+MULTI_CANVAS = {
+    "nodes": [
+        {"id": "f1", "type": "lambda", "position": {"x": 0, "y": 0},
+         "data": {"label": "thumbnailer", "runtime": "python3.13", "files": MULTI}},
+    ],
+    "edges": [],
+}
+
+
+def test_every_member_of_a_multi_file_package_reaches_the_canvas():
+    """Before v0.8.14 the importer read `namelist()[0]` and called it the
+    function's whole body. Sorted, that is `helpers.py` here -- so a helper
+    module would have become the function, silently, and been re-applied as it."""
+    project = _generated(MULTI_CANVAS)
+    node = _node(parse_hcl(project.files, project.binary_files), "thumbnailer")
+    assert node["data"]["files"] == MULTI
+    # ...and NOT smuggled into `code`, where a single-file textarea would then
+    # show one member of a three-file package as the whole function.
+    assert "code" not in node["data"]
+
+
+def test_a_multi_file_package_regenerates_byte_for_byte():
+    """The same statement the single-file round trip makes, for a tree: import
+    then re-translate is a zero-drift no-op, not a redeploy."""
+    project = _generated(MULTI_CANVAS)
+    imported = parse_hcl(project.files, project.binary_files)
+    again = generate_tf(canvas_to_stack({"nodes": imported.nodes, "edges": imported.edges}))
+    assert again.files["main.tf"] == project.files["main.tf"]
+    assert again.binary_files == project.binary_files
+
+
+def test_a_single_file_package_still_comes_back_as_code_not_files():
+    """The v1 shape must keep landing in the field the config panel edits."""
+    project = _generated()
+    node = _node(parse_hcl(project.files, project.binary_files), "thumbnailer")
+    assert node["data"]["code"] == CODE and "files" not in node["data"]
+
+
+def _archive(members: dict[str, bytes]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        for name, blob in members.items():
+            archive.writestr(name, blob)
+    return buf.getvalue()
+
+
+def test_a_binary_member_is_named_rather_than_dropped_in_silence():
+    """A canvas carries a package as TEXT, so a vendored `.so` cannot ride
+    along. Saying which files were left behind is the whole difference between
+    a known limit and a function that quietly stops working."""
+    project = _generated(MULTI_CANVAS)
+    result = parse_hcl(project.files, {"thumbnailer.zip": _archive({
+        "lambda_function.py": BODY.encode(),
+        "helpers.py": HELPERS.encode(),
+        "_speedups.so": b"\x7fELF\x02\x01\x01\x00\xff\xfe",
+    })})
+    assert _node(result, "thumbnailer")["data"]["files"] == {"lambda_function.py": BODY, "helpers.py": HELPERS}
+    (warning,) = [w for w in result.warnings if "not text" in w]
+    assert "_speedups.so" in warning and "sourceDir" in warning, warning

@@ -24,7 +24,11 @@ from odin.cli.http import OutputFormat
 from odin.spec.translate import canvas_problems
 
 canvas_app = typer.Typer(
-    help="Read/write the saved canvas (one global canvas.json — no env scoping).",
+    # The very caveat this module's docstring says outlived its subject, still
+    # standing in the string `odin --help` PRINTS -- the docstring was fixed
+    # when the canvas went per-env and this was not. It is `.odin/<env>/
+    # canvas.json`, and both commands take `--env`.
+    help="Read/write an env's saved canvas (.odin/<env>/canvas.json).",
     no_args_is_help=True,
 )
 app.add_typer(canvas_app, name="canvas")

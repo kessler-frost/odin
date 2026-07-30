@@ -166,15 +166,24 @@ def _json(status: int, payload: dict) -> Response:
     return Response(json.dumps(body), status_code=status, media_type="application/json")
 
 
-def _not_found(name: str) -> Response:
+def _not_found_message(name: str) -> str:
     """The reader-side half of the empty-identifier family. Fifteen call sites
     pass the URL `resource` straight in, and a request that named no function
     made this render `Function not found: arn:aws:lambda:...:function:` -- the
     sentence trailing off inside the ARN, which reads as an odin bug rather
     than as the malformed request it is. The ARN is only worth printing when
-    there is a name to put in it."""
+    there is a name to put in it.
+
+    Split out from `_not_found` so `invoke()` -- which answers an OUTCOME, not
+    a Response -- says the same sentence the wire does. One wording, so a
+    dispatched invoke and a `lambda:Invoke` call cannot disagree about what
+    "there is no such function" reads like."""
     subject = f"arn:aws:lambda:{REGION}:{ACCOUNT}:function:{name}" if name else "this request named no function"
-    return errors.synth_error("lambda", "ResourceNotFoundException", f"Function not found: {subject}", 404)
+    return f"Function not found: {subject}"
+
+
+def _not_found(name: str) -> Response:
+    return errors.synth_error("lambda", "ResourceNotFoundException", _not_found_message(name), 404)
 
 
 def _conflict(message: str) -> Response:
@@ -782,21 +791,59 @@ async def _ship_logs(stores: SynthStores, env: str, name: str, substrate: Functi
     )
 
 
-async def _invoke(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
-    fn = _function(stores, env, resource)
+class Invocation(NamedTuple):
+    """What one invoke actually did, as an OUTCOME rather than as a Response.
+
+    `outcome` is the whole vocabulary: `ran` (the container answered -- the
+    handler may still have raised, which is `function_error`), `missing`,
+    `not_ready`, `unreachable`. `detail` is the sentence a human reads, already
+    worded, so the wire and the dispatcher say the same thing about the same
+    failure. `function_error` is `InvokeResult.function_error`, derived from the
+    response BODY by `compute/functions.py::_function_error` -- never from an
+    `x-amz-function-error` header, which real RIE does not send (one of the four
+    guards that silently never fired; see .claude/CLAUDE.md honesty rule 1)."""
+
+    outcome: str
+    function_error: str | None
+    payload: bytes
+    detail: str
+
+
+async def invoke(
+    stores: SynthStores, env: str, name: str, payload: bytes,
+    substrate: FunctionRuntime | None = None,
+) -> Invocation:
+    """THE invoke path. `_invoke` (the `lambda:Invoke` wire handler) and
+    `reconcile/dispatch.py` (every triggered invocation) are its two callers,
+    and that is the point rather than a convenience.
+
+    Everything that makes an invocation VISIBLE lives here: the `State !=
+    Active` guard, `_ship_logs` (the handler's traceback, which is the whole
+    reason a user opens `odin logs`), and the durable
+    `last_invocation_error` write that `reconcile/tf_status.py::
+    _invocation_verdict` projects into `/world`. `FunctionRuntime.invoke` is
+    the execution SEAM underneath, and a caller reaching for it directly gets
+    a function that fails every single dispatched invocation while reporting
+    `healthy` with no verdict -- field test 2 finding #4, re-created through a
+    new door. So there is one door.
+
+    `FunctionRuntime.invoke` is a coroutine, and the await is what lets the loop
+    serve the handler's own re-entrant AWS calls while it runs (see
+    `compute/functions.py::invoke`, and the measured 25.11s + `TimeoutError`
+    that motivated it). NO LOCK is held across it, deliberately: a lock held
+    across an await is a DEADLOCK rather than a stall, because the task that
+    would release it can never be resumed."""
+    runtime = substrate or FunctionRuntime(ColimaRuntime(), stores.root)
+    fn = _function(stores, env, name)
     if fn is None:
-        return _not_found(resource)
+        return Invocation("missing", None, b"", _not_found_message(name))
     if fn["state"] != "Active":
-        return errors.synth_error(
-            "lambda", "ResourceNotReadyException",
-            f"Function '{resource}' is not ready to be invoked (state={fn['state']})", 502,
+        return Invocation(
+            "not_ready", None, b"",
+            f"Function '{name}' is not ready to be invoked (state={fn['state']})",
         )
     try:
-        # `FunctionRuntime.invoke` -- NOT a boto3 client's `invoke`, which is
-        # synchronous. This one is a coroutine, and the await is what lets the
-        # loop serve the handler's own re-entrant AWS calls while it runs (see
-        # `compute/functions.py::invoke`).
-        result = await substrate.invoke(env, resource, body)
+        result = await runtime.invoke(env, name, payload)
     except Exception as exc:
         # The SIBLING of `_finish_deploy`'s reason, and the one with the
         # narrowest escape hatch: this string is the whole `Message` of the
@@ -806,18 +853,38 @@ async def _invoke(resource: str, env: str, body: bytes, stores: SynthStores, now
         # the empty message, measured) -- with which botocore rendered exactly
         # `An error occurred (ServiceException) when calling the Invoke
         # operation: ` and stopped, a dangling colon where the cause belongs.
-        return errors.synth_error("lambda", "ServiceException", exc_text(exc), 500)
+        return Invocation("unreachable", None, b"", exc_text(exc))
     # Both outcomes ship: a handler that RAISED wrote its traceback to the
     # container's stderr, and that traceback is the whole reason CloudWatch
     # Logs exists.
-    await _ship_logs(stores, env, resource, substrate)
+    await _ship_logs(stores, env, name, runtime)
     # ...and both outcomes are RECORDED, which is the honesty half (field test
     # 2 finding #4): a function failing every single invocation used to report
     # `healthy` and nothing else, because `FunctionError` went into the response
     # header and nowhere durable. `reconcile/tf_status.py::_invocation_verdict`
     # projects this field as the node's verdict -- the phase stays `healthy`
     # (the deploy really did succeed) while the verdict says the handler didn't.
-    _update_function(stores, env, resource, last_invocation_error=result.function_error)
+    _update_function(stores, env, name, last_invocation_error=result.function_error)
+    return Invocation("ran", result.function_error, result.payload, result.function_error or "")
+
+
+# outcome -> the AWS error it answers on the wire. DERIVED, never initialised:
+# an outcome nobody mapped raises a KeyError out of the handler and becomes a
+# loud 500 rather than inheriting a plausible-looking one. That is the /destroy
+# lesson (.claude/CLAUDE.md honesty rule 2) applied to a four-branch function --
+# a branch that forgets fails, instead of quietly answering `ran`.
+_INVOKE_ERROR = {
+    "missing": ("ResourceNotFoundException", 404),
+    "not_ready": ("ResourceNotReadyException", 502),
+    "unreachable": ("ServiceException", 500),
+}
+
+
+async def _invoke(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+    result = await invoke(stores, env, resource, body, substrate)
+    if result.outcome != "ran":
+        code, status = _INVOKE_ERROR[result.outcome]
+        return errors.synth_error("lambda", code, result.detail, status)
     headers = {"x-amz-function-error": result.function_error} if result.function_error else {}
     return Response(result.payload, status_code=200, media_type="application/json", headers=headers)
 
@@ -853,10 +920,242 @@ async def _untag_resource(resource: str, env: str, body: bytes, stores: SynthSto
     return Response(status_code=204)
 
 
+# --- event source mappings: the SQS -> Lambda trigger's control plane -------
+#
+# `aws_lambda_event_source_mapping` drove `CreateEventSourceMapping` at a route
+# that was not in `classify._LAMBDA_ROUTES` and a model that did not exist, so
+# `tofu apply` failed on it outright. The four routes below are botocore's OWN
+# (printed from the `lambda` service model rather than remembered):
+#
+#   POST   /2015-03-31/event-source-mappings        CreateEventSourceMapping
+#   GET    /2015-03-31/event-source-mappings        ListEventSourceMappings
+#   GET    /2015-03-31/event-source-mappings/{UUID} GetEventSourceMapping
+#   PUT    /2015-03-31/event-source-mappings/{UUID} UpdateEventSourceMapping
+#   DELETE /2015-03-31/event-source-mappings/{UUID} DeleteEventSourceMapping
+#
+# WHAT ODIN REFUSES, AND WHY IT REFUSES RATHER THAN STORES. A mapping is a
+# POLLER: `reconcile/dispatch.py` reads the source and invokes the function.
+# odin can poll exactly one thing -- an SQS queue in this env's goaws backing --
+# so a Kinesis stream, a DynamoDB stream, an MSK topic or a self-managed Kafka
+# source is a mapping that would be stored, would round-trip through `plan`
+# clean, and would never deliver a single message. That is the render-and-
+# never-fire shape this whole feature exists to remove, so it is an error at
+# create time, in the same voice `eventsctl._put_events` uses.
+#
+# NO `Creating` PHASE, deliberately -- and this is the one place odin's answer
+# is SIMPLER than real AWS rather than a stand-in for it. Real
+# CreateEventSourceMapping answers `Creating` and the provider polls until
+# `Enabled`, because AWS really is provisioning pollers. odin's poller is the
+# reconciler tick, which already exists; there is nothing to wait for, so
+# answering `Enabled` immediately is the truth. Faking a transitional state we
+# would then have to leave on a timer is how a status stops meaning anything.
+
+_ESM_ENABLED = "Enabled"
+_ESM_DISABLED = "Disabled"
+_ESM_DELETING = "Deleting"
+_DEFAULT_BATCH_SIZE = 10
+# Real ListEventSourceMappings defaults to 100 and paginates; nothing here
+# paginates, so this only truncates (the same limit `eventsctl` documents).
+_ESM_DEFAULT_MAX_ITEMS = 100
+
+_ESM_UNSUPPORTED_SOURCE = (
+    "odin delivers an event source mapping by POLLING the source on the reconciler tick, and the "
+    "only source it can poll is an SQS queue in this environment's own backing. {arn} is not an SQS "
+    "queue ARN, so this mapping would be stored, would round-trip through `tofu plan` cleanly, and "
+    "would never deliver a single message. Kinesis, DynamoDB Streams, MSK and self-managed Kafka "
+    "are not modelled -- see docs/limits.md."
+)
+
+
+def _esm_key(uuid_: str) -> str:
+    return f"esm:{uuid_}"
+
+
+def _esm(stores: SynthStores, env: str, uuid_: str) -> dict | None:
+    return stores.lambdactl.get(env, _esm_key(uuid_))
+
+
+def _esm_records(stores: SynthStores, env: str) -> list[dict]:
+    return [m for key, m in stores.lambdactl.items(env).items() if key.startswith("esm:")]
+
+
+def _bare_function_name(value: str) -> str:
+    """`FunctionName` is documented as the name, the partial ARN or the full
+    ARN, and terraform sends the full ARN (`aws_lambda_function.x.arn`). All
+    three reduce to the bare name, which is what every record here is keyed by
+    -- and, for odin, is also the canvas label (`hcl.py::_lambda` emits
+    `function_name = <label>`)."""
+    return value.rsplit(":", 1)[-1] if value.startswith("arn:") else value
+
+
+def is_sqs_arn(arn: str) -> bool:
+    """Is this an ARN naming an SQS queue? The ONE place that question is
+    answered, so the create-time refusal and the dispatcher's own drain can
+    never disagree about which mappings are deliverable."""
+    return arn.startswith("arn:aws:sqs:")
+
+
+def queue_of(arn: str) -> str:
+    """The queue NAME out of an SQS ARN (`arn:aws:sqs:region:account:name`).
+    The same last-segment rule `classify._target_resource` derives a queue from
+    a QueueUrl with, so a mapping and a `sqs:*` call name one queue."""
+    return arn.rsplit(":", 1)[-1]
+
+
+def _esm_json(record: dict) -> dict:
+    """`EventSourceMappingConfiguration` -- every one of the five operations
+    answers this same shape (checked against botocore's own lambda model, which
+    gives all five the identical output shape). `LastModified` is a `timestamp`
+    there with no explicit `timestampFormat`, which for `rest-json` means the
+    unix-epoch NUMBER botocore's parser turns back into a datetime -- not the
+    formatted string `FunctionConfiguration.LastModified` uses. Two timestamp
+    members, two encodings, one model; pinned by a round-trip test rather than
+    by this comment."""
+    return {
+        "UUID": record["uuid"],
+        "EventSourceArn": record["event_source_arn"],
+        "FunctionArn": record["function_arn"],
+        "State": record["state"],
+        "BatchSize": record["batch_size"],
+        "MaximumBatchingWindowInSeconds": record["maximum_batching_window_in_seconds"],
+        "LastModified": record["last_modified"],
+        "StateTransitionReason": record["state_transition_reason"],
+        "FunctionResponseTypes": record["function_response_types"],
+        "LastProcessingResult": record["last_processing_result"],
+    }
+
+
+def _esm_fields(payload: dict, existing: dict | None) -> dict[str, object]:
+    """The members Create and Update BOTH accept, applied over `existing` (None
+    on create). Only the ones odin can honour are read; everything else the
+    provider may send is deliberately not stored rather than stored and
+    ignored, because a member echoed back unchanged reads as honoured."""
+    prior = existing or {}
+    enabled = payload.get("Enabled")
+    state = prior.get("state", _ESM_ENABLED) if enabled is None else (_ESM_ENABLED if enabled else _ESM_DISABLED)
+    return {
+        "state": state,
+        "batch_size": int(payload.get("BatchSize") or prior.get("batch_size") or _DEFAULT_BATCH_SIZE),
+        "maximum_batching_window_in_seconds": int(
+            payload.get("MaximumBatchingWindowInSeconds")
+            or prior.get("maximum_batching_window_in_seconds") or 0,
+        ),
+        "function_response_types": list(
+            payload.get("FunctionResponseTypes") or prior.get("function_response_types") or [],
+        ),
+        "last_modified": time.time(),
+    }
+
+
+async def _create_event_source_mapping(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+    payload = _payload(body)
+    source = str(payload.get("EventSourceArn") or "")
+    if not is_sqs_arn(source):
+        return _invalid_parameter(_ESM_UNSUPPORTED_SOURCE.format(arn=source or "this request's EventSourceArn"))
+    name = _bare_function_name(str(payload.get("FunctionName") or ""))
+    fn = _function(stores, env, name)
+    if fn is None:
+        # Real AWS validates this too (`ResourceNotFoundException` is in
+        # CreateEventSourceMapping's own error list), so refusing is the
+        # AWS-shaped answer rather than an odin restriction -- and it is what
+        # keeps every stored mapping's target resolvable to a World label.
+        return _not_found(name)
+    existing = next((m for m in _esm_records(stores, env)
+                     if m["event_source_arn"] == source and m["function_name"] == name), None)
+    if existing is not None:
+        return _conflict(
+            f"An event source mapping with SQS arn (\" {source} \") and function (\" {name} \") already exists. "
+            f"Please update or delete the existing mapping with UUID {existing['uuid']}",
+        )
+    record = {
+        "uuid": str(uuid.uuid4()),
+        "event_source_arn": source,
+        "function_name": name,
+        "function_arn": fn["function_arn"],
+        "state_transition_reason": "USER_INITIATED",
+        "last_processing_result": None,
+        **_esm_fields(payload, None),
+    }
+    stores.lambdactl.set(env, _esm_key(record["uuid"]), record)
+    return _json(202, _esm_json(record))
+
+
+async def _get_event_source_mapping(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+    record = _esm(stores, env, resource)
+    if record is None:
+        return _esm_not_found(resource)
+    return _json(200, _esm_json(record))
+
+
+async def _update_event_source_mapping(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+    payload = _payload(body)
+
+    def mutate(current: dict | None) -> dict | object:
+        if current is None:  # deleted concurrently
+            return NO_CHANGE
+        return {**current, **_esm_fields(payload, current)}
+
+    record = stores.lambdactl.update(env, _esm_key(resource), mutate)
+    if record is NO_CHANGE:
+        return _esm_not_found(resource)
+    return _json(202, _esm_json(record))
+
+
+async def _delete_event_source_mapping(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+    record = _esm(stores, env, resource)
+    if record is None:
+        return _esm_not_found(resource)
+    stores.lambdactl.delete(env, _esm_key(resource))
+    # `Deleting` with the record ALREADY gone: the provider's delete waiter
+    # polls Get until it 404s, and there is nothing here that takes time, so
+    # reporting a transitional state we are not actually in for any measurable
+    # window would be the lie. The answer describes what the call did.
+    return _json(202, {**_esm_json(record), "State": _ESM_DELETING})
+
+
+async def _list_event_source_mappings(resource: str, env: str, body: bytes, stores: SynthStores, now: float, substrate: FunctionRuntime, query: dict[str, str], keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+    wanted_source = (query or {}).get("EventSourceArn") or ""
+    wanted_function = _bare_function_name((query or {}).get("FunctionName") or "")
+    matched = [
+        m for m in _esm_records(stores, env)
+        if (not wanted_source or m["event_source_arn"] == wanted_source)
+        and (not wanted_function or m["function_name"] == wanted_function)
+    ]
+    matched.sort(key=lambda m: m["uuid"])
+    limit = int((query or {}).get("MaxItems") or _ESM_DEFAULT_MAX_ITEMS)
+    return _json(200, {"EventSourceMappings": [_esm_json(m) for m in matched[:limit]], "NextMarker": None})
+
+
+def _esm_not_found(uuid_: str) -> Response:
+    return errors.synth_error(
+        "lambda", "ResourceNotFoundException",
+        f"The resource you requested does not exist. Event source mapping: {uuid_}", 404,
+    )
+
+
+def event_source_mappings(stores: SynthStores, env: str) -> list[dict]:
+    """Every event source mapping in this env -- the read `reconcile/
+    dispatch.py` drains from. In-process only and never on an HTTP route, the
+    same boundary `eventsctl.rules` and `ssmctl.parameter_value` keep."""
+    return _esm_records(stores, env)
+
+
+def mapping_enabled(record: dict) -> bool:
+    """Is this mapping actually draining? A `Disabled` mapping is a real,
+    stored, plan-clean resource that deliberately delivers nothing -- the ONE
+    non-delivering mapping that is not a lie, because the user asked for it."""
+    return record["state"] == _ESM_ENABLED
+
+
 # --- dispatch --------------------------------------------------------------
 
 
 _HANDLERS: dict[str, _Handler] = {
+    "CreateEventSourceMapping": _create_event_source_mapping,
+    "GetEventSourceMapping": _get_event_source_mapping,
+    "UpdateEventSourceMapping": _update_event_source_mapping,
+    "DeleteEventSourceMapping": _delete_event_source_mapping,
+    "ListEventSourceMappings": _list_event_source_mappings,
     "CreateFunction": _create_function,
     "GetFunction": _get_function,
     "GetFunctionConfiguration": _get_function_configuration,

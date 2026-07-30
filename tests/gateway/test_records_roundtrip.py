@@ -24,9 +24,9 @@ from urllib.parse import urlencode
 
 import pytest
 
-from odin.gateway import synth
-from odin.gateway.models import ec2net, ecr, iamctl, logsctl, secretsctl, ssmctl
-from odin.gateway.stores import SynthStores
+from odin.gateway import records, synth
+from odin.gateway.models import ec2net, ecr, eventsctl, iamctl, logsctl, secretsctl, ssmctl
+from odin.gateway.stores import JsonStore, SynthStores
 
 ENV = "v77a-rt"
 NOW = 1785130167.0
@@ -38,15 +38,40 @@ def reload(root: Path) -> SynthStores:
     return SynthStores(root)
 
 
+def store_names(stores: SynthStores) -> list[str]:
+    """Every `JsonStore` on `SynthStores`, DERIVED rather than listed.
+
+    This used to be a hand-written list of 17 names, and the store count has
+    grown one service at a time from four -- so an 18th store was invisible to
+    both readers below until someone remembered to type it in. Same reasoning
+    `SynthStores.forget_env` already writes down for deriving from `vars`."""
+    return sorted(name for name, store in vars(stores).items() if isinstance(store, JsonStore))
+
+
 def touch_everything(stores: SynthStores) -> dict[str, int]:
     """Force a load of every store and report how many records each holds, so
     a test that seeded nothing cannot pass by validating nothing."""
-    names = [
-        "tags", "sqs_queues", "sns_topics", "sns_subscriptions", "ec2net", "iamctl",
-        "ecr", "ec2compute", "lambdactl", "ecsctl", "logsctl", "secretsctl",
-        "ssmctl", "cachectl", "rdsctl", "elbv2ctl",
-    ]
-    return {name: len(getattr(stores, name).items(ENV)) for name in names}
+    return {name: len(getattr(stores, name).items(ENV)) for name in store_names(stores)}
+
+
+def test_every_store_has_a_records_schema(tmp_path: Path):
+    """The ratchet that was missing: a new `JsonStore` with no `SCHEMAS` entry
+    loads WITHOUT validation and says nothing about it (`_adapter_for` returns
+    None for an unknown store name and every record is skipped).
+
+    That is a guard silently not firing -- honesty rule 1 -- and it is exactly
+    how the file-shape bugs `records.py`'s docstring lists got in. Nothing
+    enforced the pairing before: `touch_everything`'s list happened to match
+    `SCHEMAS` at 17 entries each, by hand, twice."""
+    missing = sorted(set(store_names(SynthStores(tmp_path))) - set(records.SCHEMAS))
+    assert not missing, f"these stores load unvalidated -- add a records.SCHEMAS entry: {missing}"
+
+
+def test_records_schemas_name_no_store_that_does_not_exist(tmp_path: Path):
+    """The other direction: a `SCHEMAS` key that matches no store validates
+    nothing at all, so a typo there is a schema that silently never runs."""
+    unknown = sorted(set(records.SCHEMAS) - set(store_names(SynthStores(tmp_path))))
+    assert not unknown, f"these SCHEMAS entries match no JsonStore: {unknown}"
 
 
 async def json_call(module, action: str, payload: dict, stores: SynthStores, resource: str = ""):
@@ -153,6 +178,26 @@ async def test_secretsctl_real_records_reload(tmp_path: Path):
     assert versions and "AWSCURRENT" in versions[0]["version_stages"]
 
 
+async def test_eventsctl_real_records_reload(tmp_path: Path):
+    """A custom bus, a rule on it, and the target LIST -- the shape that made
+    `events:` splat into characters one store over."""
+    stores = SynthStores(tmp_path)
+    await json_call(eventsctl, "events:CreateEventBus", {"Name": "orders"}, stores)
+    await json_call(eventsctl, "events:PutRule", {
+        "Name": "nightly", "EventBusName": "orders", "ScheduleExpression": "rate(1 day)",
+        "Tags": [{"Key": "odin:node", "Value": "nightly"}],
+    }, stores)
+    await json_call(eventsctl, "events:PutTargets", {
+        "Name": "nightly", "Rule": "nightly", "EventBusName": "orders",
+        "Targets": [{"Id": "t1", "Arn": "arn:aws:lambda:us-east-1:000000000000:function:f"}],
+    }, stores)
+
+    fresh = reload(tmp_path)
+    assert fresh.eventsctl.get(ENV, "rule:orders:nightly")["event_bus_name"] == "orders"
+    assert [t["Id"] for t in fresh.eventsctl.get(ENV, "targets:orders:nightly")] == ["t1"]
+    assert fresh.tags.get(ENV, f"events:{eventsctl.rule_arn('orders', 'nightly')}") == {"odin:node": "nightly"}
+
+
 async def test_ec2net_real_records_reload(tmp_path: Path):
     """vpc + subnet + the DEFAULT security group the VPC mints, whose `rules`
     map is compiled into the Nebula firewall."""
@@ -184,21 +229,21 @@ def _synth_env(root: Path) -> SynthStores:
         "sqs:CreateQueue", "jobs", ENV,
         json.dumps({"Attributes": {"VisibilityTimeout": "30"}, "tags": {"odin:node": "jobs"}}).encode(),
         json.dumps({"QueueUrl": "http://127.0.0.1:4100/queue/jobs"}).encode(),
-        stores, "127.0.0.1:5186", NOW,
+        stores, "127.0.0.1:5186", NOW, "", {},
     )
     synth.postprocess(
-        "sqs:DeleteQueue", "old-jobs", ENV, b"{}", b"{}", stores, "127.0.0.1:5186", NOW,
+        "sqs:DeleteQueue", "old-jobs", ENV, b"{}", b"{}", stores, "127.0.0.1:5186", NOW, "", {},
     )
     synth.postprocess(
         "sns:CreateTopic", "events", ENV,
         b"Attributes.entry.1.key=DisplayName&Attributes.entry.1.value=events"
         b"&Tags.member.1.Key=odin%3Anode&Tags.member.1.Value=events",
-        b"<CreateTopicResponse/>", stores, "127.0.0.1:5186", NOW,
+        b"<CreateTopicResponse/>", stores, "127.0.0.1:5186", NOW, "", {},
     )
     synth.postprocess(
         "sns:Unsubscribe", "events", ENV,
         b"SubscriptionArn=arn%3Aaws%3Asns%3Aus-east-1%3A000000000000%3Aevents%3Asub",
-        b"<UnsubscribeResponse/>", stores, "127.0.0.1:5186", NOW,
+        b"<UnsubscribeResponse/>", stores, "127.0.0.1:5186", NOW, "", {},
     )
     return stores
 

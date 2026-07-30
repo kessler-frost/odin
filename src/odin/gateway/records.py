@@ -191,6 +191,25 @@ class LambdaFunction(Record):
     last_invocation_error: str | None = None
 
 
+class EventSourceMapping(Record):
+    """`esm:{uuid}` (gateway/models/lambdactl.py) -- one
+    `aws_lambda_event_source_mapping`, the SQS queue whose messages
+    `reconcile/dispatch.py` drains into `function_name`.
+
+    `state` is what makes a DISABLED mapping stop draining, and `function_name`
+    is what the drain invokes; a wrong type on either turns the mapping into a
+    poller that reads a queue and delivers nowhere. `event_source_arn` is the
+    queue it reads -- the only field that can point the drain at the wrong
+    queue, so a malformed one must fail the load rather than silently drain
+    somebody else's messages."""
+
+    uuid: str
+    event_source_arn: str
+    function_name: str
+    state: str
+    batch_size: int = 10
+
+
 # --- cloudwatch logs ---------------------------------------------------------
 
 
@@ -521,6 +540,55 @@ class Target(Record):
 TARGETS = strict(list[Target])
 
 
+# --- eventbridge -------------------------------------------------------------
+
+
+class EventRule(Record):
+    """`rule:{bus}:{name}` (gateway/models/eventsctl.py).
+
+    `event_bus_name` is the one worth pinning beyond the obvious: it is half of
+    the key every target lookup is built from (`targets:{bus}:{rule}`), so a
+    non-string there sends `ListTargetsByRule` to a key that exists for no rule
+    and the answer is an empty target list behind a 200 -- a rule that reads as
+    having no targets rather than as broken. `state` is what a dispatcher must
+    read to honour a DISABLED rule, and `arn` is what the tag ops resolve a
+    `ResourceARN` against (`_by_arn`), so a wrong type there loses a rule's tags
+    without failing."""
+
+    name: str
+    arn: str
+    event_bus_name: str
+    state: str
+
+
+class EventTarget(Record):
+    """One entry inside `targets:{bus}:{rule}` -- stored VERBATIM as terraform
+    sent it, so the members are the wire's own capitalized names.
+
+    `Id` alone is modelled, and that is deliberate rather than lazy: it is the
+    only member any reader indexes (`_put_targets`' upsert-by-id, `_remove_targets`'
+    filter, `_delete_rule`'s "targets remain" guard all do `t["Id"]`). `Arn` is
+    REQUIRED by botocore and will be load-bearing the moment a dispatcher reads
+    it, but nothing indexes it today, and requiring a field no released writer
+    guarantees is how this module bricks an env instead of protecting one
+    (module docstring, rule 1)."""
+
+    Id: str
+
+
+# `targets:{bus}:{rule}` -- a LIST of targets, the events store's own instance
+# of the shape that made `events:` splat into characters in logsctl.
+EVENT_TARGETS = strict(list[EventTarget])
+
+
+class EventBus(Record):
+    """`bus:{name}`. The DEFAULT bus is never stored (eventsctl's `_bus`
+    synthesizes it), so every record under this prefix is a real custom bus."""
+
+    name: str
+    arn: str
+
+
 # --- elasticache -------------------------------------------------------------
 
 
@@ -558,6 +626,72 @@ class SsmParameter(Record):
 
     name: str
     version: int
+
+
+# --- event delivery: the dispatcher's bookkeeping + S3's own notification
+# control plane (reconcile/dispatch.py, gateway/models/s3notify.py) -----------
+
+
+class DispatchAnchor(Record):
+    """`fired:{bus}:{rule}` in the `dispatch` store -- when a scheduled
+    EventBridge rule's clock was last set, wall-clock seconds.
+
+    `at` is the one field and it is arithmetic: `reconcile/dispatch.py` fires
+    when `now - at >= period`. A STRING there raises `TypeError` mid-tick, and
+    a record that lost the field reads as "never seen", which re-anchors the
+    rule every tick and means it never becomes due -- a trigger that silently
+    never fires, which is the whole bug class the dispatcher exists to avoid.
+    So this one is pinned for a measured reason, not for symmetry."""
+
+    at: float
+
+
+class PendingNotification(Record):
+    """`pending:{id}` in the `dispatch` store -- one S3 object write that has
+    matched a bucket notification and is waiting for the next dispatcher pass.
+
+    Written SYNCHRONOUSLY by `synth.postprocess` (which cannot await -- see
+    gateway/synth.py and the design note's §5) and drained by the tick-driven
+    dispatcher, so this record is the whole handoff between the two. Every
+    field is read on the delivery side: `target_arn` picks the function,
+    `bucket`/`key`/`event_name`/`size`/`etag` build the S3 event AWS's own
+    handlers expect, and `at` orders the drain.
+
+    `at` is WALL-CLOCK (`time.time()`), never `time.monotonic()`, and that is
+    load-bearing rather than stylistic: this record is PERSISTED to
+    `.odin/{env}/gateway/dispatch.json`, and monotonic's epoch is arbitrary and
+    resets with the process -- so a record written before a restart and one
+    written after would be ordered against incomparable clocks and the drain's
+    ascending sort would silently invert.
+
+    `attempts` is how many times delivery has been TRIED and failed. The
+    producer never writes it; `reconcile/dispatch.py` increments it and drops
+    the record once it reaches its bound, which is what stops a broken function
+    from being invoked forever by a notification nobody can deliver."""
+
+    bucket: str
+    key: str
+    event_name: str
+    target_arn: str
+    at: float
+    size: int = 0
+    etag: str = ""
+    attempts: int = 0
+
+
+class BucketNotification(Record):
+    """`notify:{bucket}` in the `s3notify` store -- odin's OWN copy of a
+    bucket's notification configuration.
+
+    It is odin's own because RustFS cannot hold it: measured against
+    `rustfs/rustfs:latest`, every `PutBucketNotificationConfiguration` ARN form
+    is rejected with `InvalidArgument` and the configuration is stored anyway,
+    so a forwarded write fails the apply while the next GET reports no drift.
+    `configurations` is the parsed, normalized list every reader uses (the
+    dispatcher matches an object write against it; `GetBucketNotification`
+    renders it back)."""
+
+    configurations: list[dict[str, Any]] = []
 
 
 # --- the four synth.py stores ------------------------------------------------
@@ -600,7 +734,7 @@ UNSUBSCRIBED_AT = strict(float)
 # carry no prefix at all.
 SCHEMAS: dict[str, dict[str, TypeAdapter]] = {
     "rdsctl": {"db:": strict(DbInstance)},
-    "lambdactl": {"fn:": strict(LambdaFunction)},
+    "lambdactl": {"fn:": strict(LambdaFunction), "esm:": strict(EventSourceMapping)},
     "logsctl": {
         "group:": strict(LogGroup),
         "stream:": strict(LogStream),
@@ -632,9 +766,16 @@ SCHEMAS: dict[str, dict[str, TypeAdapter]] = {
         "listener:": strict(Listener),
         "targets:": TARGETS,
     },
+    "eventsctl": {
+        "rule:": strict(EventRule),
+        "targets:": EVENT_TARGETS,
+        "bus:": strict(EventBus),
+    },
     "cachectl": {"cluster:": strict(CacheCluster)},
     "secretsctl": {"secret:": strict(Secret), "version:": strict(SecretVersion)},
     "ssmctl": {"param:": strict(SsmParameter)},
+    "dispatch": {"fired:": strict(DispatchAnchor), "pending:": strict(PendingNotification)},
+    "s3notify": {"notify:": strict(BucketNotification)},
     "tags": {"": TAG_SET},
     "sqs_queues": {"": strict(SqsQueue)},
     "sns_topics": {"": TOPIC_ATTRIBUTES},

@@ -207,6 +207,46 @@ def test_wrong_answer_target_list_string(tmp_path: Path):
     assert "'targets:api'" in str(unreadable(stores, "elbv2ctl"))
 
 
+def test_wrong_answer_event_targets_string(tmp_path: Path):
+    """`targets:{bus}:{rule}` is a bare list, the same shape that made the
+    logsctl ring buffer splat. Measured on this store with the guard removed:
+    a string here is iterated as CHARACTERS by `_put_targets`' upsert
+    (`t["Id"]` -> `TypeError: string indices must be integers`, naming no
+    file), and `ListTargetsByRule` answers `{"Targets": "arn:aws:..."}` -- a
+    string where the wire shape is a list of structures -- behind a 200."""
+    stores = seed(tmp_path, "eventsctl", {"targets:default:nightly": "arn:aws:lambda:::function:f"})
+    assert "'targets:default:nightly'" in str(unreadable(stores, "eventsctl"))
+
+
+def test_wrong_answer_event_rule_missing_its_bus(tmp_path: Path):
+    """`event_bus_name` is half of every target key (`targets:{bus}:{rule}`),
+    so a record that lost it sends `ListTargetsByRule` to a key no rule owns
+    and the rule reads as having NO targets -- a 200 with an empty list, which
+    is exactly the answer a rule with no targets gives. Nothing distinguishes
+    them."""
+    stores = seed(tmp_path, "eventsctl", {"rule:default:nightly": {
+        "name": "nightly", "arn": "arn:aws:events:us-east-1:000000000000:rule/nightly", "state": "ENABLED",
+    }})
+    assert "event_bus_name" in str(unreadable(stores, "eventsctl"))
+
+
+def test_wrong_answer_event_target_without_an_id(tmp_path: Path):
+    """`Id` is what `PutTargets` upserts on and `RemoveTargets` filters by -- a
+    target missing it is one that can never be replaced or removed."""
+    stores = seed(tmp_path, "eventsctl", {"targets:default:nightly": [
+        {"Arn": "arn:aws:lambda:us-east-1:000000000000:function:f"},
+    ]})
+    assert "Id" in str(unreadable(stores, "eventsctl"))
+
+
+def test_upgrade_an_event_target_carrying_only_its_id_loads(tmp_path: Path):
+    """The other direction: `Arn` is required by botocore but NOT modelled
+    here, because nothing indexes it yet and a guard that rejects a record a
+    writer can legitimately produce bricks the env (records.py rule 1)."""
+    stores = seed(tmp_path, "eventsctl", {"targets:default:nightly": [{"Id": "t1"}]})
+    assert stores.eventsctl.get(ENV, "targets:default:nightly") == [{"Id": "t1"}]
+
+
 def test_wrong_answer_sqs_attributes_string_is_no_longer_echoed_as_a_map(tmp_path: Path):
     """Measured on v0.7.6: `{"attributes": "VisibilityTimeout=30"}` made
     GetQueueAttributes answer

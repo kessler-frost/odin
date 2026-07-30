@@ -107,6 +107,12 @@ def containers():
     yield names
     for name in reversed(names):
         subprocess.run(["docker", "rm", "-f", "-v", name], capture_output=True, timeout=60)
+        # ...and, for an rds container, its NAMED data volume: `rm -f -v`
+        # deliberately leaves those standing (that is what makes odin's repair
+        # non-destructive), so removing only the container leaks a Postgres
+        # volume on every run that fails before its real teardown. A no-op --
+        # exit 0 -- for every other kind, which has no such volume.
+        subprocess.run(["docker", "volume", "rm", "-f", f"{name}-data"], capture_output=True, timeout=60)
 
 
 @pytest.fixture

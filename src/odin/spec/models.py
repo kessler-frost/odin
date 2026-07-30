@@ -107,14 +107,27 @@ class Ref(BaseModel):
 # make the four PROVISIONED kinds referenceable -- but the reconciler only
 # stores its `_fabric` and never calls it, so it is not a live path and must not
 # be counted as one here.)
-REFERENCEABLE_KINDS = ("rds", "elasticache", "alb", "ec2")
+REFERENCEABLE_KINDS = ("rds", "elasticache", "alb", "ec2", "ecr")
 
 
 class Edge(BaseModel):
     model_config = {"frozen": True}
     src: str
     dst: str
-    kind: str = "ref"            # "ref" | "iam" | "network"
+    # A free string on purpose, so a canvas saved before a kind existed still
+    # parses. `spec/translate.py::EDGE_KINDS` is the registry; `ui/src/lib/iam.ts`
+    # is its UI half. "network" is retained as a legacy value: every saved
+    # canvas carries it, and the builders key on NODE KINDS rather than this
+    # field, so gating on it without a migration would tear down live resources.
+    #
+    # `connection` is the one exception, and the shape of the exception is the
+    # rule: `spec/translate.py::_merge_connection_edges` DOES gate on this field,
+    # which is safe because gating is dangerous only when it can REMOVE something
+    # already being built -- every saved canvas types its sns->sqs edge "network",
+    # so a gate there would have tofu destroy live subscriptions, whereas a NEW
+    # meaning on a NEW kind can only withhold a new feature from an old canvas.
+    kind: str = "ref"            # ref | iam | sg | role | target | subscription |
+                                 # connection | unmodelled | network
     perms: tuple[str, ...] = ()
 
 

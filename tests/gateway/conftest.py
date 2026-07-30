@@ -114,6 +114,21 @@ def rds(sink: CaptureSink):
 
 
 @pytest.fixture
+def awslambda(sink: CaptureSink):
+    # `lambda` is a Python keyword, so the fixture cannot be named after the
+    # service the way every other one here is.
+    return _client(sink, "lambda")
+
+
+@pytest.fixture
+def events(sink: CaptureSink):
+    # EventBridge. botocore names the service model `events`, which is also its
+    # SigV4 credential scope (and so `classify()`'s `service`) -- unlike elbv2
+    # below, the two agree here.
+    return _client(sink, "events")
+
+
+@pytest.fixture
 def elbv2(sink: CaptureSink):
     # botocore names the service model `elbv2`; its SigV4 credential scope (and
     # so `classify()`'s `service`) is `elasticloadbalancing`.

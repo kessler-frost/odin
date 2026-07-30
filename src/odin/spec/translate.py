@@ -223,18 +223,46 @@ def _resource(node: dict) -> ResourceDesired | None:
     )
 
 
-def _edge(e: dict, labels: dict[str, str]) -> Edge:
+def _edges(e: dict, labels: dict[str, str]) -> tuple[Edge, ...]:
     # The UI stores access metadata under `data` (Canvas.tsx): `permissions` +
-    # `edgeType` ("iam" | "network"). Thread both through so the Brain's IAM
-    # review sees real grants. (Data-flow ${{node.attr}} refs are NOT edges —
+    # `edgeType`, one of `EDGE_KINDS` above. Thread both through so the Brain's
+    # IAM review sees real grants. (Data-flow ${{node.attr}} refs are NOT edges —
     # they're lifted into ResourceDesired.refs above.)
     # Edge endpoints are ReactFlow node IDs but Stack resources are keyed by
     # LABEL — translate through `labels` (fall back for edges naming labels).
+    #
+    # An edge with no `edgeType` at all (a hand-authored canvas) falls to
+    # `UNMODELLED`, matching what the UI now stores for the same pair. The kind
+    # written here is NOT read back by any builder -- `agent/hcl.py`'s ALB and
+    # subscription passes key on the two NODE kinds -- so changing the word
+    # cannot change what gets built, only what the canvas says it is.
+    #
+    # ONE CANVAS EDGE CAN CARRY MORE THAN ONE MEANING (v0.8.15). A pair like
+    # rds/ecs means both `connection` and `iam`, and in AWS both readings are
+    # simultaneously true, so the picker in `ConfigPanel.tsx` is multi-select and
+    # stores its answer as a `+`-joined set in the same `edgeType` string.
+    # It is split back into one `Edge` per meaning HERE, and that is the point:
+    # every Python consumer downstream matches a SINGLE kind
+    # (`gateway/policy.py::compile_policies` and `agent/hcl.py::_granted_ids`
+    # both gate on `kind == "iam"`), so a joined string reaching them would have
+    # dropped the grant silently. Splitting at the boundary means none of them
+    # changed at all.
+    #
+    # A one-meaning edge -- every canvas ever saved -- takes the identical path
+    # it always did and produces the identical `Edge`, because a string with no
+    # separator in it splits into itself.
     data = e.get("data") or {}
     perms = tuple(data.get("permissions") or ())
-    kind = data.get("edgeType") or ("iam" if perms else "network")
+    stored = str(data.get("edgeType") or "") or ("iam" if perms else UNMODELLED)
+    kinds = [k for k in (part.strip() for part in stored.split(EDGE_KIND_SEPARATOR)) if k] or [UNMODELLED]
     src, dst = e.get("source", ""), e.get("target", "")
-    return Edge(src=labels.get(src, src), dst=labels.get(dst, dst), kind=kind, perms=perms)
+    src, dst = labels.get(src, src), labels.get(dst, dst)
+    # `perms` rides on EVERY part rather than only the `iam` one, deliberately:
+    # for the single-meaning case that keeps the produced `Edge` byte-identical
+    # to what this function returned before, which is what makes a stored Stack
+    # revision's content hash stable across this change. Only the `iam` edge's
+    # `perms` is ever read.
+    return tuple(Edge(src=src, dst=dst, kind=kind, perms=perms) for kind in dict.fromkeys(kinds))
 
 
 def skipped_node_types(canvas: dict) -> list[str]:
@@ -281,6 +309,23 @@ def drawn_node_types(canvas: dict) -> dict[str, str]:
 
 
 
+# --- edge kinds --------------------------------------------------------------
+#
+# `Edge.kind` is a free `str` (spec/models.py), which is what lets every canvas
+# ever saved keep parsing -- including the ones carrying the pre-rename catch-all
+# `"network"`. The cost of a free string is that a typo round-trips through the
+# store and through Apply looking real, so the set below is the ONE place Python
+# knows which kinds exist, and `agent/chat.py` validates against it.
+#
+# Being in this set does NOT mean a builder gates on it. Two consumers -- the
+# subscription pass in `agent/hcl.py` and `reconcile/reconciler.py::
+# _desired_subs` -- key on the two NODE kinds and never read `edge.kind`, and
+# they must keep doing so: every saved canvas types an sns->sqs edge `network`,
+# so requiring `kind == "subscription"` without a migration in the same commit
+# would drop the subscription from the generated HCL for all of them and `tofu`
+# would DESTROY the live subscription on the next apply. The reconciler would
+# not catch it either -- `_desired_subs` only ever ADDS a missing subscription.
+
 # The edge kind that means "this security group gates this resource".
 #
 # Membership is a RELATIONSHIP, not ownership: containment already supplies an
@@ -289,6 +334,40 @@ def drawn_node_types(canvas: dict) -> dict[str, str]:
 # cannot express it. Before this it could only be typed into an ec2/rds node's
 # `securityGroups` text field, so the canvas could not show it at all.
 SG_MEMBERSHIP = "sg"
+
+# "This workload assumes this role" -- folded into the `role` FIELD below.
+ROLE_ASSUMPTION = "role"
+
+# "This load balancer fronts that service" and "this topic fans out to that
+# queue". Both are PRESENTATIONAL today (see the note above): they name what the
+# user drew, and the passes that build them read the node kinds instead.
+ALB_TARGET = "target"
+SNS_SUBSCRIPTION = "subscription"
+
+# "This workload's environment is wired to that producer's endpoint" -- folded
+# into the consumer's `refs` by `_merge_connection_edges` below.
+CONNECTION = "connection"
+
+# One canvas edge, more than one meaning. `data.edgeType` holds a `+`-joined SET
+# in registry order (`ui/src/lib/iam.ts::serializeEdgeTypes`) and `_edges` splits
+# it into one `Edge` per meaning, so `Edge.kind` is always exactly one kind and
+# every consumer keeps matching on one. A single meaning has no separator in it
+# and round-trips unchanged, which is why this needed no migration.
+EDGE_KIND_SEPARATOR = "+"
+
+# The catch-all: odin has no model for this pair of kinds, so the edge is stored
+# and nothing reads it. Measured before the rename, `"network"` was the answer
+# for 341 of the 378 unordered kind pairs and meant exactly this for 340 of them.
+UNMODELLED = "unmodelled"
+
+# The pre-rename catch-all. Every canvas saved before `UNMODELLED` existed
+# carries it, and `Edge.kind`'s own default is `"ref"`, so both stay valid.
+LEGACY_UNMODELLED = "network"
+
+EDGE_KINDS = frozenset({
+    "iam", SG_MEMBERSHIP, ROLE_ASSUMPTION, ALB_TARGET, SNS_SUBSCRIPTION,
+    CONNECTION, UNMODELLED, LEGACY_UNMODELLED, "ref",
+})
 
 # Kinds whose HCL reads `securityGroups` (`agent/hcl.py::_security_group_refs`,
 # used by `_ec2` and `_rds`). An SG edge to anything else is left alone rather
@@ -343,9 +422,282 @@ def _merge_sg_edges(
     return tuple(merged)
 
 
+# Kinds whose HCL reads a `role` field (`agent/hcl.py::_lambda`). ec2 and ecs
+# reach a role through an auto-generated role plus an instance profile /
+# `task_role_arn` and read no `role` field at all, so a role edge drawn to them
+# is deliberately NOT registered on the canvas (`ui/src/lib/iam.ts`) and never
+# authored here -- the same rule `_SG_MEMBERS` holds. Writing a field nothing
+# reads is the drawn-line-that-does-nothing bug this whole edge type exists to
+# fix. See docs/limits.md for what it would take to honour those two.
+_ROLE_HOLDERS = frozenset({"lambda"})
+
+
+def _merge_role_edges(
+    resources: tuple[ResourceDesired, ...], edges: tuple[Edge, ...],
+) -> tuple[ResourceDesired, ...]:
+    """Fold role edges into each holder's `role` field.
+
+    Before this, `iam_role` was not registered as an edge target at all (it
+    declares no `iamActions`, correctly -- a role is not an IAM data-plane
+    target), so an `iam_role -> lambda` edge fell through to the catch-all,
+    was stored in the Stack, survived every revision, and was read by NOTHING.
+    Draw `admin-role -> my-lambda` while the lambda's `role` field says
+    `other-role` and you got a dead edge, `other-role` in the generated file,
+    and `other-role`'s statements enforced by the gateway: the canvas saying one
+    thing and the gateway doing another, silently and permanently.
+
+    Folding into the field the builder ALREADY reads is what makes the edge take
+    effect with no change to `agent/hcl.py` at all -- `_lambda` still reads one
+    `role` field and cannot tell how a name got there. Same technique as
+    `_merge_sg_edges`, and direction is not significant for the same reason.
+
+    A HAND-TYPED value wins. `odin canvas set`, the README's JSON schema and the
+    translation agent all write the field directly, and an edge must not
+    silently overwrite something a user typed -- unlike `securityGroups`, a role
+    is single-valued, so "add to it" is not available as an answer here.
+
+    Two DIFFERENT roles edged to one lambda is a contradiction the canvas can
+    express and odin cannot resolve; the lowest name wins, deterministically, so
+    the generated file never depends on edge ordering. That is better than the
+    old behaviour (both edges did nothing) and still not right -- it is recorded
+    as an open limit in docs/limits.md rather than presented as a decision.
+    """
+    by_id = {r.id: r for r in resources}
+    edged: dict[str, list[str]] = {}
+    for edge in edges:
+        if edge.kind != ROLE_ASSUMPTION:
+            continue
+        for role, holder in ((edge.src, edge.dst), (edge.dst, edge.src)):
+            role_res, holder_res = by_id.get(role), by_id.get(holder)
+            if role_res is None or holder_res is None:
+                continue
+            if role_res.kind == "iam_role" and holder_res.kind in _ROLE_HOLDERS:
+                edged.setdefault(holder, []).append(role)
+
+    if not edged:
+        return resources
+    merged = []
+    for res in resources:
+        roles = edged.get(res.id)
+        typed = str(res.fields.get("role", FieldValue(value="")).value).strip()
+        if not roles or typed:
+            merged.append(res)
+            continue
+        fields = {**res.fields, "role": FieldValue(value=sorted(roles)[0], provenance="user")}
+        merged.append(res.model_copy(update={"fields": fields}))
+    return tuple(merged)
+
+
+# --- the connection edge -----------------------------------------------------
+#
+# PRODUCER kind -> (env var, the fact to read off it). Both kinds are in
+# `spec/models.py::REFERENCEABLE_KINDS`, so `agent/hcl.py::_ref_fault` already
+# accepts a ref to them and emits the `depends_on` that orders the producer
+# before the consumer -- this authors an ordinary ref and nothing else.
+#
+# The PLAIN attribute, never the `_VM` one: the two consumers below are both
+# containers (`CONTAINER_HOST`), and `DATABASE_URL_VM`/`REDIS_URL_VM` name the
+# same port under `host.lima.internal`, which is the address an EC2 Lima VM
+# needs. See docs/limits.md for `DATABASE_URL_MESH`, the only SG-gated form,
+# which is deliberately not the default because it exists only when a VPC is
+# drawn.
+_CONNECTION_REFS: dict[str, tuple[str, str]] = {
+    "rds": ("DATABASE_URL", "DATABASE_URL"),
+    "elasticache": ("REDIS_URL", "REDIS_URL"),
+}
+
+# CONSUMER kinds: exactly the kinds whose real container is launched with the
+# node's `env` map, which is `gateway/wiring.py::node_env`'s caller list --
+# `gateway/models/ecsctl.py` and `gateway/models/lambdactl.py`, and nothing else.
+# `gateway/models/ec2compute.py` imports `workload_env` (the issued gateway
+# credentials) and never `node_env`, so a ref authored onto an ec2 node would
+# reach NOTHING. That is the drawn-line-that-does-nothing bug this edge exists to
+# fix, so ec2 is left out on the same rule `_SG_MEMBERS` and `_ROLE_HOLDERS`
+# hold, and recorded in docs/limits.md rather than quietly half-supported.
+_CONNECTION_CONSUMERS = frozenset({"ecs", "lambda"})
+
+
+def _ref_text(target_id: str, target_attr: str) -> str:
+    return "${{" + f"{target_id}.{target_attr}" + "}}"
+
+
+def _authored_vars(res: ResourceDesired) -> dict[str, str]:
+    """Every environment variable this resource ALREADY claims, and what it says
+    each one is: static `env` entries as their literal value, refs as the
+    `${{target.attr}}` text they were written as.
+
+    Both halves matter, because `_resource` has already split one authored `env`
+    map across two places by the time any merge runs."""
+    env = res.fields.get("env")
+    static = env.value if env is not None and isinstance(env.value, dict) else {}
+    return {
+        **{str(key): str(value) for key, value in static.items()},
+        **{ref.var: _ref_text(ref.target_id, ref.target_attr) for ref in res.refs},
+    }
+
+
+def _connection_wires(
+    resources: tuple[ResourceDesired, ...], edges: tuple[Edge, ...],
+) -> list[tuple[str, str, Ref]]:
+    """`(consumer id, producer id, the ref that edge asks for)`, in drawn order.
+
+    Direction is not significant, exactly as it isn't for `_merge_sg_edges` and
+    `_merge_role_edges`: an edge drawn db->service and one drawn service->db
+    express the same intent, and only one of the two orientations can ever match
+    (no producer kind is a consumer kind and vice versa)."""
+    by_id = {r.id: r for r in resources}
+    wires: list[tuple[str, str, Ref]] = []
+    for edge in edges:
+        if edge.kind != CONNECTION:
+            continue
+        for producer, consumer in ((edge.src, edge.dst), (edge.dst, edge.src)):
+            producer_res, consumer_res = by_id.get(producer), by_id.get(consumer)
+            if producer_res is None or consumer_res is None:
+                continue
+            wire = _CONNECTION_REFS.get(producer_res.kind)
+            if wire is None or consumer_res.kind not in _CONNECTION_CONSUMERS:
+                continue
+            var, attr = wire
+            wires.append((consumer, producer, Ref(var=var, target_id=producer, target_attr=attr)))
+    return wires
+
+
+def _merge_connection_edges(
+    resources: tuple[ResourceDesired, ...], edges: tuple[Edge, ...],
+) -> tuple[ResourceDesired, ...]:
+    """Fold connection edges into each consumer's `refs`.
+
+    The one genuine job of the most-drawn line in any architecture diagram.
+    Before this, `rds -> ecs` produced a cyan IAM edge whose default grant was
+    `rds-db:connect` -- an action `classify.py` can never emit, so the gateway
+    never evaluated it -- while the thing the user meant, `DATABASE_URL`, still
+    had to be typed by hand into the consumer's env field. Three mechanisms wear
+    the word "connection": reachability (the `sg` edge, real), permission (the
+    `iam` edge, real where the data plane is AWS-signed) and the ADDRESS. Only
+    the address had no gesture, and this is it.
+
+    Folding into `refs` -- the thing `gateway/wiring.py::node_env` already
+    resolves and injects at container launch -- is what makes the edge take
+    effect with no change to any builder, the same technique `_merge_sg_edges`
+    and `_merge_role_edges` use for `securityGroups` and `role`.
+
+    A HAND-TYPED value wins, and silently doing nothing is NOT how that is
+    reported: `connection_conflicts` names every var where the two disagree, and
+    `/apply-full` refuses on it. A field is a legitimate authoring surface
+    (`odin canvas set`, the README's JSON schema, the translation agent), so an
+    edge must not become a second source of truth beside it -- but a drawn line
+    that quietly does nothing is the exact bug this edge type was created to fix,
+    so it cannot be the answer to the disagreement either.
+
+    Two producers of the same kind edged to one consumer is the other
+    disagreement (both want `DATABASE_URL`). The first drawn one is authored, so
+    the result never depends on which order the merge happened to see them, and
+    the second is reported the same way.
+    """
+    wires = _connection_wires(resources, edges)
+    if not wires:
+        return resources
+    authored: dict[str, dict[str, Ref]] = {}
+    for consumer, _producer, ref in wires:
+        authored.setdefault(consumer, {}).setdefault(ref.var, ref)
+    return tuple(
+        res.model_copy(update={"refs": (*res.refs, *added)})
+        if (added := [
+            ref for var, ref in authored.get(res.id, {}).items()
+            if var not in _authored_vars(res)
+        ]) else res
+        for res in resources
+    )
+
+
+def connection_conflicts(stack: Stack) -> list[str]:
+    """Every connection edge whose variable the consumer already claims as
+    something else -- one human sentence each, for `wiring_errors`.
+
+    Computed on the MERGED Stack and therefore idempotent: a ref this translator
+    authored now agrees with the edge that asked for it, so it reports nothing,
+    while a genuine disagreement survives the merge and keeps reporting. That
+    matters because `/apply-full` re-derives the Stack from the canvas on every
+    call.
+
+    Reported through `wiring_errors` rather than `unsupported` for the reason
+    `agent/hcl.py::_ref_fault` spells out at length: `unsupported` is the
+    COVERAGE field a CI gate reads, and a canvas that wires two things to one
+    variable is a user error on nodes odin supports perfectly well.
+
+    It is FATAL at `/apply-full` (`server.py::_wiring_rejection` refuses the
+    whole apply), which is the honest consequence rather than a harsher one:
+    odin cannot tell which of the two answers the user meant, and applying the
+    canvas would hand the workload one of them while the screen showed both.
+    """
+    conflicts = []
+    for consumer, producer, ref in _connection_wires(stack.resources, stack.edges):
+        res = next(r for r in stack.resources if r.id == consumer)
+        claimed = _authored_vars(res).get(ref.var)
+        wanted = _ref_text(ref.target_id, ref.target_attr)
+        if claimed is None or claimed == wanted:
+            continue
+        conflicts.append(
+            f"{consumer} ({res.kind}): the connection edge from {producer!r} would set "
+            f"{ref.var}={wanted}, but {consumer!r} already sets {ref.var}={claimed}. odin cannot "
+            f"tell which one you meant, so it changed nothing: delete the edge, or clear "
+            f"{ref.var} on {consumer!r} and let the edge author it"
+        )
+    return conflicts
+
+
+def _orient_subscription_edges(
+    resources: tuple[ResourceDesired, ...], edges: tuple[Edge, ...],
+) -> tuple[Edge, ...]:
+    """Point every sns/sqs edge topic -> queue, whichever way it was drawn.
+
+    A subscription has exactly one possible direction: a topic fans out to a
+    queue, never the reverse. Both consumers nevertheless key on the DRAWN
+    direction -- `agent/hcl.py`'s subscription pass reads `edge.src` as the
+    topic, and `reconcile/reconciler.py::_desired_subs` filters on
+    `e.src == sns_id` -- so drawing the edge queue -> topic gave a grey line, a
+    green Apply, no subscription, and no entry in `unsupported` or
+    `wiring_errors`. A silent no-op, with no test in either direction. Three
+    hundred lines earlier hcl.py's ALB pass already accepts both orderings
+    "since which end the user started from carries no meaning"; the same
+    reasoning had never been applied here.
+
+    Normalising in the SPEC rather than teaching either consumer to look at
+    `edge.kind` is the deliberate choice. Every canvas saved before edge types
+    were named carries `kind="network"` on this edge and works anyway, precisely
+    because both consumers ignore the kind; a builder that started requiring
+    `kind == "subscription"` would drop the subscription from the generated HCL
+    for all of them, and `tofu` would DESTROY the live subscription on the next
+    apply while the reconciler stayed quiet (`_desired_subs` only ever ADDS).
+    Flipping src/dst leaves that path exactly as it is and fixes both consumers
+    at once.
+
+    `iam` edges are left alone: `hcl.py::_granted_ids` and
+    `gateway/policy.py::compile_policies` both read `edge.src` as the PRINCIPAL,
+    so flipping one would move a grant to a different node.
+    """
+    by_id = {r.id: r for r in resources}
+    reversed_ids = {
+        (edge.src, edge.dst) for edge in edges
+        if edge.kind != "iam"
+        and getattr(by_id.get(edge.src), "kind", None) == "sqs"
+        and getattr(by_id.get(edge.dst), "kind", None) == "sns"
+    }
+    return tuple(
+        edge.model_copy(update={"src": edge.dst, "dst": edge.src})
+        if (edge.src, edge.dst) in reversed_ids else edge
+        for edge in edges
+    )
+
+
 def canvas_to_stack(canvas: dict, env: str = "default") -> Stack:
     nodes = canvas.get("nodes") or []
     labels = {n["id"]: _node_id(n) for n in nodes if n.get("id")}
     resources = tuple(r for n in nodes if (r := _resource(n)) is not None)
-    edges = tuple(_edge(e, labels) for e in (canvas.get("edges") or []))
-    return Stack(env=env, resources=_merge_sg_edges(resources, edges), edges=edges)
+    edges = _orient_subscription_edges(
+        resources, tuple(edge for e in (canvas.get("edges") or []) for edge in _edges(e, labels)),
+    )
+    resources = _merge_connection_edges(
+        _merge_role_edges(_merge_sg_edges(resources, edges), edges), edges,
+    )
+    return Stack(env=env, resources=resources, edges=edges)

@@ -94,7 +94,7 @@ async def test_get_caller_identity_account_matches_the_account_inside_a_returned
     synth.postprocess(
         "sqs:CreateQueue", "jobs", env, create_req.body,
         b'{"QueueUrl": "http://us-east-1.goaws.com:4100/000000000000/jobs"}',
-        stores, "127.0.0.1:4266", 0.0,
+        stores, "127.0.0.1:4266", 0.0, "", {},
     )
     get_req = sink.call(
         lambda: sqs.get_queue_attributes(
@@ -161,7 +161,7 @@ async def test_sqs_get_queue_attributes_echoes_created_attributes(sink, sqs, sto
         lambda: sqs.create_queue(QueueName="jobs", Attributes={"DelaySeconds": "5"}, tags={"env": "prod"})
     )
     fake_goaws_response = b'{"QueueUrl": "http://us-east-1.goaws.com:4100/000000000000/jobs"}'
-    synth.postprocess("sqs:CreateQueue", "jobs", "default", create_req.body, fake_goaws_response, stores, "127.0.0.1:4266", 0.0)
+    synth.postprocess("sqs:CreateQueue", "jobs", "default", create_req.body, fake_goaws_response, stores, "127.0.0.1:4266", 0.0, "", {})
 
     get_req = sink.call(
         lambda: sqs.get_queue_attributes(QueueUrl=f"{sink.endpoint}/000000000000/jobs", AttributeNames=["All"])
@@ -220,14 +220,14 @@ async def test_sqs_get_queue_attributes_returns_queue_does_not_exist_past_grace_
 def test_sqs_delete_queue_then_recreate_clears_deleted_marker(sink, sqs, stores):
     create_req = sink.call(lambda: sqs.create_queue(QueueName="jobs"))
     fake_response = b'{"QueueUrl": "http://us-east-1.goaws.com:4100/000000000000/jobs"}'
-    synth.postprocess("sqs:CreateQueue", "jobs", "default", create_req.body, fake_response, stores, "127.0.0.1:4266", 0.0)
+    synth.postprocess("sqs:CreateQueue", "jobs", "default", create_req.body, fake_response, stores, "127.0.0.1:4266", 0.0, "", {})
 
     delete_req = sink.call(lambda: sqs.delete_queue(QueueUrl=f"{sink.endpoint}/000000000000/jobs"))
-    synth.postprocess("sqs:DeleteQueue", "jobs", "default", delete_req.body, b"{}", stores, "127.0.0.1:4266", 10.0)
+    synth.postprocess("sqs:DeleteQueue", "jobs", "default", delete_req.body, b"{}", stores, "127.0.0.1:4266", 10.0, "", {})
     assert stores.sqs_queues.get("default", "jobs")["deleted_at"] == 10.0
 
     recreate_req = sink.call(lambda: sqs.create_queue(QueueName="jobs"))
-    synth.postprocess("sqs:CreateQueue", "jobs", "default", recreate_req.body, fake_response, stores, "127.0.0.1:4266", 20.0)
+    synth.postprocess("sqs:CreateQueue", "jobs", "default", recreate_req.body, fake_response, stores, "127.0.0.1:4266", 20.0, "", {})
     assert stores.sqs_queues.get("default", "jobs")["deleted_at"] is None
 
 
@@ -239,7 +239,7 @@ def test_create_queue_rewrites_goaws_host_to_gateway_host(sink, sqs, stores):
     fake_goaws_response = b'{"QueueUrl": "http://us-east-1.goaws.com:4100/000000000000/jobs"}'
 
     rewritten = synth.postprocess(
-        "sqs:CreateQueue", "jobs", "default", create_req.body, fake_goaws_response, stores, "127.0.0.1:4266", 0.0
+        "sqs:CreateQueue", "jobs", "default", create_req.body, fake_goaws_response, stores, "127.0.0.1:4266", 0.0, "", {}
     )
 
     payload = json.loads(rewritten)
@@ -252,7 +252,7 @@ def test_create_queue_response_still_parses_after_rewrite(sink, sqs, stores):
     create_req = sink.call(lambda: sqs.create_queue(QueueName="jobs"))
     fake_goaws_response = b'{"QueueUrl": "http://us-east-1.goaws.com:4100/000000000000/jobs"}'
     rewritten = synth.postprocess(
-        "sqs:CreateQueue", "jobs", "default", create_req.body, fake_goaws_response, stores, "127.0.0.1:4266", 0.0
+        "sqs:CreateQueue", "jobs", "default", create_req.body, fake_goaws_response, stores, "127.0.0.1:4266", 0.0, "", {}
     )
     parsed = _parse("sqs", "CreateQueue", Response(rewritten, media_type="application/x-amz-json-1.0"))
     assert parsed["QueueUrl"] == "http://127.0.0.1:4266/000000000000/jobs"
@@ -298,7 +298,7 @@ def test_sns_create_topic_seeds_attributes_and_tags(sink, sns, stores):
         b"<CreateTopicResult><TopicArn>arn:aws:sns:us-east-1:000000000000:alerts</TopicArn></CreateTopicResult>"
         b"<ResponseMetadata><RequestId>r</RequestId></ResponseMetadata></CreateTopicResponse>"
     )
-    unchanged = synth.postprocess("sns:CreateTopic", "alerts", "default", create_req.body, fake_response, stores, "127.0.0.1:4266", 0.0)
+    unchanged = synth.postprocess("sns:CreateTopic", "alerts", "default", create_req.body, fake_response, stores, "127.0.0.1:4266", 0.0, "", {})
     assert unchanged == fake_response  # CreateTopic doesn't need a host rewrite
 
     assert stores.sns_topics.get("default", "alerts") == {"DisplayName": "Alerts"}
@@ -355,7 +355,7 @@ async def test_sns_unsubscribe_then_get_subscription_attributes_returns_not_foun
     unsub_req = sink.call(
         lambda: sns.unsubscribe(SubscriptionArn="arn:aws:sns:us-east-1:000000000000:alerts:sub-uuid-1")
     )
-    synth.postprocess("sns:Unsubscribe", "alerts", "default", unsub_req.body, b"", stores, "127.0.0.1:4266", 5.0)
+    synth.postprocess("sns:Unsubscribe", "alerts", "default", unsub_req.body, b"", stores, "127.0.0.1:4266", 5.0, "", {})
 
     get_req = sink.call(
         lambda: sns.get_subscription_attributes(
@@ -374,7 +374,7 @@ async def test_sns_unsubscribe_marker_is_keyed_by_subscription_not_topic(sink, s
     unsub_req = sink.call(
         lambda: sns.unsubscribe(SubscriptionArn="arn:aws:sns:us-east-1:000000000000:alerts:sub-uuid-1")
     )
-    synth.postprocess("sns:Unsubscribe", "alerts", "default", unsub_req.body, b"", stores, "127.0.0.1:4266", 0.0)
+    synth.postprocess("sns:Unsubscribe", "alerts", "default", unsub_req.body, b"", stores, "127.0.0.1:4266", 0.0, "", {})
 
     other_req = sink.call(
         lambda: sns.get_subscription_attributes(
@@ -438,7 +438,7 @@ def test_dynamodb_create_table_seeds_tags_closing_the_documented_drift(sink, dyn
         )
     )
     unchanged = synth.postprocess(
-        "dynamodb:CreateTable", "orders", "default", create_req.body, b'{"TableDescription": {}}', stores, "127.0.0.1:4266", 0.0
+        "dynamodb:CreateTable", "orders", "default", create_req.body, b'{"TableDescription": {}}', stores, "127.0.0.1:4266", 0.0, "", {}
     )
     assert unchanged == b'{"TableDescription": {}}'
     assert stores.tags.get("default", "dynamodb:orders") == {"env": "prod"}
@@ -474,7 +474,7 @@ def test_postprocess_strips_the_null_placeholder_entries_goaws_sends():
         b"</GetSubscriptionAttributesResult></GetSubscriptionAttributesResponse>"
     )
     fixed = synth.postprocess(
-        "sns:GetSubscriptionAttributes", "alerts", "default", b"", goaws_body, None, "127.0.0.1:4266", 0.0,
+        "sns:GetSubscriptionAttributes", "alerts", "default", b"", goaws_body, None, "127.0.0.1:4266", 0.0, "", {},
     )
     assert b"<key>FilterPolicy</key>" not in fixed
     assert b"<key>RawMessageDelivery</key><value>true</value>" in fixed  # a real value is untouched
@@ -483,6 +483,6 @@ def test_postprocess_strips_the_null_placeholder_entries_goaws_sends():
 def test_postprocess_is_a_noop_when_no_null_placeholders_are_present():
     goaws_body = b"<Attributes><entry><key>RawMessageDelivery</key><value>true</value></entry></Attributes>"
     fixed = synth.postprocess(
-        "sns:GetSubscriptionAttributes", "alerts", "default", b"", goaws_body, None, "127.0.0.1:4266", 0.0,
+        "sns:GetSubscriptionAttributes", "alerts", "default", b"", goaws_body, None, "127.0.0.1:4266", 0.0, "", {},
     )
     assert fixed == goaws_body

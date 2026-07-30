@@ -71,7 +71,7 @@ jobs:
       # needs it on PATH.
 
   frontend:
-    name: Frontend (typecheck + build)
+    name: Frontend (typecheck + test + build)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -83,5 +83,13 @@ jobs:
         run: bun install
       - name: Typecheck
         run: bunx tsc --noEmit
+      # The UI suite ran nowhere but a developer's laptop until 2026-07-28: this
+      # job typechecked and built, so 103 passing tests -- including the
+      # edge-type ambiguity ratchet everything about canvas edges rests on --
+      # could have gone red for weeks without anything saying so. A guard that
+      # does not run where it matters is the repo's honesty rule 1 in its own
+      # pipeline.
+      - name: Test
+        run: bun test
       - name: Build
         run: bun run build

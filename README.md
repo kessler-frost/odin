@@ -22,7 +22,7 @@ call sits anywhere in that path.
 ## Contents
 
 [Install](#install) · [What you can do](#what-you-can-do) · [Apply](#apply) ·
-[Edges are IAM](#edges-are-iam) · [Terminal](#driving-it-from-a-terminal) ·
+[What an edge means](#what-an-edge-means) · [Terminal](#driving-it-from-a-terminal) ·
 [AI](#ai-two-features-one-switch) · [How it works](#how-it-works) ·
 [Known limits](#known-limits) · [Security](#security) ·
 [Contributing](#contributing) · [Where it's going](#where-its-going)
@@ -101,6 +101,7 @@ Drag any of these onto the canvas, wire them up, and press Apply:
 | **EC2** | A Lima VM, joined to the environment's Nebula mesh |
 | **VPC / Subnet / SG** | Nebula networks and compiled firewall rules |
 | **IAM role, ECR, Secrets, SSM, CloudWatch Logs, ALB** | Gateway-backed AWS APIs |
+| **Event triggers** | A schedule, a queue, or a bucket write really invokes a Lambda |
 
 Geometry carries meaning. A node drawn inside a VPC or Subnet box belongs to it,
 which compiles to `vpc_id` and `subnet_id`, and an ECS box drawn inside an EC2 box
@@ -109,7 +110,8 @@ ALB becomes a load balancer plus a target group plus a listener, and a Lambda
 drawn without a role gets one generated for it.
 
 Environments are independent. `--env staging` and `--env prod` keep separate
-canvases, containers and state.
+canvases, containers and state. `odin envs` lists them, and `odin env rm <name>`
+decommissions one — teardown, then the environment itself.
 
 ## Apply
 
@@ -121,33 +123,63 @@ output names which one and why.
 ```bash
 odin apply --env prod
 odin world --env prod          # one line per resource, with its live facts
-odin destroy --env prod
+odin destroy --env prod        # tear the resources down, keep the environment
+odin env rm prod               # ...and remove the environment itself
 ```
+
+`odin destroy` and `odin env rm` are different verbs. Destroy keeps the
+environment on purpose: its desired state is what makes a retry possible and its
+reconciler is what converges the next apply. `env rm` is the decommission — the
+same teardown, then the `.odin/prod/` directory, the gateway credentials it
+issued, its synthesized control-plane records, its reconciler, and its entry in
+`odin envs`. It is not undoable (`odin export --env prod` first if you might want
+it back), and it exits non-zero, having deleted nothing, if the environment is
+not actually gone.
 
 If a container is killed or removed out of band, the next apply rebuilds it and
 tells you what that cost:
 
 ```
 note: desired state applied; rds app-db was re-created because container
-odin-rds-prod-app-db is not running (exit 137) (its data did not survive —
-the container is new and empty)
+odin-rds-prod-app-db is not running (exit 137) (its data survived — the
+container is new, the volume holding the database is not)
 ```
 
-## Edges are IAM
+Each RDS instance keeps its data on a named Docker volume, so a repair replaces
+the container and not the database. Odin checks that volume before it says so,
+and says the opposite when it is gone.
 
-An edge from a workload to a resource is a permission. Draw one, pick the actions,
+## What an edge means
+
+An edge from a workload to a resource is usually a permission. Draw one, pick the actions,
 and the gateway compiles them into policy it checks on every request. A call with
 no matching grant gets `AccessDenied`.
 
 The edge type comes from what you connected: `lambda → dynamodb` is an IAM grant
 with sensible defaults, `sg → ec2` is group membership, `ec2 → subnet` is
-containment. Across the whole catalog no pair is ambiguous, so odin never guesses.
+containment.
+
+Eight of the lines you can draw mean two things at once: `rds` or `elasticache`
+against `ecs` or `lambda`, in either direction. The workload needs the producer's
+address, and it may also need a grant on it — in AWS both readings are true at the
+same time. Odin does not choose between them for you: the picker lists both and
+you tick the ones you mean, so one line can carry both. Ticking the connection on
+`rds → ecs` writes `DATABASE_URL` into the service's environment, resolved to the
+real endpoint when the container starts.
+
+Two more lines decide something besides access. A Log Group drawn to a workload
+becomes the group its output really lands in, rather than a second empty group
+beside the one the runtime writes to. An ECR repository drawn to an ECS service
+becomes that service's image, resolved to the registry address odin published. In
+both cases the permission alone used to be the whole of it, which meant the line
+looked like it wired the thing it granted access to and did not.
 
 A drawn permission is emitted as a real `aws_iam_role_policy` on the workload's
-role, so it survives into the Terraform and back out of it. One caveat if you take
-the HCL to Amazon: the policy's `Resource` is odin's node label, which is what the
-gateway matches on, where AWS expects an ARN. `odin translate` says so per policy
-on stderr.
+role, naming a real ARN — `arn:aws:s3:::uploads` and `arn:aws:s3:::uploads/*` for
+a bucket grant — so the file means the same thing on Amazon as it does here. The
+gateway matches either form: it reports odin's node label for a request and
+reduces the ARN back to it, which is what keeps a permission enforced locally and
+portable at the same time.
 
 ## Driving it from a terminal
 
@@ -318,11 +350,15 @@ The ones most likely to matter:
 - **An emitted IAM policy names resources by label, not ARN.** It round-trips
   through odin perfectly; taken to Amazon each policy needs its `Resource`
   rewritten as an ARN.
-- **An RDS container keeps no volume**, so anything that replaces it comes back
-  empty. Odin's own repair says so in the apply output.
+- **An RDS instance has no snapshots and no backups.** Its data survives a
+  container replacement (a named volume), and `odin destroy` deletes it along
+  with the volume — there is nothing to restore from afterwards.
 - **Import is narrower in `--live` mode**, and a live-imported RDS arrives with
   odin's default password, because no AWS API returns one.
-- **Lambda is inline code only**, one version, with no S3-deployed packages.
+- **Lambda dependencies are vendored only.** A function can be a whole directory
+  (`sourceDir`), so it can import its own modules and carry whatever you have
+  installed into that directory — but odin never runs a package manager and
+  fetches nothing at apply time. One version, no S3-deployed packages.
 - **Nebula is single-host.** The mesh, firewall and per-VM daemons work; a second
   machine joining the same environment is still to come.
 
