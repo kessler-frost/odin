@@ -373,6 +373,24 @@ def _torn_down(client, env: str):
         capture_output=True, text=True, check=False,
     ).stdout.split()
     assert survivors == [], f"{env} left {len(survivors)} containers standing"
+
+    # And the VOLUMES, which the first version of this teardown missed -- it
+    # reclaimed the containers and leaked a Postgres data directory per rds node
+    # instead, growing once per run rather than staying at four. `aws/rds.py`'s
+    # own docstring predicts exactly this: a named volume is the one thing
+    # `docker rm -f -v` does NOT remove. Reaped by NAME rather than through
+    # `reclaim_env_volumes`, for the same reason the containers are: that seam
+    # takes a runtime, and the runtime this app was handed is a fake, which is
+    # the asymmetry that caused the leak in the first place.
+    subprocess.run(
+        f"docker volume ls -q --filter name=-{env}- | xargs -r docker volume rm",
+        shell=True, capture_output=True, check=False,
+    )
+    left = subprocess.run(
+        ["docker", "volume", "ls", "-q", "--filter", f"name=-{env}-"],
+        capture_output=True, text=True, check=False,
+    ).stdout.split()
+    assert left == [], f"{env} left {len(left)} volumes standing: {left}"
     return resp.json()
 
 
