@@ -123,9 +123,22 @@ async def test_disk_low_fails(monkeypatch):
     assert "free up disk space" in disk.fix
 
 
+async def test_a_low_disk_points_at_odins_own_biggest_reclaimable(monkeypatch):
+    """The DISCOVERY half of the volume reclaim. An rds instance's data lives on
+    a named Docker volume that outlives its container by design, so odin can be
+    holding gigabytes a user has no idea about — and `odin volumes` is a command
+    nobody finds unless something points at it. This row is where a user short on
+    disk actually looks."""
+    patch_disk(monkeypatch, free_bytes=5 * GIB)
+    disk = by_name(await run_checks(["disk"], make_run(), disk_path=Path.cwd()))["disk"]
+    assert "`odin volumes`" in disk.fix
+    assert "orphaned" in disk.fix
+
+
 async def test_disk_headroom_ok(monkeypatch):
     patch_disk(monkeypatch, free_bytes=50 * GIB)
     disk = by_name(await run_checks(["disk"], make_run(), disk_path=Path.cwd()))["disk"]
+    # The row is a check, not an advert: an ok disk suggests nothing at all.
     assert (disk.status, disk.fix) == ("ok", "")
 
 

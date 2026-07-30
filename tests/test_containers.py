@@ -85,7 +85,10 @@ class FakeVolumeRuntime(FakeRuntime):
         super().__init__()
         self._volumes = list(names)
 
-    async def volume_names(self) -> list[str]:
+    async def volume_names(self, env: str | None = None) -> list[str]:
+        # `own_volumes` scopes by odin's volume NAMING (the same infix rule it
+        # uses for containers) and asks for the full listing, so `env` is
+        # accepted for signature parity and never exercised here.
         return list(self._volumes)
 
 

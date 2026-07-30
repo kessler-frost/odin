@@ -131,3 +131,109 @@ def test_removing_an_env_that_never_existed_exits_zero_and_creates_nothing(tmp_p
     assert result.exit_code == 0, result.output
     assert "status: not_found" in result.stdout
     assert not (tmp_path / "envrm-nope").exists()
+
+
+# --- the DISK, through the real CLI ---------------------------------------
+
+
+def test_the_cli_names_each_volume_it_reclaimed(tmp_path, monkeypatch, runner):
+    """A Postgres data directory is not small and nothing else on the machine
+    would ever say it went back. A reclaim the CLI does not print is
+    indistinguishable from one that had nothing to do."""
+    runtime = CleanRuntime()
+    runtime.seed_volume(f"odin-rds-{DROP}-app-db-data", DROP)
+    _app, client = _live(tmp_path, monkeypatch, runtime=runtime)
+    with client:
+        client.post(f"/apply?env={DROP}", json=S3_CANVAS)
+        result = runner.invoke(cli, ["env", "rm", DROP])
+
+    assert result.exit_code == 0, result.output
+    assert f"reclaimed volume odin-rds-{DROP}-app-db-data" in result.stdout
+    assert runtime.volumes == set()
+
+
+def test_a_volume_that_would_not_go_exits_one_and_names_it(tmp_path, monkeypatch, runner):
+    """Exit code, not just a body: `odin env rm` performs an action, so it
+    reports whether the end state HOLDS. A volume odin could not reclaim means it
+    does not — the disk leak is still there and the state directory was kept so a
+    retry is clean."""
+    runtime = CleanRuntime()
+    runtime.seed_volume(f"odin-rds-{DROP}-app-db-data", DROP)
+    runtime.refuse_volume(f"odin-rds-{DROP}-app-db-data")
+    _app, client = _live(tmp_path, monkeypatch, runtime=runtime)
+    with client:
+        client.post(f"/apply?env={DROP}", json=S3_CANVAS)
+        result = runner.invoke(cli, ["env", "rm", DROP])
+
+        assert result.exit_code == 1, result.output
+        assert "was NOT removed" in result.stderr
+        assert "could not reclaim the Docker volume" in result.stderr
+        assert (tmp_path / DROP / "HEAD").exists()
+        assert DROP in client.get("/envs").json()["envs"]
+    assert runtime.volumes == {f"odin-rds-{DROP}-app-db-data"}
+
+
+def test_odin_volumes_lists_orphans_and_the_command_that_reclaims_them(tmp_path, monkeypatch, runner):
+    """`odin volumes` is the discovery surface for the disk an rds instance's
+    named volume holds — the thing that previously required a hand-run
+    `docker volume ls`."""
+    runtime = CleanRuntime()
+    runtime.seed_volume(f"odin-rds-{KEEP}-app-db-data", KEEP)
+    runtime.seed_volume("odin-rds-envrm-ghost-app-db-data", "envrm-ghost")
+    _app, client = _live(tmp_path, monkeypatch, runtime=runtime)
+    with client:
+        client.post(f"/apply?env={KEEP}", json=S3_CANVAS)
+        listed = runner.invoke(cli, ["volumes"])
+
+        assert listed.exit_code == 0, listed.output
+        assert "env envrm-ghost" in listed.stdout
+        assert "ORPHAN — reclaim with: odin env rm envrm-ghost" in listed.stdout
+        # The live env's row says in-use and offers no command at all.
+        assert f"odin-rds-{KEEP}-app-db-data" in listed.stdout
+        assert f"reclaim with: odin env rm {KEEP}" not in listed.stdout
+        assert "1 of 2 volume(s) belong to no live environment." in listed.stdout
+
+        # ...and the offered command really works, end to end through the CLI.
+        assert runner.invoke(cli, ["env", "rm", "envrm-ghost"]).exit_code == 0
+        assert "0 of 1 volume(s)" in runner.invoke(cli, ["volumes"]).stdout
+
+    assert runtime.volumes == {f"odin-rds-{KEEP}-app-db-data"}
+
+
+def test_odin_volumes_prints_the_zero_rather_than_nothing(tmp_path, monkeypatch, runner):
+    """A command that prints nothing when there is nothing to reclaim leaves a
+    user unable to tell it from a command they misread. The count is the answer."""
+    runtime = CleanRuntime()
+    runtime.seed_volume(f"odin-rds-{KEEP}-app-db-data", KEEP)
+    _app, client = _live(tmp_path, monkeypatch, runtime=runtime)
+    with client:
+        client.post(f"/apply?env={KEEP}", json=S3_CANVAS)
+        listed = runner.invoke(cli, ["volumes"])
+
+    assert listed.exit_code == 0, listed.output
+    assert "0 of 1 volume(s) belong to no live environment." in listed.stdout
+
+
+def test_odin_volumes_on_an_empty_machine_says_so(tmp_path, monkeypatch, runner):
+    _app, client = _live(tmp_path, monkeypatch)
+    with client:
+        listed = runner.invoke(cli, ["volumes"])
+    assert listed.exit_code == 0, listed.output
+    assert "odin holds no named Docker volumes." in listed.stdout
+
+
+def test_odin_volumes_reports_a_docker_it_cannot_read_on_stderr(tmp_path, monkeypatch, runner):
+    """`{"volumes": []}` from a docker that would not answer would print "odin
+    holds no named Docker volumes" — the single most misleading sentence this
+    command could produce. It exits 1 with the reason instead."""
+    class BlindRuntime(CleanRuntime):
+        async def volume_names(self, env=None):
+            raise RuntimeError("Cannot connect to the Docker daemon")
+
+    _app, client = _live(tmp_path, monkeypatch, runtime=BlindRuntime())
+    with client:
+        listed = runner.invoke(cli, ["volumes"])
+
+    assert listed.exit_code == 1, listed.output
+    assert "could not list this machine's Docker volumes" in listed.stderr
+    assert "holds no named Docker volumes" not in listed.stdout

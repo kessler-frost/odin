@@ -40,6 +40,12 @@ def _render_rm(body: dict) -> None:
     forgotten = body.get("forgotten") or {}
     if body.get("state_dir"):
         typer.echo(f"removed {body['state_dir']}")
+    # The DISK this removal gave back, named one volume at a time. A Postgres
+    # data directory is not small and nothing else on the machine would ever say
+    # it went -- and a reclaim that prints nothing is indistinguishable from one
+    # that had nothing to do, which is the bug class this repo keeps re-finding.
+    for volume in (body.get("reclaimed") or {}).get("volumes") or ():
+        typer.echo(f"reclaimed volume {volume}")
     # Only the halves that HELD something -- a removal that forgot nothing but
     # a directory should not print six lines of zeroes.
     for name, value in sorted(forgotten.items()):
@@ -54,18 +60,24 @@ def env_rm(
     output: OutputFormat = http.OUTPUT,
 ) -> None:
     """Tear an env down AND forget it — state directory, credentials, gateway
-    records, reconciler, and its entry in `odin envs`.
+    records, reconciler, its Docker volumes, and its entry in `odin envs`.
 
     Destructive and not undoable: everything under `.odin/<name>/` goes,
-    including the canvas and every Stack revision. `odin export --env <name>`
-    first if you might want it back.
+    including the canvas and every Stack revision, and so do the named volumes
+    holding this env's database files — there is no snapshot to restore from.
+    `odin export --env <name>` first if you might want the control-plane state
+    back; it does NOT carry volume contents.
 
     Exits 1 with the server's own reason on stderr if the env is NOT gone —
     a failed teardown, a reconciler that would not stop, a container still
-    standing, or a state directory odin could not delete. In every one of those
-    cases nothing was deleted, so re-running after fixing the cause is safe.
+    standing, a volume odin could not reclaim, or a state directory odin could
+    not delete. In every one of those cases nothing was deleted, so re-running
+    after fixing the cause is safe.
+
     An env that never existed exits 0 (`not_found`): nothing was removed, and
-    nothing was created.
+    nothing was created. It is also how you reclaim an env that is gone from
+    disk but still holding volumes — `odin volumes` lists those, and this exits
+    0 with `removed` when it really gave the disk back.
     """
     body = http.body_or_fail(http.request("POST", url, "/envs/rm", params={"env": name}), output)
     http.emit(body, output, _render_rm)
