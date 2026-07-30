@@ -1542,6 +1542,31 @@ while a suite is running.
 
 ## Next — known, measured, not yet fixed
 
+- [ ] **A fake runtime does not isolate `/apply-full`, so a "unit" test boots real
+  containers.** Measured 2026-07-29, after it leaked four containers into every
+  unit-suite run and cost a release-gate diagnosis.
+  `create_app(runtime=FakeRuntime(), rds=FakeRds(), aws=FakeAws(), backings=False)`
+  reads as hermetic and is not: `/apply-full` runs a real `tofu apply`, and the
+  gateway's own models default their substrate (`lambdactl` to
+  `FunctionRuntime(ColimaRuntime(), ...)`, rdsctl and cachectl likewise), so the
+  injected fakes are bypassed and real Postgres, Redis and RIE containers start.
+  `tests/spec/test_connection_edges.py` took 68s in the "unit" suite for this
+  reason.
+
+  The asymmetry is the actual defect, and it guarantees a leak rather than merely
+  risking one: **creation is real and teardown is fake.** The gateway created a
+  real Postgres through `ColimaRuntime`; `/destroy` runs through the reconciler,
+  which DOES honour `FakeRds`, so it destroyed a fake and left the container
+  standing. Measured — `/destroy` cleared the lambda and cache containers and left
+  `odin-rds-conn2-app-db` and `odin-rds-conn2-other-db` running.
+
+  Patched at the call site (`_torn_down` destroys, then reaps that env's own
+  containers by name and asserts the end state). The real fix is in the seam: a
+  test that injects a fake runtime should get a gateway whose models use it, or
+  `create_app` should refuse the combination rather than silently half-honour it.
+  Until then, every `/apply-full` test needs Docker and nobody is told.
+
+
 - [x] **Event delivery: triggers that actually fire.** odin could record "when X
   happens, run Y" and nothing read the record. `reconcile/dispatch.py` is the
   other half — one dispatcher, three sources (a scheduled EventBridge rule, an
