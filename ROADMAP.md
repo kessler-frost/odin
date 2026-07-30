@@ -651,8 +651,20 @@ future decision against these points instead of re-deriving them:
       no join), needs `NET_ADMIN` + `/dev/net/tun` INSIDE the sidecar
       container (a container capability Colima grants unprivileged — no sudo,
       no host change), and `ODIN_BACKING_MESH=0` turns it off.
-    - Not modeled yet: egress rules (nebula gets allow-all outbound
-      regardless of what a canvas draws), NACLs, an SG's self-reference
+    - **Egress rules are ENFORCED as of v0.8.17** — this line used to read
+      "not modeled yet: egress rules (nebula gets allow-all outbound
+      regardless of what a canvas draws)". `sg_rules_to_firewall` now compiles
+      `IpPermissionsEgress` into nebula's `outbound`, and
+      `ec2net._compiled_firewall` stops filtering the egress half of the store
+      away. MEASURED on a real mesh (`tests/simulate/
+      test_sg_egress_gates_e2e.py`): a member whose group's only egress rule is
+      `tcp:6000` reaches tcp:6000 on a peer and gets **nothing** from tcp:5432
+      on that same peer in the same instant; revert the compiler and the same
+      probe returns `pong5432`. AWS's default is untouched — an empty
+      `egressRules` field keeps the seeded allow-all, so an existing canvas
+      admits the same packets. What it gates is OVERLAY traffic only; see
+      `docs/limits.md` for what that does and does not cover.
+    - Not modeled yet: NACLs, an SG's self-reference
       (`self = true`), and ICMP rules from the canvas (`ingressRules` takes a
       numeric port, so `icmp:-1:...` can't be drawn — the API path can).
   - Single local server by design: `ODIN_GATEWAY_PORT` overrides the embedded
@@ -1851,9 +1863,12 @@ run and are not described as such.
     **The outbound half of that was closed in v0.8.14**: the sg node has an
     `egressRules` field in the same line format, real `egress` blocks are
     emitted from it, and the wide-open default now applies only when the field
-    is empty — which keeps every pre-existing canvas byte-identical. Nebula
-    still compiles INGRESS only (`outbound: any`), so an egress rule is portable
-    configuration rather than a control; `docs/limits.md` says so.
+    is empty — which keeps every pre-existing canvas byte-identical. **And in
+    v0.8.17 it became a control rather than portable configuration**: nebula
+    compiles the outbound half too, measured blocking real traffic on a real
+    mesh. This paragraph said "Nebula still compiles INGRESS only
+    (`outbound: any`), so an egress rule is portable configuration rather than
+    a control" until that landed.
   - **ec2** — three references that each decide something different: containment
     (unappliable without it), security groups (less protected), and the companion
     key pair (unreachable). One warning each, not one vague line.

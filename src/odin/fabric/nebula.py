@@ -691,10 +691,13 @@ _PORTLESS_PROTOCOLS = ("icmp", "icmpv6")  # AWS expresses ICMP type/code via Fro
 # the whole daemon down over a rule that was only ever meant to be a no-op.
 
 
-def sg_rules_to_firewall(permissions: list[dict]) -> FirewallRules:
-    """Translate AWS security-group IpPermissions (canvas SG edges) to Nebula
-    firewall rules — recovered, for deriving per-env ACLs from the canvas."""
-    inbound: list[FirewallRule] = []
+def _compile_side(permissions: list[dict]) -> list[FirewallRule]:
+    """One direction's AWS IpPermissions -> nebula rules. Shared by both sides
+    because AWS's `IpPermissions` and `IpPermissionsEgress` are the SAME shape
+    and nebula's `inbound` and `outbound` take the same rule body -- the only
+    thing that differs is which end of the flow the port and peer describe,
+    and neither this function nor nebula's config format has to know that."""
+    rules: list[FirewallRule] = []
     for perm in permissions:
         proto = perm.get("IpProtocol", "-1")
         from_port, to_port = perm.get("FromPort"), perm.get("ToPort")
@@ -703,12 +706,51 @@ def sg_rules_to_firewall(permissions: list[dict]) -> FirewallRules:
         if proto not in ("-1", *_PORTLESS_PROTOCOLS) and from_port is not None:
             nebula_port = str(from_port) if from_port == to_port else f"{from_port}-{to_port}"
         for ip_range in perm.get("IpRanges", []):
-            inbound.append(FirewallRule(port=nebula_port, proto=nebula_proto, cidr=ip_range.get("CidrIp")))
+            rules.append(FirewallRule(port=nebula_port, proto=nebula_proto, cidr=ip_range.get("CidrIp")))
         for group_ref in perm.get("UserIdGroupPairs", []):
-            inbound.append(FirewallRule(port=nebula_port, proto=nebula_proto, group=group_ref.get("GroupId", "")))
+            rules.append(FirewallRule(port=nebula_port, proto=nebula_proto, group=group_ref.get("GroupId", "")))
         if not perm.get("IpRanges") and not perm.get("UserIdGroupPairs"):
-            inbound.append(FirewallRule(port=nebula_port, proto=nebula_proto))
-    return FirewallRules(inbound=inbound, outbound=[FirewallRule(port="any", proto="any")])
+            rules.append(FirewallRule(port=nebula_port, proto=nebula_proto))
+    return rules
+
+
+# What `egress_permissions=None` means, and why it is not the same as `[]`.
+#
+# `[]` is a real answer: a security group whose egress rules were all revoked,
+# which in AWS blocks every outbound packet. MEASURED against nebula 1.10.3 on
+# 2026-07-30 -- `outbound: []` really does deny (a member with it could reach
+# NEITHER of two live listeners on a peer it had just been reaching), so the
+# empty list is not quietly read as "no restriction" the way some firewalls
+# read an empty ruleset.
+#
+# `None` is the ABSENCE of an answer: a caller that has no egress information
+# at all. Those get AWS's own default for a group that never restricted
+# anything -- allow all outbound -- because the alternative is to read "I did
+# not ask" as "deny everything" and cut a working environment's mesh traffic.
+_ALLOW_ALL_OUTBOUND = [FirewallRule(port="any", proto="any")]
+
+
+def sg_rules_to_firewall(
+    permissions: list[dict], egress_permissions: list[dict] | None = None,
+) -> FirewallRules:
+    """Translate AWS security-group IpPermissions (canvas SG rules) to Nebula
+    firewall rules, BOTH directions.
+
+    `permissions` is the group's ingress (`IpPermissions`) and compiles to
+    nebula's `inbound`. `egress_permissions` is its `IpPermissionsEgress` and
+    compiles to `outbound` -- see `_ALLOW_ALL_OUTBOUND` for why omitting it is
+    deliberately not the same as passing an empty list.
+
+    Until v0.8.17 the outbound list was the hardcoded allow-all regardless of
+    what the group said, so an `egressRules` line survived translation, `tofu
+    plan`, and the gateway's own store, and then gated nothing: exactly the
+    "renders as configuration, changes nothing" shape this repo keeps finding.
+    Nebula supported outbound rules the whole time (`generate_config` has
+    always emitted the list) -- odin simply never compiled any."""
+    return FirewallRules(
+        inbound=_compile_side(permissions),
+        outbound=_ALLOW_ALL_OUTBOUND if egress_permissions is None else _compile_side(egress_permissions),
+    )
 
 
 def union_firewalls(firewalls: Iterable[FirewallRules]) -> FirewallRules:
@@ -723,7 +765,17 @@ def union_firewalls(firewalls: Iterable[FirewallRules]) -> FirewallRules:
     is stable across re-applies. An empty input yields an empty inbound list
     -- deny-all-inbound, which is exactly what a compiled SG with no ingress
     rules already means to nebula; the caller decides whether "no groups at
-    all" should instead fall back to something else."""
+    all" should instead fall back to something else.
+
+    BOTH sides are unioned, and that only started to MEAN anything in v0.8.17:
+    until egress was compiled, every group's outbound was the identical
+    hardcoded allow-all, so this loop unioned one constant with itself and
+    nothing here could have been observably wrong. It is the right rule now
+    that the inputs differ -- AWS's permissive-only semantics govern egress
+    exactly as they govern ingress, so a node in a restricted-egress group AND
+    an allow-all-egress group may send everything. That is the WIDENING
+    direction and it is what AWS does; narrowing means taking the wide group
+    off the node, not drawing a narrow one beside it."""
     inbound: dict[tuple, FirewallRule] = {}
     outbound: dict[tuple, FirewallRule] = {}
     for firewall in firewalls:

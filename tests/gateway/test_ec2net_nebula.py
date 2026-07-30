@@ -67,11 +67,32 @@ async def test_second_vpc_reuses_the_env_network(sink, ec2, stores, tmp_path):
 
 
 async def test_create_security_group_compiles_an_empty_inbound_firewall(sink, ec2, stores):
+    """THE upgrade-safety test for v0.8.17's egress compilation: a group that
+    says nothing about egress must still allow ALL outbound, because that is
+    what AWS's seeded rule means and what every canvas drawn before
+    `egressRules` existed relies on.
+
+    The outbound rule's SHAPE changed even though its meaning did not, and
+    that is worth stating rather than hiding. It used to be a hardcoded
+    `FirewallRule(port="any", proto="any")` -- a constant that described no
+    group at all. It is now the real compilation of the seeded egress rule,
+    which carries `0.0.0.0/0`, so the cidr is populated. On odin's IPv4-only
+    overlay those admit the same packets (MEASURED, 2026-07-30: a member whose
+    only outbound rule was `port/proto any, cidr 0.0.0.0/0` reached a live
+    listener on a peer), and it is the identical form the INBOUND side has
+    always compiled a `0.0.0.0/0` rule to.
+
+    The cost, which is real and is in docs/limits.md: an environment that was
+    already on the mesh before this change sees its config text move once, so
+    every member takes one firewall-only reload (a SIGHUP, no tunnel dropped).
+    Byte-identical was not achievable without special-casing the wide-open
+    rule back into `host: any`, which would have made this the one rule odin
+    compiles differently from every other."""
     vpc_id = await _create_vpc(stores, sink, ec2)
     group_id = await _create_sg(stores, sink, ec2, vpc_id)
     firewall = _stored_firewall(stores, group_id)
     assert firewall.inbound == []  # no ingress yet; the seeded rule is egress
-    assert firewall.outbound == [FirewallRule(port="any", proto="any")]
+    assert firewall.outbound == [FirewallRule(port="any", proto="any", cidr="0.0.0.0/0")]
 
 
 async def test_authorize_recompiles_the_golden_firewall(sink, ec2, stores):
@@ -83,8 +104,54 @@ async def test_authorize_recompiles_the_golden_firewall(sink, ec2, stores):
             FirewallRule(port="443", proto="tcp", cidr="10.0.0.0/16"),
             FirewallRule(port="443", proto="tcp", group=group_id),
         ],
-        outbound=[FirewallRule(port="any", proto="any")],
+        outbound=[FirewallRule(port="any", proto="any", cidr="0.0.0.0/0")],
     )
+
+
+async def test_authorize_egress_narrows_the_outbound_firewall(sink, ec2, stores):
+    """The link v0.8.17 built. Revoking the seeded allow-all and authorizing a
+    single egress rule must reach `outbound` -- before this, the whole egress
+    half of the store was compiled away and every config said `outbound: any`
+    no matter what the group held."""
+    vpc_id = await _create_vpc(stores, sink, ec2)
+    group_id = await _create_sg(stores, sink, ec2, vpc_id)
+    revoke = sink.call(lambda: ec2.revoke_security_group_egress(GroupId=group_id, IpPermissions=[
+        {"IpProtocol": "-1", "FromPort": 0, "ToPort": 0, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+    ]))
+    assert (await _answer(stores, revoke)).status_code == 200
+    # Nothing at all: AWS's own "a group whose egress was revoked blocks every
+    # outbound packet", and nebula agrees -- an empty list is a real deny, not
+    # an absent ruleset (MEASURED against nebula 1.10.3, 2026-07-30).
+    assert _stored_firewall(stores, group_id).outbound == []
+
+    authorize = sink.call(lambda: ec2.authorize_security_group_egress(GroupId=group_id, IpPermissions=[
+        {"IpProtocol": "tcp", "FromPort": 5432, "ToPort": 5432, "IpRanges": [{"CidrIp": "10.42.0.0/16"}]},
+    ]))
+    assert (await _answer(stores, authorize)).status_code == 200
+    firewall = _stored_firewall(stores, group_id)
+    assert firewall.outbound == [FirewallRule(port="5432", proto="tcp", cidr="10.42.0.0/16")]
+    assert firewall.inbound == []  # the egress rule did NOT leak into inbound
+
+
+async def test_egress_to_another_group_compiles_to_an_identity_rule(sink, ec2, stores):
+    """An egress rule whose DESTINATION is another security group compiles to a
+    nebula `group:` rule, the same identity-matching form the ingress side
+    uses -- which is the only form that can gate mesh traffic, since overlay
+    addresses are not VPC addresses."""
+    vpc_id = await _create_vpc(stores, sink, ec2)
+    group_id = await _create_sg(stores, sink, ec2, vpc_id)
+    revoke = sink.call(lambda: ec2.revoke_security_group_egress(GroupId=group_id, IpPermissions=[
+        {"IpProtocol": "-1", "FromPort": 0, "ToPort": 0, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+    ]))
+    assert (await _answer(stores, revoke)).status_code == 200
+    authorize = sink.call(lambda: ec2.authorize_security_group_egress(GroupId=group_id, IpPermissions=[
+        {"IpProtocol": "tcp", "FromPort": 5432, "ToPort": 5432,
+         "UserIdGroupPairs": [{"GroupId": group_id}]},
+    ]))
+    assert (await _answer(stores, authorize)).status_code == 200
+    assert _stored_firewall(stores, group_id).outbound == [
+        FirewallRule(port="5432", proto="tcp", group=group_id),
+    ]
 
 
 async def test_revoke_recompiles_down_to_the_remaining_rules(sink, ec2, stores):
@@ -112,7 +179,7 @@ async def test_compiled_firewall_is_what_a_v3_node_config_consumes(sink, ec2, st
         {"port": "443", "proto": "tcp", "cidr": "10.0.0.0/16"},
         {"port": "443", "proto": "tcp", "group": group_id},
     ]
-    assert config["firewall"]["outbound"] == [{"port": "any", "proto": "any", "host": "any"}]
+    assert config["firewall"]["outbound"] == [{"port": "any", "proto": "any", "cidr": "0.0.0.0/0"}]
 
 
 # --- mesh_state: the GET /mesh?env= read model --------------------------------
