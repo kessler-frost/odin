@@ -28,8 +28,21 @@ apply. `odin env rm` is the *decommission*: the same teardown, and then the
 environment — `.odin/<name>/` (canvas, every Stack revision, `world.json`, the
 event log, the tofu workspace, the gateway sidecars, `keys.json`), the credentials
 that keystore issued, the in-memory gateway routing table and synth records, the
-reconciler, and its entry in `odin envs`. Not undoable: `odin export --env <name>`
-first if you might want it back.
+reconciler, **the named Docker volumes holding its databases**, and its entry in
+`odin envs`. Not undoable: `odin export --env <name>` first if you might want it
+back — and note that an export carries control-plane state, *not* volume contents,
+so a restored env's database comes back empty.
+
+The volume step is the one that is not obvious. An RDS instance's data lives on a
+named volume that deliberately *outlives* its container (that is what makes odin's
+own repair non-destructive), so `docker rm -f -v` never takes one — and until
+v0.8.15 nothing else did either, leaving a Postgres data directory on the disk with
+nothing left that named it. `env rm` now reclaims them, scoped to the `odin.env`
+label docker filters on, and names each one it removed (`reclaimed.volumes`). It
+works even when the env is gone from everywhere else — no directory, no reconciler,
+absent from `odin envs` — which is exactly how orphans accumulate. **`odin volumes`**
+lists every volume odin holds, which environment's label each carries, and the one
+command that reclaims it.
 
 It reports whether the environment is **gone**, not whether it tried, and no
 failure deletes anything — `.odin/<name>/` is still there afterwards in every
@@ -39,13 +52,14 @@ de-registered; the table says which.)
 
 | status | exit | what it means |
 | ------ | ---- | ------------- |
-| `removed` | 0 | teardown succeeded, the loop's task really ended, no container of this env's is left, and the directory is gone |
-| `not_found` | 0 | the env never existed — nothing was removed, and nothing was created |
+| `removed` | 0 | teardown succeeded, the loop's task really ended, no container of this env's is left, its volumes were reclaimed, and the directory is gone. Also the answer for an env that had *only* volumes left, since something really was removed |
+| `not_found` | 0 | the env never existed — no directory, no reconciler, and no volume either. Nothing was removed, and nothing was created |
 | `remove_refused` | 1 | a tofu run holds this env, or the name does not resolve to a directory under the store. Nothing was read, written or deleted |
 | `remove_failed_teardown` | 1 | the teardown failed; `teardown` carries its whole report, tofu tail included |
 | `remove_failed_loop_running` | 1 | the reconciler was asked to stop and its task had not finished. Deleting the state under a live loop would let it re-create `world.json` and real containers inside the directory being deleted |
 | `remove_failed_containers_standing` | 1 | the teardown reported success and a container of this env's is still up; `still_standing.containers` names them |
-| `remove_unverified` | 1 | odin could not list the machine's containers, so it cannot say this env left none behind — and will not call a removal complete on a half it could not read |
+| `remove_failed_volumes_standing` | 1 | a named volume of this env's would not go; `still_standing.volumes` names each one with docker's own reason (`volume is in use - [<id>]` means a container is still attached). Deleting the env's state over that would leave the volume with nothing left that names it |
+| `remove_unverified` | 1 | odin could not list the machine's containers, or could not list this env's volumes, so it cannot say this env left nothing behind — and will not call a removal complete on a half it could not read. The `error` says which half |
 | `remove_failed_state_survives` | 1 | the directory still exists after odin deleted it (the one case where the loop *has* been stopped and the env *is* de-registered) |
 | `remove_failed` | 1 | a removal that reported no outcome at all: an odin bug, reported as a failure rather than assumed to have worked |
 

@@ -367,10 +367,12 @@ They are listed because finding one by surprise is worse than reading it here.
   keeps `tofu apply` and Apply delivering identically, but it changes what a
   consumer reads.
 - **`odin env rm` refuses when another environment's name ends with this one's.**
-  Its last check before deleting anything is "does this machine still have a
+  One of its checks before deleting anything is "does this machine still have a
   container of this env's", and it answers that from odin's container *naming*
   (`odin-aws-rustfs-<env>`, `odin-rds-<env>-…`) rather than a label, so a
-  `-`-suffix collision reads across. Measured: with `a` and `b-a` both live,
+  `-`-suffix collision reads across. (Its volume reclaim, which runs after that
+  check, has no such collision — it is scoped to the `odin.env` label. See the
+  RDS-volume entry below.) Measured: with `a` and `b-a` both live,
   removing `a` sees `odin-aws-rustfs-b-a` and stops, having deleted nothing —
   `odin env rm b-a` first, or rename. It errs this way on purpose: refusing a
   legitimate removal is recoverable, and deleting the last record of a running
@@ -399,9 +401,49 @@ They are listed because finding one by surprise is worse than reading it here.
     `applied_resources_unhealthy`. That is the honest outcome, but it does mean
     `docker volume rm odin-rds-<env>-<node>-data` is the manual step for "give me
     a blank database back".
-  - Nothing sweeps volumes on a schedule, so a `.odin` store deleted while
-    containers are still up orphans them. `docker volume ls --filter
-    label=odin=1` lists every volume odin made.
+  - **Nothing sweeps volumes on a schedule, and nothing will.** A reclaim on the
+    reconciler tick is the one shape this must not take: a reconciler is per-env
+    while Docker volumes are per-*machine*, so "no environment claims this volume"
+    is a question no per-env loop can answer — a second odin with its own store
+    root (every parallel agent worktree has one) owns environments the first has
+    never heard of, and a tick sweeping on that reasoning would delete its
+    databases. Nor is a live env's volume ever swept on "its node left the
+    Stack": a database dragged off the canvas mid-edit still holds your rows.
+    So reclaiming is always driven by an env **name you supplied**:
+    - `odin env rm <env>` reclaims that env's volumes as part of its teardown
+      (v0.8.15), scoped to the `odin.env` label docker filters on and nothing
+      else — a *name* filter cannot be used, because `odin-rds-conn2-app-db-data`
+      is env `conn2` database `app-db` **and** env `conn2-app` database `db`, and
+      the string does not say which. It works even when the env is gone from
+      everywhere else: no directory, no reconciler, absent from `odin envs`, which
+      is exactly the shape of the four orphans measured on the development machine
+      before this landed.
+    - `odin volumes` lists every volume odin holds, which environment's label each
+      one carries, and the one command that reclaims it. A volume odin could not
+      remove is **named** with docker's own reason (`volume is in use - [<id>]`
+      means a container is still attached), and `odin env rm` reports it as
+      `remove_failed_volumes_standing` and exits 1 rather than deleting the env's
+      state over the top of a leak.
+  - **Residual: a volume created before v0.8.15 has no `odin.env` label, so
+    `odin env rm` cannot reach it.** Four such volumes were found by hand on the
+    development machine — `odin-rds-conn-{app,other}-db-data`,
+    `odin-rds-conn2-{app,other}-db-data`, from two environments with no container,
+    no `.odin/<env>/` and no entry in `odin envs`. That listing is the measurement;
+    that they carry no `odin.env` is an *inference* from the label not existing
+    before v0.8.15, not a re-probe (the machine's docker was busy with a release
+    gate when this landed). `odin volumes` will show which it is: they appear with
+    `env: null` and `docker volume rm <name>` as the manual step. Left manual on
+    purpose rather than as a gap — attributing them would mean parsing the name,
+    and the ambiguity above is exactly why nothing that *deletes* may do that. The
+    set is closed: `create_volume` is the only thing that makes an `odin=1` volume
+    and it now always writes the env label, so this can shrink and never grow.
+  - **Residual: `odin volumes` judges "live" against the store root of the server
+    you asked.** Two odin servers on one machine share docker's volumes but not
+    their `.odin/`, so the other one's live environments are listed as orphaned.
+    Nothing on that route deletes anything, which is why it is a reading to check
+    rather than a hazard; `odin env rm <that env>` typed against the wrong server
+    is the hazard, and its container witness is what catches the realistic case
+    (a live database has a container, running or exited).
 - **An EC2 VM gets 300s to boot** (`limactl start --timeout`), and that ceiling is
   real: the two-VM mesh e2e finishes in 74.6s on an idle Mac, but at the tail of a
   57-minute test run a VM reached the hypervisor's `running` state in one second
@@ -490,14 +532,40 @@ They are listed because finding one by surprise is worse than reading it here.
   `7e7a063e…`, identical. A multipart completion and every delete carry an
   empty ETag and size `0`, because neither is knowable there; treat `""` as
   "not reported", not as an error.
-- **SQS long-polling through the gateway fails when the queue is empty.**
-  Pre-existing and unrelated to triggers, but measured while building them: the
-  gateway's forward client is a plain `httpx.AsyncClient()` whose default read
-  timeout is 5s, so a `ReceiveMessage` with `WaitTimeSeconds >= 5` against an
-  empty queue exceeds it, and the gateway answers **503 ServiceUnavailable**
-  (a `ReadTimeout` is an `httpx.HTTPError`, which the gateway maps to
-  "the backing isn't there"). Short-poll, or keep `WaitTimeSeconds` under 5.
-  odin's own dispatcher short-polls (`WaitTimeSeconds=0`) and is unaffected.
+- **SQS long-polling works, and a wait above 20s is REFUSED rather than
+  clamped.** This entry used to say long polling failed outright: the gateway's
+  forward client is a plain `httpx.AsyncClient()` whose default read timeout is
+  5s, so a `ReceiveMessage` with `WaitTimeSeconds >= 5` on an empty queue
+  exceeded it and the gateway answered **503 ServiceUnavailable** — a healthy
+  queue reported as a dead backing, for the recommended way to consume a queue.
+  Fixed: the forward's read timeout is now **derived per request** (the client's
+  own 5s plus the caller's own `WaitTimeSeconds` — `gateway/app.py::_long_poll` /
+  `_forward_timeout`), so every *other* forwarded call still fails fast at 5s
+  instead of inheriting a blanket larger number. Measured through a real boto3
+  consumer, before → after: `WaitTimeSeconds=5` 503 in 10.17s (10s, not 5s,
+  because botocore retries a 503) → empty answer in 5.01s; `10` → 10.00s;
+  `20` → 20.01s. A long poll holds a connection, never the event loop.
+  What remains, and it is deliberate:
+  - **`WaitTimeSeconds` outside 0..20 gets `InvalidParameterValue` (HTTP 400).**
+    Real SQS rejects it; **goaws v0.5.4 does not validate it at all** (read from
+    `app/gosqs/receive_message.go`: `loops := waitTimeSeconds * 10`, one 100ms
+    timer per loop — so `WaitTimeSeconds=3600` really would poll for an hour), so
+    odin is the only place that can. Clamping was rejected: answering sooner than
+    the caller asked is indistinguishable from an empty queue.
+  - **A queue configured with `ReceiveMessageWaitTimeSeconds` above 20 still
+    hits the old 503 on a wait-less receive.** goaws falls back to that queue
+    attribute when the request's wait is 0, and odin accommodates it up to AWS's
+    own maximum of 20s — beyond that it stops waiting and reports the backing
+    unavailable. Real SQS refuses such a queue at creation and odin does not
+    (`CreateQueue` is forwarded, attributes unvalidated), so this needs a queue
+    real AWS would never have accepted.
+  - **odin only knows the attribute for queues created THROUGH the gateway**
+    (`synth._sqs_create_queue` stores it). A queue created by dialling the goaws
+    container's published port directly is invisible to that lookup, and a
+    wait-less receive against it long-polls in goaws while odin gives up at 5s.
+  odin's own event dispatcher short-polls (`WaitTimeSeconds=0`) and is
+  deliberately left that way — a 20s poll inside a reconciler tick would stall
+  everything else the tick does (`reconcile/dispatch.py`).
 - **S3 bucket notifications fire only for a LAMBDA target, and only for writes
   through the gateway.** They work as of v0.8.15, and the way they got there is
   the reason for the shape: `aws_s3_bucket_notification` used to be forwarded to

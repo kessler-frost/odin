@@ -25,6 +25,9 @@ class FakeRuntime:
     # against real docker while passing a test that only checked membership.
     calls: list[tuple[str, str]] = field(default_factory=list)
     volumes: set[str] = field(default_factory=set)
+    # name -> the `odin.env` label `create_volume` put on it, which is the one
+    # thing the reclaim keys on (`runtime/colima.py::ENV_LABEL`).
+    volume_envs: dict[str, str] = field(default_factory=dict)
 
     async def run_container(self, spec: ContainerSpec):
         self.runs.append(spec)
@@ -44,13 +47,21 @@ class FakeRuntime:
     async def host_port(self, name: str, container_port: int) -> int:
         return self.ports.get(name, 0)
 
-    async def create_volume(self, name: str) -> None:
+    async def create_volume(self, name: str, env: str) -> None:
         self.calls.append(("create_volume", name))
         self.volumes.add(name)
+        self.volume_envs[name] = env
 
     async def remove_volume(self, name: str) -> None:
         self.calls.append(("remove_volume", name))
         self.volumes.discard(name)
+        self.volume_envs.pop(name, None)
+
+    async def volume_names(self, env: str | None = None) -> list[str]:
+        return sorted(
+            name for name in self.volumes
+            if env is None or self.volume_envs.get(name) == env
+        )
 
 
 def test_container_name_is_env_scoped():

@@ -77,7 +77,19 @@ recurring. Read them before writing a guard, a status, or a caveat.
    steady-state checks are real, but both e2e tests set
    `ODIN_DRIFT_SWEEP_TICKS=1` and *wait for the sweep* before the failing
    apply — measuring the guard only after the input it depends on has provably
-   arrived, and stepping around the entire residual. Measured without that
+   arrived, and stepping around the entire residual.
+   **HALF-RETIRED as of v0.8.16, and the fix is the more useful lesson.**
+   `test_rds_tf_e2e.py` now `delenv`s that variable and runs at the production
+   cadence; only `test_rds_noop_apply_outage_e2e.py` still sets it. What
+   replaced it was not a longer wait but a different SIGNAL: the test had paired
+   a CADENCE-FREE fact (`/world` reading `crashed`, which `tf_status.project`
+   derives on every projection) with a CADENCED one (the record, written by the
+   background `DriftSweeper`) and given the second zero retries. The assertion
+   moved onto the recovery apply's own `recovered_resources`, which is
+   synchronous and in the response body. Falsified rather than assumed: with the
+   sweep pinned so it can NEVER run (`TICKS=1000000`) the test still passes. So
+   when a test waits on a cadence, the question is not "how long" but "is there
+   an in-band witness for this at all".) Measured without that
    help: FOUR consecutive `applied`/exit-0 applies over ~8s with zero
    containers, and `/world` green for the same window — four times worse than
    the prose that disclosed it. So: if a guard depends on a signal produced on

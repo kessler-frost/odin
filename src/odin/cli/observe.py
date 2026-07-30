@@ -75,6 +75,48 @@ def envs(url: str = http.URL, output: OutputFormat = http.OUTPUT) -> None:
     http.emit(body, output, _render_envs)
 
 
+def _render_volumes(body: dict) -> None:
+    """The volumes table, and above all the count of the ones nothing owns.
+
+    A reclaim that prints nothing looks exactly like a machine with nothing to
+    reclaim, so the orphan line is printed even when it is zero -- that zero is
+    the whole answer to "is odin holding disk I can get back", and leaving it out
+    would make the useful case (a non-zero count) indistinguishable from a
+    command the user simply misread."""
+    volumes = body["volumes"]
+    if volumes is None:
+        return  # `body_or_fail` already put the reason on stderr and exited
+    if not volumes:
+        typer.echo("odin holds no named Docker volumes.")
+        return
+    width = max(len(v["name"]) for v in volumes)
+    for volume in volumes:
+        owner = f"env {volume['env']}" if volume["env"] else "no odin.env label"
+        state = "in use" if volume["live"] else f"ORPHAN — reclaim with: {volume['reclaim']}"
+        typer.echo(f"{volume['name']:<{width}}  {owner:<24}  {state}")
+    orphans = body["orphans"]
+    typer.echo(f"\n{len(orphans)} of {len(volumes)} volume(s) belong to no live environment.")
+
+
+@app.command()
+def volumes(url: str = http.URL, output: OutputFormat = http.OUTPUT) -> None:
+    """Named Docker volumes odin is holding, and which are orphaned.
+
+    An RDS instance's data lives on a named volume that deliberately OUTLIVES its
+    container, so `docker rm -f -v` never takes one and a Postgres data directory
+    can sit on a disk-tight machine with nothing left that names it. This is how
+    you see them.
+
+    Nothing here deletes anything, and there is no sweep-everything flag on
+    purpose: each orphan row carries the one scoped command that reclaims THAT
+    volume. `live` is judged against this server's own store, so a second odin on
+    the same machine — every parallel agent worktree has one — shows up here with
+    its live environments looking orphaned. Read the row before you run it.
+    """
+    body = http.body_or_fail(http.request("GET", url, "/volumes"), output)
+    http.emit(body, output, _render_volumes)
+
+
 def _render_events(events_list: list[dict]) -> None:
     for event in events_list:
         http.echo_json(event)

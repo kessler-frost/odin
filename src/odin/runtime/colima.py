@@ -18,6 +18,19 @@ from odin.spec.models import Phase
 from odin.util import run_command_async
 
 LABEL = "odin"
+# The label that says WHICH ENVIRONMENT a named volume belongs to, and the only
+# thing any reclaim is allowed to key on.
+#
+# A volume's NAME (`odin-rds-{env}-{db_id}-data`) cannot answer that question:
+# both halves may contain `-`, so `odin-rds-conn2-app-db-data` is env `conn2`
+# database `app-db` AND env `conn2-app` database `db`, with nothing in the string
+# to choose between them. Odin already carries one documented residual of exactly
+# that shape (`docs/limits.md`: a `-`-suffix env collision makes `odin env rm`
+# refuse), and there the wrong answer merely refuses. Here the wrong answer
+# DELETES A DATABASE, so a name is not good enough. The label is set by whoever
+# creates the volume, is matched by `--filter label=...` (the same mechanism
+# `volume_names` already uses for `odin=1`), and is exact.
+ENV_LABEL = f"{LABEL}.env"
 
 
 class PortUnreadable(RuntimeError):
@@ -523,20 +536,27 @@ class _ContainerRuntime:
     # as a VOLUME, so every rds container already had one, just an ANONYMOUS
     # one that `stop`'s `-v` deleted along with it. Naming it is the whole fix.
 
-    async def create_volume(self, name: str) -> None:
-        """Ensure a named volume exists, LABELLED as odin's.
+    async def create_volume(self, name: str, env: str) -> None:
+        """Ensure a named volume exists, LABELLED as odin's and as `env`'s.
 
         Idempotent by the CLI's own contract (probed: a second
         `docker volume create` on the same name exits 0 and changes nothing),
         so this needs no exists-check and no branch.
 
-        The explicit create earns its one extra call by the label: `-v
+        The explicit create earns its one extra call by the labels: `-v
         name:/path` auto-creates an UNLABELLED volume, which is indistinguishable
         from one the user made by hand -- and an odin volume nobody can attribute
         to odin is one nobody can ever safely reclaim on a disk-tight machine.
-        `volume_names` is what that buys."""
+        `volume_names` is what that buys.
+
+        `env` is why the reclaim exists at all. v0.8.14 made the volume named so
+        it would OUTLIVE its container; nothing then reclaimed one, and four
+        orphans from two long-dead environments were measured on this machine.
+        The reclaim is keyed on this label and never on the name -- see
+        `ENV_LABEL` for the ambiguity that rules a name out."""
         await self._cli(
-            "volume", "create", "--label", f"{LABEL}=1", "--label", f"{LABEL}.name={name}", name,
+            "volume", "create", "--label", f"{LABEL}=1", "--label", f"{LABEL}.name={name}",
+            "--label", f"{ENV_LABEL}={env}", name,
         )
 
     async def remove_volume(self, name: str) -> None:
@@ -555,14 +575,26 @@ class _ContainerRuntime:
         `odin destroy` reporting a success it did not achieve."""
         await self._cli("volume", "rm", "-f", name)
 
-    async def volume_names(self) -> list[str]:
+    async def volume_names(self, env: str | None = None) -> list[str]:
         """Every odin-labelled volume's NAME, in one call -- `container_names`'
         twin, and `check=True` for the same reason: an empty answer here means
         "the volume is really gone", so a CLI hiccup must raise rather than
         arrive as an innocent empty list. `server.py`'s recovery disclosure
         reads it to say whether a database's data really survived, instead of
-        asserting that it must have."""
-        out = await self._cli("volume", "ls", "--format", "{{.Name}}", "--filter", f"label={LABEL}=1")
+        asserting that it must have.
+
+        With `env`, the listing is narrowed by the `ENV_LABEL` filter to the
+        volumes THAT ENVIRONMENT created, and that narrowing is what every
+        reclaim is built on: `docker volume prune` and any name-shaped filter are
+        machine-wide, and this repo has already had a machine-wide sweep destroy
+        another agent's work. Two docker filters, ANDed by docker itself, so an
+        unlabelled volume (odin's own, made before v0.8.15, or a bare `-v
+        name:/path` auto-create) is absent from an env-scoped answer by
+        construction -- it is reported by `GET /volumes` instead of guessed at."""
+        scope = ["--filter", f"label={ENV_LABEL}={env}"] if env is not None else []
+        out = await self._cli(
+            "volume", "ls", "--format", "{{.Name}}", "--filter", f"label={LABEL}=1", *scope,
+        )
         return [line for line in out.splitlines() if line]
 
     async def list_odin(self) -> list[str]:

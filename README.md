@@ -352,7 +352,9 @@ The ones most likely to matter:
   rewritten as an ARN.
 - **An RDS instance has no snapshots and no backups.** Its data survives a
   container replacement (a named volume), and `odin destroy` deletes it along
-  with the volume — there is nothing to restore from afterwards.
+  with the volume — there is nothing to restore from afterwards. `odin volumes`
+  shows which volumes odin is holding and which belong to no live environment;
+  `odin env rm <env>` reclaims that env's.
 - **Import is narrower in `--live` mode**, and a live-imported RDS arrives with
   odin's default password, because no AWS API returns one.
 - **Lambda dependencies are vendored only.** A function can be a whole directory

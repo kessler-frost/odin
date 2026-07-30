@@ -34,6 +34,9 @@ class FakeRuntime:
         # a data loss that never happened -- and a fake that always answered "yes"
         # would prove nothing at all.
         self.volumes: set[str] = set()
+        # ...and which ENV each one is labelled for, because that label is the
+        # only thing `odin env rm`'s volume reclaim is allowed to key on.
+        self.volume_envs: dict[str, str] = {}
 
     async def run_container(self, spec):
         return RunHandle(id="x", name=spec.name)
@@ -50,14 +53,21 @@ class FakeRuntime:
     async def ensure_host(self):
         return HostFacts()
 
-    async def create_volume(self, name):
+    async def create_volume(self, name, env):
         self.volumes.add(name)
+        self.volume_envs[name] = env
 
     async def remove_volume(self, name):
         self.volumes.discard(name)
+        self.volume_envs.pop(name, None)
 
-    async def volume_names(self):
-        return sorted(self.volumes)
+    async def volume_names(self, env=None):
+        # The `odin.env` label filter, modelled: an env-scoped listing sees only
+        # volumes labelled for that env, which is what makes the reclaim exact.
+        return sorted(
+            name for name in self.volumes
+            if env is None or self.volume_envs.get(name) == env
+        )
 
 
 class FakeRds:

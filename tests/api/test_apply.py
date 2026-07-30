@@ -10,9 +10,15 @@ from odin.runtime.colima import ContainerFacts, HostFacts, RunHandle
 from odin.server import create_app
 from odin.simulate.workspace import tf_dir
 from odin.spec.store import SpecStore
+from tests.volumes import FakeVolumes
 
 
-class FakeRuntime:
+class FakeRuntime(FakeVolumes):
+    """`FakeVolumes` because `/envs/rm` reclaims this env's named volumes as part
+    of its teardown, and it asks the RUNTIME for them -- a fake without the
+    volume surface makes every removal answer `remove_unverified` (correctly:
+    odin will not call a removal complete on a half it could not read)."""
+
     def __init__(self):
         self.runs = []
 

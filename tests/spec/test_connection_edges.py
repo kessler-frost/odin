@@ -21,6 +21,8 @@ right in the Stack and is read by nobody downstream.
 """
 from __future__ import annotations
 
+import subprocess
+
 from fastapi.testclient import TestClient
 
 from odin.agent.hcl import generate_tf
@@ -315,6 +317,7 @@ def test_apply_full_REFUSES_a_conflicting_connection_edge(tmp_path):
                      rds=FakeRds(), aws=FakeAws(), backings=False)
     with TestClient(app) as client:
         resp = client.post("/apply-full", params={"env": "conn"}, json=canvas)
+        _torn_down(client, "conn")
 
     assert resp.status_code == 409, resp.text
     body = resp.json()
@@ -326,6 +329,71 @@ def test_apply_full_REFUSES_a_conflicting_connection_edge(tmp_path):
     assert body.get("not_covered", []) == [], body.get("not_covered")
 
 
+# --- the two /apply-full tests really boot containers -------------------------
+#
+# MEASURED 2026-07-29, after these leaked four containers into every unit run and
+# cost a release-gate diagnosis: `create_app(runtime=FakeRuntime(), rds=FakeRds(),
+# aws=FakeAws(), backings=False)` does NOT make `/apply-full` hermetic. It runs a
+# real `tofu apply`, and the gateway's own models default their substrate --
+# `lambdactl` to `FunctionRuntime(ColimaRuntime(), ...)`, and rdsctl/cachectl
+# likewise -- so the injected fakes are bypassed and real Postgres, Redis and RIE
+# containers start. Before this teardown: `conn2` left
+# odin-rds-conn2-app-db, odin-rds-conn2-other-db, odin-lambda-conn2-worker and
+# odin-cache-conn2-cache standing, on EVERY run of the unit suite.
+#
+# `_torn_down` is the narrow fix: destroy the env before the client closes. The
+# wider one -- that a fake runtime does not actually isolate `/apply-full` -- is
+# a real defect in the test seam rather than in these tests, and is recorded in
+# ROADMAP rather than papered over here.
+
+
+def _torn_down(client, env: str):
+    """Destroy `env` on the way out, then reap what `/destroy` provably cannot.
+
+    `/destroy` alone is not enough here, and the reason is the defect: creation
+    is REAL and teardown is FAKE. The gateway's rdsctl bypassed the injected
+    `FakeRds` and started a real Postgres through `ColimaRuntime`, while
+    `/destroy` runs through the reconciler, which DOES honour `FakeRds` -- so it
+    tears down a fake and the real container stands. Measured: `/destroy` cleared
+    the lambda and cache containers and left `odin-rds-conn2-app-db` and
+    `odin-rds-conn2-other-db` running.
+
+    So the reap is scoped to this env's own container names, never a label or a
+    machine-wide filter -- another agent's containers must not be reachable from
+    here. It asserts the end state rather than trusting either step, because a
+    teardown that quietly does nothing is exactly how this leaked for a week."""
+    resp = client.post("/destroy", params={"env": env})
+    assert resp.status_code == 200, resp.text
+    subprocess.run(
+        f"docker ps -aq --filter name=-{env}- --filter name=-{env}$ | xargs -r docker rm -f",
+        shell=True, capture_output=True, check=False,
+    )
+    survivors = subprocess.run(
+        ["docker", "ps", "-aq", "--filter", f"name=-{env}-"],
+        capture_output=True, text=True, check=False,
+    ).stdout.split()
+    assert survivors == [], f"{env} left {len(survivors)} containers standing"
+
+    # And the VOLUMES, which the first version of this teardown missed -- it
+    # reclaimed the containers and leaked a Postgres data directory per rds node
+    # instead, growing once per run rather than staying at four. `aws/rds.py`'s
+    # own docstring predicts exactly this: a named volume is the one thing
+    # `docker rm -f -v` does NOT remove. Reaped by NAME rather than through
+    # `reclaim_env_volumes`, for the same reason the containers are: that seam
+    # takes a runtime, and the runtime this app was handed is a fake, which is
+    # the asymmetry that caused the leak in the first place.
+    subprocess.run(
+        f"docker volume ls -q --filter name=-{env}- | xargs -r docker volume rm",
+        shell=True, capture_output=True, check=False,
+    )
+    left = subprocess.run(
+        ["docker", "volume", "ls", "-q", "--filter", f"name=-{env}-"],
+        capture_output=True, text=True, check=False,
+    ).stdout.split()
+    assert left == [], f"{env} left {len(left)} volumes standing: {left}"
+    return resp.json()
+
+
 def test_apply_full_ACCEPTS_the_ordinary_connection_edge(tmp_path):
     """The other half, and the one that catches an over-eager guard: a canvas
     whose only connection edge agrees with everything must sail through. A
@@ -335,6 +403,7 @@ def test_apply_full_ACCEPTS_the_ordinary_connection_edge(tmp_path):
                      rds=FakeRds(), aws=FakeAws(), backings=False)
     with TestClient(app) as client:
         resp = client.post("/apply-full", params={"env": "conn2"}, json=canvas)
+        _torn_down(client, "conn2")
 
     assert resp.status_code != 409, resp.text
     assert resp.json().get("wiring_errors", []) == []

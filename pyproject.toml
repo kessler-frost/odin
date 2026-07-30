@@ -1,6 +1,6 @@
 [project]
 name = "odin"
-version = "0.8.15"
+version = "0.8.16"
 description = "Odin: a local-first AWS-compatible cloud. Design AWS architectures on a drag-drop canvas; apply them for real onto local open-source substitutes (RustFS, goaws, dynalite, Postgres) on Colima/Lima."
 requires-python = ">=3.12"
 license = "Apache-2.0"

@@ -1540,7 +1540,82 @@ machine-wide-sweep rule already in CLAUDE.md. A test-owned env is invisible to
 every check a human would think to run; the only safe rule is to touch nothing
 while a suite is running.
 
+## v0.8.16 — the gate stops lying, and two leaks that made it lie
+
+**SQS long polling works.** `WaitTimeSeconds >= 5` used to exceed the forward
+client's 5s read timeout, so an empty queue answered `ServiceUnavailable` — for
+the recommended way to consume a queue, and indistinguishable from the backing
+being down while `/world` said healthy. Measured cost was 10s, not 5, because
+botocore retries a 503. The timeout is DERIVED (`client read + this request's
+wait`), not raised: a blanket 30s would make every other forwarded call wait 30s
+before failing. A wait above AWS's 20s maximum is refused with
+`InvalidParameterValue` rather than clamped, because answering sooner than asked
+is indistinguishable from an empty queue. The trap worth recording:
+`httpx.ASGITransport` enforces NO timeouts, so the natural test would have
+passed against the broken code — it needed a real socket.
+
+**Orphaned volumes are reclaimable.** Named volumes survive `docker rm -f -v` by
+design — that is what makes RDS repair non-destructive — and nothing reclaimed
+them. Scoped by a new `odin.env` LABEL, never by name: `odin-rds-conn2-app-db-data`
+is ambiguous between env `conn2`/db `app-db` and env `conn2-app`/db `db`, so a
+name filter over-reaches by construction. Deliberately NO reconciler-tick sweep:
+a reconciler is per-env while volumes are per-machine, so "no env claims this" is
+unanswerable from inside one, and every agent worktree is a second odin whose
+databases such a sweep would delete.
+
+**Two flakes fixed by changing the signal, not the timeout.** `test_rds_tf_e2e`
+paired a CADENCE-FREE fact (`/world` reading `crashed`) with a CADENCED one (the
+record, written by the background sweeper) and gave the second zero retries. It
+now asserts on the recovery apply's own `recovered_resources` — synchronous, in
+the response body — and `ODIN_DRIFT_SWEEP_TICKS=1` is GONE, so it runs at the
+production cadence. Falsified rather than assumed: with the sweep pinned so it can
+never run, the test still passes. `test_debug_e2e` was not cadence at all — the
+model called a node "the working control… not implicated" in prose and listed it
+in `suspects` anyway. The CONTRACT was the defect (`_SYSTEM`'s only rule was
+provenance, which permits naming every evidence node); it is implicated-only in
+all three channels the model reads now. The test hard-asserts recall and PRINTS
+precision, because which nodes a model names is not schema-guaranteed.
+
+**A "unit" test that booted four real containers and kept them.** Not
+integration-marked, built with `FakeRuntime`/`FakeRds`/`FakeAws`, and the fakes
+are bypassed: `/apply-full` runs real tofu and the gateway's models default to
+`ColimaRuntime`. The asymmetry makes a leak certain rather than likely —
+**creation is real, teardown is fake** — so `/destroy` destroyed a fake while the
+real Postgres stood. Fixed twice: the first fix reclaimed containers and leaked a
+data directory per node instead.
+
+**The gate, stated honestly.** 84/84, rc=0, but as THREE serial invocations
+(27+28+29) whose partition was verified by `diff` before running — a single
+84-test invocation cannot complete in this harness, which kills at ~61 minutes
+against a ~65-minute suite. Measured twice. Three green runs are not one green
+run and are not described as such.
+
 ## Next — known, measured, not yet fixed
+
+- [ ] **A fake runtime does not isolate `/apply-full`, so a "unit" test boots real
+  containers.** Measured 2026-07-29, after it leaked four containers into every
+  unit-suite run and cost a release-gate diagnosis.
+  `create_app(runtime=FakeRuntime(), rds=FakeRds(), aws=FakeAws(), backings=False)`
+  reads as hermetic and is not: `/apply-full` runs a real `tofu apply`, and the
+  gateway's own models default their substrate (`lambdactl` to
+  `FunctionRuntime(ColimaRuntime(), ...)`, rdsctl and cachectl likewise), so the
+  injected fakes are bypassed and real Postgres, Redis and RIE containers start.
+  `tests/spec/test_connection_edges.py` took 68s in the "unit" suite for this
+  reason.
+
+  The asymmetry is the actual defect, and it guarantees a leak rather than merely
+  risking one: **creation is real and teardown is fake.** The gateway created a
+  real Postgres through `ColimaRuntime`; `/destroy` runs through the reconciler,
+  which DOES honour `FakeRds`, so it destroyed a fake and left the container
+  standing. Measured — `/destroy` cleared the lambda and cache containers and left
+  `odin-rds-conn2-app-db` and `odin-rds-conn2-other-db` running.
+
+  Patched at the call site (`_torn_down` destroys, then reaps that env's own
+  containers by name and asserts the end state). The real fix is in the seam: a
+  test that injects a fake runtime should get a gateway whose models use it, or
+  `create_app` should refuse the combination rather than silently half-honour it.
+  Until then, every `/apply-full` test needs Docker and nobody is told.
+
 
 - [x] **Event delivery: triggers that actually fire.** odin could record "when X
   happens, run Y" and nothing read the record. `reconcile/dispatch.py` is the
@@ -1682,6 +1757,24 @@ while a suite is running.
      old warning. A static "your data is safe" would have been a guard reading
      no signal — honesty rule 1, in the direction that reassures rather than
      alarms. Mutation-tested both ways.
+
+     **And the first of those two came back in v0.8.15, which is the part worth
+     carrying forward hardest.** "Every teardown path had to learn to remove it"
+     was true of `delete_db` and false of `odin env rm`: four orphaned volumes
+     from two environments that no longer existed in any form — no containers, no
+     `.odin/<env>/`, absent from `GET /envs` — were found on the development
+     machine by hand, with `docker volume ls` the only thing that could see them.
+     A fix whose whole point is that state OUTLIVES its container leaves a
+     reclaim question behind by construction, and that question was answered for
+     one caller instead of as a lifecycle. The closure (`aws/rds.py::
+     reclaim_env_volumes`, `GET /volumes`, `odin volumes`) also had to add a
+     `odin.env` LABEL, because the volume's own name cannot be used to scope a
+     deletion: `odin-rds-conn2-app-db-data` is env `conn2` database `app-db` and
+     env `conn2-app` database `db`, so a name filter over-reaches by
+     construction. Deliberately NOT on the reconciler tick — a reconciler is
+     per-env and docker volumes are per-machine, so "no env claims this" is a
+     question no per-env loop can answer without deleting another odin's
+     databases. See `docs/limits.md` for the two residuals.
   3. ~~**An ECS service's canvas wiring cannot be imported.**~~ The GENERATE
      half is CLOSED in v0.8.14: a ref travels as an `odin:ref:<VAR>` tag whose
      value is `<producer>.<attr>` — the non-secret representation this entry

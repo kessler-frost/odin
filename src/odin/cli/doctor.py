@@ -195,7 +195,14 @@ async def _check_disk(root: Path) -> CheckResult:
         "disk", "ok" if ok else "fail", True,
         f"{free_gib:.1f} GiB free on the volume holding {root} "
         f"(Apply needs >{floor:.0f} GiB; ODIN_MIN_DISK_GIB overrides)",
-        "" if ok else f"free up disk space (>{floor:.0f} GiB needed; no single command)",
+        # Odin's own biggest reclaimable is named here rather than left to be
+        # discovered: an rds data volume outlives its container by design, so a
+        # user short on disk has somewhere concrete to look before hunting.
+        # Printed only on FAILURE -- the row is a check, not an advert -- and it
+        # names the command instead of a count, because a count would need a
+        # docker read this check does not do and cannot honestly guess at.
+        "" if ok else f"free up disk space (>{floor:.0f} GiB needed; no single command). "
+                      "`odin volumes` lists the Docker volumes odin is holding and which are orphaned",
     )
 
 
