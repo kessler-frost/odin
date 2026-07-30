@@ -330,6 +330,69 @@ async def test_sqs_sns_dynamodb_through_gateway(tmp_path, runtime):
     assert await own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"
 
 
+async def test_sqs_long_poll_on_an_empty_queue_is_not_a_503(tmp_path, runtime):
+    """The claim no unit test can make: REAL goaws, holding a receive open for the
+    full wait on an EMPTY queue, and the answer coming back empty rather than 503
+    `ServiceUnavailable`.
+
+    Long polling is the RECOMMENDED way to consume a queue and it was broken for
+    every wait of 5s or more: `httpx.AsyncClient()` defaults to a 5s read timeout,
+    the `ReadTimeout` is an `httpx.HTTPError`, and `_unhandled_failure` maps that
+    to "the backing isn't there" -- so a worker got `ServiceUnavailable` while
+    `/world` reported the same queue healthy, with no way to reconcile the two.
+
+    Why the existing sqs slice never caught it: `test_sqs_sns_dynamodb_through_gateway`
+    also passes `WaitTimeSeconds=5`, but always straight after a `send_message`, so
+    goaws finds a message on its first 100ms poll and answers at once. An EMPTY
+    queue is the whole reproduction, which is why this one polls before sending
+    anything.
+
+    Three things, in one applied env because each apply costs a container set:
+    the 20-second poll (AWS's maximum, and the case furthest past the old 5s
+    cliff), a poll that RETURNS EARLY when a message shows up (so the fix is not
+    just "always wait the full time"), and odin's refusal of a wait above 20."""
+    app = create_app(runtime=runtime, store=SpecStore(tmp_path))
+    with TestClient(app) as client:
+        client.post("/apply", json=CANVAS_MULTI_SERVICE)
+        _wait(client, lambda p: p.get("jobs") == "healthy")
+        port = _gateway_port(client)
+        queue_url = _world(client)["jobs"]["facts"]["QUEUE_URL"]
+
+        operator_key, operator_secret = app.state.gateway_keys.issue("default", OPERATOR_NODE_ID)
+        # No client-side retry, so what is measured is odin's FIRST answer: a 503
+        # is retryable, and botocore's default would hide it behind three more
+        # attempts (that is why the old failure cost 10s for a 5s timeout).
+        sqs = boto3.client(
+            "sqs", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+            aws_access_key_id=operator_key, aws_secret_access_key=operator_secret,
+            config=Config(retries={"max_attempts": 1, "mode": "standard"}, read_timeout=60),
+        )
+
+        started = time.monotonic()
+        empty = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=1, WaitTimeSeconds=20)
+        waited = time.monotonic() - started
+        print(f"\nempty-queue long poll: {waited:.2f}s, Messages={empty.get('Messages', [])!r}")
+        assert empty.get("Messages", []) == [], "the queue is empty -- an empty answer is the correct one"
+        # Deliberately loose: this asserts the request was really HELD (past the
+        # old 5s cliff) without turning machine load into a failure.
+        assert waited > 5.0, f"a 20s long poll returned in {waited:.2f}s -- it was not held at all"
+
+        sqs.send_message(QueueUrl=queue_url, MessageBody="long-polled")
+        started = time.monotonic()
+        got = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=1, WaitTimeSeconds=20)
+        print(f"non-empty long poll returned in {time.monotonic() - started:.2f}s")
+        assert [m["Body"] for m in got.get("Messages", [])] == ["long-polled"], \
+            "a waiting message must end the poll, not wait out the clock"
+
+        with pytest.raises(ClientError) as too_long:
+            sqs.receive_message(QueueUrl=queue_url, WaitTimeSeconds=25)
+        assert too_long.value.response["Error"]["Code"] == "InvalidParameterValue", \
+            "above AWS's maximum odin refuses the parameter; goaws v0.5.4 would poll for as long as it was told"
+
+        _destroy(client)
+    assert await own_containers(runtime, *OWN_ENVS) == [], "every container this test made is gone"
+
+
 async def test_latency_overhead(tmp_path, runtime):
     app = create_app(runtime=runtime, store=SpecStore(tmp_path))
     with TestClient(app) as client:

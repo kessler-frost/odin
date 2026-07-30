@@ -532,14 +532,40 @@ They are listed because finding one by surprise is worse than reading it here.
   `7e7a063e…`, identical. A multipart completion and every delete carry an
   empty ETag and size `0`, because neither is knowable there; treat `""` as
   "not reported", not as an error.
-- **SQS long-polling through the gateway fails when the queue is empty.**
-  Pre-existing and unrelated to triggers, but measured while building them: the
-  gateway's forward client is a plain `httpx.AsyncClient()` whose default read
-  timeout is 5s, so a `ReceiveMessage` with `WaitTimeSeconds >= 5` against an
-  empty queue exceeds it, and the gateway answers **503 ServiceUnavailable**
-  (a `ReadTimeout` is an `httpx.HTTPError`, which the gateway maps to
-  "the backing isn't there"). Short-poll, or keep `WaitTimeSeconds` under 5.
-  odin's own dispatcher short-polls (`WaitTimeSeconds=0`) and is unaffected.
+- **SQS long-polling works, and a wait above 20s is REFUSED rather than
+  clamped.** This entry used to say long polling failed outright: the gateway's
+  forward client is a plain `httpx.AsyncClient()` whose default read timeout is
+  5s, so a `ReceiveMessage` with `WaitTimeSeconds >= 5` on an empty queue
+  exceeded it and the gateway answered **503 ServiceUnavailable** — a healthy
+  queue reported as a dead backing, for the recommended way to consume a queue.
+  Fixed: the forward's read timeout is now **derived per request** (the client's
+  own 5s plus the caller's own `WaitTimeSeconds` — `gateway/app.py::_long_poll` /
+  `_forward_timeout`), so every *other* forwarded call still fails fast at 5s
+  instead of inheriting a blanket larger number. Measured through a real boto3
+  consumer, before → after: `WaitTimeSeconds=5` 503 in 10.17s (10s, not 5s,
+  because botocore retries a 503) → empty answer in 5.01s; `10` → 10.00s;
+  `20` → 20.01s. A long poll holds a connection, never the event loop.
+  What remains, and it is deliberate:
+  - **`WaitTimeSeconds` outside 0..20 gets `InvalidParameterValue` (HTTP 400).**
+    Real SQS rejects it; **goaws v0.5.4 does not validate it at all** (read from
+    `app/gosqs/receive_message.go`: `loops := waitTimeSeconds * 10`, one 100ms
+    timer per loop — so `WaitTimeSeconds=3600` really would poll for an hour), so
+    odin is the only place that can. Clamping was rejected: answering sooner than
+    the caller asked is indistinguishable from an empty queue.
+  - **A queue configured with `ReceiveMessageWaitTimeSeconds` above 20 still
+    hits the old 503 on a wait-less receive.** goaws falls back to that queue
+    attribute when the request's wait is 0, and odin accommodates it up to AWS's
+    own maximum of 20s — beyond that it stops waiting and reports the backing
+    unavailable. Real SQS refuses such a queue at creation and odin does not
+    (`CreateQueue` is forwarded, attributes unvalidated), so this needs a queue
+    real AWS would never have accepted.
+  - **odin only knows the attribute for queues created THROUGH the gateway**
+    (`synth._sqs_create_queue` stores it). A queue created by dialling the goaws
+    container's published port directly is invisible to that lookup, and a
+    wait-less receive against it long-polls in goaws while odin gives up at 5s.
+  odin's own event dispatcher short-polls (`WaitTimeSeconds=0`) and is
+  deliberately left that way — a 20s poll inside a reconciler tick would stall
+  everything else the tick does (`reconcile/dispatch.py`).
 - **S3 bucket notifications fire only for a LAMBDA target, and only for writes
   through the gateway.** They work as of v0.8.15, and the way they got there is
   the reason for the shape: `aws_s3_bucket_notification` used to be forwarded to
