@@ -16,16 +16,55 @@ They are listed because finding one by surprise is worse than reading it here.
   `s3`, `sqs`, `sns`, `dynamodb`, `rds`, `vpc`, `subnet` only — and a
   live-imported RDS arrives with odin's default password, because no AWS API
   returns a master password.
-- **A security group's OUTBOUND rules are authored but not ENFORCED.** Since
-  v0.8.14 the sg node has an `egressRules` field, in the same
-  `protocol:port:destination` form as `ingressRules`, and it emits real `egress`
-  blocks that reach the gateway — so a restricted egress survives generation and
-  `tofu plan`. What still does not gate it is the mesh: `fabric/nebula.py::
-  _compiled_firewall` compiles the group's INGRESS rules only, and every Nebula
-  config odin writes carries `outbound: any`. Treat an egress rule as portable
-  configuration, not as a control. An empty field still emits AWS's own
-  allow-all egress, which is what every canvas drawn before the field existed
-  gets and why their generated file is byte-identical to what it was.
+- **A security group's OUTBOUND rules are enforced ON THE MESH, and the mesh is
+  narrower than the canvas looks.** This entry read "authored but not ENFORCED"
+  until v0.8.17, and that was the whole of it: `sg_rules_to_firewall` ended with
+  a hardcoded `outbound=[any/any]` and `ec2net._compiled_firewall` filtered the
+  egress rules out of the store before they could reach it, so a restricted
+  egress survived generation, `tofu plan` and the gateway's own record — and
+  gated nothing. Nebula had supported outbound rules the whole time; odin never
+  compiled any.
+  MEASURED (`tests/simulate/test_sg_egress_gates_e2e.py`, 2026-07-30): a member
+  whose group's only egress rule is `tcp:6000` gets `pong6000` from a peer's
+  tcp:6000 and **empty** from that same peer's tcp:5432, same instant, same
+  overlay. Falsified rather than assumed — reverting the compiler makes the
+  same probe return `pong5432`.
+  **What it does NOT gate, and this is the part to read before trusting it:**
+  Nebula gates OVERLAY traffic. A container or VM reaching the internet, or the
+  host, or another container's published port through Colima/Lima NAT is not on
+  the overlay, and no egress rule touches it — an `egressRules` line cannot stop
+  a workload calling out to the network at large. Nor is every kind on the mesh:
+  only **EC2 Lima VMs** and **RDS Postgres containers** (plus the other backings
+  via `fabric/sidecar.py`) join it today. **ECS tasks, the ALB nginx proxy,
+  Lambda RIE containers and ElastiCache are NOT mesh members**, so their egress
+  is ungated regardless of what group they are drawn into — the asymmetry is
+  real and is not narrowed by this change. The same boundary the ingress side
+  has always had (see *Which endpoint fact your security groups actually
+  govern*) applies unchanged: the raw published host port is reachable from the
+  host and SGs gate neither direction on it.
+  Three things that follow, all measured rather than reasoned:
+  - **An empty `egressRules` field still means allow-all.** AWS's own default:
+    the gateway seeds every group with the allow-all egress rule and `hcl.py`
+    emits that identical block for an empty field, so a canvas that never
+    mentioned egress admits exactly the packets it always did.
+  - **A group whose egress was revoked and never re-authorized blocks
+    everything outbound**, which is AWS's behaviour too. `outbound: []` is a
+    real deny to nebula, not an absent ruleset that defaults open — checked
+    against nebula 1.10.3 directly, because a firewall that read an empty list
+    as "no restriction" would have made this whole feature a silent no-op.
+  - **The firewall is STATEFUL, so restricting a database's egress does not
+    break replies.** A member with `outbound: []` still answers a connection its
+    inbound rules admitted (nebula keeps a conntrack entry per flow), which is
+    what an AWS security group does. Egress restricts what a member *initiates*,
+    never what it may answer.
+  One upgrade cost, small but real: the outbound rule's SHAPE changed even where
+  its meaning did not. It used to render as `host: any` (a hardcoded constant
+  describing no group at all) and now renders as the seeded rule's true
+  compilation, `cidr: 0.0.0.0/0`. Those admit the same packets on odin's
+  IPv4-only overlay, but the config TEXT moves, so an environment already on the
+  mesh takes one firewall-only reload (a SIGHUP; no tunnel is dropped). Byte-
+  identical would have needed the wide-open rule special-cased back into
+  `host: any`, making it the one rule odin compiles unlike every other.
 - **A security group is IPv4 only.** An IPv6 CIDR in either rule field is
   declined with that reason, and the reason is real rather than a parser
   limitation: `sg_rules_to_firewall` compiles `IpRanges` and `UserIdGroupPairs`
