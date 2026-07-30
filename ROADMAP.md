@@ -1454,6 +1454,92 @@ index-to-index deletion on this file.
     hiding the only actionable detail. The two failures are now distinct, and the
     one observed field alias is accepted.
 
+## v0.8.15 — the canvas stops lying about what a line means, and triggers fire
+
+**Event delivery, end to end.** Three sources, each proven against real
+containers rather than fakes: a scheduled EventBridge rule invoked a real RIE
+container **60.5s after `PutTargets`**, exactly once per period (a per-tick bug
+would have shown ~60); `sqs → lambda` through real goaws, message in, `Records`
+envelope out, message really gone after — plus the redrive half, where removing
+the function's container leaves the message undeleted and goaws redelivers it;
+and S3 notifications synthesized from traffic the gateway already sees, with
+`tofu apply` succeeding and the follow-up `plan -detailed-exitcode` clean.
+
+S3 had to be synthesized rather than forwarded, and that was a measurement not a
+preference: RustFS **rejects every notification ARN form with `InvalidArgument`
+and stores the configuration anyway**, so an apply failed, the next plan read the
+config back through GET and reported no drift, and nothing ever fired. Three
+answers, all different, none right. odin answers the call itself now.
+
+Refused rather than half-shipped, because each would have applied clean, planned
+clean, and never fired: `EventPattern` rules, `cron(...)` schedules, non-Lambda
+EventBridge targets, non-SQS event sources. `PutEvents` still returns a named
+error instead of `{"FailedEntryCount": 0}`.
+
+**Six edge types instead of "everything is IAM".** The `iam_role → workload`
+edge was completely inert — typed `network`, read by nobody — so the canvas
+showed one role while the gateway enforced another, silently and permanently.
+`logs → workload` shipped to a hardcoded `/aws/lambda/{fn}` while the group you
+drew sat empty forever. `ecr → ecs` granted a pull and let a text box decide the
+image. Each now authors the thing its permission was for.
+
+**The connection edge, and the selector it made real.** `rds → ecs` writes
+`DATABASE_URL` from the gesture. It also created odin's first genuinely ambiguous
+pairs — eight of them — because in AWS a workload wired to an endpoint may also
+need a grant on it. The picker is multi-select, not exclusive.
+
+**Four from the limits queue:** `odin env rm`, non-destructive RDS repair on a
+named volume, multi-file Lambda packaging, and SG egress with ARN-portable
+policies that stay enforceable locally.
+
+**What I would defend hardest: six new ratchets.** Guards that fire, replacing
+prose that ages.
+- The ambiguity ratchet the ROADMAP had claimed for a month and which **did not
+  exist** — `iam.test.ts` iterated no pairs, and the only trace was a comment
+  asserting it stayed green. Written, mutation-tested, and it fired for real the
+  same day the connection edge landed, naming all eight pairs.
+- A cross-language ratchet pinning the UI's edge registry against the Python
+  builders, which caught `albTargetTypes` being one merge behind and printed
+  which side and which line.
+- A doc-count ratchet, after a *measured* number in a file no build reads rotted
+  within a day of being written.
+- The ECR vocabulary pinned both directions, after a comment claimed a test
+  proved an action enforceable and that test's own docstring says it cannot.
+- A cadence ratchet failing the build if any file assigns `ODIN_DISPATCH_TICKS`.
+- **`bun test` in CI**, which had never run: 103 UI tests were gating nothing.
+
+**Bugs found by verifying rather than reviewing.** `_instance_address` read
+`private_ip_address`/`public_ip_address` — keys `ec2compute` has never written —
+so it returned `None` for every real instance, and its one test fabricated a
+record with the key the reader wanted. The dispatcher counted a **mid-redeploy**
+function as a failed delivery attempt, so a redeploy slower than five ticks
+dropped every notification enqueued during it *and* reported `GIVING UP` — a lost
+event with a false verdict on top. `synth_error` had no `s3` branch while
+`_respond` always had, so an S3 error came back as JSON botocore parses as XML.
+An IPv6 CIDR's colons made `split(":")` produce five fields and silently
+discarded an entire security group.
+
+**The gate, stated as measured.** Two consecutive full integration runs, each
+**82 passed / 1 failed**, a DIFFERENT single test each time, and each failure
+passes in isolation: `test_rds_tf_e2e` (waiting for a drift sweep to mark a
+killed database `failed`) then `test_debug_e2e` (waiting for a crash verdict).
+Both are cadence-dependent assertions, and a 59-minute suite booting real VMs on
+a machine also running agents is exactly the condition under which a window is
+missed. This is the class already recorded as "a tight `elapsed <` assert tests
+CI load, not the code" — so it is not a regression, and it is also not fixed:
+those assertions should wait on the signal rather than on a window. Named here
+rather than left as folklore about a flaky suite.
+
+**One process lesson, because it cost a gate run.** During the first run I
+removed containers for env `conn2`, having verified it was dead — the `:4200`
+server did not list it and no `.odin/conn2` existed on disk. Both checks were
+true and neither could see it: `tests/spec/test_connection_edges.py` applies that
+env through its own TestClient with its own store root. So the cleanup was
+correctly scoped to a prefix and still wrong, which is the subtle form of the
+machine-wide-sweep rule already in CLAUDE.md. A test-owned env is invisible to
+every check a human would think to run; the only safe rule is to touch nothing
+while a suite is running.
+
 ## Next — known, measured, not yet fixed
 
 - [x] **Event delivery: triggers that actually fire.** odin could record "when X
