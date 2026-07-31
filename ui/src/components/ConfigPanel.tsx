@@ -58,8 +58,12 @@ const fieldsForType: Record<string, FieldDef[]> = {
       // The source is a CIDR *or* another Security Group node's name -- the
       // "only the web tier may reach me" rule, which is what actually gates
       // mesh traffic (agent/hcl.py::_ingress_source).
-      key: 'ingressRules', label: 'Ingress Rules (protocol:port:cidr-or-SG-name, one per line)',
-      editable: true, multiline: true, placeholder: 'tcp:443:0.0.0.0/0\ntcp:5432:web-sg',
+      // The port may be a RANGE (`8000-8100`, v0.8.17). The placeholder shows
+      // one, because a field that only ever demonstrated a single port is how
+      // an importable form stays undiscovered (agent/hcl.py::parse_sg_rule).
+      key: 'ingressRules', label: 'Ingress Rules (protocol:port-or-range:cidr-or-SG-name, one per line)',
+      editable: true, multiline: true,
+      placeholder: 'tcp:443:0.0.0.0/0\ntcp:8000-8100:10.0.0.0/16\ntcp:5432:web-sg',
     },
     {
       // Outbound. EMPTY MEANS WIDE OPEN -- odin emits AWS's own allow-all
@@ -67,8 +71,9 @@ const fieldsForType: Record<string, FieldDef[]> = {
       // before this field existed and what real AWS seeds a new group with.
       // The placeholder shows that default spelled out, so the first thing a
       // reader learns is what they are replacing (agent/hcl.py::_sg).
-      key: 'egressRules', label: 'Egress Rules (protocol:port:cidr-or-SG-name, one per line — empty = allow all)',
-      editable: true, multiline: true, placeholder: '-1:0:0.0.0.0/0\ntcp:443:10.0.0.0/16',
+      key: 'egressRules', label: 'Egress Rules (protocol:port-or-range:cidr-or-SG-name, one per line — empty = allow all)',
+      editable: true, multiline: true,
+      placeholder: '-1:0:0.0.0.0/0\ntcp:443:10.0.0.0/16\ntcp:8000-8100:10.0.0.0/16',
     },
     { key: 'vpc', label: 'VPC (containment)' },
     { key: 'subnet', label: 'Subnet (containment)' },

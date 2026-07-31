@@ -191,10 +191,16 @@ def test_tofu_fmt_accepts_a_group_with_identity_rules_in_both_directions(tmp_pat
 
 
 def test_the_default_rule_is_the_one_the_line_grammar_parses():
-    """`_DEFAULT_EGRESS_RULE` has to be spellable as an `egressRules` line, or
-    the "identical either way" property above would hold by luck."""
-    protocol, port, destination = hcl._DEFAULT_EGRESS_RULE
+    """`_DEFAULT_EGRESS_LINE` has to be spellable as an `egressRules` line, or
+    the "identical either way" property above would hold by luck.
+
+    Since v0.8.17 the constant IS a line and `_default_egress_block` parses it,
+    so this is closer to a statement of that fact than a check of it -- what it
+    still catches is the port field growing a shape (a range) the default cannot
+    be written in."""
+    assert hcl.parse_sg_rule(hcl._DEFAULT_EGRESS_LINE) == ("-1", "0", "0", "0.0.0.0/0")
     res = ResourceDesired(id="db-sg", kind="sg", fields={
-        "egressRules": FieldValue(value=f"{protocol}:{port}:{destination}", provenance="user"),
+        "egressRules": FieldValue(value=hcl._DEFAULT_EGRESS_LINE, provenance="user"),
     })
-    assert hcl._sg_rules(res, "egressRules") == [(protocol, port, destination)]
+    blocks = hcl._sg_rule_blocks(res, {}, "egress", "egressRules", "destination")
+    assert blocks == [hcl._default_egress_block()]

@@ -183,14 +183,21 @@ resource "aws_security_group" "ranged" {
 """
 
 
-def test_a_port_range_is_named_rather_than_narrowed_to_one_port():
-    """odin's rule is a SINGLE port. Importing 8000-8999 as `tcp:8000:...` would
-    close 999 ports without a word; the rule is left out and counted instead."""
+def test_a_port_range_is_carried_with_both_bounds_and_warns_about_nothing():
+    """v0.8.17. This test used to assert the OPPOSITE -- that `8000-8999` was
+    left out and counted, because odin's rule was a single port and importing it
+    as `tcp:8000:...` would have closed 999 ports without a word. Dropping it was
+    the honest move while the canvas could not say `8000-8999`; now it can, so
+    the rule is carried and there is nothing to warn about.
+
+    BOTH BOUNDS are asserted through the literal text. An importer that wrote
+    `tcp:8000-8000:...` would satisfy "the range survived" and still have closed
+    999 ports -- the same defect wearing the new grammar."""
     result = parse_hcl_text(_PORT_RANGE)
-    assert _node(result, "ranged-sg")["data"]["ingressRules"] == "tcp:22:10.0.0.0/16"
-    (warning,) = [w for w in result.warnings if "ingress rule" in w]
-    assert "1 of 2" in warning, warning
-    assert "allows LESS" in warning, warning
+    assert _node(result, "ranged-sg")["data"]["ingressRules"] == (
+        "tcp:8000-8999:10.0.0.0/16\ntcp:22:10.0.0.0/16"
+    )
+    assert [w for w in result.warnings if "ingress rule" in w] == []
 
 
 def test_a_group_outside_any_imported_vpc_is_reported_not_silently_applied():

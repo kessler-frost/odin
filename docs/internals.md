@@ -117,9 +117,11 @@ To regenerate this diagram after editing `docs/diagrams/*.mmd`:
   Terraform → canvas reads all 18 back across 24 resource types. Anything odin
   does not model is a LISTED unsupported entry rather than a silent omission.
   Equal node coverage is **not lossless**, and what it costs is listed rather
-  than discovered: a security group's port RANGES and IPv6 rules, a Lambda's body
-  when only the HCL text is read, and — until the reader learns them — the
-  `odin:ref:` tags and `egress` blocks the generator now writes. A drawn IAM
+  than discovered: a security group's IPv6 rules and any port that is not a
+  literal number, a Lambda's body when only the HCL text is read, and — until the
+  reader learns them — the `odin:ref:` tags and `egress` blocks the generator now
+  writes. Port RANGES were on that list until v0.8.17 and are not any more: the
+  grammar takes `tcp:8000-8100:0.0.0.0/0` and both bounds round-trip. A drawn IAM
   permission is no longer among them: since v0.8.11 it is a real
   `aws_iam_role_policy`, and since v0.8.14 its `Resource` is a real ARN, so the
   generated file grants on Amazon what it grants here. See Known limits.
