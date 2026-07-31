@@ -683,19 +683,22 @@ future decision against these points instead of re-deriving them:
       locked VM still reached the host over vzNAT and got HTTP 200 from
       `https://example.com`.
     - Not modeled yet: NACLs and an SG's self-reference (`self = true`).
-      ICMP is NOT in this list any more: this line used to claim "ICMP rules
-      from the canvas … can't be drawn", and that is only true of the literal
-      `icmp:-1:...` spelling, which is declined because the port field wants a
-      digit. Measured: `icmp:-1:0.0.0.0/0` → declined with the format reason;
+      ICMP is a narrower gap than this line used to claim. `icmp:-1:...` still
+      can't be drawn — `ingressRules` takes a numeric port or an `8000-8100`
+      range, and a bare `-1` is neither; pinned by `test_sg_port_ranges.py::
+      test_a_bare_minus_one_port_is_still_declined`, since a range grammar is
+      exactly the change that could have made this stale by accident. But ICMP
+      as such IS drawable, which the old wording denied. Measured against the
+      range grammar: `icmp:-1:0.0.0.0/0` → declined with the format reason;
       `icmp:0:0.0.0.0/0` and `icmp:8:0.0.0.0/0` → both drawn, and both compile
-      to the IDENTICAL `proto: icmp, port: any`, because
-      `_PORTLESS_PROTOCOLS` discards the port. That is the right AWS semantics
-      (an SG's ICMP type/code lives in the port fields and nebula has no such
-      granularity) but it is a quiet footgun worth naming: **the number you
-      write after `icmp:` is ignored**, so `icmp:8` means all ICMP, not
-      echo-request. Verified on the wire by the VM test above, where the rule
-      gates real pings in both directions — an `icmp:0` rule admits an echo
-      REQUEST (type 8), which it could not do if the port were honoured.
+      to the IDENTICAL `proto: icmp, port: any`, because `_PORTLESS_PROTOCOLS`
+      discards the port. That is the right AWS semantics (an SG's ICMP
+      type/code lives in the port fields and nebula has no such granularity)
+      but it is a quiet footgun worth naming: **the number you write after
+      `icmp:` is ignored**, so `icmp:8` means all ICMP, not echo-request.
+      Verified on the wire by the VM test above, where the rule gates real
+      pings in both directions — an `icmp:0` rule admits an echo REQUEST
+      (type 8), which it could not do if the port were honoured.
   - Single local server by design: `ODIN_GATEWAY_PORT` overrides the embedded
     gateway's port, but there is no supported way to run two servers against
     the same CWD-relative `.odin` store (the second binds-conflicts on the
@@ -1923,6 +1926,14 @@ run and are not described as such.
     is named with a count because the group then allows LESS, and `egress` cannot
     survive at all (odin re-emits its own wide-open default and has no outbound
     field) so a restricted source comes back UNRESTRICTED.
+    **The port-RANGE half was closed in v0.8.17**: the line grammar takes
+    `tcp:8000-8100:0.0.0.0/0` in both fields, a single port is the degenerate
+    range so existing canvases emit byte-identical HCL, and an imported range
+    round-trips with BOTH bounds instead of being dropped. The narrowing it
+    replaced was a correctness bug, not a missing feature — regenerating
+    someone's Terraform handed back a firewall tighter than the one they wrote.
+    What still cannot be imported is a port that is not a literal number
+    (`var.port`), which is named and counted the same way.
     **The outbound half of that was closed in v0.8.14**: the sg node has an
     `egressRules` field in the same line format, real `egress` blocks are
     emitted from it, and the wide-open default now applies only when the field

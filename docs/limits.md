@@ -121,9 +121,19 @@ They are listed because finding one by surprise is worse than reading it here.
   Nebula change, not a canvas one. One bad line still declines the whole group,
   deliberately: silently dropping one rule from a firewall is worse than
   refusing the group.
-- **A security group's rules are a single port each.** `tcp:443:0.0.0.0/0`, not
-  a range — so an imported ingress block with a port RANGE is reported and left
-  out, and the regenerated group allows *less* than the source.
+- **A security group's rule port must be a literal number or range.**
+  `tcp:443:0.0.0.0/0` or `tcp:8000-8100:0.0.0.0/0`, in either rule field. This
+  entry used to read "a single port each … an imported ingress block with a port
+  RANGE is reported and left out, and the regenerated group allows *less* than
+  the source", and that was a correctness bug wearing a limit's clothes: a round
+  trip through odin handed back a NARROWER firewall than the Terraform you gave
+  it. Since v0.8.17 both bounds survive import → canvas → regenerate, and a
+  single port is simply the degenerate range, so every canvas drawn before this
+  emits byte-identical HCL. What is still left out is a port that is not a
+  literal number — `from_port = var.port`, or any computed expression — which is
+  named and counted like any other unimportable rule. A MALFORMED range
+  (`8000-`, `8100-8000`, `8000 - 8100`) declines the whole group and names the
+  offending line; it is never half-parsed into its low bound.
 - **A workload's `${{producer.ATTR}}` references are carried as TAGS, and the
   resolved values still are not.** The distinction the design rests on: a
   reference names a producer and an attribute, while the string it resolves to
@@ -145,9 +155,11 @@ They are listed because finding one by surprise is worse than reading it here.
   survives — the import names the producers and says to re-add the references.
   And **a rule odin cannot express empties the field**, which for egress is the
   dangerous direction: an empty `egressRules` is exactly what selects the
-  allow-all default, so a group whose only outbound rule is a port range or an
-  IPv6 CIDR does not come back with no egress, it comes back with all of it. The
-  import says which of the two happened rather than leaving you to find it.
+  allow-all default, so a group whose only outbound rule is an IPv6 CIDR (or a
+  port that is not a literal number) does not come back with no egress, it comes
+  back with all of it. The import says which of the two happened rather than
+  leaving you to find it. *A port RANGE was on that list until v0.8.17 and is
+  not any more — it round-trips with both bounds.*
 - **Some arguments are re-emitted with odin's own value whatever you wrote**, and
   each one warns on its own line — `imported with CHANGED argument(s) -- odin
   substitutes its own value` — kept separate from the `imported without unmodeled

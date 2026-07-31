@@ -400,13 +400,19 @@ def test_a_group_whose_egress_cannot_be_expressed_says_it_comes_back_wide_open()
     """The DANGEROUS direction, and the reason egress gets its own warning text
     rather than sharing ingress's. A dropped ingress rule makes the group more
     restrictive; a dropped egress rule empties the field, and an empty field is
-    exactly what makes hcl.py emit allow-everything."""
+    exactly what makes hcl.py emit allow-everything.
+
+    The unexpressible block used to be a port RANGE (`1024-65535`). v0.8.17
+    carries ranges, so this now uses an IPv6 destination -- which is still
+    genuinely unexpressible (`fabric/nebula.py` compiles IPv4 and group identity
+    and nothing else, so an IPv6 rule would be enforced by nothing). The branch
+    under test is unchanged; only the example that reaches it is."""
     tf = _sg_tf('''
   egress {
-    from_port   = 1024
-    to_port     = 65535
+    from_port   = 443
+    to_port     = 443
     protocol    = "tcp"
-    cidr_blocks = ["10.0.0.0/16"]
+    cidr_blocks = ["2001:db8::/32"]
   }
 ''')
     (warning,) = [w for w in parse_hcl_text(tf).warnings if "egress" in w]
@@ -417,13 +423,16 @@ def test_a_group_whose_egress_cannot_be_expressed_says_it_comes_back_wide_open()
 def test_a_partly_expressible_egress_says_it_allows_LESS_not_more():
     """The other side of the same branch: when SOME rules survive, the field is
     non-empty, the default is not emitted, and the group is more restrictive --
-    the opposite claim, so it must not share the sentence above."""
+    the opposite claim, so it must not share the sentence above.
+
+    Same substitution as the test above: an IPv6 destination in place of the port
+    range that v0.8.17 now carries."""
     tf = _sg_tf(_RESTRICTED_EGRESS + '''
   egress {
-    from_port   = 1024
-    to_port     = 65535
+    from_port   = 443
+    to_port     = 443
     protocol    = "tcp"
-    cidr_blocks = ["10.0.0.0/16"]
+    cidr_blocks = ["2001:db8::/32"]
   }
 ''')
     (warning,) = [w for w in parse_hcl_text(tf).warnings if "egress" in w]

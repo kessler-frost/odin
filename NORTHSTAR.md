@@ -171,6 +171,37 @@ canvas and its configuration.
   teardown). Keep the UI uncrowded. Backend routes like `/destroy` may
   survive for tests/CLI, but the human surface is: draw → Apply.
 
+- **2026-07-30 (owner observation, recorded as the governing principle) —
+  deterministic first; intelligence only where no function exists.** The owner,
+  reading this document back against what got built: *"I feel we have found a
+  deterministic way of doing all of those things without intelligence right?
+  And we'll only involve intelligence where needed."*
+
+  That is what happened, and it is a better outcome than the plan. Directive 2
+  said an agent translates canvas ↔ Terraform; both directions are
+  deterministic code (`agent/hcl.py`, `agent/import_tf.py`), with the SDK behind
+  an off-by-default refine pass a guardrail can reject outright — structurally
+  incapable of deciding what gets applied. The same pattern then repeated
+  everywhere it was tested: edge semantics are a pair table with a
+  mutation-tested ratchet, not a model's opinion; IAM is compiled from the
+  applied file, not inferred; the reconciler is `plan(Stack, World) -> [Action]`,
+  total and idempotent.
+
+  So the rule, stated once here rather than rediscovered per feature:
+  **where a deterministic function exists, write it — reserve intelligence for
+  the places where one provably does not.** Three such places are known today.
+  Explaining a failure is the only one SHIPPED (`agent/debugger.py`): there is no
+  function from an exit code plus log lines to a cause, and it is safe to be
+  load-bearing there because it is read-only, prose out, secrets redacted, and
+  honest when the SDK cannot run. The unbuilt ones are HCL for kinds with no
+  builder, least-privilege policy synthesis, and import of unmodeled types — plus
+  RANKING among legal edge meanings once a pair is ambiguous, where the table
+  still decides what is legal and the model only chooses between those.
+
+  The test that keeps this honest: if a model's output is load-bearing, ask what
+  a deterministic checker would look like. If one is possible, it belongs in the
+  code and the model belongs behind it.
+
 ## Non-negotiables carried forward
 
 Local-first on one Mac (multi-Mac via self-hosted Nebula later) · real
