@@ -48,6 +48,7 @@ from odin.aws.backings import ACCOUNT, REGION
 from odin.gateway.policy import arn_label
 from odin.simulate import workspace as workspace_mod
 from odin.simulate.runner import PLUGIN_CACHE_DIR
+from odin.util import reap
 
 _GRID_STEP = 220
 
@@ -1825,7 +1826,10 @@ async def _run(tofu: str, args: tuple[str, ...], cwd: Path, env: dict[str, str])
     proc = await asyncio.create_subprocess_exec(
         tofu, *args, cwd=cwd, env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
     )
-    await proc.communicate()  # best-effort: `generated.tf`'s existence is the real success signal (module docstring)
+    try:
+        await proc.communicate()  # best-effort: `generated.tf`'s existence is the real success signal (module docstring)
+    finally:
+        await reap(proc)  # a cancelled call must not leave tofu (or its transport) standing
 
 
 async def import_live(

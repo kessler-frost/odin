@@ -38,6 +38,8 @@ smarter teardown filter.
 """
 from __future__ import annotations
 
+import subprocess
+
 
 def _mine(names, envs: tuple[str, ...]) -> list[str]:
     return sorted(
@@ -69,3 +71,39 @@ async def own_volumes(runtime, *envs: str) -> list[str]:
     Named `odin-rds-{env}-{node}-data`, so the env INFIX rule `own_containers`
     already uses matches it unchanged."""
     return _mine(await runtime.volume_names(), envs)
+
+
+def reap_volumes(*envs: str) -> None:
+    """`own_volumes` for a SYNC teardown fixture: remove `envs`' data volumes,
+    then ASSERT none survived.
+
+    Why this exists at all is the named-volume asymmetry. Every teardown
+    fixture in this suite reclaims containers with `docker rm -f -v`, and that
+    `-v` removes a container's ANONYMOUS volumes while deliberately leaving
+    NAMED ones -- which is the whole point of `aws/rds.py`'s named PGDATA
+    volume (it is what makes odin's own rds repair non-destructive). So a
+    fixture that removed only containers reported a clean teardown while
+    `odin-rds-{env}-{db}-data` sat on the disk, once per run, and nothing else
+    ever reclaimed it: `reclaim_env_volumes` is driven by `odin env rm`, which
+    an integration test never calls.
+
+    Scoped to these envs' own names, never a label and never machine-wide --
+    another agent's volumes must not be reachable from here. The assertion is
+    the load-bearing half: a teardown that quietly does nothing looks exactly
+    like a teardown that had nothing to do, which is how this leaked.
+
+    Sync (and shelling out) rather than `own_volumes`, because the fixtures
+    that need it are sync and hold no `RuntimeDriver`."""
+    for env in envs:
+        subprocess.run(
+            f"docker volume ls -q --filter name=-{env}- | xargs -r docker volume rm",
+            shell=True, capture_output=True, check=False, timeout=60,
+        )
+    left = [
+        name for env in envs
+        for name in subprocess.run(
+            ["docker", "volume", "ls", "-q", "--filter", f"name=-{env}-"],
+            capture_output=True, text=True, check=False, timeout=60,
+        ).stdout.split()
+    ]
+    assert left == [], f"{list(envs)} left {len(left)} volumes standing: {left}"

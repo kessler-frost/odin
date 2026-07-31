@@ -29,11 +29,39 @@ They are listed because finding one by surprise is worse than reading it here.
   tcp:6000 and **empty** from that same peer's tcp:5432, same instant, same
   overlay. Falsified rather than assumed — reverting the compiler makes the
   same probe return `pong5432`.
+  MEASURED ON A REAL EC2 LIMA VM TOO (`tests/simulate/
+  test_sg_egress_gates_vm_e2e.py`, 2026-07-31), which is a separate claim and
+  was for one release an INFERENCE: that test's container proof said in its own
+  release note "no real Lima VM ever wore a restricted egress … that is an
+  inference, not a measurement". A VM is a mesh member by a different route
+  entirely (`compute/instances.py` writes `/etc/nebula/config.yml` with
+  `limactl shell … sudo tee` and runs nebula under systemd as root; a container
+  gets a bind-mounted config and runs it as pid 1 in the backing's network
+  namespace), so "same bytes" was never the same as "same effect". One canvas,
+  two real VMs, IDENTICAL ingress on both groups so `egressRules` is the only
+  field that differs:
+
+  | from → to | `locked` (egress `tcp:6000`) | `peer` (egress allow-all) |
+  |---|---|---|
+  | → `:6000` | `HTTP/1.0 200 OK` | `HTTP/1.0 200 OK` |
+  | → `:5432` | **`REFUSED timed out`** | `HTTP/1.0 200 OK` |
+
+  The bottom-right cell is the control a single VM cannot give: it rules out
+  "no VM can reach that port on this overlay", which is the VM-specific
+  confound a container-level proof hides. Falsified the same way — with
+  `sg_rules_to_firewall`'s outbound compilation reverted to the pre-v0.8.17
+  hardcoded allow-all, the compiled rule became `[('any','any')]` and the same
+  probe returned `HTTP/1.0 200 OK`, failing on that one line and no other.
   **What it does NOT gate, and this is the part to read before trusting it:**
   Nebula gates OVERLAY traffic. A container or VM reaching the internet, or the
   host, or another container's published port through Colima/Lima NAT is not on
   the overlay, and no egress rule touches it — an `egressRules` line cannot stop
-  a workload calling out to the network at large. Nor is every kind on the mesh:
+  a workload calling out to the network at large. That used to be reasoning;
+  it is now MEASURED on the same VM in the same run, seconds after its overlay
+  packet to `:5432` was dropped: a TCP connection to the **host** at
+  `192.168.64.1` over vzNAT returned `CONNECTED`, and `curl https://example.com`
+  returned **HTTP 200** over slirp. A locked-down egress rule stops nothing
+  leaving the box by either path. Nor is every kind on the mesh:
   only **EC2 Lima VMs** and **RDS Postgres containers** (plus the other backings
   via `fabric/sidecar.py`) join it today. **ECS tasks, the ALB nginx proxy,
   Lambda RIE containers and ElastiCache are NOT mesh members**, so their egress
@@ -57,6 +85,26 @@ They are listed because finding one by surprise is worse than reading it here.
     inbound rules admitted (nebula keeps a conntrack entry per flow), which is
     what an AWS security group does. Egress restricts what a member *initiates*,
     never what it may answer.
+  - **A restricted egress drops the member's OWN re-handshake poke, and that is
+    a real consequence nothing had asked about.** `fabric/nebula.py::
+    rehandshake_script` closes a measured 10–60s dead window after a nebula
+    restart by having the restarted member ping every peer — and ICMP is a
+    protocol like any other to the outbound firewall. MEASURED on the VM test
+    above, with both groups admitting `icmp` INBOUND identically so the result
+    is attributable to the sender: `locked → ping peer` **fails** (rc=1) while
+    `peer → ping locked` succeeds (rc=0). So a member whose `egressRules` omit
+    `icmp` buys no tunnel state from `_converge`, and its first real connection
+    after a restart pays the window instead. It fails CLOSED (a slower
+    re-handshake, never a wider firewall), and the fix if it ever matters is to
+    name `icmp` in the group's egress — but do not read `_converge` as
+    unconditional any more.
+  - **A conntrack entry can make a working outbound firewall look broken —
+    watch the ORDER of your probes.** Found the hard way while measuring the
+    line above: run `peer → ping locked` FIRST and `locked → ping peer` then
+    PASSES, because admitting the inbound ping opened an ICMP conntrack entry
+    for that pair which the locked member's own ping rides as an established
+    flow. Measured both ways on the same pair of VMs. Anything probing an
+    outbound rule must do it on a flow with no state in the other direction.
   One upgrade cost, small but real: the outbound rule's SHAPE changed even where
   its meaning did not. It used to render as `host: any` (a hardcoded constant
   describing no group at all) and now renders as the seeded rule's true
