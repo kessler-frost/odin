@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import stat
+import time
 import threading
 import tomllib
 from importlib.metadata import PackageNotFoundError
@@ -239,6 +240,113 @@ async def test_it_does_not_block_the_event_loop():
 def test_run_command_feeds_stdin():
     result = util.run_command(["cat"], input="piped")
     assert (result.returncode, result.stdout) == (0, "piped")
+
+
+# --- cancellation reaps the child, and its TRANSPORT ------------------------
+#
+# `PytestUnraisableExceptionWarning: Event loop is closed`, raised out of the
+# garbage collector by `BaseSubprocessTransport.__del__`, is what an unreaped
+# transport looks like from a test run. The cause is a cancelled command: a
+# `gateway/models::background` boot task cancelled at app shutdown unwinds out
+# of `communicate()` having never collected the child's exit status, so
+# `Process` never closes the transport (`_maybe_close_transport` needs the
+# returncode AND EOF on the pipes). See `util.reap`.
+#
+# These test the PROCESS, not the warning. The warning is downstream of the
+# same fact and needs a closed loop plus a GC pass to show up, whereas
+# "returncode is not None" is the thing `reap` actually establishes and is
+# checkable inline.
+#
+# Mutation-tested, and only the FIRST of the two is the guard: neutering `reap`
+# fails it with `assert None is not None` (measured). The second calls `reap`
+# directly, so it survives that mutation by design -- it pins the no-op half of
+# the contract, which is what lets `reap` sit in a `finally` at all.
+
+
+async def test_a_cancelled_command_does_not_leave_the_child_running(monkeypatch: pytest.MonkeyPatch):
+    """The honest half of the bug: without the reap, a cancelled `docker` call
+    left an orphan process behind and the warning was merely the visible part.
+
+    The real `Process` is captured on its way out of `create_subprocess_exec`,
+    so the assertion reads the child odin actually spawned rather than a stand-in."""
+    spawned: list[asyncio.subprocess.Process] = []
+    real = asyncio.create_subprocess_exec
+
+    async def recording(*args, **kwargs):
+        proc = await real(*args, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", recording)
+
+    task = asyncio.create_task(util.run_command_async(["sh", "-c", "sleep 30"]))
+    await asyncio.sleep(0.2)  # let the subprocess really start
+    assert spawned and spawned[0].returncode is None, (
+        "the subprocess never started -- this test would pass vacuously"
+    )
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert spawned[0].returncode is not None, "a cancelled run_command_async left its child running"
+
+
+async def test_a_surviving_grandchild_cannot_stall_the_cancellation(monkeypatch: pytest.MonkeyPatch):
+    """The bug the FIRST version of `reap` shipped, and the reason the wait is
+    bounded and the transport closed explicitly.
+
+    `Process.wait()` does not resolve when the child dies -- CPython resolves
+    its waiters only once EVERY pipe has hit EOF (`base_subprocess.py`,
+    `_try_finish` -> `_call_connection_lost`). A grandchild that inherited the
+    child's stdout holds that pipe open, so an unbounded wait here blocked for
+    the grandchild's whole lifetime: measured at 30.0s, on the CANCELLATION
+    path, which is a hung shutdown rather than a slow one.
+
+    Two assertions because there are two independent guards, and each fails
+    alone: drop the `asyncio.timeout` and the elapsed check fails (30s, not
+    sub-second); drop `proc._transport.close()` and `_closed` stays False and
+    the ResourceWarning comes back. `REAP_TIMEOUT` is shortened so the test
+    measures the MECHANISM rather than sitting through the production grace."""
+    monkeypatch.setattr(util, "REAP_TIMEOUT", 0.3)
+    spawned: list[asyncio.subprocess.Process] = []
+    real = asyncio.create_subprocess_exec
+
+    async def recording(*args, **kwargs):
+        proc = await real(*args, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", recording)
+
+    # The grandchild outlives the shell by 30s and keeps its stdout open.
+    task = asyncio.create_task(util.run_command_async(["sh", "-c", "sleep 30 & sleep 30"]))
+    await asyncio.sleep(0.2)
+    assert spawned, "the subprocess never started -- this test would pass vacuously"
+
+    started = time.monotonic()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    elapsed = time.monotonic() - started
+
+    # A very loose bound on purpose: the failure it catches is 30s, so anything
+    # near the grandchild's lifetime is the bug. This is not timing the runner.
+    assert elapsed < 10.0, f"reap stalled the cancellation for {elapsed:.1f}s"
+    assert spawned[0].returncode is not None, "the child was left running"
+    assert spawned[0]._transport._closed, (
+        "the transport must be closed explicitly when the bounded wait gives up, "
+        "or the `Event loop is closed` warning comes back"
+    )
+
+
+async def test_reap_is_a_no_op_once_the_command_has_finished():
+    """`reap` sits in a `finally`, so it runs on the ordinary path too and must
+    not disturb it -- the returncode a caller reads is the command's own."""
+    proc = await asyncio.create_subprocess_exec("sh", "-c", "exit 3")
+    await proc.wait()
+    await util.reap(proc)
+    assert proc.returncode == 3
 
 
 async def test_colima_runtime_survives_a_missing_docker_cli(monkeypatch: pytest.MonkeyPatch):

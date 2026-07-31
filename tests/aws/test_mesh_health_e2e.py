@@ -42,6 +42,7 @@ from odin.fabric.sidecar import MeshSidecar, underlay_ip
 from odin.reconcile import mesh_health
 from odin.reconcile.assertions import mesh_ready_sync, pg_ready
 from odin.runtime.colima import ColimaRuntime
+from tests.containers import reap_volumes
 
 pytestmark = pytest.mark.integration
 
@@ -67,6 +68,12 @@ def containers():
     yield names
     for name in reversed(names):
         subprocess.run(["docker", "rm", "-f", "-v", name], capture_output=True, timeout=60)
+    # The `-v` above does NOT take the database's data volume with it: PGDATA is
+    # a NAMED volume since v0.8.14 (`aws/rds.py`), and a named volume is exactly
+    # the one thing `docker rm -f -v` leaves standing. This test never calls
+    # `delete_db` -- the only code path that removes it -- so without this it
+    # leaked `odin-rds-mesh-health-e2e-db-data` on EVERY run.
+    reap_volumes(ENV)
 
 
 @pytest.fixture

@@ -664,9 +664,38 @@ future decision against these points instead of re-deriving them:
       `egressRules` field keeps the seeded allow-all, so an existing canvas
       admits the same packets. What it gates is OVERLAY traffic only; see
       `docs/limits.md` for what that does and does not cover.
-    - Not modeled yet: NACLs, an SG's self-reference
-      (`self = true`), and ICMP rules from the canvas (`ingressRules` takes a
-      numeric port, so `icmp:-1:...` can't be drawn — the API path can).
+    - **…and enforced ON A REAL EC2 VM as of v0.8.18**, which was a separate
+      claim: v0.8.17's proof was container-level and said so ("no real Lima VM
+      ever wore a restricted egress … that is an inference, not a
+      measurement"). A VM reaches nebula by a wholly different route — config
+      via `limactl shell … sudo tee`, daemon under systemd as root — so "same
+      bytes" was not "same effect". MEASURED (`tests/simulate/
+      test_sg_egress_gates_vm_e2e.py`), two real VMs whose groups differ ONLY
+      in `egressRules`: `locked → peer:6000` (its own rule) returns `HTTP/1.0
+      200 OK` and `locked → peer:5432` returns `REFUSED timed out`, while
+      `peer → locked:5432` returns `HTTP/1.0 200 OK` in the same run — the
+      control that rules out "no VM can reach that port". Revert the compiler
+      and the blocked cell alone turns into `HTTP/1.0 200 OK`.
+      Two things that fell out of it, both in `docs/limits.md`: a restricted
+      egress also drops the member's own ICMP **re-handshake poke**
+      (`rehandshake_script`), so `_converge` is no longer unconditional; and
+      what egress does NOT gate is now measured rather than reasoned — the same
+      locked VM still reached the host over vzNAT and got HTTP 200 from
+      `https://example.com`.
+    - Not modeled yet: NACLs and an SG's self-reference (`self = true`).
+      ICMP is NOT in this list any more: this line used to claim "ICMP rules
+      from the canvas … can't be drawn", and that is only true of the literal
+      `icmp:-1:...` spelling, which is declined because the port field wants a
+      digit. Measured: `icmp:-1:0.0.0.0/0` → declined with the format reason;
+      `icmp:0:0.0.0.0/0` and `icmp:8:0.0.0.0/0` → both drawn, and both compile
+      to the IDENTICAL `proto: icmp, port: any`, because
+      `_PORTLESS_PROTOCOLS` discards the port. That is the right AWS semantics
+      (an SG's ICMP type/code lives in the port fields and nebula has no such
+      granularity) but it is a quiet footgun worth naming: **the number you
+      write after `icmp:` is ignored**, so `icmp:8` means all ICMP, not
+      echo-request. Verified on the wire by the VM test above, where the rule
+      gates real pings in both directions — an `icmp:0` rule admits an echo
+      REQUEST (type 8), which it could not do if the port were honoured.
   - Single local server by design: `ODIN_GATEWAY_PORT` overrides the embedded
     gateway's port, but there is no supported way to run two servers against
     the same CWD-relative `.odin` store (the second binds-conflicts on the
@@ -1551,6 +1580,40 @@ correctly scoped to a prefix and still wrong, which is the subtle form of the
 machine-wide-sweep rule already in CLAUDE.md. A test-owned env is invisible to
 every check a human would think to run; the only safe rule is to touch nothing
 while a suite is running.
+
+## v0.8.18 — the egress gate is measured on a VM, and a cancelled subprocess stops leaking
+
+**A drawn egress rule is now proven to block on a real EC2 Lima VM.** v0.8.17
+compiled `IpPermissionsEgress` into nebula's `outbound` and measured a real
+block — on CONTAINERS, and said so: *"No real Lima VM ever wore a restricted
+egress … that is an inference, not a measurement."* A VM is a mesh member by a
+different route (config landed with `limactl shell … sudo tee`, daemon under
+systemd as root, its own tun) so "same bytes" was never "same effect". The
+measurement, the falsification and the two things that fell out of it are in
+`docs/limits.md`; the short version is that the block is real, and reverting the
+compiler turns the one blocked cell — and no other — green.
+
+**A cancelled subprocess no longer leaks a process OR its transport, and the fix
+that removed the leak nearly shipped a 30-second hang.** `run_command_async` and
+three siblings unwound out of `communicate()` on cancellation having never
+collected the child, leaving a live `docker`/`tofu` and an asyncio transport that
+raised `RuntimeError: Event loop is closed` out of the garbage collector.
+`util.reap` kills and collects in a `finally`. The trap, found by challenging the
+first version rather than by a test: **`Process.wait()` does not return when the
+process dies** — CPython resolves its waiters only once every pipe hits EOF, so a
+SIGKILLed child that left a GRANDCHILD holding the inherited stdout pipe blocks
+forever. Measured at 29.7s on the cancellation path, with the killed process
+provably gone. So the wait is bounded (`REAP_TIMEOUT`, 0.5s — there is no middle
+case for a larger value to cover) and `_transport.close()` makes the timeout path
+lossless. Mutation-tested both ways in `tests/test_reap_bounded.py`.
+
+*Honest gap:* the symptom originally reported — `PytestUnraisableExceptionWarning`
+out of `tests/simulate/test_lambda_failure_e2e.py` — **did not reproduce here**,
+with the fix or with `reap` neutralised (injection verified active by that same
+run failing the reap ratchets). The defect and the fix are real and were
+reproduced in pure asyncio; that particular test only produces the warning when
+something actually cancels an in-flight command, which an isolated fast run never
+does. Recorded rather than claimed.
 
 ## v0.8.16 — the gate stops lying, and two leaks that made it lie
 

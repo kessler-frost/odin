@@ -61,6 +61,7 @@ from odin.compute.instances import instance_membership_path, vm_name
 from odin.fabric.nebula import LighthouseManager
 from odin.server import create_app
 from odin.spec.store import SpecStore
+from tests.containers import reap_volumes
 
 pytestmark = pytest.mark.integration
 
@@ -129,6 +130,11 @@ def containers():
     yield names
     for name in reversed(names):
         subprocess.run(["docker", "rm", "-f", "-v", name], capture_output=True, timeout=60)
+    # The `-v` above does NOT take `odin-rds-{ENV}-db-data` with it: PGDATA is a
+    # NAMED volume (`aws/rds.py`), and leaving named volumes alone is exactly
+    # what `docker rm -f -v` promises. Nothing else here removes it -- the canvas
+    # is never destroyed through a real DELETE -- so it leaked once per run.
+    reap_volumes(ENV)
 
 
 @pytest.fixture

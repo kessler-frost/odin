@@ -376,6 +376,20 @@ class TfRunner:
             # documented recovery, on the same tail the CLI/UI already print.
             if hint:
                 tail.append(hint)
+        finally:
+            # The timeout above is not the only way out of this frame: an
+            # OUTER cancellation (the request aborted, the app shutting down)
+            # unwinds straight past both branches with tofu still running. That
+            # leaves the whole process GROUP standing -- tofu AND its provider
+            # plugin -- plus an unreaped asyncio transport that raises
+            # `RuntimeError: Event loop is closed` out of the GC once the loop
+            # closes. Same defect and same reasoning as `util.reap`, which this
+            # cannot simply call: `start_new_session=True` above means the group
+            # is what has to be signalled, not the single pid.
+            if proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                await proc.wait()
 
         ok = code in ok_codes
         payload = {"type": "tf", "env": env, "phase": phase, "status": "ok" if ok else "failed", "exit_code": code}

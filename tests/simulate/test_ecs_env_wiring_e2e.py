@@ -36,6 +36,7 @@ from odin.agent import translate as translate_mod
 from odin.compute.tasks import container_name
 from odin.server import create_app
 from odin.spec.store import SpecStore
+from tests.containers import reap_volumes
 
 pytestmark = pytest.mark.integration
 
@@ -102,6 +103,11 @@ def cleanup():
     ps = _docker("ps", "-aq", "--filter", "label=odin=1", "--filter", f"name={ENV}")
     for container_id in (line for line in ps.stdout.splitlines() if line):
         _docker("rm", "-f", "-v", container_id)
+    # The `-v` above does NOT take `odin-rds-{ENV}-{db}-data` with it: PGDATA is
+    # a NAMED volume (`aws/rds.py`), and leaving named volumes alone is exactly
+    # what `docker rm -f -v` promises. This canvas has an rds node and is never
+    # destroyed through a real DELETE, so the volume leaked once per run.
+    reap_volumes(ENV)
 
 
 def test_an_ecs_service_consumes_its_canvas_env_refs_for_real(tmp_path, monkeypatch, cleanup):

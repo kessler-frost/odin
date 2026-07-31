@@ -99,6 +99,7 @@ from odin.gateway.keys import KeyStore, workload_env
 from odin.gateway.models import background, ec2net
 from odin.gateway.stores import NO_CHANGE, SynthStores
 from odin.simulate.workspace import tf_dir
+from odin.util import reap
 
 log = logging.getLogger("odin.gateway.ec2compute")
 
@@ -975,7 +976,10 @@ async def _generate_keypair() -> tuple[str, str]:
         proc = await asyncio.create_subprocess_exec(
             *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await proc.communicate()
+        try:
+            stdout, stderr = await proc.communicate()
+        finally:
+            await reap(proc)  # a cancelled call must not leave ssh-keygen (or its transport) standing
         if proc.returncode:
             raise subprocess.CalledProcessError(
                 proc.returncode, argv, output=stdout.decode(errors="replace"),

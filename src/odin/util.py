@@ -25,6 +25,7 @@ pidfile, and `odin import` refuses to restore into a live store.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import errno
 import fcntl
 import os
@@ -43,6 +44,21 @@ from pathlib import Path
 # repeating an octal literal.
 SECRET_FILE_MODE = 0o600
 PRIVATE_DIR_MODE = 0o700
+
+# How long `reap` will wait for a SIGKILLed child to be collected before giving
+# up. See `reap` for the measurement that makes an unbounded wait a hang rather
+# than a wait.
+#
+# 0.5, not the 5.0 this first landed as, and the reason is that there is no
+# middle case for it to cover. After a SIGKILL the wait resolves either as soon
+# as the loop services the pipe readers -- ~1ms measured, because the dead
+# child's write end is closed by the kernel -- or NEVER, because a surviving
+# grandchild still holds that write end open (`reap`'s table). Nothing takes
+# 2s. So every tenth of a second here is pure shutdown stall in the grandchild
+# case and buys nothing in the ordinary one, and `_transport.close()` below
+# makes the timeout path lossless anyway. 0.5 keeps a 500x margin over the
+# measured figure for a loaded machine without stalling a shutdown.
+REAP_TIMEOUT = 0.5
 
 # The running version, from the ONE file a human edits (pyproject.toml) when
 # we're in a source checkout, and from installed metadata otherwise. Order
@@ -120,6 +136,85 @@ def run_command(args: list[str], input: str | None = None) -> CommandResult:
     return CommandResult(proc.returncode, proc.stdout, proc.stderr)
 
 
+async def reap(proc: asyncio.subprocess.Process) -> None:
+    """Kill and collect `proc` if it is still running. A no-op on every ordinary
+    return, so it belongs in a `finally` rather than an `except`.
+
+    CANCELLATION is the case this exists for, and it is not hypothetical: a
+    `gateway/models::background` boot task cancelled when the app shuts down, or
+    a `wait_for` giving up, unwinds out of `communicate()` having never
+    collected the child's exit status. That leaves TWO things standing -- the
+    `docker` process itself, and asyncio's subprocess TRANSPORT, which
+    `Process` only closes once the returncode is in AND the pipes have hit EOF
+    (`asyncio/subprocess.py::_maybe_close_transport`). The transport then
+    reaches `__del__` after the loop has closed and raises out of the garbage
+    collector, which is what pytest reports as
+    `PytestUnraisableExceptionWarning: Event loop is closed`:
+
+        BaseSubprocessTransport.__del__  (base_subprocess.py:130)
+          -> close()                     (:107  proto.pipe.close())
+          -> _UnixReadPipeTransport._close  (unix_events.py:627)
+          -> loop.call_soon()            -> RuntimeError: Event loop is closed
+
+    Probed on this interpreter rather than assumed. CPython 3.13.3 carries no
+    gh-114177 "skip the pipe close if the loop is already closed" guard, so
+    `close()` really does reach `call_soon` on a dead loop. Measured on a
+    cancelled `run_command_async`: `_closed=False` with no reap and the
+    RuntimeError on the next `gc.collect()`; `_closed=True` and silence with
+    one.
+
+    The honest half is the process, not the warning: without this a cancelled
+    apply left an orphan `docker` running, and the warning was only the part
+    that was visible.
+
+    THE WAIT IS BOUNDED, and that is not defensive padding -- an unbounded
+    `await proc.wait()` here HANGS FOREVER in a case this very repo produces.
+    `Process.wait()` does not resolve when the process dies; CPython resolves
+    its waiters in `BaseSubprocessTransport._call_connection_lost`, which
+    `_try_finish` gates on EVERY pipe being disconnected. So a SIGKILLed
+    process that left a GRANDCHILD holding the inherited stdout pipe never
+    reaches EOF and never resolves, even though the process we killed is
+    provably gone. Measured on this interpreter, same script all three ways:
+
+        stdout=PIPE, grandchild left    wait() HUNG >5s   (ps: shell is gone)
+        stdout=PIPE, grandchild killed  wait() -> rc=-9 in 0.000s
+        no pipe at all                  wait() -> rc=-9 immediately
+
+    That matters because this runs in a `finally` on the CANCELLATION path, so
+    an unbounded wait would block a shutdown indefinitely -- strictly worse
+    than the warning it exists to remove. `simulate/runner.py`'s sibling is not
+    exposed to it: `start_new_session=True` lets it `killpg` the whole group,
+    so the grandchildren die and release the pipes.
+
+    The timeout firing used to mean accepting the warning back -- MEASURED, the
+    grandchild case came back `_closed=False` and raised on the next
+    `gc.collect()` even with the bound in place. The close below is what retires
+    that residual, so the bound now costs nothing but the wait itself."""
+    if proc.returncode is None:
+        proc.kill()
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(REAP_TIMEOUT):
+                await proc.wait()
+    # THE BACKSTOP, and the reason giving up on the wait above is safe.
+    #
+    # `__del__`'s entire problem is WHEN it calls `close()`, not that it does:
+    # after the loop is dead, `call_soon` raises. `close()` itself waits for
+    # nothing (it is synchronous, closes the read pipes and SIGKILLs a child
+    # that is somehow still running), so calling it HERE -- on a live loop --
+    # is both instant and sufficient, and it sets `_closed` so `__del__`
+    # becomes a no-op. Measured on the grandchild case that defeats the bound:
+    # `_closed=False` + RuntimeError without this line, `_closed=True` + a
+    # clean GC with it, same 0.5s reap either way.
+    #
+    # `_transport` is private, and is reached for because there is no public
+    # equivalent -- `Process` exposes kill/wait/communicate and no way to say
+    # "release this". It is safe to hold: `Process` never nulls it (only
+    # `SubprocessStreamProtocol._maybe_close_transport` nulls its OWN copy), and
+    # `close()` is idempotent, so the ordinary path where the transport already
+    # closed itself returns immediately.
+    proc._transport.close()
+
+
 async def run_command_async(args: list[str], input: str | None = None) -> CommandResult:
     """`run_command`'s async twin, and the one the event loop should use.
 
@@ -152,7 +247,10 @@ async def run_command_async(args: list[str], input: str | None = None) -> Comman
         )
     except FileNotFoundError:
         return CommandResult(COMMAND_NOT_FOUND, "", f"{args[0]}: command not found")
-    out, err = await proc.communicate(input.encode() if input is not None else None)
+    try:
+        out, err = await proc.communicate(input.encode() if input is not None else None)
+    finally:
+        await reap(proc)
     return CommandResult(
         proc.returncode if proc.returncode is not None else COMMAND_NOT_FOUND,
         out.decode("utf-8", errors="replace"),

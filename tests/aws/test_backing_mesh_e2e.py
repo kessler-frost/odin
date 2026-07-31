@@ -37,6 +37,7 @@ from odin.fabric.nebula import LighthouseManager, ensure_network
 from odin.fabric.sidecar import MeshSidecar, underlay_ip
 from odin.reconcile.assertions import pg_ready
 from odin.runtime.colima import ColimaRuntime, ContainerSpec
+from tests.containers import reap_volumes
 
 pytestmark = pytest.mark.integration
 
@@ -69,6 +70,12 @@ def containers():
     yield names
     for name in reversed(names):
         subprocess.run(["docker", "rm", "-f", "-v", name], capture_output=True, timeout=60)
+    # ...and the rds data VOLUME, which `-v` above does NOT remove: PGDATA is a
+    # NAMED volume (`aws/rds.py`), and leaving named volumes alone is precisely
+    # what `docker rm -f -v` promises. The happy path ends in `delete_db`, which
+    # does remove it -- but any assertion failing BEFORE that line skips it, so
+    # the leak was the failure path only, which is the worst kind to leave.
+    reap_volumes(ENV)
 
 
 @pytest.fixture
