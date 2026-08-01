@@ -19,12 +19,20 @@ and after. Before: `WaitTimeSeconds=5` -> `ServiceUnavailableException` 503 in
 5 -> empty answer in 5.01s, 10 -> 10.00s, 20 -> 20.01s, and 25 -> `ClientError
 Code='InvalidParameterValue'` HTTP 400 in 0.00s -- so `InvalidParameterValue` is
 what botocore really surfaces from the document `errors.synth_error` writes,
-measured rather than assumed. The one thing NO unit test here can prove is that
-REAL goaws holds an empty-queue receive open for the whole wait; that is
-`tests/gateway/test_gateway_e2e.py::test_sqs_long_poll_on_an_empty_queue_is_not_a_503`,
-which needs a container. goaws's side of it was read from its source at the
-pinned `v0.5.4` (`loops := waitTimeSeconds * 10`, one 100ms timer per loop) rather
-than guessed.
+measured rather than assumed.
+
+AND WHAT IT MISSED (2026-07-31). This file used to say that the one thing no unit
+test here could prove was that REAL goaws holds an empty-queue receive open "for
+the whole wait". The premise was wrong, not just the coverage: goaws holds it for
+about 1.5x the wait -- a 20-second poll comes back at ~30.5s. `loops :=
+waitTimeSeconds * 10` with a 100ms timer per loop was read correctly off the
+pinned v0.5.4 source and then reasoned about as if a 100ms Go timer in a
+container costs 100ms. So the derivation accommodated 20s, the backing took
+30.5s, and `test_sqs_long_poll_on_an_empty_queue_is_not_a_503` -- written but
+never run at the time -- failed against a real container while every test in here
+passed. The measurements are beside `app.py::_BACKING_LONG_POLL_OVERSHOOT`, and
+`goaws_paced` now makes the socket stand-in overshoot the way the real backing
+does, so that gap can fail a build instead of waiting for a container.
 
 The base read timeout is deliberately SHRUNK (`_BASE_READ`) in the socket tests
 rather than left at production's 5s: it makes the test harder, not easier -- a
@@ -66,6 +74,12 @@ _BASE_READ = 0.5
 # What the slow backing waits before answering -- comfortably past `_BASE_READ`,
 # so an unextended read timeout fails and an extended one does not.
 _BACKING_DELAY = 1.5
+# The worst goaws:nominal hold ratio MEASURED against the real container on
+# 2026-07-31 (1.57x; the table lives beside
+# `app.py::_BACKING_LONG_POLL_OVERSHOOT`). `goaws_paced` sleeps this multiple of
+# the wait it is handed, so the socket half of this file models the backing odin
+# actually ships instead of one that honours its own parameter exactly.
+_MEASURED_GOAWS_OVERSHOOT = 1.6
 
 _EMPTY_RECEIVE = b'{"Messages": []}'
 _OK_HEAD = (
@@ -77,15 +91,15 @@ _OK_HEAD = (
 Handler = Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]]
 
 
-async def _read_request(reader: asyncio.StreamReader) -> list[bytes]:
-    """The request's header lines, with its body consumed -- leaving unread body
-    bytes in the socket makes the close look like a broken response."""
+async def _read_request(reader: asyncio.StreamReader) -> tuple[list[bytes], bytes]:
+    """The request's header lines AND its body. The body must be consumed either
+    way -- leaving unread bytes in the socket makes the close look like a broken
+    response -- and `goaws_paced` needs to read the wait out of it."""
     head = await reader.readuntil(b"\r\n\r\n")
     lines = head.split(b"\r\n")
     length = int(next((line.split(b":", 1)[1] for line in lines
                        if line.lower().startswith(b"content-length:")), b"0"))
-    await reader.readexactly(length)
-    return lines
+    return lines, await reader.readexactly(length)
 
 
 def _target(lines: list[bytes]) -> str:
@@ -109,10 +123,37 @@ def slow_receive(seen: list[str], delay: float = _BACKING_DELAY) -> Handler:
     through the SAME routing table."""
 
     async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        target = _target(await _read_request(reader))
+        lines, _ = await _read_request(reader)
+        target = _target(lines)
         seen.append(target)
         if target.endswith("ReceiveMessage"):
             await asyncio.sleep(delay)
+        writer.write(_OK_HEAD + _EMPTY_RECEIVE)
+        await writer.drain()
+        writer.close()
+
+    return handler
+
+
+def goaws_paced(seen: list[str], overshoot: float = _MEASURED_GOAWS_OVERSHOOT) -> Handler:
+    """`slow_receive`'s honest sibling: a backing that holds the receive for
+    `overshoot` times the wait it was HANDED, the way the real one does.
+
+    This is the stand-in the first version of this file needed and did not have.
+    `slow_receive` sleeps a fixed delay chosen by the test, so it models a backing
+    that returns whenever the test finds convenient; nothing about it could ever
+    contradict `_forward_timeout`. Real goaws answers a 20-second poll at ~30.5s
+    (`app.py::_BACKING_LONG_POLL_OVERSHOOT` carries the measurements), so a
+    derivation that accommodated exactly 20 shipped the same 503 it was written to
+    remove and the whole socket half of this file stayed green.
+
+    Reading the wait out of the REQUEST is the point -- a hard-coded sleep would
+    be another number the test picked."""
+
+    async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        lines, body = await _read_request(reader)
+        seen.append(_target(lines))
+        await asyncio.sleep(json.loads(body or b"{}").get("WaitTimeSeconds", 0) * overshoot)
         writer.write(_OK_HEAD + _EMPTY_RECEIVE)
         await writer.drain()
         writer.close()
@@ -133,7 +174,8 @@ def never_answers(seen: list[str], released: asyncio.Event) -> Handler:
     is the timeout under test."""
 
     async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        seen.append(_target(await _read_request(reader)))
+        lines, _ = await _read_request(reader)
+        seen.append(_target(lines))
         await released.wait()
         writer.close()
 
@@ -208,13 +250,20 @@ def test_the_production_forward_client_extends_only_its_read_timeout():
 
     This is the test that rejects a "fix" that simply raises every timeout: read
     stays at the client's OWN 5s when there is no poll, and connect/write/pool
-    stay at 5s always."""
+    stay at 5s always.
+
+    The multiplier is the second half of the fix and the reason these numbers
+    moved: 20 used to buy 25.0s here, and real goaws holds a 20-second poll for
+    ~30.5s, so that answer was short by five seconds of the one case it existed
+    to cover."""
     client = httpx.AsyncClient()
     assert client.timeout.read == 5.0, "the httpx default this bug was made of"
 
-    assert _forward_timeout(client, 0).read == 5.0
-    assert _forward_timeout(client, 5).read == 10.0
-    assert _forward_timeout(client, SQS_MAX_WAIT_TIME_SECONDS).read == 25.0
+    assert _forward_timeout(client, 0).read == 5.0, "no poll, no extension"
+    assert _forward_timeout(client, 5).read == 17.5
+    assert _forward_timeout(client, SQS_MAX_WAIT_TIME_SECONDS).read == 55.0
+    assert _forward_timeout(client, SQS_MAX_WAIT_TIME_SECONDS).read > 30.94, \
+        "the longest hold ever MEASURED out of real goaws for a 20s poll was 30.94s"
 
     stretched = _forward_timeout(client, SQS_MAX_WAIT_TIME_SECONDS)
     assert (stretched.connect, stretched.write, stretched.pool) == (5.0, 5.0, 5.0), \
@@ -297,6 +346,38 @@ async def test_a_long_poll_outlasts_the_base_read_timeout_and_answers_empty(sink
     assert seen == ["AmazonSQS.ReceiveMessage"]
 
 
+async def test_a_backing_that_overshoots_its_wait_like_real_goaws_is_still_accommodated(
+    sink, keystore, stores,
+):
+    """THE GAP THIS FILE HAD. Every other socket test here uses `slow_receive`,
+    which sleeps a delay the TEST picked -- so the stand-in always answered inside
+    whatever `_forward_timeout` allowed, and the whole file stayed green while the
+    integration test failed against a real container.
+
+    `goaws_paced` sleeps 1.6x the wait it was handed, which is what the real
+    backing measurably does. With the old `read = base + wait` derivation the
+    numbers here are 0.5 + 1 = 1.5s of patience against a 1.6s hold: a
+    `ReadTimeout`, and the same 503 for a queue that is merely empty. With the
+    overshoot factor it is 0.5 + 2.5 = 3.0s, and the empty answer arrives.
+
+    Mutation-tested rather than assumed: `_BACKING_LONG_POLL_OVERSHOOT = 1`
+    fails this test with the 503."""
+    sqs = _sqs_client(sink, keystore)
+    req = sink.call(lambda: sqs.receive_message(
+        QueueUrl=f"{sink.endpoint}/000000000000/jobs", WaitTimeSeconds=1, MaxNumberOfMessages=1,
+    ))
+    seen: list[str] = []
+
+    async with backing(goaws_paced(seen)) as port:
+        resp = await _drive(_app(_granted(port, "sqs:ReceiveMessage"), keystore, stores), req,
+                            tolerate_failure=True)
+
+    assert resp.status_code == 200, \
+        f"a backing that holds {_MEASURED_GOAWS_OVERSHOOT}x its wait is the one odin ships: {resp.text}"
+    assert resp.json() == {"Messages": []}
+    assert seen == ["AmazonSQS.ReceiveMessage"]
+
+
 async def test_a_forward_that_is_not_a_long_poll_keeps_the_base_read_timeout(sink, keystore, stores):
     """The other half of "derived, not raised": a `SendMessage` to the very same
     queue still gives up at the client's own read timeout.
@@ -343,7 +424,8 @@ async def test_the_queue_attribute_goaws_falls_back_to_is_accommodated_too(sink,
     seen: list[str] = []
 
     async def create_then_poll(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        target = _target(await _read_request(reader))
+        lines, _ = await _read_request(reader)
+        target = _target(lines)
         seen.append(target)
         # CreateQueue must answer a QueueUrl, since synth's postprocess rewrites it.
         body = b'{"QueueUrl": "http://us-east-1.goaws.com:4100/000000000000/jobs"}'
