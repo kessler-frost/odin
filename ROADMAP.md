@@ -651,10 +651,54 @@ future decision against these points instead of re-deriving them:
       no join), needs `NET_ADMIN` + `/dev/net/tun` INSIDE the sidecar
       container (a container capability Colima grants unprivileged — no sudo,
       no host change), and `ODIN_BACKING_MESH=0` turns it off.
-    - Not modeled yet: egress rules (nebula gets allow-all outbound
-      regardless of what a canvas draws), NACLs, an SG's self-reference
-      (`self = true`), and ICMP rules from the canvas (`ingressRules` takes a
-      numeric port, so `icmp:-1:...` can't be drawn — the API path can).
+    - **Egress rules are ENFORCED as of v0.8.17** — this line used to read
+      "not modeled yet: egress rules (nebula gets allow-all outbound
+      regardless of what a canvas draws)". `sg_rules_to_firewall` now compiles
+      `IpPermissionsEgress` into nebula's `outbound`, and
+      `ec2net._compiled_firewall` stops filtering the egress half of the store
+      away. MEASURED on a real mesh (`tests/simulate/
+      test_sg_egress_gates_e2e.py`): a member whose group's only egress rule is
+      `tcp:6000` reaches tcp:6000 on a peer and gets **nothing** from tcp:5432
+      on that same peer in the same instant; revert the compiler and the same
+      probe returns `pong5432`. AWS's default is untouched — an empty
+      `egressRules` field keeps the seeded allow-all, so an existing canvas
+      admits the same packets. What it gates is OVERLAY traffic only; see
+      `docs/limits.md` for what that does and does not cover.
+    - **…and enforced ON A REAL EC2 VM as of v0.8.18**, which was a separate
+      claim: v0.8.17's proof was container-level and said so ("no real Lima VM
+      ever wore a restricted egress … that is an inference, not a
+      measurement"). A VM reaches nebula by a wholly different route — config
+      via `limactl shell … sudo tee`, daemon under systemd as root — so "same
+      bytes" was not "same effect". MEASURED (`tests/simulate/
+      test_sg_egress_gates_vm_e2e.py`), two real VMs whose groups differ ONLY
+      in `egressRules`: `locked → peer:6000` (its own rule) returns `HTTP/1.0
+      200 OK` and `locked → peer:5432` returns `REFUSED timed out`, while
+      `peer → locked:5432` returns `HTTP/1.0 200 OK` in the same run — the
+      control that rules out "no VM can reach that port". Revert the compiler
+      and the blocked cell alone turns into `HTTP/1.0 200 OK`.
+      Two things that fell out of it, both in `docs/limits.md`: a restricted
+      egress also drops the member's own ICMP **re-handshake poke**
+      (`rehandshake_script`), so `_converge` is no longer unconditional; and
+      what egress does NOT gate is now measured rather than reasoned — the same
+      locked VM still reached the host over vzNAT and got HTTP 200 from
+      `https://example.com`.
+    - Not modeled yet: NACLs and an SG's self-reference (`self = true`).
+      ICMP is a narrower gap than this line used to claim. `icmp:-1:...` still
+      can't be drawn — `ingressRules` takes a numeric port or an `8000-8100`
+      range, and a bare `-1` is neither; pinned by `test_sg_port_ranges.py::
+      test_a_bare_minus_one_port_is_still_declined`, since a range grammar is
+      exactly the change that could have made this stale by accident. But ICMP
+      as such IS drawable, which the old wording denied. Measured against the
+      range grammar: `icmp:-1:0.0.0.0/0` → declined with the format reason;
+      `icmp:0:0.0.0.0/0` and `icmp:8:0.0.0.0/0` → both drawn, and both compile
+      to the IDENTICAL `proto: icmp, port: any`, because `_PORTLESS_PROTOCOLS`
+      discards the port. That is the right AWS semantics (an SG's ICMP
+      type/code lives in the port fields and nebula has no such granularity)
+      but it is a quiet footgun worth naming: **the number you write after
+      `icmp:` is ignored**, so `icmp:8` means all ICMP, not echo-request.
+      Verified on the wire by the VM test above, where the rule gates real
+      pings in both directions — an `icmp:0` rule admits an echo REQUEST
+      (type 8), which it could not do if the port were honoured.
   - Single local server by design: `ODIN_GATEWAY_PORT` overrides the embedded
     gateway's port, but there is no supported way to run two servers against
     the same CWD-relative `.odin` store (the second binds-conflicts on the
@@ -1540,9 +1584,80 @@ machine-wide-sweep rule already in CLAUDE.md. A test-owned env is invisible to
 every check a human would think to run; the only safe rule is to touch nothing
 while a suite is running.
 
+## v0.8.17 — egress enforced and MEASURED, port ranges round-trip, and three tests that were never really waiting
+
+**A drawn egress rule is now proven to block on a real EC2 Lima VM.** v0.8.17
+compiled `IpPermissionsEgress` into nebula's `outbound` and measured a real
+block — on CONTAINERS, and said so: *"No real Lima VM ever wore a restricted
+egress … that is an inference, not a measurement."* A VM is a mesh member by a
+different route (config landed with `limactl shell … sudo tee`, daemon under
+systemd as root, its own tun) so "same bytes" was never "same effect". The
+measurement, the falsification and the two things that fell out of it are in
+`docs/limits.md`; the short version is that the block is real, and reverting the
+compiler turns the one blocked cell — and no other — green.
+
+**SQS long polling did NOT work in v0.8.16 — the backing holds a poll 1.5x
+longer than the wait, and the fix's own integration test proved it the first
+time it was run.** v0.8.16 derived the forward's read timeout as `client read +
+this request's wait` and called it fixed on the strength of a real-socket unit
+proof. The socket slept exactly the wait it was handed; real goaws does not.
+MEASURED against the container with a 300s client-side timeout: `WaitTimeSeconds=
+20` is held for **29.83–30.94s** (1.47–1.57x, and the queue-attribute door
+overshoots the same), so 25s of patience produced the very `ServiceUnavailable`
+the change existed to remove. `loops := waitTimeSeconds * 10` with a 100ms timer
+per loop had been read correctly off the pinned v0.5.4 source and then reasoned
+about as if a 100ms Go timer in a container costs 100ms. The timeout now scales
+by a measured overshoot factor (`5 + wait × 2.5`; 55s for the longest legal
+poll, inside botocore's 60s default), and — the part that stops the recurrence —
+the socket stand-in overshoots like the real backing, so reverting the factor
+fails the UNIT suite instead of waiting for a container. Measured after:
+empty-queue 20s poll → empty answer in 28.06s, non-empty → 0.00s.
+
+**A "regression" in the SG mesh test was a test with no time in it, and the
+egress compiler was innocent.** `test_a_drawn_sg_gates_real_postgres_traffic_
+over_the_overlay` began failing its host-path assertion right after egress
+compilation landed, which reads like the change breaking connectivity to a
+database. It is not: the wait was `for _ in range(60)` with no sleep, and all 60
+attempts MEASURED 0.182s against a Postgres that first answered at 0.735s —
+`create_db` returns when `docker run` does, PGDATA still needs initdb, and
+docker-proxy accepts then closes while nothing listens. It had been green only
+because `join_mesh` burned ~1.6s of unrelated wall clock first. Three
+independent falsifications: it reproduces with the mesh skipped entirely (0.136s
+of attempts vs a 2.218s first answer), the changed functions
+(`sg_rules_to_firewall`/`union_firewalls`) are not on the test's code path at
+all, and it fails identically at the pre-egress v0.8.16 commit. Both waits are
+deadlines in seconds now. Production never had the bug — `rdsctl`'s create
+waiter is already `while time.monotonic() < deadline`.
+
+**A cancelled subprocess no longer leaks a process OR its transport, and the fix
+that removed the leak nearly shipped a 30-second hang.** `run_command_async` and
+three siblings unwound out of `communicate()` on cancellation having never
+collected the child, leaving a live `docker`/`tofu` and an asyncio transport that
+raised `RuntimeError: Event loop is closed` out of the garbage collector.
+`util.reap` kills and collects in a `finally`. The trap, found by challenging the
+first version rather than by a test: **`Process.wait()` does not return when the
+process dies** — CPython resolves its waiters only once every pipe hits EOF, so a
+SIGKILLed child that left a GRANDCHILD holding the inherited stdout pipe blocks
+forever. Measured at 29.7s on the cancellation path, with the killed process
+provably gone. So the wait is bounded (`REAP_TIMEOUT`, 0.5s — there is no middle
+case for a larger value to cover) and `_transport.close()` makes the timeout path
+lossless. Mutation-tested both ways in `tests/test_reap_bounded.py`.
+
+*Honest gap:* the symptom originally reported — `PytestUnraisableExceptionWarning`
+out of `tests/simulate/test_lambda_failure_e2e.py` — **did not reproduce here**,
+with the fix or with `reap` neutralised (injection verified active by that same
+run failing the reap ratchets). The defect and the fix are real and were
+reproduced in pure asyncio; that particular test only produces the warning when
+something actually cancels an in-flight command, which an isolated fast run never
+does. Recorded rather than claimed.
+
 ## v0.8.16 — the gate stops lying, and two leaks that made it lie
 
-**SQS long polling works.** `WaitTimeSeconds >= 5` used to exceed the forward
+**SQS long polling works.** *(CORRECTED in v0.8.18 — it did not. The derived
+timeout accommodated the NOMINAL wait, and real goaws holds a poll ~1.5x longer
+than that, so the 503 survived for any wait it mattered for. See the v0.8.18
+entry; the "real socket" this section credits is exactly what missed it.)*
+`WaitTimeSeconds >= 5` used to exceed the forward
 client's 5s read timeout, so an empty queue answered `ServiceUnavailable` — for
 the recommended way to consume a queue, and indistinguishable from the backing
 being down while `/world` said healthy. Measured cost was 10s, not 5, because
@@ -1848,12 +1963,23 @@ run and are not described as such.
     is named with a count because the group then allows LESS, and `egress` cannot
     survive at all (odin re-emits its own wide-open default and has no outbound
     field) so a restricted source comes back UNRESTRICTED.
+    **The port-RANGE half was closed in v0.8.17**: the line grammar takes
+    `tcp:8000-8100:0.0.0.0/0` in both fields, a single port is the degenerate
+    range so existing canvases emit byte-identical HCL, and an imported range
+    round-trips with BOTH bounds instead of being dropped. The narrowing it
+    replaced was a correctness bug, not a missing feature — regenerating
+    someone's Terraform handed back a firewall tighter than the one they wrote.
+    What still cannot be imported is a port that is not a literal number
+    (`var.port`), which is named and counted the same way.
     **The outbound half of that was closed in v0.8.14**: the sg node has an
     `egressRules` field in the same line format, real `egress` blocks are
     emitted from it, and the wide-open default now applies only when the field
-    is empty — which keeps every pre-existing canvas byte-identical. Nebula
-    still compiles INGRESS only (`outbound: any`), so an egress rule is portable
-    configuration rather than a control; `docs/limits.md` says so.
+    is empty — which keeps every pre-existing canvas byte-identical. **And in
+    v0.8.17 it became a control rather than portable configuration**: nebula
+    compiles the outbound half too, measured blocking real traffic on a real
+    mesh. This paragraph said "Nebula still compiles INGRESS only
+    (`outbound: any`), so an egress rule is portable configuration rather than
+    a control" until that landed.
   - **ec2** — three references that each decide something different: containment
     (unappliable without it), security groups (less protected), and the companion
     key pair (unreachable). One warning each, not one vague line.

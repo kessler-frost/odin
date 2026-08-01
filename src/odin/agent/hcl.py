@@ -371,7 +371,13 @@ _NOT_IN_VPC = (
 # an import canonicalize a wide-open egress either way — as an empty field or
 # as that one line — and regenerate the same file. Two hand-kept copies would
 # have made "identical" a hope; one builder makes it arithmetic.
-_DEFAULT_EGRESS_RULE = ("-1", "0", "0.0.0.0/0")
+#
+# v0.8.17 goes one step further and stores it as the LINE rather than as a
+# pre-split tuple, so `_default_egress_block` runs it through `parse_sg_rule`
+# like any other canvas line. "Spellable in the grammar" was previously a test
+# assertion about a tuple; now it is the only way this constant reaches the
+# emitter at all.
+_DEFAULT_EGRESS_LINE = "-1:0:0.0.0.0/0"
 
 
 # CANVAS WIRING ordering (field test 2, the product hole). A workload node's
@@ -609,11 +615,45 @@ _SG_RULE_FIELDS: tuple[tuple[str, str, str], ...] = (
 )
 
 
-def _sg_rules(res: ResourceDesired, field: str) -> list[tuple[str, str, str]] | None:
-    """Parse one of the SG node's rule fields (`ingressRules`/`egressRules`):
-    one rule per line, formatted `protocol:port:peer` (e.g. `tcp:443:0.0.0.0/0`).
-    Returns (protocol, port, peer) triples, or None when any non-empty line
-    doesn't fit the format.
+def _port_span(text: str) -> tuple[str, str] | None:
+    """The PORT field of a rule line, as the `(from_port, to_port)` pair AWS's
+    model is actually made of. None when the text is not a port span at all.
+
+    A SINGLE PORT IS THE DEGENERATE RANGE. `443` is `("443", "443")`, which is
+    what `_sg_rule_block` already emitted for every rule ever written, so
+    extending the grammar changes no existing canvas's bytes -- pinned by
+    `tests/agent/test_sg_port_ranges.py::test_a_single_port_emits_exactly_the_
+    bytes_it_always_did`.
+
+    `partition` and not `split("-")`, and the `if sep` is the whole point: with
+    `split` plus a `high or low` fallback, `8000-` would parse as `8000-8000`
+    and a user who typed half a range would get a firewall a thousand ports
+    narrower than the one they were editing, silently. A separator with nothing
+    after it is a MALFORMED range, not a single port, so it declines here and
+    `_rule_reason` names the line.
+
+    A reversed span (`8100-8000`) is declined too: real AWS rejects
+    `to_port < from_port` (InvalidParameterValue), and nebula's
+    `f"{from_port}-{to_port}"` would emit a range no packet can be in -- a rule
+    that looks enforced and matches nothing.
+    """
+    low, sep, high = text.partition("-")
+    high = high if sep else low
+    ordered = low.isdigit() and high.isdigit() and int(low) <= int(high)
+    return (low, high) if ordered else None
+
+
+def parse_sg_rule(line: str) -> tuple[str, str, str, str] | None:
+    """One canvas rule line -> `(protocol, from_port, to_port, peer)`, or None
+    when the line does not fit the grammar.
+
+    THE GRAMMAR, in one place, because `import_tf.py` writes lines that this
+    has to read back. It is `protocol:port:peer` (e.g. `tcp:443:0.0.0.0/0`),
+    where `port` is a single port or a `low-high` RANGE (`tcp:8000-8100:
+    0.0.0.0/0`). `import_tf._readable_rule` is literally `parse_sg_rule(line)
+    is not None`, so the two directions cannot drift apart into a line odin
+    emits happily and then cannot parse -- which is exactly the bug that once
+    made an IPv6 import delete a whole security group.
 
     `split(":", 2)` and NOT a bare `split(":")`: AN IPv6 CIDR CONTAINS COLONS.
     Found from the import side by the agent building the inverse of this
@@ -626,11 +666,26 @@ def _sg_rules(res: ResourceDesired, field: str) -> list[tuple[str, str, str]] | 
     changes; a line with a fourth field now resolves a peer that no group
     matches and is declined by `_sg_peer` with the reason for THAT, rather
     than on arity.
+
+    THE RANGE SEPARATOR DOES NOT INTERACT WITH THAT FIX, and it was checked
+    rather than assumed. `-` is read only out of `parts[1]`, which `split(":",
+    2)` has already bounded, so neither an IPv6 CIDR (no `-` in the notation,
+    and it lands in `parts[2]` regardless) nor a hyphenated canvas label
+    (`web-sg`, also `parts[2]`) can reach it. The `-1` all-protocols spelling
+    sits in `parts[0]`; a `-1` in the PORT position still declines, exactly as
+    it did before, so `icmp:-1:...` is no more drawable than it was.
     """
-    lines = [line.strip() for line in _field(res, field, "").splitlines()]
-    parsed = [tuple(line.split(":", 2)) for line in lines if line]
-    ok = all(len(p) == 3 and p[1].isdigit() for p in parsed)
-    return parsed if ok else None
+    parts = line.split(":", 2)
+    span = _port_span(parts[1]) if len(parts) == 3 else None
+    return (parts[0], *span, parts[2]) if span else None
+
+
+def sg_rule_port(from_port: str, to_port: str) -> str:
+    """The inverse of `_port_span`: the PORT field an import writes for a
+    `from_port`/`to_port` pair. Equal bounds collapse to the single-port
+    spelling, so a group that never had a range imports to the same text it
+    always did."""
+    return from_port if from_port == to_port else f"{from_port}-{to_port}"
 
 
 # IPv6, DECLINED WITH THE REAL REASON rather than made authorable.
@@ -652,10 +707,16 @@ _NO_IPV6 = (
 )
 
 
-def _is_ipv6_cidr(peer: str) -> bool:
+def is_ipv6_cidr(peer: str) -> bool:
     """An IPv6 CIDR is the one peer form that is neither an IPv4 CIDR nor a
     label: it carries BOTH a `/` and a `:`, and no canvas label can (a label
-    with a colon in it would already be unresolvable as a group)."""
+    with a colon in it would already be unresolvable as a group).
+
+    PUBLIC because `import_tf._readable_rule` needs it. That function asks "will
+    the generator accept this line?", and parsing is only half the answer -- a
+    line can parse cleanly here and still decline the whole security group for
+    being IPv6. Exporting the real predicate is what keeps the import from
+    writing such a line into a canvas."""
     return "/" in peer and ":" in peer
 
 
@@ -690,40 +751,74 @@ def _sg_peer(peer: str, res: ResourceDesired, refs: Refs) -> tuple[str, str] | N
     return ("security_groups", f"[aws_security_group.{name}.id]") if kind == "sg" else None
 
 
+def _rule_reason(line: str, field: str, word: str) -> str:
+    """The human reason ONE unparseable rule line declines its whole group.
+
+    TWO sentences, because they are two different mistakes and the second one
+    is new. A line whose port field carries a `-` was an attempt at a RANGE:
+    the author is editing a firewall and needs to see WHICH line and what is
+    wrong with it, not a generic format reminder that shows only the
+    single-port example they already know. Anything else did not fit the
+    grammar at all, and that message is deliberately byte-for-byte what it has
+    always been (pinned by `test_hcl_sg_egress.py::
+    test_the_ingress_messages_are_unchanged_word_for_word`) -- a grammar
+    extension is no excuse for rewording text that was already correct.
+    """
+    parts = line.split(":", 2)
+    if len(parts) == 3 and "-" in parts[1]:
+        return (f"{field}: {line!r} has a malformed port range {parts[1]!r} — a range is two whole "
+                "ports, low first, like tcp:8000-8100:0.0.0.0/0")
+    return (f'{field}: expected one "protocol:port:{word}" rule per line, '
+            "e.g. tcp:443:0.0.0.0/0")
+
+
 def _sg_rule_blocks(res: ResourceDesired, refs: Refs, block: str, field: str, word: str) -> list[str] | str:
     """Every `ingress {}` / `egress {}` block one rule field produces, or -- the
     `_alb_ports` idiom -- the human reason a line can't be built."""
-    rules = _sg_rules(res, field)
-    if rules is None:
-        return (f'{field}: expected one "protocol:port:{word}" rule per line, '
-                "e.g. tcp:443:0.0.0.0/0")
-    ipv6 = [peer for _protocol, _port, peer in rules if _is_ipv6_cidr(peer)]
+    lines = [stripped for line in _field(res, field, "").splitlines() if (stripped := line.strip())]
+    rules = [parse_sg_rule(line) for line in lines]
+    unreadable = [line for line, rule in zip(lines, rules, strict=True) if rule is None]
+    if unreadable:
+        return _rule_reason(unreadable[0], field, word)
+    ipv6 = [peer for _protocol, _from, _to, peer in rules if is_ipv6_cidr(peer)]
     if ipv6:
         return f"{field}: {word} {ipv6[0]!r} is an IPv6 CIDR — {_NO_IPV6}"
-    peers = [_sg_peer(peer, res, refs) for _protocol, _port, peer in rules]
+    peers = [_sg_peer(peer, res, refs) for _protocol, _from, _to, peer in rules]
     if None in peers:
-        bad = [r[2] for r, p in zip(rules, peers, strict=True) if p is None]
+        bad = [r[3] for r, p in zip(rules, peers, strict=True) if p is None]
         return (
             f"{field}: {word} {bad[0]!r} is neither a CIDR (like 10.0.0.0/16) "
             "nor the label of another Security Group node on this canvas"
         )
     return [
-        _sg_rule_block(block, protocol, port, *peer)
-        for (protocol, port, _peer), peer in zip(rules, peers, strict=True)
+        _sg_rule_block(block, protocol, from_port, to_port, *peer)
+        for (protocol, from_port, to_port, _peer), peer in zip(rules, peers, strict=True)
     ]
 
 
 def _default_egress_block() -> str:
-    """AWS's own allow-all egress, through the authored-rule builder — see
-    `_DEFAULT_EGRESS_RULE`."""
-    protocol, port, destination = _DEFAULT_EGRESS_RULE
-    return _sg_rule_block("egress", protocol, port, "cidr_blocks", f"[{quote(destination)}]")
+    """AWS's own allow-all egress, through the authored-rule builder AND
+    through the line parser — see `_DEFAULT_EGRESS_LINE`."""
+    protocol, from_port, to_port, destination = parse_sg_rule(_DEFAULT_EGRESS_LINE)
+    return _sg_rule_block(
+        "egress", protocol, from_port, to_port, "cidr_blocks", f"[{quote(destination)}]",
+    )
 
 
-def _sg_rule_block(block: str, protocol: str, port: str, peer_key: str, peer_value: str) -> str:
+def _sg_rule_block(
+    block: str, protocol: str, from_port: str, to_port: str, peer_key: str, peer_value: str,
+) -> str:
     """One `ingress {}` / `egress {}` block, `=` aligned to its own widest key
-    exactly the way `tofu fmt` aligns it (see `_sg_peer`)."""
-    args = {"from_port": port, "to_port": port, "protocol": quote(protocol), peer_key: peer_value}
+    exactly the way `tofu fmt` aligns it (see `_sg_peer`).
+
+    `from_port`/`to_port` arrive as a PAIR rather than as one port written
+    twice. They were always two arguments in the emitted HCL; taking them
+    separately is what lets `tcp:8000-8100:...` reach the file, and an equal
+    pair produces the identical bytes it produced when there was only one."""
+    args = {
+        "from_port": from_port, "to_port": to_port, "protocol": quote(protocol),
+        peer_key: peer_value,
+    }
     width = max(len(key) for key in args)
     body = "\n".join(f"    {key.ljust(width)} = {value}" for key, value in args.items())
     return f"  {block} {{\n{body}\n  }}"

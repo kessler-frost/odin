@@ -198,6 +198,46 @@ _WAIT_OUT_OF_RANGE = (
     "Value {value} for parameter WaitTimeSeconds is invalid. "
     f"Reason: Must be >= 0 and <= {SQS_MAX_WAIT_TIME_SECONDS}, if provided."
 )
+# goaws does NOT hold a receive open for the wait it was given. It holds it for
+# about HALF AGAIN as long, and the forward's read timeout has to be derived from
+# that second number rather than from the protocol's.
+#
+# This constant is the correction, and it exists because the first version of
+# this fix did not have it: `read = base.read + wait` accommodated a NOMINAL 20s
+# poll in 25s, real goaws held for 30.5s, and the `ReadTimeout` became the very
+# 503 `ServiceUnavailable` the fix was written to remove. The unit proof missed
+# it because the socket standing in for goaws slept exactly the wait it was
+# handed -- a backing that honours its own parameter to the millisecond, which is
+# not the backing odin ships. Same shape as every guard in this repo that read a
+# signal nobody sends: the derivation was checked against the SPEC and never
+# against the component.
+#
+# `receive_message.go` at the pinned v0.5.4 is `loops := waitTimeSeconds * 10`
+# with a 100ms timer per loop, which reads like exactly `waitTimeSeconds` -- that
+# reading is where the 1.0 came from. It is wrong because each iteration also
+# rescans the queue, and a 100ms Go timer inside a container on Colima's VM does
+# not fire at 100ms. MEASURED against the real backing on 2026-07-31, with a
+# 300-second client-side read timeout so the number is goaws's and not ours:
+#
+#     WaitTimeSeconds=1    held  1.38s, 1.47s                      1.38-1.47x
+#     WaitTimeSeconds=5    held  7.37s, 7.78s                      1.47-1.56x
+#     WaitTimeSeconds=20   held 30.42s, 30.54s, 30.94s, 29.83s     1.49-1.55x
+#     queue attribute 20, no WaitTimeSeconds: held 31.39s          1.57x
+#
+# The overhead is per-ITERATION (~50ms on top of each nominal 100ms) and so it
+# grows with the wait -- which is why the correction is a FACTOR and not a fixed
+# margin, and why a bigger poll is where it bites hardest.
+#
+# Why 2.5 and not the measured 1.57: the two directions of being wrong are not
+# symmetric. Too tight turns a CORRECT empty answer into "the backing isn't
+# there" -- the bug that shipped. Too loose only means a genuinely wedged backing
+# is reported later. Those measurements are an IDLE machine, and the integration
+# suite runs this under Colima contention, where the per-iteration cost is
+# precisely what grows. 2.5 leaves ~75% headroom over the worst observed hold and
+# still keeps the worst LEGAL poll (odin refuses anything above 20) at
+# 5 + 20*2.5 = 55s, inside botocore's own 60s default read timeout -- so a
+# wedged backing is still odin's 503 to report rather than the client's guess.
+_BACKING_LONG_POLL_OVERSHOOT = 2.5
 
 
 def _whole_seconds(value: object) -> int:
@@ -252,8 +292,13 @@ def _long_poll(action: str, resource: str, env: str, body: bytes, stores: SynthS
 
 
 def _forward_timeout(client: httpx.AsyncClient, long_poll_wait: int) -> httpx.Timeout:
-    """The forward client's own timeout with READ extended by the backing's own
-    long poll -- derived per request, never a blanket larger number.
+    """The forward client's own timeout with READ extended to cover how long the
+    BACKING will really hold this request -- derived per request, never a blanket
+    larger number.
+
+    The extension is `long_poll_wait * _BACKING_LONG_POLL_OVERSHOOT`, not
+    `long_poll_wait`: read that constant for the measurements: goaws holds a
+    20-second poll for ~30.5s, so accommodating 20 accommodated nothing.
 
     Only `read` moves. `connect`/`write`/`pool` describe reaching a container on
     loopback and are not made slower by a wait that happens after the request is
@@ -271,7 +316,7 @@ def _forward_timeout(client: httpx.AsyncClient, long_poll_wait: int) -> httpx.Ti
     has no read timeout to extend and already accommodates any poll -- coercing
     that to a number would take a deliberately unbounded client and bound it."""
     base = client.timeout
-    read = base.read + long_poll_wait if base.read is not None else None
+    read = base.read + long_poll_wait * _BACKING_LONG_POLL_OVERSHOOT if base.read is not None else None
     return httpx.Timeout(connect=base.connect, read=read, write=base.write, pool=base.pool)
 
 

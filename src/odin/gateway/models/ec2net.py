@@ -62,8 +62,9 @@ layer"): mutations push the env's desired network state through
   mapping is 1:1 for now (`nebula_network` == env on the VPC record);
   multi-VPC-per-env topology is deliberately NOT modeled yet.
 - Every SG mutation (create / authorize / revoke) recompiles the group's
-  ingress rule set through `sg_rules_to_firewall` -- research finding #3:
-  the IpPermissions shape IS that function's input, no adapter -- and
+  ingress AND egress rule sets through `sg_rules_to_firewall` -- research
+  finding #3: the IpPermissions shape IS that function's input, no adapter,
+  and `IpPermissionsEgress` is the same shape again -- and
   stores the resulting `FirewallRules` dump on the SG record itself
   (`sg["firewall"]`), so it dies with the group and `fabric.nebula
   .mesh_state` can read it straight off this module's sidecar file. The
@@ -602,10 +603,11 @@ async def _delete_subnet(params: dict[str, str], env: str, stores: SynthStores) 
 
 
 def _compiled_firewall(sg: dict) -> dict:
-    """The SG's ingress rule set through `fabric.nebula.sg_rules_to_firewall`
-    (V1b) -- `aggregate_permissions` already emits that function's exact
-    input shape. Stored as a plain dump on the SG record so it dies with the
-    group and `mesh_state` reads it without importing gateway code."""
+    """The SG's ingress AND egress rule sets through
+    `fabric.nebula.sg_rules_to_firewall` -- `aggregate_permissions` already
+    emits that function's exact input shape for either side. Stored as a plain
+    dump on the SG record so it dies with the group and `mesh_state` reads it
+    without importing gateway code."""
     # `is False`, not `not ...`: this one boolean is the whole difference
     # between "allow all OUTBOUND" (the seeded AWS default) and "allow all
     # INBOUND", and a truthiness test hands that decision to any falsy value.
@@ -616,8 +618,24 @@ def _compiled_firewall(sg: dict) -> dict:
     # failed closed while those three failed OPEN. `records.py` now rejects a
     # non-bool on read; this fails CLOSED even if a rule ever reaches here
     # without passing through that validation.
+    #
+    # v0.8.17: the EGRESS half, compiled the same strict way. `is_egress is
+    # True` rather than `not (... is False)` so a non-bool falls out of BOTH
+    # lists -- it can neither widen inbound (the old failure) nor widen
+    # outbound (the new one). Both directions fail closed on a malformed rule.
+    #
+    # Every group the gateway mints is SEEDED with AWS's allow-all egress
+    # (`_new_sg`), and `agent/hcl.py` emits that identical block for an sg node
+    # whose `egressRules` field is empty -- so a canvas that never mentioned
+    # egress compiles to `outbound: [any/any]`, byte-identical to what this
+    # returned when it was hardcoded. A canvas that DOES restrict egress makes
+    # the TF provider revoke the seeded rule and authorize its own, and those
+    # are what land here.
     ingress = [r for r in sg["rules"].values() if r["is_egress"] is False]
-    return sg_rules_to_firewall(aggregate_permissions(ingress)).model_dump()
+    egress = [r for r in sg["rules"].values() if r["is_egress"] is True]
+    return sg_rules_to_firewall(
+        aggregate_permissions(ingress), aggregate_permissions(egress),
+    ).model_dump()
 
 
 def compiled_firewall(stores: SynthStores, env: str, group_id: str) -> FirewallRules | None:

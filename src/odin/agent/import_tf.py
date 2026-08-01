@@ -48,6 +48,7 @@ from odin.aws.backings import ACCOUNT, REGION
 from odin.gateway.policy import arn_label
 from odin.simulate import workspace as workspace_mod
 from odin.simulate.runner import PLUGIN_CACHE_DIR
+from odin.util import reap
 
 _GRID_STEP = 220
 
@@ -747,14 +748,14 @@ def _is_odin_default_egress(blocks: list) -> bool:
 
 
 def _readable_rule(line: str) -> bool:
-    """Can `hcl.py::_ingress_rules` read this line BACK?
+    """Can `hcl.py` read this line BACK?
 
     This asserts the inverse instead of describing it, and it is here because
-    describing it was wrong. `_ingress_rules` is `line.split(":")` with
-    `len(p) == 3`; the writer below is `":".join(...)` with no check on the
-    parts. So any source containing a colon produces a line odin emits happily
-    and then cannot parse -- **an IPv6 CIDR is the everyday case**, and a canvas
-    label with a colon in it is the other one.
+    describing it was wrong. It used to be a hand-kept COPY of the generator's
+    parse (`line.split(":")` with `len(p) == 3`) while the writer below is
+    `":".join(...)` with no check on the parts. So any source containing a colon
+    produced a line odin emits happily and then cannot parse -- **an IPv6 CIDR is
+    the everyday case**, and a canvas label with a colon in it is the other one.
 
     Measured before this guard, on a group whose only rule was
     `cidr_blocks = ["2001:db8::/32"]`: the import produced
@@ -766,11 +767,25 @@ def _readable_rule(line: str) -> bool:
     security group on the next Apply is strictly worse than one that says it
     could not carry a rule.
 
-    Written as a real round-trip check rather than a `":" not in source` test so
-    it still holds if the separator or the arity ever changes.
+    v0.8.17 stops copying the parse and CALLS it. A copy is only ever as true as
+    the last person who remembered to edit both, and the port-range grammar is
+    the proof: extending `hcl.parse_sg_rule` to accept `8000-8100` while this
+    still read `parts[1].isdigit()` would have made every imported range fail its
+    own round-trip check and be dropped -- a new feature that silently narrows a
+    firewall, which is the exact defect the feature exists to remove.
+
+    THE IPv6 TERM IS NOT DECORATION, and the first version of that conversion
+    left it out and broke four tests. Parsing is only half of "will the generator
+    accept this?": `hcl.parse_sg_rule` bounds its split at 2 fields ON PURPOSE, so
+    `tcp:443:2001:db8::/32` parses perfectly well and is then declined by
+    `_sg_rule_blocks` for being IPv6 -- taking the whole group with it. The old
+    bare `split(":")` happened to reject IPv6 by counting colons, which is why
+    dropping it looked safe. Asking the real predicate is both narrower (a canvas
+    label that CONTAINS a colon now round-trips, where colon-counting refused it)
+    and honest about the reason.
     """
-    parts = line.split(":")
-    return len(parts) == 3 and parts[1].isdigit()
+    rule = hcl.parse_sg_rule(line)
+    return rule is not None and not hcl.is_ipv6_cidr(rule[3])
 
 
 def _ingress_rule_line(block: dict, by_hcl_name: dict[str, str]) -> str | None:
@@ -784,14 +799,23 @@ def _ingress_rule_line(block: dict, by_hcl_name: dict[str, str]) -> str | None:
     group's label (not its `sg-` id) is what lets the rule survive a round trip
     at all, since the canvas has no ids in it.
 
-    A port RANGE cannot be expressed: odin's field is one port, and `_sg` emits
-    `from_port == to_port`. Returning None sends it to the dropped list rather
-    than silently narrowing a range to its lower bound. `_readable_rule` is the
-    same refusal for a rule that would SERIALIZE fine and not parse back.
+    A port RANGE IS CARRIED, since v0.8.17 (`hcl.sg_rule_port` writes the
+    `8000-8100` spelling and `hcl.parse_sg_rule` reads it back). This used to
+    return None for `from_port != to_port`, which was the honest thing while the
+    canvas had no way to say it -- the rule went to the dropped list with a count
+    rather than being narrowed to its lower bound in silence. Now BOTH BOUNDS
+    survive, and `tests/agent/test_sg_port_ranges.py` asserts both of them: a
+    round trip that returned `8000-8000` would satisfy "the rule survived" and
+    still have closed a hundred ports.
+
+    What still cannot be expressed is a block with no readable port at all
+    (`var.port`, a computed value) -- `_int_text` returns None and the block goes
+    to the dropped list. `_readable_rule` is the same refusal for a rule that
+    would SERIALIZE fine and not parse back.
     """
     from_port, to_port = _int_text(block.get("from_port")), _int_text(block.get("to_port"))
     protocol = hcl.unquote(block.get("protocol"))
-    if from_port is None or from_port != to_port or not isinstance(protocol, str):
+    if from_port is None or to_port is None or not isinstance(protocol, str):
         return None
     cidrs = block.get("cidr_blocks") or []
     groups = block.get("security_groups") or []
@@ -803,7 +827,7 @@ def _ingress_rule_line(block: dict, by_hcl_name: dict[str, str]) -> str | None:
          if (label := _referenced_label(value, "aws_security_group", by_hcl_name))),
         None,
     )
-    line = f"{protocol}:{from_port}:{source}"
+    line = f"{protocol}:{hcl.sg_rule_port(from_port, to_port)}:{source}"
     return line if source and _readable_rule(line) else None
 
 
@@ -1346,10 +1370,10 @@ def _stamp_sg_rules(
         lost = len(lines) - len(kept)
         warnings += [] if not lost else [
             f"{label} (sg): {lost} of {len(lines)} ingress rule(s) could not be imported -- odin's "
-            "rule is one `protocol:port:source` with a single port and a CIDR or an imported "
-            "security group, so a port RANGE, an IPv6 CIDR (it contains the `:` the rule format "
-            "separates on) or a source odin cannot resolve is left out. The regenerated group "
-            "allows LESS inbound than the source did."
+            "rule is one `protocol:port:source` (the port may be a `8000-8100` range) with a CIDR "
+            "or an imported security group, so an IPv6 CIDR (it contains the `:` the rule format "
+            "separates on), a port that is not a literal number, or a source odin cannot resolve "
+            "is left out. The regenerated group allows LESS inbound than the source did."
         ]
 
         # The default block is left as an EMPTY field on purpose: it regenerates
@@ -1366,9 +1390,9 @@ def _stamp_sg_rules(
         egress_lost = len(egress_lines) - len(egress_kept)
         warnings += [] if not egress_lost else [
             f"{label} (sg): {egress_lost} of {len(egress_lines)} egress rule(s) could not be "
-            "imported -- odin's rule is one `protocol:port:destination` with a single port and a "
-            "CIDR or an imported security group, so a port RANGE, an IPv6 CIDR or an unresolvable "
-            "destination is left out."
+            "imported -- odin's rule is one `protocol:port:destination` (the port may be a "
+            "`8000-8100` range) with a CIDR or an imported security group, so an IPv6 CIDR, a "
+            "port that is not a literal number, or an unresolvable destination is left out."
             + (
                 " NONE of them survived, so the field is empty and odin re-emits its WIDE-OPEN "
                 "default: this group's outbound traffic comes back UNRESTRICTED."
@@ -1802,7 +1826,10 @@ async def _run(tofu: str, args: tuple[str, ...], cwd: Path, env: dict[str, str])
     proc = await asyncio.create_subprocess_exec(
         tofu, *args, cwd=cwd, env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
     )
-    await proc.communicate()  # best-effort: `generated.tf`'s existence is the real success signal (module docstring)
+    try:
+        await proc.communicate()  # best-effort: `generated.tf`'s existence is the real success signal (module docstring)
+    finally:
+        await reap(proc)  # a cancelled call must not leave tofu (or its transport) standing
 
 
 async def import_live(

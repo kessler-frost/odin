@@ -289,6 +289,91 @@ def test_sg_rules_to_firewall_golden():
     assert sg_rules_to_firewall(GOLDEN_PERMISSIONS) == GOLDEN_FIREWALL
 
 
+# --- v0.8.17: the EGRESS half ------------------------------------------------
+#
+# Until v0.8.17 the outbound list was a hardcoded allow-all whatever the group
+# said, so an `egressRules` line reached Terraform, reached the gateway's store,
+# showed up in `tofu plan` -- and gated nothing. Nebula has always emitted the
+# outbound list (`generate_config`); odin just never compiled one.
+
+
+def test_omitting_egress_keeps_awss_allow_all_default():
+    """A caller with no egress information gets AWS's default for a group that
+    never restricted anything. This is the compatibility contract: every
+    existing call site passes one argument, and every one of them must behave
+    exactly as it did."""
+    assert sg_rules_to_firewall(GOLDEN_PERMISSIONS).outbound == [FirewallRule(port="any", proto="any")]
+    assert sg_rules_to_firewall(GOLDEN_PERMISSIONS) == GOLDEN_FIREWALL
+
+
+def test_an_empty_egress_list_is_a_real_deny_not_an_absent_one():
+    """`[]` and `None` must NOT collapse into each other. `[]` is a group whose
+    egress rules were revoked, which in AWS blocks every outbound packet;
+    `None` is a caller that had nothing to say. MEASURED against nebula 1.10.3
+    on 2026-07-30 that `outbound: []` really does deny -- a member holding it
+    could reach neither of two live listeners on a peer it had been reaching a
+    moment earlier -- so this distinction is enforcement, not bookkeeping."""
+    assert sg_rules_to_firewall(GOLDEN_PERMISSIONS, []).outbound == []
+    assert sg_rules_to_firewall(GOLDEN_PERMISSIONS, None).outbound != []
+
+
+def test_egress_permissions_compile_to_outbound_rules():
+    """The same grammar as ingress, because AWS's `IpPermissionsEgress` is the
+    same wire shape and nebula's outbound rule body is the same body."""
+    firewall = sg_rules_to_firewall([], [
+        {"IpProtocol": "tcp", "FromPort": 5432, "ToPort": 5432, "IpRanges": [{"CidrIp": "10.42.0.0/16"}]},
+        {"IpProtocol": "tcp", "FromPort": 443, "ToPort": 443, "UserIdGroupPairs": [{"GroupId": "sg-db"}]},
+        {"IpProtocol": "udp", "FromPort": 8000, "ToPort": 8100, "IpRanges": [{"CidrIp": "10.0.0.0/8"}]},
+    ])
+    assert firewall.inbound == []  # egress must not leak into inbound
+    assert firewall.outbound == [
+        FirewallRule(port="5432", proto="tcp", cidr="10.42.0.0/16"),
+        FirewallRule(port="443", proto="tcp", group="sg-db"),
+        FirewallRule(port="8000-8100", proto="udp", cidr="10.0.0.0/8"),
+    ]
+
+
+def test_the_two_directions_do_not_bleed_into_one_another():
+    """The mutation this guards: compiling one side's permissions into both
+    lists. Distinct inputs must produce distinct outputs."""
+    firewall = sg_rules_to_firewall(
+        [{"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": [{"CidrIp": "10.0.0.0/8"}]}],
+        [{"IpProtocol": "tcp", "FromPort": 5432, "ToPort": 5432, "IpRanges": [{"CidrIp": "10.42.0.0/16"}]}],
+    )
+    assert firewall.inbound == [FirewallRule(port="22", proto="tcp", cidr="10.0.0.0/8")]
+    assert firewall.outbound == [FirewallRule(port="5432", proto="tcp", cidr="10.42.0.0/16")]
+
+
+def test_a_restricted_egress_survives_generate_config(tmp_path):
+    """The last link: what a real nebula daemon reads. A rule that stops here
+    is the whole bug this change closes."""
+    mgr = NebulaManager(tmp_path / "nebula", runner=FakeRunner())
+    firewall = sg_rules_to_firewall([], [
+        {"IpProtocol": "tcp", "FromPort": 5432, "ToPort": 5432, "IpRanges": [{"CidrIp": "10.42.0.0/16"}]},
+    ])
+    config = yaml.safe_load(mgr.generate_config("10.42.0.1", "127.0.0.1", firewall))
+    assert config["firewall"]["outbound"] == [{"port": "5432", "proto": "tcp", "cidr": "10.42.0.0/16"}]
+
+
+def test_union_of_a_narrow_and_a_wide_egress_is_the_wide_one():
+    """AWS's permissive-only semantics on the egress side: a node in two groups
+    may send whatever EITHER allows. The widening direction, deliberately --
+    narrowing means removing the wide group, not drawing a narrow one beside
+    it. This assertion could not have failed before v0.8.17, when both inputs
+    were the same hardcoded constant."""
+    narrow = sg_rules_to_firewall([], [
+        {"IpProtocol": "tcp", "FromPort": 5432, "ToPort": 5432, "IpRanges": [{"CidrIp": "10.42.0.0/16"}]},
+    ])
+    wide = sg_rules_to_firewall([], [{"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}])
+    merged = union_firewalls([narrow, wide])
+    assert merged.outbound == [
+        FirewallRule(port="5432", proto="tcp", cidr="10.42.0.0/16"),
+        FirewallRule(port="any", proto="any", cidr="0.0.0.0/0"),
+    ]
+    # ...and two identical egress rule sets dedupe rather than doubling.
+    assert union_firewalls([narrow, narrow]).outbound == narrow.outbound
+
+
 def test_compiled_firewall_round_trips_through_generate_config(tmp_path):
     """REAL but dormant (V1): the compiled FirewallRules must be EXACTLY what
     a Nebula node config consumes at V3 -- proven by feeding them through

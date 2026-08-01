@@ -16,16 +16,103 @@ They are listed because finding one by surprise is worse than reading it here.
   `s3`, `sqs`, `sns`, `dynamodb`, `rds`, `vpc`, `subnet` only — and a
   live-imported RDS arrives with odin's default password, because no AWS API
   returns a master password.
-- **A security group's OUTBOUND rules are authored but not ENFORCED.** Since
-  v0.8.14 the sg node has an `egressRules` field, in the same
-  `protocol:port:destination` form as `ingressRules`, and it emits real `egress`
-  blocks that reach the gateway — so a restricted egress survives generation and
-  `tofu plan`. What still does not gate it is the mesh: `fabric/nebula.py::
-  _compiled_firewall` compiles the group's INGRESS rules only, and every Nebula
-  config odin writes carries `outbound: any`. Treat an egress rule as portable
-  configuration, not as a control. An empty field still emits AWS's own
-  allow-all egress, which is what every canvas drawn before the field existed
-  gets and why their generated file is byte-identical to what it was.
+- **A security group's OUTBOUND rules are enforced ON THE MESH, and the mesh is
+  narrower than the canvas looks.** This entry read "authored but not ENFORCED"
+  until v0.8.17, and that was the whole of it: `sg_rules_to_firewall` ended with
+  a hardcoded `outbound=[any/any]` and `ec2net._compiled_firewall` filtered the
+  egress rules out of the store before they could reach it, so a restricted
+  egress survived generation, `tofu plan` and the gateway's own record — and
+  gated nothing. Nebula had supported outbound rules the whole time; odin never
+  compiled any.
+  MEASURED (`tests/simulate/test_sg_egress_gates_e2e.py`, 2026-07-30): a member
+  whose group's only egress rule is `tcp:6000` gets `pong6000` from a peer's
+  tcp:6000 and **empty** from that same peer's tcp:5432, same instant, same
+  overlay. Falsified rather than assumed — reverting the compiler makes the
+  same probe return `pong5432`.
+  MEASURED ON A REAL EC2 LIMA VM TOO (`tests/simulate/
+  test_sg_egress_gates_vm_e2e.py`, 2026-07-31), which is a separate claim and
+  was for one release an INFERENCE: that test's container proof said in its own
+  release note "no real Lima VM ever wore a restricted egress … that is an
+  inference, not a measurement". A VM is a mesh member by a different route
+  entirely (`compute/instances.py` writes `/etc/nebula/config.yml` with
+  `limactl shell … sudo tee` and runs nebula under systemd as root; a container
+  gets a bind-mounted config and runs it as pid 1 in the backing's network
+  namespace), so "same bytes" was never the same as "same effect". One canvas,
+  two real VMs, IDENTICAL ingress on both groups so `egressRules` is the only
+  field that differs:
+
+  | from → to | `locked` (egress `tcp:6000`) | `peer` (egress allow-all) |
+  |---|---|---|
+  | → `:6000` | `HTTP/1.0 200 OK` | `HTTP/1.0 200 OK` |
+  | → `:5432` | **`REFUSED timed out`** | `HTTP/1.0 200 OK` |
+
+  The bottom-right cell is the control a single VM cannot give: it rules out
+  "no VM can reach that port on this overlay", which is the VM-specific
+  confound a container-level proof hides. Falsified the same way — with
+  `sg_rules_to_firewall`'s outbound compilation reverted to the pre-v0.8.17
+  hardcoded allow-all, the compiled rule became `[('any','any')]` and the same
+  probe returned `HTTP/1.0 200 OK`, failing on that one line and no other.
+  **What it does NOT gate, and this is the part to read before trusting it:**
+  Nebula gates OVERLAY traffic. A container or VM reaching the internet, or the
+  host, or another container's published port through Colima/Lima NAT is not on
+  the overlay, and no egress rule touches it — an `egressRules` line cannot stop
+  a workload calling out to the network at large. That used to be reasoning;
+  it is now MEASURED on the same VM in the same run, seconds after its overlay
+  packet to `:5432` was dropped: a TCP connection to the **host** at
+  `192.168.64.1` over vzNAT returned `CONNECTED`, and `curl https://example.com`
+  returned **HTTP 200** over slirp. A locked-down egress rule stops nothing
+  leaving the box by either path. Nor is every kind on the mesh:
+  only **EC2 Lima VMs** and **RDS Postgres containers** (plus the other backings
+  via `fabric/sidecar.py`) join it today. **ECS tasks, the ALB nginx proxy,
+  Lambda RIE containers and ElastiCache are NOT mesh members**, so their egress
+  is ungated regardless of what group they are drawn into — the asymmetry is
+  real and is not narrowed by this change. The same boundary the ingress side
+  has always had (see *Which endpoint fact your security groups actually
+  govern*) applies unchanged: the raw published host port is reachable from the
+  host and SGs gate neither direction on it.
+  Three things that follow, all measured rather than reasoned:
+  - **An empty `egressRules` field still means allow-all.** AWS's own default:
+    the gateway seeds every group with the allow-all egress rule and `hcl.py`
+    emits that identical block for an empty field, so a canvas that never
+    mentioned egress admits exactly the packets it always did.
+  - **A group whose egress was revoked and never re-authorized blocks
+    everything outbound**, which is AWS's behaviour too. `outbound: []` is a
+    real deny to nebula, not an absent ruleset that defaults open — checked
+    against nebula 1.10.3 directly, because a firewall that read an empty list
+    as "no restriction" would have made this whole feature a silent no-op.
+  - **The firewall is STATEFUL, so restricting a database's egress does not
+    break replies.** A member with `outbound: []` still answers a connection its
+    inbound rules admitted (nebula keeps a conntrack entry per flow), which is
+    what an AWS security group does. Egress restricts what a member *initiates*,
+    never what it may answer.
+  - **A restricted egress drops the member's OWN re-handshake poke, and that is
+    a real consequence nothing had asked about.** `fabric/nebula.py::
+    rehandshake_script` closes a measured 10–60s dead window after a nebula
+    restart by having the restarted member ping every peer — and ICMP is a
+    protocol like any other to the outbound firewall. MEASURED on the VM test
+    above, with both groups admitting `icmp` INBOUND identically so the result
+    is attributable to the sender: `locked → ping peer` **fails** (rc=1) while
+    `peer → ping locked` succeeds (rc=0). So a member whose `egressRules` omit
+    `icmp` buys no tunnel state from `_converge`, and its first real connection
+    after a restart pays the window instead. It fails CLOSED (a slower
+    re-handshake, never a wider firewall), and the fix if it ever matters is to
+    name `icmp` in the group's egress — but do not read `_converge` as
+    unconditional any more.
+  - **A conntrack entry can make a working outbound firewall look broken —
+    watch the ORDER of your probes.** Found the hard way while measuring the
+    line above: run `peer → ping locked` FIRST and `locked → ping peer` then
+    PASSES, because admitting the inbound ping opened an ICMP conntrack entry
+    for that pair which the locked member's own ping rides as an established
+    flow. Measured both ways on the same pair of VMs. Anything probing an
+    outbound rule must do it on a flow with no state in the other direction.
+  One upgrade cost, small but real: the outbound rule's SHAPE changed even where
+  its meaning did not. It used to render as `host: any` (a hardcoded constant
+  describing no group at all) and now renders as the seeded rule's true
+  compilation, `cidr: 0.0.0.0/0`. Those admit the same packets on odin's
+  IPv4-only overlay, but the config TEXT moves, so an environment already on the
+  mesh takes one firewall-only reload (a SIGHUP; no tunnel is dropped). Byte-
+  identical would have needed the wide-open rule special-cased back into
+  `host: any`, making it the one rule odin compiles unlike every other.
 - **A security group is IPv4 only.** An IPv6 CIDR in either rule field is
   declined with that reason, and the reason is real rather than a parser
   limitation: `sg_rules_to_firewall` compiles `IpRanges` and `UserIdGroupPairs`
@@ -34,9 +121,19 @@ They are listed because finding one by surprise is worse than reading it here.
   Nebula change, not a canvas one. One bad line still declines the whole group,
   deliberately: silently dropping one rule from a firewall is worse than
   refusing the group.
-- **A security group's rules are a single port each.** `tcp:443:0.0.0.0/0`, not
-  a range — so an imported ingress block with a port RANGE is reported and left
-  out, and the regenerated group allows *less* than the source.
+- **A security group's rule port must be a literal number or range.**
+  `tcp:443:0.0.0.0/0` or `tcp:8000-8100:0.0.0.0/0`, in either rule field. This
+  entry used to read "a single port each … an imported ingress block with a port
+  RANGE is reported and left out, and the regenerated group allows *less* than
+  the source", and that was a correctness bug wearing a limit's clothes: a round
+  trip through odin handed back a NARROWER firewall than the Terraform you gave
+  it. Since v0.8.17 both bounds survive import → canvas → regenerate, and a
+  single port is simply the degenerate range, so every canvas drawn before this
+  emits byte-identical HCL. What is still left out is a port that is not a
+  literal number — `from_port = var.port`, or any computed expression — which is
+  named and counted like any other unimportable rule. A MALFORMED range
+  (`8000-`, `8100-8000`, `8000 - 8100`) declines the whole group and names the
+  offending line; it is never half-parsed into its low bound.
 - **A workload's `${{producer.ATTR}}` references are carried as TAGS, and the
   resolved values still are not.** The distinction the design rests on: a
   reference names a producer and an attribute, while the string it resolves to
@@ -58,9 +155,11 @@ They are listed because finding one by surprise is worse than reading it here.
   survives — the import names the producers and says to re-add the references.
   And **a rule odin cannot express empties the field**, which for egress is the
   dangerous direction: an empty `egressRules` is exactly what selects the
-  allow-all default, so a group whose only outbound rule is a port range or an
-  IPv6 CIDR does not come back with no egress, it comes back with all of it. The
-  import says which of the two happened rather than leaving you to find it.
+  allow-all default, so a group whose only outbound rule is an IPv6 CIDR (or a
+  port that is not a literal number) does not come back with no egress, it comes
+  back with all of it. The import says which of the two happened rather than
+  leaving you to find it. *A port RANGE was on that list until v0.8.17 and is
+  not any more — it round-trips with both bounds.*
 - **Some arguments are re-emitted with odin's own value whatever you wrote**, and
   each one warns on its own line — `imported with CHANGED argument(s) -- odin
   substitutes its own value` — kept separate from the `imported without unmodeled
@@ -539,12 +638,27 @@ They are listed because finding one by surprise is worse than reading it here.
   exceeded it and the gateway answered **503 ServiceUnavailable** — a healthy
   queue reported as a dead backing, for the recommended way to consume a queue.
   Fixed: the forward's read timeout is now **derived per request** (the client's
-  own 5s plus the caller's own `WaitTimeSeconds` — `gateway/app.py::_long_poll` /
-  `_forward_timeout`), so every *other* forwarded call still fails fast at 5s
-  instead of inheriting a blanket larger number. Measured through a real boto3
-  consumer, before → after: `WaitTimeSeconds=5` 503 in 10.17s (10s, not 5s,
-  because botocore retries a 503) → empty answer in 5.01s; `10` → 10.00s;
-  `20` → 20.01s. A long poll holds a connection, never the event loop.
+  own 5s plus `WaitTimeSeconds` × a measured backing-overshoot factor —
+  `gateway/app.py::_long_poll` / `_forward_timeout`), so every *other* forwarded
+  call still fails fast at 5s instead of inheriting a blanket larger number.
+  A long poll holds a connection, never the event loop.
+  - **goaws holds a poll ~1.5x LONGER than the wait it was given, and the first
+    version of this fix did not survive that.** The numbers this entry used to
+    quote — `WaitTimeSeconds=5` → 5.01s, `10` → 10.00s, `20` → 20.01s — were
+    measured against a real socket standing in for goaws, which slept exactly
+    the wait it was handed. Against the real container they are wrong. MEASURED
+    2026-07-31 with a 300s client-side read timeout, so the number is goaws's
+    own: `1` → held 1.38s/1.47s, `5` → 7.37s/7.78s, `20` → 29.83s–30.94s
+    (1.47–1.57x), and the queue-attribute door overshoots identically (20 →
+    31.39s). `loops := waitTimeSeconds * 10` with a 100ms timer per loop had
+    been read off the pinned v0.5.4 source and then reasoned about as if a 100ms
+    Go timer in a container costs 100ms; each iteration also rescans the queue.
+    So a 20s poll got 25s of patience, took 30.5s, and came back as the same
+    503 — the fix's own integration test (`test_sqs_long_poll_on_an_empty_queue_
+    is_not_a_503`) was written at the time but never run, and it caught this the
+    first time it executed. odin now allows `5 + wait × 2.5` (55s for the
+    longest legal poll, inside botocore's 60s default), and the socket stand-in
+    overshoots like the real backing so the gap fails a build.
   What remains, and it is deliberate:
   - **`WaitTimeSeconds` outside 0..20 gets `InvalidParameterValue` (HTTP 400).**
     Real SQS rejects it; **goaws v0.5.4 does not validate it at all** (read from

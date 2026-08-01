@@ -32,6 +32,7 @@ from odin.agent.hcl import TfProject, generate_tf
 from odin.simulate.runner import PLUGIN_CACHE_DIR
 from odin.spec.models import REDACTED, Stack, scrub
 from odin.spec.store import rev_of
+from odin.util import reap
 
 log = logging.getLogger("odin.translate")
 
@@ -218,7 +219,10 @@ async def _tofu_run(tofu: str, args: tuple[str, ...], cwd: Path, env: dict[str, 
     proc = await asyncio.create_subprocess_exec(
         tofu, *args, cwd=cwd, env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
     )
-    out, _ = await proc.communicate()
+    try:
+        out, _ = await proc.communicate()
+    finally:
+        await reap(proc)  # a cancelled call must not leave tofu (or its transport) standing
     return proc.returncode, out.decode(errors="replace")
 
 
