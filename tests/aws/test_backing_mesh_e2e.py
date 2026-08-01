@@ -24,9 +24,11 @@ mount. `mesh_root` cleans up after itself.
 """
 from __future__ import annotations
 
+import asyncio
 import secrets
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -99,6 +101,50 @@ async def _client(runtime: ColimaRuntime, mesh: MeshSidecar, name: str, group: s
     assert await mesh.ensure(name, name, groups=(group,)) is not None, f"{name} never joined the mesh"
 
 
+# Both waits below are bounded in SECONDS, never in attempts. An attempt count
+# measures how fast the machine can FAIL, which is the opposite of a wait: the
+# host-path loop here used to be `for _ in range(60)` with no sleep in it, and
+# MEASURED on 2026-07-31 all 60 attempts finished in 0.182s while the Postgres
+# they were waiting for first answered at 0.735s. `create_db` returns as soon as
+# `docker run` does -- PGDATA still needs initdb, and docker-proxy accepts on the
+# published port and closes immediately while nothing listens behind it, so each
+# attempt fast-failed in ~3ms with `unexpected connection_lost()`. The test was
+# green only because `join_mesh` happened to burn ~1.6s of unrelated wall clock
+# first; run with the mesh skipped entirely, the same 60 attempts took 0.136s
+# against a first answer at 2.218s. Nothing about nebula, the sidecar or the
+# compiled SG firewall was ever involved -- it reproduces identically at the
+# pre-egress v0.8.16 commit.
+#
+# Production never had this bug: `gateway/models/rdsctl.py`'s create-waiter is a
+# `while time.monotonic() < deadline` with a real `await asyncio.sleep`, and the
+# sibling `test_mesh_health_e2e.py` already sleeps 1.0s per attempt for exactly
+# this reason. These are that same wait.
+_HOST_READY_TIMEOUT = 90.0
+_OVERLAY_REACH_TIMEOUT = 180.0  # > the 160s the old 20-attempt loop could reach
+
+
+async def _pg_ready_within(host: str, port: int, timeout: float = _HOST_READY_TIMEOUT):
+    """Poll `pg_ready` until it succeeds or `timeout` REAL seconds have passed."""
+    deadline = time.monotonic() + timeout
+    ready = await pg_ready(host, port, "app", PASSWORD)
+    while not ready.ok and time.monotonic() < deadline:
+        await asyncio.sleep(0.5)
+        ready = await pg_ready(host, port, "app", PASSWORD)
+    return ready
+
+
+async def _psql_within(client: str, host: str, timeout: float = _OVERLAY_REACH_TIMEOUT) -> subprocess.CompletedProcess:
+    """Poll `_psql` until it exits 0 or `timeout` REAL seconds have passed. The
+    sidecars must still handshake with the lighthouse and set up a relayed
+    tunnel after `ensure` returned, so the first attempts legitimately fail."""
+    deadline = time.monotonic() + timeout
+    done = _psql(client, host)
+    while done.returncode != 0 and time.monotonic() < deadline:
+        await asyncio.sleep(1.0)
+        done = _psql(client, host)
+    return done
+
+
 def _psql(client: str, host: str) -> subprocess.CompletedProcess:
     # `-d postgres` explicitly: that's the database the substrate really creates
     # (`create_db`'s `db_name` default, W2.7) and the one the DATABASE_URL fact
@@ -133,11 +179,7 @@ async def test_a_drawn_sg_gates_real_postgres_traffic_over_the_overlay(mesh_root
     # the gateway's forwarding, the RDS model's own create-waiter probe, and
     # host-side clients are untouched by mesh membership.
     host, port = await rds.endpoint("db")
-    ready = None
-    for _ in range(60):
-        ready = await pg_ready(host, port, "app", PASSWORD)
-        if ready.ok:
-            break
+    ready = await _pg_ready_within(host, port)
     assert ready.ok, f"the HOST path must keep working: {ready.error}"
     print(f"[W2.6-p2] host path still live at {host}:{port} (pg_ready ok)")
 
@@ -145,13 +187,7 @@ async def test_a_drawn_sg_gates_real_postgres_traffic_over_the_overlay(mesh_root
     await _client(runtime, mesh, f"odin-mesh-web-{ENV}", "sg-web", containers)
     await _client(runtime, mesh, f"odin-mesh-other-{ENV}", "sg-other", containers)
 
-    # The allowed side polls: both sidecars must still handshake with the
-    # lighthouse and set up a relayed tunnel after `ensure` returned.
-    allowed = None
-    for _ in range(20):
-        allowed = _psql(f"odin-mesh-web-{ENV}", db_ip)
-        if allowed.returncode == 0:
-            break
+    allowed = await _psql_within(f"odin-mesh-web-{ENV}", db_ip)
     print(f"[W2.6-p2] psql {db_ip} from the sg-web member: rc={allowed.returncode} {allowed.stdout.strip()!r}")
     assert allowed.returncode == 0, f"the sg-web member must reach the DB over the overlay:\n{allowed.stderr}"
     assert "overlay-ok" in allowed.stdout

@@ -638,12 +638,27 @@ They are listed because finding one by surprise is worse than reading it here.
   exceeded it and the gateway answered **503 ServiceUnavailable** — a healthy
   queue reported as a dead backing, for the recommended way to consume a queue.
   Fixed: the forward's read timeout is now **derived per request** (the client's
-  own 5s plus the caller's own `WaitTimeSeconds` — `gateway/app.py::_long_poll` /
-  `_forward_timeout`), so every *other* forwarded call still fails fast at 5s
-  instead of inheriting a blanket larger number. Measured through a real boto3
-  consumer, before → after: `WaitTimeSeconds=5` 503 in 10.17s (10s, not 5s,
-  because botocore retries a 503) → empty answer in 5.01s; `10` → 10.00s;
-  `20` → 20.01s. A long poll holds a connection, never the event loop.
+  own 5s plus `WaitTimeSeconds` × a measured backing-overshoot factor —
+  `gateway/app.py::_long_poll` / `_forward_timeout`), so every *other* forwarded
+  call still fails fast at 5s instead of inheriting a blanket larger number.
+  A long poll holds a connection, never the event loop.
+  - **goaws holds a poll ~1.5x LONGER than the wait it was given, and the first
+    version of this fix did not survive that.** The numbers this entry used to
+    quote — `WaitTimeSeconds=5` → 5.01s, `10` → 10.00s, `20` → 20.01s — were
+    measured against a real socket standing in for goaws, which slept exactly
+    the wait it was handed. Against the real container they are wrong. MEASURED
+    2026-07-31 with a 300s client-side read timeout, so the number is goaws's
+    own: `1` → held 1.38s/1.47s, `5` → 7.37s/7.78s, `20` → 29.83s–30.94s
+    (1.47–1.57x), and the queue-attribute door overshoots identically (20 →
+    31.39s). `loops := waitTimeSeconds * 10` with a 100ms timer per loop had
+    been read off the pinned v0.5.4 source and then reasoned about as if a 100ms
+    Go timer in a container costs 100ms; each iteration also rescans the queue.
+    So a 20s poll got 25s of patience, took 30.5s, and came back as the same
+    503 — the fix's own integration test (`test_sqs_long_poll_on_an_empty_queue_
+    is_not_a_503`) was written at the time but never run, and it caught this the
+    first time it executed. odin now allows `5 + wait × 2.5` (55s for the
+    longest legal poll, inside botocore's 60s default), and the socket stand-in
+    overshoots like the real backing so the gap fails a build.
   What remains, and it is deliberate:
   - **`WaitTimeSeconds` outside 0..20 gets `InvalidParameterValue` (HTTP 400).**
     Real SQS rejects it; **goaws v0.5.4 does not validate it at all** (read from
