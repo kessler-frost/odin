@@ -1584,7 +1584,7 @@ machine-wide-sweep rule already in CLAUDE.md. A test-owned env is invisible to
 every check a human would think to run; the only safe rule is to touch nothing
 while a suite is running.
 
-## v0.8.18 — the egress gate is measured on a VM, and a cancelled subprocess stops leaking
+## v0.8.17 — egress enforced and MEASURED, port ranges round-trip, and three tests that were never really waiting
 
 **A drawn egress rule is now proven to block on a real EC2 Lima VM.** v0.8.17
 compiled `IpPermissionsEgress` into nebula's `outbound` and measured a real
