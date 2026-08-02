@@ -991,8 +991,15 @@ class Reconciler:
         self._store.write_world(kept)
         # Tell the canvas the node is back to draft, else its tile stays stale-green
         # after a Destroy / node removal (the World emptied but the UI never heard).
+        #
+        # A real `WorldDelta`, not the hand-built dict this used to be: the dict
+        # is why `draft` could be on the wire for months while missing from the
+        # `Phase` literal it is supposed to satisfy -- pydantic never saw it.
+        # Built and dumped rather than `_emit`ed, deliberately: `_emit` calls
+        # `apply_delta`, which would put the resource straight back into the
+        # World the two lines above just removed it from.
         if self._ws is not None and gone is not None:
-            await self._ws.broadcast({
-                "type": "world_delta", "env": self._env, "resource_id": rid,
-                "kind": gone.kind, "phase": "draft", "facts": {}, "verdict": None,
-            })
+            delta = WorldDelta(
+                env=self._env, resource_id=rid, kind=gone.kind, phase="draft",
+            )
+            await self._ws.broadcast(delta.model_dump())

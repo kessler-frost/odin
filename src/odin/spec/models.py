@@ -44,7 +44,19 @@ def scrub(text: str, secrets: frozenset[str]) -> str:
     return text
 
 # A resource's observed lifecycle phase.
+#
+# Every value here must be one `ui/src/components/nodes/StatusBadge.tsx` can
+# style, and vice versa -- they are the two halves of one wire contract, and
+# `draft` is the proof that the halves can drift: the reconciler has
+# broadcast `phase: "draft"` on every prune since the prune path existed, the
+# UI has styled it all along, and this Literal did not contain it. It stayed
+# invisible because the prune broadcast was a HAND-BUILT dict rather than a
+# `WorldDelta`, so pydantic never validated it (constructing
+# `WorldDelta(phase="draft")` would have raised). That construction is now a
+# real WorldDelta -- see `reconciler.py::_prune` -- so the wire and the type
+# cannot diverge again without a test failing.
 Phase = Literal[
+    "draft",      # in the canvas, not in World: never applied, or just pruned
     "pending",    # desired but nothing started
     "starting",   # container launched, not yet healthy
     "healthy",    # assertion passed
