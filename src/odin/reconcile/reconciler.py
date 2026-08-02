@@ -55,7 +55,7 @@ from odin.aws.backings import BackingUnavailable, ENSURE_KINDS, PROVISIONED
 from odin.fabric.localhost import LocalhostFabric
 from odin.gateway.policy import compile_policies, compile_policies_from_iam
 from odin.gateway.stores import SynthStores
-from odin.reconcile.actions import NoOp, ProvisionResource, StopContainer
+from odin.reconcile.actions import NoOp, PruneResource, ProvisionResource
 from odin.reconcile.dispatch import Dispatcher
 from odin.reconcile.drift import DriftSweeper
 from odin.reconcile.plan import plan
@@ -597,7 +597,7 @@ class Reconciler:
         never destroys a TF-owned resource itself).
 
         This prune is the SOLE authority on a TF-owned label leaving World
-        (see `_execute`'s StopContainer branch): "the desired Stack no longer
+        (see `_execute`'s PruneResource branch): "the desired Stack no longer
         wants it" is not the same question as "it no longer exists", and
         answering the second one with the first is what made every
         odin-synthesized resource flap (field test 2 finding #3).
@@ -947,8 +947,18 @@ class Reconciler:
             subs = self._desired_subs(stack, action.id) if action.service == "sns" else ()
             await self._aws.provision(action.service, action.id, subs)
             await self._emit(action.id, action.service, "starting")
-        elif isinstance(action, StopContainer):
+        elif isinstance(action, PruneResource):
+            # THREE outcomes, and only the last one stops a container. Read
+            # them as what the user gets, not as what the branch calls:
+            #   PROVISIONED -> the real bucket/queue/table/topic is DELETED
+            #   TF_OWNED    -> nothing happens here at all (tofu owns it)
+            #   otherwise   -> the container is stopped
+            # The World entry goes either way (`_prune` below).
             if action.kind in PROVISIONED:
+                # Deletes the resource AND its contents:
+                # `backings.py::deprovision` -> delete_bucket / delete_queue /
+                # delete_table / delete_topic. Best-effort by design -- see
+                # that method's docstring for what "either way" costs here.
                 await self._aws.deprovision(action.kind, action.id)
             elif action.kind in TF_OWNED_KINDS and self._stores is not None:
                 # tofu (never this reconciler) owns create/destroy for a

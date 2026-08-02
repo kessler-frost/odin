@@ -733,7 +733,7 @@ async def test_ec2_instance_phase_reflects_real_state_name(tmp_path):
 async def test_stale_tf_owned_world_entry_never_calls_runtime_stop(tmp_path):
     # A canvas node removed WITHOUT a tofu destroy having run yet (e.g. a
     # canvas edit ahead of the next Apply) leaves plan() seeing "observed but
-    # no longer desired" -> a StopContainer action -- tofu, never
+    # no longer desired" -> a PruneResource action -- tofu, never
     # `self._rt.stop`, owns tearing down a TF-managed resource.
     rt = FakeRuntime()
     store = SpecStore(tmp_path)

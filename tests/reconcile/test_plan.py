@@ -7,7 +7,7 @@ AWS-shaped PROVISIONED kinds are all that's left to create here.
 """
 from __future__ import annotations
 
-from odin.reconcile.actions import NoOp, ProvisionResource, StopContainer
+from odin.reconcile.actions import NoOp, PruneResource, ProvisionResource
 from odin.reconcile.plan import plan
 from odin.spec.models import FieldValue, ResourceDesired, ResourceObserved, Stack, World
 
@@ -54,4 +54,4 @@ def test_aws_resource_recreated_when_crashed():
 def test_prune_extra():
     world = _world(ResourceObserved(id="ghost", kind="rds", phase="healthy"))
     actions = plan(STACK, world)
-    assert StopContainer(id="ghost", name="ghost", kind="rds") in actions
+    assert PruneResource(id="ghost", name="ghost", kind="rds") in actions
