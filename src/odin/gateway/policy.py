@@ -88,12 +88,6 @@ _ARN_RESOURCE_LABEL: dict[str, re.Pattern[str]] = {
     "elasticache": re.compile(r"cluster:(?P<label>.+)"),
     "secretsmanager": re.compile(r"secret:(?P<label>.+)"),
     "ecr": re.compile(r"repository/(?P<label>.+)"),
-    # `key/<label>` -- the same shape as ecr. Landed BEFORE `hcl.py` emits a
-    # kms ARN, deliberately: with the emitter ahead of this table, a drawn kms
-    # grant reduces to None and every call is DENIED while the canvas, the
-    # file and `tofu plan` all look correct. Measured before writing the line --
-    # ARN form evaluated False, bare label True, for the identical grant.
-    "kms": re.compile(r"key/(?P<label>.+)"),
     # cluster/<name>, service/<cluster>/<name>, task-definition/<family:rev>
     "ecs": re.compile(r"[a-z-]+/(?:[^/]+/)?(?P<label>[^/]+)"),
     # a group name contains `/` and the ARN can carry a `:*` or `:log-stream:`

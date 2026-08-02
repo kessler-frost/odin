@@ -214,6 +214,22 @@ graph TD
 
 Each workload reaches its role through its **own service record** — a lambda's `role`, a task definition's `task_role_arn`, an instance's profile — never a naming convention. That is what makes a drawn permission take effect only after it is applied.
 
+### KMS
+
+`AES-256-GCM key material in .odin/<env>/kms.json — a file, not a container`
+
+```mermaid
+graph TD
+  K["kms node"] -->|"aws_kms_key"| G["gateway kmsctl"]
+  G --> M["key material<br/>.odin/env/kms.json 0600"]
+  S["secret / ssm node"] -.->|"encryption edge"| K
+  M -->|"seals on write"| SC["secretsctl.json<br/>ssmctl.json — ciphertext"]
+  SC -->|"opens only via<br/>an IAM-allowed read"| W["workload"]
+  X["s3 · rds · dynamodb<br/>sqs · sns"] -.->|"NOT encrypted"| N["no key, no seal"]
+```
+
+Encrypts **two files** and nothing else: the values in `secretsctl.json` and `ssmctl.json`, every secret and every parameter, including a plain `String`. The key sits one directory **above** the ciphertext at `0600` — which separates two files, not two principals, since odin runs unattended and has nowhere to hide a key it must also use. **S3 objects, RDS storage, DynamoDB, SQS and SNS are not encrypted by anything**, which is why an `encryption` edge to those is not offered rather than being drawn and doing nothing.
+
 ## Measured, not estimated
 
 | | |

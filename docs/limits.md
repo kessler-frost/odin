@@ -235,15 +235,19 @@ They are listed because finding one by surprise is worse than reading it here.
   backings and the prune, and reads a cached drift result instead of sweeping. ECS
   stays genuinely live because its task sweep runs on every one of those ticks;
   EC2, Lambda and RDS drift can be up to one sweep cadence stale for the duration.
-- **A drawn edge carries a modelled TYPE for only 41 of the 378 kind pairs.**
-  The honest majority answer is `unmodelled` — 337 of the 378 unordered pairs,
+- **A drawn edge carries a modelled TYPE for only 46 of the 378 kind pairs.**
+  The honest majority answer is `unmodelled` — 332 of the 378 unordered pairs,
   drawn as a grey line labelled *Not modelled*, stored in the Stack and read by
   nothing. It was called `network` until v0.8.14, which was a claim about layer 3
   that odin never checked. Re-measured 2026-07-29 over the real 27 canvas kinds,
   the pairs that do mean something: `iam`
-  (31 pairs, a real policy), `connection` **and** `iam` together (4),
+  (34 pairs, a real policy), `connection` **and** `iam` together (4),
   `sg` (2, security-group membership), `target` (2 — `alb ↔ ecs`, and since
-  v0.8.15 `alb ↔ ec2`), `role` (`iam_role ↔ lambda`) and `subscription`
+  v0.8.15 `alb ↔ ec2`), `encryption` (2 — `kms ↔ secret|ssm`, the only two sidecars odin holds the
+  plaintext of; `kms ↔ s3|rds|dynamodb` stays `unmodelled` ON PURPOSE, because
+  those live in RustFS, Postgres and dynalite containers odin holds no key for
+  and a line there would claim an encryption that does not happen),
+  `role` (`iam_role ↔ lambda`) and `subscription`
   (`sns ↔ sqs`). Drawing anything else is decoration, and now
   says so.
   Three more pairs carry a SECOND meaning on top of the grant, added in
