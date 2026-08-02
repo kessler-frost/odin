@@ -17,15 +17,31 @@ provider reads `description`/`tier`/`allowed_pattern`/`key_id` from
 DescribeParameters and tags from ListTagsForResource, so both are load-bearing
 for apply -> plan zero-drift, not extras.
 
-**`SecureString` IS NOT ENCRYPTED AT REST.** A SecureString parameter is
-stored byte-for-byte the same as a String one, in the per-env JSON sidecar
-`.odin/{env}/gateway/ssmctl.json` (written `0600` by JsonStore, like
-`keys.json`). There is no KMS in odin: `KeyId` is accepted, stored and echoed
-back for TF fidelity and encrypts NOTHING, and `WithDecryption` changes
-nothing about the answer. This is recorded as a limit in ROADMAP.md and in
-SECURITY.md's Secrets section rather than implied away -- the protection is
-the file mode and the machine boundary, plus the fact that a value only ever
-leaves this process through a `GetParameter*` whose principal an IAM edge
+**EVERY PARAMETER IS ENCRYPTED AT REST (v0.8.18) -- INCLUDING A PLAIN
+`String`.** Until v0.8.17 this paragraph read: "`SecureString` IS NOT ENCRYPTED
+AT REST. A SecureString parameter is stored byte-for-byte the same as a String
+one ... There is no KMS in odin: `KeyId` is accepted, stored and echoed back for
+TF fidelity and encrypts NOTHING." That was true, and it is what this change
+retracts.
+
+A parameter's `Value` is now stored as an `odin-kms-v1:{keyId}:{base64}`
+envelope, AES-256-GCM, under real material odin generates and keeps at
+`.odin/{env}/kms.json` (0600, one directory above this sidecar). `KeyId` names
+WHICH key; a parameter that names none is sealed under the env's default key.
+
+NOTE THE ONE SENTENCE THAT SURVIVES INTACT: a `SecureString` is still stored
+byte-for-byte the same way a `String` is. odin encrypts BOTH rather than making
+the type the protection, so `SecureString` still buys nothing over `String`
+here -- it is just that what both get is now real. Claiming otherwise would
+reintroduce the same lie one level down.
+
+`WithDecryption` still changes nothing about the answer: odin holds the key and
+decrypts on every read regardless, because a parameter odin cannot decrypt is
+one nobody can (see `docs/limits.md`). What a lost key DOES change is that
+`GetParameter` answers `InvalidKeyId` NAMING THE KEY rather than a blank value.
+The protection remains the file mode and the machine boundary
+(`gateway/kms.py` states the bounds precisely), plus the fact that a value only
+ever leaves this process through a `GetParameter*` whose principal an IAM edge
 allowed.
 
 NAME CANONICALIZATION (`canonical_name`): AWS treats a ROOT-level
@@ -55,7 +71,14 @@ from starlette.responses import Response
 
 from odin.aws.backings import ACCOUNT, REGION
 from odin.gateway import errors
+from odin.gateway.kms import KeyUnavailable
+from odin.gateway.models import kmsctl
 from odin.gateway.stores import SynthStores
+
+# The service half of the AEAD's additional data (`kmsctl.aad`). The CANONICAL
+# name, not the caller's spelling, because `/db` and `db` are one parameter and
+# a value written under one must open under the other.
+_AAD_SERVICE = "ssm"
 
 DEFAULT_TYPE = "String"
 DEFAULT_TIER = "Standard"
@@ -139,15 +162,21 @@ def _tags_to_list(tags: dict[str, str]) -> list[dict[str, str]]:
 # --- wire shapes (member names verified against botocore's `ssm` model) ----
 
 
-def _wire_parameter(record: dict) -> dict:
+def _wire_parameter(stores: SynthStores, env: str, record: dict) -> dict:
     """A `Parameter` -- the VALUE-carrying shape (GetParameter/GetParameters/
-    GetParametersByPath). `WithDecryption` is irrelevant here: nothing is
-    encrypted (module docstring), so a SecureString reads back the same way a
-    String does."""
+    GetParametersByPath), and the ONE place a stored envelope becomes the
+    string the caller asked for.
+
+    `WithDecryption` is still irrelevant, for a NEW reason: every parameter is
+    encrypted now, odin holds the key, and it decrypts on every read. A
+    SecureString still reads back the same way a String does (module
+    docstring). What can change the answer is a LOST key -- `kmsctl.unseal`
+    raises `KeyUnavailable` naming it, and the sole `except` in this module
+    turns that into an `InvalidKeyId`, never a blank value."""
     return _drop_none({
         "Name": record["name"],
         "Type": record["type"],
-        "Value": record["value"],
+        "Value": kmsctl.unseal(stores, env, record["value"], _AAD_SERVICE, canonical_name(record["name"])),
         "Version": record["version"],
         "LastModifiedDate": record["last_modified_date"],
         "ARN": record["arn"],
@@ -241,15 +270,20 @@ def _put_parameter(payload: dict, env: str, stores: SynthStores, now: float) -> 
     existing = _param(stores, env, name)
     if existing is not None and not payload.get("Overwrite"):
         return _already_exists(name)
+    key_id = payload.get("KeyId")
     record = {
         "name": name,
         "arn": parameter_arn(name),
         "type": param_type,
-        "value": value,
+        # SEALED, not the plaintext -- and sealed BEFORE anything is written,
+        # so a `KeyId` naming a key that does not exist leaves the store
+        # untouched instead of half-updating a live parameter.
+        "value": kmsctl.seal(stores, env, key_id, _AAD_SERVICE, canonical_name(name), value),
         "version": int(existing["version"]) + 1 if existing else 1,
         "description": payload.get("Description"),
-        # Stored + echoed for TF fidelity; encrypts nothing (module docstring).
-        "key_id": payload.get("KeyId"),
+        # NO LONGER DECORATIVE (v0.8.18): this is the key the value above is
+        # really sealed under, not a string kept for terraform's benefit.
+        "key_id": key_id,
         "allowed_pattern": payload.get("AllowedPattern"),
         "tier": payload.get("Tier") or DEFAULT_TIER,
         "data_type": payload.get("DataType") or DEFAULT_DATA_TYPE,
@@ -268,14 +302,14 @@ def _get_parameter(payload: dict, env: str, stores: SynthStores, now: float) -> 
     record = _param(stores, env, name)
     if record is None:
         return _not_found(name)
-    return _json({"Parameter": _wire_parameter(record)})
+    return _json({"Parameter": _wire_parameter(stores, env, record)})
 
 
 def _get_parameters(payload: dict, env: str, stores: SynthStores, now: float) -> Response:
     names = [n for n in (payload.get("Names") or []) if isinstance(n, str)]
     found = [(n, _param(stores, env, n)) for n in names]
     return _json({
-        "Parameters": [_wire_parameter(r) for _n, r in found if r is not None],
+        "Parameters": [_wire_parameter(stores, env, r) for _n, r in found if r is not None],
         "InvalidParameters": [n for n, r in found if r is None],
     })
 
@@ -304,7 +338,7 @@ def _get_parameters_by_path(payload: dict, env: str, stores: SynthStores, now: f
     limit = int(payload.get("MaxResults") or DEFAULT_MAX_RESULTS)
     # No pagination state: `NextToken` is never emitted (a paginator stops
     # after this page); `MaxResults` truncates.
-    return _json({"Parameters": [_wire_parameter(r) for r in matched[:limit]]})
+    return _json({"Parameters": [_wire_parameter(stores, env, r) for r in matched[:limit]]})
 
 
 def _describe_parameters(payload: dict, env: str, stores: SynthStores, now: float) -> Response:
@@ -375,11 +409,27 @@ def parameter_exists(stores: SynthStores, env: str, name: str) -> bool:
 
 
 def parameter_value(stores: SynthStores, env: str, name: str) -> str | None:
-    """The stored value, for odin's own tests -- deliberately NOT on any HTTP
-    route, so the only way a value leaves this process is a `GetParameter*`
-    whose principal an IAM edge allowed."""
+    """The stored value, DECRYPTED, for odin's own tests -- deliberately NOT on
+    any HTTP route, so the only way a value leaves this process is a
+    `GetParameter*` whose principal an IAM edge allowed.
+
+    Goes through the same `kmsctl.unseal` the wire path does (so a test on it
+    proves the round trip a caller gets) and RAISES `KeyUnavailable` on a lost
+    key rather than answering None -- None already means "no such parameter",
+    and one value for two very different facts is how an at-rest test ends up
+    unable to tell a destroyed key from an empty store."""
     record = _param(stores, env, name)
-    return record["value"] if record else None
+    if record is None:
+        return None
+    return kmsctl.unseal(stores, env, record["value"], _AAD_SERVICE, canonical_name(name))
+
+
+def stored_key_id(stores: SynthStores, env: str, name: str) -> str | None:
+    """Which KMS key the value is actually SEALED UNDER, read off the envelope
+    rather than off the record's `key_id` -- what was DONE, not what was asked
+    for. See `secretsctl.stored_key_id`."""
+    record = _param(stores, env, name)
+    return kmsctl.key_of(record["value"]) if record else None
 
 
 # --- dispatch --------------------------------------------------------------
@@ -413,4 +463,12 @@ async def pure_answer(action: str, resource: str, env: str, body: bytes, stores:
         payload = json.loads(body) if body else {}
     except (json.JSONDecodeError, UnicodeDecodeError):
         payload = {}
-    return handler(payload, env, stores, now)
+    # The ONE `except` for the crypto path, and it exists so a lost or wrong KMS
+    # key can never be answered with a plausible-looking value. `InvalidKeyId`
+    # is SSM's own error code for exactly this (botocore's `ssm` model lists it
+    # on GetParameter/PutParameter), and `kmsctl.decryption_failure` puts the
+    # key id in the message so the operator knows which one they destroyed.
+    try:
+        return handler(payload, env, stores, now)
+    except KeyUnavailable as exc:
+        return kmsctl.decryption_failure("ssm", "InvalidKeyId", exc)

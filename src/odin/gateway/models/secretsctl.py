@@ -25,14 +25,34 @@ other model module uses, written `0600` like `keys.json` (JsonStore's own
 `_persist_locked` sets the mode; nothing here is world-readable, even
 briefly).
 
-**THE PLAINTEXT RULE.** A secret's value is stored in that sidecar as
-CLEARTEXT. There is no KMS here and no encryption at rest -- `KmsKeyId` is
-accepted, stored and echoed back for TF fidelity, and encrypts NOTHING. The
-protection is the file mode (0600) and the machine boundary, exactly as
-SECURITY.md's Secrets section already describes for an rds `password`. This
-module is deliberately the ONLY place that can hand a value back, and only
-to a principal whose canvas edge grants `secretsmanager:GetSecretValue` on
-that secret's node.
+**THE PLAINTEXT RULE IS RETIRED (v0.8.18), and the retraction is the point.**
+Until v0.8.17 this paragraph read: "A secret's value is stored in that sidecar
+as CLEARTEXT. There is no KMS here and no encryption at rest -- `KmsKeyId` is
+accepted, stored and echoed back for TF fidelity, and encrypts NOTHING." Every
+word of that was true, and `KmsKeyId` was the sharpest instance of it: a field
+the wire accepted, the record kept and `DescribeSecret` echoed, so terraform
+saw a key and nothing was encrypted by it.
+
+It is load-bearing now. A version's `SecretString`/`SecretBinary` is stored as
+an `odin-kms-v1:{keyId}:{base64}` envelope, AES-256-GCM, keyed by real material
+odin generates and keeps at `.odin/{env}/kms.json` (0600, one directory above
+this sidecar). `KmsKeyId` names WHICH key; a secret that names none is sealed
+under the env's default key, so encryption is unconditional rather than opt-in.
+`gateway/kms.py`'s docstring states exactly what that buys and what it does
+not -- read it before repeating the claim, because the failure mode of this
+feature is a second overclaim replacing the first.
+
+Two consequences worth stating here rather than discovering:
+  * The file mode (0600) is still the whole protection for the KEY. Encryption
+    moved the secret out of one file, not out of `.odin/`.
+  * A destroyed key is destroyed data. `ScheduleKeyDeletion` is IMMEDIATE
+    (kmsctl deviation 2), so `GetSecretValue` on a secret whose key is gone
+    answers `DecryptionFailure` NAMING THE KEY -- never an empty string, never
+    the raw envelope, and never a silent fall back to some other key.
+
+This module is still deliberately the ONLY place that can hand a value back,
+and only to a principal whose canvas edge grants
+`secretsmanager:GetSecretValue` on that secret's node.
 
 Versioning fidelity (v1, deliberately bounded): a version is created by
 CreateSecret-with-a-value / PutSecretValue / UpdateSecret-with-a-value, gets
@@ -72,7 +92,15 @@ from starlette.responses import Response
 
 from odin.aws.backings import ACCOUNT, REGION
 from odin.gateway import errors
+from odin.gateway.kms import KeyUnavailable
+from odin.gateway.models import kmsctl
 from odin.gateway.stores import SynthStores
+
+# The service half of the AEAD's additional data (`kmsctl.aad`): a stored
+# envelope is bound to (env, "secretsmanager", secret name), so one moved into
+# another secret's record -- or another env's file -- fails to open rather than
+# quietly answering with the wrong secret.
+_AAD_SERVICE = "secretsmanager"
 
 CURRENT_STAGE = "AWSCURRENT"
 PREVIOUS_STAGE = "AWSPREVIOUS"
@@ -190,15 +218,23 @@ def _wire_secret(record: dict, tags: dict[str, str], stages: dict[str, list[str]
     })
 
 
-def _wire_value(record: dict, version: dict) -> dict:
+def _wire_value(stores: SynthStores, env: str, record: dict, version: dict) -> dict:
+    """The value shape -- and the ONE place a stored envelope becomes the
+    string the caller asked for. Both members go through `kmsctl.unseal`, which
+    raises `KeyUnavailable` (naming the key) if the material is gone; the sole
+    `except` in this module, in `pure_answer`, turns that into a
+    `DecryptionFailure`. Neither ever degrades to an empty value or to the
+    envelope text, because a caller cannot tell those from a real secret."""
+    name = record["name"]
     return _drop_none({
         "ARN": record["arn"],
-        "Name": record["name"],
+        "Name": name,
         "VersionId": version["version_id"],
-        "SecretString": version["secret_string"],
-        # A blob arrives base64-encoded on the JSON wire and is stored exactly
-        # as it arrived, so echoing it back needs no decode step.
-        "SecretBinary": version["secret_binary"],
+        "SecretString": kmsctl.unseal(stores, env, version["secret_string"], _AAD_SERVICE, name),
+        # A blob arrives base64-encoded on the JSON wire and is sealed exactly
+        # as it arrived, so echoing it back needs no decode step -- only the
+        # unseal, which returns the same base64 text that was sent.
+        "SecretBinary": kmsctl.unseal(stores, env, version["secret_binary"], _AAD_SERVICE, name),
         "VersionStages": list(version["version_stages"]),
         "CreatedDate": version["created_date"],
     })
@@ -207,8 +243,16 @@ def _wire_value(record: dict, version: dict) -> dict:
 # --- versions --------------------------------------------------------------
 
 
+def _seal(stores: SynthStores, env: str, name: str, key_id: str | None, value: object) -> str | None:
+    """`value` sealed under the secret's key, or None when it has no value.
+    The ONE place a plaintext enters this module's storage."""
+    if not isinstance(value, str) or not value:
+        return None
+    return kmsctl.seal(stores, env, key_id, _AAD_SERVICE, name, value)
+
+
 def _new_version(
-    stores: SynthStores, env: str, name: str, payload: dict, now_epoch: float,
+    stores: SynthStores, env: str, name: str, payload: dict, now_epoch: float, key_id: str | None,
 ) -> str:
     """Store a new version carrying `payload`'s SecretString/SecretBinary and
     return its VersionId. AWS uses the caller's `ClientRequestToken` AS the
@@ -216,12 +260,26 @@ def _new_version(
     faithfully, since terraform's own `aws_secretsmanager_secret_version`
     reads the returned id straight back into state.
 
+    `key_id` is the secret's `KmsKeyId` (None -> the env default key), threaded
+    from the RECORD by every caller rather than read out of `payload`: a
+    `PutSecretValue` carries no KmsKeyId at all, so reading the payload would
+    have silently re-keyed every rewrite to the default and left the first
+    version unreadable under a key the record still advertised.
+
     Stage bookkeeping: the new version takes whatever `VersionStages` the
     caller asked for (`AWSCURRENT` by default) and any stage it claims is
     removed from whichever version held it; a displaced `AWSCURRENT` becomes
     `AWSPREVIOUS`, which is real AWS's own shift and the only stage motion
     v1 models on its own (module docstring)."""
     version_id = payload.get("ClientRequestToken") or uuid.uuid4().hex
+    # SEAL FIRST, before any store write. A `KeyUnavailable` here (the canvas
+    # named a key that does not exist) must leave the store exactly as it was:
+    # sealing after the stage bookkeeping below would displace AWSCURRENT and
+    # then raise, leaving a secret with no current version and no new one --
+    # odin destroying a working secret while reporting the failure of a
+    # different operation.
+    sealed_string = _seal(stores, env, name, key_id, payload.get("SecretString"))
+    sealed_binary = _seal(stores, env, name, key_id, payload.get("SecretBinary"))
     stages = [s for s in (payload.get("VersionStages") or [CURRENT_STAGE]) if isinstance(s, str)]
     for existing in _versions(stores, env, name):
         kept = [s for s in existing["version_stages"] if s not in stages]
@@ -234,8 +292,8 @@ def _new_version(
     stores.secretsctl.set(env, _version_key(name, version_id), {
         "secret_name": name,
         "version_id": version_id,
-        "secret_string": payload.get("SecretString"),
-        "secret_binary": payload.get("SecretBinary"),
+        "secret_string": sealed_string,
+        "secret_binary": sealed_binary,
         "version_stages": stages,
         "created_date": now_epoch,
     })
@@ -256,17 +314,23 @@ def _create_secret(payload: dict, env: str, stores: SynthStores, now: float) -> 
     if _secret(stores, env, name) is not None:
         return _exists(f"The operation failed because the secret {name} already exists.")
     epoch = time.time()
+    key_id = payload.get("KmsKeyId")
+    # The value is sealed BEFORE the record is written, for the same reason
+    # `_new_version` seals before its own bookkeeping: a CreateSecret naming a
+    # key that does not exist must leave no half-made secret behind.
+    version_id = _new_version(stores, env, name, payload, epoch, key_id) if _has_value(payload) else None
     stores.secretsctl.set(env, _secret_key(name), {
         "name": name,
         "arn": secret_arn(name),
         "description": payload.get("Description"),
-        "kms_key_id": payload.get("KmsKeyId"),
+        # NO LONGER DECORATIVE (v0.8.18): this is the key `_new_version` above
+        # actually sealed with, not a string kept for terraform's benefit.
+        "kms_key_id": key_id,
         "resource_policy": None,
         "created_date": epoch,
         "last_changed_date": epoch,
     })
     _set_tags(stores, env, name, _tags_from_list(payload.get("Tags")))
-    version_id = _new_version(stores, env, name, payload, epoch) if _has_value(payload) else None
     return _json(_drop_none({"ARN": secret_arn(name), "Name": name, "VersionId": version_id}))
 
 
@@ -284,14 +348,19 @@ def _update_secret(payload: dict, env: str, stores: SynthStores, now: float) -> 
     if record is None:
         return _not_found(f"Secrets Manager can't find the specified secret: {name}")
     epoch = time.time()
-    updated = {
+    key_id = payload.get("KmsKeyId", record["kms_key_id"])
+    # Changing the key re-keys only what is written FROM HERE ON. Older
+    # versions stay sealed under whichever key sealed them and stay readable,
+    # because the envelope carries its own key id -- so a re-key never
+    # retroactively bricks history, and never silently claims to have
+    # re-encrypted it either.
+    version_id = _new_version(stores, env, name, payload, epoch, key_id) if _has_value(payload) else None
+    stores.secretsctl.set(env, _secret_key(name), {
         **record,
         "description": payload.get("Description", record["description"]),
-        "kms_key_id": payload.get("KmsKeyId", record["kms_key_id"]),
+        "kms_key_id": key_id,
         "last_changed_date": epoch,
-    }
-    stores.secretsctl.set(env, _secret_key(name), updated)
-    version_id = _new_version(stores, env, name, payload, epoch) if _has_value(payload) else None
+    })
     return _json(_drop_none({"ARN": record["arn"], "Name": name, "VersionId": version_id}))
 
 
@@ -393,7 +462,7 @@ def _get_secret_value(payload: dict, env: str, stores: SynthStores, now: float) 
             f"Secrets Manager can't find the specified secret value for "
             f"{'VersionId' if version_id else 'staging label'}: {version_id or stage}"
         )
-    return _json(_wire_value(record, version))
+    return _json(_wire_value(stores, env, record, version))
 
 
 def _put_secret_value(payload: dict, env: str, stores: SynthStores, now: float) -> Response:
@@ -403,7 +472,9 @@ def _put_secret_value(payload: dict, env: str, stores: SynthStores, now: float) 
         return _not_found(f"Secrets Manager can't find the specified secret: {name}")
     if not _has_value(payload):
         return _invalid("SecretString or SecretBinary is required")
-    version_id = _new_version(stores, env, name, payload, time.time())
+    # `PutSecretValue` carries no KmsKeyId of its own: the key comes off the
+    # RECORD, so a rewrite stays under the key the canvas chose.
+    version_id = _new_version(stores, env, name, payload, time.time(), record["kms_key_id"])
     version = _version_by_id(stores, env, name, version_id) or {}
     return _json({
         "ARN": record["arn"], "Name": name, "VersionId": version_id,
@@ -437,13 +508,32 @@ def secret_exists(stores: SynthStores, env: str, name: str) -> bool:
 
 
 def current_value(stores: SynthStores, env: str, name: str) -> str | None:
-    """The AWSCURRENT version's `SecretString`, or None when the secret has
-    no current version (or holds binary only). Used by odin's own tests and
-    the World projection's existence check -- deliberately NOT exposed on any
-    HTTP route, so the ONLY way a value leaves this process is a
-    `GetSecretValue` whose principal an IAM edge allowed."""
+    """The AWSCURRENT version's `SecretString`, DECRYPTED, or None when the
+    secret has no current version (or holds binary only). Used by odin's own
+    tests and the World projection's existence check -- deliberately NOT
+    exposed on any HTTP route, so the ONLY way a value leaves this process is a
+    `GetSecretValue` whose principal an IAM edge allowed.
+
+    It goes through the same `kmsctl.unseal` the wire path does, so a test
+    asserting on it proves the same round trip a caller gets -- and RAISES
+    `KeyUnavailable` on a lost key rather than answering None, because a helper
+    that returned None for "gone" and None for "no version" would make the
+    at-rest tests unable to tell a destroyed key from an empty secret."""
     version = _version_by_stage(stores, env, name, CURRENT_STAGE)
-    return version.get("secret_string") if version else None
+    if version is None:
+        return None
+    return kmsctl.unseal(stores, env, version.get("secret_string"), _AAD_SERVICE, name)
+
+
+def stored_key_id(stores: SynthStores, env: str, name: str) -> str | None:
+    """Which KMS key the AWSCURRENT version is actually SEALED UNDER, read off
+    the envelope rather than off the record's `kms_key_id`.
+
+    The distinction is the whole point: the record's field is what was ASKED
+    for, and this is what was DONE. A test comparing the two is what would
+    catch a seal path that accepted a key and quietly used the default."""
+    version = _version_by_stage(stores, env, name, CURRENT_STAGE)
+    return kmsctl.key_of(version.get("secret_string")) if version else None
 
 
 # --- dispatch --------------------------------------------------------------
@@ -499,6 +589,12 @@ def _missing_identifier(op: str, payload: dict) -> str | None:
     )
 
 
+# Which `secretsmanager` error code a KMS failure wears, per op. Only
+# `GetSecretValue` reads a stored value, so it is the only DECRYPTION failure;
+# every other op that touches the key is writing one.
+_KMS_FAILURE_CODE = {"GetSecretValue": "DecryptionFailure"}
+_WRITE_KMS_FAILURE = "EncryptionFailure"
+
 _Handler = Callable[[dict, str, SynthStores, float], Response]
 
 _HANDLERS: dict[str, _Handler] = {
@@ -530,4 +626,17 @@ async def pure_answer(action: str, resource: str, env: str, body: bytes, stores:
     except (json.JSONDecodeError, UnicodeDecodeError):
         payload = {}
     missing = _missing_identifier(op, payload)
-    return _invalid(f"{missing} is required") if missing else handler(payload, env, stores, now)
+    if missing:
+        return _invalid(f"{missing} is required")
+    # The ONE `except` in this module, and it exists so a lost or wrong KMS key
+    # can never be answered with a plausible-looking value. `KeyUnavailable`
+    # carries the key id; `kmsctl.decryption_failure` puts it in the message.
+    # Both codes are real `secretsmanager` error shapes (botocore's own model):
+    # a READ that cannot decrypt is `DecryptionFailure`, a WRITE that cannot
+    # encrypt is `EncryptionFailure`.
+    try:
+        return handler(payload, env, stores, now)
+    except KeyUnavailable as exc:
+        return kmsctl.decryption_failure(
+            "secretsmanager", _KMS_FAILURE_CODE.get(op, _WRITE_KMS_FAILURE), exc,
+        )

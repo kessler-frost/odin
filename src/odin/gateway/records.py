@@ -628,6 +628,24 @@ class SsmParameter(Record):
     version: int
 
 
+class KmsKey(Record):
+    """`key:{keyId}` (gateway/models/kmsctl.py) -- the key's METADATA.
+
+    `enabled` and `rotation_enabled` are pinned as real bools because both are
+    read back into terraform state (`aws_kms_key.is_enabled` /
+    `enable_key_rotation`), and pydantic's strict mode is what stops the string
+    `"false"` -- truthy -- from being echoed as an enabled key.
+
+    There is deliberately no key-material field here to pin: the AES bytes live
+    in `.odin/{env}/kms.json` (`gateway/kms.py`), never in a gateway sidecar.
+    """
+
+    key_id: str
+    arn: str
+    enabled: bool
+    rotation_enabled: bool
+
+
 # --- event delivery: the dispatcher's bookkeeping + S3's own notification
 # control plane (reconcile/dispatch.py, gateway/models/s3notify.py) -----------
 
@@ -774,6 +792,7 @@ SCHEMAS: dict[str, dict[str, TypeAdapter]] = {
     "cachectl": {"cluster:": strict(CacheCluster)},
     "secretsctl": {"secret:": strict(Secret), "version:": strict(SecretVersion)},
     "ssmctl": {"param:": strict(SsmParameter)},
+    "kmsctl": {"key:": strict(KmsKey)},
     "dispatch": {"fired:": strict(DispatchAnchor), "pending:": strict(PendingNotification)},
     "s3notify": {"notify:": strict(BucketNotification)},
     "tags": {"": TAG_SET},

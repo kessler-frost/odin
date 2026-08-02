@@ -17,7 +17,7 @@
 // both ways: `(placeholder)` in a sublabel means Apply skips it, and nothing
 // else does. When a placeholder becomes real, the marker comes off in the same
 // commit that adds it to `_KIND`.
-// Today: kinesis, kms, route53, apigateway, efs, events, ebs, eip, igw.
+// Today: kinesis, route53, apigateway, efs, events, ebs, eip, igw.
 
 // `multiline`/`placeholder` mirror ConfigPanel's own FieldDef (catalogFields
 // spreads straight into it), so a catalog entry can declare a textarea field
@@ -128,9 +128,10 @@ export const CATALOG: ServiceDef[] = [
   // tile that did -- which let a user draw an IAM edge to a node Apply never
   // creates and tick permissions against a namespace the gateway does not
   // classify at all (there is no kinesis handler in gateway/models/). Removed for
-  // exactly the reason kms has never had any: a permission odin can neither
-  // enforce nor reach is a promise the engine cannot keep, and offering it is
-  // worse than offering nothing. They come back with a real Kinesis model.
+  // the reason kms's were withheld until kms became real (W2.9): a permission
+  // odin can neither enforce nor reach is a promise the engine cannot keep, and
+  // offering it is worse than offering nothing. They come back with a real
+  // Kinesis model -- which is exactly how kms got its list back.
   {
     type: 'kinesis', abbr: 'KIN', label: 'Kinesis Stream', sublabel: 'Data stream (placeholder)',
     category: 'Integration', color: 'fuchsia', width: 200,
@@ -211,9 +212,17 @@ export const CATALOG: ServiceDef[] = [
   // W2.4: real Secrets Manager -- the node's Name IS the secret name (the
   // gateway classifies every secretsmanager:* call by that bare name, so an
   // IAM edge drawn to this node only enforces while the two match). Value is
-  // the secret's initial version; it is stored CLEARTEXT in a 0600 per-env
-  // JSON sidecar -- there is no KMS in odin, so nothing here is encrypted at
-  // rest. Read SECURITY.md's Secrets section before typing a real credential.
+  // the secret's initial version.
+  //
+  // ENCRYPTED AT REST as of W2.9. This paragraph said the opposite until then --
+  // "stored CLEARTEXT ... there is no KMS in odin, so nothing here is encrypted
+  // at rest" -- and that was true when written. The value is now sealed
+  // AES-256-GCM by `gateway/kms.py` before it reaches the 0600 per-env sidecar,
+  // under the key `KMS Key` names or the env's default key when it is blank.
+  // Two consequences worth knowing before typing a real credential: the KEY
+  // FILE (`.odin/{env}/kms.json`) sits beside the sidecar on the same disk, so
+  // this defends against reading the sidecar, not against reading the
+  // directory; and deleting the key DESTROYS this value, immediately.
   {
     type: 'secret', abbr: 'SEC', label: 'Secret', sublabel: 'Secrets Manager',
     category: 'Security', color: 'lime', width: 220,
@@ -221,25 +230,68 @@ export const CATALOG: ServiceDef[] = [
       { key: 'label', label: 'Name', editable: true },
       { key: 'description', label: 'Description', editable: true },
       { key: 'secretString', label: 'Value', editable: true },
+      // Blank = the env's default key, which is a REAL key created on first
+      // use, not "unencrypted". Naming a key that does not exist is a hard
+      // error rather than a silent fallback, so a `kms -> secret` edge fills
+      // this in (`spec/translate.py::_merge_encryption_edges`) instead of
+      // asking the user to keep two places in step.
+      { key: 'kmsKeyId', label: 'KMS Key', editable: true },
     ],
-    defaultData: { label: 'new-secret', description: '', secretString: '' },
+    defaultData: { label: 'new-secret', description: '', secretString: '', kmsKeyId: '' },
     iamActions: [
       'secretsmanager:GetSecretValue', 'secretsmanager:DescribeSecret',
       'secretsmanager:PutSecretValue', 'secretsmanager:*',
     ],
   },
-  // kms: an UNBACKED placeholder -- odin has no KMS substitute and the gateway
-  // classifies no `kms:*` action, so it is not in translate.py's _KIND and Apply
-  // skips it (see skipped_node_types).
-  // Deliberately NO `iamActions`: advertising kms:Encrypt/Decrypt let a user
-  // draw an IAM edge and tick permissions that could never be enforced or
-  // even reached -- a promise the engine cannot keep. They come back with a
-  // real KMS model, not before.
+  // W2.9: kms is REAL. It was an unbacked placeholder until then, and the
+  // paragraph here said so at length -- that odin "has no KMS substitute" and
+  // "the gateway classifies no `kms:*` action". Both are now false, which is the
+  // caveat-outliving-its-fix failure .claude/CLAUDE.md's honesty rule 3 names,
+  // so what it says instead is what the key actually does:
+  //
+  //   * WHAT IT ENCRYPTS: the two sidecars odin holds the plaintext of --
+  //     Secrets Manager secrets and SSM parameters. `gateway/kms.py` keeps
+  //     AES-256 material in a 0600 `.odin/{env}/kms.json` and every value is
+  //     sealed AES-GCM before it reaches `secretsctl.json` / `ssmctl.json`.
+  //     THIS IS ENCRYPTION WHERE THE DATA LIVES, not a claim that AWS would
+  //     encrypt the same thing -- and the key file sits beside the sidecar on
+  //     the same disk, so it defends against reading the sidecar, NOT against
+  //     reading the directory. Say the smaller true thing.
+  //   * WHAT IT DOES NOT: everything else. An S3 object, an RDS volume and a
+  //     DynamoDB item are stored by real RustFS / Postgres / dynalite
+  //     containers that odin does not hold the keys for, so drawing this at
+  //     them encrypts nothing -- those pairs stay `unmodelled` on purpose.
+  //     An RDS master password is likewise still stored and used in cleartext;
+  //     nothing here changes that.
+  //   * DELETING THE KEY DESTROYS THE DATA. `ScheduleKeyDeletion` is IMMEDIATE
+  //     here (no 7-30 day window), and a secret sealed under a deleted key
+  //     reads back as a 400 naming the key, never a blank value.
+  //
+  // The Name IS the key id: real `CreateKey` carries no name, so the label rides
+  // in on the `odin:node` tag and the gateway keys by it. Rename the node and
+  // you have a different key -- and any secret still naming the old one fails
+  // loudly rather than falling back to the default.
   {
-    type: 'kms', abbr: 'KMS', label: 'KMS Key', sublabel: 'Encryption key (placeholder)',
-    category: 'Security', color: 'teal', width: 200,
-    fields: [{ key: 'label', label: 'Description', editable: true }, { key: 'arn', label: 'Key ARN' }],
-    defaultData: { label: 'new-key', arn: '' },
+    type: 'kms', abbr: 'KMS', label: 'KMS Key', sublabel: 'Encryption key',
+    category: 'Security', color: 'teal', width: 220,
+    fields: [
+      { key: 'label', label: 'Name (key ID)', editable: true },
+      { key: 'description', label: 'Description', editable: true },
+      // A FLAG, not a rotation: `kmsctl` records it and GetKeyRotationStatus
+      // reports it back, but no material is re-derived and no ciphertext is
+      // re-wrapped. Offered because the generated Terraform is portable, where
+      // it means the real thing; never pre-ticked, because a default asserts a
+      // protection odin has not got.
+      { key: 'rotate', label: 'Key Rotation', editable: true, select: ['false', 'true'] },
+    ],
+    defaultData: { label: 'new-key', description: '', rotate: 'false' },
+    // Every one of these has a real handler in `gateway/models/kmsctl.py` --
+    // the bar `tests/gateway/test_iam_vocabulary_is_enforceable.py` and the ecr
+    // precedent set. The grant/alias verbs odin models NO handler for
+    // (CreateAlias, CreateGrant, ...) answer `InvalidAction` 400 and are
+    // deliberately not offered: a tickable action the gateway cannot answer is
+    // decorative, which is what got kinesis's list deleted outright.
+    iamActions: ['kms:Encrypt', 'kms:Decrypt', 'kms:GenerateDataKey', 'kms:DescribeKey', 'kms:*'],
   },
   // iam_role/ecr (V2c) are REAL, gateway-modeled services (NORTHSTAR directive
   // 5). Both render via the generic ServiceNode, no bespoke component.
@@ -361,10 +413,16 @@ export const CATALOG: ServiceDef[] = [
   // W2.4: real SSM Parameter Store -- the node's Name IS the parameter name,
   // slashes and all (the gateway classifies every ssm:* call by that bare
   // name, so an IAM edge drawn to this node only enforces while the two
-  // match). SecureString is NOT encrypted: there is no KMS in odin, so it is
-  // stored byte-for-byte like a String would be, CLEARTEXT in a 0600 per-env
-  // JSON sidecar -- see SECURITY.md's Secrets section. A parameter can't exist
-  // without a Value, hence the placeholder default rather than an empty one.
+  // match). A parameter can't exist without a Value, hence the placeholder
+  // default rather than an empty one.
+  //
+  // ENCRYPTED AT REST as of W2.9, and the sentence this replaces was right
+  // about the part that has NOT changed. It read: "SecureString is NOT
+  // encrypted ... stored byte-for-byte like a String would be, CLEARTEXT".
+  // Every value is now sealed AES-256-GCM before it reaches the 0600 per-env
+  // sidecar -- but odin seals EVERY type, so `SecureString` still buys nothing
+  // over `String`. The Type is AWS's own record of intent here, not the
+  // protection; the KMS Key field is.
   {
     type: 'ssm', abbr: 'SSM', label: 'SSM Parameter', sublabel: 'Parameter store',
     category: 'Management', color: 'indigo', width: 220,
@@ -372,8 +430,11 @@ export const CATALOG: ServiceDef[] = [
       { key: 'label', label: 'Name', editable: true },
       { key: 'paramType', label: 'Type', editable: true, select: ['String', 'StringList', 'SecureString'] },
       { key: 'paramValue', label: 'Value', editable: true },
+      // Same as the secret's `kmsKeyId`, under the name the AWS API and the
+      // terraform provider both use for a parameter (`key_id`).
+      { key: 'keyId', label: 'KMS Key', editable: true },
     ],
-    defaultData: { label: '/odin/param', paramType: 'String', paramValue: 'changeme' },
+    defaultData: { label: '/odin/param', paramType: 'String', paramValue: 'changeme', keyId: '' },
     primary: { key: 'paramType', label: 'Type' },
     iamActions: [
       'ssm:GetParameter', 'ssm:GetParameters', 'ssm:GetParametersByPath',

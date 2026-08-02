@@ -329,6 +329,8 @@ def classify(
         return _classify_secretsmanager(lower_headers, body)
     if service == "ssm":
         return _classify_ssm(lower_headers, body)
+    if service == "kms":
+        return _classify_kms(lower_headers, body)
     if service == "elasticache":
         return _classify_elasticache(body)
     if service == "rds":
@@ -643,6 +645,61 @@ def _classify_ssm(lower_headers: dict[str, str], body: bytes) -> tuple[str, str]
     except (json.JSONDecodeError, UnicodeDecodeError):
         return None
     return f"ssm:{op}", _ssm_resource(payload)
+
+
+def _kms_resource(payload: dict) -> str:
+    """The bare KEY ID -- which for a `kms` canvas node IS its label, because
+    `gateway/models/kmsctl.py` keys a key by the `odin:node` tag rather than
+    minting a uuid (its deviation 1, which exists so this function can exist:
+    a uuid would need a store lookup classify has no access to).
+
+    Every form a `KeyId` arrives in reduces the same way `kmsctl.bare_key_id`
+    reduces it -- kept in lock-step, and
+    `tests/gateway/test_kmsctl.py::test_classify_and_model_agree_on_every_key_id_form`
+    pins the two against each other rather than trusting this comment.
+    `CreateKey` carries no KeyId at all and its identity is the tag, so that one
+    resolves through `_kms_tag_key`; `ListKeys` names nothing and falls back to
+    `"*"` -- never None, so the OPERATOR (tofu) is never denied via
+    `unmappable-action`.
+    """
+    value = payload.get("KeyId")
+    if isinstance(value, str) and value:
+        tail = value.rpartition(":key/")[2] or value
+        return tail.removeprefix("alias/")
+    return _kms_tag_key(payload)
+
+
+def _kms_tag_key(payload: dict) -> str:
+    """CreateKey's identity: the `odin:node` tag `agent/hcl.py` stamps. KMS
+    spells a tag `{"TagKey": ..., "TagValue": ...}`, NOT the `Key`/`Value` every
+    other service modeled here uses -- read the common spelling and every
+    `CreateKey` classifies to `"*"`, which the operator's wildcard still allows,
+    so nothing breaks until someone draws an iam edge. That is the
+    DynamoDB-Streams trap `_events_resource` already carries a paragraph about;
+    both spellings come from botocore's own model, not from memory."""
+    tags = payload.get("Tags")
+    for entry in tags if isinstance(tags, list) else []:
+        if isinstance(entry, dict) and entry.get("TagKey") == "odin:node":
+            return str(entry.get("TagValue") or "*")
+    return "*"
+
+
+def _classify_kms(lower_headers: dict[str, str], body: bytes) -> tuple[str, str] | None:
+    """KMS shares ECR's JSON-target wire shape -- but its `X-Amz-Target` prefix
+    is `TrentService`, KMS's internal name, NOT `kms` (verified against
+    botocore's own `kms` model: protocol `json`, jsonVersion 1.1, targetPrefix
+    `TrentService`, endpointPrefix `kms`). Only the endpointPrefix reaches this
+    module (it is the SigV4 credential-scope name), and the op is taken from the
+    part AFTER the dot, so the prefix's spelling never has to be hardcoded."""
+    target = lower_headers.get("x-amz-target")
+    if target is None or "." not in target:
+        return None
+    op = target.rsplit(".", 1)[1]
+    try:
+        payload = json.loads(body) if body else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return f"kms:{op}", _kms_resource(payload)
 
 
 def _elbv2_name(value: str) -> str:

@@ -1,6 +1,6 @@
 """Fix-wave 2b finding #1 -- a pure, read-only projection of the TF-owned
 resource kinds (vpc/subnet/sg/ec2/ecs/lambda/iam_role/ecr/logs/secret/ssm/
-elasticache/rds/alb: the kinds
+elasticache/rds/alb/kms: the kinds
 `agent/hcl.py` can build and only `tofu apply`/`tofu destroy` ever
 creates/destroys -- s3/sqs/sns/dynamodb are excluded, those already get real
 World entries via the reconciler's own PROVISIONED path in plan.py) from the
@@ -74,7 +74,7 @@ from odin.compute.functions import container_name as function_container_name
 from odin.compute.proxy import container_name as proxy_container_name
 from odin.compute.tasks import TaskRuntime
 from odin.fabric.nebula import NebulaManager
-from odin.gateway.models import cachectl, ecsctl, elbv2ctl, logsctl, rdsctl, ssmctl
+from odin.gateway.models import cachectl, ecsctl, elbv2ctl, kmsctl, logsctl, rdsctl, ssmctl
 from odin.gateway.models.ecsctl import sweep_tasks, task_verdict
 from odin.gateway.stores import SynthStores
 from odin.reconcile import mesh_health
@@ -86,7 +86,7 @@ from odin.spec.models import ResourceObserved, World
 
 TF_OWNED_KINDS = frozenset({
     "vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr", "logs", "secret", "ssm",
-    "elasticache", "rds", "alb",
+    "elasticache", "rds", "alb", "kms",
 })
 
 # elbv2's own load-balancer state machine (gateway/models/elbv2ctl.py) -> the
@@ -290,6 +290,44 @@ def _ssm_parameters(stores: SynthStores, env: str) -> Projected:
         label = _label(tags, record["name"])
         if label:
             out[label] = ("ssm", "healthy", {}, None)
+    return out
+
+
+def _kms_keys(stores: SynthStores, env: str) -> Projected:
+    """W2.9: a `kms` node exists once tofu's CreateKey landed. NO FACTS ARE
+    PROJECTED, on `_secrets`' rule -- a key id is not itself a secret, but there
+    is nothing here a consumer could use: odin publishes no
+    `${{key.SOMETHING}}`, the key is named by the LABEL a canvas already knows,
+    and the one thing a fact could carry that the canvas does not (the ARN) is
+    reconstructible from the label by anyone who wants it. Existence + phase is
+    the whole honest projection.
+
+    THE `odin:node` TAG IS THE ONLY ROUTE BACK TO A LABEL HERE, with no
+    AWS-native fallback -- the one thing that makes this unlike `_secrets` /
+    `_ssm_parameters`, whose `Name` equals the label by construction. A key's
+    `key_id` does NOT: `kmsctl` mints the env's default key as `odin-default`
+    (`DEFAULT_KEY_ID`, created on first use to seal any secret no kms node was
+    drawn for) and a uuid for any untagged CreateKey. Falling back to `key_id`
+    would project `odin-default` as a World resource no canvas node matches, no
+    Stack revision can prune and `plan()` would call "observed but no longer
+    desired" on every tick -- the phantom `_log_groups` skips an `auto` group to
+    avoid, and the same one the v0.5.2 terminated-instance fix removed. So an
+    untagged key is simply not projected, exactly as an untagged vpc/subnet/ec2
+    is not.
+
+    No phase but `healthy`: a key is metadata plus 32 bytes on disk, with no
+    container to be down and no state machine to fail. `ScheduleKeyDeletion`
+    deletes the record outright (kmsctl's deviation 2 -- it is immediate), so
+    the reconciler's own prune is what removes the node from World.
+    """
+    out: Projected = {}
+    for key, record in stores.kmsctl.items(env).items():
+        if not key.startswith("key:"):
+            continue
+        tags = stores.tags.get(env, f"kms:{record['arn']}", {})
+        label = tags.get(kmsctl.NODE_TAG)
+        if label:
+            out[label] = ("kms", "healthy", {}, None)
     return out
 
 
@@ -718,6 +756,7 @@ async def project(
     out.update(_log_groups(stores, env))
     out.update(_secrets(stores, env))
     out.update(_ssm_parameters(stores, env))
+    out.update(_kms_keys(stores, env))
     out.update(await _db_instances(stores, env))
     out.update(_load_balancers(stores, env))
     out.update(await _ec2_instances(stores, env))

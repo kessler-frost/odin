@@ -16,7 +16,7 @@ from odin.aws.rds import container_name as db_container_name
 from odin.compute.functions import container_name as function_container_name
 from odin.compute.proxy import container_name as proxy_container_name
 from odin.fabric.models import MeshNetwork, SubnetAllocation
-from odin.gateway.models import cachectl, elbv2ctl, lambdactl, rdsctl, secretsctl, ssmctl
+from odin.gateway.models import cachectl, elbv2ctl, kmsctl, lambdactl, rdsctl, secretsctl, ssmctl
 from odin.gateway.stores import SynthStores
 from odin.reconcile import mesh_health
 from odin.reconcile.tf_status import TF_OWNED_KINDS, project, stranded_in_tf_state
@@ -73,7 +73,7 @@ def test_tf_owned_kinds_excludes_reconciler_owned_kinds():
     # own PROVISIONED path -- this projection must never double-own them.
     assert TF_OWNED_KINDS == {
         "vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr", "logs", "secret", "ssm",
-        "elasticache", "rds", "alb",
+        "elasticache", "rds", "alb", "kms",
     }
 
 
@@ -311,6 +311,68 @@ async def test_a_root_level_parameters_tag_key_is_the_canonical_name(tmp_path):
     stores.ssmctl.set(ENV, "param:db-url", _param("/db-url"))
     stores.tags.set(ENV, "ssm:db-url", {"odin:node": "the-canvas-label"})
     assert (await project(stores, ENV))["the-canvas-label"] == ("ssm", "healthy", {}, None)
+
+
+# --- kms (W2.9): the one projected kind with NO AWS-native name to fall back
+# on, because real CreateKey takes no name at all. ---------------------------
+
+
+def _key(key_id: str) -> dict:
+    """A kmsctl `key:` record, as `ensure_key` writes it."""
+    return {
+        "key_id": key_id, "arn": kmsctl.key_arn(key_id), "description": "", "enabled": True,
+        "key_state": "Enabled", "key_usage": "ENCRYPT_DECRYPT", "key_spec": "SYMMETRIC_DEFAULT",
+        "rotation_enabled": False, "policy": None, "creation_date": 1.0,
+    }
+
+
+async def test_a_kms_key_projects_healthy_with_no_facts(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.kmsctl.set(ENV, "key:app-key", _key("app-key"))
+    stores.tags.set(ENV, f"kms:{kmsctl.key_arn('app-key')}", {"odin:node": "app-key"})
+    assert (await project(stores, ENV))["app-key"] == ("kms", "healthy", {}, None)
+
+
+async def test_the_env_DEFAULT_key_is_never_projected(tmp_path):
+    """THE REASON THIS KIND HAS NO NATURAL-NAME FALLBACK, and the bug that
+    fallback would have been.
+
+    `kmsctl.seal` mints `odin-default` on first use for every secret no kms node
+    was drawn for, so an env with one plain secret and NO kms node on the canvas
+    still has a `key:` record. Resolving a label off `key_id` the way `_secrets`
+    resolves one off `name` would put `odin-default` in World -- a resource no
+    Stack revision names, which `plan()` calls "observed but no longer desired"
+    on every single tick and prunes straight back out. That is the phantom
+    `_log_groups` skips an `auto` group to avoid.
+    """
+    stores = SynthStores(tmp_path)
+    stores.kmsctl.set(ENV, f"key:{kmsctl.DEFAULT_KEY_ID}", _key(kmsctl.DEFAULT_KEY_ID))
+    result = await project(stores, ENV)
+    assert result == {}, result
+
+
+async def test_an_untagged_key_is_not_projected_even_beside_a_tagged_one(tmp_path):
+    """A CreateKey that carried no `odin:node` tag got a uuid (kmsctl deviation
+    1) and is addressable from no canvas. Mutation guard: swap the tag-only
+    lookup for `_label(tags, record["key_id"])` and this fails while the test
+    above still passes for the default key alone."""
+    stores = SynthStores(tmp_path)
+    stores.kmsctl.set(ENV, "key:app-key", _key("app-key"))
+    stores.tags.set(ENV, f"kms:{kmsctl.key_arn('app-key')}", {"odin:node": "app-key"})
+    stores.kmsctl.set(ENV, "key:deadbeef00", _key("deadbeef00"))
+    result = await project(stores, ENV)
+    assert set(result) == {"app-key"}
+
+
+async def test_the_canvas_label_wins_over_the_key_id_when_they_differ(tmp_path):
+    """They are equal by construction for a canvas key (the label IS the id),
+    so a record where they differ is what proves the TAG is what is read."""
+    stores = SynthStores(tmp_path)
+    stores.kmsctl.set(ENV, "key:some-id", _key("some-id"))
+    stores.tags.set(ENV, f"kms:{kmsctl.key_arn('some-id')}", {"odin:node": "the-canvas-label"})
+    result = await project(stores, ENV)
+    assert result["the-canvas-label"] == ("kms", "healthy", {}, None)
+    assert "some-id" not in result
 
 
 # --- ec2: the flagship case -- a real Lima VM state machine mapped onto the

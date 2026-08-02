@@ -24,6 +24,13 @@ dependencies = [
     # to 180s, freezing gateway and reconciler together.
     "asyncpg>=0.30",
     "python-hcl2>=8.1.2",
+    # Apache-2.0 OR BSD-3-Clause, and ALREADY RESOLVED in uv.lock before this
+    # line existed (`pyjwt[crypto]` pulls it transitively) -- so this promotes a
+    # dependency odin already shipped rather than adding one. It is here for
+    # `AESGCM`, which seals the secret/parameter sidecars (`gateway/kms.py`).
+    # There is no stdlib alternative: Python ships `hashlib`/`hmac` and no
+    # block cipher at all, so the choice was this or writing an AEAD.
+    "cryptography>=44",
 ]
 
 [project.optional-dependencies]

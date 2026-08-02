@@ -65,6 +65,15 @@ export const defaultPermissions: Record<string, string[]> = {
   // grants Describe/Modify, and nothing odin does at the IAM layer can gate a
   // GET/SET (that's a security-group question). See ROADMAP's limits.
   elasticache: ['elasticache:DescribeCacheClusters'],
+  // W2.9: the two symmetric data-plane ops, and both really bite --
+  // `kmsctl.py` answers Encrypt and Decrypt for real against the env's key
+  // material. `GenerateDataKey` and `DescribeKey` are tickable in the catalog
+  // and not pre-ticked: envelope encryption is a deliberate choice a user
+  // makes, and Describe is metadata a workload rarely needs. NOT offered at
+  // all, in either place: the alias and grant verbs, which `kmsctl` answers
+  // `InvalidAction` 400 for -- the ecr lesson, that classifiable is not the
+  // same as answerable.
+  kms: ['kms:Encrypt', 'kms:Decrypt'],
   // W2.5 note: `alb` is deliberately ABSENT here and from `iamActionsForTarget`.
   // A load balancer is not an IAM data-plane target -- you don't "call" an ALB
   // with signed AWS requests, you send it plain HTTP, and no IAM policy gates
@@ -160,6 +169,20 @@ export const edgeTypes: Record<string, EdgeTypeDef> = {
   // launch). Emerald and solid: solid because it is a wire that carries a value,
   // and a colour of its own because it is neither a grant nor a firewall.
   connection: { id: 'connection', label: 'Connection', color: '#34d399', dashed: false },
+  // "This key encrypts that sidecar at rest" -- it AUTHORS the target's own
+  // key-naming field (`spec/translate.py::_merge_encryption_edges` ->
+  // `agent/hcl.py::_secret`/`_ssm` -> a real `kms_key_id`/`key_id` argument), so
+  // it is the same author-a-field-a-builder-already-reads shape as `role` and
+  // `sg`, not a presentational label.
+  //
+  // Teal and SOLID, by the two rules the edges above already follow. Teal
+  // matches the KMS tile's own accent (`catalog.ts`'s `color: 'teal'`), the
+  // rule `sg` states for red and `role` for amber. Solid rather than dashed
+  // because dashed is reserved here for an IDENTITY fact -- who may act as whom
+  // (`iam`, `role`) -- and this is not one: a sealed value is a property of the
+  // data at rest, true whether or not anybody is calling anything, which puts it
+  // with `sg`/`subscription`/`connection` on the solid side.
+  encryption: { id: 'encryption', label: 'Encrypted With', color: '#2dd4bf', dashed: false },
 };
 
 // Given a pair of node types (unordered), return which edge types are valid
@@ -289,6 +312,26 @@ for (const queue of subscriptionTargetTypes) register('sns', queue, 'subscriptio
 // label says so on the canvas at draw time; see docs/limits.md.
 export const roleHolderTypes = new Set(['lambda']);
 for (const holder of roleHolderTypes) register('iam_role', holder, 'role');
+
+// W2.9: "this key encrypts that sidecar at rest." Folded into the field the
+// builder already reads -- a secret's `kmsKeyId` and a parameter's `keyId`
+// (`spec/translate.py::_merge_encryption_edges`) -- so `agent/hcl.py` gained a
+// `kms_key_id`/`key_id` argument and no knowledge of edges at all.
+//
+// Limited to the kinds whose HCL actually reads such a field, the same rule
+// `roleHolderTypes` and `sgMemberTypes` hold. Here that limit is not a
+// deferral, it is the truth about the substrate: `gateway/kms.py` seals exactly
+// the two sidecars odin holds the plaintext of. An s3 object lives in RustFS,
+// an rds volume in a Postgres container, a dynamodb item in dynalite -- odin
+// holds no key for any of them, so `kms -> s3` would be a line that encrypts
+// nothing. Those pairs stay `unmodelled`, whose label says on the canvas that
+// odin does nothing with the line, rather than a teal one implying it does.
+//
+// Pinned against the Python half by
+// `tests/spec/test_edge_registry_matches_builders.py`, like albTargetTypes /
+// sgMemberTypes / roleHolderTypes before it.
+export const encryptionTargetTypes = new Set(['secret', 'ssm']);
+for (const t of encryptionTargetTypes) register('kms', t, 'encryption');
 
 // The catch-all every unregistered pair falls to. Deliberately a NAMED type
 // with a definition, not a bare string, so `edgeStyle` and the ambiguity

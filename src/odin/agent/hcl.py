@@ -1276,6 +1276,31 @@ _ARN_FORMS: dict[str, tuple[str, ...]] = {
     ),
     "ecr": ("arn:aws:ecr:{region}:{account}:repository/{label}",),
     "ecs": ("arn:aws:ecs:{region}:{account}:service/{cluster}/{label}",),
+    # W2.9. The label IS the KeyId (`kmsctl` deviation 1: real CreateKey carries
+    # no name, so the canvas label rides in on the `odin:node` tag), which is
+    # also what `classify._kms_resource` reports for a real request.
+    #
+    # THIS ROW WAS HELD BACK ONE STEP BEHIND ITS INVERSE, ON PURPOSE, and the
+    # measurement is kept because it is the whole reason the two tables are
+    # pinned together. With `policy.py::_ARN_RESOURCE_LABEL` still missing its
+    # `kms` entry:
+    #   arn_label("arn:aws:kms:...:key/app-key", "kms:Encrypt")  -> None
+    #   classify(TrentService.Encrypt, {"KeyId": "app-key"})     -> ('kms:Encrypt', 'app-key')
+    #   evaluate([Allow kms:Encrypt on the ARN], 'kms:Encrypt', 'app-key') -> False
+    # i.e. emitting this line first would have denied every drawn kms grant
+    # while `tofu plan` stayed clean and the apply stayed green -- canvas
+    # correct, file correct, gateway refusing every call.
+    #
+    # CLOSED by `policy.py::_ARN_RESOURCE_LABEL`'s `"kms": re.compile(r"key/
+    # (?P<label>.+)")`. With that line in, the same three calls give 'app-key' /
+    # ('kms:Encrypt', 'app-key') / True, and removing it again makes an applied
+    # kms grant evaluate False -- so the pairing is load-bearing, not decorative.
+    #
+    # ONE SHAPE ONLY, deliberately: no `alias/...` form. odin models no aliases
+    # (`kmsctl` answers `InvalidAction` for every alias op), so a second shape
+    # here would be an ARN no request can ever be made against -- and its
+    # inverse would be a reducer entry with nothing behind it.
+    "kms": ("arn:aws:kms:{region}:{account}:key/{label}",),
 }
 
 
@@ -1789,8 +1814,42 @@ _SSM_NEEDS_VALUE = "paramValue is empty — an SSM parameter cannot exist withou
 _BAD_SSM_TYPE = f"paramType must be one of {', '.join(_SSM_TYPES)}"
 
 
+def _bad_kms_ref(field: str, label: str) -> str:
+    return (
+        f"{field} names {label!r}, which is not a kms node on this canvas — a key that does not "
+        f"exist is a HARD error in odin (the gateway refuses to seal rather than quietly using "
+        f"the default key), so clear the field or draw the kms node"
+    )
+
+
+def _kms_key_attr(res: ResourceDesired, refs: Refs, field: str, attr: str) -> dict[str, str] | str:
+    """`{attr: aws_kms_key.<name>.key_id}` for the key this node is sealed under
+    -- `{}` when it names none, or the decline reason when the name is not a kms
+    node (the `_lambda`/`_security_group_refs` pattern: a `str` is routed into
+    `unsupported`).
+
+    An INTERPOLATED reference rather than the bare label, deliberately: it is
+    what makes tofu create the key before the secret that names it. Without the
+    ordering the apply is a coin flip, and the losing side is not a retryable
+    error -- `kmsctl.seal` refuses a key that does not exist yet, so the secret
+    fails to create at all.
+
+    `.key_id` and not `.arn`: `gateway/classify.py::_kms_resource` reduces every
+    KeyId form to the bare id, which for a canvas key IS its label, and that is
+    the string an IAM edge's grant has to match.
+    """
+    label = _field(res, field, "").strip()
+    if not label:
+        return {}
+    kind, name = refs.get(label, ("", ""))
+    return {attr: f"aws_kms_key.{name}.key_id"} if kind == "kms" else _bad_kms_ref(field, label)
+
+
 def _secret(res: ResourceDesired, refs: Refs) -> Built:
-    attrs = {"name": quote(res.id), "recovery_window_in_days": _SECRET_RECOVERY_WINDOW}
+    key = _kms_key_attr(res, refs, "kmsKeyId", "kms_key_id")
+    if isinstance(key, str):
+        return key
+    attrs = {"name": quote(res.id), "recovery_window_in_days": _SECRET_RECOVERY_WINDOW, **key}
     description = _field(res, "description", "")
     if description:
         attrs["description"] = quote(description)
@@ -1807,10 +1866,103 @@ def _ssm(res: ResourceDesired, refs: Refs) -> Built:
     param_type = _field(res, "paramType", "String")
     if param_type not in _SSM_TYPES:
         return _BAD_SSM_TYPE
-    attrs = {"name": quote(res.id), "type": quote(param_type), "value": quote(value)}
+    # PORTABILITY DIVERGENCE, stated rather than validated away: real AWS reads
+    # `key_id` only for a `SecureString`, and rejects PutParameter if you send
+    # one for a String. odin's `ssmctl._put_parameter` seals EVERY type under
+    # the named key, so a String parameter here really is encrypted at rest by
+    # the key the canvas drew. Declining the combination would therefore refuse
+    # something odin does correctly; emitting it is honest about odin and only
+    # divergent on Amazon, where the parameter would still be created and this
+    # argument ignored for a non-SecureString.
+    key = _kms_key_attr(res, refs, "keyId", "key_id")
+    if isinstance(key, str):
+        return key
+    attrs = {"name": quote(res.id), "type": quote(param_type), "value": quote(value), **key}
     description = _field(res, "description", "")
     if description:
         attrs["description"] = quote(description)
+    return attrs, ""
+
+
+# W2.9: KMS keys (gateway/models/kmsctl.py + gateway/kms.py -- real AES-256-GCM
+# material in a 0600 `.odin/{env}/kms.json`, sealing the secretsmanager and ssm
+# sidecars). The builder that emits NO NAME, and that is the whole reason this
+# kind is unusual: real `CreateKey` takes no name argument at all, so there is
+# nowhere for the canvas label to ride except the `odin:node` tag every primary
+# resource already carries (`_tags_block`, applied in generate_tf's pass 2). If
+# that tag ever stopped being stamped on this type, `kmsctl._create_key` would
+# mint a uuid instead and the key would be addressable from nothing -- not by
+# `_kms_key_attr` below, not by an IAM edge, not by the World projection.
+#
+# `deletion_window_in_days` is PORTABILITY ONLY and the number is a lie odin is
+# forced into: odin's ScheduleKeyDeletion destroys the material IMMEDIATELY
+# (kmsctl's deviation 2), so the honest value would be 0, exactly as `_secret`
+# emits `recovery_window_in_days = 0` for the same immediate-delete deviation.
+# AWS's minimum is 7 and the provider validates it client-side, so 0 would fail
+# `tofu plan` before the gateway is reached. 7 is emitted because it is the
+# smallest value that parses -- odin does NOT honour it, and applied against
+# real Amazon this key would survive 7 days where odin's is gone at once.
+_KMS_DELETION_WINDOW = "7"
+# `rotate` is a FLAG, not a rotation. `kmsctl` records `rotation_enabled` and
+# `GetKeyRotationStatus` reports it back, so the field round-trips through a
+# real EnableKeyRotation call -- but no key material is ever re-derived and no
+# old ciphertext is re-wrapped. Offered anyway because the generated file is
+# meant to be portable, where it does mean the real thing; never defaulted on,
+# because a default asserts a protection odin has not got.
+_KMS_ROTATE = ("true", "false")
+_BAD_KMS_ROTATE = f"rotate must be one of {', '.join(_KMS_ROTATE)}"
+
+# A label the gateway's `kmsctl.bare_key_id` would REWRITE, which is a key that
+# is created successfully and can then never be addressed again.
+#
+# MEASURED against the real model, not reasoned about. `_create_key` keys its
+# record by the RAW `odin:node` tag, while every other op keys by
+# `bare_key_id(KeyId)` -- so the two disagree exactly when `bare_key_id` is not
+# the identity. Driving the real handlers with a canvas label of
+# `alias/prod-key`:
+#
+#   CreateKey   -> 200, KeyId 'alias/prod-key'
+#   DescribeKey -> 400 NotFoundException "Key 'prod-key' does not exist"
+#   Encrypt     -> 400 NotFoundException "Key 'prod-key' does not exist"
+#
+# ...and a secret naming it then fails `EncryptionFailure` quoting a key id the
+# user never typed. A green create for a key that is dead on arrival is this
+# repo's own "reports success it did not achieve", one layer down.
+#
+# Declined HERE, at generate time, on the `_rds` precedent: the node's name IS
+# the identifier, so the reason names `data.label` -- the key a CLI reader can
+# actually edit -- rather than a gesture. The rule is DUPLICATED from
+# `bare_key_id` rather than imported, the same way `_SSM_TYPES` duplicates
+# ssmctl's `VALID_TYPES`: the deterministic translator stays independent of the
+# gateway. The real repair belongs in `_create_key` (create and lookup should
+# key alike); this stops the canvas from reaching it either way.
+_BAD_KMS_LABEL = (
+    "a KMS key's name may not contain ':key/' or start with 'alias/' — the node's name IS the key "
+    "id, and the gateway reduces both of those forms to something shorter, creating a key nothing "
+    "can address afterwards. Change data.label"
+)
+
+
+def _bare_key_id(value: str) -> str:
+    """`kmsctl.bare_key_id`, character for character. Mirrored rather than
+    approximated: a looser `"alias/" in value` test would also decline
+    `my-alias/key`, which the real function leaves alone (it strips a PREFIX),
+    and declining a name that works is its own kind of wrong answer."""
+    return (value.rpartition(":key/")[2] or value).removeprefix("alias/")
+
+
+def _kms(res: ResourceDesired, refs: Refs) -> Built:
+    if _bare_key_id(res.id) != res.id:
+        return _BAD_KMS_LABEL
+    attrs = {"deletion_window_in_days": _KMS_DELETION_WINDOW}
+    description = _field(res, "description", "").strip()
+    if description:
+        attrs["description"] = quote(description)
+    rotate = _field(res, "rotate", "").strip()
+    if rotate and rotate not in _KMS_ROTATE:
+        return _BAD_KMS_ROTATE
+    if rotate:
+        attrs["enable_key_rotation"] = rotate
     return attrs, ""
 
 
@@ -1905,6 +2057,7 @@ _TF_TYPES = {
     "elasticache": "aws_elasticache_cluster",
     "rds": "aws_db_instance",
     "alb": "aws_lb",
+    "kms": "aws_kms_key",
 }
 
 _BUILDERS = {
@@ -1926,6 +2079,7 @@ _BUILDERS = {
     "elasticache": _elasticache,
     "rds": _rds,
     "alb": _alb,
+    "kms": _kms,
 }
 
 # W2.5: which canvas kinds can actually BE an ALB target. An ECS service

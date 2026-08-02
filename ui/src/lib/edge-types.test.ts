@@ -21,6 +21,7 @@ import {
   edgeDataForConnection,
   edgeStyle,
   edgeTypes,
+  encryptionTargetTypes,
   iamActionsForTarget,
   iamTargetTypes,
   roleHolderTypes,
@@ -155,8 +156,63 @@ describe('the two meanings that were hiding inside `network`', () => {
   });
 });
 
+describe('the encryption edge (kms -> the sidecars odin holds keys for)', () => {
+  it('kms <-> secret and kms <-> ssm are ENCRYPTION, not the catch-all', () => {
+    // It authors the target's own key field (`_merge_encryption_edges` ->
+    // `hcl.py::_secret`/`_ssm` -> a real `kms_key_id`/`key_id`), so unlike
+    // `target`/`subscription` this one is not presentational.
+    expect(detectEdgeTypes('kms', 'secret')).toEqual(['encryption']);
+    expect(detectEdgeTypes('secret', 'kms')).toEqual(['encryption']);
+    expect(detectEdgeTypes('kms', 'ssm')).toEqual(['encryption']);
+    expect(edgeTypes.encryption.label).toBe('Encrypted With');
+  });
+
+  it('renders as itself rather than a grey fallback', () => {
+    expect(edgeStyle('encryption').stroke).toBe(edgeTypes.encryption.color);
+    expect(edgeStyle('encryption').stroke).not.toBe(edgeTypes[UNMODELLED].color);
+  });
+
+  it('carries no permissions — being sealed under a key is not a grant', () => {
+    expect(edgeDataForConnection('kms', 'secret').permissions).toEqual([]);
+  });
+
+  it('is limited to the kinds odin really holds the plaintext of', () => {
+    // NOT a deferral, unlike `roleHolderTypes`' ec2/ecs: an s3 object lives in
+    // RustFS, an rds volume in a Postgres container, a dynamodb item in
+    // dynalite, and odin holds no key for any of them. A teal line there would
+    // claim an encryption that does not happen.
+    expect([...encryptionTargetTypes].sort()).toEqual(['secret', 'ssm']);
+    for (const kind of ['s3', 'rds', 'dynamodb', 'ec2']) {
+      expect(detectEdgeTypes('kms', kind)).not.toContain('encryption');
+    }
+  });
+
+  it('a workload -> kms edge is an IAM grant, and a separate question', () => {
+    // The two meanings never collide: `kms -> secret` is encryption, `lambda ->
+    // kms` is permission to call Encrypt/Decrypt. Neither pair carries both, so
+    // `edge-ambiguity.test.ts` stays green.
+    expect(detectEdgeTypes('lambda', 'kms')).toEqual(['iam']);
+    expect(edgeDataForConnection('lambda', 'kms').permissions)
+      .toEqual(defaultPermissions.kms);
+  });
+
+  it('offers only kms actions the gateway has a handler for', () => {
+    // The ecr lesson: classifiable is not answerable. Every action here is in
+    // `kmsctl.py`'s dispatch table; the alias/grant verbs it answers
+    // `InvalidAction` 400 for are deliberately absent.
+    expect(iamActionsForTarget.kms).toEqual([
+      'kms:Encrypt', 'kms:Decrypt', 'kms:GenerateDataKey', 'kms:DescribeKey', 'kms:*',
+    ]);
+    for (const action of defaultPermissions.kms) {
+      expect(iamActionsForTarget.kms).toContain(action);
+    }
+  });
+});
+
 describe('the renamed catch-all', () => {
   it('an unmodelled pair says so instead of claiming to be a network', () => {
+    // s3 is NOT an encryption target -- nothing odin runs encrypts a RustFS
+    // object -- so this pair stayed unmodelled when kms became real.
     expect(detectEdgeTypes('s3', 'kms')).toEqual([UNMODELLED]);
     expect(detectEdgeTypes('vpc', 'subnet')).toEqual([UNMODELLED]);
     expect(edgeTypes[UNMODELLED].label).toBe('Not modelled');
