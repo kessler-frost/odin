@@ -1707,6 +1707,104 @@ run and are not described as such.
 
 ## Next — known, measured, not yet fixed
 
+- [ ] **One runtime backend, macOS and Linux, containers AND VMs (owner ask,
+  2026-07-31).** *"I want to use lima or colima or something ONLY and not a mix
+  of both like we currently have … something that handles containers as well as
+  VMs natively."*
+
+  **The good news, verified rather than assumed: Colima IS Lima.** Colima 0.10.3
+  is a wrapper that boots a Lima VM and puts a container runtime inside it, so
+  odin already has one virtualization layer — what it does not have is one
+  *interface* to that layer. It talks to the same machine three ways:
+  - `runtime/colima.py` — `CLI = "docker"`, over Colima's docker socket. The
+    default, and what every backing container uses.
+  - `runtime/lima.py` — `CLI = "nerdctl"`, via `limactl shell <vm> sudo nerdctl`.
+    A second container driver behind the same `RuntimeDriver` protocol.
+  - `compute/instances.py` + `compute/lima_yaml.py` — `limactl` directly, for
+    EC2 nodes, which are real Lima VMs.
+
+  So the split is not container-vs-VM; it is **docker-socket vs limactl** for
+  things that already share a hypervisor. Lima 2.1.3 runs both: `limactl` manages
+  VMs, and a Lima VM with containerd gives `nerdctl` — which `runtime/lima.py`
+  already drives today. The unification is therefore *deleting a layer*, not
+  adopting a new one, and `RuntimeDriver` was written for exactly this.
+
+  What to establish before committing to it, because none of it is free:
+  - **Cost of losing the docker socket.** `docker` is what `aws/backings.py`,
+    ECR's real `docker push`, and every test fixture speak. `nerdctl` is
+    CLI-compatible in most of what odin uses, but "most" needs measuring, not
+    assuming — start by running the integration suite against `LimaRuntime` and
+    reporting what breaks.
+  - **Linux.** Lima supports Linux hosts, but odin has never been run on one.
+    Nested virtualization for EC2 nodes is the thing most likely to differ, and
+    a claim that odin works on Linux is not one to make from a Mac.
+  - **The vzNAT address EC2 targets rely on** (`192.168.64.x`) is a
+    Virtualization.framework detail; QEMU on Linux addresses differently, and
+    `alb → ec2` resolves through it.
+  - **Whether it is worth it at all.** The honest alternative is to keep Colima
+    for containers and Lima for VMs and stop pretending that is a mix — it is one
+    hypervisor with two front doors. Decide on evidence; do not refactor a
+    working substrate for tidiness.
+
+  Related and already true: **`odin doctor`, `odin world`, `odin envs` and
+  `odin volumes` are the inspection surface** — what is running, what each env
+  holds, and which named volumes exist with the env label each carries. If the
+  backend unifies, that surface is what should stay stable while the thing
+  underneath changes.
+
+
+- [x] **Service coverage, scoped to what people deploy (owner call, 2026-07-31).**
+  Ten kinds sat in the catalog as unbackable placeholders, filtered out of the
+  palette so nobody could drag one. The owner's scoping: *"I am actually fine
+  with not having things like eip, igw, kinesis … because the majority of people
+  don't really use that for deploying applications … but keep the ones that are
+  used like ebs, efs, kms, apigateway, route53."*
+
+  **DROPPED — removed rather than left as a promise.** `eip`, `igw`, `kinesis`.
+  A placeholder is a claim the catalog makes and the engine cannot keep, and two
+  of these were already assessed as low value on their own merits: an `eip` would
+  re-label the sticky overlay IP Nebula already assigns, and an `igw` would
+  duplicate what containment already expresses while implying control over
+  internet reachability that odin does not have (`internal = true` is hardcoded
+  on every ALB precisely because there is no internet gateway). `kinesis` has no
+  substrate at all. If any is ever wanted, the argument is recorded here rather
+  than the tile pretending.
+
+  **KEEPING, in value-to-risk order** — each becomes real or is dropped too:
+  1. **`ebs → ec2`** — the strongest case. Lima 2.1.3 has `limactl disk` and
+     `additionalDisks:` in the stock template, so a real second block device on a
+     real VM is reachable. Verify with `lsblk` inside the VM, not with a model
+     value. Known constraint: Lima attaches disks at VM creation and exposes no
+     attach verb, so hot-attach is likely impossible where AWS treats it as
+     routine, and `device_name = "/dev/sdf"` will not be what the guest sees.
+  2. **`efs → ecs|lambda`** — container mounts are already proven machinery
+     (`ContainerSpec.volumes` is how Lambda gets its code dir). Two tasks writing
+     and reading one directory is a real mount or it isn't. **Scope to containers:
+     the `ec2` end has no Terraform expression (it is an fstab line in user-data)
+     and this repo has a measured burn where a host-dir mount into Lima silently
+     mounted an empty directory.**
+  3. **`apigateway → lambda|ecs`** — settled as belonging to the TARGET family,
+     not events, on the synchrony argument: a caller holds a connection open and
+     awaits a status code. Substrate is `compute/proxy.py`'s nginx given a route
+     table. It needs the HTTP↔invoke-envelope shim `alb → lambda` was declined
+     for; build it once, here.
+  4. **`route53`** — `--add-host` for containers and `/etc/hosts` via cloud-init
+     for VMs are both real. THE TRAP, measured: an ALB's endpoint is
+     `127.0.0.1:<dynamic port>` and a hosts entry cannot carry a port, so a name
+     would resolve and then fail to connect. Either scope to mesh addresses or
+     say so on the tile.
+  5. **`kms` — NOT as encryption, and this is a deliberate reversal.** The
+     storage analysis found no substrate encrypts anything: RustFS SSE unverified,
+     a Postgres container has no storage encryption, dynalite none, and
+     secrets/SSM are explicitly cleartext in a 0600 JSON sidecar. Emitting
+     `kms_key_id` would produce a green resource claiming a property it does not
+     have — the same promise the catalog already refused when it denied kms any
+     `iamActions`. **What IS real and worth building: encrypting the secrets and
+     SSM sidecars at rest with a key odin actually holds**, so the tile means
+     "this is encrypted where it lives" rather than "AWS would encrypt this".
+     If that is not built, kms is dropped with the other three.
+
+
 - [ ] **A fake runtime does not isolate `/apply-full`, so a "unit" test boots real
   containers.** Measured 2026-07-29, after it leaked four containers into every
   unit-suite run and cost a release-gate diagnosis.
