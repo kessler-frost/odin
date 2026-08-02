@@ -110,8 +110,16 @@ recurring. Read them before writing a guard, a status, or a caveat.
    report an *outcome*; the status is derived from a map; an unmapped outcome
    falls through to failure. A branch that forgets now fails loudly instead of
    inheriting a lie — patching branches one at a time never got there.
-2b. **`docs/architecture.md` is a DIAGRAM of what runs — keep it current with
-   the thing it draws.** One mermaid diagram per implemented service plus two
+2b. **`docs/architecture.md` + `docs/architecture.html` are a DIAGRAM of what
+   runs — keep them current with the thing they draw, and with each other.**
+   TWO files on purpose: GitHub does not render an HTML file in a repo (clicking
+   one shows source), so the markdown is what a reader clicks; the HTML is the
+   styled standalone, with the mermaid PRE-RENDERED to inline SVG so it needs no
+   JS, no CDN and works offline (mermaid is 3.4MB — too heavy to vendor for a
+   docs page). Regenerate the HTML by rendering the diagrams headlessly with
+   `agent-browser` and inlining the SVG; the markdown is generated from the same
+   diagram sources. Update BOTH in the same change or they diverge, which is the
+   failure this rule exists to prevent one level up. One mermaid diagram per implemented service plus two
    for the system, each with a note saying what is really underneath (the
    substrate image, the enforcement path, the measured number). GitHub renders
    it inline, and the README links it as the picture version of `internals.md`.

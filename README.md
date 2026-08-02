@@ -342,6 +342,8 @@ against them by action and resource before it reaches any substitute.
 
 [docs/architecture.md](docs/architecture.md) is the picture version — a diagram
 per service showing what really runs underneath, and one for the whole system.
+GitHub renders those inline; [docs/architecture.html](docs/architecture.html) is
+the same thing styled, self-contained, and offline — open it in a browser.
 [docs/internals.md](docs/internals.md) has the architecture in full, and how each
 claim in this README is verified.
 
