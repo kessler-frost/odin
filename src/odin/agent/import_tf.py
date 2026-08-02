@@ -48,6 +48,7 @@ from odin.aws.backings import ACCOUNT, REGION
 from odin.gateway.policy import arn_label
 from odin.simulate import workspace as workspace_mod
 from odin.simulate.runner import PLUGIN_CACHE_DIR
+from odin.spec.translate import VOLUME_ATTACHMENT
 from odin.util import reap
 
 _GRID_STEP = 220
@@ -95,6 +96,12 @@ _KIND = {
     # `parse_hcl_text` cannot -- see `_stamp_lambda`, which says so rather than
     # letting odin's default payload pass for the user's own function.
     "aws_lambda_function": "lambda",
+    # v0.8.18: an `aws_ebs_volume` has NO `name` argument (exactly like
+    # `aws_instance`), so its label comes from the `odin:node` tag `_label`
+    # already falls back to -- which is why it has no `_NAME_ATTR` entry. Its
+    # attachment to an instance is a companion `aws_volume_attachment`, folded
+    # back into a canvas EDGE below rather than becoming a node.
+    "aws_ebs_volume": "ebs",
 }
 # Neither of these becomes a node. The task definition folds onto its service
 # (image/port/memory/cpu live there, not on the service); the cluster is a
@@ -156,8 +163,13 @@ _NAME_ATTR = {
 # `lambda` is out of the live path because its CODE is not recoverable from any
 # AWS API odin implements -- a live import would produce a function whose body is
 # odin's default payload, which is the substitution this whole module refuses.
+# `ebs` is out for the `sg`/`ec2` reason: a volume's live import id is its
+# `vol-...` VolumeId, minted by the gateway at CreateVolume and appearing nowhere
+# on a canvas, so there is no id to resolve one from outside an Apply. Mode (a),
+# reading an existing HCL project, works.
 _NO_LIVE_IMPORT = {
     "iam_role", "logs", "secret", "ssm", "elasticache", "alb", "sg", "ecr", "ec2", "ecs", "lambda",
+    "ebs",
 }
 _TF_TYPE = {kind: rtype for rtype, kind in _KIND.items() if kind not in _NO_LIVE_IMPORT}
 
@@ -249,6 +261,13 @@ _CARRIED_ATTRS = {
         "function_name", "role", "handler", "runtime", "filename",
         "source_code_hash", "depends_on",
     },
+    # v0.8.18. `type` is carried in the sense that odin always re-emits it -- as
+    # `gp3`, unconditionally (`hcl.py::_ebs`), because the canvas tile has no
+    # volume-type field and the substrate (a `limactl disk`) has no volume type
+    # at all. A source `type = "io2"` is therefore a CHANGED argument
+    # (`_FIXED_VALUES`), never a dropped one: an io2 volume imported as gp3 in
+    # silence is the elasticache bug in another costume.
+    "ebs": {"availability_zone", "size", "type"},
 }
 # EVERY primary kind's carried set, `tags` included.
 #
@@ -283,6 +302,13 @@ _CARRIED_COMPANION_ATTRS = {
     "aws_lb_listener": {"load_balancer_arn", "port", "protocol", "default_action"},
     "aws_sns_topic_subscription": {"topic_arn", "protocol", "endpoint", "raw_message_delivery"},
     "aws_secretsmanager_secret_version": {"secret_id", "secret_string"},
+    # v0.8.18. An attachment becomes an EDGE, and an edge carries no arguments,
+    # so anything the source put on it has to be accounted for here or it
+    # vanishes: `force_detach` and `skip_destroy` both change what a destroy
+    # does to a disk that has data on it. `device_name` IS carried in the sense
+    # that odin re-derives it positionally (`_assigned_devices`), so a source
+    # that names a different device is reported CHANGED.
+    "aws_volume_attachment": {"device_name", "instance_id", "volume_id"},
 }
 _CARRIED_HEALTH_CHECK_ATTRS = {"path"}
 # (owner, attribute) -> the value odin ALWAYS emits, lowercased. An imported
@@ -319,6 +345,7 @@ _FIXED_VALUES = {
     ("ecs", "wait_for_steady_state"): "true",
     ("ecs", "deployment_minimum_healthy_percent"): "100",
     ("ecs", "deployment_maximum_percent"): "200",
+    ("ebs", "type"): "gp3",
 }
 # The default odin's `_node_data` falls back to when a NUMERIC argument's source
 # value isn't a literal number odin can read (`allocated_storage = var.size`,
@@ -334,6 +361,9 @@ _UNREADABLE_NUMBERS = {
     },
     "rds": {
         "allocated_storage": f"the canvas gets odin's default {_RDS_DEFAULT_STORAGE} GiB",
+    },
+    "ebs": {
+        "size": f"the canvas gets odin's default {hcl._DEFAULT_EBS_SIZE} GiB",
     },
 }
 _CONTAINER_KINDS = ("vpc", "subnet")
@@ -695,7 +725,40 @@ def _node_data(kind: str, label: str, attrs: dict) -> dict:
             value = hcl.unquote(attrs.get(attr))
             if isinstance(value, str):
                 data[field] = value
+    if kind == "ebs":
+        # `size` is TEXT on the canvas -- the tile's own `defaultData` is
+        # `{size: '10'}` and the config panel writes a string -- so a quoted
+        # `size = "100"` and a bare `size = 100` both land as digits, exactly as
+        # rds's `allocatedStorage` does. A computed one can't be read at all and
+        # `_unreadable_numbers` reports THAT rather than substituting in silence.
+        data["size"] = _int_text(attrs.get("size")) or hcl._DEFAULT_EBS_SIZE
+        az = hcl.unquote(attrs.get("availability_zone"))
+        if isinstance(az, str):
+            data["az"] = az
     return data
+
+
+def _assigned_devices(pairs: list[tuple[str, str]]) -> dict[tuple[str, str], str]:
+    """`{(volume label, instance label): the device odin will assign}`.
+
+    RE-DERIVED with `hcl.py`'s own positional rule rather than read from the
+    source, because that is what a regenerate does: `hcl.py`'s attachment pass
+    indexes `_EBS_DEVICE_NAMES` by the volume's place in the sorted list of that
+    instance's volumes. A source `device_name = "/dev/xvdb"` therefore comes back
+    as something else, which is a CHANGED argument and is reported as one.
+
+    That the two rules agree is not asserted here in prose -- the byte-stable
+    generate -> import -> generate test is what proves it, the same way the alb
+    target group's `<label>-tg` name is proved."""
+    by_instance: dict[str, list[str]] = {}
+    for volume, instance in pairs:
+        by_instance.setdefault(instance, []).append(volume)
+    return {
+        (volume, instance): hcl._EBS_DEVICE_NAMES[slot]
+        for instance, volumes in by_instance.items()
+        for slot, volume in enumerate(sorted(set(volumes)))
+        if slot < len(hcl._EBS_DEVICE_NAMES)
+    }
 
 
 def _referenced_label(value: object, rtype: str, by_hcl_name: dict[str, str]) -> str | None:
@@ -1538,6 +1601,7 @@ def parse_hcl(files: dict[str, str], archives: dict[str, bytes] | None = None) -
     subscriptions: list[tuple[str, dict]] = []
     secret_versions: list[tuple[str, dict]] = []
     alb_companions: list[tuple[str, str, dict]] = []
+    volume_attachments: list[tuple[str, dict]] = []
     key_pairs: dict[str, dict] = {}
     taskdefs: dict[str, dict] = {}
     role_policies: list[dict] = []
@@ -1554,6 +1618,12 @@ def parse_hcl(files: dict[str, str], archives: dict[str, bytes] | None = None) -
             continue
         if rtype in _ALB_COMPANION_TYPES:
             alb_companions.append((rtype, rname, attrs))
+            continue
+        if rtype == "aws_volume_attachment":
+            # v0.8.18: a COMPANION that becomes an EDGE, like an sns
+            # subscription -- it is how the canvas says which instance a volume
+            # is attached to, and it never becomes a node.
+            volume_attachments.append((rname, attrs))
             continue
         if rtype == _IAM_POLICY_TYPE:
             role_policies.append(attrs)
@@ -1761,6 +1831,48 @@ def parse_hcl(files: dict[str, str], archives: dict[str, bytes] | None = None) -
                 type="aws_sns_topic_subscription", name=rname,
                 reason="subscription references a resource outside the supported set -- edge dropped",
             ))
+
+    # v0.8.18: each `aws_volume_attachment` back into the canvas edge that
+    # produced it -- the exact inverse of hcl.py's attachment pass, which is what
+    # makes generate -> import -> generate stable instead of losing the
+    # attachment (and so DETACHING a live disk on the next apply).
+    #
+    # `edgeType` is stamped even though hcl.py keys on the two node KINDS: the
+    # canvas needs it to draw and label the line, and `spec/translate.py`'s
+    # `VOLUME_ATTACHMENT` is what it must spell.
+    attached = [
+        (rname, attrs,
+         _referenced_label(attrs.get("volume_id"), "aws_ebs_volume", by_hcl_name),
+         _referenced_label(attrs.get("instance_id"), "aws_instance", by_hcl_name))
+        for rname, attrs in volume_attachments
+    ]
+    devices = _assigned_devices([(v, i) for _, _, v, i in attached if v and i])
+    for rname, attrs, volume_label, instance_label in attached:
+        if not (volume_label and instance_label):
+            # The subscription pass's rule, and it matters more here: a dropped
+            # attachment is a disk that the next apply detaches.
+            missing = ", ".join(
+                f"{arg}={attrs.get(arg)!r}" for arg, found in
+                (("volume_id", volume_label), ("instance_id", instance_label)) if not found
+            )
+            unsupported.append(Unsupported(
+                type="aws_volume_attachment", name=rname,
+                reason=f"attachment references a resource outside the supported set ({missing}) "
+                       "-- the edge is dropped, so a regenerated project would NOT attach this volume",
+            ))
+            continue
+        edges.append({
+            "source": volume_label, "target": instance_label,
+            "data": {"edgeType": VOLUME_ATTACHMENT},
+        })
+        expected = devices.get((volume_label, instance_label))
+        dropped, changed = _attribute_notes(
+            "aws_volume_attachment", attrs, _CARRIED_COMPANION_ATTRS["aws_volume_attachment"], (),
+            _derived_changes([("device_name", attrs.get("device_name"), expected)] if expected else []),
+        )
+        warnings += _attribute_warnings(
+            f"{volume_label} -> {instance_label} (volume attachment)", "", dropped, changed,
+        )
 
     policy_edges, policy_warnings = _edges_from_role_policies(
         role_policies, node_by_label, attrs_by_label,

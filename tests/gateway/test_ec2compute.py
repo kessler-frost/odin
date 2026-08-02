@@ -70,7 +70,10 @@ class FakeInstanceVm:
     ec2compute.py spawns can be observed with a short poll instead of a real
     boot's ~30-60s."""
 
-    def __init__(self, ip: str = "192.168.64.10", fail_boot: bool = False, fail_start: bool = False) -> None:
+    def __init__(
+        self, ip: str = "192.168.64.10", fail_boot: bool = False, fail_start: bool = False,
+        fail_disk_create: bool = False, fail_attach: bool = False, fail_disk_delete: bool = False,
+    ) -> None:
         self.ip = ip
         self.fail_boot = fail_boot
         self.fail_start = fail_start
@@ -78,6 +81,68 @@ class FakeInstanceVm:
         self.stopped: list[str] = []
         self.started: list[str] = []
         self.deleted: list[str] = []
+        # The EBS half. `disk_sets` records the FULL desired list handed to
+        # each attach/detach, because that list becoming unstable is the one
+        # failure that would silently renumber a guest's /dev/vd* letters
+        # under a mounted filesystem -- an assertion needs to see it whole.
+        self.fail_disk_create = fail_disk_create
+        self.fail_attach = fail_attach
+        self.fail_disk_delete = fail_disk_delete
+        self.created_disks: list[tuple[str, int]] = []
+        self.deleted_disks: list[str] = []
+        self.disk_sets: list[tuple[str, list[str]]] = []
+        self.verified: list[str] = []
+        # The witness for the per-VM serialisation -- see `_reboot`.
+        self.in_flight = 0
+        self.overlapped = False
+
+    async def create_disk(self, disk, size_gib):
+        if self.fail_disk_create:
+            raise RuntimeError("limactl disk create failed: no space left on device")
+        self.created_disks.append((disk, size_gib))
+
+    async def delete_disk(self, disk):
+        if self.fail_disk_delete:
+            raise RuntimeError(f"cannot delete disk `{disk}` in use by instance `some-vm`")
+        self.deleted_disks.append(disk)
+
+    async def disks(self, check=False):
+        held = {d for _, disks in self.disk_sets for d in disks}
+        return [
+            {"name": d, "instance": "vm" if d in held else "", "mountPoint": f"/mnt/lima-{d}"}
+            for d, _ in self.created_disks if d not in self.deleted_disks
+        ]
+
+    async def _reboot(self, name, disks):
+        """A stand-in that really SUSPENDS, because otherwise it cannot
+        falsify the thing it is used to test.
+
+        The real `attach_disk` is stop -> edit -> start, three awaits on a
+        VM that must not be touched concurrently. A fake whose body runs
+        straight through never yields, so two tasks can never interleave in
+        it -- and a test built on that fake passes identically with the
+        per-VM lock REMOVED (measured: that mutant survived). `sleep(0)`
+        gives the loop the same chance to switch that a real subprocess
+        does, and `in_flight` is the witness that it did."""
+        self.in_flight += 1
+        self.overlapped = self.overlapped or self.in_flight > 1
+        for _ in range(3):
+            await asyncio.sleep(0)
+        self.in_flight -= 1
+        self.disk_sets.append((name, list(disks)))
+
+    async def attach_disk(self, name, disks, verify, timeout=None):
+        await self._reboot(name, disks)
+        self.verified.append(verify)
+        if self.fail_attach:
+            raise RuntimeError(f"{verify} is not mounted at /mnt/lima-{verify} in {name} after the attach reboot")
+        return self.ip
+
+    async def detach_disk(self, name, disks, timeout=None):
+        await self._reboot(name, disks)
+        if self.fail_attach:
+            raise RuntimeError("start failed")
+        return self.ip
 
     async def boot(self, name, vm_config, *, hostname, ssh_pubkey=None, user_data=None, nebula=None, timeout=300.0, env_vars=None):
         self.booted.append((name, hostname, ssh_pubkey, user_data, nebula, env_vars))

@@ -17,7 +17,10 @@
 // both ways: `(placeholder)` in a sublabel means Apply skips it, and nothing
 // else does. When a placeholder becomes real, the marker comes off in the same
 // commit that adds it to `_KIND`.
-// Today: kinesis, kms, route53, apigateway, efs, events, ebs, eip, igw.
+// Today: kinesis, kms, route53, apigateway, efs, events, eip, igw.
+// (`ebs` came OFF this list in v0.8.18 -- it is a real `limactl disk` volume
+// on a real VM now, and the marker came off in the same commit that added it
+// to `_KIND`, exactly as the rule above requires.)
 
 // `multiline`/`placeholder` mirror ConfigPanel's own FieldDef (catalogFields
 // spreads straight into it), so a catalog entry can declare a textarea field
@@ -408,7 +411,13 @@ export const CATALOG: ServiceDef[] = [
     primary: { key: 'schedule', label: 'Schedule' },
   },
   {
-    type: 'ebs', abbr: 'EBS', label: 'EBS Volume', sublabel: 'Block storage (placeholder)',
+    // REAL as of v0.8.18: a real `limactl disk` volume, attached to a real
+    // Lima VM through its `additionalDisks:`. Drawn to an ec2 node it emits an
+    // `aws_volume_attachment` (`iam.ts`'s `volume` edge). What the guest
+    // actually gets is `/dev/vdb`, not the `/dev/sdf` the attachment asks for
+    // -- see docs/limits.md, which states the measurement rather than the
+    // wish. `az` and `size` map straight onto `aws_ebs_volume`.
+    type: 'ebs', abbr: 'EBS', label: 'EBS Volume', sublabel: 'Block storage',
     category: 'Storage', color: 'lime', width: 200,
     fields: [
       { key: 'label', label: 'Name', editable: true },

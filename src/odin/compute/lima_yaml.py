@@ -16,10 +16,36 @@ UBUNTU_IMAGES = [
     },
 ]
 
+def additional_disks(names: tuple[str, ...] | list[str]) -> list[dict]:
+    """Lima's `additionalDisks` entries for named `limactl disk` volumes --
+    the EBS substrate (`gateway/models/ec2compute.py`'s volume actions).
+
+    MEASURED against real limactl 2.1.3 + a real vz VM (2026-08-02), because
+    every claim below is one this repo would otherwise be guessing at:
+
+    - the guest device is `/dev/vdb` (virtio), NOT the `/dev/sdf` an
+      `aws_volume_attachment` asks for -- an AWS device name is ADVISORY here
+      and `docs/limits.md` says so;
+    - Lima FORMATS and MOUNTS the disk itself: it arrives partitioned
+      (`vdb1`, ext4) and mounted at `/mnt/lima-<disk name>`, where AWS hands
+      you a raw device to `mkfs` yourself;
+    - the cloud-init `cidata` ISO SHIFTS from `vdb` to `vdc` once an extra
+      disk exists, so device letters are positional and not a contract;
+    - a disk can only be attached to a STOPPED instance (`limactl edit` on a
+      running one is `fatal: cannot edit a running instance`, exit 1), which
+      is why `InstanceVm.attach_disk` reboots.
+
+    The dict form (`- name: X`) is used rather than the bare-string shorthand
+    because it is the form probed live.
+    """
+    return [{"name": name} for name in names]
+
+
 def generate_lima_yaml(
     config: VmConfig,
     cloud_init_script: str | None = None,
     shared_network: bool = False,
+    disks: tuple[str, ...] | list[str] = (),
 ) -> str:
     doc: dict = {
         "cpus": config.cpus,
@@ -27,6 +53,11 @@ def generate_lima_yaml(
         "disk": config.disk,
         "images": UBUNTU_IMAGES,
         "mounts": [],
+        # Always emitted, empty or not (like `mounts`): `InstanceVm.set_disks`
+        # REPLACES this key wholesale on every attach/detach, so a document
+        # whose shape depends on whether a disk happened to exist at birth
+        # would make the two paths disagree.
+        "additionalDisks": additional_disks(disks),
         "ssh": {
             "forwardAgent": False,
             "loadDotSSHPubKeys": False,

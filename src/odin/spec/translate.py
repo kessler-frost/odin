@@ -73,6 +73,7 @@ _KIND = {
     "ssm": "ssm",
     "elasticache": "elasticache",
     "alb": "alb",
+    "ebs": "ebs",
 }
 
 
@@ -344,6 +345,14 @@ ROLE_ASSUMPTION = "role"
 ALB_TARGET = "target"
 SNS_SUBSCRIPTION = "subscription"
 
+# "This volume is attached to that instance" -- an `aws_volume_attachment`, and
+# behind it a real `limactl disk` on the instance's VM. PRESENTATIONAL in the
+# same sense as the two above, and here it is load-bearing that it stays so:
+# `agent/hcl.py`'s attachment pass keys on the two NODE KINDS, so an old canvas
+# whose edge still says `network` keeps its attachment. Gating on the name would
+# make the next apply detach a disk with data on it.
+VOLUME_ATTACHMENT = "volume"
+
 # "This workload's environment is wired to that producer's endpoint" -- folded
 # into the consumer's `refs` by `_merge_connection_edges` below.
 CONNECTION = "connection"
@@ -366,7 +375,7 @@ LEGACY_UNMODELLED = "network"
 
 EDGE_KINDS = frozenset({
     "iam", SG_MEMBERSHIP, ROLE_ASSUMPTION, ALB_TARGET, SNS_SUBSCRIPTION,
-    CONNECTION, UNMODELLED, LEGACY_UNMODELLED, "ref",
+    CONNECTION, VOLUME_ATTACHMENT, UNMODELLED, LEGACY_UNMODELLED, "ref",
 })
 
 # Kinds whose HCL reads `securityGroups` (`agent/hcl.py::_security_group_refs`,

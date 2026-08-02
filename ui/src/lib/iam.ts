@@ -160,6 +160,15 @@ export const edgeTypes: Record<string, EdgeTypeDef> = {
   // launch). Emerald and solid: solid because it is a wire that carries a value,
   // and a colour of its own because it is neither a grant nor a firewall.
   connection: { id: 'connection', label: 'Connection', color: '#34d399', dashed: false },
+  // "This volume is attached to that instance" -- it emits a real
+  // `aws_volume_attachment`, and behind that a real `limactl disk` volume in a
+  // real Lima VM's `additionalDisks:`. Lime, matching the EBS node's own accent,
+  // and solid because it is a physical attachment rather than a grant.
+  //
+  // The edge is how the canvas says WHICH instance, and there is no other way:
+  // an `aws_ebs_volume` alone attaches to nothing, so an ebs node drawn with no
+  // volume edge is a real, free-standing `available` volume and says so.
+  volume: { id: 'volume', label: 'Volume Attachment', color: '#a3e635', dashed: false },
 };
 
 // Given a pair of node types (unordered), return which edge types are valid
@@ -289,6 +298,23 @@ for (const queue of subscriptionTargetTypes) register('sns', queue, 'subscriptio
 // label says so on the canvas at draw time; see docs/limits.md.
 export const roleHolderTypes = new Set(['lambda']);
 for (const holder of roleHolderTypes) register('iam_role', holder, 'role');
+
+// An ebs -> ec2 edge is a VOLUME ATTACHMENT: it emits a real
+// `aws_volume_attachment`, and the gateway turns that into a real block device
+// in a real VM (`compute/instances.py::attach_disk`). Kept to `ec2` alone
+// because that is the only kind odin runs as a machine with a disk controller
+// -- an ebs drawn against a lambda or an ecs service would author an
+// attachment nothing could perform, the same rule `sgMemberTypes` and
+// `roleHolderTypes` hold.
+//
+// PRESENTATIONAL, like `target` and `subscription`: `agent/hcl.py`'s
+// attachment pass keys on the two NODE kinds and never reads `edge.kind`.
+// Gating it on the name would be the destructive change documented at the
+// `subscription` note above -- with a live volume the tear-down is worse, so
+// this one is worth being explicit about: an attachment dropped from the
+// generated file makes tofu DETACH a disk that has data on it.
+export const volumeHostTypes = new Set(['ec2']);
+for (const host of volumeHostTypes) register('ebs', host, 'volume');
 
 // The catch-all every unregistered pair falls to. Deliberately a NAMED type
 // with a definition, not a bare string, so `edgeStyle` and the ambiguity

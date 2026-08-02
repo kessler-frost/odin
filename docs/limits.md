@@ -235,16 +235,17 @@ They are listed because finding one by surprise is worse than reading it here.
   backings and the prune, and reads a cached drift result instead of sweeping. ECS
   stays genuinely live because its task sweep runs on every one of those ticks;
   EC2, Lambda and RDS drift can be up to one sweep cadence stale for the duration.
-- **A drawn edge carries a modelled TYPE for only 41 of the 378 kind pairs.**
-  The honest majority answer is `unmodelled` — 337 of the 378 unordered pairs,
+- **A drawn edge carries a modelled TYPE for only 42 of the 378 kind pairs.**
+  The honest majority answer is `unmodelled` — 336 of the 378 unordered pairs,
   drawn as a grey line labelled *Not modelled*, stored in the Stack and read by
   nothing. It was called `network` until v0.8.14, which was a claim about layer 3
   that odin never checked. Re-measured 2026-07-29 over the real 27 canvas kinds,
   the pairs that do mean something: `iam`
   (31 pairs, a real policy), `connection` **and** `iam` together (4),
   `sg` (2, security-group membership), `target` (2 — `alb ↔ ecs`, and since
-  v0.8.15 `alb ↔ ec2`), `role` (`iam_role ↔ lambda`) and `subscription`
-  (`sns ↔ sqs`). Drawing anything else is decoration, and now
+  v0.8.15 `alb ↔ ec2`), `role` (`iam_role ↔ lambda`), `subscription`
+  (`sns ↔ sqs`) and, since v0.8.18, `volume` (`ebs ↔ ec2`, a real
+  `aws_volume_attachment`). Drawing anything else is decoration, and now
   says so.
   Three more pairs carry a SECOND meaning on top of the grant, added in
   v0.8.15 because a permission whose subject is not wired is the same
@@ -713,6 +714,130 @@ They are listed because finding one by surprise is worse than reading it here.
   `allocated_storage` and `instance_class` round-trip faithfully but resize
   nothing, there are no snapshots, and a node's label must be a valid RDS
   identifier (lowercase, hyphen-separated).
+- **EBS: a real disk, but ATTACHING ONE REBOOTS THE INSTANCE, and the device
+  name you write is not the one the guest sees.** An `ebs` node is a real
+  `limactl disk` volume that really joins a real Lima VM; these are the three
+  ways it is not AWS. All three were MEASURED against limactl 2.1.3 on macOS
+  (vz driver, Ubuntu 24.04 guest) on 2026-08-02, before any of the code was
+  written, and the probe output is quoted rather than paraphrased.
+
+  1. **No hot-attach. `AttachVolume` and `DetachVolume` restart the VM.** AWS
+     attaches a volume to a running instance as a routine online operation.
+     Lima cannot: `limactl disk` has create/delete/ls/import/resize/unlock and
+     **no attach verb at all**, attachment exists only as an instance's
+     `additionalDisks:`, and editing that on a live instance is refused
+     outright —
+
+     ```
+     $ limactl edit ebs-probe --set '.additionalDisks = [{"name":"ebs-probe-vol"}]'
+     time="..." level=fatal msg="cannot edit a running instance"
+     exit 1
+     ```
+
+     …while the guest's block devices were, before and after that attempt,
+     byte-identical. So odin does the only thing that works: **stop, rewrite
+     `additionalDisks`, start** — a genuine reboot of your instance, taking
+     roughly as long as a boot. It is not hidden: the instance moves to
+     `pending` (World phase `starting`) for the duration instead of continuing
+     to claim `running`, because during the reboot it is not running. An
+     `aws_volume_attachment` in a `tofu apply` therefore costs an instance
+     restart, and a canvas that adds a volume to a live instance restarts it.
+     odin does NOT refuse the operation, because refusing would make every
+     `aws_volume_attachment` fail; it performs it and tells you what it cost.
+     **Two volumes on one instance cost two restarts.** Terraform plans those
+     attachments in parallel, so both calls arrive before either reboot
+     finishes; both are accepted and the VM work is serialised per instance,
+     the second rebooting with both disks. It has to be serialised rather
+     than merely allowed: a `limactl edit` landing during a `limactl start`
+     is refused outright. An instance is attachable while `running` or
+     already mid-attach; `stopped`, `shutting-down` and `terminated` are
+     refused by name.
+
+  2. **`device_name` is ADVISORY. The guest calls it `/dev/vdb`.** The
+     attachment odin emits says `/dev/sdf` because that is what the AWS
+     provider expects to write, and nothing on this substrate honours it —
+     Lima attaches disks as virtio devices in yaml order. What a guest with
+     one 3GiB volume really reports:
+
+     ```
+     $ limactl shell ebs-probe2 lsblk
+     NAME    MAJ:MIN RM   SIZE RO TYPE MOUNTPOINTS
+     vda     253:0    0    10G  0 disk
+     ├─vda1  253:1    0     9G  0 part /
+     ├─vda15 253:15   0    99M  0 part /boot/efi
+     └─vda16 259:0    0   923M  0 part /boot
+     vdb     253:16   0     3G  0 disk
+     └─vdb1  253:17   0     3G  0 part /mnt/lima-ebs-probe-vol2
+     vdc     253:32   0 268.7M  1 disk /mnt/lima-cidata
+     ```
+
+     Three things in that output are worth reading twice. The size is exact
+     (`3221225472` bytes for a 3GiB request). **Lima formats and mounts the
+     disk for you** — it arrives partitioned `vdb1`, ext4, mounted at
+     `/mnt/lima-<disk name>` — where AWS hands you a raw device to `mkfs`
+     yourself, so a `user_data` script that formats `/dev/sdf` will not find
+     it and does not need to. And the cloud-init `cidata` ISO **moved from
+     `vdb` to `vdc`** the moment a volume existed: device letters here are
+     positional, not a contract, so address the disk by its mount point and
+     never by `/dev/vdX`.
+
+     **How stable that ordering really is, stated precisely, because the
+     first draft of this entry overstated it.** odin hands Lima the disks
+     sorted by volume id, which makes the order DETERMINISTIC — the same
+     canvas always produces the same list — but not insertion-stable: a new
+     volume whose id sorts earlier takes an earlier slot and pushes the
+     others' `/dev/vd*` letters along. What saves a workload from caring is
+     that Lima mounts each disk at `/mnt/lima-<disk name>`, derived from the
+     NAME and not the position, and that an attach reboots the VM anyway, so
+     every device is re-enumerated and re-mounted by name at boot. So: mount
+     points are stable, device letters are not, and the earlier sentence
+     about disks never being "renumbered under a mounted filesystem" was
+     true only in the sense that the filesystem is not mounted at the moment
+     it happens.
+
+     **The version of this that DOES cost you something is one layer up, in
+     Terraform, and it is the sharpest edge on this feature.**
+     `aws_volume_attachment.device_name` is **ForceNew** — measured against
+     OpenTofu 1.12.3 with a real state file, changing it plans
+     `~ device_name = "/dev/sdf" -> "/dev/sdg" # forces replacement`,
+     `Plan: 1 to add, 0 to change, 1 to destroy`. And odin assigns those
+     names positionally from `/dev/sdf`…`/dev/sdp` over the instance's
+     volumes sorted by LABEL, so adding a volume whose label sorts earlier
+     renumbers every later one. Measured through odin's own generator:
+
+     ```
+     before         : data=/dev/sdf   logs=/dev/sdg
+     after +archive : archive=/dev/sdf  data=/dev/sdg  logs=/dev/sdh
+     ```
+
+     Both existing disks are therefore **detached and reattached** by a
+     change that had nothing to do with them — and on this substrate each of
+     those is a VM reboot. **Name volumes so that new ones sort last if you
+     care.** This is not fixable inside the generator: `generate_tf` is a
+     pure function of the canvas with no memory of the last apply and the
+     device pool has 11 slots, so no rule can be insertion-stable; hashing
+     labels into slots would only make the renumbering rarer and
+     unpredictable instead of rare and explainable. The real fixes are a
+     canvas field the tile does not have, or reading the live attachment
+     back. Until one lands, it is written here rather than discovered during
+     an apply, and pinned by
+     `test_hcl_ebs.py::test_adding_an_earlier_sorting_volume_renumbers_the_others`.
+
+  3. **A disk is reclaimed with the env, and refuses to vanish quietly.**
+     `limactl disk delete` will not remove a disk an instance still holds —
+     `fatal msg="cannot delete disk ebs-probe-vol2 in use by instance
+     ebs-probe2"`, exit 1 — which is the guard working, so `/destroy` deletes
+     the VMs first and the disks second, and `DeleteVolume` refuses anything
+     not `available`. Both `/destroy` and `odin env rm` sweep the machine for
+     `odin-ebs-<env>-*` and not merely the store, so a disk whose record was
+     lost is still found; anything that will not go is named, and neither
+     command reports success over it.
+
+  What is NOT modelled: snapshots, `iops`/`throughput`/`encrypted` (reported
+  as gp3/3000/false regardless of what you ask for), resize after creation,
+  multi-attach, and `DeleteOnTermination` for a drawn volume — terminating an
+  instance frees its volumes back to `available` rather than deleting them,
+  which is AWS's own behaviour for a non-root volume.
 - **Nebula** is live single-host. VPC and SG config compiles to Nebula
   network and firewall primitives, and every VPC-joined EC2 VM runs a
   `nebula` daemon carrying the compiled SG firewall. The per-environment

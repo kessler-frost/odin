@@ -103,7 +103,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from odin.compute.cloud_init import generate_cloud_init
-from odin.compute.lima_yaml import generate_lima_yaml
+from odin.compute.lima_yaml import additional_disks, generate_lima_yaml
 from odin.compute.models import VmConfig
 from odin.fabric.models import FirewallRules
 from odin.fabric.nebula import (
@@ -197,6 +197,20 @@ async def _default_runner(args: list[str], input: str | None = None) -> _Proc:
 
 def vm_name(env: str, instance_id: str) -> str:
     return f"odin-ec2-{env}-{instance_id}"
+
+
+# `limactl disk` names live in ONE flat machine-wide namespace
+# (`$LIMA_HOME/_disks/`), not per-instance -- so the env belongs in the name
+# for the same reason it belongs in `vm_name`: it is what makes a reclaim
+# scopable to one env instead of a machine-wide sweep over every disk the
+# user owns. Every disk odin creates matches this prefix and nothing else is
+# ever deleted (see `env_disk_prefix`).
+def disk_name(env: str, volume_id: str) -> str:
+    return f"odin-ebs-{env}-{volume_id}"
+
+
+def env_disk_prefix(env: str) -> str:
+    return f"odin-ebs-{env}-"
 
 
 # --- how long an env name may be, before limactl refuses every boot ---------
@@ -460,6 +474,7 @@ class InstanceVm:
         nebula: NebulaJoin | None = None,
         timeout: float | None = None,
         env_vars: dict[str, str] | None = None,
+        disks: list[str] | None = None,
     ) -> str:
         """Create + start a fresh VM, wait for its vzNAT IP, return it.
         Raises on any failure (boot timeout, a `limactl` error) -- the
@@ -473,7 +488,9 @@ class InstanceVm:
             hostname=hostname, ssh_pubkey=ssh_pubkey, extra_script=extra, env_vars=env_vars,
             install_nebula=nebula is not None,
         )
-        yaml_doc = generate_lima_yaml(vm_config, cloud_init_script=script, shared_network=True)
+        yaml_doc = generate_lima_yaml(
+            vm_config, cloud_init_script=script, shared_network=True, disks=disks or [],
+        )
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as handle:
             handle.write(yaml_doc)
             yaml_path = handle.name
@@ -767,6 +784,107 @@ class InstanceVm:
             f"{name} did not report a reachable IP within {timeout}s "
             f"(raise {_BOOT_TIMEOUT_ENV} if this Mac is just slow or loaded)"
         )
+
+    # --- EBS: real `limactl disk` volumes ----------------------------------
+    #
+    # Every claim in this block was PROBED against limactl 2.1.3 and real vz
+    # VMs before it was coded against (honesty rule 1), and the probe output
+    # is quoted in `docs/limits.md`. The three that shape the design:
+    #
+    #   1. There is NO attach verb. `limactl disk` offers create/delete/ls/
+    #      import/resize/unlock and nothing else; attachment lives only in an
+    #      instance's `additionalDisks:`.
+    #   2. `limactl edit` REFUSES a running instance -- `level=fatal
+    #      msg="cannot edit a running instance"`, exit 1. So attaching to a
+    #      live instance is a stop/edit/start cycle: a REBOOT, which AWS does
+    #      not do. `attach_disk`/`detach_disk` therefore return the instance's
+    #      re-discovered IP, because a restarted VM need not come back on the
+    #      address it left on.
+    #   3. `limactl disk delete` REFUSES a disk an instance still holds --
+    #      `fatal msg="cannot delete disk X in use by instance Y"`, exit 1.
+    #      Reclaim must detach (or delete the VM) first, and `delete_disk`
+    #      runs with check=True precisely so that refusal can never be
+    #      mistaken for a reclaim.
+
+    async def create_disk(self, disk: str, size_gib: int) -> None:
+        """`limactl disk create` -- a real qcow2/raw file under
+        `$LIMA_HOME/_disks/<disk>`. Raises on failure: a CreateVolume that
+        answers `available` having created nothing is exactly the false
+        success this repo keeps fixing."""
+        await self._lima("disk", "create", disk, "--size", f"{size_gib}GiB")
+
+    async def delete_disk(self, disk: str) -> None:
+        """`limactl disk delete`. Raises -- see note 3 above."""
+        await self._lima("disk", "delete", disk)
+
+    async def disks(self, check: bool = False) -> list[dict]:
+        """Every disk `limactl disk list --json` reports, as its own records
+        (JSON Lines, like `limactl list --json`). The fields this app reads,
+        all confirmed present on 2.1.3:
+
+            {"name":"...","size":1073741824,"format":"raw","dir":"...",
+             "instance":"","instanceDir":"","mountPoint":"/mnt/lima-..."}
+
+        `instance` is the VM currently holding it ("" when free) and
+        `mountPoint` is where LIMA ITSELF says it lands in a guest -- read
+        rather than reconstructed, so the in-guest verification below checks
+        limactl's own answer instead of odin's guess at its convention."""
+        out = (await self._lima("disk", "list", "--json", check=check)).stdout
+        return [json.loads(line) for line in out.splitlines() if line.strip()]
+
+    async def disk(self, name: str) -> dict | None:
+        return next((d for d in await self.disks() if d.get("name") == name), None)
+
+    async def set_disks(self, name: str, disks: list[str]) -> None:
+        """Replace a STOPPED instance's `additionalDisks:` wholesale.
+
+        Wholesale, not incremental, and deliberately: the gateway store is
+        the single source of truth for which volumes an instance holds, so
+        rewriting the whole list makes a VM whose yaml has drifted converge
+        instead of accumulating the drift. `--set` takes a yq expression;
+        the value is `json.dumps`'d (valid YAML, and the disk names are
+        odin-minted) rather than pasted together by hand."""
+        await self._lima("edit", name, "--set", f".additionalDisks = {json.dumps(additional_disks(disks))}")
+
+    async def attach_disk(self, name: str, disks: list[str], verify: str, timeout: float | None = None) -> str:
+        """Stop, rewrite `additionalDisks`, start -- and PROVE the disk
+        reached the guest before returning. Returns the instance's IP.
+
+        `disks` is the instance's full desired set; `verify` is the one disk
+        this call is adding, checked by its real mount point inside the
+        booted guest (`_disk_landed`). Verifying is the entire point: an
+        AttachVolume that returns `attached` because a yaml edit succeeded
+        would be the decorative bug -- the yaml edit succeeds happily whether
+        or not a disk exists behind the name."""
+        await self.stop(name)
+        await self.set_disks(name, disks)
+        ip = await self.start(name, timeout)
+        await self._verify_disk_landed(name, verify)
+        return ip
+
+    async def detach_disk(self, name: str, disks: list[str], timeout: float | None = None) -> str:
+        """The same reboot, without the verification: `disks` is what remains
+        attached. Absence needs no in-guest proof -- `limactl disk list`'s own
+        `instance` field is the durable witness, and `delete_disk` refuses
+        anything still held, so a detach that silently did nothing cannot be
+        mistaken for a reclaim later."""
+        await self.stop(name)
+        await self.set_disks(name, disks)
+        return await self.start(name, timeout)
+
+    async def _verify_disk_landed(self, name: str, disk: str) -> None:
+        record = await self.disk(disk)
+        mount = (record or {}).get("mountPoint")
+        if not mount:
+            raise RuntimeError(f"limactl no longer reports a disk named {disk!r}; nothing was attached to {name}")
+        proc = await self._lima("shell", name, "--", "lsblk", "-J", "-b", "-o", "NAME,SIZE,MOUNTPOINT", check=False)
+        if proc.returncode != 0:
+            raise RuntimeError(f"could not read block devices in {name} to confirm {disk} attached: {_failure_reason(proc)}")
+        if mount not in proc.stdout:
+            raise RuntimeError(
+                f"{disk} is not mounted at {mount} in {name} after the attach reboot; "
+                f"lsblk reported: {proc.stdout.strip()}"
+            )
 
     async def stop(self, name: str) -> None:
         await self._lima("stop", name, check=False)

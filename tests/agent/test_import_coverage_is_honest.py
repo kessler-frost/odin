@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from odin.agent import hcl, import_tf
 from odin.agent.hcl import generate_tf
 from odin.agent.import_tf import parse_hcl_text
 from odin.spec.translate import canvas_to_stack
@@ -43,6 +44,12 @@ CANVAS = {
         # all. The last remaining gap has to actually be IN the fixture.
         {"id": "f1", "type": "lambda", "position": {"x": 0, "y": 0},
          "data": {"label": "thumbnailer", "code": "def lambda_handler(event, context):\n    return event\n"}},
+        # v0.8.18: an ebs node plus the edge below, so the round-trip claim
+        # covers the `aws_volume_attachment` COMPANION. A companion that does not
+        # come back is not a cosmetic loss here -- the regenerated project omits
+        # the attachment, and the next apply detaches a disk with data on it.
+        {"id": "d1", "type": "ebs", "position": {"x": 0, "y": 0},
+         "data": {"label": "scratch", "az": "us-east-1a", "size": "40"}},
     ],
     # An IAM edge, deliberately. Until field test 7 this fixture had NO edges,
     # which made the round-trip claim below vacuous on exactly the thing it
@@ -52,6 +59,7 @@ CANVAS = {
     "edges": [
         {"id": "e1", "source": "c1", "target": "b1",
          "data": {"edgeType": "iam", "permissions": ["s3:GetObject"]}},
+        {"id": "e2", "source": "d1", "target": "e1", "data": {"edgeType": "volume"}},
     ],
 }
 
@@ -74,7 +82,7 @@ def test_odins_own_project_now_round_trips_with_nothing_unsupported():
     result = _round_trip()
     assert result.unsupported == [], [e.type for e in result.unsupported]
     assert {n["type"] for n in result.nodes} >= {
-        "vpc", "subnet", "sg", "ec2", "ecs", "s3", "lambda",
+        "vpc", "subnet", "sg", "ec2", "ecs", "s3", "lambda", "ebs",
     }
 
 
@@ -110,6 +118,41 @@ def test_the_readme_describes_the_coverage_import_actually_has():
         "the README claims equal coverage without separating it from FIDELITY -- "
         "an ECS service's wiring, a security group's egress, and a function's code "
         "read from HCL text alone all still cost something"
+    )
+
+
+def test_the_coverage_numbers_in_that_bullet_are_measured_not_written():
+    """The bullet quotes three counts, and until v0.8.18 nothing read them.
+
+    They had gone stale exactly the way `docs/limits.md`'s edge-pair counts
+    did before `edge-types.test.ts` started recomputing them -- the bullet
+    said "builds 18 … across 24 resource types" while the real companion
+    count made 24 arithmetically impossible for 18 kinds. Nobody was
+    careless; the numbers simply lived in a file no build reads, which is the
+    definition of prose that cannot fail. So they are derived here from the
+    real registries instead, and a kind or companion added on either side
+    fails this test until the sentence is corrected.
+
+    Mutation-test: change either number in `docs/internals.md` and this
+    fails."""
+    builds = len(hcl._BUILDERS)
+    reads = len(set(import_tf._KIND.values()))
+    # Every `aws_*` type `parse_hcl` recognises: the primaries, plus every
+    # companion folded onto a node or turned into an edge rather than
+    # becoming one. `aws_key_pair` is handled by a literal branch in
+    # `parse_hcl` and belongs to no registry, so it is named here.
+    companions = (
+        set(import_tf._ECS_COMPANION_TYPES)
+        | set(import_tf._ALB_COMPANION_TYPES)
+        | set(import_tf._CARRIED_COMPANION_ATTRS)
+        | {import_tf._IAM_POLICY_TYPE, "aws_key_pair"}
+    )
+    types = len(set(import_tf._KIND) | companions)
+
+    claim = re.search(r"- \*\*Translation\*\*.*?(?=\n- \*\*)", INTERNALS, re.S).group(0)
+    assert f"builds {builds}" in claim, f"internals.md is behind: odin builds {builds} kinds"
+    assert f"reads all {reads} back across {types} resource types" in claim, (
+        f"internals.md is behind: import reads {reads} kinds across {types} resource types"
     )
 
 
