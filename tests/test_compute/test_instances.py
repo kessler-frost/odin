@@ -74,6 +74,24 @@ class FakeRunner:
         return _Proc(0, "")
 
 
+class _ConfigTrackingRunner(FakeRunner):
+    """A `FakeRunner` that also keeps the nebula config YAML the VM was handed.
+
+    `config_input` is what `limactl shell <vm> -- ... tee` was piped, i.e. the
+    FINAL config that lands on the VM -- the only place a test can read what
+    odin actually decided about the firewall.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.config_input: str | None = None
+
+    async def __call__(self, args, input=None):
+        if args[:4] == ["limactl", "shell", NAME, "--"] and "tee" in args:
+            self.config_input = input
+        return await super().__call__(args, input=input)
+
+
 def _yaml_path_from_create_call(runner: FakeRunner) -> Path:
     create_call = next(c for c in runner.calls if "create" in c)
     return Path(create_call[-1])
@@ -377,13 +395,7 @@ async def test_activate_nebula_derives_underlay_and_writes_final_config(tmp_path
     """Post-boot: the host's OWN address on the VM's vzNAT /24 is derived by
     correlating to the VM's just-discovered IP (not a hardcoded subnet), and
     the FINAL config (real underlay, real firewall) lands on the VM."""
-    class _TrackingRunner(FakeRunner):
-        async def __call__(self, args, input=None):
-            if args[:4] == ["limactl", "shell", NAME, "--"] and "tee" in args:
-                self.config_input = input
-            return await super().__call__(args, input=input)
-
-    runner = _TrackingRunner()
+    runner = _ConfigTrackingRunner()
     runner.responses["hostname -I"] = _Proc(0, "192.168.64.20")
     runner.responses["ifconfig"] = _ifconfig_response("192.168.64.1")
     lighthouse = FakeLighthouseManager()
@@ -408,14 +420,34 @@ async def test_activate_nebula_derives_underlay_and_writes_final_config(tmp_path
 
 
 async def test_activate_nebula_without_firewall_falls_back_to_default_allow_all(tmp_path):
-    runner = FakeRunner()
+    """A `NebulaJoin` with no firewall must land `DEFAULT_FIREWALL` on the VM,
+    and `DEFAULT_FIREWALL` is ALLOW-ALL in both directions
+    (`fabric/nebula.py`) -- the default is deliberately permissive, PKI is what
+    draws the per-env boundary, and real per-group ACLs are an M7 item.
+
+    This test asserted NOTHING until v0.8.18: it ran the boot and commented
+    that allow-all was used. It would have passed just as happily if the
+    fallback were deny-all, if no `firewall` block rendered at all, or if the
+    config were never written -- which is to say it was a test for the
+    absence of an exception wearing a firewall's name. Mutation-tested: with
+    `DEFAULT_FIREWALL`'s ports flipped to `"22"`, this fails.
+    """
+    runner = _ConfigTrackingRunner()
     runner.responses["hostname -I"] = _Proc(0, "192.168.64.20")
     runner.responses["ifconfig"] = _ifconfig_response("192.168.64.1")
     vm = InstanceVm(runner=runner, lighthouse=FakeLighthouseManager())
 
     nebula = NebulaJoin(root=tmp_path, env="myenv", host_id="i-nofw")
     await vm.boot(NAME, get_instance_type("t3.micro"), hostname="i-nofw", nebula=nebula)
-    # No exception, no `firewall=None` crash -- DEFAULT_FIREWALL (allow-all) used.
+
+    config = yaml.safe_load(runner.config_input)
+    # `host: any` rather than a cidr: `nebula.py::_rule_to_dict` emits nebula's
+    # own any-source form when a rule names neither a cidr nor a group, which
+    # is what `DEFAULT_FIREWALL`'s two rules do. Read off the rendered config,
+    # not off the model, so a renderer that dropped the rules would fail here.
+    allow_all = [{"port": "any", "proto": "any", "host": "any"}]
+    assert config["firewall"]["inbound"] == allow_all
+    assert config["firewall"]["outbound"] == allow_all
 
 
 async def test_activate_nebula_is_best_effort_when_underlay_cannot_be_derived(tmp_path):
