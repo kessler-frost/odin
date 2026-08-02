@@ -983,6 +983,16 @@ class Reconciler:
             await self._prune(action.id)
         elif isinstance(action, NoOp):
             pass  # nothing left to gate on now that workload refs are gone
+        else:
+            # Honesty rule 2's shape, applied to the executor: an unmapped
+            # outcome must fail loudly, never inherit "handled". This chain had
+            # no `else`, so a new `Action` member -- or the `RunContainer` that
+            # sat in the union for a whole parked layer without a handler --
+            # was executed by DOING NOTHING and reported as done.
+            raise NotImplementedError(
+                f"{type(action).__name__} is in the Action union but `_execute` "
+                "has no branch for it, so it would be silently dropped"
+            )
 
     async def _prune(self, rid: str) -> None:
         world = self._store.current_world(self._env)

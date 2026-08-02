@@ -2,8 +2,15 @@
 
 Actions are INTENT keyed by resource id; the executor (reconciler.py) turns each
 into concrete runtime / backing calls, building specs from the Stack + Fabric.
-Skeleton scope: provision an AWS-shaped resource, run an app container, prune
-one that is no longer desired.
+
+Scope today: provision an AWS-shaped resource, prune one that is no longer
+desired, or do nothing. THREE members, and `_execute` handles all three -- the
+docstring used to advertise a fourth, "run an app container", for a
+`RunContainer` action that was deleted at tag `app-layer-parked` in everything
+but name: `plan()` never emitted one and `_execute` never handled one, so an
+emitted `RunContainer` would have been dropped in silence. That is the unmapped
+outcome honesty rule 2 forbids, which is why `_execute` now ends in an `else`
+that raises rather than falling off the end.
 """
 from __future__ import annotations
 
@@ -15,11 +22,6 @@ from typing import Union
 class ProvisionResource:
     id: str
     service: str  # "rds" or a PROVISIONED kind (s3/sqs/sns/dynamodb)
-
-
-@dataclass(frozen=True)
-class RunContainer:
-    id: str
 
 
 @dataclass(frozen=True)
@@ -56,4 +58,4 @@ class NoOp:
     id: str = ""
 
 
-Action = Union[ProvisionResource, RunContainer, PruneResource, NoOp]
+Action = Union[ProvisionResource, PruneResource, NoOp]

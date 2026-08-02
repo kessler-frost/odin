@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import dataclass
 
 import pytest
 
@@ -728,6 +729,26 @@ async def test_ec2_instance_phase_reflects_real_state_name(tmp_path):
     observed = store.current_world().get("server")
     assert observed.kind == "ec2"
     assert observed.phase == "healthy"
+
+
+async def test_an_action_the_executor_cannot_handle_raises_instead_of_vanishing(tmp_path):
+    """Honesty rule 2's shape, at the executor: an unmapped outcome must fail
+    loudly rather than inherit "handled".
+
+    `_execute`'s isinstance chain had no `else`, so an Action with no branch
+    was executed by DOING NOTHING and the tick reported success. That was not
+    hypothetical -- `RunContainer` sat in the `Action` union for a whole parked
+    layer with no producer and no handler, so anything that started emitting
+    one would have been silently dropped. The action below stands in for the
+    NEXT one someone adds.
+    """
+    @dataclass(frozen=True)
+    class UnhandledAction:
+        id: str = "ghost"
+
+    recon = Reconciler(SpecStore(tmp_path), FakeRuntime(), aws=FakeAws(), poll_interval=0)
+    with pytest.raises(NotImplementedError, match="UnhandledAction"):
+        await recon._execute(UnhandledAction(), Stack())
 
 
 async def test_stale_tf_owned_world_entry_never_calls_runtime_stop(tmp_path):
