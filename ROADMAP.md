@@ -1738,9 +1738,26 @@ run and are not described as such.
   - **Linux.** Lima supports Linux hosts, but odin has never been run on one.
     Nested virtualization for EC2 nodes is the thing most likely to differ, and
     a claim that odin works on Linux is not one to make from a Mac.
-  - **The vzNAT address EC2 targets rely on** (`192.168.64.x`) is a
-    Virtualization.framework detail; QEMU on Linux addresses differently, and
-    `alb → ec2` resolves through it.
+  - **Host-reachable VM networking is the one place the platforms really
+    diverge** — and the owner's instinct to abstract it is right, with a useful
+    correction: **odin already does, and by the better method.**
+    `compute/instances.py::_pick_shared_ip` does NOT match `192.168.64.x`. It
+    asks the VM `hostname -I` and returns whichever non-loopback address is not
+    Lima's user-mode slirp subnet (`192.168.5.0/24`, egress-only, never
+    host-reachable) — excluding the one known-WRONG network instead of matching
+    one known-right one, which is why a Lima version changing its allocation
+    does not break it.
+
+    So the IP *discovery* is already portable. What is not, and what the seam
+    must cover, is **which network to ask for and whether host-reachability
+    exists at all on that platform**: `vmType: vz` on macOS gets the `shared`
+    (vmnet/vzNAT) network; Linux typically runs QEMU+KVM — and Lima also has
+    `krun` now, so it is not even QEMU-or-vz — where the equivalent is a
+    different network stack with different privileges. The honest shape is a
+    per-driver capability, not a per-platform constant: *does this VM driver
+    offer a host-reachable network, and what is it called?* `alb → ec2` and
+    every mesh join resolve through the answer, so a driver that cannot offer
+    one must say so rather than hand back an unreachable address.
   - **Whether it is worth it at all.** The honest alternative is to keep Colima
     for containers and Lima for VMs and stop pretending that is a mix — it is one
     hypervisor with two front doors. Decide on evidence; do not refactor a
