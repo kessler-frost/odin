@@ -110,6 +110,22 @@ recurring. Read them before writing a guard, a status, or a caveat.
    report an *outcome*; the status is derived from a map; an unmapped outcome
    falls through to failure. A branch that forgets now fails loudly instead of
    inheriting a lie — patching branches one at a time never got there.
+2b. **`docs/architecture.md` is a DIAGRAM of what runs — keep it current with
+   the thing it draws.** One mermaid diagram per implemented service plus two
+   for the system, each with a note saying what is really underneath (the
+   substrate image, the enforcement path, the measured number). GitHub renders
+   it inline, and the README links it as the picture version of `internals.md`.
+
+   It goes stale the same way prose does, and worse: a diagram is believed
+   faster than a paragraph. So when a service gains a substrate, an enforcement
+   path changes, a measured number moves, or a kind is added or dropped, update
+   the diagram IN THE SAME CHANGE — not the release after. Two rules it must
+   keep: every arrow corresponds to something that runs, and a boundary that is
+   NOT gated is drawn as not gated (the mesh covers overlay traffic only; ECS
+   tasks, the ALB proxy, Lambda and ElastiCache are not members). Drawing an
+   ungated path as gated is the same lie as a doc claiming an unfired guard,
+   with better graphics.
+
 3. **Caveats outlive their fixes — audit docs against source.** README and
    ROADMAP both documented the `/world` freeze after it was fixed; an audit
    found two more stale entries. Grep the docs for the bug's own words when a
