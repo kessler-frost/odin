@@ -233,15 +233,35 @@ A `secret` node (Secrets Manager) and an `ssm` node hold values that **are**
 the secret — that's the whole point of the node — and they land in the same
 places, plus one more:
 
-- The canvas JSON, every immutable Stack revision, and now the per-env
-  gateway sidecars the values actually live in (`secretsctl.json` and
-  `ssmctl.json` under `.odin/<env>/gateway/`), all written `0600`.
-- **A `SecureString` is not encrypted at rest.** There is no KMS in odin: a
-  SecureString parameter is stored byte-for-byte like a plain String one, and
-  `KmsKeyId`/`KeyId` are accepted and echoed back for Terraform fidelity
-  while encrypting nothing. `SecureString` buys you the file mode and nothing
-  else. It's stated plainly rather than implied away, because it's the single
-  assumption people are most likely to bring to odin and be wrong about.
+- The canvas JSON and every immutable Stack revision, both `0600` — and both
+  still **cleartext**; the encryption below covers the gateway sidecars only.
+- **The per-env gateway sidecars are ENCRYPTED at rest (v0.8.18).** The values
+  in `.odin/<env>/gateway/secretsctl.json` and `ssmctl.json` are AES-256-GCM
+  envelopes (`odin-kms-v1:<keyId>:<base64>`) under real key material odin
+  generates and keeps at `.odin/<env>/kms.json`, `0600` — the same mode and
+  the same directory as `keys.json`. Every secret and every parameter,
+  including a plain `String`. `KmsKeyId`/`KeyId` name the key that really did
+  the sealing; a value with no key named goes under the env's default key, so
+  this is unconditional rather than opt-in. Measured by
+  `tests/gateway/test_kms_at_rest.py`, which reads the file off disk.
+- **This paragraph used to say the opposite, and the retraction matters.**
+  Until v0.8.17 it read: "A `SecureString` is not encrypted at rest. There is
+  no KMS in odin ... `KmsKeyId`/`KeyId` are accepted and echoed back for
+  Terraform fidelity while encrypting nothing." That was accurate for eleven
+  releases. **One clause of it survives:** a `SecureString` is *still* stored
+  byte-for-byte like a plain `String`, because odin encrypts both — the type
+  is still not the protection, it is just that what both get is now real.
+- **What the encryption does NOT buy, said plainly for the same reason the old
+  limit was.** The key file is in the same tree as the ciphertext and owned by
+  the same user, so this separates two FILES, not two permissions: anyone who
+  can read `.odin/` can still read your secrets. odin runs unattended and has
+  nowhere to hide a key it must also be able to use. What you do get: the
+  plaintext is not in the sidecar, so anything that ships or leaks the gateway
+  directory alone carries no secret; a destroyed KMS key is destroyed data,
+  immediately and loudly (`DecryptionFailure` / `InvalidKeyId`, naming the
+  key); and a ciphertext is bound to `(env, service, name)`, so one moved
+  between records or environments fails to open rather than answering as the
+  wrong secret. `docs/limits.md` carries the full bound.
 - What **does** protect a value: it never enters a World fact, so it never
   travels on the WebSocket or into `world.json` or `events.jsonl`; it's
   redacted out of the translation agent's prompt and out of every streamed
@@ -258,9 +278,13 @@ places, plus one more:
 
 - An `odin export` archive is a copy of all of the above: it contains the
   env's issued gateway credentials (`keys.json`), the gateway's secret and
-  parameter sidecars, and every canvas secret in the stack revisions,
-  `world.json` and the tofu workspace, unencrypted, in a file that is easy to
-  email or drop in cloud storage. The archive is written `0600` and every
+  parameter sidecars **together with `kms.json`, the key that opens them**
+  (without it the restored env would be unrecoverable, so it has to ride
+  along), and every canvas secret in the stack revisions, `world.json` and the
+  tofu workspace, unencrypted, in a file that is easy to email or drop in
+  cloud storage. An archive is exactly as sensitive as it was before the
+  sidecars were encrypted — that is the honest reading, and the reason it is
+  spelled out here rather than left for someone to infer the opposite. The archive is written `0600` and every
   member inside it is stored `0600`, so a restore can only ever tighten a
   store's modes, never loosen them. Treat it like a private key file — and
   note that the mode does not survive the things people do to archives: `scp`,

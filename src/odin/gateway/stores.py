@@ -21,6 +21,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+from odin.gateway.kms import KeyMaterial
 from odin.gateway.records import validate
 from odin.spec.store import CONTROL, _load
 from odin.util import atomic_write_text
@@ -259,17 +260,32 @@ class SynthStores:
       `"secret:{name}"` / `"version:{name}:{versionId}"`, persisted at
       `.odin/{env}/gateway/secretsctl.json`. Secret tags live in the shared
       `tags` store above, keyed `"secretsmanager:{secretArn}"`. This sidecar
-      holds secret VALUES in cleartext -- `_persist_locked`'s `mode=0o600`
-      below is what keeps it owner-only, the same protection `keys.json` gets
-      (see secretsctl.py's PLAINTEXT RULE and SECURITY.md's Secrets section).
+      holds secret VALUES **SEALED**, not cleartext -- v0.8.18 -- as
+      `odin-kms-v1:{keyId}:{base64}` envelopes under AES-256-GCM
+      (`gateway/kms.py`); `_persist_locked`'s `mode=0o600` below is still what
+      keeps the file owner-only, and it is still the whole protection for the
+      KEY (see `kms` below, and `gateway/kms.py`'s statement of what the
+      encryption does and does not buy).
     - `ssmctl`: the SSM Parameter Store model's whole state
       (`gateway/models/ssmctl.py`, task W2.4) -- flat keys `"param:{name}"`
       (the canonicalized name -- see `ssmctl.canonical_name`), persisted at
       `.odin/{env}/gateway/ssmctl.json`. Parameter tags live in the shared
       `tags` store above, keyed `"ssm:{canonicalName}"` (SSM's tag API carries
-      the parameter NAME as `ResourceId`, not an ARN). A `SecureString`
-      parameter's value lives here in cleartext too -- odin has no KMS; 0600
-      is the protection, recorded as a limit rather than implied away.
+      the parameter NAME as `ResourceId`, not an ARN). A parameter's value is
+      SEALED here exactly like a secret's above -- and a `SecureString` is
+      still stored the same way a `String` is, because odin encrypts BOTH
+      rather than pretending the type is the protection.
+    - `kmsctl`: the KMS model's METADATA (`gateway/models/kmsctl.py`) -- flat
+      keys `"key:{keyId}"`, persisted at `.odin/{env}/gateway/kmsctl.json`. Key
+      tags live in the shared `tags` store above, keyed `"kms:{keyArn}"`.
+      **No key BYTES are in this file**, and that split is the point: this is
+      the record terraform diffs and a debug dump would carry, and the material
+      is somewhere else.
+    - `kms`: NOT a `JsonStore` -- `gateway/kms.py::KeyMaterial`, the AES-256 key
+      bytes, at `.odin/{env}/kms.json` (0600, one directory ABOVE the
+      ciphertext, the same place and mode `keys.py` writes issued credentials).
+      It is swept by `forget_env` below like every store, because that method
+      asks for a `forget_env` METHOD rather than for a `JsonStore` type.
     - `cachectl`: the ElastiCache control-plane model's whole state
       (`gateway/models/cachectl.py`, W2.8) -- flat keys `"cluster:{id}"`,
       persisted at `.odin/{env}/gateway/cachectl.json`. ElastiCache tags live
@@ -338,6 +354,11 @@ class SynthStores:
         self.logsctl = JsonStore(root, "logsctl")
         self.secretsctl = JsonStore(root, "secretsctl")
         self.ssmctl = JsonStore(root, "ssmctl")
+        self.kmsctl = JsonStore(root, "kmsctl")
+        # The one member here that is NOT a JsonStore, and deliberately so: key
+        # material must not sit in the file terraform diffs and a debug dump
+        # carries. See this class's docstring and `gateway/kms.py`.
+        self.kms = KeyMaterial(root)
         self.cachectl = JsonStore(root, "cachectl")
         self.rdsctl = JsonStore(root, "rdsctl")
         self.elbv2ctl = JsonStore(root, "elbv2ctl")
@@ -350,15 +371,22 @@ class SynthStores:
         held one.
 
         DERIVED from the attributes, never a hand-written list: this class has
-        grown from four stores to seventeen, one service at a time, and a
+        grown from four stores to eighteen, one service at a time, and a
         removal that named them individually would silently miss the
-        eighteenth. `vars(self)` also skips `root`, which is a Path, not a
+        nineteenth. `vars(self)` also skips `root`, which is a Path, not a
         store.
 
         That is not hypothetical. This method and `eventsctl` arrived in the
         same merge, from two agents that never saw each other's work, and the
-        derived form covered the new store with no edit at all."""
+        derived form covered the new store with no edit at all.
+
+        The predicate asks for a `forget_env` METHOD rather than for
+        `isinstance(store, JsonStore)`, and that is the second version of the
+        same lesson: `kms` (the AES key material) is deliberately not a
+        JsonStore, so a type check would have skipped exactly the member whose
+        survival past an `/envs/rm` matters most -- a cached key for a deleted
+        env, served to the next env that reuses the name."""
         return sorted(
             name for name, store in vars(self).items()
-            if isinstance(store, JsonStore) and store.forget_env(env)
+            if callable(getattr(store, "forget_env", None)) and store.forget_env(env)
         )

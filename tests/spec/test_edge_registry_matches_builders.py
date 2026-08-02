@@ -81,6 +81,47 @@ def test_sg_member_kinds_agree_across_the_language_boundary():
     )
 
 
+def test_encryption_target_kinds_agree_across_the_language_boundary():
+    """W2.9's edge, and the one where drift is not merely cosmetic.
+
+    UI wider than the merge: the canvas draws a teal "Encrypted With" line to a
+    kind whose builder reads no key field, so the value stays sealed under the
+    env's DEFAULT key while the screen names a different one -- odin showing one
+    key and using another.
+
+    Merge wider than the UI: `_merge_encryption_edges` writes `kmsKeyId` on a
+    kind the picker never offers `encryption` for, so a line the canvas labels
+    "Not modelled" silently changes which key a secret is sealed under. Deleting
+    that key then destroys the value (`ScheduleKeyDeletion` is immediate in
+    odin), which is the most expensive of the four drift outcomes on this page.
+    """
+    from odin.spec.translate import _ENCRYPTION_TARGETS
+    ui = _ts_set("encryptionTargetTypes")
+    assert ui == set(_ENCRYPTION_TARGETS), (
+        f"`iam.ts::encryptionTargetTypes` is {sorted(ui)} but "
+        f"`translate.py::_ENCRYPTION_TARGETS` is {sorted(_ENCRYPTION_TARGETS)} -- an encryption "
+        "edge the canvas offers and nothing folds into a key field, or one folded without ever "
+        "being offered."
+    )
+
+
+def test_every_encryption_target_kind_has_a_key_field_a_builder_reads():
+    """The half the set-comparison above cannot see. Both sides could agree on a
+    kind whose HCL reads no key field at all, and the edge would still do
+    nothing -- the drawn-line-that-does-nothing bug wearing an agreement. So the
+    field each kind maps to is checked against the builder that consumes it."""
+    from odin.agent.hcl import _BUILDERS
+    from odin.spec.translate import _ENCRYPTION_FIELDS
+    hcl_source = (REPO / "src" / "odin" / "agent" / "hcl.py").read_text()
+    for kind, field in _ENCRYPTION_FIELDS.items():
+        assert kind in _BUILDERS, f"{kind} has no Terraform builder, so its key field reaches nothing"
+        assert f'"{field}"' in hcl_source, (
+            f"`translate.py` folds an encryption edge into {field!r} on a {kind} node, but "
+            f"`agent/hcl.py` never reads that field name -- the edge would author a field "
+            f"nothing consumes"
+        )
+
+
 def test_role_holder_kinds_agree_across_the_language_boundary():
     """And for the role edge added in the same change as this file -- the one
     whose absence from the registry was the original inert-edge bug."""

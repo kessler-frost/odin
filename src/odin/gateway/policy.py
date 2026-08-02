@@ -96,6 +96,24 @@ _ARN_RESOURCE_LABEL: dict[str, re.Pattern[str]] = {
     # `parameter/db` -> `db`; the leading slash of a HIERARCHICAL name is part of
     # it, exactly as `classify._ssm_canonical` / `ssmctl.canonical_name` decide
     "ssm": re.compile(r"parameter/(?P<label>.+)"),
+    # `key/app-key` -> `app-key`. A kms key's label IS its KeyId
+    # (`gateway/models/kmsctl.py` deviation 1: real CreateKey carries no name, so
+    # the canvas label rides in on the `odin:node` tag and the store keys by it),
+    # which is also exactly what `classify._kms_resource` reports. odin models no
+    # ALIASES, so `alias/...` is deliberately not a shape here -- the model
+    # answers `InvalidAction` for every alias op, and a reducer that accepted a
+    # form nothing can create would be an entry with no request behind it.
+    #
+    # THIS LINE MUST LAND BEFORE `hcl.py::_ARN_FORMS` gains a "kms" row, not
+    # after. MEASURED with the reducer missing, which is the state this entry
+    # fixes:
+    #   arn_label("arn:aws:kms:...:key/app-key", "kms:Encrypt")  -> None
+    #   classify(TrentService.Encrypt, {"KeyId": "app-key"})     -> ('kms:Encrypt', 'app-key')
+    #   evaluate([Allow kms:Encrypt on the ARN], 'kms:Encrypt', 'app-key') -> False
+    # -- i.e. emitting the ARN first would have made every drawn kms grant deny
+    # silently while the apply stayed green, which is the exact failure
+    # `tests/agent/test_hcl_iam_arns.py`'s docstring was written about.
+    "kms": re.compile(r"key/(?P<label>.+)"),
 }
 # The one service whose label is not simply the captured group: SSM restores the
 # leading slash of a hierarchical name (`/odin/db`) and drops it from a

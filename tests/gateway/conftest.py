@@ -104,6 +104,15 @@ def ssm(sink: CaptureSink):
 
 
 @pytest.fixture
+def kms(sink: CaptureSink):
+    # botocore names the service model `kms`, which is also its SigV4
+    # credential scope (and so `classify()`'s `service`). Its `X-Amz-Target`
+    # prefix is `TrentService`, which is a THIRD name and never reaches
+    # classify's dispatch -- see gateway/models/kmsctl.py's wire-shape note.
+    return _client(sink, "kms")
+
+
+@pytest.fixture
 def elasticache(sink: CaptureSink):
     return _client(sink, "elasticache")
 

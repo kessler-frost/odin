@@ -67,6 +67,7 @@ from odin.gateway.models import (
     elbv2ctl,
     eventsctl,
     iamctl,
+    kmsctl,
     lambdactl,
     logsctl,
     rdsctl,
@@ -410,11 +411,21 @@ async def pure_answer(
     JSON-sidecar substrate: the Secrets Manager control+value plane
     (gateway/models/secretsctl.py) and the SSM Parameter Store
     (gateway/models/ssmctl.py). These two are the only models whose store
-    holds user SECRETS in cleartext (0600, no KMS -- each module's own
-    docstring records the limit), and a value only ever leaves through a
+    holds user SECRETS, and as of v0.8.18 it holds them SEALED rather than in
+    cleartext: `kms:*` (below) is a real model now, both sidecars store
+    AES-256-GCM envelopes, and the sentence that used to sit here -- "in
+    cleartext (0600, no KMS)" -- was true for eleven releases and is the thing
+    this change removed. A value still only ever leaves through a
     GetSecretValue/GetParameter that evaluate() already allowed -- which,
     since both classify to the canvas node's label, means an IAM EDGE is what
     grants it.
+    `kms:*` is all-synth on that same JSON-sidecar substrate, plus ONE file
+    that is not a sidecar: the AES key material at `.odin/{env}/kms.json`
+    (`gateway/kms.py`), deliberately outside `gateway/` so the record tofu
+    diffs and a debug dump carries holds no key bytes. It is the only modeled
+    family whose deletion path DESTROYS user data on purpose -- see
+    kmsctl.py's deviation 2 -- and the only one whose value is measured by a
+    test that reads the sidecar off disk rather than through the API.
     `rds:*` (task W2.7) is all-synth as well, with a REAL Postgres container
     per instance as its substrate (`aws/rds.py::PostgresRds`) -- `rds` is the
     injectable seam for it, threaded from app.py's `create_app(rds=...)` the
@@ -465,6 +476,8 @@ async def pure_answer(
         return await secretsctl.pure_answer(action, resource, env, body, stores, now)
     if action.startswith("ssm:"):
         return await ssmctl.pure_answer(action, resource, env, body, stores, now)
+    if action.startswith("kms:"):
+        return await kmsctl.pure_answer(action, resource, env, body, stores, now)
     if action.startswith("elasticache:"):
         return await cachectl.pure_answer(action, resource, env, body, stores, now)
     if action.startswith("rds:"):

@@ -892,12 +892,16 @@ future decision against these points instead of re-deriving them:
   AccessDenied.
 
   **v1 limits, recorded rather than hidden:**
-  - No KMS at all. A secret's value and an SSM `SecureString` are stored
-    CLEARTEXT in a per-env JSON sidecar
-    (`.odin/{env}/gateway/secretsctl.json`, `.odin/{env}/gateway/ssmctl.json`)
-    written `0600`; `KmsKeyId`/`KeyId` are accepted, stored and echoed back
-    for Terraform fidelity and encrypt NOTHING. The protection is the file
-    mode and the machine boundary — see SECURITY.md's Secrets section.
+  - ~~No KMS at all. A secret's value and an SSM `SecureString` are stored
+    CLEARTEXT ... `KmsKeyId`/`KeyId` are accepted, stored and echoed back
+    for Terraform fidelity and encrypt NOTHING.~~ **RETIRED v0.8.18** — this
+    was true for eleven releases and is the limit the `kms` item below
+    removes. Both sidecars now hold AES-256-GCM envelopes under real key
+    material at `.odin/{env}/kms.json` (0600), `KmsKeyId`/`KeyId` name the key
+    that really sealed the value, and an unkeyed secret goes under the env's
+    default key so encryption is unconditional rather than opt-in. The
+    file mode is still the whole protection for the KEY, and nothing else in
+    odin is encrypted at rest — `docs/limits.md` states both bounds.
   - `DeleteSecret` is IMMEDIATE: `RecoveryWindowInDays` is accepted and
     ignored, there is no recovery window and no `RestoreSecret`. A deliberate
     deviation, and the thing that makes an empty-canvas Apply followed by a
@@ -1108,12 +1112,36 @@ future decision against these points instead of re-deriving them:
     passed; the answer is a 503) and polluted the exact stream a security review
     reads for real denials.
 - **Recorded as UNSUPPORTED for now** (northstar directive 5's honesty rule):
-  EKS, CloudFormation, autoscaling, and KMS (the `kms` catalog node is an
-  unbacked placeholder — no substitute, no gateway model, and as of W2.6 it
-  advertises no IAM actions either, since a `kms:Encrypt` permission could
-  never be enforced or even reached). (ALB/ELBv2 was on this list until W2.5
-  and RDS-via-Terraform until W2.7 — `aws_lb` and `aws_db_instance` are real
-  now; see the ALB and RDS limits above for what's still missing inside them.)
+  EKS, CloudFormation, and autoscaling. (ALB/ELBv2 was on this list until W2.5,
+  RDS-via-Terraform until W2.7, and **KMS until v0.8.18** — `aws_lb`,
+  `aws_db_instance` and `aws_kms_key` are real now; see the ALB, RDS and KMS
+  limits for what is still missing inside them.)
+- [x] **KMS is real, and it is deliberately NOT the obvious build (v0.8.18).**
+  The obvious one was "emit `kms_key_id` on buckets, databases and queues",
+  and it would have been theatre: **no odin substrate encrypts anything** —
+  RustFS's SSE is unverified, a Postgres container has no storage encryption,
+  dynalite has none. A green `kms` node beside them would have claimed a
+  property odin does not have, which is the exact promise `catalog.ts` refused
+  when it denied the tile any `iamActions` ("a permission odin can neither
+  enforce nor reach is a promise the engine cannot keep").
+  So the key encrypts the one thing odin really holds: the secrets and SSM
+  sidecars. `gateway/models/kmsctl.py` is a real model (CreateKey /
+  DescribeKey / ListKeys / ScheduleKeyDeletion / the provider's refresh reads /
+  Encrypt / Decrypt / GenerateDataKey, wire-verified against botocore:
+  `X-Amz-Target: TrentService.*`), `gateway/kms.py` holds the AES-256 material
+  at `.odin/{env}/kms.json` 0600, and a `kms → secret|ssm` edge names WHICH key
+  by folding the label into the `kms_key_id`/`key_id` field the builder already
+  reads. The tile lost its `(placeholder)` marker in the same commit that added
+  `kms` to `translate.py::_KIND`, per the catalog's own invariant.
+  **The bar it had to clear, and did:** the plaintext is provably absent from
+  the sidecar on disk (`tests/gateway/test_kms_at_rest.py` reads the file, and
+  the seal-deleted mutation fails 13 of its 15 tests while all 52 pre-existing
+  API tests stay green), and a destroyed key destroys the data loudly, by name.
+  **What it does NOT claim:** the key file is in the same tree as the
+  ciphertext, so this separates two files and not two permissions; and nothing
+  else in odin — S3, RDS, DynamoDB, SQS, SNS, the tofu workspace, the stack
+  revisions, an export archive — is encrypted at rest. `docs/limits.md` states
+  every bound.
 - [x] **Nebula network layer (single-host), fully activated.** Security
   groups and VPCs drawn on the canvas compile to real Nebula network +
   firewall primitives (`fabric/nebula.py::sg_rules_to_firewall`,

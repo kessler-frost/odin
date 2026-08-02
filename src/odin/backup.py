@@ -12,6 +12,16 @@ What an archive holds (`.odin/<env>/`, every file, recursively):
 - `stacks/` + `HEAD`  — the immutable desired-state lineage
 - `world.json`        — the last observed World (phases + facts)
 - `keys.json`         — the env's issued gateway credentials
+- `kms.json`          — the env's AES key material (v0.8.18). It rides along by
+                        construction (`_exportable_files` walks the whole tree)
+                        and it MUST: without it the exported `gateway/
+                        secretsctl.json` and `ssmctl.json` are unrecoverable
+                        ciphertext. Say the consequence out loud rather than
+                        letting "the sidecars are encrypted now" imply an
+                        archive is safer than it was — the key travels WITH the
+                        ciphertext, so an archive is exactly as sensitive as
+                        before. `odin export`'s "treat it like a private key
+                        file" is now literal.
 - `gateway/`          — the gateway's JSON stores + lambda deployment zips
 - `tf/`               — `main.tf`, `override.tf`, `terraform.tfstate`
 - `goaws.yaml`, `events.jsonl`, `nebula/` — whatever else the env wrote
@@ -169,11 +179,13 @@ def _private_archive(dest: Path) -> Iterator[tarfile.TarFile]:
     """The archive, created 0600 before a single byte of it exists.
 
     `odin export` tells the user to "treat it like a private key file" and it
-    genuinely is one -- it carries `keys.json`'s operator credentials and every
-    canvas secret in cleartext -- but under the default umask `tarfile.open`
-    made it 0644 (v0.7.0's leak). The `fchmod` covers the case where `dest`
-    already existed with a looser mode, since O_CREAT's mode applies only to a
-    file it actually creates.
+    genuinely is one -- it carries `keys.json`'s operator credentials, every
+    canvas secret in cleartext (the stack revisions and the tofu workspace,
+    which v0.8.18's sidecar encryption does NOT touch), and `kms.json`'s key
+    material beside the ciphertext it opens -- but under the default umask
+    `tarfile.open` made it 0644 (v0.7.0's leak). The `fchmod` covers the case
+    where `dest` already existed with a looser mode, since O_CREAT's mode
+    applies only to a file it actually creates.
     """
     fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, SECRET_FILE_MODE)
     os.fchmod(fd, SECRET_FILE_MODE)

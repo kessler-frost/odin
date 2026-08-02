@@ -28,6 +28,7 @@ from odin.agent.hcl import generate_tf
 from odin.spec.models import Edge, Stack
 from odin.spec.translate import (
     EDGE_KINDS,
+    ENCRYPTION,
     LEGACY_UNMODELLED,
     ROLE_ASSUMPTION,
     SNS_SUBSCRIPTION,
@@ -253,18 +254,140 @@ def test_an_edge_with_no_type_at_all_is_unmodelled():
     assert canvas_to_stack(canvas).edges[0].kind == UNMODELLED
 
 
+# --- 4. the encryption edge (W2.9) --------------------------------------------
+
+
+def _kms_canvas(edges: list[dict], **typed) -> dict:
+    """A key, a lower-named key, a secret and a parameter -- plus an s3 bucket,
+    which is the kind the edge must REFUSE to author onto (nothing encrypts a
+    RustFS object; see `_ENCRYPTION_FIELDS`)."""
+    return {
+        "nodes": [
+            {"id": "k-1", "type": "kms", "position": {"x": 0, "y": 0},
+             "data": {"label": "app-key"}},
+            {"id": "k-2", "type": "kms", "position": {"x": 20, "y": 0},
+             "data": {"label": "aaa-key"}},
+            {"id": "sec-1", "type": "secret", "position": {"x": 40, "y": 0},
+             "data": {"label": "db-password", "secretString": "hunter2",
+                      **({"kmsKeyId": typed["kmsKeyId"]} if "kmsKeyId" in typed else {})}},
+            {"id": "ssm-1", "type": "ssm", "position": {"x": 60, "y": 0},
+             "data": {"label": "/odin/db", "paramValue": "x",
+                      **({"keyId": typed["keyId"]} if "keyId" in typed else {})}},
+            {"id": "s3-1", "type": "s3", "position": {"x": 80, "y": 0},
+             "data": {"label": "uploads"}},
+        ],
+        "edges": edges,
+    }
+
+
+def _field_of(stack: Stack, resource_id: str, field: str) -> str:
+    resource = next(r for r in stack.resources if r.id == resource_id)
+    value = resource.fields.get(field)
+    return str(value.value).strip() if value else ""
+
+
+def test_an_encryption_edge_reaches_the_generated_terraform():
+    """The product's own path, for the same reason the role tests take it: the
+    bug class is a value that looks right in the Stack and is read by nobody.
+    The INTERPOLATED reference is the half that matters -- it is what orders the
+    key ahead of the secret, and `kmsctl.seal` refuses a key that does not exist
+    yet, so without the ordering the apply fails outright rather than retrying."""
+    stack = canvas_to_stack(_kms_canvas([
+        _edge("k-1", "sec-1", ENCRYPTION), _edge("k-1", "ssm-1", ENCRYPTION),
+    ]))
+    main_tf = generate_tf(stack).files["main.tf"]
+    assert 'resource "aws_kms_key" "app_key"' in main_tf
+    # `_block` pads its keys into a column, so match on the value side only.
+    assert main_tf.count("= aws_kms_key.app_key.key_id") == 2
+
+
+def test_the_key_carries_the_odin_node_tag_which_is_its_only_name():
+    """Real `CreateKey` takes no name argument, so `gateway/models/kmsctl.py`
+    keys a key by this tag and mints a uuid without it. Every reference to the
+    key -- the secret's `kms_key_id`, an IAM grant's Resource, the World
+    projection -- resolves through the label, so an untagged key is addressable
+    from nothing. `_tags_block` stamps it on every primary, but this kind is the
+    one where losing it is silent AND total."""
+    main_tf = generate_tf(canvas_to_stack(_kms_canvas([]))).files["main.tf"]
+    key_block = main_tf.split('resource "aws_kms_key" "app_key"')[1].split("\nresource ")[0]
+    assert '"odin:node" = "app-key"' in key_block
+    # ...and no `name`, because the AWS resource has no such argument at all.
+    assert "name" not in key_block
+
+
+def test_an_encryption_edge_is_direction_insensitive():
+    forward = canvas_to_stack(_kms_canvas([_edge("k-1", "sec-1", ENCRYPTION)]))
+    backward = canvas_to_stack(_kms_canvas([_edge("sec-1", "k-1", ENCRYPTION)]))
+    assert _field_of(forward, "db-password", "kmsKeyId") == "app-key"
+    assert _field_of(backward, "db-password", "kmsKeyId") == "app-key"
+
+
+def test_a_hand_typed_key_wins_over_a_drawn_one():
+    stack = canvas_to_stack(
+        _kms_canvas([_edge("k-1", "sec-1", ENCRYPTION)], kmsKeyId="aaa-key"),
+    )
+    assert _field_of(stack, "db-password", "kmsKeyId") == "aaa-key"
+
+
+def test_two_conflicting_encryption_edges_resolve_deterministically():
+    both = [_edge("k-1", "sec-1", ENCRYPTION), _edge("k-2", "sec-1", ENCRYPTION)]
+    assert _field_of(canvas_to_stack(_kms_canvas(both)), "db-password", "kmsKeyId") == "aaa-key"
+    assert _field_of(canvas_to_stack(_kms_canvas(both[::-1])), "db-password", "kmsKeyId") == "aaa-key"
+
+
+def test_an_encryption_edge_to_s3_authors_nothing():
+    """odin holds no key for a RustFS object, a Postgres volume or a dynalite
+    item, so there is no field to author and the pair stays `unmodelled` on the
+    canvas too (`ui/src/lib/iam.ts::encryptionTargetTypes`)."""
+    stack = canvas_to_stack(_kms_canvas([_edge("k-1", "s3-1", ENCRYPTION)]))
+    assert _field_of(stack, "uploads", "kmsKeyId") == ""
+    assert _field_of(stack, "uploads", "keyId") == ""
+
+
+def test_only_an_encryption_KIND_edge_authors_the_field():
+    for kind in ("iam", UNMODELLED, LEGACY_UNMODELLED, "sg", ROLE_ASSUMPTION):
+        stack = canvas_to_stack(_kms_canvas([_edge("k-1", "sec-1", kind)]))
+        assert _field_of(stack, "db-password", "kmsKeyId") == "", kind
+
+
+def test_a_key_field_naming_a_node_that_is_not_a_key_is_DECLINED_not_ignored():
+    """The one place this edge type must not fail soft. A silently dropped
+    `kms_key_id` would seal the secret under the env's DEFAULT key while the
+    canvas named another -- odin using one key and showing a different one. The
+    resource is declined with the reason instead, which `/apply` reports."""
+    canvas = _kms_canvas([], kmsKeyId="uploads")  # an s3 bucket, not a key
+    project = generate_tf(canvas_to_stack(canvas))
+    (declined,) = [u for u in project.unsupported if u.startswith("db-password")]
+    assert "'uploads'" in declined and "kms node" in declined
+    assert "aws_secretsmanager_secret" not in project.files["main.tf"]
+
+
+def test_the_encryption_edge_survives_into_the_stack():
+    stack = canvas_to_stack(_kms_canvas([_edge("k-1", "sec-1", ENCRYPTION)]))
+    assert [(e.src, e.dst, e.kind) for e in stack.edges] == [("app-key", "db-password", ENCRYPTION)]
+
+
+def test_a_kms_node_is_a_real_stack_resource_now():
+    """It was skipped by Apply entirely until W2.9 -- `_KIND` had no entry, so
+    `skipped_node_types` reported it and nothing was ever built."""
+    from odin.spec.translate import skipped_node_types
+    canvas = _kms_canvas([])
+    assert "kms" not in skipped_node_types(canvas)
+    assert "app-key" in {r.id: r.kind for r in canvas_to_stack(canvas).resources}
+
+
 def test_the_kind_vocabulary_names_every_kind_the_canvas_can_author():
     """`EDGE_KINDS` is the ONE place Python knows which kinds exist, and it is
     what `agent/chat.py` validates against. Both catch-alls are in it: dropping
     the legacy one would make `odin chat` refuse an edge type that is sitting in
     every saved canvas on disk."""
-    assert {"iam", "sg", "role", "target", "subscription", "connection"} <= EDGE_KINDS
+    assert {"iam", "sg", "role", "target", "subscription", "connection", ENCRYPTION} <= EDGE_KINDS
     assert UNMODELLED in EDGE_KINDS and LEGACY_UNMODELLED in EDGE_KINDS
     assert "ref" in EDGE_KINDS  # Edge.kind's own default
     # `<=` is a SUBSET check, so a kind added to `EDGE_KINDS` and forgotten here
     # passes vacuously -- exactly what happened to `connection` on the day it
     # landed. Pinning the whole set is what makes the test's own name true.
     assert EDGE_KINDS == {
-        "iam", "sg", "role", "target", "subscription", "connection",
+        "iam", "sg", "role", "target", "subscription", "connection", ENCRYPTION,
         UNMODELLED, LEGACY_UNMODELLED, "ref",
     }
