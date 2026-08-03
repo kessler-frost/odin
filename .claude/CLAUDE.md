@@ -42,7 +42,16 @@ assertions verify.
 - `aws/` — `backings.py` (`BackingAws`: the real RustFS/goaws/dynalite backings — provision/exists/deprovision/gc/aws_env/facts, a host-side boto3 `client` for tests), `rds.py` (`PostgresRds`: rds nodes as direct Postgres containers).
 - `fabric/` — resolve `${{node.VAR}}` from World facts. `localhost.py` (loopback, the default); `nebula.py` + `models.py` = the **self-hosted Nebula mesh fabric** for multi-Mac: `NebulaFabric` is a drop-in for `resolve` (the overlay IP rides in via facts), plus recovered nebula-cert/lighthouse primitives (one network per env, sticky overlay IPs) + `mesh_state`/`GET /mesh?env=` for a mesh UI. Nebula NOT Tailscale (you own the lighthouse, build a control plane on top). The old per-EC2 Nebula *Simulate* overlay was deleted; this host-level mesh is the new thing — don't confuse them.
 - `compute/` — `lima_yaml.py`/`cloud_init.py`/`models.py`: the EC2-as-real-Lima-VM substrate for the next service-coverage phase (not wired into the reconciler yet).
-- `agent/` — parked (just `__init__.py`); the canvas↔Terraform translation agent lands here next. `api/canvas.py`, `api/ws.py`, `server.py`.
+- `iac/` — **DETERMINISTIC, and the directory name now says so.** `hcl.py`
+  (Stack → Terraform) and `import_tf.py` (Terraform → Stack) moved here from
+  `agent/` in v0.8.21: neither imports `claude_agent_sdk`, and a reader seeing
+  `agent/hcl.py` concluded a model generates their infrastructure. It does not,
+  and that is the layer's most important property (NORTHSTAR's 2026-07-30
+  deterministic-first amendment). `tests/test_iac_is_deterministic.py` pins it:
+  no SDK import, and `iac` never imports from `agent`.
+- `agent/` — what actually calls a model: `ai.py` (the master switch), `chat.py`,
+  `debugger.py`, `translate.py` (the refine pass). Those three are the ONLY
+  modules in odin that can reach `claude_agent_sdk`. `api/canvas.py`, `api/ws.py`, `server.py`.
 
 **Node kinds today:** rds (a direct Postgres container) + s3/sqs/sns/dynamodb
 (AWS-shaped resources in shared per-env backing containers). service/dep/
