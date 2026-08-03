@@ -870,3 +870,34 @@ They are listed because finding one by surprise is worse than reading it here.
   node then reports `crashed` with the reason), but that check is cached for 30
   seconds on success, so it means "reachable recently", not "reachable now".
 
+
+<!-- apigateway (v0.8.19) -->
+- **The closed world is method-independent NOW, and was not before v0.8.19.**
+  odin's stated posture is that a request the gateway cannot map to an
+  `(action, resource)` pair is denied, never guessed at
+  (`gateway/classify.py`'s docstring says so twice). That property lived inside
+  `catch_all`, and the route table in front of it listed five verbs — so a
+  **PATCH or an OPTIONS never reached odin's code at all**. Starlette answered
+  `405 Method Not Allowed`: no SigV4 verification, no policy evaluation, no
+  `access_denied` event. Measured on the real app:
+
+      PATCH http://127.0.0.1:62976/v2/apis/api123
+      status: 405
+      body  : Method Not Allowed
+
+  It was latent rather than exploitable — no modeled service used PATCH — but
+  nothing in the docs said the guarantee stopped at five verbs, and apigateway
+  makes it live (`UpdateApi` is `PATCH /v2/apis/{apiId}`). Both verbs are routed
+  now, and the property is pinned by
+  `tests/gateway/test_closed_world_is_method_independent.py`, which asserts a
+  denial for each of GET/PUT/POST/DELETE/PATCH/OPTIONS **and** fails if a verb is
+  added to the router that it does not check. Mutation-tested both ways: deleting
+  PATCH from the table fails it with `PATCH was refused by the ROUTER (405 Method
+  Not Allowed), so odin's closed world never ran`, and deleting OPTIONS fails it
+  the same way.
+
+  **The remaining edge, stated rather than discovered later:** verbs outside that
+  list (`TRACE`, `CONNECT`, `PROPFIND`, any extension method) are still answered
+  405 by the router. No AWS API uses one, so nothing odin models can reach it —
+  but if a future service does, the answer will be a 405 and not a denial, and
+  the test above is where to add it.
