@@ -71,10 +71,20 @@ from odin.aws.cache import container_name as cache_container_name
 from odin.aws.rds import POSTGRES_PORT
 from odin.aws.rds import container_name as db_container_name
 from odin.compute.functions import container_name as function_container_name
+from odin.compute.instances import HostsVerdict
 from odin.compute.proxy import container_name as proxy_container_name
 from odin.compute.tasks import TaskRuntime
 from odin.fabric.nebula import NebulaManager
-from odin.gateway.models import cachectl, ecsctl, elbv2ctl, kmsctl, logsctl, rdsctl, ssmctl
+from odin.gateway.models import (
+    cachectl,
+    ecsctl,
+    elbv2ctl,
+    kmsctl,
+    logsctl,
+    rdsctl,
+    route53ctl,
+    ssmctl,
+)
 from odin.gateway.models.ecsctl import sweep_tasks, task_verdict
 from odin.gateway.stores import SynthStores
 from odin.reconcile import mesh_health
@@ -356,66 +366,103 @@ def _kms_keys(stores: SynthStores, env: str) -> Projected:
 _ROUTE53_AUTO_TYPES = frozenset({"SOA", "NS"})
 
 
-def _route53_zones(stores: SynthStores, env: str, overlay: dict[str, str]) -> Projected:
+def _route53_zones(stores: SynthStores, env: str) -> Projected:
     """A `route53` node exists once tofu's CreateHostedZone landed.
 
-    THE LABEL NEEDS NO TAG, and this is the one projector where that is true by
-    construction rather than by luck: a hosted zone's id IS its domain name
-    (`route53ctl`'s deviation 1 -- `classify.py` cannot recover a canvas label
-    from the wire, because only the create body carries the name and every call
-    after it carries an opaque id in the path, so the id is DERIVED from the
-    name instead of minted). `agent/hcl.py::_route53` emits `name = <label>` and
-    refuses a label that is not a valid DNS name, so `record["zone_id"]` and the
-    canvas label are the same string. No `stores.tags` lookup, and no untagged-
-    resource hole of the kind `_kms_keys` has to skip around.
+    THE LABEL COMES FROM THE `odin:node` TAG, like every other primary, and the
+    first version of this function got that wrong in a way worth recording.
 
-    THE PHASE IS NOT ALWAYS `healthy`, AND THAT IS THE WHOLE POINT OF THIS
-    FUNCTION. odin resolves a name with a hosts entry, and which address works
-    depends on who is asking: a container reaches an instance's `private_ip`,
-    but a VM CANNOT reach another VM's -- stock Lima `vz` NATs each VM into its
-    own isolated address space and a raw ping between two VMs' vzNAT addresses
-    is 100% loss, before nebula is involved (`fabric/nebula.py`'s R5 note). VMs
-    are served the Nebula OVERLAY address instead, so in an env with more than
-    one VM and no mesh there is NO address that would work and odin writes no
-    hosts line at all.
+    A hosted zone's id IS its domain name (`route53ctl`'s deviation 1 -- the id
+    is DERIVED from the name rather than minted, which is what lets `classify.py`
+    recover the IAM resource from the path with no store access), and
+    `agent/hcl.py::_route53` emits `name = <label>`. So `record["zone_id"]`
+    EQUALS the canvas label for every zone odin's canvas authored, and reading it
+    directly looked like a free simplification -- this docstring used to claim it
+    needed no tag "by construction rather than by luck".
 
-    Withholding was the first design and it was wrong. It was modelled on
-    `_ec2_facts` dropping `MESH_IP` when the lighthouse is down -- the right
-    INPUT, and the wrong whole story. CLAUDE.md honesty rule 1 lists "the mesh
-    gate withheld facts that never reached World" among four guards that
-    silently never fired; a user drawing a record, watching the tile go green
-    and getting no resolution and no reason is that bug rebuilt deliberately. So
-    the zone reports `crashed` with the real reason -- the same phase and the
-    same channel `_ALB_PHASE` uses for a load balancer that exists and does not
-    serve, naming what is still standing: the zone is real, its records are
-    real, and this env cannot deliver them to a VM.
+    That is true for the zones odin drew and false for every other one. A zone in
+    a hand-written project, or any zone created without the tag, would then be
+    projected as a World resource that no canvas node matches, no Stack revision
+    can prune, and `plan()` would call "observed but no longer desired" on every
+    tick -- the phantom `_kms_keys` refuses to create by declining to fall back
+    to `key_id`, and `_log_groups` avoids by skipping an `auto` group. Caught by
+    the gateway author reviewing this projector, not by me writing it.
+
+    So: untagged zone, not projected -- exactly as an untagged vpc/subnet/ec2/kms
+    is not.
+
+    THE PHASE IS NOT ALWAYS `healthy`, and what decides it is OBSERVED, never
+    inferred. odin resolves a name with a hosts entry, and which address works
+    depends on who is asking: a container reaches an instance's `private_ip`, a
+    VM cannot reach another VM's at all (stock Lima `vz` NATs each VM into its
+    own address space -- 100% loss, before nebula is involved), so a VM is
+    served the Nebula overlay address or nothing.
+
+    THIS PROJECTOR USED TO WORK THAT OUT FOR ITSELF, and deleting that is the
+    point of the current shape. It counted `stores.ec2compute` records, read the
+    overlay assignments, and PREDICTED what a hosts push would do. Meanwhile
+    `compute/instances.py::HostsVerdict` recorded what a push actually DID. Two
+    sources for one fact is how they drift, and then whichever happens to win
+    decides what the user is told -- exactly the defect the ECS work hit when
+    `container_gone_reason` was extracted to unify two writers while their
+    ARGUMENTS stayed divergent, so the race went on deciding the answer anyway.
+    Extracting a shared helper would have repeated that. The inference is GONE:
+    this reads `hosts_action`/`hosts_names` off the instance records the
+    resolver writes, and if nothing wrote them there is nothing to report.
+
+    That last clause is deliberate and is the honest failure mode. A zone whose
+    instances carry no verdict reads `healthy` -- because "no VM reported a
+    problem" is what the substrate is saying. It is NOT a claim that resolution
+    was proven; that proof is `tests/test_compute/test_hosts_resolution_e2e.py`,
+    which asks `getent hosts` inside a real container and a real VM.
     """
     out: Projected = {}
-    vms = [record for record in stores.ec2compute.items(env).values() if "instance_id" in record]
-    # Only a SECOND VM makes VM-to-VM resolution something a user can want; a
-    # lone VM resolving a name that points at itself is served by the container
-    # path and by its own interface. Checked against the real overlay
-    # assignments (`_overlay_assignments`) rather than against "is nebula
-    # configured", because an assignment is the thing that actually exists.
-    unreachable = len(vms) > 1 and not any(overlay.get(vm["instance_id"]) for vm in vms)
+    unresolvable = sorted({
+        name
+        for record in stores.ec2compute.items(env).values()
+        if record.get("hosts_action") and not HostsVerdict(
+            vm=record.get("instance_id", ""),
+            action=record["hosts_action"],
+            names=tuple(record.get("hosts_names") or ()),
+        ).healthy
+        for name in (record.get("hosts_names") or ())
+    })
     for key, record in stores.route53ctl.items(env).items():
         if not key.startswith("zone:"):
             continue
-        label = record.get("zone_id")
-        drawn = [
-            rrset for rrset in stores.route53ctl.get(env, f"rrset:{label}", [])
-            if rrset.get("type") not in _ROUTE53_AUTO_TYPES
-        ]
-        verdict = (
-            f"{len(drawn)} record(s) cannot be served to a VM in this env: {len(vms)} EC2 "
-            "instances and no Nebula overlay address for any of them. A VM cannot reach "
-            "another VM's private address on stock Lima vz (100% loss), so odin writes no "
-            "/etc/hosts line rather than one that resolves and hangs. Container consumers "
-            "are unaffected"
-        ) if (unreachable and drawn) else None
-        if label:
-            out[label] = ("route53", "crashed" if verdict else "healthy", {}, verdict)
+        zone_id = record.get("zone_id")
+        label = stores.tags.get(env, f"{route53ctl.SERVICE}:{zone_id}", {}).get(route53ctl.NODE_TAG)
+        if not label:
+            continue
+        # Only the names belonging to THIS zone: two zones in one env fail
+        # independently, and telling a user their `internal.test` zone is broken
+        # because `example.com` could not be pushed is a different lie. Keyed on
+        # the ZONE ID, which is what a record's name is actually suffixed with --
+        # the label is what the canvas calls the node, and the two are equal for
+        # a canvas-authored zone but must not be assumed equal here.
+        mine = [name for name in unresolvable if name.endswith(f".{zone_id}")]
+        verdict = _hosts_verdict_for(stores, env, mine) if mine else None
+        out[label] = ("route53", "crashed" if verdict else "healthy", {}, verdict)
     return out
+
+
+def _hosts_verdict_for(stores: SynthStores, env: str, names: list[str]) -> str:
+    """The REAL reason, taken from the resolver's own `HostsVerdict.reason`
+    rather than re-worded here -- `compute/instances.py` owns that text, it is
+    keyed off an outcome map with no optimistic default, and an unmapped action
+    reports itself as the bug. Re-deriving the sentence in this file is the
+    second-writer problem in prose."""
+    reasons = sorted({
+        HostsVerdict(
+            vm=record.get("instance_id", ""),
+            action=record["hosts_action"],
+            names=tuple(record.get("hosts_names") or ()),
+        ).reason
+        for record in stores.ec2compute.items(env).values()
+        if record.get("hosts_action")
+        and any(name in names for name in (record.get("hosts_names") or ()))
+    })
+    return " | ".join(reason for reason in reasons if reason)
 
 
 # The two rds facts that name the OVERLAY (SG-gated) address rather than the
@@ -890,18 +937,11 @@ async def project(
     out.update(_lambda_functions(stores, env))
     out.update(await _ecs_services(stores, env, ecs_runtime))
     out.update(_cache_clusters(stores, env))
-    # A SECOND `_overlay_assignments` read in the same projection, not a shared
-    # snapshot -- `_ec2_instances` computes its own and does not hand it back.
-    # Stated rather than glossed, because the two CAN disagree if `overlay.json`
-    # is rewritten between them, and a zone reporting "no mesh" beside an
-    # instance reporting a `MESH_IP` would be a contradiction on one screen.
-    # Accepted for now: the read is a side-effect-free load of one small file
-    # (`NebulaManager.load_overlay`'s own contract -- no mkdir, no allocation),
-    # the window is microseconds, and the write that could land inside it is an
-    # instance boot, which moves this zone from unservable to servable rather
-    # than the reverse. If that stops being true, hoist the read into `project`
-    # and pass it to both rather than adding a third.
-    out.update(_route53_zones(stores, env, _overlay_assignments(stores, env)))
+    # Takes no overlay snapshot at all any more. It used to read
+    # `_overlay_assignments` a second time to PREDICT whether a hosts push could
+    # work; it now reads what the push RECORDED, so the mesh question is asked
+    # once, by the component that acts on the answer.
+    out.update(_route53_zones(stores, env))
     # The live container check, applied over whatever the records claimed. Facts
     # go with it: a database that isn't running must stop advertising a
     # DATABASE_URL nothing can connect to -- the stale-green fact `_db_facts`

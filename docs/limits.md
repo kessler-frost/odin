@@ -277,6 +277,23 @@ They are listed because finding one by surprise is worse than reading it here.
   The emitted TTL (60s) exists so the generated project stays portable to Amazon;
   odin's own substrate is a hosts FILE and has no TTL at all, so a changed
   record lands on the next container launch or hosts push.
+- **odin serves NO DNS.** There is no resolver, no port 53, and nothing answers
+  a DNS query. A hosted zone and its records are stored, round-trip for `tofu`,
+  and are real IAM targets — but the only thing that ever *resolves* a name is a
+  hosts entry odin writes (`--add-host` on a container, `/etc/hosts` on a VM).
+  So `dig`, `nslookup` and anything that talks the DNS protocol will not find an
+  odin record; `getent hosts` and any ordinary client library will. Stated
+  because "Route 53 works" and "names resolve" are the same sentence to most
+  readers and only the second one is true here.
+- **A hosted zone's tags are replayed, but tag REMOVAL on a re-apply is
+  untested.** `ChangeTagsForResource` is really sent on create (measured
+  through a real `tofu apply`, and `ListTagsForResource` must replay it or the
+  provider plans a perpetual diff — the plan is `-detailed-exitcode` 0, so the
+  create path is confirmed). `RemoveTagKeys` is implemented and unit-tested, but
+  no real provider was ever observed sending one: if it instead sends a full
+  replacement, a removed tag would linger. Named here rather than discovered,
+  because the only tag odin itself writes is `odin:node`, which is what
+  `reconcile/tf_status.py` recovers the canvas label from.
 - **A `dns` record resolves to a DIFFERENT address depending on who is asking,
   and for a VM with no mesh it does not resolve at all.** This is the sharper
   half of the entry above and it was got wrong first time, so it is stated in

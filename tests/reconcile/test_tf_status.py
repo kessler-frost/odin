@@ -11,9 +11,21 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+
 from odin.aws.cache import container_name as cache_container_name
 from odin.aws.rds import container_name as db_container_name
 from odin.compute.functions import container_name as function_container_name
+# The four outcome CONSTANTS only. `HostsVerdict` itself is deliberately NOT
+# imported: the verdict sentences below are spelled out as literals, because an
+# expectation computed from the class under test cannot fail with it (honesty
+# rule 5). If this import ever comes back, check what it is being used for.
+from odin.compute.instances import (
+    HOSTS_FAILED,
+    HOSTS_NO_MESH,
+    HOSTS_PUSHED,
+    HOSTS_UNCHANGED,
+)
 from odin.compute.proxy import container_name as proxy_container_name
 from odin.fabric.models import MeshNetwork, SubnetAllocation
 from odin.gateway.models import cachectl, elbv2ctl, kmsctl, lambdactl, rdsctl, secretsctl, ssmctl
@@ -1521,106 +1533,176 @@ async def test_only_the_volume_key_family_is_projected_as_ebs(tmp_path):
 # --- route53: the projector whose whole job is NOT saying healthy ------------
 
 
-def _zone(stores, label: str, records: list[dict] | None = None) -> None:
+def _zone(stores, label: str, records: list[dict] | None = None, tagged: bool = True) -> None:
     """A hosted zone as `route53ctl` really writes it: the zone id IS the domain
-    (its deviation 1), and CreateHostedZone always mints an SOA and an NS pair
-    that nobody drew."""
+    (its deviation 1), CreateHostedZone always mints an SOA and an NS pair that
+    nobody drew, and the canvas label rides on an `odin:node` tag in the SHARED
+    tag store under `route53:{zone_id}` -- not on the zone record."""
     stores.route53ctl.set(ENV, f"zone:{label}", {"zone_id": label, "name": label})
     stores.route53ctl.set(ENV, f"rrset:{label}", [
         {"name": label, "type": "SOA", "values": ["ns. root. 1 7200 900 1209600 86400"]},
         {"name": label, "type": "NS", "values": ["ns."]},
         *(records or []),
     ])
+    if tagged:
+        stores.tags.set(ENV, f"route53:{label}", {"odin:node": label})
 
 
 def _a_record(fqdn: str, address: str) -> dict:
     return {"name": fqdn, "type": "A", "ttl": 60, "values": [address]}
 
 
-def _running_vm(stores, n: int) -> None:
+def _running_vm(stores, n: int, hosts_action: str | None = None,
+                hosts_names: tuple[str, ...] = ()) -> None:
+    """A VM record, optionally carrying the verdict the hosts resolver RECORDED.
+
+    `hosts_action`/`hosts_names` are the observed signal -- what a real
+    `push_hosts` reported -- not a prediction this test makes on its behalf."""
     stores.ec2compute.set(ENV, f"instance:i-{n}", {
         **_ec2_instance(f"i-{n}", "running"), "private_ip": f"192.168.64.{n}",
+        **({"hosts_action": hosts_action, "hosts_names": list(hosts_names)}
+           if hosts_action else {}),
     })
     stores.tags.set(ENV, f"ec2:i-{n}", {"odin:node": f"vm{n}"})
 
 
-def _overlay(tmp_path, assignments: dict[str, str]) -> None:
-    nebula = tmp_path / ENV / "nebula"
-    nebula.mkdir(parents=True, exist_ok=True)
-    (nebula / "overlay.json").write_text(MeshNetwork(
-        network=ENV, subnets={"hosts": SubnetAllocation(
-            network=ENV, subnet="hosts", cidr="10.42.1.0/24",
-            next_ip=len(assignments) + 1, assignments=assignments,
-        )},
-    ).model_dump_json())
-
-
-async def test_a_zone_is_projected_under_its_domain_with_no_tag_lookup(tmp_path):
-    """The one projector that needs no `odin:node` tag, by construction rather
-    than by luck: a hosted zone's id IS its domain name, and `hcl.py::_route53`
-    emits `name = <label>`, so the two are the same string. Deliberately writes
-    NO tag at all -- if this ever starts needing one, that is a real change in
-    how the label travels and it should fail here."""
+async def test_a_zone_is_projected_under_its_canvas_label(tmp_path):
     stores = SynthStores(tmp_path)
     _zone(stores, "example.com")
     assert (await project(stores, ENV))["example.com"] == ("route53", "healthy", {}, None)
 
 
-async def test_a_zone_serving_a_lone_vm_is_healthy(tmp_path):
-    """One VM cannot need VM-to-VM resolution. The container path serves it and
-    the VM reaches its own address, so there is nothing unservable to report."""
+async def test_an_UNTAGGED_zone_is_not_projected_at_all(tmp_path):
+    """The phantom guard, and this projector shipped without it until the gateway
+    author reviewed it.
+
+    A zone id EQUALS the canvas label for every zone odin drew, so reading it
+    straight off the record looked free -- and would have projected a
+    hand-written project's zone as a World resource no canvas node matches, no
+    Stack revision can prune, and `plan()` calls "observed but no longer desired"
+    on every tick. `_kms_keys` refuses the identical shortcut for `key_id`;
+    `_log_groups` skips an `auto` group for the same reason.
+
+    Mutation-test: fall back to `record["zone_id"]` when the tag is missing and
+    this fails."""
     stores = SynthStores(tmp_path)
-    _running_vm(stores, 1)
-    _zone(stores, "example.com", [_a_record("api.example.com", "192.168.64.1")])
+    _zone(stores, "example.com", tagged=False)
+    assert "example.com" not in await project(stores, ENV)
+
+
+async def test_a_zone_whose_vms_all_pushed_cleanly_is_healthy(tmp_path):
+    """`pushed`/`unchanged` are the resolver's healthy outcomes, so a zone over
+    them reports nothing. Without this the failing test below would also pass
+    against a projector that ALWAYS says crashed."""
+    stores = SynthStores(tmp_path)
+    _running_vm(stores, 1, HOSTS_PUSHED, ("vm2.example.com",))
+    _running_vm(stores, 2, HOSTS_UNCHANGED, ("vm1.example.com",))
+    _zone(stores, "example.com", [_a_record("vm1.example.com", "192.168.64.1")])
 
     assert (await project(stores, ENV))["example.com"][1] == "healthy"
 
 
-async def test_two_vms_and_no_mesh_makes_the_zone_report_the_real_reason(tmp_path):
-    """THE POINT OF THIS PROJECTOR. A VM cannot reach another VM's private
-    address on stock Lima vz -- 100% loss, before nebula is involved -- so odin
-    writes no /etc/hosts line at all. Withholding silently is the bug CLAUDE.md
-    rule 1 names ("the mesh gate withheld facts that never reached World"), so
-    the zone must NOT read healthy and must carry the reason.
+async def test_a_zone_reports_the_reason_the_RESOLVER_gave(tmp_path):
+    """THE POINT OF THIS PROJECTOR, and the reason it no longer computes
+    anything. The verdict text belongs to `compute/instances.py::HostsVerdict`,
+    which keys it off an outcome map with no optimistic default. This asserts
+    the projection carries THAT sentence rather than one written here -- a
+    second author for one fact is how the two drift, which is the defect the ECS
+    work hit when `container_gone_reason` unified two writers and left their
+    arguments divergent.
 
-    Mutation-test: make `unreachable` always False and this fails."""
+    Mutation-test: make the projector skip non-healthy verdicts and this fails.
+    """
     stores = SynthStores(tmp_path)
-    _running_vm(stores, 1)
-    _running_vm(stores, 2)
-    _zone(stores, "example.com", [_a_record("vm1.example.com", "192.168.64.1")])
+    _running_vm(stores, 1, HOSTS_NO_MESH, ("vm2.example.com",))
+    _running_vm(stores, 2, HOSTS_PUSHED)
+    _zone(stores, "example.com", [_a_record("vm2.example.com", "192.168.64.2")])
 
     kind, phase, _, verdict = (await project(stores, ENV))["example.com"]
     assert (kind, phase) == ("route53", "crashed")
-    assert verdict is not None
-    # Names what is still standing: how many records, how many VMs, the real
-    # cause, and who is NOT affected.
-    assert "1 record(s)" in verdict and "2 EC2 instances" in verdict
-    assert "no Nebula overlay address" in verdict
-    assert "Container consumers are unaffected" in verdict
+    # SPELLED OUT IN FULL, deliberately. This assertion first read
+    # `== HostsVerdict(...).reason` -- the very call the source makes -- which is
+    # honesty rule 5's opening example verbatim (`tests/gateway/test_ecsctl.py`
+    # graded `container_gone_reason` against itself and stayed green for months
+    # while odin printed a name `docker inspect` cannot find). A verdict that
+    # silently lost its instruction, or gained a wrong one, changed BOTH sides
+    # together and the test could not fail. The literal is the only expectation
+    # the subject cannot reach.
+    assert verdict == (
+        "vm2.example.com cannot be resolved on this instance: the record points at another "
+        "EC2 instance, a VM can only reach another VM over the Nebula overlay (a VM-to-VM "
+        "vzNAT address is 100% loss), and this environment has no mesh. Draw the instances "
+        "into a VPC so the env gets one, or reach the target from a container instead"
+    )
 
 
-async def test_two_vms_WITH_a_mesh_is_healthy_again(tmp_path):
-    """The other side of the same guard: once the overlay really has addresses,
-    the VM path is servable and nothing is reported. Without this the test above
-    would also pass against a projector that ALWAYS says crashed."""
+async def test_a_failed_push_is_reported_too_not_only_the_mesh_case(tmp_path):
+    """`no_mesh` is not the only way a name fails to resolve. A push that simply
+    could not be written leaves the VM resolving whatever it last had, which is
+    just as invisible to the user and must read the same way."""
+    stores = SynthStores(tmp_path)
+    _running_vm(stores, 1, HOSTS_FAILED, ("vm2.example.com",))
+    _zone(stores, "example.com", [_a_record("vm2.example.com", "192.168.64.2")])
+
+    _, phase, _, verdict = (await project(stores, ENV))["example.com"]
+    assert phase == "crashed"
+    # Spelled out for the reason the test above records.
+    assert verdict == (
+        "odin could not write this instance's /etc/hosts, so vm2.example.com still "
+        "resolve to whatever the VM last had (or to nothing)"
+    )
+
+
+async def test_one_zones_failure_does_not_condemn_another(tmp_path):
+    """Two zones in one env fail independently. Telling a user their
+    `internal.test` zone is broken because `example.com` could not be pushed is
+    a different lie from the one this projector exists to prevent, and just as
+    expensive.
+
+    Mutation-test: drop the `endswith` zone filter and this fails."""
+    stores = SynthStores(tmp_path)
+    _running_vm(stores, 1, HOSTS_NO_MESH, ("vm2.example.com",))
+    _zone(stores, "example.com", [_a_record("vm2.example.com", "192.168.64.2")])
+    _zone(stores, "internal.test", [_a_record("vm2.internal.test", "192.168.64.2")])
+
+    projected = await project(stores, ENV)
+    assert projected["example.com"][1] == "crashed"
+    assert projected["internal.test"][1] == "healthy"
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "OPEN SEAM: nothing in src/odin writes `hosts_action` yet. The per-consumer "
+    "address mapping that would produce a HostsVerdict is unbuilt, so this "
+    "projector currently reads a signal that never arrives -- honesty rule 1, in "
+    "new code. STRICT on purpose: the day a writer lands this xpasses, which "
+    "FAILS the build and forces the marker off, instead of the gap being "
+    "remembered by a comment nobody re-reads."
+))
+def test_something_actually_writes_the_verdict_this_projector_reads():
+    """The ratchet over the gap, because prose cannot fail a build.
+
+    `_route53_zones` keys entirely off `hosts_action` on an ec2compute record.
+    A reader with no writer is the exact shape of the four guards CLAUDE.md
+    records as having silently never fired, so the absence is pinned here rather
+    than described in a docstring."""
+    src = Path(__file__).resolve().parents[2] / "src" / "odin"
+    writers = sorted(
+        path.relative_to(src).as_posix()
+        for path in src.rglob("*.py")
+        if path.name != "tf_status.py" and "hosts_action" in path.read_text()
+    )
+    assert writers, "no module writes `hosts_action`, so the route53 projector can never fire"
+
+
+async def test_a_zone_over_vms_that_recorded_nothing_is_healthy(tmp_path):
+    """The honest failure mode, asserted rather than left implicit: when no VM
+    recorded a verdict there is nothing to report, so the zone reads healthy.
+    That is the substrate saying "no VM reported a problem" -- NOT a proof that
+    resolution works. That proof is the integration test that asks `getent
+    hosts` inside a real container and a real VM."""
     stores = SynthStores(tmp_path)
     _running_vm(stores, 1)
     _running_vm(stores, 2)
     _zone(stores, "example.com", [_a_record("vm1.example.com", "192.168.64.1")])
-    _overlay(tmp_path, {"i-1": "10.42.1.1", "i-2": "10.42.1.2"})
-
-    assert (await project(stores, ENV))["example.com"][1] == "healthy"
-
-
-async def test_a_zone_with_only_its_auto_records_is_healthy_even_with_no_mesh(tmp_path):
-    """An empty hosted zone serves nothing, so there is nothing it fails to
-    serve. The SOA/NS pair route53ctl mints on create must not count as drawn
-    records -- if they did, EVERY zone in a mesh-less env would read crashed.
-
-    Mutation-test: drop the `_ROUTE53_AUTO_TYPES` filter and this fails."""
-    stores = SynthStores(tmp_path)
-    _running_vm(stores, 1)
-    _running_vm(stores, 2)
-    _zone(stores, "example.com")
 
     assert (await project(stores, ENV))["example.com"][1] == "healthy"
