@@ -420,6 +420,11 @@ def _route53_zones(stores: SynthStores, env: str) -> Projected:
     unresolvable = sorted({
         name
         for record in stores.ec2compute.items(env).values()
+        # No `details=` here, deliberately: `HostsVerdict.healthy` is
+        # `action in _HOSTS_HEALTHY` and never reads them. Passing it was
+        # suggested and would have been dead weight -- proved by mutation, where
+        # DELETING it killed nothing because nothing could observe it. It is
+        # required in `_hosts_verdict_for` below, where the reason is rendered.
         if record.get("hosts_action") and not HostsVerdict(
             vm=record.get("instance_id", ""),
             action=record["hosts_action"],
@@ -457,6 +462,14 @@ def _hosts_verdict_for(stores: SynthStores, env: str, names: list[str]) -> str:
             vm=record.get("instance_id", ""),
             action=record["hosts_action"],
             names=tuple(record.get("hosts_names") or ()),
+            # `HOSTS_UNRESOLVABLE`'s template is literally "{details}", so
+            # dropping this field renders the generic fallback and the SPECIFIC
+            # cause disappears at this boundary -- a record pointing at a
+            # terminated instance in a fully-meshed env would read "this
+            # environment has no mesh" and send the reader to fix something that
+            # is not broken. The resolver made that distinction on purpose; the
+            # projection has to carry it.
+            details=tuple(record.get("hosts_details") or ()),
         ).reason
         for record in stores.ec2compute.items(env).values()
         if record.get("hosts_action")

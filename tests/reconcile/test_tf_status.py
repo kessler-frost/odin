@@ -9,9 +9,8 @@ from __future__ import annotations
 
 import json
 import os
+import ast
 from pathlib import Path
-
-import pytest
 
 from odin.aws.cache import container_name as cache_container_name
 from odin.aws.rds import container_name as db_container_name
@@ -21,6 +20,7 @@ from odin.compute.functions import container_name as function_container_name
 # expectation computed from the class under test cannot fail with it (honesty
 # rule 5). If this import ever comes back, check what it is being used for.
 from odin.compute.instances import (
+    HOSTS_UNRESOLVABLE,
     HOSTS_FAILED,
     HOSTS_NO_MESH,
     HOSTS_PUSHED,
@@ -1553,14 +1553,19 @@ def _a_record(fqdn: str, address: str) -> dict:
 
 
 def _running_vm(stores, n: int, hosts_action: str | None = None,
-                hosts_names: tuple[str, ...] = ()) -> None:
+                hosts_names: tuple[str, ...] = (),
+                details: tuple[str, ...] = ()) -> None:
     """A VM record, optionally carrying the verdict the hosts resolver RECORDED.
 
-    `hosts_action`/`hosts_names` are the observed signal -- what a real
-    `push_hosts` reported -- not a prediction this test makes on its behalf."""
+    `hosts_action`/`hosts_names`/`hosts_details` are the observed signal -- what a
+    real `push_hosts` reported -- not a prediction this test makes on its behalf.
+    All three are written as JSON-native types (str, list), because these records
+    round-trip through `world.json` every tick and a tuple read back as a list
+    compares unequal to itself for ever."""
     stores.ec2compute.set(ENV, f"instance:i-{n}", {
         **_ec2_instance(f"i-{n}", "running"), "private_ip": f"192.168.64.{n}",
-        **({"hosts_action": hosts_action, "hosts_names": list(hosts_names)}
+        **({"hosts_action": hosts_action, "hosts_names": list(hosts_names),
+            "hosts_details": list(details)}
            if hosts_action else {}),
     })
     stores.tags.set(ENV, f"ec2:i-{n}", {"odin:node": f"vm{n}"})
@@ -1653,6 +1658,36 @@ async def test_a_failed_push_is_reported_too_not_only_the_mesh_case(tmp_path):
     )
 
 
+async def test_the_unresolvable_verdict_carries_its_SPECIFIC_cause(tmp_path):
+    """The fifth action, and the one that only works if this projector forwards
+    `hosts_details`.
+
+    `HOSTS_UNRESOLVABLE`'s reason template is literally `"{details}"`. Reconstruct
+    a verdict without that field and it renders the generic fallback instead --
+    so a record pointing at a TERMINATED instance in a fully-meshed env would be
+    explained as "this environment has no mesh", sending the reader to fix
+    something that is not broken. That false reason is exactly what the fifth
+    action was added to remove, and it would have been thrown away here.
+
+    The expectation is the resolver's sentence spelled out (rule 5): deriving it
+    from `HostsVerdict` would pass with `details` dropped, because both sides
+    would fall back together.
+
+    Mutation-test: delete `details=` from either reconstruction in
+    `_route53_zones` and this fails."""
+    stores = SynthStores(tmp_path)
+    _running_vm(stores, 1, HOSTS_UNRESOLVABLE, ("api.example.com",),
+                details=("api.example.com -> 192.168.64.9 matches no running instance",))
+    _zone(stores, "example.com", [_a_record("api.example.com", "192.168.64.9")])
+
+    _, phase, _, verdict = (await project(stores, ENV))["example.com"]
+    assert phase == "crashed"
+    assert verdict == "api.example.com -> 192.168.64.9 matches no running instance"
+    # The generic fallback must NOT be what surfaced -- that is the whole bug.
+    assert verdict != "api.example.com could not be resolved"
+    assert "no mesh" not in verdict, "a terminated target must not be blamed on the mesh"
+
+
 async def test_one_zones_failure_does_not_condemn_another(tmp_path):
     """Two zones in one env fail independently. Telling a user their
     `internal.test` zone is broken because `example.com` could not be pushed is
@@ -1670,26 +1705,43 @@ async def test_one_zones_failure_does_not_condemn_another(tmp_path):
     assert projected["internal.test"][1] == "healthy"
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "OPEN SEAM: nothing in src/odin writes `hosts_action` yet. The per-consumer "
-    "address mapping that would produce a HostsVerdict is unbuilt, so this "
-    "projector currently reads a signal that never arrives -- honesty rule 1, in "
-    "new code. STRICT on purpose: the day a writer lands this xpasses, which "
-    "FAILS the build and forces the marker off, instead of the gap being "
-    "remembered by a comment nobody re-reads."
-))
 def test_something_actually_writes_the_verdict_this_projector_reads():
-    """The ratchet over the gap, because prose cannot fail a build.
+    """The seam, now CLOSED -- and the marker came off the way it was meant to.
 
-    `_route53_zones` keys entirely off `hosts_action` on an ec2compute record.
-    A reader with no writer is the exact shape of the four guards CLAUDE.md
-    records as having silently never fired, so the absence is pinned here rather
-    than described in a docstring."""
+    `_route53_zones` keys entirely off `hosts_action` on an ec2compute record. A
+    reader with no writer is the exact shape of the four guards CLAUDE.md records
+    as having silently never fired, so while the writer was missing this carried
+    `@pytest.mark.xfail(strict=True)` naming the gap. `gateway/route53_hosts.py`
+    now writes it, the xfail XPASSED, the build FAILED, and the marker had to
+    come off -- which is the entire point of `strict`: a comment or a TODO would
+    have decayed silently, and this could not.
+
+    It stays as a live assertion because the gap can REOPEN. Someone refactoring
+    the hosts wiring could stop writing the field and every zone would read
+    `healthy` for ever with nothing to say otherwise -- silent, green, and
+    exactly what this file exists to prevent.
+
+    IT SEARCHES THE AST, NOT THE TEXT, and that correction was earned. The first
+    version did `"hosts_action" in path.read_text()`, and a mutant that renamed
+    the real dict key at `route53_hosts.py:159` SURVIVED -- because line 140 of
+    that same file mentions `hosts_action` in a DOCSTRING, so the grep still
+    matched while nothing wrote the field. That is honesty rule 5's third bullet
+    (`grep -c 'card-head'` matching the page's own stylesheet) reproduced inside
+    the very ratchet meant to prevent this class of bug. A comment is absent from
+    the AST entirely and a docstring is an `Expr`, never a dict key, so only a
+    real write can satisfy this now."""
     src = Path(__file__).resolve().parents[2] / "src" / "odin"
     writers = sorted(
         path.relative_to(src).as_posix()
         for path in src.rglob("*.py")
-        if path.name != "tf_status.py" and "hosts_action" in path.read_text()
+        if path.name != "tf_status.py"
+        and any(
+            isinstance(key, ast.Constant) and key.value == "hosts_action"
+            for node in ast.walk(ast.parse(path.read_text()))
+            if isinstance(node, ast.Dict)
+            for key in node.keys
+            if key is not None
+        )
     )
     assert writers, "no module writes `hosts_action`, so the route53 projector can never fire"
 
