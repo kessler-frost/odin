@@ -1729,7 +1729,14 @@ def test_something_actually_writes_the_verdict_this_projector_reads():
     (`grep -c 'card-head'` matching the page's own stylesheet) reproduced inside
     the very ratchet meant to prevent this class of bug. A comment is absent from
     the AST entirely and a docstring is an `Expr`, never a dict key, so only a
-    real write can satisfy this now."""
+    real write can satisfy this now.
+
+    THE GENERAL FORM, worth carrying past this one test: a text grep cannot prove
+    a WRITE in a file that documents itself well -- and the better a module
+    explains its own seam, the more likely it is to fool a grep-based guard. The
+    incentive is perverse, because the modules most worth trusting are the ones
+    whose prose most reliably defeats the check. When a guard must prove that
+    code DOES something, match the structure, not the source text."""
     src = Path(__file__).resolve().parents[2] / "src" / "odin"
     writers = sorted(
         path.relative_to(src).as_posix()
