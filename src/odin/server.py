@@ -427,11 +427,21 @@ def _uncovered_rejection(uncovered: list[dict], env: str) -> JSONResponse:
 
 
 async def _surviving_containers(runtime, env: str) -> list[str] | None:
-    """Odin containers this env still has, by odin's own container naming --
-    `odin-aws-{backing}-{env}` carries the env as a SUFFIX, `odin-rds-{env}-…`
-    / `odin-ecs-{env}-…` / `odin-lambda-{env}-…` as an INFIX, both anchored on
-    `-` so a longer env sharing this one's prefix never matches (the rule
-    tests/containers.py documents and relies on).
+    """Odin containers this env still has, by the `odin-env` LABEL.
+
+    It matched odin's container NAMING until v0.8.21, and that was ambiguous
+    in a way no anchoring could fix: the env is a suffix in
+    `odin-aws-{backing}-{env}` and an infix in `odin-rds-{env}-…`, and an env
+    name may itself contain `-`, so env `a` matched `odin-aws-rustfs-b-a` and
+    `odin env rm a` REFUSED while `b-a` was alive. It refused rather than
+    over-deleted, which is why it shipped -- but it refused a legitimate
+    removal, and `docs/limits.md` carried it as a residual.
+
+    The label is exact, and safe to switch to only because it is set at every
+    one of the eight container launch sites (backings, cache, rds, apigw,
+    functions, proxy, tasks, sidecar) -- verified, because a label with
+    incomplete coverage would MISS a survivor, which is the one failure worse
+    than the refusal it replaces.
 
     Best-effort by design, and `reconcile/drift.py::_listing`'s exact
     reasoning: this runs only when a destroy has ALREADY failed, so a docker
@@ -444,11 +454,11 @@ async def _surviving_containers(runtime, env: str) -> list[str] | None:
     with the real reason in the server log only, in the one report whose whole
     job is naming what survived a failed teardown."""
     try:
-        names = await runtime.container_names()
+        names = await runtime.container_names(env)
     except Exception as exc:  # noqa: BLE001 -- any CLI/parse failure means "unknown"
         log.warning("could not list containers while reporting a failed destroy (%s)", exc)
         return None
-    return sorted(name for name in names if name.endswith(f"-{env}") or f"-{env}-" in name)
+    return sorted(names)
 
 
 # --- the last line of defence: no odin route may answer with a non-JSON body ---

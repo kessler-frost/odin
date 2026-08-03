@@ -48,22 +48,30 @@ class CleanRuntime(FakeRuntime):
     models docker's `odin.env` label filter for real — a fake that ignored the
     filter would let a reclaim that swept the whole machine pass."""
 
-    async def container_names(self):
+    async def container_names(self, env=None):
         return []
 
 
 class SurvivingRuntime(FakeRuntime):
     """A machine where this env's backing container is still up after the
-    teardown claimed success."""
+    teardown claimed success -- plus another env's, which must NOT be reported.
 
-    async def container_names(self):
-        return [f"odin-aws-rustfs-{DROP}", "odin-aws-rustfs-someone-else"]
+    Honours `env` the way `docker ps --filter label=odin-env=` does. That
+    filtering moved OUT of odin and into the substrate in v0.8.21 (odin used to
+    match container names, which is ambiguous when an env name contains `-`),
+    so a fake that returned both regardless would be asserting against a filter
+    nothing performs."""
+
+    _OWNER = {f"odin-aws-rustfs-{DROP}": DROP, "odin-aws-rustfs-someone-else": "someone-else"}
+
+    async def container_names(self, env=None):
+        return [n for n, e in self._OWNER.items() if env is None or e == env]
 
 
 class BlindRuntime(FakeRuntime):
     """A machine odin cannot ask: `docker` will not answer at all."""
 
-    async def container_names(self):
+    async def container_names(self, env=None):
         raise RuntimeError("Cannot connect to the Docker daemon")
 
 
@@ -400,15 +408,23 @@ def test_the_route_is_reachable_and_returns_json(tmp_path):
     assert json.loads(resp.content)["env"] == DROP
 
 
-def test_an_env_whose_name_suffixes_another_refuses_rather_than_over_deletes(tmp_path):
-    """The residual `docs/limits.md` documents, pinned so the doc stays true.
+def test_an_env_whose_name_suffixes_another_is_removed_rather_than_refused(tmp_path):
+    """FIXED in v0.8.21; this asserted the REFUSAL until then.
 
-    The container witness matches odin's container NAMING, not a label, so
-    `odin-aws-rustfs-b-a` reads as env `a`'s. That is a refusal, never an
-    over-delete: nothing is removed, and `b-a` is untouched."""
+    The container witness matched odin's container NAMING, and an env name may
+    contain `-`, so `odin-aws-rustfs-envrm-b-envrm-a` read as env `envrm-a`'s
+    and `odin env rm envrm-a` refused with `b`'s container as the reason. It
+    refused rather than over-deleted, which is why it was tolerable -- but it
+    refused a LEGITIMATE removal, and `docs/limits.md` carried it as a residual.
+
+    The witness now filters on the `odin-env` LABEL, which is exact. The fake
+    below honours `env` the way `docker ps --filter label=odin-env=` does,
+    because a fake that ignored it would pass this test no matter what the
+    source did."""
     class TwoEnvRuntime(FakeRuntime):
-        async def container_names(self):
-            return ["odin-aws-rustfs-envrm-b-envrm-a"]
+        async def container_names(self, env=None):
+            owner = {"odin-aws-rustfs-envrm-b-envrm-a": "envrm-b-envrm-a"}
+            return [n for n, e in owner.items() if env is None or e == env]
 
     app = _app(tmp_path, runtime=TwoEnvRuntime())
     with TestClient(app) as client:
@@ -416,10 +432,11 @@ def test_an_env_whose_name_suffixes_another_refuses_rather_than_over_deletes(tmp
         _seed(client, app, "envrm-b-envrm-a")
         resp = client.post("/envs/rm?env=envrm-a")
 
-    assert resp.json()["status"] == "remove_failed_containers_standing"
-    assert resp.json()["still_standing"]["containers"] == ["odin-aws-rustfs-envrm-b-envrm-a"]
-    assert (tmp_path / "envrm-a" / "HEAD").exists()
-    assert (tmp_path / "envrm-b-envrm-a" / "HEAD").exists()
+    assert resp.json()["status"] == "removed", resp.json()
+    assert not (tmp_path / "envrm-a" / "HEAD").exists(), "envrm-a should be gone"
+    # The whole point: the OTHER env is untouched, which the name match also
+    # achieved -- by refusing to do the job at all.
+    assert (tmp_path / "envrm-b-envrm-a" / "HEAD").exists(), "envrm-b-envrm-a must survive"
 
 
 def test_rds_canvas_env_removes_too(tmp_path):
@@ -605,7 +622,7 @@ def test_a_directoryless_env_with_a_live_container_refuses_before_touching_disk(
     Mutation-test: delete the `_surviving_containers` check from `_reclaim_only`
     and this fails."""
     class OtherOdinsEnvRuntime(CleanRuntime):
-        async def container_names(self):
+        async def container_names(self, env=None):
             return ["odin-rds-envrm-elsewhere-app-db"]
 
     runtime = OtherOdinsEnvRuntime()

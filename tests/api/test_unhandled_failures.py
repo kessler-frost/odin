@@ -68,7 +68,7 @@ class FakeRuntime:
     async def ensure_host(self):
         return HostFacts()
 
-    async def container_names(self):
+    async def container_names(self, env=None):
         return []
 
 

@@ -42,7 +42,7 @@ class NoVolumeSurface:
     all -- `tests/api/test_env_rm.py`'s `container_names` case, one method over.
     An `AttributeError` is still "odin could not ask"."""
 
-    async def container_names(self):
+    async def container_names(self, env=None):
         return []
 
 
