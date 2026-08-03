@@ -225,9 +225,11 @@ def _resource(node: dict) -> ResourceDesired | None:
 
 def _edges(e: dict, labels: dict[str, str]) -> tuple[Edge, ...]:
     # The UI stores access metadata under `data` (Canvas.tsx): `permissions` +
-    # `edgeType`, one of `EDGE_KINDS` above. Thread both through so the Brain's
-    # IAM review sees real grants. (Data-flow ${{node.attr}} refs are NOT edges —
-    # they're lifted into ResourceDesired.refs above.)
+    # `edgeType`, one of `EDGE_KINDS` above. Thread both through so the IAM
+    # compiler (`gateway/policy.py`) sees real grants -- this used to say "the
+    # Brain's IAM review", naming `agent/brain.py`, which was parked at tag
+    # `app-layer-parked` and does not exist. (Data-flow ${{node.attr}} refs are
+    # NOT edges — they're lifted into ResourceDesired.refs above.)
     # Edge endpoints are ReactFlow node IDs but Stack resources are keyed by
     # LABEL — translate through `labels` (fall back for edges naming labels).
     #

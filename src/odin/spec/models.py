@@ -1,8 +1,10 @@
 """The Spec Store data model: Stack (desired) and World (observed).
 
-The Stack is whole-canvas declarative desired state authored by the Canvas and
-the Brain; the World is observed state authored only by drivers + the Assertion
-Engine. They are kept as separate frozen documents per environment. A Stack
+The Stack is whole-canvas declarative desired state authored by the Canvas (and,
+later, the canvas<->Terraform translation agent); the World is observed state
+authored only by drivers + the Assertion Engine. "The Brain" used to be named
+here as a second author: that was `agent/brain.py`, parked at tag
+`app-layer-parked`, and the module does not exist. They are kept as separate frozen documents per environment. A Stack
 carries no `rev` field — the revision is the sha256 of its canonical JSON,
 computed by the SpecStore (carrying it inside would be circular).
 """
