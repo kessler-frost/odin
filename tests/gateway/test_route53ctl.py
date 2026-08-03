@@ -18,7 +18,9 @@ so the provider's waiter can terminate.
 """
 from __future__ import annotations
 
+import ast
 from pathlib import Path
+from xml.etree import ElementTree
 
 import botocore.session
 import pytest
@@ -26,7 +28,7 @@ from botocore.awsrequest import HeadersDict
 from botocore.parsers import create_parser
 from starlette.responses import Response
 
-from odin.gateway import synth
+from odin.gateway import errors, synth
 from odin.gateway.classify import _route53_zone, classify
 from odin.gateway.models import route53ctl
 from odin.gateway.stores import SynthStores
@@ -312,6 +314,75 @@ async def test_an_unsupported_record_type_is_refused(stores, sink, route53):
     assert [r for r in listed["ResourceRecordSets"] if r["Type"] == "WKS"] == []
 
 
+def _alias_change_body(zone: str, *, ttl: str = "", records: str = "") -> bytes:
+    """A raw ChangeResourceRecordSets carrying AliasTarget plus whatever the
+    caller asks for. Hand-built rather than boto3-built: boto3 will happily sign
+    this combination, but building it through the client makes the test read as
+    if the SDK endorsed the shape. The bytes are what the gateway must judge."""
+    return (
+        f'<ChangeResourceRecordSetsRequest xmlns="{route53ctl.NS}"><ChangeBatch><Changes><Change>'
+        f"<Action>CREATE</Action><ResourceRecordSet><Name>cdn.{zone}.</Name><Type>A</Type>"
+        f"{ttl}{records}"
+        f"<AliasTarget><HostedZoneId>Z2FDTNDATAQYW2</HostedZoneId>"
+        f"<DNSName>d111111.cloudfront.net.</DNSName>"
+        f"<EvaluateTargetHealth>false</EvaluateTargetHealth></AliasTarget>"
+        f"</ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>"
+    ).encode()
+
+
+_RECORDS_XML = "<ResourceRecords><ResourceRecord><Value>10.0.0.5</Value></ResourceRecord></ResourceRecords>"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "named"),
+    [
+        ({"records": _RECORDS_XML}, "ResourceRecords"),
+        ({"ttl": "<TTL>60</TTL>"}, "TTL"),
+        ({"ttl": "<TTL>60</TTL>", "records": _RECORDS_XML}, "ResourceRecords"),
+    ],
+)
+async def test_an_alias_record_carrying_ttl_or_resource_records_is_refused(stores, sink, route53, kwargs, named):
+    """An ALIAS record routes to another resource, so it carries `AliasTarget`
+    INSTEAD OF the TTL/ResourceRecords pair. AWS's own docs (in botocore's
+    service model) say to omit BOTH; `_rrset_from_wire` parses the two branches
+    independently, so without this guard the store can hold a record that is
+    both at once and no reader can say which field wins.
+
+    The error must NAME the field to remove -- "invalid" alone leaves a user
+    guessing whether to drop AliasTarget or the other half."""
+    await _create_zone(stores, sink, route53)
+    response = await synth.pure_answer(
+        "route53:ChangeResourceRecordSets", ZONE, ENV,
+        _alias_change_body(ZONE, **kwargs), stores, 0.0,
+    )
+    parsed = _parse("ChangeResourceRecordSets", response, error=True)
+    assert parsed["Error"]["Code"] == "InvalidChangeBatch"
+    assert named in parsed["Error"]["Message"], parsed["Error"]["Message"]
+    assert f"cdn.{ZONE}." in parsed["Error"]["Message"]
+    # ...and nothing was written.
+    listed = _parse("ListResourceRecordSets", await _answer(
+        stores, sink.call(lambda: route53.list_resource_record_sets(HostedZoneId=ZONE))
+    ))
+    assert [r for r in listed["ResourceRecordSets"] if r["Name"] == f"cdn.{ZONE}."] == []
+
+
+async def test_a_well_formed_alias_record_is_still_accepted(stores, sink, route53):
+    """The other direction, so the guard cannot be 'reject every alias'. A
+    mutation that refuses all aliases must kill THIS test while the ones above
+    stay green -- an inference guard pinned in both directions."""
+    await _create_zone(stores, sink, route53)
+    _parse("ChangeResourceRecordSets", await synth.pure_answer(
+        "route53:ChangeResourceRecordSets", ZONE, ENV, _alias_change_body(ZONE), stores, 0.0,
+    ))
+    listed = _parse("ListResourceRecordSets", await _answer(
+        stores, sink.call(lambda: route53.list_resource_record_sets(HostedZoneId=ZONE))
+    ))
+    alias = next(r for r in listed["ResourceRecordSets"] if r["Name"] == f"cdn.{ZONE}.")
+    assert alias["AliasTarget"]["DNSName"] == "d111111.cloudfront.net."
+    assert "TTL" not in alias
+    assert "ResourceRecords" not in alias
+
+
 async def test_an_unknown_route53_action_is_refused_not_silently_accepted(stores):
     """The model's own belt-and-braces: `classify` already refuses an
     unrecognised (method, path), but a caller reaching `pure_answer` with an
@@ -334,6 +405,146 @@ def test_an_unmodeled_route53_path_is_unmappable(sink, route53):
     req = sink.call(lambda: route53.list_health_checks())
     path, query = split_url(req.url)
     assert classify("route53", req.method, path, query, req.headers, req.body) is None
+
+
+@pytest.mark.parametrize("build", [
+    lambda: errors.access_denied("route53", "route53:GetHostedZone", ZONE),
+    lambda: errors.access_denied("route53", "unmappable-action"),
+    lambda: errors.service_unavailable("route53"),
+    lambda: errors.internal_failure("route53", "RuntimeError"),
+    lambda: errors.auth_error("route53", "SignatureDoesNotMatch", "nope"),
+    lambda: errors.synth_error("route53", "NoSuchHostedZone", "gone", 404),
+])
+def test_every_route53_error_is_xml_and_carries_odins_own_code(build):
+    """route53 is rest-xml, and `errors.py` had no branch for it -- so every
+    deny and every 5xx on this service fell through to the AWS-JSON body at the
+    bottom of `_respond`/`synth_error`.
+
+    MEASURED through the parser botocore really picks for route53
+    (`RestXMLParser`), that body reads as `{'Code': '404', 'Message': 'Not
+    Found'}` -- odin's own code and message gone. A teammate measured the same
+    bug from the other side, feeding those bytes to a real `tofu apply` and
+    getting `api error UnknownError: UnknownError`.
+
+    This pins BOTH halves so the fix cannot silently regress: the response is
+    XML, and the code that comes back out is the one odin put in. It covers
+    every constructor in `errors.py`, not just `synth_error`, because the
+    unmappable-action deny is the one a user hits first."""
+    response = build()
+    assert response.media_type in ("text/xml", "application/xml"), response.media_type
+    assert response.body.lstrip().startswith(b"<?xml"), response.body[:80]
+    model = _SESSION.get_service_model("route53")
+    parser = create_parser(model.protocol)
+    parsed = parser.parse(
+        {"status_code": response.status_code, "headers": HeadersDict(dict(response.headers)),
+         "body": response.body},
+        model.operation_model("GetHostedZone").output_shape,
+    )
+    assert "Error" in parsed, f"no Error document in {response.body!r}"
+    assert parsed["Error"]["Code"] not in ("404", "403", "500", "503", "UnknownError"), (
+        f"odin's own error code was lost -- botocore read {parsed['Error']!r}"
+    )
+
+
+@pytest.mark.parametrize("build", [
+    lambda: errors.access_denied("route53", "route53:GetHostedZone", ZONE),
+    lambda: errors.access_denied("route53", "unmappable-action"),
+    lambda: errors.service_unavailable("route53"),
+    lambda: errors.internal_failure("route53", "RuntimeError"),
+    lambda: errors.auth_error("route53", "SignatureDoesNotMatch", "nope"),
+    lambda: errors.synth_error("route53", "NoSuchHostedZone", "gone", 404),
+])
+def test_route53_errors_use_the_ErrorResponse_envelope_not_s3s(build):
+    """THE ROOT ELEMENT, asserted structurally -- and this test exists because
+    every OTHER assertion in this file is blind to what it checks.
+
+    botocore's `RestXMLParser` reads `<ErrorResponse><Error>` and S3's bare
+    `<Error>` IDENTICALLY: both give `Code='AccessDenied'` with odin's message.
+    So the test above, and every `_parse(..., error=True)` here, passes either
+    way. MEASURED, not assumed: routing route53 through the `_s3_xml` branch was
+    mutation-tested against the whole gateway suite and **1286 tests passed**.
+
+    The two are not interchangeable. The terraform provider is aws-sdk-go-v2 and
+    is the only principal that ever reaches route53, and across six real
+    `tofu apply` runs it read the bare form as `UnknownError: UnknownError`
+    while reading `<ErrorResponse>` as `AccessDenied` with odin's real message.
+    For route53 the s3 envelope destroys odin's error exactly as thoroughly as
+    the AWS-JSON fallthrough does -- it is just invisible from python.
+
+    Hence a structural assertion on the wrapper rather than a parsed-code one:
+    the code survives the mutation, the wrapper does not."""
+    body = build().body
+    root = ElementTree.fromstring(body)
+    assert root.tag == "ErrorResponse", (
+        f"route53 errors must use the <ErrorResponse> envelope -- aws-sdk-go-v2 reads "
+        f"<{root.tag}> as 'UnknownError: UnknownError'. Got: {body[:120]!r}"
+    )
+    assert root.find("Error") is not None, f"no nested <Error> in {body[:120]!r}"
+    assert root.find("Error/Code") is not None
+    assert root.find("Error/Message") is not None
+
+
+def test_route53_is_registered_as_an_xml_envelope_service():
+    """The one-line registration the envelope above depends on, pinned directly.
+
+    Both teammates who measured this asked for it by name. It is deliberately
+    redundant with the structural test above -- that one proves the BYTES are
+    right, this one names the mechanism, so a reader who breaks the constant
+    gets a failure that says which line to look at rather than an XML diff."""
+    assert "route53" in errors._QUERY_XML_SERVICES
+
+
+def test_the_container_half_of_hosts_resolution_is_still_unwired():
+    """A RATCHET on a docstring claim, because prose cannot fail a build.
+
+    `route53ctl.py`'s module docstring states that the CONTAINER half of hosts
+    resolution is not wired -- `compute/hosts.py::container_hosts` exists, is
+    unit-tested, and is called by nothing. That sentence is true when written
+    and is exactly the kind that decays silently: someone wires it, the docstring
+    keeps saying it did not, and a reader designs around a limit that is gone.
+
+    MATCHES THE AST, NOT THE SOURCE TEXT, and the first cut of this test did the
+    latter -- an allowlist of files whose TEXT contains `container_hosts`. A
+    teammate's `tf_status.py` guard hit the general form of that mistake and
+    named it: *a text grep cannot prove what code DOES, and the better a module
+    explains its own seam, the more likely its prose defeats the check.* The
+    incentive is perverse -- the modules most worth trusting are the ones whose
+    comments most reliably fool a grep.
+
+    It bites HERE in a specific way. This very file's subject, `route53ctl.py`,
+    contains `container_hosts` in a DOCSTRING and nothing else; the text version
+    had to carve it into an allowlist to stay green. Any third module that so
+    much as MENTIONS the name in a comment would then fail this test -- a false
+    alarm, whose obvious fix is to widen the allowlist, which is exactly how a
+    real caller gets waved through. An `ast.Call`/`ast.ImportFrom` cannot be
+    satisfied by prose, so the allowlist disappears and with it the pressure to
+    grow one.
+
+    MEASURED at the time of writing: `container_hosts` is DEFINED in
+    `compute/hosts.py`, imported in 0 files, called in 0 files, and mentioned as
+    text-only in `gateway/models/route53ctl.py` (this claim's own docstring)."""
+    src = Path(__file__).resolve().parents[2] / "src"
+    wired: dict[str, str] = {}
+    for path in src.rglob("*.py"):
+        source = path.read_text()
+        if "container_hosts" not in source:
+            continue
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.ImportFrom) and any(
+                alias.name == "container_hosts" for alias in node.names
+            ):
+                wired[str(path.relative_to(src))] = "imports it"
+            if isinstance(node, ast.Call) and (
+                (isinstance(node.func, ast.Name) and node.func.id == "container_hosts")
+                or (isinstance(node.func, ast.Attribute) and node.func.attr == "container_hosts")
+            ):
+                wired[str(path.relative_to(src))] = "calls it"
+    assert wired == {}, (
+        f"`container_hosts` is now wired: {wired}. The container half of hosts resolution is "
+        f"LIVE, so the fourth bullet of route53ctl.py's module docstring -- which says "
+        f"containers get no records from a route53 record -- is false. Update it in THIS "
+        f"commit, then delete this test."
+    )
 
 
 # --- classification ---------------------------------------------------------
@@ -363,12 +574,6 @@ def test_every_modeled_route_classifies_to_its_own_action(method, path, expected
 @pytest.mark.parametrize(
     ("method", "path"),
     [
-        # Mutation target (b): the trailing slash is the ONLY thing separating
-        # the rrset WRITE route from the rrset READ route, so an unanchored or
-        # slash-tolerant pattern classifies a write as a read -- a policy hole,
-        # not a 404.
-        ("POST", f"/2013-04-01/hostedzone/{ZONE}/rrset"),
-        ("GET", f"/2013-04-01/hostedzone/{ZONE}/rrset/"),
         # Paths that must not be swallowed by a neighbouring pattern.
         ("GET", "/2013-04-01/hostedzone/a/b"),
         ("GET", "/2013-04-01/healthcheck"),
@@ -376,10 +581,56 @@ def test_every_modeled_route_classifies_to_its_own_action(method, path, expected
         ("PUT", f"/2013-04-01/hostedzone/{ZONE}"),
         ("GET", "/2013-04-01/change"),
         ("POST", f"/2013-04-01/hostedzone/{ZONE}"),
+        # THE `$` ANCHOR ITSELF, and these cases exist because a mutation test
+        # found the gap: dropping `/?$` from the two rrset patterns left them
+        # PREFIX-matching and every test above still passed. An unanchored write
+        # route classifies an unmodeled path as ChangeResourceRecordSets, which
+        # is an unknown request authorized as a known write rather than refused.
+        ("POST", f"/2013-04-01/hostedzone/{ZONE}/rrsets"),
+        ("GET", f"/2013-04-01/hostedzone/{ZONE}/rrsets"),
+        ("POST", f"/2013-04-01/hostedzone/{ZONE}/rrset/extra"),
+        ("GET", f"/2013-04-01/hostedzone/{ZONE}/rrset/extra"),
+        ("POST", f"/2013-04-01/hostedzone/{ZONE}/rrset//"),
     ],
 )
 def test_a_path_no_route_owns_is_unmappable(method, path):
     assert classify("route53", method, path, {}, {}, b"") is None
+
+
+@pytest.mark.parametrize("path", [
+    f"/2013-04-01/hostedzone/{ZONE}/rrset/",   # what boto3 sends
+    f"/2013-04-01/hostedzone/{ZONE}/rrset",    # what the terraform provider sends
+])
+def test_both_rrset_spellings_reach_the_write_route(path):
+    """A REGRESSION TEST for a bug the real provider found and boto3 could not.
+
+    botocore's `requestUri` for ChangeResourceRecordSets carries a trailing
+    slash, so a route table built from captured boto3 bytes requires one. The
+    terraform provider is aws-sdk-go-v2 and sends no slash: measured against a
+    real `tofu apply`, that path classified as UNMAPPABLE and the record failed
+    with `403 AccessDenied: unmappable-action` AFTER the zone had been created.
+    Both spellings must reach the WRITE route -- and note the pair below proves
+    the widening did not turn a write into a read, which is the failure that
+    would matter more."""
+    classified = classify("route53", "POST", path, {}, {}, b"")
+    assert classified is not None, f"POST {path} must classify -- the real provider sends it"
+    assert classified[0] == "route53:ChangeResourceRecordSets"
+    assert classified[1] == ZONE
+
+
+@pytest.mark.parametrize("path", [
+    f"/2013-04-01/hostedzone/{ZONE}/rrset/",
+    f"/2013-04-01/hostedzone/{ZONE}/rrset",
+])
+def test_a_read_of_either_rrset_spelling_is_never_the_write_action(path):
+    """The half of the slash-widening that is a POLICY property, not a
+    convenience: METHOD is now the only thing separating the rrset write from
+    the rrset read, so a GET must never classify as ChangeResourceRecordSets.
+    Getting this wrong is a write authorized as a read, which is a hole rather
+    than a 404."""
+    classified = classify("route53", "GET", path, {}, {}, b"")
+    assert classified is not None
+    assert classified[0] == "route53:ListResourceRecordSets"
 
 
 def test_no_two_routes_match_the_same_method_and_path():
@@ -393,7 +644,7 @@ def test_no_two_routes_match_the_same_method_and_path():
         ("GET", "/2013-04-01/hostedzonesbyname"),
         ("GET", f"/2013-04-01/hostedzone/{ZONE}"),
         ("DELETE", f"/2013-04-01/hostedzone/{ZONE}"),
-        ("POST", f"/2013-04-01/hostedzone/{ZONE}/rrset/"),
+        ("POST", f"/2013-04-01/hostedzone/{ZONE}/rrset"),
         ("GET", f"/2013-04-01/hostedzone/{ZONE}/rrset"),
         ("GET", "/2013-04-01/change/C123"),
         ("POST", f"/2013-04-01/tags/hostedzone/{ZONE}"),

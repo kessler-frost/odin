@@ -96,6 +96,16 @@ class ContainerSpec:
     # Emitted in SORTED order for a deterministic argv: the set comes from a
     # store whose iteration order is not meaningful, and an argv that reorders
     # between two identical converges is one no caller can compare.
+    #
+    # UNVERIFIED ON nerdctl, and named here rather than assumed. `run_container`
+    # is shared with `LimaRuntime`, which drives `nerdctl` inside a Lima VM, so
+    # a PLACED ECS task (`ecsctl.runtime_for_service`) would carry these flags
+    # to a different binary. docker's `--add-host` behaviour is measured; the
+    # nerdctl half has not been probed, and this repo's own rule is that
+    # inheriting a second CLI's contract on faith is how `host_port` nearly
+    # shipped a bug (see that method, which WAS probed on both). Probe
+    # `nerdctl run --add-host` against a real VM before relying on route53 for
+    # a placed task.
     hosts: dict[str, str] = field(default_factory=dict)
 
 

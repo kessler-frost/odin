@@ -19,6 +19,11 @@ import yaml
 
 from odin.compute import instances
 from odin.compute.instances import (
+    HOSTS_FAILED,
+    HOSTS_NO_MESH,
+    HOSTS_PUSHED,
+    HOSTS_UNCHANGED,
+    HostsVerdict,
     InstanceVm,
     NebulaJoin,
     _BOOT_SEMAPHORE,
@@ -1370,6 +1375,87 @@ async def test_push_hosts_never_raises_out_of_an_apply(tmp_path):
     action = await InstanceVm(runner=_Exploding()).push_hosts(
         NAME, tmp_path, "myenv", "i-1", {"api.internal": "10.42.0.5"})
     assert action == "failed"
+
+
+# --- the World-facing verdict (what tf_status projects) ---------------------
+
+
+def test_a_pushed_or_unchanged_verdict_is_healthy_and_silent():
+    for action in (HOSTS_PUSHED, HOSTS_UNCHANGED):
+        verdict = HostsVerdict(vm=NAME, action=action)
+        assert verdict.healthy is True
+        assert verdict.reason == ""
+
+
+def test_a_failed_push_names_what_is_still_standing():
+    verdict = HostsVerdict(vm=NAME, action=HOSTS_FAILED, names=("api.internal",))
+    assert verdict.healthy is False
+    assert "api.internal" in verdict.reason
+    assert "still resolve to whatever the VM last had" in verdict.reason
+
+
+def test_no_mesh_is_reported_not_merely_withheld():
+    """Honesty rule 1's own example: "the mesh gate withheld facts that never
+    reached World". Withholding the entry is CORRECT -- a VM cannot reach
+    another VM's vzNAT address, so writing it would produce a name that
+    resolves and never connects. But a withheld entry nobody is told about is
+    indistinguishable from a working one, so the verdict must be non-healthy
+    and must say why and what to do."""
+    verdict = HostsVerdict(vm=NAME, action=HOSTS_NO_MESH, names=("api.internal",))
+    assert verdict.healthy is False
+    assert "api.internal" in verdict.reason
+    assert "Nebula overlay" in verdict.reason
+    assert "this environment has no mesh" in verdict.reason
+
+
+def test_an_unmapped_outcome_fails_loudly_instead_of_passing():
+    """The shape `/destroy` needed four rounds to learn: the status is derived
+    from a map and is never initialised optimistically, so a branch added later
+    that forgets to report an outcome fails visibly rather than inheriting a
+    success."""
+    verdict = HostsVerdict(vm=NAME, action="something-new", names=("api.internal",))
+    assert verdict.healthy is False
+    assert "unrecognised" in verdict.reason
+    assert "something-new" in verdict.reason
+
+
+def test_every_action_push_hosts_can_return_is_classified():
+    """A ratchet across the seam: if `push_hosts` grows a fifth return value
+    and nobody classifies it, this fails rather than letting it reach World as
+    an unexplained non-healthy node.
+
+    The four actions are spelled as LITERALS, not imported from the module
+    under test, and the constants are checked against them separately. Driving
+    the loop from `(HOSTS_UNCHANGED, ...)` would make the subject grade itself:
+    deleting or renaming an action would delete its own case and the test would
+    pass with fewer assertions — green, and quieter than before. That is
+    honesty rule 5's "a guard parametrized over the thing it guards, so the
+    regression DELETES the case", and this test had it until the rule was
+    written."""
+    expected = {
+        "unchanged": True, "pushed": True,
+        "failed": False, "no_mesh": False, "unresolvable": False,
+    }
+    for action, healthy in expected.items():
+        verdict = HostsVerdict(
+            vm=NAME, action=action, names=("api.internal",), details=("because reasons",),
+        )
+        assert verdict.healthy is healthy, action
+        assert "unrecognised" not in verdict.reason, action
+        assert verdict.healthy or verdict.reason, action
+    # EVERY `HOSTS_*` constant the module exports must appear above. Checking
+    # only the four I happened to name would catch a rename or a deletion and
+    # miss the thing that actually happened: a FIFTH action was added and this
+    # test kept passing, because a loop over names it already knows can never
+    # notice a new one. The literals are the authority; the module is measured
+    # against them, not the other way round (honesty rule 5).
+    exported = {
+        value for name, value in vars(instances).items()
+        if name.startswith("HOSTS_") and isinstance(value, str)
+    }
+    assert exported == set(expected), (
+        f"a HOSTS_* action is not classified here: {sorted(exported ^ set(expected))}"
+    )
 
 
 async def test_a_malformed_record_cannot_reach_the_vm(tmp_path):

@@ -1,14 +1,42 @@
 """The gateway's Route 53 model -- and the ONE thing to know before reading the
 API surface, because the obvious misreading of this module is dangerous.
 
-**ODIN SERVES NO DNS.** This is a CONTROL PLANE and nothing else: a hosted zone
-and its record sets are stored, round-trip for terraform, and are enforceable
-targets for an IAM edge -- but no resolver anywhere answers them. Nothing in
-odin queries `api.odin.internal` and gets 10.0.0.5 back. A record here is a
-DOCUMENT, not a route. `fabric/localhost.py` and `fabric/nebula.py` are what
-actually resolve one odin resource to another, and they do not read this store.
-Anyone wiring a workload to a name declared here will find it does not resolve,
-and that limit belongs in docs/limits.md next to the ones like it.
+**ODIN STILL SERVES NO DNS.** Nothing speaks the DNS protocol on any port, and
+this module is a CONTROL PLANE: a hosted zone and its record sets are stored,
+round-trip for terraform, and are enforceable targets for an IAM edge.
+
+What a record now DOES do is resolve as an `/etc/hosts` entry, in exactly one
+substrate. `gateway/route53_hosts.py` reads `rrset:{zone_id}` out of this store
+and `server.py` calls it on every Apply (after the mesh pass -- a VM reaches
+another VM by its NEBULA OVERLAY address, and that only exists once the mesh
+pass has allocated it). So, VERIFIED against those call sites rather than
+assumed:
+
+  * A drawn name resolves inside a **RUNNING Lima VM odin manages**, and
+    nowhere else. Not from the macOS host, not from any process odin did not
+    launch. `dig` and `nslookup` will not find an odin record; `getent hosts`
+    inside such a VM will.
+  * A **NOT-running** instance is skipped entirely -- there is no guest to write
+    to. It gets its records at boot instead, via `generate_cloud_init`.
+  * A record whose target has no reachable address is **withheld from the guest
+    and reported to World** as a non-healthy verdict, never written silently.
+    That direction is deliberate: "the mesh gate withheld facts that never
+    reached World" is a defect this repo already paid for once.
+  * **The CONTAINER half is NOT wired.** `compute/hosts.py::container_hosts` is
+    built and unit-tested and is called by NOTHING in `src/` -- verified, not
+    inferred: its only non-docstring reference outside its own definition is
+    `tests/test_compute/test_hosts.py`. Containers odin launches get no
+    `--add-host` from a route53 record today.
+
+That last clause is the one to keep explicit. "route53 works" heard as covering
+both substrates is the claim that would have to be retracted, and hosts-file
+injection is indistinguishable from DNS to a user until they try `dig` from the
+Mac or reach for a container.
+
+(This paragraph carried a KNOWN EXPIRY while the resolution layer was unwired,
+and the expiry has now FIRED for the VM half. It is still armed for the
+container half: when `container_hosts` gains a caller, the fourth bullet above
+is what has to change, in that same commit.)
 
 That stated, the module is real in the way that matters for the gateway's job:
 without it a single `aws_route53_zone` in a generated project fails the user's
@@ -53,10 +81,18 @@ The ten operations, with the method + requestUri MEASURED from
   ListTagsForResource      GET    /2013-04-01/tags/{ResourceType}/{ResourceId}
 
 Note the two pairs that differ ONLY by method (`/hostedzone` create vs list,
-`/tags/...` write vs read) and the ONE pair that differs only by a TRAILING
-SLASH: `ChangeResourceRecordSets` is `.../rrset/` and `ListResourceRecordSets`
-is `.../rrset`. That asymmetry is real, it is in the captured bytes, and it is
-why `classify.py`'s route table anchors every pattern with `$`.
+`/tags/...` write vs read), which is why `classify.py`'s route table anchors
+every pattern with `$`.
+
+The trailing slash on `.../rrset/` in that table is REAL but not RELIABLE, and
+the difference cost an apply before it was measured. boto3 sends the slash on
+ChangeResourceRecordSets because botocore's `requestUri` has it; the terraform
+provider (5.100.0, on aws-sdk-go-v2) sends `.../rrset` with no slash and got
+`unmappable-action` -> a 403 that failed the record after the zone had already
+been created. `classify.py` accepts both spellings now, and its own comment
+carries the measurement. The lesson generalises past this module: a wire fact
+captured from botocore is a fact about BOTO3, not about every SDK that will
+call odin.
 
 THE HANG RISK, AND WHAT WAS AND WAS NOT MEASURED ABOUT IT
 ---------------------------------------------------------
@@ -176,15 +212,29 @@ CHANGE_ACTIONS = frozenset({"CREATE", "DELETE", "UPSERT"})
 AUTO_TYPES = frozenset({"SOA", "NS"})
 
 # A fixed delegation set. Real Route 53 allocates four name servers per zone;
-# odin fabricates a stable four so `aws_route53_zone.name_servers` round-trips
-# without drift. They resolve nothing -- see the module docstring.
+# odin fabricates a stable four so `aws_route53_zone.name_servers` and
+# `primary_name_server` round-trip without drift. They resolve nothing -- see
+# the module docstring.
+#
+# THE DELEGATION SET CARRIES NO `Id`, AND THAT IS MEASURED, NOT AN OMISSION.
+# Real Route 53 returns `DelegationSet.Id` only for a zone created against a
+# REUSABLE delegation set; an ordinary zone gets name servers and no id. The
+# first cut of this module fabricated one, and a real `tofu plan` right after a
+# clean `tofu apply` came back exit 2:
+#
+#     - delegation_set_id = "N-odin-delegation-set" -> null # forces replacement
+#
+# -- the config never sets `delegation_set_id`, so reading one back is drift,
+# and because it FORCES REPLACEMENT it cascaded: the zone was replaced, its
+# `zone_id` became unknown, and the record was replaced too. A zero-drift plan
+# after an apply is the whole bar for a control-plane model, and one fabricated
+# optional field missed it.
 NAME_SERVERS = (
     "ns-1.odin-dns.internal",
     "ns-2.odin-dns.internal",
     "ns-3.odin-dns.internal",
     "ns-4.odin-dns.internal",
 )
-DELEGATION_SET_ID = "N-odin-delegation-set"
 
 DEFAULT_SOA_TTL = 900
 DEFAULT_NS_TTL = 172800
@@ -309,10 +359,7 @@ def _zone_xml(record: dict, count: int) -> str:
 
 def _delegation_set_xml() -> str:
     servers = "".join(_elem("NameServer", ns) for ns in NAME_SERVERS)
-    return _wrap(
-        "DelegationSet",
-        _elem("Id", DELEGATION_SET_ID) + _wrap("NameServers", servers),
-    )
+    return _wrap("DelegationSet", _wrap("NameServers", servers))
 
 
 def _change_info_xml(change: dict) -> str:
@@ -580,6 +627,49 @@ def _rrset_from_wire(wire: dict) -> dict:
     }
 
 
+def _alias_conflict(record: dict) -> str | None:
+    """The reason an ALIAS record set is malformed, or None.
+
+    An alias record routes to another AWS resource, so it carries `AliasTarget`
+    INSTEAD OF the `TTL`/`ResourceRecords` pair, never as well. MEASURED from
+    AWS's own documentation, carried in botocore's `route53` service model:
+
+        ResourceRecords  "If you're creating an alias resource record set,
+                          omit ResourceRecords"
+        TTL              "If you're creating or updating an alias resource
+                          record set, omit TTL"
+
+    Note TTL is in scope too, which is easy to miss when thinking of this as
+    "AliasTarget vs ResourceRecords".
+
+    NOT measured, and worth separating: that real Route 53 REJECTS the
+    combination rather than ignoring the extra fields. The docs say "omit"; a
+    teammate driving the real provider reports a rejection. Refusing is the
+    honest choice either way -- storing a shape AWS documents as invalid makes
+    odin round-trip a record real AWS would not have accepted, and `_rrset_from_wire`
+    parses the two branches INDEPENDENTLY, so without this the store really can
+    hold a record that is both at once and no reader can tell which field wins.
+
+    NAMES THE FIELD TO REMOVE. "Invalid" alone leaves a user guessing that
+    dropping `ResourceRecords` rather than `AliasTarget` is the fix."""
+    if not record.get("alias"):
+        return None
+    offending = [
+        name for name, present in
+        (("ResourceRecords", bool(record.get("values"))), ("TTL", record.get("ttl") is not None))
+        if present
+    ]
+    if not offending:
+        return None
+    return (
+        f"[name='{fqdn(record['name'])}', type='{record['type']}'] is an alias resource record "
+        f"set (it carries AliasTarget) and must not also carry "
+        f"{' or '.join(offending)} -- remove {' and '.join(offending)}, or remove AliasTarget "
+        f"if this was meant to be an ordinary record. Route 53 takes the TTL and the target from "
+        f"the aliased resource."
+    )
+
+
 def _apply_change(current: list[dict], action: str, incoming: dict) -> tuple[list[dict], str | None]:
     """`current` with one change applied, or the reason it cannot be.
 
@@ -636,6 +726,9 @@ def _change_resource_record_sets(payload: dict, resource: str, env: str, stores:
             )
         if not incoming["name"]:
             return _invalid_change_batch("Every ResourceRecordSet requires a Name")
+        conflict = _alias_conflict(incoming)
+        if conflict is not None:
+            return _invalid_change_batch(conflict)
         working, reason = _apply_change(working, action, incoming)
         if reason is not None:
             return _invalid_change_batch(reason)

@@ -319,6 +319,108 @@ def instance_membership_path(root: Path, env: str, host_id: str) -> Path:
     return instance_config_path(root, env, host_id).with_name("membership.json")
 
 
+# --- route53 on a VM: the four answers, and why silence is not one of them ---
+#
+# `push_hosts` returns the first three; `HOSTS_NO_MESH` is the resolver's, for
+# the case where there is nothing to push BECAUSE no resolvable address exists.
+#
+# That fourth value is the one that earns this block. A VM cannot reach another
+# VM's vzNAT `private_ip` at all -- stock Lima `vz` NATs each VM into its own
+# address space and a raw ping between two of them is 100% loss, before nebula
+# is involved (`fabric/nebula.py`'s R5 note, confirmed live). So the only
+# address that works VM-to-VM is the Nebula OVERLAY one, and an env with no
+# mesh has none to give. Withholding the entry is therefore CORRECT -- writing
+# `private_ip` into that VM's /etc/hosts would produce a name that resolves and
+# then never connects, which is worse than one that does not resolve.
+#
+# But withholding cannot be the WHOLE story, and that is this repo's own
+# scar tissue: honesty rule 1 lists "the mesh gate withheld facts that never
+# reached World" as one of four guards that silently never fired. A withheld
+# entry that nobody is told about is indistinguishable from a working one until
+# someone's connection fails. So the resolver reports this verdict, and
+# `reconcile/tf_status.py` (owned elsewhere) projects it as a non-healthy phase
+# carrying `hosts_reason` verbatim.
+HOSTS_UNCHANGED = "unchanged"
+HOSTS_PUSHED = "pushed"
+HOSTS_FAILED = "failed"
+HOSTS_NO_MESH = "no_mesh"
+# A name that could not be resolved for a reason OTHER than a missing mesh --
+# it points at no instance, at two, or carries several addresses. The resolver
+# (`compute/hosts.py`) has already produced the exact sentence for each, so
+# this action carries THOSE rather than a template of its own.
+#
+# It exists because the alternative was reporting every unresolvable name as
+# `no_mesh`, which is a FALSE reason: a record pointing at a terminated
+# instance in a fully-meshed env would have been explained as "this
+# environment has no mesh". A wrong reason is worse than a generic one --
+# it sends the reader to fix something that is not broken.
+HOSTS_UNRESOLVABLE = "unresolvable"
+
+_HOSTS_HEALTHY = (HOSTS_UNCHANGED, HOSTS_PUSHED)
+
+# Keyed on the OUTCOME, never initialised optimistically -- honesty rule 2's
+# "what finally worked" for `/destroy` after four rounds. An action this map
+# does not know falls through to a failure that NAMES the unknown action,
+# rather than inheriting a success it was never granted.
+_HOSTS_REASON = {
+    HOSTS_FAILED: (
+        "odin could not write this instance's /etc/hosts, so {names} still "
+        "resolve to whatever the VM last had (or to nothing)"
+    ),
+    HOSTS_NO_MESH: (
+        "{names} cannot be resolved on this instance: the record points at another "
+        "EC2 instance, a VM can only reach another VM over the Nebula overlay "
+        "(a VM-to-VM vzNAT address is 100% loss), and this environment has no "
+        "mesh. Draw the instances into a VPC so the env gets one, or reach the "
+        "target from a container instead"
+    ),
+    # The resolver's own sentences, verbatim. Nothing is re-derived here: it
+    # already knows exactly why each name failed, and re-deciding would make
+    # two components answer the same question from different inputs.
+    HOSTS_UNRESOLVABLE: "{details}",
+}
+
+
+@dataclass(frozen=True)
+class HostsVerdict:
+    """What really happened to one VM's route53 entries, in a form
+    `reconcile/tf_status.py` can project without re-deriving anything.
+
+    `names` is what could NOT be made to resolve -- empty on the healthy
+    actions. It is carried rather than recomputed so the projection and the
+    substrate can never disagree about which names are affected."""
+
+    vm: str
+    action: str
+    names: tuple[str, ...] = ()
+    # Per-name sentences from `compute/hosts.py`, carried rather than
+    # regenerated. Only `HOSTS_UNRESOLVABLE` uses them.
+    details: tuple[str, ...] = ()
+
+    @property
+    def healthy(self) -> bool:
+        return self.action in _HOSTS_HEALTHY
+
+    @property
+    def reason(self) -> str:
+        """Empty when healthy; otherwise names the resource, what is still
+        standing, and the real cause. Never empty for a non-healthy action --
+        an unmapped action reports ITSELF as the bug rather than passing."""
+        if self.healthy:
+            return ""
+        template = _HOSTS_REASON.get(
+            self.action,
+            "odin reported an unrecognised route53 hosts outcome ({action!r}) for this "
+            "instance, so it cannot say whether {names} resolve",
+        )
+        listed = ", ".join(self.names) or "its route53 names"
+        # `details` falls back to the name list rather than rendering empty:
+        # a reason slot with nothing in it is the dangling-colon failure
+        # `_failure_reason` exists to prevent, one layer up.
+        detailed = "; ".join(self.details) or f"{listed} could not be resolved"
+        return template.format(names=listed, action=self.action, details=detailed)
+
+
 @dataclass(frozen=True)
 class NebulaJoin:
     """What `InstanceVm.boot` needs to land THIS instance's cert+config onto

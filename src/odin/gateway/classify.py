@@ -949,15 +949,29 @@ def _classify_lambda(method: str, path: str, body: bytes) -> tuple[str, str] | N
 # per operation off botocore's own `route53` model and confirmed against
 # captured request bytes -- not remembered.
 #
-# TWO collisions this anchoring is load-bearing for, both real:
-#   * `/2013-04-01/hostedzone` is CreateHostedZone on POST and ListHostedZones
-#     on GET; `/2013-04-01/tags/{type}/{id}` is Change on POST and List on GET.
-#     Method alone separates those.
-#   * `ChangeResourceRecordSets` is `.../rrset/` WITH a trailing slash and
-#     `ListResourceRecordSets` is `.../rrset` WITHOUT one. That asymmetry is in
-#     the captured bytes, and an unanchored pattern would let the list route
-#     swallow the change route (or the reverse), which is a WRITE classified as
-#     a READ -- a policy hole rather than a 404.
+# THE COLLISION this anchoring is load-bearing for: `/2013-04-01/hostedzone` is
+# CreateHostedZone on POST and ListHostedZones on GET, and
+# `/2013-04-01/tags/{type}/{id}` is Change on POST and List on GET. METHOD is
+# what separates each pair, so the paths must not be allowed to overlap further.
+#
+# THE TRAILING SLASH ON `/rrset` IS OPTIONAL, AND THAT IS A MEASURED CORRECTION
+# RATHER THAN A CONVENIENCE. botocore's `requestUri` for ChangeResourceRecordSets
+# really is `.../rrset/` WITH a slash while ListResourceRecordSets is `.../rrset`
+# without one, and boto3 puts exactly that on the wire -- so the first cut of
+# this table required the slash on the write route. The REAL terraform provider
+# does not send it. Measured, driving a real `tofu apply` (provider 5.100.0,
+# which uses aws-sdk-go-v2, not botocore) against this gateway:
+#
+#     POST /2013-04-01/hostedzone/odin.internal/rrset   -> UNMAPPABLE
+#     Error: creating Route53 Record: ... StatusCode: 403,
+#       api error AccessDenied: User is not authorized to perform: unmappable-action
+#
+# The zone had already been created; the record killed the apply. Two SDKs spell
+# the same operation differently, and modelling only the one that is easy to
+# capture from python is how a service passes its own tests and then fails the
+# only client that matters. Accepting both spellings costs nothing here: the two
+# rrset routes differ by METHOD, so no widening of the path can make them
+# collide, and each is still `$`-anchored against every other route.
 #
 # `{zone}` is a hosted zone id, and deviation 1 in `models/route53ctl.py` is
 # what makes it the thing an IAM policy is written against: the zone id IS the
@@ -969,8 +983,8 @@ _ROUTE53_ROUTES: tuple[tuple[str, re.Pattern[str], str], ...] = (
     ("GET", re.compile(r"^/2013-04-01/hostedzonesbyname$"), "ListHostedZonesByName"),
     ("GET", re.compile(r"^/2013-04-01/hostedzone/(?P<zone>[^/]+)$"), "GetHostedZone"),
     ("DELETE", re.compile(r"^/2013-04-01/hostedzone/(?P<zone>[^/]+)$"), "DeleteHostedZone"),
-    ("POST", re.compile(r"^/2013-04-01/hostedzone/(?P<zone>[^/]+)/rrset/$"), "ChangeResourceRecordSets"),
-    ("GET", re.compile(r"^/2013-04-01/hostedzone/(?P<zone>[^/]+)/rrset$"), "ListResourceRecordSets"),
+    ("POST", re.compile(r"^/2013-04-01/hostedzone/(?P<zone>[^/]+)/rrset/?$"), "ChangeResourceRecordSets"),
+    ("GET", re.compile(r"^/2013-04-01/hostedzone/(?P<zone>[^/]+)/rrset/?$"), "ListResourceRecordSets"),
     ("GET", re.compile(r"^/2013-04-01/change/(?P<change>[^/]+)$"), "GetChange"),
     ("POST", re.compile(r"^/2013-04-01/tags/hostedzone/(?P<zone>[^/]+)$"), "ChangeTagsForResource"),
     ("GET", re.compile(r"^/2013-04-01/tags/hostedzone/(?P<zone>[^/]+)$"), "ListTagsForResource"),
