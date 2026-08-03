@@ -136,6 +136,22 @@ graph TD
 
 A real virtual machine, not a container pretending. Security groups gate **overlay traffic only** — the same VM whose overlay packet was just dropped can still reach the internet over vzNAT, which is stated rather than implied.
 
+### EBS
+
+`limactl disk — a real block device in the VM's additionalDisks:`
+
+```mermaid
+graph TD
+  B["ebs node"] -->|"aws_ebs_volume"| G["gateway ec2compute"]
+  G --> D["limactl disk<br/>odin-ebs-env-id"]
+  V["volume edge to an ec2 node"] -->|"aws_volume_attachment"| G
+  G -->|"stop · rewrite additionalDisks · start"| VM["the VM REBOOTS"]
+  VM --> BD["/dev/vdb in the guest<br/>ext4, mounted at /mnt/lima-name"]
+```
+
+Lima has no attach verb and refuses `limactl edit` on a live instance, so an attachment is **stop, rewrite, start** — a real reboot, and the instance reads `pending`/`starting` for its duration rather than going on claiming `running`. `device_name` is advisory: `/dev/sdf` goes in, `/dev/vdb` comes out, Lima formats and mounts it by NAME, and the cidata ISO shifts along. Address the disk by its mount point, never by its letter.
+
+
 ### VPC · Subnet · Security Group
 
 `Nebula — a network per env, compiled firewall rules`

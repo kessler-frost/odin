@@ -277,6 +277,20 @@ describe('the counts in docs/limits.md are measured, not written', () => {
     expect(LIMITS).toContain(`\`unmodelled\` — ${unmodelled} of the ${total} unordered`);
   });
 
+  it('states it EXACTLY ONCE, so a merge cannot leave two contradictory counts', () => {
+    // MEASURED FAILURE, v0.8.18: the kms/ebs three-way merge kept both sides of
+    // this bullet, so docs/limits.md carried `47 of the 378`/`331` AND
+    // `42 of the 378`/`336` four lines apart. The assertions above PASSED --
+    // `toContain` is satisfied by the true copy and never sees the false one.
+    // That is the same defect as the IAM record guard replaced this release: a
+    // substring check answers "does this appear" when the question is "is this
+    // what the file says".
+    const claims = LIMITS.match(/A drawn edge carries a modelled TYPE for only \d+ of the \d+ kind pairs/g) ?? [];
+    expect(claims.length).toBe(1);
+    const majority = LIMITS.match(/The honest majority answer is `unmodelled` — \d+ of the \d+ unordered/g) ?? [];
+    expect(majority.length).toBe(1);
+  });
+
   it('states the right per-type counts for the two it enumerates', () => {
     const { byType } = counts();
     expect(LIMITS).toContain(`\`iam\`\n  (${byType.iam} pairs, a real policy)`);

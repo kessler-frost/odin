@@ -311,3 +311,54 @@ async def test_chat_constructs_no_client_when_the_switch_is_off(monkeypatch, tmp
     assert result.canvas == canvas
     assert result.changes == []
     assert "ODIN_AI" in result.note
+
+
+# --- the one-caller invariant, which was PROSE -------------------------------
+#
+# `agent/chat.py`'s comment argues that chat needs no `ai.refuse_if_off()`
+# because `propose`'s `disabled_reason()` gate covers every path that can reach
+# the SDK -- and that argument holds "for one reason only: `_run_agent` has
+# exactly ONE caller". That is a load-bearing claim kept in a comment, which in
+# this repo is a claim that goes stale: the module-level inventory two functions
+# up said "exactly two" while there were three, and the thread inventory in
+# CLAUDE.md described a state that had not existed for a week. Prose cannot fail
+# a build, so the invariant is pinned here instead.
+#
+# Counted by AST for the same reason `_imports_the_sdk` is: a substring count of
+# "_run_agent" scores its own definition and the three comment lines that
+# discuss it, which is how you get a guard that passes at four callers.
+
+
+def _call_sites(path: Path, name: str) -> list[int]:
+    """Line numbers where `name` is CALLED -- not defined, not mentioned."""
+    tree = ast.parse(path.read_text())
+    return sorted(
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == name
+    )
+
+
+def test_run_agent_still_has_exactly_one_caller_or_chat_needs_the_boundary_check():
+    """The safety argument for chat having no `refuse_if_off` is reachability.
+
+    A second caller can reach `ClaudeSDKClient` without passing `propose`'s
+    `disabled_reason()`, which turns `ODIN_AI=0` from a guarantee into a
+    coincidence. If this fails, the fix is NOT to update the number: it is to
+    call `ai.refuse_if_off()` at the top of `_run_agent` and delete the comment's
+    one-caller clause.
+    """
+    callers = _call_sites(_SRC / "agent/chat.py", "_run_agent")
+    assert len(callers) == 1, (
+        f"_run_agent now has {len(callers)} call sites (lines {callers}). The comment in "
+        "agent/chat.py above the SDK half says one caller is what makes the missing "
+        "ai.refuse_if_off() safe -- add the boundary check rather than editing this number."
+    )
+
+
+def test_the_one_caller_is_reached_through_the_gate_that_is_claimed_to_cover_it():
+    """Names the gate, so deleting it fails here rather than silently."""
+    source = (_SRC / "agent/chat.py").read_text()
+    assert "disabled_reason()" in source, (
+        "agent/chat.py no longer calls disabled_reason() -- that IS chat's ODIN_AI gate"
+    )
