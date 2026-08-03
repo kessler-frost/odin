@@ -113,8 +113,12 @@ To regenerate this diagram after editing `docs/diagrams/*.mmd`:
   VPC, SG, IAM, ECR, Lambda and ECS have no open-source AWS API to borrow, so odin
   owns the model and binds it to a substrate.
 - **Translation** (`src/odin/agent/`) is deterministic in both directions and
-  covers the same NODE KINDS in both: canvas → Terraform builds 18, and
-  Terraform → canvas reads all 18 back across 24 resource types. Anything odin
+  no longer covers quite the same node kinds in both: canvas → Terraform
+  builds 20, and Terraform → canvas reads all 19 back across 28 resource types
+  that it models. The gap is `kms`, added in v0.8.18 — emitted and not yet
+  imported, so a project carrying an `aws_kms_key` does not round-trip through
+  the canvas. Stated rather than rounded away, because "both directions" was
+  true for eleven releases and is the sort of claim a reader keeps believing. Anything odin
   does not model is a LISTED unsupported entry rather than a silent omission.
   Equal node coverage is **not lossless**, and what it costs is listed rather
   than discovered: a security group's IPv6 rules and any port that is not a

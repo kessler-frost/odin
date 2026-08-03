@@ -1612,6 +1612,79 @@ machine-wide-sweep rule already in CLAUDE.md. A test-owned env is invisible to
 every check a human would think to run; the only safe rule is to touch nothing
 while a suite is running.
 
+## v0.8.18 — `ebs` stops being a placeholder: a drawn disk is a real block device on a real VM
+
+**Service-coverage scoping starts here.** Ten catalog tiles were unbackable
+placeholders, filtered out of the palette so nobody could drag one. `ebs` was
+picked first because it was the most clearly reachable — the tile's fields
+were already `az` and `size`, an exact match for `aws_ebs_volume` — and
+because it is the one whose substrate could be PROVED rather than modelled.
+It now emits `aws_ebs_volume` + `aws_volume_attachment`, imports both back,
+answers `CreateVolume`/`AttachVolume`/`DetachVolume`/`DeleteVolume` beside the
+`DescribeVolumes` that was already there, and behind all of it there is a real
+`limactl disk` volume in a real Lima VM's `additionalDisks:`.
+
+**The proof is `lsblk` inside the guest, not a model value.** A
+`DescribeVolumes` that returns what odin itself wrote proves the store
+round-trips and nothing else, so `tests/simulate/test_ebs_volume_e2e.py`
+boots a real VM through the real gateway handlers and asks the machine. It
+passes in 72s, and the answer it reads is:
+
+```
+lsblk before attach: vda (10GiB, root)  |  vdb 281729024 → /mnt/lima-cidata
+lsblk after attach:  vda (10GiB, root)  |  vdb 3221225472 → vdb1 → /mnt/lima-odin-ebs-…
+                                        |  vdc 281729024 → /mnt/lima-cidata
+```
+
+**Three divergences from AWS, each measured before the code was written and
+each written into `docs/limits.md` in measured terms:**
+
+- **There is no hot-attach, so `AttachVolume` REBOOTS the instance.** `limactl
+  disk` has no attach verb at all, and `limactl edit` on a live instance is
+  `fatal msg="cannot edit a running instance"`, exit 1 — with the guest's
+  block devices byte-identical before and after the attempt. So odin stops the
+  VM, rewrites `additionalDisks`, and starts it. It does not refuse (refusing
+  would make every `aws_volume_attachment` fail) and it does not hide it: the
+  instance moves to `pending`/`starting` for the duration instead of going on
+  claiming `running`, because during the reboot it is not running.
+- **`device_name` is advisory.** `/dev/sdf` goes in because that is what the
+  provider writes; `/dev/vdb` is what the guest reports, Lima formats and
+  mounts it itself at `/mnt/lima-<disk>`, and the cidata ISO is shoved from
+  `vdb` to `vdc` by the arriving volume. **The e2e caught this in its own
+  first draft** — it diffed device NAMES, found `vdc`, and failed on the ISO,
+  which is the best available argument that the limits entry is worth having.
+  Volumes are ordered by id and held stable, so adding a second disk cannot
+  renumber a mounted one.
+- **A volume that outlives its env is a disk leak, so both teardown paths
+  sweep the MACHINE and not just the store.** `limactl disk delete` refuses a
+  disk an instance still holds (`in use by instance`, exit 1), so `/destroy`
+  deletes VMs first and disks second, and a disk that will not go is named
+  rather than skipped — `reclaim_env_disks` answers with the same
+  `VolumeReclaim` three-way (`reclaimed`/`standing`/`unknown`) the docker
+  reclaim already used, and neither `/destroy` nor `odin env rm` reports
+  success over one. The sweep is scoped to `odin-ebs-<env>-` and finds a disk
+  whose record was lost, which the store alone never could.
+
+**Two silent breakages of the REAL provider, found by asking what
+`aws_volume_attachment` actually polls rather than what odin would like to
+answer.** Its waiter reads `Attachments[0].State` from a DescribeVolumes
+filtered on `volume-id` AND `attachment.instance-id` AND
+`attachment.device`, with `attaching` as its one pending value. odin
+would have answered nothing useful to either half: `_matches` requires
+EVERY named filter to match, so `attachment.device` being unmodelled does
+not narrow a result — it EMPTIES it; and an `attaching` volume rendered an
+empty `<attachmentSet/>`, leaving the waiter no attachment to read. Both
+would have looked like a hung apply on a volume that had already attached.
+Modelled and mutation-tested.
+
+**15 of 15 mutants killed** across the attach verification, the reclaim
+sweep, the terminate-frees-volumes rule, the provider waiter and the World
+projection. One SURVIVED first time and is the more useful result: the
+projection's record guard was a field sniff whose two halves were each
+already redundant, and the test's witness was excluded by the other half — so
+loosening it killed nothing. It now keys on the `volume:` store prefix, the
+fact that actually distinguishes the records, and the mutant dies.
+
 ## v0.8.17 — egress enforced and MEASURED, port ranges round-trip, and three tests that were never really waiting
 
 **A drawn egress rule is now proven to block on a real EC2 Lima VM.** v0.8.17
@@ -1849,6 +1922,17 @@ run and are not described as such.
      "this is encrypted where it lives" rather than "AWS would encrypt this".
      If that is not built, kms is dropped with the other three.
 
+- [ ] **odin's OWN output does not re-import cleanly for two companions.**
+  Measured 2026-08-02 while adding `ebs`, and it long predates it: a canvas
+  with an `alb → ec2` target plus a granted `ec2` generates a file whose
+  `aws_iam_instance_profile` and `aws_lb_target_group_attachment` both come
+  back `unsupported` on import. `test_odins_own_project_now_round_trips_with_
+  nothing_unsupported` does not catch it because its canvas contains neither,
+  which is the more interesting half: the guard is real, its FIXTURE is
+  narrower than the generator. Fixing it means teaching `import_tf` those two
+  companion types (instance profile folds onto the ec2 node; the target-group
+  attachment is already an alb↔ec2 edge) and widening that canvas so the gap
+  cannot reopen.
 
 - [ ] **A fake runtime does not isolate `/apply-full`, so a "unit" test boots real
   containers.** Measured 2026-07-29, after it leaked four containers into every

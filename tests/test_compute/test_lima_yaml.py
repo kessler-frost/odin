@@ -69,6 +69,29 @@ def test_no_shared_network_by_default():
     assert "networks" not in parsed
 
 
+def test_no_additional_disks_by_default_but_the_key_is_always_present():
+    """Always emitted, empty or not, like `mounts`. `InstanceVm.set_disks`
+    REPLACES this key wholesale on every attach, so a document whose shape
+    depended on whether a disk existed at birth would make the birth path and
+    the attach path disagree about what a diskless VM looks like."""
+    config = VmConfig(cpus=1, memory="1GiB", disk="10GiB")
+    parsed = yaml.safe_load(generate_lima_yaml(config))
+    assert parsed["additionalDisks"] == []
+
+
+def test_additional_disks_use_limas_own_dict_form():
+    """MEASURED against real limactl 2.1.3 and a real vz VM (2026-08-02):
+    this exact document shape gives the guest a 3GiB `/dev/vdb`, partitioned
+    and mounted by Lima at `/mnt/lima-<name>`. The dict spelling is the one
+    probed live, not the bare-string shorthand."""
+    config = VmConfig(cpus=1, memory="1GiB", disk="10GiB")
+    parsed = yaml.safe_load(generate_lima_yaml(config, disks=["odin-ebs-e1-vol-a", "odin-ebs-e1-vol-b"]))
+    assert parsed["additionalDisks"] == [
+        {"name": "odin-ebs-e1-vol-a"},
+        {"name": "odin-ebs-e1-vol-b"},
+    ]
+
+
 def test_nebulas_port_is_never_forwarded_to_the_host():
     """W2.6, found live: Lima forwards every guest listener to the host's
     127.0.0.1, so a VM's `nebula` daemon made `limactl` hold UDP

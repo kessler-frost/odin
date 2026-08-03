@@ -2035,6 +2035,35 @@ def _rds(res: ResourceDesired, refs: Refs) -> Built:
     }, nested
 
 
+# v0.8.18: EBS volumes -- one `aws_ebs_volume` per ebs node, plus an
+# `aws_volume_attachment` companion per ebs<->ec2 edge (the attachment pass at
+# the bottom of `generate_tf`). The substrate is a real `limactl disk` attached
+# to the instance's Lima VM (`compute/`).
+#
+# `type = "gp3"` is FIXED and is NOT a canvas field. The tile authors exactly
+# three (`label`, `az`, `size` -- ui/src/lib/catalog.ts), so a `type` argument
+# read from the canvas would be a field nothing can set; and a `limactl disk`
+# has no volume type at all, so any value but one would be a claim odin cannot
+# back. It is registered in `import_tf._FIXED_VALUES` instead, which is what
+# makes an imported `type = "io2"` a reported CHANGED argument rather than a
+# silent substitution.
+_DEFAULT_EBS_AZ = "us-east-1a"
+_DEFAULT_EBS_SIZE = "10"
+_EBS_VOLUME_TYPE = "gp3"
+_BAD_EBS_SIZE = "size must be a whole number of GiB (e.g. 10)"
+
+
+def _ebs(res: ResourceDesired, refs: Refs) -> Built:
+    size = _field(res, "size", _DEFAULT_EBS_SIZE).strip()
+    if not size.isdigit():
+        return _BAD_EBS_SIZE
+    return {
+        "availability_zone": quote(_field(res, "az", _DEFAULT_EBS_AZ)),
+        "size": size,
+        "type": quote(_EBS_VOLUME_TYPE),
+    }, ""
+
+
 # kind -> terraform resource type; kept separate from _BUILDERS so pass 1 of
 # generate_tf can assign HCL names (scoped per resource type) without running
 # any builder.
@@ -2058,6 +2087,7 @@ _TF_TYPES = {
     "rds": "aws_db_instance",
     "alb": "aws_lb",
     "kms": "aws_kms_key",
+    "ebs": "aws_ebs_volume",
 }
 
 _BUILDERS = {
@@ -2080,6 +2110,7 @@ _BUILDERS = {
     "rds": _rds,
     "alb": _alb,
     "kms": _kms,
+    "ebs": _ebs,
 }
 
 # W2.5: which canvas kinds can actually BE an ALB target. An ECS service
@@ -2104,6 +2135,77 @@ _ALB_NO_LAMBDA = (
     "translation is the same shim an apigateway → lambda route needs and is deliberately built "
     "once, there, rather than twice"
 )
+
+
+# v0.8.18: which canvas kinds a VOLUME can be attached to. `ec2` alone, because
+# it is the only kind odin runs as a machine with a disk controller -- an ebs
+# node edged to a lambda or an ecs service would author an attachment nothing
+# could perform, the same rule `_SG_MEMBERS` and `_ROLE_HOLDERS` hold one file
+# over. Mirrored by `ui/src/lib/iam.ts::volumeHostTypes`, and
+# `tests/spec/test_edge_registry_matches_builders.py` fails the build if the two
+# sides ever disagree -- the same cross-language ratchet `_ALB_TARGET_KINDS` has.
+_VOLUME_HOST_KINDS = ("ec2",)
+
+# The device names odin hands out, in order. Real AWS REJECTS two attachments
+# claiming the same device on one instance, so the name is assigned by the
+# volume's POSITION in the sorted list of that instance's attached volumes:
+# deterministic, and stable when an unrelated volume on the same instance is
+# declined. `/dev/sd[f-p]` is the conventional range for extra volumes on a
+# Linux instance; a 12th volume is declined BY NAME rather than silently reusing
+# a device that the provider (or Amazon) would then reject for the whole apply.
+#
+# `device_name` IS ADVISORY, and that is measured rather than assumed. On real
+# Lima 2.1.3 (2026-08-02) the guest names an extra disk `/dev/vdb` (virtio),
+# auto-partitions it `vdb1` ext4 and auto-mounts it at `/mnt/lima-<disk>`; adding
+# that disk also SHIFTS the cloud-init `cidata` ISO from `vdb` to `vdc`. Device
+# letters inside the guest are therefore positional and not a contract: odin does
+# NOT honour `/dev/sdf`, and nothing here may claim it does. What the argument is
+# for is Terraform itself -- `aws_volume_attachment.device_name` is required, and
+# it must be unique per instance. It is also what the provider's own attachment
+# WAITER filters DescribeVolumes on (`attachment.device`), so the string emitted
+# here has to be the string `AttachVolume` was sent -- there is exactly one
+# source for it (this tuple), and nothing normalises, lowercases or defaults it
+# on the way out.
+#
+# THE RESIDUAL, MEASURED, because a positional scheme cannot be fully stable and
+# pretending otherwise would be the caveat-that-outlives-its-fix bug in advance.
+# `device_name` is ForceNew: measured against OpenTofu 1.12.3 with a real state
+# file, changing it prints `~ device_name = "/dev/sdf" -> "/dev/sdg" # forces
+# replacement` and `Plan: 1 to add, 0 to change, 1 to destroy` -- a detach and
+# reattach of a LIVE disk. And the slot is positional, so adding a volume whose
+# label sorts EARLIER renumbers every later volume on that instance: measured,
+# adding `archive` to an instance holding `data` (/dev/sdf) and `logs`
+# (/dev/sdg) moves them to /dev/sdg and /dev/sdh. Both existing disks are
+# therefore detached and reattached by a change that had nothing to do with them.
+#
+# It is kept anyway, and the reasoning is worth writing down so nobody "fixes" it
+# into something worse. `generate_tf` is a pure function of the canvas with no
+# memory of the last apply, and the pool has 11 slots, so NO assignment rule can
+# be insertion-stable -- hashing the label into a slot merely makes the
+# renumbering rarer and unpredictable instead of rare and explainable. The real
+# fixes are a canvas field the tile does not have, or reading the live
+# attachment back, and both are larger than this pass. Until then the honest
+# thing is that this is stated here, pinned by
+# `test_hcl_ebs.py::test_adding_an_earlier_sorting_volume_renumbers_the_others`,
+# and named in docs/limits.md rather than discovered during an apply.
+_EBS_DEVICE_NAMES = tuple(f"/dev/sd{letter}" for letter in "fghijklmnop")
+
+
+def _too_many_volumes(volume_id: str, instance_id: str) -> str:
+    return (
+        f"{volume_id} (ebs): {instance_id} already holds {len(_EBS_DEVICE_NAMES)} volumes and odin "
+        f"assigns device names from {_EBS_DEVICE_NAMES[0]} to {_EBS_DEVICE_NAMES[-1]}, so there is "
+        "none left — the aws_ebs_volume is emitted UNATTACHED and no aws_volume_attachment is "
+        "generated for it. Move it to another instance, or detach one of the others"
+    )
+
+
+def _volume_already_attached(volume_id: str, instance_id: str, holder: str) -> str:
+    return (
+        f"{volume_id} (ebs): a second attachment edge, to {instance_id} — a gp3 volume attaches to "
+        f"exactly one instance (and the substrate, a limactl disk, to exactly one VM), so only the "
+        f"attachment to {holder} is emitted. Multi-attach would fail at apply, not here"
+    )
 
 
 def _alb_target_unsupported(alb_id: str, target_id: str, kind: str) -> str:
@@ -2667,6 +2769,58 @@ def generate_tf(stack: Stack) -> TfProject:
                 },
             )
             blocks.append((("aws_lb_target_group_attachment", f"{res.id}.{target_id}"), attachment))
+
+    # v0.8.18: VOLUME ATTACHMENTS. An ebs node and an ec2 node joined by an edge
+    # is a volume attachment, and the edge is the ONLY thing that can say which
+    # instance -- an `aws_ebs_volume` on its own attaches to nothing, so an ebs
+    # node with no edge stays a real, free-standing `available` volume.
+    #
+    # KEYED ON THE TWO NODE KINDS AND NEVER ON `edge.kind`, for the reason the
+    # EDGE-AUTHORED FIELDS note at the top of this module gives -- and here the
+    # cost of getting that wrong is the worst in the file: every canvas saved
+    # before the edge-type registry carries `kind: "network"`, so gating on the
+    # type name would drop the attachment from the generated HCL and make the
+    # next `tofu apply` DETACH a disk that has data on it. Direction is not
+    # significant either (`_kind_pair_edges` reads both), because which end the
+    # user started the drag from carries no meaning.
+    #
+    # `built_ids` gates the emission for the reason pass 2 records: an attachment
+    # naming an `aws_instance` or an `aws_ebs_volume` that pass 2 declined is an
+    # unresolvable reference, which fails `tofu plan` for the WHOLE project. The
+    # declined node's own entry in `unsupported` already names the cause, so
+    # nothing is lost silently here.
+    attached_to: dict[str, str] = {}
+    for instance_id, volume_ids in sorted(
+        _kind_pair_edges(stack, by_id, _VOLUME_HOST_KINDS, ("ebs",)).items()
+    ):
+        # The SLOT is the volume's position among ALL of this instance's attached
+        # volumes, built or not, so declining one (a non-numeric size) does not
+        # renumber the devices of the others -- a renumbering tofu would apply as
+        # a detach-and-reattach of live disks.
+        for slot, volume_id in enumerate(sorted(volume_ids)):
+            holder = attached_to.setdefault(volume_id, instance_id)
+            if holder != instance_id:
+                unsupported.append(_volume_already_attached(volume_id, instance_id, holder))
+                continue
+            if slot >= len(_EBS_DEVICE_NAMES):
+                unsupported.append(_too_many_volumes(volume_id, instance_id))
+                continue
+            if instance_id not in built_ids or volume_id not in built_ids:
+                continue
+            volume_name, instance_name = hcl_name_by_id[volume_id], hcl_name_by_id[instance_id]
+            # Its own name namespace: `a_b` + `c` and `a` + `b_c` both compose to
+            # `a_b_c_attach`, and two attachments sharing an HCL name is a file
+            # that does not parse.
+            name = unique_name(
+                f"{volume_name}_{instance_name}_attach",
+                used_names.setdefault("aws_volume_attachment", set()),
+            )
+            attachment = _block("aws_volume_attachment", name, {
+                "device_name": quote(_EBS_DEVICE_NAMES[slot]),
+                "instance_id": f"aws_instance.{instance_name}.id",
+                "volume_id": f"aws_ebs_volume.{volume_name}.id",
+            })
+            blocks.append((("aws_volume_attachment", f"{volume_id}.{instance_id}"), attachment))
 
     blocks.sort(key=lambda b: b[0])
     main_tf = "\n\n".join([HEADER, provider_block(), *(text for _, text in blocks)]) + "\n"

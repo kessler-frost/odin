@@ -382,6 +382,7 @@ def test_the_kind_vocabulary_names_every_kind_the_canvas_can_author():
     the legacy one would make `odin chat` refuse an edge type that is sitting in
     every saved canvas on disk."""
     assert {"iam", "sg", "role", "target", "subscription", "connection", ENCRYPTION} <= EDGE_KINDS
+    assert {"iam", "sg", "role", "target", "subscription", "connection", "volume"} <= EDGE_KINDS
     assert UNMODELLED in EDGE_KINDS and LEGACY_UNMODELLED in EDGE_KINDS
     assert "ref" in EDGE_KINDS  # Edge.kind's own default
     # `<=` is a SUBSET check, so a kind added to `EDGE_KINDS` and forgotten here
@@ -389,5 +390,6 @@ def test_the_kind_vocabulary_names_every_kind_the_canvas_can_author():
     # landed. Pinning the whole set is what makes the test's own name true.
     assert EDGE_KINDS == {
         "iam", "sg", "role", "target", "subscription", "connection", ENCRYPTION,
+        "iam", "sg", "role", "target", "subscription", "connection", "volume",
         UNMODELLED, LEGACY_UNMODELLED, "ref",
     }

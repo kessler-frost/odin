@@ -89,7 +89,15 @@ from xml.sax.saxutils import escape
 from starlette.responses import Response
 
 from odin.aws.backings import ACCOUNT, REGION
-from odin.compute.instances import InstanceVm, NebulaJoin, membership_changed, vm_name
+from odin.aws.rds import VolumeReclaim
+from odin.compute.instances import (
+    InstanceVm,
+    NebulaJoin,
+    disk_name,
+    env_disk_prefix,
+    membership_changed,
+    vm_name,
+)
 from odin.compute.models import INSTANCE_TYPES, get_instance_type
 from odin.fabric.models import FirewallRules
 from odin.fabric.nebula import LighthouseManager, union_firewalls
@@ -430,17 +438,70 @@ def _state_change_xml(instance_id: str, previous: str, current: str) -> str:
     )
 
 
-def _volume_xml(volume: dict) -> str:
+# A volume's own lifecycle, as EBS spells it. `attaching`/`detaching` are not
+# decoration: attaching a disk on this substrate REBOOTS the instance
+# (`compute/instances.py::attach_disk` -- `limactl edit` refuses a running
+# instance, measured), which takes tens of seconds, so the transitional state
+# is the one a poller genuinely sees. `aws_volume_attachment` waits for
+# `attached`, which is exactly the right thing for it to wait for here.
+#
+# `attaching` IS in this set, and leaving it out would have broken the real
+# provider rather than merely under-reporting. `aws_volume_attachment`'s
+# waiter polls DescribeVolumes and reads `Attachments[0].State`, with
+# `attaching` as its one pending value -- an empty `attachmentSet` during the
+# reboot gives it no attachment to read at all. AWS reports the attachment
+# from the moment the call is accepted, and so does this.
+_VOLUME_ATTACHED = {"attaching", "in-use", "detaching"}
+
+# volume state -> the ATTACHMENT's own status, which is a different vocabulary
+# (`in-use` is a volume; `attached` is an attachment).
+_ATTACHMENT_STATUS = {"attaching": "attaching", "in-use": "attached", "detaching": "detaching"}
+
+
+def _volume_view(volume: dict) -> dict:
+    """One shape for BOTH volume families, so `_volume_xml` has no branch per
+    origin: the root volume nested on an instance record (minted by
+    `_run_instances`, six fields) and a standalone `volume:` record created by
+    `CreateVolume`. Defaults describe the root volume, because it is the one
+    that pre-dates the fields."""
+    attached = volume.get("instance_id") is not None
+    return {
+        **volume,
+        "state": volume.get("state") or ("in-use" if attached else "available"),
+        "volume_type": volume.get("volume_type") or "gp3",
+        "device": volume.get("device") or "",
+        "attach_time": volume.get("attach_time") or volume["create_time"],
+        # The root volume really IS deleted with its instance -- the whole VM
+        # goes. A volume created by `CreateVolume` is not: `aws_ebs_volume` is
+        # its own resource with its own lifecycle, and saying otherwise here
+        # would be a promise nothing keeps.
+        "delete_on_termination": volume.get("delete_on_termination", not volume.get("disk")),
+    }
+
+
+def _attachment_xml(view: dict) -> str:
+    if view["state"] not in _VOLUME_ATTACHED or not view.get("instance_id"):
+        return "<attachmentSet/>"
     return (
-        f"<volumeId>{volume['volume_id']}</volumeId><size>{volume['size']}</size>"
-        f"<availabilityZone>{escape(volume['availability_zone'])}</availabilityZone>"
-        f"<status>in-use</status><createTime>{volume['create_time']}</createTime>"
         "<attachmentSet><item>"
-        f"<volumeId>{volume['volume_id']}</volumeId><instanceId>{volume['instance_id']}</instanceId>"
-        f"<device>{volume['device']}</device><status>attached</status>"
-        f"<attachTime>{volume['create_time']}</attachTime><deleteOnTermination>true</deleteOnTermination>"
+        f"<volumeId>{view['volume_id']}</volumeId><instanceId>{view['instance_id']}</instanceId>"
+        f"<device>{escape(view['device'])}</device>"
+        f"<status>{_ATTACHMENT_STATUS[view['state']]}</status>"
+        f"<attachTime>{view['attach_time']}</attachTime>"
+        f"<deleteOnTermination>{'true' if view['delete_on_termination'] else 'false'}</deleteOnTermination>"
         "</item></attachmentSet>"
-        '<volumeType>gp3</volumeType><iops>3000</iops><encrypted>false</encrypted>'
+    )
+
+
+def _volume_xml(volume: dict) -> str:
+    view = _volume_view(volume)
+    return (
+        f"<volumeId>{view['volume_id']}</volumeId><size>{view['size']}</size>"
+        f"<availabilityZone>{escape(view['availability_zone'])}</availabilityZone>"
+        f"<status>{view['state']}</status><createTime>{view['create_time']}</createTime>"
+        f"{_attachment_xml(view)}"
+        f"<volumeType>{escape(view['volume_type'])}</volumeType>"
+        "<iops>3000</iops><encrypted>false</encrypted>"
     )
 
 
@@ -527,6 +588,10 @@ async def _finish_terminate(stores: SynthStores, env: str, instance_id: str, nam
         stores, env, instance_id, state_name="terminated", terminated_at=time.monotonic(),
         state_reason=None, delete_failed=False,
     )
+    # Only after the VM is really gone: while it exists it still HOLDS those
+    # disks, and a volume marked `available` over a disk limactl would refuse
+    # to delete is exactly the kind of record that turns into an orphan.
+    _release_instance_volumes(stores, env, instance_id)
     _maybe_stop_lighthouse(stores, env)
 
 
@@ -947,14 +1012,323 @@ async def _describe_instance_credit_specifications(params: dict[str, str], env: 
 async def _describe_volumes(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
     volume_ids = _scalars(params, "VolumeId")
     filters = _filters(params)
-    volumes = [i["root_volume"] for i in _records(stores, env, "instance")]
+    volumes = _all_volumes(stores, env)
     selected = [
         v for v in volumes
-        if (not volume_ids or v["volume_id"] in volume_ids)
-        and _matches(filters, {"volume-id": v["volume_id"], "attachment.instance-id": v["instance_id"]})
+        if (not volume_ids or v["volume_id"] in volume_ids) and _matches(filters, _volume_filter_attrs(v))
     ]
     items = "".join(f"<item>{_volume_xml(v)}</item>" for v in selected)
     return _response("DescribeVolumes", f"<volumeSet>{items}</volumeSet>")
+
+
+# --- EBS volumes: real `limactl disk` block devices --------------------------
+#
+# `aws_ebs_volume` + `aws_volume_attachment`, backed by a REAL Lima disk in a
+# REAL VM's `additionalDisks:` -- not a record that says `in-use`. What the
+# guest actually gets was measured before any of this was written (limactl
+# 2.1.3, vz, 2026-08-02; the full probe output is in `docs/limits.md`):
+# `/dev/vdb`, partitioned `vdb1` ext4, mounted by Lima at `/mnt/lima-<disk>`.
+#
+# THE ONE DIVERGENCE THAT MATTERS, and it is not hidden: **AttachVolume and
+# DetachVolume REBOOT the instance.** `limactl edit` refuses a running
+# instance outright (`fatal: cannot edit a running instance`, exit 1) and
+# `limactl disk` has no attach verb at all, so a disk can only join a VM that
+# is stopped. AWS hot-attaches; odin cannot, and `docs/limits.md` says so in
+# measured terms. The instance is moved to `pending` for the duration rather
+# than left claiming `running`, because during the reboot it genuinely is not.
+#
+# Attaching is therefore SLOW (a whole VM restart), which is why it follows
+# `_run_instances`' shape exactly: answer with the transitional state at once,
+# do the real work in `background()`. `aws_volume_attachment` polls for
+# `attached`, so the provider waits for the thing that is really happening.
+
+
+# One lock per VM name, held across the stop/edit/start. This is a critical
+# section that really does contain `await`s, which is the repo's own test for
+# whether a lock is needed at all -- without it two parallel attachments to
+# one instance interleave two stop/start cycles on the same VM, and the
+# second `limactl edit` lands while the first `limactl start` is running,
+# which limactl refuses outright. `asyncio.Lock`, never `threading.Lock`: one
+# held across an await on a single loop is a DEADLOCK, not a stall.
+_ATTACH_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _attach_lock(name: str) -> asyncio.Lock:
+    return _ATTACH_LOCKS.setdefault(name, asyncio.Lock())
+
+
+def _volume_filter_attrs(volume: dict) -> dict:
+    """Which `Filter.N` names DescribeVolumes can answer.
+
+    `_matches` requires EVERY named filter to match, so a name missing from
+    this dict does not narrow the result -- it empties it. That makes the
+    contents load-bearing rather than a convenience: `aws_volume_attachment`'s
+    waiter filters on `volume-id`, `attachment.instance-id` AND
+    `attachment.device` together, and omitting the third would have returned
+    an empty `volumeSet` to every poll, so the provider would have waited out
+    its whole timeout on an attachment that had already succeeded."""
+    view = _volume_view(volume)
+    return {
+        "volume-id": view["volume_id"],
+        "status": view["state"],
+        "availability-zone": view["availability_zone"],
+        "size": str(view["size"]),
+        "volume-type": view["volume_type"],
+        "attachment.instance-id": volume.get("instance_id"),
+        "attachment.device": view["device"] or None,
+        "attachment.status": _ATTACHMENT_STATUS.get(view["state"]),
+    }
+
+
+def _volume(stores: SynthStores, env: str, volume_id: str) -> dict | None:
+    return stores.ec2compute.get(env, _key("volume", volume_id))
+
+
+def _all_volumes(stores: SynthStores, env: str) -> list[dict]:
+    """Every volume this env has, from BOTH families: each instance's auto
+    root volume and every standalone `CreateVolume` one.
+
+    `.get("root_volume")`, not `[...]`: an instance record written without one
+    (every test that seeds `instance:` directly, and any store predating the
+    field) otherwise raises a `KeyError` inside a handler that is on its way to
+    a 200 -- a 500 for a describe that should simply have listed less."""
+    roots = [i["root_volume"] for i in _records(stores, env, "instance") if i.get("root_volume")]
+    return roots + _records(stores, env, "volume")
+
+
+def _not_found_volume(volume_id: str) -> Response:
+    return errors.synth_error(
+        "ec2", "InvalidVolume.NotFound", f"The volume '{volume_id}' does not exist.", 400,
+    )
+
+
+def _update_volume(stores: SynthStores, env: str, volume_id: str, **fields: object) -> None:
+    def mutate(volume: dict | None) -> dict | object:
+        if volume is None:  # deleted underneath a background attach
+            return NO_CHANGE
+        return {**volume, **fields}
+
+    stores.ec2compute.update(env, _key("volume", volume_id), mutate)
+
+
+def _attached_disks(stores: SynthStores, env: str, instance_id: str) -> list[str]:
+    """The Lima disk names an instance's volumes claim, in a STABLE order.
+
+    Sorted by volume id, and that is load-bearing rather than tidy: this list
+    becomes the VM's whole `additionalDisks:` on every attach and detach, and
+    an unstable order would silently renumber the guest's `/dev/vd*` letters
+    under a filesystem that is already mounted. `attaching` counts (the disk
+    is being added right now) and `detaching` does not."""
+    volumes = [
+        v for v in _records(stores, env, "volume")
+        if v.get("instance_id") == instance_id and v["state"] in ("attaching", "in-use")
+    ]
+    return [v["disk"] for v in sorted(volumes, key=lambda v: v["volume_id"])]
+
+
+async def _create_volume(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+    """Create a REAL `limactl disk`, then record it -- never the other way
+    round. A record written first and a disk that failed to appear is the
+    decorative bug this repo keeps finding; here the failure is simply an
+    error response and no volume exists at all."""
+    az = params.get("AvailabilityZone", "")
+    if not az:
+        return _missing_parameter("AvailabilityZone")
+    size = params.get("Size", "")
+    if not size.isdigit() or int(size) <= 0:
+        return errors.synth_error(
+            "ec2", "InvalidParameterValue",
+            f"Invalid value '{size}' for size. Size must be a whole number of GiB, greater than zero.", 400,
+        )
+    volume_id = _mint("vol")
+    disk = disk_name(env, volume_id)
+    try:
+        await vm.create_disk(disk, int(size))
+    except Exception as exc:  # noqa: BLE001 -- limactl's refusal IS the answer
+        log.error("could not create the backing disk for %s (env %s): %s", volume_id, env, exc_text(exc))
+        return errors.synth_error(
+            "ec2", "InternalError", f"could not create a {size}GiB disk for the volume: {exc_text(exc)}", 500,
+        )
+    volume = {
+        "volume_id": volume_id, "size": int(size), "availability_zone": az,
+        "volume_type": params.get("VolumeType") or "gp3", "create_time": _now_iso(),
+        "state": "available", "instance_id": None, "device": None, "attach_time": None,
+        # The real artifact. Everything else here is a description OF it.
+        "disk": disk,
+    }
+    stores.ec2compute.set(env, _key("volume", volume_id), volume)
+    stores.tags.set(env, f"ec2:{volume_id}", _spec_tags(params))
+    return _response("CreateVolume", _volume_xml(volume))
+
+
+async def _attach_volume(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+    volume_id, instance_id = params.get("VolumeId", ""), params.get("InstanceId", "")
+    volume = _volume(stores, env, volume_id)
+    if volume is None:
+        return _not_found_volume(volume_id)
+    instance = _instance(stores, env, instance_id)
+    if instance is None:
+        return _not_found_instance(instance_id)
+    if volume["state"] != "available":
+        return errors.synth_error(
+            "ec2", "VolumeInUse",
+            f"The volume '{volume_id}' is in state '{volume['state']}' and cannot be attached.", 400,
+        )
+    # `pending` is accepted, and that is not laxness -- it is what makes TWO
+    # volumes on ONE instance work in a single `tofu apply`. Terraform plans
+    # those attachments in parallel, and the FIRST one moves this instance to
+    # `pending` for its reboot; refusing anything but `running` would have
+    # failed the second with `IncorrectState`, i.e. odin would decline a
+    # perfectly ordinary canvas. The real work is serialised per VM instead
+    # (`_attach_lock`), so the second attach waits and then reboots with both
+    # disks. `stopped`/`shutting-down`/`terminated` are still refused.
+    if instance["state_name"] not in ("running", "pending"):
+        return errors.synth_error(
+            "ec2", "IncorrectState",
+            f"The instance '{instance_id}' is in state '{instance['state_name']}'; "
+            "a volume can only be attached to a running instance.", 400,
+        )
+    device = params.get("Device") or "/dev/sdf"
+    _update_volume(
+        stores, env, volume_id, state="attaching", instance_id=instance_id,
+        device=device, attach_time=_now_iso(),
+    )
+    # The instance really does go down for this. Saying `pending` is the whole
+    # difference between odin disclosing a reboot and hiding one.
+    _update_instance(stores, env, instance_id, state_name="pending")
+    background(_finish_attach(stores, env, volume_id, instance_id, vm))
+    return _response("AttachVolume", _attachment_inner_xml(_volume(stores, env, volume_id)))
+
+
+async def _finish_attach(stores: SynthStores, env: str, volume_id: str, instance_id: str, vm: InstanceVm) -> None:
+    volume = _volume(stores, env, volume_id)
+    if volume is None:
+        return
+    name = vm_name(env, instance_id)
+    try:
+        # `_attached_disks` is read INSIDE the lock, never before it: a second
+        # attachment queued behind this one must see the set as it stands when
+        # its own reboot begins, or it would hand Lima a list missing whichever
+        # disk landed while it waited -- and detach a live volume by omission.
+        async with _attach_lock(name):
+            ip = await vm.attach_disk(name, _attached_disks(stores, env, instance_id), verify=volume["disk"])
+    except Exception as exc:  # noqa: BLE001 -- reported on the volume, never swallowed
+        log.error("attaching %s to %s failed: %s", volume_id, name, exc_text(exc))
+        # Back to `available` and NOT `in-use`: the disk is not in that guest,
+        # so anything else here would be a record claiming an attachment a
+        # `lsblk` would contradict. The instance is left `pending` only if it
+        # really did not come back -- `start` raising is what got us here.
+        _update_volume(
+            stores, env, volume_id, state="available", instance_id=None, device=None,
+            attach_time=None, last_error=exc_text(exc),
+        )
+        _update_instance(
+            stores, env, instance_id, state_reason={
+                "code": "Server.InternalError",
+                "message": f"attaching volume {volume_id} failed: {exc_text(exc)}",
+            },
+        )
+        return
+    _update_volume(stores, env, volume_id, state="in-use", last_error=None)
+    _update_instance(stores, env, instance_id, state_name="running", private_ip=ip, public_ip=ip, state_reason=None)
+
+
+async def _detach_volume(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+    volume_id = params.get("VolumeId", "")
+    volume = _volume(stores, env, volume_id)
+    if volume is None:
+        return _not_found_volume(volume_id)
+    if volume["state"] != "in-use" or not volume.get("instance_id"):
+        return errors.synth_error(
+            "ec2", "IncorrectState",
+            f"The volume '{volume_id}' is in state '{volume['state']}' and is not attached.", 400,
+        )
+    instance_id = volume["instance_id"]
+    _update_volume(stores, env, volume_id, state="detaching")
+    _update_instance(stores, env, instance_id, state_name="pending")
+    background(_finish_detach(stores, env, volume_id, instance_id, vm))
+    return _response("DetachVolume", _attachment_inner_xml(_volume(stores, env, volume_id)))
+
+
+async def _finish_detach(stores: SynthStores, env: str, volume_id: str, instance_id: str, vm: InstanceVm) -> None:
+    name = vm_name(env, instance_id)
+    try:
+        # The SAME lock as the attach path, for the same reason: a detach and
+        # an attach on one VM are two stop/start cycles that cannot overlap.
+        async with _attach_lock(name):
+            ip = await vm.detach_disk(name, _attached_disks(stores, env, instance_id))
+    except Exception as exc:  # noqa: BLE001
+        log.error("detaching %s from %s failed: %s", volume_id, name, exc_text(exc))
+        # STAYS attached. The disk is still in that VM's yaml, so `in-use` is
+        # the true reading -- and `DeleteVolume` refuses an attached volume,
+        # which is what stops this failure from becoming a lost disk later.
+        _update_volume(stores, env, volume_id, state="in-use", last_error=exc_text(exc))
+        return
+    _update_volume(
+        stores, env, volume_id, state="available", instance_id=None, device=None,
+        attach_time=None, last_error=None,
+    )
+    _update_instance(stores, env, instance_id, state_name="running", private_ip=ip, public_ip=ip)
+
+
+async def _delete_volume(params: dict[str, str], env: str, stores: SynthStores, now: float, vm: InstanceVm, keystore: KeyStore | None = None, gateway_port: int | None = None) -> Response:
+    volume_id = params.get("VolumeId", "")
+    volume = _volume(stores, env, volume_id)
+    if volume is None:
+        return _not_found_volume(volume_id)
+    if volume["state"] != "available":
+        return errors.synth_error(
+            "ec2", "VolumeInUse",
+            f"The volume '{volume_id}' is in state '{volume['state']}' and cannot be deleted.", 400,
+        )
+    try:
+        await vm.delete_disk(volume["disk"])
+    except Exception as exc:  # noqa: BLE001 -- limactl refusing to destroy data IS the answer
+        log.error("could not delete the backing disk %s: %s", volume["disk"], exc_text(exc))
+        # The record STAYS. A forgotten record over a disk that is still on
+        # the machine is precisely the orphan `odin env rm` was built to stop
+        # leaving behind, and the reclaim sweep needs the record to find it.
+        return errors.synth_error(
+            "ec2", "InternalError",
+            f"the volume '{volume_id}' was NOT deleted: its disk {volume['disk']} is still on this "
+            f"machine ({exc_text(exc)})", 500,
+        )
+    stores.tags.set(env, f"ec2:{volume_id}", {})
+    stores.ec2compute.delete(env, _key("volume", volume_id))
+    return _response("DeleteVolume", "<return>true</return>")
+
+
+def _attachment_inner_xml(volume: dict) -> str:
+    """Attach/DetachVolume answer with the ATTACHMENT's own fields at the top
+    level, not a `<volume>` element -- botocore's `VolumeAttachment` shape.
+
+    Takes a `dict`, not `dict | None`: both callers have just written the
+    record and read it straight back, so a `None` here would be a bug, and an
+    `or {}` would turn that bug into a `KeyError` deep inside a formatter
+    instead of at the line that lost the record."""
+    view = _volume_view(volume)
+    return (
+        f"<volumeId>{view['volume_id']}</volumeId><instanceId>{view['instance_id']}</instanceId>"
+        f"<device>{escape(view['device'])}</device><status>{view['state']}</status>"
+        f"<attachTime>{view['attach_time']}</attachTime>"
+        f"<deleteOnTermination>{'true' if view['delete_on_termination'] else 'false'}</deleteOnTermination>"
+    )
+
+
+def _release_instance_volumes(stores: SynthStores, env: str, instance_id: str) -> None:
+    """A terminated instance's VM is DELETED, which frees every disk it held.
+
+    So the volumes really do become `available`, and recording that is not
+    bookkeeping: `limactl disk delete` refuses a disk an instance still holds
+    (measured), so a volume left claiming `in-use` after its VM is gone can
+    never be deleted by `DeleteVolume` again -- a permanent leak created by a
+    stale field. Matches AWS: a non-root EBS volume survives its instance."""
+    for volume in _records(stores, env, "volume"):
+        if volume.get("instance_id") == instance_id:
+            _update_volume(
+                stores, env, volume["volume_id"], state="available", instance_id=None,
+                device=None, attach_time=None,
+            )
 
 
 # --- Key pairs --------------------------------------------------------------
@@ -1272,6 +1646,75 @@ async def reclaim_env_instances(stores: SynthStores, env: str, vm: InstanceVm | 
     return reclaimed
 
 
+async def reclaim_env_disks(stores: SynthStores, env: str, vm: InstanceVm | None = None) -> VolumeReclaim:
+    """Delete every REAL Lima disk belonging to `env`, and forget the records.
+
+    Answers with `aws/rds.py`'s `VolumeReclaim` rather than a bare list,
+    because the question is identical one layer over: what a single env-scoped
+    sweep REALLY did, with "nothing to reclaim" and "could not reclaim" kept
+    apart. Both callers need that distinction and both already speak it --
+    `/destroy` turns `.failed` into `ReclaimFailed`, `odin env rm` into its
+    `volumes_standing` outcome.
+
+    MUST run AFTER `reclaim_env_instances`. `limactl disk delete` refuses a
+    disk an instance still holds -- measured, `fatal: cannot delete disk X in
+    use by instance Y`, exit 1 -- so that refusal is the guard working, and
+    calling this first would turn every attached volume into a `standing`
+    failure. Same ordering rule, and the same reason, as `/destroy` reclaiming
+    docker volumes only after the containers (`aws/rds.py`).
+
+    It sweeps the MACHINE, not just the store, and the two answers are
+    deliberately different things. The store is what odin THINKS it made; a
+    disk whose `CreateVolume` was interrupted between `limactl disk create`
+    and the record write exists with nothing naming it, and would otherwise be
+    invisible forever -- the same shape `reap_orphaned_vms` exists for. Scoped
+    to `odin-ebs-{env}-` and nothing else, so it can never reach another env's
+    data or a disk a human made (a machine-wide sweep here would be the
+    `docker rm -f` mistake, one layer down)."""
+    machine = vm or InstanceVm()
+    prefix = env_disk_prefix(env)
+    records = {v["disk"]: v["volume_id"] for v in _records(stores, env, "volume") if v.get("disk")}
+    # `check=False` on the LISTING only, and the asymmetry is deliberate.
+    # `limactl` is genuinely optional here (`odin doctor` reports it as such),
+    # and on a machine without it there provably are no Lima disks -- failing
+    # every `/destroy` on that machine would be a false failure, not a
+    # careful one. Nothing is lost by being lenient at this step: every disk
+    # odin RECORDED is deleted below regardless, and if limactl really is
+    # broken those deletes raise by name and this still refuses to say
+    # `destroyed`. The listing's only extra job is finding a disk NO record
+    # names, which cannot exist unless limactl was working when it was made.
+    on_machine = {d["name"] for d in await machine.disks() if d["name"].startswith(prefix)}
+
+    reclaimed, standing = [], []
+    for disk in sorted(records.keys() | on_machine):
+        try:
+            await machine.delete_disk(disk)
+        except Exception as exc:  # noqa: BLE001 -- limactl's refusal IS the answer, reported by name
+            log.error("could not reclaim disk %s (env %s): %s", disk, env, exc_text(exc))
+            standing.append({"disk": disk, "reason": exc_text(exc)})
+            continue
+        volume_id = records.get(disk)
+        if volume_id is not None:
+            stores.tags.set(env, f"ec2:{volume_id}", {})
+            stores.ec2compute.delete(env, _key("volume", volume_id))
+        reclaimed.append(disk)
+    if reclaimed:
+        log.warning("reclaimed %d EBS disk(s) for env %s: %s", len(reclaimed), env, reclaimed)
+    return VolumeReclaim(tuple(reclaimed), tuple(standing))
+
+
+def disks_standing(env: str, standing: tuple[dict, ...]) -> ReclaimFailed:
+    """The `/destroy` half of the sentence, so the words live next to the
+    sweep that produces them rather than in the route."""
+    named = "; ".join(f"{d['disk']} ({d['reason']})" for d in standing)
+    return ReclaimFailed(
+        f"env {env!r} is NOT destroyed: {len(standing)} EBS disk(s) are still on this machine and "
+        f"could not be deleted -- {named}. They are real files under `$LIMA_HOME/_disks/` holding "
+        f"real space. Retry `odin destroy`, or remove them by exact name with "
+        f"`limactl disk delete <name>`."
+    )
+
+
 def tf_forgotten_instances(stores: SynthStores, env: str) -> list[str]:
     """Instance ids this env's gateway store still claims that tofu's OWN
     state no longer holds -- unreachable by any terraform operation, forever,
@@ -1416,6 +1859,10 @@ _HANDLERS: dict[str, _Handler] = {
     "DescribeInstanceAttribute": _describe_instance_attribute,
     "DescribeInstanceCreditSpecifications": _describe_instance_credit_specifications,
     "DescribeVolumes": _describe_volumes,
+    "CreateVolume": _create_volume,
+    "AttachVolume": _attach_volume,
+    "DetachVolume": _detach_volume,
+    "DeleteVolume": _delete_volume,
     "CreateKeyPair": _create_key_pair,
     "ImportKeyPair": _import_key_pair,
     "DescribeKeyPairs": _describe_key_pairs,
