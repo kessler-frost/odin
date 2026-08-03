@@ -475,14 +475,23 @@ async def test_exists_false_when_check_raises(rt, factory, tmp_path):
     assert await aws.exists("dynamodb", "jobs") is False
 
 
-async def test_deprovision_is_best_effort(rt, factory, tmp_path):
+async def test_deprovision_is_best_effort_AND_SAYS_WHICH(rt, factory, tmp_path):
+    """Best-effort is the deliberate contract (the resource or its whole backing
+    may already be gone, and a raise would fail a teardown for having nothing to
+    tear down) -- but "swallowed" and "deleted" must not be the same answer.
+
+    This test asserted only "must not raise" until v0.8.18, which is exactly the
+    ambiguity: `deprovision` returned None either way, and
+    `reconciler.py::_execute` prunes the World entry regardless, so a bucket
+    that survived the delete vanished from the canvas anyway.
+    """
     factory.errors[("s3", "delete_bucket")] = ClientError(
         {"Error": {"Code": "NoSuchBucket", "Message": "no"}}, "DeleteBucket")
     aws = _aws(rt, factory, tmp_path)
     await aws.ensure_backing("sqs")
-    await aws.deprovision("s3", "uploads")  # must not raise
+    assert await aws.deprovision("s3", "uploads") is False  # swallowed, not deleted
     factory.responses[("sqs", "get_queue_url")] = {"QueueUrl": "http://q/jobs"}
-    await aws.deprovision("sqs", "jobs")
+    assert await aws.deprovision("sqs", "jobs") is True
     assert ("sqs", "delete_queue", {"QueueUrl": "http://q/jobs"}) in factory.calls
 
 

@@ -9,6 +9,7 @@ tests below drive. `rds` used to be the driver here; it's TF-owned now
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass
 
@@ -189,6 +190,56 @@ async def test_rds_is_no_longer_provisioned_by_this_loop_at_all(tmp_path):
     # Never entered into World by this loop either: only tf_status.project()
     # (fed by the gateway's own DB-instance record) can put it there.
     assert store.current_world().get("db") is None
+
+
+async def test_a_swallowed_deprovision_is_logged_while_the_world_entry_still_goes(tmp_path, caplog):
+    """The residual `BackingAws.deprovision`'s best-effort contract leaves, made
+    VISIBLE rather than fixed.
+
+    `_execute` prunes the World entry whether or not the delete landed, so a
+    bucket that survived the delete vanishes from the canvas anyway. Changing
+    that is a teardown-semantics change needing a measurement against real
+    backings; naming it is not. So: the prune still happens (asserted, because
+    a "fix" that quietly stopped pruning would be the worse bug), and a warning
+    names what is still standing.
+    """
+    class RefusingAws(FakeAws):
+        async def deprovision(self, service, name):
+            return False
+
+    rt, aws = FakeRuntime(), RefusingAws()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(BUCKET,)))
+    recon = Reconciler(store, rt, aws=aws, poll_interval=0)
+    for _ in range(2):
+        await recon.tick()                       # provision, then observe healthy
+    assert store.current_world().get("uploads").phase == "healthy"
+
+    store.apply(Stack())                         # the node is removed from the canvas
+    with caplog.at_level(logging.WARNING, logger="odin.reconcile"):
+        await recon.tick()
+
+    assert store.current_world().get("uploads") is None, "the prune must still happen"
+    assert "uploads" in caplog.text
+    assert "may still exist" in caplog.text
+
+
+async def test_a_deprovision_that_worked_logs_nothing(tmp_path, caplog):
+    """The other half, and the reason the check is `is False` rather than
+    `not`: `FakeAws.deprovision` returns None because it predates the bool, not
+    because it failed. Warning about that would be the false report this line
+    exists to prevent."""
+    rt, aws = FakeRuntime(), FakeAws()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(resources=(BUCKET,)))
+    for _ in range(2):
+        await Reconciler(store, rt, aws=aws, poll_interval=0).tick()
+
+    store.apply(Stack())
+    with caplog.at_level(logging.WARNING, logger="odin.reconcile"):
+        await Reconciler(store, rt, aws=aws, poll_interval=0).tick()
+
+    assert "may still exist" not in caplog.text
 
 
 async def test_unchanged_status_is_not_rebroadcast(tmp_path):

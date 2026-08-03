@@ -957,9 +957,25 @@ class Reconciler:
             if action.kind in PROVISIONED:
                 # Deletes the resource AND its contents:
                 # `backings.py::deprovision` -> delete_bucket / delete_queue /
-                # delete_table / delete_topic. Best-effort by design -- see
-                # that method's docstring for what "either way" costs here.
-                await self._aws.deprovision(action.kind, action.id)
+                # delete_table / delete_topic. Best-effort by design (see that
+                # method's docstring), and the prune below runs either way --
+                # so a resource that did NOT leave the backing still leaves
+                # World, and odin would otherwise report an empty canvas over a
+                # bucket that still holds objects. Changing that is a teardown
+                # semantics change needing a measurement against real backings;
+                # NAMING it is not, so name it.
+                #
+                # `is False` rather than `not`: a test double whose
+                # `deprovision` returns None did not fail, it just predates the
+                # bool, and warning about it would be the false report this
+                # line exists to prevent.
+                deleted = await self._aws.deprovision(action.kind, action.id)
+                if deleted is False:
+                    log.warning(
+                        "%s: could not delete the %s %r from its backing, but it is being "
+                        "removed from World anyway -- the real resource may still exist",
+                        self._env, action.kind, action.id,
+                    )
             elif action.kind in TF_OWNED_KINDS and self._stores is not None:
                 # tofu (never this reconciler) owns create/destroy for a
                 # TF-managed kind, and `_project_tf_owned` -- which prunes any
