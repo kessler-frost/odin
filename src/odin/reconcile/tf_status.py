@@ -86,8 +86,7 @@ from odin.spec.models import ResourceObserved, World
 
 TF_OWNED_KINDS = frozenset({
     "vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr", "logs", "secret", "ssm",
-    "elasticache", "rds", "alb", "kms",
-    "elasticache", "rds", "alb", "ebs",
+    "elasticache", "rds", "alb", "kms", "ebs",
 })
 
 # An EBS volume's own states (gateway/models/ec2compute.py's volume records)

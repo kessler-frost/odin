@@ -237,8 +237,6 @@ They are listed because finding one by surprise is worse than reading it here.
   EC2, Lambda and RDS drift can be up to one sweep cadence stale for the duration.
 - **A drawn edge carries a modelled TYPE for only 47 of the 378 kind pairs.**
   The honest majority answer is `unmodelled` — 331 of the 378 unordered pairs,
-- **A drawn edge carries a modelled TYPE for only 42 of the 378 kind pairs.**
-  The honest majority answer is `unmodelled` — 336 of the 378 unordered pairs,
   drawn as a grey line labelled *Not modelled*, stored in the Stack and read by
   nothing. It was called `network` until v0.8.14, which was a claim about layer 3
   that odin never checked. Re-measured 2026-07-29 over the real 27 canvas kinds,

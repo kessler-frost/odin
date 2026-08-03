@@ -17,8 +17,7 @@
 // both ways: `(placeholder)` in a sublabel means Apply skips it, and nothing
 // else does. When a placeholder becomes real, the marker comes off in the same
 // commit that adds it to `_KIND`.
-// Today: kinesis, route53, apigateway, efs, events, ebs, eip, igw.
-// Today: kinesis, kms, route53, apigateway, efs, events, eip, igw.
+// Today: kinesis, route53, apigateway, efs, events, eip, igw.
 // (`ebs` came OFF this list in v0.8.18 -- it is a real `limactl disk` volume
 // on a real VM now, and the marker came off in the same commit that added it
 // to `_KIND`, exactly as the rule above requires.)
