@@ -53,7 +53,7 @@ class FakeContainers:
     def __init__(self, *running: str) -> None:
         self.running = list(running)
 
-    async def container_names(self) -> list[str]:
+    async def container_names(self, env=None) -> list[str]:
         return list(self.running)
 
     async def status(self, name: str) -> str:

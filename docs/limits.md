@@ -573,19 +573,6 @@ They are listed because finding one by surprise is worse than reading it here.
   and that holds on an import round trip even if your `.tf` said otherwise. It
   keeps `tofu apply` and Apply delivering identically, but it changes what a
   consumer reads.
-- **`odin env rm` refuses when another environment's name ends with this one's.**
-  One of its checks before deleting anything is "does this machine still have a
-  container of this env's", and it answers that from odin's container *naming*
-  (`odin-aws-rustfs-<env>`, `odin-rds-<env>-…`) rather than a label, so a
-  `-`-suffix collision reads across. (Its volume reclaim, which runs after that
-  check, has no such collision — it is scoped to the `odin.env` label. See the
-  RDS-volume entry below.) Measured: with `a` and `b-a` both live,
-  removing `a` sees `odin-aws-rustfs-b-a` and stops, having deleted nothing —
-  `odin env rm b-a` first, or rename. It errs this way on purpose: refusing a
-  legitimate removal is recoverable, and deleting the last record of a running
-  container is not. Nothing else about the two environments is affected; the
-  matching rule is the same one a failed `odin destroy` uses to report what
-  survived.
 - **An RDS instance's data is a Docker volume and nothing else — there are no
   snapshots and no backups.** This entry used to say the opposite of its first
   half: the container held its data on the image's *anonymous* volume, which

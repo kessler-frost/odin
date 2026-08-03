@@ -120,14 +120,14 @@ def test_destroy_reports_tofu_failure_and_keeps_the_desired_state_for_a_retry(tm
 class _BlindRuntime(FakeRuntime):
     """A machine odin cannot ask: `docker` will not answer at all."""
 
-    async def container_names(self):
+    async def container_names(self, env=None):
         raise RuntimeError("Cannot connect to the Docker daemon")
 
 
 class _CleanRuntime(FakeRuntime):
     """A machine that really has no container left for this env."""
 
-    async def container_names(self):
+    async def container_names(self, env=None):
         return []
 
 
@@ -249,8 +249,14 @@ class _SurvivingRuntime(FakeRuntime):
     this env and one for a DIFFERENT env, so the residue report is proven to be
     env-scoped rather than a blanket listing."""
 
-    async def container_names(self):
-        return ["odin-rds-default-db", "odin-aws-s3-default", "odin-rds-other-db"]
+    _OWNER = {"odin-rds-default-db": "default", "odin-aws-s3-default": "default",
+              "odin-rds-other-db": "other"}
+
+    async def container_names(self, env=None):
+        # Honours `env` as `docker ps --filter label=odin-env=` does. odin used
+        # to filter these by NAME; since v0.8.21 the substrate filters, so a
+        # fake that ignored `env` would be testing a filter nothing runs.
+        return [n for n, e in self._OWNER.items() if env is None or e == env]
 
 
 def _surviving_app(tmp_path):

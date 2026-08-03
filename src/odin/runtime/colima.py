@@ -656,7 +656,7 @@ class _ContainerRuntime:
         out = await self._cli("ps", "-aq", "--filter", f"label={LABEL}=1", check=False)
         return [line for line in out.splitlines() if line]
 
-    async def container_names(self) -> list[str]:
+    async def container_names(self, env: str | None = None) -> list[str]:
         """Every odin-labelled container's NAME -- running or exited, ONE
         `docker ps` call regardless of how many there are (W2.2's drift sweep
         compares whole synth stores against this single listing, never one
@@ -665,8 +665,18 @@ class _ContainerRuntime:
         `check=True`, deliberately: this is the one listing whose EMPTY answer
         is load-bearing (absent from it == the container was really removed),
         so a failed CLI call must raise rather than come back as an innocent
-        empty list -- see `reconcile/drift.py::_listing`."""
-        out = await self._cli("ps", "-a", "--format", "{{.Names}}", "--filter", f"label={LABEL}=1")
+        empty list -- see `reconcile/drift.py::_listing`.
+
+        `env` narrows to ONE environment by the `odin-env` LABEL, which is the
+        only exact answer: odin's container NAMES carry the env as a suffix
+        (`odin-aws-{backing}-{env}`) or an infix (`odin-rds-{env}-...`), and an
+        env name may itself contain `-`, so `endswith(f"-{env}")` matches env
+        `a` against `odin-aws-rustfs-b-a`. That ambiguity is unfixable in the
+        name; the label is set at every one of the eight launch sites
+        (backings, cache, rds, apigw, functions, proxy, tasks, sidecar), so
+        filtering on it can neither over-match nor MISS a survivor."""
+        env_filter = ("--filter", f"label=odin-env={env}") if env is not None else ()
+        out = await self._cli("ps", "-a", "--format", "{{.Names}}", "--filter", f"label={LABEL}=1", *env_filter)
         return [line for line in out.splitlines() if line]
 
 
