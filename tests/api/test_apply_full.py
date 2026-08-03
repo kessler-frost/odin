@@ -957,7 +957,7 @@ class _FakeStates:
     def __init__(self, *_args, **_kwargs) -> None:
         pass
 
-    async def container_names(self) -> list[str]:
+    async def container_names(self, env=None) -> list[str]:
         return list(type(self).running)
 
     async def status(self, name: str) -> str:
