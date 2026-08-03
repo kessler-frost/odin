@@ -1898,12 +1898,76 @@ run and are not described as such.
      value. Known constraint: Lima attaches disks at VM creation and exposes no
      attach verb, so hot-attach is likely impossible where AWS treats it as
      routine, and `device_name = "/dev/sdf"` will not be what the guest sees.
-  2. **`efs → ecs|lambda`** — container mounts are already proven machinery
-     (`ContainerSpec.volumes` is how Lambda gets its code dir). Two tasks writing
-     and reading one directory is a real mount or it isn't. **Scope to containers:
-     the `ec2` end has no Terraform expression (it is an fstab line in user-data)
-     and this repo has a measured burn where a host-dir mount into Lima silently
-     mounted an empty directory.**
+  2. **`efs → ecs|lambda`** — **BUILT 2026-08-03 (v0.8.19).**
+     **The mount is NOT YET VERIFIED END TO END.** Saying that first, because this entry's own
+     acceptance criterion was *"two tasks writing and reading one directory is a
+     real mount or it isn't"* and that test has been written and not run —
+     Docker and Lima were embargoed behind a release gate for the whole change.
+     Everything below is measured from the provider, from botocore and from
+     odin's source; the mount itself is argued from the renderer rather than
+     observed. **This item is not finished until that test runs**, and the
+     honest state is built-and-unproven, not done. An `efs` node is a
+     real host directory under `.odin/<env>/gateway/efs/<fs-id>/`, bind-mounted
+     into the real container behind every `ecs`/`lambda` node it is edged to,
+     through the same `ContainerSpec.volumes` that already hands a Lambda its
+     code dir. It comes off the placeholder list, the read-only `fsId` field is
+     replaced by an authorable `path`, and the line gets an edge type of its
+     own: `mount`, **not** a reuse of `volume`. That is the one design call
+     worth recording — `volume` means "this block device is attached to that
+     instance" and `hcl.py` refuses a second attachment, while an EFS mount is
+     SHARED by as many consumers as you draw, and sharing is the entire
+     feature. One label reading "Volume Attachment" over both would have told
+     the user the wrong thing about exclusivity on the one line where sharing
+     is the point.
+
+     **Measured before any of it was written**, by pointing `AWS_ENDPOINT_URL`
+     at a recording endpoint and running a real `tofu init`/`apply`/`plan`/
+     `destroy` over `aws_efs_file_system` + `aws_efs_access_point` on OpenTofu
+     1.12.3 + hashicorp/aws 6.57.1, all three exiting 0: EFS is `rest-json`, so
+     it routes like Lambda rather than like SQS; and the provider never calls
+     `DescribeMountTargets`, `DescribeBackupPolicy`, `DescribeFileSystemPolicy`,
+     `ListTagsForResource` or `TagResource` at all, so implementing any of them
+     would have been dead code. Read out of botocore rather than remembered:
+     `LocalMountPath` is `/mnt/[a-zA-Z0-9-_.]+`, **exactly one segment under
+     `/mnt`**, so `/mnt/efs` is legal, `/mnt/efs/data` is not, and a node asking
+     for one is declined by name instead of emitted into a project real AWS
+     would reject.
+
+     **The scope limit held, and it is a refusal rather than a deferral —
+     TWICE.** The `ec2` end stays `unmodelled`: odin creates its Lima VMs with
+     `"mounts": []` (`compute/lima_yaml.py`), so the bind mount would succeed
+     and the directory would be empty — the measured burn this entry was
+     written to avoid, and the same reason the file system lives under `.odin/`
+     rather than a temp dir Colima does not share in. Excluding the EDGE does
+     not cover an ECS service PLACED inside an ec2 box, which runs under
+     `LimaRuntime` in that same mountless VM, so that combination is refused
+     too: `TaskRuntime._refuse_unmountable` raises before any container starts,
+     naming the instance, the mount and `mounts: []` as the reason, and
+     `ecsctl._launch_task` turns it into a STOPPED task carrying that text —
+     which fails the apply instead of showing a green tile over an empty
+     directory. Pinned in both directions (deleting either half of the
+     condition fails a named test) and the PREMISE is pinned too, so the
+     refusal cannot outlive its reason if odin's VMs ever gain a mount.
+
+     **Residuals, each in `docs/limits.md` in measured terms:** one mount path
+     per file system rather than one per consumer (a tile has nowhere to hang a
+     per-consumer value); no mount targets, no security group on the file
+     system, no IAM authorization and no encryption in either direction — a
+     bind mount is performed by the container runtime and the gateway never
+     sees a signed request for it, which is exactly why the tile declares NO
+     `iamActions`; and mounts are read-write always, because
+     `ContainerSpec.volumes` renders `-v src:dst` with no `:ro` support, so a
+     `readOnly: true` in a task definition round-trips and changes nothing.
+
+     Two ratchets moved with it rather than after it: `docs/limits.md`'s pair
+     counts, recomputed from the live registry (**47/331 → 49/329 typed/
+     unmodelled**, the two new `mount` pairs), and the ambiguity ratchet, which
+     stays green only because `efs` declares no `iamActions` — falsified by
+     mutation, not assumed: giving the tile `elasticfilesystem:*` makes
+     `edge-ambiguity.test.ts` fail naming `efs -> ecs: iam | mount` and three
+     siblings. **`docs/architecture.md` + `.html` gained a diagram for `efs`
+     AND for `ebs`**, which v0.8.18 skipped — CLAUDE.md rule 2b requires both
+     files in the same change, and neither mentioned `ebs` at all until now.
   3. **`apigateway → lambda|ecs`** — settled as belonging to the TARGET family,
      not events, on the synchrony argument: a caller holds a connection open and
      awaits a status code. Substrate is `compute/proxy.py`'s nginx given a route

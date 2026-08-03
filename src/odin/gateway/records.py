@@ -589,6 +589,42 @@ class EventBus(Record):
     arn: str
 
 
+# --- elastic file system -----------------------------------------------------
+
+
+class EfsFileSystem(Record):
+    """`fs:{FileSystemId}` (gateway/models/efsctl.py).
+
+    `host_dir` is the load-bearing one and the reason this record is validated
+    at all: it is the absolute path odin BIND-MOUNTS into real containers. A
+    non-string there reaches `Path(...)` and then a `docker -v` argument, and a
+    `docker -v` of a source that does not exist does not fail -- it silently
+    creates an empty directory and the workload comes up green with none of the
+    shared data. `creation_token` is what a second CreateFileSystem is matched
+    against for idempotency, so a wrong type there duplicates a file system
+    instead of returning the existing one."""
+
+    file_system_id: str
+    creation_token: str
+    host_dir: str
+    created_at: float
+    performance_mode: str
+    throughput_mode: str
+    size_bytes: int = 0
+
+
+class EfsAccessPoint(Record):
+    """`ap:{AccessPointId}` (gateway/models/efsctl.py) -- the indirection a
+    Lambda mount goes through: `FileSystemConfig.Arn` names an ACCESS POINT, so
+    `file_system_id` is the only route from a function's config back to a
+    directory. A missing one is a function that cannot resolve its own mount."""
+
+    access_point_id: str
+    file_system_id: str
+    client_token: str
+    created_at: float
+
+
 # --- elasticache -------------------------------------------------------------
 
 
@@ -789,6 +825,7 @@ SCHEMAS: dict[str, dict[str, TypeAdapter]] = {
         "targets:": EVENT_TARGETS,
         "bus:": strict(EventBus),
     },
+    "efsctl": {"fs:": strict(EfsFileSystem), "ap:": strict(EfsAccessPoint)},
     "cachectl": {"cluster:": strict(CacheCluster)},
     "secretsctl": {"secret:": strict(Secret), "version:": strict(SecretVersion)},
     "ssmctl": {"param:": strict(SsmParameter)},

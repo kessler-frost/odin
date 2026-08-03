@@ -74,7 +74,7 @@ from odin.compute.functions import container_name as function_container_name
 from odin.compute.proxy import container_name as proxy_container_name
 from odin.compute.tasks import TaskRuntime
 from odin.fabric.nebula import NebulaManager
-from odin.gateway.models import cachectl, ecsctl, elbv2ctl, kmsctl, logsctl, rdsctl, ssmctl
+from odin.gateway.models import cachectl, ecsctl, efsctl, elbv2ctl, kmsctl, logsctl, rdsctl, ssmctl
 from odin.gateway.models.ecsctl import sweep_tasks, task_verdict
 from odin.gateway.stores import SynthStores
 from odin.reconcile import mesh_health
@@ -84,9 +84,16 @@ from odin.runtime.lima import LIMA_HOST
 from odin.simulate.workspace import tf_dir
 from odin.spec.models import ResourceObserved, World
 
+# ONE line per kind, deduplicated. This was two overlapping lines
+# (`... "alb", "kms",` then `... "alb", "ebs",`) -- a both-sides-kept merge
+# artifact from the kms and ebs branches landing together. It was harmless only
+# because a `frozenset` collapses duplicates; the mirrored assertion in
+# `tests/reconcile/test_tf_status.py` compared against a `set` literal and
+# collapsed them too, so nothing anywhere could ever have failed on it. That is
+# the problem with it: a merge artifact that no test can see is one that grows.
 TF_OWNED_KINDS = frozenset({
     "vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr", "logs", "secret", "ssm",
-    "elasticache", "rds", "alb", "kms", "ebs",
+    "elasticache", "rds", "alb", "kms", "ebs", "efs",
 })
 
 # An EBS volume's own states (gateway/models/ec2compute.py's volume records)
@@ -608,6 +615,54 @@ def _ebs_volumes(stores: SynthStores, env: str) -> Projected:
     return out
 
 
+def _efs_file_systems(stores: SynthStores, env: str) -> Projected:
+    """Every EFS file system the gateway holds, by its canvas label.
+
+    THE PHASE IS READ OFF THE DISK, not off the record, and that is the whole
+    reason this projection is worth having. Every other TF-owned kind here
+    projects a state machine some model wrote down; an EFS file system has no
+    state machine at all -- it is a directory, and the only question worth
+    asking is whether it is really there. A record saying `available` over a
+    directory that has been removed is precisely the self-report this repo's
+    honesty rules exist about, and it is REACHABLE: `.odin/` is an ordinary tree
+    a person can `rm -rf`, and a half-finished `/destroy` can remove the
+    directory and leave the record.
+
+    So: `healthy` when the directory exists, `crashed` with a verdict naming the
+    path when it does not. The verdict says what odin looked at, so a reader can
+    check the same thing odin checked.
+    """
+    out: Projected = {}
+    for key, record in stores.efsctl.items(env).items():
+        # Keyed on the STORE KEY PREFIX -- `_ebs_volumes`' lesson, which a
+        # mutation test taught it: a field sniff whose halves are each already
+        # redundant is a guard nothing can prove. `fs:` is the fact that
+        # distinguishes a file system from an access point in this store.
+        if not key.startswith("fs:"):
+            continue
+        arn = efsctl.file_system_arn(record["file_system_id"])
+        label = stores.tags.get(env, f"elasticfilesystem:{arn}", {}).get("odin:node")
+        if not label:
+            continue
+        directory = Path(record["host_dir"])
+        exists = directory.is_dir()
+        facts = {"FILE_SYSTEM_ID": record["file_system_id"], "EFS_PATH": record["host_dir"]}
+        out[label] = (
+            ("efs", "healthy", facts, None) if exists else
+            # NO FACTS on the crashed branch, for the same reason `live_verdicts`
+            # withholds a dead database's DATABASE_URL: `EFS_PATH` is a value the
+            # Fabric hands to a workload, and publishing a path to a directory
+            # that is gone is a stale-green fact, not a diagnostic.
+            ("efs", "crashed", {}, (
+                f"odin's file system {record['file_system_id']} has no directory at {directory} -- "
+                f"that directory IS the file system, so there is nothing behind this node. Anything "
+                f"mounting it will be refused rather than started with an empty directory in its "
+                f"place. Apply again to recreate it."
+            ))
+        )
+    return out
+
+
 def _invocation_verdict(record: dict) -> str | None:
     """Field test 2 finding #4: a Lambda reported `healthy` while failing every
     single invocation (the canvas code defined `handler`, the entry point looked
@@ -811,6 +866,7 @@ async def project(
     out.update(_load_balancers(stores, env))
     out.update(await _ec2_instances(stores, env))
     out.update(_ebs_volumes(stores, env))
+    out.update(_efs_file_systems(stores, env))
     out.update(_lambda_functions(stores, env))
     out.update(await _ecs_services(stores, env, ecs_runtime))
     out.update(_cache_clusters(stores, env))

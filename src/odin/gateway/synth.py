@@ -76,6 +76,7 @@ from odin.gateway.models import (
     ec2compute,
     ecr,
     ecsctl,
+    efsctl,
     elbv2ctl,
     eventsctl,
     iamctl,
@@ -401,10 +402,11 @@ async def pure_answer(
     `backing_port` is app.py's existing `GatewayState.backing_port` lookup,
     threaded through here rather than forwarded (ECR's data plane, image
     bytes, bypasses the gateway entirely -- see gateway/models/ecr.py).
-    `query` is app.py's already-parsed query-string dict, needed only by
+    `query` is app.py's already-parsed query-string dict, needed by
     lambdactl.py's UntagResource (`TagKeys` rides the querystring on
-    Lambda's REST wire, unlike every other service modeled here -- see its
-    own docstring for the resulting v1 limitation). `ecs:*` (task V5a) is
+    Lambda's REST wire) and by efsctl.py's two describes, whose ENTIRE filter
+    is in the query string -- without it every describe would be an unfiltered
+    list-all and EFS's post-delete 404 could never fire. `ecs:*` (task V5a) is
     all-synth the same way, with its own REAL Colima-container substrate
     (`compute/tasks.py::TaskRuntime`, defaulted inside ecsctl.py itself --
     it needs no live fact threaded through here, unlike ecr's backing_port).
@@ -464,6 +466,13 @@ async def pure_answer(
     and `PutEvents` returns an error naming the missing dispatcher rather than
     an accepted-and-never-delivered `FailedEntryCount: 0` (gateway/models/
     eventsctl.py).
+    `efs:*` (`gateway/models/efsctl.py`) is all-synth too, and it is the ONE
+    modeled family whose substrate is neither a container nor a JSON sidecar: an
+    EFS file system IS a real host DIRECTORY at
+    `.odin/{env}/gateway/efs/{fs-id}/`, bind-mounted into the ECS tasks and
+    Lambda containers drawn with a mount edge to it. Nothing is forwarded and
+    nothing is booted; what makes the claim true is that two containers really
+    see the same directory.
     `s3:PutBucketNotification`/`s3:GetBucketNotification` are the ONE pair of
     S3 actions that are synth-owned (`gateway/models/s3notify.py`, in
     `_PURE_HANDLERS` below): S3 otherwise forwards wholesale to RustFS, but
@@ -506,6 +515,8 @@ async def pure_answer(
         return await elbv2ctl.pure_answer(action, resource, env, body, stores, now)
     if action.startswith("events:"):
         return await eventsctl.pure_answer(action, resource, env, body, stores, now)
+    if action.startswith("elasticfilesystem:"):
+        return await efsctl.pure_answer(action, resource, env, body, stores, now, query=query)
     # `_PURE_HANDLERS` is the one table that stays SYNCHRONOUS: these are the
     # gap-fill handlers for services that DO have a backing container, and
     # every one of them is pure in-memory reshaping of the request body -- no

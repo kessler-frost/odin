@@ -48,7 +48,7 @@ from odin.aws.backings import ACCOUNT, REGION
 from odin.gateway.policy import arn_label
 from odin.simulate import workspace as workspace_mod
 from odin.simulate.runner import PLUGIN_CACHE_DIR
-from odin.spec.translate import VOLUME_ATTACHMENT
+from odin.spec.translate import FILE_SYSTEM_MOUNT, VOLUME_ATTACHMENT
 from odin.util import reap
 
 _GRID_STEP = 220
@@ -102,6 +102,29 @@ _KIND = {
     # attachment to an instance is a companion `aws_volume_attachment`, folded
     # back into a canvas EDGE below rather than becoming a node.
     "aws_ebs_volume": "ebs",
+    # v0.8.19: a shared file system. Its label comes from `creation_token` (a
+    # `_NAME_ATTR` entry), NOT from the `odin:node` tag `ebs`/`ec2` fall back to,
+    # and the difference is only visible on a project odin did not generate.
+    #
+    # `aws_efs_file_system` has no `name` argument at all -- checked against the
+    # provider schema, the arguments are creation_token / encrypted / kms_key_id /
+    # performance_mode / throughput_mode / lifecycle_policy / tags -- so
+    # `creation_token` is the only name-shaped one, and it is the one `hcl.py`
+    # writes the canvas label into. That much would work either way, because
+    # odin's own output carries BOTH the token and the tag and they agree.
+    #
+    # The deciding reason is `_renamed_by_import`, which only fires for a type
+    # that HAS a `_NAME_ATTR`: without the entry, a hand-authored
+    # `creation_token = "${var.env}-data"` would fall through to the bare HCL
+    # resource name and the regenerated file system would be created under a
+    # DIFFERENT token, silently. With it, odin's own output round-trips without a
+    # word (the literal equals the label) and a computed one is reported CHANGED.
+    #
+    # Its mounts come back from the CONSUMER side -- a task definition's
+    # `volume`/`mountPoints` pair and a lambda's `file_system_config` -- as canvas
+    # EDGES, below. The `aws_efs_access_point` those lambda mounts point through
+    # is a COMPANION and never a node.
+    "aws_efs_file_system": "efs",
 }
 # Neither of these becomes a node. The task definition folds onto its service
 # (image/port/memory/cpu live there, not on the service); the cluster is a
@@ -120,6 +143,17 @@ _IAM_POLICY_TYPE = "aws_iam_role_policy"
 # aws_secretsmanager_secret_version folds onto its secret, which is what makes
 # generate -> import -> generate round-trip instead of multiplying resources.
 _ALB_COMPANION_TYPES = ("aws_lb_target_group", "aws_lb_listener")
+# v0.8.19: an access point folds away exactly as an ecs CLUSTER does -- it never
+# becomes a node and it is never reported unsupported when something claims it.
+#
+# It exists at all because `aws_lambda_function.file_system_config.arn` is
+# documented as an ACCESS POINT arn (botocore's own `FileSystemArn` pattern ends
+# `access-point/fsap-[a-f0-9]{17}$`), so a file-system arn there is a project
+# real AWS rejects. On the way back it is the JOIN: a lambda's mount names the
+# access point, the access point names the file system, and only then is there an
+# efs node to draw the edge to. Keyed by HCL resource NAME, like `aws_key_pair`,
+# because that is what the lambda's interpolation names.
+_EFS_ACCESS_POINT_TYPE = "aws_efs_access_point"
 # The attribute each supported type's human-facing name lives in (mirrors
 # hcl.py's builders: s3 uses `bucket`, elasticache uses `cluster_id`, rds uses
 # `identifier`, everything else uses `name`).
@@ -134,6 +168,10 @@ _NAME_ATTR = {
     "aws_security_group": "name", "aws_ecr_repository": "name",
     "aws_ecs_service": "name",
     "aws_lambda_function": "function_name",
+    # v0.8.19. See the `_KIND` note: `creation_token` is the only name-shaped
+    # argument the type has, it is where `hcl.py` writes the label, and being
+    # HERE is what makes `_renamed_by_import` fire for one odin cannot read.
+    "aws_efs_file_system": "creation_token",
 }
 # canvas kind -> aws_* type, for mode (b) (the inverse of `_KIND`). iam_role,
 # logs, secret and ssm have no backing to enumerate live resources from (all
@@ -167,9 +205,16 @@ _NAME_ATTR = {
 # `vol-...` VolumeId, minted by the gateway at CreateVolume and appearing nowhere
 # on a canvas, so there is no id to resolve one from outside an Apply. Mode (a),
 # reading an existing HCL project, works.
+# `efs` is out for that same reason and it is worth stating rather than assuming:
+# `terraform import aws_efs_file_system.x` takes the bare `fs-...` FileSystemId,
+# which the gateway mints at CreateFileSystem and which appears NOWHERE on a
+# canvas -- the label is the `creation_token`, not the id. There is no
+# `_import_id` shape that resolves one from outside an Apply, and claiming mode
+# (b) without one is how a live import generates a bogus `import {}` block and
+# fails at apply. Mode (a) works.
 _NO_LIVE_IMPORT = {
     "iam_role", "logs", "secret", "ssm", "elasticache", "alb", "sg", "ecr", "ec2", "ecs", "lambda",
-    "ebs",
+    "ebs", "efs",
 }
 _TF_TYPE = {kind: rtype for rtype, kind in _KIND.items() if kind not in _NO_LIVE_IMPORT}
 
@@ -257,9 +302,15 @@ _CARRIED_ATTRS = {
     # `filename`/`source_code_hash` are carried in the sense that odin re-derives
     # both from the code it materializes itself; `role` is either a reference to a
     # drawn iam_role node or odin's own auto-generated one (`_stamp_lambda`).
+    # v0.8.19: `file_system_config` is carried as a canvas EDGE (plus the efs
+    # node's `path`) by the mount pass below, not as a field on this node -- so
+    # it belongs here for the same reason `depends_on` does. Leaving it out
+    # reported "imported without unmodeled attribute(s): file_system_config" on
+    # every mounted function INCLUDING odin's own output, which is exactly the
+    # noise the central `tags` fix was written to stop.
     "lambda": {
         "function_name", "role", "handler", "runtime", "filename",
-        "source_code_hash", "depends_on",
+        "source_code_hash", "depends_on", "file_system_config",
     },
     # v0.8.18. `type` is carried in the sense that odin always re-emits it -- as
     # `gp3`, unconditionally (`hcl.py::_ebs`), because the canvas tile has no
@@ -268,6 +319,15 @@ _CARRIED_ATTRS = {
     # (`_FIXED_VALUES`), never a dropped one: an io2 volume imported as gp3 in
     # silence is the elasticache bug in another costume.
     "ebs": {"availability_zone", "size", "type"},
+    # v0.8.19. `creation_token` only -- everything else `aws_efs_file_system`
+    # accepts is genuinely UNMODELLED and reported dropped, which is the honest
+    # answer rather than a `_FIXED_VALUES` entry pretending odin re-emits it.
+    # `encrypted`/`kms_key_id` are the ones that matter: odin's substrate is a
+    # host directory (agent C's `.odin/<env>/gateway/efs/<fs-id>/`) and it
+    # encrypts NOTHING, so carrying them onto the canvas would claim a property
+    # the substrate has not got -- the kms lesson. `performance_mode`,
+    # `throughput_mode` and `lifecycle_policy` have no substrate meaning either.
+    "efs": {"creation_token"},
 }
 # EVERY primary kind's carried set, `tags` included.
 #
@@ -309,8 +369,40 @@ _CARRIED_COMPANION_ATTRS = {
     # that odin re-derives it positionally (`_assigned_devices`), so a source
     # that names a different device is reported CHANGED.
     "aws_volume_attachment": {"device_name", "instance_id", "volume_id"},
+    # v0.8.19. The access point folds ONTO its file system, so anything the
+    # source put on it has to be accounted for here or it vanishes. `posix_user`
+    # is the one that bites: it forces every file the mount creates to one
+    # uid/gid, and odin re-emits nothing for it. `root_directory` IS carried in
+    # the sense that odin always re-emits it -- as `path = "/"` -- so a source
+    # rooted at a subdirectory is a CHANGED argument, reported by
+    # `_root_directory_change` below rather than by `_FIXED_VALUES`, which cannot
+    # reach inside a block.
+    _EFS_ACCESS_POINT_TYPE: {"file_system_id", "root_directory"},
 }
 _CARRIED_HEALTH_CHECK_ATTRS = {"path"}
+# v0.8.19: the arguments of the ECS mount, which lives in nested blocks on a
+# TASK DEFINITION rather than on a resource of its own.
+#
+# It is NOT in `_CARRIED_COMPANION_ATTRS`, deliberately, and not only because
+# `aws_ecs_task_definition` is not the owner of these keys: that table is read by
+# `tests/agent/test_import_coverage_is_honest.py` as the set of aws_* resource
+# TYPES import understands, and a key that is not a type would inflate the
+# published count. `_CARRIED_HEALTH_CHECK_ATTRS` sits outside it for the same
+# reason.
+#
+# The task definition has NO general attribute-honesty pass (it is folded on by
+# `_stamp_ecs_taskdef`, which reports what it cannot carry in prose), and adding
+# one here was rejected on scope: it would immediately warn about `family`,
+# `network_mode` and `requires_compatibilities` on every ecs import that exists
+# today. So the pass below is targeted at the mount blocks, which are the part
+# this change introduces and the part that would otherwise vanish.
+_CARRIED_EFS_VOLUME_ATTRS = {"name", "efs_volume_configuration"}
+_CARRIED_EFS_VOLUME_CONFIG_ATTRS = {"file_system_id", "root_directory"}
+# hcl.py roots BOTH the access point and the ECS volume configuration at the top
+# of the file system. A source that roots either one at a subdirectory is telling
+# the consumer it may see only that subtree, and regenerating with `/` hands it
+# the WHOLE file system -- a widening, which is the direction worth a warning.
+_ODIN_EFS_ROOT = "/"
 # (owner, attribute) -> the value odin ALWAYS emits, lowercased. An imported
 # value that differs is reported by name: the argument survives, its MEANING
 # does not. Owner is the canvas kind for a primary resource, the aws_* type for
@@ -1331,6 +1423,241 @@ def _stamp_ecs_taskdef(
     return warnings
 
 
+def _root_directory_path(value: object) -> str | None:
+    """The directory a `root_directory` roots a mount at, or None when the source
+    does not state it as a plain literal.
+
+    TWO SPELLINGS, ONE MEANING, which is why this takes a value rather than a
+    key: on an `aws_efs_access_point` it is a BLOCK (`root_directory { path =
+    "/data" }`, which python-hcl2 hands back as a list of dicts), and inside a
+    task definition's `efs_volume_configuration` it is a plain string ARGUMENT.
+    """
+    block = value[0] if isinstance(value, list) and value and isinstance(value[0], dict) else None
+    return _plain_literal(block.get("path") if block is not None else value)
+
+
+def _root_directory_lines(attrs: dict, key: str) -> list[str]:
+    """The CHANGED line for a mount rooted somewhere other than the top of the
+    file system.
+
+    A `_FIXED_VALUES` entry cannot express this -- that table compares
+    `attrs[key]` directly, and a block never equals a scalar -- and routing it
+    through `_attribute_notes`'s `also_changed` would print the parsed block
+    verbatim as `[{'path': '"/data"'}]`. So the line is rendered here, with the
+    real path in it.
+
+    The direction is what makes it worth a warning: odin re-roots the mount at
+    `/`, so the consumer comes back seeing the WHOLE file system where the source
+    had confined it to one subtree. A widening, reported by name.
+    """
+    path = _root_directory_path(attrs.get(key)) if key in attrs else _ODIN_EFS_ROOT
+    return [] if path == _ODIN_EFS_ROOT else [
+        f"{key}={path or _literal(attrs[key])} (odin always roots this mount at "
+        f"{_ODIN_EFS_ROOT}, so the consumer sees the WHOLE file system, not that subtree)"
+    ]
+
+
+def _efs_volume_notes(block: dict) -> tuple[list[str], list[str]]:
+    """`(dropped, changed)` for one task-definition `volume {}` block holding an
+    EFS mount -- the arguments an EDGE cannot carry.
+
+    `transit_encryption` and `authorization_config` are the two that matter, and
+    neither survives: odin's substrate is a host directory bind-mounted into the
+    container, so there is no TLS session to encrypt and no access point to
+    authorize against. A mount the source encrypted coming back plain, with no
+    word said, is this module's worst available failure.
+
+    The owner passed to `_attribute_notes` is the resource these blocks live on
+    rather than a name invented for them, so a `_FIXED_VALUES` entry added for
+    `aws_ecs_task_definition` later would be honoured here for free.
+    """
+    config = (block.get("efs_volume_configuration") or [{}])[0]
+    dropped, _ = _attribute_notes(
+        "aws_ecs_task_definition", block, _CARRIED_EFS_VOLUME_ATTRS, (), {},
+    )
+    inner, _ = _attribute_notes(
+        "aws_ecs_task_definition", config, _CARRIED_EFS_VOLUME_CONFIG_ATTRS, (), {},
+    )
+    return (
+        sorted(dropped + [f"efs_volume_configuration.{name}" for name in inner]),
+        [f"efs_volume_configuration.{line}" for line in _root_directory_lines(config, "root_directory")],
+    )
+
+
+def _ecs_efs_mounts(
+    label: str, attrs: dict, taskdefs: dict[str, dict], by_hcl_name: dict[str, str],
+) -> tuple[list[tuple[str, str, str | None]], list[str]]:
+    """`([(efs label, container path, access point name)], warnings)` for one ecs
+    service. The access point is always None on this side -- ECS reaches the file
+    system directly.
+
+    THE MOUNT IS A JOIN, not a lookup, and that is the whole difficulty: the task
+    definition's `volume {}` block names the FILE SYSTEM
+    (`efs_volume_configuration.file_system_id`) and the container definition's
+    `mountPoints[]` names the PATH, and the only thing tying the two together is
+    the volume's own `name` matching a mountPoint's `sourceVolume`. Either half
+    missing is a mount that cannot be reconstructed, and each is reported
+    separately because they cost different things.
+
+    A `host {}` or `docker_volume_configuration {}` volume is NOT an efs mount and
+    is skipped rather than reported: calling it a lost efs mount would be a lie
+    about its type, and a mountPoint pointing at one is perfectly ordinary.
+    """
+    taskdef = taskdefs.get(_ref_target(attrs.get("task_definition")) or "", {})
+    container = _container_definition(taskdef)
+    paths = {
+        point.get("sourceVolume"): point.get("containerPath")
+        for point in container.get("mountPoints") or [] if isinstance(point, dict)
+    }
+    mounts: list[tuple[str, str, str | None]] = []
+    warnings: list[str] = []
+    for block in taskdef.get("volume") or []:
+        configs = block.get("efs_volume_configuration") or []
+        if not configs:
+            continue
+        name = hcl.unquote(block.get("name"))
+        efs = _referenced_label(configs[0].get("file_system_id"), "aws_efs_file_system", by_hcl_name)
+        path = paths.get(name)
+        if efs is None:
+            warnings.append(
+                f"{label} (ecs): its task definition mounts a volume named {name!r} whose "
+                "`file_system_id` names no imported aws_efs_file_system. THE MOUNT IS LOST: the "
+                "regenerated task definition carries no volume at all, so the container starts with "
+                "an empty directory where its shared data was"
+            )
+            continue
+        if path is None:
+            warnings.append(
+                f"{efs} -> {label} (efs mount): the task definition DECLARES this volume and no "
+                "container mounts it (no `mountPoints` entry has "
+                f"`sourceVolume = {name!r}`), so it does nothing today. odin's canvas cannot express "
+                "a declared-but-unmounted volume -- an edge means mounted -- so the regenerated task "
+                "definition omits the volume block"
+            )
+            continue
+        mounts.append((efs, path, None))
+        dropped, changed = _efs_volume_notes(block)
+        warnings += _attribute_warnings(f"{efs} -> {label} (efs mount)", "", dropped, changed)
+    return mounts, warnings
+
+
+def _lambda_efs_mounts(
+    label: str, attrs: dict, access_points: dict[str, dict], by_hcl_name: dict[str, str],
+) -> tuple[list[tuple[str, str, str | None]], list[str]]:
+    """`([(efs label, local mount path, access point resource name)], warnings)`
+    for one function.
+
+    THE ACCESS POINT IS IN THE MIDDLE and it is not optional:
+    `file_system_config.arn` is an access-point arn, so the function names the
+    access point and the access point names the file system. Two hops, two ways
+    to lose the mount, reported separately.
+    """
+    mounts: list[tuple[str, str, str | None]] = []
+    warnings: list[str] = []
+    for block in attrs.get("file_system_config") or []:
+        ap_name = _ref_target(block.get("arn"))
+        ap_attrs = access_points.get(ap_name or "")
+        efs = _referenced_label(
+            (ap_attrs or {}).get("file_system_id"), "aws_efs_file_system", by_hcl_name,
+        )
+        if efs is None:
+            warnings.append(
+                f"{label} (lambda): its `file_system_config.arn` does not resolve to an imported "
+                "aws_efs_file_system -- " + (
+                    "it names no imported aws_efs_access_point" if ap_attrs is None else
+                    "the aws_efs_access_point it names has a `file_system_id` that does"
+                    " not either"
+                ) + ". THE MOUNT IS LOST: the regenerated function has no file_system_config, so it "
+                "runs with nothing at that path"
+            )
+            continue
+        # An unreadable path is carried as "" rather than skipped: the MOUNT is
+        # real and its edge must come back, and `_stamp_efs_paths` reports the
+        # path separately rather than letting odin's default pass for the
+        # source's own.
+        mounts.append((efs, _plain_literal(block.get("local_mount_path")) or "", ap_name))
+    return mounts, warnings
+
+
+def _stamp_efs_paths(
+    node_by_label: dict[str, dict], mounts: list[tuple[str, str, str, str]],
+) -> list[str]:
+    """Put ONE mount path on each efs node and report every consumer that used a
+    different one. `mounts` is `[(efs label, consumer label, consumer kind, path)]`.
+
+    AWS lets each consumer mount a file system wherever it likes; odin's tile has
+    a single `path` field and `hcl.py` re-emits it to every consumer, so a source
+    that disagrees cannot round-trip. Substituting in silence is the elasticache
+    bug in another costume -- a function told to read `/mnt/config` comes back
+    reading `/mnt/efs`, finds an empty directory, and nothing said so.
+
+    WHICH path wins is not arbitrary, and the asymmetry is measured from
+    botocore's own models rather than assumed. Lambda's `LocalMountPath` carries
+    `pattern: /mnt/[a-zA-Z0-9-_.]+` -- ONE segment under /mnt, and the provider
+    enforces it client-side -- while ECS's `containerPath` has no pattern at all.
+    So a lambda's path is always legal for an ecs task and an ecs task's `/data`
+    is NOT legal for a lambda: preferring the lambda's can never produce a project
+    odin then declines by name, and preferring the other one can. Ties inside a
+    kind break on the consumer label, so the answer never depends on file order.
+    """
+    warnings: list[str] = []
+    by_efs: dict[str, list[tuple[str, str, str]]] = {}
+    for efs, consumer, kind, path in sorted(mounts):
+        by_efs.setdefault(efs, []).append((kind, consumer, path))
+    for efs, entries in sorted(by_efs.items()):
+        ranked = sorted(entries, key=lambda entry: (entry[0] != "lambda", entry[1]))
+        paths = {consumer: path for _kind, consumer, path in ranked if path}
+        unreadable = sorted(consumer for _kind, consumer, path in ranked if not path)
+        warnings += [] if not unreadable else [
+            f"{efs} (efs): {', '.join(unreadable)} mount(s) it at a `local_mount_path` odin cannot "
+            "read as a literal, so the canvas gets odin's own default mount path -- not the one the "
+            "source asked for"
+        ]
+        if not paths:
+            continue
+        chosen = next(path for _kind, consumer, path in ranked if path)
+        node_by_label[efs]["data"]["path"] = chosen
+        # A path a LAMBDA cannot mount, reported here at import time rather than
+        # left to surface much later as an Apply that silently drops a function
+        # -- `_stamp_containment`'s rule, and field test U2's.
+        #
+        # It ASKS THE REAL PREDICATE (`hcl._MOUNT_PATH`, compiled from the
+        # pattern `hcl.py` reads out of botocore) instead of restating it, for
+        # `_readable_rule`'s reason: a copy is only ever as true as the last
+        # person who edited both.
+        #
+        # GATED ON A LAMBDA CONSUMER EXISTING, and that gate is the whole
+        # correctness of this guard. AWS constrains only Lambda's
+        # `LocalMountPath`; ECS's `containerPath` has no pattern at all, so
+        # `/data` is a legal ecs-only mount that odin's bind-mount substrate
+        # serves happily and `hcl.py` emits without complaint. An earlier version
+        # fired on the node's path alone and told the user their file system
+        # would be dropped -- true against a generator that applied Lambda's
+        # pattern to every efs node, false the moment that was narrowed to
+        # decline only the offending FUNCTION. The pattern it reads was real
+        # throughout; the conclusion it drew from it went stale.
+        #
+        # Reachable despite `ranked` preferring a lambda's path: a lambda whose
+        # own `local_mount_path` is computed contributes no readable path, so an
+        # ecs consumer's `/data` wins and lands on a node that function mounts.
+        mounts_on_lambda = any(kind == "lambda" for kind, _consumer, _path in ranked)
+        warnings += [] if hcl._MOUNT_PATH.fullmatch(chosen) or not mounts_on_lambda else [
+            f"{efs} (efs): the canvas gets `path = {chosen}`, which a Lambda function cannot mount "
+            f"(AWS's pattern is {hcl._LOCAL_MOUNT_PATH_PATTERN}, one segment under /mnt). The file "
+            "system and its ecs mounts are fine; odin declines the FUNCTION by name on the next "
+            "Apply, so give it a path under /mnt or mount it on a service instead"
+        ]
+        changes = _derived_changes(
+            (consumer, path, chosen) for consumer, path in sorted(paths.items())
+        )
+        warnings += _attribute_warnings(
+            f"{efs} (efs)", "per-consumer mount ", [],
+            [f"{consumer} mounts it at {paths[consumer]} ({why} to EVERY consumer, because the "
+             "canvas tile carries ONE path field)" for consumer, why in sorted(changes.items())],
+        )
+    return warnings
+
+
 def _stamp_ec2_wiring(
     node_by_label: dict[str, dict], attrs_by_label: dict[str, dict], by_hcl_name: dict[str, str],
     key_pairs: dict[str, dict],
@@ -1602,6 +1929,7 @@ def parse_hcl(files: dict[str, str], archives: dict[str, bytes] | None = None) -
     secret_versions: list[tuple[str, dict]] = []
     alb_companions: list[tuple[str, str, dict]] = []
     volume_attachments: list[tuple[str, dict]] = []
+    access_points: dict[str, dict] = {}
     key_pairs: dict[str, dict] = {}
     taskdefs: dict[str, dict] = {}
     role_policies: list[dict] = []
@@ -1633,6 +1961,13 @@ def parse_hcl(files: dict[str, str], archives: dict[str, bytes] | None = None) -
             # singleton odin always emits and the canvas has no kind for.
             if rtype == "aws_ecs_task_definition":
                 taskdefs[rname] = attrs
+            continue
+        if rtype == _EFS_ACCESS_POINT_TYPE:
+            # v0.8.19: a COMPANION, like an `aws_key_pair` -- it folds onto the
+            # file system a lambda mounts through it and never becomes a node.
+            # Keyed by HCL resource name because that is what the function's
+            # `file_system_config.arn` interpolation names.
+            access_points[rname] = attrs
             continue
         if rtype == "aws_key_pair":
             # A COMPANION, like a secret version: it folds onto the instance that
@@ -1873,6 +2208,70 @@ def parse_hcl(files: dict[str, str], archives: dict[str, bytes] | None = None) -
         warnings += _attribute_warnings(
             f"{volume_label} -> {instance_label} (volume attachment)", "", dropped, changed,
         )
+
+    # v0.8.19: EFS MOUNTS, recovered from the CONSUMER side.
+    #
+    # This is where the shape differs from every other companion in this file. An
+    # `aws_volume_attachment` is a RESOURCE of its own naming both ends, so its
+    # inverse is a lookup. An EFS mount is a nested block on the CONSUMER naming
+    # only the file system, so the edge has to be reassembled -- from two places
+    # on an ecs task definition (`volume {}` for the file system, `mountPoints[]`
+    # for the path) and through an access point in the middle on a lambda.
+    #
+    # `edgeType` is stamped even though hcl.py's mount pass keys on the two node
+    # KINDS: the canvas needs it to draw and label the line, and
+    # `spec/translate.py`'s `FILE_SYSTEM_MOUNT` is what it must spell.
+    finders = {
+        "ecs": lambda label: _ecs_efs_mounts(label, attrs_by_label[label], taskdefs, by_hcl_name),
+        "lambda": lambda label: _lambda_efs_mounts(
+            label, attrs_by_label[label], access_points, by_hcl_name,
+        ),
+    }
+    mounts: list[tuple[str, str, str, str]] = []
+    claimed_access_points: set[str] = set()
+    for label, node in sorted(node_by_label.items()):
+        find = finders.get(node["type"])
+        if find is None:
+            continue
+        found, mount_warnings = find(label)
+        warnings += mount_warnings
+        mounts += [(efs, label, node["type"], path) for efs, path, _ap in found]
+        claimed_access_points |= {ap for _efs, _path, ap in found if ap}
+    # ONE edge per (file system, consumer) pair even when a task definition
+    # mounts the same file system twice: two edges between the same two nodes is
+    # a canvas the UI cannot draw and a round trip that is not stable.
+    edges += [
+        {"source": efs, "target": consumer, "data": {"edgeType": FILE_SYSTEM_MOUNT}}
+        for efs, consumer in sorted({(efs, consumer) for efs, consumer, _kind, _path in mounts})
+    ]
+    warnings += _stamp_efs_paths(node_by_label, mounts)
+    # The claimed access points' own arguments, held to the same rule as any
+    # other companion's, and attributed to the file system they fold onto --
+    # once each, not once per function, since two lambdas may mount through one.
+    for rname in sorted(claimed_access_points):
+        ap_attrs = access_points[rname]
+        efs = _referenced_label(
+            ap_attrs.get("file_system_id"), "aws_efs_file_system", by_hcl_name,
+        )
+        dropped, changed = _attribute_notes(
+            _EFS_ACCESS_POINT_TYPE, ap_attrs,
+            _CARRIED_COMPANION_ATTRS[_EFS_ACCESS_POINT_TYPE], (), {},
+        )
+        warnings += _attribute_warnings(
+            f"{efs} (efs)", f"{_EFS_ACCESS_POINT_TYPE} ", dropped,
+            sorted(changed + _root_directory_lines(ap_attrs, "root_directory")),
+        )
+    # An access point no imported function mounts through is the target group
+    # case: it folds onto nothing, so it is REPORTED rather than dropped in
+    # silence. odin emits one only for a file system a lambda mounts, so its own
+    # output never lands here.
+    for rname in sorted(set(access_points) - claimed_access_points):
+        unsupported.append(Unsupported(
+            type=_EFS_ACCESS_POINT_TYPE, name=rname,
+            reason="access point is not the mount target of any imported aws_lambda_function -- "
+                   "odin emits one only for a file system a function mounts, so a regenerated "
+                   "project would NOT contain it",
+        ))
 
     policy_edges, policy_warnings = _edges_from_role_policies(
         role_policies, node_by_label, attrs_by_label,

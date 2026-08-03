@@ -151,6 +151,21 @@ graph TD
 
 Lima has no attach verb and refuses `limactl edit` on a live instance, so an attachment is **stop, rewrite, start** — a real reboot, and the instance reads `pending`/`starting` for its duration rather than going on claiming `running`. `device_name` is advisory: `/dev/sdf` goes in, `/dev/vdb` comes out, Lima formats and mounts it by NAME, and the cidata ISO shifts along. Address the disk by its mount point, never by its letter.
 
+### EFS
+
+`a real host directory under .odin/<env>/gateway/efs/, bind-mounted`
+
+```mermaid
+graph TD
+  F["efs node"] -->|"aws_efs_file_system"| G["gateway efsctl"]
+  G --> D[".odin/env/gateway/efs/fs-id<br/>a real directory on the host"]
+  D -->|"-v dir:/mnt/efs"| T1["ecs task container"]
+  D -->|"-v dir:/mnt/efs"| T2["lambda RIE container"]
+  E["ec2 node — a Lima VM"] -.->|"mounts: [] — NOT visible"| D
+  G -.->|"no mount target, no SG,<br/>no IAM, no encryption"| N["nothing gates the mount"]
+```
+
+One directory, many consumers — sharing is the whole feature, which is why this is a `mount` edge and not the exclusive `volume` one above. It reaches **containers only**: odin's Lima VMs are created with `"mounts": []`, so the same bind mount into an `ec2` node would succeed and be empty, and the pair is left `unmodelled` rather than drawn. Nothing gates it either — a bind mount is performed by the container runtime and the gateway never sees a signed request for it, which is why the EFS tile offers no IAM actions at all.
 
 ### VPC · Subnet · Security Group
 

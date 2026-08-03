@@ -114,11 +114,25 @@ To regenerate this diagram after editing `docs/diagrams/*.mmd`:
   owns the model and binds it to a substrate.
 - **Translation** (`src/odin/agent/`) is deterministic in both directions and
   no longer covers quite the same node kinds in both: canvas → Terraform
-  builds 20, and Terraform → canvas reads all 19 back across 28 resource types
+  builds 21, and Terraform → canvas reads all 20 back across 30 resource types
   that it models. The gap is `kms`, added in v0.8.18 — emitted and not yet
   imported, so a project carrying an `aws_kms_key` does not round-trip through
-  the canvas. Stated rather than rounded away, because "both directions" was
-  true for eleven releases and is the sort of claim a reader keeps believing. Anything odin
+  the canvas. `efs` (v0.8.19) did NOT widen that gap: it arrived in both
+  directions at once, and its two resource types are why 28 became 30 —
+  `aws_efs_file_system` and the `aws_efs_access_point` companion a lambda mount
+  needs. Stated rather than rounded away, because "both directions" was
+  true for eleven releases and is the sort of claim a reader keeps believing.
+
+  These three numbers are pinned by
+  `tests/agent/test_import_coverage_is_honest.py`, which derives all three from
+  the live registries — so this sentence cannot go stale. **Nothing pins a
+  COMMIT MESSAGE, and one is already wrong**: `a775d3d` says "corrected to a
+  measured 19/19/28", which was true when written and was moved by the kms work
+  a commit later. A commit message is immutable, unreachable by any ratchet, and
+  reads as authoritative forever. So if you are here because a git log quoted
+  these counts at you, re-derive them rather than believing the message —
+  `len(hcl._BUILDERS)`, `len(set(import_tf._KIND.values()))`, and
+  `len(set(import_tf._KIND) | companions)` are what the ratchet reads. Anything odin
   does not model is a LISTED unsupported entry rather than a silent omission.
   Equal node coverage is **not lossless**, and what it costs is listed rather
   than discovered: a security group's IPv6 rules and any port that is not a

@@ -21,6 +21,7 @@ import {
   edgeDataForConnection,
   edgeStyle,
   edgeTypes,
+  efsMountTypes,
   encryptionTargetTypes,
   iamActionsForTarget,
   iamTargetTypes,
@@ -206,6 +207,58 @@ describe('the encryption edge (kms -> the sidecars odin holds keys for)', () => 
     for (const action of defaultPermissions.kms) {
       expect(iamActionsForTarget.kms).toContain(action);
     }
+  });
+});
+
+describe('the mount edge (efs -> the container-backed kinds)', () => {
+  // There is no equivalent block for `volume` (v0.8.18) -- it is pinned across
+  // the language boundary by `tests/spec/test_edge_registry_matches_builders.py`
+  // and nowhere here. Worth saying rather than quietly matching: this file is
+  // where the LABEL and the rendering are pinned, and those two are exactly what
+  // a Python test cannot see.
+  it('efs <-> ecs and efs <-> lambda are MOUNTS, not the catch-all', () => {
+    expect(detectEdgeTypes('efs', 'ecs')).toEqual(['mount']);
+    expect(detectEdgeTypes('ecs', 'efs')).toEqual(['mount']);
+    expect(detectEdgeTypes('efs', 'lambda')).toEqual(['mount']);
+    expect(edgeTypes.mount.label).toBe('File System Mount');
+  });
+
+  it('renders as itself rather than a grey fallback', () => {
+    expect(edgeStyle('mount').stroke).toBe(edgeTypes.mount.color);
+    expect(edgeStyle('mount').stroke).not.toBe(edgeTypes[UNMODELLED].color);
+  });
+
+  it('carries no permissions — a bind mount is not an AWS-signed call', () => {
+    // The reason `efs` declares no `iamActions`: odin's gateway never sees a
+    // request for the mount, so `elasticfilesystem:ClientMount` would be a
+    // permission that cannot bite. It is also what keeps this pair unambiguous
+    // -- the IAM loop registers every `iamActionsForTarget` key against every
+    // compute kind, so declaring one would give this pair a second meaning and
+    // fail `edge-ambiguity.test.ts` by name.
+    expect(edgeDataForConnection('efs', 'ecs').permissions).toEqual([]);
+    expect(iamTargetTypes.has('efs')).toBe(false);
+  });
+
+  it('is limited to the kinds whose substrate is a CONTAINER', () => {
+    // Not a deferral. `ec2` runs as a Lima VM and odin creates those with
+    // `mounts: []` (`compute/lima_yaml.py`), so a host directory is not visible
+    // inside one -- a fuchsia line there would claim a share that is empty,
+    // which is the measured burn this repo already has on record.
+    expect([...efsMountTypes].sort()).toEqual(['ecs', 'lambda']);
+    expect(detectEdgeTypes('efs', 'ec2')).toEqual([UNMODELLED]);
+  });
+
+  it('no two meanings are drawn the same colour', () => {
+    // Added with `mount` because it nearly was one: the EFS tile's accent was
+    // `sky`, which is `target`'s colour, and an `alb -> ecs` target meets an
+    // `efs -> ecs` mount on the same node in an ordinary canvas. Two solid lines
+    // of one colour meaning two things is the canvas saying less than it knows.
+    // `network` is the ONE deliberate duplicate: it is the pre-rename spelling
+    // of `unmodelled` and shares its grey on purpose.
+    const byColor: Record<string, string[]> = {};
+    for (const [id, def] of Object.entries(edgeTypes)) (byColor[def.color] ??= []).push(id);
+    const shared = Object.values(byColor).filter((ids) => ids.length > 1).map((ids) => ids.sort().join('+'));
+    expect(shared).toEqual(['network+unmodelled']);
   });
 });
 

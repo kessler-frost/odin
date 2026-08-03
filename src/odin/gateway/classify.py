@@ -339,6 +339,8 @@ def classify(
         return _classify_elbv2(body)
     if service == "events":
         return _classify_events(lower_headers, body)
+    if service == "elasticfilesystem":
+        return _classify_efs(method, path, query, body)
     return None
 
 
@@ -925,6 +927,105 @@ def _classify_lambda(method: str, path: str, body: bytes) -> tuple[str, str] | N
             return f"lambda:{op}", "*"
         return f"lambda:{op}", name.rsplit(":", 1)[-1] if name.startswith("arn:") else name
     return None
+
+
+# EFS, the SECOND rest-json service odin models (Lambda is the first), so it
+# routes by method+path exactly like `_LAMBDA_ROUTES` above and not by an
+# X-Amz-Target header or a query-protocol `Action` param. Verified against
+# botocore's own efs model: `protocol: rest-json`, `endpointPrefix:
+# elasticfilesystem`, `targetPrefix: None`.
+#
+# SEVEN routes and no more, because seven is what a real `tofu apply` + `plan` +
+# `destroy` over `aws_efs_file_system` + `aws_efs_access_point` was MEASURED
+# calling (OpenTofu 1.12.3 / hashicorp/aws 6.57.1, against a recording
+# endpoint). `DescribeBackupPolicy`, `DescribeFileSystemPolicy`,
+# `ListTagsForResource`, `DescribeMountTargets` and `TagResource` are never
+# called at all -- a route for one of those would be a permission nothing can
+# exercise, which is the decorative thing this repo keeps deleting.
+#
+# The action prefix is `elasticfilesystem:` -- the SIGNING NAME, which is also
+# AWS's real IAM namespace, and the same rule every other branch in this file
+# keeps (`elasticloadbalancing:`, `secretsmanager:`, `elasticache:`, `kms:` are
+# all their own signing names). An earlier draft emitted a short `efs:`, and
+# MEASURING it is what settled the question rather than taste:
+#
+#   arn_label("arn:aws:elasticfilesystem:...:file-system/fs-...", "efs:Describe...")
+#
+# `policy.py::arn_label` compares the ARN's OWN service field against
+# `action.partition(":")[0]` and returns None on a mismatch BEFORE it ever looks
+# up a resource pattern -- so an `efs:` prefix could never match an ARN-form
+# `Resource`, no matter what `_ARN_RESOURCE_LABEL` entry anyone added later. A
+# permission the classifier emits that nothing can grant is this repo's
+# ecr/rds/kms bug, planted fresh. `elasticfilesystem:` is merely not-yet-wired
+# there (no efs IAM edges exist -- see the tile's `iamActions` note), which is a
+# gap that can be closed; a dead end is not.
+_EFS_ROUTES: tuple[tuple[str, re.Pattern[str], str], ...] = (
+    ("POST", re.compile(r"^/2015-02-01/file-systems$"), "CreateFileSystem"),
+    ("GET", re.compile(r"^/2015-02-01/file-systems$"), "DescribeFileSystems"),
+    (
+        "GET",
+        re.compile(r"^/2015-02-01/file-systems/(?P<fs>[^/]+)/lifecycle-configuration$"),
+        "DescribeLifecycleConfiguration",
+    ),
+    ("DELETE", re.compile(r"^/2015-02-01/file-systems/(?P<fs>[^/]+)$"), "DeleteFileSystem"),
+    ("POST", re.compile(r"^/2015-02-01/access-points$"), "CreateAccessPoint"),
+    ("GET", re.compile(r"^/2015-02-01/access-points$"), "DescribeAccessPoints"),
+    ("DELETE", re.compile(r"^/2015-02-01/access-points/(?P<ap>[^/]+)$"), "DeleteAccessPoint"),
+)
+
+# Which request field names the resource, per operation, when the PATH does not.
+# A create carries it in the body; a describe carries it in the querystring
+# (rest-json puts a `querystring` location on those members), which is why
+# `_classify_efs` needs `query` at all.
+_EFS_BODY_RESOURCE = {"CreateFileSystem": "CreationToken", "CreateAccessPoint": "FileSystemId"}
+_EFS_QUERY_RESOURCE = {
+    "DescribeFileSystems": ("FileSystemId", "CreationToken"),
+    "DescribeAccessPoints": ("AccessPointId", "FileSystemId"),
+}
+
+
+def _classify_efs(method: str, path: str, query: dict[str, str], body: bytes) -> tuple[str, str] | None:
+    for route_method, pattern, op in _EFS_ROUTES:
+        if route_method != method:
+            continue
+        match = pattern.match(path)
+        if match is None:
+            continue
+        groups = match.groupdict()
+        path_id = groups.get("fs") or groups.get("ap")
+        return f"elasticfilesystem:{op}", unquote(path_id) if path_id else _efs_resource(op, query, body)
+    return None
+
+
+def _efs_resource(op: str, query: dict[str, str], body: bytes) -> str:
+    """The resource a create/describe names, or `*` for an unfiltered list.
+
+    `*` for a list-all is the same choice `_classify_lambda` makes for a
+    nameless CreateFunction, and it means the same thing here: the request is
+    genuinely not about one resource, so a policy that grants one must not match
+    it. An unscoped `DescribeFileSystems()` is a different permission from
+    reading the file system an edge points at -- the exact distinction field
+    test 2 cost an engineer an hour over on rds."""
+    try:
+        payload = json.loads(body) if body else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        payload = {}
+    body_key = _EFS_BODY_RESOURCE.get(op)
+    if body_key:
+        value = payload.get(body_key) if isinstance(payload, dict) else None
+        return _efs_bare(value) if isinstance(value, str) and value else "*"
+    for key in _EFS_QUERY_RESOURCE.get(op, ()):
+        if query.get(key):
+            return _efs_bare(unquote(query[key]))
+    return "*"
+
+
+def _efs_bare(value: str) -> str:
+    """`arn:aws:elasticfilesystem:...:file-system/fs-x` -> `fs-x`; anything
+    without a `/` (a bare id, a creation token) passes through unchanged. Every
+    EFS id member accepts both forms -- its own botocore patterns spell out the
+    ARN alternative -- so a policy written against one must match the other."""
+    return value.rpartition("/")[2] or value
 
 
 def _classify_s3(
