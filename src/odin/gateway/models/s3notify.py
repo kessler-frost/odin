@@ -366,12 +366,47 @@ def probe_keys(
     """The keys whose EXISTENCE has to be established before the delete is
     forwarded -- the input to `app.py`'s pre-forward HEAD probe.
 
-    WHY BEFORE THE FORWARD. S3 deletes are idempotent and the response says so:
-    MEASURED against `rustfs/rustfs:latest` on 2026-08-03, a single-object
-    `DELETE` of a key that never existed answered **204**, exactly as it did for
-    a key that did, and `DeleteObjects` reported BOTH under `<Deleted>` with
-    zero `<Error>` entries. After the forward the answer is gone, so the only
-    place the question can be asked is here.
+    WHY BEFORE THE FORWARD. S3 deletes are idempotent and the response says so.
+    THE RAW WIRE, `rustfs/rustfs:latest`, 2026-08-03, signed requests, every
+    response header verbatim -- because a summary of a probe is the thing that
+    goes stale, and the header in the fourth block is the whole reason this
+    module reads HEAD instead:
+
+        HEAD /lim6raw/incoming/a.jpg          (key exists)
+          HTTP/1.1 200 OK
+          accept-ranges: bytes
+          content-length: 5
+          content-type: image/jpeg
+          etag: "5d41402abc4b2a76b9719d911017c592"
+          last-modified: Mon, 03 Aug 2026 19:11:48 GMT
+
+        HEAD /lim6raw/does/not/exist.jpg      (key never existed)
+          HTTP/1.1 404 Not Found
+          content-type: application/xml
+          <body 0 bytes>
+
+        DELETE /lim6raw/does/not/exist.jpg    (key never existed)
+          HTTP/1.1 204 No Content
+          x-request-id: 16a39520-ec49-4656-9fa6-701b8b3a7539
+          <body 0 bytes>
+
+        DELETE /lim6raw/incoming/a.jpg        (key exists)
+          HTTP/1.1 204 No Content
+          x-amz-delete-marker: false
+          x-request-id: e1f057dd-7ce6-4e18-8ddf-e953395baa7d
+          <body 0 bytes>
+
+        POST /lim6raw?delete=                 (one of each)
+          HTTP/1.1 200 OK
+          content-length: 207
+          b'<?xml version="1.0" encoding="UTF-8"?><DeleteResult xmlns="http:/
+          /s3.amazonaws.com/doc/2006-03-01/"><Deleted><Key>incoming/a.jpg</Ke
+          y></Deleted><Deleted><Key>does/not/exist.jpg</Key></Deleted></Delet
+          eResult>'
+
+    Both DELETEs are 204 and both keys come back `<Deleted>` with zero
+    `<Error>`. After the forward the answer is gone, so the only place the
+    question can be asked is here.
 
     WHY THIS IS NOT "one HEAD per delete". The probe is scoped to the keys a
     stored configuration would actually FIRE for -- the same `matches`

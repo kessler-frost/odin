@@ -19,8 +19,10 @@ about how odin FULFILLS a call locally stops existing the moment AWS fulfills it
 instead: RustFS rejecting every notification ARN, an EBS attach rebooting the
 instance because Lima has no hot-attach verb, `device_name` being advisory
 (`/dev/sdf` in, `/dev/vdb` out), the mesh covering VMs and RDS but not
-containers, an S3 removal over-firing for a key that never existed, odin's
-process sitting in the data path for an ECS route. None of that is in the HCL.
+containers, odin's process sitting in the data path for an ECS route. None of
+that is in the HCL. (An S3 removal over-firing for a key that never existed was
+in this list until v0.8.21, when it stopped happening locally too — see the
+entry below for what the pre-forward probe costs.)
 
 **What FOLLOWS you — the emitted HCL is a real but NARROW subset.** These are
 choices baked into the generated file, so they are what you would actually get:
