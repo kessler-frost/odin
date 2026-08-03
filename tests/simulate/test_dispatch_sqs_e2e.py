@@ -254,6 +254,25 @@ def test_a_message_survives_when_the_function_cannot_run(store_root, cleanup):
         # 5s default read timeout, and the gateway answers 503 (a `ReadTimeout`
         # is an `httpx.HTTPError`, which `_unhandled_failure` maps to
         # ServiceUnavailable). See docs/limits.md.
+        # THE MAPPING GOES FIRST, and that ordering is the whole fix.
+        # MEASURED (v0.8.20 gate): this test passed ALONE in 77s and FAILED
+        # inside a 26-file partition at `120.0s, "the undelivered message was
+        # lost rather than redelivered"`. Not a product bug -- the dispatcher
+        # polls this same queue every tick, and EVERY receive resets goaws's
+        # visibility timeout. So the test was racing the dispatcher for the one
+        # message, and only won when its poll landed between expiry and the
+        # dispatcher's next one. Machine load decided the outcome.
+        #
+        # Deleting the mapping stops the competing reader, and costs the test
+        # NOTHING: the property under test -- that an undeliverable message is
+        # LEFT rather than deleted -- is already established by the 12s above,
+        # during which the dispatcher had the mapping and failed repeatedly.
+        # What follows now only has to show the message still exists.
+        #
+        # Raising the timeout was the tempting fix and is the wrong one: it
+        # makes the race rarer and the diagnosis slower. See CLAUDE.md rule 5c.
+        awslambda.delete_event_source_mapping(UUID=mapping["UUID"])
+
         got = _await(
             lambda: sqs.receive_message(
                 QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=0,
@@ -262,6 +281,5 @@ def test_a_message_survives_when_the_function_cannot_run(store_root, cleanup):
         )
         assert any(m["Body"] == "must-survive" for m in got), got
 
-        awslambda.delete_event_source_mapping(UUID=mapping["UUID"])
         awslambda.delete_function(FunctionName=FUNCTION)
         http.post("/destroy", params={"env": ENV})
