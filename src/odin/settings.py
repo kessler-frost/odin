@@ -36,6 +36,14 @@ pins that). A pydantic `bool` would reject both at construction and take the
 fail-safe away, so the interpretation stays where its reasoning lives, beside
 the code that acts on it.
 
+`ODIN_RUNTIME` is the one CHOICE that is strict without being a number, and it
+is the test of that rule rather than an exception to it: the question is not
+"is this a string" but "does a typo have a dangerous direction". It does not --
+neither `colima` nor `lima` is the unsafe one -- so there is nothing to fail
+toward, and silently reading a typo as `colima` would give a user who asked for
+VM isolation containers on the host with nothing said. `Literal` rejects it at
+startup instead.
+
 NOT HERE, deliberately:
   * `ODIN_URL` -- typer reads it itself (`envvar=` on the `--url` option in
     `cli/http.py` and `__main__.py`), so it never reaches `os.environ` in
@@ -45,6 +53,7 @@ NOT HERE, deliberately:
 from __future__ import annotations
 
 import os
+from typing import Literal
 
 from pydantic import AliasChoices, AliasGenerator, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -171,10 +180,38 @@ class SimulateSettings(BaseSettings):
 
 
 class ComputeSettings(BaseSettings):
-    """The EC2-as-real-Lima-VM substrate, and the admission check that decides
-    whether a canvas fits on this Mac at all."""
+    """Which container backend odin runs on, the EC2-as-real-Lima-VM substrate,
+    and the admission check that decides whether a canvas fits on this Mac at
+    all."""
 
     model_config = _CONFIG
+
+    # Which `RuntimeDriver` every container substrate binds to. `colima` is
+    # `docker` on the host's Colima VM (the default, and what odin has always
+    # done); `lima` is `nerdctl` inside odin's own shared `odin-host` Lima VM
+    # (`runtime/lima.py`), i.e. VM-level isolation. `runtime/select.py` owns the
+    # name -> class map; this field only decides which name is asked for.
+    #
+    # STRICT, NOT LENIENT -- the deliberate opposite of the five flags above,
+    # and the difference is whether a typo has a dangerous direction. It does
+    # for them: an unrecognised `ODIN_REAP_EC2_VMS` must leave the reaper ON, an
+    # unrecognised `ODIN_AI` must leave model calls OFF. It does NOT here.
+    # Neither backend is the unsafe one, so there is no side to fail toward --
+    # and quietly reading `ODIN_RUNTIME=limaa` as `colima` would hand a user who
+    # asked for VM isolation containers straight on the host with nothing said,
+    # which is honesty rule 2's shape wearing a config file. A `Literal` makes
+    # `settings.validate_all()` (first statement of `create_app`) reject it
+    # before anything boots, and the message is pydantic's own, measured:
+    #
+    #     ODIN_RUNTIME
+    #       Input should be 'colima' or 'lima' [type=literal_error,
+    #       input_value='limaa', input_type=str]
+    #
+    # It names the variable (that is what `_odin_env` buys) and spells out both
+    # accepted values, so the error needs no prose of odin's beside it. Values
+    # are lower-case: `ODIN_RUNTIME=LIMA` is rejected the same way, rather than
+    # being coerced into something the user did not type.
+    runtime: Literal["colima", "lima"] = "colima"
 
     # 300s is generous for a healthy boot -- the nebula mesh e2e boots two VMs
     # and finishes ENTIRELY in 74.6s on an idle machine. It is not generous on
