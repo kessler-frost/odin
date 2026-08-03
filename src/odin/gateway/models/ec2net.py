@@ -625,7 +625,7 @@ def _compiled_firewall(sg: dict) -> dict:
     # outbound (the new one). Both directions fail closed on a malformed rule.
     #
     # Every group the gateway mints is SEEDED with AWS's allow-all egress
-    # (`_new_sg`), and `agent/hcl.py` emits that identical block for an sg node
+    # (`_new_sg`), and `iac/hcl.py` emits that identical block for an sg node
     # whose `egressRules` field is empty -- so a canvas that never mentioned
     # egress compiles to `outbound: [any/any]`, byte-identical to what this
     # returned when it was hardcoded. A canvas that DOES restrict egress makes

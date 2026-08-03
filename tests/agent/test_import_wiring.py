@@ -1,7 +1,7 @@
 """Canvas wiring and security-group EGRESS survive an import — by ROUND TRIP.
 
 Two `docs/limits.md` entries, both closed against a format agreed with the agent
-that owns `agent/hcl.py` rather than one guessed at:
+that owns `iac/hcl.py` rather than one guessed at:
 
 * an imported ECS service lost its `${{producer.ATTR}}` env references entirely.
 * an imported security group's OUTBOUND rules did not survive.
@@ -15,7 +15,7 @@ actually depends on is that the second file orders the same resources as the
 first.
 
 **On `_with_ref_tags`, and why it is not a way of dodging the real generator.**
-The emitter half lives in `agent/hcl.py` and was written in parallel with this
+The emitter half lives in `iac/hcl.py` and was written in parallel with this
 file. When it is present, `_with_ref_tags` returns the generated text UNTOUCHED
 and every assertion below runs against real bytes; when it is not, it stamps the
 tags in the exact shape agreed with its author. The capability is detected once,
@@ -33,8 +33,8 @@ import re
 
 import pytest
 
-from odin.agent.hcl import generate_tf
-from odin.agent.import_tf import parse_hcl_text
+from odin.iac.hcl import generate_tf
+from odin.iac.import_tf import parse_hcl_text
 from odin.spec.translate import canvas_to_stack
 
 _WIRED_CANVAS = {"nodes": [
@@ -308,7 +308,7 @@ def test_authored_egress_rules_survive_a_full_canvas_round_trip():
     ], "edges": []}
     first = generate_tf(canvas_to_stack(canvas)).files["main.tf"]
     if 'cidr_blocks = ["10.0.0.0/16"]' not in first:
-        pytest.skip("the agent/hcl.py egress emitter is not in this tree yet")
+        pytest.skip("the iac/hcl.py egress emitter is not in this tree yet")
 
     imported = parse_hcl_text(first)
     cache = next(n for n in imported.nodes if n["data"]["label"] == "cache")

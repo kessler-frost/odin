@@ -21,7 +21,7 @@ Two services in one canvas, one apply:
   * `sized`   -- `memory: "256"` on the node -> `HostConfig.Memory` == 256 MiB
   * `default` -- no memory field at all      -> `HostConfig.Memory` == 512 MiB
 
-The second is as load-bearing as the first. `agent/hcl.py` deliberately emits NO
+The second is as load-bearing as the first. `iac/hcl.py` deliberately emits NO
 `memory` attribute when the canvas does not set one (writing 512 into the HCL
 would freeze today's default into every canvas ever applied), so the fallback has
 to be supplied further down, by `compute/tasks.py::_memory_mib`. A regression
@@ -43,7 +43,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from odin.agent import hcl
+from odin.iac import hcl
 from odin.agent import translate as translate_mod
 from odin.compute.tasks import _DEFAULT_MEMORY_MIB, container_name
 from odin.server import create_app

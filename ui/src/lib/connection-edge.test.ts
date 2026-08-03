@@ -280,7 +280,7 @@ describe('the picker, which had never once rendered', () => {
   });
 
   it('ticking IAM auto-ticks the permissions that meaning requires', () => {
-    // An `iam` edge with no permissions is not harmless: `agent/hcl.py` reserves
+    // An `iam` edge with no permissions is not harmless: `iac/hcl.py` reserves
     // a role for it and emits an `aws_iam_role` carrying no policy at all.
     const next = toggleEdgeType('connection', available, 'iam', true, 'rds', 'ecs');
     expect(next.permissions).toEqual(defaultPermissions.rds);

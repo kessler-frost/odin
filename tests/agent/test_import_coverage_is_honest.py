@@ -13,9 +13,9 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from odin.agent import hcl, import_tf
-from odin.agent.hcl import generate_tf
-from odin.agent.import_tf import parse_hcl_text
+from odin.iac import hcl, import_tf
+from odin.iac.hcl import generate_tf
+from odin.iac.import_tf import parse_hcl_text
 from odin.spec.translate import canvas_to_stack
 
 _ROOT = Path(__file__).resolve().parents[2]

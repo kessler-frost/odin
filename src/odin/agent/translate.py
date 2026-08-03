@@ -27,8 +27,9 @@ from typing import Any, TypedDict
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, SdkMcpTool, create_sdk_mcp_server, tool
 from pydantic import BaseModel
 
-from odin.agent import ai, hcl
-from odin.agent.hcl import TfProject, generate_tf
+from odin.agent import ai
+from odin.iac import hcl
+from odin.iac.hcl import TfProject, generate_tf
 from odin.simulate.runner import PLUGIN_CACHE_DIR
 from odin.spec.models import REDACTED, Stack, scrub
 from odin.spec.store import rev_of
@@ -55,7 +56,7 @@ def refine_enabled() -> bool:
     also have to know this flag exists.
 
     `ODIN_TRANSLATE_REFINE` opts IN to the claude-agent-sdk refine pass --
-    OFF by default. The canvas -> Terraform translation (`agent/hcl.py`) is
+    OFF by default. The canvas -> Terraform translation (`iac/hcl.py`) is
     fully deterministic; this pass is a best-effort ADD-ON that can only
     attach comments/tags/unset arguments (`validate_refinement`'s
     value-fidelity check rejects anything else), never change the

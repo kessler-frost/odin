@@ -19,8 +19,8 @@ import subprocess
 
 import pytest
 
-from odin.agent import hcl
-from odin.agent.hcl import generate_tf
+from odin.iac import hcl
+from odin.iac.hcl import generate_tf
 from odin.spec.models import FieldValue, ResourceDesired
 from odin.spec.translate import canvas_to_stack
 

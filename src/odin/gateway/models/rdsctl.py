@@ -57,7 +57,7 @@ and drifts on every plan), plus `MultiAZ` / `PubliclyAccessible` /
 answers.
 
 DELIBERATE LIMITS, each honest rather than silently wrong:
-- **Postgres only.** The substrate is a Postgres container, so `agent/hcl.py`
+- **Postgres only.** The substrate is a Postgres container, so `iac/hcl.py`
   routes any other `engine` to `unsupported` rather than emitting HCL this
   module would fulfil with the wrong database.
 - **`AllocatedStorage`/`DBInstanceClass` are metadata.** A local container has
@@ -112,7 +112,7 @@ _REQUEST_ID = "00000000-0000-0000-0000-000000000000"
 # Postgres to accept a real connection before giving up and reporting
 # `failed`. Bounded so "never comes up" is a fast honest apply failure rather
 # than the provider's own 40-minute default create wait (the same reasoning
-# behind `_ECS_CONVERGE_TIMEOUT` in agent/hcl.py).
+# behind `_ECS_CONVERGE_TIMEOUT` in iac/hcl.py).
 _CREATE_TIMEOUT = 180.0
 _POLL_INTERVAL = 0.5
 # Consecutive successful `pg_ready` probes required before reporting

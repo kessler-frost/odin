@@ -8,7 +8,7 @@ ec2/rds node's `securityGroups` field, one label per line, which meant the
 canvas could not show it at all.
 
 The design that makes this safe rather than a second source of truth: the edge
-ADDS to that field instead of replacing it. `agent/hcl.py` is untouched -- it
+ADDS to that field instead of replacing it. `iac/hcl.py` is untouched -- it
 still reads one field (`_security_group_refs`, used by `_ec2` and `_rds`) and
 cannot tell how a line got there. A hand-authored canvas keeps working
 unchanged, which matters because `odin canvas set`, the README's documented JSON

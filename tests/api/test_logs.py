@@ -448,7 +448,7 @@ async def test_logs_node_whose_group_exists_but_is_empty_says_so(tmp_path):
 async def test_a_sink_node_reads_the_group_it_was_renamed_to(tmp_path):
     """v0.8.15: a Log Group drawn as a workload's sink is CREATED under the
     name that workload's substrate really ships to (`/aws/lambda/myfn`), not
-    under the node's label -- `agent/hcl.py::_LOG_DESTINATIONS`.
+    under the node's label -- `iac/hcl.py::_LOG_DESTINATIONS`.
 
     THE RENAME WOULD STRAND THE NODE without this: `odin logs --node
     /odin/logs` read the group NAMED `/odin/logs`, which after the rename does

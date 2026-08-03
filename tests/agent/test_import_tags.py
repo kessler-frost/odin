@@ -20,8 +20,8 @@ from __future__ import annotations
 
 import pytest
 
-from odin.agent.hcl import generate_tf
-from odin.agent.import_tf import _KIND, _NAME_ATTR, parse_hcl_text
+from odin.iac.hcl import generate_tf
+from odin.iac.import_tf import _KIND, _NAME_ATTR, parse_hcl_text
 from odin.spec.translate import canvas_to_stack
 
 # The one argument each type needs before `_label` will call it by name. Kinds

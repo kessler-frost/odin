@@ -213,7 +213,7 @@ def workload_env(keystore: KeyStore, env: str, node_label: str, gateway_port: in
     the gateway AS ITSELF (fix-wave 2b finding #2): a Lima VM's cloud-init
     (`compute/instances.py`), an ECS task container (`compute/tasks.py`), or
     a Lambda RIE container (`compute/functions.py`). `node_label` is the
-    canvas node's own label -- the SAME string `agent/hcl.py` stamps as the
+    canvas node's own label -- the SAME string `iac/hcl.py` stamps as the
     `odin:node` tag on the resource being launched, so every substrate
     resolves it the identical way (see `hcl._tags_block`'s docstring).
     Issuing again for the same (env, node_label) returns the SAME keystore

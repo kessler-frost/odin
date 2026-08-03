@@ -2,7 +2,7 @@
 
 The bug this closes is the one the repo keeps finding under different names: a
 rule that renders as configuration and changes nothing. Since v0.8.14 an sg
-node has an `egressRules` field, `agent/hcl.py` emits real `egress` blocks from
+node has an `egressRules` field, `iac/hcl.py` emits real `egress` blocks from
 it, and the gateway stored every one of them -- and then
 `ec2net._compiled_firewall` filtered them out and `sg_rules_to_firewall` ended
 with a hardcoded `outbound=[any/any]`. So a user could restrict egress, watch

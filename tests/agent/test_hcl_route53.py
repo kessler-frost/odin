@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import re
 
-from odin.agent.hcl import _DNS_TARGET_KINDS, generate_tf
+from odin.iac.hcl import _DNS_TARGET_KINDS, generate_tf
 from odin.spec.translate import canvas_to_stack
 
 _NETWORK = [

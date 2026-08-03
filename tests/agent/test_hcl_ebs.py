@@ -17,7 +17,7 @@ mistakes live:
 """
 from __future__ import annotations
 
-from odin.agent.hcl import _EBS_DEVICE_NAMES, generate_tf
+from odin.iac.hcl import _EBS_DEVICE_NAMES, generate_tf
 from odin.spec.translate import canvas_to_stack
 
 _NETWORK = [

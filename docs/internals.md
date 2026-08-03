@@ -26,7 +26,7 @@
                         v                         |
 +-----------------------------------------------+ |
 |                                               | |
-|          agent/hcl.py: canvas to HCL          | |
+|           iac/hcl.py: canvas to HCL           | |
 |                                               | |
 +-----------------------------------------------+ |
                         |                         |
@@ -86,7 +86,7 @@ Each hop is a module you can read on its own:
 | Stage | Module | What it owns |
 |---|---|---|
 | desired state | `spec/store.py` | append-only, content-addressed canvas revisions |
-| compile | `agent/hcl.py` | canvas to HCL, deterministic and model-free |
+| compile | `iac/hcl.py` | canvas to HCL, deterministic and model-free |
 | run | `simulate/runner.py` | `tofu apply`, bounded, with its output streamed |
 | serve AWS | `gateway/` | SigV4, request classification, IAM, the AWS APIs |
 | provision | `aws/`, `compute/` | Postgres, RustFS, goaws, dynalite, Lima VMs |

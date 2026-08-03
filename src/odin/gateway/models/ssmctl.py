@@ -50,7 +50,7 @@ parameter) while a HIERARCHICAL name's leading slash is part of the name
 (`/odin/db-url`). One rule covers both, and it's the same rule
 `classify.py`'s `_ssm_resource` applies -- which is what makes an IAM edge to
 an `ssm` canvas node enforce correctly (the canvas label IS the parameter
-name; `agent/hcl.py`'s `_ssm` builder emits `name = <label>`). The record
+name; `iac/hcl.py`'s `_ssm` builder emits `name = <label>`). The record
 keeps the name EXACTLY as the caller sent it, so the wire echo can never
 differ from what terraform put in the config (which would read as drift).
 

@@ -39,7 +39,7 @@ from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
-from odin.agent.hcl import TfProject
+from odin.iac.hcl import TfProject
 from odin.simulate import workspace as workspace_mod
 from odin.spec.models import scrub
 

@@ -778,7 +778,7 @@ future decision against these points instead of re-deriving them:
   v0.7.1 the two bullets above ("a container consumes `${{cache.REDIS_URL}}`",
   "a CONTAINER consumes `${{db.DATABASE_URL}}`") were **not achievable**: both
   field-test agents confirmed the map was silently dropped — `spec/translate.py`
-  parsed it and lifted refs onto `ResourceDesired.refs`, but `agent/hcl.py`
+  parsed it and lifted refs onto `ResourceDesired.refs`, but `iac/hcl.py`
   emitted no `environment` block at all, `fabric.resolve` had no production
   caller, and the container came up with the four `AWS_*` vars and nothing else.
   So you could provision the whole production stack with no canvas-driven way
@@ -2274,7 +2274,7 @@ run and are not described as such.
   `data["permissions"]`, so an agent-drawn grant rendered on the canvas and
   granted nothing at all — decorative in the literal sense.
 
-  Now: `agent/hcl.py` emits the policy, tofu applies it through the gateway,
+  Now: `iac/hcl.py` emits the policy, tofu applies it through the gateway,
   `iamctl` stores it, and `policy.compile_policies_from_iam` reads it back —
   each workload's role found in its OWN service record (a lambda's `role`, a
   task definition's `task_role_arn`, an instance's `iam_instance_profile`
@@ -2512,7 +2512,7 @@ run and are not described as such.
   no separator and serialises to the bytes it always did, so nothing needed
   migrating; `spec/translate.py::_edges` splits the set into one `Edge` per
   meaning, which is what lets `gateway/policy.py::compile_policies` and
-  `agent/hcl.py::_granted_ids` keep gating on `kind == "iam"` unchanged. Handing
+  `iac/hcl.py::_granted_ids` keep gating on `kind == "iam"` unchanged. Handing
   them the joined string would have compiled NO policy — permissions ticked in
   the panel and none granted.
 
@@ -2545,7 +2545,7 @@ run and are not described as such.
   drawing `admin-role → my-lambda` while the lambda's `role` field said
   `other-role` gave a dead line, `other-role` in the generated file, and
   `other-role` enforced by the gateway. There is a `role` edge type now, folded
-  into the `role` FIELD `agent/hcl.py::_lambda` already reads, so it took effect
+  into the `role` FIELD `iac/hcl.py::_lambda` already reads, so it took effect
   with no builder change at all. Lambda only -- ec2/ecs reach a role through an
   auto-role plus an instance profile / `task_role_arn` and read no such field, so
   those pairs stay `unmodelled` rather than authoring a field nothing consumes
@@ -2650,7 +2650,7 @@ run and are not described as such.
   `securityGroups` field, so the canvas could not show it at all.
 
   The design that keeps it safe: the edge ADDS to that field rather than
-  replacing it, so `agent/hcl.py` is untouched -- it still reads one field
+  replacing it, so `iac/hcl.py` is untouched -- it still reads one field
   (`_security_group_refs`) and cannot tell how a line got there. A hand-authored
   canvas keeps working unchanged, duplicates collapse (real AWS rejects a doubled
   entry), and direction is not significant, exactly as for an IAM edge.
@@ -2748,7 +2748,7 @@ have meant retiring a claim rather than fixing a bug.
   has no route to it through real containers -- measured dead ends: a bad
   `runtime` falls back to the DEFAULT image (`RUNTIME_IMAGES.get(runtime,
   RUNTIME_IMAGES[DEFAULT_RUNTIME])`) and boots a working container;
-  `memory_size` is neither canvas-settable nor emitted by `agent/hcl.py`; and
+  `memory_size` is neither canvas-settable nor emitted by `iac/hcl.py`; and
   readiness is a TCP check on the RIE port, which a broken handler satisfies.
 
   The CLAIM is not retired -- it is covered by `tests/api/test_apply_full.py::
