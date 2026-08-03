@@ -167,6 +167,54 @@ than claimed" — was the single most valuable output of the field tests.
    signalled nothing because the container's BusyBox lacks `pgrep -o`, and odin
    was right to keep reporting healthy).
 
+5. **When the check and its subject share a source, the check cannot fail.**
+   Rule 1 is about a guard whose signal never ARRIVES. This is the opposite
+   failure: the signal arrives fine, and the guard is asking the subject to
+   grade itself. FIVE instances in one night (2026-08-02), every one green,
+   every one reviewed, none visible from inside:
+   - **A test deriving its expectation from the expression under test.**
+     `tests/gateway/test_ecsctl.py` asserted
+     `== container_gone_reason(task["container_name"])` — the very call the
+     source made. Green for MONTHS while ecsctl passed the task DEFINITION's
+     name (`web`) where drift.py passed the real container
+     (`odin-ecs-{env}-{id}-web`), so odin told users to go look at something
+     `docker inspect` cannot find. Caught by the release gate, never by review.
+   - **A guard parametrized over the thing it guards, so the regression DELETES
+     the case.** The closed-world method-independence test drew its cases from
+     `gateway/app.py`'s own route table: removing PATCH removed the `[PATCH]`
+     case, and the file went 5 passed where 6 had. A property test, green, on
+     exactly the regression it existed to catch.
+   - **A measurement pattern matching the subject's own styling.**
+     `grep -c 'card-head' docs/architecture.html` also matches two CSS rules in
+     that page's stylesheet — 15 where the real count is 13. I relayed the
+     phantom mismatch to three agents as a caution before it was measured
+     properly. A false claim about the repo becomes load-bearing fast.
+   - **Asserting a property of the PRIOR state without reading the prior
+     state** ("the new SVG uses a stable id, matching what `mermaid-kms`
+     already does" — `mermaid-kms` did so only BECAUSE of that commit).
+   - **An inference that decayed under a still-valid input.** An efs guard
+     warned a bad mount path would drop the whole file system; the builder had
+     since narrowed it to decline only the offending function. Its input stayed
+     true; the SENTENCE built on it rotted. Only the end-to-end round trip could
+     tell them apart — the guard's own unit test passed on the half that still
+     fired, which is what makes a stale inference invisible at unit scope.
+
+   **So:** the expectation must come from somewhere the subject cannot reach — a
+   literal spelled out in full, an independently-owned list, a second producer.
+   **Mutation-test by DELETING an element, not only by corrupting one, and treat
+   a mutation run whose test COUNT drops as a failure** — that is the quietest
+   of the five and it reads as success. Anchor a measuring pattern to the real
+   element (`<div class="card-head">`, not `card-head`) or the file's own
+   comments and styling will answer for it. Pin an inference guard in BOTH
+   directions: a mutant removing the gate must kill the silence test, a mutant
+   forcing it must kill the declined test.
+
+5b. **Two-point sampling is the same error over time.** "The broken diagram
+   shipped for however long" became "broke at `7693f08`, repaired at `08ba9a3`,
+   never in any tag" only by walking EVERY commit in the window instead of the
+   endpoints. Checking two points and inferring the middle turns a six-hour
+   develop-only regression into a claim about released software.
+
 ## Browser automation: `agent-browser` (playwright-cli removed 2026-07-27)
 `agent-browser` (brew, Apache-2.0) is the only browser driver. `@playwright/cli`
 and its skill are gone; nothing in odin depended on them
