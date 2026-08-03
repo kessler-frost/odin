@@ -4,6 +4,47 @@ Every one of these is a thing odin does not do, or does differently from AWS.
 They are listed because finding one by surprise is worse than reading it here.
 
 
+## If you take the generated Terraform to real AWS
+
+Most of this file does NOT follow you there, and the split is worth knowing
+before you read 60 entries trying to work it out.
+
+`main.tf` is portable by construction: **no `endpoints` block, no `skip_*`
+flags, no credentials**. Everything that redirects AWS calls at odin lives in a
+runtime-generated `override.tf` and environment variables, never in the file
+you would commit. It is `tofu fmt`-canonical and passes a real `tofu validate`.
+
+**What evaporates on real AWS — most of this document.** Every limit that is
+about how odin FULFILLS a call locally stops existing the moment AWS fulfills it
+instead: RustFS rejecting every notification ARN, an EBS attach rebooting the
+instance because Lima has no hot-attach verb, `device_name` being advisory
+(`/dev/sdf` in, `/dev/vdb` out), the mesh covering VMs and RDS but not
+containers, an S3 removal over-firing for a key that never existed, odin's
+process sitting in the data path for an ECS route. None of that is in the HCL.
+
+**What FOLLOWS you — the emitted HCL is a real but NARROW subset.** These are
+choices baked into the generated file, so they are what you would actually get:
+
+- **Every ALB is `internal = true`.** Deliberate: odin has no internet gateway,
+  so an internet-facing scheme would be a claim nothing backs. On real AWS you
+  get an internal-only load balancer, and only `application` type — no NLB.
+- **ECS is `launch_type = "EC2"` with `requires_compatibilities = ["EC2"]` and
+  no `network_configuration`.** So no Fargate, and no awsvpc-style ENIs.
+- **No `aws_internet_gateway`.** A VPC with no route to the internet.
+- **API Gateway: the `$default` stage only, payload format 2.0 only, and no
+  authorizers** — every route is `authorization_type = "NONE"`, i.e. public.
+- **Every SNS→SQS subscription is `raw_message_delivery = true`.**
+- **A security group is IPv4-only**, and its rule ports must be literals.
+- **Some arguments are re-emitted with odin's own value whatever you wrote** —
+  those are enumerated further down, and they apply on real AWS too.
+
+So: odin generates real, valid, portable AWS Terraform **of the subset it
+models**. Nothing in it is odin-specific and nothing would break an apply. What
+you would hit is not breakage but SCOPE — an internal ALB where you wanted
+internet-facing, EC2 launch type where you wanted Fargate, no IGW.
+
+
+
 - **A Lambda's CODE needs the whole directory, not just the HCL.** A function's
   body lives in a zip beside `main.tf`, so `odin translate import <dir>` recovers
   it and reading HCL text alone cannot — in that case the node comes back with
