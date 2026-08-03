@@ -69,15 +69,19 @@ def test_import_tf_hcl_source_parses_for_real(tmp_path):
 
 def test_import_tf_hcl_source_lists_unsupported_types(tmp_path):
     app = _app(tmp_path)
-    # `aws_route53_zone`, not `aws_lambda_function`: lambda became importable in
-    # v0.8.4, so using it here would have turned this route's unsupported-listing
-    # assertion into a test that nothing is ever listed.
-    body = {"source": "hcl", "hcl": 'resource "aws_route53_zone" "dns" {\n  name = "example.com"\n}\n'}
+    # `aws_kinesis_stream`, not `aws_lambda_function` or `aws_route53_zone`: both
+    # of those became importable (v0.8.4, v0.8.19), so either would have turned
+    # this route's unsupported-listing assertion into a test that nothing is ever
+    # listed. ROADMAP.md records kinesis as DROPPED -- "has no substrate at all"
+    # -- so it will not follow them.
+    body = {"source": "hcl", "hcl": 'resource "aws_kinesis_stream" "events" {\n  name = "events"\n}\n'}
     with TestClient(app) as client:
         resp = client.post("/import-tf", params={"env": "default"}, json=body)
     assert resp.status_code == 200
     unsupported = resp.json()["unsupported"]
-    assert unsupported == [{"type": "aws_route53_zone", "name": "dns", "reason": unsupported[0]["reason"]}]
+    assert unsupported == [
+        {"type": "aws_kinesis_stream", "name": "events", "reason": unsupported[0]["reason"]},
+    ]
     assert "not supported" in unsupported[0]["reason"]
 
 

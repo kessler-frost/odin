@@ -310,3 +310,75 @@ async def test_facts_never_asks_an_absent_container_for_a_port():
     facts = await ColimaRuntime(runner=runner).facts("gone", container_port=9000)
     assert (facts.phase, facts.host_port) == ("pending", 0)
     assert not [c for c in calls if "{{json .NetworkSettings.Ports}}" in c]
+
+
+# --- route53: a drawn DNS record becomes a real /etc/hosts line -------------
+
+
+def _add_host_args(call: list[str]) -> list[str]:
+    """Every `--add-host` VALUE in an argv, in argv order."""
+    return [call[i + 1] for i, tok in enumerate(call) if tok == "--add-host"]
+
+
+async def test_spec_hosts_become_add_host_flags_sorted():
+    """A route53 record reaches the container as a real `--add-host`, and the
+    argv is SORTED so two converges over the same record set are byte-identical
+    -- the set comes from a store whose iteration order means nothing."""
+    runner = FakeRunner()
+    await ColimaRuntime(runner=runner).run_container(ContainerSpec(
+        name="app", image="nginx:alpine",
+        hosts={"web.internal": "10.42.0.9", "api.internal": "10.42.0.5"},
+    ))
+    call = _run_call(runner)
+    assert _add_host_args(call) == [
+        "host.docker.internal:host-gateway", "api.internal:10.42.0.5", "web.internal:10.42.0.9",
+    ]
+    # Flags before the image, or docker reads them as the container's argv.
+    assert call.index("--add-host") < call.index("nginx:alpine")
+
+
+async def test_no_hosts_means_only_the_infrastructure_alias():
+    """The default must not change what any existing caller emits."""
+    runner = FakeRunner()
+    await ColimaRuntime(runner=runner).run_container(
+        ContainerSpec(name="pg", image="postgres:16-alpine"))
+    assert _add_host_args(_run_call(runner)) == ["host.docker.internal:host-gateway"]
+
+
+async def test_hosts_on_a_namespace_sharing_container_is_refused_not_dropped():
+    """`--add-host` with `--network container:` is a hard docker error, so the
+    entries CANNOT be honoured here. Refusing is the point: dropping them
+    silently would leave a name the canvas says resolves and the container says
+    does not -- a decorative record, which is the whole failure mode route53
+    exists to avoid. The sidecar itself never sets hosts, so this guard is for
+    the caller who wires them somewhere new."""
+    runner = FakeRunner()
+    with pytest.raises(ValueError, match="shares another container's network namespace"):
+        await ColimaRuntime(runner=runner).run_container(ContainerSpec(
+            name="pg-mesh", image="odin-nebula:1.10.3", network="container:pg",
+            hosts={"api.internal": "10.42.0.5"},
+        ))
+    # And it refused BEFORE running anything, rather than half-creating it.
+    assert runner.calls == []
+
+
+async def test_a_sidecar_with_no_hosts_still_runs():
+    """The guard keys on hosts AND a namespace share -- a sidecar with no
+    entries is exactly today's behaviour and must not start raising."""
+    runner = FakeRunner()
+    await ColimaRuntime(runner=runner).run_container(ContainerSpec(
+        name="pg-mesh", image="odin-nebula:1.10.3", network="container:pg",
+    ))
+    assert _add_host_args(_run_call(runner)) == []
+
+
+async def test_hosts_are_emitted_for_a_non_namespace_network():
+    """The refusal is keyed on `container:` specifically, not on "any
+    `--network`" -- only that form is the one docker was measured rejecting.
+    Refusing a combination that is actually legal is its own wrong answer."""
+    runner = FakeRunner()
+    await ColimaRuntime(runner=runner).run_container(ContainerSpec(
+        name="app", image="nginx:alpine", network="my-bridge",
+        hosts={"api.internal": "10.42.0.5"},
+    ))
+    assert _add_host_args(_run_call(runner)) == ["api.internal:10.42.0.5"]

@@ -83,6 +83,8 @@ _KIND = {
     "alb": "alb",
     "kms": "kms",
     "ebs": "ebs",
+    # No trailing `# comment` on any entry line here -- see the note below.
+    "route53": "route53",
     "efs": "efs",
     # v0.8.19. NOTE THE COMMENT PLACEMENT: `ui/src/lib/catalog.test.ts` parses
     # this table out of this file with `/^\s*"([\w-]+)":\s*"([\w-]+)",$/gm`, so a
@@ -380,6 +382,15 @@ SNS_SUBSCRIPTION = "subscription"
 # make the next apply detach a disk with data on it.
 VOLUME_ATTACHMENT = "volume"
 
+# "This zone resolves that instance's name" -- an `aws_route53_record`, and
+# behind it a REAL hosts entry (`--add-host` on every container in the env,
+# `/etc/hosts` on every VM). PRESENTATIONAL in the same sense as the three
+# above: `agent/hcl.py`'s record pass keys on the two NODE KINDS, and it must
+# stay that way -- `route53` has been a drawable catalog tile since long before
+# it had a builder, so a canvas whose route53 edge still says `network` would
+# silently lose its record if the pass gated on this name.
+DNS_RECORD = "dns"
+
 # "This workload mounts that file system" -- a `volume` + `mountPoints` pair on
 # an ecs task definition, or a `file_system_config` on a lambda, and behind both
 # a real host directory bind-mounted into the container.
@@ -423,7 +434,7 @@ LEGACY_UNMODELLED = "network"
 
 EDGE_KINDS = frozenset({
     "iam", SG_MEMBERSHIP, ROLE_ASSUMPTION, ALB_TARGET, SNS_SUBSCRIPTION,
-    CONNECTION, ENCRYPTION, VOLUME_ATTACHMENT, FILE_SYSTEM_MOUNT,
+    CONNECTION, ENCRYPTION, VOLUME_ATTACHMENT, DNS_RECORD, FILE_SYSTEM_MOUNT,
     UNMODELLED, LEGACY_UNMODELLED, "ref",
 })
 

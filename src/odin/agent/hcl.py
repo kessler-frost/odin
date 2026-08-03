@@ -2206,6 +2206,94 @@ def _efs(res: ResourceDesired, refs: Refs) -> Built:
     return _efs_fault(res) or ({"creation_token": quote(res.id)}, "")
 
 
+# v0.8.19: DNS -- one `aws_route53_zone` per route53 node, plus an
+# `aws_route53_record` companion per route53<->ec2 edge (the record pass at the
+# bottom of `generate_tf`). The substrate is REAL NAME RESOLUTION: an
+# `--add-host` entry on every container in the env and an `/etc/hosts` line on
+# every Lima VM in it, both written from the applied records.
+#
+# THE TRAP, AND WHY THIS IS SCOPED TO ec2. A hosts entry is `<ip> <name>`: it
+# carries no port and no scheme. So the only kinds a name can point AT are the
+# ones whose World fact is a bare address, and that is exactly one.
+#
+# The SHAPES below were measured 2026-08-02 by running the real projectors in
+# `reconcile/tf_status.py` over records in the shape the gateway models really
+# write. The HOST halves are real constants read out of the source
+# (`elbv2ctl._DNS_NAME`, `runtime/colima.py::CONTAINER_HOST`); the PORT DIGITS
+# were the probe's own inputs, and are written here as `<dynamic port>` rather
+# than as numbers, because inventing a plausible number and then citing it as a
+# measurement is exactly the failure the rest of this comment is about:
+#
+#   ALB   projected facts  -> {"ALB_ENDPOINT": "http://127.0.0.1:<dynamic port>"}
+#   RDS   projected facts  -> {"endpoint": "host.docker.internal:<dynamic port>", ...}
+#   EC2   projected facts  -> {"PRIVATE_IP": <bare IPv4>, "MESH_IP": <bare IPv4>}
+#
+# An alb's port is DYNAMIC (`elbv2ctl._DNS_NAME`'s own note: two load balancers,
+# or two envs, would collide on a fixed 80), so a name pointing at one would
+# resolve to 127.0.0.1 and then fail to connect on :80 -- a green resource that
+# does not work, which is the exact failure this repo's honesty rules exist to
+# stop. rds is the same shape with a nonstandard port. So both are DECLINED BY
+# NAME here rather than emitted (`_dns_target_unsupported`).
+#
+# WHICH ec2 ADDRESS THE TERRAFORM CARRIES, and why the SUBSTRATE does not always
+# agree with it. The record's value is `aws_instance.<n>.private_ip` -- what
+# DescribeInstances reports, what `tf_status._ec2_facts` publishes as
+# `PRIVATE_IP`, and the only thing a project taken to Amazon could portably
+# mean. What resolves the name LOCALLY is a hosts entry, and which address
+# actually works there depends on who is reading it:
+#
+#   container -> VM private_ip : reachable
+#   host      -> VM private_ip : reachable
+#   VM        -> VM private_ip : 100% PACKET LOSS. Stock Lima `vz` NATs each VM
+#                                into its OWN isolated address space, so there
+#                                is no VM-to-VM underlay path at all, before
+#                                nebula is even involved -- see the R5 note in
+#                                `fabric/nebula.py` (~line 41 and ~line 465),
+#                                which records it as confirmed live with two
+#                                real VMs.
+#
+# So a VM's `/etc/hosts` may NOT be handed `private_ip`: that is a name which
+# resolves and then hangs, which is this kind's own trap one layer down. A VM
+# gets the Nebula OVERLAY address instead (relayed through the lighthouse, which
+# is what makes VM-to-VM work at all), and gets NO entry when the env has no
+# mesh -- `_ec2_facts` already withholds `MESH_IP` on exactly that condition,
+# "so odin never hands out an address no peer can reach". The divergence between
+# the emitted argument and the local substrate is deliberate, and is recorded in
+# docs/limits.md in these measured terms -- the same shape as ebs's advisory
+# `device_name`.
+_DNS_TARGET_KINDS = ("ec2",)
+_DNS_RECORD_TYPE = "A"
+# 60s, and it is not arbitrary: odin's substrate is a hosts FILE, which has no
+# TTL at all. The number exists so the generated project stays portable to
+# Amazon, and it is deliberately the shortest value a human would write, because
+# the local substrate re-reads on the next container launch / hosts push rather
+# than on any expiry.
+_DNS_RECORD_TTL = "60"
+# A DNS label: letters, digits and hyphens, not starting or ending with one.
+# `aws_route53_zone.name` must be a domain and a record's own name is
+# `<ec2 label>.<zone>`, so BOTH halves are checked against this -- an
+# unresolvable name is a record odin would write into /etc/hosts and no resolver
+# would ever match.
+_DNS_LABEL = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$")
+
+
+def _bad_dns_name(name: str) -> str | None:
+    """The reason `name` cannot be a DNS name, or None if it can."""
+    parts = name.split(".")
+    bad = [part for part in parts if not _DNS_LABEL.match(part)]
+    if bad:
+        return (
+            f"{name!r} is not a valid DNS name: {', '.join(repr(p) for p in bad)} "
+            "is not a label of letters, digits and hyphens (not leading or trailing)"
+        )
+    return None
+
+
+def _route53(res: ResourceDesired, refs: Refs) -> Built:
+    reason = _bad_dns_name(res.id)
+    return reason if reason else ({"name": quote(res.id)}, "")
+
+
 # kind -> terraform resource type; kept separate from _BUILDERS so pass 1 of
 # generate_tf can assign HCL names (scoped per resource type) without running
 # any builder.
@@ -2310,6 +2398,7 @@ _TF_TYPES = {
     "alb": "aws_lb",
     "kms": "aws_kms_key",
     "ebs": "aws_ebs_volume",
+    "route53": "aws_route53_zone",
     "efs": "aws_efs_file_system",
     # apigateway (v0.8.19). **v2, not v1**, and that is an importability
     # decision rather than a preference: an `aws_api_gateway_rest_api` needs
@@ -2343,6 +2432,7 @@ _BUILDERS = {
     "alb": _alb,
     "kms": _kms,
     "ebs": _ebs,
+    "route53": _route53,
     "efs": _efs,
     "apigateway": _apigateway,  # v0.8.19
 }
@@ -2482,6 +2572,35 @@ def _mount_path_taken(efs_id: str, consumer_id: str, holder: str, path: str) -> 
         f"container holds one file system — odin renders `-v <host dir>:{path}` per mounted file "
         f"system (`runtime/colima.py`), so only {holder} is mounted there. Give one of them a "
         "different `path`, or draw one of the edges elsewhere"
+    )
+
+
+_DNS_PORTED_FACTS = {
+    "alb": "the `ALB_ENDPOINT` fact — `http://127.0.0.1:<a dynamic port>`. The proxy is published "
+           "on a DYNAMIC host port because a fixed 80 would collide across load balancers and envs",
+    "rds": "the `endpoint` fact — `host.docker.internal:<a dynamic port>`. A Postgres container "
+           "is published on a dynamic host port for the same reason",
+}
+
+
+def _dns_target_unsupported(zone_id: str, target_id: str, kind: str) -> str:
+    """Why this target cannot have a DNS record. NEVER a record that resolves to
+    something unreachable: odin's substrate for a route53 record is a hosts entry
+    (`--add-host` on containers, `/etc/hosts` on VMs), a hosts entry is
+    `<ip> <name>` and carries NO PORT, so a name pointing at a ported endpoint
+    would resolve and then fail to connect."""
+    ported = _DNS_PORTED_FACTS.get(kind)
+    reason = (
+        f"its address is {ported}. A hosts entry is `<ip> <name>` and cannot carry a port, so "
+        f"the name would resolve and then fail to connect"
+        if ported else
+        f"odin's substrate for a DNS record is a hosts entry (`--add-host` on containers, "
+        f"`/etc/hosts` on VMs), and only {'/'.join(_DNS_TARGET_KINDS)} publishes a bare address for "
+        f"one to point at — a {kind} node publishes no address a hosts file can express"
+    )
+    return (
+        f"{zone_id} (route53): DNS record for {target_id} ({kind}) — {reason}. "
+        f"No aws_route53_record is emitted; use the node's own endpoint fact instead"
     )
 
 
@@ -3290,6 +3409,61 @@ def generate_tf(stack: Stack) -> TfProject:
                         "target": f'"integrations/${{aws_apigatewayv2_integration.{integration_name}.id}}"',
                     },
                 )))
+
+    # v0.8.19: DNS RECORDS. A route53 node and a node it is edged to is an
+    # `aws_route53_record`, and the edge is the ONLY thing that can say what a
+    # name points at -- an `aws_route53_zone` on its own resolves nothing, so a
+    # route53 node with no edge is a real, empty hosted zone and says so.
+    #
+    # KEYED ON THE TWO NODE KINDS AND NEVER ON `edge.kind`, the rule every
+    # companion pass in this file holds (see the EDGE-AUTHORED FIELDS note at the
+    # top). `route53` has been a drawable catalog tile since long before it had a
+    # builder, so canvases carrying a route53 edge typed `network` already exist;
+    # gating on the type name would silently emit no record for any of them.
+    #
+    # EVERY OTHER TARGET IS DECLINED BY NAME. That is the whole difficulty of
+    # this kind, and it is measured rather than assumed -- see `_DNS_TARGET_KINDS`
+    # for the four real fact shapes and `_dns_target_unsupported` for what the
+    # user is told. Declining is the honest outcome: a record pointing at
+    # `http://127.0.0.1:<dynamic port>` would resolve to 127.0.0.1 and fail to connect.
+    for zone_id, target_ids in sorted(
+        _kind_pair_edges(stack, by_id, ("route53",), tuple(_TF_TYPES)).items()
+    ):
+        for target_id in sorted(target_ids):
+            kind = kind_by_id.get(target_id, "")
+            if kind not in _DNS_TARGET_KINDS:
+                unsupported.append(_dns_target_unsupported(zone_id, target_id, kind))
+                continue
+            fqdn = f"{target_id}.{zone_id}"
+            bad = _bad_dns_name(fqdn)
+            if bad:
+                unsupported.append(
+                    f"{zone_id} (route53): DNS record for {target_id} ({kind}) — {bad}"
+                )
+                continue
+            # `built_ids` gates the emission for the reason pass 2 records: a
+            # record naming an `aws_route53_zone` or an `aws_instance` that pass 2
+            # declined is an unresolvable reference, which fails `tofu plan` for
+            # the WHOLE project. The declined node's own entry in `unsupported`
+            # already names the cause, so nothing is lost silently here.
+            if zone_id not in built_ids or target_id not in built_ids:
+                continue
+            zone_name, instance_name = hcl_name_by_id[zone_id], hcl_name_by_id[target_id]
+            name = unique_name(
+                f"{zone_name}_{instance_name}", used_names.setdefault("aws_route53_record", set()),
+            )
+            record = _block("aws_route53_record", name, {
+                "zone_id": f"aws_route53_zone.{zone_name}.zone_id",
+                "name": quote(fqdn),
+                "type": quote(_DNS_RECORD_TYPE),
+                "ttl": _DNS_RECORD_TTL,
+                # The instance's PRIVATE address, not its mesh one -- see the
+                # `_DNS_TARGET_KINDS` note for why the overlay address would be
+                # the same trap one layer down.
+                "records": f"[aws_instance.{instance_name}.private_ip]",
+            })
+            blocks.append((("aws_route53_record", f"{zone_id}.{target_id}"), record))
+
 
     blocks.sort(key=lambda b: b[0])
     main_tf = "\n\n".join([HEADER, provider_block(), *(text for _, text in blocks)]) + "\n"

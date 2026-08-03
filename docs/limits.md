@@ -235,8 +235,8 @@ They are listed because finding one by surprise is worse than reading it here.
   backings and the prune, and reads a cached drift result instead of sweeping. ECS
   stays genuinely live because its task sweep runs on every one of those ticks;
   EC2, Lambda and RDS drift can be up to one sweep cadence stale for the duration.
-- **A drawn edge carries a modelled TYPE for only 51 of the 378 kind pairs.**
-  The honest majority answer is `unmodelled` — 327 of the 378 unordered pairs,
+- **A drawn edge carries a modelled TYPE for only 52 of the 378 kind pairs.**
+  The honest majority answer is `unmodelled` — 326 of the 378 unordered pairs,
   drawn as a grey line labelled *Not modelled*, stored in the Stack and read by
   nothing. It was called `network` until v0.8.14, which was a claim about layer 3
   that odin never checked. Re-measured 2026-08-03 over the real 27 canvas kinds,
@@ -252,8 +252,11 @@ They are listed because finding one by surprise is worse than reading it here.
   plaintext of; `kms ↔ s3|rds|dynamodb` stays `unmodelled` ON PURPOSE, because
   those live in RustFS, Postgres and dynalite containers odin holds no key for
   and a line there would claim an encryption that does not happen),
-  `role` (`iam_role ↔ lambda`) and `subscription`
-  (`sns ↔ sqs`). Drawing anything else is decoration, and now
+  `role` (1 — `iam_role ↔ lambda`), `subscription` (1 — `sns ↔ sqs`)
+  and, since v0.8.19, `dns` (1 — `route53 ↔ ec2`, a real
+  `aws_route53_record`, and behind it real name resolution: an `--add-host`
+  entry on every container in the env and an `/etc/hosts` line on every Lima
+  VM in it). Drawing anything else is decoration, and now
   says so.
   (These five numbers are not written by hand: `ui/src/lib/edge-types.test.ts`
   recomputes them from the live registry and fails if this paragraph disagrees.
@@ -269,6 +272,96 @@ They are listed because finding one by surprise is worse than reading it here.
   all three — they stay `iam` — because the passes that read them key on the
   two NODE kinds. `connection` is the one that does get its own type, because
   unlike those it is a meaning a user has to CHOOSE (see the next entry).
+- **A `dns` edge to an alb or an rds is REFUSED BY NAME on Apply**, rather than
+  silently dropped. A hosts entry is `<ip> <name>`: it carries no port and no
+  scheme. Measured 2026-08-02 against the real projectors in
+  `reconcile/tf_status.py`, an alb publishes `http://127.0.0.1:<dynamic port>`
+  (dynamic so two load balancers, or two envs, cannot collide on 80) and an rds
+  publishes `host.docker.internal:<port>`, so a name pointing at either would
+  resolve and then fail to connect — a green resource that does not work. Only
+  `ec2` publishes a bare address (`PRIVATE_IP`), so `route53 ↔ ec2` is the whole
+  of the edge; every other target stays `unmodelled` on the canvas and
+  `agent/hcl.py::_dns_target_unsupported` names the target and the reason in the
+  apply's `unsupported` list.
+  The emitted TTL (60s) exists so the generated project stays portable to Amazon;
+  odin's own substrate is a hosts FILE and has no TTL at all, so a changed
+  record lands on the next container launch or hosts push.
+- **A withdrawn record stops resolving WITHIN THE TTL, not instantly —
+  measured at ~2.2 seconds against a published 60s.** Removing a record empties
+  the guest's odin block immediately (`grep -c` for the name → 0 the moment
+  `push_hosts` returns), and `getent hosts` inside that VM keeps answering the
+  old address for about 2.2s more: `systemd-resolved` is active on the stock
+  Lima image (`nsswitch: hosts: files dns`) and still holds what the file used
+  to say. Measured 2026-08-03 on a real Lima VM.
+
+  **That is inside the contract odin publishes, not a defect against it.** Every
+  record carries `ttl = 60` (`agent/hcl.py::_DNS_RECORD_TTL`), so a resolver is
+  entitled to keep answering for up to a minute; real Route 53 defaults an A
+  record to 300s. The 2.2s is ~27× tighter than odin's own TTL and ~136× tighter
+  than AWS's default.
+  `tests/test_compute/test_hosts_resolution_e2e.py::test_removing_the_record_
+  stops_the_name_resolving` asserts both halves: the block is empty immediately,
+  and the name stops resolving within a 15s budget — an order of magnitude above
+  what was measured, well under the TTL, and still fatal to an append-only
+  writer, which never converges at all.
+
+  Worth recording because the first two attempts at this were both wrong.
+  `resolvectl flush-caches` was added as a fix and is not one: it keeps the
+  *after-boot* case immediate — which was already immediate — and changes
+  nothing for a record cloud-init seeded at BOOT, the case that actually lagged.
+  It was validated against the scenario that already passed. It is kept anyway,
+  because the after-boot case is what an edited record really is. The second
+  attempt was to make `push_hosts` poll `getent` before returning `pushed`; that
+  is the known stronger fix and is **not built** — it changes `push_hosts`'s
+  contract and its unit tests, and it is only worth doing if odin ever wants to
+  promise something tighter than the TTL it emits.
+
+- **odin serves NO DNS.** There is no resolver, no port 53, and nothing answers
+  a DNS query. A hosted zone and its records are stored, round-trip for `tofu`,
+  and are real IAM targets — but the only thing that ever *resolves* a name is a
+  hosts entry odin writes (`--add-host` on a container, `/etc/hosts` on a VM).
+  So `dig`, `nslookup` and anything that talks the DNS protocol will not find an
+  odin record; `getent hosts` and any ordinary client library will. Stated
+  because "Route 53 works" and "names resolve" are the same sentence to most
+  readers and only the second one is true here.
+- **A hosted zone's tags are replayed, but tag REMOVAL on a re-apply is
+  untested.** `ChangeTagsForResource` is really sent on create (measured
+  through a real `tofu apply`, and `ListTagsForResource` must replay it or the
+  provider plans a perpetual diff — the plan is `-detailed-exitcode` 0, so the
+  create path is confirmed). `RemoveTagKeys` is implemented and unit-tested, but
+  no real provider was ever observed sending one: if it instead sends a full
+  replacement, a removed tag would linger. Named here rather than discovered,
+  because the only tag odin itself writes is `odin:node`, which is what
+  `reconcile/tf_status.py` recovers the canvas label from.
+- **A `dns` record resolves to a DIFFERENT address depending on who is asking,
+  and for a VM with no mesh it does not resolve at all.** This is the sharper
+  half of the entry above and it was got wrong first time, so it is stated in
+  full. The emitted `aws_route53_record` carries `aws_instance.<n>.private_ip` —
+  the portable, AWS-shaped answer, and a pure function of the canvas, because
+  making `main.tf` depend on runtime mesh state would break the round trip and
+  show `tofu plan` drift with nothing changed. What odin writes into a hosts
+  file is not always that value:
+
+  | consumer | address written | why |
+  |---|---|---|
+  | container | the instance's `private_ip` | measured reachable |
+  | VM | the instance's Nebula **overlay** address | `private_ip` is **100% packet loss** VM→VM |
+  | VM, env with no mesh | **nothing is written** | there is no address that would work |
+
+  Stock Lima `vz` NATs each VM into its OWN isolated address space: a raw ping
+  between two VMs' vzNAT addresses is 100% loss *before nebula is involved*
+  (`fabric/nebula.py`'s R5 note, confirmed live with two real VMs — it is why
+  VM-to-VM traffic relays through the lighthouse at all). So handing a VM a
+  `private_ip` would be a name that resolves and then hangs, which is this
+  kind's own trap one layer down. The divergence between the emitted argument
+  and the substrate is the same shape as EBS's advisory `device_name`.
+
+  **The no-mesh case is REPORTED in World, not merely withheld**, and that
+  correction is the point. The first design simply wrote no hosts line —
+  modelled on `tf_status._ec2_facts` dropping `MESH_IP` when the lighthouse is
+  down. That is the right INPUT and the wrong whole story: honesty rule 1 lists
+  *"the mesh gate withheld facts that never reached World"* among the four
+  guards that silently never fired, and a user drawing a record, watching the
 - **Four kind pairs mean two things at once, and odin asks.** `rds` and
   `elasticache` against `ecs` and `lambda` — 8 ordered pairs — are simultaneously
   a `connection` (the workload's environment is wired to the endpoint) and an

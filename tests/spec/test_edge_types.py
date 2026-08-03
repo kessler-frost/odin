@@ -27,6 +27,7 @@ from __future__ import annotations
 from odin.agent.hcl import generate_tf
 from odin.spec.models import Edge, Stack
 from odin.spec.translate import (
+    DNS_RECORD,
     EDGE_KINDS,
     ENCRYPTION,
     LEGACY_UNMODELLED,
@@ -382,6 +383,8 @@ def test_the_kind_vocabulary_names_every_kind_the_canvas_can_author():
     the legacy one would make `odin chat` refuse an edge type that is sitting in
     every saved canvas on disk."""
     assert {
+        "iam", "sg", "role", "target", "subscription", "connection",
+        ENCRYPTION, "volume", DNS_RECORD,
         "iam", "sg", "role", "target", "subscription", "connection", ENCRYPTION, "volume", "mount",
     } <= EDGE_KINDS
     assert UNMODELLED in EDGE_KINDS and LEGACY_UNMODELLED in EDGE_KINDS
@@ -390,6 +393,8 @@ def test_the_kind_vocabulary_names_every_kind_the_canvas_can_author():
     # passes vacuously -- exactly what happened to `connection` on the day it
     # landed. Pinning the whole set is what makes the test's own name true.
     assert EDGE_KINDS == {
+        "iam", "sg", "role", "target", "subscription", "connection",
+        ENCRYPTION, "volume", DNS_RECORD,
         "iam", "sg", "role", "target", "subscription", "connection", ENCRYPTION, "volume", "mount",
         UNMODELLED, LEGACY_UNMODELLED, "ref",
     }

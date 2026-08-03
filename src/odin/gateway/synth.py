@@ -85,6 +85,7 @@ from odin.gateway.models import (
     lambdactl,
     logsctl,
     rdsctl,
+    route53ctl,
     s3notify,
     secretsctl,
     ssmctl,
@@ -467,6 +468,17 @@ async def pure_answer(
     and `PutEvents` returns an error naming the missing dispatcher rather than
     an accepted-and-never-delivered `FailedEntryCount: 0` (gateway/models/
     eventsctl.py).
+    `route53:*` is all-synth on the JSON-sidecar substrate as well, and it is
+    the one family whose substrate is a DOCUMENT and nothing else: odin serves
+    NO DNS, so a hosted zone and its record sets are stored, round-trip for
+    tofu, and are enforceable IAM targets, while nothing anywhere resolves them
+    (`gateway/models/route53ctl.py` states that limit first, before its API
+    surface). It exists because `app.py` denies an unclassifiable service, so
+    one `aws_route53_zone` in a generated project would otherwise fail the
+    user's whole apply and take every other resource with it. `GetChange` is
+    the operation worth knowing about: every change is `INSYNC` from the moment
+    it is minted, because a `PENDING` odin never leaves would make `tofu apply`
+    HANG rather than fail, and a hang is indistinguishable from "still working".
     `efs:*` (`gateway/models/efsctl.py`) is all-synth too, and it is the ONE
     modeled family whose substrate is neither a container nor a JSON sidecar: an
     EFS file system IS a real host DIRECTORY at
@@ -516,6 +528,8 @@ async def pure_answer(
         return await elbv2ctl.pure_answer(action, resource, env, body, stores, now)
     if action.startswith("events:"):
         return await eventsctl.pure_answer(action, resource, env, body, stores, now)
+    if action.startswith("route53:"):
+        return await route53ctl.pure_answer(action, resource, env, body, stores, now)
     if action.startswith("elasticfilesystem:"):
         return await efsctl.pure_answer(action, resource, env, body, stores, now, query=query)
     # apigateway (v0.8.19). The ONE branch here that needs the request PATH: API

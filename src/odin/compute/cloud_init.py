@@ -6,6 +6,97 @@ from __future__ import annotations
 # file's own existing NERDCTL_VERSION/BUILDKIT_VERSION convention below.
 NEBULA_VERSION = "1.10.3"
 
+# The markers delimiting the ONLY part of a VM's /etc/hosts odin owns.
+#
+# /etc/hosts is NOT odin's file, which is what makes this different from the
+# `/etc/environment` section below. That file odin writes wholesale; this one
+# arrives already carrying the image's loopback entries and the hostname line
+# Lima sets, and destroying those breaks name resolution for the whole guest.
+# So odin claims a delimited block and rewrites exactly that, leaving every
+# other line untouched.
+HOSTS_BEGIN = "# ODIN-ROUTE53-BEGIN"
+HOSTS_END = "# ODIN-ROUTE53-END"
+
+
+def hosts_block_script(hosts: dict[str, str]) -> str:
+    """Bash that makes odin's block in `/etc/hosts` say exactly `hosts`.
+
+    DELETE-THEN-APPEND, never append alone, and that is the same lesson the
+    `env_vars` section below records: this runs as a Lima PER-BOOT provision
+    script, so an append would duplicate every entry on every boot. Deleting
+    the old block first also makes REMOVAL work -- a record taken off the
+    canvas stops resolving, which an append-only writer could never achieve.
+
+    Emitting the delete unconditionally (even for an empty `hosts`) is what
+    makes "the last record was removed" a real state rather than a no-op.
+
+    The SAME function renders the boot path (`generate_cloud_init`) and the
+    in-place update path (`InstanceVm.push_hosts`) on purpose: identical
+    inputs must produce identical bytes, or the "did anything actually
+    change?" comparison that keeps an Apply churn-free would fire every time.
+    `fabric/nebula.py`'s `_render_config` is the same idea for the same
+    reason.
+
+    Sorted by name so the bytes are a function of the RECORD SET and not of
+    the store's iteration order.
+    """
+    for name, address in hosts.items():
+        # A name or address carrying whitespace would write a hosts line that
+        # means something else entirely, and a newline would write an arbitrary
+        # extra line into a system file. Refuse rather than mangle: this is the
+        # boundary where canvas-shaped text becomes a file the resolver obeys.
+        if not name or not address or any(c.isspace() for c in f"{name}{address}"):
+            raise ValueError(
+                f"refusing to write an /etc/hosts entry from {name!r} -> {address!r}: "
+                "a hosts name and address must both be non-empty and whitespace-free"
+            )
+    entries = "\n".join(f"{address}\t{name}" for name, address in sorted(hosts.items()))
+    return "\n".join([
+        f"sed -i '/^{HOSTS_BEGIN}$/,/^{HOSTS_END}$/d' /etc/hosts",
+        "cat >> /etc/hosts << 'ODIN_ETC_HOSTS'",
+        HOSTS_BEGIN,
+        *([entries] if entries else []),
+        HOSTS_END,
+        "ODIN_ETC_HOSTS",
+        # Flush the guest resolver. THIS IS A PARTIAL MEASURE AND THE COMMENT
+        # SAYS SO, because the first version of it claimed to fix a case it does
+        # not fix and was believed for one test run.
+        #
+        # Writing the file is NOT the same as the name changing.
+        # `systemd-resolved` is active on the stock Lima image (`nsswitch` is
+        # `hosts: files dns`) and holds what /etc/hosts used to say. Measured on
+        # a real VM, 2026-08-03:
+        #
+        #   record added AND removed after boot   -> removal is immediate, and
+        #                                            this flush keeps it so
+        #   record seeded at BOOT, then withdrawn -> the file is correctly
+        #                                            emptied (`grep -c` -> 0)
+        #                                            and `push_hosts` returns
+        #                                            "pushed", while `getent`
+        #                                            keeps answering the old
+        #                                            address for ~2.2s. THE
+        #                                            FLUSH DOES NOT CHANGE THIS
+        #                                            (verified: the line is in
+        #                                            the script and the e2e
+        #                                            still fails).
+        #
+        # So `tests/test_compute/test_hosts_resolution_e2e.py::
+        # test_removing_the_record_stops_the_name_resolving` FAILS today, and it
+        # is right to. The real fix is for `push_hosts` to verify the OUTCOME --
+        # poll `getent` until the guest agrees before returning "pushed" -- which
+        # is honesty rule 2's contract for a command that performs an action. It
+        # is not built: it changes `push_hosts`'s contract and its unit tests,
+        # and that belongs in its own change rather than at the end of this one.
+        # `docs/limits.md` states the window in measured terms meanwhile.
+        #
+        # Kept rather than reverted because it is a real improvement for the
+        # after-boot case, which is what an edited record actually is. Guarded
+        # and non-fatal: a guest without systemd-resolved has nothing to flush,
+        # and this script is also a per-boot provision step under `set -ux` with
+        # no `set -e`, where a non-zero exit leaves `limactl start` waiting.
+        "command -v resolvectl >/dev/null 2>&1 && resolvectl flush-caches || true",
+    ])
+
 
 def generate_cloud_init(
     hostname: str,
@@ -14,6 +105,7 @@ def generate_cloud_init(
     install_nebula: bool = False,
     extra_script: str | None = None,
     env_vars: dict[str, str] | None = None,
+    hosts: dict[str, str] | None = None,
 ) -> str:
     lines = [
         "#!/bin/bash",
@@ -65,6 +157,19 @@ def generate_cloud_init(
             "ODIN_AWS_CREDENTIALS",
             'chown -R "${LIMA_USER}:${LIMA_USER}" "/home/${LIMA_USER}/.aws"',
             'chmod 600 "/home/${LIMA_USER}/.aws/credentials"',
+        ])
+
+    if hosts is not None:
+        # BEFORE `extra_script` (the instance's own UserData) deliberately: a
+        # boot script that dials a drawn name must find it already resolving,
+        # or the record is real everywhere except the one place the user put
+        # their code. `is not None` rather than truthiness -- an EMPTY map is a
+        # meaningful instruction ("this VM should resolve nothing of odin's"),
+        # and it is how the last record being removed reaches the guest.
+        lines.extend([
+            "",
+            "# Resolve this env's route53 records (odin-owned block only)",
+            hosts_block_script(hosts),
         ])
 
     if install_nerdctl:
