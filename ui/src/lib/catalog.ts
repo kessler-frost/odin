@@ -27,7 +27,10 @@
 // worktrees: each edit dropped its own kind and neither saw the other's, so one
 // line still called ebs a placeholder and the other still called kms one. Both
 // were wrong, and the test that pins this invariant could not see it, because
-// it reads CATALOG rather than this comment. Keep it to ONE line.)
+// it reads CATALOG rather than this comment. Keep it to ONE line. `develop`
+// landed the same dedupe independently in 38d1a99 -- two people finding the
+// same artifact separately, which is the argument for the ratchet that commit
+// added rather than for either fix.)
 
 // `multiline`/`placeholder` mirror ConfigPanel's own FieldDef (catalogFields
 // spreads straight into it), so a catalog entry can declare a textarea field

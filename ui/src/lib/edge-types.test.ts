@@ -328,14 +328,33 @@ describe('the counts in docs/limits.md are measured, not written', () => {
     expect(LIMITS).toContain(`\`unmodelled\` — ${unmodelled} of the ${total} unordered`);
   });
 
+  // TWO guards over the same paragraph, from two worktrees that fixed the same
+  // duplicated bullet independently (this branch, and `develop`'s 38d1a99).
+  // Both are kept because they fail on DIFFERENT halves of the defect: the
+  // exactly-once check catches a merge that leaves two copies, and the
+  // every-type check catches a single copy whose enumeration is stale. Neither
+  // subsumes the other, and the bug that prompted them was both at once.
+  it('states it EXACTLY ONCE, so a merge cannot leave two contradictory counts', () => {
+    // MEASURED FAILURE, v0.8.18: the kms/ebs three-way merge kept both sides of
+    // this bullet, so docs/limits.md carried `47 of the 378`/`331` AND
+    // `42 of the 378`/`336` four lines apart. The assertions above PASSED --
+    // `toContain` is satisfied by the true copy and never sees the false one.
+    // That is the same defect as the IAM record guard replaced this release: a
+    // substring check answers "does this appear" when the question is "is this
+    // what the file says".
+    const claims = LIMITS.match(/A drawn edge carries a modelled TYPE for only \d+ of the \d+ kind pairs/g) ?? [];
+    expect(claims.length).toBe(1);
+    const majority = LIMITS.match(/The honest majority answer is `unmodelled` — \d+ of the \d+ unordered/g) ?? [];
+    expect(majority.length).toBe(1);
+  });
+
   it('states the right per-type count for EVERY type it enumerates', () => {
     // It used to check three of the nine, and the six unchecked ones were where
     // the paragraph actually rotted: `volume` and `encryption` landed in one
     // release from two worktrees, each edit rewrote the enumeration, and the
-    // result was a DUPLICATED bullet claiming both 47 and 42 typed pairs. This
-    // assertion is `toContain`, so the wrong copy could sit beside the right one
-    // for ever without failing anything. Pinning all nine is what makes a
-    // half-merged enumeration fail instead of merely looking odd.
+    // result was a DUPLICATED bullet claiming both 47 and 42 typed pairs.
+    // Pinning all of them is what makes a half-merged enumeration fail instead
+    // of merely looking odd.
     const { byType } = counts();
     expect(LIMITS).toContain(`\`iam\`\n  (${byType.iam} pairs, a real policy)`);
     expect(LIMITS).toContain(`\`connection\` **and** \`iam\` together (${byType.connection})`);

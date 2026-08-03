@@ -778,8 +778,16 @@ async def sweep_tasks(stores: SynthStores, env: str, runtime: TaskRuntime) -> No
         _update_task(
             stores, env, task["cluster_name"], task["task_id"],
             last_status="STOPPED", stopped_at=time.time(), exit_code=exit_code,
-            stopped_reason=(container_gone_reason(task["container_name"]) if gone
-                            else _ESSENTIAL_CONTAINER_EXITED),
+            # `task["container_name"]` is the TASK DEFINITION's container name
+            # ("web"), NOT the container. Passing it here made this sweep write
+            # "container web removed outside odin" while drift.py -- racing it
+            # for the identical event -- wrote the real "odin-ecs-{env}-{id}-web".
+            # `container_gone_reason` was extracted to give both ONE wording and
+            # did; nobody checked they were passing it the same KIND of name, so
+            # the race went on deciding what the user saw. "web" matches no
+            # docker object, so the remedy it names cannot be acted on.
+            stopped_reason=(container_gone_reason(container_name(env, task["task_id"], task["container_name"]))
+                            if gone else _ESSENTIAL_CONTAINER_EXITED),
         )
         # W2.5: a task that died on its own must leave its load balancer's
         # upstream list too, or the proxy keeps a dead server in rotation. Runs
