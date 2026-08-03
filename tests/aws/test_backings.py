@@ -426,7 +426,7 @@ async def test_provision_sns_subscribes_queues_using_returned_arns(rt, factory, 
     factory.responses[("sns", "create_topic")] = {"TopicArn": "arn:fake:alerts"}
     factory.responses[("sqs", "create_queue")] = {"QueueUrl": "http://q/jobs"}
     factory.responses[("sqs", "get_queue_attributes")] = {"Attributes": {"QueueArn": "arn:fake:jobs"}}
-    await _aws(rt, factory, tmp_path).provision("sns", "alerts", subscriptions=("jobs",))
+    await _aws(rt, factory, tmp_path).provision("sns", "alerts", subscriptions=(("jobs", True),))
 
     assert ("sqs", "create_queue", {"QueueName": "jobs"}) in factory.calls
     get_attrs = next(c for c in factory.calls if c[1] == "get_queue_attributes")
@@ -436,6 +436,21 @@ async def test_provision_sns_subscribes_queues_using_returned_arns(rt, factory, 
         "TopicArn": "arn:fake:alerts", "Protocol": "sqs",
         "Endpoint": "arn:fake:jobs", "Attributes": {"RawMessageDelivery": "true"},
     }
+
+
+async def test_an_edge_that_turned_raw_delivery_OFF_subscribes_with_false(rt, factory, tmp_path):
+    """The non-tofu Apply path has to agree with the generated HCL. It
+    hardcoded `"true"` until v0.8.21, so a canvas that turned the flag off got
+    the JSON envelope through `tofu apply` and the raw body through Apply --
+    the same topic delivering two different shapes depending on which button
+    the user pressed, visible only to whatever parsed the message."""
+    factory.responses[("sns", "create_topic")] = {"TopicArn": "arn:fake:alerts"}
+    factory.responses[("sqs", "create_queue")] = {"QueueUrl": "http://q/jobs"}
+    factory.responses[("sqs", "get_queue_attributes")] = {"Attributes": {"QueueArn": "arn:fake:jobs"}}
+    await _aws(rt, factory, tmp_path).provision("sns", "alerts", subscriptions=(("jobs", False),))
+
+    subscribe = next(c for c in factory.calls if c[1] == "subscribe")
+    assert subscribe[2]["Attributes"] == {"RawMessageDelivery": "false"}
 
 
 async def test_provision_tolerates_already_exists_client_errors(rt, factory, tmp_path):

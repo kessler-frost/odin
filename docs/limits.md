@@ -35,7 +35,9 @@ choices baked into the generated file, so they are what you would actually get:
 - **No `aws_internet_gateway`.** A VPC with no route to the internet.
 - **API Gateway: the `$default` stage only, payload format 2.0 only, and no
   authorizers** — every route is `authorization_type = "NONE"`, i.e. public.
-- **Every SNS→SQS subscription is `raw_message_delivery = true`.**
+- **An SNS→SQS subscription defaults to `raw_message_delivery = true`.**
+  Authorable per edge since v0.8.21, so it follows you as whatever you
+  chose; an edge nobody touched still emits `true`.
 - **A security group is IPv4-only**, and its rule ports must be literals.
 - **Some arguments are re-emitted with odin's own value whatever you wrote** —
   those are enumerated further down, and they apply on real AWS too.
@@ -213,8 +215,8 @@ internet-facing, EC2 launch type where you wanted Fargate, no IGW.
   single-node Redis, so a three-node memcached cluster comes back as one Redis —
   it now says so); a DynamoDB table's `billing_mode`; a bucket's `force_destroy`;
   an RDS `skip_final_snapshot` and `allocated_storage`; a log group's
-  `retention_in_days`; a secret's `recovery_window_in_days`; a subscription's
-  `raw_message_delivery`; and **any resource name odin takes from the HCL block
+  `retention_in_days`; a secret's `recovery_window_in_days`; and **any resource
+  name odin takes from the HCL block
   label instead of the `name` you wrote** — which is what happens whenever the
   real name is computed, so a project whose names come from variables gets
   renamed on import and is told.
@@ -602,11 +604,20 @@ internet-facing, EC2 launch type where you wanted Fargate, no IGW.
   v0.8.15; the default is now `rds:DescribeDBInstances`, which is classified and
   enforced, and what a user drawing that line usually wants is the `connection`
   edge above.
-- **SNS→SQS subscriptions** are all generated with `raw_message_delivery = true`,
-  so the queue gets the published body verbatim rather than SNS's JSON envelope,
-  and that holds on an import round trip even if your `.tf` said otherwise. It
-  keeps `tofu apply` and Apply delivering identically, but it changes what a
-  consumer reads.
+- **Changing `raw_message_delivery` on an ALREADY-LIVE subscription only takes
+  effect through Simulate, not through Apply.** The flag is authorable per edge
+  since v0.8.21 and both paths honour it when the subscription is CREATED —
+  `iac/hcl.py` emits it and `aws/backings.py::provision` subscribes with it, so
+  a fresh canvas delivers the same shape whichever button you press. Flipping
+  it afterwards is the gap: `Reconciler._watch` re-subscribes a queue that is
+  MISSING from the topic, never one whose attributes merely differ, and
+  `BackingAws.subscriptions` reads endpoints out of `ListSubscriptionsByTopic`,
+  which carries no attributes at all — so odin cannot currently SEE the
+  difference. Closing it needs a `GetSubscriptionAttributes` per subscription
+  and a probe of what goaws answers to one; neither has been done, so this is
+  written down rather than guessed at. `tofu apply` has no such gap: the
+  provider issues `SetSubscriptionAttributes` itself. Workaround on the Apply
+  path: delete the edge, apply, redraw it.
 - **An RDS instance's data is a Docker volume and nothing else — there are no
   snapshots and no backups.** This entry used to say the opposite of its first
   half: the container held its data on the image's *anonymous* volume, which

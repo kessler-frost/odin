@@ -510,7 +510,14 @@ _FIXED_VALUES = {
     ("aws_lb_target_group", "target_type"): "instance",
     ("aws_lb_listener", "protocol"): "http",
     ("aws_sns_topic_subscription", "protocol"): "sqs",
-    ("aws_sns_topic_subscription", "raw_message_delivery"): "true",
+    # `raw_message_delivery` LEFT THIS TABLE in v0.8.21. It sat here because
+    # odin substituted its own `true` for whatever the source said, and the
+    # warning was the honest disclosure of a real loss: a consumer written
+    # against SNS's JSON envelope stopped finding one. It is authorable now
+    # (`Edge.raw_message_delivery`), so the value round-trips and there is
+    # nothing left to disclose -- leaving the entry would report a
+    # substitution that no longer happens, which is the same lie as hiding one
+    # that does.
     # odin emits all four of these unconditionally (`hcl.py::_ecs`), and the
     # rolling-update pair is load-bearing: `_ECS_MIN_HEALTHY_PERCENT = 100` is
     # what keeps the previous revision serving while a new one comes up, so a
@@ -2440,12 +2447,23 @@ def parse_hcl(files: dict[str, str], archives: dict[str, bytes] | None = None) -
         topic_label = by_hcl_name.get(f"aws_sns_topic.{topic_target}") if topic_target else None
         queue_label = by_hcl_name.get(f"aws_sqs_queue.{queue_target}") if queue_target else None
         if topic_label and queue_label:
-            edges.append({"source": topic_label, "target": queue_label})
-            # The subscription becomes an EDGE, and an edge carries no arguments
-            # -- so everything the source put ON the subscription has to be
-            # accounted for here or it vanishes. `filter_policy` is the one that
-            # matters most: drop it and the queue starts receiving every message
-            # published to the topic, which no warning ever mentioned.
+            # `rawMessageDelivery` is written ONLY when the source turned it
+            # off. An edge dict with no such key is byte-identical to what this
+            # produced before the field existed, and `translate._edges` reads
+            # its absence as True -- so every canvas and every `.tf` that never
+            # mentioned it imports exactly as it always did, and re-generates
+            # the same file. Writing `true` explicitly would churn every stored
+            # canvas's content hash for no change in meaning.
+            edge: dict = {"source": topic_label, "target": queue_label}
+            if _literal(attrs.get("raw_message_delivery")) == "false":
+                edge["data"] = {"rawMessageDelivery": False}
+            edges.append(edge)
+            # The subscription becomes an EDGE, and an edge carries almost no
+            # arguments -- so everything the source put ON the subscription has
+            # to be accounted for here or it vanishes. `filter_policy` is the
+            # one that matters most: drop it and the queue starts receiving
+            # every message published to the topic, which no warning ever
+            # mentioned.
             sub_type = "aws_sns_topic_subscription"
             dropped, changed = _attribute_notes(
                 sub_type, attrs, _CARRIED_COMPANION_ATTRS[sub_type], (), {},

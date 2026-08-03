@@ -2968,11 +2968,18 @@ def generate_tf(stack: Stack) -> TfProject:
             sanitize_name(f"{topic_name}_{queue_name}"),
             used_names.setdefault("aws_sns_topic_subscription", set()),
         )
+        # AUTHORABLE since v0.8.21, and `true` is still what an unmarked edge
+        # produces -- `Edge.raw_message_delivery` defaults to True and
+        # `translate._edges` reads an absent field as True, so every canvas
+        # drawn before the checkbox existed emits the identical bytes. Only an
+        # edge explicitly turned off writes `false`, and then the IMPORT reads
+        # it back (`import_tf._subscription_edge`) instead of substituting
+        # odin's own value, which is what the round trip used to do.
         attrs = {
             "topic_arn": f"aws_sns_topic.{topic_name}.arn",
             "protocol": quote("sqs"),
             "endpoint": f"aws_sqs_queue.{queue_name}.arn",
-            "raw_message_delivery": "true",
+            "raw_message_delivery": "true" if edge.raw_message_delivery else "false",
         }
         block = _block("aws_sns_topic_subscription", name, attrs)
         blocks.append((("sns_subscription", f"{topic.id}.{queue.id}"), block))
