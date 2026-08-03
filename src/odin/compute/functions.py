@@ -166,6 +166,7 @@ class FunctionRuntime:
     async def ensure(
         self, env: str, function_name: str, runtime: str, handler: str,
         env_vars: dict[str, str], code_dir: Path, memory_mib: int | None = None,
+        volumes: dict[str, str] | None = None,
     ) -> int:
         """(Re)create the function's container from `code_dir` and block
         until its RIE answers -- the caller (lambdactl.py's background
@@ -178,7 +179,21 @@ class FunctionRuntime:
         `MemorySize` (lambdactl.py always sets one -- `_DEFAULT_MEMORY`, 128,
         when CreateFunction didn't) -- capped onto the REAL container so a
         runaway handler can't eat the host; `None` (a caller that predates
-        this) leaves the container unbounded, same as before."""
+        this) leaves the container unbounded, same as before.
+
+        `volumes` is `{host path -> container path}` for this function's EFS
+        mounts, already resolved by the caller
+        (`gateway/models/efsctl.py::function_mounts` walks
+        `FileSystemConfigs[].Arn` -> access point -> file system -> directory).
+        Resolved up there and not here because that mapping lives in the
+        gateway's store and `compute/` sits BELOW `gateway/`. It is merged
+        BESIDE the code directory, never over it: `/var/task` is where the
+        handler lives, and a mount landing on top of it would replace the
+        function's own code with the shared file system -- so the code entry is
+        written LAST and wins any collision, which is also what real Lambda
+        does (`LocalMountPath` must be under `/mnt/`, and AWS's own pattern
+        enforces it -- `function_mounts` checks that before this is ever
+        called)."""
         name = container_name(env, function_name)
         await self._rt.stop(name)  # clear any exited remnant (UpdateFunctionCode redeploy, or a stale prior run)
         image = RUNTIME_IMAGES.get(runtime, RUNTIME_IMAGES[DEFAULT_RUNTIME])
@@ -187,7 +202,7 @@ class FunctionRuntime:
             ports={_RIE_PORT: 0},
             labels={"odin-env": env, "odin-lambda-fn": function_name},
             command=(handler,) if handler else (),
-            volumes={str(code_dir): "/var/task"},
+            volumes={**(volumes or {}), str(code_dir): "/var/task"},
             memory_mib=float(memory_mib) if memory_mib else None,
         ))
         return await self._await_ready(name)

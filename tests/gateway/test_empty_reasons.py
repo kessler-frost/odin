@@ -159,7 +159,7 @@ class SilentlyFailingTaskRuntime(FakeTaskRuntime):
     """`run` raises with NO message -- the shape a real `MemoryError` (or any
     no-arg construction) takes when it reaches `_launch_task`'s broad catch."""
 
-    async def run(self, env, task_id, container_def, extra_env=None, cpu=None, memory=None):
+    async def run(self, env, task_id, container_def, extra_env=None, cpu=None, memory=None, volumes=None):
         self.ran.append((env, task_id, container_def, extra_env, cpu, memory))
         raise RuntimeError()
 
@@ -229,7 +229,7 @@ async def test_mark_task_stopped_refuses_a_reason_that_says_nothing(stores):
 class SilentlyFailingFunctionRuntime(FakeFunctionRuntime):
     """`ensure` raises with NO message."""
 
-    async def ensure(self, env, name, runtime, handler, env_vars, code_dir, memory_mib=None):
+    async def ensure(self, env, name, runtime, handler, env_vars, code_dir, memory_mib=None, volumes=None):
         self.ensured.append((env, name, runtime, handler, dict(env_vars), code_dir, memory_mib))
         raise RuntimeError()
 

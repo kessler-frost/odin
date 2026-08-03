@@ -44,7 +44,7 @@ from odin.fabric.sidecar import MeshSidecar
 from odin.gateway import DEFAULT_GATEWAY_PORT, GATEWAY_PORT_ENV, wiring
 from odin.gateway.app import GatewayState, create_gateway_app, serve_on_loop
 from odin.gateway.keys import OPERATOR_NODE_ID, KeyStore, Principal
-from odin.gateway.models import ec2compute, ec2net, ecsctl, lambdactl, rdsctl
+from odin.gateway.models import ec2compute, ec2net, ecsctl, efsctl, lambdactl, rdsctl
 from odin.gateway.stores import SynthStores
 from odin.reconcile import admission, drift
 from odin.reconcile.dispatch import Dispatcher
@@ -1186,6 +1186,22 @@ def create_apply_router(
                 raise ec2compute.disks_standing(env, disks.standing)
             if disks.reclaimed:
                 body["reclaimed_disks"] = list(disks.reclaimed)
+            # ...and the EFS file systems, for the same reason and with a
+            # sharper edge: an EFS file system IS a host directory, so what is
+            # left behind here is not space but the FILES the workloads that
+            # mounted it wrote. `tofu destroy` calls DeleteFileSystem and that
+            # removes it -- but only for resources its state knows about, and an
+            # interrupted apply is exactly the case where it does not. The sweep
+            # walks `.odin/{env}/gateway/efs/` itself rather than the records, so
+            # it also finds a directory whose record was lost, and it is scoped
+            # to this one env's directory by construction. `ReclaimFailed`
+            # because the verdict it maps to is already the right one: the
+            # request did not complete and the env is not destroyed.
+            reclaimed_fs, standing_fs = efsctl.reclaim_env_file_systems(stores, env)
+            if standing_fs:
+                raise ec2compute.ReclaimFailed(efsctl.file_systems_standing(env, standing_fs))
+            if reclaimed_fs:
+                body["reclaimed_file_systems"] = list(reclaimed_fs)
             # ...and the network records the same interruption left behind,
             # which `tofu destroy` likewise never reaches. They are what kept
             # `/world` listing a VPC and subnets for a destroyed env -- and,
@@ -1286,6 +1302,12 @@ def create_apply_router(
         detail["reclaimed"]["disks"] = list(disks.reclaimed)
         if disks.standing:
             return "volumes_standing", {**detail, "still_standing": {"disks": list(disks.standing)}}
+        # EFS deliberately gets NO sweep here, and the reason is a property
+        # rather than an oversight: an EFS file system is a directory UNDER
+        # `.odin/{env}/`, and this branch is only reached when that directory
+        # does not exist (`_remove_env`'s `not target.exists()` gate). There is
+        # nothing left for a sweep to find. Docker volumes and Lima disks need
+        # one precisely because they live somewhere else on the machine.
         # Reclaiming something means the env DID exist, so "removed" is the true
         # word and `not_found` would be the false one -- odin just deleted state
         # a user cannot get back, and reporting that as "there was nothing here"

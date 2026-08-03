@@ -94,7 +94,7 @@ from odin.compute.functions import DEFAULT_RUNTIME, READY_TIMEOUT, FunctionRunti
 from odin.gateway import errors
 from odin.gateway.errors import exc_text
 from odin.gateway.keys import KeyStore, workload_env
-from odin.gateway.models import background, join, logsctl
+from odin.gateway.models import background, efsctl, join, logsctl
 from odin.gateway.stores import NO_CHANGE, SynthStores
 from odin.gateway.wiring import node_env
 from odin.runtime.colima import ColimaRuntime
@@ -222,6 +222,14 @@ def _configuration_json(fn: dict) -> dict:
         "PackageType": "Zip",
         "Architectures": ["x86_64"],
         "RevisionId": fn["revision_id"],
+        # ECHOED, and that is not cosmetic: `FileSystemConfigs` is a member of
+        # `FunctionConfiguration` as well as of `CreateFunctionRequest`, so a
+        # provider that sent one and reads none back sees a resource that lost a
+        # field it set -- permanent drift on every `plan`, forever. `.get` rather
+        # than `[...]` because a function record written by an odin from before
+        # EFS existed has no such key, and a KeyError here would 500 every
+        # GetFunctionConfiguration in that env.
+        "FileSystemConfigs": fn.get("file_system_configs") or None,
     }
 
 
@@ -289,7 +297,16 @@ async def _finish_deploy(
             container_env.update(await node_env(stores, env, label))
         if keystore is not None and gateway_port is not None and label:
             container_env.update(workload_env(keystore, env, label, gateway_port))
-        await substrate.ensure(env, name, runtime, handler, container_env, code_dir, memory_mib=memory_mib)
+        # EFS mounts, resolved HERE rather than captured at the call site, and
+        # read from the store rather than passed in: this coroutine is the one
+        # place all three deploy paths (create, code update, config update) meet,
+        # so reading the record is what makes a mount changed by
+        # UpdateFunctionConfiguration actually take effect. A mount that cannot
+        # be made real raises `MountUnavailable` into the `except` below and the
+        # function goes `Failed` with that reason -- never started with an empty
+        # directory standing in for the shared file system.
+        mounts = efsctl.function_mounts(stores, env, (_function(stores, env, name) or {}).get("file_system_configs") or [])
+        await substrate.ensure(env, name, runtime, handler, container_env, code_dir, memory_mib=memory_mib, volumes=mounts)
     except Exception as exc:
         # `_exc_text`, not `str(exc)`: an exception built with no args would
         # make BOTH reason fields empty, and `_configuration_json` drops an
@@ -584,6 +601,12 @@ async def _create_function(resource: str, env: str, body: bytes, stores: SynthSt
         # creation so a never-invoked function is honestly "no failure" rather
         # than "unknown".
         "last_invocation_error": None,
+        # The function's EFS mounts, stored verbatim as terraform sent them --
+        # `[{"Arn": "<access point arn>", "LocalMountPath": "/mnt/efs"}]`. Stored
+        # rather than resolved: the Arn is what the provider diffs against, and
+        # `_finish_deploy` resolves it to a real directory at boot time so a
+        # file system deleted and recreated between deploys resolves afresh.
+        "file_system_configs": list(payload.get("FileSystemConfigs") or []),
         "revision_id": str(uuid.uuid4()),
     }
     stores.lambdactl.set(env, _key(name), fn)
@@ -727,6 +750,13 @@ async def _update_function_configuration(resource: str, env: str, body: bytes, s
             updated["memory_size"] = int(payload["MemorySize"])
         if "Environment" in payload:
             updated["environment"] = dict((payload.get("Environment") or {}).get("Variables") or {})
+        if "FileSystemConfigs" in payload:
+            # A changed mount is a real config change, and it reaches the
+            # container because a config-only update already restarts it (this
+            # module's own "no relabel-without-restart" rule, two lines down).
+            # Echoing it is the other half: an update that stored the new value
+            # but answered with the old one would drift on the very next plan.
+            updated["file_system_configs"] = list(payload.get("FileSystemConfigs") or [])
         updated.update(_redeploy_fields({}))
         return updated
 

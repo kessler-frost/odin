@@ -17,10 +17,18 @@
 // both ways: `(placeholder)` in a sublabel means Apply skips it, and nothing
 // else does. When a placeholder becomes real, the marker comes off in the same
 // commit that adds it to `_KIND`.
-// Today: kinesis, route53, apigateway, efs, events, eip, igw.
-// (`ebs` came OFF this list in v0.8.18 -- it is a real `limactl disk` volume
-// on a real VM now, and the marker came off in the same commit that added it
-// to `_KIND`, exactly as the rule above requires.)
+// Today: kinesis, route53, apigateway, events, eip, igw.
+// `kms`, `ebs` and now `efs` came OFF this list; each marker came off in the
+// same commit that added the kind to `_KIND`, exactly as the rule above
+// requires.
+//
+// That one line was TWO contradictory lines for a merge -- one still naming
+// `ebs`, the other still naming `kms`, both kept -- so it is worth saying how
+// this one was arrived at: by grepping the file for `(placeholder)'` and
+// checking each hit against `translate.py::_KIND`, not from memory. A
+// hand-maintained list beside the thing it describes is prose that cannot
+// fail a build; `catalog.test.ts` pins the INVARIANT (nothing marked
+// `(placeholder)` reaches `PALETTE`), which is the half that matters.
 
 // `multiline`/`placeholder` mirror ConfigPanel's own FieldDef (catalogFields
 // spreads straight into it), so a catalog entry can declare a textarea field
@@ -366,10 +374,49 @@ export const CATALOG: ServiceDef[] = [
     defaultData: { label: 'new-api', apiId: '' },
   },
   {
-    type: 'efs', abbr: 'EFS', label: 'EFS', sublabel: 'Elastic file system (placeholder)',
-    category: 'Storage', color: 'sky', width: 200,
-    fields: [{ key: 'label', label: 'Name', editable: true }, { key: 'fsId', label: 'File System ID' }],
-    defaultData: { label: 'new-fs', fsId: '' },
+    // REAL as of v0.8.19, and what is really underneath is a shared HOST
+    // DIRECTORY: one `.odin/<env>/gateway/efs/<fs-id>/` per file system,
+    // bind-mounted into the container behind every ecs/lambda node the tile is
+    // edged to (`iam.ts`'s `mount` edge -> `ContainerSpec.volumes` -> a real
+    // `-v source:path`). Two tasks writing and reading one directory is what
+    // "shared file system" has to mean, and that is what the e2e measures.
+    //
+    // `path` is the mount path INSIDE the consumer, and it is one field for the
+    // whole node rather than one per edge, because a tile has nowhere to hang a
+    // per-consumer value -- every consumer of one efs node mounts it at the same
+    // place. Stated in docs/limits.md rather than left to be discovered.
+    // The default is `/mnt/efs` because AWS's own `LocalMountPath` pattern
+    // (`/mnt/[a-zA-Z0-9-_.]+`, read out of botocore rather than remembered)
+    // allows exactly ONE segment under `/mnt`: `/mnt/efs` is legal, and
+    // `/mnt/efs/data` is not.
+    //
+    // NO `iamActions`, and that is a decision rather than an omission -- the
+    // same one `alb` and `iam_role` carry. An EFS mount is a kernel bind mount
+    // performed by the container runtime; odin's gateway never sees a signed
+    // request for it, so an `elasticfilesystem:ClientMount` offered here would
+    // be a permission that cannot bite, which is the defect
+    // `tests/gateway/test_iam_vocabulary_is_enforceable.py` exists to stop.
+    // It is load-bearing a second way: the IAM loop in `iam.ts` registers every
+    // `iamActionsForTarget` key against every compute kind, so declaring
+    // actions here would give `efs <-> ecs` and `efs <-> lambda` a SECOND
+    // meaning and fail `edge-ambiguity.test.ts` by name.
+    //
+    // The accent moved from `sky` to `fuchsia` in the same change, for a reason
+    // that only exists once the tile is real: every edge type takes its colour
+    // from its node's accent (`iam.ts`, the rule `sg` states for red and `role`
+    // for amber), and `sky` (#38bdf8) is already the `target` edge. An
+    // `alb -> ecs` target and an `efs -> ecs` mount meet on the same ECS node in
+    // an ordinary canvas -- docs/SCENARIOS.md's S11 is exactly that graph -- and
+    // two solid lines of one colour meaning two different things is the canvas
+    // saying less than it knows. `fuchsia` is unused by any edge type.
+    type: 'efs', abbr: 'EFS', label: 'EFS', sublabel: 'Elastic file system',
+    category: 'Storage', color: 'fuchsia', width: 200,
+    fields: [
+      { key: 'label', label: 'Name', editable: true },
+      { key: 'path', label: 'Mount Path', editable: true, placeholder: '/mnt/efs' },
+    ],
+    defaultData: { label: 'new-fs', path: '/mnt/efs' },
+    primary: { key: 'path', label: 'Mount' },
   },
   // ecs (V5c) is the REAL, gateway-modeled ECS service (NORTHSTAR directive
   // 5): the drawn node IS the service+taskdef pair (v1 single-container

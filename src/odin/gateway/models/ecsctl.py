@@ -108,7 +108,7 @@ from odin.compute.tasks import TaskRuntime, container_name
 from odin.gateway import errors
 from odin.gateway.errors import exc_text
 from odin.gateway.keys import KeyStore, workload_env
-from odin.gateway.models import background, elbv2ctl, join, logsctl
+from odin.gateway.models import background, efsctl, elbv2ctl, join, logsctl
 from odin.gateway.stores import NO_CHANGE, SynthStores
 from odin.gateway.wiring import node_env
 from odin.runtime.colima import CONTAINER_HOST
@@ -858,9 +858,17 @@ async def _launch_task(
         # what makes a bad ref a `crashed` node with a naming verdict AND a
         # failed apply (the service never reaches steady state).
         launch_env = {**await node_env(stores, env, node_label), **(extra_env or {})} if node_label else extra_env
+        # The EFS join, and it is INSIDE this `try` for the same reason an
+        # `UnresolvedRef` is: a mount that cannot be made real must land the task
+        # in STOPPED with the real reason (`MountUnavailable`'s own message),
+        # which fails the apply and puts a verdict on the canvas -- never a
+        # container quietly started with an empty directory where the shared
+        # file system should be. `taskdef["volumes"]` has been stored and echoed
+        # since ECS landed and read by nothing until now.
         handle = await runtime.run(
             env, task_id, container_def, extra_env=launch_env,
             cpu=taskdef.get("cpu"), memory=taskdef.get("memory"),
+            volumes=efsctl.task_mounts(stores, env, taskdef, container_def),
         )
     except Exception as exc:
         # Deliberately broad: this runs as a background task with no caller to

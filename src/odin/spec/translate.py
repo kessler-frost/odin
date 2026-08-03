@@ -83,6 +83,7 @@ _KIND = {
     "alb": "alb",
     "kms": "kms",
     "ebs": "ebs",
+    "efs": "efs",
 }
 
 
@@ -364,6 +365,23 @@ SNS_SUBSCRIPTION = "subscription"
 # make the next apply detach a disk with data on it.
 VOLUME_ATTACHMENT = "volume"
 
+# "This workload mounts that file system" -- a `volume` + `mountPoints` pair on
+# an ecs task definition, or a `file_system_config` on a lambda, and behind both
+# a real host directory bind-mounted into the container.
+#
+# NOT a reuse of `VOLUME_ATTACHMENT`, and the difference is the feature: a gp3
+# volume attaches to exactly ONE instance (`agent/hcl.py` refuses a second
+# attachment edge by name), while an EFS file system is mounted by MANY
+# consumers at once. One label reading "Volume Attachment" over both would tell
+# the user the wrong thing about exclusivity on the one line where sharing is
+# the point. They also emit different Terraform -- a standalone
+# `aws_volume_attachment` resource versus a nested block on the CONSUMER -- so
+# the importer's inverse differs correspondingly.
+#
+# PRESENTATIONAL in the same sense as the kinds above: `agent/hcl.py`'s mount
+# pass keys on the two NODE KINDS and never on this name.
+FILE_SYSTEM_MOUNT = "mount"
+
 # "This workload's environment is wired to that producer's endpoint" -- folded
 # into the consumer's `refs` by `_merge_connection_edges` below.
 CONNECTION = "connection"
@@ -390,8 +408,8 @@ LEGACY_UNMODELLED = "network"
 
 EDGE_KINDS = frozenset({
     "iam", SG_MEMBERSHIP, ROLE_ASSUMPTION, ALB_TARGET, SNS_SUBSCRIPTION,
-    CONNECTION, ENCRYPTION, UNMODELLED, LEGACY_UNMODELLED, "ref",
-    CONNECTION, VOLUME_ATTACHMENT, UNMODELLED, LEGACY_UNMODELLED, "ref",
+    CONNECTION, ENCRYPTION, VOLUME_ATTACHMENT, FILE_SYSTEM_MOUNT,
+    UNMODELLED, LEGACY_UNMODELLED, "ref",
 })
 
 # Kinds whose HCL reads `securityGroups` (`agent/hcl.py::_security_group_refs`,

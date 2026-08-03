@@ -72,6 +72,7 @@ class TaskRuntime:
     async def run(
         self, env: str, task_id: str, container_def: dict, extra_env: dict[str, str] | None = None,
         cpu: str | int | None = None, memory: str | int | None = None,
+        volumes: dict[str, str] | None = None,
     ) -> TaskContainerHandle:
         """Boot the task's single container from its taskdef container
         definition (image/environment/portMappings/command) -- returns as
@@ -89,8 +90,18 @@ class TaskRuntime:
 
         `cpu`/`memory` (owner directive B4): the taskdef's own top-level
         fields (real ECS CPU units / MiB, as strings) when RegisterTaskDefinition
-        set them, else this module's own default cap -- never unbounded."""
+        set them, else this module's own default cap -- never unbounded.
+
+        `volumes` is `{host path -> container path}`, already RESOLVED by the
+        caller (`gateway/models/efsctl.py::task_mounts` joins the task
+        definition's `volumes[].efsVolumeConfiguration.fileSystemId` with this
+        container's `mountPoints[]`). It is resolved up there rather than here
+        on purpose: the file-system id -> directory mapping lives in the
+        gateway's efsctl store, and `compute/` sits BELOW `gateway/` -- importing
+        upward would be a cycle. This module stays what it is, a substrate
+        binding that mounts what it is handed."""
         name = container_name(env, task_id, container_def["name"])
+        self._refuse_unmountable(volumes)
         env_vars = {kv["name"]: kv.get("value", "") for kv in container_def.get("environment") or []}
         if extra_env:
             env_vars.update(extra_env)
@@ -100,6 +111,7 @@ class TaskRuntime:
             command=tuple(container_def.get("command") or []),
             labels={"odin-env": env, "odin-ecs-task": task_id},
             memory_mib=_memory_mib(memory), cpus=_cpus(cpu),
+            volumes=dict(volumes or {}),
         )
         if not self._placed_on:
             await self._rt.run_container(spec)
@@ -121,6 +133,41 @@ class TaskRuntime:
                 ) from exc
         host_ports = {cport: await self._rt.host_port(name, cport) for cport in ports}
         return TaskContainerHandle(name=name, host_ports=host_ports)
+
+    def _refuse_unmountable(self, volumes: dict[str, str] | None) -> None:
+        """A PLACED task cannot bind-mount a host directory, so it is refused
+        rather than started with an empty one.
+
+        THE SUBSTRATE FACT, and it is checkable: `compute/lima_yaml.py` emits
+        `"mounts": []` for every VM odin creates, so a Lima guest shares NO host
+        paths at all. A placed service runs under `LimaRuntime`
+        (`ecsctl.runtime_for_service`), whose `-v` goes to nerdctl INSIDE that
+        guest -- where the host path does not exist, so nerdctl creates a fresh
+        empty directory and reports nothing wrong. The task would come up, mount
+        something, read nothing, and every status would be green. That is the
+        exact failure this repo names "reports success it did not achieve", and
+        the only honest answers are to refuse or to report; refusing is louder,
+        and the caller (`ecsctl._launch_task`) already turns this into a STOPPED
+        task carrying the reason, which fails the apply and puts a real verdict
+        on the canvas.
+
+        `tests/test_compute/test_tasks.py` pins the premise as well as the
+        behaviour: it asserts `generate_lima_yaml` really does emit no mounts, so
+        if odin's VMs ever gain one, that test fails and points here instead of
+        leaving a guard that refuses something newly possible.
+
+        `_placed_on` is a real arriving signal, not a sniff: `runtime_for_service`
+        sets it from the service record's own placement and this class already
+        uses it to phrase boot failures."""
+        if volumes and self._placed_on:
+            raise RuntimeError(
+                f"this task is drawn INSIDE the {self._placed_on!r} instance and also mounts an EFS "
+                f"file system ({', '.join(sorted(volumes.values()))}), and odin cannot make both true: "
+                f"a placed task runs in that instance's own Lima VM, and odin's VMs are created sharing "
+                f"NO host directories (compute/lima_yaml.py emits `mounts: []`), so the mount would be "
+                f"an EMPTY directory that reports no error. Nothing was started. Draw the task outside "
+                f"the instance to mount the file system, or drop the mount edge to keep the placement."
+            )
 
     async def status(self, env: str, task_id: str, container_def_name: str) -> str:
         return await self._rt.status(container_name(env, task_id, container_def_name))

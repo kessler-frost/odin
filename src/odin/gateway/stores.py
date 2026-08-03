@@ -329,6 +329,16 @@ class SynthStores:
       into `eventsctl`/`s3notify`: those two are CONTROL planes that tofu reads
       back, and mixing a mutable per-tick cursor into a record terraform diffs
       is how a refresh starts reporting drift on odin's own bookkeeping.
+    - `efsctl`: the EFS model's whole state (`gateway/models/efsctl.py`) --
+      flat keys `"fs:{FileSystemId}"` / `"ap:{AccessPointId}"`, persisted at
+      `.odin/{env}/gateway/efsctl.json`. EFS tags live in the shared `tags`
+      store above, keyed `"elasticfilesystem:{arn}"`.
+      **The REAL file system is NOT in this file** -- it is a host DIRECTORY at
+      `.odin/{env}/gateway/efs/{fs-id}/`, bind-mounted into the containers drawn
+      with a mount edge to it, and the record here merely names it (`host_dir`).
+      That split matters for teardown: deleting this JSON leaves the user's data
+      on disk, so `/envs/rm` sweeps the directory tree ITSELF
+      (`efsctl.reclaim_env_file_systems`) rather than iterating records.
     - `s3notify`: the S3 bucket-notification configuration
       (`gateway/models/s3notify.py`) -- flat keys `"notify:{bucket}"`,
       persisted at `.odin/{env}/gateway/s3notify.json`. This is odin's OWN
@@ -363,6 +373,7 @@ class SynthStores:
         self.rdsctl = JsonStore(root, "rdsctl")
         self.elbv2ctl = JsonStore(root, "elbv2ctl")
         self.eventsctl = JsonStore(root, "eventsctl")
+        self.efsctl = JsonStore(root, "efsctl")
         self.dispatch = JsonStore(root, "dispatch")
         self.s3notify = JsonStore(root, "s3notify")
 
