@@ -209,6 +209,26 @@ than claimed" — was the single most valuable output of the field tests.
    directions: a mutant removing the gate must kill the silence test, a mutant
    forcing it must kill the declined test.
 
+5c. **A test that CONSUMES the thing it is asserting on races anything else
+   consuming it.** MEASURED, v0.8.20 gate:
+   `test_dispatch_sqs_e2e::test_a_message_survives_when_the_function_cannot_run`
+   passed alone in 77s and FAILED inside a 26-file partition, at
+   `120.0s, "the undelivered message was lost rather than redelivered"`.
+   Not a product regression and not luck: the test polls `ReceiveMessage` to
+   prove the message was not deleted, while the DISPATCHER polls the same queue
+   every tick -- and **every receive resets the visibility timeout**. The test
+   only wins when its poll lands between expiry and the dispatcher's next one,
+   so machine load decides the outcome.
+   The tell is a test that passes alone and fails in a suite, on an assertion
+   about a resource something else is also reading.
+   **Two fixes, in order of preference:** (a) assert with a NON-CONSUMING
+   witness (a count, an attribute, a record) so nothing is taken from under the
+   other reader; (b) if the assertion genuinely needs the item, first STOP the
+   competing reader -- here, delete the event-source mapping before polling,
+   which costs nothing because the property (survived N failed deliveries) is
+   already established by the wait that precedes it. Raising the timeout is not
+   a fix: it makes the race rarer and the diagnosis slower.
+
 5b. **Two-point sampling is the same error over time.** "The broken diagram
    shipped for however long" became "broke at `7693f08`, repaired at `08ba9a3`,
    never in any tag" only by walking EVERY commit in the window instead of the
