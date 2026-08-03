@@ -1248,7 +1248,7 @@ def _granted_ids(stack: Stack) -> set[str]:
 # THE OTHER HALF OF THIS CHANGE LIVES IN `gateway/policy.py`. Emitting ARNs and
 # changing nothing else would have silently broken every permission in the
 # product: the gateway authorizes from the APPLIED IAM (v0.8.12) and asks
-# `evaluate` to match these strings against a bare label. `policy.py::_arn_label`
+# `evaluate` to match these strings against a bare label. `policy.py::arn_label`
 # reduces an ARN back to the label the classifier reports, and
 # `tests/agent/test_hcl_iam_arns.py` pins THIS table against THAT reducer for
 # every kind, so a shape added here without a reducer there fails the build
@@ -1276,6 +1276,31 @@ _ARN_FORMS: dict[str, tuple[str, ...]] = {
     ),
     "ecr": ("arn:aws:ecr:{region}:{account}:repository/{label}",),
     "ecs": ("arn:aws:ecs:{region}:{account}:service/{cluster}/{label}",),
+    # W2.9. The label IS the KeyId (`kmsctl` deviation 1: real CreateKey carries
+    # no name, so the canvas label rides in on the `odin:node` tag), which is
+    # also what `classify._kms_resource` reports for a real request.
+    #
+    # THIS ROW WAS HELD BACK ONE STEP BEHIND ITS INVERSE, ON PURPOSE, and the
+    # measurement is kept because it is the whole reason the two tables are
+    # pinned together. With `policy.py::_ARN_RESOURCE_LABEL` still missing its
+    # `kms` entry:
+    #   arn_label("arn:aws:kms:...:key/app-key", "kms:Encrypt")  -> None
+    #   classify(TrentService.Encrypt, {"KeyId": "app-key"})     -> ('kms:Encrypt', 'app-key')
+    #   evaluate([Allow kms:Encrypt on the ARN], 'kms:Encrypt', 'app-key') -> False
+    # i.e. emitting this line first would have denied every drawn kms grant
+    # while `tofu plan` stayed clean and the apply stayed green -- canvas
+    # correct, file correct, gateway refusing every call.
+    #
+    # CLOSED by `policy.py::_ARN_RESOURCE_LABEL`'s `"kms": re.compile(r"key/
+    # (?P<label>.+)")`. With that line in, the same three calls give 'app-key' /
+    # ('kms:Encrypt', 'app-key') / True, and removing it again makes an applied
+    # kms grant evaluate False -- so the pairing is load-bearing, not decorative.
+    #
+    # ONE SHAPE ONLY, deliberately: no `alias/...` form. odin models no aliases
+    # (`kmsctl` answers `InvalidAction` for every alias op), so a second shape
+    # here would be an ARN no request can ever be made against -- and its
+    # inverse would be a reducer entry with nothing behind it.
+    "kms": ("arn:aws:kms:{region}:{account}:key/{label}",),
 }
 
 
@@ -1789,8 +1814,42 @@ _SSM_NEEDS_VALUE = "paramValue is empty — an SSM parameter cannot exist withou
 _BAD_SSM_TYPE = f"paramType must be one of {', '.join(_SSM_TYPES)}"
 
 
+def _bad_kms_ref(field: str, label: str) -> str:
+    return (
+        f"{field} names {label!r}, which is not a kms node on this canvas — a key that does not "
+        f"exist is a HARD error in odin (the gateway refuses to seal rather than quietly using "
+        f"the default key), so clear the field or draw the kms node"
+    )
+
+
+def _kms_key_attr(res: ResourceDesired, refs: Refs, field: str, attr: str) -> dict[str, str] | str:
+    """`{attr: aws_kms_key.<name>.key_id}` for the key this node is sealed under
+    -- `{}` when it names none, or the decline reason when the name is not a kms
+    node (the `_lambda`/`_security_group_refs` pattern: a `str` is routed into
+    `unsupported`).
+
+    An INTERPOLATED reference rather than the bare label, deliberately: it is
+    what makes tofu create the key before the secret that names it. Without the
+    ordering the apply is a coin flip, and the losing side is not a retryable
+    error -- `kmsctl.seal` refuses a key that does not exist yet, so the secret
+    fails to create at all.
+
+    `.key_id` and not `.arn`: `gateway/classify.py::_kms_resource` reduces every
+    KeyId form to the bare id, which for a canvas key IS its label, and that is
+    the string an IAM edge's grant has to match.
+    """
+    label = _field(res, field, "").strip()
+    if not label:
+        return {}
+    kind, name = refs.get(label, ("", ""))
+    return {attr: f"aws_kms_key.{name}.key_id"} if kind == "kms" else _bad_kms_ref(field, label)
+
+
 def _secret(res: ResourceDesired, refs: Refs) -> Built:
-    attrs = {"name": quote(res.id), "recovery_window_in_days": _SECRET_RECOVERY_WINDOW}
+    key = _kms_key_attr(res, refs, "kmsKeyId", "kms_key_id")
+    if isinstance(key, str):
+        return key
+    attrs = {"name": quote(res.id), "recovery_window_in_days": _SECRET_RECOVERY_WINDOW, **key}
     description = _field(res, "description", "")
     if description:
         attrs["description"] = quote(description)
@@ -1807,10 +1866,103 @@ def _ssm(res: ResourceDesired, refs: Refs) -> Built:
     param_type = _field(res, "paramType", "String")
     if param_type not in _SSM_TYPES:
         return _BAD_SSM_TYPE
-    attrs = {"name": quote(res.id), "type": quote(param_type), "value": quote(value)}
+    # PORTABILITY DIVERGENCE, stated rather than validated away: real AWS reads
+    # `key_id` only for a `SecureString`, and rejects PutParameter if you send
+    # one for a String. odin's `ssmctl._put_parameter` seals EVERY type under
+    # the named key, so a String parameter here really is encrypted at rest by
+    # the key the canvas drew. Declining the combination would therefore refuse
+    # something odin does correctly; emitting it is honest about odin and only
+    # divergent on Amazon, where the parameter would still be created and this
+    # argument ignored for a non-SecureString.
+    key = _kms_key_attr(res, refs, "keyId", "key_id")
+    if isinstance(key, str):
+        return key
+    attrs = {"name": quote(res.id), "type": quote(param_type), "value": quote(value), **key}
     description = _field(res, "description", "")
     if description:
         attrs["description"] = quote(description)
+    return attrs, ""
+
+
+# W2.9: KMS keys (gateway/models/kmsctl.py + gateway/kms.py -- real AES-256-GCM
+# material in a 0600 `.odin/{env}/kms.json`, sealing the secretsmanager and ssm
+# sidecars). The builder that emits NO NAME, and that is the whole reason this
+# kind is unusual: real `CreateKey` takes no name argument at all, so there is
+# nowhere for the canvas label to ride except the `odin:node` tag every primary
+# resource already carries (`_tags_block`, applied in generate_tf's pass 2). If
+# that tag ever stopped being stamped on this type, `kmsctl._create_key` would
+# mint a uuid instead and the key would be addressable from nothing -- not by
+# `_kms_key_attr` below, not by an IAM edge, not by the World projection.
+#
+# `deletion_window_in_days` is PORTABILITY ONLY and the number is a lie odin is
+# forced into: odin's ScheduleKeyDeletion destroys the material IMMEDIATELY
+# (kmsctl's deviation 2), so the honest value would be 0, exactly as `_secret`
+# emits `recovery_window_in_days = 0` for the same immediate-delete deviation.
+# AWS's minimum is 7 and the provider validates it client-side, so 0 would fail
+# `tofu plan` before the gateway is reached. 7 is emitted because it is the
+# smallest value that parses -- odin does NOT honour it, and applied against
+# real Amazon this key would survive 7 days where odin's is gone at once.
+_KMS_DELETION_WINDOW = "7"
+# `rotate` is a FLAG, not a rotation. `kmsctl` records `rotation_enabled` and
+# `GetKeyRotationStatus` reports it back, so the field round-trips through a
+# real EnableKeyRotation call -- but no key material is ever re-derived and no
+# old ciphertext is re-wrapped. Offered anyway because the generated file is
+# meant to be portable, where it does mean the real thing; never defaulted on,
+# because a default asserts a protection odin has not got.
+_KMS_ROTATE = ("true", "false")
+_BAD_KMS_ROTATE = f"rotate must be one of {', '.join(_KMS_ROTATE)}"
+
+# A label the gateway's `kmsctl.bare_key_id` would REWRITE, which is a key that
+# is created successfully and can then never be addressed again.
+#
+# MEASURED against the real model, not reasoned about. `_create_key` keys its
+# record by the RAW `odin:node` tag, while every other op keys by
+# `bare_key_id(KeyId)` -- so the two disagree exactly when `bare_key_id` is not
+# the identity. Driving the real handlers with a canvas label of
+# `alias/prod-key`:
+#
+#   CreateKey   -> 200, KeyId 'alias/prod-key'
+#   DescribeKey -> 400 NotFoundException "Key 'prod-key' does not exist"
+#   Encrypt     -> 400 NotFoundException "Key 'prod-key' does not exist"
+#
+# ...and a secret naming it then fails `EncryptionFailure` quoting a key id the
+# user never typed. A green create for a key that is dead on arrival is this
+# repo's own "reports success it did not achieve", one layer down.
+#
+# Declined HERE, at generate time, on the `_rds` precedent: the node's name IS
+# the identifier, so the reason names `data.label` -- the key a CLI reader can
+# actually edit -- rather than a gesture. The rule is DUPLICATED from
+# `bare_key_id` rather than imported, the same way `_SSM_TYPES` duplicates
+# ssmctl's `VALID_TYPES`: the deterministic translator stays independent of the
+# gateway. The real repair belongs in `_create_key` (create and lookup should
+# key alike); this stops the canvas from reaching it either way.
+_BAD_KMS_LABEL = (
+    "a KMS key's name may not contain ':key/' or start with 'alias/' — the node's name IS the key "
+    "id, and the gateway reduces both of those forms to something shorter, creating a key nothing "
+    "can address afterwards. Change data.label"
+)
+
+
+def _bare_key_id(value: str) -> str:
+    """`kmsctl.bare_key_id`, character for character. Mirrored rather than
+    approximated: a looser `"alias/" in value` test would also decline
+    `my-alias/key`, which the real function leaves alone (it strips a PREFIX),
+    and declining a name that works is its own kind of wrong answer."""
+    return (value.rpartition(":key/")[2] or value).removeprefix("alias/")
+
+
+def _kms(res: ResourceDesired, refs: Refs) -> Built:
+    if _bare_key_id(res.id) != res.id:
+        return _BAD_KMS_LABEL
+    attrs = {"deletion_window_in_days": _KMS_DELETION_WINDOW}
+    description = _field(res, "description", "").strip()
+    if description:
+        attrs["description"] = quote(description)
+    rotate = _field(res, "rotate", "").strip()
+    if rotate and rotate not in _KMS_ROTATE:
+        return _BAD_KMS_ROTATE
+    if rotate:
+        attrs["enable_key_rotation"] = rotate
     return attrs, ""
 
 
@@ -1883,6 +2035,35 @@ def _rds(res: ResourceDesired, refs: Refs) -> Built:
     }, nested
 
 
+# v0.8.18: EBS volumes -- one `aws_ebs_volume` per ebs node, plus an
+# `aws_volume_attachment` companion per ebs<->ec2 edge (the attachment pass at
+# the bottom of `generate_tf`). The substrate is a real `limactl disk` attached
+# to the instance's Lima VM (`compute/`).
+#
+# `type = "gp3"` is FIXED and is NOT a canvas field. The tile authors exactly
+# three (`label`, `az`, `size` -- ui/src/lib/catalog.ts), so a `type` argument
+# read from the canvas would be a field nothing can set; and a `limactl disk`
+# has no volume type at all, so any value but one would be a claim odin cannot
+# back. It is registered in `import_tf._FIXED_VALUES` instead, which is what
+# makes an imported `type = "io2"` a reported CHANGED argument rather than a
+# silent substitution.
+_DEFAULT_EBS_AZ = "us-east-1a"
+_DEFAULT_EBS_SIZE = "10"
+_EBS_VOLUME_TYPE = "gp3"
+_BAD_EBS_SIZE = "size must be a whole number of GiB (e.g. 10)"
+
+
+def _ebs(res: ResourceDesired, refs: Refs) -> Built:
+    size = _field(res, "size", _DEFAULT_EBS_SIZE).strip()
+    if not size.isdigit():
+        return _BAD_EBS_SIZE
+    return {
+        "availability_zone": quote(_field(res, "az", _DEFAULT_EBS_AZ)),
+        "size": size,
+        "type": quote(_EBS_VOLUME_TYPE),
+    }, ""
+
+
 # kind -> terraform resource type; kept separate from _BUILDERS so pass 1 of
 # generate_tf can assign HCL names (scoped per resource type) without running
 # any builder.
@@ -1905,6 +2086,8 @@ _TF_TYPES = {
     "elasticache": "aws_elasticache_cluster",
     "rds": "aws_db_instance",
     "alb": "aws_lb",
+    "kms": "aws_kms_key",
+    "ebs": "aws_ebs_volume",
 }
 
 _BUILDERS = {
@@ -1926,6 +2109,8 @@ _BUILDERS = {
     "elasticache": _elasticache,
     "rds": _rds,
     "alb": _alb,
+    "kms": _kms,
+    "ebs": _ebs,
 }
 
 # W2.5: which canvas kinds can actually BE an ALB target. An ECS service
@@ -1950,6 +2135,77 @@ _ALB_NO_LAMBDA = (
     "translation is the same shim an apigateway → lambda route needs and is deliberately built "
     "once, there, rather than twice"
 )
+
+
+# v0.8.18: which canvas kinds a VOLUME can be attached to. `ec2` alone, because
+# it is the only kind odin runs as a machine with a disk controller -- an ebs
+# node edged to a lambda or an ecs service would author an attachment nothing
+# could perform, the same rule `_SG_MEMBERS` and `_ROLE_HOLDERS` hold one file
+# over. Mirrored by `ui/src/lib/iam.ts::volumeHostTypes`, and
+# `tests/spec/test_edge_registry_matches_builders.py` fails the build if the two
+# sides ever disagree -- the same cross-language ratchet `_ALB_TARGET_KINDS` has.
+_VOLUME_HOST_KINDS = ("ec2",)
+
+# The device names odin hands out, in order. Real AWS REJECTS two attachments
+# claiming the same device on one instance, so the name is assigned by the
+# volume's POSITION in the sorted list of that instance's attached volumes:
+# deterministic, and stable when an unrelated volume on the same instance is
+# declined. `/dev/sd[f-p]` is the conventional range for extra volumes on a
+# Linux instance; a 12th volume is declined BY NAME rather than silently reusing
+# a device that the provider (or Amazon) would then reject for the whole apply.
+#
+# `device_name` IS ADVISORY, and that is measured rather than assumed. On real
+# Lima 2.1.3 (2026-08-02) the guest names an extra disk `/dev/vdb` (virtio),
+# auto-partitions it `vdb1` ext4 and auto-mounts it at `/mnt/lima-<disk>`; adding
+# that disk also SHIFTS the cloud-init `cidata` ISO from `vdb` to `vdc`. Device
+# letters inside the guest are therefore positional and not a contract: odin does
+# NOT honour `/dev/sdf`, and nothing here may claim it does. What the argument is
+# for is Terraform itself -- `aws_volume_attachment.device_name` is required, and
+# it must be unique per instance. It is also what the provider's own attachment
+# WAITER filters DescribeVolumes on (`attachment.device`), so the string emitted
+# here has to be the string `AttachVolume` was sent -- there is exactly one
+# source for it (this tuple), and nothing normalises, lowercases or defaults it
+# on the way out.
+#
+# THE RESIDUAL, MEASURED, because a positional scheme cannot be fully stable and
+# pretending otherwise would be the caveat-that-outlives-its-fix bug in advance.
+# `device_name` is ForceNew: measured against OpenTofu 1.12.3 with a real state
+# file, changing it prints `~ device_name = "/dev/sdf" -> "/dev/sdg" # forces
+# replacement` and `Plan: 1 to add, 0 to change, 1 to destroy` -- a detach and
+# reattach of a LIVE disk. And the slot is positional, so adding a volume whose
+# label sorts EARLIER renumbers every later volume on that instance: measured,
+# adding `archive` to an instance holding `data` (/dev/sdf) and `logs`
+# (/dev/sdg) moves them to /dev/sdg and /dev/sdh. Both existing disks are
+# therefore detached and reattached by a change that had nothing to do with them.
+#
+# It is kept anyway, and the reasoning is worth writing down so nobody "fixes" it
+# into something worse. `generate_tf` is a pure function of the canvas with no
+# memory of the last apply, and the pool has 11 slots, so NO assignment rule can
+# be insertion-stable -- hashing the label into a slot merely makes the
+# renumbering rarer and unpredictable instead of rare and explainable. The real
+# fixes are a canvas field the tile does not have, or reading the live
+# attachment back, and both are larger than this pass. Until then the honest
+# thing is that this is stated here, pinned by
+# `test_hcl_ebs.py::test_adding_an_earlier_sorting_volume_renumbers_the_others`,
+# and named in docs/limits.md rather than discovered during an apply.
+_EBS_DEVICE_NAMES = tuple(f"/dev/sd{letter}" for letter in "fghijklmnop")
+
+
+def _too_many_volumes(volume_id: str, instance_id: str) -> str:
+    return (
+        f"{volume_id} (ebs): {instance_id} already holds {len(_EBS_DEVICE_NAMES)} volumes and odin "
+        f"assigns device names from {_EBS_DEVICE_NAMES[0]} to {_EBS_DEVICE_NAMES[-1]}, so there is "
+        "none left — the aws_ebs_volume is emitted UNATTACHED and no aws_volume_attachment is "
+        "generated for it. Move it to another instance, or detach one of the others"
+    )
+
+
+def _volume_already_attached(volume_id: str, instance_id: str, holder: str) -> str:
+    return (
+        f"{volume_id} (ebs): a second attachment edge, to {instance_id} — a gp3 volume attaches to "
+        f"exactly one instance (and the substrate, a limactl disk, to exactly one VM), so only the "
+        f"attachment to {holder} is emitted. Multi-attach would fail at apply, not here"
+    )
 
 
 def _alb_target_unsupported(alb_id: str, target_id: str, kind: str) -> str:
@@ -2513,6 +2769,58 @@ def generate_tf(stack: Stack) -> TfProject:
                 },
             )
             blocks.append((("aws_lb_target_group_attachment", f"{res.id}.{target_id}"), attachment))
+
+    # v0.8.18: VOLUME ATTACHMENTS. An ebs node and an ec2 node joined by an edge
+    # is a volume attachment, and the edge is the ONLY thing that can say which
+    # instance -- an `aws_ebs_volume` on its own attaches to nothing, so an ebs
+    # node with no edge stays a real, free-standing `available` volume.
+    #
+    # KEYED ON THE TWO NODE KINDS AND NEVER ON `edge.kind`, for the reason the
+    # EDGE-AUTHORED FIELDS note at the top of this module gives -- and here the
+    # cost of getting that wrong is the worst in the file: every canvas saved
+    # before the edge-type registry carries `kind: "network"`, so gating on the
+    # type name would drop the attachment from the generated HCL and make the
+    # next `tofu apply` DETACH a disk that has data on it. Direction is not
+    # significant either (`_kind_pair_edges` reads both), because which end the
+    # user started the drag from carries no meaning.
+    #
+    # `built_ids` gates the emission for the reason pass 2 records: an attachment
+    # naming an `aws_instance` or an `aws_ebs_volume` that pass 2 declined is an
+    # unresolvable reference, which fails `tofu plan` for the WHOLE project. The
+    # declined node's own entry in `unsupported` already names the cause, so
+    # nothing is lost silently here.
+    attached_to: dict[str, str] = {}
+    for instance_id, volume_ids in sorted(
+        _kind_pair_edges(stack, by_id, _VOLUME_HOST_KINDS, ("ebs",)).items()
+    ):
+        # The SLOT is the volume's position among ALL of this instance's attached
+        # volumes, built or not, so declining one (a non-numeric size) does not
+        # renumber the devices of the others -- a renumbering tofu would apply as
+        # a detach-and-reattach of live disks.
+        for slot, volume_id in enumerate(sorted(volume_ids)):
+            holder = attached_to.setdefault(volume_id, instance_id)
+            if holder != instance_id:
+                unsupported.append(_volume_already_attached(volume_id, instance_id, holder))
+                continue
+            if slot >= len(_EBS_DEVICE_NAMES):
+                unsupported.append(_too_many_volumes(volume_id, instance_id))
+                continue
+            if instance_id not in built_ids or volume_id not in built_ids:
+                continue
+            volume_name, instance_name = hcl_name_by_id[volume_id], hcl_name_by_id[instance_id]
+            # Its own name namespace: `a_b` + `c` and `a` + `b_c` both compose to
+            # `a_b_c_attach`, and two attachments sharing an HCL name is a file
+            # that does not parse.
+            name = unique_name(
+                f"{volume_name}_{instance_name}_attach",
+                used_names.setdefault("aws_volume_attachment", set()),
+            )
+            attachment = _block("aws_volume_attachment", name, {
+                "device_name": quote(_EBS_DEVICE_NAMES[slot]),
+                "instance_id": f"aws_instance.{instance_name}.id",
+                "volume_id": f"aws_ebs_volume.{volume_name}.id",
+            })
+            blocks.append((("aws_volume_attachment", f"{volume_id}.{instance_id}"), attachment))
 
     blocks.sort(key=lambda b: b[0])
     main_tf = "\n\n".join([HEADER, provider_block(), *(text for _, text in blocks)]) + "\n"

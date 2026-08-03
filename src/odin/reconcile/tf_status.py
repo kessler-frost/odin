@@ -1,6 +1,6 @@
 """Fix-wave 2b finding #1 -- a pure, read-only projection of the TF-owned
 resource kinds (vpc/subnet/sg/ec2/ecs/lambda/iam_role/ecr/logs/secret/ssm/
-elasticache/rds/alb: the kinds
+elasticache/rds/alb/kms: the kinds
 `agent/hcl.py` can build and only `tofu apply`/`tofu destroy` ever
 creates/destroys -- s3/sqs/sns/dynamodb are excluded, those already get real
 World entries via the reconciler's own PROVISIONED path in plan.py) from the
@@ -74,7 +74,7 @@ from odin.compute.functions import container_name as function_container_name
 from odin.compute.proxy import container_name as proxy_container_name
 from odin.compute.tasks import TaskRuntime
 from odin.fabric.nebula import NebulaManager
-from odin.gateway.models import cachectl, ecsctl, elbv2ctl, logsctl, rdsctl, ssmctl
+from odin.gateway.models import cachectl, ecsctl, elbv2ctl, kmsctl, logsctl, rdsctl, ssmctl
 from odin.gateway.models.ecsctl import sweep_tasks, task_verdict
 from odin.gateway.stores import SynthStores
 from odin.reconcile import mesh_health
@@ -86,8 +86,19 @@ from odin.spec.models import ResourceObserved, World
 
 TF_OWNED_KINDS = frozenset({
     "vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr", "logs", "secret", "ssm",
-    "elasticache", "rds", "alb",
+    "elasticache", "rds", "alb", "kms", "ebs",
 })
+
+# An EBS volume's own states (gateway/models/ec2compute.py's volume records)
+# -> the World Phase enum. `available` is NOT crashed: a volume drawn with no
+# attachment edge is a real, correctly-created free-standing disk, which is
+# what AWS calls available too. `attaching`/`detaching` are `starting` because
+# on this substrate they are a whole VM restart, so they are states a poller
+# really sees rather than an instant.
+_EBS_PHASE = {
+    "available": "healthy", "in-use": "healthy",
+    "attaching": "starting", "detaching": "starting",
+}
 
 # elbv2's own load-balancer state machine (gateway/models/elbv2ctl.py) -> the
 # World Phase enum. `provisioning` is honest asynchrony (the real nginx
@@ -290,6 +301,44 @@ def _ssm_parameters(stores: SynthStores, env: str) -> Projected:
         label = _label(tags, record["name"])
         if label:
             out[label] = ("ssm", "healthy", {}, None)
+    return out
+
+
+def _kms_keys(stores: SynthStores, env: str) -> Projected:
+    """W2.9: a `kms` node exists once tofu's CreateKey landed. NO FACTS ARE
+    PROJECTED, on `_secrets`' rule -- a key id is not itself a secret, but there
+    is nothing here a consumer could use: odin publishes no
+    `${{key.SOMETHING}}`, the key is named by the LABEL a canvas already knows,
+    and the one thing a fact could carry that the canvas does not (the ARN) is
+    reconstructible from the label by anyone who wants it. Existence + phase is
+    the whole honest projection.
+
+    THE `odin:node` TAG IS THE ONLY ROUTE BACK TO A LABEL HERE, with no
+    AWS-native fallback -- the one thing that makes this unlike `_secrets` /
+    `_ssm_parameters`, whose `Name` equals the label by construction. A key's
+    `key_id` does NOT: `kmsctl` mints the env's default key as `odin-default`
+    (`DEFAULT_KEY_ID`, created on first use to seal any secret no kms node was
+    drawn for) and a uuid for any untagged CreateKey. Falling back to `key_id`
+    would project `odin-default` as a World resource no canvas node matches, no
+    Stack revision can prune and `plan()` would call "observed but no longer
+    desired" on every tick -- the phantom `_log_groups` skips an `auto` group to
+    avoid, and the same one the v0.5.2 terminated-instance fix removed. So an
+    untagged key is simply not projected, exactly as an untagged vpc/subnet/ec2
+    is not.
+
+    No phase but `healthy`: a key is metadata plus 32 bytes on disk, with no
+    container to be down and no state machine to fail. `ScheduleKeyDeletion`
+    deletes the record outright (kmsctl's deviation 2 -- it is immediate), so
+    the reconciler's own prune is what removes the node from World.
+    """
+    out: Projected = {}
+    for key, record in stores.kmsctl.items(env).items():
+        if not key.startswith("key:"):
+            continue
+        tags = stores.tags.get(env, f"kms:{record['arn']}", {})
+        label = tags.get(kmsctl.NODE_TAG)
+        if label:
+            out[label] = ("kms", "healthy", {}, None)
     return out
 
 
@@ -520,6 +569,45 @@ async def _ec2_instances(stores: SynthStores, env: str) -> Projected:
     return out
 
 
+def _ebs_volumes(stores: SynthStores, env: str) -> Projected:
+    """Every EBS volume the gateway holds, by its canvas label.
+
+    The one non-obvious phase is `available` WITH a `last_error`, and it is the
+    whole reason this projection is worth having. A volume in that state was
+    asked to attach and did not: the disk is real and healthy, but the thing
+    the user DREW -- a line from a volume to an instance -- is not in force.
+    Reporting `healthy` there is the decorative-edge bug in status form, so it
+    reads `crashed` and carries the real reason out as the verdict. A volume
+    that was never asked to attach has no `last_error` and is honestly green.
+    """
+    out: Projected = {}
+    # Keyed on the STORE KEY PREFIX, exactly as `_ec2_instances` above does,
+    # and NOT on which fields a value happens to carry. A shape sniff was the
+    # first thing written here and a mutation test killed it: it read
+    # `"state" in record and "volume_id" in record`, and loosening either half
+    # changed nothing, because no other family in this store carries a
+    # `volume_id` today. A guard whose two halves are both currently redundant
+    # is a guard nothing can prove -- `volume:` is the fact that actually
+    # distinguishes these records, so that is what this reads.
+    for key, record in stores.ec2compute.items(env).items():
+        if not key.startswith("volume:"):
+            continue
+        label = stores.tags.get(env, f"ec2:{record['volume_id']}", {}).get("odin:node")
+        if not label:
+            continue
+        error = record.get("last_error")
+        phase = "crashed" if (record["state"] == "available" and error) else _EBS_PHASE.get(record["state"], "starting")
+        facts = {
+            "VOLUME_ID": record["volume_id"],
+            "SIZE_GIB": str(record["size"]),
+            # The name of the REAL artifact, so a user can go and look at it
+            # with `limactl disk ls` rather than take odin's word for it.
+            "LIMA_DISK": record.get("disk") or "",
+        }
+        out[label] = ("ebs", phase, facts, error if phase == "crashed" else None)
+    return out
+
+
 def _invocation_verdict(record: dict) -> str | None:
     """Field test 2 finding #4: a Lambda reported `healthy` while failing every
     single invocation (the canvas code defined `handler`, the entry point looked
@@ -718,9 +806,11 @@ async def project(
     out.update(_log_groups(stores, env))
     out.update(_secrets(stores, env))
     out.update(_ssm_parameters(stores, env))
+    out.update(_kms_keys(stores, env))
     out.update(await _db_instances(stores, env))
     out.update(_load_balancers(stores, env))
     out.update(await _ec2_instances(stores, env))
+    out.update(_ebs_volumes(stores, env))
     out.update(_lambda_functions(stores, env))
     out.update(await _ecs_services(stores, env, ecs_runtime))
     out.update(_cache_clusters(stores, env))

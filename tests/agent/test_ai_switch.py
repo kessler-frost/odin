@@ -1,11 +1,17 @@
 """`ODIN_AI=0` — the one switch that turns OFF every model call odin can make.
 
-Two features can reach a model, each with its own flag pointing a different way
-(`ODIN_TRANSLATE_REFINE` opt-in, `ODIN_DEBUG_AGENT` opt-out). These tests pin
-that one switch covers both, that it also covers the path with NO per-feature
-gate at all (`translate(stack)` with no cache), that nothing is constructed or
-awaited when it is off, and that the deterministic compiler is completely
-unaffected.
+THREE features can reach a model, and they do not share a shape: the refine pass
+(`ODIN_TRANSLATE_REFINE`, opt-in), the debug agent (`ODIN_DEBUG_AGENT`,
+opt-out), and canvas chat (NO per-feature flag at all). These tests pin that one
+switch covers all three, that it also covers the path with NO per-feature gate
+(`translate(stack)` with no cache), that nothing is constructed or awaited when
+it is off, and that the deterministic compiler is completely unaffected.
+
+The count is now PINNED rather than asserted in prose (`test_the_inventory_of
+_model_reaching_modules_is_exactly_the_documented_three`). This docstring and
+`agent/ai.py`'s both said "two features" for the whole life of the chat
+feature -- the switch was always right, the inventory was not, and a prose
+inventory has gone stale in this repo twice before.
 
 `_NeverConstructed` is the load-bearing double: it raises from `__init__`, so
 any test that passes it and still gets an answer proves no SDK client was ever
@@ -13,12 +19,16 @@ built -- no `claude` process, nothing to dial, nothing to hang on.
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import logging
+import re
+from pathlib import Path
 
 import pytest
 
 from odin.agent import ai
+from odin.agent import chat as chat_mod
 from odin.agent import debugger as debugger_mod
 from odin.agent import translate as translate_mod
 from odin.agent.hcl import generate_tf
@@ -221,3 +231,134 @@ async def test_the_canvas_to_terraform_compiler_is_identical_with_ai_off(monkeyp
     assert off.binary_files == generate_tf(stack).binary_files
     assert off.unsupported == generate_tf(stack).unsupported
     assert off.wiring_errors == generate_tf(stack).wiring_errors
+
+
+# --- the inventory, pinned rather than described ----------------------------
+#
+# `agent/ai.py`'s docstring and this file's both said "exactly two features can
+# talk to a model" for the whole life of the chat feature. The SWITCH was never
+# wrong -- `chat.propose` checks `off_reason()` before constructing a client --
+# but a reader auditing "what can call out?" was handed a list with a hole in
+# it. So the list is derived from the source now.
+
+_SRC = Path(__file__).resolve().parents[2] / "src" / "odin"
+
+# module -> the flag that gates it BEFORE `ODIN_AI` gets a say. `None` means
+# there is none, which is a real property of chat rather than an oversight: the
+# whole argument for one master switch is that the per-feature flags do not
+# share a shape.
+MODEL_REACHING: dict[str, str | None] = {
+    "agent/translate.py": "ODIN_TRANSLATE_REFINE",
+    "agent/debugger.py": "ODIN_DEBUG_AGENT",
+    "agent/chat.py": None,
+}
+
+
+def _imports_the_sdk(path: Path) -> bool:
+    """A real `import claude_agent_sdk`, found by AST rather than by substring.
+
+    Substring-matching the module NAME is the same defect as the guard this
+    file's siblings just lost (`test_policies_from_applied_iam.py`): it counts
+    any mention, so `agent/ai.py` naming the SDK in a docstring registered as a
+    fourth caller. An `ast.Import`/`ast.ImportFrom` node cannot be a comment.
+    """
+    return any(
+        (isinstance(node, ast.Import) and any(a.name.split(".")[0] == "claude_agent_sdk" for a in node.names))
+        or (isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] == "claude_agent_sdk")
+        for node in ast.walk(ast.parse(path.read_text()))
+    )
+
+
+def test_the_inventory_of_model_reaching_modules_is_exactly_the_documented_three():
+    """Every module that imports `claude_agent_sdk` can spawn the real `claude`
+    CLI. Adding a fourth without listing it here fails, which is the point: the
+    prose said two while there were three."""
+    importers = {str(path.relative_to(_SRC)) for path in _SRC.rglob("*.py") if _imports_the_sdk(path)}
+    assert importers == set(MODEL_REACHING), (
+        "the set of modules that can reach a model changed. Update MODEL_REACHING "
+        "here, `agent/ai.py`'s docstring and this file's -- and make sure the new "
+        f"one is gated: {sorted(importers ^ set(MODEL_REACHING))}"
+    )
+
+
+@pytest.mark.parametrize("module,flag", sorted(MODEL_REACHING.items()))
+def test_each_features_own_flag_is_where_the_inventory_says_it_is(module, flag):
+    """Pins the SHAPE the master switch exists because of: two per-feature flags
+    pointing opposite ways, and one feature with none at all."""
+    source = (_SRC / module).read_text()
+    if flag is not None:
+        assert flag in source, f"{module} no longer names {flag}"
+        return
+    assert not re.search(r'os\.environ\.get\(\s*"ODIN_\w*(REFINE|AGENT)"', source), (
+        f"{module} grew a per-feature flag -- record it in MODEL_REACHING"
+    )
+
+
+async def test_chat_constructs_no_client_when_the_switch_is_off(monkeypatch, tmp_path):
+    """The third feature, behaviourally -- the half the stale inventory hid.
+
+    `_NeverConstructed` raises from `__init__`, so getting an answer at all
+    proves no SDK client was built: no `claude` process, nothing to dial. The
+    note names the switch, so the user is told WHY rather than handed a silent
+    empty proposal.
+    """
+    monkeypatch.setenv("ODIN_AI", "0")
+    monkeypatch.setattr(ai, "STATE_FILE", tmp_path / "ai.json")
+    canvas = {"nodes": [{"id": "n1", "type": "s3", "data": {"label": "uploads"}}], "edges": []}
+    result = await asyncio.wait_for(
+        chat_mod.propose(canvas, "add a queue", client_cls=_NeverConstructed), timeout=5.0,
+    )
+    assert result.canvas == canvas
+    assert result.changes == []
+    assert "ODIN_AI" in result.note
+
+
+# --- the one-caller invariant, which was PROSE -------------------------------
+#
+# `agent/chat.py`'s comment argues that chat needs no `ai.refuse_if_off()`
+# because `propose`'s `disabled_reason()` gate covers every path that can reach
+# the SDK -- and that argument holds "for one reason only: `_run_agent` has
+# exactly ONE caller". That is a load-bearing claim kept in a comment, which in
+# this repo is a claim that goes stale: the module-level inventory two functions
+# up said "exactly two" while there were three, and the thread inventory in
+# CLAUDE.md described a state that had not existed for a week. Prose cannot fail
+# a build, so the invariant is pinned here instead.
+#
+# Counted by AST for the same reason `_imports_the_sdk` is: a substring count of
+# "_run_agent" scores its own definition and the three comment lines that
+# discuss it, which is how you get a guard that passes at four callers.
+
+
+def _call_sites(path: Path, name: str) -> list[int]:
+    """Line numbers where `name` is CALLED -- not defined, not mentioned."""
+    tree = ast.parse(path.read_text())
+    return sorted(
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == name
+    )
+
+
+def test_run_agent_still_has_exactly_one_caller_or_chat_needs_the_boundary_check():
+    """The safety argument for chat having no `refuse_if_off` is reachability.
+
+    A second caller can reach `ClaudeSDKClient` without passing `propose`'s
+    `disabled_reason()`, which turns `ODIN_AI=0` from a guarantee into a
+    coincidence. If this fails, the fix is NOT to update the number: it is to
+    call `ai.refuse_if_off()` at the top of `_run_agent` and delete the comment's
+    one-caller clause.
+    """
+    callers = _call_sites(_SRC / "agent/chat.py", "_run_agent")
+    assert len(callers) == 1, (
+        f"_run_agent now has {len(callers)} call sites (lines {callers}). The comment in "
+        "agent/chat.py above the SDK half says one caller is what makes the missing "
+        "ai.refuse_if_off() safe -- add the boundary check rather than editing this number."
+    )
+
+
+def test_the_one_caller_is_reached_through_the_gate_that_is_claimed_to_cover_it():
+    """Names the gate, so deleting it fails here rather than silently."""
+    source = (_SRC / "agent/chat.py").read_text()
+    assert "disabled_reason()" in source, (
+        "agent/chat.py no longer calls disabled_reason() -- that IS chat's ODIN_AI gate"
+    )

@@ -29,7 +29,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from odin.agent.hcl import _ALB_TARGET_KINDS
+from odin.agent.hcl import _ALB_TARGET_KINDS, _VOLUME_HOST_KINDS
 
 REPO = Path(__file__).resolve().parents[2]
 IAM_TS = (REPO / "ui" / "src" / "lib" / "iam.ts").read_text()
@@ -47,6 +47,7 @@ def test_the_extraction_finds_something():
     comparison below pass over two empty sets and prove nothing at all."""
     assert _ts_set("computeTypes") == {"ec2", "lambda", "ecs"}
     assert _ALB_TARGET_KINDS, "hcl.py::_ALB_TARGET_KINDS is empty -- the import is wrong"
+    assert _VOLUME_HOST_KINDS, "hcl.py::_VOLUME_HOST_KINDS is empty -- the import is wrong"
 
 
 def test_alb_target_kinds_agree_across_the_language_boundary():
@@ -79,6 +80,71 @@ def test_sg_member_kinds_agree_across_the_language_boundary():
         f"{sorted(_SG_MEMBERS)} -- an sg edge the canvas offers but the merge ignores, "
         "or one it merges without ever offering."
     )
+
+
+def test_encryption_target_kinds_agree_across_the_language_boundary():
+    """W2.9's edge, and the one where drift is not merely cosmetic.
+
+    UI wider than the merge: the canvas draws a teal "Encrypted With" line to a
+    kind whose builder reads no key field, so the value stays sealed under the
+    env's DEFAULT key while the screen names a different one -- odin showing one
+    key and using another.
+
+    Merge wider than the UI: `_merge_encryption_edges` writes `kmsKeyId` on a
+    kind the picker never offers `encryption` for, so a line the canvas labels
+    "Not modelled" silently changes which key a secret is sealed under. Deleting
+    that key then destroys the value (`ScheduleKeyDeletion` is immediate in
+    odin), which is the most expensive of the four drift outcomes on this page.
+    """
+    from odin.spec.translate import _ENCRYPTION_TARGETS
+    ui = _ts_set("encryptionTargetTypes")
+    assert ui == set(_ENCRYPTION_TARGETS), (
+        f"`iam.ts::encryptionTargetTypes` is {sorted(ui)} but "
+        f"`translate.py::_ENCRYPTION_TARGETS` is {sorted(_ENCRYPTION_TARGETS)} -- an encryption "
+        "edge the canvas offers and nothing folds into a key field, or one folded without ever "
+        "being offered."
+    )
+
+
+def test_every_encryption_target_kind_has_a_key_field_a_builder_reads():
+    """The half the set-comparison above cannot see. Both sides could agree on a
+    kind whose HCL reads no key field at all, and the edge would still do
+    nothing -- the drawn-line-that-does-nothing bug wearing an agreement. So the
+    field each kind maps to is checked against the builder that consumes it."""
+    from odin.agent.hcl import _BUILDERS
+    from odin.spec.translate import _ENCRYPTION_FIELDS
+    hcl_source = (REPO / "src" / "odin" / "agent" / "hcl.py").read_text()
+    for kind, field in _ENCRYPTION_FIELDS.items():
+        assert kind in _BUILDERS, f"{kind} has no Terraform builder, so its key field reaches nothing"
+        assert f'"{field}"' in hcl_source, (
+            f"`translate.py` folds an encryption edge into {field!r} on a {kind} node, but "
+            f"`agent/hcl.py` never reads that field name -- the edge would author a field "
+            f"nothing consumes"
+        )
+def test_volume_host_kinds_agree_across_the_language_boundary():
+    """v0.8.18's pair, and the one with the worst failure mode of the four.
+
+    UI wider than the builder is the usual "promised, never built". Builder wider
+    than the UI is the usual "built, labelled Not modelled". But an ebs edge
+    LOSING its meaning also means the generated file stops carrying the
+    attachment, and `tofu apply` then DETACHES a disk that has data on it -- so
+    this pair is worth pinning even though the pass keys on node kinds and not on
+    the edge type name."""
+    ui, builder = _ts_set("volumeHostTypes"), set(_VOLUME_HOST_KINDS)
+    assert ui == builder, (
+        f"`ui/src/lib/iam.ts::volumeHostTypes` is {sorted(ui)} but "
+        f"`agent/hcl.py::_VOLUME_HOST_KINDS` is {sorted(builder)}.\n"
+        f"  only in the UI  (promised, never built): {sorted(ui - builder)}\n"
+        f"  only in the builder (built, labelled 'Not modelled'): {sorted(builder - ui)}\n"
+        "They must land in the same merge."
+    )
+
+
+def test_every_volume_host_kind_is_a_real_canvas_kind():
+    """The companion check: a kind the canvas cannot draw makes the agreement
+    above vacuously true for it."""
+    from odin.spec.translate import MODELLED_NODE_TYPES
+    assert set(_VOLUME_HOST_KINDS) <= MODELLED_NODE_TYPES
 
 
 def test_role_holder_kinds_agree_across_the_language_boundary():

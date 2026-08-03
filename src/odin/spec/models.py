@@ -1,8 +1,10 @@
 """The Spec Store data model: Stack (desired) and World (observed).
 
-The Stack is whole-canvas declarative desired state authored by the Canvas and
-the Brain; the World is observed state authored only by drivers + the Assertion
-Engine. They are kept as separate frozen documents per environment. A Stack
+The Stack is whole-canvas declarative desired state authored by the Canvas (and,
+later, the canvas<->Terraform translation agent); the World is observed state
+authored only by drivers + the Assertion Engine. "The Brain" used to be named
+here as a second author: that was `agent/brain.py`, parked at tag
+`app-layer-parked`, and the module does not exist. They are kept as separate frozen documents per environment. A Stack
 carries no `rev` field — the revision is the sha256 of its canonical JSON,
 computed by the SpecStore (carrying it inside would be circular).
 """
@@ -44,7 +46,19 @@ def scrub(text: str, secrets: frozenset[str]) -> str:
     return text
 
 # A resource's observed lifecycle phase.
+#
+# Every value here must be one `ui/src/components/nodes/StatusBadge.tsx` can
+# style, and vice versa -- they are the two halves of one wire contract, and
+# `draft` is the proof that the halves can drift: the reconciler has
+# broadcast `phase: "draft"` on every prune since the prune path existed, the
+# UI has styled it all along, and this Literal did not contain it. It stayed
+# invisible because the prune broadcast was a HAND-BUILT dict rather than a
+# `WorldDelta`, so pydantic never validated it (constructing
+# `WorldDelta(phase="draft")` would have raised). That construction is now a
+# real WorldDelta -- see `reconciler.py::_prune` -- so the wire and the type
+# cannot diverge again without a test failing.
 Phase = Literal[
+    "draft",      # in the canvas, not in World: never applied, or just pruned
     "pending",    # desired but nothing started
     "starting",   # container launched, not yet healthy
     "healthy",    # assertion passed

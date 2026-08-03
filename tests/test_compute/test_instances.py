@@ -74,6 +74,24 @@ class FakeRunner:
         return _Proc(0, "")
 
 
+class _ConfigTrackingRunner(FakeRunner):
+    """A `FakeRunner` that also keeps the nebula config YAML the VM was handed.
+
+    `config_input` is what `limactl shell <vm> -- ... tee` was piped, i.e. the
+    FINAL config that lands on the VM -- the only place a test can read what
+    odin actually decided about the firewall.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.config_input: str | None = None
+
+    async def __call__(self, args, input=None):
+        if args[:4] == ["limactl", "shell", NAME, "--"] and "tee" in args:
+            self.config_input = input
+        return await super().__call__(args, input=input)
+
+
 def _yaml_path_from_create_call(runner: FakeRunner) -> Path:
     create_call = next(c for c in runner.calls if "create" in c)
     return Path(create_call[-1])
@@ -377,13 +395,7 @@ async def test_activate_nebula_derives_underlay_and_writes_final_config(tmp_path
     """Post-boot: the host's OWN address on the VM's vzNAT /24 is derived by
     correlating to the VM's just-discovered IP (not a hardcoded subnet), and
     the FINAL config (real underlay, real firewall) lands on the VM."""
-    class _TrackingRunner(FakeRunner):
-        async def __call__(self, args, input=None):
-            if args[:4] == ["limactl", "shell", NAME, "--"] and "tee" in args:
-                self.config_input = input
-            return await super().__call__(args, input=input)
-
-    runner = _TrackingRunner()
+    runner = _ConfigTrackingRunner()
     runner.responses["hostname -I"] = _Proc(0, "192.168.64.20")
     runner.responses["ifconfig"] = _ifconfig_response("192.168.64.1")
     lighthouse = FakeLighthouseManager()
@@ -408,14 +420,34 @@ async def test_activate_nebula_derives_underlay_and_writes_final_config(tmp_path
 
 
 async def test_activate_nebula_without_firewall_falls_back_to_default_allow_all(tmp_path):
-    runner = FakeRunner()
+    """A `NebulaJoin` with no firewall must land `DEFAULT_FIREWALL` on the VM,
+    and `DEFAULT_FIREWALL` is ALLOW-ALL in both directions
+    (`fabric/nebula.py`) -- the default is deliberately permissive, PKI is what
+    draws the per-env boundary, and real per-group ACLs are an M7 item.
+
+    This test asserted NOTHING until v0.8.18: it ran the boot and commented
+    that allow-all was used. It would have passed just as happily if the
+    fallback were deny-all, if no `firewall` block rendered at all, or if the
+    config were never written -- which is to say it was a test for the
+    absence of an exception wearing a firewall's name. Mutation-tested: with
+    `DEFAULT_FIREWALL`'s ports flipped to `"22"`, this fails.
+    """
+    runner = _ConfigTrackingRunner()
     runner.responses["hostname -I"] = _Proc(0, "192.168.64.20")
     runner.responses["ifconfig"] = _ifconfig_response("192.168.64.1")
     vm = InstanceVm(runner=runner, lighthouse=FakeLighthouseManager())
 
     nebula = NebulaJoin(root=tmp_path, env="myenv", host_id="i-nofw")
     await vm.boot(NAME, get_instance_type("t3.micro"), hostname="i-nofw", nebula=nebula)
-    # No exception, no `firewall=None` crash -- DEFAULT_FIREWALL (allow-all) used.
+
+    config = yaml.safe_load(runner.config_input)
+    # `host: any` rather than a cidr: `nebula.py::_rule_to_dict` emits nebula's
+    # own any-source form when a rule names neither a cidr nor a group, which
+    # is what `DEFAULT_FIREWALL`'s two rules do. Read off the rendered config,
+    # not off the model, so a renderer that dropped the rules would fail here.
+    allow_all = [{"port": "any", "proto": "any", "host": "any"}]
+    assert config["firewall"]["inbound"] == allow_all
+    assert config["firewall"]["outbound"] == allow_all
 
 
 async def test_activate_nebula_is_best_effort_when_underlay_cannot_be_derived(tmp_path):
@@ -1024,3 +1056,165 @@ async def test_an_explicit_argument_still_wins(monkeypatch):
 
     start_call = next(c for c in runner.calls if "start" in c)
     assert start_call == ["limactl", "start", "--timeout=30s", NAME]
+
+
+# --- EBS disks -----------------------------------------------------------
+#
+# The argv assertions here are literal because they were COPIED FROM A REAL
+# RUN against limactl 2.1.3 (2026-08-02) rather than reasoned about, and the
+# one that would silently break everything is `edit --set`: it is a yq
+# expression, and a subtly wrong one edits nothing and exits 0.
+
+
+def _disk_names(env: str) -> tuple[str, str]:
+    return instances.disk_name(env, "vol-aaa"), instances.disk_name(env, "vol-bbb")
+
+
+def test_a_disk_name_carries_its_env_so_a_reclaim_can_be_scoped():
+    """`limactl disk` names live in ONE flat machine-wide namespace, so
+    without the env in the name the only way to reclaim an env's disks would
+    be a machine-wide sweep -- the `docker rm -f` mistake one layer down."""
+    assert instances.disk_name("prod", "vol-1") == "odin-ebs-prod-vol-1"
+    assert instances.disk_name("prod", "vol-1").startswith(instances.env_disk_prefix("prod"))
+    assert not instances.disk_name("prod-2", "vol-1").startswith(instances.env_disk_prefix("prod-"))
+
+
+async def test_create_and_delete_disk_shell_out_to_the_real_verbs():
+    runner = FakeRunner()
+    vm = InstanceVm(runner=runner)
+
+    await vm.create_disk("odin-ebs-e1-vol-a", 25)
+    await vm.delete_disk("odin-ebs-e1-vol-a")
+
+    assert ["limactl", "disk", "create", "odin-ebs-e1-vol-a", "--size", "25GiB"] in runner.calls
+    assert ["limactl", "disk", "delete", "odin-ebs-e1-vol-a"] in runner.calls
+
+
+async def test_a_disk_delete_limactl_refused_raises_rather_than_reporting_a_reclaim():
+    """MEASURED refusal: `limactl disk delete` on a held disk exits 1 with
+    `cannot delete disk X in use by instance Y`. That refusal is limactl
+    protecting data, and `reclaim_env_disks` turns it into a named `standing`
+    entry -- but only because this raises.
+
+    Mutation-test: pass `check=False` in `delete_disk` and this fails."""
+    runner = FakeRunner()
+    runner.responses["disk delete"] = _Proc(1, "", "cannot delete disk `d` in use by instance `v`")
+    vm = InstanceVm(runner=runner)
+
+    with pytest.raises(RuntimeError, match="in use by instance"):
+        await vm.delete_disk("odin-ebs-e1-vol-a")
+
+
+async def test_disks_parses_limactls_own_json_lines():
+    """`limactl disk list --json` is JSON Lines, not a JSON array -- the same
+    shape `limactl list --json` uses, and getting it wrong would make every
+    reclaim see nothing to do."""
+    runner = FakeRunner()
+    runner.responses["disk list"] = _Proc(0, (
+        '{"name":"odin-ebs-e1-vol-a","size":1073741824,"format":"raw","dir":"/d",'
+        '"instance":"","instanceDir":"","mountPoint":"/mnt/lima-odin-ebs-e1-vol-a"}\n'
+        '{"name":"odin-ebs-e1-vol-b","size":2147483648,"format":"raw","dir":"/d",'
+        '"instance":"odin-ec2-e1-i-1","instanceDir":"/i","mountPoint":"/mnt/lima-odin-ebs-e1-vol-b"}\n'
+    ))
+    vm = InstanceVm(runner=runner)
+
+    disks = await vm.disks()
+
+    assert [d["name"] for d in disks] == ["odin-ebs-e1-vol-a", "odin-ebs-e1-vol-b"]
+    # The two fields odin reads: who holds it, and where LIMA says it lands.
+    assert disks[1]["instance"] == "odin-ec2-e1-i-1"
+    assert (await vm.disk("odin-ebs-e1-vol-a"))["mountPoint"] == "/mnt/lima-odin-ebs-e1-vol-a"
+    assert await vm.disk("odin-ebs-e1-vol-missing") is None
+
+
+async def test_set_disks_writes_a_yq_expression_limactl_really_accepts():
+    """The literal argv from the live probe. `limactl edit --set` takes a yq
+    expression; `json.dumps` of the dict list is valid YAML, and this is the
+    exact string that produced `additionalDisks:\\n- name: ebs-probe-vol` in
+    the instance's own lima.yaml."""
+    runner = FakeRunner()
+    vm = InstanceVm(runner=runner)
+
+    await vm.set_disks(NAME, ["odin-ebs-e1-vol-a", "odin-ebs-e1-vol-b"])
+
+    assert runner.calls[-1] == [
+        "limactl", "edit", NAME, "--set",
+        '.additionalDisks = [{"name": "odin-ebs-e1-vol-a"}, {"name": "odin-ebs-e1-vol-b"}]',
+    ]
+
+
+async def _attach_runner(mounted: bool) -> tuple[FakeRunner, InstanceVm]:
+    runner = FakeRunner()
+    runner.responses["hostname -I"] = _Proc(0, "192.168.64.20")
+    runner.responses["disk list"] = _Proc(0, (
+        '{"name":"odin-ebs-e1-vol-a","size":3221225472,"format":"raw","dir":"/d",'
+        '"instance":"","instanceDir":"","mountPoint":"/mnt/lima-odin-ebs-e1-vol-a"}\n'
+    ))
+    body = '{"blockdevices":[{"name":"vda","size":10737418240,"mountpoint":null}'
+    if mounted:
+        body += ',{"name":"vdb","size":3221225472,"mountpoint":"/mnt/lima-odin-ebs-e1-vol-a"}'
+    runner.responses["lsblk"] = _Proc(0, body + "]}")
+    return runner, InstanceVm(runner=runner, poll_interval=0.01)
+
+
+async def test_attach_is_a_stop_edit_start_cycle_and_verifies_the_guest():
+    """The reboot is not an implementation detail, it is THE divergence from
+    AWS: `limactl edit` refuses a running instance (`fatal: cannot edit a
+    running instance`, exit 1, measured), so this is the only order that
+    works. And the attach is verified INSIDE the booted guest, because the
+    yaml edit succeeds happily whether or not a disk exists behind the name."""
+    runner, vm = await _attach_runner(mounted=True)
+
+    ip = await vm.attach_disk(NAME, ["odin-ebs-e1-vol-a"], verify="odin-ebs-e1-vol-a")
+
+    assert ip == "192.168.64.20"
+    verbs = [c[1] for c in runner.calls if c[0] == "limactl"]
+    assert verbs.index("stop") < verbs.index("edit") < verbs.index("start")
+    assert any("lsblk" in c for c in runner.calls)
+
+
+async def test_an_attach_whose_disk_never_reached_the_guest_raises():
+    """THE guard. `lsblk` is a signal that actually arrives (probed on a real
+    VM before this was written), and the mount point checked against it is
+    limactl's OWN `mountPoint`, read back rather than reconstructed from a
+    guessed convention.
+
+    Mutation-test: make `_verify_disk_landed` return unconditionally and this
+    test fails -- which is the point, because without it `AttachVolume` would
+    report `in-use` over a guest where `lsblk` shows nothing."""
+    runner, vm = await _attach_runner(mounted=False)
+
+    with pytest.raises(RuntimeError, match="is not mounted at /mnt/lima-odin-ebs-e1-vol-a"):
+        await vm.attach_disk(NAME, ["odin-ebs-e1-vol-a"], verify="odin-ebs-e1-vol-a")
+
+
+async def test_an_attach_whose_disk_limactl_forgot_raises_rather_than_guessing():
+    runner, vm = await _attach_runner(mounted=True)
+    runner.responses["disk list"] = _Proc(0, "")
+
+    with pytest.raises(RuntimeError, match="no longer reports a disk named"):
+        await vm.attach_disk(NAME, ["odin-ebs-e1-vol-a"], verify="odin-ebs-e1-vol-a")
+
+
+async def test_boot_carries_the_disks_into_the_vms_own_yaml():
+    """A volume already attached when an instance is recreated must arrive
+    with it, not need a second reboot to get back in.
+
+    The yaml is written, read by `create`, then deleted in `boot`'s `finally`
+    -- so it is captured from inside the runner call, the same way
+    `test_boot_yaml_has_shared_network` does it, not re-read afterwards."""
+    class _CapturingRunner(FakeRunner):
+        doc: dict = {}
+
+        async def __call__(self, args, input=None):
+            if args[:2] == ["limactl", "create"]:
+                self.doc = yaml.safe_load(Path(args[-1]).read_text())
+            return await super().__call__(args, input)
+
+    runner = _CapturingRunner()
+    runner.responses["hostname -I"] = _Proc(0, "192.168.64.20")
+    vm = InstanceVm(runner=runner, poll_interval=0.01)
+
+    await vm.boot(NAME, get_instance_type("t3.micro"), hostname="i-1", disks=["odin-ebs-e1-vol-a"])
+
+    assert runner.doc["additionalDisks"] == [{"name": "odin-ebs-e1-vol-a"}]

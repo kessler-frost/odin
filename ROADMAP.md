@@ -892,12 +892,16 @@ future decision against these points instead of re-deriving them:
   AccessDenied.
 
   **v1 limits, recorded rather than hidden:**
-  - No KMS at all. A secret's value and an SSM `SecureString` are stored
-    CLEARTEXT in a per-env JSON sidecar
-    (`.odin/{env}/gateway/secretsctl.json`, `.odin/{env}/gateway/ssmctl.json`)
-    written `0600`; `KmsKeyId`/`KeyId` are accepted, stored and echoed back
-    for Terraform fidelity and encrypt NOTHING. The protection is the file
-    mode and the machine boundary — see SECURITY.md's Secrets section.
+  - ~~No KMS at all. A secret's value and an SSM `SecureString` are stored
+    CLEARTEXT ... `KmsKeyId`/`KeyId` are accepted, stored and echoed back
+    for Terraform fidelity and encrypt NOTHING.~~ **RETIRED v0.8.18** — this
+    was true for eleven releases and is the limit the `kms` item below
+    removes. Both sidecars now hold AES-256-GCM envelopes under real key
+    material at `.odin/{env}/kms.json` (0600), `KmsKeyId`/`KeyId` name the key
+    that really sealed the value, and an unkeyed secret goes under the env's
+    default key so encryption is unconditional rather than opt-in. The
+    file mode is still the whole protection for the KEY, and nothing else in
+    odin is encrypted at rest — `docs/limits.md` states both bounds.
   - `DeleteSecret` is IMMEDIATE: `RecoveryWindowInDays` is accepted and
     ignored, there is no recovery window and no `RestoreSecret`. A deliberate
     deviation, and the thing that makes an empty-canvas Apply followed by a
@@ -1108,12 +1112,36 @@ future decision against these points instead of re-deriving them:
     passed; the answer is a 503) and polluted the exact stream a security review
     reads for real denials.
 - **Recorded as UNSUPPORTED for now** (northstar directive 5's honesty rule):
-  EKS, CloudFormation, autoscaling, and KMS (the `kms` catalog node is an
-  unbacked placeholder — no substitute, no gateway model, and as of W2.6 it
-  advertises no IAM actions either, since a `kms:Encrypt` permission could
-  never be enforced or even reached). (ALB/ELBv2 was on this list until W2.5
-  and RDS-via-Terraform until W2.7 — `aws_lb` and `aws_db_instance` are real
-  now; see the ALB and RDS limits above for what's still missing inside them.)
+  EKS, CloudFormation, and autoscaling. (ALB/ELBv2 was on this list until W2.5,
+  RDS-via-Terraform until W2.7, and **KMS until v0.8.18** — `aws_lb`,
+  `aws_db_instance` and `aws_kms_key` are real now; see the ALB, RDS and KMS
+  limits for what is still missing inside them.)
+- [x] **KMS is real, and it is deliberately NOT the obvious build (v0.8.18).**
+  The obvious one was "emit `kms_key_id` on buckets, databases and queues",
+  and it would have been theatre: **no odin substrate encrypts anything** —
+  RustFS's SSE is unverified, a Postgres container has no storage encryption,
+  dynalite has none. A green `kms` node beside them would have claimed a
+  property odin does not have, which is the exact promise `catalog.ts` refused
+  when it denied the tile any `iamActions` ("a permission odin can neither
+  enforce nor reach is a promise the engine cannot keep").
+  So the key encrypts the one thing odin really holds: the secrets and SSM
+  sidecars. `gateway/models/kmsctl.py` is a real model (CreateKey /
+  DescribeKey / ListKeys / ScheduleKeyDeletion / the provider's refresh reads /
+  Encrypt / Decrypt / GenerateDataKey, wire-verified against botocore:
+  `X-Amz-Target: TrentService.*`), `gateway/kms.py` holds the AES-256 material
+  at `.odin/{env}/kms.json` 0600, and a `kms → secret|ssm` edge names WHICH key
+  by folding the label into the `kms_key_id`/`key_id` field the builder already
+  reads. The tile lost its `(placeholder)` marker in the same commit that added
+  `kms` to `translate.py::_KIND`, per the catalog's own invariant.
+  **The bar it had to clear, and did:** the plaintext is provably absent from
+  the sidecar on disk (`tests/gateway/test_kms_at_rest.py` reads the file, and
+  the seal-deleted mutation fails 13 of its 15 tests while all 52 pre-existing
+  API tests stay green), and a destroyed key destroys the data loudly, by name.
+  **What it does NOT claim:** the key file is in the same tree as the
+  ciphertext, so this separates two files and not two permissions; and nothing
+  else in odin — S3, RDS, DynamoDB, SQS, SNS, the tofu workspace, the stack
+  revisions, an export archive — is encrypted at rest. `docs/limits.md` states
+  every bound.
 - [x] **Nebula network layer (single-host), fully activated.** Security
   groups and VPCs drawn on the canvas compile to real Nebula network +
   firewall primitives (`fabric/nebula.py::sg_rules_to_firewall`,
@@ -1179,7 +1207,10 @@ future decision against these points instead of re-deriving them:
       memory, so it is charged against, and quoted against, real host memory
       (`os.sysconf` — stdlib, no new dependency, no subprocess).
   - **The budget** is 70% of each pool's TOTAL memory (not free memory).
-    Overrides: `ODIN_MEMORY_BUDGET_MIB` (container pool, absolute MiB),
+    Overrides: `ODIN_CONTAINER_MEMORY_BUDGET_MIB` (container pool, absolute
+    MiB — the older `ODIN_MEMORY_BUDGET_MIB` is still accepted, and was renamed
+    because unqualified it reads as odin's whole memory budget while governing
+    only one of two disjoint pools),
     `ODIN_VM_MEMORY_BUDGET_MIB` (VM pool), `ODIN_MIN_DISK_GIB` (free-disk
     floor, default 10 GiB — the same figure `odin doctor` checks).
   - **What it charges:** ec2 = the exact `INSTANCE_TYPES` memory;
@@ -1584,6 +1615,79 @@ machine-wide-sweep rule already in CLAUDE.md. A test-owned env is invisible to
 every check a human would think to run; the only safe rule is to touch nothing
 while a suite is running.
 
+## v0.8.18 — `ebs` stops being a placeholder: a drawn disk is a real block device on a real VM
+
+**Service-coverage scoping starts here.** Ten catalog tiles were unbackable
+placeholders, filtered out of the palette so nobody could drag one. `ebs` was
+picked first because it was the most clearly reachable — the tile's fields
+were already `az` and `size`, an exact match for `aws_ebs_volume` — and
+because it is the one whose substrate could be PROVED rather than modelled.
+It now emits `aws_ebs_volume` + `aws_volume_attachment`, imports both back,
+answers `CreateVolume`/`AttachVolume`/`DetachVolume`/`DeleteVolume` beside the
+`DescribeVolumes` that was already there, and behind all of it there is a real
+`limactl disk` volume in a real Lima VM's `additionalDisks:`.
+
+**The proof is `lsblk` inside the guest, not a model value.** A
+`DescribeVolumes` that returns what odin itself wrote proves the store
+round-trips and nothing else, so `tests/simulate/test_ebs_volume_e2e.py`
+boots a real VM through the real gateway handlers and asks the machine. It
+passes in 72s, and the answer it reads is:
+
+```
+lsblk before attach: vda (10GiB, root)  |  vdb 281729024 → /mnt/lima-cidata
+lsblk after attach:  vda (10GiB, root)  |  vdb 3221225472 → vdb1 → /mnt/lima-odin-ebs-…
+                                        |  vdc 281729024 → /mnt/lima-cidata
+```
+
+**Three divergences from AWS, each measured before the code was written and
+each written into `docs/limits.md` in measured terms:**
+
+- **There is no hot-attach, so `AttachVolume` REBOOTS the instance.** `limactl
+  disk` has no attach verb at all, and `limactl edit` on a live instance is
+  `fatal msg="cannot edit a running instance"`, exit 1 — with the guest's
+  block devices byte-identical before and after the attempt. So odin stops the
+  VM, rewrites `additionalDisks`, and starts it. It does not refuse (refusing
+  would make every `aws_volume_attachment` fail) and it does not hide it: the
+  instance moves to `pending`/`starting` for the duration instead of going on
+  claiming `running`, because during the reboot it is not running.
+- **`device_name` is advisory.** `/dev/sdf` goes in because that is what the
+  provider writes; `/dev/vdb` is what the guest reports, Lima formats and
+  mounts it itself at `/mnt/lima-<disk>`, and the cidata ISO is shoved from
+  `vdb` to `vdc` by the arriving volume. **The e2e caught this in its own
+  first draft** — it diffed device NAMES, found `vdc`, and failed on the ISO,
+  which is the best available argument that the limits entry is worth having.
+  Volumes are ordered by id and held stable, so adding a second disk cannot
+  renumber a mounted one.
+- **A volume that outlives its env is a disk leak, so both teardown paths
+  sweep the MACHINE and not just the store.** `limactl disk delete` refuses a
+  disk an instance still holds (`in use by instance`, exit 1), so `/destroy`
+  deletes VMs first and disks second, and a disk that will not go is named
+  rather than skipped — `reclaim_env_disks` answers with the same
+  `VolumeReclaim` three-way (`reclaimed`/`standing`/`unknown`) the docker
+  reclaim already used, and neither `/destroy` nor `odin env rm` reports
+  success over one. The sweep is scoped to `odin-ebs-<env>-` and finds a disk
+  whose record was lost, which the store alone never could.
+
+**Two silent breakages of the REAL provider, found by asking what
+`aws_volume_attachment` actually polls rather than what odin would like to
+answer.** Its waiter reads `Attachments[0].State` from a DescribeVolumes
+filtered on `volume-id` AND `attachment.instance-id` AND
+`attachment.device`, with `attaching` as its one pending value. odin
+would have answered nothing useful to either half: `_matches` requires
+EVERY named filter to match, so `attachment.device` being unmodelled does
+not narrow a result — it EMPTIES it; and an `attaching` volume rendered an
+empty `<attachmentSet/>`, leaving the waiter no attachment to read. Both
+would have looked like a hung apply on a volume that had already attached.
+Modelled and mutation-tested.
+
+**15 of 15 mutants killed** across the attach verification, the reclaim
+sweep, the terminate-frees-volumes rule, the provider waiter and the World
+projection. One SURVIVED first time and is the more useful result: the
+projection's record guard was a field sniff whose two halves were each
+already redundant, and the test's witness was excluded by the other half — so
+loosening it killed nothing. It now keys on the `volume:` store prefix, the
+fact that actually distinguishes the records, and the mutant dies.
+
 ## v0.8.17 — egress enforced and MEASURED, port ranges round-trip, and three tests that were never really waiting
 
 **A drawn egress rule is now proven to block on a real EC2 Lima VM.** v0.8.17
@@ -1706,6 +1810,132 @@ against a ~65-minute suite. Measured twice. Three green runs are not one green
 run and are not described as such.
 
 ## Next — known, measured, not yet fixed
+
+- [ ] **One runtime backend, macOS and Linux, containers AND VMs (owner ask,
+  2026-07-31).** *"I want to use lima or colima or something ONLY and not a mix
+  of both like we currently have … something that handles containers as well as
+  VMs natively."*
+
+  **The good news, verified rather than assumed: Colima IS Lima.** Colima 0.10.3
+  is a wrapper that boots a Lima VM and puts a container runtime inside it, so
+  odin already has one virtualization layer — what it does not have is one
+  *interface* to that layer. It talks to the same machine three ways:
+  - `runtime/colima.py` — `CLI = "docker"`, over Colima's docker socket. The
+    default, and what every backing container uses.
+  - `runtime/lima.py` — `CLI = "nerdctl"`, via `limactl shell <vm> sudo nerdctl`.
+    A second container driver behind the same `RuntimeDriver` protocol.
+  - `compute/instances.py` + `compute/lima_yaml.py` — `limactl` directly, for
+    EC2 nodes, which are real Lima VMs.
+
+  So the split is not container-vs-VM; it is **docker-socket vs limactl** for
+  things that already share a hypervisor. Lima 2.1.3 runs both: `limactl` manages
+  VMs, and a Lima VM with containerd gives `nerdctl` — which `runtime/lima.py`
+  already drives today. The unification is therefore *deleting a layer*, not
+  adopting a new one, and `RuntimeDriver` was written for exactly this.
+
+  What to establish before committing to it, because none of it is free:
+  - **Cost of losing the docker socket.** `docker` is what `aws/backings.py`,
+    ECR's real `docker push`, and every test fixture speak. `nerdctl` is
+    CLI-compatible in most of what odin uses, but "most" needs measuring, not
+    assuming — start by running the integration suite against `LimaRuntime` and
+    reporting what breaks.
+  - **Linux.** Lima supports Linux hosts, but odin has never been run on one.
+    Nested virtualization for EC2 nodes is the thing most likely to differ, and
+    a claim that odin works on Linux is not one to make from a Mac.
+  - **Host-reachable VM networking is the one place the platforms really
+    diverge** — and the owner's instinct to abstract it is right, with a useful
+    correction: **odin already does, and by the better method.**
+    `compute/instances.py::_pick_shared_ip` does NOT match `192.168.64.x`. It
+    asks the VM `hostname -I` and returns whichever non-loopback address is not
+    Lima's user-mode slirp subnet (`192.168.5.0/24`, egress-only, never
+    host-reachable) — excluding the one known-WRONG network instead of matching
+    one known-right one, which is why a Lima version changing its allocation
+    does not break it.
+
+    So the IP *discovery* is already portable. What is not, and what the seam
+    must cover, is **which network to ask for and whether host-reachability
+    exists at all on that platform**: `vmType: vz` on macOS gets the `shared`
+    (vmnet/vzNAT) network; Linux typically runs QEMU+KVM — and Lima also has
+    `krun` now, so it is not even QEMU-or-vz — where the equivalent is a
+    different network stack with different privileges. The honest shape is a
+    per-driver capability, not a per-platform constant: *does this VM driver
+    offer a host-reachable network, and what is it called?* `alb → ec2` and
+    every mesh join resolve through the answer, so a driver that cannot offer
+    one must say so rather than hand back an unreachable address.
+  - **Whether it is worth it at all.** The honest alternative is to keep Colima
+    for containers and Lima for VMs and stop pretending that is a mix — it is one
+    hypervisor with two front doors. Decide on evidence; do not refactor a
+    working substrate for tidiness.
+
+  Related and already true: **`odin doctor`, `odin world`, `odin envs` and
+  `odin volumes` are the inspection surface** — what is running, what each env
+  holds, and which named volumes exist with the env label each carries. If the
+  backend unifies, that surface is what should stay stable while the thing
+  underneath changes.
+
+
+- [x] **Service coverage, scoped to what people deploy (owner call, 2026-07-31).**
+  Ten kinds sat in the catalog as unbackable placeholders, filtered out of the
+  palette so nobody could drag one. The owner's scoping: *"I am actually fine
+  with not having things like eip, igw, kinesis … because the majority of people
+  don't really use that for deploying applications … but keep the ones that are
+  used like ebs, efs, kms, apigateway, route53."*
+
+  **DROPPED — removed rather than left as a promise.** `eip`, `igw`, `kinesis`.
+  A placeholder is a claim the catalog makes and the engine cannot keep, and two
+  of these were already assessed as low value on their own merits: an `eip` would
+  re-label the sticky overlay IP Nebula already assigns, and an `igw` would
+  duplicate what containment already expresses while implying control over
+  internet reachability that odin does not have (`internal = true` is hardcoded
+  on every ALB precisely because there is no internet gateway). `kinesis` has no
+  substrate at all. If any is ever wanted, the argument is recorded here rather
+  than the tile pretending.
+
+  **KEEPING, in value-to-risk order** — each becomes real or is dropped too:
+  1. **`ebs → ec2`** — the strongest case. Lima 2.1.3 has `limactl disk` and
+     `additionalDisks:` in the stock template, so a real second block device on a
+     real VM is reachable. Verify with `lsblk` inside the VM, not with a model
+     value. Known constraint: Lima attaches disks at VM creation and exposes no
+     attach verb, so hot-attach is likely impossible where AWS treats it as
+     routine, and `device_name = "/dev/sdf"` will not be what the guest sees.
+  2. **`efs → ecs|lambda`** — container mounts are already proven machinery
+     (`ContainerSpec.volumes` is how Lambda gets its code dir). Two tasks writing
+     and reading one directory is a real mount or it isn't. **Scope to containers:
+     the `ec2` end has no Terraform expression (it is an fstab line in user-data)
+     and this repo has a measured burn where a host-dir mount into Lima silently
+     mounted an empty directory.**
+  3. **`apigateway → lambda|ecs`** — settled as belonging to the TARGET family,
+     not events, on the synchrony argument: a caller holds a connection open and
+     awaits a status code. Substrate is `compute/proxy.py`'s nginx given a route
+     table. It needs the HTTP↔invoke-envelope shim `alb → lambda` was declined
+     for; build it once, here.
+  4. **`route53`** — `--add-host` for containers and `/etc/hosts` via cloud-init
+     for VMs are both real. THE TRAP, measured: an ALB's endpoint is
+     `127.0.0.1:<dynamic port>` and a hosts entry cannot carry a port, so a name
+     would resolve and then fail to connect. Either scope to mesh addresses or
+     say so on the tile.
+  5. **`kms` — NOT as encryption, and this is a deliberate reversal.** The
+     storage analysis found no substrate encrypts anything: RustFS SSE unverified,
+     a Postgres container has no storage encryption, dynalite none, and
+     secrets/SSM are explicitly cleartext in a 0600 JSON sidecar. Emitting
+     `kms_key_id` would produce a green resource claiming a property it does not
+     have — the same promise the catalog already refused when it denied kms any
+     `iamActions`. **What IS real and worth building: encrypting the secrets and
+     SSM sidecars at rest with a key odin actually holds**, so the tile means
+     "this is encrypted where it lives" rather than "AWS would encrypt this".
+     If that is not built, kms is dropped with the other three.
+
+- [ ] **odin's OWN output does not re-import cleanly for two companions.**
+  Measured 2026-08-02 while adding `ebs`, and it long predates it: a canvas
+  with an `alb → ec2` target plus a granted `ec2` generates a file whose
+  `aws_iam_instance_profile` and `aws_lb_target_group_attachment` both come
+  back `unsupported` on import. `test_odins_own_project_now_round_trips_with_
+  nothing_unsupported` does not catch it because its canvas contains neither,
+  which is the more interesting half: the guard is real, its FIXTURE is
+  narrower than the generator. Fixing it means teaching `import_tf` those two
+  companion types (instance profile folds onto the ec2 node; the target-group
+  attachment is already an alb↔ec2 edge) and widening that canvas so the gap
+  cannot reopen.
 
 - [ ] **A fake runtime does not isolate `/apply-full`, so a "unit" test boots real
   containers.** Measured 2026-07-29, after it leaked four containers into every

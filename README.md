@@ -22,7 +22,7 @@ call sits anywhere in that path.
 ## Contents
 
 [Install](#install) · [What you can do](#what-you-can-do) · [Apply](#apply) ·
-[What an edge means](#what-an-edge-means) · [Terminal](#driving-it-from-a-terminal) ·
+[What an edge means](#what-an-edge-means) · [Diagrams](docs/architecture.md) · [Terminal](#driving-it-from-a-terminal) ·
 [AI](#ai-two-features-one-switch) · [How it works](#how-it-works) ·
 [Known limits](#known-limits) · [Security](#security) ·
 [Contributing](#contributing) · [Where it's going](#where-its-going)
@@ -340,6 +340,10 @@ against them by action and resource before it reaches any substitute.
 
 </details>
 
+[docs/architecture.md](docs/architecture.md) is the picture version — a diagram
+per service showing what really runs underneath, and one for the whole system.
+GitHub renders those inline; [docs/architecture.html](docs/architecture.html) is
+the same thing styled, self-contained, and offline — open it in a browser.
 [docs/internals.md](docs/internals.md) has the architecture in full, and how each
 claim in this README is verified.
 

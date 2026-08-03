@@ -1172,6 +1172,20 @@ def create_apply_router(
             reclaimed = await ec2compute.reclaim_env_instances(stores, env)
             if reclaimed:
                 body["reclaimed_vms"] = reclaimed
+            # ...and then the EBS disks, in that order and never the other
+            # way: `limactl disk delete` refuses a disk an instance still
+            # holds, so sweeping before the VMs are gone would turn every
+            # attached volume into a refusal. Same shape and the same reason
+            # as reclaiming docker volumes only after their containers
+            # (`aws/rds.py`). A disk that will not go raises `ReclaimFailed`
+            # too -- an unreclaimed volume is gigabytes on a machine with
+            # limited headroom, and reporting `destroyed` over it is the
+            # exact lie the VM reclaim above exists to stop telling.
+            disks = await ec2compute.reclaim_env_disks(stores, env)
+            if disks.standing:
+                raise ec2compute.disks_standing(env, disks.standing)
+            if disks.reclaimed:
+                body["reclaimed_disks"] = list(disks.reclaimed)
             # ...and the network records the same interruption left behind,
             # which `tofu destroy` likewise never reaches. They are what kept
             # `/world` listing a VPC and subnets for a destroyed env -- and,
@@ -1262,11 +1276,21 @@ def create_apply_router(
             return "volumes_unknown", detail
         if volumes.standing:
             return "volumes_standing", {**detail, "still_standing": {"volumes": list(volumes.standing)}}
+        # The EBS half of the same question, and it needs its own sweep for
+        # the reason this whole branch exists: a Lima disk is a file under
+        # `$LIMA_HOME/_disks/`, nowhere near the store directory that is
+        # already gone, so nothing here would ever name it again. `env` is a
+        # name a human typed, and the sweep is scoped to `odin-ebs-{env}-`,
+        # so it can only reach disks odin made for this env.
+        disks = await ec2compute.reclaim_env_disks(stores, env)
+        detail["reclaimed"]["disks"] = list(disks.reclaimed)
+        if disks.standing:
+            return "volumes_standing", {**detail, "still_standing": {"disks": list(disks.standing)}}
         # Reclaiming something means the env DID exist, so "removed" is the true
         # word and `not_found` would be the false one -- odin just deleted state
         # a user cannot get back, and reporting that as "there was nothing here"
         # is the same class of lie as an exit 0 over a standing env.
-        return ("removed" if volumes.reclaimed else "never_existed"), detail
+        return ("removed" if (volumes.reclaimed or disks.reclaimed) else "never_existed"), detail
 
     async def _remove_env(env: str) -> tuple[str, dict]:
         """Remove `env` entirely, and report the OUTCOME -- never a status.

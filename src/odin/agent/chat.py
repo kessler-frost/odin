@@ -344,11 +344,24 @@ def apply_ops(canvas: dict, ops: list[Op]) -> tuple[dict, list[str], list[Refusa
 #
 # Everything above is pure and decides what is ALLOWED. This half decides what is
 # ASKED FOR, and it is the only part a model touches. Same split, same reasons and
-# the same shape as `agent/translate.py`'s refine pass and `agent/debugger.py`'s
-# diagnosis: one typed MCP tool as the sole effect channel, `ai.refuse_if_off()`
-# before any client exists, and a bounded `wait_for` around the un-awaited
-# coroutine (awaiting first would complete the pass unbounded and leave the
-# timeout measuring a finished value -- the exact hang the bound exists to stop).
+# largely the same shape as `agent/translate.py`'s refine pass and
+# `agent/debugger.py`'s diagnosis: one typed MCP tool as the sole effect channel,
+# and a bounded `wait_for` around the un-awaited coroutine (awaiting first would
+# complete the pass unbounded and leave the timeout measuring a finished value --
+# the exact hang the bound exists to stop).
+#
+# ONE DIFFERENCE, stated because this comment used to claim the opposite:
+# chat does NOT call `ai.refuse_if_off()`. Its gate is `propose`'s own
+# `disabled_reason()` -- which IS `ai.off_reason()` -- checked before anything
+# is constructed, and that is sufficient today for one reason only: `_run_agent`
+# below has exactly ONE caller. `refuse_if_off` exists because translate has an
+# uncached path that reaches the SDK with no per-feature check; chat has no such
+# path yet. Give `_run_agent` a second caller and it needs the boundary check,
+# and note that `propose`'s blanket `except Exception` would relabel an
+# `AiDisabled` raised in there as "the agent could not be reached" -- so add the
+# call above `create_sdk_mcp_server`, where the other two put it, not inside.
+# `tests/agent/test_ai_switch.py` pins the property that matters either way: no
+# client is CONSTRUCTED while the switch is off.
 
 
 class ProposeEditsInput(BaseModel):

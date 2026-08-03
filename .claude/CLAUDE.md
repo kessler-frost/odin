@@ -110,6 +110,30 @@ recurring. Read them before writing a guard, a status, or a caveat.
    report an *outcome*; the status is derived from a map; an unmapped outcome
    falls through to failure. A branch that forgets now fails loudly instead of
    inheriting a lie — patching branches one at a time never got there.
+2b. **`docs/architecture.md` + `docs/architecture.html` are a DIAGRAM of what
+   runs — keep them current with the thing they draw, and with each other.**
+   TWO files on purpose: GitHub does not render an HTML file in a repo (clicking
+   one shows source), so the markdown is what a reader clicks; the HTML is the
+   styled standalone, with the mermaid PRE-RENDERED to inline SVG so it needs no
+   JS, no CDN and works offline (mermaid is 3.4MB — too heavy to vendor for a
+   docs page). Regenerate the HTML by rendering the diagrams headlessly with
+   `agent-browser` and inlining the SVG; the markdown is generated from the same
+   diagram sources. Update BOTH in the same change or they diverge, which is the
+   failure this rule exists to prevent one level up. One mermaid diagram per implemented service plus two
+   for the system, each with a note saying what is really underneath (the
+   substrate image, the enforcement path, the measured number). GitHub renders
+   it inline, and the README links it as the picture version of `internals.md`.
+
+   It goes stale the same way prose does, and worse: a diagram is believed
+   faster than a paragraph. So when a service gains a substrate, an enforcement
+   path changes, a measured number moves, or a kind is added or dropped, update
+   the diagram IN THE SAME CHANGE — not the release after. Two rules it must
+   keep: every arrow corresponds to something that runs, and a boundary that is
+   NOT gated is drawn as not gated (the mesh covers overlay traffic only; ECS
+   tasks, the ALB proxy, Lambda and ElastiCache are not members). Drawing an
+   ungated path as gated is the same lie as a doc claiming an unfired guard,
+   with better graphics.
+
 3. **Caveats outlive their fixes — audit docs against source.** README and
    ROADMAP both documented the `/world` freeze after it was fixed; an audit
    found two more stale entries. Grep the docs for the bug's own words when a
@@ -142,6 +166,54 @@ than claimed" — was the single most valuable output of the field tests.
    that silently does nothing looks exactly like a bug (a `kill -STOP` that
    signalled nothing because the container's BusyBox lacks `pgrep -o`, and odin
    was right to keep reporting healthy).
+
+5. **When the check and its subject share a source, the check cannot fail.**
+   Rule 1 is about a guard whose signal never ARRIVES. This is the opposite
+   failure: the signal arrives fine, and the guard is asking the subject to
+   grade itself. FIVE instances in one night (2026-08-02), every one green,
+   every one reviewed, none visible from inside:
+   - **A test deriving its expectation from the expression under test.**
+     `tests/gateway/test_ecsctl.py` asserted
+     `== container_gone_reason(task["container_name"])` — the very call the
+     source made. Green for MONTHS while ecsctl passed the task DEFINITION's
+     name (`web`) where drift.py passed the real container
+     (`odin-ecs-{env}-{id}-web`), so odin told users to go look at something
+     `docker inspect` cannot find. Caught by the release gate, never by review.
+   - **A guard parametrized over the thing it guards, so the regression DELETES
+     the case.** The closed-world method-independence test drew its cases from
+     `gateway/app.py`'s own route table: removing PATCH removed the `[PATCH]`
+     case, and the file went 5 passed where 6 had. A property test, green, on
+     exactly the regression it existed to catch.
+   - **A measurement pattern matching the subject's own styling.**
+     `grep -c 'card-head' docs/architecture.html` also matches two CSS rules in
+     that page's stylesheet — 15 where the real count is 13. I relayed the
+     phantom mismatch to three agents as a caution before it was measured
+     properly. A false claim about the repo becomes load-bearing fast.
+   - **Asserting a property of the PRIOR state without reading the prior
+     state** ("the new SVG uses a stable id, matching what `mermaid-kms`
+     already does" — `mermaid-kms` did so only BECAUSE of that commit).
+   - **An inference that decayed under a still-valid input.** An efs guard
+     warned a bad mount path would drop the whole file system; the builder had
+     since narrowed it to decline only the offending function. Its input stayed
+     true; the SENTENCE built on it rotted. Only the end-to-end round trip could
+     tell them apart — the guard's own unit test passed on the half that still
+     fired, which is what makes a stale inference invisible at unit scope.
+
+   **So:** the expectation must come from somewhere the subject cannot reach — a
+   literal spelled out in full, an independently-owned list, a second producer.
+   **Mutation-test by DELETING an element, not only by corrupting one, and treat
+   a mutation run whose test COUNT drops as a failure** — that is the quietest
+   of the five and it reads as success. Anchor a measuring pattern to the real
+   element (`<div class="card-head">`, not `card-head`) or the file's own
+   comments and styling will answer for it. Pin an inference guard in BOTH
+   directions: a mutant removing the gate must kill the silence test, a mutant
+   forcing it must kill the declined test.
+
+5b. **Two-point sampling is the same error over time.** "The broken diagram
+   shipped for however long" became "broke at `7693f08`, repaired at `08ba9a3`,
+   never in any tag" only by walking EVERY commit in the window instead of the
+   endpoints. Checking two points and inferring the middle turns a six-hour
+   develop-only regression into a claim about released software.
 
 ## Browser automation: `agent-browser` (playwright-cli removed 2026-07-27)
 `agent-browser` (brew, Apache-2.0) is the only browser driver. `@playwright/cli`
@@ -364,8 +436,9 @@ Hard-won mechanics. Ignoring these has already destroyed work in this repo.
 - `odin start` / `odin start --dev` (Vite :4200 + uvicorn :4201). Tests: `uv run pytest` (unit), `uv run pytest -m integration` (real Colima backings — slow).
 
 ## Status / lifecycle
-- Canonical resource id = the node **label**. World phases: `pending` / `starting` / `healthy` / `crashed` are what's actually emitted today (rds + the PROVISIONED AWS kinds). `blocked` / `queued` / `running` / `done` / `evicted` / `error` remain in the `Phase` type for the parked workload layer and future gateway/Simulate error states — don't be surprised they're unreachable right now.
-- Status is a one-way projection: drivers + assertions author facts → Reconciler emits `WorldDelta` → `ConnectionManager.broadcast` (SSE) + append-only `.odin/<env>/world.json` + `events.jsonl`. The UI is a pure projection; `StatusBadge` maps phases to colors; deltas carry `env` (UI filters by the active env).
+- Canonical resource id = the node **label**. World phases: `draft` / `pending` / `starting` / `healthy` / `crashed` are what's actually emitted today (rds + the PROVISIONED AWS kinds). `blocked` / `queued` / `running` / `done` / `evicted` / `error` remain in the `Phase` type for the parked workload layer and future gateway/Simulate error states — don't be surprised they're unreachable right now.
+  - **`draft` was missing from this list AND from the `Phase` literal until v0.8.18**, while the reconciler broadcast it on every prune and `StatusBadge.tsx` styled it. It stayed invisible because `_prune` hand-built a dict instead of a `WorldDelta`, so pydantic never validated the wire (`WorldDelta(phase="draft")` would have raised). Both are fixed; the prune now constructs a real `WorldDelta`, so the wire and the type cannot diverge again. Treat any hand-built delta dict as the same bug waiting.
+- Status is a one-way projection: drivers + assertions author facts → Reconciler emits `WorldDelta` → `ConnectionManager.broadcast` (SSE) + `.odin/<env>/world.json` + append-only `events.jsonl`. **`world.json` is NOT append-only** — `spec/store.py::write_world` overwrites it wholesale, every tick; the append-only pair is `stacks/<rev>.json` (content-addressed revisions) and `events.jsonl`. The UI is a pure projection; `StatusBadge` maps phases to colors; deltas carry `env` (UI filters by the active env).
 
 ## Environments
 Multiple named envs reconciled independently (`/apply?env=`, `/world?env=`, `/destroy?env=`, `/envs`); each env gets its own `BackingAws` + `PostgresRds` (containers named `odin-aws-<backing>-<env>` / `odin-rds-<env>-<id>`) → isolated AWS-shaped state per env. UI has an env field in the TopBar.

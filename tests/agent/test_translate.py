@@ -184,6 +184,57 @@ async def test_a_new_tag_is_accepted_without_altering_an_existing_one():
     assert reason is None
 
 
+async def test_changing_a_NESTED_value_is_rejected_and_odin_node_is_why():
+    """The recursive half of `values_preserved`, in the only direction that
+    matters — and the one direction nothing tested.
+
+    Found by audit 2026-08-02. Four of the five guardrail directions were
+    covered; nested-value CHANGED and nested-value REMOVED were not, so
+    `hcl.py`'s recursive branch was only ever exercised where it returns True.
+    Proposed and confirmed mutation: make `values_preserved` skip nested dicts
+    entirely and all five existing guardrail tests stay green.
+
+    Why this one is the security case rather than a completeness case. The only
+    nested map odin emits is `tags`, and `tags` carries `odin:node` — which is
+    the workload's PRINCIPAL IDENTITY. `gateway/policy.py::_role_by_node` reads
+    it out of the tag store to decide what name a workload is authorized under.
+    An agent refine pass able to rewrite that decides who a resource IS to the
+    gateway, which is the one thing NORTHSTAR's amendment says the pass is
+    "structurally incapable" of doing. It was, in fact, structurally capable
+    and only unproven.
+    """
+    stack = Stack(resources=(ResourceDesired(id="uploads", kind="s3"),))
+    skeleton = generate_tf(stack).files
+    tampered = {"main.tf": skeleton["main.tf"].replace(
+        '"odin:node" = "uploads"', '"odin:node" = "attacker"',
+    )}
+    assert tampered["main.tf"] != skeleton["main.tf"], "the tamper did not apply"
+
+    reason, formatted = await validate_refinement(tampered, skeleton)
+
+    assert reason is not None, (
+        "a refine pass rewrote the odin:node tag — the workload's principal "
+        "identity — and the value-fidelity guard accepted it"
+    )
+    assert formatted is None
+
+
+async def test_removing_a_NESTED_value_is_rejected():
+    """The sibling direction. Dropping a key from `tags` is a value the skeleton
+    set that did not survive, exactly like the top-level `force_destroy` case
+    below — but through the recursive branch."""
+    stack = Stack(resources=(ResourceDesired(id="uploads", kind="s3"),))
+    skeleton = generate_tf(stack).files
+    tampered = {"main.tf": skeleton["main.tf"].replace(
+        '\n    "odin:node" = "uploads"', "",
+    )}
+    assert tampered["main.tf"] != skeleton["main.tf"], "the tamper did not apply"
+
+    reason, _ = await validate_refinement(tampered, skeleton)
+
+    assert reason is not None, "a refine pass dropped odin:node and it was accepted"
+
+
 async def test_removing_an_existing_argument_value_is_rejected():
     stack = Stack(resources=(ResourceDesired(id="uploads", kind="s3"),))
     skeleton = generate_tf(stack).files

@@ -1121,6 +1121,9 @@ _EVERY_KIND_CANVAS = {
         # which is exactly what it is for.
         {"id": "n11", "type": "ecs", "data": {"label": "api", "image": "nginx:alpine",
                                               "count": "2", "port": "8080"}},
+        # v0.8.18: same reason as `ecs` above -- `("ebs", "type")` claims odin
+        # always emits gp3, and nothing here would have proved it.
+        {"id": "n12", "type": "ebs", "data": {"label": "scratch", "size": "10"}},
     ],
     "edges": [{"id": "e1", "source": "n9", "target": "n10"}],
 }

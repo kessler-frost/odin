@@ -40,6 +40,14 @@ _REF = re.compile(r"^\$\{\{\s*([\w-]+)\.([\w-]+)\s*\}\}$")
 # proxy container whose upstreams are the target group's registered targets --
 # is driven by the gateway's CreateLoadBalancer/CreateListener/RegisterTargets
 # handlers (gateway/models/elbv2ctl.py + compute/proxy.py).
+#
+# kms is the same shape once more, and it is the kind whose LABEL matters most:
+# real `CreateKey` takes no name at all, so `gateway/models/kmsctl.py` keys a key
+# by the `odin:node` tag `agent/hcl.py::_tags_block` stamps. That tag is the ONLY
+# carrier of the canvas label -- an untagged key gets a uuid and is addressable
+# from nothing. Its REAL lifecycle (AES-256 material in a 0600 `.odin/{env}/
+# kms.json`, sealing the secret/ssm sidecars) is driven by CreateKey /
+# ScheduleKeyDeletion.
 
 # (kind, field) pairs whose value is a CREDENTIAL BY CONSTRUCTION, whatever the
 # field happens to be called (W2.4). `is_sensitive_field_name` catches names
@@ -73,6 +81,8 @@ _KIND = {
     "ssm": "ssm",
     "elasticache": "elasticache",
     "alb": "alb",
+    "kms": "kms",
+    "ebs": "ebs",
 }
 
 
@@ -225,9 +235,11 @@ def _resource(node: dict) -> ResourceDesired | None:
 
 def _edges(e: dict, labels: dict[str, str]) -> tuple[Edge, ...]:
     # The UI stores access metadata under `data` (Canvas.tsx): `permissions` +
-    # `edgeType`, one of `EDGE_KINDS` above. Thread both through so the Brain's
-    # IAM review sees real grants. (Data-flow ${{node.attr}} refs are NOT edges —
-    # they're lifted into ResourceDesired.refs above.)
+    # `edgeType`, one of `EDGE_KINDS` above. Thread both through so the IAM
+    # compiler (`gateway/policy.py`) sees real grants -- this used to say "the
+    # Brain's IAM review", naming `agent/brain.py`, which was parked at tag
+    # `app-layer-parked` and does not exist. (Data-flow ${{node.attr}} refs are
+    # NOT edges — they're lifted into ResourceDesired.refs above.)
     # Edge endpoints are ReactFlow node IDs but Stack resources are keyed by
     # LABEL — translate through `labels` (fall back for edges naming labels).
     #
@@ -344,9 +356,21 @@ ROLE_ASSUMPTION = "role"
 ALB_TARGET = "target"
 SNS_SUBSCRIPTION = "subscription"
 
+# "This volume is attached to that instance" -- an `aws_volume_attachment`, and
+# behind it a real `limactl disk` on the instance's VM. PRESENTATIONAL in the
+# same sense as the two above, and here it is load-bearing that it stays so:
+# `agent/hcl.py`'s attachment pass keys on the two NODE KINDS, so an old canvas
+# whose edge still says `network` keeps its attachment. Gating on the name would
+# make the next apply detach a disk with data on it.
+VOLUME_ATTACHMENT = "volume"
+
 # "This workload's environment is wired to that producer's endpoint" -- folded
 # into the consumer's `refs` by `_merge_connection_edges` below.
 CONNECTION = "connection"
+
+# "This key encrypts that sidecar at rest" -- folded into the target's own
+# key-naming FIELD by `_merge_encryption_edges` below.
+ENCRYPTION = "encryption"
 
 # One canvas edge, more than one meaning. `data.edgeType` holds a `+`-joined SET
 # in registry order (`ui/src/lib/iam.ts::serializeEdgeTypes`) and `_edges` splits
@@ -366,7 +390,8 @@ LEGACY_UNMODELLED = "network"
 
 EDGE_KINDS = frozenset({
     "iam", SG_MEMBERSHIP, ROLE_ASSUMPTION, ALB_TARGET, SNS_SUBSCRIPTION,
-    CONNECTION, UNMODELLED, LEGACY_UNMODELLED, "ref",
+    CONNECTION, ENCRYPTION, UNMODELLED, LEGACY_UNMODELLED, "ref",
+    CONNECTION, VOLUME_ATTACHMENT, UNMODELLED, LEGACY_UNMODELLED, "ref",
 })
 
 # Kinds whose HCL reads `securityGroups` (`agent/hcl.py::_security_group_refs`,
@@ -484,6 +509,84 @@ def _merge_role_edges(
             merged.append(res)
             continue
         fields = {**res.fields, "role": FieldValue(value=sorted(roles)[0], provenance="user")}
+        merged.append(res.model_copy(update={"fields": fields}))
+    return tuple(merged)
+
+
+# --- the encryption edge -----------------------------------------------------
+#
+# TARGET kind -> the canvas field naming the key it is sealed under. The two
+# names differ because the two AWS APIs differ, and `agent/hcl.py` reads each
+# one into the argument its own resource type takes: a secret's `kmsKeyId` ->
+# `aws_secretsmanager_secret.kms_key_id`, a parameter's `keyId` ->
+# `aws_ssm_parameter.key_id`. Naming them alike here would only move the
+# translation somewhere less visible.
+#
+# EXACTLY the kinds whose HCL reads such a field, which is the same rule
+# `_SG_MEMBERS`, `_ROLE_HOLDERS` and `_CONNECTION_CONSUMERS` hold, and for the
+# same reason: an encryption edge to anything else would author a field no
+# builder consumes -- the drawn-line-that-does-nothing bug. It is also the
+# HONEST boundary here rather than an arbitrary one. `gateway/models/kmsctl.py`
+# seals exactly two things, the secretsmanager and ssm sidecars; nothing
+# encrypts an s3 object, an rds volume or a dynamodb item, because those live in
+# real RustFS/Postgres/dynalite containers odin does not hold the keys for. So a
+# `kms -> s3` edge stays `unmodelled`, whose label says on the canvas that odin
+# does nothing with the line.
+_ENCRYPTION_FIELDS = {"secret": "kmsKeyId", "ssm": "keyId"}
+_ENCRYPTION_TARGETS = frozenset(_ENCRYPTION_FIELDS)
+
+
+def _merge_encryption_edges(
+    resources: tuple[ResourceDesired, ...], edges: tuple[Edge, ...],
+) -> tuple[ResourceDesired, ...]:
+    """Fold encryption edges into each target's own key-naming field.
+
+    The third instance of the technique `_merge_sg_edges` and `_merge_role_edges`
+    already use, and it earns its place the same way: `agent/hcl.py::_secret` and
+    `::_ssm` read ONE field and cannot tell whether a key's name was typed there
+    or drawn, so the edge takes effect with no builder change at all.
+
+    A HAND-TYPED value wins, exactly as it does for `role` and for the same
+    reason: `odin canvas set`, the README's JSON schema and the translation agent
+    all write the field directly, and a key is single-valued, so "add to it" is
+    not an available answer. Direction is not significant either -- an edge drawn
+    key->secret and one drawn secret->key express the same intent.
+
+    Two DIFFERENT keys edged to one secret is a contradiction the canvas can
+    express and odin cannot resolve; the lowest name wins, deterministically, so
+    the generated file never depends on edge ordering. Recorded as an open limit
+    rather than presented as a decision, the same as `_merge_role_edges`'.
+
+    WHAT IS AT STAKE if this quietly picks wrong, which is why it declines to
+    guess: naming a key that does not exist is a HARD error in the gateway
+    (`kmsctl.seal` raises rather than falling back to the default key), and
+    deleting the key a secret was sealed under destroys that secret's value --
+    `ScheduleKeyDeletion` is immediate in odin. So this authors a name only when
+    the canvas already agrees on one.
+    """
+    by_id = {r.id: r for r in resources}
+    edged: dict[str, list[str]] = {}
+    for edge in edges:
+        if edge.kind != ENCRYPTION:
+            continue
+        for key, target in ((edge.src, edge.dst), (edge.dst, edge.src)):
+            key_res, target_res = by_id.get(key), by_id.get(target)
+            if key_res is None or target_res is None:
+                continue
+            if key_res.kind == "kms" and target_res.kind in _ENCRYPTION_TARGETS:
+                edged.setdefault(target, []).append(key)
+
+    if not edged:
+        return resources
+    merged = []
+    for res in resources:
+        keys = edged.get(res.id)
+        field = _ENCRYPTION_FIELDS.get(res.kind, "")
+        typed = str(res.fields.get(field, FieldValue(value="")).value).strip()
+        if not keys or typed:
+            merged.append(res)
+            continue
+        fields = {**res.fields, field: FieldValue(value=sorted(keys)[0], provenance="user")}
         merged.append(res.model_copy(update={"fields": fields}))
     return tuple(merged)
 
@@ -698,6 +801,8 @@ def canvas_to_stack(canvas: dict, env: str = "default") -> Stack:
         resources, tuple(edge for e in (canvas.get("edges") or []) for edge in _edges(e, labels)),
     )
     resources = _merge_connection_edges(
-        _merge_role_edges(_merge_sg_edges(resources, edges), edges), edges,
+        _merge_encryption_edges(
+            _merge_role_edges(_merge_sg_edges(resources, edges), edges), edges,
+        ), edges,
     )
     return Stack(env=env, resources=resources, edges=edges)

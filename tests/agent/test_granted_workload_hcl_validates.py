@@ -120,3 +120,44 @@ async def test_the_generated_file_passes_the_real_tofu_validate(kind):
 
     assert reason is None, f"{kind}: generated Terraform does not validate — {reason}"
     assert formatted is not None
+
+
+# v0.8.18: the VOLUME ATTACHMENT companion, validated here for the same reason
+# the grants are. `aws_volume_attachment` is a resource type nothing else in this
+# suite hands to tofu, and a wrong argument NAME on it (`device` for
+# `device_name`, `instance` for `instance_id`) is invisible to every pure-Python
+# assertion in tests/agent — only the provider schema knows. Two volumes on one
+# instance, so the device-name assignment is exercised too, not just the refs.
+VOLUMES_CANVAS = {
+    "nodes": [
+        *NETWORK,
+        {"id": "i", "type": "ec2", "position": {"x": 40, "y": 40},
+         "data": {"label": "box", "instanceType": "t3.micro", "subnet": "net-a"}},
+        {"id": "d1", "type": "ebs", "position": {"x": 0, "y": 0},
+         "data": {"label": "alpha", "az": "us-east-1a", "size": "40"}},
+        {"id": "d2", "type": "ebs", "position": {"x": 0, "y": 0},
+         "data": {"label": "beta", "az": "us-east-1a", "size": "20"}},
+    ],
+    "edges": [
+        {"id": "e1", "source": "d1", "target": "i", "data": {"edgeType": "volume"}},
+        # Drawn the other way round, and carrying the pre-registry type name that
+        # every canvas saved before v0.8.15 actually has.
+        {"id": "e2", "source": "i", "target": "d2", "data": {"edgeType": "network"}},
+    ],
+}
+
+
+@pytest.mark.skipif(_NO_TOFU, reason="tofu not on PATH")
+async def test_the_generated_volume_attachments_pass_the_real_tofu_validate():
+    project = generate_tf(canvas_to_stack(VOLUMES_CANVAS))
+    assert project.unsupported == [], project.unsupported
+    main_tf = project.files["main.tf"]
+    # The content check first: `tofu validate` also passes a file with no
+    # attachment in it at all, so this is what keeps the assertion below honest.
+    assert main_tf.count('resource "aws_volume_attachment"') == 2
+    assert main_tf.count('resource "aws_ebs_volume"') == 2
+
+    files = {"main.tf": main_tf}
+    reason, formatted = await validate_refinement(files, files)
+    assert reason is None, f"generated Terraform does not validate — {reason}"
+    assert formatted is not None

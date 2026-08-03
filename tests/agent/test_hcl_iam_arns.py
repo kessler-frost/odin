@@ -144,6 +144,22 @@ TARGETS: dict[str, dict] = {
                     {"X-Amz-Target": "AmazonEC2ContainerServiceV20141113.ListTasks"},
                     b'{"serviceName": "worker"}'),
     },
+    # W2.9. The `X-Amz-Target` prefix is `TrentService`, KMS's internal name,
+    # NOT `kms` -- taken from botocore's own model rather than guessed, and the
+    # classifier reads only the part after the dot, so this row would still hold
+    # if the prefix were spelled anything else. The KeyId is sent in its ARN
+    # form, which is what `aws_kms_key.<name>.arn` would pass and what
+    # `bare_key_id` has to reduce; the bare-id form is covered by
+    # `tests/gateway/test_kmsctl.py`.
+    "kms": {
+        "node": {"label": "app-key"},
+        "action": "kms:Encrypt", "resource": "app-key",
+        "request": ("kms", "POST", "/", {}, {"X-Amz-Target": "TrentService.Encrypt"},
+                    json.dumps({
+                        "KeyId": f"arn:aws:kms:{REGION}:{ACCOUNT}:key/app-key",
+                        "Plaintext": "eA==",
+                    }).encode()),
+    },
 }
 
 # The workload every grant is drawn FROM. A lambda always has a role, drawn or
