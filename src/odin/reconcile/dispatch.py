@@ -67,7 +67,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import time
 import uuid
 from functools import partial
@@ -78,10 +77,9 @@ import httpx
 from odin.aws.backings import ACCOUNT, REGION
 from odin.gateway.models import eventsctl, lambdactl
 from odin.gateway.stores import SynthStores
+from odin.settings import settings
 
 log = logging.getLogger("odin.reconcile.dispatch")
-
-_DEFAULT_DISPATCH_TICKS = 1
 
 # How long a receive/delete against the local goaws backing may take. Short
 # because it IS local and short-polled; long enough that a busy daemon does not
@@ -160,10 +158,11 @@ _MAX_DELIVERY_ATTEMPTS = 5
 
 
 def _dispatch_ticks() -> int:
-    """Ticks between passes. Read fresh (not cached) so the override is real,
-    the same convention `drift._sweep_ticks` uses -- but defaulting to 1, for
-    the reason in the module docstring."""
-    return max(1, int(os.environ.get("ODIN_DISPATCH_TICKS", str(_DEFAULT_DISPATCH_TICKS))))
+    """Ticks between passes. Read fresh on every call (never cached at import)
+    so the override is real, the same convention `drift._sweep_ticks` uses --
+    but defaulting to 1, for the reason in the module docstring. The default
+    and its bound live in `settings.ReconcileSettings`."""
+    return settings.reconcile.dispatch_ticks
 
 
 class Delivery(NamedTuple):

@@ -116,13 +116,16 @@ from odin.fabric.nebula import (
     rehandshake_script,
 )
 from odin.runtime.colima import _failure_reason
+from odin.settings import ComputeSettings, env_name, settings
 from odin.util import atomic_write_text, run_command_async
 
 log = logging.getLogger("odin.compute.instances")
 
 _SLIRP_PREFIX = "192.168.5."  # Lima's built-in user-mode network -- never host-reachable
-BOOT_TIMEOUT = 300.0
-_BOOT_TIMEOUT_ENV = "ODIN_BOOT_TIMEOUT"
+# The name, for the sentence a timed-out boot prints. `settings.py` owns both
+# it and the 300s default, along with the measurement that justifies the
+# ceiling and the argument for why it deliberately does not move.
+_BOOT_TIMEOUT_ENV = env_name(ComputeSettings, "boot_timeout")
 
 
 def boot_timeout() -> float:
@@ -146,7 +149,7 @@ def boot_timeout() -> float:
     a genuinely hung boot take longer to report, and a slow boot and a dead one
     look identical until the clock runs out.
     """
-    return float(os.environ.get(_BOOT_TIMEOUT_ENV, BOOT_TIMEOUT))
+    return settings.compute.boot_timeout
 
 
 def _default_max_concurrent_boots() -> int:
@@ -160,7 +163,7 @@ def _default_max_concurrent_boots() -> int:
     semaphore would reset every call and bound nothing. `ODIN_MAX_CONCURRENT_VM_BOOTS`
     overrides; read fresh (not cached) so tests can monkeypatch it, same
     convention as `agent/translate.py`'s `_default_timeout`."""
-    return int(os.environ.get("ODIN_MAX_CONCURRENT_VM_BOOTS", "3"))
+    return settings.compute.max_concurrent_vm_boots
 
 
 # Process-wide: every `InstanceVm` -- including the fresh one each gateway

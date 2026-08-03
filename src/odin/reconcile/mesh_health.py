@@ -70,7 +70,6 @@ fresh every tick (`reconcile/tf_status.py`), the same reason
 from __future__ import annotations
 
 import logging
-import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -79,15 +78,13 @@ from odin.fabric.nebula import LighthouseManager
 from odin.fabric.sidecar import MeshSidecar
 from odin.reconcile.assertions import mesh_ready_sync
 from odin.runtime.colima import ColimaRuntime
+from odin.settings import settings
 
 log = logging.getLogger("odin.reconcile.mesh_health")
 
 # `label -> (kind, phase, facts, verdict)`'s value -- reconcile/tf_status.py's
 # `Projected` entry, which `gate` takes and returns.
 Entry = tuple[str, str, dict, str | None]
-
-_OK_SECONDS = 30.0
-_FAIL_SECONDS = 5.0
 
 # The remedy for every fault an Apply genuinely repairs: `rdsctl.ensure_db_mesh`
 # re-creates a stopped sidecar and re-joins a replaced target (this module's
@@ -115,11 +112,11 @@ class MeshVerdict:
 
 
 def _ok_seconds() -> float:
-    return float(os.environ.get("ODIN_MESH_SWEEP_SECONDS", _OK_SECONDS))
+    return settings.mesh.sweep_seconds
 
 
 def _fail_seconds() -> float:
-    return float(os.environ.get("ODIN_MESH_RECHECK_SECONDS", _FAIL_SECONDS))
+    return settings.mesh.recheck_seconds
 
 
 def reset_cache() -> None:

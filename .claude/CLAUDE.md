@@ -39,6 +39,11 @@ assertions verify.
 - `spec/` — `models.py` (Stack=desired, World=observed, WorldDelta, provenance-tagged fields), `store.py` (append-only content-addressed per-env revisions + `list_envs`), `translate.py` (canvas → Stack; `${{node.attr}}` → Ref; kinds today: rds/s3/sqs/sns/dynamodb).
 - `reconcile/` — `plan.py` (pure `plan(Stack,World)→[Action]`, total+idempotent; rds + the AWS-shaped PROVISIONED kinds), `reconciler.py` (the loop: observe → plan → execute, supervision, AWS env injection, per-env, gc), `assertions.py` (pg_ready — the rds health check), `actions.py`.
 - `runtime/` — `driver.py` (protocol), `colima.py`, `lima.py`.
+- `settings.py` — EVERY `ODIN_*` knob, as six domain `BaseSettings` classes on one
+  `settings` singleton. Sections are built from the environment at ACCESS time, not
+  at import — see the Configuration section below for why that is load-bearing.
+  `docs/config.md` is the human-readable index; `tests/test_settings_inventory.py`
+  is the ratchet.
 - `aws/` — `backings.py` (`BackingAws`: the real RustFS/goaws/dynalite backings — provision/exists/deprovision/gc/aws_env/facts, a host-side boto3 `client` for tests), `rds.py` (`PostgresRds`: rds nodes as direct Postgres containers).
 - `fabric/` — resolve `${{node.VAR}}` from World facts. `localhost.py` (loopback, the default); `nebula.py` + `models.py` = the **self-hosted Nebula mesh fabric** for multi-Mac: `NebulaFabric` is a drop-in for `resolve` (the overlay IP rides in via facts), plus recovered nebula-cert/lighthouse primitives (one network per env, sticky overlay IPs) + `mesh_state`/`GET /mesh?env=` for a mesh UI. Nebula NOT Tailscale (you own the lighthouse, build a control plane on top). The old per-EC2 Nebula *Simulate* overlay was deleted; this host-level mesh is the new thing — don't confuse them.
 - `compute/` — `lima_yaml.py`/`cloud_init.py`/`models.py`: the EC2-as-real-Lima-VM substrate for the next service-coverage phase (not wired into the reconciler yet).
@@ -243,6 +248,53 @@ than claimed" — was the single most valuable output of the field tests.
    never in any tag" only by walking EVERY commit in the window instead of the
    endpoints. Checking two points and inferring the middle turns a six-hour
    develop-only regression into a claim about released software.
+
+## Configuration is a Settings class. A REGISTRY is not configuration.
+(owner directive, 2026-08-03)
+
+**Config goes in `src/odin/settings.py`** — domain-specific pydantic
+`BaseSettings` classes (`GatewaySettings`, `ReconcileSettings`,
+`SimulateSettings`, `ComputeSettings`, `MeshSettings`, `AiSettings`) composed
+onto ONE singleton, imported where needed. `env_prefix="ODIN_"`, typed fields,
+validated at construction.
+
+**Why:** the state this replaced was 30 distinct `ODIN_*` variables read
+directly in 19 files, each with its own ad-hoc parsing and none validated — so
+`ODIN_DISPATCH_TICKS=abc` failed whenever that code path first ran, if ever,
+rather than at startup. And there was nowhere to look up what odin's knobs even
+are. A scalar tunable added anywhere else is a knob nobody can find.
+
+**Carry a default's REASON with it.** Several are load-bearing and measured —
+`READY_TIMEOUT = 120.0` is sized for first-run image pulls, and the EC2 boot
+ceiling's default "deliberately stays put" because a longer one makes a
+genuinely hung boot slower to report. A default without its reason is the next
+thing someone tidies.
+
+**THE TRAP, and it is rule 5's shape: tests monkeypatch these variables.** A
+singleton read ONCE at import time makes every `monkeypatch.setenv` silently
+ineffective — the test sets the var, the code reads a value captured at import,
+and the test passes for the wrong reason with nothing failing. So settings must
+be read at USE time, and the proof is two mutations, not one: a test that
+monkeypatches a var must still pass when you break the production default, and
+a test that relies on the default must FAIL when you change it. Demonstrate
+both or the object is being read at the wrong moment.
+
+**A REGISTRY IS NOT A SETTING, and must not become one.** `_CARRIED_ATTRS`,
+`_KIND`, `_BUILDERS`, `TF_OWNED_KINDS`, `_ALB_COMPANION_TYPES`,
+`_RESTJSON_SERVICES` are static DOMAIN KNOWLEDGE the code dispatches on. Nobody
+overrides them with an environment variable. Making them settings fields would
+imply they are user-configurable, put env lookup on a hot path, and lose the
+exhaustiveness checking that is the point of them.
+
+**What registries DO owe you is a test, because an entry is a PROMISE.**
+`_CARRIED_ATTRS["ecs"]` claims a round trip reproduces that argument — and
+membership SUPPRESSES the warning that would otherwise name it, so a false
+entry is worse than a missing one. Measured: `alb → ecs` silently lost its whole
+`load_balancer` block on import with `unsupported == []` and no warning at all,
+precisely because the entry was there. Every registry entry needs a test that
+would fail if the promise broke, and that test must use a value THE GENERATOR'S
+DEFAULT CANNOT REPRODUCE — a round trip over a default passes even when import
+drops the field, because the generator refills it.
 
 ## Browser automation: `agent-browser` (playwright-cli removed 2026-07-27)
 `agent-browser` (brew, Apache-2.0) is the only browser driver. `@playwright/cli`

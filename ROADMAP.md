@@ -2137,7 +2137,7 @@ run and are not described as such.
      "this is encrypted where it lives" rather than "AWS would encrypt this".
      If that is not built, kms is dropped with the other three.
 
-- [ ] **odin's OWN output does not re-import cleanly for two companions.**
+- [x] **odin's OWN output does not re-import cleanly for two companions.**
   Measured 2026-08-02 while adding `ebs`, and it long predates it: a canvas
   with an `alb → ec2` target plus a granted `ec2` generates a file whose
   `aws_iam_instance_profile` and `aws_lb_target_group_attachment` both come
@@ -2148,6 +2148,48 @@ run and are not described as such.
   companion types (instance profile folds onto the ec2 node; the target-group
   attachment is already an alb↔ec2 edge) and widening that canvas so the gap
   cannot reopen.
+
+  **Done in v0.8.21, and the entry above got one of the two treatments wrong.**
+  The attachment is an EDGE, as written. The instance profile does **not** fold
+  onto the ec2 node — it folds AWAY entirely, the `aws_ecs_cluster` treatment,
+  because it carries nothing a canvas node has a field for: `name` is
+  `<ec2 label>-profile`, `role` is that instance's own auto-role, and the grant
+  it exists for already comes back as an `iam` edge from the
+  `aws_iam_role_policy`. Folding it onto the node would have invented a field;
+  making it an edge would have drawn a second line for a permission already
+  drawn. `import_tf` has exactly two moves for a non-node resource and this one
+  needed neither of the ones the entry named.
+
+  **A THIRD instance was found while fixing these two, and it was the worst of
+  the three.** `alb → ecs` also lost the target edge on the round trip — and
+  unlike the two above it did so in SILENCE: `unsupported == []`, no warning, no
+  edge, and a regenerated `main.tf` missing the whole `load_balancer` block, so
+  the next apply would take a live service out of the load balancer's rotation
+  with nothing said. It hid because `load_balancer` was already listed in
+  `_CARRIED_ATTRS["ecs"]`, which suppressed the one warning that would have named
+  it. **A carried-set entry is a PROMISE that a round trip reproduces the
+  argument, and nothing was checking that promise** — which makes the carried
+  sets a place to go looking for more of these, not a place to trust.
+
+  Measured after the fix, on a canvas with one alb fronting BOTH an ec2 and an
+  ecs service plus a granted ec2: `unsupported == []`, `warnings == []`,
+  `again.files["main.tf"] == main_tf`. The values are deliberately non-default
+  (listener 8080, target 9000, health check `/healthz`) because 80/80/`/`
+  regenerate byte-identically even if import drops them — `hcl.py` refills the
+  defaults. Six mutations, each killing named tests with the test COUNT held at
+  114: deleting the attachment from `_ALB_COMPANION_TYPES` (10 failed), dropping
+  the attachment edge (5), deleting the profile branch (8), removing the profile
+  name check (1), deleting the ecs `load_balancer` recovery (5), and removing the
+  two re-derived `ec2` carried attrs (4).
+
+  **One thing a byte-identical round trip could never have proved**, and it is
+  worth carrying forward: the PROFILE. `hcl.py` re-derives it from the grant
+  edge, so `again == main_tf` held in the broken state too — measured, with
+  `aws_iam_instance_profile` sitting in `unsupported` and the equality still
+  `True`. A generator that puts a resource back cannot be used to check that the
+  importer read it (honesty rule 5, the check and its subject sharing a source).
+  The profile's proof is `unsupported == []` plus `warnings == []` plus the
+  falsification tests, never the equality.
 
 - [ ] **A fake runtime does not isolate `/apply-full`, so a "unit" test boots real
   containers.** Measured 2026-07-29, after it leaked four containers into every

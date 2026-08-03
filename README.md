@@ -345,15 +345,22 @@ per service showing what really runs underneath, and one for the whole system.
 GitHub renders those inline; [docs/architecture.html](docs/architecture.html) is
 the same thing styled, self-contained, and offline — open it in a browser.
 [docs/internals.md](docs/internals.md) has the architecture in full, and how each
-claim in this README is verified.
+claim in this README is verified. [docs/config.md](docs/config.md) is every
+`ODIN_*` knob odin has, with its default and why that default is what it is —
+all of them declared in one place, `src/odin/settings.py`.
 
 ## Known limits
 
 The ones most likely to matter:
 
-- **An emitted IAM policy names resources by label, not ARN.** It round-trips
-  through odin perfectly; taken to Amazon each policy needs its `Resource`
-  rewritten as an ARN.
+- **A drawn IAM grant is real Terraform, and its `Resource` is a real ARN.**
+  This bullet used to say the opposite — "names resources by label, not ARN …
+  taken to Amazon each policy needs its `Resource` rewritten" — and that limit
+  was closed in v0.8.14, which `tests/agent/test_hcl_iam_arns.py` quotes verbatim
+  as the limit it closes. Measured 2026-08-03 on a granted `ec2 → s3` canvas:
+  `"Resource": ["arn:aws:s3:::uploads", "arn:aws:s3:::uploads/*"]`. A caveat
+  outliving its fix is this repo's third honesty rule; it is recorded here rather
+  than quietly deleted because a stale limit is read as a live one.
 - **An RDS instance has no snapshots and no backups.** Its data survives a
   container replacement (a named volume), and `odin destroy` deletes it along
   with the volume — there is nothing to restore from afterwards. `odin volumes`

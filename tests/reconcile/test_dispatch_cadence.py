@@ -27,6 +27,7 @@ from odin.reconcile import dispatch
 from odin.reconcile.dispatch import Dispatcher
 from odin.reconcile.reconciler import Reconciler
 from odin.runtime.colima import ColimaRuntime
+from odin.settings import ReconcileSettings
 from odin.spec.models import Stack
 from odin.spec.store import SpecStore
 
@@ -41,7 +42,10 @@ def test_the_default_cadence_is_one_tick_not_the_drift_sweeps_ten(monkeypatch):
     is an ACTION, so it is every tick."""
     monkeypatch.delenv(ENV_VAR, raising=False)
     assert dispatch._dispatch_ticks() == 1
-    assert dispatch._DEFAULT_DISPATCH_TICKS == 1
+    # The SHIPPED default, read off the settings class rather than the reader
+    # above -- so an edit to `settings.py` that raises it fails here even if
+    # somebody's environment happens to hold it at 1.
+    assert ReconcileSettings.model_fields["dispatch_ticks"].default == 1
 
 
 # An ASSIGNMENT of the variable, not a mention of it. The first version of this

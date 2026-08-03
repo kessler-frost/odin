@@ -116,7 +116,6 @@ from __future__ import annotations
 
 import logging
 import asyncio
-import os
 from functools import partial
 from typing import NamedTuple
 
@@ -131,10 +130,9 @@ from odin.gateway.models.lambdactl import mark_function_failed
 from odin.gateway.stores import SynthStores
 from odin.reconcile.assertions import pg_ready
 from odin.runtime.colima import ColimaRuntime
+from odin.settings import settings
 
 log = logging.getLogger("odin.reconcile.drift")
-
-_DEFAULT_SWEEP_TICKS = 10
 
 # How long the rds half waits before re-asking "is it really down?" (see
 # `_sweep_databases`). Short enough that a genuinely dead database is still
@@ -157,11 +155,12 @@ def _probe_reason(probe) -> str:
 
 
 def _sweep_ticks() -> int:
-    """Ticks between sweeps. Read fresh (not cached) so a test can
-    monkeypatch the env var, the same convention `compute/instances.py`'s
-    `_default_max_concurrent_boots` and `agent/translate.py`'s
-    `_default_timeout` already use."""
-    return max(1, int(os.environ.get("ODIN_DRIFT_SWEEP_TICKS", str(_DEFAULT_SWEEP_TICKS))))
+    """Ticks between sweeps. Read fresh on every call (never cached at import)
+    so a test can monkeypatch the env var, the same convention
+    `compute/instances.py`'s `_default_max_concurrent_boots` and
+    `agent/translate.py`'s `_default_timeout` already use -- and the reason
+    `settings` is a live object rather than one built at import."""
+    return settings.reconcile.drift_sweep_ticks
 
 
 def _label(tags: dict[str, str], natural: str | None = None) -> str | None:

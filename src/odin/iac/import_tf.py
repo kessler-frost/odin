@@ -154,11 +154,41 @@ _ECS_COMPANION_TYPES = ("aws_ecs_task_definition", "aws_ecs_cluster")
 # nothing, which is the round-trip loss the emission was added to fix; importing
 # the policy back is the other half of that fix.
 _IAM_POLICY_TYPE = "aws_iam_role_policy"
-# W2.5: the two OTHER types an `alb` canvas node expands to. Neither becomes a
-# node of its own -- they fold ONTO the alb node the same way
+# W2.5: the OTHER types an `alb` canvas node expands to. None becomes a node of
+# its own -- the first two fold ONTO the alb node the same way
 # aws_secretsmanager_secret_version folds onto its secret, which is what makes
 # generate -> import -> generate round-trip instead of multiplying resources.
-_ALB_COMPANION_TYPES = ("aws_lb_target_group", "aws_lb_listener")
+#
+# v0.8.21 adds the THIRD, and it is the other of the two shapes this file has for
+# a companion: `aws_lb_target_group_attachment` becomes an EDGE rather than
+# folding onto a node, exactly like `aws_volume_attachment`. The rule that picks
+# between them is what the resource IS -- an attachment is a RELATIONSHIP between
+# two canvas nodes and holds no field the canvas has anywhere to put, while a
+# target group and a listener are properties OF the load balancer (its port, its
+# health check path) and the canvas has fields for both.
+#
+# Losing it is not cosmetic. odin registers an EC2 target through tofu (an ECS
+# service registers its own tasks -- see `_ecs_alb_targets`), so a dropped
+# attachment means the regenerated project contains no attachment at all and the
+# next apply DEREGISTERS a live instance from the load balancer fronting it.
+_ALB_ATTACHMENT_TYPE = "aws_lb_target_group_attachment"
+_ALB_COMPANION_TYPES = ("aws_lb_target_group", "aws_lb_listener", _ALB_ATTACHMENT_TYPE)
+# v0.8.21: how a granted `ec2` node reaches its role, which is how AWS models it
+# and what `iamctl` implements (hcl.py emits one for an instance that was granted
+# something, and for no other instance).
+#
+# IT FOLDS AWAY ENTIRELY -- it is neither a node nor an edge, which makes it the
+# `aws_ecs_cluster` shape rather than the `aws_volume_attachment` one. The reason
+# is that it carries no canvas information of any kind: its `name` is
+# `<ec2 label>-profile` and its `role` is that instance's own auto-role, both
+# re-derived by the generator, and the thing it exists FOR -- the grant -- is
+# already recovered as an `iam` edge from the `aws_iam_role_policy`. Importing it
+# as a node would invent one the canvas has no kind for; importing it as an edge
+# would invent a second line for a permission already drawn.
+#
+# Keyed by HCL resource NAME, like `aws_key_pair` and the efs access point,
+# because that is what the instance's `iam_instance_profile` interpolation names.
+_INSTANCE_PROFILE_TYPE = "aws_iam_instance_profile"
 # v0.8.19: an access point folds away exactly as an ecs CLUSTER does -- it never
 # becomes a node and it is never reported unsupported when something claims it.
 #
@@ -332,8 +362,16 @@ _CARRIED_ATTRS = {
     # `subnet_id` is containment; `vpc_security_group_ids` becomes the node's
     # `securityGroups` label list; `key_name` is a reference to the companion
     # aws_key_pair whose `public_key` is the real value.
+    # v0.8.21: `iam_instance_profile` and `depends_on` are carried in the sense
+    # `lambda`'s `depends_on` is -- odin RE-DERIVES both from the drawn IAM edge
+    # (`hcl.py::_ec2` emits the profile reference and `_grant_dependency` the
+    # ordering, for a granted instance and no other), so neither is ever a
+    # dropped argument. Leaving them out reported "imported without unmodeled
+    # attribute(s): depends_on, iam_instance_profile" on every GRANTED instance
+    # including odin's own output, which is precisely the noise the central
+    # `tags` fix above was written to stop.
     "ec2": {"ami", "instance_type", "subnet_id", "vpc_security_group_ids",
-            "key_name", "user_data"},
+            "key_name", "user_data", "iam_instance_profile", "depends_on"},
     # `depends_on` is carried in the sense that odin RE-DERIVES it from the
     # node's own `${{...}}` refs, so it is never a dropped argument -- but see
     # `_stamp_ecs_taskdef`: the refs themselves are not in the HCL at all and
@@ -420,6 +458,27 @@ _CARRIED_COMPANION_ATTRS = {
     "aws_lb_listener": {"load_balancer_arn", "port", "protocol", "default_action"},
     "aws_sns_topic_subscription": {"topic_arn", "protocol", "endpoint", "raw_message_delivery"},
     "aws_secretsmanager_secret_version": {"secret_id", "secret_string"},
+    # v0.8.21. The attachment becomes an EDGE, and an edge carries no arguments,
+    # so anything the source wrote on it has to be accounted for here or it
+    # vanishes. `target_group_arn`/`target_id` are the two references the edge is
+    # rebuilt from. `port` IS carried, in the re-derived sense: odin registers
+    # every target on the TARGET GROUP's own port (`hcl.py::_alb_ports`, which is
+    # the alb node's `port` field), so a source that registered an instance on a
+    # different port is reported CHANGED -- the regenerated project dials it
+    # somewhere else, which is a reachability change and not a detail. What is
+    # deliberately NOT here is `availability_zone`, the only other argument the
+    # type takes: it means something only for an `ip` target type odin never
+    # emits, so it is reported dropped rather than quietly implied.
+    _ALB_ATTACHMENT_TYPE: {"target_group_arn", "target_id", "port"},
+    # v0.8.21. The profile folds away entirely, so -- exactly as for an efs
+    # access point -- anything the source put on it has to be accounted for here
+    # or it vanishes. Both entries are carried in the RE-DERIVED sense: `name` is
+    # `<ec2 label>-profile` (a source that named it otherwise is reported CHANGED
+    # by `_derived_changes`, since the regenerated profile is a differently-named
+    # AWS resource) and `role` is that instance's own auto-role. `path` and
+    # `tags` are the other two arguments the type takes and odin models neither,
+    # so both are reported dropped.
+    _INSTANCE_PROFILE_TYPE: {"name", "role"},
     # v0.8.18. An attachment becomes an EDGE, and an edge carries no arguments,
     # so anything the source put on it has to be accounted for here or it
     # vanishes: `force_detach` and `skip_destroy` both change what a destroy
@@ -480,6 +539,20 @@ _CARRIED_HEALTH_CHECK_ATTRS = {"path"}
 # this change introduces and the part that would otherwise vanish.
 _CARRIED_EFS_VOLUME_ATTRS = {"name", "efs_volume_configuration"}
 _CARRIED_EFS_VOLUME_CONFIG_ATTRS = {"file_system_id", "root_directory"}
+# v0.8.21: the arguments of an ECS service's `load_balancer {}` block, which is
+# the OTHER shape of an alb target -- a nested block on the consumer where an
+# `ec2` target gets a resource of its own.
+#
+# It sits here rather than in `_CARRIED_COMPANION_ATTRS` for the reason
+# `_CARRIED_EFS_VOLUME_ATTRS` does, one comment up: that table is read by
+# `tests/agent/test_import_coverage_is_honest.py` as the set of aws_* resource
+# TYPES import understands, and `load_balancer` is a block name, not a type --
+# putting it there would inflate the published count by a resource that does not
+# exist. All three are carried in the re-derived sense: `container_name` is the
+# service's own label and `container_port` its task definition's port, both of
+# which the node already carries, so a source that disagrees with either is
+# reported CHANGED rather than looking carried because the block parsed.
+_CARRIED_ECS_LOAD_BALANCER_ATTRS = {"target_group_arn", "container_name", "container_port"}
 # hcl.py roots BOTH the access point and the ECS volume configuration at the top
 # of the file system. A source that roots either one at a subdirectory is telling
 # the consumer it may see only that subtree, and regenerating with `/` hands it
@@ -1737,6 +1810,131 @@ def _stamp_ecs_taskdef(
     return warnings
 
 
+def _ecs_alb_targets(
+    node_by_label: dict[str, dict], attrs_by_label: dict[str, dict], alb_by_target_group: dict[str, str],
+) -> tuple[list[tuple[str, str]], list[str]]:
+    """`[(alb label, ecs label)]` from each service's `load_balancer {}` blocks.
+
+    THE SIBLING OF THE ATTACHMENT PASS, found while fixing it and worse than the
+    defect that was reported: `alb -> ec2` at least came back `unsupported`, while
+    `alb -> ecs` round-tripped GREEN with the wiring gone. Measured on develop
+    before this pass existed -- an alb+ecs canvas imported with
+    `unsupported == []`, no warning, and zero edges, and the regenerated `main.tf`
+    was missing the whole `load_balancer` block, so the next apply would have
+    taken the service out of the load balancer's rotation with nothing said.
+
+    It was invisible because `load_balancer` is listed in `_CARRIED_ATTRS["ecs"]`,
+    which suppressed the one warning that would have named it -- a carried-set
+    entry is a PROMISE that a round trip reproduces the argument, and until this
+    pass nothing kept it. So the two halves of the fix belong together: the entry
+    was already there, and this is what makes it true.
+
+    The two supported target kinds need opposite machinery in the generator (an
+    ECS service registers its own tasks with a `load_balancer` block; an EC2
+    instance is registered by tofu through an `aws_lb_target_group_attachment`),
+    so they need opposite machinery here too -- but they rebuild the SAME canvas
+    edge, which is why the two passes both end in one `ALB_TARGET`. Same shape as
+    the efs mounts, recovered from two consumer forms into one `mount` edge.
+    """
+    targets: list[tuple[str, str]] = []
+    warnings: list[str] = []
+    for label, node in sorted(node_by_label.items()):
+        if node["type"] != "ecs":
+            continue
+        port = node["data"].get("port")
+        for block in attrs_by_label[label].get("load_balancer") or []:
+            group = _ref_target(block.get("target_group_arn"))
+            alb_label = alb_by_target_group.get(f"aws_lb_target_group.{group}" if group else "")
+            if not alb_label:
+                warnings.append(
+                    f"{label} (ecs): a `load_balancer` block names a target group "
+                    f"({block.get('target_group_arn')!r}) that folds onto no imported aws_lb, so "
+                    "the edge is dropped -- a regenerated project would NOT put this service "
+                    "behind a load balancer"
+                )
+                continue
+            targets.append((alb_label, label))
+            # The block's own arguments, held to the rule every other companion
+            # is held to. `container_port` is compared against the port the TASK
+            # DEFINITION gave this node -- a second producer, which is the whole
+            # point: comparing the block against itself could never fail.
+            dropped, changed = _attribute_notes(
+                "ecs.load_balancer", block, _CARRIED_ECS_LOAD_BALANCER_ATTRS, (),
+                _derived_changes([
+                    ("container_name", block.get("container_name"), label),
+                    *([("container_port", block.get("container_port"), port)] if port else []),
+                ]),
+            )
+            warnings += _attribute_warnings(
+                f"{alb_label} -> {label} (alb target)", "load_balancer ", dropped, changed,
+            )
+    return targets, warnings
+
+
+def _fold_instance_profiles(
+    node_by_label: dict[str, dict], attrs_by_label: dict[str, dict],
+    profiles: dict[str, dict], granted: set[str],
+) -> tuple[list[str], list[Unsupported]]:
+    """Fold each `aws_iam_instance_profile` onto the instance that references it.
+
+    "Fold onto" here means the `aws_ecs_cluster` kind of folding: nothing is
+    carried, because there is nothing on it to carry (see `_INSTANCE_PROFILE_TYPE`).
+    What the pass exists for is the honesty half -- odin's own output must import
+    with the profile accounted for rather than reported `unsupported`, and a
+    profile that is NOT odin's own must have its differences named.
+
+    Two things are reported, and both are about what a regenerate would produce
+    rather than about the profile itself:
+
+    * `granted` -- the ec2 labels an `iam` edge was actually recovered for. The
+      generator emits a profile for a granted instance AND NO OTHER, so an
+      instance whose source gave it a profile while nothing here recovered a
+      grant comes back with no profile, no role and no AWS credentials. That is
+      the real consequence and it is stated as one. It is passed IN, from the
+      policy pass's own edges, rather than re-derived from the role name: the
+      question is not "does a role exist" but "did an edge survive".
+    * an unclaimed profile is `unsupported`, the unclaimed-target-group rule --
+      it folds onto nothing, so a regenerated project would not contain it.
+    """
+    warnings: list[str] = []
+    claimed: set[str] = set()
+    for label, node in sorted(node_by_label.items()):
+        if node["type"] != "ec2":
+            continue
+        attrs = attrs_by_label[label]
+        rname = _ref_target(attrs.get("iam_instance_profile"))
+        profile = profiles.get(rname or "")
+        if profile is None:
+            warnings += [] if attrs.get("iam_instance_profile") is None else [
+                f"{label} (ec2): its `iam_instance_profile` names no imported "
+                f"{_INSTANCE_PROFILE_TYPE}, so the instance comes back with NO role and none of "
+                "the AWS permissions the profile carried"
+            ]
+            continue
+        claimed.add(rname)
+        dropped, changed = _attribute_notes(
+            _INSTANCE_PROFILE_TYPE, profile, _CARRIED_COMPANION_ATTRS[_INSTANCE_PROFILE_TYPE], (),
+            _derived_changes([("name", profile.get("name"), f"{label}-profile")]),
+        )
+        warnings += _attribute_warnings(
+            f"{label} (ec2)", f"{_INSTANCE_PROFILE_TYPE} ", dropped, changed,
+        )
+        warnings += [] if label in granted else [
+            f"{label} (ec2): odin emits an instance profile only for an instance a drawn IAM edge "
+            "grants something, and no grant could be imported for this one -- so the regenerated "
+            "project has NO profile and NO role for it, and it loses the permissions the source "
+            "gave it"
+        ]
+    return warnings, [
+        Unsupported(
+            type=_INSTANCE_PROFILE_TYPE, name=rname,
+            reason="instance profile is referenced by no imported aws_instance -- odin emits one "
+                   "only for an instance it attaches, so a regenerated project would NOT contain it",
+        )
+        for rname in sorted(set(profiles) - claimed)
+    ]
+
+
 def _root_directory_path(value: object) -> str | None:
     """The directory a `root_directory` roots a mount at, or None when the source
     does not state it as a plain literal.
@@ -2246,6 +2444,7 @@ def parse_hcl(files: dict[str, str], archives: dict[str, bytes] | None = None) -
     dns_records: list[tuple[str, dict]] = []
     access_points: dict[str, dict] = {}
     apigw_companions: list[tuple[str, str, dict]] = []  # v0.8.19
+    instance_profiles: dict[str, dict] = {}  # v0.8.21
     key_pairs: dict[str, dict] = {}
     taskdefs: dict[str, dict] = {}
     role_policies: list[dict] = []
@@ -2295,6 +2494,12 @@ def parse_hcl(files: dict[str, str], archives: dict[str, bytes] | None = None) -
             # Keyed by HCL resource name because that is what the function's
             # `file_system_config.arn` interpolation names.
             access_points[rname] = attrs
+            continue
+        if rtype == _INSTANCE_PROFILE_TYPE:
+            # v0.8.21: a COMPANION that folds AWAY -- see `_INSTANCE_PROFILE_TYPE`.
+            # Keyed by HCL resource name because that is what the instance's own
+            # `iam_instance_profile` interpolation names.
+            instance_profiles[rname] = attrs
             continue
         if rtype == "aws_key_pair":
             # A COMPANION, like a secret version: it folds onto the instance that
@@ -2357,7 +2562,14 @@ def parse_hcl(files: dict[str, str], archives: dict[str, bytes] | None = None) -
     # listener pointing at it can't be attributed to any load balancer, so it's
     # reported rather than guessed at (the subscription pass's rule).
     target_groups = {f"aws_lb_target_group.{rname}": attrs for rtype, rname, attrs in alb_companions if rtype == "aws_lb_target_group"}
-    claimed_target_groups: set[str] = set()
+    # v0.8.21: a MAP now, not a set. Both target-registration passes below need
+    # to answer "which load balancer is this target group part of", and the
+    # listener is the only resource in the file that says so -- so the answer is
+    # recorded once, here, where the listener is already being walked, rather
+    # than re-derived from hcl.py's `<label>_tg` naming convention in two more
+    # places. Membership still reads the same, so the unclaimed-group report
+    # below is unchanged.
+    alb_by_target_group: dict[str, str] = {}
     for rtype, rname, attrs in alb_companions:
         if rtype != "aws_lb_listener":
             continue
@@ -2378,7 +2590,7 @@ def parse_hcl(files: dict[str, str], archives: dict[str, bytes] | None = None) -
                 reason="listener's forward action names no importable target group -- port/health check not carried",
             ))
             continue
-        claimed_target_groups.add(tg_key)
+        alb_by_target_group[tg_key] = node["data"]["label"]
         node["data"]["port"] = str(_int_attr(tg_attrs.get("port"), 80))
         node["data"]["healthCheckPath"] = _health_check_path(tg_attrs)
         # The companions' own arguments are held to the same honesty rule as a
@@ -2401,7 +2613,7 @@ def parse_hcl(files: dict[str, str], archives: dict[str, bytes] | None = None) -
             )
             warnings += _attribute_warnings(f"{label} (alb)", f"{companion_type} ", dropped, changed)
     for rtype, rname, attrs in alb_companions:
-        if rtype == "aws_lb_target_group" and f"aws_lb_target_group.{rname}" not in claimed_target_groups:
+        if rtype == "aws_lb_target_group" and f"aws_lb_target_group.{rname}" not in alb_by_target_group:
             unsupported.append(Unsupported(
                 type=rtype, name=rname,
                 reason="target group is not the forward target of any imported listener -- not folded onto a load balancer",
@@ -2547,6 +2759,62 @@ def parse_hcl(files: dict[str, str], archives: dict[str, bytes] | None = None) -
             f"{volume_label} -> {instance_label} (volume attachment)", "", dropped, changed,
         )
 
+    # v0.8.21: ALB TARGETS. One canvas `alb -> ec2`/`alb -> ecs` edge, recovered
+    # from the two DIFFERENT resources the generator splits it into -- an
+    # `aws_lb_target_group_attachment` for an instance, a `load_balancer {}` block
+    # on the service for a task. Same shape as the efs mounts: two producer forms,
+    # one edge kind, so the canvas gets back the line the user drew and not the
+    # implementation detail underneath it.
+    #
+    # `edgeType` is stamped even though hcl.py keys on the two node KINDS: the
+    # canvas needs it to draw and label the line, and `spec/translate.py`'s
+    # `ALB_TARGET` is what it must spell.
+    ecs_targets, ecs_target_warnings = _ecs_alb_targets(
+        node_by_label, attrs_by_label, alb_by_target_group,
+    )
+    warnings += ecs_target_warnings
+    alb_targets: list[tuple[str, str]] = list(ecs_targets)
+    for rtype, rname, attrs in alb_companions:
+        if rtype != _ALB_ATTACHMENT_TYPE:
+            continue
+        group = _ref_target(attrs.get("target_group_arn"))
+        alb_label = alb_by_target_group.get(f"aws_lb_target_group.{group}" if group else "")
+        instance_label = _referenced_label(attrs.get("target_id"), "aws_instance", by_hcl_name)
+        if not (alb_label and instance_label):
+            # The subscription pass's rule. The cost here is the attachment
+            # pass's own: a dropped registration is an instance the next apply
+            # takes OUT of the load balancer's rotation.
+            missing = ", ".join(
+                f"{arg}={attrs.get(arg)!r}" for arg, found in
+                (("target_group_arn", alb_label), ("target_id", instance_label)) if not found
+            )
+            unsupported.append(Unsupported(
+                type=_ALB_ATTACHMENT_TYPE, name=rname,
+                reason=f"attachment references a resource outside the supported set ({missing}) -- "
+                       "the edge is dropped, so a regenerated project would NOT register this "
+                       "instance with the load balancer",
+            ))
+            continue
+        alb_targets.append((alb_label, instance_label))
+        dropped, changed = _attribute_notes(
+            _ALB_ATTACHMENT_TYPE, attrs, _CARRIED_COMPANION_ATTRS[_ALB_ATTACHMENT_TYPE], (),
+            # The expected port comes from the alb node's own `port`, which the
+            # listener pass read off the TARGET GROUP -- a second producer, not
+            # this attachment's own value graded against itself.
+            _derived_changes([("port", attrs.get("port"), node_by_label[alb_label]["data"]["port"])]),
+        )
+        warnings += _attribute_warnings(
+            f"{alb_label} -> {instance_label} (alb target)", "", dropped, changed,
+        )
+    # ONE edge per (load balancer, target) pair: two `load_balancer` blocks on one
+    # service, or a second attachment for the same instance, are still one drawn
+    # line, and two edges between the same two nodes is a canvas the UI cannot
+    # draw and a round trip that is not stable.
+    edges += [
+        {"source": alb_label, "target": target_label, "data": {"edgeType": ALB_TARGET}}
+        for alb_label, target_label in sorted(set(alb_targets))
+    ]
+
     # v0.8.19: each `aws_route53_record` back into the canvas edge that produced
     # it -- the inverse of hcl.py's record pass, and the same stake as the
     # attachment pass above. Lose the edge and the second generate emits no
@@ -2667,6 +2935,17 @@ def parse_hcl(files: dict[str, str], archives: dict[str, bytes] | None = None) -
     )
     edges += policy_edges
     warnings += policy_warnings
+
+    # v0.8.21, and it runs LAST on purpose: the profile's fate on a regenerate is
+    # decided by whether a grant EDGE survived, which is not known until the line
+    # above has run. Deriving it any earlier (from the role's name, say) would be
+    # asking a different question than the one the user cares about.
+    profile_warnings, profile_unsupported = _fold_instance_profiles(
+        node_by_label, attrs_by_label, instance_profiles,
+        {edge["source"] for edge in policy_edges},
+    )
+    warnings += profile_warnings
+    unsupported += profile_unsupported
 
     return ImportResult(nodes=nodes, edges=edges, unsupported=unsupported, warnings=warnings)
 
