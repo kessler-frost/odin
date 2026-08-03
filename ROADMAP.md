@@ -1905,6 +1905,25 @@ run and are not described as such.
 ## Next — known, measured, not yet fixed
 
 - [ ] **One runtime backend, macOS and Linux, containers AND VMs (owner ask,
+
+  **MEASURED 2026-08-03, and the blocker is SELECTABILITY, not capability.**
+  `LimaRuntime` works: `tests/runtime/test_lima_integration.py` boots a real
+  Lima VM, runs a real container inside it via `nerdctl`, reads its published
+  port, and tears the VM down -- **5 passed in 49.27s**, `limactl list` empty
+  afterwards. So the second backend is not hypothetical; it runs.
+
+  What does NOT exist is any way to CHOOSE it. `create_app(runtime=...)` is a
+  programmatic seam (and since the isolation work it is honoured everywhere,
+  which is what makes this newly cheap), but `server.py:2856` is
+  `_runtime = runtime or ColimaRuntime()` and there is no `ODIN_RUNTIME`
+  setting -- so no user can run odin on Lima, and the full integration suite
+  has never been run against it. **The comparison this item wants cannot be
+  made until the switch exists**, and that is the next step, not more probing:
+  a `ComputeSettings` field selecting the backend, then the gate run twice.
+
+  Stated this way deliberately: "LimaRuntime is unproven" would be false (it
+  is proven for what it does), and "LimaRuntime works, ship it" would be
+  false too (nothing has driven odin's real workloads through it).
   2026-07-31).** *"I want to use lima or colima or something ONLY and not a mix
   of both like we currently have … something that handles containers as well as
   VMs natively."*
