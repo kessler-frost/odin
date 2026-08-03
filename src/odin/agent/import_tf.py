@@ -855,7 +855,7 @@ def _ingress_rule_line(block: dict, by_hcl_name: dict[str, str]) -> str | None:
     """One `protocol:port:source` line from an `ingress {}`/`egress {}` block, or
     None when the block cannot be expressed as one.
 
-    The exact inverse of `hcl.py::_ingress_source`: `cidr_blocks` is a literal
+    The exact inverse of `hcl.py::_sg_peer`: `cidr_blocks` is a literal
     CIDR, and `security_groups` is another SG NODE'S LABEL -- the
     identity-based "only the web tier may reach me" rule, which is the form the
     Nebula firewall compiles to a `group:` rule. Reading it back as the referenced

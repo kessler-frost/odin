@@ -1248,7 +1248,7 @@ def _granted_ids(stack: Stack) -> set[str]:
 # THE OTHER HALF OF THIS CHANGE LIVES IN `gateway/policy.py`. Emitting ARNs and
 # changing nothing else would have silently broken every permission in the
 # product: the gateway authorizes from the APPLIED IAM (v0.8.12) and asks
-# `evaluate` to match these strings against a bare label. `policy.py::_arn_label`
+# `evaluate` to match these strings against a bare label. `policy.py::arn_label`
 # reduces an ARN back to the label the classifier reports, and
 # `tests/agent/test_hcl_iam_arns.py` pins THIS table against THAT reducer for
 # every kind, so a shape added here without a reducer there fails the build
