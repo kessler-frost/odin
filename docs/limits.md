@@ -166,19 +166,31 @@ internet-facing, EC2 launch type where you wanted Fargate, no IGW.
   Nebula change, not a canvas one. One bad line still declines the whole group,
   deliberately: silently dropping one rule from a firewall is worse than
   refusing the group.
-- **A security group's rule port must be a literal number or range.**
-  `tcp:443:0.0.0.0/0` or `tcp:8000-8100:0.0.0.0/0`, in either rule field. This
-  entry used to read "a single port each … an imported ingress block with a port
-  RANGE is reported and left out, and the regenerated group allows *less* than
-  the source", and that was a correctness bug wearing a limit's clothes: a round
-  trip through odin handed back a NARROWER firewall than the Terraform you gave
-  it. Since v0.8.17 both bounds survive import → canvas → regenerate, and a
-  single port is simply the degenerate range, so every canvas drawn before this
-  emits byte-identical HCL. What is still left out is a port that is not a
-  literal number — `from_port = var.port`, or any computed expression — which is
-  named and counted like any other unimportable rule. A MALFORMED range
-  (`8000-`, `8100-8000`, `8000 - 8100`) declines the whole group and names the
-  offending line; it is never half-parsed into its low bound.
+- **A security group's rule port must be a literal — `443`, `8000-8100`, or
+  `-1` — never a computed expression.** In either rule field. The entry has now
+  shed the same bug TWICE, and both times it was a correctness bug wearing a
+  limit's clothes: a round trip through odin handed back a NARROWER firewall
+  than the Terraform you gave it. Port RANGES were the first (fixed v0.8.17,
+  both bounds survive import → canvas → regenerate). `-1` was the second, fixed
+  in v0.8.21 — and it is the most literal number in the whole AWS
+  security-group model, because an ICMP rule is `from_port = -1, to_port = -1`,
+  which is exactly what the console writes for "allow ping". MEASURED on the
+  real path before the fix: a group carrying one `tcp:443` rule and one ICMP
+  rule imported as `ingressRules = 'tcp:443:0.0.0.0/0'`, warned that "a port
+  that is not a literal number … is left out", and regenerated with no ping.
+  The cause was not where that warning pointed: **python-hcl2 renders `-1` as
+  the interpolation `'${-1}'`**, so odin's literal check saw an expression.
+  `-1` is taken only for `icmp`, `icmpv6` and protocol `-1` — the ones with no
+  ports to name — because `fabric/nebula.py` passes the port through verbatim
+  for anything else and a verbatim `-1` makes the nebula daemon refuse to
+  start; `tcp:-1:…` is declined and now says so in those words instead of
+  claiming a malformed range. What is genuinely still left out is a port that
+  is not a literal at all — `from_port = var.port`, or any computed expression
+  — which is named and counted like any other unimportable rule; reading a
+  wrapped literal is not the same as evaluating HCL, and odin does not evaluate
+  it. A MALFORMED range (`8000-`, `8100-8000`, `8000 - 8100`) declines the
+  whole group and names the offending line; it is never half-parsed into its
+  low bound.
 - **A workload's `${{producer.ATTR}}` references are carried as TAGS, and the
   resolved values still are not.** The distinction the design rests on: a
   reference names a producer and an attribute, while the string it resolves to

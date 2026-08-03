@@ -615,9 +615,38 @@ _SG_RULE_FIELDS: tuple[tuple[str, str, str], ...] = (
 )
 
 
-def _port_span(text: str) -> tuple[str, str] | None:
+# `-1` in the PORT position means "all of them", and it is a LITERAL AWS itself
+# writes: an ICMP rule is `from_port = -1, to_port = -1` (the type and code,
+# both "any"), and that is what the console produces for "allow ping". It was
+# declined until v0.8.21, which made an ordinary AWS security group unimportable
+# -- MEASURED on the real path: a group with a `tcp:443` rule and an ICMP rule
+# imported as `ingressRules = 'tcp:443:0.0.0.0/0'` with a warning blaming "a
+# port that is not a literal number", and the regenerated group allowed no ping.
+# Narrower than the Terraform you handed it, which is the same correctness bug
+# wearing a limit's clothes that port RANGES were until v0.8.17.
+#
+# ONLY THESE PROTOCOLS, and the restriction is a daemon-down hazard, not
+# fussiness. `fabric/nebula.py::_compile_side` elides the port for `icmp` /
+# `icmpv6` / `-1` and passes it through verbatim for everything else, and its
+# own comment records what a verbatim `-1` does: nebula REFUSES TO START
+# ("port appears to be a range but could not be parsed"). So accepting
+# `tcp:-1:...` here would take the whole mesh down over one rule. AWS does not
+# accept it either -- `-1` ports are only meaningful where there are no ports.
+# `tests/agent/test_sg_port_ranges.py` pins the pair BEHAVIOURALLY, by
+# compiling each of these through the real `sg_rules_to_firewall` and checking
+# no `-1` survives into a nebula port, rather than by comparing two constants
+# that could agree while both being wrong.
+_ALL_PORTS = "-1"
+_ALL_PORTS_PROTOCOLS = frozenset({"icmp", "icmpv6", "-1"})
+
+
+def _port_span(text: str, protocol: str) -> tuple[str, str] | None:
     """The PORT field of a rule line, as the `(from_port, to_port)` pair AWS's
     model is actually made of. None when the text is not a port span at all.
+
+    `protocol` is here ONLY for the `-1` spelling above, which is legal for
+    some protocols and a mesh outage for others -- see `_ALL_PORTS_PROTOCOLS`.
+    Everything else in this function ignores it.
 
     A SINGLE PORT IS THE DEGENERATE RANGE. `443` is `("443", "443")`, which is
     what `_sg_rule_block` already emitted for every rule ever written, so
@@ -637,6 +666,8 @@ def _port_span(text: str) -> tuple[str, str] | None:
     `f"{from_port}-{to_port}"` would emit a range no packet can be in -- a rule
     that looks enforced and matches nothing.
     """
+    if text == _ALL_PORTS:
+        return (_ALL_PORTS, _ALL_PORTS) if protocol in _ALL_PORTS_PROTOCOLS else None
     low, sep, high = text.partition("-")
     high = high if sep else low
     ordered = low.isdigit() and high.isdigit() and int(low) <= int(high)
@@ -672,11 +703,14 @@ def parse_sg_rule(line: str) -> tuple[str, str, str, str] | None:
     2)` has already bounded, so neither an IPv6 CIDR (no `-` in the notation,
     and it lands in `parts[2]` regardless) nor a hyphenated canvas label
     (`web-sg`, also `parts[2]`) can reach it. The `-1` all-protocols spelling
-    sits in `parts[0]`; a `-1` in the PORT position still declines, exactly as
-    it did before, so `icmp:-1:...` is no more drawable than it was.
+    sits in `parts[0]`; a `-1` in the PORT position is read by `_port_span`,
+    which accepts it only for the protocols that HAVE no ports -- so
+    `icmp:-1:10.0.0.0/16` (the "allow ping" rule AWS's own console writes) is
+    drawable since v0.8.21 and `tcp:-1:...` is still declined, because a
+    verbatim `-1` in a nebula port stops the daemon starting.
     """
     parts = line.split(":", 2)
-    span = _port_span(parts[1]) if len(parts) == 3 else None
+    span = _port_span(parts[1], parts[0]) if len(parts) == 3 else None
     return (parts[0], *span, parts[2]) if span else None
 
 
@@ -754,17 +788,26 @@ def _sg_peer(peer: str, res: ResourceDesired, refs: Refs) -> tuple[str, str] | N
 def _rule_reason(line: str, field: str, word: str) -> str:
     """The human reason ONE unparseable rule line declines its whole group.
 
-    TWO sentences, because they are two different mistakes and the second one
-    is new. A line whose port field carries a `-` was an attempt at a RANGE:
-    the author is editing a firewall and needs to see WHICH line and what is
-    wrong with it, not a generic format reminder that shows only the
-    single-port example they already know. Anything else did not fit the
-    grammar at all, and that message is deliberately byte-for-byte what it has
-    always been (pinned by `test_hcl_sg_egress.py::
-    test_the_ingress_messages_are_unchanged_word_for_word`) -- a grammar
-    extension is no excuse for rewording text that was already correct.
+    THREE sentences, because they are three different mistakes. A line whose
+    port field carries a `-` was an attempt at a RANGE: the author is editing a
+    firewall and needs to see WHICH line and what is wrong with it, not a
+    generic format reminder that shows only the single-port example they
+    already know. A `-1` port on a protocol that HAS ports is its own mistake
+    and got the range message until v0.8.21, which was actively misleading --
+    the author wrote a legal AWS spelling on the wrong protocol, and telling
+    them "a range is two whole ports" sends them to fix the wrong thing.
+    Anything else did not fit the grammar at all, and that message is
+    deliberately byte-for-byte what it has always been (pinned by
+    `test_hcl_sg_egress.py::test_the_ingress_messages_are_unchanged_word_for_word`)
+    -- a grammar extension is no excuse for rewording text that was already
+    correct.
     """
     parts = line.split(":", 2)
+    if len(parts) == 3 and parts[1] == _ALL_PORTS:
+        return (f"{field}: {line!r} uses the all-ports port {_ALL_PORTS!r}, which odin takes only "
+                f"for {', '.join(sorted(_ALL_PORTS_PROTOCOLS))} — those are the protocols with no "
+                f"ports to name. For {parts[0]!r}, give a real port or range, like "
+                "tcp:443:0.0.0.0/0")
     if len(parts) == 3 and "-" in parts[1]:
         return (f"{field}: {line!r} has a malformed port range {parts[1]!r} — a range is two whole "
                 "ports, low first, like tcp:8000-8100:0.0.0.0/0")
