@@ -345,7 +345,9 @@ per service showing what really runs underneath, and one for the whole system.
 GitHub renders those inline; [docs/architecture.html](docs/architecture.html) is
 the same thing styled, self-contained, and offline — open it in a browser.
 [docs/internals.md](docs/internals.md) has the architecture in full, and how each
-claim in this README is verified.
+claim in this README is verified. [docs/config.md](docs/config.md) is every
+`ODIN_*` knob odin has, with its default and why that default is what it is —
+all of them declared in one place, `src/odin/settings.py`.
 
 ## Known limits
 

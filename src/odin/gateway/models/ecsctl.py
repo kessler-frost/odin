@@ -91,7 +91,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import asyncio
 import time
 import uuid
@@ -110,6 +109,7 @@ from odin.gateway.errors import exc_text
 from odin.gateway.keys import KeyStore, workload_env
 from odin.gateway.models import background, efsctl, elbv2ctl, join, logsctl
 from odin.gateway.stores import NO_CHANGE, SynthStores
+from odin.settings import settings
 from odin.gateway.wiring import node_env
 from odin.runtime.colima import CONTAINER_HOST
 
@@ -1133,7 +1133,6 @@ async def converge_services(
 # Nothing in tofu can close that, by definition: tofu has nothing to do. So
 # odin verifies it itself, right after its own convergence pass.
 _STEADY_POLL_SECONDS = 0.5
-_STEADY_TIMEOUT_ENV = "ODIN_ECS_STEADY_TIMEOUT"
 
 
 def steady_timeout() -> float:
@@ -1141,7 +1140,7 @@ def steady_timeout() -> float:
     as `iac/hcl.py`'s `timeouts.update` (the tf-side twin of this check) --
     one number for "how long may a task legitimately take to come up", not two.
     `ODIN_ECS_STEADY_TIMEOUT` overrides, matching every other odin timeout."""
-    return float(os.environ.get(_STEADY_TIMEOUT_ENV, "60"))
+    return settings.gateway.ecs_steady_timeout
 
 
 class ServiceShortfall(NamedTuple):

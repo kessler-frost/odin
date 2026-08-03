@@ -91,6 +91,7 @@ from odin.fabric.models import (
     SgFirewall,
     VpcNetwork,
 )
+from odin.settings import settings
 from odin.spec.models import World
 from odin.util import atomic_write_text, private_mkdir, run_command_async
 
@@ -127,9 +128,6 @@ LIGHTHOUSE_PORT = 4342
 # guest's own outbound sockets (and therefore Lima's automatic port
 # forwarding) genuinely do land.
 LIGHTHOUSE_PORTS = range(LIGHTHOUSE_PORT, LIGHTHOUSE_PORT + 100)
-# An explicit pin, for reproducing a collision and for a user who needs a
-# specific port open. Honoured verbatim: no probing, no reallocation.
-_PORT_PIN_ENV = "ODIN_LIGHTHOUSE_PORT"
 
 # How long `ensure_started` waits, after spawning, to catch an IMMEDIATE
 # crash (bad cert/config, port already in use) before declaring success -- a
@@ -281,8 +279,15 @@ def _lock_for_dir(data_dir: Path) -> asyncio.Lock:
 
 
 def _pinned_port() -> int | None:
-    pin = os.environ.get(_PORT_PIN_ENV)
-    return int(pin) if pin and pin.isdigit() else None
+    """An explicit `ODIN_LIGHTHOUSE_PORT` pin, for reproducing a collision and
+    for a user who needs a specific port open. Honoured verbatim: no probing,
+    no reallocation.
+
+    Non-numeric used to be silently ignored (`pin.isdigit()`), which meant a
+    typo'd pin quietly allocated somewhere else and the user's firewall rule
+    pointed at nothing. It is now a startup ValidationError naming the
+    variable -- the whole reason the field is typed."""
+    return settings.mesh.lighthouse_port
 
 
 def _bindable(family: int, port: int) -> bool:

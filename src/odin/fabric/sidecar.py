@@ -56,7 +56,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -71,6 +70,7 @@ from odin.fabric.nebula import (
     rehandshake_script,
 )
 from odin.runtime.colima import ContainerSpec
+from odin.settings import settings
 from odin.util import atomic_write_text, private_mkdir
 
 log = logging.getLogger("odin.fabric.sidecar")
@@ -105,11 +105,6 @@ ENTRYPOINT ["/usr/local/bin/nebula", "-config", "/etc/nebula/config.yml"]
 # user-mode gateway differs.
 HOST_GATEWAY_IP = "192.168.5.2"
 
-# Mesh membership for backings is OFF unless this env actually has a Nebula
-# network (`ensure_network` ran, i.e. the canvas has a VPC) -- an env of bare
-# s3/sqs nodes with no network drawn pays nothing. `ODIN_BACKING_MESH=0`
-# disables it outright.
-_DISABLE_ENV = "ODIN_BACKING_MESH"
 
 
 # The groups baked into the certificate this member is currently holding,
@@ -122,7 +117,7 @@ _GROUPS_FILE = "groups.json"
 
 
 def underlay_ip() -> str:
-    return os.environ.get("ODIN_MESH_UNDERLAY") or HOST_GATEWAY_IP
+    return settings.mesh.underlay or HOST_GATEWAY_IP
 
 
 def _recorded_groups(member_dir: Path) -> list[str] | None:
@@ -178,7 +173,11 @@ class MeshSidecar:
 
     # ---- state ----
     def enabled(self) -> bool:
-        return os.environ.get(_DISABLE_ENV, "1") != "0" and (self._nebula_dir() / "ca.crt").exists()
+        """Mesh membership for backings is OFF unless this env actually has a
+        Nebula network (`ensure_network` ran, i.e. the canvas has a VPC) -- an
+        env of bare s3/sqs nodes with no network drawn pays nothing.
+        `ODIN_BACKING_MESH=0` disables it outright."""
+        return settings.mesh.backing_mesh != "0" and (self._nebula_dir() / "ca.crt").exists()
 
     def overlay_ip(self, member: str) -> str | None:
         """This member's sticky overlay address, or None if it never joined.
