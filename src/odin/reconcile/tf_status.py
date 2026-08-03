@@ -84,10 +84,16 @@ from odin.runtime.lima import LIMA_HOST
 from odin.simulate.workspace import tf_dir
 from odin.spec.models import ResourceObserved, World
 
+# Deduplicated in v0.8.19. This literal had grown TWO overlapping lines --
+# `"elasticache", "rds", "alb", "kms"` and `"elasticache", "rds", "alb", "ebs"`
+# -- a merge artifact from the kms and ebs work landing in one release out of two
+# worktrees, each adding its own kind to its own copy of the tail. A set literal
+# makes that harmless to evaluate and invisible to every test, which is exactly
+# why it survived: `test_tf_status.py` pins the resulting SET, and the set was
+# right. Kept as one line per group so the next addition has nowhere to hide.
 TF_OWNED_KINDS = frozenset({
     "vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr", "logs", "secret", "ssm",
-    "elasticache", "rds", "alb", "kms",
-    "elasticache", "rds", "alb", "ebs",
+    "elasticache", "rds", "alb", "kms", "ebs", "route53",
 })
 
 # An EBS volume's own states (gateway/models/ec2compute.py's volume records)
@@ -340,6 +346,75 @@ def _kms_keys(stores: SynthStores, env: str) -> Projected:
         label = tags.get(kmsctl.NODE_TAG)
         if label:
             out[label] = ("kms", "healthy", {}, None)
+    return out
+
+
+# v0.8.19: the record types `route53ctl` mints for a zone at creation and that
+# NOBODY drew. Real CreateHostedZone makes an SOA and an NS pair, which is why a
+# fresh zone's `ResourceRecordSetCount` is 2 and not 0. They must not count as
+# drawn records here, or every zone would look like it serves something.
+_ROUTE53_AUTO_TYPES = frozenset({"SOA", "NS"})
+
+
+def _route53_zones(stores: SynthStores, env: str, overlay: dict[str, str]) -> Projected:
+    """A `route53` node exists once tofu's CreateHostedZone landed.
+
+    THE LABEL NEEDS NO TAG, and this is the one projector where that is true by
+    construction rather than by luck: a hosted zone's id IS its domain name
+    (`route53ctl`'s deviation 1 -- `classify.py` cannot recover a canvas label
+    from the wire, because only the create body carries the name and every call
+    after it carries an opaque id in the path, so the id is DERIVED from the
+    name instead of minted). `agent/hcl.py::_route53` emits `name = <label>` and
+    refuses a label that is not a valid DNS name, so `record["zone_id"]` and the
+    canvas label are the same string. No `stores.tags` lookup, and no untagged-
+    resource hole of the kind `_kms_keys` has to skip around.
+
+    THE PHASE IS NOT ALWAYS `healthy`, AND THAT IS THE WHOLE POINT OF THIS
+    FUNCTION. odin resolves a name with a hosts entry, and which address works
+    depends on who is asking: a container reaches an instance's `private_ip`,
+    but a VM CANNOT reach another VM's -- stock Lima `vz` NATs each VM into its
+    own isolated address space and a raw ping between two VMs' vzNAT addresses
+    is 100% loss, before nebula is involved (`fabric/nebula.py`'s R5 note). VMs
+    are served the Nebula OVERLAY address instead, so in an env with more than
+    one VM and no mesh there is NO address that would work and odin writes no
+    hosts line at all.
+
+    Withholding was the first design and it was wrong. It was modelled on
+    `_ec2_facts` dropping `MESH_IP` when the lighthouse is down -- the right
+    INPUT, and the wrong whole story. CLAUDE.md honesty rule 1 lists "the mesh
+    gate withheld facts that never reached World" among four guards that
+    silently never fired; a user drawing a record, watching the tile go green
+    and getting no resolution and no reason is that bug rebuilt deliberately. So
+    the zone reports `crashed` with the real reason -- the same phase and the
+    same channel `_ALB_PHASE` uses for a load balancer that exists and does not
+    serve, naming what is still standing: the zone is real, its records are
+    real, and this env cannot deliver them to a VM.
+    """
+    out: Projected = {}
+    vms = [record for record in stores.ec2compute.items(env).values() if "instance_id" in record]
+    # Only a SECOND VM makes VM-to-VM resolution something a user can want; a
+    # lone VM resolving a name that points at itself is served by the container
+    # path and by its own interface. Checked against the real overlay
+    # assignments (`_overlay_assignments`) rather than against "is nebula
+    # configured", because an assignment is the thing that actually exists.
+    unreachable = len(vms) > 1 and not any(overlay.get(vm["instance_id"]) for vm in vms)
+    for key, record in stores.route53ctl.items(env).items():
+        if not key.startswith("zone:"):
+            continue
+        label = record.get("zone_id")
+        drawn = [
+            rrset for rrset in stores.route53ctl.get(env, f"rrset:{label}", [])
+            if rrset.get("type") not in _ROUTE53_AUTO_TYPES
+        ]
+        verdict = (
+            f"{len(drawn)} record(s) cannot be served to a VM in this env: {len(vms)} EC2 "
+            "instances and no Nebula overlay address for any of them. A VM cannot reach "
+            "another VM's private address on stock Lima vz (100% loss), so odin writes no "
+            "/etc/hosts line rather than one that resolves and hangs. Container consumers "
+            "are unaffected"
+        ) if (unreachable and drawn) else None
+        if label:
+            out[label] = ("route53", "crashed" if verdict else "healthy", {}, verdict)
     return out
 
 
@@ -815,6 +890,18 @@ async def project(
     out.update(_lambda_functions(stores, env))
     out.update(await _ecs_services(stores, env, ecs_runtime))
     out.update(_cache_clusters(stores, env))
+    # A SECOND `_overlay_assignments` read in the same projection, not a shared
+    # snapshot -- `_ec2_instances` computes its own and does not hand it back.
+    # Stated rather than glossed, because the two CAN disagree if `overlay.json`
+    # is rewritten between them, and a zone reporting "no mesh" beside an
+    # instance reporting a `MESH_IP` would be a contradiction on one screen.
+    # Accepted for now: the read is a side-effect-free load of one small file
+    # (`NebulaManager.load_overlay`'s own contract -- no mkdir, no allocation),
+    # the window is microseconds, and the write that could land inside it is an
+    # instance boot, which moves this zone from unservable to servable rather
+    # than the reverse. If that stops being true, hoist the read into `project`
+    # and pass it to both rather than adding a third.
+    out.update(_route53_zones(stores, env, _overlay_assignments(stores, env)))
     # The live container check, applied over whatever the records claimed. Facts
     # go with it: a database that isn't running must stop advertising a
     # DATABASE_URL nothing can connect to -- the stale-green fact `_db_facts`

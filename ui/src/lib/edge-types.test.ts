@@ -21,6 +21,7 @@ import {
   edgeDataForConnection,
   edgeStyle,
   edgeTypes,
+  dnsTargetTypes,
   encryptionTargetTypes,
   iamActionsForTarget,
   iamTargetTypes,
@@ -209,6 +210,56 @@ describe('the encryption edge (kms -> the sidecars odin holds keys for)', () => 
   });
 });
 
+describe('the dns edge (route53 -> the one kind a hosts entry can name)', () => {
+  it('route53 <-> ec2 is a DNS RECORD, not the catch-all', () => {
+    // It emits a real `aws_route53_record`, and the substrate is real name
+    // resolution: an `--add-host` on every container in the env and an
+    // `/etc/hosts` line on every Lima VM in it.
+    expect(detectEdgeTypes('route53', 'ec2')).toEqual(['dns']);
+    expect(detectEdgeTypes('ec2', 'route53')).toEqual(['dns']);
+    expect(edgeTypes.dns.label).toBe('DNS Record');
+  });
+
+  it('renders as itself rather than a grey fallback', () => {
+    expect(edgeStyle('dns').stroke).toBe(edgeTypes.dns.color);
+    expect(edgeStyle('dns').stroke).not.toBe(edgeTypes[UNMODELLED].color);
+  });
+
+  it('carries no permissions — resolving a name is not a grant', () => {
+    // route53 declares no `iamActions` on purpose: a workload does not resolve a
+    // name by making a signed AWS call, it reads a hosts file, which consults
+    // nobody. Giving it actions would also make this pair AMBIGUOUS -- `pairKey`
+    // sorts, so the `computeTypes x iamTargets` loop would land `iam` on the very
+    // key `dns` uses, and `edge-ambiguity.test.ts` would fail naming it.
+    expect(edgeDataForConnection('route53', 'ec2').permissions).toEqual([]);
+    expect(iamActionsForTarget.route53).toBeUndefined();
+    expect(iamTargetTypes.has('route53')).toBe(false);
+  });
+
+  it('is limited to the one kind that publishes an address a hosts entry can hold', () => {
+    // NOT a deferral. A hosts entry is `<ip> <name>` -- no port, no scheme --
+    // and measured against the real projectors in `reconcile/tf_status.py` only
+    // ec2 publishes that shape (`PRIVATE_IP`). An alb publishes
+    // `http://127.0.0.1:<dynamic port>` and rds a `host:port`, so a name pointing
+    // at either would resolve and then fail to connect. `hcl.py` declines those
+    // by name; the canvas must not offer them in the first place.
+    expect([...dnsTargetTypes]).toEqual(['ec2']);
+    for (const kind of ['alb', 'rds', 'ecs', 'lambda', 's3']) {
+      expect(detectEdgeTypes('route53', kind)).not.toContain('dns');
+    }
+  });
+
+  it('is PRESENTATIONAL — the record pass may not gate on the name', () => {
+    // Sharper here than for `target`/`subscription`/`volume`: `route53` has been
+    // a DRAWABLE catalog tile since long before it had a builder, so canvases
+    // whose route53 edge is typed `network` already exist. A pass requiring
+    // `kind === 'dns'` would emit no record for a single one of them.
+    // `agent/hcl.py`'s record pass keys on the two NODE kinds instead.
+    expect(edgeTypes.dns).toBeDefined();
+    expect(edgeTypes.network).toBeDefined();
+  });
+});
+
 describe('the renamed catch-all', () => {
   it('an unmodelled pair says so instead of claiming to be a network', () => {
     // s3 is NOT an encryption target -- nothing odin runs encrypts a RustFS
@@ -277,10 +328,35 @@ describe('the counts in docs/limits.md are measured, not written', () => {
     expect(LIMITS).toContain(`\`unmodelled\` — ${unmodelled} of the ${total} unordered`);
   });
 
-  it('states the right per-type counts for the two it enumerates', () => {
+  it('states the right per-type count for EVERY type it enumerates', () => {
+    // It used to check three of the nine, and the six unchecked ones were where
+    // the paragraph actually rotted: `volume` and `encryption` landed in one
+    // release from two worktrees, each edit rewrote the enumeration, and the
+    // result was a DUPLICATED bullet claiming both 47 and 42 typed pairs. This
+    // assertion is `toContain`, so the wrong copy could sit beside the right one
+    // for ever without failing anything. Pinning all nine is what makes a
+    // half-merged enumeration fail instead of merely looking odd.
     const { byType } = counts();
     expect(LIMITS).toContain(`\`iam\`\n  (${byType.iam} pairs, a real policy)`);
+    expect(LIMITS).toContain(`\`connection\` **and** \`iam\` together (${byType.connection})`);
     expect(LIMITS).toContain(`\`sg\` (${byType.sg}, security-group membership)`);
     expect(LIMITS).toContain(`\`target\` (${byType.target} —`);
+    expect(LIMITS).toContain(`\`role\` (${byType.role} —`);
+    expect(LIMITS).toContain(`\`subscription\` (${byType.subscription} —`);
+    expect(LIMITS).toContain(`\`volume\` (${byType.volume} —`);
+    expect(LIMITS).toContain(`\`encryption\` (${byType.encryption} —`);
+    expect(LIMITS).toContain(`\`dns\` (${byType.dns} —`);
+  });
+
+  it('enumerates every type the registry can actually answer', () => {
+    // The half `toContain` cannot see: a NEW edge type would add a line to the
+    // prose that nothing above asks for, so the counts would all still match
+    // while the paragraph quietly under-reported what a canvas can mean. Every
+    // type that is the primary answer for at least one pair must be named.
+    const { byType } = counts();
+    const unnamed = Object.keys(byType)
+      .filter((type) => type !== UNMODELLED)
+      .filter((type) => !LIMITS.includes(`\`${type}\``));
+    expect(unnamed).toEqual([]);
   });
 });

@@ -235,27 +235,80 @@ They are listed because finding one by surprise is worse than reading it here.
   backings and the prune, and reads a cached drift result instead of sweeping. ECS
   stays genuinely live because its task sweep runs on every one of those ticks;
   EC2, Lambda and RDS drift can be up to one sweep cadence stale for the duration.
-- **A drawn edge carries a modelled TYPE for only 47 of the 378 kind pairs.**
-  The honest majority answer is `unmodelled` — 331 of the 378 unordered pairs,
-- **A drawn edge carries a modelled TYPE for only 42 of the 378 kind pairs.**
-  The honest majority answer is `unmodelled` — 336 of the 378 unordered pairs,
+- **A drawn edge carries a modelled TYPE for only 48 of the 378 kind pairs.**
+  The honest majority answer is `unmodelled` — 330 of the 378 unordered pairs,
   drawn as a grey line labelled *Not modelled*, stored in the Stack and read by
   nothing. It was called `network` until v0.8.14, which was a claim about layer 3
-  that odin never checked. Re-measured 2026-07-29 over the real 27 canvas kinds,
+  that odin never checked. Re-measured 2026-08-02 over the real 27 canvas kinds,
   the pairs that do mean something: `iam`
   (34 pairs, a real policy), `connection` **and** `iam` together (4),
   `sg` (2, security-group membership), `target` (2 — `alb ↔ ecs`, and since
-  v0.8.15 `alb ↔ ec2`), `volume` (1 — `ebs ↔ ec2`, a real block device on a real VM),
+  v0.8.15 `alb ↔ ec2`), `role` (1 — `iam_role ↔ lambda`),
+  `subscription` (1 — `sns ↔ sqs`),
+  `volume` (1 — `ebs ↔ ec2`, a real `aws_volume_attachment`, and behind it a
+  real `limactl disk` in a real Lima VM),
   `encryption` (2 — `kms ↔ secret|ssm`, the only two sidecars odin holds the
   plaintext of; `kms ↔ s3|rds|dynamodb` stays `unmodelled` ON PURPOSE, because
   those live in RustFS, Postgres and dynalite containers odin holds no key for
-  and a line there would claim an encryption that does not happen),
-  `role` (`iam_role ↔ lambda`) and `subscription`
-  (`sns ↔ sqs`). Drawing anything else is decoration, and now
-  v0.8.15 `alb ↔ ec2`), `role` (`iam_role ↔ lambda`), `subscription`
-  (`sns ↔ sqs`) and, since v0.8.18, `volume` (`ebs ↔ ec2`, a real
-  `aws_volume_attachment`). Drawing anything else is decoration, and now
-  says so.
+  and a line there would claim an encryption that does not happen), and, since
+  v0.8.19, `dns` (1 — `route53 ↔ ec2`, a real `aws_route53_record`, and behind
+  it real name resolution: an `--add-host` entry on every container in the env
+  and an `/etc/hosts` line on every Lima VM in it). Drawing anything else is
+  decoration, and now says so.
+  This paragraph was DUPLICATED — two openings claiming 47 and 42, and two
+  overlapping enumerations — until v0.8.19, a merge artifact from the `volume`
+  and `encryption` work landing in one release out of two worktrees. The
+  recomputation in `ui/src/lib/edge-types.test.ts` uses `toContain`, so it
+  passed against whichever copy happened to be right and the wrong one sat there
+  unread: prose that cannot fail, which is the exact shape this file complains
+  about elsewhere. That test now pins EVERY per-type count above, not three of
+  them.
+- **A `dns` edge to an alb or an rds is REFUSED BY NAME on Apply**, rather than
+  silently dropped. A hosts entry is `<ip> <name>`: it carries no port and no
+  scheme. Measured 2026-08-02 against the real projectors in
+  `reconcile/tf_status.py`, an alb publishes `http://127.0.0.1:<dynamic port>`
+  (dynamic so two load balancers, or two envs, cannot collide on 80) and an rds
+  publishes `host.docker.internal:<port>`, so a name pointing at either would
+  resolve and then fail to connect — a green resource that does not work. Only
+  `ec2` publishes a bare address (`PRIVATE_IP`), so `route53 ↔ ec2` is the whole
+  of the edge; every other target stays `unmodelled` on the canvas and
+  `agent/hcl.py::_dns_target_unsupported` names the target and the reason in the
+  apply's `unsupported` list.
+  The emitted TTL (60s) exists so the generated project stays portable to Amazon;
+  odin's own substrate is a hosts FILE and has no TTL at all, so a changed
+  record lands on the next container launch or hosts push.
+- **A `dns` record resolves to a DIFFERENT address depending on who is asking,
+  and for a VM with no mesh it does not resolve at all.** This is the sharper
+  half of the entry above and it was got wrong first time, so it is stated in
+  full. The emitted `aws_route53_record` carries `aws_instance.<n>.private_ip` —
+  the portable, AWS-shaped answer, and a pure function of the canvas, because
+  making `main.tf` depend on runtime mesh state would break the round trip and
+  show `tofu plan` drift with nothing changed. What odin writes into a hosts
+  file is not always that value:
+
+  | consumer | address written | why |
+  |---|---|---|
+  | container | the instance's `private_ip` | measured reachable |
+  | VM | the instance's Nebula **overlay** address | `private_ip` is **100% packet loss** VM→VM |
+  | VM, env with no mesh | **nothing is written** | there is no address that would work |
+
+  Stock Lima `vz` NATs each VM into its OWN isolated address space: a raw ping
+  between two VMs' vzNAT addresses is 100% loss *before nebula is involved*
+  (`fabric/nebula.py`'s R5 note, confirmed live with two real VMs — it is why
+  VM-to-VM traffic relays through the lighthouse at all). So handing a VM a
+  `private_ip` would be a name that resolves and then hangs, which is this
+  kind's own trap one layer down. The divergence between the emitted argument
+  and the substrate is the same shape as EBS's advisory `device_name`.
+
+  **The no-mesh case is REPORTED in World, not merely withheld**, and that
+  correction is the point. The first design simply wrote no hosts line —
+  modelled on `tf_status._ec2_facts` dropping `MESH_IP` when the lighthouse is
+  down. That is the right INPUT and the wrong whole story: honesty rule 1 lists
+  *"the mesh gate withheld facts that never reached World"* among the four
+  guards that silently never fired, and a user drawing a record, watching the
+  tile go healthy and getting no resolution and no reason is that bug rebuilt on
+  purpose. The resource reports a non-healthy phase naming what is still
+  standing — the record, the address it wanted, and that this env has no mesh.
   Three more pairs carry a SECOND meaning on top of the grant, added in
   v0.8.15 because a permission whose subject is not wired is the same
   decoration under a colour: `logs ↔ lambda|ecs` decides which group the

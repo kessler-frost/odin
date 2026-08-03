@@ -102,7 +102,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from odin.compute.cloud_init import generate_cloud_init
+from odin.compute.cloud_init import generate_cloud_init, hosts_block_script
 from odin.compute.lima_yaml import additional_disks, generate_lima_yaml
 from odin.compute.models import VmConfig
 from odin.fabric.models import FirewallRules
@@ -285,6 +285,19 @@ def instance_config_path(root: Path, env: str, host_id: str) -> Path:
     never go stale across a recreate either -- a recreated instance is a NEW
     instance id, so it gets a fresh path."""
     return Path(root) / env / "nebula" / "instances" / host_id / "config.yml"
+
+
+def instance_hosts_path(root: Path, env: str, host_id: str) -> Path:
+    """`instance_config_path`'s twin for the route53 entries odin last landed
+    in this VM's `/etc/hosts`.
+
+    Same trick, same reason: comparing against a local file makes an unchanged
+    record set cost ZERO `limactl shell` calls, which is what lets
+    `push_hosts` run for every instance on every Apply without churning. And
+    the same safety rule -- written only AFTER the guest has taken the change,
+    so a push that failed half-way is retried by the next Apply instead of
+    being remembered as done."""
+    return instance_config_path(root, env, host_id).with_name("hosts.json")
 
 
 def instance_membership_path(root: Path, env: str, host_id: str) -> Path:
@@ -475,6 +488,7 @@ class InstanceVm:
         timeout: float | None = None,
         env_vars: dict[str, str] | None = None,
         disks: list[str] | None = None,
+        hosts: dict[str, str] | None = None,
     ) -> str:
         """Create + start a fresh VM, wait for its vzNAT IP, return it.
         Raises on any failure (boot timeout, a `limactl` error) -- the
@@ -486,7 +500,7 @@ class InstanceVm:
         extra = _extra_provision_script(await self._nebula_files(nebula), user_data)
         script = generate_cloud_init(
             hostname=hostname, ssh_pubkey=ssh_pubkey, extra_script=extra, env_vars=env_vars,
-            install_nebula=nebula is not None,
+            install_nebula=nebula is not None, hosts=hosts,
         )
         yaml_doc = generate_lima_yaml(
             vm_config, cloud_init_script=script, shared_network=True, disks=disks or [],
@@ -614,6 +628,69 @@ class InstanceVm:
             lighthouse_port=network.lighthouse_port,
             firewall_revision=nebula.revision,
         )
+
+    async def push_hosts(self, name: str, root: Path, env: str, host_id: str, hosts: dict[str, str]) -> str:
+        """Make a RUNNING VM's `/etc/hosts` say exactly `hosts`, without a
+        reboot. Returns what it did: `unchanged` / `pushed` / `failed`.
+
+        THIS METHOD IS WHY route53 RECORDS ARE NOT FROZEN AT BOOT.
+        `generate_cloud_init` runs once, inside `limactl create` (see `boot`),
+        and its bytes are then baked into the instance's own lima.yaml --
+        `limactl start` re-runs the SAME script, and `limactl edit` refuses a
+        running instance outright (`level=fatal msg="cannot edit a running
+        instance"`, the note in the EBS block below). So a record edited after
+        an instance booted could never reach it through cloud-init, which is
+        exactly the shape of bug `refresh_nebula` exists to fix one layer over
+        -- a control the canvas shows as applied and the guest never sees.
+
+        NO CHURN, on the same contract `refresh_nebula` holds: an unchanged
+        record set is one local file read and nothing else -- no `limactl`, no
+        subprocess. That matters because this is meant to run for every
+        running instance on every Apply.
+
+        Never raises. A mesh/DNS wiring failure must not fail an Apply on its
+        own (`_activate_nebula`'s rule) -- but `failed` is a real answer the
+        caller is expected to act on, not a shrug, exactly as
+        `refresh_nebula`'s is.
+        """
+        try:
+            return await self._push_hosts(name, root, env, host_id, hosts)
+        except Exception as exc:  # noqa: BLE001 -- deliberately broad, see docstring
+            log.warning("hosts push failed for %s: %s", name, exc)
+            return "failed"
+
+    async def _push_hosts(self, name: str, root: Path, env: str, host_id: str, hosts: dict[str, str]) -> str:
+        record = instance_hosts_path(root, env, host_id)
+        # Compared as the RECORD SET, not as rendered bytes: two dicts that
+        # differ only in insertion order are the same set of names, and
+        # re-rendering them is churn. `hosts_block_script` sorts for the same
+        # reason.
+        #
+        # NO RECORD => PUSH, and `boot` deliberately does not write one even
+        # though it seeds the same block through cloud-init. The reason is
+        # specific rather than tidy: that provision script runs under `set -ux`
+        # and NOT `set -e` (`cloud_init.py`'s own note -- a failing command
+        # there must not hang `limactl start` forever), so a `sed` that failed
+        # inside it leaves the boot reporting success with the block never
+        # written. Recording at boot would therefore record a landing nobody
+        # observed. Costing one `limactl shell` per instance lifetime buys the
+        # guarantee that odin only ever claims what it watched succeed --
+        # `_reissue_cert` makes the same call for the same reason.
+        if record.exists() and json.loads(record.read_text()) == hosts:
+            return "unchanged"
+        script = hosts_block_script(hosts)
+        proc = await self._lima("shell", name, "--", "sudo", "bash", "-s", input=script, check=False)
+        if proc.returncode != 0:
+            # `_failure_reason`, not `proc.stderr or "no output"`: this is a
+            # `sudo bash -s`, whose real failure mode was MEASURED as
+            # `rc=9, stderr='', stdout=''` -- see `_lima`. The exit code is
+            # often the whole of the answer.
+            log.warning("could not write /etc/hosts on %s: %s", name, _failure_reason(proc))
+            return "failed"
+        # Recorded only now -- see `instance_hosts_path`.
+        atomic_write_text(record, json.dumps(hosts, sort_keys=True))
+        log.info("wrote %d route53 entr%s into %s's /etc/hosts", len(hosts), "y" if len(hosts) == 1 else "ies", name)
+        return "pushed"
 
     async def _push_config(self, name: str, nebula: NebulaJoin, config: str) -> None:
         """Write the config INTO the VM and record what we put there."""

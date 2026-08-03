@@ -71,10 +71,16 @@ def _param(name: str, value: str = "v") -> dict:
 def test_tf_owned_kinds_excludes_reconciler_owned_kinds():
     # s3/sqs/sns/dynamodb already get real World entries via the reconciler's
     # own PROVISIONED path -- this projection must never double-own them.
+    # Deduplicated in v0.8.19. This literal carried the SAME self-contradicting
+    # tail the source did -- one line ending "kms", the next "ebs", both
+    # repeating elasticache/rds/alb -- because the merge that produced the one in
+    # `tf_status.py` produced this one too. `tests/test_no_self_contradicting_sets
+    # .py` scans `src/` only, so it would not have caught this copy; noted here
+    # rather than widened, since that scanner's own commit records that including
+    # more surface gave 25 false positives against 1 real finding.
     assert TF_OWNED_KINDS == {
         "vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr", "logs", "secret", "ssm",
-        "elasticache", "rds", "alb", "kms",
-        "elasticache", "rds", "alb", "ebs",
+        "elasticache", "rds", "alb", "kms", "ebs", "route53",
     }
 
 
@@ -1510,3 +1516,111 @@ async def test_only_the_volume_key_family_is_projected_as_ebs(tmp_path):
 
     assert projected["web"][0] == "ec2"
     assert "decoy" not in projected
+
+
+# --- route53: the projector whose whole job is NOT saying healthy ------------
+
+
+def _zone(stores, label: str, records: list[dict] | None = None) -> None:
+    """A hosted zone as `route53ctl` really writes it: the zone id IS the domain
+    (its deviation 1), and CreateHostedZone always mints an SOA and an NS pair
+    that nobody drew."""
+    stores.route53ctl.set(ENV, f"zone:{label}", {"zone_id": label, "name": label})
+    stores.route53ctl.set(ENV, f"rrset:{label}", [
+        {"name": label, "type": "SOA", "values": ["ns. root. 1 7200 900 1209600 86400"]},
+        {"name": label, "type": "NS", "values": ["ns."]},
+        *(records or []),
+    ])
+
+
+def _a_record(fqdn: str, address: str) -> dict:
+    return {"name": fqdn, "type": "A", "ttl": 60, "values": [address]}
+
+
+def _running_vm(stores, n: int) -> None:
+    stores.ec2compute.set(ENV, f"instance:i-{n}", {
+        **_ec2_instance(f"i-{n}", "running"), "private_ip": f"192.168.64.{n}",
+    })
+    stores.tags.set(ENV, f"ec2:i-{n}", {"odin:node": f"vm{n}"})
+
+
+def _overlay(tmp_path, assignments: dict[str, str]) -> None:
+    nebula = tmp_path / ENV / "nebula"
+    nebula.mkdir(parents=True, exist_ok=True)
+    (nebula / "overlay.json").write_text(MeshNetwork(
+        network=ENV, subnets={"hosts": SubnetAllocation(
+            network=ENV, subnet="hosts", cidr="10.42.1.0/24",
+            next_ip=len(assignments) + 1, assignments=assignments,
+        )},
+    ).model_dump_json())
+
+
+async def test_a_zone_is_projected_under_its_domain_with_no_tag_lookup(tmp_path):
+    """The one projector that needs no `odin:node` tag, by construction rather
+    than by luck: a hosted zone's id IS its domain name, and `hcl.py::_route53`
+    emits `name = <label>`, so the two are the same string. Deliberately writes
+    NO tag at all -- if this ever starts needing one, that is a real change in
+    how the label travels and it should fail here."""
+    stores = SynthStores(tmp_path)
+    _zone(stores, "example.com")
+    assert (await project(stores, ENV))["example.com"] == ("route53", "healthy", {}, None)
+
+
+async def test_a_zone_serving_a_lone_vm_is_healthy(tmp_path):
+    """One VM cannot need VM-to-VM resolution. The container path serves it and
+    the VM reaches its own address, so there is nothing unservable to report."""
+    stores = SynthStores(tmp_path)
+    _running_vm(stores, 1)
+    _zone(stores, "example.com", [_a_record("api.example.com", "192.168.64.1")])
+
+    assert (await project(stores, ENV))["example.com"][1] == "healthy"
+
+
+async def test_two_vms_and_no_mesh_makes_the_zone_report_the_real_reason(tmp_path):
+    """THE POINT OF THIS PROJECTOR. A VM cannot reach another VM's private
+    address on stock Lima vz -- 100% loss, before nebula is involved -- so odin
+    writes no /etc/hosts line at all. Withholding silently is the bug CLAUDE.md
+    rule 1 names ("the mesh gate withheld facts that never reached World"), so
+    the zone must NOT read healthy and must carry the reason.
+
+    Mutation-test: make `unreachable` always False and this fails."""
+    stores = SynthStores(tmp_path)
+    _running_vm(stores, 1)
+    _running_vm(stores, 2)
+    _zone(stores, "example.com", [_a_record("vm1.example.com", "192.168.64.1")])
+
+    kind, phase, _, verdict = (await project(stores, ENV))["example.com"]
+    assert (kind, phase) == ("route53", "crashed")
+    assert verdict is not None
+    # Names what is still standing: how many records, how many VMs, the real
+    # cause, and who is NOT affected.
+    assert "1 record(s)" in verdict and "2 EC2 instances" in verdict
+    assert "no Nebula overlay address" in verdict
+    assert "Container consumers are unaffected" in verdict
+
+
+async def test_two_vms_WITH_a_mesh_is_healthy_again(tmp_path):
+    """The other side of the same guard: once the overlay really has addresses,
+    the VM path is servable and nothing is reported. Without this the test above
+    would also pass against a projector that ALWAYS says crashed."""
+    stores = SynthStores(tmp_path)
+    _running_vm(stores, 1)
+    _running_vm(stores, 2)
+    _zone(stores, "example.com", [_a_record("vm1.example.com", "192.168.64.1")])
+    _overlay(tmp_path, {"i-1": "10.42.1.1", "i-2": "10.42.1.2"})
+
+    assert (await project(stores, ENV))["example.com"][1] == "healthy"
+
+
+async def test_a_zone_with_only_its_auto_records_is_healthy_even_with_no_mesh(tmp_path):
+    """An empty hosted zone serves nothing, so there is nothing it fails to
+    serve. The SOA/NS pair route53ctl mints on create must not count as drawn
+    records -- if they did, EVERY zone in a mesh-less env would read crashed.
+
+    Mutation-test: drop the `_ROUTE53_AUTO_TYPES` filter and this fails."""
+    stores = SynthStores(tmp_path)
+    _running_vm(stores, 1)
+    _running_vm(stores, 2)
+    _zone(stores, "example.com")
+
+    assert (await project(stores, ENV))["example.com"][1] == "healthy"

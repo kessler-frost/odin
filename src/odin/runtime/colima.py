@@ -86,6 +86,33 @@ class ContainerSpec:
     network: str | None = None
     cap_add: tuple[str, ...] = ()
     devices: tuple[str, ...] = ()
+    # route53: extra name -> IPv4 entries for this container's /etc/hosts,
+    # emitted as `--add-host name:ip`. This is how a DRAWN DNS record becomes
+    # real resolution for a container consumer -- `getent hosts api.internal`
+    # answers, because docker really wrote the line.
+    #
+    # A dict keyed by name, so one name cannot appear twice with two addresses
+    # (the argv would carry both and the resolver would silently pick one).
+    # Emitted in SORTED order for a deterministic argv: the set comes from a
+    # store whose iteration order is not meaningful, and an argv that reorders
+    # between two identical converges is one no caller can compare.
+    hosts: dict[str, str] = field(default_factory=dict)
+
+
+def _shares_namespace(network: str | None) -> bool:
+    """Does this `--network` value put the container in ANOTHER container's
+    network namespace, where `--add-host` is a hard docker error?
+
+    Keyed on the `container:` prefix specifically, and not on "any network",
+    because only that form is the one this repo has actually MEASURED docker
+    rejecting (`run_container`'s own note, and
+    `tests/runtime/test_colima_unit.py`). odin sets nothing else today --
+    `fabric/sidecar.py` is the only caller that sets `network` at all -- so a
+    caller that later introduces `--network host` or a named network owes
+    docker's real behaviour a probe before assuming this function covers it.
+    Guessing a broader rule here would refuse a combination that may be
+    perfectly legal, which is its own kind of wrong answer."""
+    return (network or "").startswith("container:")
 
 
 @dataclass(frozen=True)
@@ -319,12 +346,30 @@ class _ContainerRuntime:
         # `--add-host` together with `--network container:` outright ("conflicting
         # options"), and it needs none -- it inherits the target's /etc/hosts-less
         # networking wholesale (fabric/sidecar.py).
+        #
+        # `spec.hosts` hits that SAME documented conflict, and the two are handled
+        # differently on purpose. `_run_flags()` is odin's own infrastructure alias
+        # (`host.docker.internal`), so dropping it for a sidecar is correct and
+        # silent. `spec.hosts` is a DRAWN route53 record: dropping it silently
+        # would leave a name that the canvas says resolves and the container says
+        # does not -- a decorative record, which is the exact failure this feature
+        # exists to avoid. There is no honest way to honour it here, so the
+        # combination is refused rather than quietly discarded.
+        if spec.hosts and _shares_namespace(spec.network):
+            raise ValueError(
+                f"cannot give {spec.name} DNS entries ({', '.join(sorted(spec.hosts))}) while it "
+                f"shares another container's network namespace ({spec.network}): docker rejects "
+                f"--add-host with --network container: as conflicting options. It resolves names "
+                f"through the namespace it joined, so the entries belong on THAT container."
+            )
         args = [
             "run", "-d", "--name", spec.name, *([] if spec.network else self._run_flags()),
             "--label", f"{LABEL}=1", "--label", f"{LABEL}.name={spec.name}",
         ]
         if spec.network:
             args += ["--network", spec.network]
+        for name, address in sorted(spec.hosts.items()):
+            args += ["--add-host", f"{name}:{address}"]
         for capability in spec.cap_add:
             args += ["--cap-add", capability]
         for device in spec.devices:

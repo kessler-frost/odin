@@ -83,6 +83,7 @@ _KIND = {
     "alb": "alb",
     "kms": "kms",
     "ebs": "ebs",
+    "route53": "route53",
 }
 
 
@@ -364,6 +365,15 @@ SNS_SUBSCRIPTION = "subscription"
 # make the next apply detach a disk with data on it.
 VOLUME_ATTACHMENT = "volume"
 
+# "This zone resolves that instance's name" -- an `aws_route53_record`, and
+# behind it a REAL hosts entry (`--add-host` on every container in the env,
+# `/etc/hosts` on every VM). PRESENTATIONAL in the same sense as the three
+# above: `agent/hcl.py`'s record pass keys on the two NODE KINDS, and it must
+# stay that way -- `route53` has been a drawable catalog tile since long before
+# it had a builder, so a canvas whose route53 edge still says `network` would
+# silently lose its record if the pass gated on this name.
+DNS_RECORD = "dns"
+
 # "This workload's environment is wired to that producer's endpoint" -- folded
 # into the consumer's `refs` by `_merge_connection_edges` below.
 CONNECTION = "connection"
@@ -390,8 +400,8 @@ LEGACY_UNMODELLED = "network"
 
 EDGE_KINDS = frozenset({
     "iam", SG_MEMBERSHIP, ROLE_ASSUMPTION, ALB_TARGET, SNS_SUBSCRIPTION,
-    CONNECTION, ENCRYPTION, UNMODELLED, LEGACY_UNMODELLED, "ref",
-    CONNECTION, VOLUME_ATTACHMENT, UNMODELLED, LEGACY_UNMODELLED, "ref",
+    CONNECTION, ENCRYPTION, VOLUME_ATTACHMENT, DNS_RECORD,
+    UNMODELLED, LEGACY_UNMODELLED, "ref",
 })
 
 # Kinds whose HCL reads `securityGroups` (`agent/hcl.py::_security_group_refs`,

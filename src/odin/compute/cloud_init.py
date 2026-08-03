@@ -6,6 +6,60 @@ from __future__ import annotations
 # file's own existing NERDCTL_VERSION/BUILDKIT_VERSION convention below.
 NEBULA_VERSION = "1.10.3"
 
+# The markers delimiting the ONLY part of a VM's /etc/hosts odin owns.
+#
+# /etc/hosts is NOT odin's file, which is what makes this different from the
+# `/etc/environment` section below. That file odin writes wholesale; this one
+# arrives already carrying the image's loopback entries and the hostname line
+# Lima sets, and destroying those breaks name resolution for the whole guest.
+# So odin claims a delimited block and rewrites exactly that, leaving every
+# other line untouched.
+HOSTS_BEGIN = "# ODIN-ROUTE53-BEGIN"
+HOSTS_END = "# ODIN-ROUTE53-END"
+
+
+def hosts_block_script(hosts: dict[str, str]) -> str:
+    """Bash that makes odin's block in `/etc/hosts` say exactly `hosts`.
+
+    DELETE-THEN-APPEND, never append alone, and that is the same lesson the
+    `env_vars` section below records: this runs as a Lima PER-BOOT provision
+    script, so an append would duplicate every entry on every boot. Deleting
+    the old block first also makes REMOVAL work -- a record taken off the
+    canvas stops resolving, which an append-only writer could never achieve.
+
+    Emitting the delete unconditionally (even for an empty `hosts`) is what
+    makes "the last record was removed" a real state rather than a no-op.
+
+    The SAME function renders the boot path (`generate_cloud_init`) and the
+    in-place update path (`InstanceVm.push_hosts`) on purpose: identical
+    inputs must produce identical bytes, or the "did anything actually
+    change?" comparison that keeps an Apply churn-free would fire every time.
+    `fabric/nebula.py`'s `_render_config` is the same idea for the same
+    reason.
+
+    Sorted by name so the bytes are a function of the RECORD SET and not of
+    the store's iteration order.
+    """
+    for name, address in hosts.items():
+        # A name or address carrying whitespace would write a hosts line that
+        # means something else entirely, and a newline would write an arbitrary
+        # extra line into a system file. Refuse rather than mangle: this is the
+        # boundary where canvas-shaped text becomes a file the resolver obeys.
+        if not name or not address or any(c.isspace() for c in f"{name}{address}"):
+            raise ValueError(
+                f"refusing to write an /etc/hosts entry from {name!r} -> {address!r}: "
+                "a hosts name and address must both be non-empty and whitespace-free"
+            )
+    entries = "\n".join(f"{address}\t{name}" for name, address in sorted(hosts.items()))
+    return "\n".join([
+        f"sed -i '/^{HOSTS_BEGIN}$/,/^{HOSTS_END}$/d' /etc/hosts",
+        "cat >> /etc/hosts << 'ODIN_ETC_HOSTS'",
+        HOSTS_BEGIN,
+        *([entries] if entries else []),
+        HOSTS_END,
+        "ODIN_ETC_HOSTS",
+    ])
+
 
 def generate_cloud_init(
     hostname: str,
@@ -14,6 +68,7 @@ def generate_cloud_init(
     install_nebula: bool = False,
     extra_script: str | None = None,
     env_vars: dict[str, str] | None = None,
+    hosts: dict[str, str] | None = None,
 ) -> str:
     lines = [
         "#!/bin/bash",
@@ -65,6 +120,19 @@ def generate_cloud_init(
             "ODIN_AWS_CREDENTIALS",
             'chown -R "${LIMA_USER}:${LIMA_USER}" "/home/${LIMA_USER}/.aws"',
             'chmod 600 "/home/${LIMA_USER}/.aws/credentials"',
+        ])
+
+    if hosts is not None:
+        # BEFORE `extra_script` (the instance's own UserData) deliberately: a
+        # boot script that dials a drawn name must find it already resolving,
+        # or the record is real everywhere except the one place the user put
+        # their code. `is not None` rather than truthiness -- an EMPTY map is a
+        # meaningful instruction ("this VM should resolve nothing of odin's"),
+        # and it is how the last record being removed reaches the guest.
+        lines.extend([
+            "",
+            "# Resolve this env's route53 records (odin-owned block only)",
+            hosts_block_script(hosts),
         ])
 
     if install_nerdctl:

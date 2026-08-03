@@ -29,7 +29,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from odin.agent.hcl import _ALB_TARGET_KINDS, _VOLUME_HOST_KINDS
+from odin.agent.hcl import _ALB_TARGET_KINDS, _DNS_TARGET_KINDS, _VOLUME_HOST_KINDS
 
 REPO = Path(__file__).resolve().parents[2]
 IAM_TS = (REPO / "ui" / "src" / "lib" / "iam.ts").read_text()
@@ -48,6 +48,7 @@ def test_the_extraction_finds_something():
     assert _ts_set("computeTypes") == {"ec2", "lambda", "ecs"}
     assert _ALB_TARGET_KINDS, "hcl.py::_ALB_TARGET_KINDS is empty -- the import is wrong"
     assert _VOLUME_HOST_KINDS, "hcl.py::_VOLUME_HOST_KINDS is empty -- the import is wrong"
+    assert _DNS_TARGET_KINDS, "hcl.py::_DNS_TARGET_KINDS is empty -- the import is wrong"
 
 
 def test_alb_target_kinds_agree_across_the_language_boundary():
@@ -145,6 +146,38 @@ def test_every_volume_host_kind_is_a_real_canvas_kind():
     above vacuously true for it."""
     from odin.spec.translate import MODELLED_NODE_TYPES
     assert set(_VOLUME_HOST_KINDS) <= MODELLED_NODE_TYPES
+
+
+def test_dns_target_kinds_agree_across_the_language_boundary():
+    """v0.8.19's pair, and the one where the UI-wider direction is the sharper
+    lie of the two.
+
+    UI wider than the builder: the canvas draws an indigo "DNS Record" line to a
+    kind whose address is not something a hosts entry can express, so the user is
+    promised a NAME and gets nothing -- `hcl.py` declines the target by name and
+    emits no record. Worse than the usual "promised, never built", because the
+    thing promised is reachability: an app configured against that name fails to
+    resolve at runtime, far from the canvas that promised it.
+
+    Builder wider than the UI: `hcl.py` writes a real `--add-host` for a pair the
+    canvas labels "Not modelled", so a name is resolving inside every container
+    in the env and nothing on screen says where it came from.
+    """
+    ui, builder = _ts_set("dnsTargetTypes"), set(_DNS_TARGET_KINDS)
+    assert ui == builder, (
+        f"`ui/src/lib/iam.ts::dnsTargetTypes` is {sorted(ui)} but "
+        f"`agent/hcl.py::_DNS_TARGET_KINDS` is {sorted(builder)}.\n"
+        f"  only in the UI  (promised, never built): {sorted(ui - builder)}\n"
+        f"  only in the builder (built, labelled 'Not modelled'): {sorted(builder - ui)}\n"
+        "They must land in the same merge."
+    )
+
+
+def test_every_dns_target_kind_is_a_real_canvas_kind():
+    """The companion check: a kind the canvas cannot draw makes the agreement
+    above vacuously true for it."""
+    from odin.spec.translate import MODELLED_NODE_TYPES
+    assert set(_DNS_TARGET_KINDS) <= MODELLED_NODE_TYPES
 
 
 def test_role_holder_kinds_agree_across_the_language_boundary():

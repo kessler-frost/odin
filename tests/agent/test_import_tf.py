@@ -51,8 +51,13 @@ resource "aws_dynamodb_table" "items" {
 # about the unsupported-listing invariant, not about lambda, so they need a type
 # odin genuinely has no model for -- otherwise closing an import gap silently
 # turns "unsupported types are listed" into an assertion about nothing.
-resource "aws_route53_zone" "dns" {
-  name = "example.com"
+#
+# v0.8.19: it was `aws_route53_zone`, which is now imported TOO -- the third
+# occupant of this slot. `aws_kinesis_stream` is the one that stays: ROADMAP.md
+# records kinesis as DROPPED because it "has no substrate at all", so unlike its
+# two predecessors it is not merely waiting its turn.
+resource "aws_kinesis_stream" "events" {
+  name = "events"
 }
 '''
 
@@ -71,8 +76,8 @@ def test_full_project_parses_into_nodes_edges_and_unsupported():
     assert result.edges == [{"source": "alerts", "target": "jobs"}]
 
     assert len(result.unsupported) == 1
-    assert result.unsupported[0].type == "aws_route53_zone"
-    assert result.unsupported[0].name == "dns"
+    assert result.unsupported[0].type == "aws_kinesis_stream"
+    assert result.unsupported[0].name == "events"
 
 
 def test_grid_positions_are_on_the_20px_grid_in_220px_steps():
@@ -85,12 +90,12 @@ def test_grid_positions_are_on_the_20px_grid_in_220px_steps():
 
 
 def test_unsupported_type_never_dropped_even_when_alone():
-    result = parse_hcl_text('resource "aws_route53_zone" "dns" {\n  name = "example.com"\n}\n')
+    result = parse_hcl_text('resource "aws_kinesis_stream" "events" {\n  name = "events"\n}\n')
     assert result.nodes == []
     assert result.edges == []
     assert len(result.unsupported) == 1
-    assert result.unsupported[0].type == "aws_route53_zone"
-    assert result.unsupported[0].name == "dns"
+    assert result.unsupported[0].type == "aws_kinesis_stream"
+    assert result.unsupported[0].name == "events"
     assert "not supported" in result.unsupported[0].reason
 
 
@@ -120,7 +125,7 @@ def test_malformed_hcl_sets_parse_error_not_unsupported():
 
 
 def test_valid_file_with_only_unsupported_resources_has_no_parse_error():
-    result = parse_hcl_text('resource "aws_route53_zone" "dns" {\n  name = "example.com"\n}\n')
+    result = parse_hcl_text('resource "aws_kinesis_stream" "events" {\n  name = "events"\n}\n')
     assert result.parse_error is None
     assert len(result.unsupported) == 1
 
@@ -1124,8 +1129,20 @@ _EVERY_KIND_CANVAS = {
         # v0.8.18: same reason as `ecs` above -- `("ebs", "type")` claims odin
         # always emits gp3, and nothing here would have proved it.
         {"id": "n12", "type": "ebs", "data": {"label": "scratch", "size": "10"}},
+        # v0.8.19: the two `aws_route53_record` claims need a record to be
+        # checked against, and a record only exists for a route53 -> ec2 EDGE --
+        # so this canvas needs both nodes and the edge, not just a zone. A zone
+        # on its own emits no record at all and the assertion below would have
+        # failed on an empty list, which is precisely how it caught `ecs` and
+        # `ebs` before.
+        {"id": "n13", "type": "ec2",
+         "data": {"label": "api-server", "vpc": "net", "subnet": "web"}},
+        {"id": "n14", "type": "route53", "data": {"label": "example.com"}},
     ],
-    "edges": [{"id": "e1", "source": "n9", "target": "n10"}],
+    "edges": [
+        {"id": "e1", "source": "n9", "target": "n10"},
+        {"id": "e2", "source": "n14", "target": "n13", "data": {"edgeType": "dns"}},
+    ],
 }
 
 

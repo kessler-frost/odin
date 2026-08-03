@@ -114,10 +114,12 @@ To regenerate this diagram after editing `docs/diagrams/*.mmd`:
   owns the model and binds it to a substrate.
 - **Translation** (`src/odin/agent/`) is deterministic in both directions and
   no longer covers quite the same node kinds in both: canvas → Terraform
-  builds 20, and Terraform → canvas reads all 19 back across 28 resource types
-  that it models. The gap is `kms`, added in v0.8.18 — emitted and not yet
+  builds 21, and Terraform → canvas reads all 20 back across 30 resource types
+  that it models. The gap is still `kms`, added in v0.8.18 — emitted and not yet
   imported, so a project carrying an `aws_kms_key` does not round-trip through
-  the canvas. Stated rather than rounded away, because "both directions" was
+  the canvas. `route53` (v0.8.19) did NOT widen that gap: it is emitted and
+  imported in the same change, zone and record both. Stated rather than rounded
+  away, because "both directions" was
   true for eleven releases and is the sort of claim a reader keeps believing. Anything odin
   does not model is a LISTED unsupported entry rather than a silent omission.
   Equal node coverage is **not lossless**, and what it costs is listed rather

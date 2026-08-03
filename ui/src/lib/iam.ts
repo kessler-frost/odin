@@ -192,6 +192,18 @@ export const edgeTypes: Record<string, EdgeTypeDef> = {
   // an `aws_ebs_volume` alone attaches to nothing, so an ebs node drawn with no
   // volume edge is a real, free-standing `available` volume and says so.
   volume: { id: 'volume', label: 'Volume Attachment', color: '#a3e635', dashed: false },
+  // "This zone resolves that instance's name" -- it emits a real
+  // `aws_route53_record`, and behind that a real hosts entry: an `--add-host` on
+  // every container in the env and an `/etc/hosts` line on every Lima VM in it.
+  //
+  // Indigo, matching the Route 53 tile's own accent (`catalog.ts`'s
+  // `color: 'indigo'`, whose bundle is rgb 129,140,248), the rule `sg` states
+  // for red, `role` for amber and `encryption` for teal. SOLID, by the rule
+  // those same entries hold: dashed is reserved for an IDENTITY fact -- who may
+  // act as whom (`iam`, `role`) -- and a name resolving to an address is not
+  // one. It is a wire that carries a value, which puts it with `connection` and
+  // `volume` on the solid side.
+  dns: { id: 'dns', label: 'DNS Record', color: '#818cf8', dashed: false },
 };
 
 // Given a pair of node types (unordered), return which edge types are valid
@@ -357,6 +369,60 @@ for (const t of encryptionTargetTypes) register('kms', t, 'encryption');
 // generated file makes tofu DETACH a disk that has data on it.
 export const volumeHostTypes = new Set(['ec2']);
 for (const host of volumeHostTypes) register('ebs', host, 'volume');
+
+// A route53 -> ec2 edge is a DNS RECORD: it emits a real `aws_route53_record`,
+// and odin's substrate for that record is real name resolution -- an
+// `--add-host` entry on every container in the env and an `/etc/hosts` line on
+// every Lima VM in it. The edge is the ONLY thing that can say what a name
+// points AT: an `aws_route53_zone` on its own resolves nothing, so a route53
+// node with no dns edge is a real, empty hosted zone and says so.
+//
+// PRESENTATIONAL, like `target`, `subscription` and `volume`: `agent/hcl.py`'s
+// record pass keys on the two NODE KINDS and never reads `edge.kind`. Here that
+// is load-bearing rather than incidental -- `route53` has been a DRAWABLE
+// catalog tile since long before it had a builder, so canvases already exist
+// whose route53 edge is typed `network`. Gating the pass on this name would
+// emit no record for a single one of them: the exact destructive shape the
+// `subscription` note above spells out, and the `volume` note after it.
+//
+// Kept to `ec2` alone, and that limit is MEASURED, not a deferral. A hosts entry
+// is `<ip> <name>` -- no port, no scheme -- so the only kinds a name can point
+// at are the ones whose World fact is a bare address. Running the real
+// projectors in `reconcile/tf_status.py` gave exactly one. The SHAPES are the
+// finding; the digits are per-run and are deliberately not written down here:
+//   ALB -> {"ALB_ENDPOINT": "http://127.0.0.1:<dynamic port>"}  scheme + port
+//   RDS -> {"endpoint": "host.docker.internal:<dynamic port>", ...}
+//   EC2 -> {"PRIVATE_IP": <bare IPv4>, "MESH_IP": <bare IPv4>}
+// A name pointing at the alb would resolve to 127.0.0.1 and then fail to connect
+// on the listener port, which is a green resource that does not work. `hcl.py`
+// declines those BY NAME (`_dns_target_unsupported`) rather than emitting them.
+//
+// WHICH ADDRESS the name resolves to is NOT one answer, and that asymmetry is
+// the sharpest thing on this edge. The emitted Terraform carries
+// `aws_instance.<n>.private_ip` -- the portable, AWS-shaped value, true at
+// Amazon. odin's local SUBSTRATE resolves the name to whatever the CONSUMER can
+// actually reach, because a VM cannot reach another VM's private_ip at all:
+// stock Lima `vz` NATs each VM into its own isolated address space, and a raw
+// ping between two VMs' vzNAT addresses is 100% loss BEFORE nebula is involved
+// (`fabric/nebula.py`'s R5 note, confirmed live with two real VMs). Measured:
+//   container -> VM private_ip : reachable
+//   host      -> VM private_ip : reachable
+//   VM        -> VM private_ip : 100% LOSS
+// So a container gets `private_ip`, a VM gets the Nebula OVERLAY address, and a
+// VM in an env with no mesh gets NO hosts line -- there is no address that would
+// work. That last case is REPORTED in World rather than merely withheld: a
+// record that silently resolves nothing while the tile goes healthy is honesty
+// rule 1's "the mesh gate withheld facts that never reached World" rebuilt on
+// purpose. Same shape as ebs's advisory `device_name`: the emitted argument is
+// the portable truth, the substrate does what works, and the divergence is
+// stated as a measured limit rather than papered over. docs/limits.md carries
+// the full matrix.
+//
+// Same rule `sgMemberTypes`, `roleHolderTypes` and `volumeHostTypes` hold, and
+// pinned against `hcl.py::_DNS_TARGET_KINDS` by
+// tests/spec/test_edge_registry_matches_builders.py.
+export const dnsTargetTypes = new Set(['ec2']);
+for (const target of dnsTargetTypes) register('route53', target, 'dns');
 
 // The catch-all every unregistered pair falls to. Deliberately a NAMED type
 // with a definition, not a bare string, so `edgeStyle` and the ambiguity

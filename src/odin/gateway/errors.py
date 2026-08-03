@@ -4,6 +4,13 @@ produce (PRD R1: "Errors are protocol-correct per service"). The v1
 service set spans four wire protocols:
 
 - s3:            REST-XML, a bare ``<Error>`` document.
+- route53:       ALSO rest-xml, but its error envelope is the ``<ErrorResponse>
+                  <Error>`` one below, not S3's bare ``<Error>`` -- so it rides
+                  `_QUERY_XML_SERVICES` despite not being a query-protocol
+                  service. Verified by round-tripping both candidate bodies
+                  through `RestXMLParser` (the parser botocore picks for
+                  route53) and printing the parsed `Error` dict; see the
+                  constant's own note for what the AWS-JSON fallback did.
 - sns/iam/rds/
   elasticache/
   elbv2/sts:      query-XML, wrapped in ``<ErrorResponse><Error>...`` --
@@ -54,9 +61,25 @@ _JSON_TYPE_PREFIX = {
     "sqs": "com.amazonaws.sqs#",
 }
 
-# Services whose errors ride botocore's "query" protocol envelope
-# (``<ErrorResponse><Error>...``) -- see the module docstring.
-_QUERY_XML_SERVICES = ("sns", "iam", "rds", "elasticache", "elasticloadbalancing", "sts")
+# Services whose errors ride the ``<ErrorResponse><Error>...`` envelope -- see
+# the module docstring.
+#
+# `route53` is the one member that is NOT botocore's "query" protocol: it is
+# `rest-xml`, and it is here because its ERROR envelope is the query one
+# regardless. MEASURED by feeding candidate bodies through the parser botocore
+# actually picks for route53 (`RestXMLParser`) and printing what it returned:
+#
+#   <ErrorResponse><Error>...   -> {'Code': 'NoSuchHostedZone', 'Message': ...}
+#   <Error>...                  -> {'Code': 'NoSuchHostedZone', 'Message': ...}
+#   {"__type": ..., "message":} -> {'Code': '404', 'Message': 'Not Found'}
+#
+# That third line is why this is a required entry and not a tidiness one: the
+# AWS-JSON body at the bottom of `_respond`/`synth_error` is what route53 would
+# otherwise fall through to, and it LOSES the code odin wrote entirely -- the
+# caller is told "404 Not Found" instead of `NoSuchHostedZone`, so a provider
+# checking for a specific error code never sees it. Exactly the bug the s3 note
+# in `synth_error` below records, one service over, found the same way.
+_QUERY_XML_SERVICES = ("sns", "iam", "rds", "elasticache", "elasticloadbalancing", "sts", "route53")
 
 _STATUS = {
     "InvalidClientTokenId": 401,

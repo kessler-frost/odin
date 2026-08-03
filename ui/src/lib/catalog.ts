@@ -17,11 +17,17 @@
 // both ways: `(placeholder)` in a sublabel means Apply skips it, and nothing
 // else does. When a placeholder becomes real, the marker comes off in the same
 // commit that adds it to `_KIND`.
-// Today: kinesis, route53, apigateway, efs, events, ebs, eip, igw.
-// Today: kinesis, kms, route53, apigateway, efs, events, eip, igw.
-// (`ebs` came OFF this list in v0.8.18 -- it is a real `limactl disk` volume
-// on a real VM now, and the marker came off in the same commit that added it
-// to `_KIND`, exactly as the rule above requires.)
+// Today: kinesis, apigateway, efs, events, eip, igw.
+// (`kms`, `ebs` and `route53` each came OFF this list -- kms in W2.9, a real
+// sealed-at-rest key; ebs in v0.8.18, a real `limactl disk` volume on a real
+// VM; route53 in v0.8.19, a real hosts entry -- and each time the marker came
+// off in the same commit that added the kind to `_KIND`, exactly as the rule
+// above requires. There were TWO contradictory "Today" lines here until
+// v0.8.19, a merge artifact from kms and ebs landing in one release out of two
+// worktrees: each edit dropped its own kind and neither saw the other's, so one
+// line still called ebs a placeholder and the other still called kms one. Both
+// were wrong, and the test that pins this invariant could not see it, because
+// it reads CATALOG rather than this comment. Keep it to ONE line.)
 
 // `multiline`/`placeholder` mirror ConfigPanel's own FieldDef (catalogFields
 // spreads straight into it), so a catalog entry can declare a textarea field
@@ -354,11 +360,66 @@ export const CATALOG: ServiceDef[] = [
     // user that odin cannot enforce is odin claiming a protection it has not got.
     iamActions: ['ecr:GetAuthorizationToken', 'ecr:BatchGetImage', 'ecr:GetDownloadUrlForLayer', 'ecr:BatchCheckLayerAvailability', 'ecr:*'],
   },
+  // REAL as of v0.8.19: an `aws_route53_zone` per node, plus an
+  // `aws_route53_record` per edge drawn to an EC2 instance (`iam.ts`'s `dns`
+  // edge). The substrate is real name resolution -- an `--add-host` entry on
+  // every container in the env and an `/etc/hosts` line on every Lima VM in it.
+  // The label IS the domain: `agent/hcl.py::_route53` emits `name = <label>` and
+  // REFUSES a label that is not a valid DNS name rather than writing a record no
+  // resolver could ever match.
+  //
+  // The sublabel STATES THE LIMIT rather than merely dropping `(placeholder)`,
+  // because the limit is the design. A hosts entry is `<ip> <name>`: no port, no
+  // scheme. Measured 2026-08-02 by running the real projectors in
+  // `reconcile/tf_status.py`, exactly one kind publishes an address that shape
+  // -- ec2's `PRIVATE_IP`. An alb publishes `http://127.0.0.1:<dynamic port>`
+  // and rds a `host:port`, so a name pointing at either would resolve and then
+  // fail to connect: a green resource that does not work, which is the failure
+  // this repo's honesty rules exist to stop. Both are declined BY NAME on Apply
+  // (`hcl.py::_dns_target_unsupported`), never silently dropped.
+  //
+  // "Resolves EC2" does NOT mean one address for everybody, and the sublabel is
+  // careful to name the TARGET KIND rather than promise a value. The emitted
+  // Terraform carries `aws_instance.<n>.private_ip` -- the portable, AWS-shaped
+  // answer -- while odin's substrate resolves the name to whatever the CONSUMER
+  // can reach: `private_ip` from a container or the host, the Nebula OVERLAY
+  // address from another VM, and no hosts line at all for a VM in an env with no
+  // mesh (a case odin REPORTS rather than silently skipping, since a name that
+  // resolves nothing under a healthy badge is the bug this repo's honesty rules
+  // are named after). That is forced rather than chosen: stock Lima `vz` NATs
+  // each VM into its own isolated address space, so VM -> VM on a private_ip is
+  // 100% packet loss before nebula is involved at all (`fabric/nebula.py`'s R5 note,
+  // confirmed live with two real VMs). See `iam.ts`'s `dnsTargetTypes` note for
+  // the full matrix; docs/limits.md states it as a measured limit.
+  //
+  // NO `iamActions`, deliberately, and both reasons are load-bearing:
+  //   * HONESTY -- the argument `iam.ts` already records for `alb`. A workload
+  //     does not resolve a name by making a signed AWS call; resolution reads a
+  //     hosts file, which consults nobody and never reaches odin's gateway. The
+  //     route53:* namespace is a CONTROL plane only tofu (the operator
+  //     principal) ever touches, so a grant drawn here would gate nothing.
+  //   * MECHANICAL -- `iam.ts::pairKey` SORTS, so `route53 -> ec2` and
+  //     `ec2 -> route53` are ONE key. Declaring `iamActions` would put route53
+  //     into `iamTargetTypes`, and the `computeTypes x iamTargets` loop would
+  //     then register `iam` on that very key beside `dns`. The pair becomes
+  //     AMBIGUOUS and `edge-ambiguity.test.ts` fails naming it. Verified by
+  //     doing exactly that: it printed `ec2 -> route53: iam | dns` and
+  //     `route53 -> ec2: iam | dns` and failed.
+  //
+  // The `zoneId` display field is GONE. Nothing ever wrote it -- there is no
+  // route53 projector in `tf_status.py` and no hosted-zone id anywhere in
+  // `src/odin` (grep: zero producers) -- because odin's substrate is a hosts
+  // file and a hosts file has no zones. On a placeholder tile a permanently
+  // blank read-only field was merely inert; on a REAL one it reads as "not
+  // applied yet", which is the tile claiming a fact odin does not have. (`arn`
+  // on the sqs/sns tiles is the same shape and equally unwritten: a pre-existing
+  // defect, reported rather than propagated to one more tile.)
   {
-    type: 'route53', abbr: 'DNS', label: 'Route 53 Zone', sublabel: 'Hosted zone (placeholder)',
+    type: 'route53', abbr: 'DNS', label: 'Route 53 Zone',
+    sublabel: 'Hosted zone (resolves EC2 only)',
     category: 'Networking', color: 'indigo', width: 200,
-    fields: [{ key: 'label', label: 'Domain', editable: true }, { key: 'zoneId', label: 'Zone ID' }],
-    defaultData: { label: 'example.com', zoneId: '' },
+    fields: [{ key: 'label', label: 'Domain', editable: true }],
+    defaultData: { label: 'example.com' },
   },
   {
     type: 'apigateway', abbr: 'API', label: 'API Gateway', sublabel: 'REST API (placeholder)',

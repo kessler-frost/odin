@@ -138,6 +138,17 @@ def events(sink: CaptureSink):
 
 
 @pytest.fixture
+def route53(sink: CaptureSink):
+    # Route 53 is a GLOBAL service, and its SigV4 credential scope carries
+    # whatever region the CLIENT is configured with once `endpoint_url` is
+    # overridden -- MEASURED as `.../us-west-2/route53/aws4_request` from a
+    # client built with `region_name="us-west-2"`, i.e. NOT forced to
+    # `us-east-1`. `_client` pins `us-east-1` like every other fixture here;
+    # nothing in classify or the model reads the region, so the two agree.
+    return _client(sink, "route53")
+
+
+@pytest.fixture
 def elbv2(sink: CaptureSink):
     # botocore names the service model `elbv2`; its SigV4 credential scope (and
     # so `classify()`'s `service`) is `elasticloadbalancing`.

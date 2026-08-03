@@ -26,6 +26,7 @@ from odin.compute.instances import (
     _Proc,
     _pick_shared_ip,
     instance_config_path,
+    instance_hosts_path,
     membership_changed,
     vm_name,
 )
@@ -1218,3 +1219,164 @@ async def test_boot_carries_the_disks_into_the_vms_own_yaml():
     await vm.boot(NAME, get_instance_type("t3.micro"), hostname="i-1", disks=["odin-ebs-e1-vol-a"])
 
     assert runner.doc["additionalDisks"] == [{"name": "odin-ebs-e1-vol-a"}]
+
+
+# --- route53: /etc/hosts, seeded at boot and UPDATED IN PLACE ----------------
+#
+# The in-place half is the load-bearing one. `generate_cloud_init` runs once,
+# inside `limactl create`, and its bytes are then frozen into the instance's
+# own lima.yaml; `limactl edit` refuses a running instance. So without
+# `push_hosts` a record edited after boot could never reach the guest -- the
+# exact shape of "the canvas says applied and the substrate never saw it".
+
+
+class _HostsRunner(FakeRunner):
+    """Keeps whatever was piped to a `sudo bash -s` inside the VM."""
+
+    def __init__(self, returncode: int = 0, stderr: str = "", stdout: str = "") -> None:
+        super().__init__()
+        self.script_input: str | None = None
+        self._push = _Proc(returncode, stdout, stderr)
+
+    async def __call__(self, args, input=None):
+        if "bash" in args and "-s" in args:
+            self.script_input = input
+            self.calls.append(args)
+            return self._push
+        return await super().__call__(args, input=input)
+
+
+def _shell_calls(runner: FakeRunner) -> list[list[str]]:
+    return [c for c in runner.calls if c[:2] == ["limactl", "shell"]]
+
+
+async def test_boot_hosts_land_in_the_cloud_init_script():
+    class _TrackingRunner(FakeRunner):
+        async def __call__(self, args, input=None):
+            if "create" in args:
+                self.script = yaml.safe_load(Path(args[-1]).read_text())["provision"][0]["script"]
+            return await super().__call__(args, input=input)
+
+    runner = _TrackingRunner()
+    runner.responses["hostname -I"] = _Proc(0, "192.168.64.20")
+    vm = InstanceVm(runner=runner, poll_interval=0.01)
+    await vm.boot(
+        NAME, get_instance_type("t3.micro"), hostname="i-1",
+        hosts={"api.internal": "10.42.0.5"},
+    )
+    assert "10.42.0.5\tapi.internal" in runner.script
+
+
+async def test_push_hosts_writes_the_block_into_a_running_vm(tmp_path):
+    runner = _HostsRunner()
+    vm = InstanceVm(runner=runner)
+    action = await vm.push_hosts(NAME, tmp_path, "myenv", "i-1", {"api.internal": "10.42.0.5"})
+    assert action == "pushed"
+    assert "10.42.0.5\tapi.internal" in runner.script_input
+    # Through `limactl shell`, i.e. into a RUNNING VM -- no create, no edit,
+    # no restart. `limactl edit` would have refused it.
+    assert len(_shell_calls(runner)) == 1
+    assert not [c for c in runner.calls if "edit" in c or "create" in c]
+
+
+async def test_push_hosts_records_only_what_landed(tmp_path):
+    runner = _HostsRunner()
+    vm = InstanceVm(runner=runner)
+    await vm.push_hosts(NAME, tmp_path, "myenv", "i-1", {"api.internal": "10.42.0.5"})
+    assert json.loads(instance_hosts_path(tmp_path, "myenv", "i-1").read_text()) == {
+        "api.internal": "10.42.0.5",
+    }
+
+
+async def test_push_hosts_is_free_when_nothing_changed(tmp_path):
+    """NO CHURN is a hard requirement -- this runs for every instance on every
+    Apply, so an unchanged record set must cost one local file read and NOT a
+    single `limactl`."""
+    hosts = {"api.internal": "10.42.0.5"}
+    first = _HostsRunner()
+    await InstanceVm(runner=first).push_hosts(NAME, tmp_path, "myenv", "i-1", hosts)
+
+    second = _HostsRunner()
+    action = await InstanceVm(runner=second).push_hosts(NAME, tmp_path, "myenv", "i-1", hosts)
+    assert action == "unchanged"
+    assert second.calls == []
+
+
+async def test_push_hosts_reorders_without_churning(tmp_path):
+    """Compared as a record SET: the same names in a different dict order are
+    not a change."""
+    await InstanceVm(runner=_HostsRunner()).push_hosts(
+        NAME, tmp_path, "myenv", "i-1", {"a.internal": "10.42.0.1", "b.internal": "10.42.0.2"})
+    runner = _HostsRunner()
+    action = await InstanceVm(runner=runner).push_hosts(
+        NAME, tmp_path, "myenv", "i-1", {"b.internal": "10.42.0.2", "a.internal": "10.42.0.1"})
+    assert action == "unchanged"
+    assert runner.calls == []
+
+
+async def test_push_hosts_pushes_again_when_a_record_changes(tmp_path):
+    await InstanceVm(runner=_HostsRunner()).push_hosts(
+        NAME, tmp_path, "myenv", "i-1", {"api.internal": "10.42.0.5"})
+    runner = _HostsRunner()
+    action = await InstanceVm(runner=runner).push_hosts(
+        NAME, tmp_path, "myenv", "i-1", {"api.internal": "10.42.0.6"})
+    assert action == "pushed"
+    assert "10.42.0.6\tapi.internal" in runner.script_input
+
+
+async def test_push_hosts_removing_the_last_record_still_reaches_the_vm(tmp_path):
+    """A deleted record must stop resolving. If an empty set were treated as
+    "nothing to do", the name would keep answering until the VM was rebuilt."""
+    await InstanceVm(runner=_HostsRunner()).push_hosts(
+        NAME, tmp_path, "myenv", "i-1", {"api.internal": "10.42.0.5"})
+    runner = _HostsRunner()
+    action = await InstanceVm(runner=runner).push_hosts(NAME, tmp_path, "myenv", "i-1", {})
+    assert action == "pushed"
+    assert "api.internal" not in runner.script_input
+    assert "sed -i" in runner.script_input  # the delete still runs
+
+
+async def test_push_hosts_failure_is_reported_and_not_recorded(tmp_path):
+    """The measured failure shape of a `sudo bash -s` is `rc=9, stderr='',
+    stdout=''` (see `_lima`), so a nonzero code with no output is a REAL
+    failure and must not be remembered as done -- otherwise the next Apply
+    reads `unchanged` over a guest that never took the write."""
+    runner = _HostsRunner(returncode=9)
+    action = await InstanceVm(runner=runner).push_hosts(
+        NAME, tmp_path, "myenv", "i-1", {"api.internal": "10.42.0.5"})
+    assert action == "failed"
+    assert not instance_hosts_path(tmp_path, "myenv", "i-1").exists()
+
+
+async def test_push_hosts_retries_after_a_failure(tmp_path):
+    """The consequence of not recording a failure: the next Apply tries again
+    rather than believing the entry is already there."""
+    await InstanceVm(runner=_HostsRunner(returncode=9)).push_hosts(
+        NAME, tmp_path, "myenv", "i-1", {"api.internal": "10.42.0.5"})
+    runner = _HostsRunner()
+    action = await InstanceVm(runner=runner).push_hosts(
+        NAME, tmp_path, "myenv", "i-1", {"api.internal": "10.42.0.5"})
+    assert action == "pushed"
+
+
+async def test_push_hosts_never_raises_out_of_an_apply(tmp_path):
+    """Mesh/DNS wiring must not fail an Apply by exception (the
+    `_activate_nebula` rule) -- but `failed` is a real answer the caller acts
+    on, not a shrug."""
+    class _Exploding(FakeRunner):
+        async def __call__(self, args, input=None):
+            raise OSError("limactl is not on PATH")
+
+    action = await InstanceVm(runner=_Exploding()).push_hosts(
+        NAME, tmp_path, "myenv", "i-1", {"api.internal": "10.42.0.5"})
+    assert action == "failed"
+
+
+async def test_a_malformed_record_cannot_reach_the_vm(tmp_path):
+    """The renderer refuses it, and `push_hosts` turns that into `failed`
+    rather than writing a broken /etc/hosts into a real guest."""
+    runner = _HostsRunner()
+    action = await InstanceVm(runner=runner).push_hosts(
+        NAME, tmp_path, "myenv", "i-1", {"api internal": "10.42.0.5"})
+    assert action == "failed"
+    assert runner.calls == []
