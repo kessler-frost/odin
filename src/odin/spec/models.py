@@ -121,7 +121,10 @@ class Ref(BaseModel):
 # make the four PROVISIONED kinds referenceable -- but the reconciler only
 # stores its `_fabric` and never calls it, so it is not a live path and must not
 # be counted as one here.)
-REFERENCEABLE_KINDS = ("rds", "elasticache", "alb", "ec2", "ecr")
+# `apigateway` joined in v0.8.19: `gateway/wiring.py::producer_facts` publishes
+# its real `API_ENDPOINT`, gated the same way the alb is -- withheld entirely
+# unless the API is AVAILABLE on a real published port.
+REFERENCEABLE_KINDS = ("rds", "elasticache", "alb", "ec2", "ecr", "apigateway")
 
 
 class Edge(BaseModel):

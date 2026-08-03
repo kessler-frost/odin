@@ -66,8 +66,10 @@ from starlette.routing import Route
 from odin.aws.backings import ACCESS_KEY as BACKING_ACCESS_KEY
 from odin.aws.backings import REGION as BACKING_REGION
 from odin.aws.backings import SECRET_KEY as BACKING_SECRET_KEY
+from odin.gateway import apigw_shim
 from odin.gateway import classify as classify_mod
 from odin.gateway import errors, sigv4, synth
+from odin.gateway.models import lambdactl
 from odin.gateway.keys import OPERATOR_NODE_ID, KeyStore, Principal
 from odin.gateway.policy import Statement, evaluate
 from odin.gateway.stores import SynthStores
@@ -451,6 +453,7 @@ def create_gateway_app(
         pure = await synth.pure_answer(
             action, resource, principal.env, body, stores, now, backing_port, query_params,
             keystore=keystore, gateway_port=gateway_port() if gateway_port else None, rds=rds,
+            path=path,
         )
         if pure is not None:
             return pure
@@ -512,8 +515,38 @@ def create_gateway_app(
     # is parametrized over THIS list -- so a verb added here without a
     # corresponding deny is a test failure, and a verb removed is too.
     methods = ["GET", "PUT", "POST", "DELETE", "HEAD", "PATCH", "OPTIONS"]
+
+    # apigateway (v0.8.19): THE INVOKE SHIM, and it is deliberately NOT part of
+    # `catch_all`.
+    #
+    # An HTTP API route with `authorization_type = "NONE"` -- the only kind odin
+    # emits -- is a PUBLIC endpoint. That is what an API Gateway is. So the
+    # requests nginx forwards here carry no signature and could never survive
+    # `catch_all`'s pipeline. Two ways to allow that: an early return inside
+    # `catch_all`, or a route in FRONT of it. This is the second, because it
+    # leaves the pipeline's invariant -- everything through `catch_all` is
+    # SigV4-signed -- true and checkable in one place, rather than true-except-
+    # for-a-branch. `docs/architecture` draws this arrow as ungated, because it
+    # is.
+    #
+    # What bounds it instead of a signature: the URL names no function, only an
+    # `(env, api id, integration id)` triple resolved through the STORED
+    # records, and the API's own `route_token` must be replayed in a header. See
+    # `gateway/apigw_shim.py`.
+    async def apigw_shim_route(request: Request) -> Response:
+        port = gateway_port() if gateway_port else None
+        return await apigw_shim.serve_request(request, stores, invoke_via=lambdactl.invoke, gateway_port=port)
+
     return Starlette(
         routes=[
+            Route(
+                apigw_shim.SHIM_PREFIX + "/{env}/{api_id}/{integration_id}",
+                apigw_shim_route, methods=methods,
+            ),
+            Route(
+                apigw_shim.SHIM_PREFIX + "/{env}/{api_id}/{integration_id}/{rest:path}",
+                apigw_shim_route, methods=methods,
+            ),
             Route("/", catch_all, methods=methods),
             Route("/{path:path}", catch_all, methods=methods),
         ],

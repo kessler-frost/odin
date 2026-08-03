@@ -80,7 +80,7 @@ from pathlib import Path
 
 from odin.aws.rds import POSTGRES_PORT
 from odin.fabric.nebula import NebulaManager
-from odin.gateway.models import cachectl, elbv2ctl, rdsctl
+from odin.gateway.models import apigwctl, cachectl, elbv2ctl, rdsctl
 from odin.gateway.stores import SynthStores
 from odin.reconcile import mesh_health
 from odin.runtime.colima import CONTAINER_HOST
@@ -250,6 +250,17 @@ async def producer_facts(stores: SynthStores, env: str) -> dict[str, dict[str, s
             continue
         tags = stores.tags.get(env, f"{elbv2ctl.SERVICE}:{record['arn']}", {})
         facts[_label(tags, record["name"])] = {"ALB_ENDPOINT": endpoint}
+    # apigateway (v0.8.19). Same shape and same readiness gate as the load
+    # balancer above: `endpoint_url` returns None unless the API is AVAILABLE
+    # with a real published port, so a workload's `${{api.API_ENDPOINT}}` either
+    # resolves to something dialable or fails loudly with `UnresolvedRef` --
+    # never to `http://127.0.0.1:0`.
+    for key, record in stores.apigwctl.items(env).items():
+        endpoint = apigwctl.endpoint_url(record) if key.startswith("api:") else None
+        if endpoint is None:
+            continue
+        tags = stores.tags.get(env, f"{apigwctl.SERVICE}:{apigwctl.api_arn(record['api_id'])}", {})
+        facts[_label(tags, record["name"])] = {"API_ENDPOINT": endpoint}
     for key, record in stores.ecr.items(env).items():
         if not key.startswith("repo:"):
             continue

@@ -204,6 +204,23 @@ export const edgeTypes: Record<string, EdgeTypeDef> = {
   // one. It is a wire that carries a value, which puts it with `connection` and
   // `volume` on the solid side.
   dns: { id: 'dns', label: 'DNS Record', color: '#818cf8', dashed: false },
+  // "This file system is mounted into that workload" -- it emits a nested block
+  // on the CONSUMER (`file_system_config` on the lambda; `volume` +
+  // `mountPoints` on the ECS task definition), and behind that a real host
+  // directory bind-mounted into the real container. Fuchsia, matching the EFS
+  // tile's accent, and solid because a mount is a physical fact about where
+  // bytes live rather than a grant.
+  //
+  // NOT a reuse of `volume`, and the difference is the whole feature. `volume`
+  // means "this block device is attached to that instance" and is EXCLUSIVE --
+  // `hcl.py` refuses a second attachment, because a gp3 volume attaches to
+  // exactly one instance. An EFS mount is SHARED by as many consumers as you
+  // draw, which is the entire reason to draw one. One label reading "Volume
+  // Attachment" over both would tell the user the wrong thing about exclusivity
+  // on the one line where sharing is the point, and they emit different
+  // Terraform besides: `volume` a standalone `aws_volume_attachment`, `mount` a
+  // block inside the consumer's own resource.
+  mount: { id: 'mount', label: 'File System Mount', color: '#e879f9', dashed: false },
 };
 
 // Given a pair of node types (unordered), return which edge types are valid
@@ -286,6 +303,27 @@ for (const target of Object.keys(iamActionsForTarget)) {
 // NODE kinds and never reads `edge.kind`, and it must stay that way -- see the
 // `subscription` note below for what gating it would destroy.
 for (const target of albTargetTypes) register('alb', target, 'target');
+// v0.8.19: an apigateway <-> lambda|ecs edge is a `target` edge too, and it is
+// the SAME relationship rather than a near-synonym: a front door forwards a
+// request to a workload and the caller holds the connection open waiting for a
+// status code. That synchrony is the whole argument for putting it here and not
+// in the event family -- an event producer does not wait, and nothing about a
+// 200 travels back up an event edge.
+//
+// It does NOT collide with the IAM loop above. `apigateway` is not in
+// `computeTypes` (an API Gateway invoking a Lambda uses a resource policy on
+// real AWS, not an execution role, and odin enforces no such thing), and it has
+// no entry in `iamActionsForTarget`, so neither `apigateway:lambda` nor
+// `apigateway:ecs` is ever registered as `iam`. Each therefore has exactly ONE
+// meaning and `edge-ambiguity.test.ts` stays green without an allowlist entry --
+// checked by running it, not assumed.
+//
+// PRESENTATIONAL, like `target`'s other members: `agent/hcl.py`'s route pass
+// keys on the two NODE kinds and never reads `edge.kind`. Gating it on the name
+// would make an old canvas (whose edges still say `network`) lose every route on
+// the next apply -- a 404 for every path that worked yesterday.
+export const apiTargetTypes = new Set(['lambda', 'ecs']);
+for (const target of apiTargetTypes) register('apigateway', target, 'target');
 // An sg drawn against a kind whose HCL reads `securityGroups` means MEMBERSHIP,
 // and only that -- a plain "network" line between a group and an instance would
 // describe nothing. Kept deliberately to the kinds `agent/hcl.py` actually
@@ -423,6 +461,47 @@ for (const host of volumeHostTypes) register('ebs', host, 'volume');
 // tests/spec/test_edge_registry_matches_builders.py.
 export const dnsTargetTypes = new Set(['ec2']);
 for (const target of dnsTargetTypes) register('route53', target, 'dns');
+// An efs -> ecs|lambda edge is a FILE SYSTEM MOUNT: the consumer's container
+// really gets the file system's host directory bind-mounted at the efs node's
+// `path`, through the same `ContainerSpec.volumes` that already hands a Lambda
+// its code directory. Kept to the two CONTAINER-backed kinds on purpose, and
+// the exclusion is measured rather than deferred: `ec2` runs as a Lima VM, odin
+// creates those VMs with `"mounts": []` (`compute/lima_yaml.py`), so a host
+// directory is not visible inside one at all -- and a mount there has no
+// Terraform expression either, being an fstab line in user-data. An efs drawn
+// to an ec2 stays `unmodelled`, whose label says on the canvas that odin does
+// nothing with the line, which is the honest answer rather than a fuchsia one
+// implying a share that would be empty.
+//
+// PRESENTATIONAL, like `target`, `subscription` and `volume`: `agent/hcl.py`'s
+// mount pass keys on the two NODE kinds and never reads `edge.kind`, and it has
+// to stay that way, because the hazard here is LIVE.
+//
+// This comment first claimed the opposite -- that no saved canvas can contain an
+// efs node, so the convention was being followed on its own merit. That was
+// FALSE, and the git history says so: `ac796d6` (2026-06-20) added this tile
+// with sublabel `Elastic file system` and NO `(placeholder)` marker, so it was
+// draggable like any other; placeholders were not hidden until `41d214b`
+// (2026-07-27), whose own message records that the hiding is PALETTE-ONLY --
+// "CATALOG keeps every entry, so a canvas already containing a placeholder node
+// still renders properly". Five weeks of saved canvases can hold an efs node
+// with `network`-typed edges hanging off it.
+//
+// So gating the mount pass on `edge.kind === 'mount'` would silently ignore
+// every one of those edges, and the first Apply after this change would create
+// a file system mounted NOWHERE, with no error. It is milder than the `ebs`
+// case and worth saying so rather than dramatising: such an efs node was a
+// placeholder, Apply skipped it, and there is no live file system behind it for
+// tofu to tear down -- the failure is a silently unmounted share, not a
+// detached disk with data on it.
+//
+// Pinned against the Python half by
+// `tests/spec/test_edge_registry_matches_builders.py`, like albTargetTypes /
+// sgMemberTypes / roleHolderTypes / volumeHostTypes before it. That test
+// regex-parses this literal, so it stays on ONE line with single-quoted
+// lowercase members.
+export const efsMountTypes = new Set(['ecs', 'lambda']);
+for (const consumer of efsMountTypes) register('efs', consumer, 'mount');
 
 // The catch-all every unregistered pair falls to. Deliberately a NAMED type
 // with a definition, not a bare string, so `edgeStyle` and the ambiguity

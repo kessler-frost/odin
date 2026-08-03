@@ -83,7 +83,15 @@ _KIND = {
     "alb": "alb",
     "kms": "kms",
     "ebs": "ebs",
+    # No trailing `# comment` on any entry line here -- see the note below.
     "route53": "route53",
+    "efs": "efs",
+    # v0.8.19. NOTE THE COMMENT PLACEMENT: `ui/src/lib/catalog.test.ts` parses
+    # this table out of this file with `/^\s*"([\w-]+)":\s*"([\w-]+)",$/gm`, so a
+    # trailing `# comment` on the entry line makes the regex miss it and the tile
+    # reads as an unmarked placeholder. That is exactly how it was written first,
+    # and the ratchet failed by name -- which is the ratchet working.
+    "apigateway": "apigateway",
 }
 
 
@@ -354,6 +362,15 @@ ROLE_ASSUMPTION = "role"
 # "This load balancer fronts that service" and "this topic fans out to that
 # queue". Both are PRESENTATIONAL today (see the note above): they name what the
 # user drew, and the passes that build them read the node kinds instead.
+#
+# `apigateway -> lambda|ecs` joined `target` in v0.8.19 rather than becoming its
+# own kind or joining the event family, on the SYNCHRONY argument: the caller
+# holds a connection open and waits for a status code, which is what every other
+# member of this family does and what no member of the event family does. The
+# label ("LB Target") is the one thing that no longer fits perfectly; the
+# relationship it names -- "this front door forwards to that workload" -- fits
+# exactly, and inventing a near-synonym edge type to preserve a label would put
+# two names on one meaning.
 ALB_TARGET = "target"
 SNS_SUBSCRIPTION = "subscription"
 
@@ -373,6 +390,23 @@ VOLUME_ATTACHMENT = "volume"
 # it had a builder, so a canvas whose route53 edge still says `network` would
 # silently lose its record if the pass gated on this name.
 DNS_RECORD = "dns"
+
+# "This workload mounts that file system" -- a `volume` + `mountPoints` pair on
+# an ecs task definition, or a `file_system_config` on a lambda, and behind both
+# a real host directory bind-mounted into the container.
+#
+# NOT a reuse of `VOLUME_ATTACHMENT`, and the difference is the feature: a gp3
+# volume attaches to exactly ONE instance (`agent/hcl.py` refuses a second
+# attachment edge by name), while an EFS file system is mounted by MANY
+# consumers at once. One label reading "Volume Attachment" over both would tell
+# the user the wrong thing about exclusivity on the one line where sharing is
+# the point. They also emit different Terraform -- a standalone
+# `aws_volume_attachment` resource versus a nested block on the CONSUMER -- so
+# the importer's inverse differs correspondingly.
+#
+# PRESENTATIONAL in the same sense as the kinds above: `agent/hcl.py`'s mount
+# pass keys on the two NODE KINDS and never on this name.
+FILE_SYSTEM_MOUNT = "mount"
 
 # "This workload's environment is wired to that producer's endpoint" -- folded
 # into the consumer's `refs` by `_merge_connection_edges` below.
@@ -400,7 +434,7 @@ LEGACY_UNMODELLED = "network"
 
 EDGE_KINDS = frozenset({
     "iam", SG_MEMBERSHIP, ROLE_ASSUMPTION, ALB_TARGET, SNS_SUBSCRIPTION,
-    CONNECTION, ENCRYPTION, VOLUME_ATTACHMENT, DNS_RECORD,
+    CONNECTION, ENCRYPTION, VOLUME_ATTACHMENT, DNS_RECORD, FILE_SYSTEM_MOUNT,
     UNMODELLED, LEGACY_UNMODELLED, "ref",
 })
 

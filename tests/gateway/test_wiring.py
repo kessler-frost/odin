@@ -126,6 +126,21 @@ def _seed_alb(stores: SynthStores) -> None:
     })
 
 
+_APIGW_NODE = "public-api"
+
+
+def _seed_apigw(stores: SynthStores) -> None:
+    """An `AVAILABLE` apigwctl record with a real published nginx port -- the
+    same shape `tests/gateway/test_apigwctl.py` produces through the real
+    CreateApi, so the two projections of an API's one fact are seeded
+    identically. v0.8.19."""
+    stores.apigwctl.set(ENV, "api:api00000001", {
+        "api_id": "api00000001", "name": _APIGW_NODE, "protocol_type": "HTTP",
+        "created_date": "2026-08-02T00:00:00Z", "route_token": "0" * 32,
+        "state": "AVAILABLE", "state_reason": None, "host_port": 41999,
+    })
+
+
 def _save_stack(tmp_path, nodes: list[dict]) -> None:
     SpecStore(tmp_path).apply(canvas_to_stack({"nodes": nodes, "edges": []}, env=ENV))
 
@@ -203,12 +218,28 @@ async def test_every_referenceable_kind_really_publishes_and_no_other_kind_does(
     _seed_alb(stores)
     _seed_ec2(stores, tmp_path)
     _seed_ecr(stores)
+    _seed_apigw(stores)
     facts = await producer_facts(stores, ENV)
-    assert set(facts) == {"appdb", "cache", _ALB_NODE, _VM_NODE, _ECR_NODE}
+    assert set(facts) == {"appdb", "cache", _ALB_NODE, _VM_NODE, _ECR_NODE, _APIGW_NODE}
     assert all(facts.values()), "a producer in the table must publish at least one fact"
+    assert facts[_APIGW_NODE] == {"API_ENDPOINT": "http://127.0.0.1:41999"}
     # ...and every kind NOT in the tuple contributes nothing, which is the claim
     # the error message now makes on the strength of this.
-    assert set(REFERENCEABLE_KINDS) == {"rds", "elasticache", "alb", "ec2", "ecr"}
+    assert set(REFERENCEABLE_KINDS) == {"rds", "elasticache", "alb", "ec2", "ecr", "apigateway"}
+
+
+async def test_an_api_that_is_not_available_publishes_no_endpoint(tmp_path):
+    """v0.8.19, and the same gate the alb has for the same reason: a host port of
+    0 is not a port, it is "nothing is published". Handing a workload
+    `http://127.0.0.1:0` is worse than raising `UnresolvedRef` -- the first fails
+    somewhere far from the cause."""
+    stores = _stores(tmp_path)
+    _seed_apigw(stores)
+    stores.apigwctl.set(ENV, "api:api00000001", {
+        **stores.apigwctl.get(ENV, "api:api00000001"),
+        "state": "FAILED", "state_reason": "nginx: [emerg] invalid parameter", "host_port": 0,
+    })
+    assert await producer_facts(stores, ENV) == {}
 
 
 class _PortOnlyRuntime:
@@ -414,7 +445,7 @@ async def test_a_ref_to_a_vm_that_is_not_up_yet_fails_honestly(tmp_path):
 
 async def test_a_ref_to_a_kind_that_can_never_produce_says_so_and_does_not_deny_its_facts(tmp_path):
     """Field test 6, F3's sub-finding. The message said an sqs node "publishes no
-    facts (only rds, elasticache, alb, ec2 and ecr do)" -- while `/world` was
+    facts (only rds, elasticache, alb, ec2, ecr and apigateway do)" -- while `/world` was
     publishing that same node's `QUEUE_URL`. Measured against a real server at
     the same instant:
 
@@ -432,7 +463,7 @@ async def test_a_ref_to_a_kind_that_can_never_produce_says_so_and_does_not_deny_
     message = str(excinfo.value)
     assert "'jobs' is a sqs node" in message
     assert "no sqs node publishes an endpoint a reference can resolve" in message
-    assert "only rds, elasticache, alb, ec2 and ecr do" in message
+    assert "only rds, elasticache, alb, ec2, ecr and apigateway do" in message
     # The claim the field test falsified must not come back in any form.
     assert "publishes no facts" not in message
     assert "not healthy yet" not in message

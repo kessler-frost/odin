@@ -540,6 +540,69 @@ class Target(Record):
 TARGETS = strict(list[Target])
 
 
+# --- api gateway v2 (v0.8.19) ------------------------------------------------
+
+
+class HttpApi(Record):
+    """`api:{apiId}` (gateway/models/apigwctl.py).
+
+    `host_port` is an INT and pinned as one for `LoadBalancer.endpoints`'
+    reason, one layer simpler: `endpoint_url` builds `http://127.0.0.1:{port}`
+    and that string becomes the wire's `apiEndpoint`, from which the provider
+    derives `aws_apigatewayv2_stage.invoke_url` client-side. A port that
+    round-tripped as a string would produce a URL that still LOOKS right and a
+    `plan` that is dirty forever.
+
+    `route_token` is the secret nginx replays to the invoke shim. It is in this
+    record rather than a separate file because it must be deleted with the API
+    and no sooner -- one lifetime, one owner."""
+
+    api_id: str
+    name: str
+    protocol_type: str
+    created_date: str
+    route_token: str
+    state: Literal["AVAILABLE", "FAILED"]
+    host_port: int
+    state_reason: str | None = None
+    description: str | None = None
+    version: str | None = None
+    api_key_selection_expression: str | None = None
+    route_selection_expression: str | None = None
+
+
+class HttpApiIntegration(Record):
+    """`integration:{apiId}:{integrationId}`."""
+
+    integration_type: str
+    connection_type: str
+    timeout_in_millis: int
+    integration_uri: str | None = None
+    integration_method: str | None = None
+    description: str | None = None
+    payload_format_version: str | None = None
+
+
+class HttpApiRoute(Record):
+    """`route:{apiId}:{routeId}`. `target` is `integrations/{id}` or absent --
+    a route may legitimately exist before its integration is attached."""
+
+    route_key: str
+    authorization_type: str
+    api_key_required: bool
+    target: str | None = None
+    operation_name: str | None = None
+
+
+class HttpApiStage(Record):
+    """`stage:{apiId}:{stageName}`."""
+
+    stage_name: str
+    auto_deploy: bool
+    created_date: str
+    description: str | None = None
+
+
 # --- eventbridge -------------------------------------------------------------
 
 
@@ -587,6 +650,42 @@ class EventBus(Record):
 
     name: str
     arn: str
+
+
+# --- elastic file system -----------------------------------------------------
+
+
+class EfsFileSystem(Record):
+    """`fs:{FileSystemId}` (gateway/models/efsctl.py).
+
+    `host_dir` is the load-bearing one and the reason this record is validated
+    at all: it is the absolute path odin BIND-MOUNTS into real containers. A
+    non-string there reaches `Path(...)` and then a `docker -v` argument, and a
+    `docker -v` of a source that does not exist does not fail -- it silently
+    creates an empty directory and the workload comes up green with none of the
+    shared data. `creation_token` is what a second CreateFileSystem is matched
+    against for idempotency, so a wrong type there duplicates a file system
+    instead of returning the existing one."""
+
+    file_system_id: str
+    creation_token: str
+    host_dir: str
+    created_at: float
+    performance_mode: str
+    throughput_mode: str
+    size_bytes: int = 0
+
+
+class EfsAccessPoint(Record):
+    """`ap:{AccessPointId}` (gateway/models/efsctl.py) -- the indirection a
+    Lambda mount goes through: `FileSystemConfig.Arn` names an ACCESS POINT, so
+    `file_system_id` is the only route from a function's config back to a
+    directory. A missing one is a function that cannot resolve its own mount."""
+
+    access_point_id: str
+    file_system_id: str
+    client_token: str
+    created_at: float
 
 
 # --- elasticache -------------------------------------------------------------
@@ -827,6 +926,14 @@ SCHEMAS: dict[str, dict[str, TypeAdapter]] = {
         "rule:": strict(EventRule),
         "targets:": EVENT_TARGETS,
         "bus:": strict(EventBus),
+    },
+    "efsctl": {"fs:": strict(EfsFileSystem), "ap:": strict(EfsAccessPoint)},
+    # apigateway (v0.8.19)
+    "apigwctl": {
+        "api:": strict(HttpApi),
+        "integration:": strict(HttpApiIntegration),
+        "route:": strict(HttpApiRoute),
+        "stage:": strict(HttpApiStage),
     },
     "cachectl": {"cluster:": strict(CacheCluster)},
     "secretsctl": {"secret:": strict(Secret), "version:": strict(SecretVersion)},

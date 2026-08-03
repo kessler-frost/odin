@@ -385,6 +385,7 @@ def test_the_kind_vocabulary_names_every_kind_the_canvas_can_author():
     assert {
         "iam", "sg", "role", "target", "subscription", "connection",
         ENCRYPTION, "volume", DNS_RECORD,
+        "iam", "sg", "role", "target", "subscription", "connection", ENCRYPTION, "volume", "mount",
     } <= EDGE_KINDS
     assert UNMODELLED in EDGE_KINDS and LEGACY_UNMODELLED in EDGE_KINDS
     assert "ref" in EDGE_KINDS  # Edge.kind's own default
@@ -394,5 +395,6 @@ def test_the_kind_vocabulary_names_every_kind_the_canvas_can_author():
     assert EDGE_KINDS == {
         "iam", "sg", "role", "target", "subscription", "connection",
         ENCRYPTION, "volume", DNS_RECORD,
+        "iam", "sg", "role", "target", "subscription", "connection", ENCRYPTION, "volume", "mount",
         UNMODELLED, LEGACY_UNMODELLED, "ref",
     }

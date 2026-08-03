@@ -235,97 +235,35 @@ They are listed because finding one by surprise is worse than reading it here.
   backings and the prune, and reads a cached drift result instead of sweeping. ECS
   stays genuinely live because its task sweep runs on every one of those ticks;
   EC2, Lambda and RDS drift can be up to one sweep cadence stale for the duration.
-- **A drawn edge carries a modelled TYPE for only 48 of the 378 kind pairs.**
-  The honest majority answer is `unmodelled` — 330 of the 378 unordered pairs,
+- **A drawn edge carries a modelled TYPE for only 52 of the 378 kind pairs.**
+  The honest majority answer is `unmodelled` — 326 of the 378 unordered pairs,
   drawn as a grey line labelled *Not modelled*, stored in the Stack and read by
   nothing. It was called `network` until v0.8.14, which was a claim about layer 3
-  that odin never checked. Re-measured 2026-08-02 over the real 27 canvas kinds,
+  that odin never checked. Re-measured 2026-08-03 over the real 27 canvas kinds,
   the pairs that do mean something: `iam`
   (34 pairs, a real policy), `connection` **and** `iam` together (4),
-  `sg` (2, security-group membership), `target` (2 — `alb ↔ ecs`, and since
-  v0.8.15 `alb ↔ ec2`), `role` (1 — `iam_role ↔ lambda`),
-  `subscription` (1 — `sns ↔ sqs`),
-  `volume` (1 — `ebs ↔ ec2`, a real `aws_volume_attachment`, and behind it a
-  real `limactl disk` in a real Lima VM),
+  `sg` (2, security-group membership), `target` (4 — `alb ↔ ecs`, and since
+  v0.8.15 `alb ↔ ec2`), `volume` (1 — `ebs ↔ ec2`, a real block device on a real VM),
+  `mount` (2 — `efs ↔ ecs|lambda`, a real host directory bind-mounted into the
+  real container behind each of those nodes; `efs ↔ ec2` is deliberately NOT
+  among them, because odin's Lima VMs are created with `mounts: []` and a host
+  directory is not visible inside one at all),
   `encryption` (2 — `kms ↔ secret|ssm`, the only two sidecars odin holds the
   plaintext of; `kms ↔ s3|rds|dynamodb` stays `unmodelled` ON PURPOSE, because
   those live in RustFS, Postgres and dynalite containers odin holds no key for
-  and a line there would claim an encryption that does not happen), and, since
-  v0.8.19, `dns` (1 — `route53 ↔ ec2`, a real `aws_route53_record`, and behind
-  it real name resolution: an `--add-host` entry on every container in the env
-  and an `/etc/hosts` line on every Lima VM in it). Drawing anything else is
-  decoration, and now says so.
-  This paragraph was DUPLICATED — two openings claiming 47 and 42, and two
-  overlapping enumerations — until v0.8.19, a merge artifact from the `volume`
-  and `encryption` work landing in one release out of two worktrees. The
-  recomputation in `ui/src/lib/edge-types.test.ts` uses `toContain`, so it
-  passed against whichever copy happened to be right and the wrong one sat there
-  unread: prose that cannot fail, which is the exact shape this file complains
-  about elsewhere. That test now pins EVERY per-type count above, not three of
-  them.
-- **A `dns` edge to an alb or an rds is REFUSED BY NAME on Apply**, rather than
-  silently dropped. A hosts entry is `<ip> <name>`: it carries no port and no
-  scheme. Measured 2026-08-02 against the real projectors in
-  `reconcile/tf_status.py`, an alb publishes `http://127.0.0.1:<dynamic port>`
-  (dynamic so two load balancers, or two envs, cannot collide on 80) and an rds
-  publishes `host.docker.internal:<port>`, so a name pointing at either would
-  resolve and then fail to connect — a green resource that does not work. Only
-  `ec2` publishes a bare address (`PRIVATE_IP`), so `route53 ↔ ec2` is the whole
-  of the edge; every other target stays `unmodelled` on the canvas and
-  `agent/hcl.py::_dns_target_unsupported` names the target and the reason in the
-  apply's `unsupported` list.
-  The emitted TTL (60s) exists so the generated project stays portable to Amazon;
-  odin's own substrate is a hosts FILE and has no TTL at all, so a changed
-  record lands on the next container launch or hosts push.
-- **odin serves NO DNS.** There is no resolver, no port 53, and nothing answers
-  a DNS query. A hosted zone and its records are stored, round-trip for `tofu`,
-  and are real IAM targets — but the only thing that ever *resolves* a name is a
-  hosts entry odin writes (`--add-host` on a container, `/etc/hosts` on a VM).
-  So `dig`, `nslookup` and anything that talks the DNS protocol will not find an
-  odin record; `getent hosts` and any ordinary client library will. Stated
-  because "Route 53 works" and "names resolve" are the same sentence to most
-  readers and only the second one is true here.
-- **A hosted zone's tags are replayed, but tag REMOVAL on a re-apply is
-  untested.** `ChangeTagsForResource` is really sent on create (measured
-  through a real `tofu apply`, and `ListTagsForResource` must replay it or the
-  provider plans a perpetual diff — the plan is `-detailed-exitcode` 0, so the
-  create path is confirmed). `RemoveTagKeys` is implemented and unit-tested, but
-  no real provider was ever observed sending one: if it instead sends a full
-  replacement, a removed tag would linger. Named here rather than discovered,
-  because the only tag odin itself writes is `odin:node`, which is what
-  `reconcile/tf_status.py` recovers the canvas label from.
-- **A `dns` record resolves to a DIFFERENT address depending on who is asking,
-  and for a VM with no mesh it does not resolve at all.** This is the sharper
-  half of the entry above and it was got wrong first time, so it is stated in
-  full. The emitted `aws_route53_record` carries `aws_instance.<n>.private_ip` —
-  the portable, AWS-shaped answer, and a pure function of the canvas, because
-  making `main.tf` depend on runtime mesh state would break the round trip and
-  show `tofu plan` drift with nothing changed. What odin writes into a hosts
-  file is not always that value:
-
-  | consumer | address written | why |
-  |---|---|---|
-  | container | the instance's `private_ip` | measured reachable |
-  | VM | the instance's Nebula **overlay** address | `private_ip` is **100% packet loss** VM→VM |
-  | VM, env with no mesh | **nothing is written** | there is no address that would work |
-
-  Stock Lima `vz` NATs each VM into its OWN isolated address space: a raw ping
-  between two VMs' vzNAT addresses is 100% loss *before nebula is involved*
-  (`fabric/nebula.py`'s R5 note, confirmed live with two real VMs — it is why
-  VM-to-VM traffic relays through the lighthouse at all). So handing a VM a
-  `private_ip` would be a name that resolves and then hangs, which is this
-  kind's own trap one layer down. The divergence between the emitted argument
-  and the substrate is the same shape as EBS's advisory `device_name`.
-
-  **The no-mesh case is REPORTED in World, not merely withheld**, and that
-  correction is the point. The first design simply wrote no hosts line —
-  modelled on `tf_status._ec2_facts` dropping `MESH_IP` when the lighthouse is
-  down. That is the right INPUT and the wrong whole story: honesty rule 1 lists
-  *"the mesh gate withheld facts that never reached World"* among the four
-  guards that silently never fired, and a user drawing a record, watching the
-  tile go healthy and getting no resolution and no reason is that bug rebuilt on
-  purpose. The resource reports a non-healthy phase naming what is still
-  standing — the record, the address it wanted, and that this env has no mesh.
+  and a line there would claim an encryption that does not happen),
+  `role` (1 — `iam_role ↔ lambda`), `subscription` (1 — `sns ↔ sqs`)
+  and, since v0.8.19, `dns` (1 — `route53 ↔ ec2`, a real
+  `aws_route53_record`, and behind it real name resolution: an `--add-host`
+  entry on every container in the env and an `/etc/hosts` line on every Lima
+  VM in it). Drawing anything else is decoration, and now
+  says so.
+  (These five numbers are not written by hand: `ui/src/lib/edge-types.test.ts`
+  recomputes them from the live registry and fails if this paragraph disagrees.
+  This block carried TWO CONTRADICTORY versions of itself until v0.8.19 — 47/331
+  and 42/336, spliced together by a merge — and the ratchet passed anyway,
+  because `toContain` only needs the correct variant to be present somewhere.
+  If it doubles again, delete the stale half rather than adding a third.)
   Three more pairs carry a SECOND meaning on top of the grant, added in
   v0.8.15 because a permission whose subject is not wired is the same
   decoration under a colour: `logs ↔ lambda|ecs` decides which group the
@@ -917,6 +855,194 @@ They are listed because finding one by surprise is worse than reading it here.
   multi-attach, and `DeleteOnTermination` for a drawn volume — terminating an
   instance frees its volumes back to `available` rather than deleting them,
   which is AWS's own behaviour for a non-root volume.
+- **EFS: a real SHARED DIRECTORY, mounted into containers only, at ONE path per
+  file system — and there are no mount targets, no IAM authorization and no
+  encryption anywhere in it.** An `efs` node is a real host directory
+  (`.odin/<env>/gateway/efs/<fs-id>/`) bind-mounted into the real container
+  behind every `ecs`/`lambda` node you edge it to, through the same
+  `ContainerSpec.volumes` that already hands a Lambda its code directory.
+
+  **VERIFIED END TO END, and falsified.** The acceptance test ran: task A wrote
+  inside its container, the bytes were read ON THE HOST, and task B — a separate
+  container, different task id asserted — read them back from inside its own.
+  `2 passed, exit 0, in 3.41s`. Because that is fast enough to look like nothing
+  ran, `efsctl.task_mounts` was mutated to `return {}`: `1 failed in 181.64s`,
+  burning the full deadline and failing on the host-side half. So the test waits,
+  watches the host, and is quick only because a working bind mount is instant.
+
+  These are the ways it is not AWS, each measured before the code was written.
+
+  1. **`efs → ec2` is NOT modelled, and this one is a refusal rather than a
+     gap.** odin's EC2 nodes are real Lima VMs, and odin creates them with
+     `"mounts": []` (`compute/lima_yaml.py`), so a host directory is not visible
+     inside one *at all* — the mount would succeed and the directory would be
+     empty. There is also no Terraform expression for it: an EFS mount on an
+     instance is an fstab line in user-data, not an argument on
+     `aws_instance`. So the pair stays `unmodelled` and the canvas draws it as a
+     grey *Not modelled* line rather than a fuchsia one. **The same trap one
+     level down, and it is why the file system lives under `.odin/`:** a `-v` of
+     a path under macOS's per-user temp dir (`/private/var/folders/…`) mounts an
+     EMPTY directory under Colima's virtiofs and errors on nothing, because the
+     path does exist inside the VM. That burn is measured and on record. The
+     inference drawn from it — that `.odin/` under `$HOME` therefore mounts
+     NON-empty, `$HOME` being the tree Colima shares in — is **reasoned, not
+     measured**: confirming it needs a real container reading a real file, which
+     is the embargoed suite. It is why the file system lives under `.odin/`
+     rather than a temp dir, and it is the assumption to check first if a mount
+     ever comes up empty.
+
+     **The case that exclusion does NOT cover, and it is the one a user is most
+     likely to hit by accident:** excluding `ec2` from the mount kinds handles an
+     `efs → ec2` EDGE. It does nothing about an ECS service PLACED inside an ec2
+     box, which runs under `LimaRuntime` (`ecsctl.py::runtime_for_service`) — the
+     same VM, the same empty `mounts:`. **odin REFUSES that combination rather
+     than starting it.** `compute/tasks.py::TaskRuntime._refuse_unmountable`
+     raises before any container starts, naming the instance you drew, the mount
+     path, and `mounts: []` as the reason — so the message says why and a user
+     can check it. `ecsctl.py::_launch_task` catches that and writes the task
+     `last_status="STOPPED"` with the exception's text as `stopped_reason`,
+     which becomes the apply's failure line and the node's World verdict rather
+     than a green tile over an empty directory.
+
+     The refusal is pinned in BOTH directions, so it can neither under- nor
+     over-fire: deleting the `_placed_on` half of the condition fails
+     `test_a_placed_task_that_mounts_efs_is_refused_and_never_started`, and
+     deleting the `volumes` half fails `test_a_placed_task_with_no_mounts_still_runs`
+     — placement alone is not the problem, the combination is. And
+     `test_odins_lima_vms_really_share_no_host_directories` pins the PREMISE,
+     asserting that `generate_lima_yaml` really does emit `mounts: []`, so if
+     odin's VMs ever gain a mount that test fails and points at the guard
+     instead of leaving a refusal that forbids something newly possible.
+
+     **What remains unmeasured is narrow and specific:** the real-VM
+     confirmation — that a placed task on a genuine Lima VM would indeed see an
+     empty directory — because that needs the embargoed integration suite. The
+     refusal itself is implemented and unit-tested.
+  2. **One mount path for the whole file system, not one per consumer.** The
+     tile has a single `path` field (default `/mnt/efs`), so every workload that
+     mounts a given efs node mounts it at the same place — a canvas wanting
+     `/mnt/shared` in one service and `/mnt/data` in another needs two efs
+     nodes. AWS models it per consumer (`mountPoints[].containerPath` on ECS,
+     `FileSystemConfig.LocalMountPath` on Lambda) and odin's generator writes
+     the node's one value into both. **What AWS itself allows there is narrower
+     than people expect**, and it is checked rather than assumed: botocore's
+     own `LocalMountPath` shape is `pattern /mnt/[a-zA-Z0-9-_.]+`, `max 160` —
+     exactly ONE segment under `/mnt`. `/mnt/efs` is legal, `/mnt/efs/data` is
+     not, and a node whose `path` does not match is declined by name with the
+     reason rather than emitted into a project real AWS would reject.
+  3. **No mount targets, no security groups on the file system, no IAM
+     authorization, no encryption.** `aws_efs_mount_target` is not modelled, and
+     that is not an oversight about ordering: the substrate is a directory on
+     the machine odin runs on, so there is no ENI to place in a subnet and
+     nothing for a security group to gate. Reachability here is container
+     configuration, not networking. Likewise the two encryption knobs AWS
+     offers — `encrypted`/`kms_key_id` at rest and `transitEncryption` on the
+     ECS volume — are neither emitted nor honoured, for the reason the kms work
+     already recorded: emitting them would claim a property the substrate does
+     not have. And `authorizationConfig.iam` cannot bite, because a bind mount
+     is performed by the container runtime and odin's gateway never sees a
+     signed request for it. That is exactly why the EFS tile offers no IAM
+     actions at all, where every other data-plane tile does.
+
+     **Four fields are accepted, stored and echoed back with NO substrate
+     meaning** — they round-trip so a plan stays clean, and they change nothing:
+     `PerformanceMode` (always `generalPurpose`), `ThroughputMode` (always
+     `bursting`), `Encrypted` (always answers `False` — odin encrypts nothing
+     here), and `PosixUser`, which is the one worth knowing: a `{Uid, Gid}` is
+     stored and echoed but **NOT applied**, so files are created as whatever
+     user the container runs as, not the uid/gid you asked for. Exactly one
+     field is real rather than echoed: `SizeInBytes` is measured by walking the
+     directory, so `du` agrees with it.
+  4. **Mounts are read-write and whole-file-system, and odin REFUSES the two
+     task-definition fields that say otherwise rather than mis-mounting.**
+     `ContainerSpec.volumes` is a `dict[source → container_path]` and the one
+     renderer both drivers share is literally
+     `args += ["-v", f"{host}:{container}"]` (`runtime/colima.py`) — no `:ro`
+     form, no sub-path form. So:
+     - **`readOnly: true` is refused**, not downgraded to a writable mount.
+       Measured before the refusal existed: the mount came up **writable with no
+       word to the user**, which is a protection claimed and not delivered. The
+       message names the volume and says what to do —
+       *"…odin cannot enforce that: its container runtime renders a bind mount
+       as `-v source:target` with no `:ro` form. Nothing was mounted, rather
+       than mounting it WRITABLE and letting you believe the data was
+       protected. Set `readOnly: false` if a writable share is acceptable."*
+     - **A `rootDirectory` other than `/` is refused**, on both the ECS volume
+       and the access point. Measured before the refusal: a volume scoped to
+       `/data` silently received **the WHOLE file system — every other
+       consumer's files**, which is the sharper of the two, since it is a
+       confinement the author asked for and did not get.
+
+     Neither can fire on an odin-generated project: `hcl.py` hardcodes
+     `readOnly: false` and emits `path = "/"`. Both bite only a HAND-WRITTEN or
+     IMPORTED task definition — which is exactly the case the importer can
+     produce, so they are reachable in normal use.
+  5. **A Lambda mounts at most ONE file system, and odin declines the second by
+     name.** That is AWS's own limit, not odin's: `file_system_config` carries
+     `max_items: 1` in the provider schema and `FileSystemConfigs` is `max: 1`
+     in botocore's Lambda model. Drawing a second `efs → lambda` mount is
+     refused with the reason rather than emitted as two blocks that fail
+     `tofu validate` for the whole project.
+  6. **odin's mount-path rule is STRICTER than ECS's, because one field serves
+     both consumers.** `/mnt/efs` is validated against Lambda's
+     `LocalMountPath` pattern (above) for every consumer, but ECS's
+     `containerPath` has no such pattern at all — so `/data` is a mount ECS
+     would happily accept and odin declines. A real limitation created by the
+     tile having one `path` field rather than one per edge, and the honest
+     trade for the tile staying legible.
+
+  7. **Importing someone else's EFS drops `posix_user`, and re-roots the access
+     point at `/`.** `aws_efs_access_point` folds ONTO the file-system node on
+     import, and an access point has arguments a node has nowhere to keep:
+     `posix_user` forces every file the mount creates to one uid/gid and odin
+     re-emits nothing for it, so a project that had one loses it. Its
+     `root_directory` is carried in the weaker sense that odin always re-emits
+     `path = "/"`, so a source rooted at a subdirectory comes back as a CHANGED
+     argument rather than silently — which is the honest half of the same
+     limitation. **Read the DIRECTION of that change, because it is the half
+     that matters here: re-rooting at `/` WIDENS the mount.** A source that
+     confined a consumer to one subtree comes back with the whole file system
+     visible to it, so the imported project grants more access than the one you
+     handed in, never less. Pinned by
+     `test_an_access_point_rooted_at_a_subdirectory_is_reported_as_CHANGED` and
+     its ecs sibling.
+
+  **A migration note with a real date on it, because an efs node CAN already be
+  sitting in a canvas you saved.** The tile was added draggable on 2026-06-20
+  (`ac796d6` — sublabel `Elastic file system`, no `(placeholder)` marker) and
+  placeholders were not hidden from the palette until 2026-07-27 (`41d214b`),
+  whose own commit message records that the hiding is palette-only: "CATALOG
+  keeps every entry, so a canvas already containing a placeholder node still
+  renders properly". So a canvas saved in those five weeks can hold an efs node
+  whose edges are typed `network`, the pre-v0.8.14 catch-all. Those edges still
+  compile, because the mount pass keys on the two NODE kinds and never on
+  `edge.kind` — which is exactly why it must keep doing so. Gating it on the
+  name would silently ignore every one of those edges and produce a file system
+  mounted nowhere, with no error. Milder than the equivalent `ebs` mistake and
+  worth saying so: the old node was a placeholder Apply skipped, so there is no
+  live file system behind it for `tofu` to tear down.
+
+  **odin models exactly the seven operations a real apply/plan/destroy calls,
+  and answers everything else with a protocol-correct 400 naming the op** —
+  `CreateMountTarget`, `DescribeMountTargets`, `PutBackupPolicy`, `TagResource`
+  and `PutLifecycleConfiguration` all return `BadRequest`, never a 503 and never
+  a plausible-looking empty success. Which seven was measured rather than
+  guessed: against OpenTofu 1.12.3 + hashicorp/aws 6.57.1, with
+  `AWS_ENDPOINT_URL` pointed at a recording endpoint, a real
+  apply/plan/destroy over `aws_efs_file_system` + `aws_efs_access_point` never
+  calls `DescribeMountTargets`, `DescribeBackupPolicy`,
+  `DescribeFileSystemPolicy`, `ListTagsForResource` or `TagResource` at all. So
+  they are unimplemented because implementing them would be dead code on this
+  path, not because they were forgotten — and a caller that reaches for one is
+  told so by name.
+
+  **Teardown is swept from the DISK, not from the records**, the same rule the
+  ebs entry states: `/destroy` walks `.odin/<env>/gateway/efs/` itself, so it
+  also finds a directory whose record an interrupted apply lost, and `odin env
+  rm` reclaims it with the state dir. A file system that will NOT go is never
+  reported destroyed — the env is refused with the count, the id, the path and
+  the real OS error, on the grounds that each one holds whatever the workloads
+  that mounted it wrote.
 - **Nebula** is live single-host. VPC and SG config compiles to Nebula
   network and firewall primitives, and every VPC-joined EC2 VM runs a
   `nebula` daemon carrying the compiled SG firewall. The per-environment
@@ -973,3 +1099,104 @@ They are listed because finding one by surprise is worse than reading it here.
   405 by the router. No AWS API uses one, so nothing odin models can reach it —
   but if a future service does, the answer will be a 405 and not a denial, and
   the test above is where to add it.
+
+<!-- apigateway (v0.8.19) -->
+- **API Gateway: the reachable address is `api_endpoint`, NOT the stage's
+  `invoke_url`.** MEASURED against real terraform-provider-aws 5.100.0 driving
+  odin's own gateway, in one state file:
+
+      aws_apigatewayv2_api.public_api   api_endpoint = "http://127.0.0.1:39999"
+      aws_apigatewayv2_stage.default    invoke_url   = "https://api75a2c592.execute-api.us-east-1.amazonaws.com/"
+
+  `api_endpoint` is odin's answer and points at the real nginx container.
+  `invoke_url` is built CLIENT-SIDE by the provider from the API id and the
+  region — it never asks the API, so nothing odin returns can change it, and
+  curling it reaches Amazon or nothing. An earlier probe concluded the opposite
+  because a throwaway stub happened to answer `apiEndpoint` with exactly the
+  string the provider constructs; the match was read as causation. Read
+  `api_endpoint`, or `${{<api node>.API_ENDPOINT}}` on the canvas.
+- **One route per target, at the target's own label, and you cannot choose the
+  path.** A drawn `apigateway → lambda|ecs` edge emits `ANY /<target label>` and
+  `ANY /<target label>/{proxy+}` — two route keys because that is what AWS needs
+  to serve a whole prefix, collapsing to one nginx `location` pair. The path
+  comes from the label because `generate_tf` is a pure function of the canvas
+  and the tile has no route field. Importing a project whose route key is
+  something else (`POST /checkout` against a function labelled `orders`) does not
+  fail — it reports the key as CHANGED and names what odin would emit instead,
+  because the next Apply really would serve a different path.
+- **Only the `$default` stage is served.** odin emits exactly one stage per API,
+  always `$default` with `auto_deploy = true` — the stage whose invoke path
+  carries no stage segment, which is what lets the nginx prefix and the route key
+  mean the same thing. A stage with any other name is STORED and ECHOED (so
+  `tofu plan` is clean) and routes nothing; an imported one is reported CHANGED.
+- **An `apigateway → ecs` route names the service through a hostname only odin
+  resolves.** `integration_uri` is
+  `http://${aws_ecs_service.<n>.name}.odin.internal`. `integration_uri` must be a
+  URI and an ECS service has no URL on real AWS either — an HTTP API reaches a
+  private service through a VPC link, which odin does not model — so the
+  generated file is NOT something that would work against Amazon for this edge.
+  The alternative was requiring an ALB in between, which would make the simplest
+  useful canvas a four-node one.
+- **odin's process is in the data path for an ECS route, and there is no
+  failover across tasks.** An ALB's nginx dials the task directly; an API's nginx
+  dials odin's own invoke shim, which resolves the task's address per request.
+  That is deliberate: a task's published host port changes every time it is
+  replaced, so a baked-in address needs a push from `ecsctl` on every lifecycle
+  transition (four call sites that must all stay correct forever), and a miss is
+  a 502 with no explanation. Resolving per request cannot go stale. What is given
+  up is nginx's request-level `proxy_next_upstream` retry across tasks: the shim
+  dials the FIRST running task and reports the failure if it is not there. An ECS
+  service with no running task yet answers **503 naming the service**, not a
+  bare 502.
+- **The invoke shim is an UNAUTHENTICATED route on the gateway port, bounded by a
+  per-API token.** An HTTP API route with `authorization_type = "NONE"` — the only
+  kind odin emits — is a public endpoint; that is what an API Gateway is. So
+  `/_odin/apigw/{env}/{api}/{integration}` on the gateway's own port accepts
+  unsigned requests. It is bounded rather than open: it takes no function name
+  (only ids resolved through stored records, so it can invoke only what a route
+  already points at) and requires the API's `route_token`, a 32-hex secret minted
+  at CreateApi, kept in the 0600 `apigwctl.json` sidecar and injected by nginx.
+  Without it: 403, with no detail about which id was wrong. That makes the shim
+  no more powerful than dialing the API's own published port — which is the bar,
+  not "the endpoint is protected". `_odin` is a reserved path prefix on the
+  gateway.
+- **A crashed handler is a 502, and that took reading what RIE really sends.**
+  RIE answers a RAISED handler with **HTTP 200** and an `{"errorMessage",
+  "errorType", ...}` body, with no `X-Amz-Function-Error` header at all. Payload
+  format 2.0's rule that "anything without a `statusCode` is the response body"
+  would therefore serve a crashed function as `200 OK` with a stack trace as the
+  payload. odin answers 502 with the function's own error document, which is what
+  a real API Gateway does.
+- **Payload format 2.0 only.** A `1.0` integration is REFUSED at
+  CreateIntegration rather than served a 2.0 event: a 1.0 handler reads
+  `event["httpMethod"]`, which a 2.0 event does not have, so the mismatch would
+  surface as a `KeyError` inside the user's own function and blame their code.
+  A `WEBSOCKET` protocol type is refused at CreateApi for the same class of
+  reason — nginx answers a handshake with a 200 and the caller hangs.
+- **What is NOT modelled:** authorizers (JWT, Lambda, IAM) — every route is
+  `authorization_type = "NONE"`; custom domains and base-path mappings; API keys
+  and usage plans; throttling and quotas; `request_parameters` path/header
+  rewrites; `tls_config`; per-route `timeout_milliseconds` (the shim's own 30s
+  matches the Lambda default); CORS configuration; access logging; and
+  `aws_lambda_permission` — odin does not enforce Lambda resource policies, so
+  the permission real AWS would require to let the API invoke the function is
+  neither emitted nor needed. Every one of these that appears in an imported
+  project is reported by name rather than dropped in silence.
+- **The API Gateway v1 (REST) resource types are not modelled at all.**
+  `aws_api_gateway_rest_api` and its `_resource`/`_method`/`_integration`/
+  `_deployment`/`_stage` companions import as `unsupported`. v2 was chosen
+  because its companion set is flat, which is what makes odin's own output
+  re-import; v1's `parent_id` chains are a tree the importer would have to
+  rebuild. Both v1 and v2 sign under the SigV4 credential scope `apigateway`,
+  so a v1 call reaches the gateway and is classified — it simply has no handler.
+- **The nginx prefix location's upstream path ends in `/`, and it has to.** When
+  `proxy_pass` carries a URI, nginx REPLACES the matched location prefix with it
+  TEXTUALLY. Without the trailing slash, `location /hello/` turned `/hello/a/b`
+  into `/_odin/apigw/<env>/<api>/<int>a/b` — the remainder concatenated onto the
+  integration id. Measured against a real container, which answered
+  `404 {"message": "No integration intbc3b5d20a on API api843ac33f"}` for an
+  integration really called `intbc3b5d20`. Only the `{proxy+}` half broke (an
+  exact-match location appends nothing), so it read as "the greedy route is
+  broken" rather than as string concatenation. Pinned in BOTH directions by
+  `tests/gateway/test_apigwctl.py` — the prefix location must gain the slash and
+  the exact-match location must not.

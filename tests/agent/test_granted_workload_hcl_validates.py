@@ -161,3 +161,66 @@ async def test_the_generated_volume_attachments_pass_the_real_tofu_validate():
     reason, formatted = await validate_refinement(files, files)
     assert reason is None, f"generated Terraform does not validate — {reason}"
     assert formatted is not None
+
+
+# v0.8.19: the EFS MOUNTS, here for the same reason as everything above it and
+# with one addition of its own -- an efs mount is emitted as a NESTED BLOCK on
+# the consumer (`file_system_config` on the function, `volume` +
+# `efs_volume_configuration` on the task definition), and the provider schema is
+# the only thing in this repo that knows those block names and their arguments.
+# A pure-Python assertion cannot tell `local_mount_path` from `local_path`, or
+# `volume` from `vol`; `tofu validate` rejects all four (measured, each one
+# exit 1 with "Missing required argument"/"Unsupported block type").
+#
+# The LAMBDA is included, unlike the grants cases above, and it costs one extra
+# thing to get right: a lambda's HCL calls `filebase64sha256("worker.zip")`,
+# which tofu evaluates at validate time, so the zip `generate_tf` produced has to
+# reach the scratch dir or validation fails on a missing FILE and proves nothing
+# about the mount. `validate_refinement` takes `binary_files` for exactly that,
+# so the caveat at the top of this file ("a lambda canvas cannot go through
+# validate_refinement") is out of date rather than a limit to work around --
+# MEASURED here, this case validates green with the real zip on disk, and the
+# alternative would have left `file_system_config` proven by nothing but string
+# assertions on the one resource type whose argument names only tofu knows.
+MOUNTS_CANVAS = {
+    "nodes": [
+        {"id": "fs", "type": "efs", "position": {"x": 0, "y": 0},
+         "data": {"label": "shared-data", "path": "/mnt/efs"}},
+        {"id": "svc", "type": "ecs", "position": {"x": 20, "y": 0},
+         "data": {"label": "api", "image": "nginx:alpine", "port": "8080"}},
+        {"id": "fn", "type": "lambda", "position": {"x": 40, "y": 0},
+         "data": {"label": "worker", "runtime": "python3.12",
+                  "code": "def lambda_handler(event, context):\n    return event\n"}},
+    ],
+    "edges": [
+        {"id": "e1", "source": "fs", "target": "svc", "data": {"edgeType": "mount"}},
+        # Drawn the other way round AND carrying the pre-registry catch-all type,
+        # which is not hypothetical for efs: `ac796d6` (2026-06-20) shipped the
+        # tile draggable with NO `(placeholder)` marker, `1b158fe` (2026-07-26)
+        # added the marker and `41d214b` (2026-07-27) hid placeholders from the
+        # palette only -- so for five weeks it looked like an ordinary Storage
+        # tile, and a canvas saved then can hold an efs node whose edges are typed
+        # `network`. Gate the mount pass on `edge.kind` and this file loses the
+        # lambda's `file_system_config` -- while still validating perfectly.
+        {"id": "e2", "source": "fn", "target": "fs", "data": {"edgeType": "network"}},
+    ],
+}
+
+
+@pytest.mark.skipif(_NO_TOFU, reason="tofu not on PATH")
+async def test_the_generated_efs_mounts_pass_the_real_tofu_validate():
+    project = generate_tf(canvas_to_stack(MOUNTS_CANVAS))
+    assert project.unsupported == [], project.unsupported
+    main_tf = project.files["main.tf"]
+    # Content first, because `tofu validate` is just as green over a file with no
+    # mount in it at all -- which is precisely the failure being guarded against.
+    assert main_tf.count('resource "aws_efs_file_system"') == 1
+    assert main_tf.count('resource "aws_efs_access_point"') == 1
+    assert main_tf.count("efs_volume_configuration {") == 1
+    assert main_tf.count("file_system_config {") == 1
+    assert '"mountPoints\\": [{\\"sourceVolume\\": \\"shared-data\\"' in main_tf
+
+    files = {"main.tf": main_tf}
+    reason, formatted = await validate_refinement(files, files, project.binary_files)
+    assert reason is None, f"generated Terraform does not validate — {reason}"
+    assert formatted is not None

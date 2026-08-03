@@ -28,7 +28,7 @@ from odin.compute.instances import (
 )
 from odin.compute.proxy import container_name as proxy_container_name
 from odin.fabric.models import MeshNetwork, SubnetAllocation
-from odin.gateway.models import cachectl, elbv2ctl, kmsctl, lambdactl, rdsctl, secretsctl, ssmctl
+from odin.gateway.models import cachectl, efsctl, elbv2ctl, kmsctl, lambdactl, rdsctl, secretsctl, ssmctl
 from odin.gateway.stores import SynthStores
 from odin.reconcile import mesh_health
 from odin.reconcile.tf_status import TF_OWNED_KINDS, project, stranded_in_tf_state
@@ -83,16 +83,17 @@ def _param(name: str, value: str = "v") -> dict:
 def test_tf_owned_kinds_excludes_reconciler_owned_kinds():
     # s3/sqs/sns/dynamodb already get real World entries via the reconciler's
     # own PROVISIONED path -- this projection must never double-own them.
-    # Deduplicated in v0.8.19. This literal carried the SAME self-contradicting
-    # tail the source did -- one line ending "kms", the next "ebs", both
-    # repeating elasticache/rds/alb -- because the merge that produced the one in
-    # `tf_status.py` produced this one too. `tests/test_no_self_contradicting_sets
-    # .py` scans `src/` only, so it would not have caught this copy; noted here
-    # rather than widened, since that scanner's own commit records that including
-    # more surface gave 25 false positives against 1 real finding.
+    #
+    # ONE line per kind, spelled out in full, once. This assertion used to
+    # mirror the source's own both-sides-kept merge artifact (`..."alb",
+    # "kms",` then `..."alb", "ebs",`), and it could never have caught it: a
+    # `set` literal collapses duplicates exactly as the `frozenset` under test
+    # does, so the two agreed while both were malformed. A duplicated
+    # expectation that cannot fail is the same shape as one derived from its
+    # subject -- honesty rule 5.
     assert TF_OWNED_KINDS == {
         "vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr", "logs", "secret", "ssm",
-        "elasticache", "rds", "alb", "kms", "ebs", "route53",
+        "elasticache", "rds", "alb", "kms", "ebs", "efs", "apigateway", "route53",
     }
 
 
@@ -1765,3 +1766,106 @@ async def test_a_zone_over_vms_that_recorded_nothing_is_healthy(tmp_path):
     _zone(stores, "example.com", [_a_record("vm1.example.com", "192.168.64.1")])
 
     assert (await project(stores, ENV))["example.com"][1] == "healthy"
+# --- efs: the ONE kind whose phase is read off the DISK ----------------------
+#
+# Every other kind here projects a state machine some model wrote down. An EFS
+# file system has no state machine at all -- it IS a directory -- so the only
+# question worth asking is whether it is really there.
+
+
+def _file_system(tmp_path: Path, file_system_id: str = "fs-00000000000000001", *, on_disk: bool = True) -> dict:
+    directory = efsctl.host_dir(tmp_path, ENV, file_system_id)
+    if on_disk:
+        directory.mkdir(parents=True)
+    return {
+        "file_system_id": file_system_id,
+        "creation_token": "shared",
+        "host_dir": str(directory),
+        "created_at": 1.0,
+        "performance_mode": "generalPurpose",
+        "throughput_mode": "bursting",
+        "size_bytes": 0,
+    }
+
+
+def _tag_fs(stores: SynthStores, file_system_id: str, label: str) -> None:
+    stores.tags.set(ENV, f"elasticfilesystem:{efsctl.file_system_arn(file_system_id)}", {"odin:node": label})
+
+
+async def test_a_file_system_with_a_real_directory_is_healthy(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.efsctl.set(ENV, "fs:fs-00000000000000001", _file_system(tmp_path))
+    _tag_fs(stores, "fs-00000000000000001", "shared-data")
+
+    kind, phase, facts, verdict = (await project(stores, ENV))["shared-data"]
+
+    assert (kind, phase, verdict) == ("efs", "healthy", None)
+    assert facts["FILE_SYSTEM_ID"] == "fs-00000000000000001"
+    # The path to the REAL artifact, so a user can go and look at it rather
+    # than take odin's word for it -- `_ebs_volumes`' `LIMA_DISK` convention.
+    assert Path(facts["EFS_PATH"]).is_dir()
+
+
+async def test_a_file_system_whose_directory_is_gone_reads_crashed_and_says_where(tmp_path):
+    """THE guard, and the reason this projection is worth having: a record
+    saying `available` over a directory that has been removed is exactly the
+    self-report odin's honesty rules are about. `.odin/` is an ordinary tree a
+    person can `rm -rf`, and a half-finished `/destroy` reaches the same state.
+
+    Mutation-test: replace `directory.is_dir()` with `True` in
+    `_efs_file_systems` and this fails."""
+    stores = SynthStores(tmp_path)
+    stores.efsctl.set(ENV, "fs:fs-00000000000000001", _file_system(tmp_path, on_disk=False))
+    _tag_fs(stores, "fs-00000000000000001", "shared-data")
+
+    kind, phase, facts, verdict = (await project(stores, ENV))["shared-data"]
+
+    assert (kind, phase) == ("efs", "crashed")
+    assert "fs-00000000000000001" in verdict
+    assert str(efsctl.host_dir(tmp_path, ENV, "fs-00000000000000001")) in verdict
+    # NO FACTS, for the same reason `live_verdicts` withholds a dead database's
+    # DATABASE_URL: `EFS_PATH` is a value handed to a workload, and publishing a
+    # path to a directory that is gone is a stale-green fact, not a diagnostic.
+    assert facts == {}
+
+
+async def test_a_directory_that_comes_back_is_healthy_again(tmp_path):
+    """The other half of the ratchet: a projection hard-coded to `crashed`
+    would pass the test above and report every working file system as broken."""
+    stores = SynthStores(tmp_path)
+    record = _file_system(tmp_path, on_disk=False)
+    stores.efsctl.set(ENV, "fs:fs-00000000000000001", record)
+    _tag_fs(stores, "fs-00000000000000001", "shared-data")
+    assert (await project(stores, ENV))["shared-data"][1] == "crashed"
+
+    Path(record["host_dir"]).mkdir(parents=True)
+
+    assert (await project(stores, ENV))["shared-data"][1] == "healthy"
+
+
+async def test_an_untagged_file_system_projects_nothing_rather_than_a_wrong_label(tmp_path):
+    stores = SynthStores(tmp_path)
+    stores.efsctl.set(ENV, "fs:fs-00000000000000001", _file_system(tmp_path))
+
+    assert "fs-00000000000000001" not in await project(stores, ENV)
+
+
+async def test_only_the_fs_key_family_is_projected_as_efs(tmp_path):
+    """`_efs_file_systems` scans the whole `efsctl` store, which also holds
+    ACCESS POINTS -- so what selects a record has to be the key prefix, not a
+    field sniff. `_ebs_volumes`' surviving-mutant lesson, applied before it
+    could happen again: the witness here is a record under a DIFFERENT key that
+    carries every field a file system does.
+
+    Mutation-test: drop the `key.startswith("fs:")` check and this fails."""
+    stores = SynthStores(tmp_path)
+    stores.efsctl.set(ENV, "fs:fs-00000000000000001", _file_system(tmp_path))
+    _tag_fs(stores, "fs-00000000000000001", "shared-data")
+    # A file-system-SHAPED record filed under the access-point family's key.
+    stores.efsctl.set(ENV, "ap:fsap-00000000000000001", _file_system(tmp_path, "fs-decoy00000000000"))
+    _tag_fs(stores, "fs-decoy00000000000", "decoy")
+
+    projected = await project(stores, ENV)
+
+    assert projected["shared-data"][0] == "efs"
+    assert "decoy" not in projected

@@ -168,6 +168,50 @@ async def test_ensure_falls_back_to_the_default_image_for_an_unknown_runtime(tmp
     assert runtime.runs[0].image == RUNTIME_IMAGES[DEFAULT_RUNTIME]
 
 
+# --- efs: the mount lands BESIDE the code directory, never on top of it -----
+
+
+async def test_ensure_mounts_efs_beside_the_code_directory(tmp_path, listener):
+    runtime = FakeRuntime()
+    runtime.next_port = listener
+    rt = FunctionRuntime(runtime, root=tmp_path)
+    code_dir = rt.extract_code(ENV, FN, _zip_bytes({"lambda_function.py": "x"}))
+
+    await rt.ensure(
+        ENV, FN, "python3.12", "h.h", {}, code_dir,
+        volumes={"/Users/x/.odin/e/gateway/efs/fs-1": "/mnt/efs"},
+    )
+
+    assert runtime.runs[0].volumes == {
+        "/Users/x/.odin/e/gateway/efs/fs-1": "/mnt/efs",
+        str(code_dir): "/var/task",
+    }
+
+
+async def test_the_code_directory_wins_a_collision_with_a_mount(tmp_path, listener):
+    """`/var/task` is where the handler lives, so a mount landing on top of it
+    would replace the function's own code with the shared file system -- a
+    function that deploys and then cannot import itself.
+
+    `efsctl.function_mounts` already refuses any path outside `/mnt/<one
+    segment>` (AWS's own `LocalMountPath` pattern), so this cannot arrive
+    through the product's path today. It is pinned anyway because the ordering
+    in `ensure` is the thing that makes that true here rather than two layers
+    away, and an ordering nobody asserts is an ordering that gets tidied."""
+    runtime = FakeRuntime()
+    runtime.next_port = listener
+    rt = FunctionRuntime(runtime, root=tmp_path)
+    code_dir = rt.extract_code(ENV, FN, _zip_bytes({"lambda_function.py": "x"}))
+
+    await rt.ensure(ENV, FN, "python3.12", "h.h", {}, code_dir, volumes={"/somewhere/else": "/var/task"})
+
+    assert runtime.runs[0].volumes["/somewhere/else"] == "/var/task"
+    assert runtime.runs[0].volumes[str(code_dir)] == "/var/task"
+    # The code entry is written LAST, so docker's own last-wins ordering puts
+    # the handler's directory on /var/task.
+    assert list(runtime.runs[0].volumes)[-1] == str(code_dir)
+
+
 # --- owner directive B4: the function's real MemorySize caps the container --
 
 

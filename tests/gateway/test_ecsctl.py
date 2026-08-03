@@ -27,7 +27,7 @@ from odin.aws.backings import REGION
 from odin.compute.tasks import TaskContainerHandle
 from odin.gateway.classify import classify
 from odin.gateway.keys import KeyStore
-from odin.gateway.models import ecsctl, join, logsctl
+from odin.gateway.models import ecsctl, efsctl, join, logsctl
 from odin.gateway.stores import SynthStores
 from odin.runtime.colima import CONTAINER_HOST
 from odin.spec.store import SpecStore
@@ -64,6 +64,7 @@ class FakeTaskRuntime:
         self.fail_run = fail_run
         self.block = block
         self.ran: list[tuple] = []
+        self.volumes: dict[str, str] = {}
         self.stopped: list[tuple] = []
         self._status: dict[tuple, str] = {}
         self._exit_codes: dict[tuple, int] = {}
@@ -90,7 +91,13 @@ class FakeTaskRuntime:
     async def run(
         self, env: str, task_id: str, container_def: dict, extra_env: dict[str, str] | None = None,
         cpu: str | int | None = None, memory: str | int | None = None,
+        volumes: dict[str, str] | None = None,
     ) -> TaskContainerHandle:
+        # RECORDED, not merely accepted -- a fake that swallowed this kwarg would
+        # keep every test here green while proving nothing about the EFS mount
+        # the caller resolves. `test_a_task_definitions_efs_volume_reaches_the_
+        # container` reads it.
+        self.volumes = dict(volumes or {})
         await self._like_a_real_docker_call()
         if self.block is not None:
             # `threading.Event.wait(timeout=5.0)` RETURNS on timeout and lets
@@ -1571,3 +1578,105 @@ async def test_sweep_marks_a_task_whose_container_vanished(sink, ecs, stores):
         "removed outside odin — re-Apply to recreate"
     )
     assert (await _describe_service(stores, sink, ecs, runtime))["runningCount"] == 0
+
+
+# --- efs: `taskdef["volumes"]` finally gets READ -----------------------------
+#
+# It has been stored (`_register_task_definition`) and echoed
+# (`_taskdef_json`) since ECS landed, and read by absolutely nothing. These
+# tests are about the join that reads it reaching a REAL container spec, and
+# about the two ways it must refuse rather than mount an empty directory.
+
+
+async def _a_file_system(stores, tmp_path, file_system_id: str = "fs-00000000000000001") -> str:
+    """A file system record plus its REAL directory -- the same pair
+    `efsctl._create_file_system` writes, built directly so this file needs no
+    EFS client of its own."""
+    directory = efsctl.host_dir(tmp_path, ENV, file_system_id)
+    directory.mkdir(parents=True)
+    stores.efsctl.set(ENV, f"fs:{file_system_id}", {
+        "file_system_id": file_system_id, "creation_token": "shared", "host_dir": str(directory),
+        "created_at": 1.0, "performance_mode": "generalPurpose", "throughput_mode": "bursting",
+        "size_bytes": 0,
+    })
+    return str(directory)
+
+
+_EFS_VOLUMES = [{"name": "shared", "efsVolumeConfiguration": {"fileSystemId": "fs-00000000000000001"}}]
+_MOUNTING_CONTAINER_DEF = [{
+    **_CONTAINER_DEF[0],
+    "mountPoints": [{"sourceVolume": "shared", "containerPath": "/mnt/efs", "readOnly": False}],
+}]
+
+
+async def test_a_task_definitions_efs_volume_reaches_the_container(stores, sink, ecs, tmp_path):
+    """The whole ECS half, through the real handlers: a taskdef registered with
+    an `efsVolumeConfiguration` and a container that names it in `mountPoints`
+    launches a container bind-mounting the REAL host directory."""
+    directory = await _a_file_system(stores, tmp_path)
+    runtime = FakeTaskRuntime()
+    await _create_cluster(stores, sink, ecs, runtime)
+    await _register_taskdef(
+        stores, sink, ecs, runtime,
+        containerDefinitions=_MOUNTING_CONTAINER_DEF, volumes=_EFS_VOLUMES,
+    )
+    await _create_service(stores, sink, ecs, runtime, desiredCount=1)
+    await _wait_for_running_count(stores, sink, ecs, runtime, 1)
+
+    assert runtime.volumes == {directory: "/mnt/efs"}
+
+
+async def test_the_stored_container_definition_is_not_mutated_by_the_mount(stores, sink, ecs, tmp_path):
+    """ecsctl's zero-drift mandate: `containerDefinitions` is stored VERBATIM.
+    The join reads `mountPoints` and builds a SEPARATE volume map, so what tofu
+    reads back is byte-for-byte what it sent."""
+    await _a_file_system(stores, tmp_path)
+    runtime = FakeTaskRuntime()
+    await _create_cluster(stores, sink, ecs, runtime)
+    await _register_taskdef(
+        stores, sink, ecs, runtime,
+        containerDefinitions=_MOUNTING_CONTAINER_DEF, volumes=_EFS_VOLUMES,
+    )
+
+    stored = stores.ecsctl.get(ENV, "taskdef:app:1")
+    assert stored["container_definitions"] == _MOUNTING_CONTAINER_DEF
+    assert stored["volumes"] == _EFS_VOLUMES
+
+
+async def test_a_task_whose_file_system_is_gone_stops_with_the_real_reason(stores, sink, ecs, tmp_path):
+    """THE refusal, at the level a user sees it. The task does not come up
+    holding an empty directory and reporting success -- it goes STOPPED with
+    the reason, which is what fails the apply and puts a verdict on the canvas.
+
+    Mutation-test: make `efsctl._mount_source` return the path without the
+    `is_dir()` check and this fails (the task reaches RUNNING)."""
+    directory = await _a_file_system(stores, tmp_path)
+    Path(directory).rmdir()
+    assert not Path(directory).exists(), "the injection did nothing -- this test proves nothing"
+
+    runtime = FakeTaskRuntime()
+    await _create_cluster(stores, sink, ecs, runtime)
+    await _register_taskdef(
+        stores, sink, ecs, runtime,
+        containerDefinitions=_MOUNTING_CONTAINER_DEF, volumes=_EFS_VOLUMES,
+    )
+    await _create_service(stores, sink, ecs, runtime, desiredCount=1)
+    await _wait_for_running_count(stores, sink, ecs, runtime, 0)
+
+    assert not runtime.ran, "the container was STARTED over a missing file system"
+    (task,) = [v for k, v in stores.ecsctl.items(ENV).items() if k.startswith("task:")]
+    assert task["last_status"] == "STOPPED"
+    assert directory in task["stopped_reason"]
+    assert "empty directory" in task["stopped_reason"]
+
+
+async def test_a_taskdef_with_no_efs_volume_mounts_nothing(stores, sink, ecs):
+    """The other half of the ratchet: the ordinary ECS path must acquire no
+    volume at all."""
+    runtime = FakeTaskRuntime()
+    await _create_cluster(stores, sink, ecs, runtime)
+    await _register_taskdef(stores, sink, ecs, runtime)
+    await _create_service(stores, sink, ecs, runtime, desiredCount=1)
+    await _wait_for_running_count(stores, sink, ecs, runtime, 1)
+
+    assert runtime.volumes == {}

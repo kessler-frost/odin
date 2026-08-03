@@ -29,7 +29,12 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from odin.agent.hcl import _ALB_TARGET_KINDS, _DNS_TARGET_KINDS, _VOLUME_HOST_KINDS
+from odin.agent.hcl import (
+    _ALB_TARGET_KINDS,
+    _DNS_TARGET_KINDS,
+    _EFS_MOUNT_KINDS,
+    _VOLUME_HOST_KINDS,
+)
 
 REPO = Path(__file__).resolve().parents[2]
 IAM_TS = (REPO / "ui" / "src" / "lib" / "iam.ts").read_text()
@@ -49,6 +54,7 @@ def test_the_extraction_finds_something():
     assert _ALB_TARGET_KINDS, "hcl.py::_ALB_TARGET_KINDS is empty -- the import is wrong"
     assert _VOLUME_HOST_KINDS, "hcl.py::_VOLUME_HOST_KINDS is empty -- the import is wrong"
     assert _DNS_TARGET_KINDS, "hcl.py::_DNS_TARGET_KINDS is empty -- the import is wrong"
+    assert _EFS_MOUNT_KINDS, "hcl.py::_EFS_MOUNT_KINDS is empty -- the import is wrong"
 
 
 def test_alb_target_kinds_agree_across_the_language_boundary():
@@ -173,11 +179,33 @@ def test_dns_target_kinds_agree_across_the_language_boundary():
     )
 
 
+def test_efs_mount_kinds_agree_across_the_language_boundary():
+    """v0.8.19's pair. Both drift directions are the usual ones, but the second is
+    worse than usual here because a mount is INVISIBLE when it is missing: a
+    service whose task definition carries no `volume` starts perfectly, serves
+    traffic, and writes to its own container filesystem instead of the shared one
+    -- so the data is silently not shared and nothing fails until someone looks
+    for a file that is not there."""
+    ui, builder = _ts_set("efsMountTypes"), set(_EFS_MOUNT_KINDS)
+    assert ui == builder, (
+        f"`ui/src/lib/iam.ts::efsMountTypes` is {sorted(ui)} but "
+        f"`agent/hcl.py::_EFS_MOUNT_KINDS` is {sorted(builder)}.\n"
+        f"  only in the UI  (promised, never built): {sorted(ui - builder)}\n"
+        f"  only in the builder (built, labelled 'Not modelled'): {sorted(builder - ui)}\n"
+        "They must land in the same merge."
+    )
+
 def test_every_dns_target_kind_is_a_real_canvas_kind():
     """The companion check: a kind the canvas cannot draw makes the agreement
     above vacuously true for it."""
     from odin.spec.translate import MODELLED_NODE_TYPES
     assert set(_DNS_TARGET_KINDS) <= MODELLED_NODE_TYPES
+
+def test_every_efs_mount_kind_is_a_real_canvas_kind():
+    """The companion check: a kind the canvas cannot draw makes the agreement
+    above vacuously true for it."""
+    from odin.spec.translate import MODELLED_NODE_TYPES
+    assert set(_EFS_MOUNT_KINDS) <= MODELLED_NODE_TYPES
 
 
 def test_role_holder_kinds_agree_across_the_language_boundary():

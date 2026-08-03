@@ -1379,7 +1379,27 @@ def _lambda(res: ResourceDesired, refs: Refs) -> Built:
     }
     # No `environment` block: the node's env map is injected at container launch
     # (`gateway/wiring.py`); this only orders the producers ahead of it.
-    return attrs, _depends_on_block(res, refs, _grant_dependency(res, refs))
+    blocks = [_depends_on_block(res, refs, _grant_dependency(res, refs))]
+    # v0.8.19: an efs node edged to this function mounts its file system here.
+    # The `arn` is an ACCESS POINT's, never the file system's: AWS's own pattern
+    # for this argument ends `access-point/fsap-[a-f0-9]{17}` (botocore's
+    # `FileSystemConfig.Arn`), so a file-system arn is a project real AWS
+    # rejects. The mount pass reserved both halves under `_efs_mount_key`, and
+    # reserving it at all is already gated on the efs node being buildable --
+    # otherwise this reference would resolve to nothing and fail the plan for
+    # every resource on the canvas.
+    #
+    # No extra `depends_on`: this reference IS the ordering, so tofu cannot
+    # create the function before the access point exists.
+    mount_path, access_point = refs.get(_efs_mount_key(res.id), ("", ""))
+    if access_point:
+        blocks.append(
+            "  file_system_config {\n"
+            f"    arn              = aws_efs_access_point.{access_point}.arn\n"
+            f"    local_mount_path = {quote(mount_path)}\n"
+            "  }"
+        )
+    return attrs, "\n\n".join(block for block in blocks if block)
 
 
 # V5c: ECS services (real per-task Colima containers, gateway/models/
@@ -1688,14 +1708,35 @@ def _ecs_image(res: ResourceDesired, refs: Refs) -> str:
     return f"${{aws_ecr_repository.{repo_name}.repository_url}}:{tag}"
 
 
-def _ecs_container_definitions(res: ResourceDesired, refs: Refs) -> list[dict]:
+def _ecs_container_definitions(
+    res: ResourceDesired, refs: Refs, mounts: tuple[tuple[str, str], ...] = (),
+) -> list[dict]:
+    """`mounts` is `[(efs node id, container path)]` for the file systems this
+    service was edged to, resolved by `generate_tf`'s mount pass. It arrives as
+    an argument rather than through `refs` because a service may mount SEVERAL
+    file systems and a `refs` value is one pair of strings.
+
+    ABSENT rather than `[]` when nothing is mounted, so every canvas without an
+    efs node generates the byte-identical container definition it did before --
+    `container_definitions` is stored verbatim by `ecsctl` and a changed string
+    is a new task-definition revision, which redeploys the service."""
     port = _field(res, "port", _DEFAULT_ECS_PORT)
     port_int = int(port) if port.isdigit() else int(_DEFAULT_ECS_PORT)
+    # `sourceVolume` must be the `volume` block's `name` (the taskdef pass emits
+    # the efs node's id there) or ECS rejects the registration; `readOnly` is
+    # false because odin's renderer has no `:ro` form at all (`ContainerSpec.
+    # volumes`), and claiming read-only while mounting read-write would be worse
+    # than not offering it.
+    mounted = [
+        {"sourceVolume": efs_id, "containerPath": path, "readOnly": False}
+        for efs_id, path in mounts
+    ]
     return [{
         "name": res.id,
         "image": _ecs_image(res, refs),
         "essential": True,
         "portMappings": [{"containerPort": port_int, "hostPort": 0, "protocol": "tcp"}],
+        **({"mountPoints": mounted} if mounted else {}),
     }]
 
 
@@ -2064,6 +2105,107 @@ def _ebs(res: ResourceDesired, refs: Refs) -> Built:
     }, ""
 
 
+# v0.8.19: EFS file systems -- one `aws_efs_file_system` per efs node, and then
+# the part that is actually the feature, which is the COMPANIONS: an
+# `aws_efs_access_point` for a file system some lambda mounts, and a `volume` +
+# `mountPoints` pair on the task definition of every ecs service that mounts it
+# (the mount pass at the bottom of `generate_tf`). An `aws_efs_file_system` on
+# its own is storage nothing can reach; the whole point of EFS is that many
+# consumers share ONE of them, which is why the mount is many-to-many where
+# `_VOLUME_HOST_KINDS`' attachment is strictly one-to-one.
+#
+# What this deliberately does NOT emit, each absence for its own reason:
+#   * `encrypted` / `kms_key_id` -- odin encrypts nothing here. The substrate is
+#     a real host directory; emitting the argument would claim a property the
+#     substrate does not have, which is the mistake the kms work paid for once
+#     already.
+#   * `performance_mode` / `throughput_mode` -- the tile authors neither, so
+#     reading them from the canvas would be a field nothing can set. Measured on
+#     the wire (a real `tofu apply` of these two resources against a recording
+#     HTTP endpoint, hashicorp/aws 6.57.1): the provider sends
+#     `ThroughputMode: bursting` by itself.
+#   * `name` -- MEASURED from the real provider schema (`tofu providers schema
+#     -json`, OpenTofu 1.12.3, hashicorp/aws ~> 5.0): `aws_efs_file_system.name`
+#     is COMPUTED, not an argument at all. A file system is named by its `Name`
+#     tag and nothing else. odin carries the canvas label on `odin:node` for
+#     every kind (`_tags_block`), which is the answer `kmsctl` reached for the
+#     identical reason -- `CreateKey` has no name argument either.
+_DEFAULT_EFS_PATH = "/mnt/efs"
+
+# AWS's OWN pattern for a LAMBDA mount path, copied verbatim out of botocore's
+# `FileSystemConfig.LocalMountPath` shape (botocore 1.43.30) rather than
+# remembered -- `test_hcl_efs.py::test_the_mount_path_pattern_is_the_one_aws_publishes`
+# reads it back out of botocore and fails the build if the two ever diverge.
+#
+# The character class holds no `/`, so a lambda mount path is exactly ONE segment
+# under `/mnt`: `/mnt/efs` is legal and `/mnt/efs/data` is not. That is worth a
+# guard rather than a comment, because the file odin would generate for the
+# second is one real AWS rejects at CreateFunction -- an apply failure a long way
+# from the canvas field that caused it.
+#
+# IT IS A LAMBDA CONSTRAINT AND ONLY A LAMBDA CONSTRAINT, which is the whole
+# reason the check lives in the mount pass and not in `_efs`. ECS's own
+# `MountPoint.containerPath` carries NO pattern and no length limit at all
+# (botocore, printed: `metadata={}`), and odin's substrate is a bind mount that
+# serves any path, so an ecs-only canvas mounting at `/data` is legal in AWS,
+# legal here, and must not be refused. Applying lambda's rule to every efs node
+# did exactly that, and it was caught by the agent building the IMPORTER against
+# this file rather than by anything on this side.
+#
+# `fullmatch`, because that is how AWS applies a shape pattern and because
+# `search` is measurably useless here: it accepts `/mnt/efs/data`, `/mnt/e s`
+# and `/mnt/efs:x` alike (printed before this line was written).
+_LOCAL_MOUNT_PATH_PATTERN = "/mnt/[a-zA-Z0-9-_.]+"
+_MOUNT_PATH = re.compile(_LOCAL_MOUNT_PATH_PATTERN)
+
+# `CreationToken` is `min 1, max 64` in botocore's own `CreateFileSystemRequest`.
+# The canvas label IS the creation token (odin's canonical id everywhere else
+# too), so a longer label has to be declined BY NAME: truncating it in silence
+# would let two long labels name one file system.
+_MAX_CREATION_TOKEN = 64
+
+
+def _lambda_mount_path(efs_id: str, path: str) -> str:
+    return (
+        f"mounts {efs_id} at {path!r}, which is not a path a Lambda function can mount — AWS's own "
+        f"pattern is {_LOCAL_MOUNT_PATH_PATTERN}, one segment under /mnt ('/mnt/efs' yes, "
+        f"'/mnt/efs/data' no), and CreateFunction rejects anything else. An ecs service has no such "
+        f"constraint (ECS's `containerPath` carries no pattern at all), so give {efs_id} a `path` "
+        "under /mnt, or mount it on a service instead"
+    )
+
+
+def _long_creation_token(label: str) -> str:
+    return (
+        f"the label is {len(label)} characters and an EFS creation token is capped at "
+        f"{_MAX_CREATION_TOKEN} — shorten the label rather than have odin truncate it, which would "
+        "let two long labels name one file system"
+    )
+
+
+def _efs_fault(res: ResourceDesired) -> str:
+    """The reason this efs node cannot be BUILT, or "" if it can.
+
+    Only properties of the file system ITSELF live here -- the mount path does
+    not, because whether a path is legal depends on WHO mounts it (see
+    `_LOCAL_MOUNT_PATH_PATTERN`), which this cannot see.
+
+    ONE function, shared by `_efs` (which declines the node) and by the mount
+    pass, which runs BEFORE pass 2 -- `_lambda` reads its answer -- and so cannot
+    consult `built_ids`. The two must not disagree: a mount pass that authored a
+    `file_system_config` naming an access point the declined node never emitted
+    leaves an unresolvable reference, and `tofu plan` fails for the WHOLE project
+    on one of those, so every other resource on the canvas stops applying too.
+    The same reason `_grant_role_ref` is shared by the pass that reserves a
+    policy name and the pass that emits it.
+    """
+    return _long_creation_token(res.id) if len(res.id) > _MAX_CREATION_TOKEN else ""
+
+
+def _efs(res: ResourceDesired, refs: Refs) -> Built:
+    return _efs_fault(res) or ({"creation_token": quote(res.id)}, "")
+
+
 # v0.8.19: DNS -- one `aws_route53_zone` per route53 node, plus an
 # `aws_route53_record` companion per route53<->ec2 edge (the record pass at the
 # bottom of `generate_tf`). The substrate is REAL NAME RESOLUTION: an
@@ -2155,6 +2297,86 @@ def _route53(res: ResourceDesired, refs: Refs) -> Built:
 # kind -> terraform resource type; kept separate from _BUILDERS so pass 1 of
 # generate_tf can assign HCL names (scoped per resource type) without running
 # any builder.
+# --- apigateway (v0.8.19) ---------------------------------------------------
+#
+# An HTTP API (`aws_apigatewayv2_api`) whose ROUTES come from its edges, exactly
+# as an ALB's target attachments do. One canvas node becomes:
+#
+#     aws_apigatewayv2_api          the API itself (this builder)
+#     aws_apigatewayv2_stage        one, always `$default` (companion pass)
+#     aws_apigatewayv2_integration  one per target edge (companion pass)
+#     aws_apigatewayv2_route x2     per target edge (companion pass)
+#
+# WHY TWO ROUTES PER TARGET. A route key `ANY /orders` matches ONLY `/orders`;
+# `ANY /orders/{proxy+}` matches `/orders/a/b` and NOT `/orders`. Serving a whole
+# path prefix therefore takes both -- that is AWS's own idiom, not odin's
+# invention -- and they collapse back to ONE nginx `location` pair on the
+# substrate side (`compute/apigw.py`) and to ONE canvas edge on the import side
+# (`agent/import_tf.py` recovers the edge from the INTEGRATION, so the route
+# count never reaches the canvas).
+#
+# The path segment is the TARGET's label, not a canvas field, for the reason
+# `_EBS_DEVICE_NAMES` gives about positional device names: `generate_tf` is a
+# pure function of the canvas, and a field the tile does not have cannot be read.
+# A label is stable, unique on the canvas, and reads correctly
+# (`https://<endpoint>/orders/...` -> the `orders` function).
+_APIGW_STAGE = "$default"
+_APIGW_TARGET_KINDS = ("lambda", "ecs")
+# The ECS hostname suffix. Kept in lock-step with
+# `gateway/models/apigwctl.py::ECS_HOST_SUFFIX`, which parses it back off the
+# wire; `tests/agent/test_hcl_apigateway.py` asserts the two agree so a rename
+# on one side fails the build rather than silently breaking routing.
+_APIGW_ECS_HOST_SUFFIX = ".odin.internal"
+
+
+def _apigateway(res: ResourceDesired, refs: Refs) -> Built:
+    """The PRIMARY `aws_apigatewayv2_api` block.
+
+    Deliberately NOT containment-gated, unlike `_alb`/`_ec2`: a real HTTP API is
+    regional and has no subnet, so requiring one would be odin inventing a
+    constraint AWS does not have. It also has no canvas-authored knob worth
+    emitting -- `route_selection_expression` is fixed by the protocol and
+    `disable_execute_api_endpoint` would be a claim about a domain odin has no
+    model for."""
+    return {
+        "name": quote(res.id),
+        "protocol_type": quote("HTTP"),
+    }, ""
+
+
+def _apigw_route_keys(target_id: str) -> tuple[str, str]:
+    """The two route keys one target owns. One function so the generator and the
+    tests cannot drift on the spelling."""
+    return f"ANY /{target_id}", f"ANY /{target_id}/{{proxy+}}"
+
+
+def _apigw_integration_attrs(target: ResourceDesired, target_name: str) -> dict[str, str]:
+    """The integration block for one target, which is where the two kinds
+    genuinely differ.
+
+    lambda -> `AWS_PROXY` carrying the function's `invoke_arn`, which is real
+    AWS's own wiring and what `apigwctl.function_of` reads the name back out of.
+
+    ecs -> `HTTP_PROXY` at `http://<service name>.odin.internal`. An ECS service
+    has no URL on real AWS either (an HTTP API reaches a private one through a
+    VPC link, which odin does not model), and `integration_uri` must be a URI --
+    so odin names the service through a hostname only odin resolves, and
+    docs/limits.md says so rather than implying the file would work against
+    Amazon. The alternative considered and rejected was requiring an ALB in
+    between, which would make the simplest useful canvas a four-node one."""
+    if target.kind == "lambda":
+        return {
+            "integration_type": quote("AWS_PROXY"),
+            "integration_uri": f"aws_lambda_function.{target_name}.invoke_arn",
+            "payload_format_version": quote("2.0"),
+        }
+    return {
+        "integration_type": quote("HTTP_PROXY"),
+        "integration_method": quote("ANY"),
+        "integration_uri": f'"http://${{aws_ecs_service.{target_name}.name}}{_APIGW_ECS_HOST_SUFFIX}"',
+    }
+
+
 _TF_TYPES = {
     "s3": "aws_s3_bucket",
     "sqs": "aws_sqs_queue",
@@ -2177,6 +2399,16 @@ _TF_TYPES = {
     "kms": "aws_kms_key",
     "ebs": "aws_ebs_volume",
     "route53": "aws_route53_zone",
+    "efs": "aws_efs_file_system",
+    # apigateway (v0.8.19). **v2, not v1**, and that is an importability
+    # decision rather than a preference: an `aws_api_gateway_rest_api` needs
+    # `aws_api_gateway_resource` + `_method` + `_integration` + `_deployment` +
+    # `_stage` per path -- five companion types whose relationships the importer
+    # would have to rebuild from `parent_id` chains -- against v2's flat
+    # api/integration/route/stage. odin's own output MUST re-import
+    # (ROADMAP: two companions already fail that bar and a third is not
+    # acceptable), and a flat companion set is what makes that reachable.
+    "apigateway": "aws_apigatewayv2_api",
 }
 
 _BUILDERS = {
@@ -2201,6 +2433,8 @@ _BUILDERS = {
     "kms": _kms,
     "ebs": _ebs,
     "route53": _route53,
+    "efs": _efs,
+    "apigateway": _apigateway,  # v0.8.19
 }
 
 # W2.5: which canvas kinds can actually BE an ALB target. An ECS service
@@ -2298,15 +2532,53 @@ def _volume_already_attached(volume_id: str, instance_id: str, holder: str) -> s
     )
 
 
-# The two kinds whose World fact carries a PORT, and so cannot be named by a
-# hosts entry. Spelled with the measured value rather than "an address odin
-# cannot express", because the whole point of declining is that the user is told
-# what odin actually saw -- and because a reader can check it against
-# `tf_status.py::_load_balancers` / `_db_facts` in one grep.
+# v0.8.19: which canvas kinds can MOUNT a file system. `ecs` and `lambda` -- the
+# two kinds odin runs as CONTAINERS, because the substrate is a host directory
+# bind-mounted into one, so a kind with no container has nowhere to put it.
+#
+# `ec2` is absent deliberately and the reason is measured, not stylistic: odin's
+# Lima VMs are created with `"mounts": []` (`compute/lima_yaml.py`), so a host
+# directory is not visible inside a VM at all. An `efs -> ec2` edge would author
+# a mount that silently resolves to an EMPTY directory, which is the substrate
+# hazard this repo has already been bitten by once under Colima's virtiofs.
+#
+# Mirrored by `ui/src/lib/iam.ts::efsMountTypes`, with
+# `tests/spec/test_edge_registry_matches_builders.py` failing the build if the
+# two sides ever disagree -- the same cross-language ratchet `_ALB_TARGET_KINDS`
+# and `_VOLUME_HOST_KINDS` have.
+_EFS_MOUNT_KINDS = ("ecs", "lambda")
+
+
+def _efs_mount_key(node_id: str) -> str:
+    """A synthetic `refs` key (never a real canvas id -- see the `Refs` type)
+    carrying the EFS mount a workload was edged to, as `(local mount path,
+    access point HCL name)`. Reserved by the mount pass in `generate_tf`, read by
+    `_lambda`, exactly like `_alb_target_key` and the lambda auto-role."""
+    return f"__efs_mount__{node_id}"
+
+
+def _two_file_systems(efs_ids: list[str]) -> str:
+    return (
+        f"drawn to more than one EFS file system ({', '.join(repr(i) for i in efs_ids)}) and a "
+        "Lambda function mounts at most ONE — `file_system_config` carries `max_items: 1` in the "
+        "real provider schema and `FileSystemConfigs` `max: 1` in botocore's Lambda model (both "
+        "measured), so emitting two blocks fails `tofu validate` for the whole project. Draw one"
+    )
+
+
+def _mount_path_taken(efs_id: str, consumer_id: str, holder: str, path: str) -> str:
+    return (
+        f"{efs_id} (efs): {consumer_id} already mounts {holder} at {path}, and one path inside a "
+        f"container holds one file system — odin renders `-v <host dir>:{path}` per mounted file "
+        f"system (`runtime/colima.py`), so only {holder} is mounted there. Give one of them a "
+        "different `path`, or draw one of the edges elsewhere"
+    )
+
+
 _DNS_PORTED_FACTS = {
-    "alb": "the `ALB_ENDPOINT` fact, measured as `http://127.0.0.1:41234` — the proxy is published "
+    "alb": "the `ALB_ENDPOINT` fact — `http://127.0.0.1:<a dynamic port>`. The proxy is published "
            "on a DYNAMIC host port because a fixed 80 would collide across load balancers and envs",
-    "rds": "the `endpoint` fact, measured as `host.docker.internal:55432` — a Postgres container "
+    "rds": "the `endpoint` fact — `host.docker.internal:<a dynamic port>`. A Postgres container "
            "is published on a dynamic host port for the same reason",
 }
 
@@ -2515,6 +2787,96 @@ def generate_tf(stack: Stack) -> TfProject:
             else:
                 unsupported.append(_alb_target_unsupported(alb_id, target_id, target_res.kind))
             break  # one edge is one (alb, target) pair, whichever way it was drawn
+
+    # Pass 1.55 (v0.8.19) — EFS MOUNT edges. An efs node edged to an ecs service
+    # or a lambda means "that workload mounts this file system", at the efs
+    # node's own `path`. The edge is the only thing that can say who mounts what,
+    # and unlike every other pair in this file the relation is MANY-TO-MANY on
+    # purpose: two workloads sharing one file system is the entire feature, so
+    # nothing de-duplicates by file system the way the volume pass does.
+    #
+    # KEYED ON THE TWO NODE KINDS AND NEVER ON `edge.kind`, per the EDGE-AUTHORED
+    # FIELDS note at the top of this module -- and here the hazard is LIVE, which
+    # took two corrections to establish. The first draft of this comment claimed
+    # no saved canvas could hold an efs node. Measured from git instead:
+    #   * `ac796d6` (2026-06-20) shipped the tile draggable, sublabel
+    #     'Elastic file system' -- NO `(placeholder)` marker at all;
+    #   * `1b158fe` (2026-07-26) added the marker ("a sidebar tile now says
+    #     whether Apply can actually build it");
+    #   * `41d214b` (2026-07-27) hid placeholders, and its own message says the
+    #     hiding is PALETTE-ONLY -- a canvas already holding one still renders.
+    # So for five weeks it looked like an ordinary Storage tile, not a warned-off
+    # one, which is what makes such saved canvases likely rather than merely
+    # possible. Every edge from that node is typed `network` (the
+    # unregistered-pair catch-all).
+    #
+    # It is milder than ebs's, and the difference is worth being exact about
+    # rather than dramatising: `efs` was never in `translate.py::_KIND`, so Apply
+    # skipped the node for that whole window and no file system was ever created
+    # -- there is nothing for tofu to tear down. What a `edge.kind == "mount"`
+    # gate WOULD do is silently ignore the old edge, so the user's first Apply
+    # after this change creates a file system and mounts it NOWHERE, with no
+    # error at all. A drawn line that does nothing is the exact bug the edge
+    # registry exists to kill.
+    #
+    # It runs BEFORE pass 2 because `_lambda` reads its answer out of `refs`,
+    # which is why the buildability gate here is `_efs_fault` and not `built_ids`
+    # (see that function).
+    efs_mounts: dict[str, list[tuple[str, str]]] = {}
+    for consumer_id, efs_ids in sorted(
+        _kind_pair_edges(stack, by_id, _EFS_MOUNT_KINDS, ("efs",)).items()
+    ):
+        mounts = [
+            (efs_id, _field(by_id[efs_id], "path", _DEFAULT_EFS_PATH).strip())
+            for efs_id in sorted(efs_ids)
+            if efs_id in hcl_name_by_id and not _efs_fault(by_id[efs_id])
+        ]
+        if not mounts or consumer_id not in hcl_name_by_id:
+            continue
+        if by_id[consumer_id].kind == "lambda" and len(mounts) > 1:
+            edge_declined[consumer_id] = _two_file_systems([efs_id for efs_id, _ in mounts])
+            continue
+        # The mount path is checked HERE and not in `_efs`, because only a lambda
+        # has a pattern to break. The declined node is the FUNCTION rather than
+        # the file system, for the smallest honest blast radius: the file system
+        # is perfectly buildable, any ecs service mounting it still mounts it, and
+        # what odin cannot do is exactly the one thing named -- mount it on that
+        # function. Declining the efs node instead took the file system and every
+        # other consumer's mount down with it.
+        #
+        # A lambda has exactly ONE mount by the time this line runs (an empty
+        # list and a list of two both `continue` above), so `mounts[0]` is it.
+        mounted_id, mount_path = mounts[0]
+        if by_id[consumer_id].kind == "lambda" and not _MOUNT_PATH.fullmatch(mount_path):
+            edge_declined[consumer_id] = _lambda_mount_path(mounted_id, mount_path)
+            continue
+        # One container path holds one file system, and TWO efs nodes on one
+        # service is the default collision rather than an exotic one: the tile
+        # defaults `path` to /mnt/efs, so drawing a second one and edging it to
+        # the same service collides immediately. The first by sorted id keeps the
+        # path and the second is declined by name.
+        taken: dict[str, str] = {}
+        for efs_id, path in mounts:
+            holder = taken.setdefault(path, efs_id)
+            if holder != efs_id:
+                unsupported.append(_mount_path_taken(efs_id, consumer_id, holder, path))
+                continue
+            efs_mounts.setdefault(consumer_id, []).append((efs_id, path))
+        # A lambda's single mount travels to `_lambda` through `refs`; an ecs
+        # service's mounts travel to the task definition pass, which needs a list.
+        one_mount = efs_mounts.get(consumer_id, [])[:1] if by_id[consumer_id].kind == "lambda" else []
+        for efs_id, path in one_mount:
+            refs[_efs_mount_key(consumer_id)] = (path, f"{hcl_name_by_id[efs_id]}_ap")
+
+    # Which file systems need an `aws_efs_access_point` companion: the ones a
+    # LAMBDA mounts, and no others (the `_ECS_CLUSTER_KEY` rule -- never a
+    # dangling resource on a canvas that does not need one). An ecs service needs
+    # none; its `efs_volume_configuration` names the file system directly.
+    lambda_mounted = {
+        efs_id
+        for consumer_id, mounts in efs_mounts.items() if by_id[consumer_id].kind == "lambda"
+        for efs_id, _ in mounts
+    }
 
     # Pass 1.6 — reserve each granted workload's policy name, so pass 2 can
     # point that workload's `depends_on` at it. This runs as its own pass, after
@@ -2770,6 +3132,29 @@ def generate_tf(stack: Stack) -> TfProject:
         block = _block("aws_ecs_cluster", cluster_name, {"name": quote(_ECS_CLUSTER_NAME)})
         blocks.append((("aws_ecs_cluster", "__cluster__"), block))
 
+    # v0.8.19: the `aws_efs_access_point` companion, for a file system some
+    # LAMBDA mounts and for nothing else -- one canvas node to two tf resources,
+    # the same shape as the ecs task definition and the lambda auto-role below.
+    #
+    # It exists because `aws_lambda_function.file_system_config.arn` is an ACCESS
+    # POINT arn (AWS's own pattern for that argument ends
+    # `access-point/fsap-[a-f0-9]{17}`), so a file-system arn there is a project
+    # real AWS rejects. `built_ids` gates it for the reason pass 2 records: an
+    # access point naming an `aws_efs_file_system` that pass 2 declined is an
+    # unresolvable reference, and one of those fails `tofu plan` for the WHOLE
+    # project. `root_directory { path = "/" }` because the file system's own root
+    # IS the shared directory -- odin has no per-consumer sub-directory model,
+    # and inventing one would be a claim the substrate does not back.
+    for res in ordered:
+        own_name = hcl_name_by_id.get(res.id)
+        if res.id not in lambda_mounted or own_name is None or res.id not in built_ids:
+            continue
+        blocks.append((("aws_efs_access_point", res.id), _block(
+            "aws_efs_access_point", f"{own_name}_ap",
+            {"file_system_id": f"aws_efs_file_system.{own_name}.id"},
+            '  root_directory {\n    path = "/"\n  }',
+        )))
+
     # V5c: each ecs node's companion `aws_ecs_task_definition` -- named
     # deterministically off the node's own hcl name (`_ecs`'s builder
     # references this exact same name for `task_definition`), same
@@ -2784,8 +3169,29 @@ def generate_tf(stack: Stack) -> TfProject:
         own_name = hcl_name_by_id.get(res.id)
         if own_name is None:
             continue
-        container_json = quote(json.dumps(_ecs_container_definitions(res, refs)))
-        nested = f"  container_definitions = {container_json}"
+        # v0.8.19: the file systems this service mounts, in the TWO places ECS
+        # needs them -- a `volume` block naming the file system, and a
+        # `mountPoints` entry inside the container definition naming that volume
+        # back. Either one alone mounts nothing at all: a volume no container
+        # references is dead weight, and a mount point naming a volume that does
+        # not exist is a RegisterTaskDefinition ECS rejects. `built_ids` is the
+        # gate for the reason pass 2 records -- `aws_efs_file_system.<n>.id` for
+        # a declined node is an unresolvable reference, which fails the plan for
+        # the whole project.
+        mounts = tuple((efs_id, path) for efs_id, path in efs_mounts.get(res.id, []) if efs_id in built_ids)
+        container_json = quote(json.dumps(_ecs_container_definitions(res, refs, mounts)))
+        volumes = "\n\n".join(
+            "  volume {\n"
+            f"    name = {quote(efs_id)}\n"
+            "\n"
+            "    efs_volume_configuration {\n"
+            f"      file_system_id = aws_efs_file_system.{hcl_name_by_id[efs_id]}.id\n"
+            '      root_directory = "/"\n'
+            "    }\n"
+            "  }"
+            for efs_id, _ in mounts
+        )
+        nested = "\n\n".join(part for part in (f"  container_definitions = {container_json}", volumes) if part)
         # `cpu`/`memory` only when the canvas actually says so. odin ENFORCES
         # memory -- `compute/tasks.py::_memory_mib` turns the taskdef's value
         # into the container's hard cap -- and until now nothing emitted it, so
@@ -2946,6 +3352,64 @@ def generate_tf(stack: Stack) -> TfProject:
             })
             blocks.append((("aws_volume_attachment", f"{volume_id}.{instance_id}"), attachment))
 
+    # apigateway (v0.8.19): each API's `$default` stage, plus one integration and
+    # TWO routes per target edge. See the `_apigateway` note above for why two.
+    #
+    # KEYED ON THE TWO NODE KINDS AND NEVER ON `edge.kind`, the rule every
+    # builder here holds: a canvas saved before the edge-type registry carries
+    # `kind: "network"`, and gating on the type name would drop the routes and
+    # make the next apply serve 404 for every path that worked yesterday.
+    # Direction is not significant either -- which end the user dragged from
+    # carries no meaning.
+    #
+    # `built_ids` gates each target for the reason pass 2 records: an integration
+    # naming an `aws_lambda_function` or `aws_ecs_service` that pass 2 declined
+    # is an unresolvable reference, which fails `tofu plan` for the WHOLE
+    # project. That node's own `unsupported` entry already names the cause.
+    apigw_targets = _kind_pair_edges(stack, by_id, ("apigateway",), _APIGW_TARGET_KINDS)
+    for res in ordered:
+        own_name = hcl_name_by_id.get(res.id)
+        if res.kind != "apigateway" or own_name is None or res.id not in built_ids:
+            continue
+        blocks.append((("aws_apigatewayv2_stage", res.id), _block(
+            "aws_apigatewayv2_stage", f"{own_name}_stage",
+            {
+                "api_id": f"aws_apigatewayv2_api.{own_name}.id",
+                "name": quote(_APIGW_STAGE),
+                # The stage odin serves is `$default`, whose invoke path has no
+                # stage segment -- which is what makes the nginx prefix and the
+                # route key agree about what `/orders` means. `auto_deploy` is
+                # `$default`'s only sane setting: without it a route change needs
+                # an explicit deployment that odin has no concept of.
+                "auto_deploy": "true",
+            },
+        )))
+        for target_id in sorted(apigw_targets.get(res.id, [])):
+            if target_id not in built_ids:
+                continue
+            target = by_id[target_id]
+            target_name = hcl_name_by_id[target_id]
+            integration_name = unique_name(
+                f"{own_name}_{target_name}",
+                used_names.setdefault("aws_apigatewayv2_integration", set()),
+            )
+            blocks.append((("aws_apigatewayv2_integration", f"{res.id}.{target_id}"), _block(
+                "aws_apigatewayv2_integration", integration_name,
+                {
+                    "api_id": f"aws_apigatewayv2_api.{own_name}.id",
+                    **_apigw_integration_attrs(target, target_name),
+                },
+            )))
+            for suffix, route_key in zip(("root", "proxy"), _apigw_route_keys(target_id), strict=True):
+                blocks.append((("aws_apigatewayv2_route", f"{res.id}.{target_id}.{suffix}"), _block(
+                    "aws_apigatewayv2_route", f"{integration_name}_{suffix}",
+                    {
+                        "api_id": f"aws_apigatewayv2_api.{own_name}.id",
+                        "route_key": quote(route_key),
+                        "target": f'"integrations/${{aws_apigatewayv2_integration.{integration_name}.id}}"',
+                    },
+                )))
+
     # v0.8.19: DNS RECORDS. A route53 node and a node it is edged to is an
     # `aws_route53_record`, and the edge is the ONLY thing that can say what a
     # name points at -- an `aws_route53_zone` on its own resolves nothing, so a
@@ -2961,7 +3425,7 @@ def generate_tf(stack: Stack) -> TfProject:
     # this kind, and it is measured rather than assumed -- see `_DNS_TARGET_KINDS`
     # for the four real fact shapes and `_dns_target_unsupported` for what the
     # user is told. Declining is the honest outcome: a record pointing at
-    # `http://127.0.0.1:41234` would resolve to 127.0.0.1 and fail to connect.
+    # `http://127.0.0.1:<dynamic port>` would resolve to 127.0.0.1 and fail to connect.
     for zone_id, target_ids in sorted(
         _kind_pair_edges(stack, by_id, ("route53",), tuple(_TF_TYPES)).items()
     ):
@@ -2999,6 +3463,7 @@ def generate_tf(stack: Stack) -> TfProject:
                 "records": f"[aws_instance.{instance_name}.private_ip]",
             })
             blocks.append((("aws_route53_record", f"{zone_id}.{target_id}"), record))
+
 
     blocks.sort(key=lambda b: b[0])
     main_tf = "\n\n".join([HEADER, provider_block(), *(text for _, text in blocks)]) + "\n"
