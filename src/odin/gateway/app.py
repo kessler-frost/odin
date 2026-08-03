@@ -490,7 +490,28 @@ def create_gateway_app(
             response_body = rewritten
         return Response(content=response_body, status_code=upstream.status_code, headers=response_headers)
 
-    methods = ["GET", "PUT", "POST", "DELETE", "HEAD"]
+    # THE CLOSED WORLD IS METHOD-INDEPENDENT, and it was not until v0.8.19.
+    #
+    # `classify.py`'s docstring states odin's posture twice: a request it cannot
+    # map is DENIED, never guessed at. That property lived entirely inside
+    # `catch_all` -- and this list decided which requests ever got there. PATCH
+    # and OPTIONS were absent, so Starlette answered them `405 Method Not
+    # Allowed` before a single line of odin ran: no SigV4 verification, no
+    # policy evaluation, no `on_deny` event, no `AccessDeniedException`. A 405
+    # is a categorically different answer from a denial, and nothing in the docs
+    # said the guarantee stopped at five verbs.
+    #
+    # It was LATENT rather than live -- no modeled service used PATCH -- which is
+    # exactly how a guard sits unfired here for months (honesty rule 1). It stops
+    # being latent with apigateway: `UpdateApi`/`UpdateRoute`/`UpdateIntegration`
+    # /`UpdateStage` are all `PATCH`, measured against real terraform-provider-aws
+    # 5.100.0. OPTIONS is added in the same breath because it is the other verb an
+    # HTTP caller can reach a gateway with and it had the identical hole.
+    #
+    # Pinned by `tests/gateway/test_closed_world_is_method_independent.py`, which
+    # is parametrized over THIS list -- so a verb added here without a
+    # corresponding deny is a test failure, and a verb removed is too.
+    methods = ["GET", "PUT", "POST", "DELETE", "HEAD", "PATCH", "OPTIONS"]
     return Starlette(
         routes=[
             Route("/", catch_all, methods=methods),

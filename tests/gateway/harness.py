@@ -60,6 +60,16 @@ class _CaptureHandler(BaseHTTPRequestHandler):
     do_POST = _capture
     do_DELETE = _capture
     do_HEAD = _capture
+    # v0.8.19: `UpdateApi`/`UpdateRoute`/`UpdateIntegration`/`UpdateStage` are
+    # PATCH, and this sink could not capture one -- `call()` raised `IndexError:
+    # list index out of range` from `self.requests[before]`, because
+    # BaseHTTPRequestHandler answers an unhandled verb with 501 and nothing is
+    # ever appended. Measured while probing whether odin's gateway routes PATCH
+    # at all; the sink was the first thing in the way. OPTIONS joins it because
+    # the gateway's route table now accepts it and a test that cannot capture a
+    # verb cannot check it.
+    do_PATCH = _capture
+    do_OPTIONS = _capture
 
 
 class CaptureSink:
