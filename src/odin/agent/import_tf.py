@@ -32,6 +32,7 @@ import asyncio
 import io
 import json
 import os
+import re
 import shutil
 import tempfile
 import zipfile
@@ -48,7 +49,7 @@ from odin.aws.backings import ACCOUNT, REGION
 from odin.gateway.policy import arn_label
 from odin.simulate import workspace as workspace_mod
 from odin.simulate.runner import PLUGIN_CACHE_DIR
-from odin.spec.translate import VOLUME_ATTACHMENT
+from odin.spec.translate import ALB_TARGET, VOLUME_ATTACHMENT
 from odin.util import reap
 
 _GRID_STEP = 220
@@ -102,6 +103,11 @@ _KIND = {
     # attachment to an instance is a companion `aws_volume_attachment`, folded
     # back into a canvas EDGE below rather than becoming a node.
     "aws_ebs_volume": "ebs",
+    # v0.8.19: an HTTP API. Its stage, integrations and routes are COMPANIONS
+    # (`_APIGW_COMPANION_TYPES` below) -- the stage and the routes fold away
+    # entirely, and each integration becomes a canvas EDGE, which is what makes
+    # one canvas node survive a round trip as one canvas node.
+    "aws_apigatewayv2_api": "apigateway",
 }
 # Neither of these becomes a node. The task definition folds onto its service
 # (image/port/memory/cpu live there, not on the service); the cluster is a
@@ -120,6 +126,22 @@ _IAM_POLICY_TYPE = "aws_iam_role_policy"
 # aws_secretsmanager_secret_version folds onto its secret, which is what makes
 # generate -> import -> generate round-trip instead of multiplying resources.
 _ALB_COMPANION_TYPES = ("aws_lb_target_group", "aws_lb_listener")
+# v0.8.19: the three OTHER types an `apigateway` canvas node expands to.
+#
+# THE EDGE IS RECOVERED FROM THE INTEGRATION, NOT FROM THE ROUTES, and that is
+# the decision that makes this importable at all. odin emits TWO routes per
+# target (`ANY /x` and `ANY /x/{proxy+}` -- see hcl.py) because that is what AWS
+# needs to serve a whole path prefix, but both point at ONE integration, and the
+# integration is the thing that names the target workload. So the route count
+# never reaches the canvas and cannot double an edge.
+#
+# The stage folds away with nothing carried: odin emits exactly one, always
+# `$default` with `auto_deploy = true`, so there is no information in it to
+# lose. A stage with any OTHER name is reported, because serving it is something
+# odin does not do.
+_APIGW_COMPANION_TYPES = (
+    "aws_apigatewayv2_stage", "aws_apigatewayv2_integration", "aws_apigatewayv2_route",
+)
 # The attribute each supported type's human-facing name lives in (mirrors
 # hcl.py's builders: s3 uses `bucket`, elasticache uses `cluster_id`, rds uses
 # `identifier`, everything else uses `name`).
@@ -134,6 +156,7 @@ _NAME_ATTR = {
     "aws_security_group": "name", "aws_ecr_repository": "name",
     "aws_ecs_service": "name",
     "aws_lambda_function": "function_name",
+    "aws_apigatewayv2_api": "name",
 }
 # canvas kind -> aws_* type, for mode (b) (the inverse of `_KIND`). iam_role,
 # logs, secret and ssm have no backing to enumerate live resources from (all
@@ -167,9 +190,13 @@ _NAME_ATTR = {
 # `vol-...` VolumeId, minted by the gateway at CreateVolume and appearing nowhere
 # on a canvas, so there is no id to resolve one from outside an Apply. Mode (a),
 # reading an existing HCL project, works.
+# `apigateway` is out for the `alb`/`ecs` reason rather than the id reason: one
+# canvas node is four tf resource types, so there is no single live resource to
+# import it from, and the INTEGRATIONS are what carry the wiring. Mode (a),
+# reading an existing HCL project, works.
 _NO_LIVE_IMPORT = {
     "iam_role", "logs", "secret", "ssm", "elasticache", "alb", "sg", "ecr", "ec2", "ecs", "lambda",
-    "ebs",
+    "ebs", "apigateway",
 }
 _TF_TYPE = {kind: rtype for rtype, kind in _KIND.items() if kind not in _NO_LIVE_IMPORT}
 
@@ -268,6 +295,12 @@ _CARRIED_ATTRS = {
     # (`_FIXED_VALUES`), never a dropped one: an io2 volume imported as gp3 in
     # silence is the elasticache bug in another costume.
     "ebs": {"availability_zone", "size", "type"},
+    # v0.8.19. `protocol_type` is carried in the sense that odin always re-emits
+    # it as `HTTP` -- a `WEBSOCKET` source is a CHANGED argument
+    # (`_FIXED_VALUES`) rather than a silently dropped one, because odin's
+    # substrate is an HTTP reverse proxy and a websocket API imported as an HTTP
+    # one would be a green tile that never completes a handshake.
+    "apigateway": {"name", "protocol_type"},
 }
 # EVERY primary kind's carried set, `tags` included.
 #
@@ -309,6 +342,17 @@ _CARRIED_COMPANION_ATTRS = {
     # that odin re-derives it positionally (`_assigned_devices`), so a source
     # that names a different device is reported CHANGED.
     "aws_volume_attachment": {"device_name", "instance_id", "volume_id"},
+    # v0.8.19. The integration becomes an EDGE, and an edge carries no
+    # arguments, so anything the source put on one has to be accounted for here
+    # or it vanishes silently. `request_parameters` (a path/header rewrite),
+    # `credentials_arn`, `tls_config` and `timeout_milliseconds` all change what
+    # the caller gets, and odin models none of them.
+    "aws_apigatewayv2_integration": {
+        "api_id", "integration_type", "integration_uri", "integration_method",
+        "payload_format_version",
+    },
+    "aws_apigatewayv2_route": {"api_id", "route_key", "target"},
+    "aws_apigatewayv2_stage": {"api_id", "name", "auto_deploy"},
 }
 _CARRIED_HEALTH_CHECK_ATTRS = {"path"}
 # (owner, attribute) -> the value odin ALWAYS emits, lowercased. An imported
@@ -736,6 +780,161 @@ def _node_data(kind: str, label: str, attrs: dict) -> dict:
         if isinstance(az, str):
             data["az"] = az
     return data
+
+
+def _apigw_target_label(uri: object, by_hcl_name: dict[str, str]) -> str | None:
+    """The canvas label an integration's `integration_uri` names, or None.
+
+    Two shapes, one per integration type, and both are odin's OWN output read
+    back rather than a guess about what a hand-written project might contain:
+
+      AWS_PROXY   `aws_lambda_function.<hcl name>.invoke_arn`
+      HTTP_PROXY  `"http://${aws_ecs_service.<hcl name>.name}.odin.internal"`
+
+    A regex over the whole string, NOT `_referenced_label`, and that difference
+    is a real bug this caught rather than a style choice. `_ref_target` requires
+    the value to be an interpolation END TO END (`value.startswith("${") and
+    value.endswith("}")`), which the lambda form is and the ecs form is NOT --
+    its interpolation is EMBEDDED in a URL. Written the first way, every
+    `apigateway -> ecs` edge came back `unsupported` with
+    `integration_uri='"http://${aws_ecs_service.checkout.name}.odin.internal"'`
+    and the route was silently lost on the round trip.
+
+    A URI naming anything else (a real Lambda ARN typed by hand, an external
+    URL) resolves to None and the caller reports it as unsupported rather than
+    dropping the wiring in silence."""
+    text = uri if isinstance(uri, str) else ""
+    for rtype in ("aws_lambda_function", "aws_ecs_service"):
+        name = _referenced_hcl_name(text, rtype)
+        label = by_hcl_name.get(f"{rtype}.{name}") if name else None
+        if label:
+            return label
+    return None
+
+
+def _apigw_companions(
+    companions: list[tuple[str, str, dict]], by_hcl_name: dict[str, str],
+) -> tuple[list[dict], list[str], list[Unsupported]]:
+    """An API's stage/integrations/routes -> canvas edges + honesty warnings.
+
+    ONE EDGE PER INTEGRATION, never per route. odin emits two routes for every
+    target, so counting routes would produce two identical edges for one drawn
+    line -- and the canvas would then generate four routes on the next Apply,
+    then eight. Recovering from the integration makes the round trip a fixed
+    point by construction rather than by a de-duplication step someone could
+    remove.
+
+    The routes are still READ, for what they can say that the integration
+    cannot: a route key that is not one of the two odin would emit means the
+    source serves a path odin will not, and that is reported CHANGED. Silence
+    there would let `POST /checkout` import as a node whose next Apply serves
+    `/checkout` on a completely different path.
+    """
+    edges: list[dict] = []
+    warnings: list[str] = []
+    unsupported: list[Unsupported] = []
+    integration_labels: dict[str, tuple[str, str]] = {}
+
+    for rtype, rname, attrs in companions:
+        if rtype != "aws_apigatewayv2_integration":
+            continue
+        api_label = _referenced_label(attrs.get("api_id"), "aws_apigatewayv2_api", by_hcl_name)
+        target_label = _apigw_target_label(attrs.get("integration_uri"), by_hcl_name)
+        if not (api_label and target_label):
+            missing = ", ".join(
+                f"{arg}={attrs.get(arg)!r}" for arg, found in
+                (("api_id", api_label), ("integration_uri", target_label)) if not found
+            )
+            unsupported.append(Unsupported(
+                type="aws_apigatewayv2_integration", name=rname,
+                reason=f"integration references a resource outside the supported set ({missing}) "
+                       "-- the edge is dropped, so a regenerated project would NOT route to this target",
+            ))
+            continue
+        integration_labels[rname] = (api_label, target_label)
+        edges.append({
+            "source": api_label, "target": target_label, "data": {"edgeType": ALB_TARGET},
+        })
+        dropped, changed = _attribute_notes(
+            "aws_apigatewayv2_integration", attrs,
+            _CARRIED_COMPANION_ATTRS["aws_apigatewayv2_integration"], (), {},
+        )
+        warnings += _attribute_warnings(
+            f"{api_label} -> {target_label} (api route)", "", dropped, changed,
+        )
+
+    warnings += _apigw_route_warnings(companions, integration_labels, by_hcl_name)
+    warnings += _apigw_stage_warnings(companions)
+    return edges, warnings, unsupported
+
+
+def _apigw_route_warnings(
+    companions: list[tuple[str, str, dict]],
+    integration_labels: dict[str, tuple[str, str]],
+    by_hcl_name: dict[str, str],
+) -> list[str]:
+    """A route whose key is not one odin would generate, named.
+
+    The canvas cannot hold a route key -- the path comes from the TARGET's label
+    (`hcl.py::_apigw_route_keys`) -- so a source that routes `POST /checkout` to
+    a function labelled `orders` loses the `/checkout` path on the next Apply and
+    serves `/orders` instead. That is a real behaviour change and it is exactly
+    the class `_FIXED_VALUES` exists for, reported the same way."""
+    warnings: list[str] = []
+    for rtype, rname, attrs in companions:
+        if rtype != "aws_apigatewayv2_route":
+            continue
+        target = attrs.get("target")
+        integration = _referenced_hcl_name(target, "aws_apigatewayv2_integration")
+        labels = integration_labels.get(integration or "")
+        if labels is None:
+            continue
+        api_label, target_label = labels
+        expected = hcl._apigw_route_keys(target_label)
+        actual = attrs.get("route_key")
+        # `_literal` on BOTH sides, never a raw `in`: python-hcl2 hands back the
+        # value quote-wrapped (`'"ANY /orders"'`), so a raw membership test says
+        # "changed" for every route odin itself just generated -- which it did,
+        # on the first run, for the `{proxy+}` half of every pair.
+        matched = _literal(actual) in {_literal(key) for key in expected}
+        dropped, changed = _attribute_notes(
+            "aws_apigatewayv2_route", attrs, _CARRIED_COMPANION_ATTRS["aws_apigatewayv2_route"], (),
+            _derived_changes([] if matched else [("route_key", actual, " or ".join(expected))]),
+        )
+        warnings += _attribute_warnings(
+            f"{api_label} -> {target_label} (api route {rname})", "", dropped, changed,
+        )
+    return warnings
+
+
+def _apigw_stage_warnings(companions: list[tuple[str, str, dict]]) -> list[str]:
+    """A stage odin will not serve, named. odin emits exactly one stage per API,
+    always `$default` -- the stage whose invoke path carries no stage segment,
+    which is what lets the nginx prefix and the route key mean the same thing.
+    A source naming any other stage would have its paths served one segment
+    higher than it wrote them."""
+    warnings: list[str] = []
+    for rtype, rname, attrs in companions:
+        if rtype != "aws_apigatewayv2_stage":
+            continue
+        dropped, changed = _attribute_notes(
+            "aws_apigatewayv2_stage", attrs, _CARRIED_COMPANION_ATTRS["aws_apigatewayv2_stage"], (),
+            _derived_changes([("name", attrs.get("name"), hcl._APIGW_STAGE)]),
+        )
+        warnings += _attribute_warnings(f"{rname} (api stage)", "", dropped, changed)
+    return warnings
+
+
+def _referenced_hcl_name(value: object, rtype: str) -> str | None:
+    """The HCL RESOURCE NAME a `${aws_x.<name>.attr}` interpolation points at.
+
+    `_referenced_label` answers with the canvas LABEL, which is what an edge
+    needs; this answers with the name, which is what joining two companions to
+    each other needs (a route names its integration, and the integration is not
+    a node)."""
+    text = value if isinstance(value, str) else ""
+    match = re.search(rf"{re.escape(rtype)}\.([A-Za-z0-9_]+)\.", text)
+    return match.group(1) if match else None
 
 
 def _assigned_devices(pairs: list[tuple[str, str]]) -> dict[tuple[str, str], str]:
@@ -1602,6 +1801,7 @@ def parse_hcl(files: dict[str, str], archives: dict[str, bytes] | None = None) -
     secret_versions: list[tuple[str, dict]] = []
     alb_companions: list[tuple[str, str, dict]] = []
     volume_attachments: list[tuple[str, dict]] = []
+    apigw_companions: list[tuple[str, str, dict]] = []  # v0.8.19
     key_pairs: dict[str, dict] = {}
     taskdefs: dict[str, dict] = {}
     role_policies: list[dict] = []
@@ -1624,6 +1824,11 @@ def parse_hcl(files: dict[str, str], archives: dict[str, bytes] | None = None) -
             # subscription -- it is how the canvas says which instance a volume
             # is attached to, and it never becomes a node.
             volume_attachments.append((rname, attrs))
+            continue
+        if rtype in _APIGW_COMPANION_TYPES:
+            # v0.8.19. The INTEGRATION becomes an edge; the routes and the stage
+            # are checked against what odin would emit and then folded away.
+            apigw_companions.append((rtype, rname, attrs))
             continue
         if rtype == _IAM_POLICY_TYPE:
             role_policies.append(attrs)
@@ -1873,6 +2078,11 @@ def parse_hcl(files: dict[str, str], archives: dict[str, bytes] | None = None) -
         warnings += _attribute_warnings(
             f"{volume_label} -> {instance_label} (volume attachment)", "", dropped, changed,
         )
+
+    apigw_edges, apigw_warnings, apigw_unsupported = _apigw_companions(apigw_companions, by_hcl_name)
+    edges += apigw_edges
+    warnings += apigw_warnings
+    unsupported += apigw_unsupported
 
     policy_edges, policy_warnings = _edges_from_role_policies(
         role_policies, node_by_label, attrs_by_label,

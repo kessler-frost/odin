@@ -235,27 +235,29 @@ They are listed because finding one by surprise is worse than reading it here.
   backings and the prune, and reads a cached drift result instead of sweeping. ECS
   stays genuinely live because its task sweep runs on every one of those ticks;
   EC2, Lambda and RDS drift can be up to one sweep cadence stale for the duration.
-- **A drawn edge carries a modelled TYPE for only 47 of the 378 kind pairs.**
-  The honest majority answer is `unmodelled` — 331 of the 378 unordered pairs,
-- **A drawn edge carries a modelled TYPE for only 42 of the 378 kind pairs.**
-  The honest majority answer is `unmodelled` — 336 of the 378 unordered pairs,
+- **A drawn edge carries a modelled TYPE for only 49 of the 378 kind pairs.**
+  The honest majority answer is `unmodelled` — 329 of the 378 unordered pairs,
   drawn as a grey line labelled *Not modelled*, stored in the Stack and read by
   nothing. It was called `network` until v0.8.14, which was a claim about layer 3
-  that odin never checked. Re-measured 2026-07-29 over the real 27 canvas kinds,
+  that odin never checked. Re-measured over the real 27 canvas kinds,
   the pairs that do mean something: `iam`
   (34 pairs, a real policy), `connection` **and** `iam` together (4),
-  `sg` (2, security-group membership), `target` (2 — `alb ↔ ecs`, and since
-  v0.8.15 `alb ↔ ec2`), `volume` (1 — `ebs ↔ ec2`, a real block device on a real VM),
+  `sg` (2, security-group membership), `target` (4 — `alb ↔ ecs`, `alb ↔ ec2`
+  since v0.8.15, and `apigateway ↔ lambda|ecs` since v0.8.19),
+  `volume` (1 — `ebs ↔ ec2`, a real block device on a real VM),
   `encryption` (2 — `kms ↔ secret|ssm`, the only two sidecars odin holds the
   plaintext of; `kms ↔ s3|rds|dynamodb` stays `unmodelled` ON PURPOSE, because
   those live in RustFS, Postgres and dynalite containers odin holds no key for
   and a line there would claim an encryption that does not happen),
-  `role` (`iam_role ↔ lambda`) and `subscription`
-  (`sns ↔ sqs`). Drawing anything else is decoration, and now
-  v0.8.15 `alb ↔ ec2`), `role` (`iam_role ↔ lambda`), `subscription`
-  (`sns ↔ sqs`) and, since v0.8.18, `volume` (`ebs ↔ ec2`, a real
-  `aws_volume_attachment`). Drawing anything else is decoration, and now
+  `role` (1, `iam_role ↔ lambda`) and `subscription` (1, `sns ↔ sqs`).
+  Drawing anything else is decoration, and now
   says so.
+  (These five numbers are not written by hand: `ui/src/lib/edge-types.test.ts`
+  recomputes them from the live registry and fails if this paragraph disagrees.
+  This block carried TWO CONTRADICTORY versions of itself until v0.8.19 — 47/331
+  and 42/336, spliced together by a merge — and the ratchet passed anyway,
+  because `toContain` only needs the correct variant to be present somewhere.
+  If it doubles again, delete the stale half rather than adding a third.)
   Three more pairs carry a SECOND meaning on top of the grant, added in
   v0.8.15 because a permission whose subject is not wired is the same
   decoration under a colour: `logs ↔ lambda|ecs` decides which group the
@@ -903,3 +905,93 @@ They are listed because finding one by surprise is worse than reading it here.
   405 by the router. No AWS API uses one, so nothing odin models can reach it —
   but if a future service does, the answer will be a 405 and not a denial, and
   the test above is where to add it.
+
+<!-- apigateway (v0.8.19) -->
+- **API Gateway: the reachable address is `api_endpoint`, NOT the stage's
+  `invoke_url`.** MEASURED against real terraform-provider-aws 5.100.0 driving
+  odin's own gateway, in one state file:
+
+      aws_apigatewayv2_api.public_api   api_endpoint = "http://127.0.0.1:39999"
+      aws_apigatewayv2_stage.default    invoke_url   = "https://api75a2c592.execute-api.us-east-1.amazonaws.com/"
+
+  `api_endpoint` is odin's answer and points at the real nginx container.
+  `invoke_url` is built CLIENT-SIDE by the provider from the API id and the
+  region — it never asks the API, so nothing odin returns can change it, and
+  curling it reaches Amazon or nothing. An earlier probe concluded the opposite
+  because a throwaway stub happened to answer `apiEndpoint` with exactly the
+  string the provider constructs; the match was read as causation. Read
+  `api_endpoint`, or `${{<api node>.API_ENDPOINT}}` on the canvas.
+- **One route per target, at the target's own label, and you cannot choose the
+  path.** A drawn `apigateway → lambda|ecs` edge emits `ANY /<target label>` and
+  `ANY /<target label>/{proxy+}` — two route keys because that is what AWS needs
+  to serve a whole prefix, collapsing to one nginx `location` pair. The path
+  comes from the label because `generate_tf` is a pure function of the canvas
+  and the tile has no route field. Importing a project whose route key is
+  something else (`POST /checkout` against a function labelled `orders`) does not
+  fail — it reports the key as CHANGED and names what odin would emit instead,
+  because the next Apply really would serve a different path.
+- **Only the `$default` stage is served.** odin emits exactly one stage per API,
+  always `$default` with `auto_deploy = true` — the stage whose invoke path
+  carries no stage segment, which is what lets the nginx prefix and the route key
+  mean the same thing. A stage with any other name is STORED and ECHOED (so
+  `tofu plan` is clean) and routes nothing; an imported one is reported CHANGED.
+- **An `apigateway → ecs` route names the service through a hostname only odin
+  resolves.** `integration_uri` is
+  `http://${aws_ecs_service.<n>.name}.odin.internal`. `integration_uri` must be a
+  URI and an ECS service has no URL on real AWS either — an HTTP API reaches a
+  private service through a VPC link, which odin does not model — so the
+  generated file is NOT something that would work against Amazon for this edge.
+  The alternative was requiring an ALB in between, which would make the simplest
+  useful canvas a four-node one.
+- **odin's process is in the data path for an ECS route, and there is no
+  failover across tasks.** An ALB's nginx dials the task directly; an API's nginx
+  dials odin's own invoke shim, which resolves the task's address per request.
+  That is deliberate: a task's published host port changes every time it is
+  replaced, so a baked-in address needs a push from `ecsctl` on every lifecycle
+  transition (four call sites that must all stay correct forever), and a miss is
+  a 502 with no explanation. Resolving per request cannot go stale. What is given
+  up is nginx's request-level `proxy_next_upstream` retry across tasks: the shim
+  dials the FIRST running task and reports the failure if it is not there. An ECS
+  service with no running task yet answers **503 naming the service**, not a
+  bare 502.
+- **The invoke shim is an UNAUTHENTICATED route on the gateway port, bounded by a
+  per-API token.** An HTTP API route with `authorization_type = "NONE"` — the only
+  kind odin emits — is a public endpoint; that is what an API Gateway is. So
+  `/_odin/apigw/{env}/{api}/{integration}` on the gateway's own port accepts
+  unsigned requests. It is bounded rather than open: it takes no function name
+  (only ids resolved through stored records, so it can invoke only what a route
+  already points at) and requires the API's `route_token`, a 32-hex secret minted
+  at CreateApi, kept in the 0600 `apigwctl.json` sidecar and injected by nginx.
+  Without it: 403, with no detail about which id was wrong. That makes the shim
+  no more powerful than dialing the API's own published port — which is the bar,
+  not "the endpoint is protected". `_odin` is a reserved path prefix on the
+  gateway.
+- **A crashed handler is a 502, and that took reading what RIE really sends.**
+  RIE answers a RAISED handler with **HTTP 200** and an `{"errorMessage",
+  "errorType", ...}` body, with no `X-Amz-Function-Error` header at all. Payload
+  format 2.0's rule that "anything without a `statusCode` is the response body"
+  would therefore serve a crashed function as `200 OK` with a stack trace as the
+  payload. odin answers 502 with the function's own error document, which is what
+  a real API Gateway does.
+- **Payload format 2.0 only.** A `1.0` integration is REFUSED at
+  CreateIntegration rather than served a 2.0 event: a 1.0 handler reads
+  `event["httpMethod"]`, which a 2.0 event does not have, so the mismatch would
+  surface as a `KeyError` inside the user's own function and blame their code.
+  A `WEBSOCKET` protocol type is refused at CreateApi for the same class of
+  reason — nginx answers a handshake with a 200 and the caller hangs.
+- **What is NOT modelled:** authorizers (JWT, Lambda, IAM) — every route is
+  `authorization_type = "NONE"`; custom domains and base-path mappings; API keys
+  and usage plans; throttling and quotas; `request_parameters` path/header
+  rewrites; `tls_config`; per-route `timeout_milliseconds` (the shim's own 30s
+  matches the Lambda default); CORS configuration; access logging; and
+  `aws_lambda_permission` — odin does not enforce Lambda resource policies, so
+  the permission real AWS would require to let the API invoke the function is
+  neither emitted nor needed. Every one of these that appears in an imported
+  project is reported by name rather than dropped in silence.
+- **The API Gateway v1 (REST) resource types are not modelled at all.**
+  `aws_api_gateway_rest_api` and its `_resource`/`_method`/`_integration`/
+  `_deployment`/`_stage` companions import as `unsupported`. v2 was chosen
+  because its companion set is flat, which is what makes odin's own output
+  re-import; v1's `parent_id` chains are a tree the importer would have to
+  rebuild. Both v1 and v2 sign under the SigV4 credential scope `apigateway`,
+  so a v1 call reaches the gateway and is classified — it simply has no handler.

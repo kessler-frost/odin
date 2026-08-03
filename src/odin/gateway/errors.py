@@ -93,9 +93,35 @@ def _ec2_xml(code: str, message: str) -> str:
     )
 
 
-def _lambda_response(code: str, message: str, status: int) -> Response:
-    body = json.dumps({"Type": "User", "Message": message})
+# The rest-json services. Their errors carry the code in the `x-amzn-errortype`
+# HEADER, which is what botocore's `RestJSONParser._inject_error_code` reads
+# FIRST (verified against botocore's own parsers.py) and what aws-sdk-go-v2's
+# restjson decoder reads first too -- so a body-only code is a coin flip.
+# `apigateway` joined in v0.8.19: BOTH API Gateway v1 and v2 sign under that
+# credential scope, and both are rest-json.
+_RESTJSON_SERVICES = ("lambda", "apigateway")
+
+# The error body each rest-json service really sends. Lambda's is
+# `{"Type", "Message"}`; apigatewayv2's is `{"message"}` alone (lowercase),
+# which is also what its `NotFoundException` shape names. Neither is what
+# botocore reads the CODE from -- that is the header above -- but a human
+# reading a raw response, and any client that falls back to the body, gets the
+# real thing rather than a plausible-looking one from another service.
+_RESTJSON_BODY = {
+    "lambda": lambda message: {"Type": "User", "Message": message},
+    "apigateway": lambda message: {"message": message},
+}
+
+
+def _restjson_response(service: str, code: str, message: str, status: int) -> Response:
+    body = json.dumps(_RESTJSON_BODY[service](message))
     return Response(body, status_code=status, media_type="application/json", headers={"x-amzn-errortype": code})
+
+
+def _lambda_response(code: str, message: str, status: int) -> Response:
+    """Kept as a name because tests and other modules reference it; the shared
+    builder above is the implementation."""
+    return _restjson_response("lambda", code, message, status)
 
 
 def _json_body_raw(service: str, code: str, message: str) -> str:
@@ -115,8 +141,8 @@ def _respond(service: str, code: str, message: str) -> Response:
         return Response(_sns_xml(code, message), status_code=status, media_type="text/xml")
     if service == "ec2":
         return Response(_ec2_xml(code, message), status_code=status, media_type="text/xml")
-    if service == "lambda":
-        return _lambda_response(code, message, status)
+    if service in _RESTJSON_SERVICES:
+        return _restjson_response(service, code, message, status)
     return Response(_json_body(service, code, message), status_code=status, media_type="application/x-amz-json-1.0")
 
 
@@ -200,8 +226,8 @@ def synth_error(service: str, code: str, message: str, status: int) -> Response:
         return Response(_sns_xml(code, message), status_code=status, media_type="text/xml")
     if service == "ec2":
         return Response(_ec2_xml(code, message), status_code=status, media_type="text/xml")
-    if service == "lambda":
-        return _lambda_response(code, message, status)
+    if service in _RESTJSON_SERVICES:
+        return _restjson_response(service, code, message, status)
     return Response(_json_body_raw(service, code, message), status_code=status, media_type="application/x-amz-json-1.0")
 
 

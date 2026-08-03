@@ -72,6 +72,7 @@ from odin.aws.backings import ACCOUNT, REGION
 from odin.gateway import errors
 from odin.gateway.keys import KeyStore, Principal
 from odin.gateway.models import (
+    apigwctl,
     cachectl,
     ec2compute,
     ecr,
@@ -378,7 +379,7 @@ async def pure_answer(
     action: str, resource: str, env: str, body: bytes, stores: SynthStores, now: float,
     backing_port: int | None = None, query: dict[str, str] | None = None,
     keystore: KeyStore | None = None, gateway_port: int | None = None,
-    rds=None,
+    rds=None, path: str = "",
 ) -> Response | None:
     """A direct synth answer for a PURE/CONDITIONAL action, or None if
     `action` isn't synth-owned for this call -- the caller (app.py) forwards
@@ -506,6 +507,17 @@ async def pure_answer(
         return await elbv2ctl.pure_answer(action, resource, env, body, stores, now)
     if action.startswith("events:"):
         return await eventsctl.pure_answer(action, resource, env, body, stores, now)
+    # apigateway (v0.8.19). The ONE branch here that needs the request PATH: API
+    # Gateway v2 is REST, so the api id and the child id (integration, route,
+    # stage) live in the URL and not the body. `classify` already parsed the api
+    # id out to use as the resource, but its contract is `(action, resource)` and
+    # widening that for one service would ripple through sixteen other
+    # classifiers -- so the path is threaded down and parsed once more where the
+    # ids are actually needed.
+    if action.startswith("apigateway:"):
+        return await apigwctl.pure_answer(
+            action, resource, env, body, stores, now, gateway_port=gateway_port, path=path,
+        )
     # `_PURE_HANDLERS` is the one table that stays SYNCHRONOUS: these are the
     # gap-fill handlers for services that DO have a backing container, and
     # every one of them is pure in-memory reshaping of the request body -- no

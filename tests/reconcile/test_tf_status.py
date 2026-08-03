@@ -71,10 +71,14 @@ def _param(name: str, value: str = "v") -> dict:
 def test_tf_owned_kinds_excludes_reconciler_owned_kinds():
     # s3/sqs/sns/dynamodb already get real World entries via the reconciler's
     # own PROVISIONED path -- this projection must never double-own them.
+    # Spelled out in full, once. This literal carried TWO contradictory lines
+    # (one ending `kms`, one ending `ebs`) after a merge -- and a set literal
+    # dedupes, so both members were present and the assertion passed either way.
+    # A duplicated expectation that cannot fail is the same shape as an
+    # expectation derived from the subject: honesty rule 5.
     assert TF_OWNED_KINDS == {
         "vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr", "logs", "secret", "ssm",
-        "elasticache", "rds", "alb", "kms",
-        "elasticache", "rds", "alb", "ebs",
+        "elasticache", "rds", "alb", "kms", "ebs", "apigateway",
     }
 
 

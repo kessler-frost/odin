@@ -904,7 +904,7 @@ def test_a_ref_to_a_kind_that_cannot_produce_is_refused_before_tofu_runs():
     assert "worker (lambda)" in note and "QUEUE_URL" in note
     assert "'jobs' (kind: sqs)" in note
     assert "no sqs node publishes an endpoint a reference can resolve" in note
-    assert "Only rds, elasticache, alb, ec2 and ecr nodes do" in note
+    assert "Only rds, elasticache, alb, ec2, ecr and apigateway nodes do" in note
     # It must not deny the facts the user can see in `odin world`...
     assert "OBSERVED state, not wiring values" in note
     assert "publishes no facts" not in note

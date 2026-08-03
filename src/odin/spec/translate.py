@@ -83,6 +83,12 @@ _KIND = {
     "alb": "alb",
     "kms": "kms",
     "ebs": "ebs",
+    # v0.8.19. NOTE THE COMMENT PLACEMENT: `ui/src/lib/catalog.test.ts` parses
+    # this table out of this file with `/^\s*"([\w-]+)":\s*"([\w-]+)",$/gm`, so a
+    # trailing `# comment` on the entry line makes the regex miss it and the tile
+    # reads as an unmarked placeholder. That is exactly how it was written first,
+    # and the ratchet failed by name -- which is the ratchet working.
+    "apigateway": "apigateway",
 }
 
 
@@ -353,6 +359,15 @@ ROLE_ASSUMPTION = "role"
 # "This load balancer fronts that service" and "this topic fans out to that
 # queue". Both are PRESENTATIONAL today (see the note above): they name what the
 # user drew, and the passes that build them read the node kinds instead.
+#
+# `apigateway -> lambda|ecs` joined `target` in v0.8.19 rather than becoming its
+# own kind or joining the event family, on the SYNCHRONY argument: the caller
+# holds a connection open and waits for a status code, which is what every other
+# member of this family does and what no member of the event family does. The
+# label ("LB Target") is the one thing that no longer fits perfectly; the
+# relationship it names -- "this front door forwards to that workload" -- fits
+# exactly, and inventing a near-synonym edge type to preserve a label would put
+# two names on one meaning.
 ALB_TARGET = "target"
 SNS_SUBSCRIPTION = "subscription"
 

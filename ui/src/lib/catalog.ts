@@ -17,11 +17,19 @@
 // both ways: `(placeholder)` in a sublabel means Apply skips it, and nothing
 // else does. When a placeholder becomes real, the marker comes off in the same
 // commit that adds it to `_KIND`.
-// Today: kinesis, route53, apigateway, efs, events, ebs, eip, igw.
-// Today: kinesis, kms, route53, apigateway, efs, events, eip, igw.
+// Today: kinesis, route53, efs, events, eip, igw.
 // (`ebs` came OFF this list in v0.8.18 -- it is a real `limactl disk` volume
-// on a real VM now, and the marker came off in the same commit that added it
-// to `_KIND`, exactly as the rule above requires.)
+// on a real VM now -- and `apigateway` in v0.8.19, a real nginx container per
+// API. In both cases the marker came off in the same commit that added the kind
+// to `_KIND`, exactly as the rule above requires. `kms` is off it too.)
+//
+// NOTE FOR THE MERGE: this comment carried TWO contradictory "Today:" lines at
+// v0.8.18 (one still listing `ebs` and `kms`), which is what a three-way merge
+// of three agents each editing one line looks like when nobody reconciles it.
+// One line now. If it doubles again, delete the stale one rather than adding a
+// third -- the list is checked by `catalog.test.ts` only through the
+// `(placeholder)` markers, so a wrong line here fails nothing and misleads
+// everyone.
 
 // `multiline`/`placeholder` mirror ConfigPanel's own FieldDef (catalogFields
 // spreads straight into it), so a catalog entry can declare a textarea field
@@ -361,7 +369,18 @@ export const CATALOG: ServiceDef[] = [
     defaultData: { label: 'example.com', zoneId: '' },
   },
   {
-    type: 'apigateway', abbr: 'API', label: 'API Gateway', sublabel: 'REST API (placeholder)',
+    // REAL as of v0.8.19: a real nginx container per API (`compute/apigw.py`),
+    // published on a real host port, whose `location` blocks are this API's
+    // routes. Draw an edge to a lambda or an ecs service and `/<that node's
+    // label>` is served -- for a lambda through odin's HTTP<->invoke-envelope
+    // shim, for an ecs service as a plain reverse proxy to the running task.
+    // The reachable address is the API's `api_endpoint`, NOT the stage's
+    // `invoke_url` (the provider builds that one client-side from the api id
+    // and it points at amazonaws.com -- measured; see docs/limits.md).
+    //
+    // `apiId` stays a read-only field: it is minted by the gateway on
+    // CreateApi, so a user-typed value could only ever be ignored.
+    type: 'apigateway', abbr: 'API', label: 'API Gateway', sublabel: 'HTTP API',
     category: 'Networking', color: 'fuchsia', width: 200,
     fields: [{ key: 'label', label: 'Name', editable: true }, { key: 'apiId', label: 'API ID' }],
     defaultData: { label: 'new-api', apiId: '' },

@@ -2067,6 +2067,86 @@ def _ebs(res: ResourceDesired, refs: Refs) -> Built:
 # kind -> terraform resource type; kept separate from _BUILDERS so pass 1 of
 # generate_tf can assign HCL names (scoped per resource type) without running
 # any builder.
+# --- apigateway (v0.8.19) ---------------------------------------------------
+#
+# An HTTP API (`aws_apigatewayv2_api`) whose ROUTES come from its edges, exactly
+# as an ALB's target attachments do. One canvas node becomes:
+#
+#     aws_apigatewayv2_api          the API itself (this builder)
+#     aws_apigatewayv2_stage        one, always `$default` (companion pass)
+#     aws_apigatewayv2_integration  one per target edge (companion pass)
+#     aws_apigatewayv2_route x2     per target edge (companion pass)
+#
+# WHY TWO ROUTES PER TARGET. A route key `ANY /orders` matches ONLY `/orders`;
+# `ANY /orders/{proxy+}` matches `/orders/a/b` and NOT `/orders`. Serving a whole
+# path prefix therefore takes both -- that is AWS's own idiom, not odin's
+# invention -- and they collapse back to ONE nginx `location` pair on the
+# substrate side (`compute/apigw.py`) and to ONE canvas edge on the import side
+# (`agent/import_tf.py` recovers the edge from the INTEGRATION, so the route
+# count never reaches the canvas).
+#
+# The path segment is the TARGET's label, not a canvas field, for the reason
+# `_EBS_DEVICE_NAMES` gives about positional device names: `generate_tf` is a
+# pure function of the canvas, and a field the tile does not have cannot be read.
+# A label is stable, unique on the canvas, and reads correctly
+# (`https://<endpoint>/orders/...` -> the `orders` function).
+_APIGW_STAGE = "$default"
+_APIGW_TARGET_KINDS = ("lambda", "ecs")
+# The ECS hostname suffix. Kept in lock-step with
+# `gateway/models/apigwctl.py::ECS_HOST_SUFFIX`, which parses it back off the
+# wire; `tests/agent/test_hcl_apigateway.py` asserts the two agree so a rename
+# on one side fails the build rather than silently breaking routing.
+_APIGW_ECS_HOST_SUFFIX = ".odin.internal"
+
+
+def _apigateway(res: ResourceDesired, refs: Refs) -> Built:
+    """The PRIMARY `aws_apigatewayv2_api` block.
+
+    Deliberately NOT containment-gated, unlike `_alb`/`_ec2`: a real HTTP API is
+    regional and has no subnet, so requiring one would be odin inventing a
+    constraint AWS does not have. It also has no canvas-authored knob worth
+    emitting -- `route_selection_expression` is fixed by the protocol and
+    `disable_execute_api_endpoint` would be a claim about a domain odin has no
+    model for."""
+    return {
+        "name": quote(res.id),
+        "protocol_type": quote("HTTP"),
+    }, ""
+
+
+def _apigw_route_keys(target_id: str) -> tuple[str, str]:
+    """The two route keys one target owns. One function so the generator and the
+    tests cannot drift on the spelling."""
+    return f"ANY /{target_id}", f"ANY /{target_id}/{{proxy+}}"
+
+
+def _apigw_integration_attrs(target: ResourceDesired, target_name: str) -> dict[str, str]:
+    """The integration block for one target, which is where the two kinds
+    genuinely differ.
+
+    lambda -> `AWS_PROXY` carrying the function's `invoke_arn`, which is real
+    AWS's own wiring and what `apigwctl.function_of` reads the name back out of.
+
+    ecs -> `HTTP_PROXY` at `http://<service name>.odin.internal`. An ECS service
+    has no URL on real AWS either (an HTTP API reaches a private one through a
+    VPC link, which odin does not model), and `integration_uri` must be a URI --
+    so odin names the service through a hostname only odin resolves, and
+    docs/limits.md says so rather than implying the file would work against
+    Amazon. The alternative considered and rejected was requiring an ALB in
+    between, which would make the simplest useful canvas a four-node one."""
+    if target.kind == "lambda":
+        return {
+            "integration_type": quote("AWS_PROXY"),
+            "integration_uri": f"aws_lambda_function.{target_name}.invoke_arn",
+            "payload_format_version": quote("2.0"),
+        }
+    return {
+        "integration_type": quote("HTTP_PROXY"),
+        "integration_method": quote("ANY"),
+        "integration_uri": f'"http://${{aws_ecs_service.{target_name}.name}}{_APIGW_ECS_HOST_SUFFIX}"',
+    }
+
+
 _TF_TYPES = {
     "s3": "aws_s3_bucket",
     "sqs": "aws_sqs_queue",
@@ -2088,6 +2168,15 @@ _TF_TYPES = {
     "alb": "aws_lb",
     "kms": "aws_kms_key",
     "ebs": "aws_ebs_volume",
+    # apigateway (v0.8.19). **v2, not v1**, and that is an importability
+    # decision rather than a preference: an `aws_api_gateway_rest_api` needs
+    # `aws_api_gateway_resource` + `_method` + `_integration` + `_deployment` +
+    # `_stage` per path -- five companion types whose relationships the importer
+    # would have to rebuild from `parent_id` chains -- against v2's flat
+    # api/integration/route/stage. odin's own output MUST re-import
+    # (ROADMAP: two companions already fail that bar and a third is not
+    # acceptable), and a flat companion set is what makes that reachable.
+    "apigateway": "aws_apigatewayv2_api",
 }
 
 _BUILDERS = {
@@ -2111,6 +2200,7 @@ _BUILDERS = {
     "alb": _alb,
     "kms": _kms,
     "ebs": _ebs,
+    "apigateway": _apigateway,  # v0.8.19
 }
 
 # W2.5: which canvas kinds can actually BE an ALB target. An ECS service
@@ -2821,6 +2911,64 @@ def generate_tf(stack: Stack) -> TfProject:
                 "volume_id": f"aws_ebs_volume.{volume_name}.id",
             })
             blocks.append((("aws_volume_attachment", f"{volume_id}.{instance_id}"), attachment))
+
+    # apigateway (v0.8.19): each API's `$default` stage, plus one integration and
+    # TWO routes per target edge. See the `_apigateway` note above for why two.
+    #
+    # KEYED ON THE TWO NODE KINDS AND NEVER ON `edge.kind`, the rule every
+    # builder here holds: a canvas saved before the edge-type registry carries
+    # `kind: "network"`, and gating on the type name would drop the routes and
+    # make the next apply serve 404 for every path that worked yesterday.
+    # Direction is not significant either -- which end the user dragged from
+    # carries no meaning.
+    #
+    # `built_ids` gates each target for the reason pass 2 records: an integration
+    # naming an `aws_lambda_function` or `aws_ecs_service` that pass 2 declined
+    # is an unresolvable reference, which fails `tofu plan` for the WHOLE
+    # project. That node's own `unsupported` entry already names the cause.
+    apigw_targets = _kind_pair_edges(stack, by_id, ("apigateway",), _APIGW_TARGET_KINDS)
+    for res in ordered:
+        own_name = hcl_name_by_id.get(res.id)
+        if res.kind != "apigateway" or own_name is None or res.id not in built_ids:
+            continue
+        blocks.append((("aws_apigatewayv2_stage", res.id), _block(
+            "aws_apigatewayv2_stage", f"{own_name}_stage",
+            {
+                "api_id": f"aws_apigatewayv2_api.{own_name}.id",
+                "name": quote(_APIGW_STAGE),
+                # The stage odin serves is `$default`, whose invoke path has no
+                # stage segment -- which is what makes the nginx prefix and the
+                # route key agree about what `/orders` means. `auto_deploy` is
+                # `$default`'s only sane setting: without it a route change needs
+                # an explicit deployment that odin has no concept of.
+                "auto_deploy": "true",
+            },
+        )))
+        for target_id in sorted(apigw_targets.get(res.id, [])):
+            if target_id not in built_ids:
+                continue
+            target = by_id[target_id]
+            target_name = hcl_name_by_id[target_id]
+            integration_name = unique_name(
+                f"{own_name}_{target_name}",
+                used_names.setdefault("aws_apigatewayv2_integration", set()),
+            )
+            blocks.append((("aws_apigatewayv2_integration", f"{res.id}.{target_id}"), _block(
+                "aws_apigatewayv2_integration", integration_name,
+                {
+                    "api_id": f"aws_apigatewayv2_api.{own_name}.id",
+                    **_apigw_integration_attrs(target, target_name),
+                },
+            )))
+            for suffix, route_key in zip(("root", "proxy"), _apigw_route_keys(target_id), strict=True):
+                blocks.append((("aws_apigatewayv2_route", f"{res.id}.{target_id}.{suffix}"), _block(
+                    "aws_apigatewayv2_route", f"{integration_name}_{suffix}",
+                    {
+                        "api_id": f"aws_apigatewayv2_api.{own_name}.id",
+                        "route_key": quote(route_key),
+                        "target": f'"integrations/${{aws_apigatewayv2_integration.{integration_name}.id}}"',
+                    },
+                )))
 
     blocks.sort(key=lambda b: b[0])
     main_tf = "\n\n".join([HEADER, provider_block(), *(text for _, text in blocks)]) + "\n"

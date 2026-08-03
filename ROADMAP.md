@@ -1615,6 +1615,90 @@ machine-wide-sweep rule already in CLAUDE.md. A test-owned env is invisible to
 every check a human would think to run; the only safe rule is to touch nothing
 while a suite is running.
 
+## v0.8.19 — `apigateway` stops being a placeholder, and the closed world stops at five verbs
+
+Two things, and the second was found while probing for the first.
+
+**A drawn API Gateway is a real HTTP endpoint.** One `nginx:alpine` container
+per API (`compute/apigw.py`), published on a real host port, whose `location`
+blocks are that API's routes. An `apigateway → lambda|ecs` edge emits
+`aws_apigatewayv2_api` + `_stage` + `_integration` + two `_route`s, and the
+whole thing round-trips: odin's own output re-imports with nothing unsupported
+and generate→import→generate is byte-identical.
+
+**The HTTP↔invoke-envelope shim exists now, once.** `alb → lambda` was declined
+in v0.8.15 precisely because nginx dials `host:port` upstreams and a Lambda is
+an RIE container whose only route takes an event document. `gateway/apigw_shim.py`
+is that translator: payload format 2.0 out, the handler's return value back in
+by 2.0's two rules — including the one people forget, that a return value with
+no `statusCode` IS the response body. It rides as a Starlette route mounted
+AHEAD of the gateway's SigV4 catch-all rather than as a branch inside it, so the
+pipeline's "everything through here is signed" invariant stays true and
+checkable in one place. `docs/architecture` draws that arrow as ungated, because
+it is.
+
+**Measured, not asserted, in five probes — three of which changed the design:**
+
+- The SigV4 credential scope is **`apigateway`**, for both v1 and v2
+  (`Credential=probe/…/us-east-1/apigateway/aws4_request`), while the SDK's
+  model is called `apigatewayv2`. A reader who "fixes" that constant breaks
+  every call, so the classifier carries the recording.
+- The wire is rest-json with **lower-camelCase** members. A first stub answering
+  PascalCase failed with `serialization failed: input member ApiId must not be
+  empty`.
+- **`$default` arrives percent-encoded** as `%24default`. A first measurement
+  taken off Starlette's already-decoded `request.url.path` said otherwise, and
+  the resulting create-from-body / read-from-path mismatch failed a real apply
+  with `reading API Gateway v2 Stage ($default): couldn't find resource`.
+- **RETRACTED: `invoke_url` is not derived from `apiEndpoint`.** Probe 1
+  concluded it was, because the throwaway stub happened to answer `apiEndpoint`
+  with exactly the `https://{apiId}.execute-api…` string the provider
+  constructs; the match was read as causation. Against the real gateway, in one
+  state file: `api_endpoint = "http://127.0.0.1:39999"` and
+  `invoke_url = "https://api75a2c592.execute-api.us-east-1.amazonaws.com/"`. The
+  reachable address is `api_endpoint`; `docs/limits.md` says so.
+- An `apigatewayv2` `CreateApi` from the OPERATOR got **403
+  `AccessDeniedException` / `unmappable-action`** before this work — closed
+  world confirmed by measurement rather than by reading the docstring.
+
+**The second thing: odin's closed world was silently method-limited.**
+`classify.py` states twice that an unmappable request is denied, never guessed
+at. That property lived inside `catch_all`, and the route table in front of it
+listed five verbs — so a **PATCH or an OPTIONS never reached odin's code at
+all**. Starlette answered `405 Method Not Allowed`: no SigV4 verification, no
+policy evaluation, no `access_denied` event. Latent (no modeled service used
+PATCH) until apigateway, whose four Update operations are all PATCH. Both verbs
+are routed now and the property is pinned by
+`tests/gateway/test_closed_world_is_method_independent.py`. The residual is
+stated rather than fixed: TRACE/CONNECT/extension methods are still a router
+405, because no AWS API uses one and inventing handling for verbs that never
+arrive is how a fifth unfired guard gets written.
+
+**The most useful finding was in a test, not in the code.** The first draft of
+that method-independence test parametrized over `gateway/app.py`'s own route
+table — the natural move. Removing PATCH therefore DELETED the `[PATCH]` case:
+the file went from 6 green to 5 green and reported success, on exactly the
+regression it existed to catch. A test derived from the thing under test cannot
+fail when that thing shrinks. It is honesty rule 5 in `.claude/CLAUDE.md` now,
+and the same shape was found the same night in `test_ecsctl.py`, green for
+months.
+
+Every guard added here was mutation-tested, and every run's test COUNT was
+checked as well as its pass/fail — a mutation whose count drops is the quiet
+failure above wearing a green coat:
+
+    gate the route pass on edge.kind  -> FAILED ...still_routes            (1F/18P)
+    recover the edge per ROUTE        -> FAILED ...exactly_one_line + 1    (2F/17P)
+    silence the route-key check       -> FAILED ...reported_as_CHANGED     (1F/18P)
+    drop the shim's token check       -> FAILED ...refuses_a_wrong_token   (1F/20P)
+    ignore RIE's function_error       -> FAILED ...502_not_a_200 (200==502)(1F/18P)
+    remove PATCH / remove OPTIONS     -> FAILED ...[PATCH] / [OPTIONS]     (1F/7P)
+
+One of those mutations was itself wrong first and worth recording: modelling
+"recover the edge per route" as "widen the loop's type filter" produced
+`unsupported` entries rather than duplicate edges, so it proved nothing. A
+mutation has to model the real defect.
+
 ## v0.8.18 — `ebs` stops being a placeholder: a drawn disk is a real block device on a real VM
 
 **Service-coverage scoping starts here.** Ten catalog tiles were unbackable
@@ -1904,11 +1988,15 @@ run and are not described as such.
      the `ec2` end has no Terraform expression (it is an fstab line in user-data)
      and this repo has a measured burn where a host-dir mount into Lima silently
      mounted an empty directory.**
-  3. **`apigateway → lambda|ecs`** — settled as belonging to the TARGET family,
-     not events, on the synchrony argument: a caller holds a connection open and
-     awaits a status code. Substrate is `compute/proxy.py`'s nginx given a route
-     table. It needs the HTTP↔invoke-envelope shim `alb → lambda` was declined
-     for; build it once, here.
+  3. ~~**`apigateway → lambda|ecs`**~~ **CLOSED in v0.8.19.** Settled as
+     belonging to the TARGET family, not events, on the synchrony argument: a
+     caller holds a connection open and awaits a status code. The substrate is
+     `compute/apigw.py` — the SAME nginx mechanism as `compute/proxy.py`, every
+     moving part imported from it, differing only in what goes in the config
+     (`location` blocks per route rather than an upstream per target). The
+     HTTP↔invoke-envelope shim `alb → lambda` was declined for is built, once,
+     in `gateway/apigw_shim.py`, and `hcl.py::_ALB_NO_LAMBDA` still points at
+     it. See the v0.8.19 entry.
   4. **`route53`** — `--add-host` for containers and `/etc/hosts` via cloud-init
      for VMs are both real. THE TRAP, measured: an ALB's endpoint is
      `127.0.0.1:<dynamic port>` and a hosts entry cannot carry a port, so a name

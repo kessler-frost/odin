@@ -339,6 +339,10 @@ def classify(
         return _classify_elbv2(body)
     if service == "events":
         return _classify_events(lower_headers, body)
+    # apigateway (v0.8.19). ONE branch for both API Gateway v1 and v2 -- they
+    # share this credential scope; see `_APIGW_ROUTES` above.
+    if service == "apigateway":
+        return _classify_apigateway(method, path)
     return None
 
 
@@ -924,6 +928,67 @@ def _classify_lambda(method: str, path: str, body: bytes) -> tuple[str, str] | N
         if not isinstance(name, str) or not name:
             return f"lambda:{op}", "*"
         return f"lambda:{op}", name.rsplit(":", 1)[-1] if name.startswith("arn:") else name
+    return None
+
+
+# --- apigateway (v0.8.19) --------------------------------------------------
+#
+# THE CREDENTIAL SCOPE IS `apigateway`, FOR BOTH v1 AND v2. Measured, not
+# assumed: real terraform-provider-aws 5.100.0 creating an
+# `aws_apigatewayv2_api` signs with
+# `Credential=probe/20260803/us-east-1/apigateway/aws4_request`. botocore agrees
+# from the other side -- the `apigatewayv2` service model's `endpointPrefix` is
+# `apigateway` and its `signingName` is `apigateway`. Since `gateway/app.py`
+# reads the service from the credential scope and NOTHING else, a reader who
+# "corrects" this to `apigatewayv2` because that is the SDK's name breaks every
+# call and gets `unmappable-action` for their trouble. This comment is here
+# rather than only in the model because THIS is the file that dispatches on it.
+#
+# Shape is lambda's: REST, so (method, path) against an anchored table. Same
+# OPERATOR-only reasoning as ec2/iam/ecr/lambda -- the only principal driving
+# apigateway calls is tofu, so extraction only needs to never return None for a
+# route it recognizes. The resource is the API ID (a bare `apiXXXXXXXX`) rather
+# than a canvas label: an id is what every path carries, and the API's label is
+# recoverable from its `odin:node` tag when anything needs it. No workload IAM
+# edge targets an apigateway node (`ui/src/lib/iam.ts` grants it no actions), so
+# nothing depends on the resource being a label -- exactly the `alb` precedent.
+_APIGW_ROUTES: tuple[tuple[str, re.Pattern[str], str], ...] = (
+    ("POST", re.compile(r"^/v2/apis$"), "CreateApi"),
+    ("GET", re.compile(r"^/v2/apis$"), "GetApis"),
+    ("GET", re.compile(r"^/v2/apis/(?P<api>[^/]+)$"), "GetApi"),
+    ("PATCH", re.compile(r"^/v2/apis/(?P<api>[^/]+)$"), "UpdateApi"),
+    ("DELETE", re.compile(r"^/v2/apis/(?P<api>[^/]+)$"), "DeleteApi"),
+    ("POST", re.compile(r"^/v2/apis/(?P<api>[^/]+)/integrations$"), "CreateIntegration"),
+    ("GET", re.compile(r"^/v2/apis/(?P<api>[^/]+)/integrations/[^/]+$"), "GetIntegration"),
+    ("PATCH", re.compile(r"^/v2/apis/(?P<api>[^/]+)/integrations/[^/]+$"), "UpdateIntegration"),
+    ("DELETE", re.compile(r"^/v2/apis/(?P<api>[^/]+)/integrations/[^/]+$"), "DeleteIntegration"),
+    ("POST", re.compile(r"^/v2/apis/(?P<api>[^/]+)/routes$"), "CreateRoute"),
+    ("GET", re.compile(r"^/v2/apis/(?P<api>[^/]+)/routes/[^/]+$"), "GetRoute"),
+    ("PATCH", re.compile(r"^/v2/apis/(?P<api>[^/]+)/routes/[^/]+$"), "UpdateRoute"),
+    ("DELETE", re.compile(r"^/v2/apis/(?P<api>[^/]+)/routes/[^/]+$"), "DeleteRoute"),
+    ("POST", re.compile(r"^/v2/apis/(?P<api>[^/]+)/stages$"), "CreateStage"),
+    # The stage's own segment is `.+` and not `[^/]+`: a stage NAME is the id,
+    # and a name containing a slash should reach the model's own error rather
+    # than become `unmappable-action`, which would blame authorization for a
+    # naming problem. The name odin has to serve is the literal `$default`, and
+    # it arrives PERCENT-ENCODED as `%24default` -- measured on the raw path,
+    # after a first measurement taken off Starlette's already-decoded
+    # `request.url.path` said the opposite and produced a real bug
+    # (`apigwctl.path_ids` records it).
+    ("GET", re.compile(r"^/v2/apis/(?P<api>[^/]+)/stages/.+$"), "GetStage"),
+    ("PATCH", re.compile(r"^/v2/apis/(?P<api>[^/]+)/stages/.+$"), "UpdateStage"),
+    ("DELETE", re.compile(r"^/v2/apis/(?P<api>[^/]+)/stages/.+$"), "DeleteStage"),
+)
+
+
+def _classify_apigateway(method: str, path: str) -> tuple[str, str] | None:
+    for route_method, pattern, op in _APIGW_ROUTES:
+        if route_method != method:
+            continue
+        match = pattern.match(path)
+        if match is None:
+            continue
+        return f"apigateway:{op}", unquote(match.groupdict().get("api") or "*")
     return None
 
 
