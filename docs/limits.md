@@ -788,21 +788,34 @@ They are listed because finding one by surprise is worse than reading it here.
   fires nothing — in practice every workload gets `AWS_ENDPOINT_URL`, so every
   workload write goes through. A queue or topic target is refused at PUT with
   `InvalidArgument` rather than stored, because nothing would drain it.
-- **An S3 removal notification OVER-FIRES for a key that never existed.**
-  S3 deletes are idempotent: deleting a key that was never
-  there SUCCEEDS. Measured against `rustfs/rustfs:latest` — deleting one real
-  key and one that never existed returned HTTP 200 and reported **both** as
-  `<Deleted>`, with zero `<Error>` entries; the single-object `DELETE` answers
-  204 the same way regardless. So the response carries no signal that separates
-  "removed something" from "removed nothing", and odin's hook runs after the
-  forward, when the answer is already unrecoverable. odin therefore enqueues an
-  `s3:ObjectRemoved:Delete` notification in both cases; **real AWS sends nothing
-  when nothing was removed.** A handler that assumes the object existed (and,
-  say, deletes a matching database row) will run for a key that never did.
-  Over-firing is the milder direction — a trigger that never fires is worse —
-  but it is a real divergence, so it is written here rather than discovered.
-  Genuine per-object FAILURES are handled correctly: a key S3 reports under
-  `<Error>` (AccessDenied, an object-lock retention) fires nothing.
+- **An S3 removal notification costs one HEAD per key that would fire, and that
+  is the price of not over-firing.** This entry used to say the opposite half:
+  odin enqueued `s3:ObjectRemoved:Delete` for a key that never existed, where
+  real AWS sends nothing. The response genuinely cannot tell — re-measured
+  against `rustfs/rustfs:latest` on 2026-08-03, a single-object `DELETE` of a
+  key that never was answers **204**, exactly as for one that did, and
+  `DeleteObjects` reports **both** under `<Deleted>` with zero `<Error>`
+  entries. So since v0.8.21 the question is asked BEFORE the forward, which is
+  the last moment it has an answer: `gateway/app.py::_absent_keys` issues a
+  signed HEAD per key and `s3notify._writes` drops the ones the backing 404'd.
+  What that costs, measured the same day, loopback, otherwise-idle machine:
+  one HEAD is **0.89 ms median** (p95 1.25) for a key that is present and
+  **0.74 ms** (p95 0.98) for one that is not; RustFS answers a concurrent batch
+  near-serially, so 100 keys is **97.5 ms** and 1000 keys is **1.51 s**. It is
+  charged only to buckets that have a matching `ObjectRemoved` configuration,
+  and only for the keys inside its prefix/suffix filter — a bucket with no
+  notification issues no HEAD at all. Against the same 1000 notifications
+  taking ~100 s to deliver at 10 per tick, the probe is ~1.5% of a pipeline the
+  user opted into. Every failure of the probe (timeout, 403, unparseable
+  request body) falls back to firing, so the old over-fire is the degraded
+  mode rather than silence. Genuine per-object FAILURES are still handled
+  separately: a key S3 reports under `<Error>` fires nothing.
+  Not used, though it would be free: RustFS puts `x-amz-delete-marker: false`
+  on a single-object delete that removed something and omits the header when it
+  did not (20/20 both ways, plus a zero-byte object). Real AWS sends that header
+  only for a versioned bucket, `backings.py` pins the image at `:latest`, and
+  its failure direction is silence rather than noise — so odin reads 200-vs-404
+  on HEAD, which every S3 implementation answers the same way.
 - **RDS** is Terraform-managed (`aws_db_instance` → a Postgres container)
   and Postgres-only: MySQL or MariaDB is declined with the reason.
   `allocated_storage` and `instance_class` round-trip faithfully but resize

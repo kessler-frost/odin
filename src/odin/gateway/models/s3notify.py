@@ -65,6 +65,7 @@ dispatcher -- never ahead of it.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import time
 import uuid
@@ -310,14 +311,11 @@ def _deleted_keys(response_body: bytes) -> list[str]:
         <Deleted><Key>does/not/exist.jpg</Key></Deleted></DeleteResult>
 
     -- so the element shape is exactly what this parses, and there were ZERO
-    `<Error>` entries. That second fact is the LIMIT recorded in
-    `docs/limits.md`: DeleteObjects is idempotent, so S3 reports a key that
-    never existed as `<Deleted>`, and odin therefore enqueues a removal
-    notification real AWS would not send (real AWS fires nothing -- nothing was
-    removed). The response carries no signal that distinguishes the two cases,
-    and `postprocess` runs AFTER the forward, so odin cannot tell from here.
-    The single-object `DELETE /{b}/{k}` has the identical divergence for the
-    identical reason: S3 answers 204 whether or not the key was there.
+    `<Error>` entries. THAT is why a `<Deleted>` entry alone cannot decide
+    whether to fire: DeleteObjects is idempotent, so a key that never existed
+    is reported exactly like one that did. What separates them is the
+    PRE-FORWARD existence probe (`absent_keys` below); this function's job is
+    only "what did the backing agree to remove", and both filters compose.
 
     The `<Error>` skip below is still correct and still load-bearing -- a
     GENUINE per-object failure (AccessDenied, an object-lock retention) does
@@ -334,7 +332,96 @@ def _deleted_keys(response_body: bytes) -> list[str]:
     ]
 
 
-def _writes(action: str, path: str, query: dict[str, str], request_body: bytes, response_body: bytes) -> list[tuple[str, str, int, str]]:
+def _requested_keys(path: str, query: dict[str, str], request_body: bytes) -> list[str]:
+    """The keys a delete request ASKS to remove -- known BEFORE the forward, and
+    therefore the only list an existence probe can be built from.
+
+    `_deleted_keys` reads the RESPONSE and is the right source for what was
+    actually removed; this reads the REQUEST and is the right source for what
+    to probe. Both delete shapes are covered: the single-object key is in the
+    path, and the multi-object list is `<Delete><Object><Key>` in the body --
+    the request half of the same document `_deleted_keys` answers.
+
+    A body that does not parse yields NO keys, so nothing is probed and nothing
+    is suppressed: the forward then behaves exactly as it did before this
+    function existed. That is the fail-open direction on purpose (see
+    `probe_keys`)."""
+    if "delete" not in query:
+        return [key for key in (_object_key(path),) if key]
+    with contextlib.suppress(ElementTree.ParseError):
+        root = ElementTree.fromstring(request_body)
+        return [
+            text
+            for obj in root
+            if _local(obj.tag) == "Object"
+            for key in obj
+            if _local(key.tag) == "Key" and (text := (key.text or ""))
+        ]
+    return []
+
+
+def probe_keys(
+    stores: SynthStores, env: str, bucket: str, path: str, query: dict[str, str], request_body: bytes,
+) -> tuple[str, ...]:
+    """The keys whose EXISTENCE has to be established before the delete is
+    forwarded -- the input to `app.py`'s pre-forward HEAD probe.
+
+    WHY BEFORE THE FORWARD. S3 deletes are idempotent and the response says so:
+    MEASURED against `rustfs/rustfs:latest` on 2026-08-03, a single-object
+    `DELETE` of a key that never existed answered **204**, exactly as it did for
+    a key that did, and `DeleteObjects` reported BOTH under `<Deleted>` with
+    zero `<Error>` entries. After the forward the answer is gone, so the only
+    place the question can be asked is here.
+
+    WHY THIS IS NOT "one HEAD per delete". The probe is scoped to the keys a
+    stored configuration would actually FIRE for -- the same `matches`
+    predicate `_enqueue` uses, so the two cannot drift. A bucket with no
+    removal notification (every bucket, until someone draws one) probes NOTHING
+    and pays NOTHING, and a bucket with a `prefix`/`suffix` filter probes only
+    the keys inside it.
+
+    WHAT IT COSTS WHEN IT DOES RUN, measured the same day, loopback,
+    otherwise-idle machine, `rustfs/rustfs:latest`:
+
+        one HEAD                     median 0.89 ms (p95 1.25) key present
+                                     median 0.74 ms (p95 0.98) key absent
+        10   concurrent HEADs        median   11.3 ms
+        100  concurrent HEADs        median   97.5 ms
+        1000 concurrent HEADs        median 1508.7 ms
+
+    -- so RustFS answers these near-serially (~1.1ms each) and `httpx`'s own
+    100-connection pool is the ceiling, not the parallelism. A 1000-key
+    `aws s3 rm --recursive` batch against a bucket that HAS a removal
+    notification therefore pays ~1.5s. That is real, and it is small against
+    what those same 1000 notifications then cost to deliver:
+    `reconcile/dispatch.py` drains at most 10 per tick, i.e. ~100 SECONDS at
+    the production 1s poll. The probe is 1.5% of a pipeline the user has
+    already opted into by configuring the notification.
+
+    THE ALTERNATIVE THAT WAS MEASURED AND REJECTED. RustFS turns out to carry a
+    discriminator on the single-object delete: `x-amz-delete-marker: false` is
+    present when the key existed and the header is ABSENT when it never did --
+    20/20 both ways, plus a zero-byte object, on this image. It is free, and it
+    is not used, for three reasons. (1) Real AWS sends that header only for a
+    VERSIONED bucket, so it is a RustFS behaviour rather than an S3 contract,
+    and `backings.py` pins the image at `:latest` -- an image pull could remove
+    it silently. (2) Its failure direction is the bad one: no header means
+    "never fired", and this file's own docs say a trigger that never fires is
+    worse than one that over-fires. (3) It does not exist for the multi-object
+    shape at all, so it would buy one mechanism for one shape and leave the
+    other needing the probe anyway. 200-vs-404 on HEAD is bedrock S3 that every
+    implementation answers the same way."""
+    stored = configurations(stores, env, bucket)
+    return tuple(
+        key for key in _requested_keys(path, query, request_body)
+        if any(matches(configuration, OBJECT_REMOVED_DELETE, key) for configuration in stored)
+    )
+
+
+def _writes(
+    action: str, path: str, query: dict[str, str], request_body: bytes, response_body: bytes,
+    absent: frozenset[str],
+) -> list[tuple[str, str, int, str]]:
     """(key, event name, size, etag) for every object this request actually
     landed or removed -- EMPTY for the request shapes that land no object.
 
@@ -363,17 +450,24 @@ def _writes(action: str, path: str, query: dict[str, str], request_body: bytes, 
     every shape where that identity does not hold. Deletes carry neither in a
     real S3 event either.
 
-    ONE KNOWN OVER-FIRE, measured and documented in `docs/limits.md` rather
-    than hidden: BOTH delete shapes enqueue a removal for a key that never
-    existed. S3 is idempotent about deletes -- a single-object DELETE answers
-    204 and DeleteObjects reports `<Deleted>`, in both cases whether or not the
-    key was there (probed against RustFS; see `_deleted_keys`) -- so the
-    response carries nothing that would let odin tell the difference, and
-    `postprocess` runs after the forward, when the answer is unrecoverable
-    either way. Real AWS fires no event there."""
+    `absent` is what the PRE-FORWARD probe (`probe_keys`, run by `app.py`
+    before the delete was forwarded) found definitively missing, and it is the
+    whole of the fix for the over-fire this file used to document as a limit.
+    S3 is idempotent about deletes -- a single-object DELETE answers 204 and
+    DeleteObjects reports `<Deleted>`, in both cases whether or not the key was
+    there (probed against RustFS; see `_deleted_keys`) -- so the RESPONSE can
+    never tell the two apart and the question has to be asked earlier.
+
+    ABSENT, not "existing", and the polarity is the safety property. An empty
+    set suppresses NOTHING, so every path that does not or cannot probe -- a
+    HEAD that timed out, a 403, an unparseable request body, a caller that
+    never ran the probe at all -- falls back to firing, which is the behaviour
+    this had before and the milder direction of the two. Only a definite 404
+    puts a key in here. A trigger that over-fires is a nuisance; a trigger that
+    silently stops firing is the failure this repo keeps finding."""
     if action == "s3:DeleteObject":
         keys = _deleted_keys(response_body) if "delete" in query else [_object_key(path)]
-        return [(key, OBJECT_REMOVED_DELETE, 0, "") for key in keys if key]
+        return [(key, OBJECT_REMOVED_DELETE, 0, "") for key in keys if key and key not in absent]
     key = _object_key(path)
     if not key or "uploads" in query or "partNumber" in query:
         return []
@@ -405,7 +499,7 @@ def matches(configuration: dict[str, Any], event_name: str, key: str) -> bool:
 
 def _enqueue(
     action: str, resource: str, env: str, request_body: bytes, response_body: bytes,
-    stores: SynthStores, now: float, path: str, query: dict[str, str],
+    stores: SynthStores, now: float, path: str, query: dict[str, str], absent: frozenset[str],
 ) -> bytes:
     """Write one `pending:{id}` record per MATCHING configuration and return
     the response body untouched.
@@ -426,7 +520,7 @@ def _enqueue(
     identical trap."""
     at = time.time()
     stored = configurations(stores, env, resource)
-    for key, event_name, size, etag in _writes(action, path, query, request_body, response_body):
+    for key, event_name, size, etag in _writes(action, path, query, request_body, response_body, absent):
         for configuration in stored:
             if matches(configuration, event_name, key):
                 stores.dispatch.set(env, f"pending:{uuid.uuid4().hex}", {
@@ -443,12 +537,14 @@ def _enqueue(
 def enqueue_put_object(
     resource: str, env: str, request_body: bytes, response_body: bytes,
     stores: SynthStores, gateway_host: str, now: float, path: str, query: dict[str, str],
+    absent: frozenset[str],
 ) -> bytes:
-    return _enqueue("s3:PutObject", resource, env, request_body, response_body, stores, now, path, query)
+    return _enqueue("s3:PutObject", resource, env, request_body, response_body, stores, now, path, query, absent)
 
 
 def enqueue_delete_object(
     resource: str, env: str, request_body: bytes, response_body: bytes,
     stores: SynthStores, gateway_host: str, now: float, path: str, query: dict[str, str],
+    absent: frozenset[str],
 ) -> bytes:
-    return _enqueue("s3:DeleteObject", resource, env, request_body, response_body, stores, now, path, query)
+    return _enqueue("s3:DeleteObject", resource, env, request_body, response_body, stores, now, path, query, absent)
