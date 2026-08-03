@@ -16,8 +16,8 @@ The obvious shape -- hand the model a canvas, take a canvas back -- is the wrong
 one, and not for prompt-engineering reasons. A returned canvas is unauditable:
 a node silently dropped, a `password` quietly rewritten and a label changed all
 arrive as the same opaque blob, and diffing two canvases to find out cannot
-recover INTENT ("was that node meant to go?"). The whole of `agent/hcl.py` and
-`agent/import_tf.py` is deterministic precisely so nothing an LLM does can change
+recover INTENT ("was that node meant to go?"). The whole of `iac/hcl.py` and
+`iac/import_tf.py` is deterministic precisely so nothing an LLM does can change
 what gets applied; a canvas-in-canvas-out chat would hand that back.
 
 An operation list is the opposite. Each op names exactly what it touches, so:
@@ -60,6 +60,7 @@ from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, SdkMcpTool, cr
 from pydantic import BaseModel, Field, ValidationError
 
 from odin.agent import ai
+from odin.settings import settings
 from odin.spec.translate import _KIND, EDGE_KINDS
 
 log = logging.getLogger("odin.chat")
@@ -202,7 +203,7 @@ def validate(op: Op, canvas: dict) -> str | None:
         # here rather than in the schema underneath.
         #
         # NOTE what this does NOT close, because it must not be read as having
-        # closed it: `agent/hcl.py`'s subscription and ALB passes match on the
+        # closed it: `iac/hcl.py`'s subscription and ALB passes match on the
         # two NODE kinds and never read the kind at all, so a perfectly valid
         # 'iam' edge between an sns node and an sqs node still emits a real
         # `aws_sns_topic_subscription`. Kind-blindness is the primary defect and
@@ -385,8 +386,6 @@ class ProposeEditsInput(BaseModel):
 
 
 _MODEL = "claude-sonnet-5"
-_TIMEOUT_ENV = "ODIN_CHAT_TIMEOUT"
-_DEFAULT_TIMEOUT = 60.0
 
 _SYSTEM = (
     "You edit an odin canvas: a diagram of AWS-shaped infrastructure that odin builds for real. "
@@ -412,7 +411,7 @@ _SYSTEM = (
 def default_timeout() -> float:
     """Read per call so it can be raised for one slow request without a restart
     (`rdsctl.available_timeout`'s shape)."""
-    return float(os.environ.get(_TIMEOUT_ENV, _DEFAULT_TIMEOUT))
+    return settings.ai.chat_timeout
 
 
 def disabled_reason() -> str | None:

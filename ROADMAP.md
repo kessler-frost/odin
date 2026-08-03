@@ -271,18 +271,27 @@ future decision against these points instead of re-deriving them:
   - SNS→SQS live-edit: FIXED (v0.5.0) — adding a subscription edge to an
     already-healthy topic lands on the next Apply via the reconciler's
     observe pass (proven by real fanout to both queues).
-  - **Every odin-generated SNS→SQS subscription sets
-    `raw_message_delivery = true`, including on an import round trip where the
-    source didn't have it.** Stated here because it CHANGES DELIVERY SEMANTICS:
-    the queue receives the published body verbatim instead of SNS's JSON
-    envelope, so a consumer that parses `Message` out of an envelope will not
-    find one. It is deliberate and load-bearing rather than cosmetic — the
-    reconciler's own `provision()` path subscribes with
-    `Attributes={"RawMessageDelivery": "true"}` (`aws/backings.py`) and goaws
-    honours it, so dropping it from the generated HCL would make a
-    tofu-applied stack deliver differently from an `/apply`-provisioned one.
-    A source `.tf` that wants the envelope has no way to say so today; the
-    round trip will add the attribute back (v0.7.1, field test U3).
+  - SNS→SQS `raw_message_delivery`: **AUTHORABLE (v0.8.21), default `true`.**
+    This read "every odin-generated subscription sets `raw_message_delivery =
+    true`, including on an import round trip where the source didn't have it",
+    and closed with "a source `.tf` that wants the envelope has no way to say
+    so today". It can now: the flag is a per-edge value
+    (`Edge.raw_message_delivery`, `data.rawMessageDelivery` on the wire, a
+    checkbox on the edge panel), an absent field still reads as `true` so every
+    canvas drawn before it emits the identical bytes, and an imported `false`
+    is CARRIED rather than substituted — the round trip stopped adding the
+    attribute back. The reason it was load-bearing is unchanged and is why BOTH
+    paths were changed together: `aws/backings.py::provision` used to subscribe
+    with a hardcoded `Attributes={"RawMessageDelivery": "true"}`, so leaving it
+    alone would have made a tofu-applied stack deliver differently from an
+    `/apply`-provisioned one. It now takes the flag from the same edge.
+    NOT closed: changing the flag on an ALREADY-LIVE subscription only takes
+    effect through Simulate. `Reconciler._watch` re-subscribes a queue that is
+    MISSING, never one whose attributes merely differ, and
+    `BackingAws.subscriptions` reads endpoints out of
+    `ListSubscriptionsByTopic` — which carries no attributes — so seeing the
+    difference needs a `GetSubscriptionAttributes` per subscription, and goaws
+    has not been probed for it. Listed in `docs/limits.md` rather than assumed.
   - ElastiCache (W2.8): **single node, redis only.** `aws_elasticache_cluster`
     is real — a `redis:7-alpine` container per cluster, its published port
     advertised as the cluster's node endpoint, zero-drift re-plan — but
@@ -778,7 +787,7 @@ future decision against these points instead of re-deriving them:
   v0.7.1 the two bullets above ("a container consumes `${{cache.REDIS_URL}}`",
   "a CONTAINER consumes `${{db.DATABASE_URL}}`") were **not achievable**: both
   field-test agents confirmed the map was silently dropped — `spec/translate.py`
-  parsed it and lifted refs onto `ResourceDesired.refs`, but `agent/hcl.py`
+  parsed it and lifted refs onto `ResourceDesired.refs`, but `iac/hcl.py`
   emitted no `environment` block at all, `fabric.resolve` had no production
   caller, and the container came up with the four `AWS_*` vars and nothing else.
   So you could provision the whole production stack with no canvas-driven way
@@ -1896,6 +1905,51 @@ run and are not described as such.
 ## Next — known, measured, not yet fixed
 
 - [ ] **One runtime backend, macOS and Linux, containers AND VMs (owner ask,
+
+  **MEASURED 2026-08-03, and the blocker is SELECTABILITY, not capability.**
+  `LimaRuntime` works: `tests/runtime/test_lima_integration.py` boots a real
+  Lima VM, runs a real container inside it via `nerdctl`, reads its published
+  port, and tears the VM down -- **5 passed in 49.27s**, `limactl list` empty
+  afterwards. So the second backend is not hypothetical; it runs.
+
+  **THE SWITCH NOW EXISTS (v0.8.22).** `ODIN_RUNTIME` -- a `ComputeSettings`
+  field, `colima` (default) or `lima` -- is honoured by `create_app`, which
+  reads `runtime or build_runtime()` (`runtime/select.py`). `colima` is
+  byte-identical to before and an explicitly passed `runtime=` still wins over
+  the setting, since that is the injection seam. An unrecognised value fails at
+  `settings.validate_all()` naming the variable and both accepted values, rather
+  than falling back to `colima` and handing someone who asked for VM isolation
+  containers on the host with nothing said. Pinned by
+  `tests/runtime/test_select.py`; five mutations killed, and the one that
+  survives (`_BACKENDS.get(..., ColimaRuntime)`) is reported in that file's
+  docstring with the measurement showing it is unreachable behind the `Literal`.
+
+  **WHAT REMAINS is the comparison itself: run the integration gate against
+  `lima`.** That is now possible and has NOT been done -- so nothing below is
+  retired, and "odin runs on Lima" is still not a claim anyone can make.
+  Probing the real VM while wiring the switch already found two things the gate
+  would hit immediately, both measured on a booted `odin-host` and both written
+  up in `docs/limits.md`:
+  - **`host.docker.internal` does not resolve inside a container in the VM.**
+    `ColimaRuntime._run_flags()` adds `--add-host …:host-gateway`; `LimaRuntime`
+    does not override `_run_flags`, and everything odin injects into a workload
+    (`AWS_ENDPOINT_URL`, the ALB/apigw upstreams) is spelled with that name. The
+    container's `/etc/hosts` holds only localhost and itself. `host.lima.internal`
+    resolves *in the VM* (`192.168.5.2`) but not in a container in it. This also
+    corrects `runtime/lima.py`'s own docstring, which reasoned from Lima's
+    VM→host port forwarding to "references work the same" -- true for host-side
+    probes, false for container-side references.
+  - **The VM has no host mounts** (`compute/lima_yaml.py` emits `"mounts": []`;
+    confirmed live -- no virtiofs/9p/reverse-sshfs, a real host dir lists
+    empty), so every bind mount is an empty directory: Lambda code at
+    `/var/task`, the Nebula sidecar's `/etc/nebula`, EFS task mounts. RDS
+    escapes only because it uses a NAMED volume.
+
+  So the accurate status is three-way, and the middle term is the new one:
+  "LimaRuntime is unproven" would be false (it is proven for what it does),
+  "nobody can choose it" is now false too, and "LimaRuntime works, ship it"
+  remains false -- nothing has driven odin's real workloads through it, and two
+  known gaps say what the first attempt will hit.
   2026-07-31).** *"I want to use lima or colima or something ONLY and not a mix
   of both like we currently have … something that handles containers as well as
   VMs natively."*
@@ -2128,7 +2182,7 @@ run and are not described as such.
      "this is encrypted where it lives" rather than "AWS would encrypt this".
      If that is not built, kms is dropped with the other three.
 
-- [ ] **odin's OWN output does not re-import cleanly for two companions.**
+- [x] **odin's OWN output does not re-import cleanly for two companions.**
   Measured 2026-08-02 while adding `ebs`, and it long predates it: a canvas
   with an `alb → ec2` target plus a granted `ec2` generates a file whose
   `aws_iam_instance_profile` and `aws_lb_target_group_attachment` both come
@@ -2140,29 +2194,113 @@ run and are not described as such.
   attachment is already an alb↔ec2 edge) and widening that canvas so the gap
   cannot reopen.
 
+  **Done in v0.8.21, and the entry above got one of the two treatments wrong.**
+  The attachment is an EDGE, as written. The instance profile does **not** fold
+  onto the ec2 node — it folds AWAY entirely, the `aws_ecs_cluster` treatment,
+  because it carries nothing a canvas node has a field for: `name` is
+  `<ec2 label>-profile`, `role` is that instance's own auto-role, and the grant
+  it exists for already comes back as an `iam` edge from the
+  `aws_iam_role_policy`. Folding it onto the node would have invented a field;
+  making it an edge would have drawn a second line for a permission already
+  drawn. `import_tf` has exactly two moves for a non-node resource and this one
+  needed neither of the ones the entry named.
+
+  **A THIRD instance was found while fixing these two, and it was the worst of
+  the three.** `alb → ecs` also lost the target edge on the round trip — and
+  unlike the two above it did so in SILENCE: `unsupported == []`, no warning, no
+  edge, and a regenerated `main.tf` missing the whole `load_balancer` block, so
+  the next apply would take a live service out of the load balancer's rotation
+  with nothing said. It hid because `load_balancer` was already listed in
+  `_CARRIED_ATTRS["ecs"]`, which suppressed the one warning that would have named
+  it. **A carried-set entry is a PROMISE that a round trip reproduces the
+  argument, and nothing was checking that promise** — which makes the carried
+  sets a place to go looking for more of these, not a place to trust.
+
+  Measured after the fix, on a canvas with one alb fronting BOTH an ec2 and an
+  ecs service plus a granted ec2: `unsupported == []`, `warnings == []`,
+  `again.files["main.tf"] == main_tf`. The values are deliberately non-default
+  (listener 8080, target 9000, health check `/healthz`) because 80/80/`/`
+  regenerate byte-identically even if import drops them — `hcl.py` refills the
+  defaults. Six mutations, each killing named tests with the test COUNT held at
+  114: deleting the attachment from `_ALB_COMPANION_TYPES` (10 failed), dropping
+  the attachment edge (5), deleting the profile branch (8), removing the profile
+  name check (1), deleting the ecs `load_balancer` recovery (5), and removing the
+  two re-derived `ec2` carried attrs (4).
+
+  **One thing a byte-identical round trip could never have proved**, and it is
+  worth carrying forward: the PROFILE. `hcl.py` re-derives it from the grant
+  edge, so `again == main_tf` held in the broken state too — measured, with
+  `aws_iam_instance_profile` sitting in `unsupported` and the equality still
+  `True`. A generator that puts a resource back cannot be used to check that the
+  importer read it (honesty rule 5, the check and its subject sharing a source).
+  The profile's proof is `unsupported == []` plus `warnings == []` plus the
+  falsification tests, never the equality.
+
 - [ ] **A fake runtime does not isolate `/apply-full`, so a "unit" test boots real
+- [x] **A fake runtime does not isolate `/apply-full`, so a "unit" test boots real
   containers.** Measured 2026-07-29, after it leaked four containers into every
   unit-suite run and cost a release-gate diagnosis.
   `create_app(runtime=FakeRuntime(), rds=FakeRds(), aws=FakeAws(), backings=False)`
-  reads as hermetic and is not: `/apply-full` runs a real `tofu apply`, and the
-  gateway's own models default their substrate (`lambdactl` to
+  read as hermetic and was not: `/apply-full` ran a real `tofu apply`, and the
+  gateway's own models defaulted their substrate (`lambdactl` to
   `FunctionRuntime(ColimaRuntime(), ...)`, rdsctl and cachectl likewise), so the
-  injected fakes are bypassed and real Postgres, Redis and RIE containers start.
-  `tests/spec/test_connection_edges.py` took 68s in the "unit" suite for this
-  reason.
+  injected fakes were bypassed and real Postgres, Redis and RIE containers
+  started. `tests/spec/test_connection_edges.py` took 68s in the "unit" suite for
+  this reason.
 
-  The asymmetry is the actual defect, and it guarantees a leak rather than merely
-  risking one: **creation is real and teardown is fake.** The gateway created a
+  The asymmetry was the actual defect, and it guaranteed a leak rather than merely
+  risking one: **creation was real and teardown was fake.** The gateway created a
   real Postgres through `ColimaRuntime`; `/destroy` runs through the reconciler,
   which DOES honour `FakeRds`, so it destroyed a fake and left the container
   standing. Measured — `/destroy` cleared the lambda and cache containers and left
   `odin-rds-conn2-app-db` and `odin-rds-conn2-other-db` running.
 
-  Patched at the call site (`_torn_down` destroys, then reaps that env's own
-  containers by name and asserts the end state). The real fix is in the seam: a
-  test that injects a fake runtime should get a gateway whose models use it, or
-  `create_app` should refuse the combination rather than silently half-honour it.
-  Until then, every `/apply-full` test needs Docker and nobody is told.
+  **Fixed in the seam (v0.8.21), and the enumeration came first.** Every spawn the
+  whole unit suite makes was recorded by hooking `subprocess.Popen.__init__` and
+  `BaseEventLoop.subprocess_exec` — not `odin.util`, which would have shared a
+  source with its subject. 3976 tests, before: **216 tests spawned
+  docker/limactl/tofu/nebula-cert**, of which the `create_app`+TestClient ones
+  were `test_env_rm` (19, `limactl disk list`), `test_destroy_tf` (18, same),
+  `test_apply_full` (14 — 12 a `tmp_path` tofu STUB, 2 real `docker logs`),
+  `test_apply` (4), `test_connection_edges` (2 — real `/opt/homebrew/bin/tofu`,
+  real `docker run -d`, real `docker volume create`, real `limactl`),
+  `test_volumes_route` (2), `test_unhandled_failures` (1), `test_tf_status` (1,
+  real `docker ps`), `test_reconciler` (1, real `docker logs`).
+
+  **What leaked, and it was not the gateway models.** Every post-apply pass
+  already TOOK an injectable substrate; nothing ever passed one, so each built its
+  own — `ecsctl.converge_services` a bare `TaskRuntime()`,
+  `lambdactl.converge_functions` a `FunctionRuntime(ColimaRuntime(), ...)`,
+  `rdsctl` a real `PostgresRds`, `drift.sweep_compute` a real `ColimaRuntime`,
+  `ec2compute`/`route53_hosts` a real limactl `InstanceVm`, and
+  `Reconciler._project_tf_owned` (the tick `/apply-full` ends with) both of the
+  first two. `server.py::Substrates` is the missing caller: one bundle, built once
+  from the runtime the app was handed, threaded into every pass. Production is
+  byte-identical — `create_app`'s runtime defaults to `ColimaRuntime()`, so the
+  objects are the ones the defaults built.
+
+  **Two seams a `RuntimeDriver` fake structurally cannot cover, so `create_app`
+  grew them**: `vm=` (Lima — `RuntimeDriver` is a container API and a VM is not a
+  container) and `runner=` (the `tofu` BINARY — not a substrate odin drives at
+  all). Naming them is the honest half; without them "a fake runtime isolates
+  this" would have stayed a claim that could not be true.
+
+  Measured after, same probe: **161 tests**, limactl 53 → 2 (both a deliberate
+  `/nonexistent/limactl` in the recorder's own falsification test), docker 18 → 3.
+  `test_connection_edges` no longer appears at all. Proved a second way with
+  `DOCKER_HOST` pointed at a dead socket — see `tests/api/test_apply_full_
+  isolation.py`, which is the ratchet: it fails if `/apply-full` or `/destroy`
+  spawns anything on a fake-runtime app. 12/12 mutations caught (each seam
+  reverted to its pre-fix default one at a time).
+
+  **What is still standing, named rather than implied.** `agent/hcl.py`'s tests
+  run the REAL `tofu fmt`/`validate` (126 spawns) — deliberate, they check
+  generated HCL against the real parser. `tests/gateway/test_ec2compute.py`,
+  `test_ec2net*`, `test_ec2_volumes`, `test_empty_reasons`,
+  `test_records_roundtrip` and `test_elbv2ctl` still shell out to `nebula-cert`
+  (190) and `limactl`: they call the gateway models directly rather than through
+  `create_app`, so `Substrates` never reaches them. Same shape, different entry
+  point, and not fixed here.
 
 
 - [x] **Event delivery: triggers that actually fire.** odin could record "when X
@@ -2232,7 +2370,7 @@ run and are not described as such.
   `data["permissions"]`, so an agent-drawn grant rendered on the canvas and
   granted nothing at all — decorative in the literal sense.
 
-  Now: `agent/hcl.py` emits the policy, tofu applies it through the gateway,
+  Now: `iac/hcl.py` emits the policy, tofu applies it through the gateway,
   `iamctl` stores it, and `policy.compile_policies_from_iam` reads it back —
   each workload's role found in its OWN service record (a lambda's `role`, a
   task definition's `task_role_arn`, an instance's `iam_instance_profile`
@@ -2470,7 +2608,7 @@ run and are not described as such.
   no separator and serialises to the bytes it always did, so nothing needed
   migrating; `spec/translate.py::_edges` splits the set into one `Edge` per
   meaning, which is what lets `gateway/policy.py::compile_policies` and
-  `agent/hcl.py::_granted_ids` keep gating on `kind == "iam"` unchanged. Handing
+  `iac/hcl.py::_granted_ids` keep gating on `kind == "iam"` unchanged. Handing
   them the joined string would have compiled NO policy — permissions ticked in
   the panel and none granted.
 
@@ -2503,7 +2641,7 @@ run and are not described as such.
   drawing `admin-role → my-lambda` while the lambda's `role` field said
   `other-role` gave a dead line, `other-role` in the generated file, and
   `other-role` enforced by the gateway. There is a `role` edge type now, folded
-  into the `role` FIELD `agent/hcl.py::_lambda` already reads, so it took effect
+  into the `role` FIELD `iac/hcl.py::_lambda` already reads, so it took effect
   with no builder change at all. Lambda only -- ec2/ecs reach a role through an
   auto-role plus an instance profile / `task_role_arn` and read no such field, so
   those pairs stay `unmodelled` rather than authoring a field nothing consumes
@@ -2608,7 +2746,7 @@ run and are not described as such.
   `securityGroups` field, so the canvas could not show it at all.
 
   The design that keeps it safe: the edge ADDS to that field rather than
-  replacing it, so `agent/hcl.py` is untouched -- it still reads one field
+  replacing it, so `iac/hcl.py` is untouched -- it still reads one field
   (`_security_group_refs`) and cannot tell how a line got there. A hand-authored
   canvas keeps working unchanged, duplicates collapse (real AWS rejects a doubled
   entry), and direction is not significant, exactly as for an IAM edge.
@@ -2706,7 +2844,7 @@ have meant retiring a claim rather than fixing a bug.
   has no route to it through real containers -- measured dead ends: a bad
   `runtime` falls back to the DEFAULT image (`RUNTIME_IMAGES.get(runtime,
   RUNTIME_IMAGES[DEFAULT_RUNTIME])`) and boots a working container;
-  `memory_size` is neither canvas-settable nor emitted by `agent/hcl.py`; and
+  `memory_size` is neither canvas-settable nor emitted by `iac/hcl.py`; and
   readiness is a TCP check on the RIE port, which a broken handler satisfies.
 
   The CLAIM is not retired -- it is covered by `tests/api/test_apply_full.py::

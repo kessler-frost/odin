@@ -167,7 +167,7 @@ export const CATALOG: ServiceDef[] = [
     // W2.7: a real `aws_db_instance` (a real Postgres container behind it), so
     // every argument the HCL builder emits is editable here. `engine` lists
     // only postgres: that IS the substrate, and an honest Apply declines any
-    // other engine rather than quietly handing you a Postgres (agent/hcl.py).
+    // other engine rather than quietly handing you a Postgres (iac/hcl.py).
     // The name must be a valid RDS identifier (lowercase, hyphen-separated).
     type: 'rds', abbr: 'RDS', label: 'RDS Database', sublabel: 'Relational DB',
     category: 'Database', color: 'sky', width: 220,
@@ -180,7 +180,7 @@ export const CATALOG: ServiceDef[] = [
       { key: 'username', label: 'Username', editable: true },
       { key: 'password', label: 'Password', editable: true },
       // W2.6: the DB really is gated by the SGs named here -- they become the
-      // `aws_db_instance`'s `vpc_security_group_ids` (agent/hcl.py), and the
+      // `aws_db_instance`'s `vpc_security_group_ids` (iac/hcl.py), and the
       // gateway puts its Postgres on the env's Nebula mesh behind their
       // compiled firewall (gateway/models/rdsctl.py::_db_firewall). Same
       // one-label-per-line convention as an ec2 node's.
@@ -379,7 +379,7 @@ export const CATALOG: ServiceDef[] = [
   // `aws_route53_record` per edge drawn to an EC2 instance (`iam.ts`'s `dns`
   // edge). The substrate is real name resolution -- an `--add-host` entry on
   // every container in the env and an `/etc/hosts` line on every Lima VM in it.
-  // The label IS the domain: `agent/hcl.py::_route53` emits `name = <label>` and
+  // The label IS the domain: `iac/hcl.py::_route53` emits `name = <label>` and
   // REFUSES a label that is not a valid DNS name rather than writing a record no
   // resolver could ever match.
   //
@@ -513,7 +513,7 @@ export const CATALOG: ServiceDef[] = [
   },
   // ecs (V5c) is the REAL, gateway-modeled ECS service (NORTHSTAR directive
   // 5): the drawn node IS the service+taskdef pair (v1 single-container
-  // taskdefs), sharing ONE auto-generated cluster per canvas (agent/hcl.py's
+  // taskdefs), sharing ONE auto-generated cluster per canvas (iac/hcl.py's
   // `_ecs` builder) -- renders via the generic ServiceNode, no bespoke
   // component, same as iam_role/ecr/lambda.
   {
@@ -539,7 +539,7 @@ export const CATALOG: ServiceDef[] = [
       // Without it the placement was the one containment stamp odin acted on
       // and never showed. It is not cosmetic -- it emits a real
       // `placement_constraints { memberOf }` and runs the task in that VM
-      // (`agent/hcl.py`, `gateway/models/ecsctl.py::runtime_for_service`) --
+      // (`iac/hcl.py`, `gateway/models/ecsctl.py::runtime_for_service`) --
       // so a user who dragged a box a few pixels short of "fully inside" had
       // no way to tell the placement had not taken. The strict containment
       // rule makes that a real possibility, which is exactly why the answer
@@ -641,7 +641,7 @@ export const CATALOG: ServiceDef[] = [
     defaultData: { label: 'new-igw', igwId: '' },
   },
   // W2.5: a REAL load balancer -- one node expands to aws_lb +
-  // aws_lb_target_group + aws_lb_listener (agent/hcl.py's `_alb`), and the
+  // aws_lb_target_group + aws_lb_listener (iac/hcl.py's `_alb`), and the
   // substrate is an actual nginx reverse-proxy container per load balancer
   // (compute/proxy.py) whose upstreams are the target group's registered
   // targets. Draw it INSIDE a Subnet (containment is what gives aws_lb its

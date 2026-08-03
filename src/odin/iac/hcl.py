@@ -615,9 +615,38 @@ _SG_RULE_FIELDS: tuple[tuple[str, str, str], ...] = (
 )
 
 
-def _port_span(text: str) -> tuple[str, str] | None:
+# `-1` in the PORT position means "all of them", and it is a LITERAL AWS itself
+# writes: an ICMP rule is `from_port = -1, to_port = -1` (the type and code,
+# both "any"), and that is what the console produces for "allow ping". It was
+# declined until v0.8.21, which made an ordinary AWS security group unimportable
+# -- MEASURED on the real path: a group with a `tcp:443` rule and an ICMP rule
+# imported as `ingressRules = 'tcp:443:0.0.0.0/0'` with a warning blaming "a
+# port that is not a literal number", and the regenerated group allowed no ping.
+# Narrower than the Terraform you handed it, which is the same correctness bug
+# wearing a limit's clothes that port RANGES were until v0.8.17.
+#
+# ONLY THESE PROTOCOLS, and the restriction is a daemon-down hazard, not
+# fussiness. `fabric/nebula.py::_compile_side` elides the port for `icmp` /
+# `icmpv6` / `-1` and passes it through verbatim for everything else, and its
+# own comment records what a verbatim `-1` does: nebula REFUSES TO START
+# ("port appears to be a range but could not be parsed"). So accepting
+# `tcp:-1:...` here would take the whole mesh down over one rule. AWS does not
+# accept it either -- `-1` ports are only meaningful where there are no ports.
+# `tests/agent/test_sg_port_ranges.py` pins the pair BEHAVIOURALLY, by
+# compiling each of these through the real `sg_rules_to_firewall` and checking
+# no `-1` survives into a nebula port, rather than by comparing two constants
+# that could agree while both being wrong.
+_ALL_PORTS = "-1"
+_ALL_PORTS_PROTOCOLS = frozenset({"icmp", "icmpv6", "-1"})
+
+
+def _port_span(text: str, protocol: str) -> tuple[str, str] | None:
     """The PORT field of a rule line, as the `(from_port, to_port)` pair AWS's
     model is actually made of. None when the text is not a port span at all.
+
+    `protocol` is here ONLY for the `-1` spelling above, which is legal for
+    some protocols and a mesh outage for others -- see `_ALL_PORTS_PROTOCOLS`.
+    Everything else in this function ignores it.
 
     A SINGLE PORT IS THE DEGENERATE RANGE. `443` is `("443", "443")`, which is
     what `_sg_rule_block` already emitted for every rule ever written, so
@@ -637,6 +666,8 @@ def _port_span(text: str) -> tuple[str, str] | None:
     `f"{from_port}-{to_port}"` would emit a range no packet can be in -- a rule
     that looks enforced and matches nothing.
     """
+    if text == _ALL_PORTS:
+        return (_ALL_PORTS, _ALL_PORTS) if protocol in _ALL_PORTS_PROTOCOLS else None
     low, sep, high = text.partition("-")
     high = high if sep else low
     ordered = low.isdigit() and high.isdigit() and int(low) <= int(high)
@@ -672,11 +703,14 @@ def parse_sg_rule(line: str) -> tuple[str, str, str, str] | None:
     2)` has already bounded, so neither an IPv6 CIDR (no `-` in the notation,
     and it lands in `parts[2]` regardless) nor a hyphenated canvas label
     (`web-sg`, also `parts[2]`) can reach it. The `-1` all-protocols spelling
-    sits in `parts[0]`; a `-1` in the PORT position still declines, exactly as
-    it did before, so `icmp:-1:...` is no more drawable than it was.
+    sits in `parts[0]`; a `-1` in the PORT position is read by `_port_span`,
+    which accepts it only for the protocols that HAVE no ports -- so
+    `icmp:-1:10.0.0.0/16` (the "allow ping" rule AWS's own console writes) is
+    drawable since v0.8.21 and `tcp:-1:...` is still declined, because a
+    verbatim `-1` in a nebula port stops the daemon starting.
     """
     parts = line.split(":", 2)
-    span = _port_span(parts[1]) if len(parts) == 3 else None
+    span = _port_span(parts[1], parts[0]) if len(parts) == 3 else None
     return (parts[0], *span, parts[2]) if span else None
 
 
@@ -690,20 +724,40 @@ def sg_rule_port(from_port: str, to_port: str) -> str:
 
 # IPv6, DECLINED WITH THE REAL REASON rather than made authorable.
 #
-# `fabric/nebula.py::sg_rules_to_firewall` reads `IpRanges` and
-# `UserIdGroupPairs` and nothing else, so an `Ipv6Ranges` entry compiles to ZERO
-# nebula rules. Emitting `ipv6_cidr_blocks` would therefore hand a user a
-# firewall rule that is carried in Terraform, stored by the gateway, visible in
-# `tofu plan` -- and enforced by nothing. That is a decorative permission, the
-# same class of bug `tests/gateway/test_iam_vocabulary_is_enforceable.py` exists
-# to prevent, so the ergonomic hole stays open and the message tells the truth
-# about why. Making it real is a nebula change (teach the compiler IPv6), not a
-# grammar one; `docs/limits.md` records it as such.
+# TWO CORRECTIONS to what this comment used to say, both measured on
+# 2026-08-03, because it pointed the next reader at the wrong component AND
+# understated the hazard.
+#
+# 1. It is NOT a nebula limitation. Probed against nebula 1.10.3, the pinned
+#    version: a firewall rule with `cidr: 2001:db8::/32` loads and `nebula
+#    -test` exits 0, while `cidr: not-a-cidr` exits 1 with `netip.ParsePrefix`
+#    -- so the zero is acceptance, not indifference. `nebula-cert sign
+#    -networks fd00::1/64` signs a v2 cert too. What actually blocks it is
+#    ODIN: `fabric/models.py::MeshNetwork` hands out `10.42.0.0/16`, so every
+#    mesh member has an IPv4 overlay address and a rule's CIDR is matched
+#    against exactly that. An IPv6 rule could never match a peer. Making it
+#    mean something is dual-stack overlay ADDRESSING, not a compiler tweak.
+#
+# 2. An `Ipv6Ranges` entry does NOT compile to zero rules -- it compiles to a
+#    WIDER one. `sg_rules_to_firewall` reads `IpRanges` and `UserIdGroupPairs`,
+#    and its last branch turns a permission with neither into a PEERLESS rule,
+#    which nebula renders `host: any`. Measured: an IPv6-only tcp/443
+#    permission yields `{'port': '443', 'proto': 'tcp', 'host': 'any'}` --
+#    "from anyone on the mesh" where the author wrote "from this one block". So
+#    deleting this decline without teaching that function about `Ipv6Ranges` in
+#    the same change is a security regression, not an ergonomic win.
+#    `tests/fabric/test_nebula.py::test_an_ipv6_only_permission_would_WIDEN_the_group`
+#    is the part of this comment that can fail a build.
+#
+# The refusal itself stands: a rule carried in Terraform, stored by the gateway
+# and visible in `tofu plan` while gating nothing is a decorative permission,
+# the same class of bug `tests/gateway/test_iam_vocabulary_is_enforceable.py`
+# exists to prevent. `docs/limits.md` records the corrected reason.
 _NO_IPV6 = (
-    "odin's security groups are IPv4 only, because the mesh firewall that enforces them "
-    "(fabric/nebula.py) compiles IPv4 ranges and group identities and nothing else — an IPv6 rule "
-    "would be carried by Terraform and enforced by nothing. Use an IPv4 CIDR, or another Security "
-    "Group node's label to gate by identity"
+    "odin's security groups are IPv4 only, because odin's mesh is: every member gets an overlay "
+    "address out of 10.42.0.0/16 (fabric/models.py), and a firewall rule's CIDR is matched against "
+    "that — so an IPv6 rule could never match a peer. Nebula itself is not the blocker. Use an "
+    "IPv4 CIDR, or another Security Group node's label to gate by identity"
 )
 
 
@@ -754,17 +808,26 @@ def _sg_peer(peer: str, res: ResourceDesired, refs: Refs) -> tuple[str, str] | N
 def _rule_reason(line: str, field: str, word: str) -> str:
     """The human reason ONE unparseable rule line declines its whole group.
 
-    TWO sentences, because they are two different mistakes and the second one
-    is new. A line whose port field carries a `-` was an attempt at a RANGE:
-    the author is editing a firewall and needs to see WHICH line and what is
-    wrong with it, not a generic format reminder that shows only the
-    single-port example they already know. Anything else did not fit the
-    grammar at all, and that message is deliberately byte-for-byte what it has
-    always been (pinned by `test_hcl_sg_egress.py::
-    test_the_ingress_messages_are_unchanged_word_for_word`) -- a grammar
-    extension is no excuse for rewording text that was already correct.
+    THREE sentences, because they are three different mistakes. A line whose
+    port field carries a `-` was an attempt at a RANGE: the author is editing a
+    firewall and needs to see WHICH line and what is wrong with it, not a
+    generic format reminder that shows only the single-port example they
+    already know. A `-1` port on a protocol that HAS ports is its own mistake
+    and got the range message until v0.8.21, which was actively misleading --
+    the author wrote a legal AWS spelling on the wrong protocol, and telling
+    them "a range is two whole ports" sends them to fix the wrong thing.
+    Anything else did not fit the grammar at all, and that message is
+    deliberately byte-for-byte what it has always been (pinned by
+    `test_hcl_sg_egress.py::test_the_ingress_messages_are_unchanged_word_for_word`)
+    -- a grammar extension is no excuse for rewording text that was already
+    correct.
     """
     parts = line.split(":", 2)
+    if len(parts) == 3 and parts[1] == _ALL_PORTS:
+        return (f"{field}: {line!r} uses the all-ports port {_ALL_PORTS!r}, which odin takes only "
+                f"for {', '.join(sorted(_ALL_PORTS_PROTOCOLS))} — those are the protocols with no "
+                f"ports to name. For {parts[0]!r}, give a real port or range, like "
+                "tcp:443:0.0.0.0/0")
     if len(parts) == 3 and "-" in parts[1]:
         return (f"{field}: {line!r} has a malformed port range {parts[1]!r} — a range is two whole "
                 "ports, low first, like tcp:8000-8100:0.0.0.0/0")
@@ -1071,7 +1134,7 @@ def _lambda_entry(runtime: str) -> tuple[str, str]:
 #      runs a package manager of its own and never fetches anything at apply
 #      time (docs/limits.md says so in those words).
 #   2. `files` -- an inline `{relative path: text}` map. Nothing authors this
-#      by hand; `agent/import_tf.py` writes it when it recovers a MULTI-FILE
+#      by hand; `iac/import_tf.py` writes it when it recovers a MULTI-FILE
 #      deployment zip, so a package that came from Terraform goes back to
 #      Terraform byte-identically instead of collapsing to whichever member
 #      happened to sort first.
@@ -1223,6 +1286,21 @@ def _grants_key(node_id: str) -> str:
 def _instance_profile_key(node_id: str) -> str:
     """`refs` key for the instance profile that carries an ec2 node's role."""
     return f"__instance_profile__{node_id}"
+
+
+def _key_pair_name(node_id: str) -> str:
+    """The AWS NAME of the key pair an ec2 node's `key` field becomes -- a real
+    resource name, not an HCL one. Named here because `import_tf` compares a
+    source's `key_name` against it: a key pair the user called `deploy-key`
+    comes back as `<label>-key`, which is a DIFFERENT AWS resource, and that has
+    to be reported rather than derived twice and hoped to agree."""
+    return f"{node_id}-key"
+
+
+def _grants_policy_name(node_id: str) -> str:
+    """The AWS NAME of the inline role policy a workload's grants become. Here
+    for `_key_pair_name`'s reason exactly."""
+    return f"{node_id}-grants"
 
 
 def _workload_role_key(node_id: str) -> str:
@@ -1426,6 +1504,14 @@ _ECS_CLUSTER_KEY = "__ecs_cluster__"
 # value -- an ecs grant's ARN would name a cluster that does not exist if the
 # two ever disagreed.
 _ECS_CLUSTER_NAME = "odin"
+# The two task-definition arguments odin emits UNCONDITIONALLY, named here for
+# the reason `_ECS_CLUSTER_NAME` is: `import_tf` compares a source's values
+# against them, and a comparison against a copied literal is a check that shares
+# no source with its subject only by luck. `bridge` because odin's substrate is
+# a docker container on a shared host with no ENI to give a task, and `EC2`
+# because there is no Fargate substrate at all.
+_ECS_TASK_NETWORK_MODE = "bridge"
+_ECS_TASK_COMPATIBILITY = "EC2"
 _DEFAULT_ECS_IMAGE = "nginx:alpine"
 _DEFAULT_ECS_COUNT = "1"
 _DEFAULT_ECS_PORT = "80"
@@ -1775,7 +1861,7 @@ _BAD_LOGS_RETENTION = "retentionInDays must be a whole number of days (e.g. 14)"
 #     node under its own label -- no change needed there, verified;
 #   * `api/logs.py`'s `kind == "logs"` branch assumed name == label and is
 #     changed in the same commit to resolve through that same tag;
-#   * `agent/import_tf.py::_label` prefers the `name` literal, so importing
+#   * `iac/import_tf.py::_label` prefers the `name` literal, so importing
 #     the generated file back gives the node the DESTINATION as its label.
 #     The file then regenerates byte-identically (label == destination is the
 #     coincidence case), and the drawn edge plus the policy ARN stay
@@ -2312,7 +2398,7 @@ def _route53(res: ResourceDesired, refs: Refs) -> Built:
 # path prefix therefore takes both -- that is AWS's own idiom, not odin's
 # invention -- and they collapse back to ONE nginx `location` pair on the
 # substrate side (`compute/apigw.py`) and to ONE canvas edge on the import side
-# (`agent/import_tf.py` recovers the edge from the INTEGRATION, so the route
+# (`iac/import_tf.py` recovers the edge from the INTEGRATION, so the route
 # count never reaches the canvas).
 #
 # The path segment is the TARGET's label, not a canvas field, for the reason
@@ -2968,11 +3054,18 @@ def generate_tf(stack: Stack) -> TfProject:
             sanitize_name(f"{topic_name}_{queue_name}"),
             used_names.setdefault("aws_sns_topic_subscription", set()),
         )
+        # AUTHORABLE since v0.8.21, and `true` is still what an unmarked edge
+        # produces -- `Edge.raw_message_delivery` defaults to True and
+        # `translate._edges` reads an absent field as True, so every canvas
+        # drawn before the checkbox existed emits the identical bytes. Only an
+        # edge explicitly turned off writes `false`, and then the IMPORT reads
+        # it back (`import_tf._subscription_edge`) instead of substituting
+        # odin's own value, which is what the round trip used to do.
         attrs = {
             "topic_arn": f"aws_sns_topic.{topic_name}.arn",
             "protocol": quote("sqs"),
             "endpoint": f"aws_sqs_queue.{queue_name}.arn",
-            "raw_message_delivery": "true",
+            "raw_message_delivery": "true" if edge.raw_message_delivery else "false",
         }
         block = _block("aws_sns_topic_subscription", name, attrs)
         blocks.append((("sns_subscription", f"{topic.id}.{queue.id}"), block))
@@ -3012,7 +3105,7 @@ def generate_tf(stack: Stack) -> TfProject:
         if not key or instance_name is None:
             continue
         name = f"{instance_name}_key"
-        attrs = {"key_name": quote(f"{res.id}-key"), "public_key": quote(key)}
+        attrs = {"key_name": quote(_key_pair_name(res.id)), "public_key": quote(key)}
         block = _block("aws_key_pair", name, attrs)
         blocks.append((("aws_key_pair", res.id), block))
 
@@ -3055,7 +3148,7 @@ def generate_tf(stack: Stack) -> TfProject:
         _, role_name = role_ref
         name = refs[_grants_key(res.id)][1]
         attrs = {
-            "name": quote(f"{res.id}-grants"),
+            "name": quote(_grants_policy_name(res.id)),
             "role": f"aws_iam_role.{role_name}.name",
             "policy": quote(_policy_document(grants, kind_by_id, aws_names)),
         }
@@ -3219,8 +3312,8 @@ def generate_tf(stack: Stack) -> TfProject:
             "family": quote(res.id),
             **sized,
             **attached,
-            "requires_compatibilities": '["EC2"]',
-            "network_mode": quote("bridge"),
+            "requires_compatibilities": f'["{_ECS_TASK_COMPATIBILITY}"]',
+            "network_mode": quote(_ECS_TASK_NETWORK_MODE),
         }
         block = _block("aws_ecs_task_definition", f"{own_name}_taskdef", attrs, nested)
         blocks.append((("aws_ecs_task_definition", res.id), block))

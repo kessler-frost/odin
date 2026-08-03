@@ -12,7 +12,7 @@ another -- and both measured before this file existed:
    silently, and for every revision after.
 
 2. **An sns/sqs subscription edge drawn BACKWARDS was a silent no-op.** Both
-   consumers key on the drawn direction (`agent/hcl.py`'s subscription pass
+   consumers key on the drawn direction (`iac/hcl.py`'s subscription pass
    reads `edge.src` as the topic; `reconcile/reconciler.py::_desired_subs`
    filters `e.src == sns_id`), so `sqs -> sns` gave a grey line, a green Apply,
    no subscription, and no entry in `unsupported` or `wiring_errors`.
@@ -24,7 +24,7 @@ read by nobody downstream.
 """
 from __future__ import annotations
 
-from odin.agent.hcl import generate_tf
+from odin.iac.hcl import generate_tf
 from odin.spec.models import Edge, Stack
 from odin.spec.translate import (
     DNS_RECORD,

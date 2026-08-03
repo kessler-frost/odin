@@ -67,7 +67,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import time
 import uuid
 from functools import partial
@@ -78,10 +77,9 @@ import httpx
 from odin.aws.backings import ACCOUNT, REGION
 from odin.gateway.models import eventsctl, lambdactl
 from odin.gateway.stores import SynthStores
+from odin.settings import settings
 
 log = logging.getLogger("odin.reconcile.dispatch")
-
-_DEFAULT_DISPATCH_TICKS = 1
 
 # How long a receive/delete against the local goaws backing may take. Short
 # because it IS local and short-polled; long enough that a busy daemon does not
@@ -106,7 +104,7 @@ _SQS_TIMEOUT = 5.0
 #   - this is a RECONCILER TICK, not a request. One pass drains every mapping and
 #     every pending S3 notification in turn, so a 20s park here is 20s that the
 #     drift sweep, the scheduled rules and every other mapping also spend
-#     waiting. A bounded pass is the whole design (see `_MAX_PENDING_PER_PASS`).
+#     waiting. A bounded pass is the whole design (see `_MAX_PASS_SECONDS`).
 #   - it would also have to outlast `_SQS_TIMEOUT` below, which is sized for a
 #     LOCAL round trip and is what turns a genuinely wedged goaws into a
 #     `source_unavailable` verdict rather than a hang.
@@ -117,22 +115,54 @@ _SQS_TIMEOUT = 5.0
 # is the part of this comment that can fail a build.
 _WAIT_TIME_SECONDS = 0
 
-# How many pending S3 notifications one pass may deliver, and how many times one
-# of them may fail before it is dropped with a verdict. Both are bounds on the
-# same hazard from opposite sides -- an unbounded BATCH stalls the tick, an
-# unbounded RETRY invokes a broken function forever -- and `_dispatch_pending`'s
-# docstring argues each. 10 matches the SQS batch size for no deeper reason than
-# that one tick should move a comparable amount of work whichever source it came
-# from.
-_MAX_PENDING_PER_PASS = 10
+# HOW LONG one pass of pending S3 notifications may spend STARTING deliveries,
+# and how many times one record may fail before it is dropped with a verdict.
+#
+# THIS USED TO BE A COUNT (`_MAX_PENDING_PER_PASS = 10`) AND A COUNT CANNOT
+# BOUND THE THING IT CLAIMED TO. Its own comment said the hazard was "an
+# unbounded BATCH stalls the tick", and `docs/limits.md` admitted the hole in
+# the next breath: "a SLOW handler makes the pass itself exceed one tick". It
+# did far worse than exceed one tick. Read off the source rather than a clock:
+# `_deliver` awaits each invoke IN TURN, `lambdactl.invoke` calls
+# `runtime.invoke(env, name, payload)` with no timeout argument, and
+# `compute/functions.py::FunctionRuntime.invoke` defaults to `timeout=30.0`.
+# Ten serial invokes of a handler that runs to that ceiling is **300 seconds**
+# in which the reconciler observes nothing, `/world` reports nothing new and
+# the drift sweep does not run -- because every tick queues behind
+# `Reconciler._tick_lock`. A count of ten bounded the RECORDS and left the
+# LATENCY unbounded, and latency was the hazard.
+#
+# So the bound is now in the unit of the hazard. A pass may START a new
+# delivery only while it has been running for less than `_MAX_PASS_SECONDS`; it
+# cannot preempt one already in flight, so the honest worst case is
+# `_MAX_PASS_SECONDS + 30.0s`, i.e. ~35s against the old 300s. That is the
+# whole claim -- one slow handler still costs a pass, but it can no longer cost
+# ten.
+#
+# 5.0 is five production reconciler polls (`server.py` passes
+# `poll_interval=1.0`), so the reconciler falls at most about five ticks behind
+# on notification work before the dispatcher stops taking more. It is not
+# tuned to a measured invoke duration, because odin has none for a real RIE
+# container and inventing one would put this straight back where it started.
+# What replaced the arbitrary number is not a better number, it is a bound that
+# is checked against the thing that actually varies.
+#
+# The count is GONE rather than kept alongside: two bounds on one loop means
+# the reader has to work out which one is load-bearing, and with a deadline in
+# place the answer is always the deadline. A burst of fast deliveries now
+# drains as fast as it can for 5 seconds instead of ten per second, which is
+# the `aws s3 cp --recursive` case the old docstring described and did not
+# serve.
+_MAX_PASS_SECONDS = 5.0
 _MAX_DELIVERY_ATTEMPTS = 5
 
 
 def _dispatch_ticks() -> int:
-    """Ticks between passes. Read fresh (not cached) so the override is real,
-    the same convention `drift._sweep_ticks` uses -- but defaulting to 1, for
-    the reason in the module docstring."""
-    return max(1, int(os.environ.get("ODIN_DISPATCH_TICKS", str(_DEFAULT_DISPATCH_TICKS))))
+    """Ticks between passes. Read fresh on every call (never cached at import)
+    so the override is real, the same convention `drift._sweep_ticks` uses --
+    but defaulting to 1, for the reason in the module docstring. The default
+    and its bound live in `settings.ReconcileSettings`."""
+    return settings.reconcile.dispatch_ticks
 
 
 class Delivery(NamedTuple):
@@ -507,16 +537,34 @@ def _s3_event(pending: dict) -> bytes:
     }]}).encode()
 
 
-async def _dispatch_pending(stores: SynthStores, env: str, substrate=None) -> list[Delivery]:
-    """Pending S3 notifications, oldest first, at most `_MAX_PENDING_PER_PASS`
-    ATTEMPTS per pass, each record retried at most `_MAX_DELIVERY_ATTEMPTS`
-    times.
+async def _dispatch_pending(
+    stores: SynthStores, env: str, substrate=None, clock=time.monotonic,
+) -> list[Delivery]:
+    """Pending S3 notifications, oldest first, starting new deliveries for at
+    most `_MAX_PASS_SECONDS`, each record retried at most
+    `_MAX_DELIVERY_ATTEMPTS` times.
 
-    "attempts per pass" rather than "records per pass" is load-bearing, and is
-    why the sort below is not sliced: a record skipped because its function is
-    mid-redeploy is not an attempt and must not consume a slot. Slicing first
-    would let a few such records hold the ten oldest places and starve every
-    healthy function behind them until the redeploy finished (`_mid_redeploy`).
+    A DEADLINE rather than a count, and `_MAX_PASS_SECONDS` carries the whole
+    argument for why. The short version: the hazard is how long the reconciler
+    is blocked, and ten records of unknown duration is not a bound on that.
+
+    `clock` is the seam, defaulting to `time.monotonic` -- a DURATION must not
+    be measured with a wall clock that can step, and this one is never
+    persisted, so `at`'s reason for using `time.time` does not apply here. It
+    is injected so a test can make a delivery genuinely consume budget instead
+    of asserting against a sleep.
+
+    Deliveries are still SERIAL, deliberately. Firing a pass concurrently would
+    bound it by the slowest handler rather than the sum, but a function's RIE
+    container serves one invocation at a time, so concurrency within one
+    function's backlog buys queueing inside the container instead of here --
+    the same wait, somewhere it cannot be reported.
+
+    The sort is not sliced, and that is load-bearing: a record skipped because
+    its function is mid-redeploy costs no budget and must not end the pass.
+    Slicing first would let a handful of such records hold the oldest places
+    and starve every healthy function behind them until the redeploy finished
+    (`_mid_redeploy`).
 
     THE THREE PROPERTIES, because every one of them has a silent failure mode
     and the first version of this function got two of them wrong.
@@ -538,32 +586,29 @@ async def _dispatch_pending(stores: SynthStores, env: str, substrate=None) -> li
        into a dead-letter queue, with an honest report standing in for the DLQ
        odin does not have.
 
-    3. **The pass is BOUNDED.** `aws s3 cp --recursive` over a few thousand
-       objects enqueues a few thousand records in one burst, and draining them
-       all inside one tick would stall the reconciler for everything else. The
-       remainder is not lost -- these are durable records, and the next pass is
-       one tick away. What that costs, stated rather than implied: at the
-       production 1s poll the drain rate is ~`_MAX_PENDING_PER_PASS` per second,
-       and a SLOW handler makes the pass itself exceed one tick, in which case
-       ticks queue behind `Reconciler._tick_lock` rather than overlapping -- the
-       reconciler falls behind, it does not double-run."""
-    # NOT sliced here: the batch bounds ATTEMPTS, and a record skipped for a
-    # redeploying function is not an attempt. Slicing first would let a handful
-    # of such records hold the ten oldest slots and starve everything behind
-    # them until the redeploy finished.
+    3. **The pass is BOUNDED IN TIME.** `aws s3 cp --recursive` over a few
+       thousand objects enqueues a few thousand records in one burst, and
+       draining them all inside one tick would stall the reconciler for
+       everything else. The remainder is not lost -- these are durable records,
+       and the next pass is one tick away. What that costs, stated rather than
+       implied: a pass stops STARTING deliveries after `_MAX_PASS_SECONDS`, so
+       the reconciler is held for at most that plus the one invoke already in
+       flight (30.0s ceiling), and ticks queue behind `Reconciler._tick_lock`
+       rather than overlapping -- odin falls behind, it does not double-run.
+       How MANY records that moves is whatever fits, which for a fast handler
+       is far more than the fixed ten this used to allow."""
     pending = sorted(
         ((key, record) for key, record in stores.dispatch.items(env).items() if key.startswith("pending:")),
         key=lambda item: item[1]["at"],
     )
     out: list[Delivery] = []
-    attempted = 0
+    deadline = clock() + _MAX_PASS_SECONDS
     for key, record in pending:
-        if attempted >= _MAX_PENDING_PER_PASS:
+        if clock() >= deadline:
             break
         function_name = record["target_arn"].rsplit(":", 1)[-1]
         if _mid_redeploy(stores, env, function_name):
             continue
-        attempted += 1
         trigger = f"the {record['bucket']!r} notification for {record['key']!r}"
         delivery = await _deliver(stores, env, function_name, _s3_event(record), trigger, substrate)
         if delivery.fired:

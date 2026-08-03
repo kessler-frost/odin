@@ -57,7 +57,7 @@ and drifts on every plan), plus `MultiAZ` / `PubliclyAccessible` /
 answers.
 
 DELIBERATE LIMITS, each honest rather than silently wrong:
-- **Postgres only.** The substrate is a Postgres container, so `agent/hcl.py`
+- **Postgres only.** The substrate is a Postgres container, so `iac/hcl.py`
   routes any other `engine` to `unsupported` rather than emitting HCL this
   module would fulfil with the wrong database.
 - **`AllocatedStorage`/`DBInstanceClass` are metadata.** A local container has
@@ -80,7 +80,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import secrets
 import time
 from collections.abc import Awaitable, Callable, Iterable
@@ -100,6 +99,7 @@ from odin.gateway.errors import exc_text
 from odin.gateway.models import background, ec2net, join
 from odin.gateway.models.ec2compute import membership_revision
 from odin.gateway.stores import NO_CHANGE, SynthStores
+from odin.settings import settings
 from odin.reconcile.assertions import pg_ready
 from odin.runtime.colima import CONTAINER_HOST, ColimaRuntime
 
@@ -112,7 +112,7 @@ _REQUEST_ID = "00000000-0000-0000-0000-000000000000"
 # Postgres to accept a real connection before giving up and reporting
 # `failed`. Bounded so "never comes up" is a fast honest apply failure rather
 # than the provider's own 40-minute default create wait (the same reasoning
-# behind `_ECS_CONVERGE_TIMEOUT` in agent/hcl.py).
+# behind `_ECS_CONVERGE_TIMEOUT` in iac/hcl.py).
 _CREATE_TIMEOUT = 180.0
 _POLL_INTERVAL = 0.5
 # Consecutive successful `pg_ready` probes required before reporting
@@ -794,7 +794,6 @@ def converge_db_instances(
 # and its create waiter -- the one thing that DOES catch this on a fresh
 # apply -- never runs again.
 _AVAILABLE_POLL_SECONDS = 0.5
-_AVAILABLE_TIMEOUT_ENV = "ODIN_RDS_AVAILABLE_TIMEOUT"
 # Deliberately NOT ECS's 60s. `_CREATE_TIMEOUT` (180s) is already the one
 # number for "how long may THIS substrate legitimately take to become ready",
 # and a database really is slower than a container: a cold `postgres:16-alpine`
@@ -809,8 +808,15 @@ _AVAILABLE_MARGIN = 30.0
 
 def available_timeout() -> float:
     """The post-apply readiness budget, in seconds. `ODIN_RDS_AVAILABLE_TIMEOUT`
-    overrides, matching every other odin timeout."""
-    return float(os.environ.get(_AVAILABLE_TIMEOUT_ENV, str(_CREATE_TIMEOUT + _AVAILABLE_MARGIN)))
+    overrides, matching every other odin timeout.
+
+    The DEFAULT is derived here rather than written into `settings.py`, because
+    `_CREATE_TIMEOUT` and `_AVAILABLE_MARGIN` are this module's own numbers and
+    copying them would be a second source of truth for a bound whose reasoning
+    lives beside them. `settings.gateway.rds_available_timeout` is therefore
+    `None` when unset."""
+    override = settings.gateway.rds_available_timeout
+    return override if override is not None else _CREATE_TIMEOUT + _AVAILABLE_MARGIN
 
 
 class DatabaseFault(NamedTuple):

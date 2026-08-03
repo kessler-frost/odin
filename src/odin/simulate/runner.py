@@ -39,7 +39,8 @@ from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
-from odin.agent.hcl import TfProject
+from odin.iac.hcl import TfProject
+from odin.settings import settings
 from odin.simulate import workspace as workspace_mod
 from odin.spec.models import scrub
 
@@ -67,8 +68,9 @@ def _default_tofu_timeout() -> float:
     hours with nothing to stop it. `ODIN_TOFU_TIMEOUT` (seconds) overrides
     the default for `init` and `apply` (each gets its own budget, not one
     shared across the whole call). `destroy` has its own, smaller budget --
-    see `_default_destroy_timeout`."""
-    return float(os.environ.get("ODIN_TOFU_TIMEOUT", "600"))
+    see `_default_destroy_timeout`. The measurement behind the number lives on
+    `settings.SimulateSettings.tofu_timeout`."""
+    return settings.simulate.tofu_timeout
 
 
 def _default_destroy_timeout() -> float:
@@ -85,8 +87,10 @@ def _default_destroy_timeout() -> float:
     single operation an `aws_db_instance` destroy at 1m1s), so 300s is generous
     for a working teardown and a fifth of the old worst case for a wedged one.
     It is a DEADLINE ACROSS THE WHOLE CALL (init included), not per phase.
-    `ODIN_TOFU_DESTROY_TIMEOUT` overrides."""
-    return float(os.environ.get("ODIN_TOFU_DESTROY_TIMEOUT", "300"))
+    `ODIN_TOFU_DESTROY_TIMEOUT` overrides
+    (`settings.SimulateSettings.tofu_destroy_timeout`, which carries the field
+    measurements behind the 300)."""
+    return settings.simulate.tofu_destroy_timeout
 
 
 # What a bounded-out destroy almost always means, and the documented recovery.
@@ -111,7 +115,7 @@ def _default_parallelism() -> int:
     EC2 boots, ECS convergence waits -- on top of whatever else Apply is
     already doing. `ODIN_TOFU_PARALLELISM` overrides; read fresh per
     `TfRunner` construction, same convention as `_default_tofu_timeout`."""
-    return int(os.environ.get("ODIN_TOFU_PARALLELISM", "4"))
+    return settings.simulate.tofu_parallelism
 
 
 class TofuNotInstalled(Exception):

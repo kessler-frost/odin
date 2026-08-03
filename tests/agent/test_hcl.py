@@ -12,8 +12,8 @@ from pathlib import Path
 import pytest
 
 
-from odin.agent import hcl
-from odin.agent.hcl import (
+from odin.iac import hcl
+from odin.iac.hcl import (
     _ALB_NLB_UNSUPPORTED,
     _ecs_container_definitions,
     generate_tf,
@@ -21,6 +21,7 @@ from odin.agent.hcl import (
     resource_set,
     unquote,
 )
+from odin.iac.import_tf import parse_hcl_text
 from odin.server import not_covered
 from odin.spec.models import REFERENCEABLE_KINDS, Edge, FieldValue, ResourceDesired, Stack
 from odin.spec.translate import MODELLED_NODE_TYPES, canvas_to_stack, skipped_node_types
@@ -292,6 +293,59 @@ def test_sns_sqs_edge_becomes_topic_subscription_with_resource_references():
     assert "topic_arn            = aws_sns_topic.alerts.arn" in main_tf
     assert "endpoint             = aws_sqs_queue.jobs.arn" in main_tf
     assert "raw_message_delivery = true" in main_tf
+
+
+def test_an_edge_that_turns_raw_delivery_OFF_emits_false():
+    """AUTHORABLE since v0.8.21. Until then this argument was a literal `"true"`
+    in the builder, so a `.tf` that said `false` came back as `true` on an
+    import round trip and the consumer's envelope changed under it."""
+    canvas = {
+        "nodes": [
+            {"id": "n1", "type": "sns", "data": {"label": "alerts"}},
+            {"id": "n2", "type": "sqs", "data": {"label": "jobs"}},
+        ],
+        "edges": [{"source": "n1", "target": "n2",
+                   "data": {"edgeType": "subscription", "rawMessageDelivery": False}}],
+    }
+    main_tf = generate_tf(canvas_to_stack(canvas)).files["main.tf"]
+    assert 'resource "aws_sns_topic_subscription" "alerts_jobs"' in main_tf
+    assert "raw_message_delivery = false" in main_tf
+
+
+def test_an_edge_with_NO_raw_delivery_field_emits_the_bytes_it_always_did():
+    """Every canvas saved before the field existed. An absent
+    `rawMessageDelivery` must read as True, or the next apply silently changes
+    the envelope of every live subscription."""
+    canvas = {
+        "nodes": [
+            {"id": "n1", "type": "sns", "data": {"label": "alerts"}},
+            {"id": "n2", "type": "sqs", "data": {"label": "jobs"}},
+        ],
+        "edges": [{"source": "n1", "target": "n2", "data": {"edgeType": "subscription"}}],
+    }
+    main_tf = generate_tf(canvas_to_stack(canvas)).files["main.tf"]
+    assert "raw_message_delivery = true" in main_tf
+
+
+def test_a_raw_delivery_choice_survives_a_full_round_trip():
+    """generate -> import -> generate, which is the loop the old behaviour
+    broke: the value went out as `false`, came back substituted to `true`, and
+    the second file differed from the first."""
+    canvas = {
+        "nodes": [
+            {"id": "n1", "type": "sns", "data": {"label": "alerts"}},
+            {"id": "n2", "type": "sqs", "data": {"label": "jobs"}},
+        ],
+        "edges": [{"source": "n1", "target": "n2",
+                   "data": {"edgeType": "subscription", "rawMessageDelivery": False}}],
+    }
+    first = generate_tf(canvas_to_stack(canvas)).files["main.tf"]
+    imported = parse_hcl_text(first)
+    second = generate_tf(canvas_to_stack(
+        {"nodes": imported.nodes, "edges": imported.edges},
+    )).files["main.tf"]
+    assert "raw_message_delivery = false" in second
+    assert first == second, "a second round trip must be byte-identical"
 
 
 def test_edge_between_non_sns_sqs_kinds_produces_no_subscription():

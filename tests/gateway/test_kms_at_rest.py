@@ -80,7 +80,7 @@ async def _create_key(stores, sink, kms, label=KEY_LABEL) -> Response:
     return await _answer(stores, "kms", sink.call(lambda: kms.create_key(
         Description=f"key for {label}",
         # The `odin:node` tag is the ONLY carrier of the canvas label, because
-        # real CreateKey takes no name. `agent/hcl.py` stamps it for real.
+        # real CreateKey takes no name. `iac/hcl.py` stamps it for real.
         Tags=[{"TagKey": kmsctl.NODE_TAG, "TagValue": label}],
     )))
 

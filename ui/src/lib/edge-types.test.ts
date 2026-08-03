@@ -26,8 +26,10 @@ import {
   encryptionTargetTypes,
   iamActionsForTarget,
   iamTargetTypes,
+  rawMessageDeliveryOf,
   roleHolderTypes,
   subscriptionTargetTypes,
+  supportsRawMessageDelivery,
 } from './iam';
 
 describe('role edges (iam_role -> workload)', () => {
@@ -125,7 +127,7 @@ describe('compute -> compute IAM edges', () => {
 describe('the two meanings that were hiding inside `network`', () => {
   it('alb <-> ecs is a load-balancer TARGET', () => {
     // It compiles to a real `load_balancer` block on the ECS service
-    // (`agent/hcl.py` pass 1.5) -- which is why that pass has to explain in
+    // (`iac/hcl.py` pass 1.5) -- which is why that pass has to explain in
     // prose that a "NETWORK edge" means a target. The registry says it now.
     expect(detectEdgeTypes('alb', 'ecs')).toEqual(['target']);
     expect(detectEdgeTypes('ecs', 'alb')).toEqual(['target']);
@@ -143,7 +145,7 @@ describe('the two meanings that were hiding inside `network`', () => {
   it('both are PRESENTATIONAL — no consumer may gate on the name', () => {
     // This is a safety property, not a style note. Every canvas saved before
     // these types existed stores `network` on those edges and works anyway,
-    // because both `agent/hcl.py` passes key on the two NODE kinds. A builder
+    // because both `iac/hcl.py` passes key on the two NODE kinds. A builder
     // that started requiring the new name without a migration in the same
     // commit would drop the subscription from the generated HCL for all of
     // them and `tofu` would DESTROY the live subscription on the next apply --
@@ -308,7 +310,7 @@ describe('the dns edge (route53 -> the one kind a hosts entry can name)', () => 
     // a DRAWABLE catalog tile since long before it had a builder, so canvases
     // whose route53 edge is typed `network` already exist. A pass requiring
     // `kind === 'dns'` would emit no record for a single one of them.
-    // `agent/hcl.py`'s record pass keys on the two NODE kinds instead.
+    // `iac/hcl.py`'s record pass keys on the two NODE kinds instead.
     expect(edgeTypes.dns).toBeDefined();
     expect(edgeTypes.network).toBeDefined();
   });
@@ -430,5 +432,43 @@ describe('the counts in docs/limits.md are measured, not written', () => {
       .filter((type) => type !== UNMODELLED)
       .filter((type) => !LIMITS.includes(`\`${type}\``));
     expect(unnamed).toEqual([]);
+  });
+});
+
+describe('raw message delivery', () => {
+  it('is offered on an sns<->sqs pair, whichever way it was drawn', () => {
+    expect(supportsRawMessageDelivery('sns', 'sqs')).toBe(true);
+    expect(supportsRawMessageDelivery('sqs', 'sns')).toBe(true);
+  });
+
+  it('is offered on NOTHING else', () => {
+    // A literal list rather than a sweep over the registry: a gate built from
+    // the same table it guards cannot fail when that table changes.
+    for (const [a, b] of [
+      ['sns', 'lambda'], ['s3', 'sqs'], ['sqs', 'sqs'], ['sns', 'sns'],
+      ['ecs', 'rds'], ['alb', 'ecs'], ['', ''],
+    ]) {
+      expect(supportsRawMessageDelivery(a, b)).toBe(false);
+    }
+  });
+
+  it('reads an ABSENT setting as ON, matching the Python side exactly', () => {
+    // `spec/translate.py::_edges` uses `is not False`. Every canvas saved
+    // before the field existed has no key at all, and reading that as OFF
+    // would change the envelope of every live subscription on the next apply.
+    expect(rawMessageDeliveryOf(undefined)).toBe(true);
+    expect(rawMessageDeliveryOf(null)).toBe(true);
+    expect(rawMessageDeliveryOf({})).toBe(true);
+    expect(rawMessageDeliveryOf({ edgeType: 'network' })).toBe(true);
+    expect(rawMessageDeliveryOf({ rawMessageDelivery: true })).toBe(true);
+  });
+
+  it('is turned off ONLY by a literal false', () => {
+    expect(rawMessageDeliveryOf({ rawMessageDelivery: false })).toBe(false);
+    // Not by anything merely falsy: `null` is what a cleared field serialises
+    // to, and it must read as "not given", not as "off".
+    expect(rawMessageDeliveryOf({ rawMessageDelivery: null })).toBe(true);
+    expect(rawMessageDeliveryOf({ rawMessageDelivery: 0 })).toBe(true);
+    expect(rawMessageDeliveryOf({ rawMessageDelivery: '' })).toBe(true);
   });
 });

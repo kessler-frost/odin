@@ -21,8 +21,8 @@ import shutil
 
 import pytest
 
-from odin.agent import hcl
-from odin.agent.hcl import generate_tf, resource_attrs, unquote
+from odin.iac import hcl
+from odin.iac.hcl import generate_tf, resource_attrs, unquote
 from odin.agent.translate import validate_refinement
 from odin.spec.models import Edge, FieldValue, ResourceDesired, Stack
 

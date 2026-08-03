@@ -15,7 +15,7 @@ some minutes later.
 Real ECS answers this with capacity providers, which odin has no model for. What
 it CAN do honestly is arithmetic: refuse before applying, naming the instance,
 what was asked of it and what it has. That is the same shape as the wiring guard
-(`agent/hcl.py`'s unresolvable-ref refusal, a 409 before tofu runs) rather than
+(`iac/hcl.py`'s unresolvable-ref refusal, a 409 before tofu runs) rather than
 a new mechanism.
 
 ## What this deliberately does NOT do

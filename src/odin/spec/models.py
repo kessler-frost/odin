@@ -98,7 +98,7 @@ class Ref(BaseModel):
 # THE canvas kinds a `${{producer.ATTR}}` reference can resolve against. ONE
 # definition, imported by both halves that need it: `gateway/wiring.py::
 # producer_facts`, which builds the values at launch time, and
-# `agent/hcl.py::_unwired_refs`, which refuses a ref against anything else
+# `iac/hcl.py::_unwired_refs`, which refuses a ref against anything else
 # BEFORE tofu runs.
 #
 # Field test 6, F3's sub-finding. The list used to exist only as prose inside
@@ -146,6 +146,18 @@ class Edge(BaseModel):
     kind: str = "ref"            # ref | iam | sg | role | target | subscription |
                                  # connection | unmodelled | network
     perms: tuple[str, ...] = ()
+    # The SECOND per-edge VALUE, after `perms` -- everything else an edge has
+    # ever carried is a MEANING (`kind`), or is folded into a node field by one
+    # of translate.py's `_merge_*_edges` passes.
+    #
+    # `True` is not a neutral default, it is TODAY'S BEHAVIOUR made explicit.
+    # Every SNS->SQS subscription odin has ever generated set
+    # `raw_message_delivery = true`, and `aws/backings.py::provision` subscribes
+    # with `RawMessageDelivery: "true"` on the non-tofu path, so the two agree.
+    # Defaulting to `False` here would silently change the envelope every
+    # existing consumer parses on the next apply -- the destructive direction
+    # `Edge.kind`'s own comment warns about, arriving through a new door.
+    raw_message_delivery: bool = True
 
 
 class ResourceDesired(BaseModel):

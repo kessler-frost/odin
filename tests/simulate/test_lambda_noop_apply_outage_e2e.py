@@ -12,7 +12,7 @@ is empty forever and its create waiter never runs a second time.
 The trigger is the field-verified one, and it is deliberately the SAME one the
 ECS test uses: a broken `${{...}}` ref in the node's `env` map. That map is
 injected at container launch and is NOT part of the `aws_lambda_function`
-resource (`agent/hcl.py::_lambda` says so in as many words), so adding it is a
+resource (`iac/hcl.py::_lambda` says so in as many words), so adding it is a
 guaranteed empty plan -- the exact path that had no guard.
 
   1. a healthy function                         -> applied, exit 0, prompt
@@ -44,7 +44,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from odin.agent import hcl
+from odin.iac import hcl
 from odin.agent import translate as translate_mod
 from odin.compute.functions import container_name
 from odin.server import create_app
@@ -129,7 +129,7 @@ def _await_state(root: Path, want: str, timeout: float = 60.0) -> dict:
 #                 RUNTIME_IMAGES[DEFAULT_RUNTIME]) -- an unknown runtime falls
 #                 back to the DEFAULT image and boots a WORKING container
 #   memory        `memory_size` is neither settable from the canvas nor emitted
-#                 by `agent/hcl.py`, so it cannot make `docker run` refuse
+#                 by `iac/hcl.py`, so it cannot make `docker run` refuse
 #   broken code   readiness is a TCP check on the RIE port
 #                 (`functions.py::_await_ready`), which a broken handler still
 #                 satisfies -- the error only appears on invoke

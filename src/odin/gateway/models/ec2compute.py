@@ -74,7 +74,6 @@ import base64
 import hashlib
 import json
 import logging
-import os
 import secrets
 import subprocess
 import tempfile
@@ -106,6 +105,7 @@ from odin.gateway.errors import exc_text
 from odin.gateway.keys import KeyStore, workload_env
 from odin.gateway.models import background, ec2net
 from odin.gateway.stores import NO_CHANGE, SynthStores
+from odin.settings import settings
 from odin.simulate.workspace import tf_dir
 from odin.util import reap
 
@@ -826,7 +826,7 @@ async def _run_instances(params: dict[str, str], env: str, stores: SynthStores, 
     user_data = base64.b64decode(user_data_b64).decode("utf-8", "replace") if user_data_b64 else None
     name = vm_name(env, instance_id)
     # Workload identity (fix-wave 2b finding #2): an instance carrying the
-    # `odin:node` tag (agent/hcl.py stamps it on every canvas-node-backed
+    # `odin:node` tag (iac/hcl.py stamps it on every canvas-node-backed
     # resource) boots with its keystore credentials + the gateway endpoint
     # baked into cloud-init -- the VM can call the gateway AS ITSELF. These
     # env vars go ONLY into the VM, never into any AWS API response body.
@@ -1466,7 +1466,7 @@ def _reaper_enabled() -> bool:
     `limactl delete` it yourself. That is the ONLY thing the reaper does --
     it never touches a VM any env's store still expects, and never one
     outside this module's own `odin-ec2-` naming."""
-    return os.environ.get("ODIN_REAP_EC2_VMS", "1").strip().lower() not in _REAPER_OFF_VALUES
+    return settings.gateway.reap_ec2_vms.strip().lower() not in _REAPER_OFF_VALUES
 
 
 class MeshRefreshFailed(RuntimeError):

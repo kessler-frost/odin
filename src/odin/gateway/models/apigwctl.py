@@ -183,7 +183,7 @@ def _set_tags(stores: SynthStores, env: str, api_id: str, tags: dict) -> None:
 # --- route keys ------------------------------------------------------------
 #
 # A route key is `"<METHOD> <path>"` or the literal `"$default"`. odin emits
-# `ANY /<label>` and `ANY /<label>/{proxy+}` per target (see agent/hcl.py), and
+# `ANY /<label>` and `ANY /<label>/{proxy+}` per target (see iac/hcl.py), and
 # both reduce to the SAME nginx prefix -- which is the point: nginx's
 # `location = /orders` + `location /orders/` pair is exactly those two route
 # keys, so the pair round-trips as one thing.
@@ -219,7 +219,7 @@ def _integration_id_of(route: dict) -> str | None:
 def ecs_service_of(integration: dict) -> str | None:
     """The ECS service name an HTTP_PROXY integration's URI names, or None.
 
-    The inverse of what `agent/hcl.py` writes (`http://<service>.odin.internal`),
+    The inverse of what `iac/hcl.py` writes (`http://<service>.odin.internal`),
     kept here so the two spellings live one function apart."""
     uri = integration.get("integration_uri") or ""
     host = uri.removeprefix("http://").removeprefix("https://").split("/")[0]
@@ -720,7 +720,7 @@ async def _create_stage(ctx: _Ctx) -> Response:
     ctx.stores.apigwctl.set(ctx.env, _stage_key(ctx.api_id, stage_name), record)
     # No converge: a stage changes nothing about routing. odin serves the
     # `$default` stage's paths at the API's root, which is what `$default` means
-    # -- and it is the only stage `agent/hcl.py` emits. A stage with any other
+    # -- and it is the only stage `iac/hcl.py` emits. A stage with any other
     # name is STORED (so tofu plans clean) and serves nothing, which
     # docs/limits.md says out loud rather than leaving to be discovered.
     return _json(_stage_wire(record), status=201)

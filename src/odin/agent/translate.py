@@ -27,8 +27,10 @@ from typing import Any, TypedDict
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, SdkMcpTool, create_sdk_mcp_server, tool
 from pydantic import BaseModel
 
-from odin.agent import ai, hcl
-from odin.agent.hcl import TfProject, generate_tf
+from odin.agent import ai
+from odin.settings import settings
+from odin.iac import hcl
+from odin.iac.hcl import TfProject, generate_tf
 from odin.simulate.runner import PLUGIN_CACHE_DIR
 from odin.spec.models import REDACTED, Stack, scrub
 from odin.spec.store import rev_of
@@ -46,7 +48,7 @@ def _default_timeout() -> float:
     `TranslateCache`) -- so this timeout only bounds how long that background
     task runs before giving up, never how long a `/translate` or `/apply-full`
     caller waits. `ODIN_TRANSLATE_TIMEOUT` overrides it."""
-    return float(os.environ.get("ODIN_TRANSLATE_TIMEOUT", "45"))
+    return settings.ai.translate_timeout
 
 
 def refine_enabled() -> bool:
@@ -55,7 +57,7 @@ def refine_enabled() -> bool:
     also have to know this flag exists.
 
     `ODIN_TRANSLATE_REFINE` opts IN to the claude-agent-sdk refine pass --
-    OFF by default. The canvas -> Terraform translation (`agent/hcl.py`) is
+    OFF by default. The canvas -> Terraform translation (`iac/hcl.py`) is
     fully deterministic; this pass is a best-effort ADD-ON that can only
     attach comments/tags/unset arguments (`validate_refinement`'s
     value-fidelity check rejects anything else), never change the
@@ -70,7 +72,7 @@ def refine_enabled() -> bool:
     of its own -- see `_refine`.)"""
     if ai.off_reason() is not None:
         return False
-    return os.environ.get("ODIN_TRANSLATE_REFINE", "").strip().lower() in ("1", "true", "yes", "on")
+    return settings.ai.translate_refine.strip().lower() in ("1", "true", "yes", "on")
 
 
 _TIMEOUT_S = _default_timeout()

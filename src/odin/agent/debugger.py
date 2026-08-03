@@ -2,7 +2,7 @@
 genuinely cannot do.
 
 Everything else the agent layer touches is deterministic on purpose
-(`agent/hcl.py` canvas->TF, `agent/import_tf.py` TF->canvas, with the refine
+(`iac/hcl.py` canvas->TF, `iac/import_tf.py` TF->canvas, with the refine
 pass off by default and structurally unable to change what gets applied). This
 module is the opposite case: given a region of the canvas, EXPLAIN in plain
 English why it is broken. There is no deterministic function from (exit code,
@@ -74,6 +74,7 @@ from typing import Annotated, Any, TypedDict
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, SdkMcpTool, create_sdk_mcp_server, tool
 
 from odin.agent import ai
+from odin.settings import settings
 from odin.spec.models import REDACTED, FieldValue, Stack, World, scrub
 
 log = logging.getLogger("odin.debugger")
@@ -114,7 +115,7 @@ def disabled_reason() -> str | None:
     reason = ai.off_reason()
     if reason is not None:
         return f"the failure-explanation agent did not run: {reason}"
-    if os.environ.get("ODIN_DEBUG_AGENT", "1").strip().lower() in ("0", "false", "no", "off"):
+    if settings.ai.debug_agent.strip().lower() in ("0", "false", "no", "off"):
         return _DISABLED
     return None
 
@@ -137,8 +138,9 @@ def _default_timeout() -> float:
     on a real M8 run, the first nested-CLI launch took ~65s wall-clock end to
     end and a warm one ~49s, so a 60s budget turned a perfectly good diagnosis
     into "agent unavailable" purely on startup cost. `ODIN_DEBUG_TIMEOUT`
-    overrides it."""
-    return float(os.environ.get("ODIN_DEBUG_TIMEOUT", "90"))
+    overrides it (`settings.ai.debug_timeout`, where that measurement lives
+    beside the number it justifies)."""
+    return settings.ai.debug_timeout
 
 
 # --- 1. the context assembler (pure) -----------------------------------------

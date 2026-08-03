@@ -19,7 +19,7 @@ them apart on purpose:
 """
 from __future__ import annotations
 
-from odin.agent.hcl import TfProject, generate_tf
+from odin.iac.hcl import TfProject, generate_tf
 from odin.simulate import workspace
 from odin.spec.models import FieldValue, ResourceDesired, Stack
 

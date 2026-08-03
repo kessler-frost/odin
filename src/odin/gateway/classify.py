@@ -86,7 +86,7 @@ this only needs to never deny it via `unmappable-action`.
 LOGS (task W2.1) SHARES ECR's JSON-target SHAPE but is the FIRST modeled
 service whose resource is a real WORKLOAD-FACING label again (like s3/sqs/
 sns/dynamodb, unlike the operator-only ec2/iam/ecr/lambda/ecs families): a
-`logs` canvas node's label IS its log-group name (agent/hcl.py's `_logs`
+`logs` canvas node's label IS its log-group name (iac/hcl.py's `_logs`
 builder emits `name = <label>`), so `_logs_resource` returning the bare group
 name is exactly what `policy.compile_policies` puts in an iam edge's
 statement -- draw `lambda -> log-group` with `logs:PutLogEvents` and the
@@ -100,7 +100,7 @@ default-deny.
 SECRETS MANAGER + SSM (task W2.4) ARE THE PAYOFF CASE for the LOGS reasoning
 above: both share ECR's JSON-target wire shape, and for both the resource IS
 the canvas node's label -- a `secret` node's label is its secret name
-(`agent/hcl.py`'s `_secret` emits `name = <label>`), an `ssm` node's label is
+(`iac/hcl.py`'s `_secret` emits `name = <label>`), an `ssm` node's label is
 its parameter name (`_ssm` emits the same). So `_secretsmanager_resource` /
 `_ssm_resource` returning the bare name is exactly what
 `policy.compile_policies` puts in an iam edge's statement: draw
@@ -124,7 +124,7 @@ Recorded in ROADMAP.md; the single-name reads a workload actually makes
 RDS (task W2.7) is the QUERY protocol (form-encoded `Action=`, like sns/ec2/
 iam -- not a JSON target header), and its resource is workload-facing like
 logs': an `rds` canvas node's label IS its `DBInstanceIdentifier`
-(agent/hcl.py's `_rds` builder emits `identifier = <label>`), so an
+(iac/hcl.py's `_rds` builder emits `identifier = <label>`), so an
 `rds:DescribeDBInstances` edge drawn to that node compiles to a statement the
 gateway enforces with no rds-specific code in the policy layer.
 
@@ -519,7 +519,7 @@ def _ecs_resource(op: str, payload: dict) -> str:
 
 def _logs_resource(payload: dict) -> str:
     """The bare LOG GROUP NAME -- which for a `logs` canvas node IS its label
-    (agent/hcl.py's `_logs` builder sets `name = <label>`), so an iam edge
+    (iac/hcl.py's `_logs` builder sets `name = <label>`), so an iam edge
     drawn to that node gates every call here through the ordinary
     `evaluate(statements, action, resource)` path with no logs-specific
     plumbing (see the module docstring's LOGS note). `logGroupIdentifier` /
@@ -549,7 +549,7 @@ def _bare_log_group(value: str) -> str:
 
 def _rds_resource(params: dict[str, str]) -> str:
     """The bare DB-instance IDENTIFIER -- which for an `rds` canvas node IS
-    its label (agent/hcl.py's `_rds` builder emits `identifier = <label>`), so
+    its label (iac/hcl.py's `_rds` builder emits `identifier = <label>`), so
     an `rds:DescribeDBInstances` edge drawn to that node
     gates through the ordinary `evaluate(statements, action, resource)` path
     with no rds-specific plumbing (the same identity rule s3's bucket, sqs's
@@ -678,7 +678,7 @@ def _kms_resource(payload: dict) -> str:
 
 
 def _kms_tag_key(payload: dict) -> str:
-    """CreateKey's identity: the `odin:node` tag `agent/hcl.py` stamps. KMS
+    """CreateKey's identity: the `odin:node` tag `iac/hcl.py` stamps. KMS
     spells a tag `{"TagKey": ..., "TagValue": ...}`, NOT the `Key`/`Value` every
     other service modeled here uses -- read the common spelling and every
     `CreateKey` classifies to `"*"`, which the operator's wildcard still allows,
@@ -748,7 +748,7 @@ def _elbv2_resource(params: dict[str, str]) -> str:
     `_classify_iam`/`_classify_ecr`/`_classify_ecs` already use: extract a real
     value when the request carries one, `"*"` otherwise -- never None, so the
     operator (tofu) is never denied via `unmappable-action`. An `alb` canvas
-    node's label IS its load-balancer name (`agent/hcl.py`'s `_alb` emits
+    node's label IS its load-balancer name (`iac/hcl.py`'s `_alb` emits
     `name = <label>`), so this value is also what an iam edge's compiled
     statement would name -- but note the deliberate design choice in
     `ui/src/lib/iam.ts`: `alb` is NOT an IAM target on the canvas (nothing a

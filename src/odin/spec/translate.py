@@ -36,14 +36,14 @@ _REF = re.compile(r"^\$\{\{\s*([\w-]+)\.([\w-]+)\s*\}\}$")
 # driven by CreateCacheCluster/DeleteCacheCluster in gateway/models/cachectl.py.
 # alb (W2.5) is the same shape
 # again: one canvas node expands to aws_lb + aws_lb_target_group +
-# aws_lb_listener (agent/hcl.py), and its REAL substrate -- an nginx reverse
+# aws_lb_listener (iac/hcl.py), and its REAL substrate -- an nginx reverse
 # proxy container whose upstreams are the target group's registered targets --
 # is driven by the gateway's CreateLoadBalancer/CreateListener/RegisterTargets
 # handlers (gateway/models/elbv2ctl.py + compute/proxy.py).
 #
 # kms is the same shape once more, and it is the kind whose LABEL matters most:
 # real `CreateKey` takes no name at all, so `gateway/models/kmsctl.py` keys a key
-# by the `odin:node` tag `agent/hcl.py::_tags_block` stamps. That tag is the ONLY
+# by the `odin:node` tag `iac/hcl.py::_tags_block` stamps. That tag is the ONLY
 # carrier of the canvas label -- an untagged key gets a uuid and is addressable
 # from nothing. Its REAL lifecycle (AES-256 material in a 0600 `.odin/{env}/
 # kms.json`, sealing the secret/ssm sidecars) is driven by CreateKey /
@@ -128,7 +128,7 @@ _A = {str: "a string", dict: "an object", list: "a list", bool: "a boolean",
 _NODE_SHAPE = {"id": str, "type": str, "data": dict}
 _NODE_DATA_SHAPE = {"label": str, "env": dict}
 _EDGE_SHAPE = {"source": str, "target": str, "data": dict}
-_EDGE_DATA_SHAPE = {"edgeType": str, "permissions": list}
+_EDGE_DATA_SHAPE = {"edgeType": str, "permissions": list, "rawMessageDelivery": bool}
 
 
 def _got(value: object) -> str:
@@ -254,7 +254,7 @@ def _edges(e: dict, labels: dict[str, str]) -> tuple[Edge, ...]:
     #
     # An edge with no `edgeType` at all (a hand-authored canvas) falls to
     # `UNMODELLED`, matching what the UI now stores for the same pair. The kind
-    # written here is NOT read back by any builder -- `agent/hcl.py`'s ALB and
+    # written here is NOT read back by any builder -- `iac/hcl.py`'s ALB and
     # subscription passes key on the two NODE kinds -- so changing the word
     # cannot change what gets built, only what the canvas says it is.
     #
@@ -264,7 +264,7 @@ def _edges(e: dict, labels: dict[str, str]) -> tuple[Edge, ...]:
     # stores its answer as a `+`-joined set in the same `edgeType` string.
     # It is split back into one `Edge` per meaning HERE, and that is the point:
     # every Python consumer downstream matches a SINGLE kind
-    # (`gateway/policy.py::compile_policies` and `agent/hcl.py::_granted_ids`
+    # (`gateway/policy.py::compile_policies` and `iac/hcl.py::_granted_ids`
     # both gate on `kind == "iam"`), so a joined string reaching them would have
     # dropped the grant silently. Splitting at the boundary means none of them
     # changed at all.
@@ -274,6 +274,12 @@ def _edges(e: dict, labels: dict[str, str]) -> tuple[Edge, ...]:
     # separator in it splits into itself.
     data = e.get("data") or {}
     perms = tuple(data.get("permissions") or ())
+    # ABSENT means True, which is what makes every canvas saved before this
+    # field existed generate the bytes it always did. Only an explicit `false`
+    # turns it off -- `is not False` rather than a truthiness test, so a canvas
+    # carrying `null` (which the schema allows for every optional field) reads
+    # as "not given" instead of as "off".
+    raw = data.get("rawMessageDelivery") is not False
     stored = str(data.get("edgeType") or "") or ("iam" if perms else UNMODELLED)
     kinds = [k for k in (part.strip() for part in stored.split(EDGE_KIND_SEPARATOR)) if k] or [UNMODELLED]
     src, dst = e.get("source", ""), e.get("target", "")
@@ -283,7 +289,10 @@ def _edges(e: dict, labels: dict[str, str]) -> tuple[Edge, ...]:
     # to what this function returned before, which is what makes a stored Stack
     # revision's content hash stable across this change. Only the `iam` edge's
     # `perms` is ever read.
-    return tuple(Edge(src=src, dst=dst, kind=kind, perms=perms) for kind in dict.fromkeys(kinds))
+    return tuple(
+        Edge(src=src, dst=dst, kind=kind, perms=perms, raw_message_delivery=raw)
+        for kind in dict.fromkeys(kinds)
+    )
 
 
 def skipped_node_types(canvas: dict) -> list[str]:
@@ -339,7 +348,7 @@ def drawn_node_types(canvas: dict) -> dict[str, str]:
 # knows which kinds exist, and `agent/chat.py` validates against it.
 #
 # Being in this set does NOT mean a builder gates on it. Two consumers -- the
-# subscription pass in `agent/hcl.py` and `reconcile/reconciler.py::
+# subscription pass in `iac/hcl.py` and `reconcile/reconciler.py::
 # _desired_subs` -- key on the two NODE kinds and never read `edge.kind`, and
 # they must keep doing so: every saved canvas types an sns->sqs edge `network`,
 # so requiring `kind == "subscription"` without a migration in the same commit
@@ -377,7 +386,7 @@ SNS_SUBSCRIPTION = "subscription"
 # "This volume is attached to that instance" -- an `aws_volume_attachment`, and
 # behind it a real `limactl disk` on the instance's VM. PRESENTATIONAL in the
 # same sense as the two above, and here it is load-bearing that it stays so:
-# `agent/hcl.py`'s attachment pass keys on the two NODE KINDS, so an old canvas
+# `iac/hcl.py`'s attachment pass keys on the two NODE KINDS, so an old canvas
 # whose edge still says `network` keeps its attachment. Gating on the name would
 # make the next apply detach a disk with data on it.
 VOLUME_ATTACHMENT = "volume"
@@ -385,7 +394,7 @@ VOLUME_ATTACHMENT = "volume"
 # "This zone resolves that instance's name" -- an `aws_route53_record`, and
 # behind it a REAL hosts entry (`--add-host` on every container in the env,
 # `/etc/hosts` on every VM). PRESENTATIONAL in the same sense as the three
-# above: `agent/hcl.py`'s record pass keys on the two NODE KINDS, and it must
+# above: `iac/hcl.py`'s record pass keys on the two NODE KINDS, and it must
 # stay that way -- `route53` has been a drawable catalog tile since long before
 # it had a builder, so a canvas whose route53 edge still says `network` would
 # silently lose its record if the pass gated on this name.
@@ -396,7 +405,7 @@ DNS_RECORD = "dns"
 # a real host directory bind-mounted into the container.
 #
 # NOT a reuse of `VOLUME_ATTACHMENT`, and the difference is the feature: a gp3
-# volume attaches to exactly ONE instance (`agent/hcl.py` refuses a second
+# volume attaches to exactly ONE instance (`iac/hcl.py` refuses a second
 # attachment edge by name), while an EFS file system is mounted by MANY
 # consumers at once. One label reading "Volume Attachment" over both would tell
 # the user the wrong thing about exclusivity on the one line where sharing is
@@ -404,7 +413,7 @@ DNS_RECORD = "dns"
 # `aws_volume_attachment` resource versus a nested block on the CONSUMER -- so
 # the importer's inverse differs correspondingly.
 #
-# PRESENTATIONAL in the same sense as the kinds above: `agent/hcl.py`'s mount
+# PRESENTATIONAL in the same sense as the kinds above: `iac/hcl.py`'s mount
 # pass keys on the two NODE KINDS and never on this name.
 FILE_SYSTEM_MOUNT = "mount"
 
@@ -438,7 +447,7 @@ EDGE_KINDS = frozenset({
     UNMODELLED, LEGACY_UNMODELLED, "ref",
 })
 
-# Kinds whose HCL reads `securityGroups` (`agent/hcl.py::_security_group_refs`,
+# Kinds whose HCL reads `securityGroups` (`iac/hcl.py::_security_group_refs`,
 # used by `_ec2` and `_rds`). An SG edge to anything else is left alone rather
 # than invented into a field nothing consumes.
 _SG_MEMBERS = frozenset({"ec2", "rds"})
@@ -453,7 +462,7 @@ def _merge_sg_edges(
     README's own JSON schema, the translation agent next) writes it directly and
     must keep working, so an edge ADDS to whatever is typed there -- the edge is
     another way to author the same fact, not a second source of truth competing
-    with it. `agent/hcl.py` therefore needs no change at all: it still reads one
+    with it. `iac/hcl.py` therefore needs no change at all: it still reads one
     field, and cannot tell how a line got there.
 
     Order is preserved and duplicates are dropped, so drawing an edge that
@@ -491,7 +500,7 @@ def _merge_sg_edges(
     return tuple(merged)
 
 
-# Kinds whose HCL reads a `role` field (`agent/hcl.py::_lambda`). ec2 and ecs
+# Kinds whose HCL reads a `role` field (`iac/hcl.py::_lambda`). ec2 and ecs
 # reach a role through an auto-generated role plus an instance profile /
 # `task_role_arn` and read no `role` field at all, so a role edge drawn to them
 # is deliberately NOT registered on the canvas (`ui/src/lib/iam.ts`) and never
@@ -516,7 +525,7 @@ def _merge_role_edges(
     thing and the gateway doing another, silently and permanently.
 
     Folding into the field the builder ALREADY reads is what makes the edge take
-    effect with no change to `agent/hcl.py` at all -- `_lambda` still reads one
+    effect with no change to `iac/hcl.py` at all -- `_lambda` still reads one
     `role` field and cannot tell how a name got there. Same technique as
     `_merge_sg_edges`, and direction is not significant for the same reason.
 
@@ -560,7 +569,7 @@ def _merge_role_edges(
 # --- the encryption edge -----------------------------------------------------
 #
 # TARGET kind -> the canvas field naming the key it is sealed under. The two
-# names differ because the two AWS APIs differ, and `agent/hcl.py` reads each
+# names differ because the two AWS APIs differ, and `iac/hcl.py` reads each
 # one into the argument its own resource type takes: a secret's `kmsKeyId` ->
 # `aws_secretsmanager_secret.kms_key_id`, a parameter's `keyId` ->
 # `aws_ssm_parameter.key_id`. Naming them alike here would only move the
@@ -586,7 +595,7 @@ def _merge_encryption_edges(
     """Fold encryption edges into each target's own key-naming field.
 
     The third instance of the technique `_merge_sg_edges` and `_merge_role_edges`
-    already use, and it earns its place the same way: `agent/hcl.py::_secret` and
+    already use, and it earns its place the same way: `iac/hcl.py::_secret` and
     `::_ssm` read ONE field and cannot tell whether a key's name was typed there
     or drawn, so the edge takes effect with no builder change at all.
 
@@ -638,7 +647,7 @@ def _merge_encryption_edges(
 # --- the connection edge -----------------------------------------------------
 #
 # PRODUCER kind -> (env var, the fact to read off it). Both kinds are in
-# `spec/models.py::REFERENCEABLE_KINDS`, so `agent/hcl.py::_ref_fault` already
+# `spec/models.py::REFERENCEABLE_KINDS`, so `iac/hcl.py::_ref_fault` already
 # accepts a ref to them and emits the `depends_on` that orders the producer
 # before the consumer -- this authors an ordinary ref and nothing else.
 #
@@ -768,7 +777,7 @@ def connection_conflicts(stack: Stack) -> list[str]:
     call.
 
     Reported through `wiring_errors` rather than `unsupported` for the reason
-    `agent/hcl.py::_ref_fault` spells out at length: `unsupported` is the
+    `iac/hcl.py::_ref_fault` spells out at length: `unsupported` is the
     COVERAGE field a CI gate reads, and a canvas that wires two things to one
     variable is a user error on nodes odin supports perfectly well.
 
@@ -800,7 +809,7 @@ def _orient_subscription_edges(
 
     A subscription has exactly one possible direction: a topic fans out to a
     queue, never the reverse. Both consumers nevertheless key on the DRAWN
-    direction -- `agent/hcl.py`'s subscription pass reads `edge.src` as the
+    direction -- `iac/hcl.py`'s subscription pass reads `edge.src` as the
     topic, and `reconcile/reconciler.py::_desired_subs` filters on
     `e.src == sns_id` -- so drawing the edge queue -> topic gave a grey line, a
     green Apply, no subscription, and no entry in `unsupported` or

@@ -27,7 +27,7 @@ import shutil
 
 import pytest
 
-from odin.agent.hcl import generate_tf
+from odin.iac.hcl import generate_tf
 from odin.agent.translate import validate_refinement
 from odin.spec.translate import canvas_to_stack
 

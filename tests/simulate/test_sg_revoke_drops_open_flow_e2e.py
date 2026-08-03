@@ -64,7 +64,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from odin.agent import hcl
+from odin.iac import hcl
 from odin.agent import translate as translate_mod
 from odin.compute.instances import vm_name
 from odin.fabric.nebula import LighthouseManager

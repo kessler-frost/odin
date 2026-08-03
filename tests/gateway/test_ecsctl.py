@@ -927,7 +927,7 @@ async def test_delete_cluster_after_service_delete_is_allowed(sink, ecs, stores)
 
 
 async def test_create_service_with_odin_node_tag_injects_workload_creds(sink, ecs, stores, keystore):
-    """A service tagged `odin:node` (agent/hcl.py's `_tags_block` stamp)
+    """A service tagged `odin:node` (iac/hcl.py's `_tags_block` stamp)
     launches its REAL task containers with the four AWS-SDK env vars layered
     on via `extra_env` -- so the container can call odin's own gateway AS
     ITSELF -- while the stored taskdef stays byte-for-byte untouched."""

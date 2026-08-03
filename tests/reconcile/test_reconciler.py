@@ -84,7 +84,13 @@ class FakeAws:
     async def provision(self, service, name, subscriptions=()):
         self.provisioned.append((service, name, subscriptions))
         if service == "sns":  # a re-provision is observable as a subscription change
-            self.subs[name] = self.subs.get(name, ()) + tuple(subscriptions)
+            # `subscriptions` is `(queue, raw_message_delivery)` pairs since
+            # v0.8.21, and `self.subs` mirrors the real backing's
+            # `ListSubscriptionsByTopic`, which returns ENDPOINTS and no
+            # attributes -- so the flag is dropped here on purpose. That is
+            # also exactly why a flag CHANGE on a live subscription is a listed
+            # limit: nothing on this path can see one.
+            self.subs[name] = self.subs.get(name, ()) + tuple(q for q, _raw in subscriptions)
 
     async def subscriptions(self, topic):
         return self.subs.get(topic, ())
@@ -533,8 +539,15 @@ async def test_a_task_container_removed_mid_apply_is_seen_within_one_tick(tmp_pa
     store = SpecStore(tmp_path)
     store.apply(Stack(resources=(ResourceDesired(id="app", kind="ecs"),)))
     stores = _ecs_service_stores(tmp_path, ["t1", "t2"])
+    # `lambda containers:` -- the real arity. `project` now builds its task view
+    # as `TaskRuntime(containers)` from the RECONCILER'S OWN runtime instead of
+    # a bare `TaskRuntime()`, so a fake-runtime app's trailing tick stops
+    # reaching real `docker` (see `server.py::Substrates`). Spelling the
+    # parameter out rather than `*_` keeps this fake failing loudly the next
+    # time the real signature moves.
     monkeypatch.setattr(
-        tf_status, "TaskRuntime", lambda: FakeTaskContainers({"t1": "running", "t2": "running"}),
+        tf_status, "TaskRuntime",
+        lambda containers: FakeTaskContainers({"t1": "running", "t2": "running"}),
     )
     # The drift sweeper sees BOTH containers, so it is not what reports this.
     recon = Reconciler(
@@ -546,7 +559,8 @@ async def test_a_task_container_removed_mid_apply_is_seen_within_one_tick(tmp_pa
 
     async with recon.hold():  # an apply is now in flight, actions suspended
         monkeypatch.setattr(
-            tf_status, "TaskRuntime", lambda: FakeTaskContainers({"t1": "running", "t2": "absent"}),
+            tf_status, "TaskRuntime",
+            lambda containers: FakeTaskContainers({"t1": "running", "t2": "absent"}),
         )
         await recon.tick()
 
@@ -950,12 +964,56 @@ async def test_new_sns_edge_on_a_healthy_topic_provisions_the_missing_subscripti
     store.apply(Stack(resources=(alerts, jobs), edges=(Edge(src="alerts", dst="jobs"),)))
     await recon.tick()
 
-    assert ("sns", "alerts", ("jobs",)) in aws.provisioned  # observe re-provisioned the gap
+    # `(queue, raw_message_delivery)` since v0.8.21, and True is what an edge
+    # that never mentioned the flag carries -- spelled out rather than taken
+    # from `Edge.raw_message_delivery`'s default, so a change to that default
+    # fails here instead of passing silently.
+    assert ("sns", "alerts", (("jobs", True),)) in aws.provisioned  # observe re-provisioned the gap
     assert aws.subs["alerts"] == ("jobs",)
     assert store.current_world().get("alerts").phase == "healthy"  # never left healthy
 
     await recon.tick()                            # already subscribed: no re-provision spam
-    assert aws.provisioned.count(("sns", "alerts", ("jobs",))) == 1
+    assert aws.provisioned.count(("sns", "alerts", (("jobs", True),))) == 1
+
+
+async def test_an_edge_that_turned_raw_delivery_OFF_reaches_the_backing_as_false(tmp_path):
+    """The Apply path has to say what the canvas says, because the OTHER path
+    (`iac/hcl.py` -> `tofu apply`) already does. This subscribed with a
+    hardcoded `RawMessageDelivery: "true"` until v0.8.21, so a canvas that
+    turned the flag off got the raw body here and the JSON envelope through
+    Simulate -- one topic, two envelopes, depending on which button was
+    pressed."""
+    rt, aws = FakeRuntime(), FakeAws()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(
+        resources=(ResourceDesired(id="alerts", kind="sns"), ResourceDesired(id="jobs", kind="sqs")),
+        edges=(Edge(src="alerts", dst="jobs", kind="subscription", raw_message_delivery=False),),
+    ))
+    recon = Reconciler(store, rt, aws=aws, poll_interval=0)
+    await recon.tick()
+
+    assert ("sns", "alerts", (("jobs", False),)) in aws.provisioned
+
+
+async def test_one_line_meaning_two_things_subscribes_the_queue_ONCE(tmp_path):
+    """`translate._edges` emits one `Edge` per MEANING, so an sns->sqs line
+    that is both a subscription and an iam grant arrives twice with the same
+    src/dst. Subscribing twice with conflicting attributes would make the
+    winner depend on iteration order; the queue must appear exactly once, with
+    the first edge's flag."""
+    rt, aws = FakeRuntime(), FakeAws()
+    store = SpecStore(tmp_path)
+    store.apply(Stack(
+        resources=(ResourceDesired(id="alerts", kind="sns"), ResourceDesired(id="jobs", kind="sqs")),
+        edges=(
+            Edge(src="alerts", dst="jobs", kind="subscription", raw_message_delivery=False),
+            Edge(src="alerts", dst="jobs", kind="iam", perms=("sqs:SendMessage",)),
+        ),
+    ))
+    recon = Reconciler(store, rt, aws=aws, poll_interval=0)
+    await recon.tick()
+
+    assert ("sns", "alerts", (("jobs", False),)) in aws.provisioned
 
 
 # --- W2.2 drift detection: the TF-owned projection is cross-checked against

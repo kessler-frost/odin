@@ -27,7 +27,7 @@ CONSTRUCTED for any of the three when the switch is off, the way
 fail a build.
 
 WHAT IT IS NOT. It does not touch the canvas↔Terraform translation, which is a
-deterministic compiler (`agent/hcl.py`): with `ODIN_AI=0` a canvas still
+deterministic compiler (`iac/hcl.py`): with `ODIN_AI=0` a canvas still
 compiles to the same Terraform, `tofu apply` still runs, IAM edges are still
 enforced, and every substrate still works. The refine pass is optional
 decoration over an already-correct translation -- turning it off costs
@@ -57,14 +57,17 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from pathlib import Path
 
+from odin.settings import AiSettings, env_name, settings
 from odin.util import atomic_write_text
 
 log = logging.getLogger("odin.agent")
 
-ENV_VAR = "ODIN_AI"
+# The name, from the one place that owns it (`odin/settings.py`), because every
+# sentence below quotes it back at the user -- a message naming a variable the
+# reader does not honour is the exact failure `env_name` exists to prevent.
+ENV_VAR = env_name(AiSettings, "enabled")
 _ON = ("1", "true", "yes", "on")
 _OFF = ("0", "false", "no", "off")
 
@@ -108,8 +111,13 @@ def off_reason() -> str | None:
     CI job or a `ODIN_AI=0 odin apply` relies on and it must not be silently
     overridden by a preference file. With it unset, the UI switch decides, and
     its default is off.
+
+    The value is a `str` in `AiSettings`, not a `bool`, and this function is
+    why: FOUR outcomes come out of it, not two, and the fourth (an
+    unrecognised value -> no model calls, plus a warning naming the value) is
+    the one a pydantic `bool` would turn into a startup crash instead.
     """
-    raw = os.environ.get(ENV_VAR, "").strip()
+    raw = settings.ai.enabled.strip()
     value = raw.lower()
     if value in _OFF:
         return f"{ENV_VAR}={raw} — every model call is disabled (unset it, or set {ENV_VAR}=1, to allow them)"

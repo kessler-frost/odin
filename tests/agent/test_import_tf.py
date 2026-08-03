@@ -3,9 +3,9 @@ import against a real gateway + backings) is exercised in
 tests/simulate/test_import_tf_e2e.py (integration, needs Colima/tofu)."""
 from __future__ import annotations
 
-from odin.agent import hcl
-from odin.agent.hcl import generate_tf, resource_attrs
-from odin.agent.import_tf import (
+from odin.iac import hcl
+from odin.iac.hcl import generate_tf, resource_attrs
+from odin.iac.import_tf import (
     _FIXED_VALUES,
     _TF_TYPE,
     LiveResource,
@@ -1010,16 +1010,22 @@ resource "aws_sns_topic_subscription" "alerts_jobs" {
 '''
 
 
-def test_a_subscriptions_filter_policy_and_raw_delivery_are_reported():
-    """A subscription becomes an EDGE, and an edge carries no arguments -- so
-    nothing ever computed dropped attributes for one. Losing `filter_policy`
-    means the queue starts receiving EVERY message on the topic."""
+def test_a_subscriptions_filter_policy_is_reported_and_its_raw_delivery_is_CARRIED():
+    """`filter_policy` is still lost, and losing it means the queue starts
+    receiving EVERY message on the topic -- so it is still reported.
+
+    `raw_message_delivery = false` is no longer among the losses. It used to be
+    reported as CHANGED ("odin always emits true"), which was the honest
+    disclosure of a real substitution; since v0.8.21 the edge carries it and
+    there is nothing to substitute. Both halves are asserted, because a fix
+    that carried the flag AND stopped reporting `filter_policy` would look the
+    same from the value side alone."""
     result = parse_hcl_text(_FILTERED_SUBSCRIPTION_TF)
-    assert result.edges == [{"source": "alerts", "target": "jobs"}]
+    assert result.edges == [{"source": "alerts", "target": "jobs",
+                             "data": {"rawMessageDelivery": False}}]
     (lost,) = _lost(result, "sns subscription")
     assert "filter_policy" in lost
-    (changed,) = _changed(result, "sns subscription")
-    assert "raw_message_delivery=false (odin always emits true)" in changed
+    assert _changed(result, "sns subscription") == [], "nothing is substituted any more"
 
 
 def test_a_subscription_odin_itself_generated_reports_nothing():
@@ -1138,6 +1144,15 @@ _EVERY_KIND_CANVAS = {
         {"id": "n13", "type": "ec2",
          "data": {"label": "api-server", "vpc": "net", "subnet": "web"}},
         {"id": "n14", "type": "route53", "data": {"label": "example.com"}},
+        # v0.8.22: `apigateway`, and it is the fourth time this fixture has been
+        # narrower than the generator (ecs, ebs, route53, now this). It costs two
+        # claims, not one: `("apigateway", "protocol_type")` -- whose absence had
+        # been asserted in a COMMENT since v0.8.19 while no entry existed -- and
+        # `("aws_apigatewayv2_stage", "auto_deploy")`, which comes from the STAGE
+        # a bare API emits alongside itself. No target edge is needed: an
+        # integration carries no `_FIXED_VALUES` claim (odin emits a different
+        # set per target kind, checked by `_apigw_integration_notes` instead).
+        {"id": "n15", "type": "apigateway", "data": {"label": "public-api"}},
     ],
     "edges": [
         {"id": "e1", "source": "n9", "target": "n10"},

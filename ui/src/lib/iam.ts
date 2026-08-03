@@ -84,7 +84,7 @@ export const defaultPermissions: Record<string, string[]> = {
 };
 
 // W2.5: an alb <-> compute edge is a TARGET edge -- "this load balancer fronts
-// that service". `agent/hcl.py`'s pass 1.5 stamps a `load_balancer` block onto
+// that service". `iac/hcl.py`'s pass 1.5 stamps a `load_balancer` block onto
 // the aws_ecs_service, which is how real ECS attaches to a target group.
 //
 // It was carried as the `network` edge type until v0.8.14 and now has its own
@@ -155,7 +155,7 @@ export const edgeTypes: Record<string, EdgeTypeDef> = {
   // edge follows.
   role: { id: 'role', label: 'IAM Role', color: '#fbbf24', dashed: true },
   // "This load balancer fronts that service" -- previously carried as `network`
-  // and registered as such, which is why `agent/hcl.py`'s pass 1.5 comment has
+  // and registered as such, which is why `iac/hcl.py`'s pass 1.5 comment has
   // to spell out that a NETWORK edge between an alb and a compute node means a
   // target. It compiles to a real `load_balancer` block on the ECS service.
   target: { id: 'target', label: 'LB Target', color: '#38bdf8', dashed: false },
@@ -171,7 +171,7 @@ export const edgeTypes: Record<string, EdgeTypeDef> = {
   connection: { id: 'connection', label: 'Connection', color: '#34d399', dashed: false },
   // "This key encrypts that sidecar at rest" -- it AUTHORS the target's own
   // key-naming field (`spec/translate.py::_merge_encryption_edges` ->
-  // `agent/hcl.py::_secret`/`_ssm` -> a real `kms_key_id`/`key_id` argument), so
+  // `iac/hcl.py::_secret`/`_ssm` -> a real `kms_key_id`/`key_id` argument), so
   // it is the same author-a-field-a-builder-already-reads shape as `role` and
   // `sg`, not a presentational label.
   //
@@ -296,7 +296,7 @@ for (const target of Object.keys(iamActionsForTarget)) {
   for (const workload of computeTypes) register(workload, target, 'iam');
 }
 // W2.5: alb <-> compute is a target edge (see `albTargetTypes` above). It was
-// registered as `network` until this change, which is why `agent/hcl.py`'s pass
+// registered as `network` until this change, which is why `iac/hcl.py`'s pass
 // 1.5 has to explain in prose that a "NETWORK edge between an `alb` node and a
 // compute node" means a load-balancer target. Naming the type says it in the
 // registry instead. The type is PRESENTATIONAL: hcl.py's pass keys on the two
@@ -318,7 +318,7 @@ for (const target of albTargetTypes) register('alb', target, 'target');
 // meaning and `edge-ambiguity.test.ts` stays green without an allowlist entry --
 // checked by running it, not assumed.
 //
-// PRESENTATIONAL, like `target`'s other members: `agent/hcl.py`'s route pass
+// PRESENTATIONAL, like `target`'s other members: `iac/hcl.py`'s route pass
 // keys on the two NODE kinds and never reads `edge.kind`. Gating it on the name
 // would make an old canvas (whose edges still say `network`) lose every route on
 // the next apply -- a 404 for every path that worked yesterday.
@@ -326,7 +326,7 @@ export const apiTargetTypes = new Set(['lambda', 'ecs']);
 for (const target of apiTargetTypes) register('apigateway', target, 'target');
 // An sg drawn against a kind whose HCL reads `securityGroups` means MEMBERSHIP,
 // and only that -- a plain "network" line between a group and an instance would
-// describe nothing. Kept deliberately to the kinds `agent/hcl.py` actually
+// describe nothing. Kept deliberately to the kinds `iac/hcl.py` actually
 // consumes it for (`_ec2`, `_rds`), so the edge cannot author a field nothing
 // reads. Unambiguous, so the ambiguity ratchet stays green: there is one honest
 // meaning here, and odin should not ask about it.
@@ -338,7 +338,7 @@ for (const member of sgMemberTypes) register('sg', member, 'sg');
 // queue. It rendered as a grey "Network" line, which describes neither.
 //
 // PRESENTATIONAL ONLY, and this is a safety property rather than a style
-// choice. Both consumers -- `agent/hcl.py`'s subscription pass and
+// choice. Both consumers -- `iac/hcl.py`'s subscription pass and
 // `reconcile/reconciler.py::_desired_subs` -- key on the two NODE kinds and
 // never read `edge.kind`, and every canvas saved before this change types the
 // edge `network`. If a builder ever started REQUIRING `kind === 'subscription'`
@@ -350,9 +350,40 @@ for (const member of sgMemberTypes) register('sg', member, 'sg');
 export const subscriptionTargetTypes = new Set(['sqs']);
 for (const queue of subscriptionTargetTypes) register('sns', queue, 'subscription');
 
+/**
+ * Does this pair have a raw-message-delivery choice to make?
+ *
+ * The NODE KINDS, not `edge.kind` -- the same rule the comment above states,
+ * for the same reason: every canvas saved before the `subscription` name
+ * existed stores `network`, and gating this on the name would hide the control
+ * from exactly those edges.
+ *
+ * Order-insensitive, because a user may draw the line either way and
+ * `spec/translate.py::_orient_subscription_edges` turns a backwards one into
+ * the same subscription. A panel that only offered the choice in one direction
+ * would leave half of them unauthorable.
+ */
+export function supportsRawMessageDelivery(sourceType: string, targetType: string): boolean {
+  const pair = new Set([sourceType, targetType]);
+  return pair.has('sns') && pair.has('sqs');
+}
+
+/**
+ * The edge's raw-delivery setting, with ABSENT meaning `true`.
+ *
+ * The mirror of `spec/translate.py::_edges`' `data.get("rawMessageDelivery")
+ * is not False`, and it has to agree with it exactly: every canvas drawn
+ * before the field existed has no such key, and reading that as `false` would
+ * change the envelope of every live subscription on the next apply. So the
+ * ONLY value that turns it off is a literal `false`.
+ */
+export function rawMessageDeliveryOf(data: Record<string, unknown> | undefined | null): boolean {
+  return data?.rawMessageDelivery !== false;
+}
+
 // "This workload assumes this role." Folded into the `role` FIELD the builder
 // already reads (`spec/translate.py::_merge_role_edges` ->
-// `agent/hcl.py::_lambda`), so the edge is another way to author a fact odin
+// `iac/hcl.py::_lambda`), so the edge is another way to author a fact odin
 // already consumes rather than a second source of truth beside it.
 //
 // Before this, `iam_role` declared no `iamActions` (correctly -- a role is not
@@ -374,7 +405,7 @@ for (const holder of roleHolderTypes) register('iam_role', holder, 'role');
 
 // W2.9: "this key encrypts that sidecar at rest." Folded into the field the
 // builder already reads -- a secret's `kmsKeyId` and a parameter's `keyId`
-// (`spec/translate.py::_merge_encryption_edges`) -- so `agent/hcl.py` gained a
+// (`spec/translate.py::_merge_encryption_edges`) -- so `iac/hcl.py` gained a
 // `kms_key_id`/`key_id` argument and no knowledge of edges at all.
 //
 // Limited to the kinds whose HCL actually reads such a field, the same rule
@@ -399,7 +430,7 @@ for (const t of encryptionTargetTypes) register('kms', t, 'encryption');
 // attachment nothing could perform, the same rule `sgMemberTypes` and
 // `roleHolderTypes` hold.
 //
-// PRESENTATIONAL, like `target` and `subscription`: `agent/hcl.py`'s
+// PRESENTATIONAL, like `target` and `subscription`: `iac/hcl.py`'s
 // attachment pass keys on the two NODE kinds and never reads `edge.kind`.
 // Gating it on the name would be the destructive change documented at the
 // `subscription` note above -- with a live volume the tear-down is worse, so
@@ -415,7 +446,7 @@ for (const host of volumeHostTypes) register('ebs', host, 'volume');
 // points AT: an `aws_route53_zone` on its own resolves nothing, so a route53
 // node with no dns edge is a real, empty hosted zone and says so.
 //
-// PRESENTATIONAL, like `target`, `subscription` and `volume`: `agent/hcl.py`'s
+// PRESENTATIONAL, like `target`, `subscription` and `volume`: `iac/hcl.py`'s
 // record pass keys on the two NODE KINDS and never reads `edge.kind`. Here that
 // is load-bearing rather than incidental -- `route53` has been a DRAWABLE
 // catalog tile since long before it had a builder, so canvases already exist
@@ -473,7 +504,7 @@ for (const target of dnsTargetTypes) register('route53', target, 'dns');
 // nothing with the line, which is the honest answer rather than a fuchsia one
 // implying a share that would be empty.
 //
-// PRESENTATIONAL, like `target`, `subscription` and `volume`: `agent/hcl.py`'s
+// PRESENTATIONAL, like `target`, `subscription` and `volume`: `iac/hcl.py`'s
 // mount pass keys on the two NODE kinds and never reads `edge.kind`, and it has
 // to stay that way, because the hazard here is LIVE.
 //
@@ -619,7 +650,7 @@ export function defaultPermissionsFor(
   // catalog: `ecs -> lambda` (lambda:Invoke) and `ec2 -> ecs` (ecs:RunTask).
   // For those the old rule produced `resourceType = ''` and therefore NO
   // permissions, so the user got a cyan IAM edge with nothing ticked, and
-  // downstream `agent/hcl.py` reserved an auto-role and emitted an
+  // downstream `iac/hcl.py` reserved an auto-role and emitted an
   // `aws_iam_role` carrying no policy at all.
   //
   // Asking "is this end an IAM target" answers it for every pair, and it is
@@ -638,7 +669,7 @@ export function defaultPermissionsFor(
   // way": `rds -> ecs` and `ecs -> rds` disagreed.
   //
   // The PRINCIPAL is what was actually missing. Only a compute kind can hold a
-  // role (`agent/hcl.py::_GRANTABLE_KINDS` plus lambda), so where exactly one
+  // role (`iac/hcl.py::_GRANTABLE_KINDS` plus lambda), so where exactly one
   // end is compute, THAT end is the principal and the other is the resource,
   // whichever way the line was drawn. The arrow only decides when both ends are
   // compute, which is the one case where it is the only thing that can.

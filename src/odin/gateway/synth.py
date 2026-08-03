@@ -555,7 +555,7 @@ async def pure_answer(
 # --- postprocess: forwarded for real, then observed/reshaped ----------------
 
 
-def _sqs_create_queue(resource: str, env: str, request_body: bytes, response_body: bytes, stores: SynthStores, gateway_host: str, now: float, path: str, query: dict[str, str]) -> bytes:
+def _sqs_create_queue(resource: str, env: str, request_body: bytes, response_body: bytes, stores: SynthStores, gateway_host: str, now: float, path: str, query: dict[str, str], absent: frozenset[str]) -> bytes:
     request = json.loads(request_body or b"{}")
     payload = json.loads(response_body)
     payload["QueueUrl"] = _rewrite_host(payload.get("QueueUrl", ""), gateway_host)
@@ -566,21 +566,21 @@ def _sqs_create_queue(resource: str, env: str, request_body: bytes, response_bod
     return json.dumps(payload).encode()
 
 
-def _sqs_delete_queue(resource: str, env: str, request_body: bytes, response_body: bytes, stores: SynthStores, gateway_host: str, now: float, path: str, query: dict[str, str]) -> bytes:
+def _sqs_delete_queue(resource: str, env: str, request_body: bytes, response_body: bytes, stores: SynthStores, gateway_host: str, now: float, path: str, query: dict[str, str], absent: frozenset[str]) -> bytes:
     state = stores.sqs_queues.get(env, resource, {"attributes": {}, "deleted_at": None})
     state["deleted_at"] = now
     stores.sqs_queues.set(env, resource, state)
     return response_body
 
 
-def _sns_create_topic(resource: str, env: str, request_body: bytes, response_body: bytes, stores: SynthStores, gateway_host: str, now: float, path: str, query: dict[str, str]) -> bytes:
+def _sns_create_topic(resource: str, env: str, request_body: bytes, response_body: bytes, stores: SynthStores, gateway_host: str, now: float, path: str, query: dict[str, str], absent: frozenset[str]) -> bytes:
     params = dict(parse_qsl(request_body.decode("utf-8")))
     stores.sns_topics.set(env, resource, _parse_map(params, "Attributes"))
     stores.tags.set(env, _tags_key("sns", resource), _tags_from_structs(_parse_struct_list(params, "Tags")))
     return response_body
 
 
-def _sns_fix_subscription_attributes(resource: str, env: str, request_body: bytes, response_body: bytes, stores: SynthStores, gateway_host: str, now: float, path: str, query: dict[str, str]) -> bytes:
+def _sns_fix_subscription_attributes(resource: str, env: str, request_body: bytes, response_body: bytes, stores: SynthStores, gateway_host: str, now: float, path: str, query: dict[str, str], absent: frozenset[str]) -> bytes:
     """goaws's LIVE GetSubscriptionAttributes answer includes an entry like
     `FilterPolicy = "null"` (the literal 4-char string) for every optional
     attribute nobody set -- verified against goaws's own wire response.
@@ -594,7 +594,7 @@ def _sns_fix_subscription_attributes(resource: str, env: str, request_body: byte
     return re.sub(rb"<entry><key>[^<]+</key><value>null</value></entry>", b"", response_body)
 
 
-def _sns_unsubscribe(resource: str, env: str, request_body: bytes, response_body: bytes, stores: SynthStores, gateway_host: str, now: float, path: str, query: dict[str, str]) -> bytes:
+def _sns_unsubscribe(resource: str, env: str, request_body: bytes, response_body: bytes, stores: SynthStores, gateway_host: str, now: float, path: str, query: dict[str, str], absent: frozenset[str]) -> bytes:
     params = dict(parse_qsl(request_body.decode("utf-8")))
     subscription_arn = params.get("SubscriptionArn", "")
     if subscription_arn:
@@ -602,13 +602,15 @@ def _sns_unsubscribe(resource: str, env: str, request_body: bytes, response_body
     return response_body
 
 
-def _ddb_create_table(resource: str, env: str, request_body: bytes, response_body: bytes, stores: SynthStores, gateway_host: str, now: float, path: str, query: dict[str, str]) -> bytes:
+def _ddb_create_table(resource: str, env: str, request_body: bytes, response_body: bytes, stores: SynthStores, gateway_host: str, now: float, path: str, query: dict[str, str], absent: frozenset[str]) -> bytes:
     request = json.loads(request_body or b"{}")
     stores.tags.set(env, _tags_key("dynamodb", resource), _tags_from_structs(request.get("Tags", [])))
     return response_body
 
 
-_PostprocessHandler = Callable[[str, str, bytes, bytes, SynthStores, str, float, str, dict[str, str]], bytes]
+_PostprocessHandler = Callable[
+    [str, str, bytes, bytes, SynthStores, str, float, str, dict[str, str], frozenset[str]], bytes
+]
 
 _POSTPROCESS_HANDLERS: dict[str, _PostprocessHandler] = {
     "sqs:CreateQueue": _sqs_create_queue,
@@ -634,6 +636,7 @@ def is_postprocess_action(action: str) -> bool:
 def postprocess(
     action: str, resource: str, env: str, request_body: bytes, response_body: bytes,
     stores: SynthStores, gateway_host: str, now: float, path: str, query: dict[str, str],
+    absent: frozenset[str] = frozenset(),
 ) -> bytes:
     """The (possibly rewritten) response body for a POSTPROCESS action --
     called only after a successful (<300) forward. `gateway_host` is the
@@ -650,5 +653,14 @@ def postprocess(
     CompleteMultipartUpload) are told apart only by the query. Without them the
     S3-notification hook would enqueue an empty key and fire once per uploaded
     PART; see `s3notify._writes`, which is where that is worked out. Do not
-    tidy them away because the other five handlers ignore them."""
-    return _POSTPROCESS_HANDLERS[action](resource, env, request_body, response_body, stores, gateway_host, now, path, query)
+    tidy them away because the other five handlers ignore them.
+
+    `absent` is the same kind of context one step further out: the keys
+    `app.py`'s PRE-forward probe found were not there, which is the one fact a
+    post-forward hook can never recover for itself, because an S3 delete
+    answers 204/`<Deleted>` either way. It DEFAULTS to empty rather than being
+    required, and empty suppresses nothing -- a caller that does not probe gets
+    exactly the behaviour this had before the parameter existed."""
+    return _POSTPROCESS_HANDLERS[action](
+        resource, env, request_body, response_body, stores, gateway_host, now, path, query, absent,
+    )

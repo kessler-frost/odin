@@ -43,7 +43,7 @@ from fastapi.testclient import TestClient
 from odin.compute.functions import container_name
 from odin.gateway.keys import OPERATOR_NODE_ID
 from odin.server import create_app
-from odin.agent.hcl import TfProject
+from odin.iac.hcl import TfProject
 from odin.simulate import workspace as workspace_mod
 from odin.spec.store import SpecStore
 

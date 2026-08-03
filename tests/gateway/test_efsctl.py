@@ -430,7 +430,7 @@ async def test_a_task_mounting_a_deleted_file_system_is_refused(stores, sink, ef
 async def test_a_read_only_mount_is_refused_not_silently_made_writable(stores, sink, efs, tmp_path):
     """odin's bind-mount renderer has no `:ro` form, so a `readOnly: true`
     mountPoint cannot be honoured -- and mounting it WRITABLE would leave a user
-    believing their data was protected when it is not. `agent/hcl.py` hardcodes
+    believing their data was protected when it is not. `iac/hcl.py` hardcodes
     `readOnly: false`, so this bites only a hand-written or IMPORTED taskdef.
 
     Mutation-test: delete the `_refuse_read_only` call and this fails."""
@@ -460,7 +460,7 @@ async def test_a_scoped_root_directory_is_refused_not_widened_to_the_whole_share
 
 
 async def test_the_root_directory_odin_really_emits_is_accepted(stores, sink, efs):
-    """The other half: `agent/hcl.py` emits `rootDirectory = "/"`, and a guard
+    """The other half: `iac/hcl.py` emits `rootDirectory = "/"`, and a guard
     that refused THAT would break every generated project."""
     created = await _create_fs(stores, sink, efs)
     taskdef = _taskdef(created["FileSystemId"])

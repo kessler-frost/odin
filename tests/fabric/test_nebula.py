@@ -21,6 +21,7 @@ from odin.fabric.nebula import (
     LighthouseManager,
     NebulaFabric,
     NebulaManager,
+    _rule_to_dict,
     ensure_network,
     firewall_only_change,
     mesh_state,
@@ -416,6 +417,50 @@ def test_sg_rules_to_firewall_icmp_has_no_ports(tmp_path):
     mgr = NebulaManager(tmp_path / "nebula", runner=FakeRunner())
     config = yaml.safe_load(mgr.generate_config("10.42.0.1", "127.0.0.1", rules))
     assert config["firewall"]["inbound"][0] == {"port": "any", "proto": "icmp", "cidr": "0.0.0.0/0"}
+
+
+def test_an_ipv6_only_permission_would_WIDEN_the_group():
+    """WHY THE IPv6 DECLINE IN `iac/hcl.py` IS NOT MERE PEDANTRY, pinned so the
+    reason in `docs/limits.md` cannot rot back into "just remove the check".
+
+    This compiler reads `IpRanges` and `UserIdGroupPairs`. A permission with
+    NEITHER falls through to the peerless branch, which nebula renders as
+    `host: any` -- so an `Ipv6Ranges`-only permission does not compile to
+    nothing, it compiles to ALLOW FROM EVERYONE ON THE MESH, where the author
+    wrote "from this one block". Dropping the decline without teaching this
+    function about `Ipv6Ranges` in the same change is a security regression,
+    not an ergonomic win.
+
+    The expected rule is spelled out in full rather than derived from the
+    permission: this is a test about what the compiler INVENTS when its input
+    says nothing, so nothing about the expectation may come from the input.
+
+    IT FAILS ON THE FIX TOO, and that is the design. Adding an `Ipv6Ranges`
+    loop here breaks this test (verified: it does), which is the point --
+    teaching the compiler IPv6 has to land together with removing the decline
+    in `iac/hcl.py` and rewriting the `docs/limits.md` entry, or odin ships an
+    IPv6 rule that renders as configuration and gates nothing. If you are
+    reading this because you just made it fail, that is the checklist."""
+    rules = sg_rules_to_firewall([{
+        "IpProtocol": "tcp", "FromPort": 443, "ToPort": 443,
+        "Ipv6Ranges": [{"CidrIpv6": "2001:db8::/32"}],
+    }])
+    assert [_rule_to_dict(r) for r in rules.inbound] == [
+        {"port": "443", "proto": "tcp", "host": "any"}
+    ]
+
+
+def test_odins_overlay_is_IPv4_which_is_what_an_ipv6_rule_could_never_match():
+    """The other half of the same entry. Nebula 1.10.3 parses an IPv6 firewall
+    CIDR happily (probed: `nebula -test` exits 0, and a garbage CIDR exits 1,
+    so the zero means accepted) and signs IPv6 overlay networks -- so the
+    blocker is HERE, not there. Every odin mesh member gets an address out of
+    this block, and a rule's CIDR is matched against a peer's OVERLAY address.
+
+    A literal, not `MeshNetwork().base_cidr` compared to itself: the point is
+    that the value is IPv4, and reading it from the subject would assert
+    nothing at all."""
+    assert MeshNetwork(network="probe").base_cidr == "10.42.0.0/16"
 
 
 # --- W2.6 piece 1: the union of a node's ASSIGNED security groups ---

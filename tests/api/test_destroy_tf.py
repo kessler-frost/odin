@@ -27,10 +27,20 @@ from odin.simulate.runner import SimulateBusy, TfResult, TofuNotInstalled
 from odin.spec.store import SpecStore
 from tests.api.test_apply import CANVAS, FakeRds, FakeRuntime
 from tests.api.test_apply_full import FakeAws
+from tests.substrates import NoVm
 
 
 def _app(tmp_path):
-    return create_app(runtime=FakeRuntime(), store=SpecStore(tmp_path), rds=FakeRds(), backings=False)
+    # `vm=NoVm()`: `/destroy` reclaims real Lima VMs and real Lima disks
+    # (`ec2compute.reclaim_env_instances`/`reclaim_env_disks`), and it now takes
+    # the app's OWN VM substrate rather than building a limactl-backed one
+    # itself. Without that seam every test in this file ran a real
+    # `limactl disk list` against the developer's machine -- measured, 18 of
+    # them. Nothing here asserts on a Lima disk, so the answer is unchanged;
+    # what changes is that it is odin's answer rather than the machine's.
+    return create_app(
+        runtime=FakeRuntime(), store=SpecStore(tmp_path), rds=FakeRds(), backings=False, vm=NoVm(),
+    )
 
 
 def _make_workspace(tmp_path, env: str = "default") -> None:
@@ -120,14 +130,14 @@ def test_destroy_reports_tofu_failure_and_keeps_the_desired_state_for_a_retry(tm
 class _BlindRuntime(FakeRuntime):
     """A machine odin cannot ask: `docker` will not answer at all."""
 
-    async def container_names(self):
+    async def container_names(self, env=None):
         raise RuntimeError("Cannot connect to the Docker daemon")
 
 
 class _CleanRuntime(FakeRuntime):
     """A machine that really has no container left for this env."""
 
-    async def container_names(self):
+    async def container_names(self, env=None):
         return []
 
 
@@ -146,6 +156,7 @@ def test_a_failed_destroy_says_the_reconciler_will_re_create_what_it_removed(tmp
     window, and what to do -- and must NOT claim the retry resumes."""
     app = create_app(
         runtime=_SurvivingRuntime(), store=SpecStore(tmp_path), rds=FakeRds(), aws=FakeAws(),
+        vm=NoVm(),
     )
     _write_state(tmp_path)
     app.state.tf_runner.destroy = _failing_destroy(1, ("Error: deleting S3 Bucket",))
@@ -192,7 +203,7 @@ def test_a_failed_destroy_with_nothing_visible_does_not_read_as_a_success(tmp_pa
     is naming what survived. Reachable for real: a timed-out destroy on a machine
     the containers have already left."""
     app = create_app(
-        runtime=_CleanRuntime(), store=SpecStore(tmp_path), rds=FakeRds(), backings=False,
+        runtime=_CleanRuntime(), store=SpecStore(tmp_path), rds=FakeRds(), backings=False, vm=NoVm(),
     )
     _make_workspace(tmp_path)  # a workspace with no state file -> no addresses
     app.state.tf_runner.destroy = _failing_destroy(-9, ("killed",), timed_out=True)
@@ -209,7 +220,7 @@ def test_a_destroy_that_cannot_list_containers_says_unknown_not_zero(tmp_path):
     docker daemon that would not answer, with the real reason in the server log
     only -- so "couldn't tell" wore the words of "there is nothing there"."""
     app = create_app(
-        runtime=_BlindRuntime(), store=SpecStore(tmp_path), rds=FakeRds(), backings=False,
+        runtime=_BlindRuntime(), store=SpecStore(tmp_path), rds=FakeRds(), backings=False, vm=NoVm(),
     )
     _write_state(tmp_path)
     app.state.tf_runner.destroy = _failing_destroy(1, ("boom",))
@@ -227,7 +238,7 @@ def test_nothing_visible_and_nothing_knowable_are_not_the_same_sentence(tmp_path
     folded into the nothing-standing sentence, because "odin can see nothing" is
     then a claim odin has no basis for."""
     app = create_app(
-        runtime=_BlindRuntime(), store=SpecStore(tmp_path), rds=FakeRds(), backings=False,
+        runtime=_BlindRuntime(), store=SpecStore(tmp_path), rds=FakeRds(), backings=False, vm=NoVm(),
     )
     _make_workspace(tmp_path)  # workspace, no state file -> tf_state == []
     app.state.tf_runner.destroy = _failing_destroy(-9, ("killed",), timed_out=True)
@@ -249,12 +260,20 @@ class _SurvivingRuntime(FakeRuntime):
     this env and one for a DIFFERENT env, so the residue report is proven to be
     env-scoped rather than a blanket listing."""
 
-    async def container_names(self):
-        return ["odin-rds-default-db", "odin-aws-s3-default", "odin-rds-other-db"]
+    _OWNER = {"odin-rds-default-db": "default", "odin-aws-s3-default": "default",
+              "odin-rds-other-db": "other"}
+
+    async def container_names(self, env=None):
+        # Honours `env` as `docker ps --filter label=odin-env=` does. odin used
+        # to filter these by NAME; since v0.8.21 the substrate filters, so a
+        # fake that ignored `env` would be testing a filter nothing runs.
+        return [n for n, e in self._OWNER.items() if env is None or e == env]
 
 
 def _surviving_app(tmp_path):
-    return create_app(runtime=_SurvivingRuntime(), store=SpecStore(tmp_path), rds=FakeRds(), backings=False)
+    return create_app(
+        runtime=_SurvivingRuntime(), store=SpecStore(tmp_path), rds=FakeRds(), backings=False, vm=NoVm(),
+    )
 
 
 def _write_state(tmp_path, env: str = "default") -> None:

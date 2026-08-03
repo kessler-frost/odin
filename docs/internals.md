@@ -26,7 +26,7 @@
                         v                         |
 +-----------------------------------------------+ |
 |                                               | |
-|          agent/hcl.py: canvas to HCL          | |
+|           iac/hcl.py: canvas to HCL           | |
 |                                               | |
 +-----------------------------------------------+ |
                         |                         |
@@ -86,7 +86,7 @@ Each hop is a module you can read on its own:
 | Stage | Module | What it owns |
 |---|---|---|
 | desired state | `spec/store.py` | append-only, content-addressed canvas revisions |
-| compile | `agent/hcl.py` | canvas to HCL, deterministic and model-free |
+| compile | `iac/hcl.py` | canvas to HCL, deterministic and model-free |
 | run | `simulate/runner.py` | `tofu apply`, bounded, with its output streamed |
 | serve AWS | `gateway/` | SigV4, request classification, IAM, the AWS APIs |
 | provision | `aws/`, `compute/` | Postgres, RustFS, goaws, dynalite, Lima VMs |
@@ -112,9 +112,9 @@ To regenerate this diagram after editing `docs/diagrams/*.mmd`:
   forwards to a backing or answers from its own per-service model store. EC2,
   VPC, SG, IAM, ECR, Lambda and ECS have no open-source AWS API to borrow, so odin
   owns the model and binds it to a substrate.
-- **Translation** (`src/odin/agent/`) is deterministic in both directions and
+- **Translation** (`src/odin/iac/`) is deterministic in both directions and
   no longer covers quite the same node kinds in both: canvas → Terraform
-  builds 23, and Terraform → canvas reads all 22 back across 36 resource types
+  builds 23, and Terraform → canvas reads all 22 back across 38 resource types
   that it models. The gap is `kms`, added in v0.8.18 — emitted and not yet
   imported, so a project carrying an `aws_kms_key` does not round-trip through
   the canvas. `efs` and `route53` (both v0.8.19) did NOT widen that gap: each
@@ -122,6 +122,13 @@ To regenerate this diagram after editing `docs/diagrams/*.mmd`:
   (`aws_route53_zone` plus the `aws_route53_record` companion an edge becomes)
   are why 32 became 36. Stated rather than rounded away, because "both directions" was
   true for eleven releases and is the sort of claim a reader keeps believing.
+  36 became 38 in v0.8.21 with **no new node kind at all**, which is the
+  interesting part: `aws_iam_instance_profile` and
+  `aws_lb_target_group_attachment` were resources odin's generator had always
+  written and its importer had never read, so odin's OWN output came back with
+  two `unsupported` entries. Every kind was covered and the round trip was still
+  broken — companion coverage is a separate count from kind coverage, which is
+  why this sentence quotes both.
 
   These three numbers are pinned by
   `tests/agent/test_import_coverage_is_honest.py`, which derives all three from
@@ -134,12 +141,58 @@ To regenerate this diagram after editing `docs/diagrams/*.mmd`:
   `len(hcl._BUILDERS)`, `len(set(import_tf._KIND.values()))`, and
   `len(set(import_tf._KIND) | companions)` are what the ratchet reads. Anything odin
   does not model is a LISTED unsupported entry rather than a silent omission.
+
+  **Resource-type coverage and ARGUMENT coverage are a third separate count, and
+  v0.8.22 is where it was first measured.** A type odin recognises is kept out of
+  `unsupported` by that recognition, and an argument in a carried set is kept out
+  of the "unmodeled attribute(s)" line by that membership — so a registry entry
+  is a promise, and membership actively SUPPRESSES the warning that would
+  otherwise name a loss. Sweeping all **179** entries as they then stood, each
+  set to a value `hcl.py`'s own defaults cannot reproduce, found **20 promises
+  that were silent** — every one of them `unsupported == []` and
+  `warnings == []`:
+
+  * a `WEBSOCKET` API imported as HTTP. Its `_FIXED_VALUES` entry had been
+    *described in a comment* since v0.8.19 and never written, which is the
+    audit's own lesson in one line.
+  * an integration's `integration_type`, `payload_format_version` and
+    `integration_method` — none of which can be a `_FIXED_VALUES` entry, because
+    odin emits a different set per target kind. A `payload_format_version = 1.0`
+    hands the function a different event shape and said nothing.
+  * a route or stage attached to an API outside the file, and a route whose
+    `target` names an integration this import did not recover: the path is served
+    not at all afterwards.
+  * an `aws_ecs_cluster` named anything but `odin`, a service whose `cluster`
+    reference leaves the file, a task definition's `family`, `network_mode` and
+    `requires_compatibilities`, and its `timeouts` block.
+  * an `aws_key_pair`'s `key_name` and an `aws_iam_role_policy`'s `name` — both
+    real AWS resources renamed, the `aws_iam_instance_profile` defect v0.8.21
+    fixed, in the two types beside it in the same dispatch.
+  * a target group's `vpc_id`, a stage's `auto_deploy`, and a listener's
+    `default_action` — a listener that redirected to HTTPS or returned a fixed
+    403 came back FORWARDING that traffic to the backend.
+  * the two worst, both of which are how real Terraform is actually written: a
+    `container_definitions` spelled `jsonencode([...])` came back carrying odin's
+    DEFAULT `nginx:alpine` image rather than the user's container, and an
+    `aws_iam_role_policy` spelled `jsonencode({...})` dropped the grant outright
+    — so importing a hand-written project lost its entire IAM posture and
+    reported a clean import.
+
+  All 20 are named now, and `tests/agent/test_carried_promises.py` holds every
+  entry to a hand-written verdict — `carried`, `named` or `declined` — so a new
+  entry is unchecked until somebody decides which it is. The verdict table is
+  parametrized over ITSELF rather than over the registry, because a test that
+  draws its cases from the thing it guards loses the case when the entry is
+  deleted, and a run with fewer tests reads as success.
   Equal node coverage is **not lossless**, and what it costs is listed rather
   than discovered: a security group's IPv6 rules and any port that is not a
-  literal number, a Lambda's body when only the HCL text is read, and — until the
+  literal, a Lambda's body when only the HCL text is read, and — until the
   reader learns them — the `odin:ref:` tags and `egress` blocks the generator now
   writes. Port RANGES were on that list until v0.8.17 and are not any more: the
-  grammar takes `tcp:8000-8100:0.0.0.0/0` and both bounds round-trip. A drawn IAM
+  grammar takes `tcp:8000-8100:0.0.0.0/0` and both bounds round-trip. Nor is
+  `-1`, since v0.8.21: an ICMP rule (`from_port = -1`, which python-hcl2 renders
+  as the interpolation `${-1}`, which is why it read as an expression) survives
+  the round trip byte for byte. A drawn IAM
   permission is no longer among them: since v0.8.11 it is a real
   `aws_iam_role_policy`, and since v0.8.14 its `Resource` is a real ARN, so the
   generated file grants on Amazon what it grants here. See Known limits.

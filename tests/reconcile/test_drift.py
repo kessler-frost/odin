@@ -60,7 +60,7 @@ class FakeContainers:
         self.calls = 0
         self.status_calls: list[str] = []
 
-    async def container_names(self) -> list[str]:
+    async def container_names(self, env=None) -> list[str]:
         self.calls += 1
         if self.error is not None:
             raise self.error

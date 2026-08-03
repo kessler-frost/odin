@@ -53,7 +53,9 @@ TOPIC_ARN = "arn:aws:sns:us-east-1:000000000000:fanout"
 # and one that never did. Two facts, and the second is the interesting one:
 # the element shape is exactly `<DeleteResult><Deleted><Key>`, and a key that
 # NEVER EXISTED comes back as `<Deleted>` with no `<Error>` at all -- correct
-# S3 idempotency, and the source of the documented over-fire below.
+# S3 idempotency, and the reason the RESPONSE can never decide whether to fire.
+# What decides is `app.py`'s pre-forward HEAD probe, which arrives here as the
+# `absent` argument to `_post`.
 MEASURED_DELETE_RESULT = (
     b'<?xml version="1.0" encoding="UTF-8"?>'
     b'<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
@@ -106,10 +108,12 @@ async def _pure(stores: SynthStores, req) -> Response:
     return response
 
 
-def _post(stores: SynthStores, req, response_body: bytes = b"") -> bytes:
+def _post(stores: SynthStores, req, response_body: bytes = b"", absent: frozenset[str] = frozenset()) -> bytes:
     action, resource, path, query = _classified(req)
     assert synth.is_postprocess_action(action), f"{action} is not registered for postprocess"
-    return synth.postprocess(action, resource, ENV, req.body, response_body, stores, "127.0.0.1:4266", 0.0, path, query)
+    return synth.postprocess(
+        action, resource, ENV, req.body, response_body, stores, "127.0.0.1:4266", 0.0, path, query, absent,
+    )
 
 
 def _pending(stores: SynthStores) -> list[dict]:
@@ -576,18 +580,18 @@ async def test_a_multi_object_delete_enqueues_per_key_the_backing_reported_delet
     assert [record["key"] for record in _pending(stores)] == ["does/not/exist.jpg", "incoming/a.jpg"]
 
 
-async def test_deleting_a_key_that_never_existed_over_fires_a_removal(stores, sink, s3):
-    """A DOCUMENTED DIVERGENCE FROM REAL AWS, pinned so it cannot drift into
-    being an unnoticed one. `docs/limits.md` carries it in these words.
+async def test_a_key_the_probe_found_ABSENT_fires_nothing(stores, sink, s3):
+    """The over-fire this file used to pin as a documented divergence.
 
-    The probe deleted `incoming/a.jpg` (which existed) and
-    `does/not/exist.jpg` (which never did). RustFS reported BOTH as `<Deleted>`
-    with zero `<Error>` entries -- correct S3 behaviour, since DeleteObjects is
-    idempotent. Real AWS fires no `s3:ObjectRemoved` for the second, because
-    nothing was removed; odin fires one, because the response carries no signal
-    that separates the two and `postprocess` runs after the forward. Over-firing
-    is milder than never firing, but it is still odin reporting something that
-    did not happen, so it is written down rather than left silent."""
+    RustFS reported BOTH keys as `<Deleted>` with zero `<Error>` entries --
+    correct S3 behaviour, since DeleteObjects is idempotent, and the reason the
+    RESPONSE can never separate them. What separates them is `app.py`'s
+    pre-forward HEAD probe, whose answer arrives here as `absent`. Real AWS
+    fires nothing for a key that was not there, and now neither does odin.
+
+    The expected list is spelled out in full rather than derived from the
+    input: a test that filtered the same tuple the source filters would pass
+    for a `_writes` that had stopped filtering at all."""
     await _configure(stores, sink, s3, {"LambdaFunctionConfigurations": [
         {"Id": "removed", "LambdaFunctionArn": LAMBDA_ARN, "Events": ["s3:ObjectRemoved:*"]},
     ]})
@@ -595,10 +599,116 @@ async def test_deleting_a_key_that_never_existed_over_fires_a_removal(stores, si
         Bucket=BUCKET, Delete={"Objects": [{"Key": "incoming/a.jpg"}, {"Key": "does/not/exist.jpg"}]},
     ))
 
-    _post(stores, captured, MEASURED_DELETE_RESULT)
+    _post(stores, captured, MEASURED_DELETE_RESULT, absent=frozenset({"does/not/exist.jpg"}))
 
-    fired = [record["key"] for record in _pending(stores)]
-    assert "does/not/exist.jpg" in fired, "the documented over-fire; real AWS sends nothing here"
+    assert [record["key"] for record in _pending(stores)] == ["incoming/a.jpg"]
+
+
+async def test_a_single_object_delete_of_an_absent_key_fires_nothing(stores, sink, s3):
+    """The same fix on the other delete shape. `DELETE /{b}/{k}` answers 204
+    whether or not the key was there (MEASURED against rustfs/rustfs:latest,
+    2026-08-03), so this one needs the probe just as much -- and it used to be
+    covered by nothing at all, since only the multi-object shape had a test."""
+    await _configure(stores, sink, s3, {"LambdaFunctionConfigurations": [
+        {"Id": "removed", "LambdaFunctionArn": LAMBDA_ARN, "Events": ["s3:ObjectRemoved:*"]},
+    ]})
+
+    _post(
+        stores, sink.call(lambda: s3.delete_object(Bucket=BUCKET, Key="incoming/a.jpg")),
+        absent=frozenset({"incoming/a.jpg"}),
+    )
+
+    assert _pending(stores) == []
+
+
+async def test_an_EMPTY_absent_set_suppresses_nothing(stores, sink, s3):
+    """The fail-open polarity, pinned. `_absent_keys` returns only keys the
+    backing definitely 404'd, so a probe that timed out, was refused, or never
+    ran hands back an empty set -- and an empty set must leave every key
+    firing. Inverting the sense (an `existing` set that must CONTAIN a key for
+    it to fire) would turn every one of those failures into silence."""
+    await _configure(stores, sink, s3, {"LambdaFunctionConfigurations": [
+        {"Id": "removed", "LambdaFunctionArn": LAMBDA_ARN, "Events": ["s3:ObjectRemoved:*"]},
+    ]})
+    captured = sink.call(lambda: s3.delete_objects(
+        Bucket=BUCKET, Delete={"Objects": [{"Key": "incoming/a.jpg"}, {"Key": "does/not/exist.jpg"}]},
+    ))
+
+    _post(stores, captured, MEASURED_DELETE_RESULT, absent=frozenset())
+
+    assert [record["key"] for record in _pending(stores)] == ["does/not/exist.jpg", "incoming/a.jpg"]
+
+
+# --- what the pre-forward probe asks about, and what it costs ----------------
+
+
+async def test_a_bucket_with_no_notification_is_never_probed(stores, sink, s3):
+    """The whole cost argument. `probe_keys` returns nothing for a bucket that
+    has no configuration, so `app.py` issues no HEAD at all -- which is every
+    bucket until someone draws a notification onto one."""
+    captured = sink.call(lambda: s3.delete_object(Bucket=BUCKET, Key="incoming/a.jpg"))
+    _action, resource, path, query = _classified(captured)
+
+    assert s3notify.probe_keys(stores, ENV, resource, path, query, captured.body) == ()
+
+
+async def test_only_a_REMOVAL_configuration_makes_a_delete_worth_probing(stores, sink, s3):
+    """A bucket whose only configuration is `ObjectCreated` fires nothing on a
+    delete, so probing its keys would buy an answer nobody reads."""
+    await _configure(stores, sink, s3, {"LambdaFunctionConfigurations": [
+        {"Id": "created", "LambdaFunctionArn": LAMBDA_ARN, "Events": ["s3:ObjectCreated:*"]},
+    ]})
+    captured = sink.call(lambda: s3.delete_object(Bucket=BUCKET, Key="incoming/a.jpg"))
+    _action, resource, path, query = _classified(captured)
+
+    assert s3notify.probe_keys(stores, ENV, resource, path, query, captured.body) == ()
+
+
+async def test_the_probe_is_scoped_to_the_keys_the_filter_would_fire_for(stores, sink, s3):
+    """A `prefix`/`suffix` filter narrows what is probed, not just what fires.
+    Both expected tuples are literals: deriving them from `matches` would be
+    the source grading its own homework."""
+    await _configure(stores, sink, s3, {"LambdaFunctionConfigurations": [
+        {"Id": "jpgs", "LambdaFunctionArn": LAMBDA_ARN, "Events": ["s3:ObjectRemoved:*"], "Filter": {"Key": {
+            "FilterRules": [{"Name": "prefix", "Value": "incoming/"}, {"Name": "suffix", "Value": ".jpg"}],
+        }}},
+    ]})
+    captured = sink.call(lambda: s3.delete_objects(Bucket=BUCKET, Delete={"Objects": [
+        {"Key": "incoming/a.jpg"}, {"Key": "incoming/b.txt"}, {"Key": "elsewhere/c.jpg"},
+    ]}))
+    _action, resource, path, query = _classified(captured)
+
+    assert s3notify.probe_keys(stores, ENV, resource, path, query, captured.body) == ("incoming/a.jpg",)
+
+
+async def test_the_probe_reads_the_multi_object_keys_out_of_the_REQUEST(stores, sink, s3):
+    """`POST /{b}?delete` carries its keys in the body and none in the path,
+    and the probe runs BEFORE the response exists -- so this is the one list it
+    can be built from. Spelled out in full, in wire order."""
+    await _configure(stores, sink, s3, {"LambdaFunctionConfigurations": [
+        {"Id": "removed", "LambdaFunctionArn": LAMBDA_ARN, "Events": ["s3:ObjectRemoved:*"]},
+    ]})
+    captured = sink.call(lambda: s3.delete_objects(Bucket=BUCKET, Delete={"Objects": [
+        {"Key": "incoming/a.jpg"}, {"Key": "does/not/exist.jpg"},
+    ]}))
+    _action, resource, path, query = _classified(captured)
+
+    assert s3notify.probe_keys(stores, ENV, resource, path, query, captured.body) == (
+        "incoming/a.jpg", "does/not/exist.jpg",
+    )
+
+
+async def test_an_unparseable_delete_body_probes_nothing_rather_than_raising(stores, sink, s3):
+    """Fail-open at the other end of the same path: a body odin cannot read
+    yields no probe keys, an empty `absent`, and therefore today's behaviour --
+    not a 500 on a delete that would otherwise have succeeded."""
+    await _configure(stores, sink, s3, {"LambdaFunctionConfigurations": [
+        {"Id": "removed", "LambdaFunctionArn": LAMBDA_ARN, "Events": ["s3:ObjectRemoved:*"]},
+    ]})
+    captured = sink.call(lambda: s3.delete_objects(Bucket=BUCKET, Delete={"Objects": [{"Key": "a.txt"}]}))
+    _action, resource, path, query = _classified(captured)
+
+    assert s3notify.probe_keys(stores, ENV, resource, path, query, b"} not xml {") == ()
 
 
 async def test_a_key_the_backing_reported_as_FAILED_does_not_enqueue(stores, sink, s3):

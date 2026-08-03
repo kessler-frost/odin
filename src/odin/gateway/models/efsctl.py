@@ -101,7 +101,7 @@ _ID_HEX = 17
 # AWS's own `LocalMountPath` pattern, copied from botocore's lambda model
 # rather than remembered: `/mnt/` plus ONE path segment. `/mnt/efs` is legal,
 # `/mnt/efs/data` is NOT -- there is no second slash in it. The tile's `path`
-# is validated against this by `agent/hcl.py` before a project is generated;
+# is validated against this by `iac/hcl.py` before a project is generated;
 # it is repeated here because a mount that reaches this module by any other
 # route (an imported project, a hand-written taskdef) has never been through
 # that check.
@@ -543,7 +543,7 @@ def _refuse_read_only(point: dict, referrer: str) -> None:
     ECS honours the flag, so accepting it here would also be a canvas that
     behaves differently on Amazon.
 
-    `agent/hcl.py` hardcodes `readOnly: false`, so no odin-generated project can
+    `iac/hcl.py` hardcodes `readOnly: false`, so no odin-generated project can
     reach this. It bites only a hand-written or IMPORTED task definition -- which
     is exactly the case v0.8.12 exists to honour, so it is worth refusing loudly
     rather than leaving as a trap."""
@@ -567,7 +567,7 @@ def _refuse_subdirectory(path: str, referrer: str, field: str) -> None:
     silently receiving the WHOLE file system, including every other consumer's
     files. That is a confidentiality answer, not a cosmetic one.
 
-    `agent/hcl.py` always emits `/`, so no odin-generated project reaches this;
+    `iac/hcl.py` always emits `/`, so no odin-generated project reaches this;
     a hand-written or imported one can."""
     if path not in ("", "/"):
         raise MountUnavailable(
@@ -594,7 +594,7 @@ def function_mounts(stores: SynthStores, env: str, file_system_configs: list) ->
     is documented as an access-point ARN and botocore's own pattern demands
     `access-point/fsap-[a-f0-9]{17}$` -- so this resolves Arn -> access point ->
     file system -> directory. Handing it a file-system ARN would be a project
-    real AWS rejects, which is exactly why `agent/hcl.py` emits a companion
+    real AWS rejects, which is exactly why `iac/hcl.py` emits a companion
     `aws_efs_access_point` for a canvas with a lambda mount edge."""
     mounts: dict[str, str] = {}
     for config in file_system_configs or []:

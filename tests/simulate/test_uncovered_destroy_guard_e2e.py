@@ -30,7 +30,7 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 from fastapi.testclient import TestClient
 
-from odin.agent import hcl
+from odin.iac import hcl
 from odin.agent import translate as translate_mod
 from odin.cli import http
 from odin.gateway.keys import OPERATOR_NODE_ID

@@ -4,6 +4,51 @@ Every one of these is a thing odin does not do, or does differently from AWS.
 They are listed because finding one by surprise is worse than reading it here.
 
 
+## If you take the generated Terraform to real AWS
+
+Most of this file does NOT follow you there, and the split is worth knowing
+before you read 60 entries trying to work it out.
+
+`main.tf` is portable by construction: **no `endpoints` block, no `skip_*`
+flags, no credentials**. Everything that redirects AWS calls at odin lives in a
+runtime-generated `override.tf` and environment variables, never in the file
+you would commit. It is `tofu fmt`-canonical and passes a real `tofu validate`.
+
+**What evaporates on real AWS — most of this document.** Every limit that is
+about how odin FULFILLS a call locally stops existing the moment AWS fulfills it
+instead: RustFS rejecting every notification ARN, an EBS attach rebooting the
+instance because Lima has no hot-attach verb, `device_name` being advisory
+(`/dev/sdf` in, `/dev/vdb` out), the mesh covering VMs and RDS but not
+containers, odin's process sitting in the data path for an ECS route. None of
+that is in the HCL. (An S3 removal over-firing for a key that never existed was
+in this list until v0.8.21, when it stopped happening locally too — see the
+entry below for what the pre-forward probe costs.)
+
+**What FOLLOWS you — the emitted HCL is a real but NARROW subset.** These are
+choices baked into the generated file, so they are what you would actually get:
+
+- **Every ALB is `internal = true`.** Deliberate: odin has no internet gateway,
+  so an internet-facing scheme would be a claim nothing backs. On real AWS you
+  get an internal-only load balancer, and only `application` type — no NLB.
+- **ECS is `launch_type = "EC2"` with `requires_compatibilities = ["EC2"]` and
+  no `network_configuration`.** So no Fargate, and no awsvpc-style ENIs.
+- **No `aws_internet_gateway`.** A VPC with no route to the internet.
+- **API Gateway: the `$default` stage only, payload format 2.0 only, and no
+  authorizers** — every route is `authorization_type = "NONE"`, i.e. public.
+- **An SNS→SQS subscription defaults to `raw_message_delivery = true`.**
+  Authorable per edge since v0.8.21, so it follows you as whatever you
+  chose; an edge nobody touched still emits `true`.
+- **A security group is IPv4-only**, and its rule ports must be literals.
+- **Some arguments are re-emitted with odin's own value whatever you wrote** —
+  those are enumerated further down, and they apply on real AWS too.
+
+So: odin generates real, valid, portable AWS Terraform **of the subset it
+models**. Nothing in it is odin-specific and nothing would break an apply. What
+you would hit is not breakage but SCOPE — an internal ALB where you wanted
+internet-facing, EC2 launch type where you wanted Fargate, no IGW.
+
+
+
 - **A Lambda's CODE needs the whole directory, not just the HCL.** A function's
   body lives in a zip beside `main.tf`, so `odin translate import <dir>` recovers
   it and reading HCL text alone cannot — in that case the node comes back with
@@ -113,27 +158,66 @@ They are listed because finding one by surprise is worse than reading it here.
   mesh takes one firewall-only reload (a SIGHUP; no tunnel is dropped). Byte-
   identical would have needed the wide-open rule special-cased back into
   `host: any`, making it the one rule odin compiles unlike every other.
-- **A security group is IPv4 only.** An IPv6 CIDR in either rule field is
-  declined with that reason, and the reason is real rather than a parser
-  limitation: `sg_rules_to_firewall` compiles `IpRanges` and `UserIdGroupPairs`
-  and nothing else, so an IPv6 rule would be carried by Terraform, stored by the
-  gateway, visible in `tofu plan`, and enforced by nothing. Making it real is a
-  Nebula change, not a canvas one. One bad line still declines the whole group,
-  deliberately: silently dropping one rule from a firewall is worse than
-  refusing the group.
-- **A security group's rule port must be a literal number or range.**
-  `tcp:443:0.0.0.0/0` or `tcp:8000-8100:0.0.0.0/0`, in either rule field. This
-  entry used to read "a single port each … an imported ingress block with a port
-  RANGE is reported and left out, and the regenerated group allows *less* than
-  the source", and that was a correctness bug wearing a limit's clothes: a round
-  trip through odin handed back a NARROWER firewall than the Terraform you gave
-  it. Since v0.8.17 both bounds survive import → canvas → regenerate, and a
-  single port is simply the degenerate range, so every canvas drawn before this
-  emits byte-identical HCL. What is still left out is a port that is not a
-  literal number — `from_port = var.port`, or any computed expression — which is
-  named and counted like any other unimportable rule. A MALFORMED range
-  (`8000-`, `8100-8000`, `8000 - 8100`) declines the whole group and names the
-  offending line; it is never half-parsed into its low bound.
+- **A security group is IPv4 only, and the blocker is ODIN'S OVERLAY, not
+  Nebula.** An IPv6 CIDR in either rule field is declined with that reason.
+  This entry used to end "making it real is a Nebula change, not a canvas one",
+  and that sent the next reader at the wrong component — MEASURED against
+  nebula 1.10.3 (the pinned version, `compute/cloud_init.py::NEBULA_VERSION`)
+  on 2026-08-03:
+
+  - a firewall rule of `cidr: 2001:db8::/32` loads fine — `nebula -test` exits
+    **0**. The probe discriminates: `cidr: not-a-cidr` exits **1** with
+    `firewall.inbound rule #0; cidr did not parse; netip.ParsePrefix(...)`, so
+    the zero is nebula accepting the prefix, not nebula ignoring the field.
+  - `nebula-cert sign -networks fd00::1/64` succeeds and prints a v2
+    certificate whose `networks` is `["fd00::1/64"]`. Nebula does IPv6
+    overlays.
+
+  What actually stops it is one line of odin: `fabric/models.py::MeshNetwork`
+  hands out `10.42.0.0/16`, so **every member of every odin mesh has an IPv4
+  overlay address**, and nebula matches a rule's CIDR against that. An IPv6
+  rule would therefore be a rule that can never match a peer — real, enforced,
+  and matching nothing. Making it mean something is dual-stack overlay
+  addressing (cert signing, `static_host_map`, the lighthouse, sticky IP
+  allocation), which is a large change and not one this entry is waiting on.
+
+  **Do not "just remove the decline" — measured, that WIDENS the group.**
+  `sg_rules_to_firewall` reads `IpRanges` and `UserIdGroupPairs` and nothing
+  else, and its last branch turns a permission with neither into a peerless
+  rule. An IPv6-only permission compiles today to
+  `{'port': '443', 'proto': 'tcp', 'host': 'any'}` — "allow 443 from anyone on
+  the mesh" where the author wrote "allow 443 from this one block". That is
+  worse than the refusal by a wide margin, and
+  `tests/fabric/test_nebula.py::test_an_ipv6_only_permission_would_WIDEN_the_group`
+  pins it so the reason cannot rot back into a suggestion.
+
+  One bad line still declines the whole group, deliberately: silently dropping
+  one rule from a firewall is worse than refusing the group.
+- **A security group's rule port must be a literal — `443`, `8000-8100`, or
+  `-1` — never a computed expression.** In either rule field. The entry has now
+  shed the same bug TWICE, and both times it was a correctness bug wearing a
+  limit's clothes: a round trip through odin handed back a NARROWER firewall
+  than the Terraform you gave it. Port RANGES were the first (fixed v0.8.17,
+  both bounds survive import → canvas → regenerate). `-1` was the second, fixed
+  in v0.8.21 — and it is the most literal number in the whole AWS
+  security-group model, because an ICMP rule is `from_port = -1, to_port = -1`,
+  which is exactly what the console writes for "allow ping". MEASURED on the
+  real path before the fix: a group carrying one `tcp:443` rule and one ICMP
+  rule imported as `ingressRules = 'tcp:443:0.0.0.0/0'`, warned that "a port
+  that is not a literal number … is left out", and regenerated with no ping.
+  The cause was not where that warning pointed: **python-hcl2 renders `-1` as
+  the interpolation `'${-1}'`**, so odin's literal check saw an expression.
+  `-1` is taken only for `icmp`, `icmpv6` and protocol `-1` — the ones with no
+  ports to name — because `fabric/nebula.py` passes the port through verbatim
+  for anything else and a verbatim `-1` makes the nebula daemon refuse to
+  start; `tcp:-1:…` is declined and now says so in those words instead of
+  claiming a malformed range. What is genuinely still left out is a port that
+  is not a literal at all — `from_port = var.port`, or any computed expression
+  — which is named and counted like any other unimportable rule; reading a
+  wrapped literal is not the same as evaluating HCL, and odin does not evaluate
+  it. A MALFORMED range (`8000-`, `8100-8000`, `8000 - 8100`) declines the
+  whole group and names the offending line; it is never half-parsed into its
+  low bound.
 - **A workload's `${{producer.ATTR}}` references are carried as TAGS, and the
   resolved values still are not.** The distinction the design rests on: a
   reference names a producer and an attribute, while the string it resolves to
@@ -170,8 +254,8 @@ They are listed because finding one by surprise is worse than reading it here.
   single-node Redis, so a three-node memcached cluster comes back as one Redis —
   it now says so); a DynamoDB table's `billing_mode`; a bucket's `force_destroy`;
   an RDS `skip_final_snapshot` and `allocated_storage`; a log group's
-  `retention_in_days`; a secret's `recovery_window_in_days`; a subscription's
-  `raw_message_delivery`; and **any resource name odin takes from the HCL block
+  `retention_in_days`; a secret's `recovery_window_in_days`; and **any resource
+  name odin takes from the HCL block
   label instead of the `name` you wrote** — which is what happens whenever the
   real name is computed, so a project whose names come from variables gets
   renamed on import and is told.
@@ -281,7 +365,7 @@ They are listed because finding one by surprise is worse than reading it here.
   resolve and then fail to connect — a green resource that does not work. Only
   `ec2` publishes a bare address (`PRIVATE_IP`), so `route53 ↔ ec2` is the whole
   of the edge; every other target stays `unmodelled` on the canvas and
-  `agent/hcl.py::_dns_target_unsupported` names the target and the reason in the
+  `iac/hcl.py::_dns_target_unsupported` names the target and the reason in the
   apply's `unsupported` list.
   The emitted TTL (60s) exists so the generated project stays portable to Amazon;
   odin's own substrate is a hosts FILE and has no TTL at all, so a changed
@@ -295,7 +379,7 @@ They are listed because finding one by surprise is worse than reading it here.
   to say. Measured 2026-08-03 on a real Lima VM.
 
   **That is inside the contract odin publishes, not a defect against it.** Every
-  record carries `ttl = 60` (`agent/hcl.py::_DNS_RECORD_TTL`), so a resolver is
+  record carries `ttl = 60` (`iac/hcl.py::_DNS_RECORD_TTL`), so a resolver is
   entitled to keep answering for up to a minute; real Route 53 defaults an A
   record to 300s. The 2.2s is ~27× tighter than odin's own TTL and ~136× tighter
   than AWS's default.
@@ -324,15 +408,6 @@ They are listed because finding one by surprise is worse than reading it here.
   odin record; `getent hosts` and any ordinary client library will. Stated
   because "Route 53 works" and "names resolve" are the same sentence to most
   readers and only the second one is true here.
-- **A hosted zone's tags are replayed, but tag REMOVAL on a re-apply is
-  untested.** `ChangeTagsForResource` is really sent on create (measured
-  through a real `tofu apply`, and `ListTagsForResource` must replay it or the
-  provider plans a perpetual diff — the plan is `-detailed-exitcode` 0, so the
-  create path is confirmed). `RemoveTagKeys` is implemented and unit-tested, but
-  no real provider was ever observed sending one: if it instead sends a full
-  replacement, a removed tag would linger. Named here rather than discovered,
-  because the only tag odin itself writes is `odin:node`, which is what
-  `reconcile/tf_status.py` recovers the canvas label from.
 - **A `dns` record resolves to a DIFFERENT address depending on who is asking,
   and for a VM with no mesh it does not resolve at all.** This is the sharper
   half of the entry above and it was got wrong first time, so it is stated in
@@ -433,7 +508,7 @@ They are listed because finding one by surprise is worse than reading it here.
   decorative-permission bug; use the destination name, which `odin logs --node
   <label>` and `/world` still resolve for you through the `odin:node` tag.
   (b) `odin import-tf` reads a group's label from its `name` argument
-  (`agent/import_tf.py::_label` prefers the literal over the tag), so importing
+  (`iac/import_tf.py::_label` prefers the literal over the tag), so importing
   the generated file back labels the node `/aws/lambda/myfn`. The file then
   regenerates byte-identically and the edge and policy stay self-consistent —
   it is a visible label change, not a broken round trip.
@@ -528,7 +603,7 @@ They are listed because finding one by surprise is worse than reading it here.
   `apigateway → lambda` route needs, so it is deliberately built once, there,
   rather than twice.
 - **A `role` edge works for lambda only.** `iam_role → lambda` folds into the
-  lambda's `role` field, which is what `agent/hcl.py` already reads, so the edge
+  lambda's `role` field, which is what `iac/hcl.py` already reads, so the edge
   really does decide the execution role in the generated Terraform. **ec2 and ecs
   reach a role differently** — an auto-generated role plus an instance profile /
   `task_role_arn`, with no `role` field anywhere — so odin does *not* offer a
@@ -540,7 +615,7 @@ They are listed because finding one by surprise is worse than reading it here.
   resolve: the alphabetically lowest role name wins, deterministically, so the
   generated file never depends on edge ordering. Nothing reports the conflict.
 - **`edge.kind` decides nothing in any BUILDER.** The subscription and ALB passes
-  in `agent/hcl.py`, and `reconcile/reconciler.py::_desired_subs`, all match on
+  in `iac/hcl.py`, and `reconcile/reconciler.py::_desired_subs`, all match on
   the two NODE kinds and never read the edge's kind — so an `iam`-typed line
   between an SNS node and an SQS node still emits a real
   `aws_sns_topic_subscription`. `odin chat` now refuses an edge kind odin does
@@ -568,24 +643,20 @@ They are listed because finding one by surprise is worse than reading it here.
   v0.8.15; the default is now `rds:DescribeDBInstances`, which is classified and
   enforced, and what a user drawing that line usually wants is the `connection`
   edge above.
-- **SNS→SQS subscriptions** are all generated with `raw_message_delivery = true`,
-  so the queue gets the published body verbatim rather than SNS's JSON envelope,
-  and that holds on an import round trip even if your `.tf` said otherwise. It
-  keeps `tofu apply` and Apply delivering identically, but it changes what a
-  consumer reads.
-- **`odin env rm` refuses when another environment's name ends with this one's.**
-  One of its checks before deleting anything is "does this machine still have a
-  container of this env's", and it answers that from odin's container *naming*
-  (`odin-aws-rustfs-<env>`, `odin-rds-<env>-…`) rather than a label, so a
-  `-`-suffix collision reads across. (Its volume reclaim, which runs after that
-  check, has no such collision — it is scoped to the `odin.env` label. See the
-  RDS-volume entry below.) Measured: with `a` and `b-a` both live,
-  removing `a` sees `odin-aws-rustfs-b-a` and stops, having deleted nothing —
-  `odin env rm b-a` first, or rename. It errs this way on purpose: refusing a
-  legitimate removal is recoverable, and deleting the last record of a running
-  container is not. Nothing else about the two environments is affected; the
-  matching rule is the same one a failed `odin destroy` uses to report what
-  survived.
+- **Changing `raw_message_delivery` on an ALREADY-LIVE subscription only takes
+  effect through Simulate, not through Apply.** The flag is authorable per edge
+  since v0.8.21 and both paths honour it when the subscription is CREATED —
+  `iac/hcl.py` emits it and `aws/backings.py::provision` subscribes with it, so
+  a fresh canvas delivers the same shape whichever button you press. Flipping
+  it afterwards is the gap: `Reconciler._watch` re-subscribes a queue that is
+  MISSING from the topic, never one whose attributes merely differ, and
+  `BackingAws.subscriptions` reads endpoints out of `ListSubscriptionsByTopic`,
+  which carries no attributes at all — so odin cannot currently SEE the
+  difference. Closing it needs a `GetSubscriptionAttributes` per subscription
+  and a probe of what goaws answers to one; neither has been done, so this is
+  written down rather than guessed at. `tofu apply` has no such gap: the
+  provider issues `SetSubscriptionAttributes` itself. Workaround on the Apply
+  path: delete the edge, apply, redraw it.
 - **An RDS instance's data is a Docker volume and nothing else — there are no
   snapshots and no backups.** This entry used to say the opposite of its first
   half: the container held its data on the image's *anonymous* volume, which
@@ -719,14 +790,25 @@ They are listed because finding one by surprise is worse than reading it here.
   machine rather than a fault. It stands in for the dead-letter queue odin does
   not have — the notification really is lost, and the verdict is the only record
   of it.
-- **One tick delivers at most 10 pending notifications.** `aws s3 cp
-  --recursive` over a few thousand objects enqueues a few thousand records in
-  one burst; the drain is bounded so one upload cannot stall the reconciler for
-  every other resource. Nothing is lost — the records are durable and the next
-  pass is one tick away, so the steady drain rate is ~10/second at the
-  production poll. A **slow handler** makes the pass itself exceed one tick, in
-  which case ticks queue behind the reconciler's own lock rather than
-  overlapping: odin falls behind, it does not double-run.
+- **One tick spends at most 5 seconds STARTING notification deliveries, plus
+  the one already in flight.** `aws s3 cp --recursive` over a few thousand
+  objects enqueues a few thousand records in one burst, and the drain is
+  bounded so one upload cannot stall the reconciler for every other resource.
+  Nothing is lost — the records are durable and the next pass is one tick away.
+  This entry read "at most 10 pending notifications" until v0.8.21, and that
+  count was a bound on the wrong quantity: deliveries are serial,
+  `FunctionRuntime.invoke` has a 30.0s ceiling and `lambdactl.invoke` passes no
+  shorter one, so ten of them was **up to 300 seconds** during which the
+  reconciler observed nothing, `/world` reported nothing new and the drift
+  sweep did not run — every tick queues behind the reconciler's own lock. The
+  entry admitted the hole in its own last sentence ("a slow handler makes the
+  pass itself exceed one tick") without saying by how much. The bound is now a
+  deadline, which is the unit the hazard is measured in: worst case **~35s**
+  (the budget, plus one handler that cannot be preempted once started), and for
+  a fast handler the pass moves as many records as fit rather than exactly ten.
+  5 seconds is five production reconciler polls; it is not tuned to a measured
+  invoke duration, because odin has none for a real RIE container and inventing
+  one would put the arbitrary number straight back.
 - **Only writes that go THROUGH the gateway fire a notification.** Delivery is
   synthesized from the gateway's own view of an object write, not forwarded from
   RustFS (which cannot hold the configuration at all). In practice that is every
@@ -801,21 +883,35 @@ They are listed because finding one by surprise is worse than reading it here.
   fires nothing — in practice every workload gets `AWS_ENDPOINT_URL`, so every
   workload write goes through. A queue or topic target is refused at PUT with
   `InvalidArgument` rather than stored, because nothing would drain it.
-- **An S3 removal notification OVER-FIRES for a key that never existed.**
-  S3 deletes are idempotent: deleting a key that was never
-  there SUCCEEDS. Measured against `rustfs/rustfs:latest` — deleting one real
-  key and one that never existed returned HTTP 200 and reported **both** as
-  `<Deleted>`, with zero `<Error>` entries; the single-object `DELETE` answers
-  204 the same way regardless. So the response carries no signal that separates
-  "removed something" from "removed nothing", and odin's hook runs after the
-  forward, when the answer is already unrecoverable. odin therefore enqueues an
-  `s3:ObjectRemoved:Delete` notification in both cases; **real AWS sends nothing
-  when nothing was removed.** A handler that assumes the object existed (and,
-  say, deletes a matching database row) will run for a key that never did.
-  Over-firing is the milder direction — a trigger that never fires is worse —
-  but it is a real divergence, so it is written here rather than discovered.
-  Genuine per-object FAILURES are handled correctly: a key S3 reports under
-  `<Error>` (AccessDenied, an object-lock retention) fires nothing.
+- **An S3 removal notification costs one HEAD per key that would fire, and that
+  is the price of not over-firing.** This entry used to say the opposite half:
+  odin enqueued `s3:ObjectRemoved:Delete` for a key that never existed, where
+  real AWS sends nothing. The response genuinely cannot tell — re-measured
+  against `rustfs/rustfs:latest` on 2026-08-03, a single-object `DELETE` of a
+  key that never was answers **204**, exactly as for one that did, and
+  `DeleteObjects` reports **both** under `<Deleted>` with zero `<Error>`
+  entries. So since v0.8.21 the question is asked BEFORE the forward, which is
+  the last moment it has an answer: `gateway/app.py::_absent_keys` issues a
+  signed HEAD per key and `s3notify._writes` drops the ones the backing 404'd.
+  What that costs, measured the same day, loopback, otherwise-idle machine:
+  one HEAD is **0.89 ms median** (p95 1.25) for a key that is present and
+  **0.74 ms** (p95 0.98) for one that is not; RustFS answers a concurrent batch
+  near-serially, so 100 keys is **97.5 ms** and 1000 keys is **1.51 s**. It is
+  charged only to buckets that have a matching `ObjectRemoved` configuration,
+  and only for the keys inside its prefix/suffix filter — a bucket with no
+  notification issues no HEAD at all. Delivering those same 1000 notifications
+  spans several reconciler passes (5 s of starting-work each, see the entry
+  above), so the probe costs less than one pass's budget. Every failure of the
+  probe (timeout, 403, unparseable
+  request body) falls back to firing, so the old over-fire is the degraded
+  mode rather than silence. Genuine per-object FAILURES are still handled
+  separately: a key S3 reports under `<Error>` fires nothing.
+  Not used, though it would be free: RustFS puts `x-amz-delete-marker: false`
+  on a single-object delete that removed something and omits the header when it
+  did not (20/20 both ways, plus a zero-byte object). Real AWS sends that header
+  only for a versioned bucket, `backings.py` pins the image at `:latest`, and
+  its failure direction is silence rather than noise — so odin reads 200-vs-404
+  on HEAD, which every S3 implementation answers the same way.
 - **RDS** is Terraform-managed (`aws_db_instance` → a Postgres container)
   and Postgres-only: MySQL or MariaDB is declined with the reason.
   `allocated_storage` and `instance_class` round-trip faithfully but resize
@@ -1290,3 +1386,75 @@ They are listed because finding one by surprise is worse than reading it here.
   broken" rather than as string concatenation. Pinned in BOTH directions by
   `tests/gateway/test_apigwctl.py` — the prefix location must gain the slash and
   the exact-match location must not.
+
+
+## `ODIN_RUNTIME=lima` is SELECTABLE, not yet proven for odin's workloads
+
+`ODIN_RUNTIME` (see [`config.md`](config.md)) chooses the container backend:
+`colima` (the default, `docker` on the host's Colima VM) or `lima` (`nerdctl`
+inside odin's own shared `odin-host` Lima VM). The switch is real and pinned by
+`tests/runtime/test_select.py`. **What it does not come with is evidence that
+odin's services work on the far side of it**, and the honest summary is that
+two things are known to be missing today. Both were measured against a real
+booted `odin-host` VM on 2026-08-03, not read out of the source.
+
+**The shared `odin-host` VM is the right default, and multi-env is NOT the
+problem.** `ODIN_RUNTIME=lima` asks for isolation between odin and the Mac, not
+between odin's own environments — and one VM holding every env's containers is
+exactly what Colima already is. Environments stay separated the way they always
+have been, by container name (`odin-aws-<backing>-<env>`,
+`odin-rds-<env>-<id>`), so nothing about running several envs changes when the
+containers move inside a VM. (A per-instance VM *is* a real thing in odin, but
+it means something else: `gateway/models/ecsctl.py::runtime_for_service` binds
+an ECS service placed inside an EC2 box to that node's own
+`odin-ec2-<env>-<id>`. That is placement, decided per service by the canvas —
+not something a process-wide backend switch could express.)
+
+- **`host.docker.internal` does not resolve inside a container in the Lima VM,
+  and odin hands containers that name constantly.** `ColimaRuntime._run_flags()`
+  adds `--add-host host.docker.internal:host-gateway` to every `run`;
+  `LimaRuntime` does not override `_run_flags`, so it adds nothing. Everything
+  odin injects into a workload is spelled with that name —
+  `AWS_ENDPOINT_URL`/`AWS_ENDPOINT_URL_<SERVICE>` (`aws/backings.py`,
+  `gateway/keys.py`) and the ALB and API Gateway upstreams
+  (`compute/proxy.py`, `compute/apigw.py`, both defaulting to
+  `CONTAINER_HOST`). Measured inside a `busybox` container run by `nerdctl` in
+  `odin-host`:
+
+  | resolved from | `host.docker.internal` | `host.lima.internal` |
+  |---|---|---|
+  | inside the VM | **does not resolve** (`getent` exit 2) | `192.168.5.2` |
+  | inside a container in the VM | **does not resolve** | **does not resolve** |
+
+  The container's whole `/etc/hosts` is `localhost` plus its own name. So a
+  workload started under `ODIN_RUNTIME=lima` cannot reach odin's gateway by the
+  address odin gave it. Note this **corrects `runtime/lima.py`'s own docstring**,
+  which says it "omits Colima's host-gateway flag" and that "Lima auto-forwards
+  VM-bound ports to the Mac, so host-side probes and references work the same".
+  The first half is true and the conclusion does not follow from it: Lima's port
+  forwarding runs VM → host, so *host-side probes* really do work the same, and
+  *container-side references* do not — a container in the VM has no name for the
+  host at all. The two directions had been collapsed into one sentence.
+
+- **The `odin-host` VM has no host mounts, so every bind mount is an empty
+  directory.** `compute/lima_yaml.py` emits `"mounts": []`, and that is a
+  deliberate choice rather than an oversight (it is the same reason the EFS
+  work refuses an `ec2`-placed mount by name instead of showing a green tile
+  over an empty directory). Confirmed at runtime, not just in the generator:
+  inside `odin-host`, `mount | grep -E 'virtiofs|9p|reverse-sshfs'` returns
+  nothing, and a real host directory lists as empty. Anything that binds a host
+  path therefore silently gets nothing — `FunctionRuntime` mounting a Lambda's
+  code directory to `/var/task` (`compute/functions.py`), the Nebula sidecar's
+  `/etc/nebula` config (`fabric/sidecar.py`), and EFS task mounts. RDS is the
+  exception and only by luck: `aws/rds.py` uses a NAMED volume, which lives
+  inside the VM.
+
+**So what does `lima` give you today?** What
+`tests/runtime/test_lima_integration.py` proves and no more: a real Lima VM
+boots, a real container runs inside it through `nerdctl`, and its published
+port reads back correctly (5 passed, 49.27 s from cold — 2.73 s against an
+already-booted VM). That is a working `RuntimeDriver`, and it is the honest
+extent of the claim. Driving odin's actual services through it means running
+the integration gate against it, which is the ROADMAP item this switch exists
+to unblock and which has **not** been done. Until then, treat `lima` as the
+option that is now *possible to evaluate*, not one to run an environment on.

@@ -53,7 +53,7 @@ class FakeContainers:
     def __init__(self, *running: str) -> None:
         self.running = list(running)
 
-    async def container_names(self) -> list[str]:
+    async def container_names(self, env=None) -> list[str]:
         return list(self.running)
 
     async def status(self, name: str) -> str:
@@ -531,7 +531,7 @@ async def test_ec2_instance_with_no_odin_node_tag_is_not_projected(tmp_path):
 
 
 # --- lambda: two-state mapping, falls back to FunctionName (== the canvas
-# label already, per agent/hcl.py's own builder). --------------------------
+# label already, per iac/hcl.py's own builder). --------------------------
 
 
 def _lambda_fn(name: str, state: str, state_reason: str | None = None) -> dict:
@@ -1057,7 +1057,12 @@ async def test_multiple_kinds_project_independently(tmp_path):
     stores.cachectl.set(ENV, "cluster:cache", _cache_cluster("cache", "available", port=51234))
     stores.elbv2ctl.set(ENV, "lb:web-lb", _lb("web-lb"))
 
-    result = await project(stores, ENV)
+    # `containers=` even though this test is about the KEYS, not liveness: an
+    # `Active` lambda record makes `live_verdicts` ask the machine, and without
+    # a stand-in that was a real `docker ps` -- the only one left in this file
+    # and invisible until the whole suite's spawns were measured. `fn1` is up,
+    # so the projection reads exactly as it did.
+    result = await project(stores, ENV, containers=_fns_up("fn1"))
     assert set(result) == {"net", "r1", "fn1", "cache", "web-lb"}
 
 
@@ -1190,7 +1195,7 @@ async def test_a_failed_database_projects_crashed_with_the_real_reason_and_no_st
 
 async def test_an_untagged_database_still_projects_under_its_identifier(tmp_path):
     """Unlike vpc/subnet/ec2, rds HAS an AWS-native name -- the
-    DBInstanceIdentifier, which agent/hcl.py sets to the canvas label -- so an
+    DBInstanceIdentifier, which iac/hcl.py sets to the canvas label -- so an
     untagged instance (imported out of band) is still projectable."""
     stores = SynthStores(tmp_path)
     stores.rdsctl.set(ENV, "db:app-db", _db_record("app-db"))

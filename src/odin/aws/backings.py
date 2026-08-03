@@ -521,7 +521,13 @@ class BackingAws:
         return boto3.client(service, endpoint_url=endpoint, aws_access_key_id=ACCESS_KEY,
                             aws_secret_access_key=SECRET_KEY, region_name=REGION, config=config)
 
-    async def provision(self, service: str, name: str, subscriptions: tuple[str, ...] = ()) -> None:
+    async def provision(
+        self, service: str, name: str, subscriptions: tuple[tuple[str, bool], ...] = (),
+    ) -> None:
+        """`subscriptions` is `(queue name, raw_message_delivery)` pairs since
+        v0.8.21 -- the flag used to be a hardcoded `"true"` below, and this path
+        has to agree with `iac/hcl.py`'s generated `aws_sns_topic_subscription`
+        or a queue's envelope would depend on which of the two created it."""
         await self.ensure_backing(service)
         client = await self.client(service)
         try:
@@ -538,14 +544,14 @@ class BackingAws:
             elif service == "sns":
                 topic_arn = client.create_topic(Name=name)["TopicArn"]  # RETURNED, not constructed
                 sqs = await self.client("sqs")
-                for queue in subscriptions:
+                for queue, raw in subscriptions:
                     # idempotent — the sqs node's own provision may not have run yet
                     queue_url = sqs.create_queue(QueueName=queue)["QueueUrl"]
                     qarn = sqs.get_queue_attributes(
                         QueueUrl=queue_url, AttributeNames=["QueueArn"],
                     )["Attributes"]["QueueArn"]
                     client.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=qarn,
-                                     Attributes={"RawMessageDelivery": "true"})
+                                     Attributes={"RawMessageDelivery": str(raw).lower()})
         except ClientError as exc:
             if not any(w in str(exc) for w in ("Exist", "Conflict", "InUse")):
                 raise
