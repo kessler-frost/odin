@@ -1071,7 +1071,7 @@ def _lambda_entry(runtime: str) -> tuple[str, str]:
 #      runs a package manager of its own and never fetches anything at apply
 #      time (docs/limits.md says so in those words).
 #   2. `files` -- an inline `{relative path: text}` map. Nothing authors this
-#      by hand; `agent/import_tf.py` writes it when it recovers a MULTI-FILE
+#      by hand; `iac/import_tf.py` writes it when it recovers a MULTI-FILE
 #      deployment zip, so a package that came from Terraform goes back to
 #      Terraform byte-identically instead of collapsing to whichever member
 #      happened to sort first.
@@ -1775,7 +1775,7 @@ _BAD_LOGS_RETENTION = "retentionInDays must be a whole number of days (e.g. 14)"
 #     node under its own label -- no change needed there, verified;
 #   * `api/logs.py`'s `kind == "logs"` branch assumed name == label and is
 #     changed in the same commit to resolve through that same tag;
-#   * `agent/import_tf.py::_label` prefers the `name` literal, so importing
+#   * `iac/import_tf.py::_label` prefers the `name` literal, so importing
 #     the generated file back gives the node the DESTINATION as its label.
 #     The file then regenerates byte-identically (label == destination is the
 #     coincidence case), and the drawn edge plus the policy ARN stay
@@ -2312,7 +2312,7 @@ def _route53(res: ResourceDesired, refs: Refs) -> Built:
 # path prefix therefore takes both -- that is AWS's own idiom, not odin's
 # invention -- and they collapse back to ONE nginx `location` pair on the
 # substrate side (`compute/apigw.py`) and to ONE canvas edge on the import side
-# (`agent/import_tf.py` recovers the edge from the INTEGRATION, so the route
+# (`iac/import_tf.py` recovers the edge from the INTEGRATION, so the route
 # count never reaches the canvas).
 #
 # The path segment is the TARGET's label, not a canvas field, for the reason

@@ -9,10 +9,10 @@ import base64
 
 from fastapi.testclient import TestClient
 
-from odin.agent.import_tf import ImportResult
+from odin.iac.import_tf import ImportResult
 from odin.gateway.keys import OPERATOR_NODE_ID
 from odin.runtime.colima import ContainerFacts, HostFacts, RunHandle
-from odin.agent.hcl import generate_tf
+from odin.iac.hcl import generate_tf
 from odin.server import create_app
 from odin.spec.store import SpecStore
 from odin.spec.translate import canvas_to_stack

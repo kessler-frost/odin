@@ -9,7 +9,7 @@ RegisterTaskDefinition payload and hands it to `run_task`. `spec/capacity.py`
 already reads a `memory` field off the ecs NODE to decide whether the instance a
 service was drawn inside can hold it.
 
-Every link existed except the first two. `agent/hcl.py` emitted an
+Every link existed except the first two. `iac/hcl.py` emitted an
 `aws_ecs_task_definition` with no `memory` attribute at all, and the catalog
 offered no field to set one -- so the value was ALWAYS the 512 default, a
 container needing 1 GiB was OOM-killed with no way to say otherwise, and
@@ -35,7 +35,7 @@ look correct in every test that checked only one end.
 """
 from __future__ import annotations
 
-from odin.agent.hcl import generate_tf
+from odin.iac.hcl import generate_tf
 from odin.compute.tasks import _DEFAULT_MEMORY_MIB, _memory_mib
 from odin.spec.capacity import DEFAULT_TASK_MEMORY_MIB, workload_demand_mib
 from odin.spec.models import FieldValue, ResourceDesired, Stack

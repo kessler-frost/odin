@@ -281,7 +281,7 @@ They are listed because finding one by surprise is worse than reading it here.
   resolve and then fail to connect — a green resource that does not work. Only
   `ec2` publishes a bare address (`PRIVATE_IP`), so `route53 ↔ ec2` is the whole
   of the edge; every other target stays `unmodelled` on the canvas and
-  `agent/hcl.py::_dns_target_unsupported` names the target and the reason in the
+  `iac/hcl.py::_dns_target_unsupported` names the target and the reason in the
   apply's `unsupported` list.
   The emitted TTL (60s) exists so the generated project stays portable to Amazon;
   odin's own substrate is a hosts FILE and has no TTL at all, so a changed
@@ -295,7 +295,7 @@ They are listed because finding one by surprise is worse than reading it here.
   to say. Measured 2026-08-03 on a real Lima VM.
 
   **That is inside the contract odin publishes, not a defect against it.** Every
-  record carries `ttl = 60` (`agent/hcl.py::_DNS_RECORD_TTL`), so a resolver is
+  record carries `ttl = 60` (`iac/hcl.py::_DNS_RECORD_TTL`), so a resolver is
   entitled to keep answering for up to a minute; real Route 53 defaults an A
   record to 300s. The 2.2s is ~27× tighter than odin's own TTL and ~136× tighter
   than AWS's default.
@@ -433,7 +433,7 @@ They are listed because finding one by surprise is worse than reading it here.
   decorative-permission bug; use the destination name, which `odin logs --node
   <label>` and `/world` still resolve for you through the `odin:node` tag.
   (b) `odin import-tf` reads a group's label from its `name` argument
-  (`agent/import_tf.py::_label` prefers the literal over the tag), so importing
+  (`iac/import_tf.py::_label` prefers the literal over the tag), so importing
   the generated file back labels the node `/aws/lambda/myfn`. The file then
   regenerates byte-identically and the edge and policy stay self-consistent —
   it is a visible label change, not a broken round trip.
@@ -528,7 +528,7 @@ They are listed because finding one by surprise is worse than reading it here.
   `apigateway → lambda` route needs, so it is deliberately built once, there,
   rather than twice.
 - **A `role` edge works for lambda only.** `iam_role → lambda` folds into the
-  lambda's `role` field, which is what `agent/hcl.py` already reads, so the edge
+  lambda's `role` field, which is what `iac/hcl.py` already reads, so the edge
   really does decide the execution role in the generated Terraform. **ec2 and ecs
   reach a role differently** — an auto-generated role plus an instance profile /
   `task_role_arn`, with no `role` field anywhere — so odin does *not* offer a
@@ -540,7 +540,7 @@ They are listed because finding one by surprise is worse than reading it here.
   resolve: the alphabetically lowest role name wins, deterministically, so the
   generated file never depends on edge ordering. Nothing reports the conflict.
 - **`edge.kind` decides nothing in any BUILDER.** The subscription and ALB passes
-  in `agent/hcl.py`, and `reconcile/reconciler.py::_desired_subs`, all match on
+  in `iac/hcl.py`, and `reconcile/reconciler.py::_desired_subs`, all match on
   the two NODE kinds and never read the edge's kind — so an `iam`-typed line
   between an SNS node and an SQS node still emits a real
   `aws_sns_topic_subscription`. `odin chat` now refuses an edge kind odin does

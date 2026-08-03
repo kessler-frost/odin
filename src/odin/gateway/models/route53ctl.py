@@ -187,7 +187,7 @@ SERVICE = "route53"
 # the captured `CreateHostedZoneRequest` bytes, not remembered.
 NS = "https://route53.amazonaws.com/doc/2013-04-01/"
 
-# The tag `agent/hcl.py::_tags_block` stamps on every resource it emits. For a
+# The tag `iac/hcl.py::_tags_block` stamps on every resource it emits. For a
 # hosted zone it arrives on a SEPARATE `ChangeTagsForResource` call (deviation
 # 2), and this module writes it to the SHARED `tags` store under the key
 # `"route53:{zone_id}"` -- a flat `{tag_key: tag_value}` dict, the same shape

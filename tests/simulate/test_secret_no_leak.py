@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from odin.agent import hcl
+from odin.iac import hcl
 from odin.agent.translate import _prompt
 from odin.api.events import ConnectionManager
 from odin.simulate.runner import TfRunner

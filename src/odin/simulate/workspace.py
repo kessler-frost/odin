@@ -28,7 +28,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from odin.agent.hcl import TfProject
+from odin.iac.hcl import TfProject
 from odin.util import (
     SECRET_FILE_MODE,
     atomic_write_bytes,

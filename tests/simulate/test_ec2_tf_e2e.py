@@ -26,8 +26,8 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from odin.agent import hcl
-from odin.agent.hcl import TfProject
+from odin.iac import hcl
+from odin.iac.hcl import TfProject
 from odin.compute.instances import vm_name
 from odin.gateway.keys import OPERATOR_NODE_ID
 from odin.gateway.stores import SynthStores

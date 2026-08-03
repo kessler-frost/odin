@@ -128,7 +128,7 @@ def _canvas(host: str | None = None, ref: bool = False) -> dict:
 
 
 def _depends_on(canvas: dict) -> str:
-    from odin.agent.hcl import generate_tf
+    from odin.iac.hcl import generate_tf
     from odin.spec.translate import canvas_to_stack
 
     tf = generate_tf(canvas_to_stack(canvas)).files["main.tf"]

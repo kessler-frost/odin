@@ -28,7 +28,7 @@ import stat
 import tarfile
 from pathlib import Path
 
-from odin.agent.hcl import TfProject
+from odin.iac.hcl import TfProject
 from odin.api.events import ConnectionManager
 from odin.backup import export_env
 from odin.gateway.keys import KeyStore

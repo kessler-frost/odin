@@ -46,7 +46,7 @@ Secrets Manager model already deviates -- the canvas is the source of truth and
 Apply must converge:
 
 1. **The KeyId IS the canvas label**, not a UUID. Real `CreateKey` carries no
-   name at all, so the label rides in on the `odin:node` tag `agent/hcl.py`
+   name at all, so the label rides in on the `odin:node` tag `iac/hcl.py`
    stamps on every resource, and the ARN is `...:key/{label}`. This is
    secretsctl's own "ARNs carry no random suffix ... deterministic per env and
    a name<->ARN round trip needs no lookup table" applied one service over, and
@@ -87,7 +87,7 @@ from odin.gateway import errors
 from odin.gateway.kms import KeyUnavailable, envelope_key_id, is_envelope
 from odin.gateway.stores import SynthStores
 
-# The tag `agent/hcl.py::_tags_block` stamps on every resource it emits; for a
+# The tag `iac/hcl.py::_tags_block` stamps on every resource it emits; for a
 # kms key it is the ONLY carrier of the canvas label (deviation 1 above).
 NODE_TAG = "odin:node"
 
@@ -307,7 +307,7 @@ def _create_key(payload: dict, env: str, stores: SynthStores, now: float) -> Res
     #   Encrypt     -> 400 NotFoundException "Key 'prod-key' does not exist"
     #
     # A green create for a key that is dead on arrival, and then a secret
-    # naming it fails quoting an id the user never typed. `agent/hcl.py`
+    # naming it fails quoting an id the user never typed. `iac/hcl.py`
     # declines such a LABEL on the canvas, but a direct SDK `CreateKey` and an
     # `odin import-tf` of a hand-written `aws_kms_key` both reach here without
     # passing it, so the gateway has to be right on its own.

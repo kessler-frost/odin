@@ -30,7 +30,7 @@ from odin.runtime.colima import ColimaRuntime, ContainerSpec
 # Owner directive B4: a runaway task container can't eat the host. Real ECS
 # taskdef `cpu`/`memory` are strings -- `cpu` in CPU units (1024 == 1 vCPU),
 # `memory` in MiB -- when present (bridge/EC2 launch type, v1's ONLY mode:
-# `agent/hcl.py`'s `_ecs` builder doesn't emit either field today, so this
+# `iac/hcl.py`'s `_ecs` builder doesn't emit either field today, so this
 # fallback is what actually caps every canvas-drawn ECS node until it does).
 _DEFAULT_MEMORY_MIB = 512.0
 _DEFAULT_CPUS = 1.0

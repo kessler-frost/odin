@@ -12,8 +12,8 @@ from pathlib import Path
 import pytest
 
 
-from odin.agent import hcl
-from odin.agent.hcl import (
+from odin.iac import hcl
+from odin.iac.hcl import (
     _ALB_NLB_UNSUPPORTED,
     _ecs_container_definitions,
     generate_tf,

@@ -37,8 +37,8 @@ from pathlib import Path
 
 import pytest
 
-from odin.agent import hcl
-from odin.agent.hcl import generate_tf
+from odin.iac import hcl
+from odin.iac.hcl import generate_tf
 from odin.aws.backings import ACCOUNT, REGION
 from odin.gateway.classify import classify
 from odin.gateway.policy import Statement, arn_label, compile_policies, evaluate
@@ -119,7 +119,7 @@ TARGETS: dict[str, dict] = {
     # this log group IS that function's sink -- and since v0.8.15 a sink is
     # created under the name the substrate really ships to
     # (`/aws/lambda/caller`), not under the node's label, or the drawn group
-    # collects nothing (`agent/hcl.py::_LOG_DESTINATIONS`). The grant has to
+    # collects nothing (`iac/hcl.py::_LOG_DESTINATIONS`). The grant has to
     # follow the group to the name `classify.py` will report for a real
     # PutLogEvents, which is exactly what this row pins: the label is left
     # deliberately UNLIKE the destination so a rename that silently stopped

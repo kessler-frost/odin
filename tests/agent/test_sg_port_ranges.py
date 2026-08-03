@@ -35,9 +35,9 @@ import subprocess
 
 import pytest
 
-from odin.agent import hcl
-from odin.agent.hcl import generate_tf, parse_sg_rule
-from odin.agent.import_tf import parse_hcl_text
+from odin.iac import hcl
+from odin.iac.hcl import generate_tf, parse_sg_rule
+from odin.iac.import_tf import parse_hcl_text
 from odin.agent.translate import validate_refinement
 from odin.fabric.nebula import sg_rules_to_firewall
 from odin.spec.translate import canvas_to_stack

@@ -237,7 +237,7 @@ nothing.
 ## How it works
 
 A canvas is the desired state. `spec/` stores it as append-only,
-content-addressed revisions, `agent/hcl.py` compiles it to HCL, `simulate/` runs
+content-addressed revisions, `iac/hcl.py` compiles it to HCL, `simulate/` runs
 `tofu apply` against `gateway/`, and `reconcile/` observes what exists and
 projects it back as node status.
 

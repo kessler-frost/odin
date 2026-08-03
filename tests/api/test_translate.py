@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-from odin.agent.hcl import generate_tf
+from odin.iac.hcl import generate_tf
 from odin.agent.translate import TranslateResult
 from odin.runtime.colima import ContainerFacts, HostFacts, RunHandle
 from odin.server import create_app

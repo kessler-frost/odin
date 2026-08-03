@@ -16,8 +16,8 @@ The obvious shape -- hand the model a canvas, take a canvas back -- is the wrong
 one, and not for prompt-engineering reasons. A returned canvas is unauditable:
 a node silently dropped, a `password` quietly rewritten and a label changed all
 arrive as the same opaque blob, and diffing two canvases to find out cannot
-recover INTENT ("was that node meant to go?"). The whole of `agent/hcl.py` and
-`agent/import_tf.py` is deterministic precisely so nothing an LLM does can change
+recover INTENT ("was that node meant to go?"). The whole of `iac/hcl.py` and
+`iac/import_tf.py` is deterministic precisely so nothing an LLM does can change
 what gets applied; a canvas-in-canvas-out chat would hand that back.
 
 An operation list is the opposite. Each op names exactly what it touches, so:
@@ -202,7 +202,7 @@ def validate(op: Op, canvas: dict) -> str | None:
         # here rather than in the schema underneath.
         #
         # NOTE what this does NOT close, because it must not be read as having
-        # closed it: `agent/hcl.py`'s subscription and ALB passes match on the
+        # closed it: `iac/hcl.py`'s subscription and ALB passes match on the
         # two NODE kinds and never read the kind at all, so a perfectly valid
         # 'iam' edge between an sns node and an sqs node still emits a real
         # `aws_sns_topic_subscription`. Kind-blindness is the primary defect and

@@ -34,7 +34,7 @@ canvas and its configuration.
 *Engineering note, as built (audit finding, 2026-07-24 — not a rewording of*
 *the owner's words above, which stay verbatim per this doc's own charter):*
 *both directions of this translation layer are DETERMINISTIC code*
-*(`agent/hcl.py` canvas→TF, `agent/import_tf.py` TF→canvas) — that's what*
+*(`iac/hcl.py` canvas→TF, `iac/import_tf.py` TF→canvas) — that's what*
 *makes them reliable and testable. `claude-agent-sdk` sits behind an*
 *optional, off-by-default refine pass (`ODIN_TRANSLATE_REFINE`) over the*
 *canvas→TF direction only: it may add comments/tags/unset arguments, and a*
@@ -179,7 +179,7 @@ canvas and its configuration.
 
   That is what happened, and it is a better outcome than the plan. Directive 2
   said an agent translates canvas ↔ Terraform; both directions are
-  deterministic code (`agent/hcl.py`, `agent/import_tf.py`), with the SDK behind
+  deterministic code (`iac/hcl.py`, `iac/import_tf.py`), with the SDK behind
   an off-by-default refine pass a guardrail can reject outright — structurally
   incapable of deciding what gets applied. The same pattern then repeated
   everywhere it was tested: edge semantics are a pair table with a
@@ -201,6 +201,18 @@ canvas and its configuration.
   The test that keeps this honest: if a model's output is load-bearing, ask what
   a deterministic checker would look like. If one is possible, it belongs in the
   code and the model belongs behind it.
+
+  *Follow-through (2026-08-03): the two translators MOVED out of `agent/` into*
+  *`src/odin/iac/` because of this amendment.* They had never imported
+  `claude_agent_sdk` — they lived under `agent/` only because directive 2 said
+  "an agent translates" and the directory got named for the intent before the
+  implementation turned out deterministic. But a directory name is read as a
+  claim, and `agent/hcl.py` told every reader a model writes their
+  infrastructure. `agent/` now holds only what actually calls one (`chat.py`,
+  `debugger.py`, `translate.py`'s refine pass, `ai.py`), the dependency runs one
+  way (`agent` → `iac`, never back), and
+  `tests/test_iac_is_deterministic.py` fails the build on either leak — because
+  this paragraph cannot.
 
 ## Non-negotiables carried forward
 

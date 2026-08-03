@@ -79,8 +79,8 @@ distinction — ECS tasks run either on EC2 container instances or on Fargate.
 
 | fact | where |
 | --- | --- |
-| `launch_type` is hardcoded `"EC2"` for every ecs node | `agent/hcl.py:759` |
-| ...deliberately, as the "LEAST-FICTION" choice | `agent/hcl.py:708-711` |
+| `launch_type` is hardcoded `"EC2"` for every ecs node | `iac/hcl.py:759` |
+| ...deliberately, as the "LEAST-FICTION" choice | `iac/hcl.py:708-711` |
 | the field exists end to end | `gateway/records.py:402`, `ecsctl.py:566` |
 | ECS tasks actually run as plain containers on the host | `compute/tasks.py::TaskRuntime` |
 | **there is no container-instance concept at all** | grep: zero hits |

@@ -82,7 +82,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from odin.agent import hcl
+from odin.iac import hcl
 from odin.agent import translate as translate_mod
 from odin.aws.rds import container_name as db_container_name
 from odin.compute.functions import container_name as function_container_name

@@ -3,7 +3,7 @@ container, proven with a real Lima VM on one side and a real Postgres on the
 other.
 
 One canvas, one Apply. `db-sg` authorizes 5432 FROM `web-sg` (an SG-to-SG
-ingress rule -- `agent/hcl.py::_ingress_source`), the `web` instance is in
+ingress rule -- `iac/hcl.py::_ingress_source`), the `web` instance is in
 `web-sg`, the `worker` instance is in no SG at all, and the `db` node names
 `db-sg`. Everything downstream is real: tofu creates the VPC/subnets/SGs AND
 the database through the gateway, two real Lima VMs boot and join the env's
@@ -45,7 +45,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from odin.agent import hcl
+from odin.iac import hcl
 from odin.agent import translate as translate_mod
 from odin.compute.instances import vm_name
 from odin.fabric.nebula import LighthouseManager

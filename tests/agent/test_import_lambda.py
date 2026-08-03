@@ -33,8 +33,8 @@ from __future__ import annotations
 import io
 import zipfile
 
-from odin.agent.hcl import generate_tf
-from odin.agent.import_tf import parse_hcl, parse_hcl_dir, parse_hcl_text
+from odin.iac.hcl import generate_tf
+from odin.iac.import_tf import parse_hcl, parse_hcl_dir, parse_hcl_text
 from odin.spec.translate import canvas_to_stack
 
 CODE = "def lambda_handler(event, context):\n    return {'ok': True}\n"

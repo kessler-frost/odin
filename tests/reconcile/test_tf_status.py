@@ -531,7 +531,7 @@ async def test_ec2_instance_with_no_odin_node_tag_is_not_projected(tmp_path):
 
 
 # --- lambda: two-state mapping, falls back to FunctionName (== the canvas
-# label already, per agent/hcl.py's own builder). --------------------------
+# label already, per iac/hcl.py's own builder). --------------------------
 
 
 def _lambda_fn(name: str, state: str, state_reason: str | None = None) -> dict:
@@ -1190,7 +1190,7 @@ async def test_a_failed_database_projects_crashed_with_the_real_reason_and_no_st
 
 async def test_an_untagged_database_still_projects_under_its_identifier(tmp_path):
     """Unlike vpc/subnet/ec2, rds HAS an AWS-native name -- the
-    DBInstanceIdentifier, which agent/hcl.py sets to the canvas label -- so an
+    DBInstanceIdentifier, which iac/hcl.py sets to the canvas label -- so an
     untagged instance (imported out of band) is still projectable."""
     stores = SynthStores(tmp_path)
     stores.rdsctl.set(ENV, "db:app-db", _db_record("app-db"))

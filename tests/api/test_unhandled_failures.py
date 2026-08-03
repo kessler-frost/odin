@@ -37,7 +37,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from odin.agent.hcl import generate_tf
+from odin.iac.hcl import generate_tf
 from odin.agent.translate import TranslateResult
 from odin.aws.backings import BackingUnavailable
 from odin.gateway.models import ec2compute

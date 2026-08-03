@@ -3,9 +3,9 @@ import against a real gateway + backings) is exercised in
 tests/simulate/test_import_tf_e2e.py (integration, needs Colima/tofu)."""
 from __future__ import annotations
 
-from odin.agent import hcl
-from odin.agent.hcl import generate_tf, resource_attrs
-from odin.agent.import_tf import (
+from odin.iac import hcl
+from odin.iac.hcl import generate_tf, resource_attrs
+from odin.iac.import_tf import (
     _FIXED_VALUES,
     _TF_TYPE,
     LiveResource,

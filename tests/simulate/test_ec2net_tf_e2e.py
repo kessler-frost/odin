@@ -7,7 +7,7 @@ deliberate differences:
 - No canvas/`generate_tf`: the container-node -> HCL mapping is V1c's layer
   (landing in parallel); the brief's gate is "workspace + operator
   principal, no UI needed", so main.tf is hand-authored to research
-  §2a's exact resource shapes via agent/hcl's own HEADER/provider_block/
+  §2a's exact resource shapes via iac/hcl's own HEADER/provider_block/
   quote helpers.
 - No backing containers and NO `app.state.gateway.update(ENV, ...)` at all:
   EC2 is all-synth (never forwarded), and the OPERATOR principal is
@@ -34,8 +34,8 @@ import subprocess
 import pytest
 from fastapi.testclient import TestClient
 
-from odin.agent import hcl
-from odin.agent.hcl import TfProject
+from odin.iac import hcl
+from odin.iac.hcl import TfProject
 from odin.gateway.keys import OPERATOR_NODE_ID
 from odin.server import create_app
 from odin.simulate import workspace as workspace_mod

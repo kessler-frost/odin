@@ -125,7 +125,7 @@ describe('compute -> compute IAM edges', () => {
 describe('the two meanings that were hiding inside `network`', () => {
   it('alb <-> ecs is a load-balancer TARGET', () => {
     // It compiles to a real `load_balancer` block on the ECS service
-    // (`agent/hcl.py` pass 1.5) -- which is why that pass has to explain in
+    // (`iac/hcl.py` pass 1.5) -- which is why that pass has to explain in
     // prose that a "NETWORK edge" means a target. The registry says it now.
     expect(detectEdgeTypes('alb', 'ecs')).toEqual(['target']);
     expect(detectEdgeTypes('ecs', 'alb')).toEqual(['target']);
@@ -143,7 +143,7 @@ describe('the two meanings that were hiding inside `network`', () => {
   it('both are PRESENTATIONAL — no consumer may gate on the name', () => {
     // This is a safety property, not a style note. Every canvas saved before
     // these types existed stores `network` on those edges and works anyway,
-    // because both `agent/hcl.py` passes key on the two NODE kinds. A builder
+    // because both `iac/hcl.py` passes key on the two NODE kinds. A builder
     // that started requiring the new name without a migration in the same
     // commit would drop the subscription from the generated HCL for all of
     // them and `tofu` would DESTROY the live subscription on the next apply --
@@ -308,7 +308,7 @@ describe('the dns edge (route53 -> the one kind a hosts entry can name)', () => 
     // a DRAWABLE catalog tile since long before it had a builder, so canvases
     // whose route53 edge is typed `network` already exist. A pass requiring
     // `kind === 'dns'` would emit no record for a single one of them.
-    // `agent/hcl.py`'s record pass keys on the two NODE kinds instead.
+    // `iac/hcl.py`'s record pass keys on the two NODE kinds instead.
     expect(edgeTypes.dns).toBeDefined();
     expect(edgeTypes.network).toBeDefined();
   });

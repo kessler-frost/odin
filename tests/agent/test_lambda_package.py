@@ -19,7 +19,7 @@ import io
 import zipfile
 from pathlib import Path
 
-from odin.agent import hcl
+from odin.iac import hcl
 from odin.spec.translate import canvas_to_stack
 
 ECHO = "def lambda_handler(event, context):\n    return event\n"
