@@ -237,7 +237,13 @@ _VERDICTS: dict[tuple[str, str], str] = {
     ("aws_security_group", "name"): _CARRIED,
     ("aws_sns_topic", "name"): _CARRIED,
     ("aws_sns_topic_subscription", "protocol"): _NAMED,
-    ("aws_sns_topic_subscription", "raw_message_delivery"): _NAMED,
+    # CARRIED since the limits-six branch made it authorable per edge; this
+    # table was written while it was still hardcoded `true` and import
+    # substituted it, which is what _NAMED recorded. Two branches, each
+    # correct on its own tree. Measured on the merged tree: emitting
+    # `raw_message_delivery = false` imports back as
+    # `{"rawMessageDelivery": False}` on the subscription edge.
+    ("aws_sns_topic_subscription", "raw_message_delivery"): _CARRIED,
     ("aws_sqs_queue", "name"): _CARRIED,
     ("aws_ssm_parameter", "description"): _CARRIED,
     ("aws_ssm_parameter", "name"): _CARRIED,
