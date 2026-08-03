@@ -17,7 +17,7 @@ class FakeRuntime:
     def __init__(self, *names: str) -> None:
         self._names = list(names)
 
-    async def container_names(self) -> list[str]:
+    async def container_names(self, env=None) -> list[str]:
         return list(self._names)
 
 
