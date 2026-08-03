@@ -97,8 +97,28 @@ def _ec2_xml(code: str, message: str) -> str:
     )
 
 
-def _lambda_response(code: str, message: str, status: int) -> Response:
-    body = json.dumps({"Type": "User", "Message": message})
+# The rest-json services. Their errors carry the code in the `x-amzn-errortype`
+# HEADER, which is what botocore's `RestJSONParser._inject_error_code` reads
+# FIRST (verified against botocore's own parsers.py) and what aws-sdk-go-v2's
+# restjson decoder reads first too -- so a body-only code is a coin flip.
+# `apigateway` joined in v0.8.19: BOTH API Gateway v1 and v2 sign under that
+# credential scope, and both are rest-json.
+_RESTJSON_SERVICES = ("lambda", "apigateway")
+
+# The error body each rest-json service really sends. Lambda's is
+# `{"Type", "Message"}`; apigatewayv2's is `{"message"}` alone (lowercase),
+# which is also what its `NotFoundException` shape names. Neither is what
+# botocore reads the CODE from -- that is the header above -- but a human
+# reading a raw response, and any client that falls back to the body, gets the
+# real thing rather than a plausible-looking one from another service.
+_RESTJSON_BODY = {
+    "lambda": lambda message: {"Type": "User", "Message": message},
+    "apigateway": lambda message: {"message": message},
+}
+
+
+def _restjson_response(service: str, code: str, message: str, status: int) -> Response:
+    body = json.dumps(_RESTJSON_BODY[service](message))
     return Response(body, status_code=status, media_type="application/json", headers={"x-amzn-errortype": code})
 
 
@@ -126,6 +146,10 @@ def _efs_response(code: str, message: str, status: int) -> Response:
     these are odin's only two rest-json services."""
     body = json.dumps({"ErrorCode": code, "Message": message})
     return Response(body, status_code=status, media_type="application/json", headers={"x-amzn-errortype": code})
+def _lambda_response(code: str, message: str, status: int) -> Response:
+    """Kept as a name because tests and other modules reference it; the shared
+    builder above is the implementation."""
+    return _restjson_response("lambda", code, message, status)
 
 
 def _json_body_raw(service: str, code: str, message: str) -> str:
@@ -159,8 +183,13 @@ def _wire(service: str, code: str, message: str, status: int, json_body: str) ->
         return Response(_sns_xml(code, message), status_code=status, media_type="text/xml")
     if service == "ec2":
         return Response(_ec2_xml(code, message), status_code=status, media_type="text/xml")
-    if service == "lambda":
-        return _lambda_response(code, message, status)
+    # BOTH rest-json services, not lambda by name. `apigateway` joined the tuple
+    # in v0.8.19 and a merge left this branch naming only lambda, so every
+    # apigateway error went out as json-1.0 with NO `x-amzn-errortype` -- the
+    # one header both botocore and aws-sdk-go-v2 read FIRST. Caught by
+    # `test_a_missing_api_is_a_rest_json_NotFoundException`.
+    if service in _RESTJSON_SERVICES:
+        return _restjson_response(service, code, message, status)
     if service == "elasticfilesystem":
         return _efs_response(code, message, status)
     return Response(json_body, status_code=status, media_type="application/x-amz-json-1.0")
@@ -246,6 +275,22 @@ def synth_error(service: str, code: str, message: str, status: int) -> Response:
     # REST-XML locally rather than touch this file. `_wire` is that fix taken one
     # step further: there is no second chain left to forget a service in.
     return _wire(service, code, message, status, _json_body_raw(service, code, message))
+    # s3 first, and it was MISSING here while `_respond` above has had it all
+    # along -- so a synth-authored S3 error fell through to the AWS-JSON body at
+    # the bottom, which botocore parses with RestXMLParser and cannot read. The
+    # caller sees a parse failure instead of the error odin wrote. Found by an
+    # agent building S3 notifications, who was about to hand-build REST-XML
+    # locally rather than touch this file; one shared builder is the point of
+    # this module.
+    if service == "s3":
+        return Response(_s3_xml(code, message), status_code=status, media_type="application/xml")
+    if service in _QUERY_XML_SERVICES:
+        return Response(_sns_xml(code, message), status_code=status, media_type="text/xml")
+    if service == "ec2":
+        return Response(_ec2_xml(code, message), status_code=status, media_type="text/xml")
+    if service in _RESTJSON_SERVICES:
+        return _restjson_response(service, code, message, status)
+    return Response(_json_body_raw(service, code, message), status_code=status, media_type="application/x-amz-json-1.0")
 
 
 def exc_text(exc: BaseException) -> str:

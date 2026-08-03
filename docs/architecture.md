@@ -198,6 +198,32 @@ graph LR
 
 Targets resolve to a **real address**: an `i-…` target is looked up to the VM's own vzNAT IP — a container on Colima really can reach it, which was measured rather than assumed. The endpoint rides out as a fact because `DNSName` cannot carry a dynamic port.
 
+### API Gateway
+
+`nginx container per API + odin's own HTTP↔invoke-envelope shim`
+
+```mermaid
+graph LR
+  A["apigateway node"] -->|"aws_apigatewayv2_api<br/>+ route + integration"| G["gateway apigwctl"]
+  G --> P["nginx container<br/>one location per route"]
+  P -->|"UNSIGNED, token in a header"| S["invoke shim<br/>on the gateway port"]
+  S -->|"format 2.0 event"| L["lambda RIE container"]
+  S -->|"plain reverse proxy"| E["ecs task"]
+  G -->|"API_ENDPOINT fact"| W["World"]
+```
+
+Both integration types go through the shim, and the arrow into it is drawn
+**ungated on purpose**: an HTTP API route is `authorization_type = "NONE"`, so
+those requests carry no SigV4 signature and never enter the gateway's
+verify→classify→evaluate pipeline. What bounds the shim instead is that it takes
+no function name — only ids resolved through stored records — plus a per-API
+token nginx replays. A lambda's return value becomes the HTTP response by payload
+format 2.0's two rules, and a **crashed handler is a 502**: RIE answers a raised
+handler with HTTP 200 and an error document, so passing it through would serve a
+stack trace as a success. The reachable address is the API's `api_endpoint`; the
+stage's `invoke_url` is built client-side by the provider and points at
+amazonaws.com.
+
 ### Event delivery
 
 `reconcile/dispatch.py — one tick, three sources`
@@ -268,12 +294,15 @@ Encrypts **two files** and nothing else: the values in `secretsctl.json` and `ss
 | scheduled rule → invoke | **60.5s**, once per period, on a real RIE container |
 | goaws poll overhead | **1.5×** — 29.8–30.9s held for a 20s wait |
 | gateway added latency | **~2ms** — verify → classify → evaluate → forward |
-| integration suite | **86 tests**, three partitions, ~65 min total |
+| integration suite | **90 tests**, three partitions, ~65 min total |
 
 ## The boundary, stated
 
-The mesh gates overlay traffic and nothing else. ECS tasks, the ALB proxy, Lambda
-containers and ElastiCache are not mesh members, so their egress is ungated
-whatever group they are drawn into. A security group cannot stop a workload
+The mesh gates overlay traffic and nothing else. ECS tasks, the ALB proxy, the
+API Gateway proxy and its invoke shim, Lambda containers and ElastiCache are not
+mesh members, so their egress is ungated whatever group they are drawn into. An
+HTTP API endpoint is unauthenticated by construction — that is what an API
+Gateway is — and so is the shim behind it, bounded only by the ids it will
+resolve and the per-API token nginx replays. A security group cannot stop a workload
 reaching the internet over Colima/Lima NAT. Drawing those as gated would have
 made a prettier diagram and a false one.

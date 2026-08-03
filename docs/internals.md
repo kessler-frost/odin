@@ -114,7 +114,7 @@ To regenerate this diagram after editing `docs/diagrams/*.mmd`:
   owns the model and binds it to a substrate.
 - **Translation** (`src/odin/agent/`) is deterministic in both directions and
   no longer covers quite the same node kinds in both: canvas → Terraform
-  builds 21, and Terraform → canvas reads all 20 back across 30 resource types
+  builds 22, and Terraform → canvas reads all 21 back across 34 resource types
   that it models. The gap is `kms`, added in v0.8.18 — emitted and not yet
   imported, so a project carrying an `aws_kms_key` does not round-trip through
   the canvas. `efs` (v0.8.19) did NOT widen that gap: it arrived in both

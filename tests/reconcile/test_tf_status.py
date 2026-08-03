@@ -72,14 +72,16 @@ def test_tf_owned_kinds_excludes_reconciler_owned_kinds():
     # s3/sqs/sns/dynamodb already get real World entries via the reconciler's
     # own PROVISIONED path -- this projection must never double-own them.
     #
-    # ONE line per kind. This assertion used to mirror the source's own
-    # both-sides-kept merge artifact (`..."alb", "kms",` then `..."alb",
-    # "ebs",`), and it could never have caught it: a `set` literal collapses
-    # duplicates exactly as the `frozenset` under test does, so the two agreed
-    # while both were malformed.
+    # ONE line per kind, spelled out in full, once. This assertion used to
+    # mirror the source's own both-sides-kept merge artifact (`..."alb",
+    # "kms",` then `..."alb", "ebs",`), and it could never have caught it: a
+    # `set` literal collapses duplicates exactly as the `frozenset` under test
+    # does, so the two agreed while both were malformed. A duplicated
+    # expectation that cannot fail is the same shape as one derived from its
+    # subject -- honesty rule 5.
     assert TF_OWNED_KINDS == {
         "vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr", "logs", "secret", "ssm",
-        "elasticache", "rds", "alb", "kms", "ebs", "efs",
+        "elasticache", "rds", "alb", "kms", "ebs", "efs", "apigateway",
     }
 
 

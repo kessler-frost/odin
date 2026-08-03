@@ -17,7 +17,7 @@
 // both ways: `(placeholder)` in a sublabel means Apply skips it, and nothing
 // else does. When a placeholder becomes real, the marker comes off in the same
 // commit that adds it to `_KIND`.
-// Today: kinesis, route53, apigateway, events, eip, igw.
+// Today: kinesis, route53, events, eip, igw.
 // `kms`, `ebs` and now `efs` came OFF this list; each marker came off in the
 // same commit that added the kind to `_KIND`, exactly as the rule above
 // requires.
@@ -368,7 +368,18 @@ export const CATALOG: ServiceDef[] = [
     defaultData: { label: 'example.com', zoneId: '' },
   },
   {
-    type: 'apigateway', abbr: 'API', label: 'API Gateway', sublabel: 'REST API (placeholder)',
+    // REAL as of v0.8.19: a real nginx container per API (`compute/apigw.py`),
+    // published on a real host port, whose `location` blocks are this API's
+    // routes. Draw an edge to a lambda or an ecs service and `/<that node's
+    // label>` is served -- for a lambda through odin's HTTP<->invoke-envelope
+    // shim, for an ecs service as a plain reverse proxy to the running task.
+    // The reachable address is the API's `api_endpoint`, NOT the stage's
+    // `invoke_url` (the provider builds that one client-side from the api id
+    // and it points at amazonaws.com -- measured; see docs/limits.md).
+    //
+    // `apiId` stays a read-only field: it is minted by the gateway on
+    // CreateApi, so a user-typed value could only ever be ignored.
+    type: 'apigateway', abbr: 'API', label: 'API Gateway', sublabel: 'HTTP API',
     category: 'Networking', color: 'fuchsia', width: 200,
     fields: [{ key: 'label', label: 'Name', editable: true }, { key: 'apiId', label: 'API ID' }],
     defaultData: { label: 'new-api', apiId: '' },

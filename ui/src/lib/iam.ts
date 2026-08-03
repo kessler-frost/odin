@@ -291,6 +291,27 @@ for (const target of Object.keys(iamActionsForTarget)) {
 // NODE kinds and never reads `edge.kind`, and it must stay that way -- see the
 // `subscription` note below for what gating it would destroy.
 for (const target of albTargetTypes) register('alb', target, 'target');
+// v0.8.19: an apigateway <-> lambda|ecs edge is a `target` edge too, and it is
+// the SAME relationship rather than a near-synonym: a front door forwards a
+// request to a workload and the caller holds the connection open waiting for a
+// status code. That synchrony is the whole argument for putting it here and not
+// in the event family -- an event producer does not wait, and nothing about a
+// 200 travels back up an event edge.
+//
+// It does NOT collide with the IAM loop above. `apigateway` is not in
+// `computeTypes` (an API Gateway invoking a Lambda uses a resource policy on
+// real AWS, not an execution role, and odin enforces no such thing), and it has
+// no entry in `iamActionsForTarget`, so neither `apigateway:lambda` nor
+// `apigateway:ecs` is ever registered as `iam`. Each therefore has exactly ONE
+// meaning and `edge-ambiguity.test.ts` stays green without an allowlist entry --
+// checked by running it, not assumed.
+//
+// PRESENTATIONAL, like `target`'s other members: `agent/hcl.py`'s route pass
+// keys on the two NODE kinds and never reads `edge.kind`. Gating it on the name
+// would make an old canvas (whose edges still say `network`) lose every route on
+// the next apply -- a 404 for every path that worked yesterday.
+export const apiTargetTypes = new Set(['lambda', 'ecs']);
+for (const target of apiTargetTypes) register('apigateway', target, 'target');
 // An sg drawn against a kind whose HCL reads `securityGroups` means MEMBERSHIP,
 // and only that -- a plain "network" line between a group and an instance would
 // describe nothing. Kept deliberately to the kinds `agent/hcl.py` actually

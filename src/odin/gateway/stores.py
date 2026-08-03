@@ -374,6 +374,14 @@ class SynthStores:
         self.elbv2ctl = JsonStore(root, "elbv2ctl")
         self.eventsctl = JsonStore(root, "eventsctl")
         self.efsctl = JsonStore(root, "efsctl")
+        # apigateway (v0.8.19): `gateway/models/apigwctl.py`'s whole state --
+        # flat keys `api:{id}` / `integration:{apiId}:{id}` / `route:{apiId}:{id}`
+        # / `stage:{apiId}:{name}`, at `.odin/{env}/gateway/apigwctl.json`. API
+        # tags live in the shared `tags` store, keyed `apigateway:{apiArn}`. The
+        # api record carries a `route_token` secret, which is why this file's
+        # 0600 mode is load-bearing here and not merely tidy -- see
+        # `gateway/apigw_shim.py`.
+        self.apigwctl = JsonStore(root, "apigwctl")
         self.dispatch = JsonStore(root, "dispatch")
         self.s3notify = JsonStore(root, "s3notify")
 
