@@ -995,3 +995,14 @@ They are listed because finding one by surprise is worse than reading it here.
   re-import; v1's `parent_id` chains are a tree the importer would have to
   rebuild. Both v1 and v2 sign under the SigV4 credential scope `apigateway`,
   so a v1 call reaches the gateway and is classified — it simply has no handler.
+- **The nginx prefix location's upstream path ends in `/`, and it has to.** When
+  `proxy_pass` carries a URI, nginx REPLACES the matched location prefix with it
+  TEXTUALLY. Without the trailing slash, `location /hello/` turned `/hello/a/b`
+  into `/_odin/apigw/<env>/<api>/<int>a/b` — the remainder concatenated onto the
+  integration id. Measured against a real container, which answered
+  `404 {"message": "No integration intbc3b5d20a on API api843ac33f"}` for an
+  integration really called `intbc3b5d20`. Only the `{proxy+}` half broke (an
+  exact-match location appends nothing), so it read as "the greedy route is
+  broken" rather than as string concatenation. Pinned in BOTH directions by
+  `tests/gateway/test_apigwctl.py` — the prefix location must gain the slash and
+  the exact-match location must not.

@@ -202,16 +202,35 @@ def response_from_return_value(payload: bytes) -> Response:
     """A handler's return value as an HTTP response, by payload-format-2.0's
     own two rules -- and this is the half where getting it wrong is invisible.
 
-    WHAT IS MEASURED HERE AND WHAT IS NOT. The two rules below are AWS's
-    documented payload-format-2.0 contract, and `payload` is whatever
-    `compute/functions.py::FunctionRuntime.invoke` handed back, which is RIE's
-    response body VERBATIM (that module returns `response.content` unchanged).
-    The link this function depends on and cannot check by itself is whether RIE
-    really returns the handler's return value byte-for-byte as JSON -- see
-    `tests/gateway/test_apigw_shim_against_real_rie.py`, which invokes a REAL
-    `public.ecr.aws/lambda/python:3.12` container and asserts on what came back,
-    rather than on what this docstring believes. Read that test's recorded
-    output before trusting this paragraph.
+    MEASURED against a real `public.ecr.aws/lambda/python:3.12` container. Three
+    handlers, one event, raw bytes quoted rather than paraphrased:
+
+        proxy handler (returns statusCode/headers/body/cookies)
+          {"statusCode": 201, "headers": {...}, "body": "...",
+           "cookies": ["a=1; Path=/", "b=2; Path=/"]}
+          function_error: None
+
+        bare handler (no statusCode at all)
+          {"ok": true, "echo": "/hello/probe"}
+          function_error: None
+
+        raising handler
+          {"errorMessage": "boom from the handler", "errorType": "ValueError",
+           "requestId": "07f79599-...", "stackTrace": [...]}
+          function_error: 'Unhandled'   <- from the BODY; RIE sends no header
+
+    So RIE returns the handler's return value VERBATIM as JSON, `cookies`
+    included; a handler with no `statusCode` really does need rule 2 below; and
+    a RAISED handler arrives as an ordinary SUCCESSFUL invoke carrying an error
+    document, which is why `_from_invocation` checks `function_error` first.
+
+    The first run of that probe answered `Unable to import module 'app'` for all
+    three, which reads exactly like an RIE finding. It was the HARNESS: Colima
+    only mounts paths under `$HOME`, and the probe rooted its code directory in
+    `tempfile.mkdtemp()` under `/private/var/folders/...`, so the bind mount
+    silently resolved to an EMPTY directory. Check your own harness before
+    believing a measurement -- `tests/simulate/test_apigateway_e2e.py`'s
+    `store_root` fixture exists for exactly this.
 
     Rule 1: a JSON OBJECT carrying `statusCode` is a proxy response. Its
     `statusCode`, `headers`, `cookies`, `body` and `isBase64Encoded` are used.

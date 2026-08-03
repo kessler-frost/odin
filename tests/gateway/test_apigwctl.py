@@ -383,3 +383,64 @@ async def test_a_stopped_task_is_not_an_address(stores, proxy):
     )
     assert resolved.http_upstream is None
     assert resolved.unavailable is not None
+
+
+# --- the rendered nginx config ----------------------------------------------
+#
+# These read `render_conf`'s OUTPUT rather than a FakeProxy's recorded call,
+# because the defect they pin is textual: nginx's `proxy_pass`-with-a-URI
+# rewrite is string replacement, and a fake proxy sees the ApiRoute dataclass
+# long before that string exists.
+
+
+def test_the_prefix_location_ends_its_upstream_path_in_a_slash():
+    """THE BUG A REAL nginx FOUND, and one no fake proxy could.
+
+    When `proxy_pass` carries a URI, nginx REPLACES the matched location prefix
+    with it textually. Without the trailing slash, `location /hello/` turns
+    `/hello/a/b` into `/_odin/apigw/e/api1/int1a/b` -- the remainder
+    concatenated onto the integration id. Measured against a real container:
+
+        404 {"message": "No integration intbc3b5d20a on API api843ac33f"}
+
+    Only the `{proxy+}` half failed, so it read as "the greedy route is broken"
+    rather than as string concatenation.
+    """
+    from odin.compute.apigw import render_conf
+
+    conf = render_conf((ApiRoute(
+        prefix="/hello", upstream="host.docker.internal:4266",
+        upstream_path="/_odin/apigw/e/api1/int1",
+    ),))
+
+    assert "    location = /hello {\n        proxy_pass http://host.docker.internal:4266/_odin/apigw/e/api1/int1;\n" in conf
+    assert "    location /hello/ {\n        proxy_pass http://host.docker.internal:4266/_odin/apigw/e/api1/int1/;\n" in conf
+
+
+def test_the_exact_location_does_NOT_gain_a_trailing_slash():
+    """The other direction, and it matters: an exact-match location appends
+    nothing, so a trailing slash there would send `/_odin/apigw/e/api1/int1/`
+    where the shim's no-rest route expects `/_odin/apigw/e/api1/int1`. Pinning
+    only the prefix half would let a 'fix everything to end in /' change pass."""
+    from odin.compute.apigw import render_conf
+
+    conf = render_conf((ApiRoute(
+        prefix="/hello", upstream="h:1", upstream_path="/_odin/apigw/e/api1/int1",
+    ),))
+    exact = conf.split("    location = /hello {")[1].split("}")[0]
+
+    assert "proxy_pass http://h:1/_odin/apigw/e/api1/int1;" in exact
+    assert "/int1/;" not in exact
+
+
+def test_an_api_with_no_routes_renders_a_config_nginx_can_actually_start_on():
+    """`CreateApi` runs before any `CreateRoute`, so the FIRST converge of every
+    API is this case. An empty `upstream {}` block would be a config error and
+    the container would never start -- the 404 catch-all is what makes it
+    valid."""
+    from odin.compute.apigw import render_conf
+
+    conf = render_conf(())
+    assert "location / {" in conf
+    assert "return 404" in conf
+    assert "upstream" not in conf

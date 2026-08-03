@@ -56,6 +56,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from odin.compute.apigw import container_name as apigw_container_name
+from odin.gateway.keys import OPERATOR_NODE_ID
 from odin.compute.functions import FunctionRuntime
 from odin.compute.functions import container_name as fn_container_name
 from odin.server import create_app
@@ -164,6 +165,32 @@ def _api_record(root: Path, env: str) -> dict:
 
 
 @pytest.fixture
+def store_root():
+    """A store root under the repo checkout, NOT pytest's `tmp_path`, and this
+    is load-bearing rather than tidy -- the same discovery
+    `test_lambda_tf_e2e.py`'s module docstring records.
+
+    Colima only mounts paths beneath `$HOME` into its VM. `tmp_path` resolves to
+    macOS's per-user temp dir (`/private/var/folders/...`), which is NOT under
+    `$HOME`, so a Lambda's code-directory bind mount silently resolves to an
+    EMPTY directory -- nothing errors, and RIE answers every invoke with
+    `Unable to import module 'app'`. MEASURED while probing RIE for this
+    feature, where it looked exactly like an RIE finding until the harness was
+    checked:
+
+        b'{"errorMessage": "Unable to import module \'app\': No module named
+          \'app\'", "errorType": "Runtime.ImportModuleError", ...}'
+
+    The first draft of this file used `tmp_path` and would have produced that,
+    reported as a broken shim."""
+    root = Path(__file__).resolve().parents[2] / ".odin-apigw-test"
+    shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True)
+    yield root
+    shutil.rmtree(root, ignore_errors=True)
+
+
+@pytest.fixture
 def container_cleanup():
     """Force-remove by EXACT name on teardown regardless of outcome. Never a
     label or a machine-wide filter -- another agent's containers carry the same
@@ -209,11 +236,11 @@ def _get(url: str, tries: int = 20) -> httpx.Response:
     raise AssertionError(f"never got an HTTP answer from {url}: {last!r}")
 
 
-def test_an_api_with_no_routes_runs_a_real_proxy_answers_404_and_plans_clean(tmp_path, container_cleanup):
+def test_an_api_with_no_routes_runs_a_real_proxy_answers_404_and_plans_clean(store_root, container_cleanup):
     assert shutil.which("tofu"), "OpenTofu must be on PATH for this integration test"
     assert shutil.which("docker"), "docker must be on PATH for this integration test"
     container_cleanup.add(apigw_container_name(ENV_ALONE, API))
-    store = SpecStore(tmp_path)
+    store = SpecStore(store_root)
     app = create_app(store=store)
     with TestClient(app) as client:
         gateway_port = client.get("/health").json()["gateway"]["port"]
@@ -231,7 +258,8 @@ def test_an_api_with_no_routes_runs_a_real_proxy_answers_404_and_plans_clean(tmp
         # the two projections of one fact, held to each other rather than to a
         # hand-written expectation.
         world = client.get(f"/world?env={ENV_ALONE}").json()
-        node = world["resources"][API]
+        # `resources` is a LIST of ResourceObserved, not a dict keyed by label.
+        node = next(r for r in world["resources"] if r["id"] == API)
         assert node["phase"] == "healthy", node
         assert node["facts"]["API_ENDPOINT"] == endpoint, node
 
@@ -243,15 +271,14 @@ def test_an_api_with_no_routes_runs_a_real_proxy_answers_404_and_plans_clean(tmp
         # ZERO DRIFT. The surface where apigateway drift would hide is the
         # api's own tags and the stage, both of which odin echoes.
         workspace = store.root / ENV_ALONE / "tf"
-        keys = client.post(f"/keys?env={ENV_ALONE}").json()
         plan = _tofu(
             ["plan", "-detailed-exitcode"], workspace,
-            _tf_env(gateway_port, keys["access_key_id"], keys["secret_access_key"]),
+            _tf_env(gateway_port, *app.state.gateway_keys.issue(ENV_ALONE, OPERATOR_NODE_ID)),
         )
         assert plan.returncode == 0, f"plan is dirty:\n{plan.stdout}\n{plan.stderr}"
 
 
-def test_a_real_rie_returns_the_handlers_value_verbatim(tmp_path, container_cleanup):
+def test_a_real_rie_returns_the_handlers_value_verbatim(store_root, container_cleanup):
     """THE PROBE, AS A TEST -- run and read this before trusting
     `apigw_shim.response_from_return_value`.
 
@@ -266,7 +293,7 @@ def test_a_real_rie_returns_the_handlers_value_verbatim(tmp_path, container_clea
     assert shutil.which("docker"), "docker must be on PATH for this integration test"
     for name in (FN, FN_CRASH):
         container_cleanup.add(fn_container_name(ENV_PROBE, name))
-    runtime = FunctionRuntime(root=tmp_path)
+    runtime = FunctionRuntime(root=store_root)
 
     def _zip(source: str) -> bytes:
         buffer = io.BytesIO()
@@ -302,7 +329,7 @@ def test_a_real_rie_returns_the_handlers_value_verbatim(tmp_path, container_clea
     assert "boom from the handler" in body["errorMessage"], body
 
 
-def test_a_drawn_api_serves_a_real_lambda(tmp_path, container_cleanup):
+def test_a_drawn_api_serves_a_real_lambda(store_root, container_cleanup):
     """THE FLAGSHIP. A caller holds a connection open and gets a status code back
     from a real function -- which is the synchrony argument that put this edge in
     the TARGET family, proven rather than asserted."""
@@ -310,7 +337,7 @@ def test_a_drawn_api_serves_a_real_lambda(tmp_path, container_cleanup):
     assert shutil.which("docker"), "docker must be on PATH for this integration test"
     container_cleanup.add(apigw_container_name(ENV_SERVED, API))
     container_cleanup.add(fn_container_name(ENV_SERVED, FN))
-    store = SpecStore(tmp_path)
+    store = SpecStore(store_root)
     app = create_app(store=store)
     with TestClient(app) as client:
         _apply(client, ENV_SERVED, _canvas(with_lambda=True))

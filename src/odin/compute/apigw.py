@@ -129,12 +129,17 @@ class ProxyNotServing(RuntimeError):
     it is only ever in the container's own output."""
 
 
-def _proxy_body(route: ApiRoute) -> str:
+def _proxy_body(route: ApiRoute, trailing_slash: bool = False) -> str:
+    """One `location`'s body. `trailing_slash` is for the PREFIX location only --
+    see `render_conf`, where the reason is measured rather than asserted."""
     headers = "".join(
         f"        proxy_set_header {name} {value};\n" for name, value in route.headers
     )
+    upstream_path = route.upstream_path
+    if trailing_slash and upstream_path and not upstream_path.endswith("/"):
+        upstream_path += "/"
     return (
-        f"        proxy_pass http://{route.upstream}{route.upstream_path};\n"
+        f"        proxy_pass http://{route.upstream}{upstream_path};\n"
         "        proxy_http_version 1.1;\n"
         "        proxy_set_header Host $host;\n"
         "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
@@ -157,12 +162,26 @@ def render_conf(routes: tuple[ApiRoute, ...]) -> str:
     any `CreateRoute`, so the very first converge of every API is this case."""
     blocks = []
     for route in sorted(routes, key=lambda r: r.prefix):
-        body = _proxy_body(route)
         if route.prefix == "/":
-            blocks.append(f"    location / {{\n{body}    }}\n")
+            blocks.append(f"    location / {{\n{_proxy_body(route)}    }}\n")
             continue
-        blocks.append(f"    location = {route.prefix} {{\n{body}    }}\n")
-        blocks.append(f"    location {route.prefix}/ {{\n{body}    }}\n")
+        blocks.append(f"    location = {route.prefix} {{\n{_proxy_body(route)}    }}\n")
+        # THE PREFIX LOCATION'S UPSTREAM PATH MUST END IN `/`, and this is the
+        # one line in this module that a fake-proxy unit test could never have
+        # caught. When `proxy_pass` carries a URI, nginx REPLACES the matched
+        # location prefix with it -- textually. So `location /hello/` with
+        # `proxy_pass http://h:p/_odin/apigw/e/api1/int1;` turns `/hello/a/b`
+        # into `/_odin/apigw/e/api1/int1a/b`: the remainder is CONCATENATED onto
+        # the integration id. Measured against a real nginx, which answered
+        #
+        #     404 {"message": "No integration intbc3b5d20a on API api843ac33f"}
+        #
+        # for a request to `/hello/a/b` where the integration was `intbc3b5d20`.
+        # The exact-match location above is unaffected (it matches the whole
+        # path and appends nothing), which is why `/hello` worked and only the
+        # `{proxy+}` half failed -- a shape that reads as "the greedy route is
+        # broken" rather than as a string-concatenation bug.
+        blocks.append(f"    location {route.prefix}/ {{\n{_proxy_body(route, trailing_slash=True)}    }}\n")
     if not any(route.prefix == "/" for route in routes):
         blocks.append(
             "    location / {\n"
