@@ -428,10 +428,14 @@ def probe_keys(
     100-connection pool is the ceiling, not the parallelism. A 1000-key
     `aws s3 rm --recursive` batch against a bucket that HAS a removal
     notification therefore pays ~1.5s. That is real, and it is small against
-    what those same 1000 notifications then cost to deliver:
-    `reconcile/dispatch.py` drains at most 10 per tick, i.e. ~100 SECONDS at
-    the production 1s poll. The probe is 1.5% of a pipeline the user has
-    already opted into by configuring the notification.
+    what those same 1000 notifications then cost to DELIVER:
+    `reconcile/dispatch.py` spends at most `_MAX_PASS_SECONDS` (5.0) per tick
+    starting deliveries, so a burst of that size necessarily spans several
+    passes and the probe is smaller than ONE pass's budget. (That comparison
+    said "~100 SECONDS at 10 per tick" when this was first written, hours
+    before the count bound became a deadline -- left visible rather than
+    quietly corrected, because a cost argument resting on another module's
+    constant is exactly the sentence that rots.)
 
     THE ALTERNATIVE THAT WAS MEASURED AND REJECTED. RustFS turns out to carry a
     discriminator on the single-object delete: `x-amz-delete-marker: false` is

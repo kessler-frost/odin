@@ -740,14 +740,25 @@ internet-facing, EC2 launch type where you wanted Fargate, no IGW.
   machine rather than a fault. It stands in for the dead-letter queue odin does
   not have — the notification really is lost, and the verdict is the only record
   of it.
-- **One tick delivers at most 10 pending notifications.** `aws s3 cp
-  --recursive` over a few thousand objects enqueues a few thousand records in
-  one burst; the drain is bounded so one upload cannot stall the reconciler for
-  every other resource. Nothing is lost — the records are durable and the next
-  pass is one tick away, so the steady drain rate is ~10/second at the
-  production poll. A **slow handler** makes the pass itself exceed one tick, in
-  which case ticks queue behind the reconciler's own lock rather than
-  overlapping: odin falls behind, it does not double-run.
+- **One tick spends at most 5 seconds STARTING notification deliveries, plus
+  the one already in flight.** `aws s3 cp --recursive` over a few thousand
+  objects enqueues a few thousand records in one burst, and the drain is
+  bounded so one upload cannot stall the reconciler for every other resource.
+  Nothing is lost — the records are durable and the next pass is one tick away.
+  This entry read "at most 10 pending notifications" until v0.8.21, and that
+  count was a bound on the wrong quantity: deliveries are serial,
+  `FunctionRuntime.invoke` has a 30.0s ceiling and `lambdactl.invoke` passes no
+  shorter one, so ten of them was **up to 300 seconds** during which the
+  reconciler observed nothing, `/world` reported nothing new and the drift
+  sweep did not run — every tick queues behind the reconciler's own lock. The
+  entry admitted the hole in its own last sentence ("a slow handler makes the
+  pass itself exceed one tick") without saying by how much. The bound is now a
+  deadline, which is the unit the hazard is measured in: worst case **~35s**
+  (the budget, plus one handler that cannot be preempted once started), and for
+  a fast handler the pass moves as many records as fit rather than exactly ten.
+  5 seconds is five production reconciler polls; it is not tuned to a measured
+  invoke duration, because odin has none for a real RIE container and inventing
+  one would put the arbitrary number straight back.
 - **Only writes that go THROUGH the gateway fire a notification.** Delivery is
   synthesized from the gateway's own view of an object write, not forwarded from
   RustFS (which cannot hold the configuration at all). In practice that is every
@@ -838,9 +849,10 @@ internet-facing, EC2 launch type where you wanted Fargate, no IGW.
   near-serially, so 100 keys is **97.5 ms** and 1000 keys is **1.51 s**. It is
   charged only to buckets that have a matching `ObjectRemoved` configuration,
   and only for the keys inside its prefix/suffix filter — a bucket with no
-  notification issues no HEAD at all. Against the same 1000 notifications
-  taking ~100 s to deliver at 10 per tick, the probe is ~1.5% of a pipeline the
-  user opted into. Every failure of the probe (timeout, 403, unparseable
+  notification issues no HEAD at all. Delivering those same 1000 notifications
+  spans several reconciler passes (5 s of starting-work each, see the entry
+  above), so the probe costs less than one pass's budget. Every failure of the
+  probe (timeout, 403, unparseable
   request body) falls back to firing, so the old over-fire is the degraded
   mode rather than silence. Genuine per-object FAILURES are still handled
   separately: a key S3 reports under `<Error>` fires nothing.

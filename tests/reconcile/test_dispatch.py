@@ -419,25 +419,102 @@ async def test_delivery_is_given_up_on_LOUDLY_rather_than_retried_forever(stores
     assert "uploads/a/b.png" in final[FUNCTION], "the verdict must name what was dropped"
 
 
-async def test_one_pass_drains_a_bounded_number_of_notifications(stores):
-    """`aws s3 cp --recursive` over a few thousand objects enqueues a few
-    thousand records in one burst. Draining them all inside one tick would stall
-    the reconciler for every other resource -- the same shape as a blocking call
-    on the shared loop. The remainder is not lost: these are durable records and
-    the next pass is one tick away."""
+class BudgetConsumingFunctions(FakeFunctions):
+    """A `FunctionRuntime` stand-in whose invocations really COST time, by
+    advancing the clock the pass deadline is measured against.
+
+    Nothing sleeps. A test that slept would measure this machine's scheduler,
+    which is the "a tight wall-clock assert tests CI load, not the code" trap;
+    advancing an injected clock measures the arithmetic the bound is made of.
+    The handler duration is the input and the number of deliveries is the
+    output, which is the direction the real system runs in too."""
+
+    def __init__(self, clock: MovableClock, seconds: float) -> None:
+        super().__init__()
+        self._clock = clock
+        self._seconds = seconds
+
+    async def invoke(self, env: str, name: str, payload: bytes) -> InvokeResult:
+        result = await super().invoke(env, name, payload)
+        self._clock.advance(self._seconds)
+        return result
+
+
+async def test_a_pass_stops_starting_deliveries_once_it_has_spent_its_budget(stores):
+    """THE BOUND, in the unit of the hazard. This used to be a count of ten,
+    which bounded the RECORDS and left the LATENCY unbounded -- ten serial
+    invokes of a handler that runs to `FunctionRuntime.invoke`'s 30s ceiling is
+    300 seconds in which the reconciler observes nothing and `/world` reports
+    nothing new, because every tick queues behind `Reconciler._tick_lock`.
+
+    Two seconds a handler, a five second budget: deliveries start at elapsed
+    0.0, 2.0 and 4.0, and the fourth check sees 6.0 and stops. THREE, written
+    as a literal and as the three oldest keys by name -- deriving it from
+    `_MAX_PASS_SECONDS / 2.0` would pass for a loop that had stopped checking
+    the deadline at all."""
     seed_function(stores)
-    for i in range(dispatch._MAX_PENDING_PER_PASS * 3):
+    for i in range(30):
         seed_pending(stores, store_key=f"pending:{i:03d}", at=float(i), key=f"obj-{i:03d}")
-    functions = FakeFunctions()
+    clock = MovableClock()
+    functions = BudgetConsumingFunctions(clock, seconds=2.0)
 
-    await Dispatcher(functions, MovableClock()).verdicts(stores, ENV)
-    assert len(functions.payloads) == dispatch._MAX_PENDING_PER_PASS
-    remaining = [k for k in stores.dispatch.items(ENV) if k.startswith("pending:")]
-    assert len(remaining) == dispatch._MAX_PENDING_PER_PASS * 2, "the rest wait, they are not dropped"
+    await dispatch._dispatch_pending(stores, ENV, functions, clock=clock)
 
-    # ...and the OLDEST were the ones taken, so nothing starves at the back.
     delivered = [json.loads(p)["Records"][0]["s3"]["object"]["key"] for p in functions.payloads]
-    assert delivered == [f"obj-{i:03d}" for i in range(dispatch._MAX_PENDING_PER_PASS)]
+    assert delivered == ["obj-000", "obj-001", "obj-002"]
+    remaining = [k for k in stores.dispatch.items(ENV) if k.startswith("pending:")]
+    assert len(remaining) == 27, "the rest wait, they are not dropped"
+
+
+async def test_the_deadline_never_preempts_a_delivery_already_in_flight(stores):
+    """The honest worst case, stated as a test rather than as prose. A pass
+    cannot cancel an invoke it has started, so ONE handler slower than the
+    whole budget still runs to completion and the pass costs
+    `_MAX_PASS_SECONDS + that handler`. That is the claim the constant makes,
+    and it is why the bound is ~35s rather than 5s."""
+    seed_function(stores)
+    for i in range(5):
+        seed_pending(stores, store_key=f"pending:{i:03d}", at=float(i), key=f"obj-{i:03d}")
+    clock = MovableClock()
+    functions = BudgetConsumingFunctions(clock, seconds=100.0)
+
+    await dispatch._dispatch_pending(stores, ENV, functions, clock=clock)
+
+    delivered = [json.loads(p)["Records"][0]["s3"]["object"]["key"] for p in functions.payloads]
+    assert delivered == ["obj-000"], "the first delivery runs in full; the second never starts"
+
+
+async def test_a_burst_of_CHEAP_deliveries_is_no_longer_capped_at_ten(stores):
+    """What the change buys, and the case the old docstring described and did
+    not serve: `aws s3 cp --recursive` over thousands of objects against a fast
+    handler. Under the old count this pass moved exactly ten records however
+    cheap they were; now it moves whatever fits in the budget."""
+    seed_function(stores)
+    for i in range(30):
+        seed_pending(stores, store_key=f"pending:{i:03d}", at=float(i), key=f"obj-{i:03d}")
+    clock = MovableClock()
+    functions = BudgetConsumingFunctions(clock, seconds=0.0)
+
+    await dispatch._dispatch_pending(stores, ENV, functions, clock=clock)
+
+    assert len(functions.payloads) == 30
+    assert [k for k in stores.dispatch.items(ENV) if k.startswith("pending:")] == []
+
+
+async def test_the_oldest_pending_notifications_are_the_ones_taken(stores):
+    """Nothing starves at the back of the queue: the sort is by `at`, and the
+    records are seeded out of order here so that a loop reading store order
+    would fail."""
+    seed_function(stores)
+    for i, at in enumerate([9.0, 3.0, 7.0, 1.0, 5.0]):
+        seed_pending(stores, store_key=f"pending:{i:03d}", at=at, key=f"obj-at-{at:g}")
+    clock = MovableClock()
+    functions = BudgetConsumingFunctions(clock, seconds=2.0)
+
+    await dispatch._dispatch_pending(stores, ENV, functions, clock=clock)
+
+    delivered = [json.loads(p)["Records"][0]["s3"]["object"]["key"] for p in functions.payloads]
+    assert delivered == ["obj-at-1", "obj-at-3", "obj-at-5"]
 
 
 # --- SQS event source mappings ----------------------------------------------
