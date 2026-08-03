@@ -272,6 +272,90 @@ They are listed because finding one by surprise is worse than reading it here.
   all three — they stay `iam` — because the passes that read them key on the
   two NODE kinds. `connection` is the one that does get its own type, because
   unlike those it is a meaning a user has to CHOOSE (see the next entry).
+- **A `dns` edge to an alb or an rds is REFUSED BY NAME on Apply**, rather than
+  silently dropped. A hosts entry is `<ip> <name>`: it carries no port and no
+  scheme. Measured 2026-08-02 against the real projectors in
+  `reconcile/tf_status.py`, an alb publishes `http://127.0.0.1:<dynamic port>`
+  (dynamic so two load balancers, or two envs, cannot collide on 80) and an rds
+  publishes `host.docker.internal:<port>`, so a name pointing at either would
+  resolve and then fail to connect — a green resource that does not work. Only
+  `ec2` publishes a bare address (`PRIVATE_IP`), so `route53 ↔ ec2` is the whole
+  of the edge; every other target stays `unmodelled` on the canvas and
+  `agent/hcl.py::_dns_target_unsupported` names the target and the reason in the
+  apply's `unsupported` list.
+  The emitted TTL (60s) exists so the generated project stays portable to Amazon;
+  odin's own substrate is a hosts FILE and has no TTL at all, so a changed
+  record lands on the next container launch or hosts push.
+- **Removing a record does not stop it resolving IMMEDIATELY on a VM — measured
+  at ~2.2 seconds, and the e2e that catches it is RED on purpose.** Withdrawing a
+  record writes the guest's `/etc/hosts` correctly (`grep -c` for the name → 0)
+  and `push_hosts` returns `pushed`, while `getent hosts` inside that VM keeps
+  answering the old address for about 2.2s more: `systemd-resolved` is active on
+  the stock Lima image (`nsswitch: hosts: files dns`) and still holds what the
+  file used to say. Measured 2026-08-03 on a real VM.
+
+  Two things this is NOT. It is not a write bug — the file is right the moment
+  the push returns. And it is not fixed by `resolvectl flush-caches`, which was
+  tried: a flush keeps the *after-boot* case immediate (adding then removing a
+  record), but changes nothing for a record cloud-init seeded at BOOT, which is
+  the failing case. That first fix was validated against the scenario that
+  already worked, which is why it is named here rather than quietly kept.
+
+  `tests/test_compute/test_hosts_resolution_e2e.py::test_removing_the_record_
+  stops_the_name_resolving` FAILS today and is left failing rather than relaxed:
+  odin returning `pushed` over a name that still resolves is an action reported
+  as an outcome, and the fix is for `push_hosts` to poll `getent` until the guest
+  agrees before it claims anything. The other three assertions in that file pass
+  against real Docker and a real Lima VM — a container resolves a drawn name and
+  only a drawn name, a VM resolves at boot without losing its own hosts file, and
+  an edited record reaches a running VM with no reboot.
+
+- **odin serves NO DNS.** There is no resolver, no port 53, and nothing answers
+  a DNS query. A hosted zone and its records are stored, round-trip for `tofu`,
+  and are real IAM targets — but the only thing that ever *resolves* a name is a
+  hosts entry odin writes (`--add-host` on a container, `/etc/hosts` on a VM).
+  So `dig`, `nslookup` and anything that talks the DNS protocol will not find an
+  odin record; `getent hosts` and any ordinary client library will. Stated
+  because "Route 53 works" and "names resolve" are the same sentence to most
+  readers and only the second one is true here.
+- **A hosted zone's tags are replayed, but tag REMOVAL on a re-apply is
+  untested.** `ChangeTagsForResource` is really sent on create (measured
+  through a real `tofu apply`, and `ListTagsForResource` must replay it or the
+  provider plans a perpetual diff — the plan is `-detailed-exitcode` 0, so the
+  create path is confirmed). `RemoveTagKeys` is implemented and unit-tested, but
+  no real provider was ever observed sending one: if it instead sends a full
+  replacement, a removed tag would linger. Named here rather than discovered,
+  because the only tag odin itself writes is `odin:node`, which is what
+  `reconcile/tf_status.py` recovers the canvas label from.
+- **A `dns` record resolves to a DIFFERENT address depending on who is asking,
+  and for a VM with no mesh it does not resolve at all.** This is the sharper
+  half of the entry above and it was got wrong first time, so it is stated in
+  full. The emitted `aws_route53_record` carries `aws_instance.<n>.private_ip` —
+  the portable, AWS-shaped answer, and a pure function of the canvas, because
+  making `main.tf` depend on runtime mesh state would break the round trip and
+  show `tofu plan` drift with nothing changed. What odin writes into a hosts
+  file is not always that value:
+
+  | consumer | address written | why |
+  |---|---|---|
+  | container | the instance's `private_ip` | measured reachable |
+  | VM | the instance's Nebula **overlay** address | `private_ip` is **100% packet loss** VM→VM |
+  | VM, env with no mesh | **nothing is written** | there is no address that would work |
+
+  Stock Lima `vz` NATs each VM into its OWN isolated address space: a raw ping
+  between two VMs' vzNAT addresses is 100% loss *before nebula is involved*
+  (`fabric/nebula.py`'s R5 note, confirmed live with two real VMs — it is why
+  VM-to-VM traffic relays through the lighthouse at all). So handing a VM a
+  `private_ip` would be a name that resolves and then hangs, which is this
+  kind's own trap one layer down. The divergence between the emitted argument
+  and the substrate is the same shape as EBS's advisory `device_name`.
+
+  **The no-mesh case is REPORTED in World, not merely withheld**, and that
+  correction is the point. The first design simply wrote no hosts line —
+  modelled on `tf_status._ec2_facts` dropping `MESH_IP` when the lighthouse is
+  down. That is the right INPUT and the wrong whole story: honesty rule 1 lists
+  *"the mesh gate withheld facts that never reached World"* among the four
+  guards that silently never fired, and a user drawing a record, watching the
 - **Four kind pairs mean two things at once, and odin asks.** `rds` and
   `elasticache` against `ecs` and `lambda` — 8 ordered pairs — are simultaneously
   a `connection` (the workload's environment is wired to the endpoint) and an

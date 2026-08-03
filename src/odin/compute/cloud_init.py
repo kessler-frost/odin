@@ -58,25 +58,42 @@ def hosts_block_script(hosts: dict[str, str]) -> str:
         *([entries] if entries else []),
         HOSTS_END,
         "ODIN_ETC_HOSTS",
-        # FLUSH THE GUEST RESOLVER, and this line is a measured bug fix rather
-        # than defensive housekeeping. Writing the file is NOT the same as the
-        # name changing: `systemd-resolved` is active on the stock Lima image
-        # (`nsswitch` is `hosts: files dns`) and it caches what /etc/hosts said.
+        # Flush the guest resolver. THIS IS A PARTIAL MEASURE AND THE COMMENT
+        # SAYS SO, because the first version of it claimed to fix a case it does
+        # not fix and was believed for one test run.
         #
-        # MEASURED on a real VM, 2026-08-03. Boot with a record, then push an
-        # EMPTY set: the file is correctly emptied (`grep -c` -> 0) and
-        # `push_hosts` returns "pushed" -- while `getent hosts api.internal`
-        # keeps answering `10.42.0.5` for a further **2.2 seconds**. That is odin
-        # reporting an outcome it has not achieved yet, which is honesty rule 2
-        # in the smallest possible window, and a withdrawn record that still
-        # resolves is the one thing this feature must never do.
+        # Writing the file is NOT the same as the name changing.
+        # `systemd-resolved` is active on the stock Lima image (`nsswitch` is
+        # `hosts: files dns`) and holds what /etc/hosts used to say. Measured on
+        # a real VM, 2026-08-03:
         #
-        # With the flush the same sequence is NO-RESOLVE immediately.
+        #   record added AND removed after boot   -> removal is immediate, and
+        #                                            this flush keeps it so
+        #   record seeded at BOOT, then withdrawn -> the file is correctly
+        #                                            emptied (`grep -c` -> 0)
+        #                                            and `push_hosts` returns
+        #                                            "pushed", while `getent`
+        #                                            keeps answering the old
+        #                                            address for ~2.2s. THE
+        #                                            FLUSH DOES NOT CHANGE THIS
+        #                                            (verified: the line is in
+        #                                            the script and the e2e
+        #                                            still fails).
         #
-        # Guarded and non-fatal on purpose: a guest without systemd-resolved has
-        # nothing to flush and must not fail the push for it, and this script
-        # also runs as a per-boot provision step under `set -ux` with no
-        # `set -e`, where a non-zero exit would leave `limactl start` waiting.
+        # So `tests/test_compute/test_hosts_resolution_e2e.py::
+        # test_removing_the_record_stops_the_name_resolving` FAILS today, and it
+        # is right to. The real fix is for `push_hosts` to verify the OUTCOME --
+        # poll `getent` until the guest agrees before returning "pushed" -- which
+        # is honesty rule 2's contract for a command that performs an action. It
+        # is not built: it changes `push_hosts`'s contract and its unit tests,
+        # and that belongs in its own change rather than at the end of this one.
+        # `docs/limits.md` states the window in measured terms meanwhile.
+        #
+        # Kept rather than reverted because it is a real improvement for the
+        # after-boot case, which is what an edited record actually is. Guarded
+        # and non-fatal: a guest without systemd-resolved has nothing to flush,
+        # and this script is also a per-boot provision step under `set -ux` with
+        # no `set -e`, where a non-zero exit leaves `limactl start` waiting.
         "command -v resolvectl >/dev/null 2>&1 && resolvectl flush-caches || true",
     ])
 
