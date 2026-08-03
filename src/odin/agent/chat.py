@@ -60,6 +60,7 @@ from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, SdkMcpTool, cr
 from pydantic import BaseModel, Field, ValidationError
 
 from odin.agent import ai
+from odin.settings import settings
 from odin.spec.translate import _KIND, EDGE_KINDS
 
 log = logging.getLogger("odin.chat")
@@ -385,8 +386,6 @@ class ProposeEditsInput(BaseModel):
 
 
 _MODEL = "claude-sonnet-5"
-_TIMEOUT_ENV = "ODIN_CHAT_TIMEOUT"
-_DEFAULT_TIMEOUT = 60.0
 
 _SYSTEM = (
     "You edit an odin canvas: a diagram of AWS-shaped infrastructure that odin builds for real. "
@@ -412,7 +411,7 @@ _SYSTEM = (
 def default_timeout() -> float:
     """Read per call so it can be raised for one slow request without a restart
     (`rdsctl.available_timeout`'s shape)."""
-    return float(os.environ.get(_TIMEOUT_ENV, _DEFAULT_TIMEOUT))
+    return settings.ai.chat_timeout
 
 
 def disabled_reason() -> str | None:

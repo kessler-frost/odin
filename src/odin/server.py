@@ -12,7 +12,6 @@ import asyncio
 import base64
 import json
 import logging
-import os
 import shutil
 from collections.abc import Callable
 from contextlib import asynccontextmanager
@@ -41,7 +40,7 @@ from odin.compute.tasks import TaskRuntime
 from odin.fabric.localhost import LocalhostFabric
 from odin.fabric.nebula import mesh_state, reap_orphaned_lighthouses
 from odin.fabric.sidecar import MeshSidecar
-from odin.gateway import DEFAULT_GATEWAY_PORT, GATEWAY_PORT_ENV, route53_hosts, wiring
+from odin.gateway import route53_hosts, wiring
 from odin.gateway.app import GatewayState, create_gateway_app, serve_on_loop
 from odin.gateway.keys import OPERATOR_NODE_ID, KeyStore, Principal
 from odin.gateway.models import ec2compute, ec2net, ecsctl, efsctl, lambdactl, rdsctl
@@ -52,6 +51,7 @@ from odin.reconcile.drift import DriftSweeper
 from odin.reconcile.reconciler import LoopHealth, Reconciler
 from odin.reconcile.tf_status import stranded_in_tf_state
 from odin.runtime.colima import ColimaRuntime
+from odin.settings import settings
 from odin.simulate.runner import SimulateBusy, TfRunner, TofuNotInstalled
 from odin.simulate.workspace import tf_dir
 from odin.spec import store as store_mod
@@ -1886,7 +1886,7 @@ def create_tf_router(
         override it, so the control renders disabled with the reason rather than
         pretending to work.
         """
-        forced = os.environ.get(ai.ENV_VAR, "").strip()
+        forced = settings.ai.enabled.strip()
         return {
             "enabled": ai.off_reason() is None,
             "source": "env" if forced else "switch",
@@ -2737,6 +2737,11 @@ def create_app(
     gateway_port: int | None = None,
     reap_ec2_vms: bool | None = None,
 ) -> FastAPI:
+    # Every `ODIN_*` knob, parsed and bounded HERE, before anything boots. The
+    # state this replaced let a non-numeric `ODIN_DISPATCH_TICKS` sail through
+    # startup and blow up whenever that code path first ran -- which for most
+    # of these knobs is "maybe never". pydantic names the variable.
+    settings.validate_all()
     _runtime = runtime or ColimaRuntime()
     _store = store or SpecStore(ODIN_DIR)
     # The startup EC2-VM reaper (release finding #4) cross-references
@@ -2749,7 +2754,7 @@ def create_app(
     # app, never for a test or any other caller that brought its own store.
     _reap_ec2_vms = reap_ec2_vms if reap_ec2_vms is not None else store is None
     ws_manager = ConnectionManager(_store.root)
-    _resolved_gateway_port = gateway_port if gateway_port is not None else int(os.environ.get(GATEWAY_PORT_ENV, DEFAULT_GATEWAY_PORT))
+    _resolved_gateway_port = gateway_port if gateway_port is not None else settings.gateway.port
 
     # The gateway: workload SDK calls carry per-node creds and land here
     # (checked reverse proxy -> real backing), never the backing directly.
