@@ -1138,6 +1138,15 @@ _EVERY_KIND_CANVAS = {
         {"id": "n13", "type": "ec2",
          "data": {"label": "api-server", "vpc": "net", "subnet": "web"}},
         {"id": "n14", "type": "route53", "data": {"label": "example.com"}},
+        # v0.8.22: `apigateway`, and it is the fourth time this fixture has been
+        # narrower than the generator (ecs, ebs, route53, now this). It costs two
+        # claims, not one: `("apigateway", "protocol_type")` -- whose absence had
+        # been asserted in a COMMENT since v0.8.19 while no entry existed -- and
+        # `("aws_apigatewayv2_stage", "auto_deploy")`, which comes from the STAGE
+        # a bare API emits alongside itself. No target edge is needed: an
+        # integration carries no `_FIXED_VALUES` claim (odin emits a different
+        # set per target kind, checked by `_apigw_integration_notes` instead).
+        {"id": "n15", "type": "apigateway", "data": {"label": "public-api"}},
     ],
     "edges": [
         {"id": "e1", "source": "n9", "target": "n10"},

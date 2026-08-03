@@ -1225,6 +1225,21 @@ def _instance_profile_key(node_id: str) -> str:
     return f"__instance_profile__{node_id}"
 
 
+def _key_pair_name(node_id: str) -> str:
+    """The AWS NAME of the key pair an ec2 node's `key` field becomes -- a real
+    resource name, not an HCL one. Named here because `import_tf` compares a
+    source's `key_name` against it: a key pair the user called `deploy-key`
+    comes back as `<label>-key`, which is a DIFFERENT AWS resource, and that has
+    to be reported rather than derived twice and hoped to agree."""
+    return f"{node_id}-key"
+
+
+def _grants_policy_name(node_id: str) -> str:
+    """The AWS NAME of the inline role policy a workload's grants become. Here
+    for `_key_pair_name`'s reason exactly."""
+    return f"{node_id}-grants"
+
+
 def _workload_role_key(node_id: str) -> str:
     """`refs` key for the auto-role an ec2/ecs node gets when something is
     granted to it. Same reservation shape as `_lambda_role_key`."""
@@ -1426,6 +1441,14 @@ _ECS_CLUSTER_KEY = "__ecs_cluster__"
 # value -- an ecs grant's ARN would name a cluster that does not exist if the
 # two ever disagreed.
 _ECS_CLUSTER_NAME = "odin"
+# The two task-definition arguments odin emits UNCONDITIONALLY, named here for
+# the reason `_ECS_CLUSTER_NAME` is: `import_tf` compares a source's values
+# against them, and a comparison against a copied literal is a check that shares
+# no source with its subject only by luck. `bridge` because odin's substrate is
+# a docker container on a shared host with no ENI to give a task, and `EC2`
+# because there is no Fargate substrate at all.
+_ECS_TASK_NETWORK_MODE = "bridge"
+_ECS_TASK_COMPATIBILITY = "EC2"
 _DEFAULT_ECS_IMAGE = "nginx:alpine"
 _DEFAULT_ECS_COUNT = "1"
 _DEFAULT_ECS_PORT = "80"
@@ -3012,7 +3035,7 @@ def generate_tf(stack: Stack) -> TfProject:
         if not key or instance_name is None:
             continue
         name = f"{instance_name}_key"
-        attrs = {"key_name": quote(f"{res.id}-key"), "public_key": quote(key)}
+        attrs = {"key_name": quote(_key_pair_name(res.id)), "public_key": quote(key)}
         block = _block("aws_key_pair", name, attrs)
         blocks.append((("aws_key_pair", res.id), block))
 
@@ -3055,7 +3078,7 @@ def generate_tf(stack: Stack) -> TfProject:
         _, role_name = role_ref
         name = refs[_grants_key(res.id)][1]
         attrs = {
-            "name": quote(f"{res.id}-grants"),
+            "name": quote(_grants_policy_name(res.id)),
             "role": f"aws_iam_role.{role_name}.name",
             "policy": quote(_policy_document(grants, kind_by_id, aws_names)),
         }
@@ -3219,8 +3242,8 @@ def generate_tf(stack: Stack) -> TfProject:
             "family": quote(res.id),
             **sized,
             **attached,
-            "requires_compatibilities": '["EC2"]',
-            "network_mode": quote("bridge"),
+            "requires_compatibilities": f'["{_ECS_TASK_COMPATIBILITY}"]',
+            "network_mode": quote(_ECS_TASK_NETWORK_MODE),
         }
         block = _block("aws_ecs_task_definition", f"{own_name}_taskdef", attrs, nested)
         blocks.append((("aws_ecs_task_definition", res.id), block))

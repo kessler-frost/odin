@@ -141,6 +141,49 @@ To regenerate this diagram after editing `docs/diagrams/*.mmd`:
   `len(hcl._BUILDERS)`, `len(set(import_tf._KIND.values()))`, and
   `len(set(import_tf._KIND) | companions)` are what the ratchet reads. Anything odin
   does not model is a LISTED unsupported entry rather than a silent omission.
+
+  **Resource-type coverage and ARGUMENT coverage are a third separate count, and
+  v0.8.22 is where it was first measured.** A type odin recognises is kept out of
+  `unsupported` by that recognition, and an argument in a carried set is kept out
+  of the "unmodeled attribute(s)" line by that membership — so a registry entry
+  is a promise, and membership actively SUPPRESSES the warning that would
+  otherwise name a loss. Sweeping all **179** entries as they then stood, each
+  set to a value `hcl.py`'s own defaults cannot reproduce, found **20 promises
+  that were silent** — every one of them `unsupported == []` and
+  `warnings == []`:
+
+  * a `WEBSOCKET` API imported as HTTP. Its `_FIXED_VALUES` entry had been
+    *described in a comment* since v0.8.19 and never written, which is the
+    audit's own lesson in one line.
+  * an integration's `integration_type`, `payload_format_version` and
+    `integration_method` — none of which can be a `_FIXED_VALUES` entry, because
+    odin emits a different set per target kind. A `payload_format_version = 1.0`
+    hands the function a different event shape and said nothing.
+  * a route or stage attached to an API outside the file, and a route whose
+    `target` names an integration this import did not recover: the path is served
+    not at all afterwards.
+  * an `aws_ecs_cluster` named anything but `odin`, a service whose `cluster`
+    reference leaves the file, a task definition's `family`, `network_mode` and
+    `requires_compatibilities`, and its `timeouts` block.
+  * an `aws_key_pair`'s `key_name` and an `aws_iam_role_policy`'s `name` — both
+    real AWS resources renamed, the `aws_iam_instance_profile` defect v0.8.21
+    fixed, in the two types beside it in the same dispatch.
+  * a target group's `vpc_id`, a stage's `auto_deploy`, and a listener's
+    `default_action` — a listener that redirected to HTTPS or returned a fixed
+    403 came back FORWARDING that traffic to the backend.
+  * the two worst, both of which are how real Terraform is actually written: a
+    `container_definitions` spelled `jsonencode([...])` came back carrying odin's
+    DEFAULT `nginx:alpine` image rather than the user's container, and an
+    `aws_iam_role_policy` spelled `jsonencode({...})` dropped the grant outright
+    — so importing a hand-written project lost its entire IAM posture and
+    reported a clean import.
+
+  All 20 are named now, and `tests/agent/test_carried_promises.py` holds every
+  entry to a hand-written verdict — `carried`, `named` or `declined` — so a new
+  entry is unchecked until somebody decides which it is. The verdict table is
+  parametrized over ITSELF rather than over the registry, because a test that
+  draws its cases from the thing it guards loses the case when the entry is
+  deleted, and a run with fewer tests reads as success.
   Equal node coverage is **not lossless**, and what it costs is listed rather
   than discovered: a security group's IPv6 rules and any port that is not a
   literal number, a Lambda's body when only the HCL text is read, and — until the
