@@ -1912,18 +1912,44 @@ run and are not described as such.
   port, and tears the VM down -- **5 passed in 49.27s**, `limactl list` empty
   afterwards. So the second backend is not hypothetical; it runs.
 
-  What does NOT exist is any way to CHOOSE it. `create_app(runtime=...)` is a
-  programmatic seam (and since the isolation work it is honoured everywhere,
-  which is what makes this newly cheap), but `server.py:2856` is
-  `_runtime = runtime or ColimaRuntime()` and there is no `ODIN_RUNTIME`
-  setting -- so no user can run odin on Lima, and the full integration suite
-  has never been run against it. **The comparison this item wants cannot be
-  made until the switch exists**, and that is the next step, not more probing:
-  a `ComputeSettings` field selecting the backend, then the gate run twice.
+  **THE SWITCH NOW EXISTS (v0.8.22).** `ODIN_RUNTIME` -- a `ComputeSettings`
+  field, `colima` (default) or `lima` -- is honoured by `create_app`, which
+  reads `runtime or build_runtime()` (`runtime/select.py`). `colima` is
+  byte-identical to before and an explicitly passed `runtime=` still wins over
+  the setting, since that is the injection seam. An unrecognised value fails at
+  `settings.validate_all()` naming the variable and both accepted values, rather
+  than falling back to `colima` and handing someone who asked for VM isolation
+  containers on the host with nothing said. Pinned by
+  `tests/runtime/test_select.py`; five mutations killed, and the one that
+  survives (`_BACKENDS.get(..., ColimaRuntime)`) is reported in that file's
+  docstring with the measurement showing it is unreachable behind the `Literal`.
 
-  Stated this way deliberately: "LimaRuntime is unproven" would be false (it
-  is proven for what it does), and "LimaRuntime works, ship it" would be
-  false too (nothing has driven odin's real workloads through it).
+  **WHAT REMAINS is the comparison itself: run the integration gate against
+  `lima`.** That is now possible and has NOT been done -- so nothing below is
+  retired, and "odin runs on Lima" is still not a claim anyone can make.
+  Probing the real VM while wiring the switch already found two things the gate
+  would hit immediately, both measured on a booted `odin-host` and both written
+  up in `docs/limits.md`:
+  - **`host.docker.internal` does not resolve inside a container in the VM.**
+    `ColimaRuntime._run_flags()` adds `--add-host …:host-gateway`; `LimaRuntime`
+    does not override `_run_flags`, and everything odin injects into a workload
+    (`AWS_ENDPOINT_URL`, the ALB/apigw upstreams) is spelled with that name. The
+    container's `/etc/hosts` holds only localhost and itself. `host.lima.internal`
+    resolves *in the VM* (`192.168.5.2`) but not in a container in it. This also
+    corrects `runtime/lima.py`'s own docstring, which reasoned from Lima's
+    VM→host port forwarding to "references work the same" -- true for host-side
+    probes, false for container-side references.
+  - **The VM has no host mounts** (`compute/lima_yaml.py` emits `"mounts": []`;
+    confirmed live -- no virtiofs/9p/reverse-sshfs, a real host dir lists
+    empty), so every bind mount is an empty directory: Lambda code at
+    `/var/task`, the Nebula sidecar's `/etc/nebula`, EFS task mounts. RDS
+    escapes only because it uses a NAMED volume.
+
+  So the accurate status is three-way, and the middle term is the new one:
+  "LimaRuntime is unproven" would be false (it is proven for what it does),
+  "nobody can choose it" is now false too, and "LimaRuntime works, ship it"
+  remains false -- nothing has driven odin's real workloads through it, and two
+  known gaps say what the first attempt will hit.
   2026-07-31).** *"I want to use lima or colima or something ONLY and not a mix
   of both like we currently have … something that handles containers as well as
   VMs natively."*

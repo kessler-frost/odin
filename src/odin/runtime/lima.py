@@ -1,12 +1,30 @@
 """A second Runtime impl: containers inside a shared Lima VM (VM isolation).
 
 Same interface as ColimaRuntime via the shared `_ContainerRuntime` base — the
-only differences are the CLI seam (`nerdctl` inside one odin Lima host VM
-instead of host `docker`) and that it omits Colima's host-gateway flag. Lima
-auto-forwards VM-bound ports to the Mac, so host-side probes and references work
-the same. Heavier than Colima (a VM boot), so it's an opt-in runtime for
-VM-level isolation. The subprocess seam is injectable for testing; the multi-Mac
-fleet (a Lima VM per remote Mac) is explicitly out of scope here.
+differences are the CLI seam (`nerdctl` inside one odin Lima host VM instead of
+host `docker`) and that it omits Colima's host-gateway flag. Heavier than Colima
+(a VM boot), so it's an opt-in runtime for VM-level isolation, selected with
+`ODIN_RUNTIME=lima` (`runtime/select.py`). The subprocess seam is injectable for
+testing; the multi-Mac fleet (a Lima VM per remote Mac) is explicitly out of
+scope here.
+
+THE HOST-GATEWAY OMISSION IS NOT COSMETIC, and this paragraph used to say it
+was. It read "Lima auto-forwards VM-bound ports to the Mac, so host-side probes
+and references work the same" — true of the first half, and the conclusion does
+not follow. Lima's port forwarding runs VM → host, so a host-side probe of a
+published port really does work the same; it gives a container INSIDE the VM no
+name for the host at all. Measured 2026-08-03 in a busybox container run by
+`nerdctl` in `odin-host`: `getent hosts host.docker.internal` and `getent hosts
+host.lima.internal` BOTH return nothing, and the container's entire `/etc/hosts`
+is localhost plus its own name. (`host.lima.internal` does resolve one layer
+out, in the VM itself — `192.168.5.2` — which is what `LIMA_HOST` below is for,
+and is a different thing from what a container can see.) Since `aws/backings.py`
+and `gateway/keys.py` inject `AWS_ENDPOINT_URL` as `http://host.docker.internal:
+<port>`, and `compute/proxy.py`/`compute/apigw.py` default their upstreams to
+the same name, a workload started under this runtime cannot currently reach
+odin's gateway by the address odin gave it. `_run_flags()` is where that would
+be fixed; see `docs/limits.md` for the rest of what the switch does not yet
+carry.
 
 Observability v1: `logs()` (inherited from `_ContainerRuntime`, unchanged) is
 a real `nerdctl logs` against a container inside this shared VM -- already a

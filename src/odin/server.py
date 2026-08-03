@@ -54,7 +54,7 @@ from odin.reconcile.dispatch import Dispatcher
 from odin.reconcile.drift import DriftSweeper
 from odin.reconcile.reconciler import LoopHealth, Reconciler
 from odin.reconcile.tf_status import stranded_in_tf_state
-from odin.runtime.colima import ColimaRuntime
+from odin.runtime.select import build_runtime
 from odin.settings import settings
 from odin.simulate.runner import SimulateBusy, TfRunner, TofuNotInstalled
 from odin.simulate.workspace import tf_dir
@@ -2177,9 +2177,13 @@ class Substrates:
     real-machine call.
 
     PRODUCTION IS UNCHANGED, and that is the property that makes this safe:
-    `create_app`'s `runtime` defaults to `ColimaRuntime()`, so the objects
+    `create_app`'s `runtime` defaults to `build_runtime()`, which is a
+    `ColimaRuntime()` unless `ODIN_RUNTIME` says otherwise, so the objects
     built here are the same objects the defaults built. The difference is only
-    that a test can now change them.
+    that a test can now change them -- and, since `ODIN_RUNTIME` exists, that
+    a user can. This bundle is what makes that switch worth anything: it is
+    the reason `ODIN_RUNTIME=lima` reaches every post-apply pass instead of
+    only the reconciler.
 
     `tasks`/`functions` are properties rather than fields because the call
     sites constructed a fresh one per call and there is no reason to start
@@ -2188,8 +2192,9 @@ class Substrates:
     """
 
     containers: object
-    """The `RuntimeDriver` every container substrate binds to -- `ColimaRuntime`
-    in production, the app's injected fake in a test."""
+    """The `RuntimeDriver` every container substrate binds to -- whichever
+    backend `ODIN_RUNTIME` selected in production (`ColimaRuntime` by default,
+    `LimaRuntime` when asked), the app's injected fake in a test."""
     root: Path
     """The store root. `FunctionRuntime` and `PostgresRds` both need it (code
     directories, the Nebula CA the mesh sidecar joins), and it is `stores.root`
@@ -2833,7 +2838,10 @@ def create_app(
       `runtime`  the container `RuntimeDriver` -- and, since the `Substrates`
                  bundle below, the one every container substrate the routes
                  build now binds to, instead of each call site defaulting to
-                 its own `ColimaRuntime()`.
+                 its own `ColimaRuntime()`. Passing one WINS over `ODIN_RUNTIME`
+                 (`runtime/select.py`): this is the injection seam, so ambient
+                 environment must never take an injected fake back. Left None,
+                 the setting chooses -- `colima` unless told otherwise.
       `rds`      a `PostgresRds` stand-in, honoured by BOTH the gateway's RDS
                  model and `/apply-full`'s converge pass.
       `vm`       the limactl-backed `InstanceVm`. Its own seam because it is
@@ -2853,7 +2861,14 @@ def create_app(
     # startup and blow up whenever that code path first ran -- which for most
     # of these knobs is "maybe never". pydantic names the variable.
     settings.validate_all()
-    _runtime = runtime or ColimaRuntime()
+    # The explicit argument still wins -- it is the TEST seam, and a test that
+    # hands in a fake must not have the ambient environment take it back. Only
+    # when nothing is passed does `ODIN_RUNTIME` decide, and with that unset
+    # `build_runtime()` returns the `ColimaRuntime()` this line used to name
+    # outright. Note `validate_all()` above runs FIRST on purpose: an
+    # unrecognised `ODIN_RUNTIME` fails the process there, by name, rather than
+    # reaching the backend map.
+    _runtime = runtime or build_runtime()
     _store = store or SpecStore(ODIN_DIR)
     # The startup EC2-VM reaper (release finding #4) cross-references
     # REAL, machine-global `limactl` VMs against this app's OWN store --

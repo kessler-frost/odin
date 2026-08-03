@@ -24,6 +24,10 @@ carries the reasoning next to each one.
   unrecognised `ODIN_REAP_EC2_VMS`, `ODIN_AI`, `ODIN_DEBUG_AGENT`,
   `ODIN_TRANSLATE_REFINE` or `ODIN_BACKING_MESH` never enables the dangerous
   side. A safety net you disabled by mistyping the value is not a safety net.
+  `ODIN_RUNTIME` is a *choice* rather than a flag and is strict for the mirror
+  reason: neither backend is the dangerous one, so there is no safe side to
+  fall toward, and reading a typo as `colima` would give someone who asked for
+  VM isolation containers on the host with nothing said.
 
 ## Gateway — `GatewaySettings`
 
@@ -54,6 +58,7 @@ carries the reasoning next to each one.
 
 | Variable | Default | What it does |
 | --- | --- | --- |
+| `ODIN_RUNTIME` | `colima` | Which container backend everything runs on. `colima` is `docker` on the host's Colima VM. `lima` is `nerdctl` inside odin's own shared `odin-host` Lima VM, for VM-level isolation — **see the caveats in [`limits.md`](limits.md#odin_runtimelima-is-selectable-not-yet-proven-for-odins-workloads) before using it.** Lower-case only, and an unrecognised value is a startup error rather than a silent fall back to `colima`. |
 | `ODIN_BOOT_TIMEOUT` | `300` s | How long an EC2 node's Lima VM may take to report a running guest. Raise it on a loaded Mac; the **default deliberately does not move**, because a longer one makes a genuinely hung boot slower to report. |
 | `ODIN_MAX_CONCURRENT_VM_BOOTS` | `3` | Concurrent `limactl create`/`start` calls. Unbounded, N EC2 nodes stampede the machine at once. |
 | `ODIN_MIN_DISK_GIB` | `10` | Free-disk floor an Apply requires. Matches `odin doctor`'s own figure, so the two agree on "enough disk". |
