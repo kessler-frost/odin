@@ -244,6 +244,53 @@ than claimed" — was the single most valuable output of the field tests.
    endpoints. Checking two points and inferring the middle turns a six-hour
    develop-only regression into a claim about released software.
 
+## Configuration is a Settings class. A REGISTRY is not configuration.
+(owner directive, 2026-08-03)
+
+**Config goes in `src/odin/settings.py`** — domain-specific pydantic
+`BaseSettings` classes (`GatewaySettings`, `ReconcileSettings`,
+`SimulateSettings`, `ComputeSettings`, `MeshSettings`, `AiSettings`) composed
+onto ONE singleton, imported where needed. `env_prefix="ODIN_"`, typed fields,
+validated at construction.
+
+**Why:** the state this replaced was 30 distinct `ODIN_*` variables read
+directly in 19 files, each with its own ad-hoc parsing and none validated — so
+`ODIN_DISPATCH_TICKS=abc` failed whenever that code path first ran, if ever,
+rather than at startup. And there was nowhere to look up what odin's knobs even
+are. A scalar tunable added anywhere else is a knob nobody can find.
+
+**Carry a default's REASON with it.** Several are load-bearing and measured —
+`READY_TIMEOUT = 120.0` is sized for first-run image pulls, and the EC2 boot
+ceiling's default "deliberately stays put" because a longer one makes a
+genuinely hung boot slower to report. A default without its reason is the next
+thing someone tidies.
+
+**THE TRAP, and it is rule 5's shape: tests monkeypatch these variables.** A
+singleton read ONCE at import time makes every `monkeypatch.setenv` silently
+ineffective — the test sets the var, the code reads a value captured at import,
+and the test passes for the wrong reason with nothing failing. So settings must
+be read at USE time, and the proof is two mutations, not one: a test that
+monkeypatches a var must still pass when you break the production default, and
+a test that relies on the default must FAIL when you change it. Demonstrate
+both or the object is being read at the wrong moment.
+
+**A REGISTRY IS NOT A SETTING, and must not become one.** `_CARRIED_ATTRS`,
+`_KIND`, `_BUILDERS`, `TF_OWNED_KINDS`, `_ALB_COMPANION_TYPES`,
+`_RESTJSON_SERVICES` are static DOMAIN KNOWLEDGE the code dispatches on. Nobody
+overrides them with an environment variable. Making them settings fields would
+imply they are user-configurable, put env lookup on a hot path, and lose the
+exhaustiveness checking that is the point of them.
+
+**What registries DO owe you is a test, because an entry is a PROMISE.**
+`_CARRIED_ATTRS["ecs"]` claims a round trip reproduces that argument — and
+membership SUPPRESSES the warning that would otherwise name it, so a false
+entry is worse than a missing one. Measured: `alb → ecs` silently lost its whole
+`load_balancer` block on import with `unsupported == []` and no warning at all,
+precisely because the entry was there. Every registry entry needs a test that
+would fail if the promise broke, and that test must use a value THE GENERATOR'S
+DEFAULT CANNOT REPRODUCE — a round trip over a default passes even when import
+drops the field, because the generator refills it.
+
 ## Browser automation: `agent-browser` (playwright-cli removed 2026-07-27)
 `agent-browser` (brew, Apache-2.0) is the only browser driver. `@playwright/cli`
 and its skill are gone; nothing in odin depended on them
