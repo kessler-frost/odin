@@ -26,6 +26,7 @@ from odin.server import create_app
 from odin.spec.store import SpecStore
 from tests.api.test_env_rm import DROP, KEEP, CleanRuntime, FakeAws, S3_CANVAS
 from tests.api.test_apply import FakeRds
+from tests.substrates import NoVm
 
 BASE = "http://localhost:4200"
 
@@ -38,9 +39,11 @@ def _through(client: TestClient):
 
 
 def _live(tmp_path, monkeypatch, runtime=None):
+    # `vm=NoVm()`: `odin env rm` sweeps this env's Lima disks -- see
+    # `tests/api/test_destroy_tf.py::_app`. Nothing here asserts on one.
     app = create_app(
         runtime=runtime or CleanRuntime(), store=SpecStore(tmp_path),
-        rds=FakeRds(), aws=FakeAws(), reap_ec2_vms=False,
+        rds=FakeRds(), aws=FakeAws(), reap_ec2_vms=False, vm=NoVm(),
     )
     client = TestClient(app)
     monkeypatch.setattr(http, "request", _through(client))

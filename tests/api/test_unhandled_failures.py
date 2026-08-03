@@ -48,6 +48,7 @@ from odin.server import create_app
 from odin.spec.store import SpecStore, StoreUnreadable
 from odin.spec import store as store_mod
 from odin.spec.translate import canvas_to_stack
+from tests.substrates import NoVm
 
 S3_ONLY = {"nodes": [{"type": "s3", "data": {"label": "uploads"}}], "edges": []}
 
@@ -134,8 +135,12 @@ def _gone(container: str = "odin-aws-rustfs-applyfix", observed: str = "absent")
 
 
 def _app(tmp_path, aws=None):
+    # `vm=NoVm()`: `/destroy` sweeps this env's Lima VMs and disks -- see
+    # `tests/api/test_destroy_tf.py::_app`. The two tests here that make
+    # `ec2compute` raise install their own stub over it, which is the point:
+    # this file is about the VERDICT, so its VM must never be a real one.
     return create_app(runtime=FakeRuntime(), store=SpecStore(tmp_path),
-                      rds=FakeRds(), aws=aws or FakeAws(), backings=False)
+                      rds=FakeRds(), aws=aws or FakeAws(), backings=False, vm=NoVm())
 
 
 def _patch_translate(monkeypatch) -> None:
@@ -277,7 +282,13 @@ def test_destroy_reports_a_failed_vm_reclaim_with_the_vm_names_in_the_body(tmp_p
     """The claim `/destroy` already made in a comment, now true. `ReclaimFailed`
     used to escape unhandled, so the VM names -- the entire point of the
     exception -- reached the server log and never the caller."""
-    def boom(stores, env):
+    # `(stores, env, vm)` -- the real signature. `reclaim_env_instances` has
+    # always taken an injectable `vm`, and `/destroy` now passes the app's own
+    # (`server.py::Substrates.vm`) instead of letting the model build a real
+    # limactl-backed one. A stub that kept the old two-argument shape would
+    # raise `TypeError` from the route and this test would assert its verdict
+    # against the WRONG exception -- green on the status, meaningless.
+    def boom(stores, env, vm=None):
         raise ec2compute.ReclaimFailed(
             f"env {env!r} is NOT destroyed: 1 EC2 VM(s) are still running and could not be "
             "deleted -- odin-ec2-applyfix-i-123 (limactl: timed out)."
@@ -307,7 +318,7 @@ def test_destroy_reports_a_failed_vm_reclaim_with_the_vm_names_in_the_body(tmp_p
 
 
 def test_apply_full_reports_a_mesh_refresh_failure_by_name(tmp_path, monkeypatch):
-    def boom(stores, env):
+    def boom(stores, env, vm=None):  # `(stores, env, vm)` -- the real signature
         raise ec2compute.MeshRefreshFailed("web1 did not take its new security groups")
 
     _patch_translate(monkeypatch)
@@ -328,7 +339,7 @@ def test_an_exception_type_nobody_mapped_still_fails_loudly_in_json(tmp_path, mo
     failure. A future way for a route to blow up therefore reports a failure, in
     JSON, naming the real exception -- it cannot inherit a success or a bare
     traceback by being forgotten."""
-    def boom(stores, env):
+    def boom(stores, env, vm=None):  # `(stores, env, vm)` -- the real signature
         raise ZeroDivisionError("a bug nobody has met yet")
 
     _patch_translate(monkeypatch)

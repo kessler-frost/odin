@@ -539,8 +539,15 @@ async def test_a_task_container_removed_mid_apply_is_seen_within_one_tick(tmp_pa
     store = SpecStore(tmp_path)
     store.apply(Stack(resources=(ResourceDesired(id="app", kind="ecs"),)))
     stores = _ecs_service_stores(tmp_path, ["t1", "t2"])
+    # `lambda containers:` -- the real arity. `project` now builds its task view
+    # as `TaskRuntime(containers)` from the RECONCILER'S OWN runtime instead of
+    # a bare `TaskRuntime()`, so a fake-runtime app's trailing tick stops
+    # reaching real `docker` (see `server.py::Substrates`). Spelling the
+    # parameter out rather than `*_` keeps this fake failing loudly the next
+    # time the real signature moves.
     monkeypatch.setattr(
-        tf_status, "TaskRuntime", lambda: FakeTaskContainers({"t1": "running", "t2": "running"}),
+        tf_status, "TaskRuntime",
+        lambda containers: FakeTaskContainers({"t1": "running", "t2": "running"}),
     )
     # The drift sweeper sees BOTH containers, so it is not what reports this.
     recon = Reconciler(
@@ -552,7 +559,8 @@ async def test_a_task_container_removed_mid_apply_is_seen_within_one_tick(tmp_pa
 
     async with recon.hold():  # an apply is now in flight, actions suspended
         monkeypatch.setattr(
-            tf_status, "TaskRuntime", lambda: FakeTaskContainers({"t1": "running", "t2": "absent"}),
+            tf_status, "TaskRuntime",
+            lambda containers: FakeTaskContainers({"t1": "running", "t2": "absent"}),
         )
         await recon.tick()
 

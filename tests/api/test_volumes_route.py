@@ -31,6 +31,7 @@ from fastapi.testclient import TestClient
 from odin.server import create_app
 from odin.spec.store import SpecStore
 from tests.api.test_apply import CANVAS, FakeRds
+from tests.substrates import NoVm
 from tests.api.test_env_rm import CleanRuntime, FakeAws
 
 LIVE = "vols-live"
@@ -47,9 +48,12 @@ class NoVolumeSurface:
 
 
 def _app(tmp_path, runtime):
+    # `vm=NoVm()`: this route's sibling teardown sweeps Lima disks too -- see
+    # `tests/api/test_destroy_tf.py::_app`. The DOCKER volumes this file is
+    # about still come from the injected `runtime`.
     return create_app(
         runtime=runtime, store=SpecStore(tmp_path), rds=FakeRds(), aws=FakeAws(),
-        reap_ec2_vms=False,
+        reap_ec2_vms=False, vm=NoVm(),
     )
 
 

@@ -10,6 +10,7 @@ from odin.runtime.colima import ContainerFacts, HostFacts, RunHandle
 from odin.server import create_app
 from odin.simulate.workspace import tf_dir
 from odin.spec.store import SpecStore
+from tests.substrates import NoVm
 from tests.volumes import FakeVolumes
 
 
@@ -68,7 +69,7 @@ def test_apply_stores_the_stack_and_never_creates_a_tf_owned_resource(tmp_path):
     the database here would race the `tofu apply` that `/apply-full` runs (the
     exact class of bug /apply-full's deferred store commit exists to avoid)."""
     rt, rds = FakeRuntime(), FakeRds()
-    app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, backings=False)
+    app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, backings=False, vm=NoVm())
     with TestClient(app) as client:
         resp = client.post("/apply", json=CANVAS)
         assert resp.json()["status"] == "applied" and resp.json()["rev"]
@@ -83,7 +84,7 @@ def test_apply_stores_the_stack_and_never_creates_a_tf_owned_resource(tmp_path):
 
 def test_mesh_endpoint_returns_empty_network(tmp_path):
     rt, rds = FakeRuntime(), FakeRds()
-    app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, backings=False)
+    app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, backings=False, vm=NoVm())
     with TestClient(app) as client:
         body = client.get("/mesh").json()
         assert body["network"] == "default" and body["hosts"] == []  # no hosts joined yet
@@ -91,7 +92,7 @@ def test_mesh_endpoint_returns_empty_network(tmp_path):
 
 def test_destroy_prunes(tmp_path):
     rt, rds = FakeRuntime(), FakeRds()
-    app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, backings=False)
+    app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, backings=False, vm=NoVm())
     with TestClient(app) as client:
         client.post("/apply", json=CANVAS)
         client.post("/destroy")
@@ -163,7 +164,7 @@ def test_destroy_boots_the_backings_before_tofu_then_gcs_them_after(tmp_path, mo
     monkeypatch.setattr("odin.simulate.runner.TfRunner.destroy", fake_destroy)
     app = create_app(
         runtime=FakeRuntime(), store=SpecStore(tmp_path), rds=FakeRds(),
-        aws=RecordingAws(log), backings=False,
+        aws=RecordingAws(log), backings=False, vm=NoVm(),
     )
     (tmp_path / "default" / "tf").mkdir(parents=True)  # a workspace exists -> tofu runs
     with TestClient(app) as client:
@@ -189,7 +190,7 @@ def test_destroy_with_no_tf_workspace_boots_nothing(tmp_path):
     log: list = []
     app = create_app(
         runtime=FakeRuntime(), store=SpecStore(tmp_path), rds=FakeRds(),
-        aws=RecordingAws(log), backings=False,
+        aws=RecordingAws(log), backings=False, vm=NoVm(),
     )
     with TestClient(app) as client:
         client.post("/apply", json=S3_CANVAS)
@@ -200,7 +201,7 @@ def test_destroy_with_no_tf_workspace_boots_nothing(tmp_path):
 
 def test_destroy_revokes_the_envs_gateway_keys(tmp_path):
     rt, rds = FakeRuntime(), FakeRds()
-    app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, backings=False)
+    app = create_app(runtime=rt, store=SpecStore(tmp_path), rds=rds, backings=False, vm=NoVm())
     with TestClient(app) as client:
         client.post("/apply", json=CANVAS)
         access_key, _secret_key = app.state.gateway_keys.issue("default", "db")

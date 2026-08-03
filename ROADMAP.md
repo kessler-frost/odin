@@ -2192,28 +2192,70 @@ run and are not described as such.
   falsification tests, never the equality.
 
 - [ ] **A fake runtime does not isolate `/apply-full`, so a "unit" test boots real
+- [x] **A fake runtime does not isolate `/apply-full`, so a "unit" test boots real
   containers.** Measured 2026-07-29, after it leaked four containers into every
   unit-suite run and cost a release-gate diagnosis.
   `create_app(runtime=FakeRuntime(), rds=FakeRds(), aws=FakeAws(), backings=False)`
-  reads as hermetic and is not: `/apply-full` runs a real `tofu apply`, and the
-  gateway's own models default their substrate (`lambdactl` to
+  read as hermetic and was not: `/apply-full` ran a real `tofu apply`, and the
+  gateway's own models defaulted their substrate (`lambdactl` to
   `FunctionRuntime(ColimaRuntime(), ...)`, rdsctl and cachectl likewise), so the
-  injected fakes are bypassed and real Postgres, Redis and RIE containers start.
-  `tests/spec/test_connection_edges.py` took 68s in the "unit" suite for this
-  reason.
+  injected fakes were bypassed and real Postgres, Redis and RIE containers
+  started. `tests/spec/test_connection_edges.py` took 68s in the "unit" suite for
+  this reason.
 
-  The asymmetry is the actual defect, and it guarantees a leak rather than merely
-  risking one: **creation is real and teardown is fake.** The gateway created a
+  The asymmetry was the actual defect, and it guaranteed a leak rather than merely
+  risking one: **creation was real and teardown was fake.** The gateway created a
   real Postgres through `ColimaRuntime`; `/destroy` runs through the reconciler,
   which DOES honour `FakeRds`, so it destroyed a fake and left the container
   standing. Measured — `/destroy` cleared the lambda and cache containers and left
   `odin-rds-conn2-app-db` and `odin-rds-conn2-other-db` running.
 
-  Patched at the call site (`_torn_down` destroys, then reaps that env's own
-  containers by name and asserts the end state). The real fix is in the seam: a
-  test that injects a fake runtime should get a gateway whose models use it, or
-  `create_app` should refuse the combination rather than silently half-honour it.
-  Until then, every `/apply-full` test needs Docker and nobody is told.
+  **Fixed in the seam (v0.8.21), and the enumeration came first.** Every spawn the
+  whole unit suite makes was recorded by hooking `subprocess.Popen.__init__` and
+  `BaseEventLoop.subprocess_exec` — not `odin.util`, which would have shared a
+  source with its subject. 3976 tests, before: **216 tests spawned
+  docker/limactl/tofu/nebula-cert**, of which the `create_app`+TestClient ones
+  were `test_env_rm` (19, `limactl disk list`), `test_destroy_tf` (18, same),
+  `test_apply_full` (14 — 12 a `tmp_path` tofu STUB, 2 real `docker logs`),
+  `test_apply` (4), `test_connection_edges` (2 — real `/opt/homebrew/bin/tofu`,
+  real `docker run -d`, real `docker volume create`, real `limactl`),
+  `test_volumes_route` (2), `test_unhandled_failures` (1), `test_tf_status` (1,
+  real `docker ps`), `test_reconciler` (1, real `docker logs`).
+
+  **What leaked, and it was not the gateway models.** Every post-apply pass
+  already TOOK an injectable substrate; nothing ever passed one, so each built its
+  own — `ecsctl.converge_services` a bare `TaskRuntime()`,
+  `lambdactl.converge_functions` a `FunctionRuntime(ColimaRuntime(), ...)`,
+  `rdsctl` a real `PostgresRds`, `drift.sweep_compute` a real `ColimaRuntime`,
+  `ec2compute`/`route53_hosts` a real limactl `InstanceVm`, and
+  `Reconciler._project_tf_owned` (the tick `/apply-full` ends with) both of the
+  first two. `server.py::Substrates` is the missing caller: one bundle, built once
+  from the runtime the app was handed, threaded into every pass. Production is
+  byte-identical — `create_app`'s runtime defaults to `ColimaRuntime()`, so the
+  objects are the ones the defaults built.
+
+  **Two seams a `RuntimeDriver` fake structurally cannot cover, so `create_app`
+  grew them**: `vm=` (Lima — `RuntimeDriver` is a container API and a VM is not a
+  container) and `runner=` (the `tofu` BINARY — not a substrate odin drives at
+  all). Naming them is the honest half; without them "a fake runtime isolates
+  this" would have stayed a claim that could not be true.
+
+  Measured after, same probe: **161 tests**, limactl 53 → 2 (both a deliberate
+  `/nonexistent/limactl` in the recorder's own falsification test), docker 18 → 3.
+  `test_connection_edges` no longer appears at all. Proved a second way with
+  `DOCKER_HOST` pointed at a dead socket — see `tests/api/test_apply_full_
+  isolation.py`, which is the ratchet: it fails if `/apply-full` or `/destroy`
+  spawns anything on a fake-runtime app. 12/12 mutations caught (each seam
+  reverted to its pre-fix default one at a time).
+
+  **What is still standing, named rather than implied.** `agent/hcl.py`'s tests
+  run the REAL `tofu fmt`/`validate` (126 spawns) — deliberate, they check
+  generated HCL against the real parser. `tests/gateway/test_ec2compute.py`,
+  `test_ec2net*`, `test_ec2_volumes`, `test_empty_reasons`,
+  `test_records_roundtrip` and `test_elbv2ctl` still shell out to `nebula-cert`
+  (190) and `limactl`: they call the gateway models directly rather than through
+  `create_app`, so `Substrates` never reaches them. Same shape, different entry
+  point, and not fixed here.
 
 
 - [x] **Event delivery: triggers that actually fire.** odin could record "when X

@@ -15,6 +15,7 @@ import logging
 import shutil
 from collections.abc import Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
@@ -35,7 +36,10 @@ from odin.api.logs import create_logs_router
 from odin.api.events import SSE_HEADERS, ConnectionManager, event_stream
 from odin.aws.backings import PROVISIONED, BackingAws, BackingUnavailable
 from odin.aws.rds import reclaim_env_volumes, volume_env_candidates
+from odin.aws.rds import PostgresRds
 from odin.aws.rds import volume_name as rds_volume_name
+from odin.compute.functions import FunctionRuntime
+from odin.compute.instances import InstanceVm
 from odin.compute.tasks import TaskRuntime
 from odin.fabric.localhost import LocalhostFabric
 from odin.fabric.nebula import mesh_state, reap_orphaned_lighthouses
@@ -999,10 +1003,15 @@ def _stale_resource(resource: dict, health: LoopHealth) -> dict:
 
 def create_apply_router(
     store: SpecStore, reconciler_for, keystore: KeyStore, runner: TfRunner, gateway_port, env_epoch: dict[str, int],
-    stores: SynthStores, gateway: GatewayState, runtime, reconcilers: dict[str, Reconciler],
+    stores: SynthStores, gateway: GatewayState, substrates: Substrates, reconcilers: dict[str, Reconciler],
     chat_sessions: dict[str, list[tuple[str, str]]] | None = None,
 ) -> APIRouter:
     router = APIRouter()
+    # The app's OWN substrates, never a per-call-site default. `/destroy` and
+    # `/envs/rm` reclaim real Lima VMs and real Lima disks, and both used to
+    # build their own `InstanceVm()` inside `ec2compute`; a fake-runtime app
+    # therefore shelled out to `limactl` on every teardown. See `Substrates`.
+    runtime = substrates.containers
     # `/envs/rm` forgets these too -- see `_remove_env`. Defaulted so every
     # existing caller (the api tests build this router directly) keeps working;
     # `create_app` passes the real ones the chat route and the stream use.
@@ -1179,7 +1188,7 @@ def create_apply_router(
             # VM names reached the server log and the caller got the bare text
             # `Internal Server Error`. `_EXCEPTION_VERDICTS` is what actually
             # puts them in a 500 JSON body now.
-            reclaimed = await ec2compute.reclaim_env_instances(stores, env)
+            reclaimed = await ec2compute.reclaim_env_instances(stores, env, substrates.vm)
             if reclaimed:
                 body["reclaimed_vms"] = reclaimed
             # ...and then the EBS disks, in that order and never the other
@@ -1191,7 +1200,7 @@ def create_apply_router(
             # too -- an unreclaimed volume is gigabytes on a machine with
             # limited headroom, and reporting `destroyed` over it is the
             # exact lie the VM reclaim above exists to stop telling.
-            disks = await ec2compute.reclaim_env_disks(stores, env)
+            disks = await ec2compute.reclaim_env_disks(stores, env, substrates.vm)
             if disks.standing:
                 raise ec2compute.disks_standing(env, disks.standing)
             if disks.reclaimed:
@@ -1308,7 +1317,7 @@ def create_apply_router(
         # already gone, so nothing here would ever name it again. `env` is a
         # name a human typed, and the sweep is scoped to `odin-ebs-{env}-`,
         # so it can only reach disks odin made for this env.
-        disks = await ec2compute.reclaim_env_disks(stores, env)
+        disks = await ec2compute.reclaim_env_disks(stores, env, substrates.vm)
         detail["reclaimed"]["disks"] = list(disks.reclaimed)
         if disks.standing:
             return "volumes_standing", {**detail, "still_standing": {"disks": list(disks.standing)}}
@@ -2135,9 +2144,81 @@ def _tf_failed_note(faults: list[dict]) -> str:
     return f"{_TF_FAILED_NOTE}. odin's own records say why: {named}" if named else _TF_FAILED_NOTE
 
 
+@dataclass(frozen=True)
+class Substrates:
+    """Every real-machine binding a route needs, built ONCE from the runtime
+    the app was handed instead of defaulted independently at each call site.
+
+    ## The defect this exists to close
+
+    `create_app(runtime=FakeRuntime(), rds=FakeRds(), aws=FakeAws(),
+    backings=False)` read as hermetic and was not. Measured 2026-07-29, after
+    it leaked four containers into every unit-suite run and cost a release-gate
+    diagnosis: the reconciler honoured the fakes, and every post-apply pass
+    reached past them to the machine, because each one owned its own
+    `x or RealThing()` default -- `ecsctl.converge_services` a bare
+    `TaskRuntime()`, `lambdactl.converge_functions` a
+    `FunctionRuntime(ColimaRuntime(), ...)`, `rdsctl` a real `PostgresRds`,
+    `drift.sweep_compute` a real `ColimaRuntime`, `ec2compute` and
+    `route53_hosts` a real limactl-backed `InstanceVm`.
+
+    The asymmetry is what made a leak CERTAIN rather than merely possible:
+    creation was real and teardown was fake. `/destroy` goes through the
+    reconciler, which does honour `FakeRds`, so it destroyed a stand-in and
+    left the real container standing -- measured, `odin-rds-conn2-app-db` and
+    `odin-rds-conn2-other-db` still running after a destroy reported success.
+
+    Every one of those functions ALREADY took an injectable substrate; nothing
+    ever passed one. So this is not a new seam, it is the missing caller: the
+    defaults were correct in isolation and wrong in aggregate, which is exactly
+    the shape a per-call-site fix cannot reach (honesty rule 2 -- fix the shape,
+    not the instance). One object, built once, threaded everywhere, so a new
+    post-apply pass that forgets it is a visible omission rather than a silent
+    real-machine call.
+
+    PRODUCTION IS UNCHANGED, and that is the property that makes this safe:
+    `create_app`'s `runtime` defaults to `ColimaRuntime()`, so the objects
+    built here are the same objects the defaults built. The difference is only
+    that a test can now change them.
+
+    `tasks`/`functions` are properties rather than fields because the call
+    sites constructed a fresh one per call and there is no reason to start
+    sharing state; `database` is a method because a `PostgresRds` is env-scoped
+    (`rdsctl._substrate`'s own shape).
+    """
+
+    containers: object
+    """The `RuntimeDriver` every container substrate binds to -- `ColimaRuntime`
+    in production, the app's injected fake in a test."""
+    root: Path
+    """The store root. `FunctionRuntime` and `PostgresRds` both need it (code
+    directories, the Nebula CA the mesh sidecar joins), and it is `stores.root`
+    -- the same directory `rdsctl._substrate` reads."""
+    vm: InstanceVm
+    """The limactl-backed VM substrate. NOT derivable from `containers`: a
+    `RuntimeDriver` is a container API and Lima is not one, so a test that
+    injects only a fake runtime still reaches limactl through this. That is why
+    `create_app` takes its own `vm=` seam."""
+    rds: object | None = None
+    """`create_app`'s `rds=` stand-in, or None to build the real per-env
+    `PostgresRds`. Same meaning it already has on `create_gateway_app`, so one
+    injection covers the gateway's RDS model and the apply's converge pass."""
+
+    @property
+    def tasks(self) -> TaskRuntime:
+        return TaskRuntime(self.containers)
+
+    @property
+    def functions(self) -> FunctionRuntime:
+        return FunctionRuntime(self.containers, self.root)
+
+    def database(self, env: str) -> object:
+        return self.rds or PostgresRds(self.containers, env, root=self.root)
+
+
 def create_apply_full_router(
     store: SpecStore, reconciler_for, runner: TfRunner, keystore: KeyStore, gateway_port, env_epoch: dict[str, int],
-    translate_cache: translate_mod.TranslateCache, runtime, stores: SynthStores,
+    translate_cache: translate_mod.TranslateCache, substrates: Substrates, stores: SynthStores,
 ) -> APIRouter:
     """S5 -- the UI's single Apply button: /apply's exact canvas->Stack->tick
     semantics, then translate (S3b) and, when the canvas has TF-supported
@@ -2217,7 +2298,7 @@ def create_apply_full_router(
         # Owner directive B1: reject BEFORE ensure_backings/translate/tofu
         # ever touch a container or VM, not after 20 of them have already
         # started thrashing the host.
-        rejection = await _admission_rejection(runtime, store, stack)
+        rejection = await _admission_rejection(substrates.containers, store, stack)
         if rejection is not None:
             return rejection
 
@@ -2373,9 +2454,15 @@ def create_apply_full_router(
         # task). This is odin's equivalent, triggered by the user's Apply
         # rather than a background timer, and idempotent: a service already at
         # desiredCount launches nothing.
-        # A bare `TaskRuntime()` (not this app's `runtime`) deliberately: it
-        # must be the SAME substrate that launched these containers, and
-        # ecsctl's own `runtime or TaskRuntime()` default is what did.
+        # `substrates.tasks` -- THIS APP'S runtime, not a bare `TaskRuntime()`.
+        # The old line built its own and said so deliberately, on the argument
+        # that the converge must use the same substrate that launched these
+        # containers and ecsctl's `runtime or TaskRuntime()` default is what
+        # did. The argument was right and its conclusion was wrong: the thing
+        # that launched them is the app's runtime, and in production that IS
+        # `ColimaRuntime()`, so nothing changes for a real user. What changed is
+        # that a test injecting a fake runtime is no longer bypassed here -- see
+        # `Substrates` for the four containers this leaked into every unit run.
         # Correct the records BEFORE converging anything.
         #
         # `converge_services`/`converge_functions`/`converge_db_instances` only
@@ -2395,11 +2482,11 @@ def create_apply_full_router(
         # is skipped, which is the concern the post-apply sweep's own comment
         # raises. That later sweep stays exactly where it is -- it verifies
         # what this one enabled.
-        await drift.sweep_compute(stores, env)
+        await drift.sweep_compute(stores, env, containers=substrates.containers)
         # Read WHO is broken between the sweep that marks it and the converges
         # that clear the mark -- this is the only instant both are true.
-        recovering = await _recovering_resources(stores, env, runtime)
-        converging = await ecsctl.converge_services(stores, env, TaskRuntime(), keystore, gateway_port())
+        recovering = await _recovering_resources(stores, env, substrates.containers)
+        converging = await ecsctl.converge_services(stores, env, substrates.tasks, keystore, gateway_port())
         # The same recovery for lambda, and for the same reason: a function's
         # RIE container is its EXECUTION ENVIRONMENT, not a TF resource -- an
         # `aws_lambda_function`'s config doesn't change when its container is
@@ -2407,7 +2494,9 @@ def create_apply_full_router(
         # diff on), so tofu's plan is empty forever. Real Lambda's own control
         # plane replaces a dead sandbox; this is odin's equivalent. Idempotent:
         # only a `Failed` function is re-`ensure`d, an Active one is untouched.
-        deploying = lambdactl.converge_functions(stores, env, keystore=keystore, gateway_port=gateway_port())
+        deploying = lambdactl.converge_functions(
+            stores, env, substrate=substrates.functions, keystore=keystore, gateway_port=gateway_port(),
+        )
         # W2.7: and the same recovery for rds. A Postgres container is odin's
         # execution substrate for a resource whose terraform config is
         # unchanged (`status` is read-only Computed in the provider's schema),
@@ -2416,7 +2505,7 @@ def create_apply_full_router(
         # one is re-created and re-`pg_ready`-gated. This is what makes the
         # scenario-2 crash/recover behavior survive the move off the
         # reconciler -- see reconcile/drift.py's rds notes.
-        booting = rdsctl.converge_db_instances(stores, env)
+        booting = rdsctl.converge_db_instances(stores, env, substrate=substrates.database(env))
         # W2.6/field test 2 HIGH-1: push every RUNNING EC2 VM's CURRENT
         # security groups into its already-booted VM. An SG edit reached the
         # gateway and the newly-created VMs but never the already-running ones,
@@ -2433,7 +2522,7 @@ def create_apply_full_router(
         # restarts its daemon and pokes it into re-handshaking with every peer,
         # all synchronously, so by the time it returns the database is looking
         # at the new identity.
-        await ec2compute.ensure_instance_mesh(stores, env)
+        await ec2compute.ensure_instance_mesh(stores, env, substrates.vm)
         # ...then make each running VM's /etc/hosts match this env's route53
         # records. AFTER the mesh pass, and that order is load-bearing rather
         # than tidy: a VM can only reach another VM over the Nebula overlay (a
@@ -2449,14 +2538,14 @@ def create_apply_full_router(
         # Without this call a record edited after boot could never reach the
         # guest. Cheap: an unchanged record set is one local file comparison
         # per instance -- no `limactl`. See gateway/route53_hosts.py.
-        await route53_hosts.ensure_instance_hosts(stores, env)
+        await route53_hosts.ensure_instance_hosts(stores, env, substrates.vm)
         # ...then push each live database's SG-compiled firewall into its mesh
         # sidecar. An apply is exactly the right cadence -- security groups are
         # TF-owned, so an edited `db-sg` only reaches the gateway here. Also
         # heals a sidecar that was killed under a still-running database, and
         # carries the membership revision that closes the flows above. See
         # rdsctl.ensure_db_mesh.
-        await rdsctl.ensure_db_mesh(stores, env)
+        await rdsctl.ensure_db_mesh(stores, env, substrate=substrates.database(env))
         # Field test 3 (HIGH): an Apply may not report success while a service
         # is short of its desired task count. tofu's own `wait_for_steady_state`
         # only runs when tofu UPDATES the service, so every apply tofu sees as a
@@ -2470,7 +2559,7 @@ def create_apply_full_router(
         # would only make an already-honest failure slower. Off the event loop:
         # `wait_for_steady_services` joins real threads and sleeps.
         if body["status"] == "applied":
-            shortfalls = await ecsctl.wait_for_steady_services(stores, env, TaskRuntime(), converging)
+            shortfalls = await ecsctl.wait_for_steady_services(stores, env, substrates.tasks, converging)
             if shortfalls:
                 body["status"] = "applied_services_unhealthy"
                 body["unhealthy"] = [s._asdict() for s in shortfalls]
@@ -2510,7 +2599,7 @@ def create_apply_full_router(
             # finished. `tf_status.project()` calls the SAME function, so
             # `/world` and this apply read one corrected record rather than two
             # checks that can disagree.
-            await drift.sweep_compute(stores, env)
+            await drift.sweep_compute(stores, env, containers=substrates.containers)
             unhealthy = _known_faults(stores, env)
             if unhealthy:
                 body["status"] = "applied_resources_unhealthy"
@@ -2736,7 +2825,29 @@ def create_app(
     backings: bool = True,
     gateway_port: int | None = None,
     reap_ec2_vms: bool | None = None,
+    vm=None,
+    runner=None,
 ) -> FastAPI:
+    """The control app. Four substrate seams, all defaulting to the real thing:
+
+      `runtime`  the container `RuntimeDriver` -- and, since the `Substrates`
+                 bundle below, the one every container substrate the routes
+                 build now binds to, instead of each call site defaulting to
+                 its own `ColimaRuntime()`.
+      `rds`      a `PostgresRds` stand-in, honoured by BOTH the gateway's RDS
+                 model and `/apply-full`'s converge pass.
+      `vm`       the limactl-backed `InstanceVm`. Its own seam because it is
+                 NOT derivable from `runtime`: a `RuntimeDriver` is a container
+                 API and Lima is not one, so an app given only a fake runtime
+                 still shelled out to `limactl` on every `/destroy`.
+      `runner`   the `TfRunner`. Also its own seam, and for the same kind of
+                 reason: tofu is a BINARY on PATH, not a container substrate,
+                 so no runtime fake can stand in for it. Without this there is
+                 no way to build an app whose Apply provably spawns nothing --
+                 which is what `tests/api/test_apply_full_isolation.py` pins.
+
+    `backings` stays what it always was: the reconciler's own real-substrate
+    switch (`BackingAws`, the drift sweeper, the event dispatcher)."""
     # Every `ODIN_*` knob, parsed and bounded HERE, before anything boots. The
     # state this replaced let a non-numeric `ODIN_DISPATCH_TICKS` sail through
     # startup and blow up whenever that code path first ran -- which for most
@@ -2773,7 +2884,16 @@ def create_app(
     # gateway above under the OPERATOR principal. No lifespan hook of its own
     # (unlike reconcilers) -- routes only ever run once lifespan has resolved
     # gateway_port_actual, so a plain closure over it is enough.
-    tf_runner = TfRunner(_store.root, ws_manager)
+    tf_runner = runner or TfRunner(_store.root, ws_manager)
+    # Every real-machine binding the ROUTES need, built once from this app's
+    # own runtime rather than defaulted independently inside each post-apply
+    # pass. See `Substrates` for the leak that closes. `gateway_stores.root` is
+    # `_store.root`; it is spelled through the stores because that is the
+    # directory `rdsctl._substrate`/`FunctionRuntime` really read, so the two
+    # cannot drift apart.
+    substrates = Substrates(
+        containers=_runtime, root=gateway_stores.root, vm=vm or InstanceVm(), rds=rds,
+    )
     # Release finding #4: a per-env generation counter /destroy and an
     # empty-canvas /apply-full bump -- see _bump_epoch's own docstring.
     env_epoch: dict[str, int] = {}
@@ -3001,7 +3121,7 @@ def create_app(
     app.include_router(
         create_apply_router(
             _store, reconciler_for, gateway_keystore, tf_runner, lambda: gateway_port_actual, env_epoch,
-            gateway_stores, gateway_state, _runtime, reconcilers, chat_sessions,
+            gateway_stores, gateway_state, substrates, reconcilers, chat_sessions,
         )
     )
     app.include_router(
@@ -3013,7 +3133,7 @@ def create_app(
     app.include_router(
         create_apply_full_router(
             _store, reconciler_for, tf_runner, gateway_keystore, lambda: gateway_port_actual, env_epoch,
-            translate_cache, _runtime, gateway_stores,
+            translate_cache, substrates, gateway_stores,
         )
     )
     app.include_router(create_logs_router(_store, gateway_stores, _runtime))

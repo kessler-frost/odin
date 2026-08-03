@@ -1057,7 +1057,12 @@ async def test_multiple_kinds_project_independently(tmp_path):
     stores.cachectl.set(ENV, "cluster:cache", _cache_cluster("cache", "available", port=51234))
     stores.elbv2ctl.set(ENV, "lb:web-lb", _lb("web-lb"))
 
-    result = await project(stores, ENV)
+    # `containers=` even though this test is about the KEYS, not liveness: an
+    # `Active` lambda record makes `live_verdicts` ask the machine, and without
+    # a stand-in that was a real `docker ps` -- the only one left in this file
+    # and invisible until the whole suite's spawns were measured. `fn1` is up,
+    # so the projection reads exactly as it did.
+    result = await project(stores, ENV, containers=_fns_up("fn1"))
     assert set(result) == {"net", "r1", "fn1", "cache", "web-lb"}
 
 

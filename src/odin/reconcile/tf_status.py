@@ -955,14 +955,14 @@ def _serving_previous_verdict(stores: SynthStores, env: str, service: dict, prev
     return f"{previous} {plural} serving the previous revision; deployment{target} failed: {task_verdict(failed)}"
 
 
-async def _ecs_services(stores: SynthStores, env: str, runtime: TaskRuntime | None = None) -> Projected:
+async def _ecs_services(stores: SynthStores, env: str, runtime: TaskRuntime) -> Projected:
     out: Projected = {}
     # Keep task state honest against real containers BEFORE reading it below
     # -- without this, a task whose container already exited on its own
     # keeps reading "RUNNING" from the store until some unrelated Describe*
     # call happens to sweep it, and a crash-looping service shows "starting"
     # forever (the exact bug this fix closes).
-    await sweep_tasks(stores, env, runtime or TaskRuntime())
+    await sweep_tasks(stores, env, runtime)
     for key, record in stores.ecsctl.items(env).items():
         # An INACTIVE service is mid-delete (ecsctl.py's own grace-window
         # sweep, `_INACTIVE_SERVICE_SWEEP_SECONDS`) -- World must drop it
@@ -1011,10 +1011,18 @@ async def project(
 ) -> Projected:
     """`label -> (kind, phase, facts, verdict)` for every currently-existing
     TF-owned resource in the env's synth stores -- a snapshot of what tofu has
-    created, save for the two record syncs below. `ecs_runtime`/`containers` are
-    injectable seams purely for tests; every real caller leaves them default (a
-    real `TaskRuntime()` / `ColimaRuntime()`, matching ecsctl.py's own
-    `runtime or TaskRuntime()` precedent).
+    created, save for the two record syncs below.
+
+    `containers` is the `RuntimeDriver` every liveness read here goes through,
+    and `ecs_runtime` the `TaskRuntime` built over it -- ONE seam expressed
+    twice, because ECS asks its questions per-task and the lambda/rds check
+    asks them in bulk. Both default to the real thing (`ColimaRuntime`), so a
+    caller that passes neither behaves exactly as before; `Reconciler` passes
+    its OWN runtime, which is what stops a fake-runtime app reaching real
+    `docker` from the tick `/apply-full` ends with (see
+    `server.py::Substrates`). `ecs_runtime` is derived from `containers` rather
+    than defaulted separately, so the two can never disagree about which
+    machine is being asked.
 
     `live_verdicts` LAST, and it is the field-test-5 fix: a lambda or rds whose
     container is not running right now reads `crashed` with the real reason and
@@ -1044,7 +1052,7 @@ async def project(
     out.update(_ebs_volumes(stores, env))
     out.update(_efs_file_systems(stores, env))
     out.update(_lambda_functions(stores, env))
-    out.update(await _ecs_services(stores, env, ecs_runtime))
+    out.update(await _ecs_services(stores, env, ecs_runtime or TaskRuntime(containers)))
     out.update(_cache_clusters(stores, env))
     # Takes no overlay snapshot at all any more. It used to read
     # `_overlay_assignments` a second time to PREDICT whether a hosts push could

@@ -646,7 +646,16 @@ class Reconciler:
         # starting the new one, so invoking mid-`UpdateFunctionCode` would
         # report a function unreachable that is merely being redeployed.
         dispatched = await self._dispatch_verdicts(act)
-        projected = await project_tf_owned(self._stores, self._env)
+        # THIS reconciler's runtime, never `project`'s own `ColimaRuntime()`
+        # default. Identical in production (the default IS `ColimaRuntime`),
+        # and the difference matters in exactly one place: `/apply-full` ends
+        # with `reconciler.tick()`, so an app built with a fake runtime used to
+        # reach real `docker inspect`/`docker logs` on this line after every
+        # apply -- past the fake it was handed. Same defect and same fix as
+        # `server.py::Substrates`; see its docstring. `containers` ALONE, not a
+        # `TaskRuntime` built here as well: `project` derives that from this
+        # driver, so there is one answer to "which machine" rather than two.
+        projected = await project_tf_owned(self._stores, self._env, containers=self._rt)
         for label, (kind, phase, facts, verdict) in projected.items():
             phase, verdict = ("crashed", drifted[label]) if label in drifted else (phase, verdict)
             # A dispatch verdict never changes the PHASE, deliberately -- the

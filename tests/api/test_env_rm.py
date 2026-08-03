@@ -31,6 +31,7 @@ from odin.server import _REMOVE_FAILED, _REMOVE_OK, _REMOVE_STATUS, create_app
 from odin.simulate.runner import TfResult
 from odin.spec.store import SpecStore
 from tests.api.test_apply import CANVAS, FakeRds, FakeRuntime
+from tests.substrates import NoVm
 from tests.volumes import IN_USE
 
 S3_CANVAS = {"nodes": [{"type": "s3", "data": {"label": "uploads"}}], "edges": []}
@@ -104,9 +105,14 @@ class FakeAws:
 
 
 def _app(tmp_path, runtime=None):
+    # `vm=NoVm()` for the reason `tests/api/test_destroy_tf.py::_app` gives:
+    # `/envs/rm` sweeps this env's Lima disks, and 19 tests here ran a real
+    # `limactl disk list` to be told what they already knew. None asserts on a
+    # Lima disk; the DOCKER volumes this file is about still come from the
+    # injected runtime.
     return create_app(
         runtime=runtime or CleanRuntime(), store=SpecStore(tmp_path),
-        rds=FakeRds(), aws=FakeAws(), reap_ec2_vms=False,
+        rds=FakeRds(), aws=FakeAws(), reap_ec2_vms=False, vm=NoVm(),
     )
 
 

@@ -69,6 +69,43 @@ class FakeRuntime:
             if env is None or self.volume_envs.get(name) == env
         )
 
+    # --- the READ half of the driver -------------------------------------
+    #
+    # Added when `server.py` grew its `Substrates` bundle: /apply-full's
+    # post-apply passes used to build their own `ColimaRuntime()` and reach the
+    # real machine past this fake, so these calls were never made OF it. They
+    # are now, and each answers exactly what real Docker answers for a
+    # container this fake never booted -- which is what makes adding them a
+    # speed-up rather than a change of verdict:
+    #
+    #   `docker logs <gone>`     -> nothing on stdout (measured: rc 1, empty)
+    #   `docker inspect .State`  -> nothing, i.e. "the container is not there"
+    #
+    # `status("")` is `drift.py`'s own sentinel for "no such container", so a
+    # seeded-dead record still reads as dead here and every drift verdict this
+    # file asserts on is unchanged. `exit_code`'s -1 is the runtime's documented
+    # "would not give up a code" sentinel (`_dead_verdict`), never an invented
+    # exit status.
+
+    async def logs(self, name, tail=20):
+        return ""
+
+    async def status(self, name):
+        return ""
+
+    async def exit_code(self, name):
+        return -1
+
+    async def container_names(self):
+        # The drift sweep's ONE bulk listing. `[]` is the honest answer for a
+        # runtime that booted nothing, and it is what makes a seeded-dead
+        # record read dead: `drift._dead` marks every record whose container is
+        # absent from this list.
+        return []
+
+    async def list_odin(self):
+        return []
+
 
 class FakeRds:
     # Async where the real `PostgresRds` is async; `container_name` is the one
@@ -76,7 +113,15 @@ class FakeRds:
     def __init__(self):
         self.created = []
 
-    async def create_db(self, db_id, user, pw):
+    async def create_db(self, db_id, user, pw, db_name="postgres"):
+        # `db_name` mirrors the real `PostgresRds.create_db`, and its absence
+        # was invisible until `/apply-full` started honouring this stand-in:
+        # `rdsctl.converge_db_instances` passes four arguments, so the converge
+        # died with `TypeError: create_db() takes 4 positional arguments but 5
+        # were given` and the recovery it was supposed to perform never
+        # happened. The `_DeadTaskRuntime` lesson exactly -- a fake whose
+        # signature has drifted from the real callee reports a plausible-looking
+        # failure for the wrong cause.
         self.created.append(db_id)
 
     async def delete_db(self, db_id):
@@ -87,6 +132,14 @@ class FakeRds:
 
     def container_name(self, db_id):
         return f"odin-rds-default-{db_id}"
+
+    async def join_mesh(self, db_id, firewall=None, revision=""):
+        # `/apply-full`'s `ensure_db_mesh` pass, which reaches this stand-in now
+        # that the route passes the app's own rds substrate instead of building
+        # a real `PostgresRds`. None is the REAL answer for an env with no
+        # Nebula network -- `aws/rds.py::join_mesh`'s own no-op case -- so a
+        # test whose env has no VPC sees exactly what production would give it.
+        return None
 
 
 class FakeAws:
@@ -125,8 +178,8 @@ S3_SQS = {"nodes": [{"type": "s3", "data": {"label": "uploads"}},
 BUSY_BODY = {"error": "a tofu run is already in progress for env 'default'"}
 
 
-def _app(tmp_path, rds=None, aws=None):
-    return create_app(runtime=FakeRuntime(), store=SpecStore(tmp_path),
+def _app(tmp_path, rds=None, aws=None, runtime=None):
+    return create_app(runtime=runtime or FakeRuntime(), store=SpecStore(tmp_path),
                       rds=rds or FakeRds(), aws=aws or FakeAws(), backings=False)
 
 
@@ -590,7 +643,19 @@ class _DeadTaskRuntime:
     the real callee reports a plausible-looking failure for the WRONG CAUSE;
     had that assertion been on the status alone it would have passed and proven
     nothing. `**kwargs` would hide the next such drift instead of surfacing it.
+
+    The CONSTRUCTOR is the same lesson, one level up, and it arrived the same
+    way. `server.py` used to build a bare `TaskRuntime()` and this fake took no
+    arguments to match; the `Substrates` bundle now builds
+    `TaskRuntime(containers)` from the app's own runtime, so a no-argument fake
+    raised `TypeError: _DeadTaskRuntime() takes no arguments` from inside the
+    route -- which the route dutifully reported as a 500. Mirroring the real
+    signature is what keeps a substituted fake answering the question the test
+    is asking instead of a question about itself.
     """
+
+    def __init__(self, runtime=None, placed_on: str = "") -> None:
+        self.runtime = runtime
 
     async def run(self, env, task_id, container_def, extra_env=None, cpu=None, memory=None,
                   volumes=None):
@@ -864,6 +929,22 @@ def _seed_failed_database(app, env: str = "default", volume: bool = True) -> Non
 
 
 def _patch_dead_substrates(monkeypatch) -> None:
+    """Make the LAMBDA execution substrate dead everywhere it can be built.
+
+    THREE names, because there are three builders and they are not
+    interchangeable. `odin.server.FunctionRuntime` is the one `/apply-full`'s
+    converge pass now reaches (`Substrates.functions`); the two under
+    `gateway/models/` are what a call arriving through the GATEWAY builds, and
+    they stay patched so a test that does run tofu gets the same dead
+    substrate on both paths rather than a live one on whichever it happens to
+    take.
+
+    The rds half is NOT here, and that is the point of the change that added
+    this note: it goes through `create_app(rds=...)`, a seam that already
+    existed and that `/apply-full` now honours, so those tests inject
+    `_DeadPostgresRds()` instead of rewriting a module attribute. Patching a
+    name is the fallback for a substrate with no seam, not the house style."""
+    monkeypatch.setattr("odin.server.FunctionRuntime", _DeadFunctionRuntime)
     monkeypatch.setattr("odin.gateway.models.lambdactl.FunctionRuntime", _DeadFunctionRuntime)
     monkeypatch.setattr("odin.gateway.models.rdsctl.PostgresRds", _DeadPostgresRds)
 
@@ -876,7 +957,7 @@ def test_apply_full_fails_when_a_lambda_this_apply_converged_never_came_back(tmp
     _patch_dead_substrates(monkeypatch)
     monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: None)
     _patch_translate(monkeypatch, TranslateResult(files={}, refined=False))
-    app = _app(tmp_path)
+    app = _app(tmp_path, rds=_DeadPostgresRds())
     _seed_failed_function(app)
     with TestClient(app) as client:
         resp = client.post("/apply-full", json={"nodes": [], "edges": []})
@@ -901,7 +982,7 @@ def test_apply_full_fails_when_an_rds_this_apply_converged_never_came_back(tmp_p
     _patch_dead_substrates(monkeypatch)
     monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: None)
     _patch_translate(monkeypatch, TranslateResult(files={}, refined=False))
-    app = _app(tmp_path)
+    app = _app(tmp_path, rds=_DeadPostgresRds())
     _seed_failed_database(app)
     with TestClient(app) as client:
         resp = client.post("/apply-full", json={"nodes": [], "edges": []})
@@ -926,7 +1007,7 @@ def test_apply_full_reports_a_broken_lambda_and_a_broken_database_together(tmp_p
     _patch_dead_substrates(monkeypatch)
     monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: None)
     _patch_translate(monkeypatch, TranslateResult(files={}, refined=False))
-    app = _app(tmp_path)
+    app = _app(tmp_path, rds=_DeadPostgresRds())
     _seed_failed_function(app)
     _seed_failed_database(app)
     with TestClient(app) as client:
@@ -947,24 +1028,30 @@ def test_apply_full_reports_a_broken_lambda_and_a_broken_database_together(tmp_p
 # applies, is the apply itself. -----------------------------------------------
 
 
-class _FakeStates:
-    """The container runtime `sweep_compute` builds when none is injected --
-    `container_names()` + `status()`, the two seams `drift._live_states` uses.
-    `running` names the containers that exist."""
+class _FakeStates(FakeRuntime):
+    """`FakeRuntime` with a controllable set of containers that really DO
+    exist -- `container_names()` + `status()`, the two seams
+    `drift._live_states` uses, with `running` naming what is there.
+
+    It is now the APP'S RUNTIME (`_app(runtime=...)`) rather than a stand-in
+    monkeypatched over `drift.ColimaRuntime`, and that is the whole point of
+    the change: `/apply-full` passes the app's own runtime into
+    `sweep_compute`, so this controls the sweep by being the substrate instead
+    of by rewriting a module attribute the route no longer reads.
+
+    Dropping that patch is deliberate rather than tidy-up. Had it stayed, a
+    regression that put the real `ColimaRuntime` back would still have found
+    this fake sitting on `drift.ColimaRuntime` and these tests would have gone
+    on passing over a real-Docker call -- the mask, not the guard.
+    `tests/api/test_apply_full_isolation.py` is what fails in that case now."""
 
     running: tuple[str, ...] = ()
-
-    def __init__(self, *_args, **_kwargs) -> None:
-        pass
 
     async def container_names(self, env=None) -> list[str]:
         return list(type(self).running)
 
     async def status(self, name: str) -> str:
         return "running" if name in type(self).running else "absent"
-
-    async def exit_code(self, name: str) -> int:
-        return -1
 
 
 class _NoMeshPostgresRds(_DeadPostgresRds):
@@ -1004,8 +1091,11 @@ def _seed_live_database(app, env: str = "default") -> None:
 
 
 def _patch_no_containers(monkeypatch) -> None:
-    monkeypatch.setattr("odin.reconcile.drift.ColimaRuntime", _FakeStates)
-    monkeypatch.setattr("odin.gateway.models.rdsctl.PostgresRds", _NoMeshPostgresRds)
+    """The LAMBDA substrate, on both builders. The container view is no longer
+    patched here at all -- it arrives as `_app(runtime=_FakeStates())`, and the
+    rds substrate as `_app(rds=_NoMeshPostgresRds())`, because both are seams
+    `/apply-full` really honours now (`server.py::Substrates`)."""
+    monkeypatch.setattr("odin.server.FunctionRuntime", _DeadFunctionRuntime)
     monkeypatch.setattr("odin.gateway.models.lambdactl.FunctionRuntime", _DeadFunctionRuntime)
 
 
@@ -1020,7 +1110,7 @@ def test_apply_full_fails_on_a_function_whose_container_is_gone_though_the_recor
     _patch_no_containers(monkeypatch)
     monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: None)
     _patch_translate(monkeypatch, TranslateResult(files={}, refined=False))
-    app = _app(tmp_path)
+    app = _app(tmp_path, rds=_NoMeshPostgresRds(), runtime=_FakeStates())
     _seed_live_function(app)
     with TestClient(app) as client:
         resp = client.post("/apply-full", json={"nodes": [], "edges": []})
@@ -1050,7 +1140,7 @@ def test_apply_full_fails_on_a_database_whose_container_is_gone_though_the_recor
     _patch_no_containers(monkeypatch)
     monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: None)
     _patch_translate(monkeypatch, TranslateResult(files={}, refined=False))
-    app = _app(tmp_path)
+    app = _app(tmp_path, rds=_NoMeshPostgresRds(), runtime=_FakeStates())
     _seed_live_database(app)
     with TestClient(app) as client:
         resp = client.post("/apply-full", json={"nodes": [], "edges": []})
@@ -1093,7 +1183,7 @@ def test_apply_full_stays_applied_when_the_containers_really_are_there(tmp_path,
     )
     monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: None)
     _patch_translate(monkeypatch, TranslateResult(files={}, refined=False))
-    app = _app(tmp_path)
+    app = _app(tmp_path, rds=_NoMeshPostgresRds(), runtime=_FakeStates())
     _seed_live_function(app)
     _seed_live_database(app)
     with TestClient(app) as client:
@@ -1115,7 +1205,7 @@ def test_apply_full_does_not_fail_a_resource_that_is_merely_still_starting(tmp_p
     monkeypatch.setenv("ODIN_LAMBDA_ACTIVE_TIMEOUT", "2")
     monkeypatch.setenv("ODIN_RDS_AVAILABLE_TIMEOUT", "2")
     _patch_translate(monkeypatch, TranslateResult(files={}, refined=False))
-    app = _app(tmp_path)
+    app = _app(tmp_path, rds=_NoMeshPostgresRds(), runtime=_FakeStates())
     _seed_live_function(app)
     _seed_live_database(app)
     stores = app.state.gateway_stores
@@ -1182,7 +1272,7 @@ def test_a_tofu_failure_is_not_also_charged_the_lambda_and_rds_waits(tmp_path, m
     _write_fake_tofu(tmp_path, _APPLY_FAILS)
     monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
     _patch_translate(monkeypatch, TranslateResult(files=_skeleton_files(), refined=True))
-    app = _app(tmp_path)
+    app = _app(tmp_path, rds=_DeadPostgresRds())
     _seed_failed_function(app)
     _seed_failed_database(app)
     with TestClient(app) as client:
@@ -1221,7 +1311,7 @@ def test_a_failed_tf_apply_names_the_reason_odin_already_holds(tmp_path, monkeyp
     _write_fake_tofu(tmp_path, _APPLY_FAILS)
     monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: str(tmp_path / "tofu"))
     _patch_translate(monkeypatch, TranslateResult(files=_skeleton_files(), refined=True))
-    app = _app(tmp_path)
+    app = _app(tmp_path, rds=_DeadPostgresRds())
     _seed_failed_database(app)
     with TestClient(app) as client:
         resp = client.post("/apply-full", json=S3_SQS)
@@ -1301,7 +1391,7 @@ def test_a_recovery_is_disclosed_even_when_an_unrelated_service_fails(tmp_path, 
     monkeypatch.setenv("ODIN_ECS_STEADY_TIMEOUT", "5")
     _patch_dead_substrates(monkeypatch)
     _patch_translate(monkeypatch, TranslateResult(files={}, refined=False))
-    app = _app(tmp_path)
+    app = _app(tmp_path, rds=_DeadPostgresRds())
     _seed_broken_service(app)
     _seed_failed_database(app)
     with TestClient(app) as client:
@@ -1343,7 +1433,7 @@ def test_a_recovery_whose_volume_is_also_gone_still_reports_the_data_loss(tmp_pa
     _patch_dead_substrates(monkeypatch)
     monkeypatch.setattr("odin.simulate.runner.shutil.which", lambda name: None)
     _patch_translate(monkeypatch, TranslateResult(files={}, refined=False))
-    app = _app(tmp_path)
+    app = _app(tmp_path, rds=_DeadPostgresRds())
     _seed_failed_database(app, volume=False)
     with TestClient(app) as client:
         resp = client.post("/apply-full", json={"nodes": [], "edges": []})
