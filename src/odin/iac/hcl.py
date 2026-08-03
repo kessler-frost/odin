@@ -724,20 +724,40 @@ def sg_rule_port(from_port: str, to_port: str) -> str:
 
 # IPv6, DECLINED WITH THE REAL REASON rather than made authorable.
 #
-# `fabric/nebula.py::sg_rules_to_firewall` reads `IpRanges` and
-# `UserIdGroupPairs` and nothing else, so an `Ipv6Ranges` entry compiles to ZERO
-# nebula rules. Emitting `ipv6_cidr_blocks` would therefore hand a user a
-# firewall rule that is carried in Terraform, stored by the gateway, visible in
-# `tofu plan` -- and enforced by nothing. That is a decorative permission, the
-# same class of bug `tests/gateway/test_iam_vocabulary_is_enforceable.py` exists
-# to prevent, so the ergonomic hole stays open and the message tells the truth
-# about why. Making it real is a nebula change (teach the compiler IPv6), not a
-# grammar one; `docs/limits.md` records it as such.
+# TWO CORRECTIONS to what this comment used to say, both measured on
+# 2026-08-03, because it pointed the next reader at the wrong component AND
+# understated the hazard.
+#
+# 1. It is NOT a nebula limitation. Probed against nebula 1.10.3, the pinned
+#    version: a firewall rule with `cidr: 2001:db8::/32` loads and `nebula
+#    -test` exits 0, while `cidr: not-a-cidr` exits 1 with `netip.ParsePrefix`
+#    -- so the zero is acceptance, not indifference. `nebula-cert sign
+#    -networks fd00::1/64` signs a v2 cert too. What actually blocks it is
+#    ODIN: `fabric/models.py::MeshNetwork` hands out `10.42.0.0/16`, so every
+#    mesh member has an IPv4 overlay address and a rule's CIDR is matched
+#    against exactly that. An IPv6 rule could never match a peer. Making it
+#    mean something is dual-stack overlay ADDRESSING, not a compiler tweak.
+#
+# 2. An `Ipv6Ranges` entry does NOT compile to zero rules -- it compiles to a
+#    WIDER one. `sg_rules_to_firewall` reads `IpRanges` and `UserIdGroupPairs`,
+#    and its last branch turns a permission with neither into a PEERLESS rule,
+#    which nebula renders `host: any`. Measured: an IPv6-only tcp/443
+#    permission yields `{'port': '443', 'proto': 'tcp', 'host': 'any'}` --
+#    "from anyone on the mesh" where the author wrote "from this one block". So
+#    deleting this decline without teaching that function about `Ipv6Ranges` in
+#    the same change is a security regression, not an ergonomic win.
+#    `tests/fabric/test_nebula.py::test_an_ipv6_only_permission_would_WIDEN_the_group`
+#    is the part of this comment that can fail a build.
+#
+# The refusal itself stands: a rule carried in Terraform, stored by the gateway
+# and visible in `tofu plan` while gating nothing is a decorative permission,
+# the same class of bug `tests/gateway/test_iam_vocabulary_is_enforceable.py`
+# exists to prevent. `docs/limits.md` records the corrected reason.
 _NO_IPV6 = (
-    "odin's security groups are IPv4 only, because the mesh firewall that enforces them "
-    "(fabric/nebula.py) compiles IPv4 ranges and group identities and nothing else — an IPv6 rule "
-    "would be carried by Terraform and enforced by nothing. Use an IPv4 CIDR, or another Security "
-    "Group node's label to gate by identity"
+    "odin's security groups are IPv4 only, because odin's mesh is: every member gets an overlay "
+    "address out of 10.42.0.0/16 (fabric/models.py), and a firewall rule's CIDR is matched against "
+    "that — so an IPv6 rule could never match a peer. Nebula itself is not the blocker. Use an "
+    "IPv4 CIDR, or another Security Group node's label to gate by identity"
 )
 
 

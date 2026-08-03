@@ -158,14 +158,41 @@ internet-facing, EC2 launch type where you wanted Fargate, no IGW.
   mesh takes one firewall-only reload (a SIGHUP; no tunnel is dropped). Byte-
   identical would have needed the wide-open rule special-cased back into
   `host: any`, making it the one rule odin compiles unlike every other.
-- **A security group is IPv4 only.** An IPv6 CIDR in either rule field is
-  declined with that reason, and the reason is real rather than a parser
-  limitation: `sg_rules_to_firewall` compiles `IpRanges` and `UserIdGroupPairs`
-  and nothing else, so an IPv6 rule would be carried by Terraform, stored by the
-  gateway, visible in `tofu plan`, and enforced by nothing. Making it real is a
-  Nebula change, not a canvas one. One bad line still declines the whole group,
-  deliberately: silently dropping one rule from a firewall is worse than
-  refusing the group.
+- **A security group is IPv4 only, and the blocker is ODIN'S OVERLAY, not
+  Nebula.** An IPv6 CIDR in either rule field is declined with that reason.
+  This entry used to end "making it real is a Nebula change, not a canvas one",
+  and that sent the next reader at the wrong component — MEASURED against
+  nebula 1.10.3 (the pinned version, `compute/cloud_init.py::NEBULA_VERSION`)
+  on 2026-08-03:
+
+  - a firewall rule of `cidr: 2001:db8::/32` loads fine — `nebula -test` exits
+    **0**. The probe discriminates: `cidr: not-a-cidr` exits **1** with
+    `firewall.inbound rule #0; cidr did not parse; netip.ParsePrefix(...)`, so
+    the zero is nebula accepting the prefix, not nebula ignoring the field.
+  - `nebula-cert sign -networks fd00::1/64` succeeds and prints a v2
+    certificate whose `networks` is `["fd00::1/64"]`. Nebula does IPv6
+    overlays.
+
+  What actually stops it is one line of odin: `fabric/models.py::MeshNetwork`
+  hands out `10.42.0.0/16`, so **every member of every odin mesh has an IPv4
+  overlay address**, and nebula matches a rule's CIDR against that. An IPv6
+  rule would therefore be a rule that can never match a peer — real, enforced,
+  and matching nothing. Making it mean something is dual-stack overlay
+  addressing (cert signing, `static_host_map`, the lighthouse, sticky IP
+  allocation), which is a large change and not one this entry is waiting on.
+
+  **Do not "just remove the decline" — measured, that WIDENS the group.**
+  `sg_rules_to_firewall` reads `IpRanges` and `UserIdGroupPairs` and nothing
+  else, and its last branch turns a permission with neither into a peerless
+  rule. An IPv6-only permission compiles today to
+  `{'port': '443', 'proto': 'tcp', 'host': 'any'}` — "allow 443 from anyone on
+  the mesh" where the author wrote "allow 443 from this one block". That is
+  worse than the refusal by a wide margin, and
+  `tests/fabric/test_nebula.py::test_an_ipv6_only_permission_would_WIDEN_the_group`
+  pins it so the reason cannot rot back into a suggestion.
+
+  One bad line still declines the whole group, deliberately: silently dropping
+  one rule from a firewall is worse than refusing the group.
 - **A security group's rule port must be a literal — `443`, `8000-8100`, or
   `-1` — never a computed expression.** In either rule field. The entry has now
   shed the same bug TWICE, and both times it was a correctness bug wearing a
