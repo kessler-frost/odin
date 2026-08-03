@@ -5,8 +5,9 @@ The two translators (`iac/hcl.py` canvas->TF, `iac/import_tf.py` TF->canvas)
 lived under `agent/` for months, purely because NORTHSTAR directive 2 said "an
 agent translates" and the directory was named for the intent before the
 implementation turned out deterministic. Neither file has ever imported
-`claude_agent_sdk`. But a reader opening `agent/hcl.py` reasonably concludes a
-model writes their infrastructure -- and per NORTHSTAR's 2026-07-30 amendment
+`claude_agent_sdk`. But a reader who opened `agent/hcl.py` (the path until
+2026-08-03; there is no such file now) reasonably concluded that a model writes
+their infrastructure -- and per NORTHSTAR's 2026-07-30 amendment
 ("deterministic first; intelligence only where no function exists") the fact
 that it does NOT is the most important property of the whole layer.
 
