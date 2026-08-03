@@ -112,7 +112,7 @@ To regenerate this diagram after editing `docs/diagrams/*.mmd`:
   forwards to a backing or answers from its own per-service model store. EC2,
   VPC, SG, IAM, ECR, Lambda and ECS have no open-source AWS API to borrow, so odin
   owns the model and binds it to a substrate.
-- **Translation** (`src/odin/agent/`) is deterministic in both directions and
+- **Translation** (`src/odin/iac/`) is deterministic in both directions and
   no longer covers quite the same node kinds in both: canvas → Terraform
   builds 23, and Terraform → canvas reads all 22 back across 38 resource types
   that it models. The gap is `kms`, added in v0.8.18 — emitted and not yet

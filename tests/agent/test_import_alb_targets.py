@@ -44,8 +44,8 @@ below -- a round trip cannot see a resource its own generator puts back.
 """
 from __future__ import annotations
 
-from odin.agent.hcl import generate_tf
-from odin.agent.import_tf import parse_hcl_text
+from odin.iac.hcl import generate_tf
+from odin.iac.import_tf import parse_hcl_text
 from odin.spec.translate import canvas_to_stack
 
 _NETWORK = (
