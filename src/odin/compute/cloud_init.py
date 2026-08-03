@@ -58,6 +58,26 @@ def hosts_block_script(hosts: dict[str, str]) -> str:
         *([entries] if entries else []),
         HOSTS_END,
         "ODIN_ETC_HOSTS",
+        # FLUSH THE GUEST RESOLVER, and this line is a measured bug fix rather
+        # than defensive housekeeping. Writing the file is NOT the same as the
+        # name changing: `systemd-resolved` is active on the stock Lima image
+        # (`nsswitch` is `hosts: files dns`) and it caches what /etc/hosts said.
+        #
+        # MEASURED on a real VM, 2026-08-03. Boot with a record, then push an
+        # EMPTY set: the file is correctly emptied (`grep -c` -> 0) and
+        # `push_hosts` returns "pushed" -- while `getent hosts api.internal`
+        # keeps answering `10.42.0.5` for a further **2.2 seconds**. That is odin
+        # reporting an outcome it has not achieved yet, which is honesty rule 2
+        # in the smallest possible window, and a withdrawn record that still
+        # resolves is the one thing this feature must never do.
+        #
+        # With the flush the same sequence is NO-RESOLVE immediately.
+        #
+        # Guarded and non-fatal on purpose: a guest without systemd-resolved has
+        # nothing to flush and must not fail the push for it, and this script
+        # also runs as a per-boot provision step under `set -ux` with no
+        # `set -e`, where a non-zero exit would leave `limactl start` waiting.
+        "command -v resolvectl >/dev/null 2>&1 && resolvectl flush-caches || true",
     ])
 
 

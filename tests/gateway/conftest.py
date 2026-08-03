@@ -146,6 +146,9 @@ def route53(sink: CaptureSink):
     # `us-east-1`. `_client` pins `us-east-1` like every other fixture here;
     # nothing in classify or the model reads the region, so the two agree.
     return _client(sink, "route53")
+
+
+@pytest.fixture
 def efs(sink: CaptureSink):
     # botocore names the service model `efs`; its SigV4 credential scope (and so
     # `classify()`'s `service`) is `elasticfilesystem` -- the same two-name split
