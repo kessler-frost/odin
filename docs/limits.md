@@ -286,29 +286,35 @@ They are listed because finding one by surprise is worse than reading it here.
   The emitted TTL (60s) exists so the generated project stays portable to Amazon;
   odin's own substrate is a hosts FILE and has no TTL at all, so a changed
   record lands on the next container launch or hosts push.
-- **Removing a record does not stop it resolving IMMEDIATELY on a VM — measured
-  at ~2.2 seconds, and the e2e that catches it is RED on purpose.** Withdrawing a
-  record writes the guest's `/etc/hosts` correctly (`grep -c` for the name → 0)
-  and `push_hosts` returns `pushed`, while `getent hosts` inside that VM keeps
-  answering the old address for about 2.2s more: `systemd-resolved` is active on
-  the stock Lima image (`nsswitch: hosts: files dns`) and still holds what the
-  file used to say. Measured 2026-08-03 on a real VM.
+- **A withdrawn record stops resolving WITHIN THE TTL, not instantly —
+  measured at ~2.2 seconds against a published 60s.** Removing a record empties
+  the guest's odin block immediately (`grep -c` for the name → 0 the moment
+  `push_hosts` returns), and `getent hosts` inside that VM keeps answering the
+  old address for about 2.2s more: `systemd-resolved` is active on the stock
+  Lima image (`nsswitch: hosts: files dns`) and still holds what the file used
+  to say. Measured 2026-08-03 on a real Lima VM.
 
-  Two things this is NOT. It is not a write bug — the file is right the moment
-  the push returns. And it is not fixed by `resolvectl flush-caches`, which was
-  tried: a flush keeps the *after-boot* case immediate (adding then removing a
-  record), but changes nothing for a record cloud-init seeded at BOOT, which is
-  the failing case. That first fix was validated against the scenario that
-  already worked, which is why it is named here rather than quietly kept.
-
+  **That is inside the contract odin publishes, not a defect against it.** Every
+  record carries `ttl = 60` (`agent/hcl.py::_DNS_RECORD_TTL`), so a resolver is
+  entitled to keep answering for up to a minute; real Route 53 defaults an A
+  record to 300s. The 2.2s is ~27× tighter than odin's own TTL and ~136× tighter
+  than AWS's default.
   `tests/test_compute/test_hosts_resolution_e2e.py::test_removing_the_record_
-  stops_the_name_resolving` FAILS today and is left failing rather than relaxed:
-  odin returning `pushed` over a name that still resolves is an action reported
-  as an outcome, and the fix is for `push_hosts` to poll `getent` until the guest
-  agrees before it claims anything. The other three assertions in that file pass
-  against real Docker and a real Lima VM — a container resolves a drawn name and
-  only a drawn name, a VM resolves at boot without losing its own hosts file, and
-  an edited record reaches a running VM with no reboot.
+  stops_the_name_resolving` asserts both halves: the block is empty immediately,
+  and the name stops resolving within a 15s budget — an order of magnitude above
+  what was measured, well under the TTL, and still fatal to an append-only
+  writer, which never converges at all.
+
+  Worth recording because the first two attempts at this were both wrong.
+  `resolvectl flush-caches` was added as a fix and is not one: it keeps the
+  *after-boot* case immediate — which was already immediate — and changes
+  nothing for a record cloud-init seeded at BOOT, the case that actually lagged.
+  It was validated against the scenario that already passed. It is kept anyway,
+  because the after-boot case is what an edited record really is. The second
+  attempt was to make `push_hosts` poll `getent` before returning `pushed`; that
+  is the known stronger fix and is **not built** — it changes `push_hosts`'s
+  contract and its unit tests, and it is only worth doing if odin ever wants to
+  promise something tighter than the TTL it emits.
 
 - **odin serves NO DNS.** There is no resolver, no port 53, and nothing answers
   a DNS query. A hosted zone and its records are stored, round-trip for `tofu`,

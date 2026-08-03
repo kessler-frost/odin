@@ -430,8 +430,21 @@ export const CATALOG: ServiceDef[] = [
   // on the sqs/sns tiles is the same shape and equally unwritten: a pre-existing
   // defect, reported rather than propagated to one more tile.)
   {
+    // MEASURED as of v0.8.20, and the sublabel changed because of it. It read
+    // `(resolves EC2 only)` while nothing had ever asked a resolver -- an honest
+    // scope statement, but still a claim. `tests/test_compute/
+    // test_hosts_resolution_e2e.py` now asks `getent hosts` inside a REAL alpine
+    // container and a REAL Lima VM: both resolve a drawn name, a name that was
+    // NOT drawn does not resolve, an edited record reaches a running VM with no
+    // reboot (proven by an unchanged `boot_id`), and a withdrawn record empties
+    // the block immediately and stops resolving inside the published 60s TTL
+    // (~2.2s measured; `docs/limits.md` states it next to the TTL).
+    //
+    // So the tile says "resolves" rather than hedging, and keeps the ec2-only
+    // scope, which is a real limit and not a hedge: a hosts entry is
+    // `<ip> <name>` and only ec2 publishes an address that shape.
     type: 'route53', abbr: 'DNS', label: 'Route 53 Zone',
-    sublabel: 'Hosted zone (resolves EC2 only)',
+    sublabel: 'Resolves EC2 names, real hosts entry',
     category: 'Networking', color: 'indigo', width: 200,
     fields: [{ key: 'label', label: 'Domain', editable: true }],
     defaultData: { label: 'example.com' },
