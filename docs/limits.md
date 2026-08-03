@@ -367,15 +367,6 @@ internet-facing, EC2 launch type where you wanted Fargate, no IGW.
   odin record; `getent hosts` and any ordinary client library will. Stated
   because "Route 53 works" and "names resolve" are the same sentence to most
   readers and only the second one is true here.
-- **A hosted zone's tags are replayed, but tag REMOVAL on a re-apply is
-  untested.** `ChangeTagsForResource` is really sent on create (measured
-  through a real `tofu apply`, and `ListTagsForResource` must replay it or the
-  provider plans a perpetual diff — the plan is `-detailed-exitcode` 0, so the
-  create path is confirmed). `RemoveTagKeys` is implemented and unit-tested, but
-  no real provider was ever observed sending one: if it instead sends a full
-  replacement, a removed tag would linger. Named here rather than discovered,
-  because the only tag odin itself writes is `odin:node`, which is what
-  `reconcile/tf_status.py` recovers the canvas label from.
 - **A `dns` record resolves to a DIFFERENT address depending on who is asking,
   and for a VM with no mesh it does not resolve at all.** This is the sharper
   half of the entry above and it was got wrong first time, so it is stated in
