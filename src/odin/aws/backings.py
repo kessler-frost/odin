@@ -583,7 +583,29 @@ class BackingAws:
         subs = sns.list_subscriptions_by_topic(TopicArn=topic_arn)["Subscriptions"]
         return tuple(s["Endpoint"].rsplit(":", 1)[-1] for s in subs if s["Protocol"] == "sqs")
 
-    async def deprovision(self, service: str, name: str) -> None:
+    async def deprovision(self, service: str, name: str) -> bool:
+        """DELETE the real resource -- `delete_bucket` / `delete_queue` /
+        `delete_table` / `delete_topic`, contents included. BEST-EFFORT, which
+        is a deliberate contract and not an oversight, so it is written down
+        here rather than left to be inferred from a bare `except: pass`.
+
+        Why best-effort. The two ways this is reached are a canvas node being
+        removed and a `/destroy`, and in both the resource or its whole backing
+        container may ALREADY be gone -- a raise there would fail a teardown
+        for having nothing to tear down. `BackingUnavailable` in particular is
+        the normal case when the env's backing has already been stopped.
+
+        What it costs, stated plainly because the caller cannot see it
+        otherwise: `reconciler.py::_execute` prunes the World entry
+        UNCONDITIONALLY after calling this. So a resource that failed to leave
+        the backing still leaves World, and odin then reports a canvas with
+        nothing in it while a real bucket still holds real objects.
+
+        Returns True if the delete call completed, False if it was swallowed.
+        The prune does NOT key on it -- changing teardown semantics needs a
+        measurement against real backings that a unit test cannot make -- but
+        the reconciler LOGS a False, naming what is still standing, so the
+        residual above is at least visible instead of silent."""
         try:
             client = await self.client(service)
             if service == "s3":
@@ -595,7 +617,8 @@ class BackingAws:
             elif service == "sns":
                 client.delete_topic(TopicArn=f"arn:aws:sns:{REGION}:{ACCOUNT}:{name}")
         except (ClientError, BotoCoreError, BackingUnavailable):
-            pass  # best-effort: the resource or its whole backing may already be gone
+            return False  # the resource or its whole backing may already be gone
+        return True
 
     async def facts(self, service: str, name: str) -> dict:
         """This resource's World facts. Every value is a `str` -- see

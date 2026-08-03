@@ -1,14 +1,30 @@
 """`ODIN_AI=0` — the one switch that turns OFF every model call odin can make.
 
-WHY IT IS ONE SWITCH. odin has exactly two features that can talk to a model,
-each with its own flag and its own default: the canvas→Terraform refine pass
-(`ODIN_TRANSLATE_REFINE`, opt-IN, off by default) and "what's wrong here?"
-(`ODIN_DEBUG_AGENT`, opt-OUT, ON by default). Both go through
-`claude-agent-sdk`, which spawns the real `claude` CLI. A user who wants "no
-model calls, ever" had to know both flags, know which way each one points, and
-keep knowing as features are added. That is not a switch, it is a research
-project -- so this one sits UNDER both of them, and under the SDK boundary
-itself.
+WHY IT IS ONE SWITCH. odin has THREE features that can talk to a model, and
+they do NOT have a uniform shape -- which is the whole argument:
+
+  * the canvas→Terraform refine pass (`agent/translate.py`) --
+    `ODIN_TRANSLATE_REFINE`, opt-IN, off by default;
+  * "what's wrong here?" (`agent/debugger.py`) -- `ODIN_DEBUG_AGENT`,
+    opt-OUT, ON by default;
+  * canvas chat (`agent/chat.py`) -- NO per-feature flag at all; its
+    `disabled_reason()` is `ai.off_reason()` and nothing else.
+
+All three go through `claude-agent-sdk`, which spawns the real `claude` CLI. A
+user who wants "no model calls, ever" would have had to know two flags, know
+which way each one points, notice that the third feature has none, and keep
+knowing as features are added. That is not a switch, it is a research project --
+so this one sits UNDER all of them, and under the SDK boundary itself
+(`refuse_if_off`), which is what makes the flagless third feature safe.
+
+This paragraph said "exactly two" until v0.8.18, after chat had shipped. The
+SWITCH was never wrong -- `chat.propose` checks `off_reason()` before
+constructing a client -- only the inventory, and an inventory in prose has gone
+stale in this repo twice. `tests/agent/test_ai_switch.py` now pins it -- by
+finding every module that imports `claude_agent_sdk` and by proving no client is
+CONSTRUCTED for any of the three when the switch is off, the way
+`tests/test_thread_inventory.py` pins the thread list. A prose inventory cannot
+fail a build.
 
 WHAT IT IS NOT. It does not touch the canvas↔Terraform translation, which is a
 deterministic compiler (`agent/hcl.py`): with `ODIN_AI=0` a canvas still

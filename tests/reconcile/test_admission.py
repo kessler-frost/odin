@@ -3,6 +3,8 @@ estimated memory footprint against real host headroom, and free disk on the
 store volume, BEFORE Apply spawns anything."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from odin.compute.instances import max_env_name_len
@@ -17,6 +19,20 @@ from odin.reconcile.admission import (
 )
 from odin.runtime.driver import HostFacts
 from odin.spec.models import FieldValue, ResourceDesired, Stack
+
+@pytest.fixture(autouse=True)
+def _no_ambient_budget(monkeypatch):
+    """Both spellings of the container-pool budget, cleared for every test here.
+
+    The per-test `delenv` calls below cleared only `ODIN_MEMORY_BUDGET_MIB`,
+    which was the whole list until the variable was renamed to
+    `ODIN_CONTAINER_MEMORY_BUDGET_MIB`. Leaving that as a per-test chore is how
+    the NEXT name gets missed in ten places; a test's environment should be
+    stated once. Runs before the body, so a test that sets one still wins.
+    """
+    for name in ("ODIN_CONTAINER_MEMORY_BUDGET_MIB", "ODIN_MEMORY_BUDGET_MIB", "ODIN_VM_MEMORY_BUDGET_MIB"):
+        monkeypatch.delenv(name, raising=False)
+
 
 # --- estimate_stack_memory_mib -----------------------------------------------
 
@@ -85,13 +101,46 @@ def test_zero_footprint_kinds_contribute_nothing():
 
 
 def test_memory_budget_defaults_to_70_percent_of_total(monkeypatch):
+    monkeypatch.delenv("ODIN_CONTAINER_MEMORY_BUDGET_MIB", raising=False)
     monkeypatch.delenv("ODIN_MEMORY_BUDGET_MIB", raising=False)
     assert default_memory_budget_mib(10_000.0) == 7_000.0
 
 
-def test_memory_budget_env_override_wins(monkeypatch):
-    monkeypatch.setenv("ODIN_MEMORY_BUDGET_MIB", "2048")
+@pytest.mark.parametrize("name", ["ODIN_CONTAINER_MEMORY_BUDGET_MIB", "ODIN_MEMORY_BUDGET_MIB"])
+def test_memory_budget_env_override_wins(monkeypatch, name):
+    """BOTH spellings. `ODIN_MEMORY_BUDGET_MIB` was renamed to
+    `ODIN_CONTAINER_MEMORY_BUDGET_MIB` (unqualified it reads as odin's whole
+    memory budget while governing only the container pool) and the old one is
+    still honoured -- it is in ROADMAP, in `odin doctor`'s output, and in
+    whatever shells already export it."""
+    monkeypatch.delenv("ODIN_CONTAINER_MEMORY_BUDGET_MIB", raising=False)
+    monkeypatch.delenv("ODIN_MEMORY_BUDGET_MIB", raising=False)
+    monkeypatch.setenv(name, "2048")
     assert default_memory_budget_mib(10_000.0) == 2048.0
+
+
+def test_the_specific_name_wins_when_both_are_set(monkeypatch):
+    """Someone who sets both meant the specific one."""
+    monkeypatch.setenv("ODIN_CONTAINER_MEMORY_BUDGET_MIB", "2048")
+    monkeypatch.setenv("ODIN_MEMORY_BUDGET_MIB", "4096")
+    assert default_memory_budget_mib(10_000.0) == 2048.0
+
+
+@pytest.mark.parametrize("name", ["ODIN_CONTAINER_MEMORY_BUDGET_MIB", "ODIN_MEMORY_BUDGET_MIB"])
+def test_a_rejection_names_the_variable_that_actually_set_the_budget(monkeypatch, name):
+    """Not merely the preferred spelling. Pointing a user at
+    `ODIN_CONTAINER_MEMORY_BUDGET_MIB` when their number came from the legacy
+    variable names something they have not set -- the same class of unhelpful
+    as the pool confusion the rename exists to fix."""
+    monkeypatch.delenv("ODIN_CONTAINER_MEMORY_BUDGET_MIB", raising=False)
+    monkeypatch.delenv("ODIN_MEMORY_BUDGET_MIB", raising=False)
+    monkeypatch.setenv(name, "1")  # 1 MiB: anything at all is over budget
+    result = check_admission(
+        Stack(resources=(ResourceDesired(id="db", kind="rds"),)),
+        HostFacts(total_mem_mib=10_000.0), Path.cwd(),
+    )
+    assert not result.ok
+    assert name in result.reason
 
 
 def test_min_disk_gib_defaults_to_10(monkeypatch):

@@ -16,7 +16,7 @@ entry is cleared here, while the real resource is destroyed by tofu.
 from __future__ import annotations
 
 from odin.aws.backings import PROVISIONED
-from odin.reconcile.actions import Action, NoOp, ProvisionResource, StopContainer
+from odin.reconcile.actions import Action, NoOp, PruneResource, ProvisionResource
 from odin.spec.models import Stack, World
 
 
@@ -24,11 +24,13 @@ def plan(stack: Stack, world: World) -> list[Action]:
     actions: list[Action] = []
     desired_ids = {r.id for r in stack.resources}
 
-    # Prune: anything observed but no longer desired.
+    # Prune: anything observed but no longer desired. `kind` decides what that
+    # MEANS -- for a PROVISIONED kind the executor deletes the real bucket /
+    # queue / table / topic, so this is a data-destroying action, not a stop.
     for observed in world.resources:
         if observed.id not in desired_ids:
             actions.append(
-                StopContainer(id=observed.id, name=observed.id, kind=observed.kind)
+                PruneResource(id=observed.id, name=observed.id, kind=observed.kind)
             )
 
     for res in stack.resources:

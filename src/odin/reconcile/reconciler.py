@@ -55,7 +55,7 @@ from odin.aws.backings import BackingUnavailable, ENSURE_KINDS, PROVISIONED
 from odin.fabric.localhost import LocalhostFabric
 from odin.gateway.policy import compile_policies, compile_policies_from_iam
 from odin.gateway.stores import SynthStores
-from odin.reconcile.actions import NoOp, ProvisionResource, StopContainer
+from odin.reconcile.actions import NoOp, PruneResource, ProvisionResource
 from odin.reconcile.dispatch import Dispatcher
 from odin.reconcile.drift import DriftSweeper
 from odin.reconcile.plan import plan
@@ -597,7 +597,7 @@ class Reconciler:
         never destroys a TF-owned resource itself).
 
         This prune is the SOLE authority on a TF-owned label leaving World
-        (see `_execute`'s StopContainer branch): "the desired Stack no longer
+        (see `_execute`'s PruneResource branch): "the desired Stack no longer
         wants it" is not the same question as "it no longer exists", and
         answering the second one with the first is what made every
         odin-synthesized resource flap (field test 2 finding #3).
@@ -947,9 +947,35 @@ class Reconciler:
             subs = self._desired_subs(stack, action.id) if action.service == "sns" else ()
             await self._aws.provision(action.service, action.id, subs)
             await self._emit(action.id, action.service, "starting")
-        elif isinstance(action, StopContainer):
+        elif isinstance(action, PruneResource):
+            # THREE outcomes, and only the last one stops a container. Read
+            # them as what the user gets, not as what the branch calls:
+            #   PROVISIONED -> the real bucket/queue/table/topic is DELETED
+            #   TF_OWNED    -> nothing happens here at all (tofu owns it)
+            #   otherwise   -> the container is stopped
+            # The World entry goes either way (`_prune` below).
             if action.kind in PROVISIONED:
-                await self._aws.deprovision(action.kind, action.id)
+                # Deletes the resource AND its contents:
+                # `backings.py::deprovision` -> delete_bucket / delete_queue /
+                # delete_table / delete_topic. Best-effort by design (see that
+                # method's docstring), and the prune below runs either way --
+                # so a resource that did NOT leave the backing still leaves
+                # World, and odin would otherwise report an empty canvas over a
+                # bucket that still holds objects. Changing that is a teardown
+                # semantics change needing a measurement against real backings;
+                # NAMING it is not, so name it.
+                #
+                # `is False` rather than `not`: a test double whose
+                # `deprovision` returns None did not fail, it just predates the
+                # bool, and warning about it would be the false report this
+                # line exists to prevent.
+                deleted = await self._aws.deprovision(action.kind, action.id)
+                if deleted is False:
+                    log.warning(
+                        "%s: could not delete the %s %r from its backing, but it is being "
+                        "removed from World anyway -- the real resource may still exist",
+                        self._env, action.kind, action.id,
+                    )
             elif action.kind in TF_OWNED_KINDS and self._stores is not None:
                 # tofu (never this reconciler) owns create/destroy for a
                 # TF-managed kind, and `_project_tf_owned` -- which prunes any
@@ -973,6 +999,16 @@ class Reconciler:
             await self._prune(action.id)
         elif isinstance(action, NoOp):
             pass  # nothing left to gate on now that workload refs are gone
+        else:
+            # Honesty rule 2's shape, applied to the executor: an unmapped
+            # outcome must fail loudly, never inherit "handled". This chain had
+            # no `else`, so a new `Action` member -- or the `RunContainer` that
+            # sat in the union for a whole parked layer without a handler --
+            # was executed by DOING NOTHING and reported as done.
+            raise NotImplementedError(
+                f"{type(action).__name__} is in the Action union but `_execute` "
+                "has no branch for it, so it would be silently dropped"
+            )
 
     async def _prune(self, rid: str) -> None:
         world = self._store.current_world(self._env)
@@ -981,8 +1017,15 @@ class Reconciler:
         self._store.write_world(kept)
         # Tell the canvas the node is back to draft, else its tile stays stale-green
         # after a Destroy / node removal (the World emptied but the UI never heard).
+        #
+        # A real `WorldDelta`, not the hand-built dict this used to be: the dict
+        # is why `draft` could be on the wire for months while missing from the
+        # `Phase` literal it is supposed to satisfy -- pydantic never saw it.
+        # Built and dumped rather than `_emit`ed, deliberately: `_emit` calls
+        # `apply_delta`, which would put the resource straight back into the
+        # World the two lines above just removed it from.
         if self._ws is not None and gone is not None:
-            await self._ws.broadcast({
-                "type": "world_delta", "env": self._env, "resource_id": rid,
-                "kind": gone.kind, "phase": "draft", "facts": {}, "verdict": None,
-            })
+            delta = WorldDelta(
+                env=self._env, resource_id=rid, kind=gone.kind, phase="draft",
+            )
+            await self._ws.broadcast(delta.model_dump())

@@ -21,9 +21,21 @@ Three call shapes, dispatched by `app.py`:
     entirely (verify() is the only gate: GetCallerIdentity isn't scoped to
     any canvas resource, so there's no applied statement that could
     ever grant/deny it -- matching real AWS, where it needs no IAM policy).
-  - `pure_answer` -- PURE_ACTIONS never reach a backing (goaws/dynalite lack
-    or mishandle them entirely): tag CRUD, SNS Get/SetTopicAttributes, SQS
-    GetQueueAttributes (always synth-owned -- see its docstring for why).
+  - `pure_answer` -- a `_PURE_HANDLERS` action never reaches a backing
+    (goaws/dynalite lack or mishandle them entirely): tag CRUD, SNS
+    Get/SetTopicAttributes, SQS GetQueueAttributes (always synth-owned -- see
+    its docstring for why).
+
+    WHAT "PURE" MEANS HERE, because the word is misleading and the misreading
+    is dangerous: it means NO FORWARD TO A BACKING -- the gateway answers this
+    call itself. It emphatically does NOT mean side-effect-free. `pure_answer`
+    dispatches `ec2:RunInstances` (boots a REAL Lima VM), `ecs:*` (real
+    containers), `rds:*` (a real Postgres container), `elasticache:*` (a real
+    Redis container) and `elasticloadbalancing:*` (a real nginx container), and
+    every model writes to a real per-env store. "Pure" is a statement about the
+    REQUEST PATH, never about the effects. The name is kept only because it is
+    load-bearing in ~200 places including 14 model modules; read it as
+    "synth-owned".
     Also covers the one CONDITIONAL action, SNS GetSubscriptionAttributes:
     returns None (meaning "not synth-owned for THIS call, forward normally")
     unless the subscription was already Unsubscribed -- a LIVE subscription
@@ -34,8 +46,8 @@ Three call shapes, dispatched by `app.py`:
     value and drifts on every subsequent plan -- `_sns_fix_subscription_attributes`
     strips it, closing the "goaws returns incomplete attrs -> drift; GW
     completes" half of research §3 that S1 left as a live-forward pass-through.
-  - `postprocess` -- POSTPROCESS_ACTIONS forward for real (the create/delete/
-    read must actually happen in goaws/dynalite) but the gateway also
+  - `postprocess` -- a `_POSTPROCESS_HANDLERS` action forwards for real (the
+    create/delete/read must actually happen in goaws/dynalite) but the gateway also
     observes or reshapes the response: CreateQueue's host rewrite +
     attribute/tag seeding, CreateTopic's attribute/tag seeding, DeleteQueue/
     Unsubscribe's delete markers, CreateTable's tag seeding (dynalite
@@ -370,7 +382,15 @@ async def pure_answer(
 ) -> Response | None:
     """A direct synth answer for a PURE/CONDITIONAL action, or None if
     `action` isn't synth-owned for this call -- the caller (app.py) forwards
-    normally in that case. Every `ec2:*`/`iam:*`/`lambda:*`/`ecs:*` action is
+    normally in that case.
+
+    "PURE" = NEVER FORWARDED TO A BACKING. It does NOT mean side-effect-free,
+    and this function is the loudest counter-example in odin: the branches
+    below boot a real Lima VM (`ec2:RunInstances`), real containers
+    (`ecs:*`, `rds:*`, `elasticache:*`, `elasticloadbalancing:*`) and write
+    real per-env stores. See the module docstring.
+
+    Every `ec2:*`/`iam:*`/`lambda:*`/`ecs:*` action is
     owned wholesale by its own model module(s) -- `ec2compute.py` (task V3:
     instances + key pairs, falling through to `ec2net.py`'s VPC/Subnet/SG for
     everything else), `iamctl.py`, `lambdactl.py` (task V4a), and

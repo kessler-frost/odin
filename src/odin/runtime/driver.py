@@ -1,9 +1,13 @@
 """The Runtime driver port: how odin runs + observes workloads on a host.
 
-`ColimaRuntime` (in `colima.py`) is the single-host impl for the skeleton. A
-Lima-VM impl (VM isolation / remote hosts) is a later milestone behind the same
-Protocol. The data types live in `colima.py` (the concrete module) to keep the
-import graph one-way (driver → colima).
+Two implementations, both live: `ColimaRuntime` (`colima.py`) runs containers
+directly on Colima and is the default, and `LimaRuntime` (`lima.py`) runs them
+inside a Lima VM for VM isolation. This used to call the Lima driver "a later
+milestone"; it shipped, and `compute/instances.py` builds EC2 nodes as real
+Lima VMs on top of it.
+
+The data types live in `colima.py` (the concrete module) to keep the import
+graph one-way (driver → colima).
 """
 from __future__ import annotations
 

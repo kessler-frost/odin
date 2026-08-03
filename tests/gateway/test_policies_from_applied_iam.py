@@ -12,11 +12,26 @@ The IAM half is driven by the real handlers (`iam:CreateRole`,
 `iam:PutRolePolicy`, `iam:CreateInstanceProfile`, `iam:AddRoleToInstanceProfile`)
 with the parameters the AWS provider really sends, because that half is what the
 new code reads and a hand-written dict would only prove the compiler parses my
-guess. The workload records are seeded, deliberately: `lambda:CreateFunction`
-and `ec2:RunInstances` boot a real RIE container and a real Lima VM, so calling
-them here would make a unit test start substrate. `test_the_seeded_workload
-_records_still_match_what_the_real_writers_produce` is the guard on that
-shortcut — it fails if a writer renames a field this compiler depends on.
+guess.
+
+The workload records come BOTH ways, and the split is deliberate:
+
+  * the focused cases below seed a record directly, because what they are about
+    is the compiler's chain (an instance with no node tag, a role with no
+    policy) and a seed states that in three lines;
+  * `test_a_real_*` (bottom of the file) run the REAL writers —
+    `ec2:RunInstances`, `ecs:RegisterTaskDefinition` + `CreateService`,
+    `lambda:CreateFunction` — into a fresh store and then run the real
+    compiler. That is what stops the seeds drifting from the writers.
+
+This file used to claim the second group was impossible, "because
+`lambda:CreateFunction` and `ec2:RunInstances` boot a real RIE container and a
+real Lima VM". That was wrong, and it cost the file its only real guard: all
+three writers take an injectable substrate (`vm=`, `runtime=`, `substrate=`)
+and the rest of the gateway suite has always driven them with fakes. What stood
+in for the missing test was a substring grep over the writer modules' source
+text, which was green in both of the ways it could be wrong — see the comment
+above those tests.
 
 That guard is not theoretical. Writing this file is what caught the ec2 label
 bug: the compiler read `instance["tags"]`, which does not exist — the tags live
@@ -31,9 +46,19 @@ import re
 from pathlib import Path
 from urllib.parse import urlencode
 
-from odin.gateway.models import iamctl
+from odin.gateway.classify import classify
+from odin.gateway.models import ec2compute, ecsctl, iamctl, lambdactl
 from odin.gateway.policy import compile_policies_from_iam
 from odin.gateway.stores import SynthStores
+
+from .conftest import split_url
+# The substrate fakes the rest of the gateway suite already drives these
+# writers with -- imported rather than re-declared so a fake that drifts from
+# its real class drifts in exactly one place (the precedent is
+# `test_serve_on_loop.py` importing `FakeRds`/`FakeRuntime`).
+from .test_ec2compute import FakeInstanceVm
+from .test_ecsctl import _CONTAINER_DEF, FakeTaskRuntime
+from .test_lambdactl import FakeFunctionRuntime
 
 ENV = "applied-iam"
 NOW = 1785130167.0
@@ -166,44 +191,154 @@ async def test_an_attached_managed_policy_counts_too(tmp_path: Path):
 
 
 # --- the guard on the seeded records ------------------------------------------
+#
+# Until v0.8.18 this section was a SUBSTRING GREP: a list of ten string literals
+# asserted to appear somewhere in the writer module's source text. It never
+# built a record, never called a writer and never ran the compiler, and it was
+# green in both of the ways that matter:
+#
+#   * a READ satisfies a grep meant to guard a WRITE. `"task_role_arn"` appears
+#     twice in ecsctl.py -- the write at the RegisterTaskDefinition record and a
+#     read at `_taskdef_wire`. Rename the write and the read still matches, so
+#     the guard stayed green while every applied permission on every ecs
+#     workload was denied.
+#   * for ec2 there was no write occurrence to match AT ALL: `"odin:node"`
+#     appears exactly once in ec2compute.py, in `tags.get("odin:node")` -- a
+#     read. Delete the tag write and the guard could not notice. That is
+#     precisely the bug the module docstring above says this file exists to
+#     prevent.
+#
+# One of the ten (`"iam_instance_profile"`) had a single, write-only occurrence
+# and did work. The replacement below runs the REAL writers instead, which is
+# what the IAM half of this file already does and for the same reason.
+
+WRITER_MUTATION_NOTE = """\
+Mutation-tested (v0.8.18), both killed:
+  * ecsctl.py's RegisterTaskDefinition record key `"task_role_arn"` -> renamed
+  * ec2compute.py's `stores.tags.set(env, f"ec2:{instance_id}", tags)` -> deleted
+Both left the OLD grep green; both fail here.
+"""
+
+
+async def _ec2_answer(stores: SynthStores, req, vm) -> None:
+    path, query = split_url(req.url)
+    action, resource = classify("ec2", req.method, path, query, req.headers, req.body)
+    response = await ec2compute.pure_answer(action, resource, ENV, req.body, stores, NOW, vm)
+    assert response.status_code == 200, response.body
+
+
+async def _ecs_answer(stores: SynthStores, req, runtime) -> None:
+    path, query = split_url(req.url)
+    action, resource = classify("ecs", req.method, path, query, req.headers, req.body)
+    response = await ecsctl.pure_answer(action, resource, ENV, req.body, stores, NOW, runtime)
+    assert response.status_code == 200, response.body
+
+
+async def _lambda_answer(stores: SynthStores, req, substrate) -> None:
+    path, query = split_url(req.url)
+    action, resource = classify("lambda", req.method, path, query, req.headers, req.body)
+    response = await lambdactl.pure_answer(action, resource, ENV, req.body, stores, NOW, substrate, query)
+    assert response.status_code in (200, 201, 202), response.body
+
+
+async def test_a_real_run_instances_produces_a_record_the_compiler_can_authorize(
+    tmp_path: Path, sink, ec2,
+):
+    """The REAL `ec2:RunInstances` writer, not a seed -- a fake `InstanceVm` is
+    all it takes to run it, so the old "calling it would boot a VM" excuse for
+    the grep never held.
+
+    Asserts the PROPERTY, not the presence of a string: the grants reach the
+    compiler under the node label a caller actually presents. Two separate
+    writes have to be right for that -- the instance record's
+    `iam_instance_profile` and the tag store's `odin:node` -- and the tag write
+    is the one the old grep could not see at all.
+    """
+    stores = SynthStores(tmp_path)
+    await _role_with_grant(stores, "box-role")
+    await _iam("iam:CreateInstanceProfile", {"InstanceProfileName": "box-profile"}, stores)
+    await _iam("iam:AddRoleToInstanceProfile", {
+        "InstanceProfileName": "box-profile", "RoleName": "box-role",
+    }, stores)
+
+    req = sink.call(lambda: ec2.run_instances(
+        ImageId="ami-0abcdef1234567890", MinCount=1, MaxCount=1, InstanceType="t3.micro",
+        IamInstanceProfile={"Name": "box-profile"},
+        TagSpecifications=[{"ResourceType": "instance", "Tags": [{"Key": "odin:node", "Value": "box"}]}],
+    ))
+    await _ec2_answer(stores, req, FakeInstanceVm())
+
+    compiled = compile_policies_from_iam(stores, ENV)
+    assert [(s.actions, s.resources) for s in compiled.get("box", [])] == [
+        (("s3:GetObject", "s3:ListBucket"), ("uploads",)),
+    ], f"a really-launched instance's grants never reached the gateway. Got: {sorted(compiled)}"
+
+
+async def test_a_real_register_task_definition_produces_a_record_the_compiler_can_authorize(
+    tmp_path: Path, sink, ecs,
+):
+    """The REAL `ecs:RegisterTaskDefinition` + `ecs:CreateService` writers.
+    `desiredCount=0` so nothing is placed -- the records are what this is about,
+    and `FakeTaskRuntime` covers the convergence pass either way.
+
+    This is the case the old grep provably could not catch: `"task_role_arn"`
+    occurs twice in ecsctl.py, and only one of them is the write.
+    """
+    stores = SynthStores(tmp_path)
+    await _role_with_grant(stores, "api-role")
+    runtime = FakeTaskRuntime()
+
+    await _ecs_answer(stores, sink.call(lambda: ecs.create_cluster(clusterName="odin")), runtime)
+    await _ecs_answer(stores, sink.call(lambda: ecs.register_task_definition(
+        family="api", containerDefinitions=_CONTAINER_DEF,
+        taskRoleArn="arn:aws:iam::000000000000:role/api-role",
+    )), runtime)
+    await _ecs_answer(stores, sink.call(lambda: ecs.create_service(
+        cluster="odin", serviceName="api", taskDefinition="api", desiredCount=0,
+    )), runtime)
+
+    compiled = compile_policies_from_iam(stores, ENV)
+    assert [(s.actions, s.resources) for s in compiled.get("api", [])] == [
+        (("s3:GetObject", "s3:ListBucket"), ("uploads",)),
+    ], f"a really-registered task definition's grants never reached the gateway. Got: {sorted(compiled)}"
+
+
+async def test_a_real_create_function_produces_a_record_the_compiler_can_authorize(
+    tmp_path: Path, sink, lambda_,
+):
+    """The REAL `lambda:CreateFunction` writer, with a fake `FunctionRuntime`
+    standing in for the RIE container -- the same seam every other lambda unit
+    test in this suite uses."""
+    stores = SynthStores(tmp_path)
+    await _role_with_grant(stores, "resizer-role")
+
+    req = sink.call(lambda: lambda_.create_function(
+        FunctionName="resizer", Role="arn:aws:iam::000000000000:role/resizer-role",
+        Runtime="python3.12", Handler="lambda_function.lambda_handler",
+        Code={"ZipFile": b"PK\x03\x04fake-zip-bytes"},
+    ))
+    await _lambda_answer(stores, req, FakeFunctionRuntime())
+
+    compiled = compile_policies_from_iam(stores, ENV)
+    assert [(s.actions, s.resources) for s in compiled.get("resizer", [])] == [
+        (("s3:GetObject", "s3:ListBucket"), ("uploads",)),
+    ], f"a really-created function's grants never reached the gateway. Got: {sorted(compiled)}"
+
 
 SRC = Path(__file__).resolve().parents[2] / "src" / "odin" / "gateway"
-# Every field the compiler reads off a record it did not write here, and the
-# module whose writer must still produce it.
-DEPENDENCIES = [
-    ("models/lambdactl.py", '"function_name"'),
-    ("models/lambdactl.py", '"role"'),
-    ("models/ecsctl.py", '"task_role_arn"'),
-    ("models/ecsctl.py", '"revision"'),
-    ("models/ecsctl.py", '"service_name"'),
-    ("models/ecsctl.py", '"task_definition_arn"'),
-    ("models/ec2compute.py", '"iam_instance_profile"'),
-    ("models/ec2compute.py", '"instance_id"'),
-    ("models/ec2compute.py", 'f"ec2:{instance_id}"'),
-    ("models/ec2compute.py", '"odin:node"'),
-]
-
-
-def test_the_seeded_workload_records_still_match_what_the_real_writers_produce():
-    """The price of not calling `CreateFunction`/`RunInstances` here (they boot a
-    real container and a real VM) is that the seeds could drift from the writers.
-    This is what stops that being silent: rename a field the compiler depends on
-    and this fails, naming it, instead of the gateway quietly denying every
-    permission on that kind."""
-    missing = [
-        f"{module}: {field}" for module, field in DEPENDENCIES
-        if field not in (SRC / module).read_text()
-    ]
-    assert missing == [], (
-        "`compile_policies_from_iam` reads these off records written elsewhere, "
-        f"and the writer no longer mentions them: {missing}"
-    )
 
 
 def test_the_compiler_reads_the_tag_store_for_an_ec2_label():
     """The specific bug this file caught, pinned by shape rather than by prose.
     The instance record has no `tags` field — reading one found nothing, fell
-    back to the instance id, and produced a principal no caller can present."""
+    back to the instance id, and produced a principal no caller can present.
+
+    A TEXT check, and that is now its whole job: it names the wrong SHAPE
+    (`instance.get("tags")`) so a reviewer reading the diff sees why it is
+    wrong. The guarantee that the label really arrives lives in
+    `test_a_real_run_instances_produces_a_record_the_compiler_can_authorize`,
+    which runs the writer.
+    """
     source = (SRC / "policy.py").read_text()
     ec2_half = source.partition("instance-profile:")[2]
     assert "stores.tags.get(" in ec2_half, (

@@ -146,7 +146,7 @@ class MeshState(BaseModel):
     `vpcs` / `security_groups` (task V1b): the canvas's VPCs and security
     groups projected onto the mesh -- see `fabric/nebula.py::_ec2net_networks`.
     `lighthouse_running` (R3): whether the env's host lighthouse PROCESS is
-    up right now (`fabric/lighthouse.py::LighthouseManager.is_running`) --
+    up right now (`fabric/nebula.py::LighthouseManager.is_running`) --
     distinct from `lighthouse_underlay` merely being recorded.
     `lighthouse_port`: which UDP port THIS env's lighthouse owns -- reported
     because it is now per-env rather than one machine-global constant, and
