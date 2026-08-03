@@ -128,7 +128,7 @@ _A = {str: "a string", dict: "an object", list: "a list", bool: "a boolean",
 _NODE_SHAPE = {"id": str, "type": str, "data": dict}
 _NODE_DATA_SHAPE = {"label": str, "env": dict}
 _EDGE_SHAPE = {"source": str, "target": str, "data": dict}
-_EDGE_DATA_SHAPE = {"edgeType": str, "permissions": list}
+_EDGE_DATA_SHAPE = {"edgeType": str, "permissions": list, "rawMessageDelivery": bool}
 
 
 def _got(value: object) -> str:
@@ -274,6 +274,12 @@ def _edges(e: dict, labels: dict[str, str]) -> tuple[Edge, ...]:
     # separator in it splits into itself.
     data = e.get("data") or {}
     perms = tuple(data.get("permissions") or ())
+    # ABSENT means True, which is what makes every canvas saved before this
+    # field existed generate the bytes it always did. Only an explicit `false`
+    # turns it off -- `is not False` rather than a truthiness test, so a canvas
+    # carrying `null` (which the schema allows for every optional field) reads
+    # as "not given" instead of as "off".
+    raw = data.get("rawMessageDelivery") is not False
     stored = str(data.get("edgeType") or "") or ("iam" if perms else UNMODELLED)
     kinds = [k for k in (part.strip() for part in stored.split(EDGE_KIND_SEPARATOR)) if k] or [UNMODELLED]
     src, dst = e.get("source", ""), e.get("target", "")
@@ -283,7 +289,10 @@ def _edges(e: dict, labels: dict[str, str]) -> tuple[Edge, ...]:
     # to what this function returned before, which is what makes a stored Stack
     # revision's content hash stable across this change. Only the `iam` edge's
     # `perms` is ever read.
-    return tuple(Edge(src=src, dst=dst, kind=kind, perms=perms) for kind in dict.fromkeys(kinds))
+    return tuple(
+        Edge(src=src, dst=dst, kind=kind, perms=perms, raw_message_delivery=raw)
+        for kind in dict.fromkeys(kinds)
+    )
 
 
 def skipped_node_types(canvas: dict) -> list[str]:

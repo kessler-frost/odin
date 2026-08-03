@@ -149,10 +149,22 @@ def test_an_ipv6_cidr_is_declined_with_the_reason_it_really_fails_for(field: str
     error and took the entire security group down with it -- including its other,
     perfectly readable rules. `split(":", 2)` makes the peer one field again, and
     the message then names the real limit instead of a format the user got right.
+
+    THE REASON ITSELF WAS WRONG until v0.8.21 and said so at the user: it
+    blamed the mesh firewall for "compiling IPv4 ranges and nothing else".
+    Nebula 1.10.3 accepts an IPv6 firewall CIDR — probed, `nebula -test` exits
+    0, and a garbage CIDR exits 1, so the zero is acceptance. The blocker is
+    odin's own overlay (`10.42.0.0/16`, `fabric/models.py`): every member has
+    an IPv4 address, so an IPv6 rule could never match a peer. A caveat that
+    names the wrong component is worse than none, because it is actionable in
+    the wrong direction — so the message is asserted to name the overlay AND to
+    stop blaming nebula.
     """
     (reason,) = _project(**{field: "tcp:443:2001:db8::/32"}).unsupported
     assert f"{field}: {word} '2001:db8::/32' is an IPv6 CIDR" in reason
-    assert "IPv4 only" in reason and "nebula" in reason
+    assert "IPv4 only" in reason
+    assert "10.42.0.0/16" in reason, "the reason must name the real blocker"
+    assert "Nebula itself is not the blocker" in reason
 
 
 def test_an_ipv6_line_does_not_take_the_readable_rules_down_as_a_format_error():

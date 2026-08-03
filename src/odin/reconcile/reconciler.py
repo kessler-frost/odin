@@ -783,11 +783,29 @@ class Reconciler:
     def _kind_of(self, stack: Stack, rid: str) -> str | None:
         return next((r.kind for r in stack.resources if r.id == rid), None)
 
-    def _desired_subs(self, stack: Stack, sns_id: str) -> tuple[str, ...]:
-        """An sns→sqs canvas edge is a subscription: the queues this topic
-        must fan out to."""
-        return tuple(e.dst for e in stack.edges
-                     if e.src == sns_id and self._kind_of(stack, e.dst) == "sqs")
+    def _desired_subs(self, stack: Stack, sns_id: str) -> tuple[tuple[str, bool], ...]:
+        """An sns→sqs canvas edge is a subscription: the queues this topic must
+        fan out to, each with the raw-delivery flag its edge authored.
+
+        A PAIR rather than a bare name since v0.8.21, so the non-tofu Apply
+        path subscribes with what the canvas says instead of a hardcoded
+        `true`. The two paths have to agree: `iac/hcl.py` emits
+        `raw_message_delivery` from the same `Edge` field, and a queue whose
+        envelope depended on which path created it would be the worst kind of
+        difference -- invisible until a consumer parsed the wrong thing.
+
+        De-duplicated on the QUEUE, keeping the FIRST edge's flag and the
+        canvas's own order: one canvas can carry the same src/dst pair several
+        times, because `translate._edges` emits one `Edge` per MEANING, so an
+        sns->sqs line that is both a subscription and an iam grant arrives
+        twice. Subscribing twice with conflicting attributes would make the
+        winner depend on iteration order; `setdefault` makes it depend on the
+        canvas."""
+        pairs: dict[str, bool] = {}
+        for edge in stack.edges:
+            if edge.src == sns_id and self._kind_of(stack, edge.dst) == "sqs":
+                pairs.setdefault(edge.dst, edge.raw_message_delivery)
+        return tuple(pairs.items())
 
     async def _emit(self, rid, kind, phase, facts=None, verdict=None) -> None:
         # Skip unchanged status: observe runs every tick, so re-emitting an
@@ -899,7 +917,7 @@ class Reconciler:
         if res.kind != "sns" or not ok:
             return
         actual = await self._aws.subscriptions(res.id)
-        missing = tuple(q for q in self._desired_subs(stack, res.id) if q not in actual)
+        missing = tuple(pair for pair in self._desired_subs(stack, res.id) if pair[0] not in actual)
         if missing:
             await self._aws.provision("sns", res.id, missing)
 

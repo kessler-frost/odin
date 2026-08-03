@@ -1010,16 +1010,22 @@ resource "aws_sns_topic_subscription" "alerts_jobs" {
 '''
 
 
-def test_a_subscriptions_filter_policy_and_raw_delivery_are_reported():
-    """A subscription becomes an EDGE, and an edge carries no arguments -- so
-    nothing ever computed dropped attributes for one. Losing `filter_policy`
-    means the queue starts receiving EVERY message on the topic."""
+def test_a_subscriptions_filter_policy_is_reported_and_its_raw_delivery_is_CARRIED():
+    """`filter_policy` is still lost, and losing it means the queue starts
+    receiving EVERY message on the topic -- so it is still reported.
+
+    `raw_message_delivery = false` is no longer among the losses. It used to be
+    reported as CHANGED ("odin always emits true"), which was the honest
+    disclosure of a real substitution; since v0.8.21 the edge carries it and
+    there is nothing to substitute. Both halves are asserted, because a fix
+    that carried the flag AND stopped reporting `filter_policy` would look the
+    same from the value side alone."""
     result = parse_hcl_text(_FILTERED_SUBSCRIPTION_TF)
-    assert result.edges == [{"source": "alerts", "target": "jobs"}]
+    assert result.edges == [{"source": "alerts", "target": "jobs",
+                             "data": {"rawMessageDelivery": False}}]
     (lost,) = _lost(result, "sns subscription")
     assert "filter_policy" in lost
-    (changed,) = _changed(result, "sns subscription")
-    assert "raw_message_delivery=false (odin always emits true)" in changed
+    assert _changed(result, "sns subscription") == [], "nothing is substituted any more"
 
 
 def test_a_subscription_odin_itself_generated_reports_nothing():

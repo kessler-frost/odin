@@ -583,7 +583,14 @@ _FIXED_VALUES = {
     ("aws_lb_target_group", "target_type"): "instance",
     ("aws_lb_listener", "protocol"): "http",
     ("aws_sns_topic_subscription", "protocol"): "sqs",
-    ("aws_sns_topic_subscription", "raw_message_delivery"): "true",
+    # `raw_message_delivery` LEFT THIS TABLE in v0.8.21. It sat here because
+    # odin substituted its own `true` for whatever the source said, and the
+    # warning was the honest disclosure of a real loss: a consumer written
+    # against SNS's JSON envelope stopped finding one. It is authorable now
+    # (`Edge.raw_message_delivery`), so the value round-trips and there is
+    # nothing left to disclose -- leaving the entry would report a
+    # substitution that no longer happens, which is the same lie as hiding one
+    # that does.
     # odin emits all four of these unconditionally (`hcl.py::_ecs`), and the
     # rolling-update pair is load-bearing: `_ECS_MIN_HEALTHY_PERCENT = 100` is
     # what keeps the previous revision serving while a new one comes up, so a
@@ -795,19 +802,47 @@ def _literal(value: object) -> str:
     return str(unquoted).lower()
 
 
+# hcl2's rendering of a NEGATIVE number literal, and nothing looser: the whole
+# body between the braces must be `-<digits>`, so `${var.port}` and
+# `${-1 + x}` are still expressions this module refuses to read. See
+# `_int_text` for the measurement that made this necessary.
+_NEGATIVE_LITERAL = re.compile(r"\$\{(-\d+)\}")
+
+
 def _int_text(value: object) -> str | None:
     """An HCL integer argument as digits, or None when the source value isn't a
     literal number at all. python-hcl2 parses `20` as a real int and a quoted
     `"20"` as a 4-character string (both are valid HCL for a number argument and
     both must survive), while `var.size` arrives as the string `${var.size}`,
     which nothing can turn into a number here -- and `isinstance(True, int)` is
-    True in Python, so a bool has to be excluded explicitly."""
+    True in Python, so a bool has to be excluded explicitly.
+
+    A NEGATIVE literal is the exception this function did not have, and it cost
+    a real security group. MEASURED against the installed python-hcl2:
+
+        from_port = -1    ->  '${-1}'   (a str)
+        from_port = 443   ->  443       (an int)
+
+    -- hcl2 renders unary minus as an INTERPOLATION, so `-1` arrived looking
+    exactly like `var.port` and was dropped as "not a literal number". It is
+    the most literal number in the whole AWS security-group model: an ICMP rule
+    is `from_port = -1, to_port = -1`, which is what the console writes for
+    "allow ping", and odin silently regenerated the group without it.
+
+    `${-<digits>}` ONLY. `${var.port}`, `${local.p + 1}` and every other
+    expression still return None, because the point is to read a literal that
+    hcl2 happened to wrap, not to start evaluating HCL. A negative that is not
+    `-1` gets no further either: `hcl.parse_sg_rule` takes `-1` and nothing
+    else in the port position, and names the line if it sees another."""
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
         return str(value)
     unquoted = hcl.unquote(value)
-    return unquoted if isinstance(unquoted, str) and unquoted.isdigit() else None
+    if not isinstance(unquoted, str):
+        return None
+    negative = _NEGATIVE_LITERAL.fullmatch(unquoted)
+    return negative.group(1) if negative else (unquoted if unquoted.isdigit() else None)
 
 
 def _derived_changes(triples: Iterable[tuple[str, object, str]]) -> dict[str, str]:
@@ -2652,12 +2687,23 @@ def parse_hcl(files: dict[str, str], archives: dict[str, bytes] | None = None) -
         topic_label = by_hcl_name.get(f"aws_sns_topic.{topic_target}") if topic_target else None
         queue_label = by_hcl_name.get(f"aws_sqs_queue.{queue_target}") if queue_target else None
         if topic_label and queue_label:
-            edges.append({"source": topic_label, "target": queue_label})
-            # The subscription becomes an EDGE, and an edge carries no arguments
-            # -- so everything the source put ON the subscription has to be
-            # accounted for here or it vanishes. `filter_policy` is the one that
-            # matters most: drop it and the queue starts receiving every message
-            # published to the topic, which no warning ever mentioned.
+            # `rawMessageDelivery` is written ONLY when the source turned it
+            # off. An edge dict with no such key is byte-identical to what this
+            # produced before the field existed, and `translate._edges` reads
+            # its absence as True -- so every canvas and every `.tf` that never
+            # mentioned it imports exactly as it always did, and re-generates
+            # the same file. Writing `true` explicitly would churn every stored
+            # canvas's content hash for no change in meaning.
+            edge: dict = {"source": topic_label, "target": queue_label}
+            if _literal(attrs.get("raw_message_delivery")) == "false":
+                edge["data"] = {"rawMessageDelivery": False}
+            edges.append(edge)
+            # The subscription becomes an EDGE, and an edge carries almost no
+            # arguments -- so everything the source put ON the subscription has
+            # to be accounted for here or it vanishes. `filter_policy` is the
+            # one that matters most: drop it and the queue starts receiving
+            # every message published to the topic, which no warning ever
+            # mentioned.
             sub_type = "aws_sns_topic_subscription"
             dropped, changed = _attribute_notes(
                 sub_type, attrs, _CARRIED_COMPANION_ATTRS[sub_type], (), {},

@@ -256,11 +256,102 @@ def test_a_malformed_port_never_parses(port: str):
     assert parse_sg_rule(f"tcp:{port}:0.0.0.0/0") is None
 
 
-def test_a_bare_minus_one_port_is_still_declined():
-    """`icmp:-1:...` was never drawable and still is not -- ROADMAP says so, and
-    a range grammar is exactly the change that could have made that line stale by
-    accident (`-1` splits into an empty low bound)."""
-    assert parse_sg_rule("icmp:-1:0.0.0.0/0") is None
+@pytest.mark.parametrize("protocol", ["icmp", "icmpv6", "-1"])
+def test_the_all_ports_port_is_drawable_on_a_protocol_that_has_no_ports(protocol):
+    """`icmp:-1:...` is the "allow ping" rule AWS's own console writes, and it
+    was declined until v0.8.21. The protocols are listed as literals rather
+    than iterated from `hcl._ALL_PORTS_PROTOCOLS`: a test parametrized over the
+    set it guards loses its case when the set loses a member, and the run still
+    reads green with a smaller count."""
+    assert parse_sg_rule(f"{protocol}:-1:0.0.0.0/0") == (protocol, "-1", "-1", "0.0.0.0/0")
+
+
+@pytest.mark.parametrize("protocol", ["tcp", "udp", "esp", "47"])
+def test_the_all_ports_port_is_REFUSED_on_a_protocol_that_has_ports(protocol):
+    """The other half, and it is a daemon-down guard rather than pedantry:
+    `fabric/nebula.py::_compile_side` passes the port through verbatim for any
+    protocol outside its portless set, and a verbatim `-1` makes nebula refuse
+    to start. AWS refuses these too."""
+    assert parse_sg_rule(f"{protocol}:-1:0.0.0.0/0") is None
+
+
+@pytest.mark.parametrize("protocol", ["icmp", "icmpv6", "-1"])
+def test_no_all_ports_rule_can_put_a_minus_one_into_a_nebula_PORT(protocol):
+    """THE RATCHET, and it is behavioural on purpose. The grammar above and the
+    nebula compiler are two separate producers that must agree, and comparing
+    their two constants would pass while both were wrong. So this compiles each
+    accepted protocol through the REAL `sg_rules_to_firewall` and asserts what
+    comes out the far end: a port nebula can parse.
+
+    Break it in either direction and this fails -- adding `tcp` to the grammar's
+    accepted set, or removing `icmp` from nebula's portless set."""
+    firewall = sg_rules_to_firewall([{
+        "IpProtocol": protocol, "FromPort": -1, "ToPort": -1,
+        "IpRanges": [{"CidrIp": "10.0.0.0/16"}],
+    }])
+    assert [(r.port, r.proto) for r in firewall.inbound] == [
+        ("any", "any" if protocol == "-1" else protocol)
+    ]
+
+
+def test_an_ICMP_rule_survives_import_canvas_regenerate_byte_for_byte():
+    """The round trip the drop used to break. MEASURED first, and the cause was
+    not where the warning said: python-hcl2 renders `-1` as the interpolation
+    `'${-1}'`, so `_int_text` read the most literal number in the AWS security
+    group model as an expression and the group came back with no ping."""
+    source = (
+        'resource "aws_vpc" "main" {\n  cidr_block = "10.0.0.0/16"\n}\n\n'
+        'resource "aws_security_group" "web" {\n'
+        '  name   = "web"\n  vpc_id = aws_vpc.main.id\n\n'
+        "  ingress {\n    from_port   = -1\n    to_port     = -1\n"
+        '    protocol    = "icmp"\n    cidr_blocks = ["10.0.0.0/16"]\n  }\n}\n'
+    )
+    imported = parse_hcl_text(source)
+
+    (sg,) = [n for n in imported.nodes if n["type"] == "sg"]
+    assert sg["data"]["ingressRules"] == "icmp:-1:10.0.0.0/16"
+    assert imported.warnings == [], "nothing was lost, so nothing should be reported"
+
+    regenerated = generate_tf(canvas_to_stack(
+        {"nodes": imported.nodes, "edges": imported.edges},
+    )).files["main.tf"]
+    assert (
+        "  ingress {\n"
+        "    from_port   = -1\n"
+        "    to_port     = -1\n"
+        '    protocol    = "icmp"\n'
+        '    cidr_blocks = ["10.0.0.0/16"]\n'
+        "  }"
+    ) in regenerated
+
+
+def test_a_non_literal_port_is_still_refused_and_still_reported():
+    """The half of the old limit that is NOT closed and must not quietly open:
+    reading `${-1}` as the literal it is must not turn into evaluating HCL.
+    `var.port` has no value at import time and never will."""
+    source = (
+        'resource "aws_vpc" "main" {\n  cidr_block = "10.0.0.0/16"\n}\n\n'
+        'variable "port" {\n  default = 8080\n}\n\n'
+        'resource "aws_security_group" "web" {\n'
+        '  name   = "web"\n  vpc_id = aws_vpc.main.id\n\n'
+        "  ingress {\n    from_port   = var.port\n    to_port     = var.port\n"
+        '    protocol    = "tcp"\n    cidr_blocks = ["0.0.0.0/0"]\n  }\n}\n'
+    )
+    imported = parse_hcl_text(source)
+
+    (sg,) = [n for n in imported.nodes if n["type"] == "sg"]
+    assert sg["data"].get("ingressRules", "") == ""
+    assert any("1 of 1 ingress rule(s) could not be imported" in w for w in imported.warnings)
+
+
+def test_a_minus_one_port_on_a_ported_protocol_is_named_for_what_it_IS():
+    """It got the malformed-range message until v0.8.21, which sent the author
+    to fix a range they had not written. The reason has to name the real
+    mistake: a legal AWS spelling on the wrong protocol."""
+    (reason,) = _project(ingressRules="tcp:-1:0.0.0.0/0").unsupported
+    assert "uses the all-ports port '-1'" in reason
+    assert "icmp" in reason and "icmpv6" in reason
+    assert "malformed port range" not in reason
 
 
 def test_the_generic_format_message_is_untouched_for_a_line_with_no_range():

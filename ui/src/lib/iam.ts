@@ -350,6 +350,37 @@ for (const member of sgMemberTypes) register('sg', member, 'sg');
 export const subscriptionTargetTypes = new Set(['sqs']);
 for (const queue of subscriptionTargetTypes) register('sns', queue, 'subscription');
 
+/**
+ * Does this pair have a raw-message-delivery choice to make?
+ *
+ * The NODE KINDS, not `edge.kind` -- the same rule the comment above states,
+ * for the same reason: every canvas saved before the `subscription` name
+ * existed stores `network`, and gating this on the name would hide the control
+ * from exactly those edges.
+ *
+ * Order-insensitive, because a user may draw the line either way and
+ * `spec/translate.py::_orient_subscription_edges` turns a backwards one into
+ * the same subscription. A panel that only offered the choice in one direction
+ * would leave half of them unauthorable.
+ */
+export function supportsRawMessageDelivery(sourceType: string, targetType: string): boolean {
+  const pair = new Set([sourceType, targetType]);
+  return pair.has('sns') && pair.has('sqs');
+}
+
+/**
+ * The edge's raw-delivery setting, with ABSENT meaning `true`.
+ *
+ * The mirror of `spec/translate.py::_edges`' `data.get("rawMessageDelivery")
+ * is not False`, and it has to agree with it exactly: every canvas drawn
+ * before the field existed has no such key, and reading that as `false` would
+ * change the envelope of every live subscription on the next apply. So the
+ * ONLY value that turns it off is a literal `false`.
+ */
+export function rawMessageDeliveryOf(data: Record<string, unknown> | undefined | null): boolean {
+  return data?.rawMessageDelivery !== false;
+}
+
 // "This workload assumes this role." Folded into the `role` FIELD the builder
 // already reads (`spec/translate.py::_merge_role_edges` ->
 // `iac/hcl.py::_lambda`), so the edge is another way to author a fact odin

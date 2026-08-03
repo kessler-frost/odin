@@ -54,7 +54,7 @@ import time
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qsl, quote
 
 import httpx
 import uvicorn
@@ -69,7 +69,7 @@ from odin.aws.backings import SECRET_KEY as BACKING_SECRET_KEY
 from odin.gateway import apigw_shim
 from odin.gateway import classify as classify_mod
 from odin.gateway import errors, sigv4, synth
-from odin.gateway.models import lambdactl
+from odin.gateway.models import lambdactl, s3notify
 from odin.gateway.keys import OPERATOR_NODE_ID, KeyStore, Principal
 from odin.gateway.policy import Statement, evaluate
 from odin.gateway.stores import SynthStores
@@ -330,6 +330,45 @@ def _raw_target(request: Request) -> tuple[str, str]:
     return request.scope["raw_path"].decode("latin-1"), request.scope["query_string"].decode("latin-1")
 
 
+async def _absent_keys(
+    client: httpx.AsyncClient, backing_port: int, bucket: str, keys: tuple[str, ...],
+) -> frozenset[str]:
+    """Which of `keys` the S3 backing says are NOT there -- one signed HEAD each,
+    concurrently, BEFORE the delete that is about to remove the answer.
+
+    This is the half of the S3 removal-notification fix that cannot live in
+    `synth.postprocess`: that hook is synchronous and runs after the forward,
+    and an S3 delete answers 204 (or `<Deleted>`) whether or not the key was
+    there, so by the time it runs the question is unanswerable. Which keys are
+    worth asking about is `s3notify.probe_keys`' decision, and it returns an
+    EMPTY tuple for every bucket with no matching removal notification -- which
+    is every bucket until someone draws one, so the common path never gets
+    here. See that function for the measured cost of the path that does.
+
+    ONLY A DEFINITE 404 COUNTS. A timeout, a connection error, a 403, a 500 --
+    anything that is not the backing plainly saying "no such key" -- leaves the
+    key out of the returned set, and `s3notify._writes` suppresses nothing for
+    a key that is not in it. So every failure of this probe degrades to the
+    over-fire that preceded it rather than to silence, and that direction is
+    deliberate: an event that fires when it should not is a nuisance a handler
+    can guard against, and an event that stops firing is invisible.
+
+    `asyncio.gather` and no semaphore: `httpx.AsyncClient`'s own pool caps
+    concurrency at 100 connections, which is a real bound already in the
+    dependency rather than a second one to keep in step with it."""
+    async def absent(key: str) -> str | None:
+        url = f"http://127.0.0.1:{backing_port}/{bucket}/{quote(key, safe='/')}"
+        headers = sigv4.resign(
+            "HEAD", url, {}, b"", BACKING_ACCESS_KEY, BACKING_SECRET_KEY, "s3", BACKING_REGION,
+        )
+        with contextlib.suppress(httpx.HTTPError):
+            response = await client.request("HEAD", url, headers=headers)
+            return key if response.status_code == 404 else None
+        return None
+
+    return frozenset(key for key in await asyncio.gather(*map(absent, keys)) if key is not None)
+
+
 def create_gateway_app(
     state: GatewayState,
     keystore: KeyStore,
@@ -469,6 +508,17 @@ def create_gateway_app(
             await on_unavailable(principal, action, resource, service)
             return errors.service_unavailable(service)
 
+        # BEFORE the forward, and only for a delete: which of the keys a
+        # removal notification would fire for are not actually there. An S3
+        # delete is idempotent and reports success either way, so this is the
+        # last moment the question has an answer -- see `_absent_keys` and
+        # `s3notify.probe_keys` for why it costs nothing on a bucket without a
+        # matching notification, which is every bucket by default.
+        absent = await _absent_keys(
+            client, backing_port, resource,
+            s3notify.probe_keys(stores, principal.env, resource, path, query_params, body),
+        ) if action == "s3:DeleteObject" else frozenset()
+
         backing_url = f"http://127.0.0.1:{backing_port}{path}" + (f"?{query}" if query else "")
         forward_headers = _strip(headers, _HOP_BY_HOP)
         if service == "s3":
@@ -487,7 +537,7 @@ def create_gateway_app(
         response_body = upstream.content
         response_headers = _strip(dict(upstream.headers), _RESPONSE_HOP_BY_HOP)
         if upstream.status_code < 300 and synth.is_postprocess_action(action):
-            rewritten = synth.postprocess(action, resource, principal.env, body, response_body, stores, headers.get("host", ""), now, path, query_params)
+            rewritten = synth.postprocess(action, resource, principal.env, body, response_body, stores, headers.get("host", ""), now, path, query_params, absent)
             if rewritten != response_body:
                 response_headers["content-length"] = str(len(rewritten))
             response_body = rewritten

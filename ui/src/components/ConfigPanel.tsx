@@ -4,6 +4,7 @@ import StatusBadge, { phaseTextColor } from './nodes/StatusBadge';
 import {
   iamActionsForTarget, edgeTypes, detectEdgeTypes, UNMODELLED,
   edgeTypeChoices, primaryEdgeType, selectedEdgeTypes, toggleEdgeType,
+  supportsRawMessageDelivery, rawMessageDeliveryOf,
 } from '../lib/iam';
 import { catalogTypeConfig, catalogFields } from '../lib/catalog';
 
@@ -287,7 +288,12 @@ function EdgeConfigView({ edge, nodes, onEdgeUpdate, onCollapse }: { edge: Edge;
     // did before there was anything else to mean) would silently drop the
     // `connection` half of an rds->ecs edge -- the workload would keep its grant
     // and lose its DATABASE_URL, with the panel showing no sign of it.
+    // `...edge.data` first, and it is load-bearing: `onEdgeUpdate` REPLACES
+    // the whole data object, so returning only what `toggleEdgeType` computes
+    // would silently drop `rawMessageDelivery` -- the user's subscription
+    // envelope reverting because they ticked a permission.
     onEdgeUpdate?.(edge.id, {
+      ...(edge.data ?? {}),
       ...toggleEdgeType(stored, availableTypes, 'iam', true, sourceType, targetType, newPermissions),
       permissions: newPermissions,
     });
@@ -303,9 +309,17 @@ function EdgeConfigView({ edge, nodes, onEdgeUpdate, onCollapse }: { edge: Edge;
   // `<select>` this replaces was gated on `availableTypes.length > 1` and had
   // never once rendered, since every pair meant exactly one thing until v0.8.15.
   const changeEdgeType = (edgeType: string, on: boolean) =>
-    onEdgeUpdate?.(edge.id, toggleEdgeType(
-      stored, availableTypes, edgeType, on, sourceType, targetType, permissions,
-    ));
+    onEdgeUpdate?.(edge.id, {
+      ...(edge.data ?? {}),
+      ...toggleEdgeType(stored, availableTypes, edgeType, on, sourceType, targetType, permissions),
+    });
+
+  // ABSENT means on, matching `spec/translate.py::_edges`. Written back as an
+  // explicit boolean either way once touched, which is what the Python side
+  // reads with `is not False`.
+  const rawDelivery = rawMessageDeliveryOf(edge.data as Record<string, unknown>);
+  const changeRawDelivery = (on: boolean) =>
+    onEdgeUpdate?.(edge.id, { ...(edge.data ?? {}), rawMessageDelivery: on });
 
   return (
     <div className={panelBase}>
@@ -390,6 +404,25 @@ function EdgeConfigView({ edge, nodes, onEdgeUpdate, onCollapse }: { edge: Edge;
           </div>
         </div>
       ))}
+
+      {/* Delivery — the ONE authorable value an sns->sqs subscription has. */}
+      {supportsRawMessageDelivery(sourceType, targetType) && (
+        <div className="px-4 py-3 border-b border-border">
+          <div className="font-mono text-[10px] uppercase tracking-[2px] mb-2.5 text-text-muted">
+            Delivery
+          </div>
+          <PermissionCheckbox
+            action="raw_message_delivery"
+            checked={rawDelivery}
+            onChange={changeRawDelivery}
+          />
+          <div className="font-mono text-[10px] text-text-muted mt-1.5 leading-relaxed">
+            {rawDelivery
+              ? 'The queue receives the published body verbatim.'
+              : "The queue receives SNS's JSON envelope; the body is under \"Message\"."}
+          </div>
+        </div>
+      )}
 
       {/* Edge ID */}
       <div className="px-4 py-3 border-t border-border">

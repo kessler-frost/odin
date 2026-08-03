@@ -271,18 +271,27 @@ future decision against these points instead of re-deriving them:
   - SNS→SQS live-edit: FIXED (v0.5.0) — adding a subscription edge to an
     already-healthy topic lands on the next Apply via the reconciler's
     observe pass (proven by real fanout to both queues).
-  - **Every odin-generated SNS→SQS subscription sets
-    `raw_message_delivery = true`, including on an import round trip where the
-    source didn't have it.** Stated here because it CHANGES DELIVERY SEMANTICS:
-    the queue receives the published body verbatim instead of SNS's JSON
-    envelope, so a consumer that parses `Message` out of an envelope will not
-    find one. It is deliberate and load-bearing rather than cosmetic — the
-    reconciler's own `provision()` path subscribes with
-    `Attributes={"RawMessageDelivery": "true"}` (`aws/backings.py`) and goaws
-    honours it, so dropping it from the generated HCL would make a
-    tofu-applied stack deliver differently from an `/apply`-provisioned one.
-    A source `.tf` that wants the envelope has no way to say so today; the
-    round trip will add the attribute back (v0.7.1, field test U3).
+  - SNS→SQS `raw_message_delivery`: **AUTHORABLE (v0.8.21), default `true`.**
+    This read "every odin-generated subscription sets `raw_message_delivery =
+    true`, including on an import round trip where the source didn't have it",
+    and closed with "a source `.tf` that wants the envelope has no way to say
+    so today". It can now: the flag is a per-edge value
+    (`Edge.raw_message_delivery`, `data.rawMessageDelivery` on the wire, a
+    checkbox on the edge panel), an absent field still reads as `true` so every
+    canvas drawn before it emits the identical bytes, and an imported `false`
+    is CARRIED rather than substituted — the round trip stopped adding the
+    attribute back. The reason it was load-bearing is unchanged and is why BOTH
+    paths were changed together: `aws/backings.py::provision` used to subscribe
+    with a hardcoded `Attributes={"RawMessageDelivery": "true"}`, so leaving it
+    alone would have made a tofu-applied stack deliver differently from an
+    `/apply`-provisioned one. It now takes the flag from the same edge.
+    NOT closed: changing the flag on an ALREADY-LIVE subscription only takes
+    effect through Simulate. `Reconciler._watch` re-subscribes a queue that is
+    MISSING, never one whose attributes merely differ, and
+    `BackingAws.subscriptions` reads endpoints out of
+    `ListSubscriptionsByTopic` — which carries no attributes — so seeing the
+    difference needs a `GetSubscriptionAttributes` per subscription, and goaws
+    has not been probed for it. Listed in `docs/limits.md` rather than assumed.
   - ElastiCache (W2.8): **single node, redis only.** `aws_elasticache_cluster`
     is real — a `redis:7-alpine` container per cluster, its published port
     advertised as the cluster's node endpoint, zero-drift re-plan — but

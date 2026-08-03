@@ -762,7 +762,31 @@ def _get_change(payload: dict, resource: str, env: str, stores: SynthStores) -> 
 def _change_tags_for_resource(payload: dict, resource: str, env: str, stores: SynthStores) -> Response:
     """Where the canvas label actually lands (deviation 2). Writes the SHARED
     `tags` store under `"route53:{zone_id}"`, so `reconcile/tf_status.py` reads
-    `stores.tags.get(env, f"route53:{zone_id}")[NODE_TAG]`."""
+    `stores.tags.get(env, f"route53:{zone_id}")[NODE_TAG]`.
+
+    THE MERGE IS A UNION, AND THAT IS ONLY CORRECT BECAUSE THE PROVIDER SENDS
+    `RemoveTagKeys`. A key in neither `AddTags` nor `RemoveTagKeys` is KEPT, so
+    a provider that instead re-sent the whole desired set with the dropped key
+    simply omitted would leave that key here forever. `docs/limits.md` carried
+    that as an untested risk until it was measured, because `RemoveTagKeys` had
+    only ever been driven from boto3 -- which proves the parser, not the
+    integration.
+
+    MEASURED on 2026-08-03, OpenTofu 1.12.3 / hashicorp/aws 5.100.0, a real
+    `tofu apply` against this gateway. Created with two user tags, then `tier`
+    deleted from the config and re-applied. The provider's SECOND
+    `ChangeTagsForResource` was, in full and byte for byte:
+
+        <ChangeTagsForResourceRequest xmlns="https://route53.amazonaws.com/doc/2013-04-01/">
+          <RemoveTagKeys><Key>tier</Key></RemoveTagKeys>
+        </ChangeTagsForResourceRequest>
+
+    -- a removal and NOTHING else: no `AddTags` element at all, so the union is
+    the right shape and a replacement would have been the wrong one. The store
+    went `{tier, team}` -> `{team}`, and the `tofu plan -detailed-exitcode`
+    that followed returned **0**, which is the independent half: the provider
+    read `ListTagsForResource` back and agreed, so nothing lingered.
+    Pinned by `tests/simulate/test_route53_tags_tf_e2e.py`."""
     if _zone(stores, env, resource) is None:
         return _no_such_zone(resource)
     remove = {k for k in _members(payload, "RemoveTagKeys", "Key") if isinstance(k, str)}
