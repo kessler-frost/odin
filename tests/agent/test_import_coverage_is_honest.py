@@ -50,6 +50,19 @@ CANVAS = {
         # the attachment, and the next apply detaches a disk with data on it.
         {"id": "d1", "type": "ebs", "position": {"x": 0, "y": 0},
          "data": {"label": "scratch", "az": "us-east-1a", "size": "40"}},
+        # v0.8.19: an efs node plus BOTH mount edges below, so the round-trip
+        # claim covers the `aws_efs_access_point` companion and the two mount
+        # shapes at once.
+        #
+        # `/mnt/shared` IS NOT ARBITRARY -- do not tidy it to `/mnt/efs`. A
+        # round trip over DEFAULT values proves the defaults agree, not that
+        # the data survives: `/mnt/efs` regenerates byte-identically even with
+        # the path dropped entirely, because `hcl.py::_DEFAULT_EFS_PATH` refills
+        # it. Measured over an efs+ecs canvas -- `/mnt/efs` vs path ABSENT are
+        # IDENTICAL, `/mnt/scratch` vs ABSENT DIFFER. Same reasoning, at length,
+        # in `test_import_efs.py::test_the_round_trip_keeps_a_non_default_mount_path`.
+        {"id": "fs1", "type": "efs", "position": {"x": 0, "y": 0},
+         "data": {"label": "shared", "path": "/mnt/shared"}},
     ],
     # An IAM edge, deliberately. Until field test 7 this fixture had NO edges,
     # which made the round-trip claim below vacuous on exactly the thing it
@@ -60,6 +73,13 @@ CANVAS = {
         {"id": "e1", "source": "c1", "target": "b1",
          "data": {"edgeType": "iam", "permissions": ["s3:GetObject"]}},
         {"id": "e2", "source": "d1", "target": "e1", "data": {"edgeType": "volume"}},
+        # ONE file system, TWO consumers, which is the whole difference between
+        # `mount` and `volume`: a gp3 volume attaches to exactly one instance,
+        # an EFS file system is shared. The second edge is also drawn the OTHER
+        # WAY ROUND, because `hcl.py`'s mount pass keys on the two node kinds
+        # and must read either direction the same.
+        {"id": "e3", "source": "fs1", "target": "c1", "data": {"edgeType": "mount"}},
+        {"id": "e4", "source": "f1", "target": "fs1", "data": {"edgeType": "mount"}},
     ],
 }
 
@@ -82,7 +102,7 @@ def test_odins_own_project_now_round_trips_with_nothing_unsupported():
     result = _round_trip()
     assert result.unsupported == [], [e.type for e in result.unsupported]
     assert {n["type"] for n in result.nodes} >= {
-        "vpc", "subnet", "sg", "ec2", "ecs", "s3", "lambda", "ebs",
+        "vpc", "subnet", "sg", "ec2", "ecs", "s3", "lambda", "ebs", "efs",
     }
 
 

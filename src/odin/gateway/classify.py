@@ -339,6 +339,12 @@ def classify(
         return _classify_elbv2(body)
     if service == "events":
         return _classify_events(lower_headers, body)
+    if service == "elasticfilesystem":
+        return _classify_efs(method, path, query, body)
+    # apigateway (v0.8.19). ONE branch for both API Gateway v1 and v2 -- they
+    # share this credential scope; see `_APIGW_ROUTES` below.
+    if service == "apigateway":
+        return _classify_apigateway(method, path)
     return None
 
 
@@ -924,6 +930,166 @@ def _classify_lambda(method: str, path: str, body: bytes) -> tuple[str, str] | N
         if not isinstance(name, str) or not name:
             return f"lambda:{op}", "*"
         return f"lambda:{op}", name.rsplit(":", 1)[-1] if name.startswith("arn:") else name
+    return None
+
+
+# EFS, the SECOND rest-json service odin models (Lambda is the first), so it
+# routes by method+path exactly like `_LAMBDA_ROUTES` above and not by an
+# X-Amz-Target header or a query-protocol `Action` param. Verified against
+# botocore's own efs model: `protocol: rest-json`, `endpointPrefix:
+# elasticfilesystem`, `targetPrefix: None`.
+#
+# SEVEN routes and no more, because seven is what a real `tofu apply` + `plan` +
+# `destroy` over `aws_efs_file_system` + `aws_efs_access_point` was MEASURED
+# calling (OpenTofu 1.12.3 / hashicorp/aws 6.57.1, against a recording
+# endpoint). `DescribeBackupPolicy`, `DescribeFileSystemPolicy`,
+# `ListTagsForResource`, `DescribeMountTargets` and `TagResource` are never
+# called at all -- a route for one of those would be a permission nothing can
+# exercise, which is the decorative thing this repo keeps deleting.
+#
+# The action prefix is `elasticfilesystem:` -- the SIGNING NAME, which is also
+# AWS's real IAM namespace, and the same rule every other branch in this file
+# keeps (`elasticloadbalancing:`, `secretsmanager:`, `elasticache:`, `kms:` are
+# all their own signing names). An earlier draft emitted a short `efs:`, and
+# MEASURING it is what settled the question rather than taste:
+#
+#   arn_label("arn:aws:elasticfilesystem:...:file-system/fs-...", "efs:Describe...")
+#
+# `policy.py::arn_label` compares the ARN's OWN service field against
+# `action.partition(":")[0]` and returns None on a mismatch BEFORE it ever looks
+# up a resource pattern -- so an `efs:` prefix could never match an ARN-form
+# `Resource`, no matter what `_ARN_RESOURCE_LABEL` entry anyone added later. A
+# permission the classifier emits that nothing can grant is this repo's
+# ecr/rds/kms bug, planted fresh. `elasticfilesystem:` is merely not-yet-wired
+# there (no efs IAM edges exist -- see the tile's `iamActions` note), which is a
+# gap that can be closed; a dead end is not.
+_EFS_ROUTES: tuple[tuple[str, re.Pattern[str], str], ...] = (
+    ("POST", re.compile(r"^/2015-02-01/file-systems$"), "CreateFileSystem"),
+    ("GET", re.compile(r"^/2015-02-01/file-systems$"), "DescribeFileSystems"),
+    (
+        "GET",
+        re.compile(r"^/2015-02-01/file-systems/(?P<fs>[^/]+)/lifecycle-configuration$"),
+        "DescribeLifecycleConfiguration",
+    ),
+    ("DELETE", re.compile(r"^/2015-02-01/file-systems/(?P<fs>[^/]+)$"), "DeleteFileSystem"),
+    ("POST", re.compile(r"^/2015-02-01/access-points$"), "CreateAccessPoint"),
+    ("GET", re.compile(r"^/2015-02-01/access-points$"), "DescribeAccessPoints"),
+    ("DELETE", re.compile(r"^/2015-02-01/access-points/(?P<ap>[^/]+)$"), "DeleteAccessPoint"),
+)
+
+# Which request field names the resource, per operation, when the PATH does not.
+# A create carries it in the body; a describe carries it in the querystring
+# (rest-json puts a `querystring` location on those members), which is why
+# `_classify_efs` needs `query` at all.
+_EFS_BODY_RESOURCE = {"CreateFileSystem": "CreationToken", "CreateAccessPoint": "FileSystemId"}
+_EFS_QUERY_RESOURCE = {
+    "DescribeFileSystems": ("FileSystemId", "CreationToken"),
+    "DescribeAccessPoints": ("AccessPointId", "FileSystemId"),
+}
+
+
+def _classify_efs(method: str, path: str, query: dict[str, str], body: bytes) -> tuple[str, str] | None:
+    for route_method, pattern, op in _EFS_ROUTES:
+        if route_method != method:
+            continue
+        match = pattern.match(path)
+        if match is None:
+            continue
+        groups = match.groupdict()
+        path_id = groups.get("fs") or groups.get("ap")
+        return f"elasticfilesystem:{op}", unquote(path_id) if path_id else _efs_resource(op, query, body)
+    return None
+
+
+def _efs_resource(op: str, query: dict[str, str], body: bytes) -> str:
+    """The resource a create/describe names, or `*` for an unfiltered list.
+
+    `*` for a list-all is the same choice `_classify_lambda` makes for a
+    nameless CreateFunction, and it means the same thing here: the request is
+    genuinely not about one resource, so a policy that grants one must not match
+    it. An unscoped `DescribeFileSystems()` is a different permission from
+    reading the file system an edge points at -- the exact distinction field
+    test 2 cost an engineer an hour over on rds."""
+    try:
+        payload = json.loads(body) if body else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        payload = {}
+    body_key = _EFS_BODY_RESOURCE.get(op)
+    if body_key:
+        value = payload.get(body_key) if isinstance(payload, dict) else None
+        return _efs_bare(value) if isinstance(value, str) and value else "*"
+    for key in _EFS_QUERY_RESOURCE.get(op, ()):
+        if query.get(key):
+            return _efs_bare(unquote(query[key]))
+    return "*"
+
+
+def _efs_bare(value: str) -> str:
+    """`arn:aws:elasticfilesystem:...:file-system/fs-x` -> `fs-x`; anything
+    without a `/` (a bare id, a creation token) passes through unchanged. Every
+    EFS id member accepts both forms -- its own botocore patterns spell out the
+    ARN alternative -- so a policy written against one must match the other."""
+    return value.rpartition("/")[2] or value
+
+
+# --- apigateway (v0.8.19) --------------------------------------------------
+#
+# THE CREDENTIAL SCOPE IS `apigateway`, FOR BOTH v1 AND v2. Measured, not
+# assumed: real terraform-provider-aws 5.100.0 creating an
+# `aws_apigatewayv2_api` signs with
+# `Credential=probe/20260803/us-east-1/apigateway/aws4_request`. botocore agrees
+# from the other side -- the `apigatewayv2` service model's `endpointPrefix` is
+# `apigateway` and its `signingName` is `apigateway`. Since `gateway/app.py`
+# reads the service from the credential scope and NOTHING else, a reader who
+# "corrects" this to `apigatewayv2` because that is the SDK's name breaks every
+# call and gets `unmappable-action` for their trouble. This comment is here
+# rather than only in the model because THIS is the file that dispatches on it.
+#
+# Shape is lambda's: REST, so (method, path) against an anchored table. Same
+# OPERATOR-only reasoning as ec2/iam/ecr/lambda -- the only principal driving
+# apigateway calls is tofu, so extraction only needs to never return None for a
+# route it recognizes. The resource is the API ID (a bare `apiXXXXXXXX`) rather
+# than a canvas label: an id is what every path carries, and the API's label is
+# recoverable from its `odin:node` tag when anything needs it. No workload IAM
+# edge targets an apigateway node (`ui/src/lib/iam.ts` grants it no actions), so
+# nothing depends on the resource being a label -- exactly the `alb` precedent.
+_APIGW_ROUTES: tuple[tuple[str, re.Pattern[str], str], ...] = (
+    ("POST", re.compile(r"^/v2/apis$"), "CreateApi"),
+    ("GET", re.compile(r"^/v2/apis$"), "GetApis"),
+    ("GET", re.compile(r"^/v2/apis/(?P<api>[^/]+)$"), "GetApi"),
+    ("PATCH", re.compile(r"^/v2/apis/(?P<api>[^/]+)$"), "UpdateApi"),
+    ("DELETE", re.compile(r"^/v2/apis/(?P<api>[^/]+)$"), "DeleteApi"),
+    ("POST", re.compile(r"^/v2/apis/(?P<api>[^/]+)/integrations$"), "CreateIntegration"),
+    ("GET", re.compile(r"^/v2/apis/(?P<api>[^/]+)/integrations/[^/]+$"), "GetIntegration"),
+    ("PATCH", re.compile(r"^/v2/apis/(?P<api>[^/]+)/integrations/[^/]+$"), "UpdateIntegration"),
+    ("DELETE", re.compile(r"^/v2/apis/(?P<api>[^/]+)/integrations/[^/]+$"), "DeleteIntegration"),
+    ("POST", re.compile(r"^/v2/apis/(?P<api>[^/]+)/routes$"), "CreateRoute"),
+    ("GET", re.compile(r"^/v2/apis/(?P<api>[^/]+)/routes/[^/]+$"), "GetRoute"),
+    ("PATCH", re.compile(r"^/v2/apis/(?P<api>[^/]+)/routes/[^/]+$"), "UpdateRoute"),
+    ("DELETE", re.compile(r"^/v2/apis/(?P<api>[^/]+)/routes/[^/]+$"), "DeleteRoute"),
+    ("POST", re.compile(r"^/v2/apis/(?P<api>[^/]+)/stages$"), "CreateStage"),
+    # The stage's own segment is `.+` and not `[^/]+`: a stage NAME is the id,
+    # and a name containing a slash should reach the model's own error rather
+    # than become `unmappable-action`, which would blame authorization for a
+    # naming problem. The name odin has to serve is the literal `$default`, and
+    # it arrives PERCENT-ENCODED as `%24default` -- measured on the raw path,
+    # after a first measurement taken off Starlette's already-decoded
+    # `request.url.path` said the opposite and produced a real bug
+    # (`apigwctl.path_ids` records it).
+    ("GET", re.compile(r"^/v2/apis/(?P<api>[^/]+)/stages/.+$"), "GetStage"),
+    ("PATCH", re.compile(r"^/v2/apis/(?P<api>[^/]+)/stages/.+$"), "UpdateStage"),
+    ("DELETE", re.compile(r"^/v2/apis/(?P<api>[^/]+)/stages/.+$"), "DeleteStage"),
+)
+
+
+def _classify_apigateway(method: str, path: str) -> tuple[str, str] | None:
+    for route_method, pattern, op in _APIGW_ROUTES:
+        if route_method != method:
+            continue
+        match = pattern.match(path)
+        if match is None:
+            continue
+        return f"apigateway:{op}", unquote(match.groupdict().get("api") or "*")
     return None
 
 

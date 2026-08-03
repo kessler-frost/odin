@@ -577,9 +577,23 @@ def test_stale_request_is_superseded_right_before_the_final_commit(tmp_path, mon
 
 class _DeadTaskRuntime:
     """A TaskRuntime whose containers never come up -- `run` raises the way a
-    real bad-image `docker run` does, and nothing is ever `running`."""
+    real bad-image `docker run` does, and nothing is ever `running`.
 
-    async def run(self, env, task_id, container_def, extra_env=None, cpu=None, memory=None):
+    `volumes` is accepted and ignored, and it has to be DECLARED rather than
+    swallowed by a `**kwargs`, for a reason this fake demonstrated the hard way
+    in v0.8.19. When `TaskRuntime.run` grew the parameter (EFS mounts), this
+    signature did not, so `ecsctl`'s call raised `TypeError: got an unexpected
+    keyword argument 'volumes'` -- and the test around it still went GREEN on
+    its outer status (`applied_services_unhealthy`) and failed only on the
+    `reason` string, which read the TypeError instead of the bad-image
+    RuntimeError it exists to assert. A fake whose signature has drifted from
+    the real callee reports a plausible-looking failure for the WRONG CAUSE;
+    had that assertion been on the status alone it would have passed and proven
+    nothing. `**kwargs` would hide the next such drift instead of surfacing it.
+    """
+
+    async def run(self, env, task_id, container_def, extra_env=None, cpu=None, memory=None,
+                  volumes=None):
         raise RuntimeError(f"pull access denied for {container_def['image']}")
 
     async def status(self, env, task_id, container_name):

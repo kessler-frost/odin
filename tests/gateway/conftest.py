@@ -138,6 +138,15 @@ def events(sink: CaptureSink):
 
 
 @pytest.fixture
+def efs(sink: CaptureSink):
+    # botocore names the service model `efs`; its SigV4 credential scope (and so
+    # `classify()`'s `service`) is `elasticfilesystem` -- the same two-name split
+    # elbv2 has below, and the reason every efs test passes the scope name
+    # explicitly rather than reusing the fixture's.
+    return _client(sink, "efs")
+
+
+@pytest.fixture
 def elbv2(sink: CaptureSink):
     # botocore names the service model `elbv2`; its SigV4 credential scope (and
     # so `classify()`'s `service`) is `elasticloadbalancing`.

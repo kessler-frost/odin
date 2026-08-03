@@ -1615,6 +1615,90 @@ machine-wide-sweep rule already in CLAUDE.md. A test-owned env is invisible to
 every check a human would think to run; the only safe rule is to touch nothing
 while a suite is running.
 
+## v0.8.19 — `apigateway` stops being a placeholder, and the closed world stops at five verbs
+
+Two things, and the second was found while probing for the first.
+
+**A drawn API Gateway is a real HTTP endpoint.** One `nginx:alpine` container
+per API (`compute/apigw.py`), published on a real host port, whose `location`
+blocks are that API's routes. An `apigateway → lambda|ecs` edge emits
+`aws_apigatewayv2_api` + `_stage` + `_integration` + two `_route`s, and the
+whole thing round-trips: odin's own output re-imports with nothing unsupported
+and generate→import→generate is byte-identical.
+
+**The HTTP↔invoke-envelope shim exists now, once.** `alb → lambda` was declined
+in v0.8.15 precisely because nginx dials `host:port` upstreams and a Lambda is
+an RIE container whose only route takes an event document. `gateway/apigw_shim.py`
+is that translator: payload format 2.0 out, the handler's return value back in
+by 2.0's two rules — including the one people forget, that a return value with
+no `statusCode` IS the response body. It rides as a Starlette route mounted
+AHEAD of the gateway's SigV4 catch-all rather than as a branch inside it, so the
+pipeline's "everything through here is signed" invariant stays true and
+checkable in one place. `docs/architecture` draws that arrow as ungated, because
+it is.
+
+**Measured, not asserted, in five probes — three of which changed the design:**
+
+- The SigV4 credential scope is **`apigateway`**, for both v1 and v2
+  (`Credential=probe/…/us-east-1/apigateway/aws4_request`), while the SDK's
+  model is called `apigatewayv2`. A reader who "fixes" that constant breaks
+  every call, so the classifier carries the recording.
+- The wire is rest-json with **lower-camelCase** members. A first stub answering
+  PascalCase failed with `serialization failed: input member ApiId must not be
+  empty`.
+- **`$default` arrives percent-encoded** as `%24default`. A first measurement
+  taken off Starlette's already-decoded `request.url.path` said otherwise, and
+  the resulting create-from-body / read-from-path mismatch failed a real apply
+  with `reading API Gateway v2 Stage ($default): couldn't find resource`.
+- **RETRACTED: `invoke_url` is not derived from `apiEndpoint`.** Probe 1
+  concluded it was, because the throwaway stub happened to answer `apiEndpoint`
+  with exactly the `https://{apiId}.execute-api…` string the provider
+  constructs; the match was read as causation. Against the real gateway, in one
+  state file: `api_endpoint = "http://127.0.0.1:39999"` and
+  `invoke_url = "https://api75a2c592.execute-api.us-east-1.amazonaws.com/"`. The
+  reachable address is `api_endpoint`; `docs/limits.md` says so.
+- An `apigatewayv2` `CreateApi` from the OPERATOR got **403
+  `AccessDeniedException` / `unmappable-action`** before this work — closed
+  world confirmed by measurement rather than by reading the docstring.
+
+**The second thing: odin's closed world was silently method-limited.**
+`classify.py` states twice that an unmappable request is denied, never guessed
+at. That property lived inside `catch_all`, and the route table in front of it
+listed five verbs — so a **PATCH or an OPTIONS never reached odin's code at
+all**. Starlette answered `405 Method Not Allowed`: no SigV4 verification, no
+policy evaluation, no `access_denied` event. Latent (no modeled service used
+PATCH) until apigateway, whose four Update operations are all PATCH. Both verbs
+are routed now and the property is pinned by
+`tests/gateway/test_closed_world_is_method_independent.py`. The residual is
+stated rather than fixed: TRACE/CONNECT/extension methods are still a router
+405, because no AWS API uses one and inventing handling for verbs that never
+arrive is how a fifth unfired guard gets written.
+
+**The most useful finding was in a test, not in the code.** The first draft of
+that method-independence test parametrized over `gateway/app.py`'s own route
+table — the natural move. Removing PATCH therefore DELETED the `[PATCH]` case:
+the file went from 6 green to 5 green and reported success, on exactly the
+regression it existed to catch. A test derived from the thing under test cannot
+fail when that thing shrinks. It is honesty rule 5 in `.claude/CLAUDE.md` now,
+and the same shape was found the same night in `test_ecsctl.py`, green for
+months.
+
+Every guard added here was mutation-tested, and every run's test COUNT was
+checked as well as its pass/fail — a mutation whose count drops is the quiet
+failure above wearing a green coat:
+
+    gate the route pass on edge.kind  -> FAILED ...still_routes            (1F/18P)
+    recover the edge per ROUTE        -> FAILED ...exactly_one_line + 1    (2F/17P)
+    silence the route-key check       -> FAILED ...reported_as_CHANGED     (1F/18P)
+    drop the shim's token check       -> FAILED ...refuses_a_wrong_token   (1F/20P)
+    ignore RIE's function_error       -> FAILED ...502_not_a_200 (200==502)(1F/18P)
+    remove PATCH / remove OPTIONS     -> FAILED ...[PATCH] / [OPTIONS]     (1F/7P)
+
+One of those mutations was itself wrong first and worth recording: modelling
+"recover the edge per route" as "widen the loop's type filter" produced
+`unsupported` entries rather than duplicate edges, so it proved nothing. A
+mutation has to model the real defect.
+
 ## v0.8.18 — `ebs` stops being a placeholder: a drawn disk is a real block device on a real VM
 
 **Service-coverage scoping starts here.** Ten catalog tiles were unbackable
@@ -1898,12 +1982,84 @@ run and are not described as such.
      value. Known constraint: Lima attaches disks at VM creation and exposes no
      attach verb, so hot-attach is likely impossible where AWS treats it as
      routine, and `device_name = "/dev/sdf"` will not be what the guest sees.
-  2. **`efs → ecs|lambda`** — container mounts are already proven machinery
-     (`ContainerSpec.volumes` is how Lambda gets its code dir). Two tasks writing
-     and reading one directory is a real mount or it isn't. **Scope to containers:
-     the `ec2` end has no Terraform expression (it is an fstab line in user-data)
-     and this repo has a measured burn where a host-dir mount into Lima silently
-     mounted an empty directory.**
+  2. **`efs → ecs|lambda`** — **BUILT 2026-08-03 (v0.8.19).**
+     **THE MOUNT IS VERIFIED END TO END.** This entry's own acceptance criterion
+     was *"two tasks writing and reading one directory is a real mount or it
+     isn't"*, and it ran: task A wrote inside its container, the bytes were read
+     ON THE HOST at `.odin/<env>/gateway/efs/fs-.../`, and task B — a separate
+     service in a separate container, with `reader["task_id"] != writer["task_id"]`
+     asserted — printed them back from inside its own. Both halves, because
+     either alone is satisfiable by two independent empty directories.
+     `2 passed, exit 0, in 3.41s`.
+
+     **And the pass was falsified rather than trusted**, because 3.41s is fast
+     enough to look like nothing ran. Mutating `efsctl.task_mounts` to
+     `return {}` gives `1 failed in 181.64s` — the mutant burns the full
+     deadline and fails on the HOST-side half (*"the bind mount did not reach
+     the host"*), which proves the test genuinely waits and genuinely watches
+     the host, and that 3.41s is fast because a working bind mount is
+     instantaneous. Restored and re-run green. An `efs` node is a
+     real host directory under `.odin/<env>/gateway/efs/<fs-id>/`, bind-mounted
+     into the real container behind every `ecs`/`lambda` node it is edged to,
+     through the same `ContainerSpec.volumes` that already hands a Lambda its
+     code dir. It comes off the placeholder list, the read-only `fsId` field is
+     replaced by an authorable `path`, and the line gets an edge type of its
+     own: `mount`, **not** a reuse of `volume`. That is the one design call
+     worth recording — `volume` means "this block device is attached to that
+     instance" and `hcl.py` refuses a second attachment, while an EFS mount is
+     SHARED by as many consumers as you draw, and sharing is the entire
+     feature. One label reading "Volume Attachment" over both would have told
+     the user the wrong thing about exclusivity on the one line where sharing
+     is the point.
+
+     **Measured before any of it was written**, by pointing `AWS_ENDPOINT_URL`
+     at a recording endpoint and running a real `tofu init`/`apply`/`plan`/
+     `destroy` over `aws_efs_file_system` + `aws_efs_access_point` on OpenTofu
+     1.12.3 + hashicorp/aws 6.57.1, all three exiting 0: EFS is `rest-json`, so
+     it routes like Lambda rather than like SQS; and the provider never calls
+     `DescribeMountTargets`, `DescribeBackupPolicy`, `DescribeFileSystemPolicy`,
+     `ListTagsForResource` or `TagResource` at all, so implementing any of them
+     would have been dead code. Read out of botocore rather than remembered:
+     `LocalMountPath` is `/mnt/[a-zA-Z0-9-_.]+`, **exactly one segment under
+     `/mnt`**, so `/mnt/efs` is legal, `/mnt/efs/data` is not, and a node asking
+     for one is declined by name instead of emitted into a project real AWS
+     would reject.
+
+     **The scope limit held, and it is a refusal rather than a deferral —
+     TWICE.** The `ec2` end stays `unmodelled`: odin creates its Lima VMs with
+     `"mounts": []` (`compute/lima_yaml.py`), so the bind mount would succeed
+     and the directory would be empty — the measured burn this entry was
+     written to avoid, and the same reason the file system lives under `.odin/`
+     rather than a temp dir Colima does not share in. Excluding the EDGE does
+     not cover an ECS service PLACED inside an ec2 box, which runs under
+     `LimaRuntime` in that same mountless VM, so that combination is refused
+     too: `TaskRuntime._refuse_unmountable` raises before any container starts,
+     naming the instance, the mount and `mounts: []` as the reason, and
+     `ecsctl._launch_task` turns it into a STOPPED task carrying that text —
+     which fails the apply instead of showing a green tile over an empty
+     directory. Pinned in both directions (deleting either half of the
+     condition fails a named test) and the PREMISE is pinned too, so the
+     refusal cannot outlive its reason if odin's VMs ever gain a mount.
+
+     **Residuals, each in `docs/limits.md` in measured terms:** one mount path
+     per file system rather than one per consumer (a tile has nowhere to hang a
+     per-consumer value); no mount targets, no security group on the file
+     system, no IAM authorization and no encryption in either direction — a
+     bind mount is performed by the container runtime and the gateway never
+     sees a signed request for it, which is exactly why the tile declares NO
+     `iamActions`; and mounts are read-write always, because
+     `ContainerSpec.volumes` renders `-v src:dst` with no `:ro` support, so a
+     `readOnly: true` in a task definition round-trips and changes nothing.
+
+     Two ratchets moved with it rather than after it: `docs/limits.md`'s pair
+     counts, recomputed from the live registry (**47/331 → 49/329 typed/
+     unmodelled**, the two new `mount` pairs), and the ambiguity ratchet, which
+     stays green only because `efs` declares no `iamActions` — falsified by
+     mutation, not assumed: giving the tile `elasticfilesystem:*` makes
+     `edge-ambiguity.test.ts` fail naming `efs -> ecs: iam | mount` and three
+     siblings. **`docs/architecture.md` + `.html` gained a diagram for `efs`
+     AND for `ebs`**, which v0.8.18 skipped — CLAUDE.md rule 2b requires both
+     files in the same change, and neither mentioned `ebs` at all until now.
   3. **`apigateway → lambda|ecs`** — settled as belonging to the TARGET family,
      not events, on the synchrony argument: a caller holds a connection open and
      awaits a status code. Substrate is `compute/proxy.py`'s nginx given a route

@@ -26,7 +26,7 @@ from starlette.responses import Response
 from odin.compute.functions import READY_TIMEOUT, InvokeResult
 from odin.gateway.classify import classify
 from odin.gateway.keys import KeyStore, workload_env
-from odin.gateway.models import lambdactl, logsctl
+from odin.gateway.models import efsctl, lambdactl, logsctl
 from odin.gateway.stores import SynthStores
 from odin.runtime.colima import CONTAINER_HOST
 from odin.spec.store import SpecStore
@@ -75,6 +75,7 @@ class FakeFunctionRuntime:
         self.block = block
         self.extracted: list[tuple] = []
         self.ensured: list[tuple] = []
+        self.volumes: dict[str, str] = {}
         self.invoked: list[tuple] = []
         self.deleted: list[tuple] = []
         self.log_reads: list[tuple] = []
@@ -88,8 +89,13 @@ class FakeFunctionRuntime:
 
     async def ensure(
         self, env: str, name: str, runtime: str, handler: str, env_vars: dict[str, str], code_dir: Path,
-        memory_mib: int | None = None,
+        memory_mib: int | None = None, volumes: dict[str, str] | None = None,
     ) -> int:
+        # `volumes` (the function's EFS mounts) is RECORDED, not ignored. A fake
+        # that merely accepted the kwarg would keep these tests green while
+        # proving nothing about the one thing the caller does with it --
+        # `test_a_functions_efs_mount_reaches_the_container` reads this.
+        self.volumes = dict(volumes or {})
         if self.block is not None:
             # `threading.Event.wait(timeout=5.0)` returned False and carried on
             # rather than raising; `asyncio.timeout` raises, so the suppress is
@@ -986,3 +992,115 @@ def test_active_timeout_defaults_to_outlasting_the_deploy_it_verifies(monkeypatc
 
     monkeypatch.setenv("ODIN_LAMBDA_ACTIVE_TIMEOUT", "7")
     assert lambdactl.active_timeout() == 7.0
+
+
+# --- efs: FileSystemConfigs, stored, ECHOED, and resolved to a real directory
+
+
+def _a_file_system_and_access_point(stores, tmp_path, file_system_id="fs-00000000000000001",
+                                    access_point_id="fsap-00000000000000001") -> tuple[str, str]:
+    """The record pair plus the REAL directory -- the same thing efsctl writes,
+    built directly so this file needs no EFS client of its own."""
+    directory = efsctl.host_dir(tmp_path, ENV, file_system_id)
+    directory.mkdir(parents=True)
+    stores.efsctl.set(ENV, f"fs:{file_system_id}", {
+        "file_system_id": file_system_id, "creation_token": "shared", "host_dir": str(directory),
+        "created_at": 1.0, "performance_mode": "generalPurpose", "throughput_mode": "bursting",
+        "size_bytes": 0,
+    })
+    stores.efsctl.set(ENV, f"ap:{access_point_id}", {
+        "access_point_id": access_point_id, "file_system_id": file_system_id,
+        "client_token": "t", "created_at": 1.0,
+    })
+    return str(directory), efsctl.access_point_arn(access_point_id)
+
+
+async def test_a_functions_efs_mount_reaches_the_container(stores, sink, lambda_, tmp_path):
+    """The whole Lambda half, through the real handlers: `FileSystemConfigs`
+    resolves Arn -> access point -> file system -> directory, and the REAL host
+    directory is what gets mounted."""
+    directory, arn = _a_file_system_and_access_point(stores, tmp_path)
+    substrate = FakeFunctionRuntime()
+    await _create(stores, sink, lambda_, substrate, FileSystemConfigs=[
+        {"Arn": arn, "LocalMountPath": "/mnt/efs"},
+    ])
+    await _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
+
+    assert substrate.volumes == {directory: "/mnt/efs"}
+
+
+async def test_file_system_configs_are_echoed_back_or_the_provider_sees_permanent_drift(
+    stores, sink, lambda_, tmp_path,
+):
+    """`FileSystemConfigs` is a member of `FunctionConfiguration` as well as of
+    `CreateFunctionRequest`. A provider that sent one and reads none back sees a
+    resource that lost a field it set -- drift on every `plan`, forever.
+
+    Mutation-test: drop the `FileSystemConfigs` line from `_configuration_json`
+    and this fails."""
+    _directory, arn = _a_file_system_and_access_point(stores, tmp_path)
+    substrate = FakeFunctionRuntime()
+    created = await _create(stores, sink, lambda_, substrate, FileSystemConfigs=[
+        {"Arn": arn, "LocalMountPath": "/mnt/efs"},
+    ])
+    assert created["FileSystemConfigs"] == [{"Arn": arn, "LocalMountPath": "/mnt/efs"}]
+
+    configuration = await _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
+    assert configuration["FileSystemConfigs"] == [{"Arn": arn, "LocalMountPath": "/mnt/efs"}]
+
+    req = sink.call(lambda: lambda_.get_function(FunctionName="fn1"))
+    whole = _parse("GetFunction", await _answer(stores, req, substrate))
+    assert whole["Configuration"]["FileSystemConfigs"] == [{"Arn": arn, "LocalMountPath": "/mnt/efs"}]
+
+
+async def test_a_function_with_no_mount_omits_the_field_entirely(stores, sink, lambda_):
+    """Real AWS omits an unset optional member, and so must odin: an empty list
+    echoed where AWS sends nothing is the same drift with the sign flipped."""
+    substrate = FakeFunctionRuntime()
+    created = await _create(stores, sink, lambda_, substrate)
+    assert "FileSystemConfigs" not in created
+    assert substrate.volumes == {}
+
+
+async def test_updating_the_mount_takes_effect_and_is_echoed(stores, sink, lambda_, tmp_path):
+    """A config-only update already restarts the container (this module's
+    no-relabel-without-restart rule), so a changed mount reaches it -- and the
+    new value has to come back out or the next plan drifts."""
+    directory, arn = _a_file_system_and_access_point(stores, tmp_path)
+    substrate = FakeFunctionRuntime()
+    await _create(stores, sink, lambda_, substrate)
+    await _wait_for_state(stores, sink, lambda_, "fn1", "Active", substrate)
+    assert substrate.volumes == {}
+
+    req = sink.call(lambda: lambda_.update_function_configuration(
+        FunctionName="fn1", FileSystemConfigs=[{"Arn": arn, "LocalMountPath": "/mnt/efs"}],
+    ))
+    updated = _parse("UpdateFunctionConfiguration", await _answer(stores, req, substrate))
+    assert updated["FileSystemConfigs"] == [{"Arn": arn, "LocalMountPath": "/mnt/efs"}]
+
+    await _wait_for(stores, sink, lambda_, "fn1", "LastUpdateStatus", "Successful", substrate)
+    assert substrate.volumes == {directory: "/mnt/efs"}
+
+
+async def test_a_function_whose_file_system_is_gone_goes_failed_with_the_real_reason(
+    stores, sink, lambda_, tmp_path,
+):
+    """THE refusal at the level a user sees it: `State: Failed` with the reason,
+    which `reconcile/tf_status.py` renders as the node's World verdict -- never
+    a function started with an empty directory in place of the shared one.
+
+    Mutation-test: remove the `is_dir()` check in `efsctl._mount_source` and
+    this fails (the function reaches Active)."""
+    directory, arn = _a_file_system_and_access_point(stores, tmp_path)
+    Path(directory).rmdir()
+    assert not Path(directory).exists(), "the injection did nothing -- this test proves nothing"
+
+    substrate = FakeFunctionRuntime()
+    await _create(stores, sink, lambda_, substrate, FileSystemConfigs=[
+        {"Arn": arn, "LocalMountPath": "/mnt/efs"},
+    ])
+    configuration = await _wait_for_state(stores, sink, lambda_, "fn1", "Failed", substrate)
+
+    assert not substrate.ensured, "the container was STARTED over a missing file system"
+    assert directory in configuration["StateReason"]
+    assert "empty directory" in configuration["StateReason"]
