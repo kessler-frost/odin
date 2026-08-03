@@ -79,7 +79,6 @@ import hashlib
 import json
 import logging
 import asyncio
-import os
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterable
@@ -96,6 +95,7 @@ from odin.gateway.errors import exc_text
 from odin.gateway.keys import KeyStore, workload_env
 from odin.gateway.models import background, efsctl, join, logsctl
 from odin.gateway.stores import NO_CHANGE, SynthStores
+from odin.settings import settings
 from odin.gateway.wiring import node_env
 from odin.runtime.colima import ColimaRuntime
 from odin.util import private_mkdir
@@ -430,7 +430,6 @@ def converge_functions(
 # no state attribute to diff on (`mark_function_failed`'s own note), so tofu's
 # plan is empty forever and its create waiter never runs again.
 _ACTIVE_POLL_SECONDS = 0.5
-_ACTIVE_TIMEOUT_ENV = "ODIN_LAMBDA_ACTIVE_TIMEOUT"
 # `READY_TIMEOUT` (180s) is how long `FunctionRuntime.ensure` itself waits for
 # RIE to answer -- a cold `public.ecr.aws/lambda/*` pull is a real
 # multi-hundred-MB fetch -- so it is already the one number for "how long may a
@@ -444,8 +443,15 @@ _ACTIVE_MARGIN = 30.0
 
 def active_timeout() -> float:
     """The post-apply readiness budget, in seconds. `ODIN_LAMBDA_ACTIVE_TIMEOUT`
-    overrides, matching every other odin timeout."""
-    return float(os.environ.get(_ACTIVE_TIMEOUT_ENV, str(READY_TIMEOUT + _ACTIVE_MARGIN)))
+    overrides, matching every other odin timeout.
+
+    The DEFAULT is derived here rather than written into `settings.py`, because
+    `READY_TIMEOUT` and `_ACTIVE_MARGIN` are this module's own numbers and
+    copying them would be a second source of truth for a bound whose reasoning
+    lives beside them. `settings.gateway.lambda_active_timeout` is therefore
+    `None` when unset."""
+    override = settings.gateway.lambda_active_timeout
+    return override if override is not None else READY_TIMEOUT + _ACTIVE_MARGIN
 
 
 class FunctionFault(NamedTuple):

@@ -74,7 +74,6 @@ import base64
 import hashlib
 import json
 import logging
-import os
 import secrets
 import subprocess
 import tempfile
@@ -106,6 +105,7 @@ from odin.gateway.errors import exc_text
 from odin.gateway.keys import KeyStore, workload_env
 from odin.gateway.models import background, ec2net
 from odin.gateway.stores import NO_CHANGE, SynthStores
+from odin.settings import settings
 from odin.simulate.workspace import tf_dir
 from odin.util import reap
 
@@ -1466,7 +1466,7 @@ def _reaper_enabled() -> bool:
     `limactl delete` it yourself. That is the ONLY thing the reaper does --
     it never touches a VM any env's store still expects, and never one
     outside this module's own `odin-ec2-` naming."""
-    return os.environ.get("ODIN_REAP_EC2_VMS", "1").strip().lower() not in _REAPER_OFF_VALUES
+    return settings.gateway.reap_ec2_vms.strip().lower() not in _REAPER_OFF_VALUES
 
 
 class MeshRefreshFailed(RuntimeError):

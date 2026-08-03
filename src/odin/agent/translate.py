@@ -28,6 +28,7 @@ from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, SdkMcpTool, cr
 from pydantic import BaseModel
 
 from odin.agent import ai
+from odin.settings import settings
 from odin.iac import hcl
 from odin.iac.hcl import TfProject, generate_tf
 from odin.simulate.runner import PLUGIN_CACHE_DIR
@@ -47,7 +48,7 @@ def _default_timeout() -> float:
     `TranslateCache`) -- so this timeout only bounds how long that background
     task runs before giving up, never how long a `/translate` or `/apply-full`
     caller waits. `ODIN_TRANSLATE_TIMEOUT` overrides it."""
-    return float(os.environ.get("ODIN_TRANSLATE_TIMEOUT", "45"))
+    return settings.ai.translate_timeout
 
 
 def refine_enabled() -> bool:
@@ -71,7 +72,7 @@ def refine_enabled() -> bool:
     of its own -- see `_refine`.)"""
     if ai.off_reason() is not None:
         return False
-    return os.environ.get("ODIN_TRANSLATE_REFINE", "").strip().lower() in ("1", "true", "yes", "on")
+    return settings.ai.translate_refine.strip().lower() in ("1", "true", "yes", "on")
 
 
 _TIMEOUT_S = _default_timeout()
