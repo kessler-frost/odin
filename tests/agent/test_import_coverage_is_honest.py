@@ -70,6 +70,24 @@ CANVAS = {
         # in `test_import_efs.py::test_the_round_trip_keeps_a_non_default_mount_path`.
         {"id": "fs1", "type": "efs", "position": {"x": 0, "y": 0},
          "data": {"label": "shared", "path": "/mnt/shared"}},
+        # v0.8.21: a load balancer, plus the target edge and the ec2 GRANT below.
+        # This is the widening the defect asked for, and the defect is the
+        # argument for it: `aws_iam_instance_profile` and
+        # `aws_lb_target_group_attachment` both came back `unsupported` from a
+        # project odin itself had just written, and the assertion below did not
+        # notice because THIS CANVAS CONTAINED NEITHER SHAPE. The guard was real;
+        # its fixture was narrower than the generator. Both resources exist only
+        # for a canvas with an `alb -> ec2` target and a granted `ec2`, so both
+        # have to be here or the gap reopens in silence.
+        #
+        # `listenerPort`/`port`/`healthCheckPath` ARE NOT ARBITRARY -- do not
+        # tidy them to the defaults. 80/80/"/" regenerate byte-identically even
+        # if import drops all three, because `hcl.py` refills them; 8080/9000/
+        # "/healthz" cannot be reproduced by a default. Same reasoning, at
+        # length, in `test_import_alb_targets.py`.
+        {"id": "lb1", "type": "alb", "position": {"x": 0, "y": 0},
+         "data": {"label": "front", "vpc": "prod-vpc", "subnet": "app-subnet",
+                  "listenerPort": "8080", "port": "9000", "healthCheckPath": "/healthz"}},
     ],
     # An IAM edge, deliberately. Until field test 7 this fixture had NO edges,
     # which made the round-trip claim below vacuous on exactly the thing it
@@ -88,6 +106,17 @@ CANVAS = {
         # and must read either direction the same.
         {"id": "e3", "source": "fs1", "target": "c1", "data": {"edgeType": "mount"}},
         {"id": "e4", "source": "f1", "target": "fs1", "data": {"edgeType": "mount"}},
+        # v0.8.21, the two edges the alb node above exists for. The TARGET edge
+        # makes odin emit an `aws_lb_target_group_attachment` (an ec2 is
+        # registered by tofu; an ecs service registers its own tasks with a
+        # `load_balancer` block, which is a second shape of the same canvas edge
+        # and is covered by `e6`), and the GRANT makes it emit an
+        # `aws_iam_instance_profile` -- odin emits one for a granted instance and
+        # for no other instance, so nothing short of a real grant produces it.
+        {"id": "e5", "source": "lb1", "target": "e1", "data": {"edgeType": "target"}},
+        {"id": "e6", "source": "lb1", "target": "c1", "data": {"edgeType": "target"}},
+        {"id": "e7", "source": "e1", "target": "b1",
+         "data": {"edgeType": "iam", "permissions": ["s3:PutObject"]}},
     ],
 }
 
@@ -112,6 +141,7 @@ def test_odins_own_project_now_round_trips_with_nothing_unsupported():
     assert {n["type"] for n in result.nodes} >= {
         "vpc", "subnet", "sg", "ec2", "ecs", "s3", "lambda", "ebs", "route53",
         "vpc", "subnet", "sg", "ec2", "ecs", "s3", "lambda", "ebs", "efs",
+        "alb",
     }
 
 
@@ -226,9 +256,14 @@ def test_a_drawn_GRANT_is_emitted_as_real_terraform_and_survives_a_round_trip():
     # And the round trip keeps it, which is the part that used to be lost.
     imported = parse_hcl_text(main_tf)
     assert imported.unsupported == [], [e.type for e in imported.unsupported]
-    (edge,) = [e for e in imported.edges if (e.get("data") or {}).get("edgeType") == "iam"]
-    assert edge["source"] == "web" and edge["target"] == "uploads"
-    assert edge["data"]["permissions"] == ["s3:GetObject"]
+    # BOTH grants, by (source, target), not `(edge,) = ...`. The canvas gained an
+    # ec2 grant in v0.8.21 (it is what makes odin emit the
+    # `aws_iam_instance_profile` this round trip has to survive), and a one-tuple
+    # unpack would have made that widening look like a regression here.
+    assert {
+        (e["source"], e["target"]): e["data"]["permissions"] for e in imported.edges
+        if (e.get("data") or {}).get("edgeType") == "iam"
+    } == {("web", "uploads"): ["s3:GetObject"], ("api-server", "uploads"): ["s3:PutObject"]}
 
     again = generate_tf(canvas_to_stack({"nodes": imported.nodes, "edges": imported.edges}))
     assert again.files["main.tf"] == main_tf, "generate -> import -> generate must be stable"
