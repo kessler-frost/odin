@@ -1557,5 +1557,17 @@ async def test_sweep_marks_a_task_whose_container_vanished(sink, ecs, stores):
     # The SHARED wording -- reconcile/drift.py's reality sweep races this
     # passive path for the identical event, and they must not disagree about
     # what the user is told (a test asserting one of two sentences flaked).
-    assert task["stopped_reason"] == ecsctl.container_gone_reason(task["container_name"])
+    #
+    # SPELLED OUT IN FULL, DELIBERATELY. This used to read
+    # `== ecsctl.container_gone_reason(task["container_name"])`, which derives
+    # the expectation from the same expression the source uses -- so it stayed
+    # green for months while the source passed the TASK DEFINITION's name
+    # ("web") where drift.py passed the real container. The literal below is
+    # the user-facing contract: the verdict names something `docker inspect`
+    # would find. Pairs with tests/reconcile/test_drift.py's assertion on the
+    # other writer; together they pin the two to ONE string.
+    assert task["stopped_reason"] == (
+        f"container odin-ecs-{ENV}-{task_id[:8]}-{task['container_name']} "
+        "removed outside odin — re-Apply to recreate"
+    )
     assert (await _describe_service(stores, sink, ecs, runtime))["runningCount"] == 0
