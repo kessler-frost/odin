@@ -2,7 +2,7 @@
 genuinely cannot do.
 
 Everything else the agent layer touches is deterministic on purpose
-(`agent/hcl.py` canvas->TF, `agent/import_tf.py` TF->canvas, with the refine
+(`iac/hcl.py` canvas->TF, `iac/import_tf.py` TF->canvas, with the refine
 pass off by default and structurally unable to change what gets applied). This
 module is the opposite case: given a region of the canvas, EXPLAIN in plain
 English why it is broken. There is no deterministic function from (exit code,

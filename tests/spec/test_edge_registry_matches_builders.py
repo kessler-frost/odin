@@ -29,7 +29,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from odin.agent.hcl import (
+from odin.iac.hcl import (
     _ALB_TARGET_KINDS,
     _DNS_TARGET_KINDS,
     _EFS_MOUNT_KINDS,
@@ -61,7 +61,7 @@ def test_alb_target_kinds_agree_across_the_language_boundary():
     ui, builder = _ts_set("albTargetTypes"), set(_ALB_TARGET_KINDS)
     assert ui == builder, (
         f"`ui/src/lib/iam.ts::albTargetTypes` is {sorted(ui)} but "
-        f"`agent/hcl.py::_ALB_TARGET_KINDS` is {sorted(builder)}.\n"
+        f"`iac/hcl.py::_ALB_TARGET_KINDS` is {sorted(builder)}.\n"
         f"  only in the UI  (promised, never built): {sorted(ui - builder)}\n"
         f"  only in the builder (built, labelled 'Not modelled'): {sorted(builder - ui)}\n"
         "Fix by editing the ONE line that is behind -- `albTargetTypes` in iam.ts, or "
@@ -118,14 +118,14 @@ def test_every_encryption_target_kind_has_a_key_field_a_builder_reads():
     kind whose HCL reads no key field at all, and the edge would still do
     nothing -- the drawn-line-that-does-nothing bug wearing an agreement. So the
     field each kind maps to is checked against the builder that consumes it."""
-    from odin.agent.hcl import _BUILDERS
+    from odin.iac.hcl import _BUILDERS
     from odin.spec.translate import _ENCRYPTION_FIELDS
-    hcl_source = (REPO / "src" / "odin" / "agent" / "hcl.py").read_text()
+    hcl_source = (REPO / "src" / "odin" / "iac" / "hcl.py").read_text()
     for kind, field in _ENCRYPTION_FIELDS.items():
         assert kind in _BUILDERS, f"{kind} has no Terraform builder, so its key field reaches nothing"
         assert f'"{field}"' in hcl_source, (
             f"`translate.py` folds an encryption edge into {field!r} on a {kind} node, but "
-            f"`agent/hcl.py` never reads that field name -- the edge would author a field "
+            f"`iac/hcl.py` never reads that field name -- the edge would author a field "
             f"nothing consumes"
         )
 def test_volume_host_kinds_agree_across_the_language_boundary():
@@ -140,7 +140,7 @@ def test_volume_host_kinds_agree_across_the_language_boundary():
     ui, builder = _ts_set("volumeHostTypes"), set(_VOLUME_HOST_KINDS)
     assert ui == builder, (
         f"`ui/src/lib/iam.ts::volumeHostTypes` is {sorted(ui)} but "
-        f"`agent/hcl.py::_VOLUME_HOST_KINDS` is {sorted(builder)}.\n"
+        f"`iac/hcl.py::_VOLUME_HOST_KINDS` is {sorted(builder)}.\n"
         f"  only in the UI  (promised, never built): {sorted(ui - builder)}\n"
         f"  only in the builder (built, labelled 'Not modelled'): {sorted(builder - ui)}\n"
         "They must land in the same merge."
@@ -172,7 +172,7 @@ def test_dns_target_kinds_agree_across_the_language_boundary():
     ui, builder = _ts_set("dnsTargetTypes"), set(_DNS_TARGET_KINDS)
     assert ui == builder, (
         f"`ui/src/lib/iam.ts::dnsTargetTypes` is {sorted(ui)} but "
-        f"`agent/hcl.py::_DNS_TARGET_KINDS` is {sorted(builder)}.\n"
+        f"`iac/hcl.py::_DNS_TARGET_KINDS` is {sorted(builder)}.\n"
         f"  only in the UI  (promised, never built): {sorted(ui - builder)}\n"
         f"  only in the builder (built, labelled 'Not modelled'): {sorted(builder - ui)}\n"
         "They must land in the same merge."
@@ -189,7 +189,7 @@ def test_efs_mount_kinds_agree_across_the_language_boundary():
     ui, builder = _ts_set("efsMountTypes"), set(_EFS_MOUNT_KINDS)
     assert ui == builder, (
         f"`ui/src/lib/iam.ts::efsMountTypes` is {sorted(ui)} but "
-        f"`agent/hcl.py::_EFS_MOUNT_KINDS` is {sorted(builder)}.\n"
+        f"`iac/hcl.py::_EFS_MOUNT_KINDS` is {sorted(builder)}.\n"
         f"  only in the UI  (promised, never built): {sorted(ui - builder)}\n"
         f"  only in the builder (built, labelled 'Not modelled'): {sorted(builder - ui)}\n"
         "They must land in the same merge."

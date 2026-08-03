@@ -23,9 +23,9 @@ paid for once:
 """
 from __future__ import annotations
 
-from odin.agent import import_tf
-from odin.agent.hcl import _APIGW_ECS_HOST_SUFFIX, _apigw_route_keys, generate_tf
-from odin.agent.import_tf import parse_hcl_text
+from odin.iac import import_tf
+from odin.iac.hcl import _APIGW_ECS_HOST_SUFFIX, _apigw_route_keys, generate_tf
+from odin.iac.import_tf import parse_hcl_text
 from odin.gateway.models import apigwctl
 from odin.spec.translate import canvas_to_stack
 

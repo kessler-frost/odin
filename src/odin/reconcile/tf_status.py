@@ -1,7 +1,7 @@
 """Fix-wave 2b finding #1 -- a pure, read-only projection of the TF-owned
 resource kinds (vpc/subnet/sg/ec2/ecs/lambda/iam_role/ecr/logs/secret/ssm/
 elasticache/rds/alb/kms: the kinds
-`agent/hcl.py` can build and only `tofu apply`/`tofu destroy` ever
+`iac/hcl.py` can build and only `tofu apply`/`tofu destroy` ever
 creates/destroys -- s3/sqs/sns/dynamodb are excluded, those already get real
 World entries via the reconciler's own PROVISIONED path in plan.py) from the
 gateway's synth stores into `label -> (kind, phase, facts, verdict)`.
@@ -50,7 +50,7 @@ apply silently recreate a database nobody had been told was dead -- see
 reconcile/drift.py's "WHY THE PROJECTION MAY NOT WRITE".
 
 Label resolution is uniform across every kind: prefer the `odin:node` tag
-`agent/hcl.py::_tags_block` stamps on every canvas-node-backed resource,
+`iac/hcl.py::_tags_block` stamps on every canvas-node-backed resource,
 falling back to the resource's own AWS-native name field where one exists
 (sg's GroupName, iam_role's RoleName, ecr's repositoryName, lambda's
 FunctionName, ecs's serviceName, a log group's logGroupName, a secret's Name, an
@@ -388,7 +388,7 @@ def _route53_zones(stores: SynthStores, env: str) -> Projected:
     A hosted zone's id IS its domain name (`route53ctl`'s deviation 1 -- the id
     is DERIVED from the name rather than minted, which is what lets `classify.py`
     recover the IAM resource from the path with no store access), and
-    `agent/hcl.py::_route53` emits `name = <label>`. So `record["zone_id"]`
+    `iac/hcl.py::_route53` emits `name = <label>`. So `record["zone_id"]`
     EQUALS the canvas label for every zone odin's canvas authored, and reading it
     directly looked like a free simplification -- this docstring used to claim it
     needed no tag "by construction rather than by luck".
@@ -1072,7 +1072,7 @@ _TF_STATE = "terraform.tfstate"
 # whose World entries therefore come from the reconciler's PROVISIONED observe
 # path -- not from `project()` above. tofu resource type -> (odin kind, the
 # attribute carrying the resource's own name, which equals the canvas label by
-# construction: see agent/hcl.py's `_s3`/`_sqs`/`_sns`/`_dynamodb`).
+# construction: see iac/hcl.py's `_s3`/`_sqs`/`_sns`/`_dynamodb`).
 _BACKED_TF_TYPES = {
     "aws_s3_bucket": ("s3", "bucket"),
     "aws_sqs_queue": ("sqs", "name"),

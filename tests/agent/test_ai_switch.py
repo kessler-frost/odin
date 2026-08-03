@@ -31,7 +31,7 @@ from odin.agent import ai
 from odin.agent import chat as chat_mod
 from odin.agent import debugger as debugger_mod
 from odin.agent import translate as translate_mod
-from odin.agent.hcl import generate_tf
+from odin.iac.hcl import generate_tf
 from odin.agent.translate import translate
 from odin.spec.models import ResourceDesired, Stack
 from odin.spec.store import rev_of
@@ -222,7 +222,7 @@ async def test_the_debug_agent_answers_its_honest_unavailable_without_calling_an
 @pytest.mark.parametrize("kind", ["s3", "sqs", "sns", "dynamodb", "rds", "vpc", "lambda", "ecs"])
 async def test_the_canvas_to_terraform_compiler_is_identical_with_ai_off(monkeypatch, kind):
     """The reassuring fact, pinned per kind: canvas -> Terraform is a
-    deterministic compiler (`agent/hcl.py`), so `ODIN_AI=0` changes NOTHING
+    deterministic compiler (`iac/hcl.py`), so `ODIN_AI=0` changes NOTHING
     about what gets applied."""
     stack = Stack(resources=(ResourceDesired(id="node", kind=kind),))
     monkeypatch.setenv("ODIN_AI", "0")

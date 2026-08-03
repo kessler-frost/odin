@@ -19,7 +19,7 @@ import asyncio
 
 import pytest
 
-from odin.agent import hcl
+from odin.iac import hcl
 from odin.compute.instances import disk_name
 from odin.gateway.models import ec2compute
 from odin.gateway.stores import SynthStores
@@ -513,7 +513,7 @@ async def test_reclaim_on_an_env_that_never_had_a_volume_is_a_quiet_success(stor
 
 async def test_the_type_odin_WRITES_is_the_type_the_gateway_ANSWERS(sink, ec2, stores):
     """A cross-half ratchet, and it exists because the halves were agreeing
-    by coincidence. `agent/hcl.py` writes `type = "gp3"` into every
+    by coincidence. `iac/hcl.py` writes `type = "gp3"` into every
     `aws_ebs_volume`; `import_tf._FIXED_VALUES` claims odin always emits
     `gp3` and is tested against the EMITTER; this gateway answers
     `<volumeType>` on the wire. Nothing compared the third to the first, so

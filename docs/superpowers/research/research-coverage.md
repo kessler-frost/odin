@@ -390,7 +390,7 @@ the reconciler Postgres path — already the recorded Simulate-v1 decision),
 layers/versions/aliases beyond `$LATEST`, EC2 EBS snapshots / secondary ENIs /
 spot, ECR image scan *findings*, `ModifyInstanceAttribute` in-place edits (v1
 stub). Surface these in `generate_tf`'s existing `unsupported` list
-(`agent/hcl.py::_UNSUPPORTED_REASONS`) so Apply tells the user, never silently
+(`iac/hcl.py::_UNSUPPORTED_REASONS`) so Apply tells the user, never silently
 drops.
 
 ---

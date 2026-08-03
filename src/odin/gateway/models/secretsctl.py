@@ -72,7 +72,7 @@ the source of truth and Apply must converge":
    `RecoveryWindowInDays` is accepted here and ignored, the record is gone
    when the call returns, and `DeletionDate` reports that moment. Without
    this, "empty canvas + Apply = full teardown" followed by a re-Apply would
-   wedge on `InvalidRequestException: scheduled for deletion`. (agent/hcl.py
+   wedge on `InvalidRequestException: scheduled for deletion`. (iac/hcl.py
    emits `recovery_window_in_days = 0` for the same reason: the generated HCL
    says out loud what odin actually does, and means the same thing against
    real AWS.)

@@ -31,7 +31,7 @@ def _classify(req):
 
 
 def test_create_file_system_is_named_by_its_creation_token(sink, efs):
-    """The creation token is the canvas LABEL (`agent/hcl.py` emits
+    """The creation token is the canvas LABEL (`iac/hcl.py` emits
     `creation_token = "<label>"`), and a create carries no id yet -- so the
     token is the only thing on the wire that names the resource."""
     req = sink.call(lambda: efs.create_file_system(CreationToken="shared-data"))

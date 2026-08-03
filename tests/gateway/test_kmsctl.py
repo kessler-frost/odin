@@ -77,7 +77,7 @@ async def _create(stores, sink, kms, label=LABEL, **kwargs) -> Response:
 
 async def test_create_key_takes_its_id_from_the_odin_node_tag(stores, sink, kms):
     """Deviation 1, and the load-bearing one: real `CreateKey` carries no name,
-    so the canvas label rides in on the tag `agent/hcl.py` stamps. Without
+    so the canvas label rides in on the tag `iac/hcl.py` stamps. Without
     this, every key is a uuid and no IAM edge or `kms_key_id` reference can
     ever name one."""
     parsed = _parse("CreateKey", await _create(stores, sink, kms, Description="the app key"))
@@ -118,7 +118,7 @@ async def test_a_node_tag_that_would_not_survive_lookup_is_REFUSED(stores, sink,
     REFUSED rather than normalised, deliberately: rewriting it to `prod-key`
     would make create and lookup agree and move the defect one layer out -- the
     canvas would show `alias/prod-key`, an IAM edge would emit
-    `.../key/alias/prod-key`, and the grant would deny silently. `agent/hcl.py`
+    `.../key/alias/prod-key`, and the grant would deny silently. `iac/hcl.py`
     declines the LABEL on the canvas, but a direct SDK call and `odin
     import-tf` both arrive here without passing it."""
     response = await _answer(stores, sink.call(lambda: kms.create_key(

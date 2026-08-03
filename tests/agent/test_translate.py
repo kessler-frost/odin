@@ -18,9 +18,9 @@ import time
 import pytest
 from mcp import types as mcp_types
 
-from odin.agent import hcl
+from odin.iac import hcl
 from odin.agent import translate as translate_mod
-from odin.agent.hcl import generate_tf
+from odin.iac.hcl import generate_tf
 from odin.agent.translate import translate, validate_refinement
 from odin.spec.models import FieldValue, ResourceDesired, Stack
 from odin.spec.store import rev_of

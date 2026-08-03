@@ -52,7 +52,7 @@ from odin.runtime.colima import ColimaRuntime, ContainerSpec
 from odin.util import private_mkdir
 
 # AWS's own base images (Apache-2.0 RIE built in, research-verified). Only
-# the runtimes odin's HCL layer offers on the canvas (agent/hcl.py's
+# the runtimes odin's HCL layer offers on the canvas (iac/hcl.py's
 # `_LAMBDA_RUNTIME_ENTRY`) are mapped; an unrecognized runtime string falls
 # back to the default rather than failing closed -- ImageId's own "accepted
 # verbatim, never validated" precedent (gateway/models/ec2compute.py).

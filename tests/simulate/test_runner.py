@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from odin.agent.hcl import TfProject
+from odin.iac.hcl import TfProject
 from odin.simulate import runner as runner_mod
 from odin.simulate.runner import SimulateBusy, TfResult, TfRunner, TofuNotInstalled
 

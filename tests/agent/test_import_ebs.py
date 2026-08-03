@@ -7,8 +7,8 @@ and a dropped attachment is a disk the next apply DETACHES.
 """
 from __future__ import annotations
 
-from odin.agent.hcl import generate_tf
-from odin.agent.import_tf import parse_hcl_text
+from odin.iac.hcl import generate_tf
+from odin.iac.import_tf import parse_hcl_text
 from odin.spec.translate import canvas_to_stack
 
 _VOLUME = (

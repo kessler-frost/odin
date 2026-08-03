@@ -32,7 +32,7 @@ import json
 
 from fastapi.testclient import TestClient
 
-from odin.agent.hcl import generate_tf
+from odin.iac.hcl import generate_tf
 from odin.agent.translate import TranslateResult
 from odin.server import _covered_nodes, create_app
 from odin.simulate.runner import TfResult

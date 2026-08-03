@@ -31,13 +31,13 @@ Workspace materialization (main.tf from the translation output, override.tf gene
 
 ### Task S3: the translation agent (canvas → TF)
 
-**Files:** `src/odin/agent/translate.py` (the agent returns via a typed `emit_terraform` tool: `{files: [{path, content}], notes: [str]}`), `src/odin/agent/hcl.py` (deterministic skeleton generation for the 5 supported kinds — the agent refines/annotates; determinism first, intelligence on top), route `POST /translate?env=` returning the TF for review, tests (deterministic skeleton unit-tested exhaustively; agent path integration-marked).
+**Files:** `src/odin/agent/translate.py` (the agent returns via a typed `emit_terraform` tool: `{files: [{path, content}], notes: [str]}`), `src/odin/iac/hcl.py` (deterministic skeleton generation for the 5 supported kinds — the agent refines/annotates; determinism first, intelligence on top), route `POST /translate?env=` returning the TF for review, tests (deterministic skeleton unit-tested exhaustively; agent path integration-marked).
 
 Canvas mapping: s3→aws_s3_bucket, sqs→aws_sqs_queue, sns→aws_sns_topic, sns→sqs edge→aws_sns_topic_subscription (+ queue policy note), dynamodb→aws_dynamodb_table (hash key from node config), rds→aws_db_instance is OUT of Simulate v1 (no RDS API in the gateway yet — keep rds on the reconciler path; record as unsupported in Simulate, per northstar directive 5 honesty rule).
 
 ### Task S4: TF import (TF → canvas)
 
-**Files:** `src/odin/agent/import_tf.py`, route `POST /import-tf` (multipart or path), tests.
+**Files:** `src/odin/iac/import_tf.py`, route `POST /import-tf` (multipart or path), tests.
 
 Two modes, research-verified: (a) parse an existing project's state/HCL for the supported resource types → canvas nodes+edges (deterministic); (b) live import: `import {}` blocks + `tofu plan -generate-config-out` against the gateway (research Q4 verified this works against custom endpoints). Unsupported resource types in the source project → listed in the response `unsupported: [...]`, never silently dropped (directive 5).
 

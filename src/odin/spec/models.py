@@ -98,7 +98,7 @@ class Ref(BaseModel):
 # THE canvas kinds a `${{producer.ATTR}}` reference can resolve against. ONE
 # definition, imported by both halves that need it: `gateway/wiring.py::
 # producer_facts`, which builds the values at launch time, and
-# `agent/hcl.py::_unwired_refs`, which refuses a ref against anything else
+# `iac/hcl.py::_unwired_refs`, which refuses a ref against anything else
 # BEFORE tofu runs.
 #
 # Field test 6, F3's sub-finding. The list used to exist only as prose inside

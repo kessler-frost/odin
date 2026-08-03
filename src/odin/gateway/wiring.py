@@ -6,7 +6,7 @@ Before this, an ECS node carrying
 `env: {DATABASE_URL: "${{db.DATABASE_URL}}", REDIS_URL: "${{cache.REDIS_URL}}"}`
 had that map silently dropped: `spec/translate.py` DID parse it (static entries
 into `fields["env"]`, `${{...}}` entries lifted into `ResourceDesired.refs`),
-but the only consumer of either was M8's debug display. `agent/hcl.py` emitted
+but the only consumer of either was M8's debug display. `iac/hcl.py` emitted
 no `environment` block at all, `fabric/`'s `resolve` had no production caller,
 and the container came up with the four AWS_* vars and nothing else. So you
 could provision the whole production stack and have no canvas-driven way to hand
@@ -38,7 +38,7 @@ Four reasons not to:
    picked up by the next task, instead of a stale value frozen in tofu state.
 
 The cost of that choice is ORDERING: with no value interpolated into the HCL,
-tofu has no reason to create the database before the service. `agent/hcl.py`
+tofu has no reason to create the database before the service. `iac/hcl.py`
 therefore emits `depends_on` for each ref'd producer -- a real, portable
 Terraform argument that carries NO values -- so a producer is fully created (and,
 for rds/elasticache, `available`) before its consumer's tasks ever launch.
@@ -59,7 +59,7 @@ never reaches steady state, as a FAILED apply.
 WHICH KINDS PRODUCE: `spec/models.py::REFERENCEABLE_KINDS` -- rds, elasticache,
 alb and ec2, the same four `reconcile/tf_status.py` projects facts for, held to
 the same gates (see `producer_facts`). That tuple lives in `spec/models.py`
-rather than here because `agent/hcl.py` needs the identical list to refuse an
+rather than here because `iac/hcl.py` needs the identical list to refuse an
 unreferenceable ref BEFORE tofu runs, and field test 6 found the cost of having
 it as prose in one error string instead: the string told users an sqs node
 "publishes no facts" while `/world` was publishing its QUEUE_URL.
@@ -89,7 +89,7 @@ from odin.spec.models import REFERENCEABLE_KINDS, Ref, Stack
 from odin.spec.store import SpecStore
 from odin.util import atomic_write_text
 
-# The canvas-label tag `agent/hcl.py::_tags_block` stamps on every
+# The canvas-label tag `iac/hcl.py::_tags_block` stamps on every
 # canvas-node-backed resource -- the same identity bridge `workload_env` and
 # `reconcile/tf_status.py` already use to get from an AWS resource back to the
 # node the user drew.

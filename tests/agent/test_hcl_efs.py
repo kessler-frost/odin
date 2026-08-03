@@ -30,7 +30,7 @@ import json
 
 import botocore.session
 
-from odin.agent.hcl import (
+from odin.iac.hcl import (
     _LOCAL_MOUNT_PATH_PATTERN,
     _MAX_CREATION_TOKEN,
     _efs_fault,

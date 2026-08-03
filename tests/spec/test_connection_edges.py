@@ -25,7 +25,7 @@ import subprocess
 
 from fastapi.testclient import TestClient
 
-from odin.agent.hcl import generate_tf
+from odin.iac.hcl import generate_tf
 from odin.gateway.policy import compile_policies
 from odin.server import create_app
 from odin.spec.models import Stack
@@ -85,7 +85,7 @@ def test_a_connection_edge_authors_the_database_url():
 
 
 def test_the_ref_survives_into_the_generated_terraform():
-    """`refs` is not the finish line -- `agent/hcl.py` has to accept it and emit
+    """`refs` is not the finish line -- `iac/hcl.py` has to accept it and emit
     the `depends_on` that orders the database before the service, or the ref
     resolves against a database that does not exist yet and the task STOPS.
 
@@ -240,7 +240,7 @@ def test_a_joined_edge_type_becomes_one_edge_PER_meaning():
 
 def test_the_GRANT_survives_a_joined_edge_type():
     """The failure this split exists to prevent. `gateway/policy.py::
-    compile_policies` and `agent/hcl.py::_granted_ids` both gate on
+    compile_policies` and `iac/hcl.py::_granted_ids` both gate on
     `kind == "iam"`, so a joined string reaching them intact would have compiled
     NO policy -- the user would see permissions ticked in the panel and get
     none, which is this repo's most-repeated bug shape."""
@@ -302,7 +302,7 @@ def test_apply_full_REFUSES_a_conflicting_connection_edge(tmp_path):
     """`connection_conflicts` returning a list proves a function; this proves the
     PRODUCT. `/apply-full` is where the list has to arrive, and the wiring
     rejection it feeds is assembled from `skeleton.wiring_errors` -- a field
-    `agent/hcl.py` builds and this one is not in. A conflict that never reached
+    `iac/hcl.py` builds and this one is not in. A conflict that never reached
     the route would be a guard reading a signal nobody sends, which is the
     failure mode odin's honesty rule 1 exists for.
 

@@ -10,7 +10,7 @@ Modeled on test_ec2_tf_e2e.py/test_iamctl_ecr_tf_e2e.py, with lambda's own
 substrate shape: unlike EC2's Lima VM (a whole separate host), Lambda's
 substrate is a Colima CONTAINER (like ECR's registry:2), so this test needs
 Colima/docker on PATH, not limactl. odin materializes the function's zip
-itself pre-tofu (agent/hcl.py's own `_lambda` builder does the same thing
+itself pre-tofu (iac/hcl.py's own `_lambda` builder does the same thing
 for real canvases; this test builds the same TfProject shape by hand for a
 raw-HCL round-trip, matching V3d's/V2's own "hand-authored HCL, not
 generate_tf()" style).
@@ -54,9 +54,9 @@ import pytest
 from botocore.config import Config
 from fastapi.testclient import TestClient
 
-from odin.agent import hcl
+from odin.iac import hcl
 from odin.agent import translate as translate_mod
-from odin.agent.hcl import TfProject
+from odin.iac.hcl import TfProject
 from odin.compute.functions import container_name
 from odin.gateway.keys import OPERATOR_NODE_ID
 from odin.server import create_app

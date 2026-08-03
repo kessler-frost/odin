@@ -36,8 +36,8 @@ import boto3
 import pytest
 from fastapi.testclient import TestClient
 
-from odin.agent import hcl
-from odin.agent.hcl import TfProject
+from odin.iac import hcl
+from odin.iac.hcl import TfProject
 from odin.compute.tasks import container_name
 from odin.gateway.keys import OPERATOR_NODE_ID
 from odin.server import create_app
@@ -78,7 +78,7 @@ def _main_tf(desired_count: int) -> str:
     # `plan -detailed-exitcode` checks now also cover: the gateway must echo
     # the block back (DescribeServices/ListTagsForResource) or every plan
     # after apply shows a tags diff (ROADMAP's old ECS v1 limit). `odin:node`
-    # mirrors agent/hcl.py::_tags_block's production stamp; the `scale` tag
+    # mirrors iac/hcl.py::_tags_block's production stamp; the `scale` tag
     # CHANGES with desired_count, so the scale-down re-apply drives a real
     # TagResource call through the provider, not just the create-time path.
     service = f"""resource "aws_ecs_service" "app" {{

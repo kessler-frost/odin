@@ -31,7 +31,7 @@ from urllib.parse import urlparse
 import pytest
 from fastapi.testclient import TestClient
 
-from odin.agent import hcl
+from odin.iac import hcl
 from odin.agent import translate as translate_mod
 from odin.compute.tasks import container_name
 from odin.server import create_app

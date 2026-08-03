@@ -13,7 +13,7 @@ drawn on the canvas took effect without an apply, and the Terraform odin
 generated described an IAM posture the gateway was not using.
 
 Now a drawn permission is compiled into a real `aws_iam_role_policy` by
-`agent/hcl.py`, applied by tofu through the gateway like any other resource,
+`iac/hcl.py`, applied by tofu through the gateway like any other resource,
 and landed HERE. `gateway/policy.py::compile_policies_from_iam` reads these
 records back -- each workload's role via its own service record (a lambda's
 `role`, a task definition's `task_role_arn`, an instance's

@@ -1,5 +1,5 @@
 """The HTTP <-> Lambda invoke-envelope shim -- the piece `alb -> lambda` was
-DECLINED for (`agent/hcl.py::_ALB_NO_LAMBDA`), built once, here.
+DECLINED for (`iac/hcl.py::_ALB_NO_LAMBDA`), built once, here.
 
 THE PROBLEM IT SOLVES. odin's routers are nginx containers that dial `host:port`
 upstreams (`compute/proxy.py`, `compute/apigw.py`). A Lambda is not a
@@ -46,7 +46,7 @@ The token is NOT a claim that the API endpoint is protected. Anything that can
 reach the published nginx port can call the function, exactly as on real AWS.
 The token bounds the SHIM to the same authority, no more.
 
-PAYLOAD FORMAT 2.0, and only 2.0. `agent/hcl.py` emits
+PAYLOAD FORMAT 2.0, and only 2.0. `iac/hcl.py` emits
 `payload_format_version = "2.0"` on every AWS_PROXY integration odin generates,
 which is also the default for HTTP APIs, so there is one event shape and one
 response shape rather than a version switch nothing would exercise. An
@@ -86,7 +86,7 @@ STAGE_HEADER = "x-odin-stage"
 
 PAYLOAD_FORMAT = "2.0"
 # The stage every odin API serves under. `$default` is the only stage
-# `agent/hcl.py` emits, and it is the one whose `invoke_url` has no stage
+# `iac/hcl.py` emits, and it is the one whose `invoke_url` has no stage
 # segment in the path -- which is what makes the nginx prefix and the route key
 # agree about what `/orders` means.
 DEFAULT_STAGE = "$default"
