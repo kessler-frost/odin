@@ -93,8 +93,33 @@ _BACKING_MEMORY_MIB: dict[str, float] = {
 
 _DEFAULT_BUDGET_RATIO = 0.7  # >70% of a pool's total memory -- the owner's own number
 _DEFAULT_MIN_DISK_GIB = 10.0  # matches cli/doctor.py's own MIN_DISK_GIB
-_CONTAINER_BUDGET_ENV = "ODIN_MEMORY_BUDGET_MIB"
-_VM_BUDGET_ENV = "ODIN_VM_MEMORY_BUDGET_MIB"
+# The CONTAINER pool's budget. `ODIN_MEMORY_BUDGET_MIB` -- the original name --
+# reads as "odin's memory budget" beside `ODIN_VM_MEMORY_BUDGET_MIB`, which is
+# exactly the misreading this module's headline warns about: the two pools are
+# DISJOINT, so a user rejected on the EC2/VM pool who raises the unqualified
+# one changes nothing at all and gets the same rejection.
+_CONTAINER_BUDGET_ENV = "ODIN_CONTAINER_MEMORY_BUDGET_MIB"
+# Still accepted, and deliberately unqualified in the message it produces: it is
+# in ROADMAP, in `odin doctor`'s output and in whatever shells and CI jobs
+# already export it. The new name wins when both are set, because someone who
+# set both meant the specific one.
+_CONTAINER_BUDGET_ENV_LEGACY = "ODIN_MEMORY_BUDGET_MIB"
+# ONE precedence order, read by the reader AND by the rejection message, so a
+# rejection can never name a variable that is not the one that set the number.
+_CONTAINER_BUDGET_ENVS = (_CONTAINER_BUDGET_ENV, _CONTAINER_BUDGET_ENV_LEGACY)
+_VM_BUDGET_ENVS = ("ODIN_VM_MEMORY_BUDGET_MIB",)
+_VM_BUDGET_ENV = _VM_BUDGET_ENVS[0]
+
+
+def _set_budget_env(names: tuple[str, ...]) -> str | None:
+    """The FIRST of `names` actually set in the environment, in precedence
+    order, or None."""
+    return next((name for name in names if os.environ.get(name)), None)
+
+
+def _override(names: tuple[str, ...]) -> str | None:
+    name = _set_budget_env(names)
+    return os.environ.get(name) if name is not None else None
 
 
 def _gib_str_to_mib(value: str) -> float:
@@ -165,12 +190,17 @@ def estimate_stack_memory_mib(stack: Stack) -> float:
 
 
 def default_memory_budget_mib(total_mem_mib: float) -> float:
-    """The CONTAINER pool's budget. `ODIN_MEMORY_BUDGET_MIB` overrides it
-    outright (an absolute MiB figure); otherwise it's `_DEFAULT_BUDGET_RATIO` of
-    the container runtime's total memory (`HostFacts.total_mem_mib`). Read fresh
-    on every call (not cached at import), same convention as
-    `agent/translate.py`'s `_default_timeout`."""
-    override = os.environ.get(_CONTAINER_BUDGET_ENV)
+    """The CONTAINER pool's budget. `ODIN_CONTAINER_MEMORY_BUDGET_MIB` overrides
+    it outright (an absolute MiB figure), and the older
+    `ODIN_MEMORY_BUDGET_MIB` still does the same; otherwise it's
+    `_DEFAULT_BUDGET_RATIO` of the container runtime's total memory
+    (`HostFacts.total_mem_mib`). Read fresh on every call (not cached at
+    import), same convention as `agent/translate.py`'s `_default_timeout`.
+
+    It governs ONE of two disjoint pools -- raising it does nothing for an
+    `ec2` rejection, which is `ODIN_VM_MEMORY_BUDGET_MIB`'s pool. That is what
+    the rename says out loud."""
+    override = _override(_CONTAINER_BUDGET_ENVS)
     if override:
         return float(override)
     return total_mem_mib * _DEFAULT_BUDGET_RATIO
@@ -180,7 +210,7 @@ def default_vm_budget_mib(host_mem_mib: float) -> float:
     """The HOST/VM pool's budget (`ec2` nodes = real Lima VMs).
     `ODIN_VM_MEMORY_BUDGET_MIB` overrides it outright; otherwise it's
     `_DEFAULT_BUDGET_RATIO` of REAL host memory."""
-    override = os.environ.get(_VM_BUDGET_ENV)
+    override = _override(_VM_BUDGET_ENVS)
     if override:
         return float(override)
     return host_mem_mib * _DEFAULT_BUDGET_RATIO
@@ -265,12 +295,18 @@ class _Pool:
         )
 
 
-def _budget_origin(env_var: str, total_mib: float, described: str) -> str:
+def _budget_origin(env_vars: tuple[str, ...], total_mib: float, described: str) -> str:
     """Either the env override that set the budget outright, or the pool total
     the default ratio was taken from -- so the parenthetical in a rejection is
-    never a number nobody can check."""
-    if os.environ.get(env_var):
-        return f"({env_var})"
+    never a number nobody can check.
+
+    `env_vars` is the same precedence tuple the READER uses, not a single name:
+    naming `ODIN_CONTAINER_MEMORY_BUDGET_MIB` in a rejection whose number came
+    from the legacy `ODIN_MEMORY_BUDGET_MIB` would point the user at a variable
+    they have not set."""
+    name = _set_budget_env(env_vars)
+    if name is not None:
+        return f"({name})"
     return f"({_gib(total_mib):.1f} GiB {described})"
 
 
@@ -279,7 +315,7 @@ def _pools(footprint: StackFootprint, host: HostFacts, host_mem_mib: float) -> t
         _Pool(
             wants="of container memory",
             ceiling=_budget_origin(
-                _CONTAINER_BUDGET_ENV, host.total_mem_mib,
+                _CONTAINER_BUDGET_ENVS, host.total_mem_mib,
                 "reported by the container runtime -- that is Colima's VM, not the whole machine",
             ),
             advice=(
@@ -293,7 +329,7 @@ def _pools(footprint: StackFootprint, host: HostFacts, host_mem_mib: float) -> t
             # EC2 nodes are Lima VMs allocated from the Mac's own RAM, so this
             # pool -- and only this pool -- may speak of "this host".
             wants="of memory for its EC2 instances (each one is a real Lima VM on the host)",
-            ceiling=_budget_origin(_VM_BUDGET_ENV, host_mem_mib, "total on this host"),
+            ceiling=_budget_origin(_VM_BUDGET_ENVS, host_mem_mib, "total on this host"),
             advice="reduce instance sizes or apply fewer nodes",
             estimated_mib=footprint.vm_mib,
             budget_mib=default_vm_budget_mib(host_mem_mib),

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from typer.testing import CliRunner
 
 import odin.__main__  # noqa: F401 — registers start/stop/… so `app` stays a multi-command group
@@ -163,12 +164,19 @@ async def test_memory_reports_the_admission_budget(monkeypatch):
     memory = by_name(await run_checks(["memory"], make_run(), disk_path=Path.cwd()))["memory"]
     assert (memory.status, memory.required) == ("ok", False)
     assert "33.6 GiB admission budget of 48.0 GiB" in memory.detail  # 0.7 x 48
+    assert "ODIN_CONTAINER_MEMORY_BUDGET_MIB" in memory.detail
+    # The legacy spelling stays visible too, because it still works.
     assert "ODIN_MEMORY_BUDGET_MIB" in memory.detail
 
 
-async def test_memory_budget_honours_the_env_override(monkeypatch):
+@pytest.mark.parametrize("name", ["ODIN_CONTAINER_MEMORY_BUDGET_MIB", "ODIN_MEMORY_BUDGET_MIB"])
+async def test_memory_budget_honours_the_env_override(monkeypatch, name):
+    """Both spellings -- `ODIN_MEMORY_BUDGET_MIB` was renamed to name the pool
+    it actually governs, and kept working."""
     patch_disk(monkeypatch)
-    monkeypatch.setenv("ODIN_MEMORY_BUDGET_MIB", "2048")
+    monkeypatch.delenv("ODIN_CONTAINER_MEMORY_BUDGET_MIB", raising=False)
+    monkeypatch.delenv("ODIN_MEMORY_BUDGET_MIB", raising=False)
+    monkeypatch.setenv(name, "2048")
     memory = by_name(await run_checks(["memory"], make_run(), disk_path=Path.cwd()))["memory"]
     assert "2.0 GiB admission budget" in memory.detail
 

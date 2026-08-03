@@ -1179,7 +1179,10 @@ future decision against these points instead of re-deriving them:
       memory, so it is charged against, and quoted against, real host memory
       (`os.sysconf` — stdlib, no new dependency, no subprocess).
   - **The budget** is 70% of each pool's TOTAL memory (not free memory).
-    Overrides: `ODIN_MEMORY_BUDGET_MIB` (container pool, absolute MiB),
+    Overrides: `ODIN_CONTAINER_MEMORY_BUDGET_MIB` (container pool, absolute
+    MiB — the older `ODIN_MEMORY_BUDGET_MIB` is still accepted, and was renamed
+    because unqualified it reads as odin's whole memory budget while governing
+    only one of two disjoint pools),
     `ODIN_VM_MEMORY_BUDGET_MIB` (VM pool), `ODIN_MIN_DISK_GIB` (free-disk
     floor, default 10 GiB — the same figure `odin doctor` checks).
   - **What it charges:** ec2 = the exact `INSTANCE_TYPES` memory;

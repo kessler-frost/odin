@@ -228,8 +228,11 @@ async def _check_memory(run: Runner, root: Path) -> CheckResult:
     known = budget_mib > 0
     detail = (
         f"{budget_mib / 1024:.1f} GiB admission budget of {host.total_mem_mib / 1024:.1f} GiB "
+        # Names the CONTAINER pool's variable specifically: this row reports the
+        # container runtime's memory, and the EC2/VM pool has its own budget
+        # (`ODIN_VM_MEMORY_BUDGET_MIB`) that this number says nothing about.
         "total reported by the container runtime -- Apply rejects a canvas estimated above it "
-        "(ODIN_MEMORY_BUDGET_MIB overrides)"
+        "(ODIN_CONTAINER_MEMORY_BUDGET_MIB overrides; the older ODIN_MEMORY_BUDGET_MIB still works)"
         if known else
         "unknown -- the container runtime reported no memory total, so Apply's memory "
         "admission check is skipped entirely"
