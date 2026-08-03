@@ -293,12 +293,18 @@ def test_a_grant_no_longer_reports_itself_as_unportable():
 
 def test_an_edge_to_a_node_that_is_not_on_the_canvas_keeps_the_label_and_says_so():
     """The one case that still falls back. Inventing an ARN for a target odin
-    cannot identify would be worse than naming what was drawn."""
+    cannot identify would be worse than naming what was drawn.
+
+    The ghost is now a dangling EDGE with no node behind it, which is what this
+    test's name and `_not_in_terraform`'s own docstring both describe ("a `dst`
+    that is not a resource on this canvas"). It used to be a `route53` node,
+    chosen because odin had no builder for that kind -- and v0.8.19 gave it one,
+    which is the second time this fixture has been invalidated by a kind becoming
+    real. A missing node cannot become real, so the fallback it exercises is the
+    one that survives every future kind."""
     canvas = _canvas("s3")
     canvas["edges"].append({"id": "e2", "source": "w", "target": "ghost",
                             "data": {"edgeType": "iam", "permissions": ["s3:GetObject"]}})
-    canvas["nodes"].append({"id": "ghost", "type": "route53", "position": {"x": 0, "y": 0},
-                            "data": {"label": "ghost"}})
     project = generate_tf(canvas_to_stack(canvas))
     (gap,) = project.not_in_terraform
     assert "'ghost'" in gap and "ARN" in gap

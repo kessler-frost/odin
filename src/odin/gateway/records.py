@@ -745,6 +745,45 @@ class KmsKey(Record):
     rotation_enabled: bool
 
 
+class HostedZone(Record):
+    """`zone:{zoneId}` (gateway/models/route53ctl.py).
+
+    `zone_id` and `name` are both pinned and both are the domain name (that
+    model's deviation 1): the id is what an IAM policy is written against and
+    what `classify.py` derives from the path, so a non-string here is a resource
+    no policy can match. `private_zone` is a real bool because it is read back
+    into terraform state (`aws_route53_zone.vpc`), where the string `"false"` is
+    truthy and would echo a private zone as public."""
+
+    zone_id: str
+    name: str
+    caller_reference: str
+    private_zone: bool
+
+
+class Route53Change(Record):
+    """`change:{changeId}` (gateway/models/route53ctl.py).
+
+    `status` is pinned to the two values botocore's `ChangeStatus` enum has
+    because the provider's waiter compares it by EXACT string: an unrecognised
+    value is neither the pending state nor the target state, so the waiter can
+    never terminate and `tofu apply` HANGS rather than fails. That is the one
+    failure in this store that costs more than a bad read, which is why it is
+    the only `Literal` here."""
+
+    change_id: str
+    status: Literal["PENDING", "INSYNC"]
+    submitted_at: float
+
+
+# `rrset:{zoneId}` -- a LIST of that zone's record sets. Pinned as a list for
+# `logsctl`'s `events:` reason exactly: `_change_resource_record_sets` does
+# `list(...)` over it and re-persists, so a bare string would be SPLATTED INTO
+# CHARACTERS and written back behind a 200. The dicts inside are `Any` because
+# an ALIAS record and a TTL record are legitimately different shapes.
+RESOURCE_RECORD_SETS = strict(list[dict[str, Any]])
+
+
 # --- event delivery: the dispatcher's bookkeeping + S3's own notification
 # control plane (reconcile/dispatch.py, gateway/models/s3notify.py) -----------
 
@@ -900,6 +939,11 @@ SCHEMAS: dict[str, dict[str, TypeAdapter]] = {
     "secretsctl": {"secret:": strict(Secret), "version:": strict(SecretVersion)},
     "ssmctl": {"param:": strict(SsmParameter)},
     "kmsctl": {"key:": strict(KmsKey)},
+    "route53ctl": {
+        "zone:": strict(HostedZone),
+        "rrset:": RESOURCE_RECORD_SETS,
+        "change:": strict(Route53Change),
+    },
     "dispatch": {"fired:": strict(DispatchAnchor), "pending:": strict(PendingNotification)},
     "s3notify": {"notify:": strict(BucketNotification)},
     "tags": {"": TAG_SET},

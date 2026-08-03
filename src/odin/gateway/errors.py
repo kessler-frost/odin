@@ -4,6 +4,16 @@ produce (PRD R1: "Errors are protocol-correct per service"). The v1
 service set spans four wire protocols:
 
 - s3:            REST-XML, a bare ``<Error>`` document.
+- route53:       ALSO rest-xml, but its error envelope is the ``<ErrorResponse>
+                  <Error>`` one below, NOT S3's bare ``<Error>`` -- so it rides
+                  `_QUERY_XML_SERVICES` despite not being a query-protocol
+                  service. This is not a style choice between two working
+                  shapes: botocore reads both, but aws-sdk-go-v2 (the terraform
+                  provider, and the only client that ever calls route53 here)
+                  reads ONLY ``<ErrorResponse>`` and answers the bare form with
+                  ``UnknownError: UnknownError``. See the constant's own note
+                  for the full two-SDK table and for what the AWS-JSON fallback
+                  destroyed.
 - sns/iam/rds/
   elasticache/
   elbv2/sts:      query-XML, wrapped in ``<ErrorResponse><Error>...`` --
@@ -58,9 +68,62 @@ _JSON_TYPE_PREFIX = {
     "sqs": "com.amazonaws.sqs#",
 }
 
-# Services whose errors ride botocore's "query" protocol envelope
-# (``<ErrorResponse><Error>...``) -- see the module docstring.
-_QUERY_XML_SERVICES = ("sns", "iam", "rds", "elasticache", "elasticloadbalancing", "sts")
+# Services whose errors ride the ``<ErrorResponse><Error>...`` envelope -- see
+# the module docstring.
+#
+# `route53` is the one member that is NOT botocore's "query" protocol: it is
+# `rest-xml`, and it is here because its ERROR envelope is the query one
+# regardless. IT MUST NOT BE MOVED TO THE `s3` BRANCH, and the reason is a
+# measurement that took two SDKs to see.
+#
+# Through the parser botocore picks for route53 (`RestXMLParser`), all three
+# candidate bodies look like this:
+#
+#   <ErrorResponse><Error>...   -> {'Code': 'NoSuchHostedZone', 'Message': ...}
+#   <Error>...                  -> {'Code': 'NoSuchHostedZone', 'Message': ...}
+#   {"__type": ..., "message":} -> {'Code': '403',  'Message': 'Forbidden'}
+#
+# On that evidence alone the first two are interchangeable and only the third is
+# broken. THEY ARE NOT INTERCHANGEABLE. The terraform provider is aws-sdk-go-v2,
+# and tofu is the only principal that ever reaches route53 (operator-only, the
+# same reasoning ec2/iam/ecr use), so the Go SDK is the parser whose verdict
+# decides this. Measured across six real `tofu apply` runs:
+#
+#   envelope                  botocore                Go SDK (what matters)
+#   <ErrorResponse><Error>    Code=AccessDenied       AccessDenied + odin's message
+#   <Error>  (the s3 form)    Code=AccessDenied       UnknownError: UnknownError
+#   {"__type": ...}           Code='403'/'Forbidden'  UnknownError: UnknownError
+#
+# So for route53 the bare `<Error>` form is the SAME class of failure as the
+# AWS-JSON fallthrough -- odin's error is destroyed either way -- it is merely
+# harder to catch, because botocore reads it fine and only the client odin
+# actually serves cannot. `<ErrorResponse>` is the only envelope BOTH read, and
+# it is also where `Type` and `RequestId` have somewhere to live.
+#
+# A botocore-based test CANNOT tell these two apart: moving route53 to the s3
+# branch was mutation-tested and passed 1286 tests. `tests/gateway/
+# test_route53ctl.py::test_route53_errors_use_the_ErrorResponse_envelope_not_s3s`
+# asserts the ROOT ELEMENT for exactly that reason.
+#
+# THE RULE THIS IS AN INSTANCE OF, because whoever next "simplifies" this will be
+# looking at a green test suite while they do it:
+#
+#     THE CLIENT'S PARSER IS THE CONTRACT, NOT THE SERVICE'S MODEL.
+#
+# Every step of getting this wrong was rigorous. The test was real, the
+# measurement was real, the reasoning was sound -- and the SUBJECT was wrong.
+# Being careful does not protect you from measuring something adjacent to the
+# thing that matters, which is why this is worse than the shapes honesty rule 5
+# lists: there is no sloppiness to notice.
+#
+# It is not a route53 quirk. `efs` hit the mirror image the same night: EFS's own
+# service model makes `ErrorCode` a REQUIRED body member, so answering
+# model-faithfully is the obvious choice -- and the provider ignores the body and
+# reads the `x-amzn-errortype` HEADER. Two services, two agents, one lesson. So
+# before changing any error shape here, ask which SDK actually issues the call
+# (for route53 and efs that is only ever terraform, i.e. aws-sdk-go-v2) and test
+# against THAT, not against whichever client is convenient to import.
+_QUERY_XML_SERVICES = ("sns", "iam", "rds", "elasticache", "elasticloadbalancing", "sts", "route53")
 
 _STATUS = {
     "InvalidClientTokenId": 401,

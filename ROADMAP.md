@@ -2065,11 +2065,58 @@ run and are not described as such.
      awaits a status code. Substrate is `compute/proxy.py`'s nginx given a route
      table. It needs the HTTP↔invoke-envelope shim `alb → lambda` was declined
      for; build it once, here.
-  4. **`route53`** — `--add-host` for containers and `/etc/hosts` via cloud-init
-     for VMs are both real. THE TRAP, measured: an ALB's endpoint is
-     `127.0.0.1:<dynamic port>` and a hosts entry cannot carry a port, so a name
-     would resolve and then fail to connect. Either scope to mesh addresses or
-     say so on the tile.
+  4. ~~**`route53`**~~ — DONE in v0.8.19, scoped to `route53 → ec2` and refusing
+     everything else BY NAME. The trap this entry named was real, and probing it
+     first turned up a second one underneath that was bigger.
+
+     **The stated trap, confirmed.** Running the real projectors in
+     `reconcile/tf_status.py` over records in the shape the gateway models
+     really write gives three shapes, and only one of them is a name's worth of
+     address:
+
+         alb -> {"ALB_ENDPOINT": "http://127.0.0.1:<dynamic port>"}
+         rds -> {"endpoint": "host.docker.internal:<dynamic port>", ...}
+         ec2 -> {"PRIVATE_IP": <bare IPv4>, "MESH_IP": <bare IPv4>}
+
+     A hosts entry is `<ip> <name>` and carries no port, so alb and rds are
+     `unsupported` with the measured reason and a pointer to the endpoint fact
+     that *does* carry the port. `hcl.py::_DNS_TARGET_KINDS` is `("ec2",)` and a
+     test asserts that literally, because every refusal assertion is vacuous if
+     the allowed set silently grows.
+
+     **The trap underneath, which this entry did not know about.** The suggested
+     alternative — "scope to mesh addresses" — would have been a bug, and the
+     ec2-only scope does not escape it either. Stock Lima `vz` NATs each VM into
+     its OWN isolated address space: a raw ping between two VMs' vzNAT addresses
+     is **100% loss, before nebula is involved** (`fabric/nebula.py`'s R5 note,
+     ~line 41 and ~line 465, confirmed live with two real VMs). The measured
+     matrix is ASYMMETRIC — container→VM reachable, host→VM reachable,
+     **VM→VM 100% loss** — so `private_ip` in a VM's `/etc/hosts` is a name that
+     resolves and then hangs, which is this entry's own trap one layer down.
+
+     So the record and the substrate deliberately differ, the same shape as
+     ebs's advisory `device_name`: the emitted `aws_route53_record` carries
+     `aws_instance.<n>.private_ip` (the portable, AWS-shaped answer, and a PURE
+     FUNCTION OF THE CANVAS — making `main.tf` depend on runtime mesh state
+     would break round-trip and show `tofu plan` drift with nothing changed),
+     while odin resolves the name to what the consumer can actually reach:
+     `private_ip` for containers, the Nebula OVERLAY address for VMs, and no
+     entry at all for a VM in an env with no mesh.
+
+     **That last case is REPORTED, not merely withheld**, and the correction is
+     worth recording because the first design got it wrong. Withholding was
+     modelled on `_ec2_facts` dropping `MESH_IP` when the lighthouse is down —
+     the right input, but silence as the whole story is precisely the failure
+     honesty rule 1 lists as *"the mesh gate withheld facts that never reached
+     World"*. A user would draw a record, watch the tile go healthy, and get no
+     resolution and no reason. It surfaces in World with the real reason
+     instead.
+
+     One more thing this cost that was not on the list: `aws_route53_zone` was
+     the canonical "a resource odin does not model at all" fixture in four test
+     files, so making it real invalidated the example. It is `aws_kinesis_stream`
+     now — a kind this same roadmap entry DROPPED with a recorded reason, so it
+     cannot quietly become modelled later.
   5. **`kms` — NOT as encryption, and this is a deliberate reversal.** The
      storage analysis found no substrate encrypts anything: RustFS SSE unverified,
      a Postgres container has no storage encryption, dynalite none, and

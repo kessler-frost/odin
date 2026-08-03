@@ -9,11 +9,23 @@ from __future__ import annotations
 
 import json
 import os
+import ast
 from pathlib import Path
 
 from odin.aws.cache import container_name as cache_container_name
 from odin.aws.rds import container_name as db_container_name
 from odin.compute.functions import container_name as function_container_name
+# The four outcome CONSTANTS only. `HostsVerdict` itself is deliberately NOT
+# imported: the verdict sentences below are spelled out as literals, because an
+# expectation computed from the class under test cannot fail with it (honesty
+# rule 5). If this import ever comes back, check what it is being used for.
+from odin.compute.instances import (
+    HOSTS_UNRESOLVABLE,
+    HOSTS_FAILED,
+    HOSTS_NO_MESH,
+    HOSTS_PUSHED,
+    HOSTS_UNCHANGED,
+)
 from odin.compute.proxy import container_name as proxy_container_name
 from odin.fabric.models import MeshNetwork, SubnetAllocation
 from odin.gateway.models import cachectl, efsctl, elbv2ctl, kmsctl, lambdactl, rdsctl, secretsctl, ssmctl
@@ -81,7 +93,7 @@ def test_tf_owned_kinds_excludes_reconciler_owned_kinds():
     # subject -- honesty rule 5.
     assert TF_OWNED_KINDS == {
         "vpc", "subnet", "sg", "ec2", "ecs", "lambda", "iam_role", "ecr", "logs", "secret", "ssm",
-        "elasticache", "rds", "alb", "kms", "ebs", "efs", "apigateway",
+        "elasticache", "rds", "alb", "kms", "ebs", "efs", "apigateway", "route53",
     }
 
 
@@ -1519,6 +1531,241 @@ async def test_only_the_volume_key_family_is_projected_as_ebs(tmp_path):
     assert "decoy" not in projected
 
 
+# --- route53: the projector whose whole job is NOT saying healthy ------------
+
+
+def _zone(stores, label: str, records: list[dict] | None = None, tagged: bool = True) -> None:
+    """A hosted zone as `route53ctl` really writes it: the zone id IS the domain
+    (its deviation 1), CreateHostedZone always mints an SOA and an NS pair that
+    nobody drew, and the canvas label rides on an `odin:node` tag in the SHARED
+    tag store under `route53:{zone_id}` -- not on the zone record."""
+    stores.route53ctl.set(ENV, f"zone:{label}", {"zone_id": label, "name": label})
+    stores.route53ctl.set(ENV, f"rrset:{label}", [
+        {"name": label, "type": "SOA", "values": ["ns. root. 1 7200 900 1209600 86400"]},
+        {"name": label, "type": "NS", "values": ["ns."]},
+        *(records or []),
+    ])
+    if tagged:
+        stores.tags.set(ENV, f"route53:{label}", {"odin:node": label})
+
+
+def _a_record(fqdn: str, address: str) -> dict:
+    return {"name": fqdn, "type": "A", "ttl": 60, "values": [address]}
+
+
+def _running_vm(stores, n: int, hosts_action: str | None = None,
+                hosts_names: tuple[str, ...] = (),
+                details: tuple[str, ...] = ()) -> None:
+    """A VM record, optionally carrying the verdict the hosts resolver RECORDED.
+
+    `hosts_action`/`hosts_names`/`hosts_details` are the observed signal -- what a
+    real `push_hosts` reported -- not a prediction this test makes on its behalf.
+    All three are written as JSON-native types (str, list), because these records
+    round-trip through `world.json` every tick and a tuple read back as a list
+    compares unequal to itself for ever."""
+    stores.ec2compute.set(ENV, f"instance:i-{n}", {
+        **_ec2_instance(f"i-{n}", "running"), "private_ip": f"192.168.64.{n}",
+        **({"hosts_action": hosts_action, "hosts_names": list(hosts_names),
+            "hosts_details": list(details)}
+           if hosts_action else {}),
+    })
+    stores.tags.set(ENV, f"ec2:i-{n}", {"odin:node": f"vm{n}"})
+
+
+async def test_a_zone_is_projected_under_its_canvas_label(tmp_path):
+    stores = SynthStores(tmp_path)
+    _zone(stores, "example.com")
+    assert (await project(stores, ENV))["example.com"] == ("route53", "healthy", {}, None)
+
+
+async def test_an_UNTAGGED_zone_is_not_projected_at_all(tmp_path):
+    """The phantom guard, and this projector shipped without it until the gateway
+    author reviewed it.
+
+    A zone id EQUALS the canvas label for every zone odin drew, so reading it
+    straight off the record looked free -- and would have projected a
+    hand-written project's zone as a World resource no canvas node matches, no
+    Stack revision can prune, and `plan()` calls "observed but no longer desired"
+    on every tick. `_kms_keys` refuses the identical shortcut for `key_id`;
+    `_log_groups` skips an `auto` group for the same reason.
+
+    Mutation-test: fall back to `record["zone_id"]` when the tag is missing and
+    this fails."""
+    stores = SynthStores(tmp_path)
+    _zone(stores, "example.com", tagged=False)
+    assert "example.com" not in await project(stores, ENV)
+
+
+async def test_a_zone_whose_vms_all_pushed_cleanly_is_healthy(tmp_path):
+    """`pushed`/`unchanged` are the resolver's healthy outcomes, so a zone over
+    them reports nothing. Without this the failing test below would also pass
+    against a projector that ALWAYS says crashed."""
+    stores = SynthStores(tmp_path)
+    _running_vm(stores, 1, HOSTS_PUSHED, ("vm2.example.com",))
+    _running_vm(stores, 2, HOSTS_UNCHANGED, ("vm1.example.com",))
+    _zone(stores, "example.com", [_a_record("vm1.example.com", "192.168.64.1")])
+
+    assert (await project(stores, ENV))["example.com"][1] == "healthy"
+
+
+async def test_a_zone_reports_the_reason_the_RESOLVER_gave(tmp_path):
+    """THE POINT OF THIS PROJECTOR, and the reason it no longer computes
+    anything. The verdict text belongs to `compute/instances.py::HostsVerdict`,
+    which keys it off an outcome map with no optimistic default. This asserts
+    the projection carries THAT sentence rather than one written here -- a
+    second author for one fact is how the two drift, which is the defect the ECS
+    work hit when `container_gone_reason` unified two writers and left their
+    arguments divergent.
+
+    Mutation-test: make the projector skip non-healthy verdicts and this fails.
+    """
+    stores = SynthStores(tmp_path)
+    _running_vm(stores, 1, HOSTS_NO_MESH, ("vm2.example.com",))
+    _running_vm(stores, 2, HOSTS_PUSHED)
+    _zone(stores, "example.com", [_a_record("vm2.example.com", "192.168.64.2")])
+
+    kind, phase, _, verdict = (await project(stores, ENV))["example.com"]
+    assert (kind, phase) == ("route53", "crashed")
+    # SPELLED OUT IN FULL, deliberately. This assertion first read
+    # `== HostsVerdict(...).reason` -- the very call the source makes -- which is
+    # honesty rule 5's opening example verbatim (`tests/gateway/test_ecsctl.py`
+    # graded `container_gone_reason` against itself and stayed green for months
+    # while odin printed a name `docker inspect` cannot find). A verdict that
+    # silently lost its instruction, or gained a wrong one, changed BOTH sides
+    # together and the test could not fail. The literal is the only expectation
+    # the subject cannot reach.
+    assert verdict == (
+        "vm2.example.com cannot be resolved on this instance: the record points at another "
+        "EC2 instance, a VM can only reach another VM over the Nebula overlay (a VM-to-VM "
+        "vzNAT address is 100% loss), and this environment has no mesh. Draw the instances "
+        "into a VPC so the env gets one, or reach the target from a container instead"
+    )
+
+
+async def test_a_failed_push_is_reported_too_not_only_the_mesh_case(tmp_path):
+    """`no_mesh` is not the only way a name fails to resolve. A push that simply
+    could not be written leaves the VM resolving whatever it last had, which is
+    just as invisible to the user and must read the same way."""
+    stores = SynthStores(tmp_path)
+    _running_vm(stores, 1, HOSTS_FAILED, ("vm2.example.com",))
+    _zone(stores, "example.com", [_a_record("vm2.example.com", "192.168.64.2")])
+
+    _, phase, _, verdict = (await project(stores, ENV))["example.com"]
+    assert phase == "crashed"
+    # Spelled out for the reason the test above records.
+    assert verdict == (
+        "odin could not write this instance's /etc/hosts, so vm2.example.com still "
+        "resolve to whatever the VM last had (or to nothing)"
+    )
+
+
+async def test_the_unresolvable_verdict_carries_its_SPECIFIC_cause(tmp_path):
+    """The fifth action, and the one that only works if this projector forwards
+    `hosts_details`.
+
+    `HOSTS_UNRESOLVABLE`'s reason template is literally `"{details}"`. Reconstruct
+    a verdict without that field and it renders the generic fallback instead --
+    so a record pointing at a TERMINATED instance in a fully-meshed env would be
+    explained as "this environment has no mesh", sending the reader to fix
+    something that is not broken. That false reason is exactly what the fifth
+    action was added to remove, and it would have been thrown away here.
+
+    The expectation is the resolver's sentence spelled out (rule 5): deriving it
+    from `HostsVerdict` would pass with `details` dropped, because both sides
+    would fall back together.
+
+    Mutation-test: delete `details=` from either reconstruction in
+    `_route53_zones` and this fails."""
+    stores = SynthStores(tmp_path)
+    _running_vm(stores, 1, HOSTS_UNRESOLVABLE, ("api.example.com",),
+                details=("api.example.com -> 192.168.64.9 matches no running instance",))
+    _zone(stores, "example.com", [_a_record("api.example.com", "192.168.64.9")])
+
+    _, phase, _, verdict = (await project(stores, ENV))["example.com"]
+    assert phase == "crashed"
+    assert verdict == "api.example.com -> 192.168.64.9 matches no running instance"
+    # The generic fallback must NOT be what surfaced -- that is the whole bug.
+    assert verdict != "api.example.com could not be resolved"
+    assert "no mesh" not in verdict, "a terminated target must not be blamed on the mesh"
+
+
+async def test_one_zones_failure_does_not_condemn_another(tmp_path):
+    """Two zones in one env fail independently. Telling a user their
+    `internal.test` zone is broken because `example.com` could not be pushed is
+    a different lie from the one this projector exists to prevent, and just as
+    expensive.
+
+    Mutation-test: drop the `endswith` zone filter and this fails."""
+    stores = SynthStores(tmp_path)
+    _running_vm(stores, 1, HOSTS_NO_MESH, ("vm2.example.com",))
+    _zone(stores, "example.com", [_a_record("vm2.example.com", "192.168.64.2")])
+    _zone(stores, "internal.test", [_a_record("vm2.internal.test", "192.168.64.2")])
+
+    projected = await project(stores, ENV)
+    assert projected["example.com"][1] == "crashed"
+    assert projected["internal.test"][1] == "healthy"
+
+
+def test_something_actually_writes_the_verdict_this_projector_reads():
+    """The seam, now CLOSED -- and the marker came off the way it was meant to.
+
+    `_route53_zones` keys entirely off `hosts_action` on an ec2compute record. A
+    reader with no writer is the exact shape of the four guards CLAUDE.md records
+    as having silently never fired, so while the writer was missing this carried
+    `@pytest.mark.xfail(strict=True)` naming the gap. `gateway/route53_hosts.py`
+    now writes it, the xfail XPASSED, the build FAILED, and the marker had to
+    come off -- which is the entire point of `strict`: a comment or a TODO would
+    have decayed silently, and this could not.
+
+    It stays as a live assertion because the gap can REOPEN. Someone refactoring
+    the hosts wiring could stop writing the field and every zone would read
+    `healthy` for ever with nothing to say otherwise -- silent, green, and
+    exactly what this file exists to prevent.
+
+    IT SEARCHES THE AST, NOT THE TEXT, and that correction was earned. The first
+    version did `"hosts_action" in path.read_text()`, and a mutant that renamed
+    the real dict key at `route53_hosts.py:159` SURVIVED -- because line 140 of
+    that same file mentions `hosts_action` in a DOCSTRING, so the grep still
+    matched while nothing wrote the field. That is honesty rule 5's third bullet
+    (`grep -c 'card-head'` matching the page's own stylesheet) reproduced inside
+    the very ratchet meant to prevent this class of bug. A comment is absent from
+    the AST entirely and a docstring is an `Expr`, never a dict key, so only a
+    real write can satisfy this now.
+
+    THE GENERAL FORM, worth carrying past this one test: a text grep cannot prove
+    a WRITE in a file that documents itself well -- and the better a module
+    explains its own seam, the more likely it is to fool a grep-based guard. The
+    incentive is perverse, because the modules most worth trusting are the ones
+    whose prose most reliably defeats the check. When a guard must prove that
+    code DOES something, match the structure, not the source text."""
+    src = Path(__file__).resolve().parents[2] / "src" / "odin"
+    writers = sorted(
+        path.relative_to(src).as_posix()
+        for path in src.rglob("*.py")
+        if path.name != "tf_status.py"
+        and any(
+            isinstance(key, ast.Constant) and key.value == "hosts_action"
+            for node in ast.walk(ast.parse(path.read_text()))
+            if isinstance(node, ast.Dict)
+            for key in node.keys
+            if key is not None
+        )
+    )
+    assert writers, "no module writes `hosts_action`, so the route53 projector can never fire"
+
+
+async def test_a_zone_over_vms_that_recorded_nothing_is_healthy(tmp_path):
+    """The honest failure mode, asserted rather than left implicit: when no VM
+    recorded a verdict there is nothing to report, so the zone reads healthy.
+    That is the substrate saying "no VM reported a problem" -- NOT a proof that
+    resolution works. That proof is the integration test that asks `getent
+    hosts` inside a real container and a real VM."""
+    stores = SynthStores(tmp_path)
+    _running_vm(stores, 1)
+    _running_vm(stores, 2)
+    _zone(stores, "example.com", [_a_record("vm1.example.com", "192.168.64.1")])
+
+    assert (await project(stores, ENV))["example.com"][1] == "healthy"
 # --- efs: the ONE kind whose phase is read off the DISK ----------------------
 #
 # Every other kind here projects a state machine some model wrote down. An EFS

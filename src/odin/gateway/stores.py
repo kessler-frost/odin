@@ -321,6 +321,18 @@ class SynthStores:
       `reconcile/dispatch.py`, whose own bookkeeping lives in `dispatch` below
       rather than in here: this store is EventBridge's control plane, and
       "when did this rule last fire" is not a fact EventBridge's API has.
+    - `route53ctl`: the Route 53 model's whole state
+      (`gateway/models/route53ctl.py`) -- flat keys `"zone:{zoneId}"` /
+      `"rrset:{zoneId}"` (a LIST of that zone's record sets) /
+      `"change:{changeId}"`, persisted at `.odin/{env}/gateway/route53ctl.json`.
+      Hosted-zone tags live in the shared `tags` store above, keyed
+      `"route53:{zoneId}"` -- and for this ONE service that key is not merely
+      where tags go, it is the only carrier of the CANVAS LABEL: Route 53 tags
+      are a separate `ChangeTagsForResource` call rather than an argument on
+      create, so `odin:node` arrives AFTER the zone exists. `zoneId` is the
+      domain name (route53ctl deviation 1), never an opaque `Z...`. Nothing in
+      this store resolves: odin serves no DNS, and that limit is the first thing
+      the model's docstring states.
     - `dispatch`: the event dispatcher's own bookkeeping
       (`reconcile/dispatch.py`) -- flat keys `"fired:{bus}:{rule}"` (a
       scheduled rule's clock anchor) and `"pending:{id}"` (an S3 object write
@@ -373,6 +385,7 @@ class SynthStores:
         self.rdsctl = JsonStore(root, "rdsctl")
         self.elbv2ctl = JsonStore(root, "elbv2ctl")
         self.eventsctl = JsonStore(root, "eventsctl")
+        self.route53ctl = JsonStore(root, "route53ctl")
         self.efsctl = JsonStore(root, "efsctl")
         # apigateway (v0.8.19): `gateway/models/apigwctl.py`'s whole state --
         # flat keys `api:{id}` / `integration:{apiId}:{id}` / `route:{apiId}:{id}`

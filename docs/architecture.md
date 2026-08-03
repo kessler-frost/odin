@@ -198,6 +198,24 @@ graph LR
 
 Targets resolve to a **real address**: an `i-…` target is looked up to the VM's own vzNAT IP — a container on Colima really can reach it, which was measured rather than assumed. The endpoint rides out as a fact because `DNSName` cannot carry a dynamic port.
 
+### Route 53
+
+`a hosts entry — --add-host on containers, /etc/hosts on VMs`
+
+```mermaid
+graph TD
+  Z["route53 node<br/>label IS the domain"] -->|"aws_route53_zone"| G["gateway route53ctl"]
+  E["ec2 node"] -.->|"dns edge"| Z
+  Z -->|"aws_route53_record<br/>A, ttl 60, private_ip"| G
+  G --> C["container consumers<br/>--add-host name:private_ip"]
+  G --> V["VM consumers<br/>/etc/hosts name overlay_ip"]
+  V -.->|"no mesh in this env"| N["NO entry — reported in World,<br/>not silently withheld"]
+  X["alb · rds"] -.->|"REFUSED by name"| P["address carries a PORT<br/>a hosts entry cannot"]
+```
+
+Only an **ec2** target gets a record, and that is the whole design. A hosts entry is `<ip> <name>` — no port, no scheme — and exactly one kind publishes an address that shape: an alb's is `http://127.0.0.1:<dynamic port>` and an rds's is `host:<dynamic port>`, so both are refused **by name** on Apply rather than resolving to somewhere nothing listens.
+
+The two arrows out of the gateway carry **different addresses on purpose**. A container reaches a VM's `private_ip`; a VM cannot — stock Lima `vz` NATs each VM into its own isolated address space and a raw ping between two VMs' vzNAT addresses is **100% loss**, before nebula is involved. So VMs are given the Nebula overlay address, which relays through the lighthouse. The Terraform still carries `private_ip`, because `main.tf` is a pure function of the canvas and portable to real AWS; the divergence is the same shape as EBS's advisory `device_name`.
 ### API Gateway
 
 `nginx container per API + odin's own HTTP↔invoke-envelope shim`

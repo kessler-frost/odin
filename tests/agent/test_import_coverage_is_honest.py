@@ -50,6 +50,13 @@ CANVAS = {
         # the attachment, and the next apply detaches a disk with data on it.
         {"id": "d1", "type": "ebs", "position": {"x": 0, "y": 0},
          "data": {"label": "scratch", "az": "us-east-1a", "size": "40"}},
+        # v0.8.19: a route53 zone plus the edge below, for the ebs reason one
+        # service over -- the round-trip claim has to cover the
+        # `aws_route53_record` COMPANION. A record that does not come back means
+        # the regenerated project writes no hosts entry, so a name that resolved
+        # stops resolving on the next apply.
+        {"id": "z1", "type": "route53", "position": {"x": 0, "y": 0},
+         "data": {"label": "example.com"}},
         # v0.8.19: an efs node plus BOTH mount edges below, so the round-trip
         # claim covers the `aws_efs_access_point` companion and the two mount
         # shapes at once.
@@ -73,6 +80,7 @@ CANVAS = {
         {"id": "e1", "source": "c1", "target": "b1",
          "data": {"edgeType": "iam", "permissions": ["s3:GetObject"]}},
         {"id": "e2", "source": "d1", "target": "e1", "data": {"edgeType": "volume"}},
+        {"id": "e3", "source": "z1", "target": "e1", "data": {"edgeType": "dns"}},
         # ONE file system, TWO consumers, which is the whole difference between
         # `mount` and `volume`: a gp3 volume attaches to exactly one instance,
         # an EFS file system is shared. The second edge is also drawn the OTHER
@@ -102,6 +110,7 @@ def test_odins_own_project_now_round_trips_with_nothing_unsupported():
     result = _round_trip()
     assert result.unsupported == [], [e.type for e in result.unsupported]
     assert {n["type"] for n in result.nodes} >= {
+        "vpc", "subnet", "sg", "ec2", "ecs", "s3", "lambda", "ebs", "route53",
         "vpc", "subnet", "sg", "ec2", "ecs", "s3", "lambda", "ebs", "efs",
     }
 
@@ -110,10 +119,18 @@ def test_a_resource_odin_does_not_model_at_all_is_listed_with_a_reason():
     """Northstar directive 5, the half that stays true forever: silence would mean
     importing a real project and losing part of it without being told. Checked
     against a resource odin has no model for, so full generate-side coverage can
-    never make it vacuous."""
-    result = parse_hcl_text('resource "aws_route53_zone" "main" {\n  name = "example.com"\n}\n')
+    never make it vacuous.
+
+    `aws_kinesis_stream`, not `aws_route53_zone`: route53 became importable in
+    v0.8.19, which is the THIRD time this example has had to move (lambda ->
+    route53 -> here). It stops moving now, because the choice is no longer "a
+    kind nobody has got to yet" -- ROADMAP.md records `kinesis` as DROPPED, with
+    the reason "has no substrate at all", so it cannot quietly become modelled
+    the way the other two did.
+    """
+    result = parse_hcl_text('resource "aws_kinesis_stream" "events" {\n  name = "events"\n}\n')
     (entry,) = result.unsupported
-    assert entry.type == "aws_route53_zone"
+    assert entry.type == "aws_kinesis_stream"
     assert entry.reason, "listed with no reason"
     assert result.nodes == []
 

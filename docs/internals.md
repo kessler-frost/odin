@@ -114,13 +114,13 @@ To regenerate this diagram after editing `docs/diagrams/*.mmd`:
   owns the model and binds it to a substrate.
 - **Translation** (`src/odin/agent/`) is deterministic in both directions and
   no longer covers quite the same node kinds in both: canvas → Terraform
-  builds 22, and Terraform → canvas reads all 21 back across 34 resource types
+  builds 23, and Terraform → canvas reads all 22 back across 36 resource types
   that it models. The gap is `kms`, added in v0.8.18 — emitted and not yet
   imported, so a project carrying an `aws_kms_key` does not round-trip through
-  the canvas. `efs` (v0.8.19) did NOT widen that gap: it arrived in both
-  directions at once, and its two resource types are why 28 became 30 —
-  `aws_efs_file_system` and the `aws_efs_access_point` companion a lambda mount
-  needs. Stated rather than rounded away, because "both directions" was
+  the canvas. `efs` and `route53` (both v0.8.19) did NOT widen that gap: each
+  arrived in both directions at once. efs's two resource types and route53's two
+  (`aws_route53_zone` plus the `aws_route53_record` companion an edge becomes)
+  are why 32 became 36. Stated rather than rounded away, because "both directions" was
   true for eleven releases and is the sort of claim a reader keeps believing.
 
   These three numbers are pinned by

@@ -41,7 +41,7 @@ from odin.compute.tasks import TaskRuntime
 from odin.fabric.localhost import LocalhostFabric
 from odin.fabric.nebula import mesh_state, reap_orphaned_lighthouses
 from odin.fabric.sidecar import MeshSidecar
-from odin.gateway import DEFAULT_GATEWAY_PORT, GATEWAY_PORT_ENV, wiring
+from odin.gateway import DEFAULT_GATEWAY_PORT, GATEWAY_PORT_ENV, route53_hosts, wiring
 from odin.gateway.app import GatewayState, create_gateway_app, serve_on_loop
 from odin.gateway.keys import OPERATOR_NODE_ID, KeyStore, Principal
 from odin.gateway.models import ec2compute, ec2net, ecsctl, efsctl, lambdactl, rdsctl
@@ -2424,6 +2424,22 @@ def create_apply_full_router(
         # all synchronously, so by the time it returns the database is looking
         # at the new identity.
         await ec2compute.ensure_instance_mesh(stores, env)
+        # ...then make each running VM's /etc/hosts match this env's route53
+        # records. AFTER the mesh pass, and that order is load-bearing rather
+        # than tidy: a VM can only reach another VM over the Nebula overlay (a
+        # VM-to-VM vzNAT address is 100% loss), so a record's usable address is
+        # the target's OVERLAY address -- which exists only once the mesh pass
+        # has allocated it. Running this first would resolve every name to
+        # nothing on the very apply that created the instances.
+        #
+        # Same cadence and same reason as the two passes either side: records
+        # are TF-owned, so an edited one reaches the gateway only here, and
+        # cloud-init runs once at VM CREATE (its bytes are frozen into the
+        # instance's lima.yaml, and `limactl edit` refuses a running instance).
+        # Without this call a record edited after boot could never reach the
+        # guest. Cheap: an unchanged record set is one local file comparison
+        # per instance -- no `limactl`. See gateway/route53_hosts.py.
+        await route53_hosts.ensure_instance_hosts(stores, env)
         # ...then push each live database's SG-compiled firewall into its mesh
         # sidecar. An apply is exactly the right cadence -- security groups are
         # TF-owned, so an edited `db-sg` only reaches the gateway here. Also

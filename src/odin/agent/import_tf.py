@@ -49,7 +49,7 @@ from odin.aws.backings import ACCOUNT, REGION
 from odin.gateway.policy import arn_label
 from odin.simulate import workspace as workspace_mod
 from odin.simulate.runner import PLUGIN_CACHE_DIR
-from odin.spec.translate import ALB_TARGET, FILE_SYSTEM_MOUNT, VOLUME_ATTACHMENT
+from odin.spec.translate import ALB_TARGET, DNS_RECORD, FILE_SYSTEM_MOUNT, VOLUME_ATTACHMENT
 from odin.util import reap
 
 _GRID_STEP = 220
@@ -103,6 +103,16 @@ _KIND = {
     # attachment to an instance is a companion `aws_volume_attachment`, folded
     # back into a canvas EDGE below rather than becoming a node.
     "aws_ebs_volume": "ebs",
+    # v0.8.19: the DNS kind, and it needs a `_NAME_ATTR` entry where the two
+    # kinds above it deliberately have none. `aws_instance`/`aws_ebs_volume`
+    # have NO `name` argument at all, so their labels can only come from the
+    # `odin:node` tag; an `aws_route53_zone` DOES have one, and the zone's name
+    # IS its canvas label -- a route53 node is drawn as the domain itself
+    # (`hcl.py::_route53` emits `quote(res.id)`). So the name argument is read
+    # first and the tag stays the fallback, exactly as for every other named
+    # kind. Its records are a companion `aws_route53_record`, folded back into a
+    # canvas EDGE below rather than becoming a node.
+    "aws_route53_zone": "route53",
     # v0.8.19: a shared file system. Its label comes from `creation_token` (a
     # `_NAME_ATTR` entry), NOT from the `odin:node` tag `ebs`/`ec2` fall back to,
     # and the difference is only visible on a project odin did not generate.
@@ -190,6 +200,7 @@ _NAME_ATTR = {
     "aws_security_group": "name", "aws_ecr_repository": "name",
     "aws_ecs_service": "name",
     "aws_lambda_function": "function_name",
+    "aws_route53_zone": "name",
     # v0.8.19. See the `_KIND` note: `creation_token` is the only name-shaped
     # argument the type has, it is where `hcl.py` writes the label, and being
     # HERE is what makes `_renamed_by_import` fire for one odin cannot read.
@@ -228,6 +239,13 @@ _NAME_ATTR = {
 # `vol-...` VolumeId, minted by the gateway at CreateVolume and appearing nowhere
 # on a canvas, so there is no id to resolve one from outside an Apply. Mode (a),
 # reading an existing HCL project, works.
+# `route53` is out for the same reason, and it is the ID SHAPE rather than a
+# missing model: a hosted zone's live import id is its `Z...` HostedZoneId,
+# minted when the zone is created, while the canvas carries the DOMAIN
+# (`example.com`) -- a different string, so there is nothing here to resolve one
+# from. That holds whether or not a route53 gateway model exists to enumerate
+# zones (there was none when this line was written, 2026-08-02), which is why
+# the reason is stated as the id and not as the backing.
 # `efs` is out for that same reason and it is worth stating rather than assuming:
 # `terraform import aws_efs_file_system.x` takes the bare `fs-...` FileSystemId,
 # which the gateway mints at CreateFileSystem and which appears NOWHERE on a
@@ -241,7 +259,7 @@ _NAME_ATTR = {
 # reading an existing HCL project, works.
 _NO_LIVE_IMPORT = {
     "iam_role", "logs", "secret", "ssm", "elasticache", "alb", "sg", "ecr", "ec2", "ecs", "lambda",
-    "ebs", "efs", "apigateway",
+    "ebs", "route53", "efs", "apigateway",
 }
 _TF_TYPE = {kind: rtype for rtype, kind in _KIND.items() if kind not in _NO_LIVE_IMPORT}
 
@@ -346,6 +364,13 @@ _CARRIED_ATTRS = {
     # (`_FIXED_VALUES`), never a dropped one: an io2 volume imported as gp3 in
     # silence is the elasticache bug in another costume.
     "ebs": {"availability_zone", "size", "type"},
+    # v0.8.19. A hosted zone is a ONE-ARGUMENT resource here: `name`, which IS
+    # the canvas label. Everything that makes a zone do anything lives in its
+    # RECORDS, and those are companions -- so anything else written on the zone
+    # itself (`comment`, `force_destroy`, a `vpc {}` block making it private,
+    # `delegation_set_id`) is genuinely unmodeled and is reported by name rather
+    # than looking carried because the zone imported cleanly.
+    "route53": {"name"},
     # v0.8.19. `creation_token` only -- everything else `aws_efs_file_system`
     # accepts is genuinely UNMODELLED and reported dropped, which is the honest
     # answer rather than a `_FIXED_VALUES` entry pretending odin re-emits it.
@@ -402,6 +427,19 @@ _CARRIED_COMPANION_ATTRS = {
     # that odin re-derives it positionally (`_assigned_devices`), so a source
     # that names a different device is reported CHANGED.
     "aws_volume_attachment": {"device_name", "instance_id", "volume_id"},
+    # v0.8.19, the attachment's shape exactly: a record becomes an EDGE, so
+    # everything the source wrote on it has to be accounted for here or it
+    # vanishes. `zone_id`/`records` are the two references the edge is rebuilt
+    # from; `type`/`ttl` are carried in the sense that odin re-emits its own
+    # (`_FIXED_VALUES` names a source that disagrees); `name` is RE-DERIVED as
+    # `<ec2 label>.<zone label>`, so a record the user named anything else is
+    # reported CHANGED, the same way an attachment's `device_name` is. What is
+    # NOT here is every routing feature a hosts file cannot have --
+    # `set_identifier`, `weighted_routing_policy`, `failover_routing_policy`,
+    # `health_check_id`, `alias` -- and each of those changes WHICH address the
+    # name answers with, so a silent drop would be a different record wearing
+    # the same name.
+    "aws_route53_record": {"zone_id", "name", "type", "ttl", "records"},
     # v0.8.19. The access point folds ONTO its file system, so anything the
     # source put on it has to be accounted for here or it vanishes. `posix_user`
     # is the one that bites: it forces every file the mount creates to one
@@ -482,6 +520,20 @@ _FIXED_VALUES = {
     ("ecs", "deployment_minimum_healthy_percent"): "100",
     ("ecs", "deployment_maximum_percent"): "200",
     ("ebs", "type"): "gp3",
+    # v0.8.19, and the substitution is the substrate's, not a shortcut: odin
+    # resolves a name with a HOSTS ENTRY (`--add-host` on containers,
+    # `/etc/hosts` on VMs), and a hosts entry is `<ip> <name>`. It has no record
+    # type and no TTL to express, so `hcl.py` emits `A`/`60` unconditionally
+    # (`_DNS_RECORD_TYPE`/`_DNS_RECORD_TTL`). A source `type = "CNAME"` really
+    # does come back as an A record answering with an IP -- a different kind of
+    # answer, not a detail -- and a `ttl = 300` really does come back as 60.
+    #
+    # Lowercase because this table is compared against `_literal`, which
+    # lowercases: an entry spelled `"A"` could never equal the source's own `"a"`
+    # and would fire on every import of odin's OWN output, which is the
+    # every-time warning `_same_literal` exists to have stopped once already.
+    ("aws_route53_record", "type"): "a",
+    ("aws_route53_record", "ttl"): "60",
 }
 # The default odin's `_node_data` falls back to when a NUMERIC argument's source
 # value isn't a literal number odin can read (`allocated_storage = var.size`,
@@ -1057,6 +1109,34 @@ def _referenced_label(value: object, rtype: str, by_hcl_name: dict[str, str]) ->
     at (`vpc_id = aws_vpc.net.id` -> the vpc node's label), or None."""
     target = _ref_target(value)
     return by_hcl_name.get(f"{rtype}.{target}") if target else None
+
+
+# What odin emits for a record's `records`, spelled once so the warning and the
+# comment cannot drift apart.
+_ONE_RECORD_VALUE = (
+    "odin emits ONE address per record -- one `aws_route53_record` per drawn "
+    "route53 -> ec2 edge, holding that instance's `private_ip`"
+)
+
+
+def _record_reference(value: object) -> object:
+    """The single interpolation out of an `aws_route53_record`'s `records`.
+
+    PRINTED FROM python-hcl2 BEFORE CODING AGAINST IT (honesty rule 1), because
+    this is the one reference in this file that is not a bare string.
+    `records = [aws_instance.api_server.private_ip]` parses to the LIST
+    `['${aws_instance.api_server.private_ip}']` -- the interpolation is INSIDE
+    it, and `_ref_target` reads only a `str`, so handing the list straight to
+    `_referenced_label` returns None and EVERY record, odin's own included,
+    would be reported as naming a resource outside the supported set.
+
+    The FIRST entry, because odin emits exactly one. A source round-robin record
+    listing several addresses keeps only that one, and the loss is reported as a
+    CHANGED `records` argument (`_ONE_RECORD_VALUE`) rather than left for the
+    next apply to reveal.
+    """
+    values = value if isinstance(value, list) else []
+    return values[0] if values else None
 
 
 # hcl.py::_DEFAULT_EGRESS, as the parsed block it becomes.
@@ -2128,6 +2208,7 @@ def parse_hcl(files: dict[str, str], archives: dict[str, bytes] | None = None) -
     secret_versions: list[tuple[str, dict]] = []
     alb_companions: list[tuple[str, str, dict]] = []
     volume_attachments: list[tuple[str, dict]] = []
+    dns_records: list[tuple[str, dict]] = []
     access_points: dict[str, dict] = {}
     apigw_companions: list[tuple[str, str, dict]] = []  # v0.8.19
     key_pairs: dict[str, dict] = {}
@@ -2152,6 +2233,12 @@ def parse_hcl(files: dict[str, str], archives: dict[str, bytes] | None = None) -
             # subscription -- it is how the canvas says which instance a volume
             # is attached to, and it never becomes a node.
             volume_attachments.append((rname, attrs))
+            continue
+        if rtype == "aws_route53_record":
+            # v0.8.19: a COMPANION that becomes an EDGE, exactly like an
+            # attachment -- it is how the canvas says which instance a name
+            # resolves to, and it never becomes a node of its own.
+            dns_records.append((rname, attrs))
             continue
         if rtype in _APIGW_COMPANION_TYPES:
             # v0.8.19. The INTEGRATION becomes an edge; the routes and the stage
@@ -2414,6 +2501,53 @@ def parse_hcl(files: dict[str, str], archives: dict[str, bytes] | None = None) -
             f"{volume_label} -> {instance_label} (volume attachment)", "", dropped, changed,
         )
 
+    # v0.8.19: each `aws_route53_record` back into the canvas edge that produced
+    # it -- the inverse of hcl.py's record pass, and the same stake as the
+    # attachment pass above. Lose the edge and the second generate emits no
+    # record at all, so the next apply REMOVES the hosts entry and a name that
+    # resolved stops resolving.
+    #
+    # ONLY an `aws_instance` is ever looked for, and the scope is not widened
+    # here. hcl.py declines every other target BY NAME (`_DNS_TARGET_KINDS`,
+    # measured against the real fact shapes) because a hosts entry is
+    # `<ip> <name>` and carries no port -- so an edge invented to an alb or an
+    # rds would be one the generator refuses to re-emit, i.e. an import that
+    # cannot round-trip and says nothing about it.
+    for rname, attrs in dns_records:
+        zone_label = _referenced_label(attrs.get("zone_id"), "aws_route53_zone", by_hcl_name)
+        instance_label = _referenced_label(
+            _record_reference(attrs.get("records")), "aws_instance", by_hcl_name,
+        )
+        if not (zone_label and instance_label):
+            missing = ", ".join(
+                f"{arg}={attrs.get(arg)!r}" for arg, found in
+                (("zone_id", zone_label), ("records", instance_label)) if not found
+            )
+            unsupported.append(Unsupported(
+                type="aws_route53_record", name=rname,
+                reason=f"record references a resource outside the supported set ({missing}) -- the "
+                       "edge is dropped, so a regenerated project would NOT resolve this name",
+            ))
+            continue
+        edges.append({
+            "source": zone_label, "target": instance_label,
+            "data": {"edgeType": DNS_RECORD},
+        })
+        values = attrs.get("records")
+        dropped, changed = _attribute_notes(
+            "aws_route53_record", attrs, _CARRIED_COMPANION_ATTRS["aws_route53_record"], (),
+            {
+                # hcl.py names the record `<ec2 label>.<zone label>`, so a record
+                # the source called anything else is renamed by the round trip --
+                # and a renamed DNS record is a name that stops answering.
+                **_derived_changes([("name", attrs.get("name"), f"{instance_label}.{zone_label}")]),
+                **({"records": _ONE_RECORD_VALUE}
+                   if isinstance(values, list) and len(values) > 1 else {}),
+            },
+        )
+        warnings += _attribute_warnings(
+            f"{zone_label} -> {instance_label} (dns record)", "", dropped, changed,
+        )
     # v0.8.19: EFS MOUNTS, recovered from the CONSUMER side.
     #
     # This is where the shape differs from every other companion in this file. An

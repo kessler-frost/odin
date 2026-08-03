@@ -339,6 +339,8 @@ def classify(
         return _classify_elbv2(body)
     if service == "events":
         return _classify_events(lower_headers, body)
+    if service == "route53":
+        return _classify_route53(method, path, body)
     if service == "elasticfilesystem":
         return _classify_efs(method, path, query, body)
     # apigateway (v0.8.19). ONE branch for both API Gateway v1 and v2 -- they
@@ -1090,6 +1092,107 @@ def _classify_apigateway(method: str, path: str) -> tuple[str, str] | None:
         if match is None:
             continue
         return f"apigateway:{op}", unquote(match.groupdict().get("api") or "*")
+    return None
+
+
+# ROUTE 53 IS LAMBDA'S SHAPE, NOT ELBV2'S: rest-xml is still REST, so it routes
+# on (method, path) exactly like `_LAMBDA_ROUTES` above, and every pattern is
+# `$`-anchored so no two can match the same pair. Method + requestUri MEASURED
+# per operation off botocore's own `route53` model and confirmed against
+# captured request bytes -- not remembered.
+#
+# THE COLLISION this anchoring is load-bearing for: `/2013-04-01/hostedzone` is
+# CreateHostedZone on POST and ListHostedZones on GET, and
+# `/2013-04-01/tags/{type}/{id}` is Change on POST and List on GET. METHOD is
+# what separates each pair, so the paths must not be allowed to overlap further.
+#
+# THE TRAILING SLASH ON `/rrset` IS OPTIONAL, AND THAT IS A MEASURED CORRECTION
+# RATHER THAN A CONVENIENCE. botocore's `requestUri` for ChangeResourceRecordSets
+# really is `.../rrset/` WITH a slash while ListResourceRecordSets is `.../rrset`
+# without one, and boto3 puts exactly that on the wire -- so the first cut of
+# this table required the slash on the write route. The REAL terraform provider
+# does not send it. Measured, driving a real `tofu apply` (provider 5.100.0,
+# which uses aws-sdk-go-v2, not botocore) against this gateway:
+#
+#     POST /2013-04-01/hostedzone/odin.internal/rrset   -> UNMAPPABLE
+#     Error: creating Route53 Record: ... StatusCode: 403,
+#       api error AccessDenied: User is not authorized to perform: unmappable-action
+#
+# The zone had already been created; the record killed the apply. Two SDKs spell
+# the same operation differently, and modelling only the one that is easy to
+# capture from python is how a service passes its own tests and then fails the
+# only client that matters. Accepting both spellings costs nothing here: the two
+# rrset routes differ by METHOD, so no widening of the path can make them
+# collide, and each is still `$`-anchored against every other route.
+#
+# `{zone}` is a hosted zone id, and deviation 1 in `models/route53ctl.py` is
+# what makes it the thing an IAM policy is written against: the zone id IS the
+# domain name, so `route53ctl.zone_id` reduces every spelling of it here with no
+# store access at all. `{change}` deliberately is NOT a zone -- see below.
+_ROUTE53_ROUTES: tuple[tuple[str, re.Pattern[str], str], ...] = (
+    ("POST", re.compile(r"^/2013-04-01/hostedzone$"), "CreateHostedZone"),
+    ("GET", re.compile(r"^/2013-04-01/hostedzone$"), "ListHostedZones"),
+    ("GET", re.compile(r"^/2013-04-01/hostedzonesbyname$"), "ListHostedZonesByName"),
+    ("GET", re.compile(r"^/2013-04-01/hostedzone/(?P<zone>[^/]+)$"), "GetHostedZone"),
+    ("DELETE", re.compile(r"^/2013-04-01/hostedzone/(?P<zone>[^/]+)$"), "DeleteHostedZone"),
+    ("POST", re.compile(r"^/2013-04-01/hostedzone/(?P<zone>[^/]+)/rrset/?$"), "ChangeResourceRecordSets"),
+    ("GET", re.compile(r"^/2013-04-01/hostedzone/(?P<zone>[^/]+)/rrset/?$"), "ListResourceRecordSets"),
+    ("GET", re.compile(r"^/2013-04-01/change/(?P<change>[^/]+)$"), "GetChange"),
+    ("POST", re.compile(r"^/2013-04-01/tags/hostedzone/(?P<zone>[^/]+)$"), "ChangeTagsForResource"),
+    ("GET", re.compile(r"^/2013-04-01/tags/hostedzone/(?P<zone>[^/]+)$"), "ListTagsForResource"),
+)
+
+# The `<Name>` a CreateHostedZone carries in its rest-xml body -- the ONE route
+# above whose path has no zone in it, so the resource has to come from the body
+# (the same technique `_classify_lambda` uses for CreateFunction's FunctionName
+# and `_classify_ecr` for repositoryName). Matched rather than XML-parsed
+# because `classify` runs before any handler and must never raise on a body a
+# caller malformed; a body with no Name at all classifies as `"*"` and the
+# handler answers the real complaint.
+_ROUTE53_NAME = re.compile(rb"<Name>([^<]*)</Name>")
+
+
+def _route53_zone(value: str) -> str:
+    """The bare zone id out of every spelling one arrives in.
+
+    A DUPLICATE of `models/route53ctl.py::zone_id`, deliberately, and for the
+    same reason `_kms_resource` duplicates `kmsctl.bare_key_id`: this module
+    imports NOTHING from odin, and keeping it a leaf is worth more than sharing
+    three lines -- `route53ctl` pulls in `gateway/stores.py`, `gateway/kms.py`
+    and `spec/store.py` behind it, none of which classification needs.
+
+    The cost of duplication is drift, and drift here is silent and expensive:
+    if create stores one spelling while classify reports another, an IAM edge
+    to that zone DENIES with no explanation. So unlike the kms pair, this one is
+    not left to prose -- `tests/gateway/test_route53ctl.py::
+    test_classify_and_model_agree_on_every_zone_id_spelling` asserts the two
+    functions agree over a table of forms, and fails if either moves."""
+    tail = value.rpartition("/hostedzone/")[2] or value
+    return tail.strip("/").rstrip(".")
+
+
+def _classify_route53(method: str, path: str, body: bytes) -> tuple[str, str] | None:
+    for route_method, pattern, op in _ROUTE53_ROUTES:
+        if route_method != method:
+            continue
+        match = pattern.match(path)
+        if match is None:
+            continue
+        groups = match.groupdict()
+        if "zone" in groups:
+            return f"route53:{op}", _route53_zone(unquote(groups["zone"]))
+        if "change" in groups:
+            # A change id is NOT a zone, and must not be reported as one: a
+            # policy written against `odin.internal` must not accidentally match
+            # a GetChange for some other zone's change. Same reasoning as
+            # `_classify_lambda`'s event-source-mapping UUID -- polling a change
+            # is an OPERATOR action (tofu's own waiter), and the operator's
+            # full-allow statement covers it, while a workload principal denies
+            # it by ordinary default-deny rather than by `unmappable-action`.
+            return f"route53:{op}", unquote(groups["change"])
+        found = _ROUTE53_NAME.search(body or b"")
+        name = found.group(1).decode(errors="replace") if found else ""
+        return f"route53:{op}", _route53_zone(name) if name else "*"
     return None
 
 
