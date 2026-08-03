@@ -114,7 +114,7 @@ To regenerate this diagram after editing `docs/diagrams/*.mmd`:
   owns the model and binds it to a substrate.
 - **Translation** (`src/odin/agent/`) is deterministic in both directions and
   no longer covers quite the same node kinds in both: canvas → Terraform
-  builds 23, and Terraform → canvas reads all 22 back across 36 resource types
+  builds 23, and Terraform → canvas reads all 22 back across 38 resource types
   that it models. The gap is `kms`, added in v0.8.18 — emitted and not yet
   imported, so a project carrying an `aws_kms_key` does not round-trip through
   the canvas. `efs` and `route53` (both v0.8.19) did NOT widen that gap: each
@@ -122,6 +122,13 @@ To regenerate this diagram after editing `docs/diagrams/*.mmd`:
   (`aws_route53_zone` plus the `aws_route53_record` companion an edge becomes)
   are why 32 became 36. Stated rather than rounded away, because "both directions" was
   true for eleven releases and is the sort of claim a reader keeps believing.
+  36 became 38 in v0.8.21 with **no new node kind at all**, which is the
+  interesting part: `aws_iam_instance_profile` and
+  `aws_lb_target_group_attachment` were resources odin's generator had always
+  written and its importer had never read, so odin's OWN output came back with
+  two `unsupported` entries. Every kind was covered and the round trip was still
+  broken — companion coverage is a separate count from kind coverage, which is
+  why this sentence quotes both.
 
   These three numbers are pinned by
   `tests/agent/test_import_coverage_is_honest.py`, which derives all three from

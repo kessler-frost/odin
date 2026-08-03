@@ -351,9 +351,14 @@ claim in this README is verified.
 
 The ones most likely to matter:
 
-- **An emitted IAM policy names resources by label, not ARN.** It round-trips
-  through odin perfectly; taken to Amazon each policy needs its `Resource`
-  rewritten as an ARN.
+- **A drawn IAM grant is real Terraform, and its `Resource` is a real ARN.**
+  This bullet used to say the opposite — "names resources by label, not ARN …
+  taken to Amazon each policy needs its `Resource` rewritten" — and that limit
+  was closed in v0.8.14, which `tests/agent/test_hcl_iam_arns.py` quotes verbatim
+  as the limit it closes. Measured 2026-08-03 on a granted `ec2 → s3` canvas:
+  `"Resource": ["arn:aws:s3:::uploads", "arn:aws:s3:::uploads/*"]`. A caveat
+  outliving its fix is this repo's third honesty rule; it is recorded here rather
+  than quietly deleted because a stale limit is read as a live one.
 - **An RDS instance has no snapshots and no backups.** Its data survives a
   container replacement (a named volume), and `odin destroy` deletes it along
   with the volume — there is nothing to restore from afterwards. `odin volumes`
