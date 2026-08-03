@@ -32,6 +32,23 @@ confirmed failing:
         fails `test_an_unrecognised_runtime_fails_at_startup_naming_the_variable`
   * `_BACKENDS` losing its `"lima"` entry
         fails `test_every_accepted_value_builds_its_own_backend[lima-LimaRuntime]`
+        AND three others -- 4 failed, 7 passed, i.e. the run still COLLECTS 11.
+        That is the property rule 5 asks for and the reason the pairs are
+        literals: a file that parametrized over `_BACKENDS` would have gone
+        green at 10 tests, and a test count falling by one reads as success.
+
+ONE MUTATION SURVIVES, AND IT IS REPORTED RATHER THAN PAPERED OVER.
+`_BACKENDS[...]` -> `_BACKENDS.get(..., ColimaRuntime)` passes all 11. It
+survives BY CONSTRUCTION, not by a gap here: `ComputeSettings.runtime` is a
+`Literal`, so an unrecognised value raises one expression earlier and the
+`.get` default is unreachable. It is reachable only in combination with
+loosening that `Literal` -- and the loosening half is killed on its own by
+`test_an_unrecognised_runtime_fails_at_startup_naming_the_variable`. Measured
+directly with `ODIN_RUNTIME=limaa`: `Literal`+subscript raises ValidationError,
+`str`+subscript raises KeyError (still loud), and only `str`+`.get` silently
+returns a `ColimaRuntime`. No test is written for the third row, because a test
+that has to break two things to observe one would pin the mutant rather than
+the behaviour.
 """
 from __future__ import annotations
 

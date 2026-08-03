@@ -1386,3 +1386,75 @@ internet-facing, EC2 launch type where you wanted Fargate, no IGW.
   broken" rather than as string concatenation. Pinned in BOTH directions by
   `tests/gateway/test_apigwctl.py` — the prefix location must gain the slash and
   the exact-match location must not.
+
+
+## `ODIN_RUNTIME=lima` is SELECTABLE, not yet proven for odin's workloads
+
+`ODIN_RUNTIME` (see [`config.md`](config.md)) chooses the container backend:
+`colima` (the default, `docker` on the host's Colima VM) or `lima` (`nerdctl`
+inside odin's own shared `odin-host` Lima VM). The switch is real and pinned by
+`tests/runtime/test_select.py`. **What it does not come with is evidence that
+odin's services work on the far side of it**, and the honest summary is that
+two things are known to be missing today. Both were measured against a real
+booted `odin-host` VM on 2026-08-03, not read out of the source.
+
+**The shared `odin-host` VM is the right default, and multi-env is NOT the
+problem.** `ODIN_RUNTIME=lima` asks for isolation between odin and the Mac, not
+between odin's own environments — and one VM holding every env's containers is
+exactly what Colima already is. Environments stay separated the way they always
+have been, by container name (`odin-aws-<backing>-<env>`,
+`odin-rds-<env>-<id>`), so nothing about running several envs changes when the
+containers move inside a VM. (A per-instance VM *is* a real thing in odin, but
+it means something else: `gateway/models/ecsctl.py::runtime_for_service` binds
+an ECS service placed inside an EC2 box to that node's own
+`odin-ec2-<env>-<id>`. That is placement, decided per service by the canvas —
+not something a process-wide backend switch could express.)
+
+- **`host.docker.internal` does not resolve inside a container in the Lima VM,
+  and odin hands containers that name constantly.** `ColimaRuntime._run_flags()`
+  adds `--add-host host.docker.internal:host-gateway` to every `run`;
+  `LimaRuntime` does not override `_run_flags`, so it adds nothing. Everything
+  odin injects into a workload is spelled with that name —
+  `AWS_ENDPOINT_URL`/`AWS_ENDPOINT_URL_<SERVICE>` (`aws/backings.py`,
+  `gateway/keys.py`) and the ALB and API Gateway upstreams
+  (`compute/proxy.py`, `compute/apigw.py`, both defaulting to
+  `CONTAINER_HOST`). Measured inside a `busybox` container run by `nerdctl` in
+  `odin-host`:
+
+  | resolved from | `host.docker.internal` | `host.lima.internal` |
+  |---|---|---|
+  | inside the VM | **does not resolve** (`getent` exit 2) | `192.168.5.2` |
+  | inside a container in the VM | **does not resolve** | **does not resolve** |
+
+  The container's whole `/etc/hosts` is `localhost` plus its own name. So a
+  workload started under `ODIN_RUNTIME=lima` cannot reach odin's gateway by the
+  address odin gave it. Note this **corrects `runtime/lima.py`'s own docstring**,
+  which says it "omits Colima's host-gateway flag" and that "Lima auto-forwards
+  VM-bound ports to the Mac, so host-side probes and references work the same".
+  The first half is true and the conclusion does not follow from it: Lima's port
+  forwarding runs VM → host, so *host-side probes* really do work the same, and
+  *container-side references* do not — a container in the VM has no name for the
+  host at all. The two directions had been collapsed into one sentence.
+
+- **The `odin-host` VM has no host mounts, so every bind mount is an empty
+  directory.** `compute/lima_yaml.py` emits `"mounts": []`, and that is a
+  deliberate choice rather than an oversight (it is the same reason the EFS
+  work refuses an `ec2`-placed mount by name instead of showing a green tile
+  over an empty directory). Confirmed at runtime, not just in the generator:
+  inside `odin-host`, `mount | grep -E 'virtiofs|9p|reverse-sshfs'` returns
+  nothing, and a real host directory lists as empty. Anything that binds a host
+  path therefore silently gets nothing — `FunctionRuntime` mounting a Lambda's
+  code directory to `/var/task` (`compute/functions.py`), the Nebula sidecar's
+  `/etc/nebula` config (`fabric/sidecar.py`), and EFS task mounts. RDS is the
+  exception and only by luck: `aws/rds.py` uses a NAMED volume, which lives
+  inside the VM.
+
+**So what does `lima` give you today?** What
+`tests/runtime/test_lima_integration.py` proves and no more: a real Lima VM
+boots, a real container runs inside it through `nerdctl`, and its published
+port reads back correctly (5 passed, 49.27 s from cold — 2.73 s against an
+already-booted VM). That is a working `RuntimeDriver`, and it is the honest
+extent of the claim. Driving odin's actual services through it means running
+the integration gate against it, which is the ROADMAP item this switch exists
+to unblock and which has **not** been done. Until then, treat `lima` as the
+option that is now *possible to evaluate*, not one to run an environment on.

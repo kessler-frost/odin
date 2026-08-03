@@ -59,12 +59,26 @@ def build_runtime() -> RuntimeDriver:
     `monkeypatch.setenv("ODIN_RUNTIME", ...)` silently ineffective and the
     tests would pass for the wrong reason.
 
-    No `KeyError` guard, deliberately: the only values that reach this line are
-    the ones `ComputeSettings.runtime`'s `Literal` allows, and `create_app`
-    calls `settings.validate_all()` before anything else, so an unrecognised
-    `ODIN_RUNTIME` has already failed the process by name. A `.get(...,
-    ColimaRuntime)` here would take that startup failure away and hand back the
-    default instead -- the exact silent fallback the strict `Literal` exists to
-    prevent.
+    No `KeyError` guard, and the accurate reason is narrower than the obvious
+    one -- MEASURED, because the obvious one is what was written here first and
+    it was wrong. Mutating this line to `_BACKENDS.get(settings.compute.runtime,
+    ColimaRuntime)()` SURVIVES the whole of `tests/runtime/test_select.py`
+    (11 passed), and it survives correctly: `settings.compute.runtime` is a
+    `Literal`, so an unrecognised value raises inside `ComputeSettings()` one
+    expression earlier and the `.get` default can never be reached. So a
+    fallback here would NOT "take the startup failure away" -- it would be
+    unreachable code.
+
+    That is precisely why it stays off. Unreachable code carrying a default is
+    a silent fallback with a delay fuse: the day anyone loosens the `Literal`
+    to `str`, `.get` starts answering `colima` for a typo and nothing fails.
+    The subscript keeps the two halves honest. Measured with `ODIN_RUNTIME`
+    set to `limaa`, one variable changed at a time:
+
+        Literal + subscript (shipped)      ValidationError   names the variable
+        str + subscript                    KeyError          still loud
+        str + .get(..., ColimaRuntime)     ColimaRuntime     SILENT
+
+    Only the third row is a lie, and it needs BOTH halves to get there.
     """
     return _BACKENDS[settings.compute.runtime]()
