@@ -1,6 +1,6 @@
 graph TD
   UI["canvas (UI or odin canvas set)"] --> Store["spec/store.py: append-only revision"]
-  Store --> HCL["agent/hcl.py: canvas to HCL"]
+  Store --> HCL["iac/hcl.py: canvas to HCL"]
   HCL --> Run["simulate/runner.py: tofu apply"]
   Run --> GW["gateway/: SigV4, IAM, AWS APIs"]
   GW --> Sub["aws/, compute/: Postgres, RustFS, goaws, Lima"]

@@ -63,7 +63,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from odin.agent import hcl
+from odin.iac import hcl
 from odin.agent import translate as translate_mod
 from odin.gateway.app import serve_in_thread, stop_in_thread
 from odin.server import create_app

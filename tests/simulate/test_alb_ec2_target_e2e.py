@@ -78,7 +78,7 @@ def _canvas() -> dict:
     re-derives them from geometry).
 
     The edge is typed `network` ON PURPOSE. That is what every canvas saved
-    before the edge-type registry carries, and `agent/hcl.py`'s target pass
+    before the edge-type registry carries, and `iac/hcl.py`'s target pass
     matches on the two NODE kinds rather than on `edge.kind` precisely so
     those canvases keep working. A test that typed it `target` would prove the
     happy path and miss the whole hazard.

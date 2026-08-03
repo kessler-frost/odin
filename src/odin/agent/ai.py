@@ -27,7 +27,7 @@ CONSTRUCTED for any of the three when the switch is off, the way
 fail a build.
 
 WHAT IT IS NOT. It does not touch the canvas↔Terraform translation, which is a
-deterministic compiler (`agent/hcl.py`): with `ODIN_AI=0` a canvas still
+deterministic compiler (`iac/hcl.py`): with `ODIN_AI=0` a canvas still
 compiles to the same Terraform, `tofu apply` still runs, IAM edges are still
 enforced, and every substrate still works. The refine pass is optional
 decoration over an already-correct translation -- turning it off costs

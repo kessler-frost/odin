@@ -55,7 +55,7 @@ def _matches_any(specs: tuple[str, ...], value: str) -> bool:
 # CONTRACT ADDENDUM). A statement's `Resource`, though, can arrive in either
 # form, and BOTH have to match or a real permission is silently denied:
 #
-#   * `agent/hcl.py::_ARN_FORMS` emits a real ARN since v0.8.14, so a canvas
+#   * `iac/hcl.py::_ARN_FORMS` emits a real ARN since v0.8.14, so a canvas
 #     applied through the gateway now grants `arn:aws:s3:::uploads`;
 #   * `compile_policies` (the edge compiler, still used when a Reconciler has no
 #     gateway stores) emits the bare label;
@@ -73,7 +73,7 @@ _ARN = re.compile(r"^arn:[^:]*:(?P<service>[^:]*):[^:]*:[^:]*:(?P<resource>.+)$"
 
 # The RESOURCE part of each modeled service's ARN -> the LABEL `classify.py`
 # reports for that resource. Every entry is the exact inverse of the
-# corresponding `agent/hcl.py::_ARN_FORMS` shape, and
+# corresponding `iac/hcl.py::_ARN_FORMS` shape, and
 # `tests/agent/test_hcl_iam_arns.py` walks the two tables against each other so
 # neither can gain a shape the other cannot read.
 _ARN_RESOURCE_LABEL: dict[str, re.Pattern[str]] = {

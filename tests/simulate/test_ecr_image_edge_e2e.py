@@ -70,7 +70,7 @@ def _service_canvas() -> dict:
     thing that can give it one is the edge.
 
     The edge is typed `network`, which is what every canvas saved before the
-    edge-type registry carries -- `agent/hcl.py`'s image pass matches on the
+    edge-type registry carries -- `iac/hcl.py`'s image pass matches on the
     two NODE kinds and never on `edge.kind`, and a test that typed it `iam`
     would step around that hazard rather than pin it.
     """

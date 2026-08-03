@@ -406,7 +406,7 @@ async def test_describe_instances_filters_by_state_and_vpc(sink, ec2, stores):
 
 
 async def test_run_instances_with_odin_node_tag_injects_workload_env(sink, ec2, stores, tmp_path):
-    """An instance tagged `odin:node=<label>` (agent/hcl.py stamps this on
+    """An instance tagged `odin:node=<label>` (iac/hcl.py stamps this on
     every canvas-node-backed resource) boots with the four AWS-SDK env vars
     from `workload_env` -- the keystore identity issued for that label --
     baked into its cloud-init, so the VM can call the gateway AS ITSELF."""

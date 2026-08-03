@@ -74,7 +74,7 @@ async def test_run_layers_extra_env_on_top_and_odin_wins_name_collisions():
 
 
 async def test_run_defaults_memory_and_cpu_when_the_taskdef_sets_neither():
-    # v1's ECS canvas builder (agent/hcl.py) never emits cpu/memory on the
+    # v1's ECS canvas builder (iac/hcl.py) never emits cpu/memory on the
     # taskdef today -- this default is what actually caps every canvas-drawn
     # ECS node until it does.
     runtime = FakeRuntime()

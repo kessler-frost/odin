@@ -12,12 +12,12 @@ GitHub renders these diagrams inline. For the ASCII forms used in the README,
 ```mermaid
 graph TD
   Canvas["Canvas — React + ReactFlow"] -->|"canvas_to_stack"| Stack["Stack (desired state)<br/>append-only, content-addressed"]
-  Stack -->|"agent/hcl.py — deterministic"| TF["main.tf + lambda zips"]
+  Stack -->|"iac/hcl.py — deterministic"| TF["main.tf + lambda zips"]
   TF -->|"tofu apply"| GW["odin gateway<br/>one SigV4 endpoint"]
   GW --> Sub["Substrates: containers + Lima VMs"]
   Sub -->|"observe"| World["World (observed state)"]
   World -->|"WorldDelta over SSE"| Canvas
-  TF -.->|"agent/import_tf.py"| Stack
+  TF -.->|"iac/import_tf.py"| Stack
   GW -.->|"reconcile/dispatch.py"| Sub
 ```
 

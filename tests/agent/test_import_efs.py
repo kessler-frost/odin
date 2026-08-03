@@ -15,9 +15,9 @@ from __future__ import annotations
 
 import json
 
-from odin.agent import hcl
-from odin.agent.hcl import generate_tf
-from odin.agent.import_tf import parse_hcl_text
+from odin.iac import hcl
+from odin.iac.hcl import generate_tf
+from odin.iac.import_tf import parse_hcl_text
 from odin.spec.translate import FILE_SYSTEM_MOUNT, canvas_to_stack
 
 _FS = (

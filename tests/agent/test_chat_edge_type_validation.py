@@ -9,7 +9,7 @@ up: the canvas is permissive about `data.*` BY DESIGN, so the gate has to sit
 where the op is authored.
 
 WHAT THIS DOES NOT CLOSE, stated here so the file cannot be read as having
-closed it. `agent/hcl.py`'s subscription and ALB passes match on the two NODE
+closed it. `iac/hcl.py`'s subscription and ALB passes match on the two NODE
 kinds and never read `edge.kind` at all, so a perfectly valid `iam` edge between
 an sns node and an sqs node still emits a real `aws_sns_topic_subscription`.
 Kind-blindness is the PRIMARY defect and it survives this fix entirely --

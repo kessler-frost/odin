@@ -25,7 +25,7 @@ resolves by guessing. This test removes the guess.
 SCOPE, deliberately narrow. Only FLAT set and `frozenset({...})` literals of
 string constants. Tuples and lists are excluded because odin uses
 `(("engine", "engine"), ("db_name", "dbName"))` old->new mapping tables all
-over `agent/import_tf.py`, where a repeated value is correct and intended --
+over `iac/import_tf.py`, where a repeated value is correct and intended --
 flagging those would produce 25 false positives against 1 real finding, and a
 guard that cries wolf gets deleted.
 """

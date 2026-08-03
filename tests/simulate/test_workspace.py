@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from odin.agent.hcl import TfProject
+from odin.iac.hcl import TfProject
 from odin.simulate import workspace
 
 # The exact override.tf block (research §1 -- `skip_requests_validation`

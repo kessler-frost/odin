@@ -30,7 +30,7 @@ node then reports `not running`, which is exactly true.
 Kind -> real backing:
 - rds: the instance's own Postgres container (aws/rds.py::PostgresRds) --
   still resolved by node LABEL, which is the DBInstanceIdentifier tofu
-  created it under (agent/hcl.py's `_rds`), so W2.7 moving rds onto
+  created it under (iac/hcl.py's `_rds`), so W2.7 moving rds onto
   Terraform changed nothing here.
 - s3/sqs/sns/dynamodb: the env's shared backing container (aws/backings.py).
 - ec2: the instance's own Lima VM -- no single process to `docker logs`, so
@@ -164,7 +164,7 @@ def _find_log_group(stores: SynthStores, env: str, node: str) -> str:
     identity IS its name, and odin's canonical resource id is the node label".
     v0.8.15 breaks that rule on purpose for ONE case: a log group drawn as a
     workload's sink is created under the name that workload's substrate really
-    ships to (`/aws/lambda/{fn}`, `/ecs/{svc}` -- `agent/hcl.py::
+    ships to (`/aws/lambda/{fn}`, `/ecs/{svc}` -- `iac/hcl.py::
     _LOG_DESTINATIONS`), because otherwise the drawn group stays empty forever
     while a second, undrawn one collects every line.
 

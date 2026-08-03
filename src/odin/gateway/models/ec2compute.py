@@ -826,7 +826,7 @@ async def _run_instances(params: dict[str, str], env: str, stores: SynthStores, 
     user_data = base64.b64decode(user_data_b64).decode("utf-8", "replace") if user_data_b64 else None
     name = vm_name(env, instance_id)
     # Workload identity (fix-wave 2b finding #2): an instance carrying the
-    # `odin:node` tag (agent/hcl.py stamps it on every canvas-node-backed
+    # `odin:node` tag (iac/hcl.py stamps it on every canvas-node-backed
     # resource) boots with its keystore credentials + the gateway endpoint
     # baked into cloud-init -- the VM can call the gateway AS ITSELF. These
     # env vars go ONLY into the VM, never into any AWS API response body.

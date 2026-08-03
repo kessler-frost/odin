@@ -90,7 +90,7 @@ import asyncpg
 import pytest
 from fastapi.testclient import TestClient
 
-from odin.agent import hcl
+from odin.iac import hcl
 from odin.agent import translate as translate_mod
 from odin.aws.rds import container_name, volume_name
 from odin.gateway.keys import OPERATOR_NODE_ID
@@ -102,7 +102,7 @@ from odin.spec.store import SpecStore
 pytestmark = pytest.mark.integration
 
 ENV = "rds-tf-e2e"
-NODE = "w27-db"          # also the DBInstanceIdentifier (agent/hcl.py's `_rds`)
+NODE = "w27-db"          # also the DBInstanceIdentifier (iac/hcl.py's `_rds`)
 DB_NAME = "orders"
 USER = "svc"
 PASSWORD = "w27-pw-9x2"

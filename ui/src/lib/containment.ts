@@ -33,7 +33,7 @@ export type Containment = {
    *
    * Note what this is NOT: a Fargate/EC2 launch-type switch. odin already emits
    * `launch_type = "EC2"` unconditionally and has no Fargate substrate at all
-   * (`agent/hcl.py`, the "least-fiction" note), so flipping a label would claim
+   * (`iac/hcl.py`, the "least-fiction" note), so flipping a label would claim
    * a distinction odin cannot back. PLACEMENT is the part that is real.
    */
   host?: string;

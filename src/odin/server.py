@@ -26,10 +26,10 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from odin.agent import ai, chat
-from odin.api.canvas import write_canvas
-from odin.agent import import_tf as import_tf_mod
 from odin.agent import translate as translate_mod
-from odin.agent.hcl import TfProject, generate_tf, parse_tf, resource_set, unquote
+from odin.iac import import_tf as import_tf_mod
+from odin.iac.hcl import TfProject, generate_tf, parse_tf, resource_set, unquote
+from odin.api.canvas import write_canvas
 from odin.api.canvas import CanvasGraph, create_canvas_router
 from odin.api.debug import create_debug_router
 from odin.api.logs import create_logs_router
@@ -227,7 +227,7 @@ def _tf_state_readable(root: Path, env: str) -> bool:
     return not (state.is_file() and state.read_text().strip() and not _tf_state(root, env))
 
 
-# The tag `agent/hcl.py::_tags_block` stamps on EVERY primary canvas-node-backed
+# The tag `iac/hcl.py::_tags_block` stamps on EVERY primary canvas-node-backed
 # resource block (never on a companion -- a task definition, an sns->sqs
 # subscription, a lambda's auto-role), carrying the canvas label. Already the
 # mechanism `reconcile/tf_status.py` and `gateway/keys.py::workload_env` key

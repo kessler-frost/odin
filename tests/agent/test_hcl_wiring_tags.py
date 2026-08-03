@@ -25,7 +25,7 @@ import json
 
 import pytest
 
-from odin.agent.hcl import generate_tf
+from odin.iac.hcl import generate_tf
 from odin.gateway.wiring import db_facts
 from odin.spec.translate import canvas_to_stack
 

@@ -57,10 +57,10 @@ const fieldsForType: Record<string, FieldDef[]> = {
     {
       // The source is a CIDR *or* another Security Group node's name -- the
       // "only the web tier may reach me" rule, which is what actually gates
-      // mesh traffic (agent/hcl.py::_ingress_source).
+      // mesh traffic (iac/hcl.py::_ingress_source).
       // The port may be a RANGE (`8000-8100`, v0.8.17). The placeholder shows
       // one, because a field that only ever demonstrated a single port is how
-      // an importable form stays undiscovered (agent/hcl.py::parse_sg_rule).
+      // an importable form stays undiscovered (iac/hcl.py::parse_sg_rule).
       key: 'ingressRules', label: 'Ingress Rules (protocol:port-or-range:cidr-or-SG-name, one per line)',
       editable: true, multiline: true,
       placeholder: 'tcp:443:0.0.0.0/0\ntcp:8000-8100:10.0.0.0/16\ntcp:5432:web-sg',
@@ -70,7 +70,7 @@ const fieldsForType: Record<string, FieldDef[]> = {
       // egress when nothing is authored here, which is what every group did
       // before this field existed and what real AWS seeds a new group with.
       // The placeholder shows that default spelled out, so the first thing a
-      // reader learns is what they are replacing (agent/hcl.py::_sg).
+      // reader learns is what they are replacing (iac/hcl.py::_sg).
       key: 'egressRules', label: 'Egress Rules (protocol:port-or-range:cidr-or-SG-name, one per line — empty = allow all)',
       editable: true, multiline: true,
       placeholder: '-1:0:0.0.0.0/0\ntcp:443:10.0.0.0/16\ntcp:8000-8100:10.0.0.0/16',
@@ -105,7 +105,7 @@ const fieldsForType: Record<string, FieldDef[]> = {
     // A function that is more than one file. The path is read BY THE SERVER at
     // translate time (it builds the zip; the browser never touches the tree),
     // so it must be a real directory on the machine running odin. Set, it wins
-    // over Code entirely -- agent/hcl.py::_lambda_package documents the whole
+    // over Code entirely -- iac/hcl.py::_lambda_package documents the whole
     // precedence, and it is also the only place dependencies can come from:
     // whatever you install INTO that directory ships with it.
     {
@@ -239,7 +239,7 @@ function EdgeConfigView({ edge, nodes, onEdgeUpdate, onCollapse }: { edge: Edge;
   const iamAvailable = availableTypes.includes('iam');
 
   // What this edge IS. A canvas saved before an edge type was named carries the
-  // old catch-all `network`, and `network` decides nothing: `agent/hcl.py`'s ALB
+  // old catch-all `network`, and `network` decides nothing: `iac/hcl.py`'s ALB
   // and subscription passes key on the two NODE kinds and never read the edge's
   // kind at all. So an alb->ecs edge stored as `network` really does compile to
   // a `load_balancer` block, and labelling that panel "Network" would name the

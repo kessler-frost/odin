@@ -25,7 +25,7 @@ import pytest
 import typer
 from fastapi.testclient import TestClient
 
-from odin.agent import hcl
+from odin.iac import hcl
 from odin.agent import translate as translate_mod
 from odin.cli import http
 from odin.server import create_app

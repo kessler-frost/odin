@@ -43,10 +43,10 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
-from odin.agent import hcl
-from odin.agent.hcl import sanitize_name as sanitize
 from odin.aws.backings import ACCOUNT, REGION
 from odin.gateway.policy import arn_label
+from odin.iac import hcl
+from odin.iac.hcl import sanitize_name as sanitize
 from odin.simulate import workspace as workspace_mod
 from odin.simulate.runner import PLUGIN_CACHE_DIR
 from odin.spec.translate import ALB_TARGET, DNS_RECORD, FILE_SYSTEM_MOUNT, VOLUME_ATTACHMENT
@@ -2080,7 +2080,7 @@ def _stamp_containment(
     Containment on the canvas is not geometry to the backend: it is the
     `data.vpc`/`data.subnet` fields the UI stamps onto a node drawn inside a
     container box (`ui/src/lib/containment.ts`), which `spec/translate.py`
-    carries through like any other field and `agent/hcl.py` turns into
+    carries through like any other field and `iac/hcl.py` turns into
     `vpc_id`/`subnets`. So the inverse is exact: a subnet's `vpc_id` and a load
     balancer's `subnets` name the containers it belongs to.
 

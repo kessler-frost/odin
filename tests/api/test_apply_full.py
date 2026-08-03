@@ -14,7 +14,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from odin.agent.hcl import generate_tf
+from odin.iac.hcl import generate_tf
 from odin.agent.translate import TranslateResult
 from odin.aws.rds import volume_name as rds_volume_name
 from odin.runtime.colima import ContainerFacts, HostFacts, RunHandle

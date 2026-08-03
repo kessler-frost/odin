@@ -98,7 +98,7 @@ def test_a_bare_describe_classifies_to_the_literal_star_resource(sink, rds, elas
 
 
 def test_a_scoped_describe_classifies_to_the_node_label(sink, rds, elasticache):
-    """The identifier IS the canvas label (`agent/hcl.py` emits
+    """The identifier IS the canvas label (`iac/hcl.py` emits
     `identifier = <label>`), which is what the edge compiled its statement
     against."""
     assert _classified(sink, "rds", lambda: rds.describe_db_instances(DBInstanceIdentifier=DB)) == (
