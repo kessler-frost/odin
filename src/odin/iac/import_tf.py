@@ -49,6 +49,7 @@ from odin.iac import hcl
 from odin.iac.hcl import sanitize_name as sanitize
 from odin.simulate import workspace as workspace_mod
 from odin.simulate.runner import PLUGIN_CACHE_DIR
+from odin.spec.models import ResourceDesired
 from odin.spec.translate import ALB_TARGET, DNS_RECORD, FILE_SYSTEM_MOUNT, VOLUME_ATTACHMENT
 from odin.util import reap
 
@@ -519,7 +520,46 @@ _CARRIED_COMPANION_ATTRS = {
     },
     "aws_apigatewayv2_route": {"api_id", "route_key", "target"},
     "aws_apigatewayv2_stage": {"api_id", "name", "auto_deploy"},
+    # v0.8.22. FOUR types that folded away with NO honesty pass of any kind --
+    # not a false entry in a set, but the same defect one level up: being
+    # recognised by `parse_hcl`'s dispatch kept them out of `unsupported`, and
+    # nothing then computed what they cost. Each was measured silent on develop.
+    #
+    # `aws_ecs_cluster` is the singleton. Its `name` is `hcl._ECS_CLUSTER_NAME`,
+    # always -- a source cluster called `production` came back `odin` with
+    # `unsupported == []` and `warnings == []`, i.e. the next apply builds a new
+    # cluster and moves every service into it.
+    "aws_ecs_cluster": {"name"},
+    # `aws_ecs_task_definition` folds onto its service, carrying image/port from
+    # `container_definitions` and `cpu`/`memory` directly. The three re-derived
+    # arguments are `family` (the service's own label), `network_mode` and
+    # `requires_compatibilities`. A previous comment rejected a pass here on the
+    # grounds that it "would immediately warn about `family`, `network_mode` and
+    # `requires_compatibilities` on every ecs import that exists today" -- that
+    # is true of a plain dropped-attribute pass and FALSE of the derived
+    # comparison used everywhere else in this file, which is silent whenever the
+    # source agrees with what odin emits. Measured: a `FARGATE`/`awsvpc`/
+    # `legacy-web` task definition imported with nothing said at all.
+    # `task_role_arn` is carried in the reference sense -- `_edges_from_role_policies`
+    # reads it to find which workload a role belongs to.
+    "aws_ecs_task_definition": {
+        "family", "network_mode", "requires_compatibilities", "container_definitions",
+        "cpu", "memory", "volume", "task_role_arn",
+    },
+    # `aws_key_pair` folds onto the instance that references it. `public_key` is
+    # the real value and it survives; `key_name` is RE-DERIVED as
+    # `<ec2 label>-key`, so a shared key pair the user called `deploy-key` comes
+    # back as a differently-named AWS resource -- the `aws_iam_instance_profile`
+    # defect exactly, in the type sitting next to it in `parse_hcl`'s dispatch.
+    "aws_key_pair": {"key_name", "public_key"},
+    # `aws_iam_role_policy` becomes an `iam` EDGE. `name` is re-derived as
+    # `<workload label>-grants`; `role` and `policy` are what the edge is rebuilt
+    # from. Anything else on it (`name_prefix`) is genuinely dropped.
+    _IAM_POLICY_TYPE: {"name", "role", "policy"},
 }
+# The integration's two REFERENCE arguments -- resolved to labels by the caller,
+# so never compared as text (see `_apigw_integration_notes`).
+_APIGW_INTEGRATION_REFS = frozenset({"api_id", "integration_uri"})
 _CARRIED_HEALTH_CHECK_ATTRS = {"path"}
 # v0.8.19: the arguments of the ECS mount, which lives in nested blocks on a
 # TASK DEFINITION rather than on a resource of its own.
@@ -614,6 +654,26 @@ _FIXED_VALUES = {
     # every-time warning `_same_literal` exists to have stopped once already.
     ("aws_route53_record", "type"): "a",
     ("aws_route53_record", "ttl"): "60",
+    # v0.8.22. `auto_deploy` is in `_CARRIED_COMPANION_ATTRS
+    # ["aws_apigatewayv2_stage"]` and odin emits `true` unconditionally, so a
+    # source that turned it OFF -- routes take effect only on an explicit
+    # deployment, which odin has no concept of -- imported silent and came back
+    # auto-deploying. It hid twice over: membership suppressed the dropped line,
+    # and it is the only BOOLEAN in this table that was missing, which is
+    # exactly the sort of entry an audit sweep loses to a sloppy witness (a bare
+    # `false` matches `"readOnly": false` in an unrelated JSON blob, so the
+    # first sweep read this as carried).
+    ("aws_apigatewayv2_stage", "auto_deploy"): "true",
+    # v0.8.22, and it is the whole reason a registry audit was worth running:
+    # `_CARRIED_ATTRS["apigateway"]`'s own comment has said since v0.8.19 that a
+    # `WEBSOCKET` source "is a CHANGED argument (`_FIXED_VALUES`)" -- and THERE
+    # WAS NO ENTRY. Measured on develop before this line: a
+    # `protocol_type = "WEBSOCKET"` api imported with `unsupported == []`,
+    # `warnings == []` and came back an HTTP api. The comment described the fix
+    # and the fix was never written, which is exactly what carried-set
+    # membership hides: being in `_CARRIED_ATTRS` suppressed the "unmodeled
+    # attribute" line that would otherwise have named it.
+    ("apigateway", "protocol_type"): "http",
 }
 # The default odin's `_node_data` falls back to when a NUMERIC argument's source
 # value isn't a literal number odin can read (`allocated_storage = var.size`,
@@ -784,6 +844,68 @@ def _forward_target_group(listener_attrs: dict) -> str | None:
         if target:
             return f"aws_lb_target_group.{target}"
     return None
+
+
+_ALB_FORWARD_ACTION = "forward"
+# The members of a listener's `default_action {}` odin reproduces. `type` and
+# `target_group_arn` are the whole of what it emits, so anything else in there
+# (`redirect {}`, `fixed_response {}`, `authenticate_cognito {}`, `order`) is a
+# behaviour the regenerated listener does not have.
+_CARRIED_DEFAULT_ACTION_ATTRS = {"type", "target_group_arn"}
+
+
+def _default_action_notes(listener_attrs: dict) -> tuple[list[str], list[str]]:
+    """`(dropped, changed)` for a listener's `default_action {}` blocks.
+
+    v0.8.22. `default_action` is in `_CARRIED_COMPANION_ATTRS["aws_lb_listener"]`
+    and the block was read for one thing only -- the target group arn
+    `_forward_target_group` needs -- so everything else in it vanished with
+    membership suppressing the line that would have named it. odin emits exactly
+    one action, `type = "forward"` to the node's own target group, because an
+    nginx reverse proxy is the whole substrate.
+
+    The direction is what makes it worth a warning rather than a footnote: a
+    listener whose default action is a `redirect` to HTTPS, or a
+    `fixed_response` returning 403, comes back FORWARDING that traffic to the
+    backend. A round trip that turns a closed door into an open one is the
+    egress-rule lesson in another service.
+    """
+    dropped: list[str] = []
+    changed: list[str] = []
+    for block in listener_attrs.get("default_action") or []:
+        inner, _ = _attribute_notes(
+            "aws_lb_listener.default_action", block, _CARRIED_DEFAULT_ACTION_ATTRS, (), {},
+        )
+        dropped += [f"default_action.{key}" for key in inner]
+        changed += [
+            f"default_action.{key}={_literal(block[key])} ({why})"
+            for key, why in _derived_changes(
+                [("type", block.get("type"), _ALB_FORWARD_ACTION)],
+            ).items()
+        ]
+    return sorted(set(dropped)), sorted(set(changed))
+
+
+def _target_group_vpc_change(
+    companion_type: str, attrs: dict, alb_vpc: str | None, by_hcl_name: dict[str, str],
+) -> list[tuple[str, object, str]]:
+    """The `_derived_changes` triple for a target group's `vpc_id`, or nothing.
+
+    v0.8.22. `vpc_id` is in `_CARRIED_COMPANION_ATTRS["aws_lb_target_group"]` and
+    was read by nothing at all: odin RE-DERIVES it from the load balancer's own
+    containment (`hcl.py::_vpc_ref`), so a target group the source put in a
+    different VPC comes back in the alb's. Measured silent on develop -- a
+    `vpc_id` naming an imported `other-vpc` regenerated as the alb's `probe_vpc`
+    with `warnings == []`.
+
+    Compared as resolved LABELS so a project whose HCL resource names are not
+    odin's own never fires -- and falling back to the raw reference text when it
+    resolves to nothing, because a `vpc_id` pointing OUT of the file is the same
+    loss and `_derived_changes` skips a `None`."""
+    if companion_type != "aws_lb_target_group" or alb_vpc is None or "vpc_id" not in attrs:
+        return []
+    resolved = _referenced_label(attrs["vpc_id"], "aws_vpc", by_hcl_name) or _literal(attrs["vpc_id"])
+    return [("vpc_id", resolved, alb_vpc)]
 
 
 def _health_check_path(tg_attrs: dict) -> str:
@@ -1064,6 +1186,62 @@ def _apigw_target_label(uri: object, by_hcl_name: dict[str, str]) -> str | None:
     return None
 
 
+def _apigw_target_kind(uri: object) -> str:
+    """The canvas KIND an integration's `integration_uri` points at.
+
+    Split out from `_apigw_target_label` because the two genuinely different
+    integration shapes below key on the kind, not on the label -- and asking
+    `hcl.py` what it would emit needs a `ResourceDesired`, which needs a kind."""
+    text = uri if isinstance(uri, str) else ""
+    return next(
+        (kind for rtype, kind in (("aws_lambda_function", "lambda"), ("aws_ecs_service", "ecs"))
+         if _referenced_hcl_name(text, rtype)),
+        "",
+    )
+
+
+def _apigw_integration_notes(target_label: str, kind: str, attrs: dict) -> tuple[list[str], dict[str, str]]:
+    """`(also_dropped, also_changed)` for one integration, derived by asking
+    `hcl.py::_apigw_integration_attrs` what it would emit for this target --
+    the generator itself, not a second copy of its table.
+
+    v0.8.22, and it is the shape a carried set hides best. `integration_type`,
+    `integration_method` and `payload_format_version` are all in
+    `_CARRIED_COMPANION_ATTRS`, and NONE of them could be a `_FIXED_VALUES`
+    entry, because odin emits a different set per target kind (`AWS_PROXY` +
+    `payload_format_version = "2.0"` for a lambda, `HTTP_PROXY` +
+    `integration_method = "ANY"` for a service). So membership suppressed the
+    dropped-attribute line and nothing replaced it.
+
+    Measured on develop before this pass: an `integration_type = "AWS"` with
+    `payload_format_version = "1.0"` on a lambda imported with `unsupported ==
+    []` and no warning at all, and came back `AWS_PROXY`/`2.0` -- two different
+    event shapes handed to the same function, and a non-proxy `AWS` integration
+    passes a mapping template's output where a proxy passes the request.
+
+    BOTH halves are needed, not just the changed one: an argument odin emits for
+    the OTHER kind (a `payload_format_version` on an ecs integration) is not
+    changed, it is gone, and the carried set was suppressing that line too.
+
+    The two REFERENCE arguments are compared by neither: `api_id` and
+    `integration_uri` are already resolved to the api and target labels by the
+    caller, and diffing HCL reference text would fire on every project whose
+    resource names are not odin's own."""
+    # `unquote`d: the generator hands back HCL source (`'"AWS_PROXY"'`), and the
+    # warning renders the expected value verbatim -- `odin always emits
+    # "AWS_PROXY"` reads as a quoting bug to everyone who sees it.
+    expected = {
+        key: hcl.unquote(want) for key, want in
+        hcl._apigw_integration_attrs(ResourceDesired(id=target_label, kind=kind), "x").items()
+        if key not in _APIGW_INTEGRATION_REFS
+    }
+    carried = _CARRIED_COMPANION_ATTRS["aws_apigatewayv2_integration"] - _APIGW_INTEGRATION_REFS
+    return (
+        sorted(key for key in carried if key in attrs and key not in expected),
+        _derived_changes((key, attrs.get(key), want) for key, want in expected.items()),
+    )
+
+
 def _apigw_companions(
     companions: list[tuple[str, str, dict]], by_hcl_name: dict[str, str],
 ) -> tuple[list[dict], list[str], list[Unsupported]]:
@@ -1107,16 +1285,19 @@ def _apigw_companions(
         edges.append({
             "source": api_label, "target": target_label, "data": {"edgeType": ALB_TARGET},
         })
+        also_dropped, also_changed = _apigw_integration_notes(
+            target_label, _apigw_target_kind(attrs.get("integration_uri")), attrs,
+        )
         dropped, changed = _attribute_notes(
             "aws_apigatewayv2_integration", attrs,
-            _CARRIED_COMPANION_ATTRS["aws_apigatewayv2_integration"], (), {},
+            _CARRIED_COMPANION_ATTRS["aws_apigatewayv2_integration"], also_dropped, also_changed,
         )
         warnings += _attribute_warnings(
             f"{api_label} -> {target_label} (api route)", "", dropped, changed,
         )
 
     warnings += _apigw_route_warnings(companions, integration_labels, by_hcl_name)
-    warnings += _apigw_stage_warnings(companions)
+    warnings += _apigw_stage_warnings(companions, by_hcl_name)
     return edges, warnings, unsupported
 
 
@@ -1131,7 +1312,16 @@ def _apigw_route_warnings(
     (`hcl.py::_apigw_route_keys`) -- so a source that routes `POST /checkout` to
     a function labelled `orders` loses the `/checkout` path on the next Apply and
     serves `/orders` instead. That is a real behaviour change and it is exactly
-    the class `_FIXED_VALUES` exists for, reported the same way."""
+    the class `_FIXED_VALUES` exists for, reported the same way.
+
+    v0.8.22: a route whose `target` names no integration this import recovered
+    used to `continue` in SILENCE, which lost the whole route rather than its
+    key. Measured on develop: a `POST /admin/purge` route pointing at an
+    integration outside the supported set imported with `unsupported == []` and
+    `warnings == []`, and the regenerated project served that path not at all.
+    `target` is in `_CARRIED_COMPANION_ATTRS["aws_apigatewayv2_route"]`, so
+    membership was suppressing the dropped-attribute line that would have said
+    so -- the promise and the silence came from the same entry."""
     warnings: list[str] = []
     for rtype, rname, attrs in companions:
         if rtype != "aws_apigatewayv2_route":
@@ -1140,6 +1330,11 @@ def _apigw_route_warnings(
         integration = _referenced_hcl_name(target, "aws_apigatewayv2_integration")
         labels = integration_labels.get(integration or "")
         if labels is None:
+            warnings.append(
+                f"{rname} (api route): its `target` ({_literal(target)}) names no integration this "
+                f"import could recover, so the route is DROPPED -- a regenerated project does not "
+                f"serve {_literal(attrs.get('route_key'))} at all"
+            )
             continue
         api_label, target_label = labels
         expected = hcl._apigw_route_keys(target_label)
@@ -1148,6 +1343,7 @@ def _apigw_route_warnings(
         # value quote-wrapped (`'"ANY /orders"'`), so a raw membership test says
         # "changed" for every route odin itself just generated -- which it did,
         # on the first run, for the `{proxy+}` half of every pair.
+        warnings += _unresolved_api_id(f"api route {rname}", rname, attrs, by_hcl_name)
         matched = _literal(actual) in {_literal(key) for key in expected}
         dropped, changed = _attribute_notes(
             "aws_apigatewayv2_route", attrs, _CARRIED_COMPANION_ATTRS["aws_apigatewayv2_route"], (),
@@ -1159,12 +1355,18 @@ def _apigw_route_warnings(
     return warnings
 
 
-def _apigw_stage_warnings(companions: list[tuple[str, str, dict]]) -> list[str]:
+def _apigw_stage_warnings(
+    companions: list[tuple[str, str, dict]], by_hcl_name: dict[str, str],
+) -> list[str]:
     """A stage odin will not serve, named. odin emits exactly one stage per API,
     always `$default` -- the stage whose invoke path carries no stage segment,
     which is what lets the nginx prefix and the route key mean the same thing.
     A source naming any other stage would have its paths served one segment
-    higher than it wrote them."""
+    higher than it wrote them.
+
+    v0.8.22: `api_id` is checked too. It is in the carried set, which promises a
+    round trip reproduces it -- and it was read by nothing, so a stage attached
+    to an API this import did not see folded away without a word."""
     warnings: list[str] = []
     for rtype, rname, attrs in companions:
         if rtype != "aws_apigatewayv2_stage":
@@ -1174,7 +1376,24 @@ def _apigw_stage_warnings(companions: list[tuple[str, str, dict]]) -> list[str]:
             _derived_changes([("name", attrs.get("name"), hcl._APIGW_STAGE)]),
         )
         warnings += _attribute_warnings(f"{rname} (api stage)", "", dropped, changed)
+        warnings += _unresolved_api_id("api stage", rname, attrs, by_hcl_name)
     return warnings
+
+
+def _unresolved_api_id(
+    what: str, rname: str, attrs: dict, by_hcl_name: dict[str, str],
+) -> list[str]:
+    """A route or stage whose `api_id` names no imported `aws_apigatewayv2_api`.
+
+    Both fold AWAY -- the canvas keeps neither -- so the only thing that makes
+    them reappear is odin regenerating them for an API node it has. One attached
+    to an API outside this file therefore does not come back at all, and `api_id`
+    being in both carried sets was suppressing the line that says so."""
+    return [] if _referenced_label(attrs.get("api_id"), "aws_apigatewayv2_api", by_hcl_name) else [
+        f"{rname} ({what}): its `api_id` ({_literal(attrs.get('api_id'))}) names no imported "
+        "aws_apigatewayv2_api, so it belongs to an API this canvas does not hold and a "
+        "regenerated project does not contain it at all"
+    ]
 
 
 def _referenced_hcl_name(value: object, rtype: str) -> str | None:
@@ -1513,11 +1732,11 @@ def _container_definition(taskdef: dict) -> dict:
     raw = hcl.unquote(taskdef.get("container_definitions"))
     if not isinstance(raw, str):
         return {}
-    try:
+    with suppress(json.JSONDecodeError):
         parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return {}
-    return parsed[0] if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict) else {}
+        if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+            return parsed[0]
+    return {}
 
 
 def _member_text(archive: zipfile.ZipFile, name: str) -> str | None:
@@ -1633,8 +1852,18 @@ def _statement_resources(statement: dict) -> list[str]:
     ))
 
 
+def _json_object(document: str) -> dict:
+    """`document` as a JSON object, or `{}` when it is not one. Separate from the
+    caller so "is this readable" and "read it" are the same question asked once
+    -- a `try/except` inline made the unreadable case a bare `continue`."""
+    with suppress(json.JSONDecodeError):
+        parsed = json.loads(document)
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
 def _edges_from_role_policies(
-    policies: list[dict], node_by_label: dict[str, dict], attrs_by_label: dict[str, dict],
+    policies: list[tuple[str, dict]], node_by_label: dict[str, dict], attrs_by_label: dict[str, dict],
 ) -> tuple[list[dict], list[str]]:
     """Turn each `aws_iam_role_policy` back into the canvas edges that produced it.
 
@@ -1673,15 +1902,38 @@ def _edges_from_role_policies(
 
     out: list[dict] = []
     warnings: list[str] = []
-    for policy in policies:
+    for name, policy in policies:
         source = role_to_workload.get(_ref_target(policy.get("role")) or "")
         document = hcl.unquote(policy.get("policy"))
-        if source is None or not isinstance(document, str):
+        # THREE SILENT `continue`s LIVED HERE UNTIL v0.8.22, directly under a
+        # docstring saying this must never happen again, and the middle one is
+        # the one that matters: `jsonencode({...})` is how real Terraform spells
+        # a policy document, and python-hcl2 hands it back as `${jsonencode(...)}`
+        # -- not a literal, so `json.loads` was never even reached. Measured on
+        # develop, a hand-written project with one `jsonencode` grant imported
+        # with `unsupported == []`, `warnings == []` and ZERO edges. Importing a
+        # real-world project silently dropped its entire IAM posture and reported
+        # a clean import.
+        #
+        # The other two are the same defect at different depths: a policy on a
+        # role no workload carries (a CI role, a role odin has no node for), and
+        # a document that is a literal but not JSON. Each is a permission the
+        # source granted and the canvas will not.
+        why = (
+            f"its `role` ({_literal(policy.get('role'))}) belongs to no imported workload"
+            if source is None else
+            "its `policy` is not a literal document -- a `jsonencode({...})` or a variable "
+            "reference cannot be read from HCL text"
+            if not isinstance(document, str) or "${" in document else
+            "its `policy` is not valid JSON" if not _json_object(document) else ""
+        )
+        if why:
+            warnings.append(
+                f"{name} (iam): a granted permission could not be imported as an edge -- {why}. "
+                "THE PERMISSION IS LOST: the imported canvas grants less than the source did."
+            )
             continue
-        try:
-            parsed = json.loads(document)
-        except json.JSONDecodeError:
-            continue
+        parsed = _json_object(document)
         for statement in parsed.get("Statement") or []:
             actions = statement.get("Action") or []
             resources = _statement_resources(statement)
@@ -1701,6 +1953,16 @@ def _edges_from_role_policies(
                 f"{', '.join(unresolved)}, which names no node on this canvas. The PERMISSION IS "
                 "LOST: the imported canvas grants less than the source did."
             ]
+        # v0.8.22: the policy resource's own arguments, the rule every companion
+        # is held to. `name` is RE-DERIVED as `<workload>-grants`, so a policy
+        # the user called something else comes back as a differently-named AWS
+        # resource -- the `aws_iam_instance_profile` shape again.
+        warnings += _attribute_warnings(
+            f"{source} (iam)", f"{_IAM_POLICY_TYPE} ", *_attribute_notes(
+                _IAM_POLICY_TYPE, policy, _CARRIED_COMPANION_ATTRS[_IAM_POLICY_TYPE], (),
+                _derived_changes([("name", policy.get("name"), hcl._grants_policy_name(source))]),
+            ),
+        )
     return out, warnings
 
 
@@ -1756,7 +2018,7 @@ def _stamp_lambda(
 
 def _stamp_ecs_taskdef(
     node_by_label: dict[str, dict], attrs_by_label: dict[str, dict], by_hcl_name: dict[str, str],
-    taskdefs: dict[str, dict],
+    taskdefs: dict[str, dict], clusters: dict[str, dict],
 ) -> list[str]:
     """Fold each service's task definition back onto its node, and say what a
     round trip cannot bring with it.
@@ -1790,7 +2052,44 @@ def _stamp_ecs_taskdef(
                 "the service comes back with odin's DEFAULT image and no port -- not the container "
                 "it was running"
             )
+        # v0.8.22: the service's OWN two silent re-derivations. `cluster` and
+        # `timeouts` are both in `_CARRIED_ATTRS["ecs"]`, and neither was read
+        # by anything.
+        #
+        # `cluster`: odin puts every service in its one shared cluster
+        # (`hcl._ECS_CLUSTER_NAME`), so a service pointing at a cluster this
+        # import did not see joins a DIFFERENT cluster on the next apply.
+        # `_ecs_cluster_warnings` covers the cluster that IS in the file; this
+        # covers the reference that leaves it.
+        warnings += [] if attrs.get("cluster") is None or _ref_target(attrs.get("cluster")) in clusters else [
+            f"{label} (ecs): its `cluster` ({_literal(attrs.get('cluster'))}) names no imported "
+            f"aws_ecs_cluster, so the service comes back in odin's own "
+            f"{hcl._ECS_CLUSTER_NAME!r} cluster instead of the one it was running in"
+        ]
+        # `timeouts`: odin emits `hcl._ECS_CONVERGE_TIMEOUT` for all three, so a
+        # source that gave a slow rollout twenty minutes gets sixty seconds --
+        # and a tofu apply that now reports a timeout for a deploy that was
+        # simply still going.
+        warnings += _attribute_warnings(
+            f"{label} (ecs)", "timeouts ", *_ecs_timeout_notes(attrs),
+        )
         container = _container_definition(taskdef)
+        # v0.8.22: a task definition odin FOUND but whose containers it cannot
+        # read. Measured silent on develop, in the two spellings that matter --
+        # `jsonencode([{...}])` (which is how real Terraform writes it, and which
+        # python-hcl2 hands back as a `${...}` interpolation, never a literal)
+        # and a malformed literal. In both, the service came back carrying odin's
+        # DEFAULT image, so `ghcr.io/acme/web:3.1` imported as `nginx:alpine`
+        # with `unsupported == []` and no warning: a different program entirely,
+        # reported as a clean import. The MISSING-taskdef case above already said
+        # this; the unreadable one said nothing.
+        warnings += [] if container or not taskdef else [
+            f"{label} (ecs): its task definition's `container_definitions` is not a literal JSON "
+            "array odin can read (a `jsonencode([...])` or a variable reference cannot be read "
+            f"from HCL text), so the service comes back with odin's DEFAULT image "
+            f"{hcl._DEFAULT_ECS_IMAGE!r} and port {hcl._DEFAULT_ECS_PORT} -- not the container it "
+            "was running, and no mount it declared"
+        ]
         image = container.get("image")
         if isinstance(image, str):
             node["data"]["image"] = image
@@ -1807,7 +2106,84 @@ def _stamp_ecs_taskdef(
         if host:
             node["data"]["host"] = host
 
+        # v0.8.22: the task definition's OWN arguments, held to the rule every
+        # other companion is held to. See `_CARRIED_COMPANION_ATTRS
+        # ["aws_ecs_task_definition"]` for why the earlier "it would warn on
+        # every ecs import" reasoning was true of a plain dropped-attribute pass
+        # and false of this one -- `_derived_changes` is silent whenever the
+        # source agrees with what `hcl.py` emits, which odin's own output always
+        # does.
+        dropped, changed = _attribute_notes(
+            "aws_ecs_task_definition", taskdef,
+            _CARRIED_COMPANION_ATTRS["aws_ecs_task_definition"], (),
+            _derived_changes([
+                ("family", taskdef.get("family"), label),
+                ("network_mode", taskdef.get("network_mode"), hcl._ECS_TASK_NETWORK_MODE),
+                ("requires_compatibilities", _only_element(taskdef.get("requires_compatibilities")),
+                 hcl._ECS_TASK_COMPATIBILITY),
+            ]),
+        )
+        warnings += _attribute_warnings(
+            f"{label} (ecs)", "aws_ecs_task_definition ", dropped, changed,
+        )
+
     return warnings
+
+
+def _ecs_timeout_notes(attrs: dict) -> tuple[list[str], list[str]]:
+    """`(dropped, changed)` for an ecs service's `timeouts {}` block -- odin
+    emits `hcl._ECS_CONVERGE_TIMEOUT` for create/update/delete and nothing else,
+    so any other value or member does not survive."""
+    dropped: list[str] = []
+    changed: list[str] = []
+    for block in attrs.get("timeouts") or []:
+        inner, _ = _attribute_notes(
+            "aws_ecs_service.timeouts", block, {"create", "update", "delete"}, (), {},
+        )
+        dropped += [f"timeouts.{key}" for key in inner]
+        changed += [
+            f"timeouts.{key}={_literal(block[key])} ({why})"
+            for key, why in _derived_changes(
+                (key, block.get(key), hcl._ECS_CONVERGE_TIMEOUT)
+                for key in ("create", "update", "delete")
+            ).items()
+        ]
+    return sorted(set(dropped)), sorted(set(changed))
+
+
+def _ecs_cluster_warnings(clusters: dict[str, dict]) -> list[str]:
+    """A cluster odin will not reproduce, named.
+
+    v0.8.22. odin emits exactly ONE cluster per project, always called
+    `hcl._ECS_CLUSTER_NAME`, and every service joins it. The canvas has no kind
+    for a cluster, so there is nothing to import it INTO -- but that is an
+    argument about nodes, and it was being used to justify saying nothing at
+    all. Measured on develop: `resource "aws_ecs_cluster" "prod" { name =
+    "production" }` imported with `unsupported == []` and `warnings == []`, and
+    the regenerated project declares a cluster named `odin` instead. The next
+    apply builds that second cluster and moves the service into it, which is a
+    migration, not a detail.
+
+    Silent for odin's own output, like every other derived check here: odin
+    writes the expected name, so the comparison finds nothing."""
+    return [
+        line
+        for rname, attrs in sorted(clusters.items())
+        for line in _attribute_warnings(
+            f"{rname} (ecs cluster)", "", *_attribute_notes(
+                "aws_ecs_cluster", attrs, _CARRIED_COMPANION_ATTRS["aws_ecs_cluster"], (),
+                _derived_changes([("name", attrs.get("name"), hcl._ECS_CLUSTER_NAME)]),
+            ),
+        )
+    ]
+
+
+def _only_element(value: object) -> object:
+    """A single-element HCL list reduced to that element, so `_derived_changes`
+    can compare `requires_compatibilities = ["FARGATE"]` against the one string
+    odin emits. A list of any other length is returned as-is and therefore
+    reported changed, which is right: odin emits exactly one."""
+    return value[0] if isinstance(value, list) and len(value) == 1 else value
 
 
 def _ecs_alb_targets(
@@ -2226,13 +2602,28 @@ def _stamp_ec2_wiring(
         ]
 
         target = _ref_target(attrs.get("key_name"))
-        public_key = hcl.unquote((key_pairs.get(target) or {}).get("public_key")) if target else None
+        pair = key_pairs.get(target) if target else None
+        public_key = hcl.unquote((pair or {}).get("public_key"))
         if isinstance(public_key, str):
             node["data"]["key"] = public_key
         warnings += [] if target is None or isinstance(public_key, str) else [
             f"{label} (ec2): its `key_name` names no imported aws_key_pair, so the instance comes "
             "back with NO SSH key and you will not be able to log in to it"
         ]
+        # v0.8.22: the key pair's OWN arguments. It folded onto the instance
+        # with no honesty pass at all -- the `aws_iam_instance_profile` defect,
+        # in the type sitting right beside it in `parse_hcl`'s dispatch, and it
+        # survived that fix because nothing enumerated the companions. `key_name`
+        # is RE-DERIVED as `<label>-key`, so a shared `deploy-key` comes back as
+        # a different AWS key pair; a `tags` block on it vanished outright.
+        # Measured silent on develop, both halves.
+        if pair is not None:
+            warnings += _attribute_warnings(
+                f"{label} (ec2)", "aws_key_pair ", *_attribute_notes(
+                    "aws_key_pair", pair, _CARRIED_COMPANION_ATTRS["aws_key_pair"], (),
+                    _derived_changes([("key_name", pair.get("key_name"), hcl._key_pair_name(label))]),
+                ),
+            )
     return warnings
 
 
@@ -2447,7 +2838,8 @@ def parse_hcl(files: dict[str, str], archives: dict[str, bytes] | None = None) -
     instance_profiles: dict[str, dict] = {}  # v0.8.21
     key_pairs: dict[str, dict] = {}
     taskdefs: dict[str, dict] = {}
-    role_policies: list[dict] = []
+    clusters: dict[str, dict] = {}
+    role_policies: list[tuple[str, dict]] = []
     node_by_label: dict[str, dict] = {}
     attrs_by_label: dict[str, dict] = {}
     index = 0
@@ -2480,13 +2872,16 @@ def parse_hcl(files: dict[str, str], archives: dict[str, bytes] | None = None) -
             apigw_companions.append((rtype, rname, attrs))
             continue
         if rtype == _IAM_POLICY_TYPE:
-            role_policies.append(attrs)
+            role_policies.append((rname, attrs))
             continue
         if rtype in _ECS_COMPANION_TYPES:
             # The task definition folds onto its service; the cluster is a
             # singleton odin always emits and the canvas has no kind for.
-            if rtype == "aws_ecs_task_definition":
-                taskdefs[rname] = attrs
+            # v0.8.22: both are COLLECTED now rather than the cluster being
+            # thrown away at the dispatch -- "the canvas has no kind for it" is
+            # a reason not to make it a node, not a reason to say nothing about
+            # what it cost.
+            (taskdefs if rtype == "aws_ecs_task_definition" else clusters)[rname] = attrs
             continue
         if rtype == _EFS_ACCESS_POINT_TYPE:
             # v0.8.19: a COMPANION, like an `aws_key_pair` -- it folds onto the
@@ -2593,6 +2988,15 @@ def parse_hcl(files: dict[str, str], archives: dict[str, bytes] | None = None) -
         alb_by_target_group[tg_key] = node["data"]["label"]
         node["data"]["port"] = str(_int_attr(tg_attrs.get("port"), 80))
         node["data"]["healthCheckPath"] = _health_check_path(tg_attrs)
+        # The VPC the regenerated target group will be in. Read from the LOAD
+        # BALANCER's own subnet rather than from `node["data"]["vpc"]`, which
+        # `_stamp_containment` has not written yet at this point in the pass --
+        # a second producer for the same answer, and taking the not-yet-stamped
+        # one would have made the check below silently vacuous.
+        alb_subnet = _referenced_label(_only_element(attrs_by_label[node["data"]["label"]].get("subnets")), "aws_subnet", by_hcl_name)
+        alb_vpc = _referenced_label(
+            (attrs_by_label.get(alb_subnet) or {}).get("vpc_id"), "aws_vpc", by_hcl_name,
+        ) if alb_subnet else None
         # The companions' own arguments are held to the same honesty rule as a
         # primary resource's: v0.7.0 folded them on and said nothing about what
         # it left behind (a target group's `matcher = "200-299"`, every
@@ -2601,17 +3005,35 @@ def parse_hcl(files: dict[str, str], archives: dict[str, bytes] | None = None) -
         for companion_type, companion_attrs in (
             ("aws_lb_listener", attrs), ("aws_lb_target_group", tg_attrs),
         ):
+            # v0.8.22: a listener's `default_action {}` members too -- a target
+            # group carries none, so this is a no-op for it the same way
+            # `_dropped_health_check_attrs` is a no-op for the listener.
+            action_dropped, action_changed = _default_action_notes(companion_attrs)
             dropped, changed = _attribute_notes(
                 companion_type, companion_attrs, _CARRIED_COMPANION_ATTRS[companion_type],
                 # A listener carries no health_check block and no `name`, so both
                 # of these are no-ops for it -- no per-type branch needed.
-                _dropped_health_check_attrs(companion_attrs),
+                _dropped_health_check_attrs(companion_attrs) + action_dropped,
                 # hcl.py names the target group `<the alb node's label>-tg`, so a
                 # target group the user named anything else is renamed by the
                 # round trip (silent through v0.7.5).
-                _derived_changes([("name", companion_attrs.get("name"), f"{label}-tg")]),
+                #
+                # v0.8.22: `vpc_id` too. It is in the carried set and was read by
+                # nothing -- odin RE-DERIVES it from the load balancer's own
+                # containment (`hcl.py::_vpc_ref`), so a target group the source
+                # put in a different VPC comes back in the alb's. Measured
+                # silent: a `vpc_id` naming an imported `other-vpc` regenerated
+                # as `probe_vpc` with `warnings == []`. Compared as resolved
+                # LABELS, never as reference text, so a project whose HCL names
+                # are not odin's own does not fire.
+                _derived_changes([
+                    ("name", companion_attrs.get("name"), f"{label}-tg"),
+                    *_target_group_vpc_change(companion_type, companion_attrs, alb_vpc, by_hcl_name),
+                ]),
             )
-            warnings += _attribute_warnings(f"{label} (alb)", f"{companion_type} ", dropped, changed)
+            warnings += _attribute_warnings(
+                f"{label} (alb)", f"{companion_type} ", dropped, sorted(changed + action_changed),
+            )
     for rtype, rname, attrs in alb_companions:
         if rtype == "aws_lb_target_group" and f"aws_lb_target_group.{rname}" not in alb_by_target_group:
             unsupported.append(Unsupported(
@@ -2622,7 +3044,8 @@ def parse_hcl(files: dict[str, str], archives: dict[str, bytes] | None = None) -
     warnings += _stamp_containment(node_by_label, attrs_by_label, by_hcl_name)
     warnings += _stamp_sg_rules(node_by_label, attrs_by_label, by_hcl_name)
     warnings += _stamp_ec2_wiring(node_by_label, attrs_by_label, by_hcl_name, key_pairs)
-    warnings += _stamp_ecs_taskdef(node_by_label, attrs_by_label, by_hcl_name, taskdefs)
+    warnings += _stamp_ecs_taskdef(node_by_label, attrs_by_label, by_hcl_name, taskdefs, clusters)
+    warnings += _ecs_cluster_warnings(clusters)
     warnings += _stamp_canvas_refs(node_by_label, attrs_by_label, by_hcl_name)
     role_names = {
         label: str(hcl.unquote(attrs_by_label[label].get("name")) or "")
