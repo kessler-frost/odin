@@ -286,6 +286,46 @@ canvas and its configuration.
   what it says for the core kinds — the emulator path is long-tail only,
   and each kind's entry records what actually holds its state.
 
+- **2026-08-06 (owner, DECIDED) — intelligence in the UI is visual proposal,
+  not chat: "vision is the communication language and not chatting
+  primarily."** Refines directives 1 and 4 and carries the 2026-07-27
+  directive ("canvas and navigating things around IS the language of odin")
+  into the intelligence layer rather than amending it away. The model:
+
+  1. **The AI proposes; the user's click is the drawing.** Proposals (ghost
+     edges, pending config completions) are UI-only overlay state — never
+     written to the Stack, invisible to Apply, gone on dismiss. Accepting
+     routes through the SAME creation path as the equivalent manual action,
+     so "edges are drawn by the user, never by odin" stays true in code, not
+     just in spirit. Accepted items carry provenance
+     "agent-proposed, user-accepted" (`spec/models.py` provenance fields),
+     permanently distinguishable from hand-drawn work.
+  2. **"Accept all" exists, but odin's edges are PERMISSION GRANTS
+     (directive 4), so bulk-accept is a bulk permissioning action.** For
+     IAM-granting edges, accept-all must first show the grant summary it is
+     about to make — how many edges, which actions, which directions, in the
+     same vocabulary as the per-edge checkmarks — so one click approves it
+     informed. Reference-only edges (plain `${{node.attr}}` wiring) may
+     accept-all freely.
+  3. **Completions are VISIBLE, attributed, and pending until accepted.**
+     Config-panel proposals render as visibly-pending values with a
+     one-line why, per the precedent `docs/intelligence-layer.md` already
+     sets for containment ("show what containment decided and why"). The
+     gesture invariant extends to intelligence verbatim: nothing silently
+     rewrites what a person authored, and nothing accepted becomes
+     indistinguishable from what the person typed.
+  4. **The 2026-07-30 division of labor is unchanged**: the pair table
+     decides what an edge MAY mean; the model only ranks among legal
+     meanings and drafts values; deterministic code decides what gets
+     applied. Chat stays the auxiliary channel for what has no spatial
+     representation (the debugger's "why is this crashed?" — failure causes
+     are not drawable).
+
+  Bookkeeping owed when this is built: CLAUDE.md's edge-origin inventory
+  ("Canvas.tsx produces edges in exactly two places") gains a third place —
+  the accept handler — and must be updated in the same change, for the same
+  reason that line exists at all.
+
 ## Non-negotiables carried forward
 
 Local-first on one Mac (multi-Mac via self-hosted Nebula later) · real
