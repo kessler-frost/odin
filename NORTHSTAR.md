@@ -214,6 +214,42 @@ canvas and its configuration.
   `tests/test_iac_is_deterministic.py` fails the build on either leak — because
   this paragraph cannot.
 
+- **2026-08-06 (owner, recorded as an OPEN QUESTION — not yet a directive) —
+  who is odin for, and how AWS should its face be?** Raised while sizing odin
+  against Brainboard/Cloudcraft (canvas tools for professional infra teams
+  deploying to real cloud accounts): *"whether we should rely on aws keywords
+  that heavily, as I'm looking to target odin and perhaps build it for the
+  home lab users who are somewhat different than professional infra
+  engineers? Especially when intelligence backends are becoming increasingly
+  local like self hosted models."*
+
+  Unpacked, three threads to test future decisions against:
+  1. **Audience: home-lab users, not (only) professional infra engineers.**
+     Home-labbers want running services on their own hardware with no cloud
+     bill — which is what odin already does. The commercial canvas-to-cloud
+     tools all assume real cloud credentials; nobody found so far serves the
+     local-first quadrant. This reframes them as neighbors, not competitors.
+  2. **Surface language: how much AWS vocabulary to wear.** The question is
+     about the FACE (keywords, catalog names, marketing), not the contract —
+     directive 1's AWS wire protocol at the gateway is what makes real
+     Terraform providers work and stays. Open: whether the canvas could speak
+     in plainer nouns ("object storage", "queue", "database", "function")
+     with AWS-compat as the implementation detail underneath, so a home-lab
+     user who has never opened the AWS console isn't repelled by SQS/SNS/EBS
+     jargon. AWS-shaped names would remain the resource kinds' identity in
+     Stack/HCL either way.
+  3. **Self-hosted intelligence fits this audience.** Home-labbers
+     increasingly run local models; odin's agent layer (`agent/ai.py` master
+     switch) currently assumes `claude_agent_sdk`. If the audience shifts,
+     "bring your own local model" becomes a natural expectation for the
+     chat/debugger/refine surfaces — same shape as odin substituting local
+     backings for AWS services, applied to the intelligence layer itself.
+
+  Not decided; nothing in the codebase moves on this yet. Recorded so the
+  thought survives, and so the tension with directive 1's framing ("an
+  AWS-compatible endpoint on your Mac") is confronted deliberately rather
+  than drifted past.
+
 ## Non-negotiables carried forward
 
 Local-first on one Mac (multi-Mac via self-hosted Nebula later) · real
