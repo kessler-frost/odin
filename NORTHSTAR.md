@@ -300,13 +300,17 @@ canvas and its configuration.
      just in spirit. Accepted items carry provenance
      "agent-proposed, user-accepted" (`spec/models.py` provenance fields),
      permanently distinguishable from hand-drawn work.
-  2. **"Accept all" exists, but odin's edges are PERMISSION GRANTS
-     (directive 4), so bulk-accept is a bulk permissioning action.** For
-     IAM-granting edges, accept-all must first show the grant summary it is
-     about to make — how many edges, which actions, which directions, in the
-     same vocabulary as the per-edge checkmarks — so one click approves it
-     informed. Reference-only edges (plain `${{node.attr}}` wiring) may
-     accept-all freely.
+  2. **"Accept all" means accepting every PENDING PROPOSAL in one click
+     (owner clarification, same day) — it never widens what any single edge
+     grants.** Each accepted edge carries exactly the action set the AI
+     proposed and nothing more; no gesture exists that grants "everything
+     an edge could mean." Because odin's edges are permission grants
+     (directive 4), batch-accepting proposed IAM edges is still a bulk
+     permissioning action, so it first shows a summary of what was proposed
+     — how many edges, which actions, which directions, in the same
+     vocabulary as the per-edge checkmarks — and one click approves exactly
+     that, nothing wider. Reference-only edges (plain `${{node.attr}}`
+     wiring) batch-accept freely.
   3. **Completions are VISIBLE, attributed, and pending until accepted.**
      Config-panel proposals render as visibly-pending values with a
      one-line why, per the precedent `docs/intelligence-layer.md` already
