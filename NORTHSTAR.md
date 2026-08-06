@@ -250,6 +250,42 @@ canvas and its configuration.
   AWS-compatible endpoint on your Mac") is confronted deliberately rather
   than drifted past.
 
+- **2026-08-06 (from the same landscape review, recorded as an OPTION under
+  directive 5 — not adopted) — post-LocalStack emulators (MiniStack, Floci)
+  as candidate LONG-TAIL BACKINGS behind the gateway.** Context: LocalStack
+  archived its OSS repo and account-walled the product (2026-03); the vacuum
+  filled with MIT-licensed emulators — `ministackorg/ministack` (~4k stars;
+  RDS = real Postgres containers, EKS = real k3s: odin's real-substrate
+  philosophy independently reinvented) and `floci-io/floci` (~18k stars, 69
+  services, Docker-backed tier for the heavy ones). Neither has a canvas,
+  IaC generation/import, or IAM enforcement (MiniStack README: "IAM policies
+  are stored but not enforced"; Floci: "credentials can be any non-empty
+  values") — they are the substrate layer commoditizing, not competitors on
+  odin's axes.
+
+  The option: for kinds odin will never hand-build a real substrate for,
+  fulfill the API behind odin's OWN gateway by proxying to one of these
+  containers — the same shape as goaws/dynalite today, with sixty services
+  in one container. Odin keeps the contract, SigV4, IAM enforcement, canvas
+  and translation; the emulator community does the long-tail API surface.
+  MIT both sides, so the permissive-only rule holds.
+
+  Relation to the deprecation above ("MiniStack as a runtime dependency —
+  stays removed"): that entry removed MiniStack as the MIDDLE LAYER — the
+  thing holding the AWS contract itself (the Moto → MiniStack → own-gateway
+  arc). This option puts an emulator BEHIND the gateway as one more
+  replaceable backing, the position directive 5 and the non-negotiable
+  ("every dependency behind [the contract] is replaceable") already
+  contemplate. Not a reversal — but near enough that adoption must be
+  deliberate and per-kind, never by drift.
+
+  Two conditions if ever adopted, both owed to the honesty rules: (1) a kind
+  backed by an emulator is DRAWN as emulated — in `docs/limits.md` and the
+  architecture diagram (rule 2b: an unreal boundary drawn as real is the
+  diagram lying); (2) "real execution, no mock-only modes" keeps meaning
+  what it says for the core kinds — the emulator path is long-tail only,
+  and each kind's entry records what actually holds its state.
+
 ## Non-negotiables carried forward
 
 Local-first on one Mac (multi-Mac via self-hosted Nebula later) · real
