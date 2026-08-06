@@ -3,14 +3,17 @@
 ## Overview
 [NORTHSTAR.md](../NORTHSTAR.md) (repo root) governs — read it first for the
 full direction. In short: a drag-drop canvas where people design real AWS
-architectures; an agent (claude-agent-sdk) translates canvas ↔ Terraform/
-OpenTofu both ways; **Simulate** runs a real `tofu apply` against odin's own
-gateway, which fulfills the AWS calls with local substitutes (RustFS for S3,
-etc.) at full API compatibility; IAM permissions drawn as edges are enforced
-for real; Nebula is the network layer. Today, live code covers the AWS
-substitute layer (RDS/S3/SQS/SNS/DynamoDB applied for real per environment) —
-the gateway, the translation agent, Simulate, and IAM enforcement are still
-being built (see ROADMAP.md).
+architectures; **`iac/` translates canvas ↔ Terraform DETERMINISTICALLY** in
+both directions (no model — see the `iac/` note below); Apply runs a real
+`tofu apply` against odin's own gateway, which fulfills the AWS calls with
+local substitutes (RustFS for S3, etc.); IAM permissions drawn as edges are
+enforced for real; Nebula is the network layer.
+
+**All of that is LIVE as of v0.8.21** — gateway, Apply, IAM enforcement and 22
+node kinds, each backed by a real substrate and covered by an integration gate
+over every `-m integration` file. `docs/limits.md` is the honest boundary and
+`ROADMAP.md` is what is left. This paragraph said those four were "still being
+built" until 2026-08-04, which had been false for weeks.
 
 **PARKED (2026-07-22, tag `app-layer-parked`):** the app-workload layer —
 service/dep/batch/llm node kinds, the memory-aware scheduler
@@ -367,34 +370,15 @@ reason to start calling it directly. On Python 3.13 the stdlib covers what
 concurrency, `asyncio.create_subprocess_exec` for async subprocesses,
 `asyncio.timeout`, `asyncio.Lock`. That is also what uvicorn/FastAPI run on.
 
-**Status (v0.7.7 in flight, branch `v077-dethread`).** `asyncio.to_thread` is
-GONE from odin's own code — 0 call sites, down from 28. The gateway models'
-boot threads are `asyncio` tasks now (`gateway/models/__init__.py::background`,
-which holds a strong reference in a module-level set with a done-callback
-discard — a bare `create_task` reference can be garbage-collected mid-flight
-where a daemon thread could not). The locks that guarded sections containing
-no `await` were DELETED rather than ported.
-
-**Still standing, re-measured 2026-07-27 — exactly TWO modules, not five.**
-This list previously named `__main__.py`'s log relays, `compute/instances.py`'s
-boot semaphore and `fabric/nebula.py`'s locks; all three had already been
-converted, so the inventory described a state that no longer existed. It is now
-pinned by `tests/test_thread_inventory.py` rather than by this paragraph,
-because prose about thread inventories has gone stale here twice and prose
-cannot fail a build:
-- `gateway/app.py::serve_in_thread` / `stop_in_thread` — TEST-ONLY, and
-  genuinely unavoidable: two SYNC integration tests must dial a real bound port
-  while doing blocking boto3/docker work inline, so serving on the caller's loop
-  would deadlock against the loop those calls block. Production uses
-  `serve_on_loop`.
-- `gateway/stores.py` — `JsonStore`'s per-env locks, whose ONLY remaining
-  contender is that helper. Every critical section there is synchronous (the
-  file has no `async def` and no `await`), so on one event loop they guard
-  nothing: **delete them in the same change that deletes `serve_in_thread`, and
-  not before.** Removing them while it exists reintroduces a real interleaved
-  read/write in those two tests that no unit test catches.
-
-`asyncio.to_thread` is at ZERO call sites and a ratchet keeps it there.
+**Status: DONE, and pinned by a test rather than by this paragraph.**
+`asyncio.to_thread` is at ZERO call sites (down from 28) and a ratchet keeps it
+there. `tests/test_thread_inventory.py` is the live inventory — the prose here
+listed five surviving modules when there were two, twice, which is why it is a
+test now. Two remain, both deliberate: `gateway/app.py::serve_in_thread`
+(TEST-ONLY; two sync integration tests must dial a real bound port while doing
+blocking work inline) and `gateway/stores.py`'s `JsonStore` locks, whose only
+contender is that helper — **delete them in the same change that deletes
+`serve_in_thread`, not before.**
 
 **Four failure modes this conversion creates. All are silent, none is caught
 by an ordinary test, and each now has a mutation-tested ratchet under

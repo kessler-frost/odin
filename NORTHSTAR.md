@@ -214,6 +214,118 @@ canvas and its configuration.
   `tests/test_iac_is_deterministic.py` fails the build on either leak — because
   this paragraph cannot.
 
+- **2026-08-06 (owner, recorded as an OPEN QUESTION — not yet a directive) —
+  who is odin for, and how AWS should its face be?** Raised while sizing odin
+  against Brainboard/Cloudcraft (canvas tools for professional infra teams
+  deploying to real cloud accounts): *"whether we should rely on aws keywords
+  that heavily, as I'm looking to target odin and perhaps build it for the
+  home lab users who are somewhat different than professional infra
+  engineers? Especially when intelligence backends are becoming increasingly
+  local like self hosted models."*
+
+  Unpacked, three threads to test future decisions against:
+  1. **Audience: home-lab users, not (only) professional infra engineers.**
+     Home-labbers want running services on their own hardware with no cloud
+     bill — which is what odin already does. The commercial canvas-to-cloud
+     tools all assume real cloud credentials; nobody found so far serves the
+     local-first quadrant. This reframes them as neighbors, not competitors.
+  2. **Surface language: how much AWS vocabulary to wear.** The question is
+     about the FACE (keywords, catalog names, marketing), not the contract —
+     directive 1's AWS wire protocol at the gateway is what makes real
+     Terraform providers work and stays. Open: whether the canvas could speak
+     in plainer nouns ("object storage", "queue", "database", "function")
+     with AWS-compat as the implementation detail underneath, so a home-lab
+     user who has never opened the AWS console isn't repelled by SQS/SNS/EBS
+     jargon. AWS-shaped names would remain the resource kinds' identity in
+     Stack/HCL either way.
+  3. **Self-hosted intelligence fits this audience.** Home-labbers
+     increasingly run local models; odin's agent layer (`agent/ai.py` master
+     switch) currently assumes `claude_agent_sdk`. If the audience shifts,
+     "bring your own local model" becomes a natural expectation for the
+     chat/debugger/refine surfaces — same shape as odin substituting local
+     backings for AWS services, applied to the intelligence layer itself.
+
+  Not decided; nothing in the codebase moves on this yet. Recorded so the
+  thought survives, and so the tension with directive 1's framing ("an
+  AWS-compatible endpoint on your Mac") is confronted deliberately rather
+  than drifted past.
+
+- **2026-08-06 (from the same landscape review, recorded as an OPTION under
+  directive 5 — not adopted) — post-LocalStack emulators (MiniStack, Floci)
+  as candidate LONG-TAIL BACKINGS behind the gateway.** Context: LocalStack
+  archived its OSS repo and account-walled the product (2026-03); the vacuum
+  filled with MIT-licensed emulators — `ministackorg/ministack` (~4k stars;
+  RDS = real Postgres containers, EKS = real k3s: odin's real-substrate
+  philosophy independently reinvented) and `floci-io/floci` (~18k stars, 69
+  services, Docker-backed tier for the heavy ones). Neither has a canvas,
+  IaC generation/import, or IAM enforcement (MiniStack README: "IAM policies
+  are stored but not enforced"; Floci: "credentials can be any non-empty
+  values") — they are the substrate layer commoditizing, not competitors on
+  odin's axes.
+
+  The option: for kinds odin will never hand-build a real substrate for,
+  fulfill the API behind odin's OWN gateway by proxying to one of these
+  containers — the same shape as goaws/dynalite today, with sixty services
+  in one container. Odin keeps the contract, SigV4, IAM enforcement, canvas
+  and translation; the emulator community does the long-tail API surface.
+  MIT both sides, so the permissive-only rule holds.
+
+  Relation to the deprecation above ("MiniStack as a runtime dependency —
+  stays removed"): that entry removed MiniStack as the MIDDLE LAYER — the
+  thing holding the AWS contract itself (the Moto → MiniStack → own-gateway
+  arc). This option puts an emulator BEHIND the gateway as one more
+  replaceable backing, the position directive 5 and the non-negotiable
+  ("every dependency behind [the contract] is replaceable") already
+  contemplate. Not a reversal — but near enough that adoption must be
+  deliberate and per-kind, never by drift.
+
+  Two conditions if ever adopted, both owed to the honesty rules: (1) a kind
+  backed by an emulator is DRAWN as emulated — in `docs/limits.md` and the
+  architecture diagram (rule 2b: an unreal boundary drawn as real is the
+  diagram lying); (2) "real execution, no mock-only modes" keeps meaning
+  what it says for the core kinds — the emulator path is long-tail only,
+  and each kind's entry records what actually holds its state.
+
+- **2026-08-06 (owner, DECIDED) — intelligence in the UI is visual proposal,
+  not chat: "vision is the communication language and not chatting
+  primarily."** Refines directives 1 and 4 and carries the 2026-07-27
+  directive ("canvas and navigating things around IS the language of odin")
+  into the intelligence layer rather than amending it away. The model:
+
+  1. **The AI proposes; the user's click is the drawing.** Proposals (ghost
+     edges, pending config completions) are UI-only overlay state — never
+     written to the Stack, invisible to Apply, gone on dismiss. Accepting
+     routes through the SAME creation path as the equivalent manual action,
+     so "edges are drawn by the user, never by odin" stays true in code, not
+     just in spirit. Accepted items carry provenance
+     "agent-proposed, user-accepted" (`spec/models.py` provenance fields),
+     permanently distinguishable from hand-drawn work.
+  2. **"Accept all" exists, but odin's edges are PERMISSION GRANTS
+     (directive 4), so bulk-accept is a bulk permissioning action.** For
+     IAM-granting edges, accept-all must first show the grant summary it is
+     about to make — how many edges, which actions, which directions, in the
+     same vocabulary as the per-edge checkmarks — so one click approves it
+     informed. Reference-only edges (plain `${{node.attr}}` wiring) may
+     accept-all freely.
+  3. **Completions are VISIBLE, attributed, and pending until accepted.**
+     Config-panel proposals render as visibly-pending values with a
+     one-line why, per the precedent `docs/intelligence-layer.md` already
+     sets for containment ("show what containment decided and why"). The
+     gesture invariant extends to intelligence verbatim: nothing silently
+     rewrites what a person authored, and nothing accepted becomes
+     indistinguishable from what the person typed.
+  4. **The 2026-07-30 division of labor is unchanged**: the pair table
+     decides what an edge MAY mean; the model only ranks among legal
+     meanings and drafts values; deterministic code decides what gets
+     applied. Chat stays the auxiliary channel for what has no spatial
+     representation (the debugger's "why is this crashed?" — failure causes
+     are not drawable).
+
+  Bookkeeping owed when this is built: CLAUDE.md's edge-origin inventory
+  ("Canvas.tsx produces edges in exactly two places") gains a third place —
+  the accept handler — and must be updated in the same change, for the same
+  reason that line exists at all.
+
 ## Non-negotiables carried forward
 
 Local-first on one Mac (multi-Mac via self-hosted Nebula later) · real

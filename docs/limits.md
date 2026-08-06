@@ -1346,6 +1346,20 @@ internet-facing, EC2 launch type where you wanted Fargate, no IGW.
   no more powerful than dialing the API's own published port — which is the bar,
   not "the endpoint is protected". `_odin` is a reserved path prefix on the
   gateway.
+- **A function's configured `Timeout` is ACCEPTED, STORED, ECHOED — and never
+  enforced.** `lambdactl` records `Timeout` on CreateFunction/UpdateFunctionConfiguration
+  (`lambdactl.py:754`) so `tofu plan` sees no drift, but the invoke path calls
+  `runtime.invoke(env, name, payload)` with no timeout argument
+  (`lambdactl.py:882`), so `FunctionRuntime.invoke`'s own default applies —
+  **30 seconds, whatever you configured**. AWS's default is 3. So a handler that
+  hangs runs 10x longer than its configuration says before anything gives up,
+  and a `Timeout` set deliberately low as a guard does not guard.
+  Found 2026-08-04 while triaging this file, not by a failing test — the field
+  is the decorative-value shape this repo keeps re-finding, and it is written
+  here rather than left for someone to discover in a hung invoke. The fix is
+  small (pass the stored value) but changes invoke behaviour, so it wants its
+  own change and its own test rather than a drive-by.
+
 - **A crashed handler is a 502, and that took reading what RIE really sends.**
   RIE answers a RAISED handler with **HTTP 200** and an `{"errorMessage",
   "errorType", ...}` body, with no `X-Amz-Function-Error` header at all. Payload
